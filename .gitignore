@@ -1,0 +1,28 @@
+# Operating-system and editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Private agent records
+.agent/private/
+
+# Local third-party checkouts and research source files
+third_party/*/
+resources/
+
+# Common generated output
+node_modules/
+dist/
+build/
+coverage/
+*.log
+*.tmp

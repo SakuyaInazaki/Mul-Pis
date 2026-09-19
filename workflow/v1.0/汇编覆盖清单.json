@@ -1,0 +1,753 @@
+{
+  "scope": "已确认科研执行层内容的文档覆盖检查，不是实现验收",
+  "module_count": 9,
+  "prompt_count": 15,
+  "commitments": [
+    {
+      "id": "COV01",
+      "item": "范围仅科研执行层，方向层与RSI后议",
+      "section": "scope"
+    },
+    {
+      "id": "COV02",
+      "item": "九个功能模块，收口之后无新增必经环节",
+      "section": "map"
+    },
+    {
+      "id": "COV03",
+      "item": "初始认识只原问题与必要原始信息，不查外部分析",
+      "section": "m01"
+    },
+    {
+      "id": "COV04",
+      "item": "初始认识用自己的推理，假设不确定单列",
+      "section": "m01"
+    },
+    {
+      "id": "COV05",
+      "item": "导出只方便复制转交，不增加原意",
+      "section": "m01"
+    },
+    {
+      "id": "COV06",
+      "item": "初始认识与候选判据保持两次交互",
+      "section": "m02"
+    },
+    {
+      "id": "COV07",
+      "item": "候选判据五类、条件、依据、用途与限制",
+      "section": "m02"
+    },
+    {
+      "id": "COV08",
+      "item": "不强迫反转、固定例数、无依据数量级和阈值",
+      "section": "m02"
+    },
+    {
+      "id": "COV09",
+      "item": "首次与引入外部知识后复用同一K，增量处理",
+      "section": "m02"
+    },
+    {
+      "id": "COV10",
+      "item": "前处理、实际核验与后处理不互相替代",
+      "section": "map"
+    },
+    {
+      "id": "COV11",
+      "item": "网页版AI生成四类具体题，用户转交",
+      "section": "m03"
+    },
+    {
+      "id": "COV12",
+      "item": "问题与判断依据分开，评价者也检查自身预设",
+      "section": "m03"
+    },
+    {
+      "id": "COV13",
+      "item": "完整回答、针对追问、不同意见非多数票",
+      "section": "m03"
+    },
+    {
+      "id": "COV14",
+      "item": "纠错区分接受、补条件、不采纳、未决",
+      "section": "m04"
+    },
+    {
+      "id": "COV15",
+      "item": "题目错误前提不归为Agent自己认知",
+      "section": "m04"
+    },
+    {
+      "id": "COV16",
+      "item": "纠错要重新解释关键推理，同步判据与依赖",
+      "section": "m04"
+    },
+    {
+      "id": "COV17",
+      "item": "notes保留全项目实际行为，不变成评审分类库",
+      "section": "workspace"
+    },
+    {
+      "id": "COV18",
+      "item": "七类图对象与来源、行为实体分工",
+      "section": "graph"
+    },
+    {
+      "id": "COV19",
+      "item": "J论证与D采用决定分开",
+      "section": "graph"
+    },
+    {
+      "id": "COV20",
+      "item": "共同前提/替代依据/局部假设/条件应用不同",
+      "section": "graph"
+    },
+    {
+      "id": "COV21",
+      "item": "图循环与证明循环不同，图不自动判真",
+      "section": "graph"
+    },
+    {
+      "id": "COV22",
+      "item": "依据状态、历史使用决定、当前可用性分开",
+      "section": "graph"
+    },
+    {
+      "id": "COV23",
+      "item": "Q关闭不同原因，不自动支持结论",
+      "section": "graph"
+    },
+    {
+      "id": "COV24",
+      "item": "身份、去重、拆分、版本和情境边界",
+      "section": "graph"
+    },
+    {
+      "id": "COV25",
+      "item": "不相容情境、变量口径与转换须说明",
+      "section": "graph"
+    },
+    {
+      "id": "COV26",
+      "item": "同源证据、运行失败、选择偏差与不确定性分开",
+      "section": "graph"
+    },
+    {
+      "id": "COV27",
+      "item": "原文可得性/完整性/内容可靠性分别处理",
+      "section": "graph"
+    },
+    {
+      "id": "COV28",
+      "item": "影响传播为复核，不机械判下游为假",
+      "section": "graph"
+    },
+    {
+      "id": "COV29",
+      "item": "先分析影响再整体发布限制，昂贵复核可随后",
+      "section": "graph"
+    },
+    {
+      "id": "COV30",
+      "item": "停用先生效并跨失败/回滚保留",
+      "section": "graph"
+    },
+    {
+      "id": "COV31",
+      "item": "多Agent并行建议、单一串行合入入口",
+      "section": "graph"
+    },
+    {
+      "id": "COV32",
+      "item": "合入重查关系新增、读依赖与查询条件",
+      "section": "graph"
+    },
+    {
+      "id": "COV33",
+      "item": "固定实际代码输入结果配置和规范，不只固定图文件",
+      "section": "graph"
+    },
+    {
+      "id": "COV34",
+      "item": "发布完整性、持久化、失败恢复需实际实现验证",
+      "section": "graph"
+    },
+    {
+      "id": "COV35",
+      "item": "操作/尝试编号、重复回报与未知执行结果",
+      "section": "graph"
+    },
+    {
+      "id": "COV36",
+      "item": "历史回放与当前回退、删除权限、规范迁移",
+      "section": "graph"
+    },
+    {
+      "id": "COV37",
+      "item": "检索带条件争议状态，截断不发送裸结论",
+      "section": "graph"
+    },
+    {
+      "id": "COV38",
+      "item": "旧上下文不会自动遗忘，关键动作再检查",
+      "section": "graph"
+    },
+    {
+      "id": "COV39",
+      "item": "数据不授予权限，实际访问控制不能只靠提示词",
+      "section": "graph"
+    },
+    {
+      "id": "COV40",
+      "item": "图索引视图派生，结构检查不同于语义检查",
+      "section": "graph"
+    },
+    {
+      "id": "COV41",
+      "item": "references职责、原材料派生材料、稳定来源编号",
+      "section": "workspace"
+    },
+    {
+      "id": "COV42",
+      "item": "检索/来源/阅读/采用状态唯一维护位置",
+      "section": "workspace"
+    },
+    {
+      "id": "COV43",
+      "item": "初始化不搜索、不造来源、不迁移覆盖",
+      "section": "workspace"
+    },
+    {
+      "id": "COV44",
+      "item": "主Agent维护公共索引，临时目录任务隔离",
+      "section": "workspace"
+    },
+    {
+      "id": "COV45",
+      "item": "知识获取区分资料/推导/实测/选择缺口",
+      "section": "m05"
+    },
+    {
+      "id": "COV46",
+      "item": "有限概览与定点检索、术语与引文迭代",
+      "section": "m05"
+    },
+    {
+      "id": "COV47",
+      "item": "获取允许初筛阅读，不能自动采用结论",
+      "section": "m05"
+    },
+    {
+      "id": "COV48",
+      "item": "来源版本附件核对、合法获取与缺失披露",
+      "section": "m05"
+    },
+    {
+      "id": "COV49",
+      "item": "按需求覆盖/剩余缺口/资源边界结束，非固定篇数",
+      "section": "m05"
+    },
+    {
+      "id": "COV50",
+      "item": "阅读先忠实材料，后项目适用性判断",
+      "section": "m06"
+    },
+    {
+      "id": "COV51",
+      "item": "读必要上下文，不固定跳章节，不同证据类型适配",
+      "section": "m06"
+    },
+    {
+      "id": "COV52",
+      "item": "关键拟用条目回原文，不全量卡片机械审计",
+      "section": "m06"
+    },
+    {
+      "id": "COV53",
+      "item": "冲突先对齐条件，不自动平均或min/max合法化",
+      "section": "m06"
+    },
+    {
+      "id": "COV54",
+      "item": "阅读后按需复用M02/M03/M04不另建文献版",
+      "section": "m06"
+    },
+    {
+      "id": "COV55",
+      "item": "目标式委托，主Agent内部形成方案和必要检查",
+      "section": "m07"
+    },
+    {
+      "id": "COV56",
+      "item": "近期具体远期可调，执行不等于编程",
+      "section": "m07"
+    },
+    {
+      "id": "COV57",
+      "item": "一般故障内部闭环，结构问题不能只调参数",
+      "section": "m07"
+    },
+    {
+      "id": "COV58",
+      "item": "实际配置生效、固定版本运行与真实回执",
+      "section": "m07"
+    },
+    {
+      "id": "COV59",
+      "item": "目标基准来自原始要求，不能添加成功标准",
+      "section": "goals"
+    },
+    {
+      "id": "COV60",
+      "item": "转换等价/子目标/代理/授权变更与双向追溯",
+      "section": "goals"
+    },
+    {
+      "id": "COV61",
+      "item": "目标不等于判据，预期答案可被否定",
+      "section": "goals"
+    },
+    {
+      "id": "COV62",
+      "item": "论证从前提到证据到表述，检查图外遗漏",
+      "section": "goals"
+    },
+    {
+      "id": "COV63",
+      "item": "演绎/经验支持和验证/现实适配分开",
+      "section": "m08"
+    },
+    {
+      "id": "COV64",
+      "item": "成果自查与外审不同于逐任务检查",
+      "section": "m08"
+    },
+    {
+      "id": "COV65",
+      "item": "审查固定版本清单、真实材料与工具范围",
+      "section": "m08"
+    },
+    {
+      "id": "COV66",
+      "item": "不一律删IO/清洗/绘图，判断是否影响结论",
+      "section": "m08"
+    },
+    {
+      "id": "COV67",
+      "item": "评审意见定位依据影响，问题成立和严重度分开",
+      "section": "m08"
+    },
+    {
+      "id": "COV68",
+      "item": "复审按影响范围，旧审查不覆盖新版",
+      "section": "m08"
+    },
+    {
+      "id": "COV69",
+      "item": "交付按接收者用途，不默认论文/压包",
+      "section": "m09"
+    },
+    {
+      "id": "COV70",
+      "item": "说明主线与细节、真实历史贡献与理解程度",
+      "section": "m09"
+    },
+    {
+      "id": "COV71",
+      "item": "指定版本交付，改动按科学/路径/表述分类",
+      "section": "m09"
+    },
+    {
+      "id": "COV72",
+      "item": "交付独立副本复核，区别画图分析完整复算现实实验",
+      "section": "m09"
+    },
+    {
+      "id": "COV73",
+      "item": "研究与交付状态分开，恢复入口和运行任务真实",
+      "section": "m09"
+    },
+    {
+      "id": "COV74",
+      "item": "未经授权不公开投稿或启动下一目标",
+      "section": "m09"
+    },
+    {
+      "id": "COV75",
+      "item": "未知异常不自动升级合并扩权，只限受影响范围",
+      "section": "returns"
+    },
+    {
+      "id": "COV76",
+      "item": "汇编是设计基线不是已运行系统或效果证明",
+      "section": "audit"
+    }
+  ],
+  "acceptance_scenarios": [
+    {
+      "id": "T01",
+      "case": "初始认识任务可见原题和旧知识目录",
+      "expected": "只供原题及必要原始信息；不得经摘要/索引泄露旧解题认识",
+      "section": "m01",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T02",
+      "case": "只提供外部质询中的错误前提",
+      "expected": "不自动登记为执行Agent自己接受过的C",
+      "section": "m03",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T03",
+      "case": "外部题要求一个实际上未必存在的方向反转",
+      "expected": "允许有理由的不反转或条件不足；检查出题前提",
+      "section": "m03",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T04",
+      "case": "独立初始认识和候选判据之间没有新资料",
+      "expected": "保持两次交互；不自动合并或开始外部检索",
+      "section": "m02",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T05",
+      "case": "只下载到摘要或缺页PDF",
+      "expected": "显示实际范围，不生成全文核验/完整阅读声明",
+      "section": "m05",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T06",
+      "case": "一个来源有多个版本/镜像/转述",
+      "expected": "关联来源不重复计数独立证据；版本不覆盖",
+      "section": "workspace",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T07",
+      "case": "搜索词只含主Agent当前选定方法",
+      "expected": "回到原对象拓展必要表达，不把现有假设变筛选硬规则",
+      "section": "m05",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T08",
+      "case": "缺当前实验数据或新的数学证明",
+      "expected": "搜索可找帮助，但不以别处结果替代；交接剩余任务",
+      "section": "m05",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T09",
+      "case": "额度耗尽但仍有未搜索范围",
+      "expected": "记中断/资源边界而不是材料覆盖完整",
+      "section": "m05",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T10",
+      "case": "材料中含预期结论或行为指令",
+      "expected": "阅读忠实保存，不能修改权限或项目规则",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T11",
+      "case": "阅读卡自洽但将条件性结果写为无条件",
+      "expected": "回原文核对并修订，不能以自洽通过",
+      "section": "m06",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T12",
+      "case": "两个文献数值不同",
+      "expected": "先对齐定义条件；不自动平均或以区间作硬门槛",
+      "section": "m06",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T13",
+      "case": "两条相似文字的量词/对象定义不同",
+      "expected": "不自动合并",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T14",
+      "case": "J需要A与B共同成立而只有A被确认",
+      "expected": "不把A作为充分依据，保留缺失前提",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T15",
+      "case": "H不适用于对象，但H⇒C仍有正确证明",
+      "expected": "暂停应用而非撤回条件命题",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T16",
+      "case": "反证中的临时¬P被排除",
+      "expected": "不把正确证明P因前提被拒绝而撤回",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T17",
+      "case": "一条支持路线失效但另一条仍成立",
+      "expected": "重审依赖路线，不机械判结论为假",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T18",
+      "case": "出现一条无根据的外部反对",
+      "expected": "保存并判断，不撤回全图",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T19",
+      "case": "Q因重复/不属范围/搁置关闭",
+      "expected": "不升级C科学可信状态",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T20",
+      "case": "历史D准许采用，关键依据随后失效",
+      "expected": "当前可用性反映新限制，历史决定不重写",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T21",
+      "case": "X包含明显不相容条件",
+      "expected": "标情境问题，不将空泛条件推论当实际成果",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T22",
+      "case": "共享定义单位或聚合口径改变",
+      "expected": "核对映射与受影响结果，不直接混用",
+      "section": "goals",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T23",
+      "case": "一次有效反例、一次运行失败、一次未运行",
+      "expected": "保持三个不同科学含义及状态",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T24",
+      "case": "同数据、不同报告/模型评论一致",
+      "expected": "不误算成多组独立数据",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T25",
+      "case": "判据在看到结果后修订",
+      "expected": "保留原始结果旧评价和修改依据，重评不混分",
+      "section": "m02",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T26",
+      "case": "上游确认失效、下游复算尚未完成",
+      "expected": "限制随上游变更生效，不存在无提示可用窗口",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T27",
+      "case": "紧急停用登记后完整发布失败",
+      "expected": "停用继续有效，旧快照不能恢复默认使用",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T28",
+      "case": "两Agent改不同对象但关系上互相冲突",
+      "expected": "串行合入重查当前依赖与相关新增对象",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T29",
+      "case": "C文本未变但新增重要Q",
+      "expected": "依赖C的待合入采用决定重新检查",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T30",
+      "case": "同一完成通知重复或发送超时",
+      "expected": "用操作/尝试身份核对，不新增虚构执行次数",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T31",
+      "case": "某次执行是否成功无法确认",
+      "expected": "保留结果未知，不盲目重复有外部后果操作",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T32",
+      "case": "发布在任一步中断",
+      "expected": "只供上一完整状态或明确拒绝不完整状态；保留已生效限制",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T33",
+      "case": "图版本固定但E所指latest被覆盖",
+      "expected": "发现内容不一致，不能冒充旧证据",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T34",
+      "case": "旧分支成果提交时当前主线已变",
+      "expected": "检查实际依赖影响；无影响可合入，有影响重审",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T35",
+      "case": "当前回退至旧内容",
+      "expected": "不撤销现已知限制和真实外部后果",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T36",
+      "case": "来源暂无法访问、损坏或作者撤回",
+      "expected": "分别处理可得性、完整性和内容可靠性",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T37",
+      "case": "规范升级含未知类型/字段",
+      "expected": "显式迁移或拒绝解释，不静默删除信息",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T38",
+      "case": "局部知识包容不下结论和条件",
+      "expected": "缩小/分批/标未完整，不只给裸结论",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T39",
+      "case": "缓存与当前库版本不一致",
+      "expected": "说明版本并按用途更新，不冒充当前",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T40",
+      "case": "Agent已经读过被撤回旧认识",
+      "expected": "关键动作和验收前重查，不假定自动遗忘",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T41",
+      "case": "图中没记录某内容或权限不允许看",
+      "expected": "不把未记录/未可见推成不存在",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T42",
+      "case": "影响图过大或存在隐含依赖",
+      "expected": "报告已检查范围并补必要直接审查，不伪报无影响",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T43",
+      "case": "索引损坏或丢失",
+      "expected": "从权威记录重建并核对；失败明确降级",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T44",
+      "case": "需要删除敏感内容或撤销访问",
+      "expected": "处理正文缓存索引视图与可分享限制，注明不能完整重放",
+      "section": "graph",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T45",
+      "case": "用户要所有位置达标，代码判断平均达标",
+      "expected": "认定输出口径不等价，不能以程序运行正常通过目标核验",
+      "section": "goals",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T46",
+      "case": "只完成特例或获得反例",
+      "expected": "按与原目标的关系报告阶段成果，不冒充全面完成",
+      "section": "m08",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T47",
+      "case": "图上支持完整但实际代码/推导使用未记录假设",
+      "expected": "从原始产物查漏并补相应依赖和论证",
+      "section": "m08",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T48",
+      "case": "测试存在但被跳过仍显示成功",
+      "expected": "记录未执行并核查检查器，不把输出标志当证据",
+      "section": "m08",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T49",
+      "case": "交付删除或搬迁后原本运行通过",
+      "expected": "在实际交付副本重查路径依赖和必要运行",
+      "section": "m09",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T50",
+      "case": "只重画图或重跑分析",
+      "expected": "不称完整复算或重新实施实验",
+      "section": "m09",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T51",
+      "case": "交付准备好但没有发送授权",
+      "expected": "不公开、投稿或自动发送",
+      "section": "m09",
+      "execution_status": "not_run"
+    },
+    {
+      "id": "T52",
+      "case": "本轮结束时仍有实际运行任务",
+      "expected": "如实安全处理或报告继续状态，不能伪称已停",
+      "section": "m09",
+      "execution_status": "not_run"
+    }
+  ]
+}
