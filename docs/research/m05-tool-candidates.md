@@ -6,7 +6,7 @@
 
 检索范围是全网络，包括论文、论坛、社区及其他与研究问题有关的公开来源。用户已授权资料获取；不得购买付费资料。遇到付费墙或不可直接取得的版本时，应自动寻找作者稿、预印本、机构知识库或其他合法可用版本，并如实记录版本与来源。
 
-用户自研工具仍在研发。本文列出的现成工具均保持可替换，不代表完整覆盖，也不代表已经采用。
+用户自研工具仍在研发。2026-09-20 用户决定先用现成项目：其推荐的 browser-use 与本文候选表中的 Crawl4AI 已接入 harness 的 M05（见 `docs/implementation/design.md`），Playwright 作为二者底层随之安装。Docling 与 SearXNG 曾按候选表接入，用户明确不在本地运行模型、也不用 Docker 后均已移除：PDF 改为 poppler 文本层加按页渲染图像交给多模态模型；检索改为 OpenAlex、arXiv、Hacker News、Stack Exchange、Reddit、GitHub 的公开接口加 DuckDuckGo 公开 HTML，另可选 Brave Search API 密钥。以上都通过 `AcquisitionBackend` 接口保持可替换。
 
 ## browser-use web-ui
 

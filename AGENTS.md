@@ -36,9 +36,10 @@
 
 ## Current implementation boundary
 
-- Study how Pi can carry the workflow's existing rules before proposing implementation architecture.
-- Extension, SDK, model routing, workflow-improvement loops, and the degree of self-improvement remain later decisions pending research and user choice.
-- No runtime implementation is authorized in the current organization and research phase.
+- On 2026-09-20 the user authorised implementation of the research harness after the alignment pass. The implementation lives in `src/` (TypeScript on the local Pi 0.85.1 SDK), with tests in `test/` and the design record in `docs/implementation/design.md`.
+- Scope of the current implementation: workspace init, M01–M06 session orchestration with real input isolation, the C/K/E/J/Q/D/X knowledge store with a single serial merge entry, and a CLI. M05 uses browser-use (user-recommended) and Crawl4AI plus public HTTP search endpoints (OpenAlex, arXiv, Hacker News, Stack Exchange, Reddit, GitHub, DuckDuckGo HTML, optional Brave API key), behind the replaceable `AcquisitionBackend` interface; PDFs are handled with poppler only (text layer plus on-demand page images for multimodal models). The user does not want local ML models or Docker: do not add Docling, OCR models, SearXNG containers or similar local services. The Python stack lives in `.venv/` (ignored) and is installed by `scripts/setup-tools.sh`. M07 Pi-side packaging, M08/M09, model routing defaults, workflow-improvement loops and the degree of self-improvement remain undecided or unimplemented; do not add them without a user decision.
+- The harness never chooses a model: every role's model comes from the workspace `research.config.json`.
+- Tests must not call real models or the network. Dependencies resolve through `node_modules/` symlinks into `third_party/pi` (ignored by Git); do not run `npm install` against the network without the user's request.
 
 ## Git and release
 

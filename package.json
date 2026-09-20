@@ -1,0 +1,19 @@
+{
+  "name": "pre-rsi-research-harness",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Controller that carries the user's research workflow v1.0 (current alignment) on the Pi agent harness 0.85.1.",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 'test/**/*.test.ts'",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "harness": "node src/cli.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "0.85.1",
+    "@earendil-works/pi-coding-agent": "0.85.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0"
+  }
+}

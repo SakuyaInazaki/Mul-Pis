@@ -26,3 +26,12 @@ build/
 coverage/
 *.log
 *.tmp
+
+# Trial research workspaces created next to the repository
+workspaces/
+
+# Python tool environment for M05 (Crawl4AI, browser-use)
+.venv/
+.venv-tools.json
+__pycache__/
+*.pyc
