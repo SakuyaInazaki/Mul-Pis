@@ -10,12 +10,17 @@
  *   m02 [--m01 <runId>]          候选判据首次准备（与 M01 相同模型的新会话）
  *   m03 [--m01 <runId>] [--m02 <runId>]
  *                                自动跨会话质询：评审出题 → M01 原会话作答 → 同一评审会话评价
- *   m04 --from M03|M06 [--run <runId>] | --feedback <file> [--label <text>] [--fresh]
+ *   m04 --from M03|M06|M07|M08 [--run <runId>] | --feedback <file> [--label <text>] [--fresh]
  *                                纠错与知识状态更新（首轮续接 M01，其后新建研究会话）
  *   m05 [--goal <text> | --goal-file <file>] [--no-browser]
  *                                外部知识获取：检索、开放版本、抓取、下载、PDF 提取、初筛、登记来源
  *   m06 [--source S001 ...] [--full-text] [--requirements <file>]
  *                                每份资料三会话组；整批汇总后交 M04
+ *   m08 --materials <json> --self-checks <json> --reviewers <json> [--process-feedback]
+ *                                固定成果版本，完成独立自查与同版本外审；可显式整批转交 M04
+ *   m09 --m08 <runId> --m04 <runId> --recipient <text> --purpose <text>
+ *       --delivery-scope <json> --reproduction <json> [--closure-requested]
+ *                                在严格配对的 M08/M04 版本上解释、复核交付副本并记录收口
  *   status                       runs, snapshot, limits
  *   knowledge pack --purpose <text> [--ids C001,K002] [--terms a,b]
  *   knowledge views              regenerate derived views
@@ -37,6 +42,8 @@ import { runM03 } from "./stages/m03.ts";
 import { runM04, type M04Feedback } from "./stages/m04.ts";
 import { runM05 } from "./stages/m05.ts";
 import { runM06 } from "./stages/m06.ts";
+import { runM08, type M08Options } from "./stages/m08.ts";
+import { runM09, type M09Options } from "./stages/m09.ts";
 import { HarnessError } from "./types.ts";
 import { Workspace } from "./workspace.ts";
 
@@ -89,7 +96,14 @@ async function makeRunner(kind: string): Promise<SessionRunner> {
 }
 
 function usage(): string {
-	return `用法：node src/cli.ts <init|m01|m02|m03|m04|m05|m06|status|knowledge> [选项]\n  --workspace <dir>   工作区（默认当前目录）\n  --runner pi|fake    会话运行器（默认 pi）\n详见 src/cli.ts 顶部说明。`;
+	return `用法：node src/cli.ts <init|m01|m02|m03|m04|m05|m06|m08|m09|status|knowledge> [选项]\n  --workspace <dir>   工作区（默认当前目录）\n  --runner pi|fake    会话运行器（默认 pi）\n  m08 的 materials/self-checks/reviewers 是显式 JSON 文件\n  m09 的 delivery-scope/reproduction 是显式 JSON 文件；instructions 是预授权的精确 shell 命令，read-only 时应为空；不会自动发布\n详见 src/cli.ts 顶部说明。`;
+}
+
+async function jsonFile<T>(args: ParsedArgs, name: string): Promise<T> {
+	const file = flag(args, name);
+	if (!file) throw new HarnessError("cli.input", `缺少 --${name} <json>`);
+	try { return JSON.parse(await readFile(path.resolve(file), "utf8")) as T; }
+	catch (error) { throw new HarnessError("cli.input", `无法读取 --${name}：${(error as Error).message}`); }
 }
 
 export async function main(argv: string[]): Promise<number> {
@@ -110,6 +124,18 @@ export async function main(argv: string[]): Promise<number> {
 		if (result.configMissing) {
 			console.log(`\n缺少 ${path.basename(ws.configFile)}。请按下面模板创建并填入你选择的模型（harness 不预设模型）：\n${CONFIG_TEMPLATE}`);
 		}
+		return 0;
+	}
+	if (command === "status") {
+		const snapshot = await store.current();
+		const limits = (await store.limits()).filter((l) => !l.liftedAt);
+		console.log(`工作区：${ws.root}\n知识快照：${snapshot?.id ?? "无"}（记录 ${snapshot?.records.length ?? 0} 条）\n生效限制：${limits.length}`);
+		for (const stage of ["M01", "M02", "M03", "M04", "M05", "M06", "M07", "M08", "M09"]) {
+			const runs = await ws.listRuns(stage);
+			const latest = runs.length ? await ws.readRun(stage, runs[runs.length - 1]) : undefined;
+			console.log(`${stage}：${runs.length} 次${latest ? `，最近 ${latest.runId} ${latest.status}` : ""}`);
+		}
+		console.log("限制：running 状态不会自动重跑；M08 completed 不等于科研通过；M09 不发布或关闭 Pi，full-recomputation 请求不等于已完整复现。");
 		return 0;
 	}
 
@@ -138,9 +164,9 @@ export async function main(argv: string[]): Promise<number> {
 			let feedback: M04Feedback;
 			const from = flag(args, "from");
 			const file = flag(args, "feedback");
-			if (from === "M03" || from === "M06") feedback = { kind: from, runId: flag(args, "run") };
+			if (from === "M03" || from === "M06" || from === "M07" || from === "M08") feedback = { kind: from, runId: flag(args, "run") };
 			else if (file) feedback = { kind: "file", label: flag(args, "label") ?? path.basename(file), path: path.resolve(file) };
-			else throw new HarnessError("cli.m04", "m04 需要 --from M03|M06 或 --feedback <file>");
+			else throw new HarnessError("cli.m04", "m04 需要 --from M03|M06|M07|M08 或 --feedback <file>");
 			const r = await runM04(ctx, { feedback, freshSession: has(args, "fresh") });
 			console.log(`M04 完成：运行 ${r.record.runId}（${r.mode}）${r.snapshotId ? `，已合入快照 ${r.snapshotId}` : "，无知识变化入库"}`);
 			printFailures(r.record.failures);
@@ -162,15 +188,36 @@ export async function main(argv: string[]): Promise<number> {
 			printFailures(r.record.failures);
 			return 0;
 		}
-		case "status": {
-			const snapshot = await store.current();
-			const limits = (await store.limits()).filter((l) => !l.liftedAt);
-			console.log(`工作区：${ws.root}\n知识快照：${snapshot?.id ?? "无"}（记录 ${snapshot?.records.length ?? 0} 条）\n生效限制：${limits.length}`);
-			for (const stage of ["M01", "M02", "M03", "M04", "M05", "M06"]) {
-				const runs = await ws.listRuns(stage);
-				const latest = runs.length ? await ws.readRun(stage, runs[runs.length - 1]) : undefined;
-				console.log(`${stage}：${runs.length} 次${latest ? `，最近 ${latest.runId} ${latest.status}` : ""}`);
+		case "m08": {
+			const materials = await jsonFile<M08Options["materials"]>(args, "materials");
+			const selfChecks = await jsonFile<M08Options["selfChecks"]>(args, "self-checks");
+			const reviewers = await jsonFile<M08Options["reviewers"]>(args, "reviewers");
+			const r = await runM08(ctx, {
+				materials, selfChecks, reviewers,
+				unprovidedScopes: flag(args, "unprovided-scopes") ? await jsonFile<string[]>(args, "unprovided-scopes") : undefined,
+				previousRunId: flag(args, "previous"), changeSummary: flag(args, "change-summary"), affectedScope: flag(args, "affected-scope"),
+			});
+			console.log(`M08 已结束：运行 ${r.record.runId}，状态 ${r.record.status}\n固定材料：${r.manifest.entries.length} 项\n审查反馈：${r.bundlePath ?? "未生成"}`);
+			printFailures(r.record.failures);
+			if (has(args, "process-feedback")) {
+				if (r.record.status !== "completed" || !r.bundlePath) throw new HarnessError("m08.feedback", "M08 审查批次未完整完成，不能转交 M04");
+				const feedback = await runM04(ctx, { feedback: { kind: "M08", runId: r.record.runId }, freshSession: true });
+				console.log(`M08 已整批转交 M04：运行 ${feedback.record.runId}；转交不等于审查通过`);
+				printFailures(feedback.record.failures);
 			}
+			return 0;
+		}
+		case "m09": {
+			const m08RunId = flag(args, "m08"), m04RunId = flag(args, "m04"), recipient = flag(args, "recipient"), purpose = flag(args, "purpose");
+			if (!m08RunId || !m04RunId || !recipient || !purpose) throw new HarnessError("cli.m09", "m09 需要 --m08、--m04、--recipient 与 --purpose");
+			const r = await runM09(ctx, {
+				m08RunId, m04RunId, recipient, purpose,
+				deliveryScope: await jsonFile<M09Options["deliveryScope"]>(args, "delivery-scope"),
+				reproduction: await jsonFile<M09Options["reproduction"]>(args, "reproduction"),
+				closureRequested: has(args, "closure-requested"),
+			});
+			console.log(`M09 已结束：运行 ${r.record.runId}，状态 ${r.record.status}\n收口回执：${r.record.outputs.find((o) => o.label === "M09 收口回执")?.path ?? "未生成"}\n未执行发布、投稿、外发或下一目标启动；完整复算请求不等于已完整复现。`);
+			printFailures(r.record.failures);
 			return 0;
 		}
 		case "knowledge": {

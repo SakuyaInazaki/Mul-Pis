@@ -1,6 +1,7 @@
 import { Type } from "@earendil-works/pi-ai";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import path from "node:path";
 import { loadPrompt } from "../prompts.ts";
 import { ResearchService, type StageRequest } from "./service.ts";
 
@@ -31,6 +32,38 @@ function compact(value: unknown): Record<string, unknown> {
 		limitations: item.limitations,
 	};
 	const record = item.record as Record<string, unknown> | undefined;
+	if (record?.stage === "M08") {
+		const member = (entry: unknown) => {
+			const value = entry as Record<string, unknown>;
+			return { id: value.id, role: value.role, status: value.status, failure: value.failure, coverage: value.coverage };
+		};
+		return {
+			stage: record.stage, runId: record.runId, status: record.status,
+			selfChecks: Array.isArray(item.selfChecks) ? item.selfChecks.map(member) : [],
+			reviews: Array.isArray(item.reviews) ? item.reviews.map(member) : [],
+			bundlePath: item.bundlePath, outputs: record.outputs, failures: record.failures,
+			...(item.feedback ? { feedback: compact(item.feedback) } : {}),
+		};
+	}
+	if (record?.stage === "M09") {
+		const closure = item.closure as Record<string, unknown> | undefined;
+		const reproduction = closure?.reproduction as Record<string, unknown> | undefined;
+		return {
+			stage: record.stage, runId: record.runId, status: record.status, outputs: record.outputs, failures: record.failures,
+			closure: closure ? {
+				status: closure.status, closureRequested: closure.closureRequested, researchCompletion: closure.researchCompletion,
+				deliveryStatus: closure.deliveryStatus, version: closure.version, recipient: closure.recipient, purpose: closure.purpose,
+				deliveryScope: closure.deliveryScope, reproduction: reproduction ? {
+					mode: reproduction.mode, status: reproduction.status, authorizedExecution: reproduction.authorizedExecution,
+					actualToolCalls: reproduction.actualToolCalls, interpretation: reproduction.interpretation,
+					instructionCount: Array.isArray(reproduction.instructions) ? reproduction.instructions.length : undefined,
+					pdfPages: reproduction.pdfPages,
+				} : undefined, limitations: closure.limitations,
+				recoveryEntry: closure.recoveryEntry, runningTasks: closure.runningTasks, automaticActionsNotTaken: closure.automaticActionsNotTaken,
+				artifacts: closure.artifacts,
+			} : undefined,
+		};
+	}
 	if (record) return {
 		stage: record.stage, runId: record.runId, status: record.status, outputs: record.outputs,
 		failures: record.failures, remarks: record.remarks,
@@ -42,6 +75,10 @@ function compact(value: unknown): Record<string, unknown> {
 
 function strings(value: unknown): string[] | undefined {
 	return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : undefined;
+}
+
+function workspaceFrom(value: string | undefined, cwd: string): string {
+	return value ? path.resolve(cwd, value) : cwd;
 }
 
 export interface ResearchExtensionOptions {
@@ -64,19 +101,19 @@ export function createResearchExtension(options: ResearchExtensionOptions = {}) 
 			if (!researchActive || activePiCwd !== ctx.cwd) return;
 			const p07 = await loadPrompt("P07");
 			return {
-				systemPrompt: `${event.systemPrompt}\n\n${p07}\n\n当前执行边界：通过 research_status 查看事实状态；阶段会话彼此按现有 M01–M06 规则隔离；M04 的科学判断留在研究会话。任务返回、外部意见和阶段完成都不自动等于通过或采用。`,
+				systemPrompt: `${event.systemPrompt}\n\n${p07}\n\n当前执行边界：通过 research_status 查看事实状态；阶段会话彼此按现有 M01–M09 规则隔离；M04 的科学判断留在研究会话。任务返回、外部意见和阶段完成都不自动等于通过或采用。M09 不执行发布或启动下一目标。`,
 			};
 		});
 
 		pi.registerTool({
 			name: "research_status",
 			label: "Research Status",
-			description: "Read the persisted M01–M07 research status for a workspace without starting or retrying work.",
+			description: "Read the persisted M01–M09 research status for a workspace without starting or retrying work.",
 			promptSnippet: "Inspect persisted research workflow status without rerunning tasks",
 			promptGuidelines: ["Use research_status before deciding which research stage or M07 action is needed."],
 			parameters: Type.Object({ workspace: Type.Optional(Type.String({ description: "Research workspace; defaults to the current Pi cwd" })) }),
 			executionMode: "sequential",
-			async execute(_id, params, _signal, _update, ctx) { return result(await service.status(params.workspace ?? ctx.cwd)); },
+			async execute(_id, params, _signal, _update, ctx) { return result(await service.status(workspaceFrom(params.workspace, ctx.cwd))); },
 		});
 
 		pi.registerTool({
@@ -87,24 +124,24 @@ export function createResearchExtension(options: ResearchExtensionOptions = {}) 
 			promptGuidelines: ["Use research_init only when the user asked to initialize the selected research workspace."],
 			parameters: Type.Object({ workspace: Type.String({ description: "Explicit research workspace path" }) }),
 			executionMode: "sequential",
-			async execute(_id, params, _signal, _update, ctx) { return result(await service.init(params.workspace ?? ctx.cwd)); },
+			async execute(_id, params, _signal, _update, ctx) { return result(await service.init(workspaceFrom(params.workspace, ctx.cwd))); },
 		});
 
 		pi.registerTool({
 			name: "research_stage",
 			label: "Run Research Stage",
-			description: "Run one existing M01–M06 stage. M03/M06 feedback is transferred to M04 only when processFeedback is explicitly true; incomplete M06 batches are never transferred.",
-			promptSnippet: "Run one isolated M01–M06 workflow stage and optionally transfer complete feedback",
+			description: "Run one existing M01–M06, M08, or M09 stage. M03/M06/M08 feedback is transferred to M04 only when processFeedback is explicitly true and its whole batch completed. M09 requires an exact M08/M04 pair and never publishes.",
+			promptSnippet: "Run one isolated research stage with explicit inputs and optional complete feedback transfer",
 			promptGuidelines: [
 				"Use research_stage only after research_status confirms the requested stage inputs exist.",
 				"Treat research_stage completion and returned opinions as artifacts to inspect, not automatic acceptance.",
 			],
 			parameters: Type.Object({
-				stage: Type.Union([Type.Literal("M01"), Type.Literal("M02"), Type.Literal("M03"), Type.Literal("M04"), Type.Literal("M05"), Type.Literal("M06")]),
+				stage: Type.Union([Type.Literal("M01"), Type.Literal("M02"), Type.Literal("M03"), Type.Literal("M04"), Type.Literal("M05"), Type.Literal("M06"), Type.Literal("M08"), Type.Literal("M09")]),
 				workspace: Type.Optional(Type.String({ description: "Research workspace; defaults to current Pi cwd" })),
 				m01RunId: Type.Optional(Type.String()),
 				m02RunId: Type.Optional(Type.String()),
-				feedbackStage: Type.Optional(Type.Union([Type.Literal("M03"), Type.Literal("M06"), Type.Literal("M07")])),
+				feedbackStage: Type.Optional(Type.Union([Type.Literal("M03"), Type.Literal("M06"), Type.Literal("M07"), Type.Literal("M08")])),
 				feedbackRunId: Type.Optional(Type.String()),
 				feedbackFile: Type.Optional(Type.String()),
 				feedbackLabel: Type.Optional(Type.String()),
@@ -114,13 +151,26 @@ export function createResearchExtension(options: ResearchExtensionOptions = {}) 
 				sources: Type.Optional(Type.Array(Type.String())),
 				fullText: Type.Optional(Type.Boolean()),
 				requirements: Type.Optional(Type.String()),
-				processFeedback: Type.Optional(Type.Boolean({ description: "After a complete M03/M06 result, explicitly transfer it to M04" })),
+				processFeedback: Type.Optional(Type.Boolean({ description: "After a complete M03/M06/M08 result, explicitly transfer it to M04" })),
+				materials: Type.Optional(Type.Array(Type.Object({ label: Type.String(), path: Type.String(), sourceCategory: Type.String(), providedScope: Type.Optional(Type.String()) }))),
+				selfChecks: Type.Optional(Type.Array(Type.Object({ id: Type.String(), instruction: Type.String(), mode: Type.Optional(Type.Union([Type.Literal("read-only"), Type.Literal("execute")])) }))),
+				reviewers: Type.Optional(Type.Array(Type.Object({ id: Type.String(), role: Type.Union([Type.Literal("execution"), Type.Literal("reviewer"), Type.Literal("research"), Type.Literal("reader"), Type.Literal("checker"), Type.Literal("applicability"), Type.Literal("acquisition")]), mode: Type.Optional(Type.Union([Type.Literal("read-only"), Type.Literal("execute")])) }))),
+				unprovidedScopes: Type.Optional(Type.Array(Type.String())), previousRunId: Type.Optional(Type.String()), changeSummary: Type.Optional(Type.String()), affectedScope: Type.Optional(Type.String()),
+				m08RunId: Type.Optional(Type.String()), m04RunId: Type.Optional(Type.String()), recipient: Type.Optional(Type.String()), purpose: Type.Optional(Type.String()),
+				deliveryScope: Type.Optional(Type.Object({ included: Type.Array(Type.String()), excluded: Type.Array(Type.String()), limitations: Type.Array(Type.String()) })),
+					reproduction: Type.Optional(Type.Object({
+					mode: Type.Union([Type.Literal("read-only"), Type.Literal("specified-checks"), Type.Literal("full-recomputation")]),
+					instructions: Type.Array(Type.String({ description: "Exact pre-authorized shell command for one controlled reproduction check; leave empty for read-only mode" })),
+						authorizedExecution: Type.Boolean({ description: "Whether the listed commands may run in the isolated delivery copy; does not grant free-form shell access" }),
+						pdfPages: Type.Optional(Type.Array(Type.Object({ path: Type.String({ description: "Included manifest/delivery relative PDF path" }), pages: Type.Array(Type.Integer({ minimum: 1 })) }))),
+				})),
+				closureRequested: Type.Optional(Type.Boolean({ description: "Record intent to stop the current goal; does not close Pi, publish, or start another goal" })),
 			}),
 			executionMode: "sequential",
 			async execute(_id, params, signal, onUpdate, ctx) {
 				activeUpdate = onUpdate as typeof activeUpdate;
 				try {
-					const value = await service.runStage({ ...params, workspace: params.workspace ?? ctx.cwd, sources: strings(params.sources) } as StageRequest, signal);
+					const value = await service.runStage({ ...params, workspace: workspaceFrom(params.workspace, ctx.cwd), sources: strings(params.sources) } as StageRequest, signal);
 					researchActive = true; activePiCwd = ctx.cwd;
 					return result(value);
 				} finally { activeUpdate = undefined; }
@@ -143,7 +193,7 @@ export function createResearchExtension(options: ResearchExtensionOptions = {}) 
 			}),
 			executionMode: "sequential",
 			async execute(_id, params, signal, _update, ctx) {
-				const workspace = params.workspace ?? ctx.cwd;
+				const workspace = workspaceFrom(params.workspace, ctx.cwd);
 				if (params.action === "status") {
 					if (!params.runId) throw new Error("research_goal status requires runId");
 					return result(await service.goalStatus(params.runId, workspace));
@@ -174,7 +224,7 @@ export function createResearchExtension(options: ResearchExtensionOptions = {}) 
 			executionMode: "sequential",
 			async execute(_id, params, signal, onUpdate, ctx) {
 				activeUpdate = onUpdate as typeof activeUpdate;
-				try { const { workspace, runId, ...task } = params; const value = await service.delegate(runId, task, workspace ?? ctx.cwd, signal); researchActive = true; activePiCwd = ctx.cwd; return result(value); }
+				try { const { workspace, runId, ...task } = params; const value = await service.delegate(runId, task, workspaceFrom(workspace, ctx.cwd), signal); researchActive = true; activePiCwd = ctx.cwd; return result(value); }
 				finally { activeUpdate = undefined; }
 			},
 		});
@@ -193,7 +243,7 @@ export function createResearchExtension(options: ResearchExtensionOptions = {}) 
 			}),
 			executionMode: "sequential",
 			async execute(_id, params, signal, _update, ctx) {
-				const value = await service.review(params.runId, { taskId: params.taskId, checks: params.checks, artifacts: params.artifacts, failures: params.failures, unexecuted: params.unexecuted, limitations: params.limitations, ...(params.independentCheckTaskId && params.independentCheckReport && params.independentCheckDisposition ? { independentCheck: { taskId: params.independentCheckTaskId, report: params.independentCheckReport, disposition: params.independentCheckDisposition } } : {}) }, params.workspace ?? ctx.cwd, signal);
+				const value = await service.review(params.runId, { taskId: params.taskId, checks: params.checks, artifacts: params.artifacts, failures: params.failures, unexecuted: params.unexecuted, limitations: params.limitations, ...(params.independentCheckTaskId && params.independentCheckReport && params.independentCheckDisposition ? { independentCheck: { taskId: params.independentCheckTaskId, report: params.independentCheckReport, disposition: params.independentCheckDisposition } } : {}) }, workspaceFrom(params.workspace, ctx.cwd), signal);
 				researchActive = true; activePiCwd = ctx.cwd;
 				return result(value);
 			},
@@ -212,7 +262,7 @@ export function createResearchExtension(options: ResearchExtensionOptions = {}) 
 					ctx.ui.notify("未知子命令；使用 /research help", "error");
 					return;
 				}
-				const status = await service.status(rest.length ? rest.join(" ") : ctx.cwd);
+				const status = await service.status(workspaceFrom(rest.length ? rest.join(" ") : undefined, ctx.cwd));
 				ctx.ui.notify(JSON.stringify(status, null, 2), "info");
 			},
 		});

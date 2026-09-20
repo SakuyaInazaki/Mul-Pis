@@ -13,11 +13,13 @@ import { runM03 } from "../stages/m03.ts";
 import { runM04 } from "../stages/m04.ts";
 import { runM05 } from "../stages/m05.ts";
 import { runM06 } from "../stages/m06.ts";
+import { runM08, type M08Options } from "../stages/m08.ts";
+import { runM09, type M09Options } from "../stages/m09.ts";
 import type { StageContext } from "../stages/context.ts";
 import { HarnessError, type StageRunRecord } from "../types.ts";
 import { Workspace } from "../workspace.ts";
 
-export type ResearchStage = "M01" | "M02" | "M03" | "M04" | "M05" | "M06" | "M07";
+export type ResearchStage = "M01" | "M02" | "M03" | "M04" | "M05" | "M06" | "M07" | "M08" | "M09";
 export type RunnableStage = Exclude<ResearchStage, "M07">;
 
 export interface ResearchProgress {
@@ -42,7 +44,7 @@ export interface StageRequest {
 	workspace?: string;
 	m01RunId?: string;
 	m02RunId?: string;
-	feedbackStage?: "M03" | "M06" | "M07";
+	feedbackStage?: "M03" | "M06" | "M07" | "M08";
 	feedbackRunId?: string;
 	feedbackFile?: string;
 	feedbackLabel?: string;
@@ -53,6 +55,20 @@ export interface StageRequest {
 	fullText?: boolean;
 	requirements?: string;
 	processFeedback?: boolean;
+	materials?: M08Options["materials"];
+	selfChecks?: M08Options["selfChecks"];
+	reviewers?: M08Options["reviewers"];
+	unprovidedScopes?: string[];
+	previousRunId?: string;
+	changeSummary?: string;
+	affectedScope?: string;
+	m08RunId?: string;
+	m04RunId?: string;
+	recipient?: string;
+	purpose?: string;
+	deliveryScope?: M09Options["deliveryScope"];
+	reproduction?: M09Options["reproduction"];
+	closureRequested?: boolean;
 }
 
 export interface ResearchServiceOptions {
@@ -126,7 +142,7 @@ export class ResearchService {
 		const ws = new Workspace(root);
 		const store = createFileKnowledgeStore(ws.knowledgeDir);
 		const stages = {} as ResearchStatus["stages"];
-		for (const stage of ["M01", "M02", "M03", "M04", "M05", "M06", "M07"] as const) {
+		for (const stage of ["M01", "M02", "M03", "M04", "M05", "M06", "M07", "M08", "M09"] as const) {
 			const ids = await ws.listRuns(stage);
 			const latest = ids.length ? await ws.readRun(stage, ids.at(-1)!) : undefined;
 			stages[stage] = { count: ids.length, ...(latest ? { latest: summarizeRun(latest) } : {}) };
@@ -140,7 +156,12 @@ export class ResearchService {
 			knowledgeSnapshot: snapshot?.id,
 			activeLimits: limits.length,
 			stages,
-			limitations: ["断线或进程退出后的 running 任务不会自动重跑。", "取消会传给 Pi 会话；并非所有外部 HTTP 后端都支持即时取消。"],
+			limitations: [
+				"断线或进程退出后的 running 任务不会自动重跑。",
+				"取消会传给 Pi 会话；并非所有外部 HTTP 后端都支持即时取消。",
+				"M08 completed 只表示整批成员均已返回，不表示科研结论通过或被 M04 采用。",
+				"M09 不发布、不关闭 Pi，也不把 full-recomputation 请求表述为已完整复现。",
+			],
 		};
 	}
 
@@ -174,6 +195,27 @@ export class ResearchService {
 						throw new HarnessError("m07.feedback", "M06 存在失败资料组，整批未转交 M04");
 					}
 					result = request.processFeedback ? { stage, feedback: await runM04(ctx, { feedback: { kind: "M06", runId: stage.record.runId } }) } : stage;
+					break;
+				}
+				case "M08": {
+					const stage = await runM08(ctx, {
+						materials: request.materials ?? [], selfChecks: request.selfChecks ?? [], reviewers: request.reviewers ?? [],
+						unprovidedScopes: request.unprovidedScopes, previousRunId: request.previousRunId,
+						changeSummary: request.changeSummary, affectedScope: request.affectedScope,
+					});
+					if (request.processFeedback && (!stage.bundlePath || stage.record.status !== "completed")) throw new HarnessError("m08.feedback", "M08 审查批次未完整完成，不能转交 M04");
+					result = request.processFeedback ? { stage, feedback: await runM04(ctx, { feedback: { kind: "M08", runId: stage.record.runId }, freshSession: true }) } : stage;
+					break;
+				}
+				case "M09": {
+					if (!request.m08RunId || !request.m04RunId || !request.recipient || !request.purpose || !request.deliveryScope || !request.reproduction) {
+						throw new HarnessError("m09.input", "M09 需要明确 m08RunId、m04RunId、recipient、purpose、deliveryScope 与 reproduction");
+					}
+					result = await runM09(ctx, {
+						m08RunId: request.m08RunId, m04RunId: request.m04RunId, recipient: request.recipient,
+						purpose: request.purpose, deliveryScope: request.deliveryScope, reproduction: request.reproduction,
+						closureRequested: request.closureRequested,
+					});
 					break;
 				}
 			}

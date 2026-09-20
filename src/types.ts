@@ -33,7 +33,7 @@ export interface ModelSpec {
  */
 export interface HarnessConfig {
 	roles: Partial<Record<Role | "default", string>>;
-	/** Maximum number of M06 material groups processed at the same time. Engineering default 1. */
+	/** Maximum number of independent stage tasks processed at the same time. Engineering default 1. */
 	concurrency: number;
 	/** External tool endpoints for M05. Absent entries disable the corresponding provider. */
 	tools: ToolsConfig;

@@ -8,18 +8,23 @@
  * batch is the minimal unit. Proposals are validated structurally and merged
  * through the single serial entry; merging is never a truth certificate.
  */
+import { lstat } from "node:fs/promises";
 import path from "node:path";
 import type { ProposalOp } from "../knowledge/types.ts";
 import { buildM04Message, extractKnowledgeProposals, systemPromptFor } from "../prompts.ts";
+import type { ProblemMaterials } from "../prompts.ts";
 import { HarnessError, type InputRef, type StageRunRecord } from "../types.ts";
 import { readTextIfExists } from "../workspace.ts";
 import { loadProblemMaterials, readOutput, recordSession, relPath, requireCompletedRun, sessionSpec, withRun, type StageContext } from "./context.ts";
 import { specFileFor } from "./m03.ts";
+import { readFrozenArtifactManifest, type FrozenArtifactManifest } from "./artifacts.ts";
+import { renderPageTool } from "../tools/pagetool.ts";
 
 export type M04Feedback =
 	| { kind: "M03"; runId?: string }
 	| { kind: "M06"; runId?: string }
 	| { kind: "M07"; runId?: string }
+	| { kind: "M08"; runId?: string }
 	| { kind: "file"; label: string; path: string };
 
 export interface M04Options {
@@ -43,6 +48,7 @@ interface ResolvedFeedback {
 	text: string;
 	inputs: InputRef[];
 	artifactPaths: string[];
+	m08?: { runId: string; manifest: FrozenArtifactManifest; manifestPath: string };
 }
 
 async function resolveFeedback(ctx: StageContext, feedback: M04Feedback): Promise<ResolvedFeedback> {
@@ -89,6 +95,18 @@ async function resolveFeedback(ctx: StageContext, feedback: M04Feedback): Promis
 			artifactPaths: run.outputs.map((o) => relPath(ctx, o.path)),
 		};
 	}
+	if (feedback.kind === "M08") {
+		const run = await requireCompletedRun(ctx, "M08", feedback.runId);
+		const bundle = await readOutput(run, "M08 审查反馈包");
+		const manifestRef = run.outputs.find((o) => o.label === "固定材料清单");
+		if (!manifestRef) throw new HarnessError("m04.m08", `M08 运行 ${run.runId} 缺少固定材料清单`);
+		const manifest = await readFrozenArtifactManifest(manifestRef.path, { m08RunId: run.runId, rootDir: path.join(ctx.ws.runDir("M08", run.runId), "frozen") });
+		return {
+			label: `M08 完整审查反馈（运行 ${run.runId}）`, text: bundle.text,
+			inputs: [{ label: `M08 审查反馈包（运行 ${run.runId}）`, path: bundle.path }, { label: `M08 固定材料清单（运行 ${run.runId}）`, path: manifestRef.path }, ...run.outputs.filter((o) => /完整报告|实际读取范围|核验工具记录/.test(o.label)).map((o) => ({ label: `M08 ${o.label}`, path: o.path }))],
+			artifactPaths: manifest.entries.map((x) => x.relativePath), m08: { runId: run.runId, manifest, manifestPath: manifestRef.path },
+		};
+	}
 	const text = await readTextIfExists(feedback.path);
 	if (!text) throw new HarnessError("m04.feedback", `找不到意见文件 ${feedback.path}`);
 	return { label: feedback.label, text, inputs: [{ label: feedback.label, path: feedback.path }], artifactPaths: [relPath(ctx, feedback.path)] };
@@ -96,12 +114,26 @@ async function resolveFeedback(ctx: StageContext, feedback: M04Feedback): Promis
 
 export async function runM04(ctx: StageContext, options: M04Options): Promise<M04Result> {
 	const feedback = await resolveFeedback(ctx, options.feedback);
-	const { materials, inputs: problemInputs } = await loadProblemMaterials(ctx.ws);
+	let materials: ProblemMaterials;
+	let problemInputs: InputRef[];
+	if (feedback.m08) {
+		const fixedProblem = feedback.m08.manifest.entries.find((x) => x.sourceCategory === "original-problem");
+		if (!fixedProblem) throw new HarnessError("m04.m08", "M08 固定材料缺少原问题");
+		const fixedProblemText = await readTextIfExists(fixedProblem.frozenPath);
+		if (fixedProblemText === undefined || !fixedProblemText.trim()) throw new HarnessError("m04.m08", "M08 固定原问题缺失或为空");
+		materials = { problem: fixedProblemText, rawInfo: [] };
+		for (const item of feedback.m08.manifest.entries.filter((x) => x.sourceCategory === "raw-input")) {
+			const content = await readTextIfExists(item.frozenPath);
+			if (content === undefined) throw new HarnessError("m04.m08", `M08 固定原始信息缺失：${item.relativePath}`);
+			materials.rawInfo.push({ name: item.label, content });
+		}
+		problemInputs = [{ label: `M08 固定原始问题（运行 ${feedback.m08.runId}）`, path: fixedProblem.frozenPath }, ...feedback.m08.manifest.entries.filter((x) => x.sourceCategory === "raw-input").map((x) => ({ label: x.label, path: x.frozenPath }))];
+	} else ({ materials, inputs: problemInputs } = await loadProblemMaterials(ctx.ws));
 	const snapshot = await ctx.store.current();
 	const previousM04 = await ctx.ws.latestCompletedRun("M04");
 	const m01 = await ctx.ws.latestCompletedRun("M01");
 	const m01Session = m01?.sessions.find((s) => s.label === "M01");
-	const continueM01 = feedback.label.startsWith("M07 ") ? false : !options.freshSession && !previousM04 && !!m01Session?.file;
+	const continueM01 = feedback.label.startsWith("M07 ") || feedback.m08 ? false : !options.freshSession && !previousM04 && !!m01Session?.file;
 	const mode: M04Result["mode"] = continueM01 ? "continue-m01" : "research-session";
 
 	const record = await ctx.ws.startRun("M04", [...problemInputs, ...feedback.inputs], snapshot?.id);
@@ -111,6 +143,7 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 		ctx,
 		record,
 		async () => {
+			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-source.json", JSON.stringify({ m08RunId: feedback.m08.runId, manifestPath: feedback.m08.manifestPath, reviewBundlePath: feedback.inputs[0].path }, null, 2), "M08 处理来源");
 			let knowledgePack: string | undefined;
 			if (mode === "research-session") {
 				const pack = await ctx.store.buildPack({ purpose: options.purpose ?? `M04 处理：${feedback.label}`, includeOpenQuestions: true, types: ["C", "K", "E", "J", "Q", "D", "X"], maxChars: 60_000 });
@@ -121,21 +154,37 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			const message = await buildM04Message({ materials, feedbackLabel: feedback.label, feedback: feedback.text, artifactPaths: feedback.artifactPaths, knowledgePack, includeProblem: mode === "research-session" });
 			await ctx.ws.writeOutput(record, "message.md", message, "发送给研究会话的完整消息");
 
+			const allowedM08Paths = feedback.m08?.manifest.entries.map((x) => x.relativePath) ?? [];
+			const m08DispositionInstruction = feedback.m08 ? `\n\n本轮必须在处理文本末尾输出一个 JSON 代码块，围栏名为 m08-disposition，结构严格为：{\"m08RunId\":\"${feedback.m08.runId}\",\"status\":\"ready|partial|rework|needs_evidence|unresolved\",\"deliverablePaths\":[\"固定材料 relativePath\"],\"limitations\":[\"...\"],\"rationale\":\"非空理由\"}。deliverablePaths 只允许从以下精确相对路径选择：${allowedM08Paths.join("、")}。ready/partial 必须至少选择一项；这是用途处置，不是投票或科学认证；无法判断不得写 ready。` : "";
+			const finalMessage = message + m08DispositionInstruction;
+			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-message.md", finalMessage, "发送给 M04 的固定 M08 消息");
+			const m08RenderedPages: string[] = [];
+			const m08PageTool = feedback.m08 ? renderPageTool({ root: feedback.m08.manifest.rootDir, outputDir: path.join(ctx.ws.runDir("M04", record.runId), "rendered-pages"), tools: ctx.config.tools, onRendered: ({ pdf, page }) => { m08RenderedPages.push(`${path.relative(feedback.m08!.manifest.rootDir, pdf)}#${page}`); } }) : undefined;
 			const handle =
 				mode === "continue-m01" && m01Session?.file
 					? await ctx.runner.resume({ label: "M01", role: "execution", id: m01Session.id, model: m01Session.model, file: m01Session.file, specFile: specFileFor(m01Session.file) })
-					: await ctx.runner.create(sessionSpec(ctx, "M04-research", "research", systemPromptFor("research"), { kind: "none" }));
+					: await ctx.runner.create(sessionSpec(ctx, "M04-research", "research", systemPromptFor("research"), feedback.m08 ? { kind: "read-dir", root: feedback.m08.manifest.rootDir, toolName: "m08_material_read", extraTools: [m08PageTool!] } : { kind: "none" }));
 			let output: string;
+			let m08ReadCoverage: string[] = [];
+			let m08ToolLog: ReturnType<typeof handle.toolLog> = [];
 			try {
 				recordSession(record, handle);
-				const turn = await handle.prompt(message);
+				const turn = await handle.prompt(finalMessage);
 				output = turn.text;
+				m08ReadCoverage = handle.readCoverage();
+				m08ToolLog = handle.toolLog();
 				await ctx.ws.writeOutput(record, "processing.md", output, "处理结果");
 			} finally {
 				handle.dispose();
 			}
+			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-coverage.json", JSON.stringify({ files: m08ReadCoverage, renderedPages: m08RenderedPages, tools: m08ToolLog }, null, 2), "M08 处理实际读取范围");
 
 			const result: M04Result = { record, output, mode };
+			if (feedback.m08) {
+				const disposition = await requireDispositionEvidence(parseM08Disposition(output, feedback.m08), feedback.m08.manifest, m08ReadCoverage, m08RenderedPages);
+				await ctx.ws.writeOutput(record, "m08-disposition.json", JSON.stringify(disposition, null, 2), "M08 用途处置");
+				if (disposition.status === "unresolved") record.failures.push(`M08 处置缺失、非法或缺少实际材料访问依据，已保守记录为 unresolved；不能供 M09 收口。${disposition.limitations.join("；")}`);
+			}
 			const extracted = extractKnowledgeProposals(output);
 			if (extracted.error) {
 				record.failures.push(`知识提案未入库：${extracted.error}`);
@@ -160,4 +209,49 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 		() =>
 			`按 P04 处理“${feedback.label}”。${mode === "continue-m01" ? "续接 M01 原会话" : "新建研究会话并提供局部知识包"}；保存处理结果；如有结构合法的知识提案则经单一串行入口合入并发布快照。意见来源：${feedback.inputs.map((i) => path.basename(i.path)).join("、")}。`,
 	);
+}
+
+interface M08Disposition { m08RunId: string; status: "ready" | "partial" | "rework" | "needs_evidence" | "unresolved"; deliverablePaths: string[]; limitations: string[]; rationale: string }
+
+async function requireDispositionEvidence(disposition: M08Disposition, manifest: FrozenArtifactManifest, readCoverage: string[], renderedPages: string[]): Promise<M08Disposition> {
+	if (disposition.status !== "ready" && disposition.status !== "partial") return disposition;
+	const readPaths = readCoverage.map((item) => path.normalize(item));
+	const renderedPaths = renderedPages.map((item) => path.normalize(item.replace(/#\d+$/, "")));
+	const evidencePaths = [...new Set([...readPaths, ...renderedPaths])];
+	const missing: string[] = [];
+	for (const deliverablePath of disposition.deliverablePaths) {
+		const entry = manifest.entries.find((item) => item.relativePath === deliverablePath)!;
+		const relativePath = path.normalize(entry.relativePath);
+		if (entry.kind === "file") {
+			if (!evidencePaths.includes(relativePath)) missing.push(entry.relativePath);
+			continue;
+		}
+		let foundFile = false;
+		for (const candidate of evidencePaths) {
+			const within = path.relative(relativePath, candidate);
+			if (!within || within.startsWith("..") || path.isAbsolute(within)) continue;
+			const absolute = path.resolve(manifest.rootDir, candidate);
+			try { if ((await lstat(absolute)).isFile()) { foundFile = true; break; } }
+			catch { /* Coverage must resolve to a real frozen file to count. */ }
+		}
+		if (!foundFile) missing.push(entry.relativePath);
+	}
+	if (!missing.length) return disposition;
+	const reason = `M04 未实际读取或渲染待交付材料：${missing.join("、")}`;
+	return { m08RunId: disposition.m08RunId, status: "unresolved", deliverablePaths: [], limitations: [...disposition.limitations, reason], rationale: reason };
+}
+
+function parseM08Disposition(text: string, source: NonNullable<ResolvedFeedback["m08"]>): M08Disposition {
+	const fallback: M08Disposition = { m08RunId: source.runId, status: "unresolved", deliverablePaths: [], limitations: ["M04 未产生有效的 m08-disposition"], rationale: "结构化用途处置缺失或无效" };
+	const match = /```m08-disposition\s*\n([\s\S]*?)```/m.exec(text);
+	if (!match) return fallback;
+	try {
+		const x = JSON.parse(match[1]) as Record<string, unknown>;
+		const statuses = ["ready", "partial", "rework", "needs_evidence", "unresolved"];
+		if (x.m08RunId !== source.runId || !statuses.includes(String(x.status)) || !Array.isArray(x.deliverablePaths) || !x.deliverablePaths.every((p) => typeof p === "string") || !Array.isArray(x.limitations) || !x.limitations.every((p) => typeof p === "string") || typeof x.rationale !== "string" || !x.rationale.trim()) return fallback;
+		const allowed = new Set(source.manifest.entries.map((e) => e.relativePath));
+		if (!(x.deliverablePaths as string[]).every((p) => allowed.has(p))) return fallback;
+		if ((x.status === "ready" || x.status === "partial") && !(x.deliverablePaths as string[]).length) return fallback;
+		return x as unknown as M08Disposition;
+	} catch { return fallback; }
 }

@@ -50,6 +50,10 @@ test("tool workspace defaults to each execute ctx.cwd instead of extension const
 	assert.match(JSON.stringify(output), new RegExp(currentRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 	const explicit = await registered.tools.get("research_status")!.execute("status", { workspace: defaultRoot }, undefined, undefined, toolContext(currentRoot));
 	assert.match(JSON.stringify(explicit), new RegExp(defaultRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+	const child = path.join(currentRoot, "relative-workspace");
+	await mkdir(child);
+	const relative = await registered.tools.get("research_status")!.execute("status", { workspace: "relative-workspace" }, undefined, undefined, toolContext(currentRoot));
+	assert.match(JSON.stringify(relative), new RegExp(child.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
 test("stage tool uses a fresh runner, reports progress, and preserves completion caveat", async () => {
@@ -72,6 +76,54 @@ test("stage tool uses a fresh runner, reports progress, and preserves completion
 	assert.equal(run.status, "completed");
 	assert.ok(updates.some((message) => message.includes("M01：正在创建隔离会话")));
 	assert.ok(updates.some((message) => message.includes("完成不等于科学判断已通过")));
+});
+
+test("research_stage schema invokes the real M08 service path with explicit review inputs", async () => {
+	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-m08-extension-"));
+	await mkdir(path.join(root, "problem", "raw"), { recursive: true });
+	await writeFile(path.join(root, "problem", "problem.md"), "需要审查的原问题\n");
+	const artifact = path.join(root, "result.md");
+	await writeFile(artifact, "实际成果\n");
+	await writeFile(path.join(root, "research.config.json"), `${JSON.stringify({ roles: { reviewer: "fake/reviewer" }, concurrency: 1 })}\n`);
+	const service = new ResearchService({ defaultWorkspace: root, runnerFactory: () => new FakeSessionRunner(() => ({ text: "已按固定材料核验", reads: ["materials/001-成果/result.md"] })) });
+	await service.init(root);
+	const tool = captureExtension(service).tools.get("research_stage")!;
+	const output = await tool.execute("m08", {
+		stage: "M08", materials: [{ label: "成果", path: artifact, sourceCategory: "result", providedScope: "全文" }],
+		selfChecks: [{ id: "scope", instruction: "核对目标与成果", mode: "read-only" }],
+		reviewers: [{ id: "external", role: "reviewer", mode: "read-only" }],
+		unprovidedScopes: ["未提供现实实验复核"],
+	}, undefined, undefined, toolContext(root));
+	assert.match(JSON.stringify(output), /review-bundle\.md/);
+	assert.match(JSON.stringify(output), /scope/);
+	assert.match(JSON.stringify(output), /external/);
+	assert.match(JSON.stringify(output), /coverage/);
+	const status = await service.status(root);
+	assert.equal(status.stages.M08.latest?.status, "completed");
+});
+
+test("M09 tool result keeps the bounded closure summary", async () => {
+	const service = { runStage: async () => ({
+		record: { stage: "M09", runId: "m09-test", status: "completed", outputs: [{ label: "M09 收口回执", path: "/workspace/receipt.json" }], failures: [] },
+		closure: {
+			status: "current-goal-returned", closureRequested: true, researchCompletion: "not-decided-by-m09", deliveryStatus: "checked",
+			version: { m08RunId: "m08-test", m04RunId: "m04-test", manifestPath: "/workspace/manifest.json" }, recipient: "reader", purpose: "inspect",
+			deliveryScope: { included: ["result.txt"], excluded: [], limitations: ["bounded"] },
+			reproduction: { mode: "read-only", status: "not-executed", authorizedExecution: false, instructions: [], actualToolCalls: 0, interpretation: "not certified" },
+			limitations: ["bounded"], recoveryEntry: "/workspace/receipt.json", runningTasks: [], automaticActionsNotTaken: ["publish"],
+			artifacts: { explanation: "/workspace/explanation.md", deliveryRoot: "/workspace/delivery", verificationReport: "/workspace/verification.md", sourceTrace: "/workspace/trace.json" },
+		},
+	}) } as unknown as ResearchService;
+	const output = await captureExtension(service).tools.get("research_stage")!.execute("m09", {
+		stage: "M09", m08RunId: "m08-test", m04RunId: "m04-test", recipient: "reader", purpose: "inspect",
+		deliveryScope: { included: ["result.txt"], excluded: [], limitations: [] },
+		reproduction: { mode: "read-only", instructions: [], authorizedExecution: false, pdfPages: [{ path: "paper.pdf", pages: [1] }] },
+	}, undefined, undefined, toolContext("/workspace"));
+	const text = JSON.stringify(output);
+	assert.match(text, /not-decided-by-m09/);
+	assert.match(text, /not-executed/);
+	assert.match(text, /automaticActionsNotTaken/);
+	assert.doesNotMatch(text, /完整状态已持久化/);
 });
 
 test("failed research operation does not activate P07; success, off, and session start control activation", async () => {

@@ -17,6 +17,8 @@ export interface RenderPageToolOptions {
 	onRendered?: (info: { pdf: string; page: number; imagePath: string }) => Promise<void> | void;
 	/** Extra confinement roots (e.g. an M05 work directory) whose PDFs may also be rendered; pages go next to the PDF. */
 	extraRoots?: string[];
+	/** Optional output directory for rendered pages, so read-only source trees need not be modified. */
+	outputDir?: string;
 }
 
 export function renderPageTool(options: RenderPageToolOptions): CustomToolSpec {
@@ -39,7 +41,7 @@ export function renderPageTool(options: RenderPageToolOptions): CustomToolSpec {
 			const home = roots.find((r) => resolved === r || resolved.startsWith(`${r}${path.sep}`));
 			if (!home) throw new HarnessError("tool.path", `只能渲染材料目录内的 PDF：${file}`);
 			if (!resolved.toLowerCase().endsWith(".pdf")) throw new HarnessError("tool.args", "只接受 .pdf 文件");
-			const outDir = home === roots[0] ? options.root : path.dirname(resolved);
+			const outDir = options.outputDir ?? (home === roots[0] ? options.root : path.dirname(resolved));
 			const rendered = await renderPdfPage(resolved, page, outDir, options.tools);
 			await options.onRendered?.({ pdf: resolved, page, imagePath: rendered.path });
 			return {
