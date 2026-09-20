@@ -45,7 +45,7 @@ class ContentParser(HTMLParser):
             self._in_title = True
         if tag in {"script", "style", "noscript", "svg"}:
             self._skip_depth += 1
-        if tag == "a" and values.get("href") and len(self.links) < 200:
+        if tag == "a" and values.get("href"):
             self._link_href = urljoin(self.base_url, values["href"] or "")
             self._link_text = []
         if tag in {
@@ -60,9 +60,11 @@ class ContentParser(HTMLParser):
             self._in_title = False
         if tag in {"script", "style", "noscript", "svg"} and self._skip_depth:
             self._skip_depth -= 1
-        if tag == "a" and self._link_href and len(self.links) < 200:
+        if tag == "a" and self._link_href:
             text = " ".join("".join(self._link_text).split())
-            self.links.append({"text": text, "href": self._link_href})
+            parsed = urlparse(self._link_href)
+            if parsed.scheme.lower() in {"http", "https"}:
+                self.links.append({"text": text, "href": self._link_href})
             self._link_href = None
             self._link_text = []
 
@@ -135,7 +137,14 @@ def is_html(content_type: str) -> bool:
     return not media_type or media_type in {"text/html", "application/xhtml+xml"}
 
 
-def write_page(out_dir: Path, html: str, markdown: str, meta: dict[str, Any]) -> None:
+def write_page(
+    out_dir: Path,
+    html: str,
+    markdown: str,
+    meta: dict[str, Any],
+    *,
+    links_complete: bool,
+) -> None:
     html_path = out_dir / "page.html"
     markdown_path = out_dir / "page.md"
     html_path.write_text(html, encoding="utf-8")
@@ -146,7 +155,16 @@ def write_page(out_dir: Path, html: str, markdown: str, meta: dict[str, Any]) ->
     parser.feed(html)
     if not meta["title"]:
         meta["title"] = parser.title
-    meta["links"] = parser.links[:200]
+    unique_links: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for link in parser.links:
+        if link["href"] in seen:
+            continue
+        seen.add(link["href"])
+        unique_links.append(link)
+    meta["linksTotal"] = len(unique_links)
+    meta["links"] = unique_links
+    meta["linksComplete"] = links_complete
 
 
 def robots_allows(url: str, timeout: float) -> tuple[bool, str | None]:
@@ -212,6 +230,12 @@ def http_fetch(
             meta["warnings"].append(
                 f"Access appears blocked (HTTP {meta['status']}); no bypass was attempted"
             )
+        if meta["status"] >= 400:
+            meta["error"] = f"HTTP {meta['status']}"
+            meta["warnings"].append(
+                f"Saved HTTP {meta['status']} response page for diagnosis; "
+                "target-page link extraction is not claimed complete"
+            )
         if not body:
             meta["error"] = f"HTTP {meta['status']} returned no content"
             return meta, False
@@ -226,7 +250,13 @@ def http_fetch(
         html = body.decode(charset, errors="replace")
         parser = ContentParser(meta["finalUrl"])
         parser.feed(html)
-        write_page(out_dir, html, parser.markdown, meta)
+        write_page(
+            out_dir,
+            html,
+            parser.markdown,
+            meta,
+            links_complete=meta["status"] < 400,
+        )
         return meta, True
     except Exception as exc:
         meta["error"] = f"Could not save fetched content: {type(exc).__name__}: {exc}"
@@ -315,6 +345,14 @@ async def crawl_fetch(url: str, out_dir: Path, timeout: float) -> tuple[dict[str
     if not bool(getattr(result, "success", True)):
         message = str(getattr(result, "error_message", None) or "Crawl4AI reported failure")
         meta["warnings"].append(message)
+    result_success = bool(getattr(result, "success", True))
+    status_success = isinstance(meta["status"], int) and meta["status"] < 400
+    if isinstance(meta["status"], int) and meta["status"] >= 400:
+        meta["error"] = f"HTTP {meta['status']}"
+        meta["warnings"].append(
+            f"Saved HTTP {meta['status']} response page for diagnosis; "
+            "target-page link extraction is not claimed complete"
+        )
     if html or markdown:
         if not html:
             html = ""
@@ -325,7 +363,13 @@ async def crawl_fetch(url: str, out_dir: Path, timeout: float) -> tuple[dict[str
             meta["warnings"].append(
                 "Crawl4AI returned no markdown; generated minimal text from HTML"
             )
-        write_page(out_dir, html, markdown, meta)
+        write_page(
+            out_dir,
+            html,
+            markdown,
+            meta,
+            links_complete=result_success and status_success,
+        )
         return meta, True
 
     meta["error"] = str(getattr(result, "error_message", None) or "Crawl4AI returned no content")

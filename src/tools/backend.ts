@@ -17,7 +17,7 @@ export interface AcquisitionBackend {
 	extractPdf(pdfPath: string, outDir: string, options?: ExtractOptions): Promise<ExtractResult>;
 	findOpenAccess(idOrUrl: string): Promise<OpenAccessResult>;
 	/** Interactive browser agent (browser-use). Absent when no model is configured for it. */
-	browseInteractive?(url: string, task: string, outDir: string): Promise<InteractiveResult>;
+	browseInteractive?(url: string, task: string, outDir: string, options?: { maxSteps?: number; timeoutMs?: number }): Promise<InteractiveResult>;
 	/** Human-readable description of what is actually available (engines, providers), for the run record. */
 	describe(): string[];
 }
@@ -30,7 +30,7 @@ export function defaultBackend(tools: ToolsConfig): AcquisitionBackend {
 		downloadFile: (url, destPath) => downloadToFile(url, destPath),
 		extractPdf: (pdfPath, outDir, options) => extractPdf(pdfPath, outDir, tools, options),
 		findOpenAccess: (idOrUrl) => findOpenAccess(idOrUrl, tools.openAlexMailto),
-		...(tools.browserUseModel ? { browseInteractive: (url: string, task: string, outDir: string) => browseInteractive(url, task, outDir, tools) } : {}),
+		...(tools.browserUseModel ? { browseInteractive: (url: string, task: string, outDir: string, options?: { maxSteps?: number; timeoutMs?: number }) => browseInteractive(url, task, outDir, tools, options) } : {}),
 		describe: () => [
 			`检索来源：${providers.map((p) => p.name).join("、")}${tools.braveApiKey ? "" : "（未配置 Brave 密钥；通用网页检索走无密钥的 DuckDuckGo，尽力而为）"}`,
 			`网页抓取：${tools.pythonVenv || "默认 .venv"} 中的 Crawl4AI 可用时优先，否则纯 HTTP`,

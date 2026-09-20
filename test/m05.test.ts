@@ -140,6 +140,8 @@ describe("M05 acquisition stage", () => {
 		assert.ok(existsSync(path.join(dir, "a.pdf")));
 		assert.ok(existsSync(path.join(dir, "extracted.md")), "PDF registration attaches extracted text");
 		assert.ok(sourceMd.includes("extracted.md（extracted；提取引擎 pdftotext"));
+		assert.ok(sourceMd.includes("来源 https://example.org/a.pdf"), "download provenance is retained");
+		assert.ok(sourceMd.includes("派生自 references/_work/"), `extracted text records its actual parent file:\n${sourceMd}`);
 		const index = await readFile(path.join(ws.referencesDir, "INDEX.md"), "utf8");
 		assert.ok(index.includes("| S001 | Paper A on mechanism A |"));
 		// search log and tool log

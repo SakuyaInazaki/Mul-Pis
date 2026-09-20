@@ -26,7 +26,7 @@ describe("search parsers", () => {
 
 	it("selects providers from config without any local service", () => {
 		const names = providersFor({}).map((p) => p.name);
-		assert.deepEqual(names, ["openalex", "arxiv", "hackernews", "stackexchange", "github", "duckduckgo"]);
+		assert.deepEqual(names, ["openalex", "arxiv", "crossref", "hackernews", "stackexchange", "github", "github-issues", "duckduckgo"]);
 		assert.ok(providersFor({ braveApiKey: "k" }).some((p) => p.name === "brave"));
 		assert.deepEqual(providersFor({ searchProviders: ["arxiv", "github", "reddit"] }).map((p) => p.name), ["arxiv", "github", "reddit"], "reddit is opt-in");
 	});

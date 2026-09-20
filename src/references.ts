@@ -15,6 +15,8 @@ export interface SourceFile {
 	path: string;
 	role: "original" | "extracted" | "page-image" | "other";
 	note?: string;
+	/** Factual per-file origin, useful when one browser task captures several pages/files. */
+	provenance?: { url?: string; title?: string; capturedAt?: string; contentType?: string; kind?: string; derivedFrom?: string };
 }
 
 export interface SourceRegistration {
@@ -75,7 +77,10 @@ export async function registerSource(ws: Workspace, reg: SourceRegistration): Pr
 		const dest = path.join(dir, candidate);
 		await copyFile(f.path, dest);
 		copied.push(dest);
-		fileRows.push(`- ${candidate}（${f.role}${f.note ? `；${f.note}` : ""}）`);
+		const facts = f.provenance
+			? [f.provenance.kind ? `类型 ${f.provenance.kind}` : "", f.provenance.url ? `来源 ${f.provenance.url}` : "", f.provenance.title ? `标题 ${f.provenance.title}` : "", f.provenance.capturedAt ? `取得时间 ${f.provenance.capturedAt}` : "", f.provenance.contentType ? `内容类型 ${f.provenance.contentType}` : "", f.provenance.derivedFrom ? `派生自 ${f.provenance.derivedFrom}` : ""].filter(Boolean)
+			: [];
+		fileRows.push(`- ${candidate}（${[f.role, f.note, ...facts].filter(Boolean).join("；")}）`);
 	}
 	const accessedAt = reg.accessedAt ?? nowIso();
 	const sourceMd = `# ${reg.title.trim()}
@@ -156,9 +161,10 @@ export class SearchLog {
 		return new SearchLog(file);
 	}
 
-	async append(entry: { at: string; provider: string; query: string; limit: number; endpoint: string; hits: Array<{ title: string; url: string; date?: string }>; warnings: string[] }): Promise<void> {
+	async append(entry: { at: string; provider: string; query: string; limit: number; endpoint: string; hits: Array<{ title: string; url: string; date?: string }>; warnings: string[]; page?: number; nextPage?: number; cursor?: string; nextCursor?: string; site?: string }): Promise<void> {
 		const rows = entry.hits.map((h, i) => `   ${i + 1}. ${h.title.replace(/\r?\n/g, " ")} — ${h.url}${h.date ? `（${h.date}）` : ""}`).join("\n");
-		const block = `### ${entry.at} ${entry.provider}\n\n- 检索式：${entry.query}\n- 上限：${entry.limit}；实际返回：${entry.hits.length}\n- 来源端点：${entry.endpoint}\n- 限制/警告：${entry.warnings.length ? entry.warnings.join("；") : "无"}\n- 命中：\n${rows || "   无"}\n\n`;
+		const continuation = [entry.page ? `页码 ${entry.page}` : "", entry.cursor ? `游标 ${entry.cursor}` : "", entry.nextPage ? `下一页 ${entry.nextPage}` : "", entry.nextCursor ? `下一游标 ${entry.nextCursor}` : ""].filter(Boolean).join("；") || "无";
+		const block = `### ${entry.at} ${entry.provider}\n\n- 检索式：${entry.query}\n- 站点限定：${entry.site ?? "无"}\n- 上限：${entry.limit}；实际返回：${entry.hits.length}\n- 页码/续查：${continuation}\n- 来源端点：${entry.endpoint}\n- 限制/警告：${entry.warnings.length ? entry.warnings.join("；") : "无"}\n- 命中：\n${rows || "   无"}\n\n`;
 		const current = await readFile(this.file, "utf8");
 		await writeFileAtomic(this.file, current + block);
 	}

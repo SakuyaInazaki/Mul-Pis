@@ -12,7 +12,7 @@
 | 提示词 | 运行时直接读取 `workflow/v1.0/提示词/*.txt`，不复制进代码 | 提示词是用户自有工作流的一部分，单一来源 | — |
 | 知识库 | 文件式：`records/<ID>/v<N>.md`、`proposals/`、`snapshots/`、`CURRENT`、`limits.json`、派生 `views/` 与 `_index/`；单一串行合入入口；停用先行；不使用任何哈希 | 手册第七章第一版形态即文件式；用户明令不引入哈希清单 | 中：接口 `KnowledgeStore` 可换后端 |
 | M08/M09 | 本版不实现 | 仍是用户委托补齐的暂定安排 | — |
-| M05 | 用户推荐的 browser-use 作为交互式站点的最后手段（需单独配置模型）；Crawl4AI（网页抓取为 markdown）接入；检索全部走公开 HTTP 接口、无本地服务：OpenAlex 与 arXiv（论文与开放版本）、Hacker News、Stack Exchange、Reddit、GitHub（社区，官方无密钥接口）、DuckDuckGo 公开 HTML（无密钥通用网页，尽力而为）、Brave Search API（可选，需密钥）；每种能力都有无 Python 时的退化路径（纯 HTTP 抓取）。PDF 不用任何本地 ML 模型：pdftotext 提取文本层，pdftoppm 按需把单页渲染成图片交给多模态模型直接阅读。Docling 与 SearXNG（Docker）曾被接入，用户明确不想本地模型与 Docker 后已移除 | 用户 2026-09-20 的选择与“不在本地跑模型、不用 Docker、机器空间有限”的约束 | 高：`AcquisitionBackend` 接口可换任何一项 |
+| M05 | 以 `AcquisitionBackend` 提供可替换的搜索、抓取、下载、浏览器与 PDF 能力。默认检索包括 OpenAlex、arXiv、Crossref、Hacker News、Stack Exchange、GitHub 仓库与 Issues、DuckDuckGo；Reddit 为显式选择项，Brave 需密钥。搜索支持提供方适用范围内的 page/cursor/site 参数并如实警告未支持参数；Hacker News 同时保留文章与讨论地址。任意 HTTP(S) 地址可直接抓取或下载，Crawl4AI 用于浏览器渲染抓取，browser-use 用于适合交互、翻页、展开与下载的定点任务，不固定为最后手段。PDF 仅用 poppler 的文本层与按页图像。Docling 与 SearXNG 已因“不在本地跑模型、不用 Docker”而移除 | 用户 2026-09-20 的选择与任务范围完整性要求；提供通用入口但不作全网穷尽或任意站点必然成功的保证 | 高：默认集合可由配置取子集，各能力可经接口替换 |
 
 ## 2. 阶段到会话的映射
 
@@ -22,7 +22,7 @@
 | M02 | 新会话 `M02`（与 M01 相同模型，不继承历史） | execution | 无 | P02 + 原始材料 + M01 完整产出 + 保存约定 | `criteria-candidates.md`，K 候选入库 |
 | M03 | 新会话 `M03-reviewer` 出题；续接 `M01` 作答；续接 `M03-reviewer` 评价 | reviewer / execution / reviewer | 无 | P03Q + 材料 + M01 + M02；M02 完整产出 + 可转发问题；P03A + 完整回答 | `questions.md`、`rationale.md`（不转发）、`answers.md`、`evaluation.md` |
 | M04 | 首轮续接 `M01`；其后新会话 `M04-research` | execution / research | 无 | P04 + 意见 + 产物位置（新会话另加原始问题与局部知识包） | `processing.md`、知识提案、`merge.json` |
-| M05 | 新会话 `M05` | acquisition | 自定义工具：web_search、find_open_access、fetch_page、download_file、extract_pdf、render_pdf_page、read_work_file、register_source、list_sources（配置了 browser-use 模型时另有 browse_interactive）；文件访问限定在本轮 `references/_work/<run>/` 与已登记来源 | P05 + 本轮目标 + 原始材料 + 局部知识包（C/K/Q/X）+ 已有索引 + 工具规则 | `acquisition-report.md`、`tool-log.jsonl`、`references/search/R###-<run>.md`、新登记的 `sources/S###/` |
+| M05 | 新会话 `M05` | acquisition | 自定义工具：web_search、find_open_access、fetch_page、list_page_links、download_file、extract_pdf、render_pdf_page、read_work_file、view_work_image、register_source、list_sources（配置了 browser-use 模型时另有 browse_interactive）；文件访问限定在本轮 `references/_work/<run>/` 与已登记来源 | P05 + 本轮目标 + 原始材料 + 局部知识包（C/K/Q/X）+ 已有索引 + 工具规则 | `acquisition-report.md`、`tool-log.jsonl`、`references/search/R###-<run>.md`、供 M06 使用的新登记 `sources/S###/` |
 | M06 | 每份资料三个新会话：`-reader`、`-checker`、`-applicability` | reader / checker / applicability | 前两者：限定在资料目录的只读工具 + `render_pdf_page`（把 PDF 单页渲染成图片直接返回，供多模态模型看公式、表格、图和扫描页）；第三者：无 | 材料 + 阅读要求；材料 + 阅读记录；经核对内容 + 同一份项目状态 | 每组三份记录、`batch-summary.md`、`batch.json` |
 
 “新会话”= 新的 `SessionManager` 文件 + 全部资源发现关闭（无 context 文件、skills、extensions、prompt templates、APPEND_SYSTEM）+ 空的 cwd 与 agentDir + 内存 settings；系统提示只含角色边界句（见 `src/prompts.ts` 的 `ROLE_SYSTEM_PROMPTS`）。会话之间只通过控制器显式搬运的可见文本交接。
@@ -50,7 +50,7 @@
 ## 5. 未决与未做
 
 - 模型选择与路由、并发数、预算：由 `research.config.json` 决定，harness 无默认。
-- M05：browser-use 需在配置中指定模型与提供 API 密钥，未配置即无交互式浏览器；Brave 密钥可选，缺省时通用网页检索只有 DuckDuckGo 公开 HTML 接口，可能限流。Crawl4AI 与 browser-use 本身不运行本地模型（Crawl4AI 的 markdown 生成是规则式的；browser-use 调用你配置的云端模型）。PDF 页面图像要求 reader/checker 角色使用多模态模型；长材料分块仍未实现。
+- M05：browser-use 需在配置中指定模型与对应 API 密钥；当前 wrapper 只接 OpenAI/Anthropic，并新建无既有 profile/login state 的 headless `BrowserSession`，尚未接入用户已有浏览器会话或凭据管理，不能据此假定登录站点普遍可用。它会在同一浏览器任务会话内逐步保存发生变化的 DOM、正文、截图和下载，失败或超时前的有效文件仍保留；`result.md` 是浏览器模型报告，不能登记为外部原始材料。每个实际材料文件可记录 URL、标题、取得时间、内容类型、材料类型和派生关系。默认上限为 20 个页面状态、12 张截图、HTML 合计 5 MB、正文合计 2 MB、登记入材料的下载合计 250 MB；该下载上限不是浏览器写盘的硬配额。触限会明确警告，因此成功也不等于材料完整。Brave 密钥可选；DuckDuckGo HTML 没有可靠的 API 翻页实现，可改用浏览器继续。所有站点与论坛都只按本轮任务保存所需范围，不自动递归取得全部帖子，也不保证任意网站均能取得。Crawl4AI 与 browser-use 不运行本地模型；PDF 页面图像要求 reader/checker 角色使用多模态模型，长材料分块仍未实现。
 - M07 主 Agent 的 Pi 端封装（extension 工具）、M08/M09：未实现。
 - 跨进程合入锁只有锁文件保护；多机无协调写入不在范围。
 - 真实模型端到端运行尚未执行；测试使用脚本化假会话与真实文件存储。
@@ -74,4 +74,4 @@ node src/cli.ts status --workspace <dir>
 
 `--runner fake` 让任何命令走脚本化假会话（用于演练目录与产物结构，不产生科研内容）。
 
-M05 的外部工具：`scripts/setup-tools.sh` 建立 `.venv` 并安装 Crawl4AI、browser-use 与 Playwright Chromium headless shell（不含任何本地 ML 模型，不需要 Docker）；检索来源可用 `tools.searchProviders` 限定，`tools.braveApiKey` 可选；`tools.browserUseModel` 指定 browser-use 的模型后交互式抓取才可用；PDF 只依赖本机 poppler（pdftotext、pdftoppm、pdfinfo），`tools.pageImageDpi` 可调页图分辨率（默认 110）。工具缺席时 M05 仍可运行，只是退化为 OpenAlex/arXiv 检索与纯 HTTP 抓取，并把所用引擎写进记录。
+M05 的外部工具：`scripts/setup-tools.sh` 建立 `.venv` 并安装 Crawl4AI、browser-use 与 Playwright Chromium headless shell（不含任何本地 ML 模型，不需要 Docker）；检索来源可用 `tools.searchProviders` 限定为默认集合的子集，`tools.braveApiKey` 可选；`tools.browserUseModel` 指定 browser-use 的模型后交互式抓取才可用；PDF 只依赖本机 poppler（pdftotext、pdftoppm、pdfinfo），`tools.pageImageDpi` 可调页图分辨率（默认 110）。Python 工具缺席时网页抓取退化为纯 HTTP 并记录实际引擎；公共 HTTP 搜索与 PDF 工具按各自依赖继续工作。

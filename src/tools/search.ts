@@ -15,6 +15,8 @@ export interface SearchHit {
 	provider: string;
 	title: string;
 	url: string;
+	/** Separate community discussion entry when the primary URL is an external resource. */
+	discussionUrl?: string;
 	snippet?: string;
 	date?: string;
 	doi?: string;
@@ -32,12 +34,47 @@ export interface SearchOutcome {
 	warnings: string[];
 	/** Endpoint used, without secrets, for the search log. */
 	endpoint: string;
+	/** One-based page actually requested when the endpoint uses numbered pages. */
+	page?: number;
+	/** Next one-based page only when the endpoint reports or implies that one exists. */
+	nextPage?: number;
+	/** Opaque continuation token returned by the provider. Never contains credentials. */
+	nextCursor?: string;
+}
+
+export interface SearchOptions {
+	limit: number;
+	/** One-based page. Providers that do not support numbered pages warn instead of ignoring it. */
+	page?: number;
+	/** Opaque provider continuation token. Providers that do not support it warn instead of ignoring it. */
+	cursor?: string;
+	/** Stack Exchange site or general-web domain scope. Other providers warn instead of ignoring it. */
+	site?: string;
 }
 
 export interface SearchProvider {
 	name: string;
 	description: string;
-	search(query: string, options: { limit: number }): Promise<SearchOutcome>;
+	search(query: string, options: SearchOptions): Promise<SearchOutcome>;
+}
+
+type JsonFetcher = typeof fetchJson;
+type TextFetcher = typeof fetchText;
+
+function pageNumber(page: number | undefined): number {
+	return Number.isFinite(page) ? Math.max(1, Math.floor(page!)) : 1;
+}
+
+function unsupported(options: SearchOptions, supported: Array<"page" | "cursor" | "site">): string[] {
+	const warnings: string[] = [];
+	if (options.page !== undefined && !supported.includes("page")) warnings.push("此提供方不支持 page；参数未应用");
+	if (options.cursor !== undefined && !supported.includes("cursor")) warnings.push("此提供方不支持 cursor；参数未应用");
+	if (options.site !== undefined && !supported.includes("site")) warnings.push("此提供方不支持 site；参数未应用");
+	return warnings;
+}
+
+function scopedQuery(query: string, site?: string): string {
+	return site ? `${query} site:${site}` : query;
 }
 
 const clean = (s: string | undefined | null): string => (s ?? "").replace(/\s+/g, " ").trim();
@@ -75,15 +112,22 @@ export function openAlexHit(w: OpenAlexWork): SearchHit {
 	};
 }
 
-export function openAlexProvider(mailto?: string): SearchProvider {
+export function openAlexProvider(mailto?: string, getJson: JsonFetcher = fetchJson): SearchProvider {
 	return {
 		name: "openalex",
 		description: "OpenAlex 学术文献检索：DOI、发表信息与开放获取地址",
-		async search(query, { limit }) {
+		async search(query, options) {
+			const { limit, cursor } = options;
+			const page = pageNumber(options.page);
 			const params = new URLSearchParams({ search: query, "per-page": String(Math.min(limit, 50)), select: "id,doi,title,display_name,publication_year,publication_date,authorships,primary_location,open_access,best_oa_location" });
+			if (cursor) params.set("cursor", cursor);
+			else if (options.page !== undefined) params.set("page", String(page));
 			if (mailto) params.set("mailto", mailto);
-			const data = await fetchJson<{ results?: OpenAlexWork[] }>(`https://api.openalex.org/works?${params.toString()}`);
-			return { provider: "openalex", query, limit, hits: (data.results ?? []).map(openAlexHit), warnings: [], endpoint: "https://api.openalex.org/works" };
+			const data = await getJson<{ results?: OpenAlexWork[]; meta?: { count?: number; next_cursor?: string | null } }>(`https://api.openalex.org/works?${params.toString()}`);
+			const warnings = unsupported(options, ["page", "cursor"]);
+			if (cursor && options.page !== undefined) warnings.push("同时提供 page 与 cursor 时优先使用 cursor；page 未应用");
+			const count = Math.min(limit, 50);
+			return { provider: "openalex", query, limit, hits: (data.results ?? []).map(openAlexHit), warnings, endpoint: "https://api.openalex.org/works", ...(cursor ? {} : { page, nextPage: page * count < (data.meta?.count ?? 0) ? page + 1 : undefined }), nextCursor: data.meta?.next_cursor ?? undefined };
 		},
 	};
 }
@@ -101,52 +145,67 @@ export function parseArxivAtom(xml: string): SearchHit[] {
 	return hits;
 }
 
-export function arxivProvider(): SearchProvider {
+export function arxivProvider(getText: TextFetcher = fetchText): SearchProvider {
 	return {
 		name: "arxiv",
 		description: "arXiv 预印本检索：标题、摘要、发布日期与 PDF 地址",
-		async search(query, { limit }) {
-			const url = `https://export.arxiv.org/api/query?search_query=${encodeURIComponent(`all:${query}`)}&max_results=${Math.min(limit, 50)}`;
-			const { text, status } = await fetchText(url);
-			if (status !== 200) return { provider: "arxiv", query, limit, hits: [], warnings: [`arXiv 返回 HTTP ${status}`], endpoint: "https://export.arxiv.org/api/query" };
-			return { provider: "arxiv", query, limit, hits: parseArxivAtom(text), warnings: [], endpoint: "https://export.arxiv.org/api/query" };
+		async search(query, options) {
+			const { limit } = options;
+			const page = pageNumber(options.page);
+			const count = Math.min(limit, 50);
+			const url = `https://export.arxiv.org/api/query?search_query=${encodeURIComponent(`all:${query}`)}&start=${(page - 1) * count}&max_results=${count}`;
+			const { text, status } = await getText(url);
+			const baseWarnings = unsupported(options, ["page"]);
+			if (status !== 200) return { provider: "arxiv", query, limit, hits: [], warnings: [...baseWarnings, `arXiv 返回 HTTP ${status}`], endpoint: "https://export.arxiv.org/api/query", page };
+			const hits = parseArxivAtom(text);
+			const total = Number(/<opensearch:totalResults[^>]*>(\d+)<\/opensearch:totalResults>/.exec(text)?.[1] ?? NaN);
+			return { provider: "arxiv", query, limit, hits, warnings: baseWarnings, endpoint: "https://export.arxiv.org/api/query", page, nextPage: Number.isFinite(total) && page * count < total ? page + 1 : undefined };
 		},
 	};
 }
 
 /* ------------------------------------------------------------------ communities (official keyless APIs) */
 
-export function hackerNewsProvider(): SearchProvider {
+export function hackerNewsProvider(getJson: JsonFetcher = fetchJson): SearchProvider {
 	return {
 		name: "hackernews",
 		description: "Hacker News 讨论检索（Algolia 官方接口）",
-		async search(query, { limit }) {
-			const data = await fetchJson<{ hits?: Array<{ title?: string; story_title?: string; url?: string; objectID?: string; created_at?: string; points?: number; num_comments?: number; comment_text?: string; story_text?: string }> }>(
-				`https://hn.algolia.com/api/v1/search?query=${encodeURIComponent(query)}&hitsPerPage=${Math.min(limit, 50)}`,
+		async search(query, options) {
+			const { limit } = options;
+			const page = pageNumber(options.page);
+			const data = await getJson<{ page?: number; nbPages?: number; hits?: Array<{ title?: string; story_title?: string; url?: string; objectID?: string; created_at?: string; points?: number; num_comments?: number; comment_text?: string; story_text?: string }> }>(
+				`https://hn.algolia.com/api/v1/search?query=${encodeURIComponent(query)}&hitsPerPage=${Math.min(limit, 50)}&page=${page - 1}`,
 			);
-			const hits: SearchHit[] = (data.hits ?? []).map((h) => ({
-				provider: "hackernews",
-				title: clean(h.title ?? h.story_title),
-				url: `https://news.ycombinator.com/item?id=${h.objectID}`,
-				snippet: clean([h.url ? `外链：${h.url}` : "", h.story_text ?? h.comment_text ?? ""].filter(Boolean).join(" ")).slice(0, 400),
-				date: h.created_at,
-				venue: `HN ${h.points ?? 0} 分 / ${h.num_comments ?? 0} 评论`,
-			}));
-			return { provider: "hackernews", query, limit, hits, warnings: [], endpoint: "https://hn.algolia.com/api/v1/search" };
+			const hits: SearchHit[] = (data.hits ?? []).map((h) => {
+				const discussionUrl = `https://news.ycombinator.com/item?id=${h.objectID}`;
+				const primaryUrl = h.url || discussionUrl;
+				return {
+					provider: "hackernews",
+					title: clean(h.title ?? h.story_title),
+					url: primaryUrl,
+					discussionUrl: primaryUrl === discussionUrl ? undefined : discussionUrl,
+					snippet: clean(h.story_text ?? h.comment_text ?? "").slice(0, 400),
+					date: h.created_at,
+					venue: `HN ${h.points ?? 0} 分 / ${h.num_comments ?? 0} 评论`,
+				};
+			});
+			return { provider: "hackernews", query, limit, hits, warnings: unsupported(options, ["page"]), endpoint: "https://hn.algolia.com/api/v1/search", page, nextPage: (data.page ?? page - 1) + 1 < (data.nbPages ?? 0) ? page + 1 : undefined };
 		},
 	};
 }
 
-export function stackExchangeProvider(site: string = "stackoverflow"): SearchProvider {
+export function stackExchangeProvider(site: string = "stackoverflow", getJson: JsonFetcher = fetchJson): SearchProvider {
 	return {
 		name: "stackexchange",
 		description: "Stack Exchange 问答检索（官方接口，默认 stackoverflow，可用 site: 前缀指定站点，如 site:physics）",
-		async search(query, { limit }) {
+		async search(query, options) {
+			const { limit } = options;
+			const page = pageNumber(options.page);
 			const m = /^site:(\S+)\s+/.exec(query);
-			const target = m ? m[1] : site;
+			const target = options.site ?? (m ? m[1] : site);
 			const q = m ? query.slice(m[0].length) : query;
-			const data = await fetchJson<{ items?: Array<{ title?: string; link?: string; creation_date?: number; score?: number; answer_count?: number; is_answered?: boolean; tags?: string[] }>; quota_remaining?: number }>(
-				`https://api.stackexchange.com/2.3/search/advanced?order=desc&sort=relevance&q=${encodeURIComponent(q)}&site=${encodeURIComponent(target)}&pagesize=${Math.min(limit, 50)}`,
+			const data = await getJson<{ items?: Array<{ title?: string; link?: string; creation_date?: number; score?: number; answer_count?: number; is_answered?: boolean; tags?: string[] }>; quota_remaining?: number; has_more?: boolean; backoff?: number }>(
+				`https://api.stackexchange.com/2.3/search/advanced?order=desc&sort=relevance&q=${encodeURIComponent(q)}&site=${encodeURIComponent(target)}&pagesize=${Math.min(limit, 50)}&page=${page}`,
 			);
 			const hits: SearchHit[] = (data.items ?? []).map((i) => ({
 				provider: "stackexchange",
@@ -157,18 +216,24 @@ export function stackExchangeProvider(site: string = "stackoverflow"): SearchPro
 				venue: target,
 			}));
 			const warnings = typeof data.quota_remaining === "number" && data.quota_remaining < 20 ? [`Stack Exchange 无密钥配额剩余 ${data.quota_remaining}`] : [];
-			return { provider: "stackexchange", query, limit, hits, warnings, endpoint: "https://api.stackexchange.com/2.3/search/advanced" };
+			if (data.backoff) warnings.push(`Stack Exchange 要求等待 ${data.backoff} 秒后再请求`);
+			warnings.push(...unsupported(options, ["page", "site"]));
+			return { provider: "stackexchange", query: `site:${target} ${q}`, limit, hits, warnings, endpoint: "https://api.stackexchange.com/2.3/search/advanced", page, nextPage: data.has_more ? page + 1 : undefined };
 		},
 	};
 }
 
-export function redditProvider(): SearchProvider {
+export function redditProvider(getJson: JsonFetcher = fetchJson): SearchProvider {
 	return {
 		name: "reddit",
 		description: "Reddit 帖子检索（公开 JSON 接口，无密钥时限流较严）",
-		async search(query, { limit }) {
-			const data = await fetchJson<{ data?: { children?: Array<{ data?: { title?: string; permalink?: string; subreddit?: string; created_utc?: number; score?: number; num_comments?: number; selftext?: string; url?: string } }> } }>(
-				`https://www.reddit.com/search.json?q=${encodeURIComponent(query)}&limit=${Math.min(limit, 50)}&sort=relevance`,
+		async search(query, options) {
+			const { limit } = options;
+			const effectiveQuery = options.site ? `${query} subreddit:${options.site.replace(/^r\//, "")}` : query;
+			const params = new URLSearchParams({ q: effectiveQuery, limit: String(Math.min(limit, 50)), sort: "relevance" });
+			if (options.cursor) params.set("after", options.cursor);
+			const data = await getJson<{ data?: { after?: string | null; children?: Array<{ data?: { title?: string; permalink?: string; subreddit?: string; created_utc?: number; score?: number; num_comments?: number; selftext?: string; url?: string } }> } }>(
+				`https://www.reddit.com/search.json?${params.toString()}`,
 				{ headers: { accept: "application/json" } },
 			);
 			const hits: SearchHit[] = (data.data?.children ?? []).map(({ data: d }) => ({
@@ -179,18 +244,23 @@ export function redditProvider(): SearchProvider {
 				snippet: clean(d?.selftext).slice(0, 300),
 				venue: d?.subreddit ? `r/${d.subreddit}（${d.score ?? 0} 分 / ${d.num_comments ?? 0} 评论）` : undefined,
 			}));
-			return { provider: "reddit", query, limit, hits, warnings: hits.length ? [] : ["Reddit 未返回结果；无密钥访问可能被限流或要求登录"], endpoint: "https://www.reddit.com/search.json" };
+			const warnings = unsupported(options, ["cursor", "site"]);
+			if (!hits.length) warnings.push("Reddit 未返回结果；无密钥访问可能被限流或要求登录");
+			return { provider: "reddit", query: effectiveQuery, limit, hits, warnings, endpoint: "https://www.reddit.com/search.json", nextCursor: data.data?.after ?? undefined };
 		},
 	};
 }
 
-export function githubProvider(): SearchProvider {
+export function githubProvider(getJson: JsonFetcher = fetchJson): SearchProvider {
 	return {
 		name: "github",
 		description: "GitHub 仓库检索（官方接口，无密钥每分钟约 10 次）",
-		async search(query, { limit }) {
-			const data = await fetchJson<{ items?: Array<{ full_name?: string; html_url?: string; description?: string | null; stargazers_count?: number; pushed_at?: string; language?: string | null }> }>(
-				`https://api.github.com/search/repositories?q=${encodeURIComponent(query)}&per_page=${Math.min(limit, 50)}`,
+		async search(query, options) {
+			const { limit } = options;
+			const page = pageNumber(options.page);
+			const effectiveQuery = query;
+			const data = await getJson<{ total_count?: number; incomplete_results?: boolean; items?: Array<{ full_name?: string; html_url?: string; description?: string | null; stargazers_count?: number; pushed_at?: string; language?: string | null }> }>(
+				`https://api.github.com/search/repositories?q=${encodeURIComponent(effectiveQuery)}&per_page=${Math.min(limit, 50)}&page=${page}`,
 				{ headers: { accept: "application/vnd.github+json" } },
 			);
 			const hits: SearchHit[] = (data.items ?? []).map((r) => ({
@@ -201,7 +271,79 @@ export function githubProvider(): SearchProvider {
 				date: r.pushed_at?.slice(0, 10),
 				venue: `GitHub ${r.stargazers_count ?? 0} stars${r.language ? ` / ${r.language}` : ""}`,
 			}));
-			return { provider: "github", query, limit, hits, warnings: [], endpoint: "https://api.github.com/search/repositories" };
+			const warnings = unsupported(options, ["page"]);
+			if ((data.total_count ?? 0) > 1000) warnings.push("GitHub Search API 仅允许访问前 1000 条匹配结果");
+			if (data.incomplete_results) warnings.push("GitHub 报告结果不完整，可能因搜索超时或限制而缺失");
+			const accessible = Math.min(data.total_count ?? 0, 1000);
+			return { provider: "github", query: effectiveQuery, limit, hits, warnings, endpoint: "https://api.github.com/search/repositories", page, nextPage: page * Math.min(limit, 50) < accessible ? page + 1 : undefined };
+		},
+	};
+}
+
+export function githubIssuesProvider(getJson: JsonFetcher = fetchJson): SearchProvider {
+	return {
+		name: "github-issues",
+		description: "GitHub issues 检索（官方搜索接口；不包含 Discussions）",
+		async search(query, options) {
+			const { limit } = options;
+			const page = pageNumber(options.page);
+			const effectiveQuery = `${query} is:issue`;
+			const data = await getJson<{ total_count?: number; incomplete_results?: boolean; items?: Array<{ title?: string; html_url?: string; body?: string | null; created_at?: string; repository_url?: string; comments?: number; state?: string }> }>(
+				`https://api.github.com/search/issues?q=${encodeURIComponent(effectiveQuery)}&per_page=${Math.min(limit, 50)}&page=${page}`,
+				{ headers: { accept: "application/vnd.github+json" } },
+			);
+			const hits = (data.items ?? []).map((i): SearchHit => ({ provider: "github-issues", title: clean(i.title), url: i.html_url ?? "", snippet: clean(i.body).slice(0, 300), date: i.created_at?.slice(0, 10), venue: `GitHub issue · ${i.state ?? "unknown"} · ${i.comments ?? 0} comments` }));
+			const warnings = unsupported(options, ["page"]);
+			if ((data.total_count ?? 0) > 1000) warnings.push("GitHub Search API 仅允许访问前 1000 条匹配结果");
+			if (data.incomplete_results) warnings.push("GitHub 报告结果不完整，可能因搜索超时或限制而缺失");
+			const accessible = Math.min(data.total_count ?? 0, 1000);
+			return { provider: "github-issues", query: effectiveQuery, limit, hits, warnings, endpoint: "https://api.github.com/search/issues", page, nextPage: page * Math.min(limit, 50) < accessible ? page + 1 : undefined };
+		},
+	};
+}
+
+interface CrossrefItem {
+	DOI?: string;
+	title?: string[];
+	URL?: string;
+	abstract?: string;
+	issued?: { "date-parts"?: number[][] };
+	author?: Array<{ given?: string; family?: string }>;
+	"container-title"?: string[];
+}
+
+export function crossrefProvider(mailto?: string, getJson: JsonFetcher = fetchJson): SearchProvider {
+	return {
+		name: "crossref",
+		description: "Crossref 学术元数据检索（官方 REST API，DOI 与出版信息）",
+		async search(query, options) {
+			const { limit, cursor } = options;
+			const page = pageNumber(options.page);
+			const rows = Math.min(limit, 50);
+			const offset = (page - 1) * rows;
+			const warnings = unsupported(options, ["page", "cursor"]);
+			if (cursor && options.page !== undefined) warnings.push("同时提供 page 与 cursor 时优先使用 cursor；page 未应用");
+			if (!cursor && offset > 10_000) {
+				warnings.push("Crossref REST API 的 offset 上限为 10000；本页未请求，请缩小范围或使用其他检索方式");
+				return { provider: "crossref", query, limit, hits: [], warnings, endpoint: "https://api.crossref.org/works", page };
+			}
+			const params = new URLSearchParams({ query, rows: String(rows), select: "DOI,title,URL,abstract,issued,author,container-title" });
+			if (cursor) params.set("cursor", cursor);
+			else params.set("offset", String(offset));
+			if (mailto) params.set("mailto", mailto);
+			const data = await getJson<{ message?: { items?: CrossrefItem[]; "total-results"?: number; "next-cursor"?: string } }>(`https://api.crossref.org/works?${params.toString()}`);
+			const hits = (data.message?.items ?? []).map((i): SearchHit => ({
+				provider: "crossref",
+				title: clean(i.title?.[0]),
+				url: i.URL ?? (i.DOI ? `https://doi.org/${i.DOI}` : ""),
+				doi: i.DOI,
+				snippet: clean(i.abstract?.replace(/<[^>]+>/g, "")).slice(0, 300),
+				date: i.issued?.["date-parts"]?.[0]?.join("-"),
+				authors: (i.author ?? []).map((a) => clean(`${a.given ?? ""} ${a.family ?? ""}`)).filter(Boolean),
+				venue: i["container-title"]?.[0],
+			}));
+			const total = data.message?.["total-results"] ?? 0;
+			return { provider: "crossref", query, limit, hits, warnings, endpoint: "https://api.crossref.org/works", ...(cursor ? {} : { page, nextPage: offset + hits.length < total && offset + rows <= 10_000 ? page + 1 : undefined }), nextCursor: data.message?.["next-cursor"] };
 		},
 	};
 }
@@ -225,33 +367,43 @@ export function parseDuckDuckGoHtml(html: string): SearchHit[] {
 	return hits;
 }
 
-export function duckDuckGoProvider(): SearchProvider {
+export function duckDuckGoProvider(getText: TextFetcher = fetchText): SearchProvider {
 	return {
 		name: "duckduckgo",
 		description: "DuckDuckGo 通用网页检索（无需密钥的公开 HTML 接口；尽力而为，可能限流）",
-		async search(query, { limit }) {
-			const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-			const { text, status } = await fetchText(url, { headers: { accept: "text/html" } });
+		async search(query, options) {
+			const { limit } = options;
+			const effectiveQuery = scopedQuery(query, options.site);
+			const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(effectiveQuery)}`;
+			const { text, status } = await getText(url, { headers: { accept: "text/html" } });
 			const warnings: string[] = ["非官方 API：结果来自公开 HTML 页面，可能不稳定或被限流"];
-			if (status !== 200) return { provider: "duckduckgo", query, limit, hits: [], warnings: [...warnings, `HTTP ${status}`], endpoint: "https://html.duckduckgo.com/html/" };
+			warnings.push(...unsupported(options, ["site"]));
+			if (options.page !== undefined || options.cursor !== undefined) warnings.push("DuckDuckGo HTML continuation 未可靠实现；请使用浏览器继续翻页");
+			if (status !== 200) return { provider: "duckduckgo", query: effectiveQuery, limit, hits: [], warnings: [...warnings, `HTTP ${status}`], endpoint: "https://html.duckduckgo.com/html/" };
 			const hits = parseDuckDuckGoHtml(text).slice(0, limit);
 			if (!hits.length && /anomaly|captcha|bot/i.test(text)) warnings.push("DuckDuckGo 返回了人机验证页，本次无结果");
-			return { provider: "duckduckgo", query, limit, hits, warnings, endpoint: "https://html.duckduckgo.com/html/" };
+			return { provider: "duckduckgo", query: effectiveQuery, limit, hits, warnings, endpoint: "https://html.duckduckgo.com/html/" };
 		},
 	};
 }
 
-export function braveProvider(apiKey: string): SearchProvider {
+export function braveProvider(apiKey: string, getJson: JsonFetcher = fetchJson): SearchProvider {
 	return {
 		name: "brave",
 		description: "Brave Search API 通用网页检索（需用户提供密钥）",
-		async search(query, { limit }) {
-			const data = await fetchJson<{ web?: { results?: Array<{ title?: string; url?: string; description?: string; age?: string; page_age?: string }> } }>(
-				`https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${Math.min(limit, 20)}`,
+		async search(query, options) {
+			const { limit } = options;
+			const page = pageNumber(options.page);
+			const effectiveQuery = scopedQuery(query, options.site);
+			const count = Math.min(limit, 20);
+			if (page > 10) return { provider: "brave", query: effectiveQuery, limit, hits: [], warnings: [...unsupported(options, ["page", "site"]), "Brave Web Search 仅支持前 10 个 offset 页；本页未请求"], endpoint: "https://api.search.brave.com/res/v1/web/search", page };
+			const data = await getJson<{ web?: { results?: Array<{ title?: string; url?: string; description?: string; age?: string; page_age?: string }> } }>(
+				`https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(effectiveQuery)}&count=${count}&offset=${page - 1}`,
 				{ headers: { "X-Subscription-Token": apiKey, accept: "application/json" } },
 			);
 			const hits: SearchHit[] = (data.web?.results ?? []).map((r) => ({ provider: "brave", title: clean(r.title), url: r.url ?? "", snippet: decodeEntities(clean(r.description).replace(/<[^>]+>/g, "")).slice(0, 300), date: r.page_age?.slice(0, 10) ?? r.age }));
-			return { provider: "brave", query, limit, hits, warnings: [], endpoint: "https://api.search.brave.com/res/v1/web/search" };
+			const warnings = unsupported(options, ["page", "site"]);
+			return { provider: "brave", query: effectiveQuery, limit, hits, warnings, endpoint: "https://api.search.brave.com/res/v1/web/search", page };
 		},
 	};
 }
@@ -262,7 +414,7 @@ export function braveProvider(apiKey: string): SearchProvider {
  * clients as of 2026-09-20). `tools.searchProviders` restricts the set (by name) when present.
  */
 export function providersFor(tools: ToolsConfig): SearchProvider[] {
-	const defaults: SearchProvider[] = [openAlexProvider(tools.openAlexMailto), arxivProvider(), hackerNewsProvider(), stackExchangeProvider(), githubProvider(), duckDuckGoProvider()];
+	const defaults: SearchProvider[] = [openAlexProvider(tools.openAlexMailto), arxivProvider(), crossrefProvider(tools.openAlexMailto), hackerNewsProvider(), stackExchangeProvider(), githubProvider(), githubIssuesProvider(), duckDuckGoProvider()];
 	if (tools.braveApiKey) defaults.push(braveProvider(tools.braveApiKey));
 	if (tools.searchProviders?.length) {
 		const wanted = new Set(tools.searchProviders);
