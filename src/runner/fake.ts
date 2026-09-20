@@ -72,9 +72,11 @@ export class FakeSessionRunner implements SessionRunner {
 				.split(/\r?\n/)
 				.filter((line) => line.trim())
 				.map((line) => JSON.parse(line) as TranscriptMessage);
-			if (spec.tools.kind === "custom") throw new Error(`fake runner: custom-tool session ${ref.id} cannot be resumed`);
 			state = { spec, ref: { ...ref, model: spec.model }, transcript, reads: new Set(), turns: transcript.filter((m) => m.role === "user").length, toolLog: [] };
 			this.sessions.set(ref.id, state);
+		}
+		if (state.spec.tools.kind === "custom" || state.spec.tools.kind === "execution" || (state.spec.tools.kind === "read-dir" && state.spec.tools.extraTools?.length)) {
+			throw new Error(`fake runner: non-resumable tool session ${ref.id} cannot be resumed`);
 		}
 		this.resumed.push(ref);
 		return this.handle(state);

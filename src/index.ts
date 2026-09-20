@@ -16,4 +16,6 @@ export * from "./references.ts";
 export type { AcquisitionBackend } from "./tools/backend.ts";
 export { defaultBackend } from "./tools/backend.ts";
 export { runM06 } from "./stages/m06.ts";
+export { createM07Controller } from "./m07/controller.ts";
+export type * from "./m07/types.ts";
 export type { StageContext } from "./stages/context.ts";

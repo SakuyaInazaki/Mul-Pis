@@ -6,9 +6,9 @@
 
 | 决定 | 内容 | 理由 | 可逆性 |
 |---|---|---|---|
-| 承载方式 | TypeScript 控制器直接使用本地 `third_party/pi` 的 Pi 0.85.1 SDK（`createAgentSession`），不用 RPC 子进程，不先做 extension | SDK 提供自定义 `ResourceLoader`（真实输入隔离）、`SessionManager.create/open`（持久会话与续接）、`tools`/`customTools` 白名单（限定只读工具）、按会话指定模型；这些正是 M01–M06 对齐所需的原语，见 [`pi-harness.md`](../research/pi-harness.md) 第 3–8 节 | 高：`SessionRunner` 接口把 SDK 细节隔离在 `src/runner/pi.ts`，日后可换 RPC 或 extension |
-| 模型 | 每个角色的模型来自工作区 `research.config.json`，写法 `provider/model[:thinking]`；harness 不预设任何模型，缺配置即拒绝运行 | 用户尚未选定模型，且明确 Claude 不采用；选型是用户决定 | 高 |
-| 主 Agent | 当前由用户或一个交互式 Pi 会话通过 CLI 驱动各阶段；控制器承担“委派”语义 | Pi 核心无 subagent；先把阶段编排做对，再决定是否包成 extension 工具 | 高 |
+| 承载方式 | TypeScript 控制器直接使用本地 `third_party/pi` 的 Pi 0.85.1 SDK（`createAgentSession`），不用 RPC 子进程；`extensions/research.ts` 是显式加载的薄入口 | SDK 提供自定义 `ResourceLoader`（真实输入隔离）、`SessionManager.create/open`（持久会话与续接）、原生/自定义工具白名单、按会话指定模型；这些是 M01–M07 所需原语，见 [`pi-harness.md`](../research/pi-harness.md) 第 3–8 节 | 高：`SessionRunner` 和 `ResearchService` 隔离 SDK 与 extension 接口 |
+| 模型 | 每个实际运行子会话的角色模型来自工作区 `research.config.json`，写法 `provider/model[:thinking]`；harness 不预设任何模型。只有会启动模型会话的操作要求该配置，M07 goal/status/plan/decision/review/finish 等纯状态操作不要求 | 用户尚未选定模型，且明确 Claude 不采用；选型是用户决定 | 高 |
+| 主 Agent | 一个交互式 Pi 主会话通过 `research_*` extension 工具读取状态、运行 M01–M06、管理 M07 目标、动态委派并验收；CLI 仍可直接运行 M01–M06 | Pi 核心没有内建 subagent；M07 用新建 SDK session 实现有界任务，不再造第二个主 Agent。extension 不替换主会话模型 | 高 |
 | 提示词 | 运行时直接读取 `workflow/v1.0/提示词/*.txt`，不复制进代码 | 提示词是用户自有工作流的一部分，单一来源 | — |
 | 知识库 | 文件式：`records/<ID>/v<N>.md`、`proposals/`、`snapshots/`、`CURRENT`、`limits.json`、派生 `views/` 与 `_index/`；单一串行合入入口；停用先行；不使用任何哈希 | 手册第七章第一版形态即文件式；用户明令不引入哈希清单 | 中：接口 `KnowledgeStore` 可换后端 |
 | M08/M09 | 本版不实现 | 仍是用户委托补齐的暂定安排 | — |
@@ -24,8 +24,15 @@
 | M04 | 首轮续接 `M01`；其后新会话 `M04-research` | execution / research | 无 | P04 + 意见 + 产物位置（新会话另加原始问题与局部知识包） | `processing.md`、知识提案、`merge.json` |
 | M05 | 新会话 `M05` | acquisition | 自定义工具：web_search、find_open_access、fetch_page、list_page_links、download_file、extract_pdf、render_pdf_page、read_work_file、view_work_image、register_source、list_sources（配置了 browser-use 模型时另有 browse_interactive）；文件访问限定在本轮 `references/_work/<run>/` 与已登记来源 | P05 + 本轮目标 + 原始材料 + 局部知识包（C/K/Q/X）+ 已有索引 + 工具规则 | `acquisition-report.md`、`tool-log.jsonl`、`references/search/R###-<run>.md`、供 M06 使用的新登记 `sources/S###/` |
 | M06 | 每份资料三个新会话：`-reader`、`-checker`、`-applicability` | reader / checker / applicability | 前两者：限定在资料目录的只读工具 + `render_pdf_page`（把 PDF 单页渲染成图片直接返回，供多模态模型看公式、表格、图和扫描页）；第三者：无 | 材料 + 阅读要求；材料 + 阅读记录；经核对内容 + 同一份项目状态 | 每组三份记录、`batch-summary.md`、`batch.json` |
+| M07 | 每个动态子任务一个新会话 `M07-T###`；主会话只通过工具组织与验收 | execute/reason 为 execution，check 为 reviewer | execute：Pi 原生 read/write/edit/bash，cwd 为任务 work 目录；check：任务目录只读；reason：无工具 | 冻结目标、约束、成功要求、显式输入副本、局部知识包、预期产物与 checks | 自动保存的任务报告、execute 的 work 文件、逐项 review、目标状态与 `m04-feedback.md` |
 
-“新会话”= 新的 `SessionManager` 文件 + 全部资源发现关闭（无 context 文件、skills、extensions、prompt templates、APPEND_SYSTEM）+ 空的 cwd 与 agentDir + 内存 settings；系统提示只含角色边界句（见 `src/prompts.ts` 的 `ROLE_SYSTEM_PROMPTS`）。会话之间只通过控制器显式搬运的可见文本交接。
+“新会话”= 新的 `SessionManager` 文件 + 全部资源发现关闭（无 context 文件、skills、extensions、prompt templates、APPEND_SYSTEM）+ 空 agentDir + 内存 settings；M01–M06 的无工具/自定义工具会话使用空 scratch cwd，M07 execute 的 SDK cwd 明确设为该任务 work 目录。系统提示只含角色边界句（见 `src/prompts.ts` 的 `ROLE_SYSTEM_PROMPTS`）。会话之间只通过控制器显式搬运的可见文本交接。M07 execute 的工具集合是能力白名单而不是 OS 沙箱；尤其 bash 仍有当前进程权限，因此不能把 cwd 写成根目录强制隔离。
+
+M07 先冻结原问题副本、目标关系、约束、成功要求、计划和当前 M04/知识快照。输入文件被复制到任务目录。execute 必须明确至少一个预期文件且路径落在自己的 work 目录；check/reason 可以不声明额外文件，但自动保存的 `report.md` 是必须实际提交和检查的产物。任务返回只进入 `returned`，主 Agent 须读取实际产物并用 `research_review` 逐项记录预定义 checks。通过要求每个 check 为 passed 且有文件证据、无失败和未执行项，并提交全部预期产物；验收时冻结被采用的产物、本任务报告与独立 checker 报告。声明需要独立检查时，check 任务取得的是待查材料副本，采用前还会核对它确实对应当前提交版本；反馈包只读取这些验收时固定的副本，避免把之后可变的报告混入正式反馈。这里不使用文件哈希清单。
+
+任务失败、拒绝、工具日志和未执行项一直保留。返工任务只有在 objective、checks、expectedOutputs、mode、独立检查要求及输入材料版本保持同一义务时才能声明 `supersedesTaskId`；不能借替代降级执行模式、取消独立检查或更换输入。沿递归替代链的新任务被接受后，链上旧失败才不再阻止 fulfilled，但历史不会删除。结束目标时必须逐项映射原始 successCriteria；fulfilled 要求每项原目标标准 passed 且有来自已接受任务的固定文件证据、没有开放用户决定、至少有一个实际任务，并且每个当前有效任务义务均已 accepted；历史上已被合法替代的失败任务仍保持原状态。
+
+`m04-feedback.md` 汇入全部任务状态、执行失败、检查、限制、工具日志和实际文本材料；二进制材料只声明存在与读取事实。M07 反馈进入 M04 时强制建立 fresh research 会话，不能续接 M01 或其他旧会话来吸收这些执行结果。
 
 ## 3. 控制器自写的文本
 
@@ -51,8 +58,9 @@
 
 - 模型选择与路由、并发数、预算：由 `research.config.json` 决定，harness 无默认。
 - M05：browser-use 需在配置中指定模型与对应 API 密钥；当前 wrapper 只接 OpenAI/Anthropic，并新建无既有 profile/login state 的 headless `BrowserSession`，尚未接入用户已有浏览器会话或凭据管理，不能据此假定登录站点普遍可用。它会在同一浏览器任务会话内逐步保存发生变化的 DOM、正文、截图和下载，失败或超时前的有效文件仍保留；`result.md` 是浏览器模型报告，不能登记为外部原始材料。每个实际材料文件可记录 URL、标题、取得时间、内容类型、材料类型和派生关系。默认上限为 20 个页面状态、12 张截图、HTML 合计 5 MB、正文合计 2 MB、登记入材料的下载合计 250 MB；该下载上限不是浏览器写盘的硬配额。触限会明确警告，因此成功也不等于材料完整。Brave 密钥可选；DuckDuckGo HTML 没有可靠的 API 翻页实现，可改用浏览器继续。所有站点与论坛都只按本轮任务保存所需范围，不自动递归取得全部帖子，也不保证任意网站均能取得。Crawl4AI 与 browser-use 不运行本地模型；PDF 页面图像要求 reader/checker 角色使用多模态模型，长材料分块仍未实现。
-- M07 主 Agent 的 Pi 端封装（extension 工具）、M08/M09：未实现。
-- 跨进程合入锁只有锁文件保护；多机无协调写入不在范围。
+- M07 通过显式 Pi extension 接入，但目前每次工具调用同步等待完成，没有 detached/异步 job、断线后自动重跑或进程重启后的 running 任务续跑。中断后仍记录为 running 的任务只能查看，不能自动重跑、假称结束或结束整个目标；本版没有修改该未知状态的恢复 API。取消会传到 Pi 会话；SDK abort 的失败会作为失败报告，已有外部 HTTP/browser 工具是否即时停下取决于其自身 signal 支持，不能承诺所有外部动作瞬停。M07 execution 会话禁止 resume，避免后续无声扩大工具范围；目标状态可恢复查看，已结束目标不能自动重跑。
+- M08/M09 未实现。
+- 知识库合入有锁文件保护；M07 service 的工作区 mutation 互斥只覆盖当前 Pi 进程，不能声称是跨进程任务锁，多机协调不在范围。
 - 真实模型端到端运行尚未执行；测试使用脚本化假会话与真实文件存储。
 
 ## 6. 运行入口
@@ -70,8 +78,11 @@ node src/cli.ts m05 --goal "本轮知识需求" --workspace <dir>   # 检索、�
 node src/cli.ts m06 --workspace <dir>          # 读取已登记的 references/sources/S###/（文本或提取后的 markdown）
 node src/cli.ts m04 --from M06 --workspace <dir>
 node src/cli.ts status --workspace <dir>
+pi -e ./extensions/research.ts                         # 显式加载主会话入口
 ```
 
 `--runner fake` 让任何命令走脚本化假会话（用于演练目录与产物结构，不产生科研内容）。
+
+Pi extension 注册 `research_status`、`research_init`、`research_stage`、`research_goal`、`research_delegate` 与 `research_review`，并提供 `/research status [workspace]` 与 `/research off`。一次研究操作成功后，extension 才在当前 Pi session 和对应 workspace 上激活 P07 与执行边界；失败调用不激活，切换 session 或 cwd 不继承，`/research off` 可显式停用。它不调用 `setModel`，因此不会替换用户当前主会话模型。只有会新建 M01–M07 模型会话的操作才读取 `research.config.json` 对应角色模型并在缺配置时拒绝；目标状态和验收等非模型操作可在没有模型配置时执行。
 
 M05 的外部工具：`scripts/setup-tools.sh` 建立 `.venv` 并安装 Crawl4AI、browser-use 与 Playwright Chromium headless shell（不含任何本地 ML 模型，不需要 Docker）；检索来源可用 `tools.searchProviders` 限定为默认集合的子集，`tools.braveApiKey` 可选；`tools.browserUseModel` 指定 browser-use 的模型后交互式抓取才可用；PDF 只依赖本机 poppler（pdftotext、pdftoppm、pdfinfo），`tools.pageImageDpi` 可调页图分辨率（默认 110）。Python 工具缺席时网页抓取退化为纯 HTTP 并记录实际引擎；公共 HTTP 搜索与 PDF 工具按各自依赖继续工作。

@@ -2,7 +2,10 @@ import { lstat, mkdir, mkdtemp, readFile, readdir, realpath } from "node:fs/prom
 import path from "node:path";
 import {
 	createAgentSession,
+	createBashToolDefinition,
+	createEditToolDefinition,
 	createReadToolDefinition,
+	createWriteToolDefinition,
 	DefaultResourceLoader,
 	ModelRuntime,
 	resolveCliModel,
@@ -24,12 +27,13 @@ const LIST_TOOL_NAME = "material_list";
 
 type SessionLike = Pick<
 	AgentSession,
-	"prompt" | "messages" | "dispose" | "getActiveToolNames" | "sessionId" | "sessionFile"
+	"prompt" | "abort" | "messages" | "dispose" | "getActiveToolNames" | "sessionId" | "sessionFile"
 >;
 
 export interface PiSessionRunnerOptions {
 	modelRuntime?: ModelRuntime;
 	createSession?: typeof createAgentSession;
+	signal?: AbortSignal;
 }
 
 interface MaterialTools {
@@ -164,11 +168,11 @@ function customToolsToPi(tools: CustomToolSpec[], log: ToolCallRecord[]): ToolDe
 			label: tool.name,
 			description: tool.description,
 			parameters: Type.Object(properties),
-			async execute(_toolCallId, params) {
+			async execute(_toolCallId, params, signal) {
 				const args = (params ?? {}) as Record<string, unknown>;
 				const at = new Date().toISOString();
 				try {
-					const result = await tool.execute(args);
+					const result = await tool.execute(args, signal);
 					log.push({ name: tool.name, args, ok: true, at });
 					const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [{ type: "text", text: result.text }];
 					for (const image of result.images ?? []) {
@@ -183,6 +187,46 @@ function customToolsToPi(tools: CustomToolSpec[], log: ToolCallRecord[]): ToolDe
 		};
 		return definition;
 	});
+}
+
+async function createExecutionTools(
+	root: string,
+	requested: Array<"read" | "write" | "edit" | "bash">,
+	log: ToolCallRecord[],
+): Promise<MaterialTools & { cwd: string }> {
+	const cwd = await realpath(root);
+	if (!(await lstat(cwd)).isDirectory()) throw new HarnessError("runner.tools", `execution root is not a directory: ${root}`);
+	const factories = {
+		read: createReadToolDefinition,
+		write: createWriteToolDefinition,
+		edit: createEditToolDefinition,
+		bash: createBashToolDefinition,
+	};
+	const names = [...new Set(requested)];
+	const readCoverage = new Set<string>();
+	const tools = names.map((name) => {
+		const base = factories[name](cwd) as ToolDefinition<any, any>;
+		return {
+			...base,
+			async execute(toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: any, ctx: any) {
+				const args = params ?? {};
+				const at = new Date().toISOString();
+				try {
+					const result = await base.execute(toolCallId, args, signal, onUpdate, { ...ctx, cwd });
+					log.push({ name, args, ok: true, at });
+					if (name === "read" && typeof args.path === "string") {
+						const resolved = path.isAbsolute(args.path) ? path.resolve(args.path) : path.resolve(cwd, args.path);
+						readCoverage.add(path.relative(cwd, resolved));
+					}
+					return result;
+				} catch (error) {
+					log.push({ name, args, ok: false, at, error: (error as Error).message });
+					throw error;
+				}
+			},
+		} as ToolDefinition<any, any>;
+	});
+	return { cwd, tools, names, readCoverage };
 }
 
 function visibleText(content: unknown): string {
@@ -289,8 +333,8 @@ export class PiSessionRunner implements SessionRunner {
 			throw new HarnessError("runner.persistence", `cannot read session spec ${ref.specFile}: ${(error as Error).message}`);
 		}
 		const spec = parsePersistedSpec(specText, ref.specFile);
-		if (spec.tools.kind === "custom" || (spec.tools.kind === "read-dir" && spec.tools.extraTools?.length)) {
-			throw new HarnessError("runner.persistence", `session ${ref.label} used harness-defined tools and cannot be resumed`);
+		if (spec.tools.kind === "custom" || spec.tools.kind === "execution" || (spec.tools.kind === "read-dir" && spec.tools.extraTools?.length)) {
+			throw new HarnessError("runner.persistence", `session ${ref.label} used non-resumable tools and cannot be resumed`);
 		}
 		const sessionManager = SessionManager.open(ref.file, spec.persistDir);
 		const cwd = sessionManager.getCwd();
@@ -359,6 +403,7 @@ export class PiSessionRunner implements SessionRunner {
 		const resolved = await this.resolveModel(spec);
 		let materialTools: MaterialTools = { tools: [], names: [], readCoverage: new Set() };
 		const toolLog: ToolCallRecord[] = [];
+		let sessionCwd = cwd;
 		if (spec.tools.kind === "read-dir") {
 			materialTools = await createMaterialTools(spec.tools.root, spec.tools.toolName);
 			if (spec.tools.extraTools?.length) {
@@ -368,11 +413,15 @@ export class PiSessionRunner implements SessionRunner {
 		} else if (spec.tools.kind === "custom") {
 			const definitions = customToolsToPi(spec.tools.tools, toolLog);
 			materialTools = { tools: definitions, names: definitions.map((d) => d.name), readCoverage: new Set() };
+		} else if (spec.tools.kind === "execution") {
+			const execution = await createExecutionTools(spec.tools.root, spec.tools.tools, toolLog);
+			materialTools = execution;
+			sessionCwd = execution.cwd;
 		}
 		const noTools = spec.tools.kind === "none" ? "all" : "builtin";
 		const createSession = this.options.createSession ?? createAgentSession;
 		const created = await createSession({
-			cwd,
+			cwd: sessionCwd,
 			agentDir: emptyAgentDir,
 			model: resolved.model,
 			thinkingLevel: resolved.thinkingLevel,
@@ -409,17 +458,56 @@ export class PiSessionRunner implements SessionRunner {
 			file: sessionFile,
 			specFile,
 		};
+		const signal = this.options.signal;
+		let disposed = false;
+		let abortListener: (() => void) | undefined;
+		let abortPromise: Promise<void> | undefined;
+		let abortError: unknown;
 		return {
 			ref,
 			prompt: async (text): Promise<AssistantTurn> => {
+				if (signal?.aborted) throw new HarnessError("runner.stop", `session ${spec.label} was aborted before prompt`);
 				const before = session.messages.length;
-				await session.prompt(text);
-				return turnResult(session.messages.slice(before), spec.label);
+				abortListener = () => {
+					// Attach the rejection handler synchronously: AgentSession.abort() is async,
+					// and an ignored rejection here would otherwise become unhandled.
+					abortPromise = session.abort().catch((error) => {
+						abortError = error;
+					});
+				};
+				signal?.addEventListener("abort", abortListener, { once: true });
+				try {
+					await session.prompt(text);
+					if (abortPromise) await abortPromise;
+					if (signal?.aborted) {
+						const detail = abortError ? `; SDK abort failed: ${(abortError as Error).message}` : "";
+						throw new HarnessError("runner.stop", `session ${spec.label} was aborted during prompt${detail}`);
+					}
+					return turnResult(session.messages.slice(before), spec.label);
+				} catch (error) {
+					if (abortPromise) await abortPromise;
+					if (signal?.aborted && !(error instanceof HarnessError && error.code === "runner.stop")) {
+						const detail = abortError ? `; SDK abort failed: ${(abortError as Error).message}` : "";
+						throw new HarnessError("runner.stop", `session ${spec.label} was aborted during prompt${detail}`);
+					}
+					throw error;
+				} finally {
+					if (abortListener) signal?.removeEventListener("abort", abortListener);
+					abortListener = undefined;
+					abortPromise = undefined;
+					abortError = undefined;
+				}
 			},
 			transcript: () => transcriptOf(session.messages),
 			readCoverage: () => [...materialTools.readCoverage].sort(),
 			toolLog: () => [...toolLog],
-			dispose: () => session.dispose(),
+			dispose: () => {
+				if (disposed) return;
+				disposed = true;
+				if (abortListener) signal?.removeEventListener("abort", abortListener);
+				abortListener = undefined;
+				session.dispose();
+			},
 		};
 	}
 

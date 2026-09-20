@@ -10,7 +10,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import { PiSessionRunner } from "../../src/runner/pi.ts";
-import type { SessionSpec } from "../../src/runner/types.ts";
+import { FakeSessionRunner } from "../../src/runner/fake.ts";
+import type { CustomToolSpec, SessionSpec, ToolGrant } from "../../src/runner/types.ts";
 import { HarnessError } from "../../src/types.ts";
 
 const MODEL = {
@@ -47,10 +48,14 @@ interface StubResponse {
 interface FactoryHarness {
 	calls: CreateAgentSessionOptions[];
 	factory: typeof createAgentSession;
+	promptCalls: number;
+	abortCalls: number;
 }
 
 function stubFactory(response?: StubResponse): FactoryHarness {
 	const calls: CreateAgentSessionOptions[] = [];
+	let promptCalls = 0;
+	let abortCalls = 0;
 	const factory = (async (options: CreateAgentSessionOptions = {}) => {
 		calls.push(options);
 		const manager = options.sessionManager;
@@ -62,6 +67,7 @@ function stubFactory(response?: StubResponse): FactoryHarness {
 			messages,
 			getActiveToolNames: () => [...(options.tools ?? [])],
 			async prompt(text: string) {
+				promptCalls += 1;
 				const user = { role: "user", content: text, timestamp: Date.now() };
 				const selected = response ?? {
 					content: [
@@ -101,11 +107,12 @@ function stubFactory(response?: StubResponse): FactoryHarness {
 				manager.appendMessage(user as never);
 				manager.appendMessage(assistant as never);
 			},
+			abort() { abortCalls += 1; },
 			dispose() {},
 		};
 		return { session, extensionsResult: undefined } as unknown as Awaited<ReturnType<typeof createAgentSession>>;
 	}) as typeof createAgentSession;
-	return { calls, factory };
+	return { calls, factory, get promptCalls() { return promptCalls; }, get abortCalls() { return abortCalls; } };
 }
 
 async function fixture(t: TestContext): Promise<string> {
@@ -251,4 +258,108 @@ test("prompt reports visible output and rejects a non-stop assistant result", as
 		assert.match(error.message, /provider failed offline/);
 		return true;
 	});
+});
+
+test("execution grants only requested native tools at the execution cwd and logs calls", async (t) => {
+	const persistDir = await fixture(t);
+	const executionRoot = path.join(persistDir, "execution");
+	await mkdir(executionRoot);
+	await writeFile(path.join(executionRoot, "input.txt"), "hello execution\n", "utf8");
+	const stub = stubFactory();
+	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory });
+	const handle = await runner.create(spec(persistDir, {
+		tools: { kind: "execution", root: executionRoot, tools: ["read", "write"] },
+	}));
+	const options = stub.calls[0];
+	assert.equal(options.cwd, await import("node:fs/promises").then(({ realpath }) => realpath(executionRoot)));
+	assert.equal(path.dirname(options.sessionManager!.getCwd()), persistDir);
+	assert.deepEqual(options.tools, ["read", "write"]);
+	assert.deepEqual(options.customTools?.map((tool) => tool.name), ["read", "write"]);
+	const readTool = options.customTools?.find((tool) => tool.name === "read");
+	const writeTool = options.customTools?.find((tool) => tool.name === "write");
+	assert(readTool);
+	assert(writeTool);
+	await readTool.execute("read-1", { path: "input.txt" }, undefined, undefined, { cwd: executionRoot } as never);
+	await writeTool.execute("write-1", { path: "output.txt", content: "written by native tool\n" }, undefined, undefined, { cwd: executionRoot } as never);
+	assert.equal(await readFile(path.join(executionRoot, "output.txt"), "utf8"), "written by native tool\n");
+	assert.deepEqual(handle.readCoverage(), ["input.txt"]);
+	assert.deepEqual(handle.toolLog().map(({ name, ok }) => ({ name, ok })), [
+		{ name: "read", ok: true },
+		{ name: "write", ok: true },
+	]);
+	await assert.rejects(runner.resume(handle.ref), /cannot be resumed/);
+});
+
+test("abort before prompt sends nothing and abort during prompt reaches the SDK", async (t) => {
+	const beforeDir = await fixture(t);
+	const beforeController = new AbortController();
+	beforeController.abort();
+	const beforeStub = stubFactory();
+	const before = await new PiSessionRunner({
+		modelRuntime: MODEL_RUNTIME,
+		createSession: beforeStub.factory,
+		signal: beforeController.signal,
+	}).create(spec(beforeDir));
+	await assert.rejects(before.prompt("must not send"), /aborted before prompt/);
+	assert.equal(beforeStub.promptCalls, 0);
+
+	const duringDir = await fixture(t);
+	const duringController = new AbortController();
+	const calls: CreateAgentSessionOptions[] = [];
+	let abortCalls = 0;
+	let release!: () => void;
+	const blocked = new Promise<void>((resolve) => { release = resolve; });
+	const factory = (async (options: CreateAgentSessionOptions = {}) => {
+		calls.push(options);
+		const manager = options.sessionManager!;
+		return { session: {
+			sessionId: manager.getSessionId(), sessionFile: manager.getSessionFile(), messages: [],
+			getActiveToolNames: () => [...(options.tools ?? [])],
+			prompt: async () => blocked,
+			abort: async () => { abortCalls += 1; release(); await Promise.resolve(); throw new Error("offline abort rejection"); },
+			dispose() {},
+		} } as unknown as Awaited<ReturnType<typeof createAgentSession>>;
+	}) as typeof createAgentSession;
+	const during = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: factory, signal: duringController.signal }).create(spec(duringDir));
+	const pending = during.prompt("interrupt me");
+	duringController.abort();
+	await assert.rejects(pending, (error: unknown) => {
+		assert(error instanceof HarnessError);
+		assert.equal(error.code, "runner.stop");
+		assert.match(error.message, /aborted during prompt/);
+		assert.match(error.message, /SDK abort failed: offline abort rejection/);
+		return true;
+	});
+	assert.equal(abortCalls, 1);
+	during.dispose();
+});
+
+test("removes the abort listener after a normal prompt", async (t) => {
+	const persistDir = await fixture(t);
+	const controller = new AbortController();
+	const stub = stubFactory();
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory, signal: controller.signal }).create(spec(persistDir));
+	await handle.prompt("finish normally");
+	controller.abort();
+	await Promise.resolve();
+	assert.equal(stub.abortCalls, 0);
+});
+
+test("fake runner rejects cached custom and execution sessions on resume", async (t) => {
+	const persistDir = await fixture(t);
+	const noopTool: CustomToolSpec = {
+		name: "noop",
+		description: "offline no-op",
+		params: {},
+		execute: async () => ({ text: "ok" }),
+	};
+	const grants: ToolGrant[] = [
+		{ kind: "custom", tools: [noopTool] },
+		{ kind: "execution", root: persistDir, tools: ["read"] },
+	];
+	for (const tools of grants) {
+		const fake = new FakeSessionRunner(() => "ok");
+		const handle = await fake.create(spec(persistDir, { tools }));
+		await assert.rejects(fake.resume(handle.ref), /non-resumable tool session/);
+	}
 });

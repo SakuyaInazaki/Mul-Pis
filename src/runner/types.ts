@@ -13,11 +13,14 @@ import type { Role } from "../types.ts";
  * - `none`: pure reasoning, no tools at all (M01, M02, M03 answering, first M04).
  * - `read-dir`: a read-only file tool restricted to one directory (M06 material reading,
  *   later M04 rounds reading the knowledge pack directory). Nothing outside `root` is reachable.
+ * - `execution`: selected Pi-native file/shell tools with `root` as their cwd. This is capability
+ *   selection, not an OS sandbox; in particular, bash retains the current process permissions.
  */
 export type ToolGrant =
 	| { kind: "none" }
 	| { kind: "read-dir"; root: string; toolName?: string; extraTools?: CustomToolSpec[] }
-	| { kind: "custom"; tools: CustomToolSpec[] };
+	| { kind: "custom"; tools: CustomToolSpec[] }
+	| { kind: "execution"; root: string; tools: Array<"read" | "write" | "edit" | "bash"> };
 
 export interface ToolParamSpec {
 	type: "string" | "number" | "boolean" | "string[]";
@@ -42,7 +45,7 @@ export interface CustomToolSpec {
 	name: string;
 	description: string;
 	params: Record<string, ToolParamSpec>;
-	execute(args: Record<string, unknown>): Promise<ToolResult>;
+	execute(args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult>;
 }
 
 export interface ToolCallRecord {
@@ -103,7 +106,7 @@ export interface SessionHandle {
 	transcript(): TranscriptMessage[];
 	/** Files actually read through a `read-dir` grant, relative to its root. Empty for `none`. */
 	readCoverage(): string[];
-	/** Every custom tool call made by the model in this session, in order. Empty unless the grant is `custom`. */
+	/** Every harness-defined or execution tool call made by the model in this session, in order. */
 	toolLog(): ToolCallRecord[];
 	dispose(): void;
 }

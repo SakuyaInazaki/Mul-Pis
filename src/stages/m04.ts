@@ -19,6 +19,7 @@ import { specFileFor } from "./m03.ts";
 export type M04Feedback =
 	| { kind: "M03"; runId?: string }
 	| { kind: "M06"; runId?: string }
+	| { kind: "M07"; runId?: string }
 	| { kind: "file"; label: string; path: string };
 
 export interface M04Options {
@@ -71,6 +72,23 @@ async function resolveFeedback(ctx: StageContext, feedback: M04Feedback): Promis
 			artifactPaths: run.outputs.map((o) => relPath(ctx, o.path)),
 		};
 	}
+	if (feedback.kind === "M07") {
+		let run: StageRunRecord;
+		if (feedback.runId) run = await ctx.ws.readRun("M07", feedback.runId);
+		else {
+			const ids = await ctx.ws.listRuns("M07");
+			if (!ids.length) throw new HarnessError("run.missing", "没有 M07 运行");
+			run = await ctx.ws.readRun("M07", ids.at(-1)!);
+		}
+		if (run.status === "running") throw new HarnessError("run.incomplete", `M07 运行 ${run.runId} 尚未结束，不能作为输入`);
+		const bundle = await readOutput(run, "M07 实际执行反馈包");
+		return {
+			label: `M07 实际执行反馈（运行 ${run.runId}）`,
+			text: bundle.text,
+			inputs: [{ label: "M07 实际执行反馈包", path: bundle.path }, ...run.outputs.filter((o) => o.label !== "M07 实际执行反馈包").map((o) => ({ label: `M07 ${o.label}`, path: o.path }))],
+			artifactPaths: run.outputs.map((o) => relPath(ctx, o.path)),
+		};
+	}
 	const text = await readTextIfExists(feedback.path);
 	if (!text) throw new HarnessError("m04.feedback", `找不到意见文件 ${feedback.path}`);
 	return { label: feedback.label, text, inputs: [{ label: feedback.label, path: feedback.path }], artifactPaths: [relPath(ctx, feedback.path)] };
@@ -83,7 +101,7 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 	const previousM04 = await ctx.ws.latestCompletedRun("M04");
 	const m01 = await ctx.ws.latestCompletedRun("M01");
 	const m01Session = m01?.sessions.find((s) => s.label === "M01");
-	const continueM01 = !options.freshSession && !previousM04 && !!m01Session?.file;
+	const continueM01 = feedback.label.startsWith("M07 ") ? false : !options.freshSession && !previousM04 && !!m01Session?.file;
 	const mode: M04Result["mode"] = continueM01 ? "continue-m01" : "research-session";
 
 	const record = await ctx.ws.startRun("M04", [...problemInputs, ...feedback.inputs], snapshot?.id);
