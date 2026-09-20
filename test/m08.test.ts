@@ -77,6 +77,8 @@ describe("M08 fixed-version review", () => {
 		const selfSession = [...f.runner.sessions.values()].find((x) => x.spec.label === "M08-selfcheck-scope")!;
 		assert.match(selfSession.transcript[0].text, /第一条主线是目标同一性/);
 		assert.match(selfSession.transcript[0].text, /第二条主线是主要结论的完整论证与证据/);
+		assert.match(selfSession.transcript[0].text, /可选语言、工具、方法或接口不自动意味着必须全部实现/);
+		assert.match(selfSession.transcript[0].text, /不要求文件哈希核验/);
 		assert.equal(self.tools.kind, "read-dir");
 		if (self.tools.kind === "read-dir") {
 			const page = self.tools.extraTools?.find((x) => x.name === "render_pdf_page")!;

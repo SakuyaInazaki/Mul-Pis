@@ -96,6 +96,8 @@ export interface TranscriptMessage {
 
 export interface SessionHandle {
 	ref: SessionRef;
+	/** Attach an explicit persisted run membership without inferring from labels. */
+	setRunContext?(context: { stage: string; runId: string }): void;
 	/**
 	 * Send one user message and wait for the assistant to finish.
 	 * Rejects when the model did not stop normally (error, abort, length) so a stage

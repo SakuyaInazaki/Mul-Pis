@@ -17,6 +17,7 @@ import { runM08, type M08Options } from "../stages/m08.ts";
 import { runM09, type M09Options } from "../stages/m09.ts";
 import type { StageContext } from "../stages/context.ts";
 import { HarnessError, type StageRunRecord } from "../types.ts";
+import { failureSignature, RetryGuard, stageFingerprint, stageInputVersion, thrownSignature } from "./retry-guard.ts";
 import { Workspace } from "../workspace.ts";
 
 export type ResearchStage = "M01" | "M02" | "M03" | "M04" | "M05" | "M06" | "M07" | "M08" | "M09";
@@ -120,6 +121,7 @@ class ProgressRunner implements SessionRunner {
 
 export class ResearchService {
 	private readonly options: ResearchServiceOptions;
+	private readonly activeStageOperations = new Map<string, { root: string; runs: Array<{ stage: string; runId: string }> }>();
 
 	constructor(options: ResearchServiceOptions) {
 		this.options = options;
@@ -168,9 +170,12 @@ export class ResearchService {
 	async runStage(request: StageRequest, signal?: AbortSignal): Promise<unknown> {
 		const root = this.resolveWorkspace(request.workspace);
 		return this.withMutation(root, async () => {
+			const retryGuard = new RetryGuard(root);
+			const fingerprint = stageFingerprint(request, await stageInputVersion(root, request));
+			await retryGuard.assertAllowed(fingerprint);
 			const ctx = await this.stageContext(root, request.stage, signal);
 			let result: unknown;
-			switch (request.stage) {
+			try { switch (request.stage) {
 				case "M01": result = await runM01(ctx); break;
 				case "M02": result = await runM02(ctx, { m01RunId: request.m01RunId }); break;
 				case "M03": {
@@ -218,10 +223,38 @@ export class ResearchService {
 					});
 					break;
 				}
-			}
+			} } catch (error) { await retryGuard.failure(fingerprint, thrownSignature(error)); throw error; }
+			const signature = failureSignature(result);
+			if (signature) await retryGuard.failure(fingerprint, signature); else await retryGuard.success(fingerprint);
 			this.options.onProgress?.({ phase: "stage-complete", stage: request.stage, message: `${request.stage} 已完成；完成不等于科学判断已通过` });
 			return result;
-		});
+		}, request.stage);
+	}
+
+	/** Record a normal host shutdown only for the stage operation owned by this service instance. */
+	async interruptActive(requested: string | undefined, reason: string): Promise<void> {
+		const root = this.resolveWorkspace(requested);
+		const key = await canonicalMutationKey(root);
+		const active = this.activeStageOperations.get(key);
+		if (!active) return;
+		await this.interruptOwned(active, reason);
+	}
+
+	/** Interrupt every exact run registered by this service instance, regardless of Pi cwd. */
+	async interruptAllActive(reason: string): Promise<void> {
+		for (const active of [...this.activeStageOperations.values()]) await this.interruptOwned(active, reason);
+	}
+
+	private async interruptOwned(active: { root: string; runs: Array<{ stage: string; runId: string }> }, reason: string): Promise<void> {
+		const ws = new Workspace(active.root);
+		for (const owned of active.runs) {
+			const run = await ws.readRun(owned.stage, owned.runId);
+			if (run.status !== "running") continue;
+			run.failures.push(`运行中断（host-shutdown）：${reason}`);
+			run.remarks.push("由拥有本次活动操作的 Pi extension 依照已登记 runId 在正常 session_shutdown 路径记录；未自动重跑。SIGKILL 或进程崩溃不在此保证内。");
+			await ws.finishRun(run, "failed");
+			await ws.writeNote(run, "主 Pi 会话在阶段仍运行时正常关闭；harness 记录中断事实，没有把阶段标为完成，也没有自动重放。 ");
+		}
 	}
 
 	async goalStatus(runId: string, requested?: string): Promise<unknown> {
@@ -269,6 +302,13 @@ export class ResearchService {
 
 	private async stageContext(root: string, stage: ResearchStage, signal?: AbortSignal): Promise<StageContext> {
 		const ws = new Workspace(root);
+		const originalStartRun = ws.startRun.bind(ws);
+		ws.startRun = async (...args) => {
+			const record = await originalStartRun(...args);
+			const key = await canonicalMutationKey(root);
+			this.activeStageOperations.get(key)?.runs.push({ stage: record.stage, runId: record.runId });
+			return record;
+		};
 		if (!existsSync(ws.configFile)) throw new HarnessError("config.missing", `缺少 ${ws.configFile}；请明确配置各角色模型`);
 		const store = createFileKnowledgeStore(ws.knowledgeDir);
 		const base = this.options.runnerFactory?.(signal) ?? createPiSessionRunner({ signal });
@@ -276,11 +316,12 @@ export class ResearchService {
 		return { ws, store, runner, config: await ws.loadConfig() };
 	}
 
-	private async withMutation<T>(root: string, operation: () => Promise<T>): Promise<T> {
+	private async withMutation<T>(root: string, operation: () => Promise<T>, stage?: ResearchStage): Promise<T> {
 		const key = await canonicalMutationKey(root);
 		if (activeMutations.has(key)) throw new HarnessError("m07.busy", `工作区已有同步研究操作：${root}`);
 		activeMutations.add(key);
-		try { return await operation(); } finally { activeMutations.delete(key); }
+		if (stage) this.activeStageOperations.set(key, { root: path.resolve(root), runs: [] });
+		try { return await operation(); } finally { activeMutations.delete(key); this.activeStageOperations.delete(key); }
 	}
 }
 

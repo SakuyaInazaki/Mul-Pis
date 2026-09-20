@@ -31,6 +31,7 @@ export function sessionSpec(ctx: StageContext, label: string, role: Role, system
 
 export function recordSession(record: StageRunRecord, handle: SessionHandle): void {
 	record.sessions.push({ label: handle.ref.label, role: handle.ref.role, id: handle.ref.id, file: handle.ref.file, model: handle.ref.model });
+	handle.setRunContext?.({ stage: record.stage, runId: record.runId });
 }
 
 export async function readOutput(record: StageRunRecord, label: string): Promise<{ path: string; text: string }> {
@@ -59,10 +60,14 @@ export function relPath(ctx: StageContext, target: string): string {
 export async function withRun<T>(ctx: StageContext, record: StageRunRecord, body: () => Promise<T>, noteBody: () => string): Promise<T> {
 	try {
 		const result = await body();
+		const persisted = await ctx.ws.readRun(record.stage, record.runId);
+		if (persisted.status !== "running") throw new HarnessError("run.interrupted", `${record.stage} 运行 ${record.runId} 已在执行期间被记录为 ${persisted.status}，不能覆盖为 completed`);
 		await ctx.ws.finishRun(record, "completed");
 		await ctx.ws.writeNote(record, noteBody());
 		return result;
 	} catch (error) {
+		const persisted = await ctx.ws.readRun(record.stage, record.runId).catch(() => undefined);
+		if (persisted && persisted.status !== "running") throw error;
 		record.failures.push(`运行失败：${(error as Error).message}`);
 		await ctx.ws.finishRun(record, "failed");
 		await ctx.ws.writeNote(record, noteBody());

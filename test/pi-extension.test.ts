@@ -32,6 +32,33 @@ test("extension registration is inert and exposes bounded tools", async () => {
 	assert.equal((await service.status(root)).initialized, false);
 });
 
+test("main-session capability guard activates only after substantive research work", async () => {
+	const service = {
+		status: async () => ({ workspace: "/workspace", stages: {} }),
+		init: async () => ({ initialized: true }),
+		goalAction: async () => ({ runId: "goal-1", lifecycle: "active" }),
+	} as unknown as ResearchService;
+	const registered = captureExtension(service);
+	const hook = registered.handlers.get("tool_call")![0];
+	const bash = { toolName: "bash", input: { command: "true" } };
+	assert.equal(await hook(bash, toolContext("/workspace")), undefined);
+	await registered.tools.get("research_status")!.execute("status", {}, undefined, undefined, toolContext("/workspace"));
+	assert.equal(await hook(bash, toolContext("/workspace")), undefined);
+	await registered.tools.get("research_init")!.execute("init", { workspace: "/workspace" }, undefined, undefined, toolContext("/workspace"));
+	assert.equal(await hook(bash, toolContext("/workspace")), undefined);
+	await registered.tools.get("research_goal")!.execute("begin", { action: "begin", goal: "g", problemRelation: "p", constraints: [], successCriteria: [], plan: "p" }, undefined, undefined, toolContext("/workspace"));
+	assert.deepEqual(await hook(bash, toolContext("/workspace")), {
+		block: true,
+		reason: "活动科研执行期间主 Pi 只负责编排与只读检查；bash 不在显式工具集合中。请把实现、平台操作或其他有副作用动作放入有界 M07 任务。",
+	});
+	// A blocked mutation remains recoverable: Pi may follow the reason and call a workflow tool next.
+	assert.equal(await hook({ toolName: "research_delegate", input: {} }, toolContext("/workspace")), undefined);
+	assert.equal(await hook({ toolName: "read", input: { path: "result.md" } }, toolContext("/workspace")), undefined);
+	assert.equal(await hook({ toolName: "research_stage", input: {} }, toolContext("/workspace")), undefined);
+	assert.equal((await hook({ toolName: "research_secret", input: {} }, toolContext("/workspace")) as { block: boolean }).block, true);
+	assert.equal(await hook(bash, toolContext("/different-cwd")), undefined);
+});
+
 test("status works without model config and does not initialize the workspace", async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-status-"));
 	const service = new ResearchService({ defaultWorkspace: root });

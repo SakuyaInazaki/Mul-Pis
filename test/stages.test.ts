@@ -109,7 +109,8 @@ describe("stages with the scripted runner", () => {
 		assert.equal(spec.role, "execution");
 		assert.equal(spec.model, "fake/model-a:high");
 		assert.deepEqual(spec.tools, { kind: "none" });
-		assert.equal(spec.systemPrompt, ROLE_SYSTEM_PROMPTS.execution);
+		assert.ok(spec.systemPrompt.includes(ROLE_SYSTEM_PROMPTS.execution), "M01 保留 execution 角色隔离契约");
+		if (spec.systemPrompt !== ROLE_SYSTEM_PROMPTS.execution) assert.match(spec.systemPrompt, /输入信任边界|不可信数据/);
 		const message = runner.sessions.values().next().value!.transcript[0].text;
 		assert.ok(message.includes(await loadPrompt("P01")));
 		assert.ok(message.includes("研究机制 A 是否解释现象 B"));
@@ -131,6 +132,7 @@ describe("stages with the scripted runner", () => {
 		const m02State = [...runner.sessions.values()].find((s) => s.spec.label === "M02")!;
 		assert.ok(m02State.transcript[0].text.includes("初始认识 ALPHA"));
 		assert.ok(m02State.transcript[0].text.includes(await loadPrompt("P02")));
+		assert.match(m02State.transcript[0].text, /只是叙述标签/);
 		assert.equal(result.snapshotId, "G001");
 		const ks = await ctx.store.list({ type: "K" });
 		assert.equal(ks.length, 2);
@@ -206,6 +208,8 @@ describe("stages with the scripted runner", () => {
 		assert.equal(spec.model, "fake/model-c");
 		assert.deepEqual(spec.tools, { kind: "none" });
 		const state = [...runner.sessions.values()].find((s) => s.spec.label === "M04-research")!;
+		assert.match(state.transcript[0].text, /知识记录身份契约/);
+		assert.match(state.transcript[0].text, /"target":"\$claim"/);
 		const message = state.transcript[0].text;
 		assert.ok(message.includes("研究机制 A 是否解释现象 B"), "fresh session gets the problem again");
 		assert.ok(message.includes("C001"), "knowledge pack included");

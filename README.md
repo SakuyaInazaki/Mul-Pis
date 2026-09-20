@@ -9,6 +9,7 @@
 - [`docs/`](docs/README.md)：其余逐文件阅读材料、M05 获取工具记录、Pi 承载调研和 RSI/SoL-Pi 外部启发。尚未决定的事项以各文档当前状态为准。
 - [`docs/provenance.md`](docs/provenance.md)：第三方依赖和本地研究资料的固定版本与来源说明。
 - [`src/`](src/)、[`extensions/research.ts`](extensions/research.ts) 与 [`docs/implementation/design.md`](docs/implementation/design.md)：研究 harness 实现（基于本地 Pi 0.85.1 SDK 的 TypeScript 控制器）：工作区初始化、M01–M06 的会话编排、M07 目标与有界任务、M08 固定版本综合审查、M09 配对版本解释与交付复核、C/K/E/J/Q/D/X 知识库、CLI 和 Pi extension；模型由工作区配置指定，harness 不预设。
+- [`docs/implementation/dashboard.md`](docs/implementation/dashboard.md)：只读本地工作流面板的启动方法、状态含义与安全读取边界。
 - [`.agent/notes/`](.agent/notes/)：为公开整理保留的审计、研究与验收记录。
 
 `third_party/` 保存本地使用的上游 Pi 与 SoL-Pi checkout，`resources/` 保存本地研究资料。两者默认不进入公开发行；公开仓库记录其来源和所调研版本。

@@ -6,6 +6,7 @@ import { HarnessError } from "../types.ts";
 import { nowIso, writeFileAtomic } from "../workspace.ts";
 import { recordSession, sessionSpec, type StageContext } from "../stages/context.ts";
 import type { BeginGoalInput, CurrentGoal, DecisionInput, EvidenceFile, FinishInput, M07Controller, M07TaskRecord, TaskCheck, TaskReviewInput, TaskSpecInput } from "./types.ts";
+import type { StageRunRecord } from "../types.ts";
 
 const STATE = "goal.json";
 const TEXT_EXTENSIONS = new Set([".txt", ".md", ".markdown", ".json", ".jsonl", ".csv", ".tsv", ".yaml", ".yml", ".toml", ".xml", ".html", ".htm", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".rs", ".go", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".sh", ".zsh", ".fish", ".sql", ".tex"]);
@@ -58,6 +59,39 @@ async function load(ctx: StageContext, runId: string): Promise<CurrentGoal> {
 	}
 }
 
+interface FormalBaseline { run: StageRunRecord; knowledgeSnapshot?: string }
+
+async function latestFormalBaseline(ctx: StageContext): Promise<FormalBaseline | undefined> {
+	const ids = await ctx.ws.listRuns("M04");
+	if (!ids.length) return undefined;
+	const runs = await Promise.all(ids.map((id) => ctx.ws.readRun("M04", id)));
+	const run = runs.sort((left, right) => left.startedAt.localeCompare(right.startedAt) || (left.finishedAt ?? "").localeCompare(right.finishedAt ?? ""))[runs.length - 1];
+	if (run.status !== "completed") throw new HarnessError("m07.baseline", `最新 M04 运行 ${run.runId} 状态为 ${run.status}，不得回退到更旧基线`);
+	if (run.failures.length) throw new HarnessError("m07.baseline", `最新 M04 运行 ${run.runId} 含未解决失败，不能作为正式基线：${run.failures.join("；")}`);
+	const proposal = run.outputs.find((item) => item.label === "知识提案");
+	const merge = run.outputs.find((item) => item.label === "合入结果");
+	if (proposal && !merge) throw new HarnessError("m07.baseline", `最新 M04 运行 ${run.runId} 产生了知识提案但未成功合入，不能作为正式基线`);
+	let knowledgeSnapshot = run.knowledgeSnapshot;
+	if (merge) {
+		try {
+			const parsed = JSON.parse(await readFile(merge.path, "utf8")) as { snapshot?: { id?: unknown } };
+			if (typeof parsed.snapshot?.id !== "string" || !parsed.snapshot.id) throw new Error("缺少 snapshot.id");
+			knowledgeSnapshot = parsed.snapshot.id;
+		} catch (error) {
+			throw new HarnessError("m07.baseline", `最新 M04 运行 ${run.runId} 的合入结果无法确定知识快照，不能作为正式基线：${(error as Error).message}`);
+		}
+	}
+	return { run, knowledgeSnapshot };
+}
+
+async function requireCurrentFormalBaseline(ctx: StageContext, goal: CurrentGoal): Promise<void> {
+	if (!goal.formalBaseline) return;
+	const baseline = await latestFormalBaseline(ctx);
+	if (!baseline || baseline.run.runId !== goal.m04BaselineRunId || baseline.knowledgeSnapshot !== goal.knowledgeSnapshot) {
+		throw new HarnessError("m07.baseline", `M07 目标 ${goal.runId} 的正式基线已不是最新可用 M04；先处理最新运行并显式刷新基线`);
+	}
+}
+
 function requireActive(goal: CurrentGoal): void {
 	if (goal.lifecycle !== "active") throw new HarnessError("m07.finished", `M07 目标 ${goal.runId} 已结束，恢复只可查看，不能自动重跑`);
 }
@@ -94,6 +128,7 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, task: TaskSpecI
 		section("待检查事项", task.checks.map((x) => `- ${x}`).join("\n") || "无"),
 	];
 	if (knowledgePack) boundary.push(section("本任务局部知识包", knowledgePack));
+	if (task.mode === "execute") boundary.push(section("外部执行与可消耗资源", "如任务涉及真实提交、评测、远程实验或其他可能消耗配额/费用/机会的动作：先用已提供的只读能力或额度接口核对接入和当前状态，并先做本地可完成的语法、类型、编译与兼容性预检。这不禁止任务已授权的真实实验，已授权平台评测/实验产生的结果属于本任务实测证据。每次真实动作都要记录实际结果和资源消耗；失败若仍消耗了资源，同样记录已消耗量、可见剩余量与恢复条件。平台配额不明时如实记录未知，不猜测统一配额。本地命令或客户端成功退出不等于远程实验通过。显式输入和原问题允许使用；若需取得新的外部研究参考资料并用于推理，将具体缺口报回主会话走 M05/M06→M04，不在 execute 任务里通过 bash 另造获取和采用链。"));
 	boundary.push("会话返回只表示任务已返回，不表示成果被主 Agent 接受。请如实列出实际动作、产物、失败、未执行项和限制。");
 	return boundary.join("\n\n");
 }
@@ -141,14 +176,15 @@ export function createM07Controller(ctx: StageContext): M07Controller {
 			if (!input.constraints.length || !input.successCriteria.length) throw new HarnessError("m07.input", "constraints 与 successCriteria 必须明确且非空");
 			input.constraints = normalizedUnique(input.constraints, "constraint"); input.successCriteria = normalizedUnique(input.successCriteria, "success criterion");
 			const problem = await ctx.ws.readProblem();
-			const snapshot = await ctx.store.current();
-			const m04 = await ctx.ws.latestCompletedRun("M04");
-			if (!m04 && !input.exploratory) throw new HarnessError("m07.baseline", "没有已完成 M04 基线；只能显式 exploratory=true 开始探索性 M07，不能声称正式结论");
-			const record = await ctx.ws.startRun("M07", [{ label: "原始问题", path: problem.path }], snapshot?.id);
+			let baseline: FormalBaseline | undefined;
+			try { baseline = await latestFormalBaseline(ctx); }
+			catch (error) { if (!input.exploratory) throw error; }
+			if (!baseline && !input.exploratory) throw new HarnessError("m07.baseline", "没有可用的 M04 正式基线；只能显式 exploratory=true 开始探索性 M07，不能声称正式结论");
+			const record = await ctx.ws.startRun("M07", [{ label: "原始问题", path: problem.path }], baseline?.knowledgeSnapshot);
 			const frozen = path.join(ctx.ws.runDir("M07", record.runId), "problem-snapshot.md");
 			await writeFileAtomic(frozen, problem.content);
-			const exploratory = input.exploratory === true || !m04;
-			const goal: CurrentGoal = { version: 1, runId: record.runId, lifecycle: "active", startedAt: record.startedAt, updatedAt: record.startedAt, goal: input.goal.trim(), problemRelation: input.problemRelation.trim(), constraints: input.constraints.map((x) => nonempty(x, "constraint")), successCriteria: input.successCriteria.map((x) => nonempty(x, "success criterion")), plan: input.plan.trim(), exploratory, formalBaseline: !!m04 && !exploratory, problemSnapshotPath: frozen, knowledgeSnapshot: snapshot?.id, m04BaselineRunId: m04?.runId, baselineHistory: m04 ? [{ at: record.startedAt, knowledgeSnapshot: snapshot?.id, m04RunId: m04.runId }] : [], tasks: [], decisions: [], limitations: [] };
+			const exploratory = input.exploratory === true || !baseline;
+			const goal: CurrentGoal = { version: 1, runId: record.runId, lifecycle: "active", startedAt: record.startedAt, updatedAt: record.startedAt, goal: input.goal.trim(), problemRelation: input.problemRelation.trim(), constraints: input.constraints.map((x) => nonempty(x, "constraint")), successCriteria: input.successCriteria.map((x) => nonempty(x, "success criterion")), plan: input.plan.trim(), exploratory, formalBaseline: !!baseline && !exploratory, problemSnapshotPath: frozen, knowledgeSnapshot: baseline?.knowledgeSnapshot, m04BaselineRunId: baseline?.run.runId, baselineHistory: baseline ? [{ at: record.startedAt, knowledgeSnapshot: baseline.knowledgeSnapshot, m04RunId: baseline.run.runId }] : [], tasks: [], decisions: [], limitations: [] };
 			await save(ctx, goal);
 			return goal;
 		},
@@ -158,14 +194,15 @@ export function createM07Controller(ctx: StageContext): M07Controller {
 		async plan(runId, plan, options) {
 			const goal = await load(ctx, runId); requireActive(goal); goal.plan = nonempty(plan, "plan");
 			if (options?.refreshBaseline) {
-				const m04 = await ctx.ws.latestCompletedRun("M04"); if (!m04) throw new HarnessError("m07.baseline", "没有可用于刷新基线的已完成 M04 运行");
-				const snapshot = await ctx.store.current(); goal.m04BaselineRunId = m04.runId; goal.knowledgeSnapshot = snapshot?.id; goal.formalBaseline = true; goal.baselineHistory.push({ at: nowIso(), knowledgeSnapshot: snapshot?.id, m04RunId: m04.runId });
+				const baseline = await latestFormalBaseline(ctx); if (!baseline) throw new HarnessError("m07.baseline", "没有可用于刷新基线的 M04 运行");
+				goal.m04BaselineRunId = baseline.run.runId; goal.knowledgeSnapshot = baseline.knowledgeSnapshot; goal.formalBaseline = true; goal.exploratory = false; goal.baselineHistory.push({ at: nowIso(), knowledgeSnapshot: baseline.knowledgeSnapshot, m04RunId: baseline.run.runId });
 			}
 			await save(ctx, goal); return goal;
 		},
 
 		async delegate(runId, spec) {
 			const goal = await load(ctx, runId); requireActive(goal); nonempty(spec.objective, "task objective");
+			await requireCurrentFormalBaseline(ctx, goal);
 			spec = { ...spec, objective: spec.objective.trim(), inputs: normalizedUnique(spec.inputs, "task input"), expectedOutputs: normalizedUnique(spec.expectedOutputs, "expected output"), checks: normalizedUnique(spec.checks, "task check") };
 			if (!spec.checks.length) throw new HarnessError("m07.task", "每个任务必须定义至少一项实际检查；推导可用会话报告作为证据");
 			if (spec.mode === "execute" && !spec.expectedOutputs.length) throw new HarnessError("m07.task", "execute 任务必须声明至少一个预期产物");
@@ -249,6 +286,14 @@ export function createM07Controller(ctx: StageContext): M07Controller {
 
 		async finish(runId, input) {
 			const goal = await load(ctx, runId); requireActive(goal);
+			let invalidBaseline: string | undefined;
+			try { await requireCurrentFormalBaseline(ctx, goal); }
+			catch (error) {
+				if (input.outcome === "fulfilled") throw error;
+				invalidBaseline = (error as Error).message;
+				goal.formalBaseline = false;
+				goal.exploratory = true;
+			}
 			if (goal.tasks.some((task) => task.status === "running")) throw new HarnessError("m07.finish", "存在状态未知的 running 任务；本版只能查看且不能结束目标、自动重跑或假称已停止");
 			if (input.goalChecks.length !== goal.successCriteria.length || goal.successCriteria.some((criterion) => !input.goalChecks.some((c) => c.criterion === criterion))) throw new HarnessError("m07.finish", "必须逐项映射原目标 successCriteria，不能以子任务状态代替目标验收");
 			const acceptedEvidence = new Map<string, string>(); for (const task of goal.tasks.filter((item) => item.status === "accepted")) { if (task.reportPath && task.review) { const frozen = await realpath(task.review.frozenReportPath); acceptedEvidence.set(frozen, frozen); if (existsSync(task.reportPath)) acceptedEvidence.set(await realpath(task.reportPath), frozen); } for (const artifact of task.review?.artifacts ?? []) { const frozen = await realpath(artifact.path); acceptedEvidence.set(frozen, frozen); if (artifact.sourcePath && existsSync(artifact.sourcePath)) acceptedEvidence.set(await realpath(artifact.sourcePath), frozen); } for (const check of task.review?.checks ?? []) for (const evidence of check.evidence) { const frozen = await realpath(evidence); acceptedEvidence.set(frozen, frozen); } }
@@ -258,7 +303,9 @@ export function createM07Controller(ctx: StageContext): M07Controller {
 			const effectiveTasks = goal.tasks.filter((item) => !superseded.has(item.taskId));
 			if (input.outcome === "fulfilled") { if (canonicalGoalChecks.some((c) => c.result !== "passed" || !c.evidence.length)) throw new HarnessError("m07.finish", "fulfilled 要求每项原目标成功标准均通过并有实际文件证据"); if (goal.decisions.some((d) => d.status === "open")) throw new HarnessError("m07.finish", "存在待用户决定事项，不能标记 fulfilled"); if (effectiveTasks.some((t) => t.status !== "accepted")) throw new HarnessError("m07.finish", "存在未接受且未被合法替代的任务，不能标记 fulfilled"); if (!goal.tasks.length) throw new HarnessError("m07.finish", "没有实际任务，不能标记 fulfilled"); }
 			goal.goalChecks = canonicalGoalChecks;
-			goal.lifecycle = "finished"; goal.outcome = input.outcome; goal.finishSummary = nonempty(input.summary, "summary"); goal.returnPath = input.returnPath; goal.limitations.push(...(input.limitations ?? [])); goal.feedbackPath = await writeFeedback(ctx, goal); await save(ctx, goal);
+			goal.lifecycle = "finished"; goal.outcome = input.outcome; goal.finishSummary = nonempty(input.summary, "summary"); goal.returnPath = input.returnPath; goal.limitations.push(...(input.limitations ?? []));
+			if (invalidBaseline) goal.limitations.push(`原正式基线已失效：${invalidBaseline}；本次仅如实记录 ${input.outcome} 并回流，不表示原目标完成。`);
+			goal.feedbackPath = await writeFeedback(ctx, goal); await save(ctx, goal);
 			const run = await ctx.ws.readRun("M07", runId); run.outputs.push({ label: "M07 实际执行反馈包", path: goal.feedbackPath }); run.remarks.push(`目标结果 ${input.outcome}；主 Agent 选择返回 ${input.returnPath}。会话返回不等于科学验收。`); for (const t of goal.tasks) { if (t.session) run.sessions.push({ label: t.session.label, role: t.session.role, id: t.session.id, file: t.session.file, model: t.session.model }); if (t.executionFailure) run.failures.push(`${t.taskId} 执行失败：${t.executionFailure}`); if (t.review) { for (const f of t.review.failures) run.failures.push(`${t.taskId}：${f}`); for (const u of t.review.unexecuted) run.failures.push(`${t.taskId} 未执行：${u}`); } } await ctx.ws.finishRun(run, input.outcome === "blocked" ? "failed" : "completed"); await ctx.ws.writeNote(run, `M07 主 Agent 目标式执行；保留原目标、所有任务、失败、未执行和限制。最终选择返回 ${input.returnPath}。`);
 			return goal;
 		},

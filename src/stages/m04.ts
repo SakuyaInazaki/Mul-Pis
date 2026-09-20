@@ -151,11 +151,12 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 				await ctx.ws.writeOutput(record, "knowledge-pack.md", pack.markdown, "提供给研究会话的局部知识包");
 				if (pack.truncated) record.remarks.push(`知识包按长度截断，未展开：${pack.omitted.join(", ")}`);
 			}
-			const message = await buildM04Message({ materials, feedbackLabel: feedback.label, feedback: feedback.text, artifactPaths: feedback.artifactPaths, knowledgePack, includeProblem: mode === "research-session" });
+			const identityContract = `\n\n【知识记录身份契约】\n- 只有上方局部知识包明确列出的 ID 才能直接引用为已有记录；意见、报告或历史正文中的 C001/J001/E001 等字样可能只是叙述标签，不得猜测或映射成知识库 ID。\n- 本批新建记录如需互相引用，每个 create 先声明唯一局部 handle（如 \"handle\":\"$claim\"），后续操作可用 \"refs\":[{\"rel\":\"supports\",\"target\":\"$claim\"}] 或将 decide/limit 的目标写为 $claim。只引用已在同一数组更早创建的 handle；handle 仅在本提案内有效，合入时才分配正式 ID。\n- 局部包可能截断或没有展开相关旧记录。需修订、决定或限制但看不到对应 ID 时，先请求补足相关记录或保留待补证，不得重建重复记录或绕过旧限制。只有确认是全新对象时才用 handle 新建；不伪造 ID。`;
+			const message = (await buildM04Message({ materials, feedbackLabel: feedback.label, feedback: feedback.text, artifactPaths: feedback.artifactPaths, knowledgePack, includeProblem: mode === "research-session" })) + identityContract;
 			await ctx.ws.writeOutput(record, "message.md", message, "发送给研究会话的完整消息");
 
 			const allowedM08Paths = feedback.m08?.manifest.entries.map((x) => x.relativePath) ?? [];
-			const m08DispositionInstruction = feedback.m08 ? `\n\n本轮必须在处理文本末尾输出一个 JSON 代码块，围栏名为 m08-disposition，结构严格为：{\"m08RunId\":\"${feedback.m08.runId}\",\"status\":\"ready|partial|rework|needs_evidence|unresolved\",\"deliverablePaths\":[\"固定材料 relativePath\"],\"limitations\":[\"...\"],\"rationale\":\"非空理由\"}。deliverablePaths 只允许从以下精确相对路径选择：${allowedM08Paths.join("、")}。ready/partial 必须至少选择一项；这是用途处置，不是投票或科学认证；无法判断不得写 ready。` : "";
+			const m08DispositionInstruction = feedback.m08 ? `\n\n【M08 固定材料访问契约】\n上方审查反馈包只是意见汇总，“实际产物位置”也只是索引；它们不表示你已读取待交付材料。若要给出 ready 或 partial，必须在本会话中用 m08_material_read 按下列精确 relativePath 实际读取每一项准备写入 deliverablePaths 的文件；目录项至少读取其中一个与处置直接相关的真实文件。PDF 文本层不足以核对公式、表格或图时，用 render_pdf_page 渲染相关页。工具会记录实际访问路径，仅在正文里复述或引用路径不算读取。\n可访问的固定材料：${allowedM08Paths.map((p) => `\n- ${p}`).join("")}\n\n本轮必须在处理文末尾输出 m08-disposition JSON 代码块。合法 status 只有 ready、partial、rework、needs_evidence、unresolved。结构示例：{\"m08RunId\":\"${feedback.m08.runId}\",\"status\":\"partial\",\"deliverablePaths\":[\"上述某一精确 relativePath\"],\"limitations\":[\"实际限制\"],\"rationale\":\"非空理由\"}。deliverablePaths 只允许从上述精确相对路径选择。ready/partial 必须至少选择一项；这是用途处置，不是投票或科学认证；无法判断不得写 ready。` : "";
 			const finalMessage = message + m08DispositionInstruction;
 			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-message.md", finalMessage, "发送给 M04 的固定 M08 消息");
 			const m08RenderedPages: string[] = [];

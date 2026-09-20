@@ -41,10 +41,51 @@ test("begin freezes problem and baseline; exploratory must be explicit without M
 	assert.equal(allowed.formalBaseline, false);
 });
 
+test("latest incomplete or failed M04 blocks formal baseline instead of falling back", async (t) => {
+	const f = await fixture(t);
+	const failed = await f.ws.startRun("M04", [{ label: "新处理", path: f.ws.problemFile }]);
+	failed.failures.push("知识提案未合入");
+	await f.ws.finishRun(failed, "failed");
+	await assert.rejects(f.controller.begin(begin), /\u6700\u65b0 M04.*failed|\u4e0d得回退/);
+	const exploratory = await f.controller.begin({ ...begin, exploratory: true });
+	assert.equal(exploratory.formalBaseline, false);
+	assert.equal(exploratory.m04BaselineRunId, undefined);
+});
+
+test("completed M04 with an unmerged proposal is not a formal baseline", async (t) => {
+	const f = await fixture(t, false);
+	const run = await f.ws.startRun("M04", [{ label: "原问题", path: f.ws.problemFile }]);
+	const proposal = path.join(f.ws.runDir("M04", run.runId), "proposal.json"); await writeFile(proposal, "{}\n");
+	run.outputs.push({ label: "知识提案", path: proposal });
+	await f.ws.finishRun(run, "completed");
+	await assert.rejects(f.controller.begin(begin), /未成功合入/);
+});
+
+test("formal goals reject fulfilled on a failed latest M04 but can return blocked or partial evidence", async (t) => {
+	const f = await fixture(t); const goal = await f.controller.begin(begin);
+	const newer = await f.ws.startRun("M04", [{ label: "新处理", path: f.ws.problemFile }]);
+	newer.failures.push("新限制尚未完整合入"); await f.ws.finishRun(newer, "failed");
+	await assert.rejects(f.controller.delegate(goal.runId, { objective: "不得基于旧正式基线继续", inputs: [], expectedOutputs: [], checks: ["基线有效"], mode: "reason" }), /最新 M04/);
+	await assert.rejects(f.controller.finish(goal.runId, { outcome: "fulfilled", summary: "不得绕过", returnPath: "M08", goalChecks: begin.successCriteria.map((criterion) => ({ criterion, result: "passed", evidence: [] })) }), /最新 M04/);
+	const blocked = await f.controller.finish(goal.runId, { outcome: "blocked", summary: "新 M04 失败，如实回流", returnPath: "M04", goalChecks: begin.successCriteria.map((criterion) => ({ criterion, result: "not_run", evidence: [] })) });
+	assert.equal(blocked.formalBaseline, false); assert.equal(blocked.exploratory, true);
+	assert.match(blocked.limitations.at(-1)!, /原正式基线已失效/);
+	assert.match(await readFile(blocked.feedbackPath!, "utf8"), /原目标完成/);
+
+	const p = await fixture(t); const partialGoal = await p.controller.begin(begin);
+	const failed = await p.ws.startRun("M04", [{ label: "新失败", path: p.ws.problemFile }]); failed.failures.push("未合入"); await p.ws.finishRun(failed, "failed");
+	const partial = await p.controller.finish(partialGoal.runId, { outcome: "partial", summary: "仅保留局部记录", returnPath: "M04", goalChecks: begin.successCriteria.map((criterion) => ({ criterion, result: "not_run", evidence: [] })) });
+	assert.equal(partial.outcome, "partial"); assert.equal(partial.formalBaseline, false);
+	assert.match(partial.limitations.at(-1)!, /不表示原目标完成/);
+});
+
 test("delegate is fresh and returned is not accepted; retry is a new retained task", async (t) => {
 	const f = await fixture(t); const goal = await f.controller.begin(begin);
 	const input = path.join(f.root, "input.txt"); await writeFile(input, "fixed input\n");
 	const first = await f.controller.delegate(goal.runId, { objective: "运行局部实验", inputs: [input], expectedOutputs: ["result.txt"], checks: ["结果文件存在且口径正确"], mode: "execute" });
+	const executionMessage = [...f.runner.sessions.values()].at(-1)!.transcript[0].text;
+	assert.match(executionMessage, /先做本地可完成的语法、类型、编译与兼容性预检/);
+	assert.match(executionMessage, /M05\/M06→M04/);
 	assert.equal(first.status, "returned");
 	assert.equal(f.runner.created.at(-1)?.tools.kind, "execution");
 	assert.equal(first.inputCopies.length, 1);

@@ -13,6 +13,7 @@ import { PiSessionRunner } from "../../src/runner/pi.ts";
 import { FakeSessionRunner } from "../../src/runner/fake.ts";
 import type { CustomToolSpec, SessionSpec, ToolGrant } from "../../src/runner/types.ts";
 import { HarnessError } from "../../src/types.ts";
+import { readTelemetry } from "../../src/dashboard/telemetry.ts";
 
 const MODEL = {
 	id: "offline-model",
@@ -141,7 +142,7 @@ test("isolates all discovered resources and preserves the exact system prompt", 
 	assert.equal(stub.calls.length, 1);
 	const loader = stub.calls[0].resourceLoader;
 	assert(loader);
-	assert.equal(loader.getSystemPrompt(), "EXACT SYSTEM PROMPT\nwith a second line");
+	assert.match(loader.getSystemPrompt() ?? "", /^EXACT SYSTEM PROMPT\nwith a second line\n\n输入信任边界：/);
 	assert.deepEqual(loader.getAppendSystemPrompt(), []);
 	assert.deepEqual(loader.getAgentsFiles().agentsFiles, []);
 	assert.deepEqual(loader.getSkills().skills, []);
@@ -221,7 +222,7 @@ test("writes the sidecar next to the SDK path and resume rebuilds from it", asyn
 	await created.prompt("persist this session");
 	const resumed = await runner.resume({ ...created.ref, label: "untrusted-ref-label", model: "offline/wrong" });
 	assert.equal(stub.calls.length, 2);
-	assert.equal(stub.calls[1].resourceLoader?.getSystemPrompt(), "persisted boundary");
+	assert.match(stub.calls[1].resourceLoader?.getSystemPrompt() ?? "", /^persisted boundary\n\n输入信任边界：/);
 	assert.equal(resumed.ref.label, original.label);
 	assert.equal(resumed.ref.model, original.model);
 });
@@ -343,6 +344,22 @@ test("removes the abort listener after a normal prompt", async (t) => {
 	controller.abort();
 	await Promise.resolve();
 	assert.equal(stub.abortCalls, 0);
+});
+
+test("runner reports only allowlisted idle and archived lifecycle metadata", async (t) => {
+	const root = await fixture(t);
+	const persistDir = path.join(root, ".agent", "sessions");
+	await mkdir(persistDir, { recursive: true });
+	const stub = stubFactory();
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory }).create(spec(persistDir));
+	await handle.prompt("sensitive prompt must not be recorded");
+	const idle = await readTelemetry(root, handle.ref.id);
+	assert.equal(idle?.activity, "idle");
+	assert.equal(idle?.outcome, "completed");
+	assert.doesNotMatch(JSON.stringify(idle), /sensitive prompt/);
+	handle.dispose();
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal((await readTelemetry(root, handle.ref.id))?.activity, "ended");
 });
 
 test("fake runner rejects cached custom and execution sessions on resume", async (t) => {

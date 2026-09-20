@@ -27,7 +27,7 @@ export interface M02Result {
 }
 
 export function m02ProposalInstructions(): string {
-	return `保存方式：在文字候选判据之后，追加一个 \`\`\`${KNOWLEDGE_PROPOSALS_FENCE} 代码块，内容为 JSON 数组，把每条候选判据写成一个 {"op":"create","type":"K","title":"简短名称","body":"检查对象、判据内容、依据、成立条件、检查办法、满足或违反分别说明什么、不能说明什么","fields":{"category":"定义类型量纲|必要约束|特例退化极限|适用边界区分|数量级标度界","nature":"必要约束|条件性约束|诊断性预期"},"usageDecision":"candidate","evidenceStatus":"本轮推导或题设"} 操作。全部是候选，不写成正式采用状态。`;
+	return `保存方式：在文字候选判据之后，追加一个 \`\`\`${KNOWLEDGE_PROPOSALS_FENCE} 代码块，内容为 JSON 数组，把每条候选判据写成一个 {"op":"create","type":"K","title":"简短名称","body":"检查对象、判据内容、依据、成立条件、检查办法、满足或违反分别说明什么、不能说明什么","fields":{"category":"定义类型量纲|必要约束|特例退化极限|适用边界区分|数量级标度界","nature":"必要约束|条件性约束|诊断性预期"},"usageDecision":"candidate","evidenceStatus":"本轮推导或题设"} 操作。全部是候选，不写成正式采用状态。M01 或本轮文字里自行使用的 C001、J001 等只是叙述标签，未由当前知识包提供就不是知识库 ID；本阶段不写 refs，也不把这些标签写成已存在的 C/E/J/Q/D/X 记录。`;
 }
 
 export async function runM02(ctx: StageContext, options: M02Options = {}): Promise<M02Result> {
