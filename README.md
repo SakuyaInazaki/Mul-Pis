@@ -4,8 +4,9 @@
 
 ## 当前内容
 
-- [`workflow/v1.0/`](workflow/v1.0/README.md)：用户经实战与逐环节讨论后确定的科研执行流程 v1.0，是本项目直接研究基础。
-- [`docs/`](docs/README.md)：以用户原 workflow 为入口，随后阅读逐文件理解材料、Pi 承载调研和 RSI/SoL-Pi 外部启发。Pi 报告基于 workflow 逐文件阅读讨论承载能力，实现选择仍未确定；RSI/SoL-Pi 比较不替代 workflow。
+- [`workflow/v1.0/`](workflow/v1.0/README.md)：用户经实战与逐环节讨论后确定的科研执行流程 v1.0，是本项目直接研究基础；本轮 M01–M09 调整入口见下项 foundation。
+- [`docs/research/workflow-foundation.md`](docs/research/workflow-foundation.md)：原 v1 基础理解与 M01–M09 当前对齐，明确哪些已对齐、哪些暂定、哪些仍待实现。
+- [`docs/`](docs/README.md)：其余逐文件阅读材料、M05 工具候选、Pi 承载调研和 RSI/SoL-Pi 外部启发。具体工具、模型和实现选择仍未确定。
 - [`docs/provenance.md`](docs/provenance.md)：第三方依赖和本地研究资料的固定版本与来源说明。
 - [`.agent/notes/`](.agent/notes/)：为公开整理保留的审计、研究与验收记录。
 
@@ -13,7 +14,7 @@
 
 ## 当前研究状态
 
-现行科研执行层以 workflow 已确定的 M01–M09、贯穿规范、返回条件和提示词为准。workflow 的整体结构和全部提示词已完成逐文件阅读；当前继续研究 Pi 如何忠实承载这些既有规则。
+现行科研执行层以原 workflow 为基础，并以 foundation 中记录的本轮阶段调整为当前入口。M01–M07 已对齐关键职责和会话关系；M08/M09 是按用户委托补齐的暂定安排。当前没有获准的科研运行时实现。
 
 RSI、自我改进程度、工作流改进循环以及是否使用 extension 或 SDK 均属于后续议题，当前没有据此选定系统架构。
 

@@ -4,7 +4,7 @@
 
 - This repository is a documentation and research baseline for a general scientific workflow carried by the Pi agent harness.
 - Do not claim that a runtime research engine or self-improving research system exists unless executable evidence is added and verified.
-- The current research-execution layer is the workflow's established M01–M09 and its existing cross-cutting rules. RSI and workflow self-improvement are later topics, not current execution-layer rules.
+- The current research-execution layer uses `workflow/v1.0/` as its original baseline. Current stage alignment is recorded in the “当前对齐” section of `docs/research/workflow-foundation.md`; RSI and workflow self-improvement are later topics, not current execution-layer rules.
 
 ## Workflow ownership
 
@@ -29,7 +29,7 @@
 
 ## Collaboration
 
-- The main agent owns requirement clarification, design judgment, orchestration, and acceptance.
+- For work on this Codex repository, the main agent owns requirement clarification, implementation-design judgment, orchestration, and acceptance. This does not move the workflow's substantive M04 scientific judgment away from the research session and model to be chosen later.
 - Prefer delegating bounded implementation, large code reads, bulk changes, and tests to execution subagents when the environment supports them.
 - The model requested for execution in the current Codex project session is `gpt-5.6-sol`.
 - These collaboration rules do not assert that Pi already provides the same subagent behavior and do not select a future Pi model-routing design.
