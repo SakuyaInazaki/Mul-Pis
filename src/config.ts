@@ -42,6 +42,19 @@ export function validateConfig(input: unknown): HarnessConfig {
 		parseModelSpec(value);
 		roles[key as Role | "default"] = value;
 	}
+	let m03Reviewers: HarnessConfig["m03Reviewers"];
+	if (obj.m03Reviewers !== undefined) {
+		if (!Array.isArray(obj.m03Reviewers) || obj.m03Reviewers.length === 0) throw new HarnessError("config.m03-reviewers", "m03Reviewers 必须是非空数组");
+		m03Reviewers = obj.m03Reviewers.map((raw, index) => {
+			if (!raw || typeof raw !== "object") throw new HarnessError("config.m03-reviewers", `m03Reviewers[${index}] 必须是对象`);
+			const item = raw as Record<string, unknown>;
+			if (typeof item.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(item.id)) throw new HarnessError("config.m03-reviewers", `m03Reviewers[${index}].id 必须是安全且非空的标识`);
+			if (typeof item.model !== "string") throw new HarnessError("config.m03-reviewers", `m03Reviewers[${index}].model 必须是字符串`);
+			parseModelSpec(item.model);
+			return { id: item.id, model: item.model };
+		});
+		if (new Set(m03Reviewers.map((item) => item.id)).size !== m03Reviewers.length) throw new HarnessError("config.m03-reviewers", "m03Reviewers id 不能重复");
+	}
 	const tools: HarnessConfig["tools"] = {};
 	if (obj.tools !== undefined) {
 		if (!obj.tools || typeof obj.tools !== "object") throw new HarnessError("config.tools", "tools 必须是对象");
@@ -69,7 +82,7 @@ export function validateConfig(input: unknown): HarnessConfig {
 		}
 		concurrency = obj.concurrency;
 	}
-	return { roles, concurrency, tools };
+	return { roles, ...(m03Reviewers ? { m03Reviewers } : {}), concurrency, tools };
 }
 
 export async function loadConfig(path: string): Promise<HarnessConfig> {

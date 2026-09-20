@@ -160,11 +160,8 @@ export class Workspace {
 	/** Most recent completed run of a stage, or undefined. */
 	async latestCompletedRun(stage: string): Promise<StageRunRecord | undefined> {
 		const ids = await this.listRuns(stage);
-		for (let i = ids.length - 1; i >= 0; i--) {
-			const record = await this.readRun(stage, ids[i]);
-			if (record.status === "completed") return record;
-		}
-		return undefined;
+		const completed = (await Promise.all(ids.map((id) => this.readRun(stage, id)))).filter((record) => record.status === "completed");
+		return completed.sort((left, right) => left.startedAt.localeCompare(right.startedAt) || (left.finishedAt ?? "").localeCompare(right.finishedAt ?? "") || left.runId.localeCompare(right.runId)).at(-1);
 	}
 
 	async writeOutput(record: StageRunRecord, name: string, content: string, label: string = name): Promise<OutputRef> {

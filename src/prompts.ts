@@ -96,11 +96,11 @@ export async function buildM03QuestionMessage(m: ProblemMaterials, m01Output: st
 	);
 }
 
-export function buildM03AnswerMessage(m02Output: string, questions: string): string {
+export function buildM03AnswerMessage(m02Output: string | undefined, questions: string): string {
 	return join(
 		"【第三轮：回答外部质询】",
-		"以下是另一独立会话依据你的初始认识与原始材料形成的候选判据完整产出；随后是外部评审提出的问题。请逐题完整回答，保留完整推理、成立条件与限制；题目本身如有错误前提，允许你指出并纠正。不要只交摘要。",
-		section("候选判据（M02 会话的完整产出）", m02Output),
+		m02Output === undefined ? "以下是下一组独立外部评审提出的问题。候选判据已在本轮第一次回答时完整提供，不在各组间重复。请逐题完整回答，保留完整推理、成立条件与限制；题目本身如有错误前提，允许你指出并纠正。不要只交摘要。" : "以下是另一独立会话依据你的初始认识与原始材料形成的候选判据完整产出；随后是外部评审提出的问题。请逐题完整回答，保留完整推理、成立条件与限制；题目本身如有错误前提，允许你指出并纠正。不要只交摘要。",
+		...(m02Output === undefined ? [] : [section("候选判据（M02 会话的完整产出）", m02Output)]),
 		section("外部质询问题", questions),
 	);
 }

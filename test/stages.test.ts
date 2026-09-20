@@ -158,7 +158,7 @@ describe("stages with the scripted runner", () => {
 		assert.ok(!answerMessage.includes(SECRET), "rationale must not reach the answering session");
 		const rationaleFile = result.record.outputs.find((o) => o.label.startsWith("出题说明"))!;
 		assert.ok((await readFile(rationaleFile.path, "utf8")).includes(SECRET));
-		assert.equal(result.answers, "完整回答 ANSWER：问1 的回答……");
+		assert.ok(result.answers.includes("完整回答 ANSWER：问1 的回答……"));
 		assert.ok(result.evaluation.startsWith("逐题评价"));
 		const reviewerState = [...runner.sessions.values()].find((s) => s.spec.label === "M03-reviewer")!;
 		assert.equal(reviewerState.transcript.filter((m) => m.role === "user").length, 2, "same reviewer session evaluated");
@@ -216,6 +216,71 @@ describe("stages with the scripted runner", () => {
 		assert.ok(message.includes("日平均值"));
 		assert.equal(result.snapshotId, undefined, "no proposals means no new snapshot");
 		assert.ok(result.record.remarks.some((r) => r.includes("没有知识提案")));
+	});
+
+	it("M03 reviewer pool isolates three sessions, serializes M01 answers, and aggregates all sources for M04", async () => {
+		const poolRunner = new FakeSessionRunner(({ spec, turnIndex, message }) => {
+			if (spec.label.startsWith("M03-reviewer-")) {
+				const id = spec.label.slice("M03-reviewer-".length);
+				if (turnIndex === 1) return { text: `# 可转发问题\n\n问题-${id}\n\n# 出题说明与判断依据\n\n依据-${id}` };
+				assert.ok(message.includes(`回答-${id}`), `${id} only receives its own answer`);
+				for (const other of ["R1", "R2", "R3"].filter((value) => value !== id)) assert.ok(!message.includes(`回答-${other}`));
+				return { text: `评价-${id}` };
+			}
+			if (spec.label === "M01") {
+				const id = ["R1", "R2", "R3"].find((value) => message.includes(`问题-${value}`))!;
+				return { text: `回答-${id}` };
+			}
+			if (spec.label === "M04-research") return { text: "pool processed" };
+			throw new Error(`unexpected ${spec.label}`);
+		});
+		const poolConfig = { ...ctx.config, m03Reviewers: [
+			{ id: "R1", model: "fake/shared" }, { id: "R2", model: "fake/shared" }, { id: "R3", model: "fake/other" },
+		] };
+		const result = await runM03({ ...ctx, runner: poolRunner, config: poolConfig });
+		assert.deepEqual(poolRunner.created.map((spec) => [spec.label, spec.model]), [
+			["M03-reviewer-R1", "fake/shared"], ["M03-reviewer-R2", "fake/shared"], ["M03-reviewer-R3", "fake/other"],
+		]);
+		assert.equal(poolRunner.resumed.filter((ref) => ref.label === "M01").length, 1);
+		const m01 = [...poolRunner.sessions.values()].find((state) => state.spec.label === "M01")!;
+		const answerMessages = m01.transcript.filter((message) => message.role === "user").slice(-3);
+		assert.equal(answerMessages.length, 3);
+		assert.ok(answerMessages[0].text.includes("候选判据草案"));
+		assert.ok(!answerMessages[1].text.includes("候选判据草案"));
+		assert.ok(!answerMessages[2].text.includes("候选判据草案"));
+		for (const id of ["R1", "R2", "R3"]) {
+			const reviewer = [...poolRunner.sessions.values()].find((state) => state.spec.label === `M03-reviewer-${id}`)!;
+			assert.equal(reviewer.transcript.filter((message) => message.role === "user").length, 2);
+		}
+		assert.ok(result.members.every((member) => member.status === "completed"));
+		assert.match(result.evaluation, /评价-R1/); assert.match(result.evaluation, /评价-R2/); assert.match(result.evaluation, /评价-R3/);
+		const m04 = await runM04({ ...ctx, runner: poolRunner, config: poolConfig }, { feedback: { kind: "M03", runId: result.record.runId }, freshSession: true });
+		const m04State = [...poolRunner.sessions.values()].find((state) => state.spec.label === "M04-research")!;
+		assert.match(m04State.transcript[0].text, /评价-R1/); assert.match(m04State.transcript[0].text, /评价-R2/); assert.match(m04State.transcript[0].text, /评价-R3/);
+		assert.equal(m04.record.status, "completed");
+	});
+
+	it("M03 fails the whole batch and records the member when one reviewer fails", async () => {
+		const beforeRuns = new Set(await ws.listRuns("M03"));
+		const failingRunner = new FakeSessionRunner(({ spec, turnIndex }) => {
+			if (spec.label.startsWith("M03-reviewer-")) {
+				const id = spec.label.slice("M03-reviewer-".length);
+				if (turnIndex === 1) return { text: `# 可转发问题\n\n问题-${id}\n\n# 出题说明与判断依据\n\n依据-${id}` };
+				if (id === "R2") throw new Error("reviewer offline");
+				return { text: `评价-${id}` };
+			}
+			if (spec.label === "M01") return { text: "回答" };
+			throw new Error(`unexpected ${spec.label}`);
+		});
+		const failingCtx = { ...ctx, runner: failingRunner, config: { ...ctx.config, m03Reviewers: [{ id: "R1", model: "fake/shared" }, { id: "R2", model: "fake/shared" }] } };
+		await assert.rejects(runM03(failingCtx), /reviewer offline/);
+		const newId = (await ws.listRuns("M03")).find((id) => !beforeRuns.has(id))!; const failed = await ws.readRun("M03", newId);
+		assert.equal(failed.status, "failed");
+		assert.ok(!failed.outputs.some((output) => output.label === "逐题评价"), "partial success is not exposed as a complete aggregate");
+		const memberFile = failed.outputs.find((output) => output.label === "M03 成员清单")!;
+		const saved = JSON.parse(await readFile(memberFile.path, "utf8")) as { members: Array<{ id: string; status: string; failure?: string }> };
+		assert.equal(saved.members.find((member) => member.id === "R2")?.status, "failed");
+		assert.match(saved.members.find((member) => member.id === "R2")?.failure ?? "", /reviewer offline/);
 	});
 
 	it("M06 runs read → check → applicability per source, keeps failures, and assembles the whole batch", async () => {

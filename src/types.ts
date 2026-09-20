@@ -33,6 +33,8 @@ export interface ModelSpec {
  */
 export interface HarnessConfig {
 	roles: Partial<Record<Role | "default", string>>;
+	/** Independent M03 question/evaluation sessions. Repeated models are allowed and remain distinct sessions. */
+	m03Reviewers?: Array<{ id: string; model: string }>;
 	/** Maximum number of independent stage tasks processed at the same time. Engineering default 1. */
 	concurrency: number;
 	/** External tool endpoints for M05. Absent entries disable the corresponding provider. */

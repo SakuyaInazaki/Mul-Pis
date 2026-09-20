@@ -8,6 +8,7 @@
 |---|---|---|---|
 | 承载方式 | TypeScript 控制器直接使用本地 `third_party/pi` 的 Pi 0.85.1 SDK（`createAgentSession`），不用 RPC 子进程；`extensions/research.ts` 是显式加载的薄入口 | SDK 提供自定义 `ResourceLoader`（真实输入隔离）、`SessionManager.create/open`（持久会话与续接）、原生/自定义工具白名单、按会话指定模型；这些是 M01–M09 所需原语，见 [`pi-harness.md`](../research/pi-harness.md) 第 3–8 节 | 高：`SessionRunner` 和 `ResearchService` 隔离 SDK 与 extension 接口 |
 | 模型 | 每个实际运行子会话的角色模型来自工作区 `research.config.json`，写法 `provider/model[:thinking]`；harness 不预设任何模型。只有会启动模型会话的操作要求该配置，M07 goal/status/plan/decision/review/finish 等纯状态操作不要求 | 用户尚未选定模型，且明确 Claude 不采用；选型是用户决定 | 高 |
+| M03 评审成员 | 工作区可选 `m03Reviewers: [{ id, model }]` 显式列出成员；每项 `model` 直接写完整 `provider/model[:thinking]` 引用，可重复。只有缺省列表时才回退 `roles.reviewer`/`roles.default` 的原有单 reviewer 路径 | 允许当前用三个独立 DeepSeek 会话实验多成员编排，同时不把同模型会话误称为多模型验证，也不固定全局成员数量 | 高 |
 | 主 Agent | 一个交互式 Pi 主会话通过 `research_*` extension 工具读取状态、运行 M01–M06/M08/M09、管理 M07 目标、动态委派并验收；CLI 也可直接运行这些阶段，但仍是直接阶段入口，不经过 extension 的主会话激活、能力门禁、有限重试或正常 shutdown 记录 | Pi 核心没有内建 subagent；独立任务用新建 SDK session 实现，不再造第二个主 Agent。extension 不替换主会话模型 | 高 |
 | 提示词 | 运行时直接读取 `workflow/v1.0/提示词/*.txt`，不复制进代码 | 提示词是用户自有工作流的一部分，单一来源 | — |
 | 知识库 | 文件式：`records/<ID>/v<N>.md`、`proposals/`、`snapshots/`、`CURRENT`、`limits.json`、派生 `views/` 与 `_index/`；单一串行合入入口；停用先行；不使用任何哈希 | 手册第七章第一版形态即文件式；用户明令不引入哈希清单 | 中：接口 `KnowledgeStore` 可换后端 |
@@ -20,7 +21,7 @@
 |---|---|---|---|---|---|
 | M01 | 新会话 `M01` | execution | 无 | P01 + 原始问题 + 必要原始信息（文本） | `initial-understanding.md` |
 | M02 | 新会话 `M02`（与 M01 相同模型，不继承历史） | execution | 无 | P02 + 原始材料 + M01 完整产出 + 保存约定 | `criteria-candidates.md`，K 候选入库 |
-| M03 | 新会话 `M03-reviewer` 出题；续接 `M01` 作答；续接 `M03-reviewer` 评价 | reviewer / execution / reviewer | 无 | P03Q + 材料 + M01 + M02；M02 完整产出 + 可转发问题；P03A + 完整回答 | `questions.md`、`rationale.md`（不转发）、`answers.md`、`evaluation.md` |
+| M03 | 每个显式成员各建独立 reviewer 会话出题；收齐后续接同一 `M01` 按成员串行作答；各 reviewer 只在自己的原会话评价自己的答案。缺省配置沿用单 reviewer | 成员项直接指定的模型 / execution / 同一成员模型 | 无 | 各 reviewer：P03Q + 同一冻结材料 + M01 + M02；M01：逐组可转发问题，M02 完整产出仅首组附带；各 reviewer：P03A + 自己那组完整回答 | 按成员保存问题、依据、回答和评价；完整批次汇总产物 |
 | M04 | 有合格 M01 基线且尚无既往 M04 时可续接 `M01`；M07/M08 反馈和其他不满足基线资格的情况使用新会话 `M04-research` | execution / research | 普通处理无工具；M08 反馈会话只读该轮 frozen root，可读取待处置材料和按需渲染 PDF 页 | P04 + 意见 + 产物位置（新会话另加原始问题与局部知识包）；M08 处置须实际访问准备列为可交付的固定材料 | `processing.md`、知识提案、`merge.json`；M08 另有访问覆盖与 `m08-disposition.json` |
 | M05 | 新会话 `M05` | acquisition | 自定义工具：web_search、find_open_access、fetch_page、list_page_links、download_file、extract_pdf、render_pdf_page、read_work_file、view_work_image、register_source、list_sources（配置了 browser-use 模型时另有 browse_interactive）；文件访问限定在本轮 `references/_work/<run>/` 与已登记来源 | P05 + 本轮目标 + 原始材料 + 局部知识包（C/K/Q/X）+ 已有索引 + 工具规则 | `acquisition-report.md`、`tool-log.jsonl`、`references/search/R###-<run>.md`、供 M06 使用的新登记 `sources/S###/` |
 | M06 | 每份资料三个新会话：`-reader`、`-checker`、`-applicability` | reader / checker / applicability | 前两者：限定在资料目录的只读工具 + `render_pdf_page`（把 PDF 单页渲染成图片直接返回，供多模态模型看公式、表格、图和扫描页）；第三者：无 | 材料 + 阅读要求；材料 + 阅读记录；经核对内容 + 同一份项目状态 | 每组三份记录、`batch-summary.md`、`batch.json` |
@@ -42,8 +43,8 @@ M07 先冻结原问题副本、目标关系、约束、成功要求、计划和�
 
 - 角色系统提示 `ROLE_SYSTEM_PROMPTS`（七种角色各一段）。
 - 材料标签 `【原始问题】`、`【必要原始信息：…】`、`【初始认识（…）】` 等。
-- M03 出题格式要求：两个一级标题 `# 可转发问题` / `# 出题说明与判断依据`，缺一不转发。
-- M03 作答框架 `【第三轮：回答外部质询】`（原 v1 无专用答题提示词，只转发问题；这里补一句说明 M02 产出的来源与“题目可被纠正”）。
+- M03 每个成员的出题格式要求：两个一级标题 `# 可转发问题` / `# 出题说明与判断依据`，缺一则该成员失败且整批不能静默跳过。
+- M03 作答框架 `【第三轮：回答外部质询】`（原 v1 无专用答题提示词，只转发问题；首组补一句说明 M02 产出的来源与“题目可被纠正”，后续组不重复附带 M02 完整产出）。
 - M02/M04 的 `knowledge-proposals` 代码块约定（JSON 操作数组）。
 - M05 的工具规则与报告小节要求（`buildM05Message`），以及各工具的描述文字。
 - M06 三类任务框架（依据手册第十章 1–3 节改写为面向阅读者/核对者/适用性会话的任务说明）。

@@ -17,14 +17,17 @@ export interface InitResult {
 }
 
 export const CONFIG_TEMPLATE = `{
-  "roles": {
+	  "roles": {
     "execution": "provider/model:thinking",
     "reviewer": "provider/model:thinking",
     "research": "provider/model:thinking",
     "reader": "provider/model",
     "checker": "provider/model",
     "applicability": "provider/model"
-  },
+	  },
+	  "m03Reviewers": [
+	    { "id": "R1", "model": "provider/model:thinking" }
+	  ],
   "concurrency": 1
 }
 `;

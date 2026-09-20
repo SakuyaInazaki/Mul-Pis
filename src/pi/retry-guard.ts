@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { HarnessError } from "../types.ts";
 import type { StageRequest } from "./service.ts";
+import { Workspace } from "../workspace.ts";
 
 interface FailureState { fingerprint: string; signature: string; consecutive: number; updatedAt: string }
 interface Ledger { version: 1; failures: FailureState[] }
@@ -53,7 +54,16 @@ export async function stageInputVersion(workspace: string, request: StageRequest
 	if (request.feedbackFile) files.push(path.resolve(workspace, request.feedbackFile));
 	for (const source of request.sources ?? []) if (!/^https?:\/\//i.test(source)) files.push(path.resolve(workspace, source));
 	for (const material of request.materials ?? []) files.push(path.resolve(workspace, material.path));
-	return Promise.all([...new Set(files)].map(fileVersion));
+	const fileVersions = await Promise.all([...new Set(files)].map(fileVersion));
+	if (request.stage !== "M03") return fileVersions;
+	const ws = new Workspace(workspace);
+	const config = await ws.loadConfig();
+	const m01RunId = request.m01RunId ?? (await ws.latestCompletedRun("M01"))?.runId;
+	const m02RunId = request.m02RunId ?? (await ws.latestCompletedRun("M02"))?.runId;
+	// IDs are provenance labels, not scientific inputs. Identity follows the
+	// multiset of actual models, preserving member count and repeated models.
+	const reviewerPool = (config.m03Reviewers?.map((item) => item.model) ?? [config.roles.reviewer ?? config.roles.default ?? "unconfigured"]).sort();
+	return { files: fileVersions, m01RunId, m02RunId, reviewerPool };
 }
 
 export function failureSignature(value: unknown): string | undefined {

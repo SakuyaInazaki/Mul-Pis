@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { ResearchService } from "../src/pi/service.ts";
-import { failureSignature } from "../src/pi/retry-guard.ts";
+import { failureSignature, stageFingerprint, stageInputVersion } from "../src/pi/retry-guard.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 import { Workspace } from "../src/workspace.ts";
 
@@ -31,6 +31,37 @@ test("completed run records with failures count as failed attempts", () => {
 		failureSignature({ record: { stage: "M09", status: "failed", failures: ["未实际读取 /tmp/run-a/source.json"] } }),
 		failureSignature({ record: { stage: "M09", status: "failed", failures: ["没有读取 /tmp/run-b/trace.json，coverage 不完整"] } }),
 	);
+});
+
+test("M03 retry identity follows the resolved upstream runs and configured reviewer pool", async () => {
+	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-m03-identity-"));
+	await mkdir(path.join(root, "problem", "raw"), { recursive: true });
+	await writeFile(path.join(root, "problem", "problem.md"), "problem\n");
+	const config = (pool: Array<{ id: string; model: string }>) => writeFile(path.join(root, "research.config.json"), `${JSON.stringify({ roles: {}, m03Reviewers: pool, concurrency: 1 })}\n`);
+	await config([{ id: "R1", model: "fake/model" }]);
+	const ws = new Workspace(root); const m01 = await ws.startRun("M01", []); await ws.finishRun(m01, "completed"); const m02 = await ws.startRun("M02", []); await ws.finishRun(m02, "completed");
+	const request = { stage: "M03" as const };
+	const first = stageFingerprint(request, await stageInputVersion(root, request));
+	assert.equal(first, stageFingerprint(request, await stageInputVersion(root, request)), "same pool and resolved inputs remain the same obligation");
+	await config([{ id: "R2", model: "fake/model" }]);
+	const renamed = stageFingerprint(request, await stageInputVersion(root, request));
+	assert.equal(renamed, first, "renaming a provenance label does not change the obligation");
+	await config([{ id: "R2", model: "fake/other" }]);
+	assert.notEqual(stageFingerprint(request, await stageInputVersion(root, request)), renamed, "the actual model is part of identity");
+	await config([{ id: "R2", model: "fake/model" }, { id: "R3", model: "fake/model" }]);
+	assert.notEqual(stageFingerprint(request, await stageInputVersion(root, request)), first, "adding another same-model session changes the obligation");
+	await config([{ id: "R1", model: "fake/model" }]);
+	const next = await ws.startRun("M02", []); await ws.finishRun(next, "completed");
+	assert.notEqual(stageFingerprint(request, await stageInputVersion(root, request)), first, "a new resolved upstream run changes the obligation");
+});
+
+test("latest completed run uses persisted millisecond timestamps instead of run-id suffix order", async () => {
+	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-latest-run-"));
+	const ws = new Workspace(root);
+	const base = { status: "completed" as const, inputs: [], sessions: [], outputs: [], failures: [], remarks: [] };
+	await ws.writeRun({ ...base, stage: "M01", runId: "20260920T120000Z-zzzz", startedAt: "2026-09-20T12:00:00.100Z", finishedAt: "2026-09-20T12:00:00.200Z" });
+	await ws.writeRun({ ...base, stage: "M01", runId: "20260920T120000Z-aaaa", startedAt: "2026-09-20T12:00:00.300Z", finishedAt: "2026-09-20T12:00:00.400Z" });
+	assert.equal((await ws.latestCompletedRun("M01"))?.runId, "20260920T120000Z-aaaa");
 });
 
 test("normal shutdown marks only the owned active run failed and late completion cannot overwrite it", async () => {
