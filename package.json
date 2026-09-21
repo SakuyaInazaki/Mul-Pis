@@ -1,9 +1,9 @@
 {
-  "name": "pre-rsi-research-harness",
+  "name": "mul-pis",
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Controller that carries the user's research workflow v1.0 (current alignment) on the Pi agent harness 0.85.1.",
+  "description": "Multi-Pi research workflow harness",
   "scripts": {
     "test": "node --test --test-concurrency=1 'test/**/*.test.ts'",
     "typecheck": "tsc --noEmit -p tsconfig.json",

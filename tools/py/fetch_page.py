@@ -20,7 +20,7 @@ from urllib.request import Request, urlopen
 from urllib.robotparser import RobotFileParser
 
 
-USER_AGENT = "Pre-RSI-M05/1.0 (+research acquisition; respects access controls)"
+USER_AGENT = "Mul-Pis-M05/1.0 (+research acquisition; respects access controls)"
 BLOCKED_STATUSES = {401, 403, 407, 429, 451}
 
 
