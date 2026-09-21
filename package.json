@@ -3,7 +3,6 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Multi-Pi research workflow harness",
   "scripts": {
     "test": "node --test --test-concurrency=1 'test/**/*.test.ts'",
     "typecheck": "tsc --noEmit -p tsconfig.json",
