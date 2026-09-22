@@ -1,14 +1,15 @@
-import { copyFile, lstat, mkdir, readFile, realpath } from "node:fs/promises";
+import { copyFile, lstat, mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { loadPrompt, section, systemPromptFor } from "../prompts.ts";
 import { HarnessError } from "../types.ts";
-import { nowIso, writeFileAtomic } from "../workspace.ts";
+import { nowIso, readTextIfExists, writeFileAtomic } from "../workspace.ts";
 import { mediaType } from "../media.ts";
 import { recordSession, sessionSpec, type StageContext } from "../stages/context.ts";
 import { isSafeRelativeOutputPath, resolveExpectedOutputFiles } from "./expected-output.ts";
 import type { BeginGoalInput, CurrentGoal, DecisionInput, EvidenceFile, FinishInput, InterruptInput, M07Controller, M07TaskRecord, TaskCheck, TaskReviewInput, TaskSpecInput } from "./types.ts";
 import type { StageRunRecord } from "../types.ts";
+import { loadActiveBudgetPolicy, projectInline, validateActiveBudgetPointer, validateBudgetPolicy, type BudgetPolicy } from "../improvement/policy.ts";
 
 const STATE = "goal.json";
 function nonempty(value: string, label: string): string {
@@ -59,6 +60,26 @@ async function load(ctx: StageContext, runId: string): Promise<CurrentGoal> {
 	} catch (error) {
 		throw new HarnessError("m07.missing", `找不到 M07 目标 ${runId}：${(error as Error).message}`);
 	}
+}
+
+async function activePolicySnapshot(ctx: StageContext): Promise<{ policy: BudgetPolicy; versionId: string }> {
+	const pointerPath = path.join(ctx.ws.root, ".agent", "improvement", "active.json");
+	for (let attempt = 0; attempt < 3; attempt++) {
+		const before = await readTextIfExists(pointerPath);
+		const policy = await loadActiveBudgetPolicy(ctx.ws.root);
+		const after = await readTextIfExists(pointerPath);
+		if (before !== after) continue;
+		if (!before) return { policy, versionId: "builtin-default" };
+		let parsed: unknown;
+		try { parsed = JSON.parse(before); } catch { throw new HarnessError("improvement.active", "active.json 不是合法 JSON"); }
+		return { policy, versionId: validateActiveBudgetPointer(parsed).versionId };
+	}
+	throw new HarnessError("m07.policy-race", "活动预算策略在 M07 begin 期间连续变化；未冻结不一致快照，请重试 begin");
+}
+
+function frozenPolicy(goal: CurrentGoal): BudgetPolicy {
+	if (!goal.budgetPolicy || !goal.budgetPolicyVersionId || !goal.budgetPolicyFrozenAt) throw new HarnessError("m07.policy-legacy", `M07 目标 ${goal.runId} 创建于策略冻结机制之前；可查看，但不得悄悄套用当前 active policy 继续委派或生成反馈，请新建目标`);
+	return validateBudgetPolicy(goal.budgetPolicy);
 }
 
 interface FormalBaseline { run: StageRunRecord; knowledgeSnapshot?: string }
@@ -112,11 +133,31 @@ function uniqueName(index: number, source: string): string {
 	return `${String(index + 1).padStart(3, "0")}-${path.basename(source).replace(/[^a-zA-Z0-9._-]/g, "_")}`;
 }
 
-async function taskMessage(ctx: StageContext, goal: CurrentGoal, task: TaskSpecInput, copies: M07TaskRecord["inputCopies"], knowledgePack?: string): Promise<string> {
+async function textInventory(file: string, displayPath: string): Promise<{ text: string; chars: number; bytes: number; path: string }> {
+	const text = await readFile(file, "utf8");
+	return { text, chars: text.length, bytes: (await stat(file)).size, path: displayPath };
+}
+
+function omissionLine(item: { chars: number; bytes: number; path: string }, shown: number): string {
+	const shownRange = shown > 0 ? `1–${shown}` : "无（0 字符）";
+	const unreadRange = shown < item.chars ? `${shown + 1}–${item.chars}` : "无";
+	return `- ${item.path}；${item.bytes} bytes / ${item.chars} 字符；已显示字符 ${shownRange}；未显示字符 ${unreadRange}；原文完整保留，可用只读工具按需读取。`;
+}
+
+async function taskMessage(ctx: StageContext, goal: CurrentGoal, task: TaskSpecInput, copies: M07TaskRecord["inputCopies"], knowledgePack: string | undefined, policy: BudgetPolicy): Promise<string> {
 	const actualInputs: string[] = [];
+	const inventory: string[] = [];
+	let inlineChars = 0;
 	for (const item of copies) {
-		if (item.mediaType === "text") actualInputs.push(section(`输入副本：${path.basename(item.copy)}`, await readFile(item.copy, "utf8")));
-		else actualInputs.push(section(`输入副本：${path.basename(item.copy)}`, "二进制输入；本消息未读取其内容，只有具备相应工具且实际读取后才能声称覆盖。"));
+		const relative = path.relative(path.dirname(path.dirname(item.copy)), item.copy);
+		if (item.mediaType === "text") {
+			const material = await textInventory(item.copy, relative);
+			const projection = projectInline(policy, material.chars, inlineChars);
+			const canInline = projection.inline;
+			if (canInline) { actualInputs.push(section(`输入副本：${path.basename(item.copy)}`, material.text)); inlineChars = projection.nextAggregateChars; }
+			inventory.push(omissionLine(material, canInline ? material.chars : 0));
+			if (!canInline && policy.overflowMode === "manifest-and-fail") throw new HarnessError("context.budget", `M07 输入 ${relative} 超出内联预算；原文已复制但策略要求拒绝而非延后读取`);
+		} else inventory.push(`- ${relative}；二进制；已显示 0 bytes；内容未读；原文件完整保留，只有实际读取后才能声称覆盖。`);
 	}
 	const boundary = [
 		section("冻结的当前目标", goal.goal),
@@ -124,7 +165,9 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, task: TaskSpecI
 		section("不可变约束", goal.constraints.map((x) => `- ${x}`).join("\n")),
 		section("原目标成功要求（本任务不得改写）", goal.successCriteria.map((x) => `- ${x}`).join("\n")),
 		section("本任务", `${task.objective}\n\n模式：${task.mode}`),
-		section("显式输入副本", copies.map((x) => `- ${path.relative(path.dirname(x.copy), x.copy)}（源：${path.relative(ctx.ws.root, x.source)}；${x.mediaType}）`).join("\n") || "无"),
+		section("冻结预算策略", `${goal.budgetPolicyVersionId}（冻结于 ${goal.budgetPolicyFrozenAt}；本目标后续不随 active policy 改变）`),
+		section("显式输入副本", copies.map((x) => `- ${path.relative(path.dirname(path.dirname(x.copy)), x.copy)}（源：${path.relative(ctx.ws.root, x.source)}；${x.mediaType}）`).join("\n") || "无"),
+		section("输入预算与读取清单", inventory.join("\n") || "无输入；没有遗漏内容。"),
 		...actualInputs,
 		section("预期产物", task.expectedOutputs.map((x) => `- ${x}`).join("\n") || "无"),
 		section("待检查事项", task.checks.map((x) => `- ${x}`).join("\n") || "无"),
@@ -133,12 +176,15 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, task: TaskSpecI
 	if (task.mode === "execute") boundary.push(section("外部执行与可消耗资源", "如任务涉及真实提交、评测、远程实验或其他可能消耗配额/费用/机会的动作：先用已提供的只读能力或额度接口核对接入和当前状态，并先做本地可完成的语法、类型、编译与兼容性预检。这不禁止任务已授权的真实实验，已授权平台评测/实验产生的结果属于本任务实测证据。每次真实动作都要记录实际结果和资源消耗；失败若仍消耗了资源，同样记录已消耗量、可见剩余量与恢复条件。平台配额不明时如实记录未知，不猜测统一配额。本地命令或客户端成功退出不等于远程实验通过。显式输入和原问题允许使用；若需取得新的外部研究参考资料并用于推理，将具体缺口报回主会话走 M05/M06→M04，不在 execute 任务里通过 bash 另造获取和采用链。"));
 	boundary.push("会话返回只表示任务已返回，不表示成果被主 Agent 接受。请如实列出实际动作、产物、失败、未执行项和限制。");
 	boundary.push("产物路径规则：expectedOutputs 必须是当前任务工作目录内的精确相对路径；说明写在 objective 或 report.md。所有实际写盘必须落在当前工作目录内，不要写到工作区根目录或绝对路径。");
-	return boundary.join("\n\n");
+	const message = boundary.join("\n\n");
+	if (message.length + systemPromptFor(task.mode === "check" ? "reviewer" : "execution").length > policy.maxPromptChars) throw new HarnessError("context.budget", `M07 控制事实与允许内联内容共 ${message.length} 字符，超过 prompt 预算 ${policy.maxPromptChars}；未静默截断`);
+	return message;
 }
 
 async function writeFeedback(ctx: StageContext, goal: CurrentGoal): Promise<string> {
+	const policy = frozenPolicy(goal);
 	const lines = [
-		"# M07 实际执行反馈包", "", `- 目标：${goal.goal}`, `- 与原问题关系：${goal.problemRelation}`, `- 目标结果：${goal.outcome ?? "进行中"}`, `- 返回路径：${goal.returnPath ?? "未选择"}`, `- 正式基线：${goal.formalBaseline ? "是" : "否（探索性）"}`, `- 知识快照：${goal.knowledgeSnapshot ?? "无"}`, "",
+		"# M07 实际执行反馈包", "", `- 目标：${goal.goal}`, `- 与原问题关系：${goal.problemRelation}`, `- 目标结果：${goal.outcome ?? "进行中"}`, `- 返回路径：${goal.returnPath ?? "未选择"}`, `- 正式基线：${goal.formalBaseline ? "是" : "否（探索性）"}`, `- 知识快照：${goal.knowledgeSnapshot ?? "无"}`, `- 冻结预算策略：${goal.budgetPolicyVersionId}（${goal.budgetPolicyFrozenAt}）`, "",
 		"## 原成功要求", "", ...goal.successCriteria.map((x) => `- ${x}`), "", "## 任务与实际证据", "",
 	];
 	for (const task of goal.tasks) {
@@ -153,7 +199,7 @@ async function writeFeedback(ctx: StageContext, goal: CurrentGoal): Promise<stri
 		if (task.toolLog.length) lines.push(`- 工具日志：${JSON.stringify(task.toolLog)}`);
 		lines.push("");
 	}
-	lines.push("## 实际材料内容", "");
+	lines.push("## 实际材料清单与预算内内容", "", "清单中的‘已显示’只表示反馈包内联范围；未显示部分没有被本反馈包或后续 M04 自动读取。", "");
 	const materialPaths = new Set<string>();
 	for (const task of goal.tasks) {
 		if (task.review) materialPaths.add(await realpath(task.review.frozenReportPath));
@@ -162,11 +208,48 @@ async function writeFeedback(ctx: StageContext, goal: CurrentGoal): Promise<stri
 		for (const check of task.review?.checks ?? []) for (const evidence of check.evidence) materialPaths.add(await realpath(evidence));
 		if (task.review?.independentCheck) materialPaths.add(await realpath(task.review.independentCheck.report));
 	}
+	let aggregateInline = 0;
 	for (const materialPath of materialPaths) {
-		if (mediaType(materialPath) === "binary") { lines.push(`### ${path.relative(ctx.ws.root, materialPath)}`, "", "二进制材料未被本反馈包读取；只记录其存在，不能据此声称覆盖内容。", ""); continue; }
-		lines.push(`### ${path.relative(ctx.ws.root, materialPath)}`, "", await readFile(materialPath, "utf8"), "");
+		const relative = path.relative(ctx.ws.runDir("M07", goal.runId), materialPath);
+		if (mediaType(materialPath) === "binary") { lines.push(`### ${relative}`, "", `- ${relative}；${(await stat(materialPath)).size} bytes；二进制；已显示 0 bytes；内容未读。`, ""); continue; }
+		const material = await textInventory(materialPath, relative);
+		const projection = projectInline(policy, material.chars, aggregateInline);
+		const canInline = projection.inline;
+		lines.push(`### ${relative}`, "", omissionLine(material, canInline ? material.chars : 0), "");
+		if (canInline) { lines.push(material.text, ""); aggregateInline = projection.nextAggregateChars; }
+		else if (policy.overflowMode === "manifest-and-fail") throw new HarnessError("context.budget", `M07 反馈证据 ${relative} 超出内联预算；冻结原文仍保留，策略要求拒绝生成延后读取包`);
 	}
 	lines.push("## 原目标验收", "", ...(goal.goalChecks?.map((c) => `- ${c.result}：${c.criterion}；证据 ${c.evidence.map((p) => path.relative(ctx.ws.root, p)).join("、") || "无"}`) ?? ["- 未验收"]), "", "## 用户决定事项", "", ...(goal.decisions.length ? goal.decisions.map((d) => `- ${d.status}：${d.question}${d.decision ? `；决定：${d.decision}` : ""}`) : ["- 无"]), "", "## 总结与限制", "", goal.finishSummary ?? "尚未结束", ...goal.limitations.map((x) => `- ${x}`));
+	const feedback = lines.join("\n");
+	if (feedback.length > policy.maxFeedbackChars) throw new HarnessError("context.budget", `M07 反馈包的控制事实与预算内清单共 ${feedback.length} 字符，超过上限 ${policy.maxFeedbackChars}；未静默截断`);
+	const target = path.join(ctx.ws.runDir("M07", goal.runId), "m04-feedback.md");
+	await writeFileAtomic(target, feedback);
+	return target;
+}
+
+async function writeLegacyInterruptFeedback(ctx: StageContext, goal: CurrentGoal): Promise<string> {
+	const lines = [
+		"# M07 legacy 受控中断反馈包", "",
+		`- 目标：${goal.goal}`,
+		`- 与原问题关系：${goal.problemRelation}`,
+		`- 目标结果：${goal.outcome ?? "blocked"}`,
+		`- 返回路径：${goal.returnPath ?? "user"}`,
+		"- 冻结预算策略：缺失（旧记录）", "",
+		"此旧目标创建时没有冻结预算策略。为保证硬停止可执行，本归档只记录控制事实和证据位置，不读取、不内联、不截断证据正文，也不套用当前 active policy。下列路径存在不表示其内容已被本反馈包核验。", "",
+		"## 原成功要求", "", ...goal.successCriteria.map((item) => `- ${item}`), "",
+		"## 任务状态与证据位置", "",
+	];
+	for (const task of goal.tasks) {
+		lines.push(`### ${task.taskId} ${task.objective}`, "", `- 状态：${task.status}`, `- 模式：${task.mode}`);
+		if (task.reportPath) lines.push(`- 会话报告位置：${path.relative(ctx.ws.root, task.reportPath)}（未由本归档读取）`);
+		for (const artifact of task.review?.artifacts ?? []) lines.push(`- 冻结产物位置：${path.relative(ctx.ws.root, artifact.path)}（未由本归档读取）`);
+		for (const check of task.review?.checks ?? []) for (const evidence of check.evidence) lines.push(`- 检查证据位置：${path.relative(ctx.ws.root, evidence)}（未由本归档读取）`);
+		if (task.executionFailure) lines.push(`- 执行失败：${task.executionFailure}`);
+		for (const failure of task.review?.failures ?? []) lines.push(`- 评审失败：${failure}`);
+		for (const item of task.review?.unexecuted ?? []) lines.push(`- 未执行：${item}`);
+		lines.push("");
+	}
+	lines.push("## 总结与限制", "", goal.finishSummary ?? "受控中断", ...goal.limitations.map((item) => `- ${item}`), "", "- legacy 归档没有证据正文覆盖，不能作为证据完整性或科学结论证明。", "");
 	const target = path.join(ctx.ws.runDir("M07", goal.runId), "m04-feedback.md");
 	await writeFileAtomic(target, lines.join("\n"));
 	return target;
@@ -183,11 +266,12 @@ export function createM07Controller(ctx: StageContext): M07Controller {
 			try { baseline = await latestFormalBaseline(ctx); }
 			catch (error) { if (!input.exploratory) throw error; }
 			if (!baseline && !input.exploratory) throw new HarnessError("m07.baseline", "没有可用的 M04 正式基线；只能显式 exploratory=true 开始探索性 M07，不能声称正式结论");
+			const budget = await activePolicySnapshot(ctx);
 			const record = await ctx.ws.startRun("M07", [{ label: "原始问题", path: problem.path }], baseline?.knowledgeSnapshot);
 			const frozen = path.join(ctx.ws.runDir("M07", record.runId), "problem-snapshot.md");
 			await writeFileAtomic(frozen, problem.content);
 			const exploratory = input.exploratory === true || !baseline;
-			const goal: CurrentGoal = { version: 1, runId: record.runId, lifecycle: "active", startedAt: record.startedAt, updatedAt: record.startedAt, goal: input.goal.trim(), problemRelation: input.problemRelation.trim(), constraints: input.constraints.map((x) => nonempty(x, "constraint")), successCriteria: input.successCriteria.map((x) => nonempty(x, "success criterion")), plan: input.plan.trim(), exploratory, formalBaseline: !!baseline && !exploratory, problemSnapshotPath: frozen, knowledgeSnapshot: baseline?.knowledgeSnapshot, m04BaselineRunId: baseline?.run.runId, baselineHistory: baseline ? [{ at: record.startedAt, knowledgeSnapshot: baseline.knowledgeSnapshot, m04RunId: baseline.run.runId }] : [], tasks: [], decisions: [], limitations: [] };
+			const goal: CurrentGoal = { version: 1, runId: record.runId, lifecycle: "active", startedAt: record.startedAt, updatedAt: record.startedAt, goal: input.goal.trim(), problemRelation: input.problemRelation.trim(), constraints: input.constraints.map((x) => nonempty(x, "constraint")), successCriteria: input.successCriteria.map((x) => nonempty(x, "success criterion")), plan: input.plan.trim(), exploratory, formalBaseline: !!baseline && !exploratory, problemSnapshotPath: frozen, knowledgeSnapshot: baseline?.knowledgeSnapshot, m04BaselineRunId: baseline?.run.runId, baselineHistory: baseline ? [{ at: record.startedAt, knowledgeSnapshot: baseline.knowledgeSnapshot, m04RunId: baseline.run.runId }] : [], budgetPolicy: budget.policy, budgetPolicyVersionId: budget.versionId, budgetPolicyFrozenAt: record.startedAt, tasks: [], decisions: [], limitations: [] };
 			await save(ctx, goal);
 			return goal;
 		},
@@ -205,6 +289,7 @@ export function createM07Controller(ctx: StageContext): M07Controller {
 
 		async delegate(runId, spec) {
 			const goal = await load(ctx, runId); requireActive(goal); nonempty(spec.objective, "task objective");
+			const policy = frozenPolicy(goal);
 			await requireCurrentFormalBaseline(ctx, goal);
 			spec = { ...spec, objective: spec.objective.trim(), inputs: normalizedUnique(spec.inputs, "task input"), expectedOutputs: normalizedUnique(spec.expectedOutputs, "expected output"), checks: normalizedUnique(spec.checks, "task check") };
 			for (const expectedOutput of spec.expectedOutputs) {
@@ -232,8 +317,8 @@ export function createM07Controller(ctx: StageContext): M07Controller {
 			if (spec.knowledgeIds?.length) pack = (await ctx.store.buildPack({ purpose: `M07 ${id}`, ids: spec.knowledgeIds, includeOpenQuestions: true, maxChars: 60_000 })).markdown;
 			const expectedOutputPaths = spec.expectedOutputs.map((x) => { const resolved = path.resolve(workDir, x); if (!inside(workDir, resolved)) throw new HarnessError("m07.path", `预期产物路径逃逸任务目录：${x}`); return resolved; });
 			const role = spec.mode === "check" ? "reviewer" : "execution";
-			const tools = spec.mode === "execute" ? { kind: "execution" as const, root: workDir, tools: ["read", "write", "edit", "bash"] as Array<"read" | "write" | "edit" | "bash"> } : spec.mode === "check" ? { kind: "read-dir" as const, root: workDir } : { kind: "none" as const };
-			const message = await taskMessage(ctx, goal, spec, copies, pack);
+			const tools = spec.mode === "execute" ? { kind: "execution" as const, root: workDir, tools: ["read", "write", "edit", "bash"] as Array<"read" | "write" | "edit" | "bash"> } : { kind: "read-dir" as const, root: workDir };
+			const message = await taskMessage(ctx, goal, spec, copies, pack, policy);
 			await writeFileAtomic(path.join(dir, "message.md"), message);
 			const task: M07TaskRecord = { ...spec, taskId: id, status: "running", createdAt: nowIso(), returnedAt: "", workDir, inputCopies: copies, expectedOutputPaths, readCoverage: [], toolLog: [], knowledgeSnapshot: goal.knowledgeSnapshot, m04BaselineRunId: goal.m04BaselineRunId };
 			goal.tasks.push(task); await save(ctx, goal);
@@ -347,7 +432,11 @@ export function createM07Controller(ctx: StageContext): M07Controller {
 			goal.returnPath = input.returnPath ?? "user";
 			goal.limitations.push(`受控中断归档：${reason}`);
 			goal.goalChecks = goal.successCriteria.map((criterion) => ({ criterion, result: "not_run" as const, evidence: [] }));
-			goal.feedbackPath = await writeFeedback(ctx, goal);
+			if (goal.budgetPolicy && goal.budgetPolicyVersionId && goal.budgetPolicyFrozenAt) goal.feedbackPath = await writeFeedback(ctx, goal);
+			else {
+				goal.limitations.push("旧目标缺少冻结预算策略；中断反馈只登记控制事实与证据位置，未读取证据正文，也未套用当前 active policy。");
+				goal.feedbackPath = await writeLegacyInterruptFeedback(ctx, goal);
+			}
 			await save(ctx, goal);
 			const run = await ctx.ws.readRun("M07", runId);
 			run.outputs.push({ label: "M07 实际执行反馈包", path: goal.feedbackPath });

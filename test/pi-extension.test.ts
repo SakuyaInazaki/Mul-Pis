@@ -8,7 +8,7 @@ import { createResearchExtension } from "../src/pi/extension.ts";
 import { ResearchService } from "../src/pi/service.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 
-function captureExtension(service: ResearchService): { tools: Map<string, ToolDefinition>; commands: Map<string, { handler: (args: string, ctx: any) => Promise<void> }>; handlers: Map<string, Array<(event: any, ctx: any) => unknown>> } {
+function captureExtension(service: ResearchService, improvementServiceFactory?: (workspaceRoot: string) => any): { tools: Map<string, ToolDefinition>; commands: Map<string, { handler: (args: string, ctx: any) => Promise<void> }>; handlers: Map<string, Array<(event: any, ctx: any) => unknown>> } {
 	const tools = new Map<string, ToolDefinition>();
 	const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
 	const handlers = new Map<string, Array<(event: any, ctx: any) => unknown>>();
@@ -17,7 +17,7 @@ function captureExtension(service: ResearchService): { tools: Map<string, ToolDe
 		registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); },
 		registerCommand(name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) { commands.set(name, command); },
 	} as unknown as ExtensionAPI;
-	createResearchExtension({ service })(api);
+	createResearchExtension({ service, improvementServiceFactory })(api);
 	return { tools, commands, handlers };
 }
 
@@ -27,9 +27,24 @@ test("extension registration is inert and exposes bounded tools", async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-extension-"));
 	const service = new ResearchService({ defaultWorkspace: root });
 	const registered = captureExtension(service);
-	assert.deepEqual([...registered.tools.keys()].sort(), ["research_delegate", "research_goal", "research_init", "research_review", "research_stage", "research_status"]);
+	assert.deepEqual([...registered.tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_review", "research_stage", "research_status"]);
 	assert.equal(registered.commands.has("research"), true);
 	assert.equal((await service.status(root)).initialized, false);
+});
+
+test("research_improve exposes the separate bounded run, status and rollback actions", async () => {
+	const calls: string[] = [];
+	const factory = (workspaceRoot: string) => ({
+		status: async () => { calls.push(`status:${workspaceRoot}`); return { activeVersionId: "budget-v1", runs: [] }; },
+		run: async () => { calls.push(`run:${workspaceRoot}`); return { run: { runId: "i1", status: "promoted" }, activeVersionId: "budget-v2" }; },
+		rollback: async () => { calls.push(`rollback:${workspaceRoot}`); return { version: 1, versionId: "budget-v1", promotedAt: "now", runId: "rollback-i1" }; },
+	});
+	const service = new ResearchService({ defaultWorkspace: "/workspace" });
+	const tool = captureExtension(service, factory).tools.get("research_improve")!;
+	assert.match(JSON.stringify(await tool.execute("s", { action: "status" }, undefined, undefined, toolContext("/workspace"))), /budget-v1/);
+	assert.match(JSON.stringify(await tool.execute("r", { action: "run" }, undefined, undefined, toolContext("/workspace"))), /promoted/);
+	assert.match(JSON.stringify(await tool.execute("b", { action: "rollback" }, undefined, undefined, toolContext("/workspace"))), /rollback-i1/);
+	assert.deepEqual(calls, ["status:/workspace", "run:/workspace", "rollback:/workspace"]);
 });
 
 test("main-session capability guard blocks side-effect tools from the start", async () => {
@@ -207,7 +222,7 @@ test("Pi DefaultResourceLoader loads the inline extension without prompting or n
 	const loaded = loader.getExtensions();
 	assert.equal(loaded.errors.length, 0);
 	assert.equal(loaded.extensions.length, 1);
-	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_init", "research_review", "research_stage", "research_status"]);
+	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_review", "research_stage", "research_status"]);
 });
 
 test("Pi DefaultResourceLoader loads the actual extensions/research.ts entrypoint", async () => {
@@ -223,7 +238,7 @@ test("Pi DefaultResourceLoader loads the actual extensions/research.ts entrypoin
 	const loaded = loader.getExtensions();
 	assert.equal(loaded.errors.length, 0);
 	assert.equal(loaded.extensions.length, 1);
-	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_init", "research_review", "research_stage", "research_status"]);
+	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_review", "research_stage", "research_status"]);
 });
 
 test("research_delegate accepts exact expected output path strings", async () => {

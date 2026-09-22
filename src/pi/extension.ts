@@ -6,6 +6,9 @@ import { existsSync } from "node:fs";
 import { loadPrompt } from "../prompts.ts";
 import { ResearchService, type StageRequest } from "./service.ts";
 import { TelemetryWriter } from "../dashboard/telemetry.ts";
+import { ImprovementService } from "../improvement/service.ts";
+import type { ImprovementRunResult, ImprovementStatus } from "../improvement/types.ts";
+import type { ActiveBudgetPointer } from "../improvement/policy.ts";
 
 type ToolResult = AgentToolResult<Record<string, unknown>>;
 
@@ -21,6 +24,14 @@ function compact(value: unknown): Record<string, unknown> {
 	if (!value || typeof value !== "object") return { value };
 	const item = value as Record<string, unknown>;
 	if ("workspace" in item && "stages" in item) return item;
+	if ("activeVersionId" in item && "runs" in item) return {
+		activeVersionId: item.activeVersionId, previousVersionId: item.previousVersionId, runs: item.runs,
+	};
+	if ("run" in item && item.run && typeof item.run === "object") {
+		const run = item.run as Record<string, unknown>;
+		return { runId: run.runId, status: run.status, rejectionReason: run.rejectionReason, activeVersionId: item.activeVersionId, evaluation: item.evaluation };
+	}
+	if ("versionId" in item && "runId" in item && "promotedAt" in item) return item;
 	if ("taskId" in item) return {
 		taskId: item.taskId, status: item.status, workDir: item.workDir, reportPath: item.reportPath,
 		expectedOutputPaths: item.expectedOutputPaths, executionFailure: item.executionFailure,
@@ -88,11 +99,12 @@ export interface ResearchExtensionOptions {
 	defaultWorkspace?: string;
 	mainAgentStallTimeoutMs?: number;
 	mainAgentStallCheckMs?: number;
+	improvementServiceFactory?: (workspaceRoot: string, signal?: AbortSignal) => Promise<Pick<ImprovementService, "run" | "status" | "rollback">> | Pick<ImprovementService, "run" | "status" | "rollback">;
 }
 
 export function createResearchExtension(options: ResearchExtensionOptions = {}) {
 	return function researchExtension(pi: ExtensionAPI): void {
-		const orchestrationTools = new Set(["research_status", "research_init", "research_stage", "research_goal", "research_delegate", "research_review"]);
+		const orchestrationTools = new Set(["research_status", "research_init", "research_stage", "research_goal", "research_delegate", "research_review", "research_improve"]);
 		const inspectionTools = new Set(["read", "grep", "find", "ls"]);
 		let researchActive = false;
 		let activePiCwd: string | undefined;
@@ -103,6 +115,11 @@ export function createResearchExtension(options: ResearchExtensionOptions = {}) 
 			onProgress: (progress) => activeUpdate?.(result(progress)),
 
 		});
+		const improvementService = async (workspaceRoot: string, signal?: AbortSignal): Promise<Pick<ImprovementService, "run" | "status" | "rollback">> => {
+			if (options.improvementServiceFactory) return options.improvementServiceFactory(workspaceRoot, signal);
+			const { createPiSessionRunner } = await import("../runner/pi.ts");
+			return new ImprovementService({ workspaceRoot, runner: createPiSessionRunner({ signal }) });
+		};
 
 const mainAgentStallTimeoutMs = options.mainAgentStallTimeoutMs ?? 10 * 60_000;
 const mainAgentStallCheckMs = options.mainAgentStallCheckMs ?? 1_000;
@@ -210,6 +227,27 @@ mainAgentWatchdog.unref?.();
 			parameters: Type.Object({ workspace: Type.Optional(Type.String({ description: "Research workspace; defaults to the current Pi cwd" })) }),
 			executionMode: "sequential",
 			async execute(_id, params, _signal, _update, ctx) { return result(await service.status(workspaceFrom(params.workspace, ctx.cwd))); },
+		});
+
+		pi.registerTool({
+			name: "research_improve",
+			label: "Improve Research Harness Budget Policy",
+			description: "Run, inspect, or roll back the bounded budget-and-evidence-handoff policy improvement loop. A passing fixed offline evaluation is promoted automatically; this does not modify workflow source or establish general scientific benefit.",
+			promptSnippet: "Operate the separate bounded budget-policy improvement loop",
+			promptGuidelines: ["Use action=status before run or rollback.", "Treat promotion as acceptance under the fixed offline evaluator, not proof of general RSI or scientific improvement."],
+			parameters: Type.Object({
+				action: Type.Union([Type.Literal("run"), Type.Literal("status"), Type.Literal("rollback")]),
+				workspace: Type.Optional(Type.String({ description: "Research workspace; defaults to current Pi cwd" })),
+			}),
+			executionMode: "sequential",
+			async execute(_id, params, signal, _update, ctx) {
+				const bounded = await improvementService(workspaceFrom(params.workspace, ctx.cwd), signal);
+				let value: ImprovementRunResult | ImprovementStatus | ActiveBudgetPointer;
+				if (params.action === "run") value = await bounded.run();
+				else if (params.action === "rollback") value = await bounded.rollback();
+				else value = await bounded.status();
+				return result(value);
+			},
 		});
 
 		pi.registerTool({

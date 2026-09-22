@@ -23,7 +23,8 @@ export const CONFIG_TEMPLATE = `{
     "research": "provider/model:thinking",
     "reader": "provider/model",
     "checker": "provider/model",
-    "applicability": "provider/model"
+    "applicability": "provider/model",
+    "improver": "provider/model:thinking"
 	  },
 	  "m03Reviewers": [
 	    { "id": "R1", "model": "provider/model:thinking" }

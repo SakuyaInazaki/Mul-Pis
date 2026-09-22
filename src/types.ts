@@ -8,9 +8,9 @@
  */
 
 /** Roles that a stage session can take. One role can be served by any configured model. */
-export type Role = "execution" | "reviewer" | "research" | "reader" | "checker" | "applicability" | "acquisition";
+export type Role = "execution" | "reviewer" | "research" | "reader" | "checker" | "applicability" | "acquisition" | "improver";
 
-export const ROLES: readonly Role[] = ["execution", "reviewer", "research", "reader", "checker", "applicability", "acquisition"];
+export const ROLES: readonly Role[] = ["execution", "reviewer", "research", "reader", "checker", "applicability", "acquisition", "improver"];
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 

@@ -25,3 +25,7 @@ export type { M09Options, M09Result, M09ClosureArtifact, ReproductionMode } from
 export { createM07Controller } from "./m07/controller.ts";
 export type * from "./m07/types.ts";
 export type { StageContext } from "./stages/context.ts";
+export { ImprovementService, collectAnonymousRunSamples } from "./improvement/service.ts";
+export type * from "./improvement/types.ts";
+export { DEFAULT_BUDGET_POLICY, loadActiveBudgetPolicy, projectInline, validateActiveBudgetPointer, validateBudgetPolicy } from "./improvement/policy.ts";
+export type { BudgetPolicy, ActiveBudgetPointer, InlineProjection } from "./improvement/policy.ts";

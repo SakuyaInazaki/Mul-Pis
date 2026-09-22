@@ -1,4 +1,5 @@
 import type { SessionRef } from "../runner/types.ts";
+import type { BudgetPolicy } from "../improvement/policy.ts";
 
 export type M07TaskMode = "execute" | "check" | "reason";
 export type M07TaskStatus = "running" | "returned" | "failed" | "accepted" | "rejected";
@@ -127,6 +128,10 @@ export interface CurrentGoal {
 	knowledgeSnapshot?: string;
 	m04BaselineRunId?: string;
 	baselineHistory: Array<{ at: string; knowledgeSnapshot?: string; m04RunId: string }>;
+	/** Frozen at begin; later promotion or rollback applies only to a new goal. Optional only for explicit legacy-record detection. */
+	budgetPolicy?: BudgetPolicy;
+	budgetPolicyVersionId?: string;
+	budgetPolicyFrozenAt?: string;
 	tasks: M07TaskRecord[];
 	decisions: UserDecision[];
 	outcome?: GoalOutcome;

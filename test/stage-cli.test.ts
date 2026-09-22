@@ -14,12 +14,20 @@ async function capture(action: () => Promise<number>): Promise<{ code: number; o
 	finally { console.log = original; }
 }
 
-test("CLI help exposes explicit M08/M09 entrypoints", async () => {
+test("CLI help exposes explicit M08/M09 and bounded improvement entrypoints", async () => {
 	const result = await capture(() => main(["help"]));
 	assert.equal(result.code, 0);
 	assert.match(result.output, /m08/);
 	assert.match(result.output, /m09/);
+	assert.match(result.output, /improve run\|status\|rollback/);
 	assert.match(result.output, /不会自动发布/);
+});
+
+test("CLI improvement status is read-only and works without model configuration", async () => {
+	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-cli-improve-"));
+	const result = await capture(() => main(["improve", "status", "--workspace", root]));
+	assert.equal(result.code, 0);
+	assert.deepEqual(JSON.parse(result.output), { runs: [] });
 });
 
 test("CLI status lists M08/M09 and limitations without model config", async () => {

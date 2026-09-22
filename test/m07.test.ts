@@ -24,6 +24,13 @@ async function fixture(t: TestContext, withM04 = true, config?: HarnessConfig) {
 	return { root, ws, store, runner, ctx, controller: createM07Controller(ctx) };
 }
 
+async function activateBudget(root: string, policy: Record<string, unknown>, versionId = "test-budget"): Promise<void> {
+	const improvement = path.join(root, ".agent", "improvement");
+	await mkdir(path.join(improvement, "versions", versionId), { recursive: true });
+	await writeFile(path.join(improvement, "versions", versionId, "policy.json"), JSON.stringify(policy));
+	await writeFile(path.join(improvement, "active.json"), JSON.stringify({ version: 1, versionId, promotedAt: "2026-09-23T00:00:00Z", runId: "test" }));
+}
+
 const begin = { goal: "检验机制 A", problemRelation: "直接回答原问题的必要部分", constraints: ["不得改变机制 A 的定义"], successCriteria: ["给出可定位证据", "执行既定检查"], plan: "先做最小区分实验，再独立检查。" };
 
 test("begin freezes problem and baseline; exploratory must be explicit without M04", async (t) => {
@@ -86,6 +93,8 @@ test("delegate is fresh and returned is not accepted; retry is a new retained ta
 	const executionMessage = [...f.runner.sessions.values()].at(-1)!.transcript[0].text;
 	assert.match(executionMessage, /先做本地可完成的语法、类型、编译与兼容性预检/);
 	assert.match(executionMessage, /M05\/M06→M04/);
+	assert.match(executionMessage, /fixed input/);
+	assert.match(executionMessage, /inputs\/001-input\.txt/);
 	assert.equal(first.status, "returned");
 	assert.equal(f.runner.created.at(-1)?.tools.kind, "execution");
 	assert.equal(first.inputCopies.length, 1);
@@ -93,6 +102,122 @@ test("delegate is fresh and returned is not accepted; retry is a new retained ta
 	const retried = await f.controller.delegate(goal.runId, { objective: "运行局部实验", inputs: [input], expectedOutputs: ["result.txt"], checks: ["结果文件存在且口径正确"], mode: "execute", parentTaskId: first.taskId, supersedesTaskId: first.taskId });
 	assert.notEqual(retried.taskId, first.taskId);
 	assert.equal((await f.controller.status(goal.runId)).tasks.length, 2);
+});
+
+test("large M07 input is preserved for bounded on-demand reading without hiding a tail counterexample", async (t) => {
+	const f = await fixture(t);
+	await activateBudget(f.root, { version: 1, maxPromptChars: 8_000, maxInlineFileChars: 1_000, maxAggregateInlineChars: 4_000, maxFeedbackChars: 4_000, overflowMode: "manifest-and-defer" });
+	const goal = await f.controller.begin(begin);
+	const input = path.join(f.root, "large-input.md");
+	await writeFile(input, `${"ordinary evidence\n".repeat(100)}TAIL-COUNTEREXAMPLE-UNIQUE\n`);
+	const task = await f.controller.delegate(goal.runId, { objective: "核对输入中的反例", inputs: [input], expectedOutputs: [], checks: ["反例已定位"], mode: "reason" });
+	const sent = [...f.runner.sessions.values()].at(-1)!.transcript[0].text;
+	assert.doesNotMatch(sent, /TAIL-COUNTEREXAMPLE-UNIQUE/);
+	assert.match(sent, /已显示字符 无（0 字符）/);
+	assert.match(sent, /未显示字符 1–/);
+	assert.equal(f.runner.created.at(-1)?.tools.kind, "read-dir");
+	assert.match(sent, new RegExp(`inputs/${path.basename(task.inputCopies[0].copy).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+	assert.equal(await readFile(task.inputCopies[0].copy, "utf8"), await readFile(input, "utf8"));
+});
+
+test("a goal freezes its budget policy while only a new goal inherits a later active version", async (t) => {
+	const f = await fixture(t);
+	const strict = { version: 1, maxPromptChars: 8_000, maxInlineFileChars: 1_000, maxAggregateInlineChars: 4_000, maxFeedbackChars: 4_000, overflowMode: "manifest-and-defer" };
+	const roomy = { ...strict, maxInlineFileChars: 2_000 };
+	await activateBudget(f.root, strict, "budget-strict");
+	const oldGoal = await f.controller.begin(begin);
+	assert.equal(oldGoal.budgetPolicyVersionId, "budget-strict");
+	assert.deepEqual(oldGoal.budgetPolicy, strict);
+
+	await activateBudget(f.root, roomy, "budget-roomy");
+	const input = path.join(f.root, "between-limits.md");
+	await writeFile(input, `${"z".repeat(1_500)}TAIL-FROZEN-POLICY\n`);
+	await f.controller.delegate(oldGoal.runId, { objective: "旧目标继续", inputs: [input], expectedOutputs: [], checks: ["范围明确"], mode: "reason" });
+	const oldMessage = [...f.runner.sessions.values()].findLast((item) => item.spec.label === "M07-T001")!.transcript[0].text;
+	assert.doesNotMatch(oldMessage, /TAIL-FROZEN-POLICY/);
+	assert.match(oldMessage, /budget-strict/);
+
+	const newGoal = await f.controller.begin(begin);
+	assert.equal(newGoal.budgetPolicyVersionId, "budget-roomy");
+	await f.controller.delegate(newGoal.runId, { objective: "新目标继承新策略", inputs: [input], expectedOutputs: [], checks: ["范围明确"], mode: "reason" });
+	const newMessage = [...f.runner.sessions.values()].findLast((item) => item.spec.label === "M07-T001")!.transcript[0].text;
+	assert.match(newMessage, /TAIL-FROZEN-POLICY/);
+	assert.match(newMessage, /budget-roomy/);
+
+	await activateBudget(f.root, strict, "budget-strict");
+	const persistedNew = await f.controller.status(newGoal.runId);
+	assert.equal(persistedNew.budgetPolicyVersionId, "budget-roomy", "rollback must not rewrite an existing goal snapshot");
+	assert.deepEqual(persistedNew.budgetPolicy, roomy);
+});
+
+test("legacy M07 goals remain viewable but cannot silently adopt the current active policy", async (t) => {
+	const f = await fixture(t);
+	const goal = await f.controller.begin(begin);
+	const goalPath = path.join(f.ws.runDir("M07", goal.runId), "goal.json");
+	const legacy = JSON.parse(await readFile(goalPath, "utf8"));
+	delete legacy.budgetPolicy; delete legacy.budgetPolicyVersionId; delete legacy.budgetPolicyFrozenAt;
+	await writeFile(goalPath, JSON.stringify(legacy));
+	assert.equal((await f.controller.status(goal.runId)).runId, goal.runId);
+	await assert.rejects(f.controller.delegate(goal.runId, { objective: "不得静默继续", inputs: [], expectedOutputs: [], checks: ["x"], mode: "reason" }), (error: unknown) => error instanceof HarnessError && error.code === "m07.policy-legacy");
+	const interrupted = await f.controller.interrupt(goal.runId, { reason: "旧目标需要硬停止", returnPath: "user" });
+	assert.equal(interrupted.lifecycle, "finished");
+	assert.equal(interrupted.outcome, "blocked");
+	assert.match(interrupted.limitations.at(-1) ?? "", /未套用当前 active policy/);
+	const feedback = await readFile(interrupted.feedbackPath!, "utf8");
+	assert.match(feedback, /legacy 受控中断反馈包/);
+	assert.match(feedback, /不读取、不内联、不截断证据正文/);
+	assert.match(feedback, /不能作为证据完整性或科学结论证明/);
+	assert.equal((await f.ws.readRun("M07", goal.runId)).status, "failed");
+});
+
+test("M07 feedback manifests oversized frozen evidence and M04 records access without claiming full coverage", async (t) => {
+	const f = await fixture(t);
+	await activateBudget(f.root, { version: 1, maxPromptChars: 8_000, maxInlineFileChars: 1_000, maxAggregateInlineChars: 4_000, maxFeedbackChars: 4_000, overflowMode: "manifest-and-defer" });
+	const goal = await f.controller.begin(begin);
+	const task = await f.controller.delegate(goal.runId, { objective: "产生长证据", inputs: [], expectedOutputs: [], checks: ["证据存在"], mode: "reason" });
+	const artifact = path.join(task.workDir, "long-evidence.md");
+	await writeFile(artifact, `${"evidence body\n".repeat(100)}TAIL-REFUTATION-UNIQUE\n`);
+	const reviewed = await f.controller.review(goal.runId, { taskId: task.taskId, artifacts: [artifact], checks: [{ criterion: "证据存在", result: "passed", evidence: [artifact] }] });
+	const done = await f.controller.finish(goal.runId, { outcome: "partial", summary: "证据需研究会话按需读取", returnPath: "M04", goalChecks: begin.successCriteria.map((criterion) => ({ criterion, result: "not_run", evidence: [] })) });
+	const feedback = await readFile(done.feedbackPath!, "utf8");
+	assert.doesNotMatch(feedback, /TAIL-REFUTATION-UNIQUE/);
+	assert.match(feedback, /已显示字符 无（0 字符）/);
+	const frozenEvidence = reviewed.review!.artifacts.find((item) => item.sourcePath?.endsWith("long-evidence.md"));
+	assert.ok(frozenEvidence);
+	const evidenceRelative = path.relative(f.ws.runDir("M07", goal.runId), frozenEvidence.path);
+	const m04Runner = new FakeSessionRunner(({ spec }) => spec.label === "M04-research" ? { text: "只做了局部访问；不声称完整核验。", reads: [evidenceRelative] } : "unused");
+	f.ctx.runner = m04Runner;
+	const m04 = await runM04(f.ctx, { feedback: { kind: "M07", runId: goal.runId }, freshSession: true });
+	const spec = m04Runner.created.findLast((item) => item.label === "M04-research")!;
+	assert.equal(spec.tools.kind, "read-dir");
+	if (spec.tools.kind === "read-dir") {
+		assert.equal(spec.tools.toolName, "m07_evidence_read");
+		assert.equal(spec.tools.root, f.ws.runDir("M07", goal.runId));
+	}
+	const sent = [...m04Runner.sessions.values()].findLast((item) => item.spec.label === "M04-research")!.transcript[0].text;
+	assert.doesNotMatch(sent, /TAIL-REFUTATION-UNIQUE/);
+	assert.match(sent, /不能证明读取了全文/);
+	assert.match(sent, /当前项目状态（局部知识包/);
+	const coveragePath = m04.record.outputs.find((item) => item.label === "M07 回流证据实际访问范围")!.path;
+	const coverage = JSON.parse(await readFile(coveragePath, "utf8")) as { filesAccessed: string[]; completeness: string; semantics: string };
+	assert.deepEqual(coverage.filesAccessed, [evidenceRelative]);
+	assert.equal(coverage.completeness, "unknown");
+	assert.match(coverage.semantics, /不证明已读全文/);
+});
+
+test("feedback control facts over the hard cap fail explicitly while frozen evidence remains recoverable", async (t) => {
+	const f = await fixture(t);
+	await activateBudget(f.root, { version: 1, maxPromptChars: 8_000, maxInlineFileChars: 1_000, maxAggregateInlineChars: 4_000, maxFeedbackChars: 4_000, overflowMode: "manifest-and-defer" });
+	const goal = await f.controller.begin(begin);
+	const task = await f.controller.delegate(goal.runId, { objective: `保留控制事实 ${"x".repeat(3_200)}`, inputs: [], expectedOutputs: [], checks: ["事实已记录"], mode: "reason" });
+	assert.ok(task.reportPath);
+	const reviewed = await f.controller.review(goal.runId, { taskId: task.taskId, artifacts: [task.reportPath], checks: [{ criterion: "事实已记录", result: "passed", evidence: [task.reportPath] }] });
+	const frozen = reviewed.review!.frozenReportPath;
+	await assert.rejects(f.controller.finish(goal.runId, { outcome: "partial", summary: "控制事实不能截断", returnPath: "M04", goalChecks: begin.successCriteria.map((criterion) => ({ criterion, result: "not_run", evidence: [] })) }), (error: unknown) => error instanceof HarnessError && error.code === "context.budget" && /未静默截断/.test(error.message));
+	assert.equal((await f.controller.status(goal.runId)).lifecycle, "active");
+	assert.match(await readFile(frozen, "utf8"), /M07-T001 returned/);
+	const run = await f.ws.readRun("M07", goal.runId);
+	assert.ok(!run.outputs.some((item) => item.label === "M07 实际执行反馈包"));
 });
 
 test("review rejects fake completion and requires a relevant independent check report", async (t) => {

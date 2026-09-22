@@ -18,6 +18,7 @@
 - `.agent/notes/` 下的实际记录；远端只允许保留 `.agent/notes/.gitignore`
 - `.agent/telemetry/`
 - `.agent/private/`
+- `.agent/improvement/` 以及任何工作区中的改进候选、离线评测、晋级与回退记录
 - `workspaces/`
 - `resources/`
 - `third_party/`
@@ -41,7 +42,7 @@
 ## 推送前检查
 
 1. 运行 `git status --short`，确认工作区没有要提交的禁止路径。
-2. 确认 staged 内容不包含 `.agent/notes/`、`.agent/telemetry/`、`.agent/private/`、`workspaces/` 等目录。
+2. 确认 staged 内容不包含 `.agent/notes/`、`.agent/telemetry/`、`.agent/private/`、`.agent/improvement/`、`workspaces/` 等目录。
 3. 扫描 staged diff 和 commit message，重点检查：
    - 本机绝对路径与用户名
    - 平台身份、邮箱、submission ID、PID

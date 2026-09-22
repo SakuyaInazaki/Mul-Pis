@@ -14,6 +14,7 @@
 | 知识库 | 文件式：`records/<ID>/v<N>.md`、`proposals/`、`snapshots/`、`CURRENT`、`limits.json`、派生 `views/` 与 `_index/`；单一串行合入入口；停用先行；不使用任何哈希 | 手册第七章第一版形态即文件式；用户明令不引入哈希清单 | 中：接口 `KnowledgeStore` 可换后端 |
 | M08/M09 | M08 每轮复制并固定原问题、必要输入、当前知识和调用方选定成果；调用方显式列出自查和 reviewer。完整批次可送 fresh M04 生成受校验的用途处置。M09 只消费严格配对的 M08/M04，按该处置允许范围建立说明和交付副本并独立复核 | 保持暂定流程的版本同一性、完整批次和不以一致性作证据；M04 的结构化处置是 M09 范围门槛 | 中 |
 | M05 | 以 `AcquisitionBackend` 提供可替换的搜索、抓取、下载、浏览器与 PDF 能力。默认检索包括 OpenAlex、arXiv、Crossref、Hacker News、Stack Exchange、GitHub 仓库与 Issues、DuckDuckGo；Reddit 为显式选择项，Brave 需密钥。搜索支持提供方适用范围内的 page/cursor/site 参数并如实警告未支持参数；Hacker News 同时保留文章与讨论地址。任意 HTTP(S) 地址可直接抓取或下载，Crawl4AI 用于浏览器渲染抓取，browser-use 用于适合交互、翻页、展开与下载的定点任务，不固定为最后手段。PDF 仅用 poppler 的文本层与按页图像。Docling 与 SearXNG 已因“不在本地跑模型、不用 Docker”而移除 | 用户 2026-09-20 的选择与任务范围完整性要求；提供通用入口但不作全网穷尽或任意站点必然成功的保证 | 高：默认集合可由配置取子集，各能力可经接口替换 |
+| 改进外环 | 独立的 `research_improve` / `improve` 入口只允许提议结构固定的预算与证据交接策略；固定离线 evaluator 成对比较当前与候选策略，要求最小缩减、单代延后负担上限、绝对最低内联覆盖率，并冻结未真实重放的 cap；跨进程锁串行变更，晋级前以活动指针 CAS 检查冻结基线，通过后自动原子晋级，可切回上一活动版本 | 先验证持久改进闭环，同时保持 M01–M09 科研判断、知识限制和评价规则不受候选控制 | 高：活动指针回退；候选与运行证据保留；残留锁需核对 owner 后精确清理 |
 
 ## 2. 阶段到会话的映射
 
@@ -31,7 +32,7 @@
 
 “新会话”= 新的 `SessionManager` 文件 + 全部资源发现关闭（无 context 文件、skills、extensions、prompt templates、APPEND_SYSTEM）+ 空 agentDir + 内存 settings；M01–M06 的无工具/自定义工具会话使用空 scratch cwd，M07 execute 的 SDK cwd 明确设为该任务 work 目录，M08 execute 与 M09 执行复核只在各自 verification 副本中运行。系统提示由角色边界句（见 `src/prompts.ts` 的 `ROLE_SYSTEM_PROMPTS`）和统一的不可信数据边界组成；材料、shell 注释、stdout/stderr 和工具返回仍会作为待核对数据进入上下文，提示只能降低其指令注入影响，不能构成模型行为保证。会话之间只通过控制器显式搬运的可见文本交接。execution 工具集合是能力白名单而不是 OS 沙箱；尤其 bash 仍有当前进程权限，因此不能把 cwd 写成根目录强制隔离。
 
-M07 先冻结原问题副本、目标关系、约束、成功要求、计划和当前正式 M04/知识快照。正式基线只取时间上最新的 M04；若该运行未 completed、含失败、产生未成功合入的知识提案，或其合入结果不能确定快照，就不回退旧 M04，调用方只能先修复或显式开始 exploratory 目标。正式目标在委派和声明 fulfilled 前再次确认该 M04/知识快照仍是最新；新 M04 出现后须显式刷新基线。基线失效时仍允许把目标按 blocked/partial 如实返回 M04，但会降为非正式探索状态并记录限制，不能声称原目标完成。输入文件被复制到任务目录。execute 必须明确至少一个预期文件且路径落在自己的 work 目录；若涉及真实提交、评测或远程实验，先做可用的本地语法、类型、编译与兼容性预检，并记录真实动作的成功、失败、配额消耗和已知恢复条件；未知配额不猜测。check/reason 可以不声明额外文件，但自动保存的 `report.md` 是必须实际提交和检查的产物。任务返回只进入 `returned`，主 Agent 须读取实际产物并用 `research_review` 逐项记录预定义 checks。通过要求每个 check 为 passed 且有文件证据、无失败和未执行项，并提交全部预期产物；验收时冻结被采用的产物、本任务报告与独立 checker 报告。声明需要独立检查时，check 任务取得的是待查材料副本，采用前还会核对它确实对应当前提交版本；反馈包只读取这些验收时固定的副本，避免把之后可变的报告混入正式反馈。这里不使用文件哈希清单。
+M07 先冻结原问题副本、目标关系、约束、成功要求、计划、当前正式 M04/知识快照，以及 `begin` 时一致读取的活动预算策略正文、版本号和冻结时间。后续委派与常规反馈生成始终使用该目标内的策略快照；晋级或回退只由之后新建的目标继承。旧格式目标可查看，但缺少策略快照时拒绝继续委派或正常结束，避免静默套用当前策略；受控 `interrupt` 仍可将其归档为 blocked，并生成只登记控制事实和证据位置、不读取证据正文的 legacy 反馈。正式基线只取时间上最新的 M04；若该运行未 completed、含失败、产生未成功合入的知识提案，或其合入结果不能确定快照，就不回退旧 M04，调用方只能先修复或显式开始 exploratory 目标。正式目标在委派和声明 fulfilled 前再次确认该 M04/知识快照仍是最新；新 M04 出现后须显式刷新基线。基线失效时仍允许把目标按 blocked/partial 如实返回 M04，但会降为非正式探索状态并记录限制，不能声称原目标完成。输入文件被复制到任务目录。execute 必须明确至少一个预期文件且路径落在自己的 work 目录；若涉及真实提交、评测或远程实验，先做可用的本地语法、类型、编译与兼容性预检，并记录真实动作的成功、失败、配额消耗和已知恢复条件；未知配额不猜测。check/reason 可以不声明额外文件，但自动保存的 `report.md` 是必须实际提交和检查的产物。任务返回只进入 `returned`，主 Agent 须读取实际产物并用 `research_review` 逐项记录预定义 checks。通过要求每个 check 为 passed 且有文件证据、无失败和未执行项，并提交全部预期产物；验收时冻结被采用的产物、本任务报告与独立 checker 报告。声明需要独立检查时，check 任务取得的是待查材料副本，采用前还会核对它确实对应当前提交版本；反馈包只读取这些验收时固定的副本，避免把之后可变的报告混入正式反馈。这里不使用文件哈希清单。
 
 任务失败、拒绝、工具日志和未执行项一直保留。返工任务只有在 objective、checks、expectedOutputs、mode、独立检查要求及输入材料版本保持同一义务时才能声明 `supersedesTaskId`；不能借替代降级执行模式、取消独立检查或更换输入。沿递归替代链的新任务被接受后，链上旧失败才不再阻止 fulfilled，但历史不会删除。结束目标时必须逐项映射原始 successCriteria；fulfilled 要求每项原目标标准 passed 且有来自已接受任务的固定文件证据、没有开放用户决定、至少有一个实际任务，并且每个当前有效任务义务均已 accepted；历史上已被合法替代的失败任务仍保持原状态。
 
@@ -41,7 +42,7 @@ M07 先冻结原问题副本、目标关系、约束、成功要求、计划和�
 
 以下文本不来自用户提示词，而是控制器为落实边界而加的，可被审阅与替换：
 
-- 角色系统提示 `ROLE_SYSTEM_PROMPTS`（七种角色各一段）。
+- 角色系统提示 `ROLE_SYSTEM_PROMPTS`（科研执行角色与独立 improver 角色各有明确边界）。
 - 材料标签 `【原始问题】`、`【必要原始信息：…】`、`【初始认识（…）】` 等。
 - M03 每个成员的出题格式要求：两个一级标题 `# 可转发问题` / `# 出题说明与判断依据`，缺一则该成员失败且整批不能静默跳过。
 - M03 作答框架 `【第三轮：回答外部质询】`（原 v1 无专用答题提示词，只转发问题；首组补一句说明 M02 产出的来源与“题目可被纠正”，后续组不重复附带 M02 完整产出）。
@@ -94,6 +95,6 @@ pi -e ./extensions/research.ts                         # 显式加载主会话�
 
 `--runner fake` 让任何命令走脚本化假会话（用于演练目录与产物结构，不产生科研内容）。
 
-Pi extension 注册 `research_status`、`research_init`、`research_stage`、`research_goal`、`research_delegate` 与 `research_review`，并提供 `/research status [workspace]` 与 `/research off`。bootstrap、`research_status`、`research_init` 和 M07 `status` 只准备或查看状态，不激活 P07；第一次成功的实质阶段、目标变更、委派或验收操作才在当前 Pi session 和对应 cwd 上激活。激活后，主 Pi 的工具调用限于 `research_*` 编排工具以及 read/grep/find/ls 只读检查，其他工具由 extension 阻断；实现、平台操作和其他副作用应进入有界 M07 任务。失败调用不激活，切换 session 或 cwd 不继承，`/research off` 可显式停用。extension service 对同一失败类别和同一受控义务的重复阶段调用作有限阻断；改变纳入指纹的实际输入、证据、scope、配对 run 或授权命令计划才形成新义务。接收者/用途的自由文本刻意不参与指纹，避免通过改写措辞绕过阻断；若它们发生实质变化，调用方须用新的有效处置或输入表达新的交付义务。该保护只覆盖经 `ResearchService.runStage` 的 extension 路径，当前 CLI 仍直接调用各阶段函数，因此不具备这项重试保护。正常 `session_shutdown` 会让拥有当前 stage 操作的 service 按其在该 workspace 中已经登记的全部精确 stage/runId，把仍为 running 的 run 记为 failed，晚返回不能再覆盖成 completed；M08 显式转交 M04 时两个 run 都可被登记。M07 `research_delegate` 不经过 `runStage`，因此目前不在这项 shutdown run 记录机制内。SIGKILL、进程崩溃、跨进程恢复和自动重放同样不在保证内。它不调用 `setModel`，因此不会替换用户当前主会话模型。只有会新建阶段或任务模型会话的操作才读取 `research.config.json` 对应角色模型并在缺配置时拒绝；目标状态和验收等非模型操作可在没有模型配置时执行。
+Pi extension 注册 `research_status`、`research_init`、`research_stage`、`research_goal`、`research_delegate`、`research_review` 与独立的 `research_improve`，并提供 `/research status [workspace]` 与 `/research off`。bootstrap、`research_status`、`research_init` 和 M07 `status` 只准备或查看状态，不激活 P07；第一次成功的实质阶段、目标变更、委派或验收操作才在当前 Pi session 和对应 cwd 上激活。`research_improve` 使用自己的状态与锁，不自动进入或改写 P07 科研目标。激活后，主 Pi 的工具调用限于 `research_*` 编排工具以及 read/grep/find/ls 只读检查，其他工具由 extension 阻断；实现、平台操作和其他副作用应进入有界 M07 任务。失败调用不激活，切换 session 或 cwd 不继承，`/research off` 可显式停用。extension service 对同一失败类别和同一受控义务的重复阶段调用作有限阻断；改变纳入指纹的实际输入、证据、scope、配对 run 或授权命令计划才形成新义务。接收者/用途的自由文本刻意不参与指纹，避免通过改写措辞绕过阻断；若它们发生实质变化，调用方须用新的有效处置或输入表达新的交付义务。该保护只覆盖经 `ResearchService.runStage` 的 extension 路径，当前 CLI 仍直接调用各阶段函数，因此不具备这项重试保护。正常 `session_shutdown` 会让拥有当前 stage 操作的 service 按其在该 workspace 中已经登记的全部精确 stage/runId，把仍为 running 的 run 记为 failed，晚返回不能再覆盖成 completed；M08 显式转交 M04 时两个 run 都可被登记。M07 `research_delegate` 不经过 `runStage`，因此目前不在这项 shutdown run 记录机制内。SIGKILL、进程崩溃、跨进程恢复和自动重放同样不在保证内。它不调用 `setModel`，因此不会替换用户当前主会话模型。只有会新建阶段、任务或改进提议模型会话的操作才读取 `research.config.json` 对应角色模型并在缺配置时拒绝；目标状态、验收和改进状态查看等非模型操作可在没有模型配置时执行。
 
 M05 的外部工具：`scripts/setup-tools.sh` 建立 `.venv` 并安装 Crawl4AI、browser-use 与 Playwright Chromium headless shell（不含任何本地 ML 模型，不需要 Docker）；检索来源可用 `tools.searchProviders` 限定为默认集合的子集，`tools.braveApiKey` 可选；`tools.browserUseModel` 指定 browser-use 的模型后交互式抓取才可用；PDF 只依赖本机 poppler（pdftotext、pdftoppm、pdfinfo），`tools.pageImageDpi` 可调页图分辨率（默认 110）。Python 工具缺席时网页抓取退化为纯 HTTP 并记录实际引擎；公共 HTTP 搜索与 PDF 工具按各自依赖继续工作。

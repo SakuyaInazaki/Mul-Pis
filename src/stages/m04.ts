@@ -49,6 +49,7 @@ interface ResolvedFeedback {
 	inputs: InputRef[];
 	artifactPaths: string[];
 	m08?: { runId: string; manifest: FrozenArtifactManifest; manifestPath: string };
+	m07?: { runId: string; rootDir: string };
 }
 
 async function resolveFeedback(ctx: StageContext, feedback: M04Feedback): Promise<ResolvedFeedback> {
@@ -93,6 +94,7 @@ async function resolveFeedback(ctx: StageContext, feedback: M04Feedback): Promis
 			text: bundle.text,
 			inputs: [{ label: "M07 实际执行反馈包", path: bundle.path }, ...run.outputs.filter((o) => o.label !== "M07 实际执行反馈包").map((o) => ({ label: `M07 ${o.label}`, path: o.path }))],
 			artifactPaths: run.outputs.map((o) => relPath(ctx, o.path)),
+			m07: { runId: run.runId, rootDir: ctx.ws.runDir("M07", run.runId) },
 		};
 	}
 	if (feedback.kind === "M08") {
@@ -143,6 +145,7 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 		ctx,
 		record,
 		async () => {
+			if (feedback.m07) await ctx.ws.writeOutput(record, "m07-source.json", JSON.stringify({ m07RunId: feedback.m07.runId, rootDir: feedback.m07.rootDir, feedbackBundlePath: feedback.inputs[0].path }, null, 2), "M07 处理来源");
 			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-source.json", JSON.stringify({ m08RunId: feedback.m08.runId, manifestPath: feedback.m08.manifestPath, reviewBundlePath: feedback.inputs[0].path }, null, 2), "M08 处理来源");
 			let knowledgePack: string | undefined;
 			if (mode === "research-session") {
@@ -153,18 +156,24 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			}
 			const identityContract = `\n\n【知识记录身份契约】\n- 只有上方局部知识包明确列出的 ID 才能直接引用为已有记录；意见、报告或历史正文中的 C001/J001/E001 等字样可能只是叙述标签，不得猜测或映射成知识库 ID。\n- 本批新建记录如需互相引用，每个 create 先声明唯一局部 handle（如 \"handle\":\"$claim\"），后续操作可用 \"refs\":[{\"rel\":\"supports\",\"target\":\"$claim\"}] 或将 decide/limit 的目标写为 $claim。只引用已在同一数组更早创建的 handle；handle 仅在本提案内有效，合入时才分配正式 ID。\n- 局部包可能截断或没有展开相关旧记录。需修订、决定或限制但看不到对应 ID 时，先请求补足相关记录或保留待补证，不得重建重复记录或绕过旧限制。只有确认是全新对象时才用 handle 新建；不伪造 ID。`;
 			const message = (await buildM04Message({ materials, feedbackLabel: feedback.label, feedback: feedback.text, artifactPaths: feedback.artifactPaths, knowledgePack, includeProblem: mode === "research-session" })) + identityContract;
-			await ctx.ws.writeOutput(record, "message.md", message, "发送给研究会话的完整消息");
 
 			const allowedM08Paths = feedback.m08?.manifest.entries.map((x) => x.relativePath) ?? [];
 			const m08DispositionInstruction = feedback.m08 ? `\n\n【M08 固定材料访问契约】\n上方审查反馈包只是意见汇总，“实际产物位置”也只是索引；它们不表示你已读取待交付材料。若要给出 ready 或 partial，必须在本会话中用 m08_material_read 按下列精确 relativePath 实际读取每一项准备写入 deliverablePaths 的文件；目录项至少读取其中一个与处置直接相关的真实文件。PDF 文本层不足以核对公式、表格或图时，用 render_pdf_page 渲染相关页。工具会记录实际访问路径，仅在正文里复述或引用路径不算读取。\n可访问的固定材料：${allowedM08Paths.map((p) => `\n- ${p}`).join("")}\n\n本轮必须在处理文末尾输出 m08-disposition JSON 代码块。合法 status 只有 ready、partial、rework、needs_evidence、unresolved。结构示例：{\"m08RunId\":\"${feedback.m08.runId}\",\"status\":\"partial\",\"deliverablePaths\":[\"上述某一精确 relativePath\"],\"limitations\":[\"实际限制\"],\"rationale\":\"非空理由\"}。deliverablePaths 只允许从上述精确相对路径选择。ready/partial 必须至少选择一项；这是用途处置，不是投票或科学认证；无法判断不得写 ready。` : "";
-			const finalMessage = message + m08DispositionInstruction;
+			const m07EvidenceInstruction = feedback.m07 ? `\n\n【M07 证据按需读取契约】\n上方反馈包中的材料清单是索引，不代表你已读取未内联的证据。需要依赖某项材料时，使用 m07_evidence_read 按清单中的相对路径读取；大文件按 offset/limit 继续读取。工具记录文件访问，但当前覆盖记录只能证明访问过该文件，不能证明读取了全文；除非实际分段读至文件末尾，否则必须把未读范围列为限制。不得把路径存在、清单摘要或一次局部读取写成“已完整核验”。` : "";
+			const finalMessage = message + m08DispositionInstruction + m07EvidenceInstruction;
+			await ctx.ws.writeOutput(record, "message.md", finalMessage, "发送给研究会话的完整消息");
 			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-message.md", finalMessage, "发送给 M04 的固定 M08 消息");
 			const m08RenderedPages: string[] = [];
 			const m08PageTool = feedback.m08 ? renderPageTool({ root: feedback.m08.manifest.rootDir, outputDir: path.join(ctx.ws.runDir("M04", record.runId), "rendered-pages"), tools: ctx.config.tools, onRendered: ({ pdf, page }) => { m08RenderedPages.push(`${path.relative(feedback.m08!.manifest.rootDir, pdf)}#${page}`); } }) : undefined;
+			const feedbackTools = feedback.m08
+				? { kind: "read-dir" as const, root: feedback.m08.manifest.rootDir, toolName: "m08_material_read", extraTools: [m08PageTool!] }
+				: feedback.m07
+					? { kind: "read-dir" as const, root: feedback.m07.rootDir, toolName: "m07_evidence_read" }
+					: { kind: "none" as const };
 			const handle =
 				mode === "continue-m01" && m01Session?.file
 					? await ctx.runner.resume({ label: "M01", role: "execution", id: m01Session.id, model: m01Session.model, file: m01Session.file, specFile: specFileFor(m01Session.file) })
-					: await ctx.runner.create(sessionSpec(ctx, "M04-research", "research", systemPromptFor("research"), feedback.m08 ? { kind: "read-dir", root: feedback.m08.manifest.rootDir, toolName: "m08_material_read", extraTools: [m08PageTool!] } : { kind: "none" }));
+					: await ctx.runner.create(sessionSpec(ctx, "M04-research", "research", systemPromptFor("research"), feedbackTools));
 			let output: string;
 			let m08ReadCoverage: string[] = [];
 			let m08ToolLog: ReturnType<typeof handle.toolLog> = [];
@@ -179,6 +188,7 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 				handle.dispose();
 			}
 			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-coverage.json", JSON.stringify({ files: m08ReadCoverage, renderedPages: m08RenderedPages, tools: m08ToolLog }, null, 2), "M08 处理实际读取范围");
+			if (feedback.m07) await ctx.ws.writeOutput(record, "m07-coverage.json", JSON.stringify({ filesAccessed: m08ReadCoverage, completeness: "unknown", semantics: "文件名仅证明工具访问过该文件；不证明已读全文。读取范围需结合会话报告中的 offset/limit 声明核对。" }, null, 2), "M07 回流证据实际访问范围");
 
 			const result: M04Result = { record, output, mode };
 			if (feedback.m08) {

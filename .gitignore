@@ -14,6 +14,7 @@ Thumbs.db
 
 # Private agent records
 .agent/private/
+.agent/improvement/
 
 # Local third-party checkouts and research source files
 third_party/*/
