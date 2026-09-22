@@ -171,9 +171,9 @@ test("an accepted same-obligation retry chain can fulfill without erasing old fa
 test("supersedes cannot downgrade mode, independent checking, or fixed inputs", async (t) => {
 	const f = await fixture(t); const goal = await f.controller.begin(begin); const input = path.join(f.root, "fixed.txt"); await writeFile(input, "v1\n");
 	const original = await f.controller.delegate(goal.runId, { objective: "固定义务", inputs: [input], expectedOutputs: ["out.txt"], checks: ["输出检查"], mode: "execute", requireIndependentCheck: true });
-	await assert.rejects(f.controller.delegate(goal.runId, { objective: "固定义务", inputs: [input], expectedOutputs: ["out.txt"], checks: ["输出检查"], mode: "reason", requireIndependentCheck: false, supersedesTaskId: original.taskId }), /完全相同/);
+	await assert.rejects(f.controller.delegate(goal.runId, { objective: "固定义务", inputs: [input], expectedOutputs: ["out.txt"], checks: ["输出检查"], mode: "reason", requireIndependentCheck: false, supersedesTaskId: original.taskId }), /supersedes 只能替代/);
 	const other = path.join(f.root, "other.txt"); await writeFile(other, "v1\n");
-	await assert.rejects(f.controller.delegate(goal.runId, { objective: "固定义务", inputs: [other], expectedOutputs: ["out.txt"], checks: ["输出检查"], mode: "execute", requireIndependentCheck: true, supersedesTaskId: original.taskId }), /完全相同/);
+	await assert.rejects(f.controller.delegate(goal.runId, { objective: "固定义务", inputs: [other], expectedOutputs: ["out.txt"], checks: ["输出检查"], mode: "execute", requireIndependentCheck: true, supersedesTaskId: original.taskId }), /supersedes 只能替代/);
 });
 
 test("review and independent reports remain frozen when live reports change or disappear", async (t) => {
@@ -189,4 +189,53 @@ test("review and independent reports remain frozen when live reports change or d
 	assert.match(feedback, new RegExp(originalTaskReport.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 	assert.match(feedback, new RegExp(originalCheckReport.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 	assert.doesNotMatch(feedback, /MUTATED-LIVE-TASK/);
+});
+
+test("interrupt archives a goal with unknown-running task as failed, never fulfilled", async (t) => {
+	const f = await fixture(t); const goal = await f.controller.begin(begin);
+	const task = await f.controller.delegate(goal.runId, { objective: "长期任务", inputs: [], expectedOutputs: [], checks: ["任务完成"], mode: "reason" });
+	assert.equal(task.status, "returned");
+	const goalPath = path.join(f.ws.runDir("M07", goal.runId), "goal.json");
+	const raw = JSON.parse(await readFile(goalPath, "utf8")); raw.tasks[0].status = "running"; await writeFile(goalPath, JSON.stringify(raw));
+	const interrupted = await f.controller.interrupt(goal.runId, { reason: "host shutdown", returnPath: "user" });
+	assert.equal(interrupted.lifecycle, "finished"); assert.equal(interrupted.outcome, "blocked");
+	assert.equal(interrupted.tasks[0].status, "failed"); assert.match(interrupted.tasks[0].executionFailure ?? "", /host shutdown/);
+	const run = await f.ws.readRun("M07", goal.runId); assert.equal(run.status, "failed");
+	assert.ok(run.failures.some((failure) => failure.includes("受控中断归档")));
+	await assert.rejects(f.controller.plan(goal.runId, "重跑"), /已结束/);
+});
+
+
+test("review auto-freezes declared expected outputs", async (t) => {
+	const f = await fixture(t);
+	const goal = await f.controller.begin(begin);
+	const task = await f.controller.delegate(goal.runId, { objective: "produce outputs", inputs: [], expectedOutputs: ["result.txt", "raw/"], checks: ["outputs exist"], mode: "execute" });
+	await mkdir(path.join(task.workDir, "raw"), { recursive: true });
+	await writeFile(path.join(task.workDir, "result.txt"), "result\n");
+	await writeFile(path.join(task.workDir, "raw", "evidence.txt"), "evidence\n");
+	const note = path.join(task.workDir, "note.md");
+	await writeFile(note, "note\n");
+	const reviewed = await f.controller.review(goal.runId, { taskId: task.taskId, artifacts: [note], checks: [{ criterion: "outputs exist", result: "passed", evidence: [note] }] });
+	assert.equal(reviewed.status, "accepted");
+	const sources = (reviewed.review?.artifacts ?? []).map((item) => item.sourcePath).filter((source): source is string => typeof source === "string");
+	assert.ok(sources.some((source) => source.endsWith("result.txt")));
+	assert.ok(sources.some((source) => source.endsWith("evidence.txt")));
+});
+
+test("supersede can upgrade a check obligation to execute", async (t) => {
+const f = await fixture(t);
+const goal = await f.controller.begin(begin);
+const first = await f.controller.delegate(goal.runId, { objective: "read only", inputs: [], expectedOutputs: [], checks: ["x"], mode: "check" });
+const retried = await f.controller.delegate(goal.runId, { objective: "read only", inputs: [], expectedOutputs: [], checks: ["x"], mode: "execute", supersedesTaskId: first.taskId });
+assert.equal(retried.mode, "execute");
+assert.equal(retried.supersedesTaskId, first.taskId);
+});
+
+test("check mode rejects declared output files", async (t) => {
+const f = await fixture(t);
+const goal = await f.controller.begin(begin);
+await assert.rejects(
+f.controller.delegate(goal.runId, { objective: "read only", inputs: [], expectedOutputs: ["report.md"], checks: ["x"], mode: "check" }),
+/不能声明 expectedOutputs/,
+);
 });

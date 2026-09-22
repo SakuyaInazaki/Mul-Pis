@@ -28,17 +28,22 @@ const entry =
 		: path.join(root, "src/cli.ts");
 const childArgs =
 	target === "pi" && !args.includes("--model") && !args.includes("--provider")
-		? ["--model", "deepseek/deepseek-flash", ...args]
+		? ["--model", "deepseek/deepseek-flash:high", ...args]
 		: args;
+const detached = process.platform !== "win32";
 const child = spawn(process.execPath, [entry, ...childArgs], {
 	cwd: root,
 	stdio: "inherit",
+	detached,
 	env: {
 		...process.env,
 		PI_CODING_AGENT_DIR: profile,
 		DEEPSEEK_API_KEY: credentials.apiKey,
 	},
 });
+process.on("SIGINT", () => { if (child.pid) { try { process.kill(-child.pid, "SIGINT"); } catch { child.kill("SIGINT"); } } });
+process.on("SIGTERM", () => { if (child.pid) { try { process.kill(-child.pid, "SIGTERM"); } catch { child.kill("SIGTERM"); } } });
+process.on("SIGHUP", () => { if (child.pid) { try { process.kill(-child.pid, "SIGHUP"); } catch { child.kill("SIGHUP"); } } });
 child.once("error", (error) => {
 	process.stderr.write(`failed to start ${target}: ${error.message}\n`);
 	process.exitCode = 1;

@@ -1,0 +1,19 @@
+import assert from "node:assert/strict";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { resolveExpectedOutputFiles } from "../src/m07/expected-output.ts";
+
+test("expected output resolution expands directories and reports missing files", async (t) => {
+const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-expected-"));
+t.after(() => rm(root, { recursive: true, force: true }));
+await mkdir(path.join(root, "raw"), { recursive: true });
+await writeFile(path.join(root, "result.txt"), "result\n");
+await writeFile(path.join(root, "raw", "evidence.txt"), "evidence\n");
+const resolved = await resolveExpectedOutputFiles(root, [path.join(root, "result.txt"), path.join(root, "raw"), path.join(root, "missing.txt")]);
+assert.equal(resolved.length, 3);
+assert.ok(resolved[0].files.some((file) => file.endsWith("result.txt")));
+assert.ok(resolved[1].files.some((file) => file.endsWith("evidence.txt")));
+assert.match(resolved[2].error ?? "", /missing\.txt/);
+});

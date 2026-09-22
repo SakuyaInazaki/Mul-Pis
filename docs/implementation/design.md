@@ -7,7 +7,7 @@
 | 决定 | 内容 | 理由 | 可逆性 |
 |---|---|---|---|
 | 承载方式 | TypeScript 控制器直接使用本地 `third_party/pi` 的 Pi 0.85.1 SDK（`createAgentSession`），不用 RPC 子进程；`extensions/research.ts` 是显式加载的薄入口 | SDK 提供自定义 `ResourceLoader`（真实输入隔离）、`SessionManager.create/open`（持久会话与续接）、原生/自定义工具白名单、按会话指定模型；这些是 M01–M09 所需原语，见 [`pi-harness.md`](../research/pi-harness.md) 第 3–8 节 | 高：`SessionRunner` 和 `ResearchService` 隔离 SDK 与 extension 接口 |
-| 模型 | 每个实际运行子会话的角色模型来自工作区 `research.config.json`，写法 `provider/model[:thinking]`；harness 不预设任何模型。只有会启动模型会话的操作要求该配置，M07 goal/status/plan/decision/review/finish 等纯状态操作不要求 | 用户尚未选定模型，且明确 Claude 不采用；选型是用户决定 | 高 |
+| 模型 | 每个实际运行子会话的角色模型来自工作区 `research.config.json`，写法 `provider/model[:thinking]`；harness 不预设任何模型。只有会启动模型会话的操作要求该配置，M07 goal/status/plan/decision/review/finish/interrupt 等纯状态操作不要求 | 用户尚未选定模型，且明确 Claude 不采用；选型是用户决定 | 高 |
 | M03 评审成员 | 工作区可选 `m03Reviewers: [{ id, model }]` 显式列出成员；每项 `model` 直接写完整 `provider/model[:thinking]` 引用，可重复。只有缺省列表时才回退 `roles.reviewer`/`roles.default` 的原有单 reviewer 路径 | 允许当前用三个独立 DeepSeek 会话实验多成员编排，同时不把同模型会话误称为多模型验证，也不固定全局成员数量 | 高 |
 | 主 Agent | 一个交互式 Pi 主会话通过 `research_*` extension 工具读取状态、运行 M01–M06/M08/M09、管理 M07 目标、动态委派并验收；CLI 也可直接运行这些阶段，但仍是直接阶段入口，不经过 extension 的主会话激活、能力门禁、有限重试或正常 shutdown 记录 | Pi 核心没有内建 subagent；独立任务用新建 SDK session 实现，不再造第二个主 Agent。extension 不替换主会话模型 | 高 |
 | 提示词 | 运行时直接读取 `workflow/v1.0/提示词/*.txt`，不复制进代码 | 提示词是用户自有工作流的一部分，单一来源 | — |
@@ -49,7 +49,7 @@ M07 先冻结原问题副本、目标关系、约束、成功要求、计划和�
 - M05 的工具规则与报告小节要求（`buildM05Message`），以及各工具的描述文字。
 - M06 三类任务框架（依据手册第十章 1–3 节改写为面向阅读者/核对者/适用性会话的任务说明）。
 - M08 自查任务框架、外审固定材料说明、材料清单与整批反馈声明；reviewer 数量和角色不由 harness 默认决定。
-- M09 加载原 workflow 的完整 P09，再附接接收者/用途说明、交付副本复核边界与收口回执要求。整理与复核共用由控制器校验的机器 schema：`status` 是固定枚举，`scope`、`unresolved`、`evidence` 是字符串数组，可选 `nonBlockingLimitations` 只保存已明确确认但不阻塞当前交付范围的限制；它不会由 `unresolved` 自动转换，`checked` 仍只允许空 `unresolved`。checker 没有自由 bash，只看到预授权命令索引；原始命令留在根外私有审计，实际 exit/stdout/stderr 以不含命令文本的日志放入 checker 受控根。source trace 和每个已执行命令日志都必须被实际读取，命令不能静默改写控制证据。请求索引与实际执行（包括未执行、取消或失败）在解析模型机器块前先落盘，因此门禁失败也保留事实。计算命令应把结果写入新路径；verification copy 中原交付文件或既有控制证据被改写或删除时拒绝收口，新增核验输出则保留为实际覆盖。调用方可用 `pdfPages` 指定 included PDF 必查页，省略时要求覆盖 included PDF 全部页；完整复算模式只记录请求和实际命令覆盖，不认证完整复现。
+- M09 加载原 workflow 的完整 P09，再附接接收者/用途说明、交付副本复核边界与收口回执要求。整理与复核共用由控制器校验的机器 schema：`status` 为 `checked | partial | needs_fix | blocked`；`scope`、`unresolved`、`evidence` 是字符串数组，可选 `nonBlockingLimitations` 只保存已明确确认但不阻塞当前交付范围的限制，不由 `unresolved` 自动转换。`checked` 只允许空 `unresolved`；只有 M04 处置为 `partial` 时才允许 `partial`，且必须保留真实非空 `unresolved`，表示受控部分交付而不是把它改写成非阻塞限制。checker 没有自由 bash，只看到预授权命令索引；原始命令留在根外私有审计，实际 exit/stdout/stderr 以不含命令文本的日志放入 checker 受控根。source trace 和每个已执行命令日志都必须被实际读取，命令不能静默改写控制证据。请求索引与实际执行（包括未执行、取消或失败）在解析模型机器块前先落盘，因此门禁失败也保留事实。计算命令应把结果写入新路径；verification copy 中原交付文件或既有控制证据被改写或删除时拒绝收口，新增核验输出则保留为实际覆盖。调用方可用 `pdfPages` 指定 included PDF 必查页，省略时要求覆盖 included PDF 全部页；完整复算模式只记录请求和实际命令覆盖，不认证完整复现。
 
 ## 4. 知识库语义
 
@@ -63,7 +63,7 @@ M07 先冻结原问题副本、目标关系、约束、成功要求、计划和�
 
 - 模型选择与路由、并发数、预算：由 `research.config.json` 决定，harness 无默认。
 - M05：browser-use 需在配置中指定模型与对应 API 密钥；当前 wrapper 只接 OpenAI/Anthropic，并新建无既有 profile/login state 的 headless `BrowserSession`，尚未接入用户已有浏览器会话或凭据管理，不能据此假定登录站点普遍可用。它会在同一浏览器任务会话内逐步保存发生变化的 DOM、正文、截图和下载，失败或超时前的有效文件仍保留；`result.md` 是浏览器模型报告，不能登记为外部原始材料。每个实际材料文件可记录 URL、标题、取得时间、内容类型、材料类型和派生关系。默认上限为 20 个页面状态、12 张截图、HTML 合计 5 MB、正文合计 2 MB、登记入材料的下载合计 250 MB；该下载上限不是浏览器写盘的硬配额。触限会明确警告，因此成功也不等于材料完整。Brave 密钥可选；DuckDuckGo HTML 没有可靠的 API 翻页实现，可改用浏览器继续。所有站点与论坛都只按本轮任务保存所需范围，不自动递归取得全部帖子，也不保证任意网站均能取得。Crawl4AI 与 browser-use 不运行本地模型；PDF 页面图像要求 reader/checker 角色使用多模态模型，长材料分块仍未实现。
-- M07 通过显式 Pi extension 接入，但目前每次工具调用同步等待完成，没有 detached/异步 job、断线后自动重跑或进程重启后的 running 任务续跑。中断后仍记录为 running 的任务只能查看，不能自动重跑、假称结束或结束整个目标；本版没有修改该未知状态的恢复 API。取消会传到 Pi 会话；SDK abort 的失败会作为失败报告，已有外部 HTTP/browser 工具是否即时停下取决于其自身 signal 支持，不能承诺所有外部动作瞬停。M07 execution 会话禁止 resume，避免后续无声扩大工具范围；目标状态可恢复查看，已结束目标不能自动重跑。
+- M07 通过显式 Pi extension 接入，但目前每次工具调用同步等待完成，没有 detached/异步 job、断线后自动重跑或进程重启后的 running 任务续跑。中断后仍记录为 running 的任务新增 `research_goal action=interrupt` 受控归档：显式记为 failed 并记录原因，目标以 blocked 收口、写入反馈包；仍不自动重跑或假称完成。取消会传到 Pi 会话；SDK abort 的失败会作为失败报告，已有外部 HTTP/browser 工具是否即时停下取决于其自身 signal 支持，不能承诺所有外部动作瞬停。M07 execution 会话禁止 resume，避免后续无声扩大工具范围；目标状态可恢复查看，已结束目标不能自动重跑。
 - M08/M09 当前按已授权的暂定流程实现；真实 reviewer 数量、模型组合、预算和领域检查策略仍由工作区配置与调用方决定。M08 完成不等于科研通过；M04 的 `m08-disposition` 可能是 partial/rework/needs_evidence/unresolved，只有 ready/partial、明确列出 deliverable paths 且本会话实际访问相应固定材料才可进入 M09。M09 在生成 running facts 后再次执行最终知识限制检查，再写收口；这缩小同进程检查窗口，但不构成跨进程原子事务。M09 不自动公开、投稿、外发、压包、启动下一目标或 RSI，也不把 `full-recomputation` 请求写成完整复现已验证。
 - 知识库合入有锁文件保护；M07 service 的工作区 mutation 互斥只覆盖当前 Pi 进程，不能声称是跨进程任务锁，多机协调不在范围。
 - 已进行一次真实题目的主 Pi 工作流试跑并取得局部阶段结果，但试跑暴露了控制、知识提案与 M09 交付协议缺口，且没有严格完整通过 M01–M09；它不能作为通用科研效果或完整流程已验证的证据。离线自动测试仍使用脚本化假会话与真实文件存储。

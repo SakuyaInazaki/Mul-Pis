@@ -55,7 +55,7 @@ function compact(value: unknown): Record<string, unknown> {
 			closure: closure ? {
 				status: closure.status, closureRequested: closure.closureRequested, researchCompletion: closure.researchCompletion,
 				deliveryStatus: closure.deliveryStatus, version: closure.version, recipient: closure.recipient, purpose: closure.purpose,
-				deliveryScope: closure.deliveryScope, reproduction: reproduction ? {
+				deliveryScope: closure.deliveryScope, unresolved: closure.unresolved, reproduction: reproduction ? {
 					mode: reproduction.mode, status: reproduction.status, authorizedExecution: reproduction.authorizedExecution,
 					actualToolCalls: reproduction.actualToolCalls, interpretation: reproduction.interpretation,
 					instructionCount: Array.isArray(reproduction.instructions) ? reproduction.instructions.length : undefined,
@@ -208,14 +208,14 @@ export function createResearchExtension(options: ResearchExtensionOptions = {}) 
 		pi.registerTool({
 			name: "research_goal",
 			label: "Manage Research Goal",
-			description: "Begin, inspect, replan, record a user decision, or finish one persisted M07 goal. Finishing does not turn returned tasks into accepted work.",
+			description: "Begin, inspect, replan, record a user decision, finish, or interrupt/archive one persisted M07 goal. Interrupt records unknown-running tasks as failed with a reason and closes the goal as blocked; it never claims completion.",
 			promptSnippet: "Manage one explicit M07 goal and its lifecycle",
 			promptGuidelines: ["Use research_goal to keep the user's frozen goal, plan, decisions, outcome, and return path explicit."],
 			parameters: Type.Object({
-				action: Type.Union([Type.Literal("begin"), Type.Literal("status"), Type.Literal("plan"), Type.Literal("decision"), Type.Literal("finish")]),
+				action: Type.Union([Type.Literal("begin"), Type.Literal("status"), Type.Literal("plan"), Type.Literal("decision"), Type.Literal("finish"), Type.Literal("interrupt")]),
 				workspace: Type.Optional(Type.String()), runId: Type.Optional(Type.String()),
 				goal: Type.Optional(Type.String()), problemRelation: Type.Optional(Type.String()), constraints: Type.Optional(Type.Array(Type.String())), successCriteria: Type.Optional(Type.Array(Type.String())), plan: Type.Optional(Type.String()), exploratory: Type.Optional(Type.Boolean()), refreshBaseline: Type.Optional(Type.Boolean()),
-				decisionAction: Type.Optional(Type.Union([Type.Literal("request"), Type.Literal("resolve")])), question: Type.Optional(Type.String()), decision: Type.Optional(Type.String()), relatedTaskIds: Type.Optional(Type.Array(Type.String())),
+				decisionAction: Type.Optional(Type.Union([Type.Literal("request"), Type.Literal("resolve")])), question: Type.Optional(Type.String()), decision: Type.Optional(Type.String()), relatedTaskIds: Type.Optional(Type.Array(Type.String())), reason: Type.Optional(Type.String({ description: "Interrupt/archive reason; required for action=interrupt" })),
 				outcome: Type.Optional(Type.Union([Type.Literal("partial"), Type.Literal("blocked"), Type.Literal("fulfilled")])), summary: Type.Optional(Type.String()), returnPath: Type.Optional(Type.Union([Type.Literal("M04"), Type.Literal("M05"), Type.Literal("M06"), Type.Literal("M08"), Type.Literal("continue"), Type.Literal("user")])), limitations: Type.Optional(Type.Array(Type.String())),
 				goalChecks: Type.Optional(Type.Array(Type.Object({ criterion: Type.String(), result: Type.Union([Type.Literal("passed"), Type.Literal("failed"), Type.Literal("not_run")]), evidence: Type.Array(Type.String()) }))),
 			}),
@@ -233,6 +233,7 @@ export function createResearchExtension(options: ResearchExtensionOptions = {}) 
 					if (!params.runId) throw new Error(`research_goal ${params.action} requires runId`);
 					if (params.action === "plan") value = await service.goalAction("plan", workspace, { runId: params.runId, plan: params.plan ?? "", refreshBaseline: params.refreshBaseline }, signal);
 					if (params.action === "decision") value = await service.goalAction("decision", workspace, { runId: params.runId, action: params.decisionAction ?? "request", question: params.question, decision: params.decision, relatedTaskIds: params.relatedTaskIds ?? [] }, signal);
+					if (params.action === "interrupt") value = await service.goalAction("interrupt", workspace, { runId: params.runId, reason: params.reason ?? params.summary ?? "用户/主 Agent 受控中断归档", returnPath: params.returnPath }, signal);
 					if (params.action === "finish") value = await service.goalAction("finish", workspace, { runId: params.runId, outcome: params.outcome ?? "partial", summary: params.summary ?? "", returnPath: params.returnPath ?? "user", limitations: params.limitations, goalChecks: params.goalChecks ?? [] }, signal);
 				}
 				researchActive = true; activePiCwd = ctx.cwd;

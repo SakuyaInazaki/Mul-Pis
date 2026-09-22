@@ -5,7 +5,8 @@ import { loadPrompt, section, systemPromptFor } from "../prompts.ts";
 import { HarnessError } from "../types.ts";
 import { nowIso, writeFileAtomic } from "../workspace.ts";
 import { recordSession, sessionSpec, type StageContext } from "../stages/context.ts";
-import type { BeginGoalInput, CurrentGoal, DecisionInput, EvidenceFile, FinishInput, M07Controller, M07TaskRecord, TaskCheck, TaskReviewInput, TaskSpecInput } from "./types.ts";
+import { resolveExpectedOutputFiles } from "./expected-output.ts";
+import type { BeginGoalInput, CurrentGoal, DecisionInput, EvidenceFile, FinishInput, InterruptInput, M07Controller, M07TaskRecord, TaskCheck, TaskReviewInput, TaskSpecInput } from "./types.ts";
 import type { StageRunRecord } from "../types.ts";
 
 const STATE = "goal.json";
@@ -26,8 +27,14 @@ function sameStrings(a: string[], b: string[]): boolean {
 	return a.length === b.length && a.every((value, index) => value === b[index]);
 }
 
+function modeRank(mode: TaskSpecInput["mode"]): number {
+	if (mode === "execute") return 2;
+	if (mode === "check") return 1;
+	return 0;
+}
+
 function sameSupersededObligation(next: TaskSpecInput, previous: M07TaskRecord): boolean {
-	return next.objective.trim() === previous.objective && next.mode === previous.mode && Boolean(next.requireIndependentCheck) === Boolean(previous.requireIndependentCheck) && sameStrings(next.checks, previous.checks) && sameStrings(next.expectedOutputs, previous.expectedOutputs);
+	return next.objective.trim() === previous.objective && modeRank(next.mode) >= modeRank(previous.mode) && Boolean(next.requireIndependentCheck) === Boolean(previous.requireIndependentCheck) && sameStrings(next.checks, previous.checks) && sameStrings(next.expectedOutputs, previous.expectedOutputs);
 }
 
 function inside(root: string, candidate: string): boolean {
@@ -205,10 +212,17 @@ export function createM07Controller(ctx: StageContext): M07Controller {
 			await requireCurrentFormalBaseline(ctx, goal);
 			spec = { ...spec, objective: spec.objective.trim(), inputs: normalizedUnique(spec.inputs, "task input"), expectedOutputs: normalizedUnique(spec.expectedOutputs, "expected output"), checks: normalizedUnique(spec.checks, "task check") };
 			if (!spec.checks.length) throw new HarnessError("m07.task", "每个任务必须定义至少一项实际检查；推导可用会话报告作为证据");
-			if (spec.mode === "execute" && !spec.expectedOutputs.length) throw new HarnessError("m07.task", "execute 任务必须声明至少一个预期产物");
+			if (spec.mode === "check") {
+				if (spec.expectedOutputs.length > 0) throw new HarnessError("m07.task", "check 模式只读且不写盘，不能声明 expectedOutputs；需要产出文件时请使用 execute 模式");
+			}
+			if (spec.mode === "execute") {
+				if (spec.expectedOutputs.length === 0) {
+					if (spec.supersedesTaskId === undefined) throw new HarnessError("m07.task", "execute 任务必须声明至少一个预期产物");
+				}
+			}
 			if (spec.parentTaskId && !goal.tasks.some((t) => t.taskId === spec.parentTaskId)) throw new HarnessError("m07.task", `未知 parentTaskId ${spec.parentTaskId}`);
 			const resolvedInputs: string[] = []; for (const requested of spec.inputs) resolvedInputs.push(await confinedExistingFile(ctx, requested));
-			if (spec.supersedesTaskId) { const previous = goal.tasks.find((t) => t.taskId === spec.supersedesTaskId); if (!previous) throw new HarnessError("m07.task", `未知 supersedesTaskId ${spec.supersedesTaskId}`); const previousInputs = previous.inputCopies.map((item) => item.source).sort(); const nextInputs = [...resolvedInputs].sort(); if (!sameSupersededObligation(spec, previous) || !sameStrings(nextInputs, previousInputs)) throw new HarnessError("m07.task", "supersedes 只能替代 objective/mode/独立检查要求/inputs/checks/expectedOutputs 完全相同的旧任务义务"); }
+			if (spec.supersedesTaskId) { const previous = goal.tasks.find((t) => t.taskId === spec.supersedesTaskId); if (!previous) throw new HarnessError("m07.task", `未知 supersedesTaskId ${spec.supersedesTaskId}`); const previousInputs = previous.inputCopies.map((item) => item.source).sort(); const nextInputs = [...resolvedInputs].sort(); if (!sameSupersededObligation(spec, previous) || !sameStrings(nextInputs, previousInputs)) throw new HarnessError("m07.task", "supersedes 只能替代 objective、兼容 mode（可升级到更强能力）、独立检查要求、inputs、checks 与 expectedOutputs 相同或不降低义务的旧任务"); }
 			const dependencies = [spec.parentTaskId, spec.supersedesTaskId].filter(Boolean) as string[];
 			if (goal.decisions.some((d) => d.status === "open" && d.relatedTaskIds.some((id) => dependencies.includes(id)))) throw new HarnessError("m07.decision", "该任务依赖待用户决定事项；可继续不受影响的任务，但不能推进此依赖分支");
 			const id = taskId(goal), dir = path.join(ctx.ws.runDir("M07", runId), "tasks", id), workDir = path.join(dir, "work"), inputsDir = path.join(workDir, "inputs");
@@ -267,9 +281,15 @@ export function createM07Controller(ctx: StageContext): M07Controller {
 				}
 			}
 			const failures = [...(input.failures ?? [])], unexecuted = [...(input.unexecuted ?? [])], limitations = input.limitations ?? [];
-			for (const expected of task.expectedOutputPaths) {
-				const actualExpected = existsSync(expected) ? await realpath(expected) : undefined;
-				if (!actualExpected || !artifacts.some((a) => a.sourcePath === actualExpected)) failures.push(`预期产物未实际提交：${path.relative(task.workDir, expected)}`);
+			const addExpectedArtifact = async (source: string): Promise<void> => {
+				if (artifacts.some((item) => item.sourcePath === source)) return;
+				const type = mediaType(source);
+				artifacts.push({ path: await freeze(source), sourcePath: source, mediaType: type, readCoverage: type === "text" ? "recorded-not-reviewed" : "unread-binary" });
+			};
+			const expectedOutputs = await resolveExpectedOutputFiles(task.workDir, task.expectedOutputPaths);
+			for (const expected of expectedOutputs) {
+				if (expected.error) { failures.push(expected.error); continue; }
+				for (const file of expected.files) await addExpectedArtifact(file);
 			}
 			const accepted = checks.every((c) => c.result === "passed") && !failures.length && !unexecuted.length;
 			task.status = accepted ? "accepted" : "rejected"; task.review = { at: nowIso(), frozenReportPath, checks, artifacts, failures, unexecuted, limitations, independentCheck: input.independentCheck };
@@ -307,6 +327,35 @@ export function createM07Controller(ctx: StageContext): M07Controller {
 			if (invalidBaseline) goal.limitations.push(`原正式基线已失效：${invalidBaseline}；本次仅如实记录 ${input.outcome} 并回流，不表示原目标完成。`);
 			goal.feedbackPath = await writeFeedback(ctx, goal); await save(ctx, goal);
 			const run = await ctx.ws.readRun("M07", runId); run.outputs.push({ label: "M07 实际执行反馈包", path: goal.feedbackPath }); run.remarks.push(`目标结果 ${input.outcome}；主 Agent 选择返回 ${input.returnPath}。会话返回不等于科学验收。`); for (const t of goal.tasks) { if (t.session) run.sessions.push({ label: t.session.label, role: t.session.role, id: t.session.id, file: t.session.file, model: t.session.model }); if (t.executionFailure) run.failures.push(`${t.taskId} 执行失败：${t.executionFailure}`); if (t.review) { for (const f of t.review.failures) run.failures.push(`${t.taskId}：${f}`); for (const u of t.review.unexecuted) run.failures.push(`${t.taskId} 未执行：${u}`); } } await ctx.ws.finishRun(run, input.outcome === "blocked" ? "failed" : "completed"); await ctx.ws.writeNote(run, `M07 主 Agent 目标式执行；保留原目标、所有任务、失败、未执行和限制。最终选择返回 ${input.returnPath}。`);
+			return goal;
+		},
+
+		async interrupt(runId, input: InterruptInput) {
+			const goal = await load(ctx, runId); requireActive(goal);
+			const reason = nonempty(input.reason, "reason");
+			const at = nowIso();
+			const interrupted: string[] = [];
+			for (const task of goal.tasks) {
+				if (task.status !== "running") continue;
+				task.status = "failed";
+				task.returnedAt = at;
+				task.executionFailure = `受控中断归档：${reason}`;
+				interrupted.push(task.taskId);
+			}
+			goal.lifecycle = "finished";
+			goal.outcome = "blocked";
+			goal.finishSummary = `目标在受控中断后归档为 blocked；原因：${reason}`;
+			goal.returnPath = input.returnPath ?? "user";
+			goal.limitations.push(`受控中断归档：${reason}`);
+			goal.goalChecks = goal.successCriteria.map((criterion) => ({ criterion, result: "not_run" as const, evidence: [] }));
+			goal.feedbackPath = await writeFeedback(ctx, goal);
+			await save(ctx, goal);
+			const run = await ctx.ws.readRun("M07", runId);
+			run.outputs.push({ label: "M07 实际执行反馈包", path: goal.feedbackPath });
+			for (const id of interrupted) run.failures.push(`${id} 执行失败：受控中断归档：${reason}`);
+			run.remarks.push(`目标受控中断归档为 blocked；返回 ${goal.returnPath}。只记录实际中断事实，不自动重跑或假称完成。`);
+			await ctx.ws.finishRun(run, "failed");
+			await ctx.ws.writeNote(run, `M07 目标受控中断归档；running 任务 ${interrupted.join("、") || "无"} 记为 failed；原因：${reason}。`);
 			return goal;
 		},
 	};

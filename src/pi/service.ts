@@ -3,7 +3,7 @@ import { realpath } from "node:fs/promises";
 import path from "node:path";
 import { createFileKnowledgeStore } from "../knowledge/store.ts";
 import { createM07Controller } from "../m07/controller.ts";
-import type { BeginGoalInput, DecisionInput, FinishInput, TaskReviewInput, TaskSpecInput } from "../m07/types.ts";
+import type { BeginGoalInput, DecisionInput, FinishInput, InterruptInput, TaskReviewInput, TaskSpecInput } from "../m07/types.ts";
 import { createPiSessionRunner } from "../runner/pi.ts";
 import type { SessionHandle, SessionRunner, SessionSpec } from "../runner/types.ts";
 import { runInit } from "../stages/init.ts";
@@ -24,7 +24,7 @@ export type ResearchStage = "M01" | "M02" | "M03" | "M04" | "M05" | "M06" | "M07
 export type RunnableStage = Exclude<ResearchStage, "M07">;
 
 export interface ResearchProgress {
-	phase: "session-create" | "session-created" | "prompt-start" | "prompt-complete" | "stage-complete";
+	phase: "session-create" | "session-created" | "prompt-start" | "prompt-heartbeat" | "prompt-complete" | "stage-complete";
 	stage?: ResearchStage;
 	session?: string;
 	message: string;
@@ -75,6 +75,14 @@ export interface StageRequest {
 export interface ResearchServiceOptions {
 	defaultWorkspace: string;
 	onProgress?: (progress: ResearchProgress) => void;
+	/** Periodic progress updates while a model prompt is still running; 0 disables. */
+	progressIntervalMs?: number;
+	/** Overall wall-clock limit for one child prompt; 0 disables. */
+	promptTimeoutMs?: number;
+	/** Abort when no transcript or tool-log progress is observed for this long; 0 disables. */
+	stallTimeoutMs?: number;
+	/** How often to check for stalled prompts. */
+	stallCheckMs?: number;
 	runnerFactory?: (signal: AbortSignal | undefined) => SessionRunner;
 }
 
@@ -84,15 +92,27 @@ class ProgressRunner implements SessionRunner {
 	private readonly inner: SessionRunner;
 	private readonly report: (progress: ResearchProgress) => void;
 	private readonly stage: ResearchStage;
+	private readonly heartbeatMs: number;
+	private readonly promptTimeoutMs: number;
+	private readonly stallTimeoutMs: number;
+	private readonly stallCheckMs: number;
 
 	constructor(
 		inner: SessionRunner,
 		report: (progress: ResearchProgress) => void,
 		stage: ResearchStage,
+		heartbeatMs = 15_000,
+		promptTimeoutMs = 60 * 60_000,
+		stallTimeoutMs = 10 * 60_000,
+		stallCheckMs = 30_000,
 	) {
 		this.inner = inner;
 		this.report = report;
 		this.stage = stage;
+		this.heartbeatMs = heartbeatMs;
+		this.promptTimeoutMs = promptTimeoutMs;
+		this.stallTimeoutMs = stallTimeoutMs;
+		this.stallCheckMs = stallCheckMs;
 	}
 
 	async create(spec: SessionSpec): Promise<SessionHandle> {
@@ -111,9 +131,57 @@ class ProgressRunner implements SessionRunner {
 			...handle,
 			prompt: async (text) => {
 				this.report({ phase: "prompt-start", stage: this.stage, session: handle.ref.label, message: `${handle.ref.label}：正在执行` });
-				const result = await handle.prompt(text);
-				this.report({ phase: "prompt-complete", stage: this.stage, session: handle.ref.label, message: `${handle.ref.label}：执行完成` });
-				return result;
+				const startedAt = Date.now();
+				let heartbeat: NodeJS.Timeout | undefined;
+				if (this.heartbeatMs > 0) {
+					heartbeat = setInterval(() => {
+						const elapsedSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+						this.report({ phase: "prompt-heartbeat", stage: this.stage, session: handle.ref.label, message: `${handle.ref.label}：心跳（不代表子会话有进展，已 ${elapsedSeconds}s）` });
+					}, this.heartbeatMs);
+					heartbeat.unref();
+				}
+				let timeoutTimer: NodeJS.Timeout | undefined;
+				let stallTimer: NodeJS.Timeout | undefined;
+				let lastProgressAt = Date.now();
+				let progressMarker = handle.transcript().length + handle.toolLog().length;
+				let watchdogFailed = false;
+				const watchdog = new Promise<never>((_resolve, reject) => {
+					const fail = (error: HarnessError): void => {
+						if (watchdogFailed) return;
+						watchdogFailed = true;
+						handle.dispose();
+						reject(error);
+					};
+					if (this.promptTimeoutMs > 0) {
+						timeoutTimer = setTimeout(() => {
+							fail(new HarnessError("runner.stop", `session ${handle.ref.label} exceeded prompt timeout (${Math.round(this.promptTimeoutMs / 1000)}s)`));
+						}, this.promptTimeoutMs);
+						timeoutTimer.unref();
+					}
+					if (this.stallTimeoutMs > 0 && this.stallCheckMs > 0) {
+						stallTimer = setInterval(() => {
+							const current = handle.transcript().length + handle.toolLog().length;
+							if (current === progressMarker) {
+								if (Date.now() - lastProgressAt > this.stallTimeoutMs) {
+									fail(new HarnessError("runner.stop", `session ${handle.ref.label} made no progress for ${Math.round(this.stallTimeoutMs / 1000)}s`));
+								}
+								return;
+							}
+							progressMarker = current;
+							lastProgressAt = Date.now();
+						}, this.stallCheckMs);
+						stallTimer.unref();
+					}
+				});
+				try {
+					const result = await Promise.race([handle.prompt(text), watchdog]);
+					this.report({ phase: "prompt-complete", stage: this.stage, session: handle.ref.label, message: `${handle.ref.label}：执行完成` });
+					return result;
+				} finally {
+					if (heartbeat) clearInterval(heartbeat);
+					if (timeoutTimer) clearTimeout(timeoutTimer);
+					if (stallTimer) clearInterval(stallTimer);
+				}
 			},
 		};
 	}
@@ -268,7 +336,7 @@ export class ResearchService {
 		return createM07Controller({ ws, store, runner: unavailable, config: { roles: {}, concurrency: 1, tools: {} } }).status(runId);
 	}
 
-	async goalAction(action: "begin" | "plan" | "decision" | "finish", requested: string | undefined, input: BeginGoalInput | { runId: string; plan: string; refreshBaseline?: boolean } | ({ runId: string } & DecisionInput) | ({ runId: string } & FinishInput), signal?: AbortSignal): Promise<unknown> {
+	async goalAction(action: "begin" | "plan" | "decision" | "finish" | "interrupt", requested: string | undefined, input: BeginGoalInput | { runId: string; plan: string; refreshBaseline?: boolean } | ({ runId: string } & DecisionInput) | ({ runId: string } & FinishInput) | ({ runId: string } & InterruptInput), signal?: AbortSignal): Promise<unknown> {
 		const root = this.resolveWorkspace(requested);
 		return this.withMutation(root, async () => {
 			const ctx = await this.nonModelContext(root);
@@ -276,6 +344,7 @@ export class ResearchService {
 			if (action === "begin") return controller.begin(input as BeginGoalInput);
 			if (action === "plan") { const value = input as { runId: string; plan: string; refreshBaseline?: boolean }; return controller.plan(value.runId, value.plan, { refreshBaseline: value.refreshBaseline }); }
 			if (action === "decision") { const { runId, ...value } = input as { runId: string } & DecisionInput; return controller.decision(runId, value); }
+			if (action === "interrupt") { const { runId, ...value } = input as { runId: string } & InterruptInput; return controller.interrupt(runId, value); }
 			const { runId, ...value } = input as { runId: string } & FinishInput;
 			return controller.finish(runId, value);
 		});
@@ -312,7 +381,7 @@ export class ResearchService {
 		if (!existsSync(ws.configFile)) throw new HarnessError("config.missing", `缺少 ${ws.configFile}；请明确配置各角色模型`);
 		const store = createFileKnowledgeStore(ws.knowledgeDir);
 		const base = this.options.runnerFactory?.(signal) ?? createPiSessionRunner({ signal });
-		const runner = new ProgressRunner(base, (progress) => this.options.onProgress?.(progress), stage);
+		const runner = new ProgressRunner(base, (progress) => this.options.onProgress?.(progress), stage, this.options.progressIntervalMs ?? 15_000, this.options.promptTimeoutMs ?? 60 * 60_000, this.options.stallTimeoutMs ?? 10 * 60_000, this.options.stallCheckMs ?? 30_000);
 		return { ws, store, runner, config: await ws.loadConfig() };
 	}
 

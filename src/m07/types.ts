@@ -59,6 +59,11 @@ export interface FinishInput {
 	goalChecks: TaskCheck[];
 }
 
+export interface InterruptInput {
+	reason: string;
+	returnPath?: ReturnPath;
+}
+
 export interface EvidenceFile {
 	path: string;
 	/** Original submitted path; `path` is the frozen review copy. */
@@ -140,4 +145,5 @@ export interface M07Controller {
 	review(runId: string, input: TaskReviewInput): Promise<M07TaskRecord>;
 	decision(runId: string, input: DecisionInput): Promise<CurrentGoal>;
 	finish(runId: string, input: FinishInput): Promise<CurrentGoal>;
+	interrupt(runId: string, input: InterruptInput): Promise<CurrentGoal>;
 }

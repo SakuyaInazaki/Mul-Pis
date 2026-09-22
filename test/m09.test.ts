@@ -10,9 +10,9 @@ import { createReproductionTool, runM09, type M09Options, type ReproductionRecor
 import { HarnessError } from "../src/types.ts";
 import { Workspace } from "../src/workspace.ts";
 
-const gate = (name: string, scope: string[], evidence: string[], extra: { unresolved?: string[]; nonBlockingLimitations?: string[] } = {}) => `\n\n\`\`\`${name}\n${JSON.stringify({ status: "checked", scope, unresolved: extra.unresolved ?? [], ...(extra.nonBlockingLimitations ? { nonBlockingLimitations: extra.nonBlockingLimitations } : {}), evidence })}\n\`\`\``;
+const gate = (name: string, scope: string[], evidence: string[], extra: { status?: "checked" | "partial"; unresolved?: string[]; nonBlockingLimitations?: string[] } = {}) => `\n\n\`\`\`${name}\n${JSON.stringify({ status: extra.status ?? "checked", scope, unresolved: extra.unresolved ?? [], ...(extra.nonBlockingLimitations ? { nonBlockingLimitations: extra.nonBlockingLimitations } : {}), evidence })}\n\`\`\``;
 
-async function fixture(t: TestContext, settings: { badEvidence?: boolean; runCommand?: boolean; existingLimit?: boolean; checkerUnresolved?: string[]; checkerLimitations?: string[]; skipTraceRead?: boolean; skipLogRead?: boolean; malformedCheckerGate?: boolean; duringChecker?: () => Promise<void> } = {}) {
+async function fixture(t: TestContext, settings: { badEvidence?: boolean; runCommand?: boolean; existingLimit?: boolean; checkerUnresolved?: string[]; checkerLimitations?: string[]; skipTraceRead?: boolean; skipLogRead?: boolean; malformedCheckerGate?: boolean; duringChecker?: () => Promise<void>; m04Status?: "ready" | "partial"; organizerPartial?: string[] } = {}) {
 	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-m09-"));
 	t.after(async () => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(root); const store = createFileKnowledgeStore(ws.knowledgeDir); await store.init();
@@ -31,10 +31,10 @@ async function fixture(t: TestContext, settings: { badEvidence?: boolean; runCom
 	const feedback = await ws.writeOutput(m08, "review.md", "review feedback", "M08 审查反馈包"); await ws.finishRun(m08, "completed");
 	const m04 = await ws.startRun("M04", [{ label: "M08 审查反馈包", path: feedback.path }], snapshot?.id);
 	await ws.writeOutput(m04, "m08-source.json", JSON.stringify({ m08RunId: m08.runId, manifestPath: manifestRef.path, reviewBundlePath: feedback.path }), "M08 处理来源");
-	await ws.writeOutput(m04, "m08-disposition.json", JSON.stringify({ m08RunId: m08.runId, status: "ready", deliverablePaths: [relativePath], limitations: ["只交付固定结果"], rationale: "指定范围可交付" }), "M08 用途处置");
+	await ws.writeOutput(m04, "m08-disposition.json", JSON.stringify({ m08RunId: m08.runId, status: settings.m04Status ?? "ready", deliverablePaths: [relativePath], limitations: ["只交付固定结果"], rationale: "指定范围可交付" }), "M08 用途处置");
 	await ws.writeOutput(m04, "processing.md", "M04 processed", "处理结果"); await ws.finishRun(m04, "completed");
 	const runner = new FakeSessionRunner(async ({ spec, tools }) => spec.label === "M09-organizer"
-		? { text: `独立说明，不新增结论。${gate("m09-delivery", [relativePath], [relativePath])}`, reads: [problemPath, relativePath] }
+		? { text: `独立说明，不新增结论。${gate("m09-delivery", [relativePath], [relativePath], settings.organizerPartial ? { status: "partial", unresolved: settings.organizerPartial } : {})}`, reads: [problemPath, relativePath] }
 		: (async () => {
 			await settings.duringChecker?.();
 			if (settings.runCommand) await tools.run_reproduction_check({ index: 0 });
@@ -219,4 +219,17 @@ test("M09 rejects stale knowledge state and proposal-processing failures", async
 	await assert.rejects(runM09(stale.ctx, stale.options), (error: unknown) => error instanceof HarnessError && error.code === "m09.knowledge-changed");
 	const failed = await fixture(t); failed.m04.failures.push("知识提案未合入：结构校验未通过"); await failed.ws.writeRun(failed.m04);
 	await assert.rejects(runM09(failed.ctx, failed.options), (error: unknown) => error instanceof HarnessError && error.code === "m09.m04-proposal");
+});
+
+test("M09 forms a partial closure only when M04 partial allows real unresolved", async (t) => {
+	const allowed = await fixture(t, { m04Status: "partial", organizerPartial: ["Q1 still open"] });
+	const result = await runM09(allowed.ctx, allowed.options);
+	assert.equal(result.record.status, "completed");
+	assert.equal(result.closure.deliveryStatus, "partial");
+	assert.deepEqual(result.closure.unresolved, ["Q1 still open"]);
+	const closureOutput = result.record.outputs.find((item) => item.label === "M09 收口回执"); assert.ok(closureOutput);
+	const closure = JSON.parse(await readFile(closureOutput.path, "utf8")); assert.deepEqual(closure.unresolved, ["Q1 still open"]);
+
+	const blocked = await fixture(t, { organizerPartial: ["Q1 still open"] });
+	await assert.rejects(runM09(blocked.ctx, blocked.options), (error: unknown) => error instanceof HarnessError && error.code === "m09.gate");
 });
