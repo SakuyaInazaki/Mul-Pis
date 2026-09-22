@@ -1,6 +1,6 @@
 import { Type } from "@earendil-works/pi-ai";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
 import { existsSync } from "node:fs";
 import { loadPrompt } from "../prompts.ts";
@@ -86,6 +86,8 @@ function workspaceFrom(value: string | undefined, cwd: string): string {
 export interface ResearchExtensionOptions {
 	service?: ResearchService;
 	defaultWorkspace?: string;
+	mainAgentStallTimeoutMs?: number;
+	mainAgentStallCheckMs?: number;
 }
 
 export function createResearchExtension(options: ResearchExtensionOptions = {}) {
@@ -99,10 +101,61 @@ export function createResearchExtension(options: ResearchExtensionOptions = {}) 
 		const service = options.service ?? new ResearchService({
 			defaultWorkspace: options.defaultWorkspace ?? process.cwd(),
 			onProgress: (progress) => activeUpdate?.(result(progress)),
+
 		});
+
+const mainAgentStallTimeoutMs = options.mainAgentStallTimeoutMs ?? 10 * 60_000;
+const mainAgentStallCheckMs = options.mainAgentStallCheckMs ?? 1_000;
+let mainAgentWatchdog: NodeJS.Timeout | undefined;
+let mainAgentWatchdogCtx: ExtensionContext | undefined;
+let mainAgentLastActivityAt = 0;
+let mainAgentLastCheckAt = 0;
+let mainAgentWatchdogTriggered = false;
+let pendingShutdownReason: string | undefined;
+
+const clearMainAgentWatchdog = (): void => {
+if (mainAgentWatchdog) clearInterval(mainAgentWatchdog);
+mainAgentWatchdog = undefined;
+mainAgentWatchdogCtx = undefined;
+mainAgentWatchdogTriggered = false;
+};
+
+const noteMainAgentActivity = (ctx?: ExtensionContext): void => {
+if (ctx) mainAgentWatchdogCtx = ctx;
+mainAgentLastActivityAt = Date.now();
+mainAgentWatchdogTriggered = false;
+};
+
+const startMainAgentWatchdog = (ctx: ExtensionContext): void => {
+if (mainAgentStallTimeoutMs <= 0 || mainAgentStallCheckMs <= 0) return;
+mainAgentWatchdogCtx = ctx;
+noteMainAgentActivity(ctx);
+if (mainAgentWatchdog) return;
+mainAgentLastCheckAt = Date.now();
+mainAgentWatchdog = setInterval(() => {
+const now = Date.now();
+const gap = now - mainAgentLastCheckAt;
+mainAgentLastCheckAt = now;
+if (gap > 5_000) {
+mainAgentLastActivityAt += gap;
+return;
+}
+if (mainAgentWatchdogTriggered) return;
+const currentCtx = mainAgentWatchdogCtx;
+if (currentCtx === undefined) return;
+if (currentCtx.isIdle()) return;
+if (now - mainAgentLastActivityAt <= mainAgentStallTimeoutMs) return;
+mainAgentWatchdogTriggered = true;
+pendingShutdownReason = `主 Pi 顶层流式响应停滞：${Math.round(mainAgentStallTimeoutMs / 1000)}s 无 message/tool 进展；由 watchdog 请求 abort`;
+try { currentCtx.abort(); } catch { mainAgentWatchdogTriggered = false; pendingShutdownReason = undefined; }
+}, mainAgentStallCheckMs);
+mainAgentWatchdog.unref?.();
+};
 
 		pi.on("session_start", async (_event, ctx) => {
 			researchActive = false; activePiCwd = undefined;
+			clearMainAgentWatchdog();
+			pendingShutdownReason = undefined;
 			const manager = (ctx as { sessionManager?: { getSessionId?: () => string } }).sessionManager;
 			const id = manager?.getSessionId?.();
 			if (id && existsSync(path.join(ctx.cwd, ".agent"))) {
@@ -110,14 +163,27 @@ export function createResearchExtension(options: ResearchExtensionOptions = {}) 
 				catch { controllerTelemetry = undefined; }
 			}
 		});
-		pi.on("agent_start", async () => { await controllerTelemetry?.heartbeat("active").catch(() => undefined); });
-		pi.on("agent_end", async () => { await controllerTelemetry?.heartbeat("idle").catch(() => undefined); });
+		pi.on("agent_start", async (_event, ctx) => { startMainAgentWatchdog(ctx); await controllerTelemetry?.heartbeat("active").catch(() => undefined); });
+		pi.on("agent_end", async () => { clearMainAgentWatchdog(); await controllerTelemetry?.heartbeat("idle").catch(() => undefined); });
+		pi.on("agent_settled", () => { clearMainAgentWatchdog(); });
 		pi.on("session_shutdown", async (event) => {
-			await service.interruptAllActive(`Pi session_shutdown: ${event.reason}`);
+			const reason = pendingShutdownReason ?? `Pi session_shutdown: ${event.reason}`;
+			pendingShutdownReason = undefined;
+			clearMainAgentWatchdog();
+			await service.interruptAllActive(reason, event.reason === "quit");
 			await controllerTelemetry?.end().catch(() => undefined);
 			controllerTelemetry = undefined;
 		});
+		pi.on("message_start", (_event, ctx) => { noteMainAgentActivity(ctx); });
+		pi.on("message_update", (_event, ctx) => { noteMainAgentActivity(ctx); });
+		pi.on("message_end", (_event, ctx) => { noteMainAgentActivity(ctx); });
+		pi.on("turn_start", (_event, ctx) => { noteMainAgentActivity(ctx); });
+		pi.on("turn_end", (_event, ctx) => { noteMainAgentActivity(ctx); });
+		pi.on("tool_execution_start", (_event, ctx) => { noteMainAgentActivity(ctx); });
+		pi.on("tool_execution_update", (_event, ctx) => { noteMainAgentActivity(ctx); });
+		pi.on("tool_execution_end", (_event, ctx) => { noteMainAgentActivity(ctx); });
 		pi.on("tool_call", (event, ctx) => {
+			noteMainAgentActivity(ctx);
 			void controllerTelemetry?.heartbeat("active", [event.toolName]).catch(() => undefined);
 			if (!researchActive || activePiCwd !== ctx.cwd || orchestrationTools.has(event.toolName) || inspectionTools.has(event.toolName)) return;
 			return {

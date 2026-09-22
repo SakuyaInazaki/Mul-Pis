@@ -20,6 +20,8 @@ import { HarnessError, type StageRunRecord } from "../types.ts";
 import { failureSignature, RetryGuard, stageFingerprint, stageInputVersion, thrownSignature } from "./retry-guard.ts";
 import { Workspace } from "../workspace.ts";
 
+const TIMER_SUSPEND_GAP_MS = 5_000;
+
 export type ResearchStage = "M01" | "M02" | "M03" | "M04" | "M05" | "M06" | "M07" | "M08" | "M09";
 export type RunnableStage = Exclude<ResearchStage, "M07">;
 
@@ -143,6 +145,7 @@ class ProgressRunner implements SessionRunner {
 				let timeoutTimer: NodeJS.Timeout | undefined;
 				let stallTimer: NodeJS.Timeout | undefined;
 				let lastProgressAt = Date.now();
+				let lastStallCheckAt = Date.now();
 				let progressMarker = handle.transcript().length + handle.toolLog().length;
 				let watchdogFailed = false;
 				const watchdog = new Promise<never>((_resolve, reject) => {
@@ -153,25 +156,43 @@ class ProgressRunner implements SessionRunner {
 						reject(error);
 					};
 					if (this.promptTimeoutMs > 0) {
-						timeoutTimer = setTimeout(() => {
-							fail(new HarnessError("runner.stop", `session ${handle.ref.label} exceeded prompt timeout (${Math.round(this.promptTimeoutMs / 1000)}s)`));
-						}, this.promptTimeoutMs);
-						timeoutTimer.unref();
-					}
+  let timeoutDeadline = Date.now() + this.promptTimeoutMs;
+  const scheduleTimeout = (): void => {
+    timeoutTimer = setTimeout(() => {
+      const now = Date.now();
+      const lateBy = now - timeoutDeadline;
+      if (lateBy > TIMER_SUSPEND_GAP_MS) {
+        timeoutDeadline = now + this.promptTimeoutMs;
+        scheduleTimeout();
+        return;
+      }
+      fail(new HarnessError("runner.stop", `session ${handle.ref.label} exceeded prompt timeout (${Math.round(this.promptTimeoutMs / 1000)}s)`));
+    }, Math.max(0, timeoutDeadline - Date.now()));
+    timeoutTimer.unref();
+  };
+  scheduleTimeout();
+}
 					if (this.stallTimeoutMs > 0 && this.stallCheckMs > 0) {
-						stallTimer = setInterval(() => {
-							const current = handle.transcript().length + handle.toolLog().length;
-							if (current === progressMarker) {
-								if (Date.now() - lastProgressAt > this.stallTimeoutMs) {
-									fail(new HarnessError("runner.stop", `session ${handle.ref.label} made no progress for ${Math.round(this.stallTimeoutMs / 1000)}s`));
-								}
-								return;
-							}
-							progressMarker = current;
-							lastProgressAt = Date.now();
-						}, this.stallCheckMs);
-						stallTimer.unref();
-					}
+  stallTimer = setInterval(() => {
+    const now = Date.now();
+    const gap = now - lastStallCheckAt;
+    lastStallCheckAt = now;
+    if (gap > TIMER_SUSPEND_GAP_MS) {
+      lastProgressAt += gap;
+      return;
+    }
+    const current = handle.transcript().length + handle.toolLog().length;
+    if (current === progressMarker) {
+      if (now - lastProgressAt > this.stallTimeoutMs) {
+        fail(new HarnessError("runner.stop", `session ${handle.ref.label} made no progress for ${Math.round(this.stallTimeoutMs / 1000)}s`));
+      }
+      return;
+    }
+    progressMarker = current;
+    lastProgressAt = Date.now();
+  }, this.stallCheckMs);
+  stallTimer.unref();
+}
 				});
 				try {
 					const result = await Promise.race([handle.prompt(text), watchdog]);
@@ -190,6 +211,7 @@ class ProgressRunner implements SessionRunner {
 export class ResearchService {
 	private readonly options: ResearchServiceOptions;
 	private readonly activeStageOperations = new Map<string, { root: string; runs: Array<{ stage: string; runId: string }> }>();
+	private readonly activeGoalRuns = new Map<string, { root: string; runIds: Set<string> }>();
 
 	constructor(options: ResearchServiceOptions) {
 		this.options = options;
@@ -309,8 +331,12 @@ export class ResearchService {
 	}
 
 	/** Interrupt every exact run registered by this service instance, regardless of Pi cwd. */
-	async interruptAllActive(reason: string): Promise<void> {
+	async interruptAllActive(reason: string, includeActiveGoals = true): Promise<void> {
 		for (const active of [...this.activeStageOperations.values()]) await this.interruptOwned(active, reason);
+		if (includeActiveGoals === false) return;
+		const goals = [...this.activeGoalRuns.values()];
+		this.activeGoalRuns.clear();
+		for (const active of goals) await this.interruptOwnedGoals(active, reason);
 	}
 
 	private async interruptOwned(active: { root: string; runs: Array<{ stage: string; runId: string }> }, reason: string): Promise<void> {
@@ -325,6 +351,55 @@ export class ResearchService {
 		}
 	}
 
+    private async interruptOwnedGoals(active: { root: string; runIds: Set<string> }, reason: string): Promise<void> {
+        const ws = new Workspace(active.root);
+        const controller = createM07Controller(await this.nonModelContext(active.root));
+        let firstError: unknown;
+        for (const runId of active.runIds) {
+            try {
+                await controller.interrupt(runId, { reason, returnPath: "user" });
+                try {
+                    const archived = await ws.readRun("M07", runId);
+                    const failure = "运行中断（host-shutdown）：" + reason;
+                    if (archived.failures.includes(failure) === false) {
+                        archived.failures.push(failure);
+                        await ws.writeRun(archived);
+                    }
+                } catch {
+                    // The controlled archive already closed the run; this is traceability only.
+                }
+
+            } catch (error) {
+                firstError ??= error;
+                try {
+                    const run = await ws.readRun("M07", runId);
+                    if (run.status !== "running") continue;
+                    run.failures.push("运行中断（host-shutdown）：" + reason);
+                    run.remarks.push("M07 目标受控归档失败；仅将 run 标记为 failed，未自动重跑或假称完成。");
+                    await ws.finishRun(run, "failed");
+                    await ws.writeNote(run, "M07 目标受控归档失败；run 标记为 failed，未自动重跑。");
+                } catch {
+                    // Best-effort fallback only; keep the original archival error.
+                }
+            }
+        }
+        if (firstError) console.error("[research] M07 受控中断归档失败：" + (firstError instanceof Error ? firstError.message : String(firstError)));
+    }
+
+    private async rememberActiveGoal(root: string, runId: string): Promise<void> {
+        const key = await canonicalMutationKey(root);
+        const active = this.activeGoalRuns.get(key) ?? { root: path.resolve(root), runIds: new Set<string>() };
+        active.runIds.add(runId);
+        this.activeGoalRuns.set(key, active);
+    }
+
+    private async forgetActiveGoal(root: string, runId: string): Promise<void> {
+        const key = await canonicalMutationKey(root);
+        const active = this.activeGoalRuns.get(key);
+        if (active === undefined) return;
+        active.runIds.delete(runId);
+        if (active.runIds.size === 0) this.activeGoalRuns.delete(key);
+    }
 	async goalStatus(runId: string, requested?: string): Promise<unknown> {
 		const root = this.resolveWorkspace(requested);
 		const ws = new Workspace(root);
@@ -341,23 +416,38 @@ export class ResearchService {
 		return this.withMutation(root, async () => {
 			const ctx = await this.nonModelContext(root);
 			const controller = createM07Controller(ctx);
-			if (action === "begin") return controller.begin(input as BeginGoalInput);
-			if (action === "plan") { const value = input as { runId: string; plan: string; refreshBaseline?: boolean }; return controller.plan(value.runId, value.plan, { refreshBaseline: value.refreshBaseline }); }
-			if (action === "decision") { const { runId, ...value } = input as { runId: string } & DecisionInput; return controller.decision(runId, value); }
-			if (action === "interrupt") { const { runId, ...value } = input as { runId: string } & InterruptInput; return controller.interrupt(runId, value); }
+			if (action === "begin") {
+				const value = await controller.begin(input as BeginGoalInput);
+				const runId = (value as { runId?: unknown } | undefined)?.runId;
+				if (typeof runId === "string" && runId) await this.rememberActiveGoal(root, runId);
+				return value;
+			}
+			if (action === "plan") { const value = input as { runId: string; plan: string; refreshBaseline?: boolean }; const result = await controller.plan(value.runId, value.plan, { refreshBaseline: value.refreshBaseline }); await this.rememberActiveGoal(root, value.runId); return result; }
+			if (action === "decision") { const { runId, ...value } = input as { runId: string } & DecisionInput; const result = await controller.decision(runId, value); await this.rememberActiveGoal(root, runId); return result; }
+			if (action === "interrupt") { const { runId, ...value } = input as { runId: string } & InterruptInput; const result = await controller.interrupt(runId, value); await this.forgetActiveGoal(root, runId); return result; }
 			const { runId, ...value } = input as { runId: string } & FinishInput;
-			return controller.finish(runId, value);
+			const result = await controller.finish(runId, value);
+			await this.forgetActiveGoal(root, runId);
+			return result;
 		});
 	}
 
 	async delegate(runId: string, task: TaskSpecInput, requested?: string, signal?: AbortSignal): Promise<unknown> {
 		const root = this.resolveWorkspace(requested);
-		return this.withMutation(root, async () => createM07Controller(await this.stageContext(root, "M07", signal)).delegate(runId, task));
+		return this.withMutation(root, async () => {
+			const value = await createM07Controller(await this.stageContext(root, "M07", signal)).delegate(runId, task);
+			await this.rememberActiveGoal(root, runId);
+			return value;
+		});
 	}
 
 	async review(runId: string, review: TaskReviewInput, requested?: string, signal?: AbortSignal): Promise<unknown> {
 		const root = this.resolveWorkspace(requested);
-		return this.withMutation(root, async () => createM07Controller(await this.nonModelContext(root)).review(runId, review));
+		return this.withMutation(root, async () => {
+			const value = await createM07Controller(await this.nonModelContext(root)).review(runId, review);
+			await this.rememberActiveGoal(root, runId);
+			return value;
+		});
 	}
 
 	private async nonModelContext(root: string): Promise<StageContext> {

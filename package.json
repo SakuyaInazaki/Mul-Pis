@@ -9,7 +9,8 @@
     "harness": "node src/cli.ts",
     "dashboard": "node src/dashboard/cli.ts",
     "deepseek:smoke": "node scripts/manual-deepseek-smoke.ts",
-    "deepseek:local": "node scripts/run-deepseek-local.ts"
+    "deepseek:local": "node scripts/run-deepseek-local.ts",
+    "workflow:control": "node scripts/workflow-control.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "0.85.1",
