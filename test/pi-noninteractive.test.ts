@@ -42,3 +42,18 @@ test("non-interactive system prompt forbids stop-and-ask user options", async ()
   const jsonPrompt = await before[0]({ systemPrompt: "base" }, context("json"));
   assert.match(JSON.stringify(jsonPrompt ?? {}), /非交互单次模式/);
 });
+
+test("non-interactive finish requires an explicit hard stop reason", async () => {
+  const calls: unknown[][] = [];
+  const service = { goalAction: async (...args: unknown[]) => { calls.push(args); return {}; } };
+  const registered = capture(service);
+  const goal = registered.tools.get("research_goal");
+  if (goal === undefined) throw new Error("missing research_goal");
+  const finish = { action: "finish", runId: "r1", outcome: "partial", summary: "s", returnPath: "user", goalChecks: [] };
+  await assert.rejects(goal.execute("f", finish, undefined, undefined, context("json")), /硬停止|stopReason|非交互/);
+  assert.equal(calls.length, 0);
+  await goal.execute("f", { ...finish, stopReason: "resource_exhausted" }, undefined, undefined, context("json"));
+  assert.equal(calls.length, 1);
+  await goal.execute("f", finish, undefined, undefined, context("tui"));
+  assert.equal(calls.length, 2);
+});
