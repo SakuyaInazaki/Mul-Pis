@@ -52,6 +52,6 @@
 
 - Follow `docs/github-push-policy.md` before every commit and push.
 - Never commit or push `.agent/notes/` records, `.agent/telemetry/`, `.agent/private/`, `workspaces/`, logs, credentials, tokens, platform identities, local absolute paths, or private identity data.
+- Never commit or push test problems, test-task materials, platform submission details, submission IDs, scores, rankings, platform guides, test ledgers, or test-specific artifacts. These are test content, not workflow code.
 - Keep commit messages meaningful and public-safe. Do not truncate them to conventional prefixes such as `docs:`, `feat:`, or `chore:`.
-- Do not add AI or tool co-author trailers unless the user explicitly requests them.
 - Run typecheck and tests before push. History rewrite and force push require explicit user authorization and an external bundle backup.

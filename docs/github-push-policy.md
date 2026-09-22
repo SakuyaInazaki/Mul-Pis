@@ -24,6 +24,7 @@
 - `.venv/`
 - 运行日志、临时文件、缓存和本机产物
 - 任何凭据、token、session、平台身份、邮箱、本机绝对路径、聊天记录或私人身份材料
+- 任何具体测试题、测试任务、平台提交相关内容：题面、候选代码、评测数据、submissionId、displayScore、排名、平台指南、提交台账、测试日志或测试专用产物。测试内容与工作流本身无关，不得进入公开仓库。
 
 ## Commit message 规范
 
@@ -35,7 +36,6 @@
   - platform submission ID、进程 PID、机器名
   - notes、telemetry、私有仓库、聊天记录等内部记录引用
   - token、apiKey、sessionToken、Bearer、turnstile、密钥片段
-- 不得添加 AI 或工具的 co-author trailer，除非用户明确要求。
 - 原提交说明包含敏感内容时，应改写为可公开的等价摘要，而不是只删除冒号后的内容。
 
 ## 推送前检查
