@@ -4,14 +4,13 @@ import path from "node:path";
 import { loadPrompt, section, systemPromptFor } from "../prompts.ts";
 import { HarnessError } from "../types.ts";
 import { nowIso, writeFileAtomic } from "../workspace.ts";
+import { mediaType } from "../media.ts";
 import { recordSession, sessionSpec, type StageContext } from "../stages/context.ts";
 import { resolveExpectedOutputFiles } from "./expected-output.ts";
 import type { BeginGoalInput, CurrentGoal, DecisionInput, EvidenceFile, FinishInput, InterruptInput, M07Controller, M07TaskRecord, TaskCheck, TaskReviewInput, TaskSpecInput } from "./types.ts";
 import type { StageRunRecord } from "../types.ts";
 
 const STATE = "goal.json";
-const TEXT_EXTENSIONS = new Set([".txt", ".md", ".markdown", ".json", ".jsonl", ".csv", ".tsv", ".yaml", ".yml", ".toml", ".xml", ".html", ".htm", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".rs", ".go", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".sh", ".zsh", ".fish", ".sql", ".tex"]);
-
 function nonempty(value: string, label: string): string {
 	if (!value?.trim()) throw new HarnessError("m07.input", `${label} 不能为空`);
 	return value.trim();
@@ -43,10 +42,6 @@ function inside(root: string, candidate: string): boolean {
 
 function statePath(ctx: StageContext, runId: string): string {
 	return path.join(ctx.ws.runDir("M07", runId), STATE);
-}
-
-function mediaType(file: string): "text" | "binary" {
-	return TEXT_EXTENSIONS.has(path.extname(file).toLowerCase()) ? "text" : "binary";
 }
 
 function taskId(goal: CurrentGoal): string {

@@ -4,7 +4,7 @@
  * <root>/
  *   research.config.json          roles -> models (user-owned)
  *   problem/problem.md            原始问题
- *   problem/raw/*.md|*.txt        必要原始信息（文本）
+ *   problem/raw/*               必要原始信息（按共享文本分类读取）
  *   references/                   资料工作区（P00R 布局）
  *   stages/<Mxx>/<runId>/         每次阶段运行的输入清单、产物与 run.json
  *   .agent/knowledge/             权威知识库（见 src/knowledge/）
@@ -16,6 +16,7 @@ import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { CONFIG_FILE, loadConfig } from "./config.ts";
+import { isTextFile } from "./media.ts";
 import { HarnessError, type HarnessConfig, type InputRef, type OutputRef, type StageRunRecord } from "./types.ts";
 
 export interface RawInfo {
@@ -105,7 +106,7 @@ export class Workspace {
 			const filePath = path.join(this.rawDir, name);
 			const info = await stat(filePath);
 			if (!info.isFile()) continue;
-			if (/\.(md|txt|markdown)$/i.test(name)) {
+			if (isTextFile(name)) {
 				items.push({ name, path: filePath, content: await readFile(filePath, "utf8") });
 			} else {
 				skipped.push(name);
