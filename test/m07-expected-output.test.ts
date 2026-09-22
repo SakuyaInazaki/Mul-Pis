@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { resolveExpectedOutputFiles } from "../src/m07/expected-output.ts";
+import { isSafeRelativeOutputPath, resolveExpectedOutputFiles } from "../src/m07/expected-output.ts";
 
 test("expected output resolution expands directories and reports missing files", async (t) => {
 const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-expected-"));
@@ -16,4 +16,13 @@ assert.equal(resolved.length, 3);
 assert.ok(resolved[0].files.some((file) => file.endsWith("result.txt")));
 assert.ok(resolved[1].files.some((file) => file.endsWith("evidence.txt")));
 assert.match(resolved[2].error ?? "", /missing\.txt/);
+});
+
+test("expected output path guard accepts relative paths and rejects escapes or whitespace", () => {
+  assert.equal(isSafeRelativeOutputPath("result.txt"), true);
+  assert.equal(isSafeRelativeOutputPath("raw/evidence(1).txt"), true);
+  assert.equal(isSafeRelativeOutputPath("raw/dir/"), true);
+  assert.equal(isSafeRelativeOutputPath("../escape.txt"), false);
+  assert.equal(isSafeRelativeOutputPath(" raw/evidence.txt"), false);
+  assert.equal(isSafeRelativeOutputPath("raw/evidence.txt\n"), false);
 });

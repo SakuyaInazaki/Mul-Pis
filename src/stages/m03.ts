@@ -74,7 +74,8 @@ export async function runM03(ctx: StageContext, options: M03Options = {}): Promi
 					const member = members[index];
 					try {
 						const message = buildM03AnswerMessage(index === 0 ? m02Output.text : undefined, member.questions!);
-						if (rationaleLeaks(member.rationale!, message)) throw new HarnessError("m03.leak", `评审 ${member.id} 的作答消息包含出题依据，已中止转发`);
+						const allowedForwarded = [member.questions!, ...(index === 0 ? [m02Output.text] : [])];
+						if (rationaleLeaks(member.rationale!, message, allowedForwarded)) throw new HarnessError("m03.leak", `评审 ${member.id} 的作答消息包含出题依据，已中止转发`);
 						await ctx.ws.writeOutput(record, `reviewer-${member.id}-answer-message.md`, message, `发送给 M01 原会话的 ${member.id} 作答消息`);
 						const answer = (await execution.prompt(message)).text; member.answer = answer; member.status = "answered";
 						await ctx.ws.writeOutput(record, `reviewer-${member.id}-answer.md`, answer, `执行会话对评审 ${member.id} 的完整回答`);

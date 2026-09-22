@@ -225,3 +225,13 @@ test("Pi DefaultResourceLoader loads the actual extensions/research.ts entrypoin
 	assert.equal(loaded.extensions.length, 1);
 	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_init", "research_review", "research_stage", "research_status"]);
 });
+
+test("research_delegate accepts exact expected output path strings", async () => {
+  let received: any;
+  const service = { delegate: async (...args: any[]) => { received = args[1]; return {}; } } as unknown as ResearchService;
+  const registered = captureExtension(service);
+  const tool = registered.tools.get("research_delegate");
+  if (tool === undefined) throw new Error("missing research_delegate");
+	await tool.execute("d", { runId: "r1", objective: "o", inputs: [], expectedOutputs: ["result.txt"], checks: ["c"], mode: "execute" }, undefined, undefined, toolContext("/workspace"));
+  assert.deepEqual(received.expectedOutputs, ["result.txt"]);
+});

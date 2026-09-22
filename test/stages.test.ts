@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
-import { loadPrompt, rationaleLeaks, ROLE_SYSTEM_PROMPTS, splitM03Questions } from "../src/prompts.ts";
+import { buildM03AnswerMessage, loadPrompt, rationaleLeaks, ROLE_SYSTEM_PROMPTS, splitM03Questions } from "../src/prompts.ts";
 import { FakeSessionRunner, type FakeReply, type FakeReplyContext } from "../src/runner/fake.ts";
 import type { StageContext } from "../src/stages/context.ts";
 import { runInit } from "../src/stages/init.ts";
@@ -171,6 +171,16 @@ describe("stages with the scripted runner", () => {
 		assert.ok(!rationaleLeaks("# 出题说明与判断依据\n短句", "短句 出现在问题里"));
 	});
 
+	it("rationaleLeaks ignores overlap in explicitly forwarded questions and M02 but still detects rationale in the skeleton", () => {
+		const shared = "这是一段足够长、会同时出现在问题或候选判据中的评审表述。";
+		const questions = `问题：请核对以下表述是否成立：${shared}`;
+		const m02 = `候选判据引用：${shared}`;
+		const message = buildM03AnswerMessage(m02, questions);
+		assert.equal(rationaleLeaks(shared, message, [questions, m02]), false, "question substring and M02 quote are allowed inputs");
+		assert.equal(rationaleLeaks(shared, `${shared}\n${message}`, [questions, m02]), true, "an extra rationale copy in the message skeleton remains blocked");
+		assert.equal(rationaleLeaks("左侧骨架文字与右侧骨架文字不应在移除后被拼接成同一行", `左侧骨架文字${questions}右侧骨架文字`, [questions]), false, "removing an allowed block preserves line boundaries");
+	});
+
 	it("splitM03Questions rejects output without both headers", () => {
 		assert.throws(() => splitM03Questions("# 可转发问题\n\n问1"), (e: unknown) => e instanceof HarnessError && e.code === "m03.format");
 	});
@@ -258,6 +268,28 @@ describe("stages with the scripted runner", () => {
 		const m04State = [...poolRunner.sessions.values()].find((state) => state.spec.label === "M04-research")!;
 		assert.match(m04State.transcript[0].text, /评价-R1/); assert.match(m04State.transcript[0].text, /评价-R2/); assert.match(m04State.transcript[0].text, /评价-R3/);
 		assert.equal(m04.record.status, "completed");
+	});
+
+	it("M03 completes when R2 rationale repeats a long question substring without forwarding rationale-only text", async () => {
+		const rationaleOnly = "这是只属于出题依据且绝对不能进入执行会话的独有长句。";
+		const shared = "这段足够长的共同表述会同时出现在问题与出题依据中。";
+		const overlapRunner = new FakeSessionRunner(({ spec, turnIndex, message }) => {
+			if (spec.label.startsWith("M03-reviewer-")) {
+				const id = spec.label.slice("M03-reviewer-".length);
+				if (turnIndex === 1) return { text: `# 可转发问题\n\n问题-${id}：请核对 ${id === "R2" ? shared : "本组条件"}\n\n# 出题说明与判断依据\n\n${id === "R2" ? `${shared}\n${rationaleOnly}` : `依据-${id}`}` };
+				return { text: `评价-${id}` };
+			}
+			if (spec.label === "M01") {
+				assert.equal(message.includes(rationaleOnly), false);
+				return { text: "执行会话回答" };
+			}
+			throw new Error(`unexpected ${spec.label}`);
+		});
+		const result = await runM03({ ...ctx, runner: overlapRunner, config: { ...ctx.config, m03Reviewers: [
+			{ id: "R1", model: "fake/shared" }, { id: "R2", model: "fake/shared" }, { id: "R3", model: "fake/shared" },
+		] } });
+		assert.equal(result.record.status, "completed");
+		assert.ok(result.members.every((member) => member.status === "completed"));
 	});
 
 	it("M03 fails the whole batch and records the member when one reviewer fails", async () => {

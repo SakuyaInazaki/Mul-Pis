@@ -13,6 +13,14 @@ function inside(root: string, candidate: string): boolean {
 	return candidate.startsWith(root + path.sep);
 }
 
+export function isSafeRelativeOutputPath(value: string): boolean {
+	if (value.length === 0) return false;
+	if (value.trim() !== value) return false;
+	if (value.includes("\n") || value.includes("\r")) return false;
+	if (path.isAbsolute(value)) return false;
+	return value.split("/").includes("..") === false;
+}
+
 export async function resolveExpectedOutputFiles(workDir: string, expectedPaths: string[]): Promise<ExpectedOutputResolution[]> {
 	const workReal = await realpath(workDir);
 	const result: ExpectedOutputResolution[] = [];

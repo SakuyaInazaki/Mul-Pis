@@ -6,7 +6,7 @@ import { HarnessError } from "../types.ts";
 import { nowIso, writeFileAtomic } from "../workspace.ts";
 import { mediaType } from "../media.ts";
 import { recordSession, sessionSpec, type StageContext } from "../stages/context.ts";
-import { resolveExpectedOutputFiles } from "./expected-output.ts";
+import { isSafeRelativeOutputPath, resolveExpectedOutputFiles } from "./expected-output.ts";
 import type { BeginGoalInput, CurrentGoal, DecisionInput, EvidenceFile, FinishInput, InterruptInput, M07Controller, M07TaskRecord, TaskCheck, TaskReviewInput, TaskSpecInput } from "./types.ts";
 import type { StageRunRecord } from "../types.ts";
 
@@ -132,6 +132,7 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, task: TaskSpecI
 	if (knowledgePack) boundary.push(section("本任务局部知识包", knowledgePack));
 	if (task.mode === "execute") boundary.push(section("外部执行与可消耗资源", "如任务涉及真实提交、评测、远程实验或其他可能消耗配额/费用/机会的动作：先用已提供的只读能力或额度接口核对接入和当前状态，并先做本地可完成的语法、类型、编译与兼容性预检。这不禁止任务已授权的真实实验，已授权平台评测/实验产生的结果属于本任务实测证据。每次真实动作都要记录实际结果和资源消耗；失败若仍消耗了资源，同样记录已消耗量、可见剩余量与恢复条件。平台配额不明时如实记录未知，不猜测统一配额。本地命令或客户端成功退出不等于远程实验通过。显式输入和原问题允许使用；若需取得新的外部研究参考资料并用于推理，将具体缺口报回主会话走 M05/M06→M04，不在 execute 任务里通过 bash 另造获取和采用链。"));
 	boundary.push("会话返回只表示任务已返回，不表示成果被主 Agent 接受。请如实列出实际动作、产物、失败、未执行项和限制。");
+	boundary.push("产物路径规则：expectedOutputs 必须是当前任务工作目录内的精确相对路径；说明写在 objective 或 report.md。所有实际写盘必须落在当前工作目录内，不要写到工作区根目录或绝对路径。");
 	return boundary.join("\n\n");
 }
 
@@ -206,6 +207,9 @@ export function createM07Controller(ctx: StageContext): M07Controller {
 			const goal = await load(ctx, runId); requireActive(goal); nonempty(spec.objective, "task objective");
 			await requireCurrentFormalBaseline(ctx, goal);
 			spec = { ...spec, objective: spec.objective.trim(), inputs: normalizedUnique(spec.inputs, "task input"), expectedOutputs: normalizedUnique(spec.expectedOutputs, "expected output"), checks: normalizedUnique(spec.checks, "task check") };
+			for (const expectedOutput of spec.expectedOutputs) {
+				if (isSafeRelativeOutputPath(expectedOutput) === false) throw new HarnessError("m07.path", `expectedOutputs 必须是 work 目录内精确相对路径，不得为绝对路径、不得包含 ..、不得有多余首尾空白或换行；说明写在 objective 或任务报告：${expectedOutput}`);
+			}
 			if (!spec.checks.length) throw new HarnessError("m07.task", "每个任务必须定义至少一项实际检查；推导可用会话报告作为证据");
 			if (spec.mode === "check") {
 				if (spec.expectedOutputs.length > 0) throw new HarnessError("m07.task", "check 模式只读且不写盘，不能声明 expectedOutputs；需要产出文件时请使用 execute 模式");

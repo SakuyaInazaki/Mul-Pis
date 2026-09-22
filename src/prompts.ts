@@ -231,16 +231,25 @@ export function splitM03Questions(text: string): { questions: string; rationale:
 
 /**
  * True when any substantive line of the reviewer's rationale (≥ 20 characters after trimming)
- * appears verbatim in a message that is about to be sent to the answering session.
+ * appears verbatim in the message skeleton that is about to be sent to the answering session.
+ * Explicitly allowed source blocks are removed once, from their last exact occurrence, before
+ * checking. Callers pass the most deeply nested/latest block first (questions before M02), so
+ * repeated text inside an allowed block cannot cause the wrong occurrence to be removed.
  * Very short fragments are ignored so that a one-word rationale cannot block forwarding
  * merely because the same word occurs in a question.
  */
-export function rationaleLeaks(rationale: string, message: string): boolean {
+export function rationaleLeaks(rationale: string, message: string, allowedForwarded: string[] = []): boolean {
+	let skeleton = message;
+	for (const block of allowedForwarded) {
+		if (!block) continue;
+		const index = skeleton.lastIndexOf(block);
+		if (index >= 0) skeleton = `${skeleton.slice(0, index)}\n[allowed-forwarded-block-removed]\n${skeleton.slice(index + block.length)}`;
+	}
 	const lines = rationale
 		.split(/\r?\n/)
 		.map((line) => line.trim())
 		.filter((line) => line.length >= 20 && !/^#{1,3}\s/.test(line));
-	return lines.some((line) => message.includes(line));
+	return lines.some((line) => skeleton.includes(line));
 }
 
 export function extractKnowledgeProposals(text: string): { ops: unknown[] | undefined; error?: string } {
