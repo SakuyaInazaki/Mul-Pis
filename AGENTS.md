@@ -47,3 +47,11 @@
 - For the current preparation pass, initialize a repository, create a remote, commit, and push only after the user accepts the organized result. In later work, follow the authorization scope of the active request.
 - Do not choose a project license on the user's behalf.
 - Before release, simulate the public file list and confirm local-only material and nested `.git` directories are excluded.
+
+## GitHub push policy
+
+- Follow `docs/github-push-policy.md` before every commit and push.
+- Never commit or push `.agent/notes/` records, `.agent/telemetry/`, `.agent/private/`, `workspaces/`, logs, credentials, tokens, platform identities, local absolute paths, or private identity data.
+- Keep commit messages meaningful and public-safe. Do not truncate them to conventional prefixes such as `docs:`, `feat:`, or `chore:`.
+- Do not add AI or tool co-author trailers unless the user explicitly requests them.
+- Run typecheck and tests before push. History rewrite and force push require explicit user authorization and an external bundle backup.
