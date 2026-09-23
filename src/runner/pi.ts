@@ -1,4 +1,5 @@
-import { lstat, mkdir, mkdtemp, readFile, readdir, realpath } from "node:fs/promises";
+import { appendFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath } from "node:fs/promises";
+import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
 import {
 	createAgentSession,
@@ -20,7 +21,9 @@ import { parseModelSpec } from "../config.ts";
 import { HarnessError } from "../types.ts";
 import { writeFileAtomic } from "../workspace.ts";
 import { TelemetryWriter } from "../dashboard/telemetry.ts";
-import type { AssistantTurn, CustomToolSpec, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, TranscriptMessage } from "./types.ts";
+import type { AssistantTurn, CustomToolSpec, ReadReturnEvent, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, TranscriptMessage, UsageEvent } from "./types.ts";
+import { summarizeUsage, usageEventsFromEntries } from "./usage.ts";
+import { sampleRunnerResources, sessionClosed, sessionOpened } from "./resource.ts";
 
 const SCRATCH_PREFIX = ".pi-session-";
 const EMPTY_AGENT_DIR = ".empty-agent-dir";
@@ -45,6 +48,7 @@ interface MaterialTools {
 	tools: ToolDefinition<any, any>[];
 	names: string[];
 	readCoverage: Set<string>;
+	readReturns: ReadReturnEvent[];
 }
 
 function isInside(root: string, candidate: string): boolean {
@@ -91,6 +95,8 @@ async function createMaterialTools(root: string, requestedReadName?: string): Pr
 		throw new HarnessError("runner.tools", `${readName} cannot be used as the read tool name because it is reserved`);
 	}
 	const readCoverage = new Set<string>();
+	const readReturns: ReadReturnEvent[] = [];
+	const readCapture = new AsyncLocalStorage<{ path?: string }>();
 	const baseRead = createReadToolDefinition(rootReal, {
 		operations: {
 			access: async (requested) => {
@@ -103,7 +109,8 @@ async function createMaterialTools(root: string, requestedReadName?: string): Pr
 				const resolved = await resolveConfinedPath(rootReal, requested);
 				rejectPdf(resolved);
 				const contents = await readFile(resolved);
-				readCoverage.add(path.relative(rootReal, resolved));
+				const captured = readCapture.getStore();
+				if (captured) captured.path = path.relative(rootReal, resolved);
 				return contents;
 			},
 			detectImageMimeType: async (requested) => {
@@ -118,14 +125,40 @@ async function createMaterialTools(root: string, requestedReadName?: string): Pr
 		label: readName,
 		// Pi normally prefers ctx.cwd over the tool factory cwd. Rebase the
 		// context so relative material paths do not resolve in the empty scratch cwd.
-		execute: (toolCallId, params, signal, onUpdate, ctx) =>
-			baseRead.execute(
-				toolCallId,
-				params,
-				signal,
-				onUpdate,
-				{ ...ctx, cwd: rootReal },
-			),
+		execute: async (toolCallId, params, signal, onUpdate, ctx) => {
+			const captured: { path?: string } = {};
+			const requested = params as { path: string; offset?: number; limit?: number };
+			const requestFields = { ...(requested.offset !== undefined ? { offset: requested.offset } : {}), ...(requested.limit !== undefined ? { limit: requested.limit } : {}) };
+			try {
+				const result = await readCapture.run(captured, () => baseRead.execute(
+					toolCallId, params, signal, onUpdate, { ...ctx, cwd: rootReal },
+				));
+				const binary = result.content.some((block) => block.type === "image") || (captured.path !== undefined && imageMimeType(captured.path) !== undefined);
+				const truncation = (result.details as { truncation?: { outputLines?: number; truncated?: boolean; firstLineExceedsLimit?: boolean } } | undefined)?.truncation;
+				const startLine = requested.offset ? Math.max(1, requested.offset) : 1;
+				const output = result.content.find((block): block is { type: "text"; text: string } => block.type === "text" && typeof block.text === "string")?.text ?? "";
+				const limitedNote = requested.limit !== undefined && /\n\n\[\d+ more lines in file\. Use offset=\d+ to continue\.\]$/.test(output);
+				const body = limitedNote ? output.replace(/\n\n\[\d+ more lines in file\. Use offset=\d+ to continue\.\]$/, "") : output;
+				const returnedLines = truncation?.outputLines ?? (body ? body.split("\n").length - (body.endsWith("\n") ? 1 : 0) : 0);
+				const hasRange = !binary && !truncation?.firstLineExceedsLimit && returnedLines > 0;
+				readReturns.push({
+					toolName: readName,
+					status: hasRange || (binary && result.content.some((block) => block.type === "image")) ? "returned" : "no-content",
+					path: captured.path ?? "<unresolved>", requested: requestFields,
+					returned: {
+						kind: binary ? "binary" : captured.path === undefined ? "unknown" : "text",
+						...(hasRange ? { startLine, endLine: startLine + returnedLines - 1 } : {}),
+						truncated: Boolean(truncation?.truncated || limitedNote),
+					},
+					at: new Date().toISOString(),
+				});
+				if (captured.path) readCoverage.add(captured.path);
+				return result;
+			} catch (error) {
+				readReturns.push({ toolName: readName, status: "error", path: captured.path ?? "<unresolved>", requested: requestFields, returned: { kind: "unknown" }, at: new Date().toISOString() });
+				throw error;
+			}
+		},
 	};
 	const materialList: ToolDefinition<any, any> = {
 		name: LIST_TOOL_NAME,
@@ -150,7 +183,7 @@ async function createMaterialTools(root: string, requestedReadName?: string): Pr
 			};
 		},
 	};
-	return { tools: [materialRead, materialList], names: [readName, LIST_TOOL_NAME], readCoverage };
+	return { tools: [materialRead, materialList], names: [readName, LIST_TOOL_NAME], readCoverage, readReturns };
 }
 
 function customToolsToPi(tools: CustomToolSpec[], log: ToolCallRecord[]): ToolDefinition<any, any>[] {
@@ -231,7 +264,7 @@ async function createExecutionTools(
 			},
 		} as ToolDefinition<any, any>;
 	});
-	return { cwd, tools, names, readCoverage };
+	return { cwd, tools, names, readCoverage, readReturns: [] };
 }
 
 function visibleText(content: unknown): string {
@@ -256,14 +289,13 @@ function transcriptOf(messages: readonly unknown[]): TranscriptMessage[] {
 	return transcript;
 }
 
-function turnResult(messages: readonly unknown[], label: string): AssistantTurn {
+function turnResult(messages: readonly unknown[], label: string, usage: AssistantTurn["usage"]): AssistantTurn {
 	const assistants = messages.filter(
 		(message): message is {
 			role: "assistant";
 			content?: unknown;
 			stopReason?: string;
 			errorMessage?: string;
-			usage?: { input?: number; output?: number; cost?: number | { total?: number } };
 		} => (message as { role?: unknown }).role === "assistant",
 	);
 	const last = assistants.at(-1);
@@ -280,15 +312,11 @@ function turnResult(messages: readonly unknown[], label: string): AssistantTurn 
 		if (!Array.isArray(assistant.content)) continue;
 		toolCalls += assistant.content.filter((block) => (block as { type?: unknown }).type === "toolCall").length;
 	}
-	const rawCost = last.usage?.cost;
-	const cost = typeof rawCost === "number" ? rawCost : rawCost?.total;
 	return {
 		text: visibleText(last.content),
 		stopReason: last.stopReason,
 		toolCalls,
-		...(last.usage
-			? { usage: { input: last.usage.input, output: last.usage.output, cost } }
-			: {}),
+		...(usage ? { usage } : {}),
 	};
 }
 
@@ -338,6 +366,9 @@ export class PiSessionRunner implements SessionRunner {
 			throw new HarnessError("runner.persistence", `cannot read session spec ${ref.specFile}: ${(error as Error).message}`);
 		}
 		const spec = parsePersistedSpec(specText, ref.specFile);
+		if (ref.methodBinding && JSON.stringify(ref.methodBinding) !== JSON.stringify(spec.methodBinding)) {
+			throw new HarnessError("runner.persistence", `session ${ref.label} method binding differs from its persisted spec`);
+		}
 		if (spec.tools.kind === "custom" || spec.tools.kind === "execution" || (spec.tools.kind === "read-dir" && spec.tools.extraTools?.length)) {
 			throw new HarnessError("runner.persistence", `session ${ref.label} used non-resumable tools and cannot be resumed`);
 		}
@@ -406,7 +437,8 @@ export class PiSessionRunner implements SessionRunner {
 		await loader.reload();
 
 		const resolved = await this.resolveModel(spec);
-		let materialTools: MaterialTools = { tools: [], names: [], readCoverage: new Set() };
+		const priced = resolved.model.cost.input > 0 && resolved.model.cost.output > 0;
+		let materialTools: MaterialTools = { tools: [], names: [], readCoverage: new Set(), readReturns: [] };
 		const toolLog: ToolCallRecord[] = [];
 		let sessionCwd = cwd;
 		if (spec.tools.kind === "read-dir") {
@@ -417,7 +449,7 @@ export class PiSessionRunner implements SessionRunner {
 			}
 		} else if (spec.tools.kind === "custom") {
 			const definitions = customToolsToPi(spec.tools.tools, toolLog);
-			materialTools = { tools: definitions, names: definitions.map((d) => d.name), readCoverage: new Set() };
+			materialTools = { tools: definitions, names: definitions.map((d) => d.name), readCoverage: new Set(), readReturns: [] };
 		} else if (spec.tools.kind === "execution") {
 			const execution = await createExecutionTools(spec.tools.root, spec.tools.tools, toolLog);
 			materialTools = execution;
@@ -439,10 +471,11 @@ export class PiSessionRunner implements SessionRunner {
 			settingsManager,
 		});
 		const session: SessionLike = created.session;
+		let telemetry: TelemetryWriter | undefined;
+		try {
 		const active = [...session.getActiveToolNames()].sort();
 		const expected = [...materialTools.names].sort();
 		if (active.length !== expected.length || active.some((name, index) => name !== expected[index])) {
-			session.dispose();
 			throw new HarnessError(
 				"runner.tools",
 				`unsafe active tool set for ${spec.label}: ${active.join(",") || "(empty)"}; expected ${expected.join(",") || "(empty)"}`,
@@ -450,7 +483,6 @@ export class PiSessionRunner implements SessionRunner {
 		}
 		const sessionFile = session.sessionFile;
 		if (!sessionFile) {
-			session.dispose();
 			throw new HarnessError("runner.persistence", `Pi did not allocate a session file for ${spec.label}`);
 		}
 		const specFile = specFileFor(sessionFile);
@@ -462,30 +494,67 @@ export class PiSessionRunner implements SessionRunner {
 			model: spec.model,
 			file: sessionFile,
 			specFile,
+			...(spec.methodBinding ? { methodBinding: spec.methodBinding } : {}),
 		};
+		const usageFile = sessionFile.replace(/\.jsonl$/, ".usage.jsonl");
+		let promptIndex = await readFile(usageFile, "utf8")
+			.then((content) => content.split(/\r?\n/).filter(Boolean).length)
+			.catch((error: NodeJS.ErrnoException) => {
+				if (error.code === "ENOENT") return 0;
+				throw error;
+			});
 		const workspace = path.basename(spec.persistDir) === "sessions" && path.basename(path.dirname(spec.persistDir)) === ".agent"
 			? path.dirname(path.dirname(spec.persistDir)) : undefined;
-		let telemetry: TelemetryWriter | undefined;
 		if (workspace) {
+			let started: TelemetryWriter | undefined;
 			try {
-				telemetry = await TelemetryWriter.start(workspace, { id: ref.id, kind: "agent", label: ref.label, role: ref.role, model: ref.model, tools: expected });
-				await telemetry.heartbeat("idle");
-			} catch { telemetry = undefined; }
+				started = await TelemetryWriter.start(workspace, { id: ref.id, kind: "agent", label: ref.label, role: ref.role, model: ref.model, tools: expected });
+				await started.heartbeat("idle");
+				telemetry = started;
+			} catch { await started?.end().catch(() => undefined); }
 		}
 		const signal = this.options.signal;
 		let disposed = false;
+		let abortedByHandle = false;
+		let promptActive = false;
+		let telemetryQueue = Promise.resolve();
+		const queueTelemetry = (operation: () => Promise<void>): Promise<void> => {
+			telemetryQueue = telemetryQueue.then(operation).catch(() => undefined);
+			return telemetryQueue;
+		};
+		const usageEvents: UsageEvent[] = [];
+		const accounted = new Set(sessionManager.getEntries().map((entry) => entry.id));
 		let abortListener: (() => void) | undefined;
 		let abortPromise: Promise<void> | undefined;
 		let abortError: unknown;
+		sessionOpened();
+		void sampleRunnerResources(spec.persistDir, "create");
 		return {
 			ref,
-			setRunContext: ({ stage, runId }) => { void telemetry?.setRunContext(stage, runId).catch(() => undefined); },
+			setRunContext: ({ stage, runId }) => { void queueTelemetry(async () => { if (!disposed) await telemetry?.setRunContext(stage, runId); }); },
 			prompt: async (text): Promise<AssistantTurn> => {
+				if (disposed) throw new HarnessError("runner.stop", `session ${spec.label} has been disposed`);
+				if (abortedByHandle) throw new HarnessError("runner.stop", `session ${spec.label} was aborted before prompt`);
+				if (promptActive) throw new HarnessError("runner.stop", `session ${spec.label} already has an active prompt`);
 				if (signal?.aborted) throw new HarnessError("runner.stop", `session ${spec.label} was aborted before prompt`);
+				promptActive = true;
 				// Do not await telemetry before installing the abort listener: prompt()
 				// must remain synchronously abortable from the caller's next statement.
-				void telemetry?.heartbeat("active").catch(() => undefined);
-				const before = session.messages.length;
+				void queueTelemetry(async () => { if (!disposed) await telemetry?.heartbeat("active"); });
+				promptIndex++;
+				const thisPrompt = promptIndex;
+				const promptEvents: UsageEvent[] = [];
+				const promptMessages: unknown[] = [];
+				const collectUsage = (): void => {
+					const fresh = sessionManager.getEntries().filter((entry) => !accounted.has(entry.id));
+					for (const entry of fresh) {
+						accounted.add(entry.id);
+						if (entry.type === "message") promptMessages.push(entry.message);
+					}
+					const events = usageEventsFromEntries(fresh, thisPrompt, priced);
+					promptEvents.push(...events);
+					usageEvents.push(...events);
+				};
 				let promptOutcome: "completed" | "failed" | "aborted" = "failed";
 				abortListener = () => {
 					// Attach the rejection handler synchronously: AgentSession.abort() is async,
@@ -498,42 +567,73 @@ export class PiSessionRunner implements SessionRunner {
 				try {
 					await session.prompt(text);
 					if (abortPromise) await abortPromise;
-					if (signal?.aborted) {
+					if (signal?.aborted || abortedByHandle) {
 						const detail = abortError ? `; SDK abort failed: ${(abortError as Error).message}` : "";
 						throw new HarnessError("runner.stop", `session ${spec.label} was aborted during prompt${detail}`);
 					}
-					const result = turnResult(session.messages.slice(before), spec.label);
+					collectUsage();
+					const result = turnResult(promptMessages, spec.label, summarizeUsage(promptEvents));
 					promptOutcome = "completed";
 					return result;
 				} catch (error) {
 					if (abortPromise) await abortPromise;
-					if (signal?.aborted && !(error instanceof HarnessError && error.code === "runner.stop")) {
+					if ((signal?.aborted || abortedByHandle) && !(error instanceof HarnessError && error.code === "runner.stop")) {
 						promptOutcome = "aborted";
 						const detail = abortError ? `; SDK abort failed: ${(abortError as Error).message}` : "";
 						throw new HarnessError("runner.stop", `session ${spec.label} was aborted during prompt${detail}`);
 					}
-					if (signal?.aborted) promptOutcome = "aborted";
+					if (signal?.aborted || abortedByHandle) promptOutcome = "aborted";
 					throw error;
 				} finally {
+					collectUsage();
+					if (promptOutcome !== "completed" && !promptEvents.some((event) => event.kind === "assistant")) {
+						const unknown: UsageEvent = { entryId: `unobserved-${ref.id}-${thisPrompt}`, kind: "assistant", promptIndex: thisPrompt, at: new Date().toISOString(), status: "unknown", costSource: "unknown", costStatus: "unknown" };
+						promptEvents.push(unknown); usageEvents.push(unknown);
+					}
+				try {
+					await appendFile(usageFile, `${JSON.stringify({ version: 1, sessionId: ref.id, promptIndex: thisPrompt, outcome: promptOutcome, events: promptEvents, summary: summarizeUsage(promptEvents) })}\n`);
+				} finally {
+					promptActive = false;
 					if (abortListener) signal?.removeEventListener("abort", abortListener);
 					abortListener = undefined;
 					abortPromise = undefined;
 					abortError = undefined;
-					await telemetry?.heartbeat("idle", undefined, promptOutcome).catch(() => undefined);
+					await queueTelemetry(async () => { if (!disposed) await telemetry?.heartbeat("idle", undefined, promptOutcome); });
+					await sampleRunnerResources(spec.persistDir, "prompt-end");
+				}
 				}
 			},
 			transcript: () => transcriptOf(session.messages),
 			readCoverage: () => [...materialTools.readCoverage].sort(),
+			readReturnEvents: () => [...materialTools.readReturns],
+			usageEvents: () => [...usageEvents],
+			usageSummary: () => summarizeUsage(usageEvents),
 			toolLog: () => [...toolLog],
+			abort: async () => {
+				if (disposed || abortedByHandle) return;
+				abortedByHandle = true;
+				if (promptActive) {
+					abortPromise = session.abort().catch((error) => { abortError = error; });
+				}
+			},
 			dispose: () => {
 				if (disposed) return;
 				disposed = true;
 				if (abortListener) signal?.removeEventListener("abort", abortListener);
 				abortListener = undefined;
-				session.dispose();
-				void telemetry?.end().catch(() => undefined);
+				try { session.dispose(); }
+				finally {
+					sessionClosed();
+					void queueTelemetry(async () => { await telemetry?.end(); });
+					void sampleRunnerResources(spec.persistDir, "dispose");
+				}
 			},
 		};
+		} catch (error) {
+			try { session.dispose(); } catch { /* Preserve the construction failure. */ }
+			await telemetry?.end().catch(() => undefined);
+			throw error;
+		}
 	}
 
 	private async assertResumeScratch(cwd: string, persistDir: string): Promise<void> {

@@ -22,7 +22,7 @@
  *       --delivery-scope <json> --reproduction <json> [--closure-requested]
  *                                在严格配对的 M08/M04 版本上解释、复核交付副本并记录收口
  *   status                       runs, snapshot, limits
- *   improve run|status|rollback  run or inspect the bounded budget-policy improvement loop
+ *   improve run|status|rollback|export|bind  run a bounded campaign (--plan <json>) or manage a budget method
  *   knowledge pack --purpose <text> [--ids C001,K002] [--terms a,b]
  *   knowledge views              regenerate derived views
  *
@@ -48,6 +48,7 @@ import { runM09, type M09Options } from "./stages/m09.ts";
 import { HarnessError } from "./types.ts";
 import { Workspace } from "./workspace.ts";
 import { ImprovementService } from "./improvement/service.ts";
+import type { CampaignPlan } from "./improvement/types.ts";
 
 interface ParsedArgs {
 	positional: string[];
@@ -98,7 +99,7 @@ async function makeRunner(kind: string): Promise<SessionRunner> {
 }
 
 function usage(): string {
-	return `用法：node src/cli.ts <init|m01|m02|m03|m04|m05|m06|m08|m09|status|knowledge|improve> [选项]\n  --workspace <dir>   工作区（默认当前目录）\n  --runner pi|fake    会话运行器（默认 pi）\n  improve run|status|rollback 仅操作自动晋级的预算与证据交接策略原型\n  m08 的 materials/self-checks/reviewers 是显式 JSON 文件\n  m09 的 delivery-scope/reproduction 是显式 JSON 文件；instructions 是预授权的精确 shell 命令，read-only 时应为空；不会自动发布\n详见 src/cli.ts 顶部说明。`;
+	return `用法：node src/cli.ts <init|m01|m02|m03|m04|m05|m06|m08|m09|status|knowledge|improve> [选项]\n  --workspace <dir>   工作区（默认当前目录）\n  --runner pi|fake    会话运行器（默认 pi）\n  improve run|status|rollback|export|bind（run 必须给 --plan <json>；无案例只筛选不晋级）\n  improve run --plan <json> 显式限定候选/实验/资源预算\n  improve export --version <id> --applicability <text> --out <json>；bind --package <json> 是人工显式迁移\n  m08 的 materials/self-checks/reviewers 是显式 JSON 文件\n  m09 的 delivery-scope/reproduction 是显式 JSON 文件；instructions 是预授权的精确 shell 命令，read-only 时应为空；不会自动发布\n详见 src/cli.ts 顶部说明。`;
 }
 
 async function jsonFile<T>(args: ParsedArgs, name: string): Promise<T> {
@@ -149,7 +150,8 @@ export async function main(argv: string[]): Promise<number> {
 			return 0;
 		}
 		if (action === "run") {
-			const value = await improvement.run();
+			const plan = await jsonFile<CampaignPlan>(args, "plan");
+			const value = await improvement.run(plan);
 			console.log(JSON.stringify(value, null, 2));
 			return value.run.status === "promoted" ? 0 : 1;
 		}
@@ -157,7 +159,16 @@ export async function main(argv: string[]): Promise<number> {
 			console.log(JSON.stringify(await improvement.rollback(), null, 2));
 			return 0;
 		}
-		throw new HarnessError("cli.improve", "improve 子命令：run | status | rollback");
+		if (action === "export") {
+			const version = flag(args, "version"), applicability = flag(args, "applicability"), out = flag(args, "out");
+			if (!version || !applicability || !out) throw new HarnessError("cli.improve", "export requires --version, --applicability, and --out");
+			console.log(JSON.stringify(await improvement.exportMethodPackage(version, applicability, path.resolve(out)), null, 2)); return 0;
+		}
+		if (action === "bind") {
+			const packagePath = flag(args, "package"); if (!packagePath) throw new HarnessError("cli.improve", "bind requires --package");
+			console.log(JSON.stringify(await improvement.bindMethodPackage(path.resolve(packagePath)), null, 2)); return 0;
+		}
+		throw new HarnessError("cli.improve", "improve 子命令：run | status | rollback | export | bind");
 	}
 
 	const config = await ws.loadConfig();

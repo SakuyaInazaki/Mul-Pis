@@ -5,6 +5,7 @@ import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { createM07Controller } from "../src/m07/controller.ts";
+import { readProjectionEvents, replayability } from "../src/improvement/observations.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 import type { StageContext } from "../src/stages/context.ts";
 import { runM04 } from "../src/stages/m04.ts";
@@ -150,6 +151,101 @@ test("a goal freezes its budget policy while only a new goal inherits a later ac
 	assert.deepEqual(persistedNew.budgetPolicy, roomy);
 });
 
+test("M07 projection events use ordered UTF-16 decisions and preserve measured bytes", async (t) => {
+	const f = await fixture(t);
+	await activateBudget(f.root, { version: 1, maxPromptChars: 8_000, maxInlineFileChars: 1_000, maxAggregateInlineChars: 4_000, maxFeedbackChars: 4_000, overflowMode: "manifest-and-defer" });
+	const goal = await f.controller.begin(begin);
+	const inputs = ["中文".repeat(450), "a".repeat(1_100), "😀".repeat(600)];
+	const files = await Promise.all(inputs.map(async (content, index) => {
+		const file = path.join(f.root, `mixed-${index}.txt`);
+		await writeFile(file, content);
+		return file;
+	}));
+	const task = await f.controller.delegate(goal.runId, { objective: "核对混合编码", inputs: files, expectedOutputs: [], checks: ["长度已核对"], mode: "reason" });
+	const [event] = await readProjectionEvents(f.ws, goal.runId);
+	assert.equal(event.purpose, "task-message");
+	assert.equal(event.taskId, task.taskId);
+	assert.equal(event.policyVersionId, "test-budget");
+	assert.equal(event.deliveryStatus, "submitted");
+	assert.deepEqual(event.materials.map((item) => item.ordinal), [0, 1, 2]);
+	assert.deepEqual(event.materials.map((item) => item.utf16CodeUnits), [900, 1_100, 1_200]);
+	assert.deepEqual(event.materials.map((item) => item.utf8Bytes), [2_700, 1_100, 2_400]);
+	assert.deepEqual(event.materials.map((item) => item.decision), ["inline", "deferred", "deferred"]);
+	assert.equal(replayability(event).replayable, true);
+	const snapshot = path.join(f.ws.runDir("M07", goal.runId), event.materials[0].snapshotPath!);
+	await writeFile(files[0], "源文件已改变");
+	assert.equal(await readFile(snapshot, "utf8"), inputs[0]);
+	await rm(snapshot);
+	const [missing] = await readProjectionEvents(f.ws, goal.runId);
+	assert.equal(missing.materials[0].availability, "missing");
+	assert.equal(replayability(missing).replayable, false);
+});
+
+test("M07 projection calls remain separate across delegates and feedback consumption", async (t) => {
+	const f = await fixture(t);
+	const goal = await f.controller.begin(begin);
+	const input = path.join(f.root, "task-only.txt");
+	await writeFile(input, "任务独有输入，不在 M07 stage inputs 中。");
+	for (let index = 0; index < 2; index++) await f.controller.delegate(goal.runId, { objective: `第 ${index + 1} 项`, inputs: [input], expectedOutputs: [], checks: ["已检查"], mode: "reason" });
+	const done = await f.controller.finish(goal.runId, { outcome: "partial", summary: "待处理", returnPath: "M04", goalChecks: begin.successCriteria.map((criterion) => ({ criterion, result: "not_run", evidence: [] })) });
+	let events = await readProjectionEvents(f.ws, goal.runId);
+	assert.deepEqual(events.map((item) => [item.callOrdinal, item.purpose, item.taskId]), [[1, "task-message", "T001"], [2, "task-message", "T002"], [3, "feedback", undefined]]);
+	assert.deepEqual(events.map((item) => item.deliveryStatus), ["submitted", "submitted", "not-submitted"]);
+	assert.equal(events[0].materials[0].role, "task-input");
+	assert.equal(events[1].materials[0].role, "task-input");
+	assert.equal((await f.ws.readRun("M07", goal.runId)).inputs.length, 1);
+	assert.equal(events[2].projectionStatus, "materialized");
+	assert.equal(replayability(events[2]).replayable, true);
+	await runM04(f.ctx, { feedback: { kind: "M07", runId: goal.runId }, freshSession: true });
+	events = await readProjectionEvents(f.ws, goal.runId);
+	assert.equal(events[2].deliveryStatus, "assembled-for-m04");
+	assert.equal(events[2].assembledBy?.stage, "M04");
+	assert.equal(done.feedbackPath && events[2].outputPath, "m04-feedback.md");
+});
+
+test("a rejected projection is recorded without pretending it reached the model", async (t) => {
+	const f = await fixture(t);
+	await activateBudget(f.root, { version: 1, maxPromptChars: 8_000, maxInlineFileChars: 1_000, maxAggregateInlineChars: 4_000, maxFeedbackChars: 4_000, overflowMode: "manifest-and-fail" });
+	const goal = await f.controller.begin(begin);
+	const input = path.join(f.root, "over-limit.txt");
+	await writeFile(input, "x".repeat(1_001));
+	await assert.rejects(f.controller.delegate(goal.runId, { objective: "检查长度", inputs: [input], expectedOutputs: [], checks: ["已检查"], mode: "reason" }), (error: unknown) => error instanceof HarnessError && error.code === "context.budget");
+	const [event] = await readProjectionEvents(f.ws, goal.runId);
+	assert.equal(event.projectionStatus, "budget-failed");
+	assert.equal(event.deliveryStatus, "not-submitted");
+	assert.equal(event.materials[0].decision, "deferred");
+	assert.equal(event.materials[0].reason, "single-file-limit");
+	assert.equal(replayability(event).replayable, false);
+	assert.equal((await f.controller.status(goal.runId)).tasks.length, 0);
+});
+
+test("measurement snapshot caps leave task inputs intact and mark unreplayable events", async (t) => {
+	const f = await fixture(t);
+	const controller = createM07Controller(f.ctx, { projectionSnapshotLimits: { perMaterialBytes: 16, perCallBytes: 16, perRunBytes: 24 } });
+	const goal = await controller.begin(begin);
+	const files = await Promise.all(["A".repeat(12), "B".repeat(12), "C".repeat(20)].map(async (content, index) => {
+		const file = path.join(f.root, `cap-${index}.txt`);
+		await writeFile(file, content);
+		return file;
+	}));
+	await controller.delegate(goal.runId, { objective: "同调用额度", inputs: files, expectedOutputs: [], checks: ["完整"], mode: "reason" });
+	await controller.delegate(goal.runId, { objective: "累计额度内", inputs: [files[0]], expectedOutputs: [], checks: ["完整"], mode: "reason" });
+	await controller.delegate(goal.runId, { objective: "累计额度外", inputs: [files[1]], expectedOutputs: [], checks: ["完整"], mode: "reason" });
+	const events = await readProjectionEvents(f.ws, goal.runId);
+	assert.deepEqual(events[0].materials.map((item) => item.snapshotStatus), ["captured", "budget-exceeded", "budget-exceeded"]);
+	assert.deepEqual(events[0].materials.map((item) => item.captureReason), [undefined, "per-call", "per-material"]);
+	assert.equal(events[1].materials[0].snapshotStatus, "captured");
+	assert.equal(events[2].materials[0].captureReason, "per-run");
+	assert.equal(events[0].captureBudget.usedCallBytes, 12);
+	assert.equal(events[2].captureBudget.usedRunBytesAtStart, 24);
+	assert.equal(replayability(events[0]).replayable, false);
+	assert.equal(replayability(events[1]).replayable, true);
+	assert.equal(replayability(events[2]).replayable, false);
+	const sent = [...f.runner.sessions.values()][0].transcript[0].text;
+	assert.match(sent, /BBBBBBBBBBBB/);
+	assert.match(sent, /CCCCCCCCCCCCCCCCCCCC/);
+});
+
 test("legacy M07 goals remain viewable but cannot silently adopt the current active policy", async (t) => {
 	const f = await fixture(t);
 	const goal = await f.controller.begin(begin);
@@ -203,6 +299,31 @@ test("M07 feedback manifests oversized frozen evidence and M04 records access wi
 	assert.deepEqual(coverage.filesAccessed, [evidenceRelative]);
 	assert.equal(coverage.completeness, "unknown");
 	assert.match(coverage.semantics, /不证明已读全文/);
+});
+
+test("failed M04 retains material ranges returned before the model error", async (t) => {
+	const f = await fixture(t);
+	const goal = await f.controller.begin(begin);
+	await f.controller.delegate(goal.runId, { objective: "生成反馈", inputs: [], expectedOutputs: [], checks: ["完成"], mode: "reason" });
+	await f.controller.finish(goal.runId, { outcome: "partial", summary: "交回 M04", returnPath: "M04", goalChecks: begin.successCriteria.map((criterion) => ({ criterion, result: "not_run", evidence: [] })) });
+	const fake = new FakeSessionRunner(() => ({ text: "unused", reads: ["tasks/T001/report.md"], stopReason: "error" }));
+	const originalCreate = fake.create.bind(fake);
+	fake.create = async (spec) => {
+		const handle = await originalCreate(spec);
+		return { ...handle, readReturnEvents: () => [{ toolName: "m07_evidence_read", path: "tasks/T001/report.md", status: "returned" as const, requested: { offset: 2, limit: 1 }, returned: { startLine: 2, endLine: 2, truncated: true, kind: "text" as const }, at: "2026-09-23T00:00:00Z" }] };
+	};
+	f.ctx.runner = fake;
+	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07", runId: goal.runId }, freshSession: true }));
+	const ids = await f.ws.listRuns("M04");
+	const failed = (await Promise.all(ids.map((id) => f.ws.readRun("M04", id)))).find((run) => run.status === "failed");
+	assert.ok(failed);
+	assert.equal(failed.status, "failed");
+	const coverageRef = failed.outputs.find((item) => item.label === "M07 回流证据实际访问范围");
+	assert.ok(coverageRef);
+	const coverage = JSON.parse(await readFile(coverageRef.path, "utf8"));
+	assert.equal(coverage.promptOutcome, "failed");
+	assert.deepEqual(coverage.filesAccessed, ["tasks/T001/report.md"]);
+	assert.deepEqual(coverage.returnedRanges[0].returned, { startLine: 2, endLine: 2, truncated: true, kind: "text" });
 });
 
 test("feedback control facts over the hard cap fail explicitly while frozen evidence remains recoverable", async (t) => {

@@ -47,7 +47,7 @@ export function validateBudgetPolicy(input: unknown): BudgetPolicy {
 	return policy;
 }
 
-export interface ActiveBudgetPointer { version: 1; versionId: string; previousVersionId?: string; promotedAt: string; runId: string }
+export interface ActiveBudgetPointer { version: 1; versionId: string; previousVersionId?: string; promotedAt: string; runId: string; provenance?: "local-mechanism-admission" | "legacy-projection-only" | "external-manual-unverified" }
 
 export interface InlineProjection { inline: boolean; inlineChars: number; deferredChars: number; nextAggregateChars: number; reason?: "single-file-limit" | "aggregate-limit" }
 
@@ -64,6 +64,7 @@ export function validateActiveBudgetPointer(input: unknown): ActiveBudgetPointer
 	const value = input as Record<string, unknown>;
 	const safeId = (item: unknown): item is string => typeof item === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(item);
 	if (value.version !== 1 || !safeId(value.versionId) || (value.previousVersionId !== undefined && !safeId(value.previousVersionId)) || typeof value.promotedAt !== "string" || typeof value.runId !== "string") throw new HarnessError("improvement.active", "active.json 字段无效");
+	if (value.provenance !== undefined && !["local-mechanism-admission", "legacy-projection-only", "external-manual-unverified"].includes(String(value.provenance))) throw new HarnessError("improvement.active", "active.json provenance 无效");
 	return value as unknown as ActiveBudgetPointer;
 }
 

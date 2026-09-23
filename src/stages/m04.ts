@@ -19,6 +19,7 @@ import { loadProblemMaterials, readOutput, recordSession, relPath, requireComple
 import { specFileFor } from "./m03.ts";
 import { readFrozenArtifactManifest, type FrozenArtifactManifest } from "./artifacts.ts";
 import { renderPageTool } from "../tools/pagetool.ts";
+import { markFeedbackAssembled } from "../improvement/observations.ts";
 
 export type M04Feedback =
 	| { kind: "M03"; runId?: string }
@@ -177,18 +178,23 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			let output: string;
 			let m08ReadCoverage: string[] = [];
 			let m08ToolLog: ReturnType<typeof handle.toolLog> = [];
+			let m07ReturnedRanges: ReturnType<NonNullable<typeof handle.readReturnEvents>> = [];
+			let promptSucceeded = false;
 			try {
 				recordSession(record, handle);
+				if (feedback.m07) await markFeedbackAssembled(ctx.ws, feedback.m07.runId, feedback.inputs[0].path, record.runId);
 				const turn = await handle.prompt(finalMessage);
 				output = turn.text;
+				await ctx.ws.writeOutput(record, "processing.md", output, "处理结果");
+				promptSucceeded = true;
+			} finally {
 				m08ReadCoverage = handle.readCoverage();
 				m08ToolLog = handle.toolLog();
-				await ctx.ws.writeOutput(record, "processing.md", output, "处理结果");
-			} finally {
+				m07ReturnedRanges = handle.readReturnEvents?.() ?? [];
 				handle.dispose();
+				if (feedback.m07) await ctx.ws.writeOutput(record, "m07-coverage.json", JSON.stringify({ sessionId: handle.ref.id, promptOutcome: promptSucceeded ? "returned" : "failed", filesAccessed: m08ReadCoverage, returnedRanges: m07ReturnedRanges, completeness: "unknown", semantics: "saved 仅表示固定材料存在；returnedRanges 仅表示工具实际返回模型的内容范围，文件名访问不证明已读全文；不证明模型使用该范围，更不证明使用正确。" }, null, 2), "M07 回流证据实际访问范围");
 			}
 			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-coverage.json", JSON.stringify({ files: m08ReadCoverage, renderedPages: m08RenderedPages, tools: m08ToolLog }, null, 2), "M08 处理实际读取范围");
-			if (feedback.m07) await ctx.ws.writeOutput(record, "m07-coverage.json", JSON.stringify({ filesAccessed: m08ReadCoverage, completeness: "unknown", semantics: "文件名仅证明工具访问过该文件；不证明已读全文。读取范围需结合会话报告中的 offset/limit 声明核对。" }, null, 2), "M07 回流证据实际访问范围");
 
 			const result: M04Result = { record, output, mode };
 			if (feedback.m08) {

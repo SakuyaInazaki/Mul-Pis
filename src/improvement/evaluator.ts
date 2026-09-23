@@ -31,6 +31,7 @@ export function evaluateCandidate(protocol: ImprovementProtocol, candidate: Budg
 	const newDeferredRatio = replay.totalObservedInputChars > 0 ? Math.max(0, replay.totalDeferredChars - baseline.totalDeferredChars) / replay.totalObservedInputChars : 0;
 	const inlineCoverageRatio = replay.totalObservedInputChars > 0 ? replay.totalInlineChars / replay.totalObservedInputChars : 0;
 	const gates = [
+		{ name: "replayable-projection-events", passed: protocol.samples.length > 0, detail: `${protocol.samples.length} replayable M07 projection calls; ${protocol.unreplayableEvents} unreplayable; ${protocol.legacyRunsWithoutEvents} legacy runs` },
 		{ name: "observed-evidence", passed: protocol.samples.length > 0 && baseline.totalObservedInputChars > 0, detail: `${protocol.samples.length} 个匿名化历史样本，输入字符 ${baseline.totalObservedInputChars}` },
 		{ name: "measurable-reduction", passed: reductionRatio >= protocol.minimumReductionRatio, detail: `内联字符减少 ${(reductionRatio * 100).toFixed(2)}%，门槛 ${(protocol.minimumReductionRatio * 100).toFixed(2)}%` },
 		{ name: "manifest-coverage", passed: replay.manifestedSamples === replay.observedSamples && replay.manifestedFiles === replay.observedFiles, detail: `${replay.manifestedFiles}/${replay.observedFiles} 文件完整表示为内联或延后` },
@@ -41,5 +42,6 @@ export function evaluateCandidate(protocol: ImprovementProtocol, candidate: Budg
 		{ name: "overflow-mode-nonregression", passed: candidate.overflowMode === protocol.baselinePolicy.overflowMode, detail: `溢出处置保持 ${protocol.baselinePolicy.overflowMode}` },
 		{ name: "maximum-inline-nonregression", passed: replay.maxInlineChars <= baseline.maxInlineChars, detail: `最大内联 ${baseline.maxInlineChars} → ${replay.maxInlineChars}` },
 	];
-	return { passed: gates.every((gate) => gate.passed), baseline, candidate: replay, reductionRatio, gates };
+	const passed = gates.every((gate) => gate.passed);
+	return { passed, status: protocol.samples.length === 0 ? "insufficient-evidence" : passed ? "screened" : "rejected", baseline, candidate: replay, reductionRatio, gates };
 }

@@ -53,7 +53,7 @@ interface FactoryHarness {
 	abortCalls: number;
 }
 
-function stubFactory(response?: StubResponse): FactoryHarness {
+function stubFactory(response?: StubResponse | StubResponse[], config: { pruneIntermediate?: boolean; compactionUsage?: StubResponse["usage"]; disposeCounter?: { count: number }; blockSpecWrite?: boolean } = {}): FactoryHarness {
 	const calls: CreateAgentSessionOptions[] = [];
 	let promptCalls = 0;
 	let abortCalls = 0;
@@ -61,6 +61,7 @@ function stubFactory(response?: StubResponse): FactoryHarness {
 		calls.push(options);
 		const manager = options.sessionManager;
 		assert(manager);
+		if (config.blockSpecWrite) await mkdir(manager.getSessionFile()!.replace(/\.jsonl$/, ".spec.json"));
 		const messages: unknown[] = [...manager.buildSessionContext().messages];
 		const session = {
 			sessionId: manager.getSessionId(),
@@ -86,30 +87,35 @@ function stubFactory(response?: StubResponse): FactoryHarness {
 						cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.3 },
 					},
 				};
+				const responses = Array.isArray(selected) ? selected : [selected];
+				for (const [index, item] of responses.entries()) {
 				const assistant = {
 					role: "assistant",
 					api: MODEL.api,
 					provider: MODEL.provider,
 					model: MODEL.id,
 					timestamp: Date.now(),
-					usage: selected.usage ?? {
+					...(("usage" in item && item.usage === undefined) ? {} : { usage: item.usage ?? {
 						input: 0,
 						output: 0,
 						cacheRead: 0,
 						cacheWrite: 0,
 						totalTokens: 0,
 						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-					},
-					content: selected.content,
-					stopReason: selected.stopReason,
-					...(selected.errorMessage ? { errorMessage: selected.errorMessage } : {}),
+					} }),
+					content: item.content,
+					stopReason: item.stopReason,
+					...(item.errorMessage ? { errorMessage: item.errorMessage } : {}),
 				};
-				messages.push(user, assistant);
-				manager.appendMessage(user as never);
+				if (index === 0) { messages.push(user); manager.appendMessage(user as never); }
+				messages.push(assistant);
 				manager.appendMessage(assistant as never);
+				if (config.pruneIntermediate && index < responses.length - 1) messages.pop();
+				}
+				if (config.compactionUsage) manager.appendCompaction("offline summary", "offline-entry", 100, undefined, false, config.compactionUsage as never);
 			},
 			abort() { abortCalls += 1; },
-			dispose() {},
+			dispose() { if (config.disposeCounter) config.disposeCounter.count++; },
 		};
 		return { session, extensionsResult: undefined } as unknown as Awaited<ReturnType<typeof createAgentSession>>;
 	}) as typeof createAgentSession;
@@ -237,7 +243,7 @@ test("prompt reports visible output and rejects a non-stop assistant result", as
 		text: "visible answer",
 		stopReason: "stop",
 		toolCalls: 1,
-		usage: { input: 7, output: 11, cost: 0.3 },
+		usage: { input: 7, output: 11, cacheRead: 0, cacheWrite: 0, totalTokens: 18, cost: 0.3, reportedEvents: 1, unknownEvents: 0, complete: true, costComplete: false },
 	});
 	assert.deepEqual(success.transcript(), [
 		{ role: "user", text: "hello" },
@@ -379,4 +385,130 @@ test("fake runner rejects cached custom and execution sessions on resume", async
 		const handle = await fake.create(spec(persistDir, { tools }));
 		await assert.rejects(fake.resume(handle.ref), /non-resumable tool session/);
 	}
+});
+
+test("accounts for every appended assistant and compaction once across prompts and resume", async (t) => {
+	const persistDir = await fixture(t);
+	const usage = (input: number, output: number, cost: number) => ({
+		input, output, cacheRead: 1, cacheWrite: 2, totalTokens: input + output + 3,
+		cost: { input: cost, output: 0, cacheRead: 0, cacheWrite: 0, total: cost },
+	});
+	const stub = stubFactory([
+		{ content: [{ type: "toolCall", id: "t", name: "offline", arguments: {} }], stopReason: "toolUse", usage: usage(10, 2, 0.1) },
+		{ content: [{ type: "text", text: "done" }], stopReason: "stop", usage: usage(20, 3, 0.2) },
+	], { pruneIntermediate: true, compactionUsage: usage(4, 1, 0.04) });
+	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory });
+	const handle = await runner.create(spec(persistDir));
+	const first = await handle.prompt("first");
+	assert.equal(first.toolCalls, 1);
+	assert.equal(first.usage?.input, 34);
+	assert.equal(first.usage?.cost, 0.34);
+	assert.deepEqual(handle.usageEvents().map((event) => event.kind), ["assistant", "assistant", "compaction"]);
+	await handle.prompt("second");
+	assert.equal(handle.usageSummary().input, 68);
+	const lines = (await readFile(handle.ref.file!.replace(/\.jsonl$/, ".usage.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+	assert.equal(lines.length, 2);
+	assert.deepEqual(lines.map((row) => row.summary.input), [34, 34]);
+	handle.dispose();
+	const resumed = await runner.resume(handle.ref);
+	await resumed.prompt("third");
+	assert.equal(resumed.usageSummary().input, 34);
+	assert.equal((await readFile(handle.ref.file!.replace(/\.jsonl$/, ".usage.jsonl"), "utf8")).trim().split("\n").length, 3);
+	resumed.dispose();
+});
+
+test("failed prompt persists unknown usage, and explicit abort leaves a readable ledger", async (t) => {
+	const persistDir = await fixture(t);
+	const missing = stubFactory({ content: [{ type: "text", text: "failed" }], stopReason: "error", usage: undefined });
+	const failed = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: missing.factory }).create(spec(persistDir));
+	await assert.rejects(failed.prompt("fail"), /stopReason=error/);
+	assert.equal(failed.usageSummary().complete, false);
+	assert.equal(failed.usageSummary().unknownEvents, 1);
+	const ledger = JSON.parse((await readFile(failed.ref.file!.replace(/\.jsonl$/, ".usage.jsonl"), "utf8")).trim());
+	assert.equal(ledger.outcome, "failed");
+	assert.equal(ledger.events[0].status, "unknown");
+	failed.dispose();
+
+	let release!: () => void;
+	const blocked = new Promise<void>((resolve) => { release = resolve; });
+	const managerFactory = (async (options: CreateAgentSessionOptions = {}) => {
+		const manager = options.sessionManager!;
+		return { session: {
+			sessionId: manager.getSessionId(), sessionFile: manager.getSessionFile(), messages: [],
+			getActiveToolNames: () => [], prompt: async () => blocked,
+			abort: async () => { release(); }, dispose() { release(); },
+		} } as unknown as Awaited<ReturnType<typeof createAgentSession>>;
+	}) as typeof createAgentSession;
+	const interrupted = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: managerFactory }).create(spec(persistDir));
+	const pending = interrupted.prompt("interrupt");
+	await interrupted.abort();
+	await assert.rejects(pending, /aborted during prompt/);
+	assert.equal(interrupted.usageSummary().unknownEvents, 1);
+	assert.equal(JSON.parse((await readFile(interrupted.ref.file!.replace(/\.jsonl$/, ".usage.jsonl"), "utf8")).trim()).outcome, "aborted");
+	interrupted.dispose();
+});
+
+test("records only returned text lines after limits, truncation and oversized-line warning", async (t) => {
+	const persistDir = await fixture(t);
+	const materialRoot = path.join(persistDir, "materials");
+	await mkdir(materialRoot);
+	await writeFile(path.join(materialRoot, "many.txt"), Array.from({ length: 2100 }, (_, i) => `line ${i + 1}`).join("\n"));
+	await writeFile(path.join(materialRoot, "wide.txt"), "x".repeat(52 * 1024));
+	const stub = stubFactory();
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory }).create(spec(persistDir, { tools: { kind: "read-dir", root: materialRoot } }));
+	const read = stub.calls[0].customTools?.find((tool) => tool.name === "material_read");
+	assert(read);
+	await read.execute("one", { path: "many.txt", offset: 5, limit: 3 }, undefined, undefined, undefined as never);
+	await read.execute("two", { path: "many.txt" }, undefined, undefined, undefined as never);
+	await read.execute("three", { path: "wide.txt" }, undefined, undefined, undefined as never);
+	await assert.rejects(read.execute("four", { path: "missing.txt" }, undefined, undefined, undefined as never));
+	assert.deepEqual(handle.readReturnEvents().map((event) => ({ status: event.status, start: event.returned.startLine, end: event.returned.endLine, truncated: event.returned.truncated })), [
+		{ status: "returned", start: 5, end: 7, truncated: true },
+		{ status: "returned", start: 1, end: 2000, truncated: true },
+		{ status: "no-content", start: undefined, end: undefined, truncated: true },
+		{ status: "error", start: undefined, end: undefined, truncated: undefined },
+	]);
+	handle.dispose();
+});
+
+test("method binding survives resume without enabling discovered resources", async (t) => {
+	const persistDir = await fixture(t);
+	const stub = stubFactory();
+	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory });
+	const binding = { versionId: "method-v1", contentId: "approved-package-v1" };
+	const handle = await runner.create(spec(persistDir, { methodBinding: binding }));
+	assert.deepEqual(handle.ref.methodBinding, binding);
+	assert.deepEqual(stub.calls[0].resourceLoader?.getExtensions().extensions, []);
+	assert.deepEqual(stub.calls[0].resourceLoader?.getSkills().skills, []);
+	await handle.prompt("first");
+	handle.dispose();
+	await assert.rejects(runner.resume({ ...handle.ref, methodBinding: { versionId: "different" } }), /method binding differs/);
+	const resumed = await runner.resume(handle.ref);
+	assert.deepEqual(resumed.ref.methodBinding, binding);
+	resumed.dispose();
+});
+
+test("releases SDK session when post-create sidecar write fails", async (t) => {
+	const persistDir = await fixture(t);
+	const disposed = { count: 0 };
+	const stub = stubFactory(undefined, { blockSpecWrite: true, disposeCounter: disposed });
+	await assert.rejects(new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory }).create(spec(persistDir)));
+	assert.equal(disposed.count, 1);
+});
+
+test("resource samples contain process counters and ending a session stays ended", async (t) => {
+	const root = await fixture(t);
+	const persistDir = path.join(root, ".agent", "sessions");
+	await mkdir(persistDir, { recursive: true });
+	const stub = stubFactory();
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory }).create(spec(persistDir));
+	await handle.prompt("offline");
+	handle.dispose();
+	handle.dispose();
+	await new Promise((resolve) => setTimeout(resolve, 30));
+	const samples = (await readFile(path.join(root, ".agent", "telemetry", `runner-resources-${process.pid}.jsonl`), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+	assert.deepEqual(samples.map((sample) => sample.event), ["create", "prompt-end", "dispose"]);
+	assert(samples.every((sample) => sample.pid === process.pid && sample.rss > 0 && sample.heapUsed > 0 && !JSON.stringify(sample).includes("offline")));
+	assert.equal(samples.at(-1).activeSessions, samples[0].activeSessions - 1);
+	assert.equal((await readTelemetry(root, handle.ref.id))?.activity, "ended");
 });

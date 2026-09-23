@@ -132,6 +132,8 @@ export interface CurrentGoal {
 	budgetPolicy?: BudgetPolicy;
 	budgetPolicyVersionId?: string;
 	budgetPolicyFrozenAt?: string;
+	/** Explicit method identity loaded when this goal began; later pointer changes do not rewrite it. */
+	methodBinding?: { versionId: string; contentId?: string };
 	tasks: M07TaskRecord[];
 	decisions: UserDecision[];
 	outcome?: GoalOutcome;

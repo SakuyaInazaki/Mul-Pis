@@ -5,7 +5,8 @@
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { readTextIfExists, writeFileAtomic } from "../workspace.ts";
-import type { AssistantTurn, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, ToolResult, TranscriptMessage } from "./types.ts";
+import type { AssistantTurn, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, ToolResult, TranscriptMessage, UsageEvent, UsageValues } from "./types.ts";
+import { summarizeUsage } from "./usage.ts";
 
 export interface FakeReplyContext {
 	spec: SessionSpec;
@@ -24,6 +25,7 @@ export interface FakeReply {
 	/** Files the fake "read" through its read-dir grant (relative to root). */
 	reads?: string[];
 	stopReason?: string;
+	usage?: UsageValues;
 }
 
 export type FakeReplyFn = (ctx: FakeReplyContext) => FakeReply | string | Promise<FakeReply | string>;
@@ -53,7 +55,7 @@ export class FakeSessionRunner implements SessionRunner {
 		const specFile = file.replace(/\.jsonl$/, ".spec.json");
 		await writeFileAtomic(specFile, `${JSON.stringify(spec, null, 2)}\n`);
 		await writeFileAtomic(file, "");
-		const ref: SessionRef = { label: spec.label, role: spec.role, id, model: spec.model, file, specFile };
+		const ref: SessionRef = { label: spec.label, role: spec.role, id, model: spec.model, file, specFile, ...(spec.methodBinding ? { methodBinding: spec.methodBinding } : {}) };
 		const state: FakeSessionState = { spec, ref, transcript: [], reads: new Set(), turns: 0, toolLog: [] };
 		this.sessions.set(id, state);
 		this.created.push(spec);
@@ -78,16 +80,25 @@ export class FakeSessionRunner implements SessionRunner {
 		if (state.spec.tools.kind === "custom" || state.spec.tools.kind === "execution" || (state.spec.tools.kind === "read-dir" && state.spec.tools.extraTools?.length)) {
 			throw new Error(`fake runner: non-resumable tool session ${ref.id} cannot be resumed`);
 		}
+		if (ref.methodBinding && JSON.stringify(ref.methodBinding) !== JSON.stringify(state.spec.methodBinding)) throw new Error(`fake runner: method binding mismatch for ${ref.id}`);
 		this.resumed.push(ref);
 		return this.handle(state);
 	}
 
 	private handle(state: FakeSessionState): SessionHandle {
+		const usageEvents: UsageEvent[] = [];
+		let disposed = false;
+		let aborted = false;
+		let rejectActive: ((error: Error) => void) | undefined;
 		return {
 			ref: state.ref,
 			prompt: async (text: string): Promise<AssistantTurn> => {
+				if (disposed || aborted) throw new Error(`session ${state.ref.label} was aborted or disposed`);
 				state.transcript.push({ role: "user", text });
 				state.turns += 1;
+				let outcome: "completed" | "failed" | "aborted" = "failed";
+				let replyUsage: UsageValues | undefined;
+				try {
 				const tools: FakeReplyContext["tools"] = {};
 				const granted = state.spec.tools.kind === "custom" ? state.spec.tools.tools : state.spec.tools.kind === "read-dir" ? (state.spec.tools.extraTools ?? []) : [];
 				{
@@ -105,26 +116,40 @@ export class FakeSessionRunner implements SessionRunner {
 						};
 					}
 				}
-				const raw = await this.reply({
+				const raw = await Promise.race([this.reply({
 					spec: state.spec,
 					ref: state.ref,
 					userMessages: state.transcript.filter((m) => m.role === "user").map((m) => m.text),
 					message: text,
 					turnIndex: state.turns,
 					tools,
-				});
+				}), new Promise<never>((_resolve, reject) => { rejectActive = reject; })]);
 				const reply: FakeReply = typeof raw === "string" ? { text: raw } : raw;
+				replyUsage = reply.usage;
 				for (const r of reply.reads ?? []) state.reads.add(r);
 				const stopReason = reply.stopReason ?? "stop";
 				if (stopReason !== "stop") throw new Error(`session ${state.ref.label} did not stop normally (stopReason=${stopReason})`);
 				state.transcript.push({ role: "assistant", text: reply.text });
 				await writeFileAtomic(state.ref.file!, state.transcript.map((m) => JSON.stringify(m)).join("\n") + "\n");
-				return { text: reply.text, stopReason, toolCalls: reply.reads?.length ?? 0 };
+				outcome = "completed";
+				return { text: reply.text, stopReason, toolCalls: reply.reads?.length ?? 0,
+					usage: summarizeUsage([{ entryId: `${state.ref.id}-${state.turns}`, kind: "assistant", promptIndex: state.turns, at: new Date().toISOString(), usage: replyUsage, status: replyUsage && ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "cost"].every((key) => Number.isFinite(replyUsage?.[key as keyof UsageValues])) ? "reported" : "unknown", costSource: replyUsage?.cost !== undefined ? "sdk-estimate" : "unknown", costStatus: replyUsage?.cost !== undefined ? "priced" : "unknown" }]) };
+				} finally {
+					rejectActive = undefined;
+					if (aborted) outcome = "aborted";
+					const event: UsageEvent = { entryId: `${state.ref.id}-${state.turns}`, kind: "assistant", promptIndex: state.turns, at: new Date().toISOString(), ...(replyUsage ? { usage: replyUsage } : {}), status: replyUsage && ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "cost"].every((key) => Number.isFinite(replyUsage?.[key as keyof UsageValues])) ? "reported" : "unknown", costSource: replyUsage?.cost !== undefined ? "sdk-estimate" : "unknown", costStatus: replyUsage?.cost !== undefined ? "priced" : "unknown" };
+					usageEvents.push(event);
+					await import("node:fs/promises").then(({ appendFile }) => appendFile(state.ref.file!.replace(/\.jsonl$/, ".usage.jsonl"), `${JSON.stringify({ version: 1, sessionId: state.ref.id, promptIndex: state.turns, outcome, events: [event], summary: summarizeUsage([event]) })}\n`));
+				}
 			},
 			transcript: () => [...state.transcript],
 			readCoverage: () => [...state.reads].sort(),
+			readReturnEvents: () => [],
+			usageEvents: () => [...usageEvents],
+			usageSummary: () => summarizeUsage(usageEvents),
 			toolLog: () => [...state.toolLog],
-			dispose: () => {},
+			abort: async () => { aborted = true; rejectActive?.(new Error(`session ${state.ref.label} was aborted`)); },
+			dispose: () => { if (disposed) return; disposed = true; rejectActive?.(new Error(`session ${state.ref.label} was disposed`)); },
 		};
 	}
 }

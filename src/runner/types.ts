@@ -67,6 +67,8 @@ export interface SessionSpec {
 	tools: ToolGrant;
 	/** Directory where the session transcript and its spec are persisted. */
 	persistDir: string;
+	/** Explicit, frozen method identity. It never enables resource discovery. */
+	methodBinding?: { versionId: string; contentId?: string };
 }
 
 /** Enough to reopen a persisted session with the same boundary. */
@@ -79,6 +81,52 @@ export interface SessionRef {
 	file?: string;
 	/** Persisted `SessionSpec` used to rebuild the identical boundary on resume. */
 	specFile?: string;
+	methodBinding?: SessionSpec["methodBinding"];
+}
+
+/** Provider-reported units only. Missing values remain unknown, never inferred from text size. */
+export interface UsageValues {
+	input?: number;
+	output?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
+	totalTokens?: number;
+	cost?: number;
+}
+
+export interface UsageEvent {
+	entryId: string;
+	kind: "assistant" | "tool-result" | "compaction" | "branch-summary";
+	promptIndex: number;
+	at: string;
+	provider?: string;
+	model?: string;
+	stopReason?: string;
+	usage?: UsageValues;
+	status: "reported" | "unknown";
+	/** Pi calculates cost from its local model price table; this is not a provider invoice. */
+	costSource?: "sdk-estimate" | "unknown";
+	costStatus?: "priced" | "unpriced" | "unknown";
+}
+
+export interface UsageSummary extends Required<UsageValues> {
+	reportedEvents: number;
+	unknownEvents: number;
+	/** False means the numerical totals are only a reported lower bound. */
+	complete: boolean;
+	/** False when model pricing is absent/zero or an event has unknown cost. */
+	costComplete: boolean;
+}
+
+export interface ReadReturnEvent {
+	toolName: string;
+	status: "returned" | "no-content" | "error";
+	/** Granted-root-relative path. */
+	path: string;
+	requested: { offset?: number; limit?: number };
+	/** One-based inclusive text lines actually sent to the model. */
+	returned: { startLine?: number; endLine?: number; truncated?: boolean; kind: "text" | "binary" | "unknown" };
+	at: string;
 }
 
 export interface AssistantTurn {
@@ -86,7 +134,7 @@ export interface AssistantTurn {
 	text: string;
 	stopReason: string;
 	toolCalls: number;
-	usage?: { input?: number; output?: number; cost?: number };
+	usage?: UsageSummary;
 }
 
 export interface TranscriptMessage {
@@ -108,6 +156,13 @@ export interface SessionHandle {
 	transcript(): TranscriptMessage[];
 	/** Files actually read through a `read-dir` grant, relative to its root. Empty for `none`. */
 	readCoverage(): string[];
+	/** Successful read-dir tool returns; file access alone does not imply full coverage. */
+	readReturnEvents(): ReadReturnEvent[];
+	/** New usage events observed through this handle, excluding history before resume. */
+	usageEvents(): UsageEvent[];
+	usageSummary(): UsageSummary;
+	/** Abort the active prompt and prevent further prompts on this handle. */
+	abort(): Promise<void>;
 	/** Every harness-defined or execution tool call made by the model in this session, in order. */
 	toolLog(): ToolCallRecord[];
 	dispose(): void;

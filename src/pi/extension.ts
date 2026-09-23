@@ -3,11 +3,13 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { loadPrompt } from "../prompts.ts";
 import { ResearchService, type StageRequest } from "./service.ts";
 import { TelemetryWriter } from "../dashboard/telemetry.ts";
+import { createMainUsageLedger } from "./main-usage.ts";
 import { ImprovementService } from "../improvement/service.ts";
-import type { ImprovementRunResult, ImprovementStatus } from "../improvement/types.ts";
+import type { CampaignPlan, ImprovementRunResult, ImprovementStatus } from "../improvement/types.ts";
 import type { ActiveBudgetPointer } from "../improvement/policy.ts";
 
 type ToolResult = AgentToolResult<Record<string, unknown>>;
@@ -25,11 +27,11 @@ function compact(value: unknown): Record<string, unknown> {
 	const item = value as Record<string, unknown>;
 	if ("workspace" in item && "stages" in item) return item;
 	if ("activeVersionId" in item && "runs" in item) return {
-		activeVersionId: item.activeVersionId, previousVersionId: item.previousVersionId, runs: item.runs,
+		activeVersionId: item.activeVersionId, activeProvenance: item.activeProvenance, previousVersionId: item.previousVersionId, runs: item.runs,
 	};
 	if ("run" in item && item.run && typeof item.run === "object") {
 		const run = item.run as Record<string, unknown>;
-		return { runId: run.runId, status: run.status, rejectionReason: run.rejectionReason, activeVersionId: item.activeVersionId, evaluation: item.evaluation };
+		return { runId: run.runId, status: run.status, stopReason: run.stopReason, attempts: run.attempts, campaignUsage: run.campaignUsage, activeVersionId: item.activeVersionId, evaluation: item.evaluation };
 	}
 	if ("versionId" in item && "runId" in item && "promotedAt" in item) return item;
 	if ("taskId" in item) return {
@@ -99,7 +101,7 @@ export interface ResearchExtensionOptions {
 	defaultWorkspace?: string;
 	mainAgentStallTimeoutMs?: number;
 	mainAgentStallCheckMs?: number;
-	improvementServiceFactory?: (workspaceRoot: string, signal?: AbortSignal) => Promise<Pick<ImprovementService, "run" | "status" | "rollback">> | Pick<ImprovementService, "run" | "status" | "rollback">;
+	improvementServiceFactory?: (workspaceRoot: string, signal?: AbortSignal) => Promise<Pick<ImprovementService, "run" | "status" | "rollback"> & Partial<Pick<ImprovementService, "exportMethodPackage" | "bindMethodPackage">>> | Pick<ImprovementService, "run" | "status" | "rollback"> & Partial<Pick<ImprovementService, "exportMethodPackage" | "bindMethodPackage">>;
 }
 
 export function createResearchExtension(options: ResearchExtensionOptions = {}) {
@@ -110,12 +112,13 @@ export function createResearchExtension(options: ResearchExtensionOptions = {}) 
 		let activePiCwd: string | undefined;
 		let activeUpdate: ((update: ToolResult) => void) | undefined;
 		let controllerTelemetry: TelemetryWriter | undefined;
+		const mainUsage = createMainUsageLedger();
 		const service = options.service ?? new ResearchService({
 			defaultWorkspace: options.defaultWorkspace ?? process.cwd(),
 			onProgress: (progress) => activeUpdate?.(result(progress)),
 
 		});
-		const improvementService = async (workspaceRoot: string, signal?: AbortSignal): Promise<Pick<ImprovementService, "run" | "status" | "rollback">> => {
+		const improvementService = async (workspaceRoot: string, signal?: AbortSignal): Promise<Pick<ImprovementService, "run" | "status" | "rollback"> & Partial<Pick<ImprovementService, "exportMethodPackage" | "bindMethodPackage">>> => {
 			if (options.improvementServiceFactory) return options.improvementServiceFactory(workspaceRoot, signal);
 			const { createPiSessionRunner } = await import("../runner/pi.ts");
 			return new ImprovementService({ workspaceRoot, runner: createPiSessionRunner({ signal }) });
@@ -170,6 +173,7 @@ mainAgentWatchdog.unref?.();
 };
 
 		pi.on("session_start", async (_event, ctx) => {
+			await mainUsage.sessionStart(ctx).catch(() => undefined);
 			researchActive = false; activePiCwd = undefined;
 			clearMainAgentWatchdog();
 			pendingShutdownReason = undefined;
@@ -180,10 +184,11 @@ mainAgentWatchdog.unref?.();
 				catch { controllerTelemetry = undefined; }
 			}
 		});
-		pi.on("agent_start", async (_event, ctx) => { startMainAgentWatchdog(ctx); await controllerTelemetry?.heartbeat("active").catch(() => undefined); });
-		pi.on("agent_end", async () => { clearMainAgentWatchdog(); await controllerTelemetry?.heartbeat("idle").catch(() => undefined); });
+		pi.on("agent_start", async (_event, ctx) => { await mainUsage.agentStart(ctx).catch(() => undefined); startMainAgentWatchdog(ctx); await controllerTelemetry?.heartbeat("active").catch(() => undefined); });
+		pi.on("agent_end", async (_event, ctx) => { await mainUsage.agentEnd(ctx).catch(() => undefined); clearMainAgentWatchdog(); await controllerTelemetry?.heartbeat("idle").catch(() => undefined); });
 		pi.on("agent_settled", () => { clearMainAgentWatchdog(); });
-		pi.on("session_shutdown", async (event) => {
+		pi.on("session_shutdown", async (event, ctx) => {
+			await mainUsage.sessionShutdown(ctx).catch(() => undefined);
 			const reason = pendingShutdownReason ?? `Pi session_shutdown: ${event.reason}`;
 			pendingShutdownReason = undefined;
 			clearMainAgentWatchdog();
@@ -232,20 +237,33 @@ mainAgentWatchdog.unref?.();
 		pi.registerTool({
 			name: "research_improve",
 			label: "Improve Research Harness Budget Policy",
-			description: "Run, inspect, or roll back the bounded budget-and-evidence-handoff policy improvement loop. A passing fixed offline evaluation is promoted automatically; this does not modify workflow source or establish general scientific benefit.",
+			description: "Run an explicit bounded campaign, inspect/roll back a policy, or manually export/bind a method package. Projection screening alone never promotes; only complete local paired mechanism admission can promote, without proving broad scientific benefit.",
 			promptSnippet: "Operate the separate bounded budget-policy improvement loop",
-			promptGuidelines: ["Use action=status before run or rollback.", "Treat promotion as acceptance under the fixed offline evaluator, not proof of general RSI or scientific improvement."],
+			promptGuidelines: ["Run requires a caller-authorized planPath with candidate and resource limits; without cases, it screens only.", "Treat local mechanism admission as narrow evidence, not complete scientific workflow benefit."],
 			parameters: Type.Object({
-				action: Type.Union([Type.Literal("run"), Type.Literal("status"), Type.Literal("rollback")]),
+				action: Type.Union([Type.Literal("run"), Type.Literal("status"), Type.Literal("rollback"), Type.Literal("export"), Type.Literal("bind")]),
+				planPath: Type.Optional(Type.String()),
+				packagePath: Type.Optional(Type.String()),
+				versionId: Type.Optional(Type.String()),
+				applicability: Type.Optional(Type.String()),
+				outputPath: Type.Optional(Type.String()),
 				workspace: Type.Optional(Type.String({ description: "Research workspace; defaults to current Pi cwd" })),
 			}),
 			executionMode: "sequential",
 			async execute(_id, params, signal, _update, ctx) {
 				const bounded = await improvementService(workspaceFrom(params.workspace, ctx.cwd), signal);
-				let value: ImprovementRunResult | ImprovementStatus | ActiveBudgetPointer;
-				if (params.action === "run") value = await bounded.run();
-				else if (params.action === "rollback") value = await bounded.rollback();
-				else value = await bounded.status();
+				let value: ImprovementRunResult | ImprovementStatus | ActiveBudgetPointer | unknown;
+				if (params.action === "run") {
+					const plan = params.planPath ? JSON.parse(await readFile(path.resolve(ctx.cwd, params.planPath), "utf8")) as CampaignPlan : undefined;
+					value = await bounded.run(plan);
+				} else if (params.action === "rollback") value = await bounded.rollback();
+				else if (params.action === "export") {
+					if (!bounded.exportMethodPackage || !params.versionId || !params.applicability || !params.outputPath) throw new Error("export requires versionId, applicability, and outputPath");
+					value = await bounded.exportMethodPackage(params.versionId, params.applicability, path.resolve(ctx.cwd, params.outputPath));
+				} else if (params.action === "bind") {
+					if (!bounded.bindMethodPackage || !params.packagePath) throw new Error("bind requires packagePath");
+					value = await bounded.bindMethodPackage(path.resolve(ctx.cwd, params.packagePath));
+				} else value = await bounded.status();
 				return result(value);
 			},
 		});
