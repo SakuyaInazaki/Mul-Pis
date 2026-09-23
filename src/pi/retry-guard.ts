@@ -31,7 +31,7 @@ function classifyFailure(message: string): string {
 export function stageFingerprint(request: StageRequest, inputVersion?: unknown): string {
 	let obligation: unknown;
 	switch (request.stage) {
-		case "M04": obligation = { feedbackStage: request.feedbackStage, feedbackRunId: request.feedbackRunId, feedbackFile: request.feedbackFile, freshSession: request.freshSession }; break;
+		case "M04": obligation = { feedbackStage: request.feedbackStage, feedbackRunId: request.feedbackRunId, feedbackCheckpointId: request.feedbackCheckpointId, feedbackFile: request.feedbackFile, freshSession: request.freshSession }; break;
 		case "M05": obligation = { goal: request.goal, noBrowser: request.noBrowser }; break;
 		case "M06": obligation = { sources: request.sources, fullText: request.fullText, requirements: request.requirements }; break;
 		case "M08": obligation = { materials: request.materials, selfChecks: request.selfChecks, reviewers: request.reviewers, unprovidedScopes: request.unprovidedScopes, previousRunId: request.previousRunId, affectedScope: request.affectedScope }; break;

@@ -3,7 +3,7 @@ import type { UsageSummary } from "../runner/types.ts";
 import type { BudgetLease, BudgetLimits, BudgetStatus, PromptReservation } from "./contracts.ts";
 
 type Counts = BudgetStatus["committed"];
-type Node = { lease: BudgetLease; limits: BudgetLimits; started: number; committed: Counts; reservedInput: number; reservedOutput: number; reservedCost: number; unknown: boolean; exceeded: boolean };
+type Node = { lease: BudgetLease; limits: BudgetLimits; started?: number; activeWallMillis: number; clockMode: "continuous" | "active"; committed: Counts; reservedInput: number; reservedOutput: number; reservedCost: number; unknown: boolean; exceeded: boolean };
 type Reservation = PromptReservation & { nodes: Node[]; open: boolean };
 const zero = (): Counts => ({ providerCalls: 0, inputTokens: 0, outputTokens: 0, sdkEstimatedCost: 0, probeCalls: 0, cpuMillis: 0 });
 const nonnegative = (value: number, name: string): void => {
@@ -19,21 +19,44 @@ export class SharedBudget {
 	private readonly nodes = new Map<string, Node>();
 	private readonly reservations = new Map<string, Reservation>();
 	private serial = 0;
+	private phaseSealed = false;
 
 	constructor(rootCampaignId: string, limits: BudgetLimits) {
 		if (!rootCampaignId.trim()) throw new Error("rootCampaignId is required");
 		checkLimits(limits);
 		this.root = { id: `${rootCampaignId}:root`, rootCampaignId };
-		this.nodes.set(this.root.id, { lease: this.root, limits: { ...limits }, started: Date.now(), committed: zero(), reservedInput: 0, reservedOutput: 0, reservedCost: 0, unknown: false, exceeded: false });
+		this.nodes.set(this.root.id, { lease: this.root, limits: { ...limits }, started: Date.now(), activeWallMillis: 0, clockMode: "continuous", committed: zero(), reservedInput: 0, reservedOutput: 0, reservedCost: 0, unknown: false, exceeded: false });
 	}
 
-	createLease(parent: BudgetLease, limits?: BudgetLimits): BudgetLease {
+	createLease(parent: BudgetLease, limits?: BudgetLimits, options?: { clockMode?: "continuous" | "active" }): BudgetLease {
+		if (this.phaseSealed) throw new Error("phase allocation is sealed");
 		const parentNode = this.node(parent);
 		const cap = limits ?? parentNode.limits;
 		checkLimits(cap);
 		const lease: BudgetLease = { id: `${this.root.rootCampaignId}:lease:${++this.serial}`, rootCampaignId: this.root.rootCampaignId, parentLeaseId: parent.id };
-		this.nodes.set(lease.id, { lease, limits: { ...cap }, started: Date.now(), committed: zero(), reservedInput: 0, reservedOutput: 0, reservedCost: 0, unknown: false, exceeded: false });
+		// An allocated branch has its full active-wall allowance until it actually runs.
+		this.nodes.set(lease.id, { lease, limits: { ...cap }, activeWallMillis: 0, clockMode: options?.clockMode ?? "continuous", committed: zero(), reservedInput: 0, reservedOutput: 0, reservedCost: 0, unknown: false, exceeded: false });
 		return lease;
+	}
+
+	/** Prevent direct root spend or unplanned new leases after phase preflight. */
+	sealRootToPhases(): void {
+		if (this.phaseSealed) throw new Error("phase allocation is already sealed");
+		this.phaseSealed = true;
+	}
+
+	/** Start a branch clock explicitly. Merely reading status never starts it. */
+	activateLease(lease: BudgetLease): void {
+		const now = Date.now();
+		for (const n of this.lineage(lease).reverse()) if (n.started === undefined) n.started = now;
+	}
+
+	/** Only an explicitly active-time lease may exclude intervals spent in another phase. */
+	pauseLease(lease: BudgetLease): void {
+		const n = this.node(lease);
+		if (n.clockMode !== "active") throw new Error("only active-time leases may pause");
+		if ([...this.reservations.values()].some((r) => r.open && r.nodes.includes(n))) throw new Error("cannot pause a lease with an in-flight prompt");
+		if (n.started !== undefined) { n.activeWallMillis += Date.now() - n.started; n.started = undefined; }
 	}
 
 	private node(lease: BudgetLease): Node {
@@ -61,13 +84,15 @@ export class SharedBudget {
 				sdkEstimatedCost: Math.max(0, l.maxSdkEstimatedCost - c.sdkEstimatedCost - n.reservedCost),
 				probeCalls: Math.max(0, l.maxProbeCalls - c.probeCalls),
 				cpuMillis: Math.max(0, l.maxCpuMillis - c.cpuMillis),
-				wallMillis: Math.max(0, l.maxWallMillis - (Date.now() - n.started)),
+				wallMillis: Math.max(0, l.maxWallMillis - n.activeWallMillis - (n.started === undefined ? 0 : Date.now() - n.started)),
 			},
 			settlement: n.exceeded ? "exceeded" : n.unknown || [...this.reservations.values()].some((r) => r.open && r.nodes.includes(n)) ? "pending-or-unknown" : "settled",
 		};
 	}
 
 	reservePrompt(lease: BudgetLease, request: { maxInputTokens: number; maxOutputTokens: number; maxSdkEstimatedCost: number }): PromptReservation {
+		if (this.phaseSealed && lease.id === this.root.id) throw new Error("direct root spend is forbidden after phase allocation");
+		this.activateLease(lease);
 		nonnegative(request.maxInputTokens, "maxInputTokens");
 		nonnegative(request.maxOutputTokens, "maxOutputTokens");
 		nonnegative(request.maxSdkEstimatedCost, "maxSdkEstimatedCost");
@@ -111,6 +136,8 @@ export class SharedBudget {
 
 	/** Probe is charged before CPU work; a failed probe does not restore quota. */
 	reserveProbe(lease: BudgetLease): void {
+		if (this.phaseSealed && lease.id === this.root.id) throw new Error("direct root probe is forbidden after phase allocation");
+		this.activateLease(lease);
 		for (const n of this.lineage(lease)) {
 			const s = this.status(n.lease);
 			if (s.settlement !== "settled" || s.remaining.probeCalls < 1 || s.remaining.wallMillis <= 0 || s.remaining.cpuMillis <= 0) throw new Error("probe budget exhausted");
@@ -119,6 +146,8 @@ export class SharedBudget {
 	}
 
 	debitCpuMillis(lease: BudgetLease, millis: number): void {
+		if (this.phaseSealed && lease.id === this.root.id) throw new Error("direct root CPU spend is forbidden after phase allocation");
+		this.activateLease(lease);
 		nonnegative(millis, "cpuMillis");
 		for (const n of this.lineage(lease)) {
 			n.committed.cpuMillis += millis;

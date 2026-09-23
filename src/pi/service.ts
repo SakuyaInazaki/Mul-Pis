@@ -3,7 +3,7 @@ import { realpath } from "node:fs/promises";
 import path from "node:path";
 import { createFileKnowledgeStore } from "../knowledge/store.ts";
 import { createM07Controller } from "../m07/controller.ts";
-import type { BeginGoalInput, DecisionInput, FinishInput, InterruptInput, TaskReviewInput, TaskSpecInput } from "../m07/types.ts";
+import type { BeginGoalInput, DecisionInput, FinishInput, HostStopReasonKind, InterruptInput, TaskReviewInput, TaskSpecInput } from "../m07/types.ts";
 import { createPiSessionRunner } from "../runner/pi.ts";
 import type { SessionHandle, SessionRunner, SessionSpec } from "../runner/types.ts";
 import { runInit } from "../stages/init.ts";
@@ -49,6 +49,7 @@ export interface StageRequest {
 	m02RunId?: string;
 	feedbackStage?: "M03" | "M06" | "M07" | "M08";
 	feedbackRunId?: string;
+	feedbackCheckpointId?: string;
 	feedbackFile?: string;
 	feedbackLabel?: string;
 	freshSession?: boolean;
@@ -274,8 +275,11 @@ export class ResearchService {
 					break;
 				}
 				case "M04": {
+					if (request.feedbackCheckpointId !== undefined && (!request.feedbackCheckpointId || request.feedbackFile || request.feedbackStage !== "M07" || !request.feedbackRunId)) throw new HarnessError("m04.checkpoint", "feedbackCheckpointId 仅可与 M07 feedbackRunId 成对使用");
 					const feedback = request.feedbackFile
 						? { kind: "file" as const, label: request.feedbackLabel ?? path.basename(request.feedbackFile), path: path.resolve(root, request.feedbackFile) }
+						: request.feedbackCheckpointId !== undefined
+							? { kind: "M07Checkpoint" as const, runId: request.feedbackRunId!, checkpointId: request.feedbackCheckpointId }
 						: request.feedbackStage
 							? { kind: request.feedbackStage, runId: request.feedbackRunId }
 							: undefined;
@@ -335,8 +339,12 @@ export class ResearchService {
 		for (const active of [...this.activeStageOperations.values()]) await this.interruptOwned(active, reason);
 		if (includeActiveGoals === false) return;
 		const goals = [...this.activeGoalRuns.values()];
-		this.activeGoalRuns.clear();
-		for (const active of goals) await this.interruptOwnedGoals(active, reason);
+		let firstError: unknown;
+		for (const active of goals) {
+			try { await this.interruptOwnedGoals(active, reason); }
+			catch (error) { firstError ??= error; }
+		}
+		if (firstError) throw firstError;
 	}
 
 	private async interruptOwned(active: { root: string; runs: Array<{ stage: string; runId: string }> }, reason: string): Promise<void> {
@@ -358,6 +366,7 @@ export class ResearchService {
         for (const runId of active.runIds) {
             try {
                 await controller.interrupt(runId, { reason, returnPath: "user" });
+                await this.forgetActiveGoal(active.root, runId);
                 try {
                     const archived = await ws.readRun("M07", runId);
                     const failure = "运行中断（host-shutdown）：" + reason;
@@ -371,19 +380,11 @@ export class ResearchService {
 
             } catch (error) {
                 firstError ??= error;
-                try {
-                    const run = await ws.readRun("M07", runId);
-                    if (run.status !== "running") continue;
-                    run.failures.push("运行中断（host-shutdown）：" + reason);
-                    run.remarks.push("M07 目标受控归档失败；仅将 run 标记为 failed，未自动重跑或假称完成。");
-                    await ws.finishRun(run, "failed");
-                    await ws.writeNote(run, "M07 目标受控归档失败；run 标记为 failed，未自动重跑。");
-                } catch {
-                    // Best-effort fallback only; keep the original archival error.
-                }
+                // Never close only the run: that would leave an active goal paired with a failed run.
+                // Keep this exact goal registered so a repair can inspect both persisted records.
             }
         }
-        if (firstError) console.error("[research] M07 受控中断归档失败：" + (firstError instanceof Error ? firstError.message : String(firstError)));
+        if (firstError) throw new HarnessError("m07.archive-repair-required", `M07 受控归档未完成；检查 goal.json 与 run.json 并修复后再继续：${firstError instanceof Error ? firstError.message : String(firstError)}`);
     }
 
     private async rememberActiveGoal(root: string, runId: string): Promise<void> {
@@ -411,23 +412,35 @@ export class ResearchService {
 		return createM07Controller({ ws, store, runner: unavailable, config: { roles: {}, concurrency: 1, tools: {} } }).status(runId);
 	}
 
-	async goalAction(action: "begin" | "plan" | "decision" | "finish" | "interrupt", requested: string | undefined, input: BeginGoalInput | { runId: string; plan: string; refreshBaseline?: boolean } | ({ runId: string } & DecisionInput) | ({ runId: string } & FinishInput) | ({ runId: string } & InterruptInput), signal?: AbortSignal): Promise<unknown> {
+	async goalAction(action: "begin" | "plan" | "checkpoint" | "decision" | "finish" | "interrupt", requested: string | undefined, input: BeginGoalInput | { runId: string; plan: string; refreshBaseline?: boolean; checkpointId?: string; m04RunId?: string } | { runId: string; taskIds?: string[] } | ({ runId: string } & DecisionInput) | ({ runId: string } & FinishInput) | ({ runId: string } & InterruptInput), signal?: AbortSignal, authority?: { executionContract: "continuous" }): Promise<unknown> {
 		const root = this.resolveWorkspace(requested);
 		return this.withMutation(root, async () => {
 			const ctx = await this.nonModelContext(root);
 			const controller = createM07Controller(ctx);
 			if (action === "begin") {
-				const value = await controller.begin(input as BeginGoalInput);
+				const value = await controller.begin(input as BeginGoalInput, authority);
 				const runId = (value as { runId?: unknown } | undefined)?.runId;
 				if (typeof runId === "string" && runId) await this.rememberActiveGoal(root, runId);
 				return value;
 			}
-			if (action === "plan") { const value = input as { runId: string; plan: string; refreshBaseline?: boolean }; const result = await controller.plan(value.runId, value.plan, { refreshBaseline: value.refreshBaseline }); await this.rememberActiveGoal(root, value.runId); return result; }
+			if (action === "plan") { const value = input as { runId: string; plan: string; refreshBaseline?: boolean; checkpointId?: string; m04RunId?: string }; const result = await controller.plan(value.runId, value.plan, { refreshBaseline: value.refreshBaseline, checkpointId: value.checkpointId, m04RunId: value.m04RunId }); await this.rememberActiveGoal(root, value.runId); return result; }
+			if (action === "checkpoint") { const value = input as { runId: string; taskIds?: string[] }; const result = await controller.checkpoint(value.runId, { taskIds: value.taskIds }); await this.rememberActiveGoal(root, value.runId); return result; }
 			if (action === "decision") { const { runId, ...value } = input as { runId: string } & DecisionInput; const result = await controller.decision(runId, value); await this.rememberActiveGoal(root, runId); return result; }
 			if (action === "interrupt") { const { runId, ...value } = input as { runId: string } & InterruptInput; const result = await controller.interrupt(runId, value); await this.forgetActiveGoal(root, runId); return result; }
 			const { runId, ...value } = input as { runId: string } & FinishInput;
 			const result = await controller.finish(runId, value);
 			await this.forgetActiveGoal(root, runId);
+			return result;
+		});
+	}
+
+	/** Host-owned lifecycle stop. This is not registered as a model tool. */
+	async hostInterrupt(input: { workspace: string; runId: string; reasonKind: HostStopReasonKind; sourceEventId?: string }): Promise<unknown> {
+		const root = this.resolveWorkspace(input.workspace);
+		return this.withMutation(root, async () => {
+			const controller = createM07Controller(await this.nonModelContext(root));
+			const result = await controller.hostInterrupt(input.runId, { reasonKind: input.reasonKind, sourceEventId: input.sourceEventId });
+			await this.forgetActiveGoal(root, input.runId);
 			return result;
 		});
 	}

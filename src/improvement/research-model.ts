@@ -10,14 +10,14 @@ export interface BoundedModelStep {
 }
 export async function runBoundedModelStep(args: {
  runner: SessionRunner; budget: SharedBudget; lease: BudgetLease; spec: Omit<SessionSpec, "tools" | "strictRequest">;
- message: string; timeoutMs: number; maxOutputTokens: number;
+ message: string; timeoutMs: number; maxOutputTokens: number; maxInputTokens?: number;
 }): Promise<BoundedModelStep> {
  const { runner, budget, lease } = args;
  const before = budget.status(lease);
- const maxOutputTokens = Math.min(args.maxOutputTokens, before.remaining.outputTokens);
+ const maxOutputTokens = args.maxOutputTokens;
  if (!Number.isSafeInteger(args.maxOutputTokens) || args.maxOutputTokens < 1) throw new HarnessError("improvement.budget", "explicit per-prompt output limit is required");
  const payloadBytes = Buffer.byteLength(args.spec.systemPrompt, "utf8") + Buffer.byteLength(args.message, "utf8") + 8_192;
- if (args.message.length > 40_000 || args.spec.systemPrompt.length > 8_000 || payloadBytes > before.remaining.inputTokens || maxOutputTokens <= 0) throw new HarnessError("improvement.budget", "bounded model input/output budget exhausted before request");
+ if (args.message.length > 40_000 || args.spec.systemPrompt.length > 8_000 || payloadBytes > before.remaining.inputTokens || maxOutputTokens > before.remaining.outputTokens || (args.maxInputTokens !== undefined && payloadBytes > args.maxInputTokens)) throw new HarnessError("improvement.budget", "bounded model input/output budget exhausted before request");
  const priceLookup = runner as SessionRunner & { estimateMaxSdkCost?: (model: string, caps: { maxInputTokens: number; maxOutputTokens: number }) => Promise<number | undefined> };
  const priced = await priceLookup.estimateMaxSdkCost?.(args.spec.model, { maxInputTokens: payloadBytes, maxOutputTokens });
  const maxSdkEstimatedCost = priced === undefined ? undefined : Math.ceil(priced * 1_000_000_000) / 1_000_000_000;

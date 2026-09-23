@@ -10,10 +10,18 @@ import { HarnessError } from "../types.ts";
 import { nowIso, readTextIfExists, writeFileAtomic } from "../workspace.ts";
 
 export interface ImproverStrategyV1 { version: 1; kind: "diagnostic-improver-prompt"; body: string }
-export type ResearchStrategy = ExecutorStrategyV1 | ImproverStrategyV1;
+/** A workflow method is a separate H capability, never a CPU-case strategy. */
+export interface M07WorkflowStrategyV1 { version: 1; kind: "m07-workflow-prompt"; slot: "research-check" | "evidence-handoff"; body: string }
+export type ResearchStrategy = ExecutorStrategyV1 | M07WorkflowStrategyV1 | ImproverStrategyV1;
+export function isCpuExecutorStrategy(value: ResearchStrategy): value is ExecutorStrategyV1 { return value.kind === "cpu-numerical-prompt"; }
+export function isM07WorkflowStrategy(value: ResearchStrategy): value is M07WorkflowStrategyV1 { return value.kind === "m07-workflow-prompt"; }
 export type StrategyKind = "executor" | "improver";
 export type StrategyOrigin = "human-seed" | "agent-generated" | "external-manual-unverified";
 export interface ExperienceRequirementV1 { targetKind: StrategyKind; ref: KnowledgeRef }
+export interface DependencyTransitionV1 {
+ version: 1; decisionRef: KnowledgeRef; removedRefs: KnowledgeRef[]; addedRefs: KnowledgeRef[];
+ evidenceRefs: KnowledgeRef[]; revalidationRef: KnowledgeRef; at: string;
+}
 export interface StrategyRecordV1 {
  version: 1; versionId: string; kind: StrategyKind; artifact: ResearchStrategy;
  parentVersionId?: string; origin: StrategyOrigin; createdAt: string;
@@ -22,6 +30,10 @@ export interface StrategyRecordV1 {
  sourceExperienceRefs: ExperienceRequirementV1[];
  /** Conservative inherited live-stop obligations; a candidate cannot self-delete them. */
  requiredExperienceRefs: ExperienceRequirementV1[];
+ /** Pinned scientific premises, distinct from consulted method experience. */
+ requiredKnowledgeRefs: KnowledgeRef[];
+ /** Immutable provenance for an explicit controller-checked dependency transition. */
+ dependencyTransition?: DependencyTransitionV1;
  /** A candidate can be exercised for research without becoming active. */
  state: "research-only" | "admitted" | "manual-active";
 }
@@ -33,7 +45,7 @@ export interface GenerationBundleV1 {
 }
 export interface ActiveGenerationPointerV1 {
  version: 1; bundleId: string; previousBundleId?: string; previousProvenance?: ActiveGenerationPointerV1["provenance"]; activatedAt: string;
- provenance: "local-executor-admission" | "local-meta-admission" | "human-seed" | "external-manual-unverified";
+ provenance: "local-executor-admission" | "local-meta-admission" | "human-seed" | "external-manual-unverified" | "knowledge-epoch-advance" | "method-dependency-transition";
  runId: string;
 }
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -58,18 +70,28 @@ export function validateExperienceRequirements(value: unknown, field: string): E
 export function validateStrategy(kind: StrategyKind, input: unknown): ResearchStrategy {
  if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.strategy", "strategy must be an object");
  const value = input as Record<string, unknown>;
- if (Object.keys(value).some((key) => !["version", "kind", "body"].includes(key)) || value.version !== 1 || value.kind !== (kind === "executor" ? "cpu-numerical-prompt" : "diagnostic-improver-prompt")) throw new HarnessError("improvement.strategy", "unsupported strategy schema");
+ if (value.version !== 1) throw new HarnessError("improvement.strategy", "unsupported strategy schema");
+ if (kind === "executor" && value.kind === "m07-workflow-prompt") {
+  if (Object.keys(value).some((key) => !["version", "kind", "slot", "body"].includes(key)) || !["research-check", "evidence-handoff"].includes(String(value.slot))) throw new HarnessError("improvement.strategy", "invalid M07 workflow method slot");
+  return { version: 1, kind: "m07-workflow-prompt", slot: value.slot, body: boundedBody(value.body, "body") } as M07WorkflowStrategyV1;
+ }
+ if (Object.keys(value).some((key) => !["version", "kind", "body"].includes(key)) || value.kind !== (kind === "executor" ? "cpu-numerical-prompt" : "diagnostic-improver-prompt")) throw new HarnessError("improvement.strategy", "unsupported strategy schema");
  return { version: 1, kind: value.kind, body: boundedBody(value.body, "body") } as ResearchStrategy;
 }
 export function validateStrategyRecord(input: unknown): StrategyRecordV1 {
  if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.generation", "strategy record must be an object");
  const item = input as Record<string, unknown>;
- if (Object.keys(item).some((key) => !["version", "versionId", "kind", "artifact", "parentVersionId", "origin", "createdAt", "applicability", "limitations", "sourceExperienceRefs", "requiredExperienceRefs", "state"].includes(key)) || item.version !== 1 || !["executor", "improver"].includes(String(item.kind)) || !["human-seed", "agent-generated", "external-manual-unverified"].includes(String(item.origin)) || !["research-only", "admitted", "manual-active"].includes(String(item.state)) || typeof item.createdAt !== "string") throw new HarnessError("improvement.generation", "invalid strategy record");
+ if (Object.keys(item).some((key) => !["version", "versionId", "kind", "artifact", "parentVersionId", "origin", "createdAt", "applicability", "limitations", "sourceExperienceRefs", "requiredExperienceRefs", "requiredKnowledgeRefs", "dependencyTransition", "state"].includes(key)) || item.version !== 1 || !["executor", "improver"].includes(String(item.kind)) || !["human-seed", "agent-generated", "external-manual-unverified"].includes(String(item.origin)) || !["research-only", "admitted", "manual-active"].includes(String(item.state)) || typeof item.createdAt !== "string") throw new HarnessError("improvement.generation", "invalid strategy record");
  safeId(item.versionId, "versionId"); if (item.parentVersionId !== undefined) safeId(item.parentVersionId, "parentVersionId");
  const sourceExperienceRefs = validateExperienceRequirements(item.sourceExperienceRefs ?? [], "sourceExperienceRefs");
  const requiredExperienceRefs = validateExperienceRequirements(item.requiredExperienceRefs ?? [], "requiredExperienceRefs");
- if (sourceExperienceRefs.some((item) => !requiredExperienceRefs.some((required) => JSON.stringify(required) === JSON.stringify(item)))) throw new HarnessError("improvement.generation", "loaded source experience cannot be omitted from live-stop requirements");
- return { ...item, artifact: validateStrategy(item.kind as StrategyKind, item.artifact), applicability: boundedStrings(item.applicability, "applicability"), limitations: boundedStrings(item.limitations, "limitations"), sourceExperienceRefs, requiredExperienceRefs } as StrategyRecordV1;
+ const requiredKnowledgeRefs = item.requiredKnowledgeRefs ?? [];
+ if (!Array.isArray(requiredKnowledgeRefs) || requiredKnowledgeRefs.length > 100 || !requiredKnowledgeRefs.every(isKnowledgeRef) || new Set(requiredKnowledgeRefs.map((ref) => `${ref.storeId}/${ref.recordId}@${ref.version}`)).size !== requiredKnowledgeRefs.length) throw new HarnessError("improvement.generation", "requiredKnowledgeRefs must be bounded distinct pinned references");
+ if (item.dependencyTransition !== undefined) {
+  const transition = item.dependencyTransition as Record<string, unknown>;
+  if (!transition || typeof transition !== "object" || Array.isArray(transition) || Object.keys(transition).some((key) => !["version", "decisionRef", "removedRefs", "addedRefs", "evidenceRefs", "revalidationRef", "at"].includes(key)) || transition.version !== 1 || !isKnowledgeRef(transition.decisionRef) || !isKnowledgeRef(transition.revalidationRef) || typeof transition.at !== "string" || !Array.isArray(transition.removedRefs) || !Array.isArray(transition.addedRefs) || !Array.isArray(transition.evidenceRefs) || transition.removedRefs.length + transition.addedRefs.length > 100 || transition.evidenceRefs.length < 1 || transition.evidenceRefs.length > 20 || ![...transition.removedRefs, ...transition.addedRefs, ...transition.evidenceRefs].every(isKnowledgeRef)) throw new HarnessError("improvement.generation", "invalid method dependency transition provenance");
+ }
+ return { ...item, artifact: validateStrategy(item.kind as StrategyKind, item.artifact), applicability: boundedStrings(item.applicability, "applicability"), limitations: boundedStrings(item.limitations, "limitations"), sourceExperienceRefs, requiredExperienceRefs, requiredKnowledgeRefs } as StrategyRecordV1;
 }
 export function validateGenerationBundle(input: unknown): GenerationBundleV1 {
  if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.generation", "bundle must be an object");
@@ -84,7 +106,7 @@ export function validateGenerationBundle(input: unknown): GenerationBundleV1 {
 export function validateActiveGenerationPointer(input: unknown): ActiveGenerationPointerV1 {
  if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.generation", "invalid active generation pointer");
  const item = input as Record<string, unknown>;
- if (item.version !== 1 || typeof item.activatedAt !== "string" || typeof item.runId !== "string" || !["local-executor-admission", "local-meta-admission", "human-seed", "external-manual-unverified"].includes(String(item.provenance)) || (item.previousProvenance !== undefined && !["local-executor-admission", "local-meta-admission", "human-seed", "external-manual-unverified"].includes(String(item.previousProvenance)))) throw new HarnessError("improvement.generation", "invalid active generation pointer");
+ if (item.version !== 1 || typeof item.activatedAt !== "string" || typeof item.runId !== "string" || !["local-executor-admission", "local-meta-admission", "human-seed", "external-manual-unverified", "knowledge-epoch-advance", "method-dependency-transition"].includes(String(item.provenance)) || (item.previousProvenance !== undefined && !["local-executor-admission", "local-meta-admission", "human-seed", "external-manual-unverified", "knowledge-epoch-advance", "method-dependency-transition"].includes(String(item.previousProvenance)))) throw new HarnessError("improvement.generation", "invalid active generation pointer");
  safeId(item.bundleId, "bundleId"); if (item.previousBundleId !== undefined) safeId(item.previousBundleId, "previousBundleId");
  return item as unknown as ActiveGenerationPointerV1;
 }
@@ -96,7 +118,7 @@ export class GenerationStore {
  private bundlePath(id: string): string { return path.join(this.root, "bundles", `${safeId(id, "bundleId")}.json`); }
  private pointerPath(): string { return path.join(this.root, "active.json"); }
  newId(prefix: string): string { return `${prefix}-${new Date().toISOString().replace(/[-:.]/g, "")}-${randomBytes(3).toString("hex")}`; }
- async writeStrategy(input: Omit<StrategyRecordV1, "version" | "createdAt" | "sourceExperienceRefs" | "requiredExperienceRefs"> & Partial<Pick<StrategyRecordV1, "sourceExperienceRefs" | "requiredExperienceRefs">>): Promise<StrategyRecordV1> {
+ async writeStrategy(input: Omit<StrategyRecordV1, "version" | "createdAt" | "sourceExperienceRefs" | "requiredExperienceRefs" | "requiredKnowledgeRefs" | "dependencyTransition"> & Partial<Pick<StrategyRecordV1, "sourceExperienceRefs" | "requiredExperienceRefs" | "requiredKnowledgeRefs" | "dependencyTransition">>): Promise<StrategyRecordV1> {
   const record = validateStrategyRecord({ version: 1, createdAt: nowIso(), ...input });
   const file = this.strategyPath(record.versionId);
   if (existsSync(file)) throw new HarnessError("improvement.generation", "strategy version already exists");

@@ -1,5 +1,5 @@
 /** Scientific method episodes and a separate quality protocol; no mechanism-cost gate is reused. */
-import type { BudgetLease, DevelopmentEnvironment, DevelopmentFeedback, ExecutorStrategyV1, ExperimentStart, ProtectedEvaluator, PublicTask, ScientificAction } from "../experiments/contracts.ts";
+import { isScientificActionId, MAX_EXECUTOR_EPISODE_ACTIONS, type BudgetLease, type DevelopmentEnvironment, type DevelopmentFeedback, type ExecutorStrategyV1, type ExperimentStart, type ProtectedEvaluator, type PublicTask, type ScientificAction } from "../experiments/contracts.ts";
 import { SharedBudget } from "../experiments/budget.ts";
 import type { CpuCaseSetV1 } from "../experiments/local-environment.ts";
 import { createCpuResponseEnvironment } from "../experiments/local-environment.ts";
@@ -30,7 +30,7 @@ function parseAction(text: string, task: PublicTask): ScientificAction {
  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new HarnessError("improvement.executor-action", "executor action must be an object");
  const value = raw as Record<string, unknown>;
  const actionId = value.actionId;
- if (typeof actionId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(actionId)) throw new HarnessError("improvement.executor-action", "invalid actionId");
+	 if (!isScientificActionId(actionId)) throw new HarnessError("improvement.executor-action", "invalid actionId");
  if (value.kind === "probe" && Object.keys(value).every((key) => ["kind", "actionId", "x"].includes(key)) && typeof value.x === "number" && task.allowedProbeX.includes(value.x)) return { kind: "probe", actionId, x: value.x };
  if (value.kind === "submit" && Object.keys(value).every((key) => ["kind", "actionId", "hypothesisId", "explanation"].includes(key)) && typeof value.hypothesisId === "string" && task.hypotheses.some((h) => h.id === value.hypothesisId) && (value.explanation === undefined || typeof value.explanation === "string" && value.explanation.length <= 500)) return { kind: "submit", actionId, hypothesisId: value.hypothesisId, ...(value.explanation ? { explanation: value.explanation as string } : {}) };
  if (value.kind === "stop" && Object.keys(value).every((key) => ["kind", "actionId", "reason"].includes(key)) && typeof value.reason === "string" && value.reason.trim() && value.reason.length <= 500) return { kind: "stop", actionId, reason: value.reason };
@@ -43,7 +43,7 @@ export function executorSystemPrompt(method: ExecutorStrategyV1): string {
 export async function runExecutorEpisode(args: {
  development: DevelopmentEnvironment; start: ExperimentStart; method: ExecutorStrategyV1; methodVersionId: string;
  runner: SessionRunner; model: string; persistDir: string; budget: SharedBudget; lease: BudgetLease; timeoutMs: number;
- maxOutputTokens: number;
+ maxOutputTokens: number; maxInputTokens?: number;
  beforeModelRequest?: () => Promise<void>;
  maxActions?: number;
 }): Promise<ExecutorEpisodeResult> {
@@ -51,12 +51,12 @@ export async function runExecutorEpisode(args: {
  const result: ExecutorEpisodeResult = { caseId: task.caseId, startId: args.start.id, methodVersionId: args.methodVersionId, status: "inconclusive", feedback: [], sessionIds: [], usageSidecars: [], modelCalls: 0, usedProbeXs: [] };
  const initialCalls = args.budget.status(args.lease).committed.providerCalls;
  const seenActions = new Map<string, string>();
- const maxActions = Math.min(args.maxActions ?? 3, task.maxProbeCalls + 2, 8);
+	 const maxActions = Math.min(args.maxActions ?? MAX_EXECUTOR_EPISODE_ACTIONS, task.maxProbeCalls + 2, 8);
  try {
   for (let index = 0; index < maxActions; index++) {
    const message = JSON.stringify({ task, visibleFeedback: result.feedback, actionIndex: index, instruction: "Return one allowed JSON action." });
    await args.beforeModelRequest?.();
-   const step = await runBoundedModelStep({ runner: args.runner, budget: args.budget, lease: args.lease, spec: { label: `H-${args.methodVersionId}-${task.caseId}-${index}`, role: "research", model: args.model, systemPrompt: executorSystemPrompt(args.method), persistDir: args.persistDir, methodBinding: { versionId: args.methodVersionId } }, message, timeoutMs: args.timeoutMs, maxOutputTokens: args.maxOutputTokens });
+   const step = await runBoundedModelStep({ runner: args.runner, budget: args.budget, lease: args.lease, spec: { label: `H-${args.methodVersionId}-${task.caseId}-${index}`, role: "research", model: args.model, systemPrompt: executorSystemPrompt(args.method), persistDir: args.persistDir, methodBinding: { versionId: args.methodVersionId } }, message, timeoutMs: args.timeoutMs, maxOutputTokens: args.maxOutputTokens, maxInputTokens: args.maxInputTokens });
    result.sessionIds.push(step.sessionId); if (step.usageSidecar) result.usageSidecars.push(step.usageSidecar);
    const action = parseAction(step.text, task);
    const earlier = seenActions.get(action.actionId), canonical = JSON.stringify(action);
@@ -81,7 +81,7 @@ export async function runExecutorQualityAdmission(args: {
  caseSet: CpuCaseSetV1; baseline: { versionId: string; artifact: ExecutorStrategyV1 }; candidate: { versionId: string; artifact: ExecutorStrategyV1 };
  runner: SessionRunner; model: string; persistDir: string; budget: SharedBudget; lease: BudgetLease;
  timeoutMs: number; repetitions: number;
- maxOutputTokens: number;
+ maxOutputTokens: number; maxInputTokens?: number; comparisonMode?: "gain" | "noninferiority";
  beforeModelRequest?: (versionId: string) => Promise<void>;
  persistObservation: (record: { start: ExperimentStart; action: ScientificAction; feedback: DevelopmentFeedback }) => Promise<{ storeId: string; id: string; version: string }>;
 }): Promise<ExecutorQualityResult> {
@@ -97,13 +97,13 @@ export async function runExecutorQualityAdmission(args: {
    for (const arm of arms) {
     const start = await env.development.fork(initial);
     const selected = arm === "baseline" ? args.baseline : args.candidate;
-    const episode = await runExecutorEpisode({ development: env.development, start, method: selected.artifact, methodVersionId: selected.versionId, runner: args.runner, model: args.model, persistDir: args.persistDir, budget: args.budget, lease: args.lease, timeoutMs: args.timeoutMs, maxOutputTokens: args.maxOutputTokens,
+    const episode = await runExecutorEpisode({ development: env.development, start, method: selected.artifact, methodVersionId: selected.versionId, runner: args.runner, model: args.model, persistDir: args.persistDir, budget: args.budget, lease: args.lease, timeoutMs: args.timeoutMs, maxOutputTokens: args.maxOutputTokens, maxInputTokens: args.maxInputTokens,
      beforeModelRequest: args.beforeModelRequest ? () => args.beforeModelRequest!(selected.versionId) : undefined });
     if (episode.feedback.some((f) => f.evidence.length === 0)) { result.reason = "decisive environment feedback was not persisted"; return result; }
     let protectedStatus: QualityArmResult["protectedStatus"] = "inconclusive";
     if (episode.status === "submitted" && episode.selectedHypothesisId) protectedStatus = (await env.protectedEvaluator.evaluate(start, episode.selectedHypothesisId)).status;
     else if (episode.status === "stopped") {
-     const stop = await env.protectedEvaluator.evaluateStop(start);
+	     const stop = await env.protectedEvaluator.evaluateStop(start, args.lease);
      protectedStatus = stop.status === "premature-stop" ? "rejected" : stop.status === "justified-unknown" ? "justified-unknown" : "inconclusive";
     }
     result.results.push({ caseId: c.id, repeatIndex, order, arm, episode, protectedStatus }); result.queryCount++;
@@ -123,6 +123,7 @@ export async function runExecutorQualityAdmission(args: {
  if (result.results.some((r) => r.arm === "candidate" && !["accepted", "justified-unknown"].includes(r.protectedStatus))) { result.status = "inconclusive"; result.reason = "candidate did not meet all registered scientific hard checks"; return result; }
  const baselineScore = result.results.filter((r) => r.arm === "baseline").reduce((n, r) => n + score(r.protectedStatus), 0);
  const candidateScore = result.results.filter((r) => r.arm === "candidate").reduce((n, r) => n + score(r.protectedStatus), 0);
+ if (args.comparisonMode === "noninferiority") { result.status = "accepted"; result.reason = "candidate met registered quality noninferiority and scientific hard checks"; return result; }
  const solvedGain = pairs.some((p) => p.find((r) => r.arm === "candidate")!.protectedStatus === "accepted" && p.find((r) => r.arm === "baseline")!.protectedStatus !== "accepted");
  if (candidateScore <= baselineScore || !solvedGain) { result.status = "rejected"; result.reason = "candidate showed no full solved-case gain under the registered partial-unknown rule"; return result; }
  result.status = "accepted"; result.reason = "candidate repaired registered failures without regression under the caller resource cap"; return result;

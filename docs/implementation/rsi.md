@@ -8,6 +8,10 @@ M07 在真实 `taskMessage` 与 `writeFeedback` 投影时，按调用边界及�
 
 投影筛选器只用可重放事件的 UTF-16 长度，按每次调用的原材料顺序重算当前策略与候选策略；不会拿 M01–M09 阶段 `inputs` 的文件字节数冒充 M07 子任务输入。它可排除无观测机会或不满足固定硬门槛的候选，但减少初始内联量不等于科研质量不降，也不能单独授权晋级。反馈包写盘与 M04 组装反馈消息分别记录；材料被保存、工具实际返回某范围、模型使用该范围、独立检查确认使用正确，是四个不同事实。M04 的 `m07_evidence_read` 记录实际返回行范围和截断状态，即使后续模型调用失败也保留已返回范围；文件名访问不证明已读全文，更不证明语义正确。
 
+M07 普通 `finish` 仍先执行原目标的成功标准、已接受证据、未决事项与有效任务硬检查。若长工具日志等控制事实使完整反馈超过该目标冻结的 `maxFeedbackChars`，控制器可写入不超过同一上限的 `indexed` 反馈，保留完整 `goal.json` 和固定证据；索引明示省略类别与原记录位置，不把截断片段冒充完整内容。`complete` 表示完整反馈写盘，`indexed` 表示仅有界索引；受控中断失败时的 `control-facts-only` 只含归档控制事实，`failed` 表示反馈交接需修复。M04 可用 `m07_evidence_read` 对同一 M07 run 的 `goal.json` 和证据按页实际读取；索引存在、路径可访问和 `fulfilled` 硬门通过，均不证明 M04 已读全或认可科学结论。归档写入异常会保留显式修复状态，不能把 goal/run 终态不一致视为正常完成。
+
+主 Pi 的非交互持续执行只在显式设置 continuation 工作区与目标绑定时启用。已绑定目标仍为 active 且模型正常结束一回合时，extension 在 Pi 的 `agent_end` 队列中续接同一会话；普通 final/checkpoint 不等于目标完成。新 `begin` 只在指定工作区成功后绑定其实际 runId，未启用的只读会话不自动拾取旧 active goal。只有持久 M07 结果为 `fulfilled` 才停止正常续接；明确用户中止、provider 错误和重复无进展会停止续接并如实留下未完成/归档原因，防止热循环。此能力不自动重放进程崩溃后的阶段或子任务，不能代替模型或平台调用的外部资源预算。
+
 改进器会收到先前尝试的假设、参数、失败类别与门槛结果摘要，并在本轮纳入已完成尝试；同一轮候选去重，跨轮也只在冻结基线、模型配置、投影观测与案例集相同的实验义务下阻止重复策略。没有可重放投影机会，或预算内没有通过准入的候选，均可正常结束为无晋级结果，不暗示研究失败或有效改进。
 
 自动晋级还需要调用方提供 `split: "admission"` 的私有机制案例集及实验预算。控制器在提议前固定案例集，不把检查器答案送进 improver 或受测会话；每个案例、每次重复、每个策略臂都新建无工具的独立研究会话，从投影变化点重新求解，延后读取只从该次固定案例文本取回。准入至少要求两次偶数重复，基线/候选先后顺序交替；全部预设硬检查通过、每一配对中候选估计成本不增加，且总体严格降低，才允许原子晋级。混合增损、超时、失败、provider usage 不完整、超预算或案例未跑完均不能晋级。`development` 案例仅供开发观察，不能授权自动晋级。此实验只验证局部“投影—按需读回”机制，不能称整套 M01–M09 科研任务已成对重跑。
@@ -57,13 +61,17 @@ campaign 的预算和账目只覆盖它启动的提议、两臂及读回调用�
 
 科研方法 campaign 另用调用方显式给出的根预算约束它启动的 I/H/meta 子请求：provider 调用、完整输入 token、输出 token、SDK 估计费用、探针、CPU 和壁钟；分支预算从同一根账扣除。缓存读写计入输入，推理输出已包含在 provider 的 output 口径，不重复加计；缺失 usage 或价格、超额和未结算调用均不能用于自动晋级。若由 extension 调用，主 Pi 编排会话另有 best-effort 主账，却不经同一根预算预约；CLI 没有主 Pi 会话。两者都不计 Codex 人工开发，也不是完整 workflow 或 provider 账单。`development` 仅供形成假设和观察结果。独立 `admission` 需要完整案例、交替顺序的重复双臂、受保护质量检查和冻结选择；H 质量与 I 产生后继 H 的能力分别评价，不能把一次碰巧作答或成本下降写成科研收益。证据仍不足时合理停止并明确报告未定，是应记录的部分质量，不等于错误答案，也不满足完整解题门槛。没有准入材料时运行保持 research-only。
 
-经验仍存于原 C/K/E/J/Q/D/X 知识库，M04 是现有提案、判断与合入路径；实验反馈不能直接升格为 adopted 或 verified。每个知识库懒初始化稳定 `storeId`，跨库引用须显式注册并固定 `{storeId, recordId, version}`。调用方显式指定目标与有限条经验；选择器检查声明的适用阶段、标签、情境与必要依赖闭包，以及每条记录当前的限制，超界或缺失即不给完整经验包。撤回、停用和传递依赖会阻止新的使用，历史记录仍可只读追溯；反例与替换史引用不自动当作必要前提。H/I 版本记录分别保存当次装载的 `sourceExperienceRefs` 和跨代继承的 `requiredExperienceRefs`；候选文本不能自行删掉必要依赖。后续计划即使省略经验引用，新 I/H 请求、晋级、回退和导入前仍须重查活跃方法的必要引用；限用时保留历史版本，但不能重新装载。V2 方法包保留这两组引用，外库未在目标工作区明确注册时不能借导入绕过检查。M07 只有显式提供经验引用才把有界包加入新子任务，未配置时沿用原输入路径。选中、装载、实际调用、忠实使用和因果收益分开记录；仅有选中或装载不证明后两者。
+经验仍存于原 C/K/E/J/Q/D/X 知识库，M04 是现有提案、判断与合入路径；实验反馈不能直接升格为 adopted 或 verified。每个知识库懒初始化稳定 `storeId`，跨库引用须显式注册并固定 `{storeId, recordId, version}`。调用方显式指定目标与有限条经验；选择器检查适用阶段、标签、情境、声明的必要依赖闭包和当前限制，超界或缺失即不给完整经验包。撤回、停用和传递必要依赖会阻止新的使用，历史记录仍可只读追溯；反例与替换史引用不自动当作科学前提。H/I 版本分别保存装载来源 `sourceExperienceRefs`、既有版本保守继承的 `requiredExperienceRefs`，以及结构化声明的必要科学前提 `requiredKnowledgeRefs`；新选入的普通参考不因被阅读就变成必要前提，旧版已记录的必要约束也不会被自动降级。候选正文和后续计划省略引用，都不能清除必要约束；新的 I/H 调用、激活、回退和 V2 导入前重查。跨库注册必须显式注入服务，方法包本身不导入外库记录。仅有选中或装载不证明忠实使用、科学正确或因果收益。
+
+知识跨轮更新是显式操作：`advance-knowledge` 要求已完成合入的 M04 run、新知识快照、无运行中的 campaign 和预期活跃 bundle；控制器保留 H/I 正文与旧 bundle，核对必要引用及 live 限制后写入新知识 epoch，不改写旧 run。`transition-dependencies` 只处理结构化的 `requiredKnowledgeRefs`，需要指向当前方法与精确引用变更的已采纳 M04 决定、登记证据和复验记录，生成有不可变沿革的新方法版本；旧 `requiredExperienceRefs` 保守保留，知识库的撤回/限用授权不会因此解除。D/E 链路结构可核验，但这不能证明 M04 的科学判断正确。
+
+M07 可在新目标 begin 时显式指定当前活跃的 `m07-workflow-prompt` H 版本，冻结 `research-check` 或 `evidence-handoff` 槽位、正文、必要引用与知识快照；CPU 数值 H 不能冒充工作流方法。正文进入真实子任务提示，证据交接槽位还随固定反馈包向 M04 标明采用的版本与适用限制，原目标、mandatory checks 和工具权限仍优先。新任务前重查 live 必要引用，已冻结目标不热换正文。普通经验包仍只在显式提供引用时有界装入任务；实际遵循和科研收益均需另有证据。
 
 方法包只带策略正文和限定元数据，不自动携带案例、答案、轨迹或知识库；跨工作区绑定是调用方显式导入，不能借来源声明冒充本地自动准入。工程测试已使用假会话覆盖控制路径，也完成过小规模真实 H 与 I 动作链的 `development` 试跑以验证环境接线；I 尚未产生或选择新后继，未运行真实模型的完整 H/I 成对准入，也没有独立 executor 或 meta 收益证据。这不能称已形成结构化 L5。其他数值环境、外部异步任务恢复、真正的代码执行沙箱、长期课程迁移及 L3/L4/L5 递归改进仍未实现或验证。
 
-新路径的 CLI 与上文旧预算策略 `improve run` 分开：先以 `node src/cli.ts improve research bootstrap --workspace <dir> --methods <methods.json>` 显式写入 H/I 种子，再以 `node src/cli.ts improve research run --workspace <dir> --plan <plan.json>` 启动。`methods.json` 的字段由 [`ResearchBootstrapInput`](../../src/improvement/research-service.ts) 定义；案例集及校验见 [`CpuCaseSetV1` 与 `validateCpuCaseSet`](../../src/experiments/local-environment.ts)。`status`、`rollback`、`export --version <id> --out <package.json>` 和 `bind --package <package.json>` 同在 `improve research` 下；`bind` 是显式人工导入。
+新路径的 CLI 与上文旧预算策略 `improve run` 分开：先以 `node src/cli.ts improve research bootstrap --workspace <dir> --methods <methods.json>` 显式写入 H/I 种子，再以 `node src/cli.ts improve research run --workspace <dir> --plan <plan.json>` 启动。`methods.json` 的字段由 [`ResearchBootstrapInput`](../../src/improvement/research-service.ts) 定义；案例集及校验见 [`CpuCaseSetV1` 与 `validateCpuCaseSet`](../../src/experiments/local-environment.ts)。`status`、`rollback`、`export --version <id> --out <package.json>` 和 `bind --package <package.json>` 同在 `improve research` 下；`bind` 是显式人工导入。跨轮知识更新用 `advance-knowledge --m04-run <id> --expected-bundle <id>`；精确前提变更用 `transition-dependencies --m04-run <id> --expected-bundle <id> --method-version <id> --decision-ref <ref.json>`，后者的输入和结构校验见 [`KnowledgeRef`](../../src/knowledge/types.ts) 与 [knowledge-epoch.ts](../../src/improvement/knowledge-epoch.ts)。这些操作也可由显式 Pi extension action 调用。
 
-例如，下列结构选择 H 的质量路径；数值只是调用方需按模型与任务校准的预算示例。`admissionCaseSetPath` 可省略，此时只保留开发记录而不晋级。案例文件必须由调用方私下提供，不应把真值或检查答案放进模型提示。
+例如，下列结构选择 H 的质量路径，假设准入集只有一个案例；数值只是调用方需按模型、案例数与任务校准的预算示例。`admissionCaseSetPath` 可省略，此时只保留开发记录而不晋级。案例文件必须由调用方私下提供，不应把真值或检查答案放进模型提示。元改进需另给 `target: "improver"`、`metaProtocol`、每臂候选上限与分支预算；两臂从同一冻结 H/K 与同一经验选择出发，各自建立开发 fork，先固定全部后继再查受保护案例。`MetaEpisode` 仅记录受保护检查前的有界开发历史，后续 plan 通过同工作区 `metaEpisodeRunIds` 显式选用；未有赢家和预算内不可判定均保留各自状态，历史不能充作新的 G 证据。
 
 ```json
 {
@@ -78,12 +86,18 @@ campaign 的预算和账目只覆盖它启动的提议、两臂及读回调用�
   "maxFeedbackItems": 8,
   "perPromptTimeoutMs": 120000,
   "perPromptMaxOutputTokens": 2048,
+  "perPromptMaxInputTokens": 8192,
+  "searchReplicates": 1,
+  "outcomeReplicates": 2,
+  "outerBudget": { "maxProviderCalls": 16, "maxInputTokens": 131072, "maxOutputTokens": 32768, "maxSdkEstimatedCost": 100, "maxProbeCalls": 16, "maxCpuMillis": 20000, "maxWallMillis": 240000 },
+  "pilotBudget": { "maxProviderCalls": 1, "maxInputTokens": 8192, "maxOutputTokens": 2048, "maxSdkEstimatedCost": 20, "maxProbeCalls": 0, "maxCpuMillis": 1000, "maxWallMillis": 120000 },
+  "protectedBudget": { "maxProviderCalls": 64, "maxInputTokens": 524288, "maxOutputTokens": 131072, "maxSdkEstimatedCost": 800, "maxProbeCalls": 16, "maxCpuMillis": 20000, "maxWallMillis": 240000 },
   "budget": {
-    "maxProviderCalls": 20,
-    "maxInputTokens": 60000,
-    "maxOutputTokens": 20000,
-    "maxSdkEstimatedCost": 10,
-    "maxProbeCalls": 20,
+    "maxProviderCalls": 100,
+    "maxInputTokens": 1000000,
+    "maxOutputTokens": 200000,
+    "maxSdkEstimatedCost": 1000,
+    "maxProbeCalls": 32,
     "maxCpuMillis": 60000,
     "maxWallMillis": 600000
   },
@@ -93,4 +107,4 @@ campaign 的预算和账目只覆盖它启动的提议、两臂及读回调用�
 }
 ```
 
-I 的元改进路径将 `experimentKind` 改为 `meta-improvement`、`target` 改为 `improver`；若提供受保护的 `admissionCaseSetPath`，还须显式提供 `metaBranchBudget`（同一组预算字段）与 `maxCandidatesPerMetaArm`，两臂各自受该上限约束并共享根账。本批元协议要求 `experienceRefs: []`，以保持两臂的初始知识条件一致。`priorDevelopmentFeedbackPath` 若提供，只能装载受校验的开发反馈，不能把受保护答案移进 I 的上下文。
+I 的元改进路径将 `experimentKind` 改为 `meta-improvement`、`target` 改为 `improver`；若提供受保护的 `admissionCaseSetPath`，还须显式提供 `metaProtocol`、`metaBranchBudget`（同一组预算字段）与 `maxCandidatesPerMetaArm`，两臂各自受该上限约束并共享根账。`experienceRefs` 可显式选择有界非空包，控制器在两臂使用同一次冻结选择并在新请求前复查 live 限制。`priorDevelopmentFeedbackPath` 若提供，只能装载受校验的开发反馈，不能把受保护答案移进 I 的上下文。

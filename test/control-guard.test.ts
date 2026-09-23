@@ -33,6 +33,13 @@ test("completed run records with failures count as failed attempts", () => {
 	);
 });
 
+test("M04 retry identity distinguishes frozen checkpoints of the same active M07 goal", () => {
+	const request = { stage: "M04" as const, feedbackStage: "M07" as const, feedbackRunId: "g1", feedbackCheckpointId: "C001", freshSession: true };
+	const first = stageFingerprint(request);
+	assert.equal(first, stageFingerprint({ ...request }), "the same checkpoint remains the same correction obligation");
+	assert.notEqual(first, stageFingerprint({ ...request, feedbackCheckpointId: "C002" }), "a later frozen evidence batch may be retried independently");
+});
+
 test("M03 retry identity follows the resolved upstream runs and configured reviewer pool", async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-m03-identity-"));
 	await mkdir(path.join(root, "problem", "raw"), { recursive: true });

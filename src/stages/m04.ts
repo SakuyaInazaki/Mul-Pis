@@ -8,7 +8,7 @@
  * batch is the minimal unit. Proposals are validated structurally and merged
  * through the single serial entry; merging is never a truth certificate.
  */
-import { lstat } from "node:fs/promises";
+import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import type { ProposalOp } from "../knowledge/types.ts";
 import { buildM04Message, extractKnowledgeProposals, systemPromptFor } from "../prompts.ts";
@@ -25,6 +25,7 @@ export type M04Feedback =
 	| { kind: "M03"; runId?: string }
 	| { kind: "M06"; runId?: string }
 	| { kind: "M07"; runId?: string }
+	| { kind: "M07Checkpoint"; runId: string; checkpointId: string }
 	| { kind: "M08"; runId?: string }
 	| { kind: "file"; label: string; path: string };
 
@@ -50,10 +51,101 @@ interface ResolvedFeedback {
 	inputs: InputRef[];
 	artifactPaths: string[];
 	m08?: { runId: string; manifest: FrozenArtifactManifest; manifestPath: string };
-	m07?: { runId: string; rootDir: string };
+	m07?: { runId: string; rootDir: string; checkpointId?: string; goalSnapshotPath?: string; manifestPath?: string; frozenMaterials?: ProblemMaterials; frozenProblemInputs?: InputRef[]; skippedRaw?: string[]; selectedTaskIds?: string[]; omittedTaskIds?: string[] };
+}
+
+const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const SAFE_CHECKPOINT_ID = /^C\d{3,}$/;
+function checkpointRelative(file: string): boolean {
+	return typeof file === "string" && file.length > 0 && file !== "." && !path.isAbsolute(file) &&
+		file.split(/[\\/]/).every((part) => part !== "" && part !== "." && part !== "..");
+}
+
+async function resolveM07Checkpoint(ctx: StageContext, runId: string, checkpointId: string): Promise<ResolvedFeedback> {
+	if (!SAFE_RUN_ID.test(runId) || !SAFE_CHECKPOINT_ID.test(checkpointId)) throw new HarnessError("m04.checkpoint", "M07 checkpoint 标识非法");
+	const runDir = ctx.ws.runDir("M07", runId);
+	const checkpointDir = path.join(runDir, "checkpoints", checkpointId);
+	const goalPath = path.join(runDir, "goal.json");
+	const ensureExact = async (file: string, expectedReal: string, directory = false): Promise<void> => {
+		const info = await lstat(file);
+		if (info.isSymbolicLink() || (directory ? !info.isDirectory() : !info.isFile()) || await realpath(file) !== expectedReal)
+			throw new HarnessError("m04.checkpoint", `M07 checkpoint 固定路径非法：${file}`);
+	};
+	try {
+		const workspaceReal = await realpath(ctx.ws.root);
+		const runReal = path.join(workspaceReal, "stages", "M07", runId);
+		const checkpointReal = path.join(runReal, "checkpoints", checkpointId);
+		await ensureExact(runDir, runReal, true);
+		await ensureExact(path.join(runDir, "checkpoints"), path.join(runReal, "checkpoints"), true);
+		await ensureExact(checkpointDir, checkpointReal, true);
+		await ensureExact(goalPath, path.join(runReal, "goal.json"));
+		const live = JSON.parse(await readFile(goalPath, "utf8")) as { runId?: string; checkpoints?: Array<Record<string, unknown>> };
+		const matches = live.checkpoints?.filter((item) => item.id === checkpointId) ?? [];
+		if (live.runId !== runId || matches.length !== 1) throw new HarnessError("m04.checkpoint", "M07 checkpoint 未由该目标唯一登记");
+		const registered = matches[0];
+		const frozenGoal = path.join(checkpointDir, "goal.json");
+		const feedbackPath = path.join(checkpointDir, "m04-feedback.md");
+		const manifestPath = path.join(checkpointDir, "manifest.json");
+		if (registered.rootDir !== checkpointDir || registered.goalSnapshotPath !== frozenGoal || registered.feedbackPath !== feedbackPath || registered.manifestPath !== manifestPath ||
+			!(["complete", "indexed"] as unknown[]).includes(registered.feedbackStatus)) throw new HarnessError("m04.checkpoint", "M07 checkpoint 登记路径或状态不匹配");
+		await ensureExact(frozenGoal, path.join(checkpointReal, "goal.json"));
+		await ensureExact(feedbackPath, path.join(checkpointReal, "m04-feedback.md"));
+		await ensureExact(manifestPath, path.join(checkpointReal, "manifest.json"));
+		const snapshot = JSON.parse(await readFile(frozenGoal, "utf8")) as { runId?: string; updatedAt?: string; budgetPolicy?: { maxFeedbackChars?: number }; tasks?: Array<{ taskId?: string; review?: unknown; reportPath?: unknown }>; checkpointScope?: { selectedTaskIds?: string[]; omittedTaskIds?: string[] } };
+		if (snapshot.runId !== runId || snapshot.updatedAt !== registered.sourceGoalUpdatedAt) throw new HarnessError("m04.checkpoint", "M07 checkpoint 目标快照身份不匹配");
+		const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as { version?: number; m07RunId?: string; checkpointId?: string; files?: Array<{ sourceRelativePath?: string; relativePath?: string; bytes?: number }>; problemFile?: string; rawFiles?: Array<{ name?: string; relativePath?: string }>; skippedRaw?: string[]; selectedTaskIds?: string[]; omittedTaskIds?: string[] };
+		if (manifest.version !== 1 || manifest.m07RunId !== runId || manifest.checkpointId !== checkpointId || !Array.isArray(manifest.files) ||
+			!checkpointRelative(manifest.problemFile ?? "") || !Array.isArray(manifest.rawFiles) || !Array.isArray(manifest.skippedRaw) ||
+			!manifest.skippedRaw.every((name) => typeof name === "string" && name.length > 0)) throw new HarnessError("m04.checkpoint", "M07 checkpoint 清单身份或原问题字段不匹配");
+		const selectedTaskIds = manifest.selectedTaskIds;
+		const omittedTaskIds = manifest.omittedTaskIds;
+		const validIds = (ids: unknown): ids is string[] => Array.isArray(ids) && ids.every((id) => typeof id === "string" && /^T\d{3,}$/.test(id)) && new Set(ids).size === ids.length;
+		if (!validIds(selectedTaskIds) || !validIds(omittedTaskIds) || !validIds(snapshot.checkpointScope?.selectedTaskIds) || !validIds(snapshot.checkpointScope?.omittedTaskIds) ||
+			JSON.stringify(selectedTaskIds) !== JSON.stringify(snapshot.checkpointScope.selectedTaskIds) || JSON.stringify(omittedTaskIds) !== JSON.stringify(snapshot.checkpointScope.omittedTaskIds) ||
+			!Array.isArray(snapshot.tasks) || !validIds(snapshot.tasks.map((task) => task.taskId)) ||
+			new Set([...selectedTaskIds, ...omittedTaskIds]).size !== snapshot.tasks.length ||
+			snapshot.tasks.some((task) => !selectedTaskIds.includes(task.taskId!) && !omittedTaskIds.includes(task.taskId!)) ||
+			snapshot.tasks.some((task) => omittedTaskIds.includes(task.taskId!) && (task.review !== undefined || task.reportPath !== undefined))) throw new HarnessError("m04.checkpoint", "M07 checkpoint 选批范围与冻结目标不一致");
+		const seen = new Set<string>();
+		for (const item of manifest.files) {
+			if (!checkpointRelative(item.sourceRelativePath ?? "") || !checkpointRelative(item.relativePath ?? "") || seen.has(item.relativePath!) ||
+				!Number.isSafeInteger(item.bytes) || item.bytes! < 0) throw new HarnessError("m04.checkpoint", "M07 checkpoint 证据清单字段非法");
+			const evidenceTaskId = /^evidence[/\\]tasks[/\\](T\d{3,})[/\\]/.exec(item.relativePath!)?.[1];
+			if (evidenceTaskId && !selectedTaskIds.includes(evidenceTaskId)) throw new HarnessError("m04.checkpoint", "M07 checkpoint 清单包含未选任务证据");
+			seen.add(item.relativePath!);
+			const file = path.join(checkpointDir, item.relativePath!);
+			await ensureExact(file, path.join(checkpointReal, item.relativePath!));
+			if ((await stat(file)).size !== item.bytes) throw new HarnessError("m04.checkpoint", `M07 checkpoint 固定证据大小变化：${item.relativePath}`);
+		}
+		if (!seen.has(manifest.problemFile!)) throw new HarnessError("m04.checkpoint", "M07 checkpoint 原问题未列入固定证据清单");
+		const rawInfo: ProblemMaterials["rawInfo"] = [];
+		const frozenProblemInputs: InputRef[] = [{ label: "M07 checkpoint 固定原始问题", path: path.join(checkpointDir, manifest.problemFile!) }];
+		const rawNames = new Set<string>();
+		for (const raw of manifest.rawFiles) {
+			if (typeof raw.name !== "string" || !raw.name.trim() || rawNames.has(raw.name) || !checkpointRelative(raw.relativePath ?? "") || !seen.has(raw.relativePath!)) throw new HarnessError("m04.checkpoint", "M07 checkpoint 固定原始信息清单非法");
+			rawNames.add(raw.name);
+			const file = path.join(checkpointDir, raw.relativePath!);
+			rawInfo.push({ name: raw.name, content: await readFile(file, "utf8") });
+			frozenProblemInputs.push({ label: `M07 checkpoint 固定原始信息 ${raw.name}`, path: file });
+		}
+		const frozenMaterials: ProblemMaterials = { problem: await readFile(path.join(checkpointDir, manifest.problemFile!), "utf8"), rawInfo };
+		if (!frozenMaterials.problem.trim()) throw new HarnessError("m04.checkpoint", "M07 checkpoint 固定原问题为空");
+		const text = await readFile(feedbackPath, "utf8");
+		if (!text || !Number.isSafeInteger(snapshot.budgetPolicy?.maxFeedbackChars) || text.length > snapshot.budgetPolicy!.maxFeedbackChars!) throw new HarnessError("m04.checkpoint", "M07 checkpoint 反馈缺失或超过冻结预算");
+		return {
+			label: `M07 checkpoint ${checkpointId}（运行 ${runId}）`, text,
+			inputs: [{ label: "M07 固定 checkpoint 反馈", path: feedbackPath }, { label: "M07 checkpoint 目标快照", path: frozenGoal }, { label: "M07 checkpoint 证据清单", path: manifestPath }],
+			artifactPaths: ["goal.json", "manifest.json", ...manifest.files.map((item) => item.relativePath!)],
+			m07: { runId, rootDir: checkpointDir, checkpointId, goalSnapshotPath: frozenGoal, manifestPath, frozenMaterials, frozenProblemInputs, skippedRaw: manifest.skippedRaw, selectedTaskIds, omittedTaskIds },
+		};
+	} catch (error) {
+		if (error instanceof HarnessError) throw error;
+		throw new HarnessError("m04.checkpoint", `M07 checkpoint 无法按固定记录读取：${(error as Error).message}`);
+	}
 }
 
 async function resolveFeedback(ctx: StageContext, feedback: M04Feedback): Promise<ResolvedFeedback> {
+	if (feedback.kind === "M07Checkpoint") return resolveM07Checkpoint(ctx, feedback.runId, feedback.checkpointId);
 	if (feedback.kind === "M03") {
 		const run = await requireCompletedRun(ctx, "M03", feedback.runId);
 		const evaluation = await readOutput(run, "逐题评价");
@@ -131,6 +223,9 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			materials.rawInfo.push({ name: item.label, content });
 		}
 		problemInputs = [{ label: `M08 固定原始问题（运行 ${feedback.m08.runId}）`, path: fixedProblem.frozenPath }, ...feedback.m08.manifest.entries.filter((x) => x.sourceCategory === "raw-input").map((x) => ({ label: x.label, path: x.frozenPath }))];
+	} else if (feedback.m07?.frozenMaterials) {
+		materials = feedback.m07.frozenMaterials;
+		problemInputs = feedback.m07.frozenProblemInputs!;
 	} else ({ materials, inputs: problemInputs } = await loadProblemMaterials(ctx.ws));
 	const snapshot = await ctx.store.current();
 	const previousM04 = await ctx.ws.latestCompletedRun("M04");
@@ -146,7 +241,7 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 		ctx,
 		record,
 		async () => {
-			if (feedback.m07) await ctx.ws.writeOutput(record, "m07-source.json", JSON.stringify({ m07RunId: feedback.m07.runId, rootDir: feedback.m07.rootDir, feedbackBundlePath: feedback.inputs[0].path }, null, 2), "M07 处理来源");
+			if (feedback.m07) await ctx.ws.writeOutput(record, "m07-source.json", JSON.stringify({ m07RunId: feedback.m07.runId, rootDir: feedback.m07.rootDir, feedbackBundlePath: feedback.inputs[0].path, ...(feedback.m07.checkpointId ? { checkpointId: feedback.m07.checkpointId, goalSnapshotPath: feedback.m07.goalSnapshotPath, manifestPath: feedback.m07.manifestPath, selectedTaskIds: feedback.m07.selectedTaskIds, omittedTaskIds: feedback.m07.omittedTaskIds } : {}) }, null, 2), "M07 处理来源");
 			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-source.json", JSON.stringify({ m08RunId: feedback.m08.runId, manifestPath: feedback.m08.manifestPath, reviewBundlePath: feedback.inputs[0].path }, null, 2), "M08 处理来源");
 			let knowledgePack: string | undefined;
 			if (mode === "research-session") {
@@ -160,7 +255,7 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 
 			const allowedM08Paths = feedback.m08?.manifest.entries.map((x) => x.relativePath) ?? [];
 			const m08DispositionInstruction = feedback.m08 ? `\n\n【M08 固定材料访问契约】\n上方审查反馈包只是意见汇总，“实际产物位置”也只是索引；它们不表示你已读取待交付材料。若要给出 ready 或 partial，必须在本会话中用 m08_material_read 按下列精确 relativePath 实际读取每一项准备写入 deliverablePaths 的文件；目录项至少读取其中一个与处置直接相关的真实文件。PDF 文本层不足以核对公式、表格或图时，用 render_pdf_page 渲染相关页。工具会记录实际访问路径，仅在正文里复述或引用路径不算读取。\n可访问的固定材料：${allowedM08Paths.map((p) => `\n- ${p}`).join("")}\n\n本轮必须在处理文末尾输出 m08-disposition JSON 代码块。合法 status 只有 ready、partial、rework、needs_evidence、unresolved。结构示例：{\"m08RunId\":\"${feedback.m08.runId}\",\"status\":\"partial\",\"deliverablePaths\":[\"上述某一精确 relativePath\"],\"limitations\":[\"实际限制\"],\"rationale\":\"非空理由\"}。deliverablePaths 只允许从上述精确相对路径选择。ready/partial 必须至少选择一项；这是用途处置，不是投票或科学认证；无法判断不得写 ready。` : "";
-			const m07EvidenceInstruction = feedback.m07 ? `\n\n【M07 证据按需读取契约】\n上方反馈包中的材料清单是索引，不代表你已读取未内联的证据。需要依赖某项材料时，使用 m07_evidence_read 按清单中的相对路径读取；大文件按 offset/limit 继续读取。工具记录文件访问，但当前覆盖记录只能证明访问过该文件，不能证明读取了全文；除非实际分段读至文件末尾，否则必须把未读范围列为限制。不得把路径存在、清单摘要或一次局部读取写成“已完整核验”。` : "";
+			const m07EvidenceInstruction = feedback.m07 ? `\n\n【M07 证据按需读取契约】\n上方反馈包中的材料清单是索引，不代表你已读取未内联的证据。需要依赖某项材料时，使用 m07_evidence_read 按清单中的相对路径读取；大文件按 offset/limit 继续读取。工具记录文件访问，但当前覆盖记录只能证明访问过该文件，不能证明读取了全文；除非实际分段读至文件末尾，否则必须把未读范围列为限制。不得把路径存在、清单摘要或一次局部读取写成“已完整核验”。${feedback.m07.checkpointId ? `\n本 checkpoint 仅冻结选定任务的评审证据；选定任务 ${feedback.m07.selectedTaskIds?.length ?? 0} 项、省略任务 ${feedback.m07.omittedTaskIds?.length ?? 0} 项。完整 ID 列表见 checkpoint manifest.json 及 M04 来源记录；省略任务仅保留控制状态，不得把其未提供的证据当作已交接或可读取。` : ""}${feedback.m07.skippedRaw?.length ? `\ncheckpoint 未复制的非文本原始信息：${feedback.m07.skippedRaw.join("、")}；须作为材料缺口，不得推断已核对。` : ""}` : "";
 			const finalMessage = message + m08DispositionInstruction + m07EvidenceInstruction;
 			await ctx.ws.writeOutput(record, "message.md", finalMessage, "发送给研究会话的完整消息");
 			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-message.md", finalMessage, "发送给 M04 的固定 M08 消息");

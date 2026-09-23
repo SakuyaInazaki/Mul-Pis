@@ -1,5 +1,8 @@
 /** Explicit, bounded views over the existing knowledge store; never an adoption path. */
 import type { KnowledgeRecord, KnowledgeRef, KnowledgeStore } from "./types.ts";
+import { createFileKnowledgeStore } from "./store.ts";
+import { HarnessError } from "../types.ts";
+import path from "node:path";
 
 export type ExperienceTargetKind = "executor" | "improver";
 
@@ -23,7 +26,7 @@ export interface ExperienceQuery {
 export interface ExperienceSelection {
 	status: "ready" | "incomplete" | "none";
 	markdown: string;
-	selected: Array<{ ref: KnowledgeRef; dependencyRefs: KnowledgeRef[] }>;
+	selected: Array<{ ref: KnowledgeRef; dependencyRefs: KnowledgeRef[]; scientificRequiredRefs: KnowledgeRef[] }>;
 	omitted: Array<{ ref: KnowledgeRef; reason: string }>;
 	checkedSnapshots: Array<{ storeId: string; snapshotId?: string }>;
 	limitsCheckedAt: string;
@@ -153,7 +156,18 @@ export function createExperienceProvider(localStore: KnowledgeStore, registeredS
 				if (!record || !model) { omitted.push({ ref, reason: "not-an-experience-record" }); continue; }
 				if (model.targetKind !== query.targetKind || !contextMatches(record, ref, query, model)) { omitted.push({ ref, reason: "not-applicable" }); continue; }
 				if (!await visit(ref)) continue;
-				selected.push({ ref, dependencyRefs: [...model.requiredRefs, ...(query.applicability.contextRefs ?? []).filter((item) => record.scope.includes(item.recordId) && item.storeId === ref.storeId)] });
+				const scientificRequired = new Map<string, KnowledgeRef>();
+				const collectRequired = (recordRef: KnowledgeRef): void => {
+					const item = records.get(key(recordRef));
+					const nested = item && definition(item.record);
+					for (const required of nested?.requiredRefs ?? []) {
+						if (scientificRequired.has(key(required))) continue;
+						scientificRequired.set(key(required), required);
+						collectRequired(required);
+					}
+				};
+				collectRequired(ref);
+				selected.push({ ref, dependencyRefs: [...model.requiredRefs, ...(query.applicability.contextRefs ?? []).filter((item) => record.scope.includes(item.recordId) && item.storeId === ref.storeId)], scientificRequiredRefs: [...scientificRequired.values()] });
 			}
 			const localSnapshot = checkedSnapshots.find((item) => item.storeId === localId)?.snapshotId;
 			if (query.expectedSnapshotId && localSnapshot !== query.expectedSnapshotId) omitted.push({ ref: query.requestedRefs[0], reason: "snapshot-mismatch" });
@@ -175,4 +189,33 @@ export function createExperienceProvider(localStore: KnowledgeStore, registeredS
 			return { status: "ready", markdown, selected, omitted: [], checkedSnapshots, limitsCheckedAt: checkedAt };
 		},
 	};
+}
+
+/** Check pinned scientific premises without requiring them to be experience records. */
+export async function verifyRequiredKnowledge(workspaceRoot: string, refs: KnowledgeRef[], expectedSnapshotId?: string, registeredStores: ReadonlyMap<string, KnowledgeStore> = new Map()): Promise<void> {
+	if (!Array.isArray(refs) || refs.length > 100 || !refs.every(isKnowledgeRef)) throw new HarnessError("knowledge.required", "necessary knowledge refs must be bounded pinned references");
+	if (!refs.length) return;
+	const local = createFileKnowledgeStore(path.join(path.resolve(workspaceRoot), ".agent", "knowledge"));
+	await local.init();
+	const localId = await local.storeId();
+	const stores = new Map(registeredStores);
+	stores.set(localId, local);
+	const before = new Map<string, string>();
+	for (const ref of refs) {
+		const store = stores.get(ref.storeId);
+		if (!store || await store.storeId() !== ref.storeId) throw new HarnessError("knowledge.required", `necessary knowledge store is not registered: ${ref.storeId}`);
+		if (!before.has(ref.storeId)) {
+			const snapshot = (await store.current())?.id;
+			if (ref.storeId === localId && expectedSnapshotId !== undefined && snapshot !== expectedSnapshotId) throw new HarnessError("knowledge.required", "necessary knowledge snapshot changed");
+			before.set(ref.storeId, JSON.stringify({ snapshot, limits: await store.limits() }));
+		}
+		const record = await store.get(ref.recordId, ref.version);
+		const availability = await store.availability(ref.recordId, ref.version);
+		if (!record || availability.availability !== "usable_conditionally") throw new HarnessError("knowledge.required", `necessary knowledge is unavailable: ${ref.storeId}/${ref.recordId}@${ref.version}`);
+	}
+	for (const [storeId, state] of before) {
+		const store = stores.get(storeId)!;
+		const after = JSON.stringify({ snapshot: (await store.current())?.id, limits: await store.limits() });
+		if (state !== after) throw new HarnessError("knowledge.required", `necessary knowledge changed during check: ${storeId}`);
+	}
 }

@@ -2,6 +2,7 @@ import type { SessionRef } from "../runner/types.ts";
 import type { BudgetPolicy } from "../improvement/policy.ts";
 import type { KnowledgeRef } from "../knowledge/types.ts";
 import type { ExperienceSelection } from "../knowledge/experience-index.ts";
+import type { ExperienceRequirementV1, M07WorkflowStrategyV1 } from "../improvement/generation.ts";
 
 export type M07TaskMode = "execute" | "check" | "reason";
 export type M07TaskStatus = "running" | "returned" | "failed" | "accepted" | "rejected";
@@ -16,6 +17,8 @@ export interface BeginGoalInput {
 	successCriteria: string[];
 	plan: string;
 	exploratory?: boolean;
+	/** Explicitly bind the active workflow H; CPU executor methods are not accepted. */
+	workflowMethodVersionId?: string;
 }
 
 export interface TaskSpecInput {
@@ -69,6 +72,29 @@ export interface FinishInput {
 export interface InterruptInput {
 	reason: string;
 	returnPath?: ReturnPath;
+}
+
+export type HostStopReasonKind = "request-aborted" | "provider-error" | "session-shutdown" | "no-progress";
+
+export interface HostStopReceipt {
+	version: 1;
+	id: string;
+	goalRunId: string;
+	source: "pi-host";
+	reasonKind: HostStopReasonKind;
+	observedAt: string;
+	sourceEventId?: string;
+}
+
+export interface M07CheckpointRecord {
+	id: string;
+	createdAt: string;
+	rootDir: string;
+	goalSnapshotPath: string;
+	feedbackPath: string;
+	manifestPath: string;
+	feedbackStatus: "complete" | "indexed";
+	sourceGoalUpdatedAt: string;
 }
 
 export interface EvidenceFile {
@@ -142,6 +168,16 @@ export interface CurrentGoal {
 	budgetPolicyFrozenAt?: string;
 	/** Explicit method identity loaded when this goal began; later pointer changes do not rewrite it. */
 	methodBinding?: { versionId: string; contentId?: string };
+	/** Host-frozen execution contract; absent on legacy/bounded goals. The model cannot opt out through goal parameters. */
+	executionContract?: { version: 1; mode: "continuous"; frozenAt: string };
+	/** Controller-created stop event; free-text model claims and tool stdout never populate this. */
+	hostStopReceipt?: HostStopReceipt;
+	/** Registered only after its frozen files and bounded feedback are durable. */
+	checkpoints?: M07CheckpointRecord[];
+	/** Frozen checkpoint snapshot only; omitted task evidence remains in the live goal, outside M04's read grant. */
+	checkpointScope?: { selectedTaskIds: string[]; omittedTaskIds: string[] };
+	/** Controller-frozen method body. Later pointer changes never hot-replace it. */
+	workflowMethod?: { versionId: string; artifact: M07WorkflowStrategyV1; requiredExperienceRefs: ExperienceRequirementV1[]; requiredKnowledgeRefs: KnowledgeRef[] };
 	tasks: M07TaskRecord[];
 	decisions: UserDecision[];
 	outcome?: GoalOutcome;
@@ -150,15 +186,21 @@ export interface CurrentGoal {
 	limitations: string[];
 	goalChecks?: TaskCheck[];
 	feedbackPath?: string;
+	/** Interrupt archival handoff state. A control-facts-only file is not a complete M04 feedback package. */
+	feedbackStatus?: "pending" | "complete" | "indexed" | "control-facts-only" | "failed";
+	feedbackError?: { code: string; summary: string };
 }
 
 export interface M07Controller {
-	begin(input: BeginGoalInput): Promise<CurrentGoal>;
+	begin(input: BeginGoalInput, options?: { executionContract?: "continuous" }): Promise<CurrentGoal>;
 	status(runId: string): Promise<CurrentGoal>;
-	plan(runId: string, plan: string, options?: { refreshBaseline?: boolean }): Promise<CurrentGoal>;
+	plan(runId: string, plan: string, options?: { refreshBaseline?: boolean; checkpointId?: string; m04RunId?: string }): Promise<CurrentGoal>;
+	checkpoint(runId: string, options?: { taskIds?: string[] }): Promise<M07CheckpointRecord>;
 	delegate(runId: string, task: TaskSpecInput): Promise<M07TaskRecord>;
 	review(runId: string, input: TaskReviewInput): Promise<M07TaskRecord>;
 	decision(runId: string, input: DecisionInput): Promise<CurrentGoal>;
 	finish(runId: string, input: FinishInput): Promise<CurrentGoal>;
 	interrupt(runId: string, input: InterruptInput): Promise<CurrentGoal>;
+	/** Trusted host lifecycle path, not exposed as a model tool. */
+	hostInterrupt(runId: string, input: { reasonKind: HostStopReasonKind; sourceEventId?: string }): Promise<CurrentGoal>;
 }

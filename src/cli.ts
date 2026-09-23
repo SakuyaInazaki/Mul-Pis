@@ -52,6 +52,7 @@ import type { CampaignPlan } from "./improvement/types.ts";
 import { ResearchImprovementService, type ResearchBootstrapInput } from "./improvement/research-service.ts";
 import type { ResearchCampaignPlanV1 } from "./improvement/research-types.ts";
 import { publicResearchRun, publicResearchStatus } from "./improvement/research-public.ts";
+import type { KnowledgeRef } from "./knowledge/types.ts";
 
 interface ParsedArgs {
 	positional: string[];
@@ -153,10 +154,23 @@ export async function main(argv: string[]): Promise<number> {
 			if (researchAction === "bootstrap") { console.log(JSON.stringify(await research.bootstrap(await jsonFile<ResearchBootstrapInput>(args, "methods")), null, 2)); return 0; }
 			if (researchAction === "run") { const result = await research.run(await jsonFile<ResearchCampaignPlanV1>(args, "plan")); console.log(JSON.stringify(publicResearchRun(result), null, 2)); return result.status === "failed" ? 1 : 0; }
 			if (researchAction === "status") { console.log(JSON.stringify(publicResearchStatus(await research.status()), null, 2)); return 0; }
+			if (researchAction === "advance-knowledge") {
+				const m04RunId = flag(args, "m04-run"), expected = flag(args, "expected-bundle");
+				if (!m04RunId || !expected) throw new HarnessError("cli.improve", "advance-knowledge requires --m04-run and --expected-bundle");
+				const changed = await research.advanceKnowledgeEpoch(m04RunId, expected);
+				console.log(JSON.stringify({ bundleId: changed.bundle.bundleId, toSnapshot: changed.toSnapshot, active: publicResearchStatus(await research.status()).active }, null, 2)); return 0;
+			}
+			if (researchAction === "transition-dependencies") {
+				const m04RunId = flag(args, "m04-run"), expected = flag(args, "expected-bundle"), method = flag(args, "method-version");
+				if (!m04RunId || !expected || !method) throw new HarnessError("cli.improve", "transition-dependencies requires --m04-run, --expected-bundle and --method-version");
+				const decisionRef = await jsonFile<KnowledgeRef>(args, "decision-ref");
+				const changed = await research.transitionKnowledgeDependencies(m04RunId, expected, method, decisionRef);
+				console.log(JSON.stringify({ bundleId: changed.bundle.bundleId, newMethodVersionId: changed.newMethodVersionId, active: publicResearchStatus(await research.status()).active }, null, 2)); return 0;
+			}
 			if (researchAction === "rollback") { console.log(JSON.stringify(await research.rollback(), null, 2)); return 0; }
 			if (researchAction === "export") { const version = flag(args, "version"), out = flag(args, "out"); if (!version || !out) throw new HarnessError("cli.improve", "research export requires --version and --out"); console.log(JSON.stringify(await research.exportMethod(version, path.resolve(out)), null, 2)); return 0; }
 			if (researchAction === "bind") { const source = flag(args, "package"); if (!source) throw new HarnessError("cli.improve", "research bind requires --package"); console.log(JSON.stringify(await research.bindMethod(path.resolve(source)), null, 2)); return 0; }
-			throw new HarnessError("cli.improve", "improve research 子命令：bootstrap | run | status | rollback | export | bind");
+			throw new HarnessError("cli.improve", "improve research 子命令：bootstrap | run | status | rollback | export | bind | advance-knowledge | transition-dependencies");
 		}
 		const runner = action === "run" ? await makeRunner(flag(args, "runner") ?? "pi") : new FakeSessionRunner(() => "unused");
 		const improvement = new ImprovementService({ workspaceRoot: ws.root, runner });

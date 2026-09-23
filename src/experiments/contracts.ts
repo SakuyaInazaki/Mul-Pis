@@ -27,6 +27,7 @@ export interface BudgetLimits {
 	/** Cap on Pi SDK price-table estimates, not a provider invoice. */
 	maxSdkEstimatedCost: number;
 	maxProbeCalls: number;
+	/** Host CPU charged by environment probes; model/provider compute is outside this counter. */
 	maxCpuMillis: number;
 	maxWallMillis: number;
 }
@@ -87,6 +88,14 @@ export type ScientificAction =
 	| { kind: "submit"; actionId: string; hypothesisId: string; explanation?: string }
 	| { kind: "stop"; actionId: string; reason: string };
 
+/** Admission uses this host-enforced default; planning must reserve every possible step. */
+export const MAX_EXECUTOR_EPISODE_ACTIONS = 3;
+
+/** The model parser and CPU environment must accept exactly the same IDs. */
+export function isScientificActionId(value: unknown): value is string {
+	return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(value);
+}
+
 export interface ExperimentLineage {
 	/** Explicit caller references, checked by the controller before linking. */
 	m07RunId?: string;
@@ -112,6 +121,8 @@ export interface DevelopmentFeedback {
 
 export interface EnvironmentHealthReport {
 	usable: boolean;
+	/** Reachability under the case's actual probe-call cap, computed in controller memory. */
+	classification: "initially-resolved" | "one-step" | "multi-step" | "not-identifiable-within-budget";
 	checks: Array<{ name: "positive" | "negative" | "initially-plausible" | "ambiguous" | "discriminating-probe" | "unidentifiable-stop" | "premature-stop" | "reset" | "resource" | "invalid-action" | "timeout"; passed: boolean; applicability?: "not-applicable"; detail?: string }>;
 }
 
@@ -128,7 +139,7 @@ export interface DevelopmentEnvironment {
 /** Only a trusted controller may hold this interface. Never pass it to a model session. */
 export interface ProtectedEvaluator {
 	evaluate(start: ExperimentStart, hypothesisId: string): Promise<{ status: "accepted" | "rejected" | "inconclusive"; evidence: ArtifactRef[] }>;
-	evaluateStop(start: ExperimentStart): Promise<{ status: "justified-unknown" | "premature-stop" | "inconclusive"; quality: "partial" | "none"; evidence: ArtifactRef[] }>;
+	evaluateStop(start: ExperimentStart, lease?: BudgetLease): Promise<{ status: "justified-unknown" | "premature-stop" | "resource-exhausted" | "inconclusive"; quality: "partial" | "none"; evidence: ArtifactRef[] }>;
 }
 
 export interface ModelStepResult {

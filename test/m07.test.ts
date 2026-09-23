@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -7,6 +7,9 @@ import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { createM07Controller } from "../src/m07/controller.ts";
 import { readProjectionEvents, replayability } from "../src/improvement/observations.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
+import { PiSessionRunner } from "../src/runner/pi.ts";
+import { createAgentSession, type CreateAgentSessionOptions, type ModelRuntime } from "@earendil-works/pi-coding-agent";
+import type { Model } from "@earendil-works/pi-ai";
 import type { StageContext } from "../src/stages/context.ts";
 import { runM04 } from "../src/stages/m04.ts";
 import { HarnessError, type HarnessConfig } from "../src/types.ts";
@@ -358,7 +361,7 @@ test("failed M04 retains material ranges returned before the model error", async
 	assert.deepEqual(coverage.returnedRanges[0].returned, { startLine: 2, endLine: 2, truncated: true, kind: "text" });
 });
 
-test("feedback control facts over the hard cap fail explicitly while frozen evidence remains recoverable", async (t) => {
+test("oversized feedback control facts produce a bounded index while frozen evidence remains recoverable", async (t) => {
 	const f = await fixture(t);
 	await activateBudget(f.root, { version: 1, maxPromptChars: 8_000, maxInlineFileChars: 1_000, maxAggregateInlineChars: 4_000, maxFeedbackChars: 4_000, overflowMode: "manifest-and-defer" });
 	const goal = await f.controller.begin(begin);
@@ -366,11 +369,229 @@ test("feedback control facts over the hard cap fail explicitly while frozen evid
 	assert.ok(task.reportPath);
 	const reviewed = await f.controller.review(goal.runId, { taskId: task.taskId, artifacts: [task.reportPath], checks: [{ criterion: "事实已记录", result: "passed", evidence: [task.reportPath] }] });
 	const frozen = reviewed.review!.frozenReportPath;
-	await assert.rejects(f.controller.finish(goal.runId, { outcome: "partial", summary: "控制事实不能截断", returnPath: "M04", goalChecks: begin.successCriteria.map((criterion) => ({ criterion, result: "not_run", evidence: [] })) }), (error: unknown) => error instanceof HarnessError && error.code === "context.budget" && /未静默截断/.test(error.message));
-	assert.equal((await f.controller.status(goal.runId)).lifecycle, "active");
+	const finished = await f.controller.finish(goal.runId, { outcome: "partial", summary: "控制事实不能截断", returnPath: "M04", goalChecks: begin.successCriteria.map((criterion) => ({ criterion, result: "not_run", evidence: [] })) });
+	assert.equal(finished.feedbackStatus, "indexed");
+	assert.equal(finished.lifecycle, "finished");
+	const index = await readFile(finished.feedbackPath!, "utf8");
+	assert.ok(index.length <= 4_000);
+	assert.match(index, /m07_evidence_read.*goal\.json/);
+	assert.match(index, /不代表 M04 已读完整记录/);
+	assert.match(await readFile(path.join(f.ws.runDir("M07", goal.runId), "goal.json"), "utf8"), /x{3200}/);
 	assert.match(await readFile(frozen, "utf8"), /M07-T001 returned/);
 	const run = await f.ws.readRun("M07", goal.runId);
+	assert.equal(run.status, "completed");
+	assert.ok(run.outputs.some((item) => item.label === "M07 实际执行反馈包"));
+});
+
+test("active checkpoint freezes reviewed evidence and problem inputs without closing the goal", async (t) => {
+	const f = await fixture(t);
+	await mkdir(f.ws.rawDir, { recursive: true });
+	const raw = path.join(f.ws.rawDir, "measurement.md");
+	await writeFile(raw, "frozen raw observation\n");
+	const goal = await f.controller.begin(begin, { executionContract: "continuous" });
+	const task = await f.controller.delegate(goal.runId, { objective: "负结果也必须回流", inputs: [], expectedOutputs: [], checks: ["检查已记录"], mode: "reason" });
+	const artifact = path.join(task.workDir, "observation.md");
+	await writeFile(artifact, "FROZEN_NEGATIVE_RESULT\n");
+	const reviewed = await f.controller.review(goal.runId, { taskId: task.taskId, artifacts: [artifact], checks: [{ criterion: "检查已记录", result: "failed", evidence: [artifact] }] });
+	assert.equal(reviewed.status, "rejected");
+	const checkpoint = await f.controller.checkpoint(goal.runId);
+	assert.equal(checkpoint.id, "C001");
+	assert.equal((await f.controller.status(goal.runId)).lifecycle, "active");
+	assert.equal((await f.ws.readRun("M07", goal.runId)).status, "running");
+	assert.equal((await f.controller.status(goal.runId)).checkpoints?.[0]?.id, checkpoint.id);
+	const manifest = JSON.parse(await readFile(checkpoint.manifestPath, "utf8"));
+	assert.equal(manifest.problemFile, "problem.md");
+	assert.deepEqual(manifest.rawFiles, [{ name: "measurement.md", relativePath: path.join("raw", "measurement.md") }]);
+	const fixedArtifact = manifest.files.find((item: { sourceRelativePath: string }) => item.sourceRelativePath.endsWith("review-snapshot/002-observation.md"));
+	assert.ok(fixedArtifact);
+	await writeFile(artifact, "LATER_CHANGED\n");
+	await writeFile(raw, "LATER_RAW\n");
+	await writeFile(f.ws.problemFile, "LATER_PROBLEM\n");
+	assert.equal(await readFile(path.join(checkpoint.rootDir, fixedArtifact.relativePath), "utf8"), "FROZEN_NEGATIVE_RESULT\n");
+	assert.equal(await readFile(path.join(checkpoint.rootDir, "raw", "measurement.md"), "utf8"), "frozen raw observation\n");
+	assert.equal(await readFile(path.join(checkpoint.rootDir, "problem.md"), "utf8"), "研究问题：机制 A 是否成立？\n");
+	const feedback = await readFile(checkpoint.feedbackPath, "utf8");
+	assert.match(feedback, /非终态开发 checkpoint/);
+	assert.doesNotMatch(feedback, /LATER_CHANGED|LATER_RAW|LATER_PROBLEM/);
+	assert.ok(feedback.length <= goal.budgetPolicy!.maxFeedbackChars);
+	const frozenGoal = JSON.parse(await readFile(checkpoint.goalSnapshotPath, "utf8"));
+	assert.equal(frozenGoal.lifecycle, "active");
+	assert.equal(frozenGoal.tasks[0].workDir, "");
+	assert.equal(frozenGoal.tasks[0].review.artifacts[0].sourcePath, undefined);
+});
+
+test("checkpoint refuses a running task and baseline refresh requires matching M04 consumption", async (t) => {
+	const f = await fixture(t);
+	const goal = await f.controller.begin(begin, { executionContract: "continuous" });
+	const statePath = path.join(f.ws.runDir("M07", goal.runId), "goal.json");
+	const running = JSON.parse(await readFile(statePath, "utf8"));
+	running.tasks.push({ taskId: "T001", status: "running", toolLog: [] });
+	await writeFile(statePath, JSON.stringify(running));
+	await assert.rejects(f.controller.checkpoint(goal.runId), (error: unknown) => error instanceof HarnessError && error.code === "m07.checkpoint");
+	await writeFile(statePath, JSON.stringify(goal));
+	const checkpoint = await f.controller.checkpoint(goal.runId);
+	await assert.rejects(f.controller.plan(goal.runId, "继续原目标", { refreshBaseline: true }), /checkpointId/);
+	const wrong = await f.ws.startRun("M04", [{ label: "other", path: f.ws.problemFile }]);
+	await f.ws.finishRun(wrong, "completed");
+	await assert.rejects(f.controller.plan(goal.runId, "继续原目标", { refreshBaseline: true, checkpointId: checkpoint.id, m04RunId: wrong.runId }), /checkpoint/);
+	const m04 = await runM04(f.ctx, { feedback: { kind: "M07Checkpoint", runId: goal.runId, checkpointId: checkpoint.id }, freshSession: true });
+	await assert.rejects(f.controller.plan(goal.runId, "继续原目标", { refreshBaseline: true, checkpointId: "C999", m04RunId: m04.record.runId }), /checkpoint/);
+	const resumed = await f.controller.plan(goal.runId, "继续原目标", { refreshBaseline: true, checkpointId: checkpoint.id, m04RunId: m04.record.runId });
+	assert.equal(resumed.lifecycle, "active");
+	assert.equal(resumed.m04BaselineRunId, m04.record.runId);
+	assert.deepEqual(resumed.successCriteria, begin.successCriteria);
+});
+
+test("failed checkpoint attempt remains untouched and retry uses a new directory", async (t) => {
+	const f = await fixture(t);
+	await mkdir(f.ws.rawDir, { recursive: true });
+	const raw = path.join(f.ws.rawDir, "oversized.md");
+	await writeFile(raw, "");
+	await truncate(raw, 8 * 1024 * 1024 + 1);
+	const goal = await f.controller.begin(begin, { executionContract: "continuous" });
+	await assert.rejects(f.controller.checkpoint(goal.runId), (error: unknown) => error instanceof HarnessError && error.code === "m07.checkpoint" && /局部冻结材料/.test(error.message));
+	const orphan = path.join(f.ws.runDir("M07", goal.runId), "checkpoints", "C001");
+	const preserved = await readFile(path.join(orphan, "problem.md"), "utf8");
+	assert.equal((await f.controller.status(goal.runId)).lifecycle, "active");
+	assert.equal((await f.controller.status(goal.runId)).checkpoints?.length ?? 0, 0);
+	await writeFile(raw, "bounded raw observation\n");
+	const checkpoint = await f.controller.checkpoint(goal.runId);
+	assert.equal(checkpoint.id, "C002");
+	assert.equal(await readFile(path.join(orphan, "problem.md"), "utf8"), preserved);
+	await assert.rejects(readFile(path.join(orphan, "manifest.json"), "utf8"), { code: "ENOENT" });
+	assert.equal(await readFile(path.join(checkpoint.rootDir, "raw", "oversized.md"), "utf8"), "bounded raw observation\n");
+	assert.deepEqual((await f.controller.status(goal.runId)).checkpoints?.map((item) => item.id), ["C002"]);
+	assert.equal((await f.ws.readRun("M07", goal.runId)).status, "running");
+});
+
+test("checkpoint taskIds freezes only the selected review batch and rejects invalid scopes", async (t) => {
+	const f = await fixture(t);
+	const goal = await f.controller.begin(begin, { executionContract: "continuous" });
+	const first = await f.controller.delegate(goal.runId, { objective: "旧批证据", inputs: [], expectedOutputs: [], checks: ["旧批检查"], mode: "reason" });
+	const firstReview = await f.controller.review(goal.runId, { taskId: first.taskId, artifacts: [first.reportPath!], checks: [{ criterion: "旧批检查", result: "passed", evidence: [first.reportPath!] }] });
+	const second = await f.controller.delegate(goal.runId, { objective: "本批负结果", inputs: [], expectedOutputs: [], checks: ["本批检查"], mode: "reason" });
+	const secondReview = await f.controller.review(goal.runId, { taskId: second.taskId, artifacts: [second.reportPath!], checks: [{ criterion: "本批检查", result: "failed", evidence: [second.reportPath!] }] });
+	for (const taskIds of [[], [first.taskId, first.taskId], ["T999"]]) await assert.rejects(f.controller.checkpoint(goal.runId, { taskIds }), (error: unknown) => error instanceof HarnessError && error.code === "m07.checkpoint");
+	const checkpoint = await f.controller.checkpoint(goal.runId, { taskIds: [second.taskId] });
+	assert.equal(checkpoint.id, "C001");
+	const manifest = JSON.parse(await readFile(checkpoint.manifestPath, "utf8"));
+	assert.deepEqual(manifest.selectedTaskIds, [second.taskId]);
+	assert.deepEqual(manifest.omittedTaskIds, [first.taskId]);
+	assert.ok(manifest.files.some((item: { sourceRelativePath: string }) => item.sourceRelativePath.endsWith(path.basename(secondReview.review!.frozenReportPath))));
+	assert.ok(!manifest.files.some((item: { sourceRelativePath: string }) => item.sourceRelativePath.includes(`/${first.taskId}/review-snapshot/`)));
+	const snapshot = JSON.parse(await readFile(checkpoint.goalSnapshotPath, "utf8"));
+	assert.equal(snapshot.tasks[0].status, firstReview.status);
+	assert.equal(snapshot.tasks[0].review, undefined);
+	assert.equal(snapshot.tasks[0].reportPath, undefined);
+	assert.equal(snapshot.tasks[1].status, secondReview.status);
+	assert.ok(snapshot.tasks[1].review?.frozenReportPath.startsWith(checkpoint.rootDir));
+	assert.deepEqual(snapshot.checkpointScope, { selectedTaskIds: [second.taskId], omittedTaskIds: [first.taskId] });
+	assert.match(await readFile(checkpoint.feedbackPath, "utf8"), /未选任务 1：T001/);
+	assert.equal((await f.controller.status(goal.runId)).tasks[0].review?.frozenReportPath, firstReview.review?.frozenReportPath);
+});
+
+test("fulfilled goal with long real task tool log keeps its hard checks and indexes the complete log", async (t) => {
+	const f = await fixture(t);
+	await activateBudget(f.root, { version: 1, maxPromptChars: 8_000, maxInlineFileChars: 1_000, maxAggregateInlineChars: 4_000, maxFeedbackChars: 4_000, overflowMode: "manifest-and-defer" });
+	const originalCreate = f.runner.create.bind(f.runner);
+	f.runner.create = async (spec) => {
+		const handle = await originalCreate(spec);
+		return { ...handle, toolLog: () => [{ name: "bounded-check", args: { note: "Z".repeat(6_000) }, ok: true, at: "2026-09-23T00:00:00Z" }] };
+	};
+	const goal = await f.controller.begin(begin);
+	const task = await f.controller.delegate(goal.runId, { objective: "核查两项要求", inputs: [], expectedOutputs: [], checks: ["可定位证据"], mode: "reason" });
+	await f.controller.review(goal.runId, { taskId: task.taskId, artifacts: [task.reportPath!], checks: [{ criterion: "可定位证据", result: "passed", evidence: [task.reportPath!] }] });
+	const finished = await f.controller.finish(goal.runId, { outcome: "fulfilled", summary: "已完成原目标硬检查", returnPath: "M04", goalChecks: begin.successCriteria.map((criterion) => ({ criterion, result: "passed", evidence: [task.reportPath!] })) });
+	assert.equal(finished.outcome, "fulfilled");
+	assert.equal(finished.feedbackStatus, "indexed");
+	assert.ok((await readFile(finished.feedbackPath!, "utf8")).length <= 4_000);
+	assert.match(await readFile(path.join(f.ws.runDir("M07", goal.runId), "goal.json"), "utf8"), /Z{6000}/);
+	assert.equal((await f.ws.readRun("M07", goal.runId)).status, "completed");
+	await runM04(f.ctx, { feedback: { kind: "M07", runId: goal.runId }, freshSession: true });
+	const m04 = await f.ws.latestCompletedRun("M04");
+	const coverage = m04!.outputs.find((item) => item.label === "M07 回流证据实际访问范围");
+	assert.ok(coverage);
+	assert.equal(JSON.parse(await readFile(coverage.path, "utf8")).completeness, "unknown");
+	const m04Spec = f.runner.created.at(-1)!;
+	assert.equal(m04Spec.tools.kind, "read-dir");
+	if (m04Spec.tools.kind !== "read-dir") throw new Error("M04 did not grant its M07 read tool");
+	assert.equal(m04Spec.tools.toolName, "m07_evidence_read");
+	assert.equal(m04Spec.tools.root, f.ws.runDir("M07", goal.runId));
+	const model = { id: "offline-model", name: "Offline model", api: "anthropic-messages", provider: "offline", baseUrl: "https://invalid.example", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 10_000, maxTokens: 1_000 } as Model<"anthropic-messages">;
+	let readTool: NonNullable<CreateAgentSessionOptions["customTools"]>[number] | undefined;
+	const runner = new PiSessionRunner({
+		modelRuntime: { getModels: () => [model] } as unknown as ModelRuntime,
+		createSession: (async (options: CreateAgentSessionOptions = {}) => {
+			readTool = options.customTools?.find((tool) => tool.name === "m07_evidence_read");
+			const manager = options.sessionManager!;
+			return { session: { sessionId: manager.getSessionId(), sessionFile: manager.getSessionFile(), messages: [], getActiveToolNames: () => [...(options.tools ?? [])], prompt: async () => undefined, abort: async () => undefined, dispose: () => undefined } } as unknown as Awaited<ReturnType<typeof createAgentSession>>;
+		}) as typeof createAgentSession,
+	});
+	const handle = await runner.create({ ...m04Spec, model: "offline/offline-model", persistDir: path.join(f.root, "offline-read-test") });
+	assert.ok(readTool);
+	const sourceLines = (await readFile(path.join(f.ws.runDir("M07", goal.runId), "goal.json"), "utf8")).split("\n");
+	const logLine = sourceLines.findIndex((line) => line.includes("Z".repeat(100))) + 1;
+	assert.ok(logLine > 1);
+	const first = await readTool.execute("page-one", { path: "goal.json", offset: logLine - 1, limit: 1 }, undefined, undefined, undefined as never);
+	const second = await readTool.execute("page-two", { path: "goal.json", offset: logLine, limit: 1 }, undefined, undefined, undefined as never);
+	assert.doesNotMatch((first.content[0] as { text: string }).text, /Z{100}/);
+	assert.match((second.content[0] as { text: string }).text, /Z{6000}/);
+	assert.deepEqual(handle.readReturnEvents().map((event) => ({ path: event.path, start: event.returned.startLine, end: event.returned.endLine })), [
+		{ path: "goal.json", start: logLine - 1, end: logLine - 1 },
+		{ path: "goal.json", start: logLine, end: logLine },
+	]);
+	handle.dispose();
+});
+
+test("interrupt with oversized feedback closes goal and run with only bounded control facts", async (t) => {
+	const f = await fixture(t);
+	await activateBudget(f.root, { version: 1, maxPromptChars: 8_000, maxInlineFileChars: 1_000, maxAggregateInlineChars: 4_000, maxFeedbackChars: 4_000, overflowMode: "manifest-and-defer" });
+	const goal = await f.controller.begin({ ...begin, goal: `真实长目标 ${"Q".repeat(5_000)}` });
+	const interrupted = await f.controller.interrupt(goal.runId, { reason: "host shutdown", returnPath: "user" });
+	assert.equal(interrupted.lifecycle, "finished");
+	assert.equal(interrupted.outcome, "blocked");
+	assert.equal(interrupted.feedbackStatus, "control-facts-only");
+	const index = await readFile(interrupted.feedbackPath!, "utf8");
+	assert.ok(index.length <= 4_000);
+	assert.match(index, /不是完整 M07 科学证据交接/);
+	assert.match(await readFile(path.join(f.ws.runDir("M07", goal.runId), "goal.json"), "utf8"), /Q{5000}/);
+	const run = await f.ws.readRun("M07", goal.runId);
+	assert.equal(run.status, "failed");
+	assert.match(run.failures.join("\n"), /反馈生成失败/);
+});
+
+test("interrupt records repair-required when even bounded feedback cannot be written", async (t) => {
+	const f = await fixture(t);
+	const goal = await f.controller.begin(begin);
+	await mkdir(path.join(f.ws.runDir("M07", goal.runId), "m04-feedback.md"));
+	const interrupted = await f.controller.interrupt(goal.runId, { reason: "host shutdown", returnPath: "user" });
+	assert.equal(interrupted.feedbackStatus, "failed");
+	assert.equal(interrupted.feedbackPath, undefined);
+	assert.equal(interrupted.feedbackError?.code, "m07.archive-repair-required");
+	assert.equal((await f.controller.status(goal.runId)).lifecycle, "finished");
+	const run = await f.ws.readRun("M07", goal.runId);
+	assert.equal(run.status, "failed");
 	assert.ok(!run.outputs.some((item) => item.label === "M07 实际执行反馈包"));
+	assert.match(run.failures.join("\n"), /无反馈包，交接需修复/);
+});
+
+test("continuous goal refuses model-declared hard stops and only host lifecycle creates a stop receipt", async (t) => {
+	const f = await fixture(t);
+	const goal = await f.controller.begin(begin, { executionContract: "continuous" });
+	assert.equal((await f.controller.status(goal.runId)).executionContract?.mode, "continuous");
+	await assert.rejects(f.controller.finish(goal.runId, { outcome: "blocked", summary: "smem 太小，当前候选失败", returnPath: "user", limitations: ["stopReason=dependency_unavailable"], goalChecks: begin.successCriteria.map((criterion) => ({ criterion, result: "not_run", evidence: [] })) }), (error: unknown) => error instanceof HarnessError && error.code === "m07.continuous");
+	await assert.rejects(f.controller.interrupt(goal.runId, { reason: "模型自称 user_stopped" }), (error: unknown) => error instanceof HarnessError && error.code === "m07.continuous");
+	assert.equal((await f.controller.status(goal.runId)).lifecycle, "active");
+	assert.equal((await f.ws.readRun("M07", goal.runId)).status, "running");
+	await assert.rejects(f.controller.hostInterrupt(goal.runId, { reasonKind: "unknown" as never }), /未知宿主停止事件/);
+	const archived = await f.controller.hostInterrupt(goal.runId, { reasonKind: "provider-error", sourceEventId: "session-1" });
+	assert.equal(archived.lifecycle, "finished");
+	assert.equal(archived.outcome, "blocked");
+	assert.equal(archived.hostStopReceipt?.goalRunId, goal.runId);
+	assert.equal(archived.hostStopReceipt?.reasonKind, "provider-error");
+	assert.equal(archived.hostStopReceipt?.source, "pi-host");
+	assert.ok(archived.hostStopReceipt?.id);
+	assert.equal((await f.ws.readRun("M07", goal.runId)).status, "failed");
 });
 
 test("review rejects fake completion and requires a relevant independent check report", async (t) => {

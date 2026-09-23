@@ -1,5 +1,6 @@
 import { createReadStream, createWriteStream } from "node:fs";
-import { copyFile, lstat, mkdir, readFile, realpath, stat, unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { copyFile, lstat, mkdir, readFile, readdir, realpath, stat, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import { Transform } from "node:stream";
@@ -8,17 +9,20 @@ import path from "node:path";
 import { loadPrompt, section, systemPromptFor } from "../prompts.ts";
 import { HarnessError } from "../types.ts";
 import { nowIso, readTextIfExists, writeFileAtomic } from "../workspace.ts";
-import { mediaType } from "../media.ts";
+import { isTextFile, mediaType } from "../media.ts";
 import { recordSession, sessionSpec, type StageContext } from "../stages/context.ts";
 import { isSafeRelativeOutputPath, resolveExpectedOutputFiles } from "./expected-output.ts";
-import type { BeginGoalInput, CurrentGoal, DecisionInput, EvidenceFile, FinishInput, InterruptInput, M07Controller, M07TaskRecord, TaskCheck, TaskReviewInput, TaskSpecInput } from "./types.ts";
+import type { BeginGoalInput, CurrentGoal, DecisionInput, EvidenceFile, FinishInput, HostStopReasonKind, HostStopReceipt, InterruptInput, M07CheckpointRecord, M07Controller, M07TaskRecord, TaskCheck, TaskReviewInput, TaskSpecInput } from "./types.ts";
 import type { StageRunRecord } from "../types.ts";
 import { loadActiveBudgetPolicy, projectInline, validateActiveBudgetPointer, validateBudgetPolicy, type BudgetPolicy } from "../improvement/policy.ts";
 import { capturedRunBytes, DEFAULT_PROJECTION_SNAPSHOT_LIMITS, newProjectionEvent, nextProjectionOrdinal, writeProjectionEvent, type ProjectionEventV1, type ProjectionMaterialV1, type ProjectionSnapshotLimits } from "../improvement/observations.ts";
-import { createExperienceProvider } from "../knowledge/experience-index.ts";
-import type { KnowledgeStore } from "../knowledge/types.ts";
+import { createExperienceProvider, verifyRequiredKnowledge } from "../knowledge/experience-index.ts";
+import type { KnowledgeRef, KnowledgeStore } from "../knowledge/types.ts";
+import { GenerationStore, isM07WorkflowStrategy } from "../improvement/generation.ts";
 
 const STATE = "goal.json";
+const HOST_STOP_KEY = Symbol("m07-host-stop");
+const HOST_STOP_REASONS: ReadonlySet<HostStopReasonKind> = new Set(["request-aborted", "provider-error", "session-shutdown", "no-progress"]);
 function nonempty(value: string, label: string): string {
 	if (!value?.trim()) throw new HarnessError("m07.input", `${label} 不能为空`);
 	return value.trim();
@@ -87,6 +91,26 @@ async function activePolicySnapshot(ctx: StageContext): Promise<{ policy: Budget
 function frozenPolicy(goal: CurrentGoal): BudgetPolicy {
 	if (!goal.budgetPolicy || !goal.budgetPolicyVersionId || !goal.budgetPolicyFrozenAt) throw new HarnessError("m07.policy-legacy", `M07 目标 ${goal.runId} 创建于策略冻结机制之前；可查看，但不得悄悄套用当前 active policy 继续委派或生成反馈，请新建目标`);
 	return validateBudgetPolicy(goal.budgetPolicy);
+}
+
+async function verifyFrozenWorkflowMethod(ctx: StageContext, goal: CurrentGoal, registeredStores?: ReadonlyMap<string, KnowledgeStore>, task?: TaskSpecInput): Promise<void> {
+	if (!goal.workflowMethod) return;
+	if (task) {
+		const provider = createExperienceProvider(ctx.store, registeredStores);
+		for (const targetKind of ["executor", "improver"] as const) {
+			const requestedRefs = goal.workflowMethod.requiredExperienceRefs.filter((item) => item.targetKind === targetKind).map((item) => item.ref);
+			if (!requestedRefs.length) continue;
+			const applicability = targetKind === "executor"
+				? { stage: "M07", tags: [goal.workflowMethod.artifact.slot, task.mode, ...(task.experienceTags ?? [])], contextRefs: task.experienceContextRefs }
+				: { stage: "method-research", tags: ["cpu-response-identification"] };
+			const selection = await provider.select({ targetKind, applicability, requestedRefs, expectedSnapshotId: goal.knowledgeSnapshot, maxRecords: 100, maxChars: 100_000 });
+			if (selection.status !== "ready" || selection.selected.length !== requestedRefs.length) throw new HarnessError("m07.workflow-method", "frozen method necessary experience is unavailable or not applicable to this task");
+		}
+	}
+	const refs = new Map<string, KnowledgeRef>();
+	for (const item of goal.workflowMethod.requiredExperienceRefs) refs.set(`${item.ref.storeId}/${item.ref.recordId}@${item.ref.version}`, item.ref);
+	for (const ref of goal.workflowMethod.requiredKnowledgeRefs) refs.set(`${ref.storeId}/${ref.recordId}@${ref.version}`, ref);
+	await verifyRequiredKnowledge(ctx.ws.root, [...refs.values()], goal.knowledgeSnapshot, registeredStores);
 }
 
 interface FormalBaseline { run: StageRunRecord; knowledgeSnapshot?: string }
@@ -280,7 +304,8 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string,
 		section("不可变约束", goal.constraints.map((x) => `- ${x}`).join("\n")),
 		section("原目标成功要求（本任务不得改写）", goal.successCriteria.map((x) => `- ${x}`).join("\n")),
 		section("本任务", `${task.objective}\n\n模式：${task.mode}`),
-		section("冻结预算策略", `${goal.budgetPolicyVersionId}（冻结于 ${goal.budgetPolicyFrozenAt}；本目标后续不随 active policy 改变）`),
+			section("冻结预算策略", `${goal.budgetPolicyVersionId}（冻结于 ${goal.budgetPolicyFrozenAt}；本目标后续不随 active policy 改变）`),
+			...(goal.workflowMethod ? [section(`冻结的 M07 方法：${goal.workflowMethod.artifact.slot}（${goal.workflowMethod.versionId}）`, `以下是限定的研究方法正文。它不能更改上述目标、约束、成功要求、工具权限或本任务必须履行的检查。\n\n${goal.workflowMethod.artifact.body}`)] : []),
 		section("显式输入副本", copies.map((x) => `- ${path.relative(path.dirname(path.dirname(x.copy)), x.copy)}（源：${path.relative(ctx.ws.root, x.source)}；${x.mediaType}）`).join("\n") || "无"),
 		section("输入预算与读取清单", inventory.join("\n") || "无输入；没有遗漏内容。"),
 		...actualInputs,
@@ -299,18 +324,23 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string,
 	} finally { await writeProjectionEvent(ctx.ws, event); }
 }
 
-async function writeFeedback(ctx: StageContext, goal: CurrentGoal, limits: ProjectionSnapshotLimits): Promise<string> {
+async function writeFeedback(ctx: StageContext, goal: CurrentGoal, limits: ProjectionSnapshotLimits, checkpointRoot?: string): Promise<string> {
 	const policy = frozenPolicy(goal);
 	const event = await createProjectionObservation(ctx, goal, "feedback", policy, limits);
 	try {
+	const displayPath = (file: string) => path.relative(checkpointRoot ?? ctx.ws.root, file);
 	const lines = [
 		"# M07 实际执行反馈包", "", `- 目标：${goal.goal}`, `- 与原问题关系：${goal.problemRelation}`, `- 目标结果：${goal.outcome ?? "进行中"}`, `- 返回路径：${goal.returnPath ?? "未选择"}`, `- 正式基线：${goal.formalBaseline ? "是" : "否（探索性）"}`, `- 知识快照：${goal.knowledgeSnapshot ?? "无"}`, `- 冻结预算策略：${goal.budgetPolicyVersionId}（${goal.budgetPolicyFrozenAt}）`, "",
+		...(checkpointRoot ? ["- 这是 active 目标的非终态开发 checkpoint；不改变原成功要求，不表示 fulfilled，也不表示 M04 已核验全部证据。", "- 本次 M04 只允许读取本 checkpoint 冻结目录，所有材料路径均相对于该目录。", ""] : []),
+		...(goal.checkpointScope ? [`- 本批已选任务 ${goal.checkpointScope.selectedTaskIds.length}：${goal.checkpointScope.selectedTaskIds.slice(0, 20).join("、") || "无"}${goal.checkpointScope.selectedTaskIds.length > 20 ? "（其余见 manifest.json）" : ""}；未选任务 ${goal.checkpointScope.omittedTaskIds.length}：${goal.checkpointScope.omittedTaskIds.slice(0, 20).join("、") || "无"}${goal.checkpointScope.omittedTaskIds.length > 20 ? "（其余见 manifest.json）" : ""}。未选任务的评审证据未交接，完整任务范围见 manifest.json。`, ""] : []),
+		...(goal.workflowMethod ? [`- 实际装载的 M07 方法：${goal.workflowMethod.versionId}（${goal.workflowMethod.artifact.slot}）；仅作为研究方法，不改变原成功要求或 M04 科学判断。`, ""] : []),
 		"## 原成功要求", "", ...goal.successCriteria.map((x) => `- ${x}`), "", "## 任务与实际证据", "",
 	];
+	if (goal.workflowMethod?.artifact.slot === "evidence-handoff") lines.push("## 冻结的证据交接方法", "", "以下方法正文曾作为 M07 任务指导；这里保留其版本与内容以供 M04 核对，实际证据与未执行项仍以本包记录为准。", "", goal.workflowMethod.artifact.body, "");
 	for (const task of goal.tasks) {
-		lines.push(`### ${task.taskId} ${task.objective}`, "", `- 状态：${task.status}`, `- 模式：${task.mode}`, `- 会话报告：${task.reportPath ? path.relative(ctx.ws.root, task.reportPath) : "未产生"}`, `- 实际读取：${task.readCoverage.join("、") || "无可记录读取"}`);
-		for (const artifact of task.review?.artifacts ?? []) lines.push(`- 产物：${path.relative(ctx.ws.root, artifact.path)}（${artifact.mediaType === "text" ? "文本，纳入下方实际内容" : "二进制，未读取内容"}）`);
-		for (const check of task.review?.checks ?? []) lines.push(`- 检查 ${check.result}：${check.criterion}；证据 ${check.evidence.map((p) => path.relative(ctx.ws.root, p)).join("、") || "无"}`);
+		lines.push(`### ${task.taskId} ${task.objective}`, "", `- 状态：${task.status}`, `- 模式：${task.mode}`, `- 会话报告：${task.reportPath ? displayPath(task.reportPath) : "未产生"}`, `- 实际读取：${task.readCoverage.join("、") || "无可记录读取"}`);
+		for (const artifact of task.review?.artifacts ?? []) lines.push(`- 产物：${displayPath(artifact.path)}（${artifact.mediaType === "text" ? "文本，纳入下方实际内容" : "二进制，未读取内容"}）`);
+		for (const check of task.review?.checks ?? []) lines.push(`- 检查 ${check.result}：${check.criterion}；证据 ${check.evidence.map(displayPath).join("、") || "无"}`);
 		for (const failure of task.review?.failures ?? []) lines.push(`- 失败：${failure}`);
 		for (const item of task.review?.unexecuted ?? []) lines.push(`- 未执行：${item}`);
 		for (const limitation of task.review?.limitations ?? []) lines.push(`- 限制：${limitation}`);
@@ -331,7 +361,7 @@ async function writeFeedback(ctx: StageContext, goal: CurrentGoal, limits: Proje
 	}
 	let aggregateInline = 0;
 	for (const [materialPath, { role, optional }] of materialPaths) {
-		const relative = path.relative(ctx.ws.runDir("M07", goal.runId), materialPath);
+		const relative = path.relative(checkpointRoot ?? ctx.ws.runDir("M07", goal.runId), materialPath);
 		const type = mediaType(materialPath);
 		const materialRecord = projectionMaterial(ctx, event, event.materials.length, role, materialPath, type);
 		event.materials.push(materialRecord);
@@ -355,15 +385,19 @@ async function writeFeedback(ctx: StageContext, goal: CurrentGoal, limits: Proje
 		if (canInline) { lines.push(material.text!, ""); aggregateInline = projection.nextAggregateChars; }
 		else if (policy.overflowMode === "manifest-and-fail") { event.projectionStatus = "budget-failed"; throw new HarnessError("context.budget", `M07 反馈证据 ${relative} 超出内联预算；冻结原文仍保留，策略要求拒绝生成延后读取包`); }
 	}
-	lines.push("## 原目标验收", "", ...(goal.goalChecks?.map((c) => `- ${c.result}：${c.criterion}；证据 ${c.evidence.map((p) => path.relative(ctx.ws.root, p)).join("、") || "无"}`) ?? ["- 未验收"]), "", "## 用户决定事项", "", ...(goal.decisions.length ? goal.decisions.map((d) => `- ${d.status}：${d.question}${d.decision ? `；决定：${d.decision}` : ""}`) : ["- 无"]), "", "## 总结与限制", "", goal.finishSummary ?? "尚未结束", ...goal.limitations.map((x) => `- ${x}`));
+	lines.push("## 原目标验收", "", ...(goal.goalChecks?.map((c) => `- ${c.result}：${c.criterion}；证据 ${c.evidence.map(displayPath).join("、") || "无"}`) ?? ["- 未验收"]), "", "## 用户决定事项", "", ...(goal.decisions.length ? goal.decisions.map((d) => `- ${d.status}：${d.question}${d.decision ? `；决定：${d.decision}` : ""}`) : ["- 无"]), "", "## 总结与限制", "", goal.finishSummary ?? "尚未结束", ...goal.limitations.map((x) => `- ${x}`));
 	const feedback = lines.join("\n");
 	if (feedback.length > policy.maxFeedbackChars) { event.projectionStatus = "budget-failed"; throw new HarnessError("context.budget", `M07 反馈包的控制事实与预算内清单共 ${feedback.length} 字符，超过上限 ${policy.maxFeedbackChars}；未静默截断`); }
-	const target = path.join(ctx.ws.runDir("M07", goal.runId), "m04-feedback.md");
+	const target = path.join(checkpointRoot ?? ctx.ws.runDir("M07", goal.runId), "m04-feedback.md");
 	await writeFileAtomic(target, feedback);
 	event.projectionStatus = "materialized";
 	event.outputPath = path.relative(ctx.ws.runDir("M07", goal.runId), target);
 	return target;
 	} finally { await writeProjectionEvent(ctx.ws, event); }
+}
+
+function isFeedbackControlOverflow(error: unknown): boolean {
+	return error instanceof HarnessError && error.code === "context.budget" && error.message.startsWith("M07 反馈包的控制事实与预算内清单共 ");
 }
 
 async function writeLegacyInterruptFeedback(ctx: StageContext, goal: CurrentGoal): Promise<string> {
@@ -390,15 +424,154 @@ async function writeLegacyInterruptFeedback(ctx: StageContext, goal: CurrentGoal
 	}
 	lines.push("## 总结与限制", "", goal.finishSummary ?? "受控中断", ...goal.limitations.map((item) => `- ${item}`), "", "- legacy 归档没有证据正文覆盖，不能作为证据完整性或科学结论证明。", "");
 	const target = path.join(ctx.ws.runDir("M07", goal.runId), "m04-feedback.md");
-	await writeFileAtomic(target, lines.join("\n"));
+	const feedback = lines.join("\n");
+	if (feedback.length > 4_000) throw new HarnessError("context.budget", `M07 legacy 中断控制事实共 ${feedback.length} 字符，超过归档上限 4000；原记录未截断`);
+	await writeFileAtomic(target, feedback);
 	return target;
+}
+
+/** A bounded handoff index; the complete source stays in goal.json and frozen task files. */
+async function writeBoundedFeedbackIndex(ctx: StageContext, goal: CurrentGoal, mode: "finish" | "interrupt" | "checkpoint", checkpointRoot?: string): Promise<string> {
+	const cap = goal.budgetPolicy ? frozenPolicy(goal).maxFeedbackChars : 4_000;
+	const taskCounts = new Map<string, number>();
+	for (const task of goal.tasks) taskCounts.set(task.status, (taskCounts.get(task.status) ?? 0) + 1);
+	const lines = [
+		mode === "finish" ? "# M07 已结束目标：有界反馈索引" : mode === "checkpoint" ? "# M07 active 目标：非终态开发 checkpoint 有界索引" : goal.budgetPolicy ? "# M07 受控中断：仅控制事实" : "# M07 legacy 受控中断反馈包：仅控制事实", "",
+		`- M07 runId：${goal.runId}`,
+		...(goal.checkpointScope ? [`- 本批已选任务 ${goal.checkpointScope.selectedTaskIds.length}：${goal.checkpointScope.selectedTaskIds.slice(0, 20).join("、") || "无"}${goal.checkpointScope.selectedTaskIds.length > 20 ? "（其余见 manifest.json）" : ""}；未选任务 ${goal.checkpointScope.omittedTaskIds.length}：${goal.checkpointScope.omittedTaskIds.slice(0, 20).join("、") || "无"}${goal.checkpointScope.omittedTaskIds.length > 20 ? "（其余见 manifest.json）" : ""}。未选任务的评审证据未交接。`] : []),
+		mode === "checkpoint" ? "- 目标仍 active；M07 run 仍 running。本快照不是目标终态，也不证明原成功要求已满足。" : `- 目标终态：${goal.outcome ?? "未知"}；M07 run 终态：${mode === "interrupt" || goal.outcome === "blocked" ? "failed" : "completed"}。目标结果由控制器硬检查确定，本索引不新增科学结论。`,
+		`- 任务总数：${goal.tasks.length}；状态计数：${[...taskCounts].map(([status, count]) => `${status}=${count}`).join("，") || "无任务"}。`,
+		`- 完整控制记录：${STATE}（含任务、工具日志、目标检查、限制及原始引用）；M04 可用 m07_evidence_read 对 goal.json 按 offset/limit 分段实际读取。`,
+		"- 原证据位置：请按 goal.json 的各任务 reportPath、review.frozenReportPath、review.artifacts 与 review.checks.evidence 定位；文件内容未由本包读取。",
+		"- 省略类别：目标与任务长文本、工具日志、检查明细、产物正文、逐项证据清单；没有把这些内容截断后冒充完整反馈。",
+		`- 完整反馈失败类别：${goal.feedbackError?.code ?? "unknown"}；详情见 goal.json 的 feedbackError。`,
+		mode === "finish" ? "- 这是有界反馈索引，不是完整 M07 科学证据交接。即使目标硬检查为 fulfilled，也不代表 M04 已读完整记录或独立确认科学结论。" : mode === "checkpoint" ? "- 这是非终态开发索引，不是完整科学证据交接。M04 可按需读取冻结材料；不能由本包断言全部材料已读或目标 fulfilled。" : "- 这是退出归档的有界索引，不是完整 M07 科学证据交接。M04 可以读取这些中断事实；不能由本包断言科学验证通过、全部材料已读或目标 fulfilled。",
+		...(goal.budgetPolicy ? [] : ["- 冻结预算策略：缺失（旧记录）；未套用当前 active policy。本包不读取、不内联、不截断证据正文。"]),
+		"- 后续如需证据，应另按原路径实际读取并记录覆盖范围；路径存在不代表内容已读取。",
+	];
+	const feedback = lines.join("\n");
+	if (feedback.length > cap) throw new HarnessError(mode === "finish" ? "context.budget" : "m07.archive-repair-required", `M07 有界反馈索引 ${feedback.length} 字符超过上限 ${cap}；goal.json 保留完整记录，需修复反馈交接`);
+	const target = path.join(checkpointRoot ?? ctx.ws.runDir("M07", goal.runId), "m04-feedback.md");
+	await writeFileAtomic(target, feedback);
+	return target;
+}
+
+/** Freeze only reviewed task evidence and the problem inputs needed by M04. */
+async function freezeCheckpoint(ctx: StageContext, goal: CurrentGoal, limits: ProjectionSnapshotLimits, selectedTaskIds: string[]): Promise<M07CheckpointRecord> {
+	const runDir = ctx.ws.runDir("M07", goal.runId);
+	const checkpointsDir = path.join(runDir, "checkpoints");
+	await mkdir(checkpointsDir, { recursive: true });
+	let id = "";
+	let rootDir = "";
+	for (let ordinal = (goal.checkpoints?.length ?? 0) + 1; ordinal <= 9999; ordinal++) {
+		const candidateId = `C${String(ordinal).padStart(3, "0")}`;
+		const candidateDir = path.join(checkpointsDir, candidateId);
+		try {
+			await mkdir(candidateDir); // Never overwrite or remove an incomplete prior attempt.
+			id = candidateId;
+			rootDir = candidateDir;
+			break;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		}
+	}
+	if (!id) throw new HarnessError("m07.checkpoint", "checkpoint 编号已用尽；本次快照未登记，原目标仍 active");
+	const frozen = structuredClone(goal);
+	delete frozen.checkpoints;
+	const selected = new Set(selectedTaskIds);
+	const omittedTaskIds = goal.tasks.filter((task) => !selected.has(task.taskId)).map((task) => task.taskId);
+	frozen.checkpointScope = { selectedTaskIds, omittedTaskIds };
+	const files: Array<{ sourceRelativePath: string; relativePath: string; bytes: number }> = [];
+	const copies = new Map<string, string>();
+	let totalBytes = 0;
+	const copy = async (source: string, relativePath: string, kind: "review" | "problem" | "raw"): Promise<string> => {
+		if (files.length >= 256) throw new HarnessError("m07.checkpoint", "本次 checkpoint 局部文件数超过 256；快照未登记，目标仍 active。可调整待交接材料后重试，不代表全工作流资源耗尽");
+		const sourcePath = path.resolve(source);
+		const found = copies.get(sourcePath);
+		if (found) return found;
+		const info = await lstat(sourcePath);
+		if (!info.isFile() || info.isSymbolicLink()) throw new HarnessError("m07.checkpoint", "checkpoint 来源必须是无符号链接的固定文件");
+		const expectedRoot = kind === "raw" ? ctx.ws.rawDir : runDir;
+		const realSource = await realpath(sourcePath);
+		const realRoot = await realpath(expectedRoot);
+		if (!inside(realRoot, realSource)) throw new HarnessError("m07.checkpoint", "checkpoint 来源越过允许目录");
+		if (kind === "review" && !/^tasks[/\\]T\d{3,}[/\\]review-snapshot[/\\][^/\\]+$/.test(path.relative(realRoot, realSource))) throw new HarnessError("m07.checkpoint", "仅允许复制已评审冻结材料");
+		if (kind === "problem" && realSource !== await realpath(goal.problemSnapshotPath)) throw new HarnessError("m07.checkpoint", "原问题来源与 begin 冻结副本不符");
+		if (info.size > 8 * 1024 * 1024 || totalBytes + info.size > 64 * 1024 * 1024) throw new HarnessError("m07.checkpoint", "本次 checkpoint 局部冻结材料超过 8 MiB/文件或 64 MiB/批；快照未登记，目标仍 active。可调整待交接材料后重试，不代表全工作流资源耗尽");
+		const target = path.join(rootDir, relativePath);
+		if (!inside(rootDir, target)) throw new HarnessError("m07.checkpoint", "checkpoint 目标路径非法");
+		const copied = await copySnapshotBounded(sourcePath, target, 8 * 1024 * 1024);
+		if (copied !== info.size || (await stat(sourcePath)).size !== info.size) throw new HarnessError("m07.checkpoint", "checkpoint 来源在复制期间改变；未登记不完整快照");
+		totalBytes += copied;
+		copies.set(sourcePath, target);
+		files.push({ sourceRelativePath: path.relative(await realpath(ctx.ws.root), realSource), relativePath, bytes: copied });
+		return target;
+	};
+	const problemFile = "problem.md";
+	await copy(goal.problemSnapshotPath, problemFile, "problem");
+	const rawFiles: Array<{ name: string; relativePath: string }> = [];
+	const skippedRaw: string[] = [];
+	if (existsSync(ctx.ws.rawDir)) {
+		const rawNames = (await readdir(ctx.ws.rawDir)).sort();
+		if (rawNames.length > 256) throw new HarnessError("m07.checkpoint", "本次 checkpoint 原始材料条目超过 256；快照未登记，目标仍 active。可调整本批材料后重试，不代表全工作流资源耗尽");
+		for (const name of rawNames) {
+			const source = path.join(ctx.ws.rawDir, name);
+			const info = await lstat(source);
+			if (!info.isFile()) continue;
+			if (!isTextFile(name)) { skippedRaw.push(name); continue; }
+			const relativePath = path.join("raw", name);
+			await copy(source, relativePath, "raw");
+			rawFiles.push({ name, relativePath });
+		}
+	}
+	const remap = async (source: string): Promise<string> => {
+		const relative = path.relative(await realpath(runDir), await realpath(source));
+		return copy(source, path.join("evidence", relative), "review");
+	};
+	for (const task of frozen.tasks) {
+		// The checkpoint exposes no live work/input directory as readable evidence.
+		task.workDir = "";
+		task.inputCopies = [];
+		task.expectedOutputPaths = [];
+		if (!selected.has(task.taskId)) { delete task.reportPath; delete task.review; continue; }
+		if (!task.review) { delete task.reportPath; continue; }
+		task.review.frozenReportPath = await remap(task.review.frozenReportPath);
+		task.reportPath = task.review.frozenReportPath;
+		for (const artifact of task.review.artifacts) { artifact.path = await remap(artifact.path); delete artifact.sourcePath; }
+		for (const check of task.review.checks) check.evidence = await Promise.all(check.evidence.map(remap));
+		if (task.review.independentCheck) task.review.independentCheck.report = await remap(task.review.independentCheck.report);
+	}
+	frozen.problemSnapshotPath = path.join(rootDir, problemFile);
+	const goalSnapshotPath = path.join(rootDir, STATE);
+	const manifestPath = path.join(rootDir, "manifest.json");
+	const sourceGoalUpdatedAt = goal.updatedAt;
+	await writeFileAtomic(goalSnapshotPath, `${JSON.stringify(frozen, null, 2)}\n`);
+	let feedbackPath: string;
+	let feedbackStatus: M07CheckpointRecord["feedbackStatus"];
+	try {
+		feedbackPath = await writeFeedback(ctx, frozen, limits, rootDir);
+		feedbackStatus = "complete";
+	} catch (error) {
+		if (!isFeedbackControlOverflow(error)) throw error;
+		frozen.feedbackError = { code: "context.budget", summary: (error as Error).message.slice(0, 500) };
+		feedbackPath = await writeBoundedFeedbackIndex(ctx, frozen, "checkpoint", rootDir);
+		feedbackStatus = "indexed";
+	}
+	frozen.feedbackPath = feedbackPath;
+	frozen.feedbackStatus = feedbackStatus;
+	await writeFileAtomic(goalSnapshotPath, `${JSON.stringify(frozen, null, 2)}\n`);
+	await writeFileAtomic(manifestPath, `${JSON.stringify({ version: 1, m07RunId: goal.runId, checkpointId: id, createdAt: nowIso(), problemFile, rawFiles, skippedRaw, selectedTaskIds, omittedTaskIds, files }, null, 2)}\n`);
+	const record: M07CheckpointRecord = { id, createdAt: nowIso(), rootDir, goalSnapshotPath, feedbackPath, manifestPath, feedbackStatus, sourceGoalUpdatedAt };
+	goal.checkpoints = [...(goal.checkpoints ?? []), record];
+	await save(ctx, goal);
+	return record;
 }
 
 export function createM07Controller(ctx: StageContext, options: { projectionSnapshotLimits?: ProjectionSnapshotLimits; registeredExperienceStores?: ReadonlyMap<string, KnowledgeStore> } = {}): M07Controller {
 	const snapshotLimits = options.projectionSnapshotLimits ?? DEFAULT_PROJECTION_SNAPSHOT_LIMITS;
 	if (!Number.isSafeInteger(snapshotLimits.perMaterialBytes) || !Number.isSafeInteger(snapshotLimits.perCallBytes) || !Number.isSafeInteger(snapshotLimits.perRunBytes) || snapshotLimits.perMaterialBytes <= 0 || snapshotLimits.perCallBytes < snapshotLimits.perMaterialBytes || snapshotLimits.perRunBytes < snapshotLimits.perCallBytes) throw new HarnessError("m07.projection-budget", "invalid projection snapshot limits");
 	return {
-		async begin(input) {
+		async begin(input, beginOptions) {
 			nonempty(input.goal, "goal"); nonempty(input.problemRelation, "problemRelation"); nonempty(input.plan, "plan");
 			if (!input.constraints.length || !input.successCriteria.length) throw new HarnessError("m07.input", "constraints 与 successCriteria 必须明确且非空");
 			input.constraints = normalizedUnique(input.constraints, "constraint"); input.successCriteria = normalizedUnique(input.successCriteria, "success criterion");
@@ -408,28 +581,69 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			catch (error) { if (!input.exploratory) throw error; }
 			if (!baseline && !input.exploratory) throw new HarnessError("m07.baseline", "没有可用的 M04 正式基线；只能显式 exploratory=true 开始探索性 M07，不能声称正式结论");
 			const budget = await activePolicySnapshot(ctx);
+			let workflowMethod: CurrentGoal["workflowMethod"];
+			if (input.workflowMethodVersionId !== undefined) {
+				const generations = new GenerationStore(ctx.ws.root);
+				const active = await generations.active();
+				if (!active || active.bundle.executorVersionId !== input.workflowMethodVersionId) throw new HarnessError("m07.workflow-method", "explicit workflow method is not the active H version");
+				const method = await generations.readStrategy(input.workflowMethodVersionId);
+				if (method.kind !== "executor" || !isM07WorkflowStrategy(method.artifact) || !["admitted", "manual-active"].includes(method.state)) throw new HarnessError("m07.workflow-method", "active H is not an admitted or manually bound M07 workflow method");
+				if (active.bundle.knowledgeSnapshot !== baseline?.knowledgeSnapshot) throw new HarnessError("m07.workflow-method", "workflow method and M04 baseline have different knowledge epochs");
+				workflowMethod = { versionId: method.versionId, artifact: method.artifact, requiredExperienceRefs: method.requiredExperienceRefs, requiredKnowledgeRefs: method.requiredKnowledgeRefs };
+				const frozenRefs = new Map<string, KnowledgeRef>();
+				for (const item of workflowMethod.requiredExperienceRefs) frozenRefs.set(`${item.ref.storeId}/${item.ref.recordId}@${item.ref.version}`, item.ref);
+				for (const ref of workflowMethod.requiredKnowledgeRefs) frozenRefs.set(`${ref.storeId}/${ref.recordId}@${ref.version}`, ref);
+				await verifyRequiredKnowledge(ctx.ws.root, [...frozenRefs.values()], baseline?.knowledgeSnapshot, options.registeredExperienceStores);
+			}
 			const record = await ctx.ws.startRun("M07", [{ label: "原始问题", path: problem.path }], baseline?.knowledgeSnapshot);
 			const frozen = path.join(ctx.ws.runDir("M07", record.runId), "problem-snapshot.md");
 			await writeFileAtomic(frozen, problem.content);
 			const exploratory = input.exploratory === true || !baseline;
-			const goal: CurrentGoal = { version: 1, runId: record.runId, lifecycle: "active", startedAt: record.startedAt, updatedAt: record.startedAt, goal: input.goal.trim(), problemRelation: input.problemRelation.trim(), constraints: input.constraints.map((x) => nonempty(x, "constraint")), successCriteria: input.successCriteria.map((x) => nonempty(x, "success criterion")), plan: input.plan.trim(), exploratory, formalBaseline: !!baseline && !exploratory, problemSnapshotPath: frozen, knowledgeSnapshot: baseline?.knowledgeSnapshot, m04BaselineRunId: baseline?.run.runId, baselineHistory: baseline ? [{ at: record.startedAt, knowledgeSnapshot: baseline.knowledgeSnapshot, m04RunId: baseline.run.runId }] : [], budgetPolicy: budget.policy, budgetPolicyVersionId: budget.versionId, budgetPolicyFrozenAt: record.startedAt, methodBinding: { versionId: budget.versionId }, tasks: [], decisions: [], limitations: [] };
+			const goal: CurrentGoal = { version: 1, runId: record.runId, lifecycle: "active", startedAt: record.startedAt, updatedAt: record.startedAt, goal: input.goal.trim(), problemRelation: input.problemRelation.trim(), constraints: input.constraints.map((x) => nonempty(x, "constraint")), successCriteria: input.successCriteria.map((x) => nonempty(x, "success criterion")), plan: input.plan.trim(), exploratory, formalBaseline: !!baseline && !exploratory, problemSnapshotPath: frozen, knowledgeSnapshot: baseline?.knowledgeSnapshot, m04BaselineRunId: baseline?.run.runId, baselineHistory: baseline ? [{ at: record.startedAt, knowledgeSnapshot: baseline.knowledgeSnapshot, m04RunId: baseline.run.runId }] : [], budgetPolicy: budget.policy, budgetPolicyVersionId: budget.versionId, budgetPolicyFrozenAt: record.startedAt, methodBinding: { versionId: workflowMethod?.versionId ?? budget.versionId }, ...(workflowMethod ? { workflowMethod } : {}), ...(beginOptions?.executionContract === "continuous" ? { executionContract: { version: 1 as const, mode: "continuous" as const, frozenAt: record.startedAt } } : {}), tasks: [], decisions: [], limitations: [] };
 			await save(ctx, goal);
 			return goal;
 		},
 
 		status: (runId) => load(ctx, runId),
 
-		async plan(runId, plan, options) {
-			const goal = await load(ctx, runId); requireActive(goal); goal.plan = nonempty(plan, "plan");
-			if (options?.refreshBaseline) {
+		async plan(runId, plan, planOptions) {
+			const goal = await load(ctx, runId); requireActive(goal);
+			if (Boolean(planOptions?.checkpointId) !== Boolean(planOptions?.m04RunId)) throw new HarnessError("m07.checkpoint", "refreshBaseline 的 checkpointId 与 m04RunId 必须成对指定");
+			if ((planOptions?.checkpointId || planOptions?.m04RunId) && !planOptions?.refreshBaseline) throw new HarnessError("m07.checkpoint", "checkpoint 消费绑定仅适用于 refreshBaseline");
+			const nextPlan = nonempty(plan, "plan");
+			if (planOptions?.refreshBaseline) {
 				const baseline = await latestFormalBaseline(ctx); if (!baseline) throw new HarnessError("m07.baseline", "没有可用于刷新基线的 M04 运行");
+				if (goal.checkpoints?.length && (!planOptions.checkpointId || !planOptions.m04RunId)) throw new HarnessError("m07.checkpoint", "checkpoint 后刷新基线必须显式绑定 checkpointId 与 M04 runId");
+				if (planOptions.checkpointId && planOptions.m04RunId) {
+					const checkpoint = goal.checkpoints?.find((item) => item.id === planOptions.checkpointId);
+					if (!checkpoint || baseline.run.runId !== planOptions.m04RunId) throw new HarnessError("m07.checkpoint", "checkpoint 或最新 M04 运行不匹配");
+					const sourceOutput = baseline.run.outputs.find((item) => item.label === "M07 处理来源");
+					if (!sourceOutput || path.resolve(sourceOutput.path) !== path.join(ctx.ws.runDir("M04", baseline.run.runId), "m07-source.json")) throw new HarnessError("m07.checkpoint", "M04 缺少控制器登记的 checkpoint 来源");
+					const source = JSON.parse(await readFile(sourceOutput.path, "utf8")) as { m07RunId?: string; checkpointId?: string; rootDir?: string; goalSnapshotPath?: string; manifestPath?: string };
+					if (source.m07RunId !== runId || source.checkpointId !== checkpoint.id || source.rootDir !== checkpoint.rootDir || source.goalSnapshotPath !== checkpoint.goalSnapshotPath || source.manifestPath !== checkpoint.manifestPath) throw new HarnessError("m07.checkpoint", "M04 来源并非本目标对应的冻结 checkpoint");
+				}
+				if (goal.workflowMethod && baseline.knowledgeSnapshot !== goal.knowledgeSnapshot) throw new HarnessError("m07.workflow-method", "已冻结工作流方法的目标不能热更新知识版本；请新建目标并显式绑定新方法版本");
+				await verifyFrozenWorkflowMethod(ctx, goal, options.registeredExperienceStores);
 				goal.m04BaselineRunId = baseline.run.runId; goal.knowledgeSnapshot = baseline.knowledgeSnapshot; goal.formalBaseline = true; goal.exploratory = false; goal.baselineHistory.push({ at: nowIso(), knowledgeSnapshot: baseline.knowledgeSnapshot, m04RunId: baseline.run.runId });
 			}
+			goal.plan = nextPlan;
 			await save(ctx, goal); return goal;
 		},
 
-		async delegate(runId, spec) {
-			const goal = await load(ctx, runId); requireActive(goal); nonempty(spec.objective, "task objective");
+		async checkpoint(runId, checkpointOptions) {
+			const goal = await load(ctx, runId); requireActive(goal);
+			frozenPolicy(goal);
+			if (goal.tasks.some((task) => task.status === "running")) throw new HarnessError("m07.checkpoint", "存在 running 任务，不能冻结非终态反馈");
+			const requested = checkpointOptions?.taskIds;
+			if (requested !== undefined && (!Array.isArray(requested) || requested.length === 0 || requested.length > 256 || requested.some((id) => typeof id !== "string" || !/^T\d{3,}$/.test(id)) || new Set(requested).size !== requested.length || requested.some((id) => !goal.tasks.some((task) => task.taskId === id)))) throw new HarnessError("m07.checkpoint", "taskIds 必须是非空、去重、属于当前目标的任务列表，且每批最多 256 项");
+			const selectedTaskIds = requested ?? goal.tasks.map((task) => task.taskId);
+			await verifyFrozenWorkflowMethod(ctx, goal, options.registeredExperienceStores);
+			return freezeCheckpoint(ctx, goal, snapshotLimits, selectedTaskIds);
+		},
+
+			async delegate(runId, spec) {
+				const goal = await load(ctx, runId); requireActive(goal); nonempty(spec.objective, "task objective");
+				await verifyFrozenWorkflowMethod(ctx, goal, options.registeredExperienceStores, spec);
 			const policy = frozenPolicy(goal);
 			await requireCurrentFormalBaseline(ctx, goal);
 			spec = { ...spec, objective: spec.objective.trim(), inputs: normalizedUnique(spec.inputs, "task input"), expectedOutputs: normalizedUnique(spec.expectedOutputs, "expected output"), checks: normalizedUnique(spec.checks, "task check") };
@@ -547,6 +761,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 
 		async finish(runId, input) {
 			const goal = await load(ctx, runId); requireActive(goal);
+			if (goal.executionContract?.mode === "continuous" && input.outcome !== "fulfilled") throw new HarnessError("m07.continuous", "continuous 目标不能由模型以 partial/blocked 或自述 stopReason 收口；只有原成功要求的 fulfilled 硬证据门或受信宿主中断可终结");
 			let invalidBaseline: string | undefined;
 			try { await requireCurrentFormalBaseline(ctx, goal); }
 			catch (error) {
@@ -566,13 +781,25 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			goal.goalChecks = canonicalGoalChecks;
 			goal.lifecycle = "finished"; goal.outcome = input.outcome; goal.finishSummary = nonempty(input.summary, "summary"); goal.returnPath = input.returnPath; goal.limitations.push(...(input.limitations ?? []));
 			if (invalidBaseline) goal.limitations.push(`原正式基线已失效：${invalidBaseline}；本次仅如实记录 ${input.outcome} 并回流，不表示原目标完成。`);
-			goal.feedbackPath = await writeFeedback(ctx, goal, snapshotLimits); await save(ctx, goal);
-			const run = await ctx.ws.readRun("M07", runId); run.outputs.push({ label: "M07 实际执行反馈包", path: goal.feedbackPath }); run.remarks.push(`目标结果 ${input.outcome}；主 Agent 选择返回 ${input.returnPath}。会话返回不等于科学验收。`); for (const t of goal.tasks) { if (t.session) run.sessions.push({ label: t.session.label, role: t.session.role, id: t.session.id, file: t.session.file, model: t.session.model }); if (t.executionFailure) run.failures.push(`${t.taskId} 执行失败：${t.executionFailure}`); if (t.review) { for (const f of t.review.failures) run.failures.push(`${t.taskId}：${f}`); for (const u of t.review.unexecuted) run.failures.push(`${t.taskId} 未执行：${u}`); } } await ctx.ws.finishRun(run, input.outcome === "blocked" ? "failed" : "completed"); await ctx.ws.writeNote(run, `M07 主 Agent 目标式执行；保留原目标、所有任务、失败、未执行和限制。最终选择返回 ${input.returnPath}。`);
+			try {
+				goal.feedbackPath = await writeFeedback(ctx, goal, snapshotLimits);
+				goal.feedbackStatus = "complete";
+				delete goal.feedbackError;
+			} catch (error) {
+				if (!isFeedbackControlOverflow(error)) throw error;
+				goal.feedbackError = { code: "context.budget", summary: (error as Error).message.slice(0, 500) };
+				goal.feedbackPath = await writeBoundedFeedbackIndex(ctx, goal, "finish");
+				goal.feedbackStatus = "indexed";
+			}
+			await save(ctx, goal);
+			const run = await ctx.ws.readRun("M07", runId); run.outputs.push({ label: "M07 实际执行反馈包", path: goal.feedbackPath }); run.remarks.push(`目标结果 ${input.outcome}；主 Agent 选择返回 ${input.returnPath}。会话返回不等于科学验收。反馈状态 ${goal.feedbackStatus}；索引不代表 M04 已读取原证据。`); for (const t of goal.tasks) { if (t.session) run.sessions.push({ label: t.session.label, role: t.session.role, id: t.session.id, file: t.session.file, model: t.session.model }); if (t.executionFailure) run.failures.push(`${t.taskId} 执行失败：${t.executionFailure}`); if (t.review) { for (const f of t.review.failures) run.failures.push(`${t.taskId}：${f}`); for (const u of t.review.unexecuted) run.failures.push(`${t.taskId} 未执行：${u}`); } } await ctx.ws.finishRun(run, input.outcome === "blocked" ? "failed" : "completed"); await ctx.ws.writeNote(run, `M07 主 Agent 目标式执行；保留原目标、所有任务、失败、未执行和限制。最终选择返回 ${input.returnPath}。`);
 			return goal;
 		},
 
-		async interrupt(runId, input: InterruptInput) {
+		async interrupt(runId, input: InterruptInput, authorization?: typeof HOST_STOP_KEY, hostReceipt?: HostStopReceipt) {
 			const goal = await load(ctx, runId); requireActive(goal);
+			if (goal.executionContract?.mode === "continuous" && (authorization !== HOST_STOP_KEY || hostReceipt?.goalRunId !== runId)) throw new HarnessError("m07.continuous", "continuous 目标不接受模型或外部 JSON 的 interrupt；仅受信宿主生命周期事件可归档");
+			if (authorization === HOST_STOP_KEY && hostReceipt?.goalRunId === runId) goal.hostStopReceipt = hostReceipt;
 			const reason = nonempty(input.reason, "reason");
 			const at = nowIso();
 			const interrupted: string[] = [];
@@ -589,19 +816,61 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			goal.returnPath = input.returnPath ?? "user";
 			goal.limitations.push(`受控中断归档：${reason}`);
 			goal.goalChecks = goal.successCriteria.map((criterion) => ({ criterion, result: "not_run" as const, evidence: [] }));
-			if (goal.budgetPolicy && goal.budgetPolicyVersionId && goal.budgetPolicyFrozenAt) goal.feedbackPath = await writeFeedback(ctx, goal, snapshotLimits);
-			else {
-				goal.limitations.push("旧目标缺少冻结预算策略；中断反馈只登记控制事实与证据位置，未读取证据正文，也未套用当前 active policy。");
-				goal.feedbackPath = await writeLegacyInterruptFeedback(ctx, goal);
-			}
-			await save(ctx, goal);
+			const legacy = !goal.budgetPolicy || !goal.budgetPolicyVersionId || !goal.budgetPolicyFrozenAt;
+			if (legacy) goal.limitations.push("旧目标缺少冻结预算策略；中断反馈只登记控制事实与证据位置，未读取证据正文，也未套用当前 active policy。");
+			goal.feedbackStatus = "pending";
+			goal.feedbackError = { code: "m07.archive-pending", summary: "中断终态已记录，反馈尚未完成；若此状态持续则需要修复交接。" };
 			const run = await ctx.ws.readRun("M07", runId);
-			run.outputs.push({ label: "M07 实际执行反馈包", path: goal.feedbackPath });
 			for (const id of interrupted) run.failures.push(`${id} 执行失败：受控中断归档：${reason}`);
 			run.remarks.push(`目标受控中断归档为 blocked；返回 ${goal.returnPath}。只记录实际中断事实，不自动重跑或假称完成。`);
-			await ctx.ws.finishRun(run, "failed");
+			try {
+				await save(ctx, goal);
+				await ctx.ws.finishRun(run, "failed");
+			} catch (error) {
+				throw new HarnessError("m07.archive-repair-required", `M07 ${runId} 终态写入未完成；检查 goal.json 与 run.json 后修复，不得只关闭其中一方：${(error as Error).message}`);
+			}
+			let feedbackFailure: unknown;
+			try {
+				if (legacy) {
+					goal.feedbackPath = await writeLegacyInterruptFeedback(ctx, goal);
+					goal.feedbackStatus = "control-facts-only";
+					goal.feedbackError = { code: "m07.policy-legacy", summary: "旧目标没有冻结策略；仅归档控制事实和证据位置。" };
+				} else {
+					goal.feedbackPath = await writeFeedback(ctx, goal, snapshotLimits);
+					goal.feedbackStatus = "complete";
+					delete goal.feedbackError;
+				}
+			} catch (error) {
+				feedbackFailure = error;
+				goal.feedbackError = { code: error instanceof HarnessError ? error.code : "m07.feedback-write", summary: (error as Error).message.slice(0, 500) };
+				goal.limitations.push("完整反馈生成失败；原控制记录及冻结证据未删除。中断控制事实仅提供证据位置，不表示完整交接或科学验收。");
+				try {
+					goal.feedbackPath = await writeBoundedFeedbackIndex(ctx, goal, "interrupt");
+					goal.feedbackStatus = "control-facts-only";
+				} catch (fallbackError) {
+					delete goal.feedbackPath;
+					goal.feedbackStatus = "failed";
+					goal.feedbackError = { code: "m07.archive-repair-required", summary: `完整反馈：${goal.feedbackError.code}；控制事实索引：${fallbackError instanceof HarnessError ? fallbackError.code : "write-failed"}。需按 goal.json 修复交接。` };
+				}
+			}
+			try {
+				await save(ctx, goal);
+				if (goal.feedbackPath) run.outputs.push({ label: "M07 实际执行反馈包", path: goal.feedbackPath });
+				if (feedbackFailure) run.failures.push(`反馈生成失败（${goal.feedbackError?.code ?? "unknown"}）；${goal.feedbackStatus === "control-facts-only" ? "仅有界控制事实可供 M04 读取，原证据须另行核查" : "无反馈包，交接需修复"}`);
+				run.remarks.push(`反馈归档状态：${goal.feedbackStatus}；${goal.feedbackStatus === "complete" ? "已生成冻结策略下的完整反馈包" : "未完成科学证据交接"}。`);
+				await ctx.ws.writeRun(run);
+			} catch (error) {
+				throw new HarnessError("m07.archive-repair-required", `M07 ${runId} 反馈归档状态写入未完成；检查 goal.json 与 run.json 后修复：${(error as Error).message}`);
+			}
 			await ctx.ws.writeNote(run, `M07 目标受控中断归档；running 任务 ${interrupted.join("、") || "无"} 记为 failed；原因：${reason}。`);
 			return goal;
+		},
+		async hostInterrupt(runId, input) {
+			if (!HOST_STOP_REASONS.has(input.reasonKind)) throw new HarnessError("m07.host-stop", "未知宿主停止事件");
+			if (input.sourceEventId !== undefined && (typeof input.sourceEventId !== "string" || input.sourceEventId.length > 128 || !/^[A-Za-z0-9._:-]+$/.test(input.sourceEventId))) throw new HarnessError("m07.host-stop", "宿主事件 ID 无效");
+			const receipt: HostStopReceipt = { version: 1, id: randomUUID(), goalRunId: runId, source: "pi-host", reasonKind: input.reasonKind, observedAt: nowIso(), ...(input.sourceEventId ? { sourceEventId: input.sourceEventId } : {}) };
+			const interruptWithAuthority = this.interrupt as (goalRunId: string, request: InterruptInput, key: typeof HOST_STOP_KEY, witness: HostStopReceipt) => Promise<CurrentGoal>;
+			return interruptWithAuthority(runId, { reason: `受信宿主生命周期停止：${input.reasonKind}`, returnPath: "user" }, HOST_STOP_KEY, receipt);
 		},
 	};
 }
