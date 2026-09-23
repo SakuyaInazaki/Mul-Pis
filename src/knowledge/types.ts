@@ -11,6 +11,13 @@ export type RecordType = "C" | "K" | "E" | "J" | "Q" | "D" | "X";
 
 export const RECORD_TYPES: readonly RecordType[] = ["C", "K", "E", "J", "Q", "D", "X"];
 
+/** A pinned identity. Bare record ids are meaningful only inside one store. */
+export interface KnowledgeRef {
+	storeId: string;
+	recordId: string;
+	version: number;
+}
+
 /** Relations carry their meaning; they are never collapsed into one generic arrow. */
 export type RelType =
 	| "premise_of" // C/E is a premise or evidence input of J
@@ -236,6 +243,8 @@ export interface ListFilter {
 export interface KnowledgeStore {
 	/** Create the layout if missing. Never overwrites existing records. */
 	init(): Promise<void>;
+	/** Stable identity of this authoritative store, independent of its local path. */
+	storeId(): Promise<string>;
 	current(): Promise<Snapshot | undefined>;
 	get(id: string, version?: number): Promise<KnowledgeRecord | undefined>;
 	/** Latest version of each record, optionally filtered. */

@@ -1,5 +1,7 @@
 import type { SessionRef } from "../runner/types.ts";
 import type { BudgetPolicy } from "../improvement/policy.ts";
+import type { KnowledgeRef } from "../knowledge/types.ts";
+import type { ExperienceSelection } from "../knowledge/experience-index.ts";
 
 export type M07TaskMode = "execute" | "check" | "reason";
 export type M07TaskStatus = "running" | "returned" | "failed" | "accepted" | "rejected";
@@ -26,6 +28,10 @@ export interface TaskSpecInput {
 	supersedesTaskId?: string;
 	requireIndependentCheck?: boolean;
 	knowledgeIds?: string[];
+	/** Explicit, pinned method experience references; never auto-loaded in M01/M06. */
+	experienceRefs?: KnowledgeRef[];
+	experienceContextRefs?: KnowledgeRef[];
+	experienceTags?: string[];
 }
 
 export interface TaskCheck {
@@ -88,6 +94,8 @@ export interface M07TaskRecord extends TaskSpecInput {
 	toolLog: unknown[];
 	knowledgeSnapshot?: string;
 	m04BaselineRunId?: string;
+	/** Selection is not proof of faithful use or causal benefit. */
+	experienceSelection?: ExperienceSelection & { loadedAt?: string; invocationStatus: "unknown"; faithfulUse: "unknown"; causalBenefit: "unknown" };
 	review?: {
 		at: string;
 		/** Frozen copy of this task's session report at review time. */

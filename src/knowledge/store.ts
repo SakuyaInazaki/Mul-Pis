@@ -1,4 +1,5 @@
 import { open, mkdir, readFile, readdir, stat, unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { HarnessError } from "../types.ts";
 import { nowIso, readTextIfExists, writeFileAtomic } from "../workspace.ts";
@@ -32,7 +33,8 @@ const USAGE_DECISIONS: readonly UsageDecision[] = ["candidate", "working_assumpt
 const CLOSE_REASONS: readonly QCloseReason[] = ["answered", "not_valid", "duplicate", "out_of_scope", "shelved"];
 const LIMIT_KINDS: readonly Limit["kind"][] = ["suspended", "withdrawn", "needs_recheck"];
 const INPUT_ROLES = ["condition", "local_assumption", "temporary_assumption", "definition", "data", "adopted_result"] as const;
-const IMPACT_RELATIONS: readonly RelType[] = ["premise_of", "supports", "refutes", "limits", "checks", "applies_in"];
+// Negative relations and version lineage are not necessary-premise edges.
+const IMPACT_RELATIONS: readonly RelType[] = ["premise_of", "supports", "checks", "applies_in"];
 const LOCK_STALE_MS = 10 * 60 * 1000;
 
 const RULES_TEXT = `# 知识库工作规则
@@ -441,11 +443,19 @@ export class FileKnowledgeStore implements KnowledgeStore {
 
 	async init(): Promise<void> {
 		for (const child of ["records", "proposals", "snapshots", "views", "_index"]) await mkdir(path.join(this.dir, child), { recursive: true });
+		await writeIfMissing(path.join(this.dir, "store-id.json"), `${JSON.stringify({ version: 1, storeId: randomUUID() }, null, 2)}\n`);
 		await writeIfMissing(path.join(this.dir, "RULES.md"), RULES_TEXT);
 		await writeIfMissing(path.join(this.dir, "CURRENT"), "");
 		await writeIfMissing(path.join(this.dir, "limits.json"), "[]\n");
 		for (const [name, content] of Object.entries(EMPTY_VIEW_FILES)) await writeIfMissing(path.join(this.dir, "views", name), content);
 		await writeIfMissing(path.join(this.dir, "_index", "records.json"), "[]\n");
+	}
+
+	async storeId(): Promise<string> {
+		await this.init();
+		const identity = await readJson<{ version?: unknown; storeId?: unknown }>(path.join(this.dir, "store-id.json"));
+		if (identity.version !== 1 || typeof identity.storeId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(identity.storeId)) throw new HarnessError("knowledge.store-id", "knowledge store identity is invalid");
+		return identity.storeId;
 	}
 
 	async current(): Promise<Snapshot | undefined> {
@@ -490,18 +500,31 @@ export class FileKnowledgeStore implements KnowledgeStore {
 	async availability(id: string, version?: number): Promise<AvailabilityReport> {
 		const record = await this.get(id, version);
 		if (!record) return { id, version: version ?? 0, availability: "unrecorded", reasons: [`未记录 ${version ? `${id}@${version}` : id}`] };
-		const active = (await this.limits()).filter((limit) => !limit.liftedAt && this.limitApplies(limit, record));
+		const limits = await this.limits();
+		const active = limits.filter((limit) => !limit.liftedAt && this.limitApplies(limit, record));
 		const blocking = active.filter((limit) => limit.kind === "suspended" || limit.kind === "withdrawn");
 		const decisionBlocked = record.usageDecision === "suspended" || record.usageDecision === "withdrawn" || record.usageDecision === "replaced";
-		if (blocking.length || decisionBlocked) {
+		const oldDecision = await this.historicalDeactivation(id);
+		const oldDecisionLifted = limits.some((limit) => limit.target === id && limit.authority === `historical-decision:${id}` && !!limit.liftedAt);
+		if (blocking.length || decisionBlocked || (oldDecision && !oldDecisionLifted)) {
 			const reasons = blocking.map((limit) => `生效限制 ${limit.kind}:${limit.target}：${limit.reason}`);
 			if (decisionBlocked) reasons.push(`历史使用决定为 ${record.usageDecision}`);
+			if (oldDecision && !oldDecisionLifted) reasons.push(`该记录存在 ${oldDecision} 历史停用决定；须显式解除，旧版本不得复活`);
 			return { id, version: record.version, availability: "not_allowed", reasons };
 		}
 		const rechecks = active.filter((limit) => limit.kind === "needs_recheck");
 		if (rechecks.length) return { id, version: record.version, availability: "needs_recheck", reasons: rechecks.map((limit) => `生效限制 needs_recheck:${limit.target}：${limit.reason}`) };
 		if (record.usageDecision === "adopted") return { id, version: record.version, availability: "usable_conditionally", reasons: ["使用决定为 adopted，且没有生效限制"] };
 		return { id, version: record.version, availability: "exploratory_only", reasons: [`使用决定为 ${record.usageDecision ?? "未记录"}`] };
+	}
+
+	private async historicalDeactivation(id: string): Promise<UsageDecision | undefined> {
+		const publishedVersion = (await this.publishedVersions()).get(id) ?? 0;
+		for (let version = publishedVersion; version >= 1; version -= 1) {
+			const decision = (await this.get(id, version))?.usageDecision;
+			if (decision === "suspended" || decision === "withdrawn" || decision === "replaced") return decision;
+		}
+		return undefined;
 	}
 
 	async submitProposal(batch: ProposalBatch): Promise<ProposalReceipt> {
@@ -602,6 +625,13 @@ export class FileKnowledgeStore implements KnowledgeStore {
 					const parsed = parseRecordTarget(target);
 					if (parsed) changedTargets.push({ id: parsed.id, version: parsed.version, allVersions: parsed.version === undefined });
 					applied.push({ opIndex, result: `限制已登记 ${activeLimitLabel(limit)}` });
+				} else if (op.op === "decide" && ["suspended", "withdrawn", "replaced"].includes(op.usageDecision)) {
+					// A deactivation decision must also disable previously adopted pinned versions.
+					const target = resolveHandle(op.id, plannedIds.handles);
+					const limit: Limit = { target, kind: op.usageDecision === "suspended" ? "suspended" : "withdrawn", reason: op.reason, authority: `decision:${proposalId}`, since: mergeTime };
+					nextLimits.push(limit);
+					limitsWrittenFirst.push(activeLimitLabel(limit));
+					changedTargets.push({ id: target, allVersions: true });
 				} else if (op.op === "lift_limit") {
 					const target = resolveHandle(op.target, plannedIds.handles);
 					let lifted = 0;
@@ -612,10 +642,15 @@ export class FileKnowledgeStore implements KnowledgeStore {
 							lifted += 1;
 						}
 					}
+					if (parseRecordTarget(target)?.version === undefined && await this.historicalDeactivation(target)) {
+						const marker = nextLimits.find((limit) => limit.target === target && limit.authority === `historical-decision:${target}`);
+						if (marker) { marker.liftedAt = mergeTime; marker.liftReason = op.reason; }
+						else nextLimits.push({ target, kind: "withdrawn", reason: "历史停用决定需显式解除", authority: `historical-decision:${target}`, since: mergeTime, liftedAt: mergeTime, liftReason: op.reason });
+					}
 					applied.push({ opIndex, result: `已解除 ${target} 的 ${lifted} 条限制（授权 ${op.authority}）` });
 				}
 			}
-			if (proposal.ops.some((op) => op.op === "limit" || op.op === "lift_limit")) {
+			if (proposal.ops.some((op) => op.op === "limit" || op.op === "lift_limit" || (op.op === "decide" && ["suspended", "withdrawn", "replaced"].includes(op.usageDecision)))) {
 				await writeFileAtomic(path.join(this.dir, "limits.json"), `${JSON.stringify(nextLimits, null, 2)}\n`);
 			}
 
@@ -728,7 +763,9 @@ export class FileKnowledgeStore implements KnowledgeStore {
 
 			for (const item of recordsToWrite) await this.writeRecord(item.record, warnings);
 
-			const impacts = this.findImpacts([...latest.values()], changedTargets);
+			const historical = await this.allRecordVersions();
+			const allVersions = new Map([...historical, ...recordsToWrite.map((item) => item.record)].map((record) => [`${record.id}@${record.version}`, record]));
+			const impacts = this.findImpacts([...allVersions.values()], changedTargets);
 			for (const impact of impacts) {
 				const target = `${impact.id}@${impact.version}`;
 				if (nextLimits.some((limit) => !limit.liftedAt && limit.kind === "needs_recheck" && limit.target === target)) continue;
@@ -811,7 +848,10 @@ export class FileKnowledgeStore implements KnowledgeStore {
 			const versions = new Set(Array.from({ length: publishedVersion }, (_, index) => index + 1));
 			entries.set(id, { type: latest.type, versions, latestVersion: publishedVersion, qOpen: latest.type === "Q" ? latest.qStatus?.open !== false : undefined });
 		}
-		return { entries, activeLimitTargets: (await this.limits()).filter((limit) => !limit.liftedAt).map((limit) => limit.target) };
+		const limits = await this.limits();
+		const activeLimitTargets = limits.filter((limit) => !limit.liftedAt).map((limit) => limit.target);
+		for (const id of entries.keys()) if (await this.historicalDeactivation(id) && !limits.some((limit) => limit.target === id && limit.authority === `historical-decision:${id}` && !!limit.liftedAt)) activeLimitTargets.push(id);
+		return { entries, activeLimitTargets };
 	}
 
 	/** Every published version (1..published) of every published record. */
@@ -903,23 +943,27 @@ export class FileKnowledgeStore implements KnowledgeStore {
 	private findImpacts(records: KnowledgeRecord[], changed: ChangedTarget[]): ImpactItem[] {
 		const impacts: ImpactItem[] = [];
 		const seen = new Set<string>();
-		for (const record of records) {
-			for (const ref of record.refs) {
+		const reached = new Set<string>();
+		let frontier = changed;
+		while (frontier.length) {
+			const next: ChangedTarget[] = [];
+			for (const record of records) for (const ref of record.refs) {
 				if (!IMPACT_RELATIONS.includes(ref.rel)) continue;
 				const target = parseRecordTarget(ref.target);
 				if (!target) continue;
-				const matches = changed.some((item) => {
-					if (item.id !== target.id) return false;
-					if (item.allVersions) return true;
-					return target.version === undefined || target.version === item.version;
-				});
-				if (!matches) continue;
+				if (!frontier.some((item) => item.id === target.id && (item.allVersions || target.version === undefined || target.version === item.version))) continue;
 				const via = `${ref.rel} ${ref.target}`;
 				const key = `${record.id}@${record.version}|${via}`;
 				if (seen.has(key)) continue;
 				seen.add(key);
 				impacts.push({ id: record.id, version: record.version, via, mark: "needs_recheck" });
+				const recordVersion = `${record.id}@${record.version}`;
+				if (!reached.has(recordVersion)) {
+					reached.add(recordVersion);
+					next.push({ id: record.id, version: record.version, allVersions: false });
+				}
 			}
+			frontier = next;
 		}
 		return impacts.sort((left, right) => left.id.localeCompare(right.id) || left.via.localeCompare(right.via));
 	}

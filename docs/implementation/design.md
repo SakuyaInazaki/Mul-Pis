@@ -15,6 +15,7 @@
 | M08/M09 | M08 每轮复制并固定原问题、必要输入、当前知识和调用方选定成果；调用方显式列出自查和 reviewer。完整批次可送 fresh M04 生成受校验的用途处置。M09 只消费严格配对的 M08/M04，按该处置允许范围建立说明和交付副本并独立复核 | 保持暂定流程的版本同一性、完整批次和不以一致性作证据；M04 的结构化处置是 M09 范围门槛 | 中 |
 | M05 | 以 `AcquisitionBackend` 提供可替换的搜索、抓取、下载、浏览器与 PDF 能力。默认检索包括 OpenAlex、arXiv、Crossref、Hacker News、Stack Exchange、GitHub 仓库与 Issues、DuckDuckGo；Reddit 为显式选择项，Brave 需密钥。搜索支持提供方适用范围内的 page/cursor/site 参数并如实警告未支持参数；Hacker News 同时保留文章与讨论地址。任意 HTTP(S) 地址可直接抓取或下载，Crawl4AI 用于浏览器渲染抓取，browser-use 用于适合交互、翻页、展开与下载的定点任务，不固定为最后手段。PDF 仅用 poppler 的文本层与按页图像。Docling 与 SearXNG 已因“不在本地跑模型、不用 Docker”而移除 | 用户 2026-09-20 的选择与任务范围完整性要求；提供通用入口但不作全网穷尽或任意站点必然成功的保证 | 高：默认集合可由配置取子集，各能力可经接口替换 |
 | 改进外环 | 独立的 `research_improve` / `improve` 入口只允许改动预算策略的两个内联阈值；真实 M07 投影事件以 UTF-16 单位进入固定离线筛选，筛选本身不授权晋级。调用方显式给出案例与资源预算后，控制器对局部投影/读回机制做每案例、每重复的新会话双臂实验；准入至少两次偶数重复、交替臂顺序、全部硬检查通过、每配对估计成本不增且总成本严格下降。锁串行变更，晋级前比较活动指针与冻结基线，原子晋级或回退 | 验证有界方法选择机制，同时保持 M01–M09 科研判断、知识限制和评价规则不受候选控制；局部准入不等于泛科研收益 | 高：活动指针回退；失败、未知账和未通过候选均保留；残留锁需核对 owner 后精确清理 |
+| 科研方法开发 | 另一条显式 campaign 在固定 CPU 响应辨识环境内装载版本化 H 执行策略与 I 改进策略；I 可选有限主动探针并提出可证伪候选，H 通过无通用工具的新会话执行允许动作。开发反馈和受保护准入分离；H 的解题质量与 I 产生后继 H 的能力各有实验路径。根预算和子分支共同约束该 campaign 启动的调用、完整 token、估计费用、探针、CPU 与壁钟 | 检验一个可运行但刻意有限的“观测—假设—策略—后续使用”切片；模型主张不等于环境事实或知识采用 | 高：版本化数据策略与活动指针；无完整准入时保留 research-only，未知成本或失败不能晋级 |
 
 ## 2. 阶段到会话的映射
 
@@ -26,7 +27,7 @@
 | M04 | 有合格 M01 基线且尚无既往 M04 时可续接 `M01`；M07/M08 反馈和其他不满足基线资格的情况使用新会话 `M04-research` | execution / research | 普通处理无工具；M07 反馈用 `m07_evidence_read` 只读对应 M07 run；M08 反馈只读该轮 frozen root 并可按需渲染 PDF 页 | P04 + 意见 + 产物位置（新会话另加原始问题与局部知识包）；M08 处置须实际访问准备列为可交付的固定材料 | `processing.md`、知识提案、`merge.json`；M07 保存实际返回范围，M08 另有访问覆盖与 `m08-disposition.json` |
 | M05 | 新会话 `M05` | acquisition | 自定义工具：web_search、find_open_access、fetch_page、list_page_links、download_file、extract_pdf、render_pdf_page、read_work_file、view_work_image、register_source、list_sources（配置了 browser-use 模型时另有 browse_interactive）；文件访问限定在本轮 `references/_work/<run>/` 与已登记来源 | P05 + 本轮目标 + 原始材料 + 局部知识包（C/K/Q/X）+ 已有索引 + 工具规则 | `acquisition-report.md`、`tool-log.jsonl`、`references/search/R###-<run>.md`、供 M06 使用的新登记 `sources/S###/` |
 | M06 | 每份资料三个新会话：`-reader`、`-checker`、`-applicability` | reader / checker / applicability | 前两者：限定在资料目录的只读工具 + `render_pdf_page`（把 PDF 单页渲染成图片直接返回，供多模态模型看公式、表格、图和扫描页）；第三者：无 | 材料 + 阅读要求；材料 + 阅读记录；经核对内容 + 同一份项目状态 | 每组三份记录、`batch-summary.md`、`batch.json` |
-| M07 | 每个动态子任务一个新会话 `M07-T###`；主会话只通过工具组织与验收 | execute/reason 为 execution，check 为 reviewer | execute：Pi 原生 read/write/edit/bash，cwd 为任务 work 目录；check/reason：任务目录只读 | 冻结目标、约束、成功要求、显式输入副本、局部知识包、预期产物与 checks | 自动保存的任务报告、execute 的 work 文件、逐项 review、目标状态、投影事件与 `m04-feedback.md` |
+| M07 | 每个动态子任务一个新会话 `M07-T###`；主会话只通过工具组织与验收 | execute/reason 为 execution，check 为 reviewer | execute：Pi 原生 read/write/edit/bash，cwd 为任务 work 目录；check/reason：任务目录只读 | 冻结目标、约束、成功要求、显式输入副本、局部知识包、可选的显式有界经验引用、预期产物与 checks | 自动保存的任务报告、execute 的 work 文件、逐项 review、目标状态、投影事件与 `m04-feedback.md` |
 | M08 | 调用方拆分的自查各一新会话；全部自查成功后，显式 reviewer 列表各一新会话 | 自查用 reviewer；外审角色由调用方从工作区角色中明确选择 | read-only 只读同一 frozen 目录；execute 只操作各自 verification 副本 | 同一固定版本的原问题、输入、知识和成果；未提供范围显式列出 | `manifest.json`、各报告与覆盖、完整 `review-bundle.md/json` |
 | M09 | 新建成果说明会话与独立交付复核会话 | execution / checker | 说明只读固定材料；checker 只读 verification copy，并只能通过 `run_reproduction_check(index)` 让控制器执行预授权命令。原始 shell 留在私有审计，不进入 checker prompt；checker 可读移除命令文本但保留真实 stdout/stderr 的执行日志 | 严格配对的 M08 manifest 与 M04 `m08-disposition`；接收者、用途、允许范围、复核模式 | 源到副本追踪、成果说明、复核报告与覆盖、requested/actual 执行摘要、`M09 收口回执` |
 
@@ -63,19 +64,23 @@ M07 投影事件在 `taskMessage` 和 `writeFeedback` 的真实决策点逐调�
 - 关系带含义（premise_of/supports/refutes/limits/questions/checks/handles/replaces/splits/applies_in/located_in），只在拥有方写入。
 - 提案 → 结构校验 → 在当前状态复查 → 先写限制 → 应用 → 影响分析只传播 `needs_recheck` → 发布快照 `G###` → 移动 `CURRENT`。任一步结构非法则整批拒绝，不留半发布状态。
 - 入库、关闭 Q、采用决定都不是科学认证；视图与索引只由记录派生。
+- 知识库首次明确访问时懒写稳定 `storeId`，不批量迁移旧工作区，旧 C001 等 ID 不变。跨库经验引用须由调用方明确注册外库并固定 `{storeId, recordId, version}`，同名 ID 不互认，也不自动写入或合并外库。
+- 显式经验选择只从现有记录生成有界视图。`fields.experience` 可声明目标、适用阶段与标签、必要的 pinned `requiredRefs`；选择时检查情境和 live availability，循环、缺失、跨库错版本、撤回或容量不足都拒绝完整装载。H/I 策略版本另存 `sourceExperienceRefs`（生成时实际装载的来源）与 `requiredExperienceRefs`（继承的必要使用约束）；新计划省略引用也不能解除后者，控制器在新的 I/H 请求和活动指针变更前复查，回退或 V2 包导入也不能复活已限用方法。普通 `refs` 还可表达反例、冲突、替换与历史，不一概视为必要依赖；声明依赖的结构完整性不证明科学前提已被穷举。
+- 停用决定和限制约束该 ID 的所有旧版本；必要依赖受影响时向后传递 `needs_recheck`，明确授权解除才能恢复新使用。旧记录保留可追溯只读；运行中已冻结的包不热替换，但新调用重新检查 live 限制。实验观察先作为事实与模型诊断分列保存，是否形成新的 K/C/E 等记录仍走 M04 提案与合入。
 
 ## 5. 未决与未做
 
 - 模型选择与路由、并发数、预算：由 `research.config.json` 决定，harness 无默认。
 - M05：browser-use 需在配置中指定模型与对应 API 密钥；当前 wrapper 只接 OpenAI/Anthropic，并新建无既有 profile/login state 的 headless `BrowserSession`，尚未接入用户已有浏览器会话或凭据管理，不能据此假定登录站点普遍可用。它会在同一浏览器任务会话内逐步保存发生变化的 DOM、正文、截图和下载，失败或超时前的有效文件仍保留；`result.md` 是浏览器模型报告，不能登记为外部原始材料。每个实际材料文件可记录 URL、标题、取得时间、内容类型、材料类型和派生关系。默认上限为 20 个页面状态、12 张截图、HTML 合计 5 MB、正文合计 2 MB、登记入材料的下载合计 250 MB；该下载上限不是浏览器写盘的硬配额。触限会明确警告，因此成功也不等于材料完整。Brave 密钥可选；DuckDuckGo HTML 没有可靠的 API 翻页实现，可改用浏览器继续。所有站点与论坛都只按本轮任务保存所需范围，不自动递归取得全部帖子，也不保证任意网站均能取得。Crawl4AI 与 browser-use 不运行本地模型；PDF 页面图像要求 reader/checker 角色使用多模态模型，长材料分块仍未实现。
 - M07 通过显式 Pi extension 接入，但目前每次工具调用同步等待完成，没有 detached/异步 job、断线后自动重跑或进程重启后的 running 任务续跑。中断后仍记录为 running 的任务新增 `research_goal action=interrupt` 受控归档：显式记为 failed 并记录原因，目标以 blocked 收口、写入反馈包；仍不自动重跑或假称完成。取消会传到 Pi 会话；SDK abort 的失败会作为失败报告，已有外部 HTTP/browser 工具是否即时停下取决于其自身 signal 支持，不能承诺所有外部动作瞬停。M07 execution 会话禁止 resume，避免后续无声扩大工具范围；目标状态可恢复查看，已结束目标不能自动重跑。
+- 科研方法开发当前只覆盖列出的仿射/二次 CPU 响应假设的主动辨识。初始观测不足以判断真值时不能凭猜中通过；每个实验臂 fork 初态，开发反馈不含私有答案，受保护检查只由控制器持有。受控 I/H 子会话为无通用工具的新会话，只接白名单开发输入，G 结果不回灌；主 Pi 若持有普通 read/bash 权限，同机私有案例并无 OS 级密封，不能把子会话上下文隔离夸大为全主 agent 保密。证据不足时合理报告未定可作为部分质量记录，不能冒充完整解题；也不能把合理停止和猜错混作同一失败。坐标统一按案例公开单位解释，单位不匹配归因、其他环境族、外部异步任务恢复、长期课程迁移、源代码候选执行与真正的 OS 代码沙箱没有实现。经验的选中或进入提示不自动证明忠实执行、知识正确或因果收益。
 - M07 产物账目：`expectedOutputs` 只接受任务 work 目录内的精确相对路径字符串；说明写入 objective 或任务报告，不得混入路径。控制器在委派前校验声明路径，并在评审时只接受实际位于 work 目录内的声明产物；执行提示要求其他写盘也留在 work，但 execution 的 bash 不是 OS 沙箱，不能据此声称可阻止或枚举所有越界副作用。
 - 工具层边界：研究扩展会话从 session 开始即只允许 `research_*` 编排工具与 read/grep/find/ls 只读检查；bash、write、edit、网络与平台操作等有副作用动作必须进入有界 M07 任务，不依赖 researchActive 是否已激活。
 - 非交互限制：print/json 单次模式不能收集用户回答；`research_goal decision request` 必须拒绝。未达到 fulfilled 时不得以 plateau、候选穷尽、历史不可复现或总耗时更快为由 finish；只有 `resource_exhausted`、`authorization_blocked`、`dependency_unavailable`、`user_stopped` 四类硬停止原因，且提供 `stopReason`，才允许 finish outcome=partial/blocked。
 - 工作流控制：`npm run workflow:control -- status|pause|resume|stop --pid-file <run.pid>` 提供进程级暂停、恢复与停止。`pause`/`resume` 使用 SIGSTOP/SIGCONT；暂停期间 top-level watchdog 与子会话 watchdog 会把异常长的计时器间隔视为暂停而不是无进展。长时间暂停后 provider/transport 可能已断开，恢复不保证继续同一请求；SIGKILL 或进程崩溃仍不保证收口。
 - M08/M09 当前按已授权的暂定流程实现；真实 reviewer 数量、模型组合、预算和领域检查策略仍由工作区配置与调用方决定。M08 完成不等于科研通过；M04 的 `m08-disposition` 可能是 partial/rework/needs_evidence/unresolved，只有 ready/partial、明确列出 deliverable paths 且本会话实际访问相应固定材料才可进入 M09。M09 在生成 running facts 后再次执行最终知识限制检查，再写收口；这缩小同进程检查窗口，但不构成跨进程原子事务。M09 不自动公开、投稿、外发、压包、启动下一目标或 RSI，也不把 `full-recomputation` 请求写成完整复现已验证。
 - 知识库合入有锁文件保护；M07 service 的工作区 mutation 互斥只覆盖当前 Pi 进程，不能声称是跨进程任务锁，多机协调不在范围。
-- 已进行一次真实题目的主 Pi 工作流试跑并取得局部阶段结果，但试跑暴露了控制、知识提案与 M09 交付协议缺口，且没有严格完整通过 M01–M09；它不能作为通用科研效果或完整流程已验证的证据。离线自动测试仍使用脚本化假会话与真实文件存储。
+- 已进行一次真实题目的主 Pi 工作流试跑并取得局部阶段结果，但试跑暴露了控制、知识提案与 M09 交付协议缺口，且没有严格完整通过 M01–M09；它不能作为通用科研效果或完整流程已验证的证据。方法开发切片另有小规模真实 H 与 I 动作链的 `development` 试跑，证明环境接线可运行；I 未选出新后继，不构成 H/I 成对准入、结构化 L5 或科研收益证据。离线自动测试使用脚本化假会话与真实文件存储。
 
 ## 6. 运行入口
 

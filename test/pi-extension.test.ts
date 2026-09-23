@@ -27,7 +27,7 @@ test("extension registration is inert and exposes bounded tools", async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-extension-"));
 	const service = new ResearchService({ defaultWorkspace: root });
 	const registered = captureExtension(service);
-	assert.deepEqual([...registered.tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_review", "research_stage", "research_status"]);
+	assert.deepEqual([...registered.tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_review", "research_stage", "research_status"]);
 	assert.equal(registered.commands.has("research"), true);
 	assert.equal((await service.status(root)).initialized, false);
 });
@@ -222,7 +222,7 @@ test("Pi DefaultResourceLoader loads the inline extension without prompting or n
 	const loaded = loader.getExtensions();
 	assert.equal(loaded.errors.length, 0);
 	assert.equal(loaded.extensions.length, 1);
-	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_review", "research_stage", "research_status"]);
+	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_review", "research_stage", "research_status"]);
 });
 
 test("Pi DefaultResourceLoader loads the actual extensions/research.ts entrypoint", async () => {
@@ -238,7 +238,7 @@ test("Pi DefaultResourceLoader loads the actual extensions/research.ts entrypoin
 	const loaded = loader.getExtensions();
 	assert.equal(loaded.errors.length, 0);
 	assert.equal(loaded.extensions.length, 1);
-	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_review", "research_stage", "research_status"]);
+	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_review", "research_stage", "research_status"]);
 });
 
 test("research_delegate accepts exact expected output path strings", async () => {
@@ -249,4 +249,10 @@ test("research_delegate accepts exact expected output path strings", async () =>
   if (tool === undefined) throw new Error("missing research_delegate");
 	await tool.execute("d", { runId: "r1", objective: "o", inputs: [], expectedOutputs: ["result.txt"], checks: ["c"], mode: "execute" }, undefined, undefined, toolContext("/workspace"));
   assert.deepEqual(received.expectedOutputs, ["result.txt"]);
+  assert.equal(received.experienceRefs, undefined);
+  const ref = { storeId: "store-a", recordId: "E001", version: 2 };
+  await tool.execute("d2", { runId: "r1", objective: "o", inputs: [], expectedOutputs: ["result.txt"], checks: ["c"], mode: "reason", experienceRefs: [ref], experienceContextRefs: [ref], experienceTags: ["diagnostic"] }, undefined, undefined, toolContext("/workspace"));
+  assert.deepEqual(received.experienceRefs, [ref]);
+  assert.deepEqual(received.experienceContextRefs, [ref]);
+  assert.deepEqual(received.experienceTags, ["diagnostic"]);
 });

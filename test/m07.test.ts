@@ -49,6 +49,38 @@ test("begin freezes problem and baseline; exploratory must be explicit without M
 	assert.equal(allowed.formalBaseline, false);
 });
 
+test("M07 loads only explicitly selected pinned experience and does not claim it was faithfully used", async (t) => {
+	const f = await fixture(t, false);
+	const storeId = await f.store.storeId();
+	const evidence = await f.store.submitProposal({ stage: "M04", runId: "feedback", ops: [
+		{ op: "create", type: "E", title: "实际观察", body: "只在已知条件下成立", usageDecision: "adopted" },
+		{ op: "create", type: "X", title: "当前情境", body: "数值局部检查", usageDecision: "adopted" },
+	] });
+	await f.store.merge(evidence.proposalId);
+	const method = await f.store.submitProposal({ stage: "M04", runId: "feedback", ops: [{ op: "create", type: "K", title: "条件性检查方法", body: "先复核测量范围，再提出解释", usageDecision: "adopted", scope: ["X001"], fields: { experience: { version: 1, targetKind: "executor", applicableStages: ["M07"], requiredTags: ["numeric"], excludedTags: [], requiredRefs: [{ storeId, recordId: "E001", version: 1 }, { storeId, recordId: "X001", version: 1 }] } } }] });
+	const merged = await f.store.merge(method.proposalId);
+	const baseline = await f.ws.startRun("M04", [{ label: "反馈", path: f.ws.problemFile }], merged.snapshot.id);
+	await f.ws.writeOutput(baseline, "merge.json", JSON.stringify(merged), "合入结果");
+	await f.ws.finishRun(baseline, "completed");
+	const goal = await f.controller.begin(begin);
+	const methodRef = { storeId, recordId: "K001", version: 1 };
+	const contextRef = { storeId, recordId: "X001", version: 1 };
+	const task = await f.controller.delegate(goal.runId, { objective: "执行条件性核查", inputs: [], expectedOutputs: [], checks: ["范围已核对"], mode: "reason", experienceRefs: [methodRef], experienceContextRefs: [contextRef], experienceTags: ["numeric"] });
+	const sent = [...f.runner.sessions.values()].at(-1)!.transcript[0].text;
+	assert.match(sent, /条件性检查方法/);
+	assert.match(sent, /实际观察/);
+	assert.equal(task.experienceSelection?.status, "ready");
+	assert.ok(task.experienceSelection?.loadedAt);
+	assert.equal(task.experienceSelection?.invocationStatus, "unknown");
+	assert.equal(task.experienceSelection?.faithfulUse, "unknown");
+	assert.equal(task.experienceSelection?.causalBenefit, "unknown");
+	await assert.rejects(f.controller.delegate(goal.runId, { objective: "不能绕开适用性检查", inputs: [], expectedOutputs: [], checks: ["范围已核对"], mode: "reason", knowledgeIds: ["K001@1"] }), /必须通过固定 storeId/);
+	const limited = await f.store.submitProposal({ stage: "M04", runId: "withdraw", ops: [{ op: "limit", target: "E001", kind: "withdrawn", reason: "数据被撤回", authority: "reviewer" }] });
+	await f.store.merge(limited.proposalId);
+	await assert.rejects(f.controller.delegate(goal.runId, { objective: "不得重用失效经验", inputs: [], expectedOutputs: [], checks: ["范围已核对"], mode: "reason", experienceRefs: [methodRef], experienceContextRefs: [contextRef], experienceTags: ["numeric"] }), /显式方法经验不可装载/);
+	assert.equal((await f.controller.status(goal.runId)).tasks[0].experienceSelection?.status, "ready", "the earlier task history is not hot-rewritten");
+});
+
 test("latest incomplete or failed M04 blocks formal baseline instead of falling back", async (t) => {
 	const f = await fixture(t);
 	const failed = await f.ws.startRun("M04", [{ label: "新处理", path: f.ws.problemFile }]);

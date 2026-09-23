@@ -15,6 +15,8 @@ import type { BeginGoalInput, CurrentGoal, DecisionInput, EvidenceFile, FinishIn
 import type { StageRunRecord } from "../types.ts";
 import { loadActiveBudgetPolicy, projectInline, validateActiveBudgetPointer, validateBudgetPolicy, type BudgetPolicy } from "../improvement/policy.ts";
 import { capturedRunBytes, DEFAULT_PROJECTION_SNAPSHOT_LIMITS, newProjectionEvent, nextProjectionOrdinal, writeProjectionEvent, type ProjectionEventV1, type ProjectionMaterialV1, type ProjectionSnapshotLimits } from "../improvement/observations.ts";
+import { createExperienceProvider } from "../knowledge/experience-index.ts";
+import type { KnowledgeStore } from "../knowledge/types.ts";
 
 const STATE = "goal.json";
 function nonempty(value: string, label: string): string {
@@ -392,7 +394,7 @@ async function writeLegacyInterruptFeedback(ctx: StageContext, goal: CurrentGoal
 	return target;
 }
 
-export function createM07Controller(ctx: StageContext, options: { projectionSnapshotLimits?: ProjectionSnapshotLimits } = {}): M07Controller {
+export function createM07Controller(ctx: StageContext, options: { projectionSnapshotLimits?: ProjectionSnapshotLimits; registeredExperienceStores?: ReadonlyMap<string, KnowledgeStore> } = {}): M07Controller {
 	const snapshotLimits = options.projectionSnapshotLimits ?? DEFAULT_PROJECTION_SNAPSHOT_LIMITS;
 	if (!Number.isSafeInteger(snapshotLimits.perMaterialBytes) || !Number.isSafeInteger(snapshotLimits.perCallBytes) || !Number.isSafeInteger(snapshotLimits.perRunBytes) || snapshotLimits.perMaterialBytes <= 0 || snapshotLimits.perCallBytes < snapshotLimits.perMaterialBytes || snapshotLimits.perRunBytes < snapshotLimits.perCallBytes) throw new HarnessError("m07.projection-budget", "invalid projection snapshot limits");
 	return {
@@ -453,13 +455,26 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			const copies: M07TaskRecord["inputCopies"] = [];
 			for (let i = 0; i < resolvedInputs.length; i++) { const source = resolvedInputs[i]; const copy = path.join(inputsDir, uniqueName(i, source)); await copyFile(source, copy); copies.push({ source, copy, mediaType: mediaType(source) }); }
 			let pack: string | undefined;
-			if (spec.knowledgeIds?.length) pack = (await ctx.store.buildPack({ purpose: `M07 ${id}`, ids: spec.knowledgeIds, includeOpenQuestions: true, maxChars: 60_000 })).markdown;
+			if (spec.knowledgeIds?.length) {
+				for (const requested of spec.knowledgeIds) {
+					const parsed = /^([CKEJQDX]\d{3,})(?:@(\d+))?$/.exec(requested);
+					if (parsed && (await ctx.store.get(parsed[1], parsed[2] ? Number(parsed[2]) : undefined))?.fields.experience !== undefined) throw new HarnessError("m07.experience", `方法经验 ${requested} 必须通过固定 storeId、recordId、version 与适用性选择入口加载`);
+				}
+				pack = (await ctx.store.buildPack({ purpose: `M07 ${id}`, ids: spec.knowledgeIds, includeOpenQuestions: true, maxChars: 60_000 })).markdown;
+			}
+			let experienceSelection: M07TaskRecord["experienceSelection"];
+			if (spec.experienceRefs?.length) {
+				const selection = await createExperienceProvider(ctx.store, options.registeredExperienceStores).select({ targetKind: "executor", applicability: { stage: "M07", tags: [spec.mode, ...(spec.experienceTags ?? [])], contextRefs: spec.experienceContextRefs }, requestedRefs: spec.experienceRefs, expectedSnapshotId: goal.knowledgeSnapshot, maxRecords: 24, maxChars: 24_000 });
+				if (selection.status !== "ready") throw new HarnessError("m07.experience", `显式方法经验不可装载：${selection.omitted.map((item) => `${item.ref.storeId}/${item.ref.recordId}@${item.ref.version}:${item.reason}`).join("；") || selection.status}`);
+				experienceSelection = { ...selection, invocationStatus: "unknown", faithfulUse: "unknown", causalBenefit: "unknown" };
+				pack = [pack, selection.markdown].filter(Boolean).join("\n\n");
+			}
 			const expectedOutputPaths = spec.expectedOutputs.map((x) => { const resolved = path.resolve(workDir, x); if (!inside(workDir, resolved)) throw new HarnessError("m07.path", `预期产物路径逃逸任务目录：${x}`); return resolved; });
 			const role = spec.mode === "check" ? "reviewer" : "execution";
 			const tools = spec.mode === "execute" ? { kind: "execution" as const, root: workDir, tools: ["read", "write", "edit", "bash"] as Array<"read" | "write" | "edit" | "bash"> } : { kind: "read-dir" as const, root: workDir };
 			const { message, event } = await taskMessage(ctx, goal, id, spec, copies, pack, policy, snapshotLimits);
 			await writeFileAtomic(path.join(dir, "message.md"), message);
-			const task: M07TaskRecord = { ...spec, taskId: id, status: "running", createdAt: nowIso(), returnedAt: "", workDir, inputCopies: copies, expectedOutputPaths, readCoverage: [], toolLog: [], knowledgeSnapshot: goal.knowledgeSnapshot, m04BaselineRunId: goal.m04BaselineRunId };
+			const task: M07TaskRecord = { ...spec, taskId: id, status: "running", createdAt: nowIso(), returnedAt: "", workDir, inputCopies: copies, expectedOutputPaths, readCoverage: [], toolLog: [], knowledgeSnapshot: goal.knowledgeSnapshot, m04BaselineRunId: goal.m04BaselineRunId, experienceSelection };
 			goal.tasks.push(task); await save(ctx, goal);
 			let handle;
 			try {
@@ -467,7 +482,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				if (goal.methodBinding) session.methodBinding = goal.methodBinding;
 				handle = await ctx.runner.create(session); task.session = handle.ref; await save(ctx, goal);
 				event.deliveryStatus = "submitted"; event.providerUsageSessionId = handle.ref.id; await writeProjectionEvent(ctx.ws, event);
-				const report = (await handle.prompt(message)).text; const reportPath = path.join(dir, "report.md"); await writeFileAtomic(reportPath, report);
+				const report = (await handle.prompt(message)).text; if (task.experienceSelection) task.experienceSelection.loadedAt = nowIso(); const reportPath = path.join(dir, "report.md"); await writeFileAtomic(reportPath, report);
 				task.reportPath = reportPath; task.status = "returned";
 			} catch (error) {
 				task.status = "failed"; task.executionFailure = (error as Error).message;

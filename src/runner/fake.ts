@@ -49,6 +49,11 @@ export class FakeSessionRunner implements SessionRunner {
 		this.reply = reply;
 	}
 
+	async estimateMaxSdkCost(_modelRaw: string, caps: { maxInputTokens: number; maxOutputTokens: number }): Promise<number | undefined> {
+		if (!Number.isInteger(caps.maxInputTokens) || caps.maxInputTokens < 1 || !Number.isInteger(caps.maxOutputTokens) || caps.maxOutputTokens < 1) return undefined;
+		return (caps.maxInputTokens + caps.maxOutputTokens) / 1_000_000;
+	}
+
 	async create(spec: SessionSpec): Promise<SessionHandle> {
 		const id = `fake-${randomBytes(4).toString("hex")}`;
 		const file = path.join(spec.persistDir, `${spec.label}-${id}.jsonl`);

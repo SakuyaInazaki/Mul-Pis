@@ -69,6 +69,8 @@ export interface SessionSpec {
 	persistDir: string;
 	/** Explicit, frozen method identity. It never enables resource discovery. */
 	methodBinding?: { versionId: string; contentId?: string };
+	/** Explicit opt-in for the L5 one-request path. JSON payload bytes conservatively bound input tokens for text-only DeepSeek. */
+	strictRequest?: { maxProviderCallsPerPrompt: 1; maxOutputTokens: number; maxInputPayloadBytes: number };
 }
 
 /** Enough to reopen a persisted session with the same boundary. */
@@ -170,6 +172,8 @@ export interface SessionHandle {
 
 export interface SessionRunner {
 	create(spec: SessionSpec): Promise<SessionHandle>;
+	/** Worst-case Pi price-table estimate for one bounded text request; absent/undefined fails admission closed. */
+	estimateMaxSdkCost?(modelRaw: string, caps: { maxInputTokens: number; maxOutputTokens: number }): Promise<number | undefined>;
 	/** Reopen a persisted session with the boundary recorded in `ref.specFile`. */
 	resume(ref: SessionRef): Promise<SessionHandle>;
 }

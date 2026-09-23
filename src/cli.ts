@@ -49,6 +49,9 @@ import { HarnessError } from "./types.ts";
 import { Workspace } from "./workspace.ts";
 import { ImprovementService } from "./improvement/service.ts";
 import type { CampaignPlan } from "./improvement/types.ts";
+import { ResearchImprovementService, type ResearchBootstrapInput } from "./improvement/research-service.ts";
+import type { ResearchCampaignPlanV1 } from "./improvement/research-types.ts";
+import { publicResearchRun, publicResearchStatus } from "./improvement/research-public.ts";
 
 interface ParsedArgs {
 	positional: string[];
@@ -99,7 +102,7 @@ async function makeRunner(kind: string): Promise<SessionRunner> {
 }
 
 function usage(): string {
-	return `用法：node src/cli.ts <init|m01|m02|m03|m04|m05|m06|m08|m09|status|knowledge|improve> [选项]\n  --workspace <dir>   工作区（默认当前目录）\n  --runner pi|fake    会话运行器（默认 pi）\n  improve run|status|rollback|export|bind（run 必须给 --plan <json>；无案例只筛选不晋级）\n  improve run --plan <json> 显式限定候选/实验/资源预算\n  improve export --version <id> --applicability <text> --out <json>；bind --package <json> 是人工显式迁移\n  m08 的 materials/self-checks/reviewers 是显式 JSON 文件\n  m09 的 delivery-scope/reproduction 是显式 JSON 文件；instructions 是预授权的精确 shell 命令，read-only 时应为空；不会自动发布\n详见 src/cli.ts 顶部说明。`;
+	return `用法：node src/cli.ts <init|m01|m02|m03|m04|m05|m06|m08|m09|status|knowledge|improve> [选项]\n  --workspace <dir>   工作区（默认当前目录）\n  --runner pi|fake    会话运行器（默认 pi）\n  improve run|status|rollback|export|bind（旧预算机制实验；run 必须给 --plan <json>）\n  improve research bootstrap --methods <json>；run --plan <json>；status|rollback|export|bind\n  research run 仅在显式开发/准入案例和共享预算下研究 H/I；无准入案例只留档\n  m08 的 materials/self-checks/reviewers 是显式 JSON 文件\n  m09 的 delivery-scope/reproduction 是显式 JSON 文件；instructions 是预授权的精确 shell 命令，read-only 时应为空；不会自动发布\n详见 src/cli.ts 顶部说明。`;
 }
 
 async function jsonFile<T>(args: ParsedArgs, name: string): Promise<T> {
@@ -143,6 +146,18 @@ export async function main(argv: string[]): Promise<number> {
 	}
 	if (command === "improve") {
 		const action = args.positional[1] ?? "status";
+		if (action === "research") {
+			const researchAction = args.positional[2] ?? "status";
+			const researchRunner = researchAction === "run" ? await makeRunner(flag(args, "runner") ?? "pi") : new FakeSessionRunner(() => "unused");
+			const research = new ResearchImprovementService({ workspaceRoot: ws.root, runner: researchRunner });
+			if (researchAction === "bootstrap") { console.log(JSON.stringify(await research.bootstrap(await jsonFile<ResearchBootstrapInput>(args, "methods")), null, 2)); return 0; }
+			if (researchAction === "run") { const result = await research.run(await jsonFile<ResearchCampaignPlanV1>(args, "plan")); console.log(JSON.stringify(publicResearchRun(result), null, 2)); return result.status === "failed" ? 1 : 0; }
+			if (researchAction === "status") { console.log(JSON.stringify(publicResearchStatus(await research.status()), null, 2)); return 0; }
+			if (researchAction === "rollback") { console.log(JSON.stringify(await research.rollback(), null, 2)); return 0; }
+			if (researchAction === "export") { const version = flag(args, "version"), out = flag(args, "out"); if (!version || !out) throw new HarnessError("cli.improve", "research export requires --version and --out"); console.log(JSON.stringify(await research.exportMethod(version, path.resolve(out)), null, 2)); return 0; }
+			if (researchAction === "bind") { const source = flag(args, "package"); if (!source) throw new HarnessError("cli.improve", "research bind requires --package"); console.log(JSON.stringify(await research.bindMethod(path.resolve(source)), null, 2)); return 0; }
+			throw new HarnessError("cli.improve", "improve research 子命令：bootstrap | run | status | rollback | export | bind");
+		}
 		const runner = action === "run" ? await makeRunner(flag(args, "runner") ?? "pi") : new FakeSessionRunner(() => "unused");
 		const improvement = new ImprovementService({ workspaceRoot: ws.root, runner });
 		if (action === "status") {

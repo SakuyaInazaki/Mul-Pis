@@ -348,6 +348,17 @@ export class PiSessionRunner implements SessionRunner {
 		this.options = options;
 	}
 
+	/** Worst-case Pi price-table estimate for a text-only bounded request; undefined when unpriced. */
+	async estimateMaxSdkCost(modelRaw: string, caps: { maxInputTokens: number; maxOutputTokens: number }): Promise<number | undefined> {
+		if (!Number.isInteger(caps.maxInputTokens) || caps.maxInputTokens < 1 || !Number.isInteger(caps.maxOutputTokens) || caps.maxOutputTokens < 1) return undefined;
+		const { model } = await this.resolveModel({ model: modelRaw } as SessionSpec);
+		const rates = [model.cost, ...(model.cost.tiers ?? [])];
+		if (rates.some((r) => !Number.isFinite(r.input) || r.input <= 0 || !Number.isFinite(r.output) || r.output <= 0 || !Number.isFinite(r.cacheRead) || r.cacheRead < 0 || !Number.isFinite(r.cacheWrite) || r.cacheWrite < 0)) return undefined;
+		const inputRate = Math.max(...rates.flatMap((r) => [r.input, r.cacheRead, r.cacheWrite]));
+		const outputRate = Math.max(...rates.map((r) => r.output));
+		return (caps.maxInputTokens * inputRate + caps.maxOutputTokens * outputRate) / 1_000_000;
+	}
+
 	async create(spec: SessionSpec): Promise<SessionHandle> {
 		await mkdir(spec.persistDir, { recursive: true });
 		const cwd = await mkdtemp(path.join(spec.persistDir, SCRATCH_PREFIX));
@@ -421,7 +432,13 @@ export class PiSessionRunner implements SessionRunner {
 			throw new HarnessError("runner.isolation", `runner agent directory is not empty: ${emptyAgentDir}`);
 		}
 
-		const settingsManager = SettingsManager.inMemory({});
+		const strict = spec.strictRequest;
+		if (strict) {
+			if (spec.tools.kind !== "none" || strict.maxProviderCallsPerPrompt !== 1 || !Number.isInteger(strict.maxOutputTokens) || strict.maxOutputTokens < 1 || !Number.isInteger(strict.maxInputPayloadBytes) || strict.maxInputPayloadBytes < 1) {
+				throw new HarnessError("runner.model", "strict request requires no tools and positive integer request caps");
+			}
+		}
+		const settingsManager = SettingsManager.inMemory(strict ? { retry: { enabled: false, provider: { maxRetries: 0 } }, compaction: { enabled: false } } : {});
 		const loader = new DefaultResourceLoader({
 			cwd,
 			agentDir: emptyAgentDir,
@@ -437,6 +454,35 @@ export class PiSessionRunner implements SessionRunner {
 		await loader.reload();
 
 		const resolved = await this.resolveModel(spec);
+		if (strict && (resolved.model.provider !== "deepseek" || resolved.model.api !== "openai-completions" || strict.maxOutputTokens > resolved.model.maxTokens)) {
+			throw new HarnessError("runner.model", "strict request currently supports only bounded DeepSeek openai-completions models");
+		}
+		let strictStreamCalls = 0;
+		let strictPayloadChecks = 0;
+		const requestRuntime = strict ? new Proxy(resolved.modelRuntime, {
+			get(target, property) {
+				if (property !== "streamSimple") {
+					const member = Reflect.get(target, property, target);
+					return typeof member === "function" ? member.bind(target) : member;
+				}
+				return (model: Parameters<ModelRuntime["streamSimple"]>[0], context: Parameters<ModelRuntime["streamSimple"]>[1], options?: Parameters<ModelRuntime["streamSimple"]>[2]) => {
+					strictStreamCalls++;
+					if (strictStreamCalls > strict.maxProviderCallsPerPrompt || model.provider !== resolved.model.provider || model.id !== resolved.model.id) throw new HarnessError("runner.model", "strict request would exceed one provider call or change model");
+					return target.streamSimple(model, context, {
+						...options, maxRetries: 0, maxTokens: strict.maxOutputTokens,
+						onPayload: async (payload, payloadModel) => {
+							strictPayloadChecks++;
+							if (strictPayloadChecks > 1 || payloadModel.provider !== model.provider || payloadModel.id !== model.id) throw new HarnessError("runner.model", "strict request payload changed model or repeated");
+							const record = payload as Record<string, unknown>;
+							if (record.max_tokens !== strict.maxOutputTokens && record.max_completion_tokens !== strict.maxOutputTokens) throw new HarnessError("runner.model", "strict request output cap missing from provider payload");
+							const bytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
+							if (bytes > strict.maxInputPayloadBytes) throw new HarnessError("runner.model", "strict request input payload exceeds reserved byte cap");
+							return payload;
+						},
+					});
+				};
+			},
+		}) : resolved.modelRuntime;
 		const priced = resolved.model.cost.input > 0 && resolved.model.cost.output > 0;
 		let materialTools: MaterialTools = { tools: [], names: [], readCoverage: new Set(), readReturns: [] };
 		const toolLog: ToolCallRecord[] = [];
@@ -462,7 +508,7 @@ export class PiSessionRunner implements SessionRunner {
 			agentDir: emptyAgentDir,
 			model: resolved.model,
 			thinkingLevel: resolved.thinkingLevel,
-			modelRuntime: resolved.modelRuntime,
+			modelRuntime: requestRuntime,
 			noTools,
 			tools: materialTools.names,
 			...(materialTools.tools.length > 0 ? { customTools: materialTools.tools } : {}),
@@ -538,6 +584,7 @@ export class PiSessionRunner implements SessionRunner {
 				if (promptActive) throw new HarnessError("runner.stop", `session ${spec.label} already has an active prompt`);
 				if (signal?.aborted) throw new HarnessError("runner.stop", `session ${spec.label} was aborted before prompt`);
 				promptActive = true;
+				if (strict) { strictStreamCalls = 0; strictPayloadChecks = 0; }
 				// Do not await telemetry before installing the abort listener: prompt()
 				// must remain synchronously abortable from the caller's next statement.
 				void queueTelemetry(async () => { if (!disposed) await telemetry?.heartbeat("active"); });
@@ -566,6 +613,7 @@ export class PiSessionRunner implements SessionRunner {
 				signal?.addEventListener("abort", abortListener, { once: true });
 				try {
 					await session.prompt(text);
+					if (strict && (strictStreamCalls !== 1 || strictPayloadChecks !== 1)) throw new HarnessError("runner.model", "strict request did not verify exactly one provider payload");
 					if (abortPromise) await abortPromise;
 					if (signal?.aborted || abortedByHandle) {
 						const detail = abortError ? `; SDK abort failed: ${(abortError as Error).message}` : "";
@@ -586,7 +634,7 @@ export class PiSessionRunner implements SessionRunner {
 					throw error;
 				} finally {
 					collectUsage();
-					if (promptOutcome !== "completed" && !promptEvents.some((event) => event.kind === "assistant")) {
+					if (!promptEvents.some((event) => event.kind === "assistant")) {
 						const unknown: UsageEvent = { entryId: `unobserved-${ref.id}-${thisPrompt}`, kind: "assistant", promptIndex: thisPrompt, at: new Date().toISOString(), status: "unknown", costSource: "unknown", costStatus: "unknown" };
 						promptEvents.push(unknown); usageEvents.push(unknown);
 					}

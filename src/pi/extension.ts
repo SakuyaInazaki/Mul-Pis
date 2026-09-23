@@ -9,6 +9,9 @@ import { ResearchService, type StageRequest } from "./service.ts";
 import { TelemetryWriter } from "../dashboard/telemetry.ts";
 import { createMainUsageLedger } from "./main-usage.ts";
 import { ImprovementService } from "../improvement/service.ts";
+import { ResearchImprovementService, type ResearchBootstrapInput } from "../improvement/research-service.ts";
+import type { ResearchCampaignPlanV1 } from "../improvement/research-types.ts";
+import { publicResearchRun, publicResearchStatus } from "../improvement/research-public.ts";
 import type { CampaignPlan, ImprovementRunResult, ImprovementStatus } from "../improvement/types.ts";
 import type { ActiveBudgetPointer } from "../improvement/policy.ts";
 
@@ -106,7 +109,7 @@ export interface ResearchExtensionOptions {
 
 export function createResearchExtension(options: ResearchExtensionOptions = {}) {
 	return function researchExtension(pi: ExtensionAPI): void {
-		const orchestrationTools = new Set(["research_status", "research_init", "research_stage", "research_goal", "research_delegate", "research_review", "research_improve"]);
+		const orchestrationTools = new Set(["research_status", "research_init", "research_stage", "research_goal", "research_delegate", "research_review", "research_improve", "research_method_improve"]);
 		const inspectionTools = new Set(["read", "grep", "find", "ls"]);
 		let researchActive = false;
 		let activePiCwd: string | undefined;
@@ -269,6 +272,44 @@ mainAgentWatchdog.unref?.();
 		});
 
 		pi.registerTool({
+			name: "research_method_improve",
+			label: "Bounded Research Method Improvement",
+			description: "Explicitly bootstrap, run, inspect, roll back, or manually transfer versioned H/I prompt strategies in the local CPU method-research environment. This is separate from the budget-policy mechanism-cost protocol; no admission cases means research-only, and no complete M01–M09 or L5 benefit is implied.",
+			promptSnippet: "Run a caller-bounded H/I method-research campaign only when explicitly authorized",
+			promptGuidelines: ["Use caller-supplied method/plan files with exact provider-call, token and SDK-estimated-cost ceilings.", "Development feedback can guide candidates; protected admission results must not return to proposal prompts."],
+			parameters: Type.Object({
+				action: Type.Union([Type.Literal("bootstrap"), Type.Literal("run"), Type.Literal("status"), Type.Literal("rollback"), Type.Literal("export"), Type.Literal("bind")]),
+				workspace: Type.Optional(Type.String()),
+				methodsPath: Type.Optional(Type.String()),
+				planPath: Type.Optional(Type.String()),
+				versionId: Type.Optional(Type.String()),
+				outputPath: Type.Optional(Type.String()),
+				packagePath: Type.Optional(Type.String()),
+			}),
+			executionMode: "sequential",
+			async execute(_id, params, signal, _update, ctx) {
+				const { createPiSessionRunner } = await import("../runner/pi.ts");
+				const research = new ResearchImprovementService({ workspaceRoot: workspaceFrom(params.workspace, ctx.cwd), runner: createPiSessionRunner({ signal }) });
+				if (params.action === "bootstrap") {
+					if (!params.methodsPath) throw new Error("bootstrap requires methodsPath");
+					return result(await research.bootstrap(JSON.parse(await readFile(path.resolve(ctx.cwd, params.methodsPath), "utf8")) as ResearchBootstrapInput));
+				}
+				if (params.action === "run") {
+					if (!params.planPath) throw new Error("run requires planPath");
+					return result(publicResearchRun(await research.run(JSON.parse(await readFile(path.resolve(ctx.cwd, params.planPath), "utf8")) as ResearchCampaignPlanV1)));
+				}
+				if (params.action === "status") return result(publicResearchStatus(await research.status()));
+				if (params.action === "rollback") return result(await research.rollback());
+				if (params.action === "export") {
+					if (!params.versionId || !params.outputPath) throw new Error("export requires versionId and outputPath");
+					return result(await research.exportMethod(params.versionId, path.resolve(ctx.cwd, params.outputPath)));
+				}
+				if (!params.packagePath) throw new Error("bind requires packagePath");
+				return result(await research.bindMethod(path.resolve(ctx.cwd, params.packagePath)));
+			},
+		});
+
+		pi.registerTool({
 			name: "research_init",
 			label: "Initialize Research Workspace",
 			description: "Initialize the explicit workspace layout. Does not create research.config.json or choose models.",
@@ -382,6 +423,9 @@ mainAgentWatchdog.unref?.();
 			promptGuidelines: ["Use research_delegate only for a bounded task under an existing M07 goal; never describe a returned task as accepted.", "Expected outputs are exact work-dir-relative path strings; put human explanations in objective or report.md, never in a path."],
 			parameters: Type.Object({
 				workspace: Type.Optional(Type.String()), runId: Type.String(), objective: Type.String(), inputs: Type.Array(Type.String()), expectedOutputs: Type.Array(Type.String({ description: "Exact work-dir-relative output path; put explanations in objective or report.md" })), checks: Type.Array(Type.String()), mode: Type.Union([Type.Literal("execute"), Type.Literal("check"), Type.Literal("reason")]), parentTaskId: Type.Optional(Type.String()), supersedesTaskId: Type.Optional(Type.String()), requireIndependentCheck: Type.Optional(Type.Boolean()), knowledgeIds: Type.Optional(Type.Array(Type.String())),
+				experienceRefs: Type.Optional(Type.Array(Type.Object({ storeId: Type.String(), recordId: Type.String(), version: Type.Integer() }))),
+				experienceContextRefs: Type.Optional(Type.Array(Type.Object({ storeId: Type.String(), recordId: Type.String(), version: Type.Integer() }))),
+				experienceTags: Type.Optional(Type.Array(Type.String())),
 			}),
 			executionMode: "sequential",
 			async execute(_id, params, signal, onUpdate, ctx) {

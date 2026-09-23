@@ -171,6 +171,39 @@ test("a none grant disables every tool", async (t) => {
 	assert.equal(stub.calls[0].sessionManager?.getSessionDir(), persistDir);
 });
 
+test("strict DeepSeek request disables retries and compaction, verifies one capped payload", async (t) => {
+	const persistDir = await fixture(t);
+	const model = { ...MODEL, id: "deepseek-flash", provider: "deepseek", api: "openai-completions", cost: { input: 0.2, output: 0.3, cacheRead: 0.1, cacheWrite: 0.1 } } as Model<"openai-completions">;
+	const seen: Array<{ maxTokens?: number; maxRetries?: number }> = [];
+	const runtime = {
+		getModels: () => [model],
+		streamSimple(_model: unknown, _context: unknown, options: { maxTokens?: number; maxRetries?: number; onPayload?: (payload: unknown, model: unknown) => Promise<unknown> }) {
+			seen.push({ maxTokens: options.maxTokens, maxRetries: options.maxRetries });
+			return options.onPayload?.({ model: "deepseek-flash", messages: [{ role: "user", content: "short" }], max_tokens: options.maxTokens }, model);
+		},
+	} as unknown as ModelRuntime;
+	const stub = stubFactory();
+	const factory = (async (options: CreateAgentSessionOptions = {}) => {
+		const created = await stub.factory(options);
+		const original = created.session.prompt.bind(created.session);
+		(created.session as unknown as { prompt: (text: string) => Promise<void> }).prompt = async (text) => {
+			await (options.modelRuntime as unknown as { streamSimple: (model: unknown, context: unknown, options: unknown) => Promise<unknown> }).streamSimple(model, { messages: [] }, {});
+			await original(text);
+		};
+		return created;
+	}) as typeof createAgentSession;
+	const runner = new PiSessionRunner({ modelRuntime: runtime, createSession: factory });
+	const estimate = await runner.estimateMaxSdkCost("deepseek/deepseek-flash", { maxInputTokens: 200, maxOutputTokens: 20 });
+	assert(estimate && estimate > 0);
+	const handle = await runner.create(spec(persistDir, { model: "deepseek/deepseek-flash", strictRequest: { maxProviderCallsPerPrompt: 1, maxOutputTokens: 20, maxInputPayloadBytes: 500 } }));
+	assert.equal(stub.calls[0].settingsManager?.getRetrySettings().enabled, false);
+	assert.equal(stub.calls[0].settingsManager?.getProviderRetrySettings().maxRetries, 0);
+	assert.equal(stub.calls[0].settingsManager?.getCompactionSettings().enabled, false);
+	await handle.prompt("one step");
+	assert.deepEqual(seen, [{ maxTokens: 20, maxRetries: 0 }]);
+	handle.dispose();
+});
+
 test("a read-dir grant confines both tools, rejects PDFs, and records successful reads", async (t) => {
 	const persistDir = await fixture(t);
 	const materialRoot = path.join(persistDir, "materials");
