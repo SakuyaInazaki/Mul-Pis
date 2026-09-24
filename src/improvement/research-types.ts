@@ -26,8 +26,6 @@ export interface ResearchCampaignPlanV1 {
  maxReadbackChars?: number;
  schemaRepairAttempts?: number;
  perPromptTimeoutMs: number;
- perPromptMaxOutputTokens: number;
- perPromptMaxInputTokens?: number;
  budget: BudgetLimits;
  /** Identical cap for each meta arm; both draw from the same root ledger. */
  metaBranchBudget?: BudgetLimits;
@@ -64,12 +62,14 @@ export interface ResearchDecisionRecordV1 {
  repairSessionIds?: string[];
  branchPrefix?: string;
 }
-export interface ResearchDevelopmentEpisodeV1 { caseId: string; candidateId: string; episode: ExecutorEpisodeResult; sdkEstimatedCost: number; modelCalls: number }
+export interface ResearchDevelopmentEpisodeV1 { caseId: string; candidateId: string; episode: ExecutorEpisodeResult; sdkEstimatedCost: number; modelCalls: number; scientificStatus: "supported" | "justified-unknown" | "contradicted" | "premature-stop" | "incomplete" }
 export interface ResearchRunV1 {
  version: 1; runId: string; startedAt: string; finishedAt?: string;
  planPath: string; baselineBundleId: string; baselinePointer?: ActiveGenerationPointerV1;
  frozenBundle: GenerationBundleV1; developmentCaseSetPath: string; admissionCaseSetPath?: string;
  status: "running" | "research-only" | "rejected" | "inconclusive" | "promoted" | "failed";
+ /** Optional precise lifecycle classification; status remains the compatible public summary. */
+ outcome?: "setup-blocked" | "provider-failed" | "search-incomplete" | "completed-no-candidate" | "candidate-rejected" | "promoted";
  selectedCandidateId?: string; candidates: ResearchCandidateV1[]; decisions: ResearchDecisionRecordV1[];
  inspections?: ResearchInspectionResultV1[]; developmentEpisodes?: ResearchDevelopmentEpisodeV1[];
  metaEpisodeIds?: string[];
@@ -83,7 +83,8 @@ export interface ResearchRunV1 {
 export function validateResearchPlan(input: unknown): ResearchCampaignPlanV1 {
  if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.research-plan", "plan must be an object");
  const p = input as Record<string, unknown>;
- const keys = new Set(["version", "experimentKind", "target", "developmentCaseSetPath", "priorDevelopmentFeedbackPath", "admissionCaseSetPath", "maxDecisions", "maxCandidates", "maxCandidatesPerMetaArm", "admissionRepetitions", "maxFeedbackItems", "maxInspectActions", "maxReadbackChars", "schemaRepairAttempts", "perPromptTimeoutMs", "perPromptMaxOutputTokens", "perPromptMaxInputTokens", "budget", "outerBudget", "pilotBudget", "protectedBudget", "metaBranchBudget", "metaProtocol", "searchReplicates", "outcomeReplicates", "experienceRefs", "experienceMaxRecords", "experienceMaxChars", "metaEpisodeRunIds"]);
+ const keys = new Set(["version", "experimentKind", "target", "developmentCaseSetPath", "priorDevelopmentFeedbackPath", "admissionCaseSetPath", "maxDecisions", "maxCandidates", "maxCandidatesPerMetaArm", "admissionRepetitions", "maxFeedbackItems", "maxInspectActions", "maxReadbackChars", "schemaRepairAttempts", "perPromptTimeoutMs", "budget", "outerBudget", "pilotBudget", "protectedBudget", "metaBranchBudget", "metaProtocol", "searchReplicates", "outcomeReplicates", "experienceRefs", "experienceMaxRecords", "experienceMaxChars", "metaEpisodeRunIds"]);
+ if ("perPromptMaxOutputTokens" in p || "perPromptMaxInputTokens" in p) throw new HarnessError("improvement.research-plan", "per-request token quotas have been removed; use campaign and phase budgets");
  if (Object.keys(p).some((key) => !keys.has(key)) || p.version !== 1 || !["executor-quality", "meta-improvement"].includes(String(p.experimentKind)) || !["executor", "improver"].includes(String(p.target)) || (p.experimentKind === "executor-quality" ? p.target !== "executor" : p.target !== "improver")) throw new HarnessError("improvement.research-plan", "invalid experiment kind/target");
  const pathValue = (v: unknown, field: string, optional = false) => { if (v === undefined && optional) return; if (typeof v !== "string" || !v.trim() || v.length > 500) throw new HarnessError("improvement.research-plan", `${field} is required`); };
  pathValue(p.developmentCaseSetPath, "developmentCaseSetPath"); pathValue(p.admissionCaseSetPath, "admissionCaseSetPath", true);
@@ -95,9 +96,6 @@ export function validateResearchPlan(input: unknown): ResearchCampaignPlanV1 {
  if (p.maxReadbackChars !== undefined) integer(p.maxReadbackChars, "maxReadbackChars", 0, 40_000);
  if (p.schemaRepairAttempts !== undefined) integer(p.schemaRepairAttempts, "schemaRepairAttempts", 0, 2);
  if (p.maxInspectActions === 0 && typeof p.maxReadbackChars === "number" && p.maxReadbackChars > 0) throw new HarnessError("improvement.research-plan", "readback characters require inspect actions");
- integer(p.perPromptMaxOutputTokens, "perPromptMaxOutputTokens", 1, 20_000);
- if (p.perPromptMaxInputTokens !== undefined) integer(p.perPromptMaxInputTokens, "perPromptMaxInputTokens", 1, 1_000_000);
- if (p.admissionCaseSetPath !== undefined && p.perPromptMaxInputTokens === undefined) throw new HarnessError("improvement.research-plan", "admission requires explicit perPromptMaxInputTokens");
  integer(p.admissionRepetitions, "admissionRepetitions", 2, 10); if ((p.admissionRepetitions as number) % 2 !== 0) throw new HarnessError("improvement.research-plan", "admissionRepetitions must be even");
  integer(p.experienceMaxRecords, "experienceMaxRecords", 0, 20); integer(p.experienceMaxChars, "experienceMaxChars", 0, 12_000);
  if (!Array.isArray(p.experienceRefs) || p.experienceRefs.length > 20 || !p.experienceRefs.every((r) => !!r && typeof r === "object" && typeof r.storeId === "string" && typeof r.recordId === "string" && Number.isSafeInteger(r.version) && r.version > 0)) throw new HarnessError("improvement.research-plan", "experienceRefs must be bounded pinned refs");
@@ -109,8 +107,6 @@ export function validateResearchPlan(input: unknown): ResearchCampaignPlanV1 {
  if (Object.keys(b).some((key) => !budgetKeys.has(key))) throw new HarnessError("improvement.research-plan", "budget has unsupported fields");
  integer(b.maxProviderCalls, "maxProviderCalls", 1, 100); integer(b.maxInputTokens, "maxInputTokens", 1, 10_000_000); integer(b.maxOutputTokens, "maxOutputTokens", 1, 10_000_000); integer(b.maxProbeCalls, "maxProbeCalls", 0, 1_000); integer(b.maxCpuMillis, "maxCpuMillis", 1, 3_600_000); integer(b.maxWallMillis, "maxWallMillis", 100, 86_400_000);
  if (typeof b.maxSdkEstimatedCost !== "number" || !Number.isFinite(b.maxSdkEstimatedCost) || b.maxSdkEstimatedCost <= 0) throw new HarnessError("improvement.research-plan", "maxSdkEstimatedCost must be positive");
- if ((p.perPromptMaxOutputTokens as number) > (b.maxOutputTokens as number)) throw new HarnessError("improvement.research-plan", "per-prompt output cap exceeds root output budget");
- if (p.perPromptMaxInputTokens !== undefined && (p.perPromptMaxInputTokens as number) > (b.maxInputTokens as number)) throw new HarnessError("improvement.research-plan", "per-prompt input cap exceeds root input budget");
  const validateChildBudget = (value: unknown, name: string) => {
   if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some((key) => !budgetKeys.has(key))) throw new HarnessError("improvement.research-plan", `${name} must be an explicit closed budget`);
   const child = value as Record<string, unknown>;

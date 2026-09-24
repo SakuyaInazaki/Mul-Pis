@@ -10,6 +10,7 @@ import { ResearchImprovementService } from "../src/improvement/research-service.
 import { GenerationStore } from "../src/improvement/generation.ts";
 import { fullyReadDevelopmentFeedbackIds, validateResearchAction, type ResearchInspectionResultV1 } from "../src/improvement/policy-host.ts";
 import type { ResearchCampaignPlanV1 } from "../src/improvement/research-types.ts";
+import { validateResearchPlan } from "../src/improvement/research-types.ts";
 import { FakeSessionRunner, type FakeReplyContext } from "../src/runner/fake.ts";
 import { SharedBudget } from "../src/experiments/budget.ts";
 import { runExecutorQualityAdmission } from "../src/improvement/executor-eval.ts";
@@ -28,13 +29,18 @@ const cpuCase = (split: "development" | "admission", id: string) => ({ version: 
   { id: "h3", formula: { kind: "affine", slope: split === "admission" ? 5 : 3, intercept: 4 } },
  ], initialX: [0], allowedProbeX: [2], maxProbeCalls: 1, tolerance: 0.01, units: { x: "s", y: "m" } }] });
 const plan = (admissionCaseSetPath?: string): ResearchCampaignPlanV1 => ({ version: 1, experimentKind: "executor-quality", target: "executor", developmentCaseSetPath: "development.json",
- ...(admissionCaseSetPath ? { admissionCaseSetPath, perPromptMaxInputTokens: 20_000, searchReplicates: 1, outcomeReplicates: 2,
+ ...(admissionCaseSetPath ? { admissionCaseSetPath, searchReplicates: 1, outcomeReplicates: 2,
   outerBudget: { maxProviderCalls: 8, maxInputTokens: 160_000, maxOutputTokens: 16_384, maxSdkEstimatedCost: 1, maxProbeCalls: 5, maxCpuMillis: 10_000, maxWallMillis: 60_000 },
   pilotBudget: { maxProviderCalls: 5, maxInputTokens: 100_000, maxOutputTokens: 10_240, maxSdkEstimatedCost: 1, maxProbeCalls: 3, maxCpuMillis: 10_000, maxWallMillis: 60_000 },
   protectedBudget: { maxProviderCalls: 12, maxInputTokens: 240_000, maxOutputTokens: 24_576, maxSdkEstimatedCost: 2, maxProbeCalls: 8, maxCpuMillis: 10_000, maxWallMillis: 60_000 } } : {}),
- maxDecisions: 4, maxCandidates: 2, admissionRepetitions: 2, maxFeedbackItems: 8, perPromptTimeoutMs: 10_000, perPromptMaxOutputTokens: 2_048,
+ maxDecisions: 4, maxCandidates: 2, admissionRepetitions: 2, maxFeedbackItems: 8, perPromptTimeoutMs: 10_000,
  budget: { maxProviderCalls: 80, maxInputTokens: 1_000_000, maxOutputTokens: 200_000, maxSdkEstimatedCost: 10, maxProbeCalls: 80, maxCpuMillis: 100_000, maxWallMillis: 500_000 },
  experienceRefs: [], experienceMaxRecords: 0, experienceMaxChars: 0 });
+
+test("research plans reject obsolete per-request token fields", () => {
+ assert.throws(() => validateResearchPlan({ ...plan(), perPromptMaxOutputTokens: 2_048 }), /per-request token quotas have been removed/);
+ assert.throws(() => validateResearchPlan({ ...plan(), perPromptMaxInputTokens: 20_000 }), /per-request token quotas have been removed/);
+});
 
 function fakeReply(ctx: FakeReplyContext) {
  assert.deepEqual(ctx.spec.tools, { kind: "none" });
@@ -78,6 +84,19 @@ test("research-only campaign consumes real CPU feedback, saves an agent H candid
  const candidate = await new GenerationStore(f.root).readStrategy(result.selectedCandidateId!);
  assert.equal(candidate.origin, "agent-generated");
  assert.ok(f.runner.created.some((x) => x.methodBinding?.versionId === candidate.versionId && x.systemPrompt.includes(candidate.artifact.body)));
+});
+
+test("documented H plan reaches a complete fake model request with its frozen seed", async (t) => {
+ const f = await fixture(t);
+ const document = await readFile(new URL("../docs/implementation/rsi.md", import.meta.url), "utf8");
+ const sample = [...document.matchAll(/```json\n([\s\S]*?)\n```/g)].find((match) => match[1].includes('"experimentKind": "executor-quality"'));
+ assert.ok(sample, "RSI documentation includes a JSON plan");
+ const documented = validateResearchPlan(JSON.parse(sample[1]));
+ const run = await f.service.run({ ...documented, developmentCaseSetPath: "development.json", admissionCaseSetPath: "admission.json" });
+ assert.ok(f.runner.created.length > 0, run.stopReason);
+ assert.ok(run.selectedCandidateId, run.stopReason);
+ assert.notEqual(run.status, "failed", run.stopReason);
+ assert.notEqual(run.stopReason?.includes("prepared request needs"), true);
 });
 
 test("executor-quality protocol may repair an underdetermined baseline without weakening mechanism-cost rules", async (t) => {
@@ -183,7 +202,7 @@ test("meta refuses identical selected H bodies before any protected query", asyn
   branchLeases: [{ old: oldLease, new: newLease }], protectedLease, protocol: "quality", searchReplicates: 1, outcomeReplicates: 2,
   developmentCaseSet: validateCpuCaseSet(cpuCase("development", "dev-a")), admissionCaseSet: validateCpuCaseSet(cpuCase("admission", "admit-b")), budget,
   produceSuccessor: async (versionId) => ({ improverVersionId: versionId, startingExecutorVersionId: "H0", selectedExecutor: { versionId: versionId === "I0" ? "HA" : "HB", artifact: { version: 1, kind: "cpu-numerical-prompt", body: "same body" } }, selectedAt: new Date().toISOString(), decisionCount: 1, status: "selected" }),
-  runner: new FakeSessionRunner(() => { throw new Error("G must not run"); }), researchModel: "fake/research", persistDir: "/tmp", timeoutMs: 10_000, maxInputTokens: 10_000, maxOutputTokens: 2_048,
+  runner: new FakeSessionRunner(() => { throw new Error("G must not run"); }), researchModel: "fake/research", persistDir: "/tmp", timeoutMs: 10_000,
   persistSelection: async () => { protectedSelection++; return "unused"; }, persistObservation: async () => { throw new Error("G must not persist"); } });
  assert.equal(result.status, "rejected"); assert.match(result.reason, /same executable H/); assert.equal(result.protectedQueriedAfterBothSelections, false); assert.equal(protectedSelection, 1);
 });
@@ -288,6 +307,30 @@ test("schema repair is explicit, bounded, and debited as another provider reques
  assert.equal(run.decisions[0].repairSessionIds?.length, 2); assert.equal((run.budgetAtEnd as { committed: { providerCalls: number } }).committed.providerCalls, 2);
 });
 
+test("development accepts justified unknown as partial scientific validity", async (t) => {
+ const f = await fixture(t);
+ const unidentifiable = { ...cpuCase("development", "dev-unknown").cases[0], hypotheses: [
+  { id: "h1", formula: { kind: "affine" as const, slope: 1, intercept: 4 } },
+  { id: "h2", formula: { kind: "quadratic" as const, coefficient: 1, intercept: 4 } },
+ ], allowedProbeX: [1] };
+ await writeFile(path.join(f.root, "development.json"), JSON.stringify({ version: 1, split: "development", cases: [unidentifiable] }));
+ const runner = new FakeSessionRunner((ctx) => {
+  if (ctx.spec.role === "research") return { text: JSON.stringify({ kind: "stop", actionId: "stop-1", reason: "all allowed measurements leave both hypotheses" }), usage };
+  const view = JSON.parse(ctx.message.slice(ctx.message.indexOf("\n") + 1));
+  const turn = Number(ctx.spec.label.split("-").at(-1));
+  if (turn === 0) return { text: JSON.stringify({ kind: "propose", target: "executor", body: "Stop when the allowed measurements cannot distinguish the remaining hypotheses.", hypothesis: {
+   claim: "A justified stop preserves uncertainty", predictedObservation: "Both hypotheses remain equivalent", falsifier: "An allowed probe separates them", applicability: ["cpu-response-identification"], motivatingEvidenceIds: [view.feedback[0].id] } }), usage };
+  if (turn === 1) return { text: JSON.stringify({ kind: "evaluate-development", candidateId: view.candidates[0].id }), usage };
+  return { text: JSON.stringify({ kind: "stop", reason: "candidate handled bounded uncertainty", selectedCandidateId: view.candidates[0].id }), usage };
+ });
+ const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner }).run({ ...plan(), maxDecisions: 3 });
+ assert.equal(run.status, "research-only", run.stopReason);
+ assert.ok(run.selectedCandidateId);
+ assert.equal(run.candidates[0].developmentStatus, "supported");
+ assert.equal(run.developmentEpisodes?.[0].scientificStatus, "justified-unknown");
+ assert.equal(run.developmentEpisodes?.[0].episode.status, "stopped");
+});
+
 test("quality protocol credits justified unknown only partially and requires a solved-case gain", async (t) => {
  const root = await mkdtemp(path.join(os.tmpdir(), "pre-rsi-unknown-")); t.after(() => rm(root, { recursive: true, force: true }));
  const identifiable = cpuCase("admission", "identifiable").cases[0];
@@ -306,7 +349,7 @@ test("quality protocol credits justified unknown only partially and requires a s
  const budget = new SharedBudget("unknown-quality", { ...limits, maxProviderCalls: 20 });
  const caseSet = validateCpuCaseSet({ version: 1, split: "admission", cases: [identifiable, unidentifiable] });
  const result = await runExecutorQualityAdmission({ caseSet, baseline: { versionId: "H0", artifact: { version: 1, kind: "cpu-numerical-prompt", body: "Submit immediately" } }, candidate: { versionId: "H1", artifact: { version: 1, kind: "cpu-numerical-prompt", body: "Probe first" } },
-  runner, model: "fake/research", persistDir: root, budget, lease: budget.root, timeoutMs: 10_000, repetitions: 2, maxOutputTokens: 2_048,
+  runner, model: "fake/research", persistDir: root, budget, lease: budget.root, timeoutMs: 10_000, repetitions: 2,
   persistObservation: async () => ({ storeId: "test", id: "persisted", version: "1" }) });
  assert.equal(result.status, "accepted", result.reason);
  assert.equal(result.results.filter((r) => r.caseId === "unidentifiable" && r.arm === "candidate").every((r) => r.protectedStatus === "justified-unknown"), true);

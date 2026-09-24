@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -41,6 +41,18 @@ test("init creates the complete layout and never overwrites existing files", asy
 	await writeFile(path.join(dir, "RULES.md"), custom, "utf8");
 	await store.init();
 	assert.equal(await readFile(path.join(dir, "RULES.md"), "utf8"), custom);
+});
+
+test("aged merge lock fails closed and retains its owner record", async (t) => {
+	const { dir, store } = await fixture(t);
+	const receipt = await store.submitProposal({ stage: "test", runId: "locked", ops: [{ op: "create", type: "E", title: "证据", body: "待合入" }] });
+	const lock = path.join(dir, ".merge.lock");
+	const owner = JSON.stringify({ pid: 999999, time: "2020-01-01T00:00:00Z" }) + "\n";
+	await writeFile(lock, owner);
+	const old = new Date(Date.now() - 11 * 60_000);
+	await utimes(lock, old, old);
+	await assert.rejects(store.merge(receipt.proposalId), /核对 \.merge\.lock 的 owner 记录/);
+	assert.equal(await readFile(lock, "utf8"), owner);
 });
 
 test("create, revise, decide, close_q, limit and lift_limit keep history", async (t) => {

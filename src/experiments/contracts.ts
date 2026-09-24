@@ -33,6 +33,7 @@ export interface BudgetLimits {
 }
 
 export interface BudgetStatus {
+	lifecycle: "allocated" | "running" | "closed";
 	limits: BudgetLimits;
 	/** Includes reservations for still-in-flight calls. */
 	committed: { providerCalls: number; inputTokens: number; outputTokens: number; sdkEstimatedCost: number; probeCalls: number; cpuMillis: number };

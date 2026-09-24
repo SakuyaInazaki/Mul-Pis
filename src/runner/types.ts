@@ -69,8 +69,8 @@ export interface SessionSpec {
 	persistDir: string;
 	/** Explicit, frozen method identity. It never enables resource discovery. */
 	methodBinding?: { versionId: string; contentId?: string };
-	/** Explicit opt-in for the L5 one-request path. JSON payload bytes conservatively bound input tokens for text-only DeepSeek. */
-	strictRequest?: { maxProviderCallsPerPrompt: 1; maxOutputTokens: number; maxInputPayloadBytes: number };
+	/** Explicit opt-in for the L5 one-request path. The optional output cap is retained for bounded runner callers. */
+	strictRequest?: { maxProviderCallsPerPrompt: 1; maxOutputTokens?: number; maxInputPayloadBytes: number };
 }
 
 /** Enough to reopen a persisted session with the same boundary. */

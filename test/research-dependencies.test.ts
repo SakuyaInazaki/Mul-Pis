@@ -25,7 +25,7 @@ function caseSet() {
 
 function plan(): ResearchCampaignPlanV1 {
 	return { version: 1, experimentKind: "executor-quality", target: "executor", developmentCaseSetPath: "development.json",
-		maxDecisions: 3, maxCandidates: 1, admissionRepetitions: 2, maxFeedbackItems: 8, perPromptTimeoutMs: 10_000, perPromptMaxOutputTokens: 2_048,
+		maxDecisions: 3, maxCandidates: 1, admissionRepetitions: 2, maxFeedbackItems: 8, perPromptTimeoutMs: 10_000,
 		budget: { maxProviderCalls: 12, maxInputTokens: 100_000, maxOutputTokens: 20_000, maxSdkEstimatedCost: 2, maxProbeCalls: 10, maxCpuMillis: 60_000, maxWallMillis: 60_000 },
 		experienceRefs: [], experienceMaxRecords: 0, experienceMaxChars: 0 };
 }

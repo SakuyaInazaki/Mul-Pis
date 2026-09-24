@@ -647,6 +647,8 @@ test("blocked M07 still supplies its complete failure evidence package to M04", 
 test("task declarations are bounded and independent checking is tied to immutable bytes", async (t) => {
 	const f = await fixture(t); const goal = await f.controller.begin(begin);
 	await assert.rejects(f.controller.delegate(goal.runId, { objective: "bad", inputs: [], expectedOutputs: [], checks: ["x"], mode: "execute" }), /预期产物/);
+	await assert.rejects(f.controller.delegate(goal.runId, { objective: "动态文件名", inputs: [], expectedOutputs: ["raw/detail-<sid>.json"], checks: ["x"], mode: "execute" }), /动态文件名请声明其父目录/);
+	assert.equal((await f.controller.status(goal.runId)).tasks.length, 0, "无效声明在创建任务前被拒绝");
 	await assert.rejects(f.controller.delegate(goal.runId, { objective: "bad", inputs: [], expectedOutputs: [], checks: ["x", " x "], mode: "reason" }), /不能重复/);
 	const task = await f.controller.delegate(goal.runId, { objective: "重要推导", inputs: [], expectedOutputs: [], checks: ["版本经独立检查"], mode: "reason", requireIndependentCheck: true }); assert.ok(task.reportPath);
 	const checker = await f.controller.delegate(goal.runId, { objective: "检查重要推导", inputs: [task.reportPath], expectedOutputs: [], checks: ["检查完成"], mode: "check", parentTaskId: task.taskId }); assert.ok(checker.reportPath);

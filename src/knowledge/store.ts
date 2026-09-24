@@ -588,8 +588,7 @@ export class FileKnowledgeStore implements KnowledgeStore {
 		if (!/^P\d{4,}$/.test(proposalId)) throw new HarnessError("merge.proposal", `提案 id 无效：${proposalId}`);
 		const proposalFile = path.join(this.dir, "proposals", `${proposalId}.json`);
 		if (!(await exists(proposalFile))) throw new HarnessError("merge.proposal", `找不到提案 ${proposalId}`);
-		const lockWarnings: string[] = [];
-		await this.acquireLock(lockWarnings);
+		await this.acquireLock();
 		try {
 			const resultFile = path.join(this.dir, "proposals", `${proposalId}.result.json`);
 			if (await exists(resultFile)) {
@@ -607,7 +606,7 @@ export class FileKnowledgeStore implements KnowledgeStore {
 				throw new HarnessError("merge.invalid", `提案 ${proposalId} 在当前状态校验失败：${errors.map((item) => item.message).join("；")}`);
 			}
 
-			const warnings = [...lockWarnings, ...issues.filter((item) => item.level === "warning").map((item) => item.message)];
+			const warnings = issues.filter((item) => item.level === "warning").map((item) => item.message);
 			const plannedIds = await this.planIds(proposal.ops);
 			const mergeTime = nowIso();
 			const originalLimits = await this.limits();
@@ -968,7 +967,7 @@ export class FileKnowledgeStore implements KnowledgeStore {
 		return impacts.sort((left, right) => left.id.localeCompare(right.id) || left.via.localeCompare(right.via));
 	}
 
-	private async acquireLock(warnings: string[]): Promise<void> {
+	private async acquireLock(): Promise<void> {
 		const lockFile = path.join(this.dir, ".merge.lock");
 		for (let attempt = 0; attempt < 100; attempt += 1) {
 			try {
@@ -985,11 +984,10 @@ export class FileKnowledgeStore implements KnowledgeStore {
 				try {
 					const info = await stat(lockFile);
 					if (Date.now() - info.mtimeMs > LOCK_STALE_MS) {
-						await unlink(lockFile);
-						warnings.push("检测到超过 10 分钟的合入锁，已覆盖");
-						continue;
+						throw new HarnessError("merge.locked", "知识库合入锁已超过 10 分钟；请核对 .merge.lock 的 owner 记录和进程状态后，手动移除该确切残锁。控制器不会按文件年龄覆盖它");
 					}
 				} catch (statError) {
+					if (statError instanceof HarnessError) throw statError;
 					if (errorCode(statError) === "ENOENT") continue;
 					throw statError;
 				}

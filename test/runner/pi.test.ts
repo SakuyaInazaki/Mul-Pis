@@ -204,6 +204,34 @@ test("strict DeepSeek request disables retries and compaction, verifies one capp
 	handle.dispose();
 });
 
+test("strict research request leaves output length to the model when no cap is supplied", async (t) => {
+	const persistDir = await fixture(t);
+	const model = { ...MODEL, id: "deepseek-flash", provider: "deepseek", api: "openai-completions" } as Model<"openai-completions">;
+	const seen: Array<{ maxTokens?: number; maxRetries?: number }> = [];
+	const runtime = {
+		getModels: () => [model],
+		streamSimple(_model: unknown, _context: unknown, options: { maxTokens?: number; maxRetries?: number; onPayload?: (payload: unknown, model: unknown) => Promise<unknown> }) {
+			seen.push({ maxTokens: options.maxTokens, maxRetries: options.maxRetries });
+			return options.onPayload?.({ model: "deepseek-flash", messages: [{ role: "user", content: "short" }] }, model);
+		},
+	} as unknown as ModelRuntime;
+	const stub = stubFactory();
+	const factory = (async (options: CreateAgentSessionOptions = {}) => {
+		const created = await stub.factory(options);
+		const original = created.session.prompt.bind(created.session);
+		(created.session as unknown as { prompt: (text: string) => Promise<void> }).prompt = async (text) => {
+			await (options.modelRuntime as unknown as { streamSimple: (model: unknown, context: unknown, options: unknown) => Promise<unknown> }).streamSimple(model, { messages: [] }, {});
+			await original(text);
+		};
+		return created;
+	}) as typeof createAgentSession;
+	const runner = new PiSessionRunner({ modelRuntime: runtime, createSession: factory });
+	const handle = await runner.create(spec(persistDir, { model: "deepseek/deepseek-flash", strictRequest: { maxProviderCallsPerPrompt: 1, maxInputPayloadBytes: 500 } }));
+	await handle.prompt("one step");
+	assert.deepEqual(seen, [{ maxTokens: undefined, maxRetries: 0 }]);
+	handle.dispose();
+});
+
 test("a read-dir grant confines both tools, rejects PDFs, and records successful reads", async (t) => {
 	const persistDir = await fixture(t);
 	const materialRoot = path.join(persistDir, "materials");

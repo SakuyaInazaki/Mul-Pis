@@ -4,6 +4,7 @@ import { SharedBudget } from "../../src/experiments/budget.ts";
 import { reserveResearchPhases } from "../../src/experiments/budget-preflight.ts";
 import { createCpuResponseEnvironment, type CpuResponseCase } from "../../src/experiments/local-environment.ts";
 import { FakeSessionRunner } from "../../src/runner/fake.ts";
+import { prepareModelRequest, runBoundedModelStep } from "../../src/improvement/research-model.ts";
 
 const limits = { maxProviderCalls: 100, maxInputTokens: 400_000, maxOutputTokens: 400_000, maxSdkEstimatedCost: 2, maxProbeCalls: 100, maxCpuMillis: 100_000, maxWallMillis: 200_000 };
 const multi: CpuResponseCase = { id: "two-step", version: 1, truthHypothesisId: "truth", hypotheses: [
@@ -51,17 +52,73 @@ test("dormant branch clocks and paused pilot exclude waiting while root elapsed 
  } finally { Date.now = realNow; }
 });
 
-test("phase preflight refuses insufficient G output before spend and seals disjoint pools", async () => {
- const runner = new FakeSessionRunner(() => "unused");
+test("completed branch freezes its own wall time while the root and other branch continue", () => {
+ const realNow = Date.now; let now = 1_000_000; Date.now = () => now;
+ try {
+  const budget = new SharedBudget("closed-clocks", limits);
+  const cap = { ...limits, maxWallMillis: 60_000 };
+  const old = budget.createLease(budget.root, cap), newer = budget.createLease(budget.root, cap);
+  budget.activateLease(old); now += 40_000;
+  const receipt = budget.closeLease(old);
+  assert.equal(receipt.lifecycle, "closed");
+  assert.equal(receipt.remaining.wallMillis, 20_000);
+  budget.activateLease(newer); now += 40_000;
+  assert.equal(budget.status(old).remaining.wallMillis, 20_000);
+  assert.equal(budget.status(newer).remaining.wallMillis, 20_000);
+  assert.equal(budget.status().remaining.wallMillis, 120_000);
+  assert.throws(() => budget.reserveProbe(old), /closed/);
+  assert.throws(() => budget.activateLease(old), /closed/);
+  const pending = budget.createLease(budget.root, cap);
+  const reservation = budget.reservePrompt(pending, { maxInputTokens: 10, maxOutputTokens: 10, maxSdkEstimatedCost: 0.01 });
+  assert.throws(() => budget.closeLease(pending), /pending/);
+  budget.markUnknown(reservation);
+  assert.throws(() => budget.closeLease(pending), /unknown/);
+ } finally { Date.now = realNow; }
+});
+
+test("prepared request uses actual prompt bytes without a per-request token quota", async () => {
+ const spec = { label: "request-prep", role: "research" as const, model: "fake/research", systemPrompt: "s", persistDir: "/tmp" };
+ const prepared = prepareModelRequest({ spec, message: "m" });
+ assert.equal(prepared.promptBytes, 2);
+ assert.equal(prepared.inputTokenCeiling, 2050);
+ assert.equal(prepared.spec.strictRequest?.maxInputPayloadBytes, prepared.payloadByteCeiling);
+ assert.equal(prepared.spec.strictRequest?.maxOutputTokens, undefined);
+ const long = prepareModelRequest({ spec, message: "x".repeat(50_000) });
+ assert.equal(long.promptBytes, 50_001);
+ assert.equal(long.inputTokenCeiling, 52_049);
+ const budget = new SharedBudget("prepared", limits);
+ const runner = new FakeSessionRunner((ctx) => {
+  assert.equal(ctx.spec.strictRequest?.maxInputPayloadBytes, prepared.payloadByteCeiling);
+  assert.equal(ctx.message, prepared.message);
+  return { text: "ok", usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 3, cost: 0.001 } };
+ });
+ const result = await runBoundedModelStep({ runner, budget, lease: budget.root, spec, message: "m", timeoutMs: 1000 });
+ assert.equal(result.text, "ok");
+ assert.equal(budget.status().committed.inputTokens, 2);
+});
+
+test("an uncapped reply is recorded, and an aggregate budget overrun blocks the next step", async () => {
+ const spec = { label: "observed-output", role: "research" as const, model: "fake/research", systemPrompt: "s", persistDir: "/tmp" };
+ const budget = new SharedBudget("observed-output", { ...limits, maxOutputTokens: 10 });
+ let calls = 0;
+ const runner = new FakeSessionRunner((ctx) => {
+  calls++;
+  assert.equal(ctx.spec.strictRequest?.maxOutputTokens, undefined);
+  return { text: "x".repeat(20_000), usage: { input: 2, output: 11, cacheRead: 0, cacheWrite: 0, totalTokens: 13, cost: 0.001 } };
+ });
+ await assert.rejects(runBoundedModelStep({ runner, budget, lease: budget.root, spec, message: "m", timeoutMs: 1000 }), /provider usage or SDK-estimated cost is incomplete/);
+ assert.equal(budget.status().committed.outputTokens, 11);
+ assert.equal(budget.status().settlement, "exceeded");
+ await assert.rejects(runBoundedModelStep({ runner, budget, lease: budget.root, spec, message: "again", timeoutMs: 1000 }));
+ assert.equal(calls, 1);
+});
+
+test("phase preflight checks protected call count and seals disjoint pools", async () => {
  const stage = { ...limits, maxProviderCalls: 2, maxInputTokens: 20_000, maxOutputTokens: 8_192, maxSdkEstimatedCost: 0.1, maxProbeCalls: 2, maxCpuMillis: 5_000, maxWallMillis: 10_000 };
  const budget = new SharedBudget("short", limits);
- const base = { kind: "meta-improvement" as const, outer: stage, pilot: stage, branch: stage, protected: { ...limits, maxProviderCalls: 24, maxInputTokens: 240_000, maxOutputTokens: 98_304, maxSdkEstimatedCost: 0.5, maxProbeCalls: 0, maxCpuMillis: 10_000, maxWallMillis: 20_000 }, searchReplicates: 2, outcomeReplicates: 2, admissionCases: [{ maxProbeCalls: 2 }], perPromptMaxInputTokens: 10_000, perPromptMaxOutputTokens: 4_096, runner, researchModel: "fake/research" };
- await assert.rejects(reserveResearchPhases(budget, { ...base, protected: { ...base.protected, maxOutputTokens: 98_303 } }), /protected maxOutputTokens/);
+ const base = { kind: "meta-improvement" as const, outer: stage, pilot: stage, branch: stage, protected: { ...limits, maxProviderCalls: 24, maxInputTokens: 240_000, maxOutputTokens: 98_304, maxSdkEstimatedCost: 0.5, maxProbeCalls: 0, maxCpuMillis: 10_000, maxWallMillis: 20_000 }, searchReplicates: 2, outcomeReplicates: 2, admissionCases: [{ maxProbeCalls: 2 }] };
+ await assert.rejects(reserveResearchPhases(budget, { ...base, protected: { ...base.protected, maxProviderCalls: 23 } }), /protected maxProviderCalls/);
  assert.equal(budget.status().committed.providerCalls, 0);
- await assert.rejects(reserveResearchPhases(budget, { ...base, protected: { ...base.protected, maxInputTokens: 239_999 } }), /protected maxInputTokens/);
- const unpriced = new FakeSessionRunner(() => "unused");
- unpriced.estimateMaxSdkCost = async () => undefined;
- await assert.rejects(reserveResearchPhases(budget, { ...base, runner: unpriced }), /price is unavailable/);
  assert.equal(budget.status().committed.providerCalls, 0);
  // An independent roomy root can reserve all stages before any request.
  const roomy = new SharedBudget("roomy", { ...limits, maxProviderCalls: 40, maxInputTokens: 360_000, maxOutputTokens: 150_000, maxSdkEstimatedCost: 2, maxProbeCalls: 20, maxCpuMillis: 50_000, maxWallMillis: 100_000 });
@@ -70,6 +127,16 @@ test("phase preflight refuses insufficient G output before spend and seals disjo
  assert.equal(phases.protectedMaxProviderCalls, 24);
  assert.throws(() => roomy.reservePrompt(roomy.root, { maxInputTokens: 1, maxOutputTokens: 1, maxSdkEstimatedCost: 0.01 }), /direct root/);
  assert.throws(() => roomy.createLease(roomy.root), /sealed/);
+});
+
+test("meta plan reports full protected and search reservation overflow before any request", async () => {
+ const root = new SharedBudget("infeasible-meta", { ...limits, maxProviderCalls: 100, maxInputTokens: 2_000_000, maxOutputTokens: 1_000_000, maxSdkEstimatedCost: 20, maxWallMillis: 1_000_000 });
+ const stage = { ...limits, maxProviderCalls: 2, maxInputTokens: 20_000, maxOutputTokens: 8_192, maxSdkEstimatedCost: 0.1, maxProbeCalls: 2, maxCpuMillis: 5_000, maxWallMillis: 10_000 };
+ await assert.rejects(reserveResearchPhases(root, { kind: "meta-improvement", outer: stage, pilot: stage, branch: stage,
+  protected: { ...limits, maxProviderCalls: 96, maxInputTokens: 960_000, maxOutputTokens: 393_216, maxSdkEstimatedCost: 10, maxWallMillis: 20_000 },
+  searchReplicates: 2, outcomeReplicates: 2, admissionCases: Array.from({ length: 4 }, () => ({ maxProbeCalls: 1 })),
+  }), /reserved phase maxProviderCalls ceilings exceed the shared root/);
+ assert.equal(root.status().committed.providerCalls, 0);
 });
 
 test("meta search freezes alternating settled no-winner arms before G and permits only measured efficiency", async (t) => {
@@ -92,7 +159,7 @@ test("meta search freezes alternating settled no-winner arms before G and permit
  const caseSet = (split: "development" | "admission") => ({ version: 1 as const, split, cases: [{ ...multi, id: `${split}-case`, hypotheses: multi.hypotheses.slice(0, 2), maxProbeCalls: 1, allowedProbeX: [2] }] });
  const result = await runMetaImprovementAdmission({ oldImproverVersionId: "I0", newImproverVersionId: "I1", initialExecutor: { versionId: "H0", artifact: { version: 1, kind: "cpu-numerical-prompt", body: "Identify the mechanism from evidence." } },
   developmentCaseSet: caseSet("development"), admissionCaseSet: caseSet("admission"), budget, branchLeases, protectedLease,
-  protocol: "efficiency", searchReplicates: 2, outcomeReplicates: 2, runner, researchModel: "fake/research", persistDir: dir, timeoutMs: 10_000, maxOutputTokens: 512, maxInputTokens: 12_000,
+  protocol: "efficiency", searchReplicates: 2, outcomeReplicates: 2, runner, researchModel: "fake/research", persistDir: dir, timeoutMs: 10_000,
   produceSuccessor: async (id, lease, _cases, index, arm) => {
    events.push(`search-${index}-${arm}`);
    const reservation = budget.reservePrompt(lease, { maxInputTokens: 1000, maxOutputTokens: 100, maxSdkEstimatedCost: 0.1 });
@@ -119,7 +186,7 @@ test("quality protocol rejects identical no-winner H0 without a protected reques
  const result = await runMetaImprovementAdmission({ oldImproverVersionId: "I0", newImproverVersionId: "I1", initialExecutor: { versionId: "H0", artifact: { version: 1, kind: "cpu-numerical-prompt", body: "Evidence first." } },
   developmentCaseSet: caseSet("development"), admissionCaseSet: caseSet("admission"), budget, branchLeases, protectedLease, protocol: "quality", searchReplicates: 1, outcomeReplicates: 2,
   produceSuccessor: async (id) => ({ improverVersionId: id, startingExecutorVersionId: "H0", decisionCount: 1, status: "no-winner" }),
-  runner: new FakeSessionRunner(() => { throw new Error("protected G must not run"); }), researchModel: "fake/research", persistDir: "/tmp", timeoutMs: 1000, maxOutputTokens: 512, maxInputTokens: 12_000,
+  runner: new FakeSessionRunner(() => { throw new Error("protected G must not run"); }), researchModel: "fake/research", persistDir: "/tmp", timeoutMs: 1000,
   persistSelection: async () => { frozen++; return "private-selection-receipt"; }, persistObservation: async () => { throw new Error("protected G must not run"); } });
  assert.equal(result.status, "rejected");
  assert.equal(result.protectedQueriedAfterBothSelections, false);

@@ -434,7 +434,7 @@ export class PiSessionRunner implements SessionRunner {
 
 		const strict = spec.strictRequest;
 		if (strict) {
-			if (spec.tools.kind !== "none" || strict.maxProviderCallsPerPrompt !== 1 || !Number.isInteger(strict.maxOutputTokens) || strict.maxOutputTokens < 1 || !Number.isInteger(strict.maxInputPayloadBytes) || strict.maxInputPayloadBytes < 1) {
+			if (spec.tools.kind !== "none" || strict.maxProviderCallsPerPrompt !== 1 || (strict.maxOutputTokens !== undefined && (!Number.isInteger(strict.maxOutputTokens) || strict.maxOutputTokens < 1)) || !Number.isInteger(strict.maxInputPayloadBytes) || strict.maxInputPayloadBytes < 1) {
 				throw new HarnessError("runner.model", "strict request requires no tools and positive integer request caps");
 			}
 		}
@@ -454,7 +454,7 @@ export class PiSessionRunner implements SessionRunner {
 		await loader.reload();
 
 		const resolved = await this.resolveModel(spec);
-		if (strict && (resolved.model.provider !== "deepseek" || resolved.model.api !== "openai-completions" || strict.maxOutputTokens > resolved.model.maxTokens)) {
+		if (strict && (resolved.model.provider !== "deepseek" || resolved.model.api !== "openai-completions" || (strict.maxOutputTokens !== undefined && strict.maxOutputTokens > resolved.model.maxTokens))) {
 			throw new HarnessError("runner.model", "strict request currently supports only bounded DeepSeek openai-completions models");
 		}
 		let strictStreamCalls = 0;
@@ -469,12 +469,12 @@ export class PiSessionRunner implements SessionRunner {
 					strictStreamCalls++;
 					if (strictStreamCalls > strict.maxProviderCallsPerPrompt || model.provider !== resolved.model.provider || model.id !== resolved.model.id) throw new HarnessError("runner.model", "strict request would exceed one provider call or change model");
 					return target.streamSimple(model, context, {
-						...options, maxRetries: 0, maxTokens: strict.maxOutputTokens,
+						...options, maxRetries: 0, ...(strict.maxOutputTokens === undefined ? {} : { maxTokens: strict.maxOutputTokens }),
 						onPayload: async (payload, payloadModel) => {
 							strictPayloadChecks++;
 							if (strictPayloadChecks > 1 || payloadModel.provider !== model.provider || payloadModel.id !== model.id) throw new HarnessError("runner.model", "strict request payload changed model or repeated");
 							const record = payload as Record<string, unknown>;
-							if (record.max_tokens !== strict.maxOutputTokens && record.max_completion_tokens !== strict.maxOutputTokens) throw new HarnessError("runner.model", "strict request output cap missing from provider payload");
+							if (strict.maxOutputTokens !== undefined && record.max_tokens !== strict.maxOutputTokens && record.max_completion_tokens !== strict.maxOutputTokens) throw new HarnessError("runner.model", "strict request output cap missing from provider payload");
 							const bytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
 							if (bytes > strict.maxInputPayloadBytes) throw new HarnessError("runner.model", "strict request input payload exceeds reserved byte cap");
 							return payload;

@@ -22,6 +22,11 @@ test("expected output path guard accepts relative paths and rejects escapes or w
   assert.equal(isSafeRelativeOutputPath("result.txt"), true);
   assert.equal(isSafeRelativeOutputPath("raw/evidence(1).txt"), true);
   assert.equal(isSafeRelativeOutputPath("raw/dir/"), true);
+  assert.equal(isSafeRelativeOutputPath("raw/detail-<sid>.json"), false);
+  assert.equal(isSafeRelativeOutputPath("raw/detail-{sid}.json"), false);
+  assert.equal(isSafeRelativeOutputPath("raw/detail-*.json"), false);
+  assert.equal(isSafeRelativeOutputPath("raw/detail-${sid}.json"), false);
+  assert.equal(isSafeRelativeOutputPath("raw/detail-%s.json"), false);
   assert.equal(isSafeRelativeOutputPath("../escape.txt"), false);
   assert.equal(isSafeRelativeOutputPath(" raw/evidence.txt"), false);
   assert.equal(isSafeRelativeOutputPath("raw/evidence.txt\n"), false);

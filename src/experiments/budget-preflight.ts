@@ -1,7 +1,6 @@
 /** Allocate every paid phase before the first request; this does not start child wall clocks. */
 import { MAX_EXECUTOR_EPISODE_ACTIONS, type BudgetLease, type BudgetLimits } from "./contracts.ts";
 import { SharedBudget } from "./budget.ts";
-import type { SessionRunner } from "../runner/types.ts";
 import { HarnessError } from "../types.ts";
 
 export interface PhaseLeases {
@@ -21,10 +20,6 @@ export interface PhaseBudgetPlan {
 	searchReplicates: number;
 	outcomeReplicates: number;
 	admissionCases: ReadonlyArray<{ maxProbeCalls: number }>;
-	perPromptMaxInputTokens: number;
-	perPromptMaxOutputTokens: number;
-	runner: SessionRunner;
-	researchModel: string;
 }
 
 const QUOTA_KEYS = ["maxProviderCalls", "maxInputTokens", "maxOutputTokens", "maxSdkEstimatedCost", "maxProbeCalls", "maxCpuMillis", "maxWallMillis"] as const;
@@ -42,26 +37,14 @@ export async function reserveResearchPhases(budget: SharedBudget, plan: PhaseBud
 	if (plan.kind === "executor-quality" && (plan.branch !== undefined || plan.searchReplicates !== 1)) fail("executor quality uses one outer search and no meta branches");
 	if (plan.kind === "meta-improvement" && !plan.branch) fail("matched meta branches require an explicit per-arm ceiling");
 	if (!plan.admissionCases.length || plan.admissionCases.length > 32 || plan.admissionCases.some((c) => !Number.isSafeInteger(c.maxProbeCalls) || c.maxProbeCalls < 1 || c.maxProbeCalls > 16)) fail("invalid frozen admission case count or probe allowance");
-	if (!Number.isSafeInteger(plan.perPromptMaxInputTokens) || plan.perPromptMaxInputTokens < 1 || !Number.isSafeInteger(plan.perPromptMaxOutputTokens) || plan.perPromptMaxOutputTokens < 1) fail("per-prompt input and output caps must be positive integers");
 	const episodeCalls = plan.admissionCases.reduce((sum, c) => sum + Math.min(MAX_EXECUTOR_EPISODE_ACTIONS, c.maxProbeCalls + 2, 8), 0);
 	const protectedMaxProviderCalls = 2 * plan.searchReplicates * plan.outcomeReplicates * episodeCalls;
 	if (!Number.isSafeInteger(protectedMaxProviderCalls) || protectedMaxProviderCalls > 10_000) fail("protected call upper bound is invalid");
-	const price = await plan.runner.estimateMaxSdkCost?.(plan.researchModel, { maxInputTokens: plan.perPromptMaxInputTokens, maxOutputTokens: plan.perPromptMaxOutputTokens });
-	if (typeof price !== "number" || !Number.isFinite(price) || price <= 0) throw new HarnessError("improvement.budget", "SDK model price is unavailable for protected preflight");
-	const costPerCall = Math.ceil(price * 1_000_000_000) / 1_000_000_000;
-	const required = {
-		maxProviderCalls: protectedMaxProviderCalls,
-		maxInputTokens: protectedMaxProviderCalls * plan.perPromptMaxInputTokens,
-		maxOutputTokens: protectedMaxProviderCalls * plan.perPromptMaxOutputTokens,
-		maxSdkEstimatedCost: protectedMaxProviderCalls * costPerCall,
-	};
-	for (const key of ["maxProviderCalls", "maxInputTokens", "maxOutputTokens", "maxSdkEstimatedCost"] as const) {
-		if (plan.protected[key] < required[key]) fail(`protected ${key} ceiling cannot cover every permitted G request`);
-	}
+	if (plan.protected.maxProviderCalls < protectedMaxProviderCalls) fail(`protected maxProviderCalls ceiling cannot cover every permitted G request: required ${protectedMaxProviderCalls}, declared ${plan.protected.maxProviderCalls}`);
 	const branchCopies = plan.kind === "meta-improvement" ? 2 * plan.searchReplicates : 0;
 	for (const key of QUOTA_KEYS) {
 		const total = plan.outer[key] + plan.pilot[key] + plan.protected[key] + branchCopies * (plan.branch?.[key] ?? 0);
-		if (!Number.isFinite(total) || total < 0 || total > root.limits[key]) fail(`reserved phase ${key} ceilings exceed the shared root`);
+		if (!Number.isFinite(total) || total < 0 || total > root.limits[key]) fail(`reserved phase ${key} ceilings exceed the shared root: required ${total}, root limit ${root.limits[key]}`);
 	}
 	const outer = budget.createLease(budget.root, plan.outer);
 	// Pilot episodes are interleaved with outer decisions. Count only their active

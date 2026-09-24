@@ -18,6 +18,9 @@ export function isSafeRelativeOutputPath(value: string): boolean {
 	if (value.trim() !== value) return false;
 	if (value.includes("\n") || value.includes("\r")) return false;
 	if (path.isAbsolute(value)) return false;
+	// The reviewer resolves a declared output literally. Placeholder and glob syntax
+	// would otherwise create an obligation that no concrete output can satisfy.
+	if (/[<>*?\[\]{}$`]/u.test(value) || /%[sd]/u.test(value)) return false;
 	return value.split("/").includes("..") === false;
 }
 

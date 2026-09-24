@@ -38,15 +38,15 @@ export async function runMetaImprovementAdmission(args: {
  budget: SharedBudget; branchLeases: Array<{ old: BudgetLease; new: BudgetLease }>; protectedLease: BudgetLease;
  protocol: "quality" | "efficiency"; searchReplicates: number; outcomeReplicates: number;
  produceSuccessor: (improverVersionId: string, lease: BudgetLease, caseSet: CpuCaseSetV1, replicateIndex: number, arm: "old" | "new") => Promise<ProducedSuccessorV1>;
- runner: SessionRunner; researchModel: string; persistDir: string; timeoutMs: number; maxOutputTokens: number; maxInputTokens: number;
+ runner: SessionRunner; researchModel: string; persistDir: string; timeoutMs: number;
  persistSelection: (replicates: Array<{ old: ProducedSuccessorV1; new: ProducedSuccessorV1 }>) => Promise<string>;
  persistObservation: (record: { start: ExperimentStart; action: ScientificAction; feedback: DevelopmentFeedback }) => Promise<ArtifactRef>;
  beforeModelRequest?: (versionId: string) => Promise<void>;
 }): Promise<MetaImprovementResultV1> {
  const result: MetaImprovementResultV1 = { version: 1, experimentKind: "meta-improvement", protocol: args.protocol, status: "inconclusive", reason: "not evaluated", oldImproverVersionId: args.oldImproverVersionId, newImproverVersionId: args.newImproverVersionId,
   initialExecutorVersionId: args.initialExecutor.versionId, knowledgeSnapshot: args.knowledgeSnapshot, replicates: [], protectedQueriedAfterBothSelections: false, budgetSettlement: "settled" };
- const withinBudget = (lease?: BudgetLease) => { const status = args.budget.status(lease); return status.settlement === "settled" && status.remaining.wallMillis > 0; };
- const settled = () => withinBudget() && withinBudget(args.protectedLease) && args.branchLeases.every((pair) => withinBudget(pair.old) && withinBudget(pair.new));
+ const withinBudget = (lease?: BudgetLease, mustBeClosed = false) => { const status = args.budget.status(lease); return status.settlement === "settled" && status.remaining.wallMillis > 0 && (!mustBeClosed || status.lifecycle === "closed"); };
+ const settled = () => withinBudget() && withinBudget(args.protectedLease) && args.branchLeases.every((pair) => withinBudget(pair.old, true) && withinBudget(pair.new, true));
  const updateSettlement = () => { result.budgetSettlement = args.budget.status().settlement; return settled(); };
  if (args.developmentCaseSet.split !== "development" || args.admissionCaseSet.split !== "admission") { result.reason = "development/admission split mismatch"; return result; }
  if (args.oldImproverVersionId === args.newImproverVersionId) { result.status = "rejected"; result.reason = "sham improver identity"; return result; }
@@ -60,7 +60,8 @@ export async function runMetaImprovementAdmission(args: {
   const outcomes = {} as { old: ProducedSuccessorV1; new: ProducedSuccessorV1 };
   for (const arm of [firstArm, firstArm === "old" ? "new" : "old"] as const) {
    outcomes[arm] = await args.produceSuccessor(arm === "old" ? args.oldImproverVersionId : args.newImproverVersionId, pair[arm], args.developmentCaseSet, index, arm);
-   if (!updateSettlement()) { result.reason = "pending, unknown, or exceeded search resource use"; return result; }
+   try { args.budget.closeLease(pair[arm]); } catch { result.reason = "search arm cannot close with pending, unknown, or exhausted resource use"; return result; }
+   if (!withinBudget(pair[arm], true) || !withinBudget()) { result.reason = "pending, unknown, or exceeded search resource use"; return result; }
   }
   const old = outcomes.old, newer = outcomes.new;
   if (old.startingExecutorVersionId !== args.initialExecutor.versionId || newer.startingExecutorVersionId !== args.initialExecutor.versionId || old.startingKnowledgeSnapshot !== args.knowledgeSnapshot || newer.startingKnowledgeSnapshot !== args.knowledgeSnapshot || old.improverVersionId !== args.oldImproverVersionId || newer.improverVersionId !== args.newImproverVersionId) { result.reason = "meta arms did not share the frozen H/K start and I identities"; return result; }
@@ -85,7 +86,7 @@ export async function runMetaImprovementAdmission(args: {
   const candidate = repeat.new.selectedExecutor ?? args.initialExecutor;
   const quality = await runExecutorQualityAdmission({ caseSet: args.admissionCaseSet, baseline, candidate,
    runner: args.runner, model: args.researchModel, persistDir: args.persistDir, budget: args.budget, lease: args.protectedLease,
-   timeoutMs: args.timeoutMs, repetitions: args.outcomeReplicates, maxOutputTokens: args.maxOutputTokens, maxInputTokens: args.maxInputTokens,
+   timeoutMs: args.timeoutMs, repetitions: args.outcomeReplicates,
    comparisonMode: args.protocol === "efficiency" ? "noninferiority" : "gain", persistObservation: args.persistObservation, beforeModelRequest: args.beforeModelRequest });
   result.protectedQueriedAfterBothSelections = true; repeat.protectedQuality = quality; result.protectedQuality = quality;
   if (!updateSettlement()) { result.reason = "unknown or exceeded nested/protected resource use"; return result; }

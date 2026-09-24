@@ -52,16 +52,22 @@ export interface ResearchDecisionViewV1 {
  methods?: { executor: ResearchMethodViewV1; improver: ResearchMethodViewV1; candidates: ResearchMethodViewV1[] };
  cases?: ResearchCaseViewV1[];
  inspections?: ResearchInspectionResultV1[];
+ inspectionWindow?: { total: number; visible: number; omitted: number };
  /** Controller-computed only after the union of read intervals covers a registered feedback object. */
  readableEvidenceIds?: string[];
  metaEpisodes?: Array<{ id: string; runId: string; target: StrategyKind; terminal: string; decisionKinds: string[]; candidateOutcomes: Array<{ id: string; claim: string; predictedObservation: string; falsifier: string; developmentStatus: string }>; feedbackIds: string[]; sdkEstimatedCost: number }>;
  feedback: Array<DevelopmentFeedback & { caseId?: string }>;
+ feedbackWindow?: { total: number; visible: number; omitted: number };
  /** Historical development feedback is context, not a live observation from this fork. */
  historicalFeedbackIds: string[];
  /** Only refs and bounded method summaries, not private case answers or G results. */
  experience: { markdown: string; refs: Array<{ storeId: string; recordId: string; version: number }>; targetKind?: StrategyKind; scientificRequiredRefs?: Array<{ storeId: string; recordId: string; version: number }> };
  candidates: Array<{ id: string; target: StrategyKind; hypothesis: ResearchHypothesisV1; developmentStatus: "untested" | "schema-valid" | "pilot-complete" | "development-supported" | "supported" | "rejected" | "inconclusive" }>;
  budget: BudgetStatus;
+ /** Controller-owned local limits, measured before this decision; the final decision can still be stop. */
+ remainingActions?: { decisions: number; candidates: number; inspections: number; readbackChars: number; finalDecision: boolean };
+ /** Actual controller receipt for the preceding action in this branch, not the model's claimed outcome. */
+ lastActionResult?: { kind: ResearchActionV1["kind"]; outcome: "executed" | "rejected"; reason?: string; candidateId?: string; developmentStatus?: string; feedbackId?: string; inspectionId?: string };
 }
 const ACTION_KEYS: Record<ResearchActionV1["kind"], string[]> = {
  inspect: ["kind", "evidenceIds", "read"], probe: ["kind", "caseId", "x", "rationale"], propose: ["kind", "target", "body", "hypothesis"],
@@ -141,6 +147,5 @@ export function improverSystemPrompt(strategy: ImproverStrategyV1): string {
 export function decisionPrompt(view: ResearchDecisionViewV1): string {
  if (view.feedback.length > 24 || view.candidates.length > 20 || (view.cases?.length ?? 0) > 32 || (view.inspections?.length ?? 0) > 12 || (view.metaEpisodes?.length ?? 0) > 4 || view.experience.markdown.length > 12_000) throw new HarnessError("improvement.context", "decision context exceeds fixed limits");
  const value = JSON.stringify(view);
- if (value.length > 40_000) throw new HarnessError("improvement.context", "decision context is too large");
- return `Choose one next research action for this frozen context. This is development information only. historicalFeedbackIds came from an earlier trial and must not be treated as observations from the current fork.\n${value}`;
+ return `Choose one next research action for this frozen context. This is development information only. historicalFeedbackIds came from an earlier trial and must not be treated as observations from the current fork. feedbackWindow and inspectionWindow report material omitted from this prompt; registered development objects remain available through inspect. remainingActions shows controller-measured local limits. On the final decision, choose stop with a supported candidate or stop without one if the evidence warrants it; using another action may exhaust the decision budget. The controller never chooses a candidate for you.\n${value}`;
 }

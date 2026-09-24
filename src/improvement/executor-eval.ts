@@ -43,7 +43,6 @@ export function executorSystemPrompt(method: ExecutorStrategyV1): string {
 export async function runExecutorEpisode(args: {
  development: DevelopmentEnvironment; start: ExperimentStart; method: ExecutorStrategyV1; methodVersionId: string;
  runner: SessionRunner; model: string; persistDir: string; budget: SharedBudget; lease: BudgetLease; timeoutMs: number;
- maxOutputTokens: number; maxInputTokens?: number;
  beforeModelRequest?: () => Promise<void>;
  maxActions?: number;
 }): Promise<ExecutorEpisodeResult> {
@@ -56,7 +55,7 @@ export async function runExecutorEpisode(args: {
   for (let index = 0; index < maxActions; index++) {
    const message = JSON.stringify({ task, visibleFeedback: result.feedback, actionIndex: index, instruction: "Return one allowed JSON action." });
    await args.beforeModelRequest?.();
-   const step = await runBoundedModelStep({ runner: args.runner, budget: args.budget, lease: args.lease, spec: { label: `H-${args.methodVersionId}-${task.caseId}-${index}`, role: "research", model: args.model, systemPrompt: executorSystemPrompt(args.method), persistDir: args.persistDir, methodBinding: { versionId: args.methodVersionId } }, message, timeoutMs: args.timeoutMs, maxOutputTokens: args.maxOutputTokens, maxInputTokens: args.maxInputTokens });
+   const step = await runBoundedModelStep({ runner: args.runner, budget: args.budget, lease: args.lease, spec: { label: `H-${args.methodVersionId}-${task.caseId}-${index}`, role: "research", model: args.model, systemPrompt: executorSystemPrompt(args.method), persistDir: args.persistDir, methodBinding: { versionId: args.methodVersionId } }, message, timeoutMs: args.timeoutMs });
    result.sessionIds.push(step.sessionId); if (step.usageSidecar) result.usageSidecars.push(step.usageSidecar);
    const action = parseAction(step.text, task);
    const earlier = seenActions.get(action.actionId), canonical = JSON.stringify(action);
@@ -81,7 +80,7 @@ export async function runExecutorQualityAdmission(args: {
  caseSet: CpuCaseSetV1; baseline: { versionId: string; artifact: ExecutorStrategyV1 }; candidate: { versionId: string; artifact: ExecutorStrategyV1 };
  runner: SessionRunner; model: string; persistDir: string; budget: SharedBudget; lease: BudgetLease;
  timeoutMs: number; repetitions: number;
- maxOutputTokens: number; maxInputTokens?: number; comparisonMode?: "gain" | "noninferiority";
+ comparisonMode?: "gain" | "noninferiority";
  beforeModelRequest?: (versionId: string) => Promise<void>;
  persistObservation: (record: { start: ExperimentStart; action: ScientificAction; feedback: DevelopmentFeedback }) => Promise<{ storeId: string; id: string; version: string }>;
 }): Promise<ExecutorQualityResult> {
@@ -97,7 +96,7 @@ export async function runExecutorQualityAdmission(args: {
    for (const arm of arms) {
     const start = await env.development.fork(initial);
     const selected = arm === "baseline" ? args.baseline : args.candidate;
-    const episode = await runExecutorEpisode({ development: env.development, start, method: selected.artifact, methodVersionId: selected.versionId, runner: args.runner, model: args.model, persistDir: args.persistDir, budget: args.budget, lease: args.lease, timeoutMs: args.timeoutMs, maxOutputTokens: args.maxOutputTokens, maxInputTokens: args.maxInputTokens,
+    const episode = await runExecutorEpisode({ development: env.development, start, method: selected.artifact, methodVersionId: selected.versionId, runner: args.runner, model: args.model, persistDir: args.persistDir, budget: args.budget, lease: args.lease, timeoutMs: args.timeoutMs,
      beforeModelRequest: args.beforeModelRequest ? () => args.beforeModelRequest!(selected.versionId) : undefined });
     if (episode.feedback.some((f) => f.evidence.length === 0)) { result.reason = "decisive environment feedback was not persisted"; return result; }
     let protectedStatus: QualityArmResult["protectedStatus"] = "inconclusive";

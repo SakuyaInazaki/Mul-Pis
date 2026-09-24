@@ -71,7 +71,7 @@ M07 可在新目标 begin 时显式指定当前活跃的 `m07-workflow-prompt` H
 
 新路径的 CLI 与上文旧预算策略 `improve run` 分开：先以 `node src/cli.ts improve research bootstrap --workspace <dir> --methods <methods.json>` 显式写入 H/I 种子，再以 `node src/cli.ts improve research run --workspace <dir> --plan <plan.json>` 启动。`methods.json` 的字段由 [`ResearchBootstrapInput`](../../src/improvement/research-service.ts) 定义；案例集及校验见 [`CpuCaseSetV1` 与 `validateCpuCaseSet`](../../src/experiments/local-environment.ts)。`status`、`rollback`、`export --version <id> --out <package.json>` 和 `bind --package <package.json>` 同在 `improve research` 下；`bind` 是显式人工导入。跨轮知识更新用 `advance-knowledge --m04-run <id> --expected-bundle <id>`；精确前提变更用 `transition-dependencies --m04-run <id> --expected-bundle <id> --method-version <id> --decision-ref <ref.json>`，后者的输入和结构校验见 [`KnowledgeRef`](../../src/knowledge/types.ts) 与 [knowledge-epoch.ts](../../src/improvement/knowledge-epoch.ts)。这些操作也可由显式 Pi extension action 调用。
 
-例如，下列结构选择 H 的质量路径，假设准入集只有一个案例；数值只是调用方需按模型、案例数与任务校准的预算示例。`admissionCaseSetPath` 可省略，此时只保留开发记录而不晋级。案例文件必须由调用方私下提供，不应把真值或检查答案放进模型提示。元改进需另给 `target: "improver"`、`metaProtocol`、每臂候选上限与分支预算；两臂从同一冻结 H/K 与同一经验选择出发，各自建立开发 fork，先固定全部后继再查受保护案例。`MetaEpisode` 仅记录受保护检查前的有界开发历史，后续 plan 通过同工作区 `metaEpisodeRunIds` 显式选用；未有赢家和预算内不可判定均保留各自状态，历史不能充作新的 G 证据。
+例如，下列结构选择 H 的质量路径，假设准入集只有一个案例；**数值仅用于演示活动与阶段预算字段，没有经过真实多案例 H/I 工作负载校准，不应复制为默认上限，更不适用于主 Pi 科研工作流**。实际计划须先测组装请求和开发 pilot 的用量，再由调用方确定活动与阶段的总资源额度。`admissionCaseSetPath` 可省略，此时只保留开发记录而不晋级。案例文件必须由调用方私下提供，不应把真值或检查答案放进模型提示。元改进需另给 `target: "improver"`、`metaProtocol`、每臂候选上限与分支预算；两臂从同一冻结 H/K 与同一经验选择出发，各自建立开发 fork，先固定全部后继再查受保护案例。`MetaEpisode` 仅记录受保护检查前的有界开发历史，后续 plan 通过同工作区 `metaEpisodeRunIds` 显式选用；未有赢家和预算内不可判定均保留各自状态，历史不能充作新的 G 证据。
 
 ```json
 {
@@ -85,13 +85,11 @@ M07 可在新目标 begin 时显式指定当前活跃的 `m07-workflow-prompt` H
   "admissionRepetitions": 2,
   "maxFeedbackItems": 8,
   "perPromptTimeoutMs": 120000,
-  "perPromptMaxOutputTokens": 2048,
-  "perPromptMaxInputTokens": 8192,
   "searchReplicates": 1,
   "outcomeReplicates": 2,
-  "outerBudget": { "maxProviderCalls": 16, "maxInputTokens": 131072, "maxOutputTokens": 32768, "maxSdkEstimatedCost": 100, "maxProbeCalls": 16, "maxCpuMillis": 20000, "maxWallMillis": 240000 },
-  "pilotBudget": { "maxProviderCalls": 1, "maxInputTokens": 8192, "maxOutputTokens": 2048, "maxSdkEstimatedCost": 20, "maxProbeCalls": 0, "maxCpuMillis": 1000, "maxWallMillis": 120000 },
-  "protectedBudget": { "maxProviderCalls": 64, "maxInputTokens": 524288, "maxOutputTokens": 131072, "maxSdkEstimatedCost": 800, "maxProbeCalls": 16, "maxCpuMillis": 20000, "maxWallMillis": 240000 },
+  "outerBudget": { "maxProviderCalls": 16, "maxInputTokens": 320000, "maxOutputTokens": 32768, "maxSdkEstimatedCost": 100, "maxProbeCalls": 16, "maxCpuMillis": 20000, "maxWallMillis": 240000 },
+  "pilotBudget": { "maxProviderCalls": 1, "maxInputTokens": 20000, "maxOutputTokens": 2048, "maxSdkEstimatedCost": 20, "maxProbeCalls": 0, "maxCpuMillis": 1000, "maxWallMillis": 120000 },
+  "protectedBudget": { "maxProviderCalls": 12, "maxInputTokens": 240000, "maxOutputTokens": 24576, "maxSdkEstimatedCost": 800, "maxProbeCalls": 16, "maxCpuMillis": 20000, "maxWallMillis": 240000 },
   "budget": {
     "maxProviderCalls": 100,
     "maxInputTokens": 1000000,
@@ -107,4 +105,8 @@ M07 可在新目标 begin 时显式指定当前活跃的 `m07-workflow-prompt` H
 }
 ```
 
-I 的元改进路径将 `experimentKind` 改为 `meta-improvement`、`target` 改为 `improver`；若提供受保护的 `admissionCaseSetPath`，还须显式提供 `metaProtocol`、`metaBranchBudget`（同一组预算字段）与 `maxCandidatesPerMetaArm`，两臂各自受该上限约束并共享根账。`experienceRefs` 可显式选择有界非空包，控制器在两臂使用同一次冻结选择并在新请求前复查 live 限制。`priorDevelopmentFeedbackPath` 若提供，只能装载受校验的开发反馈，不能把受保护答案移进 I 的上下文。
+I 的元改进路径需单独编制预算；上述 H 示例的 `pilotBudget.maxProviderCalls: 1` 不能支持一个实际内层搜索。将 `experimentKind` 改为 `meta-improvement`、`target` 改为 `improver` 时，还须提供足以覆盖候选提出、开发评价、终态选择及 H 执行的 pilot 额度。若提供受保护的 `admissionCaseSetPath`，还须显式提供 `metaProtocol`、`metaBranchBudget`（同一组预算字段）与 `maxCandidatesPerMetaArm`，两臂各自受该上限约束并共享根账。`experienceRefs` 可显式选择有界非空包，控制器在两臂使用同一次冻结选择并在新请求前复查 live 限制。`priorDevelopmentFeedbackPath` 若提供，只能装载受校验的开发反馈，不能把受保护答案移进 I 的上下文。
+
+请求准备使用已组装提示词的 UTF-8 字节数加 2048 字节的 SDK/JSON 余量，作为实际 payload 的字节边界及保守输入 token 预留；这不是固定的单次输入额度，也不是 provider 实测 token。如果这一条已组装请求超过活动或阶段剩余的总输入预算，请求不会发出。模型返回后以独立 usage 结算输入、输出和 SDK 估算费用。
+
+方法研究的提示词不再另受固定 4 万字符消息、8 千字符 system 或决策 JSON 长度门槛约束；完整组装请求只受模型上下文能力、实际 payload 检查及活动与阶段剩余总输入预算约束。有限的最近反馈与 inspect 页窗口会向 I 报告总数和省略数；旧开发材料仍留在控制器登记的对象中供按页读取。项目不再设置单次输入或输出 token 额度，也不再以固定的 16000 字符拒绝模型回复；Pi SDK 和 provider 的模型物理限制仍适用。输出和 SDK 估算费用在请求完成后按实测 usage 结算：最后一条回复可能超出活动或阶段预算，超额会被标记并停止后续请求，不能用于自动晋级。受保护阶段预检只保证声明的调用次数与各阶段总额度能装进活动总额度，不保证未知的实际 token 和费用能覆盖所有 G 请求；预算不足时结果不可判定。
