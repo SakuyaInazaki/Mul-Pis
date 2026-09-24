@@ -19,6 +19,11 @@ export interface DashboardNode {
 	tools?: string[];
 	failureCount?: number;
 	outcome?: "completed" | "failed" | "aborted";
+	/** M07 control state is independent of the persisted run status. */
+	attemptId?: string;
+	attemptState?: "running" | "suspended" | "recovery-required" | "terminated" | "legacy-untracked";
+	unresolvedOperationIds?: string[];
+	unresolvedTaskIds?: string[];
 }
 
 export interface DashboardEdge {

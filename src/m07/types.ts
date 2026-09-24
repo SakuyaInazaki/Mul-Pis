@@ -3,9 +3,10 @@ import type { BudgetPolicy } from "../improvement/policy.ts";
 import type { KnowledgeRef } from "../knowledge/types.ts";
 import type { ExperienceSelection } from "../knowledge/experience-index.ts";
 import type { ExperienceRequirementV1, M07WorkflowStrategyV1 } from "../improvement/generation.ts";
+import type { RunDescriptorV1 } from "../runtime/run-descriptor.ts";
 
 export type M07TaskMode = "execute" | "check" | "reason";
-export type M07TaskStatus = "running" | "returned" | "failed" | "accepted" | "rejected";
+export type M07TaskStatus = "running" | "returned" | "failed" | "accepted" | "rejected" | "unknown";
 export type CheckResult = "passed" | "failed" | "not_run";
 export type GoalOutcome = "partial" | "blocked" | "fulfilled";
 export type ReturnPath = "M04" | "M05" | "M06" | "M08" | "continue" | "user";
@@ -84,6 +85,36 @@ export interface HostStopReceipt {
 	reasonKind: HostStopReasonKind;
 	observedAt: string;
 	sourceEventId?: string;
+}
+
+export interface M07OperationV1 {
+	version: 1;
+	id: string;
+	taskId: string;
+	status: "prepared" | "issued" | "response-received" | "unknown" | "confirmed" | "not-issued";
+	issuedAt: string;
+	resolvedAt?: string;
+	evidencePath?: string;
+	externalId?: string;
+	observationMethod?: "external-query" | "local-tool-log";
+}
+
+export interface M07AttemptV1 {
+	version: 1;
+	id: string;
+	state: "running" | "suspended" | "recovery-required" | "terminated";
+	startedAt: string;
+	endedAt?: string;
+	runDescriptor: RunDescriptorV1;
+	stopReceipt?: HostStopReceipt;
+	controlCheckpointPath?: string;
+}
+
+export interface M07ExecutionStateV1 {
+	version: 1;
+	activeAttemptId: string;
+	attempts: M07AttemptV1[];
+	operations: M07OperationV1[];
 }
 
 export interface M07CheckpointRecord {
@@ -170,6 +201,9 @@ export interface CurrentGoal {
 	methodBinding?: { versionId: string; contentId?: string };
 	/** Host-frozen execution contract; absent on legacy/bounded goals. The model cannot opt out through goal parameters. */
 	executionContract?: { version: 1; mode: "continuous"; frozenAt: string };
+	/** New goals only. Old goal records keep their original archival semantics. */
+	executionState?: M07ExecutionStateV1;
+	predecessorGoalRunId?: string;
 	/** Controller-created stop event; free-text model claims and tool stdout never populate this. */
 	hostStopReceipt?: HostStopReceipt;
 	/** Registered only after its frozen files and bounded feedback are durable. */
@@ -203,4 +237,9 @@ export interface M07Controller {
 	interrupt(runId: string, input: InterruptInput): Promise<CurrentGoal>;
 	/** Trusted host lifecycle path, not exposed as a model tool. */
 	hostInterrupt(runId: string, input: { reasonKind: HostStopReasonKind; sourceEventId?: string }): Promise<CurrentGoal>;
+	/** Trusted control surface only; model-facing research_goal never exposes these. */
+	hostSuspend(runId: string, input: { reasonKind: HostStopReasonKind; sourceEventId?: string }): Promise<CurrentGoal>;
+	hostRecover(runId: string, input: { expectedAttemptId: string; runDescriptor: RunDescriptorV1 }): Promise<CurrentGoal>;
+	hostReconcileOperation(runId: string, input: { operationId: string; evidencePath: string }): Promise<CurrentGoal>;
+	hostCreateSuccessor(runId: string, input: { runDescriptor: RunDescriptorV1 }): Promise<CurrentGoal>;
 }

@@ -2,7 +2,7 @@
 
 ## 目的
 
-本仓库是公开仓库。推送时必须保证公开历史中只出现可公开的源码、测试、文档和工作流材料，不得把本机文件、私人记录、运行遥测、平台身份或凭据带入公开历史。
+本仓库是公开仓库。每次推送须按用户当次授权范围审查。本次用户明确要求原文发布项目 notes、运行日志、关联记录和附件；原件可保留其中的题目背景、运行路径、平台标识与成绩，不得为此改写或摘要原件。账户认证文件和实际账户密钥仍须排除。
 
 ## 允许推送
 
@@ -10,22 +10,19 @@
 - `test/`
 - `docs/`
 - `scripts/`
+- `.agent/notes/` 下经逐文件审查的项目变更记录；本次按用户要求保留原文
+- `.agent/public-evidence/` 下按明确范围制作的无损原件归档和简短清单；本次包括运行日志、关联工作区记录、telemetry、现有资源附件和用户指定的恢复附件
 - 根目录的构建、说明和配置模板文件
 - 明确标记为公开的工作流文本
 
 ## 禁止推送
 
-- `.agent/notes/` 下的实际记录；远端只允许保留 `.agent/notes/.gitignore`
-- `.agent/telemetry/`
-- `.agent/private/`
-- `.agent/improvement/` 以及任何工作区中的改进候选、离线评测、晋级与回退记录
-- `workspaces/`
-- `resources/`
+- 账户认证文件、实际账户 API key 和其原文副本；这类文件保留本地，不纳入原件归档
+- 未获本次用户授权范围覆盖的材料
+- 活动目录 `.agent/telemetry/`、`.agent/private/`、`.agent/improvement/`、`workspaces/`、`resources/` 的直接跟踪；经审查的原件仅以 `.agent/public-evidence/` 归档发布
 - `third_party/`
 - `.venv/`
-- 运行日志、临时文件、缓存和本机产物
-- 任何凭据、token、session、平台身份、邮箱、本机绝对路径、聊天记录或私人身份材料
-- 任何具体测试题、测试任务、平台提交相关内容：题面、候选代码、评测数据、submissionId、displayScore、排名、平台指南、提交台账、测试日志或测试专用产物。测试内容与工作流本身无关，不得进入公开仓库。
+- 未经明确授权的临时文件、缓存、本机产物和原始聊天记录
 
 ## Commit message 规范
 
@@ -35,22 +32,21 @@
   - 本机家目录或系统盘符开头的绝对路径
   - 本机用户名、平台账号、邮箱
   - platform submission ID、进程 PID、机器名
-  - notes、telemetry、私有仓库、聊天记录等内部记录引用
+  - telemetry、私有仓库、聊天记录等内部记录引用；公开 notes 的简明名称可按需提及
   - token、apiKey、sessionToken、Bearer、turnstile、密钥片段
 - 原提交说明包含敏感内容时，应改写为可公开的等价摘要，而不是只删除冒号后的内容。
 
 ## 推送前检查
 
 1. 运行 `git status --short`，确认工作区没有要提交的禁止路径。
-2. 确认 staged 内容不包含 `.agent/notes/`、`.agent/telemetry/`、`.agent/private/`、`.agent/improvement/`、`workspaces/` 等目录。
+2. 逐一审查 staged 的 `.agent/notes/` 原文和 `.agent/public-evidence/` 归档清单。确认原件来源属于本次明确范围，逐成员核对归档解包字节，排除认证文件及实际账户密钥；不要因题目、成绩、日志或本机路径出现就改写原件。确认 staged 不直接跟踪活动 `.agent/telemetry/`、`.agent/private/`、`.agent/improvement/`、`workspaces/`、`resources/`。只显式暂存审查通过的文件，不使用 `git add .`。
 3. 扫描 staged diff 和 commit message，重点检查：
-   - 本机绝对路径与用户名
-   - 平台身份、邮箱、submission ID、PID
-   - notes 或 telemetry 引用
+   - 提交说明和普通代码、文档中意外出现的本机绝对路径、身份、平台账号
+   - 原件归档中实际账户 API key、认证文件或密钥副本；本次授权的原始路径、题目与运行数据不因此排除
    - `apiKey`、`sessionToken`、`Bearer`、`sk-`、`turnstile`
 4. 运行 `npm run typecheck`。
 5. 运行 `npm test`。
-6. 确认远端 `.agent/notes/` 树中只有 `.gitignore`。
+6. 模拟公开文件清单，确认 notes 和原件归档只含本次审查通过的材料，不含认证文件、额外第三方 checkout、依赖目录、软链接或嵌套 `.git`；简短清单列出来源、文件数、原始字节数、归档路径及认证排除理由，不建立 hash 清单。
 
 ## 推送流程
 

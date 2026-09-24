@@ -14,6 +14,8 @@ import type { StageContext } from "../src/stages/context.ts";
 import { runM04 } from "../src/stages/m04.ts";
 import { HarnessError, type HarnessConfig } from "../src/types.ts";
 import { Workspace } from "../src/workspace.ts";
+import { execFileSync } from "node:child_process";
+import { main as cliMain } from "../src/cli.ts";
 
 async function fixture(t: TestContext, withM04 = true, config?: HarnessConfig) {
 	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-m07-"));
@@ -592,6 +594,126 @@ test("continuous goal refuses model-declared hard stops and only host lifecycle 
 	assert.equal(archived.hostStopReceipt?.source, "pi-host");
 	assert.ok(archived.hostStopReceipt?.id);
 	assert.equal((await f.ws.readRun("M07", goal.runId)).status, "failed");
+});
+
+test("host suspension keeps the goal open and fresh recovery uses a new attempt", async (t) => {
+	const f = await fixture(t);
+	const goal = await f.controller.begin(begin, { executionContract: "continuous" });
+	const originalCriteria = [...goal.successCriteria];
+	const suspended = await f.controller.hostSuspend(goal.runId, { reasonKind: "provider-error", sourceEventId: "request-1" });
+	assert.equal(suspended.lifecycle, "active");
+	assert.equal(suspended.executionState?.attempts[0].state, "suspended");
+	assert.deepEqual(suspended.successCriteria, originalCriteria);
+	assert.equal((await f.ws.readRun("M07", goal.runId)).status, "running");
+	assert.ok(suspended.executionState?.attempts[0].controlCheckpointPath);
+	await assert.rejects(f.controller.delegate(goal.runId, { objective: "before recovery", inputs: [], expectedOutputs: [], checks: ["read"], mode: "check" }), /宿主控制面恢复/);
+	const priorDescriptor = suspended.executionState!.attempts[0].runDescriptor;
+	const nextDescriptor = { ...priorDescriptor, instanceId: "new-instance", attemptId: "A002", process: { ...priorDescriptor.process, pid: priorDescriptor.process.pid + 1, processStartToken: "new-birth" } };
+	const liveOld = createM07Controller(f.ctx, { probeProcess: async () => ({ status: "alive", identityMatch: true, reason: "old process still alive" }) });
+	await assert.rejects(liveOld.hostRecover(goal.runId, { expectedAttemptId: "A001", runDescriptor: nextDescriptor }), /仍存活或身份未知/);
+	const unknownOld = createM07Controller(f.ctx, { probeProcess: async (identity) => identity.pid === priorDescriptor.process.pid ? { status: "unknown", identityMatch: false, reason: "unknown old process" } : { status: "alive", identityMatch: true, reason: "new" } });
+	await assert.rejects(unknownOld.hostRecover(goal.runId, { expectedAttemptId: "A001", runDescriptor: nextDescriptor }), /仍存活或身份未知/);
+	const controller = createM07Controller(f.ctx, { probeProcess: async (identity) => identity.pid === priorDescriptor.process.pid ? { status: "dead", identityMatch: false, reason: "old process exited" } : { status: "alive", identityMatch: true, reason: "new" } });
+	const resumed = await controller.hostRecover(goal.runId, { expectedAttemptId: "A001", runDescriptor: nextDescriptor });
+	assert.equal(resumed.executionState?.activeAttemptId, "A002");
+	assert.equal(resumed.executionState?.attempts[1].state, "running");
+	assert.deepEqual(resumed.successCriteria, originalCriteria);
+	await assert.rejects(controller.hostRecover(goal.runId, { expectedAttemptId: "A001", runDescriptor: nextDescriptor }), /不匹配/);
+});
+
+test("lost execute response requires structured external query before another execute", async (t) => {
+	const f = await fixture(t);
+	const goal = await f.controller.begin(begin);
+	const task = await f.controller.delegate(goal.runId, { objective: "执行远端动作", inputs: [], expectedOutputs: ["response.txt"], checks: ["远端查询"], mode: "execute" });
+	const statePath = path.join(f.ws.runDir("M07", goal.runId), "goal.json");
+	const raw = JSON.parse(await readFile(statePath, "utf8"));
+	raw.tasks[0].status = "running";
+	raw.executionState.operations[0].status = "issued";
+	await writeFile(statePath, JSON.stringify(raw));
+	const suspended = await f.controller.hostSuspend(goal.runId, { reasonKind: "session-shutdown" });
+	assert.equal(suspended.tasks[0].status, "unknown");
+	assert.equal(suspended.executionState?.operations[0].status, "unknown");
+	const old = suspended.executionState!.attempts[0].runDescriptor;
+	const next = { ...old, instanceId: "new-instance", attemptId: "A002", process: { ...old.process, pid: old.process.pid + 1, processStartToken: "new-birth" } };
+	const controller = createM07Controller(f.ctx, { probeProcess: async (identity) => identity.pid === old.process.pid ? { status: "dead", identityMatch: false, reason: "old process exited" } : { status: "alive", identityMatch: true, reason: "new" } });
+	await controller.hostRecover(goal.runId, { expectedAttemptId: "A001", runDescriptor: next });
+	await assert.rejects(controller.delegate(goal.runId, { objective: "重复远端动作", inputs: [], expectedOutputs: ["again.txt"], checks: ["check"], mode: "execute" }), /副作用状态未知/);
+	const check = await controller.delegate(goal.runId, { objective: "只读核查状态", inputs: [], expectedOutputs: [], checks: ["read"], mode: "check" });
+	assert.equal(check.status, "returned");
+	const operationId = suspended.executionState!.operations[0].id;
+	const evidence = path.join(f.root, "external-query.json");
+	await writeFile(evidence, JSON.stringify({ version: 1, operationId, observationMethod: "external-query", observedStatus: "unknown", observedAt: new Date().toISOString() }));
+	assert.equal((await controller.hostReconcileOperation(goal.runId, { operationId, evidencePath: evidence })).executionState?.operations[0].status, "unknown");
+	await assert.rejects(controller.delegate(goal.runId, { objective: "仍不可重复", inputs: [], expectedOutputs: ["again.txt"], checks: ["check"], mode: "execute" }), /副作用状态未知/);
+	await writeFile(evidence, JSON.stringify({ version: 1, operationId, observationMethod: "external-query", observedStatus: "confirmed", observedAt: new Date().toISOString(), externalId: "remote-123" }));
+	const reconciled = await controller.hostReconcileOperation(goal.runId, { operationId, evidencePath: evidence });
+	assert.equal(reconciled.executionState?.operations[0].status, "confirmed");
+	assert.equal(reconciled.tasks.find((item) => item.taskId === task.taskId)?.status, "failed", "old task remains unaccepted and is not replayed");
+	const nextTask = await controller.delegate(goal.runId, { objective: "新的独立工作", inputs: [], expectedOutputs: ["new.txt"], checks: ["check"], mode: "execute" });
+	assert.equal(nextTask.taskId, "T003");
+});
+
+test("CLI reconciliation and fresh process recovery do not replay a lost-response action", async (t) => {
+	const f = await fixture(t);
+	let issued = 0;
+	let queries = 0;
+	const runner = new FakeSessionRunner(async ({ spec }) => {
+		if (spec.tools.kind === "execution") { issued++; throw new Error("response lost after remote action"); }
+		return "read-only check";
+	});
+	const controller = createM07Controller({ ...f.ctx, runner });
+	const goal = await controller.begin(begin);
+	const failed = await controller.delegate(goal.runId, { objective: "one authorized remote action", inputs: [], expectedOutputs: ["response.txt"], checks: ["query remote state"], mode: "execute" });
+	assert.equal(failed.status, "failed");
+	assert.equal(issued, 1);
+	assert.equal((await controller.status(goal.runId)).executionState?.operations[0].status, "unknown");
+	await controller.hostSuspend(goal.runId, { reasonKind: "provider-error" });
+	const operationId = (await controller.status(goal.runId)).executionState!.operations[0].id;
+	const receipt = path.join(f.root, "query-result.json");
+	const query = async (observedStatus: "unknown" | "confirmed") => {
+		queries++;
+		await writeFile(receipt, JSON.stringify({ version: 1, operationId, observationMethod: "external-query", observedStatus, observedAt: new Date().toISOString(), ...(observedStatus === "confirmed" ? { externalId: "fake-remote-1" } : {}) }));
+	};
+	const previousLog = console.log;
+	console.log = () => undefined;
+	try {
+		await query("unknown");
+		assert.equal(await cliMain(["goal", "reconcile", "--workspace", f.root, "--run", goal.runId, "--operation", operationId, "--evidence", receipt]), 0);
+		assert.equal((await controller.status(goal.runId)).executionState?.operations[0].status, "unknown");
+		await query("confirmed");
+		assert.equal(await cliMain(["goal", "reconcile", "--workspace", f.root, "--run", goal.runId, "--operation", operationId, "--evidence", receipt]), 0);
+	} finally { console.log = previousLog; }
+	assert.equal(issued, 1, "status queries and reconciliation do not invoke the execute runner");
+	assert.equal(queries, 2);
+	const goalFile = path.join(f.ws.runDir("M07", goal.runId), "goal.json");
+	const crashed = JSON.parse(await readFile(goalFile, "utf8"));
+	crashed.executionState.attempts[0].runDescriptor.process.pid = 99999999;
+	await writeFile(goalFile, JSON.stringify(crashed));
+	const descriptorFile = path.join(f.root, "new-process-descriptor.json");
+	const child = `import { readCurrentProcessIdentity } from './src/runtime/process-identity.ts'; import { main } from './src/cli.ts'; import { readFile, writeFile } from 'node:fs/promises'; const goal = JSON.parse(await readFile(process.env.TEST_GOAL_FILE, 'utf8')); const prior = goal.executionState.attempts[0].runDescriptor; await writeFile(process.env.TEST_DESCRIPTOR_FILE, JSON.stringify({ ...prior, instanceId: 'fresh-cli-process', attemptId: 'A002', process: await readCurrentProcessIdentity() })); const code = await main(['goal', 'recover', '--workspace', process.env.TEST_WORKSPACE, '--run', goal.runId, '--attempt', 'A001', '--descriptor', process.env.TEST_DESCRIPTOR_FILE]); process.exit(code);`;
+	execFileSync(process.execPath, ["--input-type=module", "-e", child], { cwd: process.cwd(), env: { ...process.env, TEST_GOAL_FILE: path.join(f.ws.runDir("M07", goal.runId), "goal.json"), TEST_DESCRIPTOR_FILE: descriptorFile, TEST_WORKSPACE: f.root }, stdio: "pipe" });
+	const recovered = await controller.status(goal.runId);
+	assert.equal(recovered.executionState?.activeAttemptId, "A002");
+	assert.equal(recovered.executionState?.operations[0].status, "confirmed");
+	assert.equal(issued, 1);
+});
+
+test("crash recovery rejects a live or unknown old process and never rewrites old blocked history", async (t) => {
+	const f = await fixture(t);
+	const goal = await f.controller.begin(begin);
+	const old = goal.executionState!.attempts[0].runDescriptor;
+	const next = { ...old, instanceId: "new-instance", attemptId: "A002", process: { ...old.process, pid: old.process.pid + 1, processStartToken: "new-birth" } };
+	const unknown = createM07Controller(f.ctx, { probeProcess: async (identity) => identity.pid === old.process.pid ? { status: "unknown", identityMatch: false, reason: "pid reused" } : { status: "alive", identityMatch: true, reason: "new" } });
+	await assert.rejects(unknown.hostRecover(goal.runId, { expectedAttemptId: "A001", runDescriptor: next }), /仍存活或身份未知/);
+	const dead = createM07Controller(f.ctx, { probeProcess: async (identity) => identity.pid === old.process.pid ? { status: "dead", identityMatch: false, reason: "absent" } : { status: "alive", identityMatch: true, reason: "new" } });
+	assert.equal((await dead.hostRecover(goal.runId, { expectedAttemptId: "A001", runDescriptor: next })).executionState?.activeAttemptId, "A002");
+	const archived = await dead.hostInterrupt(goal.runId, { reasonKind: "session-shutdown" });
+	const before = await readFile(path.join(f.ws.runDir("M07", goal.runId), "goal.json"), "utf8");
+	const successor = await dead.hostCreateSuccessor(goal.runId, { runDescriptor: next });
+	assert.equal(successor.predecessorGoalRunId, goal.runId);
+	assert.deepEqual(successor.successCriteria, archived.successCriteria);
+	assert.deepEqual(successor.budgetPolicy, archived.budgetPolicy);
+	assert.equal(await readFile(path.join(f.ws.runDir("M07", goal.runId), "goal.json"), "utf8"), before);
 });
 
 test("review rejects fake completion and requires a relevant independent check report", async (t) => {

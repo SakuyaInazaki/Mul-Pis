@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import type { CurrentGoal } from "../m07/types.ts";
+import { summarizeGoalExecution } from "../m07/status.ts";
 import type { StageRunRecord } from "../types.ts";
 import { Workspace } from "../workspace.ts";
 import { listTelemetry, type SessionTelemetry } from "./telemetry.ts";
@@ -106,6 +107,10 @@ export async function readDashboardState(workspace: Workspace | string, options:
 		if (run.stage === "M07") {
 			try {
 				const goal = JSON.parse(await readFile(path.join(ws.runDir("M07", run.runId), "goal.json"), "utf8")) as CurrentGoal;
+				const execution = summarizeGoalExecution(goal);
+				const stageNode = nodes.find((node) => node.id === stageId)!;
+				Object.assign(stageNode, execution);
+				stageNode.label = `M07 ${run.runId} · ${execution.attemptId ?? "legacy"} ${execution.attemptState}`;
 				for (const task of goal.tasks) if (task.session && !run.sessions.some((s) => s.id === task.session!.id)) {
 					const session = task.session; const item = telemetryById.get(session.id);
 					const node = item ? telemetryNode({ ...item, stage: "M07", runId: run.runId }, now, freshnessMs) : {
@@ -128,6 +133,7 @@ export async function readDashboardState(workspace: Workspace | string, options:
 	}
 	for (const node of await legacySpecNodes(ws, new Set(nodes.filter((item) => item.kind === "agent").map((item) => item.id.slice("agent:".length))))) nodes.push(node);
 	for (const node of nodes.filter((item) => item.kind === "stage" && item.status === "unknown")) {
+		if (node.stage === "M07" && node.attemptState && node.attemptState !== "running" && node.attemptState !== "legacy-untracked") continue;
 		const memberIds = new Set(edges.filter((edge) => edge.source === node.id && edge.relation === "membership").map((edge) => edge.target));
 		const members = nodes.filter((item) => memberIds.has(item.id));
 		if (members.some((item) => item.activity === "active")) { node.status = "active"; node.activity = "active"; node.displayGroup = "active"; }
@@ -143,6 +149,6 @@ export async function readDashboardState(workspace: Workspace | string, options:
 	}
 	return { schemaVersion: 1, generatedAt: new Date(now).toISOString(), workspace: workspaceInfo(ws.root),
 		nodes: [...uniqueNodes.values()].sort((a, b) => a.id.localeCompare(b.id)), edges: edges.sort((a, b) => a.id.localeCompare(b.id)),
-		limitations: ["Fresh heartbeat is the only evidence of live activity; stale legacy running records remain unknown.", "Edges express persisted membership only and do not imply a single causal research path."],
+		limitations: ["Fresh heartbeat is the only evidence of live activity; stale legacy running records remain unknown.", "M07 run status and attempt state are independent; a running run can have a suspended or recovery-required attempt.", "Edges express persisted membership only and do not imply a single causal research path."],
 	};
 }

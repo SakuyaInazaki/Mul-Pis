@@ -40,12 +40,12 @@ export interface StrategyRecordV1 {
 export interface GenerationBundleV1 {
  version: 1; bundleId: string; parents: string[]; executorVersionId: string; improverVersionId: string;
  knowledgeSnapshot?: string; environmentVersion: string; modelConfig: { improver: string; research: string };
- protocolVersion: string; allowedCapabilities: Array<"cpu-probe" | "no-tools-model">;
+ protocolVersion: string; allowedCapabilities: Array<"cpu-probe" | "no-tools-model" | "m07-evidence-read">;
  state: "research-only" | "admitted" | "manual-active"; createdAt: string;
 }
 export interface ActiveGenerationPointerV1 {
  version: 1; bundleId: string; previousBundleId?: string; previousProvenance?: ActiveGenerationPointerV1["provenance"]; activatedAt: string;
- provenance: "local-executor-admission" | "local-meta-admission" | "human-seed" | "external-manual-unverified" | "knowledge-epoch-advance" | "method-dependency-transition";
+	provenance: "local-executor-admission" | "local-workflow-handoff-admission" | "local-meta-admission" | "human-seed" | "external-manual-unverified" | "knowledge-epoch-advance" | "method-dependency-transition";
  runId: string;
 }
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -100,13 +100,13 @@ export function validateGenerationBundle(input: unknown): GenerationBundleV1 {
  safeId(item.bundleId, "bundleId"); safeId(item.executorVersionId, "executorVersionId"); safeId(item.improverVersionId, "improverVersionId");
  if (item.knowledgeSnapshot !== undefined) safeId(item.knowledgeSnapshot, "knowledgeSnapshot");
  const models = item.modelConfig as Record<string, unknown>;
- if (typeof models.improver !== "string" || typeof models.research !== "string" || !Array.isArray(item.allowedCapabilities) || item.allowedCapabilities.some((x: unknown) => !["cpu-probe", "no-tools-model"].includes(String(x)))) throw new HarnessError("improvement.generation", "invalid bundle model/capabilities");
+ if (typeof models.improver !== "string" || typeof models.research !== "string" || !Array.isArray(item.allowedCapabilities) || item.allowedCapabilities.some((x: unknown) => !["cpu-probe", "no-tools-model", "m07-evidence-read"].includes(String(x)))) throw new HarnessError("improvement.generation", "invalid bundle model/capabilities");
  return item as unknown as GenerationBundleV1;
 }
 export function validateActiveGenerationPointer(input: unknown): ActiveGenerationPointerV1 {
  if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.generation", "invalid active generation pointer");
  const item = input as Record<string, unknown>;
- if (item.version !== 1 || typeof item.activatedAt !== "string" || typeof item.runId !== "string" || !["local-executor-admission", "local-meta-admission", "human-seed", "external-manual-unverified", "knowledge-epoch-advance", "method-dependency-transition"].includes(String(item.provenance)) || (item.previousProvenance !== undefined && !["local-executor-admission", "local-meta-admission", "human-seed", "external-manual-unverified", "knowledge-epoch-advance", "method-dependency-transition"].includes(String(item.previousProvenance)))) throw new HarnessError("improvement.generation", "invalid active generation pointer");
+	if (item.version !== 1 || typeof item.activatedAt !== "string" || typeof item.runId !== "string" || !["local-executor-admission", "local-workflow-handoff-admission", "local-meta-admission", "human-seed", "external-manual-unverified", "knowledge-epoch-advance", "method-dependency-transition"].includes(String(item.provenance)) || (item.previousProvenance !== undefined && !["local-executor-admission", "local-workflow-handoff-admission", "local-meta-admission", "human-seed", "external-manual-unverified", "knowledge-epoch-advance", "method-dependency-transition"].includes(String(item.previousProvenance)))) throw new HarnessError("improvement.generation", "invalid active generation pointer");
  safeId(item.bundleId, "bundleId"); if (item.previousBundleId !== undefined) safeId(item.previousBundleId, "previousBundleId");
  return item as unknown as ActiveGenerationPointerV1;
 }

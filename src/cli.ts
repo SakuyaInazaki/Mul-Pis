@@ -22,6 +22,7 @@
  *       --delivery-scope <json> --reproduction <json> [--closure-requested]
  *                                在严格配对的 M08/M04 版本上解释、复核交付副本并记录收口
  *   status                       runs, snapshot, limits
+ *   goal status|reconcile|recover|successor  inspect or explicitly reconcile/recover M07 attempts
  *   improve run|status|rollback|export|bind  run a bounded campaign (--plan <json>) or manage a budget method
  *   knowledge pack --purpose <text> [--ids C001,K002] [--terms a,b]
  *   knowledge views              regenerate derived views
@@ -53,6 +54,10 @@ import { ResearchImprovementService, type ResearchBootstrapInput } from "./impro
 import type { ResearchCampaignPlanV1 } from "./improvement/research-types.ts";
 import { publicResearchRun, publicResearchStatus } from "./improvement/research-public.ts";
 import type { KnowledgeRef } from "./knowledge/types.ts";
+import { createM07Controller } from "./m07/controller.ts";
+import { summarizeGoalExecution } from "./m07/status.ts";
+import type { CurrentGoal } from "./m07/types.ts";
+import type { RunDescriptorV1 } from "./runtime/run-descriptor.ts";
 
 interface ParsedArgs {
 	positional: string[];
@@ -92,7 +97,9 @@ async function makeRunner(kind: string): Promise<SessionRunner> {
 	if (kind === "fake") {
 		return new FakeSessionRunner(({ spec, turnIndex }) => ({
 			text:
-				spec.role === "reviewer" && turnIndex === 1
+				spec.role === "improver" && spec.label.startsWith("I-workflow-")
+					? JSON.stringify({ kind: "stop", reason: "fake runner has no research evidence or model judgment" })
+					: spec.role === "reviewer" && turnIndex === 1
 					? `（fake runner）${spec.label} 出题演练，没有调用模型。\n\n# 可转发问题\n\n问1（fake）：请说明关键假设。\n\n# 出题说明与判断依据\n\n本段是演练用的出题依据占位文本，不应出现在作答会话中。`
 					: `（fake runner）${spec.label} 收到第 ${turnIndex} 条消息，没有调用模型；本文只是演练占位回复。`,
 			reads: spec.tools.kind === "read-dir" ? ["source.md"] : [],
@@ -103,7 +110,7 @@ async function makeRunner(kind: string): Promise<SessionRunner> {
 }
 
 function usage(): string {
-	return `用法：node src/cli.ts <init|m01|m02|m03|m04|m05|m06|m08|m09|status|knowledge|improve> [选项]\n  --workspace <dir>   工作区（默认当前目录）\n  --runner pi|fake    会话运行器（默认 pi）\n  improve run|status|rollback|export|bind（旧预算机制实验；run 必须给 --plan <json>）\n  improve research bootstrap --methods <json>；run --plan <json>；status|rollback|export|bind\n  research run 仅在显式开发/准入案例和共享预算下研究 H/I；无准入案例只留档\n  m08 的 materials/self-checks/reviewers 是显式 JSON 文件\n  m09 的 delivery-scope/reproduction 是显式 JSON 文件；instructions 是预授权的精确 shell 命令，read-only 时应为空；不会自动发布\n详见 src/cli.ts 顶部说明。`;
+	return `用法：node src/cli.ts <init|m01|m02|m03|m04|m05|m06|m08|m09|status|knowledge|improve|goal> [选项]\n  --workspace <dir>   工作区（默认当前目录）\n  --runner pi|fake    会话运行器（默认 pi）\n  goal status --run <id>；reconcile --run <id> --operation <id> --evidence <json>；recover --run <id> --attempt <old-id> --descriptor <new-pi-json>；successor --run <id> --descriptor <new-pi-json>\n  improve run|status|rollback|export|bind（旧预算机制实验；run 必须给 --plan <json>）\n  improve research bootstrap --methods <json>；run --plan <json>；workflow run --plan <json>；status|rollback|export|bind\n  research run 研究 CPU H/I；workflow run 显式研究 M07 evidence-handoff 单槽，缺独立 G 时仅留档\n  m08 的 materials/self-checks/reviewers 是显式 JSON 文件\n  m09 的 delivery-scope/reproduction 是显式 JSON 文件；instructions 是预授权的精确 shell 命令，read-only 时应为空；不会自动发布\n详见 src/cli.ts 顶部说明。`;
 }
 
 async function jsonFile<T>(args: ParsedArgs, name: string): Promise<T> {
@@ -141,6 +148,13 @@ export async function main(argv: string[]): Promise<number> {
 			const runs = await ws.listRuns(stage);
 			const latest = runs.length ? await ws.readRun(stage, runs[runs.length - 1]) : undefined;
 			console.log(`${stage}：${runs.length} 次${latest ? `，最近 ${latest.runId} ${latest.status}` : ""}`);
+			if (stage === "M07" && latest) {
+				try {
+					const goal = JSON.parse(await readFile(path.join(ws.runDir("M07", latest.runId), "goal.json"), "utf8")) as CurrentGoal;
+					const execution = summarizeGoalExecution(goal);
+					console.log(`  目标 ${goal.lifecycle}；执行尝试 ${execution.attemptId ?? "旧格式"} ${execution.attemptState}；未决操作 ${execution.unresolvedOperationIds.join(",") || "无"}；未决任务 ${execution.unresolvedTaskIds.join(",") || "无"}`);
+				} catch { console.log("  M07 goal.json 不可读取；执行尝试状态未知，需修复"); }
+			}
 		}
 		console.log("限制：running 状态不会自动重跑；M08 completed 不等于科研通过；M09 不发布或关闭 Pi，full-recomputation 请求不等于已完整复现。");
 		return 0;
@@ -149,8 +163,10 @@ export async function main(argv: string[]): Promise<number> {
 		const action = args.positional[1] ?? "status";
 		if (action === "research") {
 			const researchAction = args.positional[2] ?? "status";
-			const researchRunner = researchAction === "run" ? await makeRunner(flag(args, "runner") ?? "pi") : new FakeSessionRunner(() => "unused");
+			const workflowRun = researchAction === "workflow" && args.positional[3] === "run";
+			const researchRunner = researchAction === "run" || workflowRun ? await makeRunner(flag(args, "runner") ?? "pi") : new FakeSessionRunner(() => "unused");
 			const research = new ResearchImprovementService({ workspaceRoot: ws.root, runner: researchRunner });
+			if (workflowRun) { const result = await research.runWorkflow(await jsonFile<unknown>(args, "plan")); console.log(JSON.stringify(result, null, 2)); return result.status === "failed" ? 1 : 0; }
 			if (researchAction === "bootstrap") { console.log(JSON.stringify(await research.bootstrap(await jsonFile<ResearchBootstrapInput>(args, "methods")), null, 2)); return 0; }
 			if (researchAction === "run") { const result = await research.run(await jsonFile<ResearchCampaignPlanV1>(args, "plan")); console.log(JSON.stringify(publicResearchRun(result), null, 2)); return result.status === "failed" ? 1 : 0; }
 			if (researchAction === "status") { console.log(JSON.stringify(publicResearchStatus(await research.status()), null, 2)); return 0; }
@@ -198,6 +214,25 @@ export async function main(argv: string[]): Promise<number> {
 			console.log(JSON.stringify(await improvement.bindMethodPackage(path.resolve(packagePath)), null, 2)); return 0;
 		}
 		throw new HarnessError("cli.improve", "improve 子命令：run | status | rollback | export | bind");
+	}
+	if (command === "goal") {
+		const action = args.positional[1] ?? "status";
+		const runId = flag(args, "run");
+		if (!runId) throw new HarnessError("cli.goal", "goal 需要 --run <M07 runId>");
+		const controller = createM07Controller({ ws, store, runner: new FakeSessionRunner(() => "unused"), config: { roles: {}, concurrency: 1, tools: {} } });
+		if (action === "status") { console.log(JSON.stringify(await controller.status(runId), null, 2)); return 0; }
+		if (action === "reconcile") {
+			const operationId = flag(args, "operation"), evidencePath = flag(args, "evidence");
+			if (!operationId || !evidencePath) throw new HarnessError("cli.goal", "goal reconcile 需要 --operation 和 --evidence；证据必须是实际外部查询的结构化回执");
+			console.log(JSON.stringify(await controller.hostReconcileOperation(runId, { operationId, evidencePath }), null, 2)); return 0;
+		}
+		if (action === "recover") {
+			const expectedAttemptId = flag(args, "attempt");
+			if (!expectedAttemptId) throw new HarnessError("cli.goal", "goal recover 需要 --attempt 旧 attempt ID 与 --descriptor 新 Pi 进程描述");
+			console.log(JSON.stringify(await controller.hostRecover(runId, { expectedAttemptId, runDescriptor: await jsonFile<RunDescriptorV1>(args, "descriptor") }), null, 2)); return 0;
+		}
+		if (action === "successor") { console.log(JSON.stringify(await controller.hostCreateSuccessor(runId, { runDescriptor: await jsonFile<RunDescriptorV1>(args, "descriptor") }), null, 2)); return 0; }
+		throw new HarnessError("cli.goal", "goal 子命令：status | reconcile | recover | successor");
 	}
 
 	const config = await ws.loadConfig();

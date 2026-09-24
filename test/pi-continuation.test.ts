@@ -136,6 +136,78 @@ test("shutdown archives only the explicitly bound unfinished goal", async () => 
 	assert(entries.some((entry) => (entry as { reason?: string }).reason === "session-shutdown"));
 });
 
+test("shutdown suspends a versioned attempt without calling legacy archive", async () => {
+	const calls: string[] = [];
+	const versioned = { ...goal("active"), executionState: { version: 1, activeAttemptId: "A001", attempts: [{ id: "A001", state: "running" }], operations: [] } } as unknown as CurrentGoal;
+	const service = {
+		goalStatus: async () => versioned,
+		hostSuspend: async () => { calls.push("suspend"); return versioned; },
+		hostInterrupt: async () => { calls.push("archive"); throw new Error("legacy path must not run"); },
+		interruptAllActive: async () => { calls.push("cleanup"); },
+	} as unknown as ResearchService;
+	const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+	const api = { on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, registerTool() {}, registerCommand() {}, appendEntry() {} } as unknown as ExtensionAPI;
+	createResearchExtension({ service, continuation: { workspace: "/bound", goalRunId: "g1" } })(api);
+	await handlers.get("session_shutdown")![0]({ reason: "quit" }, { cwd: "/bound", mode: "json" });
+	assert.deepEqual(calls, ["suspend", "cleanup"]);
+});
+
+test("failed fresh recovery never claims or suspends the old goal at shutdown", async (t) => {
+	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-recovery-handshake-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const descriptorFile = path.join(root, "run-descriptor.json");
+	await writeFile(descriptorFile, JSON.stringify({ version: 1, instanceId: "new-instance", attemptId: "pending", workspaceId: "store-1", goalRunId: "g1", codeRevision: "test", controlDir: root, process: { hostId: "test-host", bootId: "test-boot", pid: 999999, processStartToken: "test-start" } }));
+	const previousRecover = process.env.PRE_RSI_RECOVER_GOAL_RUN_ID;
+	const previousDescriptor = process.env.PRE_RSI_RUN_DESCRIPTOR_FILE;
+	process.env.PRE_RSI_RECOVER_GOAL_RUN_ID = "g1";
+	process.env.PRE_RSI_RUN_DESCRIPTOR_FILE = descriptorFile;
+	t.after(() => { if (previousRecover === undefined) delete process.env.PRE_RSI_RECOVER_GOAL_RUN_ID; else process.env.PRE_RSI_RECOVER_GOAL_RUN_ID = previousRecover; if (previousDescriptor === undefined) delete process.env.PRE_RSI_RUN_DESCRIPTOR_FILE; else process.env.PRE_RSI_RUN_DESCRIPTOR_FILE = previousDescriptor; });
+	const calls: string[] = [];
+	const old = { ...goal("active"), executionState: { version: 1, activeAttemptId: "A001", attempts: [{ id: "A001", state: "running" }], operations: [] } } as unknown as CurrentGoal;
+	const service = { goalStatus: async () => old, hostRecover: async () => { calls.push("recover"); throw new Error("old owner alive"); }, hostSuspend: async () => { calls.push("suspend"); }, hostInterrupt: async () => { calls.push("archive"); }, interruptAllActive: async () => { calls.push("cleanup"); } } as unknown as ResearchService;
+	const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+	const api = { on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, registerTool() {}, registerCommand() {}, appendEntry() {} } as unknown as ExtensionAPI;
+	createResearchExtension({ service, continuation: { workspace: "/bound", goalRunId: "g1" } })(api);
+	await assert.rejects(async () => { await handlers.get("session_start")![0]({}, { cwd: "/bound", mode: "json" }); }, /old owner alive/);
+	await handlers.get("session_shutdown")![0]({ reason: "quit" }, { cwd: "/bound", mode: "json" });
+	assert.deepEqual(calls, ["recover", "cleanup"]);
+});
+
+test("ordinary continuation cannot claim a versioned goal owned by another Pi process", async (t) => {
+	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-old-owner-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const descriptorFile = path.join(root, "run-descriptor.json");
+	const processIdentity = { hostId: "test-host", bootId: "test-boot", pid: 999999, processStartToken: "old-birth" };
+	const oldDescriptor = { version: 1, instanceId: "old-instance", attemptId: "A001", workspaceId: "store-1", goalRunId: "g1", codeRevision: "test", controlDir: root, process: processIdentity };
+	await writeFile(descriptorFile, JSON.stringify({ ...oldDescriptor, instanceId: "new-instance", process: { ...processIdentity, pid: 999998, processStartToken: "new-birth" } }));
+	const previousDescriptor = process.env.PRE_RSI_RUN_DESCRIPTOR_FILE;
+	const previousRecover = process.env.PRE_RSI_RECOVER_GOAL_RUN_ID;
+	process.env.PRE_RSI_RUN_DESCRIPTOR_FILE = descriptorFile;
+	delete process.env.PRE_RSI_RECOVER_GOAL_RUN_ID;
+	t.after(() => { if (previousDescriptor === undefined) delete process.env.PRE_RSI_RUN_DESCRIPTOR_FILE; else process.env.PRE_RSI_RUN_DESCRIPTOR_FILE = previousDescriptor; if (previousRecover === undefined) delete process.env.PRE_RSI_RECOVER_GOAL_RUN_ID; else process.env.PRE_RSI_RECOVER_GOAL_RUN_ID = previousRecover; });
+	const calls: string[] = [];
+	const old = { ...goal("active"), executionState: { version: 1, activeAttemptId: "A001", attempts: [{ version: 1, id: "A001", state: "running", runDescriptor: oldDescriptor }], operations: [] } } as unknown as CurrentGoal;
+	const service = { goalStatus: async () => old, hostSuspend: async () => { calls.push("suspend"); }, hostInterrupt: async () => { calls.push("archive"); }, interruptAllActive: async () => { calls.push("cleanup"); } } as unknown as ResearchService;
+	const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+	const api = { on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, registerTool() {}, registerCommand() {}, appendEntry() {} } as unknown as ExtensionAPI;
+	createResearchExtension({ service, continuation: { workspace: "/bound", goalRunId: "g1" } })(api);
+	await assert.rejects(async () => { await handlers.get("session_start")![0]({}, { cwd: "/bound", mode: "json" }); }, /不是 M07 运行中 attempt 的宿主/);
+	await handlers.get("session_shutdown")![0]({ reason: "quit" }, { cwd: "/bound", mode: "json" });
+	assert.deepEqual(calls, ["cleanup"]);
+});
+
+test("agent end does not queue another turn for an open goal with a suspended attempt", async () => {
+	const suspended = { ...goal("active"), executionState: { version: 1, activeAttemptId: "A001", attempts: [{ id: "A001", state: "suspended" }], operations: [{ id: "O001", status: "unknown" }] } } as CurrentGoal;
+	const service = { goalStatus: async () => suspended } as unknown as ResearchService;
+	const h = await offlineSession(service, { workspace: ".", goalRunId: "g1" });
+	try {
+		h.faux.setResponses([fauxAssistantMessage("pause acknowledged")]);
+		await h.session.prompt("continue");
+		assert.equal(h.faux.state.callCount, 1);
+		assert(h.sessionManager.getEntries().some((entry) => entry.type === "custom" && entry.customType === "research_continuation" && (entry.data as { reason?: string }).reason === "attempt-suspended"));
+	} finally { await h.cleanup(); }
+});
+
 test("unreadable bound goal still runs owned stage cleanup and records repair need", async () => {
 	const calls: string[] = [];
 	const service = {
@@ -151,7 +223,7 @@ test("unreadable bound goal still runs owned stage cleanup and records repair ne
 	} as unknown as ExtensionAPI;
 	createResearchExtension({ service, continuation: { workspace: "/bound", goalRunId: "g1" } })(api);
 	await assert.rejects(async () => { await handlers.get("session_shutdown")![0]({ reason: "quit" }, { cwd: "/bound", mode: "json" }); });
-	assert.deepEqual(calls, ["interrupt", "stage-cleanup"]);
+	assert.deepEqual(calls, ["stage-cleanup"], "unreadable goal version must not be guessed or archived");
 	assert(entries.some((entry) => (entry as { status?: string }).status === "repair-required"));
 });
 

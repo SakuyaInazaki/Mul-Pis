@@ -1,4 +1,4 @@
-import { open, mkdir, readFile, readdir, stat, unlink } from "node:fs/promises";
+import { open, mkdir, readFile, readdir, stat, unlink, rename } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { HarnessError } from "../types.ts";
@@ -27,6 +27,7 @@ import type {
 	ValidationIssue,
 } from "./types.ts";
 import { RECORD_TYPES } from "./types.ts";
+import { probeProcessIdentity, readCurrentProcessIdentity, type ProcessIdentityV1 } from "../runtime/process-identity.ts";
 
 const REL_TYPES: readonly RelType[] = ["premise_of", "supports", "refutes", "limits", "questions", "checks", "handles", "replaces", "splits", "applies_in", "located_in"];
 const USAGE_DECISIONS: readonly UsageDecision[] = ["candidate", "working_assumption", "adopted", "suspended", "withdrawn", "replaced"];
@@ -36,6 +37,33 @@ const INPUT_ROLES = ["condition", "local_assumption", "temporary_assumption", "d
 // Negative relations and version lineage are not necessary-premise edges.
 const IMPACT_RELATIONS: readonly RelType[] = ["premise_of", "supports", "checks", "applies_in"];
 const LOCK_STALE_MS = 10 * 60 * 1000;
+
+interface MergeIntentV1 {
+	version: 1;
+	status: "prepared" | "committed";
+	proposalId: string;
+	proposal: ProposalBatch;
+	baseSnapshotId: string | null;
+	result: MergeResult;
+	records: KnowledgeRecord[];
+	replacedOrphans: Array<{ id: string; version: number; content: string }>;
+	/** Restrictive entries only; never publish a lifted limit before CURRENT. */
+	safetyLimits: Limit[];
+	finalLimits: Limit[];
+}
+
+interface MergeLockOwnerV1 extends ProcessIdentityV1 {
+	version: 1;
+	nonce: string;
+	time: string;
+}
+
+export interface KnowledgeStoreRecoveryOptions {
+	identity?: () => Promise<ProcessIdentityV1>;
+	probe?: (identity: ProcessIdentityV1) => Promise<{ status: "alive" | "dead" | "unknown"; identityMatch: boolean; reason: string }>;
+	/** Deterministic fault injection for offline tests only. */
+	afterPhase?: (phase: "prepared" | "records" | "current" | "result", proposalId: string) => void | Promise<void>;
+}
 
 const RULES_TEXT = `# 知识库工作规则
 
@@ -436,9 +464,13 @@ export class FileKnowledgeStore implements KnowledgeStore {
 	readonly dir: string;
 	private mergeTail: Promise<void> = Promise.resolve();
 	private submitTail: Promise<void> = Promise.resolve();
+	private heldLock?: MergeLockOwnerV1;
+	private heldLockFile?: { dev: number; ino: number };
+	private readonly recovery: KnowledgeStoreRecoveryOptions;
 
-	constructor(dir: string) {
+	constructor(dir: string, recovery: KnowledgeStoreRecoveryOptions = {}) {
 		this.dir = path.resolve(dir);
+		this.recovery = recovery;
 	}
 
 	async init(): Promise<void> {
@@ -591,12 +623,31 @@ export class FileKnowledgeStore implements KnowledgeStore {
 		await this.acquireLock();
 		try {
 			const resultFile = path.join(this.dir, "proposals", `${proposalId}.result.json`);
+			const pending = (await readdir(path.join(this.dir, "proposals"))).filter((name) => /^P\d{4,}\.intent\.json$/.test(name));
+			for (const name of pending) {
+				const other = await readJson<MergeIntentV1>(path.join(this.dir, "proposals", name));
+				if (other.proposalId !== proposalId && (other.status !== "committed" || !(await exists(path.join(this.dir, "proposals", `${other.proposalId}.result.json`))))) throw new HarnessError("merge.recovery-required", `提案 ${other.proposalId} 的合入尚未对账；先恢复它，不能推进 ${proposalId}`);
+			}
+			const intentFile = path.join(this.dir, "proposals", `${proposalId}.intent.json`);
+			const proposal = await readJson<ProposalBatch>(proposalFile);
+			if (await exists(intentFile)) {
+				const intent = await readJson<MergeIntentV1>(intentFile);
+				if (intent.version !== 1 || intent.proposalId !== proposalId || JSON.stringify(intent.proposal) !== JSON.stringify(proposal)) throw new HarnessError("merge.recovery-required", `提案 ${proposalId} 的冻结合入意图与源提案不符`);
+				return await this.applyIntent(intent, intentFile, resultFile);
+			}
 			if (await exists(resultFile)) {
 				const prior = await readJson<MergeResult | { rejected?: boolean }>(resultFile);
 				if ("snapshot" in prior) return prior;
 				throw new HarnessError("merge.invalid", `提案 ${proposalId} 已被拒绝`);
 			}
-			const proposal = await readJson<ProposalBatch>(proposalFile);
+			// Old writers had no durable intent. Snapshot presence alone is not proof of publication:
+			// it may be an orphan written just before CURRENT. Require manual reconciliation.
+			for (const name of await readdir(path.join(this.dir, "snapshots"))) {
+				if (!/^G\d{3,}\.json$/.test(name)) continue;
+				const snapshot = await readJson<Snapshot>(path.join(this.dir, "snapshots", name));
+				if (snapshot.proposals.includes(proposalId)) throw new HarnessError("merge.recovery-required", `提案 ${proposalId} 有旧格式残留快照 ${snapshot.id}，无法仅凭文件证明已发布；请人工对账`);
+			}
+			const baseSnapshotId = (await this.current())?.id ?? null;
 			const state = await this.validationState();
 			const issues = validateBatchStructure(proposal, state);
 			await this.validateBaseSnapshot(proposal, issues, true);
@@ -649,10 +700,6 @@ export class FileKnowledgeStore implements KnowledgeStore {
 					applied.push({ opIndex, result: `已解除 ${target} 的 ${lifted} 条限制（授权 ${op.authority}）` });
 				}
 			}
-			if (proposal.ops.some((op) => op.op === "limit" || op.op === "lift_limit" || (op.op === "decide" && ["suspended", "withdrawn", "replaced"].includes(op.usageDecision)))) {
-				await writeFileAtomic(path.join(this.dir, "limits.json"), `${JSON.stringify(nextLimits, null, 2)}\n`);
-			}
-
 			const latest = new Map((await this.list()).map((record) => [record.id, record]));
 			const recordsToWrite: Array<{ opIndex: number; record: KnowledgeRecord }> = [];
 			for (const [opIndex, op] of proposal.ops.entries()) {
@@ -760,8 +807,6 @@ export class FileKnowledgeStore implements KnowledgeStore {
 				applied.push({ opIndex, result: `已关闭 ${record.id}@${record.version}（${op.closeReason}）` });
 			}
 
-			for (const item of recordsToWrite) await this.writeRecord(item.record, warnings);
-
 			const historical = await this.allRecordVersions();
 			const allVersions = new Map([...historical, ...recordsToWrite.map((item) => item.record)].map((record) => [`${record.id}@${record.version}`, record]));
 			const impacts = this.findImpacts([...allVersions.values()], changedTargets);
@@ -770,10 +815,6 @@ export class FileKnowledgeStore implements KnowledgeStore {
 				if (nextLimits.some((limit) => !limit.liftedAt && limit.kind === "needs_recheck" && limit.target === target)) continue;
 				nextLimits.push({ target, kind: "needs_recheck", reason: `依赖项在 ${proposalId} 中变更或受限：${impact.via}`, authority: `impact:${proposalId}`, since: mergeTime });
 			}
-			if (nextLimits.length !== originalLimits.length || proposal.ops.some((op) => op.op === "lift_limit")) {
-				await writeFileAtomic(path.join(this.dir, "limits.json"), `${JSON.stringify(nextLimits, null, 2)}\n`);
-			}
-
 			const snapshotId = await this.nextSequence("snapshots", /^G(\d{3,})\.json$/, "G", 3);
 			const snapshot: Snapshot = {
 				id: snapshotId,
@@ -783,14 +824,83 @@ export class FileKnowledgeStore implements KnowledgeStore {
 				proposals: [proposalId],
 				note: proposal.summary,
 			};
-			await writeExclusive(path.join(this.dir, "snapshots", `${snapshotId}.json`), `${JSON.stringify(snapshot, null, 2)}\n`);
-			await writeFileAtomic(path.join(this.dir, "CURRENT"), `${snapshotId}\n`);
 			const result: MergeResult = { proposalId, snapshot, applied: applied.sort((left, right) => left.opIndex - right.opIndex), impacts, limitsWrittenFirst, warnings };
-			await writeFileAtomic(resultFile, `${JSON.stringify(result, null, 2)}\n`);
-			return result;
+			const safetyLimits = originalLimits.map((limit) => ({ ...limit }));
+			for (const limit of nextLimits) {
+				if (limit.liftedAt || safetyLimits.some((prior) => JSON.stringify(prior) === JSON.stringify(limit))) continue;
+				safetyLimits.push({ ...limit });
+			}
+			const replacedOrphans: MergeIntentV1["replacedOrphans"] = [];
+			for (const { record } of recordsToWrite) {
+				const file = path.join(this.dir, "records", record.id, `v${record.version}.md`);
+				if (!(await exists(file))) continue;
+				replacedOrphans.push({ id: record.id, version: record.version, content: await readFile(file, "utf8") });
+				warnings.push(`覆盖了未发布的残留版本文件 ${record.id}@${record.version}`);
+			}
+			const intent: MergeIntentV1 = { version: 1, status: "prepared", proposalId, proposal: structuredClone(proposal), baseSnapshotId, result, records: recordsToWrite.map((item) => item.record), replacedOrphans, safetyLimits, finalLimits: nextLimits };
+			await writeExclusive(intentFile, `${JSON.stringify(intent, null, 2)}\n`);
+			await this.recovery.afterPhase?.("prepared", proposalId);
+			return await this.applyIntent(intent, intentFile, resultFile);
 		} finally {
 			await this.releaseLock();
 		}
+	}
+
+	private async assertLockOwner(): Promise<void> {
+		const owner = this.heldLock;
+		if (!owner) throw new HarnessError("merge.locked", "当前进程未持有知识合入锁");
+		let current: MergeLockOwnerV1;
+		try { current = await readJson<MergeLockOwnerV1>(path.join(this.dir, ".merge.lock")); }
+		catch { throw new HarnessError("merge.locked", "知识合入锁身份无法读取"); }
+		if (current.nonce !== owner.nonce) throw new HarnessError("merge.locked", "知识合入锁身份已变化，拒绝发布");
+	}
+
+	private async applyIntent(intent: MergeIntentV1, intentFile: string, resultFile: string): Promise<MergeResult> {
+		if (intent.version !== 1 || !/^P\d{4,}$/.test(intent.proposalId) || intent.result.proposalId !== intent.proposalId || intent.result.snapshot.proposals.length !== 1 || intent.result.snapshot.proposals[0] !== intent.proposalId) throw new HarnessError("merge.recovery-required", "冻结合入意图结构无效");
+		const snapshot = intent.result.snapshot;
+		const snapshotFile = path.join(this.dir, "snapshots", `${snapshot.id}.json`);
+		const currentId = (await this.current())?.id ?? null;
+		if (intent.status === "committed" && await exists(resultFile)) {
+			const savedResult = await readJson<MergeResult>(resultFile);
+			const savedSnapshot = await readJson<Snapshot>(snapshotFile);
+			if (JSON.stringify(savedResult) !== JSON.stringify(intent.result) || JSON.stringify(savedSnapshot) !== JSON.stringify(snapshot)) throw new HarnessError("merge.recovery-required", "已提交合入的回执或快照与冻结意图不符");
+			return intent.result;
+		}
+		if (currentId !== intent.baseSnapshotId && currentId !== snapshot.id) throw new HarnessError("merge.recovery-required", `提案 ${intent.proposalId} 的 CURRENT 已偏离冻结基线，拒绝重放`);
+		if (await exists(snapshotFile)) {
+			const saved = await readJson<Snapshot>(snapshotFile);
+			if (JSON.stringify(saved) !== JSON.stringify(snapshot)) throw new HarnessError("merge.recovery-required", `提案 ${intent.proposalId} 的快照文件与冻结意图不符`);
+		}
+		if (currentId === snapshot.id && !(await exists(snapshotFile))) throw new HarnessError("merge.recovery-required", "CURRENT 指向的冻结快照缺失");
+		if (await exists(resultFile)) {
+			const saved = await readJson<MergeResult>(resultFile);
+			if (JSON.stringify(saved) !== JSON.stringify(intent.result) || currentId !== snapshot.id) throw new HarnessError("merge.recovery-required", "合入回执与冻结意图或已发布快照不符");
+		} else if (currentId === intent.baseSnapshotId) {
+			const currentLimits = await this.limits();
+			const known = new Set([...intent.safetyLimits, ...intent.finalLimits].map((item) => JSON.stringify(item)));
+			if (currentLimits.some((item) => !known.has(JSON.stringify(item)))) throw new HarnessError("merge.recovery-required", "合入期间出现未登记限制，拒绝覆盖");
+			await writeFileAtomic(path.join(this.dir, "limits.json"), `${JSON.stringify(intent.safetyLimits, null, 2)}\n`);
+			for (const record of intent.records) await this.writeRecord(record, [], true, intent.replacedOrphans.find((item) => item.id === record.id && item.version === record.version)?.content);
+			if (!(await exists(snapshotFile))) await writeExclusive(snapshotFile, `${JSON.stringify(snapshot, null, 2)}\n`);
+			await this.recovery.afterPhase?.("records", intent.proposalId);
+			await this.assertLockOwner();
+			await writeFileAtomic(path.join(this.dir, "CURRENT"), `${snapshot.id}\n`);
+			await this.recovery.afterPhase?.("current", intent.proposalId);
+		}
+		const published = await this.current();
+		if (published?.id !== snapshot.id || JSON.stringify(published) !== JSON.stringify(snapshot)) throw new HarnessError("merge.recovery-required", "CURRENT 未发布冻结快照");
+		for (const record of intent.records) {
+			const file = path.join(this.dir, "records", record.id, `v${record.version}.md`);
+			if (!(await exists(file)) || await readFile(file, "utf8") !== serialiseRecord(record)) throw new HarnessError("merge.recovery-required", `已发布记录 ${record.id}@${record.version} 与冻结意图不符`);
+		}
+		const currentLimits = await this.limits();
+		const known = new Set([...intent.safetyLimits, ...intent.finalLimits].map((item) => JSON.stringify(item)));
+		if (currentLimits.some((item) => !known.has(JSON.stringify(item)))) throw new HarnessError("merge.recovery-required", "合入期间出现未登记限制，拒绝覆盖");
+		await writeFileAtomic(path.join(this.dir, "limits.json"), `${JSON.stringify(intent.finalLimits, null, 2)}\n`);
+		if (!(await exists(resultFile))) await writeFileAtomic(resultFile, `${JSON.stringify(intent.result, null, 2)}\n`);
+		await this.recovery.afterPhase?.("result", intent.proposalId);
+		if (intent.status !== "committed") await writeFileAtomic(intentFile, `${JSON.stringify({ ...intent, status: "committed" }, null, 2)}\n`);
+		return intent.result;
 	}
 
 	private async recordIds(): Promise<string[]> {
@@ -818,7 +928,7 @@ export class FileKnowledgeStore implements KnowledgeStore {
 		return { id, type: first.type, versions, latestVersion: versions[versions.length - 1] };
 	}
 
-	private async writeRecord(record: KnowledgeRecord, warnings: string[]): Promise<void> {
+	private async writeRecord(record: KnowledgeRecord, warnings: string[], strictExisting = false, allowedOrphanContent?: string): Promise<void> {
 		const recordDir = path.join(this.dir, "records", record.id);
 		await mkdir(recordDir, { recursive: true });
 		const filePath = path.join(recordDir, `v${record.version}.md`);
@@ -827,9 +937,17 @@ export class FileKnowledgeStore implements KnowledgeStore {
 			if (publishedVersion !== undefined && record.version <= publishedVersion) {
 				throw new HarnessError("knowledge.exists", `拒绝覆盖已发布的记录版本 ${record.id}@${record.version}`);
 			}
+			if (strictExisting) {
+				const content = await readFile(filePath, "utf8");
+				if (content !== serialiseRecord(record)) {
+					if (allowedOrphanContent === undefined || content !== allowedOrphanContent) throw new HarnessError("merge.recovery-required", `未发布记录 ${record.id}@${record.version} 与冻结合入意图不符`);
+					await writeFileAtomic(filePath, serialiseRecord(record));
+				}
+			} else {
 			// A leftover from an interrupted merge: never published, so it may be replaced. Recorded, not hidden.
 			warnings.push(`覆盖了未发布的残留版本文件 ${record.id}@${record.version}`);
 			await writeFileAtomic(filePath, serialiseRecord(record));
+			}
 		} else {
 			await writeExclusive(filePath, serialiseRecord(record));
 		}
@@ -969,21 +1087,41 @@ export class FileKnowledgeStore implements KnowledgeStore {
 
 	private async acquireLock(): Promise<void> {
 		const lockFile = path.join(this.dir, ".merge.lock");
+		const gateFile = path.join(this.dir, ".merge.recovery.lock");
+		const identity = await (this.recovery.identity ?? readCurrentProcessIdentity)();
+		const owner: MergeLockOwnerV1 = { version: 1, ...identity, nonce: randomUUID(), time: nowIso() };
 		for (let attempt = 0; attempt < 100; attempt += 1) {
+			if (await exists(gateFile)) { await new Promise<void>((resolve) => setTimeout(resolve, 100)); continue; }
 			try {
 				const handle = await open(lockFile, "wx");
 				try {
-					await handle.writeFile(`${JSON.stringify({ pid: process.pid, time: nowIso() }, null, 2)}\n`, "utf8");
+					await handle.writeFile(`${JSON.stringify(owner, null, 2)}\n`, "utf8");
 					await handle.sync();
 				} finally {
 					await handle.close();
 				}
+				this.heldLock = owner;
+				{ const locked = await stat(lockFile); this.heldLockFile = { dev: locked.dev, ino: locked.ino }; }
+				if (await exists(gateFile)) {
+					await this.releaseLock();
+					await new Promise<void>((resolve) => setTimeout(resolve, 100));
+					continue;
+				}
 				return;
 			} catch (error) {
+				if (error instanceof HarnessError) throw error;
 				if (errorCode(error) !== "EEXIST") throw error;
 				try {
 					const info = await stat(lockFile);
-					if (Date.now() - info.mtimeMs > LOCK_STALE_MS) {
+					let prior: MergeLockOwnerV1 | undefined;
+					try { prior = await readJson<MergeLockOwnerV1>(lockFile); } catch { /* old or damaged owner */ }
+					if (prior?.version === 1 && prior.nonce && prior.hostId && prior.bootId && prior.processStartToken && Number.isSafeInteger(prior.pid)) {
+						const probe = await (this.recovery.probe ?? probeProcessIdentity)(prior);
+						if (probe.status === "dead" && !probe.identityMatch && prior.hostId === identity.hostId && prior.bootId === identity.bootId) {
+							if (await this.recoverDeadLock(prior, info.ino, owner)) return;
+						}
+						if (probe.status === "unknown") throw new HarnessError("merge.locked", `知识合入锁 owner 身份未知：${probe.reason}；保留锁并要求受信核对`);
+					} else if (Date.now() - info.mtimeMs > LOCK_STALE_MS) {
 						throw new HarnessError("merge.locked", "知识库合入锁已超过 10 分钟；请核对 .merge.lock 的 owner 记录和进程状态后，手动移除该确切残锁。控制器不会按文件年龄覆盖它");
 					}
 				} catch (statError) {
@@ -997,15 +1135,56 @@ export class FileKnowledgeStore implements KnowledgeStore {
 		throw new HarnessError("merge.locked", "知识库合入锁正在使用中");
 	}
 
-	private async releaseLock(): Promise<void> {
+	private async recoverDeadLock(prior: MergeLockOwnerV1, inode: number, owner: MergeLockOwnerV1): Promise<boolean> {
+		const gateFile = path.join(this.dir, ".merge.recovery.lock");
+		const lockFile = path.join(this.dir, ".merge.lock");
+		let gate;
+		try { gate = await open(gateFile, "wx"); }
+		catch (error) { if (errorCode(error) === "EEXIST") return false; throw error; }
+		const gateStat = await gate.stat();
 		try {
+			await gate.writeFile(`${JSON.stringify({ owner: prior.nonce, contender: owner.nonce, time: nowIso() })}\n`);
+			await gate.sync();
+			const observed = await readJson<MergeLockOwnerV1>(lockFile);
+			const fileStat = await stat(lockFile);
+			if (observed.nonce !== prior.nonce || fileStat.ino !== inode) return false;
+			const probe = await (this.recovery.probe ?? probeProcessIdentity)(prior);
+			if (probe.status !== "dead" || probe.identityMatch) return false;
+			const local = await (this.recovery.identity ?? readCurrentProcessIdentity)();
+			if (prior.hostId !== local.hostId || prior.bootId !== local.bootId) return false;
+			await rename(lockFile, path.join(this.dir, `.merge.lock.recovered.${prior.nonce}`));
+			const handle = await open(lockFile, "wx");
+			try { await handle.writeFile(`${JSON.stringify(owner, null, 2)}\n`); await handle.sync(); }
+			finally { await handle.close(); }
+			this.heldLock = owner;
+			{ const locked = await stat(lockFile); this.heldLockFile = { dev: locked.dev, ino: locked.ino }; }
+			return true;
+		} finally {
+			await gate.close();
+			try {
+				const current = await stat(gateFile);
+				if (current.ino === gateStat.ino && current.dev === gateStat.dev) await unlink(gateFile);
+			} catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+		}
+	}
+
+	private async releaseLock(): Promise<void> {
+		const owner = this.heldLock;
+		if (!owner) return;
+		try {
+			const current = await readJson<MergeLockOwnerV1>(path.join(this.dir, ".merge.lock"));
+			const file = await stat(path.join(this.dir, ".merge.lock"));
+			if (current.nonce !== owner.nonce || file.dev !== this.heldLockFile?.dev || file.ino !== this.heldLockFile?.ino) throw new HarnessError("merge.locked", "合入锁已被其他 owner 替换；拒绝释放");
 			await unlink(path.join(this.dir, ".merge.lock"));
 		} catch (error) {
 			if (errorCode(error) !== "ENOENT") throw error;
+		} finally {
+			this.heldLock = undefined;
+			this.heldLockFile = undefined;
 		}
 	}
 }
 
-export function createFileKnowledgeStore(dir: string): KnowledgeStore {
-	return new FileKnowledgeStore(dir);
+export function createFileKnowledgeStore(dir: string, recovery?: KnowledgeStoreRecoveryOptions): KnowledgeStore {
+	return new FileKnowledgeStore(dir, recovery);
 }

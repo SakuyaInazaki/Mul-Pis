@@ -1,9 +1,11 @@
 import { existsSync } from "node:fs";
-import { realpath } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { createFileKnowledgeStore } from "../knowledge/store.ts";
 import { createM07Controller } from "../m07/controller.ts";
-import type { BeginGoalInput, DecisionInput, FinishInput, HostStopReasonKind, InterruptInput, TaskReviewInput, TaskSpecInput } from "../m07/types.ts";
+import type { BeginGoalInput, CurrentGoal, DecisionInput, FinishInput, HostStopReasonKind, InterruptInput, TaskReviewInput, TaskSpecInput } from "../m07/types.ts";
+import { summarizeGoalExecution } from "../m07/status.ts";
+import type { RunDescriptorV1 } from "../runtime/run-descriptor.ts";
 import { createPiSessionRunner } from "../runner/pi.ts";
 import type { SessionHandle, SessionRunner, SessionSpec } from "../runner/types.ts";
 import { runInit } from "../stages/init.ts";
@@ -19,17 +21,21 @@ import type { StageContext } from "../stages/context.ts";
 import { HarnessError, type StageRunRecord } from "../types.ts";
 import { failureSignature, RetryGuard, stageFingerprint, stageInputVersion, thrownSignature } from "./retry-guard.ts";
 import { Workspace } from "../workspace.ts";
-
-const TIMER_SUSPEND_GAP_MS = 5_000;
+import { readTrustedPauseMs } from "../runtime/run-descriptor.ts";
 
 export type ResearchStage = "M01" | "M02" | "M03" | "M04" | "M05" | "M06" | "M07" | "M08" | "M09";
 export type RunnableStage = Exclude<ResearchStage, "M07">;
 
 export interface ResearchProgress {
-	phase: "session-create" | "session-created" | "prompt-start" | "prompt-heartbeat" | "prompt-complete" | "stage-complete";
+	phase: "session-create" | "session-created" | "prompt-start" | "prompt-heartbeat" | "prompt-observation" | "prompt-complete" | "stage-complete";
 	stage?: ResearchStage;
 	session?: string;
 	message: string;
+	/** A host timer firing is observable, but does not prove provider or task progress. */
+	hostHeartbeatAt?: number;
+	providerEventAt?: number;
+	toolProgressAt?: number;
+	durableProgressAt?: number;
 }
 
 export interface ResearchStatus {
@@ -38,7 +44,7 @@ export interface ResearchStatus {
 	configPresent: boolean;
 	knowledgeSnapshot?: string;
 	activeLimits: number;
-	stages: Record<ResearchStage, { count: number; latest?: { runId: string; status: string; failures: string[] } }>;
+	stages: Record<ResearchStage, { count: number; latest?: { runId: string; status: string; failures: string[]; goalLifecycle?: CurrentGoal["lifecycle"]; attemptId?: string; attemptState?: ReturnType<typeof summarizeGoalExecution>["attemptState"]; unresolvedOperationIds?: string[]; unresolvedTaskIds?: string[]; goalStateError?: "unreadable" } }>;
 	limitations: string[];
 }
 
@@ -86,6 +92,15 @@ export interface ResearchServiceOptions {
 	stallTimeoutMs?: number;
 	/** How often to check for stalled prompts. */
 	stallCheckMs?: number;
+	/** Injectable for virtual-time watchdog tests. */
+	watchdogNow?: () => number;
+	trustedPauseMs?: (now: number) => number;
+	watchdogTimers?: {
+		setInterval(callback: () => void, ms: number): NodeJS.Timeout;
+		setTimeout(callback: () => void, ms: number): NodeJS.Timeout;
+		clearInterval(timer: NodeJS.Timeout): void;
+		clearTimeout(timer: NodeJS.Timeout): void;
+	};
 	runnerFactory?: (signal: AbortSignal | undefined) => SessionRunner;
 }
 
@@ -99,6 +114,9 @@ class ProgressRunner implements SessionRunner {
 	private readonly promptTimeoutMs: number;
 	private readonly stallTimeoutMs: number;
 	private readonly stallCheckMs: number;
+	private readonly now: () => number;
+	private readonly pauseMs: (now: number) => number;
+	private readonly timers: NonNullable<ResearchServiceOptions["watchdogTimers"]>;
 
 	constructor(
 		inner: SessionRunner,
@@ -108,6 +126,9 @@ class ProgressRunner implements SessionRunner {
 		promptTimeoutMs = 60 * 60_000,
 		stallTimeoutMs = 10 * 60_000,
 		stallCheckMs = 30_000,
+		now: () => number = Date.now,
+		pauseMs: (now: number) => number = readTrustedPauseMs,
+		timers: NonNullable<ResearchServiceOptions["watchdogTimers"]> = { setInterval, setTimeout, clearInterval, clearTimeout },
 	) {
 		this.inner = inner;
 		this.report = report;
@@ -116,6 +137,9 @@ class ProgressRunner implements SessionRunner {
 		this.promptTimeoutMs = promptTimeoutMs;
 		this.stallTimeoutMs = stallTimeoutMs;
 		this.stallCheckMs = stallCheckMs;
+		this.now = now;
+		this.pauseMs = pauseMs;
+		this.timers = timers;
 	}
 
 	async create(spec: SessionSpec): Promise<SessionHandle> {
@@ -134,20 +158,23 @@ class ProgressRunner implements SessionRunner {
 			...handle,
 			prompt: async (text) => {
 				this.report({ phase: "prompt-start", stage: this.stage, session: handle.ref.label, message: `${handle.ref.label}：正在执行` });
-				const startedAt = Date.now();
+				const startedAt = this.now();
+				const effectiveNow = (): number => { const now = this.now(); return now - this.pauseMs(now); };
+				const effectiveStartedAt = effectiveNow();
 				let heartbeat: NodeJS.Timeout | undefined;
 				if (this.heartbeatMs > 0) {
-					heartbeat = setInterval(() => {
-						const elapsedSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
-						this.report({ phase: "prompt-heartbeat", stage: this.stage, session: handle.ref.label, message: `${handle.ref.label}：心跳（不代表子会话有进展，已 ${elapsedSeconds}s）` });
+					heartbeat = this.timers.setInterval(() => {
+						const at = this.now();
+						const elapsedSeconds = Math.max(1, Math.round((at - startedAt) / 1000));
+						this.report({ phase: "prompt-heartbeat", stage: this.stage, session: handle.ref.label, hostHeartbeatAt: at, message: `${handle.ref.label}：心跳（不代表子会话有进展，已 ${elapsedSeconds}s）` });
 					}, this.heartbeatMs);
 					heartbeat.unref();
 				}
 				let timeoutTimer: NodeJS.Timeout | undefined;
 				let stallTimer: NodeJS.Timeout | undefined;
-				let lastProgressAt = Date.now();
-				let lastStallCheckAt = Date.now();
-				let progressMarker = handle.transcript().length + handle.toolLog().length;
+				let lastProgressAt = effectiveStartedAt;
+				let providerMarker = handle.transcript().filter((item) => item.role === "assistant").length;
+				let toolMarker = handle.toolLog().length;
 				let watchdogFailed = false;
 				const watchdog = new Promise<never>((_resolve, reject) => {
 					const fail = (error: HarnessError): void => {
@@ -157,40 +184,32 @@ class ProgressRunner implements SessionRunner {
 						reject(error);
 					};
 					if (this.promptTimeoutMs > 0) {
-  let timeoutDeadline = Date.now() + this.promptTimeoutMs;
-  const scheduleTimeout = (): void => {
-    timeoutTimer = setTimeout(() => {
-      const now = Date.now();
-      const lateBy = now - timeoutDeadline;
-      if (lateBy > TIMER_SUSPEND_GAP_MS) {
-        timeoutDeadline = now + this.promptTimeoutMs;
-        scheduleTimeout();
-        return;
-      }
-      fail(new HarnessError("runner.stop", `session ${handle.ref.label} exceeded prompt timeout (${Math.round(this.promptTimeoutMs / 1000)}s)`));
-    }, Math.max(0, timeoutDeadline - Date.now()));
-    timeoutTimer.unref();
-  };
-  scheduleTimeout();
-}
+						const scheduleTimeout = (): void => {
+							const remaining = this.promptTimeoutMs - (effectiveNow() - effectiveStartedAt);
+							timeoutTimer = this.timers.setTimeout(() => {
+								if (effectiveNow() - effectiveStartedAt >= this.promptTimeoutMs) fail(new HarnessError("runner.stop", `session ${handle.ref.label} exceeded prompt timeout (${Math.round(this.promptTimeoutMs / 1000)}s)`));
+								else scheduleTimeout();
+							}, Math.max(1, remaining));
+							timeoutTimer.unref();
+						};
+						scheduleTimeout();
+					}
 					if (this.stallTimeoutMs > 0 && this.stallCheckMs > 0) {
-  stallTimer = setInterval(() => {
-    const now = Date.now();
-    const gap = now - lastStallCheckAt;
-    lastStallCheckAt = now;
-    if (gap > TIMER_SUSPEND_GAP_MS) {
-      lastProgressAt += gap;
-      return;
-    }
-    const current = handle.transcript().length + handle.toolLog().length;
-    if (current === progressMarker) {
+  stallTimer = this.timers.setInterval(() => {
+	const now = effectiveNow();
+	const providerCount = handle.transcript().filter((item) => item.role === "assistant").length;
+	const toolCount = handle.toolLog().length;
+	if (providerCount === providerMarker && toolCount === toolMarker) {
       if (now - lastProgressAt > this.stallTimeoutMs) {
         fail(new HarnessError("runner.stop", `session ${handle.ref.label} made no progress for ${Math.round(this.stallTimeoutMs / 1000)}s`));
       }
       return;
     }
-    progressMarker = current;
-    lastProgressAt = Date.now();
+	const observedAt = this.now();
+	this.report({ phase: "prompt-observation", stage: this.stage, session: handle.ref.label, message: `${handle.ref.label}：观察到子会话输出或工具记录`, ...(providerCount !== providerMarker ? { providerEventAt: observedAt } : {}), ...(toolCount !== toolMarker ? { toolProgressAt: observedAt } : {}) });
+	providerMarker = providerCount;
+	toolMarker = toolCount;
+	lastProgressAt = now;
   }, this.stallCheckMs);
   stallTimer.unref();
 }
@@ -200,9 +219,9 @@ class ProgressRunner implements SessionRunner {
 					this.report({ phase: "prompt-complete", stage: this.stage, session: handle.ref.label, message: `${handle.ref.label}：执行完成` });
 					return result;
 				} finally {
-					if (heartbeat) clearInterval(heartbeat);
-					if (timeoutTimer) clearTimeout(timeoutTimer);
-					if (stallTimer) clearInterval(stallTimer);
+					if (heartbeat) this.timers.clearInterval(heartbeat);
+					if (timeoutTimer) this.timers.clearTimeout(timeoutTimer);
+					if (stallTimer) this.timers.clearInterval(stallTimer);
 				}
 			},
 		};
@@ -239,6 +258,12 @@ export class ResearchService {
 			const ids = await ws.listRuns(stage);
 			const latest = ids.length ? await ws.readRun(stage, ids.at(-1)!) : undefined;
 			stages[stage] = { count: ids.length, ...(latest ? { latest: summarizeRun(latest) } : {}) };
+			if (stage === "M07" && latest) {
+				try {
+					const goal = JSON.parse(await readFile(path.join(ws.runDir("M07", latest.runId), "goal.json"), "utf8")) as CurrentGoal;
+					Object.assign(stages.M07.latest!, { goalLifecycle: goal.lifecycle, ...summarizeGoalExecution(goal) });
+				} catch { Object.assign(stages.M07.latest!, { goalStateError: "unreadable" as const }); }
+			}
 		}
 		const snapshot = existsSync(ws.knowledgeDir) ? await store.current() : undefined;
 		const limits = existsSync(ws.knowledgeDir) ? (await store.limits()).filter((limit) => !limit.liftedAt) : [];
@@ -365,8 +390,11 @@ export class ResearchService {
         let firstError: unknown;
         for (const runId of active.runIds) {
             try {
-                await controller.interrupt(runId, { reason, returnPath: "user" });
+                const goal = await controller.status(runId);
+                if (goal.executionState) await controller.hostSuspend(runId, { reasonKind: "session-shutdown" });
+                else await controller.interrupt(runId, { reason, returnPath: "user" });
                 await this.forgetActiveGoal(active.root, runId);
+                if (goal.executionState) continue;
                 try {
                     const archived = await ws.readRun("M07", runId);
                     const failure = "运行中断（host-shutdown）：" + reason;
@@ -445,6 +473,36 @@ export class ResearchService {
 		});
 	}
 
+	/** Host lifecycle suspension; the research goal and run remain open. */
+	async hostSuspend(input: { workspace: string; runId: string; reasonKind: HostStopReasonKind; sourceEventId?: string }): Promise<unknown> {
+		const root = this.resolveWorkspace(input.workspace);
+		for (let attempt = 0; attempt < 100; attempt++) {
+			try {
+				return await this.withMutation(root, async () => {
+					const controller = createM07Controller(await this.nonModelContext(root));
+					const result = await controller.hostSuspend(input.runId, { reasonKind: input.reasonKind, sourceEventId: input.sourceEventId });
+					await this.forgetActiveGoal(root, input.runId);
+					return result;
+				});
+			} catch (error) {
+				if (!(error instanceof HarnessError && error.code === "m07.busy")) throw error;
+				await new Promise<void>((resolve) => setTimeout(resolve, 100));
+			}
+		}
+		throw new HarnessError("m07.recovery", "宿主停止时仍有运行中 M07 操作；保留 active 状态，需由新实例核对旧进程与未决副作用");
+	}
+
+	/** Explicit fresh-Pi recovery; never resumes a prior child session. */
+	async hostRecover(input: { workspace: string; runId: string; expectedAttemptId: string; runDescriptor: RunDescriptorV1 }): Promise<unknown> {
+		const root = this.resolveWorkspace(input.workspace);
+		return this.withMutation(root, async () => {
+			const controller = createM07Controller(await this.nonModelContext(root));
+			const result = await controller.hostRecover(input.runId, { expectedAttemptId: input.expectedAttemptId, runDescriptor: input.runDescriptor });
+			await this.rememberActiveGoal(root, input.runId);
+			return result;
+		});
+	}
+
 	async delegate(runId: string, task: TaskSpecInput, requested?: string, signal?: AbortSignal): Promise<unknown> {
 		const root = this.resolveWorkspace(requested);
 		return this.withMutation(root, async () => {
@@ -484,7 +542,7 @@ export class ResearchService {
 		if (!existsSync(ws.configFile)) throw new HarnessError("config.missing", `缺少 ${ws.configFile}；请明确配置各角色模型`);
 		const store = createFileKnowledgeStore(ws.knowledgeDir);
 		const base = this.options.runnerFactory?.(signal) ?? createPiSessionRunner({ signal });
-		const runner = new ProgressRunner(base, (progress) => this.options.onProgress?.(progress), stage, this.options.progressIntervalMs ?? 15_000, this.options.promptTimeoutMs ?? 60 * 60_000, this.options.stallTimeoutMs ?? 10 * 60_000, this.options.stallCheckMs ?? 30_000);
+		const runner = new ProgressRunner(base, (progress) => this.options.onProgress?.(progress), stage, this.options.progressIntervalMs ?? 15_000, this.options.promptTimeoutMs ?? 60 * 60_000, this.options.stallTimeoutMs ?? 10 * 60_000, this.options.stallCheckMs ?? 30_000, this.options.watchdogNow ?? Date.now, this.options.trustedPauseMs ?? readTrustedPauseMs, this.options.watchdogTimers);
 		return { ws, store, runner, config: await ws.loadConfig() };
 	}
 

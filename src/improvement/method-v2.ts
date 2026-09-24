@@ -21,7 +21,7 @@ export interface MethodPackageV2 {
  requiredKnowledgeRefs: KnowledgeRef[];
  dependencyTransition?: DependencyTransitionV1;
  /** Informational only: the importing workspace has not independently checked these claims. */
- sourceScope: "research-only" | "local-executor-quality" | "local-meta-improvement" | "manual";
+	 sourceScope: "research-only" | "local-executor-quality" | "local-workflow-handoff-mechanism" | "local-meta-improvement" | "manual";
 }
 const ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 function id(value: unknown, name: string): string {
@@ -36,7 +36,7 @@ export function validateMethodPackageV2(input: unknown): MethodPackageV2 {
  if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.method-v2", "package must be an object");
  const item = input as Record<string, unknown>;
  const allowed = new Set(["version", "methodType", "sourceVersionId", "sourceBundleId", "parentVersionId", "artifact", "origin", "applicability", "limitations", "sourceExperienceRefs", "requiredExperienceRefs", "requiredKnowledgeRefs", "dependencyTransition", "sourceScope"]);
- if (Object.keys(item).some((key) => !allowed.has(key)) || item.version !== 2 || !["executor", "improver"].includes(String(item.methodType)) || !["human-seed", "agent-generated", "external-manual-unverified"].includes(String(item.origin)) || !["research-only", "local-executor-quality", "local-meta-improvement", "manual"].includes(String(item.sourceScope))) throw new HarnessError("improvement.method-v2", "unsupported package schema");
+	 if (Object.keys(item).some((key) => !allowed.has(key)) || item.version !== 2 || !["executor", "improver"].includes(String(item.methodType)) || !["human-seed", "agent-generated", "external-manual-unverified"].includes(String(item.origin)) || !["research-only", "local-executor-quality", "local-workflow-handoff-mechanism", "local-meta-improvement", "manual"].includes(String(item.sourceScope))) throw new HarnessError("improvement.method-v2", "unsupported package schema");
  id(item.sourceVersionId, "sourceVersionId"); if (item.sourceBundleId !== undefined) id(item.sourceBundleId, "sourceBundleId"); if (item.parentVersionId !== undefined) id(item.parentVersionId, "parentVersionId");
  const sourceExperienceRefs = validateExperienceRequirements(item.sourceExperienceRefs, "sourceExperienceRefs");
  const requiredExperienceRefs = validateExperienceRequirements(item.requiredExperienceRefs, "requiredExperienceRefs");

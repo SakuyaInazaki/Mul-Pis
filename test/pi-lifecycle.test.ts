@@ -6,7 +6,7 @@ import test from "node:test";
 import { ResearchService } from "../src/pi/service.ts";
 import { Workspace } from "../src/workspace.ts";
 
-test("normal shutdown archives an active M07 goal instead of leaving the run running", async (t) => {
+test("normal shutdown suspends a new M07 attempt while preserving its goal and run", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-goal-shutdown-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const ws = new Workspace(root);
@@ -21,14 +21,18 @@ test("normal shutdown archives an active M07 goal instead of leaving the run run
   }) as { runId: string };
   await service.interruptAllActive("test host shutdown");
   const run = await ws.readRun("M07", goal.runId);
-  assert.equal(run.status, "failed");
-  assert.match(run.failures.join("\n"), /host-shutdown/);
-  const persisted = await service.goalStatus(goal.runId, root) as { lifecycle: string; outcome?: string };
-  assert.equal(persisted.lifecycle, "finished");
-  assert.equal(persisted.outcome, "blocked");
+  assert.equal(run.status, "running");
+  const persisted = await service.goalStatus(goal.runId, root) as { lifecycle: string; outcome?: string; executionState?: { attempts: Array<{ state: string }> } };
+  assert.equal(persisted.lifecycle, "active");
+  assert.equal(persisted.outcome, undefined);
+  assert.equal(persisted.executionState?.attempts[0].state, "suspended");
+  const visible = await service.status(root);
+  assert.equal(visible.stages.M07.latest?.attemptId, "A001");
+  assert.equal(visible.stages.M07.latest?.attemptState, "suspended");
+  assert.deepEqual(visible.stages.M07.latest?.unresolvedOperationIds, []);
 });
 
-test("shutdown with oversized M07 control facts closes both records and preserves a bounded handoff", async (t) => {
+test("shutdown with oversized M07 control facts writes a small recovery index without ending the goal", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-goal-shutdown-overflow-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const ws = new Workspace(root);
@@ -47,13 +51,13 @@ test("shutdown with oversized M07 control facts closes both records and preserve
   }) as { runId: string };
   await service.interruptAllActive("test host shutdown");
   const run = await ws.readRun("M07", goal.runId);
-  const persisted = await service.goalStatus(goal.runId, root) as { lifecycle: string; outcome?: string; feedbackStatus?: string; feedbackPath?: string };
-  assert.equal(run.status, "failed");
-  assert.equal(persisted.lifecycle, "finished");
-  assert.equal(persisted.outcome, "blocked");
-  assert.equal(persisted.feedbackStatus, "control-facts-only");
-  assert.ok((await readFile(persisted.feedbackPath!, "utf8")).length <= 4_000);
-  assert.ok(run.outputs.some((item) => item.path === persisted.feedbackPath));
+  const persisted = await service.goalStatus(goal.runId, root) as { lifecycle: string; outcome?: string; goal: string; executionState?: { attempts: Array<{ state: string; controlCheckpointPath?: string }> } };
+  assert.equal(run.status, "running");
+  assert.equal(persisted.lifecycle, "active");
+  assert.equal(persisted.outcome, undefined);
+  assert.equal(persisted.executionState?.attempts[0].state, "suspended");
+  assert.match(persisted.goal, /X{5000}/);
+  assert.ok((await readFile(persisted.executionState!.attempts[0].controlCheckpointPath!, "utf8")).length < 4_000);
 });
 
 test("host-frozen continuous contract blocks ordinary service stop but accepts host lifecycle receipt", async (t) => {

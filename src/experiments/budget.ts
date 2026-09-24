@@ -4,7 +4,8 @@ import type { BudgetLease, BudgetLimits, BudgetStatus, PromptReservation } from 
 
 type Counts = BudgetStatus["committed"];
 type Node = { lease: BudgetLease; limits: BudgetLimits; started?: number; activeWallMillis: number; clockMode: "continuous" | "active"; closed: boolean; committed: Counts; reservedInput: number; reservedOutput: number; reservedCost: number; unknown: boolean; exceeded: boolean };
-type Reservation = PromptReservation & { nodes: Node[]; open: boolean; observedOutput?: boolean };
+type Reservation = PromptReservation & { nodes: Node[]; open: boolean; observedOutput?: boolean; maxProviderCalls?: number };
+export type ObservedTurnReservation = PromptReservation & { maxProviderCalls: number };
 const zero = (): Counts => ({ providerCalls: 0, inputTokens: 0, outputTokens: 0, sdkEstimatedCost: 0, probeCalls: 0, cpuMillis: 0 });
 const nonnegative = (value: number, name: string): void => {
 	if (!Number.isFinite(value) || value < 0) throw new Error(`${name} must be finite and nonnegative`);
@@ -141,6 +142,48 @@ export class SharedBudget {
 		const reservation: Reservation = { id: randomUUID(), leaseId: lease.id, maxInputTokens: request.maxInputTokens, maxOutputTokens: 0, maxSdkEstimatedCost: 0, nodes, open: true, observedOutput: true };
 		this.reservations.set(reservation.id, reservation);
 		return { id: reservation.id, leaseId: reservation.leaseId, maxInputTokens: reservation.maxInputTokens, maxOutputTokens: 0, maxSdkEstimatedCost: 0 };
+	}
+
+	/** Reserve the remaining serial call/input envelope before a tool-using SDK turn.
+	 * Pi may make several provider calls inside one prompt. This bounds admission accounting,
+	 * but it cannot physically interrupt an SDK turn at the exact provider-call limit.
+	 */
+	reserveObservedTurn(lease: BudgetLease): ObservedTurnReservation {
+		if (this.phaseSealed && lease.id === this.root.id) throw new Error("direct root spend is forbidden after phase allocation");
+		this.activateLease(lease);
+		const nodes = this.lineage(lease);
+		const remaining = nodes.map((n) => this.status(n.lease));
+		if (remaining.some((s) => s.settlement !== "settled" || s.remaining.providerCalls < 1 || s.remaining.inputTokens < 1 || s.remaining.outputTokens < 1 || s.remaining.sdkEstimatedCost <= 0 || s.remaining.wallMillis <= 0)) throw new Error("turn budget exhausted or unsettled");
+		const maxProviderCalls = Math.min(...remaining.map((s) => s.remaining.providerCalls));
+		const maxInputTokens = Math.min(...remaining.map((s) => s.remaining.inputTokens));
+		for (const n of nodes) { n.committed.providerCalls += maxProviderCalls; n.reservedInput += maxInputTokens; }
+		const reservation: Reservation = { id: randomUUID(), leaseId: lease.id, maxInputTokens, maxOutputTokens: 0, maxSdkEstimatedCost: 0, maxProviderCalls, nodes, open: true, observedOutput: true };
+		this.reservations.set(reservation.id, reservation);
+		return { id: reservation.id, leaseId: lease.id, maxInputTokens, maxOutputTokens: 0, maxSdkEstimatedCost: 0, maxProviderCalls };
+	}
+
+	settleObservedTurn(reservation: ObservedTurnReservation, usage: UsageSummary): void {
+		const r = this.reservations.get(reservation.id);
+		if (!r || !r.open || r.leaseId !== reservation.leaseId || r.maxProviderCalls !== reservation.maxProviderCalls || r.maxInputTokens !== reservation.maxInputTokens) throw new Error("invalid or settled turn reservation");
+		r.open = false;
+		const finite = [usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.totalTokens, usage.cost, usage.reportedEvents, usage.unknownEvents].every((v) => typeof v === "number" && Number.isFinite(v) && v >= 0);
+		const known = finite && usage.complete && usage.costComplete && usage.reportedEvents > 0 && usage.unknownEvents === 0;
+		const input = known ? usage.input + usage.cacheRead + usage.cacheWrite : r.maxInputTokens;
+		const output = known ? usage.output : 0;
+		const cost = known ? usage.cost : 0;
+		for (const n of r.nodes) {
+			n.reservedInput -= r.maxInputTokens;
+			if (known) n.committed.providerCalls -= r.maxProviderCalls - usage.reportedEvents;
+			n.committed.inputTokens += input;
+			n.committed.outputTokens += output;
+			n.committed.sdkEstimatedCost += cost;
+			if (!known) n.unknown = true;
+			if (known && (usage.reportedEvents > r.maxProviderCalls || input > r.maxInputTokens) || n.committed.providerCalls > n.limits.maxProviderCalls || n.committed.inputTokens > n.limits.maxInputTokens || n.committed.outputTokens > n.limits.maxOutputTokens || n.committed.sdkEstimatedCost > n.limits.maxSdkEstimatedCost) n.exceeded = true;
+		}
+	}
+
+	markObservedTurnUnknown(reservation: ObservedTurnReservation): void {
+		this.settleObservedTurn(reservation, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, reportedEvents: 0, unknownEvents: 1, complete: false, costComplete: false });
 	}
 
 	settlePrompt(reservation: PromptReservation, usage: UsageSummary): void {

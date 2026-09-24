@@ -12,10 +12,9 @@ Thumbs.db
 *.pem
 *.key
 
-# Private agent records
+# Private agent records; reviewed project notes may be published
 .agent/private/
 .agent/improvement/
-.agent/notes/
 .agent/telemetry/
 
 # Local third-party checkouts and research source files

@@ -12,13 +12,15 @@ import { nowIso, readTextIfExists, writeFileAtomic } from "../workspace.ts";
 import { isTextFile, mediaType } from "../media.ts";
 import { recordSession, sessionSpec, type StageContext } from "../stages/context.ts";
 import { isSafeRelativeOutputPath, resolveExpectedOutputFiles } from "./expected-output.ts";
-import type { BeginGoalInput, CurrentGoal, DecisionInput, EvidenceFile, FinishInput, HostStopReasonKind, HostStopReceipt, InterruptInput, M07CheckpointRecord, M07Controller, M07TaskRecord, TaskCheck, TaskReviewInput, TaskSpecInput } from "./types.ts";
+import type { BeginGoalInput, CurrentGoal, DecisionInput, EvidenceFile, FinishInput, HostStopReasonKind, HostStopReceipt, InterruptInput, M07CheckpointRecord, M07Controller, M07TaskRecord, TaskCheck, TaskReviewInput, TaskSpecInput, M07OperationV1 } from "./types.ts";
 import type { StageRunRecord } from "../types.ts";
 import { loadActiveBudgetPolicy, projectInline, validateActiveBudgetPointer, validateBudgetPolicy, type BudgetPolicy } from "../improvement/policy.ts";
 import { capturedRunBytes, DEFAULT_PROJECTION_SNAPSHOT_LIMITS, newProjectionEvent, nextProjectionOrdinal, writeProjectionEvent, type ProjectionEventV1, type ProjectionMaterialV1, type ProjectionSnapshotLimits } from "../improvement/observations.ts";
 import { createExperienceProvider, verifyRequiredKnowledge } from "../knowledge/experience-index.ts";
 import type { KnowledgeRef, KnowledgeStore } from "../knowledge/types.ts";
 import { GenerationStore, isM07WorkflowStrategy } from "../improvement/generation.ts";
+import { probeProcessIdentity, readCurrentProcessIdentity, type ProcessIdentityV1 } from "../runtime/process-identity.ts";
+import { parseRunDescriptor, type RunDescriptorV1 } from "../runtime/run-descriptor.ts";
 
 const STATE = "goal.json";
 const HOST_STOP_KEY = Symbol("m07-host-stop");
@@ -113,9 +115,9 @@ async function verifyFrozenWorkflowMethod(ctx: StageContext, goal: CurrentGoal, 
 	await verifyRequiredKnowledge(ctx.ws.root, [...refs.values()], goal.knowledgeSnapshot, registeredStores);
 }
 
-interface FormalBaseline { run: StageRunRecord; knowledgeSnapshot?: string }
+export interface FormalBaseline { run: StageRunRecord; knowledgeSnapshot?: string }
 
-async function latestFormalBaseline(ctx: StageContext): Promise<FormalBaseline | undefined> {
+export async function latestFormalBaseline(ctx: StageContext): Promise<FormalBaseline | undefined> {
 	const ids = await ctx.ws.listRuns("M04");
 	if (!ids.length) return undefined;
 	const runs = await Promise.all(ids.map((id) => ctx.ws.readRun("M04", id)));
@@ -148,6 +150,19 @@ async function requireCurrentFormalBaseline(ctx: StageContext, goal: CurrentGoal
 
 function requireActive(goal: CurrentGoal): void {
 	if (goal.lifecycle !== "active") throw new HarnessError("m07.finished", `M07 目标 ${goal.runId} 已结束，恢复只可查看，不能自动重跑`);
+	if (goal.executionState && goal.executionState.attempts.find((attempt) => attempt.id === goal.executionState?.activeAttemptId)?.state !== "running") throw new HarnessError("m07.suspended", `M07 目标 ${goal.runId} 的执行尝试未运行；先经宿主控制面恢复`);
+}
+
+function nextAttemptId(goal: CurrentGoal): string { return `A${String((goal.executionState?.attempts.length ?? 0) + 1).padStart(3, "0")}`; }
+
+function sameProcess(a: ProcessIdentityV1, b: ProcessIdentityV1): boolean {
+	return a.hostId === b.hostId && a.bootId === b.bootId && a.pid === b.pid && a.processStartToken === b.processStartToken;
+}
+
+function validateRecoveryDescriptor(goal: CurrentGoal, descriptor: RunDescriptorV1, expectedAttemptId: string): RunDescriptorV1 {
+	const parsed = parseRunDescriptor(descriptor);
+	if (parsed.goalRunId !== goal.runId || parsed.attemptId !== expectedAttemptId || parsed.workspaceId !== goal.executionState?.attempts[0]?.runDescriptor.workspaceId) throw new HarnessError("m07.recovery", "恢复运行描述与目标、工作区或新 attempt 不匹配");
+	return parsed;
 }
 
 async function confinedExistingFile(ctx: StageContext, requested: string): Promise<string> {
@@ -270,7 +285,7 @@ async function createProjectionObservation(ctx: StageContext, goal: CurrentGoal,
 	return newProjectionEvent({ callOrdinal: await nextProjectionOrdinal(ctx.ws, goal.runId), purpose, m07RunId: goal.runId, taskId, policyVersionId: goal.budgetPolicyVersionId!, policy, methodBinding: goal.methodBinding, tokenMeasurement: { unit: "provider-token", status: "unavailable" }, captureBudget: { ...limits, usedRunBytesAtStart: await capturedRunBytes(ctx.ws, goal.runId), usedCallBytes: 0 }, projectionStatus: "unavailable", deliveryStatus: "not-submitted", materials: [] });
 }
 
-async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string, task: TaskSpecInput, copies: M07TaskRecord["inputCopies"], knowledgePack: string | undefined, policy: BudgetPolicy, limits: ProjectionSnapshotLimits): Promise<{ message: string; event: ProjectionEventV1 }> {
+async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string, task: TaskSpecInput, copies: M07TaskRecord["inputCopies"], knowledgePack: string | undefined, policy: BudgetPolicy, limits: ProjectionSnapshotLimits, operationId?: string): Promise<{ message: string; event: ProjectionEventV1 }> {
 	const event = await createProjectionObservation(ctx, goal, "task-message", policy, limits, taskId);
 	const actualInputs: string[] = [];
 	const inventory: string[] = [];
@@ -313,7 +328,7 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string,
 		section("待检查事项", task.checks.map((x) => `- ${x}`).join("\n") || "无"),
 	];
 	if (knowledgePack) boundary.push(section("本任务局部知识包", knowledgePack));
-	if (task.mode === "execute") boundary.push(section("外部执行与可消耗资源", "如任务涉及真实提交、评测、远程实验或其他可能消耗配额/费用/机会的动作：先用已提供的只读能力或额度接口核对接入和当前状态，并先做本地可完成的语法、类型、编译与兼容性预检。这不禁止任务已授权的真实实验，已授权平台评测/实验产生的结果属于本任务实测证据。每次真实动作都要记录实际结果和资源消耗；失败若仍消耗了资源，同样记录已消耗量、可见剩余量与恢复条件。平台配额不明时如实记录未知，不猜测统一配额。本地命令或客户端成功退出不等于远程实验通过。显式输入和原问题允许使用；若需取得新的外部研究参考资料并用于推理，将具体缺口报回主会话走 M05/M06→M04，不在 execute 任务里通过 bash 另造获取和采用链。"));
+	if (task.mode === "execute") boundary.push(section("外部执行与可消耗资源", `本任务控制操作 ID：${operationId ?? "旧目标无操作登记"}。若执行有真实副作用的远端动作，保存实际参数、外部请求/结果 ID、响应和可用的查询方法；在响应丢失后先查询，不能仅凭超时重发。任务级 ID 是恢复索引，只有远端明确支持时才能作为幂等键，不能声称 exactly-once。\n\n如任务涉及真实提交、评测、远程实验或其他可能消耗配额/费用/机会的动作：先用已提供的只读能力或额度接口核对接入和当前状态，并先做本地可完成的语法、类型、编译与兼容性预检。这不禁止任务已授权的真实实验，已授权平台评测/实验产生的结果属于本任务实测证据。每次真实动作都要记录实际结果和资源消耗；失败若仍消耗了资源，同样记录已消耗量、可见剩余量与恢复条件。平台配额不明时如实记录未知，不猜测统一配额。本地命令或客户端成功退出不等于远程实验通过。显式输入和原问题允许使用；若需取得新的外部研究参考资料并用于推理，将具体缺口报回主会话走 M05/M06→M04，不在 execute 任务里通过 bash 另造获取和采用链。`));
 	boundary.push("会话返回只表示任务已返回，不表示成果被主 Agent 接受。请如实列出实际动作、产物、失败、未执行项和限制。");
 	boundary.push("产物路径规则：expectedOutputs 必须是当前任务工作目录内的精确相对路径；说明写在 objective 或 report.md。所有实际写盘必须落在当前工作目录内，不要写到工作区根目录或绝对路径。");
 	const message = boundary.join("\n\n");
@@ -567,7 +582,7 @@ async function freezeCheckpoint(ctx: StageContext, goal: CurrentGoal, limits: Pr
 	return record;
 }
 
-export function createM07Controller(ctx: StageContext, options: { projectionSnapshotLimits?: ProjectionSnapshotLimits; registeredExperienceStores?: ReadonlyMap<string, KnowledgeStore> } = {}): M07Controller {
+export function createM07Controller(ctx: StageContext, options: { projectionSnapshotLimits?: ProjectionSnapshotLimits; registeredExperienceStores?: ReadonlyMap<string, KnowledgeStore>; processIdentity?: () => Promise<ProcessIdentityV1>; probeProcess?: typeof probeProcessIdentity } = {}): M07Controller {
 	const snapshotLimits = options.projectionSnapshotLimits ?? DEFAULT_PROJECTION_SNAPSHOT_LIMITS;
 	if (!Number.isSafeInteger(snapshotLimits.perMaterialBytes) || !Number.isSafeInteger(snapshotLimits.perCallBytes) || !Number.isSafeInteger(snapshotLimits.perRunBytes) || snapshotLimits.perMaterialBytes <= 0 || snapshotLimits.perCallBytes < snapshotLimits.perMaterialBytes || snapshotLimits.perRunBytes < snapshotLimits.perCallBytes) throw new HarnessError("m07.projection-budget", "invalid projection snapshot limits");
 	return {
@@ -599,7 +614,9 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			const frozen = path.join(ctx.ws.runDir("M07", record.runId), "problem-snapshot.md");
 			await writeFileAtomic(frozen, problem.content);
 			const exploratory = input.exploratory === true || !baseline;
-			const goal: CurrentGoal = { version: 1, runId: record.runId, lifecycle: "active", startedAt: record.startedAt, updatedAt: record.startedAt, goal: input.goal.trim(), problemRelation: input.problemRelation.trim(), constraints: input.constraints.map((x) => nonempty(x, "constraint")), successCriteria: input.successCriteria.map((x) => nonempty(x, "success criterion")), plan: input.plan.trim(), exploratory, formalBaseline: !!baseline && !exploratory, problemSnapshotPath: frozen, knowledgeSnapshot: baseline?.knowledgeSnapshot, m04BaselineRunId: baseline?.run.runId, baselineHistory: baseline ? [{ at: record.startedAt, knowledgeSnapshot: baseline.knowledgeSnapshot, m04RunId: baseline.run.runId }] : [], budgetPolicy: budget.policy, budgetPolicyVersionId: budget.versionId, budgetPolicyFrozenAt: record.startedAt, methodBinding: { versionId: workflowMethod?.versionId ?? budget.versionId }, ...(workflowMethod ? { workflowMethod } : {}), ...(beginOptions?.executionContract === "continuous" ? { executionContract: { version: 1 as const, mode: "continuous" as const, frozenAt: record.startedAt } } : {}), tasks: [], decisions: [], limitations: [] };
+			const attemptId = "A001";
+			const descriptor: RunDescriptorV1 = { version: 1, instanceId: process.env.PRE_RSI_RUN_INSTANCE_ID ?? randomUUID(), attemptId, workspaceId: await ctx.store.storeId(), goalRunId: record.runId, codeRevision: process.env.PRE_RSI_CODE_REVISION ?? "unrecorded", controlDir: ctx.ws.runDir("M07", record.runId), process: await (options.processIdentity ?? readCurrentProcessIdentity)() };
+			const goal: CurrentGoal = { version: 1, runId: record.runId, lifecycle: "active", startedAt: record.startedAt, updatedAt: record.startedAt, goal: input.goal.trim(), problemRelation: input.problemRelation.trim(), constraints: input.constraints.map((x) => nonempty(x, "constraint")), successCriteria: input.successCriteria.map((x) => nonempty(x, "success criterion")), plan: input.plan.trim(), exploratory, formalBaseline: !!baseline && !exploratory, problemSnapshotPath: frozen, knowledgeSnapshot: baseline?.knowledgeSnapshot, m04BaselineRunId: baseline?.run.runId, baselineHistory: baseline ? [{ at: record.startedAt, knowledgeSnapshot: baseline.knowledgeSnapshot, m04RunId: baseline.run.runId }] : [], budgetPolicy: budget.policy, budgetPolicyVersionId: budget.versionId, budgetPolicyFrozenAt: record.startedAt, methodBinding: { versionId: workflowMethod?.versionId ?? budget.versionId }, ...(workflowMethod ? { workflowMethod } : {}), ...(beginOptions?.executionContract === "continuous" ? { executionContract: { version: 1 as const, mode: "continuous" as const, frozenAt: record.startedAt } } : {}), executionState: { version: 1, activeAttemptId: attemptId, attempts: [{ version: 1, id: attemptId, state: "running", startedAt: record.startedAt, runDescriptor: descriptor }], operations: [] }, tasks: [], decisions: [], limitations: [] };
 			await save(ctx, goal);
 			return goal;
 		},
@@ -643,6 +660,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 
 			async delegate(runId, spec) {
 				const goal = await load(ctx, runId); requireActive(goal); nonempty(spec.objective, "task objective");
+				if (spec.mode === "execute" && (goal.executionState?.operations.some((operation) => operation.status === "unknown") || goal.tasks.some((task) => task.mode === "execute" && task.status === "unknown"))) throw new HarnessError("m07.operation-unknown", "仍有外部副作用状态未知；先经宿主控制面对账。只读 check/reason 任务仍可用于核查");
 				await verifyFrozenWorkflowMethod(ctx, goal, options.registeredExperienceStores, spec);
 			const policy = frozenPolicy(goal);
 			await requireCurrentFormalBaseline(ctx, goal);
@@ -686,20 +704,27 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			const expectedOutputPaths = spec.expectedOutputs.map((x) => { const resolved = path.resolve(workDir, x); if (!inside(workDir, resolved)) throw new HarnessError("m07.path", `预期产物路径逃逸任务目录：${x}`); return resolved; });
 			const role = spec.mode === "check" ? "reviewer" : "execution";
 			const tools = spec.mode === "execute" ? { kind: "execution" as const, root: workDir, tools: ["read", "write", "edit", "bash"] as Array<"read" | "write" | "edit" | "bash"> } : { kind: "read-dir" as const, root: workDir };
-			const { message, event } = await taskMessage(ctx, goal, id, spec, copies, pack, policy, snapshotLimits);
+			const operationId = spec.mode === "execute" && goal.executionState ? `O${String(goal.executionState.operations.length + 1).padStart(3, "0")}` : undefined;
+			const { message, event } = await taskMessage(ctx, goal, id, spec, copies, pack, policy, snapshotLimits, operationId);
 			await writeFileAtomic(path.join(dir, "message.md"), message);
 			const task: M07TaskRecord = { ...spec, taskId: id, status: "running", createdAt: nowIso(), returnedAt: "", workDir, inputCopies: copies, expectedOutputPaths, readCoverage: [], toolLog: [], knowledgeSnapshot: goal.knowledgeSnapshot, m04BaselineRunId: goal.m04BaselineRunId, experienceSelection };
+			const operation: M07OperationV1 | undefined = operationId ? { version: 1, id: operationId, taskId: id, status: "prepared", issuedAt: nowIso() } : undefined;
+			if (operation) goal.executionState!.operations.push(operation);
 			goal.tasks.push(task); await save(ctx, goal);
 			let handle;
+			let promptIssued = false;
 			try {
 				const session = sessionSpec(ctx, `M07-${id}`, role, systemPromptFor(role), tools);
 				if (goal.methodBinding) session.methodBinding = goal.methodBinding;
 				handle = await ctx.runner.create(session); task.session = handle.ref; await save(ctx, goal);
 				event.deliveryStatus = "submitted"; event.providerUsageSessionId = handle.ref.id; await writeProjectionEvent(ctx.ws, event);
-				const report = (await handle.prompt(message)).text; if (task.experienceSelection) task.experienceSelection.loadedAt = nowIso(); const reportPath = path.join(dir, "report.md"); await writeFileAtomic(reportPath, report);
+				if (operation) { operation.status = "issued"; await save(ctx, goal); }
+				promptIssued = true;
+				const report = (await handle.prompt(message)).text; if (operation) operation.status = "response-received"; if (task.experienceSelection) task.experienceSelection.loadedAt = nowIso(); const reportPath = path.join(dir, "report.md"); await writeFileAtomic(reportPath, report);
 				task.reportPath = reportPath; task.status = "returned";
 			} catch (error) {
 				task.status = "failed"; task.executionFailure = (error as Error).message;
+				if (operation && promptIssued && operation.status === "issued") operation.status = "unknown";
 			} finally {
 				if (handle) { task.readCoverage = handle.readCoverage(); task.toolLog = handle.toolLog(); handle.dispose(); }
 				task.returnedAt = nowIso(); await save(ctx, goal);
@@ -871,6 +896,127 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			const receipt: HostStopReceipt = { version: 1, id: randomUUID(), goalRunId: runId, source: "pi-host", reasonKind: input.reasonKind, observedAt: nowIso(), ...(input.sourceEventId ? { sourceEventId: input.sourceEventId } : {}) };
 			const interruptWithAuthority = this.interrupt as (goalRunId: string, request: InterruptInput, key: typeof HOST_STOP_KEY, witness: HostStopReceipt) => Promise<CurrentGoal>;
 			return interruptWithAuthority(runId, { reason: `受信宿主生命周期停止：${input.reasonKind}`, returnPath: "user" }, HOST_STOP_KEY, receipt);
+		},
+		async hostSuspend(runId, input) {
+			if (!HOST_STOP_REASONS.has(input.reasonKind)) throw new HarnessError("m07.host-stop", "未知宿主停止事件");
+			if (input.sourceEventId !== undefined && (typeof input.sourceEventId !== "string" || input.sourceEventId.length > 128 || !/^[A-Za-z0-9._:-]+$/.test(input.sourceEventId))) throw new HarnessError("m07.host-stop", "宿主事件 ID 无效");
+			const goal = await load(ctx, runId); requireActive(goal);
+			const state = goal.executionState;
+			if (!state) throw new HarnessError("m07.recovery", "旧目标缺少执行尝试状态；保留旧归档语义，不自动迁移");
+			const attempt = state.attempts.find((item) => item.id === state.activeAttemptId);
+			if (!attempt || attempt.state !== "running") throw new HarnessError("m07.recovery", "当前执行尝试不是运行态");
+			const receipt: HostStopReceipt = { version: 1, id: randomUUID(), goalRunId: runId, source: "pi-host", reasonKind: input.reasonKind, observedAt: nowIso(), ...(input.sourceEventId ? { sourceEventId: input.sourceEventId } : {}) };
+			for (const task of goal.tasks) {
+				if (task.status !== "running") continue;
+			task.status = task.mode === "execute" ? "unknown" : "failed";
+				task.executionFailure = `宿主停止时任务结果未确认：${input.reasonKind}；不得自动重放`;
+				task.returnedAt = receipt.observedAt;
+				const operation = state.operations.find((item) => item.taskId === task.taskId && ["prepared", "issued"].includes(item.status));
+				if (operation) operation.status = operation.status === "issued" ? "unknown" : "not-issued";
+			}
+			attempt.endedAt = receipt.observedAt;
+			attempt.stopReceipt = receipt;
+			attempt.state = state.operations.some((item) => item.status === "unknown") || goal.tasks.some((item) => item.status === "unknown") ? "recovery-required" : "suspended";
+			const controlDir = path.join(ctx.ws.runDir("M07", runId), "control-checkpoints");
+			const controlPath = path.join(controlDir, `${attempt.id}.json`);
+			await writeFileAtomic(controlPath, `${JSON.stringify({ version: 1, goalRunId: runId, attemptId: attempt.id, state: attempt.state, goalStatePath: statePath(ctx, runId), taskIds: goal.tasks.map((item) => item.taskId), unresolvedOperationIds: state.operations.filter((item) => item.status === "unknown").map((item) => item.id), knowledgeSnapshot: goal.knowledgeSnapshot, at: receipt.observedAt }, null, 2)}\n`);
+			attempt.controlCheckpointPath = controlPath;
+			await save(ctx, goal);
+			const run = await ctx.ws.readRun("M07", runId);
+			run.remarks.push(`执行尝试 ${attempt.id} 因 ${input.reasonKind} ${attempt.state}；目标仍 active，原成功要求未变。控制 checkpoint 是恢复索引，不是 M04 科学验收。`);
+			await ctx.ws.writeRun(run);
+			return goal;
+		},
+		async hostRecover(runId, input) {
+			const goal = await load(ctx, runId);
+			if (goal.lifecycle !== "active" || !goal.executionState) throw new HarnessError("m07.recovery", "只恢复有版本化 executionState 的 active 目标；旧终态须显式建立 successor");
+			const state = goal.executionState;
+			const prior = state.attempts.find((item) => item.id === state.activeAttemptId);
+			if (!prior || prior.id !== input.expectedAttemptId) throw new HarnessError("m07.recovery", "恢复所指定的旧 attempt 与持久状态不匹配");
+			const nextId = nextAttemptId(goal);
+			const descriptor = validateRecoveryDescriptor(goal, input.runDescriptor, nextId);
+			if (descriptor.instanceId === prior.runDescriptor.instanceId || sameProcess(descriptor.process, prior.runDescriptor.process)) throw new HarnessError("m07.recovery", "恢复必须使用新的独立 Pi 进程与实例身份");
+			const newProbe = await (options.probeProcess ?? probeProcessIdentity)(descriptor.process);
+			if (newProbe.status !== "alive" || !newProbe.identityMatch) throw new HarnessError("m07.recovery", "新 Pi 进程身份不可验证，拒绝恢复");
+			const oldProbe = await (options.probeProcess ?? probeProcessIdentity)(prior.runDescriptor.process);
+			if (oldProbe.status !== "dead" || prior.runDescriptor.process.hostId !== descriptor.process.hostId || prior.runDescriptor.process.bootId !== descriptor.process.bootId) throw new HarnessError("m07.recovery", "旧 attempt 的进程仍存活或身份未知，拒绝并行恢复");
+			if (prior.state === "running") {
+				prior.state = "recovery-required";
+				prior.endedAt = nowIso();
+				for (const task of goal.tasks.filter((item) => item.status === "running")) {
+					task.status = task.mode === "execute" ? "unknown" : "failed";
+					task.executionFailure = "旧进程已死，任务响应及外部副作用待对账；不得自动重放";
+					task.returnedAt = nowIso();
+					const operation = state.operations.find((item) => item.taskId === task.taskId && ["issued", "prepared"].includes(item.status));
+					if (operation) operation.status = operation.status === "issued" ? "unknown" : "not-issued";
+				}
+				const controlPath = path.join(ctx.ws.runDir("M07", runId), "control-checkpoints", `${prior.id}.json`);
+				await writeFileAtomic(controlPath, `${JSON.stringify({ version: 1, goalRunId: runId, attemptId: prior.id, state: prior.state, goalStatePath: statePath(ctx, runId), taskIds: goal.tasks.map((item) => item.taskId), unresolvedOperationIds: state.operations.filter((item) => item.status === "unknown").map((item) => item.id), knowledgeSnapshot: goal.knowledgeSnapshot, at: prior.endedAt }, null, 2)}\n`);
+				prior.controlCheckpointPath = controlPath;
+			} else if (!['suspended', 'recovery-required'].includes(prior.state)) throw new HarnessError("m07.recovery", "旧 attempt 不能恢复");
+			frozenPolicy(goal);
+			await verifyFrozenWorkflowMethod(ctx, goal, options.registeredExperienceStores);
+			await requireCurrentFormalBaseline(ctx, goal);
+			const claimsDir = path.join(ctx.ws.runDir("M07", runId), "attempt-claims");
+			await mkdir(claimsDir, { recursive: true });
+			try { await mkdir(path.join(claimsDir, nextId)); }
+			catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new HarnessError("m07.recovery", `执行尝试 ${nextId} 已被另一恢复者占用；核对 goal.json 和 claim 后处理`); throw error; }
+			state.attempts.push({ version: 1, id: nextId, state: "running", startedAt: nowIso(), runDescriptor: descriptor });
+			state.activeAttemptId = nextId;
+			await save(ctx, goal);
+			const run = await ctx.ws.readRun("M07", runId);
+			run.remarks.push(`新执行尝试 ${nextId} 已在新 Pi 身份启动；旧会话未 resume。未知副作用仍阻断 execute 委派。`);
+			await ctx.ws.writeRun(run);
+			return goal;
+		},
+		async hostReconcileOperation(runId, input) {
+			const goal = await load(ctx, runId);
+			if (goal.lifecycle !== "active" || !goal.executionState) throw new HarnessError("m07.operation", "目标无可对账的执行状态");
+			const operation = goal.executionState.operations.find((item) => item.id === input.operationId);
+			if (!operation || operation.status !== "unknown") throw new HarnessError("m07.operation", "操作不存在或已完成对账");
+			const source = await confinedExistingFile(ctx, input.evidencePath);
+			const bytes = await readFile(source);
+			if (bytes.length > 64 * 1024) throw new HarnessError("m07.operation", "对账回执超过 64 KiB");
+			let evidence: { version?: unknown; operationId?: unknown; observationMethod?: unknown; observedStatus?: unknown; observedAt?: unknown; externalId?: unknown };
+			try { evidence = JSON.parse(bytes.toString("utf8")); }
+			catch { throw new HarnessError("m07.operation", "对账证据必须是可读取的结构化 JSON 回执"); }
+			if (evidence.version !== 1 || evidence.operationId !== operation.id || evidence.observationMethod !== "external-query" || !["confirmed", "not-issued", "unknown"].includes(String(evidence.observedStatus)) || typeof evidence.observedAt !== "string" || !evidence.observedAt.trim() || (evidence.observedStatus === "confirmed" && (typeof evidence.externalId !== "string" || !evidence.externalId.trim()))) throw new HarnessError("m07.operation", "对账回执须含匹配 operationId、外部查询方法、明确状态及观察时间；确认执行还需远端 ID");
+			const frozen = path.join(ctx.ws.runDir("M07", runId), "operation-receipts", `${operation.id}-${randomUUID()}.json`);
+			await writeFileAtomic(frozen, bytes.toString("utf8"));
+			operation.evidencePath = frozen;
+			operation.observationMethod = "external-query";
+			if (typeof evidence.externalId === "string") operation.externalId = evidence.externalId;
+			if (evidence.observedStatus === "unknown") { await save(ctx, goal); return goal; }
+			operation.status = evidence.observedStatus as "confirmed" | "not-issued";
+			operation.resolvedAt = nowIso();
+			const task = goal.tasks.find((item) => item.taskId === operation.taskId);
+			if (task?.status === "unknown") { task.status = "failed"; task.executionFailure = `原响应丢失，外部查询结果 ${operation.status}；证据 ${frozen}。任务未自动重放或采用。`; }
+			await save(ctx, goal);
+			return goal;
+		},
+		async hostCreateSuccessor(runId, input) {
+			const prior = await load(ctx, runId);
+			if (prior.lifecycle !== "finished" || prior.outcome !== "blocked") throw new HarnessError("m07.successor", "仅旧 blocked 终态可显式建立关联后继；原记录保持只读");
+			frozenPolicy(prior);
+			await verifyFrozenWorkflowMethod(ctx, prior, options.registeredExperienceStores);
+			if (prior.knowledgeSnapshot !== (await ctx.store.current())?.id) throw new HarnessError("m07.successor", "原知识快照已不可作为当前基线；先对账，不得悄套新 K");
+			await requireCurrentFormalBaseline(ctx, prior);
+			const descriptor = parseRunDescriptor(input.runDescriptor);
+			const probe = await (options.probeProcess ?? probeProcessIdentity)(descriptor.process);
+			if (probe.status !== "alive" || !probe.identityMatch) throw new HarnessError("m07.successor", "新进程身份不可验证");
+			if (prior.executionState?.operations.some((item) => item.status === "unknown")) throw new HarnessError("m07.successor", "旧目标有未对账外部动作；先查询确认，不得建立可执行后继");
+			try { await mkdir(path.join(ctx.ws.runDir("M07", runId), "successor.claim")); }
+			catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new HarnessError("m07.successor", "此旧目标已有后继建立声明；核对原目标和后继运行，不能重复迁移"); throw error; }
+			const problem = await readFile(prior.problemSnapshotPath, "utf8");
+			const run = await ctx.ws.startRun("M07", [{ label: "原目标冻结问题", path: prior.problemSnapshotPath }], prior.knowledgeSnapshot);
+			const frozen = path.join(ctx.ws.runDir("M07", run.runId), "problem-snapshot.md");
+			await writeFileAtomic(frozen, problem);
+			const newDescriptor: RunDescriptorV1 = { ...descriptor, attemptId: "A001", goalRunId: run.runId, workspaceId: await ctx.store.storeId(), controlDir: ctx.ws.runDir("M07", run.runId) };
+			const successor: CurrentGoal = { version: 1, runId: run.runId, lifecycle: "active", startedAt: run.startedAt, updatedAt: run.startedAt, goal: prior.goal, problemRelation: prior.problemRelation, constraints: [...prior.constraints], successCriteria: [...prior.successCriteria], plan: prior.plan, exploratory: prior.exploratory, formalBaseline: prior.formalBaseline, problemSnapshotPath: frozen, knowledgeSnapshot: prior.knowledgeSnapshot, m04BaselineRunId: prior.m04BaselineRunId, baselineHistory: structuredClone(prior.baselineHistory), budgetPolicy: structuredClone(prior.budgetPolicy), budgetPolicyVersionId: prior.budgetPolicyVersionId, budgetPolicyFrozenAt: prior.budgetPolicyFrozenAt, methodBinding: prior.methodBinding ? structuredClone(prior.methodBinding) : undefined, workflowMethod: prior.workflowMethod ? structuredClone(prior.workflowMethod) : undefined, executionContract: prior.executionContract ? structuredClone(prior.executionContract) : undefined, predecessorGoalRunId: prior.runId, executionState: { version: 1, activeAttemptId: "A001", attempts: [{ version: 1, id: "A001", state: "running", startedAt: run.startedAt, runDescriptor: newDescriptor }], operations: [] }, tasks: [], decisions: structuredClone(prior.decisions), limitations: [`继承旧目标 ${prior.runId} 的冻结义务、K、策略和方法；旧任务及证据仍在原记录，须重新检查后采用。`] };
+			await save(ctx, successor);
+			run.remarks.push(`显式 successor of ${prior.runId}；旧 blocked goal.json 未修改。新目标保留原成功标准和冻结策略。`);
+			await ctx.ws.writeRun(run);
+			return successor;
 		},
 	};
 }

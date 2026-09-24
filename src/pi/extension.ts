@@ -6,6 +6,9 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { loadPrompt } from "../prompts.ts";
 import { ResearchService, type StageRequest } from "./service.ts";
+import { parseRunDescriptor, readTrustedPauseMs } from "../runtime/run-descriptor.ts";
+import { readCurrentProcessIdentity } from "../runtime/process-identity.ts";
+import { writeFileAtomic } from "../workspace.ts";
 import { TelemetryWriter } from "../dashboard/telemetry.ts";
 import { createMainUsageLedger } from "./main-usage.ts";
 import { ImprovementService } from "../improvement/service.ts";
@@ -15,6 +18,7 @@ import { publicResearchRun, publicResearchStatus } from "../improvement/research
 import type { CampaignPlan, ImprovementRunResult, ImprovementStatus } from "../improvement/types.ts";
 import type { ActiveBudgetPointer } from "../improvement/policy.ts";
 import type { CurrentGoal } from "../m07/types.ts";
+import { summarizeGoalExecution } from "../m07/status.ts";
 
 type ToolResult = AgentToolResult<Record<string, unknown>>;
 
@@ -51,6 +55,7 @@ function compact(value: unknown): Record<string, unknown> {
 	};
 	if ("runId" in item && "lifecycle" in item) return {
 		runId: item.runId, lifecycle: item.lifecycle, outcome: item.outcome, returnPath: item.returnPath,
+		...summarizeGoalExecution(item as unknown as CurrentGoal),
 		feedbackPath: item.feedbackPath, taskCount: Array.isArray(item.tasks) ? item.tasks.length : undefined,
 		openDecisions: Array.isArray(item.decisions) ? item.decisions.filter((entry) => (entry as { status?: string }).status === "open").length : undefined,
 		feedbackStatus: item.feedbackStatus, feedbackError: item.feedbackError, limitations: item.limitations,
@@ -154,9 +159,9 @@ const mainAgentStallCheckMs = options.mainAgentStallCheckMs ?? 1_000;
 let mainAgentWatchdog: NodeJS.Timeout | undefined;
 let mainAgentWatchdogCtx: ExtensionContext | undefined;
 let mainAgentLastActivityAt = 0;
-let mainAgentLastCheckAt = 0;
 let mainAgentWatchdogTriggered = false;
 let pendingShutdownReason: string | undefined;
+const mainAgentEffectiveNow = (): number => Date.now() - readTrustedPauseMs();
 
 const clearMainAgentWatchdog = (): void => {
 if (mainAgentWatchdog) clearInterval(mainAgentWatchdog);
@@ -167,7 +172,7 @@ mainAgentWatchdogTriggered = false;
 
 const noteMainAgentActivity = (ctx?: ExtensionContext): void => {
 if (ctx) mainAgentWatchdogCtx = ctx;
-mainAgentLastActivityAt = Date.now();
+mainAgentLastActivityAt = mainAgentEffectiveNow();
 mainAgentWatchdogTriggered = false;
 };
 
@@ -176,15 +181,8 @@ if (mainAgentStallTimeoutMs <= 0 || mainAgentStallCheckMs <= 0) return;
 mainAgentWatchdogCtx = ctx;
 noteMainAgentActivity(ctx);
 if (mainAgentWatchdog) return;
-mainAgentLastCheckAt = Date.now();
 mainAgentWatchdog = setInterval(() => {
-const now = Date.now();
-const gap = now - mainAgentLastCheckAt;
-mainAgentLastCheckAt = now;
-if (gap > 5_000) {
-mainAgentLastActivityAt += gap;
-return;
-}
+const now = mainAgentEffectiveNow();
 if (mainAgentWatchdogTriggered) return;
 const currentCtx = mainAgentWatchdogCtx;
 if (currentCtx === undefined) return;
@@ -200,10 +198,45 @@ mainAgentWatchdog.unref?.();
 		pi.on("session_start", async (_event, ctx) => {
 			await mainUsage.sessionStart(ctx).catch(() => undefined);
 			researchActive = continuationEnabled(ctx); activePiCwd = researchActive ? ctx.cwd : undefined;
-			boundGoalRunId = options.continuation?.goalRunId;
+			const requestedGoalRunId = options.continuation?.goalRunId;
+			const recoverGoalRunId = process.env.PRE_RSI_RECOVER_GOAL_RUN_ID;
+			// A fresh recovery process owns no goal until the controller accepts its identity.
+			boundGoalRunId = undefined;
 			continuationHalt = undefined; lastControlStamp = undefined; emptyRounds = 0; successfulToolSinceEnd = false; inspectionSinceEnd = false; inspected.clear(); durableToolIds.clear(); pendingInspection.clear();
 			clearMainAgentWatchdog();
 			pendingShutdownReason = undefined;
+			if (recoverGoalRunId) {
+				if (!continuationEnabled(ctx) || requestedGoalRunId !== recoverGoalRunId) throw new Error("恢复入口必须绑定同一 noninteractive M07 goal 与 workspace");
+				const descriptorFile = process.env.PRE_RSI_RUN_DESCRIPTOR_FILE;
+				if (!descriptorFile) throw new Error("恢复入口缺少受信运行描述文件");
+				const old = await service.goalStatus(recoverGoalRunId, continuationWorkspace(ctx.cwd)) as CurrentGoal;
+				if (!old.executionState) throw new Error("旧目标无执行尝试状态；只能显式建立 successor，不能隐式恢复");
+				const descriptor = parseRunDescriptor(JSON.parse(await readFile(descriptorFile, "utf8")));
+				const expectedAttemptId = old.executionState.activeAttemptId;
+				const nextAttemptId = `A${String(old.executionState.attempts.length + 1).padStart(3, "0")}`;
+				const boundDescriptor = { ...descriptor, goalRunId: recoverGoalRunId, attemptId: nextAttemptId };
+				await service.hostRecover({ workspace: continuationWorkspace(ctx.cwd)!, runId: recoverGoalRunId, expectedAttemptId, runDescriptor: boundDescriptor });
+				await writeFileAtomic(descriptorFile, `${JSON.stringify(boundDescriptor, null, 2)}\n`);
+				boundGoalRunId = recoverGoalRunId;
+				continuationEntry("recovered", `${expectedAttemptId}->${nextAttemptId}`);
+			} else if (requestedGoalRunId) {
+				const descriptorFile = process.env.PRE_RSI_RUN_DESCRIPTOR_FILE;
+				if (descriptorFile) {
+					const goal = await service.goalStatus(requestedGoalRunId, continuationWorkspace(ctx.cwd)) as CurrentGoal;
+					if (goal.executionState) {
+						const descriptor = parseRunDescriptor(JSON.parse(await readFile(descriptorFile, "utf8")));
+						const owner = goal.executionState.attempts.find((item) => item.id === goal.executionState?.activeAttemptId);
+						const actual = await readCurrentProcessIdentity();
+						const sameProcess = (a: typeof actual, b: typeof actual) => a.hostId === b.hostId && a.bootId === b.bootId && a.pid === b.pid && a.processStartToken === b.processStartToken;
+						if (!owner || owner.state !== "running" || descriptor.goalRunId !== requestedGoalRunId ||
+							descriptor.workspaceId !== owner.runDescriptor.workspaceId || descriptor.instanceId !== owner.runDescriptor.instanceId ||
+							!sameProcess(actual, descriptor.process) || !sameProcess(actual, owner.runDescriptor.process)) {
+							throw new Error("当前 Pi 不是 M07 运行中 attempt 的宿主；须使用 fresh host recovery");
+						}
+					}
+				}
+				boundGoalRunId = requestedGoalRunId;
+			}
 			const manager = (ctx as { sessionManager?: { getSessionId?: () => string } }).sessionManager;
 			const id = manager?.getSessionId?.();
 			if (id && existsSync(path.join(ctx.cwd, ".agent"))) {
@@ -234,6 +267,12 @@ mainAgentWatchdog.unref?.();
 				continuationEntry(goal.outcome === "fulfilled" ? "fulfilled" : "stopped", goal.outcome);
 				return;
 			}
+			const execution = summarizeGoalExecution(goal);
+			if (goal.executionState && execution.attemptState !== "running") {
+				continuationHalt = "session-shutdown";
+				continuationEntry("stopped", `attempt-${execution.attemptState}`);
+				return;
+			}
 			const controlStamp = `${goal.runId}:${goal.lifecycle}:${goal.outcome ?? ""}:${goal.updatedAt}:${goal.tasks.length}:${goal.decisions.length}`;
 			if (controlStamp === lastControlStamp && !successfulToolSinceEnd && !inspectionSinceEnd) emptyRounds++;
 			else emptyRounds = 0;
@@ -260,10 +299,16 @@ mainAgentWatchdog.unref?.();
 						let bound: CurrentGoal | undefined;
 						try { bound = await service.goalStatus(boundGoalRunId, continuationWorkspace(ctx.cwd)) as CurrentGoal; }
 						catch { continuationEntry("repair-required", "bound-goal-status-unavailable-at-shutdown"); }
-						if (!bound || bound.lifecycle === "active") {
+						if (!bound) throw new Error("绑定目标状态不可读取；不得猜测目标版本或归档状态");
+						if (bound.lifecycle === "active") {
+							if (bound.executionState && summarizeGoalExecution(bound).attemptState !== "running") {
+								continuationEntry("stopped", `attempt-${summarizeGoalExecution(bound).attemptState}`);
+							} else {
 							const halt = continuationHalt ?? "session-shutdown";
 							continuationEntry("stopped", halt);
-							await service.hostInterrupt({ workspace: continuationWorkspace(ctx.cwd)!, runId: boundGoalRunId, reasonKind: halt });
+							if (bound?.executionState) await service.hostSuspend({ workspace: continuationWorkspace(ctx.cwd)!, runId: boundGoalRunId, reasonKind: halt });
+							else await service.hostInterrupt({ workspace: continuationWorkspace(ctx.cwd)!, runId: boundGoalRunId, reasonKind: halt });
+							}
 						}
 					}
 				} catch (error) {

@@ -3,6 +3,8 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { HarnessError } from "../types.ts";
 import type { ResearchRunV1 } from "./research-types.ts";
+import type { WorkflowRunV1 } from "./workflow-types.ts";
+import type { GenerationBundleV1, GenerationStore } from "./generation.ts";
 
 const SAFE_RUN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 export interface MetaEpisodeV1 {
@@ -69,4 +71,29 @@ export function metaEpisodeForModel(episode: MetaEpisodeV1) {
   decisions: episode.decisions, candidates: episode.candidates, feedbackIndex: episode.feedbackIndex, feedbackExcerpt: episode.feedbackExcerpt,
   feedbackTotal: episode.feedbackTotal, feedbackExcerptCount: episode.feedbackExcerptCount,
   omittedFeedbackCount: episode.feedbackTotal - episode.feedbackExcerptCount, selectedCandidateId: episode.selectedCandidateId, terminal: episode.terminal, usage: episode.usage };
+}
+
+/** The workflow adapter uses the same bounded development episode schema, with no CPU observations. */
+export function buildWorkflowMetaEpisode(run: WorkflowRunV1, bundle: GenerationBundleV1, workspaceRoot: string, terminal: MetaEpisodeV1["terminal"]): MetaEpisodeV1 {
+ const budget = run.developmentBudgetAtSelection as { committed?: { providerCalls?: number; inputTokens?: number; outputTokens?: number; sdkEstimatedCost?: number }; settlement?: string } | undefined;
+ return { version: 1, id: `meta:${run.runId}`, runId: run.runId, workspaceRoot: path.resolve(workspaceRoot), createdAt: new Date().toISOString(), phase: "development", target: "executor",
+  current: { bundleId: bundle.bundleId, executorVersionId: run.baselineExecutorVersionId, improverVersionId: run.improverVersionId, knowledgeSnapshot: run.knowledgeSnapshot, environmentVersion: "m07-workflow/v1", modelConfig: bundle.modelConfig, protocolVersion: bundle.protocolVersion },
+  decisions: run.decisions.map((d) => ({ index: d.index, improverVersionId: d.improverVersionId, kind: d.action, outcome: d.outcome })),
+  candidates: run.candidates.map((c) => { const h = c.hypothesis as { claim: string; predictedObservation: string; falsifier: string; motivatingEvidenceIds: string[] }; return { id: c.versionId, kind: "executor", strategyVersionId: c.versionId, hypothesis: { claim: h.claim, predictedObservation: h.predictedObservation, falsifier: h.falsifier, motivatingEvidenceIds: h.motivatingEvidenceIds }, developmentStatus: c.developmentStatus }; }),
+  feedbackIndex: run.developmentArms.map((arm, index) => ({ id: `workflow:${run.runId}:${index}`, caseId: arm.caseId, status: arm.status, observationCount: arm.checkResults.length })),
+  feedbackExcerpt: [], feedbackTotal: run.developmentArms.length, feedbackExcerptCount: 0,
+  ...(run.selectedCandidateId ? { selectedCandidateId: run.selectedCandidateId } : {}), terminal,
+  usage: { providerCalls: budget?.committed?.providerCalls ?? 0, inputTokens: budget?.committed?.inputTokens ?? 0, outputTokens: budget?.committed?.outputTokens ?? 0, sdkEstimatedCost: budget?.committed?.sdkEstimatedCost ?? 0, costSource: "sdk-estimate", settlement: budget?.settlement ?? "unknown" } };
+}
+
+export async function loadWorkflowMetaEpisode(researchRoot: string, workspaceRoot: string, runId: string, generations: GenerationStore): Promise<MetaEpisodeV1> {
+ if (!SAFE_RUN.test(runId)) throw new HarnessError("improvement.meta-episode", "invalid workflow run ID");
+ const dir = path.join(researchRoot, "workflow-runs", runId), file = path.join(dir, "meta-episode.development.json");
+ if ((await stat(file)).size > 120_000 || (await stat(path.join(dir, "run.json"))).size > 3_000_000) throw new HarnessError("improvement.meta-episode", "workflow development episode exceeds read limits");
+ const value = JSON.parse(await readFile(file, "utf8")) as MetaEpisodeV1;
+ const source = JSON.parse(await readFile(path.join(dir, "run.json"), "utf8")) as WorkflowRunV1;
+ const bundle = await generations.readBundle(source.baselineBundleId);
+ if (value.version !== 1 || value.id !== `meta:${runId}` || value.runId !== runId || value.phase !== "development" || value.target !== "executor" || value.workspaceRoot !== path.resolve(workspaceRoot) || source.runId !== runId || source.kind !== "m07-evidence-handoff/v1" || !source.metaEpisodeIds?.includes(value.id) || !source.developmentBudgetAtSelection || source.knowledgeSnapshot !== bundle.knowledgeSnapshot || !["selected", "no-winner", "inconclusive"].includes(value.terminal) ||
+  JSON.stringify(metaEpisodeForModel(buildWorkflowMetaEpisode(source, bundle, workspaceRoot, value.terminal))) !== JSON.stringify(metaEpisodeForModel(value))) throw new HarnessError("improvement.meta-episode", "workflow episode does not match its same-workspace development source");
+ return value;
 }

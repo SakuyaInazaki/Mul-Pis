@@ -1,0 +1,10 @@
+# M07 feedback and shutdown archival repair
+
+This batch fixes the failure mode where an over-budget M07 feedback package made `interrupt` throw before `goal.json` was saved, while the Pi service separately marked `run.json` failed. It does not alter any historical run or task artifact.
+
+- `finish` keeps the original goal acceptance checks and frozen feedback budget. When only the final control-facts package exceeds `maxFeedbackChars`, it writes an explicitly incomplete index within the same cap. The full task log and goal checks remain in `goal.json`; M04's existing `m07_evidence_read` can read that file in pages from the M07 run root. Other policy failures and I/O errors still fail the finish.
+- `interrupt` persists `goal=finished/blocked` and `run=failed` before attempting feedback. A full feedback failure produces a bounded control-facts-only index and a machine-readable feedback status/error. If the index also fails, both records remain terminal, the goal says `feedbackStatus=failed` and the run has no feedback output. A failure to persist the two terminal records raises `m07.archive-repair-required` for explicit repair.
+- Pi service no longer marks only the run failed when controller archival throws. It retains the exact goal registration and propagates a repair-required error.
+- The fallback index states omitted categories and references `goal.json` and frozen evidence paths. Neither the index nor path existence means M04 has read or independently verified the omitted material.
+
+Offline validation: `node --test test/m07.test.ts test/pi-lifecycle.test.ts` passed 33/33. A later narrow `node --test test/m07.test.ts` passed 31/31 after adding an actual `m07_evidence_read` tool execution with an offline Pi runner stub: two adjacent `goal.json` pages were returned, including the complete 6000-character saved tool-log value on the second page, and the read-return events recorded only those ranges. No provider call was made. `npm run typecheck` passed after the concurrently edited Pi continuation test was stabilized. No real model, network, submission, or live Pi session was run.

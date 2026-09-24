@@ -91,3 +91,20 @@ test("completed runs with failures are warnings and telemetry never exposes payl
 	assert.equal(node.failureCount, 1);
 	assert.doesNotMatch(JSON.stringify(state), /private failure details|toolArgs|token/);
 });
+
+test("dashboard exposes a suspended M07 attempt even when the run and telemetry remain running", async () => {
+	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-dashboard-m07-attempt-"));
+	const ws = new Workspace(root);
+	const run = await ws.startRun("M07", []);
+	await writeFile(path.join(ws.runDir("M07", run.runId), "goal.json"), JSON.stringify({ runId: run.runId, lifecycle: "active", tasks: [{ taskId: "T001", status: "unknown" }], executionState: { version: 1, activeAttemptId: "A001", attempts: [{ id: "A001", state: "recovery-required" }], operations: [{ id: "O001", status: "unknown" }] } }));
+	const live = await TelemetryWriter.start(root, { id: "stale-owner", kind: "agent", label: "stale owner", role: "execution", model: "fake/live", tools: [] });
+	await live.setRunContext("M07", run.runId);
+	const state = await readDashboardState(ws, { now: new Date(), freshnessMs: 60_000 });
+	const node = state.nodes.find((item) => item.id === `stage:M07:${run.runId}`)!;
+	assert.equal(node.attemptId, "A001");
+	assert.equal(node.attemptState, "recovery-required");
+	assert.deepEqual(node.unresolvedOperationIds, ["O001"]);
+	assert.deepEqual(node.unresolvedTaskIds, ["T001"]);
+	assert.equal(node.status, "unknown", "fresh session telemetry cannot turn a stopped attempt into an active M07 stage");
+	await live.end();
+});

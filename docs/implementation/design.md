@@ -73,7 +73,7 @@ M07 投影事件在 `taskMessage` 和 `writeFeedback` 的真实决策点逐调�
 
 - 模型选择与路由、并发数、预算：由 `research.config.json` 决定，harness 无默认。
 - M05：browser-use 需在配置中指定模型与对应 API 密钥；当前 wrapper 只接 OpenAI/Anthropic，并新建无既有 profile/login state 的 headless `BrowserSession`，尚未接入用户已有浏览器会话或凭据管理，不能据此假定登录站点普遍可用。它会在同一浏览器任务会话内逐步保存发生变化的 DOM、正文、截图和下载，失败或超时前的有效文件仍保留；`result.md` 是浏览器模型报告，不能登记为外部原始材料。每个实际材料文件可记录 URL、标题、取得时间、内容类型、材料类型和派生关系。默认上限为 20 个页面状态、12 张截图、HTML 合计 5 MB、正文合计 2 MB、登记入材料的下载合计 250 MB；该下载上限不是浏览器写盘的硬配额。触限会明确警告，因此成功也不等于材料完整。Brave 密钥可选；DuckDuckGo HTML 没有可靠的 API 翻页实现，可改用浏览器继续。所有站点与论坛都只按本轮任务保存所需范围，不自动递归取得全部帖子，也不保证任意网站均能取得。Crawl4AI 与 browser-use 不运行本地模型；PDF 页面图像要求 reader/checker 角色使用多模态模型，长材料分块仍未实现。
-- M07 通过显式 Pi extension 接入，但每次工具调用仍同步等待完成，没有 detached/异步 job、断线后自动重跑或进程重启后的 running 任务续跑。显式配置的非交互 continuation 只对绑定工作区与 M07 runId 生效：普通 `agent_end` 若目标仍 active，会在同一 Pi prompt 中排队下一回合；若持久控制器证实 `fulfilled` 才正常停止。未启用的状态查看不自动拾取旧目标；用户中止、provider 错误或重复无进展会停止续接并记录未完成原因，不能靠 final/checkpoint 冒充完成或无界热循环。受控 `research_goal action=interrupt` 将仍在 running 的任务记为 failed，目标以 blocked 收口；反馈异常时写有界控制事实索引，若索引也失败则显式 `repair-required`，不能称完整科学交接。取消会传到 Pi 会话；SDK abort 的失败会作为失败报告，已有外部 HTTP/browser 工具是否即时停下取决于其自身 signal 支持，不能承诺所有外部动作瞬停。M07 execution 会话禁止 resume，避免后续无声扩大工具范围；目标状态可恢复查看，已结束目标不能自动重跑。
+- M07 通过显式 Pi extension 接入，每次工具调用仍同步等待完成，没有 detached/异步 job、断线后自动重跑或运行中 execution 会话重放。显式配置的非交互 continuation 只对绑定工作区与 M07 runId 生效：普通 `agent_end` 若目标仍 active，会在同一 Pi prompt 中排队下一回合；若持久控制器证实 `fulfilled` 才正常停止。未启用的状态查看不自动拾取旧目标；用户中止、provider 错误或重复无进展会停止续接并记录未完成原因，不能靠 final/checkpoint 冒充完成或无界热循环。旧版目标的受控 `research_goal action=interrupt` 仍将 running 任务记为 failed、目标 blocked 归档；反馈异常时写有界控制事实索引，若索引也失败则显式 `repair-required`。取消会传到 Pi 会话；已有外部 HTTP/browser 工具是否即时停下取决于其自身 signal 支持，不能承诺所有外部动作瞬停。M07 execution 会话禁止 resume，目标状态可恢复查看，已结束目标不会自动重跑。
 - 科研方法开发当前只覆盖列出的仿射/二次 CPU 响应假设的主动辨识。初始观测不足以判断真值时不能凭猜中通过；每个实验臂 fork 初态，开发反馈不含私有答案，受保护检查只由控制器持有。元改进的两个搜索臂从同一冻结 H/K、同一有界经验包与独立开发环境起步；全部后继选择先于 G 固定。受控 I/H 子会话为无通用工具的新会话，只接白名单开发输入，G 结果不回灌；主 Pi 若持有普通 read/bash 权限，同机私有案例并无 OS 级密封，不能把子会话上下文隔离夸大为全主 agent 保密。有界 `MetaEpisode` 只由 G 前的开发决定构造，后续显式按同工作区 run ID 加载，不能作为保护集结果。证据不足时合理报告未定可作为部分质量记录，不能冒充完整解题；也不能把合理停止和猜错混作同一失败。坐标统一按案例公开单位解释，单位不匹配归因、其他环境族、外部异步任务恢复、长期课程迁移、源代码候选执行与真正的 OS 代码沙箱没有实现。经验的选中或进入提示不自动证明忠实执行、知识正确或因果收益。
 - I 的每次决策视图含控制器计算的剩余决策、候选、inspect 次数和 readback 字符额度，以及上一动作的真实执行/拒绝回执。最后一次决策仍由 I 自行选择有支持的候选或明确无赢家 stop；若把最后一次用于其他动作，搜索按预算耗尽记为 `inconclusive`，不冒充自愿的 `no-winner`。运行保留原 `status`，并在可准确判断时附带可选 `outcome` 分类；这只说明本地流程终态，不认证科研收益。
 - M07 可在新目标 begin 时显式冻结活跃的 `m07-workflow-prompt` H 版本与知识快照。`research-check` 和 `evidence-handoff` 是限定槽位，CPU 数值策略不能作为工作流方法；版本正文进入实际委派任务提示，交接槽位还在固定反馈中向 M04 表明使用的版本与适用限制，不能改写原目标、mandatory checks 或工具许可。已有目标不热替换，新的任务调用重查必要引用；已装载不等于行为忠实或收益已验证。
@@ -82,10 +82,11 @@ M07 投影事件在 `taskMessage` 和 `writeFeedback` 的真实决策点逐调�
 - 非交互限制：print/json 单次模式不能收集用户回答；`research_goal decision request` 必须拒绝。普通有界目标保留现有 partial/blocked 回流语义；显式 continuous 目标则由宿主在 begin 时冻结执行契约，模型不能仅凭 `stopReason` 枚举、limitations 文本、候选失败或本地工具缺失调用非 fulfilled finish，也不能直接 interrupt。真实请求中止、provider 故障、无进展及会话异常由控制器内部宿主通道按实际类别留未完成记录；SDK 的 aborted 不自动等于用户明确停止。只有受信的用户控制或目标范围内必要依赖故障证据才能在将来的对应宿主入口记为那类停止事实。
 - 运行中 continuous M07 的负结果通过 `research_goal checkpoint` 形成控制器冻结的有界目标/反馈视图，返回精确 `checkpointId`；目标仍 active、原成功标准不变。默认冻结全部已评审任务，也可显式给出非空、去重、属本目标的 `taskIds` 分批冻结本轮证据；反馈与清单说明未选任务，不能把局部快照称作全文交接，原 goal 历史仍保留。M04 必须显式传 `feedbackStage=M07`、`feedbackRunId` 与 `feedbackCheckpointId` 才能读取该运行中目标的固定视图，普通 `{kind:'M07'}` 仍不读取 running 记录。M04 完成后，同一目标可用 `research_goal plan` 的 `refreshBaseline=true`、`checkpointId` 和完成的 `m04RunId` 请求显式刷新；控制器核对反馈来源和当前方法/知识绑定，不能暗换 H 或把 checkpoint 当完成。若失败，保持原目标与基线，不以科学负结果冒充外部依赖阻塞。
 - 显式持续执行：仅调用方为非交互主 Pi 会话设置 `PRE_RSI_CONTINUATION_WORKSPACE` 时启用，可再用 `PRE_RSI_CONTINUATION_GOAL_RUN_ID` 指定该工作区的既有 M07 目标；本会话成功调用 `research_goal begin` 时才承接新目标。已有绑定目标仍 active 时不能再次 begin 覆盖它，目标变更也必须指向绑定 workspace/runId；普通只读状态调用、其他工作区及未启用会话不自动续跑。每次 `agent_end` 读取绑定目标的持久状态；未完成且无模型错误或中止时，经 Pi 原生 follow-up 队列在同一次 prompt 内继续回合，科研步骤仍由工作流决定；已证实 fulfilled 或真实宿主归档才正常停止。完全相同控制状态下反复没有新持久任务/阶段记录或新成功读取的空回合，会留下 `research_continuation` 未完成诊断并停止，避免无进展热循环；这不是总请求、墙钟或内存额度。异常退出只针对绑定目标受控归档，且不会把单个 print 回合自然结束视为用户停止或归档其他目标。此机制不自动恢复进程崩溃，也不选择新题目或改变目标成功条件。
-- 工作流控制：`npm run workflow:control -- status|pause|resume|stop --pid-file <run.pid>` 提供进程级暂停、恢复与停止。`pause`/`resume` 使用 SIGSTOP/SIGCONT；暂停期间 top-level watchdog 与子会话 watchdog 会把异常长的计时器间隔视为暂停而不是无进展。长时间暂停后 provider/transport 可能已断开，恢复不保证继续同一请求；SIGKILL 或进程崩溃仍不保证收口。
-- 监控仍在写入的 JSONL 主日志时，只读取固定大小的末尾片段，例如 `tail -c 65536 <main.jsonl>`，并给监控命令设置超时；不要对增长中的文件全量 stream 或等待 EOF。私有 launcher 的累计日志上限、日志轮转、run.pid 注册、外部通道健康与主模型启动参数属于其独立控制面；使用该控制面启动前要核对这些值与工作区配置，不能把仓库内的 `workflow:control` 当作跨控制面的统一发现器。
+- 工作流控制：`npm run workflow:control -- status|pause|resume|stop --descriptor <run-descriptor.json>` 使用共享运行描述符；`--pid-file <run.pid>` 仅用于定位同目录描述符，数字 PID 本身不授权控制。`status` 分开报告 stored declaration、live observation 与 identityMatch；组长退出后仍扫描该进程组的成员，但未登记的成员身份只作观察，不自动发信号。控制命令核对 host、boot、微秒级（Darwin）或启动 tick（Linux）出生标识，以及独立进程组和同实例控制状态；未知身份拒绝控制。独占控制锁阻止两个 pause/resume 同时改状态，残锁保留供核对。可信 pause/resume 累计暂停时间；普通 event-loop 延迟不扣除 watchdog 时间。主 Pi 心跳不代表模型、工具或持久科研进展。长时间暂停后 provider/transport 可能已断开，不能承诺恢复同一请求。
+- 新版 M07 目标将科研目标和执行尝试分开：新目标冻结 A001 的运行描述符，宿主 `hostSuspend` 保持 goal/run active，写入小型 `control-checkpoints/Axxx.json` 恢复索引；它不代表 M04 科学检查已完成。显式新 Pi 会话的 `hostRecover` 核对旧尝试、目标与知识绑定和新进程身份，建立 A(next)，不续接旧 execution session。旧 blocked 目标只可通过显式 successor 保留原记录及冻结要求。未决或未知外部操作阻断 execute，受信 operator 提供的有限对账回执也不等于远端真实性证明。optional observer 故障不能改写目标终态；必要证据写入失败仍须如实停止受影响工作。进程崩溃时若未能持久写入 checkpoint，仍需人工修复，不能声称自动重放。
+- 监控增长中的 JSONL 主日志只读取固定 fd 和固定大小的片段，报告截断，不等待 EOF。现有私有 launcher 将活动主日志按可配置的单段额度轮转并保留历史；全局磁盘余量是独立保护。它登记实际 Pi 子进程的运行描述符及现有监控发现入口，支持显式 fresh recovery 预检；不提供自动真实目标重启。外部通道尚无稳定只读健康接口，真实模型/通道仍需独立检查。监控进程退出或超时不能借资源清理杀掉独立研究 worker。
 - M08/M09 当前按已授权的暂定流程实现；真实 reviewer 数量、模型组合、预算和领域检查策略仍由工作区配置与调用方决定。M08 完成不等于科研通过；M04 的 `m08-disposition` 可能是 partial/rework/needs_evidence/unresolved，只有 ready/partial、明确列出 deliverable paths 且本会话实际访问相应固定材料才可进入 M09。M09 在生成 running facts 后再次执行最终知识限制检查，再写收口；这缩小同进程检查窗口，但不构成跨进程原子事务。M09 不自动公开、投稿、外发、压包、启动下一目标或 RSI，也不把 `full-recomputation` 请求写成完整复现已验证。
-- 知识库合入有锁文件保护；超过 10 分钟的残锁会报错并保留，不能仅凭年龄自动覆盖。操作员须先检查 `.merge.lock` 的 owner PID、创建时间及对应进程状态，确认原合入进程已经结束后才可手动移除该确切锁文件并重试；若无法确认则继续 fail closed。M07 service 的工作区 mutation 互斥只覆盖当前 Pi 进程，不能声称是跨进程任务锁，多机协调不在范围。
+- 知识库合入保留独占 `.merge.lock` 和冻结的 `prepared/committed` 合入意图。同 host/boot 且可确认旧 owner 已死亡时，受控恢复使用独占 recovery gate 接管，并保留旧锁；live、PID 复用、权限不足、跨 host 或旧 PID-only owner 均 fail closed，不能按年龄清锁。合入在 CURRENT 前先写保守限制，CURRENT 后据冻结意图补齐 result，不重做知识 ID；旧版无意图的残留快照要求人工对账。M07 service 的工作区 mutation 互斥只覆盖当前 Pi 进程，多机协调仍不在范围。
 - 已进行一次真实题目的主 Pi 工作流试跑并取得局部阶段结果，但试跑暴露了控制、知识提案与 M09 交付协议缺口，且没有严格完整通过 M01–M09；它不能作为通用科研效果或完整流程已验证的证据。方法开发切片另有小规模真实 H 与 I 动作链的 `development` 试跑，证明环境接线可运行；I 未选出新后继，不构成 H/I 成对准入、结构化 L5 或科研收益证据。离线自动测试使用脚本化假会话与真实文件存储。
 
 ## 6. 运行入口
@@ -112,6 +113,35 @@ pi -e ./extensions/research.ts                         # 显式加载主会话�
 
 Pi extension 注册 `research_status`、`research_init`、`research_stage`、`research_goal`、`research_delegate`、`research_review` 与独立的 `research_improve`，并提供 `/research status [workspace]` 与 `/research off`。bootstrap、`research_status`、`research_init` 和 M07 `status` 只准备或查看状态，不激活 P07；第一次成功的实质阶段、目标变更、委派或验收操作才在当前 Pi session 和对应 cwd 上激活。`research_improve` 使用自己的状态与锁，不自动进入或改写 P07 科研目标。激活后，主 Pi 的工具调用限于 `research_*` 编排工具以及 read/grep/find/ls 只读检查，其他工具由 extension 阻断；实现、平台操作和其他副作用应进入有界 M07 任务。失败调用不激活，切换 session 或 cwd 不继承，`/research off` 可显式停用。extension service 对同一失败类别和同一受控义务的重复阶段调用作有限阻断；改变纳入指纹的实际输入、证据、scope、配对 run 或授权命令计划才形成新义务。接收者/用途的自由文本刻意不参与指纹，避免通过改写措辞绕过阻断；若它们发生实质变化，调用方须用新的有效处置或输入表达新的交付义务。该保护只覆盖经 `ResearchService.runStage` 的 extension 路径，当前 CLI 仍直接调用各阶段函数，因此不具备这项重试保护。正常 `session_shutdown` 会让拥有当前 stage 操作的 service 按其在该 workspace 中已经登记的全部精确 stage/runId，把仍为 running 的 run 记为 failed，晚返回不能再覆盖成 completed；M08 显式转交 M04 时两个 run 都可被登记。M07 `research_delegate` 不经过 `runStage`，因此目前不在这项 shutdown run 记录机制内。SIGKILL、进程崩溃、跨进程恢复和自动重放同样不在保证内。它不调用 `setModel`，因此不会替换用户当前主会话模型。只有会新建阶段、任务或改进提议模型会话的操作才读取 `research.config.json` 对应角色模型并在缺配置时拒绝；目标状态、验收和改进状态查看等非模型操作可在没有模型配置时执行。
 
-上述 `runStage` 归档机制与 M07 目标归档是两条不同路径。`research_delegate` 不属于阶段操作，但 service 会单独登记本实例创建或操作的精确 M07 runId；显式绑定的非交互会话异常终止时只对该目标执行受控中断。反馈生成失败仍保留 `goal.json` 与 run 状态并报告修复需要，不能因为打印模式结束就把普通回合标成用户停止。
+上述 `runStage` 归档机制与 M07 目标状态是两条不同路径。`research_delegate` 不属于阶段操作，但 service 会单独登记本实例创建或操作的精确 M07 runId；显式绑定的非交互会话异常终止时仅处理该目标。新版 attempt 状态可由宿主形成 suspend 和控制恢复索引，旧版目标仍走 blocked 中断归档。反馈生成失败保留 `goal.json` 与 run 状态并报告修复需要，不能因为打印模式结束就把普通回合标成用户停止。
 
 M05 的外部工具：`scripts/setup-tools.sh` 建立 `.venv` 并安装 Crawl4AI、browser-use 与 Playwright Chromium headless shell（不含任何本地 ML 模型，不需要 Docker）；检索来源可用 `tools.searchProviders` 限定为默认集合的子集，`tools.braveApiKey` 可选；`tools.browserUseModel` 指定 browser-use 的模型后交互式抓取才可用；PDF 只依赖本机 poppler（pdftotext、pdftoppm、pdfinfo），`tools.pageImageDpi` 可调页图分辨率（默认 110）。Python 工具缺席时网页抓取退化为纯 HTTP 并记录实际引擎；公共 HTTP 搜索与 PDF 工具按各自依赖继续工作。
+
+## 恢复包回归规格对照
+
+下表对应恢复包的 22 项待验收规格。状态仅说明本仓库截至本批的工程验证；真实模型与完整科研链尚未运行，不能将局部测试写成项目验收。
+
+| 规格 | 当前对应验证 | 状态 |
+| --- | --- | --- |
+| REC-01 默认停滞计时 | `test/runtime-watchdog.test.ts` 虚拟默认 30 秒 | 离线通过 |
+| REC-02 显式暂停 | `test/runtime-watchdog.test.ts`、`test/runtime-control.test.ts` | 离线通过 |
+| REC-03 状态身份 | `test/runtime-control.test.ts` 实际控制脚本 | 离线通过 |
+| REC-04 observer 隔离 | `test/runtime-observer.test.ts` 本地独立 worker | 离线通过；真实 launcher 事故链待验 |
+| REC-05 历史日志限额 | 私有 launcher 离线检查及分段写入 | 离线通过；长时运行待验 |
+| REC-06 全局磁盘不足 | 私有 launcher 保留磁盘余量硬保护 | 停前科研 checkpoint 待验 |
+| REC-07 有界日志读取 | 私有 launcher 离线尾读检查 | 离线通过 |
+| REC-08 wrapper 退出后子树 | `test/runtime-control.test.ts` 真实本地孤儿进程 | 离线通过；子进程身份仍为未知 |
+| REC-09 活 owner 不抢锁 | `test/knowledge/merge-recovery.test.ts` | 离线通过 |
+| REC-10 死 owner 与竞争 | `test/knowledge/merge-recovery.test.ts` | 离线通过 |
+| REC-11 CURRENT 后恢复 | `test/knowledge/merge-recovery.test.ts` 故障注入 | 离线通过 |
+| REC-12 限制持续 | `test/knowledge/merge-recovery.test.ts` | 离线通过 |
+| REC-13 目标与进程分离 | M07 显式 attempt/suspend/recover 工程测试 | 局部离线；真实目标待验 |
+| REC-14 未知外部副作用 | M07 operation 对账工程测试 | 局部离线；远端实际状态待验 |
+| REC-15 模型角色合同 | 私有 launcher 离线预检 | 离线通过；真实 provider 待验 |
+| REC-16 科学负结果 | 既有 M07 checkpoint/M04 测试 | 局部离线；科研判断待验 |
+| REC-17 旧目标 successor | M07 显式 successor 工程测试 | 局部离线；旧目标真实恢复待验 |
+| RSI-01 非干扰 | 工作流方法边界测试 | 局部离线；完整 serve 路径待验 |
+| RSI-02 workflow H 适配 | `test/workflow-evidence-handoff.test.ts` | 局部离线；真实模型待验 |
+| RSI-03 I 真实重入 | 无真实新 I 后继回合 | 未运行 |
+| RSI-04 匹配元比较 | 现有 meta 评价结构测试 | 局部离线；真实独立重复待验 |
+| RSI-05 无赢家 | 现有研究服务本地终态测试 | 局部离线；真实搜索待验 |

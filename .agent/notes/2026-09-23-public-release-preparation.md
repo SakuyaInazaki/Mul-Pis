@@ -1,0 +1,9 @@
+2026-09-23 public release preparation (local, ignored)
+
+- Read docs/github-push-policy.md. Prepared the existing L5 engineering changes plus continuous-goal stop and checkpoint feedback changes; no commit or push performed in this preparation turn.
+- Staged exactly 34 public regular files: 2 root guidance/README files, 2 docs files, 22 src files, and 8 test files. No unstaged publishable change remained at preparation time; no private/local directories were staged.
+- Simulated indexed public tree contains 164 paths and no forbidden private/workspace/resource/third-party path or nested Git metadata. Remote notes tree contains only .agent/notes/.gitignore.
+- Scanned staged files and complete indexed tree for machine absolute paths, credential literals/fields, emails, platform-specific task identifiers and scores, and private record references. Staged hits were policy/documentation references to ignored directories and one clearly fake offline provider credential in a test. No actual credential, machine path, platform task material, score, submission data, or personal identity was found in the staged changes. The preexisting full tree contains generic push-policy forbidden-term examples and a browser test fixture email; neither is a new staged addition.
+- Staged diff whitespace check passed. All 34 staged entries are regular 100644 files. Local HEAD, tracking origin/main, and live remote main matched at preparation time; ordinary fast-forward push remains possible if no later remote change occurs.
+- Final validation was reported by the main agent's capable environment as typecheck success and 259/259 offline tests; this release-preparation agent did not rerun tests or touch the running Pi session.
+- Proposed public-safe commit message: Strengthen bounded research methods and continuous goal feedback.

@@ -15,7 +15,7 @@ import type { SessionRunner } from "../runner/types.ts";
 import { HarnessError } from "../types.ts";
 import { nowIso, Workspace, writeFileAtomic } from "../workspace.ts";
 import { runExecutorEpisode, runExecutorQualityAdmission } from "./executor-eval.ts";
-import { GenerationStore, isCpuExecutorStrategy, type ExperienceRequirementV1, type GenerationBundleV1, type ImproverStrategyV1, type StrategyRecordV1, validateExperienceRequirements, validateStrategy } from "./generation.ts";
+import { GenerationStore, isCpuExecutorStrategy, isM07WorkflowStrategy, type ExperienceRequirementV1, type GenerationBundleV1, type ImproverStrategyV1, type M07WorkflowStrategyV1, type StrategyRecordV1, validateExperienceRequirements, validateStrategy } from "./generation.ts";
 import { advanceKnowledgeEpochInLock, transitionMethodKnowledgeDependenciesInLock } from "./knowledge-epoch.ts";
 import { bindMethodPackageV2, exportMethodPackageV2, readMethodPackageV2 } from "./method-v2.ts";
 import { buildMetaEpisode, loadMetaEpisode, metaEpisodeForModel, metaEpisodePath, type MetaEpisodeV1 } from "./meta-episode.ts";
@@ -23,11 +23,13 @@ import { runMetaImprovementAdmission, type ProducedSuccessorV1 } from "./meta-ev
 import { decisionPrompt, fullyReadDevelopmentFeedbackIds, improverSystemPrompt, validateResearchAction, type ResearchCaseViewV1, type ResearchDecisionViewV1, type ResearchInspectionRequestV1, type ResearchInspectionResultV1 } from "./policy-host.ts";
 import { runBoundedModelStep } from "./research-model.ts";
 import { validateResearchPlan, type ResearchCampaignPlanV1, type ResearchCandidateV1, type ResearchDecisionRecordV1, type ResearchRunV1 } from "./research-types.ts";
+import { runWorkflowEvidenceHandoff } from "./workflow-adapter.ts";
+import { validateWorkflowPlan } from "./workflow-types.ts";
 
 const activeMutations = new Set<string>();
 const RUN_ID = () => `${new Date().toISOString().replace(/[-:.]/g, "")}-${randomBytes(3).toString("hex")}`;
 export interface ResearchServiceOptions { workspaceRoot: string; runner: SessionRunner; registeredExperienceStores?: ReadonlyMap<string, KnowledgeStore> }
-export interface ResearchBootstrapInput { version: 1; executor: ExecutorStrategyV1; improver: ImproverStrategyV1; applicability: string[] }
+export interface ResearchBootstrapInput { version: 1; executor: ExecutorStrategyV1 | M07WorkflowStrategyV1; improver: ImproverStrategyV1; applicability: string[] }
 type SearchResult = { selected?: ResearchCandidateV1; selectedAt?: string; decisionCount: number; status: "selected" | "no-winner" | "inconclusive"; stopReason?: string };
 
 /** Recheck pinned necessary experience before every new child invocation and pointer transition. */
@@ -134,6 +136,8 @@ export class ResearchImprovementService {
    if (!input || input.version !== 1 || !Array.isArray(input.applicability) || input.applicability.length > 16 || input.applicability.some((x) => typeof x !== "string" || !x.trim() || x.length > 240)) throw new HarnessError("improvement.bootstrap", "invalid explicit human seed");
    if (await this.store.active()) throw new HarnessError("improvement.bootstrap", "research generation already active");
    const executor = validateStrategy("executor", input.executor), improver = validateStrategy("improver", input.improver);
+   const workflow = isM07WorkflowStrategy(executor);
+   if (workflow && (executor.slot !== "evidence-handoff" || !input.applicability.includes("M07"))) throw new HarnessError("improvement.bootstrap", "workflow bootstrap supports only the M07 evidence-handoff slot");
    const config = await this.ws.loadConfig();
    const models = { improver: resolveRoleModel(config, "improver"), research: resolveRoleModel(config, "research") };
    const knowledge = createFileKnowledgeStore(this.ws.knowledgeDir); await knowledge.init();
@@ -141,7 +145,7 @@ export class ResearchImprovementService {
    const h = await this.store.writeStrategy({ versionId: this.store.newId("H-human"), kind: "executor", artifact: executor, origin: "human-seed", applicability: input.applicability, limitations: [], state: "manual-active" });
    const i = await this.store.writeStrategy({ versionId: this.store.newId("I-human"), kind: "improver", artifact: improver, origin: "human-seed", applicability: input.applicability, limitations: [], state: "manual-active" });
    const bundle = await this.store.writeBundle({ bundleId: this.store.newId("bundle"), parents: [], executorVersionId: h.versionId, improverVersionId: i.versionId, knowledgeSnapshot,
-    environmentVersion: "cpu-response-identification/v1", modelConfig: models, protocolVersion: "research-protocol/v1", allowedCapabilities: ["cpu-probe", "no-tools-model"], state: "manual-active" });
+    environmentVersion: workflow ? "m07-workflow/v1" : "cpu-response-identification/v1", modelConfig: models, protocolVersion: "research-protocol/v1", allowedCapabilities: workflow ? ["m07-evidence-read", "no-tools-model"] : ["cpu-probe", "no-tools-model"], state: "manual-active" });
    await this.store.activate(bundle.bundleId, undefined, "human-seed", `bootstrap-${RUN_ID()}`);
    return bundle;
   });
@@ -156,7 +160,7 @@ export class ResearchImprovementService {
  }); }
  async exportMethod(versionId: string, outputPath: string) {
   const active = await this.store.active();
-  const scope = active?.bundle.executorVersionId === versionId && active.pointer.provenance === "local-executor-admission" ? "local-executor-quality" : active?.bundle.improverVersionId === versionId && active.pointer.provenance === "local-meta-admission" ? "local-meta-improvement" : "research-only";
+	 const scope = active?.bundle.executorVersionId === versionId && active.pointer.provenance === "local-executor-admission" ? "local-executor-quality" : active?.bundle.executorVersionId === versionId && active.pointer.provenance === "local-workflow-handoff-admission" ? "local-workflow-handoff-mechanism" : active?.bundle.improverVersionId === versionId && active.pointer.provenance === "local-meta-admission" ? "local-meta-improvement" : "research-only";
   return exportMethodPackageV2(this.store, versionId, scope, outputPath);
  }
  async bindMethod(packagePath: string) { return this.withMutation(async () => { const active = await this.store.active(); if (!active) throw new HarnessError("improvement.generation", "bootstrap research generation first");
@@ -165,6 +169,8 @@ export class ResearchImprovementService {
   await verifyRequiredKnowledge(this.ws.root, pkg.requiredKnowledgeRefs, active.bundle.knowledgeSnapshot, this.registeredExperienceStores);
   return bindMethodPackageV2(this.store, packagePath, active, `manual-bind-${RUN_ID()}`); }); }
  async run(input: unknown): Promise<ResearchRunV1> { const plan = validateResearchPlan(input); return this.withMutation(() => this.runUnlocked(plan)); }
+ /** Explicit M07 method study. It cannot be reached from normal research or M07 begin. */
+ async runWorkflow(input: unknown) { const plan = validateWorkflowPlan(input); return this.withMutation(() => runWorkflowEvidenceHandoff({ ws: this.ws, store: this.store, runner: this.runner, plan })); }
 
  private async runUnlocked(plan: ResearchCampaignPlanV1): Promise<ResearchRunV1> {
   const active = await this.store.active(); if (!active) throw new HarnessError("improvement.generation", "bootstrap a human-seeded research generation first");

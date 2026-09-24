@@ -1,2 +1,7 @@
+# Project change notes may be published after the public-release review.
+# Only Markdown notes are candidates; attachments and nested raw material stay local.
 *
+!*.md
 !.gitignore
+*.local.*
+*.private.*
