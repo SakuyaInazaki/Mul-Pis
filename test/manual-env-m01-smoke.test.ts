@@ -6,14 +6,16 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { MAX_CNY_ESTIMATE, MAX_INPUT_PAYLOAD_BYTES, MAX_OUTPUT_TOKENS, MAX_PLANNING_CNY, MODEL_PROFILE, SMOKE_MODEL, assertPreflight, publicUsageFromSidecar, safeFailure } from "../scripts/manual-env-m01-smoke.ts";
+import { MAX_CNY_ESTIMATE, MAX_INPUT_PAYLOAD_BYTES, MAX_OUTPUT_TOKENS, MAX_PLANNING_CNY, MODEL_PROFILE, OBSERVED_OUTPUT_MARGIN_TOKENS, SMOKE_MODEL, assertPreflight, publicUsageFromSidecar, safeFailure } from "../scripts/manual-env-m01-smoke.ts";
 import { HarnessError } from "../src/types.ts";
 
 test("public M01 smoke has a conservative single-call planning ceiling", () => {
   assertPreflight();
   assert.equal(SMOKE_MODEL, "deepseek/deepseek-flash:low");
   assert.equal(MAX_INPUT_PAYLOAD_BYTES, 12_000);
-  assert.equal(MAX_OUTPUT_TOKENS, 2_048);
+  assert.equal(MAX_OUTPUT_TOKENS, 8_192);
+  assert.equal(OBSERVED_OUTPUT_MARGIN_TOKENS, 32);
+  assert.equal(Number(MAX_PLANNING_CNY.toFixed(4)), 2.0224);
   assert.ok(MAX_PLANNING_CNY <= MAX_CNY_ESTIMATE);
   assert.ok(MAX_CNY_ESTIMATE < 30);
 });
@@ -48,6 +50,7 @@ test("observed SDK usage prints only whitelisted scalars and rejects incomplete 
   assert.throws(() => publicUsageFromSidecar({ ...row, summary: { ...row.summary, complete: false } }));
   assert.throws(() => publicUsageFromSidecar({ ...row, summary: { ...row.summary, cost: undefined } }));
   assert.throws(() => publicUsageFromSidecar({ ...row, events: [] }));
+  assert.throws(() => publicUsageFromSidecar({ ...row, summary: { ...row.summary, output: MAX_OUTPUT_TOKENS + OBSERVED_OUTPUT_MARGIN_TOKENS + 1 } }));
 });
 
 test("live-failure diagnostics reveal only whitelisted code, status and numeric usage", () => {

@@ -13,14 +13,17 @@ import { Workspace } from "../src/workspace.ts";
 
 export const SMOKE_MODEL = "deepseek/deepseek-flash:low";
 export const MAX_INPUT_PAYLOAD_BYTES = 12_000;
-export const MAX_OUTPUT_TOKENS = 2_048;
+export const MAX_OUTPUT_TOKENS = 8_192;
+// The provider reported 2,049 output tokens for a 2,048-token request cap in
+// the diagnostic run. Reserve a little extra for accounting variance.
+export const OBSERVED_OUTPUT_MARGIN_TOKENS = 32;
 export const MAX_PROVIDER_CALLS = 1;
-export const MAX_CNY_ESTIMATE = 1.5;
+export const MAX_CNY_ESTIMATE = 2.1;
 // An intentionally pessimistic planning rate, not a billing guarantee.
 const USD_PER_MILLION_TOKENS_CEILING = 10;
 const CNY_PER_USD_CEILING = 10;
 export const MAX_PLANNING_CNY =
-  ((MAX_INPUT_PAYLOAD_BYTES + MAX_OUTPUT_TOKENS) * USD_PER_MILLION_TOKENS_CEILING / 1_000_000) * CNY_PER_USD_CEILING;
+  ((MAX_INPUT_PAYLOAD_BYTES + MAX_OUTPUT_TOKENS + OBSERVED_OUTPUT_MARGIN_TOKENS) * USD_PER_MILLION_TOKENS_CEILING / 1_000_000) * CNY_PER_USD_CEILING;
 
 export interface PublicUsage {
   provider: "deepseek";
@@ -122,6 +125,9 @@ export function publicUsageFromSidecar(raw: unknown): PublicUsage {
   }
   const cost = summary.cost;
   if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) throw new Error("SDK cost estimate is missing");
+  if (count(summary.output) > MAX_OUTPUT_TOKENS + OBSERVED_OUTPUT_MARGIN_TOKENS) {
+    throw new Error("observed output exceeded accounting reserve");
+  }
   return {
     provider: "deepseek", model: "deepseek-flash", observedAssistantEvents: 1,
     inputTokens: count(summary.input), outputTokens: count(summary.output),
@@ -210,7 +216,7 @@ async function run(): Promise<void> {
     }
     const runner = boundedStageRunner(runtime, controller.signal);
     const sdkEstimate = await runner.estimateMaxSdkCost?.(SMOKE_MODEL, {
-      maxInputTokens: MAX_INPUT_PAYLOAD_BYTES, maxOutputTokens: MAX_OUTPUT_TOKENS,
+      maxInputTokens: MAX_INPUT_PAYLOAD_BYTES, maxOutputTokens: MAX_OUTPUT_TOKENS + OBSERVED_OUTPUT_MARGIN_TOKENS,
     });
     if (sdkEstimate === undefined || !Number.isFinite(sdkEstimate) || sdkEstimate * CNY_PER_USD_CEILING > MAX_CNY_ESTIMATE) {
       throw new Error("SDK pricing preflight failed");
