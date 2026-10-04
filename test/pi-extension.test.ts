@@ -8,7 +8,7 @@ import { createResearchExtension } from "../src/pi/extension.ts";
 import { ResearchService } from "../src/pi/service.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 
-function captureExtension(service: ResearchService, improvementServiceFactory?: (workspaceRoot: string) => any): { tools: Map<string, ToolDefinition>; commands: Map<string, { handler: (args: string, ctx: any) => Promise<void> }>; handlers: Map<string, Array<(event: any, ctx: any) => unknown>> } {
+function captureExtension(service: ResearchService, improvementServiceFactory?: (workspaceRoot: string) => any, researchImprovementServiceFactory?: (workspaceRoot: string) => any): { tools: Map<string, ToolDefinition>; commands: Map<string, { handler: (args: string, ctx: any) => Promise<void> }>; handlers: Map<string, Array<(event: any, ctx: any) => unknown>> } {
 	const tools = new Map<string, ToolDefinition>();
 	const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
 	const handlers = new Map<string, Array<(event: any, ctx: any) => unknown>>();
@@ -17,7 +17,7 @@ function captureExtension(service: ResearchService, improvementServiceFactory?: 
 		registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); },
 		registerCommand(name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) { commands.set(name, command); },
 	} as unknown as ExtensionAPI;
-	createResearchExtension({ service, improvementServiceFactory })(api);
+	createResearchExtension({ service, improvementServiceFactory, researchImprovementServiceFactory })(api);
 	return { tools, commands, handlers };
 }
 
@@ -45,6 +45,32 @@ test("research_improve exposes the separate bounded run, status and rollback act
 	assert.match(JSON.stringify(await tool.execute("r", { action: "run" }, undefined, undefined, toolContext("/workspace"))), /promoted/);
 	assert.match(JSON.stringify(await tool.execute("b", { action: "rollback" }, undefined, undefined, toolContext("/workspace"))), /rollback-i1/);
 	assert.deepEqual(calls, ["status:/workspace", "run:/workspace", "rollback:/workspace"]);
+});
+
+test("research_method_improve workflow-run dispatches the explicit workflow plan", async (t) => {
+	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-workflow-route-"));
+	t.after(() => import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true })));
+	const plan = { version: 1, kind: "m07-evidence-handoff/v1", marker: "workflow-only" };
+	await writeFile(path.join(root, "plan.json"), JSON.stringify(plan));
+	const calls: Array<{ workspace: string; plan: unknown }> = [];
+	const factory = (workspace: string) => ({ runWorkflow: async (input: unknown) => {
+		calls.push({ workspace, plan: input });
+		return { runId: "workflow-offline", status: "research-only", outcome: "completed-no-candidate", stopReason: "no winner", developmentArms: [], protectedArms: [], scientificBenefit: "unverified", budgetAtEnd: { settlement: "settled" } };
+	} });
+	const tool = captureExtension(new ResearchService({ defaultWorkspace: root }), undefined, factory).tools.get("research_method_improve")!;
+	const result = await tool.execute("w", { action: "workflow-run", workspace: root, planPath: "plan.json" }, undefined, undefined, toolContext(root));
+	assert.deepEqual(calls, [{ workspace: root, plan }]);
+	assert.match(JSON.stringify(result), /workflow-offline/);
+	assert.match(JSON.stringify(result), /completed-no-candidate/);
+	await assert.rejects(tool.execute("missing", { action: "workflow-run", workspace: root }, undefined, undefined, toolContext(root)), /requires planPath/);
+});
+
+test("research_delegate passes approved plan, versioned resources, bounded loop, and lesson output to M07", async () => {
+	const seen: unknown[] = [];
+	const service = { delegate: async (_runId: string, task: unknown) => { seen.push(task); return { taskId: "task-offline", status: "returned" }; } } as unknown as ResearchService;
+	const tool = captureExtension(service).tools.get("research_delegate")!;
+	await tool.execute("d", { runId: "goal-offline", objective: "execute approved plan", inputs: ["plan.md", "guide.md"], expectedOutputs: ["lesson.md"], checks: ["evidence recorded"], mode: "execute", planInput: "plan.md", resourceInputs: [{ id: "operator-guide", version: "v2", input: "guide.md" }], executionLoop: { maxRounds: 3, deadlineAt: "2026-10-04T20:00:00.000Z" }, lessonDeltaOutput: "lesson.md" }, undefined, undefined, toolContext("/workspace"));
+	assert.deepEqual(seen, [{ objective: "execute approved plan", inputs: ["plan.md", "guide.md"], expectedOutputs: ["lesson.md"], checks: ["evidence recorded"], mode: "execute", planInput: "plan.md", resourceInputs: [{ id: "operator-guide", version: "v2", input: "guide.md" }], executionLoop: { maxRounds: 3, deadlineAt: "2026-10-04T20:00:00.000Z" }, lessonDeltaOutput: "lesson.md" }]);
 });
 
 test("main-session capability guard blocks side-effect tools from the start", async () => {

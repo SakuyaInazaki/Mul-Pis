@@ -11,6 +11,7 @@
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import type { ProposalOp } from "../knowledge/types.ts";
+import { retrieveKnowledge } from "../knowledge/retrieval.ts";
 import { buildM04Message, extractKnowledgeProposals, systemPromptFor } from "../prompts.ts";
 import type { ProblemMaterials } from "../prompts.ts";
 import { HarnessError, type InputRef, type StageRunRecord } from "../types.ts";
@@ -245,10 +246,13 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-source.json", JSON.stringify({ m08RunId: feedback.m08.runId, manifestPath: feedback.m08.manifestPath, reviewBundlePath: feedback.inputs[0].path }, null, 2), "M08 处理来源");
 			let knowledgePack: string | undefined;
 			if (mode === "research-session") {
-				const pack = await ctx.store.buildPack({ purpose: options.purpose ?? `M04 处理：${feedback.label}`, includeOpenQuestions: true, types: ["C", "K", "E", "J", "Q", "D", "X"], maxChars: 60_000 });
+				const selection = await retrieveKnowledge(ctx.store, { purpose: options.purpose ?? `M04 处理：${feedback.label}`, text: `${materials.problem}\n${feedback.label}\n${feedback.text}`, maxRecords: 48, maxChars: 60_000 });
+				if (selection.status !== "ready") throw new HarnessError("m04.knowledge", `M04 必需知识未能完整装载：${selection.omitted.map((item) => `${item.ref}:${item.reason}`).join("；")}`);
+				const pack = selection.pack;
 				knowledgePack = pack.markdown;
 				await ctx.ws.writeOutput(record, "knowledge-pack.md", pack.markdown, "提供给研究会话的局部知识包");
-				if (pack.truncated) record.remarks.push(`知识包按长度截断，未展开：${pack.omitted.join(", ")}`);
+				await ctx.ws.writeOutput(record, "knowledge-selection.json", JSON.stringify({ snapshot: selection.snapshot, rankedRefs: selection.rankedRefs, omitted: selection.omitted, limitsCheckedAt: selection.limitsCheckedAt }, null, 2), "知识选择与未展开记录");
+				if (pack.truncated) record.remarks.push(`相关知识组未展开：${pack.omitted.join(", ")}`);
 			}
 			const identityContract = `\n\n【知识记录身份契约】\n- 只有上方局部知识包明确列出的 ID 才能直接引用为已有记录；意见、报告或历史正文中的 C001/J001/E001 等字样可能只是叙述标签，不得猜测或映射成知识库 ID。\n- 本批新建记录如需互相引用，每个 create 先声明唯一局部 handle（如 \"handle\":\"$claim\"），后续操作可用 \"refs\":[{\"rel\":\"supports\",\"target\":\"$claim\"}] 或将 decide/limit 的目标写为 $claim。只引用已在同一数组更早创建的 handle；handle 仅在本提案内有效，合入时才分配正式 ID。\n- 局部包可能截断或没有展开相关旧记录。需修订、决定或限制但看不到对应 ID 时，先请求补足相关记录或保留待补证，不得重建重复记录或绕过旧限制。只有确认是全新对象时才用 handle 新建；不伪造 ID。`;
 			const message = (await buildM04Message({ materials, feedbackLabel: feedback.label, feedback: feedback.text, artifactPaths: feedback.artifactPaths, knowledgePack, includeProblem: mode === "research-session" })) + identityContract;

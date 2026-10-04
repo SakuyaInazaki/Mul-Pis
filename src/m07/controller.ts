@@ -1,6 +1,6 @@
 import { createReadStream, createWriteStream } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { copyFile, lstat, mkdir, readFile, readdir, realpath, stat, unlink } from "node:fs/promises";
+import { copyFile, cp, lstat, mkdir, readFile, readdir, realpath, stat, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import { Transform } from "node:stream";
@@ -17,10 +17,12 @@ import type { StageRunRecord } from "../types.ts";
 import { loadActiveBudgetPolicy, projectInline, validateActiveBudgetPointer, validateBudgetPolicy, type BudgetPolicy } from "../improvement/policy.ts";
 import { capturedRunBytes, DEFAULT_PROJECTION_SNAPSHOT_LIMITS, newProjectionEvent, nextProjectionOrdinal, writeProjectionEvent, type ProjectionEventV1, type ProjectionMaterialV1, type ProjectionSnapshotLimits } from "../improvement/observations.ts";
 import { createExperienceProvider, verifyRequiredKnowledge } from "../knowledge/experience-index.ts";
+import { retrieveKnowledge } from "../knowledge/retrieval.ts";
 import type { KnowledgeRef, KnowledgeStore } from "../knowledge/types.ts";
 import { GenerationStore, isM07WorkflowStrategy } from "../improvement/generation.ts";
 import { probeProcessIdentity, readCurrentProcessIdentity, type ProcessIdentityV1 } from "../runtime/process-identity.ts";
 import { parseRunDescriptor, type RunDescriptorV1 } from "../runtime/run-descriptor.ts";
+import { parseRoundReview, promptBeforeDeadline, TaskDeadlineError } from "./execution-loop.ts";
 
 const STATE = "goal.json";
 const HOST_STOP_KEY = Symbol("m07-host-stop");
@@ -52,6 +54,17 @@ function sameSupersededObligation(next: TaskSpecInput, previous: M07TaskRecord):
 
 function inside(root: string, candidate: string): boolean {
 	return candidate === root || candidate.startsWith(`${root}${path.sep}`);
+}
+
+async function snapshotRoundForReviewer(workDir: string, destination: string): Promise<void> {
+	let files = 0, bytes = 0;
+	await cp(workDir, destination, { recursive: true, filter: async (source) => {
+		const info = await lstat(source);
+		if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) throw new HarnessError("m07.loop-snapshot", "round snapshot contains a symlink or special file");
+		if (info.isFile()) { files++; bytes += info.size; }
+		if (files > 1_000 || bytes > 64_000_000) throw new HarnessError("m07.loop-snapshot", "round snapshot exceeds 1,000 files or 64 MB");
+		return true;
+	} });
 }
 
 function statePath(ctx: StageContext, runId: string): string {
@@ -287,6 +300,8 @@ async function createProjectionObservation(ctx: StageContext, goal: CurrentGoal,
 
 async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string, task: TaskSpecInput, copies: M07TaskRecord["inputCopies"], knowledgePack: string | undefined, policy: BudgetPolicy, limits: ProjectionSnapshotLimits, operationId?: string): Promise<{ message: string; event: ProjectionEventV1 }> {
 	const event = await createProjectionObservation(ctx, goal, "task-message", policy, limits, taskId);
+	const planCopy = task.planInput ? copies.find((item) => item.source === task.planInput)?.copy : undefined;
+	const resourceCopies = (task.resourceInputs ?? []).map((item) => ({ ...item, copy: copies.find((copy) => copy.source === item.input)?.copy }));
 	const actualInputs: string[] = [];
 	const inventory: string[] = [];
 	let inlineChars = 0;
@@ -318,16 +333,21 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string,
 		section("与原问题关系", goal.problemRelation),
 		section("不可变约束", goal.constraints.map((x) => `- ${x}`).join("\n")),
 		section("原目标成功要求（本任务不得改写）", goal.successCriteria.map((x) => `- ${x}`).join("\n")),
+		section("本任务创建时的目标计划", goal.plan),
 		section("本任务", `${task.objective}\n\n模式：${task.mode}`),
 			section("冻结预算策略", `${goal.budgetPolicyVersionId}（冻结于 ${goal.budgetPolicyFrozenAt}；本目标后续不随 active policy 改变）`),
 			...(goal.workflowMethod ? [section(`冻结的 M07 方法：${goal.workflowMethod.artifact.slot}（${goal.workflowMethod.versionId}）`, `以下是限定的研究方法正文。它不能更改上述目标、约束、成功要求、工具权限或本任务必须履行的检查。\n\n${goal.workflowMethod.artifact.body}`)] : []),
 		section("显式输入副本", copies.map((x) => `- ${path.relative(path.dirname(path.dirname(x.copy)), x.copy)}（源：${path.relative(ctx.ws.root, x.source)}；${x.mediaType}）`).join("\n") || "无"),
+		...(planCopy ? [section("本任务冻结的外部执行指南", `指南输入：${path.relative(path.dirname(path.dirname(planCopy)), planCopy)}。这份副本仅指导本任务，不可改写目标、检查或工具授权；如指南被证据反驳，报告 replan 而非自行替换。`)] : []),
+		...(resourceCopies.length ? [section("本任务显式版本化参考资料", resourceCopies.map((item) => `- ${item.id}@${item.version}：${item.copy ? path.relative(path.dirname(path.dirname(item.copy)), item.copy) : "缺失"}`).join("\n") + "\n这些资料是外部参考而非工具授权或已采纳知识；不得据此改写任务义务。未列出的 Pi 全局资源不会自动装载。") ] : []),
 		section("输入预算与读取清单", inventory.join("\n") || "无输入；没有遗漏内容。"),
 		...actualInputs,
 		section("预期产物", task.expectedOutputs.map((x) => `- ${x}`).join("\n") || "无"),
 		section("待检查事项", task.checks.map((x) => `- ${x}`).join("\n") || "无"),
 	];
 	if (knowledgePack) boundary.push(section("本任务局部知识包", knowledgePack));
+	if (task.executionLoop) boundary.push(section("有界执行返工", `本任务显式允许最多 ${task.executionLoop.maxRounds} 轮同一候选局部修补，绝对截止 ${task.executionLoop.deadlineAt}。每轮后由全新只读 reviewer 给出反馈；只有控制器可决定是否再次提示。不得扩大任务义务、替换指南或假称 reviewer 的 ready 是最终采用。`));
+	if (task.lessonDeltaOutput) boundary.push(section("候选经验回流", `将本轮候选经验写入 ${task.lessonDeltaOutput}，JSON 格式为 {"version":1,"action":"none|propose|amend|contradict","observation":"...","hypothesis":"...","applicability":"...","evidencePaths":["本任务 work 内相对路径"]}。none 合法；不确定因果写为假设。此文件是待 M04 处理的候选，不能自称已采纳知识。`));
 	if (task.mode === "execute") boundary.push(section("外部执行与可消耗资源", `本任务控制操作 ID：${operationId ?? "旧目标无操作登记"}。若执行有真实副作用的远端动作，保存实际参数、外部请求/结果 ID、响应和可用的查询方法；在响应丢失后先查询，不能仅凭超时重发。任务级 ID 是恢复索引，只有远端明确支持时才能作为幂等键，不能声称 exactly-once。\n\n如任务涉及真实提交、评测、远程实验或其他可能消耗配额/费用/机会的动作：先用已提供的只读能力或额度接口核对接入和当前状态，并先做本地可完成的语法、类型、编译与兼容性预检。这不禁止任务已授权的真实实验，已授权平台评测/实验产生的结果属于本任务实测证据。每次真实动作都要记录实际结果和资源消耗；失败若仍消耗了资源，同样记录已消耗量、可见剩余量与恢复条件。平台配额不明时如实记录未知，不猜测统一配额。本地命令或客户端成功退出不等于远程实验通过。显式输入和原问题允许使用；若需取得新的外部研究参考资料并用于推理，将具体缺口报回主会话走 M05/M06→M04，不在 execute 任务里通过 bash 另造获取和采用链。`));
 	boundary.push("会话返回只表示任务已返回，不表示成果被主 Agent 接受。请如实列出实际动作、产物、失败、未执行项和限制。");
 	boundary.push("产物路径规则：expectedOutputs 必须是当前任务工作目录内的精确相对路径；说明写在 objective 或 report.md。所有实际写盘必须落在当前工作目录内，不要写到工作区根目录或绝对路径。");
@@ -665,6 +685,10 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			const policy = frozenPolicy(goal);
 			await requireCurrentFormalBaseline(ctx, goal);
 			spec = { ...spec, objective: spec.objective.trim(), inputs: normalizedUnique(spec.inputs, "task input"), expectedOutputs: normalizedUnique(spec.expectedOutputs, "expected output"), checks: normalizedUnique(spec.checks, "task check") };
+			if (spec.executionLoop) {
+				if (spec.mode !== "execute" || !Number.isInteger(spec.executionLoop.maxRounds) || spec.executionLoop.maxRounds < 1 || spec.executionLoop.maxRounds > 8 || !Number.isFinite(Date.parse(spec.executionLoop.deadlineAt)) || Date.parse(spec.executionLoop.deadlineAt) <= Date.now()) throw new HarnessError("m07.loop", "executionLoop requires execute mode, 1–8 rounds, and a future absolute deadline");
+			}
+			if (spec.lessonDeltaOutput && (spec.mode !== "execute" || !spec.expectedOutputs.includes(spec.lessonDeltaOutput))) throw new HarnessError("m07.lesson-delta", "lessonDeltaOutput must be an exact expected output of an execute task");
 			for (const expectedOutput of spec.expectedOutputs) {
 				if (isSafeRelativeOutputPath(expectedOutput) === false) throw new HarnessError("m07.path", `expectedOutputs 必须是 work 目录内精确相对路径，不得含占位符、通配符、绝对路径、..、多余首尾空白或换行；动态文件名请声明其父目录，并在 objective 或任务报告中说明：${expectedOutput}`);
 			}
@@ -679,6 +703,23 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			}
 			if (spec.parentTaskId && !goal.tasks.some((t) => t.taskId === spec.parentTaskId)) throw new HarnessError("m07.task", `未知 parentTaskId ${spec.parentTaskId}`);
 			const resolvedInputs: string[] = []; for (const requested of spec.inputs) resolvedInputs.push(await confinedExistingFile(ctx, requested));
+			if (spec.planInput) {
+				if (spec.mode !== "execute") throw new HarnessError("m07.plan-input", "planInput is only valid for an execute task");
+				const planSource = await confinedExistingFile(ctx, spec.planInput);
+				if (!resolvedInputs.includes(planSource) || mediaType(planSource) !== "text") throw new HarnessError("m07.plan-input", "planInput must identify a declared text input");
+				spec.planInput = planSource;
+			}
+			if (spec.resourceInputs !== undefined) {
+				if (!Array.isArray(spec.resourceInputs) || spec.resourceInputs.length > 12) throw new HarnessError("m07.resources", "resourceInputs must be at most 12 explicit versioned references");
+				const seen = new Set<string>();
+				spec.resourceInputs = await Promise.all(spec.resourceInputs.map(async (item) => {
+					if (!item || !/^[A-Za-z][A-Za-z0-9._-]{0,63}$/.test(item.id) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(item.version) || seen.has(item.id)) throw new HarnessError("m07.resources", "resourceInputs must have unique safe IDs and explicit versions");
+					seen.add(item.id);
+					const source = await confinedExistingFile(ctx, item.input);
+					if (!resolvedInputs.includes(source) || mediaType(source) !== "text") throw new HarnessError("m07.resources", "each resource input must be a declared text input");
+					return { id: item.id, version: item.version, input: source };
+				}));
+			}
 			if (spec.supersedesTaskId) { const previous = goal.tasks.find((t) => t.taskId === spec.supersedesTaskId); if (!previous) throw new HarnessError("m07.task", `未知 supersedesTaskId ${spec.supersedesTaskId}`); const previousInputs = previous.inputCopies.map((item) => item.source).sort(); const nextInputs = [...resolvedInputs].sort(); if (!sameSupersededObligation(spec, previous) || !sameStrings(nextInputs, previousInputs)) throw new HarnessError("m07.task", "supersedes 只能替代 objective、兼容 mode（可升级到更强能力）、独立检查要求、inputs、checks 与 expectedOutputs 相同或不降低义务的旧任务"); }
 			const dependencies = [spec.parentTaskId, spec.supersedesTaskId].filter(Boolean) as string[];
 			if (goal.decisions.some((d) => d.status === "open" && d.relatedTaskIds.some((id) => dependencies.includes(id)))) throw new HarnessError("m07.decision", "该任务依赖待用户决定事项；可继续不受影响的任务，但不能推进此依赖分支");
@@ -692,41 +733,125 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 					const parsed = /^([CKEJQDX]\d{3,})(?:@(\d+))?$/.exec(requested);
 					if (parsed && (await ctx.store.get(parsed[1], parsed[2] ? Number(parsed[2]) : undefined))?.fields.experience !== undefined) throw new HarnessError("m07.experience", `方法经验 ${requested} 必须通过固定 storeId、recordId、version 与适用性选择入口加载`);
 				}
-				pack = (await ctx.store.buildPack({ purpose: `M07 ${id}`, ids: spec.knowledgeIds, includeOpenQuestions: true, maxChars: 60_000 })).markdown;
 			}
 			let experienceSelection: M07TaskRecord["experienceSelection"];
 			if (spec.experienceRefs?.length) {
 				const selection = await createExperienceProvider(ctx.store, options.registeredExperienceStores).select({ targetKind: "executor", applicability: { stage: "M07", tags: [spec.mode, ...(spec.experienceTags ?? [])], contextRefs: spec.experienceContextRefs }, requestedRefs: spec.experienceRefs, expectedSnapshotId: goal.knowledgeSnapshot, maxRecords: 24, maxChars: 24_000 });
 				if (selection.status !== "ready") throw new HarnessError("m07.experience", `显式方法经验不可装载：${selection.omitted.map((item) => `${item.ref.storeId}/${item.ref.recordId}@${item.ref.version}:${item.reason}`).join("；") || selection.status}`);
 				experienceSelection = { ...selection, invocationStatus: "unknown", faithfulUse: "unknown", causalBenefit: "unknown" };
-				pack = [pack, selection.markdown].filter(Boolean).join("\n\n");
+				pack = selection.markdown;
 			}
+			const retrieval = await retrieveKnowledge(ctx.store, { purpose: `M07 ${id}`, text: [goal.goal, goal.problemRelation, ...goal.successCriteria, spec.objective, ...spec.checks].join("\n"), requiredIds: spec.knowledgeIds ?? [], maxRecords: 24, maxChars: 60_000, excludeExperience: true });
+			if (retrieval.status !== "ready") throw new HarnessError("m07.knowledge", `required knowledge unavailable: ${retrieval.omitted.map((item) => `${item.ref}:${item.reason}`).join("; ")}`);
+			if (goal.knowledgeSnapshot && retrieval.snapshot !== goal.knowledgeSnapshot) throw new HarnessError("m07.knowledge", "knowledge snapshot changed since goal baseline; refresh explicitly");
+			if (retrieval.pack.included.length) pack = [retrieval.pack.markdown, pack].filter(Boolean).join("\n\n");
+			const verifyDispatchKnowledge = async (): Promise<void> => {
+				const sameLocalState = async () => (await ctx.store.current())?.id === retrieval.snapshot && JSON.stringify(await ctx.store.limits()) === JSON.stringify(retrieval.limits);
+				if (!await sameLocalState()) throw new HarnessError("m07.knowledge", "knowledge snapshot or live limits changed before task dispatch");
+				await requireCurrentFormalBaseline(ctx, goal);
+				await verifyFrozenWorkflowMethod(ctx, goal, options.registeredExperienceStores, spec);
+				if (experienceSelection && spec.experienceRefs?.length) {
+					const fresh = await createExperienceProvider(ctx.store, options.registeredExperienceStores).select({ targetKind: "executor", applicability: { stage: "M07", tags: [spec.mode, ...(spec.experienceTags ?? [])], contextRefs: spec.experienceContextRefs }, requestedRefs: spec.experienceRefs, expectedSnapshotId: goal.knowledgeSnapshot, maxRecords: 24, maxChars: 24_000 });
+					if (fresh.status !== "ready" || fresh.markdown !== experienceSelection.markdown || JSON.stringify(fresh.selected) !== JSON.stringify(experienceSelection.selected)) throw new HarnessError("m07.experience", "pinned task experience changed or became unavailable before dispatch");
+				}
+				if (!await sameLocalState()) throw new HarnessError("m07.knowledge", "knowledge snapshot or live limits changed during dispatch check");
+			};
 			const expectedOutputPaths = spec.expectedOutputs.map((x) => { const resolved = path.resolve(workDir, x); if (!inside(workDir, resolved)) throw new HarnessError("m07.path", `预期产物路径逃逸任务目录：${x}`); return resolved; });
 			const role = spec.mode === "check" ? "reviewer" : "execution";
 			const tools = spec.mode === "execute" ? { kind: "execution" as const, root: workDir, tools: ["read", "write", "edit", "bash"] as Array<"read" | "write" | "edit" | "bash"> } : { kind: "read-dir" as const, root: workDir };
 			const operationId = spec.mode === "execute" && goal.executionState ? `O${String(goal.executionState.operations.length + 1).padStart(3, "0")}` : undefined;
 			const { message, event } = await taskMessage(ctx, goal, id, spec, copies, pack, policy, snapshotLimits, operationId);
 			await writeFileAtomic(path.join(dir, "message.md"), message);
-			const task: M07TaskRecord = { ...spec, taskId: id, status: "running", createdAt: nowIso(), returnedAt: "", workDir, inputCopies: copies, expectedOutputPaths, readCoverage: [], toolLog: [], knowledgeSnapshot: goal.knowledgeSnapshot, m04BaselineRunId: goal.m04BaselineRunId, experienceSelection };
+			const task: M07TaskRecord = { ...spec, taskId: id, status: "running", createdAt: nowIso(), returnedAt: "", workDir, inputCopies: copies, expectedOutputPaths, readCoverage: [], toolLog: [], knowledgeSnapshot: goal.knowledgeSnapshot, m04BaselineRunId: goal.m04BaselineRunId, experienceSelection, ...(spec.planInput ? { planCopy: copies.find((item) => item.source === spec.planInput)?.copy } : {}) };
 			const operation: M07OperationV1 | undefined = operationId ? { version: 1, id: operationId, taskId: id, status: "prepared", issuedAt: nowIso() } : undefined;
 			if (operation) goal.executionState!.operations.push(operation);
 			goal.tasks.push(task); await save(ctx, goal);
 			let handle;
 			let promptIssued = false;
+			let activeOperation = operation;
 			try {
+				const frozenInputBytes = await Promise.all([task.planCopy, ...(task.resourceInputs ?? []).map((item) => copies.find((copy) => copy.source === item.input)?.copy)].filter((item): item is string => Boolean(item)).map(async (copy) => ({ copy, bytes: await readFile(copy) })));
+				const verifyFrozenInputs = async (): Promise<void> => { for (const input of frozenInputBytes) if (!(await readFile(input.copy)).equals(input.bytes)) throw new HarnessError("m07.plan-input", "builder changed a frozen plan or versioned resource copy; stop this task and review the evidence"); };
 				const session = sessionSpec(ctx, `M07-${id}`, role, systemPromptFor(role), tools);
 				if (goal.methodBinding) session.methodBinding = goal.methodBinding;
 				handle = await ctx.runner.create(session); task.session = handle.ref; await save(ctx, goal);
-				event.deliveryStatus = "submitted"; event.providerUsageSessionId = handle.ref.id; await writeProjectionEvent(ctx.ws, event);
-				if (operation) { operation.status = "issued"; await save(ctx, goal); }
-				promptIssued = true;
-				const report = (await handle.prompt(message)).text; if (operation) operation.status = "response-received"; if (task.experienceSelection) task.experienceSelection.loadedAt = nowIso(); const reportPath = path.join(dir, "report.md"); await writeFileAtomic(reportPath, report);
-				task.reportPath = reportPath; task.status = "returned";
+				if (spec.executionLoop) {
+					const deadlineMs = Date.parse(spec.executionLoop.deadlineAt);
+					const transcript: string[] = [];
+					task.executionRounds = [];
+					let nextMessage = message;
+					for (let index = 1; index <= spec.executionLoop.maxRounds; index++) {
+						const currentOperation: M07OperationV1 = index === 1 ? operation! : { version: 1, id: `O${String(goal.executionState!.operations.length + 1).padStart(3, "0")}`, taskId: id, status: "prepared", issuedAt: nowIso() };
+						activeOperation = currentOperation;
+						if (index > 1) { goal.executionState!.operations.push(currentOperation); await save(ctx, goal); }
+						if (Date.now() >= deadlineMs) { currentOperation.status = "not-issued"; task.loopStopReason = "deadline"; break; }
+						await verifyDispatchKnowledge();
+						if (Date.now() >= deadlineMs) { currentOperation.status = "not-issued"; task.loopStopReason = "deadline"; break; }
+						if (index === 1) { event.deliveryStatus = "submitted"; event.providerUsageSessionId = handle.ref.id; await writeProjectionEvent(ctx.ws, event); }
+						currentOperation.status = "issued"; await save(ctx, goal);
+						promptIssued = true;
+						const report = await promptBeforeDeadline(handle, nextMessage, deadlineMs);
+						currentOperation.status = "response-received";
+						await verifyFrozenInputs();
+						if (task.experienceSelection) task.experienceSelection.loadedAt = nowIso();
+						const builderReportPath = path.join(dir, `round-${index}-builder.md`);
+						await writeFileAtomic(builderReportPath, report);
+						const round: NonNullable<M07TaskRecord["executionRounds"]>[number] = { index, operationId: currentOperation.id, builderReportPath, completedAt: nowIso() };
+						task.executionRounds.push(round);
+						transcript.push(`## Round ${index} builder\n\n${report}`);
+						await save(ctx, goal);
+						if (Date.now() >= deadlineMs) { task.loopStopReason = "deadline"; break; }
+						if (report.length > 16_000) { task.loopStopReason = "reviewer-invalid"; break; }
+						const reviewerRoot = path.join(dir, `round-${index}-snapshot`);
+						await snapshotRoundForReviewer(workDir, reviewerRoot);
+						round.reviewerSnapshotPath = reviewerRoot;
+						const reviewerPrompt = `Review only this M07 task round and the copied work-directory snapshot. Goal: ${goal.goal}\nProblem relation: ${goal.problemRelation}\nFrozen goal constraints: ${goal.constraints.join("; ")}\nFrozen success criteria: ${goal.successCriteria.join("; ")}\nGoal plan at task creation: ${goal.plan}\nTask objective: ${spec.objective}\nChecks: ${spec.checks.join("; ")}\nExpected outputs: ${spec.expectedOutputs.join("; ")}\nFrozen plan input: ${task.planCopy ? path.relative(workDir, task.planCopy) : "none"}\nThe builder report follows. Inspect the copied files only as needed. Reply with JSON {"verdict":"ready|revise|replan|blocked","feedback":"specific evidence-grounded reason"}. ready only means ready for the controller's separate final review. Do not change the plan or task obligations.\n\n${report}`;
+						if (reviewerPrompt.length + systemPromptFor("reviewer").length > policy.maxPromptChars) { task.loopStopReason = "reviewer-invalid"; break; }
+						const reviewerSpec = sessionSpec(ctx, `M07-${id}-round-${index}-reviewer`, "reviewer", systemPromptFor("reviewer"), { kind: "read-dir", root: reviewerRoot });
+						if (goal.methodBinding) reviewerSpec.methodBinding = goal.methodBinding;
+						const reviewer = await ctx.runner.create(reviewerSpec);
+						round.reviewerSession = reviewer.ref;
+						await save(ctx, goal);
+						let rawReview: string;
+						try {
+							await verifyDispatchKnowledge();
+							rawReview = await promptBeforeDeadline(reviewer, reviewerPrompt, deadlineMs);
+						} finally { task.toolLog.push(...reviewer.toolLog().map((entry) => ({ ...entry, reviewerSessionId: reviewer.ref.id }))); reviewer.dispose(); }
+						const reviewerReportPath = path.join(dir, `round-${index}-reviewer.md`);
+						await writeFileAtomic(reviewerReportPath, rawReview);
+						round.reviewerReportPath = reviewerReportPath;
+						let verdict;
+						try { verdict = parseRoundReview(rawReview); }
+						catch { task.loopStopReason = "reviewer-invalid"; transcript.push(`## Round ${index} reviewer\n\nInvalid structured verdict; see ${path.basename(reviewerReportPath)}.`); break; }
+						round.verdict = verdict.verdict; round.feedback = verdict.feedback;
+						transcript.push(`## Round ${index} reviewer\n\n${rawReview}`);
+						await save(ctx, goal);
+						if (Date.now() >= deadlineMs) { task.loopStopReason = "deadline"; break; }
+						if (verdict.verdict === "ready" || verdict.verdict === "replan" || verdict.verdict === "blocked") { task.loopStopReason = verdict.verdict; break; }
+						if (index === spec.executionLoop.maxRounds) { task.loopStopReason = "max-rounds"; break; }
+						nextMessage = `Continue only the same frozen task and plan. Fresh reviewer feedback from round ${index}: ${verdict.feedback}\nDo a bounded local repair, report concrete changes and verification. Do not expand scope or silently restart an external action whose outcome is unknown.`;
+					}
+					const reportPath = path.join(dir, "report.md");
+					if (Date.now() >= deadlineMs) task.loopStopReason = "deadline";
+					const renderReport = () => `# M07 bounded execution\n\nStop: ${task.loopStopReason ?? "deadline"}\n\n${transcript.join("\n\n")}\n`;
+					await writeFileAtomic(reportPath, renderReport());
+					if (Date.now() >= deadlineMs && task.loopStopReason !== "deadline") { task.loopStopReason = "deadline"; await writeFileAtomic(reportPath, renderReport()); }
+					task.reportPath = reportPath; task.status = "returned";
+				} else {
+					await verifyDispatchKnowledge();
+					event.deliveryStatus = "submitted"; event.providerUsageSessionId = handle.ref.id; await writeProjectionEvent(ctx.ws, event);
+					if (operation) { operation.status = "issued"; await save(ctx, goal); }
+					promptIssued = true;
+					const report = (await handle.prompt(message)).text; if (operation) operation.status = "response-received"; await verifyFrozenInputs(); if (task.experienceSelection) task.experienceSelection.loadedAt = nowIso(); const reportPath = path.join(dir, "report.md"); await writeFileAtomic(reportPath, report);
+					task.reportPath = reportPath; task.status = "returned";
+				}
 			} catch (error) {
 				task.status = "failed"; task.executionFailure = (error as Error).message;
-				if (operation && promptIssued && operation.status === "issued") operation.status = "unknown";
+				if (error instanceof TaskDeadlineError) task.loopStopReason = "deadline";
+				if (activeOperation?.status === "prepared") activeOperation.status = "not-issued";
+				if (activeOperation && promptIssued && activeOperation.status === "issued") activeOperation.status = "unknown";
 			} finally {
-				if (handle) { task.readCoverage = handle.readCoverage(); task.toolLog = handle.toolLog(); handle.dispose(); }
+				if (handle) { task.readCoverage = handle.readCoverage(); task.toolLog.push(...handle.toolLog()); handle.dispose(); }
 				task.returnedAt = nowIso(); await save(ctx, goal);
 			}
 			return task;
@@ -737,14 +862,24 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			if (goal.decisions.some((d) => d.status === "open" && d.relatedTaskIds.includes(task.taskId))) throw new HarnessError("m07.decision", "该任务关联待用户决定事项，不能采用；不受影响任务仍可继续");
 			if (task.status !== "returned") throw new HarnessError("m07.review", `任务 ${task.taskId} 状态为 ${task.status}，不能评审采用`);
 			const taskRoot = await realpath(path.dirname(task.workDir)); const reportReal = task.reportPath ? await realpath(task.reportPath) : undefined;
+			const readySnapshot = task.executionLoop && task.loopStopReason === "ready" ? task.executionRounds?.at(-1)?.reviewerSnapshotPath : undefined;
+			const ensureRoundReviewed = async (source: string): Promise<void> => {
+				if (!task.executionLoop || task.loopStopReason !== "ready" || source === reportReal) return;
+				if (!readySnapshot || !inside(await realpath(task.workDir), source)) throw new HarnessError("m07.review", "bounded-loop evidence was not in the ready reviewer work snapshot");
+				const relative = path.relative(task.workDir, source);
+				let frozen: string;
+				try { frozen = await realpath(path.join(readySnapshot, relative)); }
+				catch { throw new HarnessError("m07.review", `evidence was added after ready review: ${relative}`); }
+				if (!inside(await realpath(readySnapshot), frozen) || !(await readFile(source)).equals(await readFile(frozen))) throw new HarnessError("m07.review", `evidence changed after ready review: ${relative}`);
+			};
 			if (!input.artifacts.length || !input.checks.length) throw new HarnessError("m07.review", "不能用空 artifacts 或空 checks 接受任务；reason/check 可提交自动保存的 report.md");
 			const snapshotDir = path.join(path.dirname(task.workDir), "review-snapshot"); await mkdir(snapshotDir, { recursive: true });
 			const frozenBySource = new Map<string, string>(); let frozenIndex = 0;
 			const freeze = async (source: string): Promise<string> => { const found = frozenBySource.get(source); if (found) return found; const target = path.join(snapshotDir, uniqueName(frozenIndex++, source)); await copyFile(source, target); const frozen = await realpath(target); frozenBySource.set(source, frozen); return frozen; };
 			if (!reportReal) throw new HarnessError("m07.review", "任务没有可冻结的会话报告");
 			const frozenReportPath = await freeze(reportReal);
-			const artifacts: EvidenceFile[] = []; for (const p of input.artifacts) { const resolved = await confinedExistingFile(ctx, p); if (!inside(taskRoot, resolved) && resolved !== reportReal) throw new HarnessError("m07.review", `成果不属于任务固定目录或会话报告：${p}`); artifacts.push({ path: await freeze(resolved), sourcePath: resolved, mediaType: mediaType(resolved), readCoverage: mediaType(resolved) === "text" ? "recorded-not-reviewed" : "unread-binary" }); }
-			const checks: TaskCheck[] = []; for (const check of input.checks) { if (!task.checks.includes(check.criterion)) throw new HarnessError("m07.review", `检查不属于任务定义：${check.criterion}`); const evidence = []; for (const p of check.evidence) { const resolved = await confinedExistingFile(ctx, p); if (!inside(taskRoot, resolved) && resolved !== reportReal) throw new HarnessError("m07.review", `检查证据不属于任务固定目录或会话报告：${p}`); evidence.push(await freeze(resolved)); } if (check.result === "passed" && !evidence.length) throw new HarnessError("m07.review", `通过检查必须有实际文件证据：${check.criterion}`); checks.push({ ...check, evidence }); }
+			const artifacts: EvidenceFile[] = []; for (const p of input.artifacts) { const resolved = await confinedExistingFile(ctx, p); if (!inside(taskRoot, resolved) && resolved !== reportReal) throw new HarnessError("m07.review", `成果不属于任务固定目录或会话报告：${p}`); await ensureRoundReviewed(resolved); artifacts.push({ path: await freeze(resolved), sourcePath: resolved, mediaType: mediaType(resolved), readCoverage: mediaType(resolved) === "text" ? "recorded-not-reviewed" : "unread-binary" }); }
+			const checks: TaskCheck[] = []; for (const check of input.checks) { if (!task.checks.includes(check.criterion)) throw new HarnessError("m07.review", `检查不属于任务定义：${check.criterion}`); const evidence = []; for (const p of check.evidence) { const resolved = await confinedExistingFile(ctx, p); if (!inside(taskRoot, resolved) && resolved !== reportReal) throw new HarnessError("m07.review", `检查证据不属于任务固定目录或会话报告：${p}`); await ensureRoundReviewed(resolved); evidence.push(await freeze(resolved)); } if (check.result === "passed" && !evidence.length) throw new HarnessError("m07.review", `通过检查必须有实际文件证据：${check.criterion}`); checks.push({ ...check, evidence }); }
 			if (task.checks.some((criterion) => !checks.some((c) => c.criterion === criterion))) throw new HarnessError("m07.review", "必须逐项记录任务定义的全部 checks");
 			if (task.requireIndependentCheck) {
 				const independent = input.independentCheck; if (!independent) throw new HarnessError("m07.review", "该任务要求独立检查，必须引用独立 check 任务报告并说明对发现的处置");
@@ -763,6 +898,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			const failures = [...(input.failures ?? [])], unexecuted = [...(input.unexecuted ?? [])], limitations = input.limitations ?? [];
 			const addExpectedArtifact = async (source: string): Promise<void> => {
 				if (artifacts.some((item) => item.sourcePath === source)) return;
+				await ensureRoundReviewed(source);
 				const type = mediaType(source);
 				artifacts.push({ path: await freeze(source), sourcePath: source, mediaType: type, readCoverage: type === "text" ? "recorded-not-reviewed" : "unread-binary" });
 			};
@@ -771,6 +907,38 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				if (expected.error) { failures.push(expected.error); continue; }
 				for (const file of expected.files) await addExpectedArtifact(file);
 			}
+			if (task.executionLoop && task.loopStopReason === "ready") {
+				const reviewerRoot = task.executionRounds?.at(-1)?.reviewerSnapshotPath;
+				if (!reviewerRoot) failures.push("Ready verdict has no immutable round snapshot");
+				else {
+					const frozenOutputs = await resolveExpectedOutputFiles(reviewerRoot, task.expectedOutputs.map((item) => path.join(reviewerRoot, item)));
+					for (let i = 0; i < expectedOutputs.length; i++) {
+						if (expectedOutputs[i].error || frozenOutputs[i].error) { failures.push(`Ready snapshot lacks expected output ${task.expectedOutputs[i]}`); continue; }
+						const currentFiles = expectedOutputs[i].files.map((file) => path.relative(task.workDir, file)).sort();
+						const frozenFiles = frozenOutputs[i].files.map((file) => path.relative(reviewerRoot, file)).sort();
+						if (!sameStrings(currentFiles, frozenFiles)) { failures.push(`Output set changed after ready review: ${task.expectedOutputs[i]}`); continue; }
+						for (const relative of currentFiles) if (!(await readFile(path.join(task.workDir, relative))).equals(await readFile(path.join(reviewerRoot, relative)))) failures.push(`Output bytes changed after ready review: ${relative}`);
+					}
+				}
+			}
+			if (task.lessonDeltaOutput) {
+				try {
+					const deltaSource = await realpath(path.join(task.workDir, task.lessonDeltaOutput));
+					if (!inside(await realpath(task.workDir), deltaSource)) throw new Error("candidate delta escaped task work directory");
+					const bytes = await readFile(deltaSource);
+					if (bytes.length > 16_000) throw new Error("candidate delta exceeds 16,000 bytes");
+					const delta = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
+					if (delta.version !== 1 || !["none", "propose", "amend", "contradict"].includes(String(delta.action)) || !Array.isArray(delta.evidencePaths) || delta.evidencePaths.length > 20 || delta.evidencePaths.some((item) => typeof item !== "string" || !isSafeRelativeOutputPath(item))) throw new Error("candidate delta has invalid schema");
+					if (delta.action !== "none" && (typeof delta.observation !== "string" || !delta.observation.trim() || typeof delta.applicability !== "string" || !delta.applicability.trim() || delta.evidencePaths.length === 0)) throw new Error("candidate delta lacks observation, applicability, or evidence");
+					if ((delta.action === "amend" || delta.action === "contradict") && (!delta.priorRef || typeof delta.priorRef !== "object" || typeof (delta.priorRef as Record<string, unknown>).storeId !== "string" || typeof (delta.priorRef as Record<string, unknown>).recordId !== "string" || !Number.isInteger((delta.priorRef as Record<string, unknown>).version))) throw new Error("candidate delta revision lacks a pinned priorRef");
+					for (const item of delta.evidencePaths as string[]) {
+						const evidence = await realpath(path.join(task.workDir, item));
+						if (!inside(await realpath(task.workDir), evidence)) throw new Error(`candidate delta evidence escaped task work directory: ${item}`);
+						await addExpectedArtifact(evidence);
+					}
+				} catch (error) { failures.push(`Candidate lesson delta is invalid or missing: ${(error as Error).message}`); }
+			}
+			if (task.executionLoop && task.loopStopReason !== "ready") failures.push(`Bounded execution stopped without a ready handoff: ${task.loopStopReason ?? "unknown"}`);
 			const accepted = checks.every((c) => c.result === "passed") && !failures.length && !unexecuted.length;
 			task.status = accepted ? "accepted" : "rejected"; task.review = { at: nowIso(), frozenReportPath, checks, artifacts, failures, unexecuted, limitations, independentCheck: input.independentCheck };
 			await save(ctx, goal); return task;

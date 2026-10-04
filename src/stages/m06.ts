@@ -16,6 +16,7 @@ import { buildM06ApplicabilityMessage, buildM06CheckMessage, buildM06ReadMessage
 import { renderPageTool } from "../tools/pagetool.ts";
 import { HarnessError, type InputRef, type StageRunRecord } from "../types.ts";
 import { readTextIfExists } from "../workspace.ts";
+import { retrieveKnowledge } from "../knowledge/retrieval.ts";
 import { loadProblemMaterials, readOutput, recordSession, relPath, sessionSpec, withRun, type StageContext } from "./context.ts";
 
 export interface M06Options {
@@ -68,8 +69,10 @@ async function discoverSources(ctx: StageContext, wanted?: string[]): Promise<Ar
 	return sources;
 }
 
-async function buildProjectState(ctx: StageContext, materialsBlock: string, purpose: string): Promise<{ text: string; note: string }> {
-	const pack = await ctx.store.buildPack({ purpose, includeOpenQuestions: true, types: ["C", "K", "Q", "X"], maxChars: 40_000 });
+async function buildProjectState(ctx: StageContext, materialsBlock: string, purpose: string, sourceGoals: string): Promise<{ text: string; note: string }> {
+	const selection = await retrieveKnowledge(ctx.store, { purpose, text: `${materialsBlock}\n${sourceGoals}`, types: ["C", "K", "Q", "X"], maxRecords: 32, maxChars: 40_000 });
+	if (selection.status !== "ready") throw new HarnessError("m06.knowledge", `M06 必需知识未能完整装载：${selection.omitted.map((item) => `${item.ref}:${item.reason}`).join("；")}`);
+	const pack = selection.pack;
 	let extra = "";
 	if (!pack.included.length) {
 		const m01 = await ctx.ws.latestCompletedRun("M01");
@@ -95,7 +98,7 @@ export async function runM06(ctx: StageContext, options: M06Options = {}): Promi
 		ctx,
 		record,
 		async () => {
-			const state = await buildProjectState(ctx, problemBlock(materials), purpose);
+			const state = await buildProjectState(ctx, problemBlock(materials), purpose, `${options.requirements ?? ""}\n${sources.map((source) => `${source.id} ${source.title}`).join("\n")}`);
 			await ctx.ws.writeOutput(record, "project-state.md", state.text, "本批统一使用的当前项目状态");
 			record.remarks.push(`适用性分析统一使用同一项目状态：${state.note}`);
 

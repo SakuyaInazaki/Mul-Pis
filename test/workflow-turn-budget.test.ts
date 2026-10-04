@@ -7,12 +7,62 @@ import { createAgentSession, ModelRuntime, type CreateAgentSessionOptions } from
 import type { Model } from "@earendil-works/pi-ai";
 import { SharedBudget } from "../src/experiments/budget.ts";
 import { createWorkflowMeteredRunner, validateWorkflowAction, workflowDecisionPrompt, workflowImproverSystemPrompt } from "../src/improvement/workflow-adapter.ts";
+import { runBoundedModelStep } from "../src/improvement/research-model.ts";
 import { PiSessionRunner } from "../src/runner/pi.ts";
-import type { UsageSummary } from "../src/runner/types.ts";
+import type { SessionHandle, SessionRunner, UsageSummary } from "../src/runner/types.ts";
 
 const MODEL = { id: "offline-model", name: "Offline model", api: "anthropic-messages", provider: "offline", baseUrl: "https://invalid.example", reasoning: false, input: ["text"], cost: { input: 0.2, output: 0.2, cacheRead: 0.2, cacheWrite: 0.2 }, contextWindow: 100_000, maxTokens: 2_000 } as Model<"anthropic-messages">;
 const RUNTIME = { getModels: () => [MODEL] } as unknown as ModelRuntime;
 const usage = (input: number, output: number) => ({ input, output, cacheRead: 0, cacheWrite: 0, totalTokens: input + output, cost: { input: 0.01, output: 0.01, cacheRead: 0, cacheWrite: 0, total: 0.02 } });
+const settledUsage: UsageSummary = { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: 0.02, reportedEvents: 1, unknownEvents: 0, complete: true, costComplete: true };
+const deadlineLimits = { maxProviderCalls: 2, maxInputTokens: 100, maxOutputTokens: 100, maxSdkEstimatedCost: 1, maxProbeCalls: 0, maxCpuMillis: 1_000, maxWallMillis: 1_000 };
+function deadlineRunner(prompt: SessionHandle["prompt"], onAbort: () => void): SessionRunner {
+	const handle: SessionHandle = {
+		ref: { id: "offline-deadline", label: "M07-offline", role: "execution", model: "offline/offline-model" },
+		prompt, transcript: () => [], readCoverage: () => [], readReturnEvents: () => [], usageEvents: () => [], usageSummary: () => settledUsage,
+		abort: async () => { onAbort(); }, toolLog: () => [], dispose: () => undefined,
+	};
+	return { create: async () => handle, resume: async () => handle };
+}
+const deadlineSpec = { label: "M07-offline", role: "execution" as const, model: "offline/offline-model", systemPrompt: "offline", tools: { kind: "none" as const }, persistDir: "/tmp" };
+
+test("workflow arm aborts a prompt that never returns and leaves usage ineligible", async () => {
+	let aborts = 0;
+	const budget = new SharedBudget("workflow-hang", deadlineLimits);
+	const runner = createWorkflowMeteredRunner(deadlineRunner(() => new Promise<never>(() => undefined), () => { aborts++; }), budget, budget.root, [], 20);
+	const handle = await runner.create(deadlineSpec);
+	await assert.rejects(handle.prompt("bounded"), /timed out/);
+	assert.equal(aborts, 1);
+	assert.equal(budget.status().settlement, "pending-or-unknown");
+});
+
+test("workflow arm rejects settled usage when the last return exhausts wall time", async (t) => {
+	let now = 1_000;
+	t.mock.method(Date, "now", () => now);
+	const budget = new SharedBudget("workflow-final-wall", { ...deadlineLimits, maxWallMillis: 50 });
+	const events: UsageSummary[] = [];
+	const runner = createWorkflowMeteredRunner(deadlineRunner(async () => { now += 51; return { text: "report", stopReason: "stop", toolCalls: 0, usage: settledUsage }; }, () => undefined), budget, budget.root, events, 1_000);
+	const handle = await runner.create(deadlineSpec);
+	await assert.rejects(handle.prompt("last arm turn"), /wall budget exhausted/);
+	assert.equal(events.length, 1, "observed provider usage is still recorded");
+	assert.equal(budget.status().settlement, "settled");
+	assert.equal(budget.status().remaining.wallMillis, 0);
+});
+
+test("bounded I request recomputes wall time at the provider boundary", async (t) => {
+	let now = 1_000, aborts = 0;
+	t.mock.method(Date, "now", () => now);
+	const budget = new SharedBudget("workflow-i-deadline", { ...deadlineLimits, maxInputTokens: 10_000, maxWallMillis: 100 });
+	const reserve = budget.reserveObservedPrompt.bind(budget);
+	budget.reserveObservedPrompt = (...args) => { const reservation = reserve(...args); now += 60; return reservation; };
+	const runner: SessionRunner = { ...deadlineRunner(() => new Promise<never>(() => undefined), () => { aborts++; }), estimateMaxSdkCost: async () => 0.1 };
+	const start = process.hrtime.bigint();
+	await assert.rejects(runBoundedModelStep({ runner, budget, lease: budget.root, spec: { label: "I-offline", role: "improver", model: "offline/offline-model", systemPrompt: "offline", persistDir: "/tmp" }, message: "Choose a bounded action", timeoutMs: 2_000 }), /timed out/);
+	const elapsedMs = Number(process.hrtime.bigint() - start) / 1_000_000;
+	assert.ok(elapsedMs < 500, `prompt used a stale 2-second timeout (${elapsedMs} ms)`);
+	assert.equal(aborts, 1);
+	assert.equal(budget.status().settlement, "pending-or-unknown");
+});
 
 test("real Pi runner SDK boundary accounts for two offline provider rounds with an actual granted file read", async (t) => {
 	const root = await mkdtemp(path.join(os.tmpdir(), "pre-rsi-workflow-turn-"));

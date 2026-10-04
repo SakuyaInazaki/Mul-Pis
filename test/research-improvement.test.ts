@@ -76,7 +76,7 @@ async function fixture(t: TestContext) {
 test("research-only campaign consumes real CPU feedback, saves an agent H candidate, and leaves active generation unchanged", async (t) => {
  const f = await fixture(t); const before = (await f.service.status()).active!.pointer.bundleId;
  const result = await f.service.run(plan());
- assert.equal(result.status, "research-only", result.stopReason);
+ assert.equal(result.status, "research-only", result.stopReason ?? "");
  assert.ok(result.selectedCandidateId);
  assert.equal((await f.service.status()).active!.pointer.bundleId, before);
  assert.ok(result.feedback.some((x) => x.status === "observed" && x.evidence.length === 1));
@@ -93,9 +93,9 @@ test("documented H plan reaches a complete fake model request with its frozen se
  assert.ok(sample, "RSI documentation includes a JSON plan");
  const documented = validateResearchPlan(JSON.parse(sample[1]));
  const run = await f.service.run({ ...documented, developmentCaseSetPath: "development.json", admissionCaseSetPath: "admission.json" });
- assert.ok(f.runner.created.length > 0, run.stopReason);
- assert.ok(run.selectedCandidateId, run.stopReason);
- assert.notEqual(run.status, "failed", run.stopReason);
+ assert.ok(f.runner.created.length > 0, run.stopReason ?? "");
+ assert.ok(run.selectedCandidateId, run.stopReason ?? "");
+ assert.notEqual(run.status, "failed", run.stopReason ?? "");
  assert.notEqual(run.stopReason?.includes("prepared request needs"), true);
 });
 
@@ -232,7 +232,7 @@ test("one-decision I handoff reads only a matching persisted development world a
   pilotBudget: { maxProviderCalls: 1, maxInputTokens: 20_000, maxOutputTokens: 2_048, maxSdkEstimatedCost: 0.1, maxProbeCalls: 0, maxCpuMillis: 1_000, maxWallMillis: 10_000 },
   budget: { ...base.budget, maxProviderCalls: 1 } };
  const run = await service.run(one);
- assert.equal(run.status, "research-only", run.stopReason); assert.equal(calls, 1);
+ assert.equal(run.status, "research-only", run.stopReason ?? ""); assert.equal(calls, 1);
  assert.equal(run.priorDevelopmentSource?.feedbackIds[0], "prior-observed");
  assert.equal(Object.hasOwn(publicResearchRun(run), "admissionPath"), false);
  assert.equal(publicResearchStatus(await service.status()).active?.provenance, "human-seed");
@@ -260,7 +260,7 @@ test("I can probe and inspect a second registered case without losing its contro
  });
  const service = new ResearchImprovementService({ workspaceRoot: f.root, runner });
  const run = await service.run({ ...plan(), maxDecisions: 3 });
- assert.equal(run.status, "research-only", run.stopReason);
+ assert.equal(run.status, "research-only", run.stopReason ?? "");
  assert.equal(run.inspections?.length, 1); assert.equal(run.decisions[1].inspectionId, run.inspections?.[0].requestId);
  assert.equal(run.inspections?.[0].methodBindingVersionId, run.frozenBundle.improverVersionId);
 });
@@ -324,7 +324,7 @@ test("development accepts justified unknown as partial scientific validity", asy
   return { text: JSON.stringify({ kind: "stop", reason: "candidate handled bounded uncertainty", selectedCandidateId: view.candidates[0].id }), usage };
  });
  const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner }).run({ ...plan(), maxDecisions: 3 });
- assert.equal(run.status, "research-only", run.stopReason);
+ assert.equal(run.status, "research-only", run.stopReason ?? "");
  assert.ok(run.selectedCandidateId);
  assert.equal(run.candidates[0].developmentStatus, "supported");
  assert.equal(run.developmentEpisodes?.[0].scientificStatus, "justified-unknown");

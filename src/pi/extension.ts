@@ -14,6 +14,7 @@ import { createMainUsageLedger } from "./main-usage.ts";
 import { ImprovementService } from "../improvement/service.ts";
 import { ResearchImprovementService, type ResearchBootstrapInput } from "../improvement/research-service.ts";
 import type { ResearchCampaignPlanV1 } from "../improvement/research-types.ts";
+import type { WorkflowEvidenceHandoffPlanV1 } from "../improvement/workflow-types.ts";
 import { publicResearchRun, publicResearchStatus } from "../improvement/research-public.ts";
 import type { CampaignPlan, ImprovementRunResult, ImprovementStatus } from "../improvement/types.ts";
 import type { ActiveBudgetPointer } from "../improvement/policy.ts";
@@ -37,6 +38,7 @@ function compact(value: unknown): Record<string, unknown> {
 	if ("activeVersionId" in item && "runs" in item) return {
 		activeVersionId: item.activeVersionId, activeProvenance: item.activeProvenance, previousVersionId: item.previousVersionId, runs: item.runs,
 	};
+	if ("runId" in item && "scientificBenefit" in item) return item;
 	if ("run" in item && item.run && typeof item.run === "object") {
 		const run = item.run as Record<string, unknown>;
 		return { runId: run.runId, status: run.status, stopReason: run.stopReason, attempts: run.attempts, campaignUsage: run.campaignUsage, activeVersionId: item.activeVersionId, evaluation: item.evaluation };
@@ -118,6 +120,8 @@ export interface ResearchExtensionOptions {
 	mainAgentStallTimeoutMs?: number;
 	mainAgentStallCheckMs?: number;
 	improvementServiceFactory?: (workspaceRoot: string, signal?: AbortSignal) => Promise<Pick<ImprovementService, "run" | "status" | "rollback"> & Partial<Pick<ImprovementService, "exportMethodPackage" | "bindMethodPackage">>> | Pick<ImprovementService, "run" | "status" | "rollback"> & Partial<Pick<ImprovementService, "exportMethodPackage" | "bindMethodPackage">>;
+	/** Allows an offline extension test to supply a bounded method service without Pi model calls. */
+	researchImprovementServiceFactory?: (workspaceRoot: string, signal?: AbortSignal) => Pick<ResearchImprovementService, "runWorkflow">;
 }
 
 export function createResearchExtension(options: ResearchExtensionOptions = {}) {
@@ -415,11 +419,11 @@ mainAgentWatchdog.unref?.();
 		pi.registerTool({
 			name: "research_method_improve",
 			label: "Bounded Research Method Improvement",
-			description: "Explicitly bootstrap, run, inspect, roll back, or manually transfer versioned H/I prompt strategies in the local CPU method-research environment. This is separate from the budget-policy mechanism-cost protocol; no admission cases means research-only, and no complete M01–M09 or L5 benefit is implied.",
+			description: "Explicitly bootstrap, run, inspect, roll back, or manually transfer versioned H/I prompt strategies. Action run is the CPU method-research campaign; workflow-run explicitly runs the M07 evidence-handoff campaign. Neither is automatic or proof of scientific benefit.",
 			promptSnippet: "Run a caller-bounded H/I method-research campaign only when explicitly authorized",
 			promptGuidelines: ["Use caller-supplied method/plan files with exact provider-call, token and SDK-estimated-cost ceilings.", "Development feedback can guide candidates; protected admission results must not return to proposal prompts."],
 			parameters: Type.Object({
-				action: Type.Union([Type.Literal("bootstrap"), Type.Literal("run"), Type.Literal("status"), Type.Literal("rollback"), Type.Literal("export"), Type.Literal("bind"), Type.Literal("advance-knowledge"), Type.Literal("transition-dependencies")]),
+				action: Type.Union([Type.Literal("bootstrap"), Type.Literal("run"), Type.Literal("workflow-run"), Type.Literal("status"), Type.Literal("rollback"), Type.Literal("export"), Type.Literal("bind"), Type.Literal("advance-knowledge"), Type.Literal("transition-dependencies")]),
 				workspace: Type.Optional(Type.String()),
 				methodsPath: Type.Optional(Type.String()),
 				planPath: Type.Optional(Type.String()),
@@ -431,6 +435,12 @@ mainAgentWatchdog.unref?.();
 			}),
 			executionMode: "sequential",
 			async execute(_id, params, signal, _update, ctx) {
+				if (params.action === "workflow-run") {
+					if (!params.planPath) throw new Error("workflow-run requires planPath");
+					const research = options.researchImprovementServiceFactory?.(workspaceFrom(params.workspace, ctx.cwd), signal) ?? new ResearchImprovementService({ workspaceRoot: workspaceFrom(params.workspace, ctx.cwd), runner: (await import("../runner/pi.ts")).createPiSessionRunner({ signal }) });
+					const run = await research.runWorkflow(JSON.parse(await readFile(path.resolve(ctx.cwd, params.planPath), "utf8")) as WorkflowEvidenceHandoffPlanV1);
+					return result({ runId: run.runId, status: run.status, outcome: run.outcome, stopReason: run.stopReason, selectedCandidateId: run.selectedCandidateId, promotedMethodVersionId: run.promotedMethodVersionId, developmentArmCount: run.developmentArms.length, protectedArmCount: run.protectedArms.length, scientificBenefit: run.scientificBenefit, budget: run.budgetAtEnd });
+				}
 				const { createPiSessionRunner } = await import("../runner/pi.ts");
 				const research = new ResearchImprovementService({ workspaceRoot: workspaceFrom(params.workspace, ctx.cwd), runner: createPiSessionRunner({ signal }) });
 				if (params.action === "bootstrap") {
@@ -599,6 +609,10 @@ mainAgentWatchdog.unref?.();
 			promptGuidelines: ["Use research_delegate only for a bounded task under an existing M07 goal; never describe a returned task as accepted.", "Expected outputs are exact work-dir-relative path strings; put human explanations in objective or report.md, never in a path."],
 			parameters: Type.Object({
 				workspace: Type.Optional(Type.String()), runId: Type.String(), objective: Type.String(), inputs: Type.Array(Type.String()), expectedOutputs: Type.Array(Type.String({ description: "Exact work-dir-relative output path; put explanations in objective or report.md" })), checks: Type.Array(Type.String()), mode: Type.Union([Type.Literal("execute"), Type.Literal("check"), Type.Literal("reason")]), parentTaskId: Type.Optional(Type.String()), supersedesTaskId: Type.Optional(Type.String()), requireIndependentCheck: Type.Optional(Type.Boolean()), knowledgeIds: Type.Optional(Type.Array(Type.String())),
+				planInput: Type.Optional(Type.String({ description: "Exact relative input path containing the approved plan for this task" })),
+				resourceInputs: Type.Optional(Type.Array(Type.Object({ id: Type.String(), version: Type.String(), input: Type.String() }))),
+				executionLoop: Type.Optional(Type.Object({ maxRounds: Type.Integer(), deadlineAt: Type.String() })),
+				lessonDeltaOutput: Type.Optional(Type.String({ description: "Exact relative output path for the task's lesson delta" })),
 				experienceRefs: Type.Optional(Type.Array(Type.Object({ storeId: Type.String(), recordId: Type.String(), version: Type.Integer() }))),
 				experienceContextRefs: Type.Optional(Type.Array(Type.Object({ storeId: Type.String(), recordId: Type.String(), version: Type.Integer() }))),
 				experienceTags: Type.Optional(Type.Array(Type.String())),

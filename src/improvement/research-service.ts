@@ -170,7 +170,7 @@ export class ResearchImprovementService {
   return bindMethodPackageV2(this.store, packagePath, active, `manual-bind-${RUN_ID()}`); }); }
  async run(input: unknown): Promise<ResearchRunV1> { const plan = validateResearchPlan(input); return this.withMutation(() => this.runUnlocked(plan)); }
  /** Explicit M07 method study. It cannot be reached from normal research or M07 begin. */
- async runWorkflow(input: unknown) { const plan = validateWorkflowPlan(input); return this.withMutation(() => runWorkflowEvidenceHandoff({ ws: this.ws, store: this.store, runner: this.runner, plan })); }
+ async runWorkflow(input: unknown) { const plan = validateWorkflowPlan(input); return this.withMutation(() => runWorkflowEvidenceHandoff({ ws: this.ws, store: this.store, runner: this.runner, plan, registeredExperienceStores: this.registeredExperienceStores })); }
 
  private async runUnlocked(plan: ResearchCampaignPlanV1): Promise<ResearchRunV1> {
   const active = await this.store.active(); if (!active) throw new HarnessError("improvement.generation", "bootstrap a human-seeded research generation first");

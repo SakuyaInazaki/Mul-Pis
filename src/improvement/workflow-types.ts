@@ -1,4 +1,6 @@
 import type { BudgetLimits } from "../experiments/contracts.ts";
+import { isKnowledgeRef } from "../knowledge/experience-index.ts";
+import type { KnowledgeRef } from "../knowledge/types.ts";
 import type { BeginGoalInput, TaskSpecInput } from "../m07/types.ts";
 import { HarnessError } from "../types.ts";
 
@@ -37,6 +39,10 @@ export interface WorkflowEvidenceHandoffPlanV1 {
 	admissionRepetitions: number;
 	/** Prior same-workspace development episodes. Protected results are excluded. */
 	metaEpisodeRunIds?: string[];
+	/** Explicit pinned I experience; omitted means no experience pack. Never selected by search. */
+	experienceRefs?: KnowledgeRef[];
+	experienceMaxRecords?: number;
+	experienceMaxChars?: number;
 }
 export interface WorkflowArmReceiptV1 {
 	caseId: string;
@@ -94,7 +100,7 @@ function budget(value: unknown): value is BudgetLimits {
 export function validateWorkflowPlan(input: unknown): WorkflowEvidenceHandoffPlanV1 {
 	if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.workflow-plan", "workflow plan must be an object");
 	const p = input as Record<string, unknown>;
-	const keys = ["version", "kind", "developmentSource", "developmentCaseSetPath", "admissionCaseSetPath", "experimentRoot", "maxDecisions", "maxCandidates", "maxInspectActions", "maxReadbackChars", "maxFeedbackItems", "perPromptTimeoutMs", "budget", "admissionRepetitions", "metaEpisodeRunIds"];
+	const keys = ["version", "kind", "developmentSource", "developmentCaseSetPath", "admissionCaseSetPath", "experimentRoot", "maxDecisions", "maxCandidates", "maxInspectActions", "maxReadbackChars", "maxFeedbackItems", "perPromptTimeoutMs", "budget", "admissionRepetitions", "metaEpisodeRunIds", "experienceRefs", "experienceMaxRecords", "experienceMaxChars"];
 	if (Object.keys(p).some((key) => !keys.includes(key)) || p.version !== 1 || p.kind !== "m07-evidence-handoff/v1") throw new HarnessError("improvement.workflow-plan", "unsupported workflow plan");
 	const src = p.developmentSource as Record<string, unknown> | undefined;
 	if (!src || Object.keys(src).sort().join(",") !== "checkpointId,m04RunId,m07RunId" || !safeId(src.m07RunId) || !safeId(src.checkpointId) || !safeId(src.m04RunId)) throw new HarnessError("improvement.workflow-plan", "development source must pin one M07 checkpoint and its M04 run");
@@ -104,6 +110,15 @@ export function validateWorkflowPlan(input: unknown): WorkflowEvidenceHandoffPla
 		if (!Number.isSafeInteger(p[key]) || (p[key] as number) < min || (p[key] as number) > max) throw new HarnessError("improvement.workflow-plan", `${key} must be ${min}–${max}`);
 	if ((p.admissionRepetitions as number) % 2 !== 0 || !budget(p.budget)) throw new HarnessError("improvement.workflow-plan", "even paired repetitions and a closed budget are required");
 	if (p.metaEpisodeRunIds !== undefined && (!Array.isArray(p.metaEpisodeRunIds) || p.metaEpisodeRunIds.length > 4 || !p.metaEpisodeRunIds.every(safeId) || new Set(p.metaEpisodeRunIds).size !== p.metaEpisodeRunIds.length)) throw new HarnessError("improvement.workflow-plan", "prior workflow episodes must be at most four distinct run IDs");
+	if (p.experienceRefs !== undefined) {
+		if (!Array.isArray(p.experienceRefs) || p.experienceRefs.length > 20 || !p.experienceRefs.every(isKnowledgeRef) || new Set(p.experienceRefs.map((ref: KnowledgeRef) => `${ref.storeId}/${ref.recordId}@${ref.version}`)).size !== p.experienceRefs.length) throw new HarnessError("improvement.workflow-plan", "experienceRefs must be at most twenty distinct pinned references");
+	}
+	const refCount = (p.experienceRefs as KnowledgeRef[] | undefined)?.length ?? 0;
+	if (refCount) {
+		if (!Number.isSafeInteger(p.experienceMaxRecords) || (p.experienceMaxRecords as number) < refCount || (p.experienceMaxRecords as number) > 20 || !Number.isSafeInteger(p.experienceMaxChars) || (p.experienceMaxChars as number) < 1 || (p.experienceMaxChars as number) > 12_000) throw new HarnessError("improvement.workflow-plan", "nonempty workflow I experience requires bounded record and character caps");
+	} else if (p.experienceMaxRecords !== undefined || p.experienceMaxChars !== undefined) {
+		if (p.experienceMaxRecords !== 0 || p.experienceMaxChars !== 0) throw new HarnessError("improvement.workflow-plan", "empty workflow I experience must have zero or omitted caps");
+	}
 	return p as unknown as WorkflowEvidenceHandoffPlanV1;
 }
 export function validateWorkflowCaseSet(input: unknown, split: WorkflowCaseSetV1["split"]): WorkflowCaseSetV1 {

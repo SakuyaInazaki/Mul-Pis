@@ -62,3 +62,12 @@ git -C third_party/sol-pi checkout --detach FETCH_HEAD
 - 当前路径：`workflow/v1.0/`
 - 所有权与角色：用户自有的科研工作流，是本项目继续研究、修改和演进的直接基础。
 - 当前状态：从原目录迁移到现路径；后续按用户需求继续发展，不作为不可修改的第三方导入物管理。
+
+## Mechanism references for the 2026-10-04 workflow increment
+
+The links below identify designs that informed original Mul-Pis code. No upstream implementation file, prompt, skill, corpus, or artifact was copied or vendored in this change batch; the versions are references, not executable dependencies. See `docs/implementation/workflow-learning-increment.md` for the specific mechanism boundaries.
+
+- [Humanize1 workflow](https://github.com/humanfia/humanize1-flow/tree/4ac8dd415cc1df16f71990bda7070e93af69287f), fixed commit `4ac8dd415cc1df16f71990bda7070e93af69287f`: same-builder/fresh-reviewer and lesson-delta inspiration. The license at that exact snapshot was not independently verified; no code or text was imported.
+- [NVlabs KDA](https://github.com/NVlabs/kda/tree/ef6ce617693ef0782b3ecb9f37e39bbf10226a90), fixed commit `ef6ce617693ef0782b3ecb9f37e39bbf10226a90`: explicit task contract and scoped references inspiration. Its public licensing distinguishes first-party source code (Apache-2.0) from documentation/prompts/skills/assets (CC-BY-4.0); third-party submodules keep separate terms. No upstream content was imported.
+- [EveryInc Compound Engineering](https://github.com/EveryInc/compound-engineering-plugin/tree/9af474a70e7f2a844338519ad9e92aafbd92d4fb), fixed commit `9af474a70e7f2a844338519ad9e92aafbd92d4fb`: relevance-first learning lookup inspiration. Its public repository states MIT; no source content was imported.
+- [KernelWiki](https://github.com/mit-han-lab/KernelWiki/tree/76d27b56f804e7e7295d4c570e1e5d7eef4b0a75), fixed commit `76d27b56f804e7e7295d4c570e1e5d7eef4b0a75`: task-scoped technical-reference lookup inspiration. Its tooling is described as MIT-style, while embedded/derivative artifacts may have separate terms. No wiki data or tooling was imported.

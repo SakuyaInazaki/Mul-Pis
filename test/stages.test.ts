@@ -347,7 +347,7 @@ describe("stages with the scripted runner", () => {
 		assert.deepEqual(applSpec.tools, { kind: "none" });
 		const applMsg = [...runner.sessions.values()].find((s) => s.spec.label === "M06-S001-applicability")!.transcript[0].text;
 		assert.ok(applMsg.includes("研究机制 A 是否解释现象 B"));
-		assert.ok(applMsg.includes("C001"), "applicability sessions get the shared project state");
+		assert.ok(applMsg.includes("初始认识 ALPHA"), "when no published knowledge matches the source goal, applicability gets the shared baseline rather than unrelated IDs");
 		const summary = await readFile(result.summaryPath, "utf8");
 		assert.ok(summary.includes("S001") && summary.includes("S002"));
 		assert.ok(summary.includes("失败"));

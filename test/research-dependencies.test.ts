@@ -78,7 +78,7 @@ test("active I requirements survive an omitted plan selection and block new call
 	const f = await fixture(t, () => { calls++; return { text: JSON.stringify({ kind: "stop", reason: "more evidence needed" }), usage }; });
 	await activateDependent(f, [requirement(f.storeId, "improver")]);
 	const first = await f.service.run(plan());
-	assert.equal(first.status, "research-only", first.stopReason);
+	assert.equal(first.status, "research-only", first.stopReason ?? "");
 	assert.equal(calls, 1, "live pinned requirements permit a new I child without repeated plan refs");
 	await apply(f.store, [{ op: "limit", target: "K001", kind: "needs_recheck", reason: "依据需要复核", authority: "test-review" }]);
 	const recheck = await f.service.run(plan());
@@ -144,7 +144,7 @@ test("a candidate saying to ignore dependencies still inherits controller-pinned
 	const required = requirement(f.storeId, "improver");
 	await activateDependent(f, [required]);
 	const result = await f.service.run(plan());
-	assert.equal(result.status, "research-only", result.stopReason);
+	assert.equal(result.status, "research-only", result.stopReason ?? "");
 	assert.ok(result.candidates.length > 0 && calls > 3);
 	const candidate = await f.generation.readStrategy(result.candidates[0]!.strategyVersionId);
 	assert.deepEqual(candidate.sourceExperienceRefs, [], "plan omitted explicit selection");
@@ -167,7 +167,7 @@ test("a live limit after the first I reply blocks the next I request in the same
 	});
 	await activateDependent(f, [requirement(f.storeId, "improver")]);
 	const result = await f.service.run(plan());
-	assert.equal(result.status, "inconclusive", result.stopReason);
+	assert.equal(result.status, "inconclusive", result.stopReason ?? "");
 	assert.equal(calls, 1);
 	assert.ok(result.feedback.some((item) => item.status === "observed" && item.observations.some((observation) => observation.source === "probe")));
 });

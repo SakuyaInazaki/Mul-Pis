@@ -46,7 +46,12 @@ export async function runBoundedModelStep(args: {
  catch (error) { handle.dispose(); throw error; }
  let settled = false;
  try {
-  const turn = await timedPrompt(handle, prepared.message, args.timeoutMs);
+  // Price lookup and session creation happen before reservation. Recheck the
+  // campaign clock at the actual provider boundary so setup time cannot give
+  // this request a stale per-prompt allowance.
+  const remainingWallMs = Math.min(budget.status().remaining.wallMillis, budget.status(lease).remaining.wallMillis);
+  if (remainingWallMs <= 0) throw new HarnessError("improvement.budget", "campaign wall budget exhausted before prompt");
+  const turn = await timedPrompt(handle, prepared.message, Math.min(args.timeoutMs, remainingWallMs));
   const usage = turn.usage ?? handle.usageSummary();
   budget.settlePrompt(reservation, usage); settled = true;
   if (budget.status(lease).settlement !== "settled" || !usage.complete || !usage.costComplete || usage.reportedEvents < 1) throw new HarnessError("improvement.usage", "provider usage or SDK-estimated cost is incomplete");

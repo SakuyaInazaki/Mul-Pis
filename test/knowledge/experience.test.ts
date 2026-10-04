@@ -46,6 +46,13 @@ test("stable store identity prevents cross-workspace C001 collisions and require
 	assert.match(registered.markdown, /外库认识/);
 	assert.doesNotMatch(registered.markdown, /本库认识/);
 	assert.deepEqual(registered.selected[0].ref, external);
+	const localSnapshot = (await one.store.current())!.id;
+	const externalOnly = await createExperienceProvider(one.store, new Map([[two.storeId, two.store]])).select(query([external], { expectedSnapshotId: localSnapshot }));
+	assert.equal(externalOnly.status, "ready", "external-only refs still validate the local frozen K epoch");
+	assert(externalOnly.checkedSnapshots.some((item) => item.storeId === one.storeId && item.snapshotId === localSnapshot));
+	const wrongEpoch = await createExperienceProvider(one.store, new Map([[two.storeId, two.store]])).select(query([external], { expectedSnapshotId: "G999" }));
+	assert.equal(wrongEpoch.status, "incomplete");
+	assert(wrongEpoch.omitted.some((item) => item.reason === "snapshot-mismatch"));
 	const wrongRegistration = await createExperienceProvider(one.store, new Map([[two.storeId, one.store]])).select(query([external]));
 	assert.equal(wrongRegistration.status, "incomplete");
 	const overRequested = await createExperienceProvider(one.store, new Map([[two.storeId, two.store]])).select(query([ref(one.storeId, "C001"), external], { maxRecords: 1 }));

@@ -106,14 +106,19 @@ export function createExperienceProvider(localStore: KnowledgeStore, registeredS
 			stores.set(localId, localStore);
 			const checkedSnapshots: ExperienceSelection["checkedSnapshots"] = [];
 			const initialState = new Map<string, string>();
+			const captureStore = async (storeId: string, store: KnowledgeStore): Promise<void> => {
+				if (initialState.has(storeId)) return;
+				const snapshot = (await store.current())?.id ?? "";
+				initialState.set(storeId, JSON.stringify({ snapshot, limits: await store.limits() }));
+				checkedSnapshots.push({ storeId, snapshotId: snapshot || undefined });
+			};
+			// The local K epoch constrains selection even when every requested record
+			// comes from an explicitly registered external store.
+			await captureStore(localId, localStore);
 			const storeFor = async (ref: KnowledgeRef): Promise<KnowledgeStore | undefined> => {
 				const store = stores.get(ref.storeId);
 				if (!store || await store.storeId() !== ref.storeId) return undefined;
-				if (!initialState.has(ref.storeId)) {
-					const snapshot = (await store.current())?.id ?? "";
-					initialState.set(ref.storeId, JSON.stringify({ snapshot, limits: await store.limits() }));
-					checkedSnapshots.push({ storeId: ref.storeId, snapshotId: snapshot || undefined });
-				}
+				await captureStore(ref.storeId, store);
 				return store;
 			};
 			const omitted: ExperienceSelection["omitted"] = [];
@@ -201,12 +206,14 @@ export async function verifyRequiredKnowledge(workspaceRoot: string, refs: Knowl
 	const stores = new Map(registeredStores);
 	stores.set(localId, local);
 	const before = new Map<string, string>();
+	const localSnapshot = (await local.current())?.id;
+	if (expectedSnapshotId !== undefined && localSnapshot !== expectedSnapshotId) throw new HarnessError("knowledge.required", "necessary knowledge snapshot changed");
+	before.set(localId, JSON.stringify({ snapshot: localSnapshot, limits: await local.limits() }));
 	for (const ref of refs) {
 		const store = stores.get(ref.storeId);
 		if (!store || await store.storeId() !== ref.storeId) throw new HarnessError("knowledge.required", `necessary knowledge store is not registered: ${ref.storeId}`);
 		if (!before.has(ref.storeId)) {
 			const snapshot = (await store.current())?.id;
-			if (ref.storeId === localId && expectedSnapshotId !== undefined && snapshot !== expectedSnapshotId) throw new HarnessError("knowledge.required", "necessary knowledge snapshot changed");
 			before.set(ref.storeId, JSON.stringify({ snapshot, limits: await store.limits() }));
 		}
 		const record = await store.get(ref.recordId, ref.version);

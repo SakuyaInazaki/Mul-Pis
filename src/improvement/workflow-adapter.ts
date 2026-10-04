@@ -6,6 +6,7 @@ import { SharedBudget } from "../experiments/budget.ts";
 import type { BudgetLease } from "../experiments/contracts.ts";
 import { createFileKnowledgeStore } from "../knowledge/store.ts";
 import { createExperienceProvider, verifyRequiredKnowledge } from "../knowledge/experience-index.ts";
+import type { KnowledgeStore } from "../knowledge/types.ts";
 import { createM07Controller, latestFormalBaseline } from "../m07/controller.ts";
 import type { SessionHandle, SessionRunner, SessionSpec, UsageSummary } from "../runner/types.ts";
 import { runM04 } from "../stages/m04.ts";
@@ -16,6 +17,7 @@ import { GenerationStore, isM07WorkflowStrategy, type M07WorkflowStrategyV1, typ
 import { buildWorkflowMetaEpisode, loadWorkflowMetaEpisode, metaEpisodeForModel } from "./meta-episode.ts";
 import { validateResearchHypothesis, type ResearchHypothesisV1 } from "./policy-host.ts";
 import { runBoundedModelStep } from "./research-model.ts";
+import { timedPrompt } from "./admission.ts";
 import { validateWorkflowCaseSet, type WorkflowArmReceiptV1, type WorkflowCaseSetV1, type WorkflowEvidenceHandoffPlanV1, type WorkflowRunV1 } from "./workflow-types.ts";
 
 type Action = { kind: "inspect"; object: "method" | "development-feedback" | "meta-episode"; id: string; start: number; maxChars: number } |
@@ -163,14 +165,27 @@ async function protectAdmissionInputs(source: Workspace, plan: WorkflowEvidenceH
 	}
 }
 
-export function createWorkflowMeteredRunner(base: SessionRunner, budget: SharedBudget, lease: BudgetLease, events: UsageSummary[]): SessionRunner {
+/** Each arm turn has its own timeout and may not outlive the campaign wall clock. */
+function workflowDeadlineMs(budget: SharedBudget, lease: BudgetLease, perPromptTimeoutMs: number): number {
+	const remaining = Math.min(budget.status().remaining.wallMillis, budget.status(lease).remaining.wallMillis);
+	if (remaining <= 0) throw new HarnessError("improvement.budget", "workflow campaign wall budget exhausted");
+	return Math.max(1, Math.min(perPromptTimeoutMs, remaining));
+}
+
+function assertWorkflowBudgetOpen(budget: SharedBudget, lease: BudgetLease): void {
+	if (budget.status().remaining.wallMillis <= 0 || budget.status(lease).remaining.wallMillis <= 0) throw new HarnessError("improvement.budget", "workflow campaign wall budget exhausted");
+}
+
+export function createWorkflowMeteredRunner(base: SessionRunner, budget: SharedBudget, lease: BudgetLease, events: UsageSummary[], perPromptTimeoutMs = 300_000): SessionRunner {
 	const wrap = (handle: SessionHandle, spec: SessionSpec): SessionHandle => ({ ...handle, prompt: async (message) => {
+		const timeoutMs = workflowDeadlineMs(budget, lease, perPromptTimeoutMs);
 		const reservation = budget.reserveObservedTurn(lease);
 		let settled = false;
 		try {
-			const turn = await handle.prompt(message);
+			const turn = await timedPrompt(handle, message, timeoutMs);
 			const usage = turn.usage ?? handle.usageSummary();
 			budget.settleObservedTurn(reservation, usage); settled = true; events.push(usage);
+			assertWorkflowBudgetOpen(budget, lease);
 			if (!usage.complete || !usage.costComplete || usage.reportedEvents < 1 || budget.status(lease).settlement !== "settled") throw new HarnessError("improvement.workflow-usage", "M07/M04 provider use is incomplete or over the reserved serial turn envelope");
 			return turn;
 		} catch (error) { if (!settled) budget.markObservedTurnUnknown(reservation); throw error; }
@@ -178,12 +193,12 @@ export function createWorkflowMeteredRunner(base: SessionRunner, budget: SharedB
 	return { create: async (spec) => wrap(await base.create(spec), spec), resume: async (ref) => { const handle = await base.resume(ref); const spec = JSON.parse(await readFile(ref.specFile!, "utf8")) as SessionSpec; return wrap(handle, spec); }, estimateMaxSdkCost: base.estimateMaxSdkCost?.bind(base) };
 }
 
-async function executeArm(args: { source: Workspace; root: string; bundle: NonNullable<Awaited<ReturnType<GenerationStore["active"]>>>["bundle"]; h: StrategyRecordV1; i: StrategyRecordV1; caseInput: WorkflowCaseSetV1["cases"][number]; arm: WorkflowArmReceiptV1["arm"]; runner: SessionRunner; budget: SharedBudget; lease: BudgetLease }): Promise<WorkflowArmReceiptV1> {
+async function executeArm(args: { source: Workspace; root: string; bundle: NonNullable<Awaited<ReturnType<GenerationStore["active"]>>>["bundle"]; h: StrategyRecordV1; i: StrategyRecordV1; caseInput: WorkflowCaseSetV1["cases"][number]; arm: WorkflowArmReceiptV1["arm"]; runner: SessionRunner; budget: SharedBudget; lease: BudgetLease; perPromptTimeoutMs: number }): Promise<WorkflowArmReceiptV1> {
 	const receipt: WorkflowArmReceiptV1 = { caseId: args.caseInput.id, arm: args.arm, methodVersionId: args.h.versionId, workspaceRoot: args.root, checkResults: [], usage: { providerCalls: 0, inputTokens: 0, outputTokens: 0, sdkEstimatedCost: 0, complete: false }, status: "inconclusive" };
 	const events: UsageSummary[] = [];
 	try {
 		const ctx = await seedArm(args.source, args.root, args.bundle, args.h, args.i, args.caseInput);
-		ctx.runner = createWorkflowMeteredRunner(args.runner, args.budget, args.lease, events);
+		ctx.runner = createWorkflowMeteredRunner(args.runner, args.budget, args.lease, events, args.perPromptTimeoutMs);
 		const controller = createM07Controller(ctx);
 		const goal = await controller.begin({ ...args.caseInput.goal, workflowMethodVersionId: args.h.versionId });
 		receipt.m07RunId = goal.runId;
@@ -219,25 +234,26 @@ async function executeArm(args: { source: Workspace; root: string; bundle: NonNu
 		const savedGoal = await controller.status(goal.runId);
 		receipt.feedbackStatus = savedGoal.checkpoints?.find((x) => x.id === checkpoint.id)?.feedbackStatus;
 		if (m04.record.status !== "completed" || m04.record.failures.length || !["complete"].includes(String(receipt.feedbackStatus))) throw new HarnessError("improvement.workflow-arm", "M04 or full evidence handoff is incomplete");
+		assertWorkflowBudgetOpen(args.budget, args.lease);
 		if (args.budget.status(args.lease).settlement !== "settled") throw new HarnessError("improvement.workflow-usage", "arm resource use is not settled");
 		receipt.status = "complete";
 	} catch (error) { receipt.reason = (error as Error).message; }
-	receipt.usage = { providerCalls: events.reduce((n, x) => n + x.reportedEvents, 0), inputTokens: events.reduce((n, x) => n + x.input + x.cacheRead + x.cacheWrite, 0), outputTokens: events.reduce((n, x) => n + x.output, 0), sdkEstimatedCost: events.reduce((n, x) => n + x.cost, 0), complete: events.length >= 2 && events.every((x) => x.complete && x.costComplete && x.reportedEvents >= 1) && args.budget.status(args.lease).settlement === "settled" };
+	receipt.usage = { providerCalls: events.reduce((n, x) => n + x.reportedEvents, 0), inputTokens: events.reduce((n, x) => n + x.input + x.cacheRead + x.cacheWrite, 0), outputTokens: events.reduce((n, x) => n + x.output, 0), sdkEstimatedCost: events.reduce((n, x) => n + x.cost, 0), complete: events.length >= 2 && events.every((x) => x.complete && x.costComplete && x.reportedEvents >= 1) && args.budget.status(args.lease).settlement === "settled" && args.budget.status().remaining.wallMillis > 0 && args.budget.status(args.lease).remaining.wallMillis > 0 };
 	if (!receipt.usage.complete) { receipt.status = "inconclusive"; receipt.reason ??= "complete M07/M04 usage is unavailable"; }
 	return receipt;
 }
 
-export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: GenerationStore; runner: SessionRunner; plan: WorkflowEvidenceHandoffPlanV1 }): Promise<WorkflowRunV1> {
-	const { ws, store, runner, plan } = args;
+export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: GenerationStore; runner: SessionRunner; plan: WorkflowEvidenceHandoffPlanV1; registeredExperienceStores?: ReadonlyMap<string, KnowledgeStore> }): Promise<WorkflowRunV1> {
+ const { ws, store, runner, plan, registeredExperienceStores } = args;
 	const active = await store.active();
 	if (!active) throw new HarnessError("improvement.workflow", "explicit workflow H/I bundle is required");
 	const h = await store.readStrategy(active.bundle.executorVersionId), i = await store.readStrategy(active.bundle.improverVersionId);
 	if (active.bundle.environmentVersion !== "m07-workflow/v1" || !active.bundle.allowedCapabilities.includes("m07-evidence-read") || active.bundle.allowedCapabilities.includes("cpu-probe") || !isM07WorkflowStrategy(h.artifact) || h.artifact.slot !== "evidence-handoff" || i.artifact.kind !== "diagnostic-improver-prompt") throw new HarnessError("improvement.workflow", "active bundle must contain evidence-handoff H and diagnostic I");
 	const verifyLive = async (records: StrategyRecordV1[]) => {
 		const refs = uniqueRefs(records.flatMap((record) => [...record.requiredKnowledgeRefs, ...record.requiredExperienceRefs.map((item) => item.ref)]));
-		await verifyRequiredKnowledge(ws.root, refs, active.bundle.knowledgeSnapshot);
+		await verifyRequiredKnowledge(ws.root, refs, active.bundle.knowledgeSnapshot, registeredExperienceStores);
 		const knowledge = createFileKnowledgeStore(ws.knowledgeDir); await knowledge.init();
-		const provider = createExperienceProvider(knowledge);
+		const provider = createExperienceProvider(knowledge, registeredExperienceStores);
 		const iRefs = uniqueRefs(records.flatMap((record) => record.requiredExperienceRefs.filter((item) => item.targetKind === "improver").map((item) => item.ref)));
 		if (iRefs.length) {
 			const selected = await provider.select({ targetKind: "improver", applicability: { stage: "method-research", tags: ["m07-evidence-handoff"] }, requestedRefs: iRefs, expectedSnapshotId: active.bundle.knowledgeSnapshot, maxRecords: 100, maxChars: 100_000 });
@@ -264,6 +280,20 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 		const formal = await latestFormalBaseline({ ws, store: currentKnowledge, runner, config: await ws.loadConfig() });
 		const currentSnapshot = (await currentKnowledge.current())?.id;
 		if (!formal || formal.knowledgeSnapshot !== active.bundle.knowledgeSnapshot || currentSnapshot !== active.bundle.knowledgeSnapshot) throw new HarnessError("improvement.workflow-baseline", "frozen H/K and the current formal M04 baseline must share one knowledge epoch before I starts");
+		const frozenLimits = JSON.stringify(await currentKnowledge.limits());
+		const ensureLiveEpoch = async () => {
+			if ((await currentKnowledge.current())?.id !== currentSnapshot || JSON.stringify(await currentKnowledge.limits()) !== frozenLimits) throw new HarnessError("improvement.workflow-epoch", "workflow knowledge epoch or live limits changed during the campaign");
+		};
+		const requestedExperienceRefs = plan.experienceRefs ?? [];
+		const selectExperience = () => createExperienceProvider(currentKnowledge, registeredExperienceStores).select({ targetKind: "improver", applicability: { stage: "method-research", tags: ["m07-evidence-handoff"] }, requestedRefs: requestedExperienceRefs, expectedSnapshotId: active.bundle.knowledgeSnapshot, maxRecords: plan.experienceMaxRecords || 1, maxChars: plan.experienceMaxChars || 1 });
+		const selectedExperience = await selectExperience();
+		if (requestedExperienceRefs.length && (selectedExperience.status !== "ready" || selectedExperience.selected.length !== requestedExperienceRefs.length || !selectedExperience.markdown)) { run.status = "inconclusive"; run.outcome = "search-incomplete"; run.stopReason = "requested workflow I experience was unavailable or incomplete"; return run; }
+		const experience = { markdown: selectedExperience.status === "ready" ? selectedExperience.markdown : "", refs: selectedExperience.selected.map((item) => item.ref), scientificRequiredRefs: selectedExperience.selected.flatMap((item) => item.scientificRequiredRefs) };
+		const ensureLiveExperience = async () => {
+			if (!experience.refs.length) return;
+			const selected = await selectExperience();
+			if (selected.status !== "ready" || JSON.stringify(selected.selected.map((item) => item.ref)) !== JSON.stringify(experience.refs) || selected.markdown !== experience.markdown) throw new HarnessError("improvement.experience", "selected workflow I experience changed or became unavailable before a new model request");
+		};
 		const development = await loadCases(path.resolve(ws.root, plan.developmentCaseSetPath), "development");
 		await protectAdmissionInputs(ws, plan, development);
 		const priorEpisodes = await Promise.all((plan.metaEpisodeRunIds ?? []).map((priorId) => loadWorkflowMetaEpisode(store.root, ws.root, priorId, store)));
@@ -284,16 +314,21 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 		let lastActionResult: unknown;
 		let inspectCount = 0, readbackChars = 0;
 		for (let index = 0; index < plan.maxDecisions; index++) {
+			await ensureLiveEpoch();
 			await verifyLive([h, i]);
+			await ensureLiveExperience();
 			const view = { version: 1, environment: "m07-evidence-handoff/v1", target: "executor", current: { bundleId: active.bundle.bundleId, executorVersionId: h.versionId, improverVersionId: i.versionId, slot: "evidence-handoff" },
 				methods: { executor: { versionId: h.versionId, body: h.artifact.body }, improver: { versionId: i.versionId, body: i.artifact.body }, candidates: [...candidates.values()].map((c) => ({ versionId: c.versionId, developmentStatus: run.candidates.find((item) => item.versionId === c.versionId)?.developmentStatus })) },
 				developmentSource: { id: source.id, m07RunId: source.m07RunId, m04RunId: source.m04RunId, excerpt: source.text.slice(0, 4_000), totalChars: source.text.length },
 				metaEpisodes: priorEpisodes.map((episode) => ({ id: episode.id, runId: episode.runId, terminal: episode.terminal, decisionKinds: episode.decisions.map((d) => d.kind ?? "none"), candidateOutcomes: episode.candidates.map((c) => ({ id: c.id, claim: c.hypothesis.claim, developmentStatus: c.developmentStatus })), feedbackIds: episode.feedbackIndex.map((f) => f.id), sdkEstimatedCost: episode.usage.sdkEstimatedCost })),
 				feedback: run.developmentArms.slice(-plan.maxFeedbackItems).map((arm) => ({ caseId: arm.caseId, arm: arm.arm, methodVersionId: arm.methodVersionId, status: arm.status, checkResults: arm.checkResults, reason: arm.reason })),
-				budget: budget.status(), remainingActions: { decisions: plan.maxDecisions - index, candidates: plan.maxCandidates - candidates.size, inspections: plan.maxInspectActions - inspectCount, readbackChars: plan.maxReadbackChars - readbackChars, finalDecision: index === plan.maxDecisions - 1 }, lastActionResult };
+				experience: { markdown: experience.markdown, refs: experience.refs }, budget: budget.status(), remainingActions: { decisions: plan.maxDecisions - index, candidates: plan.maxCandidates - candidates.size, inspections: plan.maxInspectActions - inspectCount, readbackChars: plan.maxReadbackChars - readbackChars, finalDecision: index === plan.maxDecisions - 1 }, lastActionResult };
 			const decision = { index: index + 1, improverVersionId: i.versionId, outcome: "proposing" } as WorkflowRunV1["decisions"][number]; run.decisions.push(decision); await save();
+			await ensureLiveEpoch();
+			await ensureLiveExperience();
 			const step = await runBoundedModelStep({ runner, budget, lease: budget.root, spec: { label: `I-workflow-${runId}-${index}`, role: "improver", model: active.bundle.modelConfig.improver, systemPrompt: workflowImproverSystemPrompt(i.artifact.body), persistDir: ws.sessionsDir, methodBinding: { versionId: i.versionId } },
-				message: workflowDecisionPrompt(view), timeoutMs: plan.perPromptTimeoutMs });
+				message: workflowDecisionPrompt(view), timeoutMs: workflowDeadlineMs(budget, budget.root, plan.perPromptTimeoutMs) });
+			assertWorkflowBudgetOpen(budget, budget.root);
 			decision.sessionId = step.sessionId;
 			const action = validateWorkflowAction(JSON.parse(step.text), { sourceId: source.id, metaIds: priorEpisodes.map((e) => e.id), methodIds: [h.versionId, i.versionId, ...candidates.keys()], candidateIds: [...candidates.keys()], readbackRemaining: plan.maxReadbackChars - readbackChars });
 			decision.action = action.kind; decision.outcome = "executed";
@@ -306,8 +341,10 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 			}
 			if (action.kind === "propose") {
 				if (candidates.size >= plan.maxCandidates || action.body === h.artifact.body || [...candidates.values()].some((c) => c.artifact.body === action.body)) { lastActionResult = { kind: "propose", outcome: "rejected", reason: "unchanged, repeated or over candidate cap" }; await save(); continue; }
+				await ensureLiveEpoch();
+				await ensureLiveExperience();
 				const artifact = validateStrategy("executor", { version: 1, kind: "m07-workflow-prompt", slot: "evidence-handoff", body: action.body }) as M07WorkflowStrategyV1;
-				const candidate = await store.writeStrategy({ versionId: store.newId("H-agent"), kind: "executor", artifact, parentVersionId: h.versionId, origin: "agent-generated", applicability: action.hypothesis.applicability, limitations: [], sourceExperienceRefs: [], requiredExperienceRefs: uniqueRequirements([...h.requiredExperienceRefs, ...i.requiredExperienceRefs]), requiredKnowledgeRefs: uniqueRefs([...h.requiredKnowledgeRefs, ...i.requiredKnowledgeRefs]), state: "research-only" });
+				const candidate = await store.writeStrategy({ versionId: store.newId("H-agent"), kind: "executor", artifact, parentVersionId: h.versionId, origin: "agent-generated", applicability: action.hypothesis.applicability, limitations: [], sourceExperienceRefs: experience.refs.map((ref) => ({ targetKind: "improver" as const, ref })), requiredExperienceRefs: uniqueRequirements([...h.requiredExperienceRefs, ...i.requiredExperienceRefs]), requiredKnowledgeRefs: uniqueRefs([...h.requiredKnowledgeRefs, ...i.requiredKnowledgeRefs, ...experience.scientificRequiredRefs]), state: "research-only" });
 				candidates.set(candidate.versionId, candidate); run.candidates.push({ versionId: candidate.versionId, parentVersionId: h.versionId, producedByImproverVersionId: i.versionId, developmentStatus: "untested", hypothesis: action.hypothesis }); decision.candidateVersionId = candidate.versionId; lastActionResult = { kind: "propose", outcome: "executed", candidateId: candidate.versionId }; await save(); continue;
 			}
 			if (action.kind === "evaluate-development") {
@@ -319,8 +356,9 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 				for (const item of development.cases) {
 					const receipts: WorkflowArmReceiptV1[] = [];
 					for (const [arm, method] of [["baseline", h], ["candidate", candidateRecord]] as const) {
-						const receipt = await executeArm({ source: template, root: path.join(root, `development-${candidate.versionId}-${item.id}-${arm}`), bundle: active.bundle, h: method, i, caseInput: item, arm, runner, budget, lease: budget.root });
+						const receipt = await executeArm({ source: template, root: path.join(root, `development-${candidate.versionId}-${item.id}-${arm}`), bundle: active.bundle, h: method, i, caseInput: item, arm, runner, budget, lease: budget.root, perPromptTimeoutMs: plan.perPromptTimeoutMs });
 						run.developmentArms.push(receipt); receipts.push(receipt); await save();
+						if (receipt.status !== "complete" || !receipt.usage.complete) break;
 					}
 					if (receipts.some((x) => x.status !== "complete" || !x.usage.complete)) { complete = false; break; }
 					for (let n = 0; n < item.checks.length; n++) { const before = receipts[0]!.checkResults[n]!.passed, after = receipts[1]!.checkResults[n]!.passed; if (!before && after) gain = true; if (before && !after) regression = true; }
@@ -328,6 +366,7 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 				candidate.developmentStatus = !complete ? "inconclusive" : regression || !gain ? "rejected" : "supported";
 				lastActionResult = { kind: "evaluate-development", candidateId: candidate.versionId, developmentStatus: candidate.developmentStatus }; await save(); continue;
 			}
+			assertWorkflowBudgetOpen(budget, budget.root);
 			if (!action.selectedCandidateId) { await freezeDevelopment("no-winner"); run.status = "research-only"; run.outcome = "completed-no-candidate"; run.stopReason = action.reason; return run; }
 			const selected = run.candidates.find((c) => c.versionId === action.selectedCandidateId)!;
 			if (selected.developmentStatus !== "supported") { await freezeDevelopment("inconclusive"); run.status = "inconclusive"; run.outcome = "search-incomplete"; run.stopReason = "selected H lacks complete development support"; return run; }
@@ -336,32 +375,43 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 			run.selectionReceiptPath = path.join(dir, "selection-before-g.json");
 			await writeFileAtomic(run.selectionReceiptPath, `${JSON.stringify({ version: 1, candidateId: selected.versionId, selectedAt: nowIso(), I: i.versionId, H0: h.versionId, K: active.bundle.knowledgeSnapshot }, null, 2)}\n`);
 			await save();
-			if (!plan.admissionCaseSetPath) { run.status = "research-only"; run.stopReason = "no caller-frozen protected G set"; return run; }
+			if (!plan.admissionCaseSetPath) { assertWorkflowBudgetOpen(budget, budget.root); run.status = "research-only"; run.stopReason = "no caller-frozen protected G set"; return run; }
 			const admission = await loadCases(path.resolve(ws.root, plan.admissionCaseSetPath), "admission");
 			if (admission.cases.some((a) => development.cases.some((d) => a.id === d.id || JSON.stringify({ ...a, id: "" }) === JSON.stringify({ ...d, id: "" })))) throw new HarnessError("improvement.workflow-g", "development and protected cases overlap");
 			await protectAdmissionInputs(ws, plan, development, admission);
 			await freezeCaseInputs(ws, template, admission.cases);
 			run.protectedOpenedAt = nowIso(); await save();
 			const candidateRecord = candidates.get(selected.versionId)!;
+			await ensureLiveEpoch();
 			await verifyLive([h, i, candidateRecord]);
+			await ensureLiveExperience();
 			for (let repeat = 0; repeat < plan.admissionRepetitions; repeat++) for (const item of admission.cases) {
 				const receipts: WorkflowArmReceiptV1[] = [];
 				const order = repeat % 2 === 0 ? [["baseline", h], ["candidate", candidateRecord]] as const : [["candidate", candidateRecord], ["baseline", h]] as const;
-				for (const [arm, method] of order) { const receipt = await executeArm({ source: template, root: path.join(root, `protected-${repeat}-${item.id}-${arm}`), bundle: active.bundle, h: method, i, caseInput: item, arm, runner, budget, lease: budget.root }); run.protectedArms.push(receipt); receipts.push(receipt); await save(); }
+				for (const [arm, method] of order) { const receipt = await executeArm({ source: template, root: path.join(root, `protected-${repeat}-${item.id}-${arm}`), bundle: active.bundle, h: method, i, caseInput: item, arm, runner, budget, lease: budget.root, perPromptTimeoutMs: plan.perPromptTimeoutMs }); run.protectedArms.push(receipt); receipts.push(receipt); await save(); if (receipt.status !== "complete" || !receipt.usage.complete) break; }
 				if (receipts.some((r) => r.status !== "complete" || !r.usage.complete)) { run.status = "inconclusive"; run.outcome = "search-incomplete"; run.stopReason = "protected arm or usage incomplete"; return run; }
 				const before = receipts.find((r) => r.arm === "baseline")!, after = receipts.find((r) => r.arm === "candidate")!;
 				if (after.checkResults.some((r) => !r.passed) || !before.checkResults.some((r) => !r.passed)) { run.status = "rejected"; run.outcome = "candidate-rejected"; run.stopReason = "protected G found no strict gain or incomplete candidate checks"; return run; }
 			}
-			if (budget.status().settlement !== "settled") { run.status = "inconclusive"; run.stopReason = "campaign budget is not settled"; return run; }
+			if (budget.status().settlement !== "settled" || budget.status().remaining.wallMillis <= 0) { run.status = "inconclusive"; run.stopReason = "campaign budget is unsettled or its wall clock is exhausted"; return run; }
 			await verifyLive([h, i, candidateRecord]);
+			assertWorkflowBudgetOpen(budget, budget.root);
 			const current = await store.active();
 			if (current?.pointer.bundleId !== active.pointer.bundleId || current.pointer.runId !== active.pointer.runId) { run.status = "inconclusive"; run.stopReason = "active generation changed during isolated evaluation"; return run; }
 			const admitted = await store.writeStrategy({ versionId: store.newId("H-admitted"), kind: "executor", artifact: candidateRecord.artifact, parentVersionId: candidateRecord.versionId, origin: "agent-generated", applicability: candidateRecord.applicability, limitations: candidateRecord.limitations, sourceExperienceRefs: candidateRecord.sourceExperienceRefs, requiredExperienceRefs: candidateRecord.requiredExperienceRefs, requiredKnowledgeRefs: candidateRecord.requiredKnowledgeRefs, state: "admitted" });
 			const next = await store.writeBundle({ bundleId: store.newId("bundle"), parents: [active.bundle.bundleId], executorVersionId: admitted.versionId, improverVersionId: i.versionId, knowledgeSnapshot: active.bundle.knowledgeSnapshot, environmentVersion: "m07-workflow/v1", modelConfig: active.bundle.modelConfig, protocolVersion: active.bundle.protocolVersion, allowedCapabilities: active.bundle.allowedCapabilities, state: "admitted" });
+			await verifyLive([h, i, candidateRecord, admitted]);
+			await ensureLiveEpoch();
+			await ensureLiveExperience();
+			const latest = await store.active();
+			if (latest?.pointer.bundleId !== active.pointer.bundleId || latest.pointer.runId !== active.pointer.runId) { run.status = "inconclusive"; run.stopReason = "active generation changed before workflow promotion"; return run; }
+			await ensureLiveEpoch();
+			assertWorkflowBudgetOpen(budget, budget.root);
+			if (budget.status().settlement !== "settled") { run.status = "inconclusive"; run.stopReason = "campaign budget is not settled before workflow promotion"; return run; }
 			await store.activate(next.bundleId, active.pointer, "local-workflow-handoff-admission", runId);
 			run.promotedMethodVersionId = admitted.versionId; run.status = "promoted"; run.outcome = "promoted"; run.stopReason = "local evidence-handoff mechanism checks passed in paired isolated arms; scientific benefit remains unverified"; return run;
 		}
 		await freezeDevelopment("inconclusive"); run.status = "inconclusive"; run.outcome = "search-incomplete"; run.stopReason = "I exhausted decisions without an explicit terminal choice"; return run;
-	} catch (error) { run.status = error instanceof HarnessError && ["improvement.budget", "improvement.usage", "improvement.timeout", "improvement.workflow-usage"].includes(error.code) ? "inconclusive" : "failed"; run.outcome = "search-incomplete"; run.stopReason = (error as Error).message; return run; }
+	} catch (error) { run.status = error instanceof HarnessError && ["improvement.budget", "improvement.usage", "improvement.timeout", "improvement.workflow-usage", "improvement.experience", "improvement.workflow-epoch"].includes(error.code) ? "inconclusive" : "failed"; run.outcome = "search-incomplete"; run.stopReason = (error as Error).message; return run; }
 	finally { run.finishedAt = nowIso(); await save(); }
 }
