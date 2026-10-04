@@ -20,7 +20,7 @@ jobs:
       github.run_attempt == 1 &&
       github.event_name == 'push' &&
       github.ref == 'refs/heads/improve/workflow-learning-reliability' &&
-      github.event.head_commit.message == 'Diagnose bounded M07 model execution (mul-pis-20261004-lab-retry3)'
+      github.event.head_commit.message == 'Verify configured DeepSeek authentication before M07 (mul-pis-20261004-lab-retry4)'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

@@ -19,7 +19,7 @@ import { DeepSeekCampaignBudget } from "../src/runner/deepseek-campaign.ts";
 import { createConfinedCampaignFileTools } from "../src/runner/confined-campaign-files.ts";
 
 const MODEL = "deepseek/deepseek-flash:low";
-const MAX_CNY = 24;
+const MAX_CNY = 23;
 const CAMPAIGN_MS = 9 * 60_000;
 const FLAGS = ["-O2", "-std=c++17", "-fopenmp", "-pthread"];
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -34,6 +34,18 @@ let statusBudget: DeepSeekCampaignBudget | undefined;
 let statusPhase = "preflight";
 let statusTaskTelemetry: Record<string, unknown> | undefined;
 let statusRuntimeKey: string | undefined;
+let statusCredentialProbe: { httpStatus: number | null; accepted: boolean } | undefined;
+let statusAuthSource: "runtime" | "unexpected" | undefined;
+let statusSdkAuthMatch: boolean | undefined;
+
+async function credentialProbe(key: string, request: typeof fetch = fetch): Promise<{ httpStatus: number | null; accepted: boolean }> {
+	const response = await request("https://api.deepseek.com/models", {
+		method: "GET", redirect: "error", signal: AbortSignal.timeout(20_000),
+		headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
+	});
+	await response.body?.cancel().catch(() => undefined);
+	return { httpStatus: Number.isInteger(response.status) ? response.status : null, accepted: response.status === 200 };
+}
 
 function privateFailureMessage(raw: unknown, runtimeKey: string | undefined): string | undefined {
 	if (typeof raw !== "string" || !raw || !runtimeKey) return undefined;
@@ -266,6 +278,15 @@ async function main() {
 	delete process.env.DEEPSEEK_API_KEY;
 	if (!runtimeKey?.trim()) fail("DeepSeek credential absent");
 	statusRuntimeKey = runtimeKey;
+	statusPhase = "credential-probe";
+	try { statusCredentialProbe = await credentialProbe(runtimeKey); }
+	catch { statusCredentialProbe = { httpStatus: null, accepted: false }; }
+	if (!statusCredentialProbe.accepted) {
+		if (statusCredentialProbe.httpStatus === 401 || statusCredentialProbe.httpStatus === 403)
+			fail("DeepSeek credential rejected by read-only model-list endpoint");
+		fail("DeepSeek credential probe did not complete successfully");
+	}
+	statusPhase = "credential-verified";
 	const found = await inputs(inputDir);
 	await requireIsolation(); // fail before any provider call
 	statusPhase = "isolated-preflight-passed";
@@ -321,9 +342,13 @@ async function main() {
 		const runtime = await ModelRuntime.create({ modelsPath, authPath: path.join(profile, "auth.json"),
 			modelsStorePath: path.join(profile, "models-store.json"), allowModelNetwork: false, refreshOnCreate: false });
 		await runtime.setRuntimeApiKey("deepseek", runtimeKey);
+		statusAuthSource = runtime.getProviderAuthStatus("deepseek").source === "runtime" ? "runtime" : "unexpected";
+		if (statusAuthSource !== "runtime") fail("SDK runtime credential source did not verify");
 		const resolved = runtime.getModel("deepseek", "deepseek-flash");
 		if (resolved?.provider !== "deepseek" || resolved.id !== "deepseek-flash" ||
 			resolved.api !== "openai-completions" || resolved.baseUrl !== "https://api.deepseek.com") fail("unexpected model route");
+		statusSdkAuthMatch = (await runtime.getAuth(resolved))?.auth.apiKey === runtimeKey;
+		if (!statusSdkAuthMatch) fail("SDK model credential resolution did not verify");
 		const abort = new AbortController();
 		const timer = setTimeout(() => abort.abort(), CAMPAIGN_MS);
 		try {
@@ -395,6 +420,8 @@ async function main() {
 			statusPhase = "m07-finished";
 			await saveStatus({ outcome: finished.outcome, taskStatus: task.status,
 				loopStopReason: task.loopStopReason, taskTelemetry: statusTaskTelemetry,
+				credentialProbe: statusCredentialProbe, sdkAuthSource: statusAuthSource,
+				sdkAuthMatch: statusSdkAuthMatch,
 				independentValidation: "pending-private-post-run" });
 			console.log(JSON.stringify({ status: "private-campaign-complete", outcome: finished.outcome, budget: budget.snapshot() }));
 			if (finished.outcome !== "fulfilled") process.exitCode = 1;
@@ -413,7 +440,7 @@ async function main() {
 	}
 }
 
-export const offlineChecks = { sourceShape, inputs, stageProbe, verifierScratch, privateFailureMessage };
+export const offlineChecks = { sourceShape, inputs, stageProbe, verifierScratch, privateFailureMessage, credentialProbe };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	main().catch(async error => {
@@ -423,6 +450,9 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
 			...(preProvider ? { privateDiagnostic: error instanceof SandboxPreflightError
 				? error.privateDiagnostic : error instanceof Error ? error.message.slice(-2000) : "unknown pre-provider failure" } : {}),
 			...(statusTaskTelemetry ? { taskTelemetry: statusTaskTelemetry } : {}),
+			...(statusCredentialProbe ? { credentialProbe: statusCredentialProbe } : {}),
+			...(statusAuthSource ? { sdkAuthSource: statusAuthSource } : {}),
+			...(statusSdkAuthMatch !== undefined ? { sdkAuthMatch: statusSdkAuthMatch } : {}),
 			independentValidation: "not-complete" }); } catch { /* transport synthesizes an incomplete status */ }
 		// Never print the model response, source, input paths, credential, or raw provider errors.
 		console.error(JSON.stringify({ status: "private-campaign-failed", category: "campaign-exception" }));

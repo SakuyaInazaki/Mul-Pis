@@ -73,3 +73,21 @@ test("private diagnostic redacts a key crossing the 4000-character output bounda
 	assert.equal(redacted.includes(key), false);
 	assert.equal(redacted.slice(-5).includes("sk-"), false);
 });
+
+test("read-only credential probe uses one official model-list request and stores only status", async () => {
+	let calls = 0;
+	const mocked = (async (url: string | URL | Request, init?: RequestInit) => {
+		calls++;
+		assert.equal(String(url), "https://api.deepseek.com/models");
+		assert.equal(init?.method, "GET");
+		assert.equal(init?.redirect, "error");
+		assert.equal((init?.headers as Record<string, string>).Authorization, "Bearer sk-SYNTHETIC_TEST_KEY");
+		return new Response(null, { status: 200 });
+	}) as typeof fetch;
+	assert.deepEqual(await offlineChecks.credentialProbe("sk-SYNTHETIC_TEST_KEY", mocked),
+		{ httpStatus: 200, accepted: true });
+	assert.equal(calls, 1);
+	const rejected = (async () => new Response(null, { status: 401 })) as typeof fetch;
+	assert.deepEqual(await offlineChecks.credentialProbe("sk-SYNTHETIC_TEST_KEY", rejected),
+		{ httpStatus: 401, accepted: false });
+});
