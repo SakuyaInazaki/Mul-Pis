@@ -31,6 +31,7 @@ export class DeepSeekCampaignBudget {
 	private active = false;
 	private promptStart = 0;
 	private stopped = false;
+	private stopReason?: "payload-boundary" | "ceiling" | "usage-reconciliation" | "prompt-failure";
 
 	constructor(limits: DeepSeekCampaignLimits) {
 		if (!/^deepseek\/[^/]+(?::(?:off|minimal|low|medium|high|max))?$/.test(limits.model) || limits.endpoint !== "https://api.deepseek.com" ||
@@ -94,6 +95,7 @@ export class DeepSeekCampaignBudget {
 	reserve(payloadBytes: number): void {
 		if (!this.active || this.stopped || !count(payloadBytes) || payloadBytes > this.limits.maxInputPayloadBytes) {
 			this.stopped = true;
+			this.stopReason ??= "payload-boundary";
 			throw new HarnessError("runner.campaign", "provider payload exceeds the campaign boundary");
 		}
 		const next = this.reservations + 1;
@@ -102,6 +104,7 @@ export class DeepSeekCampaignBudget {
 		if (next > this.limits.maxProviderCalls || next - this.promptStart > this.limits.maxProviderCallsPerPrompt ||
 			this.reservedCny + worstCny > this.limits.maxCny + 1e-9) {
 			this.stopped = true;
+			this.stopReason ??= "ceiling";
 			throw new HarnessError("runner.campaign", "campaign call or CNY planning ceiling exhausted");
 		}
 		this.reservations = next;
@@ -127,15 +130,17 @@ export class DeepSeekCampaignBudget {
 			}
 		} catch (error) {
 			this.stopped = true;
+			this.stopReason ??= "usage-reconciliation";
 			throw error;
 		} finally {
 			this.active = false;
 		}
 	}
 
-	failPrompt(): void { this.stopped = true; this.active = false; }
+	failPrompt(): void { this.stopped = true; this.active = false; this.stopReason ??= "prompt-failure"; }
 
-	snapshot(): { reservedCny: number; reservations: number; stopped: boolean; active: boolean } {
-		return { reservedCny: this.reservedCny, reservations: this.reservations, stopped: this.stopped, active: this.active };
+	snapshot(): { reservedCny: number; reservations: number; stopped: boolean; active: boolean; stopReason?: string } {
+		return { reservedCny: this.reservedCny, reservations: this.reservations, stopped: this.stopped, active: this.active,
+			...(this.stopReason ? { stopReason: this.stopReason } : {}) };
 	}
 }

@@ -53,3 +53,23 @@ test("checker bind source is top-level temporary storage, not under private 0700
 		assert.equal((await stat(scratch)).mode & 0o777, 0o777);
 	} finally { await rm(scratch, { recursive: true, force: true }); }
 });
+
+test("private task failure diagnostic redacts exact key and authorization tokens", () => {
+	const key = "sk-SYNTHETICPRIVATE123456";
+	const message = `request failed Authorization: Bearer ${key}\nnext Bearer sk-ANOTHERSYNTHETIC777`;
+	const redacted = offlineChecks.privateFailureMessage(message, key);
+	assert.ok(redacted);
+	assert.equal(redacted.includes(key), false);
+	assert.equal(redacted.includes("sk-ANOTHERSYNTHETIC777"), false);
+	assert.match(redacted, /REDACTED_KEY/);
+});
+
+test("private diagnostic redacts a key crossing the 4000-character output boundary", () => {
+	const key = "sk-SYNTHETICBOUNDARYSECRET123456";
+	const message = "x".repeat(3995) + key + " trailing diagnostic";
+	const redacted = offlineChecks.privateFailureMessage(message, key);
+	assert.ok(redacted);
+	assert.equal(redacted.length, 4000);
+	assert.equal(redacted.includes(key), false);
+	assert.equal(redacted.slice(-5).includes("sk-"), false);
+});

@@ -83,6 +83,7 @@ test("campaign reserves each tool-loop provider request before transport, then r
 	await assert.rejects(reviewer.prompt("review"), /campaign call or CNY planning ceiling exhausted/);
 	assert.equal(sent.count, 2, "denied request must not reach transport");
 	assert.equal(budget.snapshot().stopped, true);
+	assert.equal(budget.snapshot().stopReason, "ceiling");
 	builder.dispose(); reviewer.dispose();
 });
 
@@ -97,6 +98,7 @@ test("campaign rejects endpoint changes, oversize payloads, and unknown outcomes
 	await assert.rejects(handle.prompt("x"), /DeepSeek model, endpoint or price ceiling did not verify/);
 	assert.equal(sent.count, 0);
 	assert.equal(budget.snapshot().stopped, true);
+	assert.equal(budget.snapshot().stopReason, "prompt-failure");
 	await assert.rejects(handle.prompt("again"), /campaign is stopped/);
 	handle.dispose();
 
@@ -104,6 +106,7 @@ test("campaign rejects endpoint changes, oversize payloads, and unknown outcomes
 	direct.beginPrompt();
 	assert.throws(() => direct.reserve(501), /payload exceeds/);
 	assert.equal(direct.snapshot().stopped, true);
+	assert.equal(direct.snapshot().stopReason, "payload-boundary");
 	assert.throws(() => direct.beginPrompt(), /campaign is stopped/);
 });
 
@@ -167,6 +170,7 @@ test("campaign halts when usage ledger cannot be persisted after a successful re
 	assert.equal(sent.count, 1);
 	assert.equal(budget.snapshot().reservations, 1);
 	assert.equal(budget.snapshot().stopped, true);
+	assert.equal(budget.snapshot().stopReason, "prompt-failure");
 	handle.dispose();
 });
 
@@ -182,6 +186,7 @@ test("campaign reconciles reported tokens and SDK cost against each reserved env
 			at: new Date().toISOString(), provider: "deepseek", model: "deepseek-flash", stopReason: "stop",
 			usage, status: "reported", costStatus: "priced", costSource: "sdk-estimate" }]), /provider usage or call outcome/);
 		assert.equal(budget.snapshot().stopped, true);
+		assert.equal(budget.snapshot().stopReason, "usage-reconciliation");
 		assert.equal(budget.snapshot().reservations, 1);
 	}
 });

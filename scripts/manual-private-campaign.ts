@@ -19,7 +19,7 @@ import { DeepSeekCampaignBudget } from "../src/runner/deepseek-campaign.ts";
 import { createConfinedCampaignFileTools } from "../src/runner/confined-campaign-files.ts";
 
 const MODEL = "deepseek/deepseek-flash:low";
-const MAX_CNY = 25;
+const MAX_CNY = 24;
 const CAMPAIGN_MS = 9 * 60_000;
 const FLAGS = ["-O2", "-std=c++17", "-fopenmp", "-pthread"];
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -32,6 +32,72 @@ let statusOutputDir: string | undefined;
 let statusRunId: string | undefined;
 let statusBudget: DeepSeekCampaignBudget | undefined;
 let statusPhase = "preflight";
+let statusTaskTelemetry: Record<string, unknown> | undefined;
+let statusRuntimeKey: string | undefined;
+
+function privateFailureMessage(raw: unknown, runtimeKey: string | undefined): string | undefined {
+	if (typeof raw !== "string" || !raw || !runtimeKey) return undefined;
+	let value = raw.replaceAll(runtimeKey, "[REDACTED_KEY]")
+		.replace(/sk-[A-Za-z0-9_-]{6,}/gi, "[REDACTED_KEY]")
+		.replace(/Bearer\s+[^\s'"\r\n]+/gi, "Bearer [REDACTED_KEY]")
+		.replace(/Authorization\s*[:=]\s*[^\r\n]+/gi, "Authorization: [REDACTED_KEY]");
+	value = value.slice(0, 4000);
+	if (value.includes(runtimeKey) || /sk-[A-Za-z0-9_-]{6,}/i.test(value) ||
+		/Bearer\s+(?!\[REDACTED_KEY\])/i.test(value)) return undefined;
+	return value;
+}
+function taskFailureCategory(raw: unknown): string {
+	if (typeof raw !== "string") return "none";
+	const http = /(?:HTTP|status(?: code)?)[ :=]+(400|401|402|403|404|408|409|413|422|429|500|502|503|504)\b/i.exec(raw);
+	if (http) return `http-${http[1]}`;
+	if (/campaign call or CNY planning ceiling exhausted/i.test(raw)) return "campaign-ceiling";
+	if (/provider payload exceeds the campaign boundary|input payload exceeds/i.test(raw)) return "payload-ceiling";
+	if (/provider usage or call outcome is incomplete/i.test(raw)) return "usage-incomplete";
+	if (/stopReason=length|output cap/i.test(raw)) return "output-limit";
+	if (/abort|deadline|timeout/i.test(raw)) return "abort-or-deadline";
+	if (/unsafe active tool set|campaign file|custom tool|tool execution/i.test(raw)) return "tool-grant";
+	if (/model.*not found|model.*resolved|model route/i.test(raw)) return "model-resolution";
+	if (/did not stop normally|runner.stop/i.test(raw)) return "sdk-stop";
+	return "unclassified";
+}
+async function taskTelemetry(ws: Workspace, task: any, runtimeKey: string | undefined): Promise<Record<string, unknown>> {
+	const failure = privateFailureMessage(task.executionFailure, runtimeKey);
+	const sessionFile = typeof task.session?.file === "string" ? path.resolve(task.session.file) : undefined;
+	let usage: Array<Record<string, unknown>> = [];
+	if (sessionFile?.startsWith(path.resolve(ws.sessionsDir) + path.sep) && sessionFile.endsWith(".jsonl")) {
+		const usageFile = sessionFile.replace(/\.jsonl$/, ".usage.jsonl");
+		try {
+			const rows = (await readFile(usageFile, "utf8")).split(/\r?\n/).filter(Boolean);
+			usage = rows.slice(-12).map(line => {
+				const row = JSON.parse(line) as Record<string, any>;
+				const summary = row.summary ?? {};
+				const eventRows = Array.isArray(row.events) ? row.events : [];
+				return { outcome: ["completed", "failed", "aborted"].includes(row.outcome) ? row.outcome : "unknown",
+					promptIndex: Number.isSafeInteger(row.promptIndex) ? row.promptIndex : null,
+					usage: Object.fromEntries(["input", "output", "cacheRead", "cacheWrite", "totalTokens", "cost",
+						"reportedEvents", "unknownEvents"].filter(key => typeof summary[key] === "number" && Number.isFinite(summary[key]))
+						.map(key => [key, summary[key]])),
+					complete: summary.complete === true, costComplete: summary.costComplete === true,
+					events: eventRows.map((event: Record<string, unknown>) => ({
+						kind: ["assistant", "tool-result", "compaction", "branch-summary"].includes(String(event.kind)) ? event.kind : "unknown",
+						status: ["reported", "unknown"].includes(String(event.status)) ? event.status : "unknown",
+						stopReason: ["stop", "toolUse", "error", "aborted", "length"].includes(String(event.stopReason)) ? event.stopReason : "other",
+					})),
+				};
+			});
+		} catch { usage = [{ status: "unavailable" }]; }
+	}
+	return { taskId: typeof task.taskId === "string" ? task.taskId : null,
+		status: ["running", "returned", "failed", "accepted", "rejected", "unknown"].includes(task.status) ? task.status : "unknown",
+		loopStopReason: typeof task.loopStopReason === "string" ? task.loopStopReason : null,
+		failureCategory: taskFailureCategory(task.executionFailure),
+		failure: failure ?? null, failureDiagnosticStatus: failure ? "redacted-private" : "unavailable",
+		sessionCreated: Boolean(sessionFile), roundCount: Array.isArray(task.executionRounds) ? task.executionRounds.length : 0,
+		tools: Array.isArray(task.toolLog) ? task.toolLog.map((item: Record<string, unknown>) => ({
+			name: ["read", "write", "edit", "material_read", "material_list"].includes(String(item.name)) ? item.name : "other",
+			ok: item.ok === true })) : [],
+		usage };
+}
 
 async function saveStatus(value: Record<string, unknown>): Promise<void> {
 	if (!statusOutputDir) return;
@@ -199,6 +265,7 @@ async function main() {
 	const runtimeKey = process.env.DEEPSEEK_API_KEY;
 	delete process.env.DEEPSEEK_API_KEY;
 	if (!runtimeKey?.trim()) fail("DeepSeek credential absent");
+	statusRuntimeKey = runtimeKey;
 	const found = await inputs(inputDir);
 	await requireIsolation(); // fail before any provider call
 	statusPhase = "isolated-preflight-passed";
@@ -301,6 +368,7 @@ async function main() {
 				objective: "Read the copied original inputs. Replace the required TODO parallel implementations with genuinely different OpenMP strategies in a complete candidate.cpp. Preserve all original non-target functions and the built-in checker/main. Examine host-generated verification.json after a round, compare actual per-kernel timings with original baselines, and use any remaining bounded round to improve or select the strongest observed valid candidate. If no gain is observed, say so; do not claim a global optimum. Use only the provided confined read/write/edit tools; do not call shell or network. The host creates verification.json after your turn; do not write it. Do not create prose deliverables.",
 				inputs: found.files.map(x => `problem/raw/${x}`), expectedOutputs: ["candidate.cpp"], checks: CHECKS,
 				executionLoop: { maxRounds: 2, deadlineAt: new Date(Date.now() + CAMPAIGN_MS - 60_000).toISOString() } });
+			statusTaskTelemetry = await taskTelemetry(ws, task, runtimeKey);
 			const candidate = path.join(task.workDir, "candidate.cpp");
 			const verificationPath = path.join(task.workDir, "verification.json");
 			if (existsSync(candidate)) await copyFile(candidate, path.join(outputDir, "candidate.cpp"));
@@ -326,16 +394,26 @@ async function main() {
 				limitations: ["Original built-in checker is not independent finite-output validation; private post-run validation remains necessary."] });
 			statusPhase = "m07-finished";
 			await saveStatus({ outcome: finished.outcome, taskStatus: task.status,
-				loopStopReason: task.loopStopReason, independentValidation: "pending-private-post-run" });
+				loopStopReason: task.loopStopReason, taskTelemetry: statusTaskTelemetry,
+				independentValidation: "pending-private-post-run" });
 			console.log(JSON.stringify({ status: "private-campaign-complete", outcome: finished.outcome, budget: budget.snapshot() }));
+			if (finished.outcome !== "fulfilled") process.exitCode = 1;
 		} finally { clearTimeout(timer); }
 	} finally {
+		if (runId && !statusTaskTelemetry) {
+			try {
+				const goalFile = path.join(new Workspace(path.join(campaignRoot, "workspace")).runDir("M07", runId), "goal.json");
+				const goal = JSON.parse(await readFile(goalFile, "utf8"));
+				const lastTask = Array.isArray(goal.tasks) ? goal.tasks.at(-1) : undefined;
+				if (lastTask) statusTaskTelemetry = await taskTelemetry(new Workspace(path.join(campaignRoot, "workspace")), lastTask, statusRuntimeKey);
+			} catch { statusTaskTelemetry = { status: "unavailable" }; }
+		}
 		await preserveCandidate(new Workspace(path.join(campaignRoot, "workspace")), runId, outputDir).catch(() => undefined);
 		await rm(campaignRoot, { recursive: true, force: true });
 	}
 }
 
-export const offlineChecks = { sourceShape, inputs, stageProbe, verifierScratch };
+export const offlineChecks = { sourceShape, inputs, stageProbe, verifierScratch, privateFailureMessage };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	main().catch(async error => {
@@ -344,6 +422,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
 		try { await saveStatus({ outcome: "incomplete", errorCategory: "campaign-exception",
 			...(preProvider ? { privateDiagnostic: error instanceof SandboxPreflightError
 				? error.privateDiagnostic : error instanceof Error ? error.message.slice(-2000) : "unknown pre-provider failure" } : {}),
+			...(statusTaskTelemetry ? { taskTelemetry: statusTaskTelemetry } : {}),
 			independentValidation: "not-complete" }); } catch { /* transport synthesizes an incomplete status */ }
 		// Never print the model response, source, input paths, credential, or raw provider errors.
 		console.error(JSON.stringify({ status: "private-campaign-failed", category: "campaign-exception" }));

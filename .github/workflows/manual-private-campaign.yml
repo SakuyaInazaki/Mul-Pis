@@ -20,7 +20,7 @@ jobs:
       github.run_attempt == 1 &&
       github.event_name == 'push' &&
       github.ref == 'refs/heads/improve/workflow-learning-reliability' &&
-      github.event.head_commit.message == 'Repair isolated workspace traversal and run M07 (mul-pis-20261004-lab-retry2)'
+      github.event.head_commit.message == 'Diagnose bounded M07 model execution (mul-pis-20261004-lab-retry3)'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
