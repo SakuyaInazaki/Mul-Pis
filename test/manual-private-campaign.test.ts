@@ -45,3 +45,11 @@ test("isolation probe remains readable by the sandbox UID under umask 077", asyn
 		await rm(directory, { recursive: true, force: true });
 	}
 });
+
+test("checker bind source is top-level temporary storage, not under private 0700 workspace", async () => {
+	const scratch = await offlineChecks.verifierScratch("original");
+	try {
+		assert.equal(path.dirname(scratch), os.tmpdir());
+		assert.equal((await stat(scratch)).mode & 0o777, 0o777);
+	} finally { await rm(scratch, { recursive: true, force: true }); }
+});

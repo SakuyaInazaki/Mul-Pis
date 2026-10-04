@@ -76,6 +76,8 @@ export interface StageRunRecord {
 	stage: string;
 	runId: string;
 	startedAt: string;
+	/** Persisted stage-local creation order for newly allocated runs; legacy records omit it. */
+	startSequence?: number;
 	finishedAt?: string;
 	status: RunStatus;
 	inputs: InputRef[];

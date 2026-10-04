@@ -97,6 +97,33 @@ test("latest incomplete or failed M04 blocks formal baseline instead of falling 
 	assert.equal(exploratory.m04BaselineRunId, undefined);
 });
 
+test("M04 starts have persisted creation sequence even when wall-clock times tie", async (t) => {
+	const f = await fixture(t, false);
+	const first = await f.ws.startRun("M04", []);
+	const second = await new Workspace(f.root).startRun("M04", []);
+	const [third, fourth] = await Promise.all([f.ws.startRun("M04", []), new Workspace(f.root).startRun("M04", [])]);
+	assert.deepEqual([first, second, third, fourth].map((run) => run.startSequence), [1, 2, 3, 4]);
+	await f.ws.writeRun({ ...fourth, startedAt: first.startedAt });
+	assert.equal((await f.ws.latestRun("M04"))?.runId, fourth.runId);
+});
+
+test("legacy equal-time M04 records block baseline selection instead of using random ID order", async (t) => {
+	const f = await fixture(t, false);
+	const baseline = await f.ws.startRun("M04", []);
+	await f.ws.finishRun(baseline, "completed");
+	await f.ws.writeRun({ ...baseline, startSequence: undefined });
+	await f.ws.writeRun({ ...baseline, runId: "00000000T000000Z-0000", startSequence: undefined, status: "failed", failures: ["unmerged"], finishedAt: baseline.finishedAt });
+	await assert.rejects(f.controller.begin(begin), /无法确定最新正式基线/);
+});
+
+test("an unsequenced M04 tied with a sequenced run remains ambiguous", async (t) => {
+	const f = await fixture(t, false);
+	const baseline = await f.ws.startRun("M04", []);
+	await f.ws.finishRun(baseline, "completed");
+	await f.ws.writeRun({ ...baseline, runId: "00000000T000000Z-0000", startSequence: undefined, status: "failed", failures: ["unmerged"], finishedAt: baseline.finishedAt });
+	await assert.rejects(f.controller.begin(begin), /无法确定最新正式基线/);
+});
+
 test("completed M04 with an unmerged proposal is not a formal baseline", async (t) => {
 	const f = await fixture(t, false);
 	const run = await f.ws.startRun("M04", [{ label: "原问题", path: f.ws.problemFile }]);

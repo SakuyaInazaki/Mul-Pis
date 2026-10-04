@@ -26,7 +26,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CHECKS = [
 	"Required parallel implementations are substantively different and original non-target functions are preserved",
 	"Original program checker exits successfully on several CPU-only configurations",
-	"Machine-readable compiler, environment and timing observations were captured without fabricated values",
+	"Measured per-kernel timings are compared with the preserved original baselines; within the bounded rounds the candidate strategies are improved or selected for the strongest observed performance, with any lack of gain recorded honestly and no global-optimality claim",
 ];
 let statusOutputDir: string | undefined;
 let statusRunId: string | undefined;
@@ -101,6 +101,11 @@ async function stageProbe(scratch: string): Promise<void> {
 	// Actions uses umask 077; mode on creation alone would leave an unreadable 0600 file for sandbox UID 65534.
 	await chmod(source, 0o644);
 }
+async function verifierScratch(kind: "original" | "candidate"): Promise<string> {
+	const directory = await mkdtemp(path.join(os.tmpdir(), `mulpis-${kind}-check-`));
+	await chmod(directory, 0o777);
+	return directory;
+}
 function extractBody(source: string, name: string): string | null {
 	const declaration = new RegExp(`\\b${name}\\s*\\(`, "g");
 	let match: RegExpExecArray | null;
@@ -168,7 +173,8 @@ async function checkCandidate(original: string, candidate: string, scratch: stri
 			stderrTail: run.status === 0 ? undefined : (run.stderr ?? "").slice(-1000) });
 	}
 	verification.originalCheckerRuns = runs;
-	verification.status = shape.ok && runs.every(x => x.exitCode === 0) ? "passed" : "failed";
+	verification.status = shape.ok && runs.every(x => x.exitCode === 0 && x.reportedKernelMs.length >= 3)
+		? "passed" : "failed";
 	return verification;
 }
 
@@ -205,9 +211,11 @@ async function main() {
 	statusBudget = budget;
 	try {
 		const ws = new Workspace(path.join(campaignRoot, "workspace"));
+		statusPhase = "workspace-init";
 		const store = createFileKnowledgeStore(ws.knowledgeDir);
 		await runInit(ws, store);
 		for (const name of found.files) await copyFile(path.join(inputDir, name), path.join(ws.rawDir, name));
+		statusPhase = "private-inputs-staged";
 		await writeFile(ws.problemFile,
 			"Private C++ parallel-programming task. Use only the supplied original inputs. Produce optimized source and machine-readable correctness/performance observations. Do not produce a prose report, screenshots, presentation, or personal reflection. Do not invent measurements.\n" +
 			(await readFile(path.join(ws.rawDir, found.files.find(x => /\.md$/i.test(x)) ?? found.files.find(x => /\.txt$/i.test(x))!), "utf8")),
@@ -218,11 +226,19 @@ async function main() {
 		const targetCount = [...originalText.matchAll(/\/\/\s*TODO[^\n]*\n\s*static\s+void\s+([A-Za-z_]\w*)\s*\(/g)].length;
 		if (targetCount < 2 || !originalText.includes('"--threads"') || !originalText.includes('"--repeats"'))
 			fail("private source does not satisfy bounded campaign preflight contract");
-		const originalSmoke = await checkCandidate(originalPath, originalPath, path.join(campaignRoot, "original-preflight"));
+		statusPhase = "original-source-smoke";
+		// The separate /tmp directory has no 0700 campaignRoot ancestor, so sandbox UID 65534 can traverse its bind source.
+		const originalScratch = await verifierScratch("original");
+		let originalSmoke;
+		try { originalSmoke = await checkCandidate(originalPath, originalPath, originalScratch); }
+		finally { await rm(originalScratch, { recursive: true, force: true }); }
+		await writeFile(path.join(outputDir, "verification.json"),
+			JSON.stringify({ kind: "original-preflight", result: originalSmoke }, null, 2), { mode: 0o600 });
 		if ((originalSmoke.compile as { success?: boolean } | undefined)?.success !== true || !Array.isArray(originalSmoke.originalCheckerRuns) ||
 			originalSmoke.originalCheckerRuns.length !== 4 || originalSmoke.originalCheckerRuns.some(x => x.exitCode !== 0))
-			fail("isolated original source compile/check preflight failed");
+			throw new SandboxPreflightError("original source compile/check failed; inspect encrypted verification.json");
 		statusPhase = "source-and-isolation-preflight-passed";
+		statusPhase = "model-route-setup";
 		const profile = path.join(campaignRoot, "profile");
 		await mkdir(profile, { mode: 0o700 });
 		const modelsPath = path.join(profile, "models.json");
@@ -255,9 +271,12 @@ async function main() {
 					return { ...handle, prompt: async (message: string) => {
 						const turn = await handle.prompt(message);
 						const candidate = path.join(workDir, "candidate.cpp");
-						const result = existsSync(candidate)
-							? await checkCandidate(originalPath, candidate, path.join(campaignRoot, "sandbox"))
-							: { version: 1, status: "failed", reason: "candidate missing" };
+						let result: Record<string, unknown> = { version: 1, status: "failed", reason: "candidate missing" };
+						if (existsSync(candidate)) {
+							const candidateScratch = await verifierScratch("candidate");
+							try { result = await checkCandidate(originalPath, candidate, candidateScratch); }
+							finally { await rm(candidateScratch, { recursive: true, force: true }); }
+						}
 						result.originalBaselineRuns = originalSmoke.originalCheckerRuns;
 						await writeFile(path.join(workDir, "verification.json"), JSON.stringify(result, null, 2), { mode: 0o600 });
 						return turn;
@@ -266,7 +285,7 @@ async function main() {
 				resume: (ref: any) => actual.resume(ref),
 			};
 			const controller = createM07Controller({ ws, store, runner, config: await ws.loadConfig() });
-			const goal = await controller.begin({ goal: "Complete the private C++ parallel optimization requested in the original inputs.",
+			const goal = await controller.begin({ goal: "Seek the strongest measured C++ parallel optimization attainable within this bounded private campaign, using the original inputs and preserved baselines.",
 				problemRelation: "Code and machine-readable correctness/performance scope of the supplied private problem.",
 				constraints: ["Use only the supplied private inputs and configured DeepSeek model.",
 					"Preserve the original non-target implementations, main and built-in checker.",
@@ -279,7 +298,7 @@ async function main() {
 			statusPhase = "m07-begun";
 			statusPhase = "model-dispatch";
 			const task = await controller.delegate(runId, { mode: "execute",
-				objective: "Read the copied original inputs. Replace the required TODO parallel implementations with genuinely different OpenMP strategies in a complete candidate.cpp. Preserve all original non-target functions and the built-in checker/main. Use only the provided confined read/write/edit tools; do not call shell or network. The host creates verification.json after your turn; do not write it. Do not create prose deliverables.",
+				objective: "Read the copied original inputs. Replace the required TODO parallel implementations with genuinely different OpenMP strategies in a complete candidate.cpp. Preserve all original non-target functions and the built-in checker/main. Examine host-generated verification.json after a round, compare actual per-kernel timings with original baselines, and use any remaining bounded round to improve or select the strongest observed valid candidate. If no gain is observed, say so; do not claim a global optimum. Use only the provided confined read/write/edit tools; do not call shell or network. The host creates verification.json after your turn; do not write it. Do not create prose deliverables.",
 				inputs: found.files.map(x => `problem/raw/${x}`), expectedOutputs: ["candidate.cpp"], checks: CHECKS,
 				executionLoop: { maxRounds: 2, deadlineAt: new Date(Date.now() + CAMPAIGN_MS - 60_000).toISOString() } });
 			const candidate = path.join(task.workDir, "candidate.cpp");
@@ -316,12 +335,15 @@ async function main() {
 	}
 }
 
-export const offlineChecks = { sourceShape, inputs, stageProbe };
+export const offlineChecks = { sourceShape, inputs, stageProbe, verifierScratch };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	main().catch(async error => {
+		const preProvider = ["preflight", "isolated-preflight-passed", "workspace-init", "private-inputs-staged",
+			"original-source-smoke", "source-and-isolation-preflight-passed"].includes(statusPhase);
 		try { await saveStatus({ outcome: "incomplete", errorCategory: "campaign-exception",
-			...(error instanceof SandboxPreflightError ? { privateDiagnostic: error.privateDiagnostic } : {}),
+			...(preProvider ? { privateDiagnostic: error instanceof SandboxPreflightError
+				? error.privateDiagnostic : error instanceof Error ? error.message.slice(-2000) : "unknown pre-provider failure" } : {}),
 			independentValidation: "not-complete" }); } catch { /* transport synthesizes an incomplete status */ }
 		// Never print the model response, source, input paths, credential, or raw provider errors.
 		console.error(JSON.stringify({ status: "private-campaign-failed", category: "campaign-exception" }));

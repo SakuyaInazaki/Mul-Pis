@@ -131,10 +131,13 @@ async function verifyFrozenWorkflowMethod(ctx: StageContext, goal: CurrentGoal, 
 export interface FormalBaseline { run: StageRunRecord; knowledgeSnapshot?: string }
 
 export async function latestFormalBaseline(ctx: StageContext): Promise<FormalBaseline | undefined> {
-	const ids = await ctx.ws.listRuns("M04");
-	if (!ids.length) return undefined;
-	const runs = await Promise.all(ids.map((id) => ctx.ws.readRun("M04", id)));
-	const run = runs.sort((left, right) => left.startedAt.localeCompare(right.startedAt) || (left.finishedAt ?? "").localeCompare(right.finishedAt ?? ""))[runs.length - 1];
+	let run: StageRunRecord | undefined;
+	try { run = await ctx.ws.latestRun("M04"); }
+	catch (error) {
+		if (error instanceof HarnessError && error.code === "run.order") throw new HarnessError("m07.baseline", "无法确定最新正式基线；M04 创建顺序存在歧义，不得回退到任一候选");
+		throw error;
+	}
+	if (!run) return undefined;
 	if (run.status !== "completed") throw new HarnessError("m07.baseline", `最新 M04 运行 ${run.runId} 状态为 ${run.status}，不得回退到更旧基线`);
 	if (run.failures.length) throw new HarnessError("m07.baseline", `最新 M04 运行 ${run.runId} 含未解决失败，不能作为正式基线：${run.failures.join("；")}`);
 	const proposal = run.outputs.find((item) => item.label === "知识提案");
