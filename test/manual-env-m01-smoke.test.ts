@@ -6,7 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { MAX_CNY_ESTIMATE, MAX_INPUT_PAYLOAD_BYTES, MAX_OUTPUT_TOKENS, MAX_PLANNING_CNY, MODEL_PROFILE, SMOKE_MODEL, assertPreflight, publicUsageFromSidecar } from "../scripts/manual-env-m01-smoke.ts";
+import { MAX_CNY_ESTIMATE, MAX_INPUT_PAYLOAD_BYTES, MAX_OUTPUT_TOKENS, MAX_PLANNING_CNY, MODEL_PROFILE, SMOKE_MODEL, assertPreflight, publicUsageFromSidecar, safeFailure } from "../scripts/manual-env-m01-smoke.ts";
+import { HarnessError } from "../src/types.ts";
 
 test("public M01 smoke has a conservative single-call planning ceiling", () => {
   assertPreflight();
@@ -49,6 +50,27 @@ test("observed SDK usage prints only whitelisted scalars and rejects incomplete 
   assert.throws(() => publicUsageFromSidecar({ ...row, events: [] }));
 });
 
+test("live-failure diagnostics reveal only whitelisted code, status and numeric usage", () => {
+  const error = new HarnessError("runner.stop", "SECRET_PROMPT sk-SECRET provider body");
+  Object.assign(error, { cause: { status: 429, message: "SECRET_RESPONSE" } });
+  const usage = { outcome: "failed", prompt: "SECRET_PROMPT", events: [{ kind: "assistant", stopReason: "length", content: "SECRET_RESPONSE" }],
+    summary: { complete: true, costComplete: true, reportedEvents: 1, unknownEvents: 0,
+      input: 500, output: 2048, cacheRead: 0, cacheWrite: 0, totalTokens: 2548, cost: 0.001,
+      privatePath: "SECRET_PATH" } };
+  const diagnostic = safeFailure(error, "m01-stage", usage);
+  assert.deepEqual(diagnostic, { check: "public-m01", ok: false, phase: "m01-stage", harnessCode: "runner.stop",
+    httpStatus: 429, promptOutcome: "failed", inputTokens: 500, outputTokens: 2048,
+    cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 2548, reportedEvents: 1,
+    unknownEvents: 0, sdkEstimatedUsdCost: 0.001, usageComplete: true, sdkCostComplete: true,
+    stopReason: "length" });
+  assert.doesNotMatch(JSON.stringify(diagnostic), /SECRET_PROMPT|SECRET_RESPONSE|SECRET_PATH|sk-SECRET/);
+  const unknown = safeFailure(new HarnessError("SECRET_CODE", "SECRET_MESSAGE"), "m01-stage", {
+    outcome: "SECRET_OUTCOME", events: [{ kind: "assistant", stopReason: "SECRET_STOP" }],
+    summary: { input: "SECRET_COUNT" },
+  });
+  assert.deepEqual(unknown, { check: "public-m01", ok: false, phase: "m01-stage" });
+});
+
 test("manual run fails closed on a missing environment key without exposing details", async () => {
   const command = promisify(execFile);
   await assert.rejects(command(process.execPath, ["scripts/manual-env-m01-smoke.ts", "--run"], {
@@ -56,7 +78,7 @@ test("manual run fails closed on a missing environment key without exposing deta
   }), (error: unknown) => {
     const failure = error as { stdout?: string; stderr?: string };
     assert.equal(failure.stdout, "");
-    assert.match(failure.stderr ?? "", /"ok":false/);
+    assert.match(failure.stderr ?? "", /"ok":false,"phase":"preflight"/);
     assert.doesNotMatch(failure.stderr ?? "", /api\.deepseek\.com|sk-|Generic public smoke/);
     return true;
   });

@@ -25,7 +25,7 @@ jobs:
           github.event.repository.full_name == github.repository &&
           github.actor == 'SakuyaInazaki' &&
           github.ref == 'refs/heads/improve/workflow-learning-reliability' &&
-          github.event.head_commit.message == 'Run one bounded public M01 connectivity check (mul-pis-20261004-once)' &&
+          github.event.head_commit.message == 'Diagnose bounded M01 failure without exposing provider content (mul-pis-20261004-diagnostic)' &&
           github.run_attempt == 1
         )
       }}
