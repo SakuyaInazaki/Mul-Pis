@@ -2,10 +2,6 @@ name: Public M01 DeepSeek smoke
 
 on:
   workflow_dispatch:
-  # One publish-time check. Remove this push trigger after its guarded run.
-  push:
-    branches:
-      - improve/workflow-learning-reliability
 
 permissions:
   contents: read
@@ -16,19 +12,6 @@ concurrency:
 
 jobs:
   public-m01:
-    if: >-
-      ${{
-        github.event_name == 'workflow_dispatch' ||
-        (
-          github.event_name == 'push' &&
-          github.repository == 'SakuyaInazaki/Mul-Pis' &&
-          github.event.repository.full_name == github.repository &&
-          github.actor == 'SakuyaInazaki' &&
-          github.ref == 'refs/heads/improve/workflow-learning-reliability' &&
-          github.event.head_commit.message == 'Verify M01 completion with a measured output allowance (mul-pis-20261004-completion)' &&
-          github.run_attempt == 1
-        )
-      }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
