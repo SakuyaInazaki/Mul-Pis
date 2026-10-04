@@ -1,0 +1,118 @@
+name: Bounded confidential campaign
+
+on:
+  push:
+    branches:
+      - improve/workflow-learning-reliability
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bounded-confidential-campaign-once
+  cancel-in-progress: false
+
+jobs:
+  private-campaign:
+    if: >-
+      github.repository == 'SakuyaInazaki/Mul-Pis' &&
+      github.actor == 'SakuyaInazaki' &&
+      github.run_attempt == 1 &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/improve/workflow-learning-reliability' &&
+      github.event.head_commit.message == 'Run bounded confidential M07 experiment (mul-pis-20261004-lab-once)'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install official OS sandbox package before private material is decoded
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+      - name: Install pinned runtime dependencies
+        run: |
+          npm install --ignore-scripts --no-save --no-package-lock --no-audit --no-fund \
+            @earendil-works/pi-ai@0.85.1 \
+            @earendil-works/pi-agent-core@0.85.1 \
+            @earendil-works/pi-coding-agent@0.85.1 \
+            typescript@5.9.3 \
+            @types/node@26.6.4
+          python -m pip install --disable-pip-version-check --no-input 'cryptography==50.0.0'
+      - name: Offline checks before private material is decoded
+        run: |
+          npm run typecheck
+          node --test test/runner/deepseek-campaign.test.ts
+          python -m unittest discover -s test -p 'private_actions_transport_test.py'
+      - name: Decode confidential input without logging it
+        id: decode
+        env:
+          MULPIS_LAB_INPUT_B64: ${{ secrets.MULPIS_LAB_INPUT_B64 }}
+        run: |
+          umask 077
+          python scripts/private_actions_transport.py decode --parent "$RUNNER_TEMP" --github-output "$GITHUB_OUTPUT"
+      - name: Run bounded private campaign
+        id: campaign
+        timeout-minutes: 30
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          INPUT_DIR: ${{ steps.decode.outputs.input_dir }}
+        run: |
+          umask 077
+          mkdir -m 700 "$RUNNER_TEMP/private-campaign-output"
+          set +e
+          node scripts/manual-private-campaign.ts \
+            --input-dir "$INPUT_DIR" \
+            --output-dir "$RUNNER_TEMP/private-campaign-output" \
+            > "$RUNNER_TEMP/private-campaign-stdout" \
+            2> "$RUNNER_TEMP/private-campaign-stderr"
+          code=$?
+          set -e
+          if [ ! -e "$RUNNER_TEMP/private-campaign-output/campaign-status.json" ]; then
+            printf '{"driver_exit_code":%s,"status":"incomplete"}\n' "$code" > "$RUNNER_TEMP/private-campaign-output/campaign-status.json"
+          fi
+          printf 'driver_exit_code=%s\n' "$code" >> "$GITHUB_OUTPUT"
+      - name: Encrypt allowlisted outcome before upload
+        if: always() && steps.decode.outcome == 'success'
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          umask 077
+          mkdir -p -m 700 "$RUNNER_TEMP/private-campaign-output"
+          if [ ! -e "$RUNNER_TEMP/private-campaign-output/campaign-status.json" ]; then
+            printf '{"status":"incomplete"}\n' > "$RUNNER_TEMP/private-campaign-output/campaign-status.json"
+          fi
+          python scripts/private_actions_transport.py encrypt \
+            --results "$RUNNER_TEMP/private-campaign-output" \
+            --public-key scripts/campaign-output-public.pem \
+            --expected-spki-sha256 095541a341d91f128aa9cd1f0c6d34f6b7291fc5d667365ef5a67efd42fd0d23 \
+            --output "$RUNNER_TEMP/private-campaign-outcome.enc.json" \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --commit "$GITHUB_SHA" \
+            --event "$GITHUB_EVENT_NAME"
+      - name: Upload ciphertext only
+        if: always() && steps.decode.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: confidential-campaign-envelope
+          path: ${{ runner.temp }}/private-campaign-outcome.enc.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Report generic campaign failure
+        if: steps.campaign.outputs.driver_exit_code != '0'
+        run: |
+          echo 'Private campaign did not complete; inspect the encrypted outcome locally.'
+          exit 1

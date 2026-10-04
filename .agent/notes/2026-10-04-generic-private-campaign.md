@@ -1,0 +1,7 @@
+# Generic private-input M07 campaign entry
+
+Added a generic manual entrypoint for an explicitly authorized private-input campaign. It discovers one C++ file and two accompanying text files at runtime, stages them only in a temporary research workspace, and invokes the existing M07 controller with a bounded DeepSeek builder and fresh reviewer. No assignment text, original source, model output, or credential is in the entrypoint.
+
+The builder receives the audited confined file-tool grant rather than native execution tools. A host-owned compile/run check occurs inside a preflighted network/PID/user-isolated bubblewrap child, and its result is frozen before M07 reviewer inspection. The entry keeps the original program's checker result distinct from later independent validation. The same in-process campaign budget is shared by builder and reviewer; it reserves worst-case requests before transport and fails closed on unknown usage. A bounded status file preserves budget information on failure. Only a fixed candidate, verification, and status set is returned to the private transport workflow.
+
+Offline validation: syntax check, the focused generic source/input-contract tests, and TypeScript typecheck passed. The actual isolated compiler path cannot be run on this development host; the entry fails before model calls if the Actions runner cannot satisfy its isolation and original-source preflight. No paid or private-input campaign was run during this change batch.

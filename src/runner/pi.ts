@@ -24,6 +24,7 @@ import { TelemetryWriter } from "../dashboard/telemetry.ts";
 import type { AssistantTurn, CustomToolSpec, ReadReturnEvent, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, TranscriptMessage, UsageEvent } from "./types.ts";
 import { summarizeUsage, usageEventsFromEntries } from "./usage.ts";
 import { sampleRunnerResources, sessionClosed, sessionOpened } from "./resource.ts";
+import { DeepSeekCampaignBudget } from "./deepseek-campaign.ts";
 
 const SCRATCH_PREFIX = ".pi-session-";
 const EMPTY_AGENT_DIR = ".empty-agent-dir";
@@ -42,6 +43,8 @@ export interface PiSessionRunnerOptions {
 	modelRuntime?: ModelRuntime;
 	createSession?: typeof createAgentSession;
 	signal?: AbortSignal;
+	/** Shared by every builder, reviewer, and resumed handle in one in-process campaign. */
+	campaignBudget?: DeepSeekCampaignBudget;
 }
 
 interface MaterialTools {
@@ -231,6 +234,7 @@ async function createExecutionTools(
 	root: string,
 	requested: Array<"read" | "write" | "edit" | "bash">,
 	log: ToolCallRecord[],
+	isolatedToolEnvironment = false,
 ): Promise<MaterialTools & { cwd: string }> {
 	const cwd = await realpath(root);
 	if (!(await lstat(cwd)).isDirectory()) throw new HarnessError("runner.tools", `execution root is not a directory: ${root}`);
@@ -243,7 +247,19 @@ async function createExecutionTools(
 	const names = [...new Set(requested)];
 	const readCoverage = new Set<string>();
 	const tools = names.map((name) => {
-		const base = factories[name](cwd) as ToolDefinition<any, any>;
+		// The model-bearing parent's credential environment must not reach a
+		// campaign bash child. This is environment hygiene, not an OS sandbox.
+		const base = (name === "bash" && isolatedToolEnvironment
+			? createBashToolDefinition(cwd, {
+				exposeSessionEnvironment: false,
+				spawnHook: (context) => ({ ...context, env: {
+					PATH: process.env.PATH ?? "/usr/bin:/bin",
+					HOME: cwd,
+					LANG: "C.UTF-8",
+					TMPDIR: process.env.TMPDIR ?? "/tmp",
+				} }),
+			})
+			: factories[name](cwd)) as ToolDefinition<any, any>;
 		return {
 			...base,
 			async execute(toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: any, ctx: any) {
@@ -360,6 +376,7 @@ export class PiSessionRunner implements SessionRunner {
 	}
 
 	async create(spec: SessionSpec): Promise<SessionHandle> {
+		if (this.options.campaignBudget) spec = this.options.campaignBudget.boundSpec(spec);
 		await mkdir(spec.persistDir, { recursive: true });
 		const cwd = await mkdtemp(path.join(spec.persistDir, SCRATCH_PREFIX));
 		const sessionManager = SessionManager.create(cwd, spec.persistDir);
@@ -377,6 +394,7 @@ export class PiSessionRunner implements SessionRunner {
 			throw new HarnessError("runner.persistence", `cannot read session spec ${ref.specFile}: ${(error as Error).message}`);
 		}
 		const spec = parsePersistedSpec(specText, ref.specFile);
+		if (this.options.campaignBudget) this.options.campaignBudget.boundSpec(spec);
 		if (ref.methodBinding && JSON.stringify(ref.methodBinding) !== JSON.stringify(spec.methodBinding)) {
 			throw new HarnessError("runner.persistence", `session ${ref.label} method binding differs from its persisted spec`);
 		}
@@ -432,12 +450,15 @@ export class PiSessionRunner implements SessionRunner {
 			throw new HarnessError("runner.isolation", `runner agent directory is not empty: ${emptyAgentDir}`);
 		}
 
+		const campaign = this.options.campaignBudget;
 		const strict = spec.strictRequest;
 		if (strict) {
-			if (spec.tools.kind !== "none" || strict.maxProviderCallsPerPrompt !== 1 || (strict.maxOutputTokens !== undefined && (!Number.isInteger(strict.maxOutputTokens) || strict.maxOutputTokens < 1)) || !Number.isInteger(strict.maxInputPayloadBytes) || strict.maxInputPayloadBytes < 1) {
-				throw new HarnessError("runner.model", "strict request requires no tools and positive integer request caps");
+			if ((!campaign && (spec.tools.kind !== "none" || strict.maxProviderCallsPerPrompt !== 1)) || !Number.isInteger(strict.maxProviderCallsPerPrompt) || strict.maxProviderCallsPerPrompt < 1 ||
+				(strict.maxOutputTokens !== undefined && (!Number.isInteger(strict.maxOutputTokens) || strict.maxOutputTokens < 1)) || !Number.isInteger(strict.maxInputPayloadBytes) || strict.maxInputPayloadBytes < 1) {
+				throw new HarnessError("runner.model", "strict request requires positive integer caps; tools require a campaign budget");
 			}
 		}
+		if (campaign && (!strict || JSON.stringify(strict) !== JSON.stringify(campaign.strictRequest))) throw new HarnessError("runner.campaign", "campaign request caps are missing or changed");
 		const settingsManager = SettingsManager.inMemory(strict ? { retry: { enabled: false, provider: { maxRetries: 0 } }, compaction: { enabled: false } } : {});
 		const loader = new DefaultResourceLoader({
 			cwd,
@@ -454,6 +475,7 @@ export class PiSessionRunner implements SessionRunner {
 		await loader.reload();
 
 		const resolved = await this.resolveModel(spec);
+		campaign?.assertResolved(resolved.model);
 		if (strict && (resolved.model.provider !== "deepseek" || resolved.model.api !== "openai-completions" || (strict.maxOutputTokens !== undefined && strict.maxOutputTokens > resolved.model.maxTokens))) {
 			throw new HarnessError("runner.model", "strict request currently supports only bounded DeepSeek openai-completions models");
 		}
@@ -467,16 +489,20 @@ export class PiSessionRunner implements SessionRunner {
 				}
 				return (model: Parameters<ModelRuntime["streamSimple"]>[0], context: Parameters<ModelRuntime["streamSimple"]>[1], options?: Parameters<ModelRuntime["streamSimple"]>[2]) => {
 					strictStreamCalls++;
-					if (strictStreamCalls > strict.maxProviderCallsPerPrompt || model.provider !== resolved.model.provider || model.id !== resolved.model.id) throw new HarnessError("runner.model", "strict request would exceed one provider call or change model");
+					campaign?.assertResolved(model);
+					if (strictStreamCalls > strict.maxProviderCallsPerPrompt || model.provider !== resolved.model.provider || model.id !== resolved.model.id || model.api !== resolved.model.api || model.baseUrl !== resolved.model.baseUrl) throw new HarnessError("runner.model", "strict request would exceed provider call cap or change model");
 					return target.streamSimple(model, context, {
 						...options, maxRetries: 0, ...(strict.maxOutputTokens === undefined ? {} : { maxTokens: strict.maxOutputTokens }),
 						onPayload: async (payload, payloadModel) => {
 							strictPayloadChecks++;
-							if (strictPayloadChecks > 1 || payloadModel.provider !== model.provider || payloadModel.id !== model.id) throw new HarnessError("runner.model", "strict request payload changed model or repeated");
+							campaign?.assertResolved(payloadModel);
+							if (strictPayloadChecks > strict.maxProviderCallsPerPrompt || payloadModel.provider !== model.provider || payloadModel.id !== model.id || payloadModel.api !== model.api || payloadModel.baseUrl !== model.baseUrl) throw new HarnessError("runner.model", "strict request payload changed model or repeated");
 							const record = payload as Record<string, unknown>;
+							if (campaign && record.model !== model.id) throw new HarnessError("runner.campaign", "provider payload model changed");
 							if (strict.maxOutputTokens !== undefined && record.max_tokens !== strict.maxOutputTokens && record.max_completion_tokens !== strict.maxOutputTokens) throw new HarnessError("runner.model", "strict request output cap missing from provider payload");
 							const bytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
 							if (bytes > strict.maxInputPayloadBytes) throw new HarnessError("runner.model", "strict request input payload exceeds reserved byte cap");
+							campaign?.reserve(bytes);
 							return payload;
 						},
 					});
@@ -497,7 +523,7 @@ export class PiSessionRunner implements SessionRunner {
 			const definitions = customToolsToPi(spec.tools.tools, toolLog);
 			materialTools = { tools: definitions, names: definitions.map((d) => d.name), readCoverage: new Set(), readReturns: [] };
 		} else if (spec.tools.kind === "execution") {
-			const execution = await createExecutionTools(spec.tools.root, spec.tools.tools, toolLog);
+			const execution = await createExecutionTools(spec.tools.root, spec.tools.tools, toolLog, Boolean(campaign));
 			materialTools = execution;
 			sessionCwd = execution.cwd;
 		}
@@ -583,6 +609,7 @@ export class PiSessionRunner implements SessionRunner {
 				if (abortedByHandle) throw new HarnessError("runner.stop", `session ${spec.label} was aborted before prompt`);
 				if (promptActive) throw new HarnessError("runner.stop", `session ${spec.label} already has an active prompt`);
 				if (signal?.aborted) throw new HarnessError("runner.stop", `session ${spec.label} was aborted before prompt`);
+				campaign?.beginPrompt();
 				promptActive = true;
 				if (strict) { strictStreamCalls = 0; strictPayloadChecks = 0; }
 				// Do not await telemetry before installing the abort listener: prompt()
@@ -613,7 +640,7 @@ export class PiSessionRunner implements SessionRunner {
 				signal?.addEventListener("abort", abortListener, { once: true });
 				try {
 					await session.prompt(text);
-					if (strict && (strictStreamCalls !== 1 || strictPayloadChecks !== 1)) throw new HarnessError("runner.model", "strict request did not verify exactly one provider payload");
+					if (strict && (strictStreamCalls < 1 || strictStreamCalls !== strictPayloadChecks)) throw new HarnessError("runner.model", "strict request did not verify every provider payload");
 					if (abortPromise) await abortPromise;
 					if (signal?.aborted || abortedByHandle) {
 						const detail = abortError ? `; SDK abort failed: ${(abortError as Error).message}` : "";
@@ -621,9 +648,11 @@ export class PiSessionRunner implements SessionRunner {
 					}
 					collectUsage();
 					const result = turnResult(promptMessages, spec.label, summarizeUsage(promptEvents));
+					campaign?.finishPrompt(promptEvents);
 					promptOutcome = "completed";
 					return result;
 				} catch (error) {
+					campaign?.failPrompt();
 					if (abortPromise) await abortPromise;
 					if ((signal?.aborted || abortedByHandle) && !(error instanceof HarnessError && error.code === "runner.stop")) {
 						promptOutcome = "aborted";
@@ -633,21 +662,29 @@ export class PiSessionRunner implements SessionRunner {
 					if (signal?.aborted || abortedByHandle) promptOutcome = "aborted";
 					throw error;
 				} finally {
+				try {
 					collectUsage();
 					if (!promptEvents.some((event) => event.kind === "assistant")) {
 						const unknown: UsageEvent = { entryId: `unobserved-${ref.id}-${thisPrompt}`, kind: "assistant", promptIndex: thisPrompt, at: new Date().toISOString(), status: "unknown", costSource: "unknown", costStatus: "unknown" };
 						promptEvents.push(unknown); usageEvents.push(unknown);
 					}
-				try {
 					await appendFile(usageFile, `${JSON.stringify({ version: 1, sessionId: ref.id, promptIndex: thisPrompt, outcome: promptOutcome, events: promptEvents, summary: summarizeUsage(promptEvents) })}\n`);
+				} catch (error) {
+					campaign?.failPrompt();
+					throw error;
 				} finally {
 					promptActive = false;
 					if (abortListener) signal?.removeEventListener("abort", abortListener);
 					abortListener = undefined;
 					abortPromise = undefined;
 					abortError = undefined;
-					await queueTelemetry(async () => { if (!disposed) await telemetry?.heartbeat("idle", undefined, promptOutcome); });
-					await sampleRunnerResources(spec.persistDir, "prompt-end");
+					try {
+						await queueTelemetry(async () => { if (!disposed) await telemetry?.heartbeat("idle", undefined, promptOutcome); });
+						await sampleRunnerResources(spec.persistDir, "prompt-end");
+					} catch (error) {
+						campaign?.failPrompt();
+						throw error;
+					}
 				}
 				}
 			},
