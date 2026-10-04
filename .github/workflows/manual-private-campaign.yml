@@ -20,7 +20,7 @@ jobs:
       github.run_attempt == 1 &&
       github.event_name == 'push' &&
       github.ref == 'refs/heads/improve/workflow-learning-reliability' &&
-      github.event.head_commit.message == 'Run bounded confidential M07 experiment (mul-pis-20261004-lab-once)'
+      github.event.head_commit.message == 'Repair isolated compiler preflight and run M07 (mul-pis-20261004-lab-retry1)'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

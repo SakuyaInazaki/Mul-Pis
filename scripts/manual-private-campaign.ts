@@ -85,8 +85,7 @@ async function requireIsolation(): Promise<void> {
 	const scratch = await mkdtemp(path.join(os.tmpdir(), "mulpis-sandbox-preflight-"));
 	try {
 		await chmod(scratch, 0o777);
-		await writeFile(path.join(scratch, "probe.cpp"),
-			"#include <omp.h>\nint main() { return omp_get_max_threads() > 0 ? 0 : 1; }\n", { mode: 0o644 });
+		await stageProbe(scratch);
 		const compileProbe = isolated("/usr/bin/g++", [...FLAGS, "/work/probe.cpp", "-o", "/work/probe-bin"], 30_000, scratch);
 		if (compileProbe.status !== 0)
 			throw new SandboxPreflightError(`compiler probe: ${(compileProbe.stderr ?? "").slice(-2000)}`);
@@ -94,6 +93,13 @@ async function requireIsolation(): Promise<void> {
 		if (runProbe.status !== 0)
 			throw new SandboxPreflightError(`executable probe: ${(runProbe.stderr ?? "").slice(-2000)}`);
 	} finally { await rm(scratch, { recursive: true, force: true }); }
+}
+async function stageProbe(scratch: string): Promise<void> {
+	const source = path.join(scratch, "probe.cpp");
+	await writeFile(source, "#include <omp.h>\nint main() { return omp_get_max_threads() > 0 ? 0 : 1; }\n",
+		{ mode: 0o644 });
+	// Actions uses umask 077; mode on creation alone would leave an unreadable 0600 file for sandbox UID 65534.
+	await chmod(source, 0o644);
 }
 function extractBody(source: string, name: string): string | null {
 	const declaration = new RegExp(`\\b${name}\\s*\\(`, "g");
@@ -142,7 +148,6 @@ async function checkCandidate(original: string, candidate: string, scratch: stri
 		limitation: "Program exit status is the original built-in checker, not an independent finite-output proof.",
 	};
 	if (build.status !== 0) return verification;
-	await chmod(compiled, 0o755);
 	// These CLI cases are used only when the private original source demonstrates support.
 	const cases = [[], ["--threads", "1", "--repeats", "10"], ["--threads", "2", "--repeats", "10"],
 		["--threads", "4", "--repeats", "10"]];
@@ -311,7 +316,7 @@ async function main() {
 	}
 }
 
-export const offlineChecks = { sourceShape, inputs };
+export const offlineChecks = { sourceShape, inputs, stageProbe };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	main().catch(async error => {

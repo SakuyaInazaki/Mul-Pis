@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, mkdir, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -32,4 +32,16 @@ test("generic private campaign accepts only one C++ and two flat text inputs", a
 		await mkdir(path.join(directory, "nested"));
 		await assert.rejects(offlineChecks.inputs(directory));
 	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("isolation probe remains readable by the sandbox UID under umask 077", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-private-probe-fixture-"));
+	const previous = process.umask(0o077);
+	try {
+		await offlineChecks.stageProbe(directory);
+		assert.equal((await stat(path.join(directory, "probe.cpp"))).mode & 0o777, 0o644);
+	} finally {
+		process.umask(previous);
+		await rm(directory, { recursive: true, force: true });
+	}
 });
