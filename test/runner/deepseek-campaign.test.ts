@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createAgentSession, type CreateAgentSessionOptions, type ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, ModelRuntime, type CreateAgentSessionOptions } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import { DeepSeekCampaignBudget, type DeepSeekCampaignLimits } from "../../src/runner/deepseek-campaign.ts";
 import { createConfinedCampaignFileTools } from "../../src/runner/confined-campaign-files.ts";
@@ -188,5 +188,52 @@ test("campaign reconciles reported tokens and SDK cost against each reserved env
 		assert.equal(budget.snapshot().stopped, true);
 		assert.equal(budget.snapshot().stopReason, "usage-reconciliation");
 		assert.equal(budget.snapshot().reservations, 1);
+	}
+});
+
+test("real Pi tool request uses the synthetic runtime key at the fixed DeepSeek endpoint", async () => {
+	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-auth-transport-"));
+	const originalFetch = globalThis.fetch;
+	let unexpectedFetches = 0;
+	globalThis.fetch = async () => { unexpectedFetches++; throw new Error("unexpected network path in offline auth test"); };
+	let handle: Awaited<ReturnType<PiSessionRunner["create"]>> | undefined;
+	try {
+		const profile = path.join(dir, "profile"), work = path.join(dir, "work"), sessions = path.join(dir, "sessions");
+		await Promise.all([mkdir(profile), mkdir(work), mkdir(sessions)]);
+		const modelsPath = path.join(profile, "models.json");
+		await writeFile(modelsPath, JSON.stringify({ providers: { deepseek: { models: [{ ...MODEL,
+			compat: { supportsStore: false, supportsDeveloperRole: false, maxTokensField: "max_tokens", thinkingFormat: "deepseek" },
+		}] } } }));
+		const runtime = await ModelRuntime.create({ modelsPath, authPath: path.join(profile, "auth.json"),
+			modelsStorePath: path.join(profile, "models-store.json"), allowModelNetwork: false, refreshOnCreate: false });
+		const syntheticKey = "sk-SYNTHETIC-OFFLINE-ONLY";
+		await runtime.setRuntimeApiKey("deepseek", syntheticKey);
+		const calls: Array<{ endpointMatches: boolean; authorizationMatches: boolean; hasTools: boolean }> = [];
+		const fakeFetch: typeof fetch = async (input, init) => {
+			const headers = new Headers(input instanceof Request ? input.headers : undefined);
+			new Headers(init?.headers).forEach((value, name) => headers.set(name, value));
+			const endpoint = input instanceof Request ? input.url : String(input);
+			const payload = typeof init?.body === "string" ? JSON.parse(init.body) as { tools?: unknown[] } : undefined;
+			calls.push({ endpointMatches: endpoint === "https://api.deepseek.com/chat/completions",
+				authorizationMatches: headers.get("authorization") === `Bearer ${syntheticKey}`,
+				hasTools: Array.isArray(payload?.tools) && payload.tools.length === 3 });
+			return new Response(JSON.stringify({ error: { message: "offline synthetic rejection", type: "invalid_request_error" } }),
+				{ status: 401, headers: { "content-type": "application/json" } });
+		};
+		const originalStream = runtime.streamSimple.bind(runtime);
+		runtime.streamSimple = ((model, context, options) => originalStream(model, context, { ...options, fetch: fakeFetch })) as typeof runtime.streamSimple;
+		const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1, maxProviderCalls: 1,
+			maxProviderCallsPerPrompt: 1, maxInputPayloadBytes: 20_000, maxOutputTokens: 32 });
+		const runner = new PiSessionRunner({ modelRuntime: runtime, campaignBudget: budget });
+		const tools = await createConfinedCampaignFileTools(work, { writableFiles: ["candidate.cpp"] });
+		handle = await runner.create(spec(sessions, "real-pi-auth", { kind: "custom", tools }));
+		await assert.rejects(handle.prompt("Offline authentication check."));
+		assert.deepEqual(calls, [{ endpointMatches: true, authorizationMatches: true, hasTools: true }]);
+		assert.equal(unexpectedFetches, 0);
+		assert.equal(budget.snapshot().reservations, 1);
+	} finally {
+		handle?.dispose();
+		globalThis.fetch = originalFetch;
+		await rm(dir, { recursive: true, force: true });
 	}
 });

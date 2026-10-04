@@ -11,3 +11,9 @@ The initial trigger permits only an exact branch/actor/commit-message push marke
 The same public transport script has a local-only `decrypt` command, intended for use outside the checkout with the separately retained private key. It checks the recipient key, authenticated run metadata, archive type, allowlist and size caps, then writes into a fresh private directory. The workflow never calls this command or receives the private key.
 
 Verification: generic Python tests cover legitimate Unicode/parenthesized paths, private modes, strict Base64, traversal, links, duplicates, compressed-size limits, key size, allowlist exclusion, authenticated encryption roundtrip and tampering. These tests use only synthetic data and an ephemeral test key.
+
+## Authentication finding and trigger cleanup
+
+The direct, read-only official model-list credential probe returned HTTP 401 in the controlled Actions run. It stopped before private task staging or model generation. The synthetic real-Pi tool-request regression independently verifies the SDK endpoint and Authorization construction using only a fixture key and an intercepted transport; it does not validate any live credential. A currently accepted credential is still required before the real optimization can finish. No candidate or performance gain is claimed.
+
+Removed the temporary push trigger. The retained manual entry defaults its explicit bounded-run confirmation to false, and each manual run must be accounted separately against any total user-approved budget. Keeping an entrypoint does not authorize another model run. No private input, private key or raw authentication error is published in this note.
