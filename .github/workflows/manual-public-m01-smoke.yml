@@ -1,0 +1,63 @@
+name: Public M01 DeepSeek smoke
+
+on:
+  workflow_dispatch:
+  # One publish-time check. Remove this push trigger after its guarded run.
+  push:
+    branches:
+      - improve/workflow-learning-reliability
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manual-public-m01-smoke
+  cancel-in-progress: false
+
+jobs:
+  public-m01:
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event_name == 'push' &&
+          github.repository == 'SakuyaInazaki/Mul-Pis' &&
+          github.event.repository.full_name == github.repository &&
+          github.actor == 'SakuyaInazaki' &&
+          github.ref == 'refs/heads/improve/workflow-learning-reliability' &&
+          github.event.head_commit.message == 'Run one bounded public M01 connectivity check (mul-pis-20261004-once)' &&
+          github.run_attempt == 1
+        )
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check required secret without displaying it
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          if [ -z "$DEEPSEEK_API_KEY" ]; then
+            echo 'DeepSeek Actions secret is missing.'
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install pinned project dependencies
+        run: >-
+          npm install --ignore-scripts --no-save --no-package-lock --no-audit --no-fund
+          @earendil-works/pi-ai@0.85.1
+          @earendil-works/pi-agent-core@0.85.1
+          @earendil-works/pi-coding-agent@0.85.1
+          typescript@5.9.3
+          @types/node@26.6.4
+      - name: Offline checks
+        run: |
+          npm run typecheck
+          node --test test/manual-env-m01-smoke.test.ts
+          node scripts/manual-env-m01-smoke.ts --check
+      - name: Run one bounded, generic Mul-Pis M01 stage
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: node scripts/manual-env-m01-smoke.ts --run
