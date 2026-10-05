@@ -10,9 +10,9 @@ test("one-use campaign push guard cannot also dispatch a second paid run manuall
 	const gate = workflow.split("  private-campaign:\n")[1]?.split("    runs-on:")[0] ?? "";
 	assert.match(workflow, /on:\n  push:\n    branches:\n      - improve\/workflow-learning-reliability/);
 	assert.match(gate, /github\.event_name == 'push'/);
-	assert.match(gate, /mul-pis-20261005-context-run1/);
-	assert.doesNotMatch(gate, /workflow_dispatch|authorize_bounded_run|lab-resume1|lab-resume2/);
-	assert.match(workflow, /description: "Authorize one DeepSeek campaign up to 7\.5 CNY/);
+	assert.match(gate, /mul-pis-20261005-context-run2/);
+	assert.doesNotMatch(gate, /workflow_dispatch|authorize_bounded_run|lab-resume1|lab-resume2|context-run1/);
+	assert.match(workflow, /description: "Authorize one DeepSeek campaign up to 7\.3 CNY/);
 });
 
 test("generic private campaign source-shape gate preserves non-target bodies", () => {
@@ -231,6 +231,23 @@ test("private diagnostic redacts a key crossing the 4000-character output bounda
 	assert.equal(redacted.length, 4000);
 	assert.equal(redacted.includes(key), false);
 	assert.equal(redacted.slice(-5).includes("sk-"), false);
+});
+
+test("post-provider controller exceptions retain only encrypted redacted code and message", () => {
+	const key = "sk-SYNTHETIC_EXCEPTION_SECRET123";
+	const error = Object.assign(new Error(`fork cannot change review-loop obligations; Authorization: Bearer ${key}`),
+		{ code: "m07.branch" });
+	const diagnostic = offlineChecks.privateExceptionDiagnostic(error, key);
+	assert.equal(diagnostic.code, "m07.branch");
+	assert.equal(diagnostic.category, "unclassified");
+	assert.match(diagnostic.message ?? "", /review-loop obligations/);
+	assert.doesNotMatch(JSON.stringify(diagnostic), /SYNTHETIC_EXCEPTION_SECRET|Bearer sk-/);
+	assert.equal(offlineChecks.privateExceptionDiagnostic(Object.assign(new Error("x"), { code: "unsafe code with spaces" }), key).code,
+		"unavailable");
+	assert.equal(offlineChecks.privateExceptionDiagnostic(Object.assign(new Error("x"), { code: key }), key).code,
+		"unavailable");
+	assert.equal(offlineChecks.privateExceptionDiagnostic(Object.assign(new Error("x"), { code: "sk-ANOTHERSECRET123456" }), key).code,
+		"unavailable");
 });
 
 test("read-only credential probe uses one official model-list request and stores only status", async () => {

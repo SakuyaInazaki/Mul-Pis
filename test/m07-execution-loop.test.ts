@@ -5,6 +5,7 @@ import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { createM07Controller } from "../src/m07/controller.ts";
+import { parseRoundReview } from "../src/m07/execution-loop.ts";
 import { FakeSessionRunner, type FakeReplyFn } from "../src/runner/fake.ts";
 import type { StageContext } from "../src/stages/context.ts";
 import { Workspace } from "../src/workspace.ts";
@@ -25,6 +26,42 @@ async function fixture(t: TestContext, reply: FakeReplyFn) {
  return {root,ws,store,runner,controller,goal,guide};
 }
 const deadlineAt = () => new Date(Date.now()+60_000).toISOString();
+
+test("reviewer JSON repairs only literal paragraph breaks inside bounded feedback", () => {
+ const malformed = '{"verdict":"revise","feedback":"Inspect the measured cases.\nOne target regressed; revise the candidate."}';
+ assert.deepEqual(parseRoundReview(malformed), { verdict: "revise", feedback: "Inspect the measured cases.\nOne target regressed; revise the candidate." });
+ const crlf = '{"verdict":"revise","feedback":"One checked case.\r\nAnother checked case."}';
+ assert.equal(parseRoundReview(crlf).feedback, "One checked case.\r\nAnother checked case.");
+ assert.deepEqual(parseRoundReview(JSON.stringify({ verdict: "ready", feedback: "All bounded checks passed." })),
+  { verdict: "ready", feedback: "All bounded checks passed." });
+ assert.throws(() => parseRoundReview('Reviewer says {"verdict":"ready","feedback":"looks good"}'), /JSON verdict/);
+ assert.throws(() => parseRoundReview('{"verdict":"ready","feedback":"unterminated\nparagraph}'), /JSON verdict/);
+ assert.throws(() => parseRoundReview('{"verdict":"accept","feedback":"looks good\nnow"}'), /bounded feedback/);
+ assert.throws(() => parseRoundReview('{"verdict":["ready"],"feedback":"looks good"}'), /bounded feedback/);
+ assert.throws(() => parseRoundReview('{"verdict":"ready","feedback":"' + "a".repeat(512_001) + '"}'), /bounded JSON size/);
+});
+
+test("nonrecoverable reviewer format still permits an honest rejected task and frozen fork", async t => {
+ const f = await fixture(t, async ({spec}) => {
+  if (spec.label.includes("reviewer")) return "The answer is revise, but this is not JSON.";
+  if (spec.tools.kind === "execution") await writeFile(path.join(spec.tools.root,"result.txt"),"candidate\n");
+  return "builder finished";
+ });
+ const spec = { objective:"bounded candidate", inputs:[], expectedOutputs:["result.txt"], checks:["checked"], mode:"execute" as const,
+  executionLoop:{ maxRounds:2, deadlineAt:deadlineAt() } };
+ const parent = await f.controller.delegate(f.goal.runId,spec);
+ assert.equal(parent.status,"returned"); assert.equal(parent.loopStopReason,"reviewer-invalid");
+ assert.ok(parent.branchSource, parent.branchUnavailableReason ?? "checkpoint unavailable");
+ const reviewed = await f.controller.review(f.goal.runId,{taskId:parent.taskId,checks:[{criterion:"checked",result:"failed",evidence:[]}],
+  artifacts:[path.join(parent.workDir,"result.txt")]});
+ assert.equal(reviewed.status,"rejected");
+ const context = {mode:"fork" as const,parentRunId:f.goal.runId,
+  parentTaskId:parent.taskId,checkpointId:parent.branchSource!.checkpoint.id};
+ await assert.rejects(f.controller.delegate(f.goal.runId,{...spec,executionLoop:{...spec.executionLoop,maxRounds:1},context}),
+  /review-loop obligations/);
+ const child = await f.controller.delegate(f.goal.runId,{...spec,context});
+ assert.equal(child.status,"returned", child.executionFailure ?? "fork failed");
+});
 
 test("opt-in M07 repair keeps one builder, creates fresh reviewers, and preserves final review and candidate delta", async t => {
  const f = await fixture(t, async ({spec,turnIndex}) => {

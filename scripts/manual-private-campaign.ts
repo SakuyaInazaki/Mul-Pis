@@ -27,10 +27,11 @@ import type { KnowledgeRef, KnowledgeStore } from "../src/knowledge/types.ts";
 import type { StageRunRecord } from "../src/types.ts";
 
 const MODEL = "deepseek/deepseek-flash:low";
-const MAX_CNY = 7.5;
+const MAX_CNY = 7.3;
 const CAMPAIGN_MS = 20 * 60_000;
 const BUILDER_PHASE_MS = 7 * 60_000;
 const M04_PHASE_MS = 5 * 60_000;
+const BUILDER_ROUNDS = 2;
 const FLAGS = ["-O2", "-std=c++17", "-fopenmp", "-pthread"];
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CHECKS = [
@@ -53,6 +54,7 @@ let statusRuntimeKey: string | undefined;
 let statusCredentialProbe: { httpStatus: number | null; accepted: boolean } | undefined;
 let statusAuthSource: "runtime" | "unexpected" | undefined;
 let statusSdkAuthMatch: boolean | undefined;
+let statusArchiveFailure: string | undefined;
 
 async function credentialProbe(key: string, request: typeof fetch = fetch): Promise<{ httpStatus: number | null; accepted: boolean }> {
 	const response = await request("https://api.deepseek.com/models", {
@@ -87,6 +89,15 @@ function taskFailureCategory(raw: unknown): string {
 	if (/model.*not found|model.*resolved|model route/i.test(raw)) return "model-resolution";
 	if (/did not stop normally|runner.stop/i.test(raw)) return "sdk-stop";
 	return "unclassified";
+}
+function privateExceptionDiagnostic(error: unknown, runtimeKey: string | undefined):
+	{ code: string; category: string; message: string | null } {
+	const raw = error instanceof Error ? error.message : undefined;
+	const candidateCode = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+	const code = typeof candidateCode === "string" && /^[A-Za-z][A-Za-z0-9._-]{0,63}$/.test(candidateCode) &&
+		privateFailureMessage(candidateCode, runtimeKey) === candidateCode ?
+		candidateCode : "unavailable";
+	return { code, category: taskFailureCategory(raw), message: privateFailureMessage(raw, runtimeKey) ?? null };
 }
 async function taskTelemetry(ws: Workspace, task: any, runtimeKey: string | undefined): Promise<Record<string, unknown>> {
 	const failure = privateFailureMessage(task.executionFailure, runtimeKey);
@@ -700,8 +711,9 @@ async function main() {
 			const initialSpec: TaskSpecInput = { mode: "execute",
 				objective: "Read the copied original inputs. Within this bounded two-target pass, replace the existing TODO parallel implementations with genuinely different OpenMP strategies in a complete candidate.cpp. Keep the other source and original checker/main for this adapter's trusted comparison. The supplied problem allows further strategies; report the scope actually tested. Examine host-generated verification.json after a round, compare actual per-kernel timings with original baselines, and use any remaining bounded round to improve or select the strongest observed valid candidate. If no gain is observed, say so; do not claim a global optimum. Write a bounded candidate lesson-delta.json with actual observation, applicability and evidencePaths, or action none when the evidence supports no lesson. This lesson is pending M04, never self-adopted. Use only the provided confined read/write/edit tools; do not call shell or network. The host creates verification.json after your turn; do not write it. Do not create prose deliverables.",
 				inputs: found.files.map(x => `problem/raw/${x}`), expectedOutputs: ["candidate.cpp", "lesson-delta.json"], lessonDeltaOutput: "lesson-delta.json", checks: CHECKS,
-				executionLoop: { maxRounds: 2, deadlineAt: new Date(Math.min(Date.now() + BUILDER_PHASE_MS, campaignStopAt - 9 * 60_000)).toISOString() } };
+				executionLoop: { maxRounds: BUILDER_ROUNDS, deadlineAt: new Date(Math.min(Date.now() + BUILDER_PHASE_MS, campaignStopAt - 9 * 60_000)).toISOString() } };
 			const task = await controller.delegate(runId, initialSpec);
+			statusPhase = "parent-task-returned";
 			statusTaskTelemetry = await taskTelemetry(ws, task, runtimeKey);
 			const parentCandidate = path.join(task.workDir, "candidate.cpp");
 			const parentVerification = path.join(task.workDir, "verification.json");
@@ -709,6 +721,7 @@ async function main() {
 			try { parentResult = JSON.parse(await readFile(parentVerification, "utf8")) as Record<string, unknown>; } catch { /* no parent verification */ }
 			const accepted = task.status === "returned" && task.loopStopReason === "ready" && parentResult?.status === "passed";
 			if (task.status === "returned" && task.reportPath) {
+				statusPhase = "parent-review";
 				const review = await controller.review(runId, { taskId: task.taskId,
 					checks: CHECKS.map((criterion, i) => ({ criterion, result: accepted ? "passed" : "failed",
 						evidence: accepted ? [i === 0 ? parentCandidate : parentVerification] : [] })),
@@ -716,6 +729,7 @@ async function main() {
 					failures: accepted ? [] : ["bounded candidate did not pass all observed checks"] });
 				if (accepted && review.status !== "accepted") fail("M07 review did not accept candidate");
 			}
+			statusPhase = "parent-reviewed";
 			let branchTask: Awaited<ReturnType<typeof controller.delegate>> | undefined;
 			let branchAccepted = false;
 			let branchExerciseComplete = false;
@@ -724,12 +738,14 @@ async function main() {
 			let winner = accepted ? task : undefined;
 			if (task.branchSource && !budget.snapshot().stopped && !abort.signal.aborted && Date.now() + 5 * 60_000 < campaignStopAt) {
 				followOnPriorVerification = parentResult;
+				statusPhase = "fork-dispatch";
 				const forked = await controller.delegate(runId, { ...initialSpec,
 					context: { mode: "fork", parentRunId: runId, parentTaskId: task.taskId,
 						checkpointId: task.branchSource.checkpoint.id },
-					executionLoop: { maxRounds: 1, deadlineAt: new Date(Math.min(Date.now() + 4 * 60_000,
+					executionLoop: { maxRounds: BUILDER_ROUNDS, deadlineAt: new Date(Math.min(Date.now() + 4 * 60_000,
 						campaignStopAt - 5 * 60_000)).toISOString() } });
 				branchTask = forked;
+				statusPhase = "fork-task-returned";
 				statusBranchTelemetry = await taskTelemetry(ws, forked, runtimeKey);
 				const branchCandidate = path.join(forked.workDir, "candidate.cpp");
 				const branchVerification = path.join(forked.workDir, "verification.json");
@@ -739,6 +755,7 @@ async function main() {
 				branchAccepted = forked.status === "returned" && forked.loopStopReason === "ready" && branchResult?.status === "passed";
 				let forkReviewStatus = forked.status;
 				if (forked.status === "returned" && forked.reportPath) {
+					statusPhase = "fork-review";
 					const reviewed = await controller.review(runId, { taskId: forked.taskId,
 						checks: CHECKS.map((criterion, i) => ({ criterion, result: branchAccepted ? "passed" : "failed",
 							evidence: branchAccepted ? [i === 0 ? branchCandidate : branchVerification] : [] })),
@@ -748,6 +765,7 @@ async function main() {
 					forkReviewStatus = reviewed.status;
 					if (branchAccepted && reviewed.status !== "accepted") fail("forked M07 review did not accept candidate");
 				}
+				statusPhase = "fork-reviewed";
 				const sourceChanged = !existsSync(parentCandidate) || !existsSync(branchCandidate) ||
 					!(await readFile(parentCandidate)).equals(await readFile(branchCandidate));
 				const preference = chooseForkWinner(accepted, branchAccepted, sourceChanged, branchComparison);
@@ -757,12 +775,14 @@ async function main() {
 				await writeFile(path.join(outputDir, "context-lineage.json"), `${JSON.stringify(lineageSummary, null, 2)}\n`, { mode: 0o600 });
 				const trueForkReceipt = lineageSummary.state === "verified";
 				if (["accepted", "rejected", "failed"].includes(forkReviewStatus)) {
+					statusPhase = "branch-selection";
 					await controller.selectBranch(runId, { parentTaskId: task.taskId,
 						...(winner ? { selectedTaskId: winner.taskId } : {}),
 						rationale: winner ? "Select the ordinarily reviewed candidate with the strongest bounded host-owned timing and no material regression; unproven speedups are not promoted." :
 							"Neither candidate met the ordinary M07 review and bounded independent checks." });
 					branchExerciseComplete = trueForkReceipt;
 				}
+				statusPhase = "branch-selected";
 				branchState = { state: branchExerciseComplete ? "completed" : "incomplete", parentTaskId: task.taskId,
 					forkTaskId: forked.taskId, checkpointId: task.branchSource.checkpoint.id,
 					parentSessionId: task.branchSource.checkpoint.sourceSessionId, forkSessionId: forked.session?.id ?? null,
@@ -776,6 +796,7 @@ async function main() {
 			const selectedTask = winner ?? task;
 			let candidate = path.join(selectedTask.workDir, "candidate.cpp");
 			let verificationPath = path.join(selectedTask.workDir, "verification.json");
+			statusPhase = "first-goal-finishing";
 			const finished = await controller.finish(runId, { outcome: acceptedWinner ? "fulfilled" : "partial", returnPath: "user",
 				summary: acceptedWinner ? "M07 builder, true refinement fork, fresh reviews and measured branch selection completed." :
 					"M07 attempt or true branch selection was incomplete.",
@@ -783,9 +804,11 @@ async function main() {
 					evidence: acceptedWinner ? [i === 0 ? candidate : verificationPath] : [] })),
 				limitations: ["The workflow-owned independent checker covers bounded shapes, mutations and threads; it is not exhaustive proof of correctness or optimality."] });
 			const firstGoalReady = firstM07Accepted(acceptedWinner, finished.outcome);
+			statusPhase = "first-goal-finished";
 			const frozenGoal = await controller.status(runId);
 			const frozenTask = frozenGoal.tasks.find(item => item.taskId === selectedTask.taskId);
 			if (!frozenTask) fail("finished M07 task identity is unavailable for private archive");
+			statusPhase = "private-archive";
 			const privateArchive = await archivePrivateM07Task({ goal: frozenGoal, task: frozenTask, destination: outputDir });
 			const parentArchiveDir = path.join(campaignRoot, "branch-parent-archive");
 			await archivePrivateM07Task({ goal: frozenGoal, task: frozenGoal.tasks.find(item => item.taskId === task.taskId)!,
@@ -803,6 +826,7 @@ async function main() {
 			let m04: { status: "completed" | "failed" | "not_run"; runId?: string; proposalSubmitted?: boolean;
 				snapshotCreated?: boolean; evidenceReturned?: boolean; adoptedExperienceRefs?: KnowledgeRef[] } = { status: "not_run" };
 			if (firstGoalReady && branchExerciseComplete && !budget.snapshot().stopped && !abort.signal.aborted) {
+				statusPhase = "m04-dispatch";
 				const m04Abort = new AbortController();
 				const m04Timer = setTimeout(() => m04Abort.abort(), M04_PHASE_MS);
 				try {
@@ -835,6 +859,7 @@ async function main() {
 			if (firstGoalReady && m04.status === "completed" && knowledgeExport.state !== "incomplete" &&
 				m04AdoptionReadContractSatisfied && existsSync(candidate) && existsSync(verificationPath) &&
 				!budget.snapshot().stopped && !abort.signal.aborted && Date.now() + 90_000 < campaignStopAt) {
+				statusPhase = "post-m04-followon";
 				try {
 					const prior = JSON.parse(await readFile(verificationPath, "utf8")) as Record<string, unknown>;
 					followOnPriorVerification = prior;
@@ -962,6 +987,7 @@ async function main() {
 		}
 		try { await preserveCandidate(new Workspace(path.join(campaignRoot, "workspace")), runId, outputDir); }
 		catch {
+			statusArchiveFailure = "bounded-fallback-archive-failed";
 			await saveStatus({ outcome: "incomplete", archiveFailure: "bounded-fallback-archive-failed",
 				independentValidation: "not-complete" }).catch(() => undefined);
 			process.exitCode = 1;
@@ -971,18 +997,23 @@ async function main() {
 }
 
 export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceReturned, inputs, stageProbe, verifierScratch,
-	privateFailureMessage, credentialProbe, parseCheckerOutput, compareCandidateTimings, chooseForkWinner, firstM07Accepted,
+	privateFailureMessage, privateExceptionDiagnostic, credentialProbe, parseCheckerOutput, compareCandidateTimings,
+	chooseForkWinner, firstM07Accepted,
 	forkReceiptMatches, contextLineageSummary, exportPrefixedArchive, preserveCandidate };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	main().catch(async error => {
 		const preProvider = ["preflight", "isolated-preflight-passed", "workspace-init", "private-inputs-staged",
 			"original-source-smoke", "source-and-isolation-preflight-passed"].includes(statusPhase);
+		const diagnostic = privateExceptionDiagnostic(error, statusRuntimeKey);
 		try { await saveStatus({ outcome: "incomplete", errorCategory: "campaign-exception",
 			...(preProvider ? { privateDiagnostic: error instanceof SandboxPreflightError
 				? error.privateDiagnostic : error instanceof Error ? error.message.slice(-2000) : "unknown pre-provider failure" } : {}),
+			...(!preProvider ? { privateDiagnostic: diagnostic.message,
+				exceptionCode: diagnostic.code, exceptionCategory: diagnostic.category } : {}),
 			...(statusTaskTelemetry ? { taskTelemetry: statusTaskTelemetry } : {}),
 			...(statusBranchTelemetry ? { branchTaskTelemetry: statusBranchTelemetry } : {}),
+			...(statusArchiveFailure ? { archiveFailure: statusArchiveFailure } : {}),
 			...(statusCredentialProbe ? { credentialProbe: statusCredentialProbe } : {}),
 			...(statusAuthSource ? { sdkAuthSource: statusAuthSource } : {}),
 			...(statusSdkAuthMatch !== undefined ? { sdkAuthMatch: statusSdkAuthMatch } : {}),
