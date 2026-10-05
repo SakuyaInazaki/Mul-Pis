@@ -1,9 +1,6 @@
 name: Bounded confidential campaign
 
 on:
-  push:
-    branches:
-      - improve/workflow-learning-reliability
   workflow_dispatch:
     inputs:
       authorize_bounded_run:
@@ -25,9 +22,9 @@ jobs:
       github.repository == 'SakuyaInazaki/Mul-Pis' &&
       github.actor == 'SakuyaInazaki' &&
       github.run_attempt == 1 &&
-      github.event_name == 'push' &&
+      github.event_name == 'workflow_dispatch' &&
       github.ref == 'refs/heads/improve/workflow-learning-reliability' &&
-      github.event.head_commit.message == 'Validate typed fork evidence and continue knowledge loop (mul-pis-20261005-context-run4)'
+      inputs.authorize_bounded_run == true
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
