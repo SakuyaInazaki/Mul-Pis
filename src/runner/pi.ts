@@ -453,8 +453,9 @@ export class PiSessionRunner implements SessionRunner {
 		const campaign = this.options.campaignBudget;
 		const strict = spec.strictRequest;
 		if (strict) {
-			if ((!campaign && (spec.tools.kind !== "none" || strict.maxProviderCallsPerPrompt !== 1)) || !Number.isInteger(strict.maxProviderCallsPerPrompt) || strict.maxProviderCallsPerPrompt < 1 ||
-				(strict.maxOutputTokens !== undefined && (!Number.isInteger(strict.maxOutputTokens) || strict.maxOutputTokens < 1)) || !Number.isInteger(strict.maxInputPayloadBytes) || strict.maxInputPayloadBytes < 1) {
+			if ((!campaign && (spec.tools.kind !== "none" || strict.maxProviderCallsPerPrompt !== 1 || strict.maxInputPayloadBytes === undefined)) || !Number.isInteger(strict.maxProviderCallsPerPrompt) || strict.maxProviderCallsPerPrompt < 1 ||
+				(strict.maxOutputTokens !== undefined && (!Number.isInteger(strict.maxOutputTokens) || strict.maxOutputTokens < 1)) ||
+				(strict.maxInputPayloadBytes !== undefined && (!Number.isInteger(strict.maxInputPayloadBytes) || strict.maxInputPayloadBytes < 1))) {
 				throw new HarnessError("runner.model", "strict request requires positive integer caps; tools require a campaign budget");
 			}
 		}
@@ -499,9 +500,16 @@ export class PiSessionRunner implements SessionRunner {
 							if (strictPayloadChecks > strict.maxProviderCallsPerPrompt || payloadModel.provider !== model.provider || payloadModel.id !== model.id || payloadModel.api !== model.api || payloadModel.baseUrl !== model.baseUrl) throw new HarnessError("runner.model", "strict request payload changed model or repeated");
 							const record = payload as Record<string, unknown>;
 							if (campaign && record.model !== model.id) throw new HarnessError("runner.campaign", "provider payload model changed");
-							if (strict.maxOutputTokens !== undefined && record.max_tokens !== strict.maxOutputTokens && record.max_completion_tokens !== strict.maxOutputTokens) throw new HarnessError("runner.model", "strict request output cap missing from provider payload");
-							const bytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
-							if (bytes > strict.maxInputPayloadBytes) throw new HarnessError("runner.model", "strict request input payload exceeds reserved byte cap");
+							if (strict.maxOutputTokens !== undefined &&
+								((record.max_tokens === undefined && record.max_completion_tokens === undefined) ||
+									(record.max_tokens !== undefined && record.max_tokens !== strict.maxOutputTokens) ||
+									(record.max_completion_tokens !== undefined && record.max_completion_tokens !== strict.maxOutputTokens))) {
+								throw new HarnessError("runner.model", "strict request output cap missing or inconsistent in provider payload");
+							}
+							const serialized = JSON.stringify(payload);
+							if (typeof serialized !== "string") throw new HarnessError("runner.model", "provider payload could not be serialized for reservation");
+							const bytes = Buffer.byteLength(serialized, "utf8");
+							if (strict.maxInputPayloadBytes !== undefined && bytes > strict.maxInputPayloadBytes) throw new HarnessError("runner.model", "strict request input payload exceeds reserved byte cap");
 							campaign?.reserve(bytes);
 							return payload;
 						},

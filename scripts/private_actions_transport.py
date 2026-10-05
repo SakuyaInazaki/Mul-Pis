@@ -29,7 +29,17 @@ MAX_TAR = 96 * 1024 * 1024
 MAX_FILE = 64 * 1024 * 1024
 EXPECTED_INPUT_FILES = 3
 MAX_ENVELOPE = 132 * 1024 * 1024
-RESULT_ALLOWLIST = ("candidate.cpp", "verification.json", "campaign-status.json")
+RESULT_ALLOWLIST = (
+    "candidate.cpp", "verification.json", "lesson-delta.json", "workflow-archive.json", "m04-adopted-knowledge.json",
+    "round-1-candidate.cpp", "round-1-verification.json", "round-2-candidate.cpp", "round-2-verification.json",
+    "followon-candidate.cpp", "followon-verification.json", "followon-lesson-delta.json", "workflow-followon-archive.json",
+    "followon-round-1-candidate.cpp", "followon-round-1-verification.json",
+    "followon-round-2-candidate.cpp", "followon-round-2-verification.json",
+    "initial-candidate.cpp", "initial-verification.json", "initial-lesson-delta.json", "workflow-initial-archive.json",
+    "initial-round-1-candidate.cpp", "initial-round-1-verification.json",
+    "initial-round-2-candidate.cpp", "initial-round-2-verification.json",
+    "campaign-status.json",
+)
 METADATA_RE = re.compile(r"^[A-Za-z0-9_./:@-]{1,160}$")
 
 

@@ -124,6 +124,8 @@ class EncryptTests(unittest.TestCase):
             results = root / "results"
             results.mkdir()
             (results / "candidate.cpp").write_bytes(b"secret candidate")
+            (results / "lesson-delta.json").write_bytes(b'{"action":"none"}')
+            (results / "workflow-archive.json").write_bytes(b'{"trustedAdoption":false}')
             (results / "campaign-status.json").write_bytes(b'{"status":"complete"}')
             (results / "ignored.txt").write_bytes(b"must be excluded")
             public = root / "public.pem"
@@ -143,7 +145,7 @@ class EncryptTests(unittest.TestCase):
             plain = AESGCM(key).decrypt(base64.b64decode(envelope["nonce_b64"]),
                 base64.b64decode(envelope["ciphertext_b64"]), aad)
             with tarfile.open(fileobj=io.BytesIO(plain), mode="r:") as tar:
-                self.assertEqual(sorted(tar.getnames()), ["campaign-status.json", "candidate.cpp"])
+                self.assertEqual(sorted(tar.getnames()), ["campaign-status.json", "candidate.cpp", "lesson-delta.json", "workflow-archive.json"])
                 self.assertEqual(tar.extractfile("candidate.cpp").read(), b"secret candidate")
             with self.assertRaises(Exception):
                 AESGCM(key).decrypt(base64.b64decode(envelope["nonce_b64"]),
@@ -154,6 +156,8 @@ class EncryptTests(unittest.TestCase):
                 serialization.NoEncryption()))
             recovered = transport.decrypt_results(encrypted, private_file, root)
             self.assertEqual((recovered / "candidate.cpp").read_bytes(), b"secret candidate")
+            self.assertEqual((recovered / "lesson-delta.json").read_bytes(), b'{"action":"none"}')
+            self.assertEqual((recovered / "workflow-archive.json").read_bytes(), b'{"trustedAdoption":false}')
             self.assertFalse((recovered / "ignored.txt").exists())
             self.assertEqual(recovered.stat().st_mode & 0o777, 0o700)
             self.assertEqual((recovered / "candidate.cpp").stat().st_mode & 0o777, 0o600)

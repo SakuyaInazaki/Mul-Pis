@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       authorize_bounded_run:
-        description: "Authorize one DeepSeek campaign up to 23 CNY after checking prior charges"
+        description: "Authorize one DeepSeek campaign up to 21 CNY after checking prior charges"
         required: true
         default: false
         type: boolean
@@ -25,12 +25,9 @@ jobs:
       github.repository == 'SakuyaInazaki/Mul-Pis' &&
       github.actor == 'SakuyaInazaki' &&
       github.run_attempt == 1 &&
-      (
-        (github.event_name == 'workflow_dispatch' && inputs.authorize_bounded_run == true) ||
-        (github.event_name == 'push' &&
-         github.ref == 'refs/heads/improve/workflow-learning-reliability' &&
-         github.event.head_commit.message == 'Resume bounded private M07 campaign (mul-pis-20261005-lab-resume1)')
-      )
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/improve/workflow-learning-reliability' &&
+      github.event.head_commit.message == 'Resume bounded private M07 campaign (mul-pis-20261005-lab-resume2)'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

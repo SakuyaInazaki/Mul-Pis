@@ -69,8 +69,8 @@ export interface SessionSpec {
 	persistDir: string;
 	/** Explicit, frozen method identity. It never enables resource discovery. */
 	methodBinding?: { versionId: string; contentId?: string };
-	/** Opt-in request guard. A campaign runner requires fixed caps for every provider request in a tool loop. */
-	strictRequest?: { maxProviderCallsPerPrompt: number; maxOutputTokens?: number; maxInputPayloadBytes: number };
+	/** Opt-in request guard. A campaign reserves actual serialized input bytes; tool-free strict callers may still set a fixed input cap. */
+	strictRequest?: { maxProviderCallsPerPrompt: number; maxOutputTokens?: number; maxInputPayloadBytes?: number };
 }
 
 /** Enough to reopen a persisted session with the same boundary. */

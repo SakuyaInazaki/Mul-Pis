@@ -13,7 +13,6 @@ export interface DeepSeekCampaignLimits {
 	maxCny: number;
 	maxProviderCalls: number;
 	maxProviderCallsPerPrompt: number;
-	maxInputPayloadBytes: number;
 	maxOutputTokens: number;
 	outputAccountingMarginTokens: number;
 	maxInputCnyPerMillionTokens: number;
@@ -30,13 +29,14 @@ export class DeepSeekCampaignBudget {
 	private reservedCny = 0;
 	private active = false;
 	private promptStart = 0;
+	private readonly requestReservations: Array<{ inputPayloadBytes: number; reservedCny: number }> = [];
 	private stopped = false;
 	private stopReason?: "payload-boundary" | "ceiling" | "usage-reconciliation" | "prompt-failure";
 
 	constructor(limits: DeepSeekCampaignLimits) {
 		if (!/^deepseek\/[^/]+(?::(?:off|minimal|low|medium|high|max))?$/.test(limits.model) || limits.endpoint !== "https://api.deepseek.com" ||
 			!positive(limits.maxCny) || !count(limits.maxProviderCalls) || !count(limits.maxProviderCallsPerPrompt) ||
-			!count(limits.maxInputPayloadBytes) || !count(limits.maxOutputTokens) ||
+			!count(limits.maxOutputTokens) ||
 			!Number.isSafeInteger(limits.outputAccountingMarginTokens) || limits.outputAccountingMarginTokens < 0 ||
 			!positive(limits.maxInputCnyPerMillionTokens) || !positive(limits.maxOutputCnyPerMillionTokens) || !positive(limits.cnyPerUsdCeiling)) {
 			throw new HarnessError("runner.campaign", "invalid DeepSeek campaign limits");
@@ -47,7 +47,6 @@ export class DeepSeekCampaignBudget {
 	get strictRequest(): NonNullable<SessionSpec["strictRequest"]> {
 		return {
 			maxProviderCallsPerPrompt: this.limits.maxProviderCallsPerPrompt,
-			maxInputPayloadBytes: this.limits.maxInputPayloadBytes,
 			maxOutputTokens: this.limits.maxOutputTokens,
 		};
 	}
@@ -93,15 +92,15 @@ export class DeepSeekCampaignBudget {
 
 	/** Called synchronously by onPayload, before the HTTP request can begin. */
 	reserve(payloadBytes: number): void {
-		if (!this.active || this.stopped || !count(payloadBytes) || payloadBytes > this.limits.maxInputPayloadBytes) {
+		if (!this.active || this.stopped || !count(payloadBytes)) {
 			this.stopped = true;
 			this.stopReason ??= "payload-boundary";
-			throw new HarnessError("runner.campaign", "provider payload exceeds the campaign boundary");
+			throw new HarnessError("runner.campaign", "provider payload byte count is unavailable");
 		}
 		const next = this.reservations + 1;
-		const worstCny = (this.limits.maxInputPayloadBytes * this.limits.maxInputCnyPerMillionTokens +
+		const worstCny = (payloadBytes * this.limits.maxInputCnyPerMillionTokens +
 			(this.limits.maxOutputTokens + this.limits.outputAccountingMarginTokens) * this.limits.maxOutputCnyPerMillionTokens) / 1_000_000;
-		if (next > this.limits.maxProviderCalls || next - this.promptStart > this.limits.maxProviderCallsPerPrompt ||
+		if (!Number.isFinite(worstCny) || next > this.limits.maxProviderCalls || next - this.promptStart > this.limits.maxProviderCallsPerPrompt ||
 			this.reservedCny + worstCny > this.limits.maxCny + 1e-9) {
 			this.stopped = true;
 			this.stopReason ??= "ceiling";
@@ -109,22 +108,23 @@ export class DeepSeekCampaignBudget {
 		}
 		this.reservations = next;
 		this.reservedCny += worstCny;
+		this.requestReservations.push({ inputPayloadBytes: payloadBytes, reservedCny: worstCny });
 	}
 
 	finishPrompt(events: readonly UsageEvent[]): void {
 		try {
 			const assistant = events.filter((event) => event.kind === "assistant");
-			const reservedPerRequest = (this.limits.maxInputPayloadBytes * this.limits.maxInputCnyPerMillionTokens +
-				(this.limits.maxOutputTokens + this.limits.outputAccountingMarginTokens) * this.limits.maxOutputCnyPerMillionTokens) / 1_000_000;
+			const reserved = this.requestReservations.slice(this.promptStart);
 			if (assistant.length !== this.reservations - this.promptStart || assistant.length === 0 ||
-				assistant.some((event) => event.status !== "reported" || event.costStatus !== "priced" ||
+				assistant.some((event, index) => event.status !== "reported" || event.costStatus !== "priced" ||
 					event.provider !== "deepseek" || event.model !== this.limits.model.slice("deepseek/".length).split(":")[0] ||
 					!event.usage || ![event.usage.input, event.usage.output, event.usage.cacheRead, event.usage.cacheWrite, event.usage.totalTokens]
 						.every((value) => Number.isSafeInteger(value) && value! >= 0) ||
-					(event.usage.input! + event.usage.cacheRead! + event.usage.cacheWrite!) > this.limits.maxInputPayloadBytes ||
+					event.usage.totalTokens! !== event.usage.input! + event.usage.output! + event.usage.cacheRead! + event.usage.cacheWrite! ||
+					(event.usage.input! + event.usage.cacheRead! + event.usage.cacheWrite!) > reserved[index].inputPayloadBytes ||
 					event.usage.output! > this.limits.maxOutputTokens + this.limits.outputAccountingMarginTokens ||
 					!Number.isFinite(event.usage.cost) || event.usage.cost! < 0 ||
-					event.usage.cost! * this.limits.cnyPerUsdCeiling > reservedPerRequest + 1e-9 ||
+					event.usage.cost! * this.limits.cnyPerUsdCeiling > reserved[index].reservedCny + 1e-9 ||
 					!(["stop", "toolUse"] as Array<string | undefined>).includes(event.stopReason))) {
 				throw new HarnessError("runner.campaign", "provider usage or call outcome is incomplete or exceeds the campaign reserve");
 			}
