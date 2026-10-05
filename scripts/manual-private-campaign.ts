@@ -17,12 +17,14 @@ import { createM07Controller } from "../src/m07/controller.ts";
 import { runMeasuredEvidenceHandoff } from "../src/m07/evidence-finalization.ts";
 import { assessAndAdvanceOriginalObjective, createOriginalObjective, objectiveProgress, runOriginalObjectiveLoop,
 	writeObjectiveProgress, writeOriginalObjectiveContract } from "../src/m07/objective-progress.ts";
-import type { ObjectiveProgressV1, ObjectiveStopReason } from "../src/m07/objective-progress.ts";
+import type { ObjectiveProgressV1, ObjectiveStopReason, OriginalObjectiveContractV1 } from "../src/m07/objective-progress.ts";
 import type { CurrentGoal, M07TaskRecord, TaskSpecInput } from "../src/m07/types.ts";
 import { runM04 } from "../src/stages/m04.ts";
 import { createPiSessionRunner } from "../src/runner/pi.ts";
 import type { SessionCheckpoint, SessionHandle, SessionRunner, SessionSpec } from "../src/runner/types.ts";
 import { DeepSeekCampaignBudget } from "../src/runner/deepseek-campaign.ts";
+import { MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, verifySignedMissionLedger } from
+	"../src/runner/signed-mission-ledger.ts";
 import { createConfinedCampaignFileTools } from "../src/runner/confined-campaign-files.ts";
 import { archivePrivateM07Task, recordPrivateM04Outcome } from "../src/workflow-archive/m07-private.ts";
 import { buildCsrChecker } from "../src/workflow-archive/csr-checker.ts";
@@ -31,7 +33,6 @@ import type { KnowledgeRef, KnowledgeStore } from "../src/knowledge/types.ts";
 import type { StageRunRecord } from "../src/types.ts";
 
 const MODEL = "deepseek/deepseek-flash:low";
-const MAX_CNY = 2.8;
 const CAMPAIGN_MS = 20 * 60_000;
 const BUILDER_PHASE_MS = 7 * 60_000;
 const M04_PHASE_MS = 5 * 60_000;
@@ -85,7 +86,9 @@ function taskFailureCategory(raw: unknown): string {
 	if (typeof raw !== "string") return "none";
 	const http = /(?:HTTP|status(?: code)?)[ :=]+(400|401|402|403|404|408|409|413|422|429|500|502|503|504)\b/i.exec(raw);
 	if (http) return `http-${http[1]}`;
-	if (/campaign call or CNY planning ceiling exhausted/i.test(raw)) return "campaign-ceiling";
+	if (/campaign (?:call or CNY planning ceiling exhausted|global CNY total exhausted)/i.test(raw)) return "campaign-total-ceiling";
+	if (/campaign provider call limit exhausted/i.test(raw)) return "provider-call-limit";
+	if (/price assumption/i.test(raw)) return "price-assumption-invalid";
 	if (/provider payload exceeds the campaign boundary|input payload exceeds/i.test(raw)) return "payload-ceiling";
 	if (/provider usage or call outcome is incomplete/i.test(raw)) return "usage-incomplete";
 	if (/stopReason=length|output cap/i.test(raw)) return "output-limit";
@@ -94,6 +97,12 @@ function taskFailureCategory(raw: unknown): string {
 	if (/model.*not found|model.*resolved|model route/i.test(raw)) return "model-resolution";
 	if (/did not stop normally|runner.stop/i.test(raw)) return "sdk-stop";
 	return "unclassified";
+}
+function campaignObjectiveStop(reason: string | undefined): ObjectiveStopReason | undefined {
+	if (reason === "total-cny-ceiling") return "budget-boundary";
+	if (reason === "provider-call-limit") return "provider-call-limit";
+	if (reason === "price-assumption-invalid") return "accounting-integrity-error";
+	return undefined;
 }
 function privateExceptionDiagnostic(error: unknown, runtimeKey: string | undefined):
 	{ code: string; category: string; message: string | null } {
@@ -154,20 +163,102 @@ async function saveStatus(value: Record<string, unknown>): Promise<void> {
 	await rename(temporary, target);
 }
 async function preserveCandidate(ws: Workspace, runId: string | undefined, outputDir: string): Promise<void> {
-	if (!runId || existsSync(path.join(outputDir, "workflow-archive.json"))) return;
+	if (!runId) return;
+	if (existsSync(path.join(outputDir, "workflow-archive.json")) &&
+		(existsSync(path.join(outputDir, "workflow-branch-child-archive.json")) ||
+			existsSync(path.join(outputDir, "workflow-followon-archive.json")) ||
+			existsSync(path.join(outputDir, "workflow-initial-archive.json")))) return;
 	const goalFile = path.join(ws.runDir("M07", runId), "goal.json");
 	if (!existsSync(goalFile)) return;
 	const goal = JSON.parse(await readFile(goalFile, "utf8")) as CurrentGoal;
 	const tasks = goal.tasks.filter(item => item.mode === "execute").slice(0, 2);
 	if (!tasks.length) return;
-	await archivePrivateM07Task({ goal, task: tasks[0], destination: outputDir });
-	if (tasks[1]) {
+	if (!existsSync(path.join(outputDir, "workflow-archive.json")))
+		await archivePrivateM07Task({ goal, task: tasks[0], destination: outputDir });
+	if (tasks[1] && !existsSync(path.join(outputDir, "workflow-branch-child-archive.json"))) {
 		const temporary = await mkdtemp(path.join(os.tmpdir(), "mulpis-private-fallback-"));
 		try {
 			await archivePrivateM07Task({ goal, task: tasks[1], destination: temporary });
 			await exportPrefixedArchive(temporary, outputDir, "branch-child");
 		} finally { await rm(temporary, { recursive: true, force: true }); }
 	}
+}
+
+/** Leave an auditable partial result when a child prompt has unresolved external-operation state. */
+async function preserveUnsettledBranchCheckpoint(input: {
+	ws: Workspace; runId: string; outputDir: string; contract: OriginalObjectiveContractV1;
+	budgetStopReason?: string;
+}): Promise<{ checkpoint: ObjectiveProgressV1; acceptedTaskIds: string[];
+	unresolvedOperationIds: string[]; archiveFailure?: string }> {
+	const goalFile = path.join(input.ws.runDir("M07", input.runId), "goal.json");
+	const goal = JSON.parse(await readFile(goalFile, "utf8")) as CurrentGoal;
+	const unresolvedOperationIds = (goal.executionState?.operations ?? [])
+		.filter(item => ["prepared", "issued", "unknown"].includes(item.status)).map(item => item.id);
+	if (goal.runId !== input.runId || !unresolvedOperationIds.length)
+		fail("unsettled branch checkpoint requires the matching goal and actual unresolved operations");
+	const acceptedTaskIds = goal.tasks.filter(item => item.status === "accepted").map(item => item.taskId);
+	let archiveFailure: string | undefined;
+	try { await preserveCandidate(input.ws, input.runId, input.outputDir); }
+	catch { archiveFailure = "unsettled-branch-archive-incomplete"; }
+	const availableArtifacts = ["candidate.cpp", "verification.json", "workflow-archive.json",
+		"branch-child-candidate.cpp", "branch-child-verification.json", "workflow-branch-child-archive.json"]
+		.filter(name => existsSync(path.join(input.outputDir, name)));
+	const checkpoint = objectiveProgress(input.contract, {
+		boundedRuns: [{ runId: input.runId, outcome: goal.lifecycle === "finished" ? goal.outcome ?? "unknown" : "active",
+			acceptedTaskIds, unresolvedOperationIds }],
+		selectedArtifacts: [], availableArtifacts, unresolvedOperationIds,
+		stopReason: campaignObjectiveStop(input.budgetStopReason) ?? "bounded-run-incomplete",
+	});
+	await writeObjectiveProgress(path.join(input.outputDir, "objective-checkpoint.json"), checkpoint);
+	return { checkpoint, acceptedTaskIds, unresolvedOperationIds, ...(archiveFailure ? { archiveFailure } : {}) };
+}
+
+async function salvageObjectiveCheckpoint(ws: Workspace, outputDir: string,
+	budgetStopReason: string | undefined, timedOut: boolean): Promise<void> {
+	const contractFile = path.join(outputDir, "original-objective.json");
+	if (!existsSync(contractFile)) return;
+	const contract = JSON.parse(await readFile(contractFile, "utf8")) as OriginalObjectiveContractV1;
+	if (contract.version !== 1 || contract.kind !== "original-objective" || !contract.id)
+		fail("frozen original objective is unavailable during checkpoint salvage");
+	const checkpointFile = path.join(outputDir, "objective-checkpoint.json");
+	let previous: ObjectiveProgressV1 | undefined;
+	try { previous = JSON.parse(await readFile(checkpointFile, "utf8")) as ObjectiveProgressV1; } catch { /* repair missing checkpoint */ }
+	const boundedRuns: ObjectiveProgressV1["boundedRuns"] = [];
+	const unresolvedOperationIds: string[] = [];
+	for (const id of await ws.listRuns("M07")) {
+		try {
+			const goal = JSON.parse(await readFile(path.join(ws.runDir("M07", id), "goal.json"), "utf8")) as CurrentGoal;
+			const pending = (goal.executionState?.operations ?? [])
+				.filter(item => ["prepared", "issued", "unknown"].includes(item.status)).map(item => item.id);
+			unresolvedOperationIds.push(...pending.map(item => `${id}/${item}`));
+			const acceptedTaskIds = goal.tasks.filter(item => item.status === "accepted").map(item => item.taskId);
+			const selected = goal.branchSelections?.findLast(item => item.selectedTaskId)?.selectedTaskId;
+			boundedRuns.push({ runId: id, outcome: goal.lifecycle === "finished" ? goal.outcome ?? "unknown" : "active",
+				acceptedTaskIds, unresolvedOperationIds: pending,
+				...(selected && acceptedTaskIds.includes(selected) ? { selectedTaskId: selected } : {}) });
+		} catch { boundedRuns.push({ runId: id, outcome: "record-unavailable" }); }
+	}
+	const availableArtifacts = (await readdir(outputDir)).filter(name =>
+		/^(?:candidate\.cpp|verification\.json|workflow-(?:archive|[A-Za-z0-9-]+-archive)\.json|(?:branch-parent|branch-child|iteration-\d+|followon|initial)-(?:candidate\.cpp|verification\.json))$/.test(name));
+	const priorCoversLive = previous?.contract.id === contract.id &&
+		previous.stopReason !== "assessment-validation-pending" && unresolvedOperationIds.length === 0 &&
+		(!timedOut || previous.stopReason === "time-boundary") &&
+		(budgetStopReason !== "total-cny-ceiling" || previous.stopReason === "budget-boundary") &&
+		(budgetStopReason !== "provider-call-limit" || previous.stopReason === "provider-call-limit") &&
+		(budgetStopReason !== "price-assumption-invalid" || previous.stopReason === "accounting-integrity-error") &&
+		boundedRuns.every(item => item.outcome !== "active" && item.outcome !== "record-unavailable") &&
+		previous.boundedRuns.length === boundedRuns.length && boundedRuns.every(item =>
+			previous!.boundedRuns.some(saved => saved.runId === item.runId && saved.outcome === item.outcome)) &&
+		availableArtifacts.every(name => previous.availableArtifacts?.includes(name));
+	if (priorCoversLive) return;
+	const progress = objectiveProgress(contract, { boundedRuns,
+		selectedArtifacts: previous?.contract.id === contract.id ?
+			previous.selectedArtifacts.filter(name => availableArtifacts.includes(name)) : [],
+		availableArtifacts, unresolvedOperationIds,
+		...(previous?.contract.id === contract.id && previous.assessment ? { assessment: previous.assessment } : {}),
+		...(previous?.contract.id === contract.id ? { assessmentHistory: previous.assessmentHistory } : {}),
+		stopReason: campaignObjectiveStop(budgetStopReason) ?? (timedOut ? "time-boundary" : "bounded-run-incomplete") });
+	await writeObjectiveProgress(checkpointFile, progress);
 }
 async function forkReceiptMatches(file: string | undefined, checkpoint: SessionCheckpoint, childSessionId: string | undefined): Promise<boolean> {
 	if (!file || !childSessionId) return false;
@@ -600,8 +691,19 @@ async function main() {
 	const inputDir = arg("--input-dir"), outputDir = arg("--output-dir");
 	statusOutputDir = outputDir;
 	await mkdir(outputDir, { recursive: true, mode: 0o700 });
+	const ledgerEnvelope = process.env.MULPIS_MISSION_LEDGER_B64;
+	const githubToken = process.env.GITHUB_TOKEN;
 	const runtimeKey = process.env.DEEPSEEK_API_KEY;
+	delete process.env.MULPIS_MISSION_LEDGER_B64;
+	delete process.env.GITHUB_TOKEN;
 	delete process.env.DEEPSEEK_API_KEY;
+	statusPhase = "mission-ledger-verification";
+	const missionLedger = await verifySignedMissionLedger({ envelopeB64: ledgerEnvelope,
+		publicKeyFile: path.join(HERE, "campaign-output-public.pem"), githubToken,
+		current: { repository: process.env.GITHUB_REPOSITORY, runId: process.env.GITHUB_RUN_ID,
+			runAttempt: process.env.GITHUB_RUN_ATTEMPT, actor: process.env.GITHUB_ACTOR,
+			event: process.env.GITHUB_EVENT_NAME, ref: process.env.GITHUB_REF,
+			sha: process.env.GITHUB_SHA, manualAuthorized: process.env.MULPIS_MANUAL_AUTHORIZED } });
 	if (!runtimeKey?.trim()) fail("DeepSeek credential absent");
 	statusRuntimeKey = runtimeKey;
 	statusPhase = "credential-probe";
@@ -618,12 +720,15 @@ async function main() {
 	statusPhase = "isolated-preflight-passed";
 	const campaignRoot = await mkdtemp(path.join(os.tmpdir(), "mulpis-private-campaign-"));
 	let runId: string | undefined;
-	const budget = new DeepSeekCampaignBudget({ model: MODEL, endpoint: "https://api.deepseek.com", maxCny: MAX_CNY,
+	const budget = new DeepSeekCampaignBudget({ model: MODEL, endpoint: "https://api.deepseek.com",
+		maxCny: MISSION_TOTAL_CNY, priorCommittedCny: missionLedger.priorCommittedCny,
 		maxProviderCalls: MAX_PROVIDER_CALLS, maxProviderCallsPerPrompt: 32,
 		maxOutputTokens: 64_000, outputAccountingMarginTokens: 32,
-		maxInputCnyPerMillionTokens: 4, maxCacheReadCnyPerMillionTokens: 0.2,
-		maxOutputCnyPerMillionTokens: 16, cnyPerUsdCeiling: 10 });
+		estimatedInputCnyPerMillionTokens: 4, estimatedCacheReadCnyPerMillionTokens: 0.2,
+		estimatedOutputCnyPerMillionTokens: 16, estimatedCnyPerUsd: 10 });
 	statusBudget = budget;
+	let campaignDeadlineAt: number | undefined;
+	let campaignTimedOut = false;
 	try {
 		const ws = new Workspace(path.join(campaignRoot, "workspace"));
 		statusPhase = "workspace-init";
@@ -691,7 +796,8 @@ async function main() {
 		if (!statusSdkAuthMatch) fail("SDK model credential resolution did not verify");
 		const abort = new AbortController();
 		const campaignStopAt = Date.now() + CAMPAIGN_MS;
-		const timer = setTimeout(() => abort.abort(), CAMPAIGN_MS);
+		campaignDeadlineAt = campaignStopAt;
+		const timer = setTimeout(() => { campaignTimedOut = true; abort.abort(); }, CAMPAIGN_MS);
 		try {
 			const actual = createPiSessionRunner({ modelRuntime: runtime, signal: abort.signal, campaignBudget: budget });
 			let followOnPriorVerification: unknown;
@@ -829,9 +935,32 @@ async function main() {
 				const lineageSummary = await contextLineageSummary(forked.session?.lineageFile,
 					task.branchSource.checkpoint, forked.session?.id, forked.session?.model,
 					task.branchSource.problemSnapshotCopy);
-				await writeFile(path.join(outputDir, "context-lineage.json"), `${JSON.stringify(lineageSummary, null, 2)}\n`, { mode: 0o600 });
-				const trueForkReceipt = lineageSummary.state === "verified";
-				if (["accepted", "rejected", "failed"].includes(forkReviewStatus)) {
+					await writeFile(path.join(outputDir, "context-lineage.json"), `${JSON.stringify(lineageSummary, null, 2)}\n`, { mode: 0o600 });
+					const trueForkReceipt = lineageSummary.state === "verified";
+					const branchGoal = await controller.status(runId);
+					const unresolvedBranchOperations = (branchGoal.executionState?.operations ?? [])
+						.filter(item => ["prepared", "issued", "unknown"].includes(item.status)).map(item => item.id);
+					if (unresolvedBranchOperations.length) {
+						statusPhase = "branch-unsettled";
+						const boundary = await preserveUnsettledBranchCheckpoint({ ws, runId, outputDir,
+							contract: originalObjective, budgetStopReason: budget.snapshot().stopReason });
+						if (boundary.archiveFailure) statusArchiveFailure = boundary.archiveFailure;
+						await saveStatus({ outcome: "incomplete", boundedRunOutcome: "partial",
+							originalObjective: { id: originalObjective.id, outcome: "incomplete",
+								stopReason: boundary.checkpoint.stopReason, checkpointFile: "objective-checkpoint.json",
+								continuation: boundary.checkpoint.continuation.mode },
+							branch: { state: "unsettled", parentTaskId: task.taskId, forkTaskId: forked.taskId,
+								parentAccepted: accepted, forkAccepted: branchAccepted, trueForkReceipt,
+								acceptedTaskIds: boundary.acceptedTaskIds,
+								unresolvedOperationIds: boundary.unresolvedOperationIds },
+							taskTelemetry: statusTaskTelemetry, branchTaskTelemetry: statusBranchTelemetry,
+							availableArtifacts: boundary.checkpoint.availableArtifacts,
+							...(boundary.archiveFailure ? { archiveFailure: boundary.archiveFailure } : {}),
+							independentValidation: "bounded-parent-only; branch and original objective unresolved" });
+						process.exitCode = 1;
+						return;
+					}
+					if (["accepted", "rejected", "failed"].includes(forkReviewStatus)) {
 					statusPhase = "branch-selection";
 					await controller.selectBranch(runId, { parentTaskId: task.taskId,
 						...(winner ? { selectedTaskId: winner.taskId } : {}),
@@ -938,8 +1067,8 @@ async function main() {
 			let latestAttemptEvidence: Array<{ name: string; file: string }> = [];
 			const loop = await runOriginalObjectiveLoop({ maxIterations: MAX_PROVIDER_CALLS,
 				admission: () => {
-					if (budget.snapshot().stopped) return budget.snapshot().stopReason === "ceiling" ?
-						"budget-boundary" : "bounded-run-incomplete";
+					if (budget.snapshot().stopped) return campaignObjectiveStop(budget.snapshot().stopReason) ??
+						"bounded-run-incomplete";
 					if (abort.signal.aborted || Date.now() + 90_000 >= campaignStopAt) return "time-boundary";
 					if (currentM04Status === "failed") return "m04-evidence-incomplete";
 					if (!firstGoalReady || currentM04Status !== "completed" || currentKnowledgeExport.state === "incomplete" ||
@@ -1000,7 +1129,7 @@ async function main() {
 						evidenceRoot: path.join(campaignRoot, `objective-evidence-${iteration}`), evidence,
 						assessmentAdmission,
 						advanceAdmission: () => budget.snapshot().stopped ?
-							budget.snapshot().stopReason === "ceiling" ? "budget-boundary" : "assessment-failed" :
+							campaignObjectiveStop(budget.snapshot().stopReason) ?? "assessment-failed" :
 							abort.signal.aborted || Date.now() + 90_000 >= campaignStopAt ? "time-boundary" : "admitted",
 						supportedTaskScopes: ["two-target-existing"],
 						recordAssessment: async assessment => {
@@ -1064,8 +1193,8 @@ async function main() {
 					}
 					objectiveAssessment = objectiveStep.assessment;
 					latestAssessmentAdvanced = Boolean(objectiveStep.advanced);
-					objectiveStopReason = objectiveStep.stopReason === "assessment-failed" && budget.snapshot().stopReason === "ceiling" ?
-						"budget-boundary" : objectiveStep.stopReason === "assessment-failed" &&
+					objectiveStopReason = objectiveStep.stopReason === "assessment-failed" && campaignObjectiveStop(budget.snapshot().stopReason) ?
+						campaignObjectiveStop(budget.snapshot().stopReason)! : objectiveStep.stopReason === "assessment-failed" &&
 						(abort.signal.aborted || Date.now() >= campaignStopAt) ? "time-boundary" : objectiveStep.stopReason;
 					if (assessmentHistory.at(-1)?.iteration === iteration) {
 						assessmentHistory[assessmentHistory.length - 1].stopReason = objectiveStopReason;
@@ -1187,9 +1316,9 @@ async function main() {
 						if (assessmentHistory.at(-1)?.iteration === iteration)
 							assessmentHistory[assessmentHistory.length - 1].stopReason = objectiveStopReason;
 					}
-				} catch (error) { objectiveStopReason = budget.snapshot().stopReason === "ceiling" ? "budget-boundary" :
-					abort.signal.aborted || Date.now() >= campaignStopAt ? "time-boundary" :
-					assessmentThisIteration ? "dispatch-failed" : "assessment-failed";
+					} catch (error) { objectiveStopReason = campaignObjectiveStop(budget.snapshot().stopReason) ??
+						(abort.signal.aborted || Date.now() >= campaignStopAt ? "time-boundary" :
+							assessmentThisIteration ? "dispatch-failed" : "assessment-failed");
 					if (assessmentHistory.at(-1)?.iteration === iteration)
 						assessmentHistory[assessmentHistory.length - 1].stopReason = objectiveStopReason;
 					let failedAttemptArchive = "unavailable";
@@ -1233,7 +1362,7 @@ async function main() {
 				currentKnowledgeExport.state !== "incomplete" && branchExerciseComplete &&
 				followOnCompleted ? "fulfilled" : "partial";
 			if (boundedRunOutcome === "partial" && objectiveStopReason === "bounded-run-incomplete" &&
-				budget.snapshot().stopReason === "ceiling")
+				budget.snapshot().stopReason === "total-cny-ceiling")
 				objectiveStopReason = "budget-boundary";
 			const boundedRuns = [{ runId: runId!, outcome: finished.outcome ?? "unknown",
 				...(firstGoalReady ? { selectedTaskId: selectedTask.taskId } : {}) },
@@ -1286,6 +1415,22 @@ async function main() {
 				independentValidation: "not-complete" }).catch(() => undefined);
 			process.exitCode = 1;
 		}
+		try { await salvageObjectiveCheckpoint(new Workspace(path.join(campaignRoot, "workspace")), outputDir,
+			budget.snapshot().stopReason, campaignTimedOut ||
+				(campaignDeadlineAt !== undefined && Date.now() >= campaignDeadlineAt)); }
+		catch { statusArchiveFailure = "objective-checkpoint-salvage-failed"; process.exitCode = 1; }
+		try {
+			await writeFile(path.join(outputDir, "mission-ledger-out.json"), `${JSON.stringify({
+				version: 1, kind: "mul-pis-private-mission-ledger-observation", missionId: MISSION_ID,
+				repository: MISSION_REPOSITORY, globalMaxCny: MISSION_TOTAL_CNY,
+				priorRevision: missionLedger.revision, priorRunId: missionLedger.previous.runId,
+				priorArtifactId: missionLedger.previous.artifactId,
+				currentRunId: process.env.GITHUB_RUN_ID, currentRunAttempt: process.env.GITHUB_RUN_ATTEMPT,
+				currentCommit: process.env.GITHUB_SHA, budget: budget.snapshot(),
+				carryForwardCny: budget.snapshot().missionCommittedCny,
+				status: "pending-local-artifact-verification-and-new-signature",
+			}, null, 2)}\n`, { mode: 0o600 });
+		} catch { statusArchiveFailure = "mission-ledger-observation-write-failed"; process.exitCode = 1; }
 		await rm(campaignRoot, { recursive: true, force: true });
 	}
 }
@@ -1293,14 +1438,18 @@ async function main() {
 export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceReturned, inputs, stageProbe, verifierScratch,
 	privateFailureMessage, privateExceptionDiagnostic, credentialProbe, parseCheckerOutput, compareCandidateTimings,
 	chooseForkWinner, chooseFollowOnCandidate, firstM07Accepted,
-	forkReceiptMatches, contextLineageSummary, selectedM07ReviewReadPaths, exportPrefixedArchive, preserveCandidate };
+	forkReceiptMatches, contextLineageSummary, selectedM07ReviewReadPaths, exportPrefixedArchive, preserveCandidate,
+	preserveUnsettledBranchCheckpoint, salvageObjectiveCheckpoint };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	main().catch(async error => {
-		const preProvider = ["preflight", "isolated-preflight-passed", "workspace-init", "private-inputs-staged",
+		const preProvider = ["preflight", "mission-ledger-verification", "credential-probe", "credential-verified",
+			"isolated-preflight-passed", "workspace-init", "private-inputs-staged",
 			"original-source-smoke", "source-and-isolation-preflight-passed"].includes(statusPhase);
 		const diagnostic = privateExceptionDiagnostic(error, statusRuntimeKey);
 		try { await saveStatus({ outcome: "incomplete", errorCategory: "campaign-exception",
+			...(existsSync(path.join(statusOutputDir ?? "", "objective-checkpoint.json")) ?
+				{ originalObjective: { outcome: "incomplete", checkpointFile: "objective-checkpoint.json" } } : {}),
 			...(preProvider ? { privateDiagnostic: error instanceof SandboxPreflightError
 				? error.privateDiagnostic : error instanceof Error ? error.message.slice(-2000) : "unknown pre-provider failure" } : {}),
 			...(!preProvider ? { privateDiagnostic: diagnostic.message,

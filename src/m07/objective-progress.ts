@@ -44,7 +44,8 @@ export interface ModelObjectiveAssessmentV1 {
 	nextTask?: ObjectiveNextTaskV1;
 }
 
-export type ObjectiveStopReason = "budget-boundary" | "time-boundary" | "assessment-failed" |
+export type ObjectiveStopReason = "budget-boundary" | "provider-call-limit" | "accounting-integrity-error" |
+	"time-boundary" | "assessment-failed" |
 	"assessment-invalid" | "assessment-evidence-unread" | "model-reported-blocked" | "model-closure-unverified" |
 	"original-checks-unverified" | "assessment-validation-pending" | "next-task-pending" | "next-task-needs-capability" |
 	"objective-reassessment-pending" | "dispatch-failed" | "no-progress" |
@@ -60,11 +61,15 @@ export interface ObjectiveProgressV1 {
 		unreadEvidence: string[] };
 	assessmentHistory: Array<{ iteration: number; assessment: NonNullable<ObjectiveProgressV1["assessment"]>;
 		stopReason: ObjectiveStopReason; advanced: boolean }>;
-	boundedRuns: Array<{ runId: string; outcome: string; selectedTaskId?: string }>;
+	boundedRuns: Array<{ runId: string; outcome: string; selectedTaskId?: string;
+		acceptedTaskIds?: string[]; unresolvedOperationIds?: string[] }>;
 	selectedArtifacts: string[];
-	continuation: { mode: "explicit-authorized-new-run"; unresolvedObligations: string[];
+	availableArtifacts: string[];
+	continuation: { mode: "explicit-authorized-new-run" | "reconcile-operations-before-new-run";
+		unresolvedOperationIds: string[]; unresolvedObligations: string[];
 		unresolvedDetails: string[];
-		nextTask?: ObjectiveNextTaskV1; requiresOriginalInputs: true; requiresBudgetAdmission: true };
+		nextTask?: ObjectiveNextTaskV1; requiresOriginalInputs: true; requiresBudgetAdmission: true;
+		requiresOperationReconciliation: boolean };
 }
 
 /** Reassess the unchanged original goal after every bounded child until an actual stop boundary. */
@@ -148,6 +153,7 @@ function parseAssessment(text: string, contract: OriginalObjectiveContractV1, ev
 
 export function objectiveProgress(contract: OriginalObjectiveContractV1, input: {
 	boundedRuns: ObjectiveProgressV1["boundedRuns"]; selectedArtifacts: string[];
+	availableArtifacts?: string[]; unresolvedOperationIds?: string[];
 	assessment?: ObjectiveProgressV1["assessment"];
 	assessmentHistory?: ObjectiveProgressV1["assessmentHistory"];
 	stopReason: ObjectiveStopReason;
@@ -170,12 +176,15 @@ export function objectiveProgress(contract: OriginalObjectiveContractV1, input: 
 			contract.closure === "open-ended" ? "model-closure-unverified" : "original-checks-unverified" : input.stopReason,
 		...(input.assessment ? { assessment: input.assessment } : {}), boundedRuns: input.boundedRuns,
 		assessmentHistory: input.assessmentHistory ? input.assessmentHistory.map(item => ({ ...item })) : [],
-		selectedArtifacts: [...input.selectedArtifacts],
-		continuation: { mode: "explicit-authorized-new-run", unresolvedObligations: unresolved,
+		selectedArtifacts: [...input.selectedArtifacts], availableArtifacts: [...(input.availableArtifacts ?? input.selectedArtifacts)],
+		continuation: { mode: input.unresolvedOperationIds?.length ? "reconcile-operations-before-new-run" :
+			"explicit-authorized-new-run", unresolvedOperationIds: [...(input.unresolvedOperationIds ?? [])],
+			unresolvedObligations: unresolved,
 			unresolvedDetails: fulfilled ? [] : input.assessment?.unresolvedDetails ?? [],
 			...(input.assessment?.nextTask && input.assessment.unreadEvidence.length === 0 && !input.nextTaskDispatched ?
 				{ nextTask: input.assessment.nextTask } : {}),
-			requiresOriginalInputs: true, requiresBudgetAdmission: true } };
+			requiresOriginalInputs: true, requiresBudgetAdmission: true,
+			requiresOperationReconciliation: Boolean(input.unresolvedOperationIds?.length) } };
 }
 
 /** A fresh, read-only model judgment with a durable boundary receipt, then one validated caller-owned M07 dispatch. */

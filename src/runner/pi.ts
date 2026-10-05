@@ -763,12 +763,15 @@ export class PiSessionRunner implements SessionRunner {
 								latest = event.message;
 								if (!requestId) throw new HarnessError("runner.campaign", "provider response has no reserved request");
 								const usage = event.message.usage;
+								const hasPricedCost = Number.isFinite(usage?.cost?.total) && (usage?.cost?.total ?? -1) >= 0;
 								const report: UsageEvent = {
 									entryId: `provider-${requestId}`, kind: "assistant", promptIndex: 0, at: new Date().toISOString(),
 									provider: event.message.provider, model: event.message.model, stopReason: event.message.stopReason,
 									usage: { input: usage?.input, output: usage?.output, cacheRead: usage?.cacheRead,
 										cacheWrite: usage?.cacheWrite, totalTokens: usage?.totalTokens, cost: usage?.cost?.total },
-									status: "reported", costSource: "sdk-estimate", costStatus: "priced",
+									status: hasPricedCost ? "reported" : "unknown",
+									costSource: hasPricedCost ? "sdk-estimate" : "unknown",
+									costStatus: hasPricedCost ? "priced" : "unknown",
 								};
 								if (event.message.stopReason === "length") campaign.stopAfterTerminalLength(lease, requestId, report);
 								else campaign.settleReported(lease, requestId, report);

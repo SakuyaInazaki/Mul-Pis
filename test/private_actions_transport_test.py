@@ -137,6 +137,7 @@ class EncryptTests(unittest.TestCase):
             (results / "objective-checkpoint.json").write_bytes(b'{"objectiveOutcome":"incomplete"}')
             (results / "objective-assessment-receipt.json").write_bytes(b'{"boundaryIntent":"independent-judgment"}')
             (results / "objective-assessment-receipts.json").write_bytes(b'{"receipts":[{"boundaryIntent":"independent-judgment"}]}')
+            (results / "mission-ledger-out.json").write_bytes(b'{"carryForwardCny":21.25,"status":"pending-local-artifact-verification-and-new-signature"}')
             (results / "ignored.txt").write_bytes(b"must be excluded")
             public = root / "public.pem"
             public.write_bytes(self.private_key.public_key().public_bytes(
@@ -155,7 +156,7 @@ class EncryptTests(unittest.TestCase):
             plain = AESGCM(key).decrypt(base64.b64decode(envelope["nonce_b64"]),
                 base64.b64decode(envelope["ciphertext_b64"]), aad)
             with tarfile.open(fileobj=io.BytesIO(plain), mode="r:") as tar:
-                self.assertEqual(sorted(tar.getnames()), ["branch-child-round-1-reviewer-feedback.txt", "branch-parent-round-1-reviewer-feedback.txt", "campaign-status.json", "candidate.cpp", "context-lineage.json", "initial-m04-adopted-knowledge.json", "lesson-delta.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "objective-checkpoint.json", "original-objective.json", "review-decision.json", "round-1-reviewer-feedback.txt", "workflow-archive.json"])
+                self.assertEqual(sorted(tar.getnames()), ["branch-child-round-1-reviewer-feedback.txt", "branch-parent-round-1-reviewer-feedback.txt", "campaign-status.json", "candidate.cpp", "context-lineage.json", "initial-m04-adopted-knowledge.json", "lesson-delta.json", "mission-ledger-out.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "objective-checkpoint.json", "original-objective.json", "review-decision.json", "round-1-reviewer-feedback.txt", "workflow-archive.json"])
                 self.assertEqual(tar.extractfile("candidate.cpp").read(), b"secret candidate")
             with self.assertRaises(Exception):
                 AESGCM(key).decrypt(base64.b64decode(envelope["nonce_b64"]),
@@ -176,6 +177,7 @@ class EncryptTests(unittest.TestCase):
             self.assertEqual((recovered / "objective-checkpoint.json").read_bytes(), b'{"objectiveOutcome":"incomplete"}')
             self.assertEqual((recovered / "objective-assessment-receipt.json").read_bytes(), b'{"boundaryIntent":"independent-judgment"}')
             self.assertEqual((recovered / "objective-assessment-receipts.json").read_bytes(), b'{"receipts":[{"boundaryIntent":"independent-judgment"}]}')
+            self.assertEqual((recovered / "mission-ledger-out.json").read_bytes(), b'{"carryForwardCny":21.25,"status":"pending-local-artifact-verification-and-new-signature"}')
             self.assertEqual((recovered / "branch-parent-round-1-reviewer-feedback.txt").read_bytes(), b"Parent rationale")
             self.assertEqual((recovered / "branch-child-round-1-reviewer-feedback.txt").read_bytes(), b"Child rationale")
             self.assertFalse((recovered / "ignored.txt").exists())

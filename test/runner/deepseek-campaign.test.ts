@@ -21,9 +21,9 @@ const MODEL = {
 
 const LIMITS: DeepSeekCampaignLimits = {
 	model: "deepseek/deepseek-flash:low", endpoint: "https://api.deepseek.com",
-	maxCny: 0.006, maxProviderCalls: 2, maxProviderCallsPerPrompt: 2,
+	maxCny: 0.006, priorCommittedCny: 0, maxProviderCalls: 2, maxProviderCallsPerPrompt: 2,
 	maxOutputTokens: 20, outputAccountingMarginTokens: 32,
-	maxInputCnyPerMillionTokens: 4, maxOutputCnyPerMillionTokens: 16, cnyPerUsdCeiling: 10,
+	estimatedInputCnyPerMillionTokens: 4, estimatedOutputCnyPerMillionTokens: 16, estimatedCnyPerUsd: 10,
 };
 
 function spec(dir: string, label: string, tools: SessionSpec["tools"] = { kind: "none" }): SessionSpec {
@@ -108,10 +108,10 @@ test("campaign reserves each tool-loop provider request before transport, then r
 	assert.equal(budget.snapshot().reservations, 2);
 	assert.equal(budget.snapshot().stopped, false);
 	const reviewer = await runner.create(spec(dir, "reviewer"));
-	await assert.rejects(reviewer.prompt("review"), /campaign call or CNY planning ceiling exhausted/);
+	await assert.rejects(reviewer.prompt("review"), /campaign provider call limit exhausted/);
 	assert.equal(sent.count, 2, "denied request must not reach transport");
 	assert.equal(budget.snapshot().stopped, true);
-	assert.equal(budget.snapshot().stopReason, "ceiling");
+	assert.equal(budget.snapshot().stopReason, "provider-call-limit");
 	builder.dispose(); reviewer.dispose();
 });
 
@@ -205,7 +205,7 @@ test("campaign rejects endpoint changes and unavailable payload sizes closed", a
 	const budget = new DeepSeekCampaignBudget(LIMITS);
 	const runner = new PiSessionRunner({ modelRuntime: offlineRuntime(sent, changed), createSession: offlineFactory(1), campaignBudget: budget });
 	const handle = await runner.create(spec(dir, "changed-endpoint"));
-	await assert.rejects(handle.prompt("x"), /DeepSeek model, endpoint or price ceiling did not verify/);
+	await assert.rejects(handle.prompt("x"), /DeepSeek model, endpoint or pricing data did not verify/);
 	assert.equal(sent.count, 0);
 	assert.equal(budget.snapshot().stopped, true);
 	assert.equal(budget.snapshot().stopReason, "prompt-failure");
@@ -238,8 +238,8 @@ test("campaign accepts input above the former 96 KB cap and reserves its actual 
 	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1, maxProviderCalls: 1, maxProviderCallsPerPrompt: 1 });
 	const handle = await new PiSessionRunner({ modelRuntime: runtime, createSession: offlineFactory(1), campaignBudget: budget }).create(spec(dir, "large-input"));
 	await handle.prompt("offline");
-	const expectedCny = (payloadBytes * LIMITS.maxInputCnyPerMillionTokens +
-		(LIMITS.maxOutputTokens + LIMITS.outputAccountingMarginTokens) * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000;
+	const expectedCny = (payloadBytes * LIMITS.estimatedInputCnyPerMillionTokens +
+		(LIMITS.maxOutputTokens + LIMITS.outputAccountingMarginTokens) * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000;
 	assert.equal(dispatched, 1);
 	assert.equal(budget.snapshot().reservedCny, expectedCny);
 	assert.equal(budget.snapshot().stopped, false);
@@ -281,13 +281,13 @@ test("campaign denies the next large payload before transport when cumulative CN
 	} as unknown as ModelRuntime;
 	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 0.5, maxProviderCalls: 2 });
 	const handle = await new PiSessionRunner({ modelRuntime: runtime, createSession: offlineFactory(2), campaignBudget: budget }).create(spec(dir, "money-ceiling"));
-	await assert.rejects(handle.prompt("offline"), /campaign call or CNY planning ceiling exhausted/);
-	const firstReservation = (payloadBytes * LIMITS.maxInputCnyPerMillionTokens +
-		(LIMITS.maxOutputTokens + LIMITS.outputAccountingMarginTokens) * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000;
+	await assert.rejects(handle.prompt("offline"), /campaign global CNY total exhausted/);
+	const firstReservation = (payloadBytes * LIMITS.estimatedInputCnyPerMillionTokens +
+		(LIMITS.maxOutputTokens + LIMITS.outputAccountingMarginTokens) * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000;
 	assert.equal(budget.snapshot().reservedCny, firstReservation);
 	assert.equal(budget.snapshot().reservations, 1);
 	assert.equal(dispatched, 1, "denied second payload must not reach the transport");
-	assert.equal(budget.snapshot().stopReason, "ceiling");
+	assert.equal(budget.snapshot().stopReason, "total-cny-ceiling");
 	handle.dispose();
 });
 
@@ -359,11 +359,10 @@ test("campaign halts when usage ledger cannot be persisted after a successful re
 	handle.dispose();
 });
 
-test("campaign reconciles reported tokens and SDK cost against each reserved envelope", () => {
+test("campaign rejects impossible token usage, independently of price estimates", () => {
 	for (const usage of [
 		{ input: 501, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 505, cost: 0.00001 },
 		{ input: 10, output: 53, cacheRead: 0, cacheWrite: 0, totalTokens: 63, cost: 0.00001 },
-		{ input: 10, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 14, cost: 1 },
 		{ input: 10, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 13, cost: 0.00001 },
 	]) {
 		const budget = new DeepSeekCampaignBudget(LIMITS);
@@ -420,9 +419,9 @@ test("parallel branch leases reserve a single shared call/CNY ceiling with inter
 	assert.equal(budget.snapshot().activePrompts, 0);
 	assert.equal(budget.snapshot().stopped, false);
 	const next = budget.beginPrompt("third-session", "1");
-	assert.throws(() => budget.reserve(next, 100, "third-1"), /campaign call or CNY planning ceiling exhausted/);
+	assert.throws(() => budget.reserve(next, 100, "third-1"), /campaign provider call limit exhausted/);
 	assert.equal(budget.snapshot().reservations, 3);
-	assert.equal(budget.snapshot().stopReason, "ceiling");
+	assert.equal(budget.snapshot().stopReason, "provider-call-limit");
 });
 
 test("two Pi handles may prompt concurrently while sharing one budget", async (t) => {
@@ -470,7 +469,7 @@ test("concurrent Pi handles cannot cross a single-call total limit", async (t) =
 	const outcomes = await Promise.allSettled([left.prompt("A"), right.prompt("B")]);
 	assert.equal(dispatched, 1);
 	assert.equal(budget.snapshot().reservations, 1);
-	assert.equal(budget.snapshot().stopReason, "ceiling");
+	assert.equal(budget.snapshot().stopReason, "provider-call-limit");
 	assert(outcomes.some((item) => item.status === "rejected"));
 });
 
@@ -523,14 +522,14 @@ test("failed branch retains reserve and stops other active branch without changi
 });
 
 test("interleaved branches obey independent per-prompt caps and one atomic CNY ceiling", () => {
-	const cap = (100 * LIMITS.maxInputCnyPerMillionTokens +
-		(LIMITS.maxOutputTokens + LIMITS.outputAccountingMarginTokens) * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000;
+	const cap = (100 * LIMITS.estimatedInputCnyPerMillionTokens +
+		(LIMITS.maxOutputTokens + LIMITS.outputAccountingMarginTokens) * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000;
 	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: cap * 2, maxProviderCalls: 4, maxProviderCallsPerPrompt: 2 });
 	const left = budget.beginPrompt("left", "1");
 	const right = budget.beginPrompt("right", "1");
 	budget.reserve(left, 100, "left-1");
 	budget.reserve(right, 100, "right-1");
-	assert.throws(() => budget.reserve(left, 100, "left-2"), /campaign call or CNY planning ceiling exhausted/);
+	assert.throws(() => budget.reserve(left, 100, "left-2"), /campaign global CNY total exhausted/);
 	assert.equal(budget.snapshot().reservations, 2, "third concurrent reservation must not pass total money ceiling");
 	assert.equal(budget.snapshot().reservedCny, cap * 2);
 	const promptCap = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1, maxProviderCalls: 4, maxProviderCallsPerPrompt: 1 });
@@ -538,7 +537,7 @@ test("interleaved branches obey independent per-prompt caps and one atomic CNY c
 	const b = promptCap.beginPrompt("b", "1");
 	promptCap.reserve(a, 100, "a-1");
 	promptCap.reserve(b, 100, "b-1");
-	assert.throws(() => promptCap.reserve(a, 100, "a-2"), /campaign call or CNY planning ceiling exhausted/);
+	assert.throws(() => promptCap.reserve(a, 100, "a-2"), /campaign provider call limit exhausted/);
 	assert.equal(promptCap.snapshot().reservations, 2, "one branch may not borrow the other prompt's calls");
 });
 
@@ -563,9 +562,9 @@ test("usage receipts cannot be charged to another branch or replayed as fork anc
 });
 
 test("known provider usage settles one request conservatively before the next reservation", () => {
-	const oneWorst = (100 * LIMITS.maxInputCnyPerMillionTokens +
-		(LIMITS.maxOutputTokens + LIMITS.outputAccountingMarginTokens) * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000;
-	const oneKnown = (10 * LIMITS.maxInputCnyPerMillionTokens + 4 * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000;
+	const oneWorst = (100 * LIMITS.estimatedInputCnyPerMillionTokens +
+		(LIMITS.maxOutputTokens + LIMITS.outputAccountingMarginTokens) * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000;
+	const oneKnown = (10 * LIMITS.estimatedInputCnyPerMillionTokens + 4 * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000;
 	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: oneWorst + oneKnown + 0.000001 });
 	const lease = budget.beginPrompt("session", "1");
 	budget.reserve(lease, 100, "request-1");
@@ -593,9 +592,9 @@ test("terminal stream usage is settled before the next tool-loop onPayload", asy
 	t.after(() => rm(dir, { recursive: true, force: true }));
 	const payload = { model: MODEL.id, messages: [], max_tokens: LIMITS.maxOutputTokens };
 	const bytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
-	const worst = (bytes * LIMITS.maxInputCnyPerMillionTokens +
-		(LIMITS.maxOutputTokens + LIMITS.outputAccountingMarginTokens) * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000;
-	const known = (10 * LIMITS.maxInputCnyPerMillionTokens + 4 * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000;
+	const worst = (bytes * LIMITS.estimatedInputCnyPerMillionTokens +
+		(LIMITS.maxOutputTokens + LIMITS.outputAccountingMarginTokens) * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000;
+	const known = (10 * LIMITS.estimatedInputCnyPerMillionTokens + 4 * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000;
 	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: worst + known + 0.000001 });
 	let called = 0;
 	let settledAtSecondPayload = false;
@@ -664,7 +663,7 @@ test("a known length terminal response settles its charge while the prompt fails
 	await lateProbe;
 	assert.equal(lateRequestDenied, true, "post-length tool-loop onPayload must fail before transport");
 	assert.equal(budget.snapshot().reservations, 1);
-	assert.equal(budget.snapshot().settledCny, (10 * LIMITS.maxInputCnyPerMillionTokens + 20 * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000);
+	assert.equal(budget.snapshot().settledCny, (10 * LIMITS.estimatedInputCnyPerMillionTokens + 20 * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000);
 	assert.equal(budget.snapshot().unknownReservedCny, 0);
 	assert.equal(budget.snapshot().stopReason, "prompt-failure");
 });
@@ -714,7 +713,7 @@ test("unknown responses retain full worst reserve while known length usage can s
 	const worst = budget.snapshot().grossReservedCny / 2;
 	budget.settleReported(lease, "known-length", reported("length", 1, 10, "length"));
 	budget.failPrompt(lease);
-	assert.equal(budget.snapshot().settledCny, (10 * LIMITS.maxInputCnyPerMillionTokens + 4 * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000);
+	assert.equal(budget.snapshot().settledCny, (10 * LIMITS.estimatedInputCnyPerMillionTokens + 4 * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000);
 	assert.equal(budget.snapshot().unknownReservedCny, worst);
 	assert.equal(budget.snapshot().inFlightReservedCny, 0);
 	assert.equal(budget.snapshot().stopReason, "prompt-failure");
@@ -753,16 +752,16 @@ test("reported disjoint cache hits settle at a verified cache-read ceiling while
 	const payloadBytes = 1_200;
 	const usage = { input: 10, cacheRead: 1_000, cacheWrite: 5, output: 4, totalTokens: 1_019, cost: 0.00002 };
 	const event = { ...reported("cached"), usage };
-	const cacheBudget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1, maxCacheReadCnyPerMillionTokens: 0.2 });
+	const cacheBudget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1, estimatedCacheReadCnyPerMillionTokens: 0.2 });
 	cacheBudget.assertResolved(MODEL);
 	const lease = cacheBudget.beginPrompt("cache", "1");
 	cacheBudget.reserve(lease, payloadBytes, "cached-request");
-	const worst = (payloadBytes * LIMITS.maxInputCnyPerMillionTokens +
-		(LIMITS.maxOutputTokens + LIMITS.outputAccountingMarginTokens) * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000;
+	const worst = (payloadBytes * LIMITS.estimatedInputCnyPerMillionTokens +
+		(LIMITS.maxOutputTokens + LIMITS.outputAccountingMarginTokens) * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000;
 	assert.equal(cacheBudget.snapshot().committedCny, worst, "reservation assumes every input byte costs the uncached rate");
 	cacheBudget.settleReported(lease, "cached-request", event);
-	const expected = ((usage.input + usage.cacheWrite) * LIMITS.maxInputCnyPerMillionTokens +
-		usage.cacheRead * 0.2 + usage.output * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000;
+	const expected = ((usage.input + usage.cacheWrite) * LIMITS.estimatedInputCnyPerMillionTokens +
+		usage.cacheRead * 0.2 + usage.output * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000;
 	assert.equal(cacheBudget.snapshot().settledCny, expected);
 	assert.equal(cacheBudget.snapshot().grossReservedCny, worst);
 	const defaultBudget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1 });
@@ -770,18 +769,120 @@ test("reported disjoint cache hits settle at a verified cache-read ceiling while
 	defaultBudget.reserve(defaultLease, payloadBytes, "default-request");
 	defaultBudget.settleReported(defaultLease, "default-request", event);
 	assert.equal(defaultBudget.snapshot().settledCny,
-		((usage.input + usage.cacheRead + usage.cacheWrite) * LIMITS.maxInputCnyPerMillionTokens +
-			usage.output * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000,
+		((usage.input + usage.cacheRead + usage.cacheWrite) * LIMITS.estimatedInputCnyPerMillionTokens +
+			usage.output * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000,
 		"omitting the optional cache ceiling retains old all-input settlement behavior");
 });
 
-test("cache-read ceiling rejects unsupported model prices and invalid limits", () => {
-	for (const cacheLimit of [0, -1, LIMITS.maxInputCnyPerMillionTokens + 0.01]) {
-		assert.throws(() => new DeepSeekCampaignBudget({ ...LIMITS, maxCacheReadCnyPerMillionTokens: cacheLimit }), /invalid DeepSeek campaign limits/);
+test("invalid cache estimates fail, while higher model prices raise total-cost planning", () => {
+	for (const cacheLimit of [0, -1]) {
+		assert.throws(() => new DeepSeekCampaignBudget({ ...LIMITS, estimatedCacheReadCnyPerMillionTokens: cacheLimit }), /invalid DeepSeek campaign limits/);
 	}
-	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCacheReadCnyPerMillionTokens: 0.2 });
-	assert.throws(() => budget.assertResolved({ ...MODEL, cost: { ...MODEL.cost, cacheRead: 0.021 } }), /price ceiling did not verify/);
-	assert.throws(() => new DeepSeekCampaignBudget({ ...LIMITS, maxCacheReadCnyPerMillionTokens: 0.05 }).assertResolved(MODEL), /price ceiling did not verify/);
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, estimatedCacheReadCnyPerMillionTokens: 0.2 });
+	budget.assertResolved({ ...MODEL, cost: { ...MODEL.cost, cacheRead: 0.5 } });
+	const lease = budget.beginPrompt("higher-price", "1");
+	budget.reserve(lease, 100, "higher-price-request");
+	assert.equal(budget.snapshot().grossReservedCny, (100 * 5 + (20 + 32) * 16) / 1_000_000);
+	const lowerEstimate = new DeepSeekCampaignBudget({ ...LIMITS, estimatedCacheReadCnyPerMillionTokens: 0.05 });
+	lowerEstimate.assertResolved(MODEL);
+});
+
+test("one mission total carries prior conservative commitments across fresh attempts", () => {
+	const cap = (100 * LIMITS.estimatedInputCnyPerMillionTokens +
+		(LIMITS.maxOutputTokens + LIMITS.outputAccountingMarginTokens) * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000;
+	const prior = 20.25; // synthetic offline carry; the driver verifies the real ledger separately
+	for (const invalid of [NaN, Infinity, -1]) {
+		assert.throws(() => new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 30, priorCommittedCny: invalid }), /invalid DeepSeek campaign limits/);
+	}
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: prior + cap * 2 - cap / 10, priorCommittedCny: prior });
+	const first = budget.beginPrompt("first-role", "1");
+	budget.reserve(first, 100, "attempt-1");
+	assert.equal(budget.snapshot().priorCommittedCny, prior);
+	assert.equal(budget.snapshot().currentCommittedCny, cap);
+	assert.equal(budget.snapshot().missionCommittedCny, prior + cap);
+	assert.equal(budget.snapshot().settledCny, 0, "historical uncertainty is not mislabeled as settled usage");
+	const second = budget.beginPrompt("child-role", "1");
+	assert.throws(() => budget.reserve(second, 100, "attempt-2"), /global CNY total exhausted/);
+	assert.equal(budget.snapshot().stopReason, "total-cny-ceiling");
+	const over = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 30, priorCommittedCny: 31 });
+	assert.equal(over.snapshot().missionCommittedCny, 31, "an over-cap historical ledger remains readable");
+	assert.throws(() => over.reserve(over.beginPrompt("over", "1"), 100, "over-1"), /global CNY total exhausted/);
+});
+
+test("higher SDK tariff rates raise planning without creating another fee ceiling", () => {
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1, maxProviderCalls: 3 });
+	budget.assertResolved({ ...MODEL, cost: { ...MODEL.cost, input: 1, output: 4 } });
+	const first = budget.beginPrompt("builder", "1");
+	budget.reserve(first, 100, "higher-priced-request");
+	assert.equal(budget.snapshot().grossReservedCny, (100 * 10 + (20 + 32) * 40) / 1_000_000);
+	budget.finishPrompt(first, [{ requestId: "higher-priced-request", event: { ...reported("higher-priced"), usage: { ...reported("higher-priced").usage, cost: 0.000026 } } }]);
+	assert.equal(budget.snapshot().settledCny, (10 * 10 + 4 * 40) / 1_000_000);
+	assert.equal(budget.snapshot().stopped, false);
+	const second = budget.beginPrompt("reviewer", "1");
+	budget.reserve(second, 100, "next-request");
+	assert.equal(budget.snapshot().reservations, 2);
+});
+
+test("an in-flight request settles with its own frozen tariff estimate", () => {
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1, maxProviderCalls: 3 });
+	budget.assertResolved(MODEL);
+	const first = budget.beginPrompt("first", "1");
+	budget.reserve(first, 100, "before-price-update");
+	budget.assertResolved({ ...MODEL, cost: { ...MODEL.cost, input: 100, output: 100 } });
+	budget.finishPrompt(first, [{ requestId: "before-price-update", event: reported("old-price") }]);
+	assert.equal(budget.snapshot().settledCny, (10 * 4 + 4 * 16) / 1_000_000);
+	assert.equal(budget.snapshot().stopped, false);
+	const second = budget.beginPrompt("second", "1");
+	budget.reserve(second, 100, "after-price-update");
+	assert.equal(budget.snapshot().grossReservedCny,
+		(100 * 4 + 52 * 16) / 1_000_000 + (100 * 1_000 + 52 * 1_000) / 1_000_000);
+});
+
+test("a reported estimate contradicting the pre-HTTP plan is retained as unknown and halts further spend", () => {
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1 });
+	const lease = budget.beginPrompt("builder", "1");
+	budget.reserve(lease, 100, "unexpected-price");
+	budget.finishPrompt(lease, [{ requestId: "unexpected-price", event: { ...reported("unexpected-price"), usage: { ...reported("unexpected-price").usage, cost: 0.01 } } }]);
+	assert.equal(budget.snapshot().settledCny, 0, "an invalidated price assumption must not masquerade as known settlement");
+	assert.equal(budget.snapshot().unknownReservedCny, 0.1);
+	assert.equal(budget.snapshot().stopReason, "price-assumption-invalid");
+	assert.throws(() => budget.beginPrompt("reviewer", "1"), /campaign is stopped/);
+	const exceeded = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 0.01 });
+	const overLease = exceeded.beginPrompt("builder", "1");
+	exceeded.reserve(overLease, 100, "exceeded-price");
+	exceeded.finishPrompt(overLease, [{ requestId: "exceeded-price", event: { ...reported("exceeded-price"), usage: { ...reported("exceeded-price").usage, cost: 0.1 } } }]);
+	assert.equal(exceeded.snapshot().stopReason, "total-cny-ceiling");
+	assert.equal(exceeded.snapshot().unknownReservedCny, 1);
+	assert(exceeded.snapshot().missionCommittedCny > 0.01);
+});
+
+test("inconsistent tokens do not erase a higher observed SDK estimate", () => {
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1 });
+	const lease = budget.beginPrompt("builder", "1");
+	budget.reserve(lease, 100, "bad-token-report");
+	assert.throws(() => budget.settleReported(lease, "bad-token-report", {
+		...reported("bad-token-report"),
+		usage: { input: 10, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 999, cost: 0.01 },
+	}), /provider usage or call outcome is inconsistent/);
+	assert.equal(budget.snapshot().unknownReservedCny, 0.1);
+	assert.equal(budget.snapshot().settledCny, 0);
+	assert.equal(budget.snapshot().stopReason, "usage-reconciliation");
+});
+
+test("missing priced cost remains unknown without a false settlement or extra fee gate", () => {
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1 });
+	const lease = budget.beginPrompt("builder", "1");
+	budget.reserve(lease, 100, "unpriced-request");
+	const held = budget.snapshot().currentCommittedCny;
+	const event = { ...reported("unpriced"), status: "unknown" as const, costStatus: "unknown" as const,
+		usage: { input: 10, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 14 } };
+	budget.finishPrompt(lease, [{ requestId: "unpriced-request", event }]);
+	assert.equal(budget.snapshot().settledCny, 0);
+	assert.equal(budget.snapshot().unknownReservedCny, held);
+	assert.equal(budget.snapshot().stopped, false);
+	const next = budget.beginPrompt("reviewer", "1");
+	budget.reserve(next, 100, "after-unpriced");
+	assert.equal(budget.snapshot().reservations, 2);
 });
 
 test("missing or overlapping cache usage remains at the full worst-case reserve", () => {
@@ -789,7 +890,7 @@ test("missing or overlapping cache usage remains at the full worst-case reserve"
 		{ input: 10, cacheWrite: 5, output: 4, totalTokens: 19, cost: 0.00001 },
 		{ input: 10, cacheRead: 1_000, cacheWrite: 5, output: 4, totalTokens: 19, cost: 0.00001 },
 	]) {
-		const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1, maxCacheReadCnyPerMillionTokens: 0.2 });
+		const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1, estimatedCacheReadCnyPerMillionTokens: 0.2 });
 		const lease = budget.beginPrompt("partial-cache", "1");
 		budget.reserve(lease, 1_200, "request");
 		const held = budget.snapshot().committedCny;
@@ -889,8 +990,8 @@ test("real Pi tool request uses the synthetic runtime key at the fixed DeepSeek 
 		assert.equal(unexpectedFetches, 0);
 		assert.equal(budget.snapshot().reservations, 1);
 		assert(transportPayloadBytes !== undefined && transportPayloadBytes > 0);
-		const expectedReserve = (transportPayloadBytes * LIMITS.maxInputCnyPerMillionTokens +
-			(32 + LIMITS.outputAccountingMarginTokens) * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000;
+		const expectedReserve = (transportPayloadBytes * LIMITS.estimatedInputCnyPerMillionTokens +
+			(32 + LIMITS.outputAccountingMarginTokens) * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000;
 		assert.equal(budget.snapshot().reservedCny, expectedReserve, "onPayload must measure the HTTP body the pinned SDK actually sends");
 	} finally {
 		handle?.dispose();

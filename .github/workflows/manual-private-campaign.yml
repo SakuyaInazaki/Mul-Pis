@@ -7,13 +7,14 @@ on:
   workflow_dispatch:
     inputs:
       authorize_bounded_run:
-        description: "Authorize one DeepSeek campaign up to 2.8 CNY after checking prior charges"
+        description: "Authorize an attempt against the shared mission total ledger"
         required: true
         default: false
         type: boolean
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: bounded-confidential-campaign-once
@@ -25,9 +26,9 @@ jobs:
       github.repository == 'SakuyaInazaki/Mul-Pis' &&
       github.actor == 'SakuyaInazaki' &&
       github.run_attempt == 1 &&
-      github.event_name == 'push' &&
       github.ref == 'refs/heads/improve/workflow-learning-reliability' &&
-      github.event.head_commit.message == 'Repair original objective continuation and verify explicit stops (mul-pis-20261005-objective-run1)'
+      ((github.event_name == 'workflow_dispatch' && inputs.authorize_bounded_run == true) ||
+       (github.event_name == 'push' && github.event.head_commit.message == 'Repair shared total ledger and retain interrupted workflow state (mul-pis-20261005-mission-run1)'))
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -71,6 +72,9 @@ jobs:
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           INPUT_DIR: ${{ steps.decode.outputs.input_dir }}
+          MULPIS_MISSION_LEDGER_B64: ${{ secrets.MULPIS_MISSION_LEDGER_B64 }}
+          MULPIS_MANUAL_AUTHORIZED: ${{ inputs.authorize_bounded_run }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           umask 077
           mkdir -m 700 "$RUNNER_TEMP/private-campaign-output"
