@@ -10,9 +10,9 @@ test("one-use campaign push guard cannot also dispatch a second paid run manuall
 	const gate = workflow.split("  private-campaign:\n")[1]?.split("    runs-on:")[0] ?? "";
 	assert.match(workflow, /on:\n  push:\n    branches:\n      - improve\/workflow-learning-reliability/);
 	assert.match(gate, /github\.event_name == 'push'/);
-	assert.match(gate, /mul-pis-20261005-context-run3/);
-	assert.doesNotMatch(gate, /workflow_dispatch|authorize_bounded_run|lab-resume1|lab-resume2|context-run1|context-run2/);
-	assert.match(workflow, /description: "Authorize one DeepSeek campaign up to 6\.5 CNY/);
+	assert.match(gate, /mul-pis-20261005-context-run4/);
+	assert.doesNotMatch(gate, /workflow_dispatch|authorize_bounded_run|lab-resume1|lab-resume2|context-run1|context-run2|context-run3/);
+	assert.match(workflow, /description: "Authorize one DeepSeek campaign up to 5\.3 CNY/);
 });
 
 test("generic private campaign source-shape gate preserves non-target bodies", () => {
@@ -59,6 +59,13 @@ test("same-goal branch selection keeps the verified faster parent when the fork 
 	assert.equal(offlineChecks.chooseForkWinner(false, false, true, { state: "unavailable" }), undefined);
 });
 
+test("follow-on cannot promote byte-identical code on a noisy measured speedup", () => {
+	const apparentGain = { state: "measured", medianRatio: 1.12, minRatio: 1.04 };
+	assert.equal(offlineChecks.chooseFollowOnCandidate(true, true, false, apparentGain), false);
+	assert.equal(offlineChecks.chooseFollowOnCandidate(true, true, true, apparentGain), true);
+	assert.equal(offlineChecks.chooseFollowOnCandidate(true, false, true, apparentGain), false);
+});
+
 test("a real fork with no accepted M07 winner cannot unlock a fulfilled follow-on", () => {
 	assert.equal(offlineChecks.firstM07Accepted(false, "partial"), false);
 	assert.equal(offlineChecks.firstM07Accepted(false, "fulfilled"), false);
@@ -70,27 +77,42 @@ test("fork provenance requires a committed child receipt bound to the frozen par
 	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-fork-receipt-fixture-"));
 	try {
 		const file = path.join(root, "lineage.json");
+		const problemCopy = path.join(root, "problem-snapshot.md");
 		const checkpoint = { id: "checkpoint-a", leafId: "leaf-a", sourceSessionId: "session-parent",
+			manifestSnapshot: path.join(root, "manifest.json"), runId: "R001", taskId: "T001",
 			model: "deepseek/deepseek-flash:low" } as any;
-		await writeFile(file, JSON.stringify({ version: 1, state: "committed", intent: "branch-exploration", checkpoint,
+		await writeFile(checkpoint.manifestSnapshot, "{}\n");
+		await writeFile(problemCopy, "frozen problem\n");
+		const bindings = [
+			{ status: "frozen-copy", path: checkpoint.manifestSnapshot, sourceVersion: checkpoint.id },
+			{ status: "frozen-copy", path: problemCopy, sourceVersion: `${checkpoint.runId}/${checkpoint.taskId}` },
+		];
+		const receipt = { version: 1, state: "committed", intent: "branch-exploration", checkpoint,
 			parent: { sessionId: "session-parent", leafId: "leaf-a" }, child: { sessionId: "session-child" },
-			evidenceBindings: [{ status: "frozen-copy", sourceVersion: checkpoint.id }],
+			evidenceBindings: bindings,
 			workspaceBinding: { version: 1, files: [{}] },
-			inheritedUsageBilled: false }));
+			inheritedUsageBilled: false };
+		await writeFile(file, JSON.stringify(receipt));
 		assert.equal(await offlineChecks.forkReceiptMatches(file, checkpoint, "session-child"), true);
-		const summary = await offlineChecks.contextLineageSummary(file, checkpoint, "session-child", checkpoint.model);
+		const summary = await offlineChecks.contextLineageSummary(file, checkpoint, "session-child", checkpoint.model, problemCopy);
 		assert.equal(summary.state, "verified");
-		assert.equal(summary.evidenceBindingCount, 1);
+		assert.equal(summary.evidenceBindingCount, 2);
 		assert.equal(summary.workspaceBindingFileCount, 1);
 		assert.equal(JSON.stringify(summary).includes("sourcePath"), false);
+		for (const changed of [
+			[{ ...bindings[0], sourceVersion: "wrong" }, bindings[1]],
+			[bindings[0], { ...bindings[1], sourceVersion: checkpoint.id }],
+			[bindings[0], { ...bindings[1], path: checkpoint.manifestSnapshot }],
+			[...bindings, { status: "frozen-copy", path: problemCopy, sourceVersion: "extra" }],
+		]) {
+			await writeFile(file, JSON.stringify({ ...receipt, evidenceBindings: changed }));
+			assert.equal((await offlineChecks.contextLineageSummary(file, checkpoint, "session-child", checkpoint.model, problemCopy)).state,
+				"unverified");
+		}
 		assert.equal(await offlineChecks.forkReceiptMatches(file, checkpoint, "session-other"), false);
-		await writeFile(file, JSON.stringify({ version: 1, state: "committed", intent: "causal-continuation", checkpoint,
-			parent: { sessionId: "session-parent", leafId: "leaf-a" }, child: { sessionId: "session-child" },
-			inheritedUsageBilled: false }));
+		await writeFile(file, JSON.stringify({ ...receipt, intent: "causal-continuation" }));
 		assert.equal(await offlineChecks.forkReceiptMatches(file, checkpoint, "session-child"), false);
-		await writeFile(file, JSON.stringify({ version: 1, state: "committed", intent: "branch-exploration", checkpoint,
-			parent: { sessionId: "session-other", leafId: "leaf-a" }, child: { sessionId: "session-child" },
-			inheritedUsageBilled: false }));
+		await writeFile(file, JSON.stringify({ ...receipt, parent: { ...receipt.parent, sessionId: "session-other" } }));
 		assert.equal(await offlineChecks.forkReceiptMatches(file, checkpoint, "session-child"), false);
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -288,7 +310,25 @@ test("M04 evidence coverage requires exact task files and complete returned text
 		assert.equal((await offlineChecks.m04EvidenceReturned(record, "T001")).complete, false);
 		await writeFile(coverage, JSON.stringify({ returnedRanges: [{ ...ranges[0], status: "error" }, ...ranges.slice(1)] }));
 		assert.equal((await offlineChecks.m04EvidenceReturned(record, "T001")).complete, false);
+		await writeFile(coverage, JSON.stringify({ returnedRanges: [{ ...ranges[0], returned: { ...ranges[0].returned, truncated: true } }, ...ranges.slice(1)] }));
+		assert.equal((await offlineChecks.m04EvidenceReturned(record, "T001")).complete, false);
 		await writeFile(coverage, JSON.stringify({ returnedRanges: [{ ...ranges[0], path: paths[0].replace("T001", "T002") }, ...ranges.slice(1)] }));
 		assert.equal((await offlineChecks.m04EvidenceReturned(record, "T001")).complete, false);
 	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("selected M07 read requirement derives exact frozen review artifacts without guessing prefixes", () => {
+	const root = path.join(os.tmpdir(), "synthetic-m07-read-root");
+	const workDir = path.join(root, "tasks", "T002", "work");
+	const names = ["candidate.cpp", "verification.json", "lesson-delta.json"];
+	const artifacts = names.map((name, index) => ({ sourcePath: path.join(workDir, name),
+		path: path.join(root, "tasks", "T002", "review-snapshot", `${String(index + 4).padStart(3, "0")}-${name}`) }));
+	const task = { taskId: "T002", workDir, status: "accepted", review: { artifacts } } as any;
+	assert.deepEqual(offlineChecks.selectedM07ReviewReadPaths(root, task),
+		artifacts.map(item => path.relative(root, item.path)));
+	assert.throws(() => offlineChecks.selectedM07ReviewReadPaths(root, { ...task,
+		review: { artifacts: [{ ...artifacts[0], path: path.join(root, "tasks", "T001", "review-snapshot", "004-candidate.cpp") },
+			...artifacts.slice(1)] } }), /outside the expected frozen task snapshot/);
+	assert.throws(() => offlineChecks.selectedM07ReviewReadPaths(root, { ...task,
+		review: { artifacts: artifacts.slice(1) } }), /missing or ambiguous/);
 });

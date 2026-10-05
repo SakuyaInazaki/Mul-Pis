@@ -11,6 +11,7 @@
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { linkedEvidence, openBoundedSession } from "../context/boundary.ts";
+import type { ReadReturnEvent } from "../runner/types.ts";
 import type { ProposalOp } from "../knowledge/types.ts";
 import { retrieveKnowledge } from "../knowledge/retrieval.ts";
 import { buildM04Message, extractKnowledgeProposals, systemPromptFor } from "../prompts.ts";
@@ -37,6 +38,8 @@ export interface M04Options {
 	freshSession?: boolean;
 	/** Purpose string recorded in the knowledge pack. */
 	purpose?: string;
+	/** Optional exact frozen M07 files that must be returned in full before any M04 merge. */
+	requiredM07ReadPaths?: string[];
 }
 
 export interface M04Result {
@@ -61,6 +64,42 @@ const SAFE_CHECKPOINT_ID = /^C\d{3,}$/;
 function checkpointRelative(file: string): boolean {
 	return typeof file === "string" && file.length > 0 && file !== "." && !path.isAbsolute(file) &&
 		file.split(/[\\/]/).every((part) => part !== "" && part !== "." && part !== "..");
+}
+
+async function requiredM07Reads(root: string, requested: string[] | undefined): Promise<string[]> {
+	if (requested === undefined) return [];
+	if (!Array.isArray(requested) || requested.length < 1 || requested.length > 12 ||
+		new Set(requested).size !== requested.length) throw new HarnessError("m04.m07-evidence", "required M07 read paths must be bounded and unique");
+	const rootReal = await realpath(root);
+	for (const relative of requested) {
+		if (typeof relative !== "string" || relative.length > 240 || !checkpointRelative(relative) ||
+			path.win32.isAbsolute(relative) || relative.includes("\\"))
+			throw new HarnessError("m04.m07-evidence", "required M07 read path is not a safe relative file");
+		const source = path.join(rootReal, relative), info = await lstat(source), resolved = await realpath(source);
+		if (!info.isFile() || info.isSymbolicLink() || !resolved.startsWith(`${rootReal}${path.sep}`))
+			throw new HarnessError("m04.m07-evidence", "required M07 read path is not a frozen regular file");
+	}
+	return requested;
+}
+
+async function assertFullM07Reads(root: string, required: string[], returned: ReadReturnEvent[]): Promise<void> {
+	for (const relative of required) {
+		const content = await readFile(path.join(root, relative), "utf8");
+		const lineCount = content.split(/\r?\n/).length - (content.endsWith("\n") ? 1 : 0);
+		if (lineCount < 1 || lineCount > 100_000) throw new HarnessError("m04.m07-evidence", "required M07 evidence line count is unavailable");
+		const covered = Array.from({ length: lineCount }, () => false);
+		let completeTerminalPage = false;
+		for (const event of returned) {
+			if (event.toolName !== "m07_evidence_read" || event.path !== relative ||
+				event.status !== "returned" || event.returned.kind !== "text") continue;
+			const start = event.returned.startLine, end = event.returned.endLine;
+			if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start! < 1 || end! < start! || end! > lineCount) continue;
+			for (let index = start!; index <= end!; index++) covered[index - 1] = true;
+			if (end === lineCount && event.returned.truncated === false) completeTerminalPage = true;
+		}
+		if (!completeTerminalPage || covered.some((value) => !value))
+			throw new HarnessError("m04.m07-evidence", "required selected M07 evidence was not returned to the research session in full");
+	}
 }
 
 async function resolveM07Checkpoint(ctx: StageContext, runId: string, checkpointId: string): Promise<ResolvedFeedback> {
@@ -211,6 +250,9 @@ async function resolveFeedback(ctx: StageContext, feedback: M04Feedback): Promis
 
 export async function runM04(ctx: StageContext, options: M04Options): Promise<M04Result> {
 	const feedback = await resolveFeedback(ctx, options.feedback);
+	if (options.requiredM07ReadPaths && !feedback.m07)
+		throw new HarnessError("m04.m07-evidence", "required M07 read paths need M07 feedback");
+	const requiredM07Paths = feedback.m07 ? await requiredM07Reads(feedback.m07.rootDir, options.requiredM07ReadPaths) : [];
 	let materials: ProblemMaterials;
 	let problemInputs: InputRef[];
 	if (feedback.m08) {
@@ -262,7 +304,8 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			const m08DispositionInstruction = feedback.m08 ? `\n\n【M08 固定材料访问契约】\n上方审查反馈包只是意见汇总，“实际产物位置”也只是索引；它们不表示你已读取待交付材料。若要给出 ready 或 partial，必须在本会话中用 m08_material_read 按下列精确 relativePath 实际读取每一项准备写入 deliverablePaths 的文件；目录项至少读取其中一个与处置直接相关的真实文件。PDF 文本层不足以核对公式、表格或图时，用 render_pdf_page 渲染相关页。工具会记录实际访问路径，仅在正文里复述或引用路径不算读取。\n可访问的固定材料：${allowedM08Paths.map((p) => `\n- ${p}`).join("")}\n\n本轮必须在处理文末尾输出 m08-disposition JSON 代码块。合法 status 只有 ready、partial、rework、needs_evidence、unresolved。结构示例：{\"m08RunId\":\"${feedback.m08.runId}\",\"status\":\"partial\",\"deliverablePaths\":[\"上述某一精确 relativePath\"],\"limitations\":[\"实际限制\"],\"rationale\":\"非空理由\"}。deliverablePaths 只允许从上述精确相对路径选择。ready/partial 必须至少选择一项；这是用途处置，不是投票或科学认证；无法判断不得写 ready。` : "";
 			const m07EvidenceInstruction = feedback.m07 ? `\n\n【M07 证据按需读取契约】\n上方反馈包中的材料清单是索引，不代表你已读取未内联的证据。需要依赖某项材料时，使用 m07_evidence_read 按清单中的相对路径读取；大文件按 offset/limit 继续读取。工具记录文件访问，但当前覆盖记录只能证明访问过该文件，不能证明读取了全文；除非实际分段读至文件末尾，否则必须把未读范围列为限制。不得把路径存在、清单摘要或一次局部读取写成“已完整核验”。${feedback.m07.checkpointId ? `\n本 checkpoint 仅冻结选定任务的评审证据；选定任务 ${feedback.m07.selectedTaskIds?.length ?? 0} 项、省略任务 ${feedback.m07.omittedTaskIds?.length ?? 0} 项。完整 ID 列表见 checkpoint manifest.json 及 M04 来源记录；省略任务仅保留控制状态，不得把其未提供的证据当作已交接或可读取。` : ""}${feedback.m07.skippedRaw?.length ? `\ncheckpoint 未复制的非文本原始信息：${feedback.m07.skippedRaw.join("、")}；须作为材料缺口，不得推断已核对。` : ""}` : "";
 			const m07ExperienceInstruction = feedback.m07 ? `\n\n【M07 候选经验处理】\n如果反馈证据中有 lesson-delta.json，它只是待判断的候选；先用 m07_evidence_read 实际读取相关版本与验证证据，再决定是否提出知识操作。没有充分证据、不可推广或 action=none 时，可不提出任何知识提案；不要为让运行“成功”而强行创建记录。若确有可复用的执行方法经验并决定提出 create/revise，fields.experience 必须使用结构 {"version":1,"targetKind":"executor","applicableStages":["M07"],"requiredTags":[],"excludedTags":[],"requiredRefs":[]}，按真实适用条件填写 tags 和已存在的必要 pinned refs，不得编造依赖。usageDecision=adopted 需要写明本轮独立证据、适用边界和保留限制；仅有 builder 自述或 reviewer ready 不足以采用。candidate 或不提案都是有效结果。即使入库，后续 M07 也必须显式 pinned 引用、通过适用性和生效限制检查；装载不等于忠实使用或收益。` : "";
-			const finalMessage = message + m08DispositionInstruction + m07EvidenceInstruction + m07ExperienceInstruction;
+			const requiredM07Instruction = requiredM07Paths.length ? `\n\n【本轮指定 M07 证据完整读取】\n在判断采用、候选或无提案之前，请用 m07_evidence_read 按以下精确相对路径读取每个文件的全文；大文件须分段读至末尾。只看索引、摘要或文件名不足以满足此要求。完整读取后可以选择不提案，不得为满足流程强行采用。\n${requiredM07Paths.map((item) => `- ${item}`).join("\n")}` : "";
+			const finalMessage = message + m08DispositionInstruction + m07EvidenceInstruction + m07ExperienceInstruction + requiredM07Instruction;
 			await ctx.ws.writeOutput(record, "message.md", finalMessage, "发送给研究会话的完整消息");
 			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-message.md", finalMessage, "发送给 M04 的固定 M08 消息");
 			const m08RenderedPages: string[] = [];
@@ -294,6 +337,8 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 				if (feedback.m07) await ctx.ws.writeOutput(record, "m07-coverage.json", JSON.stringify({ sessionId: handle.ref.id, promptOutcome: promptSucceeded ? "returned" : "failed", filesAccessed: m08ReadCoverage, returnedRanges: m07ReturnedRanges, completeness: "unknown", semantics: "saved 仅表示固定材料存在；returnedRanges 仅表示工具实际返回模型的内容范围，文件名访问不证明已读全文；不证明模型使用该范围，更不证明使用正确。" }, null, 2), "M07 回流证据实际访问范围");
 			}
 			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-coverage.json", JSON.stringify({ files: m08ReadCoverage, renderedPages: m08RenderedPages, tools: m08ToolLog }, null, 2), "M08 处理实际读取范围");
+			if (feedback.m07 && requiredM07Paths.length)
+				await assertFullM07Reads(feedback.m07.rootDir, requiredM07Paths, m07ReturnedRanges);
 
 			const result: M04Result = { record, output, mode };
 			if (feedback.m08) {

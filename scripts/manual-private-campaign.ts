@@ -15,7 +15,7 @@ import { runInit } from "../src/stages/init.ts";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { createM07Controller } from "../src/m07/controller.ts";
 import { runMeasuredEvidenceHandoff } from "../src/m07/evidence-finalization.ts";
-import type { CurrentGoal, TaskSpecInput } from "../src/m07/types.ts";
+import type { CurrentGoal, M07TaskRecord, TaskSpecInput } from "../src/m07/types.ts";
 import { runM04 } from "../src/stages/m04.ts";
 import { createPiSessionRunner } from "../src/runner/pi.ts";
 import type { SessionCheckpoint, SessionHandle, SessionRunner, SessionSpec } from "../src/runner/types.ts";
@@ -28,7 +28,7 @@ import type { KnowledgeRef, KnowledgeStore } from "../src/knowledge/types.ts";
 import type { StageRunRecord } from "../src/types.ts";
 
 const MODEL = "deepseek/deepseek-flash:low";
-const MAX_CNY = 6.5;
+const MAX_CNY = 5.3;
 const CAMPAIGN_MS = 20 * 60_000;
 const BUILDER_PHASE_MS = 7 * 60_000;
 const M04_PHASE_MS = 5 * 60_000;
@@ -179,10 +179,11 @@ async function forkReceiptMatches(file: string | undefined, checkpoint: SessionC
 	} catch { return false; }
 }
 async function contextLineageSummary(file: string | undefined, checkpoint: SessionCheckpoint,
-	childSessionId: string | undefined, childModel: string | undefined): Promise<Record<string, unknown>> {
+	childSessionId: string | undefined, childModel: string | undefined,
+	expectedProblemSnapshotCopy: string, expectedModel = MODEL): Promise<Record<string, unknown>> {
 	const identityMatches = await forkReceiptMatches(file, checkpoint, childSessionId);
 	let evidenceBindingCount = 0, workspaceBindingFileCount = 0;
-	let frozenEvidenceBindings = false, workspaceBindingPresent = false;
+	let frozenManifestBinding = false, frozenProblemBinding = false, workspaceBindingPresent = false;
 	if (identityMatches && file) {
 		try {
 			const receipt = JSON.parse(await readFile(file, "utf8")) as Record<string, any>;
@@ -190,19 +191,23 @@ async function contextLineageSummary(file: string | undefined, checkpoint: Sessi
 			const workspace = receipt.workspaceBinding;
 			evidenceBindingCount = Array.isArray(bindings) ? bindings.length : 0;
 			workspaceBindingFileCount = Array.isArray(workspace?.files) ? workspace.files.length : 0;
-			frozenEvidenceBindings = evidenceBindingCount > 0 && bindings.every((item: Record<string, unknown>) =>
-				item?.status === "frozen-copy" && item.sourceVersion === checkpoint.id);
+			frozenManifestBinding = evidenceBindingCount === 2 && bindings[0]?.status === "frozen-copy" &&
+				bindings[0]?.path === checkpoint.manifestSnapshot && bindings[0]?.sourceVersion === checkpoint.id;
+			frozenProblemBinding = evidenceBindingCount === 2 && path.isAbsolute(expectedProblemSnapshotCopy) &&
+				Boolean(checkpoint.taskId) && bindings[1]?.status === "frozen-copy" &&
+				bindings[1]?.path === expectedProblemSnapshotCopy &&
+				bindings[1]?.sourceVersion === `${checkpoint.runId}/${checkpoint.taskId}`;
 			workspaceBindingPresent = workspace?.version === 1 && workspaceBindingFileCount > 0;
 		} catch { /* Only finite, allowlisted scalar fields leave the workspace. */ }
 	}
-	const exactModel = checkpoint.model === MODEL && childModel === MODEL;
-	const verified = identityMatches && frozenEvidenceBindings && workspaceBindingPresent && exactModel;
+	const exactModel = checkpoint.model === expectedModel && childModel === expectedModel;
+	const verified = identityMatches && frozenManifestBinding && frozenProblemBinding && workspaceBindingPresent && exactModel;
 	return { version: 1, kind: "private-context-lineage-summary", state: verified ? "verified" : "unverified",
 		checkpointId: checkpoint.id, parentSessionId: checkpoint.sourceSessionId, frozenLeafId: checkpoint.leafId,
-		childSessionId: childSessionId ?? null, intent: "branch-exploration", model: MODEL,
+		childSessionId: childSessionId ?? null, intent: "branch-exploration", model: expectedModel,
 		evidenceBindingCount, workspaceBindingFileCount,
 		driverChecks: { committedExactLineage: identityMatches, exactModel,
-			frozenEvidenceBindings, workspaceBindingPresent },
+			frozenManifestBinding, frozenProblemBinding, workspaceBindingPresent },
 		limitation: "Counts and a committed receipt identify the fork; this summary does not reprint or independently reread the inherited transcript." };
 }
 /** Flat encrypted-transport layout; the renamed manifest is an index, not a default loader input. */
@@ -407,17 +412,33 @@ async function m04EvidenceReturned(record: StageRunRecord, taskId: string): Prom
 			const content = await readFile(file, "utf8");
 			const totalLines = content.split(/\r?\n/).length - (content.endsWith("\n") ? 1 : 0);
 			const covered = Array.from({ length: totalLines }, () => false);
+			let completeTerminalPage = false;
 			for (const item of relevant) {
 				if (item.path !== relevant[0].path) continue;
 				const start = item.returned!.startLine as number, end = item.returned!.endLine as number;
 				if (start < 1 || end < start || end > totalLines) continue;
 				for (let line = start; line <= end; line++) covered[line - 1] = true;
+				if (end === totalLines && item.returned?.truncated === false) completeTerminalPage = true;
 			}
-			if (!covered.length || covered.some(flag => !flag)) return { complete: false, paths };
+			if (!covered.length || !completeTerminalPage || covered.some(flag => !flag)) return { complete: false, paths };
 			paths.push(relevant[0].path as string);
 		}
 		return { complete: true, paths };
 	} catch { return { complete: false, paths: [] }; }
+}
+function selectedM07ReviewReadPaths(goalRoot: string, task: M07TaskRecord): string[] {
+	if (task.status !== "accepted" || !task.review || !/^T\d{3,}$/.test(task.taskId))
+		fail("selected M07 task lacks an accepted frozen review");
+	return ["candidate.cpp", "verification.json", "lesson-delta.json"].map(name => {
+		const source = path.join(task.workDir, name);
+		const artifacts = task.review!.artifacts.filter(item => item.sourcePath === source);
+		if (artifacts.length !== 1) fail("selected M07 review evidence is missing or ambiguous");
+		const relative = path.relative(goalRoot, artifacts[0].path).replaceAll("\\", "/");
+		const escaped = name.replace(".", "\\.");
+		if (!new RegExp(`^tasks/${task.taskId}/review-snapshot/\\d{3}-${escaped}$`).test(relative))
+			fail("selected M07 review evidence is outside the expected frozen task snapshot");
+		return relative;
+	});
 }
 async function adoptedExperienceRefs(store: KnowledgeStore, m04RunId: string, evidenceReturned: boolean): Promise<KnowledgeRef[]> {
 	if (!evidenceReturned) return [];
@@ -465,6 +486,12 @@ function chooseForkWinner(parentAccepted: boolean, forkAccepted: boolean, source
 		comparison.medianRatio !== undefined && comparison.medianRatio > 1.03 &&
 		comparison.minRatio !== undefined && comparison.minRatio >= 0.95))) return "fork";
 	return parentAccepted ? "parent" : undefined;
+}
+function chooseFollowOnCandidate(previousAccepted: boolean, followOnAccepted: boolean, sourceChanged: boolean,
+	comparison: { state?: string; medianRatio?: number; minRatio?: number }): boolean {
+	return followOnAccepted && (!previousAccepted || (sourceChanged && comparison.state === "measured" &&
+		comparison.medianRatio !== undefined && comparison.medianRatio > 1.03 &&
+		comparison.minRatio !== undefined && comparison.minRatio >= 0.95));
 }
 function firstM07Accepted(acceptedWinner: boolean, finishedOutcome: unknown): boolean {
 	return acceptedWinner && finishedOutcome === "fulfilled";
@@ -782,7 +809,8 @@ async function main() {
 				const preference = chooseForkWinner(accepted, branchAccepted, sourceChanged, branchComparison);
 				winner = preference === "fork" ? forked : preference === "parent" ? task : undefined;
 				const lineageSummary = await contextLineageSummary(forked.session?.lineageFile,
-					task.branchSource.checkpoint, forked.session?.id, forked.session?.model);
+					task.branchSource.checkpoint, forked.session?.id, forked.session?.model,
+					task.branchSource.problemSnapshotCopy);
 				await writeFile(path.join(outputDir, "context-lineage.json"), `${JSON.stringify(lineageSummary, null, 2)}\n`, { mode: 0o600 });
 				const trueForkReceipt = lineageSummary.state === "verified";
 				if (["accepted", "rejected", "failed"].includes(forkReviewStatus)) {
@@ -819,6 +847,7 @@ async function main() {
 			const frozenGoal = await controller.status(runId);
 			const frozenTask = frozenGoal.tasks.find(item => item.taskId === selectedTask.taskId);
 			if (!frozenTask) fail("finished M07 task identity is unavailable for private archive");
+			const selectedM04ReadPaths = firstGoalReady ? selectedM07ReviewReadPaths(ws.runDir("M07", runId), frozenTask) : [];
 			statusPhase = "private-archive";
 			const privateArchive = await archivePrivateM07Task({ goal: frozenGoal, task: frozenTask, destination: outputDir });
 			const parentArchiveDir = path.join(campaignRoot, "branch-parent-archive");
@@ -845,14 +874,17 @@ async function main() {
 					const m04Runner = createPiSessionRunner({ modelRuntime: runtime,
 						signal: AbortSignal.any([abort.signal, m04Abort.signal]), campaignBudget: budget });
 					const processed = await runM04({ ws, store, runner: m04Runner, config: await ws.loadConfig() },
-						{ feedback: { kind: "M07", runId }, freshSession: true, purpose: "Adjudicate bounded M07 candidate lessons and limits" });
+						{ feedback: { kind: "M07", runId }, freshSession: true,
+							requiredM07ReadPaths: selectedM04ReadPaths,
+							purpose: "Adjudicate bounded M07 candidate lessons and limits" });
 					const complete = processed.record.status === "completed" && processed.record.failures.length === 0;
 					const coverage = firstGoalReady ? await m04EvidenceReturned(processed.record, selectedTask.taskId) :
 						{ complete: false, paths: [] };
 					m04 = { status: complete ? "completed" : "failed", runId: processed.record.runId,
 						proposalSubmitted: Boolean(processed.proposalId), snapshotCreated: Boolean(processed.snapshotId),
-						evidenceReturned: coverage.complete,
-						adoptedExperienceRefs: complete ? await adoptedExperienceRefs(store, processed.record.runId, coverage.complete) : [] };
+						evidenceReturned: coverage.complete && selectedM04ReadPaths.every(item => coverage.paths.includes(item)),
+						adoptedExperienceRefs: complete ? await adoptedExperienceRefs(store, processed.record.runId,
+							coverage.complete && selectedM04ReadPaths.every(item => coverage.paths.includes(item))) : [] };
 				} catch (error) { m04 = { status: "failed", adoptedExperienceRefs: [],
 					failure: privateExceptionDiagnostic(error, runtimeKey) }; }
 				finally { clearTimeout(m04Timer); }
@@ -864,13 +896,15 @@ async function main() {
 			const m04AdoptedExperienceCount = m04.runId ? (await store.list()).filter(record =>
 				record.source.stage === "M04" && record.source.runId === m04.runId &&
 				record.usageDecision === "adopted" && record.fields.experience !== undefined).length : 0;
+			const m04SelectedReadContractSatisfied = m04.evidenceReturned === true;
 			const m04AdoptionReadContractSatisfied = m04AdoptedExperienceCount === 0 || m04.evidenceReturned === true;
 			const reusableRefs = m04.evidenceReturned && knowledgeExport.state === "complete" ?
 				(m04.adoptedExperienceRefs ?? []).filter(ref => (archivedM04.m04?.adoptedExperienceRefs ?? []).some(exported =>
 					exported.storeId === ref.storeId && exported.recordId === ref.recordId && exported.version === ref.version)) : [];
 			let followOn: Record<string, unknown> = { state: "not_run", reason: "M04, seed, budget or time boundary unavailable" };
+			let followOnSourceChanged: boolean | null = null;
 			if (firstGoalReady && m04.status === "completed" && knowledgeExport.state !== "incomplete" &&
-				m04AdoptionReadContractSatisfied && existsSync(candidate) && existsSync(verificationPath) &&
+				m04SelectedReadContractSatisfied && existsSync(candidate) && existsSync(verificationPath) &&
 				!budget.snapshot().stopped && !abort.signal.aborted && Date.now() + 90_000 < campaignStopAt) {
 				statusPhase = "post-m04-followon";
 				try {
@@ -934,11 +968,11 @@ async function main() {
 						const nextArchiveDir = path.join(campaignRoot, "followon-archive");
 						const nextArchive = await archivePrivateM07Task({ goal: nextFrozenGoal, task: nextFrozenTask, destination: nextArchiveDir });
 						await exportPrefixedArchive(nextArchiveDir, outputDir, "followon");
-						const comparisonValue = comparison as { state?: string; medianRatio?: number; minRatio?: number };
-						const chooseFollowOn = secondFinished.outcome === "fulfilled" && secondReady &&
-							(selectedCandidateSource === "none" || (comparisonValue.state === "measured" &&
-							comparisonValue.medianRatio !== undefined && comparisonValue.medianRatio > 1.03 &&
-							comparisonValue.minRatio !== undefined && comparisonValue.minRatio >= 0.95));
+						const sourceChanged = !existsSync(candidate) || !existsSync(nextCandidate) ||
+							!(await readFile(candidate)).equals(await readFile(nextCandidate));
+						const chooseFollowOn = chooseFollowOnCandidate(selectedCandidateSource !== "none",
+							secondFinished.outcome === "fulfilled" && secondReady, sourceChanged,
+							comparison as { state?: string; medianRatio?: number; minRatio?: number });
 						if (chooseFollowOn && nextArchive.files.some(item => item.name === "candidate.cpp" && item.status === "present") &&
 							nextArchive.files.some(item => item.name === "verification.json" && item.status === "present")) {
 							await exportPrefixedArchive(outputDir, outputDir, "initial");
@@ -949,12 +983,15 @@ async function main() {
 							finalArchive = nextArchive;
 							selectedCandidateSource = "followon";
 						}
+						followOnSourceChanged = sourceChanged;
 					}
 					followOn = { state: "completed", goalRunId: secondGoal.runId, m07Outcome: secondFinished.outcome,
 						priorCandidateProvided: true, priorEvidenceProvided: true, adoptedRefsEligible: proposedRefs.length,
 						experienceSelectionStatus: selection.status, pinnedRefs, loadedExperience: Boolean(secondTask.experienceSelection?.loadedAt),
 						faithfulUse: "unknown", causalBenefit: "unknown", measuredComparison: comparison,
 						candidateSelected: selectedCandidateSource === "followon", selectedCandidateSource,
+						sourceChanged: followOnSourceChanged,
+						noChangeOutcome: followOnSourceChanged === false ? "identical-source-kept-previous" : null,
 						knowledgeMode: pinnedRefs.length ? "m04-adopted-pinned" : "prior-artifact-only",
 						archiveTransportLayout: "prefixed-flat-index" };
 				} catch (error) { followOn = { state: "failed", priorCandidateProvided: true,
@@ -971,7 +1008,7 @@ async function main() {
 				(!m04.adoptedExperienceRefs?.length || knowledgeExport.state === "complete");
 			const followOnCompleted = followOn.state === "completed" && followOn.m07Outcome === "fulfilled";
 			const campaignOutcome = firstGoalReady && finalCandidateVerified && m04.status === "completed" && durableKnowledge &&
-				m04AdoptionReadContractSatisfied && branchExerciseComplete &&
+				m04SelectedReadContractSatisfied && branchExerciseComplete &&
 				followOnCompleted ? "fulfilled" : "partial";
 			await saveStatus({ outcome: campaignOutcome, m07Outcome: finished.outcome, taskStatus: task.status,
 				loopStopReason: task.loopStopReason, taskTelemetry: statusTaskTelemetry,
@@ -982,7 +1019,8 @@ async function main() {
 					finalTaskId: finalArchive.taskId,
 					lessonState: privateArchive.lesson.state, trustedAdoption: false, m04,
 					knowledgeExport, m04EvidenceReturned: m04.evidenceReturned ?? false,
-					m04AdoptedExperienceCount, m04AdoptionReadContractSatisfied },
+					m04AdoptedExperienceCount, m04AdoptionReadContractSatisfied,
+					m04SelectedReadContractSatisfied },
 				branch: branchState, branchExerciseComplete, firstGoalReady,
 				followOn, selectedCandidateSource, finalCandidateVerified,
 				independentValidation: finalCandidateVerified ? "bounded-workflow-checker-passed" : "not-complete",
@@ -1012,8 +1050,8 @@ async function main() {
 
 export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceReturned, inputs, stageProbe, verifierScratch,
 	privateFailureMessage, privateExceptionDiagnostic, credentialProbe, parseCheckerOutput, compareCandidateTimings,
-	chooseForkWinner, firstM07Accepted,
-	forkReceiptMatches, contextLineageSummary, exportPrefixedArchive, preserveCandidate };
+	chooseForkWinner, chooseFollowOnCandidate, firstM07Accepted,
+	forkReceiptMatches, contextLineageSummary, selectedM07ReviewReadPaths, exportPrefixedArchive, preserveCandidate };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	main().catch(async error => {

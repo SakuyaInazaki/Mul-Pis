@@ -1,0 +1,79 @@
+import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test, { type TestContext } from "node:test";
+import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
+import { createM07Controller } from "../src/m07/controller.ts";
+import { FakeSessionRunner } from "../src/runner/fake.ts";
+import type { ReadReturnEvent } from "../src/runner/types.ts";
+import { runM04 } from "../src/stages/m04.ts";
+import type { StageContext } from "../src/stages/context.ts";
+import { Workspace } from "../src/workspace.ts";
+
+async function fixture(t: TestContext) {
+	const root = await mkdtemp(path.join(os.tmpdir(), "m04-required-m07-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const ws = new Workspace(root);
+	await mkdir(path.dirname(ws.problemFile), { recursive: true });
+	await writeFile(ws.problemFile, "Synthetic question\n");
+	const store = createFileKnowledgeStore(ws.knowledgeDir); await store.init();
+	const prior = await ws.startRun("M04", []); await ws.finishRun(prior, "completed");
+	const runner = new FakeSessionRunner(() => "Synthetic report");
+	const ctx: StageContext = { ws, store, runner, config: { roles: { execution: "fake/execution", reviewer: "fake/reviewer", research: "fake/research" }, concurrency: 1, tools: {} } };
+	const controller = createM07Controller(ctx);
+	const goal = await controller.begin({ goal: "Synthetic bounded task", problemRelation: "Direct", constraints: ["Keep evidence frozen"], successCriteria: ["Evidence checked"], plan: "Inspect evidence" });
+	await controller.delegate(goal.runId, { objective: "Produce feedback", inputs: [], expectedOutputs: [], checks: ["Evidence checked"], mode: "reason" });
+	await controller.finish(goal.runId, { outcome: "partial", summary: "Synthetic evidence for M04", returnPath: "M04",
+		goalChecks: [{ criterion: "Evidence checked", result: "not_run", evidence: [] }] });
+	const relative = ["candidate.cpp", "verification.json", "lesson-delta.json"].map((name, index) =>
+		`tasks/T001/review-snapshot/${String(index + 1).padStart(3, "0")}-${name}`);
+	for (const item of relative) {
+		const file = path.join(ws.runDir("M07", goal.runId), item);
+		await mkdir(path.dirname(file), { recursive: true });
+		await writeFile(file, "first\nsecond\n");
+	}
+	return { ws, store, ctx, goal, relative };
+}
+
+function returnedRanges(relative: string[], terminalTruncated = false): ReadReturnEvent[] {
+	return relative.map((item, index) => ({ toolName: "m07_evidence_read", status: "returned", path: item,
+		requested: {}, returned: { kind: "text", startLine: 1, endLine: 2,
+			truncated: terminalTruncated && index === 0 }, at: new Date().toISOString() }));
+}
+
+test("M04 can choose no proposal after full selected M07 reads and sees exact paths in its message", async t => {
+	const f = await fixture(t);
+	const fake = new FakeSessionRunner(() => "No transferable lesson; no knowledge proposal.");
+	const create = fake.create.bind(fake);
+	fake.create = async spec => ({ ...await create(spec), readReturnEvents: () => returnedRanges(f.relative) });
+	f.ctx.runner = fake;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId }, freshSession: true,
+		requiredM07ReadPaths: f.relative });
+	assert.equal(result.record.status, "completed");
+	assert.equal(result.proposalId, undefined);
+	const session = [...fake.sessions.values()].find(item => item.spec.label === "M04-research");
+	const message = session?.transcript[0]?.text ?? "";
+	for (const item of f.relative) assert.ok(message.includes(item));
+	assert.match(message, /完整读取/);
+});
+
+test("M04 rejects an adopted proposal before merge when a required final page is truncated", async t => {
+	const f = await fixture(t);
+	const fake = new FakeSessionRunner(() => `\`\`\`knowledge-proposals\n${JSON.stringify([
+		{ op: "create", type: "K", title: "Synthetic method", body: "Bounded synthetic method", usageDecision: "adopted" },
+	])}\n\`\`\``);
+	const create = fake.create.bind(fake);
+	fake.create = async spec => ({ ...await create(spec), readReturnEvents: () => returnedRanges(f.relative, true) });
+	f.ctx.runner = fake;
+	const snapshot = await f.store.current();
+	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId }, freshSession: true,
+		requiredM07ReadPaths: f.relative }), /not returned.*full/);
+	assert.equal((await f.store.current())?.id, snapshot?.id);
+	const runs = await f.ws.listRuns("M04");
+	const records = await Promise.all(runs.map(id => f.ws.readRun("M04", id)));
+	const attempt = records.find(record => record.outputs.some(item => item.label === "M07 回流证据实际访问范围"));
+	assert.ok(attempt);
+	assert.equal(attempt.status, "failed");
+	assert.equal(attempt.outputs.some(item => item.label === "知识提案"), false);
+});
