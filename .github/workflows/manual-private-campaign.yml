@@ -1,6 +1,9 @@
 name: Bounded confidential campaign
 
 on:
+  push:
+    branches:
+      - improve/workflow-learning-reliability
   workflow_dispatch:
     inputs:
       authorize_bounded_run:
@@ -22,8 +25,12 @@ jobs:
       github.repository == 'SakuyaInazaki/Mul-Pis' &&
       github.actor == 'SakuyaInazaki' &&
       github.run_attempt == 1 &&
-      github.event_name == 'workflow_dispatch' &&
-      inputs.authorize_bounded_run == true
+      (
+        (github.event_name == 'workflow_dispatch' && inputs.authorize_bounded_run == true) ||
+        (github.event_name == 'push' &&
+         github.ref == 'refs/heads/improve/workflow-learning-reliability' &&
+         github.event.head_commit.message == 'Resume bounded private M07 campaign (mul-pis-20261005-lab-resume1)')
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
