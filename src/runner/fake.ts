@@ -6,7 +6,7 @@ import path from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { readTextIfExists, writeFileAtomic } from "../workspace.ts";
-import type { AssistantTurn, ForkRequest, RunnerCapabilities, SessionCheckpoint, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, ToolResult, TranscriptMessage, UsageEvent, UsageValues } from "./types.ts";
+import type { AssistantTurn, ForkRequest, ReadReturnEvent, RunnerCapabilities, SessionCheckpoint, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, ToolResult, TranscriptMessage, UsageEvent, UsageValues } from "./types.ts";
 import { summarizeUsage } from "./usage.ts";
 
 export interface FakeReplyContext {
@@ -25,6 +25,8 @@ export interface FakeReply {
 	text: string;
 	/** Files the fake "read" through its read-dir grant (relative to root). */
 	reads?: string[];
+	/** Exact returned ranges for coverage-sensitive offline stage tests. */
+	readReturns?: ReadReturnEvent[];
 	stopReason?: string;
 	usage?: UsageValues;
 }
@@ -36,6 +38,7 @@ interface FakeSessionState {
 	ref: SessionRef;
 	transcript: TranscriptMessage[];
 	reads: Set<string>;
+	readReturns: ReadReturnEvent[];
 	turns: number;
 	toolLog: ToolCallRecord[];
 	active: boolean;
@@ -70,7 +73,7 @@ export class FakeSessionRunner implements SessionRunner {
 		await writeFileAtomic(specFile, `${JSON.stringify(spec, null, 2)}\n`);
 		await writeFileAtomic(file, "");
 		const ref: SessionRef = { label: spec.label, role: spec.role, id, model: spec.model, file, specFile, ...(spec.methodBinding ? { methodBinding: spec.methodBinding } : {}) };
-		const state: FakeSessionState = { spec, ref, transcript: [], reads: new Set(), turns: 0, toolLog: [], active: false, freezing: false, completed: false, disposed: false };
+		const state: FakeSessionState = { spec, ref, transcript: [], reads: new Set(), readReturns: [], turns: 0, toolLog: [], active: false, freezing: false, completed: false, disposed: false };
 		this.sessions.set(id, state);
 		this.created.push(spec);
 		return this.handle(state);
@@ -88,7 +91,7 @@ export class FakeSessionRunner implements SessionRunner {
 				.split(/\r?\n/)
 				.filter((line) => line.trim())
 				.map((line) => JSON.parse(line) as TranscriptMessage);
-			state = { spec, ref: { ...ref, model: spec.model }, transcript, reads: new Set(), turns: transcript.filter((m) => m.role === "user").length, toolLog: [], active: false, freezing: false, completed: transcript.at(-1)?.role === "assistant", disposed: false };
+			state = { spec, ref: { ...ref, model: spec.model }, transcript, reads: new Set(), readReturns: [], turns: transcript.filter((m) => m.role === "user").length, toolLog: [], active: false, freezing: false, completed: transcript.at(-1)?.role === "assistant", disposed: false };
 			this.sessions.set(ref.id, state);
 		}
 		if (state.spec.tools.kind === "custom" || state.spec.tools.kind === "execution" || (state.spec.tools.kind === "read-dir" && state.spec.tools.extraTools?.length)) {
@@ -187,7 +190,7 @@ export class FakeSessionRunner implements SessionRunner {
 			await writeFileAtomic(specFile, `${JSON.stringify(spec, null, 2)}\n`);
 			await writeFileAtomic(lineageFile, `${JSON.stringify({ version: 1, state: "committed", intent: "branch-exploration", checkpoint, parent: { sessionId: checkpoint.sourceSessionId, sessionFile: checkpoint.sourceSessionFile, leafId: checkpoint.leafId, toolGrantKind: parentTools.kind }, child: { sessionId: id, sessionFile: file, scratch: childScratch, toolGrantKind: childTools.kind, ...(spec.tools.kind === "execution" ? { workRoot: spec.tools.root } : {}) }, reason, evidenceBindings, workspaceBinding: request.workspaceBinding, inheritedUsageBilled: false, createdAt: new Date().toISOString() }, null, 2)}\n`);
 		} catch (error) { await Promise.all([rm(file, { force: true }), rm(specFile, { force: true }), rm(lineageFile, { force: true }), rm(childScratch, { recursive: true, force: true })]); throw error; }
-		const state: FakeSessionState = { spec, ref, transcript: source, reads: new Set(), turns: source.filter((m) => m.role === "user").length, toolLog: [], active: false, freezing: false, completed: false, disposed: false };
+		const state: FakeSessionState = { spec, ref, transcript: source, reads: new Set(), readReturns: [], turns: source.filter((m) => m.role === "user").length, toolLog: [], active: false, freezing: false, completed: false, disposed: false };
 		this.sessions.set(id, state);
 		this.created.push(spec);
 		return this.handle(state);
@@ -238,6 +241,7 @@ export class FakeSessionRunner implements SessionRunner {
 				const reply: FakeReply = typeof raw === "string" ? { text: raw } : raw;
 				replyUsage = reply.usage;
 				for (const r of reply.reads ?? []) state.reads.add(r);
+				state.readReturns.push(...(reply.readReturns ?? []));
 				const stopReason = reply.stopReason ?? "stop";
 				if (stopReason !== "stop") throw new Error(`session ${state.ref.label} did not stop normally (stopReason=${stopReason})`);
 				state.transcript.push({ role: "assistant", text: reply.text });
@@ -257,7 +261,7 @@ export class FakeSessionRunner implements SessionRunner {
 			},
 			transcript: () => [...state.transcript],
 			readCoverage: () => [...state.reads].sort(),
-			readReturnEvents: () => [],
+			readReturnEvents: () => [...state.readReturns],
 			usageEvents: () => [...usageEvents],
 			usageSummary: () => summarizeUsage(usageEvents),
 			toolLog: () => [...state.toolLog],

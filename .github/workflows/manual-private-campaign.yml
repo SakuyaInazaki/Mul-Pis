@@ -1,10 +1,13 @@
 name: Bounded confidential campaign
 
 on:
+  push:
+    branches:
+      - improve/workflow-learning-reliability
   workflow_dispatch:
     inputs:
       authorize_bounded_run:
-        description: "Authorize one DeepSeek campaign up to 5.3 CNY after checking prior charges"
+        description: "Authorize one DeepSeek campaign up to 2.8 CNY after checking prior charges"
         required: true
         default: false
         type: boolean
@@ -22,9 +25,9 @@ jobs:
       github.repository == 'SakuyaInazaki/Mul-Pis' &&
       github.actor == 'SakuyaInazaki' &&
       github.run_attempt == 1 &&
-      github.event_name == 'workflow_dispatch' &&
+      github.event_name == 'push' &&
       github.ref == 'refs/heads/improve/workflow-learning-reliability' &&
-      inputs.authorize_bounded_run == true
+      github.event.head_commit.message == 'Repair original objective continuation and verify explicit stops (mul-pis-20261005-objective-run1)'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

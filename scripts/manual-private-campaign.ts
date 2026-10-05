@@ -15,6 +15,9 @@ import { runInit } from "../src/stages/init.ts";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { createM07Controller } from "../src/m07/controller.ts";
 import { runMeasuredEvidenceHandoff } from "../src/m07/evidence-finalization.ts";
+import { assessAndAdvanceOriginalObjective, createOriginalObjective, objectiveProgress, runOriginalObjectiveLoop,
+	writeObjectiveProgress, writeOriginalObjectiveContract } from "../src/m07/objective-progress.ts";
+import type { ObjectiveProgressV1, ObjectiveStopReason } from "../src/m07/objective-progress.ts";
 import type { CurrentGoal, M07TaskRecord, TaskSpecInput } from "../src/m07/types.ts";
 import { runM04 } from "../src/stages/m04.ts";
 import { createPiSessionRunner } from "../src/runner/pi.ts";
@@ -28,11 +31,12 @@ import type { KnowledgeRef, KnowledgeStore } from "../src/knowledge/types.ts";
 import type { StageRunRecord } from "../src/types.ts";
 
 const MODEL = "deepseek/deepseek-flash:low";
-const MAX_CNY = 5.3;
+const MAX_CNY = 2.8;
 const CAMPAIGN_MS = 20 * 60_000;
 const BUILDER_PHASE_MS = 7 * 60_000;
 const M04_PHASE_MS = 5 * 60_000;
 const BUILDER_ROUNDS = 2;
+const MAX_PROVIDER_CALLS = 64;
 const FLAGS = ["-O2", "-std=c++17", "-fopenmp", "-pthread"];
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CHECKS = [
@@ -212,7 +216,9 @@ async function contextLineageSummary(file: string | undefined, checkpoint: Sessi
 }
 /** Flat encrypted-transport layout; the renamed manifest is an index, not a default loader input. */
 async function exportPrefixedArchive(sourceDir: string, outputDir: string,
-	prefix: "initial" | "followon" | "branch-parent" | "branch-child"): Promise<void> {
+	prefix: string): Promise<void> {
+	if (!(["initial", "followon", "branch-parent", "branch-child"].includes(prefix) ||
+		/^iteration-(?:[1-9]|[1-5][0-9]|6[0-4])$/.test(prefix))) fail("unsupported private archive transport prefix");
 	for (const name of ARCHIVE_EVIDENCE_FILES) if (existsSync(path.join(sourceDir, name)))
 		await copyFile(path.join(sourceDir, name), path.join(outputDir, `${prefix}-${name}`));
 	const archive = JSON.parse(await readFile(path.join(sourceDir, "workflow-archive.json"), "utf8")) as Record<string, any>;
@@ -224,13 +230,13 @@ async function exportPrefixedArchive(sourceDir: string, outputDir: string,
 		if (item.reviewerReport?.file) item.reviewerReport.file = `${prefix}-${item.reviewerReport.file}`;
 	}
 	if (archive.controllerEvidence?.reviewDecision?.file) archive.controllerEvidence.reviewDecision.file = `${prefix}-${archive.controllerEvidence.reviewDecision.file}`;
-	if (prefix === "initial" && archive.m04?.knowledgeExport?.state === "complete") {
+	if (archive.m04?.knowledgeExport?.state === "complete") {
 		if (archive.m04.knowledgeExport.file !== "m04-adopted-knowledge.json" ||
 			!existsSync(path.join(sourceDir, "m04-adopted-knowledge.json")))
-			fail("complete M04 knowledge export is unavailable for prefixed initial archive");
+			fail("complete M04 knowledge export is unavailable for prefixed archive");
 		await copyFile(path.join(sourceDir, "m04-adopted-knowledge.json"),
-			path.join(outputDir, "initial-m04-adopted-knowledge.json"));
-		archive.m04.knowledgeExport.file = "initial-m04-adopted-knowledge.json";
+			path.join(outputDir, `${prefix}-m04-adopted-knowledge.json`));
+		archive.m04.knowledgeExport.file = `${prefix}-m04-adopted-knowledge.json`;
 	}
 	archive.transportLayout = { kind: "prefixed-flat-index", prefix, defaultArchiveLoaderCompatible: false };
 	await writeFile(path.join(outputDir, `workflow-${prefix}-archive.json`), JSON.stringify(archive, null, 2), { mode: 0o600 });
@@ -613,7 +619,7 @@ async function main() {
 	const campaignRoot = await mkdtemp(path.join(os.tmpdir(), "mulpis-private-campaign-"));
 	let runId: string | undefined;
 	const budget = new DeepSeekCampaignBudget({ model: MODEL, endpoint: "https://api.deepseek.com", maxCny: MAX_CNY,
-		maxProviderCalls: 64, maxProviderCallsPerPrompt: 32,
+		maxProviderCalls: MAX_PROVIDER_CALLS, maxProviderCallsPerPrompt: 32,
 		maxOutputTokens: 64_000, outputAccountingMarginTokens: 32,
 		maxInputCnyPerMillionTokens: 4, maxCacheReadCnyPerMillionTokens: 0.2,
 		maxOutputCnyPerMillionTokens: 16, cnyPerUsdCeiling: 10 });
@@ -629,6 +635,18 @@ async function main() {
 			"Private C++ parallel-programming task. Use only the supplied original inputs. Produce optimized source and machine-readable correctness/performance observations. Do not produce a prose report, screenshots, presentation, or personal reflection. Do not invent measurements.\n" +
 			(await readFile(path.join(ws.rawDir, found.files.find(x => /\.md$/i.test(x)) ?? found.files.find(x => /\.txt$/i.test(x))!), "utf8")),
 			{ mode: 0o600 });
+		const originalObjective = createOriginalObjective({
+			goal: "Find the strongest currently attainable strategy for the supplied private optimization problem, supported by correctness and measured performance across the permitted search space.",
+			goalSource: "user-intent-summary", inputNames: found.files,
+			obligations: [
+				{ id: "original-task", description: "Address the full supplied original task and user intent; the original private materials control the scientific requirements, and the model must state specific unresolved requirements from them." },
+			], closure: "open-ended",
+		});
+		const objectiveContractFile = path.join(outputDir, "original-objective.json");
+		const objectiveCheckpointFile = path.join(outputDir, "objective-checkpoint.json");
+		await writeOriginalObjectiveContract(objectiveContractFile, originalObjective);
+		await writeObjectiveProgress(objectiveCheckpointFile, objectiveProgress(originalObjective,
+			{ boundedRuns: [], selectedArtifacts: [], stopReason: "bounded-run-incomplete" }));
 		await writeFile(ws.configFile, JSON.stringify({ roles: { execution: MODEL, reviewer: MODEL, research: MODEL }, concurrency: 1, tools: {} }), { mode: 0o600 });
 		const originalPath = path.join(ws.rawDir, found.source);
 		const originalText = await readFile(originalPath, "utf8");
@@ -735,7 +753,7 @@ async function main() {
 			};
 			const controller = createM07Controller({ ws, store, runner, config: await ws.loadConfig() });
 			const goal = await controller.begin({ goal: "Seek the strongest measured C++ parallel optimization attainable within this bounded private campaign, using the original inputs and preserved baselines.",
-				problemRelation: "Code and machine-readable correctness/performance scope of the supplied private problem.",
+				problemRelation: `Bounded child of original objective ${originalObjective.id}: ${originalObjective.goal}. Code and machine-readable correctness/performance scope only.`,
 				constraints: ["Use only the supplied private inputs and configured DeepSeek model.",
 					"This bounded adapter run edits only two existing target bodies and preserves the other source, main and built-in checker. The supplied problem allows a broader strategy search; this run measures only the two-target pass.",
 					"No prose report, screenshots, presentation, or personal reflection; no fabricated measurements."],
@@ -902,45 +920,160 @@ async function main() {
 				(m04.adoptedExperienceRefs ?? []).filter(ref => (archivedM04.m04?.adoptedExperienceRefs ?? []).some(exported =>
 					exported.storeId === ref.storeId && exported.recordId === ref.recordId && exported.version === ref.version)) : [];
 			let followOn: Record<string, unknown> = { state: "not_run", reason: "M04, seed, budget or time boundary unavailable" };
+			const followOnAttempts: Array<Record<string, unknown>> = [];
 			let followOnSourceChanged: boolean | null = null;
-			if (firstGoalReady && m04.status === "completed" && knowledgeExport.state !== "incomplete" &&
-				m04SelectedReadContractSatisfied && existsSync(candidate) && existsSync(verificationPath) &&
-				!budget.snapshot().stopped && !abort.signal.aborted && Date.now() + 90_000 < campaignStopAt) {
-				statusPhase = "post-m04-followon";
+			let objectiveAssessment: ObjectiveProgressV1["assessment"];
+			let latestAssessmentAdvanced = false;
+			const assessmentHistory: ObjectiveProgressV1["assessmentHistory"] = [];
+			const objectiveReceipts: Array<Record<string, unknown>> = [];
+			let objectiveStopReason: ObjectiveStopReason = "bounded-run-incomplete";
+			let currentM04Status = m04.status;
+			let currentM04Read = m04SelectedReadContractSatisfied;
+			let currentKnowledgeExport = knowledgeExport;
+			let currentReusableRefs = reusableRefs;
+			let currentKnowledgeFile = existsSync(path.join(outputDir, "m04-adopted-knowledge.json")) ?
+				path.join(outputDir, "m04-adopted-knowledge.json") : undefined;
+			let currentSelectedGoalRunId = runId!;
+			let currentSelectedTaskId = selectedTask.taskId;
+			let latestAttemptEvidence: Array<{ name: string; file: string }> = [];
+			const loop = await runOriginalObjectiveLoop({ maxIterations: MAX_PROVIDER_CALLS,
+				admission: () => {
+					if (budget.snapshot().stopped) return budget.snapshot().stopReason === "ceiling" ?
+						"budget-boundary" : "bounded-run-incomplete";
+					if (abort.signal.aborted || Date.now() + 90_000 >= campaignStopAt) return "time-boundary";
+					if (currentM04Status === "failed") return "m04-evidence-incomplete";
+					if (!firstGoalReady || currentM04Status !== "completed" || currentKnowledgeExport.state === "incomplete" ||
+						!currentM04Read || !existsSync(candidate) || !existsSync(verificationPath)) return "bounded-run-incomplete";
+					return "admitted";
+				},
+				step: async iteration => {
+				let advancedThisIteration = false;
+				let assessmentThisIteration = false;
+				let activeFollowOnGoalId: string | undefined;
+				let activeFollowOnTaskId: string | undefined;
+				statusPhase = "original-objective-assessment";
 				try {
-					const prior = JSON.parse(await readFile(verificationPath, "utf8")) as Record<string, unknown>;
-					followOnPriorVerification = prior;
-					const seedPath = path.join(ws.runDir("M07", runId), "prior-candidate-seed.json");
-					const summary = Array.isArray(prior.originalCheckerRuns) ? prior.originalCheckerRuns.map((row: Record<string, unknown>) => ({
-						args: row.args, exitCode: row.exitCode, reportedKernelMs: row.reportedKernelMs })) : [];
-					await writeFile(seedPath, JSON.stringify({ version: 1, sourceGoalRunId: runId, sourceTaskId: selectedTask.taskId,
-						status: prior.status, independent: prior.independent, measuredCases: summary }, null, 2), { mode: 0o600 });
-					const secondGoal = await controller.begin({
-						goal: "Conditionally refine the prior measured candidate using explicit frozen evidence and only applicable M04-adopted experience.",
-						problemRelation: "Fresh M07 continuation of the same private optimization problem after completed M04 adjudication.",
-						constraints: ["Prior candidate and measurements are development evidence, not adopted truth.",
-							"Use only M04-adopted pinned experience refs that pass current applicability and live-limit checks.",
-							"Keep this adapter's two-target scope and preserve non-target code and built-in checker; no prose report or personal reflection."],
-						successCriteria: CHECKS,
-						plan: "Explicitly inspect prior candidate and bounded measurements, then perform one fresh bounded builder/reviewer loop. Distinguish loaded knowledge, actual use and measured benefit.",
-						exploratory: false,
+					const objectiveRecord = await ws.startRun("M07Objective", [
+						{ label: "Frozen original objective", path: objectiveContractFile },
+						{ label: "Original private problem", path: ws.problemFile },
+						{ label: "Selected bounded candidate", path: candidate },
+						{ label: "Selected bounded verification", path: verificationPath },
+					]);
+					const saveObjectiveReceipt = async () => {
+						await ws.writeRun(objectiveRecord);
+						const receipt = {
+							version: 1, kind: "m07-original-objective-assessment", runId: objectiveRecord.runId,
+							status: objectiveRecord.status, sessions: objectiveRecord.sessions.map(item => ({
+								sessionId: item.id, role: item.role, model: item.model,
+								boundaryMode: item.boundary?.mode ?? "unknown", boundaryIntent: item.boundary?.intent ?? "unknown",
+								toolGrantKind: item.boundary?.toolGrantKind ?? "unknown",
+								evidenceLabels: item.boundary?.evidence.map(entry => entry.label) ?? [],
+							})),
+						};
+						await writeFile(path.join(outputDir, "objective-assessment-receipt.json"),
+							JSON.stringify(receipt, null, 2), { mode: 0o600 });
+						const receiptIndex = objectiveReceipts.findIndex(item => item.runId === objectiveRecord.runId);
+						if (receiptIndex >= 0) objectiveReceipts[receiptIndex] = receipt;
+						else objectiveReceipts.push(receipt);
+						await writeFile(path.join(outputDir, "objective-assessment-receipts.json"),
+							JSON.stringify({ version: 1, kind: "m07-original-objective-assessment-receipts",
+								receipts: objectiveReceipts }, null, 2), { mode: 0o600 });
+					};
+					const evidence = [
+						{ name: "original-problem.txt", file: ws.problemFile },
+						...found.files.map((name, index) => ({ name: `original-input-${index + 1}.txt`,
+							file: path.join(ws.rawDir, name) })),
+						{ name: "candidate.cpp", file: candidate },
+						{ name: "verification.json", file: verificationPath },
+						{ name: "workflow-archive.json", file: path.join(outputDir, "workflow-archive.json") },
+						...(currentKnowledgeFile ? [{ name: "m04-knowledge.json", file: currentKnowledgeFile }] : []),
+						...latestAttemptEvidence,
+					];
+					const assessmentAdmission = "admitted";
+					let objectiveStep;
+					try { objectiveStep = await assessAndAdvanceOriginalObjective({
+						contract: originalObjective, contractFile: objectiveContractFile,
+						runner: actual, runRecord: objectiveRecord, persistReceipt: saveObjectiveReceipt,
+						sessionSpec: { label: `M07-original-objective-assessment-${iteration}`, role: "research", model: MODEL,
+							systemPrompt: "Independently assess the original research goal using the frozen evidence. Read the complete supplied files before proposing further work. Return only the requested structured judgment; acknowledge uncertainty, bounded search scope and failed checks. Do not invent measurements or treat M04 adoption as proof of performance.",
+							persistDir: ws.sessionsDir },
+						evidenceRoot: path.join(campaignRoot, `objective-evidence-${iteration}`), evidence,
+						assessmentAdmission,
+						advanceAdmission: () => budget.snapshot().stopped ?
+							budget.snapshot().stopReason === "ceiling" ? "budget-boundary" : "assessment-failed" :
+							abort.signal.aborted || Date.now() + 90_000 >= campaignStopAt ? "time-boundary" : "admitted",
+						supportedTaskScopes: ["two-target-existing"],
+						recordAssessment: async assessment => {
+							objectiveAssessment = assessment;
+							assessmentThisIteration = true;
+							assessmentHistory.push({ iteration, assessment, stopReason: "assessment-validation-pending", advanced: false });
+							await writeObjectiveProgress(objectiveCheckpointFile, objectiveProgress(originalObjective,
+								{ boundedRuns: [{ runId: runId!, outcome: finished.outcome ?? "unknown",
+									...(firstGoalReady ? { selectedTaskId: selectedTask.taskId } : {}) }],
+									selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
+									assessment, assessmentHistory, stopReason: "assessment-validation-pending" }));
+						},
+						advance: async proposal => {
+							statusPhase = "model-proposed-m07-dispatch";
+						const prior = JSON.parse(await readFile(verificationPath, "utf8")) as Record<string, unknown>;
+							followOnPriorVerification = prior;
+							const seedDir = path.join(ws.root, "objective-seeds");
+							await mkdir(seedDir, { recursive: true, mode: 0o700 });
+							const seedPath = path.join(seedDir, `prior-candidate-seed-${iteration}.json`);
+							const summary = Array.isArray(prior.originalCheckerRuns) ? prior.originalCheckerRuns.map((row: Record<string, unknown>) => ({
+								args: row.args, exitCode: row.exitCode, reportedKernelMs: row.reportedKernelMs })) : [];
+							await writeFile(seedPath, JSON.stringify({ version: 1, sourceGoalRunId: currentSelectedGoalRunId, sourceTaskId: currentSelectedTaskId,
+								status: prior.status, independent: prior.independent, measuredCases: summary }, null, 2), { mode: 0o600 });
+							const secondGoal = await controller.begin({
+								goal: `Bounded continuation of original objective ${originalObjective.id}: ${proposal.objective}`,
+								problemRelation: `Model-proposed work addressing unresolved original obligations ${proposal.addresses.join(", ")}; original goal: ${originalObjective.goal}`,
+								constraints: ["Prior candidate and measurements are development evidence, not adopted truth.",
+									"Use only M04-adopted pinned experience refs that pass current applicability and live-limit checks.",
+									"Keep this adapter's two-target scope and preserve non-target code and built-in checker; no prose report or personal reflection."],
+								successCriteria: CHECKS,
+								plan: `Investigate the model-proposed next work against the original unresolved obligations: ${proposal.addresses.join(", ")}. Inspect prior candidate and measurements, then run one fresh bounded builder/reviewer loop.`,
+								exploratory: false,
+							});
+							activeFollowOnGoalId = secondGoal.runId;
+						const proposedRefs = currentReusableRefs;
+							const tags = ["execute", "numeric", "cpu", "cpp-parallel"];
+							const selection = await createExperienceProvider(store).select({ targetKind: "executor",
+								applicability: { stage: "M07", tags }, requestedRefs: proposedRefs,
+								expectedSnapshotId: secondGoal.knowledgeSnapshot, maxRecords: 24, maxChars: 24_000 });
+							const pinnedRefs = selection.status === "ready" ? proposedRefs : [];
+						const seedInputs = [path.relative(ws.root, candidate), path.relative(ws.root, seedPath)];
+							const secondTask = await controller.delegate(secondGoal.runId, { mode: "execute",
+								objective: `${proposal.objective}\n\nInspect the supplied prior candidate and prior-candidate-seed.json as untrusted development evidence. Address original obligations ${proposal.addresses.join(", ")}. Produce a complete candidate.cpp under the adapter's fixed source scope, write a pending lesson-delta.json or action none, and report negative or mixed measured results honestly. Use only confined read/write/edit; the host writes verification.json; no shell, network or prose deliverables.`,
+								inputs: [...found.files.map(x => `problem/raw/${x}`), ...seedInputs],
+								expectedOutputs: ["candidate.cpp", "lesson-delta.json"], lessonDeltaOutput: "lesson-delta.json", checks: CHECKS,
+								...(pinnedRefs.length ? { experienceRefs: pinnedRefs, experienceTags: tags } : {}),
+								executionLoop: { maxRounds: 2, deadlineAt: new Date(Math.min(Date.now() + BUILDER_PHASE_MS, campaignStopAt - 45_000)).toISOString() },
+							});
+							activeFollowOnTaskId = secondTask.taskId;
+							return { secondGoal, secondTask, proposedRefs, selection, pinnedRefs };
+						},
 					});
-					const proposedRefs = reusableRefs;
-					const tags = ["execute", "numeric", "cpu", "cpp-parallel"];
-					const selection = await createExperienceProvider(store).select({ targetKind: "executor",
-						applicability: { stage: "M07", tags }, requestedRefs: proposedRefs,
-						expectedSnapshotId: secondGoal.knowledgeSnapshot, maxRecords: 24, maxChars: 24_000 });
-					const pinnedRefs = selection.status === "ready" ? proposedRefs : [];
-					const seedInputs = [path.relative(ws.root, candidate), path.relative(ws.root, seedPath),
-						...(existsSync(path.join(selectedTask.workDir, "lesson-delta.json")) ?
-							[path.relative(ws.root, path.join(selectedTask.workDir, "lesson-delta.json"))] : [])];
-					const secondTask = await controller.delegate(secondGoal.runId, { mode: "execute",
-						objective: "Inspect the explicitly supplied prior candidate and prior-candidate-seed.json; they are untrusted development evidence. If applicable M04 experience is loaded, assess it against this task rather than assuming it is beneficial. Produce a complete candidate.cpp that is independently correct and seek the strongest measured performance across the supplied CPU cases; report negative or mixed results honestly. Write lesson-delta.json as a pending candidate or action none. Use only confined read/write/edit; host generates verification.json before fresh reviewer inspection; no shell/network or prose deliverables.",
-						inputs: [...found.files.map(x => `problem/raw/${x}`), ...seedInputs],
-						expectedOutputs: ["candidate.cpp", "lesson-delta.json"], lessonDeltaOutput: "lesson-delta.json", checks: CHECKS,
-						...(pinnedRefs.length ? { experienceRefs: pinnedRefs, experienceTags: tags } : {}),
-						executionLoop: { maxRounds: 2, deadlineAt: new Date(Math.min(Date.now() + BUILDER_PHASE_MS, campaignStopAt - 45_000)).toISOString() },
-					});
+						objectiveRecord.outputs.push({ label: "Original objective checkpoint", path: objectiveCheckpointFile });
+						await ws.finishRun(objectiveRecord, objectiveStep.assessment?.unreadEvidence.length === 0 ? "completed" : "failed");
+						await saveObjectiveReceipt();
+					} catch (error) {
+						objectiveRecord.failures.push("Original objective assessment or model-proposed bounded dispatch failed");
+						await ws.finishRun(objectiveRecord, "failed").catch(() => undefined);
+						await saveObjectiveReceipt().catch(() => undefined);
+						throw error;
+					}
+					objectiveAssessment = objectiveStep.assessment;
+					latestAssessmentAdvanced = Boolean(objectiveStep.advanced);
+					objectiveStopReason = objectiveStep.stopReason === "assessment-failed" && budget.snapshot().stopReason === "ceiling" ?
+						"budget-boundary" : objectiveStep.stopReason === "assessment-failed" &&
+						(abort.signal.aborted || Date.now() >= campaignStopAt) ? "time-boundary" : objectiveStep.stopReason;
+					if (assessmentHistory.at(-1)?.iteration === iteration) {
+						assessmentHistory[assessmentHistory.length - 1].stopReason = objectiveStopReason;
+						assessmentHistory[assessmentHistory.length - 1].advanced = Boolean(objectiveStep.advanced);
+					}
+					if (objectiveStep.advanced) {
+						statusPhase = "post-m04-followon";
+						const { secondGoal, secondTask, proposedRefs, selection, pinnedRefs } = objectiveStep.advanced;
 					const nextCandidate = path.join(secondTask.workDir, "candidate.cpp");
 					const nextVerification = path.join(secondTask.workDir, "verification.json");
 					let nextResult: Record<string, unknown> | undefined;
@@ -963,40 +1096,128 @@ async function main() {
 							evidence: secondReady ? [index === 0 ? nextCandidate : nextVerification] : [] })),
 						limitations: ["Prior archive/context and loaded experience do not by themselves establish faithful use or scientific benefit."] });
 					const nextFrozenGoal = await controller.status(secondGoal.runId);
-					const nextFrozenTask = nextFrozenGoal.tasks.find(item => item.taskId === secondTask.taskId);
-					if (nextFrozenTask) {
-						const nextArchiveDir = path.join(campaignRoot, "followon-archive");
-						const nextArchive = await archivePrivateM07Task({ goal: nextFrozenGoal, task: nextFrozenTask, destination: nextArchiveDir });
-						await exportPrefixedArchive(nextArchiveDir, outputDir, "followon");
+						const nextFrozenTask = nextFrozenGoal.tasks.find(item => item.taskId === secondTask.taskId);
+						if (!nextFrozenTask) fail("model-proposed M07 task identity unavailable for private archive");
+						const nextArchiveDir = path.join(campaignRoot, `iteration-${iteration}-archive`);
+						await archivePrivateM07Task({ goal: nextFrozenGoal, task: nextFrozenTask, destination: nextArchiveDir });
+						let nextM04: typeof m04 = { status: "not_run" };
+						if (secondReady && nextFrozenTask.review && !budget.snapshot().stopped && !abort.signal.aborted) {
+							statusPhase = "model-proposed-m04-dispatch";
+							const requiredPaths = selectedM07ReviewReadPaths(ws.runDir("M07", secondGoal.runId), nextFrozenTask);
+							const m04Abort = new AbortController();
+							const m04Timer = setTimeout(() => m04Abort.abort(), M04_PHASE_MS);
+							try {
+								const m04Runner = createPiSessionRunner({ modelRuntime: runtime,
+									signal: AbortSignal.any([abort.signal, m04Abort.signal]), campaignBudget: budget });
+								const processed = await runM04({ ws, store, runner: m04Runner, config: await ws.loadConfig() },
+									{ feedback: { kind: "M07", runId: secondGoal.runId }, freshSession: true,
+										requiredM07ReadPaths: requiredPaths,
+										purpose: "Adjudicate the latest model-proposed bounded M07 result" });
+								const coverage = await m04EvidenceReturned(processed.record, secondTask.taskId);
+								const complete = processed.record.status === "completed" && processed.record.failures.length === 0 &&
+									coverage.complete && requiredPaths.every(item => coverage.paths.includes(item));
+								nextM04 = { status: complete ? "completed" : "failed", runId: processed.record.runId,
+									proposalSubmitted: Boolean(processed.proposalId), snapshotCreated: Boolean(processed.snapshotId),
+									evidenceReturned: complete,
+									adoptedExperienceRefs: complete ? await adoptedExperienceRefs(store, processed.record.runId, true) : [] };
+							} catch (error) { nextM04 = { status: "failed", adoptedExperienceRefs: [],
+								failure: privateExceptionDiagnostic(error, runtimeKey) }; }
+							finally { clearTimeout(m04Timer); }
+						}
+						const nextArchive = await recordPrivateM04Outcome(nextArchiveDir,
+							{ state: nextM04.status === "not_run" ? "not-run" : nextM04.status,
+								...(nextM04.runId ? { runId: nextM04.runId } : {}),
+								proposalSubmitted: nextM04.proposalSubmitted ?? false,
+								snapshotCreated: nextM04.snapshotCreated ?? false,
+								adoptedExperienceRefs: nextM04.adoptedExperienceRefs ?? [] }, store);
+						const iterationPrefix = `iteration-${iteration}`;
+						await exportPrefixedArchive(nextArchiveDir, outputDir, iterationPrefix);
+						latestAttemptEvidence = [{ name: "latest-attempt-archive.json",
+							file: path.join(outputDir, `workflow-${iterationPrefix}-archive.json`) },
+							...(existsSync(path.join(outputDir, `${iterationPrefix}-candidate.cpp`)) ?
+								[{ name: "latest-attempt.cpp", file: path.join(outputDir, `${iterationPrefix}-candidate.cpp`) }] : []),
+							...(existsSync(path.join(outputDir, `${iterationPrefix}-verification.json`)) ?
+								[{ name: "latest-attempt-verification.json", file: path.join(outputDir, `${iterationPrefix}-verification.json`) }] : [])];
 						const sourceChanged = !existsSync(candidate) || !existsSync(nextCandidate) ||
 							!(await readFile(candidate)).equals(await readFile(nextCandidate));
 						const chooseFollowOn = chooseFollowOnCandidate(selectedCandidateSource !== "none",
-							secondFinished.outcome === "fulfilled" && secondReady, sourceChanged,
+							secondFinished.outcome === "fulfilled" && secondReady && nextM04.status === "completed", sourceChanged,
 							comparison as { state?: string; medianRatio?: number; minRatio?: number });
+						let promoted = false;
 						if (chooseFollowOn && nextArchive.files.some(item => item.name === "candidate.cpp" && item.status === "present") &&
 							nextArchive.files.some(item => item.name === "verification.json" && item.status === "present")) {
-							await exportPrefixedArchive(outputDir, outputDir, "initial");
-							for (const name of [...ARCHIVE_EVIDENCE_FILES, "workflow-archive.json"]) {
+							if (selectedCandidateSource !== "followon") await exportPrefixedArchive(outputDir, outputDir, "initial");
+							for (const name of [...ARCHIVE_EVIDENCE_FILES, "workflow-archive.json", "m04-adopted-knowledge.json"]) {
 								await rm(path.join(outputDir, name), { force: true });
 								if (existsSync(path.join(nextArchiveDir, name))) await copyFile(path.join(nextArchiveDir, name), path.join(outputDir, name));
 							}
 							finalArchive = nextArchive;
 							selectedCandidateSource = "followon";
+							candidate = nextCandidate;
+							verificationPath = nextVerification;
+							currentSelectedGoalRunId = secondGoal.runId;
+							currentSelectedTaskId = secondTask.taskId;
+							promoted = true;
 						}
 						followOnSourceChanged = sourceChanged;
+						if (secondReady) {
+							currentM04Status = nextM04.status;
+							currentM04Read = nextM04.evidenceReturned === true;
+							currentKnowledgeExport = nextArchive.m04?.knowledgeExport ?? { state: "incomplete" };
+							currentReusableRefs = nextM04.evidenceReturned && currentKnowledgeExport.state === "complete" ?
+								(nextM04.adoptedExperienceRefs ?? []).filter(ref => (nextArchive.m04?.adoptedExperienceRefs ?? []).some(exported =>
+									exported.storeId === ref.storeId && exported.recordId === ref.recordId && exported.version === ref.version)) : [];
+							currentKnowledgeFile = existsSync(path.join(nextArchiveDir, "m04-adopted-knowledge.json")) ?
+								path.join(nextArchiveDir, "m04-adopted-knowledge.json") : undefined;
+						}
+						followOn = { state: "completed", iteration, goalRunId: secondGoal.runId,
+							taskId: secondTask.taskId, m07Outcome: secondFinished.outcome,
+							priorCandidateProvided: true, priorEvidenceProvided: true, adoptedRefsEligible: proposedRefs.length,
+							experienceSelectionStatus: selection.status, pinnedRefs, loadedExperience: Boolean(secondTask.experienceSelection?.loadedAt),
+							faithfulUse: "unknown", causalBenefit: "unknown", measuredComparison: comparison,
+							candidateSelected: promoted, selectedCandidateSource,
+							sourceChanged: followOnSourceChanged,
+							noChangeOutcome: followOnSourceChanged === false ? "identical-source-kept-previous" : null,
+							m04: nextM04,
+							knowledgeMode: pinnedRefs.length ? "m04-adopted-pinned" : "prior-artifact-only",
+							archiveTransportLayout: "prefixed-flat-index" };
+						followOnAttempts.push(followOn);
+						advancedThisIteration = true;
+						objectiveStopReason = "objective-reassessment-pending";
+						if (assessmentHistory.at(-1)?.iteration === iteration)
+							assessmentHistory[assessmentHistory.length - 1].stopReason = objectiveStopReason;
 					}
-					followOn = { state: "completed", goalRunId: secondGoal.runId, m07Outcome: secondFinished.outcome,
-						priorCandidateProvided: true, priorEvidenceProvided: true, adoptedRefsEligible: proposedRefs.length,
-						experienceSelectionStatus: selection.status, pinnedRefs, loadedExperience: Boolean(secondTask.experienceSelection?.loadedAt),
-						faithfulUse: "unknown", causalBenefit: "unknown", measuredComparison: comparison,
-						candidateSelected: selectedCandidateSource === "followon", selectedCandidateSource,
-						sourceChanged: followOnSourceChanged,
-						noChangeOutcome: followOnSourceChanged === false ? "identical-source-kept-previous" : null,
-						knowledgeMode: pinnedRefs.length ? "m04-adopted-pinned" : "prior-artifact-only",
-						archiveTransportLayout: "prefixed-flat-index" };
-				} catch (error) { followOn = { state: "failed", priorCandidateProvided: true,
-					failure: privateExceptionDiagnostic(error, runtimeKey), faithfulUse: "unknown", causalBenefit: "unknown" }; }
-			}
+				} catch (error) { objectiveStopReason = budget.snapshot().stopReason === "ceiling" ? "budget-boundary" :
+					abort.signal.aborted || Date.now() >= campaignStopAt ? "time-boundary" :
+					assessmentThisIteration ? "dispatch-failed" : "assessment-failed";
+					if (assessmentHistory.at(-1)?.iteration === iteration)
+						assessmentHistory[assessmentHistory.length - 1].stopReason = objectiveStopReason;
+					let failedAttemptArchive = "unavailable";
+					if (activeFollowOnGoalId) {
+						try {
+							const failedGoal = await controller.status(activeFollowOnGoalId);
+							const failedTask = failedGoal.tasks.find(item => item.taskId === activeFollowOnTaskId) ??
+								failedGoal.tasks.findLast(item => item.mode === "execute");
+							if (failedTask) {
+								activeFollowOnTaskId = failedTask.taskId;
+								const failedDir = path.join(campaignRoot, `iteration-${iteration}-archive`);
+								await archivePrivateM07Task({ goal: failedGoal, task: failedTask, destination: failedDir });
+								await exportPrefixedArchive(failedDir, outputDir, `iteration-${iteration}`);
+								failedAttemptArchive = `workflow-iteration-${iteration}-archive.json`;
+							}
+						} catch { statusArchiveFailure = "model-proposed-attempt-archive-failed"; }
+					}
+					followOn = { state: "failed", iteration, ...(activeFollowOnGoalId ? { goalRunId: activeFollowOnGoalId } : {}),
+						...(activeFollowOnTaskId ? { taskId: activeFollowOnTaskId } : {}),
+						archive: failedAttemptArchive, priorCandidateProvided: true,
+						failure: privateExceptionDiagnostic(error, runtimeKey), faithfulUse: "unknown", causalBenefit: "unknown" };
+					if (activeFollowOnGoalId) followOnAttempts.push(followOn);
+				}
+				return { advanced: advancedThisIteration, stopReason: objectiveStopReason,
+					evidenceRefs: latestAttemptEvidence.map(item => item.name) };
+				},
+			});
+			objectiveStopReason = loop.stopReason;
 			statusPhase = "workflow-finished";
 			const finalCandidateVerified = selectedCandidateSource !== "none" &&
 				finalArchive.controllerEvidence.reviewStatus === "accepted" &&
@@ -1007,10 +1228,29 @@ async function main() {
 			const durableKnowledge = knowledgeExport.state !== "incomplete" &&
 				(!m04.adoptedExperienceRefs?.length || knowledgeExport.state === "complete");
 			const followOnCompleted = followOn.state === "completed" && followOn.m07Outcome === "fulfilled";
-			const campaignOutcome = firstGoalReady && finalCandidateVerified && m04.status === "completed" && durableKnowledge &&
-				m04SelectedReadContractSatisfied && branchExerciseComplete &&
+			const boundedRunOutcome = firstGoalReady && finalCandidateVerified && m04.status === "completed" && durableKnowledge &&
+				m04SelectedReadContractSatisfied && currentM04Status === "completed" && currentM04Read &&
+				currentKnowledgeExport.state !== "incomplete" && branchExerciseComplete &&
 				followOnCompleted ? "fulfilled" : "partial";
-			await saveStatus({ outcome: campaignOutcome, m07Outcome: finished.outcome, taskStatus: task.status,
+			if (boundedRunOutcome === "partial" && objectiveStopReason === "bounded-run-incomplete" &&
+				budget.snapshot().stopReason === "ceiling")
+				objectiveStopReason = "budget-boundary";
+			const boundedRuns = [{ runId: runId!, outcome: finished.outcome ?? "unknown",
+				...(firstGoalReady ? { selectedTaskId: selectedTask.taskId } : {}) },
+				...followOnAttempts.filter(item => typeof item.goalRunId === "string").map(item => ({
+					runId: String(item.goalRunId), outcome: String(item.m07Outcome ?? "unknown"),
+					...(item.candidateSelected === true ? { selectedTaskId: String(item.taskId) } : {}) }))];
+			const objectiveCheckpoint = objectiveProgress(originalObjective, { boundedRuns,
+				selectedArtifacts: finalCandidateVerified ? ["candidate.cpp", "verification.json", "workflow-archive.json"] : [],
+				...(objectiveAssessment ? { assessment: objectiveAssessment } : {}), assessmentHistory,
+				nextTaskDispatched: latestAssessmentAdvanced, stopReason: objectiveStopReason });
+			await writeObjectiveProgress(objectiveCheckpointFile, objectiveCheckpoint);
+			const campaignOutcome = objectiveCheckpoint.objectiveOutcome;
+			await saveStatus({ outcome: campaignOutcome, boundedRunOutcome,
+				originalObjective: { id: originalObjective.id, outcome: objectiveCheckpoint.objectiveOutcome,
+					stopReason: objectiveCheckpoint.stopReason, checkpointFile: "objective-checkpoint.json",
+					goalSource: originalObjective.goalSource, continuation: objectiveCheckpoint.continuation.mode },
+				m07Outcome: finished.outcome, taskStatus: task.status,
 				loopStopReason: task.loopStopReason, taskTelemetry: statusTaskTelemetry,
 				credentialProbe: statusCredentialProbe, sdkAuthSource: statusAuthSource,
 				sdkAuthMatch: statusSdkAuthMatch,
@@ -1022,10 +1262,12 @@ async function main() {
 					m04AdoptedExperienceCount, m04AdoptionReadContractSatisfied,
 					m04SelectedReadContractSatisfied },
 				branch: branchState, branchExerciseComplete, firstGoalReady,
-				followOn, selectedCandidateSource, finalCandidateVerified,
+				followOn, followOnAttempts, objectiveLoop: loop, selectedCandidateSource, finalCandidateVerified,
+				...(statusArchiveFailure ? { archiveFailure: statusArchiveFailure } : {}),
 				independentValidation: finalCandidateVerified ? "bounded-workflow-checker-passed" : "not-complete",
 				validationLimit: "Finite bounded cases are not exhaustive correctness or global-optimality proof" });
-			console.log(JSON.stringify({ status: "private-campaign-complete", outcome: campaignOutcome, budget: budget.snapshot() }));
+			console.log(JSON.stringify({ status: "private-campaign-bounded-run-ended", outcome: campaignOutcome,
+				boundedRunOutcome, stopReason: objectiveCheckpoint.stopReason, budget: budget.snapshot() }));
 			if (campaignOutcome !== "fulfilled") process.exitCode = 1;
 		} finally { clearTimeout(timer); }
 	} finally {

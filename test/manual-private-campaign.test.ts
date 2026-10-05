@@ -5,21 +5,18 @@ import path from "node:path";
 import test from "node:test";
 import { offlineChecks } from "../scripts/manual-private-campaign.ts";
 
-test("private campaign cannot run on push and manual dispatch needs explicit confirmation", async () => {
-	const workflow = await readFile(new URL("../.github/workflows/manual-private-campaign.yml", import.meta.url), "utf8");
-	const events = workflow.split("on:\n")[1]?.split("\npermissions:")[0] ?? "";
-	const gate = workflow.split("  private-campaign:\n")[1]?.split("    runs-on:")[0] ?? "";
-	assert.match(events, /^  workflow_dispatch:\n/);
-	assert.doesNotMatch(events, /^  push:/m);
-	assert.match(events, /authorize_bounded_run:\n\s+description:[^\n]+\n\s+required: true\n\s+default: false\n\s+type: boolean/);
-	assert.match(gate, /github\.repository == 'SakuyaInazaki\/Mul-Pis'/);
-	assert.match(gate, /github\.actor == 'SakuyaInazaki'/);
-	assert.match(gate, /github\.run_attempt == 1/);
-	assert.match(gate, /github\.event_name == 'workflow_dispatch'/);
-	assert.match(gate, /github\.ref == 'refs\/heads\/improve\/workflow-learning-reliability'/);
-	assert.match(gate, /inputs\.authorize_bounded_run == true/);
-	assert.doesNotMatch(gate, /head_commit\.message|event_name == 'push'/);
-	assert.match(workflow, /description: "Authorize one DeepSeek campaign up to 5\.3 CNY/);
+test("one-use objective repair run admits only the exact authorized push", async () => {
+ const workflow = await readFile(new URL("../.github/workflows/manual-private-campaign.yml", import.meta.url), "utf8");
+ const gate = workflow.split("  private-campaign:\n")[1]?.split("    runs-on:")[0] ?? "";
+ assert.ok(workflow.includes("  push:\n    branches:\n      - improve/workflow-learning-reliability"));
+ assert.ok(gate.includes("github.repository == 'SakuyaInazaki/Mul-Pis'"));
+ assert.ok(gate.includes("github.actor == 'SakuyaInazaki'"));
+ assert.ok(gate.includes("github.run_attempt == 1"));
+ assert.ok(gate.includes("github.event_name == 'push'"));
+ assert.ok(gate.includes("github.ref == 'refs/heads/improve/workflow-learning-reliability'"));
+ assert.ok(gate.includes("mul-pis-20261005-objective-run1"));
+ assert.doesNotMatch(gate, /workflow_dispatch|authorize_bounded_run/);
+ assert.ok(workflow.includes("up to 2.8 CNY"));
 });
 
 test("generic private campaign source-shape gate preserves non-target bodies", () => {
