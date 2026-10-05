@@ -12,6 +12,7 @@
 import { existsSync } from "node:fs";
 import { mkdir, readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
+import { linkedEvidence, openBoundedSession } from "../context/boundary.ts";
 import { buildM05Message, problemBlock, systemPromptFor } from "../prompts.ts";
 import { listSources, readIndex, registerSource, SearchLog, type SourceFile, type SourceKind } from "../references.ts";
 import type { CustomToolSpec, ToolCallRecord } from "../runner/types.ts";
@@ -20,7 +21,7 @@ import { defaultBackend } from "../tools/backend.ts";
 import { renderPageTool } from "../tools/pagetool.ts";
 import { HarnessError, type StageRunRecord } from "../types.ts";
 import { writeFileAtomic } from "../workspace.ts";
-import { loadProblemMaterials, recordSession, relPath, sessionSpec, withRun, type StageContext } from "./context.ts";
+import { loadProblemMaterials, relPath, sessionSpec, withRun, type StageContext } from "./context.ts";
 
 export interface M05Options {
 	/** 本轮知识需求 (the placeholder of P05). Defaults to a generic gap-driven goal. */
@@ -405,11 +406,10 @@ export async function runM05(ctx: StageContext, options: M05Options = {}): Promi
 			const pack = await ctx.store.buildPack({ purpose: `M05 知识获取：${goal.slice(0, 60)}`, includeOpenQuestions: true, types: ["C", "K", "Q", "X"], maxChars: 30_000 });
 			const message = await buildM05Message({ goal, problem: problemBlock(materials), knowledgePack: pack.included.length ? pack.markdown : undefined, indexText: indexBefore, providerNames: backend.providers.map((p) => p.name), toolNames: tools.map((t) => t.name) });
 			await ctx.ws.writeOutput(record, "message.md", message, "发送给获取会话的完整消息");
-			const handle = await ctx.runner.create(sessionSpec(ctx, "M05", "acquisition", systemPromptFor("acquisition"), { kind: "custom", tools }));
+			const handle = await openBoundedSession(ctx.runner, record, { mode: "fresh", intent: "new-work", reason: "A new M05 acquisition run receives only its declared research need and explicit project materials", evidence: linkedEvidence(record.inputs), spec: sessionSpec(ctx, "M05", "acquisition", systemPromptFor("acquisition"), { kind: "custom", tools }) }, () => ctx.ws.writeRun(record));
 			let report: string;
 			let toolLog: ToolCallRecord[];
 			try {
-				recordSession(record, handle);
 				const turn = await handle.prompt(message);
 				report = turn.text;
 				toolLog = handle.toolLog();

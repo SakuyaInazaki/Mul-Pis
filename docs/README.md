@@ -14,6 +14,7 @@
 ## 实现
 
 - [`implementation/design.md`](implementation/design.md)：研究 harness 的架构决定、阶段到会话的映射、控制器自写文本清单、知识库语义、未决与运行入口。
+- [`implementation/context-boundaries.md`](implementation/context-boundaries.md)：独立于角色的 fresh/continue/fork 上下文决策、真实 Pi 谱系、能力与原始证据边界。
 - [`implementation/rsi.md`](implementation/rsi.md)：独立的预算与证据交接策略改进外环、自动晋级/回退语义及尚未验证的 RSI 边界。
 
 ## 来源与复现

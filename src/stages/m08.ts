@@ -1,9 +1,10 @@
 import { cp, lstat, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { openBoundedSession } from "../context/boundary.ts";
 import { loadPrompt, section, systemPromptFor } from "../prompts.ts";
 import { renderPageTool } from "../tools/pagetool.ts";
 import { HarnessError, type Role, type StageRunRecord } from "../types.ts";
-import { recordSession, sessionSpec, withRun, type StageContext } from "./context.ts";
+import { sessionSpec, withRun, type StageContext } from "./context.ts";
 import { freezeArtifacts, type ArtifactSelection, type FrozenArtifactManifest } from "./artifacts.ts";
 
 export type M08ReviewMode = "read-only" | "execute";
@@ -94,8 +95,8 @@ async function runMember(ctx: StageContext, record: StageRunRecord, manifest: Fr
 			await cp(manifest.rootDir, work, { recursive: true, force: false, errorOnExist: true });
 			tools = { kind: "execution" as const, root: work, tools: ["read", "write", "edit", "bash"] as Array<"read" | "write" | "edit" | "bash"> };
 			message += `\n\n本任务获准在独立核验副本 ${work} 内按需运行检查；不得修改正式固定材料。没有执行的检查必须写为未执行。`;
-			const execHandle = await ctx.runner.create(sessionSpec(ctx, `M08-${role}-${id}`, actualRole, systemPromptFor(actualRole, role === "selfcheck" ? "你执行主 Agent 拆分的 P08M 独立自查，只报告有材料依据的发现、实际读取范围和未决。" : undefined), tools));
-			handle = execHandle; recordSession(record, execHandle);
+			const execHandle = await openBoundedSession(ctx.runner, record, { mode: "fresh", intent: "independent-judgment", reason: `M08 ${role} ${id} independently checks the fixed version in a separate execution copy`, evidence: [{ version: 1, label: "M08 固定材料", path: manifest.rootDir, status: "frozen-copy", sourceVersion: record.runId }], spec: sessionSpec(ctx, `M08-${role}-${id}`, actualRole, systemPromptFor(actualRole, role === "selfcheck" ? "你执行主 Agent 拆分的 P08M 独立自查，只报告有材料依据的发现、实际读取范围和未决。" : undefined), tools) }, () => ctx.ws.writeRun(record));
+			handle = execHandle;
 			const turn = await execHandle.prompt(message);
 			result.report = turn.text; result.coverage = execHandle.readCoverage();
 			await assertTreeBytes(manifest.rootDir, before);
@@ -103,8 +104,7 @@ async function runMember(ctx: StageContext, record: StageRunRecord, manifest: Fr
 			result.status = "completed";
 			return result;
 		} else tools = { kind: "read-dir" as const, root: manifest.rootDir, toolName: "review_material_read", extraTools: [page] };
-		handle = await ctx.runner.create(sessionSpec(ctx, `M08-${role}-${id}`, actualRole, systemPromptFor(actualRole, role === "selfcheck" ? "你执行主 Agent 拆分的 P08M 独立自查，只报告有材料依据的发现、实际读取范围和未决。" : undefined), tools));
-		recordSession(record, handle);
+		handle = await openBoundedSession(ctx.runner, record, { mode: "fresh", intent: "independent-judgment", reason: `M08 ${role} ${id} independently reviews the same fixed materials without inheriting another member's history`, evidence: [{ version: 1, label: "M08 固定材料", path: manifest.rootDir, status: "frozen-copy", sourceVersion: record.runId }], spec: sessionSpec(ctx, `M08-${role}-${id}`, actualRole, systemPromptFor(actualRole, role === "selfcheck" ? "你执行主 Agent 拆分的 P08M 独立自查，只报告有材料依据的发现、实际读取范围和未决。" : undefined), tools) }, () => ctx.ws.writeRun(record));
 		const turn = await handle.prompt(message);
 		result.report = turn.text;
 		result.coverage = handle.readCoverage();

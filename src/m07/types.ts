@@ -1,4 +1,4 @@
-import type { SessionRef } from "../runner/types.ts";
+import type { SessionCheckpoint, SessionRef } from "../runner/types.ts";
 import type { BudgetPolicy } from "../improvement/policy.ts";
 import type { KnowledgeRef } from "../knowledge/types.ts";
 import type { ExperienceSelection } from "../knowledge/experience-index.ts";
@@ -44,11 +44,33 @@ export interface TaskSpecInput {
 	executionLoop?: { maxRounds: number; deadlineAt: string };
 	/** Expected JSON output carrying a candidate lesson to M04, never an adopted record. */
 	lessonDeltaOutput?: string;
+	/** Explicit competitive continuation from a frozen task leaf. Role remains execution. */
+	context?: { mode: "fork"; parentRunId: string; parentTaskId: string; checkpointId: string };
+}
+
+export interface M07BranchSourceV1 {
+	version: 1;
+	checkpoint: SessionCheckpoint;
+	manifestPath: string;
+	workSnapshotRoot: string;
+	problemSnapshotCopy: string;
+}
+
+export interface M07BranchSelectionV1 {
+	version: 1;
+	parentTaskId: string;
+	selectedTaskId?: string;
+	rationale: string;
+	selectedAt: string;
+	/** Compact controller facts only; complete failures, paths and evidence remain on tasks. */
+	candidates: Array<{ taskId: string; status: M07TaskStatus; checks: Array<{ criterion: string; result: CheckResult }> }>;
 }
 
 export interface M07ExecutionRound {
 	index: number;
 	operationId: string;
+	/** New round records state the real boundary; optional when reading legacy logs. */
+	builderContext?: { mode: "fresh" | "continue" | "fork"; reason: string };
 	builderReportPath: string;
 	reviewerSnapshotPath?: string;
 	reviewerReportPath?: string;
@@ -171,6 +193,9 @@ export interface M07TaskRecord extends TaskSpecInput {
 	toolLog: unknown[];
 	executionRounds?: M07ExecutionRound[];
 	loopStopReason?: "ready" | "max-rounds" | "deadline" | "replan" | "blocked" | "reviewer-invalid";
+	/** Available only after a stable task completed and its evidence was frozen. */
+	branchSource?: M07BranchSourceV1;
+	branchUnavailableReason?: string;
 	planCopy?: string;
 	knowledgeSnapshot?: string;
 	m04BaselineRunId?: string;
@@ -233,6 +258,7 @@ export interface CurrentGoal {
 	checkpoints?: M07CheckpointRecord[];
 	/** Frozen checkpoint snapshot only; omitted task evidence remains in the live goal, outside M04's read grant. */
 	checkpointScope?: { selectedTaskIds: string[]; omittedTaskIds: string[] };
+	branchSelections?: M07BranchSelectionV1[];
 	/** Controller-frozen method body. Later pointer changes never hot-replace it. */
 	workflowMethod?: { versionId: string; artifact: M07WorkflowStrategyV1; requiredExperienceRefs: ExperienceRequirementV1[]; requiredKnowledgeRefs: KnowledgeRef[] };
 	tasks: M07TaskRecord[];
@@ -254,6 +280,8 @@ export interface M07Controller {
 	plan(runId: string, plan: string, options?: { refreshBaseline?: boolean; checkpointId?: string; m04RunId?: string }): Promise<CurrentGoal>;
 	checkpoint(runId: string, options?: { taskIds?: string[] }): Promise<M07CheckpointRecord>;
 	delegate(runId: string, task: TaskSpecInput): Promise<M07TaskRecord>;
+	/** Select among reviewed candidates. No selection is a valid partial/blocked outcome. */
+	selectBranch(runId: string, input: { parentTaskId: string; selectedTaskId?: string; rationale: string }): Promise<CurrentGoal>;
 	review(runId: string, input: TaskReviewInput): Promise<M07TaskRecord>;
 	decision(runId: string, input: DecisionInput): Promise<CurrentGoal>;
 	finish(runId: string, input: FinishInput): Promise<CurrentGoal>;

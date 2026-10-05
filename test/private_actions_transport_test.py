@@ -126,6 +126,12 @@ class EncryptTests(unittest.TestCase):
             (results / "candidate.cpp").write_bytes(b"secret candidate")
             (results / "lesson-delta.json").write_bytes(b'{"action":"none"}')
             (results / "workflow-archive.json").write_bytes(b'{"trustedAdoption":false}')
+            (results / "round-1-reviewer-feedback.txt").write_bytes(b"Full explicit reviewer rationale, beyond a short index.")
+            (results / "review-decision.json").write_bytes(b'{"status":"rejected","reason":"Observed failure"}')
+            (results / "context-lineage.json").write_bytes(b'{"version":1,"branchCount":2}')
+            (results / "initial-m04-adopted-knowledge.json").write_bytes(b'{"version":1,"state":"complete"}')
+            (results / "branch-parent-round-1-reviewer-feedback.txt").write_bytes(b"Parent rationale")
+            (results / "branch-child-round-1-reviewer-feedback.txt").write_bytes(b"Child rationale")
             (results / "campaign-status.json").write_bytes(b'{"status":"complete"}')
             (results / "ignored.txt").write_bytes(b"must be excluded")
             public = root / "public.pem"
@@ -145,7 +151,7 @@ class EncryptTests(unittest.TestCase):
             plain = AESGCM(key).decrypt(base64.b64decode(envelope["nonce_b64"]),
                 base64.b64decode(envelope["ciphertext_b64"]), aad)
             with tarfile.open(fileobj=io.BytesIO(plain), mode="r:") as tar:
-                self.assertEqual(sorted(tar.getnames()), ["campaign-status.json", "candidate.cpp", "lesson-delta.json", "workflow-archive.json"])
+                self.assertEqual(sorted(tar.getnames()), ["branch-child-round-1-reviewer-feedback.txt", "branch-parent-round-1-reviewer-feedback.txt", "campaign-status.json", "candidate.cpp", "context-lineage.json", "initial-m04-adopted-knowledge.json", "lesson-delta.json", "review-decision.json", "round-1-reviewer-feedback.txt", "workflow-archive.json"])
                 self.assertEqual(tar.extractfile("candidate.cpp").read(), b"secret candidate")
             with self.assertRaises(Exception):
                 AESGCM(key).decrypt(base64.b64decode(envelope["nonce_b64"]),
@@ -158,9 +164,28 @@ class EncryptTests(unittest.TestCase):
             self.assertEqual((recovered / "candidate.cpp").read_bytes(), b"secret candidate")
             self.assertEqual((recovered / "lesson-delta.json").read_bytes(), b'{"action":"none"}')
             self.assertEqual((recovered / "workflow-archive.json").read_bytes(), b'{"trustedAdoption":false}')
+            self.assertEqual((recovered / "round-1-reviewer-feedback.txt").read_bytes(), b"Full explicit reviewer rationale, beyond a short index.")
+            self.assertEqual((recovered / "review-decision.json").read_bytes(), b'{"status":"rejected","reason":"Observed failure"}')
+            self.assertEqual((recovered / "context-lineage.json").read_bytes(), b'{"version":1,"branchCount":2}')
+            self.assertEqual((recovered / "initial-m04-adopted-knowledge.json").read_bytes(), b'{"version":1,"state":"complete"}')
+            self.assertEqual((recovered / "branch-parent-round-1-reviewer-feedback.txt").read_bytes(), b"Parent rationale")
+            self.assertEqual((recovered / "branch-child-round-1-reviewer-feedback.txt").read_bytes(), b"Child rationale")
             self.assertFalse((recovered / "ignored.txt").exists())
             self.assertEqual(recovered.stat().st_mode & 0o777, 0o700)
             self.assertEqual((recovered / "candidate.cpp").stat().st_mode & 0o777, 0o600)
+
+    def test_reviewer_text_cannot_exceed_archive_hard_limit_in_transport(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results = root / "results"
+            results.mkdir()
+            (results / "round-1-reviewer-feedback.txt").write_bytes(b"A" * 512_001)
+            public = root / "public.pem"
+            public.write_bytes(self.private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo))
+            with self.assertRaises(transport.TransportError):
+                transport.encrypt_results(results, public, root / "out.enc.json", self.metadata, self.fingerprint)
 
     def test_rejects_symlink_result_and_small_rsa_key(self):
         with tempfile.TemporaryDirectory() as tmp:

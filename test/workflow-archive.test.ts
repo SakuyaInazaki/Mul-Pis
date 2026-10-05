@@ -98,6 +98,8 @@ test("private M07 archive keeps each bounded round's source and host verificatio
 		const archive = await archivePrivateM07Task({ goal, task, destination });
 		assert.equal(archive.controllerEvidence.rounds.length, 2);
 		assert.equal(archive.controllerEvidence.rounds[0].feedback, "Fix the first round.");
+		assert.equal(await readFile(path.join(destination, "round-1-reviewer-feedback.txt"), "utf8"), "Fix the first round.");
+		assert.equal((await loadPrivateM07Archive(destination)).roundFiles[0].feedback, path.join(destination, "round-1-reviewer-feedback.txt"));
 		assert.equal(archive.controllerEvidence.rounds[0].candidate.status, "present");
 		assert.equal(await readFile(path.join(destination, "round-1-candidate.cpp"), "utf8"), "round 1 source\n");
 		assert.equal(await readFile(path.join(destination, "round-2-candidate.cpp"), "utf8"), "round 2 source\n");
@@ -111,6 +113,72 @@ test("private M07 archive keeps each bounded round's source and host verificatio
 		assert.equal(checked.originalHostComparison.medianRatio, 1.25);
 		assert.deepEqual(checked.priorCandidateComparison, { state: "unavailable" });
 		assert.doesNotMatch(verification, /private|sensitive-command-arg|stdout|stderr|args/);
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("private archive retains full long reviewer rationale and explicit controller decision as bounded artifacts", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-review-evidence-"));
+	try {
+		const workDir = path.join(root, "task", "work"), destination = path.join(root, "returned");
+		await mkdir(workDir, { recursive: true });
+		const feedback = Array.from({ length: 35 }, (_, index) => `Reason ${index + 1}: inspect the original candidate and check the actual measured row before accepting.`).join("\n");
+		const reviewerReport = `Reviewer verdict and full explicit rationale:\n${feedback}\n`;
+		const reviewerReportPath = path.join(root, "task", "round-1-reviewer.md");
+		await writeFile(reviewerReportPath, reviewerReport);
+		const task = { taskId: "T001", workDir, status: "rejected", executionRounds: [
+			{ index: 1, verdict: "revise", feedback, reviewerReportPath },
+		], review: { at: new Date().toISOString(), frozenReportPath: path.join(root, "task", "report.md"),
+			checks: [{ criterion: "real check", result: "failed", evidence: [] }], artifacts: [],
+			failures: ["Independent measurement did not cover the second target."], unexecuted: ["4-thread replay"],
+			limitations: ["Measurement must be serialized to avoid contention."],
+			independentCheck: { taskId: "T002", report: path.join(root, "task", "independent.md"), disposition: "Reject the candidate pending a full retry." } } } as unknown as M07TaskRecord;
+		const goal = { runId: "run-example", lifecycle: "active", tasks: [task] } as CurrentGoal;
+		const archive = await archivePrivateM07Task({ goal, task, destination });
+		assert.equal(archive.controllerEvidence.rounds[0].feedbackStatus, "present");
+		assert.equal(archive.controllerEvidence.rounds[0].feedback, undefined, "short inline preview is not mistaken for the full rationale");
+		assert.equal(await readFile(path.join(destination, "round-1-reviewer-feedback.txt"), "utf8"), feedback);
+		assert.equal(await readFile(path.join(destination, "round-1-reviewer-report.md"), "utf8"), reviewerReport);
+		const decision = JSON.parse(await readFile(path.join(destination, "review-decision.json"), "utf8"));
+		assert.deepEqual(decision.failures, task.review!.failures);
+		assert.deepEqual(decision.unexecuted, task.review!.unexecuted);
+		assert.equal(decision.independentCheck.disposition, task.review!.independentCheck!.disposition);
+		const loaded = await loadPrivateM07Archive(destination);
+		assert.equal(loaded.reviewDecision, path.join(destination, "review-decision.json"));
+		assert.equal(loaded.roundFiles[0].reviewerReport, path.join(destination, "round-1-reviewer-report.md"));
+		await rm(path.join(destination, "round-1-reviewer-feedback.txt"));
+		await assert.rejects(loadPrivateM07Archive(destination), /feedback file is missing or changed/);
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("private review archive redacts credential values without discarding surrounding rationale", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-review-redaction-"));
+	try {
+		const workDir = path.join(root, "task", "work"), destination = path.join(root, "returned");
+		await mkdir(workDir, { recursive: true });
+		const task = { taskId: "T001", workDir, status: "returned", executionRounds: [
+			{ index: 1, verdict: "revise", feedback: 'The independent check failed. api_key=sk-AbCdEfGhIjKlMnOp; {"password":"hidden-value"}; Authorization: Basic dXNlcjpwYXNz; run it again with a safe fixture.' },
+		] } as M07TaskRecord;
+		const archive = await archivePrivateM07Task({ goal: { runId: "run-example", lifecycle: "active", tasks: [task] } as CurrentGoal, task, destination });
+		const saved = await readFile(path.join(destination, "round-1-reviewer-feedback.txt"), "utf8");
+		assert.match(saved, /independent check failed/);
+		assert.match(saved, /safe fixture/);
+		assert.doesNotMatch(saved, /sk-AbCdEfGhIjKlMnOp/);
+		assert.doesNotMatch(saved, /hidden-value/);
+		assert.doesNotMatch(saved, /dXNlcjpwYXNz/);
+		assert.equal(archive.controllerEvidence.rounds[0].feedbackRedacted, true);
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("review text beyond the private archive hard limit fails visibly instead of reporting a normal exclusion", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-review-limit-"));
+	try {
+		const workDir = path.join(root, "task", "work"), destination = path.join(root, "returned");
+		await mkdir(workDir, { recursive: true });
+		const task = { taskId: "T001", workDir, status: "returned", executionRounds: [
+			{ index: 1, verdict: "revise", feedback: "A".repeat(512_001) },
+		] } as M07TaskRecord;
+		await assert.rejects(archivePrivateM07Task({ goal: { runId: "run-example", lifecycle: "active", tasks: [task] } as CurrentGoal, task, destination }), /hard limit/);
+		assert.equal(existsSync(path.join(destination, "workflow-archive.json")), false);
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
 

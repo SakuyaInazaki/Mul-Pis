@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       authorize_bounded_run:
-        description: "Authorize one DeepSeek campaign up to 21 CNY after checking prior charges"
+        description: "Authorize one DeepSeek campaign up to 7.5 CNY after checking prior charges"
         required: true
         default: false
         type: boolean
@@ -27,7 +27,7 @@ jobs:
       github.run_attempt == 1 &&
       github.event_name == 'push' &&
       github.ref == 'refs/heads/improve/workflow-learning-reliability' &&
-      github.event.head_commit.message == 'Resume bounded private M07 campaign (mul-pis-20261005-lab-resume2)'
+      github.event.head_commit.message == 'Run context-boundary lab workflow (mul-pis-20261005-context-run1)'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

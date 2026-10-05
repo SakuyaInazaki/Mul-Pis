@@ -10,9 +10,9 @@ test("one-use campaign push guard cannot also dispatch a second paid run manuall
 	const gate = workflow.split("  private-campaign:\n")[1]?.split("    runs-on:")[0] ?? "";
 	assert.match(workflow, /on:\n  push:\n    branches:\n      - improve\/workflow-learning-reliability/);
 	assert.match(gate, /github\.event_name == 'push'/);
-	assert.match(gate, /mul-pis-20261005-lab-resume2/);
-	assert.doesNotMatch(gate, /workflow_dispatch|authorize_bounded_run|lab-resume1/);
-	assert.match(workflow, /description: "Authorize one DeepSeek campaign up to 21 CNY/);
+	assert.match(gate, /mul-pis-20261005-context-run1/);
+	assert.doesNotMatch(gate, /workflow_dispatch|authorize_bounded_run|lab-resume1|lab-resume2/);
+	assert.match(workflow, /description: "Authorize one DeepSeek campaign up to 7\.5 CNY/);
 });
 
 test("generic private campaign source-shape gate preserves non-target bodies", () => {
@@ -28,6 +28,10 @@ int main() { return check() ? 0 : 1; }
 		.replace("static void targetA() { baseline(); }", "static void targetA() {\n#pragma omp parallel\n { } }")
 		.replace("static void targetB() { baseline(); }", "static void targetB() {\n#pragma omp parallel for\n for (int i = 0; i < 1; ++i) { } }");
 	assert.equal(offlineChecks.sourceShape(original, candidate).ok, true);
+	const conditional = candidate.replace("#pragma omp parallel", "#ifdef _OPENMP\n#pragma omp parallel\n#else\n (void)0;\n#endif");
+	assert.equal(offlineChecks.sourceShape(original, conditional).ok, true);
+	assert.equal(offlineChecks.sourceShape(original, conditional.replace("#endif", "")).ok, false);
+	assert.equal(offlineChecks.sourceShape(original, conditional.replace("#ifdef _OPENMP", "#if 1")).ok, false);
 	assert.equal(offlineChecks.sourceShape(original, candidate.replace("int x = 1", "int x = 2")).ok, false);
 	assert.equal(offlineChecks.sourceShape(original, original).ok, false);
 	assert.equal(offlineChecks.sourceShape(original, candidate.replace("#pragma omp parallel", "#define checker_run main\n#pragma omp parallel")).ok, false);
@@ -46,6 +50,51 @@ test("host checker protocol rejects extra output and candidate-reported timing c
 	assert.equal(offlineChecks.compareCandidateTimings(baseline, spoof).medianRatio, 1);
 });
 
+test("same-goal branch selection keeps the verified faster parent when the fork regresses", () => {
+	assert.equal(offlineChecks.chooseForkWinner(true, true, true, { state: "measured", medianRatio: 0.9, minRatio: 0.8 }), "parent");
+	assert.equal(offlineChecks.chooseForkWinner(true, true, true, { state: "measured", medianRatio: 1.08, minRatio: 0.91 }), "parent");
+	assert.equal(offlineChecks.chooseForkWinner(true, true, true, { state: "measured", medianRatio: 1.08, minRatio: 0.97 }), "fork");
+	assert.equal(offlineChecks.chooseForkWinner(true, true, false, { state: "measured", medianRatio: 1.08, minRatio: 0.97 }), "parent");
+	assert.equal(offlineChecks.chooseForkWinner(false, true, false, { state: "unavailable" }), "fork");
+	assert.equal(offlineChecks.chooseForkWinner(false, false, true, { state: "unavailable" }), undefined);
+});
+
+test("a real fork with no accepted M07 winner cannot unlock a fulfilled follow-on", () => {
+	assert.equal(offlineChecks.firstM07Accepted(false, "partial"), false);
+	assert.equal(offlineChecks.firstM07Accepted(false, "fulfilled"), false);
+	assert.equal(offlineChecks.firstM07Accepted(true, "partial"), false);
+	assert.equal(offlineChecks.firstM07Accepted(true, "fulfilled"), true);
+});
+
+test("fork provenance requires a committed child receipt bound to the frozen parent leaf", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-fork-receipt-fixture-"));
+	try {
+		const file = path.join(root, "lineage.json");
+		const checkpoint = { id: "checkpoint-a", leafId: "leaf-a", sourceSessionId: "session-parent",
+			model: "deepseek/deepseek-flash:low" } as any;
+		await writeFile(file, JSON.stringify({ version: 1, state: "committed", intent: "branch-exploration", checkpoint,
+			parent: { sessionId: "session-parent", leafId: "leaf-a" }, child: { sessionId: "session-child" },
+			evidenceBindings: [{ status: "frozen-copy", sourceVersion: checkpoint.id }],
+			workspaceBinding: { version: 1, files: [{}] },
+			inheritedUsageBilled: false }));
+		assert.equal(await offlineChecks.forkReceiptMatches(file, checkpoint, "session-child"), true);
+		const summary = await offlineChecks.contextLineageSummary(file, checkpoint, "session-child", checkpoint.model);
+		assert.equal(summary.state, "verified");
+		assert.equal(summary.evidenceBindingCount, 1);
+		assert.equal(summary.workspaceBindingFileCount, 1);
+		assert.equal(JSON.stringify(summary).includes("sourcePath"), false);
+		assert.equal(await offlineChecks.forkReceiptMatches(file, checkpoint, "session-other"), false);
+		await writeFile(file, JSON.stringify({ version: 1, state: "committed", intent: "causal-continuation", checkpoint,
+			parent: { sessionId: "session-parent", leafId: "leaf-a" }, child: { sessionId: "session-child" },
+			inheritedUsageBilled: false }));
+		assert.equal(await offlineChecks.forkReceiptMatches(file, checkpoint, "session-child"), false);
+		await writeFile(file, JSON.stringify({ version: 1, state: "committed", intent: "branch-exploration", checkpoint,
+			parent: { sessionId: "session-other", leafId: "leaf-a" }, child: { sessionId: "session-child" },
+			inheritedUsageBilled: false }));
+		assert.equal(await offlineChecks.forkReceiptMatches(file, checkpoint, "session-child"), false);
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("prefixed archive references its transported files and fallback keeps promoted canonical candidate", async () => {
 	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-flat-archive-fixture-"));
 	const source = path.join(root, "source"), output = path.join(root, "output");
@@ -53,19 +102,65 @@ test("prefixed archive references its transported files and fallback keeps promo
 		await mkdir(source); await mkdir(output);
 		await writeFile(path.join(source, "candidate.cpp"), "// second candidate\n");
 		await writeFile(path.join(source, "round-1-candidate.cpp"), "// second round\n");
+		await writeFile(path.join(source, "round-1-reviewer-feedback.txt"), "bounded feedback\n");
+		await writeFile(path.join(source, "round-1-reviewer-report.md"), "bounded reviewer report\n");
+		await writeFile(path.join(source, "review-decision.json"), "{}\n");
+		await writeFile(path.join(source, "m04-adopted-knowledge.json"), "{}\n");
 		await writeFile(path.join(source, "workflow-archive.json"), JSON.stringify({
 			files: [{ name: "candidate.cpp", status: "present" }],
-			controllerEvidence: { rounds: [{ candidate: { file: "round-1-candidate.cpp" }, verification: { status: "missing" } }] },
+			controllerEvidence: { rounds: [{ candidate: { file: "round-1-candidate.cpp" }, verification: { status: "missing" },
+				feedbackFile: "round-1-reviewer-feedback.txt", reviewerReport: { file: "round-1-reviewer-report.md" } }],
+				reviewDecision: { file: "review-decision.json" } },
+			m04: { knowledgeExport: { state: "complete", file: "m04-adopted-knowledge.json" } },
 		}));
 		await offlineChecks.exportPrefixedArchive(source, output, "followon");
 		const index = JSON.parse(await readFile(path.join(output, "workflow-followon-archive.json"), "utf8"));
 		assert.equal(index.files[0].name, "followon-candidate.cpp");
 		assert.equal(index.controllerEvidence.rounds[0].candidate.file, "followon-round-1-candidate.cpp");
+		assert.equal(index.controllerEvidence.rounds[0].feedbackFile, "followon-round-1-reviewer-feedback.txt");
+		assert.equal(index.controllerEvidence.rounds[0].reviewerReport.file, "followon-round-1-reviewer-report.md");
+		assert.equal(index.controllerEvidence.reviewDecision.file, "followon-review-decision.json");
+		assert.equal(await readFile(path.join(output, "followon-round-1-reviewer-feedback.txt"), "utf8"), "bounded feedback\n");
+		await offlineChecks.exportPrefixedArchive(source, output, "initial");
+		const initialIndex = JSON.parse(await readFile(path.join(output, "workflow-initial-archive.json"), "utf8"));
+		assert.equal(initialIndex.m04.knowledgeExport.file, "initial-m04-adopted-knowledge.json");
+		assert.equal(await readFile(path.join(output, "initial-m04-adopted-knowledge.json"), "utf8"), "{}\n");
 		assert.equal(index.transportLayout.defaultArchiveLoaderCompatible, false);
 		await writeFile(path.join(output, "candidate.cpp"), "// promoted second candidate\n");
 		await writeFile(path.join(output, "workflow-archive.json"), "{}\n");
 		await offlineChecks.preserveCandidate({} as any, "R001", output);
 		assert.equal(await readFile(path.join(output, "candidate.cpp"), "utf8"), "// promoted second candidate\n");
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("fallback archive failure is observable before private workspace cleanup", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-fallback-archive-fixture-"));
+	try {
+		const workDir = path.join(root, "work"), output = path.join(root, "output");
+		await mkdir(workDir); await mkdir(output);
+		await writeFile(path.join(root, "goal.json"), JSON.stringify({ runId: "run-example", lifecycle: "active", tasks: [{
+			taskId: "T001", mode: "execute", workDir, status: "returned",
+			executionRounds: Array.from({ length: 9 }, (_, index) => ({ index: index + 1 })),
+		}] }));
+		await assert.rejects(offlineChecks.preserveCandidate({ runDir: () => root } as any, "run-example", output),
+			/too many execution rounds/);
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("fallback archive retains both settled same-goal candidate files", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-fallback-pair-fixture-"));
+	try {
+		const output = path.join(root, "output"); await mkdir(output);
+		const tasks = [];
+		for (const [index, text] of ["parent", "child"].entries()) {
+			const workDir = path.join(root, `work-${index}`); await mkdir(workDir);
+			await writeFile(path.join(workDir, "candidate.cpp"), `// ${text} candidate\n`);
+			tasks.push({ taskId: `T00${index + 1}`, mode: "execute", workDir, status: "returned" });
+		}
+		await writeFile(path.join(root, "goal.json"), JSON.stringify({ runId: "run-example", lifecycle: "active", tasks }));
+		await offlineChecks.preserveCandidate({ runDir: () => root } as any, "run-example", output);
+		assert.equal(await readFile(path.join(output, "candidate.cpp"), "utf8"), "// parent candidate\n");
+		assert.equal(await readFile(path.join(output, "branch-child-candidate.cpp"), "utf8"), "// child candidate\n");
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
 

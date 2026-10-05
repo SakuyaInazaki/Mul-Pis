@@ -6,6 +6,7 @@
  * Nothing here decides models: every role's model comes from the workspace
  * configuration, and the harness refuses to run a stage whose role is unset.
  */
+import type { ContextBoundaryRecordV1 } from "./context/boundary.ts";
 
 /** Roles that a stage session can take. One role can be served by any configured model. */
 export type Role = "execution" | "reviewer" | "research" | "reader" | "checker" | "applicability" | "acquisition" | "improver";
@@ -81,7 +82,7 @@ export interface StageRunRecord {
 	finishedAt?: string;
 	status: RunStatus;
 	inputs: InputRef[];
-	sessions: Array<{ label: string; role: Role; id: string; file?: string; model: string }>;
+	sessions: Array<{ label: string; role: Role; id: string; file?: string; model: string; boundary?: ContextBoundaryRecordV1 }>;
 	outputs: OutputRef[];
 	failures: string[];
 	/** Knowledge snapshot id that was current when the run started, if any. */

@@ -1,8 +1,9 @@
 /** M03 independent external question, serial answer, and same-session evaluation batch. */
 import { buildM03AnswerMessage, buildM03EvaluationMessage, buildM03QuestionMessage, rationaleLeaks, splitM03Questions, systemPromptFor } from "../prompts.ts";
+import { linkedEvidence, openBoundedSession } from "../context/boundary.ts";
 import type { SessionRef, SessionSpec } from "../runner/types.ts";
 import { HarnessError, type StageRunRecord } from "../types.ts";
-import { loadProblemMaterials, readOutput, recordSession, requireCompletedRun, sessionSpec, withRun, type StageContext } from "./context.ts";
+import { loadProblemMaterials, readOutput, requireCompletedRun, sessionSpec, withRun, type StageContext } from "./context.ts";
 
 export interface M03Options { m01RunId?: string; m02RunId?: string }
 export interface M03MemberResult {
@@ -52,8 +53,8 @@ export async function runM03(ctx: StageContext, options: M03Options = {}): Promi
 				const configuredMember = configured[index]; const member = members[index];
 				let handle;
 				try {
-					handle = await ctx.runner.create(memberSpec(ctx, configuredMember));
-					recordSession(record, handle); member.session = handle.ref;
+					handle = await openBoundedSession(ctx.runner, record, { mode: "fresh", intent: "independent-judgment", reason: `M03 questioner ${member.id} must form an independent assessment without other reviewers' histories`, evidence: linkedEvidence(record.inputs), spec: memberSpec(ctx, configuredMember) }, () => ctx.ws.writeRun(record));
+					member.session = handle.ref;
 					const message = await buildM03QuestionMessage(materials, m01Output.text, m02Output.text);
 					await ctx.ws.writeOutput(record, `reviewer-${member.id}-question-message.md`, message, `发送给评审 ${member.id} 的出题消息`);
 					const turn = await handle.prompt(message);
@@ -67,9 +68,8 @@ export async function runM03(ctx: StageContext, options: M03Options = {}): Promi
 			}
 			await ctx.ws.writeOutput(record, "rationale.md", aggregate("评审出题说明与判断依据", members, "rationale"), "出题说明与判断依据（不转发）");
 
-			const execution = await ctx.runner.resume({ label: "M01", role: "execution", id: m01Session.id, model: m01Session.model, file: m01File, specFile: specFileFor(m01File) });
+			const execution = await openBoundedSession(ctx.runner, record, { mode: "continue", intent: "causal-continuation", reason: "M03 answers each independent question serially in the same M01 actor history for causal continuity", evidence: linkedEvidence(record.inputs), parent: { label: "M01", role: "execution", id: m01Session.id, model: m01Session.model, file: m01File, specFile: specFileFor(m01File) }, expectedToolGrantKind: "none" }, () => ctx.ws.writeRun(record));
 			try {
-				recordSession(record, execution);
 				for (let index = 0; index < members.length; index++) {
 					const member = members[index];
 					try {
@@ -85,9 +85,8 @@ export async function runM03(ctx: StageContext, options: M03Options = {}): Promi
 
 			for (const member of members) {
 				if (!member.session) throw new HarnessError("m03.session", `评审 ${member.id} 缺少会话记录`);
-				const handle = await ctx.runner.resume({ ...member.session, specFile: member.session.file ? specFileFor(member.session.file) : undefined });
+				const handle = await openBoundedSession(ctx.runner, record, { mode: "continue", intent: "causal-continuation", reason: `M03 reviewer ${member.id} evaluates only its own question against the corresponding answer`, evidence: linkedEvidence(record.outputs.filter((item) => item.label === `执行会话对评审 ${member.id} 的完整回答`).map((item) => ({ label: item.label, path: item.path }))), parent: { ...member.session, specFile: member.session.file ? specFileFor(member.session.file) : undefined }, expectedToolGrantKind: "none" }, () => ctx.ws.writeRun(record));
 				try {
-					handle.setRunContext?.({ stage: record.stage, runId: record.runId });
 					const message = await buildM03EvaluationMessage(member.answer!);
 					await ctx.ws.writeOutput(record, `reviewer-${member.id}-evaluation-message.md`, message, `发送给评审 ${member.id} 的评价消息`);
 					member.evaluation = (await handle.prompt(message)).text; member.status = "completed";

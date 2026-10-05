@@ -27,20 +27,28 @@ MAX_ENCODED = 64 * 1024
 MAX_COMPRESSED = 48 * 1024
 MAX_TAR = 96 * 1024 * 1024
 MAX_FILE = 64 * 1024 * 1024
+MAX_REVIEW_TEXT_FILE = 512_000
 EXPECTED_INPUT_FILES = 3
 MAX_ENVELOPE = 132 * 1024 * 1024
 RESULT_ALLOWLIST = (
-    "candidate.cpp", "verification.json", "lesson-delta.json", "workflow-archive.json", "m04-adopted-knowledge.json",
-    "round-1-candidate.cpp", "round-1-verification.json", "round-2-candidate.cpp", "round-2-verification.json",
+    "candidate.cpp", "verification.json", "lesson-delta.json", "workflow-archive.json", "m04-adopted-knowledge.json", "review-decision.json", "context-lineage.json",
     "followon-candidate.cpp", "followon-verification.json", "followon-lesson-delta.json", "workflow-followon-archive.json",
-    "followon-round-1-candidate.cpp", "followon-round-1-verification.json",
-    "followon-round-2-candidate.cpp", "followon-round-2-verification.json",
+    "followon-review-decision.json",
     "initial-candidate.cpp", "initial-verification.json", "initial-lesson-delta.json", "workflow-initial-archive.json",
-    "initial-round-1-candidate.cpp", "initial-round-1-verification.json",
-    "initial-round-2-candidate.cpp", "initial-round-2-verification.json",
+    "initial-review-decision.json", "initial-m04-adopted-knowledge.json",
+    "branch-parent-candidate.cpp", "branch-parent-verification.json", "branch-parent-lesson-delta.json", "workflow-branch-parent-archive.json",
+    "branch-parent-review-decision.json",
+    "branch-child-candidate.cpp", "branch-child-verification.json", "branch-child-lesson-delta.json", "workflow-branch-child-archive.json",
+    "branch-child-review-decision.json",
     "campaign-status.json",
-)
+) + tuple(f"{prefix}round-{round_index}-{suffix}"
+    for prefix in ("", "initial-", "followon-", "branch-parent-", "branch-child-") for round_index in range(1, 9)
+    for suffix in ("candidate.cpp", "verification.json", "reviewer-feedback.txt", "reviewer-report.md"))
 METADATA_RE = re.compile(r"^[A-Za-z0-9_./:@-]{1,160}$")
+
+
+def _review_text_file(name: str) -> bool:
+    return name.endswith(("reviewer-feedback.txt", "reviewer-report.md", "review-decision.json"))
 
 
 class TransportError(Exception):
@@ -137,7 +145,7 @@ def _result_tar(result_dir: Path) -> bytes:
                 continue
             with os.fdopen(fd, "rb") as source:
                 info = os.fstat(source.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE:
+                if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE or (_review_text_file(name) and info.st_size > MAX_REVIEW_TEXT_FILE):
                     raise TransportError()
                 data = source.read(MAX_FILE + 1)
                 if len(data) != info.st_size:
@@ -237,7 +245,7 @@ def decrypt_results(envelope_file: Path, private_key_file: Path, parent: Path) -
         names: set[str] = set()
         with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
             for member in tar:
-                if not member.isfile() or member.name not in RESULT_ALLOWLIST or member.name in names or member.size > MAX_FILE:
+                if not member.isfile() or member.name not in RESULT_ALLOWLIST or member.name in names or member.size > MAX_FILE or (_review_text_file(member.name) and member.size > MAX_REVIEW_TEXT_FILE):
                     raise TransportError()
                 names.add(member.name)
                 source = tar.extractfile(member)

@@ -7,7 +7,7 @@ import type { BeginGoalInput, CurrentGoal, DecisionInput, FinishInput, HostStopR
 import { summarizeGoalExecution } from "../m07/status.ts";
 import type { RunDescriptorV1 } from "../runtime/run-descriptor.ts";
 import { createPiSessionRunner } from "../runner/pi.ts";
-import type { SessionHandle, SessionRunner, SessionSpec } from "../runner/types.ts";
+import type { ForkRequest, RunnerCapabilities, SessionCheckpoint, SessionHandle, SessionRunner, SessionSpec } from "../runner/types.ts";
 import { runInit } from "../stages/init.ts";
 import { runM01 } from "../stages/m01.ts";
 import { runM02 } from "../stages/m02.ts";
@@ -150,6 +150,31 @@ class ProgressRunner implements SessionRunner {
 	async resume(ref: Parameters<SessionRunner["resume"]>[0]): Promise<SessionHandle> {
 		this.report({ phase: "session-create", stage: this.stage, session: ref.label, message: `${ref.label}：正在续接既有隔离会话` });
 		return this.wrap(await this.inner.resume(ref));
+	}
+
+	async checkpoint(handle: SessionHandle, envelope: { inputManifest: string; runId: string; taskId?: string; externalOperationsSettled: boolean }): Promise<SessionCheckpoint> {
+		if (!this.inner.checkpoint) throw new HarnessError("m07.branch-unsupported", "runner has no stable checkpoint capability");
+		return this.inner.checkpoint(handle, envelope);
+	}
+
+	async fork(request: ForkRequest): Promise<SessionHandle> {
+		if (!this.inner.fork) throw new HarnessError("m07.branch-unsupported", "runner has no true fork capability");
+		this.report({ phase: "session-create", stage: this.stage, session: request.spec.label, message: `${request.spec.label}：正在创建独立候选分支` });
+		return this.wrap(await this.inner.fork(request));
+	}
+
+	capabilities(): RunnerCapabilities {
+		const capabilities = this.inner.capabilities?.();
+		if (!capabilities) throw new HarnessError("m07.branch-unsupported", "runner cannot attest true frozen-leaf branching");
+		return capabilities;
+	}
+
+	attestConfinedGrant(handle: SessionHandle): Promise<NonNullable<SessionSpec["toolAuthority"]> | undefined> {
+		return this.inner.attestConfinedGrant?.(handle) ?? Promise.resolve(undefined);
+	}
+
+	estimateMaxSdkCost(modelRaw: string, caps: { maxInputTokens: number; maxOutputTokens: number }): Promise<number | undefined> {
+		return this.inner.estimateMaxSdkCost?.(modelRaw, caps) ?? Promise.resolve(undefined);
 	}
 
 	private wrap(handle: SessionHandle): SessionHandle {
@@ -440,7 +465,7 @@ export class ResearchService {
 		return createM07Controller({ ws, store, runner: unavailable, config: { roles: {}, concurrency: 1, tools: {} } }).status(runId);
 	}
 
-	async goalAction(action: "begin" | "plan" | "checkpoint" | "decision" | "finish" | "interrupt", requested: string | undefined, input: BeginGoalInput | { runId: string; plan: string; refreshBaseline?: boolean; checkpointId?: string; m04RunId?: string } | { runId: string; taskIds?: string[] } | ({ runId: string } & DecisionInput) | ({ runId: string } & FinishInput) | ({ runId: string } & InterruptInput), signal?: AbortSignal, authority?: { executionContract: "continuous" }): Promise<unknown> {
+	async goalAction(action: "begin" | "plan" | "checkpoint" | "decision" | "finish" | "interrupt" | "select-branch", requested: string | undefined, input: BeginGoalInput | { runId: string; plan: string; refreshBaseline?: boolean; checkpointId?: string; m04RunId?: string } | { runId: string; taskIds?: string[] } | ({ runId: string } & DecisionInput) | ({ runId: string } & FinishInput) | ({ runId: string } & InterruptInput) | { runId: string; parentTaskId: string; selectedTaskId?: string; rationale: string }, signal?: AbortSignal, authority?: { executionContract: "continuous" }): Promise<unknown> {
 		const root = this.resolveWorkspace(requested);
 		return this.withMutation(root, async () => {
 			const ctx = await this.nonModelContext(root);
@@ -453,6 +478,7 @@ export class ResearchService {
 			}
 			if (action === "plan") { const value = input as { runId: string; plan: string; refreshBaseline?: boolean; checkpointId?: string; m04RunId?: string }; const result = await controller.plan(value.runId, value.plan, { refreshBaseline: value.refreshBaseline, checkpointId: value.checkpointId, m04RunId: value.m04RunId }); await this.rememberActiveGoal(root, value.runId); return result; }
 			if (action === "checkpoint") { const value = input as { runId: string; taskIds?: string[] }; const result = await controller.checkpoint(value.runId, { taskIds: value.taskIds }); await this.rememberActiveGoal(root, value.runId); return result; }
+			if (action === "select-branch") { const { runId, ...value } = input as { runId: string; parentTaskId: string; selectedTaskId?: string; rationale: string }; const result = await controller.selectBranch(runId, value); await this.rememberActiveGoal(root, runId); return result; }
 			if (action === "decision") { const { runId, ...value } = input as { runId: string } & DecisionInput; const result = await controller.decision(runId, value); await this.rememberActiveGoal(root, runId); return result; }
 			if (action === "interrupt") { const { runId, ...value } = input as { runId: string } & InterruptInput; const result = await controller.interrupt(runId, value); await this.forgetActiveGoal(root, runId); return result; }
 			const { runId, ...value } = input as { runId: string } & FinishInput;

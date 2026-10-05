@@ -4,11 +4,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createAgentSession, ModelRuntime, type CreateAgentSessionOptions } from "@earendil-works/pi-coding-agent";
-import type { Model } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, type Model } from "@earendil-works/pi-ai";
 import { DeepSeekCampaignBudget, type DeepSeekCampaignLimits } from "../../src/runner/deepseek-campaign.ts";
 import { createConfinedCampaignFileTools } from "../../src/runner/confined-campaign-files.ts";
 import { PiSessionRunner } from "../../src/runner/pi.ts";
-import type { SessionSpec } from "../../src/runner/types.ts";
+import { openBoundedSession } from "../../src/context/boundary.ts";
+import type { SessionRunner, SessionSpec } from "../../src/runner/types.ts";
+import type { StageRunRecord } from "../../src/types.ts";
 
 const MODEL = {
 	id: "deepseek-flash", name: "Offline DeepSeek", provider: "deepseek", api: "openai-completions",
@@ -67,6 +69,32 @@ function offlineFactory(rounds: number): typeof createAgentSession {
 	}) as typeof createAgentSession;
 }
 
+function streamFactory(rounds: number): typeof createAgentSession {
+	return (async (options: CreateAgentSessionOptions = {}) => {
+		const manager = options.sessionManager!;
+		const messages: unknown[] = [];
+		return { session: {
+			sessionId: manager.getSessionId(), sessionFile: manager.getSessionFile(), messages,
+			getActiveToolNames: () => options.tools ?? [],
+			async prompt(text: string) {
+				const user = { role: "user", content: text, timestamp: Date.now() };
+				messages.push(user); manager.appendMessage(user as never);
+				for (let i = 0; i < rounds; i++) {
+					const stream = (options.modelRuntime as ModelRuntime).streamSimple(options.model!, { messages } as never, {});
+					let assistant: unknown;
+					for await (const event of stream) {
+						if (event.type === "done") assistant = event.message;
+						if (event.type === "error") throw new Error(event.error.errorMessage ?? "stream error");
+					}
+					if (!assistant) throw new Error("stream had no assistant");
+					messages.push(assistant); manager.appendMessage(assistant as never);
+				}
+			},
+			abort() {}, dispose() {},
+		} } as unknown as Awaited<ReturnType<typeof createAgentSession>>;
+	}) as typeof createAgentSession;
+}
+
 test("campaign reserves each tool-loop provider request before transport, then refuses a third", async (t) => {
 	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-campaign-"));
 	t.after(() => rm(dir, { recursive: true, force: true }));
@@ -87,6 +115,88 @@ test("campaign reserves each tool-loop provider request before transport, then r
 	builder.dispose(); reviewer.dispose();
 });
 
+test("audited campaign file tools fork into an independently bound work root without inherited provider charge", async (t) => {
+	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-fork-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const base = path.join(dir, "tasks");
+	const parentRoot = path.join(base, "T001", "work");
+	const childRoot = path.join(base, "T002", "work");
+	const frozenRoot = path.join(dir, "frozen");
+	const sessions = path.join(dir, "sessions");
+	await Promise.all([parentRoot, childRoot, frozenRoot, sessions].map((root) => mkdir(root, { recursive: true })));
+	for (const root of [parentRoot, childRoot, frozenRoot]) await writeFile(path.join(root, "candidate.cpp"), "parent\n");
+	const files = [{ sourcePath: path.join(parentRoot, "candidate.cpp"), frozenPath: path.join(frozenRoot, "candidate.cpp"), childPath: path.join(childRoot, "candidate.cpp"), bytes: 7 }];
+	const authority = { version: 1 as const, parentRoot, authorizedChildRootBase: base, childWorkLeaf: "work", frozenEvidenceRoot: frozenRoot, files: files.map(({ sourcePath, frozenPath, bytes }) => ({ sourcePath, frozenPath, bytes })) };
+	const manifest = path.join(dir, "manifest.json");
+	await writeFile(manifest, `${JSON.stringify({ forkWorkspaceAuthority: authority })}\n`);
+	const sent = { count: 0, options: [] as Array<{ maxTokens?: number; maxRetries?: number }> };
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1, maxProviderCalls: 3, maxProviderCallsPerPrompt: 1 });
+	const runner = new PiSessionRunner({ modelRuntime: offlineRuntime(sent), createSession: offlineFactory(1), campaignBudget: budget });
+	const parentTools = await createConfinedCampaignFileTools(parentRoot, { writableFiles: ["candidate.cpp"] });
+	const parent = await runner.create(spec(sessions, "parent", { kind: "custom", tools: parentTools }));
+	assert.deepEqual(await runner.attestConfinedGrant(parent), { version: 1, kind: "confined-campaign-files", root: parentRoot, writableFiles: ["candidate.cpp"] });
+	assert.equal(await runner.attestConfinedGrant({ ...parent, ref: { ...parent.ref } }), undefined, "copied ref cannot attest the live factory-backed grant");
+	await parent.prompt("parent route");
+	const checkpoint = await runner.checkpoint(parent, { inputManifest: manifest, runId: "run", taskId: "T001", externalOperationsSettled: true });
+	const ownerMarkerPath = path.join(childRoot, "fork-owner.json");
+	await writeFile(ownerMarkerPath, JSON.stringify({ version: 1, checkpointId: checkpoint.id, parentRoot, childRoot, childContainer: "T002" }));
+	const childTools = await createConfinedCampaignFileTools(childRoot, { writableFiles: ["candidate.cpp"] });
+	const child = await runner.fork({ checkpoint, spec: spec(sessions, "child", { kind: "custom", tools: childTools }),
+		evidenceBindings: [{ version: 1, label: "frozen work", path: manifest, status: "frozen-copy", sourceVersion: checkpoint.id }],
+		workspaceBinding: { ...authority, childRoot, ownerMarkerPath, files }, reason: "parallel candidate" });
+	assert.equal(JSON.parse(await readFile(child.ref.specFile!, "utf8")).toolAuthority.root, childRoot);
+	assert.equal((await runner.attestConfinedGrant(child))?.root, childRoot);
+	assert.equal(child.usageEvents().length, 0);
+	await child.prompt("child route");
+	assert.equal(budget.snapshot().reservations, 2, "copied ancestor usage must not cause another provider reservation");
+	assert.equal(sent.count, 2);
+	await childTools.find((tool) => tool.name === "write")!.execute({ path: "candidate.cpp", content: "child\n" });
+	assert.equal(await readFile(path.join(parentRoot, "candidate.cpp"), "utf8"), "parent\n");
+	assert.equal(await readFile(path.join(childRoot, "candidate.cpp"), "utf8"), "child\n");
+	await assert.rejects(childTools.find((tool) => tool.name === "write")!.execute({ path: path.join(parentRoot, "candidate.cpp"), content: "escape" }), /bounded relative file path/);
+	const outsideRoot = path.join(dir, "unrelated", "work");
+	await mkdir(outsideRoot, { recursive: true });
+	await writeFile(path.join(outsideRoot, "candidate.cpp"), "parent\n");
+	const outsideTools = await createConfinedCampaignFileTools(outsideRoot, { writableFiles: ["candidate.cpp"] });
+	const outsideOwner = path.join(outsideRoot, "fork-owner.json");
+	await writeFile(outsideOwner, JSON.stringify({ version: 1, checkpointId: checkpoint.id, parentRoot, childRoot: outsideRoot, childContainer: "unrelated" }));
+	await assert.rejects(runner.fork({ checkpoint, spec: spec(sessions, "outside-child", { kind: "custom", tools: outsideTools }),
+		evidenceBindings: [{ version: 1, label: "frozen work", path: manifest, status: "frozen-copy", sourceVersion: checkpoint.id }],
+		workspaceBinding: { ...authority, childRoot: outsideRoot, ownerMarkerPath: outsideOwner, files: files.map((file) => ({ ...file, childPath: path.join(outsideRoot, "candidate.cpp") })) }, reason: "forged root" }), /not a separate task directory|not independently bound/);
+	const broaderTools = await createConfinedCampaignFileTools(childRoot, { writableFiles: ["candidate.cpp", "extra.cpp"] });
+	await assert.rejects(runner.fork({ checkpoint, spec: spec(sessions, "broader-child", { kind: "custom", tools: broaderTools }),
+		evidenceBindings: [{ version: 1, label: "frozen work", path: manifest, status: "frozen-copy", sourceVersion: checkpoint.id }],
+		workspaceBinding: { ...authority, childRoot, ownerMarkerPath, files }, reason: "broader write grant" }), /equal-or-narrower write allowlist/);
+	child.dispose(); parent.dispose();
+});
+
+test("controller records a live-attested execution-to-confined-custom narrowing before any prompt", async (t) => {
+	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-boundary-attest-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const work = path.join(dir, "work");
+	const sessions = path.join(dir, "sessions");
+	await Promise.all([mkdir(work), mkdir(sessions)]);
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1 });
+	const sent = { count: 0, options: [] as Array<{ maxTokens?: number; maxRetries?: number }> };
+	const actual = new PiSessionRunner({ modelRuntime: offlineRuntime(sent), createSession: offlineFactory(1), campaignBudget: budget });
+	const wrapper: SessionRunner = {
+		create: async (requested) => actual.create({ ...requested, tools: { kind: "custom", tools: await createConfinedCampaignFileTools(work, { writableFiles: ["candidate.cpp"] }) } }),
+		resume: (ref) => actual.resume(ref),
+		attestConfinedGrant: (handle) => actual.attestConfinedGrant(handle),
+	};
+	const requested = spec(sessions, "bounded-builder", { kind: "execution", root: work, tools: ["read", "write"] });
+	const run: StageRunRecord = { stage: "M07", runId: "R001", startedAt: new Date().toISOString(), status: "running", inputs: [], outputs: [], sessions: [], failures: [], remarks: [] };
+	const handle = await openBoundedSession(wrapper, run, { mode: "fresh", intent: "new-work", reason: "audited private builder", evidence: [], spec: requested }, async () => { await writeFile(path.join(dir, "run.json"), JSON.stringify(run)); });
+	assert.equal(sent.count, 0);
+	assert.deepEqual(run.sessions[0].boundary?.capability, { kind: "custom", toolNames: ["edit", "read", "write"], root: work, writableFiles: ["candidate.cpp"] });
+	assert.deepEqual(run.sessions[0].boundary?.requestedCapability, { kind: "execution", root: work, toolNames: ["read", "write"] });
+	assert.equal(JSON.parse(await readFile(path.join(dir, "run.json"), "utf8")).sessions[0].boundary.capability.root, work);
+	await assert.rejects(openBoundedSession(wrapper, run, { mode: "fresh", intent: "new-work", reason: "read-only build must stay read-only", evidence: [],
+		spec: { ...requested, label: "read-only-request", tools: { kind: "execution", root: work, tools: ["read"] } } }, async () => {}), /would add read or write authority/);
+	assert.equal(run.sessions.length, 1);
+	handle.dispose();
+});
+
 test("campaign rejects endpoint changes and unavailable payload sizes closed", async (t) => {
 	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-campaign-"));
 	t.after(() => rm(dir, { recursive: true, force: true }));
@@ -103,11 +213,11 @@ test("campaign rejects endpoint changes and unavailable payload sizes closed", a
 	handle.dispose();
 
 	const direct = new DeepSeekCampaignBudget(LIMITS);
-	direct.beginPrompt();
-	assert.throws(() => direct.reserve(0), /payload byte count is unavailable/);
+	const lease = direct.beginPrompt("direct", "1");
+	assert.throws(() => direct.reserve(lease, 0, "direct-1"), /payload byte count is unavailable/);
 	assert.equal(direct.snapshot().stopped, true);
 	assert.equal(direct.snapshot().stopReason, "payload-boundary");
-	assert.throws(() => direct.beginPrompt(), /campaign is stopped/);
+	assert.throws(() => direct.beginPrompt("direct", "2"), /campaign is stopped/);
 });
 
 test("campaign accepts input above the former 96 KB cap and reserves its actual serialized bytes", async (t) => {
@@ -257,10 +367,10 @@ test("campaign reconciles reported tokens and SDK cost against each reserved env
 		{ input: 10, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 13, cost: 0.00001 },
 	]) {
 		const budget = new DeepSeekCampaignBudget(LIMITS);
-		budget.beginPrompt(); budget.reserve(100);
-		assert.throws(() => budget.finishPrompt([{ entryId: "offline", kind: "assistant", promptIndex: 1,
+		const lease = budget.beginPrompt("direct", "1"); budget.reserve(lease, 100, "request-1");
+		assert.throws(() => budget.finishPrompt(lease, [{ requestId: "request-1", event: { entryId: "offline", kind: "assistant", promptIndex: 1,
 			at: new Date().toISOString(), provider: "deepseek", model: "deepseek-flash", stopReason: "stop",
-			usage, status: "reported", costStatus: "priced", costSource: "sdk-estimate" }]), /provider usage or call outcome/);
+			usage, status: "reported", costStatus: "priced", costSource: "sdk-estimate" } }]), /provider usage or call outcome/);
 		assert.equal(budget.snapshot().stopped, true);
 		assert.equal(budget.snapshot().stopReason, "usage-reconciliation");
 		assert.equal(budget.snapshot().reservations, 1);
@@ -269,18 +379,471 @@ test("campaign reconciles reported tokens and SDK cost against each reserved env
 
 test("campaign reconciles each usage event against its own differently sized input reservation", () => {
 	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1 });
-	budget.beginPrompt();
-	budget.reserve(100);
-	budget.reserve(120_000);
+	const lease = budget.beginPrompt("direct", "1");
+	budget.reserve(lease, 100, "request-1");
+	budget.reserve(lease, 120_000, "request-2");
 	const retained = budget.snapshot().reservedCny;
 	const event = (id: string, input: number) => ({ entryId: id, kind: "assistant" as const, promptIndex: 1,
 		at: new Date().toISOString(), provider: "deepseek", model: "deepseek-flash", stopReason: "toolUse",
 		usage: { input, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: input + 4, cost: 0.00001 },
 		status: "reported" as const, costStatus: "priced" as const, costSource: "sdk-estimate" as const });
-	assert.throws(() => budget.finishPrompt([event("first", 101), event("second", 100)]), /provider usage or call outcome/);
+	assert.throws(() => budget.finishPrompt(lease, [
+		{ requestId: "request-1", event: event("first", 101) },
+		{ requestId: "request-2", event: event("second", 100) },
+	]), /provider usage or call outcome/);
 	assert.equal(budget.snapshot().stopReason, "usage-reconciliation");
 	assert.equal(budget.snapshot().reservations, 2);
 	assert.equal(budget.snapshot().reservedCny, retained, "ambiguous usage must not refund either request");
+});
+
+function reported(id: string, promptIndex = 1, input = 10, stopReason = "stop") {
+	return { entryId: id, kind: "assistant" as const, promptIndex,
+		at: new Date().toISOString(), provider: "deepseek", model: "deepseek-flash", stopReason,
+		usage: { input, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: input + 4, cost: 0.0000078 },
+		status: "reported" as const, costStatus: "priced" as const, costSource: "sdk-estimate" as const };
+}
+
+test("parallel branch leases reserve a single shared call/CNY ceiling with interleaved tool requests", () => {
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxProviderCalls: 3, maxProviderCallsPerPrompt: 2, maxCny: 1 });
+	const left = budget.beginPrompt("left-session", "1");
+	const right = budget.beginPrompt("right-session", "1");
+	budget.reserve(left, 100, "left-1");
+	budget.reserve(right, 200, "right-1");
+	budget.reserve(left, 300, "left-2");
+	assert.equal(budget.snapshot().activePrompts, 2);
+	assert.equal(budget.snapshot().reservations, 3);
+	budget.finishPrompt(right, [{ requestId: "right-1", event: reported("right-entry") }]);
+	budget.finishPrompt(left, [
+		{ requestId: "left-1", event: reported("left-entry-1", 1, 10, "toolUse") },
+		{ requestId: "left-2", event: reported("left-entry-2") },
+	]);
+	assert.equal(budget.snapshot().activePrompts, 0);
+	assert.equal(budget.snapshot().stopped, false);
+	const next = budget.beginPrompt("third-session", "1");
+	assert.throws(() => budget.reserve(next, 100, "third-1"), /campaign call or CNY planning ceiling exhausted/);
+	assert.equal(budget.snapshot().reservations, 3);
+	assert.equal(budget.snapshot().stopReason, "ceiling");
+});
+
+test("two Pi handles may prompt concurrently while sharing one budget", async (t) => {
+	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-parallel-handles-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	let dispatched = 0;
+	const runtime = {
+		getModels: () => [MODEL],
+		async streamSimple(model: Model<"openai-completions">, _context: unknown, options: { onPayload?: (payload: unknown, model: Model<"openai-completions">) => Promise<unknown> }) {
+			await options.onPayload?.({ model: model.id, messages: [], max_tokens: 20 }, model);
+			dispatched++;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		},
+	} as unknown as ModelRuntime;
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1, maxProviderCallsPerPrompt: 1 });
+	const runner = new PiSessionRunner({ modelRuntime: runtime, createSession: offlineFactory(1), campaignBudget: budget });
+	const left = await runner.create(spec(path.join(dir, "left"), "left"));
+	const right = await runner.create(spec(path.join(dir, "right"), "right"));
+	t.after(() => { left.dispose(); right.dispose(); });
+	const [a, b] = await Promise.all([left.prompt("A"), right.prompt("B")]);
+	assert.equal(a.text, "round 1");
+	assert.equal(b.text, "round 1");
+	assert.equal(dispatched, 2);
+	assert.equal(budget.snapshot().reservations, 2);
+	assert.equal(budget.snapshot().stopped, false);
+});
+
+test("concurrent Pi handles cannot cross a single-call total limit", async (t) => {
+	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-parallel-cap-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	let dispatched = 0;
+	const runtime = {
+		getModels: () => [MODEL],
+		async streamSimple(model: Model<"openai-completions">, _context: unknown, options: { onPayload?: (payload: unknown, model: Model<"openai-completions">) => Promise<unknown> }) {
+			await options.onPayload?.({ model: model.id, messages: [], max_tokens: 20 }, model);
+			dispatched++;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		},
+	} as unknown as ModelRuntime;
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1, maxProviderCalls: 1, maxProviderCallsPerPrompt: 1 });
+	const runner = new PiSessionRunner({ modelRuntime: runtime, createSession: offlineFactory(1), campaignBudget: budget });
+	const left = await runner.create(spec(path.join(dir, "left"), "left"));
+	const right = await runner.create(spec(path.join(dir, "right"), "right"));
+	t.after(() => { left.dispose(); right.dispose(); });
+	const outcomes = await Promise.allSettled([left.prompt("A"), right.prompt("B")]);
+	assert.equal(dispatched, 1);
+	assert.equal(budget.snapshot().reservations, 1);
+	assert.equal(budget.snapshot().stopReason, "ceiling");
+	assert(outcomes.some((item) => item.status === "rejected"));
+});
+
+test("duplicate lease or request ownership fails closed without granting an unmetered retry", () => {
+	const budget = new DeepSeekCampaignBudget(LIMITS);
+	const lease = budget.beginPrompt("branch", "1");
+	budget.reserve(lease, 100, "request-1");
+	assert.throws(() => budget.reserve(lease, 100, "request-1"), /already reserved/);
+	assert.equal(budget.snapshot().reservations, 1);
+	assert.equal(budget.snapshot().stopReason, "payload-boundary");
+	budget.failPrompt(lease);
+	assert.equal(budget.snapshot().stopReason, "payload-boundary", "first campaign stop reason must remain stable");
+	const second = new DeepSeekCampaignBudget(LIMITS);
+	second.beginPrompt("branch", "1");
+	assert.throws(() => second.beginPrompt("branch", "2"), /ownership is duplicated/);
+	assert.equal(second.snapshot().stopReason, "prompt-failure");
+	const third = new DeepSeekCampaignBudget(LIMITS);
+	const done = third.beginPrompt("branch", "1");
+	third.reserve(done, 100, "request-1");
+	third.finishPrompt(done, [{ requestId: "request-1", event: reported("entry-1") }]);
+	assert.throws(() => third.beginPrompt("branch", "1"), /ownership is duplicated/);
+});
+
+test("a stale prompt lease cannot reserve into a later prompt on the same session", () => {
+	const budget = new DeepSeekCampaignBudget(LIMITS);
+	const first = budget.beginPrompt("session", "1");
+	budget.reserve(first, 100, "request-1");
+	budget.finishPrompt(first, [{ requestId: "request-1", event: reported("entry-1") }]);
+	const next = budget.beginPrompt("session", "2");
+	assert.throws(() => budget.reserve(first, 100, "late-request"), /payload byte count is unavailable/);
+	assert.equal(budget.snapshot().reservations, 1);
+	assert.equal(budget.snapshot().activePrompts, 1);
+	assert.throws(() => budget.reserve(next, 100, "new-request"), /payload byte count is unavailable/);
+});
+
+test("failed branch retains reserve and stops other active branch without changing first reason", () => {
+	const budget = new DeepSeekCampaignBudget(LIMITS);
+	const left = budget.beginPrompt("left", "1");
+	const right = budget.beginPrompt("right", "1");
+	budget.reserve(left, 100, "left-1");
+	budget.reserve(right, 100, "right-1");
+	const held = budget.snapshot().reservedCny;
+	budget.failPrompt(left);
+	assert.equal(budget.snapshot().stopReason, "prompt-failure");
+	assert.throws(() => budget.reserve(right, 100, "right-2"), /payload byte count is unavailable/);
+	assert.equal(budget.snapshot().reservedCny, held);
+	budget.finishPrompt(right, [{ requestId: "right-1", event: reported("right-entry") }]);
+	assert.equal(budget.snapshot().stopReason, "prompt-failure");
+	assert.equal(budget.snapshot().activePrompts, 0);
+});
+
+test("interleaved branches obey independent per-prompt caps and one atomic CNY ceiling", () => {
+	const cap = (100 * LIMITS.maxInputCnyPerMillionTokens +
+		(LIMITS.maxOutputTokens + LIMITS.outputAccountingMarginTokens) * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000;
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: cap * 2, maxProviderCalls: 4, maxProviderCallsPerPrompt: 2 });
+	const left = budget.beginPrompt("left", "1");
+	const right = budget.beginPrompt("right", "1");
+	budget.reserve(left, 100, "left-1");
+	budget.reserve(right, 100, "right-1");
+	assert.throws(() => budget.reserve(left, 100, "left-2"), /campaign call or CNY planning ceiling exhausted/);
+	assert.equal(budget.snapshot().reservations, 2, "third concurrent reservation must not pass total money ceiling");
+	assert.equal(budget.snapshot().reservedCny, cap * 2);
+	const promptCap = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1, maxProviderCalls: 4, maxProviderCallsPerPrompt: 1 });
+	const a = promptCap.beginPrompt("a", "1");
+	const b = promptCap.beginPrompt("b", "1");
+	promptCap.reserve(a, 100, "a-1");
+	promptCap.reserve(b, 100, "b-1");
+	assert.throws(() => promptCap.reserve(a, 100, "a-2"), /campaign call or CNY planning ceiling exhausted/);
+	assert.equal(promptCap.snapshot().reservations, 2, "one branch may not borrow the other prompt's calls");
+});
+
+test("usage receipts cannot be charged to another branch or replayed as fork ancestry", () => {
+	const budget = new DeepSeekCampaignBudget(LIMITS);
+	const left = budget.beginPrompt("left", "1");
+	const right = budget.beginPrompt("right", "1");
+	budget.reserve(left, 100, "left-request");
+	budget.reserve(right, 100, "right-request");
+	assert.throws(() => budget.finishPrompt(left, [{ requestId: "right-request", event: reported("left-entry") }]), /provider usage or call outcome/);
+	assert.equal(budget.snapshot().reservations, 2);
+	assert.equal(budget.snapshot().stopReason, "usage-reconciliation");
+	budget.finishPrompt(right, [{ requestId: "right-request", event: reported("right-entry") }]);
+	const replay = new DeepSeekCampaignBudget(LIMITS);
+	const ancestor = replay.beginPrompt("ancestor", "1");
+	replay.reserve(ancestor, 100, "ancestor-request");
+	replay.finishPrompt(ancestor, [{ requestId: "ancestor-request", event: reported("shared-entry") }]);
+	const child = replay.beginPrompt("child", "1");
+	replay.reserve(child, 100, "child-request");
+	assert.throws(() => replay.finishPrompt(child, [{ requestId: "child-request", event: reported("shared-entry") }]), /provider usage or call outcome/);
+	assert.equal(replay.snapshot().reservations, 2, "copied history does not create a reservation");
+});
+
+test("known provider usage settles one request conservatively before the next reservation", () => {
+	const oneWorst = (100 * LIMITS.maxInputCnyPerMillionTokens +
+		(LIMITS.maxOutputTokens + LIMITS.outputAccountingMarginTokens) * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000;
+	const oneKnown = (10 * LIMITS.maxInputCnyPerMillionTokens + 4 * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000;
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: oneWorst + oneKnown + 0.000001 });
+	const lease = budget.beginPrompt("session", "1");
+	budget.reserve(lease, 100, "request-1");
+	budget.settleReported(lease, "request-1", reported("stream-1", 1, 10, "toolUse"));
+	const afterFirst = budget.snapshot();
+	assert.equal(afterFirst.grossReservedCny, oneWorst);
+	assert.equal(afterFirst.settledCny, oneKnown);
+	assert.equal(afterFirst.committedCny, oneKnown);
+	assert.equal(afterFirst.unknownReservedCny, 0);
+	budget.reserve(lease, 100, "request-2");
+	assert.equal(budget.snapshot().reservations, 2);
+	assert(budget.snapshot().committedCny <= budget.limits.maxCny);
+	budget.settleReported(lease, "request-2", reported("stream-2"));
+	budget.finishPrompt(lease, [
+		{ requestId: "request-1", event: reported("persisted-1", 1, 10, "toolUse") },
+		{ requestId: "request-2", event: reported("persisted-2") },
+	]);
+	assert.equal(budget.snapshot().inFlightReservedCny, 0);
+	assert.equal(budget.snapshot().committedCny, oneKnown * 2);
+	assert.equal(budget.snapshot().stopped, false);
+});
+
+test("terminal stream usage is settled before the next tool-loop onPayload", async (t) => {
+	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-stream-settlement-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const payload = { model: MODEL.id, messages: [], max_tokens: LIMITS.maxOutputTokens };
+	const bytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
+	const worst = (bytes * LIMITS.maxInputCnyPerMillionTokens +
+		(LIMITS.maxOutputTokens + LIMITS.outputAccountingMarginTokens) * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000;
+	const known = (10 * LIMITS.maxInputCnyPerMillionTokens + 4 * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000;
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: worst + known + 0.000001 });
+	let called = 0;
+	let settledAtSecondPayload = false;
+	const runtime = {
+		getModels: () => [MODEL],
+		streamSimple(model: Model<"openai-completions">, _context: unknown, options: { onPayload?: (payload: unknown, model: Model<"openai-completions">) => Promise<unknown> }) {
+			const stream = createAssistantMessageEventStream();
+			void (async () => {
+				await options.onPayload?.(payload, model);
+				called++;
+				if (called === 2) settledAtSecondPayload = budget.snapshot().settledCny > 0 && budget.snapshot().reservations === 2;
+				const stopReason = called === 1 ? "toolUse" as const : "stop" as const;
+				const assistant = { role: "assistant" as const, api: model.api, provider: model.provider, model: model.id,
+					content: [{ type: "text" as const, text: `round ${called}` }], stopReason, timestamp: Date.now(),
+					usage: { input: 10, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 14,
+						cost: { input: 0.000003, output: 0.0000048, cacheRead: 0, cacheWrite: 0, total: 0.0000078 } } };
+				stream.push({ type: "start", partial: assistant });
+				stream.push({ type: "done", reason: stopReason, message: assistant });
+				stream.end();
+			})().catch((error) => { throw error; });
+			return stream;
+		},
+	} as unknown as ModelRuntime;
+	const runner = new PiSessionRunner({ modelRuntime: runtime, createSession: streamFactory(2), campaignBudget: budget });
+	const handle = await runner.create(spec(dir, "stream-settlement"));
+	t.after(() => handle.dispose());
+	assert.equal((await handle.prompt("two tool-loop calls")).text, "round 2");
+	assert.equal(called, 2);
+	assert.equal(settledAtSecondPayload, true);
+	assert.equal(budget.snapshot().reservations, 2);
+	assert.equal(budget.snapshot().committedCny, known * 2);
+	assert.equal(budget.snapshot().stopped, false);
+});
+
+test("a known length terminal response settles its charge while the prompt fails", async (t) => {
+	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-length-settlement-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1, maxProviderCalls: 2 });
+	let lateRequestDenied = false;
+	let lateProbe: Promise<void> | undefined;
+	const runtime = {
+		getModels: () => [MODEL],
+		streamSimple(model: Model<"openai-completions">, _context: unknown, options: { onPayload?: (payload: unknown, model: Model<"openai-completions">) => Promise<unknown> }) {
+			const stream = createAssistantMessageEventStream();
+			void (async () => {
+				await options.onPayload?.({ model: model.id, messages: [], max_tokens: 20 }, model);
+				const assistant = { role: "assistant" as const, api: model.api, provider: model.provider, model: model.id,
+					content: [{ type: "text" as const, text: "truncated" }], stopReason: "length" as const, timestamp: Date.now(),
+					usage: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0, totalTokens: 30,
+						cost: { input: 0.000003, output: 0.000024, cacheRead: 0, cacheWrite: 0, total: 0.000027 } } };
+				stream.push({ type: "start", partial: assistant });
+				stream.push({ type: "done", reason: "length", message: assistant });
+				stream.end();
+				lateProbe = new Promise<void>((resolve) => setImmediate(resolve)).then(async () => {
+					try { await options.onPayload?.({ model: model.id, messages: [{ role: "user", content: "illicit continuation" }], max_tokens: 20 }, model); }
+					catch (error) { lateRequestDenied = /campaign|provider|payload/i.test(String(error)); }
+				});
+			})().catch((error) => { throw error; });
+			return stream;
+		},
+	} as unknown as ModelRuntime;
+	const runner = new PiSessionRunner({ modelRuntime: runtime, createSession: streamFactory(1), campaignBudget: budget });
+	const handle = await runner.create(spec(dir, "length-response"));
+	t.after(() => handle.dispose());
+	await assert.rejects(handle.prompt("known but incomplete"), /length/);
+	await lateProbe;
+	assert.equal(lateRequestDenied, true, "post-length tool-loop onPayload must fail before transport");
+	assert.equal(budget.snapshot().reservations, 1);
+	assert.equal(budget.snapshot().settledCny, (10 * LIMITS.maxInputCnyPerMillionTokens + 20 * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000);
+	assert.equal(budget.snapshot().unknownReservedCny, 0);
+	assert.equal(budget.snapshot().stopReason, "prompt-failure");
+});
+
+test("provider stream error stops a later tool-loop request before transport", async (t) => {
+	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-stream-error-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1, maxProviderCalls: 2 });
+	let lateRequestDenied = false;
+	let lateProbe: Promise<void> | undefined;
+	const runtime = {
+		getModels: () => [MODEL],
+		streamSimple(model: Model<"openai-completions">, _context: unknown, options: { onPayload?: (payload: unknown, model: Model<"openai-completions">) => Promise<unknown> }) {
+			const stream = createAssistantMessageEventStream();
+			void (async () => {
+				await options.onPayload?.({ model: model.id, messages: [], max_tokens: 20 }, model);
+				const assistant = { role: "assistant" as const, api: model.api, provider: model.provider, model: model.id,
+					content: [], stopReason: "error" as const, errorMessage: "synthetic unknown outcome", timestamp: Date.now(),
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+				stream.push({ type: "error", reason: "error", error: assistant });
+				stream.end();
+				lateProbe = new Promise<void>((resolve) => setImmediate(resolve)).then(async () => {
+					try { await options.onPayload?.({ model: model.id, messages: [{ role: "user", content: "illicit continuation" }], max_tokens: 20 }, model); }
+					catch (error) { lateRequestDenied = /campaign|provider|payload/i.test(String(error)); }
+				});
+			})().catch((error) => { throw error; });
+			return stream;
+		},
+	} as unknown as ModelRuntime;
+	const runner = new PiSessionRunner({ modelRuntime: runtime, createSession: streamFactory(1), campaignBudget: budget });
+	const handle = await runner.create(spec(dir, "unknown-response"));
+	t.after(() => handle.dispose());
+	await assert.rejects(handle.prompt("unknown outcome"), /synthetic unknown outcome/);
+	await lateProbe;
+	assert.equal(lateRequestDenied, true);
+	assert.equal(budget.snapshot().reservations, 1);
+	assert(budget.snapshot().unknownReservedCny > 0);
+	assert.equal(budget.snapshot().settledCny, 0);
+});
+
+test("unknown responses retain full worst reserve while known length usage can settle on failure", () => {
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1 });
+	const lease = budget.beginPrompt("session", "1");
+	budget.reserve(lease, 100, "known-length");
+	budget.reserve(lease, 100, "unknown");
+	const worst = budget.snapshot().grossReservedCny / 2;
+	budget.settleReported(lease, "known-length", reported("length", 1, 10, "length"));
+	budget.failPrompt(lease);
+	assert.equal(budget.snapshot().settledCny, (10 * LIMITS.maxInputCnyPerMillionTokens + 4 * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000);
+	assert.equal(budget.snapshot().unknownReservedCny, worst);
+	assert.equal(budget.snapshot().inFlightReservedCny, 0);
+	assert.equal(budget.snapshot().stopReason, "prompt-failure");
+	assert.equal(budget.snapshot().committedCny, budget.snapshot().settledCny + worst);
+});
+
+test("partial or synthetic zero usage never frees reserve; repeated settlement is idempotent", () => {
+	const partial = new DeepSeekCampaignBudget(LIMITS);
+	const p = partial.beginPrompt("p", "1");
+	partial.reserve(p, 100, "p-1");
+	const worst = partial.snapshot().committedCny;
+	assert.throws(() => partial.settleReported(p, "p-1", { ...reported("p-event"),
+		usage: { input: 10, output: 4, cacheRead: 0, cacheWrite: 0, cost: 0.0000078 } }), /provider usage or call outcome/);
+	assert.equal(partial.snapshot().unknownReservedCny, worst);
+	assert.equal(partial.snapshot().committedCny, worst);
+	const zero = new DeepSeekCampaignBudget(LIMITS);
+	const z = zero.beginPrompt("z", "1");
+	zero.reserve(z, 100, "z-1");
+	assert.throws(() => zero.settleReported(z, "z-1", reported("zero", 1, 0)), /provider usage or call outcome/);
+	assert.equal(zero.snapshot().unknownReservedCny, zero.snapshot().grossReservedCny);
+	const duplicate = new DeepSeekCampaignBudget(LIMITS);
+	const d = duplicate.beginPrompt("d", "1");
+	duplicate.reserve(d, 100, "d-1");
+	const response = reported("response");
+	duplicate.settleReported(d, "d-1", response);
+	const settled = duplicate.snapshot().settledCny;
+	duplicate.settleReported(d, "d-1", { ...response, entryId: "same-result-different-entry" });
+	assert.equal(duplicate.snapshot().settledCny, settled);
+	assert.throws(() => duplicate.settleReported(d, "d-1", reported("conflict", 1, 11)), /conflicts/);
+	assert.equal(duplicate.snapshot().settledCny, 0);
+	assert.equal(duplicate.snapshot().unknownReservedCny, duplicate.snapshot().grossReservedCny);
+	assert.equal(duplicate.snapshot().stopReason, "usage-reconciliation");
+});
+
+test("reported disjoint cache hits settle at a verified cache-read ceiling while the pre-request reserve stays all-miss", () => {
+	const payloadBytes = 1_200;
+	const usage = { input: 10, cacheRead: 1_000, cacheWrite: 5, output: 4, totalTokens: 1_019, cost: 0.00002 };
+	const event = { ...reported("cached"), usage };
+	const cacheBudget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1, maxCacheReadCnyPerMillionTokens: 0.2 });
+	cacheBudget.assertResolved(MODEL);
+	const lease = cacheBudget.beginPrompt("cache", "1");
+	cacheBudget.reserve(lease, payloadBytes, "cached-request");
+	const worst = (payloadBytes * LIMITS.maxInputCnyPerMillionTokens +
+		(LIMITS.maxOutputTokens + LIMITS.outputAccountingMarginTokens) * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000;
+	assert.equal(cacheBudget.snapshot().committedCny, worst, "reservation assumes every input byte costs the uncached rate");
+	cacheBudget.settleReported(lease, "cached-request", event);
+	const expected = ((usage.input + usage.cacheWrite) * LIMITS.maxInputCnyPerMillionTokens +
+		usage.cacheRead * 0.2 + usage.output * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000;
+	assert.equal(cacheBudget.snapshot().settledCny, expected);
+	assert.equal(cacheBudget.snapshot().grossReservedCny, worst);
+	const defaultBudget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1 });
+	const defaultLease = defaultBudget.beginPrompt("default", "1");
+	defaultBudget.reserve(defaultLease, payloadBytes, "default-request");
+	defaultBudget.settleReported(defaultLease, "default-request", event);
+	assert.equal(defaultBudget.snapshot().settledCny,
+		((usage.input + usage.cacheRead + usage.cacheWrite) * LIMITS.maxInputCnyPerMillionTokens +
+			usage.output * LIMITS.maxOutputCnyPerMillionTokens) / 1_000_000,
+		"omitting the optional cache ceiling retains old all-input settlement behavior");
+});
+
+test("cache-read ceiling rejects unsupported model prices and invalid limits", () => {
+	for (const cacheLimit of [0, -1, LIMITS.maxInputCnyPerMillionTokens + 0.01]) {
+		assert.throws(() => new DeepSeekCampaignBudget({ ...LIMITS, maxCacheReadCnyPerMillionTokens: cacheLimit }), /invalid DeepSeek campaign limits/);
+	}
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCacheReadCnyPerMillionTokens: 0.2 });
+	assert.throws(() => budget.assertResolved({ ...MODEL, cost: { ...MODEL.cost, cacheRead: 0.021 } }), /price ceiling did not verify/);
+	assert.throws(() => new DeepSeekCampaignBudget({ ...LIMITS, maxCacheReadCnyPerMillionTokens: 0.05 }).assertResolved(MODEL), /price ceiling did not verify/);
+});
+
+test("missing or overlapping cache usage remains at the full worst-case reserve", () => {
+	for (const usage of [
+		{ input: 10, cacheWrite: 5, output: 4, totalTokens: 19, cost: 0.00001 },
+		{ input: 10, cacheRead: 1_000, cacheWrite: 5, output: 4, totalTokens: 19, cost: 0.00001 },
+	]) {
+		const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1, maxCacheReadCnyPerMillionTokens: 0.2 });
+		const lease = budget.beginPrompt("partial-cache", "1");
+		budget.reserve(lease, 1_200, "request");
+		const held = budget.snapshot().committedCny;
+		assert.throws(() => budget.settleReported(lease, "request", { ...reported("partial-cache"), usage }), /provider usage or call outcome/);
+		assert.equal(budget.snapshot().settledCny, 0);
+		assert.equal(budget.snapshot().unknownReservedCny, held);
+		assert.equal(budget.snapshot().committedCny, held);
+	}
+});
+
+test("late and cross-lease usage cannot settle someone else's reserve", () => {
+	const budget = new DeepSeekCampaignBudget(LIMITS);
+	const left = budget.beginPrompt("left", "1");
+	const right = budget.beginPrompt("right", "1");
+	budget.reserve(left, 100, "left-request");
+	budget.reserve(right, 100, "right-request");
+	assert.throws(() => budget.settleReported(right, "left-request", reported("cross")), /no active reserved request/);
+	assert.equal(budget.snapshot().settledCny, 0);
+	assert.equal(budget.snapshot().stopReason, "usage-reconciliation");
+	budget.failPrompt(left);
+	assert.throws(() => budget.settleReported(left, "left-request", reported("late")), /no active reserved request/);
+	assert.equal(budget.snapshot().unknownReservedCny, budget.snapshot().grossReservedCny / 2);
+});
+
+test("duplicate finish cannot settle or bill the same provider response twice", () => {
+	const budget = new DeepSeekCampaignBudget(LIMITS);
+	const lease = budget.beginPrompt("session", "1");
+	budget.reserve(lease, 100, "request-1");
+	const receipts = [{ requestId: "request-1", event: reported("entry-1") }];
+	budget.finishPrompt(lease, receipts);
+	const committed = budget.snapshot().committedCny;
+	assert.throws(() => budget.finishPrompt(lease, receipts), /invalid or already finished/);
+	assert.equal(budget.snapshot().committedCny, committed);
+	assert.equal(budget.snapshot().settledCny, committed);
+	assert.equal(budget.snapshot().stopReason, "usage-reconciliation");
+});
+
+test("dispose and resume can continue the same session with a fresh prompt lease", async (t) => {
+	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-resume-lease-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1, maxProviderCallsPerPrompt: 1 });
+	const sent = { count: 0, options: [] as Array<{ maxTokens?: number; maxRetries?: number }> };
+	const runner = new PiSessionRunner({ modelRuntime: offlineRuntime(sent), createSession: offlineFactory(1), campaignBudget: budget });
+	const initial = await runner.create(spec(dir, "resume-lease"));
+	await initial.prompt("first");
+	const ref = initial.ref;
+	initial.dispose();
+	const resumed = await runner.resume(ref);
+	t.after(() => resumed.dispose());
+	await resumed.prompt("second");
+	assert.equal(sent.count, 2);
+	assert.equal(budget.snapshot().reservations, 2);
+	assert.equal(budget.snapshot().activePrompts, 0);
+	assert.equal(budget.snapshot().stopped, false);
 });
 
 test("real Pi tool request uses the synthetic runtime key at the fixed DeepSeek endpoint", async () => {

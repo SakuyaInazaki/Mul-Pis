@@ -1,6 +1,6 @@
 import { createReadStream, createWriteStream } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { copyFile, cp, lstat, mkdir, readFile, readdir, realpath, stat, unlink } from "node:fs/promises";
+import { chmod, copyFile, cp, lstat, mkdir, readFile, readdir, realpath, rmdir, stat, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import { Transform } from "node:stream";
@@ -10,7 +10,7 @@ import { loadPrompt, section, systemPromptFor } from "../prompts.ts";
 import { HarnessError } from "../types.ts";
 import { nowIso, readTextIfExists, writeFileAtomic } from "../workspace.ts";
 import { isTextFile, mediaType } from "../media.ts";
-import { recordSession, sessionSpec, type StageContext } from "../stages/context.ts";
+import { sessionSpec, type StageContext } from "../stages/context.ts";
 import { isSafeRelativeOutputPath, resolveExpectedOutputFiles } from "./expected-output.ts";
 import type { BeginGoalInput, CurrentGoal, DecisionInput, EvidenceFile, FinishInput, HostStopReasonKind, HostStopReceipt, InterruptInput, M07CheckpointRecord, M07Controller, M07TaskRecord, TaskCheck, TaskReviewInput, TaskSpecInput, M07OperationV1 } from "./types.ts";
 import type { StageRunRecord } from "../types.ts";
@@ -23,10 +23,36 @@ import { GenerationStore, isM07WorkflowStrategy } from "../improvement/generatio
 import { probeProcessIdentity, readCurrentProcessIdentity, type ProcessIdentityV1 } from "../runtime/process-identity.ts";
 import { parseRunDescriptor, type RunDescriptorV1 } from "../runtime/run-descriptor.ts";
 import { parseRoundReview, promptBeforeDeadline, TaskDeadlineError } from "./execution-loop.ts";
+import { openBoundedSession, type EvidenceBindingV1 } from "../context/boundary.ts";
 
 const STATE = "goal.json";
 const HOST_STOP_KEY = Symbol("m07-host-stop");
 const HOST_STOP_REASONS: ReadonlySet<HostStopReasonKind> = new Set(["request-aborted", "provider-error", "session-shutdown", "no-progress"]);
+const dispatchQueues = new Map<string, Promise<void>>();
+
+/** One M07 task dispatch per goal at a time, including shared benchmark operations. A stale cross-process lock fails closed. */
+async function withGoalDispatch<T>(ctx: StageContext, runId: string, body: () => Promise<T>): Promise<T> {
+	const key = ctx.ws.runDir("M07", runId);
+	const prior = dispatchQueues.get(key) ?? Promise.resolve();
+	let release!: () => void;
+	const turn = new Promise<void>((resolve) => { release = resolve; });
+	const tail = prior.then(() => turn);
+	dispatchQueues.set(key, tail);
+	await prior;
+	const lockDir = path.join(key, ".delegate-lock");
+	let acquired = false;
+	try {
+		try { await mkdir(lockDir); acquired = true; }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new HarnessError("m07.concurrent", "another process owns this goal's task dispatch; verify it has stopped before retrying");
+			throw error;
+		}
+		return await body();
+	} finally {
+		try { if (acquired) await rmdir(lockDir); }
+		finally { release(); if (dispatchQueues.get(key) === tail) dispatchQueues.delete(key); }
+	}
+}
 function nonempty(value: string, label: string): string {
 	if (!value?.trim()) throw new HarnessError("m07.input", `${label} 不能为空`);
 	return value.trim();
@@ -65,6 +91,92 @@ async function snapshotRoundForReviewer(workDir: string, destination: string): P
 		if (files > 1_000 || bytes > 64_000_000) throw new HarnessError("m07.loop-snapshot", "round snapshot exceeds 1,000 files or 64 MB");
 		return true;
 	} });
+}
+
+interface BranchManifestV1 {
+	version: 1;
+	parentRunId: string;
+	parentTaskId: string;
+	parentWorkRoot: string;
+	authorizedChildRootBase: string;
+	frozenWorkRoot: string;
+	problemSourcePath: string;
+	frozenProblemPath: string;
+	knowledgeSnapshot?: string;
+	m04BaselineRunId?: string;
+	forkWorkspaceAuthority: { version: 1; parentRoot: string; authorizedChildRootBase: string; childWorkLeaf: string; frozenEvidenceRoot: string; files: Array<{ sourcePath: string; frozenPath: string; bytes: number }> };
+	files: Array<{ relativePath: string; historicalPath: string; frozenPath: string; bytes: number }>;
+}
+
+function forbiddenBranchEvidence(relative: string): boolean {
+	return relative.split(path.sep).some((part) => /^(?:\.git|\.ssh|\.aws|\.npmrc|\.pypirc|\.netrc|\.env(?:\..*)?|id_[a-z0-9_-]+)$/i.test(part) || /(?:^|[-_.])(?:api[-_]?key|password|oauth|service[-_]?account|credential|secret|token|session|auth)(?:[-_.]|$)/i.test(part) || /\.(?:jsonl|pem|key|p12|pfx)$/i.test(part));
+}
+
+/** Freeze only bounded task work evidence. Auth/session-like files fail closed rather than entering another execution root. */
+async function freezeBranchWork(goal: CurrentGoal, task: M07TaskRecord): Promise<{ manifestPath: string; workSnapshotRoot: string; problemSnapshotCopy: string }> {
+	const parentTaskDir = path.dirname(task.workDir);
+	if ((await lstat(task.workDir)).isSymbolicLink()) throw new HarnessError("m07.branch-evidence", "task work directory was replaced by a symlink");
+	const sourceRoot = await realpath(task.workDir);
+	if (!inside(await realpath(parentTaskDir), sourceRoot)) throw new HarnessError("m07.branch-evidence", "task work directory escaped its task root");
+	const root = path.join(parentTaskDir, "branch-source");
+	const workSnapshotRoot = path.join(root, "work-snapshot");
+	await mkdir(root, { recursive: false });
+	const files: BranchManifestV1["files"] = [];
+	let totalBytes = 0;
+	await cp(sourceRoot, workSnapshotRoot, { recursive: true, filter: async (source) => {
+		const relative = path.relative(sourceRoot, source);
+		if (relative && forbiddenBranchEvidence(relative)) throw new HarnessError("m07.branch-evidence", `unsafe auth/session-like source cannot be forked: ${relative}`);
+		const info = await lstat(source);
+		if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) throw new HarnessError("m07.branch-evidence", "branch evidence contains a symlink or special file");
+		if (info.isFile()) {
+			totalBytes += info.size;
+			files.push({ relativePath: relative, historicalPath: path.join(sourceRoot, relative), frozenPath: path.join(workSnapshotRoot, relative), bytes: info.size });
+		}
+		if (files.length > 1_000 || totalBytes > 64_000_000) throw new HarnessError("m07.branch-evidence", "branch evidence exceeds 1,000 files or 64 MB");
+		return true;
+	} });
+	const manifestPath = path.join(root, "manifest.json");
+	for (const file of files) {
+		if (!(await readFile(file.historicalPath)).equals(await readFile(file.frozenPath))) throw new HarnessError("m07.branch-evidence", `task work changed during branch evidence freeze: ${file.relativePath}`);
+	}
+	const problemInfo = await lstat(goal.problemSnapshotPath);
+	if (!problemInfo.isFile() || problemInfo.isSymbolicLink() || totalBytes + problemInfo.size > 64_000_000) throw new HarnessError("m07.branch-evidence", "original problem snapshot is not a bounded regular file");
+	const problemSnapshotCopy = path.join(root, "problem-snapshot.md");
+	await copyFile(goal.problemSnapshotPath, problemSnapshotCopy);
+	if (!(await readFile(goal.problemSnapshotPath)).equals(await readFile(problemSnapshotCopy))) throw new HarnessError("m07.branch-evidence", "original problem snapshot changed while freezing");
+	const authorizedChildRootBase = await realpath(path.dirname(parentTaskDir));
+	const manifest: BranchManifestV1 = { version: 1, parentRunId: goal.runId, parentTaskId: task.taskId, parentWorkRoot: sourceRoot, authorizedChildRootBase, frozenWorkRoot: workSnapshotRoot, problemSourcePath: goal.problemSnapshotPath, frozenProblemPath: problemSnapshotCopy, knowledgeSnapshot: goal.knowledgeSnapshot, m04BaselineRunId: goal.m04BaselineRunId, forkWorkspaceAuthority: { version: 1, parentRoot: sourceRoot, authorizedChildRootBase, childWorkLeaf: path.basename(sourceRoot), frozenEvidenceRoot: workSnapshotRoot, files: files.map((file) => ({ sourcePath: file.historicalPath, frozenPath: file.frozenPath, bytes: file.bytes })) }, files };
+	await writeFileAtomic(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+	for (const file of files) await chmod(file.frozenPath, 0o444);
+	const directories = [workSnapshotRoot];
+	for (const file of files) { let current = path.dirname(file.frozenPath); while (inside(workSnapshotRoot, current) && !directories.includes(current)) { directories.push(current); current = path.dirname(current); } }
+	// Keep directories owner-writable for normal workspace cleanup. File mode deters
+	// accidental edits; native execution is not an OS sandbox against the same UID.
+	for (const directory of directories.sort((a, b) => b.length - a.length)) await chmod(directory, 0o755);
+	await chmod(manifestPath, 0o444);
+	await chmod(problemSnapshotCopy, 0o444);
+	return { manifestPath, workSnapshotRoot, problemSnapshotCopy };
+}
+
+async function loadBranchManifest(source: NonNullable<M07TaskRecord["branchSource"]>, parentRunId: string, parentTaskId: string): Promise<BranchManifestV1> {
+	let manifest: BranchManifestV1;
+	try {
+		const bytes = await readFile(source.manifestPath);
+		if (!(await readFile(source.checkpoint.manifestSnapshot)).equals(bytes)) throw new Error("manifest differs from checkpoint copy");
+		manifest = JSON.parse(bytes.toString("utf8")) as BranchManifestV1;
+	}
+	catch { throw new HarnessError("m07.branch", "frozen parent evidence manifest is unavailable"); }
+	if (manifest.version !== 1 || manifest.parentRunId !== parentRunId || manifest.parentTaskId !== parentTaskId || manifest.authorizedChildRootBase !== path.dirname(path.dirname(manifest.parentWorkRoot)) || manifest.frozenWorkRoot !== source.workSnapshotRoot || manifest.frozenProblemPath !== source.problemSnapshotCopy || !Array.isArray(manifest.files) || manifest.files.length > 1_000 || manifest.files.some((file) => !Number.isSafeInteger(file.bytes) || file.bytes < 0) || manifest.files.reduce((sum, file) => sum + file.bytes, 0) > 64_000_000) throw new HarnessError("m07.branch", "frozen parent evidence manifest does not match the requested source");
+	if (JSON.stringify(manifest.forkWorkspaceAuthority) !== JSON.stringify({ version: 1, parentRoot: manifest.parentWorkRoot, authorizedChildRootBase: manifest.authorizedChildRootBase, childWorkLeaf: path.basename(manifest.parentWorkRoot), frozenEvidenceRoot: manifest.frozenWorkRoot, files: manifest.files.map((file) => ({ sourcePath: file.historicalPath, frozenPath: file.frozenPath, bytes: file.bytes })) })) throw new HarnessError("m07.branch", "fork workspace authority does not match frozen evidence files");
+	if ((await lstat(source.problemSnapshotCopy)).isSymbolicLink() || !(await lstat(source.problemSnapshotCopy)).isFile()) throw new HarnessError("m07.branch", "frozen problem evidence is unavailable");
+	const snapshotRoot = await realpath(source.workSnapshotRoot);
+	for (const file of manifest.files) {
+		if (!file.relativePath || path.isAbsolute(file.relativePath) || file.relativePath.split(path.sep).includes("..") || forbiddenBranchEvidence(file.relativePath) || file.historicalPath !== path.join(manifest.parentWorkRoot, file.relativePath) || file.frozenPath !== path.join(source.workSnapshotRoot, file.relativePath)) throw new HarnessError("m07.branch", "frozen evidence mapping is unsafe");
+		const sourceInfo = await lstat(file.frozenPath);
+		const actual = await realpath(file.frozenPath);
+		if (sourceInfo.isSymbolicLink() || !inside(snapshotRoot, actual) || !sourceInfo.isFile() || sourceInfo.size !== file.bytes) throw new HarnessError("m07.branch", "frozen evidence file is unavailable or changed");
+	}
+	return manifest;
 }
 
 function statePath(ctx: StageContext, runId: string): string {
@@ -377,6 +489,7 @@ async function writeFeedback(ctx: StageContext, goal: CurrentGoal, limits: Proje
 	if (goal.workflowMethod?.artifact.slot === "evidence-handoff") lines.push("## 冻结的证据交接方法", "", "以下方法正文曾作为 M07 任务指导；这里保留其版本与内容以供 M04 核对，实际证据与未执行项仍以本包记录为准。", "", goal.workflowMethod.artifact.body, "");
 	for (const task of goal.tasks) {
 		lines.push(`### ${task.taskId} ${task.objective}`, "", `- 状态：${task.status}`, `- 模式：${task.mode}`, `- 会话报告：${task.reportPath ? displayPath(task.reportPath) : "未产生"}`, `- 实际读取：${task.readCoverage.join("、") || "无可记录读取"}`);
+		if (task.context) lines.push(`- 竞争分支来源：${task.context.parentRunId}/${task.context.parentTaskId}@${task.context.checkpointId}；继承历史不是知识采用，也不代表旧路径在当前分支仍可操作。`);
 		for (const artifact of task.review?.artifacts ?? []) lines.push(`- 产物：${displayPath(artifact.path)}（${artifact.mediaType === "text" ? "文本，纳入下方实际内容" : "二进制，未读取内容"}）`);
 		for (const check of task.review?.checks ?? []) lines.push(`- 检查 ${check.result}：${check.criterion}；证据 ${check.evidence.map(displayPath).join("、") || "无"}`);
 		for (const failure of task.review?.failures ?? []) lines.push(`- 失败：${failure}`);
@@ -387,6 +500,10 @@ async function writeFeedback(ctx: StageContext, goal: CurrentGoal, limits: Proje
 		if (task.toolLog.length) lines.push(`- 工具日志：${JSON.stringify(task.toolLog)}`);
 		lines.push("");
 	}
+	if (goal.branchSelections?.length) lines.push("## 竞争分支比较与选择", "", ...goal.branchSelections.flatMap((selection) => [
+		`- 来源 ${selection.parentTaskId}；候选 ${selection.candidates.map((candidate) => `${candidate.taskId}:${candidate.status}[${candidate.checks.map((check) => check.result).join(",") || "no-review"}]`).join("、")}；选择 ${selection.selectedTaskId ?? "无胜者"}。`,
+		`- 理由：${selection.rationale}`, "- 以上只是 M07 候选筛选与已记录 checks；M04 仍须实际读取原证据后自行判断经验是否采用。", "",
+	]));
 	lines.push("## 实际材料清单与预算内内容", "", "清单中的‘已显示’只表示反馈包内联范围；未显示部分没有被本反馈包或后续 M04 自动读取。", "");
 	const materialPaths = new Map<string, { role: ProjectionMaterialV1["role"]; optional: boolean }>();
 	const addMaterial = (file: string, role: ProjectionMaterialV1["role"], optional = false) => { if (!materialPaths.has(file)) materialPaths.set(file, { role, optional }); };
@@ -571,13 +688,30 @@ async function freezeCheckpoint(ctx: StageContext, goal: CurrentGoal, limits: Pr
 		task.workDir = "";
 		task.inputCopies = [];
 		task.expectedOutputPaths = [];
-		if (!selected.has(task.taskId)) { delete task.reportPath; delete task.review; continue; }
+		task.toolLog = [];
+		delete task.session;
+		delete task.executionFailure;
+		delete task.branchUnavailableReason;
+		delete task.branchSource;
+		delete task.executionRounds;
+		if (!selected.has(task.taskId)) {
+			task.objective = ""; task.inputs = []; task.expectedOutputs = []; task.checks = []; task.readCoverage = [];
+			delete task.reportPath; delete task.review; delete task.experienceSelection;
+			delete task.planCopy; delete task.planInput; delete task.resourceInputs;
+			delete task.knowledgeIds; delete task.experienceRefs; delete task.experienceContextRefs; delete task.experienceTags;
+			delete task.lessonDeltaOutput; delete task.executionLoop;
+			continue;
+		}
 		if (!task.review) { delete task.reportPath; continue; }
 		task.review.frozenReportPath = await remap(task.review.frozenReportPath);
 		task.reportPath = task.review.frozenReportPath;
 		for (const artifact of task.review.artifacts) { artifact.path = await remap(artifact.path); delete artifact.sourcePath; }
 		for (const check of task.review.checks) check.evidence = await Promise.all(check.evidence.map(remap));
 		if (task.review.independentCheck) task.review.independentCheck.report = await remap(task.review.independentCheck.report);
+	}
+	for (const selection of frozen.branchSelections ?? []) {
+		selection.rationale = "scoped checkpoint omits branch comparison rationale; inspect the complete goal only through an authorized full handoff";
+		for (const candidate of selection.candidates) if (!selected.has(candidate.taskId)) candidate.checks = [];
 	}
 	frozen.problemSnapshotPath = path.join(rootDir, problemFile);
 	const goalSnapshotPath = path.join(rootDir, STATE);
@@ -647,6 +781,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 		status: (runId) => load(ctx, runId),
 
 		async plan(runId, plan, planOptions) {
+			return withGoalDispatch(ctx, runId, async () => {
 			const goal = await load(ctx, runId); requireActive(goal);
 			if (Boolean(planOptions?.checkpointId) !== Boolean(planOptions?.m04RunId)) throw new HarnessError("m07.checkpoint", "refreshBaseline 的 checkpointId 与 m04RunId 必须成对指定");
 			if ((planOptions?.checkpointId || planOptions?.m04RunId) && !planOptions?.refreshBaseline) throw new HarnessError("m07.checkpoint", "checkpoint 消费绑定仅适用于 refreshBaseline");
@@ -668,9 +803,11 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			}
 			goal.plan = nextPlan;
 			await save(ctx, goal); return goal;
+			});
 		},
 
 		async checkpoint(runId, checkpointOptions) {
+			return withGoalDispatch(ctx, runId, async () => {
 			const goal = await load(ctx, runId); requireActive(goal);
 			frozenPolicy(goal);
 			if (goal.tasks.some((task) => task.status === "running")) throw new HarnessError("m07.checkpoint", "存在 running 任务，不能冻结非终态反馈");
@@ -679,15 +816,36 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			const selectedTaskIds = requested ?? goal.tasks.map((task) => task.taskId);
 			await verifyFrozenWorkflowMethod(ctx, goal, options.registeredExperienceStores);
 			return freezeCheckpoint(ctx, goal, snapshotLimits, selectedTaskIds);
+			});
 		},
 
 			async delegate(runId, spec) {
+			return withGoalDispatch(ctx, runId, async () => {
 				const goal = await load(ctx, runId); requireActive(goal); nonempty(spec.objective, "task objective");
+				if (spec.context && spec.context.mode !== "fork") throw new HarnessError("m07.branch", "unsupported task context mode");
 				if (spec.mode === "execute" && (goal.executionState?.operations.some((operation) => operation.status === "unknown") || goal.tasks.some((task) => task.mode === "execute" && task.status === "unknown"))) throw new HarnessError("m07.operation-unknown", "仍有外部副作用状态未知；先经宿主控制面对账。只读 check/reason 任务仍可用于核查");
 				await verifyFrozenWorkflowMethod(ctx, goal, options.registeredExperienceStores, spec);
 			const policy = frozenPolicy(goal);
 			await requireCurrentFormalBaseline(ctx, goal);
 			spec = { ...spec, objective: spec.objective.trim(), inputs: normalizedUnique(spec.inputs, "task input"), expectedOutputs: normalizedUnique(spec.expectedOutputs, "expected output"), checks: normalizedUnique(spec.checks, "task check") };
+			let branchParent: M07TaskRecord | undefined;
+			let branchManifest: BranchManifestV1 | undefined;
+			if (spec.context) {
+				const reference = spec.context;
+				if (goal.tasks.some((item) => item.status === "running") || goal.executionState?.operations.some((item) => ["prepared", "issued", "unknown"].includes(item.status))) throw new HarnessError("m07.branch", "cannot fork while another task or external operation is active or unresolved");
+				if (reference.parentRunId !== runId || !reference.parentTaskId || !reference.checkpointId) throw new HarnessError("m07.branch", "fork requires this goal's run, parent task, and exact checkpoint ID");
+				branchParent = goal.tasks.find((item) => item.taskId === reference.parentTaskId);
+				if (!branchParent || branchParent.mode !== "execute" || branchParent.context || !["returned", "accepted", "rejected"].includes(branchParent.status) || !branchParent.branchSource || branchParent.branchSource.checkpoint.id !== reference.checkpointId) throw new HarnessError("m07.branch", "parent is not a settled, frozen execute task at the requested checkpoint");
+				if (branchParent.branchSource.checkpoint.runId !== runId || branchParent.branchSource.checkpoint.taskId !== branchParent.taskId || branchParent.branchSource.checkpoint.inputManifest !== branchParent.branchSource.manifestPath) throw new HarnessError("m07.branch", "checkpoint receipt does not bind this run, task, and evidence manifest");
+				if (goal.tasks.filter((item) => item.context?.parentTaskId === reference.parentTaskId).length >= 4) throw new HarnessError("m07.branch", "one checkpoint supports at most four bounded candidates");
+				if (goal.branchSelections?.some((item) => item.parentTaskId === reference.parentTaskId)) throw new HarnessError("m07.branch", "branch selection is frozen; no later candidate may join this comparison");
+				if (spec.mode !== "execute" || spec.objective !== branchParent.objective || !sameStrings(spec.checks, branchParent.checks) || !sameStrings(spec.expectedOutputs, branchParent.expectedOutputs) || Boolean(spec.requireIndependentCheck) !== Boolean(branchParent.requireIndependentCheck) || !sameStrings(spec.inputs, branchParent.inputs) || (spec.parentTaskId && spec.parentTaskId !== branchParent.taskId) || (spec.supersedesTaskId && spec.supersedesTaskId !== branchParent.taskId)) throw new HarnessError("m07.branch", "fork candidates must retain the parent's objective, inputs, outputs, checks, execute mode, and independent-check obligation");
+				if (JSON.stringify(spec.knowledgeIds ?? []) !== JSON.stringify(branchParent.knowledgeIds ?? []) || JSON.stringify(spec.experienceRefs ?? []) !== JSON.stringify(branchParent.experienceRefs ?? []) || JSON.stringify(spec.experienceContextRefs ?? []) !== JSON.stringify(branchParent.experienceContextRefs ?? []) || JSON.stringify(spec.experienceTags ?? []) !== JSON.stringify(branchParent.experienceTags ?? []) || JSON.stringify(spec.resourceInputs ?? []) !== JSON.stringify(branchParent.resourceInputs ?? []) || spec.planInput !== branchParent.planInput || spec.lessonDeltaOutput !== branchParent.lessonDeltaOutput || Boolean(spec.executionLoop) !== Boolean(branchParent.executionLoop) || (spec.executionLoop && spec.executionLoop.maxRounds !== branchParent.executionLoop?.maxRounds)) throw new HarnessError("m07.branch", "fork cannot silently change frozen knowledge applicability, plan, resources, lesson output, or review-loop obligations");
+				if (branchParent.knowledgeSnapshot !== goal.knowledgeSnapshot || branchParent.m04BaselineRunId !== goal.m04BaselineRunId) throw new HarnessError("m07.branch", "goal baseline changed since the source task; establish a new task rather than fork old authority");
+				branchManifest = await loadBranchManifest(branchParent.branchSource, runId, branchParent.taskId);
+				if (branchManifest.knowledgeSnapshot !== goal.knowledgeSnapshot || branchManifest.m04BaselineRunId !== goal.m04BaselineRunId || branchManifest.problemSourcePath !== goal.problemSnapshotPath) throw new HarnessError("m07.branch", "frozen source manifest no longer matches the goal's inputs and formal baseline");
+				spec = { ...spec, parentTaskId: branchParent.taskId, supersedesTaskId: branchParent.taskId };
+			}
 			if (spec.executionLoop) {
 				if (spec.mode !== "execute" || !Number.isInteger(spec.executionLoop.maxRounds) || spec.executionLoop.maxRounds < 1 || spec.executionLoop.maxRounds > 8 || !Number.isFinite(Date.parse(spec.executionLoop.deadlineAt)) || Date.parse(spec.executionLoop.deadlineAt) <= Date.now()) throw new HarnessError("m07.loop", "executionLoop requires execute mode, 1–8 rounds, and a future absolute deadline");
 			}
@@ -705,10 +863,10 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				}
 			}
 			if (spec.parentTaskId && !goal.tasks.some((t) => t.taskId === spec.parentTaskId)) throw new HarnessError("m07.task", `未知 parentTaskId ${spec.parentTaskId}`);
-			const resolvedInputs: string[] = []; for (const requested of spec.inputs) resolvedInputs.push(await confinedExistingFile(ctx, requested));
+			const resolvedInputs: string[] = []; for (const requested of spec.inputs) resolvedInputs.push(branchParent ? requested : await confinedExistingFile(ctx, requested));
 			if (spec.planInput) {
 				if (spec.mode !== "execute") throw new HarnessError("m07.plan-input", "planInput is only valid for an execute task");
-				const planSource = await confinedExistingFile(ctx, spec.planInput);
+				const planSource = branchParent ? spec.planInput : await confinedExistingFile(ctx, spec.planInput);
 				if (!resolvedInputs.includes(planSource) || mediaType(planSource) !== "text") throw new HarnessError("m07.plan-input", "planInput must identify a declared text input");
 				spec.planInput = planSource;
 			}
@@ -718,7 +876,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				spec.resourceInputs = await Promise.all(spec.resourceInputs.map(async (item) => {
 					if (!item || !/^[A-Za-z][A-Za-z0-9._-]{0,63}$/.test(item.id) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(item.version) || seen.has(item.id)) throw new HarnessError("m07.resources", "resourceInputs must have unique safe IDs and explicit versions");
 					seen.add(item.id);
-					const source = await confinedExistingFile(ctx, item.input);
+					const source = branchParent ? item.input : await confinedExistingFile(ctx, item.input);
 					if (!resolvedInputs.includes(source) || mediaType(source) !== "text") throw new HarnessError("m07.resources", "each resource input must be a declared text input");
 					return { id: item.id, version: item.version, input: source };
 				}));
@@ -729,7 +887,13 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			const id = taskId(goal), dir = path.join(ctx.ws.runDir("M07", runId), "tasks", id), workDir = path.join(dir, "work"), inputsDir = path.join(workDir, "inputs");
 			await mkdir(inputsDir, { recursive: true });
 			const copies: M07TaskRecord["inputCopies"] = [];
-			for (let i = 0; i < resolvedInputs.length; i++) { const source = resolvedInputs[i]; const copy = path.join(inputsDir, uniqueName(i, source)); await copyFile(source, copy); copies.push({ source, copy, mediaType: mediaType(source) }); }
+			if (branchParent && branchManifest) {
+				for (const file of branchManifest.files) { const destination = path.join(workDir, file.relativePath); await mkdir(path.dirname(destination), { recursive: true }); await copyFile(file.frozenPath, destination); await chmod(destination, 0o644); }
+				for (const original of branchParent.inputCopies) { const relative = path.relative(branchParent.workDir, original.copy); if (relative.startsWith("..") || !branchManifest.files.some((file) => file.relativePath === relative)) throw new HarnessError("m07.branch", "parent input lacks a frozen source mapping"); copies.push({ source: original.source, copy: path.join(workDir, relative), mediaType: original.mediaType }); }
+				const childMap = branchManifest.files.map((file) => ({ historicalPath: file.historicalPath, frozenPath: file.frozenPath, childPath: path.join(workDir, file.relativePath) }));
+				await writeFileAtomic(path.join(workDir, "branch-evidence-map.json"), `${JSON.stringify({ version: 1, parentRunId: runId, parentTaskId: branchParent.taskId, checkpointId: branchParent.branchSource!.checkpoint.id, files: childMap }, null, 2)}\n`);
+				await writeFileAtomic(path.join(workDir, "fork-owner.json"), `${JSON.stringify({ version: 1, checkpointId: branchParent.branchSource!.checkpoint.id, parentRoot: branchManifest.parentWorkRoot, childRoot: workDir, childContainer: path.basename(path.dirname(workDir)) }, null, 2)}\n`);
+			} else for (let i = 0; i < resolvedInputs.length; i++) { const source = resolvedInputs[i]; const copy = path.join(inputsDir, uniqueName(i, source)); await copyFile(source, copy); copies.push({ source, copy, mediaType: mediaType(source) }); }
 			let pack: string | undefined;
 			if (spec.knowledgeIds?.length) {
 				for (const requested of spec.knowledgeIds) {
@@ -763,7 +927,11 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			const role = spec.mode === "check" ? "reviewer" : "execution";
 			const tools = spec.mode === "execute" ? { kind: "execution" as const, root: workDir, tools: ["read", "write", "edit", "bash"] as Array<"read" | "write" | "edit" | "bash"> } : { kind: "read-dir" as const, root: workDir };
 			const operationId = spec.mode === "execute" && goal.executionState ? `O${String(goal.executionState.operations.length + 1).padStart(3, "0")}` : undefined;
-			const { message, event } = await taskMessage(ctx, goal, id, spec, copies, pack, policy, snapshotLimits, operationId);
+			let { message, event } = await taskMessage(ctx, goal, id, spec, copies, pack, policy, snapshotLimits, operationId);
+			if (branchParent?.branchSource && branchManifest) {
+				message += `\n\n# Frozen competitive branch\nThis is an independently writable candidate for the exact same task and goal obligations. The inherited Pi history is a historical causal record, not permission to reuse its old absolute paths or repeat external actions. Historical work root: ${branchManifest.parentWorkRoot}. Your private work root: ${workDir}. The complete old-path to frozen-evidence and private-copy mapping is in branch-evidence-map.json in your work root. Read original evidence as needed; the manifest and summaries alone do not mean you have read it. Write only in your private work root. Do not modify parent files, other branches, the knowledge store, or original checks. Your result is a candidate until the M07 controller reviews and explicitly selects it; M04 alone decides knowledge adoption.`;
+				if (message.length + systemPromptFor("execution").length > policy.maxPromptChars) throw new HarnessError("context.budget", "branch evidence handoff exceeds the frozen prompt budget");
+			}
 			await writeFileAtomic(path.join(dir, "message.md"), message);
 			const task: M07TaskRecord = { ...spec, taskId: id, status: "running", createdAt: nowIso(), returnedAt: "", workDir, inputCopies: copies, expectedOutputPaths, readCoverage: [], toolLog: [], knowledgeSnapshot: goal.knowledgeSnapshot, m04BaselineRunId: goal.m04BaselineRunId, experienceSelection, ...(spec.planInput ? { planCopy: copies.find((item) => item.source === spec.planInput)?.copy } : {}) };
 			const operation: M07OperationV1 | undefined = operationId ? { version: 1, id: operationId, taskId: id, status: "prepared", issuedAt: nowIso() } : undefined;
@@ -777,7 +945,20 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				const verifyFrozenInputs = async (): Promise<void> => { for (const input of frozenInputBytes) if (!(await readFile(input.copy)).equals(input.bytes)) throw new HarnessError("m07.plan-input", "builder changed a frozen plan or versioned resource copy; stop this task and review the evidence"); };
 				const session = sessionSpec(ctx, `M07-${id}`, role, systemPromptFor(role), tools);
 				if (goal.methodBinding) session.methodBinding = goal.methodBinding;
-				handle = await ctx.runner.create(session); task.session = handle.ref; await save(ctx, goal);
+				const runRecord = await ctx.ws.readRun("M07", runId);
+				if (branchParent?.branchSource && branchManifest) {
+					const checkpoint = branchParent.branchSource.checkpoint;
+					const workspaceBinding = { version: 1 as const, parentRoot: branchManifest.parentWorkRoot, authorizedChildRootBase: branchManifest.authorizedChildRootBase, childWorkLeaf: branchManifest.forkWorkspaceAuthority.childWorkLeaf, childRoot: workDir, ownerMarkerPath: path.join(workDir, "fork-owner.json"), frozenEvidenceRoot: branchManifest.frozenWorkRoot, files: branchManifest.files.map((file) => ({ sourcePath: file.historicalPath, frozenPath: file.frozenPath, childPath: path.join(workDir, file.relativePath), bytes: file.bytes })) };
+					const evidence: EvidenceBindingV1[] = [
+						{ version: 1, label: `M07 ${branchParent.taskId} frozen work mapping`, path: checkpoint.manifestSnapshot, status: "frozen-copy", sourceVersion: checkpoint.id },
+						{ version: 1, label: "original problem snapshot", path: branchParent.branchSource.problemSnapshotCopy, status: "frozen-copy", sourceVersion: `${runId}/${branchParent.taskId}` },
+					];
+					handle = await openBoundedSession(ctx.runner, runRecord, { mode: "fork", intent: "branch-exploration", reason: `M07 ${id} competes from ${branchParent.taskId} frozen checkpoint ${checkpoint.id}; original checks and goal obligations remain binding`, evidence, checkpoint, workspaceBinding, spec: session }, () => ctx.ws.writeRun(runRecord));
+				} else {
+					const evidence: EvidenceBindingV1[] = copies.map((item) => ({ version: 1, label: path.basename(item.copy), path: item.copy, status: "frozen-copy", sourceVersion: `${runId}/${id}` }));
+					handle = await openBoundedSession(ctx.runner, runRecord, { mode: "fresh", intent: spec.mode === "check" ? "independent-judgment" : "new-work", reason: spec.mode === "check" ? "M07 independent task/check requires an uninherited judgement" : "M07 new task has no causal parent session", evidence, spec: session }, () => ctx.ws.writeRun(runRecord));
+				}
+				task.session = handle.ref; await save(ctx, goal);
 				if (spec.executionLoop) {
 					const deadlineMs = Date.parse(spec.executionLoop.deadlineAt);
 					const transcript: string[] = [];
@@ -799,7 +980,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 						if (task.experienceSelection) task.experienceSelection.loadedAt = nowIso();
 						const builderReportPath = path.join(dir, `round-${index}-builder.md`);
 						await writeFileAtomic(builderReportPath, report);
-						const round: NonNullable<M07TaskRecord["executionRounds"]>[number] = { index, operationId: currentOperation.id, builderReportPath, completedAt: nowIso() };
+						const round: NonNullable<M07TaskRecord["executionRounds"]>[number] = { index, operationId: currentOperation.id, builderContext: index === 1 ? branchParent ? { mode: "fork", reason: `same task explored from ${branchParent.branchSource!.checkpoint.id}` } : { mode: "fresh", reason: "new M07 task" } : { mode: "continue", reason: "same builder repairs the same frozen task in its live session" }, builderReportPath, completedAt: nowIso() };
 						task.executionRounds.push(round);
 						transcript.push(`## Round ${index} builder\n\n${report}`);
 						await save(ctx, goal);
@@ -808,11 +989,12 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 						const reviewerRoot = path.join(dir, `round-${index}-snapshot`);
 						await snapshotRoundForReviewer(workDir, reviewerRoot);
 						round.reviewerSnapshotPath = reviewerRoot;
-						const reviewerPrompt = `Review only this M07 task round and the copied work-directory snapshot. Goal: ${goal.goal}\nProblem relation: ${goal.problemRelation}\nFrozen goal constraints: ${goal.constraints.join("; ")}\nFrozen success criteria: ${goal.successCriteria.join("; ")}\nGoal plan at task creation: ${goal.plan}\nTask objective: ${spec.objective}\nChecks: ${spec.checks.join("; ")}\nExpected outputs: ${spec.expectedOutputs.join("; ")}\nFrozen plan input: ${task.planCopy ? path.relative(workDir, task.planCopy) : "none"}\nThe builder report follows. Inspect the copied files only as needed. Reply with JSON {"verdict":"ready|revise|replan|blocked","feedback":"specific evidence-grounded reason"}. ready only means ready for the controller's separate final review. Do not change the plan or task obligations.\n\n${report}`;
+						const reviewerPrompt = `Review only this M07 task round and the copied work-directory snapshot. Goal: ${goal.goal}\nProblem relation: ${goal.problemRelation}\nFrozen goal constraints: ${goal.constraints.join("; ")}\nFrozen success criteria: ${goal.successCriteria.join("; ")}\nGoal plan at task creation: ${goal.plan}\nTask objective: ${spec.objective}\nChecks: ${spec.checks.join("; ")}\nExpected outputs: ${spec.expectedOutputs.join("; ")}\nFrozen plan input: ${task.planCopy ? path.relative(workDir, task.planCopy) : "none"}\nThe builder report follows. Inspect the copied files only as needed. Reply with only JSON {"verdict":"ready|revise|replan|blocked","feedback":"specific evidence-grounded reason"}, without extra prose or code fences. Keep feedback preferably within 2,000 characters: identify decisive checked files, measurements, failures and limitations rather than reproducing the builder report. Do not omit a decisive caveat just to meet that target; use blocked if a material uncertainty remains. ready only means ready for the controller's separate final review. Do not change the plan or task obligations.\n\n${report}`;
 						if (reviewerPrompt.length + systemPromptFor("reviewer").length > policy.maxPromptChars) { task.loopStopReason = "reviewer-invalid"; break; }
 						const reviewerSpec = sessionSpec(ctx, `M07-${id}-round-${index}-reviewer`, "reviewer", systemPromptFor("reviewer"), { kind: "read-dir", root: reviewerRoot });
 						if (goal.methodBinding) reviewerSpec.methodBinding = goal.methodBinding;
-						const reviewer = await ctx.runner.create(reviewerSpec);
+						const reviewRunRecord = await ctx.ws.readRun("M07", runId);
+						const reviewer = await openBoundedSession(ctx.runner, reviewRunRecord, { mode: "fresh", intent: "independent-judgment", reason: `M07 round ${index} reviewer must independently inspect the frozen candidate snapshot`, evidence: [{ version: 1, label: `M07 ${id} round ${index} snapshot`, path: reviewerRoot, status: "frozen-copy", sourceVersion: `${runId}/${id}/round-${index}` }], spec: reviewerSpec }, () => ctx.ws.writeRun(reviewRunRecord));
 						round.reviewerSession = reviewer.ref;
 						await save(ctx, goal);
 						let rawReview: string;
@@ -854,13 +1036,26 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				if (activeOperation?.status === "prepared") activeOperation.status = "not-issued";
 				if (activeOperation && promptIssued && activeOperation.status === "issued") activeOperation.status = "unknown";
 			} finally {
-				if (handle) { task.readCoverage = handle.readCoverage(); task.toolLog.push(...handle.toolLog()); handle.dispose(); }
+				if (handle) {
+					if (task.mode === "execute" && task.status === "returned") {
+						try {
+							if (!ctx.runner.checkpoint) throw new HarnessError("m07.branch-unsupported", "runner has no stable checkpoint capability");
+							if (goal.executionState?.operations.some((item) => !["response-received", "confirmed", "not-issued"].includes(item.status))) throw new HarnessError("m07.branch", "external operation is not settled");
+							const frozen = await freezeBranchWork(goal, task);
+							const checkpoint = await ctx.runner.checkpoint(handle, { inputManifest: frozen.manifestPath, runId, taskId: id, externalOperationsSettled: true });
+							task.branchSource = { version: 1, checkpoint, manifestPath: frozen.manifestPath, workSnapshotRoot: frozen.workSnapshotRoot, problemSnapshotCopy: frozen.problemSnapshotCopy };
+						} catch (error) { task.branchUnavailableReason = (error as Error).message; }
+					}
+					task.readCoverage = handle.readCoverage(); task.toolLog.push(...handle.toolLog()); handle.dispose();
+				}
 				task.returnedAt = nowIso(); await save(ctx, goal);
 			}
 			return task;
+			});
 		},
 
 		async review(runId, input) {
+			return withGoalDispatch(ctx, runId, async () => {
 			const goal = await load(ctx, runId); requireActive(goal); const task = goal.tasks.find((t) => t.taskId === input.taskId); if (!task) throw new HarnessError("m07.task", `未知任务 ${input.taskId}`);
 			if (goal.decisions.some((d) => d.status === "open" && d.relatedTaskIds.includes(task.taskId))) throw new HarnessError("m07.decision", "该任务关联待用户决定事项，不能采用；不受影响任务仍可继续");
 			if (task.status !== "returned") throw new HarnessError("m07.review", `任务 ${task.taskId} 状态为 ${task.status}，不能评审采用`);
@@ -945,17 +1140,43 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			const accepted = checks.every((c) => c.result === "passed") && !failures.length && !unexecuted.length;
 			task.status = accepted ? "accepted" : "rejected"; task.review = { at: nowIso(), frozenReportPath, checks, artifacts, failures, unexecuted, limitations, independentCheck: input.independentCheck };
 			await save(ctx, goal); return task;
+			});
+		},
+
+		async selectBranch(runId, input) {
+			return withGoalDispatch(ctx, runId, async () => {
+			const goal = await load(ctx, runId); requireActive(goal);
+			if (goal.tasks.some((item) => ["running", "unknown"].includes(item.status)) || goal.executionState?.operations.some((item) => ["prepared", "issued", "unknown"].includes(item.status))) throw new HarnessError("m07.branch", "active tasks or unresolved external operations must settle before branch selection");
+			await requireCurrentFormalBaseline(ctx, goal);
+			await verifyFrozenWorkflowMethod(ctx, goal, options.registeredExperienceStores);
+			if (goal.knowledgeSnapshot && (await ctx.store.current())?.id !== goal.knowledgeSnapshot) throw new HarnessError("m07.branch", "knowledge snapshot changed since branch creation; refresh explicitly instead of selecting under changed authority");
+			const parent = goal.tasks.find((item) => item.taskId === input.parentTaskId);
+			if (!parent?.branchSource || parent.context) throw new HarnessError("m07.branch", "branch selection requires a frozen original task");
+			if (!parent.review || !["accepted", "rejected"].includes(parent.status)) throw new HarnessError("m07.branch", "original task must receive ordinary M07 review before competitive selection");
+			const candidates = goal.tasks.filter((item) => item.context?.parentRunId === runId && item.context.parentTaskId === parent.taskId && item.context.checkpointId === parent.branchSource!.checkpoint.id);
+			if (!candidates.length || candidates.some((item) => !["accepted", "rejected", "failed"].includes(item.status))) throw new HarnessError("m07.branch", "every returned candidate must receive ordinary M07 review before selection; running candidates block selection");
+			if (goal.branchSelections?.some((item) => item.parentTaskId === parent.taskId)) throw new HarnessError("m07.branch", "branch selection has already been frozen");
+			if (input.selectedTaskId && !(input.selectedTaskId === parent.taskId && parent.status === "accepted") && !candidates.some((item) => item.taskId === input.selectedTaskId && item.status === "accepted")) throw new HarnessError("m07.branch", "selected source or branch must be an ordinarily reviewed and accepted candidate");
+			const rationale = nonempty(input.rationale, "branch selection rationale");
+			if (rationale.length > 2_000) throw new HarnessError("m07.branch", "branch selection rationale exceeds 2,000 characters");
+			const comparison = [parent, ...candidates].map((item) => ({ taskId: item.taskId, status: item.status, checks: item.review?.checks.map((check) => ({ criterion: check.criterion, result: check.result })) ?? [] }));
+			goal.branchSelections = [...(goal.branchSelections ?? []), { version: 1, parentTaskId: parent.taskId, ...(input.selectedTaskId ? { selectedTaskId: input.selectedTaskId } : {}), rationale, selectedAt: nowIso(), candidates: comparison }];
+			await save(ctx, goal); return goal;
+			});
 		},
 
 		async decision(runId, input) {
+			return withGoalDispatch(ctx, runId, async () => {
 			const goal = await load(ctx, runId); requireActive(goal);
 			for (const id of input.relatedTaskIds) if (!goal.tasks.some((t) => t.taskId === id)) throw new HarnessError("m07.decision", `未知相关任务 ${id}`);
 			if (input.action === "request") goal.decisions.push({ id: `U${String(goal.decisions.length + 1).padStart(3, "0")}`, status: "open", question: nonempty(input.question ?? "", "question"), relatedTaskIds: input.relatedTaskIds, requestedAt: nowIso() });
 			else { const open = goal.decisions.find((d) => d.status === "open" && d.relatedTaskIds.join("|") === input.relatedTaskIds.join("|")); if (!open) throw new HarnessError("m07.decision", "没有匹配的待用户决定事项"); open.status = "resolved"; open.decision = nonempty(input.decision ?? "", "decision"); open.resolvedAt = nowIso(); }
 			await save(ctx, goal); return goal;
+			});
 		},
 
 		async finish(runId, input) {
+			return withGoalDispatch(ctx, runId, async () => {
 			const goal = await load(ctx, runId); requireActive(goal);
 			if (goal.executionContract?.mode === "continuous" && input.outcome !== "fulfilled") throw new HarnessError("m07.continuous", "continuous 目标不能由模型以 partial/blocked 或自述 stopReason 收口；只有原成功要求的 fulfilled 硬证据门或受信宿主中断可终结");
 			let invalidBaseline: string | undefined;
@@ -967,11 +1188,16 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				goal.exploratory = true;
 			}
 			if (goal.tasks.some((task) => task.status === "running")) throw new HarnessError("m07.finish", "存在状态未知的 running 任务；本版只能查看且不能结束目标、自动重跑或假称已停止");
+			if (goal.tasks.some((task) => task.status === "unknown") || goal.executionState?.operations.some((operation) => ["prepared", "issued", "unknown"].includes(operation.status))) throw new HarnessError("m07.finish", "仍有外部动作或任务状态未知；先经宿主控制面对账，不能通过分支筛选隐藏未知结果");
 			if (input.goalChecks.length !== goal.successCriteria.length || goal.successCriteria.some((criterion) => !input.goalChecks.some((c) => c.criterion === criterion))) throw new HarnessError("m07.finish", "必须逐项映射原目标 successCriteria，不能以子任务状态代替目标验收");
-			const acceptedEvidence = new Map<string, string>(); for (const task of goal.tasks.filter((item) => item.status === "accepted")) { if (task.reportPath && task.review) { const frozen = await realpath(task.review.frozenReportPath); acceptedEvidence.set(frozen, frozen); if (existsSync(task.reportPath)) acceptedEvidence.set(await realpath(task.reportPath), frozen); } for (const artifact of task.review?.artifacts ?? []) { const frozen = await realpath(artifact.path); acceptedEvidence.set(frozen, frozen); if (artifact.sourcePath && existsSync(artifact.sourcePath)) acceptedEvidence.set(await realpath(artifact.sourcePath), frozen); } for (const check of task.review?.checks ?? []) for (const evidence of check.evidence) { const frozen = await realpath(evidence); acceptedEvidence.set(frozen, frozen); } }
+			const chosenBranches = new Map((goal.branchSelections ?? []).map((selection) => [selection.parentTaskId, selection.selectedTaskId]));
+			const acceptedEvidence = new Map<string, string>(); for (const task of goal.tasks.filter((item) => item.status === "accepted" && (item.context ? chosenBranches.get(item.context.parentTaskId) === item.taskId : !chosenBranches.has(item.taskId) || chosenBranches.get(item.taskId) === item.taskId))) { if (task.reportPath && task.review) { const frozen = await realpath(task.review.frozenReportPath); acceptedEvidence.set(frozen, frozen); if (existsSync(task.reportPath)) acceptedEvidence.set(await realpath(task.reportPath), frozen); } for (const artifact of task.review?.artifacts ?? []) { const frozen = await realpath(artifact.path); acceptedEvidence.set(frozen, frozen); if (artifact.sourcePath && existsSync(artifact.sourcePath)) acceptedEvidence.set(await realpath(artifact.sourcePath), frozen); } for (const check of task.review?.checks ?? []) for (const evidence of check.evidence) { const frozen = await realpath(evidence); acceptedEvidence.set(frozen, frozen); } }
 			const canonicalGoalChecks: TaskCheck[] = []; for (const check of input.goalChecks) { const evidence: string[] = []; for (const item of check.evidence) { const resolved = await confinedExistingFile(ctx, item); const frozen = acceptedEvidence.get(resolved); if (input.outcome === "fulfilled" && !frozen) throw new HarnessError("m07.finish", `目标验收证据不来自已接受任务：${item}`); if (frozen && resolved !== frozen && !(await readFile(resolved)).equals(await readFile(frozen))) throw new HarnessError("m07.finish", `已接受成果在验收后发生变化：${item}`); evidence.push(frozen ?? resolved); } canonicalGoalChecks.push({ ...check, evidence }); }
+			const branchParents = new Set(goal.tasks.flatMap((item) => item.context ? [item.context.parentTaskId] : []));
+			if (input.outcome === "fulfilled" && [...branchParents].some((id) => !goal.branchSelections?.some((selection) => selection.parentTaskId === id && selection.selectedTaskId))) throw new HarnessError("m07.finish", "competitive branches require an explicit reviewed winner before fulfilled");
 			const byId = new Map(goal.tasks.map((item) => [item.taskId, item])); const superseded = new Set<string>();
-			for (const accepted of goal.tasks.filter((item) => item.status === "accepted")) { let prior = accepted.supersedesTaskId; while (prior && !superseded.has(prior)) { superseded.add(prior); prior = byId.get(prior)?.supersedesTaskId; } }
+			for (const accepted of goal.tasks.filter((item) => item.status === "accepted" && (!item.context || goal.branchSelections?.some((selection) => selection.parentTaskId === item.context?.parentTaskId && selection.selectedTaskId === item.taskId)))) { let prior = accepted.supersedesTaskId; while (prior && !superseded.has(prior)) { superseded.add(prior); prior = byId.get(prior)?.supersedesTaskId; } }
+			for (const selection of goal.branchSelections ?? []) if (selection.selectedTaskId) for (const branch of goal.tasks.filter((item) => item.context?.parentTaskId === selection.parentTaskId && item.taskId !== selection.selectedTaskId)) superseded.add(branch.taskId);
 			const effectiveTasks = goal.tasks.filter((item) => !superseded.has(item.taskId));
 			if (input.outcome === "fulfilled") { if (canonicalGoalChecks.some((c) => c.result !== "passed" || !c.evidence.length)) throw new HarnessError("m07.finish", "fulfilled 要求每项原目标成功标准均通过并有实际文件证据"); if (goal.decisions.some((d) => d.status === "open")) throw new HarnessError("m07.finish", "存在待用户决定事项，不能标记 fulfilled"); if (effectiveTasks.some((t) => t.status !== "accepted")) throw new HarnessError("m07.finish", "存在未接受且未被合法替代的任务，不能标记 fulfilled"); if (!goal.tasks.length) throw new HarnessError("m07.finish", "没有实际任务，不能标记 fulfilled"); }
 			goal.goalChecks = canonicalGoalChecks;
@@ -988,11 +1214,13 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				goal.feedbackStatus = "indexed";
 			}
 			await save(ctx, goal);
-			const run = await ctx.ws.readRun("M07", runId); run.outputs.push({ label: "M07 实际执行反馈包", path: goal.feedbackPath }); run.remarks.push(`目标结果 ${input.outcome}；主 Agent 选择返回 ${input.returnPath}。会话返回不等于科学验收。反馈状态 ${goal.feedbackStatus}；索引不代表 M04 已读取原证据。`); for (const t of goal.tasks) { if (t.session) run.sessions.push({ label: t.session.label, role: t.session.role, id: t.session.id, file: t.session.file, model: t.session.model }); if (t.executionFailure) run.failures.push(`${t.taskId} 执行失败：${t.executionFailure}`); if (t.review) { for (const f of t.review.failures) run.failures.push(`${t.taskId}：${f}`); for (const u of t.review.unexecuted) run.failures.push(`${t.taskId} 未执行：${u}`); } } await ctx.ws.finishRun(run, input.outcome === "blocked" ? "failed" : "completed"); await ctx.ws.writeNote(run, `M07 主 Agent 目标式执行；保留原目标、所有任务、失败、未执行和限制。最终选择返回 ${input.returnPath}。`);
+			const run = await ctx.ws.readRun("M07", runId); run.outputs.push({ label: "M07 实际执行反馈包", path: goal.feedbackPath }); run.remarks.push(`目标结果 ${input.outcome}；主 Agent 选择返回 ${input.returnPath}。会话返回不等于科学验收。反馈状态 ${goal.feedbackStatus}；索引不代表 M04 已读取原证据。`); for (const t of goal.tasks) { if (t.session && !run.sessions.some((session) => session.id === t.session!.id)) run.sessions.push({ label: t.session.label, role: t.session.role, id: t.session.id, file: t.session.file, model: t.session.model }); if (t.executionFailure) run.failures.push(`${t.taskId} 执行失败：${t.executionFailure}`); if (t.review) { for (const f of t.review.failures) run.failures.push(`${t.taskId}：${f}`); for (const u of t.review.unexecuted) run.failures.push(`${t.taskId} 未执行：${u}`); } } await ctx.ws.finishRun(run, input.outcome === "blocked" ? "failed" : "completed"); await ctx.ws.writeNote(run, `M07 主 Agent 目标式执行；保留原目标、所有任务、失败、未执行和限制。最终选择返回 ${input.returnPath}。`);
 			return goal;
+			});
 		},
 
 		async interrupt(runId, input: InterruptInput, authorization?: typeof HOST_STOP_KEY, hostReceipt?: HostStopReceipt) {
+			return withGoalDispatch(ctx, runId, async () => {
 			const goal = await load(ctx, runId); requireActive(goal);
 			if (goal.executionContract?.mode === "continuous" && (authorization !== HOST_STOP_KEY || hostReceipt?.goalRunId !== runId)) throw new HarnessError("m07.continuous", "continuous 目标不接受模型或外部 JSON 的 interrupt；仅受信宿主生命周期事件可归档");
 			if (authorization === HOST_STOP_KEY && hostReceipt?.goalRunId === runId) goal.hostStopReceipt = hostReceipt;
@@ -1060,6 +1288,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			}
 			await ctx.ws.writeNote(run, `M07 目标受控中断归档；running 任务 ${interrupted.join("、") || "无"} 记为 failed；原因：${reason}。`);
 			return goal;
+			});
 		},
 		async hostInterrupt(runId, input) {
 			if (!HOST_STOP_REASONS.has(input.reasonKind)) throw new HarnessError("m07.host-stop", "未知宿主停止事件");
@@ -1069,6 +1298,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			return interruptWithAuthority(runId, { reason: `受信宿主生命周期停止：${input.reasonKind}`, returnPath: "user" }, HOST_STOP_KEY, receipt);
 		},
 		async hostSuspend(runId, input) {
+			return withGoalDispatch(ctx, runId, async () => {
 			if (!HOST_STOP_REASONS.has(input.reasonKind)) throw new HarnessError("m07.host-stop", "未知宿主停止事件");
 			if (input.sourceEventId !== undefined && (typeof input.sourceEventId !== "string" || input.sourceEventId.length > 128 || !/^[A-Za-z0-9._:-]+$/.test(input.sourceEventId))) throw new HarnessError("m07.host-stop", "宿主事件 ID 无效");
 			const goal = await load(ctx, runId); requireActive(goal);
@@ -1097,8 +1327,12 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			run.remarks.push(`执行尝试 ${attempt.id} 因 ${input.reasonKind} ${attempt.state}；目标仍 active，原成功要求未变。控制 checkpoint 是恢复索引，不是 M04 科学验收。`);
 			await ctx.ws.writeRun(run);
 			return goal;
+			});
 		},
 		async hostRecover(runId, input) {
+			// Recovery deliberately does not take over a possibly stale dispatch lock:
+			// it proves the old process dead, atomically claims a new attempt, and
+			// leaves any residual dispatch lock for exact manual review before work.
 			const goal = await load(ctx, runId);
 			if (goal.lifecycle !== "active" || !goal.executionState) throw new HarnessError("m07.recovery", "只恢复有版本化 executionState 的 active 目标；旧终态须显式建立 successor");
 			const state = goal.executionState;
@@ -1141,6 +1375,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			return goal;
 		},
 		async hostReconcileOperation(runId, input) {
+			return withGoalDispatch(ctx, runId, async () => {
 			const goal = await load(ctx, runId);
 			if (goal.lifecycle !== "active" || !goal.executionState) throw new HarnessError("m07.operation", "目标无可对账的执行状态");
 			const operation = goal.executionState.operations.find((item) => item.id === input.operationId);
@@ -1164,8 +1399,10 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			if (task?.status === "unknown") { task.status = "failed"; task.executionFailure = `原响应丢失，外部查询结果 ${operation.status}；证据 ${frozen}。任务未自动重放或采用。`; }
 			await save(ctx, goal);
 			return goal;
+			});
 		},
 		async hostCreateSuccessor(runId, input) {
+			return withGoalDispatch(ctx, runId, async () => {
 			const prior = await load(ctx, runId);
 			if (prior.lifecycle !== "finished" || prior.outcome !== "blocked") throw new HarnessError("m07.successor", "仅旧 blocked 终态可显式建立关联后继；原记录保持只读");
 			frozenPolicy(prior);
@@ -1188,6 +1425,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			run.remarks.push(`显式 successor of ${prior.runId}；旧 blocked goal.json 未修改。新目标保留原成功标准和冻结策略。`);
 			await ctx.ws.writeRun(run);
 			return successor;
+			});
 		},
 	};
 }

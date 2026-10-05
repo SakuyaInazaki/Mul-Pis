@@ -2,11 +2,12 @@ import { constants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
 import { HarnessError } from "../types.ts";
-import type { CustomToolSpec } from "./types.ts";
+import type { CustomToolSpec, SessionSpec } from "./types.ts";
 
 const MAX_READ_BYTES = 128_000;
 const MAX_WRITE_BYTES = 128_000;
-const approved = new WeakMap<CustomToolSpec, string>();
+type GrantDescriptor = NonNullable<SessionSpec["toolAuthority"]>;
+const approved = new WeakMap<CustomToolSpec, GrantDescriptor>();
 
 function requestedPath(root: string, requested: unknown): string {
 	if (typeof requested !== "string" || !requested || requested.length > 240 || requested.includes("\0") || path.isAbsolute(requested) ||
@@ -57,6 +58,7 @@ export async function createConfinedCampaignFileTools(root: string, options: { w
 	if (!Array.isArray(options.writableFiles) || options.writableFiles.length < 1 || options.writableFiles.length > 16) throw new HarnessError("runner.campaign-files", "explicit writable file allowlist is required");
 	const writable = new Set(options.writableFiles.map((name) => requestedPath(rootReal, name)));
 	if (writable.size !== options.writableFiles.length) throw new HarnessError("runner.campaign-files", "duplicate writable file path");
+	const descriptor: GrantDescriptor = Object.freeze({ version: 1, kind: "confined-campaign-files", root: rootReal, writableFiles: Object.freeze([...options.writableFiles].sort()) as unknown as string[] });
 	const allowedWrite = (requested: unknown): string => {
 		const target = requestedPath(rootReal, requested);
 		if (!writable.has(target)) throw new HarnessError("runner.campaign-files", "file is not on the campaign write allowlist");
@@ -121,12 +123,18 @@ export async function createConfinedCampaignFileTools(root: string, options: { w
 	for (const tool of [read, write, edit]) {
 		Object.freeze(tool.params);
 		Object.freeze(tool);
-		approved.set(tool, rootReal);
+		approved.set(tool, descriptor);
 	}
 	return Object.freeze([read, write, edit]) as unknown as CustomToolSpec[];
 }
 
 export function isConfinedCampaignFileGrant(tools: readonly CustomToolSpec[]): boolean {
+	return getConfinedCampaignFileGrantDescriptor(tools) !== undefined;
+}
+
+/** Authority comes from the factory's private WeakMap, never from caller-supplied metadata. */
+export function getConfinedCampaignFileGrantDescriptor(tools: readonly CustomToolSpec[]): GrantDescriptor | undefined {
 	return tools.length === 3 && ["read", "write", "edit"].every((name, index) => tools[index]?.name === name) &&
-		approved.has(tools[0]) && tools.every((tool) => approved.get(tool) === approved.get(tools[0]));
+		approved.has(tools[0]) && tools.every((tool) => approved.get(tool) === approved.get(tools[0]))
+		? approved.get(tools[0]) : undefined;
 }

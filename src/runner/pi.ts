@@ -1,5 +1,6 @@
-import { appendFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath } from "node:fs/promises";
+import { appendFile, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import {
 	createAgentSession,
@@ -16,15 +17,16 @@ import {
 	type CreateAgentSessionOptions,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "@earendil-works/pi-ai";
+import { Type, createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
 import { parseModelSpec } from "../config.ts";
 import { HarnessError } from "../types.ts";
 import { writeFileAtomic } from "../workspace.ts";
 import { TelemetryWriter } from "../dashboard/telemetry.ts";
-import type { AssistantTurn, CustomToolSpec, ReadReturnEvent, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, TranscriptMessage, UsageEvent } from "./types.ts";
+import type { AssistantTurn, CustomToolSpec, ForkRequest, ForkWorkspaceBindingV1, ReadReturnEvent, RunnerCapabilities, SessionCheckpoint, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, TranscriptMessage, UsageEvent } from "./types.ts";
 import { summarizeUsage, usageEventsFromEntries } from "./usage.ts";
 import { sampleRunnerResources, sessionClosed, sessionOpened } from "./resource.ts";
-import { DeepSeekCampaignBudget } from "./deepseek-campaign.ts";
+import { DeepSeekCampaignBudget, type PromptLease } from "./deepseek-campaign.ts";
+import { getConfinedCampaignFileGrantDescriptor } from "./confined-campaign-files.ts";
 
 const SCRATCH_PREFIX = ".pi-session-";
 const EMPTY_AGENT_DIR = ".empty-agent-dir";
@@ -52,6 +54,16 @@ interface MaterialTools {
 	names: string[];
 	readCoverage: Set<string>;
 	readReturns: ReadReturnEvent[];
+}
+
+interface CheckpointState {
+	ref: SessionRef;
+	spec: SessionSpec;
+	manager: SessionManager;
+	active: boolean;
+	freezing: boolean;
+	completed: boolean;
+	disposed: boolean;
 }
 
 function isInside(root: string, candidate: string): boolean {
@@ -356,12 +368,80 @@ function parsePersistedSpec(text: string, specFile: string): SessionSpec {
 	return parsed as SessionSpec;
 }
 
+function forkGrantNoBroader(parent: SessionSpec["tools"], child: SessionSpec["tools"], campaignAudited: boolean): boolean {
+	if (child.kind === "none") return true;
+	if (parent.kind !== child.kind) return false;
+	if (child.kind === "read-dir" && parent.kind === "read-dir") {
+		// A generic frozen-read-root authority schema is not yet implemented.
+		// An evidence label alone cannot grant a different directory.
+		return false;
+	}
+	if (child.kind === "custom" && parent.kind === "custom") {
+		if (!campaignAudited) return false;
+		const parentTools = new Map(parent.tools.map((tool) => [tool.name, tool]));
+		return child.tools.every((tool) => JSON.stringify(tool.params) === JSON.stringify(parentTools.get(tool.name)?.params));
+	}
+	if (child.kind === "execution" && parent.kind === "execution") {
+		const parentNames = new Set(parent.tools);
+		return child.tools.every((tool) => parentNames.has(tool));
+	}
+	return false;
+}
+
+async function verifyForkWorkspaceBinding(checkpoint: SessionCheckpoint, binding: ForkWorkspaceBindingV1 | undefined, parentRootRaw: string, childRootRaw: string): Promise<void> {
+	if (!binding || binding.version !== 1 || !Array.isArray(binding.files)) throw new HarnessError("runner.fork", "writable fork requires a controller-frozen workspace binding");
+	let authority: { version?: number; parentRoot?: string; authorizedChildRootBase?: string; childWorkLeaf?: string; frozenEvidenceRoot?: string; files?: Array<{ sourcePath?: string; frozenPath?: string; bytes?: number }> };
+	try {
+		const manifest = JSON.parse(await readFile(checkpoint.manifestSnapshot, "utf8")) as { forkWorkspaceAuthority?: typeof authority };
+		authority = manifest.forkWorkspaceAuthority ?? {};
+	} catch { throw new HarnessError("runner.fork", "checkpoint input manifest lacks a readable workspace authority"); }
+	if (authority.version !== 1 || authority.parentRoot !== binding.parentRoot || authority.authorizedChildRootBase !== binding.authorizedChildRootBase || authority.childWorkLeaf !== binding.childWorkLeaf || authority.frozenEvidenceRoot !== binding.frozenEvidenceRoot ||
+		!Array.isArray(authority.files) || authority.files.length !== binding.files.length || binding.files.some((item, index) => {
+			const source = authority.files?.[index];
+			return source?.sourcePath !== item.sourcePath || source.frozenPath !== item.frozenPath || source.bytes !== item.bytes;
+		})) throw new HarnessError("runner.fork", "workspace binding differs from frozen checkpoint authority");
+	const [parentRoot, base, childRoot, frozenRoot] = await Promise.all([realpath(binding.parentRoot), realpath(binding.authorizedChildRootBase), realpath(binding.childRoot), realpath(binding.frozenEvidenceRoot)]);
+	const parentRelative = path.relative(base, parentRoot).split(path.sep);
+	const childRelative = path.relative(base, childRoot).split(path.sep);
+	const safeTaskSegment = (segment: string): boolean => /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(segment);
+	if (!/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(binding.childWorkLeaf) || parentRelative.length !== 2 || childRelative.length !== 2 ||
+		parentRelative[1] !== binding.childWorkLeaf || childRelative[1] !== binding.childWorkLeaf ||
+		!safeTaskSegment(parentRelative[0]) || !safeTaskSegment(childRelative[0]) || parentRelative[0] === childRelative[0]) throw new HarnessError("runner.fork", "child work root is not a separate task directory under frozen authority");
+	if (parentRoot !== binding.parentRoot || base !== binding.authorizedChildRootBase || childRoot !== binding.childRoot || frozenRoot !== binding.frozenEvidenceRoot ||
+		parentRoot !== await realpath(parentRootRaw) || childRoot !== await realpath(childRootRaw) ||
+		!isInside(base, childRoot) || childRoot === base || isInside(parentRoot, childRoot) || isInside(childRoot, parentRoot) || isInside(frozenRoot, childRoot) || isInside(childRoot, frozenRoot)) throw new HarnessError("runner.fork", "child work root is not independently bound inside the frozen authorized base");
+	if (binding.ownerMarkerPath !== path.join(childRoot, "fork-owner.json") || !(await lstat(binding.ownerMarkerPath)).isFile()) throw new HarnessError("runner.fork", "child work root lacks an ownership marker");
+	let owner: { version?: number; checkpointId?: string; parentRoot?: string; childRoot?: string; childContainer?: string };
+	try { owner = JSON.parse(await readFile(binding.ownerMarkerPath, "utf8")); }
+	catch { throw new HarnessError("runner.fork", "child work root ownership marker is unreadable"); }
+	if (owner.version !== 1 || owner.checkpointId !== checkpoint.id || owner.parentRoot !== parentRoot || owner.childRoot !== childRoot || owner.childContainer !== childRelative[0]) throw new HarnessError("runner.fork", "child work root owner differs from fork checkpoint");
+	for (const item of binding.files) {
+		if (!Number.isSafeInteger(item.bytes) || item.bytes < 0 || !isInside(parentRoot, item.sourcePath) || !isInside(frozenRoot, item.frozenPath) || !isInside(childRoot, item.childPath) ||
+			path.relative(parentRoot, item.sourcePath) !== path.relative(frozenRoot, item.frozenPath) || path.relative(parentRoot, item.sourcePath) !== path.relative(childRoot, item.childPath) ||
+			!(await lstat(item.frozenPath)).isFile() || !(await lstat(item.childPath)).isFile() || (await stat(item.frozenPath)).size !== item.bytes || (await stat(item.childPath)).size !== item.bytes || !(await readFile(item.frozenPath)).equals(await readFile(item.childPath))) throw new HarnessError("runner.fork", "mapped child work file differs from frozen source evidence");
+	}
+}
+
 export class PiSessionRunner implements SessionRunner {
 	private readonly options: PiSessionRunnerOptions;
 	private runtimePromise?: Promise<ModelRuntime>;
+	private readonly checkpointStates = new Map<string, CheckpointState>();
+	private readonly allCheckpointStates = new Set<CheckpointState>();
 
 	constructor(options: PiSessionRunnerOptions = {}) {
 		this.options = options;
+	}
+
+	capabilities(): RunnerCapabilities {
+		return { version: 1, fresh: true, continue: true, persistedLineage: true, forkAtFrozenLeaf: true, grantKinds: ["none", "read-dir", "custom", "execution"], modelCompatibility: "exact-model-only", multimodalHistory: "model-dependent", parallelPromptLeases: "single-process" };
+	}
+
+	async attestConfinedGrant(handle: SessionHandle): Promise<NonNullable<SessionSpec["toolAuthority"]> | undefined> {
+		const state = this.checkpointStates.get(handle.ref.id);
+		if (!this.options.campaignBudget || !state || state.ref !== handle.ref || state.disposed || state.spec.tools.kind !== "custom") return undefined;
+		const approved = getConfinedCampaignFileGrantDescriptor(state.spec.tools.tools);
+		if (!approved || JSON.stringify(state.spec.toolAuthority) !== JSON.stringify(approved)) return undefined;
+		return { ...approved, writableFiles: [...approved.writableFiles] };
 	}
 
 	/** Worst-case Pi price-table estimate for a text-only bounded request; undefined when unpriced. */
@@ -387,6 +467,7 @@ export class PiSessionRunner implements SessionRunner {
 		if (!ref.file || !ref.specFile) {
 			throw new HarnessError("runner.persistence", `session ${ref.label} is missing its file or specFile`);
 		}
+		if (!(await lstat(ref.specFile)).isFile()) throw new HarnessError("runner.persistence", "session spec must be a regular file");
 		let specText: string;
 		try {
 			specText = await readFile(ref.specFile, "utf8");
@@ -401,10 +482,145 @@ export class PiSessionRunner implements SessionRunner {
 		if (spec.tools.kind === "custom" || spec.tools.kind === "execution" || (spec.tools.kind === "read-dir" && spec.tools.extraTools?.length)) {
 			throw new HarnessError("runner.persistence", `session ${ref.label} used non-resumable tools and cannot be resumed`);
 		}
+		if (!(await lstat(ref.file)).isFile()) throw new HarnessError("runner.persistence", "session transcript must be a regular file");
 		const sessionManager = SessionManager.open(ref.file, spec.persistDir);
+		const forkParent = sessionManager.getHeader()?.parentSession;
+		if (forkParent) {
+			const lineageFile = ref.file.replace(/\.jsonl$/, ".lineage.json");
+			if (ref.lineageFile && ref.lineageFile !== lineageFile) throw new HarnessError("runner.persistence", "fork lineage path differs from its session file");
+			let lineage: { version?: number; state?: string; checkpoint?: { snapshotFile?: string }; child?: { sessionId?: string; sessionFile?: string } };
+			try { if (!(await lstat(lineageFile)).isFile()) throw new Error("lineage receipt is not a regular file"); lineage = JSON.parse(await readFile(lineageFile, "utf8")); }
+			catch { throw new HarnessError("runner.persistence", "fork lineage receipt is missing or unreadable"); }
+			if (lineage.version !== 1 || lineage.state !== "committed" || lineage.checkpoint?.snapshotFile !== forkParent || lineage.child?.sessionId !== sessionManager.getSessionId() || lineage.child?.sessionFile !== ref.file) throw new HarnessError("runner.persistence", "fork lineage receipt is not committed for this session");
+		} else if (ref.lineageFile) throw new HarnessError("runner.persistence", "non-fork session has an unexpected lineage reference");
 		const cwd = sessionManager.getCwd();
 		await this.assertResumeScratch(cwd, spec.persistDir);
-		return this.buildHandle(spec, sessionManager, cwd, false);
+		const handle = await this.buildHandle(spec, sessionManager, cwd, false);
+		if (forkParent) handle.ref.lineageFile = ref.file.replace(/\.jsonl$/, ".lineage.json");
+		return handle;
+	}
+
+	async checkpoint(handle: SessionHandle, envelope: { inputManifest: string; runId: string; taskId?: string; externalOperationsSettled: boolean }): Promise<SessionCheckpoint> {
+		const state = this.checkpointStates.get(handle.ref.id);
+		const peers = [...this.allCheckpointStates].filter((item) => item.ref.file === handle.ref.file);
+		if (!state || state.ref !== handle.ref || state.active || state.freezing || state.disposed || !state.completed || peers.some((item) => item.active || item.freezing)) {
+			throw new HarnessError("runner.fork", "checkpoint requires an idle, completed parent handle owned by this runner");
+		}
+		if (!envelope.externalOperationsSettled) throw new HarnessError("runner.fork", "unknown external operations block checkpoint");
+		if (!envelope.inputManifest.trim() || !envelope.runId.trim()) throw new HarnessError("runner.fork", "checkpoint requires frozen input manifest and run identity");
+		for (const item of peers) item.freezing = true;
+		try {
+			if (!(await lstat(envelope.inputManifest)).isFile()) throw new Error("input manifest is not a regular file");
+			const leafId = state.manager.getLeafId();
+			const terminalMessage = state.manager.getBranch(leafId ?? undefined).filter((entry) => entry.type === "message").at(-1);
+			if (!leafId || !terminalMessage || terminalMessage.type !== "message" || terminalMessage.message.role !== "assistant" || terminalMessage.message.stopReason !== "stop") {
+				throw new HarnessError("runner.fork", "checkpoint leaf is not a normally completed assistant message");
+			}
+			const sourceSessionFile = state.ref.file;
+			const sourceSpecFile = state.ref.specFile;
+			if (!sourceSessionFile || !sourceSpecFile) throw new HarnessError("runner.fork", "parent has no persisted session and spec");
+			if (await readFile(sourceSpecFile, "utf8") !== `${JSON.stringify(state.spec, null, 2)}\n`) throw new HarnessError("runner.fork", "parent persisted spec differs from the active tool and model grant");
+			const id = randomUUID();
+			const snapshotDir = path.join(path.dirname(sourceSessionFile), ".checkpoints");
+			await mkdir(snapshotDir, { recursive: true });
+			const snapshotFile = path.join(snapshotDir, `${id}.jsonl`);
+			const sourceSpecSnapshot = path.join(snapshotDir, `${id}.parent-spec.json`);
+			const manifestSnapshot = path.join(snapshotDir, `${id}.manifest.json`);
+			const before = await stat(sourceSessionFile);
+			await copyFile(sourceSessionFile, snapshotFile);
+			await copyFile(sourceSpecFile, sourceSpecSnapshot);
+			await copyFile(envelope.inputManifest, manifestSnapshot);
+			const after = await stat(sourceSessionFile);
+			const copied = await stat(snapshotFile);
+			if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || copied.size !== before.size) {
+				await rm(snapshotFile, { force: true });
+				throw new HarnessError("runner.fork", "parent file changed while freezing checkpoint");
+			}
+			const snapshot = SessionManager.open(snapshotFile, snapshotDir);
+			if (snapshot.getSessionId() !== state.ref.id || snapshot.getLeafId() !== leafId) {
+				await rm(snapshotFile, { force: true });
+				throw new HarnessError("runner.fork", "persisted parent leaf differs from live completed leaf");
+			}
+			const checkpoint: SessionCheckpoint = { version: 1, id, sourceSessionId: state.ref.id, sourceSessionFile, sourceSpecFile, sourceSpecSnapshot, snapshotFile, leafId, model: state.ref.model, inputManifest: envelope.inputManifest, manifestSnapshot, runId: envelope.runId, ...(envelope.taskId ? { taskId: envelope.taskId } : {}), frozenAt: new Date().toISOString(), snapshotBytes: copied.size };
+			await writeFileAtomic(path.join(snapshotDir, `${id}.checkpoint.json`), `${JSON.stringify(checkpoint, null, 2)}\n`);
+			return checkpoint;
+		} finally { for (const item of peers) item.freezing = false; }
+	}
+
+	async fork(request: ForkRequest): Promise<SessionHandle> {
+		const { checkpoint, evidenceBindings, reason } = request;
+		let spec = request.spec;
+		if (checkpoint.version !== 1 || !reason.trim() || !checkpoint.id || !checkpoint.leafId || !checkpoint.inputManifest || !checkpoint.runId) throw new HarnessError("runner.fork", "invalid checkpoint or fork reason");
+		if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(checkpoint.id) || !path.isAbsolute(checkpoint.sourceSessionFile) || checkpoint.sourceSpecFile !== specFileFor(checkpoint.sourceSessionFile) || checkpoint.snapshotFile !== path.join(path.dirname(checkpoint.sourceSessionFile), ".checkpoints", `${checkpoint.id}.jsonl`) || checkpoint.sourceSpecSnapshot !== path.join(path.dirname(checkpoint.sourceSessionFile), ".checkpoints", `${checkpoint.id}.parent-spec.json`) || checkpoint.manifestSnapshot !== path.join(path.dirname(checkpoint.sourceSessionFile), ".checkpoints", `${checkpoint.id}.manifest.json`)) throw new HarnessError("runner.fork", "checkpoint origin paths are invalid");
+		for (const file of [checkpoint.sourceSessionFile, checkpoint.sourceSpecFile, checkpoint.sourceSpecSnapshot, checkpoint.snapshotFile, checkpoint.manifestSnapshot, checkpoint.inputManifest, path.join(path.dirname(checkpoint.snapshotFile), `${checkpoint.id}.checkpoint.json`)]) {
+			if (!(await lstat(file)).isFile()) throw new HarnessError("runner.fork", `checkpoint path is not a regular file: ${file}`);
+		}
+		if (spec.model !== checkpoint.model) throw new HarnessError("runner.fork", "cross-model fork is not verified; use fresh evidence handoff");
+		if (this.options.campaignBudget) spec = this.options.campaignBudget.boundSpec(spec);
+		const persistedCheckpoint = JSON.parse(await readFile(path.join(path.dirname(checkpoint.snapshotFile), `${checkpoint.id}.checkpoint.json`), "utf8")) as SessionCheckpoint;
+		if (JSON.stringify(persistedCheckpoint) !== JSON.stringify(checkpoint)) throw new HarnessError("runner.fork", "checkpoint receipt differs from persisted source");
+		if (!(await stat(checkpoint.inputManifest)).isFile() || !(await stat(checkpoint.manifestSnapshot)).isFile() || !(await readFile(checkpoint.inputManifest)).equals(await readFile(checkpoint.manifestSnapshot))) throw new HarnessError("runner.fork", "frozen input manifest is missing or changed");
+		if (!(await readFile(checkpoint.sourceSpecFile)).equals(await readFile(checkpoint.sourceSpecSnapshot))) throw new HarnessError("runner.fork", "checkpoint parent spec changed");
+		const snapshotStat = await stat(checkpoint.snapshotFile);
+		if (snapshotStat.size !== checkpoint.snapshotBytes) throw new HarnessError("runner.fork", "checkpoint source bytes changed");
+		const sourceBytes = await readFile(checkpoint.sourceSessionFile);
+		const frozenBytes = await readFile(checkpoint.snapshotFile);
+		if (sourceBytes.length < frozenBytes.length || !sourceBytes.subarray(0, frozenBytes.length).equals(frozenBytes)) throw new HarnessError("runner.fork", "checkpoint source history was changed");
+		const frozen = SessionManager.open(checkpoint.snapshotFile, path.dirname(checkpoint.snapshotFile));
+		if (frozen.getSessionId() !== checkpoint.sourceSessionId || !frozen.getEntry(checkpoint.leafId)) throw new HarnessError("runner.fork", "checkpoint source session or leaf changed");
+		const parentSpec = parsePersistedSpec(await readFile(checkpoint.sourceSpecSnapshot, "utf8"), checkpoint.sourceSpecSnapshot);
+		if (path.dirname(await realpath(checkpoint.sourceSessionFile)) !== await realpath(parentSpec.persistDir)) throw new HarnessError("runner.fork", "checkpoint parent is outside its persisted session directory");
+		if (parentSpec.model !== checkpoint.model) throw new HarnessError("runner.fork", "parent model differs from checkpoint");
+		if (!forkGrantNoBroader(parentSpec.tools, spec.tools, Boolean(this.options.campaignBudget))) throw new HarnessError("runner.fork", "fork cannot elevate tool authority beyond its parent");
+		if (!Array.isArray(evidenceBindings) || evidenceBindings.some((binding) => binding.version !== 1 || binding.status !== "frozen-copy" || !binding.label.trim() || !binding.path.trim() || !binding.sourceVersion?.trim())) throw new HarnessError("runner.fork", "fork requires frozen-copy evidence bindings");
+		if (evidenceBindings.length === 0) throw new HarnessError("runner.fork", "fork requires explicit frozen evidence bindings");
+		for (const binding of evidenceBindings) if (!(await lstat(binding.path)).isFile() && !(await lstat(binding.path)).isDirectory()) throw new HarnessError("runner.fork", "frozen evidence binding must be a regular file or directory");
+		if (spec.tools.kind === "execution") {
+			const root = await realpath(spec.tools.root);
+			if (parentSpec.tools.kind === "execution") {
+				await verifyForkWorkspaceBinding(checkpoint, request.workspaceBinding, parentSpec.tools.root, root);
+			}
+			for (const binding of evidenceBindings) if (isInside(root, await realpath(binding.path))) throw new HarnessError("runner.fork", "frozen evidence cannot be inside child writable root");
+		}
+		if (spec.tools.kind === "custom") {
+			const parentAuthority = parentSpec.toolAuthority;
+			const childAuthority = spec.toolAuthority;
+			if (parentAuthority?.kind !== "confined-campaign-files" || childAuthority?.kind !== "confined-campaign-files" ||
+				!Array.isArray(parentAuthority.writableFiles) || !Array.isArray(childAuthority.writableFiles) ||
+				childAuthority.writableFiles.some((item) => !parentAuthority.writableFiles.includes(item))) throw new HarnessError("runner.fork", "audited custom fork grant lacks a frozen equal-or-narrower write allowlist");
+			const parentRoot = await realpath(parentAuthority.root);
+			const childRoot = await realpath(childAuthority.root);
+			if (parentRoot !== parentAuthority.root || childRoot !== childAuthority.root) throw new HarnessError("runner.fork", "audited custom fork root is not canonical");
+			await verifyForkWorkspaceBinding(checkpoint, request.workspaceBinding, parentRoot, childRoot);
+			for (const binding of evidenceBindings) if (isInside(childRoot, await realpath(binding.path))) throw new HarnessError("runner.fork", "frozen evidence cannot be inside child writable root");
+		}
+		await mkdir(spec.persistDir, { recursive: true });
+		const childScratch = await mkdtemp(path.join(spec.persistDir, SCRATCH_PREFIX));
+		let childFile: string | undefined;
+		let handle: SessionHandle | undefined;
+		try {
+			const manager = SessionManager.open(checkpoint.snapshotFile, spec.persistDir, childScratch);
+			if (manager.getLeafId() !== checkpoint.leafId) throw new HarnessError("runner.fork", "checkpoint snapshot has a different leaf");
+			childFile = manager.createBranchedSession(checkpoint.leafId);
+			if (!childFile || childFile === checkpoint.sourceSessionFile || manager.getSessionId() === checkpoint.sourceSessionId) throw new HarnessError("runner.fork", "Pi did not create an independent branch");
+			const child = SessionManager.open(childFile, spec.persistDir, childScratch);
+			const originalIds = frozen.getBranch(checkpoint.leafId).filter((entry) => entry.type !== "label").map((entry) => entry.id);
+			const copiedIds = child.getBranch(checkpoint.leafId).filter((entry) => entry.type !== "label").map((entry) => entry.id);
+			if (JSON.stringify(originalIds) !== JSON.stringify(copiedIds) || child.getHeader()?.cwd !== childScratch) throw new HarnessError("runner.fork", "Pi branch failed source-path or scratch validation");
+			handle = await this.buildHandle(spec, manager, childScratch, true);
+			const lineageFile = childFile.replace(/\.jsonl$/, ".lineage.json");
+			const lineage = { version: 1, state: "committed", intent: "branch-exploration", checkpoint, parent: { sessionId: checkpoint.sourceSessionId, sessionFile: checkpoint.sourceSessionFile, leafId: checkpoint.leafId, toolGrantKind: parentSpec.tools.kind, toolAuthority: parentSpec.toolAuthority }, child: { sessionId: handle.ref.id, sessionFile: childFile, scratch: childScratch, toolGrantKind: spec.tools.kind, toolAuthority: spec.toolAuthority, ...(spec.tools.kind === "execution" ? { workRoot: spec.tools.root } : {}) }, reason, evidenceBindings, workspaceBinding: request.workspaceBinding, inheritedUsageBilled: false, createdAt: new Date().toISOString() };
+			await writeFileAtomic(lineageFile, `${JSON.stringify(lineage, null, 2)}\n`);
+			handle.ref.lineageFile = lineageFile;
+			return handle;
+		} catch (error) {
+			handle?.dispose();
+			if (childFile) {
+				await Promise.all([rm(childFile, { force: true }), rm(specFileFor(childFile), { force: true }), rm(childFile.replace(/\.jsonl$/, ".lineage.json"), { force: true })]);
+			}
+			await rm(childScratch, { recursive: true, force: true });
+			throw error;
+		}
 	}
 
 	private getRuntime(): Promise<ModelRuntime> {
@@ -482,6 +698,8 @@ export class PiSessionRunner implements SessionRunner {
 		}
 		let strictStreamCalls = 0;
 		let strictPayloadChecks = 0;
+		let currentLease: PromptLease | undefined;
+		let currentRequestIds: string[] = [];
 		const requestRuntime = strict ? new Proxy(resolved.modelRuntime, {
 			get(target, property) {
 				if (property !== "streamSimple") {
@@ -489,10 +707,13 @@ export class PiSessionRunner implements SessionRunner {
 					return typeof member === "function" ? member.bind(target) : member;
 				}
 				return (model: Parameters<ModelRuntime["streamSimple"]>[0], context: Parameters<ModelRuntime["streamSimple"]>[1], options?: Parameters<ModelRuntime["streamSimple"]>[2]) => {
+					const lease = currentLease;
+					const requestIds = currentRequestIds;
+					let requestId: string | undefined;
 					strictStreamCalls++;
 					campaign?.assertResolved(model);
 					if (strictStreamCalls > strict.maxProviderCallsPerPrompt || model.provider !== resolved.model.provider || model.id !== resolved.model.id || model.api !== resolved.model.api || model.baseUrl !== resolved.model.baseUrl) throw new HarnessError("runner.model", "strict request would exceed provider call cap or change model");
-					return target.streamSimple(model, context, {
+					const inner = target.streamSimple(model, context, {
 						...options, maxRetries: 0, ...(strict.maxOutputTokens === undefined ? {} : { maxTokens: strict.maxOutputTokens }),
 						onPayload: async (payload, payloadModel) => {
 							strictPayloadChecks++;
@@ -510,10 +731,55 @@ export class PiSessionRunner implements SessionRunner {
 							if (typeof serialized !== "string") throw new HarnessError("runner.model", "provider payload could not be serialized for reservation");
 							const bytes = Buffer.byteLength(serialized, "utf8");
 							if (strict.maxInputPayloadBytes !== undefined && bytes > strict.maxInputPayloadBytes) throw new HarnessError("runner.model", "strict request input payload exceeds reserved byte cap");
-							campaign?.reserve(bytes);
+							if (campaign) {
+								if (!lease) throw new HarnessError("runner.campaign", "provider request has no active prompt lease");
+								requestId = randomUUID();
+								campaign.reserve(lease, bytes, requestId);
+								requestIds.push(requestId);
+							}
 							return payload;
 						},
 					});
+					// A terminal provider event must be accounted for before Pi can begin
+					// the next tool-loop request. Offline test runtimes may use a Promise
+					// instead of the SDK stream; final prompt reconciliation covers those.
+					if (!campaign || !lease || !inner || !(Symbol.asyncIterator in Object(inner))) return inner;
+					const outer = createAssistantMessageEventStream();
+					const emptyUsage: AssistantMessage["usage"] = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+					let latest: AssistantMessage = { role: "assistant", content: [], api: model.api, provider: model.provider,
+						model: model.id, usage: emptyUsage, stopReason: "error", timestamp: Date.now() };
+					const failStream = (error: unknown): void => {
+						campaign.failPrompt(lease);
+						outer.push({ type: "error", reason: "error", error: { ...latest, stopReason: "error", errorMessage: error instanceof Error ? error.message : String(error) } });
+						outer.end();
+					};
+					void (async () => {
+						let terminal = false;
+						for await (const event of inner) {
+							if (event.type === "start") latest = event.partial;
+							if (event.type === "done") {
+								terminal = true;
+								latest = event.message;
+								if (!requestId) throw new HarnessError("runner.campaign", "provider response has no reserved request");
+								const usage = event.message.usage;
+								const report: UsageEvent = {
+									entryId: `provider-${requestId}`, kind: "assistant", promptIndex: 0, at: new Date().toISOString(),
+									provider: event.message.provider, model: event.message.model, stopReason: event.message.stopReason,
+									usage: { input: usage?.input, output: usage?.output, cacheRead: usage?.cacheRead,
+										cacheWrite: usage?.cacheWrite, totalTokens: usage?.totalTokens, cost: usage?.cost?.total },
+									status: "reported", costSource: "sdk-estimate", costStatus: "priced",
+								};
+								if (event.message.stopReason === "length") campaign.stopAfterTerminalLength(lease, requestId, report);
+								else campaign.settleReported(lease, requestId, report);
+							}
+							if (event.type === "error") { terminal = true; latest = event.error; campaign.failPrompt(lease); }
+							outer.push(event);
+						}
+						if (!terminal) throw new HarnessError("runner.campaign", "provider stream ended without a terminal response");
+						outer.end();
+					})().catch(failStream);
+					return outer;
 				};
 			},
 		}) : resolved.modelRuntime;
@@ -576,13 +842,25 @@ export class PiSessionRunner implements SessionRunner {
 			specFile,
 			...(spec.methodBinding ? { methodBinding: spec.methodBinding } : {}),
 		};
+		const checkpointState = { ref, spec, manager: sessionManager, active: false, freezing: false, completed: false, disposed: false };
+		const terminalMessage = sessionManager.getBranch().filter((entry) => entry.type === "message").at(-1);
+		checkpointState.completed = !persistSpec && terminalMessage?.type === "message" && terminalMessage.message.role === "assistant" && terminalMessage.message.stopReason === "stop";
+		this.checkpointStates.set(ref.id, checkpointState);
+		this.allCheckpointStates.add(checkpointState);
 		const usageFile = sessionFile.replace(/\.jsonl$/, ".usage.jsonl");
-		let promptIndex = await readFile(usageFile, "utf8")
-			.then((content) => content.split(/\r?\n/).filter(Boolean).length)
+		const usageRows = await readFile(usageFile, "utf8")
+			.then((content) => content.split(/\r?\n/).filter(Boolean))
 			.catch((error: NodeJS.ErrnoException) => {
-				if (error.code === "ENOENT") return 0;
+				if (error.code === "ENOENT") return [];
 				throw error;
 			});
+		let promptIndex = usageRows.length;
+		if (!persistSpec && checkpointState.completed) {
+			let lastLedger: { sessionId?: string; outcome?: string; events?: Array<{ entryId?: string }> } | undefined;
+			try { lastLedger = usageRows.length ? JSON.parse(usageRows.at(-1)!) : undefined; } catch { /* malformed ledger cannot prove completion */ }
+			const lastAssistant = sessionManager.getBranch().filter((entry) => entry.type === "message" && entry.message.role === "assistant").at(-1);
+			checkpointState.completed = Boolean(lastAssistant && lastLedger?.sessionId === ref.id && lastLedger.outcome === "completed" && lastLedger.events?.some((event) => event.entryId === lastAssistant.id));
+		}
 		const workspace = path.basename(spec.persistDir) === "sessions" && path.basename(path.dirname(spec.persistDir)) === ".agent"
 			? path.dirname(path.dirname(spec.persistDir)) : undefined;
 		if (workspace) {
@@ -614,17 +892,21 @@ export class PiSessionRunner implements SessionRunner {
 			setRunContext: ({ stage, runId }) => { void queueTelemetry(async () => { if (!disposed) await telemetry?.setRunContext(stage, runId); }); },
 			prompt: async (text): Promise<AssistantTurn> => {
 				if (disposed) throw new HarnessError("runner.stop", `session ${spec.label} has been disposed`);
+				if (checkpointState.freezing) throw new HarnessError("runner.fork", `session ${spec.label} is being checkpointed`);
 				if (abortedByHandle) throw new HarnessError("runner.stop", `session ${spec.label} was aborted before prompt`);
 				if (promptActive) throw new HarnessError("runner.stop", `session ${spec.label} already has an active prompt`);
 				if (signal?.aborted) throw new HarnessError("runner.stop", `session ${spec.label} was aborted before prompt`);
-				campaign?.beginPrompt();
+				const thisPrompt = promptIndex + 1;
+				currentLease = campaign?.beginPrompt(ref.id, `${thisPrompt}-${randomUUID()}`);
+				currentRequestIds = [];
 				promptActive = true;
+				checkpointState.active = true;
+				checkpointState.completed = false;
 				if (strict) { strictStreamCalls = 0; strictPayloadChecks = 0; }
 				// Do not await telemetry before installing the abort listener: prompt()
 				// must remain synchronously abortable from the caller's next statement.
 				void queueTelemetry(async () => { if (!disposed) await telemetry?.heartbeat("active"); });
-				promptIndex++;
-				const thisPrompt = promptIndex;
+				promptIndex = thisPrompt;
 				const promptEvents: UsageEvent[] = [];
 				const promptMessages: unknown[] = [];
 				const collectUsage = (): void => {
@@ -656,11 +938,15 @@ export class PiSessionRunner implements SessionRunner {
 					}
 					collectUsage();
 					const result = turnResult(promptMessages, spec.label, summarizeUsage(promptEvents));
-					campaign?.finishPrompt(promptEvents);
+					if (campaign && currentLease) {
+						const assistants = promptEvents.filter((event) => event.kind === "assistant");
+						if (assistants.length !== currentRequestIds.length) throw new HarnessError("runner.campaign", "provider request and assistant usage counts differ");
+						campaign.finishPrompt(currentLease, currentRequestIds.map((requestId, index) => ({ requestId, event: assistants[index] ?? { entryId: `missing-${requestId}`, kind: "assistant", promptIndex: thisPrompt, at: new Date().toISOString(), status: "unknown" } })));
+					}
 					promptOutcome = "completed";
 					return result;
 				} catch (error) {
-					campaign?.failPrompt();
+					if (campaign && currentLease) campaign.failPrompt(currentLease);
 					if (abortPromise) await abortPromise;
 					if ((signal?.aborted || abortedByHandle) && !(error instanceof HarnessError && error.code === "runner.stop")) {
 						promptOutcome = "aborted";
@@ -676,12 +962,14 @@ export class PiSessionRunner implements SessionRunner {
 						const unknown: UsageEvent = { entryId: `unobserved-${ref.id}-${thisPrompt}`, kind: "assistant", promptIndex: thisPrompt, at: new Date().toISOString(), status: "unknown", costSource: "unknown", costStatus: "unknown" };
 						promptEvents.push(unknown); usageEvents.push(unknown);
 					}
-					await appendFile(usageFile, `${JSON.stringify({ version: 1, sessionId: ref.id, promptIndex: thisPrompt, outcome: promptOutcome, events: promptEvents, summary: summarizeUsage(promptEvents) })}\n`);
+					await appendFile(usageFile, `${JSON.stringify({ version: 1, sessionId: ref.id, promptIndex: thisPrompt, outcome: promptOutcome, requestIds: currentRequestIds, events: promptEvents, summary: summarizeUsage(promptEvents) })}\n`);
 				} catch (error) {
-					campaign?.failPrompt();
+					if (campaign && currentLease) campaign.failPrompt(currentLease);
 					throw error;
 				} finally {
 					promptActive = false;
+					checkpointState.active = false;
+					checkpointState.completed = promptOutcome === "completed";
 					if (abortListener) signal?.removeEventListener("abort", abortListener);
 					abortListener = undefined;
 					abortPromise = undefined;
@@ -690,8 +978,11 @@ export class PiSessionRunner implements SessionRunner {
 						await queueTelemetry(async () => { if (!disposed) await telemetry?.heartbeat("idle", undefined, promptOutcome); });
 						await sampleRunnerResources(spec.persistDir, "prompt-end");
 					} catch (error) {
-						campaign?.failPrompt();
+						if (campaign && currentLease) campaign.failPrompt(currentLease);
 						throw error;
+					} finally {
+						currentLease = undefined;
+						currentRequestIds = [];
 					}
 				}
 				}
@@ -712,6 +1003,9 @@ export class PiSessionRunner implements SessionRunner {
 			dispose: () => {
 				if (disposed) return;
 				disposed = true;
+				checkpointState.disposed = true;
+				if (this.checkpointStates.get(ref.id) === checkpointState) this.checkpointStates.delete(ref.id);
+				this.allCheckpointStates.delete(checkpointState);
 				if (abortListener) signal?.removeEventListener("abort", abortListener);
 				abortListener = undefined;
 				try { session.dispose(); }
@@ -724,6 +1018,11 @@ export class PiSessionRunner implements SessionRunner {
 		};
 		} catch (error) {
 			try { session.dispose(); } catch { /* Preserve the construction failure. */ }
+			const failedState = this.checkpointStates.get(session.sessionId);
+			if (failedState?.manager === sessionManager) {
+				this.checkpointStates.delete(session.sessionId);
+				this.allCheckpointStates.delete(failedState);
+			}
 			await telemetry?.end().catch(() => undefined);
 			throw error;
 		}

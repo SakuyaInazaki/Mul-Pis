@@ -8,8 +8,9 @@
  * first M04 round. Nobody has to approve the output before M02.
  */
 import { buildM01Message, systemPromptFor } from "../prompts.ts";
+import { linkedEvidence, openBoundedSession } from "../context/boundary.ts";
 import type { StageRunRecord } from "../types.ts";
-import { loadProblemMaterials, recordSession, sessionSpec, withRun, type StageContext } from "./context.ts";
+import { loadProblemMaterials, sessionSpec, withRun, type StageContext } from "./context.ts";
 
 export const M01_OUTPUT = "initial-understanding.md";
 
@@ -30,9 +31,8 @@ export async function runM01(ctx: StageContext): Promise<M01Result> {
 		record,
 		async () => {
 			const message = await buildM01Message(materials);
-			const handle = await ctx.runner.create(sessionSpec(ctx, "M01", "execution", systemPromptFor("execution"), { kind: "none" }));
+			const handle = await openBoundedSession(ctx.runner, record, { mode: "fresh", intent: "new-work", reason: "M01 independently establishes initial understanding from the original problem and necessary raw information", evidence: linkedEvidence(inputs), spec: sessionSpec(ctx, "M01", "execution", systemPromptFor("execution"), { kind: "none" }) }, () => ctx.ws.writeRun(record));
 			try {
-				recordSession(record, handle);
 				await ctx.ws.writeOutput(record, "message.md", message, "发送给 M01 会话的完整消息");
 				const turn = await handle.prompt(message);
 				await ctx.ws.writeOutput(record, M01_OUTPUT, turn.text, "初始认识");

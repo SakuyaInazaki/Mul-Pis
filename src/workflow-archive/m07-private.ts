@@ -14,6 +14,7 @@ const ARCHIVE_NAME = "workflow-archive.json";
 /** Fixed name for the private transport allowlist; never publish this file directly. */
 export const M04_KNOWLEDGE_EXPORT_NAME = "m04-adopted-knowledge.json";
 const MAX_ROUNDS = 8;
+const MAX_REVIEW_TEXT_BYTES = 512_000;
 const MAX_KNOWLEDGE_RECORDS = 48;
 const MAX_KNOWLEDGE_BYTES = 256_000;
 const FILES = [
@@ -34,11 +35,16 @@ export interface PrivateM07ArchiveV1 {
 	files: Array<{ name: typeof FILES[number]["name"]; status: "present" | "missing" | "invalid"; bytes?: number }>;
 	controllerEvidence: {
 		rounds: Array<{ index: number; verdict: "ready" | "revise" | "replan" | "blocked" | "unavailable";
+			/** Inline preview only; the complete explicit text is in feedbackFile. */
 			feedback?: string; feedbackStatus: "present" | "missing" | "excluded";
+			feedbackFile?: string; feedbackBytes?: number; feedbackRedacted?: boolean;
+			reviewerReport?: { status: "present" | "missing"; file?: string; bytes?: number; redacted?: boolean };
 			candidate: { status: "present" | "missing" | "invalid"; file?: string; bytes?: number };
 			verification: { status: "present" | "missing" | "invalid"; file?: string; bytes?: number } }>;
 		reviewChecks: Array<{ criterion: string; result: "passed" | "failed" | "not_run" }>;
 		reviewStatus: "accepted" | "rejected" | "unreviewed";
+		/** Complete explicit controller decision fields, without ephemeral evidence paths. */
+		reviewDecision?: { file: "review-decision.json"; bytes: number; redacted: boolean };
 	};
 	lesson: { state: "pending-m04" | "none" | "missing" | "invalid"; action?: "propose" | "amend" | "contradict"; evidencePaths?: string[] };
 	m04?: { state: "not-run" | "completed" | "failed"; runId?: string; proposalSubmitted?: boolean; snapshotCreated?: boolean;
@@ -75,6 +81,38 @@ function safeFeedback(value: unknown): string | undefined {
 	// Reviewer feedback is one structured field, never a raw reviewer or builder transcript.
 	if (/(?:authorization\s*:|bearer\s+\S+|api[_-]?key\s*[:=]|password\s*[:=]|-----BEGIN [A-Z ]*PRIVATE KEY-----|sk-[A-Za-z0-9_-]{6,}|tool[_ -]?call\s*[:=])/i.test(value)) return undefined;
 	return value;
+}
+
+/** Redact credential values, not whole scientific paragraphs. Never ingest hidden thinking or session JSONL. */
+function redactExplicitText(text: string): { text: string; redacted: boolean } {
+	let safe = text;
+	safe = safe.replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED_PRIVATE_KEY]");
+	safe = safe.replace(/\b(Authorization\s*:\s*(?:Bearer|Basic|Token)\s+)[A-Za-z0-9._~+\/=:-]{4,}/gi, "$1[REDACTED]");
+	safe = safe.replace(/\b(Bearer\s+)[A-Za-z0-9._~+\/-]{6,}/gi, "$1[REDACTED]");
+	safe = safe.replace(/(\b(?:api[_-]?key|password|passwd|access[_-]?token|authorization)\\?"\s*:\s*\\?")[^"\\]+/gi, "$1[REDACTED]");
+	safe = safe.replace(/\b((?:api[_-]?key|password|passwd|access[_-]?token|authorization)\s*[:=]\s*)[^\s,;]+/gi, "$1[REDACTED]");
+	safe = safe.replace(/\bsk-[A-Za-z0-9_-]{6,}/gi, "[REDACTED_KEY]");
+	return { text: safe, redacted: safe !== text };
+}
+
+async function writeExplicitText(destination: string, name: string, raw: string): Promise<{ file: string; bytes: number; redacted: boolean }> {
+	const { text, redacted } = redactExplicitText(raw);
+	const bytes = Buffer.byteLength(text, "utf8");
+	if (bytes > MAX_REVIEW_TEXT_BYTES) throw new Error(`explicit review evidence exceeds private archive hard limit: ${name}`);
+	const target = path.join(destination, name), temporary = `${target}.${process.pid}.tmp`;
+	await writeFile(temporary, text, { mode: 0o600 });
+	await rename(temporary, target);
+	return { file: name, bytes, redacted };
+}
+
+async function archiveReviewerReport(round: NonNullable<M07TaskRecord["executionRounds"]>[number], taskRoot: string, destination: string): Promise<NonNullable<PrivateM07ArchiveV1["controllerEvidence"]["rounds"][number]["reviewerReport"]>> {
+	if (!round.reviewerReportPath) return { status: "missing" };
+	const expected = path.join(taskRoot, `round-${round.index}-reviewer.md`);
+	if (path.resolve(round.reviewerReportPath) !== path.resolve(expected)) throw new Error("reviewer report path differs from the controller-owned round file");
+	const info = await lstat(expected);
+	if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_REVIEW_TEXT_BYTES) throw new Error("reviewer report is unsafe or exceeds private archive hard limit");
+	const saved = await writeExplicitText(destination, `round-${round.index}-reviewer-report.md`, await readFile(expected, "utf8"));
+	return { status: "present", ...saved };
 }
 
 function safeVerification(raw: Buffer): Record<string, unknown> | undefined {
@@ -199,10 +237,14 @@ async function archiveRounds(task: M07TaskRecord, destination: string): Promise<
 				if (info.isDirectory() && !info.isSymbolicLink() && inside(parentReal, resolved)) snapshot = expected;
 			} catch { /* A missing or invalid reviewer snapshot is explicitly recorded below. */ }
 		}
-		const feedback = safeFeedback(round.feedback);
+		const fullFeedback = typeof round.feedback === "string" && round.feedback.length > 0 ? await writeExplicitText(destination, `round-${round.index}-reviewer-feedback.txt`, round.feedback) : undefined;
+		const feedbackPreview = fullFeedback ? safeFeedback(redactExplicitText(round.feedback!).text) : undefined;
+		const reviewerReport = await archiveReviewerReport(round, path.dirname(task.workDir), destination);
 		result.push({ index: round.index, verdict: round.verdict ?? "unavailable",
-			...(feedback ? { feedback } : {}),
-			feedbackStatus: feedback ? "present" : round.feedback ? "excluded" : "missing",
+			...(feedbackPreview ? { feedback: feedbackPreview } : {}),
+			feedbackStatus: fullFeedback ? "present" : "missing",
+			...(fullFeedback ? { feedbackFile: fullFeedback.file, feedbackBytes: fullFeedback.bytes, feedbackRedacted: fullFeedback.redacted } : {}),
+			reviewerReport,
 			candidate: await archiveRoundArtifact(snapshot, round.index, "candidate", destination),
 			verification: await archiveRoundArtifact(snapshot, round.index, "verification", destination) });
 	}
@@ -284,14 +326,25 @@ export async function archivePrivateM07Task(input: {
 		await rename(temporary, target);
 		files.push({ name: item.name, status: "present", bytes: (await lstat(target)).size });
 	}
+	let reviewDecision: PrivateM07ArchiveV1["controllerEvidence"]["reviewDecision"];
+	if (task.review) {
+		const decision = { version: 1, kind: "m07-explicit-review-decision", taskId: task.taskId,
+			status: task.status, reviewedAt: task.review.at,
+			checks: task.review.checks.map((check) => ({ criterion: check.criterion, result: check.result, evidenceCount: check.evidence.length })),
+			failures: task.review.failures, unexecuted: task.review.unexecuted, limitations: task.review.limitations,
+			...(task.review.independentCheck ? { independentCheck: { taskId: task.review.independentCheck.taskId, disposition: task.review.independentCheck.disposition } } : {}) };
+		const saved = await writeExplicitText(input.destination, "review-decision.json", `${JSON.stringify(decision, null, 2)}\n`);
+		reviewDecision = { file: "review-decision.json", bytes: saved.bytes, redacted: saved.redacted };
+	}
 	const archive: PrivateM07ArchiveV1 = {
 		version: 1, kind: "m07-private-candidate-archive", goalRunId: goal.runId, taskId: task.taskId,
 		createdAt: new Date().toISOString(), goalOutcome: goal.lifecycle === "finished" ? (goal.outcome ?? "partial") : "active",
 		taskStatus: task.status, ...(task.loopStopReason ? { loopStopReason: task.loopStopReason } : {}), files,
 		controllerEvidence: {
 			rounds: await archiveRounds(task, input.destination),
-			reviewChecks: (task.review?.checks ?? []).map(check => ({ criterion: check.criterion, result: check.result })),
+			reviewChecks: (task.review?.checks ?? []).map(check => ({ criterion: redactExplicitText(check.criterion).text, result: check.result })),
 			reviewStatus: task.status === "accepted" ? "accepted" : task.status === "rejected" ? "rejected" : "unreviewed",
+			...(reviewDecision ? { reviewDecision } : {}),
 		},
 		lesson,
 		m04: { state: "not-run" },
@@ -469,7 +522,7 @@ export async function recordPrivateM04Outcome(destination: string, m04: NonNulla
 
 /** Prior archives are data, never implicit trusted knowledge or execution authority. */
 export async function loadPrivateM07Archive(directory: string): Promise<{ archive: PrivateM07ArchiveV1; candidate?: string; verification?: string; lesson?: string;
-	roundFiles: Array<{ index: number; candidate?: string; verification?: string }>; m04Knowledge?: string }> {
+	roundFiles: Array<{ index: number; candidate?: string; verification?: string; feedback?: string; reviewerReport?: string }>; reviewDecision?: string; m04Knowledge?: string }> {
 	const root = await realpath(directory);
 	const manifest = await privateFile(root, ARCHIVE_NAME, 32_000);
 	if (!manifest) throw new Error("private M07 archive manifest is missing");
@@ -479,7 +532,7 @@ export async function loadPrivateM07Archive(directory: string): Promise<{ archiv
 		!/^T\d{3,}$/.test(archive.taskId) || typeof archive.goalRunId !== "string" || !archive.goalRunId)
 		throw new Error("private M07 archive identity or pending-adoption state is invalid");
 	const result: { archive: PrivateM07ArchiveV1; candidate?: string; verification?: string; lesson?: string;
-		roundFiles: Array<{ index: number; candidate?: string; verification?: string }>; m04Knowledge?: string } = { archive, roundFiles: [] };
+		roundFiles: Array<{ index: number; candidate?: string; verification?: string; feedback?: string; reviewerReport?: string }>; reviewDecision?: string; m04Knowledge?: string } = { archive, roundFiles: [] };
 	for (const item of FILES) {
 		if (archive.files.find(file => file.name === item.name)?.status !== "present") continue;
 		const source = await privateFile(root, item.name, item.maxBytes);
@@ -495,7 +548,21 @@ export async function loadPrivateM07Archive(directory: string): Promise<{ archiv
 		if (!Number.isSafeInteger(round.index) || round.index < 1 || round.index > MAX_ROUNDS || seen.has(round.index))
 			throw new Error("private M07 archive round identity is invalid");
 		seen.add(round.index);
-		const found: { index: number; candidate?: string; verification?: string } = { index: round.index };
+		const found: { index: number; candidate?: string; verification?: string; feedback?: string; reviewerReport?: string } = { index: round.index };
+		if (round.feedbackFile) {
+			const expected = `round-${round.index}-reviewer-feedback.txt`;
+			if (round.feedbackStatus !== "present" || round.feedbackFile !== expected) throw new Error("private M07 reviewer feedback file identity is invalid");
+			const saved = await privateFile(root, expected, MAX_REVIEW_TEXT_BYTES);
+			if (!saved || saved.bytes !== round.feedbackBytes) throw new Error("private M07 reviewer feedback file is missing or changed");
+			found.feedback = saved.source;
+		}
+		if (round.reviewerReport?.status === "present") {
+			const expected = `round-${round.index}-reviewer-report.md`;
+			if (round.reviewerReport.file !== expected) throw new Error("private M07 reviewer report file identity is invalid");
+			const saved = await privateFile(root, expected, MAX_REVIEW_TEXT_BYTES);
+			if (!saved || saved.bytes !== round.reviewerReport.bytes) throw new Error("private M07 reviewer report file is missing or changed");
+			found.reviewerReport = saved.source;
+		}
 		for (const kind of ["candidate", "verification"] as const) {
 			const file = round[kind];
 			if (!file || !["present", "missing", "invalid"].includes(file.status)) throw new Error("private M07 archive round file status is invalid");
@@ -507,6 +574,13 @@ export async function loadPrivateM07Archive(directory: string): Promise<{ archiv
 			found[kind] = source.source;
 		}
 		result.roundFiles.push(found);
+	}
+	if (archive.controllerEvidence.reviewDecision) {
+		const decision = archive.controllerEvidence.reviewDecision;
+		if (decision.file !== "review-decision.json") throw new Error("private M07 review decision file identity is invalid");
+		const saved = await privateFile(root, decision.file, MAX_REVIEW_TEXT_BYTES);
+		if (!saved || saved.bytes !== decision.bytes) throw new Error("private M07 review decision file is missing or changed");
+		result.reviewDecision = saved.source;
 	}
 	if (archive.m04?.knowledgeExport?.state === "complete") {
 		if (archive.m04.knowledgeExport.file !== M04_KNOWLEDGE_EXPORT_NAME) throw new Error("private M04 knowledge export file identity is invalid");

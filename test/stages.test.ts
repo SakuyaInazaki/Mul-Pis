@@ -117,6 +117,9 @@ describe("stages with the scripted runner", () => {
 		assert.ok(message.includes("观测数据说明"));
 		assert.ok(result.output.startsWith("初始认识 ALPHA"));
 		assert.equal(result.record.status, "completed");
+		assert.equal(result.record.sessions[0].boundary?.mode, "fresh");
+		assert.equal(result.record.sessions[0].boundary?.toolGrantKind, "none");
+		assert.equal(result.record.sessions[0].boundary?.evidence.some((item) => item.label === "原始问题"), true);
 		assert.ok(result.record.failures.some((f) => f.includes("scan.pdf")), "non-text raw info is reported, not silently skipped");
 		const note = (await readFile(path.join(ws.notesDir, `${result.record.startedAt.slice(0, 10)}-M01-${result.record.runId}.md`), "utf8"));
 		assert.ok(note.includes("初始认识"));
@@ -127,6 +130,8 @@ describe("stages with the scripted runner", () => {
 		assert.equal(runner.created.length, 2);
 		const spec = runner.created[1];
 		assert.equal(spec.label, "M02");
+		assert.equal(result.record.sessions[0].boundary?.mode, "fresh");
+		assert.equal(result.record.sessions[0].boundary?.evidence.some((item) => item.label.includes("M01 初始认识")), true);
 		assert.equal(spec.model, runner.created[0].model);
 		assert.deepEqual(spec.tools, { kind: "none" });
 		const m02State = [...runner.sessions.values()].find((s) => s.spec.label === "M02")!;
@@ -160,6 +165,8 @@ describe("stages with the scripted runner", () => {
 		assert.ok((await readFile(rationaleFile.path, "utf8")).includes(SECRET));
 		assert.ok(result.answers.includes("完整回答 ANSWER：问1 的回答……"));
 		assert.ok(result.evaluation.startsWith("逐题评价"));
+		assert.deepEqual(result.record.sessions.map((item) => item.boundary?.mode), ["fresh", "continue", "continue"]);
+		assert.equal(result.record.sessions[1].boundary?.parent?.sessionId, m01State.ref.id);
 		const reviewerState = [...runner.sessions.values()].find((s) => s.spec.label === "M03-reviewer")!;
 		assert.equal(reviewerState.transcript.filter((m) => m.role === "user").length, 2, "same reviewer session evaluated");
 		assert.ok(reviewerState.transcript.at(-2)!.text.includes(await loadPrompt("P03A")));
@@ -188,6 +195,7 @@ describe("stages with the scripted runner", () => {
 	it("first M04 continues the M01 session and merges proposals through the serial entry", async () => {
 		const result = await runM04(ctx, { feedback: { kind: "M03" } });
 		assert.equal(result.mode, "continue-m01");
+		assert.equal(result.record.sessions[0].boundary?.mode, "continue");
 		assert.equal(runner.resumed.filter((r) => r.label === "M01").length, 2);
 		const m01State = [...runner.sessions.values()].find((s) => s.spec.label === "M01")!;
 		const m04Message = m01State.transcript.filter((m) => m.role === "user")[2].text;
@@ -213,6 +221,7 @@ describe("stages with the scripted runner", () => {
 		await writeFile(feedbackPath, "用户修正：现象 B 的口径是日平均值。\n");
 		const result = await runM04(ctx, { feedback: { kind: "file", label: "用户修正", path: feedbackPath } });
 		assert.equal(result.mode, "research-session");
+		assert.equal(result.record.sessions[0].boundary?.mode, "fresh");
 		const spec = runner.created.find((s) => s.label === "M04-research")!;
 		assert.equal(spec.role, "research");
 		assert.equal(spec.model, "fake/model-c");

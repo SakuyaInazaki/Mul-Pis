@@ -10,13 +10,14 @@
  */
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
+import { linkedEvidence, openBoundedSession } from "../context/boundary.ts";
 import type { ProposalOp } from "../knowledge/types.ts";
 import { retrieveKnowledge } from "../knowledge/retrieval.ts";
 import { buildM04Message, extractKnowledgeProposals, systemPromptFor } from "../prompts.ts";
 import type { ProblemMaterials } from "../prompts.ts";
 import { HarnessError, type InputRef, type StageRunRecord } from "../types.ts";
 import { readTextIfExists } from "../workspace.ts";
-import { loadProblemMaterials, readOutput, recordSession, relPath, requireCompletedRun, sessionSpec, withRun, type StageContext } from "./context.ts";
+import { loadProblemMaterials, readOutput, relPath, requireCompletedRun, sessionSpec, withRun, type StageContext } from "./context.ts";
 import { specFileFor } from "./m03.ts";
 import { readFrozenArtifactManifest, type FrozenArtifactManifest } from "./artifacts.ts";
 import { renderPageTool } from "../tools/pagetool.ts";
@@ -271,17 +272,15 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 				: feedback.m07
 					? { kind: "read-dir" as const, root: feedback.m07.rootDir, toolName: "m07_evidence_read" }
 					: { kind: "none" as const };
-			const handle =
-				mode === "continue-m01" && m01Session?.file
-					? await ctx.runner.resume({ label: "M01", role: "execution", id: m01Session.id, model: m01Session.model, file: m01Session.file, specFile: specFileFor(m01Session.file) })
-					: await ctx.runner.create(sessionSpec(ctx, "M04-research", "research", systemPromptFor("research"), feedbackTools));
+			const handle = mode === "continue-m01" && m01Session?.file
+				? await openBoundedSession(ctx.runner, record, { mode: "continue", intent: "causal-continuation", reason: "First M04 processing may retain M01 causal reasoning when its original tool boundary is sufficient", evidence: linkedEvidence(record.inputs), parent: { label: "M01", role: "execution", id: m01Session.id, model: m01Session.model, file: m01Session.file, specFile: specFileFor(m01Session.file) }, expectedToolGrantKind: "none" }, () => ctx.ws.writeRun(record))
+				: await openBoundedSession(ctx.runner, record, { mode: "fresh", intent: "independent-judgment", reason: feedback.m07 || feedback.m08 ? "M04 independently judges frozen feedback and actually reads needed evidence without inheriting executor or reviewer history" : "Later M04 reasoning starts from current selected knowledge and explicit feedback rather than unbounded prior dialogue", evidence: linkedEvidence(record.inputs), spec: sessionSpec(ctx, "M04-research", "research", systemPromptFor("research"), feedbackTools) }, () => ctx.ws.writeRun(record));
 			let output: string;
 			let m08ReadCoverage: string[] = [];
 			let m08ToolLog: ReturnType<typeof handle.toolLog> = [];
 			let m07ReturnedRanges: ReturnType<NonNullable<typeof handle.readReturnEvents>> = [];
 			let promptSucceeded = false;
 			try {
-				recordSession(record, handle);
 				if (feedback.m07) await markFeedbackAssembled(ctx.ws, feedback.m07.runId, feedback.inputs[0].path, record.runId);
 				const turn = await handle.prompt(finalMessage);
 				output = turn.text;

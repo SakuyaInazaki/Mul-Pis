@@ -8,10 +8,11 @@
  * K proposals, merged into the knowledge store as candidates only.
  */
 import type { ProposalOp } from "../knowledge/types.ts";
+import { linkedEvidence, openBoundedSession } from "../context/boundary.ts";
 import { buildM02Message, extractKnowledgeProposals, join, KNOWLEDGE_PROPOSALS_FENCE, systemPromptFor } from "../prompts.ts";
 import { HarnessError, type StageRunRecord } from "../types.ts";
 import { M01_OUTPUT } from "./m01.ts";
-import { loadProblemMaterials, readOutput, recordSession, relPath, requireCompletedRun, sessionSpec, withRun, type StageContext } from "./context.ts";
+import { loadProblemMaterials, readOutput, relPath, requireCompletedRun, sessionSpec, withRun, type StageContext } from "./context.ts";
 
 export const M02_OUTPUT = "criteria-candidates.md";
 
@@ -50,10 +51,9 @@ export async function runM02(ctx: StageContext, options: M02Options = {}): Promi
 				throw new HarnessError("m02.model", `M02 必须使用与 M01 相同的模型：M01 用 ${m01Session.model}，当前配置为 ${spec.model}`);
 			}
 			const message = join(await buildM02Message(materials, m01Output.text), m02ProposalInstructions());
-			const handle = await ctx.runner.create(spec);
+			const handle = await openBoundedSession(ctx.runner, record, { mode: "fresh", intent: "independent-judgment", reason: "M02 independently assesses M01's complete visible output without inheriting M01 conversation history", evidence: linkedEvidence(record.inputs), spec }, () => ctx.ws.writeRun(record));
 			let result: M02Result;
 			try {
-				recordSession(record, handle);
 				await ctx.ws.writeOutput(record, "message.md", message, "发送给 M02 会话的完整消息");
 				const turn = await handle.prompt(message);
 				await ctx.ws.writeOutput(record, M02_OUTPUT, turn.text, "候选判据");

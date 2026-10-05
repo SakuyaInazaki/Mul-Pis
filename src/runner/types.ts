@@ -7,6 +7,7 @@
  * SDK wiring lives in `src/runner/pi.ts`. Tests use `src/runner/fake.ts`.
  */
 import type { Role } from "../types.ts";
+import type { EvidenceBindingV1 } from "../context/boundary.ts";
 
 /**
  * What a session may touch besides the text it is given.
@@ -65,6 +66,8 @@ export interface SessionSpec {
 	/** Full system prompt. The runner must use it verbatim and must not append discovered resources. */
 	systemPrompt: string;
 	tools: ToolGrant;
+	/** Controller/runner-derived, persisted authority for audited campaign custom file tools. */
+	toolAuthority?: { version: 1; kind: "confined-campaign-files"; root: string; writableFiles: string[] };
 	/** Directory where the session transcript and its spec are persisted. */
 	persistDir: string;
 	/** Explicit, frozen method identity. It never enables resource discovery. */
@@ -84,6 +87,61 @@ export interface SessionRef {
 	/** Persisted `SessionSpec` used to rebuild the identical boundary on resume. */
 	specFile?: string;
 	methodBinding?: SessionSpec["methodBinding"];
+	/** Committed true-fork receipt. Its absence never implies a fork. */
+	lineageFile?: string;
+}
+
+/** A persisted, completed Pi leaf copied before any child may start. */
+export interface SessionCheckpoint {
+	version: 1;
+	id: string;
+	sourceSessionId: string;
+	sourceSessionFile: string;
+	sourceSpecFile: string;
+	/** Runner-owned byte copy of the parent's grant and model spec. */
+	sourceSpecSnapshot: string;
+	snapshotFile: string;
+	leafId: string;
+	model: string;
+	inputManifest: string;
+	/** Runner-owned byte copy of the controller's manifest at checkpoint time. */
+	manifestSnapshot: string;
+	runId: string;
+	taskId?: string;
+	frozenAt: string;
+	snapshotBytes: number;
+}
+
+export interface ForkRequest {
+	checkpoint: SessionCheckpoint;
+	spec: SessionSpec;
+	evidenceBindings: EvidenceBindingV1[];
+	workspaceBinding?: ForkWorkspaceBindingV1;
+	reason: string;
+}
+
+/** Controller-frozen authority for copying one task workspace into an independent branch. */
+export interface ForkWorkspaceBindingV1 {
+	version: 1;
+	parentRoot: string;
+	authorizedChildRootBase: string;
+	childWorkLeaf: string;
+	childRoot: string;
+	ownerMarkerPath: string;
+	frozenEvidenceRoot: string;
+	files: Array<{ sourcePath: string; frozenPath: string; childPath: string; bytes: number }>;
+}
+
+export interface RunnerCapabilities {
+	version: 1;
+	fresh: true;
+	continue: true;
+	persistedLineage: true;
+	forkAtFrozenLeaf: true;
+	grantKinds: ToolGrant["kind"][];
+	modelCompatibility: "exact-model-only";
+	multimodalHistory: "model-dependent";
+	parallelPromptLeases: "single-process";
 }
 
 /** Provider-reported units only. Missing values remain unknown, never inferred from text size. */
@@ -172,6 +230,13 @@ export interface SessionHandle {
 
 export interface SessionRunner {
 	create(spec: SessionSpec): Promise<SessionHandle>;
+	capabilities?(): RunnerCapabilities;
+	/** Live factory-backed attestation; persisted JSON alone cannot authorize a custom-tool narrowing claim. */
+	attestConfinedGrant?(handle: SessionHandle): Promise<NonNullable<SessionSpec["toolAuthority"]> | undefined>;
+	/** Refuse a live, failed, or unsettled parent and freeze exact source bytes. */
+	checkpoint?(handle: SessionHandle, envelope: { inputManifest: string; runId: string; taskId?: string; externalOperationsSettled: boolean }): Promise<SessionCheckpoint>;
+	/** A new persisted Pi history from the checkpoint leaf, with independent grants. */
+	fork?(request: ForkRequest): Promise<SessionHandle>;
 	/** Worst-case Pi price-table estimate for one bounded text request; absent/undefined fails admission closed. */
 	estimateMaxSdkCost?(modelRaw: string, caps: { maxInputTokens: number; maxOutputTokens: number }): Promise<number | undefined>;
 	/** Reopen a persisted session with the boundary recorded in `ref.specFile`. */

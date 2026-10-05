@@ -53,7 +53,7 @@ interface FactoryHarness {
 	abortCalls: number;
 }
 
-function stubFactory(response?: StubResponse | StubResponse[], config: { pruneIntermediate?: boolean; compactionUsage?: StubResponse["usage"]; disposeCounter?: { count: number }; blockSpecWrite?: boolean } = {}): FactoryHarness {
+function stubFactory(response?: StubResponse | StubResponse[], config: { pruneIntermediate?: boolean; compactionUsage?: StubResponse["usage"]; disposeCounter?: { count: number }; blockSpecWrite?: boolean; insertToolResult?: boolean } = {}): FactoryHarness {
 	const calls: CreateAgentSessionOptions[] = [];
 	let promptCalls = 0;
 	let abortCalls = 0;
@@ -110,6 +110,11 @@ function stubFactory(response?: StubResponse | StubResponse[], config: { pruneIn
 				if (index === 0) { messages.push(user); manager.appendMessage(user as never); }
 				messages.push(assistant);
 				manager.appendMessage(assistant as never);
+				if (config.insertToolResult && index === 0) {
+					const toolResult = { role: "toolResult", toolCallId: "t", toolName: "offline", content: [{ type: "text", text: "ORIGINAL TOOL PAYLOAD at /parent/original.txt" }], isError: false, timestamp: Date.now() };
+					messages.push(toolResult);
+					manager.appendMessage(toolResult as never);
+				}
 				if (config.pruneIntermediate && index < responses.length - 1) messages.pop();
 				}
 				if (config.compactionUsage) manager.appendCompaction("offline summary", "offline-entry", 100, undefined, false, config.compactionUsage as never);
@@ -547,6 +552,153 @@ test("method binding survives resume without enabling discovered resources", asy
 	const resumed = await runner.resume(handle.ref);
 	assert.deepEqual(resumed.ref.methodBinding, binding);
 	resumed.dispose();
+});
+
+test("Pi forks two independent histories from a frozen completed leaf, preserving tool payload and excluding later parent turns", async (t) => {
+	const root = await fixture(t);
+	const sessions = path.join(root, "parent-sessions");
+	const childSessions = path.join(root, "child-sessions");
+	const frozen = path.join(root, "frozen-evidence.json");
+	await mkdir(sessions);
+	await mkdir(childSessions);
+	await writeFile(frozen, JSON.stringify({ originalPath: "/parent/original.txt", frozenPath: frozen }));
+	const stub = stubFactory([
+		{ content: [{ type: "toolCall", id: "t", name: "offline", arguments: {} }], stopReason: "toolUse" },
+		{ content: [{ type: "text", text: "finished first" }], stopReason: "stop" },
+	], { insertToolResult: true });
+	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory });
+	const historicalTool: CustomToolSpec = { name: "offline", description: "historical only", params: {}, execute: async () => ({ text: "unused" }) };
+	const parent = await runner.create(spec(sessions, { tools: { kind: "custom", tools: [historicalTool] } }));
+	await parent.prompt("parent first");
+	const checkpoint = await runner.checkpoint(parent, { inputManifest: frozen, runId: "run-1", taskId: "task-1", externalOperationsSettled: true });
+	const parentAtCheckpoint = await readFile(parent.ref.file!, "utf8");
+	await parent.prompt("parent later");
+	const parentBeforeFork = await readFile(parent.ref.file!, "utf8");
+	const childSpec = spec(childSessions, { label: "child", role: "research", tools: { kind: "none" } });
+	const evidenceBindings = [{ version: 1 as const, label: "original tool result binding", path: frozen, status: "frozen-copy" as const, sourceVersion: checkpoint.id }];
+	const first = await runner.fork({ checkpoint, spec: childSpec, evidenceBindings, reason: "competing route one" });
+	const second = await runner.fork({ checkpoint, spec: { ...childSpec, label: "child-two" }, evidenceBindings, reason: "competing route two" });
+	assert.notEqual(first.ref.id, second.ref.id);
+	assert.notEqual(first.ref.file, second.ref.file);
+	assert.notEqual(first.ref.file, parent.ref.file);
+	assert.deepEqual(stub.calls.at(-1)?.tools, []);
+	assert.deepEqual(stub.calls.at(-1)?.resourceLoader?.getExtensions().extensions, []);
+	assert.deepEqual(stub.calls.at(-1)?.resourceLoader?.getSkills().skills, []);
+	const firstFile = await readFile(first.ref.file!, "utf8");
+	assert.match(firstFile, /ORIGINAL TOOL PAYLOAD at \/parent\/original\.txt/);
+	assert.match(JSON.stringify(stub.calls.at(-2)?.sessionManager?.buildSessionContext().messages), /ORIGINAL TOOL PAYLOAD at \/parent\/original\.txt/);
+	assert.doesNotMatch(firstFile, /parent later/);
+	assert.match(firstFile, /parent first/);
+	assert.equal(await readFile(parent.ref.file!, "utf8"), parentBeforeFork);
+	assert.notEqual((JSON.parse(firstFile.split("\n")[0]) as { cwd: string }).cwd, (JSON.parse(parentAtCheckpoint.split("\n")[0]) as { cwd: string }).cwd);
+	const lineage = JSON.parse(await readFile(first.ref.lineageFile!, "utf8"));
+	assert.equal(lineage.parent.leafId, checkpoint.leafId);
+	assert.equal(lineage.inheritedUsageBilled, false);
+	assert.deepEqual(lineage.evidenceBindings, evidenceBindings);
+	await first.prompt("first child only");
+	assert.doesNotMatch(await readFile(second.ref.file!, "utf8"), /first child only/);
+	assert.equal(first.usageEvents().filter((event) => event.kind === "assistant").length, 2);
+	first.dispose();
+	const resumedChild = await runner.resume(first.ref);
+	assert.equal(resumedChild.ref.lineageFile, first.ref.lineageFile);
+	resumedChild.dispose();
+	second.dispose();
+	await rm(second.ref.lineageFile!);
+	await assert.rejects(runner.resume(second.ref), /lineage receipt is missing/);
+	parent.dispose();
+});
+
+test("Pi checkpoint and fork fail closed for active, failed, unsettled, missing-evidence and changed-model parents", async (t) => {
+	const root = await fixture(t);
+	const manifest = path.join(root, "frozen.json");
+	await writeFile(manifest, "{}\n");
+	const stub = stubFactory();
+	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory });
+	const parent = await runner.create(spec(root));
+	await assert.rejects(runner.checkpoint(parent, { inputManifest: manifest, runId: "run", externalOperationsSettled: true }), /completed/);
+	await parent.prompt("complete");
+	await assert.rejects(runner.checkpoint(parent, { inputManifest: manifest, runId: "run", externalOperationsSettled: false }), /unknown external operations/);
+	const checkpoint = await runner.checkpoint(parent, { inputManifest: manifest, runId: "run", externalOperationsSettled: true });
+	await assert.rejects(runner.fork({ checkpoint, spec: spec(root, { model: "offline/other" }), evidenceBindings: [], reason: "candidate" }), /cross-model/);
+	await assert.rejects(runner.fork({ checkpoint, spec: spec(root, { tools: { kind: "execution", root, tools: ["bash"] } }), evidenceBindings: [{ version: 1, label: "frozen", path: manifest, status: "frozen-copy", sourceVersion: checkpoint.id }], reason: "candidate" }), /cannot elevate tool authority/);
+	await assert.rejects(runner.fork({ checkpoint, spec: spec(root), evidenceBindings: [{ version: 1, label: "mutable", path: manifest, status: "linked" }], reason: "candidate" }), /frozen-copy/);
+	await writeFile(manifest, "{\"changed\":true}\n");
+	await assert.rejects(runner.fork({ checkpoint, spec: spec(root), evidenceBindings: [{ version: 1, label: "frozen", path: manifest, status: "frozen-copy", sourceVersion: checkpoint.id }], reason: "candidate" }), /manifest is missing or changed/);
+	await writeFile(manifest, "{}\n");
+	await writeFile(parent.ref.specFile!, JSON.stringify(spec(root, { label: "changed" })));
+	await assert.rejects(runner.fork({ checkpoint, spec: spec(root), evidenceBindings: [{ version: 1, label: "frozen", path: manifest, status: "frozen-copy", sourceVersion: checkpoint.id }], reason: "candidate" }), /parent spec changed/);
+	parent.dispose();
+});
+
+test("Pi forks a compaction-aware checkpoint while retaining original JSONL evidence", async (t) => {
+	const root = await fixture(t);
+	const manifest = path.join(root, "manifest.json");
+	await writeFile(manifest, "{}\n");
+	const usage = { input: 4, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 5, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+	const stub = stubFactory(undefined, { compactionUsage: usage });
+	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory });
+	const parent = await runner.create(spec(root));
+	await parent.prompt("full original before compaction");
+	const checkpoint = await runner.checkpoint(parent, { inputManifest: manifest, runId: "run", externalOperationsSettled: true });
+	const child = await runner.fork({ checkpoint, spec: spec(path.join(root, "children")), evidenceBindings: [{ version: 1, label: "frozen", path: manifest, status: "frozen-copy", sourceVersion: checkpoint.id }], reason: "alternate compaction-aware continuation" });
+	const childJsonl = await readFile(child.ref.file!, "utf8");
+	assert.match(childJsonl, /full original before compaction/);
+	assert.match(childJsonl, /"type":"compaction"/);
+	assert.equal(child.usageEvents().length, 0);
+	child.dispose(); parent.dispose();
+});
+
+test("Pi checkpoint refuses a prompt still in flight", async (t) => {
+	const root = await fixture(t);
+	const manifest = path.join(root, "manifest.json");
+	await writeFile(manifest, "{}\n");
+	const stub = stubFactory();
+	let release!: () => void;
+	let started!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const entered = new Promise<void>((resolve) => { started = resolve; });
+	const factory = (async (options: CreateAgentSessionOptions = {}) => {
+		const created = await stub.factory(options);
+		const original = created.session.prompt.bind(created.session);
+		(created.session as unknown as { prompt(text: string): Promise<void> }).prompt = async (text) => { started(); await gate; await original(text); };
+		return created;
+	}) as typeof createAgentSession;
+	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: factory });
+	const handle = await runner.create(spec(root));
+	const inFlight = handle.prompt("waiting");
+	await entered;
+	await assert.rejects(runner.checkpoint(handle, { inputManifest: manifest, runId: "run", externalOperationsSettled: true }), /idle, completed/);
+	release();
+	await inFlight;
+	const checkpoint = await runner.checkpoint(handle, { inputManifest: manifest, runId: "run", externalOperationsSettled: true });
+	assert(checkpoint.leafId);
+	handle.dispose();
+});
+
+test("fake runner mirrors independent checkpoint snapshots and child scratch identity", async (t) => {
+	const root = await fixture(t);
+	const manifest = path.join(root, "manifest.json");
+	await writeFile(manifest, "{}\n");
+	const runner = new FakeSessionRunner(() => "ok");
+	const parent = await runner.create(spec(root));
+	await parent.prompt("ancestor");
+	const checkpoint = await runner.checkpoint(parent, { inputManifest: manifest, runId: "run", externalOperationsSettled: true });
+	await parent.prompt("later parent");
+	const evidenceBindings = [{ version: 1 as const, label: "frozen", path: manifest, status: "frozen-copy" as const, sourceVersion: checkpoint.id }];
+	const a = await runner.fork({ checkpoint, spec: spec(root, { label: "a" }), evidenceBindings, reason: "first option" });
+	const b = await runner.fork({ checkpoint, spec: spec(root, { label: "b" }), evidenceBindings, reason: "second option" });
+	assert.deepEqual(a.transcript(), b.transcript());
+	assert.doesNotMatch(JSON.stringify(a.transcript()), /later parent/);
+	const aLineage = JSON.parse(await readFile(a.ref.lineageFile!, "utf8"));
+	const bLineage = JSON.parse(await readFile(b.ref.lineageFile!, "utf8"));
+	assert.notEqual(aLineage.child.scratch, bLineage.child.scratch);
+	assert.notEqual(aLineage.child.sessionFile, bLineage.child.sessionFile);
+	a.dispose(); b.dispose();
+	const resumed = await runner.resume(a.ref);
+	resumed.dispose();
+	await rm(b.ref.lineageFile!);
+	await assert.rejects(runner.resume(b.ref), /lineage receipt is missing/);
+	parent.dispose();
 });
 
 test("releases SDK session when post-create sidecar write fails", async (t) => {
