@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       authorize_bounded_run:
-        description: "Authorize one DeepSeek campaign up to 7.3 CNY after checking prior charges"
+        description: "Authorize one DeepSeek campaign up to 6.5 CNY after checking prior charges"
         required: true
         default: false
         type: boolean
@@ -27,7 +27,7 @@ jobs:
       github.run_attempt == 1 &&
       github.event_name == 'push' &&
       github.ref == 'refs/heads/improve/workflow-learning-reliability' &&
-      github.event.head_commit.message == 'Repair review handoff and resume context workflow (mul-pis-20261005-context-run2)'
+      github.event.head_commit.message == 'Repair frozen input identity and evidence handoff (mul-pis-20261005-context-run3)'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

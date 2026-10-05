@@ -10,9 +10,9 @@ test("one-use campaign push guard cannot also dispatch a second paid run manuall
 	const gate = workflow.split("  private-campaign:\n")[1]?.split("    runs-on:")[0] ?? "";
 	assert.match(workflow, /on:\n  push:\n    branches:\n      - improve\/workflow-learning-reliability/);
 	assert.match(gate, /github\.event_name == 'push'/);
-	assert.match(gate, /mul-pis-20261005-context-run2/);
-	assert.doesNotMatch(gate, /workflow_dispatch|authorize_bounded_run|lab-resume1|lab-resume2|context-run1/);
-	assert.match(workflow, /description: "Authorize one DeepSeek campaign up to 7\.3 CNY/);
+	assert.match(gate, /mul-pis-20261005-context-run3/);
+	assert.doesNotMatch(gate, /workflow_dispatch|authorize_bounded_run|lab-resume1|lab-resume2|context-run1|context-run2/);
+	assert.match(workflow, /description: "Authorize one DeepSeek campaign up to 6\.5 CNY/);
 });
 
 test("generic private campaign source-shape gate preserves non-target bodies", () => {

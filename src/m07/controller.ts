@@ -462,7 +462,7 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string,
 	];
 	if (knowledgePack) boundary.push(section("本任务局部知识包", knowledgePack));
 	if (task.executionLoop) boundary.push(section("有界执行返工", `本任务显式允许最多 ${task.executionLoop.maxRounds} 轮同一候选局部修补，绝对截止 ${task.executionLoop.deadlineAt}。每轮后由全新只读 reviewer 给出反馈；只有控制器可决定是否再次提示。不得扩大任务义务、替换指南或假称 reviewer 的 ready 是最终采用。`));
-	if (task.lessonDeltaOutput) boundary.push(section("候选经验回流", `将本轮候选经验写入 ${task.lessonDeltaOutput}，JSON 格式为 {"version":1,"action":"none|propose|amend|contradict","observation":"...","hypothesis":"...","applicability":"...","evidencePaths":["本任务 work 内相对路径"]}。none 合法；不确定因果写为假设。此文件是待 M04 处理的候选，不能自称已采纳知识。`));
+	if (task.lessonDeltaOutput) boundary.push(section("候选经验回流", `将本轮候选经验写入 ${task.lessonDeltaOutput}，JSON 格式为 {"version":1,"action":"none|propose|amend|contradict","observation":"...","hypothesis":"...","applicability":"...","evidencePaths":["本任务 work 内相对路径"]}。none 合法；不确定因果写为假设。仅修正本任务尚未入库的候选时仍用 propose；amend 或 contradict 只用于修订/反驳已存在且已固定身份的知识记录，必须加 "priorRef":{"storeId":"...","recordId":"...","version":1}，不得猜测 ID。此文件是待 M04 处理的候选，不能自称已采纳知识。`));
 	if (task.mode === "execute") boundary.push(section("外部执行与可消耗资源", `本任务控制操作 ID：${operationId ?? "旧目标无操作登记"}。若执行有真实副作用的远端动作，保存实际参数、外部请求/结果 ID、响应和可用的查询方法；在响应丢失后先查询，不能仅凭超时重发。任务级 ID 是恢复索引，只有远端明确支持时才能作为幂等键，不能声称 exactly-once。\n\n如任务涉及真实提交、评测、远程实验或其他可能消耗配额/费用/机会的动作：先用已提供的只读能力或额度接口核对接入和当前状态，并先做本地可完成的语法、类型、编译与兼容性预检。这不禁止任务已授权的真实实验，已授权平台评测/实验产生的结果属于本任务实测证据。每次真实动作都要记录实际结果和资源消耗；失败若仍消耗了资源，同样记录已消耗量、可见剩余量与恢复条件。平台配额不明时如实记录未知，不猜测统一配额。本地命令或客户端成功退出不等于远程实验通过。显式输入和原问题允许使用；若需取得新的外部研究参考资料并用于推理，将具体缺口报回主会话走 M05/M06→M04，不在 execute 任务里通过 bash 另造获取和采用链。`));
 	boundary.push("会话返回只表示任务已返回，不表示成果被主 Agent 接受。请如实列出实际动作、产物、失败、未执行项和限制。");
 	boundary.push("产物路径规则：expectedOutputs 必须是当前任务工作目录内的精确相对路径；说明写在 objective 或 report.md。所有实际写盘必须落在当前工作目录内，不要写到工作区根目录或绝对路径。");
@@ -840,9 +840,26 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				if (goal.tasks.filter((item) => item.context?.parentTaskId === reference.parentTaskId).length >= 4) throw new HarnessError("m07.branch", "one checkpoint supports at most four bounded candidates");
 				if (goal.branchSelections?.some((item) => item.parentTaskId === reference.parentTaskId)) throw new HarnessError("m07.branch", "branch selection is frozen; no later candidate may join this comparison");
 				if (spec.mode !== "execute" || spec.objective !== branchParent.objective || !sameStrings(spec.checks, branchParent.checks) || !sameStrings(spec.expectedOutputs, branchParent.expectedOutputs) || Boolean(spec.requireIndependentCheck) !== Boolean(branchParent.requireIndependentCheck) || !sameStrings(spec.inputs, branchParent.inputs) || (spec.parentTaskId && spec.parentTaskId !== branchParent.taskId) || (spec.supersedesTaskId && spec.supersedesTaskId !== branchParent.taskId)) throw new HarnessError("m07.branch", "fork candidates must retain the parent's objective, inputs, outputs, checks, execute mode, and independent-check obligation");
+				branchManifest = await loadBranchManifest(branchParent.branchSource, runId, branchParent.taskId);
+				if (branchParent.inputCopies.length !== branchParent.inputs.length) throw new HarnessError("m07.branch", "frozen parent input identity is incomplete");
+				const rootReal = await realpath(ctx.ws.root);
+				const frozenInputSource = (requested: string): string => {
+					const index = branchParent!.inputs.indexOf(requested);
+					const copy = index >= 0 ? branchParent!.inputCopies[index] :
+						branchParent!.inputCopies.find((item) => item.source === requested);
+					if (!copy || !path.isAbsolute(copy.source) || !inside(rootReal, copy.source))
+						throw new HarnessError("m07.branch", "fork input is not one of the parent's frozen declared inputs");
+					const relative = path.relative(branchParent!.workDir, copy.copy);
+					if (relative.startsWith("..") || path.isAbsolute(relative) ||
+						!branchManifest!.files.some((file) => file.relativePath === relative && file.historicalPath === copy.copy))
+						throw new HarnessError("m07.branch", "fork input lacks the parent's frozen work-copy identity");
+					return copy.source;
+				};
+				if (spec.planInput !== undefined) spec.planInput = frozenInputSource(spec.planInput);
+				if (spec.resourceInputs !== undefined) spec.resourceInputs = spec.resourceInputs.map((item) =>
+					({ ...item, input: frozenInputSource(item.input) }));
 				if (JSON.stringify(spec.knowledgeIds ?? []) !== JSON.stringify(branchParent.knowledgeIds ?? []) || JSON.stringify(spec.experienceRefs ?? []) !== JSON.stringify(branchParent.experienceRefs ?? []) || JSON.stringify(spec.experienceContextRefs ?? []) !== JSON.stringify(branchParent.experienceContextRefs ?? []) || JSON.stringify(spec.experienceTags ?? []) !== JSON.stringify(branchParent.experienceTags ?? []) || JSON.stringify(spec.resourceInputs ?? []) !== JSON.stringify(branchParent.resourceInputs ?? []) || spec.planInput !== branchParent.planInput || spec.lessonDeltaOutput !== branchParent.lessonDeltaOutput || Boolean(spec.executionLoop) !== Boolean(branchParent.executionLoop) || (spec.executionLoop && spec.executionLoop.maxRounds !== branchParent.executionLoop?.maxRounds)) throw new HarnessError("m07.branch", "fork cannot silently change frozen knowledge applicability, plan, resources, lesson output, or review-loop obligations");
 				if (branchParent.knowledgeSnapshot !== goal.knowledgeSnapshot || branchParent.m04BaselineRunId !== goal.m04BaselineRunId) throw new HarnessError("m07.branch", "goal baseline changed since the source task; establish a new task rather than fork old authority");
-				branchManifest = await loadBranchManifest(branchParent.branchSource, runId, branchParent.taskId);
 				if (branchManifest.knowledgeSnapshot !== goal.knowledgeSnapshot || branchManifest.m04BaselineRunId !== goal.m04BaselineRunId || branchManifest.problemSourcePath !== goal.problemSnapshotPath) throw new HarnessError("m07.branch", "frozen source manifest no longer matches the goal's inputs and formal baseline");
 				spec = { ...spec, parentTaskId: branchParent.taskId, supersedesTaskId: branchParent.taskId };
 			}
@@ -863,7 +880,8 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				}
 			}
 			if (spec.parentTaskId && !goal.tasks.some((t) => t.taskId === spec.parentTaskId)) throw new HarnessError("m07.task", `未知 parentTaskId ${spec.parentTaskId}`);
-			const resolvedInputs: string[] = []; for (const requested of spec.inputs) resolvedInputs.push(branchParent ? requested : await confinedExistingFile(ctx, requested));
+			const resolvedInputs: string[] = []; for (let index = 0; index < spec.inputs.length; index++)
+				resolvedInputs.push(branchParent ? branchParent.inputCopies[index].source : await confinedExistingFile(ctx, spec.inputs[index]));
 			if (spec.planInput) {
 				if (spec.mode !== "execute") throw new HarnessError("m07.plan-input", "planInput is only valid for an execute task");
 				const planSource = branchParent ? spec.planInput : await confinedExistingFile(ctx, spec.planInput);

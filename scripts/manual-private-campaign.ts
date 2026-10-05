@@ -14,6 +14,7 @@ import { Workspace } from "../src/workspace.ts";
 import { runInit } from "../src/stages/init.ts";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { createM07Controller } from "../src/m07/controller.ts";
+import { runMeasuredEvidenceHandoff } from "../src/m07/evidence-finalization.ts";
 import type { CurrentGoal, TaskSpecInput } from "../src/m07/types.ts";
 import { runM04 } from "../src/stages/m04.ts";
 import { createPiSessionRunner } from "../src/runner/pi.ts";
@@ -27,7 +28,7 @@ import type { KnowledgeRef, KnowledgeStore } from "../src/knowledge/types.ts";
 import type { StageRunRecord } from "../src/types.ts";
 
 const MODEL = "deepseek/deepseek-flash:low";
-const MAX_CNY = 7.3;
+const MAX_CNY = 6.5;
 const CAMPAIGN_MS = 20 * 60_000;
 const BUILDER_PHASE_MS = 7 * 60_000;
 const M04_PHASE_MS = 5 * 60_000;
@@ -658,24 +659,34 @@ async function main() {
 			};
 			const checkedHandle = (handle: SessionHandle, workDir: string): SessionHandle => ({
 				...handle, prompt: async (message: string) => {
-						const turn = await handle.prompt(message);
 						const candidate = path.join(workDir, "candidate.cpp");
-						let result: Record<string, unknown> = { version: 1, status: "failed", reason: "candidate missing" };
-						if (existsSync(candidate)) {
-							const candidateScratch = await verifierScratch("candidate");
-							try { result = await checkCandidate(originalPath, candidate, candidateScratch); }
-							finally { await rm(candidateScratch, { recursive: true, force: true }); }
-						}
-						result.originalBaselineRuns = originalSmoke.originalCheckerRuns;
-						result.originalBaselineIndependent = {
-							status: (originalSmoke.independent as { status?: string }).status,
-							timings: (originalSmoke.independent as { timings?: TrustedTiming[] }).timings,
-						};
-						result.originalHostComparison = compareCandidateTimings(originalSmoke, result);
-						if (result.status === "passed" && (result.originalHostComparison as { state?: string }).state !== "measured")
-							result.status = "failed";
-						if (followOnPriorVerification) result.priorCandidateComparison = compareCandidateTimings(followOnPriorVerification, result);
-						await writeFile(path.join(workDir, "verification.json"), JSON.stringify(result, null, 2), { mode: 0o600 });
+						const verification = path.join(workDir, "verification.json");
+						const previousPhase = statusPhase;
+						const turn = await runMeasuredEvidenceHandoff({ handle,
+							implementationPrompt: message, sourceFile: candidate, evidenceFile: verification,
+							measure: async () => {
+								statusPhase = "host-verification";
+								let result: Record<string, unknown> = { version: 1, status: "failed", reason: "candidate missing" };
+								if (existsSync(candidate)) {
+									const candidateScratch = await verifierScratch("candidate");
+									try { result = await checkCandidate(originalPath, candidate, candidateScratch); }
+									finally { await rm(candidateScratch, { recursive: true, force: true }); }
+								}
+								result.originalBaselineRuns = originalSmoke.originalCheckerRuns;
+								result.originalBaselineIndependent = {
+									status: (originalSmoke.independent as { status?: string }).status,
+									timings: (originalSmoke.independent as { timings?: TrustedTiming[] }).timings,
+								};
+								result.originalHostComparison = compareCandidateTimings(originalSmoke, result);
+								if (result.status === "passed" && (result.originalHostComparison as { state?: string }).state !== "measured")
+									result.status = "failed";
+								if (followOnPriorVerification) result.priorCandidateComparison = compareCandidateTimings(followOnPriorVerification, result);
+								await writeFile(verification, JSON.stringify(result, null, 2), { mode: 0o600 });
+							},
+							finalizationPrompt: "Evidence-finalization phase for this same M07 task. The host just measured the current candidate and wrote verification.json. Use the read tool to read the complete current verification.json before making claims; earlier reports and measurements may describe a different candidate or timing run. You may read candidate.cpp and lesson-delta.json, and update only lesson-delta.json. Do not write or edit candidate.cpp or verification.json. Report the exact current measured facts, including shape-dependent winners, regressions and limitations, without inventing or reusing stale numbers. The lesson-delta.json schema is version 1 with action none, propose, amend or contradict and an evidencePaths array of at most 20 relative task paths. A proposal needs a nonempty observation and applicability and at least one evidence path such as verification.json. Amend or contradict additionally requires an exact pinned priorRef with storeId, recordId and integer version; if no such adopted prior record is available, use propose or none. None can use an empty evidencePaths array. This is only a pending lesson candidate; do not claim M04 adoption. Your response is the final evidence-grounded report for the fresh reviewer: aim below 4,000 characters, cite decisive measured values and caveats, and do not copy the full verification file. No code changes.",
+							readToolName: "read", onFinalization: () => { statusPhase = "evidence-finalization"; },
+						});
+						statusPhase = previousPhase;
 						return turn;
 					},
 			});
@@ -824,7 +835,8 @@ async function main() {
 			let selectedCandidateSource: "initial" | "fork" | "followon" | "none" = firstGoalReady ?
 				selectedTask.taskId === task.taskId ? "initial" : "fork" : "none";
 			let m04: { status: "completed" | "failed" | "not_run"; runId?: string; proposalSubmitted?: boolean;
-				snapshotCreated?: boolean; evidenceReturned?: boolean; adoptedExperienceRefs?: KnowledgeRef[] } = { status: "not_run" };
+				snapshotCreated?: boolean; evidenceReturned?: boolean; adoptedExperienceRefs?: KnowledgeRef[];
+				failure?: ReturnType<typeof privateExceptionDiagnostic> } = { status: "not_run" };
 			if (firstGoalReady && branchExerciseComplete && !budget.snapshot().stopped && !abort.signal.aborted) {
 				statusPhase = "m04-dispatch";
 				const m04Abort = new AbortController();
@@ -841,7 +853,8 @@ async function main() {
 						proposalSubmitted: Boolean(processed.proposalId), snapshotCreated: Boolean(processed.snapshotId),
 						evidenceReturned: coverage.complete,
 						adoptedExperienceRefs: complete ? await adoptedExperienceRefs(store, processed.record.runId, coverage.complete) : [] };
-				} catch { m04 = { status: "failed", adoptedExperienceRefs: [] }; }
+				} catch (error) { m04 = { status: "failed", adoptedExperienceRefs: [],
+					failure: privateExceptionDiagnostic(error, runtimeKey) }; }
 				finally { clearTimeout(m04Timer); }
 			}
 			const archivedM04 = await recordPrivateM04Outcome(outputDir, { state: m04.status === "not_run" ? "not-run" : m04.status,
@@ -944,7 +957,8 @@ async function main() {
 						candidateSelected: selectedCandidateSource === "followon", selectedCandidateSource,
 						knowledgeMode: pinnedRefs.length ? "m04-adopted-pinned" : "prior-artifact-only",
 						archiveTransportLayout: "prefixed-flat-index" };
-				} catch { followOn = { state: "failed", priorCandidateProvided: true, faithfulUse: "unknown", causalBenefit: "unknown" }; }
+				} catch (error) { followOn = { state: "failed", priorCandidateProvided: true,
+					failure: privateExceptionDiagnostic(error, runtimeKey), faithfulUse: "unknown", causalBenefit: "unknown" }; }
 			}
 			statusPhase = "workflow-finished";
 			const finalCandidateVerified = selectedCandidateSource !== "none" &&

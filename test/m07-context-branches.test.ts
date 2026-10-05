@@ -73,6 +73,51 @@ test("M07 opens two real fake-runner histories from one frozen task leaf with pr
 	assert.deepEqual(run.sessions.map((item) => item.boundary?.mode), ["fresh", "fork", "fork"]);
 });
 
+test("M07 fork keeps canonical frozen identity for relative inputs, plan and versioned resources", async t => {
+	const f = await fixture(t);
+	const guide = path.join(f.root, "guide.md"), alternative = path.join(f.root, "alternative.md");
+	await writeFile(guide, "frozen guide\n"); await writeFile(alternative, "other frozen guide\n");
+	const spec = { ...taskSpec, inputs: ["guide.md", "alternative.md"], planInput: "guide.md",
+		resourceInputs: [{ id: "guide", version: "v1", input: "guide.md" }] };
+	const parent = await f.controller.delegate(f.goal.runId, spec);
+	assert.equal(parent.status, "returned", parent.executionFailure ?? "parent failed");
+	assert.ok(parent.branchSource, parent.branchUnavailableReason ?? "checkpoint unavailable");
+	assert.equal(parent.inputCopies[0].source, guide);
+	assert.equal(parent.planInput, guide);
+	assert.equal(parent.resourceInputs?.[0].input, guide);
+	const context = { mode: "fork" as const, parentRunId: f.goal.runId, parentTaskId: parent.taskId,
+		checkpointId: parent.branchSource!.checkpoint.id };
+	await assert.rejects(f.controller.delegate(f.goal.runId, { ...spec, inputs: [...spec.inputs].reverse(), context }),
+		/retain the parent's objective, inputs/);
+	await assert.rejects(f.controller.delegate(f.goal.runId, { ...spec, planInput: "not-declared.md", context }),
+		/frozen declared inputs/);
+	await assert.rejects(f.controller.delegate(f.goal.runId, { ...spec,
+		resourceInputs: [{ id: "guide", version: "v1", input: "alternative.md" }], context }),
+		/frozen knowledge applicability, plan, resources/);
+	await assert.rejects(f.controller.delegate(f.goal.runId, { ...spec,
+		resourceInputs: [{ id: "guide", version: "v2", input: "guide.md" }], context }),
+		/frozen knowledge applicability, plan, resources/);
+	await writeFile(guide, "changed after checkpoint\n");
+	const child = await f.controller.delegate(f.goal.runId, { ...spec, context });
+	assert.equal(child.status, "returned", child.executionFailure ?? "fork failed");
+	assert.deepEqual(child.inputCopies.map(item => item.source), parent.inputCopies.map(item => item.source));
+	assert.equal(child.planInput, parent.planInput);
+	assert.deepEqual(child.resourceInputs, parent.resourceInputs);
+	assert.equal(await readFile(child.inputCopies[0].copy, "utf8"), "frozen guide\n");
+});
+
+test("M07 candidate lesson prompt requires pinned priorRef only for adopted-record amendments", async t => {
+	const f = await fixture(t);
+	await f.controller.delegate(f.goal.runId, { ...taskSpec,
+		expectedOutputs: ["candidate.txt", "lesson-delta.json"], lessonDeltaOutput: "lesson-delta.json" });
+	const execution = [...f.runner.sessions.values()].find(item => item.spec.role === "execution");
+	const message = execution?.transcript[0]?.text ?? "";
+	assert.match(message, /priorRef/);
+	assert.match(message, /storeId.*recordId.*version/);
+	assert.match(message, /amend.*contradict/);
+	assert.match(message, /propose/);
+});
+
 test("M07 branch candidates remain review-gated and selection cannot bypass original checks", async (t) => {
 	const f = await fixture(t);
 	const parent = await f.controller.delegate(f.goal.runId, taskSpec);
