@@ -109,6 +109,17 @@ test("fresh assessor reads frozen original inputs and delegates only its valid c
 	assert.equal((await readFile(f.contractFile, "utf8")), `${JSON.stringify(f.contract, null, 2)}\n`);
 });
 
+test("assessment may cite the required frozen original-objective contract", async t => {
+	const f = await fixture(t);
+	const proposal = { ...assessment("continue"),
+		evidenceRefs: ["original-objective.json", "candidate.cpp", "verification.json"] };
+	const { result, advanced } = await invoke(f,
+		{ text: JSON.stringify(proposal), readReturns: ranges(f) });
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.equal(advanced.length, 1);
+	assert.deepEqual(result.assessment?.evidenceRefs, proposal.evidenceRefs);
+});
+
 test("assessment parsing has no workflow-chosen raw response byte cap", async t => {
 	const f = await fixture(t);
 	const { result, advanced } = await invoke(f, {
@@ -206,18 +217,59 @@ test("accepted finite pilot and even a model fulfilled claim cannot close an ope
 	assert.deepEqual(progress.continuation.unresolvedObligations, ["original-task"]);
 });
 
-test("blocked and malformed assessments cannot launch more execution", async t => {
-	for (const kind of ["blocked", "malformed", "malformed-scope"] as const) {
-		const f = await fixture(t);
-		const text = kind === "malformed" ? JSON.stringify({ ...assessment("continue"), decision: ["continue"] }) :
-			kind === "malformed-scope" ? JSON.stringify({ ...assessment("continue"),
-				nextTask: { ...assessment("continue").nextTask, adapterScope: ["two-target-existing"] } }) :
-				JSON.stringify(assessment(kind === "blocked" ? "blocked" : "continue"));
-		const { result, advanced } = await invoke(f, { text, readReturns: ranges(f) });
-		assert.equal(result.stopReason, kind === "blocked" ? "model-reported-blocked" :
-			"assessment-invalid");
-		assert.equal(advanced.length, 0);
-	}
+test("blocked assessment cannot launch more execution", async t => {
+	const f = await fixture(t);
+	const { result, advanced } = await invoke(f,
+		{ text: JSON.stringify(assessment("blocked")), readReturns: ranges(f) });
+	assert.equal(result.stopReason, "model-reported-blocked");
+	assert.equal(advanced.length, 0);
+});
+
+test("complete evidence with repeated malformed assessments gets same-session schema feedback then valid dispatch", async t => {
+	const f = await fixture(t);
+	let admissionCalls = 0;
+	const runner = new FakeSessionRunner(({ turnIndex, message }) => {
+		if (turnIndex === 1) return { text: "not JSON", readReturns: ranges(f) };
+		if (turnIndex === 2) {
+			assert.match(message, /assessment is not strict JSON/);
+			assert.match(message, /frozen evidence was already returned in full/);
+			return { text: JSON.stringify({ ...assessment("continue"),
+				nextTask: { ...assessment("continue").nextTask, adapterScope: ["two-target-existing"] } }) };
+		}
+		assert.equal(turnIndex, 3);
+		assert.match(message, /next task does not address unresolved original obligations/);
+		return { text: JSON.stringify(assessment("continue")) };
+	});
+	const advanced: ObjectiveNextTaskV1[] = [];
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => { admissionCalls++; return "admitted"; },
+		supportedTaskScopes: ["two-target-existing"], advance: async task => { advanced.push(task); } });
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.equal(result.assessment?.proposalHistory?.length, 1);
+	assert.equal(advanced.length, 1);
+	assert.equal(admissionCalls, 3);
+	assert.equal(runner.created.length, 1);
+	const carried = objectiveProgress(f.contract, { boundedRuns: [{ runId: "selected-goal",
+		outcome: "fulfilled", selectedTaskId: "T001" }],
+		selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
+		assessment: result.assessment, stopReason: result.stopReason, nextTaskDispatched: true });
+	assert.equal(carried.objectiveOutcome, "incomplete");
+	assert.deepEqual(carried.selectedArtifacts,
+		["candidate.cpp", "verification.json", "workflow-archive.json"]);
+});
+
+test("invalid fully read assessment obeys real admission before retry and never dispatches", async t => {
+	const f = await fixture(t);
+	const runner = new FakeSessionRunner(() => ({ text: "not JSON", readReturns: ranges(f) }));
+	let dispatched = false;
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "output-limit", supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { dispatched = true; } });
+	assert.equal(result.stopReason, "output-limit");
+	assert.equal(dispatched, false);
+	assert.equal([...runner.sessions.values()][0].turns, 1);
 });
 
 test("unread objective evidence is fed back for same-session read and revised scientific judgement", async t => {

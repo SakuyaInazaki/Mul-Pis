@@ -1079,19 +1079,29 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 						const reviewer = await openBoundedSession(ctx.runner, reviewRunRecord, { mode: "fresh", intent: "independent-judgment", reason: `M07 round ${index} reviewer must independently inspect the frozen candidate snapshot`, evidence: [{ version: 1, label: `M07 ${id} round ${index} snapshot`, path: reviewerRoot, status: "frozen-copy", sourceVersion: `${runId}/${id}/round-${index}` }], spec: reviewerSpec }, () => ctx.ws.writeRun(reviewRunRecord));
 						round.reviewerSession = reviewer.ref;
 						await save(ctx, goal);
-						let rawReview: string;
+						let rawReview!: string;
+						let verdict!: ReturnType<typeof parseRoundReview>;
 						try {
-							await verifyDispatchKnowledge();
-							rawReview = (await reviewer.prompt(reviewerPrompt)).text;
+							let request = reviewerPrompt;
+							for (let attempt = 1; ; attempt++) {
+								if (!Number.isSafeInteger(attempt)) throw new HarnessError("m07.loop-review", "reviewer attempt identity overflow");
+								await verifyDispatchKnowledge();
+								rawReview = (await reviewer.prompt(request)).text;
+								if (Buffer.byteLength(rawReview, "utf8") > 512_000)
+									throw new HarnessError("m07.file-size", "reviewer report file exceeds 512,000 UTF-8 bytes");
+								const attemptPath = path.join(dir, `round-${index}-reviewer-attempt-${attempt}.md`);
+								await writeFileAtomic(attemptPath, rawReview);
+								try { verdict = parseRoundReview(rawReview); break; }
+								catch (error) {
+									if (!(error instanceof HarnessError) || error.code !== "m07.loop-review") throw error;
+									transcript.push(`## Round ${index} reviewer attempt ${attempt}\n\nInvalid structured verdict; see ${path.basename(attemptPath)}. ${error.message}`);
+									request = `Your preceding response was not a usable structured verdict: ${error.message}. Continue in this SAME independent read-only reviewer session against the SAME frozen round snapshot and unchanged task checks. Inspect the files as needed, then return only strict JSON {"verdict":"ready|revise|replan|blocked","feedback":"specific evidence-grounded reason"}. Do not infer ready from malformed text, change task obligations, or request builder work before a valid verdict.`;
+								}
+							}
 						} finally { task.toolLog.push(...reviewer.toolLog().map((entry) => ({ ...entry, reviewerSessionId: reviewer.ref.id }))); reviewer.dispose(); }
-						if (Buffer.byteLength(rawReview, "utf8") > 512_000)
-							throw new HarnessError("m07.file-size", "reviewer report file exceeds 512,000 UTF-8 bytes");
 						const reviewerReportPath = path.join(dir, `round-${index}-reviewer.md`);
 						await writeFileAtomic(reviewerReportPath, rawReview);
 						round.reviewerReportPath = reviewerReportPath;
-						let verdict;
-						try { verdict = parseRoundReview(rawReview); }
-						catch { task.loopStopReason = "reviewer-invalid"; transcript.push(`## Round ${index} reviewer\n\nInvalid structured verdict; see ${path.basename(reviewerReportPath)}.`); break; }
 						let fileCheckFailure: string | undefined;
 						if (verdict.verdict === "ready") {
 							const candidate = await validateCandidateFiles(reviewerRoot, spec.expectedOutputs.map((item) => path.join(reviewerRoot, item)), spec.lessonDeltaOutput);

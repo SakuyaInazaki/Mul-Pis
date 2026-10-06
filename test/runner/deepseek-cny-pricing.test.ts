@@ -153,6 +153,8 @@ test("a once-verified CNY profile becomes unpriced after expiry without blocking
 	clock = new Date("2026-10-07T00:00:00.000Z");
 	const lease = budget.beginPrompt("synthetic", "expired");
 	budget.reserve(lease, 100, "request", providerOutputLimit.maxOutputTokens);
+	assert.equal(budget.snapshot().grossReservedCny, 0);
+	assert.equal(budget.snapshot().inFlightReservedCny, 0);
 	const event = { entryId: "response", kind: "assistant" as const, promptIndex: 1,
 		at: clock.toISOString(), provider: "deepseek", model: "deepseek-flash",
 		stopReason: "stop", status: "reported" as const, costStatus: "priced" as const,
@@ -165,6 +167,128 @@ test("a once-verified CNY profile becomes unpriced after expiry without blocking
 	assert.equal(audit.requests[0].reportedUsage?.totalTokens, 14);
 	assert.equal(audit.unpricedRequestCount, 1);
 	assert.equal(budget.snapshot().stopped, false);
+});
+
+test("a request crossing the price-review boundary retains received usage without a stale CNY charge", async () => {
+	let clock = new Date("2026-10-06T23:59:59.000Z");
+	const profile = await verifyDeepSeekCnyBilling({ apiKey: KEY, request: account(["CNY"]),
+		now: () => clock });
+	const providerOutputLimit = await outputProfile();
+	const budget = new DeepSeekCampaignBudget({ model: "deepseek/deepseek-flash:low",
+		endpoint: "https://api.deepseek.com", providerOutputLimit,
+		outputAccountingMarginTokens: 32, nativeCnyPricing: profile });
+	const lease = budget.beginPrompt("crossing", "received");
+	budget.reserve(lease, 100, "crossing-request");
+	assert(budget.snapshot().inFlightReservedCny > 0);
+	clock = new Date("2026-10-07T00:00:00.000Z");
+	const response = { entryId: "crossing-response", kind: "assistant" as const, promptIndex: 1,
+		at: clock.toISOString(), provider: "deepseek", model: "deepseek-flash",
+		stopReason: "stop", status: "reported" as const, costStatus: "priced" as const,
+		usage: { input: 10, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 14,
+			cost: 0.0000078 } };
+	budget.finishPrompt(lease, [{ requestId: "crossing-request", event: response }]);
+	const audit = budget.requestAccountingAuditSnapshot();
+	assert.equal(audit.requests[0].responseReceived, true);
+	assert.equal(audit.requests[0].status, "unknown");
+	assert.equal(audit.requests[0].settledCny, null);
+	assert.equal(audit.requests[0].unknownObservedCny, null);
+	assert.equal(audit.requests[0].reportedUsage?.totalTokens, 14);
+	assert.equal(audit.unpricedRequestCount, 1);
+	assert.equal(budget.snapshot().grossReservedCny, 0);
+	assert.equal(budget.snapshot().unknownReservedCny, 0);
+	assert.equal(budget.snapshot().stopped, false);
+});
+
+test("a request crossing the price-review boundary retains unknown transport without a stale CNY hold", async () => {
+	let clock = new Date("2026-10-06T23:59:59.000Z");
+	const profile = await verifyDeepSeekCnyBilling({ apiKey: KEY, request: account(["CNY"]),
+		now: () => clock });
+	const providerOutputLimit = await outputProfile();
+	const budget = new DeepSeekCampaignBudget({ model: "deepseek/deepseek-flash:low",
+		endpoint: "https://api.deepseek.com", providerOutputLimit,
+		outputAccountingMarginTokens: 32, nativeCnyPricing: profile });
+	const lease = budget.beginPrompt("crossing", "lost");
+	budget.reserve(lease, 100, "lost-request");
+	assert(budget.snapshot().inFlightReservedCny > 0);
+	clock = new Date("2026-10-07T00:00:00.000Z");
+	budget.failPrompt(lease);
+	const audit = budget.requestAccountingAuditSnapshot();
+	assert.equal(audit.requests[0].responseReceived, false);
+	assert.equal(audit.requests[0].status, "unknown");
+	assert.equal(audit.requests[0].settledCny, null);
+	assert.equal(audit.requests[0].unknownObservedCny, null);
+	assert.equal(audit.unpricedRequestCount, 1);
+	assert.equal(budget.snapshot().grossReservedCny, 0);
+	assert.equal(budget.snapshot().unknownReservedCny, 0);
+	assert.equal(budget.snapshot().stopped, false);
+	const next = budget.beginPrompt("crossing", "later");
+	budget.reserve(next, 100, "later-request");
+	assert.equal(budget.snapshot().reservations, 2);
+});
+
+test("a response settled before expiry stays priced when only a later request is unpriced", async () => {
+	let clock = new Date("2026-10-06T23:59:59.000Z");
+	const profile = await verifyDeepSeekCnyBilling({ apiKey: KEY, request: account(["CNY"]),
+		now: () => clock });
+	const providerOutputLimit = await outputProfile();
+	const budget = new DeepSeekCampaignBudget({ model: "deepseek/deepseek-flash:low",
+		endpoint: "https://api.deepseek.com", providerOutputLimit,
+		outputAccountingMarginTokens: 32, nativeCnyPricing: profile });
+	const first = budget.beginPrompt("priced", "first");
+	budget.reserve(first, 100, "priced-request");
+	const response = { entryId: "priced-response", kind: "assistant" as const, promptIndex: 1,
+		at: clock.toISOString(), provider: "deepseek", model: "deepseek-flash",
+		stopReason: "stop", status: "reported" as const, costStatus: "priced" as const,
+		usage: { input: 10, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 14,
+			cost: 0.0000078 } };
+	budget.finishPrompt(first, [{ requestId: "priced-request", event: response }]);
+	const priorCharge = budget.requestAccountingAuditSnapshot().requests[0].settledCny;
+	assert(typeof priorCharge === "number" && priorCharge > 0);
+	const priorGross = budget.snapshot().grossReservedCny;
+	clock = new Date("2026-10-07T00:00:00.000Z");
+	const second = budget.beginPrompt("priced", "second");
+	budget.reserve(second, 100, "unpriced-request");
+	budget.failPrompt(second);
+	const audit = budget.requestAccountingAuditSnapshot();
+	assert.equal(audit.requests[0].settledCny, priorCharge);
+	assert.equal(audit.requests[0].status, "settled");
+	assert.equal(audit.requests[1].settledCny, null);
+	assert.equal(audit.requests[1].unknownObservedCny, null);
+	assert.equal(audit.unpricedRequestCount, 1);
+	assert.equal(budget.snapshot().settledCny, priorCharge);
+	assert.equal(budget.snapshot().grossReservedCny, priorGross);
+});
+
+test("an unknown fee observed before price expiry keeps its historical hold after later cleanup", async () => {
+	let clock = new Date("2026-10-06T23:59:59.000Z");
+	const profile = await verifyDeepSeekCnyBilling({ apiKey: KEY, request: account(["CNY"]),
+		now: () => clock });
+	const providerOutputLimit = await outputProfile();
+	const budget = new DeepSeekCampaignBudget({ model: "deepseek/deepseek-flash:low",
+		endpoint: "https://api.deepseek.com", providerOutputLimit,
+		outputAccountingMarginTokens: 32, nativeCnyPricing: profile });
+	const lease = budget.beginPrompt("historical", "unknown");
+	budget.reserve(lease, 100, "historical-unknown");
+	const unresolved = {
+		entryId: "unresolved-usage", kind: "assistant" as const, promptIndex: 1,
+		at: clock.toISOString(), provider: "deepseek", model: "deepseek-flash",
+		stopReason: "stop", status: "unknown" as const, costStatus: "priced" as const,
+		usage: { input: 10, output: 4, cacheRead: 0, cacheWrite: 0,
+			totalTokens: 14, cost: 0.0000078 },
+	};
+	budget.settleReported(lease, "historical-unknown", unresolved);
+	const prior = budget.requestAccountingAuditSnapshot();
+	const hold = prior.requests[0].unknownObservedCny;
+	assert(typeof hold === "number" && hold > 0);
+	clock = new Date("2026-10-07T00:00:00.000Z");
+	// The duplicate receipt is legal; finishPrompt will revisit the old unknown
+	// during lease cleanup after the price review expired.
+	budget.finishPrompt(lease, [{ requestId: "historical-unknown", event: unresolved }]);
+	const after = budget.requestAccountingAuditSnapshot();
+	assert.equal(after.requests[0].unknownObservedCny, hold);
+	assert.equal(after.unknownObservedCny, prior.unknownObservedCny);
+	assert.equal(after.unpricedRequestCount, 0);
+	assert.equal(budget.snapshot().unknownReservedCny, hold);
 });
 
 test("an unverified supplied CNY profile leaves currency unpriced and does not stop research", async () => {

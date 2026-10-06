@@ -70,10 +70,10 @@ interface RequestState {
 	readonly sessionId: string;
 	readonly inputPayloadBytes: number;
 	readonly maxOutputTokens: number;
-	readonly worstCny: number;
-	readonly rates: { input: number; cacheRead: number; output: number };
+	worstCny: number;
+	rates: { input: number; cacheRead: number; output: number };
 	/** Whether the native CNY rate was verified when this transport was admitted. */
-	readonly nativeCnyVerified?: boolean;
+	nativeCnyVerified: boolean;
 	responseReceived: boolean;
 	status: "reserved" | "settled" | "unknown";
 	settledCny?: number;
@@ -170,6 +170,19 @@ export class DeepSeekCampaignBudget {
 		catch { return false; }
 	}
 
+	/** A price that expired while a request was still open cannot quantify it.
+	 * An already disposed unknown or settled observation is historical and must
+	 * never be rewritten merely because the clock later passed the cutoff.
+	 */
+	private expireUnsettledRequestPrice(request: RequestState): void {
+		if (!request.nativeCnyVerified || request.status !== "reserved" || this.nativePricingCurrent()) return;
+		request.nativeCnyVerified = false;
+		request.worstCny = 0;
+		request.rates = { input: 0, cacheRead: 0, output: 0 };
+		this.grossReservedCny = this.auditRequests.reduce((sum, row) => sum + row.worstCny, 0);
+		this.recountCommitments();
+	}
+
 	get strictRequest(): NonNullable<SessionSpec["strictRequest"]> {
 		return {
 			maxOutputTokens: this.outputBoundTokens,
@@ -253,15 +266,17 @@ export class DeepSeekCampaignBudget {
 		const next = this.reservations + 1;
 		const projectedCny = this.worstCny(payloadBytes, maxOutputTokens);
 		const priceFinite = Number.isFinite(projectedCny) && projectedCny >= 0;
-		const worstCny = priceFinite ? projectedCny : 0;
+		const nativeCnyVerified = priceFinite && this.nativePricingCurrent();
+		const worstCny = nativeCnyVerified ? projectedCny : 0;
 		this.reservations = next;
 		this.grossReservedCny += worstCny;
 		this.inFlightReservedCny += worstCny;
 		this.requestIds.add(providerRequestId);
 		const request = { id: providerRequestId, sessionId: lease.sessionId, responseReceived: false,
 			inputPayloadBytes: payloadBytes, maxOutputTokens, worstCny,
-			nativeCnyVerified: priceFinite && this.nativePricingCurrent(),
-			rates: { ...this.rates }, status: "reserved" as const };
+			nativeCnyVerified,
+			rates: nativeCnyVerified ? { ...this.rates } : { input: 0, cacheRead: 0, output: 0 },
+			status: "reserved" as const };
 		state.requests.push(request);
 		this.auditRequests.push(request);
 	}
@@ -330,6 +345,7 @@ export class DeepSeekCampaignBudget {
 			this.stop("usage-reconciliation");
 			throw new HarnessError("runner.campaign", "provider usage conflicts with an earlier settlement");
 		}
+		this.expireUnsettledRequestPrice(request);
 		if (usage && [usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.totalTokens]
 			.every(value => Number.isSafeInteger(value) && value! >= 0)) request.reportedUsage = {
 			input: usage.input!, output: usage.output!, cacheRead: usage.cacheRead!,
@@ -384,6 +400,7 @@ export class DeepSeekCampaignBudget {
 	}
 
 	private markUnknown(request: RequestState, includeSettled = false, additionalEstimateCny = 0): void {
+		this.expireUnsettledRequestPrice(request);
 		const conservativeUnknownCny = Math.max(request.worstCny, request.settledCny ?? 0,
 			request.unknownHeldCny ?? 0, additionalEstimateCny);
 		if (request.status === "settled") {

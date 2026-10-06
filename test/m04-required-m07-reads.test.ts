@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -53,9 +53,50 @@ test("M04 can choose no proposal after full selected M07 reads and sees exact pa
 	assert.equal(result.record.status, "completed");
 	assert.equal(result.proposalId, undefined);
 	const session = [...fake.sessions.values()].find(item => item.spec.label === "M04-research");
+	assert.equal(session?.turns, 1, "a missing proposal block is a valid no-proposal result");
 	const message = session?.transcript[0]?.text ?? "";
 	for (const item of f.relative) assert.ok(message.includes(item));
 	assert.match(message, /完整读取/);
+});
+
+test("malformed explicit proposal JSON gets same-session format repair only after full M07 reads", async t => {
+	const f = await fixture(t);
+	const before = (await f.store.current())?.id;
+	const fake = new FakeSessionRunner(({ turnIndex, message }) => {
+		if (turnIndex === 1) return { text: "Provisional judgement.\n```knowledge-proposals\n{broken\n```",
+			readReturns: returnedRanges(f.relative) };
+		assert.match(message, /not a valid JSON array/);
+		assert.match(message, /No proposal was submitted or merged/);
+		assert.doesNotMatch(message, /\{broken/,
+			"format feedback must not echo raw malformed content");
+		return "Revised complete judgement: no supported transferable knowledge operation.";
+	});
+	f.ctx.runner = fake;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative });
+	assert.equal(result.record.status, "completed");
+	assert.equal(result.proposalId, undefined);
+	assert.equal((await f.store.current())?.id, before);
+	assert.equal(fake.created.filter(spec => spec.label === "M04-research").length, 1);
+	assert.equal([...fake.sessions.values()].find(item => item.spec.label === "M04-research")?.turns, 2);
+	const processed = result.record.outputs.find(item => item.label === "处理结果");
+	assert.ok(processed);
+	assert.match(await readFile(processed.path, "utf8"),
+		/Revised complete judgement/);
+	assert.equal(result.record.outputs.some(item => item.label === "知识提案"), false);
+});
+
+test("parsed but structurally invalid proposal is submitted once and never format-retried", async t => {
+	const f = await fixture(t);
+	const invalid = `\`\`\`knowledge-proposals\n${JSON.stringify([{
+		op: "create", type: "K", title: "", body: "" }])}\n\`\`\``;
+	const fake = new FakeSessionRunner(() => ({ text: invalid, readReturns: returnedRanges(f.relative) }));
+	f.ctx.runner = fake;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative });
+	assert.ok(result.proposalId, "a parsed array reached structural validation");
+	assert.ok(result.record.failures.some(item => item.includes("结构校验未通过")));
+	assert.equal([...fake.sessions.values()].find(item => item.spec.label === "M04-research")?.turns, 1);
 });
 
 test("M04 rejects an adopted proposal before merge when a required read tool reports an error", async t => {

@@ -329,8 +329,14 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			const unreadEvidence = fileCoverage.filter(item => !item.complete).map(item => item.name);
 			const unreadScore = fileCoverage.reduce((sum, item) => sum + item.score, 0);
 			let parsed: ModelObjectiveAssessmentV1 | undefined;
-			try { parsed = parseAssessment(response.text, input.contract, materials.map(item => item.name)); }
-			catch { if (!unreadEvidence.length) return { assessment: latestAssessment, stopReason: "assessment-invalid" }; }
+			let invalidReason: string | undefined;
+			try { parsed = parseAssessment(response.text, input.contract,
+				["original-objective.json", ...materials.map(item => item.name)]); }
+			catch (error) {
+				if (!(error instanceof HarnessError) || error.code !== "m07.objective-assessment") throw error;
+				// Parser reasons are fixed host text, never the model's response or private evidence.
+				invalidReason = error.message;
+			}
 			let assessment: ObjectiveProgressV1["assessment"];
 			if (parsed) {
 				proposals.push(parsed);
@@ -353,12 +359,23 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				if (admission !== "admitted") return { assessment: latestAssessment, stopReason: admission };
 				request = ["Your previous assessment is provisional because required frozen evidence was not completely returned by objective_evidence_read.",
 					`Unread or incomplete files: ${unreadEvidence.join(", ")}.`,
-					...(!parsed ? ["Your last response also failed the required strict JSON schema. Repair its format after inspecting the missing evidence."] : []),
+					...(!parsed ? [`Your last response also failed the required strict JSON schema: ${invalidReason}. Repair its format after inspecting the missing evidence.`] : []),
 					...(noReadProgress ? ["The last repair turn added no verified read coverage. Replan how to use objective_evidence_read rather than repeating the same unsupported verdict."] : []),
 					"In this same session, read every missing range of each named file, including an untruncated final page. Then reassess the unchanged original objective and return a new strict JSON assessment. Do not repeat the prior verdict without inspecting the missing evidence; no task may be dispatched or goal closed from an incomplete read."].join("\n\n");
 				continue;
 			}
-			if (!parsed || !assessment) return { assessment: latestAssessment, stopReason: "assessment-invalid" };
+			if (!parsed || !assessment) {
+				// Full evidence coverage cannot turn a single malformed model verdict
+				// into a terminal mission outcome. Correct it in the same read-only
+				// session; no work or scientific claim is admitted from this response.
+				const admission = input.advanceAdmission();
+				if (admission !== "admitted") return { assessment: latestAssessment, stopReason: admission };
+				request = [`Your previous response failed host validation: ${invalidReason ?? "assessment schema invalid"}.`,
+					"Return one strict JSON object only, with version 1, decision (fulfilled, continue, or blocked), a nonempty rationale, unique evidenceRefs chosen from the frozen file names, unique unresolvedObligations chosen from the original obligation IDs, and unique nonempty unresolvedDetails.",
+					"For continue, include unresolved obligations and details plus nextTask {objective, addresses, adapterScope}; addresses must be nonempty and contained in unresolvedObligations. For fulfilled, leave unresolved obligations and details empty, cite evidence, and omit nextTask. For blocked, retain unresolved obligations and details and omit nextTask.",
+					"The frozen evidence was already returned in full in this session. Reassess the unchanged original objective and user overrides, repair your own schema or reasoning, and return a fresh valid assessment. This invalid response did not authorize a task or close the mission."].join("\n\n");
+				continue;
+			}
 			if (parsed.decision === "blocked") {
 				const available = input.capabilities?.filter(item => item.available && input.supportedTaskScopes.includes(item.scope)) ?? [];
 				if (challengedBlocked || !available.length) return { assessment, stopReason: "model-reported-blocked" };

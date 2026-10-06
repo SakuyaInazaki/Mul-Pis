@@ -343,6 +343,7 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			let m08ToolLog: ReturnType<typeof handle.toolLog> = [];
 			let m07ReturnedRanges: ReturnType<NonNullable<typeof handle.readReturnEvents>> = [];
 			let promptSucceeded = false;
+			let extracted: ReturnType<typeof extractKnowledgeProposals> | undefined;
 			try {
 				if (feedback.m07) await markFeedbackAssembled(ctx.ws, feedback.m07.runId, feedback.inputs[0].path, record.runId);
 				let request = finalMessage;
@@ -350,22 +351,34 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 				let readEventCursor = 0;
 				for (;;) {
 					const turn = await handle.prompt(request);
-					if (!feedback.m07 || !requiredM07Paths.length) { output = turn.text; break; }
-					const returned = handle.readReturnEvents();
-					const newReadEvents = returned.slice(readEventCursor);
-					readEventCursor = returned.length;
-					const gaps = await m07ReadGaps(feedback.m07.rootDir, requiredM07Paths, returned);
-					if (!gaps.length) { output = turn.text; break; }
-					if (newReadEvents.some(item => item.toolName === "m07_evidence_read" && item.status === "error" && gaps.some(gap => gap.relative === item.path)))
-						throw new HarnessError("m04.m07-evidence", "required selected M07 evidence was not returned in full because its read tool reported an error");
-					const currentGaps = JSON.stringify(gaps);
-					const noProgress = priorGaps === currentGaps;
-					priorGaps = currentGaps;
-					request = ["Your M04 judgement is provisional. The host has not verified full m07_evidence_read returns for every required selected M07 file, so no knowledge proposal can be accepted yet.",
-						"Next missing returned range for each file (one-based lines; the host will recalculate further gaps after your next read):",
-						...gaps.map(gap => `- ${gap.relative}: ${gap.missingRanges.length ? `${gap.missingRanges[0].start}-${gap.missingRanges[0].end}; ${gap.missingRanges.length - 1} further gaps remain` : "all lines returned"}${gap.terminalPageMissing ? "; an untruncated final page is also required" : ""}`),
-						...(noProgress ? ["The previous repair turn added no complete read proof. Replan how to use m07_evidence_read rather than repeating the same judgement."] : []),
-						"Use the same read-only session to read the stated next missing range for each file, including an untruncated final page where needed. The host will give further ranges until all are complete. Then reconsider the evidence and return a revised M04 judgement in the required format. A path, summary, malformed response, or earlier proposal is not proof of a complete read. Do not force a knowledge proposal if the evidence does not support one."].join("\n\n");
+					if (feedback.m07 && requiredM07Paths.length) {
+						const returned = handle.readReturnEvents();
+						const newReadEvents = returned.slice(readEventCursor);
+						readEventCursor = returned.length;
+						const gaps = await m07ReadGaps(feedback.m07.rootDir, requiredM07Paths, returned);
+						if (gaps.length) {
+							if (newReadEvents.some(item => item.toolName === "m07_evidence_read" && item.status === "error" && gaps.some(gap => gap.relative === item.path)))
+								throw new HarnessError("m04.m07-evidence", "required selected M07 evidence was not returned in full because its read tool reported an error");
+							const currentGaps = JSON.stringify(gaps);
+							const noProgress = priorGaps === currentGaps;
+							priorGaps = currentGaps;
+							request = ["Your M04 judgement is provisional. The host has not verified full m07_evidence_read returns for every required selected M07 file, so no knowledge proposal can be accepted yet.",
+								"Next missing returned range for each file (one-based lines; the host will recalculate further gaps after your next read):",
+								...gaps.map(gap => `- ${gap.relative}: ${gap.missingRanges.length ? `${gap.missingRanges[0].start}-${gap.missingRanges[0].end}; ${gap.missingRanges.length - 1} further gaps remain` : "all lines returned"}${gap.terminalPageMissing ? "; an untruncated final page is also required" : ""}`),
+								...(noProgress ? ["The previous repair turn added no complete read proof. Replan how to use m07_evidence_read rather than repeating the same judgement."] : []),
+								"Use the same read-only session to read the stated next missing range for each file, including an untruncated final page where needed. The host will give further ranges until all are complete. Then reconsider the evidence and return a revised M04 judgement in the required format. A path, summary, malformed response, or earlier proposal is not proof of a complete read. Do not force a knowledge proposal if the evidence does not support one."].join("\n\n");
+							continue;
+						}
+					}
+					const parsed = extractKnowledgeProposals(turn.text);
+					if (parsed.error && !feedback.m08) {
+						request = ["Your last M04 answer contained an explicit knowledge-proposals fenced block, but its contents were not a valid JSON array. No proposal was submitted or merged.",
+							"This is a format repair in the same session over the same frozen evidence. Return a complete revised M04 judgment. If evidence supports a knowledge operation, include exactly one knowledge-proposals fenced block containing a valid JSON array. If it does not, omit that block. Do not treat your earlier malformed block or a file path as an accepted proposal, and do not invent scientific support."].join("\n\n");
+						continue;
+					}
+					extracted = parsed;
+					output = turn.text;
+					break;
 				}
 				await ctx.ws.writeOutput(record, "processing.md", output, "处理结果");
 				promptSucceeded = true;
@@ -386,11 +399,10 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 				await ctx.ws.writeOutput(record, "m08-disposition.json", JSON.stringify(disposition, null, 2), "M08 用途处置");
 				if (disposition.status === "unresolved") record.failures.push(`M08 处置缺失、非法或缺少实际材料访问依据，已保守记录为 unresolved；不能供 M09 收口。${disposition.limitations.join("；")}`);
 			}
-			const extracted = extractKnowledgeProposals(output);
-			if (extracted.error) {
-				record.failures.push(`知识提案未入库：${extracted.error}`);
-			} else if (extracted.ops) {
-				const receipt = await ctx.store.submitProposal({ stage: "M04", runId: record.runId, session: handle.ref.label, baseSnapshot: snapshot?.id, ops: extracted.ops as ProposalOp[], summary: feedback.label });
+			if (extracted!.error) {
+				record.failures.push(`知识提案未入库：${extracted!.error}`);
+			} else if (extracted!.ops) {
+				const receipt = await ctx.store.submitProposal({ stage: "M04", runId: record.runId, session: handle.ref.label, baseSnapshot: snapshot?.id, ops: extracted!.ops as ProposalOp[], summary: feedback.label });
 				result.proposalId = receipt.proposalId;
 				record.outputs.push({ label: "知识提案", path: receipt.file });
 				if (receipt.structurallyValid) {

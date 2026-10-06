@@ -130,26 +130,49 @@ test("reviewer JSON repairs only literal paragraph breaks inside bounded feedbac
  assert.equal(parseRoundReview('{"verdict":"ready","feedback":"' + "a".repeat(512_001) + '"}').feedback.length,512_001);
 });
 
-test("nonrecoverable reviewer format still permits an honest rejected task and frozen fork", async t => {
- const f = await fixture(t, async ({spec}) => {
-  if (spec.label.includes("reviewer")) return "The answer is revise, but this is not JSON.";
+test("malformed reviewer verdicts repair in the same frozen read-only session without rerunning builder", async t => {
+ const f = await fixture(t, async ({spec,turnIndex,message}) => {
+  if (spec.label.includes("reviewer")) {
+   if (turnIndex > 1) assert.match(message,/SAME independent read-only reviewer session/);
+   return turnIndex === 1 ? "The answer is ready, but this is not JSON." :
+    turnIndex === 2 ? JSON.stringify({verdict:"accept",feedback:"not a valid verdict"}) :
+    JSON.stringify({verdict:"ready",feedback:"Checked the frozen candidate file"});
+  }
   if (spec.tools.kind === "execution") await writeFile(path.join(spec.tools.root,"result.txt"),"candidate\n");
   return "builder finished";
  });
- const spec = { objective:"bounded candidate", inputs:[], expectedOutputs:["result.txt"], checks:["checked"], mode:"execute" as const,
-  executionLoop:{ mode:"until-ready" as const } };
- const parent = await f.controller.delegate(f.goal.runId,spec);
- assert.equal(parent.status,"returned"); assert.equal(parent.loopStopReason,"reviewer-invalid");
- assert.ok(parent.branchSource, parent.branchUnavailableReason ?? "checkpoint unavailable");
- const reviewed = await f.controller.review(f.goal.runId,{taskId:parent.taskId,checks:[{criterion:"checked",result:"failed",evidence:[]}],
-  artifacts:[path.join(parent.workDir,"result.txt")]});
- assert.equal(reviewed.status,"rejected");
- const context = {mode:"fork" as const,parentRunId:f.goal.runId,
-  parentTaskId:parent.taskId,checkpointId:parent.branchSource!.checkpoint.id};
- await assert.rejects(f.controller.delegate(f.goal.runId,{...spec,executionLoop:undefined,context}),
-  /review-loop obligations/);
- const child = await f.controller.delegate(f.goal.runId,{...spec,context});
- assert.equal(child.status,"returned", child.executionFailure ?? "fork failed");
+ const task = await f.controller.delegate(f.goal.runId,{objective:"bounded candidate",inputs:[],expectedOutputs:["result.txt"],checks:["checked"],mode:"execute",executionLoop:{mode:"until-ready"}});
+ assert.equal(task.status,"returned",task.executionFailure ?? "task failed");
+ assert.equal(task.loopStopReason,"ready");
+ assert.equal(task.executionRounds?.length,1);
+ assert.equal(f.runner.created.filter(spec=>spec.tools.kind === "execution").length,1);
+ assert.equal(f.runner.created.filter(spec=>spec.label.includes("reviewer")).length,1);
+ assert.equal([...f.runner.sessions.values()].find(session=>session.spec.label.includes("reviewer"))?.turns,3);
+ const taskDir=path.dirname(task.workDir);
+ assert.match(await readFile(path.join(taskDir,"round-1-reviewer-attempt-1.md"),"utf8"),/not JSON/);
+ assert.match(await readFile(path.join(taskDir,"round-1-reviewer-attempt-2.md"),"utf8"),/"accept"/);
+ assert.equal(await readFile(path.join(taskDir,"round-1-reviewer.md"),"utf8"),
+  await readFile(path.join(taskDir,"round-1-reviewer-attempt-3.md"),"utf8"));
+ const result=path.join(task.workDir,"result.txt");
+ const reviewed=await f.controller.review(f.goal.runId,{taskId:task.taskId,checks:[{criterion:"checked",result:"passed",evidence:[result]}],artifacts:[result]});
+ assert.equal(reviewed.status,"accepted");
+});
+
+test("reviewer prompt failure after malformed verdict stops without replaying builder operation", async t => {
+ const f=await fixture(t,async ({spec,turnIndex})=>{
+  if(spec.label.includes("reviewer")) {
+   if(turnIndex===2) throw new Error("synthetic reviewer provider failure");
+   return "not JSON";
+  }
+  if(spec.tools.kind==="execution") await writeFile(path.join(spec.tools.root,"result.txt"),"candidate\n");
+  return "builder finished";
+ });
+ const task=await f.controller.delegate(f.goal.runId,{objective:"candidate",inputs:[],expectedOutputs:["result.txt"],checks:["checked"],mode:"execute",executionLoop:{mode:"until-ready"}});
+ assert.equal(task.status,"failed");
+ assert.match(task.executionFailure??"",/synthetic reviewer provider failure/);
+ assert.equal(f.runner.created.filter(spec=>spec.tools.kind==="execution").length,1);
+ assert.deepEqual((await f.controller.status(f.goal.runId)).executionState?.operations.map(op=>op.status),["response-received"]);
+ assert.equal(await readFile(path.join(path.dirname(task.workDir),"round-1-reviewer-attempt-1.md"),"utf8"),"not JSON");
 });
 
 test("opt-in M07 repair keeps one builder, creates fresh reviewers, and preserves final review and candidate delta", async t => {
