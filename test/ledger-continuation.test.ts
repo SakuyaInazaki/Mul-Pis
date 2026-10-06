@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { deflateRawSync } from "node:zlib";
 import test, { type TestContext } from "node:test";
-import { authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE } from "../src/runner/ledger-continuation.ts";
+import { authenticatedCarryForwardOrigin, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE } from "../src/runner/ledger-continuation.ts";
 import type { RequestAuditSnapshot } from "../src/runner/ledger-continuation.ts";
 import { DeepSeekCampaignBudget, type CampaignAdmissionRejection } from "../src/runner/deepseek-campaign.ts";
 import { verifyDeepSeekCnyBilling, nativeCnyPricingRecord } from "../src/runner/deepseek-cny-pricing.ts";
@@ -1004,6 +1004,46 @@ test("Actions-backed restart claim is one-use, live-job-bound, and never refunds
 		requestAudit: audit(0, 0) }).carryForwardCny, 5.875);
 });
 
+test("control-ref request claims an authenticated prior carry while its current provider step is active", async t => {
+	const f = await compactedFixture(t);
+	const source = sha("f"), tree = sha("a"), before = source;
+	const control = { ...third, event: "push", head_branch: "run-requests/workflow-learning-reliability",
+		head_commit: { message: REUSABLE_RUN_REQUEST_MESSAGE } };
+	const request: typeof fetch = async (url, init) => {
+		const target = String(url);
+		if (target.includes("/actions/workflows/manual-private-campaign.yml/runs?"))
+			return new Response(JSON.stringify({ total_count: 4, workflow_runs: [control,
+				{ ...second, status: "completed", conclusion: "success" },
+				{ ...first, status: "completed", conclusion: "success" }, anchor] }));
+		if (target.endsWith("/git/ref/heads/improve/workflow-learning-reliability"))
+			return new Response(JSON.stringify({ object: { sha: source } }));
+		if (target.endsWith(`/git/commits/${sha("e")}`))
+			return new Response(JSON.stringify({ parents: [{ sha: source }], tree: { sha: tree } }));
+		if (target.endsWith(`/git/commits/${source}`))
+			return new Response(JSON.stringify({ parents: [], tree: { sha: tree } }));
+		if (target.includes("/actions/workflows/workflow-regression.yml/runs?"))
+			return new Response(JSON.stringify({ workflow_runs: [{ head_sha: source,
+				head_branch: "improve/workflow-learning-reliability", event: "push",
+				run_attempt: 1, conclusion: "success" }] }));
+		if (target.endsWith("/runs/7005")) return new Response(JSON.stringify(control));
+		if (target.endsWith("/runs/7005/jobs?per_page=100")) return new Response(JSON.stringify({
+			total_count: 1, jobs: [{ id: 6005, run_id: 7005, run_attempt: 1,
+				head_sha: sha("e"), name: "private-campaign", status: "in_progress",
+				steps: [{ name: "Run private campaign", status: "in_progress" }] }] }));
+		return f.request(url, init);
+	};
+	const opened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token", request,
+		current: { ...current(7005, sha("e")), event: "push", before,
+			ref: "refs/heads/run-requests/workflow-learning-reliability" },
+		loadCarryArtifact: async () => f.secondCarry.envelopeB64 });
+	const proof = opened.priorCarryProof!;
+	assert(proof);
+	const claim = await opened.claimOneUse(proof.envelopeSha256);
+	assert.equal(claim.currentRunId, "7005");
+	assert.equal(claim.currentCommit, sha("e"));
+	assert.equal(claim.priorEnvelopeSha256, proof.envelopeSha256);
+});
+
 test("branded ancestry predicate binds only exact authenticated source and carry digest", async t => {
 	const f = await compactedFixture(t);
 	const opened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token", current: current(7005, sha("e")),
@@ -1025,4 +1065,119 @@ test("branded ancestry predicate binds only exact authenticated source and carry
 	assert.equal(opened.priorUnknownHeldCny, 0.25);
 	assert.equal(sealHistoricalCarryForOfflineTests(opened, { settledCny: 0, unknownOrInFlightCny: 0,
 		requestAudit: audit(0, 0) }).carryForwardCny, 5.875);
+});
+
+test("zero-activity v3 wrapper authenticates exact legacy bundle before carrying restart facts", async t => {
+	const f = await compactedFixture(t);
+	const opened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7005, sha("e")), loadCarryArtifact: async () => f.secondCarry.envelopeB64 });
+	const emptyAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
+		requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
+	const wrapped = opened.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: emptyAudit });
+	const nextRun = run(7006, 5, "in_progress", sha("f"));
+	const base = github([anchor, { ...first, status: "completed", conclusion: "success" },
+		{ ...second, status: "completed", conclusion: "success" },
+		{ ...third, status: "completed", conclusion: "failure" }, nextRun]);
+	const request: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.includes("/runs/7003/jobs?") || address.includes("/runs/7003/artifacts?"))
+			return f.request(url, init);
+		if (address.includes("/runs/7005/jobs?")) return new Response(JSON.stringify({ total_count: 1,
+			jobs: [{ id: 6005, run_id: 7005, run_attempt: 1, head_sha: sha("e"),
+				name: "private-campaign", status: "completed", conclusion: "failure",
+				steps: [{ name: "Run private campaign", status: "completed", conclusion: "failure" }] }] }));
+		if (address.includes("/runs/7005/artifacts?")) return new Response(JSON.stringify({ total_count: 2,
+			artifacts: [{ id: 9005, name: CARRY_ARTIFACT_NAME, expired: false,
+				workflow_run: { id: 7005, head_sha: sha("e") } },
+				{ id: 9105, name: MISSION_ARTIFACT, expired: false, digest: `sha256:${"d".repeat(64)}`,
+					workflow_run: { id: 7005, head_sha: sha("e") } }] }));
+		return base(url, init);
+	};
+	const reopen = async (envelopeB64: string, legacyEnvelope = f.secondCarry.envelopeB64) =>
+		openLedgerContinuation({ ...f, githubToken: "synthetic-token", request,
+			current: current(7006, sha("f")), loadCarryArtifact: async ({ artifactId }) =>
+				artifactId === "9005" ? envelopeB64 : legacyEnvelope });
+	const passThrough = await reopen(wrapped.envelopeB64);
+	const proof = passThrough.priorCarryProof!;
+	assert.equal(proof.version, 2);
+	assert.equal(proof.source.runId, "7005");
+	assert.equal(proof.envelopeSha256,
+		createHash("sha256").update(Buffer.from(wrapped.envelopeB64, "base64")).digest("hex"));
+	assert.deepEqual(authenticatedCarryForwardOrigin(proof, passThrough.priorPrivateBundle), {
+		source: { runId: "7003", runAttempt: 1, runNumber: 3, commit: sha("c") },
+		envelopeSha256: createHash("sha256").update(Buffer.from(f.secondCarry.envelopeB64, "base64")).digest("hex"),
+		historicalCommittedNano: 5_875_000_000, historicalUnknownHeldNano: 250_000_000 });
+	assert.equal(authenticatedCarryForwardOrigin({ ...proof }, passThrough.priorPrivateBundle), undefined);
+	assert.equal(authenticatedCarryForwardOrigin(proof, { "candidate.cpp": "changed" }), undefined);
+	const changed = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7005, sha("e")), loadCarryArtifact: async () => f.secondCarry.envelopeB64 });
+	const changedCarry = changed.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: emptyAudit,
+		privateBundle: { "candidate.cpp": "different goal evidence" } });
+	const changedNext = await reopen(changedCarry.envelopeB64);
+	assert.equal(authenticatedCarryForwardOrigin(changedNext.priorCarryProof,
+		changedNext.priorPrivateBundle), undefined);
+	const requestBearing = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7005, sha("e")), loadCarryArtifact: async () => f.secondCarry.envelopeB64 });
+	const observedRequest = requestBearing.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 1, requestAudit: { ...emptyAudit, unpricedRequestCount: 1,
+			requests: [{ requestId: "synthetic-request", inputPayloadBytes: 1, status: "in-flight" as const,
+				settledCny: null, unknownObservedCny: null, reportedUsage: null }] } });
+	const requestNext = await reopen(observedRequest.envelopeB64);
+	assert.equal(authenticatedCarryForwardOrigin(requestNext.priorCarryProof,
+		requestNext.priorPrivateBundle), undefined);
+	const seed = await authenticateSignedMissionSeed({ ...f, envelopeB64: f.seedEnvelopeB64 });
+	const key = seed.derivePrivateKey("mul-pis-ledger-continuation-v1");
+	const outer = JSON.parse(Buffer.from(wrapped.envelopeB64, "base64").toString());
+	const source = { runId: "7005", runAttempt: 1, runNumber: 4, commit: sha("e") };
+	const oldCipher = createDecipheriv("aes-256-gcm", key, Buffer.from(outer.nonce, "base64"));
+	oldCipher.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
+		seed.seedDigest, 3, outer.parentDigest, source])));
+	oldCipher.setAuthTag(Buffer.from(outer.tag, "base64"));
+	const tampered = JSON.parse(Buffer.concat([oldCipher.update(Buffer.from(outer.ciphertext, "base64")),
+		oldCipher.final()]).toString());
+	tampered.historical.committedNano++;
+	const nonce = randomBytes(12);
+	const newCipher = createCipheriv("aes-256-gcm", key, nonce);
+	newCipher.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
+		seed.seedDigest, 3, outer.parentDigest, source])));
+	const ciphertext = Buffer.concat([newCipher.update(JSON.stringify(tampered)), newCipher.final()]);
+	const changedHistory = Buffer.from(JSON.stringify({ ...outer, nonce: nonce.toString("base64"),
+		ciphertext: ciphertext.toString("base64"), tag: newCipher.getAuthTag().toString("base64") })).toString("base64");
+	await assert.rejects(reopen(changedHistory), /historical commitment transition is invalid/);
+	const wrongLegacy = await reopen(wrapped.envelopeB64, f.firstCarry.envelopeB64);
+	assert.equal(authenticatedCarryForwardOrigin(wrongLegacy.priorCarryProof,
+		wrongLegacy.priorPrivateBundle), undefined);
+	const pinned = passThrough.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: emptyAudit });
+	const last = run(7007, 6, "in_progress", sha("1"));
+	const laterRequest: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.includes("/workflows/manual-private-campaign.yml/runs?"))
+			return new Response(JSON.stringify({ total_count: 6, workflow_runs: [last,
+				{ ...nextRun, status: "completed", conclusion: "failure" },
+				{ ...third, status: "completed", conclusion: "failure" },
+				{ ...second, status: "completed", conclusion: "success" },
+				{ ...first, status: "completed", conclusion: "success" }, anchor] }));
+		if (address.includes("/runs/7006/jobs?")) return new Response(JSON.stringify({ total_count: 1,
+			jobs: [{ id: 6006, run_id: 7006, run_attempt: 1, head_sha: sha("f"),
+				name: "private-campaign", status: "completed", conclusion: "failure",
+				steps: [{ name: "Run private campaign", status: "completed", conclusion: "failure" }] }] }));
+		if (address.includes("/runs/7006/artifacts?")) return new Response(JSON.stringify({ total_count: 2,
+			artifacts: [{ id: 9006, name: CARRY_ARTIFACT_NAME, expired: false,
+				workflow_run: { id: 7006, head_sha: sha("f") } },
+				{ id: 9106, name: MISSION_ARTIFACT, expired: false, digest: `sha256:${"e".repeat(64)}`,
+					workflow_run: { id: 7006, head_sha: sha("f") } }] }));
+		if (address.includes("/runs/7003/artifacts?"))
+			throw Error("old origin artifact intentionally unavailable");
+		return request(url, init);
+	};
+	const later = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		request: laterRequest, current: current(7007, sha("1")),
+		loadCarryArtifact: async ({ artifactId }) => {
+			assert.equal(artifactId, "9006"); return pinned.envelopeB64;
+		} });
+	assert.deepEqual(authenticatedCarryForwardOrigin(later.priorCarryProof, later.priorPrivateBundle),
+		authenticatedCarryForwardOrigin(proof, passThrough.priorPrivateBundle));
 });

@@ -5,6 +5,7 @@
  */
 import { createHash } from "node:crypto";
 import type { AuthenticatedRestartCarryFacts, ReviewedRestartEffectPolicy } from "../m07/independent-restart.ts";
+import { authenticatedCarryForwardOrigin } from "./ledger-continuation.ts";
 
 const sha256 = (value: string): string => createHash("sha256").update(value).digest("hex");
 const hex64 = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
@@ -52,7 +53,8 @@ interface PriorReservation {
 			envelopeSha256: string; contractId: string; reviewedPolicyId: string;
 			reviewedPolicySha256: string; unknownHeldNano: number; committedNano: number };
 		quarantine: { operationRefs: string[]; operationOutcome: "unknown";
-			selectedFromFailedAttempt: false };
+			selectedFromFailedAttempt: false;
+			historicalGoalOutcomes?: Array<{ runId: string; outcome: string }> };
 		freshWorkspace: { workspaceId: string; restartNonce: string };
 	};
 	claim: { claimId: string; priorEnvelopeSha256: string; currentRunId: string;
@@ -300,9 +302,10 @@ function reviewLengthSettled(input: PrivateCampaignEffectReviewInput,
 export function reviewPrivateCampaignRestartEffects(input: PrivateCampaignEffectReviewInput): ReviewedRestartEffectPolicy {
 	const { facts, operationRefs, privateBundle: bundle } = input;
 	if (!input.authenticatedBundle(input.proof, bundle)) reject("bundle is not authenticated by live ledger proof");
+	const carryForward = authenticatedCarryForwardOrigin(input.proof, bundle);
 	if (!(facts.source.commit === CURRENT_POLICY.sourceCommit ||
 		facts.source.commit === INHERITED_ONLY_POLICY.sourceCommit ||
-		facts.source.commit === LENGTH_SETTLED_POLICY.sourceCommit) ||
+		facts.source.commit === LENGTH_SETTLED_POLICY.sourceCommit || carryForward) ||
 		facts.resultArtifact.digestScope !== "github-artifact-archive" ||
 		facts.unknownHeldNano < 1 || !operationRefs.length || new Set(operationRefs).size !== operationRefs.length)
 		reject("latest source or unknown charge is outside reviewed scope");
@@ -318,6 +321,44 @@ export function reviewPrivateCampaignRestartEffects(input: PrivateCampaignEffect
 		"host-independent-restart-reservations") as PriorReservation[];
 	const bindings = chain(bundle["independent-restart-goal-binding.json"],
 		"host-independent-restart-goal-bindings") as PriorBinding[];
+	if (carryForward) {
+		if (carryForward.source.commit !== LENGTH_SETTLED_POLICY.sourceCommit ||
+			facts.unknownHeldNano !== carryForward.historicalUnknownHeldNano ||
+			facts.committedNano !== carryForward.historicalCommittedNano ||
+			!Number.isSafeInteger(facts.committedNano) || facts.committedNano < facts.unknownHeldNano ||
+			reservations.length !== 3 || bindings.length !== 3)
+			reject("v3 carry-forward changed historical commitments or reviewed source");
+		const historical = reservations[2]?.receipt?.quarantine?.historicalGoalOutcomes;
+		const expectedGoals = [...(historical ?? []).map(row => row.runId), bindings[2]?.goalRunId];
+		if (!Array.isArray(historical) || !historical.length ||
+			historical.some(row => !text(row.runId) || !text(row.outcome)) ||
+			!text(bindings[2]?.goalRunId) ||
+			!sameSet(expectedGoals, boundedRuns.map(row => row.runId ?? "")) ||
+			historical.some(row => boundedRuns.find(saved => saved.runId === row.runId)?.outcome !== row.outcome))
+			reject("v3 carry-forward added or changed a historical research goal");
+		let history: { entries?: Array<{ goalRunId?: string }> };
+		try { history = JSON.parse(bundle["research-history.json"]); }
+		catch { return reject("v3 carry-forward history is unavailable"); }
+		if (!Array.isArray(history.entries) ||
+			new Set(history.entries.map(row => row.goalRunId)).size !== history.entries.length ||
+			history.entries.some(row =>
+			!text(row.goalRunId) || !expectedGoals.includes(row.goalRunId)))
+			reject("v3 carry-forward added unreviewed research history");
+		const historicalFacts: AuthenticatedRestartCarryFacts = { ...facts,
+			source: { ...carryForward.source }, envelopeSha256: carryForward.envelopeSha256,
+			committedNano: carryForward.historicalCommittedNano,
+			unknownHeldNano: carryForward.historicalUnknownHeldNano };
+		const reviewed = reviewLengthSettled({ ...input, facts: historicalFacts }, checkpoint,
+			reservations, bindings);
+		const policyId = "mul-pis-v3-no-model-activity-carry-forward-v1";
+		return { sourceCommit: facts.source.commit, policyId,
+			policySha256: sha256(JSON.stringify({ policyId, actualSource: facts.source,
+				actualEnvelope: facts.envelopeSha256, resultArtifact: facts.resultArtifact,
+				terminal: facts.terminal.observationDigest, historicalPolicy: reviewed.policySha256 })),
+			operationAttestations: reviewed.operationAttestations,
+			effectClass: "confined-ephemeral-local", unknownBillingHeld: true,
+			actorThirdPartyMutations: "none", hostTransport: "immutable-versioned-archive" };
+	}
 	if (facts.source.commit === INHERITED_ONLY_POLICY.sourceCommit)
 		return reviewInheritedOnly(input, checkpoint, reservations, bindings);
 	if (facts.source.commit === LENGTH_SETTLED_POLICY.sourceCommit)

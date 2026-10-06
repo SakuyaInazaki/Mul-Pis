@@ -29,7 +29,7 @@ import { verifyDeepSeekProviderOutputLimit,
 	type DeepSeekProviderOutputLimit } from "../src/runner/deepseek-provider-limits.ts";
 import { MISSION_ID, MISSION_REPOSITORY, PRIVATE_CONTINUATION_FILE_KEYS } from
 	"../src/runner/signed-mission-ledger.ts";
-import { CARRY_FILE_NAME, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, downloadCarryArtifact,
+import { CARRY_FILE_NAME, authenticatedCarryForwardOrigin, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, downloadCarryArtifact,
 	isAuthenticatedPriorCarryProof, openLedgerContinuation,
 	type PrivateContinuationBundle } from "../src/runner/ledger-continuation.ts";
 import { reviewPrivateCampaignRestartEffects } from "../src/runner/private-campaign-restart-policy.ts";
@@ -152,9 +152,11 @@ function reviewedLegacyRestartEffects(facts: AuthenticatedRestartCarryFacts,
 }
 function authenticatedLegacyCarryFacts(proof: unknown,
 	bundle: PrivateContinuationBundle): AuthenticatedRestartCarryFacts | undefined {
+	const carriedOrigin = authenticatedCarryForwardOrigin(proof, bundle);
 	if (!isAuthenticatedPriorCarryProof(proof) || !authenticatedPriorCarryBindsBundle(proof, bundle) ||
 		!proof.resultArtifact || proof.resultArtifact.digestScope !== "github-artifact-archive" ||
-		proof.priorCommittedCny === undefined || proof.priorUnknownHeldCny === undefined) return undefined;
+		(!carriedOrigin && (proof.priorCommittedCny === undefined ||
+			proof.priorUnknownHeldCny === undefined))) return undefined;
 	const artifact = proof.resultArtifact;
 	const immutableRef = `github-actions://${artifact.repository}/runs/${artifact.runId}/artifacts/${artifact.artifactId}/${artifact.artifactName}`;
 	return { source: { runId: proof.source.runId, runAttempt: proof.source.runAttempt,
@@ -169,8 +171,8 @@ function authenticatedLegacyCarryFacts(proof: unknown,
 			observedAt: new Date().toISOString() },
 		resultArtifact: { immutableRef, digestScope: artifact.digestScope,
 			sha256: artifact.archiveSha256 },
-		committedNano: Math.ceil(proof.priorCommittedCny * 1_000_000_000),
-		unknownHeldNano: Math.ceil(proof.priorUnknownHeldCny * 1_000_000_000) };
+		committedNano: carriedOrigin?.historicalCommittedNano ?? Math.ceil(proof.priorCommittedCny! * 1_000_000_000),
+		unknownHeldNano: carriedOrigin?.historicalUnknownHeldNano ?? Math.ceil(proof.priorUnknownHeldCny! * 1_000_000_000) };
 }
 async function writePrivateJsonOnce(directory: string, name: string, value: unknown): Promise<void> {
 	if (!/^[a-z][a-z0-9-]{0,100}\.json$/.test(name)) fail("invalid private receipt name");

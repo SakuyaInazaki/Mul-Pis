@@ -55,7 +55,13 @@ export type AuthenticatedPriorCarryProof = Readonly<{
 	priorSettledCny?: number; priorUnknownObservedCny?: number; priorUnpricedRequestCount?: number;
 	admittedCurrent: Readonly<Source>;
 }>;
+export type AuthenticatedCarryForwardOrigin = Readonly<{
+	source: Readonly<Source>; envelopeSha256: string;
+	historicalCommittedNano: number; historicalUnknownHeldNano: number;
+}>;
+type StoredCarryForwardOrigin = AuthenticatedCarryForwardOrigin & { privateBundleSha256: string };
 const authenticatedCarryProofs = new WeakSet<object>();
+const authenticatedCarryForwardOrigins = new WeakMap<object, AuthenticatedCarryForwardOrigin>();
 const authenticatedCarryAncestors = new WeakMap<object, ReadonlyArray<Readonly<{
 	source: Readonly<Source>; envelopeSha256: string;
 }>>>();
@@ -88,12 +94,22 @@ export function authenticatedPriorCarryBindsAncestor(proof: unknown, source: unk
 }
 
 /** Canonicalize only the fixed filename map; file contents remain exact UTF-8 strings. */
-function privateBundleDigest(bundle: PrivateContinuationBundle): string {
-	return digest(JSON.stringify(Object.fromEntries(Object.entries(bundle).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))));
+function canonicalPrivateBundle(bundle: PrivateContinuationBundle): string {
+	return JSON.stringify(Object.fromEntries(Object.entries(bundle).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)));
 }
+function privateBundleDigest(bundle: PrivateContinuationBundle): string { return digest(canonicalPrivateBundle(bundle)); }
 export function authenticatedPriorCarryBindsBundle(proof: unknown, bundle: unknown): boolean {
 	return isAuthenticatedPriorCarryProof(proof) && proof.privateBundleSha256 !== null &&
 		validBundle(bundle) && privateBundleDigest(bundle) === proof.privateBundleSha256;
+}
+/** A verified v3 transport-only chain may retain a historical restart origin.
+ * This does not confer scientific acceptance or settle the old billing unknown.
+ */
+export function authenticatedCarryForwardOrigin(proof: unknown,
+	bundle: unknown): AuthenticatedCarryForwardOrigin | undefined {
+	if (!isAuthenticatedPriorCarryProof(proof) || proof.version !== 2 ||
+		!authenticatedPriorCarryBindsBundle(proof, bundle)) return undefined;
+	return authenticatedCarryForwardOrigins.get(proof);
 }
 type LegacyCheckpoint = { version: 1 | 2; kind: "mul-pis-private-ledger-continuation";
 	missionId: typeof MISSION_ID; repository: typeof MISSION_REPOSITORY; seedDigest: string;
@@ -153,6 +169,7 @@ type AccountingCheckpoint = {
 	requestAudit: AccountingOnlyRequestAuditSnapshot;
 	legacyAncestry: AncestorReceipt[]; ancestry: AccountingAncestorReceipt[];
 	historical: { committedNano: number; unknownHeldNano: number; legacyParentDigest: string };
+	carryForwardOrigin?: StoredCarryForwardOrigin;
 	bootstrapBinding?: BootstrapBinding; privateBundle?: PrivateContinuationBundle;
 };
 type AccountingAncestorReceipt = Pick<AccountingCheckpoint, "parentDigest" | "source" |
@@ -463,6 +480,7 @@ function readCheckpoint(envelopeB64: string, key: Buffer, seedDigest: string, ex
 			"settledNano", "unknownObservedNano", "unpricedRequestCount", "settledAddedNano",
 			"unknownObservedAddedNano", "unpricedAddedCount", "requestAudit", "ancestry",
 			"legacyAncestry", "historical",
+			...(parsed.carryForwardOrigin === undefined ? [] : ["carryForwardOrigin"]),
 			...(parsed.privateBundle === undefined ? [] : ["privateBundle"]),
 			...(parsed.bootstrapBinding === undefined ? [] : ["bootstrapBinding"])] :
 		["version", "kind", "missionId", "repository", "seedDigest",
@@ -477,6 +495,10 @@ function readCheckpoint(envelopeB64: string, key: Buffer, seedDigest: string, ex
 		cp.parentDigest !== parentDigest ||
 		(cp.version !== 1 && !Array.isArray(cp.ancestry)) ||
 		(cp.version === 3 && (!Array.isArray(cp.legacyAncestry) || !record(cp.historical))) ||
+		(cp.version === 3 && cp.carryForwardOrigin !== undefined &&
+			(!record(cp.carryForwardOrigin) || !exactKeys(cp.carryForwardOrigin,
+				["source", "envelopeSha256", "historicalCommittedNano", "historicalUnknownHeldNano",
+					"privateBundleSha256"]))) ||
 		(cp.privateBundle !== undefined && !validBundle(cp.privateBundle)) ||
 		(cp.bootstrapBinding !== undefined && !validBinding(cp.bootstrapBinding)) ||
 		(cp.privateBundle === undefined) !== (cp.bootstrapBinding === undefined))
@@ -515,6 +537,15 @@ function accountingAncestorReceipt(cp: AccountingCheckpoint, envelopeDigest: str
 		unknownObservedAddedNano: cp.unknownObservedAddedNano, unpricedAddedCount: cp.unpricedAddedCount,
 		requestAudit: cp.requestAudit,
 		...(cp.bootstrapBinding ? { bootstrapBinding: cp.bootstrapBinding } : {}) };
+}
+function hasNoV3ProviderActivity(cp: Pick<AccountingCheckpoint, "settledNano" |
+	"unknownObservedNano" | "unpricedRequestCount" | "settledAddedNano" |
+	"unknownObservedAddedNano" | "unpricedAddedCount" | "requestAudit">): boolean {
+	return cp.settledNano === 0 && cp.unknownObservedNano === 0 &&
+		cp.unpricedRequestCount === 0 && cp.settledAddedNano === 0 &&
+		cp.unknownObservedAddedNano === 0 && cp.unpricedAddedCount === 0 &&
+		cp.requestAudit.requests.length === 0 && cp.requestAudit.settledCny === 0 &&
+		cp.requestAudit.unknownObservedCny === 0 && cp.requestAudit.unpricedRequestCount === 0;
 }
 function validateAncestryV3(cp: AccountingCheckpoint, sources: Source[], seedDigest: string,
 	seedCommittedNano: number, seedBinding?: BootstrapBinding): void {
@@ -598,7 +629,7 @@ async function oneJob(runId: string, token: string, request: typeof fetch): Prom
 	return job;
 }
 function providerDisposition(job: Job): "skipped" | "executed" {
-	const steps = job.steps?.filter(step => step.name === "Run bounded private campaign") ?? [];
+	const steps = providerSteps(job);
 	if (steps.length > 1 || (job.conclusion === "skipped" &&
 		steps.some(step => step.conclusion !== "skipped")))
 		reject("workflow provider step disposition is ambiguous");
@@ -607,6 +638,12 @@ function providerDisposition(job: Job): "skipped" | "executed" {
 	if (steps[0]?.status !== "completed") reject("intervening provider execution is unresolved");
 	return "executed";
 }
+
+/** The old and current source revisions used different names for the same step. */
+function providerSteps(job: Job): NonNullable<Job["steps"]> {
+	return job.steps?.filter(step => step.name === "Run bounded private campaign" ||
+		step.name === "Run private campaign") ?? [];
+}
 function priorCarryProof(input: { source: Source; current: Source; run: Run; job: Job;
 	artifactId: string; envelopeSha256: string; bundle?: PrivateContinuationBundle;
 	resultArtifact?: AuthenticatedPriorCarryProof["resultArtifact"];
@@ -614,7 +651,7 @@ function priorCarryProof(input: { source: Source; current: Source; run: Run; job
 	accounting?: { settledNano: number; unknownObservedNano: number; unpricedRequestCount: number };
 	committedNano?: number; unknownHeldNano?: number }): AuthenticatedPriorCarryProof | undefined {
 	const { source, current, run, job } = input;
-	const steps = job.steps?.filter(step => step.name === "Run bounded private campaign") ?? [];
+	const steps = providerSteps(job);
 	const terminalConclusions = ["success", "failure", "neutral", "timed_out", "action_required", "stale"];
 	// Historical carry accounting remains readable without these extra API fields,
 	// but their absence or mismatch must never mint restart authority.
@@ -832,6 +869,7 @@ export async function openLedgerContinuation(input: {
 	let legacyAncestry: AncestorReceipt[] = [];
 	let accountingAncestry: AccountingAncestorReceipt[] = [];
 	let ancestry: (AncestorReceipt | AccountingAncestorReceipt)[] = [];
+	let carryForwardOrigin: AuthenticatedCarryForwardOrigin | undefined;
 	if (executedSources.length) {
 		const latest = executedSources.at(-1)!;
 		const latestEnvelope = await load(latest);
@@ -842,6 +880,48 @@ export async function openLedgerContinuation(input: {
 			validateAncestryV3(opened.checkpoint, executedSources, seed.seedDigest,
 				n(seed.payload.priorCommittedCny), seed.bootstrapBinding);
 			const cp = opened.checkpoint;
+			const historicalOrigin = cp.legacyAncestry.at(-1);
+			if (historicalOrigin && hasNoV3ProviderActivity(cp) &&
+				cp.ancestry.every(hasNoV3ProviderActivity) &&
+				cp.historical.legacyParentDigest === historicalOrigin.envelopeDigest) {
+				const candidate = Object.freeze({ source: Object.freeze({ ...historicalOrigin.source }),
+					envelopeSha256: historicalOrigin.envelopeDigest,
+					historicalCommittedNano: cp.historical.committedNano,
+					historicalUnknownHeldNano: cp.historical.unknownHeldNano });
+				const bundleSha256 = cp.privateBundle ? privateBundleDigest(cp.privateBundle) : undefined;
+				if (cp.carryForwardOrigin !== undefined) {
+					if (!bundleSha256 || cp.carryForwardOrigin.privateBundleSha256 !== bundleSha256 ||
+						JSON.stringify(cp.carryForwardOrigin.source) !== JSON.stringify(candidate.source) ||
+						cp.carryForwardOrigin.envelopeSha256 !== candidate.envelopeSha256 ||
+						cp.carryForwardOrigin.historicalCommittedNano !== candidate.historicalCommittedNano ||
+						cp.carryForwardOrigin.historicalUnknownHeldNano !== candidate.historicalUnknownHeldNano)
+						reject("authenticated carry-forward origin is inconsistent");
+					carryForwardOrigin = candidate;
+				} else if (bundleSha256) {
+					// Old v3 wrappers did not record a bundle digest. Authenticate the
+					// legacy ciphertext itself before claiming its files were passed through.
+					let legacyEnvelope: string | undefined;
+					try {
+						const id = await oneArtifact(historicalOrigin.source.runId, input.githubToken!, request,
+							CARRY_ARTIFACT_NAME);
+						legacyEnvelope = await input.loadCarryArtifact({ runId: historicalOrigin.source.runId,
+							artifactId: id });
+					} catch { /* Historical artifact unavailable: no pass-through authority. */ }
+					if (legacyEnvelope) {
+						let old: ReturnType<typeof readCheckpoint> | undefined;
+						try { old = readCheckpoint(legacyEnvelope, key, seed.seedDigest, historicalOrigin.source); }
+						catch { /* No authority from an unreadable legacy artifact. */ }
+						if (old?.digest === candidate.envelopeSha256 && old.checkpoint.version === 2 &&
+							old.checkpoint.committedNano === candidate.historicalCommittedNano &&
+							old.checkpoint.unknownHeldNano === candidate.historicalUnknownHeldNano &&
+							old.checkpoint.privateBundle && cp.privateBundle &&
+							canonicalPrivateBundle(old.checkpoint.privateBundle) === canonicalPrivateBundle(cp.privateBundle))
+							carryForwardOrigin = candidate;
+					}
+				}
+			}
+			if (cp.carryForwardOrigin !== undefined && !carryForwardOrigin)
+				reject("authenticated carry-forward origin is not a zero-activity pass-through");
 			legacyAncestry = cp.legacyAncestry;
 			accountingAncestry = [...cp.ancestry, accountingAncestorReceipt(cp, opened.digest)];
 			ancestry = [...legacyAncestry, ...accountingAncestry];
@@ -891,6 +971,8 @@ export async function openLedgerContinuation(input: {
 		...(accountingAncestry.length ?
 			{ accounting: { settledNano, unknownObservedNano, unpricedRequestCount } } :
 			{ committedNano, unknownHeldNano }) }) : undefined;
+	if (proof && carryForwardOrigin && priorPrivateBundle && proof.resultArtifact)
+		authenticatedCarryForwardOrigins.set(proof, carryForwardOrigin);
 	if (priorPrivateBundle) Object.freeze(priorPrivateBundle);
 	if (priorBootstrapBinding) Object.freeze(priorBootstrapBinding);
 	let sealed = false;
@@ -916,14 +998,15 @@ export async function openLedgerContinuation(input: {
 				if (JSON.stringify(sourceOf(observed)) !== JSON.stringify(currentSource) ||
 					observed.status !== "in_progress" || (observed.conclusion !== undefined && observed.conclusion !== null) ||
 					observed.workflow_id !== current.workflow_id ||
-					observed.actor?.login !== c.actor || observed.event !== c.event || observed.head_branch !== BRANCH)
+					observed.actor?.login !== c.actor || observed.event !== c.event ||
+					observed.head_branch !== current.head_branch)
 					reject("current Actions restart admission is no longer active");
 				const disposition = await githubJson(`${base}/runs/${currentSource.runId}/jobs?per_page=100`, input.githubToken!, request);
 				if (disposition.total_count !== 1 || !Array.isArray(disposition.jobs) ||
 					disposition.jobs.length !== 1 || !record(disposition.jobs[0]))
 					reject("current Actions restart job identity is incomplete");
 				const job = disposition.jobs[0] as Job;
-				const steps = Array.isArray(job.steps) ? job.steps.filter(step => record(step) && step.name === "Run bounded private campaign") : [];
+				const steps = Array.isArray(job.steps) ? providerSteps(job) : [];
 				if (!Number.isSafeInteger(job.id) || job.id! <= 0 || job.run_id !== Number(currentSource.runId) ||
 					job.run_attempt !== currentSource.runAttempt || job.head_sha !== currentSource.commit ||
 					job.name !== "private-campaign" || job.status !== "in_progress" ||
@@ -969,6 +1052,12 @@ export async function openLedgerContinuation(input: {
 					unknownObservedNano: nextUnknownNano, unpricedRequestCount: nextUnpricedCount,
 					settledAddedNano, unknownObservedAddedNano, unpricedAddedCount: amounts.unpricedRequestCount,
 					requestAudit: amounts.requestAudit,
+					...(carryForwardOrigin && privateBundle &&
+						privateBundleDigest(privateBundle) === privateBundleDigest(priorPrivateBundle!) &&
+						settledAddedNano === 0 && unknownObservedAddedNano === 0 &&
+						amounts.unpricedRequestCount === 0 && amounts.requestAudit.requests.length === 0 ?
+						{ carryForwardOrigin: { ...carryForwardOrigin,
+							privateBundleSha256: privateBundleDigest(privateBundle) } } : {}),
 					...(privateBundle ? { privateBundle, bootstrapBinding } : {}) };
 				const envelopeB64 = sealCheckpoint(cp, key);
 				sealed = true;
