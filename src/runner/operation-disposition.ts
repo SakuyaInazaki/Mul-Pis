@@ -22,7 +22,8 @@ export interface SettledLocalAdmissionStopDetails {
 	readonly effectScope: HostEffectScope;
 }
 
-/** Host-only evidence that a terminal provider response arrived and settled, but was truncated. */
+/** Host-only evidence that a terminal provider response arrived and its
+ * transport outcome was reconciled, but was truncated. CNY may remain unknown. */
 export interface SettledTerminalResponseDetails {
 	readonly settledProviderRequestCount: number;
 	readonly responseReceived: true;
@@ -58,7 +59,8 @@ export function certifySettledLocalAdmissionStop(details: SettledLocalAdmissionS
 	return error;
 }
 
-/** Call only after the owning runner has verified terminal usage and all prior settlements. */
+/** Call only after the owning runner has verified each response arrived and its
+ * transport outcome is known; fee currency is a separate observation. */
 export function certifySettledTerminalResponse(details: SettledTerminalResponseDetails,
 	message: string): HarnessError {
 	const error = new HarnessError("runner.response.length-settled", message);

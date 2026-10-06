@@ -42,6 +42,7 @@ RESULT_ALLOWLIST = (
     "branch-child-review-decision.json",
     "campaign-status.json", "original-objective.json", "objective-checkpoint.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "mission-ledger-out.json", "execution-capabilities.json", "research-history.json", "restored-candidate-verification.json",
     "independent-restart-quarantine.json", "independent-restart-goal-binding.json",
+    "host-effect-receipt.json",
 )
 RESULT_DYNAMIC_RE = re.compile(
     r"^(?:(?:iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,})-(?:candidate\.cpp|verification\.json|lesson-delta\.json|experiment-plan\.json|review-decision\.json|m04-adopted-knowledge\.json)|"

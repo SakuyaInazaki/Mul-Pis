@@ -113,6 +113,7 @@ jobs:
           MULPIS_MISSION_LEDGER_B64: ${{ secrets.MULPIS_MISSION_LEDGER_B64 }}
           MULPIS_MANUAL_AUTHORIZED: ${{ (github.event_name == 'workflow_dispatch' && inputs.authorize_bounded_run) || (github.event_name == 'push' && github.event.head_commit.message == 'Run confidential workflow') }}
           MULPIS_RUN_REQUEST_BEFORE: ${{ github.event.before }}
+          MULPIS_ACTIONS_PUBLIC_HEARTBEAT_FD: "3"
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           umask 077
@@ -121,6 +122,7 @@ jobs:
           node scripts/manual-private-campaign.ts \
             --input-dir "$INPUT_DIR" \
             --output-dir "$RUNNER_TEMP/private-campaign-output" \
+            3>&1 \
             > "$RUNNER_TEMP/private-campaign-stdout" \
             2> "$RUNNER_TEMP/private-campaign-stderr"
           code=$?

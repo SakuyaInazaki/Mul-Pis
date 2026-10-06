@@ -23,20 +23,23 @@ import type { CurrentGoal, M07TaskRecord, TaskSpecInput } from "../src/m07/types
 import { runM04 } from "../src/stages/m04.ts";
 import { createPiSessionRunner } from "../src/runner/pi.ts";
 import type { SessionCheckpoint, SessionHandle, SessionRunner, SessionSpec } from "../src/runner/types.ts";
-import { DeepSeekCampaignBudget } from "../src/runner/deepseek-campaign.ts";
+import { DeepSeekCampaignBudget, campaignSessionEffectId } from "../src/runner/deepseek-campaign.ts";
 import { verifyDeepSeekCnyBilling, type NativeCnyPricingProfile } from "../src/runner/deepseek-cny-pricing.ts";
 import { verifyDeepSeekProviderOutputLimit,
 	type DeepSeekProviderOutputLimit } from "../src/runner/deepseek-provider-limits.ts";
 import { MISSION_ID, MISSION_REPOSITORY, PRIVATE_CONTINUATION_FILE_KEYS } from
 	"../src/runner/signed-mission-ledger.ts";
-import { CARRY_FILE_NAME, authenticatedCarryForwardOrigin, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, downloadCarryArtifact,
+import { CARRY_FILE_NAME, authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence,
+	authenticatedLegacyV3RunReview,
+	authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, downloadCarryArtifact,
 	isAuthenticatedPriorCarryProof, openLedgerContinuation,
-	type PrivateContinuationBundle } from "../src/runner/ledger-continuation.ts";
+	type PrivateContinuationBundle, type HostEffectReceiptV1 } from "../src/runner/ledger-continuation.ts";
 import { reviewPrivateCampaignRestartEffects } from "../src/runner/private-campaign-restart-policy.ts";
 import { bindIndependentRestartGoal, canonicalRestartUnknowns, reserveIndependentRestart,
 	type AuthenticatedRestartCarryFacts, type IndependentRestartReservation,
 	type ReviewedRestartEffectPolicy } from "../src/m07/independent-restart.ts";
 import { createConfinedCampaignFileTools } from "../src/runner/confined-campaign-files.ts";
+import { startPrivateCampaignHeartbeat } from "./private-campaign-heartbeat.ts";
 import { archivePrivateM07Task, recordPrivateM04Outcome } from "../src/workflow-archive/m07-private.ts";
 import { buildCsrChecker as buildLegacyCsrChecker } from "../src/workflow-archive/csr-checker-legacy.ts";
 import { buildCsrChecker, inspectCsrTaskContract, validateCsrCandidateSource, validateCsrTargetBodies, CSR_EXPERIMENT_LIMITS, type CsrExperimentPlan } from "../src/workflow-archive/csr-checker.ts";
@@ -152,7 +155,9 @@ function reviewedLegacyRestartEffects(facts: AuthenticatedRestartCarryFacts,
 }
 function authenticatedLegacyCarryFacts(proof: unknown,
 	bundle: PrivateContinuationBundle): AuthenticatedRestartCarryFacts | undefined {
-	const carriedOrigin = authenticatedCarryForwardOrigin(proof, bundle);
+	const carriedOrigin = authenticatedCarryForwardOrigin(proof, bundle) ??
+		authenticatedHostEffectEvidence(proof, bundle)?.origin ??
+		authenticatedLegacyV3RunReview(proof, bundle)?.origin;
 	if (!isAuthenticatedPriorCarryProof(proof) || !authenticatedPriorCarryBindsBundle(proof, bundle) ||
 		!proof.resultArtifact || proof.resultArtifact.digestScope !== "github-artifact-archive" ||
 		(!carriedOrigin && (proof.priorCommittedCny === undefined ||
@@ -903,7 +908,7 @@ function chooseFollowOnCandidate(previousAccepted: boolean, followOnAccepted: bo
 		comparison.medianRatio !== undefined && comparison.medianRatio > 1.03 &&
 		comparison.minRatio !== undefined && comparison.minRatio >= 0.95));
 }
-function initialHistoricalSelection(selectedCandidateSource: "initial" | "fork" | "followon" | "none",
+function initialHistoricalSelection(selectedCandidateSource: "initial" | "fork" | "repair" | "followon" | "none",
 	priorValidation: "passed" | "failed" | "infrastructure-unavailable" | undefined): Record<string, unknown> {
 	return selectedCandidateSource === "none" ? {
 		priorRetained: true, retentionReason: "no-new-accepted-candidate",
@@ -916,6 +921,19 @@ function initialHistoricalSelection(selectedCandidateSource: "initial" | "fork" 
 }
 function firstM07Accepted(acceptedWinner: boolean, finishedOutcome: unknown): boolean {
 	return acceptedWinner && finishedOutcome === "fulfilled";
+}
+function selectedGoalBranchSatisfied(selectedGoalRunId: string, initialGoalRunId: string,
+	initialBranchExerciseComplete: boolean): boolean {
+	// A linked successor is a separate M07 goal. Its own finish() enforces any
+	// competitive branches it created; an earlier partial goal cannot gate it.
+	return selectedGoalRunId !== initialGoalRunId || initialBranchExerciseComplete;
+}
+function shouldRepairRejectedReview(input: { winner: boolean; stopped: boolean; aborted: boolean;
+	rejected?: { status?: string; loopStopReason?: string; review?: unknown };
+	unresolvedOperationIds: string[]; unresolvedTaskIds: string[] }): boolean {
+	return !input.winner && !input.stopped && !input.aborted &&
+		input.rejected?.status === "rejected" && input.rejected.loopStopReason === "ready" &&
+		Boolean(input.rejected.review) && !input.unresolvedOperationIds.length && !input.unresolvedTaskIds.length;
 }
 function parseCheckerOutput(stdout: string, metadata: ReturnType<typeof buildLegacyCsrChecker>["metadata"]):
 	{ status: "passed" | "failed"; timings: TrustedTiming[] } {
@@ -1266,11 +1284,60 @@ async function collectContinuationBundle(directory: string, prior?: PrivateConti
 	}
 	if (history.entries.length) selected["research-history.json"] = JSON.stringify(history);
 	for (const name of ["original-objective.json", "objective-checkpoint.json", "objective-assessment-receipts.json",
-		"independent-restart-quarantine.json", "independent-restart-goal-binding.json"] as const)
+		"independent-restart-quarantine.json", "independent-restart-goal-binding.json",
+		"host-effect-receipt.json"] as const)
 		if (current[name]) selected[name] = current[name];
+	// A receipt describes one Actions execution. An older receipt cannot attest
+	// this process merely because its historical selected tuple was retained.
+	if (!current["host-effect-receipt.json"]) delete selected["host-effect-receipt.json"];
 	if (Buffer.byteLength(JSON.stringify(selected), "utf8") > 4 * 1024 * 1024)
 		fail("research continuation exceeds the authenticated carry capacity");
 	return selected;
+}
+
+/** Host-side task and tool census; the encrypted carry later authenticates these exact bytes. */
+async function buildHostEffectReceipt(input: { ws: Workspace;
+	source: HostEffectReceiptV1["source"]; priorEnvelopeSha256: string;
+	historicalGoalRunIds: string[]; requestIds: string[];
+	sessions: ReadonlyMap<string, { sessionId: string;
+		grantKind: "none" | "read-dir" | "confined-execution"; taskId?: string;
+		workRoot?: string; grant?: NonNullable<SessionSpec["toolAuthority"]> }> }): Promise<HostEffectReceiptV1> {
+	const owners = new Map<string, { goalRunId: string; taskId: string }>();
+	const goals: HostEffectReceiptV1["goals"] = [];
+	for (const runId of await input.ws.listRuns("M07")) {
+		const goal = JSON.parse(await readFile(path.join(input.ws.runDir("M07", runId), "goal.json"), "utf8")) as CurrentGoal;
+		if (goal.runId !== runId || !Array.isArray(goal.tasks) || !Array.isArray(goal.executionState?.operations))
+			fail("M07 host effect census lacks a complete controller goal");
+		const tasks = goal.tasks.map(task => {
+			if (task.mode !== "execute" && task.mode !== "check")
+				fail("M07 host effect census saw an unsupported task mode");
+			const sessionId = task.session?.id ? campaignSessionEffectId(task.session.id) : "";
+			if (sessionId) {
+				if (owners.has(sessionId)) fail("M07 host effect census reused one session for multiple tasks");
+				owners.set(sessionId, { goalRunId: runId, taskId: task.taskId });
+			}
+			return { taskId: task.taskId, mode: task.mode, status: task.status, sessionId };
+		});
+		goals.push({ runId, outcome: goal.outcome ?? "active", tasks,
+			operations: goal.executionState.operations.map(operation => ({ id: operation.id,
+				taskId: operation.taskId, status: operation.status })) });
+	}
+	const sessions: HostEffectReceiptV1["sessions"] = [];
+	for (const session of input.sessions.values()) {
+		const sessionId = campaignSessionEffectId(session.sessionId);
+		if (session.grantKind === "confined-execution") {
+			const owner = owners.get(sessionId);
+			if (!owner || owner.taskId !== session.taskId || !session.grant || !session.workRoot)
+				fail("M07 execution grant lacks an exact controller task identity");
+			sessions.push({ sessionId, kind: "confined-execution",
+				goalRunId: owner.goalRunId, taskId: owner.taskId, workRoot: session.workRoot,
+				grant: session.grant });
+		} else sessions.push({ sessionId, kind: session.grantKind });
+	}
+	return { version: 1, kind: "m07-host-effect-census", source: input.source,
+		priorEnvelopeSha256: input.priorEnvelopeSha256,
+		historicalGoalRunIds: input.historicalGoalRunIds, goals, sessions,
+		requestIds: input.requestIds };
 }
 
 async function inputs(inputDir: string) {
@@ -1337,6 +1404,11 @@ async function main() {
 	const budget = createPrivateCampaignBudget(nativeCnyPricing, providerOutputLimit);
 	statusBudget = budget;
 	finalBudget = budget;
+	let receiptHistoricalGoalRunIds: string[] = [];
+	const sessionEffects = new Map<string, { sessionId: string;
+		grantKind: "none" | "read-dir" | "confined-execution";
+		taskId?: string; workRoot?: string;
+		grant?: NonNullable<SessionSpec["toolAuthority"]> }>();
 	let campaignCancelled = false;
 	try {
 		const ws = new Workspace(path.join(campaignRoot, "workspace"));
@@ -1359,6 +1431,7 @@ async function main() {
 		const selectedSeed = validateSelectedPriorTuple(previousBundle, found.files,
 			missionLedger.priorBootstrapBinding, originalText);
 		const previousCheckpoint = selectedSeed.checkpoint;
+		receiptHistoricalGoalRunIds = previousCheckpoint.boundedRuns.map(item => item.runId);
 		const priorNeedsQuarantine = previousCheckpoint.continuation.requiresOperationReconciliation ||
 			previousCheckpoint.continuation.unresolvedOperationIds.length > 0 ||
 			previousCheckpoint.boundedRuns.some(run => (run.unresolvedOperationIds?.length ?? 0) > 0);
@@ -1431,7 +1504,7 @@ async function main() {
 			restartReservation = await reserveIndependentRestart({ authenticatedCarryProof: priorProof,
 				privateBundle: previousBundle, freshWorkspace: { workspaceId: path.basename(campaignRoot),
 					restartNonce: randomBytes(16).toString("hex") },
-				failedHistory: { state: "unavailable", reason: "The prior failed source, experiment plan and reviewer feedback are sealed in the encrypted result artifact and unavailable to this runner; the earlier accepted candidate is separate development evidence.",
+				failedHistory: { state: "unavailable", reason: "The full prior result artifact is unavailable to this runner. Any failed source, verification or reviewer feedback retained in authenticated research-history is separate, unselected development evidence; the earlier accepted candidate remains the selected tuple.",
 					immutableArtifactRef: facts.resultArtifact.immutableRef,
 					digestScope: facts.resultArtifact.digestScope,
 					artifactSha256: facts.resultArtifact.sha256 } }, {
@@ -1461,7 +1534,9 @@ async function main() {
 			const gapFile = path.join(priorSeedDir, "prior-history-gap.json");
 			await writeFile(gapFile, `${JSON.stringify({ version: 1, kind: "untrusted-private-history-gap",
 				selectedCandidate: "earlier accepted bounded task; current correctness was revalidated without adopting old timings",
-				laterFailedAttempt: "encrypted and unavailable to this runner; source, plan, verification and feedback must not be inferred",
+				laterFailedAttempt: previousBundle["research-history.json"] ?
+					"full encrypted result artifact unavailable; bounded unselected files in authenticated research-history may be read as development evidence, never inferred as adopted truth" :
+					"encrypted and unavailable to this runner; source, plan, verification and feedback must not be inferred",
 				oldOperationOutcome: "unknown and quarantined; provider cost hold remains",
 				newExecution: "independent fresh workspace and goal only; old task is not resumed or reconciled" }, null, 2)}\n`,
 				{ mode: 0o600 });
@@ -1498,6 +1573,24 @@ async function main() {
 		process.once("SIGTERM", cancel);
 		try {
 			const actual = createPiSessionRunner({ modelRuntime: runtime, signal: abort.signal, campaignBudget: budget });
+			const recordSessionEffect = async (requested: SessionSpec, handle: SessionHandle): Promise<void> => {
+				if (sessionEffects.has(handle.ref.id)) fail("duplicate private session effect identity");
+				if (requested.tools.kind === "execution") {
+					const taskId = /^M07-(T\d{3,})$/.exec(requested.label)?.[1];
+					const grant = await actual.attestConfinedGrant(handle);
+					if (!taskId || !grant || grant.kind !== "confined-campaign-files" ||
+						grant.root !== await realpath(requested.tools.root) ||
+						JSON.stringify(grant.writableFiles) !== JSON.stringify(["candidate.cpp", "lesson-delta.json",
+							...(registeredScopeActive ? ["experiment-plan.json"] : [])].sort()))
+						fail("M07 execution session lacks the live factory-confined file grant");
+					sessionEffects.set(handle.ref.id, { sessionId: handle.ref.id, grantKind: "confined-execution",
+						taskId, workRoot: grant.root, grant });
+				} else if (requested.tools.kind === "none") {
+					sessionEffects.set(handle.ref.id, { sessionId: handle.ref.id, grantKind: "none" });
+				} else if (requested.tools.kind === "read-dir" && !requested.tools.extraTools?.length) {
+					sessionEffects.set(handle.ref.id, { sessionId: handle.ref.id, grantKind: "read-dir" });
+				} else fail("private session received an unreviewed tool grant");
+			};
 			let followOnPriorCandidate = path.join(priorSeedDir, "prior-candidate.cpp");
 			let followOnPriorPlanFile: string | undefined = previousBundle["experiment-plan.json"] ? path.join(priorSeedDir, "prior-experiment-plan.json") : undefined;
 			let registeredScopeActive = false;
@@ -1588,15 +1681,36 @@ async function main() {
 				create: async spec => {
 					const transformed = await confinedSpec(spec);
 					const handle = await actual.create(transformed);
+					try { await recordSessionEffect(spec, handle); }
+					catch (error) { handle.dispose(); throw error; }
 				return spec.tools.kind === "execution" ? checkedHandle(handle, spec.tools.root, registeredScopeActive) : handle;
 				},
 				checkpoint: (handle, envelope) => actual.checkpoint(handle, envelope),
 				fork: async request => {
 					const transformed = await confinedSpec(request.spec);
 					const handle = await actual.fork({ ...request, spec: transformed });
+					try { await recordSessionEffect(request.spec, handle); }
+					catch (error) { handle.dispose(); throw error; }
 				return request.spec.tools.kind === "execution" ? checkedHandle(handle, request.spec.tools.root, registeredScopeActive) : handle;
 				},
-				resume: ref => actual.resume(ref),
+				resume: async ref => {
+					const handle = await actual.resume(ref);
+					const known = sessionEffects.get(handle.ref.id);
+					if (!known) {
+						handle.dispose();
+						fail("resumed private session has no current host effect authority");
+					}
+					if (known.grantKind === "confined-execution") {
+						const grant = await actual.attestConfinedGrant(handle);
+						if (!grant || JSON.stringify(grant) !== JSON.stringify(known.grant) || !known.workRoot) {
+							handle.dispose();
+							fail("resumed M07 session lost its factory-confined grant");
+						}
+						return checkedHandle(handle, known.workRoot,
+							grant.writableFiles.includes("experiment-plan.json"));
+					}
+					return handle;
+				},
 			};
 			const controller = createM07Controller({ ws, store, runner, config: await ws.loadConfig() });
 			const privateEvidenceRequirements = { requiredNames: ["original-problem.txt", "candidate.cpp", "verification.json", "host-capabilities.json"],
@@ -1681,7 +1795,7 @@ async function main() {
 				await writeFile(path.join(priorSeedDir, "prior-m04-knowledge.json"), previousBundle["m04-adopted-knowledge.json"], { mode: 0o600 });
 			statusPhase = "prior-objective-assessment";
 			const firstStep = await assessAndAdvanceOriginalObjective({
-				contract: originalObjective, contractFile: objectiveContractFile, runner: actual,
+				contract: originalObjective, contractFile: objectiveContractFile, runner,
 				runRecord: firstAssessmentRecord, persistReceipt: () => persistObjectiveReceipt(firstAssessmentRecord),
 				sessionSpec: { label: "M07-prior-objective-assessment", role: "research", model: MODEL,
 					systemPrompt: "Assess the unchanged user objective and all frozen prior evidence. Choose the next scientific work yourself under observed host capabilities. Read every supplied original input and selected evidence before deciding; report uncertainty honestly.",
@@ -1762,15 +1876,16 @@ async function main() {
 			const parentVerification = path.join(task.workDir, "verification.json");
 			let parentResult: Record<string, unknown> | undefined;
 			try { parentResult = JSON.parse(await readFile(parentVerification, "utf8")) as Record<string, unknown>; } catch { /* no parent verification */ }
-			const accepted = task.status === "returned" && task.loopStopReason === "ready" && parentResult?.status === "passed";
+			const parentHostPassed = task.status === "returned" && task.loopStopReason === "ready" && parentResult?.status === "passed";
+			let accepted = false;
 			if (task.status === "returned" && task.reportPath) {
 				statusPhase = "parent-review";
 				const review = await controller.review(runId, { taskId: task.taskId,
-					checks: initialChecks.map((criterion, i) => ({ criterion, result: accepted ? "passed" : "failed",
-						evidence: accepted ? [i === 0 ? parentCandidate : parentVerification] : [] })),
+					checks: initialChecks.map((criterion, i) => ({ criterion, result: parentHostPassed ? "passed" : "failed",
+						evidence: parentHostPassed ? [i === 0 ? parentCandidate : parentVerification] : [] })),
 					artifacts: [...(initialRegistered && existsSync(path.join(task.workDir, "experiment-plan.json")) ? [path.join(task.workDir, "experiment-plan.json")] : []), task.reportPath, ...(existsSync(parentCandidate) ? [parentCandidate] : []), ...(existsSync(parentVerification) ? [parentVerification] : [])],
-					failures: accepted ? [] : ["bounded candidate did not pass all observed checks"] });
-				if (accepted && review.status !== "accepted") fail("M07 review did not accept candidate");
+					failures: parentHostPassed ? [] : ["bounded candidate did not pass all observed checks"] });
+				accepted = review.status === "accepted";
 			}
 			statusPhase = "parent-reviewed";
 			let branchTask: Awaited<ReturnType<typeof controller.delegate>> | undefined;
@@ -1799,18 +1914,18 @@ async function main() {
 				let branchResult: Record<string, unknown> | undefined;
 				try { branchResult = JSON.parse(await readFile(branchVerification, "utf8")) as Record<string, unknown>; } catch { /* no branch verification */ }
 				branchComparison = (branchResult?.priorCandidateComparison as typeof branchComparison | undefined) ?? { state: "unavailable" };
-				branchAccepted = forked.status === "returned" && forked.loopStopReason === "ready" && branchResult?.status === "passed";
+				const forkHostPassed = forked.status === "returned" && forked.loopStopReason === "ready" && branchResult?.status === "passed";
 				let forkReviewStatus = forked.status;
 				if (forked.status === "returned" && forked.reportPath) {
 					statusPhase = "fork-review";
 					const reviewed = await controller.review(runId, { taskId: forked.taskId,
-						checks: initialChecks.map((criterion, i) => ({ criterion, result: branchAccepted ? "passed" : "failed",
-							evidence: branchAccepted ? [i === 0 ? branchCandidate : branchVerification] : [] })),
+						checks: initialChecks.map((criterion, i) => ({ criterion, result: forkHostPassed ? "passed" : "failed",
+							evidence: forkHostPassed ? [i === 0 ? branchCandidate : branchVerification] : [] })),
 						artifacts: [...(initialRegistered && existsSync(path.join(forked.workDir, "experiment-plan.json")) ? [path.join(forked.workDir, "experiment-plan.json")] : []), forked.reportPath, ...(existsSync(branchCandidate) ? [branchCandidate] : []),
 							...(existsSync(branchVerification) ? [branchVerification] : [])],
-						failures: branchAccepted ? [] : ["forked candidate did not pass all observed checks"] });
+						failures: forkHostPassed ? [] : ["forked candidate did not pass all observed checks"] });
 					forkReviewStatus = reviewed.status;
-					if (branchAccepted && reviewed.status !== "accepted") fail("forked M07 review did not accept candidate");
+					branchAccepted = reviewed.status === "accepted";
 				}
 				statusPhase = "fork-reviewed";
 				const sourceChanged = !existsSync(parentCandidate) || !existsSync(branchCandidate) ||
@@ -1863,6 +1978,90 @@ async function main() {
 					measuredComparison: branchComparison,
 					selectedTaskId: winner?.taskId ?? null, taskTelemetry: statusBranchTelemetry };
 			}
+			// A ready reviewer verdict is not the controller's final adoption decision.
+			// A rejected comparison is finished partial, then its exact feedback is
+			// handed to a linked fresh goal. The controller does not allow a later
+			// task to retroactively turn a no-winner branch selection into fulfillment.
+			const initialGoalRunId = runId;
+			const rejectedGoalOutcomes: Array<{ runId: string; outcome: string }> = [];
+			const repairTaskIds: string[] = [];
+			const repairFeedbackFiles: string[] = [];
+			let rejectedForRepair = branchTask ?? task;
+			while (!winner && !budget.snapshot().stopped && !abort.signal.aborted) {
+				const currentGoal = await controller.status(runId);
+				const rejected = currentGoal.tasks.find(item => item.taskId === rejectedForRepair.taskId);
+				const unresolved = unresolvedGoalControl(currentGoal);
+				if (!shouldRepairRejectedReview({ winner: Boolean(winner), stopped: budget.snapshot().stopped,
+					aborted: abort.signal.aborted, rejected, unresolvedOperationIds: unresolved.operationIds,
+					unresolvedTaskIds: unresolved.taskIds })) break;
+				if (!rejected?.review) break;
+				const feedbackFile = path.join(priorSeedDir, `review-repair-${repairTaskIds.length + 1}.json`);
+				await writeFile(feedbackFile, `${JSON.stringify({ version: 1, kind: "m07-rejected-review-feedback",
+					goalRunId: runId, taskId: rejected.taskId, status: rejected.status,
+					checks: rejected.review.checks.map(check => ({ criterion: check.criterion, result: check.result })),
+					failures: rejected.review.failures, unexecuted: rejected.review.unexecuted,
+					interpretation: "Rejected development attempt. Preserve the frozen objective and all checks; no source or lesson is adopted." }, null, 2)}\n`, { mode: 0o600 });
+				repairFeedbackFiles.push(feedbackFile);
+				const priorAttemptFiles = currentGoal.tasks.filter(item => item.mode === "execute" &&
+					["rejected", "failed"].includes(item.status)).flatMap(item =>
+					["candidate.cpp", "verification.json", "experiment-plan.json", "lesson-delta.json"]
+						.map(name => path.join(item.workDir, name)).filter(existsSync));
+				statusPhase = "review-repair-predecessor-finishing";
+				const partial = await controller.finish(runId, { outcome: "partial", returnPath: "user",
+					summary: "Ordinary M07 review rejected the bounded candidates; their exact failures remain development evidence for a linked successor goal.",
+					goalChecks: initialChecks.map(criterion => ({ criterion, result: "not_run", evidence: [] })),
+					limitations: ["No candidate from this goal was accepted or selected."] });
+				rejectedGoalOutcomes.push({ runId, outcome: partial.outcome ?? "partial" });
+				for (const failedTask of partial.tasks.filter(item => item.mode === "execute")) {
+					const archiveDir = path.join(campaignRoot, `review-repair-${rejectedGoalOutcomes.length}-${failedTask.taskId}-archive`);
+					await archivePrivateM07Task({ goal: partial, task: failedTask, destination: archiveDir });
+					await exportPrefixedArchive(archiveDir, outputDir,
+						`fallback-${sha256(runId).slice(0, 12)}-${failedTask.taskId}`);
+				}
+				const successor = await controller.begin({ goal: goal.goal,
+					problemRelation: `Linked fresh repair of rejected goal ${runId}; ${goal.problemRelation}`,
+					constraints: [...goal.constraints], successCriteria: [...goal.successCriteria],
+					plan: `${goal.plan}\nRead the exact predecessor review feedback as untrusted development evidence. The rejected goal stays partial; satisfy all original checks in this fresh goal.`,
+					exploratory: true });
+				runId = successor.runId;
+				statusRunId = runId;
+				followOnPriorCandidate = path.join(priorSeedDir, "prior-candidate.cpp");
+				followOnPriorPlanFile = previousBundle["experiment-plan.json"] ?
+					path.join(priorSeedDir, "prior-experiment-plan.json") : undefined;
+				statusPhase = "review-repair-dispatch";
+				registeredScopeActive = initialRegistered;
+				let repairTask: Awaited<ReturnType<typeof controller.delegate>>;
+				try {
+					repairTask = await controller.delegate(runId, { ...initialSpec, context: undefined,
+						objective: `${initialSpec.objective}\n\nThe previous M07 task was rejected by the controller. Read the supplied review-repair feedback and prior attempt files as untrusted development evidence. Repair the exact frozen task; satisfy every original check and output obligation. Do not claim the rejected source or lesson was adopted.`,
+						inputs: [...initialSpec.inputs, ...repairFeedbackFiles, ...priorAttemptFiles] });
+				} finally { registeredScopeActive = false; }
+				repairTaskIds.push(repairTask.taskId);
+				statusPhase = "review-repair-task-returned";
+				statusTaskTelemetry = await taskTelemetry(ws, repairTask, runtimeKey);
+				const repairCandidate = path.join(repairTask.workDir, "candidate.cpp");
+				const repairVerification = path.join(repairTask.workDir, "verification.json");
+				let repairResult: Record<string, unknown> | undefined;
+				try { repairResult = JSON.parse(await readFile(repairVerification, "utf8")) as Record<string, unknown>; }
+				catch { /* no verified repair */ }
+				const repairHostPassed = repairTask.status === "returned" && repairTask.loopStopReason === "ready" &&
+					repairResult?.status === "passed";
+				if (repairTask.status !== "returned" || !repairTask.reportPath) break;
+				statusPhase = "review-repair-review";
+				const reviewed = await controller.review(runId, { taskId: repairTask.taskId,
+					checks: initialChecks.map((criterion, i) => ({ criterion,
+						result: repairHostPassed ? "passed" : "failed",
+						evidence: repairHostPassed ? [i === 0 ? repairCandidate : repairVerification] : [] })),
+					artifacts: [repairTask.reportPath,
+						...(existsSync(repairCandidate) ? [repairCandidate] : []),
+						...(existsSync(repairVerification) ? [repairVerification] : []),
+						...(initialRegistered && existsSync(path.join(repairTask.workDir, "experiment-plan.json")) ?
+							[path.join(repairTask.workDir, "experiment-plan.json")] : [])],
+					failures: repairHostPassed ? [] : ["repair candidate did not pass all observed checks"] });
+				if (reviewed.status === "accepted") winner = repairTask;
+				rejectedForRepair = repairTask;
+			}
+			statusPhase = "review-repair-reviewed";
 			// A failed or interrupted parent can leave an issued provider operation unknown.
 			// finish() must never be used to turn that state into a partial terminal goal.
 			const firstGoalControl = unresolvedGoalControl(await controller.status(runId));
@@ -1886,13 +2085,17 @@ async function main() {
 				process.exitCode = 1;
 				return;
 			}
-			const acceptedWinner = branchExerciseComplete && Boolean(winner);
+			const branchRequirementSatisfied = selectedGoalBranchSatisfied(runId, initialGoalRunId,
+				branchExerciseComplete);
+			const acceptedWinner = branchRequirementSatisfied && Boolean(winner);
 			const selectedTask = winner ?? task;
 			let candidate = path.join(selectedTask.workDir, "candidate.cpp");
 			let verificationPath = path.join(selectedTask.workDir, "verification.json");
 			statusPhase = "first-goal-finishing";
 			const finished = await controller.finish(runId, { outcome: acceptedWinner ? "fulfilled" : "partial", returnPath: "user",
-				summary: acceptedWinner ? "M07 builder, true refinement fork, fresh reviews and measured branch selection completed." :
+				summary: acceptedWinner ? runId === initialGoalRunId ?
+					"M07 builder, true refinement fork and controller-accepted selected task completed." :
+					"A prior rejected goal remains partial; this linked fresh goal produced a controller-accepted task." :
 					"M07 attempt or true branch selection was incomplete.",
 				goalChecks: initialChecks.map((criterion, i) => ({ criterion, result: acceptedWinner ? "passed" : "not_run",
 					evidence: acceptedWinner ? [i === 0 ? candidate : verificationPath] : [] })),
@@ -1906,27 +2109,29 @@ async function main() {
 				initialRegistered ? ["experiment-plan.json"] : []) : [];
 			statusPhase = "private-archive";
 			const privateArchive = await archivePrivateM07Task({ goal: frozenGoal, task: frozenTask, destination: outputDir });
-			const parentArchiveDir = path.join(campaignRoot, "branch-parent-archive");
-			await archivePrivateM07Task({ goal: frozenGoal, task: frozenGoal.tasks.find(item => item.taskId === task.taskId)!,
-				destination: parentArchiveDir });
-			await exportPrefixedArchive(parentArchiveDir, outputDir, "branch-parent");
-			if (branchTask) {
-				const childArchiveDir = path.join(campaignRoot, "branch-child-archive");
-				await archivePrivateM07Task({ goal: frozenGoal, task: frozenGoal.tasks.find(item => item.taskId === branchTask.taskId)!,
-					destination: childArchiveDir });
-				await exportPrefixedArchive(childArchiveDir, outputDir, "branch-child");
+			if (runId === initialGoalRunId) {
+				const parentArchiveDir = path.join(campaignRoot, "branch-parent-archive");
+				await archivePrivateM07Task({ goal: frozenGoal, task: frozenGoal.tasks.find(item => item.taskId === task.taskId)!,
+					destination: parentArchiveDir });
+				await exportPrefixedArchive(parentArchiveDir, outputDir, "branch-parent");
+				if (branchTask) {
+					const childArchiveDir = path.join(campaignRoot, "branch-child-archive");
+					await archivePrivateM07Task({ goal: frozenGoal, task: frozenGoal.tasks.find(item => item.taskId === branchTask.taskId)!,
+						destination: childArchiveDir });
+					await exportPrefixedArchive(childArchiveDir, outputDir, "branch-child");
+				}
 			}
 			let finalArchive = privateArchive;
-			let selectedCandidateSource: "initial" | "fork" | "followon" | "none" = firstGoalReady ?
+			let selectedCandidateSource: "initial" | "fork" | "repair" | "followon" | "none" = firstGoalReady ?
+				repairTaskIds.includes(selectedTask.taskId) ? "repair" :
 				selectedTask.taskId === task.taskId ? "initial" : "fork" : "none";
 			let m04: { status: "completed" | "failed" | "not_run"; runId?: string; proposalSubmitted?: boolean;
 				snapshotCreated?: boolean; evidenceReturned?: boolean; adoptedExperienceRefs?: KnowledgeRef[];
 				failure?: ReturnType<typeof privateExceptionDiagnostic> } = { status: "not_run" };
-			if (firstGoalReady && branchExerciseComplete && !budget.snapshot().stopped && !abort.signal.aborted) {
+			if (firstGoalReady && branchRequirementSatisfied && !budget.snapshot().stopped && !abort.signal.aborted) {
 				statusPhase = "m04-dispatch";
 				try {
-					const m04Runner = createPiSessionRunner({ modelRuntime: runtime,
-						signal: abort.signal, campaignBudget: budget });
+					const m04Runner = runner;
 					const processed = await runM04({ ws, store, runner: m04Runner, config: await ws.loadConfig() },
 						{ feedback: { kind: "M07", runId }, freshSession: true,
 							requiredM07ReadPaths: selectedM04ReadPaths,
@@ -2017,7 +2222,7 @@ async function main() {
 					let objectiveStep;
 					try { objectiveStep = await assessAndAdvanceOriginalObjective({
 						contract: originalObjective, contractFile: objectiveContractFile,
-						runner: actual, runRecord: objectiveRecord, persistReceipt: saveObjectiveReceipt,
+							runner, runRecord: objectiveRecord, persistReceipt: saveObjectiveReceipt,
 						sessionSpec: { label: `M07-original-objective-assessment-${iteration}`, role: "research", model: MODEL,
 							systemPrompt: "Independently assess the original research goal using the frozen evidence. Read the complete supplied files before proposing further work. Return only the requested structured judgment; acknowledge uncertainty, bounded search scope and failed checks. Do not invent measurements or treat M04 adoption as proof of performance.",
 							persistDir: ws.sessionsDir },
@@ -2038,7 +2243,8 @@ async function main() {
 							else assessmentHistory.push({ iteration, assessment, stopReason: "assessment-validation-pending", advanced: false });
 							await writeObjectiveProgress(objectiveCheckpointFile, campaignObjectiveProgress(originalObjective,
 								historicalUnresolvedOperationIds,
-								{ boundedRuns: [...previousCheckpoint.boundedRuns, { runId: runId!, outcome: finished.outcome ?? "unknown",
+								{ boundedRuns: [...previousCheckpoint.boundedRuns, ...rejectedGoalOutcomes,
+									{ runId: runId!, outcome: finished.outcome ?? "unknown",
 									...(firstGoalReady ? { selectedTaskId: selectedTask.taskId } : {}) }],
 									selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
 									assessment, assessmentHistory, stopReason: "assessment-validation-pending" }));
@@ -2153,8 +2359,7 @@ async function main() {
 							const requiredPaths = selectedM07ReviewReadPaths(ws.runDir("M07", secondGoal.runId), nextFrozenTask,
 								registered ? ["experiment-plan.json"] : []);
 							try {
-								const m04Runner = createPiSessionRunner({ modelRuntime: runtime,
-									signal: abort.signal, campaignBudget: budget });
+								const m04Runner = runner;
 								const processed = await runM04({ ws, store, runner: m04Runner, config: await ws.loadConfig() },
 									{ feedback: { kind: "M07", runId: secondGoal.runId }, freshSession: true,
 										requiredM07ReadPaths: requiredPaths,
@@ -2312,9 +2517,10 @@ async function main() {
 			const followOnCompleted = followOn.state === "completed" && followOn.m07Outcome === "fulfilled";
 			const boundedRunOutcome = firstGoalReady && finalCandidateVerified && m04.status === "completed" && durableKnowledge &&
 				m04SelectedReadContractSatisfied && currentM04Status === "completed" && currentM04Read &&
-				currentKnowledgeExport.state !== "incomplete" && branchExerciseComplete &&
+				currentKnowledgeExport.state !== "incomplete" && branchRequirementSatisfied &&
 				followOnCompleted ? "fulfilled" : "partial";
-			const boundedRuns = [...previousCheckpoint.boundedRuns, { runId: runId!, outcome: finished.outcome ?? "unknown",
+			const boundedRuns = [...previousCheckpoint.boundedRuns, ...rejectedGoalOutcomes,
+				{ runId: runId!, outcome: finished.outcome ?? "unknown",
 				...(firstGoalReady ? { selectedTaskId: selectedTask.taskId } : {}) },
 				...followOnAttempts.filter(item => typeof item.goalRunId === "string").map(item => ({
 					runId: String(item.goalRunId), outcome: String(item.m07Outcome ?? "unknown"),
@@ -2330,18 +2536,23 @@ async function main() {
 				originalObjective: { id: originalObjective.id, outcome: objectiveCheckpoint.objectiveOutcome,
 					stopReason: objectiveCheckpoint.stopReason, checkpointFile: "objective-checkpoint.json",
 					goalSource: originalObjective.goalSource, continuation: objectiveCheckpoint.continuation.mode },
-				m07Outcome: finished.outcome, taskStatus: task.status,
-				loopStopReason: task.loopStopReason, taskTelemetry: statusTaskTelemetry,
+				m07Outcome: finished.outcome, taskStatus: frozenTask.status,
+				loopStopReason: frozenTask.loopStopReason, taskTelemetry: statusTaskTelemetry,
 				credentialProbe: statusCredentialProbe, sdkAuthSource: statusAuthSource,
 				sdkAuthMatch: statusSdkAuthMatch,
-				workflowArchive: { state: "saved", firstTaskId: task.taskId,
+				workflowArchive: { state: "saved", firstGoalRunId: initialGoalRunId,
+					selectedM07GoalRunId: firstGoalReady ? runId : null,
+					firstTaskId: task.taskId,
 					selectedM07TaskId: firstGoalReady ? selectedTask.taskId : null,
 					finalTaskId: finalArchive.taskId,
 					lessonState: privateArchive.lesson.state, trustedAdoption: false, m04,
 					knowledgeExport, m04EvidenceReturned: m04.evidenceReturned ?? false,
 					m04AdoptedExperienceCount, m04AdoptionReadContractSatisfied,
 					m04SelectedReadContractSatisfied },
-				branch: branchState, branchExerciseComplete, firstGoalReady,
+				branch: branchState, branchExerciseComplete, branchRequirementSatisfied,
+				firstGoalReady: firstGoalReady && runId === initialGoalRunId,
+				selectedGoalReady: firstGoalReady,
+				rejectedGoalOutcomes,
 				followOn, followOnAttempts, objectiveLoop: loop, selectedCandidateSource,
 				selectedMissionCandidateSource: historicalSelection.priorRetained === true ?
 					"authenticated-prior-carry" : selectedCandidateSource,
@@ -2369,8 +2580,20 @@ async function main() {
 				independentValidation: "not-complete" }).catch(() => undefined);
 			process.exitCode = 1;
 		}
-		try { await salvageObjectiveCheckpoint(new Workspace(path.join(campaignRoot, "workspace")), outputDir,
-			budget.snapshot().stopReason, campaignCancelled); }
+		try {
+			const workspace = new Workspace(path.join(campaignRoot, "workspace"));
+			const noNewResearchEffect = (await workspace.listRuns("M07")).length === 0 &&
+				budget.requestAccountingAuditSnapshot().requests.length === 0;
+			// Preserve the authenticated predecessor checkpoint byte-for-byte when
+			// this request only appended a restart reservation before interruption.
+			// Fresh preflight files still travel in the encrypted result, not as a
+			// change to the selected research checkpoint.
+			if (noNewResearchEffect && missionLedger.priorPrivateBundle?.["objective-checkpoint.json"])
+				await writeFile(path.join(outputDir, "objective-checkpoint.json"),
+					missionLedger.priorPrivateBundle["objective-checkpoint.json"], { mode: 0o600 });
+			else await salvageObjectiveCheckpoint(workspace, outputDir,
+				budget.snapshot().stopReason, campaignCancelled);
+		}
 		catch { statusArchiveFailure = "objective-checkpoint-salvage-failed"; process.exitCode = 1; }
 		try {
 			const statusFile = path.join(outputDir, "campaign-status.json");
@@ -2385,6 +2608,25 @@ async function main() {
 			}
 		}
 		catch { statusArchiveFailure = "objective-status-sync-failed"; process.exitCode = 1; }
+		try {
+			if (process.env.GITHUB_ACTIONS === "true") {
+				const source = { runId: process.env.GITHUB_RUN_ID ?? "",
+					runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
+					commit: process.env.GITHUB_SHA ?? "" };
+				const priorEnvelopeSha256 = missionLedger.priorCarryProof?.envelopeSha256 ?? "";
+				if (!/^[1-9][0-9]*$/.test(source.runId) || !Number.isSafeInteger(source.runAttempt) ||
+					source.runAttempt < 1 || !/^[0-9a-f]{40}$/.test(source.commit) ||
+					!/^[0-9a-f]{64}$/.test(priorEnvelopeSha256))
+					fail("Actions host effect census lacks exact run and prior carry identity");
+				const receipt = await buildHostEffectReceipt({ ws: new Workspace(path.join(campaignRoot, "workspace")),
+					source, priorEnvelopeSha256,
+					historicalGoalRunIds: receiptHistoricalGoalRunIds,
+					requestIds: budget.requestAccountingAuditSnapshot().requests.map(item => item.requestId),
+					sessions: sessionEffects });
+				await writeFile(path.join(outputDir, "host-effect-receipt.json"),
+					`${JSON.stringify(receipt)}\n`, { mode: 0o600 });
+			}
+		} catch { statusArchiveFailure = "host-effect-census-unavailable"; process.exitCode = 1; }
 
 		await rm(campaignRoot, { recursive: true, force: true });
 	}
@@ -2425,16 +2667,20 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	privateFailureMessage, privateExceptionDiagnostic, credentialProbe, parseCheckerOutput, compareCandidateTimings,
 	campaignObjectiveStop, taskTelemetry, privateToolTelemetry,
 	chooseForkWinner, chooseFollowOnCandidate, firstM07Accepted,
+	selectedGoalBranchSatisfied,
+	shouldRepairRejectedReview,
 	availablePrivateArtifactNames,
 	initialHistoricalSelection,
 	forkReceiptMatches, contextLineageSummary, selectedM07ReviewReadPaths, exportPrefixedArchive, preserveCandidate,
 	preserveUnsettledGoalCheckpoint, preserveUnsettledBranchCheckpoint: preserveUnsettledGoalCheckpoint,
 	salvageObjectiveCheckpoint, collectContinuationBundle,
+	buildHostEffectReceipt,
 	unresolvedGoalControl, campaignObjectiveProgress,
 	canonicalUnresolvedOperationRefs, qualifiedOperationRef, reservedCanonicalOperationRefs,
 	registeredSourceShape, parseRegisteredCheckerOutput, validateContinuationSeed, rangeReadableHistory, sandboxArguments };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+	const stopHeartbeat = startPrivateCampaignHeartbeat();
 	main().catch(async error => {
 		const preProvider = ["preflight", "mission-ledger-verification", "credential-probe", "credential-verified",
 			"isolated-preflight-passed", "workspace-init", "private-inputs-staged",
@@ -2460,5 +2706,5 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
 		// Never print the model response, source, input paths, credential, or raw provider errors.
 		console.error(JSON.stringify({ status: "private-campaign-failed", category: "campaign-exception" }));
 		process.exitCode = 1;
-	});
+	}).finally(stopHeartbeat);
 }

@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 import type { AuthenticatedRestartCarryFacts } from "../src/m07/independent-restart.ts";
-import { PRIOR_REVIEWED_POLICY_SHA256, reviewPrivateCampaignRestartEffects } from
+import { PRIOR_REVIEWED_POLICY_SHA256, reviewOneTimeLegacyV3Effects,
+	reviewPrivateCampaignRestartEffects } from
 	"../src/runner/private-campaign-restart-policy.ts";
 
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -165,6 +166,139 @@ function lengthSettledFixture() {
 			digest === priorEnvelope);
 	return { ...f, thirdReceipt, thirdClaim, thirdBinding, archive };
 }
+
+function oneTimeLegacyV3Fixture() {
+	const f = lengthSettledFixture();
+	f.checkpoint.boundedRuns.splice(-1, 0, { runId: "synthetic-prior-goal",
+		outcome: "partial", unresolvedOperationIds: [] });
+	(f.thirdReceipt.quarantine as typeof f.thirdReceipt.quarantine & {
+		historicalGoalOutcomes?: Array<{ runId: string; outcome: string }> }).historicalGoalOutcomes =
+		f.checkpoint.boundedRuns.slice(0, -1).map(row => ({ runId: row.runId, outcome: row.outcome }));
+	f.thirdBinding.quarantineReceiptSha256 = hash(JSON.stringify(f.thirdReceipt));
+	const sealedReservations = JSON.parse(f.bundle["independent-restart-quarantine.json"]);
+	sealedReservations.entries[2].receipt = f.thirdReceipt;
+	f.bundle["independent-restart-quarantine.json"] = JSON.stringify(sealedReservations);
+	const sealedBindings = JSON.parse(f.bundle["independent-restart-goal-binding.json"]);
+	sealedBindings.entries[2] = f.thirdBinding;
+	f.bundle["independent-restart-goal-binding.json"] = JSON.stringify(sealedBindings);
+	const origin = { source: { ...f.facts.source, runNumber: 4 }, envelopeSha256: f.facts.envelopeSha256,
+		historicalCommittedNano: f.facts.committedNano,
+		historicalUnknownHeldNano: f.facts.unknownHeldNano };
+	const immediateZeroActivitySource = { source: { runId: "37485015330", runAttempt: 1,
+		runNumber: 5, commit: "1ca70ade2e2a7aa4d2655aca93ba806161e012b7" },
+		envelopeSha256: hash("synthetic-zero-control-carry") };
+	f.facts.source = { runId: "37490692145", runAttempt: 1,
+		commit: "f9d29bfd58449dba072c80f62a7db524f0a668c4" };
+	const newGoal = { runId: "synthetic-unselected-goal", outcome: "active",
+		acceptedTaskIds: [] as string[], unresolvedOperationIds: [] as string[] };
+	const fourthReceipt = { version: 1, kind: "host-independent-goal-quarantine",
+		prior: { source: { ...immediateZeroActivitySource.source },
+			envelopeSha256: immediateZeroActivitySource.envelopeSha256,
+			contractId: "original-contract",
+			reviewedPolicyId: "mul-pis-v3-no-model-activity-carry-forward-v1",
+			reviewedPolicySha256: hash("synthetic-reviewed-zero-policy"),
+			unknownHeldNano: origin.historicalUnknownHeldNano,
+			committedNano: origin.historicalCommittedNano },
+		quarantine: { operationRefs: [oldRef, newRef], operationOutcome: "unknown",
+			selectedFromFailedAttempt: false,
+			historicalGoalOutcomes: f.checkpoint.boundedRuns.map(row => ({ runId: row.runId,
+				outcome: row.outcome })) },
+		freshWorkspace: { workspaceId: "synthetic-final-workspace", restartNonce: "synthetic-final-nonce" } };
+	const fourthClaim = { claimId: "synthetic-final-claim", currentJobId: "synthetic-final-job",
+		priorEnvelopeSha256: fourthReceipt.prior.envelopeSha256,
+		currentRunId: f.facts.source.runId, currentRunAttempt: f.facts.source.runAttempt,
+		currentCommit: f.facts.source.commit };
+	const fourthBinding = { version: 1, kind: "host-independent-goal-binding",
+		quarantineReceiptSha256: hash(JSON.stringify(fourthReceipt)),
+		freshWorkspace: { ...fourthReceipt.freshWorkspace }, goalRunId: newGoal.runId };
+	sealedReservations.entries.push({ receipt: fourthReceipt, claim: fourthClaim });
+	sealedBindings.entries.push(fourthBinding);
+	f.bundle["independent-restart-quarantine.json"] = JSON.stringify(sealedReservations);
+	f.bundle["independent-restart-goal-binding.json"] = JSON.stringify(sealedBindings);
+	const previousBindsAncestor = f.input.bindsAncestor;
+	f.input.bindsAncestor = (proof, source, envelope) => previousBindsAncestor(proof, source, envelope) ||
+		(proof === f.input.proof && source.runId === immediateZeroActivitySource.source.runId &&
+			source.runAttempt === immediateZeroActivitySource.source.runAttempt &&
+			source.commit === immediateZeroActivitySource.source.commit &&
+			envelope === immediateZeroActivitySource.envelopeSha256);
+	f.checkpoint.boundedRuns.push(newGoal);
+	const checkpoint = { ...f.checkpoint, objectiveOutcome: "incomplete", boundedRuns: f.checkpoint.boundedRuns };
+	f.bundle["objective-checkpoint.json"] = JSON.stringify(checkpoint);
+	const history = JSON.parse(f.bundle["research-history.json"]);
+	for (const [taskId, operationIds] of [["T001", ["O001", "O002", "O003", "O004"]],
+		["T002", ["O005", "O006", "O007"]]] as const) {
+		history.entries.push({ originalContractId: "original-contract", goalRunId: newGoal.runId,
+			taskId, files: { "workflow-archive.json": JSON.stringify({ version: 1,
+				kind: "m07-private-candidate-archive", goalRunId: newGoal.runId, taskId,
+				goalOutcome: "active", taskStatus: "rejected", m04: { state: "not-run" },
+				controllerEvidence: { reviewStatus: "rejected",
+					operationOutcomes: operationIds.map(operationId => ({ operationId,
+						status: "response-received" })) } }) } });
+	}
+	f.bundle["research-history.json"] = JSON.stringify(history);
+	f.bundle["workflow-archive.json"] = JSON.stringify({ goalRunId: "earlier-goal",
+		controllerEvidence: { reviewStatus: "accepted" } });
+	const review = { origin, immediateZeroActivitySource,
+		reviewedSourceCommit: "00d4309390bb06536abbe5e86f97213298e901a0" as const,
+		settledAddedNano: 130_000_000, unknownObservedAddedNano: 0, unpricedAddedCount: 0,
+		requestAudit: { version: 3 as const, kind: "accounting-only-request-audit" as const,
+			requests: Array.from({ length: 130 }, (_, index) => ({ requestId: `synthetic-${index}`,
+				inputPayloadBytes: 40, status: "settled" as const, settledCny: 0.001,
+				unknownObservedCny: null, reportedUsage: null })),
+			settledCny: 0.13, unknownObservedCny: 0, unpricedRequestCount: 0 } };
+	const reservations = JSON.parse(f.bundle["independent-restart-quarantine.json"]).entries;
+	const bindings = JSON.parse(f.bundle["independent-restart-goal-binding.json"]).entries;
+	return { ...f, origin, newGoal, checkpoint, history, review, reservations, bindings,
+		check: () => reviewOneTimeLegacyV3Effects(f.input, review, checkpoint,
+			reservations, bindings) };
+}
+
+test("one-time reviewed v3 source preserves old quarantine and rejects two new tasks", () => {
+	const f = oneTimeLegacyV3Fixture();
+	const result = f.check();
+	assert.equal(result.sourceCommit, f.facts.source.commit);
+	assert.equal(result.policyId, "mul-pis-reviewed-run-37490692145-one-time-v1");
+	assert.deepEqual(result.operationAttestations.map(row => row.operationRef), [oldRef, newRef]);
+	assert.equal(result.unknownBillingHeld, true);
+	assert.equal(result.actorThirdPartyMutations, "none");
+});
+
+test("one-time reviewed v3 rejects a changed source, account census, old goal, or new adoption", () => {
+	const changedSource = oneTimeLegacyV3Fixture();
+	changedSource.facts.source.commit = "a".repeat(40);
+	assert.throws(changedSource.check, /source, inherited commitments/);
+	const changedAudit = oneTimeLegacyV3Fixture();
+	changedAudit.review.requestAudit.requests[0].status = "unknown" as "settled";
+	assert.throws(changedAudit.check, /settled request census/);
+	const missingRequest = oneTimeLegacyV3Fixture();
+	missingRequest.review.requestAudit.requests.pop();
+	assert.throws(missingRequest.check, /settled request census/);
+	const oldGoal = oneTimeLegacyV3Fixture();
+	oldGoal.checkpoint.boundedRuns[0].outcome = "fulfilled";
+	assert.throws(oldGoal.check, /historical goals/);
+	const selected = oneTimeLegacyV3Fixture();
+	(selected.newGoal as typeof selected.newGoal & { selectedTaskId?: string }).selectedTaskId = "T001";
+	assert.throws(selected.check, /selected, accepted, or unresolved/);
+	const unresolved = oneTimeLegacyV3Fixture();
+	unresolved.newGoal.unresolvedOperationIds.push("O008");
+	assert.throws(unresolved.check, /selected, accepted, or unresolved/);
+	const accepted = oneTimeLegacyV3Fixture();
+	accepted.history.entries.at(-1).files["workflow-archive.json"] = JSON.stringify({ version: 1,
+		kind: "m07-private-candidate-archive", goalRunId: accepted.newGoal.runId, taskId: "T002",
+		goalOutcome: "active", taskStatus: "accepted", m04: { state: "completed" },
+		controllerEvidence: { reviewStatus: "accepted", operationOutcomes: ["O005", "O006", "O007"]
+			.map(operationId => ({ operationId, status: "response-received" })) } });
+	accepted.bundle["research-history.json"] = JSON.stringify(accepted.history);
+	assert.throws(accepted.check, /rejected, response-received, unadopted/);
+});
+
+test("unbranded host-effect JSON does not authorize an unknown restart source", () => {
+	const f = lengthSettledFixture();
+	f.facts.source.commit = "b".repeat(40);
+	f.bundle["host-effect-receipt.json"] = JSON.stringify({ version: 1,
+		kind: "m07-host-effect-census", source: f.facts.source });
+	assert.throws(() => reviewPrivateCampaignRestartEffects(f.input), /outside reviewed scope/);
+});
 
 test("reviewed current source plus ancestor-bound quarantine cover exactly old and new unknowns", () => {
 	const f = fixture();

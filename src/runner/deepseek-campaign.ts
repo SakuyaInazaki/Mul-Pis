@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { HarnessError } from "../types.ts";
 import type { SessionSpec, UsageEvent } from "./types.ts";
 import { getConfinedCampaignFileGrantDescriptor } from "./confined-campaign-files.ts";
@@ -66,18 +67,25 @@ interface LeaseState {
 
 interface RequestState {
 	readonly id: string;
+	readonly sessionId: string;
 	readonly inputPayloadBytes: number;
 	readonly maxOutputTokens: number;
 	readonly worstCny: number;
 	readonly rates: { input: number; cacheRead: number; output: number };
 	/** Whether the native CNY rate was verified when this transport was admitted. */
 	readonly nativeCnyVerified?: boolean;
+	responseReceived: boolean;
 	status: "reserved" | "settled" | "unknown";
 	settledCny?: number;
 	unknownHeldCny?: number;
 	reportedUsage?: { input: number; output: number; cacheRead: number; cacheWrite: number;
 		totalTokens: number; reportedUsdCost: number | null; costStatus: string | null };
 	reportFingerprint?: string;
+}
+
+/** Opaque join key for private host effect receipts; never expose the Pi session ID. */
+export function campaignSessionEffectId(sessionId: string): string {
+	return createHash("sha256").update(`mul-pis-private-session-effect-v1\0${sessionId}`).digest("hex");
 }
 
 /** Host-only accounting evidence. Encrypt before persistence; never log or expose to a model. */
@@ -250,7 +258,8 @@ export class DeepSeekCampaignBudget {
 		this.grossReservedCny += worstCny;
 		this.inFlightReservedCny += worstCny;
 		this.requestIds.add(providerRequestId);
-		const request = { id: providerRequestId, inputPayloadBytes: payloadBytes, maxOutputTokens, worstCny,
+		const request = { id: providerRequestId, sessionId: lease.sessionId, responseReceived: false,
+			inputPayloadBytes: payloadBytes, maxOutputTokens, worstCny,
 			nativeCnyVerified: priceFinite && this.nativePricingCurrent(),
 			rates: { ...this.rates }, status: "reserved" as const };
 		state.requests.push(request);
@@ -272,7 +281,7 @@ export class DeepSeekCampaignBudget {
 		const state = this.leases.get(lease);
 		if (!effectScope || !state?.active || !state.terminalLengthRequestId || state.requests.length === 0 ||
 			state.requests.at(-1)?.id !== state.terminalLengthRequestId ||
-			state.requests.some((request) => request.status !== "settled")) return undefined;
+			state.requests.some((request) => !request.responseReceived)) return undefined;
 		return certifySettledTerminalResponse({ settledProviderRequestCount: state.requests.length,
 			responseReceived: true, terminalStopReason: "length", taskComplete: false, effectScope },
 			"provider length response received and settled; research task remains incomplete");
@@ -309,12 +318,14 @@ export class DeepSeekCampaignBudget {
 		const usage = event.usage;
 		if (request.status === "unknown") {
 			if (request.reportFingerprint === fingerprint) return;
+			request.responseReceived = false;
 			this.markUnknown(request, true);
 			this.stop("usage-reconciliation");
 			throw new HarnessError("runner.campaign", "provider usage conflicts with an earlier settlement");
 		}
 		if (request.status === "settled") {
 			if (request.reportFingerprint === fingerprint) return;
+			request.responseReceived = false;
 			this.markUnknown(request, true);
 			this.stop("usage-reconciliation");
 			throw new HarnessError("runner.campaign", "provider usage conflicts with an earlier settlement");
@@ -350,6 +361,7 @@ export class DeepSeekCampaignBudget {
 		}
 		// An unverifiable currency is an unknown fee observation, never a
 		// zero-cost charge and never a reason to refuse later work.
+		request.responseReceived = event.status === "reported";
 		if (!request.nativeCnyVerified || event.status !== "reported" || !Number.isFinite(charge)) {
 			this.markUnknown(request, false, 0);
 		} else {
@@ -366,7 +378,7 @@ export class DeepSeekCampaignBudget {
 		this.settleReported(lease, requestId, event);
 		const state = this.leases.get(lease);
 		if (state?.active && state.requests.at(-1)?.id === requestId &&
-			state.requests.every((request) => request.status === "settled")) {
+			state.requests.every((request) => request.responseReceived)) {
 			state.terminalLengthRequestId = requestId;
 		}
 	}
@@ -473,14 +485,17 @@ export class DeepSeekCampaignBudget {
 	/** New-run observations. Null CNY means currency/pricing could not be verified. */
 	requestAccountingAuditSnapshot(): {
 		version: 3; kind: "accounting-only-request-audit";
-		requests: Array<{ requestId: string; inputPayloadBytes: number; maxOutputTokens: number;
+		requests: Array<{ requestId: string; sessionId: string; responseReceived: boolean;
+			inputPayloadBytes: number; maxOutputTokens: number;
 			status: "settled" | "unknown" | "in-flight"; settledCny: number | null;
 			unknownObservedCny: number | null; reportedUsage: NonNullable<RequestState["reportedUsage"]> | null }>;
 		settledCny: number; unknownObservedCny: number; unpricedRequestCount: number;
 		pricingProfile?: NativeCnyPricingProfile;
 	} {
 		const requests = this.auditRequests.map((request) => ({
-			requestId: request.id, inputPayloadBytes: request.inputPayloadBytes,
+			requestId: request.id, sessionId: campaignSessionEffectId(request.sessionId),
+			responseReceived: request.responseReceived,
+			inputPayloadBytes: request.inputPayloadBytes,
 			maxOutputTokens: request.maxOutputTokens,
 			status: request.status === "reserved" ? "in-flight" as const : request.status,
 			settledCny: request.nativeCnyVerified && request.status === "settled" ? request.settledCny ?? null : null,

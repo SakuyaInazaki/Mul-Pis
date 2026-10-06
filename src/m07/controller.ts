@@ -11,7 +11,7 @@ import { HarnessError } from "../types.ts";
 import { nowIso, readTextIfExists, writeFileAtomic } from "../workspace.ts";
 import { isTextFile, mediaType } from "../media.ts";
 import { sessionSpec, type StageContext } from "../stages/context.ts";
-import { isSafeRelativeOutputPath, resolveExpectedOutputFiles } from "./expected-output.ts";
+import { isSafeRelativeOutputPath, resolveExpectedOutputFiles, type ExpectedOutputResolution } from "./expected-output.ts";
 import type { BeginGoalInput, CurrentGoal, DecisionInput, EvidenceFile, FinishInput, HostStopReasonKind, HostStopReceipt, InterruptInput, M07CheckpointRecord, M07Controller, M07TaskRecord, TaskCheck, TaskReviewInput, TaskSpecInput, M07OperationV1 } from "./types.ts";
 import { localNotIssuedDetails, settledLocalAdmissionStopDetails,
 	settledTerminalResponseDetails } from "../runner/operation-disposition.ts";
@@ -82,6 +82,37 @@ function sameSupersededObligation(next: TaskSpecInput, previous: M07TaskRecord):
 
 function inside(root: string, candidate: string): boolean {
 	return candidate === root || candidate.startsWith(`${root}${path.sep}`);
+}
+
+/** The same file-bound gate is used before a loop accepts ready and during final review. */
+async function validateCandidateFiles(workDir: string, expectedPaths: string[], lessonDeltaOutput?: string): Promise<{
+	expectedOutputs: ExpectedOutputResolution[];
+	lessonEvidence: string[];
+	lessonDeltaFailure?: string;
+}> {
+	const expectedOutputs = await resolveExpectedOutputFiles(workDir, expectedPaths);
+	if (!lessonDeltaOutput) return { expectedOutputs, lessonEvidence: [] };
+	try {
+		const root = await realpath(workDir);
+		const deltaSource = await realpath(path.join(workDir, lessonDeltaOutput));
+		if (!inside(root, deltaSource)) throw new Error("candidate delta escaped task work directory");
+		const bytes = await readFile(deltaSource);
+		if (bytes.length > 16_000) throw new Error("candidate lesson-delta.json file exceeds 16,000 bytes");
+		const delta = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
+		if (delta.version !== 1 || !["none", "propose", "amend", "contradict"].includes(String(delta.action)) || !Array.isArray(delta.evidencePaths) || delta.evidencePaths.length > 20 || delta.evidencePaths.some((item) => typeof item !== "string" || !isSafeRelativeOutputPath(item))) throw new Error("candidate delta has invalid schema");
+		if (delta.action !== "none" && (typeof delta.observation !== "string" || !delta.observation.trim() || typeof delta.applicability !== "string" || !delta.applicability.trim() || delta.evidencePaths.length === 0)) throw new Error("candidate delta lacks observation, applicability, or evidence");
+		if ((delta.action === "amend" || delta.action === "contradict") && (!delta.priorRef || typeof delta.priorRef !== "object" || typeof (delta.priorRef as Record<string, unknown>).storeId !== "string" || typeof (delta.priorRef as Record<string, unknown>).recordId !== "string" || !Number.isInteger((delta.priorRef as Record<string, unknown>).version))) throw new Error("candidate delta revision lacks a pinned priorRef");
+		const lessonEvidence: string[] = [];
+		for (const item of delta.evidencePaths as string[]) {
+			const evidence = await realpath(path.join(workDir, item));
+			if (!inside(root, evidence)) throw new Error(`candidate delta evidence escaped task work directory: ${item}`);
+			if (!(await stat(evidence)).isFile()) throw new Error(`candidate delta evidence is not a file: ${item}`);
+			lessonEvidence.push(evidence);
+		}
+		return { expectedOutputs, lessonEvidence };
+	} catch (error) {
+		return { expectedOutputs, lessonEvidence: [], lessonDeltaFailure: `Candidate lesson delta is invalid or missing: ${(error as Error).message}` };
+	}
 }
 
 async function snapshotRoundForReviewer(workDir: string, destination: string): Promise<number> {
@@ -1061,8 +1092,17 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 						let verdict;
 						try { verdict = parseRoundReview(rawReview); }
 						catch { task.loopStopReason = "reviewer-invalid"; transcript.push(`## Round ${index} reviewer\n\nInvalid structured verdict; see ${path.basename(reviewerReportPath)}.`); break; }
+						let fileCheckFailure: string | undefined;
+						if (verdict.verdict === "ready") {
+							const candidate = await validateCandidateFiles(reviewerRoot, spec.expectedOutputs.map((item) => path.join(reviewerRoot, item)), spec.lessonDeltaOutput);
+							const fileFailures = [...candidate.expectedOutputs.flatMap((item) => item.error ? [item.error] : []), ...(candidate.lessonDeltaFailure ? [candidate.lessonDeltaFailure] : [])];
+							if (fileFailures.length) {
+								fileCheckFailure = fileFailures.join("; ");
+								verdict = { verdict: "revise" as const, feedback: `Reviewer reported ready, but the controller's final-review file checks failed: ${fileCheckFailure}. Repair the same candidate and let a fresh reviewer inspect it.` };
+							}
+						}
 						round.verdict = verdict.verdict; round.feedback = verdict.feedback;
-						transcript.push(`## Round ${index} reviewer\n\n${rawReview}`);
+						transcript.push(`## Round ${index} reviewer\n\n${rawReview}${fileCheckFailure ? `\n\nController file-bound check changed this ready verdict to revise: ${fileCheckFailure}` : ""}`);
 						await save(ctx, goal);
 						if (verdict.verdict === "ready" || verdict.verdict === "replan" || verdict.verdict === "blocked") { task.loopStopReason = verdict.verdict; break; }
 						nextMessage = `Continue only the same frozen task and plan. Fresh reviewer feedback from round ${index}: ${verdict.feedback}\nDo a bounded local repair, report concrete changes and verification. Do not expand scope or silently restart an external action whose outcome is unknown.`;
@@ -1212,7 +1252,8 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				const type = mediaType(source);
 				artifacts.push({ path: await freeze(source), sourcePath: source, mediaType: type, readCoverage: type === "text" ? "recorded-not-reviewed" : "unread-binary" });
 			};
-			const expectedOutputs = await resolveExpectedOutputFiles(task.workDir, task.expectedOutputPaths);
+			const candidateFiles = await validateCandidateFiles(task.workDir, task.expectedOutputPaths, task.lessonDeltaOutput);
+			const expectedOutputs = candidateFiles.expectedOutputs;
 			for (const expected of expectedOutputs) {
 				if (expected.error) { failures.push(expected.error); continue; }
 				for (const file of expected.files) await addExpectedArtifact(file);
@@ -1231,23 +1272,8 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 					}
 				}
 			}
-			if (task.lessonDeltaOutput) {
-				try {
-					const deltaSource = await realpath(path.join(task.workDir, task.lessonDeltaOutput));
-					if (!inside(await realpath(task.workDir), deltaSource)) throw new Error("candidate delta escaped task work directory");
-					const bytes = await readFile(deltaSource);
-							if (bytes.length > 16_000) throw new Error("candidate lesson-delta.json file exceeds 16,000 bytes");
-					const delta = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
-					if (delta.version !== 1 || !["none", "propose", "amend", "contradict"].includes(String(delta.action)) || !Array.isArray(delta.evidencePaths) || delta.evidencePaths.length > 20 || delta.evidencePaths.some((item) => typeof item !== "string" || !isSafeRelativeOutputPath(item))) throw new Error("candidate delta has invalid schema");
-					if (delta.action !== "none" && (typeof delta.observation !== "string" || !delta.observation.trim() || typeof delta.applicability !== "string" || !delta.applicability.trim() || delta.evidencePaths.length === 0)) throw new Error("candidate delta lacks observation, applicability, or evidence");
-					if ((delta.action === "amend" || delta.action === "contradict") && (!delta.priorRef || typeof delta.priorRef !== "object" || typeof (delta.priorRef as Record<string, unknown>).storeId !== "string" || typeof (delta.priorRef as Record<string, unknown>).recordId !== "string" || !Number.isInteger((delta.priorRef as Record<string, unknown>).version))) throw new Error("candidate delta revision lacks a pinned priorRef");
-					for (const item of delta.evidencePaths as string[]) {
-						const evidence = await realpath(path.join(task.workDir, item));
-						if (!inside(await realpath(task.workDir), evidence)) throw new Error(`candidate delta evidence escaped task work directory: ${item}`);
-						await addExpectedArtifact(evidence);
-					}
-				} catch (error) { failures.push(`Candidate lesson delta is invalid or missing: ${(error as Error).message}`); }
-			}
+			if (candidateFiles.lessonDeltaFailure) failures.push(candidateFiles.lessonDeltaFailure);
+			for (const evidence of candidateFiles.lessonEvidence) await addExpectedArtifact(evidence);
 			if (task.executionLoop && task.loopStopReason !== "ready") failures.push(`Bounded execution stopped without a ready handoff: ${task.loopStopReason ?? "unknown"}`);
 			const accepted = checks.every((c) => c.result === "passed") && !failures.length && !unexecuted.length;
 			task.status = accepted ? "accepted" : "rejected"; task.review = { at: nowIso(), frozenReportPath, checks, artifacts, failures, unexecuted, limitations, independentCheck: input.independentCheck };

@@ -19,6 +19,9 @@ const NANO = 1_000_000_000;
 const BRANCH = "improve/workflow-learning-reliability";
 const REQUEST_BRANCH = "run-requests/workflow-learning-reliability";
 const WORKFLOW = "manual-private-campaign.yml";
+const ONE_TIME_LEGACY_V3_RUN = "37490692145";
+const ONE_TIME_LEGACY_V3_REQUEST = "f9d29bfd58449dba072c80f62a7db524f0a668c4";
+const ONE_TIME_LEGACY_V3_SOURCE = "00d4309390bb06536abbe5e86f97213298e901a0";
 export const REUSABLE_RUN_REQUEST_MESSAGE = "Run confidential workflow";
 export type { PrivateContinuationBundle, BootstrapBinding } from "./signed-mission-ledger.ts";
 export type CurrentMissionRun = {
@@ -124,6 +127,8 @@ export type AccountingOnlyRequestAuditSnapshot = {
 	version: 3; kind: "accounting-only-request-audit";
 	requests: Array<{
 		requestId: string; inputPayloadBytes: number; maxOutputTokens?: number;
+		/** New receipts separate received transport from possibly unknown billing. */
+		sessionId?: string; responseReceived?: boolean;
 		status: "settled" | "unknown" | "in-flight";
 		settledCny: number | null; unknownObservedCny: number | null;
 		/** Unknown/unpriced rows retain raw, possibly incomplete SDK observation. */
@@ -134,6 +139,51 @@ export type AccountingOnlyRequestAuditSnapshot = {
 	/** Structural evidence of the verified native-CNY basis, never a live price authorization. */
 	pricingProfile?: NativeCnyPricingProfile;
 };
+/** Host-created complete census. It is authority only while bound to a live carry proof. */
+export type HostEffectReceiptV1 = {
+	version: 1; kind: "m07-host-effect-census";
+	source: { runId: string; runAttempt: number; commit: string };
+	priorEnvelopeSha256: string; historicalGoalRunIds: string[];
+	goals: Array<{ runId: string; outcome: string;
+		tasks: Array<{ taskId: string; mode: "execute" | "check"; status: string; sessionId: string }>;
+		operations: Array<{ id: string; taskId: string; status: string }> }>;
+	sessions: Array<{ sessionId: string; kind: "none" | "read-dir" | "confined-execution";
+		goalRunId?: string; taskId?: string; workRoot?: string;
+		grant?: { version: 1; kind: "confined-campaign-files"; root: string; writableFiles: string[] } }>;
+	requestIds: string[];
+};
+export type AuthenticatedHostEffectEvidence = Readonly<{
+	origin: AuthenticatedCarryForwardOrigin;
+	receipt: Readonly<HostEffectReceiptV1>;
+	requestAudit: Readonly<AccountingOnlyRequestAuditSnapshot>;
+	reviewedEffectAncestry: ReadonlyArray<ReviewedEffectAncestorReceipt>;
+}>;
+const authenticatedHostEffects = new WeakMap<object, AuthenticatedHostEffectEvidence>();
+/** A copied receipt or proof cannot mint this authority. */
+export function authenticatedHostEffectEvidence(proof: unknown,
+	bundle: unknown): AuthenticatedHostEffectEvidence | undefined {
+	if (!isAuthenticatedPriorCarryProof(proof) || proof.version !== 2 ||
+		!authenticatedPriorCarryBindsBundle(proof, bundle)) return undefined;
+	return authenticatedHostEffects.get(proof);
+}
+/** Exact, non-reusable host review of one pre-census v3 Actions run. This is
+ * minted only by the live verifier after the GitHub request commit's first
+ * parent and tree have been checked. It does not validate research output. */
+export type AuthenticatedLegacyV3RunReview = Readonly<{
+	origin: AuthenticatedCarryForwardOrigin;
+	/** The immediately preceding v3 carry is authenticated and has no provider activity. */
+	immediateZeroActivitySource: Readonly<{ source: Readonly<Source>; envelopeSha256: string }>;
+	reviewedSourceCommit: "00d4309390bb06536abbe5e86f97213298e901a0";
+	requestAudit: Readonly<AccountingOnlyRequestAuditSnapshot>;
+	settledAddedNano: number; unknownObservedAddedNano: number; unpricedAddedCount: number;
+}>;
+const authenticatedLegacyV3RunReviews = new WeakMap<object, AuthenticatedLegacyV3RunReview>();
+export function authenticatedLegacyV3RunReview(proof: unknown,
+	bundle: unknown): AuthenticatedLegacyV3RunReview | undefined {
+	if (!isAuthenticatedPriorCarryProof(proof) || proof.version !== 2 ||
+		!authenticatedPriorCarryBindsBundle(proof, bundle)) return undefined;
+	return authenticatedLegacyV3RunReviews.get(proof);
+}
 export type LegacyCarrySealInput = { settledCny: number; unknownOrInFlightCny: number;
 	requestAudit: RequestAuditSnapshot; privateBundle?: PrivateContinuationBundle;
 	bootstrapBinding?: BootstrapBinding };
@@ -168,10 +218,19 @@ type AccountingCheckpoint = {
 	settledAddedNano: number; unknownObservedAddedNano: number; unpricedAddedCount: number;
 	requestAudit: AccountingOnlyRequestAuditSnapshot;
 	legacyAncestry: AncestorReceipt[]; ancestry: AccountingAncestorReceipt[];
+	/** Previously reviewed nonzero v3 runs, in accounting-source order. */
+	reviewedEffectAncestry?: ReviewedEffectAncestorReceipt[];
 	historical: { committedNano: number; unknownHeldNano: number; legacyParentDigest: string };
 	carryForwardOrigin?: StoredCarryForwardOrigin;
 	bootstrapBinding?: BootstrapBinding; privateBundle?: PrivateContinuationBundle;
 };
+export type ReviewedEffectAncestorReceipt = Readonly<{
+	source: Readonly<Source>; envelopeSha256: string; privateBundleSha256: string;
+	reviewedPolicySha256: string; selectedTupleSha256: string;
+	historicalOriginEnvelopeSha256: string;
+	/** The next run claimed this source but ended before a fresh M07 goal existed. */
+	abandonedWithoutGoal?: true;
+}>;
 type AccountingAncestorReceipt = Pick<AccountingCheckpoint, "parentDigest" | "source" |
 	"settledNano" | "unknownObservedNano" | "unpricedRequestCount" | "settledAddedNano" |
 	"unknownObservedAddedNano" | "unpricedAddedCount" | "requestAudit" | "bootstrapBinding"> &
@@ -346,9 +405,14 @@ function validAccountingAudit(value: unknown, settledNano: number, unknownNano: 
 	for (const item of audit.requests) {
 		if (!record(item) || !exactKeys(item, ["requestId", "inputPayloadBytes",
 			"status", "settledCny", "unknownObservedCny", "reportedUsage",
-			...(item.maxOutputTokens === undefined ? [] : ["maxOutputTokens"])]) ||
+			...(item.maxOutputTokens === undefined ? [] : ["maxOutputTokens"]),
+			...(item.sessionId === undefined ? [] : ["sessionId"]),
+			...(item.responseReceived === undefined ? [] : ["responseReceived"])]) ||
 			typeof item.requestId !== "string" || !item.requestId ||
 			item.requestId.length > 128 || ids.has(item.requestId) ||
+			(item.sessionId !== undefined && (typeof item.sessionId !== "string" ||
+				!/^[0-9a-f]{64}$/.test(item.sessionId))) ||
+			(item.responseReceived !== undefined && typeof item.responseReceived !== "boolean") ||
 			!Number.isSafeInteger(item.inputPayloadBytes) || item.inputPayloadBytes <= 0 ||
 			(item.maxOutputTokens !== undefined &&
 				(!Number.isSafeInteger(item.maxOutputTokens) || item.maxOutputTokens < 1)) ||
@@ -480,6 +544,7 @@ function readCheckpoint(envelopeB64: string, key: Buffer, seedDigest: string, ex
 			"settledNano", "unknownObservedNano", "unpricedRequestCount", "settledAddedNano",
 			"unknownObservedAddedNano", "unpricedAddedCount", "requestAudit", "ancestry",
 			"legacyAncestry", "historical",
+			...(parsed.reviewedEffectAncestry === undefined ? [] : ["reviewedEffectAncestry"]),
 			...(parsed.carryForwardOrigin === undefined ? [] : ["carryForwardOrigin"]),
 			...(parsed.privateBundle === undefined ? [] : ["privateBundle"]),
 			...(parsed.bootstrapBinding === undefined ? [] : ["bootstrapBinding"])] :
@@ -494,7 +559,8 @@ function readCheckpoint(envelopeB64: string, key: Buffer, seedDigest: string, ex
 		cp.missionId !== MISSION_ID || cp.repository !== MISSION_REPOSITORY || cp.seedDigest !== seedDigest ||
 		cp.parentDigest !== parentDigest ||
 		(cp.version !== 1 && !Array.isArray(cp.ancestry)) ||
-		(cp.version === 3 && (!Array.isArray(cp.legacyAncestry) || !record(cp.historical))) ||
+		(cp.version === 3 && (!Array.isArray(cp.legacyAncestry) || !record(cp.historical) ||
+			(cp.reviewedEffectAncestry !== undefined && !Array.isArray(cp.reviewedEffectAncestry)))) ||
 		(cp.version === 3 && cp.carryForwardOrigin !== undefined &&
 			(!record(cp.carryForwardOrigin) || !exactKeys(cp.carryForwardOrigin,
 				["source", "envelopeSha256", "historicalCommittedNano", "historicalUnknownHeldNano",
@@ -538,14 +604,243 @@ function accountingAncestorReceipt(cp: AccountingCheckpoint, envelopeDigest: str
 		requestAudit: cp.requestAudit,
 		...(cp.bootstrapBinding ? { bootstrapBinding: cp.bootstrapBinding } : {}) };
 }
-function hasNoV3ProviderActivity(cp: Pick<AccountingCheckpoint, "settledNano" |
-	"unknownObservedNano" | "unpricedRequestCount" | "settledAddedNano" |
+function hasNoV3ProviderActivity(cp: Pick<AccountingCheckpoint, "settledAddedNano" |
 	"unknownObservedAddedNano" | "unpricedAddedCount" | "requestAudit">): boolean {
-	return cp.settledNano === 0 && cp.unknownObservedNano === 0 &&
-		cp.unpricedRequestCount === 0 && cp.settledAddedNano === 0 &&
+	return cp.settledAddedNano === 0 &&
 		cp.unknownObservedAddedNano === 0 && cp.unpricedAddedCount === 0 &&
 		cp.requestAudit.requests.length === 0 && cp.requestAudit.settledCny === 0 &&
 		cp.requestAudit.unknownObservedCny === 0 && cp.requestAudit.unpricedRequestCount === 0;
+}
+function reviewedEffectPrefixValid(cp: AccountingCheckpoint): boolean {
+	const accounting = [...cp.ancestry, accountingAncestorReceipt(cp, "0".repeat(64))];
+	const nonzero = cp.ancestry.map((row, index) => ({ row, index }))
+		.filter(({ row }) => !hasNoV3ProviderActivity(row));
+	const reviewed = cp.reviewedEffectAncestry ?? [];
+	if (reviewed.length > cp.ancestry.length ||
+		reviewed.some(item => !record(item) || !exactKeys(item, ["source", "envelopeSha256",
+			"privateBundleSha256", "reviewedPolicySha256", "selectedTupleSha256",
+			"historicalOriginEnvelopeSha256",
+			...(item.abandonedWithoutGoal === undefined ? [] : ["abandonedWithoutGoal"])]) ||
+			(item.abandonedWithoutGoal !== undefined && item.abandonedWithoutGoal !== true))) return false;
+	if (!reviewed.length) return true;
+	let chain: unknown;
+	try { chain = JSON.parse(cp.privateBundle?.["independent-restart-quarantine.json"] ?? ""); }
+	catch { return false; }
+	if (!record(chain) || chain.version !== 1 ||
+		chain.kind !== "host-independent-restart-reservations" || !Array.isArray(chain.entries)) return false;
+	let bindings: unknown;
+	try { bindings = JSON.parse(cp.privateBundle?.["independent-restart-goal-binding.json"] ?? ""); }
+	catch { return false; }
+	if (!record(bindings) || bindings.version !== 1 ||
+		bindings.kind !== "host-independent-restart-goal-bindings" ||
+		!Array.isArray(bindings.entries)) return false;
+	let lastIndex = -1;
+	for (const entry of reviewed) {
+		const index = cp.ancestry.findIndex(row =>
+			JSON.stringify(row.source) === JSON.stringify(entry.source) &&
+			row.envelopeDigest === entry.envelopeSha256);
+		if (index <= lastIndex) return false;
+		lastIndex = index;
+		const prior = cp.ancestry[index];
+		const next = accounting[index + 1].source;
+		if (!record(entry.source) || !exactKeys(entry.source, ["runId", "runAttempt", "runNumber", "commit"]) ||
+			JSON.stringify(entry.source) !== JSON.stringify(prior.source) ||
+			entry.envelopeSha256 !== prior.envelopeDigest ||
+			entry.historicalOriginEnvelopeSha256 !== cp.historical.legacyParentDigest ||
+			![entry.envelopeSha256, entry.privateBundleSha256, entry.reviewedPolicySha256,
+				entry.selectedTupleSha256, entry.historicalOriginEnvelopeSha256]
+				.every(value => typeof value === "string" && /^[0-9a-f]{64}$/.test(value))) return false;
+		const matches = chain.entries.filter(item => {
+			if (!record(item) || !record(item.receipt) || !record(item.claim) ||
+				!record(item.receipt.prior) || !record(item.receipt.prior.source) ||
+				!record(item.receipt.quarantine) || !record(item.receipt.freshWorkspace)) return false;
+			const receipt = item.receipt as Record<string, unknown>;
+			const workspace = receipt.freshWorkspace as Record<string, unknown>;
+			const p = receipt.prior as Record<string, unknown>, claim = item.claim;
+			const source = p.source as Record<string, unknown>;
+			const receiptDigest = digest(JSON.stringify(receipt));
+			const bindingMatches = (bindings.entries as unknown[]).filter((binding: unknown) => record(binding) &&
+				binding.version === 1 && binding.kind === "host-independent-goal-binding" &&
+				binding.quarantineReceiptSha256 === receiptDigest &&
+				record(binding.freshWorkspace) &&
+				binding.freshWorkspace.workspaceId === workspace.workspaceId &&
+				binding.freshWorkspace.restartNonce === workspace.restartNonce &&
+				typeof binding.goalRunId === "string" && binding.goalRunId.length > 0);
+			const quarantine = receipt.quarantine as Record<string, unknown>;
+			return receipt.version === 1 &&
+				receipt.kind === "host-independent-goal-quarantine" &&
+				quarantine.operationOutcome === "unknown" &&
+				quarantine.selectedFromFailedAttempt === false &&
+				bindingMatches.length === (entry.abandonedWithoutGoal ? 0 : 1) &&
+				typeof claim.claimId === "string" && claim.claimId.length > 0 &&
+				typeof claim.currentJobId === "string" && claim.currentJobId.length > 0 &&
+				source.runId === entry.source.runId &&
+				source.runAttempt === entry.source.runAttempt &&
+				source.commit === entry.source.commit &&
+				p.envelopeSha256 === entry.envelopeSha256 &&
+				p.privateBundleSha256 === entry.privateBundleSha256 &&
+				p.reviewedPolicySha256 === entry.reviewedPolicySha256 &&
+				p.selectedTupleSha256 === entry.selectedTupleSha256 &&
+				claim.priorEnvelopeSha256 === entry.envelopeSha256 &&
+				claim.currentRunId === next.runId &&
+				claim.currentRunAttempt === next.runAttempt &&
+				claim.currentCommit === next.commit;
+		});
+		if (matches.length !== 1) return false;
+	}
+	const reviewedNonzero = reviewed.filter(entry => nonzero.some(item =>
+		item.row.envelopeDigest === entry.envelopeSha256));
+	return reviewedNonzero.every((entry, index) =>
+		nonzero[index]?.row.envelopeDigest === entry.envelopeSha256);
+}
+function newlyReviewedPriorEffect(proof: AuthenticatedPriorCarryProof | undefined,
+	currentSource: Source, prior: AccountingAncestorReceipt | undefined,
+	bundle: PrivateContinuationBundle | undefined,
+	origin: AuthenticatedCarryForwardOrigin | undefined,
+	abandonedWithoutGoal = false): ReviewedEffectAncestorReceipt | undefined {
+	if (!proof || !isAuthenticatedPriorCarryProof(proof) || !proof.resultArtifact ||
+		!prior || !origin ||
+		!proof.privateBundleSha256 || !bundle?.["independent-restart-quarantine.json"] ||
+		JSON.stringify(proof.source) !== JSON.stringify(prior.source) ||
+		proof.envelopeSha256 !== prior.envelopeDigest) return undefined;
+	let chain: unknown;
+	try { chain = JSON.parse(bundle["independent-restart-quarantine.json"]); }
+	catch { return undefined; }
+	if (!record(chain) || chain.version !== 1 ||
+		chain.kind !== "host-independent-restart-reservations" || !Array.isArray(chain.entries)) return undefined;
+	const matches = chain.entries.filter(item => {
+		if (!record(item) || !record(item.receipt) || !record(item.receipt.prior) ||
+			!record(item.receipt.prior.source) || !record(item.claim)) return false;
+		const p = item.receipt.prior, claim = item.claim;
+		const source = p.source as Record<string, unknown>;
+		return source.runId === proof.source.runId &&
+			source.runAttempt === proof.source.runAttempt &&
+			source.commit === proof.source.commit &&
+			p.envelopeSha256 === proof.envelopeSha256 &&
+			p.privateBundleSha256 === proof.privateBundleSha256 &&
+			typeof p.reviewedPolicySha256 === "string" && /^[0-9a-f]{64}$/.test(p.reviewedPolicySha256) &&
+			typeof p.selectedTupleSha256 === "string" && /^[0-9a-f]{64}$/.test(p.selectedTupleSha256) &&
+			claim.priorEnvelopeSha256 === proof.envelopeSha256 &&
+			claim.currentRunId === currentSource.runId &&
+			claim.currentRunAttempt === currentSource.runAttempt &&
+			claim.currentCommit === currentSource.commit;
+	});
+	if (matches.length !== 1) return undefined;
+	const p = matches[0].receipt.prior;
+	return { source: { ...proof.source }, envelopeSha256: proof.envelopeSha256,
+		privateBundleSha256: proof.privateBundleSha256,
+		reviewedPolicySha256: p.reviewedPolicySha256,
+		selectedTupleSha256: p.selectedTupleSha256,
+		historicalOriginEnvelopeSha256: origin.envelopeSha256,
+		...(abandonedWithoutGoal ? { abandonedWithoutGoal: true as const } : {}) };
+}
+function distinctStrings(values: unknown, pattern: RegExp): values is string[] {
+	return Array.isArray(values) && values.every(value => typeof value === "string" &&
+		pattern.test(value)) && new Set(values).size === values.length;
+}
+function restartChainExtends(prior: string | undefined, current: string | undefined,
+	kind: string, added: number): boolean {
+	if (added !== 0 && added !== 1) return false;
+	if (!prior && !current) return added === 0;
+	let before: unknown, after: unknown;
+	try {
+		before = prior ? JSON.parse(prior) : { version: 1, kind, entries: [] };
+		after = current ? JSON.parse(current) : undefined;
+	} catch { return false; }
+	return record(before) && record(after) && before.version === 1 && after.version === 1 &&
+		before.kind === kind && after.kind === kind && Array.isArray(before.entries) &&
+		Array.isArray(after.entries) && after.entries.length === before.entries.length + added &&
+		before.entries.every((entry, index) => JSON.stringify(entry) ===
+			JSON.stringify((after.entries as unknown[])[index]));
+}
+function hostEffectReceipt(cp: AccountingCheckpoint,
+	previousBundle?: PrivateContinuationBundle): HostEffectReceiptV1 | undefined {
+	const raw = cp.privateBundle?.["host-effect-receipt.json"];
+	if (!raw || !cp.privateBundle?.["objective-checkpoint.json"] ||
+		cp.requestAudit.requests.some(row => row.responseReceived !== true ||
+			row.status === "in-flight" || !row.sessionId)) return undefined;
+	let receipt: unknown, checkpoint: unknown, priorCheckpoint: unknown;
+	try {
+		receipt = JSON.parse(raw); checkpoint = JSON.parse(cp.privateBundle["objective-checkpoint.json"]);
+		if (previousBundle?.["objective-checkpoint.json"])
+			priorCheckpoint = JSON.parse(previousBundle["objective-checkpoint.json"]);
+	} catch { return undefined; }
+	if (!record(receipt) || !exactKeys(receipt, ["version", "kind", "source", "priorEnvelopeSha256",
+		"historicalGoalRunIds", "goals", "sessions", "requestIds"]) ||
+		receipt.version !== 1 || receipt.kind !== "m07-host-effect-census" ||
+		!record(receipt.source) || !exactKeys(receipt.source, ["runId", "runAttempt", "commit"]) ||
+		receipt.source.runId !== cp.source.runId || receipt.source.runAttempt !== cp.source.runAttempt ||
+		receipt.source.commit !== cp.source.commit || receipt.priorEnvelopeSha256 !== cp.parentDigest ||
+		!record(checkpoint) || !Array.isArray(checkpoint.boundedRuns) ||
+		!distinctStrings(receipt.historicalGoalRunIds, /^[A-Za-z0-9._:-]{1,256}$/) ||
+		!Array.isArray(receipt.goals) || !Array.isArray(receipt.sessions) ||
+		!distinctStrings(receipt.requestIds, /^[A-Za-z0-9._:-]{1,128}$/)) return undefined;
+	if (cp.requestAudit.requests.length === 0 &&
+		(!hasNoV3ProviderActivity(cp) || receipt.goals.length !== 0 ||
+			receipt.sessions.some(session => session?.kind !== "none" && session?.kind !== "read-dir") ||
+			receipt.requestIds.length !== 0)) return undefined;
+	if (previousBundle && (!record(priorCheckpoint) || !Array.isArray(priorCheckpoint.boundedRuns) ||
+		JSON.stringify(receipt.historicalGoalRunIds) !==
+		JSON.stringify(priorCheckpoint.boundedRuns.map(row => row.runId)))) return undefined;
+	const auditIds = cp.requestAudit.requests.map(row => row.requestId);
+	if (receipt.requestIds.length !== auditIds.length ||
+		receipt.requestIds.some(id => !auditIds.includes(id))) return undefined;
+	const sessions = new Map<string, Record<string, unknown>>();
+	for (const session of receipt.sessions) {
+		if (!record(session) || typeof session.sessionId !== "string" ||
+			!/^[0-9a-f]{64}$/.test(session.sessionId) || sessions.has(session.sessionId)) return undefined;
+		if (session.kind === "none" || session.kind === "read-dir") {
+			if (!exactKeys(session, ["sessionId", "kind"])) return undefined;
+		} else if (session.kind === "confined-execution") {
+			if (!exactKeys(session, ["sessionId", "kind", "goalRunId", "taskId", "workRoot", "grant"]) ||
+				typeof session.goalRunId !== "string" || !session.goalRunId ||
+				typeof session.taskId !== "string" || !/^T\d{3,}$/.test(session.taskId) ||
+				typeof session.workRoot !== "string" || !session.workRoot.startsWith("/") ||
+				!record(session.grant) || !exactKeys(session.grant, ["version", "kind", "root", "writableFiles"]) ||
+				session.grant.version !== 1 || session.grant.kind !== "confined-campaign-files" ||
+				session.grant.root !== session.workRoot ||
+				!Array.isArray(session.grant.writableFiles) ||
+				!["candidate.cpp|lesson-delta.json", "candidate.cpp|experiment-plan.json|lesson-delta.json"]
+					.includes([...session.grant.writableFiles].sort().join("|"))) return undefined;
+		} else return undefined;
+		sessions.set(session.sessionId, session);
+	}
+	if (cp.requestAudit.requests.some(row => !sessions.has(row.sessionId!))) return undefined;
+	const historicalGoalRunIds = receipt.historicalGoalRunIds as string[];
+	const expectedGoals = checkpoint.boundedRuns.filter(row =>
+		!historicalGoalRunIds.includes(row.runId));
+	if (receipt.goals.length !== expectedGoals.length || new Set(receipt.goals.map(goal => goal?.runId)).size !== receipt.goals.length ||
+		receipt.goals.some(goal => !record(goal) || !exactKeys(goal, ["runId", "outcome", "tasks", "operations"]) ||
+			!expectedGoals.some(row => row.runId === goal.runId && row.outcome === goal.outcome) ||
+			!Array.isArray(goal.tasks) || !Array.isArray(goal.operations))) return undefined;
+	const usedSessions = new Set<string>();
+	for (const goal of receipt.goals as HostEffectReceiptV1["goals"]) {
+		const taskIds = new Set<string>(), operationIds = new Set<string>();
+		for (const task of goal.tasks) {
+			if (!record(task) || !exactKeys(task, ["taskId", "mode", "status", "sessionId"]) ||
+				!/^T\d{3,}$/.test(task.taskId) || taskIds.has(task.taskId) ||
+				!["execute", "check"].includes(task.mode) ||
+				!["returned", "failed", "accepted", "rejected"].includes(task.status) ||
+				typeof task.sessionId !== "string" || !sessions.has(task.sessionId) ||
+				usedSessions.has(task.sessionId)) return undefined;
+			taskIds.add(task.taskId); usedSessions.add(task.sessionId);
+			const session = sessions.get(task.sessionId)!;
+			if (task.mode === "execute" ? session.kind !== "confined-execution" ||
+				session.goalRunId !== goal.runId || session.taskId !== task.taskId :
+				session.kind !== "read-dir") return undefined;
+		}
+		for (const operation of goal.operations) {
+			if (!record(operation) || !exactKeys(operation, ["id", "taskId", "status"]) ||
+				!/^O\d{3,}$/.test(operation.id) || operationIds.has(operation.id) ||
+				!taskIds.has(operation.taskId) || operation.status !== "response-received") return undefined;
+			operationIds.add(operation.id);
+		}
+		if (goal.tasks.some(task => task.mode === "execute" &&
+			!goal.operations.some(operation => operation.taskId === task.taskId))) return undefined;
+	}
+	if ([...sessions.values()].some(session => session.kind === "confined-execution" &&
+		!usedSessions.has(session.sessionId as string))) return undefined;
+	return receipt as HostEffectReceiptV1;
 }
 function validateAncestryV3(cp: AccountingCheckpoint, sources: Source[], seedDigest: string,
 	seedCommittedNano: number, seedBinding?: BootstrapBinding): void {
@@ -590,6 +885,8 @@ function validateAncestryV3(cp: AccountingCheckpoint, sources: Source[], seedDig
 	}
 	validateAccountingV3(cp, accountingSources.at(-1)!, parentDigest, settledNano, unknownNano,
 		unpricedCount, binding);
+	if (!reviewedEffectPrefixValid(cp))
+		reject("reviewed effect ancestry does not match prior accounting and host restart claims");
 }
 function sealCheckpoint(cp: Checkpoint, key: Buffer): string {
 	const nonce = randomBytes(12);
@@ -615,6 +912,23 @@ async function githubJson(url: string, token: string, request: typeof fetch): Pr
 	try { value = await response.json(); } catch { return reject("GitHub carry freshness response is invalid"); }
 	if (!record(value)) reject("GitHub carry freshness response is invalid");
 	return value;
+}
+/** Read-only GitHub check. Its boolean alone never brands or authorizes a carry. */
+export async function reviewedLegacyV3SourceTree(token: string, request: typeof fetch): Promise<boolean> {
+	const base = `https://api.github.com/repos/${MISSION_REPOSITORY}/git/commits`;
+	const submitted = await githubJson(`${base}/${ONE_TIME_LEGACY_V3_REQUEST}`, token, request);
+	const source = await githubJson(`${base}/${ONE_TIME_LEGACY_V3_SOURCE}`, token, request);
+	const parents = submitted.parents;
+	return submitted.sha === ONE_TIME_LEGACY_V3_REQUEST &&
+		source.sha === ONE_TIME_LEGACY_V3_SOURCE &&
+		Array.isArray(parents) && [1, 2].includes(parents.length) &&
+		parents.every(parent => record(parent) && typeof parent.sha === "string" &&
+			/^[0-9a-f]{40}$/.test(parent.sha)) &&
+		parents[0].sha === ONE_TIME_LEGACY_V3_SOURCE &&
+		record(submitted.tree) && record(source.tree) &&
+		typeof submitted.tree.sha === "string" &&
+		/^[0-9a-f]{40}$/.test(submitted.tree.sha) &&
+		submitted.tree.sha === source.tree.sha;
 }
 async function oneJob(runId: string, token: string, request: typeof fetch): Promise<Job> {
 	const url = `https://api.github.com/repos/${MISSION_REPOSITORY}/actions/runs/${runId}/jobs?per_page=100`;
@@ -870,6 +1184,9 @@ export async function openLedgerContinuation(input: {
 	let accountingAncestry: AccountingAncestorReceipt[] = [];
 	let ancestry: (AncestorReceipt | AccountingAncestorReceipt)[] = [];
 	let carryForwardOrigin: AuthenticatedCarryForwardOrigin | undefined;
+	let hostEffectEvidence: AuthenticatedHostEffectEvidence | undefined;
+	let oneTimeLegacyV3Review: AuthenticatedLegacyV3RunReview | undefined;
+	let reviewedEffectAncestry: ReviewedEffectAncestorReceipt[] = [];
 	if (executedSources.length) {
 		const latest = executedSources.at(-1)!;
 		const latestEnvelope = await load(latest);
@@ -881,23 +1198,53 @@ export async function openLedgerContinuation(input: {
 				n(seed.payload.priorCommittedCny), seed.bootstrapBinding);
 			const cp = opened.checkpoint;
 			const historicalOrigin = cp.legacyAncestry.at(-1);
-			if (historicalOrigin && hasNoV3ProviderActivity(cp) &&
-				cp.ancestry.every(hasNoV3ProviderActivity) &&
+			const allPriorEffectsReviewed = cp.ancestry.filter(row => !hasNoV3ProviderActivity(row))
+				.every(row => cp.reviewedEffectAncestry?.some(entry =>
+					entry.envelopeSha256 === row.envelopeDigest) ?? false);
+			if (historicalOrigin && allPriorEffectsReviewed &&
 				cp.historical.legacyParentDigest === historicalOrigin.envelopeDigest) {
 				const candidate = Object.freeze({ source: Object.freeze({ ...historicalOrigin.source }),
 					envelopeSha256: historicalOrigin.envelopeDigest,
 					historicalCommittedNano: cp.historical.committedNano,
 					historicalUnknownHeldNano: cp.historical.unknownHeldNano });
 				const bundleSha256 = cp.privateBundle ? privateBundleDigest(cp.privateBundle) : undefined;
-				if (cp.carryForwardOrigin !== undefined) {
+				const immediateZero = cp.ancestry.at(-1);
+				if (cp.ancestry.every(hasNoV3ProviderActivity) &&
+					immediateZero && cp.parentDigest === immediateZero.envelopeDigest &&
+					cp.source.runId === ONE_TIME_LEGACY_V3_RUN &&
+					cp.source.runAttempt === 1 && cp.source.commit === ONE_TIME_LEGACY_V3_REQUEST &&
+					executedMetadata.get(cp.source.runId)?.run.event === "push" &&
+					executedMetadata.get(cp.source.runId)?.run.head_branch === REQUEST_BRANCH &&
+					cp.privateBundle && bundleSha256 && cp.historical.unknownHeldNano > 0) {
+					if (!await reviewedLegacyV3SourceTree(input.githubToken!, request))
+						reject("one-time reviewed request commit is not the first-parent source tree");
+					oneTimeLegacyV3Review = Object.freeze({ origin: candidate,
+						immediateZeroActivitySource: Object.freeze({
+							source: Object.freeze({ ...immediateZero.source }),
+							envelopeSha256: immediateZero.envelopeDigest }),
+						reviewedSourceCommit: ONE_TIME_LEGACY_V3_SOURCE,
+						requestAudit: cp.requestAudit, settledAddedNano: cp.settledAddedNano,
+						unknownObservedAddedNano: cp.unknownObservedAddedNano,
+						unpricedAddedCount: cp.unpricedAddedCount });
+				}
+				if (hasNoV3ProviderActivity(cp) && cp.carryForwardOrigin !== undefined) {
 					if (!bundleSha256 || cp.carryForwardOrigin.privateBundleSha256 !== bundleSha256 ||
 						JSON.stringify(cp.carryForwardOrigin.source) !== JSON.stringify(candidate.source) ||
 						cp.carryForwardOrigin.envelopeSha256 !== candidate.envelopeSha256 ||
 						cp.carryForwardOrigin.historicalCommittedNano !== candidate.historicalCommittedNano ||
 						cp.carryForwardOrigin.historicalUnknownHeldNano !== candidate.historicalUnknownHeldNano)
 						reject("authenticated carry-forward origin is inconsistent");
-					carryForwardOrigin = candidate;
-				} else if (bundleSha256) {
+					if (cp.reviewedEffectAncestry?.at(-1)?.abandonedWithoutGoal) {
+						const noGoalReceipt = hostEffectReceipt(cp);
+						if (!noGoalReceipt || noGoalReceipt.goals.length !== 0 ||
+							noGoalReceipt.sessions.some(session => session.kind !== "none" &&
+								session.kind !== "read-dir") || noGoalReceipt.requestIds.length !== 0)
+							reject("abandoned reviewed restart lacks an empty host effect census");
+						hostEffectEvidence = Object.freeze({ origin: candidate, receipt: noGoalReceipt,
+							requestAudit: cp.requestAudit,
+							reviewedEffectAncestry: Object.freeze([...(cp.reviewedEffectAncestry ?? [])]) });
+					} else carryForwardOrigin = candidate;
+				} else if (hasNoV3ProviderActivity(cp) && bundleSha256) {
 					// Old v3 wrappers did not record a bundle digest. Authenticate the
 					// legacy ciphertext itself before claiming its files were passed through.
 					let legacyEnvelope: string | undefined;
@@ -918,11 +1265,22 @@ export async function openLedgerContinuation(input: {
 							canonicalPrivateBundle(old.checkpoint.privateBundle) === canonicalPrivateBundle(cp.privateBundle))
 							carryForwardOrigin = candidate;
 					}
+				} else if (cp.carryForwardOrigin !== undefined) {
+					const receipt = hostEffectReceipt(cp);
+					if (receipt && bundleSha256 && cp.carryForwardOrigin.privateBundleSha256 === bundleSha256 &&
+						JSON.stringify(cp.carryForwardOrigin.source) === JSON.stringify(candidate.source) &&
+						cp.carryForwardOrigin.envelopeSha256 === candidate.envelopeSha256 &&
+						cp.carryForwardOrigin.historicalCommittedNano === candidate.historicalCommittedNano &&
+						cp.carryForwardOrigin.historicalUnknownHeldNano === candidate.historicalUnknownHeldNano)
+						hostEffectEvidence = Object.freeze({ origin: candidate, receipt,
+							requestAudit: cp.requestAudit,
+							reviewedEffectAncestry: Object.freeze([...(cp.reviewedEffectAncestry ?? [])]) });
 				}
 			}
-			if (cp.carryForwardOrigin !== undefined && !carryForwardOrigin)
-				reject("authenticated carry-forward origin is not a zero-activity pass-through");
+			if (cp.carryForwardOrigin !== undefined && !carryForwardOrigin && !hostEffectEvidence)
+				reject("authenticated carry-forward origin lacks a complete host-effect receipt");
 			legacyAncestry = cp.legacyAncestry;
+			reviewedEffectAncestry = [...(cp.reviewedEffectAncestry ?? [])];
 			accountingAncestry = [...cp.ancestry, accountingAncestorReceipt(cp, opened.digest)];
 			ancestry = [...legacyAncestry, ...accountingAncestry];
 			historical = cp.historical;
@@ -973,6 +1331,10 @@ export async function openLedgerContinuation(input: {
 			{ committedNano, unknownHeldNano }) }) : undefined;
 	if (proof && carryForwardOrigin && priorPrivateBundle && proof.resultArtifact)
 		authenticatedCarryForwardOrigins.set(proof, carryForwardOrigin);
+	if (proof && hostEffectEvidence && priorPrivateBundle && proof.resultArtifact)
+		authenticatedHostEffects.set(proof, hostEffectEvidence);
+	if (proof && oneTimeLegacyV3Review && priorPrivateBundle && proof.resultArtifact)
+		authenticatedLegacyV3RunReviews.set(proof, oneTimeLegacyV3Review);
 	if (priorPrivateBundle) Object.freeze(priorPrivateBundle);
 	if (priorBootstrapBinding) Object.freeze(priorBootstrapBinding);
 	let sealed = false;
@@ -1052,13 +1414,74 @@ export async function openLedgerContinuation(input: {
 					unknownObservedNano: nextUnknownNano, unpricedRequestCount: nextUnpricedCount,
 					settledAddedNano, unknownObservedAddedNano, unpricedAddedCount: amounts.unpricedRequestCount,
 					requestAudit: amounts.requestAudit,
-					...(carryForwardOrigin && privateBundle &&
-						privateBundleDigest(privateBundle) === privateBundleDigest(priorPrivateBundle!) &&
-						settledAddedNano === 0 && unknownObservedAddedNano === 0 &&
-						amounts.unpricedRequestCount === 0 && amounts.requestAudit.requests.length === 0 ?
-						{ carryForwardOrigin: { ...carryForwardOrigin,
-							privateBundleSha256: privateBundleDigest(privateBundle) } } : {}),
 					...(privateBundle ? { privateBundle, bootstrapBinding } : {}) };
+				if (reviewedEffectAncestry.length)
+					cp.reviewedEffectAncestry = [...reviewedEffectAncestry];
+				const priorNonzero = accountingAncestry.filter(row => !hasNoV3ProviderActivity(row));
+				const reviewedOrigin = hostEffectEvidence?.origin ?? oneTimeLegacyV3Review?.origin ??
+					carryForwardOrigin;
+				const currentEffectReceipt = hostEffectReceipt(cp, priorPrivateBundle);
+				const selectedKeys = ["candidate.cpp", "verification.json", "workflow-archive.json",
+					"experiment-plan.json", "m04-adopted-knowledge.json"] as const;
+				const sameSelection = privateBundle && priorPrivateBundle &&
+					selectedKeys.every(name => privateBundle[name] === priorPrivateBundle[name]);
+				const emptyNoGoal = hasNoV3ProviderActivity(cp) && currentEffectReceipt &&
+					currentEffectReceipt.goals.length === 0 &&
+					currentEffectReceipt.sessions.every(session => session.kind === "none" ||
+						session.kind === "read-dir") &&
+					currentEffectReceipt.requestIds.length === 0 && sameSelection &&
+					privateBundle?.["objective-checkpoint.json"] === priorPrivateBundle?.["objective-checkpoint.json"] &&
+					privateBundle?.["research-history.json"] === priorPrivateBundle?.["research-history.json"];
+				const latestPrior = accountingAncestry.at(-1);
+				const earlierNonzeroReviewed = accountingAncestry.slice(0, -1)
+					.filter(row => !hasNoV3ProviderActivity(row)).every(row =>
+						reviewedEffectAncestry.some(entry => entry.envelopeSha256 === row.envelopeDigest));
+				if (latestPrior && earlierNonzeroReviewed &&
+					!reviewedEffectAncestry.some(entry => entry.envelopeSha256 === latestPrior.envelopeDigest) &&
+					reviewedOrigin?.envelopeSha256 === historical.legacyParentDigest) {
+					const added = newlyReviewedPriorEffect(proof, currentSource,
+						latestPrior, privateBundle, reviewedOrigin, Boolean(emptyNoGoal));
+					if (added) cp.reviewedEffectAncestry = [...reviewedEffectAncestry, added];
+				}
+				if (!reviewedEffectPrefixValid(cp))
+					reject("current reviewed effect ancestry is not bound to restart claims");
+				const allPriorEffectsReviewed = priorNonzero.every(row =>
+					cp.reviewedEffectAncestry?.some(entry => entry.envelopeSha256 === row.envelopeDigest) ?? false);
+				const originForCurrent = carryForwardOrigin ?? reviewedOrigin;
+				if (originForCurrent && privateBundle && priorPrivateBundle && allPriorEffectsReviewed) {
+					const zeroPassThrough = privateBundleDigest(privateBundle) === privateBundleDigest(priorPrivateBundle) &&
+						hasNoV3ProviderActivity(cp);
+					// Historical obligations never change. Restart links only append after
+					// a reviewed prior effect; new selection archives the old tuple.
+					const addedReviewCount = (cp.reviewedEffectAncestry?.length ?? 0) - reviewedEffectAncestry.length;
+					const abandonedAdded = addedReviewCount === 1 &&
+						cp.reviewedEffectAncestry?.at(-1)?.abandonedWithoutGoal === true;
+					const historicalPreserved = privateBundle["original-objective.json"] ===
+						priorPrivateBundle["original-objective.json"] &&
+						restartChainExtends(priorPrivateBundle["independent-restart-quarantine.json"],
+							privateBundle["independent-restart-quarantine.json"],
+							"host-independent-restart-reservations", addedReviewCount) &&
+						restartChainExtends(priorPrivateBundle["independent-restart-goal-binding.json"],
+							privateBundle["independent-restart-goal-binding.json"],
+							"host-independent-restart-goal-bindings", addedReviewCount - (abandonedAdded ? 1 : 0));
+					let oldSelectionArchived = false;
+					if (!sameSelection && privateBundle["research-history.json"] &&
+						priorPrivateBundle["candidate.cpp"] && priorPrivateBundle["verification.json"] &&
+						priorPrivateBundle["workflow-archive.json"]) {
+						try {
+							const history = JSON.parse(privateBundle["research-history.json"]);
+							oldSelectionArchived = history?.version === 1 &&
+								history.kind === "untrusted-version-bound-research-history" &&
+								Array.isArray(history.entries) && history.entries.some((entry: any) =>
+									entry?.files && selectedKeys.every(name =>
+										priorPrivateBundle[name] === undefined || entry.files[name] === priorPrivateBundle[name]));
+						} catch { /* A missing old tuple never grants restart authority. */ }
+					}
+					if (zeroPassThrough || (historicalPreserved && (sameSelection || oldSelectionArchived) &&
+						(!hasNoV3ProviderActivity(cp) || emptyNoGoal) && currentEffectReceipt))
+						cp.carryForwardOrigin = { ...originForCurrent,
+							privateBundleSha256: privateBundleDigest(privateBundle) };
+				}
 				const envelopeB64 = sealCheckpoint(cp, key);
 				sealed = true;
 				return { envelopeB64, observedSettledCny: decimal(nextSettledNano),

@@ -596,6 +596,7 @@ test("a large serialized payload is observed without the retired fee ceiling or 
 	const rows = budget.requestAccountingAuditSnapshot().requests;
 	assert.deepEqual(rows.map(row => row.inputPayloadBytes), [payloadBytes, payloadBytes]);
 	assert(rows.every(row => row.maxOutputTokens === 20));
+	assert(rows.every(row => /^[0-9a-f]{64}$/.test(row.sessionId) && row.sessionId !== handle.ref.id));
 });
 
 test("unpriced CNY retains raw usage and unknown status rather than reporting a zero charge", () => {
@@ -607,6 +608,7 @@ test("unpriced CNY retains raw usage and unknown status rather than reporting a 
 	assert.equal(audit.settledCny, 0);
 	assert.equal(audit.unpricedRequestCount, 1);
 	assert.equal(audit.requests[0].status, "unknown");
+	assert.equal(audit.requests[0].responseReceived, true, "unknown CNY is not an unknown transport");
 	assert.equal(audit.requests[0].settledCny, null);
 	assert.equal(audit.requests[0].unknownObservedCny, null);
 	assert.equal(audit.requests[0].reportedUsage?.reportedUsdCost, 0.0000078);
@@ -624,6 +626,7 @@ test("failed unpriced prompt retains unknown outcome without stopping an unrelat
 	budget.reserve(left, 100, "left-request");
 	budget.failPrompt(left);
 	assert.equal(budget.requestAccountingAuditSnapshot().requests[0].status, "unknown");
+	assert.equal(budget.requestAccountingAuditSnapshot().requests[0].responseReceived, false);
 	assert.equal(budget.requestAccountingAuditSnapshot().unpricedRequestCount, 1);
 	assert.equal(budget.snapshot().stopped, false);
 	budget.reserve(right, 100, "right-request");
@@ -632,13 +635,15 @@ test("failed unpriced prompt retains unknown outcome without stopping an unrelat
 	assert.equal(budget.snapshot().stopped, false);
 });
 
-test("unpriced CNY does not certify a settled terminal response", () => {
+test("an unpriced received length response certifies transport effects while keeping fee unknown", () => {
 	const budget = new DeepSeekCampaignBudget(LIMITS);
 	const lease = budget.beginPrompt("session", "one");
 	budget.reserve(lease, 100, "request");
 	budget.stopAfterTerminalLength(lease, "request", reported("length", 1, 10, "length"));
-	assert.equal(budget.certifySettledTerminalResponse(lease, "no-tools"), undefined);
+	assert.equal(budget.certifySettledTerminalResponse(lease, "no-tools")?.code,
+		"runner.response.length-settled");
 	assert.equal(budget.requestAccountingAuditSnapshot().requests[0].status, "unknown");
+	assert.equal(budget.requestAccountingAuditSnapshot().requests[0].responseReceived, true);
 	budget.failPrompt(lease);
 });
 

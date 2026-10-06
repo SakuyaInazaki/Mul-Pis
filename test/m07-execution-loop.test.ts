@@ -179,6 +179,48 @@ test("opt-in M07 repair keeps one builder, creates fresh reviewers, and preserve
  assert.match(await readFile(checkpoint.feedbackPath,"utf8"),/delta\.json|candidate/i);
 });
 
+test("ready with oversized lesson delta becomes same-session revise, then repaired candidate is accepted", async t => {
+ const f = await fixture(t, async ({spec, turnIndex, message}) => {
+  if (spec.label.includes("reviewer")) return JSON.stringify({verdict:"ready",feedback:"reviewed candidate files"});
+  if (spec.tools.kind === "execution") {
+   if (turnIndex === 2) assert.match(message,/lesson-delta\.json file exceeds 16,000 bytes/);
+   await writeFile(path.join(spec.tools.root,"result.txt"),`candidate ${turnIndex}\n`);
+   await writeFile(path.join(spec.tools.root,"delta.json"),JSON.stringify({version:1,action:"propose",observation:turnIndex === 1 ? "x".repeat(16_100) : "repaired candidate",applicability:"this bounded case",evidencePaths:["result.txt"]}));
+  }
+  return `builder round ${turnIndex}`;
+ });
+ const task = await f.controller.delegate(f.goal.runId,{objective:"repair file-bound candidate",inputs:[],expectedOutputs:["result.txt","delta.json"],lessonDeltaOutput:"delta.json",checks:["result inspected"],mode:"execute",executionLoop:{mode:"until-ready"}});
+ assert.equal(task.status,"returned",task.executionFailure ?? "task failed");
+ assert.equal(task.loopStopReason,"ready");
+ assert.deepEqual(task.executionRounds?.map(round=>round.verdict),["revise","ready"]);
+ assert.match(task.executionRounds![0].feedback!,/16,000 bytes/);
+ assert.equal(f.runner.created.filter(s=>s.tools.kind === "execution").length,1);
+ const result=path.join(task.workDir,"result.txt");
+ const reviewed=await f.controller.review(f.goal.runId,{taskId:task.taskId,checks:[{criterion:"result inspected",result:"passed",evidence:[result]}],artifacts:[result]});
+ assert.equal(reviewed.status,"accepted",reviewed.review?.failures.join("; ") ?? "");
+});
+
+test("final review rejects malformed lesson-delta schema and evidence paths", async t => {
+ const cases: Array<[string,string,RegExp]> = [
+  ["invalid JSON","{",/invalid or missing/],
+  ["missing observation",JSON.stringify({version:1,action:"propose",applicability:"bounded",evidencePaths:["result.txt"]}),/lacks observation/],
+  ["unpinned amendment",JSON.stringify({version:1,action:"amend",observation:"changed",applicability:"bounded",evidencePaths:["result.txt"]}),/pinned priorRef/],
+  ["unsafe evidence",JSON.stringify({version:1,action:"propose",observation:"changed",applicability:"bounded",evidencePaths:["../outside.txt"]}),/invalid schema/],
+  ["missing evidence",JSON.stringify({version:1,action:"propose",observation:"changed",applicability:"bounded",evidencePaths:["missing.txt"]}),/invalid or missing/],
+  ["too many evidence paths",JSON.stringify({version:1,action:"propose",observation:"changed",applicability:"bounded",evidencePaths:Array(21).fill("result.txt")}),/invalid schema/],
+ ];
+ for (const [name,delta,reason] of cases) {
+  await t.test(name,async t => {
+   const f=await fixture(t,async ({spec})=>{if(spec.tools.kind==="execution"){await writeFile(path.join(spec.tools.root,"result.txt"),"candidate\n"); await writeFile(path.join(spec.tools.root,"delta.json"),delta);} return "candidate";});
+   const task=await f.controller.delegate(f.goal.runId,{objective:"candidate",inputs:[],expectedOutputs:["result.txt","delta.json"],lessonDeltaOutput:"delta.json",checks:["checked"],mode:"execute"});
+   const result=path.join(task.workDir,"result.txt");
+   const reviewed=await f.controller.review(f.goal.runId,{taskId:task.taskId,checks:[{criterion:"checked",result:"passed",evidence:[result]}],artifacts:[result]});
+   assert.equal(reviewed.status,"rejected");
+   assert.match(reviewed.review?.failures.join("; ")??"",reason);
+  });
+ }
+});
+
 test("ready reviewer cannot approve candidate changed afterward", async t => {
  const f=await fixture(t,async ({spec})=>{if(spec.label.includes("reviewer"))return JSON.stringify({verdict:"ready",feedback:"reviewed snapshot"}); if(spec.tools.kind==="execution")await writeFile(path.join(spec.tools.root,"result.txt"),"reviewed"); return "done";});
  const task=await f.controller.delegate(f.goal.runId,{objective:"candidate",inputs:[f.guide],planInput:f.guide,expectedOutputs:["result.txt"],checks:["same candidate"],mode:"execute",executionLoop:{mode:"until-ready"}});

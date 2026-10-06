@@ -8,6 +8,7 @@ import { offlineChecks } from "../scripts/manual-private-campaign.ts";
 import { reserveIndependentRestart } from "../src/m07/independent-restart.ts";
 import { verifyDeepSeekCnyBilling } from "../src/runner/deepseek-cny-pricing.ts";
 import { verifyDeepSeekProviderOutputLimit } from "../src/runner/deepseek-provider-limits.ts";
+import { Workspace } from "../src/workspace.ts";
 
 test("shared-total campaign requires explicit manual admission and signed cumulative ledger", async () => {
  const workflow = await readFile(new URL("../.github/workflows/manual-private-campaign.yml", import.meta.url), "utf8");
@@ -283,6 +284,52 @@ test("a real fork with no accepted M07 winner cannot unlock a fulfilled follow-o
 	assert.equal(offlineChecks.firstM07Accepted(false, "fulfilled"), false);
 	assert.equal(offlineChecks.firstM07Accepted(true, "partial"), false);
 	assert.equal(offlineChecks.firstM07Accepted(true, "fulfilled"), true);
+});
+
+test("controller rejection after ready host pass remains repairable until actual acceptance", () => {
+	const rejected = { status: "rejected", loopStopReason: "ready", review: { failures: ["invalid lesson delta"] } };
+	const base = { winner: false, stopped: false, aborted: false, rejected,
+		unresolvedOperationIds: [] as string[], unresolvedTaskIds: [] as string[] };
+	assert.equal(offlineChecks.shouldRepairRejectedReview(base), true);
+	assert.equal(offlineChecks.shouldRepairRejectedReview({ ...base, winner: true }), false);
+	assert.equal(offlineChecks.shouldRepairRejectedReview({ ...base,
+		rejected: { ...rejected, status: "accepted" } }), false);
+	assert.equal(offlineChecks.shouldRepairRejectedReview({ ...base,
+		rejected: { ...rejected, loopStopReason: "blocked" } }), false);
+	assert.equal(offlineChecks.shouldRepairRejectedReview({ ...base, unresolvedOperationIds: ["O001"] }), false);
+	assert.equal(offlineChecks.shouldRepairRejectedReview({ ...base, stopped: true }), false);
+});
+
+test("host effect receipt captures complete task and live session census without replaying a prior receipt", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-host-effect-fixture-"));
+	try {
+		const ws = new Workspace(path.join(root, "workspace"));
+		const goalDir = ws.runDir("M07", "R001");
+		await mkdir(goalDir, { recursive: true });
+		await writeFile(path.join(goalDir, "run.json"), "{}\n");
+		await writeFile(path.join(goalDir, "goal.json"), JSON.stringify({ runId: "R001", outcome: "active",
+			tasks: [{ taskId: "T001", mode: "execute", status: "rejected", session: { id: "builder" } }],
+			executionState: { operations: [{ id: "O001", taskId: "T001", status: "response-received" }] } }));
+		const grant = { version: 1 as const, kind: "confined-campaign-files" as const,
+			root: path.join(goalDir, "tasks", "T001", "work"), writableFiles: ["candidate.cpp", "lesson-delta.json"] };
+		const receipt = await offlineChecks.buildHostEffectReceipt({ ws,
+			source: { runId: "1001", runAttempt: 1, commit: "a".repeat(40) },
+			priorEnvelopeSha256: "b".repeat(64), historicalGoalRunIds: ["R000"],
+			requestIds: ["request-1"], sessions: new Map([
+				["builder", { sessionId: "builder", grantKind: "confined-execution" as const,
+					taskId: "T001", workRoot: grant.root, grant }],
+			]) });
+		assert.deepEqual(receipt.goals[0].tasks.map(item => item.status), ["rejected"]);
+		assert.deepEqual(receipt.goals[0].operations.map(item => item.status), ["response-received"]);
+		assert.deepEqual(receipt.sessions[0].grant, grant);
+		const prior = { "candidate.cpp": "// selected\n", "host-effect-receipt.json": JSON.stringify(receipt) };
+		const output = path.join(root, "output");
+		await mkdir(output);
+		assert.equal((await offlineChecks.collectContinuationBundle(output, prior))?.["host-effect-receipt.json"], undefined);
+		await writeFile(path.join(output, "host-effect-receipt.json"), `${JSON.stringify(receipt)}\n`);
+		assert.equal((await offlineChecks.collectContinuationBundle(output, prior))?.["host-effect-receipt.json"],
+			`${JSON.stringify(receipt)}\n`);
+	} finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("fork provenance requires a committed child receipt bound to the frozen parent leaf", async () => {
