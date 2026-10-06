@@ -112,13 +112,15 @@ test("missing candidate remains a measured failure for ordinary repair review", 
 	const root = await mkdtemp(path.join(tmpdir(), "m07-missing-handoff-"));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const source = path.join(root, "candidate.cpp"), evidence = path.join(root, "verification.json");
-	const f = fixture(async () => {}, { missingSource: true });
+	const f = fixture(async ({ log }) => {
+		log.push({ name: "read", args: { path: "verification.json" }, ok: true, at: new Date().toISOString() });
+	}, { missingSource: true });
 	f.setFiles(source, evidence);
 	const result = await runMeasuredEvidenceHandoff({ handle: f.handle, implementationPrompt: "build",
 		sourceFile: source, evidenceFile: evidence, readToolName: "read", finalizationPrompt: "finalize",
 		measure: async () => writeFile(evidence, '{"status":"failed"}') });
-	assert.equal(f.prompts, 1);
-	assert.equal(result.text, "preliminary report");
+	assert.equal(f.prompts, 2);
+	assert.equal(result.text, "final report from current verification");
 });
 
 test("a final-only usage summary is not misreported as the two-prompt total", async t => {
@@ -133,4 +135,49 @@ test("a final-only usage summary is not misreported as the two-prompt total", as
 		sourceFile: source, evidenceFile: evidence, readToolName: "read", finalizationPrompt: "finalize",
 		measure: async () => writeFile(evidence, '{"status":"passed"}') });
 	assert.equal(result.usage, undefined);
+});
+
+test("model-authored experiment inputs stay bound to the measured source during measurement and finalization", async t => {
+	for (const mutateAt of ["measure", "finalize"]) {
+		const root = await mkdtemp(path.join(tmpdir(), "m07-plan-handoff-"));
+		t.after(() => rm(root, { recursive: true, force: true }));
+		const source = path.join(root, "candidate.cpp"), evidence = path.join(root, "verification.json");
+		const plan = path.join(root, "experiment-plan.json");
+		await writeFile(plan, '{"case":"original"}');
+		const f = fixture(async ({ log }) => {
+			log.push({ name: "read", args: { path: "verification.json" }, ok: true, at: new Date().toISOString() });
+			if (mutateAt === "finalize") await writeFile(plan, '{"case":"unmeasured"}');
+		});
+		f.setFiles(source, evidence);
+		await assert.rejects(runMeasuredEvidenceHandoff({ handle: f.handle, implementationPrompt: "build",
+			sourceFile: source, frozenSourceFiles: [plan], evidenceFile: evidence, readToolName: "read", finalizationPrompt: "finalize",
+			measure: async () => {
+				await writeFile(evidence, '{"status":"passed"}');
+				if (mutateAt === "measure") await writeFile(plan, '{"case":"changed"}');
+			} }), mutateAt === "measure" ? /changed while host verification ran/ : /experiment input changed after measurement/);
+	}
+});
+
+test("failed execution feedback is consumed by the same actor before it revises and sees new measured results", async t => {
+	const root = await mkdtemp(path.join(tmpdir(), "m07-feedback-revision-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const source = path.join(root, "candidate.txt"), evidence = path.join(root, "host-result.json");
+	const log: ToolCallRecord[] = [], observed: unknown[] = [];
+	let turn = 0;
+	const handle = { prompt: async (): Promise<AssistantTurn> => {
+		turn++;
+		if (turn % 2 === 1) await writeFile(source, turn === 1 ? "broken proposal" : "revised proposal");
+		else { observed.push(JSON.parse(await readFile(evidence, "utf8")));
+			log.push({ name: "read", args: { path: "host-result.json" }, ok: true, at: new Date().toISOString() }); }
+		return { text: `actor turn ${turn}`, stopReason: "stop", toolCalls: 1 };
+	}, usageEvents: () => [], toolLog: () => log } as unknown as SessionHandle;
+	for (const status of ["compile_failed", "passed"]) await runMeasuredEvidenceHandoff({ handle,
+		implementationPrompt: "Use the observed prior feedback to revise the proposal", sourceFile: source, evidenceFile: evidence,
+		readToolName: "read", finalizationPrompt: "Read current host feedback before deciding the next action",
+		measure: async () => writeFile(evidence, JSON.stringify({ status,
+			diagnostic: status === "compile_failed" ? "Synthetic missing declaration at line 3" : "Synthetic finite evaluation passed" })) });
+	assert.deepEqual(observed, [{ status: "compile_failed", diagnostic: "Synthetic missing declaration at line 3" },
+		{ status: "passed", diagnostic: "Synthetic finite evaluation passed" }]);
+	assert.equal(turn, 4);
+	assert.equal(await readFile(source, "utf8"), "revised proposal");
 });

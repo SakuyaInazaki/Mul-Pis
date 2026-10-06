@@ -4,7 +4,7 @@ import path from "node:path";
 import { HarnessError } from "../types.ts";
 import type { CustomToolSpec, SessionSpec } from "./types.ts";
 
-const MAX_READ_BYTES = 128_000;
+const MAX_READ_BYTES = 1_000_000;
 const MAX_WRITE_BYTES = 128_000;
 type GrantDescriptor = NonNullable<SessionSpec["toolAuthority"]>;
 const approved = new WeakMap<CustomToolSpec, GrantDescriptor>();
@@ -65,7 +65,7 @@ export async function createConfinedCampaignFileTools(root: string, options: { w
 		return target;
 	};
 	const read: CustomToolSpec = {
-		name: "read", description: "Read one UTF-8 text file inside the task work directory (128 KB maximum).",
+		name: "read", description: "Read one complete UTF-8 text file inside the task work directory (1 MB maximum; no truncation).",
 		params: { path: { type: "string", description: "Relative file path" } },
 		async execute(args) {
 			const target = await existingFile(rootReal, args.path);

@@ -4,129 +4,357 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { buildCsrChecker } from "../src/workflow-archive/csr-checker.ts";
+import { buildCsrChecker, CSR_EXPERIMENT_LIMITS, inspectCsrTaskContract, validateCsrCandidateSource, validateCsrTargetBodies, type CsrExperimentPlan } from "../src/workflow-archive/csr-checker.ts";
 
-// Deliberately synthetic names and input. Private lab content is never a fixture.
-function fixture(secondBody: string): string {
-	return `#include <iostream>
+// Synthetic source only. Private task inputs and strategy implementations are never fixtures.
+const task = "Register at most toy_strategy_5; original functions are toy_strategy_1 and toy_strategy_2.";
+const plan: CsrExperimentPlan = {
+	registeredStrategies: ["toy_strategy_1", "toy_strategy_2", "toy_strategy_3"],
+	cases: [{ id: "skew_a", rows: 19, cols: 23, normalNnz: 2, longRows: 2, longNnz: 13,
+		seed: 11, threadCounts: [1, 2], warmups: 1, repeats: 3 }],
+};
+function starter(): string {
+	return `#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <iostream>
+#include <limits>
+#include <string>
+#include <thread>
 #include <vector>
 struct ToyCompressedRows {
-  int rows = 0, cols = 0;
-  std::vector<int> row_ptr, col_idx;
-  std::vector<double> values;
+  int height = 0;
+  int width = 0;
+  std::vector<int> offsets;
+  std::vector<int> columns;
+  std::vector<double> weights;
 };
-static void toy_reference(const ToyCompressedRows& a, const std::vector<double>& x, std::vector<double>& y) {
-  for (int r = 0; r < a.rows; ++r) {
+struct ToyOptions {
+  int height = 1;
+  int width = 1;
+  int ordinary_width = 1;
+  int special_count = 0;
+  int special_width = 0;
+  int workers = 1;
+  int trials = 1;
+  unsigned random_seed = 0;
+};
+static ToyCompressedRows toy_matrix(const ToyOptions& options) {
+  ToyCompressedRows a; a.height = options.height; a.width = options.width;
+  a.offsets.assign(options.height + 1, 0);
+  for (int r = 0; r < options.height; ++r) {
+    const int count = r < options.special_count ? options.special_width : options.ordinary_width;
+    for (int k = 0; k < count; ++k) {
+      a.columns.push_back((r * 7 + k * 3 + options.random_seed) % options.width);
+      a.weights.push_back(static_cast<double>((r + k) % 7 - 3) / 5.0);
+    }
+    a.offsets[r + 1] = static_cast<int>(a.weights.size());
+  }
+  return a;
+}
+static std::vector<double> toy_vector(int size, unsigned seed) {
+  std::vector<double> x(size);
+  for (int k = 0; k < size; ++k) x[k] = static_cast<double>((k + seed) % 9 - 4) / 7.0;
+  return x;
+}
+static void toy_serial(const ToyCompressedRows& a, const std::vector<double>& x, std::vector<double>& y) {
+  for (int r = 0; r < a.height; ++r) {
     double sum = 0;
-    for (int p = a.row_ptr[r]; p < a.row_ptr[r+1]; ++p) sum += a.values[p] * x[a.col_idx[p]];
+    for (int p = a.offsets[r]; p < a.offsets[r+1]; ++p) sum += a.weights[p] * x[a.columns[p]];
     y[r] = sum;
   }
 }
-// TODO 1: test target
-static void toy_first(const ToyCompressedRows& a, const std::vector<double>& x, std::vector<double>& y) {
-  toy_reference(a, x, y);
+static void toy_thread(const ToyCompressedRows& a, const std::vector<double>& x, std::vector<double>& y, int threads) {
+  std::vector<std::thread> workers;
+  for (int t = 0; t < threads; ++t) workers.emplace_back([&, t]() {
+    for (int r = t; r < a.height; r += threads) {
+      double sum = 0;
+      for (int p = a.offsets[r]; p < a.offsets[r+1]; ++p) sum += a.weights[p] * x[a.columns[p]];
+      y[r] = sum;
+    }
+  });
+  for (auto& worker : workers) worker.join();
 }
-// TODO 2: test target
-static void toy_second(const ToyCompressedRows& a, const std::vector<double>& x, std::vector<double>& y) {
-  ${secondBody}
+// TODO 1: fill in first strategy.
+static void toy_strategy_1(const ToyCompressedRows& a, const std::vector<double>& x, std::vector<double>& y) {
+  toy_serial(a, x, y);
 }
-static bool toy_check(const std::vector<double>& a, const std::vector<double>& b,
-                      double abs_tol = 1e-10, double rel_tol = 1e-10) { return a == b; }
+// TODO 2: fill in second strategy.
+static void toy_strategy_2(const ToyCompressedRows& a, const std::vector<double>& x, std::vector<double>& y) {
+  toy_serial(a, x, y);
+}
+static bool toy_check(const std::vector<double>& expected, const std::vector<double>& actual,
+                      double abs_tol = 1e-10, double rel_tol = 1e-10) { return expected == actual; }
 int main() { return 0; }
 `;
 }
-
-async function compiledCheck(candidate: string): Promise<{ compile: ReturnType<typeof spawnSync>; run?: ReturnType<typeof spawnSync> }> {
+function candidate(body = "toy_serial(a, x, y);"): string {
+	return `${starter()}
+static void toy_strategy_3(const ToyCompressedRows& a, const std::vector<double>& x, std::vector<double>& y) {
+  ${body}
+}
+`;
+}
+function fiveStrategies(): string {
+	return `${candidate()}
+static void toy_strategy_4(const ToyCompressedRows& a, const std::vector<double>& x, std::vector<double>& y) {
+  toy_serial(a, x, y);
+}
+static void toy_strategy_5(const ToyCompressedRows& a, const std::vector<double>& x, std::vector<double>& y) {
+  toy_serial(a, x, y);
+}
+`;
+}
+async function compiledCheck(source: string, args: string[] = [], selectedPlan = plan, selections: string[][] = [], workerOverride?: string) {
 	const root = await mkdtemp(path.join(os.tmpdir(), "csr-checker-synthetic-"));
 	try {
-		const checker = buildCsrChecker(fixture("toy_reference(a, x, y);"));
+		const checker = buildCsrChecker(starter(), source, task, selectedPlan);
 		await writeFile(path.join(root, "checker.cpp"), checker.source);
-		await writeFile(path.join(root, "candidate.cpp"), candidate);
-		const compile = spawnSync("g++", ["-std=c++17", "-fopenmp", "-O0", "-pthread", "checker.cpp", "-o", "check"],
+		await writeFile(path.join(root, "candidate.cpp"), source);
+		await writeFile(path.join(root, "worker.cpp"), workerOverride ?? checker.workerSource);
+		await writeFile(path.join(root, "baseline-worker.cpp"), checker.baselineWorkerSource);
+		const baselineCompile = spawnSync("g++", ["-std=c++17", "-fopenmp", "-O2", "-pthread", "baseline-worker.cpp", "-o", "baseline-worker"],
 			{ cwd: root, encoding: "utf8", timeout: 20_000 });
-		if (compile.status !== 0) return { compile };
-		const run = spawnSync(path.join(root, "check"), [], { cwd: root, encoding: "utf8", timeout: 10_000 });
-		return { compile, run };
+		if (baselineCompile.status !== 0) return { compile: baselineCompile, run: undefined, runs: [] };
+		const workerCompile = spawnSync("g++", ["-std=c++17", "-fopenmp", "-O2", "-pthread", "worker.cpp", "-o", "candidate-worker"],
+			{ cwd: root, encoding: "utf8", timeout: 20_000 });
+		if (workerCompile.status !== 0) return { compile: workerCompile, run: undefined, runs: [] };
+		const compile = spawnSync("g++", ["-std=c++17", "-fopenmp", "-O2", "-pthread", "checker.cpp", "-o", "check"],
+			{ cwd: root, encoding: "utf8", timeout: 20_000 });
+		if (compile.status !== 0) return { compile, run: undefined, runs: [] };
+		return { compile, run: spawnSync(path.join(root, "check"), args,
+			{ cwd: root, encoding: "utf8", timeout: 10_000 }),
+			runs: selections.map(selection => spawnSync(path.join(root, "check"), selection,
+				{ cwd: root, encoding: "utf8", timeout: 10_000 })) };
 	} finally { await rm(root, { recursive: true, force: true }); }
 }
 
-test("checker derives names, tolerance, and finite bounded coverage at runtime", () => {
-	const result = buildCsrChecker(fixture("toy_reference(a, x, y);"));
+test("checker derives bounded registry and model-authored cases", () => {
+	const result = buildCsrChecker(starter(), candidate(), task, plan);
 	assert.equal(result.metadata.matrixType, "ToyCompressedRows");
-	assert.deepEqual(result.metadata.targets, ["toy_first", "toy_second"]);
-	assert.equal(result.metadata.absTolerance, "1e-10");
-	assert.equal(result.metadata.relTolerance, "1e-10");
-	assert.deepEqual(result.metadata.threadCounts, [1, 2, 4]);
-	assert.equal(result.metadata.shapes.length, 4);
-	assert.equal(result.metadata.mutationPasses, 2);
-	assert.equal(result.metadata.timing.marker, "CSR_TIMING");
-	assert.deepEqual(result.metadata.timing.shapes, [[1024, 509], [4096, 2047]]);
-	assert.deepEqual(result.metadata.timing.threadCounts, [1, 4]);
-	assert.equal(result.metadata.timing.warmups, 2);
-	assert.equal(result.metadata.timing.repeats, 16);
-	assert.match(result.source, /#include "candidate\.cpp"/);
-	assert.match(result.source, /CSR_CHECK_PASS/);
-	const changedTolerance = buildCsrChecker(fixture("toy_reference(a, x, y);")
-		.replace("abs_tol = 1e-10", "abs_tol = 2e-8")
-		.replace("rel_tol = 1e-10", "rel_tol = 3e-9"));
-	assert.match(changedTolerance.source, /error > 2e-8 \+ 3e-9 \* scale/);
-	assert.throws(() => buildCsrChecker(fixture("toy_reference(a, x, y);"), "../outside.cpp"));
-	assert.throws(() => buildCsrChecker(fixture("toy_reference(a, x, y);").replace("// TODO 2:", "// OMITTED:")));
+	assert.deepEqual(result.metadata.targets, plan.registeredStrategies);
+	assert.equal(result.metadata.maxStrategies, 5);
+	assert.deepEqual(result.metadata.baselines, { serial: "toy_serial", stdThread: "toy_thread" });
+	assert.deepEqual(result.metadata.timing.cases, plan.cases);
+	assert.match(result.workerSource, /#line 1 "candidate\.cpp"/);
+	assert.match(result.source, /#line 1 "immutable-original\.cpp"/);
+	assert.doesNotMatch(result.source, /static void toy_strategy_3/);
+	assert.equal(result.metadata.timing.metric, "isolated-worker-roundtrip");
+	assert.doesNotMatch(result.source, /#include "candidate\.cpp"/);
+	assert.throws(() => buildCsrChecker(starter(), candidate(), task, plan, "../outside.cpp"));
+	assert.throws(() => buildCsrChecker(starter(), candidate(), task, { ...plan, registeredStrategies: ["toy_strategy_1", "toy_strategy_2"] }));
+	assert.throws(() => buildCsrChecker(starter(), candidate(), task, { ...plan, registeredStrategies: ["toy_strategy_1", "toy_strategy_3"] }));
+	assert.throws(() => buildCsrChecker(starter(), candidate(), "no upper bound", plan));
+	assert.throws(() => buildCsrChecker(starter(), candidate(),
+		"Register at most toy_strategy_3. toy_strategy_5 is disallowed.",
+		{ ...plan, registeredStrategies: [...plan.registeredStrategies, "toy_strategy_4", "toy_strategy_5"] }));
+	assert.equal(buildCsrChecker(starter(), candidate(),
+		"Register at most toy_strategy_3. toy_strategy_5 is disallowed.", plan).metadata.maxStrategies, 3);
+	assert.throws(() => buildCsrChecker(starter(), candidate(), task, { ...plan, cases: [{ ...plan.cases[0], repeats: 500 }] }));
 });
 
-test("independent checker passes synthetic correct implementation", async t => {
+test("independent checker times serial, std::thread, and every registered strategy", async t => {
 	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
-	const result = await compiledCheck(fixture("toy_reference(a, x, y);"));
-	assert.equal(result.compile.status, 0, result.compile.stderr?.toString());
+	const selections = ["serial:0", "std_thread:0", "strategy:1", "strategy:2", "strategy:3"].flatMap(selector =>
+		[1, 2].map(thread => ["--timing", "skew_a", selector, String(thread)]));
+	const result = await compiledCheck(candidate(), ["--check"], plan, selections);
+	assert.equal(result.compile.status, 0, String(result.compile.stderr));
+	assert.equal(result.run?.status, 0, String(result.run?.stderr));
+	assert.equal(result.run?.stdout, "CSR_CHECK_PASS\n");
+	assert.equal(result.runs.length, 10);
+	const lines = result.runs.map(run => {
+		assert.equal(run.status, 0, String(run.stderr));
+		assert.equal(run.stdout.trim().split("\n").at(-1), "CSR_CHECK_PASS");
+		return run.stdout.trim().split("\n")[0];
+	});
+	for (const line of lines) {
+		assert.match(line, /^CSR_TIMING case=skew_a kind=(serial|std_thread|strategy) target=[0-3] name=toy_[a-z0-9_]+ rows=19 cols=23 ordinary_nnz=2 heavy_rows=2 heavy_nnz=13 seed=11 threads=[12] warmups=1 repeats=3 min_ns=\d+ median_ns=\d+ max_ns=\d+ startup_ns=\d+ cold_ns=\d+ warmup_samples_ns=\d+ samples_ns=\d+,\d+,\d+$/);
+	}
+	assert.ok(lines.some(line => line.includes("kind=strategy target=3 name=toy_strategy_3")));
+});
+
+test("single-strategy timing selection emits one host record after validation", async t => {
+	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
+	const result = await compiledCheck(candidate(), ["--timing", "skew_a", "strategy:3", "2"]);
+	assert.equal(result.compile.status, 0, String(result.compile.stderr));
 	assert.equal(result.run?.status, 0, String(result.run?.stderr));
 	const lines = String(result.run?.stdout).trim().split("\n");
-	assert.equal(lines.at(-1), "CSR_CHECK_PASS");
-	assert.equal(lines.filter(line => line.startsWith("CSR_TIMING ")).length, 8);
-	for (const line of lines.slice(0, -1))
-		assert.match(line, /^CSR_TIMING target=[12] rows=(1024|4096) cols=(509|2047) threads=[14] repeats=16 elapsed_ns=[1-9]\d*$/);
+	assert.equal(lines.length, 2);
+	assert.match(lines[0], /^CSR_TIMING case=skew_a kind=strategy target=3 name=toy_strategy_3 .* threads=2 /);
+	assert.equal(lines[1], "CSR_CHECK_PASS");
 });
 
-test("candidate's fake benchmark print cannot substitute for host timing records", async t => {
+test("checker covers every permitted registered strategy through the task maximum", async t => {
 	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
-	const result = await compiledCheck(fixture('std::cout << "OpenMP 0.001 ms\\n"; toy_reference(a, x, y);'));
-	assert.equal(result.compile.status, 0, result.compile.stderr?.toString());
+	const all: CsrExperimentPlan = { ...plan,
+		registeredStrategies: [...plan.registeredStrategies, "toy_strategy_4", "toy_strategy_5"] };
+	const result = await compiledCheck(fiveStrategies(), ["--check"], all,
+		[["--timing", "skew_a", "strategy:5", "1"]]);
+	assert.equal(result.compile.status, 0, String(result.compile.stderr));
 	assert.equal(result.run?.status, 0, String(result.run?.stderr));
 	const lines = String(result.run?.stdout).trim().split("\n");
-	assert.ok(lines.includes("OpenMP 0.001 ms"));
-	assert.equal(lines.filter(line => /^CSR_TIMING /.test(line)).length, 8);
-	assert.equal(lines.at(-1), "CSR_CHECK_PASS");
-	for (const line of lines.filter(line => /^CSR_TIMING /.test(line)))
-		assert.match(line, /^CSR_TIMING target=[12] rows=(1024|4096) cols=(509|2047) threads=[14] repeats=16 elapsed_ns=[1-9]\d*$/);
+	assert.deepEqual(lines, ["CSR_CHECK_PASS"]);
+	assert.equal(result.runs[0]?.status, 0);
+	assert.match(String(result.runs[0]?.stdout), /kind=strategy target=5 name=toy_strategy_5/);
 });
 
-test("independent checker detects stale cache after in-place mutation", async t => {
+test("new strategy cannot pass with stale, nonfinite, or unwritten output", async t => {
 	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
-	const candidate = fixture(`static bool ready = false;
-    static std::vector<double> cached;
-    if (!ready) { toy_reference(a, x, y); cached = y; ready = true; }
-    else y = cached;`);
-	const result = await compiledCheck(candidate);
-	assert.equal(result.compile.status, 0, result.compile.stderr?.toString());
-	assert.equal(result.run?.status, 1);
-	assert.match(String(result.run?.stderr), /mismatch\/nonfinite\/unwritten.*pass=1/);
-	assert.doesNotMatch(String(result.run?.stdout), /CSR_CHECK_PASS/);
+	for (const body of [
+		"static bool ready = false; static std::vector<double> cache; if (!ready) { toy_serial(a, x, y); cache = y; ready = true; } else y = cache;",
+		"toy_serial(a, x, y); y[0] = 0.0 / 0.0;",
+		"std::vector<double> temporary(y.size()); toy_serial(a, x, temporary); for (std::size_t r = 1; r < y.size(); ++r) y[r] = temporary[r];",
+	]) {
+		const result = await compiledCheck(candidate(body));
+		assert.equal(result.compile.status, 0, String(result.compile.stderr));
+		assert.equal(result.run?.status, 1);
+		assert.match(String(result.run?.stderr), /toy_strategy_3: mismatch\/nonfinite\/unwritten/);
+		assert.doesNotMatch(String(result.run?.stdout), /CSR_CHECK_PASS/);
+	}
 });
 
-test("independent checker rejects a nonfinite output", async t => {
-	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
-	const result = await compiledCheck(fixture("toy_reference(a, x, y); y[0] = 0.0 / 0.0;"));
-	assert.equal(result.compile.status, 0, result.compile.stderr?.toString());
-	assert.equal(result.run?.status, 1);
-	assert.match(String(result.run?.stderr), /mismatch\/nonfinite\/unwritten.*row=0/);
+test("capability inspection is input-derived and does not create a research plan", () => {
+	const contract = inspectCsrTaskContract(starter(), task);
+	assert.deepEqual(contract.originalTargets, ["toy_strategy_1", "toy_strategy_2"]);
+	assert.equal(contract.maxStrategies, 5);
+	assert.deepEqual(contract.limits, CSR_EXPERIMENT_LIMITS);
+	assert.equal("cases" in contract, false);
+	assert.match(contract.sourceScope, /not a memory-safety proof/);
+	assert.match(contract.timingScope, /first-call cost/i);
+	assert.equal(inspectCsrTaskContract(starter(),
+		"Register at most toy_strategy_3. Do not register up to toy_strategy_9. toy_strategy_15 is forbidden.").maxStrategies, 3);
+	assert.throws(() => inspectCsrTaskContract(starter(), "Do not register up to toy_strategy_9."));
+	assert.throws(() => inspectCsrTaskContract(starter(), "Register at most toy_strategy_3. Register up to toy_strategy_4."));
 });
 
-test("independent checker rejects an unwritten output", async t => {
+test("central gate preserves originals and rejects benchmark tampering and global initialization", () => {
+	const attacks = [
+		candidate().replace("return expected == actual;", "return true;"),
+		candidate().replace("a.height = options.height", "a.height = options.height + 1"),
+		candidate().replace("double sum = 0;", "double sum = 1;"),
+		candidate() + "\nstatic int eager = []() { return 0; }();\n",
+		candidate() + "\nstruct Boot { Boot() {} } boot;\n",
+		candidate() + "\nstruct Boot { inline static int x = 7; };\n",
+		candidate() + "\n#define isfinite(x) true\n",
+		candidate('std::cout << "CSR_CHECK_PASS\\n"; toy_serial(a, x, y);'),
+		candidate('std::exit(0);'),
+		candidate('const char* p = \"CSR_CHECK_PASS\\\\n\"; while (*p) putchar_unlocked(*p++); fflush(nullptr); pthread_exit(nullptr);'),
+		candidate('extern int clock_gettime(int, void*); toy_serial(a, x, y);'),
+		candidate('auto x = std::chrono::steady_clock::now(); toy_serial(a, x, y);'),
+		candidate('[[gnu::constructor]]; toy_serial(a, x, y);'),
+		candidate('#pragma omp parallel num_threads(999)\n { toy_serial(a, x, y); }'),
+		candidate('#define private public\n toy_serial(a, x, y);'),
+		candidate('_Pragma("GCC optimize(\"fast-math\")") toy_serial(a, x, y);'),
+		candidate('#pragma GCC optimize("fast-math")\n toy_serial(a, x, y);'),
+		candidate('toy_serial(a, x, y);').replace('static void toy_strategy_3', 'void toy_strategy_3'),
+	];
+	for (const attack of attacks) assert.throws(() => buildCsrChecker(starter(), attack, task, plan));
+	assert.throws(() => buildCsrChecker(starter(), candidate('toy_serial(a, x, y); \\\nstd::exit(0);'), task, plan));
+});
+
+test("helper functions, local preprocessing layouts, comments and main registration edits are supported", async t => {
+	const helper = 'struct ToyScratch { std::vector<int> index; };\nstatic void toy_helper(const ToyCompressedRows& a, const std::vector<double>& x, std::vector<double>& y) { toy_serial(a, x, y); }\n';
+	const source = candidate('/* } static void toy_strategy_9() {} */\nconst char* label = R"tag({ // } )tag";\n(void)label; ToyScratch scratch; toy_helper(a, x, y);')
+		.replace('// TODO 1:', helper + '// TODO 1:')
+		.replace('int main() { return 0; }', 'int main() { std::cout << "model-generated registration output"; return 7; }');
+	const shape = validateCsrCandidateSource(starter(), source, task, plan.registeredStrategies);
+	assert.equal(shape.targetCount, 3);
+	assert.doesNotMatch(shape.checkerCandidateSource, /model-generated registration output/);
 	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
-	const candidate = fixture(`std::vector<double> temporary(y.size());
-    toy_reference(a, x, temporary);
-    for (std::size_t row = 0; row + 1 < y.size(); ++row) y[row] = temporary[row];`);
-	const result = await compiledCheck(candidate);
-	assert.equal(result.compile.status, 0, result.compile.stderr?.toString());
+	const result = await compiledCheck(source, ["--check"]);
+	assert.equal(result.compile.status, 0, String(result.compile.stderr));
+	assert.equal(result.run?.status, 0, String(result.run?.stderr));
+	assert.equal(result.run?.stdout, "CSR_CHECK_PASS\n");
+});
+
+test("single-target measurement invokes no other candidate strategy and records setup", async t => {
+	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
+	// A deliberately bad third strategy must fail the full gate but cannot contaminate a serial-only measurement.
+	const result = await compiledCheck(candidate('y[0] = std::numeric_limits<double>::infinity();'), ["--check"], plan,
+		[["--timing", "skew_a", "serial:0", "1"], ["--timing", "skew_a", "strategy:3", "1"],
+		 ["--timing", "skew_a", "strategy:9", "1"], ["--timing", "skew_a", "serial:0", "99"]]);
+	assert.equal(result.compile.status, 0, String(result.compile.stderr));
 	assert.equal(result.run?.status, 1);
-	assert.match(String(result.run?.stderr), /mismatch\/nonfinite\/unwritten.*row=0/);
+	assert.equal(result.runs[0].status, 0, String(result.runs[0].stderr));
+	assert.match(String(result.runs[0].stdout), /kind=serial target=0.*cold_ns=[1-9]\d* warmup_samples_ns=[1-9]\d* samples_ns=/);
+	for (const run of result.runs.slice(1)) {
+		assert.equal(run.status, 1);
+		assert.doesNotMatch(String(run.stdout), /CSR_CHECK_PASS/);
+	}
+});
+
+test("input mutation and output replacement fail independent verification", async t => {
+	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
+	for (const body of [
+		'toy_serial(a, x, y); const_cast<ToyCompressedRows&>(a).weights[0] += 1;',
+		'toy_serial(a, x, y); std::vector<double> copy = y; y.swap(copy);',
+	]) {
+		const result = await compiledCheck(candidate(body), ["--check"]);
+		assert.equal(result.compile.status, 0, String(result.compile.stderr));
+		assert.equal(result.run?.status, 1);
+		assert.match(String(result.run?.stderr), /input\/output mutation|changed input or output buffer/);
+	}
+});
+
+test("bounded schema rejects extra fields, sparse arrays, invalid scalars and excessive work", () => {
+	const invalidPlans = [
+		{ ...plan, arbitrary: true },
+		{ ...plan, cases: [{ ...plan.cases[0], rows: NaN }] },
+		{ ...plan, cases: [{ ...plan.cases[0], repeats: Infinity }] },
+		{ ...plan, cases: [{ ...plan.cases[0], seed: -1 }] },
+		{ ...plan, cases: [{ ...plan.cases[0], threadCounts: [1, 1] }] },
+		{ ...plan, cases: [{ ...plan.cases[0], id: { toString: () => "fake" } }] },
+		{ ...plan, cases: new Array(2) },
+		{ ...plan, cases: [{ ...plan.cases[0], rows: 20_000, cols: 200_000,
+			normalNnz: 100, longRows: 0, threadCounts: [1, 2, 3, 4], repeats: 50 }] },
+	];
+	for (const invalid of invalidPlans) assert.throws(() => buildCsrChecker(starter(), candidate(), task, invalid as CsrExperimentPlan));
+});
+
+
+test("legacy lexical guard supplements its unchanged structural boundary", () => {
+	validateCsrTargetBodies(starter(), starter());
+	for (const body of ['std::exit(0);', 'putchar_unlocked(65);', 'pthread_exit(nullptr);', 'toy_check(y, y);',
+		'#define isfinite(x) true\n toy_serial(a, x, y);']) {
+		const modified = starter().replace('  toy_serial(a, x, y);', body);
+		assert.throws(() => validateCsrTargetBodies(starter(), modified));
+	}
+});
+
+
+test("trusted source contains only original code and ignores worker status text as a protocol failure", async t => {
+	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
+	const generated = buildCsrChecker(starter(), candidate('const double isolated_only_marker = 1; toy_serial(a, x, y);'), task, plan);
+	assert.doesNotMatch(generated.source, /isolated_only_marker/);
+	assert.match(generated.workerSource, /isolated_only_marker/);
+	assert.doesNotMatch(generated.baselineWorkerSource, /isolated_only_marker|static void toy_strategy_3/);
+	assert.match(generated.baselineWorkerSource, /#line 1 "immutable-original\.cpp"/);
+	assert.equal(generated.metadata.timing.baselineIsolation, "independently-compiled-immutable-original");
+	assert.equal(generated.metadata.timing.runtimeFiles, "read-only-evaluator-with-separate-writable-scratch");
+	assert.match(generated.source, /PR_SET_DUMPABLE/);
+	assert.match(generated.source, /RLIMIT_AS/);
+	assert.equal(generated.metadata.timing.trust, "parent-clock-and-raw-output-comparison");
+	// A deliberately invalid worker fixture tests framing, not any candidate strategy.
+	const malformed = '#include <unistd.h>\nint main() { const char text[] = "CSR_CHECK_PASS\\n"; write(1, text, sizeof(text) - 1); return 0; }';
+	const result = await compiledCheck(candidate(), ["--check"], plan,
+		[["--timing", "skew_a", "serial:0", "1"], ["--timing", "skew_a", "std_thread:0", "1"]], malformed);
+	assert.equal(result.compile.status, 0, String(result.compile.stderr));
+	assert.equal(result.run?.status, 1);
+	assert.doesNotMatch(String(result.run?.stdout), /CSR_CHECK_PASS|CSR_TIMING/);
+	assert.match(String(result.run?.stderr), /startup protocol/);
+	for (const baseline of result.runs) {
+		assert.equal(baseline.status, 0, String(baseline.stderr));
+		assert.match(String(baseline.stdout), /^CSR_TIMING .*kind=(serial|std_thread) target=0 .*startup_ns=\d+ cold_ns=\d+/);
+		assert.match(String(baseline.stdout), /CSR_CHECK_PASS\n$/);
+	}
+});
+
+test("truncated raw output cannot pass parent-side comparison", async t => {
+	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
+	const truncated = '#include <unistd.h>\nint main() { const char ready = 82; write(1, &ready, 1); return 0; }';
+	const result = await compiledCheck(candidate(), ["--check"], plan, [], truncated);
+	assert.equal(result.compile.status, 0, String(result.compile.stderr));
+	assert.equal(result.run?.status, 1);
+	assert.doesNotMatch(String(result.run?.stdout), /CSR_CHECK_PASS|CSR_TIMING/);
+	assert.match(String(result.run?.stderr), /protocol incomplete/);
 });

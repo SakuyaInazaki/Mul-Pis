@@ -35,6 +35,8 @@ export async function runMeasuredEvidenceHandoff(input: {
 	handle: SessionHandle;
 	implementationPrompt: string;
 	sourceFile: string;
+	/** Additional model-authored inputs used by host measurement, such as an experiment plan. */
+	frozenSourceFiles?: string[];
 	evidenceFile: string;
 	measure: () => Promise<void>;
 	finalizationPrompt: string;
@@ -46,23 +48,30 @@ export async function runMeasuredEvidenceHandoff(input: {
 	const usageStart = handle.usageEvents().length;
 	const implementation = await handle.prompt(input.implementationPrompt);
 	const sourceBefore = await frozenFile(input.sourceFile, true);
+	const additionalBefore = await Promise.all((input.frozenSourceFiles ?? []).map(file => frozenFile(file, true)));
 	await input.measure();
 	const sourceMeasured = await frozenFile(input.sourceFile, true);
+	const additionalMeasured = await Promise.all((input.frozenSourceFiles ?? []).map(file => frozenFile(file, true)));
 	if (Boolean(sourceBefore) !== Boolean(sourceMeasured) ||
-		(sourceBefore && sourceMeasured && !sourceBefore.equals(sourceMeasured)))
+		(sourceBefore && sourceMeasured && !sourceBefore.equals(sourceMeasured)) ||
+		additionalBefore.some((bytes, index) => Boolean(bytes) !== Boolean(additionalMeasured[index]) ||
+			(bytes && additionalMeasured[index] && !bytes.equals(additionalMeasured[index]))))
 		throw new HarnessError("m07.evidence-finalization", "candidate source changed while host verification ran");
-	// A missing candidate is a measured failure for the ordinary reviewer to request repair.
-	if (!sourceMeasured) return implementation;
+	// Even an absent source is host feedback the actor must read before ordinary repair review.
 	const evidenceMeasured = await frozenFile(input.evidenceFile);
 	if (!evidenceMeasured) throw new HarnessError("m07.evidence-finalization", "host verification is missing");
 	const toolStart = handle.toolLog().length;
 	input.onFinalization?.();
 	const finalization = await handle.prompt(input.finalizationPrompt);
 	const [sourceFinal, evidenceFinal] = await Promise.all([
-		frozenFile(input.sourceFile), frozenFile(input.evidenceFile),
+		frozenFile(input.sourceFile, true), frozenFile(input.evidenceFile),
 	]);
-	if (!sourceFinal?.equals(sourceMeasured) || !evidenceFinal?.equals(evidenceMeasured))
+	const additionalFinal = await Promise.all((input.frozenSourceFiles ?? []).map(file => frozenFile(file, true)));
+	if (Boolean(sourceFinal) !== Boolean(sourceMeasured) || (sourceFinal && sourceMeasured && !sourceFinal.equals(sourceMeasured)) || !evidenceFinal?.equals(evidenceMeasured))
 		throw new HarnessError("m07.evidence-finalization", "candidate or verification changed after measurement");
+	if (additionalMeasured.some((bytes, index) => Boolean(bytes) !== Boolean(additionalFinal[index]) ||
+		(bytes && additionalFinal[index] && !bytes.equals(additionalFinal[index]))))
+		throw new HarnessError("m07.evidence-finalization", "experiment input changed after measurement");
 	const evidencePath = path.resolve(input.evidenceFile);
 	const readEvidence = handle.toolLog().slice(toolStart).some((call) =>
 		call.ok && call.name === input.readToolName && typeof call.args.path === "string" &&

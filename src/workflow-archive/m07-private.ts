@@ -19,8 +19,9 @@ const MAX_KNOWLEDGE_RECORDS = 48;
 const MAX_KNOWLEDGE_BYTES = 256_000;
 const FILES = [
 	{ name: "candidate.cpp", maxBytes: 128_000 },
-	{ name: "verification.json", maxBytes: 256_000 },
+	{ name: "verification.json", maxBytes: 1_000_000 },
 	{ name: "lesson-delta.json", maxBytes: 16_000 },
+	{ name: "experiment-plan.json", maxBytes: 16_000 },
 ] as const;
 
 export interface PrivateM07ArchiveV1 {
@@ -158,10 +159,11 @@ function safeVerification(raw: Buffer): Record<string, unknown> | undefined {
 		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 		const item = value as Record<string, unknown>;
 		if (item.state === "unavailable") return { state: "unavailable" };
-		if (item.state !== "measured" || !Array.isArray(item.ratios) || item.ratios.length !== 8 ||
+		if (item.state !== "measured" || !Array.isArray(item.ratios) || (item.scope === "best-registered-observation-per-exact-case-with-cold-cost" ? item.ratios.length < 2 || item.ratios.length > 48 : item.ratios.length !== 8) ||
 			!item.ratios.every(ratio => numeric(ratio, 0, 1e9)) ||
 			!numeric(item.medianRatio, 0, 1e9) || !numeric(item.minRatio, 0, 1e9)) return undefined;
-		return { state: "measured", ratios: [...item.ratios], medianRatio: item.medianRatio, minRatio: item.minRatio };
+		return { state: "measured", ratios: [...item.ratios], medianRatio: item.medianRatio, minRatio: item.minRatio,
+			...(item.scope === "best-registered-observation-per-exact-case-with-cold-cost" ? { scope: item.scope } : {}) };
 	};
 	const independent = parsed.independent && typeof parsed.independent === "object" && !Array.isArray(parsed.independent)
 		? parsed.independent as Record<string, unknown> : undefined;
@@ -171,11 +173,49 @@ function safeVerification(raw: Buffer): Record<string, unknown> | undefined {
 	const baselineTimings = baselineIndependent?.timings === undefined ? undefined : trustedTimings(baselineIndependent.timings);
 	const originalComparison = parsed.originalHostComparison === undefined ? undefined : comparison(parsed.originalHostComparison);
 	const priorComparison = parsed.priorCandidateComparison === undefined ? undefined : comparison(parsed.priorCandidateComparison);
+	const registered = parsed.registeredExperiment && typeof parsed.registeredExperiment === "object" &&
+		!Array.isArray(parsed.registeredExperiment) ? parsed.registeredExperiment as Record<string, unknown> : undefined;
+	let registeredSummary: Record<string, unknown> | undefined;
+	if (registered) {
+		const names = registered.strategyNames;
+		const timings = registered.timings;
+		const plan = registered.plan;
+		if (!boundedStatus(registered.status)) return undefined;
+		if (registered.status !== "passed") registeredSummary = { status: registered.status,
+			...(typeof registered.reason === "string" ? { reason: redactExplicitText(registered.reason).text.slice(0, 4_000) } : {}),
+			...(Array.isArray(timings) && exportSafe(timings) && timings.length <= 432 ? { timings } : {}),
+			...(plan && exportSafe(plan) ? { plan } : {}) };
+		else if (!Array.isArray(names) || names.length > 16 ||
+			!names.every(name => typeof name === "string" && /^[A-Za-z_]\w{0,79}$/.test(name)) ||
+			!Array.isArray(timings) || timings.length > 432 || !exportSafe(timings) ||
+			!plan || typeof plan !== "object" || !exportSafe(plan) ||
+			Buffer.byteLength(JSON.stringify({ plan, timings }), "utf8") > 900_000) return undefined;
+		else registeredSummary = { status: registered.status, strategyNames: names, plan, timings,
+			...copy(registered, ["accounting", "freshProcessPerSelection", "metric", "measurementAuthority", "baselineIsolation", "runtimeFiles"]),
+			...(Array.isArray(registered.compileFlags) ? { compileFlags: registered.compileFlags.filter(value => typeof value === "string") } : {}) };
+	}
 	if ((independent?.timings !== undefined && !timings) || (independent?.status === "passed" && independent.timings !== undefined && timings?.length !== 8) ||
 		(parsed.originalBaselineIndependent !== undefined && (baselineIndependent?.status !== "passed" || baselineTimings?.length !== 8)) ||
 		(parsed.originalHostComparison !== undefined && !originalComparison) || (parsed.priorCandidateComparison !== undefined && !priorComparison)) return undefined;
+	const priorTiming = parsed.priorCandidateTimingEvidence && typeof parsed.priorCandidateTimingEvidence === "object" ?
+		parsed.priorCandidateTimingEvidence as Record<string, unknown> : undefined;
+	let priorTimingSummary: Record<string, unknown> | undefined;
+	if (priorTiming && exportSafe(priorTiming) && Buffer.byteLength(JSON.stringify(priorTiming), "utf8") <= 900_000) {
+		const measured = priorTiming.registeredExperiment as Record<string, unknown> | undefined;
+		const legacy = priorTiming.independent as Record<string, unknown> | undefined;
+		priorTimingSummary = { ...copy(priorTiming, ["status", "remeasuredOnCurrentHost", "historicalTimingUsed"]),
+			...(measured?.status === "passed" ? { registeredExperiment: { status: measured.status,
+				strategyNames: measured.strategyNames, plan: measured.plan, timings: measured.timings } } : {}),
+			...(legacy?.status === "passed" && trustedTimings(legacy.timings) ?
+				{ independent: { status: "passed", timings: trustedTimings(legacy.timings) } } : {}) };
+	}
 	// Deliberate allowlist: no command arguments, stdout/stderr, tool logs or session material.
+	const feedback = parsed.hostFeedback && typeof parsed.hostFeedback === "object" &&
+		(parsed.hostFeedback as Record<string, unknown>).version === 1 &&
+		(parsed.hostFeedback as Record<string, unknown>).kind === "execution-result-feedback" ?
+		JSON.parse(redactExplicitText(JSON.stringify(parsed.hostFeedback)).text) as unknown : undefined;
 	const summary = {
+		...(feedback && exportSafe(feedback) && Buffer.byteLength(JSON.stringify(feedback), "utf8") <= 64_000 ? { hostFeedback: feedback } : {}),
 		...(typeof parsed.version === "number" ? { version: parsed.version } : {}),
 		...(boundedStatus(parsed.status) ? { status: boundedStatus(parsed.status) } : {}),
 		...(copy(parsed.sourceShape, ["ok", "targetCount"]) ? { sourceShape: copy(parsed.sourceShape, ["ok", "targetCount"]) } : {}),
@@ -186,6 +226,8 @@ function safeVerification(raw: Buffer): Record<string, unknown> | undefined {
 		...(baselineTimings ? { originalBaselineIndependent: { status: "passed", timings: baselineTimings } } : {}),
 		...(originalComparison ? { originalHostComparison: originalComparison } : {}),
 		...(priorComparison ? { priorCandidateComparison: priorComparison } : {}),
+		...(registeredSummary ? { registeredExperiment: registeredSummary } : {}),
+		...(priorTimingSummary ? { priorCandidateTimingEvidence: priorTimingSummary } : {}),
 		...(Array.isArray(parsed.originalCheckerRuns) ? { originalCheckerRuns: parsed.originalCheckerRuns.slice(0, 16).map(run => ({
 			...copy(run, ["exitCode", "isolatedProcessWallMs"]),
 			...(Array.isArray((run as Record<string, unknown>)?.reportedKernelMs) ? {
@@ -312,6 +354,13 @@ export async function archivePrivateM07Task(input: {
 		}
 		if (item.name === "candidate.cpp" && !exportSafe((await readFile(source.source)).toString("utf8"))) {
 			files.push({ name: item.name, status: "invalid" }); continue;
+		}
+		if (item.name === "experiment-plan.json") {
+			let parsed: unknown;
+			try { parsed = JSON.parse(await readFile(source.source, "utf8")); } catch { parsed = undefined; }
+			if (!parsed || typeof parsed !== "object" || !exportSafe(parsed)) {
+				files.push({ name: item.name, status: "invalid" }); continue;
+			}
 		}
 		const target = path.join(input.destination, item.name);
 		const temporary = `${target}.${process.pid}.tmp`;

@@ -6,8 +6,9 @@ import type { SessionRunner, SessionSpec } from "../runner/types.ts";
 import type { StageRunRecord } from "../types.ts";
 import { HarnessError } from "../types.ts";
 
-const MAX_EVIDENCE_BYTES = 256_000;
+const MAX_EVIDENCE_BYTES = 1_000_000;
 const MAX_ASSESSMENT_BYTES = 32_000;
+const safeAdapterId = (value: unknown): value is string => typeof value === "string" && /^[a-z][a-z0-9._/-]{0,95}$/.test(value);
 const safeName = (value: string) => /^[A-Za-z][A-Za-z0-9._-]{0,79}$/.test(value);
 const safeInputName = (value: string) => /^[A-Za-z0-9][A-Za-z0-9 ._()-]{0,119}$/.test(value);
 const shortText = (value: unknown, limit: number): value is string =>
@@ -22,15 +23,25 @@ export interface OriginalObjectiveContractV1 {
 	goal: string;
 	goalSource: "verbatim-private-input" | "user-intent-summary";
 	inputNames: string[];
+	/** User directions override conflicting requirements in supplied task material. */
+	userOverrides?: string[];
 	obligations: Array<{ id: string; description: string }>;
-	/** Open-ended strongest-attainable work cannot be closed by a finite pilot's checks. */
+	/** Open-ended strongest-attainable work cannot be closed by a finite evaluation's checks. */
 	closure: "open-ended" | "finite-evidence";
 }
 
 export interface ObjectiveNextTaskV1 {
 	objective: string;
 	addresses: string[];
-	adapterScope: "two-target-existing" | "outside-current-adapter";
+	/** Opaque caller-registered capability ID. Legacy serialized adapter IDs remain readable. */
+	adapterScope: string;
+}
+
+export interface ObjectiveCapabilityV1 {
+	scope: ObjectiveNextTaskV1["adapterScope"];
+	available: boolean;
+	description: string;
+	limits: string[];
 }
 
 export interface ModelObjectiveAssessmentV1 {
@@ -48,7 +59,7 @@ export type ObjectiveStopReason = "budget-boundary" | "provider-call-limit" | "a
 	"time-boundary" | "assessment-failed" |
 	"assessment-invalid" | "assessment-evidence-unread" | "model-reported-blocked" | "model-closure-unverified" |
 	"original-checks-unverified" | "assessment-validation-pending" | "next-task-pending" | "next-task-needs-capability" |
-	"objective-reassessment-pending" | "dispatch-failed" | "no-progress" |
+	"objective-reassessment-pending" | "dispatch-failed" | "no-progress" | "capability-replan-stalled" |
 	"artifact-capacity-boundary" | "m04-evidence-incomplete" | "bounded-run-incomplete";
 
 export interface ObjectiveProgressV1 {
@@ -58,7 +69,8 @@ export interface ObjectiveProgressV1 {
 	objectiveOutcome: "incomplete" | "fulfilled";
 	stopReason: ObjectiveStopReason | null;
 	assessment?: ModelObjectiveAssessmentV1 & { sessionId: string; model: string; evidenceRead: string[];
-		unreadEvidence: string[] };
+		unreadEvidence: string[]; proposalHistory?: ModelObjectiveAssessmentV1[];
+		blockedProposals?: ObjectiveNextTaskV1[] };
 	assessmentHistory: Array<{ iteration: number; assessment: NonNullable<ObjectiveProgressV1["assessment"]>;
 		stopReason: ObjectiveStopReason; advanced: boolean }>;
 	boundedRuns: Array<{ runId: string; outcome: string; selectedTaskId?: string;
@@ -68,6 +80,7 @@ export interface ObjectiveProgressV1 {
 	continuation: { mode: "explicit-authorized-new-run" | "reconcile-operations-before-new-run";
 		unresolvedOperationIds: string[]; unresolvedObligations: string[];
 		unresolvedDetails: string[];
+		blockedProposals?: ObjectiveNextTaskV1[];
 		nextTask?: ObjectiveNextTaskV1; requiresOriginalInputs: true; requiresBudgetAdmission: true;
 		requiresOperationReconciliation: boolean };
 }
@@ -96,6 +109,7 @@ export async function runOriginalObjectiveLoop(input: {
 
 export function createOriginalObjective(input: {
 	goal: string; goalSource: OriginalObjectiveContractV1["goalSource"]; inputNames: string[];
+	userOverrides?: string[];
 	obligations: Array<{ id: string; description: string }>; closure: OriginalObjectiveContractV1["closure"];
 }): OriginalObjectiveContractV1 {
 	if (!shortText(input.goal, 4_000) || !Array.isArray(input.inputNames) || !input.inputNames.length ||
@@ -105,10 +119,13 @@ export function createOriginalObjective(input: {
 		input.obligations.some(item => !safeName(item.id) || !shortText(item.description, 1_000)) ||
 		new Set(input.obligations.map(item => item.id)).size !== input.obligations.length ||
 		!["verbatim-private-input", "user-intent-summary"].includes(input.goalSource) ||
-		!["open-ended", "finite-evidence"].includes(input.closure))
+		!["open-ended", "finite-evidence"].includes(input.closure) ||
+		!Array.isArray(input.userOverrides ?? []) || (input.userOverrides ?? []).length > 12 ||
+		(input.userOverrides ?? []).some(item => !shortText(item, 1_000)))
 		throw new HarnessError("m07.objective", "original objective contract is invalid");
 	return { version: 1, kind: "original-objective", id: randomUUID(), createdAt: new Date().toISOString(),
 		goal: input.goal, goalSource: input.goalSource, inputNames: [...input.inputNames],
+		...(input.userOverrides ? { userOverrides: [...input.userOverrides] } : {}),
 		obligations: input.obligations.map(item => ({ ...item })), closure: input.closure };
 }
 
@@ -135,8 +152,7 @@ function parseAssessment(text: string, contract: OriginalObjectiveContractV1, ev
 			throw new HarnessError("m07.objective-assessment", "next task object is invalid");
 		const task = raw.nextTask as Record<string, unknown>;
 		if (!shortText(task.objective, 4_000) || !strings(task.addresses, ids, 12) ||
-			typeof task.adapterScope !== "string" ||
-			!["two-target-existing", "outside-current-adapter"].includes(task.adapterScope) ||
+			!safeAdapterId(task.adapterScope) ||
 			!task.addresses.length || task.addresses.some(item => !(raw.unresolvedObligations as string[]).includes(item)))
 			throw new HarnessError("m07.objective-assessment", "next task does not address unresolved original obligations");
 		nextTask = { objective: task.objective, addresses: task.addresses,
@@ -180,7 +196,9 @@ export function objectiveProgress(contract: OriginalObjectiveContractV1, input: 
 		continuation: { mode: input.unresolvedOperationIds?.length ? "reconcile-operations-before-new-run" :
 			"explicit-authorized-new-run", unresolvedOperationIds: [...(input.unresolvedOperationIds ?? [])],
 			unresolvedObligations: unresolved,
-			unresolvedDetails: fulfilled ? [] : input.assessment?.unresolvedDetails ?? [],
+			unresolvedDetails: fulfilled ? [] : [...new Set([...(input.assessment?.unresolvedDetails ?? []),
+				...(input.assessment?.blockedProposals ?? []).map(item => item.objective)])],
+			...(input.assessment?.blockedProposals?.length ? { blockedProposals: input.assessment.blockedProposals } : {}),
 			...(input.assessment?.nextTask && input.assessment.unreadEvidence.length === 0 && !input.nextTaskDispatched ?
 				{ nextTask: input.assessment.nextTask } : {}),
 			requiresOriginalInputs: true, requiresBudgetAdmission: true,
@@ -194,9 +212,14 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 	persistReceipt: () => Promise<void>;
 	evidenceRoot: string;
 	evidence: Array<{ name: string; file: string }>;
+	/** Task adapters own artifact names and semantic evidence contracts. */
+	evidenceRequirements?: { requiredNames: string[]; instructions?: string };
 	assessmentAdmission: "admitted" | "budget-boundary" | "time-boundary";
 	advanceAdmission: () => "admitted" | ObjectiveStopReason;
 	supportedTaskScopes: ObjectiveNextTaskV1["adapterScope"][];
+	capabilities?: ObjectiveCapabilityV1[];
+	/** Current user policy, applied without rewriting a frozen prior contract. */
+	userOverrides?: string[];
 	recordAssessment?: (assessment: NonNullable<ObjectiveProgressV1["assessment"]>) => Promise<void>;
 	advance: (task: ObjectiveNextTaskV1) => Promise<T>;
 }): Promise<{ assessment?: ObjectiveProgressV1["assessment"]; advanced?: T; stopReason: ObjectiveStopReason }> {
@@ -205,10 +228,22 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		!input.evidence.length || input.evidence.length > 16 || input.evidence.some(item => !safeName(item.name)) ||
 		new Set(input.evidence.map(item => item.name)).size !== input.evidence.length)
 		throw new HarnessError("m07.objective", "objective assessment boundary is invalid");
-	if (!input.evidence.some(item => item.name === "original-problem.txt") ||
-		!input.evidence.some(item => item.name === "candidate.cpp") ||
-		!input.evidence.some(item => item.name === "verification.json"))
-		throw new HarnessError("m07.objective", "original problem and selected candidate evidence are required");
+	if (input.capabilities?.some(item => !safeAdapterId(item.scope) ||
+		typeof item.available !== "boolean" || !shortText(item.description, 1_000) ||
+		!Array.isArray(item.limits) || item.limits.length > 12 || item.limits.some(limit => !shortText(limit, 1_000))) ||
+		new Set(input.capabilities?.map(item => item.scope)).size !== (input.capabilities?.length ?? 0))
+		throw new HarnessError("m07.objective", "objective capability facts are invalid");
+	if (!Array.isArray(input.userOverrides ?? []) || (input.userOverrides ?? []).length > 12 ||
+		(input.userOverrides ?? []).some(item => !shortText(item, 1_000)))
+		throw new HarnessError("m07.objective", "current user overrides are invalid");
+	if (input.supportedTaskScopes.some(scope => !safeAdapterId(scope)) ||
+		new Set(input.supportedTaskScopes).size !== input.supportedTaskScopes.length)
+		throw new HarnessError("m07.objective", "supported adapter IDs are invalid");
+	if (input.evidenceRequirements && (!Array.isArray(input.evidenceRequirements.requiredNames) ||
+		input.evidenceRequirements.requiredNames.some(name => !safeName(name) || !input.evidence.some(item => item.name === name)) ||
+		(input.evidenceRequirements.instructions !== undefined && !shortText(input.evidenceRequirements.instructions, 4_000))))
+		throw new HarnessError("m07.objective", "required adapter evidence is missing or invalid");
+
 	const contractBytes = await readFile(input.contractFile);
 	if (contractBytes.toString("utf8") !== `${JSON.stringify(input.contract, null, 2)}\n`)
 		throw new HarnessError("m07.objective", "original objective contract changed after freezing");
@@ -245,20 +280,18 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 	}, input.persistReceipt);
 	try {
 		const prompt = ["# Original objective (unchanged)", input.contract.goal,
+			"# User overrides (higher priority than supplied task material)",
+			...(input.userOverrides ?? input.contract.userOverrides ?? []),
 			"# Original obligations", ...input.contract.obligations.map(item => `${item.id}: ${item.description}`),
+			"# Observed execution capabilities", ...(input.capabilities ?? []).map(item =>
+				`${item.scope}: ${item.available ? "available" : "unavailable"}; ${item.description}; limits: ${item.limits.join("; ")}`),
 			`Closure policy: ${input.contract.closure}. A bounded child goal and accepted candidate do not alone establish original-goal completion.`,
-			"The original-input-N.txt files correspond in order to inputNames in original-objective.json; read all of them as authoritative original material.",
+			input.evidenceRequirements?.instructions ?? "Read all supplied material; the caller identifies the original inputs and the meaning of artifact names.",
 			"# Frozen bounded evidence", "Use objective_evidence_read to read the complete original-objective.json and every listed file. If a file is paginated, read every page including the untruncated end. The file names are:",
 			...materials.map(item => item.name),
-			"Return only strict JSON with version 1, decision (fulfilled, continue, or blocked), rationale, evidenceRefs (file names above), unresolvedObligations (IDs above), unresolvedDetails (your concrete open requirements from the full original assignment), and when continuing nextTask {objective, addresses, adapterScope}. Choose adapterScope two-target-existing only if the proposed work fits edits to the two existing target bodies under the current adapter; otherwise use outside-current-adapter so the proposal is retained without silently narrowing it. Assess honestly. Propose the next scientific work yourself from unresolved original obligations; do not change task permissions or claim a global optimum from a finite pilot."].join("\n\n");
-		let response;
-		try { response = await handle.prompt(prompt); }
-		catch { return { stopReason: "assessment-failed" }; }
-		let parsed;
-		try { parsed = parseAssessment(response.text, input.contract, materials.map(item => item.name)); }
-		catch { return { stopReason: "assessment-invalid" }; }
-		const returned = handle.readReturnEvents();
+			"Return only strict JSON with version 1, decision (fulfilled, continue, or blocked), rationale, evidenceRefs (file names above), unresolvedObligations (IDs above), unresolvedDetails (your concrete open requirements from the full original assignment), and when continuing nextTask {objective, addresses, adapterScope}. Use a scope only when its observed host capability covers your proposed work. If a proposed task has no available registered executor, retain it as unresolved and name the unavailable capability explicitly. The host may ask you to replan feasible work; preserve unresolved requirements. Assess honestly. Propose the next scientific work yourself from unresolved original obligations; do not change task permissions or claim a global optimum from a finite evaluation."].join("\n\n");
 		const complete = (name: string, contents: string): boolean => {
+			const returned = handle.readReturnEvents();
 			const lines = contents.split("\n").length - (contents.endsWith("\n") ? 1 : 0);
 			const rows = returned.filter(item => item.toolName === "objective_evidence_read" && item.path === name &&
 				item.status === "returned" && item.returned.kind === "text" && item.returned.startLine !== undefined &&
@@ -269,19 +302,67 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			return rows.some(item => item.returned.endLine === lines && item.returned.truncated === false) && covered.size === lines;
 		};
 		const readMaterials = [{ name: "original-objective.json", text: contractBytes.toString("utf8") }, ...materials];
-		const evidenceRead = readMaterials.filter(item => complete(item.name, item.text)).map(item => item.name);
-		const unreadEvidence = readMaterials.filter(item => !evidenceRead.includes(item.name)).map(item => item.name);
-		const assessment = { ...parsed, sessionId: handle.ref.id, model: handle.ref.model, evidenceRead, unreadEvidence };
-		await input.recordAssessment?.(assessment);
-		if (unreadEvidence.length) return { assessment, stopReason: "assessment-evidence-unread" };
-		if (parsed.decision === "blocked") return { assessment, stopReason: "model-reported-blocked" };
-		if (parsed.decision === "fulfilled") return { assessment, stopReason: "model-closure-unverified" };
-		if (!input.supportedTaskScopes.includes(parsed.nextTask!.adapterScope))
-			return { assessment, stopReason: "next-task-needs-capability" };
-		const advanceAdmission = input.advanceAdmission();
-		if (advanceAdmission !== "admitted") return { assessment, stopReason: advanceAdmission };
-		const advanced = await input.advance(parsed.nextTask!);
-		return { assessment, advanced, stopReason: "objective-reassessment-pending" };
+		const proposals: ModelObjectiveAssessmentV1[] = [];
+		const unsupported = new Set<string>();
+		const blockedProposals: ObjectiveNextTaskV1[] = [];
+		let challengedBlocked = false;
+		let latestAssessment: ObjectiveProgressV1["assessment"];
+		let request = prompt;
+		for (;;) {
+			let response;
+			try { response = await handle.prompt(request); }
+			catch { return { assessment: latestAssessment, stopReason: "assessment-failed" }; }
+			let parsed;
+			try { parsed = parseAssessment(response.text, input.contract, materials.map(item => item.name)); }
+			catch { return { assessment: latestAssessment, stopReason: "assessment-invalid" }; }
+			proposals.push(parsed);
+			const evidenceRead = readMaterials.filter(item => complete(item.name, item.text)).map(item => item.name);
+			const unreadEvidence = readMaterials.filter(item => !evidenceRead.includes(item.name)).map(item => item.name);
+			const assessment = { ...parsed, sessionId: handle.ref.id, model: handle.ref.model,
+				evidenceRead, unreadEvidence, proposalHistory: [...proposals],
+				...(blockedProposals.length ? { blockedProposals: [...blockedProposals] } : {}) };
+			latestAssessment = assessment;
+			await input.recordAssessment?.(assessment);
+			if (unreadEvidence.length) return { assessment, stopReason: "assessment-evidence-unread" };
+			if (parsed.decision === "blocked") {
+				const available = input.capabilities?.filter(item => item.available && input.supportedTaskScopes.includes(item.scope)) ?? [];
+				if (challengedBlocked || !available.length) return { assessment, stopReason: "model-reported-blocked" };
+				const admission = input.advanceAdmission();
+				if (admission !== "admitted") return { assessment, stopReason: admission };
+				challengedBlocked = true;
+				request = ["Before making this blocked result terminal, reassess every remaining requirement against the available capabilities.",
+					"Unavailable optional equipment alone does not establish that all feasible work is exhausted. Choose another feasible pending part if one exists; otherwise retain the unresolved work and explain which limit blocks each part.",
+					...available.map(item => `${item.scope}: ${item.description}; limits: ${item.limits.join("; ")}`),
+					"Preserve user overrides and return the same strict JSON schema."].join("\n\n");
+				continue;
+			}
+			if (parsed.decision === "fulfilled") return { assessment, stopReason: "model-closure-unverified" };
+			const proposed = parsed.nextTask!;
+			const supported = input.supportedTaskScopes.includes(proposed.adapterScope) &&
+				(input.capabilities === undefined || input.capabilities.some(item => item.scope === proposed.adapterScope && item.available));
+			if (supported) {
+				const admission = input.advanceAdmission();
+				if (admission !== "admitted") return { assessment, stopReason: admission };
+				const advanced = await input.advance(proposed);
+				return { assessment, advanced, stopReason: "objective-reassessment-pending" };
+			}
+			if (!input.capabilities?.some(item => item.available && input.supportedTaskScopes.includes(item.scope)))
+				return { assessment, stopReason: "next-task-needs-capability" };
+			const key = JSON.stringify(proposed);
+			if (unsupported.has(key)) return { assessment, stopReason: "capability-replan-stalled" };
+			unsupported.add(key);
+			blockedProposals.push(proposed);
+			assessment.blockedProposals = [...blockedProposals];
+			await input.recordAssessment?.(assessment);
+			if (proposals.length >= 16) return { assessment, stopReason: "artifact-capacity-boundary" };
+			const admission = input.advanceAdmission();
+			if (admission !== "admitted") return { assessment, stopReason: admission };
+			request = ["Your preceding nextTask cannot be dispatched by the observed host capabilities.",
+				"Keep that proposal and its unresolved requirement in your assessment history. Choose another feasible pending part of the same original task if one exists. Do not treat unavailable optional equipment as proof the entire mission is blocked. If no feasible pending work exists, explain which host limits block each remaining part before returning blocked.",
+				"Available adapters:", ...(input.capabilities ?? []).filter(item => item.available).map(item =>
+					`${item.scope}: ${item.description}; limits: ${item.limits.join("; ")}`),
+				"Preserve the user's overrides and return the same strict JSON schema. Read frozen evidence again if needed."].join("\n\n");
+		}
 	} finally { handle.dispose(); }
 }
 

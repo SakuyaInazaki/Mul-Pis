@@ -54,7 +54,18 @@ interface RequestState {
 	readonly rates: { input: number; cacheRead: number; output: number };
 	status: "reserved" | "settled" | "unknown";
 	settledCny?: number;
+	unknownHeldCny?: number;
+	reportedUsage?: { input: number; output: number; cacheRead: number; cacheWrite: number;
+		totalTokens: number; reportedUsdCost: number | null; costStatus: string | null };
 	reportFingerprint?: string;
+}
+
+/** Host-only accounting evidence. Encrypt before persistence; never log or expose to a model. */
+export interface CampaignRequestAudit {
+	requestId: string; inputPayloadBytes: number; reservedCny: number;
+	status: "reserved" | "settled" | "unknown";
+	settledCny: number | null; unknownHeldCny: number | null;
+	reportedUsage: RequestState["reportedUsage"] | null;
 }
 
 export class DeepSeekCampaignBudget {
@@ -70,6 +81,7 @@ export class DeepSeekCampaignBudget {
 	private readonly activeSessions = new Set<string>();
 	private readonly requestIds = new Set<string>();
 	private readonly usageEntryIds = new Set<string>();
+	private readonly auditRequests: RequestState[] = [];
 	private activePrompts = 0;
 	private stopped = false;
 	private stopReason?: "payload-boundary" | "total-cny-ceiling" | "provider-call-limit" | "price-assumption-invalid" | "usage-reconciliation" | "prompt-failure";
@@ -185,10 +197,24 @@ export class DeepSeekCampaignBudget {
 		this.grossReservedCny += worstCny;
 		this.inFlightReservedCny += worstCny;
 		this.requestIds.add(providerRequestId);
-		state.requests.push({ id: providerRequestId, inputPayloadBytes: payloadBytes, worstCny, rates: { ...this.rates }, status: "reserved" });
+		const request = { id: providerRequestId, inputPayloadBytes: payloadBytes, worstCny,
+			rates: { ...this.rates }, status: "reserved" as const };
+		state.requests.push(request);
+		this.auditRequests.push(request);
 	}
 
 	private committedCny(): number { return this.limits.priorCommittedCny + this.settledCny + this.inFlightReservedCny + this.unknownReservedCny; }
+	/** Recompute from retained request facts: subtracting floating reservations can
+	 * otherwise leave a negative epsilon after the last in-flight request settles.
+	 */
+	private recountCommitments(): void {
+		this.settledCny = 0; this.inFlightReservedCny = 0; this.unknownReservedCny = 0;
+		for (const request of this.auditRequests) {
+			if (request.status === "reserved") this.inFlightReservedCny += request.worstCny;
+			else if (request.status === "settled") this.settledCny += request.settledCny!;
+			else this.unknownReservedCny += request.unknownHeldCny!;
+		}
+	}
 
 	private reportFingerprint(event: UsageEvent): string {
 		return JSON.stringify([event.provider, event.model, event.stopReason, event.status, event.costStatus,
@@ -205,24 +231,33 @@ export class DeepSeekCampaignBudget {
 			throw new HarnessError("runner.campaign", "provider usage has no active reserved request");
 		}
 		const fingerprint = this.reportFingerprint(event);
+		const usage = event.usage;
+		const observedEstimateCny = typeof usage?.cost === "number" && Number.isFinite(usage.cost) && usage.cost >= 0
+			? Math.min(Number.MAX_VALUE, usage.cost * this.limits.estimatedCnyPerUsd) : 0;
 		if (request.status === "unknown") {
 			if (request.reportFingerprint === fingerprint) return;
+			this.markUnknown(request, true, observedEstimateCny);
 			this.stop("usage-reconciliation");
 			throw new HarnessError("runner.campaign", "provider usage conflicts with an earlier settlement");
 		}
 		if (request.status === "settled") {
 			if (request.reportFingerprint === fingerprint) return;
-			this.markUnknown(request, true);
+			this.markUnknown(request, true, observedEstimateCny);
 			this.stop("usage-reconciliation");
 			throw new HarnessError("runner.campaign", "provider usage conflicts with an earlier settlement");
 		}
-		const usage = event.usage;
+		if (usage && [usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.totalTokens]
+			.every(value => Number.isSafeInteger(value) && value! >= 0)) request.reportedUsage = {
+			input: usage.input!, output: usage.output!, cacheRead: usage.cacheRead!,
+			cacheWrite: usage.cacheWrite!, totalTokens: usage.totalTokens!,
+			reportedUsdCost: Number.isFinite(usage.cost) && usage.cost! >= 0 ? usage.cost! : null,
+			costStatus: typeof event.costStatus === "string" && event.costStatus.length <= 32
+				? event.costStatus : null,
+		};
 		const input = (usage?.input ?? NaN) + (usage?.cacheRead ?? NaN) + (usage?.cacheWrite ?? NaN);
 		const charge = (((usage?.input ?? NaN) + (usage?.cacheWrite ?? NaN)) * request.rates.input +
 			(usage?.cacheRead ?? NaN) * request.rates.cacheRead +
 			(usage?.output ?? NaN) * request.rates.output) / 1_000_000;
-		const observedEstimateCny = typeof usage?.cost === "number" && Number.isFinite(usage.cost) && usage.cost >= 0
-			? Math.min(Number.MAX_VALUE, usage.cost * this.limits.estimatedCnyPerUsd) : 0;
 		if (event.kind !== "assistant" ||
 			event.provider !== "deepseek" || event.model !== this.limits.model.slice("deepseek/".length).split(":")[0] ||
 			!usage || ![usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.totalTokens]
@@ -257,8 +292,7 @@ export class DeepSeekCampaignBudget {
 		request.status = "settled";
 		request.settledCny = Math.max(charge, sdkEstimateCny);
 		request.reportFingerprint = fingerprint;
-		this.inFlightReservedCny -= request.worstCny;
-		this.settledCny += request.settledCny;
+		this.recountCommitments();
 		if (this.committedCny() > this.limits.maxCny) this.stop("total-cny-ceiling");
 	}
 
@@ -270,17 +304,16 @@ export class DeepSeekCampaignBudget {
 	}
 
 	private markUnknown(request: RequestState, includeSettled = false, additionalEstimateCny = 0): void {
-		const conservativeUnknownCny = Math.max(request.worstCny, request.settledCny ?? 0, additionalEstimateCny);
+		const conservativeUnknownCny = Math.max(request.worstCny, request.settledCny ?? 0,
+			request.unknownHeldCny ?? 0, additionalEstimateCny);
 		if (request.status === "settled") {
 			if (!includeSettled) return;
-			this.settledCny -= request.settledCny!;
-		} else if (request.status === "reserved") {
-			this.inFlightReservedCny -= request.worstCny;
-		} else return;
+		}
 		request.status = "unknown";
+		request.unknownHeldCny = conservativeUnknownCny;
 		delete request.settledCny;
 		delete request.reportFingerprint;
-		this.unknownReservedCny += conservativeUnknownCny;
+		this.recountCommitments();
 	}
 
 	finishPrompt(lease: PromptLease, receipts: readonly PromptUsageReceipt[]): void {
@@ -342,5 +375,18 @@ export class DeepSeekCampaignBudget {
 			reservations: this.reservations, stopped: this.stopped, active: this.activePrompts > 0,
 			activePrompts: this.activePrompts,
 			...(this.stopReason ? { stopReason: this.stopReason } : {}) };
+	}
+
+	/** Read-only per-transport accounting; intended solely for the encrypted host carry. */
+	requestAuditSnapshot(): { requests: CampaignRequestAudit[]; settledCny: number;
+		unknownReservedCny: number; inFlightReservedCny: number; reservations: number } {
+		return { requests: this.auditRequests.map(request => ({
+			requestId: request.id, inputPayloadBytes: request.inputPayloadBytes,
+			reservedCny: request.worstCny, status: request.status,
+			settledCny: request.settledCny ?? null,
+			unknownHeldCny: request.unknownHeldCny ?? null,
+			reportedUsage: request.reportedUsage ? { ...request.reportedUsage } : null,
+		})), settledCny: this.settledCny, unknownReservedCny: this.unknownReservedCny,
+			inFlightReservedCny: this.inFlightReservedCny, reservations: this.reservations };
 	}
 }

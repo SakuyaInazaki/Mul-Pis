@@ -31,18 +31,18 @@ MAX_REVIEW_TEXT_FILE = 512_000
 EXPECTED_INPUT_FILES = 3
 MAX_ENVELOPE = 132 * 1024 * 1024
 RESULT_ALLOWLIST = (
-    "candidate.cpp", "verification.json", "lesson-delta.json", "workflow-archive.json", "m04-adopted-knowledge.json", "review-decision.json", "context-lineage.json",
-    "followon-candidate.cpp", "followon-verification.json", "followon-lesson-delta.json", "workflow-followon-archive.json",
+    "candidate.cpp", "verification.json", "lesson-delta.json", "experiment-plan.json", "workflow-archive.json", "m04-adopted-knowledge.json", "review-decision.json", "context-lineage.json",
+    "followon-candidate.cpp", "followon-verification.json", "followon-lesson-delta.json", "followon-experiment-plan.json", "workflow-followon-archive.json",
     "followon-review-decision.json",
-    "initial-candidate.cpp", "initial-verification.json", "initial-lesson-delta.json", "workflow-initial-archive.json",
+    "initial-candidate.cpp", "initial-verification.json", "initial-lesson-delta.json", "initial-experiment-plan.json", "workflow-initial-archive.json",
     "initial-review-decision.json", "initial-m04-adopted-knowledge.json",
-    "branch-parent-candidate.cpp", "branch-parent-verification.json", "branch-parent-lesson-delta.json", "workflow-branch-parent-archive.json",
+    "branch-parent-candidate.cpp", "branch-parent-verification.json", "branch-parent-lesson-delta.json", "branch-parent-experiment-plan.json", "workflow-branch-parent-archive.json",
     "branch-parent-review-decision.json",
-    "branch-child-candidate.cpp", "branch-child-verification.json", "branch-child-lesson-delta.json", "workflow-branch-child-archive.json",
+    "branch-child-candidate.cpp", "branch-child-verification.json", "branch-child-lesson-delta.json", "branch-child-experiment-plan.json", "workflow-branch-child-archive.json",
     "branch-child-review-decision.json",
-    "campaign-status.json", "original-objective.json", "objective-checkpoint.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "mission-ledger-out.json",
+    "campaign-status.json", "original-objective.json", "objective-checkpoint.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "mission-ledger-out.json", "execution-capabilities.json", "research-history.json", "restored-candidate-verification.json",
 ) + tuple(f"iteration-{iteration}-{suffix}" for iteration in range(1, 65)
-    for suffix in ("candidate.cpp", "verification.json", "lesson-delta.json", "review-decision.json", "m04-adopted-knowledge.json")) + \
+    for suffix in ("candidate.cpp", "verification.json", "lesson-delta.json", "experiment-plan.json", "review-decision.json", "m04-adopted-knowledge.json")) + \
     tuple(f"workflow-iteration-{iteration}-archive.json" for iteration in range(1, 65)) + \
     tuple(f"{prefix}round-{round_index}-{suffix}"
     for prefix in ("", "initial-", "followon-", "branch-parent-", "branch-child-", *(f"iteration-{iteration}-" for iteration in range(1, 65))) for round_index in range(1, 9)

@@ -28,7 +28,7 @@ jobs:
       github.run_attempt == 1 &&
       github.ref == 'refs/heads/improve/workflow-learning-reliability' &&
       ((github.event_name == 'workflow_dispatch' && inputs.authorize_bounded_run == true) ||
-       (github.event_name == 'push' && github.event.head_commit.message == 'Repair shared total ledger and retain interrupted workflow state (mul-pis-20261005-mission-run1)'))
+       (github.event_name == 'push' && github.event.head_commit.message == 'Continue capability-aware workflow with private recovery (mul-pis-20261006-recovery-run1)'))
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -57,7 +57,7 @@ jobs:
       - name: Offline checks before private material is decoded
         run: |
           npm run typecheck
-          node --test test/runner/deepseek-campaign.test.ts
+          npm test
           python -m unittest discover -s test -p 'private_actions_transport_test.py'
       - name: Decode confidential input without logging it
         id: decode
@@ -120,6 +120,23 @@ jobs:
         with:
           name: confidential-campaign-envelope
           path: ${{ runner.temp }}/private-campaign-outcome.enc.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Locate encrypted mission continuation
+        if: always() && steps.decode.outcome == 'success'
+        id: continuation
+        run: |
+          if [ -f "$RUNNER_TEMP/private-campaign-output/ledger-continuation.enc.json" ]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload encrypted mission continuation
+        if: always() && steps.continuation.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: confidential-mission-carry
+          path: ${{ runner.temp }}/private-campaign-output/ledger-continuation.enc.json
           if-no-files-found: error
           retention-days: 1
       - name: Report generic campaign failure

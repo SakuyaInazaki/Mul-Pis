@@ -4,6 +4,7 @@
  * All private inputs are loaded at runtime from --input-dir and never printed.
  */
 import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
@@ -23,11 +24,14 @@ import { runM04 } from "../src/stages/m04.ts";
 import { createPiSessionRunner } from "../src/runner/pi.ts";
 import type { SessionCheckpoint, SessionHandle, SessionRunner, SessionSpec } from "../src/runner/types.ts";
 import { DeepSeekCampaignBudget } from "../src/runner/deepseek-campaign.ts";
-import { MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, verifySignedMissionLedger } from
+import { MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, PRIVATE_CONTINUATION_FILE_KEYS } from
 	"../src/runner/signed-mission-ledger.ts";
+import { CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation,
+	type PrivateContinuationBundle } from "../src/runner/ledger-continuation.ts";
 import { createConfinedCampaignFileTools } from "../src/runner/confined-campaign-files.ts";
 import { archivePrivateM07Task, recordPrivateM04Outcome } from "../src/workflow-archive/m07-private.ts";
-import { buildCsrChecker } from "../src/workflow-archive/csr-checker.ts";
+import { buildCsrChecker as buildLegacyCsrChecker } from "../src/workflow-archive/csr-checker-legacy.ts";
+import { buildCsrChecker, inspectCsrTaskContract, validateCsrCandidateSource, validateCsrTargetBodies, CSR_EXPERIMENT_LIMITS, type CsrExperimentPlan } from "../src/workflow-archive/csr-checker.ts";
 import { createExperienceProvider } from "../src/knowledge/experience-index.ts";
 import type { KnowledgeRef, KnowledgeStore } from "../src/knowledge/types.ts";
 import type { StageRunRecord } from "../src/types.ts";
@@ -45,7 +49,12 @@ const CHECKS = [
 	"Original program checker and controller-owned independent finite full-row mutation checker pass on several CPU-only configurations",
 	"Measured per-kernel timings are compared with the preserved original baselines; within the bounded rounds the candidate strategies are improved or selected for the strongest observed performance, with any lack of gain recorded honestly and no global-optimality claim",
 ];
-const ARCHIVE_EVIDENCE_FILES = ["candidate.cpp", "verification.json", "lesson-delta.json", "review-decision.json",
+const REGISTERED_CHECKS = [
+	"The model-authored experiment plan names every strategy; original generators, references, checker and benchmark are preserved; every source extension passes the independent capability boundary",
+	"The original program checker and isolated independent full-row finite and mutation checks pass for every registered strategy and both original references",
+	"Host-owned isolated-worker roundtrip timings for model-authored cases and available threads use fair preserved references; startup, cold-call and steady-state costs are separate, and no kernel-only gain is inferred from IPC-inclusive observations",
+];
+const ARCHIVE_EVIDENCE_FILES = ["candidate.cpp", "verification.json", "lesson-delta.json", "experiment-plan.json", "review-decision.json",
 	...Array.from({ length: 8 }, (_, index) => index + 1).flatMap(index => [
 		`round-${index}-candidate.cpp`, `round-${index}-verification.json`,
 		`round-${index}-reviewer-feedback.txt`, `round-${index}-reviewer-report.md`,
@@ -203,10 +212,14 @@ async function preserveUnsettledBranchCheckpoint(input: {
 	const availableArtifacts = ["candidate.cpp", "verification.json", "workflow-archive.json",
 		"branch-child-candidate.cpp", "branch-child-verification.json", "workflow-branch-child-archive.json"]
 		.filter(name => existsSync(path.join(input.outputDir, name)));
+	let prior: ObjectiveProgressV1 | undefined;
+	try { prior = JSON.parse(await readFile(path.join(input.outputDir, "objective-checkpoint.json"), "utf8")); } catch { /* First attempt has no checkpoint. */ }
+	if (prior?.contract.id !== input.contract.id) prior = undefined;
 	const checkpoint = objectiveProgress(input.contract, {
-		boundedRuns: [{ runId: input.runId, outcome: goal.lifecycle === "finished" ? goal.outcome ?? "unknown" : "active",
+		...(prior?.assessment ? { assessment: prior.assessment } : {}), assessmentHistory: prior?.assessmentHistory,
+		boundedRuns: [...(prior?.boundedRuns.filter(run => run.runId !== input.runId) ?? []), { runId: input.runId, outcome: goal.lifecycle === "finished" ? goal.outcome ?? "unknown" : "active",
 			acceptedTaskIds, unresolvedOperationIds }],
-		selectedArtifacts: [], availableArtifacts, unresolvedOperationIds,
+		selectedArtifacts: prior?.selectedArtifacts ?? [], availableArtifacts: [...new Set([...(prior?.availableArtifacts ?? []), ...availableArtifacts])], unresolvedOperationIds,
 		stopReason: campaignObjectiveStop(input.budgetStopReason) ?? "bounded-run-incomplete",
 	});
 	await writeObjectiveProgress(path.join(input.outputDir, "objective-checkpoint.json"), checkpoint);
@@ -238,8 +251,11 @@ async function salvageObjectiveCheckpoint(ws: Workspace, outputDir: string,
 				...(selected && acceptedTaskIds.includes(selected) ? { selectedTaskId: selected } : {}) });
 		} catch { boundedRuns.push({ runId: id, outcome: "record-unavailable" }); }
 	}
+	const historicalRuns = previous?.contract.id === contract.id ? previous.boundedRuns.filter(saved =>
+		!boundedRuns.some(live => live.runId === saved.runId)) : [];
+	const allBoundedRuns = [...historicalRuns, ...boundedRuns];
 	const availableArtifacts = (await readdir(outputDir)).filter(name =>
-		/^(?:candidate\.cpp|verification\.json|workflow-(?:archive|[A-Za-z0-9-]+-archive)\.json|(?:branch-parent|branch-child|iteration-\d+|followon|initial)-(?:candidate\.cpp|verification\.json))$/.test(name));
+		/^(?:candidate\.cpp|verification\.json|experiment-plan\.json|execution-capabilities\.json|research-history\.json|restored-candidate-verification\.json|workflow-(?:archive|[A-Za-z0-9-]+-archive)\.json|(?:branch-parent|branch-child|iteration-\d+|followon|initial)-(?:candidate\.cpp|verification\.json))$/.test(name));
 	const priorCoversLive = previous?.contract.id === contract.id &&
 		previous.stopReason !== "assessment-validation-pending" && unresolvedOperationIds.length === 0 &&
 		(!timedOut || previous.stopReason === "time-boundary") &&
@@ -247,13 +263,17 @@ async function salvageObjectiveCheckpoint(ws: Workspace, outputDir: string,
 		(budgetStopReason !== "provider-call-limit" || previous.stopReason === "provider-call-limit") &&
 		(budgetStopReason !== "price-assumption-invalid" || previous.stopReason === "accounting-integrity-error") &&
 		boundedRuns.every(item => item.outcome !== "active" && item.outcome !== "record-unavailable") &&
-		previous.boundedRuns.length === boundedRuns.length && boundedRuns.every(item =>
-			previous!.boundedRuns.some(saved => saved.runId === item.runId && saved.outcome === item.outcome)) &&
-		availableArtifacts.every(name => previous.availableArtifacts?.includes(name));
-	if (priorCoversLive) return;
-	const progress = objectiveProgress(contract, { boundedRuns,
+		boundedRuns.every(item =>
+			previous!.boundedRuns.some(saved => saved.runId === item.runId && saved.outcome === item.outcome));
+	if (priorCoversLive && previous) {
+		const added = availableArtifacts.filter(name => !previous.availableArtifacts.includes(name));
+		if (added.length) await writeObjectiveProgress(checkpointFile,
+			{ ...previous, availableArtifacts: [...previous.availableArtifacts, ...added] });
+		return;
+	}
+	const progress = objectiveProgress(contract, { boundedRuns: allBoundedRuns,
 		selectedArtifacts: previous?.contract.id === contract.id ?
-			previous.selectedArtifacts.filter(name => availableArtifacts.includes(name)) : [],
+			previous.selectedArtifacts : [],
 		availableArtifacts, unresolvedOperationIds,
 		...(previous?.contract.id === contract.id && previous.assessment ? { assessment: previous.assessment } : {}),
 		...(previous?.contract.id === contract.id ? { assessmentHistory: previous.assessmentHistory } : {}),
@@ -346,14 +366,17 @@ function arg(name: string): string {
 function cleanEnv(): NodeJS.ProcessEnv {
 	return { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8", HOME: "/nonexistent", TMPDIR: "/tmp" };
 }
-function isolated(command: string, args: string[], timeout: number, mountedWork?: string) {
-	return spawnSync("sudo", ["-n", "bwrap", "--unshare-user", "--unshare-net", "--unshare-pid", "--unshare-ipc",
+function sandboxArguments(command: string, args: string[], mountedWork?: string, readOnlyWork = false): string[] {
+	return ["-n", "bwrap", "--unshare-user", "--unshare-net", "--unshare-pid", "--unshare-ipc",
 		"--uid", "65534", "--gid", "65534", "--die-with-parent", "--clearenv",
 		"--setenv", "PATH", "/usr/bin:/bin", "--setenv", "LANG", "C.UTF-8",
 		"--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib",
 		"--symlink", "usr/lib64", "/lib64", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-		...(mountedWork ? ["--bind", mountedWork, "/work", "--chdir", "/work"] : []),
-		"--", command, ...args],
+		...(mountedWork ? [readOnlyWork ? "--ro-bind" : "--bind", mountedWork, "/work", "--chdir", "/work"] : []),
+		"--", command, ...args];
+}
+function isolated(command: string, args: string[], timeout: number, mountedWork?: string, readOnlyWork = false) {
+	return spawnSync("sudo", sandboxArguments(command, args, mountedWork, readOnlyWork),
 		{ encoding: "utf8", timeout, maxBuffer: 100_000, env: cleanEnv() });
 }
 async function requireIsolation(): Promise<void> {
@@ -370,7 +393,7 @@ async function requireIsolation(): Promise<void> {
 		const compileProbe = isolated("/usr/bin/g++", [...FLAGS, "/work/probe.cpp", "-o", "/work/probe-bin"], 30_000, scratch);
 		if (compileProbe.status !== 0)
 			throw new SandboxPreflightError(`compiler probe: ${(compileProbe.stderr ?? "").slice(-2000)}`);
-		const runProbe = isolated("/work/probe-bin", [], 15_000, scratch);
+		const runProbe = isolated("/work/probe-bin", [], 15_000, scratch, true);
 		if (runProbe.status !== 0)
 			throw new SandboxPreflightError(`executable probe: ${(runProbe.stderr ?? "").slice(-2000)}`);
 	} finally { await rm(scratch, { recursive: true, force: true }); }
@@ -402,7 +425,8 @@ function extractBody(source: string, name: string): string | null {
 	return null;
 }
 function targetBodySpan(source: string, name: string): { start: number; end: number } | undefined {
-	const declaration = new RegExp(`\\bstatic\\s+void\\s+${name}\\s*\\(`).exec(source);
+	const declaration = new RegExp(name === "main" ? "\\bint\\s+main\\s*\\(" :
+		`\\bstatic\\s+void\\s+${name}\\s*\\(`).exec(source);
 	if (!declaration) return undefined;
 	const open = source.indexOf("{", declaration.index + declaration[0].length);
 	if (open < 0 || source.slice(declaration.index, open).includes(";")) return undefined;
@@ -456,6 +480,15 @@ function sourceShape(original: string, candidate: string): { ok: boolean; reason
 		return { ok: false, reason: "required target bodies are identical", targetCount: targets.length };
 	return { ok: true, reason: "structural preservation checks passed; substantive difference also needs reviewer judgment", targetCount: targets.length };
 }
+/** The registered verifier owns its source preservation and extension boundary. */
+function registeredSourceShape(original: string, candidate: string, taskText: string, plan: CsrExperimentPlan):
+	{ ok: boolean; reason: string; targetCount: number } {
+	try {
+		const { ok, reason, targetCount } = validateCsrCandidateSource(original, candidate, taskText, plan.registeredStrategies);
+		return { ok, reason, targetCount };
+	} catch (error) { return { ok: false, reason: error instanceof Error ? error.message.slice(0, 2_000) : "source is outside the independently validated registered capability", targetCount: 0 }; }
+}
+
 function deriveRuntimeCases(original: string): string[][] | undefined {
 	const candidates = [...original.matchAll(/\bstruct\s+[A-Za-z_]\w*\s*\{([\s\S]*?)\};/g)]
 		.map(match => [...match[1].matchAll(/\bint\s+([A-Za-z_]\w*)\s*=\s*(\d+)\s*;/g)]
@@ -482,7 +515,8 @@ function deriveRuntimeCases(original: string): string[][] | undefined {
 		cases.push([...base, parsedFlags.get(thread.field)!, String(threads), parsedFlags.get(repeat.field)!, "10"]);
 	return cases;
 }
-async function m04EvidenceReturned(record: StageRunRecord, taskId: string): Promise<{ complete: boolean; paths: string[] }> {
+async function m04EvidenceReturned(record: StageRunRecord, taskId: string,
+	extraNames: string[] = []): Promise<{ complete: boolean; paths: string[] }> {
 	const coverage = record.outputs.find(item => item.label === "M07 回流证据实际访问范围");
 	const source = record.outputs.find(item => item.label === "M07 处理来源");
 	if (!coverage || !source || !/^T\d{3,}$/.test(taskId)) return { complete: false, paths: [] };
@@ -493,7 +527,7 @@ async function m04EvidenceReturned(record: StageRunRecord, taskId: string): Prom
 		if (typeof sourceInfo.rootDir !== "string" || !Array.isArray(parsed.returnedRanges)) return { complete: false, paths: [] };
 		const root = await realpath(sourceInfo.rootDir);
 		const paths: string[] = [];
-		for (const name of ["candidate.cpp", "verification.json", "lesson-delta.json"]) {
+		for (const name of ["candidate.cpp", "verification.json", "lesson-delta.json", ...extraNames]) {
 			const exactEvidencePath = (value: unknown): value is string => {
 				if (typeof value !== "string") return false;
 				const parts = value.replaceAll("\\", "/").split("/");
@@ -523,10 +557,12 @@ async function m04EvidenceReturned(record: StageRunRecord, taskId: string): Prom
 		return { complete: true, paths };
 	} catch { return { complete: false, paths: [] }; }
 }
-function selectedM07ReviewReadPaths(goalRoot: string, task: M07TaskRecord): string[] {
+function selectedM07ReviewReadPaths(goalRoot: string, task: M07TaskRecord, extraNames: string[] = []): string[] {
 	if (task.status !== "accepted" || !task.review || !/^T\d{3,}$/.test(task.taskId))
 		fail("selected M07 task lacks an accepted frozen review");
-	return ["candidate.cpp", "verification.json", "lesson-delta.json"].map(name => {
+	if (extraNames.some(name => name !== "experiment-plan.json") || new Set(extraNames).size !== extraNames.length)
+		fail("unsupported additional M07 evidence path");
+	return ["candidate.cpp", "verification.json", "lesson-delta.json", ...extraNames].map(name => {
 		const source = path.join(task.workDir, name);
 		const artifacts = task.review!.artifacts.filter(item => item.sourcePath === source);
 		if (artifacts.length !== 1) fail("selected M07 review evidence is missing or ambiguous");
@@ -553,7 +589,52 @@ async function adoptedExperienceRefs(store: KnowledgeStore, m04RunId: string, ev
 	return refs.slice(0, 24);
 }
 type TrustedTiming = { target: number; rows: number; cols: number; threads: number; repeats: number; elapsedNs: number };
-function compareCandidateTimings(previous: unknown, current: unknown): { state: "measured" | "unavailable"; ratios?: number[]; medianRatio?: number; minRatio?: number } {
+function compareCandidateTimings(previous: unknown, current: unknown): { state: "measured" | "unavailable"; ratios?: number[]; medianRatio?: number; minRatio?: number; scope?: string } {
+	const registered = (value: unknown): Array<Record<string, any>> | undefined => {
+		if (!value || typeof value !== "object") return undefined;
+		const experiment = (value as Record<string, any>).registeredExperiment;
+		return experiment?.status === "passed" && Array.isArray(experiment.timings) ?
+			experiment.timings.filter((row: Record<string, any>) => row.kind === "strategy") : undefined;
+	};
+	const registeredBefore = registered(previous), registeredAfter = registered(current);
+	if (registeredBefore || registeredAfter) {
+		if (!registeredBefore?.length || !registeredAfter?.length ||
+			(previous as Record<string, any>).registeredExperiment.metric !== "isolated-worker-roundtrip" ||
+			(current as Record<string, any>).registeredExperiment.metric !== "isolated-worker-roundtrip") return { state: "unavailable" };
+		const priorProtocol = (previous as Record<string, any>).registeredExperiment;
+		const nextProtocol = (current as Record<string, any>).registeredExperiment;
+		if (priorProtocol.freshProcessPerSelection !== true || nextProtocol.freshProcessPerSelection !== true ||
+			!Array.isArray(priorProtocol.compileFlags) || !Array.isArray(nextProtocol.compileFlags) ||
+			JSON.stringify(priorProtocol.compileFlags) !== JSON.stringify(nextProtocol.compileFlags) ||
+			typeof priorProtocol.accounting !== "string" || priorProtocol.accounting !== nextProtocol.accounting ||
+			priorProtocol.measurementAuthority !== "parent-clock-and-raw-output-comparison" ||
+			nextProtocol.measurementAuthority !== "parent-clock-and-raw-output-comparison" ||
+			priorProtocol.baselineIsolation !== "independently-compiled-immutable-original" || nextProtocol.baselineIsolation !== priorProtocol.baselineIsolation ||
+			priorProtocol.runtimeFiles !== "read-only-evaluator-with-separate-writable-scratch" || nextProtocol.runtimeFiles !== priorProtocol.runtimeFiles) return { state: "unavailable" };
+		const key = (row: Record<string, any>) => JSON.stringify([row.caseId, row.rows, row.cols, row.ordinaryNnz,
+			row.heavyRows, row.heavyNnz, row.seed, row.threads, row.warmups, row.repeats]);
+		const fastest = (rows: Array<Record<string, any>>) => {
+			const grouped = new Map<string, Record<string, any>>();
+			for (const row of rows) {
+				if (!Number.isSafeInteger(row.medianNs) || row.medianNs < 1 || !Number.isSafeInteger(row.coldNs) || row.coldNs < 1)
+					return undefined;
+				if (!grouped.has(key(row)) || grouped.get(key(row))!.medianNs > row.medianNs) grouped.set(key(row), row);
+			}
+			return grouped;
+		};
+		const before = fastest(registeredBefore), after = fastest(registeredAfter);
+		if (!before || !after || before.size !== after.size) return { state: "unavailable" };
+		const ratios: number[] = [];
+		for (const [caseKey, row] of before) {
+			const next = after.get(caseKey);
+			if (!next) return { state: "unavailable" };
+			// Both first-call cost and steady-state are visible; a cached steady-state gain alone cannot hide setup regressions.
+			ratios.push(Number((row.medianNs / next.medianNs).toFixed(3)), Number((row.coldNs / next.coldNs).toFixed(3)));
+		}
+		const sorted = [...ratios].sort((a, b) => a - b);
+		return { state: "measured", ratios, medianRatio: (sorted[(sorted.length - 1) >> 1] + sorted[sorted.length >> 1]) / 2,
+			minRatio: sorted[0], scope: "best-registered-observation-per-exact-case-with-cold-cost" };
+	}
 	const trusted = (value: unknown): TrustedTiming[] | undefined => {
 		if (!value || typeof value !== "object") return undefined;
 		const independent = (value as Record<string, unknown>).independent;
@@ -593,7 +674,7 @@ function chooseFollowOnCandidate(previousAccepted: boolean, followOnAccepted: bo
 function firstM07Accepted(acceptedWinner: boolean, finishedOutcome: unknown): boolean {
 	return acceptedWinner && finishedOutcome === "fulfilled";
 }
-function parseCheckerOutput(stdout: string, metadata: ReturnType<typeof buildCsrChecker>["metadata"]):
+function parseCheckerOutput(stdout: string, metadata: ReturnType<typeof buildLegacyCsrChecker>["metadata"]):
 	{ status: "passed" | "failed"; timings: TrustedTiming[] } {
 	const lines = stdout.trim().split(/\r?\n/);
 	const pass = lines.filter(line => line === "CSR_CHECK_PASS").length === 1 && lines.at(-1) === "CSR_CHECK_PASS";
@@ -613,9 +694,69 @@ function parseCheckerOutput(stdout: string, metadata: ReturnType<typeof buildCsr
 	return { status: pass && lines.length === 9 && timingLines.length === 8 && timings.length === 8 &&
 		new Set(keys).size === 8 ? "passed" : "failed", timings };
 }
-async function checkCandidate(original: string, candidate: string, scratch: string) {
+function parseRegisteredCheckerOutput(stdout: string, metadata: ReturnType<typeof buildCsrChecker>["metadata"]):
+	{ status: "passed" | "failed"; timings: Array<Record<string, string | number | number[]>> } {
+	const lines = stdout.trim().split(/\r?\n/);
+	const pattern = /^CSR_TIMING case=([a-z][a-z0-9_-]*) kind=(serial|std_thread|strategy) target=(\d+) name=([A-Za-z_]\w*) rows=(\d+) cols=(\d+) ordinary_nnz=(\d+) heavy_rows=(\d+) heavy_nnz=(\d+) seed=(\d+) threads=(\d+) warmups=(\d+) repeats=(\d+) min_ns=(\d+) median_ns=(\d+) max_ns=(\d+) startup_ns=(\d+) cold_ns=(\d+) warmup_samples_ns=([\d,]+) samples_ns=([\d,]+)$/;
+	const timings: Array<Record<string, string | number | number[]>> = [];
+	const seen = new Set<string>();
+	for (const line of lines.slice(0, -1)) {
+		const match = pattern.exec(line);
+		if (!match) return { status: "failed", timings: [] };
+		const [caseId, kind, targetText, name] = match.slice(1, 5);
+		const [rows, cols, ordinaryNnz, heavyRows, heavyNnz, seed, threads, warmups, repeats,
+			minNs, medianNs, maxNs] = match.slice(5, 17).map(Number);
+		const startupNs = Number(match[17]), coldNs = Number(match[18]);
+		const warmupSamples = match[19].split(",").map(Number);
+		const samples = match[20].split(",").map(Number);
+		const sortedSamples = [...samples].sort((a, b) => a - b);
+		const expectedMedian = sortedSamples.length % 2 ? sortedSamples[Math.floor(sortedSamples.length / 2)] :
+			Math.floor((sortedSamples[sortedSamples.length / 2 - 1] + sortedSamples[sortedSamples.length / 2]) / 2);
+		const numeric = [Number(targetText), rows, cols, ordinaryNnz, heavyRows, heavyNnz, seed, threads,
+			warmups, repeats, minNs, medianNs, maxNs, startupNs, coldNs, ...warmupSamples, ...samples];
+		const config = metadata.timing.cases.find(item => item.id === caseId);
+		const expectedName = kind === "serial" ? metadata.baselines.serial : kind === "std_thread" ?
+			metadata.baselines.stdThread : metadata.targets[Number(targetText) - 1];
+		const key = `${caseId}:${kind}:${targetText}:${threads}`;
+		if (!config || !numeric.every(Number.isSafeInteger) || samples.length !== repeats ||
+			startupNs < 1 || coldNs < 1 || warmupSamples.length !== warmups || warmupSamples.some(value => value < 1) ||
+			samples.some(value => value < 1) || minNs < 1 || medianNs !== expectedMedian || maxNs < medianNs ||
+			Math.min(...samples) !== minNs || Math.max(...samples) !== maxNs ||
+			rows !== config.rows || cols !== config.cols || ordinaryNnz !== config.normalNnz ||
+			heavyRows !== config.longRows || heavyNnz !== config.longNnz || seed !== config.seed ||
+			warmups !== config.warmups || repeats !== config.repeats || !config.threadCounts.includes(threads) ||
+			!expectedName || expectedName !== name || (kind !== "strategy" && Number(targetText) !== 0) ||
+			seen.has(key)) return { status: "failed", timings: [] };
+		seen.add(key);
+		timings.push({ caseId, kind, target: Number(targetText), name, rows, cols, ordinaryNnz, heavyRows,
+			heavyNnz, seed, threads, warmups, repeats, minNs, medianNs, maxNs, startupNs, coldNs, warmupSamplesNs: warmupSamples, samplesNs: samples });
+	}
+	const expectedCount = metadata.timing.cases.reduce((sum, item) => sum + item.threadCounts.length *
+		(metadata.targets.length + 2), 0);
+	return { status: lines.at(-1) === "CSR_CHECK_PASS" && timings.length === expectedCount ? "passed" : "failed", timings };
+}
+async function checkCandidate(original: string, candidate: string, scratch: string,
+	registered?: { taskText: string; planFile: string; deadlineAt?: number }) {
 	const originalText = await readFile(original, "utf8");
-	const shape = sourceShape(originalText, await readFile(candidate, "utf8"));
+	const candidateText = await readFile(candidate, "utf8");
+	let experimentPlan: CsrExperimentPlan | undefined;
+	let planFailure: string | undefined;
+	if (registered) try {
+		const info = await lstat(registered.planFile);
+		if (!info.isFile() || info.isSymbolicLink() || info.size > 16_000) throw new Error("invalid bounded plan file");
+		experimentPlan = JSON.parse(await readFile(registered.planFile, "utf8")) as CsrExperimentPlan;
+		if (!Array.isArray(experimentPlan?.cases) || experimentPlan.cases.some(item =>
+			!Array.isArray(item.threadCounts) || item.threadCounts.some((count: number) =>
+				!Number.isSafeInteger(count) || count < 1 || count > os.availableParallelism())))
+			throw new Error("plan requests unavailable CPU parallelism");
+	} catch { planFailure = "registered experiment plan unavailable or invalid"; }
+	let shape = registered ? experimentPlan ? registeredSourceShape(originalText, candidateText, registered.taskText, experimentPlan) :
+		{ ok: false, reason: planFailure ?? "registered experiment plan unavailable", targetCount: 0 } :
+		sourceShape(originalText, candidateText);
+	if (!registered && candidateText !== originalText) try { validateCsrTargetBodies(originalText, candidateText); }
+	catch { shape = { ok: false, reason: "candidate body is outside the lexical host-safety capability", targetCount: shape.targetCount }; }
+	if (!shape.ok && candidateText !== originalText) return { version: 1, status: "failed", sourceShape: shape,
+		compile: { success: false }, independent: { status: "not_run" } };
 	await mkdir(scratch, { recursive: true, mode: 0o700 });
 	await chmod(scratch, 0o777);
 	await copyFile(candidate, path.join(scratch, "candidate.cpp"));
@@ -638,7 +779,7 @@ async function checkCandidate(original: string, candidate: string, scratch: stri
 	const runs = [];
 	for (const args of cases) {
 		const started = process.hrtime.bigint();
-		const run = isolated("/work/candidate-bin", args, 60_000, scratch);
+		const run = isolated("/work/candidate-bin", args, 60_000, scratch, true);
 		const isolatedProcessWallMs = Number(process.hrtime.bigint() - started) / 1e6;
 		const reportedKernelMs = (run.stdout ?? "").split(/\r?\n/).flatMap(line => {
 			const match = /^\s*(.*?)\s+([0-9]+(?:\.[0-9]+)?)\s+ms\s*$/.exec(line);
@@ -650,16 +791,16 @@ async function checkCandidate(original: string, candidate: string, scratch: stri
 			stderrTail: run.status === 0 ? undefined : (run.stderr ?? "").slice(-1000) });
 	}
 	verification.originalCheckerRuns = runs;
-	try {
-		const checker = buildCsrChecker(originalText);
+	if (!registered) try {
+		const checker = buildLegacyCsrChecker(originalText);
 		await writeFile(path.join(scratch, "checker.cpp"), checker.source, { mode: 0o644 });
 		await chmod(path.join(scratch, "checker.cpp"), 0o644);
-		const compiledChecker = isolated("/usr/bin/g++", ["-O0", "-std=c++17", "-fopenmp", "-pthread",
+		const compiledChecker = isolated("/usr/bin/g++", [...FLAGS,
 			"/work/checker.cpp", "-o", "/work/independent-checker"], 90_000, scratch);
 		if (compiledChecker.status !== 0) verification.independent = { status: "compile_failed",
 			stderrTail: (compiledChecker.stderr ?? "").slice(-4000) };
 		else {
-			const checked = isolated("/work/independent-checker", [], 60_000, scratch);
+			const checked = isolated("/work/independent-checker", [], 60_000, scratch, true);
 			const parsed = parseCheckerOutput(checked.stdout ?? "", checker.metadata);
 			verification.independent = { status: checked.status === 0 ? parsed.status : "failed", timings: parsed.timings,
 				threadCounts: checker.metadata.threadCounts, shapes: checker.metadata.shapes,
@@ -670,7 +811,173 @@ async function checkCandidate(original: string, candidate: string, scratch: stri
 	verification.status = shape.ok && runs.every(x => x.exitCode === 0 && x.reportedKernelMs.length >= 3) &&
 		(verification.independent as { status?: string }).status === "passed"
 		? "passed" : "failed";
+	if (registered) {
+		verification.registeredExperiment = { status: "not_run", reason: planFailure ?? shape.reason };
+		try {
+			if (!experimentPlan || !shape.ok) return verification;
+			const generated = buildCsrChecker(originalText, candidateText, registered.taskText, experimentPlan);
+			const checkerFile = path.join(scratch, "registered-checker.cpp");
+			await writeFile(checkerFile, generated.source, { mode: 0o644 });
+			await writeFile(path.join(scratch, "candidate-worker.cpp"), generated.workerSource, { mode: 0o644 });
+			await chmod(path.join(scratch, "candidate-worker.cpp"), 0o644);
+			await writeFile(path.join(scratch, "baseline-worker.cpp"), generated.baselineWorkerSource, { mode: 0o644 });
+			await chmod(path.join(scratch, "baseline-worker.cpp"), 0o644);
+			await chmod(checkerFile, 0o644);
+			const buildRegistered = isolated("/usr/bin/g++", [...FLAGS,
+				"/work/registered-checker.cpp", "-o", "/work/registered-checker"], 90_000, scratch);
+			const buildWorker = isolated("/usr/bin/g++", [...FLAGS, "/work/candidate-worker.cpp", "-o", "/work/candidate-worker"], 90_000, scratch);
+			const buildBaseline = isolated("/usr/bin/g++", [...FLAGS, "/work/baseline-worker.cpp", "-o", "/work/baseline-worker"], 90_000, scratch);
+			if (buildRegistered.status !== 0 || buildWorker.status !== 0 || buildBaseline.status !== 0) verification.registeredExperiment = { status: "compile_failed",
+				stderrTail: ((buildRegistered.stderr ?? "") + (buildWorker.stderr ?? "") + (buildBaseline.stderr ?? "")).slice(-4000) };
+			else {
+				const correctness = isolated("/work/registered-checker", ["--check"], 60_000, scratch, true);
+				const output: string[] = [];
+				const executionFailures: Array<Record<string, unknown>> = [];
+				let passed = correctness.status === 0 && correctness.stdout.trim() === "CSR_CHECK_PASS";
+				const selectors = ["serial:0", "std_thread:0", ...generated.metadata.targets.map((_, index) => `strategy:${index + 1}`)];
+				for (const config of generated.metadata.timing.cases) {
+					for (const threads of config.threadCounts) for (const selector of selectors) {
+						if (!passed) break;
+						const remaining = (registered.deadlineAt ?? Number.POSITIVE_INFINITY) - Date.now();
+						if (remaining <= 0) { executionFailures.push({ phase: "timing", caseId: config.id, selector, threads, reason: "time-boundary" }); passed = false; break; }
+						const measured = isolated("/work/registered-checker", ["--timing", config.id, selector, String(threads)],
+							Math.min(60_000, remaining), scratch, true);
+						const rows = measured.stdout.trim().split(/\r?\n/);
+						if (measured.status !== 0 || rows.length !== 2 || rows[1] !== "CSR_CHECK_PASS") {
+							executionFailures.push({ phase: "timing", caseId: config.id, selector, threads, exitCode: measured.status, signal: measured.signal,
+								stderrTail: (measured.stderr ?? "").slice(-4_000), stdoutTail: (measured.stdout ?? "").slice(-4_000) });
+							passed = false; break; }
+						output.push(rows[0]);
+					}
+				}
+				const parsed = parseRegisteredCheckerOutput([...output, "CSR_CHECK_PASS"].join("\n"), generated.metadata);
+				verification.registeredExperiment = { status: passed ? parsed.status : "failed",
+					plan: experimentPlan, timings: parsed.timings, strategyNames: generated.metadata.targets,
+					baselineNames: generated.metadata.baselines, metric: generated.metadata.timing.metric, measurementAuthority: generated.metadata.timing.trust, accounting: generated.metadata.timing.accounting,
+					freshProcessPerSelection: true, compileFlags: FLAGS, executionFailures,
+					baselineIsolation: generated.metadata.timing.baselineIsolation, runtimeFiles: generated.metadata.timing.runtimeFiles,
+					correctness: { status: correctness.status === 0 ? "passed" : "failed",
+						threadCounts: generated.metadata.threadCounts, mutationPasses: generated.metadata.mutationPasses },
+					stderrTail: correctness.status === 0 ? undefined : (correctness.stderr ?? "").slice(-1000) };
+				verification.independent = { status: passed ? parsed.status : "failed", mutationPasses: generated.metadata.mutationPasses };
+
+			}
+		} catch (error) { verification.registeredExperiment = { status: "failed", reason: error instanceof Error ? error.message.slice(0, 2_000) : "registered checker generation or execution failed" }; }
+		verification.status = shape.ok && runs.every(run => run.exitCode === 0) &&
+			(verification.registeredExperiment as { status?: string }).status === "passed" ? "passed" : "failed";
+	}
 	return verification;
+}
+
+/** Authenticate transport elsewhere, then validate identities without promoting historical observations to current facts. */
+function validateContinuationSeed(bundle: PrivateContinuationBundle, inputNames: string[], binding: {
+	contractId: string; sourceSha256: string;
+}, originalSource: string): { checkpoint: ObjectiveProgressV1; archive: Record<string, any> } {
+	if (!bundle["candidate.cpp"] || !bundle["verification.json"] || !bundle["objective-checkpoint.json"] ||
+		!bundle["workflow-archive.json"]) fail("prior private continuation lacks selected evidence");
+	const checkpoint = JSON.parse(bundle["objective-checkpoint.json"]) as ObjectiveProgressV1;
+	if (checkpoint?.version !== 1 || checkpoint.kind !== "original-objective-progress" ||
+		checkpoint.contract?.version !== 1 || checkpoint.contract.kind !== "original-objective" ||
+		checkpoint.contract.id !== binding.contractId || typeof checkpoint.contract.createdAt !== "string" ||
+		!Number.isFinite(Date.parse(checkpoint.contract.createdAt)) ||
+		createHash("sha256").update(originalSource).digest("hex") !== binding.sourceSha256 ||
+		JSON.stringify(checkpoint.contract.inputNames) !== JSON.stringify(inputNames) ||
+		checkpoint.contract.closure !== "open-ended" || !Array.isArray(checkpoint.boundedRuns) ||
+		!Array.isArray(checkpoint.assessmentHistory) || !Array.isArray(checkpoint.selectedArtifacts) ||
+		!Array.isArray(checkpoint.availableArtifacts) || !Array.isArray(checkpoint.continuation?.unresolvedOperationIds))
+		fail("prior objective or original-source version binding is invalid");
+	// Reuse contract field validation, but preserve the original object and bytes verbatim.
+	createOriginalObjective(checkpoint.contract);
+	if (bundle["original-objective.json"] &&
+		JSON.stringify(JSON.parse(bundle["original-objective.json"])) !== JSON.stringify(checkpoint.contract))
+		fail("prior original contract and checkpoint differ");
+	if (checkpoint.continuation.requiresOperationReconciliation || checkpoint.continuation.unresolvedOperationIds.length ||
+		checkpoint.boundedRuns.some(run => (run.unresolvedOperationIds?.length ?? 0) > 0))
+		fail("prior unresolved external operations require reconciliation before new execution");
+	const archive = JSON.parse(bundle["workflow-archive.json"]) as Record<string, any>;
+	const verification = JSON.parse(bundle["verification.json"]) as Record<string, any>;
+	if (archive?.version !== 1 || archive.kind !== "m07-private-candidate-archive" ||
+		archive.controllerEvidence?.reviewStatus !== "accepted" || !/^T\d{3,}$/.test(archive.taskId ?? "") ||
+		typeof archive.goalRunId !== "string" || !checkpoint.boundedRuns.some(run => run.runId === archive.goalRunId &&
+			(run.selectedTaskId === archive.taskId || run.acceptedTaskIds?.includes(archive.taskId))) ||
+		verification?.version !== 1 || verification.status !== "passed" ||
+		Buffer.byteLength(bundle["candidate.cpp"], "utf8") > 128_000 ||
+		Buffer.byteLength(bundle["verification.json"], "utf8") > 1_000_000)
+		fail("prior source and verification do not match a bounded accepted historical task");
+	if (bundle["m04-adopted-knowledge.json"]) {
+		const knowledge = JSON.parse(bundle["m04-adopted-knowledge.json"]) as Record<string, any>;
+		if (knowledge?.version !== 1 || knowledge.kind !== "m04-published-knowledge-export" ||
+			knowledge.m04RunId !== archive.m04?.runId || typeof knowledge.storeId !== "string" ||
+			!Array.isArray(knowledge.records) || !Array.isArray(knowledge.adoptedExperienceRefs) ||
+			knowledge.adoptedExperienceRefs.some((ref: Record<string, unknown>) =>
+				ref.storeId !== knowledge.storeId || typeof ref.recordId !== "string" ||
+				!Number.isSafeInteger(ref.version) || Number(ref.version) < 1))
+			fail("prior knowledge export lacks its historical M04 version binding");
+	}
+	return { checkpoint, archive };
+}
+
+/** A read-only, lossless range-readable view; the authenticated carry keeps the original historical bytes. */
+function rangeReadableHistory(text: string): string {
+	const history = JSON.parse(text) as { version: number; kind: string; entries: Array<Record<string, any>> };
+	if (history?.version !== 1 || history.kind !== "untrusted-version-bound-research-history" || !Array.isArray(history.entries))
+		fail("historical research context is invalid");
+	return `${JSON.stringify({ ...history, entries: history.entries.map(entry => ({ ...entry,
+		files: Object.fromEntries(Object.entries(entry.files ?? {}).map(([name, content]) => {
+			if (typeof content !== "string") fail("historical file content is invalid");
+			const segments: string[] = [];
+			for (let index = 0; index < content.length; index += 2_000) segments.push(content.slice(index, index + 2_000));
+			return [name, { encoding: "concatenated-utf16-string-segments", segments }];
+		})) })) }, null, 2)}\n`;
+}
+
+/** Keep selected evidence as one coherent tuple, never combine a new failed source with an old acceptance. */
+async function collectContinuationBundle(directory: string, prior?: PrivateContinuationBundle): Promise<PrivateContinuationBundle | undefined> {
+	const current: PrivateContinuationBundle = {};
+	for (const name of PRIVATE_CONTINUATION_FILE_KEYS) {
+		const file = path.join(directory, name);
+		if (!existsSync(file)) continue;
+		const info = await lstat(file);
+		if (!info.isFile() || info.isSymbolicLink() || info.size > 4 * 1024 * 1024)
+			fail("continuation evidence must be a bounded regular file");
+		current[name] = await readFile(file, "utf8");
+	}
+	let accepted = false;
+	try {
+		const archive = JSON.parse(current["workflow-archive.json"] ?? "null");
+		const verification = JSON.parse(current["verification.json"] ?? "null");
+		const checkpoint = JSON.parse(current["objective-checkpoint.json"] ?? "null");
+		accepted = Boolean(current["candidate.cpp"] && archive?.version === 1 &&
+			archive.kind === "m07-private-candidate-archive" && archive.controllerEvidence?.reviewStatus === "accepted" &&
+			verification?.version === 1 && verification.status === "passed" &&
+			checkpoint?.selectedArtifacts?.includes("candidate.cpp") && checkpoint.selectedArtifacts.includes("verification.json") &&
+			checkpoint.boundedRuns?.some((run: { runId: string; selectedTaskId?: string }) =>
+				run.runId === archive.goalRunId && run.selectedTaskId === archive.taskId));
+	} catch { /* Keep the prior coherent accepted tuple on an interrupted or failed new attempt. */ }
+	const selected = accepted ? current : prior ? { ...prior } : undefined;
+	if (!selected) return undefined;
+	const savedHistory = current["research-history.json"] ?? prior?.["research-history.json"];
+	const history = savedHistory ? JSON.parse(savedHistory) :
+		{ version: 1, kind: "untrusted-version-bound-research-history", entries: [] };
+	if (history?.version !== 1 || history.kind !== "untrusted-version-bound-research-history" || !Array.isArray(history.entries))
+		fail("prior research history is invalid");
+	if (prior && accepted && prior["workflow-archive.json"] !== current["workflow-archive.json"]) {
+		const archived = JSON.parse(prior["workflow-archive.json"] ?? "null");
+		const checkpoint = JSON.parse(prior["objective-checkpoint.json"] ?? "null");
+		if (!archived?.goalRunId || !archived.taskId || !checkpoint?.contract?.id) fail("historical tuple lacks version binding");
+		if (!history.entries.some((entry: Record<string, unknown>) => entry.goalRunId === archived.goalRunId && entry.taskId === archived.taskId))
+			history.entries.push({ originalContractId: checkpoint.contract.id, goalRunId: archived.goalRunId,
+				taskId: archived.taskId, interpretation: "Untrusted historical development evidence; prior adoption is not current truth",
+				files: Object.fromEntries(["candidate.cpp", "verification.json", "workflow-archive.json",
+					"experiment-plan.json", "m04-adopted-knowledge.json"].filter(name => prior[name as keyof typeof prior] !== undefined)
+					.map(name => [name, prior[name as keyof typeof prior]])) });
+	}
+	if (history.entries.length) selected["research-history.json"] = JSON.stringify(history);
+	for (const name of ["original-objective.json", "objective-checkpoint.json", "objective-assessment-receipts.json"] as const)
+		if (current[name]) selected[name] = current[name];
+	if (Buffer.byteLength(JSON.stringify(selected), "utf8") > 4 * 1024 * 1024)
+		fail("research continuation exceeds the authenticated carry capacity");
+	return selected;
 }
 
 async function inputs(inputDir: string) {
@@ -698,12 +1005,15 @@ async function main() {
 	delete process.env.GITHUB_TOKEN;
 	delete process.env.DEEPSEEK_API_KEY;
 	statusPhase = "mission-ledger-verification";
-	const missionLedger = await verifySignedMissionLedger({ envelopeB64: ledgerEnvelope,
+	const missionLedger = await openLedgerContinuation({ seedEnvelopeB64: ledgerEnvelope,
 		publicKeyFile: path.join(HERE, "campaign-output-public.pem"), githubToken,
+		loadCarryArtifact: ({ artifactId }) => downloadCarryArtifact({ githubToken: githubToken ?? "", artifactId }),
 		current: { repository: process.env.GITHUB_REPOSITORY, runId: process.env.GITHUB_RUN_ID,
 			runAttempt: process.env.GITHUB_RUN_ATTEMPT, actor: process.env.GITHUB_ACTOR,
 			event: process.env.GITHUB_EVENT_NAME, ref: process.env.GITHUB_REF,
 			sha: process.env.GITHUB_SHA, manualAuthorized: process.env.MULPIS_MANUAL_AUTHORIZED } });
+	let finalBudget: DeepSeekCampaignBudget | undefined;
+	try {
 	if (!runtimeKey?.trim()) fail("DeepSeek credential absent");
 	statusRuntimeKey = runtimeKey;
 	statusPhase = "credential-probe";
@@ -727,6 +1037,7 @@ async function main() {
 		estimatedInputCnyPerMillionTokens: 4, estimatedCacheReadCnyPerMillionTokens: 0.2,
 		estimatedOutputCnyPerMillionTokens: 16, estimatedCnyPerUsd: 10 });
 	statusBudget = budget;
+	finalBudget = budget;
 	let campaignDeadlineAt: number | undefined;
 	let campaignTimedOut = false;
 	try {
@@ -740,21 +1051,35 @@ async function main() {
 			"Private C++ parallel-programming task. Use only the supplied original inputs. Produce optimized source and machine-readable correctness/performance observations. Do not produce a prose report, screenshots, presentation, or personal reflection. Do not invent measurements.\n" +
 			(await readFile(path.join(ws.rawDir, found.files.find(x => /\.md$/i.test(x)) ?? found.files.find(x => /\.txt$/i.test(x))!), "utf8")),
 			{ mode: 0o600 });
-		const originalObjective = createOriginalObjective({
-			goal: "Find the strongest currently attainable strategy for the supplied private optimization problem, supported by correctness and measured performance across the permitted search space.",
-			goalSource: "user-intent-summary", inputNames: found.files,
-			obligations: [
-				{ id: "original-task", description: "Address the full supplied original task and user intent; the original private materials control the scientific requirements, and the model must state specific unresolved requirements from them." },
-			], closure: "open-ended",
-		});
+		const originalPath = path.join(ws.rawDir, found.source);
+		const originalText = await readFile(originalPath, "utf8");
+		const previousBundle = missionLedger.priorPrivateBundle;
+		if (!previousBundle || !missionLedger.priorBootstrapBinding)
+			fail("mission continuation lacks authenticated selected prior evidence");
+		const { checkpoint: previousCheckpoint } = validateContinuationSeed(previousBundle, found.files,
+			missionLedger.priorBootstrapBinding, originalText);
+		const priorSeedDir = path.join(ws.root, "objective-seeds");
+		await mkdir(priorSeedDir, { recursive: true, mode: 0o700 });
+		await writeFile(path.join(priorSeedDir, "prior-candidate.cpp"), previousBundle["candidate.cpp"]!, { mode: 0o600 });
+		await writeFile(path.join(priorSeedDir, "prior-verification.json"), previousBundle["verification.json"]!, { mode: 0o600 });
+		await writeFile(path.join(priorSeedDir, "prior-archive.json"), previousBundle["workflow-archive.json"]!, { mode: 0o600 });
+		if (previousBundle["experiment-plan.json"])
+			await writeFile(path.join(priorSeedDir, "prior-experiment-plan.json"), previousBundle["experiment-plan.json"], { mode: 0o600 });
+		await writeFile(path.join(priorSeedDir, "prior-objective-checkpoint.json"), previousBundle["objective-checkpoint.json"]!, { mode: 0o600 });
+		if (previousBundle["research-history.json"]) await writeFile(path.join(priorSeedDir, "prior-research-history.json"), rangeReadableHistory(previousBundle["research-history.json"]), { mode: 0o600 });
+		const priorSeedInputs = ["objective-seeds/prior-objective-checkpoint.json",
+			...(previousBundle["research-history.json"] ? ["objective-seeds/prior-research-history.json"] : []),
+			...(previousBundle["m04-adopted-knowledge.json"] ? ["objective-seeds/prior-m04-knowledge.json"] : []),
+			"objective-seeds/prior-candidate.cpp", "objective-seeds/prior-verification.json",
+			"objective-seeds/prior-archive.json",
+			...(previousBundle["experiment-plan.json"] ? ["objective-seeds/prior-experiment-plan.json"] : [])];
+		const originalObjective = previousCheckpoint.contract;
+		// A historical contract is immutable; current user overrides enter prompts separately.
 		const objectiveContractFile = path.join(outputDir, "original-objective.json");
 		const objectiveCheckpointFile = path.join(outputDir, "objective-checkpoint.json");
 		await writeOriginalObjectiveContract(objectiveContractFile, originalObjective);
-		await writeObjectiveProgress(objectiveCheckpointFile, objectiveProgress(originalObjective,
-			{ boundedRuns: [], selectedArtifacts: [], stopReason: "bounded-run-incomplete" }));
+		await writeObjectiveProgress(objectiveCheckpointFile, previousCheckpoint);
 		await writeFile(ws.configFile, JSON.stringify({ roles: { execution: MODEL, reviewer: MODEL, research: MODEL }, concurrency: 1, tools: {} }), { mode: 0o600 });
-		const originalPath = path.join(ws.rawDir, found.source);
-		const originalText = await readFile(originalPath, "utf8");
 		const targetCount = [...originalText.matchAll(/\/\/\s*TODO[^\n]*\n\s*static\s+void\s+([A-Za-z_]\w*)\s*\(/g)].length;
 		if (targetCount < 2 || !originalText.includes('"--threads"') || !originalText.includes('"--repeats"'))
 			fail("private source does not satisfy bounded campaign preflight contract");
@@ -800,27 +1125,51 @@ async function main() {
 		const timer = setTimeout(() => { campaignTimedOut = true; abort.abort(); }, CAMPAIGN_MS);
 		try {
 			const actual = createPiSessionRunner({ modelRuntime: runtime, signal: abort.signal, campaignBudget: budget });
-			let followOnPriorVerification: unknown;
+			let followOnPriorCandidate = path.join(priorSeedDir, "prior-candidate.cpp");
+			let followOnPriorPlanFile: string | undefined = previousBundle["experiment-plan.json"] ? path.join(priorSeedDir, "prior-experiment-plan.json") : undefined;
+			let registeredScopeActive = false;
+			const registeredTaskText = (await Promise.all(found.files.filter(name => /\.(?:md|txt)$/i.test(name))
+				.map(name => readFile(path.join(ws.rawDir, name), "utf8")))).join("\n\n");
+			const remeasurePrior = async (priorSource: string, priorPlanFile: string | undefined,
+				registered: boolean, currentPlanFile: string): Promise<Record<string, unknown>> => {
+				if (Date.now() + 30_000 >= campaignStopAt) return { status: "not_run", reason: "time-boundary" };
+				const scratch = await verifierScratch("candidate");
+				try {
+					if (!registered) return await checkCandidate(originalPath, priorSource, scratch);
+					const plan = JSON.parse(await readFile(currentPlanFile, "utf8")) as CsrExperimentPlan;
+					const oldStrategies = priorPlanFile ? (JSON.parse(await readFile(priorPlanFile, "utf8")) as CsrExperimentPlan).registeredStrategies :
+						inspectCsrTaskContract(originalText, registeredTaskText).originalTargets;
+					const matchedPlanFile = path.join(scratch, "prior-matched-plan.json");
+					await writeFile(matchedPlanFile, JSON.stringify({ registeredStrategies: oldStrategies, cases: plan.cases }), { mode: 0o600 });
+					return await checkCandidate(originalPath, priorSource, scratch,
+						{ taskText: registeredTaskText, planFile: matchedPlanFile, deadlineAt: campaignStopAt });
+				} catch { return { status: "failed", reason: "prior source could not be revalidated under the current model-authored plan" }; }
+				finally { await rm(scratch, { recursive: true, force: true }); }
+			};
 			const confinedSpec = async (spec: SessionSpec): Promise<SessionSpec> => {
 				if (spec.tools.kind !== "execution") return spec;
 				if (!/^M07-T\d+$/.test(spec.label)) fail("unexpected execution session");
 				const tools = await createConfinedCampaignFileTools(spec.tools.root,
-					{ writableFiles: ["candidate.cpp", "lesson-delta.json"] });
+					{ writableFiles: registeredScopeActive ? ["candidate.cpp", "lesson-delta.json", "experiment-plan.json"] :
+						["candidate.cpp", "lesson-delta.json"] });
 				return { ...spec, tools: { kind: "custom", tools } };
 			};
-			const checkedHandle = (handle: SessionHandle, workDir: string): SessionHandle => ({
+			const checkedHandle = (handle: SessionHandle, workDir: string, registered: boolean): SessionHandle => ({
 				...handle, prompt: async (message: string) => {
 						const candidate = path.join(workDir, "candidate.cpp");
 						const verification = path.join(workDir, "verification.json");
+						const planFile = path.join(workDir, "experiment-plan.json");
 						const previousPhase = statusPhase;
 						const turn = await runMeasuredEvidenceHandoff({ handle,
 							implementationPrompt: message, sourceFile: candidate, evidenceFile: verification,
+							...(registered ? { frozenSourceFiles: [planFile] } : {}),
 							measure: async () => {
 								statusPhase = "host-verification";
 								let result: Record<string, unknown> = { version: 1, status: "failed", reason: "candidate missing" };
 								if (existsSync(candidate)) {
 									const candidateScratch = await verifierScratch("candidate");
-									try { result = await checkCandidate(originalPath, candidate, candidateScratch); }
+									try { result = await checkCandidate(originalPath, candidate, candidateScratch,
+										registered ? { taskText: registeredTaskText, planFile, deadlineAt: campaignStopAt } : undefined); }
 									finally { await rm(candidateScratch, { recursive: true, force: true }); }
 								}
 								result.originalBaselineRuns = originalSmoke.originalCheckerRuns;
@@ -829,12 +1178,29 @@ async function main() {
 									timings: (originalSmoke.independent as { timings?: TrustedTiming[] }).timings,
 								};
 								result.originalHostComparison = compareCandidateTimings(originalSmoke, result);
-								if (result.status === "passed" && (result.originalHostComparison as { state?: string }).state !== "measured")
+								if (!registered && result.status === "passed" && (result.originalHostComparison as { state?: string }).state !== "measured")
 									result.status = "failed";
-								if (followOnPriorVerification) result.priorCandidateComparison = compareCandidateTimings(followOnPriorVerification, result);
+								if (result.status === "passed") {
+									const measuredPrior = await remeasurePrior(followOnPriorCandidate, followOnPriorPlanFile, registered, planFile);
+									result.priorCandidateComparison = compareCandidateTimings(measuredPrior, result);
+									result.priorCandidateTimingEvidence = { status: measuredPrior.status,
+										remeasuredOnCurrentHost: measuredPrior.status === "passed", historicalTimingUsed: false,
+										independent: measuredPrior.independent, registeredExperiment: measuredPrior.registeredExperiment };
+								}
+								const compile = result.compile as Record<string, unknown> | undefined;
+								const measured = result.registeredExperiment as Record<string, unknown> | undefined;
+								const shape = result.sourceShape as Record<string, unknown> | undefined;
+								result.hostFeedback = { version: 1, kind: "execution-result-feedback", status: result.status,
+									observedEnvironment: result.environment, sourceBoundary: shape,
+									measurementMetric: measured?.metric ?? "legacy-diagnostic-only",
+									timingInterpretation: registered ? "Parent-clocked persistent-worker roundtrip, including IPC and kernel work. Startup and cold-call costs are separate. This is not kernel-only time." : "Historical diagnostic protocol",
+									diagnostics: [compile?.success === false ? { phase: "compile", message: compile.stderrTail ?? "No candidate compiled" } : undefined,
+										measured?.status !== "passed" ? { phase: "independent-validation", message: measured?.stderrTail ?? measured?.reason ?? result.reason ?? "Candidate or plan unavailable" } : undefined,
+										...(Array.isArray(measured?.executionFailures) ? measured.executionFailures : [])].filter(Boolean),
+									interpretation: "Measurements and diagnostics are task feedback. Finite passing checks do not prove exhaustive correctness, strongest possible performance, or completion." };
 								await writeFile(verification, JSON.stringify(result, null, 2), { mode: 0o600 });
 							},
-							finalizationPrompt: "Evidence-finalization phase for this same M07 task. The host just measured the current candidate and wrote verification.json. Use the read tool to read the complete current verification.json before making claims; earlier reports and measurements may describe a different candidate or timing run. You may read candidate.cpp and lesson-delta.json, and update only lesson-delta.json. Do not write or edit candidate.cpp or verification.json. Report the exact current measured facts, including shape-dependent winners, regressions and limitations, without inventing or reusing stale numbers. The lesson-delta.json schema is version 1 with action none, propose, amend or contradict and an evidencePaths array of at most 20 relative task paths. A proposal needs a nonempty observation and applicability and at least one evidence path such as verification.json. Amend or contradict additionally requires an exact pinned priorRef with storeId, recordId and integer version; if no such adopted prior record is available, use propose or none. None can use an empty evidencePaths array. This is only a pending lesson candidate; do not claim M04 adoption. Your response is the final evidence-grounded report for the fresh reviewer: aim below 4,000 characters, cite decisive measured values and caveats, and do not copy the full verification file. No code changes.",
+							finalizationPrompt: "Evidence-finalization phase for this same M07 task. The host just measured the current candidate and wrote verification.json. Use the read tool to read the complete current verification.json before making claims; earlier reports and measurements may describe a different candidate or timing run. You may read candidate.cpp and lesson-delta.json, and update only lesson-delta.json. Do not write or edit candidate.cpp, experiment-plan.json or verification.json. Report the exact current measured facts, including shape-dependent winners, regressions and limitations, without inventing or reusing stale numbers. The lesson-delta.json schema is version 1 with action none, propose, amend or contradict and an evidencePaths array of at most 20 relative task paths. A proposal needs a nonempty observation and applicability and at least one evidence path such as verification.json. Amend or contradict additionally requires an exact pinned priorRef with storeId, recordId and integer version; if no such adopted prior record is available, use propose or none. None can use an empty evidencePaths array. This is only a pending lesson candidate; do not claim M04 adoption. Return structured execution feedback for the fresh reviewer as strict JSON with version 1, status, observations, limitations, nextStep and evidenceRefs. Cite decisive current measured values and concrete failures; do not copy the full verification file or create a prose deliverable. Do not describe isolated-worker roundtrip timings as kernel-only timings. No code changes.",
 							readToolName: "read", onFinalization: () => { statusPhase = "evidence-finalization"; },
 						});
 						statusPhase = previousPhase;
@@ -847,34 +1213,165 @@ async function main() {
 				create: async spec => {
 					const transformed = await confinedSpec(spec);
 					const handle = await actual.create(transformed);
-					return spec.tools.kind === "execution" ? checkedHandle(handle, spec.tools.root) : handle;
+				return spec.tools.kind === "execution" ? checkedHandle(handle, spec.tools.root, registeredScopeActive) : handle;
 				},
 				checkpoint: (handle, envelope) => actual.checkpoint(handle, envelope),
 				fork: async request => {
 					const transformed = await confinedSpec(request.spec);
 					const handle = await actual.fork({ ...request, spec: transformed });
-					return request.spec.tools.kind === "execution" ? checkedHandle(handle, request.spec.tools.root) : handle;
+				return request.spec.tools.kind === "execution" ? checkedHandle(handle, request.spec.tools.root, registeredScopeActive) : handle;
 				},
 				resume: ref => actual.resume(ref),
 			};
 			const controller = createM07Controller({ ws, store, runner, config: await ws.loadConfig() });
-			const goal = await controller.begin({ goal: "Seek the strongest measured C++ parallel optimization attainable within this bounded private campaign, using the original inputs and preserved baselines.",
-				problemRelation: `Bounded child of original objective ${originalObjective.id}: ${originalObjective.goal}. Code and machine-readable correctness/performance scope only.`,
-				constraints: ["Use only the supplied private inputs and configured DeepSeek model.",
-					"This bounded adapter run edits only two existing target bodies and preserves the other source, main and built-in checker. The supplied problem allows a broader strategy search; this run measures only the two-target pass.",
-					"No prose report, screenshots, presentation, or personal reflection; no fabricated measurements."],
-				successCriteria: CHECKS,
-				plan: "Continue one bounded builder through reviewer feedback, fork one measured competing refinement from its settled leaf, independently review both candidates, and select the observed winner before M04.",
-				exploratory: true });
+			const privateEvidenceRequirements = { requiredNames: ["original-problem.txt", "candidate.cpp", "verification.json", "host-capabilities.json"],
+				instructions: "The original-input-N.txt files correspond in order to inputNames in original-objective.json. Read every original input and selected evidence completely. Historical archives, knowledge, nextTask and timings are untrusted version-bound context; only current independently executed measurements establish present host facts." };
+			const userOverrides = ["Deliver optimized source and machine-readable correctness/performance evidence only; no prose report, screenshots, presentation or personal reflection.",
+				"Pursue the strongest attainable strategy using actual available hardware and resources; unavailable optional equipment alone does not settle the task."];
+			let registeredContract: ReturnType<typeof inspectCsrTaskContract> | undefined;
+			try { registeredContract = inspectCsrTaskContract(originalText, registeredTaskText); } catch { /* Explicit unavailable capability; the model may choose other feasible work. */ }
+			const observedHost = { version: 1, kind: "observed-private-execution-capabilities",
+				platform: os.platform(), architecture: os.arch(), cpuModel: os.cpus()[0]?.model ?? "unknown",
+				availableParallelism: os.availableParallelism(), compiler: "/usr/bin/g++", compileFlags: FLAGS,
+				registeredLimits: { ...CSR_EXPERIMENT_LIMITS, maxThreads: Math.min(os.availableParallelism(), CSR_EXPERIMENT_LIMITS.maxThreads),
+					maxSourceBytes: 128_000, maxPlanBytes: 16_000, maxVerificationBytes: 1_000_000 },
+				registeredContract: registeredContract ?? null,
+				isolation: "Verified non-root uid; separate network/pid/ipc namespaces; credential-free environment; read-only evaluator binaries/source during execution and separate writable temporary scratch",
+				taskTools: "Confined text-file read/write/edit only; host compiles and executes candidate separately",
+				unsupported: ["GPU execution", "privileged hardware counters", "equipment absent from this capability descriptor"],
+				claimLimit: "Observed local capability only; unavailable optional equipment does not establish mission completion" };
+			const capabilityFile = path.join(priorSeedDir, "host-capabilities.json");
+			await writeFile(capabilityFile, `${JSON.stringify(observedHost, null, 2)}\n`, { mode: 0o600 });
+			await copyFile(capabilityFile, path.join(outputDir, "execution-capabilities.json"));
+			priorSeedInputs.push("objective-seeds/host-capabilities.json");
+			const experimentInstructions = [
+				"Produce experiment-plan.json with {registeredStrategies: string[], cases: [{id, rows, cols, normalNnz, longRows, longNnz, seed, threadCounts, warmups, repeats}]}.",
+				"Choose every scientific strategy and case yourself from the supplied original task. Read host-capabilities.json for actual limits; those limits describe this executor, not a smaller scientific mission.",
+				registeredContract?.sourceScope ?? "Registered execution is unavailable for this input shape.",
+				registeredContract?.timingScope ?? "No registered measurement capability verified.",
+				"Total bounded timed work is sum(nonzeros * thread-choice-count * (1 + warmups + repeats) * (registered-strategy-count + 2)). Every strategy must be registered. Retain limitations and feasible untested work in machine-readable evidence.",
+			].join(" ");
+			const objectiveCapabilities = [
+				{ scope: "two-target-existing" as const, available: false,
+					description: "Historical in-process adapter, retained only for original-source diagnostics",
+					limits: ["Use registered-csr-experiment for fresh execution of the same original bodies or wider permitted variants; model must choose the plan"] },
+				{ scope: "registered-csr-experiment" as const, available: Boolean(registeredContract),
+					description: "Model-authored registered strategies/cases with a separate independent CPU checker and per-target measurements",
+					limits: [`observed CPU parallelism ${os.availableParallelism()}`,
+						registeredContract?.sourceScope ?? "task contract shape is unsupported",
+						"Read host-capabilities.json for the complete measured capability and allocation limits"] },
+				{ scope: "outside-current-adapter" as const, available: false,
+					description: "Changes or equipment outside the verified source and measurement adapters",
+					limits: ["requires a different verifier and capability proof"] },
+			];
+
+			const priorReceipts = previousBundle["objective-assessment-receipts.json"] ?
+				JSON.parse(previousBundle["objective-assessment-receipts.json"]) : undefined;
+			const objectiveReceipts: Array<Record<string, unknown>> = Array.isArray(priorReceipts?.receipts) ? [...priorReceipts.receipts] : [];
+			const persistObjectiveReceipt = async (record: StageRunRecord) => {
+				await ws.writeRun(record);
+				const receipt = { version: 1, kind: "m07-original-objective-assessment", runId: record.runId,
+					status: record.status, sessions: record.sessions.map(item => ({ sessionId: item.id, role: item.role,
+						model: item.model, boundaryMode: item.boundary?.mode ?? "unknown",
+						boundaryIntent: item.boundary?.intent ?? "unknown", toolGrantKind: item.boundary?.toolGrantKind ?? "unknown",
+						evidenceLabels: item.boundary?.evidence.map(entry => entry.label) ?? [] })) };
+				const index = objectiveReceipts.findIndex(item => item.runId === record.runId);
+				if (index >= 0) objectiveReceipts[index] = receipt; else objectiveReceipts.push(receipt);
+				await writeFile(path.join(outputDir, "objective-assessment-receipt.json"), JSON.stringify(receipt, null, 2), { mode: 0o600 });
+				await writeFile(path.join(outputDir, "objective-assessment-receipts.json"), JSON.stringify({ version: 1,
+					kind: "m07-original-objective-assessment-receipts", receipts: objectiveReceipts }, null, 2), { mode: 0o600 });
+			};
+			const firstAssessmentRecord = await ws.startRun("M07Objective", [
+				{ label: "Unchanged original objective", path: objectiveContractFile },
+				{ label: "Prior selected source", path: path.join(priorSeedDir, "prior-candidate.cpp") },
+				{ label: "Prior selected verification", path: path.join(priorSeedDir, "prior-verification.json") },
+			]);
+			const priorEvidence = [
+				{ name: "host-capabilities.json", file: capabilityFile },
+				...(previousBundle["research-history.json"] ? [{ name: "prior-research-history.json", file: path.join(priorSeedDir, "prior-research-history.json") }] : []),
+				{ name: "original-problem.txt", file: ws.problemFile },
+				...found.files.map((name, index) => ({ name: `original-input-${index + 1}.txt`, file: path.join(ws.rawDir, name) })),
+				{ name: "candidate.cpp", file: path.join(priorSeedDir, "prior-candidate.cpp") },
+				{ name: "verification.json", file: path.join(priorSeedDir, "prior-verification.json") },
+				{ name: "workflow-archive.json", file: path.join(priorSeedDir, "prior-archive.json") },
+				{ name: "prior-objective-checkpoint.json", file: path.join(priorSeedDir, "prior-objective-checkpoint.json") },
+				...(previousBundle["m04-adopted-knowledge.json"] ? [{ name: "m04-knowledge.json",
+					file: path.join(priorSeedDir, "prior-m04-knowledge.json") }] : []),
+				...(previousBundle["experiment-plan.json"] ? [{ name: "experiment-plan.json",
+					file: path.join(priorSeedDir, "prior-experiment-plan.json") }] : []),
+			];
+			if (previousBundle["m04-adopted-knowledge.json"])
+				await writeFile(path.join(priorSeedDir, "prior-m04-knowledge.json"), previousBundle["m04-adopted-knowledge.json"], { mode: 0o600 });
+			statusPhase = "prior-objective-assessment";
+			const firstStep = await assessAndAdvanceOriginalObjective({
+				contract: originalObjective, contractFile: objectiveContractFile, runner: actual,
+				runRecord: firstAssessmentRecord, persistReceipt: () => persistObjectiveReceipt(firstAssessmentRecord),
+				sessionSpec: { label: "M07-prior-objective-assessment", role: "research", model: MODEL,
+					systemPrompt: "Assess the unchanged user objective and all frozen prior evidence. Choose the next scientific work yourself under observed host capabilities. Read every supplied original input and selected evidence before deciding; report uncertainty honestly.",
+					persistDir: ws.sessionsDir },
+				evidenceRoot: path.join(campaignRoot, "prior-objective-evidence"), evidence: priorEvidence,
+				evidenceRequirements: privateEvidenceRequirements,
+				assessmentAdmission: budget.snapshot().stopped ? "budget-boundary" :
+					abort.signal.aborted || Date.now() + 90_000 >= campaignStopAt ? "time-boundary" : "admitted",
+				advanceAdmission: () => budget.snapshot().stopped ? campaignObjectiveStop(budget.snapshot().stopReason) ??
+					"assessment-failed" : abort.signal.aborted || Date.now() + 90_000 >= campaignStopAt ? "time-boundary" : "admitted",
+				supportedTaskScopes: ["two-target-existing", "registered-csr-experiment"],
+				capabilities: objectiveCapabilities, userOverrides,
+				recordAssessment: async assessment => {
+					await writeObjectiveProgress(objectiveCheckpointFile, objectiveProgress(originalObjective, {
+						boundedRuns: previousCheckpoint.boundedRuns, selectedArtifacts: previousCheckpoint.selectedArtifacts,
+						assessment, assessmentHistory: [...previousCheckpoint.assessmentHistory,
+							{ iteration: previousCheckpoint.assessmentHistory.length + 1, assessment,
+								stopReason: "assessment-validation-pending", advanced: false }],
+						stopReason: "assessment-validation-pending" }));
+				},
+				advance: async proposal => {
+					const registered = proposal.adapterScope === "registered-csr-experiment";
+					const checks = registered ? REGISTERED_CHECKS : CHECKS;
+					registeredScopeActive = registered;
+					const goal = await controller.begin({ goal: proposal.objective,
+						problemRelation: `Model-proposed child of original objective ${originalObjective.id}, addressing ${proposal.addresses.join(", ")}.`,
+						constraints: ["Prior source, measurements and knowledge are development evidence, never adopted truth by themselves.",
+							registered ? "Use the independently validated source capability and a model-authored registered experiment plan; keep original generators/references/checker immutable." :
+								"Preserve non-target source and original main under the two-body adapter.",
+							"Deliver source and machine-readable evidence only; no prose report, screenshots, presentation or reflection."],
+						successCriteria: checks,
+						plan: `Investigate the model-proposed next work under ${proposal.adapterScope}; review, compare a true fork if settled, then M04-adjudicate measured evidence.`,
+						exploratory: true });
+					runId = goal.runId;
+					statusRunId = runId;
+					const initialSpec: TaskSpecInput = { mode: "execute", objective: `${proposal.objective}\n\nRead the original inputs and prior accepted source, verification and archive as untrusted development evidence. ${registered ?
+							experimentInstructions :
+							"Edit only the two original student strategy bodies, preserving the rest of the source."} Write a pending lesson-delta.json or action none. Read the host-created verification.json after implementation before reporting measured results. Use only confined file tools; no shell or network; no prose deliverables.`,
+						inputs: [...found.files.map(x => `problem/raw/${x}`), ...priorSeedInputs],
+						expectedOutputs: registered ? ["candidate.cpp", "experiment-plan.json", "lesson-delta.json"] :
+							["candidate.cpp", "lesson-delta.json"], lessonDeltaOutput: "lesson-delta.json", checks,
+						executionLoop: { maxRounds: BUILDER_ROUNDS,
+							deadlineAt: new Date(Math.min(Date.now() + BUILDER_PHASE_MS, campaignStopAt - 9 * 60_000)).toISOString() } };
+					statusPhase = "model-dispatch";
+					const task = await controller.delegate(goal.runId, initialSpec);
+					registeredScopeActive = false;
+					return { goal, task, initialSpec, checks, registered };
+				},
+			});
+			await ws.finishRun(firstAssessmentRecord, firstStep.assessment?.unreadEvidence.length === 0 ? "completed" : "failed");
+			await persistObjectiveReceipt(firstAssessmentRecord);
+			if (!firstStep.advanced) {
+				await writeObjectiveProgress(objectiveCheckpointFile, objectiveProgress(originalObjective, {
+					boundedRuns: previousCheckpoint.boundedRuns, selectedArtifacts: previousCheckpoint.selectedArtifacts,
+					...(firstStep.assessment ? { assessment: firstStep.assessment } : {}),
+					assessmentHistory: [...previousCheckpoint.assessmentHistory,
+						...(firstStep.assessment ? [{ iteration: previousCheckpoint.assessmentHistory.length + 1,
+							assessment: firstStep.assessment, stopReason: firstStep.stopReason, advanced: false }] : [])],
+					stopReason: firstStep.stopReason }));
+				await saveStatus({ outcome: "incomplete", originalObjective: { id: originalObjective.id,
+					stopReason: firstStep.stopReason, checkpointFile: "objective-checkpoint.json" },
+				independentValidation: "prior selected source retained; no new bounded M07 dispatched" });
+				process.exitCode = 1;
+				return;
+			}
+			const { goal, task, initialSpec, checks: initialChecks, registered: initialRegistered } = firstStep.advanced;
 			runId = goal.runId;
-			statusRunId = runId;
-			statusPhase = "m07-begun";
-			statusPhase = "model-dispatch";
-			const initialSpec: TaskSpecInput = { mode: "execute",
-				objective: "Read the copied original inputs. Within this bounded two-target pass, replace the existing TODO parallel implementations with genuinely different OpenMP strategies in a complete candidate.cpp. Keep the other source and original checker/main for this adapter's trusted comparison. The supplied problem allows further strategies; report the scope actually tested. Examine host-generated verification.json after a round, compare actual per-kernel timings with original baselines, and use any remaining bounded round to improve or select the strongest observed valid candidate. If no gain is observed, say so; do not claim a global optimum. Write a bounded candidate lesson-delta.json with actual observation, applicability and evidencePaths, or action none when the evidence supports no lesson. This lesson is pending M04, never self-adopted. Use only the provided confined read/write/edit tools; do not call shell or network. The host creates verification.json after your turn; do not write it. Do not create prose deliverables.",
-				inputs: found.files.map(x => `problem/raw/${x}`), expectedOutputs: ["candidate.cpp", "lesson-delta.json"], lessonDeltaOutput: "lesson-delta.json", checks: CHECKS,
-				executionLoop: { maxRounds: BUILDER_ROUNDS, deadlineAt: new Date(Math.min(Date.now() + BUILDER_PHASE_MS, campaignStopAt - 9 * 60_000)).toISOString() } };
-			const task = await controller.delegate(runId, initialSpec);
 			statusPhase = "parent-task-returned";
 			statusTaskTelemetry = await taskTelemetry(ws, task, runtimeKey);
 			const parentCandidate = path.join(task.workDir, "candidate.cpp");
@@ -885,9 +1382,9 @@ async function main() {
 			if (task.status === "returned" && task.reportPath) {
 				statusPhase = "parent-review";
 				const review = await controller.review(runId, { taskId: task.taskId,
-					checks: CHECKS.map((criterion, i) => ({ criterion, result: accepted ? "passed" : "failed",
+					checks: initialChecks.map((criterion, i) => ({ criterion, result: accepted ? "passed" : "failed",
 						evidence: accepted ? [i === 0 ? parentCandidate : parentVerification] : [] })),
-					artifacts: [task.reportPath, ...(existsSync(parentCandidate) ? [parentCandidate] : []), ...(existsSync(parentVerification) ? [parentVerification] : [])],
+					artifacts: [...(initialRegistered && existsSync(path.join(task.workDir, "experiment-plan.json")) ? [path.join(task.workDir, "experiment-plan.json")] : []), task.reportPath, ...(existsSync(parentCandidate) ? [parentCandidate] : []), ...(existsSync(parentVerification) ? [parentVerification] : [])],
 					failures: accepted ? [] : ["bounded candidate did not pass all observed checks"] });
 				if (accepted && review.status !== "accepted") fail("M07 review did not accept candidate");
 			}
@@ -899,13 +1396,16 @@ async function main() {
 			let branchState: Record<string, unknown> = { state: "not_run", reason: "no settled source checkpoint or remaining campaign boundary" };
 			let winner = accepted ? task : undefined;
 			if (task.branchSource && !budget.snapshot().stopped && !abort.signal.aborted && Date.now() + 5 * 60_000 < campaignStopAt) {
-				followOnPriorVerification = parentResult;
+				followOnPriorCandidate = parentCandidate;
+				followOnPriorPlanFile = initialRegistered ? path.join(task.workDir, "experiment-plan.json") : undefined;
 				statusPhase = "fork-dispatch";
+				registeredScopeActive = initialRegistered;
 				const forked = await controller.delegate(runId, { ...initialSpec,
 					context: { mode: "fork", parentRunId: runId, parentTaskId: task.taskId,
 						checkpointId: task.branchSource.checkpoint.id },
 					executionLoop: { maxRounds: BUILDER_ROUNDS, deadlineAt: new Date(Math.min(Date.now() + 4 * 60_000,
 						campaignStopAt - 5 * 60_000)).toISOString() } });
+				registeredScopeActive = false;
 				branchTask = forked;
 				statusPhase = "fork-task-returned";
 				statusBranchTelemetry = await taskTelemetry(ws, forked, runtimeKey);
@@ -919,9 +1419,9 @@ async function main() {
 				if (forked.status === "returned" && forked.reportPath) {
 					statusPhase = "fork-review";
 					const reviewed = await controller.review(runId, { taskId: forked.taskId,
-						checks: CHECKS.map((criterion, i) => ({ criterion, result: branchAccepted ? "passed" : "failed",
+						checks: initialChecks.map((criterion, i) => ({ criterion, result: branchAccepted ? "passed" : "failed",
 							evidence: branchAccepted ? [i === 0 ? branchCandidate : branchVerification] : [] })),
-						artifacts: [forked.reportPath, ...(existsSync(branchCandidate) ? [branchCandidate] : []),
+						artifacts: [...(initialRegistered && existsSync(path.join(forked.workDir, "experiment-plan.json")) ? [path.join(forked.workDir, "experiment-plan.json")] : []), forked.reportPath, ...(existsSync(branchCandidate) ? [branchCandidate] : []),
 							...(existsSync(branchVerification) ? [branchVerification] : [])],
 						failures: branchAccepted ? [] : ["forked candidate did not pass all observed checks"] });
 					forkReviewStatus = reviewed.status;
@@ -986,7 +1486,7 @@ async function main() {
 			const finished = await controller.finish(runId, { outcome: acceptedWinner ? "fulfilled" : "partial", returnPath: "user",
 				summary: acceptedWinner ? "M07 builder, true refinement fork, fresh reviews and measured branch selection completed." :
 					"M07 attempt or true branch selection was incomplete.",
-				goalChecks: CHECKS.map((criterion, i) => ({ criterion, result: acceptedWinner ? "passed" : "not_run",
+				goalChecks: initialChecks.map((criterion, i) => ({ criterion, result: acceptedWinner ? "passed" : "not_run",
 					evidence: acceptedWinner ? [i === 0 ? candidate : verificationPath] : [] })),
 				limitations: ["The workflow-owned independent checker covers bounded shapes, mutations and threads; it is not exhaustive proof of correctness or optimality."] });
 			const firstGoalReady = firstM07Accepted(acceptedWinner, finished.outcome);
@@ -994,7 +1494,8 @@ async function main() {
 			const frozenGoal = await controller.status(runId);
 			const frozenTask = frozenGoal.tasks.find(item => item.taskId === selectedTask.taskId);
 			if (!frozenTask) fail("finished M07 task identity is unavailable for private archive");
-			const selectedM04ReadPaths = firstGoalReady ? selectedM07ReviewReadPaths(ws.runDir("M07", runId), frozenTask) : [];
+			const selectedM04ReadPaths = firstGoalReady ? selectedM07ReviewReadPaths(ws.runDir("M07", runId), frozenTask,
+				initialRegistered ? ["experiment-plan.json"] : []) : [];
 			statusPhase = "private-archive";
 			const privateArchive = await archivePrivateM07Task({ goal: frozenGoal, task: frozenTask, destination: outputDir });
 			const parentArchiveDir = path.join(campaignRoot, "branch-parent-archive");
@@ -1025,7 +1526,8 @@ async function main() {
 							requiredM07ReadPaths: selectedM04ReadPaths,
 							purpose: "Adjudicate bounded M07 candidate lessons and limits" });
 					const complete = processed.record.status === "completed" && processed.record.failures.length === 0;
-					const coverage = firstGoalReady ? await m04EvidenceReturned(processed.record, selectedTask.taskId) :
+					const coverage = firstGoalReady ? await m04EvidenceReturned(processed.record, selectedTask.taskId,
+						initialRegistered ? ["experiment-plan.json"] : []) :
 						{ complete: false, paths: [] };
 					m04 = { status: complete ? "completed" : "failed", runId: processed.record.runId,
 						proposalSubmitted: Boolean(processed.proposalId), snapshotCreated: Boolean(processed.snapshotId),
@@ -1053,8 +1555,10 @@ async function main() {
 			let followOnSourceChanged: boolean | null = null;
 			let objectiveAssessment: ObjectiveProgressV1["assessment"];
 			let latestAssessmentAdvanced = false;
-			const assessmentHistory: ObjectiveProgressV1["assessmentHistory"] = [];
-			const objectiveReceipts: Array<Record<string, unknown>> = [];
+			const assessmentHistory: ObjectiveProgressV1["assessmentHistory"] = [...previousCheckpoint.assessmentHistory,
+				...(firstStep.assessment ? [{ iteration: previousCheckpoint.assessmentHistory.length + 1,
+					assessment: firstStep.assessment, stopReason: firstStep.stopReason, advanced: true }] : [])];
+			const priorAssessmentCount = assessmentHistory.length;
 			let objectiveStopReason: ObjectiveStopReason = "bounded-run-incomplete";
 			let currentM04Status = m04.status;
 			let currentM04Read = m04SelectedReadContractSatisfied;
@@ -1064,6 +1568,7 @@ async function main() {
 				path.join(outputDir, "m04-adopted-knowledge.json") : undefined;
 			let currentSelectedGoalRunId = runId!;
 			let currentSelectedTaskId = selectedTask.taskId;
+			let selectedRegisteredPlan = initialRegistered;
 			let latestAttemptEvidence: Array<{ name: string; file: string }> = [];
 			const loop = await runOriginalObjectiveLoop({ maxIterations: MAX_PROVIDER_CALLS,
 				admission: () => {
@@ -1075,7 +1580,8 @@ async function main() {
 						!currentM04Read || !existsSync(candidate) || !existsSync(verificationPath)) return "bounded-run-incomplete";
 					return "admitted";
 				},
-				step: async iteration => {
+				step: async localIteration => {
+				const iteration = priorAssessmentCount + localIteration;
 				let advancedThisIteration = false;
 				let assessmentThisIteration = false;
 				let activeFollowOnGoalId: string | undefined;
@@ -1088,32 +1594,16 @@ async function main() {
 						{ label: "Selected bounded candidate", path: candidate },
 						{ label: "Selected bounded verification", path: verificationPath },
 					]);
-					const saveObjectiveReceipt = async () => {
-						await ws.writeRun(objectiveRecord);
-						const receipt = {
-							version: 1, kind: "m07-original-objective-assessment", runId: objectiveRecord.runId,
-							status: objectiveRecord.status, sessions: objectiveRecord.sessions.map(item => ({
-								sessionId: item.id, role: item.role, model: item.model,
-								boundaryMode: item.boundary?.mode ?? "unknown", boundaryIntent: item.boundary?.intent ?? "unknown",
-								toolGrantKind: item.boundary?.toolGrantKind ?? "unknown",
-								evidenceLabels: item.boundary?.evidence.map(entry => entry.label) ?? [],
-							})),
-						};
-						await writeFile(path.join(outputDir, "objective-assessment-receipt.json"),
-							JSON.stringify(receipt, null, 2), { mode: 0o600 });
-						const receiptIndex = objectiveReceipts.findIndex(item => item.runId === objectiveRecord.runId);
-						if (receiptIndex >= 0) objectiveReceipts[receiptIndex] = receipt;
-						else objectiveReceipts.push(receipt);
-						await writeFile(path.join(outputDir, "objective-assessment-receipts.json"),
-							JSON.stringify({ version: 1, kind: "m07-original-objective-assessment-receipts",
-								receipts: objectiveReceipts }, null, 2), { mode: 0o600 });
-					};
+					const saveObjectiveReceipt = () => persistObjectiveReceipt(objectiveRecord);
 					const evidence = [
+						{ name: "host-capabilities.json", file: capabilityFile },
 						{ name: "original-problem.txt", file: ws.problemFile },
 						...found.files.map((name, index) => ({ name: `original-input-${index + 1}.txt`,
 							file: path.join(ws.rawDir, name) })),
 						{ name: "candidate.cpp", file: candidate },
 						{ name: "verification.json", file: verificationPath },
+						...(selectedRegisteredPlan && existsSync(path.join(path.dirname(candidate), "experiment-plan.json")) ?
+							[{ name: "experiment-plan.json", file: path.join(path.dirname(candidate), "experiment-plan.json") }] : []),
 						{ name: "workflow-archive.json", file: path.join(outputDir, "workflow-archive.json") },
 						...(currentKnowledgeFile ? [{ name: "m04-knowledge.json", file: currentKnowledgeFile }] : []),
 						...latestAttemptEvidence,
@@ -1127,25 +1617,33 @@ async function main() {
 							systemPrompt: "Independently assess the original research goal using the frozen evidence. Read the complete supplied files before proposing further work. Return only the requested structured judgment; acknowledge uncertainty, bounded search scope and failed checks. Do not invent measurements or treat M04 adoption as proof of performance.",
 							persistDir: ws.sessionsDir },
 						evidenceRoot: path.join(campaignRoot, `objective-evidence-${iteration}`), evidence,
+						evidenceRequirements: privateEvidenceRequirements,
 						assessmentAdmission,
 						advanceAdmission: () => budget.snapshot().stopped ?
 							campaignObjectiveStop(budget.snapshot().stopReason) ?? "assessment-failed" :
 							abort.signal.aborted || Date.now() + 90_000 >= campaignStopAt ? "time-boundary" : "admitted",
-						supportedTaskScopes: ["two-target-existing"],
+						supportedTaskScopes: ["two-target-existing", "registered-csr-experiment"],
+						userOverrides, capabilities: objectiveCapabilities,
 						recordAssessment: async assessment => {
 							objectiveAssessment = assessment;
 							assessmentThisIteration = true;
-							assessmentHistory.push({ iteration, assessment, stopReason: "assessment-validation-pending", advanced: false });
+							if (assessmentHistory.at(-1)?.iteration === iteration)
+								assessmentHistory[assessmentHistory.length - 1] = { iteration, assessment,
+									stopReason: "assessment-validation-pending", advanced: false };
+							else assessmentHistory.push({ iteration, assessment, stopReason: "assessment-validation-pending", advanced: false });
 							await writeObjectiveProgress(objectiveCheckpointFile, objectiveProgress(originalObjective,
-								{ boundedRuns: [{ runId: runId!, outcome: finished.outcome ?? "unknown",
+								{ boundedRuns: [...previousCheckpoint.boundedRuns, { runId: runId!, outcome: finished.outcome ?? "unknown",
 									...(firstGoalReady ? { selectedTaskId: selectedTask.taskId } : {}) }],
 									selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
 									assessment, assessmentHistory, stopReason: "assessment-validation-pending" }));
 						},
 						advance: async proposal => {
 							statusPhase = "model-proposed-m07-dispatch";
+							const registered = proposal.adapterScope === "registered-csr-experiment";
+							const taskChecks = registered ? REGISTERED_CHECKS : CHECKS;
 						const prior = JSON.parse(await readFile(verificationPath, "utf8")) as Record<string, unknown>;
-							followOnPriorVerification = prior;
+							followOnPriorCandidate = candidate;
+							followOnPriorPlanFile = selectedRegisteredPlan ? path.join(path.dirname(candidate), "experiment-plan.json") : undefined;
 							const seedDir = path.join(ws.root, "objective-seeds");
 							await mkdir(seedDir, { recursive: true, mode: 0o700 });
 							const seedPath = path.join(seedDir, `prior-candidate-seed-${iteration}.json`);
@@ -1158,8 +1656,10 @@ async function main() {
 								problemRelation: `Model-proposed work addressing unresolved original obligations ${proposal.addresses.join(", ")}; original goal: ${originalObjective.goal}`,
 								constraints: ["Prior candidate and measurements are development evidence, not adopted truth.",
 									"Use only M04-adopted pinned experience refs that pass current applicability and live-limit checks.",
-									"Keep this adapter's two-target scope and preserve non-target code and built-in checker; no prose report or personal reflection."],
-								successCriteria: CHECKS,
+									registered ? "Use the independently validated source capability and model-authored registered experiment plan; keep original generators/references/checker immutable." :
+										"Keep this adapter's two-target scope and preserve non-target code and built-in checker.",
+									"Deliver source and machine-readable evidence only; no prose report, screenshots, presentation or personal reflection."],
+								successCriteria: taskChecks,
 								plan: `Investigate the model-proposed next work against the original unresolved obligations: ${proposal.addresses.join(", ")}. Inspect prior candidate and measurements, then run one fresh bounded builder/reviewer loop.`,
 								exploratory: false,
 							});
@@ -1170,16 +1670,23 @@ async function main() {
 								applicability: { stage: "M07", tags }, requestedRefs: proposedRefs,
 								expectedSnapshotId: secondGoal.knowledgeSnapshot, maxRecords: 24, maxChars: 24_000 });
 							const pinnedRefs = selection.status === "ready" ? proposedRefs : [];
-						const seedInputs = [path.relative(ws.root, candidate), path.relative(ws.root, seedPath)];
+						const seedInputs = [path.relative(ws.root, candidate), path.relative(ws.root, seedPath),
+								"objective-seeds/host-capabilities.json",
+								...(selectedRegisteredPlan ? [path.relative(ws.root, path.join(path.dirname(candidate), "experiment-plan.json"))] : [])];
+							registeredScopeActive = registered;
 							const secondTask = await controller.delegate(secondGoal.runId, { mode: "execute",
-								objective: `${proposal.objective}\n\nInspect the supplied prior candidate and prior-candidate-seed.json as untrusted development evidence. Address original obligations ${proposal.addresses.join(", ")}. Produce a complete candidate.cpp under the adapter's fixed source scope, write a pending lesson-delta.json or action none, and report negative or mixed measured results honestly. Use only confined read/write/edit; the host writes verification.json; no shell, network or prose deliverables.`,
+								objective: `${proposal.objective}\n\nInspect the supplied prior candidate and prior-candidate-seed.json as untrusted development evidence. Address original obligations ${proposal.addresses.join(", ")}. Produce a complete candidate.cpp and pending lesson-delta.json. ${registered ?
+									experimentInstructions :
+									"Keep this adapter's two-target original-source scope."} Report negative or mixed measured results honestly. Use only confined read/write/edit; the host writes verification.json; no shell, network or prose deliverables.`,
 								inputs: [...found.files.map(x => `problem/raw/${x}`), ...seedInputs],
-								expectedOutputs: ["candidate.cpp", "lesson-delta.json"], lessonDeltaOutput: "lesson-delta.json", checks: CHECKS,
+								expectedOutputs: registered ? ["candidate.cpp", "experiment-plan.json", "lesson-delta.json"] :
+									["candidate.cpp", "lesson-delta.json"], lessonDeltaOutput: "lesson-delta.json", checks: taskChecks,
 								...(pinnedRefs.length ? { experienceRefs: pinnedRefs, experienceTags: tags } : {}),
 								executionLoop: { maxRounds: 2, deadlineAt: new Date(Math.min(Date.now() + BUILDER_PHASE_MS, campaignStopAt - 45_000)).toISOString() },
 							});
+							registeredScopeActive = false;
 							activeFollowOnTaskId = secondTask.taskId;
-							return { secondGoal, secondTask, proposedRefs, selection, pinnedRefs };
+							return { secondGoal, secondTask, proposedRefs, selection, pinnedRefs, taskChecks, registered };
 						},
 					});
 						objectiveRecord.outputs.push({ label: "Original objective checkpoint", path: objectiveCheckpointFile });
@@ -1202,7 +1709,7 @@ async function main() {
 					}
 					if (objectiveStep.advanced) {
 						statusPhase = "post-m04-followon";
-						const { secondGoal, secondTask, proposedRefs, selection, pinnedRefs } = objectiveStep.advanced;
+						const { secondGoal, secondTask, proposedRefs, selection, pinnedRefs, taskChecks, registered } = objectiveStep.advanced;
 					const nextCandidate = path.join(secondTask.workDir, "candidate.cpp");
 					const nextVerification = path.join(secondTask.workDir, "verification.json");
 					let nextResult: Record<string, unknown> | undefined;
@@ -1211,17 +1718,19 @@ async function main() {
 					const secondReady = secondTask.status === "returned" && secondTask.loopStopReason === "ready" && nextResult?.status === "passed";
 					if (secondTask.status === "returned" && secondTask.reportPath) {
 						const reviewed = await controller.review(secondGoal.runId, { taskId: secondTask.taskId,
-							checks: CHECKS.map((criterion, index) => ({ criterion, result: secondReady ? "passed" : "failed",
+							checks: taskChecks.map((criterion, index) => ({ criterion, result: secondReady ? "passed" : "failed",
 								evidence: secondReady ? [index === 0 ? nextCandidate : nextVerification] : [] })),
 							artifacts: [secondTask.reportPath, ...(existsSync(nextCandidate) ? [nextCandidate] : []),
-								...(existsSync(nextVerification) ? [nextVerification] : [])],
+								...(existsSync(nextVerification) ? [nextVerification] : []),
+								...(registered && existsSync(path.join(secondTask.workDir, "experiment-plan.json")) ?
+									[path.join(secondTask.workDir, "experiment-plan.json")] : [])],
 							failures: secondReady ? [] : ["follow-on candidate did not pass all bounded checks"] });
 						if (secondReady && reviewed.status !== "accepted") fail("follow-on M07 review did not accept candidate");
 					}
 					const secondFinished = await controller.finish(secondGoal.runId, { outcome: secondReady ? "fulfilled" : "partial",
 						returnPath: "user", summary: secondReady ? "Fresh bounded follow-on checked prior context and produced verified candidate." :
 							"Fresh bounded follow-on did not complete all checks.",
-						goalChecks: CHECKS.map((criterion, index) => ({ criterion, result: secondReady ? "passed" : "not_run",
+						goalChecks: taskChecks.map((criterion, index) => ({ criterion, result: secondReady ? "passed" : "not_run",
 							evidence: secondReady ? [index === 0 ? nextCandidate : nextVerification] : [] })),
 						limitations: ["Prior archive/context and loaded experience do not by themselves establish faithful use or scientific benefit."] });
 					const nextFrozenGoal = await controller.status(secondGoal.runId);
@@ -1232,7 +1741,8 @@ async function main() {
 						let nextM04: typeof m04 = { status: "not_run" };
 						if (secondReady && nextFrozenTask.review && !budget.snapshot().stopped && !abort.signal.aborted) {
 							statusPhase = "model-proposed-m04-dispatch";
-							const requiredPaths = selectedM07ReviewReadPaths(ws.runDir("M07", secondGoal.runId), nextFrozenTask);
+							const requiredPaths = selectedM07ReviewReadPaths(ws.runDir("M07", secondGoal.runId), nextFrozenTask,
+								registered ? ["experiment-plan.json"] : []);
 							const m04Abort = new AbortController();
 							const m04Timer = setTimeout(() => m04Abort.abort(), M04_PHASE_MS);
 							try {
@@ -1242,7 +1752,8 @@ async function main() {
 									{ feedback: { kind: "M07", runId: secondGoal.runId }, freshSession: true,
 										requiredM07ReadPaths: requiredPaths,
 										purpose: "Adjudicate the latest model-proposed bounded M07 result" });
-								const coverage = await m04EvidenceReturned(processed.record, secondTask.taskId);
+								const coverage = await m04EvidenceReturned(processed.record, secondTask.taskId,
+									registered ? ["experiment-plan.json"] : []);
 								const complete = processed.record.status === "completed" && processed.record.failures.length === 0 &&
 									coverage.complete && requiredPaths.every(item => coverage.paths.includes(item));
 								nextM04 = { status: complete ? "completed" : "failed", runId: processed.record.runId,
@@ -1259,14 +1770,16 @@ async function main() {
 								proposalSubmitted: nextM04.proposalSubmitted ?? false,
 								snapshotCreated: nextM04.snapshotCreated ?? false,
 								adoptedExperienceRefs: nextM04.adoptedExperienceRefs ?? [] }, store);
-						const iterationPrefix = `iteration-${iteration}`;
+						const iterationPrefix = `iteration-${localIteration}`;
 						await exportPrefixedArchive(nextArchiveDir, outputDir, iterationPrefix);
 						latestAttemptEvidence = [{ name: "latest-attempt-archive.json",
 							file: path.join(outputDir, `workflow-${iterationPrefix}-archive.json`) },
 							...(existsSync(path.join(outputDir, `${iterationPrefix}-candidate.cpp`)) ?
 								[{ name: "latest-attempt.cpp", file: path.join(outputDir, `${iterationPrefix}-candidate.cpp`) }] : []),
 							...(existsSync(path.join(outputDir, `${iterationPrefix}-verification.json`)) ?
-								[{ name: "latest-attempt-verification.json", file: path.join(outputDir, `${iterationPrefix}-verification.json`) }] : [])];
+								[{ name: "latest-attempt-verification.json", file: path.join(outputDir, `${iterationPrefix}-verification.json`) }] : []),
+							...(registered && existsSync(path.join(outputDir, `${iterationPrefix}-experiment-plan.json`)) ?
+								[{ name: "latest-attempt-plan.json", file: path.join(outputDir, `${iterationPrefix}-experiment-plan.json`) }] : [])];
 						const sourceChanged = !existsSync(candidate) || !existsSync(nextCandidate) ||
 							!(await readFile(candidate)).equals(await readFile(nextCandidate));
 						const chooseFollowOn = chooseFollowOnCandidate(selectedCandidateSource !== "none",
@@ -1286,6 +1799,7 @@ async function main() {
 							verificationPath = nextVerification;
 							currentSelectedGoalRunId = secondGoal.runId;
 							currentSelectedTaskId = secondTask.taskId;
+							selectedRegisteredPlan = registered;
 							promoted = true;
 						}
 						followOnSourceChanged = sourceChanged;
@@ -1331,8 +1845,8 @@ async function main() {
 								activeFollowOnTaskId = failedTask.taskId;
 								const failedDir = path.join(campaignRoot, `iteration-${iteration}-archive`);
 								await archivePrivateM07Task({ goal: failedGoal, task: failedTask, destination: failedDir });
-								await exportPrefixedArchive(failedDir, outputDir, `iteration-${iteration}`);
-								failedAttemptArchive = `workflow-iteration-${iteration}-archive.json`;
+								await exportPrefixedArchive(failedDir, outputDir, `iteration-${localIteration}`);
+								failedAttemptArchive = `workflow-iteration-${localIteration}-archive.json`;
 							}
 						} catch { statusArchiveFailure = "model-proposed-attempt-archive-failed"; }
 					}
@@ -1348,12 +1862,42 @@ async function main() {
 			});
 			objectiveStopReason = loop.stopReason;
 			statusPhase = "workflow-finished";
-			const finalCandidateVerified = selectedCandidateSource !== "none" &&
+			let historicalSelection: Record<string, unknown> = { priorRetained: false, comparison: { state: "unavailable" } };
+			if (selectedCandidateSource !== "none") {
+				const finalVerification = JSON.parse(await readFile(verificationPath, "utf8")) as Record<string, unknown>;
+				const prior = await remeasurePrior(path.join(priorSeedDir, "prior-candidate.cpp"),
+					previousBundle["experiment-plan.json"] ? path.join(priorSeedDir, "prior-experiment-plan.json") : undefined,
+					selectedRegisteredPlan, path.join(path.dirname(candidate), "experiment-plan.json"));
+				await writeFile(path.join(outputDir, "restored-candidate-verification.json"), JSON.stringify(prior), { mode: 0o600 });
+				const comparison = compareCandidateTimings(prior, finalVerification);
+				const changed = !(await readFile(candidate)).equals(await readFile(path.join(priorSeedDir, "prior-candidate.cpp")));
+				historicalSelection = { priorRetained: !chooseFollowOnCandidate(true, finalVerification.status === "passed", changed, comparison),
+					comparison, historicalTimingUsed: false, priorRevalidated: prior.status === "passed" };
+				if (historicalSelection.priorRetained) {
+					await exportPrefixedArchive(outputDir, outputDir, "followon");
+					const history = previousBundle["research-history.json"] ? JSON.parse(previousBundle["research-history.json"]) :
+						{ version: 1, kind: "untrusted-version-bound-research-history", entries: [] };
+					const unselectedFiles: Record<string, string> = {};
+					for (const name of ["candidate.cpp", "verification.json", "workflow-archive.json", "experiment-plan.json", "m04-adopted-knowledge.json"])
+						if (existsSync(path.join(outputDir, name))) unselectedFiles[name] = await readFile(path.join(outputDir, name), "utf8");
+					history.entries.push({ originalContractId: originalObjective.id, goalRunId: finalArchive.goalRunId, taskId: finalArchive.taskId,
+						interpretation: "Unselected current experiment; no confirmed replacement gain against the historical candidate", files: unselectedFiles });
+					await writeFile(path.join(outputDir, "research-history.json"), JSON.stringify(history), { mode: 0o600 });
+					for (const name of [...ARCHIVE_EVIDENCE_FILES, "workflow-archive.json", "m04-adopted-knowledge.json"]) {
+						await rm(path.join(outputDir, name), { force: true });
+						if (previousBundle[name as keyof PrivateContinuationBundle] !== undefined)
+							await writeFile(path.join(outputDir, name), previousBundle[name as keyof PrivateContinuationBundle]!, { mode: 0o600 });
+					}
+					finalArchive = JSON.parse(previousBundle["workflow-archive.json"]!) as typeof finalArchive;
+				}
+			}
+			const finalCandidateAvailable = selectedCandidateSource !== "none" &&
 				finalArchive.controllerEvidence.reviewStatus === "accepted" &&
-				Boolean(finalArchive.controllerEvidence.reviewDecision?.file && existsSync(path.join(outputDir, "review-decision.json"))) &&
+				(historicalSelection.priorRetained === true || Boolean(finalArchive.controllerEvidence.reviewDecision?.file && existsSync(path.join(outputDir, "review-decision.json")))) &&
 				["candidate.cpp", "verification.json"].every(name =>
 					finalArchive.files.some(item => item.name === name && item.status === "present") &&
 					existsSync(path.join(outputDir, name)));
+			const finalCandidateVerified = finalCandidateAvailable && (historicalSelection.priorRetained !== true || historicalSelection.priorRevalidated === true);
 			const durableKnowledge = knowledgeExport.state !== "incomplete" &&
 				(!m04.adoptedExperienceRefs?.length || knowledgeExport.state === "complete");
 			const followOnCompleted = followOn.state === "completed" && followOn.m07Outcome === "fulfilled";
@@ -1364,13 +1908,13 @@ async function main() {
 			if (boundedRunOutcome === "partial" && objectiveStopReason === "bounded-run-incomplete" &&
 				budget.snapshot().stopReason === "total-cny-ceiling")
 				objectiveStopReason = "budget-boundary";
-			const boundedRuns = [{ runId: runId!, outcome: finished.outcome ?? "unknown",
+			const boundedRuns = [...previousCheckpoint.boundedRuns, { runId: runId!, outcome: finished.outcome ?? "unknown",
 				...(firstGoalReady ? { selectedTaskId: selectedTask.taskId } : {}) },
 				...followOnAttempts.filter(item => typeof item.goalRunId === "string").map(item => ({
 					runId: String(item.goalRunId), outcome: String(item.m07Outcome ?? "unknown"),
 					...(item.candidateSelected === true ? { selectedTaskId: String(item.taskId) } : {}) }))];
 			const objectiveCheckpoint = objectiveProgress(originalObjective, { boundedRuns,
-				selectedArtifacts: finalCandidateVerified ? ["candidate.cpp", "verification.json", "workflow-archive.json"] : [],
+				selectedArtifacts: finalCandidateAvailable ? ["candidate.cpp", "verification.json", "workflow-archive.json"] : previousCheckpoint.selectedArtifacts,
 				...(objectiveAssessment ? { assessment: objectiveAssessment } : {}), assessmentHistory,
 				nextTaskDispatched: latestAssessmentAdvanced, stopReason: objectiveStopReason });
 			await writeObjectiveProgress(objectiveCheckpointFile, objectiveCheckpoint);
@@ -1391,7 +1935,7 @@ async function main() {
 					m04AdoptedExperienceCount, m04AdoptionReadContractSatisfied,
 					m04SelectedReadContractSatisfied },
 				branch: branchState, branchExerciseComplete, firstGoalReady,
-				followOn, followOnAttempts, objectiveLoop: loop, selectedCandidateSource, finalCandidateVerified,
+				followOn, followOnAttempts, objectiveLoop: loop, selectedCandidateSource, finalCandidateVerified, historicalSelection,
 				...(statusArchiveFailure ? { archiveFailure: statusArchiveFailure } : {}),
 				independentValidation: finalCandidateVerified ? "bounded-workflow-checker-passed" : "not-complete",
 				validationLimit: "Finite bounded cases are not exhaustive correctness or global-optimality proof" });
@@ -1419,19 +1963,30 @@ async function main() {
 			budget.snapshot().stopReason, campaignTimedOut ||
 				(campaignDeadlineAt !== undefined && Date.now() >= campaignDeadlineAt)); }
 		catch { statusArchiveFailure = "objective-checkpoint-salvage-failed"; process.exitCode = 1; }
+
+		await rm(campaignRoot, { recursive: true, force: true });
+	}
+	} finally {
 		try {
+			const snapshot = finalBudget?.snapshot();
+			const requestAudit = finalBudget?.requestAuditSnapshot() ?? { requests: [], settledCny: 0, unknownReservedCny: 0, inFlightReservedCny: 0, reservations: 0 };
+			let privateBundle = missionLedger.priorPrivateBundle;
+			try { privateBundle = await collectContinuationBundle(outputDir, missionLedger.priorPrivateBundle); }
+			catch { statusArchiveFailure = "research-continuation-collection-failed-prior-retained"; process.exitCode = 1; }
+			const carry = missionLedger.sealCurrent({ settledCny: requestAudit.settledCny,
+				unknownOrInFlightCny: requestAudit.unknownReservedCny + requestAudit.inFlightReservedCny,
+				requestAudit, ...(privateBundle ? { privateBundle } : {}) });
+			await writeFile(path.join(outputDir, CARRY_FILE_NAME), `${JSON.stringify({ envelopeB64: carry.envelopeB64 })}\n`, { mode: 0o600 });
 			await writeFile(path.join(outputDir, "mission-ledger-out.json"), `${JSON.stringify({
 				version: 1, kind: "mul-pis-private-mission-ledger-observation", missionId: MISSION_ID,
 				repository: MISSION_REPOSITORY, globalMaxCny: MISSION_TOTAL_CNY,
-				priorRevision: missionLedger.revision, priorRunId: missionLedger.previous.runId,
-				priorArtifactId: missionLedger.previous.artifactId,
 				currentRunId: process.env.GITHUB_RUN_ID, currentRunAttempt: process.env.GITHUB_RUN_ATTEMPT,
-				currentCommit: process.env.GITHUB_SHA, budget: budget.snapshot(),
-				carryForwardCny: budget.snapshot().missionCommittedCny,
-				status: "pending-local-artifact-verification-and-new-signature",
+				currentCommit: process.env.GITHUB_SHA, budget: snapshot,
+				carryForwardCny: carry.carryForwardCny,
+				status: "sealed-encrypted-continuation",
 			}, null, 2)}\n`, { mode: 0o600 });
-		} catch { statusArchiveFailure = "mission-ledger-observation-write-failed"; process.exitCode = 1; }
-		await rm(campaignRoot, { recursive: true, force: true });
+		} catch { statusArchiveFailure = "mission-ledger-continuation-write-failed"; process.exitCode = 1; }
+
 	}
 }
 
@@ -1439,7 +1994,8 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	privateFailureMessage, privateExceptionDiagnostic, credentialProbe, parseCheckerOutput, compareCandidateTimings,
 	chooseForkWinner, chooseFollowOnCandidate, firstM07Accepted,
 	forkReceiptMatches, contextLineageSummary, selectedM07ReviewReadPaths, exportPrefixedArchive, preserveCandidate,
-	preserveUnsettledBranchCheckpoint, salvageObjectiveCheckpoint };
+	preserveUnsettledBranchCheckpoint, salvageObjectiveCheckpoint, collectContinuationBundle,
+	registeredSourceShape, parseRegisteredCheckerOutput, validateContinuationSeed, rangeReadableHistory, sandboxArguments };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	main().catch(async error => {

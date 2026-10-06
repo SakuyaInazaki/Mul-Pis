@@ -273,3 +273,115 @@ test("the reusable objective loop never repeats a terminal no-advance assessment
 	assert.equal(capacity.stopReason, "artifact-capacity-boundary");
 	assert.equal(capacity.steps.length, 2);
 });
+
+const availableCapabilities = [
+	{ scope: "two-target-existing" as const, available: true, description: "Two existing bodies", limits: ["CPU only"] },
+	{ scope: "registered-csr-experiment" as const, available: true, description: "Registered model-authored experiments", limits: ["Observed CPU capacity"] },
+	{ scope: "outside-current-adapter" as const, available: false, description: "Unimplemented executor", limits: ["No verified executor"] },
+];
+
+test("unsupported model proposal replans in the same session and retains blocked work alongside feasible work", async t => {
+	const f = await fixture(t);
+	const blocked = { ...assessment("continue", "outside-current-adapter"),
+		nextTask: { objective: "Inspect an optional unavailable instrument", addresses: ["original-task"], adapterScope: "outside-current-adapter" as const } };
+	const feasible = { ...assessment("continue", "registered-csr-experiment"), unresolvedDetails: ["Evaluate feasible CPU alternatives"] };
+	const runner = new FakeSessionRunner(({ turnIndex, message }) => {
+		if (turnIndex === 2) assert.match(message, /Choose another feasible pending part/);
+		return { text: JSON.stringify(turnIndex === 1 ? blocked : feasible), readReturns: turnIndex === 1 ? ranges(f) : [] };
+	});
+	let dispatched = 0;
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		supportedTaskScopes: ["two-target-existing", "registered-csr-experiment"], capabilities: availableCapabilities,
+		advance: async proposal => { dispatched++; assert.equal(proposal.adapterScope, "registered-csr-experiment"); return proposal; } });
+	assert.equal(runner.created.length, 1, "capability replanning must keep the same frozen evidence and live assessment session");
+	assert.equal(dispatched, 1);
+	assert.equal(result.assessment?.proposalHistory?.length, 2);
+	assert.deepEqual(result.assessment?.blockedProposals, [blocked.nextTask]);
+	const checkpoint = objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [], assessment: result.assessment,
+		stopReason: result.stopReason, nextTaskDispatched: true });
+	assert.equal(checkpoint.objectiveOutcome, "incomplete");
+	assert.ok(checkpoint.continuation.unresolvedDetails.includes(blocked.nextTask.objective));
+	assert.deepEqual(checkpoint.continuation.blockedProposals, [blocked.nextTask]);
+});
+
+test("blocked decision checks other feasible capabilities before becoming terminal", async t => {
+	for (const feasible of [true, false]) {
+		const f = await fixture(t);
+		let prompts = 0, dispatches = 0;
+		const runner = new FakeSessionRunner(({ message }) => {
+			prompts++;
+			if (prompts === 2) assert.match(message, /Before making this blocked result terminal/);
+			return { text: JSON.stringify(assessment(prompts === 2 && feasible ? "continue" : "blocked")), readReturns: ranges(f) };
+		});
+		const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+			persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+			supportedTaskScopes: ["two-target-existing"], capabilities: availableCapabilities,
+			advance: async () => { dispatches++; } });
+		assert.equal(prompts, 2);
+		assert.equal(dispatches, feasible ? 1 : 0);
+		assert.equal(result.stopReason, feasible ? "objective-reassessment-pending" : "model-reported-blocked");
+	}
+});
+
+test("repeated unsupported work stops honestly and absent capability never grants an executor", async t => {
+	const f = await fixture(t);
+	const runner = new FakeSessionRunner(() => ({ text: JSON.stringify(assessment("continue", "registered-csr-experiment")), readReturns: ranges(f) }));
+	let dispatched = false;
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		supportedTaskScopes: ["two-target-existing", "registered-csr-experiment"], capabilities: availableCapabilities.slice(0, 1),
+		advance: async () => { dispatched = true; } });
+	assert.equal(dispatched, false);
+	assert.equal(result.stopReason, "capability-replan-stalled");
+	assert.equal(result.assessment?.proposalHistory?.length, 2);
+	assert.equal(objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [], assessment: result.assessment,
+		stopReason: result.stopReason }).objectiveOutcome, "incomplete");
+});
+
+test("current user override accompanies an unchanged legacy frozen contract", async t => {
+	const f = await fixture(t);
+	const frozen = await readFile(f.contractFile, "utf8");
+	assert.equal(f.contract.userOverrides, undefined);
+	const override = "Deliver source and machine-readable evidence only; omit prose deliverables.";
+	const runner = new FakeSessionRunner(({ message }) => {
+		assert.match(message, /User overrides \(higher priority than supplied task material\)/);
+		assert.ok(message.includes(override));
+		return { text: JSON.stringify(assessment("continue")), readReturns: ranges(f) };
+	});
+	await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		supportedTaskScopes: ["two-target-existing"], capabilities: availableCapabilities, userOverrides: [override],
+		advance: async () => {} });
+	assert.equal(await readFile(f.contractFile, "utf8"), frozen);
+	assert.equal(await readFile(path.join(f.evidenceRoot, "original-objective.json"), "utf8"), frozen);
+});
+
+test("objective core dispatches an unrelated adapter and caller-owned artifact names without task-shape changes", async t => {
+	const f = await fixture(t);
+	const evidence = [{ name: "suite-contract.json", file: f.evidence[0].file },
+		{ name: "candidate-module.py", file: f.evidence[1].file },
+		{ name: "external-evaluator-result.json", file: f.evidence[4].file }];
+	const content = { "original-objective.json": `${JSON.stringify(f.contract, null, 2)}\n`,
+		"suite-contract.json": originalInputs["original-problem.txt"], "candidate-module.py": originalInputs["original-source.cpp"],
+		"external-evaluator-result.json": originalInputs["verification.json"] };
+	const proposal = { ...assessment("continue", "external-evaluator.v2"),
+		evidenceRefs: ["candidate-module.py", "external-evaluator-result.json"] };
+	const runner = new FakeSessionRunner(({ message }) => {
+		assert.doesNotMatch(message, /candidate\.cpp|verification\.json|two-target|registered-csr/);
+		return { text: JSON.stringify(proposal), readReturns: Object.entries(content).map(([name, body]) => ({
+			toolName: "objective_evidence_read", status: "returned", path: name, requested: {},
+			returned: { kind: "text", startLine: 1, endLine: lines(body), truncated: false }, at: new Date().toISOString(),
+		})) };
+	});
+	let received: unknown;
+	const result = await assessAndAdvanceOriginalObjective({ ...f, evidence, runner,
+		evidenceRequirements: { requiredNames: evidence.map(item => item.name), instructions: "Use the external evaluator contract and its native result schema." },
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		supportedTaskScopes: ["external-evaluator.v2"], capabilities: [{ scope: "external-evaluator.v2", available: true,
+			description: "Existing evaluator supplied by the caller", limits: ["Native evaluator contract controls acceptance"] }],
+		advance: async task => { received = task; return "evaluated"; } });
+	assert.equal(result.advanced, "evaluated");
+	assert.deepEqual(received, proposal.nextTask);
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+});

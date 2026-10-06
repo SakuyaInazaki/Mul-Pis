@@ -40,22 +40,23 @@ function fakeGithub(options: { currentNumber?: number; skipped?: "skipped" | "su
 		const address = String(url);
 		calls.push(address);
 		let data: unknown;
-		if (address.endsWith("/workflows/manual-private-campaign.yml/runs?per_page=100")) {
-			data = { workflow_runs: [
+		if (address.endsWith("/workflows/manual-private-campaign.yml/runs?per_page=100&page=1")) {
+			data = { total_count: options.currentNumber === 13 ? 3 : 2, workflow_runs: [
 				{ id: Number(current.runId), run_number: options.currentNumber ?? 12, run_attempt: 1,
 					workflow_id: 71, status: "in_progress", head_branch: "improve/workflow-learning-reliability",
 					event: options.event ?? "workflow_dispatch", head_sha: current.sha,
 					actor: { login: "SakuyaInazaki" }, head_commit: { message: options.message ?? ONE_USE_PUSH_MARKER } },
 				...(options.currentNumber === 13 ? [{ id: 8001003, run_number: 12, run_attempt: 1,
-					workflow_id: 71, status: "completed", head_branch: "improve/workflow-learning-reliability" }] : []),
+					workflow_id: 71, status: "completed", head_sha: "b".repeat(40), head_branch: "improve/workflow-learning-reliability" }] : []),
 				{ id: 8001001, run_number: 11, run_attempt: 1,
-					workflow_id: 71, status: "completed", head_branch: "improve/workflow-learning-reliability" },
+					workflow_id: 71, status: "completed", head_sha: "b".repeat(40), head_branch: "improve/workflow-learning-reliability" },
 			] };
 		} else if (address.endsWith("/runs/8001003/jobs?per_page=100")) {
-			data = { jobs: [{ name: "private-campaign", status: "completed",
-				conclusion: options.skipped ?? "skipped" }] };
+			data = { total_count: 1, jobs: [{ name: "private-campaign", status: "completed",
+				conclusion: options.skipped ?? "skipped", steps: [{ name: "Run bounded private campaign",
+					status: "completed", conclusion: options.skipped ?? "skipped" }] }] };
 		} else if (address.endsWith("/runs/8001001/artifacts?per_page=100")) {
-			data = { artifacts: [{ id: options.artifactId ?? 9002001, name: MISSION_ARTIFACT,
+			data = { total_count: 1, artifacts: [{ id: options.artifactId ?? 9002001, name: MISSION_ARTIFACT,
 				expired: false, workflow_run: { id: 8001001 } }] };
 		} else throw new Error("unexpected mock URL");
 		return new Response(JSON.stringify(data), { status: 200 });
@@ -99,7 +100,7 @@ test("freshness permits only proved skipped intervening jobs", async (t) => {
 		githubToken: "synthetic-token", current, request: paid.request }), /may have executed/);
 	const preCampaignFailure = fakeGithub({ currentNumber: 13 });
 	const noProviderRequest: typeof fetch = async (url, init) => String(url).endsWith("/runs/8001003/jobs?per_page=100") ?
-		new Response(JSON.stringify({ jobs: [{ name: "private-campaign", status: "completed", conclusion: "failure",
+		new Response(JSON.stringify({ total_count: 1, jobs: [{ name: "private-campaign", status: "completed", conclusion: "failure",
 			steps: [{ name: "Run bounded private campaign", status: "completed", conclusion: "skipped" }] }] }),
 			{ status: 200 }) : preCampaignFailure.request(url, init);
 	await verifySignedMissionLedger({ envelopeB64: f.envelope(f.payload), publicKeyFile: f.publicKeyFile,
@@ -108,7 +109,7 @@ test("freshness permits only proved skipped intervening jobs", async (t) => {
 	const wrongArtifact = fakeGithub({ artifactId: 9 });
 	await assert.rejects(verifySignedMissionLedger({ envelopeB64: f.envelope(f.payload),
 		publicKeyFile: f.publicKeyFile, expectedSpkiSha256: f.expectedSpkiSha256,
-		githubToken: "synthetic-token", current, request: wrongArtifact.request }), /encrypted artifact/);
+		githubToken: "synthetic-token", current, request: wrongArtifact.request }), /artifact is unavailable/);
 });
 
 test("one-use push checks the exact API commit marker and SHA; manual needs explicit authorization", async (t) => {
@@ -121,7 +122,7 @@ test("one-use push checks the exact API commit marker and SHA; manual needs expl
 	await assert.rejects(verifySignedMissionLedger({ envelopeB64: f.envelope(f.payload),
 		publicKeyFile: f.publicKeyFile, expectedSpkiSha256: f.expectedSpkiSha256,
 		githubToken: "synthetic-token", current: { ...current, event: "push", manualAuthorized: undefined },
-		request: wrongMessage.request }), /previous completed workflow run/);
+		request: wrongMessage.request }), /seed freshness is invalid/);
 	const manual = fakeGithub();
 	await assert.rejects(verifySignedMissionLedger({ envelopeB64: f.envelope(f.payload),
 		publicKeyFile: f.publicKeyFile, expectedSpkiSha256: f.expectedSpkiSha256,

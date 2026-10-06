@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { offlineChecks } from "../scripts/manual-private-campaign.ts";
+import { ONE_USE_PUSH_MARKER } from "../src/runner/signed-mission-ledger.ts";
 
 test("shared-total campaign requires explicit manual admission and signed cumulative ledger", async () => {
  const workflow = await readFile(new URL("../.github/workflows/manual-private-campaign.yml", import.meta.url), "utf8");
@@ -18,7 +19,7 @@ test("shared-total campaign requires explicit manual admission and signed cumula
  assert.ok(workflow.includes("MULPIS_MISSION_LEDGER_B64: ${{ secrets.MULPIS_MISSION_LEDGER_B64 }}"));
  assert.doesNotMatch(workflow, /inputs\.mission_ledger_b64/);
  assert.ok(workflow.includes("MULPIS_MANUAL_AUTHORIZED: ${{ inputs.authorize_bounded_run }}"));
- assert.ok(gate.includes("mul-pis-20261005-mission-run1"));
+ assert.ok(gate.includes(ONE_USE_PUSH_MARKER));
  assert.ok(workflow.includes("GITHUB_TOKEN: ${{ github.token }}"));
  assert.ok(workflow.includes("  actions: read"));
  assert.doesNotMatch(workflow, /up to [0-9.]+ CNY/);
@@ -340,4 +341,59 @@ test("selected M07 read requirement derives exact frozen review artifacts withou
 			...artifacts.slice(1)] } }), /outside the expected frozen task snapshot/);
 	assert.throws(() => offlineChecks.selectedM07ReviewReadPaths(root, { ...task,
 		review: { artifacts: artifacts.slice(1) } }), /missing or ambiguous/);
+});
+
+test("registered protocol accounts for startup, first call, warmups and every model-planned sample", () => {
+	const metadata = { targets: ["synthetic_1", "synthetic_2"], baselines: { serial: "reference_one", stdThread: "reference_two" },
+		timing: { cases: [{ id: "shape-a", rows: 4, cols: 8, normalNnz: 2, longRows: 1, longNnz: 5, seed: 7,
+			threadCounts: [1], warmups: 1, repeats: 3 }] } } as unknown as Parameters<typeof offlineChecks.parseRegisteredCheckerOutput>[1];
+	const line = (kind: string, target: number, name: string) => `CSR_TIMING case=shape-a kind=${kind} target=${target} name=${name} rows=4 cols=8 ordinary_nnz=2 heavy_rows=1 heavy_nnz=5 seed=7 threads=1 warmups=1 repeats=3 min_ns=3 median_ns=5 max_ns=7 startup_ns=11 cold_ns=9 warmup_samples_ns=8 samples_ns=3,5,7`;
+	const output = [line("serial", 0, "reference_one"), line("std_thread", 0, "reference_two"),
+		line("strategy", 1, "synthetic_1"), line("strategy", 2, "synthetic_2"), "CSR_CHECK_PASS"].join("\n");
+	const result = offlineChecks.parseRegisteredCheckerOutput(output, metadata);
+	assert.equal(result.status, "passed");
+	assert.equal(result.timings.length, 4);
+	assert.equal(result.timings[0].startupNs, 11);
+	assert.equal(result.timings[0].coldNs, 9);
+	assert.deepEqual(result.timings[0].warmupSamplesNs, [8]);
+	for (const altered of [output.replace("startup_ns=11", "startup_ns=0"),
+		output.replace("warmup_samples_ns=8", "warmup_samples_ns=8,8"), output.replace("median_ns=5", "median_ns=6"),
+		output.replace("threads=1", "threads=2"), output.replace("strategy:2", "strategy:1") + "\nextra"]) {
+		assert.equal(offlineChecks.parseRegisteredCheckerOutput(altered, metadata).status, "failed");
+	}
+});
+
+test("registered comparison uses fresh compatible case metrics and cannot hide cold-call regression", () => {
+	const row = (target: number, medianNs: number, coldNs: number) => ({ kind: "strategy", target,
+		caseId: "shape-a", rows: 4, cols: 8, ordinaryNnz: 2, heavyRows: 1, heavyNnz: 5, seed: 7, threads: 1,
+		warmups: 1, repeats: 3, medianNs, coldNs });
+	const evidence = (rows: object[], metric = "isolated-worker-roundtrip") => ({ registeredExperiment: { status: "passed", metric, timings: rows, freshProcessPerSelection: true,
+		compileFlags: ["-O2"], accounting: "first-call-and-warmups-separate-from-steady-state", measurementAuthority: "parent-clock-and-raw-output-comparison",
+		baselineIsolation: "independently-compiled-immutable-original", runtimeFiles: "read-only-evaluator-with-separate-writable-scratch" } });
+	const prior = evidence([row(1, 100, 200), row(2, 120, 240)]);
+	const broader = evidence([row(1, 90, 190), row(2, 110, 220), row(3, 50, 100)]);
+	const compared = offlineChecks.compareCandidateTimings(prior, broader);
+	assert.equal(compared.state, "measured");
+	assert.deepEqual(compared.ratios, [2, 2]);
+	assert.match(compared.scope!, /exact-case-with-cold-cost/);
+	assert.equal(offlineChecks.compareCandidateTimings(prior, evidence([row(1, 50, 100)], "kernel-only")).state, "unavailable");
+	assert.equal(offlineChecks.compareCandidateTimings(prior, evidence([{ ...row(1, 50, 100), seed: 9 }])).state, "unavailable");
+	const differentFlags = evidence([row(1, 50, 100)]);
+	differentFlags.registeredExperiment.compileFlags = ["-O0"];
+	assert.equal(offlineChecks.compareCandidateTimings(prior, differentFlags).state, "unavailable");
+	const regression = offlineChecks.compareCandidateTimings(prior, evidence([row(1, 50, 500)]));
+	assert.equal(offlineChecks.chooseFollowOnCandidate(true, true, true, regression), false);
+});
+
+test("measurement mounts evaluator and immutable reference workers read-only while preserving separate temporary scratch", () => {
+	const work = "/tmp/synthetic-evaluator-work";
+	const execute = offlineChecks.sandboxArguments("/work/registered-checker", ["--check"], work, true);
+	const compile = offlineChecks.sandboxArguments("/usr/bin/g++", ["source.cpp", "-o", "worker"], work, false);
+	const mount = execute.indexOf(work);
+	assert.equal(execute[mount - 1], "--ro-bind");
+	assert.equal(execute[mount + 1], "/work");
+	assert.equal(compile[compile.indexOf(work) - 1], "--bind");
+	assert.ok(execute.includes("--tmpfs") && execute[execute.indexOf("--tmpfs") + 1] === "/tmp");
+	assert.ok(execute.includes("--unshare-net") && execute.includes("--clearenv"));
+	assert.deepEqual(execute.slice(-3), ["--", "/work/registered-checker", "--check"]);
 });

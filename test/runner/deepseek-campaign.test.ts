@@ -999,3 +999,36 @@ test("real Pi tool request uses the synthetic runtime key at the fixed DeepSeek 
 		await rm(dir, { recursive: true, force: true });
 	}
 });
+
+test("retained per-request audit is immutable and leaves no negative in-flight epsilon", () => {
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 30, maxProviderCalls: 6, maxProviderCallsPerPrompt: 6 });
+	const lease = budget.beginPrompt("private-session", "private-prompt");
+	for (const [index, bytes] of [101, 333, 777, 151, 272, 991].entries()) budget.reserve(lease, bytes, `audit-${index}`);
+	for (const index of [3, 1, 5, 0, 4, 2]) budget.settleReported(lease, `audit-${index}`, reported(`receipt-${index}`));
+	assert.equal(budget.snapshot().inFlightReservedCny, 0);
+	const evidence = budget.requestAuditSnapshot();
+	assert.equal(evidence.inFlightReservedCny, 0);
+	assert.equal(evidence.requests.length, 6);
+	assert.equal(evidence.settledCny, evidence.requests.reduce((sum, row) => sum + row.settledCny!, 0));
+	assert.doesNotMatch(JSON.stringify(evidence), /private-session|private-prompt/);
+	evidence.requests[0].reportedUsage!.input = 999;
+	evidence.requests[0].settledCny = 99;
+	assert.notEqual(budget.requestAuditSnapshot().requests[0].reportedUsage!.input, 999);
+	assert.notEqual(budget.requestAuditSnapshot().requests[0].settledCny, 99);
+});
+
+test("conflicting late price reports only increase unknown holds and never erase the larger observation", () => {
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 30 });
+	const lease = budget.beginPrompt("session", "prompt");
+	budget.reserve(lease, 100, "request");
+	budget.settleReported(lease, "request", reported("first"));
+	const higher = { ...reported("conflicting"), usage: { ...reported("conflicting").usage, cost: 3.5 } };
+	assert.throws(() => budget.settleReported(lease, "request", higher), /conflicts/);
+	assert.equal(budget.snapshot().settledCny, 0);
+	assert.equal(budget.snapshot().unknownReservedCny, 35);
+	const highest = { ...higher, usage: { ...higher.usage, cost: 4 } };
+	assert.throws(() => budget.settleReported(lease, "request", highest), /conflicts/);
+	assert.equal(budget.snapshot().unknownReservedCny, 40);
+	budget.failPrompt(lease);
+	assert.equal(budget.requestAuditSnapshot().requests[0].unknownHeldCny, 40);
+});

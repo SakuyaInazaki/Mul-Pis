@@ -345,3 +345,24 @@ test("M04 export passes a live adopted experience with required tags to explicit
 		assert.doesNotMatch(staleReplacement, /Check the observed evidence first/);
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test("private machine feedback retains actionable failed-case diagnostics and explicit measurement semantics", async t => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "machine-feedback-archive-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const workDir = path.join(root, "work"), destination = path.join(root, "out");
+	await mkdir(workDir);
+	const feedback = { version: 1, kind: "execution-result-feedback", status: "failed",
+		measurementMetric: "isolated-worker-roundtrip", observedEnvironment: { availableParallelism: 2 },
+		timingInterpretation: "Includes IPC and kernel work; finite observations only",
+		diagnostics: [{ phase: "compile", message: "Synthetic missing declaration at line 3" },
+			{ phase: "timing", caseId: "case-a", selector: "strategy:2", reason: "time-boundary" }] };
+	await writeFile(path.join(workDir, "verification.json"), JSON.stringify({ version: 1, status: "failed", hostFeedback: feedback,
+		registeredExperiment: { status: "failed", reason: "Synthetic case did not complete", timings: [], plan: { cases: [] } } }));
+	const task = { taskId: "T001", workDir, status: "failed" } as M07TaskRecord;
+	const goal = { runId: "synthetic-feedback", lifecycle: "finished", outcome: "partial", tasks: [task] } as CurrentGoal;
+	await archivePrivateM07Task({ goal, task, destination });
+	const saved = JSON.parse(await readFile(path.join(destination, "verification.json"), "utf8"));
+	assert.deepEqual(saved.hostFeedback, feedback);
+	assert.equal(saved.registeredExperiment.reason, "Synthetic case did not complete");
+	assert.equal(saved.status, "failed");
+});

@@ -134,3 +134,43 @@ test("terminal timeout replaces a stale reassessment checkpoint after a complete
 	assert.equal(checkpoint.objectiveOutcome, "incomplete");
 	assert.deepEqual(checkpoint.boundedRuns.map(item => item.runId), [run.runId]);
 });
+
+test("salvage keeps a finalized model proposal when only branch artifact names are newly visible", async t => {
+	const root = await mkdtemp(path.join(tmpdir(), "m07-finalized-proposal-"));
+	t.after(async () => rm(root, { recursive: true, force: true }));
+	const ws = new Workspace(path.join(root, "workspace"));
+	const run = await ws.startRun("M07", []);
+	await writeFile(path.join(ws.runDir("M07", run.runId), "goal.json"), JSON.stringify({
+		runId: run.runId, lifecycle: "finished", outcome: "fulfilled", tasks: [],
+		executionState: { operations: [] }, branchSelections: [],
+	}));
+	const outputDir = path.join(root, "private-output");
+	await mkdir(outputDir);
+	const contract = createOriginalObjective({ goal: "Continue the original synthetic task", goalSource: "user-intent-summary",
+		inputNames: ["original.txt"], obligations: [{ id: "original", description: "Meet original requirements" }],
+		closure: "open-ended" });
+	await writeOriginalObjectiveContract(path.join(outputDir, "original-objective.json"), contract);
+	await writeFile(path.join(outputDir, "candidate.cpp"), "// synthetic accepted source\n");
+	const nextTask = { objective: "Measure a feasible new synthetic strategy", addresses: ["original"],
+		adapterScope: "outside-current-adapter" as const };
+	const assessment = { version: 1 as const, decision: "continue" as const,
+		rationale: "The bounded pilot did not close the original task", evidenceRefs: ["candidate.cpp"],
+		unresolvedObligations: ["original"], unresolvedDetails: ["Feasible experiments remain"], nextTask,
+		sessionId: "synthetic-assessor", model: "fake/research",
+		evidenceRead: ["original-objective.json", "original-problem.txt", "original-input-1.txt", "candidate.cpp"],
+		unreadEvidence: [] };
+	const prior = objectiveProgress(contract, { boundedRuns: [{ runId: run.runId, outcome: "fulfilled" }],
+		selectedArtifacts: ["candidate.cpp"], assessment,
+		assessmentHistory: [{ iteration: 1, assessment, stopReason: "next-task-needs-capability", advanced: false }],
+		stopReason: "next-task-needs-capability" });
+	await writeObjectiveProgress(path.join(outputDir, "objective-checkpoint.json"), prior);
+	await writeFile(path.join(outputDir, "branch-child-candidate.cpp"), "// synthetic alternate source\n");
+	await offlineChecks.salvageObjectiveCheckpoint(ws, outputDir, undefined, false);
+	const checkpoint = JSON.parse(await readFile(path.join(outputDir, "objective-checkpoint.json"), "utf8")) as typeof prior;
+	assert.equal(checkpoint.objectiveOutcome, "incomplete");
+	assert.equal(checkpoint.stopReason, "next-task-needs-capability");
+	assert.deepEqual(checkpoint.assessmentHistory, prior.assessmentHistory);
+	assert.deepEqual(checkpoint.continuation.nextTask, nextTask);
+	assert.deepEqual(checkpoint.selectedArtifacts, ["candidate.cpp"]);
+	assert.ok(checkpoint.availableArtifacts.includes("branch-child-candidate.cpp"));
+});
