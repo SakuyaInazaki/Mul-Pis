@@ -35,6 +35,13 @@ const INHERITED_ONLY_POLICY = Object.freeze({ version: 1,
 	effectClass: "confined-ephemeral-local", actorThirdPartyMutations: "none",
 	hostTransport: "immutable-versioned-archive" });
 
+const LENGTH_SETTLED_POLICY = Object.freeze({ version: 1,
+	policyId: "mul-pis-confined-private-campaign-length-settled-v4",
+	sourceCommit: "fafd5051e18f4f10a5897cf507c49d92641384d3",
+	reviewedBoundary: "The immutable source retained factory-attested confined file tools, disabled Pi built-in shell/network tools, sandboxed read-only checker execution and encrypted Actions transport. Its latest actor response ended at a received, settled provider length limit; that answer and task are incomplete. Earlier unknown operations and billing holds remain quarantined without scientific acceptance.",
+	effectClass: "confined-ephemeral-local", actorThirdPartyMutations: "none",
+	hostTransport: "immutable-versioned-archive" });
+
 /** Public source-review fingerprint used to verify a sealed earlier quarantine. */
 export const PRIOR_REVIEWED_POLICY_SHA256 = sha256(JSON.stringify(PRIOR_POLICY));
 
@@ -211,12 +218,91 @@ function reviewInheritedOnly(input: PrivateCampaignEffectReviewInput,
 		actorThirdPartyMutations: "none", hostTransport: "immutable-versioned-archive" };
 }
 
+function reviewLengthSettled(input: PrivateCampaignEffectReviewInput,
+	checkpoint: { contract?: { id?: string }; boundedRuns?: Array<{ runId?: string; outcome?: string;
+		unresolvedOperationIds?: string[] }> }, reservations: PriorReservation[], bindings: PriorBinding[]): ReviewedRestartEffectPolicy {
+	const { facts, operationRefs } = input;
+	if (reservations.length !== 3 || bindings.length !== 3)
+		reject("length-settled policy requires exactly three sealed quarantine/binding links");
+	const third = reservations[2], receipt = third?.receipt, claim = third?.claim, binding = bindings[2];
+	if (receipt?.version !== 1 || receipt.kind !== "host-independent-goal-quarantine" ||
+		receipt.prior?.source?.commit !== INHERITED_ONLY_POLICY.sourceCommit ||
+		!Number.isSafeInteger(receipt.prior.committedNano) ||
+		!Number.isSafeInteger(receipt.prior.unknownHeldNano) ||
+		receipt.prior.unknownHeldNano < 1 ||
+		receipt.quarantine?.operationOutcome !== "unknown" ||
+		receipt.quarantine.selectedFromFailedAttempt !== false ||
+		!sameSet(receipt.quarantine.operationRefs ?? [], operationRefs) ||
+		!input.bindsAncestor(input.proof, receipt.prior.source, receipt.prior.envelopeSha256))
+		reject("third quarantine does not bind the authenticated inherited-only source");
+	const prefixFacts = { ...facts, source: { ...receipt.prior.source },
+		committedNano: receipt.prior.committedNano, unknownHeldNano: receipt.prior.unknownHeldNano };
+	const prefix = reviewInheritedOnly({ ...input, facts: prefixFacts }, checkpoint,
+		reservations.slice(0, 2), bindings.slice(0, 2));
+	if (receipt.prior.reviewedPolicyId !== prefix.policyId ||
+		receipt.prior.reviewedPolicySha256 !== prefix.policySha256 ||
+		receipt.prior.contractId !== checkpoint.contract?.id ||
+		facts.unknownHeldNano !== receipt.prior.unknownHeldNano ||
+		facts.committedNano < receipt.prior.committedNano ||
+		facts.source.commit !== LENGTH_SETTLED_POLICY.sourceCommit)
+		reject("third quarantine changes inherited effects or historical commitments");
+	const receiptSha = sha256(JSON.stringify(receipt));
+	const bindingSha = sha256(JSON.stringify(binding));
+	if (binding?.version !== 1 || binding.kind !== "host-independent-goal-binding" ||
+		binding.quarantineReceiptSha256 !== receiptSha ||
+		binding.freshWorkspace?.workspaceId !== receipt.freshWorkspace?.workspaceId ||
+		binding.freshWorkspace?.restartNonce !== receipt.freshWorkspace?.restartNonce ||
+		!text(binding.goalRunId) ||
+		!text(claim?.claimId) || !text(claim?.currentJobId) ||
+		claim.priorEnvelopeSha256 !== receipt.prior.envelopeSha256 ||
+		claim.currentRunId !== facts.source.runId ||
+		claim.currentRunAttempt !== facts.source.runAttempt ||
+		claim.currentCommit !== facts.source.commit)
+		reject("third quarantine claim or goal binding is not exact");
+	const latest = checkpoint.boundedRuns?.find(run => run.runId === binding.goalRunId);
+	if (latest?.outcome !== "partial" || (latest.unresolvedOperationIds?.length ?? 0) !== 0 ||
+		operationRefs.some(ref => ref.startsWith(`${binding.goalRunId}/`)))
+		reject("latest goal introduced an unresolved operation");
+	let history: { version?: number; kind?: string; entries?: Array<{ goalRunId?: string;
+		files?: Record<string, string> }> };
+	try { history = JSON.parse(input.privateBundle["research-history.json"]); }
+	catch { return reject("length-settled source lacks authenticated host archive history"); }
+	const matches = history.entries?.filter(item => item.goalRunId === binding.goalRunId) ?? [];
+	if (history.version !== 1 || history.kind !== "untrusted-version-bound-research-history" ||
+		matches.length !== 1 || typeof matches[0].files?.["workflow-archive.json"] !== "string")
+		reject("length-settled source lacks one bound host archive");
+	let archive: any;
+	try { archive = JSON.parse(matches[0].files!["workflow-archive.json"]); }
+	catch { return reject("length-settled host archive is invalid"); }
+	const outcomes = archive?.controllerEvidence?.operationOutcomes;
+	const terminal = Array.isArray(outcomes) && outcomes.length === 1 ? outcomes[0]?.terminalResponse : undefined;
+	if (archive?.version !== 1 || archive.kind !== "m07-private-candidate-archive" ||
+		archive.goalRunId !== binding.goalRunId || archive.goalOutcome !== "partial" ||
+		archive.taskStatus !== "failed" || archive.loopStopReason !== "output-limit" ||
+		archive.m04?.state !== "not-run" || archive.controllerEvidence?.reviewStatus !== "unreviewed" ||
+		!Array.isArray(outcomes) || outcomes.length !== 1 ||
+		outcomes[0]?.status !== "terminal-response-incomplete" ||
+		!/^O\d{3,}$/.test(outcomes[0]?.operationId ?? "") ||
+		!Number.isSafeInteger(terminal?.settledProviderRequestCount) ||
+		terminal.settledProviderRequestCount < 1 || terminal.responseReceived !== true ||
+		terminal.terminalStopReason !== "length" || terminal.taskComplete !== false ||
+		terminal.effectScope !== "factory-attested-confined-file-tools")
+		reject("latest goal lacks the received, settled, confined length-stop receipt");
+	const policySha = sha256(JSON.stringify(LENGTH_SETTLED_POLICY));
+	return { sourceCommit: facts.source.commit, policyId: LENGTH_SETTLED_POLICY.policyId,
+		policySha256: sha256(JSON.stringify({ policySha, prefix: prefix.policySha256,
+			receiptSha, bindingSha, terminal })), operationAttestations: prefix.operationAttestations,
+		effectClass: "confined-ephemeral-local", unknownBillingHeld: true,
+		actorThirdPartyMutations: "none", hostTransport: "immutable-versioned-archive" };
+}
+
 /** Only the reviewed source pair and a fully linked inherited quarantine are admitted. */
 export function reviewPrivateCampaignRestartEffects(input: PrivateCampaignEffectReviewInput): ReviewedRestartEffectPolicy {
 	const { facts, operationRefs, privateBundle: bundle } = input;
 	if (!input.authenticatedBundle(input.proof, bundle)) reject("bundle is not authenticated by live ledger proof");
 	if (!(facts.source.commit === CURRENT_POLICY.sourceCommit ||
-		facts.source.commit === INHERITED_ONLY_POLICY.sourceCommit) ||
+		facts.source.commit === INHERITED_ONLY_POLICY.sourceCommit ||
+		facts.source.commit === LENGTH_SETTLED_POLICY.sourceCommit) ||
 		facts.resultArtifact.digestScope !== "github-artifact-archive" ||
 		facts.unknownHeldNano < 1 || !operationRefs.length || new Set(operationRefs).size !== operationRefs.length)
 		reject("latest source or unknown charge is outside reviewed scope");
@@ -234,6 +320,8 @@ export function reviewPrivateCampaignRestartEffects(input: PrivateCampaignEffect
 		"host-independent-restart-goal-bindings") as PriorBinding[];
 	if (facts.source.commit === INHERITED_ONLY_POLICY.sourceCommit)
 		return reviewInheritedOnly(input, checkpoint, reservations, bindings);
+	if (facts.source.commit === LENGTH_SETTLED_POLICY.sourceCommit)
+		return reviewLengthSettled(input, checkpoint, reservations, bindings);
 	const qualifying: Array<{ reservation: PriorReservation; binding: PriorBinding; receiptSha256: string }> = [];
 	for (const reservation of reservations) {
 		const receipt = reservation?.receipt, claim = reservation?.claim;

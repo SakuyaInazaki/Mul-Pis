@@ -1302,7 +1302,8 @@ async function main() {
 		current: { repository: process.env.GITHUB_REPOSITORY, runId: process.env.GITHUB_RUN_ID,
 			runAttempt: process.env.GITHUB_RUN_ATTEMPT, actor: process.env.GITHUB_ACTOR,
 			event: process.env.GITHUB_EVENT_NAME, ref: process.env.GITHUB_REF,
-			sha: process.env.GITHUB_SHA, manualAuthorized: process.env.MULPIS_MANUAL_AUTHORIZED } });
+			sha: process.env.GITHUB_SHA, manualAuthorized: process.env.MULPIS_MANUAL_AUTHORIZED,
+			before: process.env.MULPIS_RUN_REQUEST_BEFORE } });
 	// Old signed ceilings remain authenticated history, not a runnable fee policy.
 	if (missionLedger.mode !== "accounting-only") fail("explicit signed accounting-only mission transition is required");
 	let finalBudget: DeepSeekCampaignBudget | undefined;

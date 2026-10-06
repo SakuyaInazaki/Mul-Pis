@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { deflateRawSync } from "node:zlib";
 import test, { type TestContext } from "node:test";
-import { authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, sealHistoricalCarryForOfflineTests } from "../src/runner/ledger-continuation.ts";
+import { authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE } from "../src/runner/ledger-continuation.ts";
 import type { RequestAuditSnapshot } from "../src/runner/ledger-continuation.ts";
 import { DeepSeekCampaignBudget, type CampaignAdmissionRejection } from "../src/runner/deepseek-campaign.ts";
 import { verifyDeepSeekCnyBilling, nativeCnyPricingRecord } from "../src/runner/deepseek-cny-pricing.ts";
@@ -798,6 +798,78 @@ test("current push is never admitted, while an authenticated historical push car
 			status: "completed", conclusion: "success" }, second]),
 		loadCarryArtifact: async () => prior.envelopeB64 });
 	assert.equal(accepted.historicalCommittedCny, f.payload.priorCommittedCny);
+});
+
+test("reusable control request admits only an exact empty tested source tree", async t => {
+	const f = await fixture(t);
+	const source = sha("f"), tree = sha("a"), requested = {
+		...first, event: "push", head_branch: "run-requests/workflow-learning-reliability",
+		head_commit: { message: REUSABLE_RUN_REQUEST_MESSAGE },
+	};
+	const base = github([anchor, requested]);
+	const request: typeof fetch = async (url, init) => {
+		const target = String(url);
+		if (target.endsWith("/git/ref/heads/improve/workflow-learning-reliability"))
+			return new Response(JSON.stringify({ object: { sha: source } }));
+		if (target.endsWith(`/git/commits/${sha("b")}`))
+			return new Response(JSON.stringify({ parents: [{ sha: source }], tree: { sha: tree } }));
+		if (target.endsWith(`/git/commits/${source}`))
+			return new Response(JSON.stringify({ parents: [], tree: { sha: tree } }));
+		if (target.includes("/actions/workflows/workflow-regression.yml/runs?"))
+			return new Response(JSON.stringify({ workflow_runs: [{ head_sha: source,
+				head_branch: "improve/workflow-learning-reliability", event: "push",
+				run_attempt: 1, conclusion: "success" }] }));
+		return base(url, init);
+	};
+	const proposed = { ...current(7002, sha("b")), event: "push", before: source,
+		ref: "refs/heads/run-requests/workflow-learning-reliability" };
+	const input = { ...f, githubToken: "synthetic-token", current: proposed, request,
+		loadCarryArtifact: async () => { throw Error("no earlier executed carry"); } };
+	assert.equal((await openLedgerContinuation(input)).mode, "accounting-only");
+	await assert.rejects(openLedgerContinuation({ ...input,
+		current: { ...proposed, actor: "someone-else" } }), /current Actions identity/);
+	await assert.rejects(openLedgerContinuation({ ...input,
+		current: { ...proposed, ref: "refs/heads/improve/workflow-learning-reliability" } }), /current Actions identity/);
+	await assert.rejects(openLedgerContinuation({ ...input, request: async (url, init) => {
+		if (String(url).includes("/actions/workflows/manual-private-campaign.yml/runs?"))
+			return new Response(JSON.stringify({ total_count: 2, workflow_runs: [
+				{ ...requested, head_commit: { message: ONE_USE_PUSH_MARKER } }, anchor] }));
+		return request(url, init);
+	} }), /workflow identity or signed seed freshness/);
+	await assert.rejects(openLedgerContinuation({ ...input, current: { ...proposed, before: sha("d") } }),
+		/not a fast-forward empty commit/);
+	const failedCi: typeof fetch = async (url, init) => String(url).includes("/actions/workflows/workflow-regression.yml/runs?")
+		? new Response(JSON.stringify({ workflow_runs: [] })) : request(url, init);
+	await assert.rejects(openLedgerContinuation({ ...input, request: failedCi }), /lacks a successful offline regression/);
+});
+
+test("next request fast-forwards the prior control ref while selecting a newly tested source", async t => {
+	const f = await fixture(t), source = sha("e"), tree = sha("a"), before = sha("b");
+	const prior = { ...run(7002, 2, "completed", before, "success"), event: "push",
+		head_branch: "run-requests/workflow-learning-reliability",
+		head_commit: { message: REUSABLE_RUN_REQUEST_MESSAGE } };
+	const proposed = { ...second, event: "push", head_branch: "run-requests/workflow-learning-reliability",
+		head_commit: { message: REUSABLE_RUN_REQUEST_MESSAGE } };
+	const base = github([anchor, prior, proposed], { step: "skipped" });
+	const request: typeof fetch = async (url, init) => {
+		const target = String(url);
+		if (target.endsWith("/git/ref/heads/improve/workflow-learning-reliability"))
+			return new Response(JSON.stringify({ object: { sha: source } }));
+		if (target.endsWith(`/git/commits/${sha("c")}`))
+			return new Response(JSON.stringify({ parents: [{ sha: source }, { sha: before }], tree: { sha: tree } }));
+		if (target.endsWith(`/git/commits/${source}`))
+			return new Response(JSON.stringify({ parents: [], tree: { sha: tree } }));
+		if (target.includes("/actions/workflows/workflow-regression.yml/runs?"))
+			return new Response(JSON.stringify({ workflow_runs: [{ head_sha: source,
+				head_branch: "improve/workflow-learning-reliability", event: "push",
+				run_attempt: 1, conclusion: "success" }] }));
+		return base(url, init);
+	};
+	const opened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token", request,
+		current: { ...current(7003, sha("c")), event: "push", before,
+			ref: "refs/heads/run-requests/workflow-learning-reliability" },
+		loadCarryArtifact: async () => { throw Error("skipped prior control job has no carry"); } });
+	assert.equal(opened.mode, "accounting-only");
 });
 
 test("historical v2 seeds without root attestation keep their old availability requirement", async t => {

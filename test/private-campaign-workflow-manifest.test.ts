@@ -7,7 +7,9 @@ test("manual private workflow preserves encrypted carry and runtime admission", 
 	const yaml = await readFile(new URL("../.github/workflows/manual-private-campaign.yml", import.meta.url), "utf8");
 	assert.ok(yaml.includes("github.event_name == 'workflow_dispatch'"));
 	assert.ok(yaml.includes("inputs.authorize_bounded_run == true"));
-	assert.doesNotMatch(yaml, /github\.event\.head_commit\.message|github\.event_name == 'push'/);
+	assert.ok(yaml.includes("github.event_name == 'push'"));
+	assert.ok(yaml.includes("github.event.head_commit.message == 'Run confidential workflow'"));
+	assert.ok(yaml.includes("refs/heads/run-requests/workflow-learning-reliability"));
 	assert.ok(yaml.includes("github.run_attempt == 1"));
 	assert.ok(yaml.includes("cancel-in-progress: false"));
 	assert.ok(yaml.includes("persist-credentials: false"));

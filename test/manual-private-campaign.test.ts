@@ -14,7 +14,9 @@ test("shared-total campaign requires explicit manual admission and signed cumula
  const gate = workflow.split("  private-campaign:\n")[1]?.split("    runs-on:")[0] ?? "";
  const triggers = workflow.split(/^on:\s*$/m)[1]?.split(/^permissions:\s*$/m)[0] ?? "";
  assert.deepEqual([...triggers.matchAll(/^  ([A-Za-z_][\w-]*):/gm)].map(match => match[1]),
-  ["workflow_dispatch"], "a push or other automatic event must never launch the paid private campaign");
+  ["push", "workflow_dispatch"]);
+ assert.ok(triggers.includes("run-requests/workflow-learning-reliability"));
+ assert.doesNotMatch(triggers, /^\s+- improve\/workflow-learning-reliability\s*$/m);
  assert.ok(gate.includes("github.repository == 'SakuyaInazaki/Mul-Pis'"));
  assert.ok(gate.includes("github.actor == 'SakuyaInazaki'"));
  assert.ok(gate.includes("github.run_attempt == 1"));
@@ -23,8 +25,12 @@ test("shared-total campaign requires explicit manual admission and signed cumula
  assert.ok(gate.includes("inputs.authorize_bounded_run == true"));
  assert.ok(workflow.includes("MULPIS_MISSION_LEDGER_B64: ${{ secrets.MULPIS_MISSION_LEDGER_B64 }}"));
  assert.doesNotMatch(workflow, /inputs\.mission_ledger_b64/);
- assert.ok(workflow.includes("MULPIS_MANUAL_AUTHORIZED: ${{ inputs.authorize_bounded_run }}"));
- assert.doesNotMatch(gate, /github\.event\.head_commit|github\.event_name == 'push'/);
+ assert.ok(workflow.includes("github.event.head_commit.message == 'Run confidential workflow'"));
+ assert.ok(workflow.includes("github.ref == 'refs/heads/run-requests/workflow-learning-reliability'"));
+ assert.ok(workflow.includes("Verify reusable control-branch request and accepted source CI"));
+ assert.ok(workflow.includes("git rev-parse HEAD^{tree}"));
+ assert.ok(workflow.includes("workflow-regression.yml/runs"));
+ assert.ok(workflow.includes("MULPIS_RUN_REQUEST_BEFORE: ${{ github.event.before }}"));
  assert.ok(workflow.includes("GITHUB_TOKEN: ${{ github.token }}"));
  assert.ok(workflow.includes("  actions: read"));
  assert.doesNotMatch(workflow, /up to [0-9.]+ CNY/);

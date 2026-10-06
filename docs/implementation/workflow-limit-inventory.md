@@ -10,7 +10,7 @@
 
 | 入口 | 当前行为与证据 | 性质/剩余问题 |
 | --- | --- | --- |
-| 私密 campaign `scripts/manual-private-campaign.ts` + `.github/workflows/manual-private-campaign.yml` | 已去除原 25 分钟 campaign、45 秒结算预留、90 秒新 phase 门槛、64 全局/32 单 prompt calls、8 builder 轮和 Actions 30/45 分钟显式 timeout。曾用于单次续跑的付费 `push` 触发器已移除；现在只有显式 `workflow_dispatch` 且 `authorize_bounded_run=true`，并核查仓库/actor/ref/首次 attempt、保持同组串行。公开离线回归工作流的 push 不运行此私密 campaign。 | 原数值是**历史限额**，不得再描述成当前停止条件。GitHub 托管 runner 自身的生命周期仍属外部边界，跨进程续作须走已验证恢复协议。 |
+| 私密 campaign `scripts/manual-private-campaign.ts` + `.github/workflows/manual-private-campaign.yml` | 已去除原 25 分钟 campaign、45 秒结算预留、90 秒新 phase 门槛、64 全局/32 单 prompt calls、8 builder 轮和 Actions 30/45 分钟显式 timeout。普通研究代码提交只触发离线回归；付费试跑须经显式 `workflow_dispatch` 授权，或向专用 `run-requests/workflow-learning-reliability` 控制分支推送树与已通过 CI 的研究代码一致、消息固定的空变更请求提交。后一方式可重复用于不同请求，不需要改源代码消息。两种入口均核查仓库/actor/ref/首次 attempt、维持同组串行。 | 原数值是**历史限额**，不得再描述成当前停止条件。GitHub 托管 runner 自身的生命周期仍属外部边界，跨进程续作须走已验证恢复协议；请求提交的 SHA 用于辨认和防重放。 |
 | M07 `src/m07/controller.ts`、`src/m07/execution-loop.ts`、`src/m07/objective-progress.ts` | builder/reviewer 持续到 reviewer 终态或真实阻断；旧 `maxRounds/deadlineAt` 字段可读但仅为历史审计，不驱动当前停止；原目标重新评估循环也不再限 64 次。重复不可用提案和连续空回合只生成诊断/重规划反馈，不再按固定重复次数终止。 | 分支仍必须保持冻结目标、材料和检查义务；未决外部操作、失败、用户决定和进程身份可能阻止继续。这些是状态/证据门禁。 |
 | Pi 主/子会话 `src/pi/service.ts`、`src/pi/extension.ts` | 整条子 prompt 的墙钟与停滞 watchdog 默认均为 0（关闭）；主会话停滞默认也关闭；显式旧配置可开启。 | 不再以默认 60 分钟/10 分钟终止仍在推进的执行；用户/调用者主动提供旧 watchdog 值仍可停止。注意供应商或 SDK 自身断连。 |
 | Pi 严格请求 `src/runner/pi.ts`、专用结算 `src/runner/deepseek-campaign.ts` | 按实时核对的 provider 最大输出值请求；旧 CNY 总额与调用次数不再决定是否发送。模型/端点身份、输入 payload、逐请求使用事件与不确定费用继续核查；strict mode 禁 SDK 自动 retry/compaction。 | Provider 的真实单请求最大输出和 context window 是**外部物理限制**。无法核实币种/价格时费用记为未知，不伪造零费用或发票；未决外部操作仍需独立核对。 |

@@ -17,12 +17,14 @@ export const CARRY_FILE_NAME = "ledger-continuation.enc.json";
 const MAX_CARRY_BYTES = 8 * 1024 * 1024;
 const NANO = 1_000_000_000;
 const BRANCH = "improve/workflow-learning-reliability";
+const REQUEST_BRANCH = "run-requests/workflow-learning-reliability";
 const WORKFLOW = "manual-private-campaign.yml";
+export const REUSABLE_RUN_REQUEST_MESSAGE = "Run confidential workflow";
 export type { PrivateContinuationBundle, BootstrapBinding } from "./signed-mission-ledger.ts";
 export type CurrentMissionRun = {
 	repository: string | undefined; runId: string | undefined; runAttempt: string | undefined;
 	actor: string | undefined; event: string | undefined; ref: string | undefined;
-	sha: string | undefined; manualAuthorized: string | undefined;
+	sha: string | undefined; manualAuthorized: string | undefined; before?: string | undefined;
 };
 type Run = { id?: number; run_number?: number; run_attempt?: number; workflow_id?: number;
 	status?: string; conclusion?: string; head_branch?: string; head_sha?: string; event?: string;
@@ -687,9 +689,14 @@ export async function openLedgerContinuation(input: {
 	requireSeedOnly?: boolean;
 }): Promise<LedgerContinuation> {
 	const c = input.current;
+	const authorizedDispatch = c.event === "workflow_dispatch" &&
+		c.ref === `refs/heads/${BRANCH}` && c.manualAuthorized === "true";
+	const authorizedControlRequest = c.event === "push" &&
+		c.ref === `refs/heads/${REQUEST_BRANCH}` && c.manualAuthorized === "true" &&
+		/^[0-9a-f]{40}$/.test(c.before ?? "");
 	if (c.repository !== MISSION_REPOSITORY || c.actor !== "SakuyaInazaki" ||
-		c.event !== "workflow_dispatch" || c.manualAuthorized !== "true" ||
-		c.ref !== `refs/heads/${BRANCH}` || c.runAttempt !== "1" || !positiveId(c.runId) ||
+		(!authorizedDispatch && !authorizedControlRequest) ||
+		c.runAttempt !== "1" || !positiveId(c.runId) ||
 		!/^[0-9a-f]{40}$/.test(c.sha ?? "") || !input.githubToken || input.githubToken.length > 4_000)
 		reject("current Actions identity is not admitted for the mission ledger");
 	const seed = await authenticateSignedMissionSeed({ envelopeB64: input.seedEnvelopeB64,
@@ -731,7 +738,8 @@ export async function openLedgerContinuation(input: {
 		!Number.isSafeInteger(anchor.run_number) || anchor.run_number! >= current.run_number! ||
 		current.run_attempt !== 1 || current.status !== "in_progress" ||
 		current.event !== c.event || current.head_sha !== c.sha || current.actor?.login !== c.actor ||
-		current.head_branch !== BRANCH ||
+		current.head_branch !== (authorizedControlRequest ? REQUEST_BRANCH : BRANCH) ||
+		(authorizedControlRequest && current.head_commit?.message !== REUSABLE_RUN_REQUEST_MESSAGE) ||
 		!Number.isSafeInteger(current.workflow_id) || current.workflow_id! <= 0 ||
 		pages.some(run => run.workflow_id !== current.workflow_id) ||
 		anchor.status !== "completed" || anchor.run_attempt !== seed.payload.previous.runAttempt ||
@@ -745,6 +753,32 @@ export async function openLedgerContinuation(input: {
 		new Set(ordered.map(x => x.run_number)).size !== ordered.length ||
 		ordered[0].id !== anchor.id || ordered.at(-1)?.id !== current.id)
 		reject("workflow run order cannot be proved exclusive");
+	if (authorizedControlRequest && pages.some(run => run.id !== current.id &&
+		run.event === "push" && run.head_sha === current.head_sha))
+		reject("run request commit was already used by an earlier workflow run");
+	if (authorizedControlRequest) {
+		const repo = `https://api.github.com/repos/${MISSION_REPOSITORY}`;
+		const featureRef = await githubJson(`${repo}/git/ref/heads/${BRANCH}`, input.githubToken, request);
+		const source = record(featureRef.object) ? featureRef.object.sha : undefined;
+		if (typeof source !== "string" || !/^[0-9a-f]{40}$/.test(source))
+			reject("run request source ref is unavailable");
+		const submitted = await githubJson(`${repo}/git/commits/${current.head_sha}`, input.githubToken, request);
+		const sourceCommit = await githubJson(`${repo}/git/commits/${source}`, input.githubToken, request);
+		const parents = submitted.parents;
+		if (!Array.isArray(parents) || ![1, 2].includes(parents.length) ||
+			parents.some(parent => !record(parent) || typeof parent.sha !== "string") ||
+			parents[0].sha !== source ||
+			(parents.length === 1 ? c.before !== source : parents[1].sha !== c.before) ||
+			!record(submitted.tree) || !record(sourceCommit.tree) ||
+			typeof submitted.tree.sha !== "string" || submitted.tree.sha !== sourceCommit.tree.sha)
+			reject("run request is not a fast-forward empty commit of the accepted source tree");
+		const ci = await githubJson(`${base}/workflows/workflow-regression.yml/runs?head_sha=${source}&per_page=100`,
+			input.githubToken, request);
+		if (!Array.isArray(ci.workflow_runs) || !ci.workflow_runs.some(row =>
+			record(row) && row.head_sha === source && row.head_branch === BRANCH &&
+			row.event === "push" && row.run_attempt === 1 && row.conclusion === "success"))
+			reject("run request source lacks a successful offline regression run");
+	}
 	// Workflow concurrency prevents simultaneous execution, but it does not promise
 	// run-number order. A newer completed paid run cannot be silently omitted just
 	// because this older queued run finally acquired the concurrency slot.
@@ -780,7 +814,7 @@ export async function openLedgerContinuation(input: {
 		if (input.requireSeedOnly) reject("intervening workflow may have executed a billable job");
 		if (run.conclusion === "cancelled" || job.conclusion === "cancelled")
 			reject("intervening workflow run is not settled");
-		if (run.head_branch !== BRANCH || run.actor?.login !== c.actor ||
+		if (![BRANCH, REQUEST_BRANCH].includes(run.head_branch ?? "") || run.actor?.login !== c.actor ||
 			(run.event !== "push" && run.event !== "workflow_dispatch"))
 			reject("intervening provider execution is unresolved");
 		executedSources.push(source);
