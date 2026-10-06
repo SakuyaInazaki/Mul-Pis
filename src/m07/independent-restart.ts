@@ -85,6 +85,8 @@ export interface IndependentRestartReceiptV1 {
 		committedNano: number; unknownHeldNano: number };
 	quarantine: { operationRefs: string[]; historicalGoalOutcomes: Array<{ runId: string; outcome: string }>;
 		operationOutcome: "unknown"; selectedFromFailedAttempt: false;
+		/** Input-only duplicate aliases; checkpoint bytes remain unchanged and hashed. */
+		legacyQualifiedAliases?: Array<{ bareOperationId: string; qualifiedOperationRef: string }>;
 		failedHistory: IndependentRestartInput["failedHistory"] };
 	freshWorkspace: IndependentRestartInput["freshWorkspace"];
 	currentValidationSha256: string;
@@ -134,6 +136,45 @@ export interface IndependentRestartHost<Proof> {
 }
 
 function fail(message: string): never { throw new Error(`independent restart refused: ${message}`); }
+
+/**
+ * One legacy writer duplicated a current operation as both Oxxx and run/Oxxx.
+ * Accept that shape only when the bounded runs identify exactly one active
+ * origin and the qualified form is already present. Do not remove or settle the
+ * operation in the historical checkpoint; return a canonical view for policy.
+ */
+export function canonicalRestartUnknowns(checkpoint: ObjectiveProgressV1): {
+	operationRefs: string[]; aliases: Array<{ bareOperationId: string; qualifiedOperationRef: string }>;
+} {
+	const historicalRefs = checkpoint.boundedRuns.flatMap(run =>
+		(run.unresolvedOperationIds ?? []).map(id => `${run.runId}/${id}`));
+	const continuationRefs = checkpoint.continuation.unresolvedOperationIds;
+	if (!historicalRefs.length || new Set(historicalRefs).size !== historicalRefs.length ||
+		new Set(continuationRefs).size !== continuationRefs.length ||
+		!checkpoint.boundedRuns.some(run => run.outcome === "active" &&
+			(run.unresolvedOperationIds?.length ?? 0) > 0))
+		fail("unknown operations are missing, duplicated, or hidden in historical state");
+	const qualified: string[] = [];
+	const aliases: Array<{ bareOperationId: string; qualifiedOperationRef: string }> = [];
+	for (const ref of continuationRefs) {
+		if (!text(ref) || ref.includes("\0"))
+			fail("unknown operation reference is invalid");
+		if (ref.includes("/")) {
+			if (!historicalRefs.includes(ref))
+				fail("continuation names an operation absent from historical bounded runs");
+			qualified.push(ref);
+			continue;
+		}
+		const origins = checkpoint.boundedRuns.filter(run => run.outcome === "active" &&
+			run.unresolvedOperationIds?.includes(ref));
+		if (origins.length !== 1 || !continuationRefs.includes(`${origins[0].runId}/${ref}`))
+			fail("bare operation lacks one active, qualified historical origin");
+		aliases.push({ bareOperationId: ref, qualifiedOperationRef: `${origins[0].runId}/${ref}` });
+	}
+	if (!sameSet(qualified, historicalRefs))
+		fail("qualified continuation operations do not exactly match historical bounded runs");
+	return { operationRefs: qualified, aliases };
+}
 
 /**
  * Admits only a new, independently validated goal. This does not modify a prior
@@ -189,13 +230,7 @@ export async function reserveIndependentRestart<Proof>(input: IndependentRestart
 	catch { return fail("authenticated bundle lacks original contract"); }
 	if (JSON.stringify(originalContract) !== JSON.stringify(checkpoint.contract))
 		fail("original contract and historical checkpoint disagree");
-	const historicalRefs = checkpoint.boundedRuns.flatMap(run =>
-		(run.unresolvedOperationIds ?? []).map(id => `${run.runId}/${id}`));
-	const unresolved = checkpoint.continuation.unresolvedOperationIds;
-	if (!historicalRefs.length || !sameSet(historicalRefs, unresolved) ||
-		!checkpoint.boundedRuns.some(run => run.outcome === "active" &&
-			(run.unresolvedOperationIds?.length ?? 0) > 0))
-		fail("unknown operations are missing, duplicated, or hidden in historical state");
+	const { operationRefs: unresolved, aliases } = canonicalRestartUnknowns(checkpoint);
 	for (const name of checkpoint.selectedArtifacts)
 		if (!text(name, 128) || typeof input.privateBundle[name] !== "string")
 			fail("selected historical tuple is incomplete");
@@ -236,6 +271,7 @@ export async function reserveIndependentRestart<Proof>(input: IndependentRestart
 		quarantine: { operationRefs: [...unresolved].sort(),
 			historicalGoalOutcomes: checkpoint.boundedRuns.map(run => ({ runId: run.runId, outcome: run.outcome })),
 			operationOutcome: "unknown", selectedFromFailedAttempt: false,
+			...(aliases.length ? { legacyQualifiedAliases: aliases } : {}),
 			failedHistory: { ...input.failedHistory } },
 		freshWorkspace: { ...input.freshWorkspace }, currentValidationSha256: selection.currentValidationSha256,
 	};

@@ -30,6 +30,26 @@ test("independent new-goal checkpoint retains quarantined historical operation I
 	assert.deepEqual(later.continuation.unresolvedOperationIds, ["prior-run/O002", "fresh-run/O003"]);
 });
 
+test("a duplicate bare operation ID normalizes only against its unique qualified unknown", () => {
+	const contract = createOriginalObjective({ goal: "Continue a synthetic task", goalSource: "user-intent-summary",
+		inputNames: ["synthetic.txt"], obligations: [{ id: "original", description: "Satisfy synthetic task" }],
+		closure: "open-ended" });
+	const raw = objectiveProgress(contract, { boundedRuns: [
+		{ runId: "old-run", outcome: "active", unresolvedOperationIds: ["O002"] },
+		{ runId: "new-run", outcome: "active", unresolvedOperationIds: ["O001"] }],
+		selectedArtifacts: [], unresolvedOperationIds: ["old-run/O002", "O001", "new-run/O001"],
+		stopReason: "bounded-run-incomplete" });
+	assert.deepEqual(offlineChecks.canonicalUnresolvedOperationRefs(raw), ["old-run/O002", "new-run/O001"]);
+	const missing = { ...raw, continuation: { ...raw.continuation,
+		unresolvedOperationIds: ["old-run/O002", "O001"] } };
+	assert.throws(() => offlineChecks.canonicalUnresolvedOperationRefs(missing), /bare operation lacks one active, qualified historical origin/);
+	const ambiguous = { ...raw, boundedRuns: [...raw.boundedRuns,
+		{ runId: "another-run", outcome: "active", unresolvedOperationIds: ["O001"] }],
+		continuation: { ...raw.continuation,
+			unresolvedOperationIds: [...raw.continuation.unresolvedOperationIds, "another-run/O001"] } };
+	assert.throws(() => offlineChecks.canonicalUnresolvedOperationRefs(ambiguous), /bare operation lacks one active, qualified historical origin/);
+});
+
 test("failed initial task is checkpointed before finish and keeps selected prior artifacts", async t => {
 	const root = await mkdtemp(path.join(tmpdir(), "m07-failed-first-task-"));
 	t.after(async () => rm(root, { recursive: true, force: true }));
@@ -65,12 +85,15 @@ test("failed initial task is checkpointed before finish and keeps selected prior
 		closure: "open-ended" });
 	await writeOriginalObjectiveContract(path.join(outputDir, "original-objective.json"), contract);
 	const prior = objectiveProgress(contract, { boundedRuns: [{ runId: "R000", outcome: "fulfilled",
-		selectedTaskId: "T001" }], selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
+		selectedTaskId: "T001" }, { runId: "R-OLD", outcome: "active", unresolvedOperationIds: ["O002"] }],
+		selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
+		unresolvedOperationIds: ["R-OLD/O002"],
 		stopReason: "bounded-run-incomplete" });
 	await writeObjectiveProgress(path.join(outputDir, "objective-checkpoint.json"), prior);
 	const boundary = await offlineChecks.preserveUnsettledGoalCheckpoint({ ws, runId, outputDir, contract });
 	assert.equal(boundary.checkpoint.objectiveOutcome, "incomplete");
 	assert.deepEqual(boundary.unresolvedOperationIds, ["O001"]);
+	assert.deepEqual(boundary.checkpoint.continuation.unresolvedOperationIds, ["R-OLD/O002", "R001/O001"]);
 	assert.deepEqual(boundary.checkpoint.selectedArtifacts, prior.selectedArtifacts);
 	assert.equal(boundary.checkpoint.continuation.requiresOperationReconciliation, true);
 	assert.equal(boundary.checkpoint.boundedRuns.find(item => item.runId === runId)?.outcome, "active");
@@ -87,6 +110,7 @@ test("failed initial task is checkpointed before finish and keeps selected prior
 	const salvaged = JSON.parse(await readFile(path.join(outputDir, "objective-checkpoint.json"), "utf8")) as typeof boundary.checkpoint;
 	assert.ok(salvaged.availableArtifacts.includes("experiment-plan.json"));
 	assert.equal(salvaged.continuation.requiresOperationReconciliation, true);
+	assert.deepEqual(salvaged.continuation.unresolvedOperationIds, ["R-OLD/O002", "R001/O001"]);
 });
 
 test("failed fork prompt leaves parent evidence intact but cannot select across unknown operation", async t => {
@@ -147,7 +171,8 @@ test("failed fork prompt leaves parent evidence intact but cannot select across 
 	assert.deepEqual(boundary.unresolvedOperationIds, persisted.executionState?.operations
 		.filter(item => item.status === "unknown").map(item => item.id));
 	assert.equal(boundary.checkpoint.continuation.requiresOperationReconciliation, true);
-	assert.deepEqual(boundary.checkpoint.continuation.unresolvedOperationIds, boundary.unresolvedOperationIds);
+	assert.deepEqual(boundary.checkpoint.continuation.unresolvedOperationIds,
+		boundary.unresolvedOperationIds.map(id => `${goal.runId}/${id}`));
 	assert.equal(boundary.checkpoint.continuation.mode, "reconcile-operations-before-new-run");
 	assert.deepEqual(boundary.checkpoint.selectedArtifacts, []);
 	assert.deepEqual((await controller.status(goal.runId)).branchSelections ?? [], []);

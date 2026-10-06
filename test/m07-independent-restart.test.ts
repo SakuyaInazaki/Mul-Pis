@@ -127,7 +127,8 @@ test("unchecked effect, omitted unknown, and failed fresh selection cannot admit
 	cp.continuation.unresolvedOperationIds = [];
 	omitted.input.privateBundle["objective-checkpoint.json"] = JSON.stringify(cp);
 	omitted.facts.privateBundleSha256 = bundleHash(omitted.input.privateBundle);
-	await assert.rejects(reserveIndependentRestart(omitted.input, omitted.host), /missing, duplicated, or hidden/);
+	await assert.rejects(reserveIndependentRestart(omitted.input, omitted.host),
+		/qualified continuation operations do not exactly match historical bounded runs/);
 	assert.equal(omitted.claims.size, 0);
 
 	const failed = fixture();
@@ -175,7 +176,7 @@ test("a later independent restart retains both historical and newly unknown oper
 	const checkpoint = JSON.parse(second.input.privateBundle["objective-checkpoint.json"]);
 	checkpoint.boundedRuns.push({ runId: "newly-ended-goal", outcome: "active", acceptedTaskIds: [],
 		unresolvedOperationIds: ["O005"] });
-	checkpoint.continuation.unresolvedOperationIds.push("newly-ended-goal/O005");
+	checkpoint.continuation.unresolvedOperationIds.push("O005", "newly-ended-goal/O005");
 	second.input.privateBundle["objective-checkpoint.json"] = JSON.stringify(checkpoint);
 	second.input.privateBundle["independent-restart-quarantine.json"] = JSON.stringify(old.receipt);
 	second.facts.privateBundleSha256 = bundleHash(second.input.privateBundle);
@@ -191,10 +192,12 @@ test("a later independent restart retains both historical and newly unknown oper
 	const later = await reserveIndependentRestart(second.input, second.host);
 	assert.deepEqual(later.quarantinedOperationRefs, ["newly-ended-goal/O005", unknown]);
 	assert.notEqual(later.receipt.reuseKey, old.receipt.reuseKey);
+	assert.deepEqual(later.receipt.quarantine.legacyQualifiedAliases,
+		[{ bareOperationId: "O005", qualifiedOperationRef: "newly-ended-goal/O005" }]);
 	assert.deepEqual(later.receipt.quarantine.historicalGoalOutcomes.map(item => item.outcome),
 		["fulfilled", "active", "active"]);
 	assert.equal(JSON.parse(second.input.privateBundle["objective-checkpoint.json"])
-		.continuation.unresolvedOperationIds.length, 2);
+		.continuation.unresolvedOperationIds.length, 3);
 });
 
 test("duplicate or absent operation references fail closed", async () => {
@@ -213,4 +216,33 @@ test("duplicate or absent operation references fail closed", async () => {
 	absent.facts.privateBundleSha256 = bundleHash(absent.input.privateBundle);
 	await assert.rejects(reserveIndependentRestart(absent.input, absent.host),
 		/missing, duplicated, or hidden/);
+});
+
+test("legacy bare alias requires the exact qualified ref and one active origin", async () => {
+	const missingQualified = fixture();
+	const noQualified = JSON.parse(missingQualified.input.privateBundle["objective-checkpoint.json"]);
+	noQualified.continuation.unresolvedOperationIds = ["O002"];
+	missingQualified.input.privateBundle["objective-checkpoint.json"] = JSON.stringify(noQualified);
+	missingQualified.facts.privateBundleSha256 = bundleHash(missingQualified.input.privateBundle);
+	await assert.rejects(reserveIndependentRestart(missingQualified.input, missingQualified.host),
+		/bare operation lacks one active, qualified historical origin/);
+
+	const ambiguous = fixture();
+	const ambiguousCheckpoint = JSON.parse(ambiguous.input.privateBundle["objective-checkpoint.json"]);
+	ambiguousCheckpoint.boundedRuns.push({ runId: "another-active-goal", outcome: "active",
+		unresolvedOperationIds: ["O002"] });
+	ambiguousCheckpoint.continuation.unresolvedOperationIds =
+		[unknown, "another-active-goal/O002", "O002"];
+	ambiguous.input.privateBundle["objective-checkpoint.json"] = JSON.stringify(ambiguousCheckpoint);
+	ambiguous.facts.privateBundleSha256 = bundleHash(ambiguous.input.privateBundle);
+	await assert.rejects(reserveIndependentRestart(ambiguous.input, ambiguous.host),
+		/bare operation lacks one active, qualified historical origin/);
+
+	const contradictory = fixture();
+	const conflictingCheckpoint = JSON.parse(contradictory.input.privateBundle["objective-checkpoint.json"]);
+	conflictingCheckpoint.continuation.unresolvedOperationIds.push("other-goal/O777");
+	contradictory.input.privateBundle["objective-checkpoint.json"] = JSON.stringify(conflictingCheckpoint);
+	contradictory.facts.privateBundleSha256 = bundleHash(contradictory.input.privateBundle);
+	await assert.rejects(reserveIndependentRestart(contradictory.input, contradictory.host),
+		/absent from historical bounded runs/);
 });

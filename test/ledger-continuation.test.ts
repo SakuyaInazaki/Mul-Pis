@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { deflateRawSync } from "node:zlib";
 import test, { type TestContext } from "node:test";
-import { authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation } from "../src/runner/ledger-continuation.ts";
+import { authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation } from "../src/runner/ledger-continuation.ts";
 import type { RequestAuditSnapshot } from "../src/runner/ledger-continuation.ts";
 import { DeepSeekCampaignBudget } from "../src/runner/deepseek-campaign.ts";
 import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, ONE_USE_PUSH_MARKER } from "../src/runner/signed-mission-ledger.ts";
@@ -669,6 +669,29 @@ test("Actions-backed restart claim is one-use, live-job-bound, and never refunds
 	assert(Object.isFrozen(claim));
 	await assert.rejects(opened.claimOneUse(proof.envelopeSha256), /already consumed/);
 	await assert.rejects(duplicate.claimOneUse(proof.envelopeSha256), /already consumed/);
+	assert.equal(opened.priorUnknownHeldCny, 0.25);
+	assert.equal(opened.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 0,
+		requestAudit: audit(0, 0) }).carryForwardCny, 5.875);
+});
+
+test("branded ancestry predicate binds only exact authenticated source and carry digest", async t => {
+	const f = await compactedFixture(t);
+	const opened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token", current: current(7005, sha("e")),
+		loadCarryArtifact: async () => f.secondCarry.envelopeB64 });
+	const proof = opened.priorCarryProof!;
+	const ancestor = { runId: "7002", runAttempt: 1, commit: sha("b") };
+	const envelopeSha256 = createHash("sha256").update(Buffer.from(f.firstCarry.envelopeB64, "base64")).digest("hex");
+	assert.equal(authenticatedPriorCarryBindsAncestor(proof, ancestor, envelopeSha256), true);
+	assert.equal(authenticatedPriorCarryBindsAncestor(proof, { ...ancestor, runNumber: 2 }, envelopeSha256), true);
+	assert.equal(authenticatedPriorCarryBindsAncestor(proof, proof.source, proof.envelopeSha256), true);
+	for (const source of [
+		{ ...ancestor, runId: "7004" }, { ...ancestor, runAttempt: 2 }, { ...ancestor, commit: sha("f") },
+		{ ...ancestor, runNumber: 3 }, { ...ancestor, runAttempt: "1" }, { ...ancestor, inferred: true }, {},
+	]) assert.equal(authenticatedPriorCarryBindsAncestor(proof, source, envelopeSha256), false);
+	assert.equal(authenticatedPriorCarryBindsAncestor(proof, ancestor, "d".repeat(64)), false);
+	assert.equal(authenticatedPriorCarryBindsAncestor({ ...proof }, ancestor, envelopeSha256), false);
+	assert.equal(authenticatedPriorCarryBindsAncestor(JSON.parse(JSON.stringify(proof)), ancestor, envelopeSha256), false);
+	assert.equal(authenticatedPriorCarryBindsAncestor(proof, { runId: "7001", runAttempt: 1, commit: sha("a") }, envelopeSha256), false);
 	assert.equal(opened.priorUnknownHeldCny, 0.25);
 	assert.equal(opened.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 0,
 		requestAudit: audit(0, 0) }).carryForwardCny, 5.875);

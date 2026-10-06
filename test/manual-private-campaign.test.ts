@@ -5,6 +5,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import test from "node:test";
 import { offlineChecks } from "../scripts/manual-private-campaign.ts";
+import { reserveIndependentRestart } from "../src/m07/independent-restart.ts";
 import { ONE_USE_PUSH_MARKER } from "../src/runner/signed-mission-ledger.ts";
 
 test("shared-total campaign requires explicit manual admission and signed cumulative ledger", async () => {
@@ -38,6 +39,56 @@ test("execution deadlines use the remaining Actions campaign rather than a pilot
 	assert.throws(() => offlineChecks.executionDeadlineAt(stop, stop - 45_000), /settlement boundary/);
 	const source = await readFile(new URL("../scripts/manual-private-campaign.ts", import.meta.url), "utf8");
 	assert.doesNotMatch(source, /BUILDER_PHASE_MS|M04_PHASE_MS|campaignStopAt\s*-\s*9\s*\*\s*60_000/);
+});
+
+test("driver checkpoint synchronization matches a generic reservation with a proved bare alias", async () => {
+	const hash = (value: string) => createHash("sha256").update(value).digest("hex");
+	const contract = { version: 1, kind: "original-objective", id: "synthetic-contract" };
+	const checkpoint = { version: 1, kind: "original-objective-progress", contract,
+		selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
+		boundedRuns: [
+			{ runId: "selected-goal", outcome: "fulfilled", selectedTaskId: "T001",
+				acceptedTaskIds: ["T001"], unresolvedOperationIds: [] },
+			{ runId: "old-goal", outcome: "active", unresolvedOperationIds: ["O002"] },
+			{ runId: "new-goal", outcome: "active", unresolvedOperationIds: ["O001"] }],
+		continuation: { unresolvedOperationIds: ["old-goal/O002", "O001", "new-goal/O001"],
+			requiresOperationReconciliation: true } };
+	const bundle = { "original-objective.json": JSON.stringify(contract),
+		"objective-checkpoint.json": JSON.stringify(checkpoint), "candidate.cpp": "// selected synthetic source\n",
+		"verification.json": JSON.stringify({ version: 1, status: "passed" }),
+		"workflow-archive.json": JSON.stringify({ version: 1, taskId: "T001" }) };
+	const facts = { source: { runId: "111", runAttempt: 1, commit: "a".repeat(40) },
+		currentRun: { runId: "222", runAttempt: 1, commit: "b".repeat(40) },
+		envelopeSha256: hash("prior-envelope"),
+		privateBundleSha256: hash(JSON.stringify(Object.fromEntries(Object.entries(bundle).sort(([a], [b]) => a.localeCompare(b))))),
+		terminal: { state: "terminal" as const, sourceRunId: "111", sourceRunAttempt: 1,
+			observationDigest: hash("terminal"), observedAt: "2030-01-01T00:00:00Z" },
+		resultArtifact: { immutableRef: "synthetic-artifact", digestScope: "github-artifact-archive",
+			sha256: hash("encrypted-archive") }, committedNano: 1000, unknownHeldNano: 1 };
+	const input = { authenticatedCarryProof: { fixture: true }, privateBundle: bundle,
+		freshWorkspace: { workspaceId: "fresh-workspace", restartNonce: "nonce" },
+		failedHistory: { state: "unavailable" as const, reason: "Synthetic encrypted evidence gap",
+			immutableArtifactRef: facts.resultArtifact.immutableRef, digestScope: facts.resultArtifact.digestScope,
+			artifactSha256: facts.resultArtifact.sha256 } };
+	const reservation = await reserveIndependentRestart(input, {
+		authenticatedFacts: proof => proof === input.authenticatedCarryProof ? facts : undefined,
+		reviewEffects: async (_facts, refs) => ({ sourceCommit: facts.source.commit,
+			policyId: "synthetic-reviewed-policy", policySha256: hash("policy"),
+			operationAttestations: refs.map(operationRef => ({ operationRef,
+				sourceCommit: facts.source.commit, evidenceSha256: hash(operationRef) })),
+			effectClass: "confined-ephemeral-local", unknownBillingHeld: true,
+			actorThirdPartyMutations: "none", hostTransport: "immutable-versioned-archive" }),
+		revalidateSelection: async ({ tupleSha256 }) => ({ status: "passed", contractId: contract.id,
+			selectedRunId: "selected-goal", selectedTaskId: "T001", tupleSha256,
+			currentValidationSha256: hash("fresh-check") }),
+		commitOneUse: async receipt => ({ receiptRef: "synthetic-only", receiptSha256: hash(JSON.stringify(receipt)),
+			claim: { claimId: "claim", priorEnvelopeSha256: facts.envelopeSha256,
+				currentRunId: facts.currentRun.runId, currentRunAttempt: 1,
+				currentCommit: facts.currentRun.commit, currentJobId: "job" } }),
+	});
+	assert.deepEqual(offlineChecks.reservedCanonicalOperationRefs(checkpoint as any, reservation),
+		["new-goal/O001", "old-goal/O002"]);
+	assert.equal(checkpoint.continuation.unresolvedOperationIds.length, 3, "raw authenticated input stays intact");
 });
 
 test("failed experiment enters untrusted history while selected prior tuple remains coherent", async () => {

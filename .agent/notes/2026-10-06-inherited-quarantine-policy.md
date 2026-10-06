@@ -1,0 +1,9 @@
+# Inherited quarantine boundary (engineering note)
+
+An interrupted research task may leave its M07 operation unknown even when its provider request accounting has settled. Task outcome and billing outcome remain separate. Neither a newer run nor a model response may mark an old operation confirmed, not-issued, accepted, or fulfilled without the existing reconciliation evidence.
+
+The generic independent-restart gate now accepts one narrowly identified historical checkpoint encoding: a bare operation ID duplicated beside the identical qualified goal/operation reference. It requires exactly one active bounded-run origin for that ID and the qualified reference already present. It rejects missing qualified references, ambiguous origins, contradictory references, and duplicate historical operations. The original checkpoint bytes are retained and hashed; the admission receipt records the compatibility alias while carrying every unknown operation forward.
+
+The private-campaign host adapter is separate from M07 core. It reviews only exact immutable execution revisions, the unchanged confined file-tool and isolated checker boundary, and a sealed prior quarantine receipt. The older receipt must be bound to authenticated carry ancestry, the current source run's claim, and the goal binding before it may attest an inherited unknown. A new unknown is attested only under the reviewed current source and its exact bound goal. The host keeps the cumulative unknown billing hold. This adapter does not confer standing permission to accept future source revisions or arbitrary operations.
+
+Offline synthetic tests cover the narrow compatibility encoding, old-plus-new unknowns, ancestor and claim mismatch, altered receipt/binding, cost hold, unreviewed source, and operation-set mismatch. They are boundary tests, not a provider-billing receipt or live scientific result.

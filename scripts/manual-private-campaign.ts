@@ -26,10 +26,11 @@ import type { SessionCheckpoint, SessionHandle, SessionRunner, SessionSpec } fro
 import { DeepSeekCampaignBudget } from "../src/runner/deepseek-campaign.ts";
 import { MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, PRIVATE_CONTINUATION_FILE_KEYS } from
 	"../src/runner/signed-mission-ledger.ts";
-import { CARRY_FILE_NAME, authenticatedPriorCarryBindsBundle, downloadCarryArtifact,
+import { CARRY_FILE_NAME, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, downloadCarryArtifact,
 	isAuthenticatedPriorCarryProof, openLedgerContinuation,
 	type PrivateContinuationBundle } from "../src/runner/ledger-continuation.ts";
-import { bindIndependentRestartGoal, reserveIndependentRestart,
+import { reviewPrivateCampaignRestartEffects } from "../src/runner/private-campaign-restart-policy.ts";
+import { bindIndependentRestartGoal, canonicalRestartUnknowns, reserveIndependentRestart,
 	type AuthenticatedRestartCarryFacts, type IndependentRestartReservation,
 	type ReviewedRestartEffectPolicy } from "../src/m07/independent-restart.ts";
 import { createConfinedCampaignFileTools } from "../src/runner/confined-campaign-files.ts";
@@ -101,6 +102,30 @@ function unresolvedGoalControl(goal: CurrentGoal): { operationIds: string[]; tas
 			.filter(item => ["prepared", "issued", "unknown"].includes(item.status)).map(item => item.id),
 		taskIds: goal.tasks.filter(item => ["running", "unknown"].includes(item.status)).map(item => item.taskId),
 	};
+}
+function qualifiedOperationRef(runId: string, operationId: string): string {
+	if (!runId) fail("unknown operation identity cannot be qualified safely");
+	if (/^O\d{3,}$/.test(operationId)) return `${runId}/${operationId}`;
+	if (operationId.startsWith(`${runId}/`) && /^O\d{3,}$/.test(operationId.slice(runId.length + 1)))
+		return operationId;
+	fail("unknown operation identity cannot be qualified safely");
+}
+function canonicalUnresolvedOperationRefs(progress: ObjectiveProgressV1): string[] {
+	if (!progress.continuation.unresolvedOperationIds.length) {
+		if (progress.boundedRuns.some(run => run.unresolvedOperationIds?.length))
+			fail("historical unknown operations are missing from the continuation");
+		return [];
+	}
+	return canonicalRestartUnknowns(progress).operationRefs;
+}
+function reservedCanonicalOperationRefs(progress: ObjectiveProgressV1,
+	reservation: IndependentRestartReservation): string[] {
+	const expected = canonicalUnresolvedOperationRefs(progress);
+	const actual = reservation.quarantinedOperationRefs;
+	if (expected.length !== actual.length || expected.some(id => !actual.includes(id)) ||
+		new Set(actual).size !== actual.length)
+		fail("independent-restart reservation does not cover all historical unknowns");
+	return [...actual];
 }
 function campaignObjectiveProgress(contract: OriginalObjectiveContractV1, inheritedUnresolvedOperationIds: string[],
 	input: Parameters<typeof objectiveProgress>[1]): ObjectiveProgressV1 {
@@ -365,11 +390,13 @@ async function preserveUnsettledGoalCheckpoint(input: {
 	let prior: ObjectiveProgressV1 | undefined;
 	try { prior = JSON.parse(await readFile(path.join(input.outputDir, "objective-checkpoint.json"), "utf8")); } catch { /* First attempt has no checkpoint. */ }
 	if (prior?.contract.id !== input.contract.id) prior = undefined;
-	const checkpoint = campaignObjectiveProgress(input.contract, prior?.continuation.unresolvedOperationIds ?? [], {
+	const checkpoint = campaignObjectiveProgress(input.contract,
+		prior ? canonicalUnresolvedOperationRefs(prior) : [], {
 		...(prior?.assessment ? { assessment: prior.assessment } : {}), assessmentHistory: prior?.assessmentHistory,
 		boundedRuns: [...(prior?.boundedRuns.filter(run => run.runId !== input.runId) ?? []), { runId: input.runId, outcome: goal.lifecycle === "finished" ? goal.outcome ?? "unknown" : "active",
 			acceptedTaskIds, unresolvedOperationIds }],
-		selectedArtifacts: prior?.selectedArtifacts ?? [], availableArtifacts: [...new Set([...(prior?.availableArtifacts ?? []), ...availableArtifacts])], unresolvedOperationIds,
+		selectedArtifacts: prior?.selectedArtifacts ?? [], availableArtifacts: [...new Set([...(prior?.availableArtifacts ?? []), ...availableArtifacts])],
+		unresolvedOperationIds: unresolvedOperationIds.map(id => qualifiedOperationRef(input.runId, id)),
 		stopReason: campaignObjectiveStop(input.budgetStopReason) ?? "bounded-run-incomplete",
 	});
 	await writeObjectiveProgress(path.join(input.outputDir, "objective-checkpoint.json"), checkpoint);
@@ -394,7 +421,7 @@ async function salvageObjectiveCheckpoint(ws: Workspace, outputDir: string,
 			const goal = JSON.parse(await readFile(path.join(ws.runDir("M07", id), "goal.json"), "utf8")) as CurrentGoal;
 			const pending = (goal.executionState?.operations ?? [])
 				.filter(item => ["prepared", "issued", "unknown"].includes(item.status)).map(item => item.id);
-			unresolvedOperationIds.push(...pending.map(item => `${id}/${item}`));
+			unresolvedOperationIds.push(...pending.map(item => qualifiedOperationRef(id, item)));
 			const acceptedTaskIds = goal.tasks.filter(item => item.status === "accepted").map(item => item.taskId);
 			const selected = goal.branchSelections?.findLast(item => item.selectedTaskId)?.selectedTaskId;
 			boundedRuns.push({ runId: id, outcome: goal.lifecycle === "finished" ? goal.outcome ?? "unknown" : "active",
@@ -423,7 +450,7 @@ async function salvageObjectiveCheckpoint(ws: Workspace, outputDir: string,
 		return;
 	}
 	const progress = campaignObjectiveProgress(contract,
-		previous?.contract.id === contract.id ? previous.continuation.unresolvedOperationIds : [], { boundedRuns: allBoundedRuns,
+		previous?.contract.id === contract.id ? canonicalUnresolvedOperationRefs(previous) : [], { boundedRuns: allBoundedRuns,
 		selectedArtifacts: previous?.contract.id === contract.id ?
 			previous.selectedArtifacts : [],
 		availableArtifacts, unresolvedOperationIds,
@@ -1275,7 +1302,7 @@ async function main() {
 			previousCheckpoint.boundedRuns.some(run => (run.unresolvedOperationIds?.length ?? 0) > 0);
 		if (!priorNeedsQuarantine) validateContinuationSeed(previousBundle, found.files,
 			missionLedger.priorBootstrapBinding, originalText);
-		const historicalUnresolvedOperationIds = [...previousCheckpoint.continuation.unresolvedOperationIds];
+		let historicalUnresolvedOperationIds = canonicalUnresolvedOperationRefs(previousCheckpoint);
 		const priorSeedDir = path.join(ws.root, "objective-seeds");
 		await mkdir(priorSeedDir, { recursive: true, mode: 0o700 });
 		await writeFile(path.join(priorSeedDir, "prior-candidate.cpp"), previousBundle["candidate.cpp"]!, { mode: 0o600 });
@@ -1348,7 +1375,13 @@ async function main() {
 					digestScope: facts.resultArtifact.digestScope,
 					artifactSha256: facts.resultArtifact.sha256 } }, {
 				authenticatedFacts: proof => proof === priorProof ? authenticatedLegacyCarryFacts(proof, previousBundle) : undefined,
-				reviewEffects: async (authenticated, operationRefs) => reviewedLegacyRestartEffects(authenticated, operationRefs),
+				reviewEffects: async (authenticated, operationRefs) =>
+					authenticated.source.commit === LEGACY_RESTART_POLICY.sourceCommit ?
+						reviewedLegacyRestartEffects(authenticated, operationRefs) :
+						reviewPrivateCampaignRestartEffects({ facts: authenticated, operationRefs,
+							privateBundle: previousBundle, proof: priorProof,
+							authenticatedBundle: authenticatedPriorCarryBindsBundle,
+							bindsAncestor: authenticatedPriorCarryBindsAncestor }),
 				revalidateSelection: async ({ privateBundle, checkpoint, tupleSha256 }) => {
 					if (privateBundle !== previousBundle || checkpoint.contract.id !== originalObjective.id ||
 						statusPriorSelectedValidation !== "passed") fail("selected prior tuple was not freshly validated");
@@ -1363,6 +1396,7 @@ async function main() {
 					return { receiptRef, receiptSha256: sha256(JSON.stringify(receipt)), claim };
 				},
 			});
+			historicalUnresolvedOperationIds = reservedCanonicalOperationRefs(previousCheckpoint, restartReservation);
 			const gapFile = path.join(priorSeedDir, "prior-history-gap.json");
 			await writeFile(gapFile, `${JSON.stringify({ version: 1, kind: "untrusted-private-history-gap",
 				selectedCandidate: "earlier accepted bounded task; current correctness was revalidated without adopting old timings",
@@ -2334,6 +2368,7 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	preserveUnsettledGoalCheckpoint, preserveUnsettledBranchCheckpoint: preserveUnsettledGoalCheckpoint,
 	salvageObjectiveCheckpoint, collectContinuationBundle,
 	executionDeadlineAt, newPhaseAdmitted, unresolvedGoalControl, campaignObjectiveProgress,
+	canonicalUnresolvedOperationRefs, qualifiedOperationRef, reservedCanonicalOperationRefs,
 	registeredSourceShape, parseRegisteredCheckerOutput, validateContinuationSeed, rangeReadableHistory, sandboxArguments };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

@@ -5,10 +5,16 @@ import path from "node:path";
 import test from "node:test";
 import { createAgentSession, ModelRuntime, type CreateAgentSessionOptions } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type Model } from "@earendil-works/pi-ai";
-import { DeepSeekCampaignBudget, type DeepSeekCampaignLimits } from "../../src/runner/deepseek-campaign.ts";
+import { DeepSeekCampaignBudget, isSettledLocalCampaignBudgetStop, settledLocalCampaignBudgetStopDetails,
+	type DeepSeekCampaignLimits } from "../../src/runner/deepseek-campaign.ts";
+import { isSettledTerminalResponse, settledTerminalResponseDetails } from "../../src/runner/operation-disposition.ts";
 import { createConfinedCampaignFileTools } from "../../src/runner/confined-campaign-files.ts";
 import { PiSessionRunner } from "../../src/runner/pi.ts";
 import { openBoundedSession } from "../../src/context/boundary.ts";
+import { createFileKnowledgeStore } from "../../src/knowledge/store.ts";
+import { createM07Controller } from "../../src/m07/controller.ts";
+import type { StageContext } from "../../src/stages/context.ts";
+import { Workspace } from "../../src/workspace.ts";
 import type { SessionRunner, SessionSpec } from "../../src/runner/types.ts";
 import type { StageRunRecord } from "../../src/types.ts";
 
@@ -659,13 +665,31 @@ test("a known length terminal response settles its charge while the prompt fails
 	const runner = new PiSessionRunner({ modelRuntime: runtime, createSession: streamFactory(1), campaignBudget: budget });
 	const handle = await runner.create(spec(dir, "length-response"));
 	t.after(() => handle.dispose());
-	await assert.rejects(handle.prompt("known but incomplete"), /length/);
+	let truncated: unknown;
+	try { await handle.prompt("known but incomplete"); } catch (error) { truncated = error; }
+	assert.equal(isSettledTerminalResponse(truncated), true);
+	assert.deepEqual(settledTerminalResponseDetails(truncated), {
+		settledProviderRequestCount: 1, responseReceived: true, terminalStopReason: "length", taskComplete: false,
+		effectScope: "no-tools",
+	});
+	assert.equal(isSettledTerminalResponse(new Error(String(truncated))), false);
 	await lateProbe;
 	assert.equal(lateRequestDenied, true, "post-length tool-loop onPayload must fail before transport");
 	assert.equal(budget.snapshot().reservations, 1);
 	assert.equal(budget.snapshot().settledCny, (10 * LIMITS.estimatedInputCnyPerMillionTokens + 20 * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000);
 	assert.equal(budget.snapshot().unknownReservedCny, 0);
 	assert.equal(budget.snapshot().stopReason, "prompt-failure");
+});
+
+test("length response cannot certify a whole prompt with an earlier unsettled request", () => {
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1 });
+	const lease = budget.beginPrompt("synthetic", "incomplete-earlier-call");
+	budget.reserve(lease, 100, "unsettled");
+	budget.reserve(lease, 100, "length");
+	budget.stopAfterTerminalLength(lease, "length", reported("length-receipt", 1, 10, "length"));
+	assert.equal(budget.certifySettledTerminalResponse(lease, "no-tools"), undefined);
+	budget.failPrompt(lease);
+	assert(budget.snapshot().unknownReservedCny > 0);
 });
 
 test("provider stream error stops a later tool-loop request before transport", async (t) => {
@@ -965,13 +989,15 @@ test("real Pi tool request uses the synthetic runtime key at the fixed DeepSeek 
 		const syntheticKey = "sk-SYNTHETIC-OFFLINE-ONLY";
 		await runtime.setRuntimeApiKey("deepseek", syntheticKey);
 		const calls: Array<{ endpointMatches: boolean; authorizationMatches: boolean; hasTools: boolean }> = [];
+		const sentCaps: number[] = [];
 		let transportPayloadBytes: number | undefined;
 		const fakeFetch: typeof fetch = async (input, init) => {
 			const headers = new Headers(input instanceof Request ? input.headers : undefined);
 			new Headers(init?.headers).forEach((value, name) => headers.set(name, value));
 			const endpoint = input instanceof Request ? input.url : String(input);
-			const payload = typeof init?.body === "string" ? JSON.parse(init.body) as { tools?: unknown[] } : undefined;
+			const payload = typeof init?.body === "string" ? JSON.parse(init.body) as { tools?: unknown[]; max_tokens?: number } : undefined;
 			transportPayloadBytes = typeof init?.body === "string" ? Buffer.byteLength(init.body, "utf8") : undefined;
+			sentCaps.push(payload?.max_tokens ?? 0);
 			calls.push({ endpointMatches: endpoint === "https://api.deepseek.com/chat/completions",
 				authorizationMatches: headers.get("authorization") === `Bearer ${syntheticKey}`,
 				hasTools: Array.isArray(payload?.tools) && payload.tools.length === 3 });
@@ -993,6 +1019,21 @@ test("real Pi tool request uses the synthetic runtime key at the fixed DeepSeek 
 		const expectedReserve = (transportPayloadBytes * LIMITS.estimatedInputCnyPerMillionTokens +
 			(32 + LIMITS.outputAccountingMarginTokens) * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000;
 		assert.equal(budget.snapshot().reservedCny, expectedReserve, "onPayload must measure the HTTP body the pinned SDK actually sends");
+		const fullBytes = transportPayloadBytes;
+		assert.equal(sentCaps[0], 32);
+		handle.dispose();
+		const minCost = ((fullBytes - 1) * LIMITS.estimatedInputCnyPerMillionTokens +
+			(1 + LIMITS.outputAccountingMarginTokens) * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000;
+		const dynamic = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: (minCost + expectedReserve) / 2,
+			maxProviderCalls: 1, maxProviderCallsPerPrompt: 1, maxOutputTokens: 32 });
+		handle = await new PiSessionRunner({ modelRuntime: runtime, campaignBudget: dynamic })
+			.create(spec(sessions, "real-pi-adaptive", { kind: "custom", tools }));
+		await assert.rejects(handle.prompt("Offline authentication check."));
+		assert.equal(calls.length, 2);
+		assert(sentCaps[1] >= 1 && sentCaps[1] < 32, "the real SDK transport must carry the reduced cap");
+		assert.equal(dynamic.requestAuditSnapshot().requests[0].maxOutputTokens, sentCaps[1]);
+		assert.equal(dynamic.requestAuditSnapshot().requests[0].inputPayloadBytes, transportPayloadBytes);
+		assert(dynamic.snapshot().grossReservedCny <= dynamic.limits.maxCny);
 	} finally {
 		handle?.dispose();
 		globalThis.fetch = originalFetch;
@@ -1031,4 +1072,170 @@ test("conflicting late price reports only increase unknown holds and never erase
 	assert.equal(budget.snapshot().unknownReservedCny, 40);
 	budget.failPrompt(lease);
 	assert.equal(budget.requestAuditSnapshot().requests[0].unknownHeldCny, 40);
+});
+
+test("campaign sends and reserves the affordable reduced output cap under the one total", async (t) => {
+	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-adaptive-cap-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const payload = { model: MODEL.id, messages: [{ role: "user", content: "offline" }], max_tokens: 20 };
+	const minBytes = Buffer.byteLength(JSON.stringify({ ...payload, max_tokens: 1 }), "utf8");
+	const fullBytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
+	const minCost = (minBytes * 4 + (1 + 32) * 16) / 1_000_000;
+	const fullCost = (fullBytes * 4 + (20 + 32) * 16) / 1_000_000;
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 30,
+		priorCommittedCny: 30 - (minCost + fullCost) / 2 });
+	let sentCap = 0;
+	let sentBytes = 0;
+	const runtime = {
+		getModels: () => [MODEL],
+		async streamSimple(model: Model<"openai-completions">, _context: unknown,
+			options: { onPayload?: (payload: unknown, model: Model<"openai-completions">) => Promise<unknown> }) {
+			const outgoing = await options.onPayload?.(payload, model) as typeof payload;
+			sentCap = outgoing.max_tokens;
+			sentBytes = Buffer.byteLength(JSON.stringify(outgoing), "utf8");
+		},
+	} as unknown as ModelRuntime;
+	const handle = await new PiSessionRunner({ modelRuntime: runtime, createSession: offlineFactory(1),
+		campaignBudget: budget }).create(spec(dir, "adaptive-cap"));
+	t.after(() => handle.dispose());
+	assert.equal((await handle.prompt("offline")).text, "round 1");
+	assert(sentCap >= 4 && sentCap < 20);
+	const audit = budget.requestAuditSnapshot().requests[0];
+	assert.equal(audit.maxOutputTokens, sentCap);
+	assert.equal(audit.inputPayloadBytes, sentBytes);
+	assert.equal(audit.reservedCny, (sentBytes * 4 + (sentCap + 32) * 16) / 1_000_000);
+	assert(budget.snapshot().missionCommittedCny <= 30);
+	assert.equal(budget.snapshot().priorCommittedCny, 30 - (minCost + fullCost) / 2);
+});
+
+test("local rejection after a settled subrequest carries a host-certified partial-settled receipt", async (t) => {
+	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-local-stop-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const payload = { model: MODEL.id, messages: [], max_tokens: 20 };
+	const bytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
+	const firstWorst = (bytes * 4 + (20 + 32) * 16) / 1_000_000;
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: firstWorst });
+	let sent = 0;
+	const runtime = {
+		getModels: () => [MODEL],
+		streamSimple(model: Model<"openai-completions">, _context: unknown,
+			options: { onPayload?: (payload: unknown, model: Model<"openai-completions">) => Promise<unknown> }) {
+			const stream = createAssistantMessageEventStream();
+			void (async () => {
+				try {
+					await options.onPayload?.(payload, model);
+					sent++;
+					const assistant = { role: "assistant" as const, api: model.api, provider: model.provider, model: model.id,
+						content: [{ type: "text" as const, text: "partial" }], stopReason: "toolUse" as const,
+						timestamp: Date.now(), usage: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0,
+							totalTokens: 30, cost: { input: 0.000003, output: 0.000024, cacheRead: 0,
+								cacheWrite: 0, total: 0.000027 } } };
+					stream.push({ type: "start", partial: assistant });
+					stream.push({ type: "done", reason: "toolUse", message: assistant });
+				} catch (error) {
+					const failed = { role: "assistant" as const, api: model.api, provider: model.provider, model: model.id,
+						content: [], stopReason: "error" as const, errorMessage: String(error), timestamp: Date.now(),
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+					stream.push({ type: "error", reason: "error", error: failed });
+				} finally { stream.end(); }
+			})();
+			return stream;
+		},
+	} as unknown as ModelRuntime;
+	const handle = await new PiSessionRunner({ modelRuntime: runtime, createSession: streamFactory(2),
+		campaignBudget: budget }).create(spec(dir, "partial-settled"));
+	t.after(() => handle.dispose());
+	let failed: unknown;
+	try { await handle.prompt("two calls"); } catch (error) { failed = error; }
+	assert.equal(isSettledLocalCampaignBudgetStop(failed), true);
+	assert.deepEqual(settledLocalCampaignBudgetStopDetails(failed), {
+		settledProviderRequestCount: 1, rejectedBeforeTransport: true, stopReason: "total-cny-ceiling",
+		effectScope: "no-tools",
+	});
+	assert.equal(sent, 1);
+	assert.equal(budget.snapshot().reservations, 1);
+	assert.equal(budget.snapshot().unknownReservedCny, 0);
+	assert(budget.snapshot().settledCny > 0);
+	assert.equal(isSettledLocalCampaignBudgetStop(new Error(String(failed))), false);
+});
+
+test("M07 persists a real runner's certified partial-settled disposition without inventing an unknown charge", async (t) => {
+	const dir = await mkdtemp(path.join(tmpdir(), "m07-campaign-local-stop-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const ws = new Workspace(dir);
+	await mkdir(path.dirname(ws.problemFile), { recursive: true });
+	await writeFile(ws.problemFile, "Synthetic bounded problem\n");
+	const store = createFileKnowledgeStore(ws.knowledgeDir);
+	await store.init();
+	const baseline = await ws.startRun("M04", [{ label: "problem", path: ws.problemFile }]);
+	await ws.finishRun(baseline, "completed");
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 0.25,
+		maxProviderCalls: 2, maxProviderCallsPerPrompt: 2 });
+	let issued = 0;
+	let calls = 0;
+	const runtime = {
+		getModels: () => [MODEL],
+		streamSimple(model: Model<"openai-completions">, _context: unknown,
+			options: { onPayload?: (payload: unknown, model: Model<"openai-completions">) => Promise<unknown> }) {
+			const stream = createAssistantMessageEventStream();
+			void (async () => {
+				try {
+					calls++;
+					const payload = { model: model.id,
+						messages: [{ role: "user", content: calls === 1 ? "synthetic" : "x".repeat(100_000) }],
+						max_tokens: LIMITS.maxOutputTokens };
+					await options.onPayload?.(payload, model);
+					issued++;
+					const assistant = { role: "assistant" as const, api: model.api, provider: model.provider,
+						model: model.id, content: [{ type: "text" as const, text: "partial" }],
+						stopReason: "toolUse" as const, timestamp: Date.now(),
+						usage: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0, totalTokens: 30,
+							cost: { input: 0.000003, output: 0.000024, cacheRead: 0,
+								cacheWrite: 0, total: 0.000027 } } };
+					stream.push({ type: "start", partial: assistant });
+					stream.push({ type: "done", reason: "toolUse", message: assistant });
+				} catch (error) {
+					const failed = { role: "assistant" as const, api: model.api, provider: model.provider,
+						model: model.id, content: [], stopReason: "error" as const,
+						errorMessage: String(error), timestamp: Date.now(),
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+					stream.push({ type: "error", reason: "error", error: failed });
+				} finally { stream.end(); }
+			})();
+			return stream;
+		},
+	} as unknown as ModelRuntime;
+	const actual = new PiSessionRunner({ modelRuntime: runtime, createSession: streamFactory(2), campaignBudget: budget });
+	const runner: SessionRunner = {
+		create: async (requested) => actual.create({ ...requested, tools: requested.tools.kind === "execution"
+			? { kind: "custom", tools: await createConfinedCampaignFileTools(requested.tools.root,
+				{ writableFiles: ["result.txt"] }) } : requested.tools }),
+		resume: (ref) => actual.resume(ref),
+		attestConfinedGrant: (handle) => actual.attestConfinedGrant(handle),
+	};
+	const controller = createM07Controller({ ws, store, runner, config: {
+		roles: { execution: LIMITS.model, reviewer: LIMITS.model }, concurrency: 1, tools: {},
+	} } as StageContext);
+	const goal = await controller.begin({ goal: "Synthetic bounded candidate", problemRelation: "direct",
+		constraints: ["keep the plan"], successCriteria: ["checked"], plan: "one candidate" });
+	const task = await controller.delegate(goal.runId, { objective: "produce candidate", inputs: [],
+		expectedOutputs: ["result.txt"], checks: ["checked"], mode: "execute",
+		executionLoop: { maxRounds: 1, deadlineAt: new Date(Date.now() + 60_000).toISOString() } });
+	assert.equal(task.status, "failed");
+	const persisted = await controller.status(goal.runId);
+	const operation = persisted.executionState?.operations.find((entry) => entry.taskId === task.taskId);
+	assert.equal(operation?.status, "partial-settled");
+	assert.equal(operation?.observationMethod, "host-local-admission-rejection");
+	assert(operation?.evidencePath);
+	const receipt = JSON.parse(await readFile(operation.evidencePath, "utf8"));
+	assert.equal(receipt.settledProviderRequestCount, 1);
+	assert.equal(receipt.rejectedBeforeTransport, true);
+	assert.equal(receipt.stopReason, "total-cny-ceiling");
+	assert.equal(receipt.effectScope, "factory-attested-confined-file-tools");
+	assert.equal(issued, 1);
+	assert.equal(budget.snapshot().settledCny > 0, true);
+	assert.equal(budget.snapshot().unknownReservedCny, 0);
+	assert.equal(budget.snapshot().reservations, 1);
 });

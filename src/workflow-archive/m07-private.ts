@@ -35,6 +35,13 @@ export interface PrivateM07ArchiveV1 {
 	loopStopReason?: M07TaskRecord["loopStopReason"];
 	files: Array<{ name: typeof FILES[number]["name"]; status: "present" | "missing" | "invalid"; bytes?: number }>;
 	controllerEvidence: {
+		operationOutcomes?: Array<{ operationId: string; status: string;
+			localStop?: { settledProviderRequestCount: number; rejectedBeforeTransport: true;
+				stopReason: "total-cny-ceiling" | "provider-call-limit";
+				effectScope: "factory-attested-confined-file-tools" };
+			terminalResponse?: { settledProviderRequestCount: number; responseReceived: true;
+				terminalStopReason: "length"; taskComplete: false;
+				effectScope: "factory-attested-confined-file-tools" } }>;
 		rounds: Array<{ index: number; verdict: "ready" | "revise" | "replan" | "blocked" | "unavailable";
 			/** Inline preview only; the complete explicit text is in feedbackFile. */
 			feedback?: string; feedbackStatus: "present" | "missing" | "excluded";
@@ -368,6 +375,55 @@ async function lessonState(raw: Buffer, workDir: string): Promise<PrivateM07Arch
 }
 
 /** Copy only explicit bounded work products, never session/auth/profile files. */
+async function archivedOperationOutcomes(goal: CurrentGoal, task: M07TaskRecord): Promise<
+	NonNullable<PrivateM07ArchiveV1["controllerEvidence"]["operationOutcomes"]>> {
+	const operations = (goal.executionState?.operations ?? []).filter(item => item.taskId === task.taskId);
+	if (operations.length > MAX_ROUNDS) throw new Error("private M07 operation count exceeds bounded rounds");
+	return Promise.all(operations.map(async operation => {
+		if (operation.status === "terminal-response-incomplete") {
+			const expected = path.join(path.dirname(task.workDir), "terminal-response-receipt.json");
+			if (operation.evidencePath !== expected || operation.observationMethod !== "host-terminal-response")
+				throw new Error("settled terminal response lacks its controller-owned receipt");
+			const source = await privateFile(path.dirname(task.workDir), "terminal-response-receipt.json", 4_000);
+			if (!source) throw new Error("settled terminal response receipt is unavailable");
+			const receipt = JSON.parse(await readFile(source.source, "utf8")) as Record<string, unknown>;
+			if (receipt.version !== 1 || receipt.kind !== "m07-incomplete-settled-terminal-response" ||
+				receipt.goalRunId !== goal.runId || receipt.taskId !== task.taskId ||
+				receipt.operationId !== operation.id || receipt.responseReceived !== true ||
+				receipt.taskComplete !== false || receipt.terminalStopReason !== "length" ||
+				receipt.effectScope !== "factory-attested-confined-file-tools" ||
+				!Number.isSafeInteger(receipt.settledProviderRequestCount) ||
+				Number(receipt.settledProviderRequestCount) < 1)
+				throw new Error("settled terminal response receipt does not match the operation");
+			return { operationId: operation.id, status: "terminal-response-incomplete",
+				terminalResponse: { settledProviderRequestCount: Number(receipt.settledProviderRequestCount),
+					responseReceived: true as const, terminalStopReason: "length" as const,
+					taskComplete: false as const,
+					effectScope: "factory-attested-confined-file-tools" as const } };
+		}
+		if (operation.status !== "partial-settled") return { operationId: operation.id, status: operation.status };
+		const expected = path.join(path.dirname(task.workDir), "local-admission-stop-receipt.json");
+		if (operation.evidencePath !== expected || operation.observationMethod !== "host-local-admission-rejection")
+			throw new Error("partial-settled operation lacks its controller-owned receipt");
+		const source = await privateFile(path.dirname(task.workDir), "local-admission-stop-receipt.json", 4_000);
+		if (!source) throw new Error("partial-settled receipt is unavailable");
+		const receipt = JSON.parse(await readFile(source.source, "utf8")) as Record<string, unknown>;
+		if (receipt.version !== 1 || receipt.kind !== "m07-partial-settled-local-admission-stop" ||
+			receipt.goalRunId !== goal.runId || receipt.taskId !== task.taskId ||
+			receipt.operationId !== operation.id || receipt.rejectedBeforeTransport !== true ||
+			receipt.effectScope !== "factory-attested-confined-file-tools" ||
+			!Number.isSafeInteger(receipt.settledProviderRequestCount) ||
+			Number(receipt.settledProviderRequestCount) < 1 ||
+			!(["total-cny-ceiling", "provider-call-limit"] as unknown[]).includes(receipt.stopReason))
+			throw new Error("partial-settled receipt does not match the operation");
+		return { operationId: operation.id, status: "partial-settled",
+			localStop: { settledProviderRequestCount: Number(receipt.settledProviderRequestCount),
+				rejectedBeforeTransport: true as const,
+				stopReason: receipt.stopReason as "total-cny-ceiling" | "provider-call-limit",
+				effectScope: "factory-attested-confined-file-tools" as const } };
+	}));
+}
+
 export async function archivePrivateM07Task(input: {
 	goal: CurrentGoal; task: M07TaskRecord; destination: string;
 }): Promise<PrivateM07ArchiveV1> {
@@ -425,6 +481,7 @@ export async function archivePrivateM07Task(input: {
 		createdAt: new Date().toISOString(), goalOutcome: goal.lifecycle === "finished" ? (goal.outcome ?? "partial") : "active",
 		taskStatus: task.status, ...(task.loopStopReason ? { loopStopReason: task.loopStopReason } : {}), files,
 		controllerEvidence: {
+			operationOutcomes: await archivedOperationOutcomes(goal, task),
 			rounds: await archiveRounds(task, input.destination),
 			reviewChecks: (task.review?.checks ?? []).map(check => ({ criterion: redactExplicitText(check.criterion).text, result: check.result })),
 			reviewStatus: task.status === "accepted" ? "accepted" : task.status === "rejected" ? "rejected" : "unreviewed",
@@ -627,6 +684,24 @@ export async function loadPrivateM07Archive(directory: string): Promise<{ archiv
 	}
 	if (!Array.isArray(archive.controllerEvidence?.rounds) || archive.controllerEvidence.rounds.length > MAX_ROUNDS)
 		throw new Error("private M07 archive round manifest is invalid");
+	if (archive.controllerEvidence.operationOutcomes !== undefined &&
+		(!Array.isArray(archive.controllerEvidence.operationOutcomes) ||
+			archive.controllerEvidence.operationOutcomes.length > MAX_ROUNDS ||
+			archive.controllerEvidence.operationOutcomes.some(item => !/^O\d{3,}$/.test(item.operationId) ||
+				!["prepared", "issued", "response-received", "partial-settled", "terminal-response-incomplete", "unknown", "confirmed", "not-issued"].includes(item.status) ||
+				(item.status === "partial-settled" ? !item.localStop ||
+					!Number.isSafeInteger(item.localStop.settledProviderRequestCount) ||
+					item.localStop.settledProviderRequestCount < 1 || item.localStop.rejectedBeforeTransport !== true ||
+					item.localStop.effectScope !== "factory-attested-confined-file-tools" ||
+					!["total-cny-ceiling", "provider-call-limit"].includes(item.localStop.stopReason) : item.localStop !== undefined) ||
+				(item.status === "terminal-response-incomplete" ? !item.terminalResponse ||
+					!Number.isSafeInteger(item.terminalResponse.settledProviderRequestCount) ||
+					item.terminalResponse.settledProviderRequestCount < 1 ||
+					item.terminalResponse.responseReceived !== true ||
+					item.terminalResponse.effectScope !== "factory-attested-confined-file-tools" ||
+					item.terminalResponse.terminalStopReason !== "length" ||
+					item.terminalResponse.taskComplete !== false : item.terminalResponse !== undefined))))
+		throw new Error("private M07 archive operation outcomes are invalid");
 	const seen = new Set<number>();
 	for (const round of archive.controllerEvidence.rounds) {
 		if (!Number.isSafeInteger(round.index) || round.index < 1 || round.index > MAX_ROUNDS || seen.has(round.index))

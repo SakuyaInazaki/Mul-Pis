@@ -1,6 +1,10 @@
 import { HarnessError } from "../types.ts";
 import type { SessionSpec, UsageEvent } from "./types.ts";
 import { getConfinedCampaignFileGrantDescriptor } from "./confined-campaign-files.ts";
+import { certifySettledLocalAdmissionStop, certifySettledTerminalResponse } from "./operation-disposition.ts";
+import type { HostEffectScope } from "./operation-disposition.ts";
+export { isSettledLocalAdmissionStop as isSettledLocalCampaignBudgetStop,
+	settledLocalAdmissionStopDetails as settledLocalCampaignBudgetStopDetails } from "./operation-disposition.ts";
 
 /**
  * In-process accounting for one DeepSeek research attempt under a global total.
@@ -45,11 +49,14 @@ export interface PromptUsageReceipt {
 interface LeaseState {
 	readonly requests: RequestState[];
 	active: boolean;
+	localRejectionReason?: "total-cny-ceiling" | "provider-call-limit";
+	terminalLengthRequestId?: string;
 }
 
 interface RequestState {
 	readonly id: string;
 	readonly inputPayloadBytes: number;
+	readonly maxOutputTokens: number;
 	readonly worstCny: number;
 	readonly rates: { input: number; cacheRead: number; output: number };
 	status: "reserved" | "settled" | "unknown";
@@ -63,6 +70,8 @@ interface RequestState {
 /** Host-only accounting evidence. Encrypt before persistence; never log or expose to a model. */
 export interface CampaignRequestAudit {
 	requestId: string; inputPayloadBytes: number; reservedCny: number;
+	/** Absent only in older sealed carry rows. The actual HTTP output cap when present. */
+	maxOutputTokens?: number;
 	status: "reserved" | "settled" | "unknown";
 	settledCny: number | null; unknownHeldCny: number | null;
 	reportedUsage: RequestState["reportedUsage"] | null;
@@ -170,10 +179,39 @@ export class DeepSeekCampaignBudget {
 		return lease;
 	}
 
+	/** Largest cap this exact serialized payload can afford, including the margin and all prior holds. */
+	affordableOutputTokens(payloadBytes: number): number {
+		if (!count(payloadBytes)) throw new HarnessError("runner.campaign", "provider payload byte count is unavailable");
+		const available = this.limits.maxCny - this.committedCny();
+		const inputCny = payloadBytes * Math.max(this.rates.input, this.rates.cacheRead) / 1_000_000;
+		const marginCny = this.limits.outputAccountingMarginTokens * this.rates.output / 1_000_000;
+		const raw = Math.floor((available - inputCny - marginCny) * 1_000_000 / this.rates.output);
+		let cap = Math.min(this.limits.maxOutputTokens, Math.max(0, raw));
+		// A decimal rounding edge may make the floor one token too high. Admission
+		// also accounts for the encrypted carry's upward nanocurrency rounding.
+		while (cap > 0 && !this.withinCeiling(this.worstCny(payloadBytes, cap))) cap--;
+		return cap;
+	}
+
+	private withinCeiling(nextCny: number): boolean {
+		const nano = (amount: number): number => Math.ceil(amount * 1_000_000_000);
+		const pieces = [this.limits.priorCommittedCny, this.settledCny, this.inFlightReservedCny,
+			this.unknownReservedCny, nextCny].map(nano);
+		return pieces.every(Number.isSafeInteger) && Number.isSafeInteger(nano(this.limits.maxCny)) &&
+			pieces.reduce((sum, amount) => sum + amount, 0) <= nano(this.limits.maxCny) &&
+			this.committedCny() + nextCny <= this.limits.maxCny;
+	}
+
+	private worstCny(payloadBytes: number, maxOutputTokens: number): number {
+		return (payloadBytes * Math.max(this.rates.input, this.rates.cacheRead) +
+			(maxOutputTokens + this.limits.outputAccountingMarginTokens) * this.rates.output) / 1_000_000;
+	}
+
 	/** Called synchronously by onPayload, before the HTTP request can begin. */
-	reserve(lease: PromptLease, payloadBytes: number, providerRequestId: string): void {
+	reserve(lease: PromptLease, payloadBytes: number, providerRequestId: string, maxOutputTokens = this.limits.maxOutputTokens): void {
 		const state = this.leases.get(lease);
-		if (!state?.active || this.stopped || !count(payloadBytes) || typeof providerRequestId !== "string" || !providerRequestId) {
+		if (!state?.active || this.stopped || !count(payloadBytes) || !count(maxOutputTokens) ||
+			maxOutputTokens > this.limits.maxOutputTokens || typeof providerRequestId !== "string" || !providerRequestId) {
 			this.stop("payload-boundary");
 			throw new HarnessError("runner.campaign", "provider payload byte count is unavailable");
 		}
@@ -183,13 +221,14 @@ export class DeepSeekCampaignBudget {
 			throw new HarnessError("runner.campaign", "provider request ID was already reserved");
 		}
 		const next = this.reservations + 1;
-		const worstCny = (payloadBytes * Math.max(this.rates.input, this.rates.cacheRead) +
-			(this.limits.maxOutputTokens + this.limits.outputAccountingMarginTokens) * this.rates.output) / 1_000_000;
+		const worstCny = this.worstCny(payloadBytes, maxOutputTokens);
 		if (next > this.limits.maxProviderCalls || state.requests.length + 1 > this.limits.maxProviderCallsPerPrompt) {
+			state.localRejectionReason = "provider-call-limit";
 			this.stop("provider-call-limit");
 			throw new HarnessError("runner.campaign", "campaign provider call limit exhausted");
 		}
-		if (!Number.isFinite(worstCny) || this.committedCny() + worstCny > this.limits.maxCny) {
+		if (!Number.isFinite(worstCny) || !this.withinCeiling(worstCny)) {
+			state.localRejectionReason = "total-cny-ceiling";
 			this.stop("total-cny-ceiling");
 			throw new HarnessError("runner.campaign", "campaign global CNY total exhausted");
 		}
@@ -197,10 +236,31 @@ export class DeepSeekCampaignBudget {
 		this.grossReservedCny += worstCny;
 		this.inFlightReservedCny += worstCny;
 		this.requestIds.add(providerRequestId);
-		const request = { id: providerRequestId, inputPayloadBytes: payloadBytes, worstCny,
+		const request = { id: providerRequestId, inputPayloadBytes: payloadBytes, maxOutputTokens, worstCny,
 			rates: { ...this.rates }, status: "reserved" as const };
 		state.requests.push(request);
 		this.auditRequests.push(request);
+	}
+
+	/** Evidence is limited to this live lease; no caller-created status can certify it. */
+	certifySettledLocalBudgetStop(lease: PromptLease, effectScope: HostEffectScope | undefined): HarnessError | undefined {
+		const state = this.leases.get(lease);
+		if (!effectScope || !state?.active || !state.localRejectionReason || state.requests.length === 0 ||
+			state.requests.some((request) => request.status !== "settled")) return undefined;
+		return certifySettledLocalAdmissionStop({ settledProviderRequestCount: state.requests.length,
+			rejectedBeforeTransport: true, stopReason: state.localRejectionReason, effectScope },
+			`${state.localRejectionReason === "total-cny-ceiling" ? "campaign global CNY total exhausted" : "campaign provider call limit exhausted"} after settled provider requests; next request was rejected before transport`);
+	}
+
+	/** A received length response is incomplete, even when every provider charge is settled. */
+	certifySettledTerminalResponse(lease: PromptLease, effectScope: HostEffectScope | undefined): HarnessError | undefined {
+		const state = this.leases.get(lease);
+		if (!effectScope || !state?.active || !state.terminalLengthRequestId || state.requests.length === 0 ||
+			state.requests.at(-1)?.id !== state.terminalLengthRequestId ||
+			state.requests.some((request) => request.status !== "settled")) return undefined;
+		return certifySettledTerminalResponse({ settledProviderRequestCount: state.requests.length,
+			responseReceived: true, terminalStopReason: "length", taskComplete: false, effectScope },
+			"provider length response received and settled; research task remains incomplete");
 	}
 
 	private committedCny(): number { return this.limits.priorCommittedCny + this.settledCny + this.inFlightReservedCny + this.unknownReservedCny; }
@@ -263,7 +323,7 @@ export class DeepSeekCampaignBudget {
 			!usage || ![usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.totalTokens]
 				.every((value) => Number.isSafeInteger(value) && value! >= 0) ||
 			usage.totalTokens !== input + usage.output! || input <= 0 || usage.output! <= 0 ||
-			input > request.inputPayloadBytes || usage.output! > this.limits.maxOutputTokens + this.limits.outputAccountingMarginTokens ||
+			input > request.inputPayloadBytes || usage.output! > request.maxOutputTokens + this.limits.outputAccountingMarginTokens ||
 			!(["stop", "toolUse", "length"] as Array<string | undefined>).includes(event.stopReason)) {
 			this.markUnknown(request, false, observedEstimateCny);
 			this.stop("usage-reconciliation");
@@ -300,6 +360,9 @@ export class DeepSeekCampaignBudget {
 	stopAfterTerminalLength(lease: PromptLease, requestId: string, event: UsageEvent): void {
 		if (event.stopReason !== "length") throw new HarnessError("runner.campaign", "terminal length stop requires a length response");
 		this.settleReported(lease, requestId, event);
+		const state = this.leases.get(lease);
+		if (state?.active && state.requests.find((request) => request.id === requestId)?.status === "settled")
+			state.terminalLengthRequestId = requestId;
 		this.stop("prompt-failure");
 	}
 
@@ -382,6 +445,7 @@ export class DeepSeekCampaignBudget {
 		unknownReservedCny: number; inFlightReservedCny: number; reservations: number } {
 		return { requests: this.auditRequests.map(request => ({
 			requestId: request.id, inputPayloadBytes: request.inputPayloadBytes,
+			maxOutputTokens: request.maxOutputTokens,
 			reservedCny: request.worstCny, status: request.status,
 			settledCny: request.settledCny ?? null,
 			unknownHeldCny: request.unknownHeldCny ?? null,

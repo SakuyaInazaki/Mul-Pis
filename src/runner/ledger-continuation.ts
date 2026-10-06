@@ -50,6 +50,9 @@ export type AuthenticatedPriorCarryProof = Readonly<{
 	priorCommittedCny: number; priorUnknownHeldCny: number; admittedCurrent: Readonly<Source>;
 }>;
 const authenticatedCarryProofs = new WeakSet<object>();
+const authenticatedCarryAncestors = new WeakMap<object, ReadonlyArray<Readonly<{
+	source: Readonly<Source>; envelopeSha256: string;
+}>>>();
 const claimedActionsAdmissions = new Set<string>();
 export type ActionsCarryRestartClaim = Readonly<{
 	claimId: string; currentRunId: string; currentRunAttempt: number; currentCommit: string;
@@ -59,6 +62,23 @@ export type ActionsCarryRestartClaim = Readonly<{
 /** Reject copied, deserialized or model-authored objects; only this live verifier may attest a carry. */
 export function isAuthenticatedPriorCarryProof(value: unknown): value is AuthenticatedPriorCarryProof {
 	return Boolean(value) && typeof value === "object" && authenticatedCarryProofs.has(value as object);
+}
+
+/** Authenticate an inherited receipt's exact origin against the already verified
+ * complete carry ancestry, including the latest prior carry itself. This says
+ * nothing about settlement or scientific acceptance of the referenced attempt.
+ */
+export function authenticatedPriorCarryBindsAncestor(proof: unknown, source: unknown, envelopeSha256: unknown): boolean {
+	if (!isAuthenticatedPriorCarryProof(proof) || !record(source) ||
+		!exactKeys(source, ["runId", "runAttempt", "commit", ...(source.runNumber === undefined ? [] : ["runNumber"])]) ||
+		!positiveId(source.runId) || !Number.isSafeInteger(source.runAttempt) || Number(source.runAttempt) <= 0 ||
+		typeof source.commit !== "string" || !/^[0-9a-f]{40}$/.test(source.commit) ||
+		(source.runNumber !== undefined && (!Number.isSafeInteger(source.runNumber) || Number(source.runNumber) <= 0)) ||
+		typeof envelopeSha256 !== "string" || !/^[0-9a-f]{64}$/.test(envelopeSha256)) return false;
+	return authenticatedCarryAncestors.get(proof)?.some(ancestor =>
+		ancestor.envelopeSha256 === envelopeSha256 && ancestor.source.runId === source.runId &&
+		ancestor.source.runAttempt === source.runAttempt && ancestor.source.commit === source.commit &&
+		(source.runNumber === undefined || ancestor.source.runNumber === source.runNumber)) ?? false;
 }
 
 /** Canonicalize only the fixed filename map; file contents remain exact UTF-8 strings. */
@@ -138,10 +158,13 @@ function validAudit(value: unknown, settledNano: number, unknownNano: number): v
 	let settled = 0, unknown = 0, inFlight = 0;
 	for (const item of a.requests) {
 		if (!record(item) || !exactKeys(item, ["requestId", "inputPayloadBytes", "reservedCny",
-			"status", "settledCny", "unknownHeldCny", "reportedUsage"]) ||
+			"status", "settledCny", "unknownHeldCny", "reportedUsage",
+			...(item.maxOutputTokens === undefined ? [] : ["maxOutputTokens"])]) ||
 			typeof item.requestId !== "string" || item.requestId.length > 128 || !item.requestId ||
 			ids.has(item.requestId) || !Number.isSafeInteger(item.inputPayloadBytes) ||
 			item.inputPayloadBytes <= 0 ||
+			(item.maxOutputTokens !== undefined &&
+				(!Number.isSafeInteger(item.maxOutputTokens) || item.maxOutputTokens < 1)) ||
 			typeof item.reservedCny !== "number" || !Number.isFinite(item.reservedCny) ||
 			item.reservedCny < 0 || item.reservedCny > MISSION_TOTAL_CNY ||
 			!["reserved", "settled", "unknown"].includes(String(item.status))) return false;
@@ -329,6 +352,7 @@ function providerDisposition(job: Job): "skipped" | "executed" {
 function priorCarryProof(input: { source: Source; current: Source; run: Run; job: Job;
 	artifactId: string; envelopeSha256: string; bundle?: PrivateContinuationBundle;
 	resultArtifact?: AuthenticatedPriorCarryProof["resultArtifact"];
+	ancestry: readonly AncestorReceipt[];
 	committedNano: number; unknownHeldNano: number }): AuthenticatedPriorCarryProof | undefined {
 	const { source, current, run, job } = input;
 	const steps = job.steps?.filter(step => step.name === "Run bounded private campaign") ?? [];
@@ -360,6 +384,9 @@ function priorCarryProof(input: { source: Source; current: Source; run: Run; job
 		admittedCurrent: Object.freeze({ ...current }),
 	});
 	authenticatedCarryProofs.add(proof);
+	authenticatedCarryAncestors.set(proof, Object.freeze(input.ancestry.map(ancestor => Object.freeze({
+		source: Object.freeze({ ...ancestor.source }), envelopeSha256: ancestor.envelopeDigest,
+	}))));
 	return proof;
 }
 async function oneArtifact(runId: string, token: string, request: typeof fetch,
@@ -556,7 +583,7 @@ export async function openLedgerContinuation(input: {
 	const proof = latestSource ? priorCarryProof({ source: latestSource, current: currentSource,
 		...executedMetadata.get(latestSource.runId)!, artifactId: loadedArtifacts.get(latestSource.runId)!,
 		resultArtifact: resultArtifacts.get(latestSource.runId),
-		envelopeSha256: parentDigest, bundle: priorPrivateBundle, committedNano, unknownHeldNano }) : undefined;
+		ancestry, envelopeSha256: parentDigest, bundle: priorPrivateBundle, committedNano, unknownHeldNano }) : undefined;
 	if (priorPrivateBundle) Object.freeze(priorPrivateBundle);
 	if (priorBootstrapBinding) Object.freeze(priorBootstrapBinding);
 	let sealed = false;

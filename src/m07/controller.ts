@@ -13,6 +13,7 @@ import { isTextFile, mediaType } from "../media.ts";
 import { sessionSpec, type StageContext } from "../stages/context.ts";
 import { isSafeRelativeOutputPath, resolveExpectedOutputFiles } from "./expected-output.ts";
 import type { BeginGoalInput, CurrentGoal, DecisionInput, EvidenceFile, FinishInput, HostStopReasonKind, HostStopReceipt, InterruptInput, M07CheckpointRecord, M07Controller, M07TaskRecord, TaskCheck, TaskReviewInput, TaskSpecInput, M07OperationV1 } from "./types.ts";
+import { settledLocalAdmissionStopDetails, settledTerminalResponseDetails } from "../runner/operation-disposition.ts";
 import type { StageRunRecord } from "../types.ts";
 import { loadActiveBudgetPolicy, projectInline, validateActiveBudgetPointer, validateBudgetPolicy, type BudgetPolicy } from "../improvement/policy.ts";
 import { capturedRunBytes, DEFAULT_PROJECTION_SNAPSHOT_LIMITS, newProjectionEvent, nextProjectionOrdinal, writeProjectionEvent, type ProjectionEventV1, type ProjectionMaterialV1, type ProjectionSnapshotLimits } from "../improvement/observations.ts";
@@ -1052,13 +1053,57 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				task.status = "failed"; task.executionFailure = (error as Error).message;
 				if (error instanceof TaskDeadlineError) task.loopStopReason = "deadline";
 				if (activeOperation?.status === "prepared") activeOperation.status = "not-issued";
-				if (activeOperation && promptIssued && activeOperation.status === "issued") activeOperation.status = "unknown";
+				if (activeOperation && promptIssued && activeOperation.status === "issued") {
+					const localStop = settledLocalAdmissionStopDetails(error);
+					const terminalResponse = settledTerminalResponseDetails(error);
+					let confinedGrantVerified = false;
+					if ((localStop || terminalResponse) && handle && ctx.runner.attestConfinedGrant) {
+						try {
+							const grant = await ctx.runner.attestConfinedGrant(handle);
+							confinedGrantVerified = grant?.version === 1 && grant.kind === "confined-campaign-files" &&
+								await realpath(grant.root) === await realpath(task.workDir);
+						} catch { /* A missing or failed live grant attestation leaves the operation unknown. */ }
+					}
+					if (localStop?.effectScope === "factory-attested-confined-file-tools" && confinedGrantVerified) {
+						try {
+							const receiptPath = path.join(dir, "local-admission-stop-receipt.json");
+							await writeFileAtomic(receiptPath, `${JSON.stringify({ version: 1,
+								kind: "m07-partial-settled-local-admission-stop", goalRunId: runId,
+								taskId: id, operationId: activeOperation.id,
+								settledProviderRequestCount: localStop.settledProviderRequestCount,
+								rejectedBeforeTransport: true, stopReason: localStop.stopReason,
+								effectScope: localStop.effectScope,
+								observedAt: nowIso() }, null, 2)}\n`);
+							activeOperation.status = "partial-settled";
+							activeOperation.resolvedAt = nowIso();
+							activeOperation.observationMethod = "host-local-admission-rejection";
+							activeOperation.evidencePath = receiptPath;
+							task.loopStopReason = "budget-boundary";
+						} catch { activeOperation.status = "unknown"; }
+					} else if (terminalResponse?.effectScope === "factory-attested-confined-file-tools" && confinedGrantVerified) {
+						try {
+							const receiptPath = path.join(dir, "terminal-response-receipt.json");
+							await writeFileAtomic(receiptPath, `${JSON.stringify({ version: 1,
+								kind: "m07-incomplete-settled-terminal-response", goalRunId: runId,
+								taskId: id, operationId: activeOperation.id,
+								settledProviderRequestCount: terminalResponse.settledProviderRequestCount,
+								responseReceived: true, terminalStopReason: "length", taskComplete: false,
+								effectScope: terminalResponse.effectScope,
+								observedAt: nowIso() }, null, 2)}\n`);
+							activeOperation.status = "terminal-response-incomplete";
+							activeOperation.resolvedAt = nowIso();
+							activeOperation.observationMethod = "host-terminal-response";
+							activeOperation.evidencePath = receiptPath;
+							task.loopStopReason = "output-limit";
+						} catch { activeOperation.status = "unknown"; }
+					} else activeOperation.status = "unknown";
+				}
 			} finally {
 				if (handle) {
 					if (task.mode === "execute" && task.status === "returned") {
 						try {
 							if (!ctx.runner.checkpoint) throw new HarnessError("m07.branch-unsupported", "runner has no stable checkpoint capability");
-							if (goal.executionState?.operations.some((item) => !["response-received", "confirmed", "not-issued"].includes(item.status))) throw new HarnessError("m07.branch", "external operation is not settled");
+							if (goal.executionState?.operations.some((item) => !["response-received", "partial-settled", "terminal-response-incomplete", "confirmed", "not-issued"].includes(item.status))) throw new HarnessError("m07.branch", "external operation is not settled");
 							const frozen = await freezeBranchWork(goal, task);
 							const checkpoint = await ctx.runner.checkpoint(handle, { inputManifest: frozen.manifestPath, runId, taskId: id, externalOperationsSettled: true });
 							task.branchSource = { version: 1, checkpoint, manifestPath: frozen.manifestPath, workSnapshotRoot: frozen.workSnapshotRoot, problemSnapshotCopy: frozen.problemSnapshotCopy };

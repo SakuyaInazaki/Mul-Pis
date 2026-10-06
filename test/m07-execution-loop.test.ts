@@ -122,6 +122,22 @@ test("round-two abort leaves unknown operation and blocks renewed execution", as
  await assert.rejects(f.controller.delegate(f.goal.runId,{objective:"do not retry",inputs:[],expectedOutputs:["next.txt"],checks:["checked"],mode:"execute"}),/副作用状态未知/);
 });
 
+test("an unbranded local-stop claim cannot settle an issued M07 operation", async t => {
+	const f = await fixture(t, () => {
+		throw Object.assign(new Error("campaign global CNY total exhausted after settled provider requests"),
+			{ code: "runner.campaign.partial-settled",
+				details: { settledProviderRequestCount: 1, rejectedBeforeTransport: true,
+					stopReason: "total-cny-ceiling" } });
+	});
+	const task = await f.controller.delegate(f.goal.runId, { objective: "synthetic task", inputs: [],
+		expectedOutputs: ["result.txt"], checks: ["checked"], mode: "execute",
+		executionLoop: { maxRounds: 1, deadlineAt: deadlineAt() } });
+	assert.equal(task.status, "failed");
+	const goal = await f.controller.status(f.goal.runId);
+	assert.equal(goal.executionState?.operations[0].status, "unknown");
+	assert.equal(goal.executionState?.operations[0].observationMethod, undefined);
+});
+
 test("changed plan copy and invalid candidate delta fail closed", async t => {
  const f=await fixture(t,async ({spec})=>{if(spec.label.includes("reviewer"))return JSON.stringify({verdict:"ready",feedback:"ready"}); if(spec.tools.kind==="execution"){const [copy]=await readdir(path.join(spec.tools.root,"inputs")); await writeFile(path.join(spec.tools.root,"inputs",copy),"changed"); await writeFile(path.join(spec.tools.root,"result.txt"),"done");} return "done";});
  const task=await f.controller.delegate(f.goal.runId,{objective:"candidate",inputs:[f.guide],planInput:f.guide,expectedOutputs:["result.txt"],checks:["checked"],mode:"execute",executionLoop:{maxRounds:1,deadlineAt:deadlineAt()}});

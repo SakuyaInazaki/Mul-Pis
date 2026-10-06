@@ -27,6 +27,7 @@ import { summarizeUsage, usageEventsFromEntries } from "./usage.ts";
 import { sampleRunnerResources, sessionClosed, sessionOpened } from "./resource.ts";
 import { DeepSeekCampaignBudget, type PromptLease } from "./deepseek-campaign.ts";
 import { getConfinedCampaignFileGrantDescriptor } from "./confined-campaign-files.ts";
+import type { HostEffectScope } from "./operation-disposition.ts";
 
 const SCRATCH_PREFIX = ".pi-session-";
 const EMPTY_AGENT_DIR = ".empty-agent-dir";
@@ -700,6 +701,8 @@ export class PiSessionRunner implements SessionRunner {
 		let strictPayloadChecks = 0;
 		let currentLease: PromptLease | undefined;
 		let currentRequestIds: string[] = [];
+		let certifiedLocalStop: HarnessError | undefined;
+		let certifiedEffectScope: HostEffectScope | undefined;
 		const requestRuntime = strict ? new Proxy(resolved.modelRuntime, {
 			get(target, property) {
 				if (property !== "streamSimple") {
@@ -727,17 +730,42 @@ export class PiSessionRunner implements SessionRunner {
 									(record.max_completion_tokens !== undefined && record.max_completion_tokens !== strict.maxOutputTokens))) {
 								throw new HarnessError("runner.model", "strict request output cap missing or inconsistent in provider payload");
 							}
-							const serialized = JSON.stringify(payload);
+							let outgoing: unknown = payload;
+							let outputCap = strict.maxOutputTokens;
+							if (campaign && outputCap !== undefined) {
+								// The pinned SDK invokes onPayload before HTTP transport and sends its
+								// returned object. Start with the provider minimum of one output token,
+								// then choose the largest cap affordable under the one global ledger.
+								const adapted = { ...record };
+								const setCap = (cap: number): void => {
+									if (record.max_tokens !== undefined) adapted.max_tokens = cap;
+									if (record.max_completion_tokens !== undefined) adapted.max_completion_tokens = cap;
+								};
+								setCap(1);
+								const minimum = JSON.stringify(adapted);
+								if (typeof minimum !== "string") throw new HarnessError("runner.model", "provider payload could not be serialized for reservation");
+								outputCap = Math.max(1, campaign.affordableOutputTokens(Buffer.byteLength(minimum, "utf8")));
+								while (true) {
+									setCap(outputCap);
+									const encoded = JSON.stringify(adapted);
+									if (typeof encoded !== "string") throw new HarnessError("runner.model", "provider payload could not be serialized for reservation");
+									const affordable = campaign.affordableOutputTokens(Buffer.byteLength(encoded, "utf8"));
+									if (affordable >= outputCap || outputCap === 1) break;
+									outputCap = Math.max(1, affordable);
+								}
+								outgoing = adapted;
+							}
+							const serialized = JSON.stringify(outgoing);
 							if (typeof serialized !== "string") throw new HarnessError("runner.model", "provider payload could not be serialized for reservation");
 							const bytes = Buffer.byteLength(serialized, "utf8");
 							if (strict.maxInputPayloadBytes !== undefined && bytes > strict.maxInputPayloadBytes) throw new HarnessError("runner.model", "strict request input payload exceeds reserved byte cap");
 							if (campaign) {
 								if (!lease) throw new HarnessError("runner.campaign", "provider request has no active prompt lease");
 								requestId = randomUUID();
-								campaign.reserve(lease, bytes, requestId);
+								campaign.reserve(lease, bytes, requestId, outputCap);
 								requestIds.push(requestId);
 							}
-							return payload;
+							return outgoing;
 						},
 					});
 					// A terminal provider event must be accounted for before Pi can begin
@@ -750,6 +778,7 @@ export class PiSessionRunner implements SessionRunner {
 					let latest: AssistantMessage = { role: "assistant", content: [], api: model.api, provider: model.provider,
 						model: model.id, usage: emptyUsage, stopReason: "error", timestamp: Date.now() };
 					const failStream = (error: unknown): void => {
+						certifiedLocalStop ??= campaign.certifySettledLocalBudgetStop(lease, certifiedEffectScope);
 						campaign.failPrompt(lease);
 						outer.push({ type: "error", reason: "error", error: { ...latest, stopReason: "error", errorMessage: error instanceof Error ? error.message : String(error) } });
 						outer.end();
@@ -776,7 +805,8 @@ export class PiSessionRunner implements SessionRunner {
 								if (event.message.stopReason === "length") campaign.stopAfterTerminalLength(lease, requestId, report);
 								else campaign.settleReported(lease, requestId, report);
 							}
-							if (event.type === "error") { terminal = true; latest = event.error; campaign.failPrompt(lease); }
+							if (event.type === "error") { terminal = true; latest = event.error;
+								certifiedLocalStop ??= campaign.certifySettledLocalBudgetStop(lease, certifiedEffectScope); campaign.failPrompt(lease); }
 							outer.push(event);
 						}
 						if (!terminal) throw new HarnessError("runner.campaign", "provider stream ended without a terminal response");
@@ -829,6 +859,15 @@ export class PiSessionRunner implements SessionRunner {
 				"runner.tools",
 				`unsafe active tool set for ${spec.label}: ${active.join(",") || "(empty)"}; expected ${expected.join(",") || "(empty)"}`,
 			);
+		}
+		if (campaign && active.length === expected.length && active.every((name, index) => name === expected[index])) {
+			if (spec.tools.kind === "none" && noTools === "all" && active.length === 0 &&
+				materialTools.tools.length === 0 && materialTools.names.length === 0) certifiedEffectScope = "no-tools";
+			else if (spec.tools.kind === "custom" && noTools === "builtin") {
+				const grant = getConfinedCampaignFileGrantDescriptor(spec.tools.tools);
+				if (grant && JSON.stringify(grant) === JSON.stringify(spec.toolAuthority))
+					certifiedEffectScope = "factory-attested-confined-file-tools";
+			}
 		}
 		const sessionFile = session.sessionFile;
 		if (!sessionFile) {
@@ -902,6 +941,7 @@ export class PiSessionRunner implements SessionRunner {
 				const thisPrompt = promptIndex + 1;
 				currentLease = campaign?.beginPrompt(ref.id, `${thisPrompt}-${randomUUID()}`);
 				currentRequestIds = [];
+				certifiedLocalStop = undefined;
 				promptActive = true;
 				checkpointState.active = true;
 				checkpointState.completed = false;
@@ -949,6 +989,11 @@ export class PiSessionRunner implements SessionRunner {
 					promptOutcome = "completed";
 					return result;
 				} catch (error) {
+					const localStop = campaign && currentLease && !signal?.aborted && !abortedByHandle
+						? certifiedLocalStop ?? campaign.certifySettledLocalBudgetStop(currentLease, certifiedEffectScope) : undefined;
+					const lengthStop = campaign && currentLease && !signal?.aborted && !abortedByHandle &&
+						error instanceof HarnessError && error.code === "runner.stop" && /stopReason=length/.test(error.message)
+						? campaign.certifySettledTerminalResponse(currentLease, certifiedEffectScope) : undefined;
 					if (campaign && currentLease) campaign.failPrompt(currentLease);
 					if (abortPromise) await abortPromise;
 					if ((signal?.aborted || abortedByHandle) && !(error instanceof HarnessError && error.code === "runner.stop")) {
@@ -957,7 +1002,7 @@ export class PiSessionRunner implements SessionRunner {
 						throw new HarnessError("runner.stop", `session ${spec.label} was aborted during prompt${detail}`);
 					}
 					if (signal?.aborted || abortedByHandle) promptOutcome = "aborted";
-					throw error;
+					throw localStop ?? lengthStop ?? error;
 				} finally {
 				try {
 					collectUsage();
@@ -986,6 +1031,7 @@ export class PiSessionRunner implements SessionRunner {
 					} finally {
 						currentLease = undefined;
 						currentRequestIds = [];
+						certifiedLocalStop = undefined;
 					}
 				}
 				}

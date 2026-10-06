@@ -366,3 +366,50 @@ test("private machine feedback retains actionable failed-case diagnostics and ex
 	assert.equal(saved.registeredExperiment.reason, "Synthetic case did not complete");
 	assert.equal(saved.status, "failed");
 });
+
+test("private archive retains a controller-certified partial-settled budget stop distinctly from an unknown operation", async t => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "partial-settled-archive-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const taskDir = path.join(root, "T001"), workDir = path.join(taskDir, "work"), destination = path.join(root, "out");
+	await mkdir(workDir, { recursive: true });
+	const evidencePath = path.join(taskDir, "local-admission-stop-receipt.json");
+	await writeFile(evidencePath, JSON.stringify({ version: 1, kind: "m07-partial-settled-local-admission-stop",
+		goalRunId: "synthetic-goal", taskId: "T001", operationId: "O001",
+		settledProviderRequestCount: 1, rejectedBeforeTransport: true,
+		stopReason: "total-cny-ceiling", effectScope: "factory-attested-confined-file-tools",
+		observedAt: new Date().toISOString() }));
+	const task = { taskId: "T001", mode: "execute", workDir, status: "failed" } as M07TaskRecord;
+	const goal = { runId: "synthetic-goal", lifecycle: "active", tasks: [task],
+		executionState: { operations: [{ id: "O001", taskId: "T001", status: "partial-settled",
+			observationMethod: "host-local-admission-rejection", evidencePath }] } } as unknown as CurrentGoal;
+	const archived = await archivePrivateM07Task({ goal, task, destination });
+	assert.deepEqual(archived.controllerEvidence.operationOutcomes, [{ operationId: "O001", status: "partial-settled",
+		localStop: { settledProviderRequestCount: 1, rejectedBeforeTransport: true,
+			stopReason: "total-cny-ceiling", effectScope: "factory-attested-confined-file-tools" } }]);
+	assert.deepEqual((await loadPrivateM07Archive(destination)).archive.controllerEvidence.operationOutcomes,
+		archived.controllerEvidence.operationOutcomes);
+});
+
+test("private archive retains a settled but truncated terminal response without claiming task completion", async t => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "terminal-response-archive-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const taskDir = path.join(root, "T001"), workDir = path.join(taskDir, "work"), destination = path.join(root, "out");
+	await mkdir(workDir, { recursive: true });
+	const evidencePath = path.join(taskDir, "terminal-response-receipt.json");
+	await writeFile(evidencePath, JSON.stringify({ version: 1, kind: "m07-incomplete-settled-terminal-response",
+		goalRunId: "synthetic-goal", taskId: "T001", operationId: "O001",
+		settledProviderRequestCount: 1, responseReceived: true, terminalStopReason: "length",
+		taskComplete: false, effectScope: "factory-attested-confined-file-tools",
+		observedAt: new Date().toISOString() }));
+	const task = { taskId: "T001", mode: "execute", workDir, status: "failed" } as M07TaskRecord;
+	const goal = { runId: "synthetic-goal", lifecycle: "active", tasks: [task],
+		executionState: { operations: [{ id: "O001", taskId: "T001", status: "terminal-response-incomplete",
+			observationMethod: "host-terminal-response", evidencePath }] } } as unknown as CurrentGoal;
+	const archived = await archivePrivateM07Task({ goal, task, destination });
+	assert.deepEqual(archived.controllerEvidence.operationOutcomes, [{ operationId: "O001", status: "terminal-response-incomplete",
+		terminalResponse: { settledProviderRequestCount: 1, responseReceived: true,
+			terminalStopReason: "length", taskComplete: false,
+			effectScope: "factory-attested-confined-file-tools" } }]);
+	assert.deepEqual((await loadPrivateM07Archive(destination)).archive.controllerEvidence.operationOutcomes,
+		archived.controllerEvidence.operationOutcomes);
+});
