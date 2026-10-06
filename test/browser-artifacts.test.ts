@@ -36,7 +36,8 @@ describe("browser artifacts", () => {
 	});
 
 	it("captures changed same-URL states and links without network access", async () => {
-		const python = path.resolve(".venv/bin/python");
+		// This fixture uses only the standard library; a clean CI checkout has no project .venv.
+		const python = process.env.PYTHON ?? "python3";
 		const testFile = path.resolve("tools/py/test_browser_artifacts.py");
 		const { stdout, stderr } = await execFileAsync(python, ["-I", testFile], { cwd: path.resolve(".") });
 		assert.match(`${stdout}${stderr}`, /Ran 5 tests/);

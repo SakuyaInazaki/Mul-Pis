@@ -161,10 +161,18 @@ test("M09 allows new verification outputs but rejects overwrite or deletion of o
 
 test("controlled reproduction command honors cancellation and records an aborted run", async (t) => {
 	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-m09-abort-")); t.after(async () => rm(root, { recursive: true, force: true }));
-	const marker = path.join(root, "should-not-exist.txt"); const logs = path.join(root, "logs"); const records = new Map<number, ReproductionRecord>();
-	const command = `node -e "setTimeout(() => require('fs').writeFileSync(${JSON.stringify(marker)}, 'late'), 500)"`;
+	const marker = path.join(root, "should-not-exist.txt"); const ready = path.join(root, "child-started.txt"); const logs = path.join(root, "logs"); const records = new Map<number, ReproductionRecord>();
+	const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+	const source = `const fs = require("node:fs"); fs.writeFileSync(${JSON.stringify(ready)}, "ready"); setTimeout(() => fs.writeFileSync(${JSON.stringify(marker)}, "late"), 500)`;
+	const command = `${shellQuote(process.execPath)} -e ${shellQuote(source)}`;
 	const tool = createReproductionTool([command], root, logs, records);
-	const controller = new AbortController(); const running = tool.execute({ index: 0 }, controller.signal); setTimeout(() => controller.abort(), 50);
+	const controller = new AbortController(); const running = tool.execute({ index: 0 }, controller.signal);
+	let started = false;
+	for (let attempt = 0; attempt < 200; attempt++) {
+		try { await access(ready); started = true; break; } catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
+	}
+	assert.ok(started, "child must execute valid JavaScript before cancellation");
+	controller.abort();
 	await running; const record = records.get(0)!;
 	assert.equal(record.exitCode, null); assert.match(record.stderr, /已取消/); assert.equal(JSON.parse(await readFile(record.logPath, "utf8")).exitCode, null);
 	await new Promise((resolve) => setTimeout(resolve, 650)); await assert.rejects(access(marker));
