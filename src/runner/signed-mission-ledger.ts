@@ -7,7 +7,7 @@ export const MISSION_ID = "mul-pis-private-original-objective-2026-10-05";
 export const MISSION_REPOSITORY = "SakuyaInazaki/Mul-Pis";
 export const MISSION_TOTAL_CNY = 30;
 export const MISSION_ARTIFACT = "confidential-campaign-envelope";
-export const ONE_USE_PUSH_MARKER = "Continue workflow with budget-aware requests and settled-stop recovery (mul-pis-20261006-recovery-run3)";
+export const ONE_USE_PUSH_MARKER = "Resume workflow with verified native CNY pricing and explicit admission feedback (mul-pis-20261006-recovery-run4)";
 export const PRIVATE_CONTINUATION_FILE_KEYS = ["candidate.cpp", "verification.json",
 	"objective-checkpoint.json", "workflow-archive.json", "m04-export.json",
 	"m04-adopted-knowledge.json", "assessment-receipts.json",

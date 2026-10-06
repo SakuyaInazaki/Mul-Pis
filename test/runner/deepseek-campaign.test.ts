@@ -7,7 +7,8 @@ import { createAgentSession, ModelRuntime, type CreateAgentSessionOptions } from
 import { createAssistantMessageEventStream, type Model } from "@earendil-works/pi-ai";
 import { DeepSeekCampaignBudget, isSettledLocalCampaignBudgetStop, settledLocalCampaignBudgetStopDetails,
 	type DeepSeekCampaignLimits } from "../../src/runner/deepseek-campaign.ts";
-import { isSettledTerminalResponse, settledTerminalResponseDetails } from "../../src/runner/operation-disposition.ts";
+import { isLocalNotIssued, localNotIssuedDetails, isSettledTerminalResponse,
+	settledTerminalResponseDetails } from "../../src/runner/operation-disposition.ts";
 import { createConfinedCampaignFileTools } from "../../src/runner/confined-campaign-files.ts";
 import { PiSessionRunner } from "../../src/runner/pi.ts";
 import { openBoundedSession } from "../../src/context/boundary.ts";
@@ -1034,6 +1035,19 @@ test("real Pi tool request uses the synthetic runtime key at the fixed DeepSeek 
 		assert.equal(dynamic.requestAuditSnapshot().requests[0].maxOutputTokens, sentCaps[1]);
 		assert.equal(dynamic.requestAuditSnapshot().requests[0].inputPayloadBytes, transportPayloadBytes);
 		assert(dynamic.snapshot().grossReservedCny <= dynamic.limits.maxCny);
+		handle.dispose();
+		const rejected = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: minCost / 2,
+			maxProviderCalls: 1, maxProviderCallsPerPrompt: 1, maxOutputTokens: 32 });
+		handle = await new PiSessionRunner({ modelRuntime: runtime, campaignBudget: rejected })
+			.create(spec(sessions, "real-pi-not-issued", { kind: "custom", tools }));
+		let denied: unknown;
+		try { await handle.prompt("Offline authentication check."); } catch (error) { denied = error; }
+		assert.equal(isLocalNotIssued(denied), true);
+		assert.equal(calls.length, 2, "zero-admitted rejection must never reach fake HTTP transport");
+		assert.equal(rejected.snapshot().reservations, 0);
+		assert.equal(rejected.snapshot().admissionRejection?.requestNotSent, true);
+		assert.equal(rejected.requestAuditSnapshot().admissionRejections[0].requestNotSent, true);
+		assert.equal(rejected.requestAuditSnapshot().admissionRejections[0].decision, "input-unaffordable");
 	} finally {
 		handle?.dispose();
 		globalThis.fetch = originalFetch;
@@ -1238,4 +1252,62 @@ test("M07 persists a real runner's certified partial-settled disposition without
 	assert.equal(budget.snapshot().settledCny > 0, true);
 	assert.equal(budget.snapshot().unknownReservedCny, 0);
 	assert.equal(budget.snapshot().reservations, 1);
+});
+
+test("M07 records no operation issued when its first request is locally refused before transport", async (t) => {
+	const dir = await mkdtemp(path.join(tmpdir(), "m07-campaign-no-transport-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const ws = new Workspace(dir);
+	await mkdir(path.dirname(ws.problemFile), { recursive: true });
+	await writeFile(ws.problemFile, "Synthetic bounded problem\n");
+	const store = createFileKnowledgeStore(ws.knowledgeDir);
+	await store.init();
+	const baseline = await ws.startRun("M04", [{ label: "problem", path: ws.problemFile }]);
+	await ws.finishRun(baseline, "completed");
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 0.25 });
+	let transports = 0;
+	const runtime = {
+		getModels: () => [MODEL],
+		async streamSimple(model: Model<"openai-completions">, _context: unknown,
+			options: { onPayload?: (payload: unknown, model: Model<"openai-completions">) => Promise<unknown> }) {
+			await options.onPayload?.({ model: model.id,
+				messages: [{ role: "user", content: "x".repeat(100_000) }], max_tokens: LIMITS.maxOutputTokens }, model);
+			transports++;
+		},
+	} as unknown as ModelRuntime;
+	const actual = new PiSessionRunner({ modelRuntime: runtime, createSession: offlineFactory(1), campaignBudget: budget });
+	const runner: SessionRunner = {
+		create: async (requested) => actual.create({ ...requested, tools: requested.tools.kind === "execution"
+			? { kind: "custom", tools: await createConfinedCampaignFileTools(requested.tools.root,
+				{ writableFiles: ["result.txt"] }) } : requested.tools }),
+		resume: (ref) => actual.resume(ref),
+		attestConfinedGrant: (handle) => actual.attestConfinedGrant(handle),
+	};
+	const controller = createM07Controller({ ws, store, runner, config: {
+		roles: { execution: LIMITS.model, reviewer: LIMITS.model }, concurrency: 1, tools: {},
+	} } as StageContext);
+	const goal = await controller.begin({ goal: "Synthetic bounded candidate", problemRelation: "direct",
+		constraints: ["keep the plan"], successCriteria: ["checked"], plan: "one candidate" });
+	const task = await controller.delegate(goal.runId, { objective: "produce candidate", inputs: [],
+		expectedOutputs: ["result.txt"], checks: ["checked"], mode: "execute",
+		executionLoop: { maxRounds: 1, deadlineAt: new Date(Date.now() + 60_000).toISOString() } });
+	assert.equal(task.status, "failed");
+	const operation = (await controller.status(goal.runId)).executionState?.operations.find(entry => entry.taskId === task.taskId);
+	assert.equal(operation?.status, "not-issued");
+	assert.equal(operation?.observationMethod, "host-local-admission-rejection");
+	assert(operation.evidencePath);
+	const receipt = JSON.parse(await readFile(operation.evidencePath, "utf8"));
+	assert.equal(receipt.requestNotSent, true);
+	assert.equal(receipt.settledProviderRequestCount, 0);
+	assert.equal(receipt.effectScope, "factory-attested-confined-file-tools");
+	assert.equal(receipt.admissionDecision, "input-unaffordable");
+	assert.equal(transports, 0);
+	assert.equal(budget.snapshot().reservations, 0);
+	assert.equal(budget.snapshot().unknownReservedCny, 0);
+	const diagnostic = budget.requestAuditSnapshot().admissionRejections[0];
+	assert.equal(diagnostic.requestNotSent, true);
+	assert.equal(diagnostic.decision, "input-unaffordable");
+	assert(diagnostic.inputUpperCny > diagnostic.availableCny);
+	assert(!JSON.stringify(diagnostic).includes("xxxxx"));
+	assert.equal(localNotIssuedDetails(new Error("runner.campaign.not-issued")), undefined);
 });

@@ -1,7 +1,8 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { inflateRawSync } from "node:zlib";
 import { HarnessError } from "../types.ts";
-import type { CampaignRequestAudit } from "./deepseek-campaign.ts";
+import type { CampaignAdmissionRejection, CampaignRequestAudit } from "./deepseek-campaign.ts";
+import { isNativeCnyPricingRecord, type NativeCnyPricingProfile } from "./deepseek-cny-pricing.ts";
 import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY,
 	MISSION_TOTAL_CNY, ONE_USE_PUSH_MARKER, PRIVATE_CONTINUATION_FILE_KEYS } from "./signed-mission-ledger.ts";
 import type { BootstrapBinding, PrivateContinuationBundle } from "./signed-mission-ledger.ts";
@@ -99,7 +100,9 @@ type AncestorReceipt = Pick<Checkpoint, "parentDigest" | "source" | "committedNa
 	"unknownHeldNano" | "settledAddedNano" | "unknownAddedNano" | "requestAudit" | "bootstrapBinding"> &
 	{ envelopeDigest: string };
 export type RequestAuditSnapshot = { requests: CampaignRequestAudit[]; settledCny: number;
-	unknownReservedCny: number; inFlightReservedCny: number; reservations: number };
+	unknownReservedCny: number; inFlightReservedCny: number; reservations: number;
+	/** Absent in earlier encrypted carries. */ admissionRejections?: CampaignAdmissionRejection[];
+	/** Verified-at-run native CNY source metadata, without balances. */ pricingProfile?: NativeCnyPricingProfile };
 function reject(reason: string): never { throw new HarnessError("runner.ledger-continuation", reason); }
 function record(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -146,10 +149,42 @@ function sameBinding(a: BootstrapBinding | undefined, b: BootstrapBinding): bool
 }
 function validAudit(value: unknown, settledNano: number, unknownNano: number): value is RequestAuditSnapshot {
 	if (!record(value) || !exactKeys(value, ["requests", "settledCny", "unknownReservedCny",
-		"inFlightReservedCny", "reservations"]) || !Array.isArray(value.requests) ||
+		"inFlightReservedCny", "reservations", ...(value.admissionRejections === undefined ? [] : ["admissionRejections"]),
+		...(value.pricingProfile === undefined ? [] : ["pricingProfile"])]) || !Array.isArray(value.requests) ||
 		value.requests.length > 1_000 || !Number.isSafeInteger(value.reservations) ||
 		value.reservations !== value.requests.length) return false;
 	const a = value as RequestAuditSnapshot;
+	if (a.pricingProfile !== undefined && !isNativeCnyPricingRecord(a.pricingProfile)) return false;
+	if (a.admissionRejections !== undefined && (!Array.isArray(a.admissionRejections) ||
+		a.admissionRejections.length > 1_000 || a.admissionRejections.some(row =>
+			!record(row) || !exactKeys(row, ["version", "kind", "decision", "requestNotSent",
+				"inputPayloadBytes", "inputUpperCny", "outputAllowanceTokens", "minimumOutputTokens",
+				"requestedOutputTokens", "outputAccountingMarginTokens", "marginUpperCny",
+				"availableCny", "requiredAtMinimumOutputCny", "globalMaxCny", "committedBeforeCny",
+				"settledProviderRequestCount", "pricingBasis"]) ||
+			row.version !== 1 || row.kind !== "campaign-admission-rejection" || row.requestNotSent !== true ||
+			!["input-unaffordable", "minimum-output-unaffordable", "requested-output-cap-unaffordable", "provider-call-limit"].includes(String(row.decision)) ||
+			![row.inputPayloadBytes, row.requestedOutputTokens, row.settledProviderRequestCount]
+				.every(x => Number.isSafeInteger(x) && x >= 0) || row.inputPayloadBytes < 1 ||
+			row.requestedOutputTokens < 1 || row.settledProviderRequestCount > a.requests.length ||
+			!Number.isSafeInteger(row.outputAllowanceTokens) || row.outputAllowanceTokens < 0 ||
+			!Number.isSafeInteger(row.outputAccountingMarginTokens) || row.outputAccountingMarginTokens < 0 ||
+			row.minimumOutputTokens !== 1 ||
+			![row.inputUpperCny, row.marginUpperCny, row.availableCny, row.requiredAtMinimumOutputCny,
+				row.globalMaxCny, row.committedBeforeCny].every(x => typeof x === "number" && Number.isFinite(x)) ||
+			[row.inputUpperCny, row.marginUpperCny, row.requiredAtMinimumOutputCny,
+				row.globalMaxCny, row.committedBeforeCny].some(x => x < 0) ||
+			!record(row.pricingBasis) || !exactKeys(row.pricingBasis, ["source", "inputCnyPerMillionTokens", "outputCnyPerMillionTokens"]) ||
+			!["higher-of-configured-and-sdk-estimates", "native-cny-peak-and-normalized-sdk-quotes"]
+				.includes(String(row.pricingBasis.source)) ||
+			(row.pricingBasis.source === "native-cny-peak-and-normalized-sdk-quotes" && !a.pricingProfile) ||
+			![row.pricingBasis.inputCnyPerMillionTokens, row.pricingBasis.outputCnyPerMillionTokens]
+				.every(x => typeof x === "number" && Number.isFinite(x) && x > 0) ||
+			row.inputUpperCny !== row.inputPayloadBytes * row.pricingBasis.inputCnyPerMillionTokens / 1_000_000 ||
+			row.marginUpperCny !== row.outputAccountingMarginTokens * row.pricingBasis.outputCnyPerMillionTokens / 1_000_000 ||
+			row.requiredAtMinimumOutputCny !== (row.inputPayloadBytes * row.pricingBasis.inputCnyPerMillionTokens +
+				(1 + row.outputAccountingMarginTokens) * row.pricingBasis.outputCnyPerMillionTokens) / 1_000_000 ||
+			row.availableCny !== row.globalMaxCny - row.committedBeforeCny))) return false;
 	if (![a.settledCny, a.unknownReservedCny, a.inFlightReservedCny].every(x =>
 		Number.isFinite(x) && x >= 0 && Number.isSafeInteger(Math.ceil(x * NANO)))) return false;
 	if (n(a.settledCny) !== settledNano ||
@@ -159,12 +194,14 @@ function validAudit(value: unknown, settledNano: number, unknownNano: number): v
 	for (const item of a.requests) {
 		if (!record(item) || !exactKeys(item, ["requestId", "inputPayloadBytes", "reservedCny",
 			"status", "settledCny", "unknownHeldCny", "reportedUsage",
-			...(item.maxOutputTokens === undefined ? [] : ["maxOutputTokens"])]) ||
+			...(item.maxOutputTokens === undefined ? [] : ["maxOutputTokens"]),
+			...(item.admissionDecision === undefined ? [] : ["admissionDecision"])]) ||
 			typeof item.requestId !== "string" || item.requestId.length > 128 || !item.requestId ||
 			ids.has(item.requestId) || !Number.isSafeInteger(item.inputPayloadBytes) ||
 			item.inputPayloadBytes <= 0 ||
 			(item.maxOutputTokens !== undefined &&
 				(!Number.isSafeInteger(item.maxOutputTokens) || item.maxOutputTokens < 1)) ||
+			(item.admissionDecision !== undefined && !["full-output", "reduced-output"].includes(String(item.admissionDecision))) ||
 			typeof item.reservedCny !== "number" || !Number.isFinite(item.reservedCny) ||
 			item.reservedCny < 0 || item.reservedCny > MISSION_TOTAL_CNY ||
 			!["reserved", "settled", "unknown"].includes(String(item.status))) return false;

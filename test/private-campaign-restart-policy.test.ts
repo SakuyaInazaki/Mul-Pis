@@ -8,6 +8,7 @@ import { PRIOR_REVIEWED_POLICY_SHA256, reviewPrivateCampaignRestartEffects } fro
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 const oldCommit = "2fe7f132370b4598c942625fad1a7e9129978eaa";
 const currentCommit = "242bb0c205ef0d6fb0bf76dd53a2c3d62e55ef66";
+const inheritedOnlyCommit = "2efc466b42757bfdc33a8c21ab053f2e786abf14";
 const oldRef = "earlier-goal/O002";
 const newRef = "latest-goal/O001";
 
@@ -58,6 +59,57 @@ function fixture() {
 			source.runAttempt === receipt.prior.source.runAttempt && source.commit === oldCommit &&
 			digest === receipt.prior.envelopeSha256 };
 	return { input, facts, bundle, receipt, claim, binding, checkpoint, setAncestor: (value: boolean) => { ancestor = value; } };
+}
+
+function inheritedOnlyFixture() {
+	const f = fixture();
+	const precedingPolicy = reviewPrivateCampaignRestartEffects(f.input);
+	const firstReservations = JSON.parse(f.bundle["independent-restart-quarantine.json"]).entries;
+	const firstBindings = JSON.parse(f.bundle["independent-restart-goal-binding.json"]).entries;
+	const source = { ...f.facts.source };
+	const secondReceipt = { version: 1, kind: "host-independent-goal-quarantine",
+		prior: { source, envelopeSha256: f.facts.envelopeSha256,
+			contractId: "original-contract", reviewedPolicyId: precedingPolicy.policyId,
+			reviewedPolicySha256: precedingPolicy.policySha256,
+			unknownHeldNano: f.facts.unknownHeldNano, committedNano: f.facts.committedNano },
+		quarantine: { operationRefs: [oldRef, newRef], operationOutcome: "unknown",
+			selectedFromFailedAttempt: false },
+		freshWorkspace: { workspaceId: "third-workspace", restartNonce: "third-nonce" } };
+	f.facts.source = { runId: "third-job", runAttempt: 1, commit: inheritedOnlyCommit };
+	f.facts.committedNano += 100_000_000;
+	const secondClaim = { claimId: "claim-third", currentJobId: "job-third",
+		priorEnvelopeSha256: secondReceipt.prior.envelopeSha256,
+		currentRunId: f.facts.source.runId, currentRunAttempt: f.facts.source.runAttempt,
+		currentCommit: f.facts.source.commit };
+	const secondBinding = { version: 1, kind: "host-independent-goal-binding",
+		quarantineReceiptSha256: hash(JSON.stringify(secondReceipt)),
+		freshWorkspace: { ...secondReceipt.freshWorkspace }, goalRunId: "partial-new-goal" };
+	f.checkpoint.boundedRuns.push({ runId: "partial-new-goal", outcome: "partial",
+		unresolvedOperationIds: [] });
+	f.bundle["objective-checkpoint.json"] = JSON.stringify(f.checkpoint);
+	f.bundle["independent-restart-quarantine.json"] = JSON.stringify({ version: 1,
+		kind: "host-independent-restart-reservations",
+		entries: [...firstReservations, { receipt: secondReceipt, claim: secondClaim }] });
+	f.bundle["independent-restart-goal-binding.json"] = JSON.stringify({ version: 1,
+		kind: "host-independent-restart-goal-bindings", entries: [...firstBindings, secondBinding] });
+	f.bundle["research-history.json"] = JSON.stringify({ version: 1,
+		kind: "untrusted-version-bound-research-history", entries: [{ goalRunId: secondBinding.goalRunId,
+			files: { "workflow-archive.json": JSON.stringify({ version: 1,
+				kind: "m07-private-candidate-archive", goalRunId: secondBinding.goalRunId,
+				goalOutcome: "partial", taskStatus: "failed", loopStopReason: "budget-boundary",
+				m04: { state: "not-run" }, controllerEvidence: { reviewStatus: "unreviewed", operationOutcomes: [{
+					operationId: "O001", status: "partial-settled",
+					localStop: { settledProviderRequestCount: 1, rejectedBeforeTransport: true,
+						stopReason: "total-cny-ceiling", effectScope: "factory-attested-confined-file-tools" },
+				}] } }) } }] });
+	f.input.bindsAncestor = (value, ancestor, envelope) => value === f.input.proof &&
+		((ancestor.runId === f.receipt.prior.source.runId &&
+			ancestor.runAttempt === f.receipt.prior.source.runAttempt &&
+			ancestor.commit === f.receipt.prior.source.commit &&
+			envelope === f.receipt.prior.envelopeSha256) ||
+			(ancestor.runId === source.runId && ancestor.runAttempt === source.runAttempt &&
+				ancestor.commit === source.commit && envelope === secondReceipt.prior.envelopeSha256));
+	return { ...f, secondReceipt, secondClaim, secondBinding };
 }
 
 test("reviewed current source plus ancestor-bound quarantine cover exactly old and new unknowns", () => {
@@ -120,4 +172,48 @@ test("extra, absent, or contradictory unknown operation references fail exact pa
 		kind: "host-independent-restart-reservations",
 		entries: [{ receipt: conflicting.receipt, claim: conflicting.claim }] });
 	assert.throws(() => reviewPrivateCampaignRestartEffects(conflicting.input), /no unique fresh-goal binding|do not partition exactly/);
+});
+
+test("inherited-only source accepts both older unknowns with two exact sealed ancestry links", () => {
+	const f = inheritedOnlyFixture();
+	const result = reviewPrivateCampaignRestartEffects(f.input);
+	assert.equal(result.sourceCommit, inheritedOnlyCommit);
+	assert.deepEqual(result.operationAttestations.map(item => item.operationRef), [oldRef, newRef]);
+	assert.deepEqual(result.operationAttestations.map(item => item.sourceCommit), [oldCommit, currentCommit]);
+	assert.equal(result.unknownBillingHeld, true);
+});
+
+test("inherited-only source rejects a new unknown, broken second link, shaved hold or unknown revision", () => {
+	const newlyUnknown = inheritedOnlyFixture();
+	newlyUnknown.checkpoint.boundedRuns.at(-1)!.unresolvedOperationIds.push("O009");
+	newlyUnknown.bundle["objective-checkpoint.json"] = JSON.stringify(newlyUnknown.checkpoint);
+	newlyUnknown.input.operationRefs.push("partial-new-goal/O009");
+	assert.throws(() => reviewPrivateCampaignRestartEffects(newlyUnknown.input), /unaccounted or newly unknown/);
+	const brokenClaim = inheritedOnlyFixture();
+	brokenClaim.secondClaim.currentRunId = "unrelated-job";
+	const entries = JSON.parse(brokenClaim.bundle["independent-restart-quarantine.json"]).entries;
+	entries[1].claim = brokenClaim.secondClaim;
+	brokenClaim.bundle["independent-restart-quarantine.json"] = JSON.stringify({ version: 1,
+		kind: "host-independent-restart-reservations", entries });
+	assert.throws(() => reviewPrivateCampaignRestartEffects(brokenClaim.input), /claims do not form/);
+	const shaved = inheritedOnlyFixture();
+	shaved.facts.unknownHeldNano -= 1;
+	assert.throws(() => reviewPrivateCampaignRestartEffects(shaved.input), /release unknown billing/);
+	const unreviewed = inheritedOnlyFixture();
+	unreviewed.facts.source.commit = "e".repeat(40);
+	assert.throws(() => reviewPrivateCampaignRestartEffects(unreviewed.input), /outside reviewed scope/);
+});
+
+test("inherited-only source requires a certified confined local-stop archive", () => {
+	const missing = inheritedOnlyFixture();
+	delete missing.bundle["research-history.json"];
+	assert.throws(() => reviewPrivateCampaignRestartEffects(missing.input), /lacks host archive history/);
+	const wrongScope = inheritedOnlyFixture();
+	const history = JSON.parse(wrongScope.bundle["research-history.json"]);
+	const archive = JSON.parse(history.entries[0].files["workflow-archive.json"]);
+	archive.controllerEvidence.operationOutcomes[0].localStop.effectScope = "unverified";
+	history.entries[0].files["workflow-archive.json"] = JSON.stringify(archive);
+	wrongScope.bundle["research-history.json"] = JSON.stringify(history);
+	assert.throws(() => reviewPrivateCampaignRestartEffects(wrongScope.input),
+		/lacks the certified confined local-stop boundary/);
 });

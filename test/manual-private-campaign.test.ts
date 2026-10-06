@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 import { offlineChecks } from "../scripts/manual-private-campaign.ts";
 import { reserveIndependentRestart } from "../src/m07/independent-restart.ts";
+import { verifyDeepSeekCnyBilling } from "../src/runner/deepseek-cny-pricing.ts";
 import { ONE_USE_PUSH_MARKER } from "../src/runner/signed-mission-ledger.ts";
 
 test("shared-total campaign requires explicit manual admission and signed cumulative ledger", async () => {
@@ -167,6 +168,18 @@ test("failed experiment enters untrusted history while selected prior tuple rema
 			secondReservation, secondClaim),
 			/reservation is invalid/);
 	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("no accepted current candidate reports prior tuple retention without a performance claim", () => {
+	const status = offlineChecks.initialHistoricalSelection("none", "passed");
+	assert.equal(status.priorRetained, true);
+	assert.equal(status.retentionReason, "no-new-accepted-candidate");
+	assert.equal(status.selectedTupleProvenance, "authenticated-prior-carry");
+	assert.equal(status.priorCurrentHostCorrectnessGuard, "passed");
+	assert.equal(status.currentAttemptAcceptedTask, false);
+	assert.equal(status.currentAttemptGainEstablished, false);
+	assert.equal((status.comparison as { state: string }).state, "unavailable");
+	assert.equal(status.comparisonPerformed, false);
 });
 
 test("generic private campaign source-shape gate preserves non-target bodies", () => {
@@ -442,6 +455,31 @@ test("read-only credential probe uses one official model-list request and stores
 	const rejected = (async () => new Response(null, { status: 401 })) as typeof fetch;
 	assert.deepEqual(await offlineChecks.credentialProbe("sk-SYNTHETIC_TEST_KEY", rejected),
 		{ httpStatus: 401, accepted: false });
+});
+
+test("private campaign uses only a live verified native-CNY peak profile for new requests", async () => {
+	const request = (async (url: string | URL | Request, options?: RequestInit) => {
+		assert.equal(String(url), "https://api.deepseek.com/user/balance");
+		assert.equal(options?.method, "GET");
+		return new Response(JSON.stringify({ is_available: true,
+			balance_infos: [{ currency: "CNY", total_balance: "SYNTHETIC_PRIVATE_AMOUNT",
+				granted_balance: "SYNTHETIC_PRIVATE_GRANT", topped_up_balance: "SYNTHETIC_PRIVATE_TOPUP" }] }),
+			{ status: 200, headers: { "content-type": "application/json" } });
+	}) as typeof fetch;
+	const profile = await verifyDeepSeekCnyBilling({ apiKey: "SYNTHETIC_KEY", request,
+		now: () => new Date("2026-10-06T11:00:00.000Z") });
+	const budget = offlineChecks.createPrivateCampaignBudget(29.1, profile);
+	assert.equal(budget.limits.estimatedInputCnyPerMillionTokens, 2);
+	assert.equal(budget.limits.estimatedCacheReadCnyPerMillionTokens, 0.04);
+	assert.equal(budget.limits.estimatedOutputCnyPerMillionTokens, 8);
+	assert.equal(budget.limits.estimatedCnyPerUsd, undefined);
+	assert.equal(budget.snapshot().priorCommittedCny, 29.1);
+	assert.equal(budget.snapshot().missionCommittedCny, 29.1);
+	assert.equal(budget.requestAuditSnapshot().pricingProfile?.currency, "CNY");
+	assert.doesNotMatch(JSON.stringify(budget.requestAuditSnapshot()), /SYNTHETIC_PRIVATE_AMOUNT|SYNTHETIC_KEY/);
+	const source = await readFile(new URL("../scripts/manual-private-campaign.ts", import.meta.url), "utf8");
+	assert.ok(source.indexOf("await verifyDeepSeekCnyBilling({ apiKey: runtimeKey })") <
+		source.indexOf("createPrivateCampaignBudget(missionLedger.priorCommittedCny, nativeCnyPricing)"));
 });
 
 test("M04 evidence coverage requires exact task files and complete returned text ranges", async () => {

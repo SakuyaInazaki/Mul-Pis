@@ -28,6 +28,13 @@ const CURRENT_POLICY = Object.freeze({ version: 1,
 	effectClass: "confined-ephemeral-local", actorThirdPartyMutations: "none",
 	hostTransport: "immutable-versioned-archive" });
 
+const INHERITED_ONLY_POLICY = Object.freeze({ version: 1,
+	policyId: "mul-pis-confined-private-campaign-inherited-only-v3",
+	sourceCommit: "2efc466b42757bfdc33a8c21ab053f2e786abf14",
+	reviewedBoundary: "The immutable source retained the factory-attested confined read/write/edit actor tools, disabled built-in shell/network tools, exact active-tool check, isolated read-only checker execution, and fixed encrypted Actions archives. Its new budget/output-cap handling and host-certified settled local stops did not grant the actor new tools or persistent third-party effects. The latest bounded goal has a partial-settled local stop and no new unknown operation; historical unknown outcomes and billing holds remain unchanged.",
+	effectClass: "confined-ephemeral-local", actorThirdPartyMutations: "none",
+	hostTransport: "immutable-versioned-archive" });
+
 /** Public source-review fingerprint used to verify a sealed earlier quarantine. */
 export const PRIOR_REVIEWED_POLICY_SHA256 = sha256(JSON.stringify(PRIOR_POLICY));
 
@@ -72,11 +79,145 @@ export interface PrivateCampaignEffectReviewInput {
 		envelopeSha256: string) => boolean;
 }
 
+function reviewInheritedOnly(input: PrivateCampaignEffectReviewInput,
+	checkpoint: { contract?: { id?: string }; boundedRuns?: Array<{ runId?: string; outcome?: string;
+		unresolvedOperationIds?: string[] }> }, reservations: PriorReservation[], bindings: PriorBinding[]): ReviewedRestartEffectPolicy {
+	const { facts, operationRefs } = input;
+	if (reservations.length !== 2 || bindings.length !== 2)
+		reject("inherited-only policy requires exactly two sealed quarantine/binding links");
+	const first = reservations[0], second = reservations[1];
+	const firstReceipt = first?.receipt, secondReceipt = second?.receipt;
+	const firstClaim = first?.claim, secondClaim = second?.claim;
+	const firstBinding = bindings[0], secondBinding = bindings[1];
+	if (firstReceipt?.version !== 1 || firstReceipt.kind !== "host-independent-goal-quarantine" ||
+		secondReceipt?.version !== 1 || secondReceipt.kind !== "host-independent-goal-quarantine" ||
+		firstReceipt.quarantine?.operationOutcome !== "unknown" ||
+		secondReceipt.quarantine?.operationOutcome !== "unknown" ||
+		firstReceipt.quarantine.selectedFromFailedAttempt !== false ||
+		secondReceipt.quarantine.selectedFromFailedAttempt !== false ||
+		!Array.isArray(firstReceipt.quarantine.operationRefs) ||
+		!Array.isArray(secondReceipt.quarantine.operationRefs) ||
+		!firstReceipt.quarantine.operationRefs.length || !secondReceipt.quarantine.operationRefs.length ||
+		new Set(firstReceipt.quarantine.operationRefs).size !== firstReceipt.quarantine.operationRefs.length ||
+		new Set(secondReceipt.quarantine.operationRefs).size !== secondReceipt.quarantine.operationRefs.length ||
+		!text(checkpoint.contract?.id) ||
+		firstReceipt.prior?.contractId !== checkpoint.contract.id ||
+		secondReceipt.prior?.contractId !== checkpoint.contract.id)
+		reject("inherited-only receipt chain is malformed or changed the original obligation");
+	const firstReceiptSha = sha256(JSON.stringify(firstReceipt));
+	const secondReceiptSha = sha256(JSON.stringify(secondReceipt));
+	const firstBindingSha = sha256(JSON.stringify(firstBinding));
+	const secondBindingSha = sha256(JSON.stringify(secondBinding));
+	if (firstBinding?.version !== 1 || firstBinding.kind !== "host-independent-goal-binding" ||
+		secondBinding?.version !== 1 || secondBinding.kind !== "host-independent-goal-binding" ||
+		firstBinding.quarantineReceiptSha256 !== firstReceiptSha ||
+		secondBinding.quarantineReceiptSha256 !== secondReceiptSha ||
+		firstBinding.freshWorkspace?.workspaceId !== firstReceipt.freshWorkspace?.workspaceId ||
+		firstBinding.freshWorkspace?.restartNonce !== firstReceipt.freshWorkspace?.restartNonce ||
+		secondBinding.freshWorkspace?.workspaceId !== secondReceipt.freshWorkspace?.workspaceId ||
+		secondBinding.freshWorkspace?.restartNonce !== secondReceipt.freshWorkspace?.restartNonce ||
+		!text(firstBinding.goalRunId) || !text(secondBinding.goalRunId) ||
+		firstBinding.goalRunId === secondBinding.goalRunId)
+		reject("inherited-only goal bindings are not exact append-only links");
+	const priorPolicySha = PRIOR_REVIEWED_POLICY_SHA256;
+	const currentPolicySha = sha256(JSON.stringify(CURRENT_POLICY));
+	const secondReviewedSha = sha256(JSON.stringify({ currentPolicySha256: currentPolicySha,
+		receiptSha256: firstReceiptSha, bindingSha256: firstBindingSha }));
+	if (firstReceipt.prior?.source?.commit !== PRIOR_POLICY.sourceCommit ||
+		secondReceipt.prior?.source?.commit !== CURRENT_POLICY.sourceCommit ||
+		firstReceipt.prior.reviewedPolicyId !== PRIOR_POLICY.policyId ||
+		firstReceipt.prior.reviewedPolicySha256 !== priorPolicySha ||
+		secondReceipt.prior.reviewedPolicyId !== CURRENT_POLICY.policyId ||
+		secondReceipt.prior.reviewedPolicySha256 !== secondReviewedSha ||
+		!hex64(firstReceipt.prior.envelopeSha256) || !hex64(secondReceipt.prior.envelopeSha256) ||
+		!input.bindsAncestor(input.proof, firstReceipt.prior.source, firstReceipt.prior.envelopeSha256) ||
+		!input.bindsAncestor(input.proof, secondReceipt.prior.source, secondReceipt.prior.envelopeSha256))
+		reject("inherited-only source-policy origins are not authenticated ancestors");
+	if (!text(firstClaim?.claimId) || !text(secondClaim?.claimId) ||
+		!text(firstClaim.currentJobId) || !text(secondClaim.currentJobId) ||
+		firstClaim.priorEnvelopeSha256 !== firstReceipt.prior.envelopeSha256 ||
+		secondClaim.priorEnvelopeSha256 !== secondReceipt.prior.envelopeSha256 ||
+		firstClaim.currentRunId !== secondReceipt.prior.source.runId ||
+		firstClaim.currentRunAttempt !== secondReceipt.prior.source.runAttempt ||
+		firstClaim.currentCommit !== secondReceipt.prior.source.commit ||
+		secondClaim.currentRunId !== facts.source.runId ||
+		secondClaim.currentRunAttempt !== facts.source.runAttempt ||
+		secondClaim.currentCommit !== facts.source.commit)
+		reject("inherited-only claims do not form the authenticated source chain");
+	const holds = [firstReceipt.prior.unknownHeldNano, secondReceipt.prior.unknownHeldNano, facts.unknownHeldNano];
+	const committed = [firstReceipt.prior.committedNano, secondReceipt.prior.committedNano, facts.committedNano];
+	if (holds.some(value => !Number.isSafeInteger(value) || value < 1) ||
+		committed.some(value => !Number.isSafeInteger(value) || value < 0) ||
+		holds[0] > holds[1] || holds[1] > holds[2] ||
+		committed[0] > committed[1] || committed[1] > committed[2])
+		reject("inherited-only quarantine would release unknown billing or rewrite committed cost");
+	const priorGoal = checkpoint.boundedRuns?.find(run => run.runId === firstBinding.goalRunId);
+	const latestGoal = checkpoint.boundedRuns?.find(run => run.runId === secondBinding.goalRunId);
+	const newlyUnknownAtFirstRestart = (priorGoal?.unresolvedOperationIds ?? [])
+		.map(id => `${firstBinding.goalRunId}/${id}`);
+	if (priorGoal?.outcome !== "active" || !newlyUnknownAtFirstRestart.length ||
+		latestGoal?.outcome !== "partial" || (latestGoal.unresolvedOperationIds?.length ?? 0) !== 0 ||
+		!sameSet([...firstReceipt.quarantine.operationRefs, ...newlyUnknownAtFirstRestart],
+			secondReceipt.quarantine.operationRefs) ||
+		!sameSet(secondReceipt.quarantine.operationRefs, operationRefs) ||
+		firstReceipt.quarantine.operationRefs.some(ref =>
+			!checkpoint.boundedRuns?.some(run => (run.unresolvedOperationIds ?? [])
+				.map(id => `${run.runId}/${id}`).includes(ref))))
+		reject("inherited-only policy found an unaccounted or newly unknown goal operation");
+	let history: { version?: number; kind?: string; entries?: Array<{ goalRunId?: string;
+		files?: Record<string, string> }> };
+	try { history = JSON.parse(input.privateBundle["research-history.json"]); }
+	catch { return reject("inherited-only latest local stop lacks host archive history"); }
+	const historyEntries = history.entries?.filter(item => item.goalRunId === secondBinding.goalRunId) ?? [];
+	if (history.version !== 1 || history.kind !== "untrusted-version-bound-research-history" ||
+		historyEntries.length !== 1 || typeof historyEntries[0].files?.["workflow-archive.json"] !== "string")
+		reject("inherited-only latest local stop lacks a unique bound host archive");
+	let archive: { version?: number; kind?: string; goalRunId?: string; goalOutcome?: string;
+		taskStatus?: string; loopStopReason?: string; m04?: { state?: string };
+		controllerEvidence?: { reviewStatus?: string; operationOutcomes?: Array<{ operationId?: string; status?: string;
+			localStop?: { settledProviderRequestCount?: number; rejectedBeforeTransport?: boolean;
+				stopReason?: string; effectScope?: string } }> } };
+	try { archive = JSON.parse(historyEntries[0].files!["workflow-archive.json"]); }
+	catch { return reject("inherited-only latest local stop host archive is invalid"); }
+	const operationOutcomes = archive.controllerEvidence?.operationOutcomes ?? [];
+	const localStop = operationOutcomes[0]?.localStop;
+	if (archive.version !== 1 || archive.kind !== "m07-private-candidate-archive" ||
+		archive.goalRunId !== secondBinding.goalRunId || archive.goalOutcome !== "partial" ||
+		archive.taskStatus !== "failed" || archive.loopStopReason !== "budget-boundary" ||
+		archive.m04?.state !== "not-run" || archive.controllerEvidence?.reviewStatus !== "unreviewed" ||
+		operationOutcomes.length !== 1 ||
+		!/^O\d{3,}$/.test(operationOutcomes[0]?.operationId ?? "") ||
+		operationOutcomes[0].status !== "partial-settled" ||
+		!Number.isSafeInteger(localStop?.settledProviderRequestCount) ||
+		Number(localStop?.settledProviderRequestCount) < 1 ||
+		localStop?.rejectedBeforeTransport !== true ||
+		localStop.stopReason !== "total-cny-ceiling" ||
+		localStop.effectScope !== "factory-attested-confined-file-tools")
+		reject("inherited-only latest goal lacks the certified confined local-stop boundary");
+	const operationAttestations = [
+		...firstReceipt.quarantine.operationRefs.map(operationRef => ({ operationRef,
+			sourceCommit: firstReceipt.prior.source.commit,
+			evidenceSha256: sha256(JSON.stringify({ firstReceiptSha, firstBindingSha, operationRef })) })),
+		...newlyUnknownAtFirstRestart.map(operationRef => ({ operationRef,
+			sourceCommit: secondReceipt.prior.source.commit,
+			evidenceSha256: sha256(JSON.stringify({ secondReceiptSha, secondBindingSha,
+				secondReviewedSha, operationRef })) })),
+	];
+	const inheritedPolicySha = sha256(JSON.stringify(INHERITED_ONLY_POLICY));
+	return { sourceCommit: facts.source.commit, policyId: INHERITED_ONLY_POLICY.policyId,
+		policySha256: sha256(JSON.stringify({ inheritedPolicySha, firstReceiptSha, secondReceiptSha,
+			firstBindingSha, secondBindingSha })), operationAttestations,
+		effectClass: "confined-ephemeral-local", unknownBillingHeld: true,
+		actorThirdPartyMutations: "none", hostTransport: "immutable-versioned-archive" };
+}
+
 /** Only the reviewed source pair and a fully linked inherited quarantine are admitted. */
 export function reviewPrivateCampaignRestartEffects(input: PrivateCampaignEffectReviewInput): ReviewedRestartEffectPolicy {
 	const { facts, operationRefs, privateBundle: bundle } = input;
 	if (!input.authenticatedBundle(input.proof, bundle)) reject("bundle is not authenticated by live ledger proof");
-	if (facts.source.commit !== CURRENT_POLICY.sourceCommit || facts.resultArtifact.digestScope !== "github-artifact-archive" ||
+	if (!(facts.source.commit === CURRENT_POLICY.sourceCommit ||
+		facts.source.commit === INHERITED_ONLY_POLICY.sourceCommit) ||
+		facts.resultArtifact.digestScope !== "github-artifact-archive" ||
 		facts.unknownHeldNano < 1 || !operationRefs.length || new Set(operationRefs).size !== operationRefs.length)
 		reject("latest source or unknown charge is outside reviewed scope");
 	let checkpoint: { contract?: { id?: string }; boundedRuns?: Array<{ runId?: string; outcome?: string;
@@ -91,6 +232,8 @@ export function reviewPrivateCampaignRestartEffects(input: PrivateCampaignEffect
 		"host-independent-restart-reservations") as PriorReservation[];
 	const bindings = chain(bundle["independent-restart-goal-binding.json"],
 		"host-independent-restart-goal-bindings") as PriorBinding[];
+	if (facts.source.commit === INHERITED_ONLY_POLICY.sourceCommit)
+		return reviewInheritedOnly(input, checkpoint, reservations, bindings);
 	const qualifying: Array<{ reservation: PriorReservation; binding: PriorBinding; receiptSha256: string }> = [];
 	for (const reservation of reservations) {
 		const receipt = reservation?.receipt, claim = reservation?.claim;

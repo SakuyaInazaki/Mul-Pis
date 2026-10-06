@@ -196,7 +196,7 @@ export interface M07TaskRecord extends TaskSpecInput {
 	executionFailure?: string;
 	toolLog: unknown[];
 	executionRounds?: M07ExecutionRound[];
-	loopStopReason?: "ready" | "max-rounds" | "deadline" | "budget-boundary" |
+	loopStopReason?: "ready" | "max-rounds" | "deadline" | "budget-boundary" | "provider-call-limit" |
 		"output-limit" | "replan" | "blocked" | "reviewer-invalid";
 	/** Available only after a stable task completed and its evidence was frozen. */
 	branchSource?: M07BranchSourceV1;

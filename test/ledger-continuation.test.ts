@@ -8,6 +8,7 @@ import test, { type TestContext } from "node:test";
 import { authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation } from "../src/runner/ledger-continuation.ts";
 import type { RequestAuditSnapshot } from "../src/runner/ledger-continuation.ts";
 import { DeepSeekCampaignBudget } from "../src/runner/deepseek-campaign.ts";
+import { verifyDeepSeekCnyBilling, nativeCnyPricingRecord } from "../src/runner/deepseek-cny-pricing.ts";
 import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, ONE_USE_PUSH_MARKER } from "../src/runner/signed-mission-ledger.ts";
 
 const sha = (letter: string) => letter.repeat(40);
@@ -272,6 +273,73 @@ test("host audit retains each reservation after a failed prompt without content"
 	assert.equal(failed.unknownReservedCny, failed.requests[0].unknownHeldCny);
 	assert.equal(failed.inFlightReservedCny, 0);
 	assert.doesNotMatch(JSON.stringify(failed), /synthetic-session|synthetic-prompt/);
+});
+
+test("encrypted carry accepts a bounded unsent-request diagnostic without charging it", async t => {
+	const f = await fixture(t);
+	const budget = new DeepSeekCampaignBudget({ model: "deepseek/synthetic", endpoint: "https://api.deepseek.com",
+		maxCny: 0.25, priorCommittedCny: 0, maxProviderCalls: 2, maxProviderCallsPerPrompt: 2,
+		maxOutputTokens: 20, outputAccountingMarginTokens: 32,
+		estimatedInputCnyPerMillionTokens: 4, estimatedOutputCnyPerMillionTokens: 16,
+		estimatedCnyPerUsd: 10 });
+	const lease = budget.beginPrompt("private-session", "private-prompt");
+	assert.throws(() => budget.reserve(lease, 100_000, "unsent", 1), /global CNY total exhausted/);
+	budget.failPrompt(lease);
+	const evidence = budget.requestAuditSnapshot();
+	assert.equal(evidence.requests.length, 0);
+	assert.equal(evidence.admissionRejections[0].decision, "input-unaffordable");
+	assert.equal(evidence.admissionRejections[0].requestNotSent, true);
+	assert.equal(evidence.settledCny, 0);
+	assert.equal(evidence.unknownReservedCny, 0);
+	const opened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7002, sha("b")), request: github([anchor, first]),
+		loadCarryArtifact: async () => { throw Error("no carry yet"); } });
+	const altered = structuredClone(evidence);
+	altered.admissionRejections[0].requestNotSent = false as true;
+	assert.throws(() => opened.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 0,
+		requestAudit: altered }), /accounting/);
+	const sealed = opened.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 0,
+		requestAudit: evidence });
+	assert.doesNotMatch(Buffer.from(sealed.envelopeB64, "base64").toString(), /input-unaffordable|private-session|private-prompt/);
+	const reopened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7003, sha("c")),
+		request: github([anchor, { ...first, status: "completed", conclusion: "failure" }, second]),
+		loadCarryArtifact: async () => sealed.envelopeB64 });
+	assert.equal(reopened.priorCommittedCny, f.payload.priorCommittedCny);
+	assert.equal(reopened.priorUnknownHeldCny, 0);
+});
+
+test("encrypted carry retains reviewed native CNY price evidence without account balances", async t => {
+	const f = await fixture(t);
+	let profileClock = new Date("2026-10-06T10:30:00.000Z");
+	const profile = await verifyDeepSeekCnyBilling({ apiKey: "synthetic-key",
+		now: () => profileClock,
+		request: async () => new Response(JSON.stringify({ is_available: true,
+			balance_infos: [{ currency: "CNY", total_balance: "PRIVATE-AMOUNT",
+				granted_balance: "PRIVATE-GRANT", topped_up_balance: "PRIVATE-TOPUP" }] }), { status: 200 }) });
+	profileClock = new Date("2026-10-07T00:00:00.000Z");
+	assert.throws(() => new DeepSeekCampaignBudget({ model: "deepseek/deepseek-flash:low",
+		endpoint: "https://api.deepseek.com", maxCny: 30, priorCommittedCny: 0,
+		maxProviderCalls: 1, maxProviderCallsPerPrompt: 1, maxOutputTokens: 20,
+		outputAccountingMarginTokens: 32, estimatedInputCnyPerMillionTokens: 2,
+		estimatedCacheReadCnyPerMillionTokens: 0.04, estimatedOutputCnyPerMillionTokens: 8,
+		nativeCnyPricing: profile }), /profile review has expired/);
+	const opened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7002, sha("b")), request: github([anchor, first]),
+		loadCarryArtifact: async () => { throw Error("no carry yet"); } });
+	const observation = { ...audit(0, 0), pricingProfile: nativeCnyPricingRecord(profile) };
+	const invalid = structuredClone(observation);
+	(invalid.pricingProfile.rates as { output: number }).output = 1;
+	assert.throws(() => opened.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 0,
+		requestAudit: invalid }), /accounting/);
+	const sealed = opened.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 0,
+		requestAudit: observation });
+	assert.doesNotMatch(Buffer.from(sealed.envelopeB64, "base64").toString(), /PRIVATE-AMOUNT|synthetic-key|DeepSeek-V4.1-Flash/);
+	const reopened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7003, sha("c")),
+		request: github([anchor, { ...first, status: "completed", conclusion: "failure" }, second]),
+		loadCarryArtifact: async () => sealed.envelopeB64 });
+	assert.equal(reopened.priorCommittedCny, f.payload.priorCommittedCny);
 });
 
 test("a completed newer paid run cannot be omitted after out-of-order concurrency admission", async t => {

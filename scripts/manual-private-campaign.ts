@@ -24,6 +24,7 @@ import { runM04 } from "../src/stages/m04.ts";
 import { createPiSessionRunner } from "../src/runner/pi.ts";
 import type { SessionCheckpoint, SessionHandle, SessionRunner, SessionSpec } from "../src/runner/types.ts";
 import { DeepSeekCampaignBudget } from "../src/runner/deepseek-campaign.ts";
+import { verifyDeepSeekCnyBilling, type NativeCnyPricingProfile } from "../src/runner/deepseek-cny-pricing.ts";
 import { MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, PRIVATE_CONTINUATION_FILE_KEYS } from
 	"../src/runner/signed-mission-ledger.ts";
 import { CARRY_FILE_NAME, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, downloadCarryArtifact,
@@ -134,6 +135,17 @@ function campaignObjectiveProgress(contract: OriginalObjectiveContractV1, inheri
 			...(input.unresolvedOperationIds ?? [])])] });
 }
 function sha256(value: string): string { return createHash("sha256").update(value).digest("hex"); }
+function createPrivateCampaignBudget(priorCommittedCny: number,
+	nativeCnyPricing: NativeCnyPricingProfile): DeepSeekCampaignBudget {
+	return new DeepSeekCampaignBudget({ model: MODEL, endpoint: "https://api.deepseek.com",
+		maxCny: MISSION_TOTAL_CNY, priorCommittedCny,
+		maxProviderCalls: MAX_PROVIDER_CALLS, maxProviderCallsPerPrompt: 32,
+		maxOutputTokens: 64_000, outputAccountingMarginTokens: 32,
+		estimatedInputCnyPerMillionTokens: 2,
+		estimatedCacheReadCnyPerMillionTokens: 0.04,
+		estimatedOutputCnyPerMillionTokens: 8,
+		nativeCnyPricing });
+}
 function reviewedLegacyRestartEffects(facts: AuthenticatedRestartCarryFacts,
 	operationRefs: readonly string[]): ReviewedRestartEffectPolicy {
 	if (facts.source.commit !== LEGACY_RESTART_POLICY.sourceCommit || !operationRefs.length ||
@@ -856,6 +868,17 @@ function chooseFollowOnCandidate(previousAccepted: boolean, followOnAccepted: bo
 		comparison.medianRatio !== undefined && comparison.medianRatio > 1.03 &&
 		comparison.minRatio !== undefined && comparison.minRatio >= 0.95));
 }
+function initialHistoricalSelection(selectedCandidateSource: "initial" | "fork" | "followon" | "none",
+	priorValidation: "passed" | "failed" | "infrastructure-unavailable" | undefined): Record<string, unknown> {
+	return selectedCandidateSource === "none" ? {
+		priorRetained: true, retentionReason: "no-new-accepted-candidate",
+		selectedTupleProvenance: "authenticated-prior-carry",
+		priorCurrentHostCorrectnessGuard: priorValidation ?? "unavailable",
+		currentAttemptAcceptedTask: false, currentAttemptGainEstablished: false,
+		comparison: { state: "unavailable" }, comparisonPerformed: false,
+	} : { priorRetained: false, retentionReason: "comparison-pending",
+		comparison: { state: "unavailable" }, comparisonPerformed: false };
+}
 function firstM07Accepted(acceptedWinner: boolean, finishedOutcome: unknown): boolean {
 	return acceptedWinner && finishedOutcome === "fulfilled";
 }
@@ -1261,17 +1284,15 @@ async function main() {
 		fail("DeepSeek credential probe did not complete successfully");
 	}
 	statusPhase = "credential-verified";
+	statusPhase = "billing-currency-verification";
+	const nativeCnyPricing = await verifyDeepSeekCnyBilling({ apiKey: runtimeKey });
+	statusPhase = "billing-currency-verified";
 	const found = await inputs(inputDir);
 	await requireIsolation(); // fail before any provider call
 	statusPhase = "isolated-preflight-passed";
 	const campaignRoot = await mkdtemp(path.join(os.tmpdir(), "mulpis-private-campaign-"));
 	let runId: string | undefined;
-	const budget = new DeepSeekCampaignBudget({ model: MODEL, endpoint: "https://api.deepseek.com",
-		maxCny: MISSION_TOTAL_CNY, priorCommittedCny: missionLedger.priorCommittedCny,
-		maxProviderCalls: MAX_PROVIDER_CALLS, maxProviderCallsPerPrompt: 32,
-		maxOutputTokens: 64_000, outputAccountingMarginTokens: 32,
-		estimatedInputCnyPerMillionTokens: 4, estimatedCacheReadCnyPerMillionTokens: 0.2,
-		estimatedOutputCnyPerMillionTokens: 16, estimatedCnyPerUsd: 10 });
+	const budget = createPrivateCampaignBudget(missionLedger.priorCommittedCny, nativeCnyPricing);
 	statusBudget = budget;
 	finalBudget = budget;
 	let campaignDeadlineAt: number | undefined;
@@ -2216,7 +2237,8 @@ async function main() {
 			});
 			objectiveStopReason = loop.stopReason;
 			statusPhase = "workflow-finished";
-			let historicalSelection: Record<string, unknown> = { priorRetained: false, comparison: { state: "unavailable" } };
+			let historicalSelection: Record<string, unknown> = initialHistoricalSelection(selectedCandidateSource,
+				statusPriorSelectedValidation);
 			if (selectedCandidateSource !== "none") {
 				const finalVerification = JSON.parse(await readFile(verificationPath, "utf8")) as Record<string, unknown>;
 				const prior = await remeasurePrior(path.join(priorSeedDir, "prior-candidate.cpp"),
@@ -2226,7 +2248,9 @@ async function main() {
 				const comparison = compareCandidateTimings(prior, finalVerification);
 				const changed = !(await readFile(candidate)).equals(await readFile(path.join(priorSeedDir, "prior-candidate.cpp")));
 				historicalSelection = { priorRetained: !chooseFollowOnCandidate(true, finalVerification.status === "passed", changed, comparison),
-					comparison, historicalTimingUsed: false, priorRevalidated: prior.status === "passed" };
+					retentionReason: comparison.state === "measured" ? "measured-comparison" : "no-supported-current-gain",
+					comparison, comparisonPerformed: comparison.state === "measured",
+					historicalTimingUsed: false, priorRevalidated: prior.status === "passed" };
 				if (historicalSelection.priorRetained) {
 					await exportPrefixedArchive(outputDir, outputDir, "followon");
 					const history = previousBundle["research-history.json"] ? JSON.parse(previousBundle["research-history.json"]) :
@@ -2290,7 +2314,10 @@ async function main() {
 					m04AdoptedExperienceCount, m04AdoptionReadContractSatisfied,
 					m04SelectedReadContractSatisfied },
 				branch: branchState, branchExerciseComplete, firstGoalReady,
-				followOn, followOnAttempts, objectiveLoop: loop, selectedCandidateSource, finalCandidateVerified, historicalSelection,
+				followOn, followOnAttempts, objectiveLoop: loop, selectedCandidateSource,
+				selectedMissionCandidateSource: historicalSelection.priorRetained === true ?
+					"authenticated-prior-carry" : selectedCandidateSource,
+				finalCandidateVerified, historicalSelection,
 				...(statusArchiveFailure ? { archiveFailure: statusArchiveFailure } : {}),
 				independentValidation: finalCandidateVerified ? "bounded-workflow-checker-passed" : "not-complete",
 				validationLimit: "Finite bounded cases are not exhaustive correctness or global-optimality proof" });
@@ -2360,10 +2387,12 @@ async function main() {
 
 export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceReturned, inputs, stageProbe, verifierScratch,
 	checkCandidate, validateSelectedPriorTuple,
+	createPrivateCampaignBudget,
 	reviewedLegacyRestartEffects,
 	appendRestartReservation, appendRestartGoalBinding,
 	privateFailureMessage, privateExceptionDiagnostic, credentialProbe, parseCheckerOutput, compareCandidateTimings,
 	chooseForkWinner, chooseFollowOnCandidate, firstM07Accepted,
+	initialHistoricalSelection,
 	forkReceiptMatches, contextLineageSummary, selectedM07ReviewReadPaths, exportPrefixedArchive, preserveCandidate,
 	preserveUnsettledGoalCheckpoint, preserveUnsettledBranchCheckpoint: preserveUnsettledGoalCheckpoint,
 	salvageObjectiveCheckpoint, collectContinuationBundle,
@@ -2375,7 +2404,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
 	main().catch(async error => {
 		const preProvider = ["preflight", "mission-ledger-verification", "credential-probe", "credential-verified",
 			"isolated-preflight-passed", "workspace-init", "private-inputs-staged",
-			"original-source-smoke", "prior-selected-revalidation", "independent-restart-admission",
+			"billing-currency-verification", "billing-currency-verified", "original-source-smoke",
+			"prior-selected-revalidation", "independent-restart-admission",
 			"source-and-isolation-preflight-passed"].includes(statusPhase);
 		const diagnostic = privateExceptionDiagnostic(error, statusRuntimeKey);
 		try { await saveStatus({ outcome: "incomplete", errorCategory: "campaign-exception",

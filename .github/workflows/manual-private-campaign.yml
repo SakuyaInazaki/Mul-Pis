@@ -28,7 +28,7 @@ jobs:
       github.run_attempt == 1 &&
       github.ref == 'refs/heads/improve/workflow-learning-reliability' &&
       ((github.event_name == 'workflow_dispatch' && inputs.authorize_bounded_run == true) ||
-       (github.event_name == 'push' && github.event.head_commit.message == 'Continue workflow with budget-aware requests and settled-stop recovery (mul-pis-20261006-recovery-run3)'))
+       (github.event_name == 'push' && github.event.head_commit.message == 'Resume workflow with verified native CNY pricing and explicit admission feedback (mul-pis-20261006-recovery-run4)'))
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

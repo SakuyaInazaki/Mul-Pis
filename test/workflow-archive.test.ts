@@ -413,3 +413,27 @@ test("private archive retains a settled but truncated terminal response without 
 	assert.deepEqual((await loadPrivateM07Archive(destination)).archive.controllerEvidence.operationOutcomes,
 		archived.controllerEvidence.operationOutcomes);
 });
+
+test("private archive distinguishes host-proven zero-request not-issued from a partial-settled prompt", async t => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "not-issued-archive-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const taskDir = path.join(root, "T001"), workDir = path.join(taskDir, "work"), destination = path.join(root, "out");
+	await mkdir(workDir, { recursive: true });
+	const evidencePath = path.join(taskDir, "local-not-issued-receipt.json");
+	await writeFile(evidencePath, JSON.stringify({ version: 1, kind: "m07-host-local-not-issued",
+		goalRunId: "synthetic-goal", taskId: "T001", operationId: "O001",
+		settledProviderRequestCount: 0, requestNotSent: true,
+		stopReason: "total-cny-ceiling", admissionDecision: "minimum-output-unaffordable",
+		effectScope: "factory-attested-confined-file-tools", observedAt: new Date().toISOString() }));
+	const task = { taskId: "T001", mode: "execute", workDir, status: "failed" } as M07TaskRecord;
+	const goal = { runId: "synthetic-goal", lifecycle: "active", tasks: [task],
+		executionState: { operations: [{ id: "O001", taskId: "T001", status: "not-issued",
+			observationMethod: "host-local-admission-rejection", evidencePath }] } } as unknown as CurrentGoal;
+	const archived = await archivePrivateM07Task({ goal, task, destination });
+	assert.deepEqual(archived.controllerEvidence.operationOutcomes, [{ operationId: "O001", status: "not-issued",
+		localNotIssued: { settledProviderRequestCount: 0, requestNotSent: true,
+			stopReason: "total-cny-ceiling", admissionDecision: "minimum-output-unaffordable",
+			effectScope: "factory-attested-confined-file-tools" } }]);
+	assert.deepEqual((await loadPrivateM07Archive(destination)).archive.controllerEvidence.operationOutcomes,
+		archived.controllerEvidence.operationOutcomes);
+});

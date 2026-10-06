@@ -702,6 +702,7 @@ export class PiSessionRunner implements SessionRunner {
 		let currentLease: PromptLease | undefined;
 		let currentRequestIds: string[] = [];
 		let certifiedLocalStop: HarnessError | undefined;
+		let certifiedNotIssued: HarnessError | undefined;
 		let certifiedEffectScope: HostEffectScope | undefined;
 		const requestRuntime = strict ? new Proxy(resolved.modelRuntime, {
 			get(target, property) {
@@ -779,6 +780,7 @@ export class PiSessionRunner implements SessionRunner {
 						model: model.id, usage: emptyUsage, stopReason: "error", timestamp: Date.now() };
 					const failStream = (error: unknown): void => {
 						certifiedLocalStop ??= campaign.certifySettledLocalBudgetStop(lease, certifiedEffectScope);
+						certifiedNotIssued ??= campaign.certifyLocalNotIssued(lease, certifiedEffectScope);
 						campaign.failPrompt(lease);
 						outer.push({ type: "error", reason: "error", error: { ...latest, stopReason: "error", errorMessage: error instanceof Error ? error.message : String(error) } });
 						outer.end();
@@ -806,7 +808,9 @@ export class PiSessionRunner implements SessionRunner {
 								else campaign.settleReported(lease, requestId, report);
 							}
 							if (event.type === "error") { terminal = true; latest = event.error;
-								certifiedLocalStop ??= campaign.certifySettledLocalBudgetStop(lease, certifiedEffectScope); campaign.failPrompt(lease); }
+								certifiedLocalStop ??= campaign.certifySettledLocalBudgetStop(lease, certifiedEffectScope);
+								certifiedNotIssued ??= campaign.certifyLocalNotIssued(lease, certifiedEffectScope);
+								campaign.failPrompt(lease); }
 							outer.push(event);
 						}
 						if (!terminal) throw new HarnessError("runner.campaign", "provider stream ended without a terminal response");
@@ -942,6 +946,7 @@ export class PiSessionRunner implements SessionRunner {
 				currentLease = campaign?.beginPrompt(ref.id, `${thisPrompt}-${randomUUID()}`);
 				currentRequestIds = [];
 				certifiedLocalStop = undefined;
+				certifiedNotIssued = undefined;
 				promptActive = true;
 				checkpointState.active = true;
 				checkpointState.completed = false;
@@ -991,6 +996,8 @@ export class PiSessionRunner implements SessionRunner {
 				} catch (error) {
 					const localStop = campaign && currentLease && !signal?.aborted && !abortedByHandle
 						? certifiedLocalStop ?? campaign.certifySettledLocalBudgetStop(currentLease, certifiedEffectScope) : undefined;
+					const localNotIssued = campaign && currentLease && !signal?.aborted && !abortedByHandle
+						? certifiedNotIssued ?? campaign.certifyLocalNotIssued(currentLease, certifiedEffectScope) : undefined;
 					const lengthStop = campaign && currentLease && !signal?.aborted && !abortedByHandle &&
 						error instanceof HarnessError && error.code === "runner.stop" && /stopReason=length/.test(error.message)
 						? campaign.certifySettledTerminalResponse(currentLease, certifiedEffectScope) : undefined;
@@ -1002,7 +1009,7 @@ export class PiSessionRunner implements SessionRunner {
 						throw new HarnessError("runner.stop", `session ${spec.label} was aborted during prompt${detail}`);
 					}
 					if (signal?.aborted || abortedByHandle) promptOutcome = "aborted";
-					throw localStop ?? lengthStop ?? error;
+					throw localStop ?? localNotIssued ?? lengthStop ?? error;
 				} finally {
 				try {
 					collectUsage();
@@ -1032,6 +1039,7 @@ export class PiSessionRunner implements SessionRunner {
 						currentLease = undefined;
 						currentRequestIds = [];
 						certifiedLocalStop = undefined;
+						certifiedNotIssued = undefined;
 					}
 				}
 				}

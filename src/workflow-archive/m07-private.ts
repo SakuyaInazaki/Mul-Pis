@@ -36,6 +36,11 @@ export interface PrivateM07ArchiveV1 {
 	files: Array<{ name: typeof FILES[number]["name"]; status: "present" | "missing" | "invalid"; bytes?: number }>;
 	controllerEvidence: {
 		operationOutcomes?: Array<{ operationId: string; status: string;
+			localNotIssued?: { settledProviderRequestCount: 0; requestNotSent: true;
+				stopReason: "total-cny-ceiling" | "provider-call-limit";
+				admissionDecision: "input-unaffordable" | "minimum-output-unaffordable" |
+					"requested-output-cap-unaffordable" | "provider-call-limit";
+				effectScope: "factory-attested-confined-file-tools" };
 			localStop?: { settledProviderRequestCount: number; rejectedBeforeTransport: true;
 				stopReason: "total-cny-ceiling" | "provider-call-limit";
 				effectScope: "factory-attested-confined-file-tools" };
@@ -380,6 +385,28 @@ async function archivedOperationOutcomes(goal: CurrentGoal, task: M07TaskRecord)
 	const operations = (goal.executionState?.operations ?? []).filter(item => item.taskId === task.taskId);
 	if (operations.length > MAX_ROUNDS) throw new Error("private M07 operation count exceeds bounded rounds");
 	return Promise.all(operations.map(async operation => {
+		if (operation.status === "not-issued" && operation.observationMethod === "host-local-admission-rejection") {
+			const expected = path.join(path.dirname(task.workDir), "local-not-issued-receipt.json");
+			if (operation.evidencePath !== expected) throw new Error("local not-issued operation lacks its controller receipt");
+			const source = await privateFile(path.dirname(task.workDir), "local-not-issued-receipt.json", 4_000);
+			if (!source) throw new Error("local not-issued receipt is unavailable");
+			const receipt = JSON.parse(await readFile(source.source, "utf8")) as Record<string, unknown>;
+			if (receipt.version !== 1 || receipt.kind !== "m07-host-local-not-issued" ||
+				receipt.goalRunId !== goal.runId || receipt.taskId !== task.taskId ||
+				receipt.operationId !== operation.id || receipt.settledProviderRequestCount !== 0 ||
+				receipt.requestNotSent !== true ||
+				receipt.effectScope !== "factory-attested-confined-file-tools" ||
+				!["total-cny-ceiling", "provider-call-limit"].includes(String(receipt.stopReason)) ||
+				!["input-unaffordable", "minimum-output-unaffordable", "requested-output-cap-unaffordable",
+					"provider-call-limit"].includes(String(receipt.admissionDecision)))
+				throw new Error("local not-issued receipt does not match the operation");
+			return { operationId: operation.id, status: "not-issued", localNotIssued: {
+				settledProviderRequestCount: 0 as const, requestNotSent: true as const,
+				stopReason: receipt.stopReason as "total-cny-ceiling" | "provider-call-limit",
+				admissionDecision: receipt.admissionDecision as "input-unaffordable" |
+					"minimum-output-unaffordable" | "requested-output-cap-unaffordable" | "provider-call-limit",
+				effectScope: "factory-attested-confined-file-tools" as const } };
+		}
 		if (operation.status === "terminal-response-incomplete") {
 			const expected = path.join(path.dirname(task.workDir), "terminal-response-receipt.json");
 			if (operation.evidencePath !== expected || operation.observationMethod !== "host-terminal-response")
@@ -689,6 +716,13 @@ export async function loadPrivateM07Archive(directory: string): Promise<{ archiv
 			archive.controllerEvidence.operationOutcomes.length > MAX_ROUNDS ||
 			archive.controllerEvidence.operationOutcomes.some(item => !/^O\d{3,}$/.test(item.operationId) ||
 				!["prepared", "issued", "response-received", "partial-settled", "terminal-response-incomplete", "unknown", "confirmed", "not-issued"].includes(item.status) ||
+				(item.localNotIssued !== undefined && (item.status !== "not-issued" ||
+					item.localNotIssued.settledProviderRequestCount !== 0 ||
+					item.localNotIssued.requestNotSent !== true ||
+					item.localNotIssued.effectScope !== "factory-attested-confined-file-tools" ||
+					!["total-cny-ceiling", "provider-call-limit"].includes(item.localNotIssued.stopReason) ||
+					!["input-unaffordable", "minimum-output-unaffordable", "requested-output-cap-unaffordable",
+						"provider-call-limit"].includes(item.localNotIssued.admissionDecision))) ||
 				(item.status === "partial-settled" ? !item.localStop ||
 					!Number.isSafeInteger(item.localStop.settledProviderRequestCount) ||
 					item.localStop.settledProviderRequestCount < 1 || item.localStop.rejectedBeforeTransport !== true ||
