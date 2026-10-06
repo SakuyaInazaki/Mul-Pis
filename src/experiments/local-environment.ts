@@ -167,8 +167,6 @@ export function createCpuResponseEnvironment(caseInput: CpuResponseCase, budget:
 		const s = state(start);
 		const previous = begin(s, action);
 		if (previous) return previous;
-		const budgetStatus = budget.status(lease);
-		if (budgetStatus.settlement !== "settled") return persist(s, action, feedback(s, action.actionId, "resource-exhausted"));
 		const selected = c.hypotheses.find((h) => h.id === action.hypothesisId);
 		const surviving = c.hypotheses.filter((h) => matches(h, s.observations, c.tolerance));
 		const status: DevelopmentFeedback["status"] = s.stopped || !selected || !action.actionId || action.actionId.length > 100 ? "invalid" : !surviving.some((h) => h.id === selected.id) ? "contradicted" : surviving.length === 1 ? "supported-by-observations" : "underdetermined";
@@ -280,10 +278,6 @@ export function createCpuResponseEnvironment(caseInput: CpuResponseCase, budget:
 				const surviving = c.hypotheses.filter((h) => matches(h, s.observations, c.tolerance));
 				if (surviving.length <= 1) return { status: "premature-stop", quality: "none", evidence: [] };
 				const caseRemaining = Math.max(0, c.maxProbeCalls - s.probes);
-				if (lease) {
-					const own = budget.status(lease), root = budget.status(budget.root);
-					if (own.settlement !== "settled" || root.settlement !== "settled") return { status: "inconclusive", quality: "none", evidence: [] };
-				}
 				const canResolve = referenceSequence(s.observations, caseRemaining) !== undefined;
 				return canResolve ? { status: "premature-stop", quality: "none", evidence: [] } : { status: "justified-unknown", quality: "partial", evidence: [] };
 		},

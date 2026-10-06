@@ -40,7 +40,8 @@ describe("browser artifacts", () => {
 		const python = process.env.PYTHON ?? "python3";
 		const testFile = path.resolve("tools/py/test_browser_artifacts.py");
 		const { stdout, stderr } = await execFileAsync(python, ["-I", testFile], { cwd: path.resolve(".") });
-		assert.match(`${stdout}${stderr}`, /Ran 5 tests/);
+		const count = `${stdout}${stderr}`.match(/Ran (\d+) tests/);
+		assert.ok(count && Number(count[1]) >= 9, "all browser lifecycle/artifact regressions execute");
 		assert.match(`${stdout}${stderr}`, /OK/);
 	});
 

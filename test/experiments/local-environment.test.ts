@@ -127,7 +127,7 @@ test("oversized model action is rejected before persistence", async () => {
 	assert.equal(persisted, 0);
 });
 
-test("shared root and child budget reserve, settle, and fail closed on unknown or invalid usage", () => {
+test("shared root and child budget retain unknown usage without stopping later work", () => {
 	const budget = new SharedBudget("tokens", limits);
 	const child = budget.createLease(budget.root, { ...limits, maxProviderCalls: 2 });
 	const one = budget.reservePrompt(child, { maxInputTokens: 20, maxSdkEstimatedCost: 0.1 });
@@ -140,7 +140,9 @@ test("shared root and child budget reserve, settle, and fail closed on unknown o
 	budget.settlePrompt(two, { ...usage, input: Number.NaN });
 	assert.equal(budget.status().settlement, "pending-or-unknown");
 	assert.equal(budget.status().committed.inputTokens, 4);
-	assert.throws(() => budget.reservePrompt(budget.root, { maxInputTokens: 1, maxSdkEstimatedCost: 0.01 }), /pending, unknown/);
+	assert.equal(budget.status().usageUnknown, true);
+	const later = budget.reservePrompt(budget.root, { maxInputTokens: 1, maxSdkEstimatedCost: 0.01 });
+	budget.settlePrompt(later, usage);
 	const overshoot = new SharedBudget("overshoot", limits);
 	const reservation = overshoot.reservePrompt(overshoot.root, { maxInputTokens: 10, maxSdkEstimatedCost: 0.1 });
 	overshoot.settlePrompt(reservation, { ...usage, output: 11 });
@@ -202,20 +204,27 @@ test("cost-only live status strips all legacy quotas while retaining actual unli
 	}
 });
 
-test("monetary budget and unknown usage still block further paid requests", () => {
+test("historical monetary reference and unknown cost never gate later requests", () => {
 	const budget = new SharedBudget("money", { maxSdkEstimatedCost: 0.1 });
 	const child = budget.createLease(budget.root, { maxSdkEstimatedCost: 1 });
-	assert.throws(() => budget.reservePrompt(child, { maxInputTokens: 1, maxSdkEstimatedCost: 0.2 }), /monetary budget/);
+	const reserved = budget.reservePrompt(child, { maxInputTokens: 1, maxSdkEstimatedCost: 0.2 });
+	budget.settlePrompt(reserved, usage);
 	const turn = budget.reserveObservedTurn(child);
 	budget.settleObservedTurn(turn, { ...usage, cost: 0.2 });
-	assert.equal(budget.status().settlement, "exceeded");
-	assert.equal(budget.status(child).settlement, "exceeded");
-	assert.throws(() => budget.reserveObservedTurn(child), /exceeded/);
+	assert.equal(budget.status().settlement, "settled");
+	assert.equal(budget.status().remaining.sdkEstimatedCost, 0);
+	const next = budget.reserveObservedTurn(child);
+	budget.settleObservedTurn(next, usage);
 	const unknown = new SharedBudget("unknown-turn", { maxSdkEstimatedCost: 1 });
 	const pending = unknown.reserveObservedTurn(unknown.root);
 	unknown.markObservedTurnUnknown(pending);
 	assert.equal(unknown.status().settlement, "pending-or-unknown");
-	assert.throws(() => unknown.reserveObservedTurn(unknown.root), /unknown/);
+	assert.equal(unknown.status().usageUnknown, true);
+	const afterUnknown = unknown.reserveObservedTurn(unknown.root);
+	unknown.settleObservedTurn(afterUnknown, usage);
+	const noCap = new SharedBudget("no-cap", {});
+	assert.deepEqual(noCap.status().remaining, {});
+	assert.deepEqual(noCap.status().limits, {});
 });
 
 

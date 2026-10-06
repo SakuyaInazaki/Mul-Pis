@@ -306,14 +306,12 @@ async def crawl_fetch(url: str, out_dir: Path, timeout: float) -> tuple[dict[str
             )
         )
         run_config = CrawlerRunConfig(
-            page_timeout=max(1, int(timeout * 1000)),
+            page_timeout=0,  # Playwright navigation: no workflow-chosen total deadline.
             check_robots_txt=True,
             markdown_generator=markdown_generator,
         )
         async with AsyncWebCrawler(config=browser_config) as crawler:
-            result = await asyncio.wait_for(
-                crawler.arun(url=url, config=run_config), timeout=timeout + 15
-            )
+            result = await crawler.arun(url=url, config=run_config)
     except Exception as exc:
         warning = f"Crawl4AI failed; used HTTP fallback: {type(exc).__name__}: {exc}"
         return http_fetch(url, out_dir, timeout, [warning])
@@ -382,7 +380,8 @@ def main() -> int:
     )
     parser.add_argument("url", metavar="URL")
     parser.add_argument("--out", required=True, type=Path, metavar="DIR")
-    parser.add_argument("--timeout", type=float, default=30.0, metavar="SECONDS")
+    parser.add_argument("--timeout", type=float, default=30.0, metavar="SECONDS",
+                        help="HTTP connection/read fault timeout for the plain-HTTP fallback; not a browser crawl deadline")
     parser.add_argument("--no-browser", action="store_true", help="use plain HTTP instead of Crawl4AI")
     args = parser.parse_args()
     if args.timeout <= 0:

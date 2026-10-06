@@ -1,4 +1,4 @@
-"""Bounded, incremental artifact capture for a live browser-use session."""
+"""Incremental browser artifacts with per-file byte bounds, not a cumulative quota."""
 
 from __future__ import annotations
 
@@ -123,33 +123,33 @@ class ArtifactRecorder:
                 captured_sequence = self._page_sequence
                 stem = f"page-{self._page_sequence:03d}"
                 html_data = html.encode("utf-8")
-                if self._html_bytes + len(html_data) <= MAX_HTML_BYTES:
+                if len(html_data) <= MAX_HTML_BYTES:
                     html_path = self.pages_dir / f"{stem}.html"
                     html_path.write_bytes(html_data)
                     self._html_bytes += len(html_data)
                     self.add_artifact(html_path, "html", url=url, title=title, capturedAt=captured_at, contentType="text/html")
                 else:
-                    self.warn_once(f"HTML capture limit reached ({MAX_HTML_BYTES} bytes); later page HTML was omitted")
+                    self.warn_once(f"HTML capture limit reached ({MAX_HTML_BYTES} bytes); this oversized page HTML was omitted")
                 heading = f"# {title or url}\n\nSource: {url}\nCaptured: {captured_at}\n\n"
                 markdown_data = (heading + text + "\n").encode("utf-8")
-                if self._text_bytes + len(markdown_data) <= MAX_TEXT_BYTES:
+                if len(markdown_data) <= MAX_TEXT_BYTES:
                     md_path = self.pages_dir / f"{stem}.md"
                     md_path.write_bytes(markdown_data)
                     self._text_bytes += len(markdown_data)
                     self.add_artifact(md_path, "markdown", url=url, title=title, capturedAt=captured_at, contentType="text/markdown")
                 else:
-                    self.warn_once(f"Text capture limit reached ({MAX_TEXT_BYTES} bytes); later page text was omitted")
+                    self.warn_once(f"Text capture limit reached ({MAX_TEXT_BYTES} bytes); this oversized page text was omitted")
                 self._last_page_state = current_state
             if captured_sequence is not None:
                 try:
                     shot_path = self.pages_dir / f"page-{captured_sequence:03d}.png"
                     screenshot_data = base64.b64decode(await page.screenshot())
-                    if self._screenshot_bytes + len(screenshot_data) <= MAX_SCREENSHOT_BYTES:
+                    if len(screenshot_data) <= MAX_SCREENSHOT_BYTES:
                         shot_path.write_bytes(screenshot_data)
                         self._screenshot_bytes += len(screenshot_data)
                         self.add_artifact(shot_path, "screenshot", url=url, title=title, capturedAt=captured_at, contentType="image/png")
                     else:
-                        self.warn_once(f"Screenshot capture limit reached ({MAX_SCREENSHOT_BYTES} bytes); later screenshots were omitted")
+                        self.warn_once(f"Screenshot capture limit reached ({MAX_SCREENSHOT_BYTES} bytes); this oversized screenshot was omitted")
                 except Exception as exc:
                     self.warn_once(f"Live page screenshot failed: {type(exc).__name__}: {exc}")
         except Exception as exc:
@@ -174,7 +174,7 @@ class ArtifactRecorder:
         except OSError as exc:
             self.warn_once(f"Could not inspect download {path.name}: {exc}")
             return
-        if size > MAX_DOWNLOAD_BYTES or self._download_bytes + size > MAX_DOWNLOAD_BYTES:
+        if size > MAX_DOWNLOAD_BYTES:
             self.warn_once(f"Download artifact limit reached ({MAX_DOWNLOAD_BYTES} bytes); oversized downloads were not registered")
             return
         source_url, content_type = self._download_sources.get(raw_path, (current_url, None))

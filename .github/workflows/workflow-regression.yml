@@ -38,3 +38,4 @@ jobs:
           npm test
           python -m unittest discover -s test -p 'private_actions_transport_test.py'
           python -m unittest discover -s tools/py -p 'test_browser_task.py'
+          python -m unittest discover -s tools/py -p 'test_browser_artifacts.py'

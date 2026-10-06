@@ -5,9 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { deflateRawSync } from "node:zlib";
 import test, { type TestContext } from "node:test";
-import { authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation } from "../src/runner/ledger-continuation.ts";
+import { authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, sealHistoricalCarryForOfflineTests } from "../src/runner/ledger-continuation.ts";
 import type { RequestAuditSnapshot } from "../src/runner/ledger-continuation.ts";
-import { DeepSeekCampaignBudget } from "../src/runner/deepseek-campaign.ts";
+import { DeepSeekCampaignBudget, type CampaignAdmissionRejection } from "../src/runner/deepseek-campaign.ts";
 import { verifyDeepSeekCnyBilling, nativeCnyPricingRecord } from "../src/runner/deepseek-cny-pricing.ts";
 import { verifyDeepSeekProviderOutputLimit, providerOutputLimitRecord } from "../src/runner/deepseek-provider-limits.ts";
 import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, ONE_USE_PUSH_MARKER } from "../src/runner/signed-mission-ledger.ts";
@@ -42,6 +42,21 @@ function audit(settledCny: number, unknownReservedCny: number): RequestAuditSnap
 		unknownHeldCny: unknownReservedCny, reportedUsage: null });
 	return { requests, settledCny, unknownReservedCny, inFlightReservedCny: 0,
 		reservations: requests.length };
+}
+function historicalUnsentRejection(): CampaignAdmissionRejection {
+	const inputPayloadBytes = 100_000, inputRate = 4, outputRate = 16;
+	const outputAccountingMarginTokens = 32;
+	return { version: 1, kind: "campaign-admission-rejection", decision: "input-unaffordable",
+		requestNotSent: true, inputPayloadBytes,
+		inputUpperCny: inputPayloadBytes * inputRate / 1_000_000,
+		outputAllowanceTokens: 0, minimumOutputTokens: 1, requestedOutputTokens: 20,
+		outputAccountingMarginTokens, marginUpperCny: outputAccountingMarginTokens * outputRate / 1_000_000,
+		availableCny: 0.25,
+		requiredAtMinimumOutputCny: (inputPayloadBytes * inputRate +
+			(1 + outputAccountingMarginTokens) * outputRate) / 1_000_000,
+		globalMaxCny: 0.25, committedBeforeCny: 0, settledProviderRequestCount: 0,
+		pricingBasis: { source: "higher-of-configured-and-sdk-estimates",
+			inputCnyPerMillionTokens: inputRate, outputCnyPerMillionTokens: outputRate } };
 }
 
 async function fixture(t: TestContext) {
@@ -100,7 +115,7 @@ test("signed seed and finished carry chain preserve the single cumulative ceilin
 		current: current(7002, sha("b")), request: github([anchor, first]),
 		loadCarryArtifact: async () => { throw Error("no carry yet"); } });
 	assert.equal(open1.priorCommittedCny, 4.125);
-	const sealed = open1.sealCurrent({ settledCny: 1.25, unknownOrInFlightCny: 0.75,
+	const sealed = sealHistoricalCarryForOfflineTests(open1, { settledCny: 1.25, unknownOrInFlightCny: 0.75,
 		requestAudit: audit(1.25, 0.75),
 		bootstrapBinding: { contractId: "synthetic-contract", sourceSha256: "f".repeat(64) },
 		privateBundle: { "candidate.cpp": "synthetic candidate" } });
@@ -117,11 +132,11 @@ test("signed seed and finished carry chain preserve the single cumulative ceilin
 	assert.deepEqual(open2.priorPrivateBundle, { "candidate.cpp": "synthetic candidate" });
 	assert.deepEqual(open2.priorBootstrapBinding,
 		{ contractId: "synthetic-contract", sourceSha256: "f".repeat(64) });
-	const next = open2.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 0,
+	const next = sealHistoricalCarryForOfflineTests(open2, { settledCny: 0, unknownOrInFlightCny: 0,
 		requestAudit: audit(0, 0) });
 	assert.equal(next.carryForwardCny, 6.125);
-	assert.throws(() => open2.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 0,
-		requestAudit: audit(0, 0) }), /already sealed/);
+	assert.throws(() => sealHistoricalCarryForOfflineTests(open2, { settledCny: 0, unknownOrInFlightCny: 0,
+		requestAudit: audit(0, 0) }), /already sealed|cannot follow/);
 });
 
 test("v2 signed seed privately bootstraps exact source-bound research files", async t => {
@@ -143,7 +158,7 @@ test("v2 signed seed privately bootstraps exact source-bound research files", as
 		request: github([anchor, first]), loadCarryArtifact: async () => "unused" });
 	assert.deepEqual(opened.priorPrivateBundle, privateFiles);
 	assert.deepEqual(opened.priorBootstrapBinding, binding);
-	const sealed = opened.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 0,
+	const sealed = sealHistoricalCarryForOfflineTests(opened, { settledCny: 0, unknownOrInFlightCny: 0,
 		requestAudit: audit(0, 0) });
 	const next = await openLedgerContinuation({ ...f, seedEnvelopeB64,
 		githubToken: "synthetic-token", current: current(7003, sha("c")),
@@ -151,10 +166,113 @@ test("v2 signed seed privately bootstraps exact source-bound research files", as
 		loadCarryArtifact: async () => sealed.envelopeB64 });
 	assert.deepEqual(next.priorPrivateBundle, privateFiles);
 	assert.deepEqual(next.priorBootstrapBinding, binding);
-	assert.throws(() => next.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 0,
+	assert.throws(() => sealHistoricalCarryForOfflineTests(next, { settledCny: 0, unknownOrInFlightCny: 0,
 		requestAudit: audit(0, 0), bootstrapBinding: { ...binding, sourceSha256: "e".repeat(64) } }),
 		/accounting exceeds mission bounds/);
 	assert.doesNotMatch(Buffer.from(seedEnvelopeB64, "base64").toString(), /synthetic candidate/);
+});
+
+test("verified legacy carry transitions monotonically to accounting-only v3 without relabeling old holds", async t => {
+	const f = await fixture(t);
+	const legacy = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7002, sha("b")), request: github([anchor, first]),
+		loadCarryArtifact: async () => "unused" });
+	const legacyCarry = sealHistoricalCarryForOfflineTests(legacy, { settledCny: 1.25,
+		unknownOrInFlightCny: 0.75, requestAudit: audit(1.25, 0.75) });
+	const completedFirst = { ...first, status: "completed", conclusion: "failure" };
+	const start = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7003, sha("c")), request: github([anchor, completedFirst, second]),
+		loadCarryArtifact: async () => legacyCarry.envelopeB64 });
+	assert.equal(start.mode, "accounting-only");
+	assert.equal(start.historicalCommittedCny, 6.125);
+	assert.equal(start.historicalUnknownHeldCny, 0.75);
+	assert.equal(start.priorSettledCny, 0);
+	assert.equal(start.priorUnknownObservedCny, 0);
+	assert.equal(start.priorUnpricedRequestCount, 0);
+	assert.equal(start.priorCarryProof?.version, 1);
+	const profile = await verifyDeepSeekCnyBilling({ apiKey: "synthetic-key",
+		now: () => new Date("2026-10-06T10:30:00.000Z"),
+		request: async () => new Response(JSON.stringify({ is_available: true,
+			balance_infos: [{ currency: "CNY", total_balance: "PRIVATE-AMOUNT",
+				granted_balance: "PRIVATE-GRANT", topped_up_balance: "PRIVATE-TOPUP" }] }),
+			{ status: 200 }) });
+	const pricedUsage = { input: 10, output: 10, cacheRead: 0, cacheWrite: 0,
+		totalTokens: 20, reportedUsdCost: 0.01, costStatus: "priced" };
+	const requestAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
+		requests: [
+			{ requestId: "priced", inputPayloadBytes: 100, maxOutputTokens: 100,
+				status: "settled" as const, settledCny: 42.25, unknownObservedCny: null,
+				reportedUsage: pricedUsage },
+			{ requestId: "unpriced", inputPayloadBytes: 100, maxOutputTokens: 100,
+				status: "settled" as const, settledCny: null, unknownObservedCny: null,
+				reportedUsage: pricedUsage },
+			{ requestId: "unknown", inputPayloadBytes: 100, maxOutputTokens: 100,
+				status: "unknown" as const, settledCny: null, unknownObservedCny: 1.5,
+				reportedUsage: { input: 7, totalTokens: 3, reportedUsdCost: null,
+					costStatus: "uncertain" } },
+		], settledCny: 42.25, unknownObservedCny: 1.5, unpricedRequestCount: 1,
+		pricingProfile: nativeCnyPricingRecord(profile) };
+	const missingPrice = { ...requestAudit, pricingProfile: undefined };
+	assert.throws(() => start.sealCurrent({ settledCny: 42.25, unknownObservedCny: 1.5,
+		unpricedRequestCount: 1, requestAudit: missingPrice }), /accounting-only carry is invalid/);
+	assert.throws(() => start.sealCurrent({ settledCny: 42.25, unknownObservedCny: 1.5,
+		unpricedRequestCount: 0, requestAudit }), /accounting-only carry is invalid/);
+	const sealed = start.sealCurrent({ settledCny: 42.25, unknownObservedCny: 1.5,
+		unpricedRequestCount: 1, requestAudit });
+	assert.equal(sealed.observedSettledCny, 42.25);
+	assert.equal(sealed.observedUnknownHeldCny, 1.5);
+	assert.equal(sealed.unpricedRequestCount, 1);
+	const completedSecond = { ...second, status: "completed", conclusion: "failure" };
+	const baseRequest = github([anchor, completedFirst, completedSecond, third]);
+	const request: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.endsWith("/runs/7003/jobs?per_page=100"))
+			return new Response(JSON.stringify({ total_count: 1, jobs: [{ id: 6003, run_id: 7003,
+				run_attempt: 1, head_sha: sha("c"), name: "private-campaign", status: "completed",
+				conclusion: "failure", steps: [{ name: "Run bounded private campaign",
+					status: "completed", conclusion: "success" }] }] }), { status: 200 });
+		if (address.endsWith("/runs/7003/artifacts?per_page=100"))
+			return new Response(JSON.stringify({ total_count: 1, artifacts: [{ id: 9003,
+				name: CARRY_ARTIFACT_NAME, expired: false, workflow_run: { id: 7003 } }] }), { status: 200 });
+		return baseRequest(url, init);
+	};
+	const next = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7005, sha("e")), request,
+		loadCarryArtifact: async () => sealed.envelopeB64 });
+	assert.equal(next.historicalCommittedCny, 6.125);
+	assert.equal(next.historicalUnknownHeldCny, 0.75);
+	assert.equal(next.priorSettledCny, 42.25);
+	assert.equal(next.priorUnknownObservedCny, 1.5);
+	assert.equal(next.priorUnpricedRequestCount, 1);
+	assert.equal(next.priorCarryProof?.version, 2);
+	assert.equal(next.priorCarryProof?.priorSettledCny, 42.25);
+});
+
+test("v3 records wholly unpriced provider requests without fabricating CNY or requiring a price profile", async t => {
+	const f = await fixture(t);
+	const opened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7002, sha("b")), request: github([anchor, first]),
+		loadCarryArtifact: async () => "unused" });
+	const requestAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
+		requests: [
+			{ requestId: "settled-unpriced", inputPayloadBytes: 100, maxOutputTokens: 100,
+				status: "settled" as const, settledCny: null, unknownObservedCny: null,
+				reportedUsage: { input: 20, output: 3, totalTokens: 100 } },
+			{ requestId: "unknown-unpriced", inputPayloadBytes: 100, maxOutputTokens: 100,
+				status: "unknown" as const, settledCny: null, unknownObservedCny: null,
+				reportedUsage: { totalTokens: 10 } },
+		], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 2 };
+	const sealed = opened.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 2, requestAudit });
+	assert.equal(sealed.observedSettledCny, 0);
+	assert.equal(sealed.unpricedRequestCount, 2);
+	const reopened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7003, sha("c")),
+		request: github([anchor, { ...first, status: "completed", conclusion: "failure" }, second]),
+		loadCarryArtifact: async () => sealed.envelopeB64 });
+	assert.equal(reopened.historicalCommittedCny, 4.125);
+	assert.equal(reopened.priorSettledCny, 0);
+	assert.equal(reopened.priorUnpricedRequestCount, 2);
 });
 
 test("v2 seed rejects unlisted files and an oversized Actions Secret", async t => {
@@ -182,10 +300,10 @@ test("missing, duplicate, replayed, or tampered carries fail closed", async t =>
 		request: github([anchor, completedFirst, second], { duplicateCarry: true }),
 		loadCarryArtifact: async () => "unused" }), /artifact is unavailable/);
 	const wrongSeed = await fixture(t);
-	const sealedByWrongSeed = (await openLedgerContinuation({ ...wrongSeed,
+	const sealedByWrongSeed = sealHistoricalCarryForOfflineTests((await openLedgerContinuation({ ...wrongSeed,
 		githubToken: "synthetic-token", current: current(7002, sha("b")),
-		request: github([anchor, first]), loadCarryArtifact: async () => "unused" }))
-		.sealCurrent({ settledCny: 1, unknownOrInFlightCny: 0, requestAudit: audit(1, 0) });
+		request: github([anchor, first]), loadCarryArtifact: async () => "unused" })),
+		{ settledCny: 1, unknownOrInFlightCny: 0, requestAudit: audit(1, 0) });
 	await assert.rejects(openLedgerContinuation({ ...common,
 		request: github([anchor, completedFirst, second]),
 		loadCarryArtifact: async () => sealedByWrongSeed.envelopeB64 }), /authentication failed/);
@@ -283,16 +401,7 @@ test("host audit retains each reservation after a failed prompt without content"
 
 test("encrypted carry accepts a bounded unsent-request diagnostic without charging it", async t => {
 	const f = await fixture(t);
-	const budget = new DeepSeekCampaignBudget({ model: "deepseek/deepseek-flash", endpoint: "https://api.deepseek.com",
-		providerOutputLimit: TEST_PROVIDER_OUTPUT_LIMIT,
-		maxCny: 0.25, priorCommittedCny: 0, maxProviderCalls: 2, maxProviderCallsPerPrompt: 2,
-		maxOutputTokens: 20, outputAccountingMarginTokens: 32,
-		estimatedInputCnyPerMillionTokens: 4, estimatedOutputCnyPerMillionTokens: 16,
-		estimatedCnyPerUsd: 10 });
-	const lease = budget.beginPrompt("private-session", "private-prompt");
-	assert.throws(() => budget.reserve(lease, 100_000, "unsent"), /global CNY total exhausted/);
-	budget.failPrompt(lease);
-	const evidence = budget.requestAuditSnapshot();
+	const evidence = { ...audit(0, 0), admissionRejections: [historicalUnsentRejection()] };
 	assert.equal(evidence.requests.length, 0);
 	assert.equal(evidence.admissionRejections[0].decision, "input-unaffordable");
 	assert.equal(evidence.admissionRejections[0].requestNotSent, true);
@@ -303,9 +412,9 @@ test("encrypted carry accepts a bounded unsent-request diagnostic without chargi
 		loadCarryArtifact: async () => { throw Error("no carry yet"); } });
 	const altered = structuredClone(evidence);
 	altered.admissionRejections[0].requestNotSent = false as true;
-	assert.throws(() => opened.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 0,
+	assert.throws(() => sealHistoricalCarryForOfflineTests(opened, { settledCny: 0, unknownOrInFlightCny: 0,
 		requestAudit: altered }), /accounting/);
-	const sealed = opened.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 0,
+	const sealed = sealHistoricalCarryForOfflineTests(opened, { settledCny: 0, unknownOrInFlightCny: 0,
 		requestAudit: evidence });
 	assert.doesNotMatch(Buffer.from(sealed.envelopeB64, "base64").toString(), /input-unaffordable|private-session|private-prompt/);
 	const reopened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
@@ -330,13 +439,14 @@ test("encrypted carry has byte bounds, not a 1000-request audit count stop", asy
 	const settledCny = requests.reduce((sum, row) => sum + row.settledCny, 0);
 	const requestAudit = { requests, settledCny, unknownReservedCny: 0,
 		inFlightReservedCny: 0, reservations: requests.length };
-	const sealed = opened.sealCurrent({ settledCny, unknownOrInFlightCny: 0, requestAudit });
+	const sealed = sealHistoricalCarryForOfflineTests(opened, { settledCny, unknownOrInFlightCny: 0, requestAudit });
 	assert(sealed.envelopeB64.length < 8 * 1024 * 1024);
 	const reopened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7003, sha("c")),
 		request: github([anchor, { ...first, status: "completed", conclusion: "failure" }, second]),
 		loadCarryArtifact: async () => sealed.envelopeB64 });
-	assert(reopened.priorCommittedCny > f.payload.priorCommittedCny);
+	assert(reopened.priorCommittedCny !== undefined &&
+		reopened.priorCommittedCny > f.payload.priorCommittedCny);
 });
 
 test("unsent-request diagnostics also have no arbitrary record-count stop", async t => {
@@ -344,18 +454,11 @@ test("unsent-request diagnostics also have no arbitrary record-count stop", asyn
 	const opened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7002, sha("b")), request: github([anchor, first]),
 		loadCarryArtifact: async () => { throw Error("no carry yet"); } });
-	const budget = new DeepSeekCampaignBudget({ model: "deepseek/deepseek-flash",
-		endpoint: "https://api.deepseek.com", providerOutputLimit: TEST_PROVIDER_OUTPUT_LIMIT,
-		maxCny: 0.25, priorCommittedCny: 0, outputAccountingMarginTokens: 32,
-		estimatedInputCnyPerMillionTokens: 4, estimatedOutputCnyPerMillionTokens: 16,
-		estimatedCnyPerUsd: 10 });
-	const lease = budget.beginPrompt("synthetic", "one");
-	assert.throws(() => budget.reserve(lease, 100_000, "not-sent"), /global CNY total exhausted/);
-	const rejection = budget.requestAuditSnapshot().admissionRejections[0];
+	const rejection = historicalUnsentRejection();
 	const requestAudit = { ...audit(0, 0),
 		admissionRejections: Array.from({ length: 1_001 }, () => ({ ...rejection,
 			pricingBasis: { ...rejection.pricingBasis } })) };
-	const sealed = opened.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 0, requestAudit });
+	const sealed = sealHistoricalCarryForOfflineTests(opened, { settledCny: 0, unknownOrInFlightCny: 0, requestAudit });
 	assert(sealed.envelopeB64.length < 8 * 1024 * 1024);
 });
 
@@ -400,13 +503,6 @@ test("encrypted carry retains reviewed native CNY price evidence without account
 		request: async () => new Response(JSON.stringify({ object: "list", data: [{ id: "deepseek-flash",
 			object: "model", name: "DeepSeek-V4.1-Flash", max_output_tokens: 393_216,
 			context_window: 1_048_576 }] }), { status: 200 }) });
-	profileClock = new Date("2026-10-07T00:00:00.000Z");
-	assert.throws(() => new DeepSeekCampaignBudget({ model: "deepseek/deepseek-flash:low",
-		endpoint: "https://api.deepseek.com", maxCny: 30, priorCommittedCny: 0,
-		providerOutputLimit,
-		outputAccountingMarginTokens: 32, estimatedInputCnyPerMillionTokens: 2,
-		estimatedCacheReadCnyPerMillionTokens: 0.04, estimatedOutputCnyPerMillionTokens: 8,
-		nativeCnyPricing: profile }), /profile review has expired/);
 	const opened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7002, sha("b")), request: github([anchor, first]),
 		loadCarryArtifact: async () => { throw Error("no carry yet"); } });
@@ -414,9 +510,9 @@ test("encrypted carry retains reviewed native CNY price evidence without account
 		providerOutputLimit: providerOutputLimitRecord(providerOutputLimit) };
 	const invalid = structuredClone(observation);
 	(invalid.pricingProfile.rates as { output: number }).output = 1;
-	assert.throws(() => opened.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 0,
+	assert.throws(() => sealHistoricalCarryForOfflineTests(opened, { settledCny: 0, unknownOrInFlightCny: 0,
 		requestAudit: invalid }), /accounting/);
-	const sealed = opened.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 0,
+	const sealed = sealHistoricalCarryForOfflineTests(opened, { settledCny: 0, unknownOrInFlightCny: 0,
 		requestAudit: observation });
 	assert.doesNotMatch(Buffer.from(sealed.envelopeB64, "base64").toString(), /PRIVATE-AMOUNT|synthetic-key|DeepSeek-V4.1-Flash/);
 	const reopened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
@@ -502,27 +598,24 @@ test("truncated job/artifact metadata and duplicate provider steps fail closed",
 	}
 });
 
-test("truthful over-ceiling unknown observations persist and prevent any next transport", async t => {
+test("historical over-ceiling unknown observations remain preserved after v3 transition", async t => {
 	const f = await fixture(t);
 	const firstOpen = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7002, sha("b")), request: github([anchor, first]), loadCarryArtifact: async () => "unused" });
 	const observed = audit(0, 31);
 	observed.requests[0].reservedCny = 1;
-	const sealed = firstOpen.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 31, requestAudit: observed });
+	const sealed = sealHistoricalCarryForOfflineTests(firstOpen, { settledCny: 0, unknownOrInFlightCny: 31, requestAudit: observed });
 	assert.equal(sealed.carryForwardCny, 35.125);
 	const restored = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7003, sha("c")), request: github([anchor, { ...first, status: "completed", conclusion: "failure" }, second]),
 		loadCarryArtifact: async () => sealed.envelopeB64 });
 	assert.equal(restored.priorCommittedCny, 35.125);
 	assert.equal(restored.priorUnknownHeldCny, 31);
-	const budget = new DeepSeekCampaignBudget({ model: "deepseek/deepseek-flash", endpoint: "https://api.deepseek.com",
-		providerOutputLimit: TEST_PROVIDER_OUTPUT_LIMIT,
-		maxCny: 30, priorCommittedCny: restored.priorCommittedCny, maxProviderCalls: 3, maxProviderCallsPerPrompt: 3,
-		maxOutputTokens: 100, outputAccountingMarginTokens: 10, estimatedInputCnyPerMillionTokens: 2,
-		estimatedOutputCnyPerMillionTokens: 4, estimatedCnyPerUsd: 7 });
-	assert.throws(() => budget.reserve(budget.beginPrompt("synthetic", "next"), 100, "next"), /global CNY total exhausted/);
-	assert.equal(budget.requestAuditSnapshot().reservations, 0);
-	assert.equal(restored.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 0,
+	assert.equal(restored.historicalCommittedCny, 35.125);
+	assert.equal(restored.historicalUnknownHeldCny, 31);
+	assert.equal(restored.priorSettledCny, 0);
+	assert.equal(restored.priorUnknownObservedCny, 0);
+	assert.equal(sealHistoricalCarryForOfflineTests(restored, { settledCny: 0, unknownOrInFlightCny: 0,
 		requestAudit: audit(0, 0) }).carryForwardCny, 35.125);
 });
 
@@ -534,7 +627,7 @@ test("audit totals cannot shave small request costs or claim settlement without 
 		const evidence = audit(1, 0);
 		if (malformed === "under-count") evidence.settledCny -= 0.00000005;
 		else evidence.requests[0].reportedUsage = null;
-		assert.throws(() => opened.sealCurrent({ settledCny: evidence.settledCny, unknownOrInFlightCny: 0,
+		assert.throws(() => sealHistoricalCarryForOfflineTests(opened, { settledCny: evidence.settledCny, unknownOrInFlightCny: 0,
 			requestAudit: evidence }), /accounting exceeds mission bounds/);
 	}
 });
@@ -543,7 +636,7 @@ test("same-seed checkpoint replay from a different source SHA is rejected", asyn
 	const f = await fixture(t);
 	const opened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7002, sha("b")), request: github([anchor, first]), loadCarryArtifact: async () => "unused" });
-	const sealed = opened.sealCurrent({ settledCny: 1, unknownOrInFlightCny: 0, requestAudit: audit(1, 0) });
+	const sealed = sealHistoricalCarryForOfflineTests(opened, { settledCny: 1, unknownOrInFlightCny: 0, requestAudit: audit(1, 0) });
 	await assert.rejects(openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7003, sha("c")), request: github([anchor, { ...first, head_sha: sha("f"), status: "completed", conclusion: "success" }, second]),
 		loadCarryArtifact: async () => sealed.envelopeB64 }), /authentication failed/);
@@ -586,11 +679,11 @@ async function compactedFixture(t: TestContext) {
 	const seedEnvelopeB64 = attestedSeed(f);
 	const firstOpened = await openLedgerContinuation({ ...f, seedEnvelopeB64, githubToken: "synthetic-token",
 		current: current(7002, sha("b")), request: github([anchor, first]), loadCarryArtifact: async () => "unused" });
-	const firstCarry = firstOpened.sealCurrent({ settledCny: 1, unknownOrInFlightCny: 0.25, requestAudit: audit(1, 0.25) });
+	const firstCarry = sealHistoricalCarryForOfflineTests(firstOpened, { settledCny: 1, unknownOrInFlightCny: 0.25, requestAudit: audit(1, 0.25) });
 	const secondOpened = await openLedgerContinuation({ ...f, seedEnvelopeB64, githubToken: "synthetic-token",
 		current: current(7003, sha("c")), request: github([anchor, { ...first, status: "completed", conclusion: "success" }, second]),
 		loadCarryArtifact: async () => firstCarry.envelopeB64 });
-	const secondCarry = secondOpened.sealCurrent({ settledCny: 0.5, unknownOrInFlightCny: 0, requestAudit: audit(0.5, 0) });
+	const secondCarry = sealHistoricalCarryForOfflineTests(secondOpened, { settledCny: 0.5, unknownOrInFlightCny: 0, requestAudit: audit(0.5, 0) });
 	const base = github([anchor, { ...first, status: "completed", conclusion: "success" },
 		{ ...second, status: "completed", conclusion: "success" }, third]);
 	const request: typeof fetch = async (url, init) => {
@@ -686,13 +779,25 @@ test("legacy carry remains readable only with every required old artifact availa
 	assert.equal(opened.priorCommittedCny, 5.875);
 });
 
-test("one-use push marker cannot authorize a second executed automatic attempt", async t => {
+test("current push is never admitted, while an authenticated historical push carry remains readable", async t => {
 	const f = await fixture(t);
 	const request = github([anchor, { ...first, event: "push", head_commit: { message: ONE_USE_PUSH_MARKER },
 		status: "completed", conclusion: "success" }, { ...second, event: "push", head_commit: { message: ONE_USE_PUSH_MARKER } }]);
 	await assert.rejects(openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: { ...current(7003, sha("c")), event: "push", manualAuthorized: undefined }, request,
-		loadCarryArtifact: async () => "unused" }), /one-use push authorization was already consumed/);
+		loadCarryArtifact: async () => "unused" }), /current Actions identity/);
+	const firstOpen = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7002, sha("b")), request: github([anchor, first]),
+		loadCarryArtifact: async () => "unused" });
+	const prior = sealHistoricalCarryForOfflineTests(firstOpen, { settledCny: 0,
+		unknownOrInFlightCny: 0, requestAudit: audit(0, 0) });
+	const accepted = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7003, sha("c")),
+		request: github([anchor, { ...first, event: "push",
+			head_commit: { message: ONE_USE_PUSH_MARKER },
+			status: "completed", conclusion: "success" }, second]),
+		loadCarryArtifact: async () => prior.envelopeB64 });
+	assert.equal(accepted.historicalCommittedCny, f.payload.priorCommittedCny);
 });
 
 test("historical v2 seeds without root attestation keep their old availability requirement", async t => {
@@ -823,7 +928,7 @@ test("Actions-backed restart claim is one-use, live-job-bound, and never refunds
 	await assert.rejects(opened.claimOneUse(proof.envelopeSha256), /already consumed/);
 	await assert.rejects(duplicate.claimOneUse(proof.envelopeSha256), /already consumed/);
 	assert.equal(opened.priorUnknownHeldCny, 0.25);
-	assert.equal(opened.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 0,
+	assert.equal(sealHistoricalCarryForOfflineTests(opened, { settledCny: 0, unknownOrInFlightCny: 0,
 		requestAudit: audit(0, 0) }).carryForwardCny, 5.875);
 });
 
@@ -846,6 +951,6 @@ test("branded ancestry predicate binds only exact authenticated source and carry
 	assert.equal(authenticatedPriorCarryBindsAncestor(JSON.parse(JSON.stringify(proof)), ancestor, envelopeSha256), false);
 	assert.equal(authenticatedPriorCarryBindsAncestor(proof, { runId: "7001", runAttempt: 1, commit: sha("a") }, envelopeSha256), false);
 	assert.equal(opened.priorUnknownHeldCny, 0.25);
-	assert.equal(opened.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 0,
+	assert.equal(sealHistoricalCarryForOfflineTests(opened, { settledCny: 0, unknownOrInFlightCny: 0,
 		requestAudit: audit(0, 0) }).carryForwardCny, 5.875);
 });

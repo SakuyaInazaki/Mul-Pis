@@ -49,6 +49,18 @@ test("workflow arm accepts settled usage beyond a legacy wall quota", async (t) 
 	assert.equal("wallMillis" in budget.status().remaining, false);
 });
 
+test("workflow turn continues with complete provider events and unknown price", async () => {
+	const budget = new SharedBudget("workflow-unpriced", {});
+	const unpriced = { ...settledUsage, costComplete: false };
+	const events: UsageSummary[] = [];
+	const runner = createWorkflowMeteredRunner(deadlineRunner(async () => ({ text: "report", stopReason: "stop", toolCalls: 0, usage: unpriced }), () => undefined), budget, budget.root, events);
+	const handle = await runner.create(deadlineSpec);
+	await handle.prompt("first");
+	await handle.prompt("second");
+	assert.equal(events.length, 2);
+	assert.equal(budget.status().usageUnknown, true);
+});
+
 test("bounded I request ignores legacy elapsed-time quotas", async () => {
  let aborts = 0;
  const budget = new SharedBudget("workflow-i-deadline", { ...deadlineLimits, maxInputTokens: 10_000, maxWallMillis: 1 });
@@ -103,13 +115,15 @@ test("real Pi runner SDK boundary accounts for two offline provider rounds with 
 	handle.dispose();
 });
 
-test("tool-turn reservation rejects missing usage but accepts additional settled SDK events", () => {
+test("tool-turn ledger retains missing usage but permits subsequent accounted turns", () => {
 	const limits = { maxProviderCalls: 2, maxInputTokens: 100, maxOutputTokens: 100, maxSdkEstimatedCost: 1, maxProbeCalls: 0, maxCpuMillis: 1_000, maxWallMillis: 20_000 };
 	const missing = new SharedBudget("unknown-turn", limits);
 	const first = missing.reserveObservedTurn(missing.root);
 	missing.markObservedTurnUnknown(first);
 	assert.equal(missing.status().settlement, "pending-or-unknown");
-	assert.throws(() => missing.reserveObservedTurn(missing.root));
+	const next = missing.reserveObservedTurn(missing.root);
+	missing.settleObservedTurn(next, settledUsage);
+	assert.equal(missing.status().usageUnknown, true);
 	const excess = new SharedBudget("excess-turn", limits);
 	const second = excess.reserveObservedTurn(excess.root);
 	excess.settleObservedTurn(second, { input: 20, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 25, cost: 0.03, reportedEvents: 3, unknownEvents: 0, complete: true, costComplete: true });

@@ -1,9 +1,9 @@
 import { HarnessError } from "../types.ts";
 import type { SessionSpec, UsageEvent } from "./types.ts";
 import { getConfinedCampaignFileGrantDescriptor } from "./confined-campaign-files.ts";
-import { certifyLocalNotIssued, certifySettledLocalAdmissionStop, certifySettledTerminalResponse } from "./operation-disposition.ts";
+import { certifySettledTerminalResponse } from "./operation-disposition.ts";
 import type { HostEffectScope, LocalAdmissionDecision } from "./operation-disposition.ts";
-import { DEEPSEEK_FLASH_PUBLISHED_USD_TO_CNY_QUOTE_RATIO, assertNativeCnyPricingCurrent,
+import { assertNativeCnyPricingCurrent,
 	isVerifiedNativeCnyPricingProfile,
 	nativeCnyPricingRecord, type NativeCnyPricingProfile } from "./deepseek-cny-pricing.ts";
 import { isVerifiedDeepSeekProviderOutputLimit, providerOutputLimitRecord,
@@ -12,19 +12,19 @@ export { isSettledLocalAdmissionStop as isSettledLocalCampaignBudgetStop,
 	settledLocalAdmissionStopDetails as settledLocalCampaignBudgetStopDetails } from "./operation-disposition.ts";
 
 /**
- * In-process accounting for one DeepSeek research attempt under a global total.
- * The caller must carry all earlier attempts' settled and unknown commitments in
- * priorCommittedCny. Unknown reservations are never refunded: a timeout or lost
- * response may still be billed. Estimates are not provider invoices. This class
- * is neither a cross-process lock nor a persistent accounting ledger.
+ * In-process transport/accounting evidence for one DeepSeek research attempt.
+ * The separate authenticated carry preserves earlier observations and uncertain
+ * holds. This class does not limit spending; estimates are not provider invoices.
  */
 export interface DeepSeekCampaignLimits {
 	model: string;
 	endpoint: "https://api.deepseek.com";
-	/** The single overall campaign ceiling, including every earlier attempt. */
-	maxCny: number;
-	/** Trusted conservative commitments from earlier processes, never model-supplied. */
-	priorCommittedCny: number;
+	/** Only valid live mode; old ceiling fields are decoded as historical data. */
+	accountingMode?: "accounting-only";
+	/** Historical caller field, accepted for compatibility but never a live gate. */
+	maxCny?: number;
+	/** Historical caller field; cumulative provenance is kept by the signed carry. */
+	priorCommittedCny?: number;
 	/** Retired historical input fields; accepted for record compatibility, never enforced. */
 	maxProviderCalls?: number;
 	maxProviderCallsPerPrompt?: number;
@@ -34,17 +34,16 @@ export interface DeepSeekCampaignLimits {
 	/** Optional serialized request byte boundary for a fixed-size public input. */
 	maxInputPayloadBytes?: number;
 	outputAccountingMarginTokens: number;
-	/** Planning estimates for the global total, dynamically raised if SDK model rates are higher. */
-	estimatedInputCnyPerMillionTokens: number;
+	/** Retired planning rates; live CNY estimates use only a verified native profile. */
+	estimatedInputCnyPerMillionTokens?: number;
 	estimatedCacheReadCnyPerMillionTokens?: number;
-	estimatedOutputCnyPerMillionTokens: number;
-	/** Legacy USD estimate conversion only; forbidden with a native CNY profile. */
+	estimatedOutputCnyPerMillionTokens?: number;
+	/** Retired USD conversion, never used as live CNY evidence. */
 	estimatedCnyPerUsd?: number;
 	/** A live host-verified CNY billing profile for new requests; never inherited from old carries. */
 	nativeCnyPricing?: NativeCnyPricingProfile;
 }
 
-function positive(value: number): boolean { return Number.isFinite(value) && value > 0; }
 function count(value: number): boolean { return Number.isSafeInteger(value) && value > 0; }
 
 /** An opaque, single-process capability for one prompt on one session. */
@@ -62,8 +61,6 @@ export interface PromptUsageReceipt {
 interface LeaseState {
 	readonly requests: RequestState[];
 	active: boolean;
-	localRejectionReason?: "total-cny-ceiling" | "provider-call-limit";
-	localAdmissionRejection?: CampaignAdmissionRejection;
 	terminalLengthRequestId?: string;
 }
 
@@ -73,6 +70,8 @@ interface RequestState {
 	readonly maxOutputTokens: number;
 	readonly worstCny: number;
 	readonly rates: { input: number; cacheRead: number; output: number };
+	/** Whether the native CNY rate was verified when this transport was admitted. */
+	readonly nativeCnyVerified?: boolean;
 	status: "reserved" | "settled" | "unknown";
 	settledCny?: number;
 	unknownHeldCny?: number;
@@ -110,7 +109,6 @@ export interface CampaignAdmissionRejection {
 export class DeepSeekCampaignBudget {
 	readonly limits: Readonly<DeepSeekCampaignLimits>;
 	private rates: { input: number; cacheRead: number; output: number };
-	private readonly usdEstimateToCnyQuote: number;
 	private readonly pricingProfile?: NativeCnyPricingProfile;
 	private readonly outputProfile: DeepSeekProviderOutputLimit;
 	private readonly outputBoundTokens: number;
@@ -128,49 +126,40 @@ export class DeepSeekCampaignBudget {
 	private readonly admissionRejections: CampaignAdmissionRejection[] = [];
 	private activePrompts = 0;
 	private stopped = false;
-	private stopReason?: "payload-boundary" | "total-cny-ceiling" | "provider-call-limit" | "price-assumption-invalid" | "usage-reconciliation" | "prompt-failure" | "output-limit";
+	private stopReason?: "payload-boundary" | "usage-reconciliation" | "prompt-failure" | "output-limit";
 
 	constructor(limits: DeepSeekCampaignLimits) {
 		if (!/^deepseek\/[^/]+(?::(?:off|minimal|low|medium|high|max))?$/.test(limits.model) || limits.endpoint !== "https://api.deepseek.com" ||
-			!positive(limits.maxCny) || !Number.isFinite(limits.priorCommittedCny) || limits.priorCommittedCny < 0 ||
+			(limits.accountingMode !== undefined && limits.accountingMode !== "accounting-only") ||
+			(limits.priorCommittedCny !== undefined && (!Number.isFinite(limits.priorCommittedCny) || limits.priorCommittedCny < 0)) ||
 			!isVerifiedDeepSeekProviderOutputLimit(limits.providerOutputLimit) ||
 			limits.providerOutputLimit.endpoint !== limits.endpoint ||
 			limits.model.slice("deepseek/".length).split(":")[0] !== limits.providerOutputLimit.model ||
 			(limits.maxInputPayloadBytes !== undefined && !count(limits.maxInputPayloadBytes)) ||
-			(limits.nativeCnyPricing !== undefined &&
-				limits.providerOutputLimit.modelVersion !== limits.nativeCnyPricing.modelVersion) ||
-			!Number.isSafeInteger(limits.outputAccountingMarginTokens) || limits.outputAccountingMarginTokens < 0 ||
-			!positive(limits.estimatedInputCnyPerMillionTokens) ||
-			(limits.estimatedCacheReadCnyPerMillionTokens !== undefined && !positive(limits.estimatedCacheReadCnyPerMillionTokens)) ||
-			!positive(limits.estimatedOutputCnyPerMillionTokens) ||
-			(limits.nativeCnyPricing ?
-				(!isVerifiedNativeCnyPricingProfile(limits.nativeCnyPricing) ||
-					!/^deepseek\/deepseek-flash(?::(?:off|minimal|low|medium|high|max))?$/.test(limits.model) ||
-					limits.estimatedCnyPerUsd !== undefined ||
-					limits.estimatedInputCnyPerMillionTokens !== limits.nativeCnyPricing.rates.inputMiss ||
-					limits.estimatedCacheReadCnyPerMillionTokens !== limits.nativeCnyPricing.rates.cacheRead ||
-					limits.estimatedOutputCnyPerMillionTokens !== limits.nativeCnyPricing.rates.output) :
-				!positive(limits.estimatedCnyPerUsd ?? NaN))) {
+			!Number.isSafeInteger(limits.outputAccountingMarginTokens) || limits.outputAccountingMarginTokens < 0) {
 			throw new HarnessError("runner.campaign", "invalid DeepSeek campaign limits");
 		}
 		const { maxProviderCalls: _retiredCalls, maxProviderCallsPerPrompt: _retiredPromptCalls,
 			maxOutputTokens: _retiredOutputCap, ...activeLimits } = limits;
 		this.limits = Object.freeze(activeLimits);
-		this.pricingProfile = limits.nativeCnyPricing;
+		this.pricingProfile = limits.nativeCnyPricing &&
+			isVerifiedNativeCnyPricingProfile(limits.nativeCnyPricing) &&
+			/^deepseek\/deepseek-flash(?::(?:off|minimal|low|medium|high|max))?$/.test(limits.model) &&
+			limits.providerOutputLimit.modelVersion === limits.nativeCnyPricing.modelVersion
+			? limits.nativeCnyPricing : undefined;
 		this.outputProfile = limits.providerOutputLimit;
 		this.outputBoundTokens = limits.providerOutputLimit.maxOutputTokens;
-		if (this.pricingProfile) assertNativeCnyPricingCurrent(this.pricingProfile);
-		this.usdEstimateToCnyQuote = limits.nativeCnyPricing ?
-			DEEPSEEK_FLASH_PUBLISHED_USD_TO_CNY_QUOTE_RATIO : limits.estimatedCnyPerUsd!;
-		this.rates = { input: limits.estimatedInputCnyPerMillionTokens,
-			cacheRead: limits.estimatedCacheReadCnyPerMillionTokens ?? limits.estimatedInputCnyPerMillionTokens,
-			output: limits.estimatedOutputCnyPerMillionTokens };
+		// A once-verified profile can expire while research is running. Its expiry
+		// makes later CNY observations unknown; it does not block transport.
+		this.rates = { input: this.pricingProfile?.rates.inputMiss ?? 0,
+			cacheRead: this.pricingProfile?.rates.cacheRead ?? 0,
+			output: this.pricingProfile?.rates.output ?? 0 };
 	}
 
-	private requireCurrentPricing(): void {
-		if (!this.pricingProfile) return;
-		try { assertNativeCnyPricingCurrent(this.pricingProfile); }
-		catch (error) { this.stop("price-assumption-invalid"); throw error; }
+	private nativePricingCurrent(): boolean {
+		if (!this.pricingProfile) return false;
+		try { assertNativeCnyPricingCurrent(this.pricingProfile); return true; }
+		catch { return false; }
 	}
 
 	get strictRequest(): NonNullable<SessionSpec["strictRequest"]> {
@@ -206,28 +195,16 @@ export class DeepSeekCampaignBudget {
 	assertResolved(model: { provider: string; id: string; api: string; baseUrl: string; maxTokens: number;
 		contextWindow?: number; cost: { input: number; output: number; cacheRead: number; cacheWrite: number;
 			tiers?: Array<{ input: number; output: number; cacheRead: number; cacheWrite: number }> } }): void {
-		this.requireCurrentPricing();
 		const modelId = this.limits.model.slice("deepseek/".length).split(":")[0];
-		const rates = [model.cost, ...(model.cost.tiers ?? [])];
 		if (model.provider !== "deepseek" || model.id !== modelId || model.api !== "openai-completions" ||
 			model.baseUrl !== this.limits.endpoint || this.outputBoundTokens > model.maxTokens ||
 			(model.maxTokens !== this.outputProfile.maxOutputTokens ||
-				model.contextWindow !== this.outputProfile.contextWindow) ||
-			rates.some((rate) => [rate.input, rate.cacheWrite, rate.cacheRead, rate.output].some((v) => !Number.isFinite(v) || v < 0)) ||
-			model.cost.input <= 0 || model.cost.output <= 0) {
-			throw new HarnessError("runner.campaign", "DeepSeek model, endpoint or pricing data did not verify");
+				model.contextWindow !== this.outputProfile.contextWindow)) {
+			throw new HarnessError("runner.campaign", "DeepSeek model, endpoint or provider output limit did not verify");
 		}
-		// Higher model rates consume more of the same global total; they are not a
-		// separate reason to reject an otherwise affordable request.
-		this.rates = {
-			input: Math.max(this.rates.input, ...rates.map((rate) => Math.max(rate.input, rate.cacheWrite) * this.usdEstimateToCnyQuote)),
-			cacheRead: Math.max(this.rates.cacheRead, ...rates.map((rate) => rate.cacheRead * this.usdEstimateToCnyQuote)),
-			output: Math.max(this.rates.output, ...rates.map((rate) => rate.output * this.usdEstimateToCnyQuote)),
-		};
 	}
 
 	beginPrompt(sessionId: string, promptId: string): PromptLease {
-		this.requireCurrentPricing();
 		if (this.stopped) throw new HarnessError("runner.campaign", "campaign is stopped");
 		if (!sessionId || !promptId || typeof sessionId !== "string" || typeof promptId !== "string") {
 			this.stop("prompt-failure");
@@ -247,57 +224,13 @@ export class DeepSeekCampaignBudget {
 	}
 
 	/** Largest cap this exact serialized payload can afford, including the margin and all prior holds. */
-	affordableOutputTokens(payloadBytes: number): number {
-		if (!count(payloadBytes)) throw new HarnessError("runner.campaign", "provider payload byte count is unavailable");
-		const available = this.limits.maxCny - this.committedCny();
-		const inputCny = payloadBytes * Math.max(this.rates.input, this.rates.cacheRead) / 1_000_000;
-		const marginCny = this.limits.outputAccountingMarginTokens * this.rates.output / 1_000_000;
-		const raw = Math.floor((available - inputCny - marginCny) * 1_000_000 / this.rates.output);
-		let cap = Math.min(this.outputBoundTokens, Math.max(0, raw));
-		// A decimal rounding edge may make the floor one token too high. Admission
-		// also accounts for the encrypted carry's upward nanocurrency rounding.
-		while (cap > 0 && !this.withinCeiling(this.worstCny(payloadBytes, cap))) cap--;
-		return cap;
-	}
-
-	private withinCeiling(nextCny: number): boolean {
-		const nano = (amount: number): number => Math.ceil(amount * 1_000_000_000);
-		const pieces = [this.limits.priorCommittedCny, this.settledCny, this.inFlightReservedCny,
-			this.unknownReservedCny, nextCny].map(nano);
-		return pieces.every(Number.isSafeInteger) && Number.isSafeInteger(nano(this.limits.maxCny)) &&
-			pieces.reduce((sum, amount) => sum + amount, 0) <= nano(this.limits.maxCny) &&
-			this.committedCny() + nextCny <= this.limits.maxCny;
-	}
-
 	private worstCny(payloadBytes: number, maxOutputTokens: number): number {
 		return (payloadBytes * Math.max(this.rates.input, this.rates.cacheRead) +
 			(maxOutputTokens + this.limits.outputAccountingMarginTokens) * this.rates.output) / 1_000_000;
 	}
 
-	private recordAdmissionRejection(state: LeaseState, payloadBytes: number,
-		requestedOutputTokens: number, decision: LocalAdmissionDecision): void {
-		const inputRate = Math.max(this.rates.input, this.rates.cacheRead);
-		const diagnostic: CampaignAdmissionRejection = Object.freeze({
-			version: 1, kind: "campaign-admission-rejection", decision, requestNotSent: true,
-			inputPayloadBytes: payloadBytes, inputUpperCny: payloadBytes * inputRate / 1_000_000,
-			outputAllowanceTokens: this.affordableOutputTokens(payloadBytes), minimumOutputTokens: 1,
-			requestedOutputTokens, outputAccountingMarginTokens: this.limits.outputAccountingMarginTokens,
-			marginUpperCny: this.limits.outputAccountingMarginTokens * this.rates.output / 1_000_000,
-			availableCny: this.limits.maxCny - this.committedCny(),
-			requiredAtMinimumOutputCny: this.worstCny(payloadBytes, 1),
-			globalMaxCny: this.limits.maxCny, committedBeforeCny: this.committedCny(),
-			settledProviderRequestCount: state.requests.filter((request) => request.status === "settled").length,
-			pricingBasis: Object.freeze({ source: this.pricingProfile ?
-				"native-cny-peak-and-normalized-sdk-quotes" : "higher-of-configured-and-sdk-estimates",
-				inputCnyPerMillionTokens: inputRate, outputCnyPerMillionTokens: this.rates.output }),
-		});
-		state.localAdmissionRejection = diagnostic;
-		this.admissionRejections.push(diagnostic);
-	}
-
 	/** Called synchronously by onPayload, before the HTTP request can begin. */
 	reserve(lease: PromptLease, payloadBytes: number, providerRequestId: string, maxOutputTokens = this.outputBoundTokens): void {
-		this.requireCurrentPricing();
 		const state = this.leases.get(lease);
 		if (!state?.active || this.stopped || !count(payloadBytes) || !count(maxOutputTokens) ||
 			maxOutputTokens !== this.outputBoundTokens || typeof providerRequestId !== "string" || !providerRequestId) {
@@ -310,46 +243,28 @@ export class DeepSeekCampaignBudget {
 			throw new HarnessError("runner.campaign", "provider request ID was already reserved");
 		}
 		const next = this.reservations + 1;
-		const worstCny = this.worstCny(payloadBytes, maxOutputTokens);
-		if (!Number.isFinite(worstCny) || !this.withinCeiling(worstCny)) {
-			state.localRejectionReason = "total-cny-ceiling";
-			const inputUpperCny = payloadBytes * Math.max(this.rates.input, this.rates.cacheRead) / 1_000_000;
-			const decision: LocalAdmissionDecision = inputUpperCny > this.limits.maxCny - this.committedCny()
-				? "input-unaffordable" : this.affordableOutputTokens(payloadBytes) < 1
-					? "minimum-output-unaffordable" : "provider-maximum-unaffordable";
-			this.recordAdmissionRejection(state, payloadBytes, maxOutputTokens, decision);
-			this.stop("total-cny-ceiling");
-			throw new HarnessError("runner.campaign", "campaign global CNY total exhausted");
-		}
+		const projectedCny = this.worstCny(payloadBytes, maxOutputTokens);
+		const priceFinite = Number.isFinite(projectedCny) && projectedCny >= 0;
+		const worstCny = priceFinite ? projectedCny : 0;
 		this.reservations = next;
 		this.grossReservedCny += worstCny;
 		this.inFlightReservedCny += worstCny;
 		this.requestIds.add(providerRequestId);
 		const request = { id: providerRequestId, inputPayloadBytes: payloadBytes, maxOutputTokens, worstCny,
+			nativeCnyVerified: priceFinite && this.nativePricingCurrent(),
 			rates: { ...this.rates }, status: "reserved" as const };
 		state.requests.push(request);
 		this.auditRequests.push(request);
 	}
 
 	/** Certified only for an unsent first request in a live prompt and safe tool scope. */
-	certifyLocalNotIssued(lease: PromptLease, effectScope: HostEffectScope | undefined): HarnessError | undefined {
-		const state = this.leases.get(lease);
-		if (!effectScope || !state?.active || !state.localRejectionReason ||
-			state.requests.length !== 0 || !state.localAdmissionRejection?.requestNotSent) return undefined;
-		return certifyLocalNotIssued({ settledProviderRequestCount: 0, requestNotSent: true,
-			stopReason: state.localRejectionReason,
-			admissionDecision: state.localAdmissionRejection.decision, effectScope },
-			`${state.localRejectionReason === "total-cny-ceiling" ? "campaign global CNY total exhausted" : "campaign provider call limit exhausted"} before first transport; prompt not issued`);
+	certifyLocalNotIssued(_lease: PromptLease, _effectScope: HostEffectScope | undefined): HarnessError | undefined {
+		return undefined;
 	}
 
 	/** Evidence is limited to this live lease; no caller-created status can certify it. */
-	certifySettledLocalBudgetStop(lease: PromptLease, effectScope: HostEffectScope | undefined): HarnessError | undefined {
-		const state = this.leases.get(lease);
-		if (!effectScope || !state?.active || !state.localRejectionReason || state.requests.length === 0 ||
-			state.requests.some((request) => request.status !== "settled")) return undefined;
-		return certifySettledLocalAdmissionStop({ settledProviderRequestCount: state.requests.length,
-			rejectedBeforeTransport: true, stopReason: state.localRejectionReason, effectScope },
-			`${state.localRejectionReason === "total-cny-ceiling" ? "campaign global CNY total exhausted" : "campaign provider call limit exhausted"} after settled provider requests; next request was rejected before transport`);
+	certifySettledLocalBudgetStop(_lease: PromptLease, _effectScope: HostEffectScope | undefined): HarnessError | undefined {
+		return undefined;
 	}
 
 	/** A received length response is incomplete, even when every provider charge is settled. */
@@ -363,7 +278,7 @@ export class DeepSeekCampaignBudget {
 			"provider length response received and settled; research task remains incomplete");
 	}
 
-	private committedCny(): number { return this.limits.priorCommittedCny + this.settledCny + this.inFlightReservedCny + this.unknownReservedCny; }
+	private committedCny(): number { return (this.limits.priorCommittedCny ?? 0) + this.settledCny + this.inFlightReservedCny + this.unknownReservedCny; }
 	/** Recompute from retained request facts: subtracting floating reservations can
 	 * otherwise leave a negative epsilon after the last in-flight request settles.
 	 */
@@ -392,17 +307,15 @@ export class DeepSeekCampaignBudget {
 		}
 		const fingerprint = this.reportFingerprint(event);
 		const usage = event.usage;
-		const observedEstimateCny = typeof usage?.cost === "number" && Number.isFinite(usage.cost) && usage.cost >= 0
-			? Math.min(Number.MAX_VALUE, usage.cost * this.usdEstimateToCnyQuote) : 0;
 		if (request.status === "unknown") {
 			if (request.reportFingerprint === fingerprint) return;
-			this.markUnknown(request, true, observedEstimateCny);
+			this.markUnknown(request, true);
 			this.stop("usage-reconciliation");
 			throw new HarnessError("runner.campaign", "provider usage conflicts with an earlier settlement");
 		}
 		if (request.status === "settled") {
 			if (request.reportFingerprint === fingerprint) return;
-			this.markUnknown(request, true, observedEstimateCny);
+			this.markUnknown(request, true);
 			this.stop("usage-reconciliation");
 			throw new HarnessError("runner.campaign", "provider usage conflicts with an earlier settlement");
 		}
@@ -419,41 +332,32 @@ export class DeepSeekCampaignBudget {
 			(usage?.cacheRead ?? NaN) * request.rates.cacheRead +
 			(usage?.output ?? NaN) * request.rates.output) / 1_000_000;
 		if (event.kind !== "assistant" ||
-			event.provider !== "deepseek" || event.model !== this.limits.model.slice("deepseek/".length).split(":")[0] ||
-			!usage || ![usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.totalTokens]
-				.every((value) => Number.isSafeInteger(value) && value! >= 0) ||
+			event.provider !== "deepseek" || event.model !== this.limits.model.slice("deepseek/".length).split(":")[0]) {
+			this.markUnknown(request);
+			this.stop("usage-reconciliation");
+			throw new HarnessError("runner.campaign", "provider identity differs from the verified DeepSeek transport");
+		}
+		if (!usage || ![usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.totalTokens]
+			.every((value) => Number.isSafeInteger(value) && value! >= 0) ||
 			usage.totalTokens !== input + usage.output! || input <= 0 || usage.output! <= 0 ||
 			input > request.inputPayloadBytes || usage.output! > request.maxOutputTokens + this.limits.outputAccountingMarginTokens ||
 			!(["stop", "toolUse", "length"] as Array<string | undefined>).includes(event.stopReason)) {
-			this.markUnknown(request, false, observedEstimateCny);
-			this.stop("usage-reconciliation");
-			throw new HarnessError("runner.campaign", "provider usage or call outcome is inconsistent");
-		}
-		if (event.status !== "reported" || event.costStatus !== "priced" ||
-			!Number.isFinite(usage.cost) || usage.cost! < 0 || !Number.isFinite(charge)) {
-			// A successful call with no trustworthy price keeps its conservative
-			// reservation. Unknown price must never be reported as settled cost.
-			this.markUnknown(request, false, Math.max(Number.isFinite(charge) ? charge : 0, observedEstimateCny));
+			// Unreliable fee usage is retained as unknown; it cannot revoke future
+			// transport authority or turn an uncertain charge into a free one.
+			this.markUnknown(request);
 			request.reportFingerprint = fingerprint;
-			if (this.committedCny() > this.limits.maxCny) this.stop("total-cny-ceiling");
-			else if (charge > request.worstCny || observedEstimateCny > request.worstCny) this.stop("price-assumption-invalid");
-			return;
+			throw new HarnessError("runner.campaign.usage-unknown", "provider usage or call outcome is inconsistent");
 		}
-		const sdkEstimateCny = observedEstimateCny;
-		if (!Number.isFinite(sdkEstimateCny) || charge > request.worstCny || sdkEstimateCny > request.worstCny) {
-			// The request's pre-HTTP reservation no longer protects the sole
-			// mission total. Preserve the larger observation, but do not allow
-			// another request on pricing assumptions that just proved too low.
-			this.markUnknown(request, false, Math.max(charge, sdkEstimateCny));
-			request.reportFingerprint = fingerprint;
-			this.stop(this.committedCny() > this.limits.maxCny ? "total-cny-ceiling" : "price-assumption-invalid");
-			return;
+		// An unverifiable currency is an unknown fee observation, never a
+		// zero-cost charge and never a reason to refuse later work.
+		if (!request.nativeCnyVerified || event.status !== "reported" || !Number.isFinite(charge)) {
+			this.markUnknown(request, false, 0);
+		} else {
+			request.status = "settled";
+			request.settledCny = charge;
+			this.recountCommitments();
 		}
-		request.status = "settled";
-		request.settledCny = Math.max(charge, sdkEstimateCny);
 		request.reportFingerprint = fingerprint;
-		this.recountCommitments();
-		if (this.committedCny() > this.limits.maxCny) this.stop("total-cny-ceiling");
 	}
 
 	/** A known length response is charged at its reported bound, but cannot authorize another request. */
@@ -464,8 +368,7 @@ export class DeepSeekCampaignBudget {
 		if (state?.active && state.requests.at(-1)?.id === requestId &&
 			state.requests.every((request) => request.status === "settled")) {
 			state.terminalLengthRequestId = requestId;
-			this.stop("output-limit");
-		} else this.stop("prompt-failure");
+		}
 	}
 
 	private markUnknown(request: RequestState, includeSettled = false, additionalEstimateCny = 0): void {
@@ -497,7 +400,8 @@ export class DeepSeekCampaignBudget {
 			}
 			for (const { event } of receipts) this.usageEntryIds.add(event.entryId);
 		} catch (error) {
-			this.stop("usage-reconciliation");
+			if (!(error instanceof HarnessError && error.code === "runner.campaign.usage-unknown"))
+				this.stop("usage-reconciliation");
 			throw error;
 		} finally {
 			if (state?.active) {
@@ -508,7 +412,6 @@ export class DeepSeekCampaignBudget {
 	}
 
 	failPrompt(lease: PromptLease): void {
-		this.stop("prompt-failure");
 		const state = this.leases.get(lease);
 		if (state?.active) {
 			for (const request of state.requests) this.markUnknown(request);
@@ -530,9 +433,10 @@ export class DeepSeekCampaignBudget {
 	/** Prior, current, and mission commitments are distinct: only the mission total controls admission.
 	 * settled/inFlight/unknown and grossReserved describe this process only; prior status is not inferred.
 	 */
-	snapshot(): { reservedCny: number; grossReservedCny: number; priorCommittedCny: number; currentCommittedCny: number; missionCommittedCny: number; committedCny: number; settledCny: number; inFlightReservedCny: number; unknownReservedCny: number; reservations: number; stopped: boolean; active: boolean; activePrompts: number; stopReason?: string; admissionRejection?: { decision: LocalAdmissionDecision; requestNotSent: true }; pricingProfile?: NativeCnyPricingProfile; providerOutputLimit?: DeepSeekProviderOutputLimit } {
+	snapshot(): { accountingMode: "observed-only"; unpricedRequestCount: number; reservedCny: number; grossReservedCny: number; priorCommittedCny: number; currentCommittedCny: number; missionCommittedCny: number; committedCny: number; settledCny: number; inFlightReservedCny: number; unknownReservedCny: number; reservations: number; stopped: boolean; active: boolean; activePrompts: number; stopReason?: string; admissionRejection?: { decision: LocalAdmissionDecision; requestNotSent: true }; pricingProfile?: NativeCnyPricingProfile; providerOutputLimit?: DeepSeekProviderOutputLimit } {
 		return { reservedCny: this.grossReservedCny, grossReservedCny: this.grossReservedCny,
-			priorCommittedCny: this.limits.priorCommittedCny,
+			accountingMode: "observed-only", unpricedRequestCount: this.auditRequests.filter((r) => !r.nativeCnyVerified).length,
+			priorCommittedCny: this.limits.priorCommittedCny ?? 0,
 			currentCommittedCny: this.settledCny + this.inFlightReservedCny + this.unknownReservedCny,
 			missionCommittedCny: this.committedCny(),
 			committedCny: this.committedCny(), settledCny: this.settledCny,
@@ -564,5 +468,31 @@ export class DeepSeekCampaignBudget {
 			admissionRejections: this.admissionRejections.map(row => ({ ...row, pricingBasis: { ...row.pricingBasis } })),
 			...(this.pricingProfile ? { pricingProfile: nativeCnyPricingRecord(this.pricingProfile) } : {}),
 			providerOutputLimit: providerOutputLimitRecord(this.outputProfile) };
+	}
+
+	/** New-run observations. Null CNY means currency/pricing could not be verified. */
+	requestAccountingAuditSnapshot(): {
+		version: 3; kind: "accounting-only-request-audit";
+		requests: Array<{ requestId: string; inputPayloadBytes: number; maxOutputTokens: number;
+			status: "settled" | "unknown" | "in-flight"; settledCny: number | null;
+			unknownObservedCny: number | null; reportedUsage: NonNullable<RequestState["reportedUsage"]> | null }>;
+		settledCny: number; unknownObservedCny: number; unpricedRequestCount: number;
+		pricingProfile?: NativeCnyPricingProfile;
+	} {
+		const requests = this.auditRequests.map((request) => ({
+			requestId: request.id, inputPayloadBytes: request.inputPayloadBytes,
+			maxOutputTokens: request.maxOutputTokens,
+			status: request.status === "reserved" ? "in-flight" as const : request.status,
+			settledCny: request.nativeCnyVerified && request.status === "settled" ? request.settledCny ?? null : null,
+			unknownObservedCny: request.nativeCnyVerified && request.status !== "settled"
+				? request.unknownHeldCny ?? request.worstCny : null,
+			reportedUsage: request.reportedUsage ? { ...request.reportedUsage } : null,
+		}));
+		return { version: 3, kind: "accounting-only-request-audit", requests,
+			settledCny: requests.reduce((sum, row) => sum + (row.settledCny ?? 0), 0),
+			unknownObservedCny: requests.reduce((sum, row) => sum + (row.unknownObservedCny ?? 0), 0),
+			unpricedRequestCount: requests.filter((row) => row.settledCny === null && row.unknownObservedCny === null).length,
+			...(this.pricingProfile && this.auditRequests.some((r) => r.nativeCnyVerified)
+				? { pricingProfile: nativeCnyPricingRecord(this.pricingProfile) } : {}) };
 	}
 }

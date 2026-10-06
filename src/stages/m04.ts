@@ -68,7 +68,7 @@ function checkpointRelative(file: string): boolean {
 
 async function requiredM07Reads(root: string, requested: string[] | undefined): Promise<string[]> {
 	if (requested === undefined) return [];
-	if (!Array.isArray(requested) || requested.length < 1 || requested.length > 12 ||
+	if (!Array.isArray(requested) || requested.length < 1 ||
 		new Set(requested).size !== requested.length) throw new HarnessError("m04.m07-evidence", "required M07 read paths must be bounded and unique");
 	const rootReal = await realpath(root);
 	for (const relative of requested) {
@@ -86,18 +86,24 @@ async function assertFullM07Reads(root: string, required: string[], returned: Re
 	for (const relative of required) {
 		const content = await readFile(path.join(root, relative), "utf8");
 		const lineCount = content.split(/\r?\n/).length - (content.endsWith("\n") ? 1 : 0);
-		if (lineCount < 1 || lineCount > 100_000) throw new HarnessError("m04.m07-evidence", "required M07 evidence line count is unavailable");
-		const covered = Array.from({ length: lineCount }, () => false);
+		if (lineCount < 1) throw new HarnessError("m04.m07-evidence", "required M07 evidence line count is unavailable");
+		const ranges: Array<{ start: number; end: number }> = [];
 		let completeTerminalPage = false;
 		for (const event of returned) {
 			if (event.toolName !== "m07_evidence_read" || event.path !== relative ||
 				event.status !== "returned" || event.returned.kind !== "text") continue;
 			const start = event.returned.startLine, end = event.returned.endLine;
 			if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start! < 1 || end! < start! || end! > lineCount) continue;
-			for (let index = start!; index <= end!; index++) covered[index - 1] = true;
+			ranges.push({ start: start!, end: end! });
 			if (end === lineCount && event.returned.truncated === false) completeTerminalPage = true;
 		}
-		if (!completeTerminalPage || covered.some((value) => !value))
+		ranges.sort((a, b) => a.start - b.start || a.end - b.end);
+		let nextUnread = 1;
+		for (const range of ranges) {
+			if (range.start > nextUnread) break;
+			nextUnread = Math.max(nextUnread, range.end + 1);
+		}
+		if (!completeTerminalPage || nextUnread <= lineCount)
 			throw new HarnessError("m04.m07-evidence", "required selected M07 evidence was not returned to the research session in full");
 	}
 }

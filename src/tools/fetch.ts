@@ -31,6 +31,7 @@ export interface FetchResult {
 }
 
 export interface FetchOptions {
+	/** HTTP connection/read-idle fault timeout; never a whole browser-crawl deadline. */
 	timeoutMs?: number;
 	signal?: AbortSignal;
 	/** Skip the browser engine even if installed. */

@@ -3,7 +3,7 @@ import { mkdir, readdir, realpath, rmdir, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { resolveRoleModel } from "../config.ts";
-import type { SessionRunner, SessionSpec } from "../runner/types.ts";
+import type { CustomToolSpec, SessionRunner, SessionSpec } from "../runner/types.ts";
 import { HarnessError } from "../types.ts";
 import { nowIso, readTextIfExists, Workspace, writeFileAtomic } from "../workspace.ts";
 import { runAdmission, timedPrompt, loadCaseSet, type AdmissionResult, type MechanismCaseSet } from "./admission.ts";
@@ -25,7 +25,7 @@ interface PromotionReceipt {
  version: 1; runId: string; versionId: string; previousVersionId?: string;
  state: "prepared" | "active"; preparedAt: string; activatedAt?: string; activePointerIsAuthority: true;
 }
-const IMPROVER_SYSTEM = `You propose one bounded budget policy candidate. Return only JSON with {"hypothesis":{"mechanism":"...","prediction":"...","falsifier":"...","applicability":"...","origin":"improver"},"policy":{"version":1,"maxPromptChars":number,"maxInlineFileChars":number,"maxAggregateInlineChars":number,"maxFeedbackChars":number,"overflowMode":"manifest-and-defer"}}. The hypothesis must be falsifiable. Only the two inline thresholds may change. The anonymous history is developmental feedback, not case answers or proof of scientific benefit. Do not infer private materials.`;
+const IMPROVER_SYSTEM = `You propose one bounded budget policy candidate. Return only JSON with {"hypothesis":{"mechanism":"...","prediction":"...","falsifier":"...","applicability":"...","origin":"improver"},"policy":{"version":1,"maxPromptChars":number,"maxInlineFileChars":number,"maxAggregateInlineChars":number,"maxFeedbackChars":number,"overflowMode":"manifest-and-defer"}}, or {"stop":"specific reason"} when the available evidence supports no further distinct proposal. The hypothesis must be falsifiable. Only the two inline thresholds may change. The anonymous history is developmental feedback, not case answers or proof of scientific benefit. The prompt shows only recent history; history_read can inspect the frozen complete historical summary in bounded ranges. An index or path is not evidence of reading. Do not infer private materials.`;
 const activeImprovements = new Set<string>();
 function runId(now: Date): string { return `${now.toISOString().replace(/[-:.]/g, "").replace("Z", "Z")}-${randomBytes(3).toString("hex")}`; }
 function improvementRoot(root: string): string { return path.join(root, ".agent", "improvement"); }
@@ -57,37 +57,42 @@ function validatePlan(input: CampaignPlan): CampaignPlan {
  const integer = (name: keyof CampaignPlan, min: number, max: number) => { const n = input[name]; if (typeof n !== "number" || !Number.isSafeInteger(n) || n < min || n > max) throw new HarnessError("improvement.plan", `${name} must be an integer from ${min} to ${max}`); };
  if (!input || input.version !== 1) throw new HarnessError("improvement.plan", "CampaignPlan.version must be 1");
  integer("repetitions", 1, Number.MAX_SAFE_INTEGER);
- if (input.maxReadbackChars !== undefined) integer("maxReadbackChars", 0, Number.MAX_SAFE_INTEGER);
- if (typeof input.maxTotalCost !== "number" || !Number.isFinite(input.maxTotalCost) || input.maxTotalCost <= 0) throw new HarnessError("improvement.plan", "maxTotalCost must be positive");
  if (input.caseSetPath !== undefined && (typeof input.caseSetPath !== "string" || !input.caseSetPath.trim())) throw new HarnessError("improvement.plan", "caseSetPath must be a nonempty string");
- const { maxTotalOutputTokens: _legacyOutputLimit, maxCandidates: _legacyCandidates,
+ const { maxTotalCost: _legacyCostLimit, maxTotalOutputTokens: _legacyOutputLimit, maxCandidates: _legacyCandidates,
   maxTrialCalls: _legacyCalls, maxTotalInputTokens: _legacyInput, maxReadbackChars: _legacyReadback, timeoutMs: _legacyTimeout, ...active } = input;
  return active;
 }
 function validateHypothesis(input: unknown): ImprovementHypothesis {
  if (!input || typeof input !== "object") throw new HarnessError("improvement.hypothesis", "hypothesis missing");
  const h = input as Record<string, unknown>;
- for (const key of ["mechanism", "prediction", "falsifier", "applicability"]) if (typeof h[key] !== "string" || !(h[key] as string).trim() || (h[key] as string).length > 2000) throw new HarnessError("improvement.hypothesis", `${key} is required`);
+ for (const key of ["mechanism", "prediction", "falsifier", "applicability"]) if (typeof h[key] !== "string" || !(h[key] as string).trim()) throw new HarnessError("improvement.hypothesis", `${key} is required`);
  if (h.origin !== "improver") throw new HarnessError("improvement.hypothesis", "model proposal origin must be improver");
  return h as unknown as ImprovementHypothesis;
 }
 interface PriorAttemptSummary { id: string; status: string; failureClass: string; hypothesis?: ImprovementHypothesis; policy?: BudgetPolicy; failedGates?: string[] }
+async function readRegisteredAttemptArtifact(root: string, runId: string, recordedPath: string | undefined, relative: string): Promise<string | undefined> {
+ const runDir = runRoot(root, runId);
+ if (!recordedPath || path.resolve(recordedPath) !== path.join(runDir, relative)) return undefined;
+ const [realRun, realFile] = await Promise.all([realpath(runDir).catch(() => undefined), realpath(recordedPath).catch(() => undefined)]);
+ if (!realRun || realFile !== path.join(realRun, relative)) return undefined;
+ return readTextIfExists(recordedPath);
+}
 async function previousAttemptSummaries(root: string, runs: ImprovementStatus["runs"]): Promise<PriorAttemptSummary[]> {
  const history: PriorAttemptSummary[] = [];
- for (const entry of runs.slice(-20)) {
+ for (const entry of runs) {
   const text = await readTextIfExists(path.join(runRoot(root, entry.runId), "run.json")); if (!text) continue;
   let prior: ImprovementRun; try { prior = JSON.parse(text) as ImprovementRun; } catch { continue; }
   for (const attempt of prior.attempts ?? []) {
    const summary: PriorAttemptSummary = { id: `${entry.runId}#${attempt.index}`, status: attempt.status, failureClass: summaryClass(attempt.reason) };
    if (attempt.hypothesis) summary.hypothesis = attempt.hypothesis;
-   const policyText = attempt.candidatePath ? await readTextIfExists(attempt.candidatePath) : undefined;
+   const policyText = await readRegisteredAttemptArtifact(root, entry.runId, attempt.candidatePath, path.join("candidate", `policy-${attempt.index}.json`));
    if (policyText) { try { summary.policy = validateBudgetPolicy(JSON.parse(policyText)); } catch { /* omit invalid legacy candidate */ } }
-   const evaluationText = attempt.evaluationPath ? await readTextIfExists(attempt.evaluationPath) : undefined;
+   const evaluationText = await readRegisteredAttemptArtifact(root, entry.runId, attempt.evaluationPath, `evaluation-${attempt.index}.json`);
    if (evaluationText) { try { const value = JSON.parse(evaluationText) as { gates?: Array<{ name: string; passed: boolean }> }; summary.failedGates = value.gates?.filter((gate) => !gate.passed).map((gate) => gate.name) ?? []; } catch { /* omit */ } }
    history.push(summary);
   }
  }
- return history.slice(-20);
+ return history;
 }
 function sameObservationObligation(a: ImprovementProtocol, b: ImprovementProtocol): boolean {
  return a.version === 2 && b.version === 2 && JSON.stringify(a.baselinePolicy) === JSON.stringify(b.baselinePolicy) &&
@@ -113,7 +118,7 @@ export class ImprovementService {
   if (!(this.minimumInlineCoverageRatio > 0 && this.minimumInlineCoverageRatio <= 1)) throw new HarnessError("improvement.protocol", "minimumInlineCoverageRatio must be between 0 and 1");
   this.now = options.now ?? (() => new Date());
  }
- /** A campaign needs an explicit caller-frozen resource plan, including screen-only runs. */
+ /** A campaign needs an explicit caller-frozen experimental plan, including screen-only runs. */
  async run(plan?: CampaignPlan): Promise<ImprovementRunResult> {
   if (!plan) throw new HarnessError("improvement.plan-required", "improve run requires an explicit CampaignPlan; no model call was made");
   return this.runCampaign(plan);
@@ -127,7 +132,7 @@ export class ImprovementService {
   const baselinePath = path.join(dir, "baseline-policy.json"), protocolPath = path.join(dir, "protocol.json"), statePath = path.join(dir, "run.json"), planPath = path.join(dir, "plan.json");
   const history = await collectProjectionHistory(ws);
   const protocol: ImprovementProtocol = { version: 2, objective: "reduce-observed-inline-payload", minimumReductionRatio: this.minimumReductionRatio, maximumNewDeferredRatio: this.maximumNewDeferredRatio, minimumInlineCoverageRatio: this.minimumInlineCoverageRatio, requireManifestCoverage: true, allowedCandidate: "budget-policy-only", baselinePolicy: baseline, ...history, createdAt: nowIso() };
-  const run: ImprovementRun = { version: 2, runId: id, status: "proposing", startedAt: nowIso(), baselineVersionId: pointer?.versionId ?? "builtin-default", baselinePath, protocolPath, planPath, attempts: [], campaignUsage: { input: 0, output: 0, cost: 0, complete: true, usageSettlement: "settled", proposerCalls: 0, trialCalls: 0, inFlightBudgetMayExceed: true } };
+  const run: ImprovementRun = { version: 2, runId: id, status: "proposing", startedAt: nowIso(), baselineVersionId: pointer?.versionId ?? "builtin-default", baselinePath, protocolPath, planPath, attempts: [], campaignUsage: { input: 0, output: 0, cost: 0, complete: true, usageSettlement: "settled", proposerCalls: 0, trialCalls: 0 } };
   await writeFileAtomic(baselinePath, `${JSON.stringify(baseline, null, 2)}\n`);
   await writeFileAtomic(protocolPath, `${JSON.stringify(protocol, null, 2)}\n`);
   await writeFileAtomic(planPath, `${JSON.stringify({ ...plan, caseSetPath: plan.caseSetPath ? "[caller-supplied case set; frozen separately]" : undefined }, null, 2)}\n`);
@@ -150,7 +155,6 @@ export class ImprovementService {
    run.status = "failed"; run.stopReason = `setup failed: ${(error as Error).message}`; run.finishedAt = nowIso();
    await writeFileAtomic(statePath, `${JSON.stringify(run, null, 2)}\n`); throw error;
   }
-  const budget = { cost: plan.maxTotalCost };
   const seen = new Set<string>();
   const previous = await this.status();
   const previousRuns = previous.runs.filter((r) => r.runId !== id);
@@ -172,22 +176,36 @@ export class ImprovementService {
    }
   }
   for (let index = 1; ; index++) {
-   if (budget.cost <= 0) { run.stopReason = "total proposer/trial cost budget exhausted"; break; }
-   const attempt: ImprovementAttempt = { index, status: "proposing", historyConsumed: [...priorHistory.map((h) => h.id), ...run.attempts.map((a) => `${id}#${a.index}`)] };
+   const currentHistory = await Promise.all(run.attempts.map(async (a): Promise<PriorAttemptSummary> => {
+    const policyText = a.candidatePath ? await readTextIfExists(a.candidatePath) : undefined;
+    let policy: BudgetPolicy | undefined;
+    if (policyText) { try { policy = validateBudgetPolicy(JSON.parse(policyText)); } catch { /* omit invalid candidate */ } }
+    return { id: `${id}#${a.index}`, status: a.status, failureClass: summaryClass(a.reason), hypothesis: a.hypothesis, policy, failedGates: a.reason?.split(", ") };
+   }));
+   const frozenHistory = [...priorHistory, ...currentHistory];
+   const recentHistory = frozenHistory.slice(-3);
+   const attempt: ImprovementAttempt = { index, status: "proposing", historyConsumed: recentHistory.map((h) => h.id), historyAvailableCount: frozenHistory.length, historyReadbackRanges: [] };
    run.attempts.push(attempt); await writeFileAtomic(statePath, `${JSON.stringify(run, null, 2)}\n`);
-   const spec: SessionSpec = { label: `RSI-budget-${id}-${index}`, role: "improver", model, systemPrompt: IMPROVER_SYSTEM, tools: { kind: "none" }, persistDir: ws.sessionsDir };
+   const frozenText = JSON.stringify({ version: 1, attempts: frozenHistory });
+   attempt.historySnapshotPath = path.join(dir, `history-${index}.json`);
+   await writeFileAtomic(attempt.historySnapshotPath, `${frozenText}\n`);
+   const historyRead: CustomToolSpec = { name: "history_read", description: "Read a UTF-16 range of frozen historical attempt summaries. Read-only; cannot browse workspace files or private cases.",
+    params: { start: { type: "number", description: "Zero-based UTF-16 starting offset" }, maxChars: { type: "number", description: "Number of UTF-16 code units to return, 1 through 4000" } },
+    execute: async (args) => {
+     const { start, maxChars } = args;
+     if (typeof start !== "number" || !Number.isSafeInteger(start) || start < 0 || start >= frozenText.length || typeof maxChars !== "number" || !Number.isSafeInteger(maxChars) || maxChars < 1 || maxChars > 4_000) throw new HarnessError("improvement.history-read", "invalid frozen history range");
+     const end = Math.min(frozenText.length, start + maxChars);
+     attempt.historyReadbackRanges!.push({ start, end });
+     await writeFileAtomic(statePath, `${JSON.stringify(run, null, 2)}\n`);
+     return { text: JSON.stringify({ start, end, totalChars: frozenText.length, nextStart: end < frozenText.length ? end : null, text: frozenText.slice(start, end) }) };
+    } };
+   const spec: SessionSpec = { label: `RSI-budget-${id}-${index}`, role: "improver", model, systemPrompt: IMPROVER_SYSTEM, tools: { kind: "custom", tools: [historyRead] }, persistDir: ws.sessionsDir };
    let handle;
    try {
     handle = await this.runner.create(spec); run.session = { id: handle.ref.id, label: handle.ref.label, model: handle.ref.model, file: handle.ref.file, usageSidecar: handle.ref.file?.replace(/\.jsonl$/, ".usage.jsonl") };
-    const currentHistory = await Promise.all(run.attempts.slice(0, -1).map(async (a): Promise<PriorAttemptSummary> => {
-     const policyText = a.candidatePath ? await readTextIfExists(a.candidatePath) : undefined;
-     let policy: BudgetPolicy | undefined;
-     if (policyText) { try { policy = validateBudgetPolicy(JSON.parse(policyText)); } catch { /* omit invalid candidate */ } }
-     return { id: `${id}#${a.index}`, status: a.status, failureClass: summaryClass(a.reason), hypothesis: a.hypothesis, policy, failedGates: a.reason?.split(", ") };
-    }));
     const safePrompt = JSON.stringify({ objective: protocol.objective, thresholds: { minimumReductionRatio: protocol.minimumReductionRatio, maximumNewDeferredRatio: protocol.maximumNewDeferredRatio, minimumInlineCoverageRatio: protocol.minimumInlineCoverageRatio }, baselinePolicy: baseline,
      samples: protocol.samples.map((s) => ({ purpose: s.purpose, deliveryStatus: s.deliveryStatus, inputFileChars: s.inputFileChars, observedInlineChars: s.observedInlineChars })),
-     history: [...priorHistory, ...currentHistory] });
+     history: recentHistory, historyWindow: { total: frozenHistory.length, visible: recentHistory.length, omitted: frozenHistory.length - recentHistory.length, totalChars: frozenText.length, readTool: "history_read" } });
     let turn;
     run.campaignUsage!.proposerCalls++;
     try { turn = await timedPrompt(handle, safePrompt); }
@@ -195,13 +213,15 @@ export class ImprovementService {
      const usage = handle.usageSummary?.() ?? { input: 0, output: 0, cost: 0, complete: false, costComplete: false };
      run.campaignUsage!.input += usage.input; run.campaignUsage!.output += usage.output; run.campaignUsage!.cost += usage.cost; run.campaignUsage!.complete &&= usage.complete && usage.costComplete === true && usage.reportedEvents > 0;
      if (!usage.complete || !usage.costComplete || usage.reportedEvents === 0) run.campaignUsage!.usageSettlement = "pending-or-unknown";
-     budget.cost -= usage.cost;
     }
-    if (!run.campaignUsage!.complete || budget.cost < 0) { attempt.status = "inconclusive"; attempt.reason = "proposer usage incomplete or observed cost budget exceeded"; break; }
     let proposal: unknown;
     try { proposal = JSON.parse(turn.text); } catch { throw new HarnessError("improvement.candidate-json", "proposal must be one JSON object"); }
     if (!proposal || typeof proposal !== "object") throw new HarnessError("improvement.candidate-json", "proposal must be an object");
     const parsed = proposal as Record<string, unknown>;
+    if (Object.hasOwn(parsed, "stop")) {
+     if (typeof parsed.stop !== "string" || !parsed.stop.trim() || Object.keys(parsed).length !== 1) throw new HarnessError("improvement.candidate-json", "stop must contain one specific reason");
+     attempt.status = "inconclusive"; attempt.reason = `improver stopped: ${parsed.stop}`; run.stopReason = attempt.reason; break;
+    }
     attempt.hypothesis = validateHypothesis(parsed.hypothesis);
     const candidate = validateBudgetPolicy(parsed.policy);
     const key = JSON.stringify(candidate);
@@ -215,7 +235,7 @@ export class ImprovementService {
     if (!evaluation.passed) { attempt.status = evaluation.status === "insufficient-evidence" ? "inconclusive" : "rejected"; attempt.reason = evaluation.gates.filter((g) => !g.passed).map((g) => g.name).join(", "); continue; }
     attempt.status = "screened";
     if (!caseSet) { attempt.status = "inconclusive"; attempt.reason = "projection screen only; no caller-authorized paired admission case"; break; }
-    const admission = await runAdmission({ runner: this.runner, config, persistDir: ws.sessionsDir, caseSet, baseline, candidate, baselineVersionId: run.baselineVersionId, candidateVersionId: `candidate-${id}-${index}`, plan, remaining: budget });
+    const admission = await runAdmission({ runner: this.runner, config, persistDir: ws.sessionsDir, caseSet, baseline, candidate, baselineVersionId: run.baselineVersionId, candidateVersionId: `candidate-${id}-${index}`, plan });
     run.campaignUsage!.trialCalls += admission.trialCalls;
     for (const arm of admission.results) { run.campaignUsage!.input += arm.usage.input; run.campaignUsage!.output += arm.usage.output; run.campaignUsage!.cost += arm.usage.cost; run.campaignUsage!.complete &&= arm.usage.complete && !arm.failure;
     if (arm.usage.usageSettlement !== "settled") run.campaignUsage!.usageSettlement = "pending-or-unknown"; }
@@ -238,7 +258,7 @@ export class ImprovementService {
    } finally { handle?.dispose(); await writeFileAtomic(statePath, `${JSON.stringify(run, null, 2)}\n`).catch(() => undefined); }
   }
   run.status = run.attempts.some((a) => a.status === "inconclusive") ? "inconclusive" : run.attempts.some((a) => a.status === "screened") ? "screened" : "rejected";
-  run.stopReason ??= "bounded campaign finished without an accepted candidate"; run.finishedAt = nowIso();
+  run.stopReason ??= "campaign finished without an accepted candidate"; run.finishedAt = nowIso();
   await writeFileAtomic(statePath, `${JSON.stringify(run, null, 2)}\n`);
   return { run, activeVersionId: pointer?.versionId };
  }

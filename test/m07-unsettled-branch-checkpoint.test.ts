@@ -188,10 +188,12 @@ test("failed fork prompt leaves parent evidence intact but cannot select across 
 	assert.equal(archivedParent.controllerEvidence.reviewStatus, "accepted");
 	const capped = await offlineChecks.preserveUnsettledBranchCheckpoint({ ws, runId: goal.runId,
 		outputDir, contract, budgetStopReason: "total-cny-ceiling" });
-	assert.equal(capped.checkpoint.stopReason, "budget-boundary");
+	assert.equal(capped.checkpoint.stopReason, "bounded-run-incomplete");
+	assert.equal(capped.checkpoint.continuation.requiresOperationReconciliation, true);
 	const pricing = await offlineChecks.preserveUnsettledBranchCheckpoint({ ws, runId: goal.runId,
 		outputDir, contract, budgetStopReason: "price-assumption-invalid" });
-	assert.equal(pricing.checkpoint.stopReason, "accounting-integrity-error");
+	assert.equal(pricing.checkpoint.stopReason, "bounded-run-incomplete");
+	assert.equal(pricing.checkpoint.continuation.requiresOperationReconciliation, true);
 	await rm(path.join(outputDir, "branch-child-candidate.cpp"));
 	await rm(path.join(outputDir, "workflow-branch-child-archive.json"));
 	await offlineChecks.preserveUnsettledBranchCheckpoint({ ws, runId: goal.runId, outputDir, contract });

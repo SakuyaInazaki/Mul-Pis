@@ -21,8 +21,8 @@ export interface BudgetLease {
 }
 
 export interface BudgetLimits {
-	/** Cap on Pi SDK price-table estimates, not a provider invoice. */
-	maxSdkEstimatedCost: number;
+	/** Historical SDK-estimate display reference. Never an execution cap. */
+	maxSdkEstimatedCost?: number;
 	/** Historical plan fields remain readable, but are never active resource quotas. */
 	maxProviderCalls?: number;
 	maxInputTokens?: number;
@@ -34,14 +34,17 @@ export interface BudgetLimits {
 
 export interface BudgetStatus {
 	lifecycle: "allocated" | "running" | "closed";
-	/** Every lease displays the one shared root monetary ceiling. */
+	/** Historical monetary reference, when supplied. Display only. */
 	limits: Pick<BudgetLimits, "maxSdkEstimatedCost">;
 	/** Observed usage, including a started call awaiting settlement. */
 	committed: { providerCalls: number; inputTokens: number; outputTokens: number; sdkEstimatedCost: number; probeCalls: number; cpuMillis: number };
 	/** Input is an accounting estimate, never an enforced token envelope. */
 	reserved: { inputTokens: number; sdkEstimatedCost: number };
-	/** Global shared-root monetary balance, including sibling activity. */
-	remaining: { sdkEstimatedCost: number };
+	/** Historical monetary reference less observed/reserved estimates; display only. */
+	remaining: { sdkEstimatedCost?: number };
+	/** Distinguishes a live request from incomplete historical usage. */
+	inFlight: boolean;
+	usageUnknown: boolean;
 	settlement: "settled" | "pending-or-unknown" | "exceeded";
 }
 

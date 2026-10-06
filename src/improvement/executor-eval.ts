@@ -20,8 +20,8 @@ export interface ExecutorQualityResult {
  version: 1; experimentKind: "executor-quality"; status: "accepted" | "rejected" | "inconclusive";
  reason: string; split: "admission"; queryCount: number; baselineAccepted: number; candidateAccepted: number;
  results: QualityArmResult[]; budgetSettlement: "settled" | "pending-or-unknown" | "exceeded";
- /** SDK-estimated cost is governed by the shared supervisor, not required to decrease. */
- costRule: "within-caller-budget";
+ /** Cost is observed for reporting, not a quality-admission criterion. */
+ costRule: "observed-only";
 }
 
 function parseAction(text: string, task: PublicTask): ScientificAction {
@@ -82,7 +82,7 @@ export async function runExecutorQualityAdmission(args: {
  beforeModelRequest?: (versionId: string) => Promise<void>;
  persistObservation: (record: { start: ExperimentStart; action: ScientificAction; feedback: DevelopmentFeedback }) => Promise<{ storeId: string; id: string; version: string }>;
 }): Promise<ExecutorQualityResult> {
- const result: ExecutorQualityResult = { version: 1, experimentKind: "executor-quality", status: "inconclusive", reason: "not evaluated", split: "admission", queryCount: 0, baselineAccepted: 0, candidateAccepted: 0, results: [], budgetSettlement: "settled", costRule: "within-caller-budget" };
+ const result: ExecutorQualityResult = { version: 1, experimentKind: "executor-quality", status: "inconclusive", reason: "not evaluated", split: "admission", queryCount: 0, baselineAccepted: 0, candidateAccepted: 0, results: [], budgetSettlement: "settled", costRule: "observed-only" };
  if (args.caseSet.split !== "admission" || args.repetitions < 2 || args.repetitions % 2 !== 0) { result.reason = "frozen admission split and even repetitions >=2 are required"; return result; }
  for (const c of args.caseSet.cases) {
   const env = createCpuResponseEnvironment(c, args.budget, { persistObservation: args.persistObservation });
@@ -107,7 +107,7 @@ export async function runExecutorQualityAdmission(args: {
     if (arm === "baseline" && protectedStatus === "accepted") result.baselineAccepted++;
     if (arm === "candidate" && protectedStatus === "accepted") result.candidateAccepted++;
     const b = args.budget.status(args.lease); result.budgetSettlement = b.settlement;
-    if (b.settlement !== "settled") { result.reason = "unknown or exceeded shared monetary budget"; return result; }
+    if (b.inFlight) { result.reason = "protected provider request remains in flight"; return result; }
    }
   }
  }
@@ -123,5 +123,5 @@ export async function runExecutorQualityAdmission(args: {
  if (args.comparisonMode === "noninferiority") { result.status = "accepted"; result.reason = "candidate met registered quality noninferiority and scientific hard checks"; return result; }
  const solvedGain = pairs.some((p) => p.find((r) => r.arm === "candidate")!.protectedStatus === "accepted" && p.find((r) => r.arm === "baseline")!.protectedStatus !== "accepted");
  if (candidateScore <= baselineScore || !solvedGain) { result.status = "rejected"; result.reason = "candidate showed no full solved-case gain under the registered partial-unknown rule"; return result; }
- result.status = "accepted"; result.reason = "candidate repaired registered failures without regression under the caller resource cap"; return result;
+ result.status = "accepted"; result.reason = "candidate repaired registered failures without regression"; return result;
 }

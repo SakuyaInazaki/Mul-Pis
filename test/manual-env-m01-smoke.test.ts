@@ -1,35 +1,59 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { MAX_CNY_ESTIMATE, MAX_INPUT_PAYLOAD_BYTES, MODEL_PROFILE, SMOKE_MODEL, assertPreflight, boundedStageRunner, publicUsageFromSidecar, safeFailure } from "../scripts/manual-env-m01-smoke.ts";
+import { MAX_INPUT_PAYLOAD_BYTES, MODEL_PROFILE, SMOKE_MODEL, boundedStageRunner, publicUsageFromSidecar, safeFailure } from "../scripts/manual-env-m01-smoke.ts";
 import { verifyDeepSeekProviderOutputLimit } from "../src/runner/deepseek-provider-limits.ts";
 import { HarnessError } from "../src/types.ts";
 
-test("public M01 smoke has a monetary ceiling without a workflow call or output cap", () => {
-  assertPreflight();
+test("public M01 smoke uses the current model without a workflow output cap", () => {
   assert.equal(SMOKE_MODEL, "deepseek/deepseek-flash:low");
   assert.equal(MAX_INPUT_PAYLOAD_BYTES, 12_000);
   assert.equal(MODEL_PROFILE.providers.deepseek.models[0].maxTokens, 393_216);
-  assert.ok(MAX_CNY_ESTIMATE < 30);
 });
 
-test("public M01 reserves the live provider maximum per transport before spending", async () => {
+test("public M01 applies only the input-byte guard and keeps the live provider output maximum", async (t) => {
   const provider = await verifyDeepSeekProviderOutputLimit({ apiKey: "synthetic-offline-key", request: async () => new Response(JSON.stringify({
     object: "list", data: [{ id: "deepseek-flash", object: "model", name: "DeepSeek-V4.1-Flash",
       context_window: 1_048_576, max_output_tokens: 393_216 }],
   }), { status: 200 }) });
-  const runner = boundedStageRunner({} as ModelRuntime, provider);
-  assert.equal(runner.campaignBudget.strictRequest.maxProviderCallsPerPrompt, undefined);
-  assert.equal(runner.campaignBudget.strictRequest.maxOutputTokens, provider.maxOutputTokens);
-  assert.equal(runner.campaignBudget.strictRequest.maxInputPayloadBytes, MAX_INPUT_PAYLOAD_BYTES);
-  const lease = runner.campaignBudget.beginPrompt("offline", "first");
-  assert.throws(() => runner.campaignBudget.reserve(lease, 100, "offline-request"), /CNY|ceiling|affordable/i);
-  assert.equal(runner.campaignBudget.snapshot().reservations, 0);
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mul-pis-public-smoke-test-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const modelsPath = path.join(dir, "models.json");
+  await writeFile(modelsPath, JSON.stringify({ providers: { deepseek: { models: [{ ...MODEL_PROFILE.providers.deepseek.models[0],
+    maxTokens: provider.maxOutputTokens, contextWindow: provider.contextWindow }] } } }));
+  const runtime = await ModelRuntime.create({ modelsPath, authPath: path.join(dir, "auth.json"),
+    modelsStorePath: path.join(dir, "models-store.json"), allowModelNetwork: false, refreshOnCreate: false });
+  assert.equal(runtime.getModel("deepseek", "deepseek-flash")?.maxTokens, provider.maxOutputTokens);
+  assert.throws(() => boundedStageRunner(runtime, { ...provider }), /live-verified/);
+  const runner = boundedStageRunner(runtime, provider);
+  const handle = await runner.create({ label: "M01", role: "execution", model: SMOKE_MODEL,
+    systemPrompt: "Offline fixed public test", tools: { kind: "none" }, persistDir: path.join(dir, "sessions"),
+    strictRequest: { maxOutputTokens: 1, maxInputPayloadBytes: 100 } });
+  t.after(() => handle.dispose());
+  assert(handle.ref.specFile);
+  const persisted = JSON.parse(await readFile(handle.ref.specFile, "utf8")) as Record<string, unknown>;
+  assert.deepEqual(persisted.strictRequest, { maxInputPayloadBytes: MAX_INPUT_PAYLOAD_BYTES });
+  assert.equal(persisted.model, SMOKE_MODEL);
+  assert.equal("campaignBudget" in runner, false);
+  assert.throws(() => runner.create({ label: "M02", role: "execution", model: SMOKE_MODEL,
+    systemPrompt: "Offline", tools: { kind: "none" }, persistDir: path.join(dir, "other") }), /only one tool-free M01/);
+});
+
+test("offline preflight reports no automatic spending ceiling", async () => {
+  const command = promisify(execFile);
+  const result = await command(process.execPath, ["scripts/manual-env-m01-smoke.ts", "--check"], {
+    cwd: process.cwd(), env: { ...process.env, DEEPSEEK_API_KEY: "" }, timeout: 20_000,
+  });
+  const report = JSON.parse(result.stdout) as Record<string, unknown>;
+  assert.equal(report.ok, true);
+  assert.equal("planningCnyMaximum" in report, false);
+  assert.equal("committedCny" in report, false);
+  assert.match(String(report.note), /no spending ceiling/);
 });
 
 test("isolated profile resolves the current official DeepSeek model offline", async (t) => {

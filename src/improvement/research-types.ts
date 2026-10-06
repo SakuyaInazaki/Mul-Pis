@@ -63,7 +63,7 @@ export interface ResearchDecisionRecordV1 {
  repairSessionIds?: string[];
  branchPrefix?: string;
 }
-export interface ResearchDevelopmentEpisodeV1 { caseId: string; candidateId: string; episode: ExecutorEpisodeResult; sdkEstimatedCost: number; modelCalls: number; scientificStatus: "supported" | "justified-unknown" | "contradicted" | "premature-stop" | "incomplete" }
+export interface ResearchDevelopmentEpisodeV1 { caseId: string; candidateId: string; episode: ExecutorEpisodeResult; sdkEstimatedCost: number; costComplete?: boolean; modelCalls: number; scientificStatus: "supported" | "justified-unknown" | "contradicted" | "premature-stop" | "incomplete" }
 export interface ResearchRunV1 {
  version: 1; runId: string; startedAt: string; finishedAt?: string;
  planPath: string; baselineBundleId: string; baselinePointer?: ActiveGenerationPointerV1;
@@ -80,7 +80,7 @@ export interface ResearchRunV1 {
  budgetAtEnd?: unknown;
 }
 
-/** Closed, caller-supplied total monetary limit. The controller invents no paid default. */
+/** Validate a research plan without inventing a monetary execution limit. */
 export function validateResearchPlan(input: unknown): ResearchCampaignPlanV1 {
  if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.research-plan", "plan must be an object");
  const p = input as Record<string, unknown>;
@@ -99,11 +99,11 @@ export function validateResearchPlan(input: unknown): ResearchCampaignPlanV1 {
  if (!Array.isArray(p.experienceRefs) || p.experienceRefs.length > 20 || !p.experienceRefs.every((r) => !!r && typeof r === "object" && typeof r.storeId === "string" && typeof r.recordId === "string" && Number.isSafeInteger(r.version) && r.version > 0)) throw new HarnessError("improvement.research-plan", "experienceRefs must be bounded pinned refs");
  if (p.experienceRefs.length && ((p.experienceMaxRecords as number) < 1 || (p.experienceMaxChars as number) < 1)) throw new HarnessError("improvement.research-plan", "experience bounds must be positive when refs are requested");
  if (p.metaEpisodeRunIds !== undefined && (!Array.isArray(p.metaEpisodeRunIds) || !p.metaEpisodeRunIds.every((id) => typeof id === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id)) || new Set(p.metaEpisodeRunIds).size !== p.metaEpisodeRunIds.length)) throw new HarnessError("improvement.research-plan", "metaEpisodeRunIds must be distinct same-workspace run identifiers");
- if (!p.budget || typeof p.budget !== "object" || Array.isArray(p.budget)) throw new HarnessError("improvement.research-plan", "budget is required");
- const b = p.budget as Record<string, unknown>;
+ if (p.budget !== undefined && (!p.budget || typeof p.budget !== "object" || Array.isArray(p.budget))) throw new HarnessError("improvement.research-plan", "budget must be an object");
+ const b = (p.budget ?? {}) as Record<string, unknown>;
  const budgetKeys = new Set(["maxProviderCalls", "maxInputTokens", "maxOutputTokens", "maxSdkEstimatedCost", "maxProbeCalls", "maxCpuMillis", "maxWallMillis"]);
  if (Object.keys(b).some((key) => !budgetKeys.has(key))) throw new HarnessError("improvement.research-plan", "budget has unsupported fields");
- if (typeof b.maxSdkEstimatedCost !== "number" || !Number.isFinite(b.maxSdkEstimatedCost) || b.maxSdkEstimatedCost <= 0) throw new HarnessError("improvement.research-plan", "maxSdkEstimatedCost must be positive");
+ if (b.maxSdkEstimatedCost !== undefined && (typeof b.maxSdkEstimatedCost !== "number" || !Number.isFinite(b.maxSdkEstimatedCost) || b.maxSdkEstimatedCost < 0)) throw new HarnessError("improvement.research-plan", "historical maxSdkEstimatedCost must be finite and nonnegative");
  const validateHistoricalPhase = (value: unknown, name: string) => {
   if (value !== undefined && (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some((key) => !budgetKeys.has(key)))) throw new HarnessError("improvement.research-plan", `${name} has unsupported fields`);
  };
@@ -123,5 +123,5 @@ export function validateResearchPlan(input: unknown): ResearchCampaignPlanV1 {
  const { maxDecisions: _decisions, maxCandidates: _candidates, maxCandidatesPerMetaArm: _branchCandidates,
   outerBudget: _outerBudget, pilotBudget: _pilotBudget, protectedBudget: _protectedBudget, metaBranchBudget: _metaBranchBudget,
   maxInspectActions: _inspections, maxReadbackChars: _readback, schemaRepairAttempts: _repairs, perPromptTimeoutMs: _timeout, ...activePlan } = p;
- return { ...activePlan, budget: withoutLegacyOutput(p.budget) } as unknown as ResearchCampaignPlanV1;
+ return { ...activePlan, budget: withoutLegacyOutput(b) } as unknown as ResearchCampaignPlanV1;
 }

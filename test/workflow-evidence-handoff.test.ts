@@ -20,6 +20,12 @@ const task = { objective: "交接固定证据", inputs: [], expectedOutputs: [],
 const caseOf = (split: "development" | "admission", id: string, marker: string) => ({ version: 1, split, cases: [{ id, goal: { ...goal, plan: `${goal.plan} ${id}` }, task: { ...task, objective: `${task.objective} ${id}` }, checks: [{ criterion: task.checks[0], contains: [marker], forbids: ["伪造证据"] }] }] });
 const limits = { maxProviderCalls: 40, maxInputTokens: 2_000_000, maxSdkEstimatedCost: 10, maxProbeCalls: 0, maxCpuMillis: 100_000, maxWallMillis: 120_000 };
 
+test("workflow plan accepts omitted monetary references", () => {
+	const p = { version: 1, kind: "m07-evidence-handoff/v1", developmentSource: { m07RunId: "m07", checkpointId: "C001", m04RunId: "m04" }, developmentCaseSetPath: "development.json", experimentRoot: "arms", maxFeedbackItems: 1, admissionRepetitions: 2 };
+	assert.deepEqual(validateWorkflowPlan(p).budget, {});
+	assert.throws(() => validateWorkflowPlan({ ...p, budget: { maxSdkEstimatedCost: Number.POSITIVE_INFINITY } }), /budget/);
+});
+
 async function fixture(t: import("node:test").TestContext, responder?: (ctx: FakeReplyContext) => string | Promise<string>, viaCli = false, withExperience = false, executorBody = "列出原始证据、限制和未执行项。") {
 	const parent = await mkdtemp(path.join(os.tmpdir(), "pre-rsi-workflow-"));
 	t.after(() => rm(parent, { recursive: true, force: true }));
@@ -295,6 +301,40 @@ test("protected G file inside pre-copied raw material is rejected before I can i
 	assert.equal(run.status, "failed");
 	assert.match(run.stopReason!, /protected case file overlaps/);
 	assert.equal(f.runner.created.length, before);
+});
+
+test("workflow development source retains processing beyond the former 8,000-character clip", async (t) => {
+	let inspected = false;
+	const marker = "COMPLETE_PROCESSING_TAIL_VISIBLE";
+	const f = await fixture(t, (ctx) => {
+		if (ctx.spec.role !== "improver") return "offline source";
+		const view = JSON.parse(ctx.message.slice(ctx.message.indexOf("\n") + 1));
+		if (!view.lastActionResult) {
+			assert.ok(view.developmentSource.totalChars > 8_000);
+			assert.ok(view.developmentSource.totalUtf8Bytes >= view.developmentSource.totalChars);
+			return JSON.stringify({ kind: "inspect", object: "development-feedback", id: view.developmentSource.id, start: view.developmentSource.totalChars - 500, maxChars: 500 });
+		}
+		assert.match(view.lastActionResult.text, /COMPLETE_PROCESSING_TAIL_VISIBLE/);
+		inspected = true;
+		return JSON.stringify({ kind: "stop", reason: "full registered processing inspected" });
+	});
+	const m04 = await f.ws.readRun("M04", f.plan.developmentSource.m04RunId);
+	const processed = m04.outputs.find((item) => item.label === "处理结果")!;
+	await writeFile(processed.path, `${"A".repeat(9_000)}${marker}`);
+	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).runWorkflow(f.plan);
+	assert.equal(run.outcome, "completed-no-candidate", run.stopReason ?? "");
+	assert.equal(inspected, true);
+});
+
+test("isolated workflow copy accepts a plain tree deeper than twelve directories", async (t) => {
+	const f = await fixture(t, (ctx) => ctx.spec.role === "improver" ? JSON.stringify({ kind: "stop", reason: "plain source copy inspected" }) : "offline source");
+	const levels = Array.from({ length: 14 }, (_, index) => `level-${index}`);
+	const nestedDir = path.join(f.ws.rawDir, ...levels);
+	await mkdir(nestedDir, { recursive: true });
+	await writeFile(path.join(nestedDir, "source.txt"), "deep but ordinary frozen evidence");
+	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).runWorkflow(f.plan);
+	assert.equal(run.outcome, "completed-no-candidate", run.stopReason ?? "");
+	assert.equal(await readFile(path.join(f.plan.experimentRoot, "template", "problem", "raw", ...levels, "source.txt"), "utf8"), "deep but ordinary frozen evidence");
 });
 
 test("problem/config symlinks cannot seed an isolated workflow arm", async (t) => {

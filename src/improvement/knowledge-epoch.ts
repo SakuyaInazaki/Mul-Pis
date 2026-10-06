@@ -54,7 +54,7 @@ async function verifyMethodRequirements(workspaceRoot: string, records: Strategy
 			const workflow = targetKind === "executor" && isM07WorkflowStrategy(artifact);
 			const selection = await provider.select({ targetKind, applicability: workflow
 				? { stage: "M07", tags: [artifact.slot] }
-				: { stage: "method-research", tags: ["cpu-response-identification"] }, requestedRefs, expectedSnapshotId: snapshotId, maxRecords: 100, maxChars: 100_000 });
+				: { stage: "method-research", tags: ["cpu-response-identification"] }, requestedRefs, expectedSnapshotId: snapshotId, maxRecords: 1, maxChars: 1, verificationOnly: true });
 			if (selection.status !== "ready" || selection.selected.length !== requestedRefs.length) throw new HarnessError("improvement.knowledge-epoch", "inherited method experience is unavailable or inapplicable at the new knowledge snapshot");
 		}
 		for (const ref of record.requiredKnowledgeRefs) necessary.set(`${ref.storeId}/${ref.recordId}@${ref.version}`, ref);
@@ -129,7 +129,7 @@ export async function transitionMethodKnowledgeDependenciesInLock(args: MethodDe
 	const decision = await knowledge.get(args.decisionRef.recordId, args.decisionRef.version);
 	if (!decision || decision.type !== "D" || decision.source.stage !== "M04" || decision.source.runId !== args.m04RunId || (await knowledge.availability(decision.id, decision.version)).availability !== "usable_conditionally") throw new HarnessError("improvement.dependency-transition", "decision is not an adopted usable M04 D record");
 	const data = decision.fields.methodDependencyTransition as Record<string, unknown> | undefined;
-	if (!data || data.version !== 1 || data.methodVersionId !== args.methodVersionId || !Array.isArray(data.remove) || !Array.isArray(data.add) || !Array.isArray(data.evidenceRefs) || !data.evidenceRefs.length || !isKnowledgeRef(data.revalidationRef) || ![...data.remove, ...data.add, ...data.evidenceRefs].every(isKnowledgeRef) || data.remove.length + data.add.length > 100 || data.evidenceRefs.length > 20) throw new HarnessError("improvement.dependency-transition", "M04 D record lacks exact bounded method/ref/evidence/revalidation decision");
+	if (!data || data.version !== 1 || data.methodVersionId !== args.methodVersionId || !Array.isArray(data.remove) || !Array.isArray(data.add) || !Array.isArray(data.evidenceRefs) || !data.evidenceRefs.length || !isKnowledgeRef(data.revalidationRef) || ![...data.remove, ...data.add, ...data.evidenceRefs].every(isKnowledgeRef)) throw new HarnessError("improvement.dependency-transition", "M04 D record lacks exact method/ref/evidence/revalidation decision");
 	const removed = data.remove as import("../knowledge/types.ts").KnowledgeRef[];
 	const added = data.add as import("../knowledge/types.ts").KnowledgeRef[];
 	const evidence = data.evidenceRefs as import("../knowledge/types.ts").KnowledgeRef[];

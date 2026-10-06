@@ -28,7 +28,7 @@ async function observedGroupMembers(pgid: number | undefined): Promise<{ status:
 	if (!pgid) return { status: "unknown", pids: [], reason: "group id unavailable" };
 	try {
 		const { stdout } = await execFileAsync("ps", ["-axo", "pid=,pgid="], { timeout: 2_000, maxBuffer: 2_000_000 });
-		const pids = stdout.split("\n").map((line) => line.trim().split(/\s+/).map(Number)).filter(([pid, group]) => Number.isSafeInteger(pid) && group === pgid).map(([pid]) => pid).slice(0, 32);
+		const pids = stdout.split("\n").map((line) => line.trim().split(/\s+/).map(Number)).filter(([pid, group]) => Number.isSafeInteger(pid) && group === pgid).map(([pid]) => pid);
 		return { status: "observed", pids };
 	} catch { return { status: "unknown", pids: [], reason: "group scan unavailable" }; }
 }

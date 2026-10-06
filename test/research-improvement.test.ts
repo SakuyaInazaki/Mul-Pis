@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import test, { type TestContext } from "node:test";
 import { ResearchImprovementService } from "../src/improvement/research-service.ts";
-import { GenerationStore } from "../src/improvement/generation.ts";
+import { GenerationStore, validateExperienceRequirements, validateGenerationBundle, validateStrategyRecord } from "../src/improvement/generation.ts";
 import { fullyReadDevelopmentFeedbackIds, validateResearchAction, type ResearchInspectionResultV1 } from "../src/improvement/policy-host.ts";
 import type { ResearchCampaignPlanV1 } from "../src/improvement/research-types.ts";
 import { validateResearchPlan } from "../src/improvement/research-types.ts";
@@ -17,7 +17,7 @@ import { runExecutorQualityAdmission } from "../src/improvement/executor-eval.ts
 import { publicResearchRun, publicResearchStatus } from "../src/improvement/research-public.ts";
 import { validateCpuCaseSet } from "../src/experiments/local-environment.ts";
 import { runMetaImprovementAdmission } from "../src/improvement/meta-eval.ts";
-import { loadMetaEpisode } from "../src/improvement/meta-episode.ts";
+import { buildMetaEpisode, loadMetaEpisode, metaEpisodePath, writeMetaEpisode } from "../src/improvement/meta-episode.ts";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 
 const usage = { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, totalTokens: 150, cost: 0.001 };
@@ -49,7 +49,7 @@ test("legacy method output quota is omitted from active research plan", () => {
  assert.equal("maxOutputTokens" in new SharedBudget("legacy", validated.budget).status().limits, false);
 });
 
-test("research plans retain only the root monetary ceiling", () => {
+test("research plans retain legacy cost references for display and accept no monetary input", () => {
  const base = plan("admission.json");
  const active = validateResearchPlan({ ...base, outerBudget: { maxSdkEstimatedCost: 0.001 }, pilotBudget: { maxSdkEstimatedCost: 0 }, protectedBudget: { maxSdkEstimatedCost: 1_000_000 } });
  assert.deepEqual(active.budget, { maxSdkEstimatedCost: 10 });
@@ -57,6 +57,10 @@ test("research plans retain only the root monetary ceiling", () => {
  const meta = validateResearchPlan({ ...base, experimentKind: "meta-improvement", target: "improver", metaProtocol: "quality", outerBudget: undefined, pilotBudget: undefined, protectedBudget: undefined, metaBranchBudget: undefined });
  assert.equal(meta.budget.maxSdkEstimatedCost, 10);
  assert.equal("metaBranchBudget" in meta, false);
+ const { budget: _legacy, ...withoutBudget } = base;
+ assert.deepEqual(validateResearchPlan(withoutBudget).budget, {});
+ assert.deepEqual(validateResearchPlan({ ...base, budget: {} }).budget, {});
+ assert.throws(() => validateResearchPlan({ ...base, budget: { maxSdkEstimatedCost: Number.POSITIVE_INFINITY } }), /finite/);
 });
 
 function fakeReply(ctx: FakeReplyContext) {
@@ -314,6 +318,47 @@ test("same-workspace development MetaEpisode is inspectable and citable without 
  const altered = JSON.parse(await readFile(episodeFile, "utf8")); altered.candidates[0].hypothesis.claim = "protected-evaluator-sentinel";
  await writeFile(episodeFile, JSON.stringify(altered));
  await assert.rejects(loadMetaEpisode(new GenerationStore(f.root).root, f.root, first.runId), /does not match/);
+});
+
+test("large development MetaEpisode retains every feedback row and observation in bounded parts", async (t) => {
+ const f = await fixture(t);
+ const first = await f.service.run(plan());
+ const root = new GenerationStore(f.root).root;
+ const runFile = path.join(root, "runs", first.runId, "run.json");
+ const source = JSON.parse(await readFile(runFile, "utf8")) as typeof first;
+ const original = source.feedback[0]!;
+ for (let i = 0; i < 100; i++) source.feedback.push({ ...original, id: `outer-initial-large-${i}`, observations: Array.from({ length: 35 }, (_, j) => ({ x: j, y: j + i, xUnit: "second", yUnit: "measurement", source: "initial" as const })) });
+ await writeFile(runFile, JSON.stringify(source));
+ const episode = buildMetaEpisode(source, f.root, "executor", "selected");
+ const file = metaEpisodePath(root, first.runId);
+ await writeMetaEpisode(file, episode);
+ const index = JSON.parse(await readFile(file, "utf8")) as { kind: string; parts: Array<{ file: string }> };
+ assert.equal(index.kind, "meta-episode-parts");
+ assert.ok((await stat(file)).size <= 120_000);
+ for (const part of index.parts) assert.ok((await stat(path.join(path.dirname(file), part.file))).size <= 120_000);
+ const restored = await loadMetaEpisode(root, f.root, first.runId);
+ assert.equal(restored.feedbackExcerptCount, restored.feedbackTotal);
+ assert.equal(restored.feedbackExcerpt.find((item) => item.id === "outer-initial-large-99")?.observations.length, 35);
+ const part = path.join(path.dirname(file), index.parts[0]!.file);
+ const originalPart = await readFile(part, "utf8");
+ await writeFile(part, `${originalPart}x`);
+ await assert.rejects(loadMetaEpisode(root, f.root, first.runId), /part/);
+ await writeFile(part, originalPart);
+ await rm(part);
+ await assert.rejects(loadMetaEpisode(root, f.root, first.runId), /ENOENT|part/);
+});
+
+test("generation validation keeps pinned identities and ancestry without count gates", () => {
+ const storeId = "00000000-0000-4000-8000-000000000001";
+ const refs = Array.from({ length: 101 }, (_, i) => ({ storeId, recordId: `K${String(i + 1).padStart(3, "0")}`, version: 1 }));
+ const requirements = refs.map((ref) => ({ targetKind: "improver" as const, ref }));
+ assert.equal(validateExperienceRequirements(requirements, "requiredExperienceRefs").length, 101);
+ assert.equal(validateStrategyRecord({ version: 1, versionId: "I-many", kind: "improver", artifact: { version: 1, kind: "diagnostic-improver-prompt", body: "Use registered evidence." }, origin: "agent-generated", createdAt: "2026-10-06T00:00:00Z", applicability: [], limitations: [], sourceExperienceRefs: requirements, requiredExperienceRefs: requirements, requiredKnowledgeRefs: refs, state: "research-only" }).requiredKnowledgeRefs.length, 101);
+ const bundle = { version: 1, bundleId: "B-next", parents: ["B-one", "B-two", "B-three", "B-four", "B-five"], executorVersionId: "H-one", improverVersionId: "I-one", createdAt: "2026-10-06T00:00:00Z", environmentVersion: "cpu/v1", modelConfig: { research: "fake/research", improver: "fake/improver" }, protocolVersion: "v1", allowedCapabilities: ["no-tools-model"], state: "research-only" };
+ assert.equal(validateGenerationBundle(bundle).parents.length, 5);
+ assert.throws(() => validateGenerationBundle({ ...bundle, parents: ["B-one", "B-one"] }), /distinct/);
+ assert.throws(() => validateGenerationBundle({ ...bundle, parents: ["B-next"] }), /acyclic/);
+ assert.throws(() => validateExperienceRequirements([...requirements, requirements[0]], "requiredExperienceRefs"), /duplicate/);
 });
 
 test("schema repair is explicit, bounded, and debited as another provider request", async (t) => {

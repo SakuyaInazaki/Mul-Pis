@@ -55,7 +55,7 @@ test("branch activation and pilot pause remain lifecycle controls without elapse
  } finally { Date.now = realNow; }
 });
 
-test("completed branch closes independently while pending or unknown branches stay open", () => {
+test("completed branch closes independently while in-flight work remains open", () => {
  const budget = new SharedBudget("closed-branches", { ...limits, maxWallMillis: 0 });
  const cap = { ...limits, maxWallMillis: 0 };
  const old = budget.createLease(budget.root, cap), newer = budget.createLease(budget.root, cap);
@@ -70,9 +70,10 @@ test("completed branch closes independently while pending or unknown branches st
  assert.throws(() => budget.activateLease(old), /closed/);
  const pending = budget.createLease(budget.root, cap);
  const reservation = budget.reservePrompt(pending, { maxInputTokens: 10, maxSdkEstimatedCost: 0.01 });
- assert.throws(() => budget.closeLease(pending), /pending/);
+ assert.throws(() => budget.closeLease(pending), /in-flight/);
  budget.markUnknown(reservation);
- assert.throws(() => budget.closeLease(pending), /unknown/);
+ assert.equal(budget.closeLease(pending).lifecycle, "closed");
+ assert.equal(budget.status(pending).usageUnknown, true);
 });
 
 test("prepared request uses actual prompt bytes without a per-request token quota", async () => {
@@ -94,6 +95,22 @@ test("prepared request uses actual prompt bytes without a per-request token quot
  const result = await runBoundedModelStep({ runner, budget, lease: budget.root, spec, message: "m", timeoutMs: 1000 });
  assert.equal(result.text, "ok");
  assert.equal(budget.status().committed.inputTokens, 2);
+});
+
+test("unknown SDK cost alone remains visible and does not stop the next model action", async () => {
+ const spec = { label: "unpriced-offline", role: "research" as const, model: "fake/unpriced", systemPrompt: "s", persistDir: "/tmp" };
+ const budget = new SharedBudget("unpriced", {});
+ const fake = new FakeSessionRunner(() => ({ text: "ok", usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 3 } }));
+ const runner = { create: fake.create.bind(fake), resume: fake.resume.bind(fake) };
+ for (let i = 0; i < 2; i++) {
+  const step = await runBoundedModelStep({ runner, budget, lease: budget.root, spec, message: "continue" });
+  assert.equal(step.text, "ok");
+  assert.equal(step.usage.complete, true);
+  assert.equal(step.usage.costComplete, false);
+ }
+ assert.equal(budget.status().committed.providerCalls, 2);
+ assert.equal(budget.status().usageUnknown, true);
+ assert.deepEqual(budget.status().remaining, {});
 });
 
 test("an uncapped reply is recorded without enforcing a legacy aggregate output quota", async () => {
@@ -126,7 +143,7 @@ test("CPU executor accepts a valid action after a long provider reply", async ()
  assert.equal(budget.status().settlement, "settled");
 });
 
-test("phase preflight creates accounting namespaces under one root monetary ceiling", async () => {
+test("phase preflight creates separate accounting namespaces without monetary gates", async () => {
  const stage = { maxSdkEstimatedCost: 0.1, maxProviderCalls: 0, maxInputTokens: 0, maxOutputTokens: 0, maxProbeCalls: 0, maxCpuMillis: 0, maxWallMillis: 0 };
  const root = new SharedBudget("phases", { ...stage, maxSdkEstimatedCost: 2 });
  const plan = { kind: "meta-improvement" as const, outer: stage, pilot: stage, branch: stage, protected: { ...stage, maxSdkEstimatedCost: 0.5 }, searchReplicates: 2, outcomeReplicates: 12, admissionCases: [{ maxProbeCalls: 20 }] };
@@ -139,7 +156,7 @@ test("phase preflight creates accounting namespaces under one root monetary ceil
  assert.throws(() => root.createLease(root.root), /sealed/);
 });
 
-test("historical phase monetary sums cannot reject a valid shared-root campaign", async () => {
+test("historical phase and root monetary values do not gate a campaign", async () => {
  const root = new SharedBudget("shared-meta", { maxSdkEstimatedCost: 0.25 });
  const stage = { maxSdkEstimatedCost: 0.1 };
  const phases = await reserveResearchPhases(root, { kind: "meta-improvement", outer: stage, pilot: stage, branch: stage,
@@ -152,7 +169,10 @@ test("historical phase monetary sums cannot reject a valid shared-root campaign"
  root.settlePrompt(second, { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: 0.1, reportedEvents: 1, unknownEvents: 0, complete: true, costComplete: true });
  assert.equal(root.status().committed.sdkEstimatedCost, 0.25);
  assert.equal(root.status().settlement, "settled");
- assert.throws(() => root.reserveObservedTurn(phases.branches[0]!.old), /monetary budget exhausted/);
+ const later = root.reserveObservedTurn(phases.branches[0]!.old);
+ root.settleObservedTurn(later, { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: 0.1, reportedEvents: 1, unknownEvents: 0, complete: true, costComplete: true });
+ assert.equal(root.status().committed.sdkEstimatedCost, 0.35);
+ assert.equal(root.status().settlement, "settled");
 });
 
 test("meta search freezes alternating settled no-winner arms before G and permits only measured efficiency", async (t) => {
@@ -207,4 +227,30 @@ test("quality protocol rejects identical no-winner H0 without a protected reques
  assert.equal(result.status, "rejected");
  assert.equal(result.protectedQueriedAfterBothSelections, false);
  assert.equal(frozen, 1);
+});
+
+test("meta efficiency never treats an unknown search price as a measured gain", async (t) => {
+ const { runMetaImprovementAdmission } = await import("../../src/improvement/meta-eval.ts");
+ const { mkdtemp, rm } = await import("node:fs/promises");
+ const os = await import("node:os");
+ const path = await import("node:path");
+ const dir = await mkdtemp(path.join(os.tmpdir(), "meta-unpriced-")); t.after(() => rm(dir, { recursive: true, force: true }));
+ const budget = new SharedBudget("meta-unpriced", {});
+ const branchLeases = [{ old: budget.createLease(budget.root), new: budget.createLease(budget.root) }];
+ const protectedLease = budget.createLease(budget.root);
+ const caseSet = (split: "development" | "admission") => ({ version: 1 as const, split, cases: [{ ...multi, id: `${split}-unpriced`, hypotheses: multi.hypotheses.slice(0, 2), maxProbeCalls: 1, allowedProbeX: [2] }] });
+ const runner = new FakeSessionRunner((ctx) => ({ text: JSON.stringify(JSON.parse(ctx.message).visibleFeedback.length ? { kind: "submit", actionId: "submit.1", hypothesisId: "truth" } : { kind: "probe", actionId: "probe.1", x: 2 }), usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: 0.001 } }));
+ const result = await runMetaImprovementAdmission({ oldImproverVersionId: "I0", newImproverVersionId: "I1", initialExecutor: { versionId: "H0", artifact: { version: 1, kind: "cpu-numerical-prompt", body: "Use evidence." } },
+  developmentCaseSet: caseSet("development"), admissionCaseSet: caseSet("admission"), budget, branchLeases, protectedLease,
+  protocol: "efficiency", searchReplicates: 1, outcomeReplicates: 2, runner, researchModel: "fake/research", persistDir: dir,
+  produceSuccessor: async (id, lease, _cases, _index, arm) => {
+   const reservation = budget.reserveObservedPrompt(lease, { maxInputTokens: 1 });
+   budget.settlePrompt(reservation, { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: arm === "old" ? 0.02 : 0, reportedEvents: 1, unknownEvents: 0, complete: true, costComplete: arm === "old" });
+   return { improverVersionId: id, startingExecutorVersionId: "H0", decisionCount: 1, status: "no-winner" };
+  },
+  persistSelection: async () => path.join(dir, "selection.json"), persistObservation: async () => ({ storeId: "test-ledger", id: "1", version: "1" }) });
+ assert.equal(result.status, "inconclusive");
+ assert.match(result.reason, /cost is incomplete/);
+ assert.equal(result.replicates[0]?.newSearchCostComplete, false);
+ assert.equal(result.protectedQueriedAfterBothSelections, true);
 });

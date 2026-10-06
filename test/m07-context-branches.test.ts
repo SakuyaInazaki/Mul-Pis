@@ -10,7 +10,7 @@ import { FakeSessionRunner } from "../src/runner/fake.ts";
 import type { StageContext } from "../src/stages/context.ts";
 import { Workspace } from "../src/workspace.ts";
 
-async function fixture(t: TestContext, unsafeFile = false, pauseExecution?: () => Promise<void>) {
+async function fixture(t: TestContext, unsafeFile = false, pauseExecution?: () => Promise<void>, extraFiles = 0) {
 	const root = await mkdtemp(path.join(tmpdir(), "m07-branches-"));
 	t.after(async () => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(root);
@@ -24,7 +24,11 @@ async function fixture(t: TestContext, unsafeFile = false, pauseExecution?: () =
 		if (spec.tools.kind === "execution") {
 			if (pauseExecution) await pauseExecution();
 			const candidate = path.join(spec.tools.root, "candidate.txt");
-			if (turnIndex === 1) await writeFile(candidate, "seed\n");
+			if (turnIndex === 1) {
+				await writeFile(candidate, "seed\n");
+				for (let index = 0; index < extraFiles; index++)
+					await writeFile(path.join(spec.tools.root, `evidence-${String(index).padStart(4, "0")}.txt`), "x\n");
+			}
 			else await writeFile(candidate, `${spec.label}\n`);
 			if (unsafeFile) await writeFile(path.join(spec.tools.root, ".env"), "PRIVATE=not-for-branch\n");
 		}
@@ -37,6 +41,31 @@ async function fixture(t: TestContext, unsafeFile = false, pauseExecution?: () =
 }
 
 const taskSpec = { objective: "Implement candidate", inputs: [], expectedOutputs: ["candidate.txt"], checks: ["Candidate file checked"], mode: "execute" as const };
+
+test("M07 can load and fork a frozen branch with more than 1,000 small files", async t => {
+	const f = await fixture(t, false, undefined, 1_001);
+	const parent = await f.controller.delegate(f.goal.runId, taskSpec);
+	assert.equal(parent.status, "returned", parent.executionFailure ?? "parent failed");
+	assert.ok(parent.branchSource, parent.branchUnavailableReason ?? "branch checkpoint unavailable");
+	const manifest = JSON.parse(await readFile(parent.branchSource!.manifestPath, "utf8"));
+	assert.ok(manifest.files.length > 1_000);
+	const context = { mode: "fork" as const, parentRunId: f.goal.runId, parentTaskId: parent.taskId,
+		checkpointId: parent.branchSource!.checkpoint.id };
+	const child = await f.controller.delegate(f.goal.runId, { ...taskSpec, context });
+	assert.equal(child.status, "returned", child.executionFailure ?? "fork failed");
+	assert.equal(await readFile(path.join(child.workDir, "evidence-1000.txt"), "utf8"), "x\n");
+});
+
+test("M07 retains more than twelve explicit versioned resource inputs", async t => {
+	const f = await fixture(t);
+	const inputs = Array.from({ length: 13 }, (_, index) => `resource-${String(index).padStart(2, "0")}.md`);
+	for (const name of inputs) await writeFile(path.join(f.root, name), `${name}\n`);
+	const resources = inputs.map((input, index) => ({ id: `resource-${index}`, version: "v1", input }));
+	const task = await f.controller.delegate(f.goal.runId, { ...taskSpec, inputs, resourceInputs: resources });
+	assert.equal(task.status, "returned", task.executionFailure ?? "task failed");
+	assert.equal(task.resourceInputs?.length, 13);
+	assert.equal(task.inputCopies.length, 13);
+});
 
 test("M07 opens two real fake-runner histories from one frozen task leaf with private work roots", async (t) => {
 	const f = await fixture(t);

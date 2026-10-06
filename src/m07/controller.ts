@@ -189,7 +189,7 @@ async function loadBranchManifest(source: NonNullable<M07TaskRecord["branchSourc
 		manifest = JSON.parse(bytes.toString("utf8")) as BranchManifestV1;
 	}
 	catch { throw new HarnessError("m07.branch", "frozen parent evidence manifest is unavailable"); }
-	if (manifest.version !== 1 || manifest.parentRunId !== parentRunId || manifest.parentTaskId !== parentTaskId || manifest.authorizedChildRootBase !== path.dirname(path.dirname(manifest.parentWorkRoot)) || manifest.frozenWorkRoot !== source.workSnapshotRoot || manifest.frozenProblemPath !== source.problemSnapshotCopy || !Array.isArray(manifest.files) || manifest.files.length > 1_000 || manifest.files.some((file) => !Number.isSafeInteger(file.bytes) || file.bytes < 0) || manifest.files.reduce((sum, file) => sum + file.bytes, 0) > 64_000_000) throw new HarnessError("m07.branch", "frozen parent evidence manifest does not match the requested source");
+	if (manifest.version !== 1 || manifest.parentRunId !== parentRunId || manifest.parentTaskId !== parentTaskId || manifest.authorizedChildRootBase !== path.dirname(path.dirname(manifest.parentWorkRoot)) || manifest.frozenWorkRoot !== source.workSnapshotRoot || manifest.frozenProblemPath !== source.problemSnapshotCopy || !Array.isArray(manifest.files) || manifest.files.some((file) => !Number.isSafeInteger(file.bytes) || file.bytes < 0) || manifest.files.reduce((sum, file) => sum + file.bytes, 0) > 64_000_000) throw new HarnessError("m07.branch", "frozen parent evidence manifest does not match the requested source");
 	if (JSON.stringify(manifest.forkWorkspaceAuthority) !== JSON.stringify({ version: 1, parentRoot: manifest.parentWorkRoot, authorizedChildRootBase: manifest.authorizedChildRootBase, childWorkLeaf: path.basename(manifest.parentWorkRoot), frozenEvidenceRoot: manifest.frozenWorkRoot, files: manifest.files.map((file) => ({ sourcePath: file.historicalPath, frozenPath: file.frozenPath, bytes: file.bytes })) })) throw new HarnessError("m07.branch", "fork workspace authority does not match frozen evidence files");
 	if ((await lstat(source.problemSnapshotCopy)).isSymbolicLink() || !(await lstat(source.problemSnapshotCopy)).isFile()) throw new HarnessError("m07.branch", "frozen problem evidence is unavailable");
 	const snapshotRoot = await realpath(source.workSnapshotRoot);
@@ -643,7 +643,7 @@ async function freezeCheckpoint(ctx: StageContext, goal: CurrentGoal, limits: Pr
 	await mkdir(checkpointsDir, { recursive: true });
 	let id = "";
 	let rootDir = "";
-	for (let ordinal = (goal.checkpoints?.length ?? 0) + 1; ordinal <= 9999; ordinal++) {
+	for (let ordinal = (goal.checkpoints?.length ?? 0) + 1; Number.isSafeInteger(ordinal); ordinal++) {
 		const candidateId = `C${String(ordinal).padStart(3, "0")}`;
 		const candidateDir = path.join(checkpointsDir, candidateId);
 		try {
@@ -665,7 +665,6 @@ async function freezeCheckpoint(ctx: StageContext, goal: CurrentGoal, limits: Pr
 	const copies = new Map<string, string>();
 	let totalBytes = 0;
 	const copy = async (source: string, relativePath: string, kind: "review" | "problem" | "raw"): Promise<string> => {
-		if (files.length >= 256) throw new HarnessError("m07.checkpoint", "本次 checkpoint 局部文件数超过 256；快照未登记，目标仍 active。可调整待交接材料后重试，不代表全工作流资源耗尽");
 		const sourcePath = path.resolve(source);
 		const found = copies.get(sourcePath);
 		if (found) return found;
@@ -693,7 +692,6 @@ async function freezeCheckpoint(ctx: StageContext, goal: CurrentGoal, limits: Pr
 	const skippedRaw: string[] = [];
 	if (existsSync(ctx.ws.rawDir)) {
 		const rawNames = (await readdir(ctx.ws.rawDir)).sort();
-		if (rawNames.length > 256) throw new HarnessError("m07.checkpoint", "本次 checkpoint 原始材料条目超过 256；快照未登记，目标仍 active。可调整本批材料后重试，不代表全工作流资源耗尽");
 		for (const name of rawNames) {
 			const source = path.join(ctx.ws.rawDir, name);
 			const info = await lstat(source);
@@ -837,7 +835,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			frozenPolicy(goal);
 			if (goal.tasks.some((task) => task.status === "running")) throw new HarnessError("m07.checkpoint", "存在 running 任务，不能冻结非终态反馈");
 			const requested = checkpointOptions?.taskIds;
-			if (requested !== undefined && (!Array.isArray(requested) || requested.length === 0 || requested.length > 256 || requested.some((id) => typeof id !== "string" || !/^T\d{3,}$/.test(id)) || new Set(requested).size !== requested.length || requested.some((id) => !goal.tasks.some((task) => task.taskId === id)))) throw new HarnessError("m07.checkpoint", "taskIds 必须是非空、去重、属于当前目标的任务列表，且每批最多 256 项");
+			if (requested !== undefined && (!Array.isArray(requested) || requested.length === 0 || requested.some((id) => typeof id !== "string" || !/^T\d{3,}$/.test(id)) || new Set(requested).size !== requested.length || requested.some((id) => !goal.tasks.some((task) => task.taskId === id)))) throw new HarnessError("m07.checkpoint", "taskIds 必须是非空、去重、属于当前目标的任务列表");
 			const selectedTaskIds = requested ?? goal.tasks.map((task) => task.taskId);
 			await verifyFrozenWorkflowMethod(ctx, goal, options.registeredExperienceStores);
 			return freezeCheckpoint(ctx, goal, snapshotLimits, selectedTaskIds);
@@ -924,7 +922,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				spec.planInput = planSource;
 			}
 			if (spec.resourceInputs !== undefined) {
-				if (!Array.isArray(spec.resourceInputs) || spec.resourceInputs.length > 12) throw new HarnessError("m07.resources", "resourceInputs must be at most 12 explicit versioned references");
+				if (!Array.isArray(spec.resourceInputs)) throw new HarnessError("m07.resources", "resourceInputs must be explicit versioned references");
 				const seen = new Set<string>();
 				spec.resourceInputs = await Promise.all(spec.resourceInputs.map(async (item) => {
 					if (!item || !/^[A-Za-z][A-Za-z0-9._-]{0,63}$/.test(item.id) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(item.version) || seen.has(item.id)) throw new HarnessError("m07.resources", "resourceInputs must have unique safe IDs and explicit versions");

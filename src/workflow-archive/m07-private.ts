@@ -11,10 +11,10 @@ import { isKnowledgeRef } from "../knowledge/experience-index.ts";
 import type { KnowledgeRecord, KnowledgeRef, KnowledgeStore, Limit, Snapshot } from "../knowledge/types.ts";
 
 const ARCHIVE_NAME = "workflow-archive.json";
+const MAX_ARCHIVE_BYTES = 32_000;
 /** Fixed name for the private transport allowlist; never publish this file directly. */
 export const M04_KNOWLEDGE_EXPORT_NAME = "m04-adopted-knowledge.json";
 const MAX_REVIEW_TEXT_BYTES = 512_000;
-const MAX_KNOWLEDGE_RECORDS = 48;
 const MAX_KNOWLEDGE_BYTES = 256_000;
 const FILES = [
 	{ name: "candidate.cpp", maxBytes: 128_000 },
@@ -350,6 +350,20 @@ async function privateFile(root: string, name: string, maxBytes: number): Promis
 	return { source, bytes: info.size };
 }
 
+function archiveManifestText(archive: PrivateM07ArchiveV1): string {
+	const serialized = `${JSON.stringify(archive, null, 2)}\n`;
+	if (Buffer.byteLength(serialized, "utf8") > MAX_ARCHIVE_BYTES)
+		throw new Error("private M07 archive manifest exceeds its byte bound");
+	return serialized;
+}
+
+async function writeArchiveManifest(destination: string, archive: PrivateM07ArchiveV1): Promise<void> {
+	const serialized = archiveManifestText(archive);
+	const target = path.join(destination, ARCHIVE_NAME), temporary = `${target}.${process.pid}.tmp`;
+	await writeFile(temporary, serialized, { mode: 0o600 });
+	await rename(temporary, target);
+}
+
 async function lessonState(raw: Buffer, workDir: string): Promise<PrivateM07ArchiveV1["lesson"]> {
 	let delta: Record<string, unknown>;
 	try { delta = JSON.parse(raw.toString("utf8")) as Record<string, unknown>; }
@@ -515,10 +529,7 @@ export async function archivePrivateM07Task(input: {
 		m04: { state: "not-run" },
 		knowledgeReuse: { trustedAdoption: false, adoptionPath: "M04", nextUse: "explicit-candidate-context-only" },
 	};
-	const target = path.join(input.destination, ARCHIVE_NAME);
-	const temporary = `${target}.${process.pid}.tmp`;
-	await writeFile(temporary, `${JSON.stringify(archive, null, 2)}\n`, { mode: 0o600 });
-	await rename(temporary, target);
+	await writeArchiveManifest(input.destination, archive);
 	return archive;
 }
 
@@ -537,15 +548,16 @@ function experienceDefinition(record: KnowledgeRecord): { requiredRefs: Knowledg
 	if (definition.version !== 1 || (definition.targetKind !== "executor" && definition.targetKind !== "improver") ||
 		!Array.isArray(definition.applicableStages) || !definition.applicableStages.every(item => typeof item === "string" && item.length <= 80) ||
 		!Array.isArray(definition.requiredTags) || !definition.requiredTags.every(item => typeof item === "string" && item.length <= 240) ||
-		!Array.isArray(definition.requiredRefs) || definition.requiredRefs.length > MAX_KNOWLEDGE_RECORDS ||
+		!Array.isArray(definition.requiredRefs) ||
 		!definition.requiredRefs.every(isKnowledgeRef)) return undefined;
 	return { requiredRefs: definition.requiredRefs as KnowledgeRef[], targetKind: definition.targetKind,
 		applicableStages: definition.applicableStages as string[], requiredTags: definition.requiredTags as string[] };
 }
 
-async function exportM04Knowledge(destination: string, m04: NonNullable<PrivateM07ArchiveV1["m04"]>, store?: KnowledgeStore): Promise<{
+async function exportM04Knowledge(m04: NonNullable<PrivateM07ArchiveV1["m04"]>, store?: KnowledgeStore): Promise<{
 	status: NonNullable<NonNullable<PrivateM07ArchiveV1["m04"]>["knowledgeExport"]>;
 	refs: KnowledgeRef[];
+	payload?: string;
 }> {
 	const incomplete = (reason: string) => ({ status: { state: "incomplete" as const, reason }, refs: [] });
 	if (m04.state !== "completed") return { status: { state: "none" }, refs: [] };
@@ -553,17 +565,15 @@ async function exportM04Knowledge(destination: string, m04: NonNullable<PrivateM
 	try {
 		const storeId = await store.storeId();
 		const snapshot = await store.current();
-		if (!snapshot || !/^G\d{3,}$/.test(snapshot.id) || snapshot.records.length > 2_000)
+		if (!snapshot || !/^G\d{3,}$/.test(snapshot.id))
 			return incomplete("bounded published M04 snapshot unavailable");
 		const initialLimits = await store.limits();
-		if (initialLimits.length > 2_000) return incomplete("knowledge limit history exceeds bounded export");
 		const m04SourceRefs: KnowledgeRef[] = [];
 		for (const item of snapshot.records) {
 			const record = await store.get(item.id, item.version);
 			if (!record) return incomplete("published snapshot record unavailable");
 			if (record.source.stage !== "M04" || record.source.runId !== m04.runId) continue;
 			m04SourceRefs.push({ storeId, recordId: record.id, version: record.version });
-			if (m04SourceRefs.length > MAX_KNOWLEDGE_RECORDS) return incomplete("too many published M04 source records");
 		}
 		const m04LimitTargetRefs: KnowledgeRef[] = [];
 		for (const limit of initialLimits.filter(item => item.since === snapshot.createdAt)) {
@@ -582,7 +592,7 @@ async function exportM04Knowledge(destination: string, m04: NonNullable<PrivateM
 		const visit = async (ref: KnowledgeRef): Promise<boolean> => {
 			const identity = refKey(ref);
 			if (records.has(identity)) return true;
-			if (ref.storeId !== storeId || visiting.size + records.size >= MAX_KNOWLEDGE_RECORDS) return false;
+			if (ref.storeId !== storeId) return false;
 			if (visiting.has(identity)) return false;
 			visiting.add(identity);
 			const record = await store.get(ref.recordId, ref.version);
@@ -626,7 +636,6 @@ async function exportM04Knowledge(destination: string, m04: NonNullable<PrivateM
 				model.targetKind !== "executor" || !model.applicableStages.includes("M07") || item.record.scope.length) continue;
 			if (model.requiredRefs.some(required => records.get(refKey(required))?.availabilityAtExport !== "usable_conditionally")) continue;
 			adopted.push(ref);
-			if (adopted.length > 24) return incomplete("too many live applicable M04 experience records");
 		}
 		const after = await store.current();
 		if (after?.id !== snapshot.id || JSON.stringify(await store.limits()) !== JSON.stringify(initialLimits))
@@ -641,10 +650,7 @@ async function exportM04Knowledge(destination: string, m04: NonNullable<PrivateM
 		};
 		const serialized = `${JSON.stringify(document, null, 2)}\n`;
 		if (Buffer.byteLength(serialized) > MAX_KNOWLEDGE_BYTES || !exportSafe(document)) return incomplete("M04 knowledge export is unsafe or exceeds byte budget");
-		const target = path.join(destination, M04_KNOWLEDGE_EXPORT_NAME), temporary = `${target}.${process.pid}.tmp`;
-		await writeFile(temporary, serialized, { mode: 0o600 });
-		await rename(temporary, target);
-		return { status: { state: "complete", file: M04_KNOWLEDGE_EXPORT_NAME, recordCount: records.size }, refs: adopted };
+		return { status: { state: "complete", file: M04_KNOWLEDGE_EXPORT_NAME, recordCount: records.size }, refs: adopted, payload: serialized };
 	} catch {
 		return incomplete("M04 knowledge could not be safely exported");
 	}
@@ -656,10 +662,22 @@ export async function recordPrivateM04Outcome(destination: string, m04: NonNulla
 	const archive = loaded.archive;
 	if (!["not-run", "completed", "failed"].includes(m04.state) ||
 		(m04.runId !== undefined && (typeof m04.runId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(m04.runId))) ||
-		(m04.adoptedExperienceRefs !== undefined && (!Array.isArray(m04.adoptedExperienceRefs) || m04.adoptedExperienceRefs.length > 24 ||
+		(m04.adoptedExperienceRefs !== undefined && (!Array.isArray(m04.adoptedExperienceRefs) ||
 			m04.adoptedExperienceRefs.some(ref => typeof ref.storeId !== "string" || typeof ref.recordId !== "string" || !/^[CKEJQDX]\d{3,}$/.test(ref.recordId) || !Number.isSafeInteger(ref.version) || ref.version < 1))))
 		throw new Error("invalid bounded M04 archive outcome");
-	const exported = await exportM04Knowledge(destination, m04, store);
+	const exported = await exportM04Knowledge(m04, store);
+	archive.m04 = { state: m04.state, ...(m04.runId ? { runId: m04.runId } : {}),
+		...(m04.proposalSubmitted !== undefined ? { proposalSubmitted: m04.proposalSubmitted } : {}),
+		...(m04.snapshotCreated !== undefined ? { snapshotCreated: m04.snapshotCreated } : {}),
+		adoptedExperienceRefs: exported.refs, knowledgeExport: exported.status };
+	archive.knowledgeReuse = { trustedAdoption: false, adoptionPath: "M04", nextUse: "explicit-candidate-context-only" };
+	// Check the existing manifest file bound before changing its separately stored knowledge payload.
+	archiveManifestText(archive);
+	if (exported.payload) {
+		const target = path.join(destination, M04_KNOWLEDGE_EXPORT_NAME), temporary = `${target}.${process.pid}.tmp`;
+		await writeFile(temporary, exported.payload, { mode: 0o600 });
+		await rename(temporary, target);
+	}
 	// A repeated outcome must not leave a formerly complete payload under the fixed
 	// transport filename when the new provenance check is incomplete.
 	if (exported.status.state !== "complete") {
@@ -674,14 +692,7 @@ export async function recordPrivateM04Outcome(destination: string, m04: NonNulla
 			await rename(temporary, target);
 		}
 	}
-	archive.m04 = { state: m04.state, ...(m04.runId ? { runId: m04.runId } : {}),
-		...(m04.proposalSubmitted !== undefined ? { proposalSubmitted: m04.proposalSubmitted } : {}),
-		...(m04.snapshotCreated !== undefined ? { snapshotCreated: m04.snapshotCreated } : {}),
-		adoptedExperienceRefs: exported.refs, knowledgeExport: exported.status };
-	archive.knowledgeReuse = { trustedAdoption: false, adoptionPath: "M04", nextUse: "explicit-candidate-context-only" };
-	const target = path.join(destination, ARCHIVE_NAME), temporary = `${target}.${process.pid}.tmp`;
-	await writeFile(temporary, `${JSON.stringify(archive, null, 2)}\n`, { mode: 0o600 });
-	await rename(temporary, target);
+	await writeArchiveManifest(destination, archive);
 	return archive;
 }
 
@@ -689,7 +700,7 @@ export async function recordPrivateM04Outcome(destination: string, m04: NonNulla
 export async function loadPrivateM07Archive(directory: string): Promise<{ archive: PrivateM07ArchiveV1; candidate?: string; verification?: string; lesson?: string;
 	roundFiles: Array<{ index: number; candidate?: string; verification?: string; feedback?: string; reviewerReport?: string }>; reviewDecision?: string; m04Knowledge?: string }> {
 	const root = await realpath(directory);
-	const manifest = await privateFile(root, ARCHIVE_NAME, 32_000);
+	const manifest = await privateFile(root, ARCHIVE_NAME, MAX_ARCHIVE_BYTES);
 	if (!manifest) throw new Error("private M07 archive manifest is missing");
 	const archive = JSON.parse(await readFile(manifest.source, "utf8")) as PrivateM07ArchiveV1;
 	if (archive.version !== 1 || archive.kind !== "m07-private-candidate-archive" ||

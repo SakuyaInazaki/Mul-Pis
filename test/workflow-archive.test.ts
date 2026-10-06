@@ -7,6 +7,7 @@ import test from "node:test";
 import { archivePrivateM07Task, loadPrivateM07Archive, recordPrivateM04Outcome, M04_KNOWLEDGE_EXPORT_NAME } from "../src/workflow-archive/m07-private.ts";
 import type { CurrentGoal, M07TaskRecord } from "../src/m07/types.ts";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
+import type { KnowledgeRecord } from "../src/knowledge/types.ts";
 
 test("private archive retains ten actual reviewed rounds without a count ceiling", async () => {
 	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-many-rounds-"));
@@ -360,6 +361,45 @@ test("M04 export passes a live adopted experience with required tags to explicit
 		const staleReplacement = await readFile(path.join(destination, M04_KNOWLEDGE_EXPORT_NAME), "utf8");
 		assert.match(staleReplacement, /"state": "incomplete"/);
 		assert.doesNotMatch(staleReplacement, /Check the observed evidence first/);
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("private M04 export retains more than 48 dependencies and all adopted experience refs", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-many-experiences-"));
+	try {
+		const workDir = path.join(root, "work"), destination = path.join(root, "returned");
+		await mkdir(workDir);
+		const task = { taskId: "T001", workDir, status: "returned" } as M07TaskRecord;
+		await archivePrivateM07Task({ goal: { runId: "run-example", lifecycle: "active", tasks: [task] } as CurrentGoal, task, destination });
+		const store = createFileKnowledgeStore(path.join(root, "knowledge"));
+		await store.init();
+		const storeId = await store.storeId();
+		const evidence: KnowledgeRecord[] = Array.from({ length: 49 }, (_, index) => ({
+			id: `E${String(index + 1).padStart(3, "0")}`, type: "E", version: 1, title: `Evidence ${index + 1}`,
+			body: "Small synthetic check", usageDecision: "adopted", scope: [], refs: [], fields: {},
+			createdAt: "2026-10-06T00:00:00Z", source: { stage: "M04", runId: "earlier" },
+		}));
+		const methods: KnowledgeRecord[] = Array.from({ length: 49 }, (_, index) => ({
+			id: `K${String(index + 1).padStart(3, "0")}`, type: "K", version: 1, title: `Method ${index + 1}`,
+			body: "Small synthetic lesson", usageDecision: "adopted", scope: [], refs: [],
+			fields: { experience: { version: 1, targetKind: "executor", applicableStages: ["M07"], requiredTags: [],
+				requiredRefs: [{ storeId, recordId: evidence[index].id, version: 1 }] } },
+			createdAt: "2026-10-06T00:00:00Z", source: { stage: "M04", runId: "m04-many" },
+		}));
+		const records = [...evidence, ...methods];
+		store.current = async () => ({ id: "G001", createdAt: "2026-10-06T00:00:00Z",
+			records: records.map(record => ({ id: record.id, version: 1 })), activeLimits: [], proposals: [] });
+		store.list = async () => records;
+		store.get = async (id, version) => records.find(record => record.id === id && (!version || version === 1));
+		store.availability = async (id, version) => ({ id, version: version ?? 1, availability: "usable_conditionally", reasons: [] });
+		const archived = await recordPrivateM04Outcome(destination, { state: "completed", runId: "m04-many", snapshotCreated: true }, store);
+		assert.equal(archived.m04?.knowledgeExport?.state, "complete");
+		assert.equal(archived.m04?.adoptedExperienceRefs?.length, 49);
+		const exported = JSON.parse(await readFile(path.join(destination, M04_KNOWLEDGE_EXPORT_NAME), "utf8"));
+		assert.equal(exported.records.length, 98);
+		assert.equal(exported.dependencies.length, 49);
+		assert.equal(exported.adoptedExperienceRefs.length, 49);
+		assert.equal((await loadPrivateM07Archive(destination)).m04Knowledge, path.join(destination, M04_KNOWLEDGE_EXPORT_NAME));
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
 

@@ -8,12 +8,13 @@ import { offlineChecks } from "../scripts/manual-private-campaign.ts";
 import { reserveIndependentRestart } from "../src/m07/independent-restart.ts";
 import { verifyDeepSeekCnyBilling } from "../src/runner/deepseek-cny-pricing.ts";
 import { verifyDeepSeekProviderOutputLimit } from "../src/runner/deepseek-provider-limits.ts";
-import { ONE_USE_PUSH_MARKER } from "../src/runner/signed-mission-ledger.ts";
 
 test("shared-total campaign requires explicit manual admission and signed cumulative ledger", async () => {
  const workflow = await readFile(new URL("../.github/workflows/manual-private-campaign.yml", import.meta.url), "utf8");
  const gate = workflow.split("  private-campaign:\n")[1]?.split("    runs-on:")[0] ?? "";
- assert.match(workflow, /^  push:/m);
+ const triggers = workflow.split(/^on:\s*$/m)[1]?.split(/^permissions:\s*$/m)[0] ?? "";
+ assert.deepEqual([...triggers.matchAll(/^  ([A-Za-z_][\w-]*):/gm)].map(match => match[1]),
+  ["workflow_dispatch"], "a push or other automatic event must never launch the paid private campaign");
  assert.ok(gate.includes("github.repository == 'SakuyaInazaki/Mul-Pis'"));
  assert.ok(gate.includes("github.actor == 'SakuyaInazaki'"));
  assert.ok(gate.includes("github.run_attempt == 1"));
@@ -23,7 +24,7 @@ test("shared-total campaign requires explicit manual admission and signed cumula
  assert.ok(workflow.includes("MULPIS_MISSION_LEDGER_B64: ${{ secrets.MULPIS_MISSION_LEDGER_B64 }}"));
  assert.doesNotMatch(workflow, /inputs\.mission_ledger_b64/);
  assert.ok(workflow.includes("MULPIS_MANUAL_AUTHORIZED: ${{ inputs.authorize_bounded_run }}"));
- assert.ok(gate.includes(ONE_USE_PUSH_MARKER));
+ assert.doesNotMatch(gate, /github\.event\.head_commit|github\.event_name == 'push'/);
  assert.ok(workflow.includes("GITHUB_TOKEN: ${{ github.token }}"));
  assert.ok(workflow.includes("  actions: read"));
  assert.doesNotMatch(workflow, /up to [0-9.]+ CNY/);
@@ -524,23 +525,22 @@ test("private campaign uses only a live verified native-CNY peak profile for new
 				object: "model", name: "DeepSeek-V4.1-Flash", context_window: 1_048_576,
 				max_output_tokens: 393_216 }] }), { status: 200 });
 		}) as typeof fetch });
-	const budget = offlineChecks.createPrivateCampaignBudget(29.1, profile, providerOutputLimit);
+	const budget = offlineChecks.createPrivateCampaignBudget(profile, providerOutputLimit);
 	assert.equal(budget.limits.estimatedInputCnyPerMillionTokens, 2);
 	assert.equal(budget.limits.estimatedCacheReadCnyPerMillionTokens, 0.04);
 	assert.equal(budget.limits.estimatedOutputCnyPerMillionTokens, 8);
 	assert.equal(budget.limits.estimatedCnyPerUsd, undefined);
 	assert.equal(budget.limits.maxOutputTokens, undefined);
 	assert.equal(budget.limits.providerOutputLimit?.maxOutputTokens, 393_216);
-	assert.equal(budget.snapshot().priorCommittedCny, 29.1);
-	assert.equal(budget.snapshot().missionCommittedCny, 29.1);
-	assert.equal(budget.requestAuditSnapshot().pricingProfile?.currency, "CNY");
-	assert.equal(budget.requestAuditSnapshot().providerOutputLimit?.maxOutputTokens, 393_216);
-	assert.doesNotMatch(JSON.stringify(budget.requestAuditSnapshot()), /SYNTHETIC_PRIVATE_AMOUNT|SYNTHETIC_KEY/);
+	assert.equal(budget.snapshot().accountingMode, "observed-only");
+	assert.equal(budget.limits.maxCny, undefined);
+	assert.equal(budget.snapshot().pricingProfile?.currency, "CNY");
+	assert.doesNotMatch(JSON.stringify(budget.requestAccountingAuditSnapshot()), /SYNTHETIC_PRIVATE_AMOUNT|SYNTHETIC_KEY/);
 	const source = await readFile(new URL("../scripts/manual-private-campaign.ts", import.meta.url), "utf8");
 	assert.ok(source.indexOf("await verifyDeepSeekProviderOutputLimit({ apiKey: runtimeKey })") <
-		source.indexOf("const budget = createPrivateCampaignBudget(missionLedger.priorCommittedCny"));
+		source.indexOf("const budget = createPrivateCampaignBudget(nativeCnyPricing"));
 	assert.ok(source.indexOf("await verifyDeepSeekCnyBilling({ apiKey: runtimeKey })") <
-		source.indexOf("const budget = createPrivateCampaignBudget(missionLedger.priorCommittedCny"));
+		source.indexOf("const budget = createPrivateCampaignBudget(nativeCnyPricing"));
 });
 
 test("M04 evidence coverage requires exact task files and complete returned text ranges", async () => {

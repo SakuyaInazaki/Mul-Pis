@@ -69,6 +69,31 @@ test("checkpoint M04 rejects unregistered IDs, traversal, and a symlink replacin
 	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07Checkpoint", runId: goal.runId, checkpointId: checkpoint.id } }), /固定路径非法/);
 });
 
+test("M07 checkpoint C10000 remains readable through the M04 checkpoint handoff", async t => {
+	const f = await fixture(t);
+	const goal = await f.controller.begin(begin);
+	const goalFile = path.join(f.ws.runDir("M07", goal.runId), "goal.json");
+	const state = JSON.parse(await readFile(goalFile, "utf8"));
+	state.checkpoints = Array.from({ length: 9_999 }, (_, index) => ({ id: `C${String(index + 1).padStart(3, "0")}` }));
+	await writeFile(goalFile, JSON.stringify(state));
+	const checkpoint = await f.controller.checkpoint(goal.runId);
+	assert.equal(checkpoint.id, "C10000");
+	const result = await runM04(f.ctx, { feedback: { kind: "M07Checkpoint", runId: goal.runId, checkpointId: checkpoint.id } });
+	assert.equal(result.record.status, "completed");
+});
+
+test("M07 freezes and M04 consumes more than 256 small raw evidence files", async t => {
+	const f = await fixture(t);
+	const goal = await f.controller.begin(begin);
+	for (let index = 0; index < 257; index++)
+		await writeFile(path.join(f.ws.rawDir, `extra-${String(index).padStart(3, "0")}.md`), `Evidence ${index}\n`);
+	const checkpoint = await f.controller.checkpoint(goal.runId);
+	const manifest = JSON.parse(await readFile(checkpoint.manifestPath, "utf8"));
+	assert.ok(manifest.rawFiles.length > 256);
+	const result = await runM04(f.ctx, { feedback: { kind: "M07Checkpoint", runId: goal.runId, checkpointId: checkpoint.id } });
+	assert.equal(result.record.status, "completed");
+});
+
 test("oversized checkpoint feedback indexes its own frozen goal and remains consumable by M04", async (t) => {
 	const f = await fixture(t);
 	const policyDir = path.join(f.root, ".agent", "improvement");

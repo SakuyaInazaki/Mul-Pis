@@ -25,12 +25,11 @@ export interface PhaseBudgetPlan {
 const fail = (message: string): never => { throw new HarnessError("improvement.budget", message); };
 
 /**
- * Child leases keep phase usage separate; every paid phase draws on the same root
- * monetary ceiling. There is no phase preallocation or per-arm monetary gate.
+ * Child leases keep phase usage separate, without monetary admission gates.
  */
 export async function reserveResearchPhases(budget: SharedBudget, plan: PhaseBudgetPlan): Promise<PhaseLeases> {
 	const root = budget.status();
-	if (root.settlement !== "settled" || Object.values(root.committed).some((value) => value !== 0) || Object.values(root.reserved).some((value) => value !== 0)) fail("phase leases must be allocated before any campaign spend");
+	if (root.inFlight || Object.values(root.committed).some((value) => value !== 0) || Object.values(root.reserved).some((value) => value !== 0)) fail("phase leases must be allocated before any campaign activity");
 	if (!Number.isSafeInteger(plan.searchReplicates) || plan.searchReplicates < 1 || !Number.isSafeInteger(plan.outcomeReplicates) || plan.outcomeReplicates < 1) fail("invalid independent search/outcome replicate counts");
 	if (plan.kind === "executor-quality" && plan.searchReplicates !== 1) fail("executor quality uses one outer search and no meta branches");
 	if (!plan.admissionCases.length || plan.admissionCases.some((c) => !Number.isSafeInteger(c.maxProbeCalls) || c.maxProbeCalls < 1)) fail("invalid frozen admission case count or probe allowance");

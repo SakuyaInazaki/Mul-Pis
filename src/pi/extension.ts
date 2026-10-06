@@ -296,14 +296,12 @@ mainAgentWatchdog.unref?.();
 			else emptyRounds = 0;
 			lastControlStamp = controlStamp;
 			successfulToolSinceEnd = false; inspectionSinceEnd = false;
-			if (emptyRounds >= 2) {
-				continuationHalt = "no-progress";
-				continuationEntry("stopped", "repeated-empty-agent-rounds-with-unchanged-goal");
-				return;
+			if (emptyRounds > 0) {
+				continuationEntry("observed", "unchanged-goal-needs-next-action");
 			}
 			continuationHalt = undefined;
 			continuationEntry("queued", "active-goal-not-fulfilled");
-			pi.sendMessage({ customType: "research_continuation", content: `继续同一科研工作流，唯一目标 runId=${boundGoalRunId}，绑定工作区 workspace=${continuationWorkspace(ctx.cwd)}。先调用 research_goal action=status，明确传入此 runId 与 workspace 核对持久状态；后续研究工具也明确传入同一 workspace，再由工作流自主选择下一有界步骤。不得把本回合 final/checkpoint 当作目标 fulfilled，不得开启另一个题目。候选负结果与局部工具限制可由 research_goal action=checkpoint 冻结反馈；若历史评审已超快照容量，可显式提供本轮非空 taskIds 分批冻结，未选任务不是已交接证据。再用 research_stage stage=M04、feedbackStage=M07、feedbackRunId=本 runId、feedbackCheckpointId=所返回 id 回流；M04 完成后如需更新基线，再显式调用 research_goal action=plan、refreshBaseline=true，并传入 checkpointId 与已完成的 m04RunId。真实宿主错误由控制器内部记录。`, display: false }, { triggerTurn: true, deliverAs: "followUp" });
+			pi.sendMessage({ customType: "research_continuation", content: `${emptyRounds > 0 ? "上个回合尚未改变目标状态；请依据已有证据执行下一可行步骤或核验真实阻塞，不要只重复计划。\n" : ""}继续同一科研工作流，唯一目标 runId=${boundGoalRunId}，绑定工作区 workspace=${continuationWorkspace(ctx.cwd)}。先调用 research_goal action=status，明确传入此 runId 与 workspace 核对持久状态；后续研究工具也明确传入同一 workspace，再由工作流自主选择下一有界步骤。不得把本回合 final/checkpoint 当作目标 fulfilled，不得开启另一个题目。候选负结果与局部工具限制可由 research_goal action=checkpoint 冻结反馈；若历史评审已超快照容量，可显式提供本轮非空 taskIds 分批冻结，未选任务不是已交接证据。再用 research_stage stage=M04、feedbackStage=M07、feedbackRunId=本 runId、feedbackCheckpointId=所返回 id 回流；M04 完成后如需更新基线，再显式调用 research_goal action=plan、refreshBaseline=true，并传入 checkpointId 与已完成的 m04RunId。真实宿主错误由控制器内部记录。`, display: false }, { triggerTurn: true, deliverAs: "followUp" });
 		});
 		pi.on("agent_settled", () => { clearMainAgentWatchdog(); });
 		pi.on("session_shutdown", async (event, ctx) => {

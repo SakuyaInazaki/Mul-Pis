@@ -1,4 +1,4 @@
-/** Deterministic, bounded selection over the published knowledge snapshot. Relevance is not authority. */
+/** Deterministic selection over the published knowledge snapshot. Relevance is not authority. */
 import { HarnessError } from "../types.ts";
 import { renderKnowledgeRecord } from "./pack.ts";
 import type { AvailabilityReport, KnowledgePack, KnowledgeRecord, KnowledgeStore, Limit, RecordType } from "./types.ts";
@@ -38,13 +38,14 @@ const ignoredWords = new Set(["the", "and", "for", "with", "from", "this", "that
 
 function terms(text: string): string[] {
 	const found = new Set<string>();
-	for (const match of text.toLocaleLowerCase().slice(0, 24_000).matchAll(/[\p{Script=Han}]+|[a-z][a-z0-9_.-]{2,}|[0-9][a-z0-9_.-]{2,}/gu)) {
+	// Rank against the whole request. The output pack is bounded separately;
+	// dropping tail terms here can make a relevant record impossible to find.
+	for (const match of text.toLocaleLowerCase().matchAll(/[\p{Script=Han}]+|[a-z][a-z0-9_.-]{2,}|[0-9][a-z0-9_.-]{2,}/gu)) {
 		const token = match[0];
 		if (/[\p{Script=Han}]/u.test(token)) {
 			if (token.length <= 6) found.add(token);
-			else for (let i = 0; i + 2 <= token.length && found.size < 96; i += 1) found.add(token.slice(i, i + 2));
+			else for (let i = 0; i + 2 <= token.length; i += 1) found.add(token.slice(i, i + 2));
 		} else if (!ignoredWords.has(token)) found.add(token);
-		if (found.size >= 96) break;
 	}
 	return [...found];
 }
@@ -111,8 +112,6 @@ export async function retrieveKnowledge(store: KnowledgeStore, request: Knowledg
 			// Reverse premise and warning edges live on their source versions. A
 			// revision may remove an edge while the older published version still
 			// matters to a pinned historical target.
-			const count = latest.reduce((sum, record) => sum + record.version, 0);
-			if (count > 2_000) return { records: [], error: "historical-premise-scan-over-budget" };
 			const records: KnowledgeRecord[] = [];
 			for (const record of latest) for (let version = 1; version <= record.version; version++) {
 				const historical = version === record.version ? record : await store.get(record.id, version);

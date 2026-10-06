@@ -77,3 +77,37 @@ test("M04 rejects an adopted proposal before merge when a required final page is
 	assert.equal(attempt.status, "failed");
 	assert.equal(attempt.outputs.some(item => item.label === "知识提案"), false);
 });
+
+test("M04 verifies more than twelve required frozen evidence files without weakening full-read checks", async t => {
+	const f = await fixture(t);
+	const required = [...f.relative];
+	for (let index = 0; index < 10; index++) {
+		const relative = `tasks/T001/review-snapshot/${String(index + 4).padStart(3, "0")}-extra-${index}.txt`;
+		await writeFile(path.join(f.ws.runDir("M07", f.goal.runId), relative), "first\nsecond\n");
+		required.push(relative);
+	}
+	const fake = new FakeSessionRunner(() => "No transferable lesson; no knowledge proposal.");
+	const create = fake.create.bind(fake);
+	fake.create = async spec => ({ ...await create(spec), readReturnEvents: () => returnedRanges(required) });
+	f.ctx.runner = fake;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId }, freshSession: true,
+		requiredM07ReadPaths: required });
+	assert.equal(result.record.status, "completed");
+	assert.equal(required.length, 13);
+});
+
+test("M04 checks complete returned ranges for evidence exceeding 100,000 lines", async t => {
+	const f = await fixture(t);
+	const totalLines = 100_001;
+	await writeFile(path.join(f.ws.runDir("M07", f.goal.runId), f.relative[0]), "x\n".repeat(totalLines));
+	const fake = new FakeSessionRunner(() => "No transferable lesson; no knowledge proposal.");
+	const create = fake.create.bind(fake);
+	fake.create = async spec => ({ ...await create(spec), readReturnEvents: () => [{
+		toolName: "m07_evidence_read", status: "returned", path: f.relative[0], requested: {},
+		returned: { kind: "text", startLine: 1, endLine: totalLines, truncated: false }, at: new Date().toISOString(),
+	}] });
+	f.ctx.runner = fake;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId }, freshSession: true,
+		requiredM07ReadPaths: [f.relative[0]] });
+	assert.equal(result.record.status, "completed");
+});

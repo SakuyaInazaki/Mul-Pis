@@ -18,7 +18,7 @@ import { runExecutorEpisode, runExecutorQualityAdmission } from "./executor-eval
 import { GenerationStore, isCpuExecutorStrategy, isM07WorkflowStrategy, type ExperienceRequirementV1, type GenerationBundleV1, type ImproverStrategyV1, type M07WorkflowStrategyV1, type StrategyRecordV1, validateExperienceRequirements, validateStrategy } from "./generation.ts";
 import { advanceKnowledgeEpochInLock, transitionMethodKnowledgeDependenciesInLock } from "./knowledge-epoch.ts";
 import { bindMethodPackageV2, exportMethodPackageV2, readMethodPackageV2 } from "./method-v2.ts";
-import { buildMetaEpisode, loadMetaEpisode, metaEpisodeForModel, metaEpisodePath, type MetaEpisodeV1 } from "./meta-episode.ts";
+import { buildMetaEpisode, loadMetaEpisode, metaEpisodeForModel, metaEpisodePath, writeMetaEpisode, type MetaEpisodeV1 } from "./meta-episode.ts";
 import { runMetaImprovementAdmission, type ProducedSuccessorV1 } from "./meta-eval.ts";
 import { decisionPrompt, fullyReadDevelopmentFeedbackIds, improverSystemPrompt, validateResearchAction, type ResearchCaseViewV1, type ResearchDecisionViewV1, type ResearchInspectionRequestV1, type ResearchInspectionResultV1 } from "./policy-host.ts";
 import { runBoundedModelStep } from "./research-model.ts";
@@ -42,14 +42,13 @@ export async function verifyRequiredExperience(workspaceRoot: string, requiremen
   const requestedRefs = checked.filter((item) => item.targetKind === targetKind).map((item) => item.ref);
   if (!requestedRefs.length) continue;
   const result = await provider.select({ targetKind, applicability: { stage: "method-research", tags: ["cpu-response-identification"] }, requestedRefs,
-   expectedSnapshotId, maxRecords: 100, maxChars: 100_000 });
+   expectedSnapshotId, maxRecords: 1, maxChars: 1, verificationOnly: true });
   if (result.status !== "ready" || result.selected.length !== requestedRefs.length) throw new HarnessError("improvement.experience", "required method experience is unavailable, changed, or not locally registered");
  }
 }
 function combineKnowledgeRefs(...groups: KnowledgeRef[][]): KnowledgeRef[] {
  const refs = new Map<string, KnowledgeRef>();
  for (const ref of groups.flat()) refs.set(`${ref.storeId}/${ref.recordId}@${ref.version}`, ref);
- if (refs.size > 100) throw new HarnessError("improvement.experience", "inherited pinned knowledge references exceed limit");
  return [...refs.values()];
 }
 function combineRequirements(...groups: ExperienceRequirementV1[][]): ExperienceRequirementV1[] {
@@ -181,7 +180,7 @@ export class ResearchImprovementService {
    developmentCaseSetPath: path.join(dir, "development-cases.private.json"), ...(plan.admissionCaseSetPath ? { admissionCaseSetPath: path.join(dir, "admission-cases.private.json") } : {}),
    status: "running", candidates: [], decisions: [], feedback: [] };
   const save = async () => { run.budgetAtEnd = budget.status(); await writeFileAtomic(statePath, `${JSON.stringify(run, null, 2)}\n`); };
-  const budget = new SharedBudget(id, plan.budget);
+  const budget = new SharedBudget(id, plan.budget ?? {});
   await writeFileAtomic(planPath, `${JSON.stringify({ ...plan, developmentCaseSetPath: "[frozen private copy]", priorDevelopmentFeedbackPath: plan.priorDevelopmentFeedbackPath ? "[checked prior public development handoff]" : undefined, admissionCaseSetPath: plan.admissionCaseSetPath ? "[frozen private copy]" : undefined }, null, 2)}\n`);
   await save();
   try {
@@ -212,14 +211,12 @@ export class ResearchImprovementService {
    run.developmentTarget = plan.target; run.developmentTerminal = selected.status; run.developmentBudgetAtSelection = budget.status();
    await save();
    const episode = buildMetaEpisode(run, this.ws.root, plan.target, selected.status);
-   const episodeText = `${JSON.stringify(episode, null, 2)}\n`;
-   if (Buffer.byteLength(episodeText, "utf8") > 120_000) throw new HarnessError("improvement.meta-episode", "development episode exceeds fixed readback size");
-   await writeFileAtomic(metaEpisodePath(this.store.root, id), episodeText);
+   await writeMetaEpisode(metaEpisodePath(this.store.root, id), episode);
    run.metaEpisodeIds = [episode.id];
    if (!selected.selected) { run.status = selected.status === "inconclusive" ? "inconclusive" : "research-only"; run.outcome = selected.status === "no-winner" ? "completed-no-candidate" : "search-incomplete"; run.stopReason = selected.stopReason ?? (selected.status === "no-winner" ? "improver explicitly stopped without selecting a development candidate" : "development search ended inconclusively"); return run; }
    await writeFileAtomic(path.join(dir, "selected-before-g.json"), `${JSON.stringify({ selectedCandidateId: selected.selected.id, selectedAt: selected.selectedAt, source: "development", target: plan.target }, null, 2)}\n`);
    if (!admission) { run.status = "research-only"; run.stopReason = "no caller-frozen admission case set; candidate remains research-only"; return run; }
-   if (budget.status().settlement !== "settled") { run.status = "inconclusive"; run.outcome = "search-incomplete"; run.stopReason = "unknown shared budget before protected admission"; return run; }
+   if (budget.status().inFlight) { run.status = "inconclusive"; run.outcome = "search-incomplete"; run.stopReason = "provider request remains in flight before protected admission"; return run; }
    if (plan.experimentKind === "executor-quality") {
     const candidate = await this.store.readStrategy(selected.selected.strategyVersionId);
     const result = await runExecutorQualityAdmission({ caseSet: admission, baseline: { versionId: h.versionId, artifact: h.artifact as ExecutorStrategyV1 }, candidate: { versionId: candidate.versionId, artifact: candidate.artifact as ExecutorStrategyV1 }, runner: this.runner,
@@ -229,7 +226,7 @@ export class ResearchImprovementService {
       await this.verifyRequirements([record, i], active.bundle.knowledgeSnapshot);
      } });
     run.admissionPath = path.join(dir, "executor-quality-admission.private.json"); await writeFileAtomic(run.admissionPath, `${JSON.stringify(result, null, 2)}\n`);
-    if (result.status === "accepted" && budget.status().settlement === "settled") {
+    if (result.status === "accepted" && !budget.status().inFlight) {
      await this.verifyRequirements([candidate, i], active.bundle.knowledgeSnapshot);
      const bundle = await this.store.writeBundle({ bundleId: this.store.newId("bundle"), parents: [active.bundle.bundleId], executorVersionId: candidate.versionId, improverVersionId: i.versionId, knowledgeSnapshot: active.bundle.knowledgeSnapshot,
       environmentVersion: active.bundle.environmentVersion, modelConfig: active.bundle.modelConfig, protocolVersion: active.bundle.protocolVersion, allowedCapabilities: active.bundle.allowedCapabilities, state: "admitted" });
@@ -254,7 +251,7 @@ export class ResearchImprovementService {
       await this.verifyRequirements([record], active.bundle.knowledgeSnapshot);
      } });
     run.admissionPath = path.join(dir, "meta-admission.private.json"); await writeFileAtomic(run.admissionPath, `${JSON.stringify(meta, null, 2)}\n`);
-    if (meta.status === "accepted" && budget.status().settlement === "settled") {
+    if (meta.status === "accepted" && !budget.status().inFlight) {
      const candidate = await this.store.readStrategy(selected.selected.strategyVersionId);
      await this.verifyRequirements([h, candidate], active.bundle.knowledgeSnapshot);
      if (candidate.artifact.body === i.artifact.body) { run.status = "rejected"; run.outcome = "candidate-rejected"; run.stopReason = "sham improver body did not change"; }
@@ -281,7 +278,7 @@ export class ResearchImprovementService {
  private async search(args: { run: ResearchRunV1; dir: string; plan: ResearchCampaignPlanV1; development: CpuCaseSetV1; bundle: GenerationBundleV1; target: "executor" | "improver";
   improver: StrategyRecordV1; executor: StrategyRecordV1; budget: SharedBudget; lease: BudgetLease; pilotLease?: BudgetLease; depth?: number; selection: ResearchDecisionViewV1["experience"]; metaEpisodes?: MetaEpisodeV1[]; save: () => Promise<void>; prefix: string; priorFeedback: DevelopmentFeedback[] }): Promise<SearchResult> {
   const { run, dir, plan, development, budget, lease } = args;
-  type CaseRuntime = { caseId: string; development: DevelopmentEnvironment; start: ExperimentStart; task: PublicTask; feedback: DevelopmentFeedback[]; episodes: Array<{ candidateId: string; episode: import("./executor-eval.ts").ExecutorEpisodeResult; sdkEstimatedCost: number }>; modelCalls: number; probeCalls: number; sdkEstimatedCost: number };
+  type CaseRuntime = { caseId: string; development: DevelopmentEnvironment; start: ExperimentStart; task: PublicTask; feedback: DevelopmentFeedback[]; episodes: Array<{ candidateId: string; episode: import("./executor-eval.ts").ExecutorEpisodeResult; sdkEstimatedCost: number; costComplete: boolean }>; modelCalls: number; probeCalls: number; sdkEstimatedCost: number };
   const cases = new Map<string, CaseRuntime>();
   const visible: Array<DevelopmentFeedback & { caseId: string }> = [];
   for (const c of development.cases) {
@@ -342,7 +339,7 @@ export class ResearchImprovementService {
     else { const record = selectedCase?.episodes[request.index!]; content = record ? JSON.stringify({ caseId: selectedCase!.caseId, candidateId: record.candidateId,
      methodVersionId: record.episode.methodVersionId, status: record.episode.status, selectedHypothesisId: record.episode.selectedHypothesisId,
      modelCalls: record.episode.modelCalls, usedProbeXs: record.episode.usedProbeXs, feedbackIds: record.episode.feedback.map((f) => f.id),
-     feedbackStatuses: record.episode.feedback.map((f) => f.status), sdkEstimatedCost: record.sdkEstimatedCost, costSource: "sdk-estimate",
+     feedbackStatuses: record.episode.feedback.map((f) => f.status), sdkEstimatedCost: record.sdkEstimatedCost, costSource: record.costComplete ? "sdk-estimate" : "unknown",
      failureCategory: record.episode.failure ? "episode-incomplete" : undefined }) : ""; }
    } else {
     request = { object: "development-feedback", start: 0, maxChars: 4_000 };
@@ -357,7 +354,7 @@ export class ResearchImprovementService {
    return result;
   };
   for (let index = 0; ; index++) {
-   if (budget.status(lease).settlement !== "settled" || budget.status(lease).remaining.sdkEstimatedCost <= 0) return { decisionCount: index, status: "inconclusive", stopReason: "development cost budget became unavailable before a terminal decision" };
+   if (budget.status(lease).inFlight) return { decisionCount: index, status: "inconclusive", stopReason: "development provider request remains in flight before a terminal decision" };
    const view: ResearchDecisionViewV1 = { version: 1, target: args.target, current: { bundleId: args.bundle.bundleId, executorVersionId: args.executor.versionId, improverVersionId: args.improver.versionId }, task,
     methods: { executor: methodView(args.executor, true), improver: methodView(args.improver, true), candidates: [...methodRecords.values()].filter((record) => record.versionId !== args.executor.versionId && record.versionId !== args.improver.versionId).map((record) => methodView(record, false)) },
     cases: caseViews(), inspections: inspectionResults.slice(-3), inspectionWindow: { total: inspectionResults.length, visible: Math.min(3, inspectionResults.length), omitted: Math.max(0, inspectionResults.length - 3) }, readableEvidenceIds: fullyReadDevelopmentFeedbackIds(inspectionResults), metaEpisodes: args.metaEpisodes?.map((episode) => ({ id: episode.id, runId: episode.runId, target: episode.target, terminal: episode.terminal,
@@ -427,7 +424,8 @@ export class ResearchImprovementService {
        beforeModelRequest: () => this.verifyRequirements([strategy], args.bundle.knowledgeSnapshot) });
       const selectedCase = cases.get(c.id)!;
       const episodeCost = budget.status(lease).committed.sdkEstimatedCost - costBefore;
-      selectedCase.episodes.push({ candidateId: candidate.id, episode, sdkEstimatedCost: episodeCost }); selectedCase.modelCalls += episode.modelCalls; selectedCase.probeCalls += episode.usedProbeXs.length;
+      const costComplete = !budget.status(lease).usageUnknown;
+      selectedCase.episodes.push({ candidateId: candidate.id, episode, sdkEstimatedCost: episodeCost, costComplete }); selectedCase.modelCalls += episode.modelCalls; selectedCase.probeCalls += episode.usedProbeXs.length;
       selectedCase.sdkEstimatedCost += episodeCost;
       let scientificStatus: import("./research-types.ts").ResearchDevelopmentEpisodeV1["scientificStatus"] = "incomplete";
       if (episode.status === "submitted") scientificStatus = episode.feedback.at(-1)?.status === "supported-by-observations" ? "supported" : episode.feedback.at(-1)?.status === "contradicted" ? "contradicted" : "incomplete";
@@ -435,7 +433,7 @@ export class ResearchImprovementService {
        const stop = await e.protectedEvaluator.evaluateStop(s, lease);
        scientificStatus = stop.status === "justified-unknown" ? "justified-unknown" : stop.status === "premature-stop" ? "premature-stop" : "incomplete";
       }
-      (run.developmentEpisodes ??= []).push({ caseId: c.id, candidateId: candidate.id, episode, sdkEstimatedCost: episodeCost, modelCalls: episode.modelCalls, scientificStatus });
+      (run.developmentEpisodes ??= []).push({ caseId: c.id, candidateId: candidate.id, episode, sdkEstimatedCost: episodeCost, costComplete, modelCalls: episode.modelCalls, scientificStatus });
       for (const f of episode.feedback) { selectedCase.feedback.push(f); visible.push({ ...f, caseId: c.id }); run.feedback.push({ ...f, caseId: c.id }); candidate.developmentEvidence.push(f.id); }
       if (scientificStatus === "supported" || scientificStatus === "justified-unknown") valid++;
       else if (scientificStatus === "contradicted" || scientificStatus === "premature-stop") contradicted++;

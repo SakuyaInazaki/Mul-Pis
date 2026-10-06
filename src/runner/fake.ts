@@ -249,12 +249,12 @@ export class FakeSessionRunner implements SessionRunner {
 				outcome = "completed";
 				state.completed = true;
 				return { text: reply.text, stopReason, toolCalls: reply.reads?.length ?? 0,
-					usage: summarizeUsage([{ entryId: `${state.ref.id}-${state.turns}`, kind: "assistant", promptIndex: state.turns, at: new Date().toISOString(), usage: replyUsage, status: replyUsage && ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "cost"].every((key) => Number.isFinite(replyUsage?.[key as keyof UsageValues])) ? "reported" : "unknown", costSource: replyUsage?.cost !== undefined ? "sdk-estimate" : "unknown", costStatus: replyUsage?.cost !== undefined ? "priced" : "unknown" }]) };
+					usage: summarizeUsage([{ entryId: `${state.ref.id}-${state.turns}`, kind: "assistant", promptIndex: state.turns, at: new Date().toISOString(), usage: replyUsage, status: replyUsage && ["input", "output", "cacheRead", "cacheWrite", "totalTokens"].every((key) => Number.isFinite(replyUsage?.[key as keyof UsageValues])) ? "reported" : "unknown", costSource: replyUsage?.cost !== undefined ? "sdk-estimate" : "unknown", costStatus: replyUsage?.cost !== undefined ? "priced" : "unknown" }]) };
 				} finally {
 					rejectActive = undefined;
 					state.active = false;
 					if (aborted) outcome = "aborted";
-					const event: UsageEvent = { entryId: `${state.ref.id}-${state.turns}`, kind: "assistant", promptIndex: state.turns, at: new Date().toISOString(), ...(replyUsage ? { usage: replyUsage } : {}), status: replyUsage && ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "cost"].every((key) => Number.isFinite(replyUsage?.[key as keyof UsageValues])) ? "reported" : "unknown", costSource: replyUsage?.cost !== undefined ? "sdk-estimate" : "unknown", costStatus: replyUsage?.cost !== undefined ? "priced" : "unknown" };
+					const event: UsageEvent = { entryId: `${state.ref.id}-${state.turns}`, kind: "assistant", promptIndex: state.turns, at: new Date().toISOString(), ...(replyUsage ? { usage: replyUsage } : {}), status: replyUsage && ["input", "output", "cacheRead", "cacheWrite", "totalTokens"].every((key) => Number.isFinite(replyUsage?.[key as keyof UsageValues])) ? "reported" : "unknown", costSource: replyUsage?.cost !== undefined ? "sdk-estimate" : "unknown", costStatus: replyUsage?.cost !== undefined ? "priced" : "unknown" };
 					usageEvents.push(event);
 					await import("node:fs/promises").then(({ appendFile }) => appendFile(state.ref.file!.replace(/\.jsonl$/, ".usage.jsonl"), `${JSON.stringify({ version: 1, sessionId: state.ref.id, promptIndex: state.turns, outcome, events: [event], summary: summarizeUsage([event]) })}\n`));
 				}

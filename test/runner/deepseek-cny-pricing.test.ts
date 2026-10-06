@@ -66,38 +66,24 @@ test("a price profile outside its reviewed UTC day stops before even the balance
 	assert.equal(requests, 0);
 });
 
-test("a profile expires before a later model call even if its account probe was earlier", async () => {
-	let clock = NOW();
-	const profile = await verifyDeepSeekCnyBilling({ apiKey: KEY, request: account(["CNY"]),
-		now: () => clock });
-	const providerOutputLimit = await outputProfile();
-	const budget = new DeepSeekCampaignBudget({ model: "deepseek/deepseek-flash:low",
-		endpoint: "https://api.deepseek.com", maxCny: 30, priorCommittedCny: 0,
-		providerOutputLimit, outputAccountingMarginTokens: 32,
-		estimatedInputCnyPerMillionTokens: 2, estimatedCacheReadCnyPerMillionTokens: 0.04,
-		estimatedOutputCnyPerMillionTokens: 8, nativeCnyPricing: profile });
-	clock = new Date("2026-10-07T00:00:00.000Z");
-	assert.throws(() => budget.beginPrompt("synthetic", "expired"), /profile review has expired/);
-	assert.equal(budget.snapshot().reservations, 0);
-	assert.equal(budget.snapshot().stopReason, "price-assumption-invalid");
-});
-
-test("native CNY profile prices new reservations without legacy FX while preserving old commitments", async () => {
+test("native CNY profile quantifies requests without a fee cap or legacy FX", async () => {
 	const profile = await verifyDeepSeekCnyBilling({ apiKey: KEY, request: account(["CNY"]),
 		now: NOW });
 	const providerOutputLimit = await outputProfile();
 	const limits = { model: "deepseek/deepseek-flash:low", endpoint: "https://api.deepseek.com" as const,
-		maxCny: 30, priorCommittedCny: 3.307312,
+		maxCny: 0.000001, priorCommittedCny: 3.307312,
 		providerOutputLimit, outputAccountingMarginTokens: 32,
 		estimatedInputCnyPerMillionTokens: 2, estimatedCacheReadCnyPerMillionTokens: 0.04,
 		estimatedOutputCnyPerMillionTokens: 8, nativeCnyPricing: profile };
-	assert.throws(() => new DeepSeekCampaignBudget({ ...limits, estimatedCnyPerUsd: 10 }), /invalid DeepSeek campaign limits/);
+	assert.equal(new DeepSeekCampaignBudget({ ...limits, estimatedCnyPerUsd: 10,
+		estimatedInputCnyPerMillionTokens: 999, estimatedOutputCnyPerMillionTokens: 999 }).strictRequest.maxOutputTokens,
+		providerOutputLimit.maxOutputTokens, "retired caller prices cannot prevent a provider-max request");
 	assert.equal(new DeepSeekCampaignBudget({ ...limits, maxProviderCalls: 1,
 		maxProviderCallsPerPrompt: 1, maxOutputTokens: 1 }).strictRequest.maxOutputTokens,
 		providerOutputLimit.maxOutputTokens,
 		"retired caller fields cannot lower the live provider bound or impose a request quota");
-	assert.throws(() => new DeepSeekCampaignBudget({ ...limits, nativeCnyPricing: nativeCnyPricingRecord(profile) }),
-		/invalid DeepSeek campaign limits/);
+	assert.equal(new DeepSeekCampaignBudget({ ...limits, nativeCnyPricing: nativeCnyPricingRecord(profile) })
+		.strictRequest.maxOutputTokens, providerOutputLimit.maxOutputTokens);
 	const budget = new DeepSeekCampaignBudget(limits);
 	budget.assertResolved({ provider: "deepseek", id: "deepseek-flash", api: "openai-completions",
 		baseUrl: "https://api.deepseek.com", maxTokens: providerOutputLimit.maxOutputTokens,
@@ -105,19 +91,18 @@ test("native CNY profile prices new reservations without legacy FX while preserv
 		cost: { input: 0.3, cacheRead: 0.006, cacheWrite: 0, output: 1.2 } });
 	const lease = budget.beginPrompt("synthetic", "one");
 	budget.reserve(lease, 100, "one", providerOutputLimit.maxOutputTokens);
-	assert.equal(budget.requestAuditSnapshot().requests[0].reservedCny,
-		(100 * 2 + (providerOutputLimit.maxOutputTokens + 32) * 8) / 1_000_000);
+	assert.equal(budget.requestAccountingAuditSnapshot().requests[0].status, "in-flight");
 	assert.equal(budget.snapshot().priorCommittedCny, 3.307312);
 	assert.equal(budget.snapshot().pricingProfile?.currency, "CNY");
-	assert.equal(budget.requestAuditSnapshot().pricingProfile?.priceReviewedAt, "2026-10-06T10:26:00.000Z");
-	assert.doesNotMatch(JSON.stringify(budget.requestAuditSnapshot()), /PRIVATE-|synthetic-only-key/);
+	assert.doesNotMatch(JSON.stringify(budget.requestAccountingAuditSnapshot()), /PRIVATE-|synthetic-only-key/);
 	const response = { entryId: "provider-one", kind: "assistant" as const, promptIndex: 1,
 		at: "2026-10-06T10:31:00.000Z", provider: "deepseek", model: "deepseek-flash",
 		stopReason: "stop", status: "reported" as const, costStatus: "priced" as const,
 		usage: { input: 10, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 14,
 			cost: 0.0000078 } };
 	budget.settleReported(lease, "one", response);
-	assert(Math.abs(budget.snapshot().settledCny - (10 * 2 + 4 * 8) / 1_000_000) < 1e-12);
+	assert(Math.abs(budget.requestAccountingAuditSnapshot().requests[0].settledCny! - (10 * 2 + 4 * 8) / 1_000_000) < 1e-12);
+	assert.equal(budget.requestAccountingAuditSnapshot().unpricedRequestCount, 0);
 	budget.finishPrompt(lease, [{ requestId: "one", event: response }]);
 	const raised = new DeepSeekCampaignBudget(limits);
 	raised.assertResolved({ provider: "deepseek", id: "deepseek-flash", api: "openai-completions",
@@ -126,9 +111,9 @@ test("native CNY profile prices new reservations without legacy FX while preserv
 		cost: { input: 0.6, cacheRead: 0.012, cacheWrite: 0, output: 2.4 } });
 	const next = raised.beginPrompt("synthetic", "higher-sdk-quote");
 	raised.reserve(next, 100, "two", providerOutputLimit.maxOutputTokens);
-	assert.equal(raised.requestAuditSnapshot().requests[0].reservedCny,
-		(100 * 4 + (providerOutputLimit.maxOutputTokens + 32) * 16) / 1_000_000,
-		"a higher normalized SDK quote raises the reserve instead of lowering the official CNY floor");
+	assert.equal(raised.requestAccountingAuditSnapshot().requests[0].status, "in-flight");
+	assert.equal(raised.requestAccountingAuditSnapshot().requests[0].maxOutputTokens,
+		providerOutputLimit.maxOutputTokens);
 });
 
 test("native budget reserves the exact live provider maximum even when it differs from today's example", async () => {
@@ -143,10 +128,8 @@ test("native budget reserves the exact live provider maximum even when it differ
 		assert.equal(budget.strictRequest.maxOutputTokens, bound);
 		const lease = budget.beginPrompt(`synthetic-${bound}`, "one");
 		budget.reserve(lease, 100, `request-${bound}`);
-		assert.equal(budget.requestAuditSnapshot().requests[0].maxOutputTokens, bound);
-		assert.equal(budget.requestAuditSnapshot().requests[0].admissionDecision, "provider-maximum");
-		assert.equal(budget.requestAuditSnapshot().requests[0].reservedCny,
-			(100 * 2 + (bound + 32) * 8) / 1_000_000);
+		assert.equal(budget.requestAccountingAuditSnapshot().requests[0].maxOutputTokens, bound);
+		assert.equal(budget.requestAccountingAuditSnapshot().requests[0].status, "in-flight");
 		if (bound === 100_000) {
 			budget.reserve(lease, 100, "second-request");
 			assert.equal(budget.snapshot().reservations, 2,
@@ -155,4 +138,61 @@ test("native budget reserves the exact live provider maximum even when it differ
 		}
 		budget.failPrompt(lease);
 	}
+});
+
+test("a once-verified CNY profile becomes unpriced after expiry without blocking another request", async () => {
+	let clock = NOW();
+	const profile = await verifyDeepSeekCnyBilling({ apiKey: KEY, request: account(["CNY"]),
+		now: () => clock });
+	const providerOutputLimit = await outputProfile();
+	const budget = new DeepSeekCampaignBudget({ model: "deepseek/deepseek-flash:low",
+		endpoint: "https://api.deepseek.com", maxCny: 0.000001, priorCommittedCny: 20,
+		providerOutputLimit, outputAccountingMarginTokens: 32,
+		estimatedInputCnyPerMillionTokens: 2, estimatedCacheReadCnyPerMillionTokens: 0.04,
+		estimatedOutputCnyPerMillionTokens: 8, nativeCnyPricing: profile });
+	clock = new Date("2026-10-07T00:00:00.000Z");
+	const lease = budget.beginPrompt("synthetic", "expired");
+	budget.reserve(lease, 100, "request", providerOutputLimit.maxOutputTokens);
+	const event = { entryId: "response", kind: "assistant" as const, promptIndex: 1,
+		at: clock.toISOString(), provider: "deepseek", model: "deepseek-flash",
+		stopReason: "stop", status: "reported" as const, costStatus: "priced" as const,
+		usage: { input: 10, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 14,
+			cost: 0.0000078 } };
+	budget.finishPrompt(lease, [{ requestId: "request", event }]);
+	const audit = budget.requestAccountingAuditSnapshot();
+	assert.equal(audit.requests[0].settledCny, null);
+	assert.equal(audit.requests[0].unknownObservedCny, null);
+	assert.equal(audit.requests[0].reportedUsage?.totalTokens, 14);
+	assert.equal(audit.unpricedRequestCount, 1);
+	assert.equal(budget.snapshot().stopped, false);
+});
+
+test("an unverified supplied CNY profile leaves currency unpriced and does not stop research", async () => {
+	const verified = await verifyDeepSeekCnyBilling({ apiKey: KEY, request: account(["CNY"]), now: NOW });
+	const providerOutputLimit = await outputProfile();
+	const unverifiedCopy = nativeCnyPricingRecord(verified);
+	assert.equal(isVerifiedNativeCnyPricingProfile(unverifiedCopy), false);
+	const budget = new DeepSeekCampaignBudget({ model: "deepseek/deepseek-flash:low",
+		endpoint: "https://api.deepseek.com", maxCny: 0.000001,
+		providerOutputLimit, outputAccountingMarginTokens: 32,
+		estimatedInputCnyPerMillionTokens: 2, estimatedOutputCnyPerMillionTokens: 8,
+		nativeCnyPricing: unverifiedCopy });
+	const first = budget.beginPrompt("synthetic", "one");
+	budget.reserve(first, 100, "one");
+	const response = { entryId: "response-one", kind: "assistant" as const, promptIndex: 1,
+		at: NOW().toISOString(), provider: "deepseek", model: "deepseek-flash",
+		stopReason: "stop", status: "reported" as const, costStatus: "priced" as const,
+		usage: { input: 10, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 14,
+			cost: 0.0000078 } };
+	budget.finishPrompt(first, [{ requestId: "one", event: response }]);
+	const audit = budget.requestAccountingAuditSnapshot();
+	assert.equal(audit.requests[0].status, "unknown");
+	assert.equal(audit.requests[0].settledCny, null);
+	assert.equal(audit.requests[0].unknownObservedCny, null);
+	assert.equal(audit.requests[0].reportedUsage?.totalTokens, 14);
+	assert.equal(audit.unpricedRequestCount, 1);
+	assert.equal(budget.snapshot().stopped, false);
+	const next = budget.beginPrompt("synthetic", "two");
+	budget.reserve(next, 100, "two");
+	assert.equal(budget.snapshot().reservations, 2);
 });

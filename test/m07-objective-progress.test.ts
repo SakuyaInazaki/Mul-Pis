@@ -118,6 +118,43 @@ test("assessment parsing has no workflow-chosen raw response byte cap", async t 
 	assert.equal(advanced.length, 1);
 });
 
+test("original-objective assessment retains more than 16 files and 12 obligations or capability facts", async t => {
+	const f = await fixture(t);
+	const extras = await Promise.all(Array.from({ length: 12 }, async (_, index) => {
+		const name = `extra-${String(index + 1).padStart(3, "0")}.txt`;
+		const file = path.join(f.root, "source", name);
+		await writeFile(file, `Evidence ${index + 1}\n`);
+		return { name, file };
+	}));
+	const evidence = [...f.evidence, ...extras];
+	const obligationIds = Array.from({ length: 13 }, (_, index) => `obligation-${index + 1}`);
+	const overrides = Array.from({ length: 13 }, (_, index) => `User constraint ${index + 1}`);
+	const contract = createOriginalObjective({ goal: `Original goal ${"G".repeat(4_100)}`, goalSource: "user-intent-summary",
+		inputNames: evidence.map(item => item.name), userOverrides: overrides,
+		obligations: obligationIds.map(id => ({ id, description: `Keep ${id}` })), closure: "open-ended" });
+	await writeFile(f.contractFile, `${JSON.stringify(contract, null, 2)}\n`);
+	const facts = [{ scope: "two-target-existing", available: true, description: "Observed capability",
+		limits: Array.from({ length: 13 }, (_, index) => `Real host fact ${index + 1}`) }];
+	const response: ModelObjectiveAssessmentV1 = { version: 1, decision: "continue", rationale: "R".repeat(4_100),
+		evidenceRefs: evidence.map(item => item.name), unresolvedObligations: obligationIds,
+		unresolvedDetails: obligationIds.map(id => `${id}: ${"D".repeat(810)}`),
+		nextTask: { objective: "Continue every remaining obligation", addresses: obligationIds, adapterScope: "two-target-existing" } };
+	const reads = await Promise.all([{ name: "original-objective.json", file: f.contractFile }, ...evidence].map(async item => {
+		const body = await readFile(item.file, "utf8");
+		return { toolName: "objective_evidence_read", status: "returned" as const, path: item.name, requested: {},
+			returned: { kind: "text" as const, startLine: 1, endLine: lines(body), truncated: false }, at: new Date().toISOString() };
+	}));
+	const runner = new FakeSessionRunner(() => ({ text: JSON.stringify(response), readReturns: reads }));
+	const result = await assessAndAdvanceOriginalObjective({ contract, contractFile: f.contractFile, runner,
+		sessionSpec: f.sessionSpec, runRecord: f.runRecord, persistReceipt: () => f.ws.writeRun(f.runRecord),
+		evidenceRoot: f.evidenceRoot, evidence, capabilities: facts, userOverrides: overrides,
+		assessmentAdmission: "admitted", advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async task => task.objective });
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.equal(result.assessment?.evidenceRead.length, evidence.length + 1);
+	assert.deepEqual(result.assessment?.unresolvedObligations, obligationIds);
+});
+
 test("accepted finite pilot and even a model fulfilled claim cannot close an open original mission", async t => {
 	const f = await fixture(t);
 	const { result, advanced } = await invoke(f, { text: JSON.stringify(assessment("fulfilled")), readReturns: ranges(f) });
@@ -347,17 +384,23 @@ test("blocked decision checks other feasible capabilities before becoming termin
 	}
 });
 
-test("repeated unsupported work stops honestly and absent capability never grants an executor", async t => {
+test("repeated unsupported proposals receive feedback until a feasible task is chosen", async t => {
 	const f = await fixture(t);
-	const runner = new FakeSessionRunner(() => ({ text: JSON.stringify(assessment("continue", "registered-csr-experiment")), readReturns: ranges(f) }));
+	let calls = 0;
+	const runner = new FakeSessionRunner(({ message }) => {
+		calls++;
+		if (calls === 4) assert.match(message, /repeats an unavailable proposal/);
+		return { text: JSON.stringify(assessment("continue", calls < 4 ? "registered-csr-experiment" : "two-target-existing")), readReturns: ranges(f) };
+	});
 	let dispatched = false;
 	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
 		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
 		supportedTaskScopes: ["two-target-existing", "registered-csr-experiment"], capabilities: availableCapabilities.slice(0, 1),
-		advance: async () => { dispatched = true; } });
-	assert.equal(dispatched, false);
-	assert.equal(result.stopReason, "capability-replan-stalled");
-	assert.equal(result.assessment?.proposalHistory?.length, 2);
+		advance: async task => { assert.equal(task.adapterScope, "two-target-existing"); dispatched = true; } });
+	assert.equal(dispatched, true);
+	assert.equal(calls, 4);
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.equal(result.assessment?.proposalHistory?.length, 4);
 	assert.equal(objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [], assessment: result.assessment,
 		stopReason: result.stopReason }).objectiveOutcome, "incomplete");
 });

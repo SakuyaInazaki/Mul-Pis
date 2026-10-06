@@ -92,17 +92,34 @@ test("pinned historical arguments retain premises and warnings whose latest vers
 	assert(selection.rankedRefs.includes("J002@1"), "the original refutation must remain visible");
 });
 
-test("historical scan limit fails the selection even when no IDs were required", async (t) => {
+test("historical closure still finds an old warning beyond 2,000 tiny versions", async (t) => {
 	const store = await fixture(t);
-	const oversized: KnowledgeRecord = {
+	const latest: KnowledgeRecord = {
 		id: "C001", type: "C", version: 2_001, title: "tensor", body: "claim", fields: {}, refs: [], scope: [],
 		createdAt: "2026-10-04T00:00:00Z", source: { stage: "test", runId: "seed" },
 	};
-	store.list = async () => [oversized];
-	const result = await retrieveKnowledge(store, { purpose: "M04", text: "tensor", maxRecords: 4, maxChars: 5_000 });
-	assert.equal(result.status, "incomplete");
-	assert(result.omitted.some((item) => item.reason === "historical-premise-scan-over-budget"));
-	assert.equal(result.pack.included.length, 0);
+	const warning: KnowledgeRecord = { ...latest, id: "J001", type: "J", version: 1,
+		title: "historical warning", body: "old refutation", refs: [{ rel: "refutes", target: "C001@1" }] };
+	store.list = async () => [latest, warning];
+	store.get = async (id, version) => id === "C001" && version && version <= 2_001 ? { ...latest, version } :
+		id === "J001" && (!version || version === 1) ? warning : undefined;
+	store.availability = async (id, version) => ({ id, version: version ?? 1, availability: "usable_conditionally", reasons: [] });
+	const result = await retrieveKnowledge(store, { purpose: "M04", text: "", requiredIds: ["C001@1"], maxRecords: 4, maxChars: 5_000 });
+	assert.equal(result.status, "ready");
+	assert(result.rankedRefs.includes("J001@1"));
+});
+
+test("ranking reads terms after 24,000 characters and after 96 distinct terms", async (t) => {
+	const store = await fixture(t);
+	await apply(store, [
+		{ op: "create", type: "C", title: "rare-tail-marker", body: "Relevant", usageDecision: "adopted" },
+		{ op: "create", type: "C", title: "filler", body: "Distractor", usageDecision: "adopted" },
+	]);
+	const manyTerms = Array.from({ length: 110 }, (_, index) => `word${index}`).join(" ");
+	const tail = await retrieveKnowledge(store, { purpose: "tail ranking", text: `${manyTerms} ${"filler ".repeat(3_500)}rare-tail-marker`, maxRecords: 1, maxChars: 5_000 });
+	assert.deepEqual(tail.rankedRefs, ["C001@1"]);
+	const distinct = await retrieveKnowledge(store, { purpose: "distinct ranking", text: `${manyTerms} rare-tail-marker`, maxRecords: 1, maxChars: 5_000 });
+	assert.deepEqual(distinct.rankedRefs, ["C001@1"]);
 });
 
 test("pinned historical claims can retrieve an older supporting argument", async (t) => {

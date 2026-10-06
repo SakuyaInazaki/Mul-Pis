@@ -21,6 +21,8 @@ export interface ExperienceQuery {
 	expectedSnapshotId?: string;
 	maxRecords: number;
 	maxChars: number;
+	/** Verify all pinned applicability and live limits without constructing a model-visible pack. */
+	verificationOnly?: boolean;
 }
 
 export interface ExperienceSelection {
@@ -61,7 +63,7 @@ function definition(record: KnowledgeRecord): ExperienceDefinition | undefined {
 	const value = record.fields.experience;
 	if (!isObject(value) || value.version !== 1 || (value.targetKind !== "executor" && value.targetKind !== "improver") ||
 		!isStrings(value.applicableStages) || !isStrings(value.requiredTags) || !isStrings(value.excludedTags) ||
-			!Array.isArray(value.requiredRefs) || value.requiredRefs.length > 100 || !value.requiredRefs.every(isKnowledgeRef)) return undefined;
+			!Array.isArray(value.requiredRefs) || !value.requiredRefs.every(isKnowledgeRef)) return undefined;
 	return value as unknown as ExperienceDefinition;
 }
 
@@ -92,13 +94,13 @@ export function createExperienceProvider(localStore: KnowledgeStore, registeredS
 				const checkedAt = new Date().toISOString();
 				const empty = (status: ExperienceSelection["status"], omitted: ExperienceSelection["omitted"] = []): ExperienceSelection => ({ status, markdown: "", selected: [], omitted, checkedSnapshots: [], limitsCheckedAt: checkedAt });
 				const contexts = query.applicability?.contextRefs ?? [];
-				if (!Array.isArray(query.requestedRefs) || query.requestedRefs.length > 100 || !isStrings(query.applicability?.tags) ||
-					!Array.isArray(contexts) || contexts.length > 100 || !contexts.every(isKnowledgeRef) ||
+				if (!Array.isArray(query.requestedRefs) || query.verificationOnly !== true && query.requestedRefs.length > 100 || !isStrings(query.applicability?.tags) ||
+					!Array.isArray(contexts) || query.verificationOnly !== true && contexts.length > 100 || !contexts.every(isKnowledgeRef) ||
 					typeof query.applicability.stage !== "string" || !query.applicability.stage.trim() || query.applicability.stage.length > 80 ||
-					!Number.isSafeInteger(query.maxRecords) || query.maxRecords < 1 || query.maxRecords > 100 ||
+					!Number.isSafeInteger(query.maxRecords) || query.maxRecords < 1 || query.verificationOnly !== true && query.maxRecords > 100 ||
 					!Number.isSafeInteger(query.maxChars) || query.maxChars < 1 || query.maxChars > 100_000) throw new Error("invalid experience selection bounds or context");
 				if (!query.requestedRefs.length) return empty("none");
-				if (query.requestedRefs.length > query.maxRecords) return empty("incomplete", [{ ref: query.requestedRefs[0], reason: "selection-record-budget-exceeded" }]);
+				if (query.verificationOnly !== true && query.requestedRefs.length > query.maxRecords) return empty("incomplete", [{ ref: query.requestedRefs[0], reason: "selection-record-budget-exceeded" }]);
 			const invalid = query.requestedRefs.filter((ref) => !isKnowledgeRef(ref));
 			if (invalid.length) return empty("incomplete", invalid.map((ref) => ({ ref, reason: "invalid-reference" })));
 			const localId = await localStore.storeId();
@@ -130,7 +132,7 @@ export function createExperienceProvider(localStore: KnowledgeStore, registeredS
 				const identity = key(ref);
 				if (visiting.has(identity)) { omitted.push({ ref, reason: "dependency-cycle" }); return false; }
 				if (checked.has(identity)) return true;
-				if (visiting.size + checked.size >= query.maxRecords) { omitted.push({ ref, reason: "selection-record-budget-exceeded" }); return false; }
+				if (query.verificationOnly !== true && visiting.size + checked.size >= query.maxRecords) { omitted.push({ ref, reason: "selection-record-budget-exceeded" }); return false; }
 				const store = await storeFor(ref);
 				if (!store) { omitted.push({ ref, reason: "store-not-registered-or-identity-mismatch" }); return false; }
 				const record = await store.get(ref.recordId, ref.version);
@@ -182,6 +184,7 @@ export function createExperienceProvider(localStore: KnowledgeStore, registeredS
 				if (state !== after) omitted.push({ ref: query.requestedRefs[0], reason: `knowledge-changed-during-selection:${storeId}` });
 			}
 			if (omitted.length) return { ...empty("incomplete", omitted), checkedSnapshots };
+			if (query.verificationOnly === true) return { status: "ready", markdown: "", selected, omitted: [], checkedSnapshots, limitsCheckedAt: checkedAt };
 			const header = "# 有界方法经验包\n\n所选记录仅在声明条件与当前限制下可供参考；入库和装载不证明科学正确、忠实使用或收益。\n\n";
 				let markdown = header;
 				for (const { ref, record } of records.values()) {
@@ -198,7 +201,7 @@ export function createExperienceProvider(localStore: KnowledgeStore, registeredS
 
 /** Check pinned scientific premises without requiring them to be experience records. */
 export async function verifyRequiredKnowledge(workspaceRoot: string, refs: KnowledgeRef[], expectedSnapshotId?: string, registeredStores: ReadonlyMap<string, KnowledgeStore> = new Map()): Promise<void> {
-	if (!Array.isArray(refs) || refs.length > 100 || !refs.every(isKnowledgeRef)) throw new HarnessError("knowledge.required", "necessary knowledge refs must be bounded pinned references");
+	if (!Array.isArray(refs) || !refs.every(isKnowledgeRef)) throw new HarnessError("knowledge.required", "necessary knowledge refs must be valid pinned references");
 	if (!refs.length) return;
 	const local = createFileKnowledgeStore(path.join(path.resolve(workspaceRoot), ".agent", "knowledge"));
 	await local.init();

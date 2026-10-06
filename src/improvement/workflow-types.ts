@@ -57,7 +57,7 @@ export interface WorkflowArmReceiptV1 {
 	reportDeliveredToM04?: boolean;
 	feedbackStatus?: string;
 	checkResults: Array<{ criterion: string; passed: boolean }>;
-	usage: { providerCalls: number; inputTokens: number; outputTokens: number; sdkEstimatedCost: number; complete: boolean };
+	usage: { providerCalls: number; inputTokens: number; outputTokens: number; sdkEstimatedCost: number; complete: boolean; costComplete?: boolean };
 	status: "complete" | "inconclusive";
 	reason?: string;
 }
@@ -95,10 +95,11 @@ export interface WorkflowRunV1 {
 
 const safeId = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
 function budget(value: unknown): value is BudgetLimits {
-	if (!value || typeof value !== "object") return false;
+	if (value === undefined) return true;
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const b = value as Record<string, unknown>;
 	return Object.keys(b).every((key) => ["maxCpuMillis", "maxInputTokens", "maxOutputTokens", "maxProbeCalls", "maxProviderCalls", "maxSdkEstimatedCost", "maxWallMillis"].includes(key)) &&
-		typeof b.maxSdkEstimatedCost === "number" && Number.isFinite(b.maxSdkEstimatedCost) && b.maxSdkEstimatedCost > 0;
+		(b.maxSdkEstimatedCost === undefined || typeof b.maxSdkEstimatedCost === "number" && Number.isFinite(b.maxSdkEstimatedCost) && b.maxSdkEstimatedCost >= 0);
 }
 export function validateWorkflowPlan(input: unknown): WorkflowEvidenceHandoffPlanV1 {
 	if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.workflow-plan", "workflow plan must be an object");
@@ -112,7 +113,7 @@ export function validateWorkflowPlan(input: unknown): WorkflowEvidenceHandoffPla
 	for (const [key, min, max] of [["maxFeedbackItems", 1, 24], ["admissionRepetitions", 2, Number.MAX_SAFE_INTEGER]] as const)
 		if (!Number.isSafeInteger(p[key]) || (p[key] as number) < min || (p[key] as number) > max) throw new HarnessError("improvement.workflow-plan", `${key} must be ${min}–${max}`);
 	if (p.maxReadbackChars !== undefined && (!Number.isSafeInteger(p.maxReadbackChars) || (p.maxReadbackChars as number) < 0)) throw new HarnessError("improvement.workflow-plan", "legacy maxReadbackChars must be a nonnegative integer");
-	if ((p.admissionRepetitions as number) % 2 !== 0 || !budget(p.budget)) throw new HarnessError("improvement.workflow-plan", "even paired repetitions and a closed budget are required");
+	if ((p.admissionRepetitions as number) % 2 !== 0 || !budget(p.budget)) throw new HarnessError("improvement.workflow-plan", "even paired repetitions and valid historical budget fields are required");
 	if (p.metaEpisodeRunIds !== undefined && (!Array.isArray(p.metaEpisodeRunIds) || !p.metaEpisodeRunIds.every(safeId) || new Set(p.metaEpisodeRunIds).size !== p.metaEpisodeRunIds.length)) throw new HarnessError("improvement.workflow-plan", "prior workflow episodes must be distinct run IDs");
 	if (p.experienceRefs !== undefined) {
 		if (!Array.isArray(p.experienceRefs) || p.experienceRefs.length > 20 || !p.experienceRefs.every(isKnowledgeRef) || new Set(p.experienceRefs.map((ref: KnowledgeRef) => `${ref.storeId}/${ref.recordId}@${ref.version}`)).size !== p.experienceRefs.length) throw new HarnessError("improvement.workflow-plan", "experienceRefs must be at most twenty distinct pinned references");
@@ -124,7 +125,7 @@ export function validateWorkflowPlan(input: unknown): WorkflowEvidenceHandoffPla
 		if (p.experienceMaxRecords !== 0 || p.experienceMaxChars !== 0) throw new HarnessError("improvement.workflow-plan", "empty workflow I experience must have zero or omitted caps");
 	}
 	const { maxOutputTokens: _legacyOutputLimit, maxProviderCalls: _calls, maxInputTokens: _input,
-		maxProbeCalls: _probes, maxCpuMillis: _cpu, maxWallMillis: _wall, ...activeBudget } = p.budget as BudgetLimits;
+		maxProbeCalls: _probes, maxCpuMillis: _cpu, maxWallMillis: _wall, ...activeBudget } = (p.budget ?? {}) as BudgetLimits;
 	const { maxDecisions: _decisions, maxCandidates: _candidates, maxInspectActions: _inspections, maxReadbackChars: _readback,
 		perPromptTimeoutMs: _timeout, ...activePlan } = p;
 	return { ...activePlan, budget: activeBudget } as unknown as WorkflowEvidenceHandoffPlanV1;

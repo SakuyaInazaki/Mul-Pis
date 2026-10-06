@@ -17,6 +17,7 @@ from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import browser_artifacts
 from browser_artifacts import ArtifactRecorder
 import fetch_page
 from fetch_page import ContentParser, empty_meta, write_page
@@ -107,6 +108,49 @@ class ArtifactRecorderTests(unittest.TestCase):
             self.assertIn("download", kinds)
             self.assertNotIn("screenshot", kinds)
             self.assertTrue(any("screenshot failed" in warning for warning in meta["warnings"]))
+
+    def test_many_small_artifacts_do_not_exhaust_a_cumulative_byte_allowance(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(browser_artifacts, "MAX_HTML_BYTES", 100), \
+                patch.object(browser_artifacts, "MAX_TEXT_BYTES", 300), \
+                patch.object(browser_artifacts, "MAX_SCREENSHOT_BYTES", 9), \
+                patch.object(browser_artifacts, "MAX_DOWNLOAD_BYTES", 4):
+            root = Path(temporary)
+            meta = {"warnings": [], "artifacts": [], "visitedUrls": []}
+            recorder = ArtifactRecorder(root, meta)
+            page = FakePage()
+            session = FakeSession(page)
+            for index in range(10):
+                page.html = f"<html>{index}</html>"
+                page.text = f"state {index}"
+                asyncio.run(recorder.capture(session))
+                download = root / "downloads" / f"{index}.txt"
+                download.write_bytes(b"abc")
+                recorder.register_download(str(download), page.url)
+            for kind in ("html", "markdown", "screenshot", "download"):
+                self.assertEqual(sum(a["kind"] == kind for a in meta["artifacts"]), 10)
+            self.assertFalse(meta["warnings"])
+
+    def test_oversized_individual_file_is_rejected_without_blocking_later_files(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(browser_artifacts, "MAX_HTML_BYTES", 20), \
+                patch.object(browser_artifacts, "MAX_DOWNLOAD_BYTES", 4):
+            root = Path(temporary)
+            meta = {"warnings": [], "artifacts": [], "visitedUrls": []}
+            recorder = ArtifactRecorder(root, meta)
+            page = FakePage()
+            session = FakeSession(page)
+            page.html = "x" * 21
+            asyncio.run(recorder.capture(session))
+            page.html = "<p>small</p>"
+            asyncio.run(recorder.capture(session))
+            self.assertEqual(sum(a["kind"] == "html" for a in meta["artifacts"]), 1)
+            large, small = root / "downloads" / "large.bin", root / "downloads" / "small.bin"
+            large.write_bytes(b"12345"); small.write_bytes(b"1234")
+            recorder.register_download(str(large), page.url)
+            recorder.register_download(str(small), page.url)
+            self.assertEqual(sum(a["kind"] == "download" for a in meta["artifacts"]), 1)
+            self.assertTrue(any("oversized" in w for w in meta["warnings"]))
 
 
 class LinkExtractionTests(unittest.TestCase):
@@ -217,6 +261,61 @@ class LinkExtractionTests(unittest.TestCase):
         self.assertEqual(meta["linksTotal"], 1)
         self.assertTrue(Path(meta["htmlPath"]).is_file())
         self.assertTrue(Path(meta["markdownPath"]).is_file())
+
+
+class CrawlLifecycleTests(unittest.TestCase):
+    def _modules(self, cancelled: bool, seen: dict):
+        class Config:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class FakeCrawler:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                seen["closed"] = True
+
+            async def arun(self, **kwargs):
+                seen["config"] = kwargs["config"]
+                if cancelled:
+                    raise asyncio.CancelledError()
+                await asyncio.sleep(0.02)
+                return SimpleNamespace(
+                    status_code=200, url="https://example.test/slow",
+                    response_headers={"content-type": "text/html"},
+                    html="<html><body>complete page</body></html>",
+                    markdown="complete page", success=True, metadata={},
+                )
+
+        return {
+            "crawl4ai": SimpleNamespace(AsyncWebCrawler=FakeCrawler, BrowserConfig=Config, CrawlerRunConfig=Config),
+            "crawl4ai.content_filter_strategy": SimpleNamespace(PruningContentFilter=Config),
+            "crawl4ai.markdown_generation_strategy": SimpleNamespace(DefaultMarkdownGenerator=Config),
+        }
+
+    def test_crawl_has_no_total_deadline_or_premature_http_fallback(self):
+        seen = {}
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(sys.modules, self._modules(False, seen)), \
+                patch.object(fetch_page.asyncio, "wait_for", side_effect=AssertionError("total deadline reintroduced")), \
+                patch.object(fetch_page, "http_fetch", side_effect=AssertionError("premature fallback")):
+            meta, saved = asyncio.run(fetch_page.crawl_fetch("https://example.test/slow", Path(temporary), 0.001))
+            self.assertTrue(saved)
+            self.assertEqual(meta["engine"], "crawl4ai")
+            self.assertEqual(seen["config"].page_timeout, 0)
+            self.assertTrue(seen["config"].check_robots_txt)
+            self.assertTrue(seen["closed"])
+
+    def test_real_cancellation_propagates_and_closes_crawler(self):
+        seen = {}
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(sys.modules, self._modules(True, seen)), \
+                patch.object(fetch_page, "http_fetch", side_effect=AssertionError("cancellation is not fallback")):
+            with self.assertRaises(asyncio.CancelledError):
+                asyncio.run(fetch_page.crawl_fetch("https://example.test/slow", Path(temporary), 0.001))
+        self.assertTrue(seen["closed"])
 
 
 if __name__ == "__main__":

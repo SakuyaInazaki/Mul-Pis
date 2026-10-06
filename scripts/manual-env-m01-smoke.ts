@@ -6,8 +6,7 @@ import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { ResearchService } from "../src/pi/service.ts";
 import { PiSessionRunner } from "../src/runner/pi.ts";
-import { DeepSeekCampaignBudget } from "../src/runner/deepseek-campaign.ts";
-import { verifyDeepSeekProviderOutputLimit, type DeepSeekProviderOutputLimit } from "../src/runner/deepseek-provider-limits.ts";
+import { isVerifiedDeepSeekProviderOutputLimit, verifyDeepSeekProviderOutputLimit, type DeepSeekProviderOutputLimit } from "../src/runner/deepseek-provider-limits.ts";
 import type { SessionRunner } from "../src/runner/types.ts";
 import { runInit } from "../src/stages/init.ts";
 import { HarnessError } from "../src/types.ts";
@@ -15,9 +14,6 @@ import { Workspace } from "../src/workspace.ts";
 
 export const SMOKE_MODEL = "deepseek/deepseek-flash:low";
 export const MAX_INPUT_PAYLOAD_BYTES = 12_000;
-export const MAX_CNY_ESTIMATE = 2.1;
-const CNY_PER_USD_CEILING = 10;
-const OUTPUT_ACCOUNTING_MARGIN_TOKENS = 32;
 
 export interface PublicUsage {
   provider: "deepseek";
@@ -128,12 +124,6 @@ export function publicUsageFromSidecar(raw: unknown): PublicUsage {
   };
 }
 
-export function assertPreflight(): void {
-  if (!Number.isFinite(MAX_CNY_ESTIMATE) || MAX_CNY_ESTIMATE <= 0 || MAX_CNY_ESTIMATE >= 30) {
-    throw new Error("smoke budget preflight failed");
-  }
-}
-
 // The pinned Pi SDK may still catalog the retired V4 name. This local, secret-free
 // profile selects the current official API ID without touching a global Pi profile.
 export const MODEL_PROFILE = {
@@ -151,26 +141,18 @@ export const MODEL_PROFILE = {
   },
 } as const;
 
-export function boundedStageRunner(runtime: ModelRuntime, providerOutputLimit: DeepSeekProviderOutputLimit): SessionRunner & { campaignBudget: DeepSeekCampaignBudget } {
-  const cost = MODEL_PROFILE.providers.deepseek.models[0].cost;
-  const campaignBudget = new DeepSeekCampaignBudget({
-    model: SMOKE_MODEL, endpoint: "https://api.deepseek.com", maxCny: MAX_CNY_ESTIMATE,
-    priorCommittedCny: 0, providerOutputLimit, maxInputPayloadBytes: MAX_INPUT_PAYLOAD_BYTES,
-    outputAccountingMarginTokens: OUTPUT_ACCOUNTING_MARGIN_TOKENS,
-    estimatedInputCnyPerMillionTokens: cost.input * CNY_PER_USD_CEILING,
-    estimatedCacheReadCnyPerMillionTokens: cost.cacheRead * CNY_PER_USD_CEILING,
-    estimatedOutputCnyPerMillionTokens: cost.output * CNY_PER_USD_CEILING,
-    estimatedCnyPerUsd: CNY_PER_USD_CEILING,
-  });
-  const actual = new PiSessionRunner({ modelRuntime: runtime, campaignBudget });
+export function boundedStageRunner(runtime: ModelRuntime, providerOutputLimit: DeepSeekProviderOutputLimit): SessionRunner {
+  if (!isVerifiedDeepSeekProviderOutputLimit(providerOutputLimit)) {
+    throw new Error("smoke requires a live-verified provider output maximum");
+  }
+  const actual = new PiSessionRunner({ modelRuntime: runtime });
   return {
-    campaignBudget,
     estimateMaxSdkCost: (model, caps) => actual.estimateMaxSdkCost(model, caps),
     create: (spec) => {
-      if (spec.label !== "M01" || spec.model !== SMOKE_MODEL || spec.tools.kind !== "none") {
+      if (spec.label !== "M01" || spec.role !== "execution" || spec.model !== SMOKE_MODEL || spec.tools.kind !== "none") {
         throw new Error("smoke supports only one tool-free M01 session");
       }
-      return actual.create(spec);
+      return actual.create({ ...spec, strictRequest: { maxInputPayloadBytes: MAX_INPUT_PAYLOAD_BYTES } });
     },
     resume: async () => { throw new Error("smoke cannot resume a session"); },
   };
@@ -194,7 +176,6 @@ async function run(): Promise<void> {
   let success: Record<string, unknown> | undefined;
   let failure: Record<string, unknown> | undefined;
   try {
-    assertPreflight();
     const key = process.env.DEEPSEEK_API_KEY;
     if (!key || !key.trim()) throw new Error("DEEPSEEK_API_KEY is absent");
     temp = await mkdtemp(path.join(os.tmpdir(), "mul-pis-public-smoke-"));
@@ -237,14 +218,8 @@ async function run(): Promise<void> {
     const usageRows = usageText.trim().split("\n");
     if (usageRows.length !== 1) throw new Error("expected one Pi usage row");
     const observedUsage = publicUsageFromSidecar(JSON.parse(usageRows[0]));
-    const costAudit = runner.campaignBudget.snapshot();
-    if (costAudit.stopped || costAudit.active || costAudit.unknownReservedCny > 0 ||
-        costAudit.inFlightReservedCny > 0 || costAudit.reservations !== observedUsage.observedAssistantEvents) {
-      throw new Error("campaign billing usage is incomplete");
-    }
     success = { check: "public-m01", ok: true, stage: "M01", model: SMOKE_MODEL,
-      providerOutputMaximum: providerLimit.maxOutputTokens, observedProviderRequests: costAudit.reservations,
-      planningCnyMaximum: MAX_CNY_ESTIMATE, committedCny: costAudit.committedCny, observedUsage };
+      providerOutputMaximum: providerLimit.maxOutputTokens, observedUsage };
   } catch (error) {
     const rawUsage = ws ? await failedRunUsage(ws).catch(() => undefined) : undefined;
     failure = safeFailure(error, phase, rawUsage);
@@ -264,9 +239,8 @@ async function run(): Promise<void> {
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)) {
   const mode = process.argv[2];
   if (mode === "--check") {
-    assertPreflight();
-    process.stdout.write(JSON.stringify({ check: "offline-preflight", ok: true, planningCnyMaximum: MAX_CNY_ESTIMATE,
-      note: "Live provider output maximum and pricing are checked before any model request." }) + "\n");
+    process.stdout.write(JSON.stringify({ check: "offline-preflight", ok: true,
+      note: "The live provider output maximum is checked before any model request; this check has no spending ceiling." }) + "\n");
   } else if (mode === "--run") {
     run().catch(() => {
       // Last-resort fixed message; never print provider errors, prompts, paths or credentials.

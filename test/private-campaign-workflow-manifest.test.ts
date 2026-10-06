@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { CARRY_ARTIFACT_NAME, CARRY_FILE_NAME } from "../src/runner/ledger-continuation.ts";
-import { ONE_USE_PUSH_MARKER } from "../src/runner/signed-mission-ledger.ts";
 
-test("private workflow agrees with the one-use runtime admission and encrypted carry contract", async () => {
+test("manual private workflow preserves encrypted carry and runtime admission", async () => {
 	const yaml = await readFile(new URL("../.github/workflows/manual-private-campaign.yml", import.meta.url), "utf8");
-	assert.ok(yaml.includes(`github.event.head_commit.message == '${ONE_USE_PUSH_MARKER}'`));
+	assert.ok(yaml.includes("github.event_name == 'workflow_dispatch'"));
+	assert.ok(yaml.includes("inputs.authorize_bounded_run == true"));
+	assert.doesNotMatch(yaml, /github\.event\.head_commit\.message|github\.event_name == 'push'/);
 	assert.ok(yaml.includes("github.run_attempt == 1"));
 	assert.ok(yaml.includes("cancel-in-progress: false"));
 	assert.ok(yaml.includes("persist-credentials: false"));

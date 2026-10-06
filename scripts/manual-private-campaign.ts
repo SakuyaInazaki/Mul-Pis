@@ -27,7 +27,7 @@ import { DeepSeekCampaignBudget } from "../src/runner/deepseek-campaign.ts";
 import { verifyDeepSeekCnyBilling, type NativeCnyPricingProfile } from "../src/runner/deepseek-cny-pricing.ts";
 import { verifyDeepSeekProviderOutputLimit,
 	type DeepSeekProviderOutputLimit } from "../src/runner/deepseek-provider-limits.ts";
-import { MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, PRIVATE_CONTINUATION_FILE_KEYS } from
+import { MISSION_ID, MISSION_REPOSITORY, PRIVATE_CONTINUATION_FILE_KEYS } from
 	"../src/runner/signed-mission-ledger.ts";
 import { CARRY_FILE_NAME, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, downloadCarryArtifact,
 	isAuthenticatedPriorCarryProof, openLedgerContinuation,
@@ -126,16 +126,15 @@ function campaignObjectiveProgress(contract: OriginalObjectiveContractV1, inheri
 			...(input.unresolvedOperationIds ?? [])])] });
 }
 function sha256(value: string): string { return createHash("sha256").update(value).digest("hex"); }
-function createPrivateCampaignBudget(priorCommittedCny: number,
-	nativeCnyPricing: NativeCnyPricingProfile,
+function createPrivateCampaignBudget(nativeCnyPricing: NativeCnyPricingProfile | undefined,
 	providerOutputLimit: DeepSeekProviderOutputLimit): DeepSeekCampaignBudget {
 	return new DeepSeekCampaignBudget({ model: MODEL, endpoint: "https://api.deepseek.com",
-		maxCny: MISSION_TOTAL_CNY, priorCommittedCny,
+		accountingMode: "accounting-only",
 		providerOutputLimit, outputAccountingMarginTokens: 32,
-		estimatedInputCnyPerMillionTokens: 2,
-		estimatedCacheReadCnyPerMillionTokens: 0.04,
-		estimatedOutputCnyPerMillionTokens: 8,
-		nativeCnyPricing });
+		estimatedInputCnyPerMillionTokens: nativeCnyPricing?.rates.inputMiss ?? 0,
+		estimatedCacheReadCnyPerMillionTokens: nativeCnyPricing?.rates.cacheRead ?? 0,
+		estimatedOutputCnyPerMillionTokens: nativeCnyPricing?.rates.output ?? 0,
+		...(nativeCnyPricing ? { nativeCnyPricing } : {}) });
 }
 function reviewedLegacyRestartEffects(facts: AuthenticatedRestartCarryFacts,
 	operationRefs: readonly string[]): ReviewedRestartEffectPolicy {
@@ -154,7 +153,8 @@ function reviewedLegacyRestartEffects(facts: AuthenticatedRestartCarryFacts,
 function authenticatedLegacyCarryFacts(proof: unknown,
 	bundle: PrivateContinuationBundle): AuthenticatedRestartCarryFacts | undefined {
 	if (!isAuthenticatedPriorCarryProof(proof) || !authenticatedPriorCarryBindsBundle(proof, bundle) ||
-		!proof.resultArtifact || proof.resultArtifact.digestScope !== "github-artifact-archive") return undefined;
+		!proof.resultArtifact || proof.resultArtifact.digestScope !== "github-artifact-archive" ||
+		proof.priorCommittedCny === undefined || proof.priorUnknownHeldCny === undefined) return undefined;
 	const artifact = proof.resultArtifact;
 	const immutableRef = `github-actions://${artifact.repository}/runs/${artifact.runId}/artifacts/${artifact.artifactId}/${artifact.artifactName}`;
 	return { source: { runId: proof.source.runId, runAttempt: proof.source.runAttempt,
@@ -285,10 +285,8 @@ function taskFailureCategory(raw: unknown): string {
 	return "unclassified";
 }
 function campaignObjectiveStop(reason: string | undefined): ObjectiveStopReason | undefined {
-	if (reason === "total-cny-ceiling") return "budget-boundary";
-	if (reason === "provider-call-limit") return "provider-call-limit";
 	if (reason === "output-limit") return "output-limit";
-	if (reason === "price-assumption-invalid") return "accounting-integrity-error";
+	if (reason === "usage-reconciliation" || reason === "payload-boundary") return "accounting-integrity-error";
 	return undefined;
 }
 function privateExceptionDiagnostic(error: unknown, runtimeKey: string | undefined):
@@ -813,7 +811,7 @@ async function adoptedExperienceRefs(store: KnowledgeStore, m04RunId: string, ev
 		if ((await store.availability(record.id, record.version)).availability !== "usable_conditionally") continue;
 		refs.push({ storeId, recordId: record.id, version: record.version });
 	}
-	return refs.slice(0, 24);
+	return refs;
 }
 type TrustedTiming = { target: number; rows: number; cols: number; threads: number; repeats: number; elapsedNs: number };
 function compareCandidateTimings(previous: unknown, current: unknown): { state: "measured" | "unavailable"; ratios?: number[]; medianRatio?: number; minRatio?: number; scope?: string } {
@@ -1305,6 +1303,8 @@ async function main() {
 			runAttempt: process.env.GITHUB_RUN_ATTEMPT, actor: process.env.GITHUB_ACTOR,
 			event: process.env.GITHUB_EVENT_NAME, ref: process.env.GITHUB_REF,
 			sha: process.env.GITHUB_SHA, manualAuthorized: process.env.MULPIS_MANUAL_AUTHORIZED } });
+	// Old signed ceilings remain authenticated history, not a runnable fee policy.
+	if (missionLedger.mode !== "accounting-only") fail("explicit signed accounting-only mission transition is required");
 	let finalBudget: DeepSeekCampaignBudget | undefined;
 	try {
 	if (!runtimeKey?.trim()) fail("DeepSeek credential absent");
@@ -1322,15 +1322,16 @@ async function main() {
 	const providerOutputLimit = await verifyDeepSeekProviderOutputLimit({ apiKey: runtimeKey });
 	statusPhase = "provider-output-limit-verified";
 	statusPhase = "billing-currency-verification";
-	const nativeCnyPricing = await verifyDeepSeekCnyBilling({ apiKey: runtimeKey });
-	statusPhase = "billing-currency-verified";
+	const checkedCnyPricing = await verifyDeepSeekCnyBilling({ apiKey: runtimeKey }).catch(() => undefined);
+	const nativeCnyPricing = checkedCnyPricing?.modelVersion === providerOutputLimit.modelVersion
+		? checkedCnyPricing : undefined;
+	statusPhase = nativeCnyPricing ? "billing-currency-verified" : "billing-currency-unverified";
 	const found = await inputs(inputDir);
 	await requireIsolation(); // fail before any provider call
 	statusPhase = "isolated-preflight-passed";
 	const campaignRoot = await mkdtemp(path.join(os.tmpdir(), "mulpis-private-campaign-"));
 	let runId: string | undefined;
-	const budget = createPrivateCampaignBudget(missionLedger.priorCommittedCny,
-		nativeCnyPricing, providerOutputLimit);
+	const budget = createPrivateCampaignBudget(nativeCnyPricing, providerOutputLimit);
 	statusBudget = budget;
 	finalBudget = budget;
 	let campaignCancelled = false;
@@ -1684,7 +1685,7 @@ async function main() {
 					persistDir: ws.sessionsDir },
 				evidenceRoot: path.join(campaignRoot, "prior-objective-evidence"), evidence: priorEvidence,
 				evidenceRequirements: privateEvidenceRequirements,
-				assessmentAdmission: budget.snapshot().stopped ? "budget-boundary" :
+				assessmentAdmission: budget.snapshot().stopped ? campaignObjectiveStop(budget.snapshot().stopReason) ?? "assessment-failed" :
 					abort.signal.aborted ? "cancelled" : "admitted",
 				advanceAdmission: () => budget.snapshot().stopped ? campaignObjectiveStop(budget.snapshot().stopReason) ??
 					"assessment-failed" : abort.signal.aborted ? "cancelled" : "admitted",
@@ -2310,9 +2311,6 @@ async function main() {
 				m04SelectedReadContractSatisfied && currentM04Status === "completed" && currentM04Read &&
 				currentKnowledgeExport.state !== "incomplete" && branchExerciseComplete &&
 				followOnCompleted ? "fulfilled" : "partial";
-			if (boundedRunOutcome === "partial" && objectiveStopReason === "bounded-run-incomplete" &&
-				budget.snapshot().stopReason === "total-cny-ceiling")
-				objectiveStopReason = "budget-boundary";
 			const boundedRuns = [...previousCheckpoint.boundedRuns, { runId: runId!, outcome: finished.outcome ?? "unknown",
 				...(firstGoalReady ? { selectedTaskId: selectedTask.taskId } : {}) },
 				...followOnAttempts.filter(item => typeof item.goalRunId === "string").map(item => ({
@@ -2390,20 +2388,25 @@ async function main() {
 	} finally {
 		try {
 			const snapshot = finalBudget?.snapshot();
-			const requestAudit = finalBudget?.requestAuditSnapshot() ?? { requests: [], settledCny: 0, unknownReservedCny: 0, inFlightReservedCny: 0, reservations: 0 };
+			const requestAudit = finalBudget?.requestAccountingAuditSnapshot() ?? {
+				version: 3 as const, kind: "accounting-only-request-audit" as const,
+				requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
 			let privateBundle = missionLedger.priorPrivateBundle;
 			try { privateBundle = await collectContinuationBundle(outputDir, missionLedger.priorPrivateBundle); }
 			catch { statusArchiveFailure = "research-continuation-collection-failed-prior-retained"; process.exitCode = 1; }
 			const carry = missionLedger.sealCurrent({ settledCny: requestAudit.settledCny,
-				unknownOrInFlightCny: requestAudit.unknownReservedCny + requestAudit.inFlightReservedCny,
+				unknownObservedCny: requestAudit.unknownObservedCny,
+				unpricedRequestCount: requestAudit.unpricedRequestCount,
 				requestAudit, ...(privateBundle ? { privateBundle } : {}) });
 			await writeFile(path.join(outputDir, CARRY_FILE_NAME), `${JSON.stringify({ envelopeB64: carry.envelopeB64 })}\n`, { mode: 0o600 });
 			await writeFile(path.join(outputDir, "mission-ledger-out.json"), `${JSON.stringify({
-				version: 1, kind: "mul-pis-private-mission-ledger-observation", missionId: MISSION_ID,
-				repository: MISSION_REPOSITORY, globalMaxCny: MISSION_TOTAL_CNY,
+				version: 3, kind: "mul-pis-private-mission-ledger-observation", missionId: MISSION_ID,
+				repository: MISSION_REPOSITORY, accountingMode: "observed-only",
 				currentRunId: process.env.GITHUB_RUN_ID, currentRunAttempt: process.env.GITHUB_RUN_ATTEMPT,
-				currentCommit: process.env.GITHUB_SHA, budget: snapshot,
-				carryForwardCny: carry.carryForwardCny,
+				currentCommit: process.env.GITHUB_SHA, accounting: snapshot,
+				observedSettledCny: carry.observedSettledCny,
+				observedUnknownHeldCny: carry.observedUnknownHeldCny,
+				unpricedRequestCount: carry.unpricedRequestCount,
 				status: "sealed-encrypted-continuation",
 			}, null, 2)}\n`, { mode: 0o600 });
 		} catch { statusArchiveFailure = "mission-ledger-continuation-write-failed"; process.exitCode = 1; }
@@ -2433,7 +2436,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
 		const preProvider = ["preflight", "mission-ledger-verification", "credential-probe", "credential-verified",
 			"isolated-preflight-passed", "workspace-init", "private-inputs-staged",
 			"provider-output-limit-verification", "provider-output-limit-verified",
-			"billing-currency-verification", "billing-currency-verified", "original-source-smoke",
+			"billing-currency-verification", "billing-currency-verified", "billing-currency-unverified", "original-source-smoke",
 			"prior-selected-revalidation", "independent-restart-admission",
 			"source-and-isolation-preflight-passed"].includes(statusPhase);
 		const diagnostic = privateExceptionDiagnostic(error, statusRuntimeKey);

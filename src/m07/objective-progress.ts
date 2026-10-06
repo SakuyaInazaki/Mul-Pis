@@ -10,8 +10,8 @@ const MAX_EVIDENCE_BYTES = 1_000_000;
 const safeAdapterId = (value: unknown): value is string => typeof value === "string" && /^[a-z][a-z0-9._/-]{0,95}$/.test(value);
 const safeName = (value: string) => /^[A-Za-z][A-Za-z0-9._-]{0,79}$/.test(value);
 const safeInputName = (value: string) => /^[A-Za-z0-9][A-Za-z0-9 ._()-]{0,119}$/.test(value);
-const shortText = (value: unknown, limit: number): value is string =>
-	typeof value === "string" && value.trim().length > 0 && value.length <= limit && !value.includes("\0");
+const nonemptyText = (value: unknown): value is string =>
+		typeof value === "string" && value.trim().length > 0 && !value.includes("\0");
 
 /** The caller's original mission is separate from any finite M07 child goal. */
 export interface OriginalObjectiveContractV1 {
@@ -108,16 +108,16 @@ export function createOriginalObjective(input: {
 	userOverrides?: string[];
 	obligations: Array<{ id: string; description: string }>; closure: OriginalObjectiveContractV1["closure"];
 }): OriginalObjectiveContractV1 {
-	if (!shortText(input.goal, 4_000) || !Array.isArray(input.inputNames) || !input.inputNames.length ||
-		input.inputNames.length > 16 || input.inputNames.some(name => !safeInputName(name)) ||
+	if (!nonemptyText(input.goal) || !Array.isArray(input.inputNames) || !input.inputNames.length ||
+		input.inputNames.some(name => !safeInputName(name)) ||
 		new Set(input.inputNames).size !== input.inputNames.length ||
-		!Array.isArray(input.obligations) || !input.obligations.length || input.obligations.length > 12 ||
-		input.obligations.some(item => !safeName(item.id) || !shortText(item.description, 1_000)) ||
+		!Array.isArray(input.obligations) || !input.obligations.length ||
+		input.obligations.some(item => !safeName(item.id) || !nonemptyText(item.description)) ||
 		new Set(input.obligations.map(item => item.id)).size !== input.obligations.length ||
 		!["verbatim-private-input", "user-intent-summary"].includes(input.goalSource) ||
 		!["open-ended", "finite-evidence"].includes(input.closure) ||
-		!Array.isArray(input.userOverrides ?? []) || (input.userOverrides ?? []).length > 12 ||
-		(input.userOverrides ?? []).some(item => !shortText(item, 1_000)))
+		!Array.isArray(input.userOverrides ?? []) ||
+		(input.userOverrides ?? []).some(item => !nonemptyText(item)))
 		throw new HarnessError("m07.objective", "original objective contract is invalid");
 	return { version: 1, kind: "original-objective", id: randomUUID(), createdAt: new Date().toISOString(),
 		goal: input.goal, goalSource: input.goalSource, inputNames: [...input.inputNames],
@@ -132,13 +132,13 @@ function parseAssessment(text: string, contract: OriginalObjectiveContractV1, ev
 	const raw = value as Record<string, unknown>;
 	const ids = new Set(contract.obligations.map(item => item.id));
 	const names = new Set(evidenceNames);
-	const strings = (item: unknown, allowed: Set<string>, max: number): item is string[] =>
-		Array.isArray(item) && item.length <= max && item.every(part => typeof part === "string" && allowed.has(part)) && new Set(item).size === item.length;
-	const details = (item: unknown): item is string[] => Array.isArray(item) && item.length <= 12 &&
-		item.every(part => shortText(part, 800)) && new Set(item).size === item.length;
+	const strings = (item: unknown, allowed: Set<string>): item is string[] =>
+		Array.isArray(item) && item.every(part => typeof part === "string" && allowed.has(part)) && new Set(item).size === item.length;
+	const details = (item: unknown): item is string[] => Array.isArray(item) &&
+		item.every(part => nonemptyText(part)) && new Set(item).size === item.length;
 	if (raw.version !== 1 || typeof raw.decision !== "string" || !["fulfilled", "continue", "blocked"].includes(raw.decision) ||
-		!shortText(raw.rationale, 4_000) || !strings(raw.evidenceRefs, names, 16) ||
-		!strings(raw.unresolvedObligations, ids, 12) || !details(raw.unresolvedDetails))
+		!nonemptyText(raw.rationale) || !strings(raw.evidenceRefs, names) ||
+		!strings(raw.unresolvedObligations, ids) || !details(raw.unresolvedDetails))
 		throw new HarnessError("m07.objective-assessment", "assessment fields are invalid");
 	const decision = raw.decision as ModelObjectiveAssessmentV1["decision"];
 	let nextTask: ObjectiveNextTaskV1 | undefined;
@@ -146,7 +146,7 @@ function parseAssessment(text: string, contract: OriginalObjectiveContractV1, ev
 		if (!raw.nextTask || typeof raw.nextTask !== "object" || Array.isArray(raw.nextTask))
 			throw new HarnessError("m07.objective-assessment", "next task object is invalid");
 		const task = raw.nextTask as Record<string, unknown>;
-		if (!shortText(task.objective, 4_000) || !strings(task.addresses, ids, 12) ||
+		if (!nonemptyText(task.objective) || !strings(task.addresses, ids) ||
 			!safeAdapterId(task.adapterScope) ||
 			!task.addresses.length || task.addresses.some(item => !(raw.unresolvedObligations as string[]).includes(item)))
 			throw new HarnessError("m07.objective-assessment", "next task does not address unresolved original obligations");
@@ -220,26 +220,27 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 }): Promise<{ assessment?: ObjectiveProgressV1["assessment"]; advanced?: T; stopReason: ObjectiveStopReason }> {
 	if (input.assessmentAdmission !== "admitted") return { stopReason: input.assessmentAdmission };
 	if (input.sessionSpec.role !== "research" ||
-		!input.evidence.length || input.evidence.length > 16 || input.evidence.some(item => !safeName(item.name)) ||
+		!input.evidence.length || input.evidence.some(item => !safeName(item.name)) ||
 		new Set(input.evidence.map(item => item.name)).size !== input.evidence.length)
 		throw new HarnessError("m07.objective", "objective assessment boundary is invalid");
 	if (input.capabilities?.some(item => !safeAdapterId(item.scope) ||
-		typeof item.available !== "boolean" || !shortText(item.description, 1_000) ||
-		!Array.isArray(item.limits) || item.limits.length > 12 || item.limits.some(limit => !shortText(limit, 1_000))) ||
+		typeof item.available !== "boolean" || !nonemptyText(item.description) ||
+		!Array.isArray(item.limits) || item.limits.some(limit => !nonemptyText(limit))) ||
 		new Set(input.capabilities?.map(item => item.scope)).size !== (input.capabilities?.length ?? 0))
 		throw new HarnessError("m07.objective", "objective capability facts are invalid");
-	if (!Array.isArray(input.userOverrides ?? []) || (input.userOverrides ?? []).length > 12 ||
-		(input.userOverrides ?? []).some(item => !shortText(item, 1_000)))
+	if (!Array.isArray(input.userOverrides ?? []) ||
+		(input.userOverrides ?? []).some(item => !nonemptyText(item)))
 		throw new HarnessError("m07.objective", "current user overrides are invalid");
 	if (input.supportedTaskScopes.some(scope => !safeAdapterId(scope)) ||
 		new Set(input.supportedTaskScopes).size !== input.supportedTaskScopes.length)
 		throw new HarnessError("m07.objective", "supported adapter IDs are invalid");
 	if (input.evidenceRequirements && (!Array.isArray(input.evidenceRequirements.requiredNames) ||
 		input.evidenceRequirements.requiredNames.some(name => !safeName(name) || !input.evidence.some(item => item.name === name)) ||
-		(input.evidenceRequirements.instructions !== undefined && !shortText(input.evidenceRequirements.instructions, 4_000))))
+		(input.evidenceRequirements.instructions !== undefined && !nonemptyText(input.evidenceRequirements.instructions))))
 		throw new HarnessError("m07.objective", "required adapter evidence is missing or invalid");
 
 	const contractBytes = await readFile(input.contractFile);
+	if (contractBytes.length > MAX_EVIDENCE_BYTES) throw new HarnessError("m07.objective", "original objective contract exceeds evidence file size boundary");
 	if (contractBytes.toString("utf8") !== `${JSON.stringify(input.contract, null, 2)}\n`)
 		throw new HarnessError("m07.objective", "original objective contract changed after freezing");
 	let total = contractBytes.length;
@@ -344,7 +345,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			if (!input.capabilities?.some(item => item.available && input.supportedTaskScopes.includes(item.scope)))
 				return { assessment, stopReason: "next-task-needs-capability" };
 			const key = JSON.stringify(proposed);
-			if (unsupported.has(key)) return { assessment, stopReason: "capability-replan-stalled" };
+			const repeatedUnsupported = unsupported.has(key);
 			unsupported.add(key);
 			blockedProposals.push(proposed);
 			assessment.blockedProposals = [...blockedProposals];
@@ -352,6 +353,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			const admission = input.advanceAdmission();
 			if (admission !== "admitted") return { assessment, stopReason: admission };
 			request = ["Your preceding nextTask cannot be dispatched by the observed host capabilities.",
+				...(repeatedUnsupported ? ["This repeats an unavailable proposal. Revisit the evidence and choose an actually available next action; repetition alone does not close the original objective."] : []),
 				"Keep that proposal and its unresolved requirement in your assessment history. Choose another feasible pending part of the same original task if one exists. Do not treat unavailable optional equipment as proof the entire mission is blocked. If no feasible pending work exists, explain which host limits block each remaining part before returning blocked.",
 				"Available adapters:", ...(input.capabilities ?? []).filter(item => item.available).map(item =>
 					`${item.scope}: ${item.description}; limits: ${item.limits.join("; ")}`),
