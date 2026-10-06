@@ -218,6 +218,11 @@ export interface TransportFailureDiagnostic {
 	responseStarted: boolean | null;
 	bytesRead: number | null;
 	abortSource: "host-signal" | "handle" | "sdk-signal" | null;
+	/** Exact, allowlisted JSON error values observed on a non-2xx response; never free-form text. */
+	providerErrorCode: string | null;
+	providerErrorType: string | null;
+	/** Validated server x-request-id, if it is a UUID or hexadecimal identifier. */
+	providerRequestId: string | null;
 	errorCodes: string[];
 }
 

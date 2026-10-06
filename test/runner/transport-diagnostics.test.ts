@@ -17,11 +17,22 @@ const MODEL = { id: "deepseek-flash", name: "Offline DeepSeek", provider: "deeps
 const OUTPUT_LIMIT = await verifyDeepSeekProviderOutputLimit({ apiKey: "synthetic-only", request: async () =>
 	new Response(JSON.stringify({ object: "list", data: [{ id: MODEL.id, object: "model", name: "DeepSeek-V4.1-Flash",
 		max_output_tokens: MODEL.maxTokens, context_window: MODEL.contextWindow }] }), { status: 200 }) });
+type Mode = "http" | "network" | "generic" | "allowlisted" | "malicious" | "oversize" | "malformed" | "absent";
+const VALID_REQUEST_ID = "12345678-1234-1234-1234-123456789abc";
 
-function factory(mode: "http" | "network" | "generic"): typeof createAgentSession {
+function factory(mode: Mode): typeof createAgentSession {
 	const fakeFetch: typeof fetch = async () => {
 		if (mode === "network") throw new Error("HIDDEN", { cause: Object.assign(new Error("HIDDEN"), { code: "UND_ERR_SOCKET" }) });
-		return new Response("private provider body", { status: 503 });
+		if (mode === "http") return new Response("private provider body", { status: 503 });
+		if (mode === "malformed") return new Response("{not-json HIDDEN", { status: 400,
+			headers: { "content-type": "application/json" } });
+		const error = mode === "allowlisted" ? { code: "context_length_exceeded", type: "invalid_request_error",
+			message: "HIDDEN private prompt", param: "HIDDEN parameter" } :
+			mode === "malicious" ? { code: "HIDDEN private prompt", type: "HIDDEN", message: "HIDDEN private prompt", param: "HIDDEN parameter" } :
+			mode === "oversize" ? { code: "context_length_exceeded", type: "invalid_request_error", message: "HIDDEN".repeat(2000) } :
+			{ message: "HIDDEN private prompt" };
+		return new Response(JSON.stringify({ error }), { status: 400, headers: { "content-type": "application/json",
+			"x-request-id": mode === "malicious" ? "sk-HIDDENprivatekey" : VALID_REQUEST_ID } });
 	};
 	return (async (options: CreateAgentSessionOptions = {}) => {
 		const manager = options.sessionManager!;
@@ -43,7 +54,7 @@ function factory(mode: "http" | "network" | "generic"): typeof createAgentSessio
 	}) as typeof createAgentSession;
 }
 
-function runtime(mode: "http" | "network" | "generic"): ModelRuntime {
+function runtime(mode: Mode, observed: { body?: string }): ModelRuntime {
 	return {
 		getModels: () => [MODEL],
 		streamSimple(model: Model<"openai-completions">, _context: unknown, options: {
@@ -57,7 +68,7 @@ function runtime(mode: "http" | "network" | "generic"): ModelRuntime {
 					try {
 						const response = await options.fetch!("https://private.example/secret?key=HIDDEN", {});
 						await options.onResponse?.({ status: response.status, headers: {} }, model);
-						await response.text();
+						observed.body = await response.text();
 					} catch { /* Simulate SDK flattening the underlying error to generic terminated. */ }
 				}
 				const error = { role: "assistant", content: [], api: model.api, provider: model.provider,
@@ -71,12 +82,13 @@ function runtime(mode: "http" | "network" | "generic"): ModelRuntime {
 	} as unknown as ModelRuntime;
 }
 
-async function run(mode: "http" | "network" | "generic") {
+async function run(mode: Mode) {
 	const dir = await mkdtemp(path.join(tmpdir(), "transport-diagnostic-"));
+	const observed: { body?: string } = {};
 	const budget = new DeepSeekCampaignBudget({ model: "deepseek/deepseek-flash:low", endpoint: "https://api.deepseek.com",
 		providerOutputLimit: OUTPUT_LIMIT, outputAccountingMarginTokens: 32,
 		estimatedInputCnyPerMillionTokens: 4, estimatedOutputCnyPerMillionTokens: 16 });
-	const handle = await new PiSessionRunner({ modelRuntime: runtime(mode), createSession: factory(mode), campaignBudget: budget })
+	const handle = await new PiSessionRunner({ modelRuntime: runtime(mode, observed), createSession: factory(mode), campaignBudget: budget })
 		.create({ label: mode, role: "execution", model: "deepseek/deepseek-flash:low", systemPrompt: "offline", tools: { kind: "none" }, persistDir: dir } satisfies SessionSpec);
 	try {
 		const checkedHandle = { ...handle };
@@ -86,7 +98,7 @@ async function run(mode: "http" | "network" | "generic") {
 		const diagnostics = checkedHandle.transportDiagnostics?.() ?? [];
 		if (diagnostics[0]) diagnostics[0].errorCodes.push("MUTATED_COPY");
 		assert.doesNotMatch(JSON.stringify(handle.transportDiagnostics?.()), /MUTATED_COPY/);
-		return { thrown, diagnostics: handle.transportDiagnostics?.() ?? [] };
+		return { thrown, diagnostics: handle.transportDiagnostics?.() ?? [], observed };
 	} finally { handle.dispose(); await rm(dir, { recursive: true, force: true }); }
 }
 
@@ -95,7 +107,8 @@ test("generic SDK terminated error retains explicitly unavailable transport fiel
 	assert(result.thrown instanceof Error);
 	assert.equal(result.diagnostics.length, 1);
 	assert.deepEqual(result.diagnostics[0], { version: 1, promptIndex: 1, requestId: result.diagnostics[0].requestId,
-		phase: "unknown", httpStatus: null, responseStarted: null, bytesRead: null, abortSource: null, errorCodes: [] });
+		phase: "unknown", httpStatus: null, responseStarted: null, bytesRead: null, abortSource: null,
+		providerErrorCode: null, providerErrorType: null, providerRequestId: null, errorCodes: [] });
 	assert.doesNotMatch(JSON.stringify(result.diagnostics), /HIDDEN|terminated/);
 });
 
@@ -108,7 +121,54 @@ test("HTTP response status and consumed bytes are recorded without private body 
 	assert.equal(result.diagnostics[0].responseStarted, true);
 	assert.equal(result.diagnostics[0].bytesRead, Buffer.byteLength("private provider body"));
 	assert.equal(result.diagnostics[0].phase, "response-body");
+	assert.equal(result.diagnostics[0].providerErrorCode, null);
+	assert.equal(result.diagnostics[0].providerErrorType, null);
+	assert.equal(result.observed.body, "private provider body");
 	assert.doesNotMatch(JSON.stringify(result.diagnostics), /HIDDEN|private|terminated/);
+});
+
+test("allowlisted provider code and type are captured without message or param", async () => {
+	const result = await run("allowlisted");
+	const row = result.diagnostics[0];
+	assert.equal(row.httpStatus, 400);
+	assert.equal(row.providerErrorCode, "context_length_exceeded");
+	assert.equal(row.providerErrorType, "invalid_request_error");
+	assert.equal(row.providerRequestId, VALID_REQUEST_ID);
+	assert.equal(row.bytesRead, Buffer.byteLength(result.observed.body!));
+	assert.match(result.observed.body!, /HIDDEN private prompt/);
+	assert.doesNotMatch(JSON.stringify(row), /HIDDEN|param|message/);
+});
+
+test("body echo in code, type, message, param and request ID is discarded", async () => {
+	const row = (await run("malicious")).diagnostics[0];
+	assert.equal(row.providerErrorCode, null);
+	assert.equal(row.providerErrorType, null);
+	assert.equal(row.providerRequestId, null);
+	assert.doesNotMatch(JSON.stringify(row), /HIDDEN|sk-/);
+});
+
+test("oversized JSON is ignored rather than partially classified", async () => {
+	const result = await run("oversize");
+	assert(result.observed.body && Buffer.byteLength(result.observed.body) > 8192);
+	assert.equal(result.diagnostics[0].providerErrorCode, null);
+	assert.equal(result.diagnostics[0].providerErrorType, null);
+	assert.equal(result.diagnostics[0].bytesRead, Buffer.byteLength(result.observed.body));
+});
+
+test("malformed JSON remains unavailable without changing SDK response bytes", async () => {
+	const result = await run("malformed");
+	assert.equal(result.observed.body, "{not-json HIDDEN");
+	assert.equal(result.diagnostics[0].httpStatus, 400);
+	assert.equal(result.diagnostics[0].providerErrorCode, null);
+	assert.equal(result.diagnostics[0].providerErrorType, null);
+	assert.doesNotMatch(JSON.stringify(result.diagnostics), /HIDDEN|not-json/);
+});
+
+test("HTTP 400 without machine error code stays cause unavailable", async () => {
+	const row = (await run("absent")).diagnostics[0];
+	assert.equal(row.httpStatus, 400);
+	assert.equal(row.providerErrorCode, null);
+	assert.equal(row.providerErrorType, null);
 });
 
 test("transport error code comes only from an actual cause", async () => {

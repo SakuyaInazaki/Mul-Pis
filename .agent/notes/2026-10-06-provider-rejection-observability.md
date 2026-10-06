@@ -1,0 +1,7 @@
+# Provider rejection observability
+
+The strict private runner now records only host-observed transport facts and allowlisted machine error code/type/request identifier values from a non-success provider response. A bounded transient JSON parser never persists the raw response body, free-form message, parameter, prompt, or credential; the SDK still receives the original response bytes. An absent code or type remains explicitly unavailable. These fields describe transport, not provider billing settlement, tool-effect reconciliation, or a scientific outcome.
+
+Future sealed continuations may carry a host-authenticated, source-ordered diagnostic census keyed to unknown request-audit rows. The next research assessor receives a small read-only historical observation with explicit cause-unavailable wording and a no-replay instruction. Older carries without this evidence remain valid and gain no retroactive cause label. A known earlier provider rejection remains an unknown fee and operation observation in its historical carry.
+
+Automatic context rotation is a separate later engineering stage: enabling untracked SDK compaction or shortening provider output was not part of this batch. Offline tests cover allowlisted and malicious response metadata, authenticated diagnostic ancestry, and compatibility with earlier carries. No paid model call or publication of confidential payloads was made for this code change.

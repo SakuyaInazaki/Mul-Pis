@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { deflateRawSync } from "node:zlib";
 import test, { type TestContext } from "node:test";
-import { authenticateOpaqueGapSourceForOfflineTests, authenticatedReviewedOpaqueRunGaps, authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, originalObjectiveMatchesSignedBootstrap, reviewKnownOpaqueGapSource, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE } from "../src/runner/ledger-continuation.ts";
+import { authenticateOpaqueGapSourceForOfflineTests, authenticatedReviewedOpaqueRunGaps, authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, originalObjectiveMatchesSignedBootstrap, reviewKnownOpaqueGapSource, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE, retainedTransportDiagnosticWithinBundle } from "../src/runner/ledger-continuation.ts";
 import type { RequestAuditSnapshot } from "../src/runner/ledger-continuation.ts";
 import { DeepSeekCampaignBudget, campaignSessionEffectId, type CampaignAdmissionRejection } from "../src/runner/deepseek-campaign.ts";
 import { offlineChecks } from "../scripts/manual-private-campaign.ts";
@@ -15,6 +15,7 @@ import { objectiveProgress, type OriginalObjectiveContractV1 } from "../src/m07/
 import { verifyDeepSeekCnyBilling, nativeCnyPricingRecord } from "../src/runner/deepseek-cny-pricing.ts";
 import { verifyDeepSeekProviderOutputLimit, providerOutputLimitRecord } from "../src/runner/deepseek-provider-limits.ts";
 import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, ONE_USE_PUSH_MARKER } from "../src/runner/signed-mission-ledger.ts";
+import { sealCampaignCarry } from "../src/runner/emergency-carry.ts";
 
 const sha = (letter: string) => letter.repeat(40);
 test("old-writer effect recovery cannot change signed objective text under the same contract ID", () => {
@@ -2249,4 +2250,100 @@ test("one-time opaque gap source authority pins the reviewed control request and
 	assert.equal(await reviewKnownOpaqueGapSource({ ...facts,
 		terminal: { ...terminal, providerStepConclusion: "failure" } },
 		"synthetic-token", requestFor()), undefined);
+});
+
+test("optional encrypted transport cause census binds only unknown audit IDs and carries forward unchanged", async t => {
+	const f = await compactedFixture(t);
+	const opened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7005, sha("e")), loadCarryArtifact: async () => f.secondCarry.envelopeB64 });
+	assert.equal(opened.priorTransportDiagnosticCensus, undefined);
+	const lostSession = campaignSessionEffectId("synthetic-lost-session");
+	const currentAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
+		requests: [{ requestId: "synthetic-lost", sessionId: lostSession, responseReceived: false,
+			inputPayloadBytes: 100, status: "unknown" as const, settledCny: null,
+			unknownObservedCny: null, reportedUsage: null }], settledCny: 0,
+		unknownObservedCny: 0, unpricedRequestCount: 1 };
+	const diagnostic = { version: 1 as const, promptIndex: 9, requestId: "synthetic-lost",
+		phase: "response-body" as const, httpStatus: 400, responseStarted: true,
+		bytesRead: 64, abortSource: null, providerErrorCode: "invalid_parameter",
+		providerErrorType: "invalid_request_error", providerRequestId: "a".repeat(32),
+		errorCodes: [], message: "RAW_PRIVATE_MESSAGE_MUST_NOT_PERSIST" };
+	const unavailable = opened.appendTransportDiagnosticCensus(currentAudit, []);
+	assert.equal(JSON.parse(unavailable!).entries[0].rows[0].availability, "unavailable");
+	const text = opened.appendTransportDiagnosticCensus(currentAudit, [diagnostic]);
+	assert.ok(text);
+	assert.doesNotMatch(text, /RAW_PRIVATE_MESSAGE_MUST_NOT_PERSIST|providerRequestId|promptIndex/);
+	const collectorFailure = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7005, sha("e")), loadCarryArtifact: async () => f.secondCarry.envelopeB64 });
+	const prepared = collectorFailure.appendTransportDiagnosticCensus(currentAudit, [diagnostic]);
+	const retained = offlineChecks.collectorFailureBundle(collectorFailure.priorPrivateBundle, prepared);
+	assert.equal(retained?.["transport-diagnostics.json"], prepared);
+	const emergency = sealCampaignCarry({ sealCurrent: () => {
+		throw Error("synthetic research collector failure");
+	}, sealEmergencyCurrent: collectorFailure.sealEmergencyCurrent },
+	{ settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 1,
+		requestAudit: currentAudit, privateBundle: retained });
+	assert.equal(emergency.mode, "emergency-effects-unreviewed");
+	assert.equal(emergency.carry.unpricedRequestCount, (collectorFailure.priorUnpricedRequestCount ?? 0) + 1);
+	const nearLimit = { "candidate.cpp": "x".repeat(4 * 1024 * 1024 - 200) };
+	assert.equal(retainedTransportDiagnosticWithinBundle(nearLimit, text), undefined,
+		"optional cause metadata yields before it could prevent a bounded fee carry");
+	assert.equal(offlineChecks.collectorFailureBundle(nearLimit,
+		retainedTransportDiagnosticWithinBundle(nearLimit, text))?.["candidate.cpp"],
+		nearLimit["candidate.cpp"]);
+	const nearLimitCarry = await rewriteSyntheticCarry(f, cp => {
+		cp.privateBundle["candidate.cpp"] = nearLimit["candidate.cpp"];
+	});
+	const nearLimitOpened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7005, sha("e")), loadCarryArtifact: async () => nearLimitCarry });
+	assert.equal(nearLimitOpened.appendTransportDiagnosticCensus(currentAudit, [diagnostic]), undefined);
+	const feeSafe = nearLimitOpened.sealEmergencyCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 1, requestAudit: currentAudit,
+		privateBundle: nearLimitOpened.priorPrivateBundle }, "effect-review-incomplete");
+	assert.equal(feeSafe.unpricedRequestCount, (nearLimitOpened.priorUnpricedRequestCount ?? 0) + 1);
+	assert.throws(() => opened.appendTransportDiagnosticCensus(currentAudit, [diagnostic, diagnostic]),
+		/repeats one unknown request/);
+	const badCode = { ...diagnostic, providerErrorCode: "raw_private_parameter" };
+	assert.throws(() => opened.appendTransportDiagnosticCensus(currentAudit, [badCode]),
+		/transport diagnostic rows/);
+	const badBundle = { ...opened.priorPrivateBundle!, "transport-diagnostics.json":
+		text.replace('"availability":"observed"', '"availability":"observed","message":"raw"') };
+	assert.throws(() => opened.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 1, requestAudit: currentAudit, privateBundle: badBundle }),
+		/transport diagnostic/);
+	for (const altered of [
+		text.replace('"requestId":"synthetic-lost"', '"requestId":"other-request"'),
+		text.replace('"commit":"' + sha("e") + '"', '"commit":"' + sha("f") + '"'),
+	]) assert.throws(() => opened.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 1, requestAudit: currentAudit,
+		privateBundle: { ...opened.priorPrivateBundle!, "transport-diagnostics.json": altered } }),
+		/transport diagnostic/);
+	const sealed = opened.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 1, requestAudit: currentAudit,
+		privateBundle: { ...opened.priorPrivateBundle!, "transport-diagnostics.json": text } });
+	const done = { ...third, status: "completed", conclusion: "failure" };
+	const next = run(7006, 5, "in_progress", sha("f"));
+	const reopened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7006, sha("f")), request: async (url, init) => {
+			const address = String(url);
+			if (address.includes("/workflows/manual-private-campaign.yml/runs?"))
+				return new Response(JSON.stringify({ total_count: 5,
+					workflow_runs: [next, done, { ...second, status: "completed", conclusion: "success" },
+						{ ...first, status: "completed", conclusion: "success" }, anchor] }));
+			if (address.includes("/runs/7005/jobs?")) return new Response(JSON.stringify({ total_count: 1,
+				jobs: [{ id: 6005, run_id: 7005, run_attempt: 1, head_sha: sha("e"),
+					name: "private-campaign", status: "completed", conclusion: "failure",
+					steps: [{ name: "Run private campaign", status: "completed", conclusion: "failure" }] }] }));
+			if (address.includes("/runs/7005/artifacts?")) return new Response(JSON.stringify({ total_count: 1,
+				artifacts: [{ id: 9005, name: CARRY_ARTIFACT_NAME, expired: false,
+					workflow_run: { id: 7005, head_sha: sha("e") } }] }));
+			return f.request(url, init);
+		}, loadCarryArtifact: async ({ artifactId }) => {
+			assert.equal(artifactId, "9005"); return sealed.envelopeB64;
+		} });
+	assert.equal(reopened.priorTransportDiagnosticCensus?.entries.length, 1);
+	assert.equal(reopened.priorTransportDiagnosticCensus?.entries[0].rows.length, 1);
+	const emptyAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
+		requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
+	assert.equal(reopened.appendTransportDiagnosticCensus(emptyAudit, []), text);
 });

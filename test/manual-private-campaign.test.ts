@@ -124,6 +124,11 @@ test("failed experiment enters untrusted history while selected prior tuple rema
 			controllerEvidence: { reviewStatus: "unreviewed" } }));
 		await writeFile(path.join(directory, "iteration-1-candidate.cpp"), "// failed later attempt\n");
 		await writeFile(path.join(directory, "iteration-1-experiment-plan.json"), "{\"cases\":[]}");
+		const transportCensus = JSON.stringify({ version: 1, kind: "host-transport-diagnostic-census",
+			entries: [{ source: { runId: "1001", runAttempt: 1, commit: "a".repeat(40) },
+				priorEnvelopeSha256: "b".repeat(64), rows: [{ requestId: "synthetic-unknown",
+					availability: "unavailable" }] }] });
+		await writeFile(path.join(directory, "transport-diagnostics.json"), transportCensus);
 		const fallbackPrefix = "fallback-aaaaaaaaaaaa-T003";
 		await writeFile(path.join(directory, `workflow-${fallbackPrefix}-archive.json`), JSON.stringify({ version: 1,
 			kind: "m07-private-candidate-archive", goalRunId: "R004", taskId: "T003",
@@ -142,6 +147,8 @@ test("failed experiment enters untrusted history while selected prior tuple rema
 		assert.equal(carried?.["verification.json"], prior["verification.json"]);
 		assert.equal(carried?.["workflow-archive.json"], prior["workflow-archive.json"]);
 		assert.equal(carried?.["objective-checkpoint.json"], await readFile(path.join(directory, "objective-checkpoint.json"), "utf8"));
+		assert.equal(carried?.["transport-diagnostics.json"], transportCensus,
+			"sanitized host observations travel separately from the selected research tuple");
 		const history = JSON.parse(carried?.["research-history.json"] ?? "null");
 		const entry = history.entries.find((item: { goalRunId: string }) => item.goalRunId === "R002");
 		assert.equal(entry.interpretation.includes("Unselected"), true);
@@ -167,6 +174,8 @@ test("failed experiment enters untrusted history while selected prior tuple rema
 		await offlineChecks.appendRestartGoalBinding(next, carried!, { version: 1, kind: "host-independent-goal-binding",
 			goalRunId: "R004", quarantineReceiptSha256: digest });
 		const twice = await offlineChecks.collectContinuationBundle(next, carried);
+		assert.equal(twice?.["transport-diagnostics.json"], transportCensus,
+			"an older authenticated observation is not lost when no new diagnostic is written");
 		assert.equal(JSON.parse(twice?.["independent-restart-quarantine.json"] ?? "null").entries.length, 2);
 		assert.equal(JSON.parse(twice?.["independent-restart-goal-binding.json"] ?? "null").entries.length, 1);
 		assert.equal(twice?.["candidate.cpp"], prior["candidate.cpp"]);

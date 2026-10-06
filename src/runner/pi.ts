@@ -36,6 +36,10 @@ class TransportProbe {
 	private responseStarted: boolean | null = null;
 	private bytesRead: number | null = null;
 	private errorCodes: string[] = [];
+	private providerErrorCode: string | null = null;
+	private providerErrorType: string | null = null;
+	private providerRequestId: string | null = null;
+	private dropPendingBody?: () => void;
 
 	readonly fetch: typeof globalThis.fetch;
 
@@ -49,17 +53,37 @@ class TransportProbe {
 				this.httpStatus = response.status;
 				this.bytesRead = 0;
 				this.phase = "response-body";
+				const requestId = response.headers.get("x-request-id");
+				if (requestId && SAFE_REQUEST_ID.test(requestId)) this.providerRequestId = requestId;
 				if (!response.body) return response;
+				// The SDK still receives every original byte. This bounded, pass-through
+				// observation is discarded at EOF/cancel/failure and never enters a receipt.
+				const captureJson = !response.ok && JSON_CONTENT_TYPE.test(response.headers.get("content-type") ?? "");
+				let parts: Uint8Array[] = [];
+				let capturedBytes = 0;
+				let oversized = false;
+				const clear = (): void => { parts = []; capturedBytes = 0; };
+				this.dropPendingBody = clear;
 				const reader = response.body.getReader();
 				const counted = new ReadableStream<Uint8Array>({
 					pull: async (controller) => {
 						try {
 							const { done, value } = await reader.read();
-							if (done) controller.close();
-							else { this.bytesRead = (this.bytesRead ?? 0) + value.byteLength; controller.enqueue(value); }
-						} catch (error) { this.captureErrorCodes(error); controller.error(error); }
+							if (done) {
+								if (captureJson && !oversized) this.observeErrorJson(Buffer.concat(parts));
+								clear(); this.dropPendingBody = undefined; controller.close();
+							} else {
+								this.bytesRead = (this.bytesRead ?? 0) + value.byteLength;
+								if (captureJson && !oversized) {
+									if (capturedBytes + value.byteLength <= MAX_ERROR_METADATA_JSON_BYTES) {
+										parts.push(Uint8Array.from(value)); capturedBytes += value.byteLength;
+									} else { oversized = true; clear(); }
+								}
+								controller.enqueue(value);
+							}
+						} catch (error) { clear(); this.dropPendingBody = undefined; this.captureErrorCodes(error); controller.error(error); }
 					},
-					cancel: (reason) => reader.cancel(reason),
+					cancel: (reason) => { clear(); this.dropPendingBody = undefined; return reader.cancel(reason); },
 				});
 				const wrapped = new Response(counted, { status: response.status, statusText: response.statusText, headers: response.headers });
 				// Fetch responses carry read-only metadata outside ResponseInit. Preserve it for SDK compatibility.
@@ -70,6 +94,18 @@ class TransportProbe {
 				throw error;
 			}
 		};
+	}
+
+	private observeErrorJson(body: Uint8Array): void {
+		try {
+			const parsed: unknown = JSON.parse(Buffer.from(body).toString("utf8"));
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+			const error = (parsed as { error?: unknown }).error;
+			if (!error || typeof error !== "object" || Array.isArray(error)) return;
+			const { code, type } = error as { code?: unknown; type?: unknown };
+			if (typeof code === "string" && SAFE_PROVIDER_ERROR_CODES.has(code)) this.providerErrorCode = code;
+			if (typeof type === "string" && SAFE_PROVIDER_ERROR_TYPES.has(type)) this.providerErrorType = type;
+		} catch { /* Malformed JSON is unavailable metadata, never a provider classification. */ }
 	}
 
 	observeResponse(status: number): void {
@@ -90,11 +126,25 @@ class TransportProbe {
 	}
 
 	failure(promptIndex: number, abortSource: TransportFailureDiagnostic["abortSource"], requestId?: string): TransportFailureDiagnostic {
+		this.dropPendingBody?.();
+		this.dropPendingBody = undefined;
 		return { version: 1, promptIndex, ...(requestId ? { requestId } : {}), phase: this.phase,
 			httpStatus: this.httpStatus, responseStarted: this.responseStarted, bytesRead: this.bytesRead,
-			abortSource, errorCodes: [...this.errorCodes] };
+			abortSource, providerErrorCode: this.providerErrorCode, providerErrorType: this.providerErrorType,
+			providerRequestId: this.providerRequestId, errorCodes: [...this.errorCodes] };
 	}
 }
+
+const MAX_ERROR_METADATA_JSON_BYTES = 8_192;
+const JSON_CONTENT_TYPE = /^application\/(?:json|[a-z0-9.+-]+\+json)(?:\s*;|$)/i;
+const SAFE_REQUEST_ID = /^(?:[0-9a-f]{16,64}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+const SAFE_PROVIDER_ERROR_TYPES = new Set([
+	"invalid_request_error", "authentication_error", "permission_error", "not_found_error", "rate_limit_error", "server_error",
+]);
+const SAFE_PROVIDER_ERROR_CODES = new Set([
+	"invalid_request_error", "invalid_format", "invalid_parameter", "invalid_api_key", "model_not_found",
+	"context_length_exceeded", "rate_limit_exceeded", "insufficient_quota", "content_filter",
+]);
 
 const SAFE_ERROR_CODES = new Set([
 	"ECONNRESET", "ECONNREFUSED", "ECONNABORTED", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EPIPE",

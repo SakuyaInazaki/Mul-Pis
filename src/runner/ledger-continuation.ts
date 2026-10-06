@@ -4,6 +4,7 @@ import { HarnessError } from "../types.ts";
 import { canonicalRestartUnknowns } from "../m07/independent-restart.ts";
 import { objectiveProgress, type ObjectiveProgressV1 } from "../m07/objective-progress.ts";
 import type { CampaignAdmissionRejection, CampaignRequestAudit } from "./deepseek-campaign.ts";
+import type { TransportFailureDiagnostic } from "./types.ts";
 import { campaignSessionEffectId } from "./deepseek-campaign.ts";
 import { isNativeCnyPricingRecord, type NativeCnyPricingProfile } from "./deepseek-cny-pricing.ts";
 import { isDeepSeekProviderOutputLimitRecord, type DeepSeekProviderOutputLimit } from "./deepseek-provider-limits.ts";
@@ -186,6 +187,20 @@ export type AccountingOnlyRequestAuditSnapshot = {
 	/** Structural evidence of the verified native-CNY basis, never a live price authorization. */
 	pricingProfile?: NativeCnyPricingProfile;
 };
+export type HostTransportDiagnosticCensusV1 = Readonly<{
+	version: 1; kind: "host-transport-diagnostic-census";
+	entries: ReadonlyArray<Readonly<{
+		source: Readonly<{ runId: string; runAttempt: number; commit: string }>;
+		priorEnvelopeSha256: string;
+		rows: ReadonlyArray<Readonly<{ requestId: string; availability: "unavailable" }> |
+			Readonly<{ requestId: string; availability: "observed";
+				phase: TransportFailureDiagnostic["phase"]; httpStatus: number | null;
+				responseStarted: boolean | null; bytesRead: number | null;
+				abortSource: TransportFailureDiagnostic["abortSource"];
+				providerErrorCode: string | null; providerErrorType: string | null;
+				errorCodes: string[] }>>;
+	}>>;
+}>;
 /** Host-created complete census. It is authority only while bound to a live carry proof. */
 export type HostEffectReceiptV1 = {
 	version: 1; kind: "m07-host-effect-census";
@@ -239,6 +254,10 @@ export type AccountingCarrySealInput = { settledCny: number; unknownObservedCny:
 	privateBundle?: PrivateContinuationBundle; bootstrapBinding?: BootstrapBinding };
 export type LedgerContinuation = {
 	mode: "accounting-only";
+	/** Validated metadata only; never an invoice or authorization to replay an operation. */
+	priorTransportDiagnosticCensus?: HostTransportDiagnosticCensusV1;
+	appendTransportDiagnosticCensus: (audit: AccountingOnlyRequestAuditSnapshot,
+		diagnostics: readonly TransportFailureDiagnostic[]) => string | undefined;
 	/** A paid, terminal Actions run lacked its encrypted carry. Known totals exclude it. */
 	opaqueExecutedRuns: readonly OpaqueExecutedRunGap[];
 	priorCommittedCny?: number; priorUnknownHeldCny?: number;
@@ -320,8 +339,21 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boo
 }
 function canonicalBase64(value: unknown, max: number): Buffer {
 	if (typeof value !== "string" || value.length > Math.ceil(max * 4 / 3) + 4 ||
-		!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value))
+		value.length === 0 || value.length % 4 !== 0)
 		reject("invalid carry encoding");
+	// A repeated capture-group regexp can overflow the JS stack on an otherwise
+	// valid near-bound carry. Validate the alphabet in a strictly linear scan.
+	const paddingAt = value.indexOf("=");
+	const dataEnd = paddingAt < 0 ? value.length : paddingAt;
+	if (value.length - dataEnd > 2) reject("invalid carry encoding");
+	for (let index = 0; index < dataEnd; index++) {
+		const code = value.charCodeAt(index);
+		if (!((code >= 65 && code <= 90) || (code >= 97 && code <= 122) ||
+			(code >= 48 && code <= 57) || code === 43 || code === 47))
+			reject("invalid carry encoding");
+	}
+	for (let index = dataEnd; index < value.length; index++)
+		if (value.charCodeAt(index) !== 61) reject("invalid carry encoding");
 	const bytes = Buffer.from(value, "base64");
 	if (!bytes.length || bytes.length > max || bytes.toString("base64") !== value)
 		reject("invalid carry bytes");
@@ -332,6 +364,12 @@ function validBundle(bundle: unknown): bundle is PrivateContinuationBundle {
 		(PRIVATE_CONTINUATION_FILE_KEYS as readonly string[]).includes(key) && typeof bundle[key] === "string" &&
 		Buffer.byteLength(bundle[key] as string, "utf8") <= 4 * 1024 * 1024) &&
 		Buffer.byteLength(JSON.stringify(bundle), "utf8") <= 4 * 1024 * 1024;
+}
+/** Optional cause metadata must yield before it could prevent a fee carry. */
+export function retainedTransportDiagnosticWithinBundle(prior: PrivateContinuationBundle | undefined,
+	next: string): string | undefined {
+	return validBundle({ ...prior, "transport-diagnostics.json": next }) ? next :
+		prior?.["transport-diagnostics.json"];
 }
 function validBinding(value: unknown): value is BootstrapBinding {
 	return record(value) && exactKeys(value, ["contractId", "sourceSha256"]) &&
@@ -519,6 +557,83 @@ function validAccountingAudit(value: unknown, settledNano: number, unknownNano: 
 		}
 	}
 	return n(settled) === settledNano && n(unknown) === unknownNano && unpriced === unpricedCount;
+}
+const TRANSPORT_PHASES = new Set(["request", "response-body", "provider-stream", "unknown"]);
+const TRANSPORT_ABORTS = new Set(["host-signal", "handle", "sdk-signal"]);
+const TRANSPORT_PROVIDER_CODES = new Set(["invalid_request_error", "invalid_format",
+	"invalid_parameter", "invalid_api_key", "model_not_found", "context_length_exceeded",
+	"rate_limit_exceeded", "insufficient_quota", "content_filter"]);
+const TRANSPORT_PROVIDER_TYPES = new Set(["invalid_request_error", "authentication_error",
+	"permission_error", "not_found_error", "rate_limit_error", "server_error"]);
+const TRANSPORT_NETWORK_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "ECONNABORTED",
+	"ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EPIPE",
+	"UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT",
+	"UND_ERR_BODY_TIMEOUT", "UND_ERR_RESPONSE", "UND_ERR_ABORTED"]);
+function transportUnknownIds(audit: AccountingOnlyRequestAuditSnapshot): string[] {
+	return audit.requests.filter(row => row.responseReceived === false && row.status === "unknown")
+		.map(row => row.requestId);
+}
+/** An optional, strictly enum-only private cause census. Earlier ciphertexts
+ * remain valid without it; the census has no billing or effect authority. */
+function transportDiagnosticCensus(cp: Pick<AccountingCheckpoint,
+	"privateBundle" | "ancestry" | "source" | "parentDigest" | "requestAudit">):
+	HostTransportDiagnosticCensusV1 | undefined {
+	const raw = cp.privateBundle?.["transport-diagnostics.json"];
+	if (raw === undefined) return undefined;
+	let parsed: unknown;
+	try { parsed = JSON.parse(raw); } catch { return reject("transport diagnostic census JSON is invalid"); }
+	if (!record(parsed) || !exactKeys(parsed, ["version", "kind", "entries"]) ||
+		parsed.version !== 1 || parsed.kind !== "host-transport-diagnostic-census" ||
+		!Array.isArray(parsed.entries) || parsed.entries.length === 0)
+		reject("transport diagnostic census fields are invalid");
+	const carried = [...cp.ancestry, cp];
+	let lastIndex = -1;
+	for (const entry of parsed.entries) {
+		if (!record(entry) || !exactKeys(entry, ["source", "priorEnvelopeSha256", "rows"]) ||
+			!record(entry.source) || !exactKeys(entry.source, ["runId", "runAttempt", "commit"]) ||
+			!positiveId(entry.source.runId) || !Number.isSafeInteger(entry.source.runAttempt) ||
+			Number(entry.source.runAttempt) < 1 || typeof entry.source.commit !== "string" ||
+			!/^[0-9a-f]{40}$/.test(entry.source.commit) ||
+			typeof entry.priorEnvelopeSha256 !== "string" ||
+			!/^[0-9a-f]{64}$/.test(entry.priorEnvelopeSha256) || !Array.isArray(entry.rows))
+			reject("transport diagnostic source or rows are invalid");
+		const diagnosticSource = entry.source as Record<string, unknown>;
+		const index = carried.findIndex(item => item.source.runId === diagnosticSource.runId &&
+			item.source.runAttempt === diagnosticSource.runAttempt &&
+			item.source.commit === diagnosticSource.commit);
+		const linked = carried[index];
+		if (index <= lastIndex || !linked || linked.parentDigest !== entry.priorEnvelopeSha256)
+			reject("transport diagnostic source is not bound to accounting ancestry");
+		lastIndex = index;
+		const expectedIds = transportUnknownIds(linked.requestAudit);
+		if (!expectedIds.length || entry.rows.length !== expectedIds.length ||
+			entry.rows.some((row, rowIndex) => !record(row) || row.requestId !== expectedIds[rowIndex] ||
+				(row.availability === "unavailable" ? !exactKeys(row, ["requestId", "availability"]) :
+					row.availability !== "observed" || !exactKeys(row, ["requestId", "availability",
+						"phase", "httpStatus", "responseStarted", "bytesRead", "abortSource",
+						"providerErrorCode", "providerErrorType", "errorCodes"]) ||
+					!TRANSPORT_PHASES.has(String(row.phase)) ||
+					(row.httpStatus !== null && (!Number.isSafeInteger(row.httpStatus) ||
+						Number(row.httpStatus) < 100 || Number(row.httpStatus) > 599)) ||
+					(row.responseStarted !== null && typeof row.responseStarted !== "boolean") ||
+					(row.bytesRead !== null && (!Number.isSafeInteger(row.bytesRead) || Number(row.bytesRead) < 0)) ||
+					(row.abortSource !== null && !TRANSPORT_ABORTS.has(String(row.abortSource))) ||
+					(row.providerErrorCode !== null && !TRANSPORT_PROVIDER_CODES.has(String(row.providerErrorCode))) ||
+					(row.providerErrorType !== null && !TRANSPORT_PROVIDER_TYPES.has(String(row.providerErrorType))) ||
+					!Array.isArray(row.errorCodes) || new Set(row.errorCodes).size !== row.errorCodes.length ||
+					row.errorCodes.some(code => !TRANSPORT_NETWORK_CODES.has(String(code))))))
+			reject("transport diagnostic rows do not match unknown request audit");
+	}
+	const census = parsed as HostTransportDiagnosticCensusV1;
+	for (const entry of census.entries) {
+		for (const row of entry.rows) {
+			if (row.availability === "observed") Object.freeze(row.errorCodes);
+			Object.freeze(row);
+		}
+		Object.freeze(entry.rows); Object.freeze(entry.source); Object.freeze(entry);
+	}
+	Object.freeze(census.entries);
+	return Object.freeze(census);
 }
 function sourceOf(run: Run): Source {
 	if (!Number.isSafeInteger(run.id) || run.id! <= 0 ||
@@ -1145,6 +1260,7 @@ function validateAncestryV3(cp: AccountingCheckpoint, sources: Source[], seedDig
 	}
 	if (!reviewedEffectPrefixValid(cp))
 		reject("reviewed effect ancestry does not match prior accounting and host restart claims");
+	transportDiagnosticCensus(cp);
 }
 function sealCheckpoint(cp: Checkpoint, key: Buffer): string {
 	const nonce = randomBytes(12);
@@ -1569,6 +1685,7 @@ export async function openLedgerContinuation(input: {
 	let hostEffectEvidence: AuthenticatedHostEffectEvidence | undefined;
 	let oneTimeLegacyV3Review: AuthenticatedLegacyV3RunReview | undefined;
 	let reviewedEffectAncestry: ReviewedEffectAncestorReceipt[] = [];
+	let priorTransportDiagnosticCensus: HostTransportDiagnosticCensusV1 | undefined;
 	let opaqueExecutedRuns: OpaqueExecutedRunGap[] = [];
 	let currentEffectReviewPending = false;
 	let pendingEffectAncestry: Source[] = [];
@@ -1582,6 +1699,7 @@ export async function openLedgerContinuation(input: {
 			validateAncestryV3(opened.checkpoint, sourcesWithCarry, seed.seedDigest,
 				n(seed.payload.priorCommittedCny), seed.bootstrapBinding);
 			const cp = opened.checkpoint;
+			priorTransportDiagnosticCensus = transportDiagnosticCensus(cp);
 			opaqueExecutedRuns = [...(cp.opaqueExecutedRuns ?? [])];
 			currentEffectReviewPending = cp.currentEffectReview === "pending";
 			pendingEffectAncestry = [...(cp.pendingEffectAncestry ?? [])];
@@ -1752,7 +1870,24 @@ export async function openLedgerContinuation(input: {
 	if (priorPrivateBundle) Object.freeze(priorPrivateBundle);
 	if (priorBootstrapBinding) Object.freeze(priorBootstrapBinding);
 	let sealed = false;
+	let diagnosticPrepared = false;
+	let preparedDiagnosticText: string | undefined;
+	let preparedDiagnosticAuditSha256: string | undefined;
+	const validateCurrentDiagnostic = (cp: AccountingCheckpoint): void => {
+		const latest = transportDiagnosticCensus(cp);
+		const inherited = priorTransportDiagnosticCensus?.entries ?? [];
+		const entries = latest?.entries ?? [];
+		if (entries.length < inherited.length || entries.length > inherited.length + 1 ||
+			JSON.stringify(entries.slice(0, inherited.length)) !== JSON.stringify(inherited) ||
+			(entries.length === inherited.length + 1 &&
+				entries.at(-1)?.source.runId !== currentSource.runId))
+			reject("transport diagnostic census did not preserve its authenticated prefix");
+		if (diagnosticPrepared && (cp.privateBundle?.["transport-diagnostics.json"] !== preparedDiagnosticText ||
+			preparedDiagnosticAuditSha256 !== digest(JSON.stringify(cp.requestAudit))))
+			reject("transport diagnostic census differs from the final host audit");
+	};
 	const result: LedgerContinuation = { mode: "accounting-only",
+		...(priorTransportDiagnosticCensus ? { priorTransportDiagnosticCensus } : {}),
 		opaqueExecutedRuns: Object.freeze([...opaqueExecutedRuns]),
 		priorSettledCny: decimal(settledNano), priorUnknownObservedCny: decimal(unknownObservedNano),
 		priorUnpricedRequestCount: unpricedRequestCount,
@@ -1763,6 +1898,51 @@ export async function openLedgerContinuation(input: {
 		...(proof ? { priorCarryProof: proof } : {}),
 		...(priorPrivateBundle ? { priorPrivateBundle } : {}),
 		...(priorBootstrapBinding ? { priorBootstrapBinding } : {}),
+		appendTransportDiagnosticCensus: (audit, diagnostics) => {
+			if (sealed) reject("transport diagnostic census cannot follow carry sealing");
+			if (!validAccountingAudit(audit, n(audit.settledCny),
+				n(audit.unknownObservedCny), audit.unpricedRequestCount))
+				reject("transport diagnostic census has an invalid current request audit");
+			const priorRaw = priorPrivateBundle?.["transport-diagnostics.json"];
+			if (priorRaw && !priorTransportDiagnosticCensus)
+				reject("prior transport diagnostic census lacks v3 ancestry authentication");
+			const unknownIds = transportUnknownIds(audit);
+			if (!unknownIds.length) {
+				diagnosticPrepared = true; preparedDiagnosticText = priorRaw;
+				preparedDiagnosticAuditSha256 = digest(JSON.stringify(audit));
+				return priorRaw;
+			}
+			const observations = new Map<string, TransportFailureDiagnostic>();
+			for (const diagnostic of diagnostics) {
+				if (!diagnostic.requestId || !unknownIds.includes(diagnostic.requestId)) continue;
+				if (observations.has(diagnostic.requestId))
+					reject("transport diagnostic census repeats one unknown request");
+				observations.set(diagnostic.requestId, diagnostic);
+			}
+			const rows = unknownIds.map(requestId => {
+				const observed = observations.get(requestId);
+				return observed ? { requestId, availability: "observed" as const,
+					phase: observed.phase, httpStatus: observed.httpStatus,
+					responseStarted: observed.responseStarted, bytesRead: observed.bytesRead,
+					abortSource: observed.abortSource, providerErrorCode: observed.providerErrorCode,
+					providerErrorType: observed.providerErrorType, errorCodes: [...observed.errorCodes] } :
+					{ requestId, availability: "unavailable" as const };
+			});
+			const source = { runId: currentSource.runId, runAttempt: currentSource.runAttempt,
+				commit: currentSource.commit };
+			const priorEntries = priorTransportDiagnosticCensus?.entries ?? [];
+			const next = JSON.stringify({ version: 1, kind: "host-transport-diagnostic-census",
+				entries: [...priorEntries, { source, priorEnvelopeSha256: parentDigest, rows }] });
+			transportDiagnosticCensus({ privateBundle: { "transport-diagnostics.json": next },
+				ancestry: accountingAncestry, source: currentSource, parentDigest, requestAudit: audit });
+			// This census is optional metadata. If appending it would cross the
+			// physical private-bundle bound, keep the authenticated older census;
+			// the current RSA result still reports the transport observation.
+			const retained = retainedTransportDiagnosticWithinBundle(priorPrivateBundle, next);
+			diagnosticPrepared = true; preparedDiagnosticText = retained;
+			preparedDiagnosticAuditSha256 = digest(JSON.stringify(audit));
+			return retained;
+		},
 		claimOneUse: async carryDigest => {
 			if (opaqueExecutedRuns.some(gap => gap.effects !== "quarantined-source-reviewed") ||
 				currentEffectReviewPending || pendingEffectAncestry.length)
@@ -1871,6 +2051,7 @@ export async function openLedgerContinuation(input: {
 				}
 				if (!reviewedEffectPrefixValid(cp))
 					reject("current reviewed effect ancestry is not bound to restart claims");
+				validateCurrentDiagnostic(cp);
 				const allPriorEffectsReviewed = priorNonzero.every(row =>
 					cp.reviewedEffectAncestry?.some(entry => entry.envelopeSha256 === row.envelopeDigest) ?? false);
 				const originForCurrent = carryForwardOrigin ?? reviewedOrigin;
@@ -1936,6 +2117,12 @@ export async function openLedgerContinuation(input: {
 				if (!predecessor) reject("pending effect ancestry lacks its authenticated source");
 				pending.push({ ...predecessor });
 			}
+			const emergencyBundle = { ...priorPrivateBundle };
+			if (amounts.privateBundle?.["transport-diagnostics.json"] !== undefined)
+				emergencyBundle["transport-diagnostics.json"] =
+					amounts.privateBundle["transport-diagnostics.json"];
+			if (!validBundle(emergencyBundle))
+				reject("emergency transport diagnostic bundle exceeds private bounds");
 			const cp: AccountingCheckpoint = { version: 3, ancestry: accountingAncestry,
 				legacyAncestry, historical,
 				kind: "mul-pis-private-ledger-continuation", missionId: MISSION_ID,
@@ -1945,11 +2132,12 @@ export async function openLedgerContinuation(input: {
 				settledAddedNano, unknownObservedAddedNano,
 				unpricedAddedCount: amounts.unpricedRequestCount,
 				requestAudit: amounts.requestAudit, currentEffectReview: "pending",
-				privateBundle: priorPrivateBundle, bootstrapBinding: priorBootstrapBinding,
+				privateBundle: emergencyBundle, bootstrapBinding: priorBootstrapBinding,
 				...(opaqueExecutedRuns.length ? { opaqueExecutedRuns: [...opaqueExecutedRuns] } : {}),
 				...(reviewedEffectAncestry.length ?
 					{ reviewedEffectAncestry: [...reviewedEffectAncestry] } : {}),
 				...(pending.length ? { pendingEffectAncestry: pending } : {}) };
+			validateCurrentDiagnostic(cp);
 			const envelopeB64 = sealCheckpoint(cp, key);
 			sealed = true;
 			return { envelopeB64, observedSettledCny: decimal(nextSettledNano),

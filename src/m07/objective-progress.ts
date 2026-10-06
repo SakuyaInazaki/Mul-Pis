@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { copyFile, lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { openBoundedSession, type EvidenceBindingV1 } from "../context/boundary.ts";
@@ -243,15 +243,20 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 	if (contractBytes.length > MAX_EVIDENCE_BYTES) throw new HarnessError("m07.objective", "original objective contract exceeds evidence file size boundary");
 	if (contractBytes.toString("utf8") !== `${JSON.stringify(input.contract, null, 2)}\n`)
 		throw new HarnessError("m07.objective", "original objective contract changed after freezing");
-	let total = contractBytes.length;
-	const materials: Array<{ name: string; file: string; text: string }> = [];
+	// Keep only per-file metadata. Evidence is read through a paged tool by the assessor;
+	// an aggregate byte cap would reject a valid collection before any such read.
+	const materials: Array<{ name: string; file: string; lineCount: number; digest: string }> = [];
 	for (const item of input.evidence) {
 		const info = await lstat(item.file);
-		if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_EVIDENCE_BYTES || total + info.size > MAX_EVIDENCE_BYTES)
+		if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_EVIDENCE_BYTES)
 			throw new HarnessError("m07.objective", "objective evidence is not a bounded regular file");
-		const text = await readFile(item.file, "utf8");
-		total += Buffer.byteLength(text, "utf8");
-		materials.push({ ...item, text });
+		const bytes = await readFile(item.file);
+		if (bytes.length > MAX_EVIDENCE_BYTES) throw new HarnessError("m07.objective", "objective evidence is not a bounded regular file");
+		let text: string;
+		try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+		catch { throw new HarnessError("m07.objective", "objective evidence is not valid UTF-8 text"); }
+		materials.push({ ...item, lineCount: text.split("\n").length - (text.endsWith("\n") ? 1 : 0),
+			digest: createHash("sha256").update(bytes).digest("hex") });
 	}
 	await mkdir(input.evidenceRoot, { mode: 0o700 });
 	const frozenContract = path.join(input.evidenceRoot, "original-objective.json");
@@ -264,7 +269,8 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 	for (const item of materials) {
 		const copy = path.join(input.evidenceRoot, item.name);
 		await copyFile(item.file, copy);
-		if (!(await readFile(copy)).equals(Buffer.from(item.text, "utf8")))
+		const frozen = await readFile(copy);
+		if (frozen.length > MAX_EVIDENCE_BYTES || createHash("sha256").update(frozen).digest("hex") !== item.digest)
 			throw new HarnessError("m07.objective", "frozen objective evidence changed during copy");
 		evidence.push({ version: 1, label: item.name, path: copy, status: "frozen-copy", sourceVersion: input.contract.id });
 	}
@@ -286,9 +292,8 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			"# Frozen bounded evidence", "Use objective_evidence_read to read the complete original-objective.json and every listed file. If a file is paginated, read every page including the untruncated end. The file names are:",
 			...materials.map(item => item.name),
 			"Return only strict JSON with version 1, decision (fulfilled, continue, or blocked), rationale, evidenceRefs (file names above), unresolvedObligations (IDs above), unresolvedDetails (your concrete open requirements from the full original assignment), and when continuing nextTask {objective, addresses, adapterScope}. Use a scope only when its observed host capability covers your proposed work. If a proposed task has no available registered executor, retain it as unresolved and name the unavailable capability explicitly. The host may ask you to replan feasible work; preserve unresolved requirements. Assess honestly. Propose the next scientific work yourself from unresolved original obligations; do not change task permissions or claim a global optimum from a finite evaluation."].join("\n\n");
-		const coverage = (name: string, contents: string): { complete: boolean; score: number } => {
+		const coverage = (name: string, lines: number): { complete: boolean; score: number } => {
 			const returned = handle.readReturnEvents();
-			const lines = contents.split("\n").length - (contents.endsWith("\n") ? 1 : 0);
 			const rows = returned.filter(item => item.toolName === "objective_evidence_read" && item.path === name &&
 				item.status === "returned" && item.returned.kind === "text" && item.returned.startLine !== undefined &&
 				item.returned.endLine !== undefined && item.returned.startLine >= 1 &&
@@ -299,7 +304,8 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			return { complete: reachedUntruncatedEnd && covered.size === lines,
 				score: covered.size + Number(reachedUntruncatedEnd) };
 		};
-		const readMaterials = [{ name: "original-objective.json", text: contractBytes.toString("utf8") }, ...materials];
+		const contractText = contractBytes.toString("utf8");
+		const readMaterials = [{ name: "original-objective.json", lineCount: contractText.split("\n").length - (contractText.endsWith("\n") ? 1 : 0) }, ...materials];
 		const proposals: ModelObjectiveAssessmentV1[] = [];
 		const unsupported = new Set<string>();
 		const blockedProposals: ObjectiveNextTaskV1[] = [];
@@ -318,7 +324,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			const returned = handle.readReturnEvents();
 			const newReadEvents = returned.slice(readEventCursor);
 			readEventCursor = returned.length;
-			const fileCoverage = readMaterials.map(item => ({ name: item.name, ...coverage(item.name, item.text) }));
+			const fileCoverage = readMaterials.map(item => ({ name: item.name, ...coverage(item.name, item.lineCount) }));
 			const evidenceRead = fileCoverage.filter(item => item.complete).map(item => item.name);
 			const unreadEvidence = fileCoverage.filter(item => !item.complete).map(item => item.name);
 			const unreadScore = fileCoverage.reduce((sum, item) => sum + item.score, 0);

@@ -807,6 +807,8 @@ test("real Pi transports one offline request with its runtime key, confined tool
 		assert.equal(diagnostics.length, 1);
 		assert.equal(diagnostics[0].httpStatus, 401);
 		assert.equal(diagnostics[0].responseStarted, true);
+		assert.equal(diagnostics[0].providerErrorType, "invalid_request_error");
+		assert.equal(diagnostics[0].providerErrorCode, null);
 		assert.equal(diagnostics[0].bytesRead, Buffer.byteLength(JSON.stringify({ error: {
 			message: "offline synthetic rejection", type: "invalid_request_error" } })));
 		assert.doesNotMatch(JSON.stringify(diagnostics), /SYNTHETIC-OFFLINE|offline synthetic rejection|chat\/completions/);

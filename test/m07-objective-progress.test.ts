@@ -155,6 +155,44 @@ test("original-objective assessment retains more than 16 files and 12 obligation
 	assert.deepEqual(result.assessment?.unresolvedObligations, obligationIds);
 });
 
+test("objective assessor freezes more than 1 MB combined individually bounded evidence", async t => {
+	const f = await fixture(t);
+	const extras = await Promise.all(["carry-control.json", "checkpoint-control.json"].map(async name => {
+		const file = path.join(f.root, "source", name);
+		await writeFile(file, `${"x".repeat(99)}\n`.repeat(5_500));
+		return { name, file };
+	}));
+	const evidence = [...f.evidence, ...extras];
+	const reads = [...ranges(f), ...extras.flatMap(item => Array.from({ length: 55 }, (_, page) => ({
+		toolName: "objective_evidence_read", status: "returned" as const, path: item.name,
+		requested: { offset: page * 100 + 1, limit: 100 },
+		returned: { kind: "text" as const, startLine: page * 100 + 1, endLine: (page + 1) * 100,
+			truncated: page < 54 }, at: new Date().toISOString(),
+	})))];
+	const runner = new FakeSessionRunner(() => ({ text: JSON.stringify(assessment("continue")), readReturns: reads }));
+	const result = await assessAndAdvanceOriginalObjective({ ...f, evidence, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async task => task.objective });
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.deepEqual(result.assessment?.unreadEvidence, []);
+	assert.equal(result.assessment?.evidenceRead.length, evidence.length + 1);
+	assert.equal(runner.created.length, 1);
+});
+
+test("objective assessor still rejects a single evidence file over 1 MB", async t => {
+	const f = await fixture(t);
+	const file = path.join(f.root, "source", "oversize-control.json");
+	await writeFile(file, "x".repeat(1_000_001));
+	const runner = new FakeSessionRunner(() => "must not dispatch");
+	await assert.rejects(assessAndAdvanceOriginalObjective({ ...f,
+		evidence: [...f.evidence, { name: "oversize-control.json", file }], runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async task => task.objective }), /bounded regular file/);
+	assert.equal(runner.created.length, 0);
+});
+
 test("accepted finite pilot and even a model fulfilled claim cannot close an open original mission", async t => {
 	const f = await fixture(t);
 	const { result, advanced } = await invoke(f, { text: JSON.stringify(assessment("fulfilled")), readReturns: ranges(f) });

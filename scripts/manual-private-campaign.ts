@@ -1362,7 +1362,7 @@ async function collectContinuationBundle(directory: string, prior?: PrivateConti
 	if (history.entries.length) selected["research-history.json"] = JSON.stringify(history);
 	for (const name of ["original-objective.json", "objective-checkpoint.json", "objective-assessment-receipts.json",
 		"independent-restart-quarantine.json", "independent-restart-goal-binding.json",
-		"host-effect-receipt.json"] as const)
+		"host-effect-receipt.json", "transport-diagnostics.json"] as const)
 		if (current[name]) selected[name] = current[name];
 	// A receipt describes one Actions execution. An older receipt cannot attest
 	// this process merely because its historical selected tuple was retained.
@@ -1370,6 +1370,14 @@ async function collectContinuationBundle(directory: string, prior?: PrivateConti
 	if (Buffer.byteLength(JSON.stringify(selected), "utf8") > 4 * 1024 * 1024)
 		fail("research continuation exceeds the authenticated carry capacity");
 	return selected;
+}
+
+/** Collection failure retains the authenticated old research and only the new
+ * host-prepared transport metadata for an emergency accounting/effect seal. */
+function collectorFailureBundle(prior: PrivateContinuationBundle | undefined,
+	transportCensus: string | undefined): PrivateContinuationBundle | undefined {
+	return transportCensus === undefined ? prior :
+		{ ...prior, "transport-diagnostics.json": transportCensus };
 }
 
 /** Host-side task and tool census; the encrypted carry later authenticates these exact bytes. */
@@ -1533,6 +1541,17 @@ async function main() {
 			"objective-seeds/prior-candidate.cpp", "objective-seeds/prior-verification.json",
 			"objective-seeds/prior-archive.json",
 			...(previousBundle["experiment-plan.json"] ? ["objective-seeds/prior-experiment-plan.json"] : [])];
+		const priorTransportObservation = missionLedger.priorTransportDiagnosticCensus?.entries.at(-1);
+		const priorTransportObservationPath = priorTransportObservation ?
+			path.join(priorSeedDir, "prior-transport-observation.json") : undefined;
+		if (priorTransportObservation && priorTransportObservationPath) {
+			await writeFile(priorTransportObservationPath, `${JSON.stringify({ version: 1,
+				kind: "authenticated-prior-transport-observation",
+				source: priorTransportObservation.source, rows: priorTransportObservation.rows,
+				interpretation: "Host-observed transport metadata only; an unreceived assistant response leaves billing and operation outcome unresolved. Do not replay the old request or treat HTTP status as a scientific verdict. A null provider error code leaves the reason unavailable.",
+			}, null, 2)}\n`, { mode: 0o600 });
+			priorSeedInputs.push("objective-seeds/prior-transport-observation.json");
+		}
 		const historicalM04Index = missionLedger.priorCarryProof ? historicalM04EvidenceIndex({
 			proof: missionLedger.priorCarryProof, bundle: previousBundle }) : undefined;
 		const historicalM04IndexPath = historicalM04Index ?
@@ -1627,6 +1646,7 @@ async function main() {
 					"full encrypted result artifact unavailable; bounded unselected files in authenticated research-history may be read as development evidence, never inferred as adopted truth" :
 					"encrypted and unavailable to this runner; source, plan, verification and feedback must not be inferred",
 				oldOperationOutcome: "unknown and quarantined; provider cost hold remains",
+				providerTransportCause: "unavailable in the authenticated prior carry; do not infer an HTTP status or replay an unreceived request",
 				newExecution: "independent fresh workspace and goal only; old task is not resumed or reconciled" }, null, 2)}\n`,
 				{ mode: 0o600 });
 			priorSeedInputs.push("objective-seeds/prior-history-gap.json");
@@ -2114,6 +2134,8 @@ async function main() {
 					file: path.join(priorSeedDir, "prior-experiment-plan.json") }] : []),
 				...(historicalM04IndexPath ? [{ name: "historical-m04-evidence-index.json",
 					file: historicalM04IndexPath }] : []),
+				...(priorTransportObservationPath ? [{ name: "prior-transport-observation.json",
+					file: priorTransportObservationPath }] : []),
 				...importAssessmentEvidence,
 			];
 			if (previousBundle["m04-adopted-knowledge.json"])
@@ -2972,7 +2994,12 @@ async function main() {
 			try { await saveStatus({ ...savedStatus, accountingAudit: requestAudit,
 				unquantifiedExecutedRunCount: missionLedger.opaqueExecutedRuns.length }); }
 			catch { statusArchiveFailure = "accounting-audit-status-write-failed"; process.exitCode = 1; }
-			let privateBundle = missionLedger.priorPrivateBundle;
+			const transportCensus = missionLedger.appendTransportDiagnosticCensus(
+				requestAudit, statusTransportDiagnostics);
+			if (transportCensus !== undefined)
+				await writeFile(path.join(outputDir, "transport-diagnostics.json"), transportCensus,
+					{ mode: 0o600 });
+			let privateBundle = collectorFailureBundle(missionLedger.priorPrivateBundle, transportCensus);
 			try { privateBundle = await collectContinuationBundle(outputDir, missionLedger.priorPrivateBundle); }
 			catch { statusArchiveFailure = "research-continuation-collection-failed-prior-retained"; process.exitCode = 1; }
 			const sealed = sealCampaignCarry(missionLedger, { settledCny: requestAudit.settledCny,
@@ -3042,7 +3069,7 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	initialHistoricalSelection,
 	forkReceiptMatches, contextLineageSummary, selectedM07ReviewReadPaths, exportPrefixedArchive, preserveCandidate,
 	preserveUnsettledGoalCheckpoint, preserveUnsettledBranchCheckpoint: preserveUnsettledGoalCheckpoint,
-	salvageObjectiveCheckpoint, collectContinuationBundle,
+	salvageObjectiveCheckpoint, collectContinuationBundle, collectorFailureBundle,
 	buildHostEffectReceipt,
 	unresolvedGoalControl, campaignObjectiveProgress,
 	canonicalUnresolvedOperationRefs, qualifiedOperationRef, reservedCanonicalOperationRefs,
