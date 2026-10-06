@@ -127,6 +127,31 @@ function safeVerification(raw: Buffer): Record<string, unknown> | undefined {
 			.map(key => [key, (value as Record<string, unknown>)[key]]));
 	};
 	const boundedStatus = (value: unknown) => typeof value === "string" && /^[a-z_-]{1,32}$/.test(value) ? value : undefined;
+	const sourceShape = parsed.sourceShape && typeof parsed.sourceShape === "object" &&
+		!Array.isArray(parsed.sourceShape) ? parsed.sourceShape as Record<string, unknown> : undefined;
+	const sourceDiagnostic = sourceShape?.diagnostic && typeof sourceShape.diagnostic === "object" &&
+		!Array.isArray(sourceShape.diagnostic) ? sourceShape.diagnostic as Record<string, unknown> : undefined;
+	const sourceLocation = sourceDiagnostic?.source && typeof sourceDiagnostic.source === "object" &&
+		!Array.isArray(sourceDiagnostic.source) ? sourceDiagnostic.source as Record<string, unknown> : undefined;
+	const sourceDiagnosticSummary = sourceDiagnostic?.kind === "csr-validation-diagnostic" &&
+		sourceDiagnostic.phase === "source-validation" && typeof sourceDiagnostic.ruleId === "string" &&
+		/^[a-z0-9._-]{1,100}$/.test(sourceDiagnostic.ruleId) && sourceLocation?.name === "candidate.cpp" &&
+		Number.isSafeInteger(sourceLocation.line) && Number(sourceLocation.line) > 0 &&
+		Number.isSafeInteger(sourceLocation.column) && Number(sourceLocation.column) > 0 ? {
+		kind: sourceDiagnostic.kind, phase: sourceDiagnostic.phase, ruleId: sourceDiagnostic.ruleId,
+		...(sourceDiagnostic.disposition === "unsupported-capability" || sourceDiagnostic.disposition === "rejected-source" ?
+			{ disposition: sourceDiagnostic.disposition } : {}),
+		source: { name: "candidate.cpp", line: sourceLocation.line, column: sourceLocation.column },
+		...(sourceDiagnostic.compilationStatus === "not_run" ? { compilationStatus: "not_run" } : {}),
+		...(sourceDiagnostic.correctnessStatus === "not_run" ? { correctnessStatus: "not_run" } : {}),
+		...(sourceDiagnostic.measurementStatus === "not_run" ? { measurementStatus: "not_run" } : {}),
+	} : undefined;
+	const sourceShapeSummary = sourceShape ? {
+		...copy(sourceShape, ["ok", "targetCount"]),
+		...(typeof sourceShape.reason === "string" && sourceShape.reason.length <= 2_000 ?
+			{ reason: redactExplicitText(sourceShape.reason).text } : {}),
+		...(sourceDiagnosticSummary ? { diagnostic: sourceDiagnosticSummary } : {}),
+	} : undefined;
 	const metric = (value: unknown) => {
 		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 		const item = value as Record<string, unknown>;
@@ -175,6 +200,14 @@ function safeVerification(raw: Buffer): Record<string, unknown> | undefined {
 	const priorComparison = parsed.priorCandidateComparison === undefined ? undefined : comparison(parsed.priorCandidateComparison);
 	const registered = parsed.registeredExperiment && typeof parsed.registeredExperiment === "object" &&
 		!Array.isArray(parsed.registeredExperiment) ? parsed.registeredExperiment as Record<string, unknown> : undefined;
+	const rawThreadPolicy = registered?.threadPolicy && typeof registered.threadPolicy === "object" &&
+		!Array.isArray(registered.threadPolicy) ? registered.threadPolicy as Record<string, unknown> : undefined;
+	const threadPolicy = rawThreadPolicy?.threadsMeaning === "requested-default-and-openmp-cap" &&
+		rawThreadPolicy.actualThreads === "not_observed" && typeof rawThreadPolicy.description === "string" &&
+		rawThreadPolicy.description.length <= 2_000 && safeFeedback(rawThreadPolicy.description) ? {
+		threadsMeaning: rawThreadPolicy.threadsMeaning, actualThreads: rawThreadPolicy.actualThreads,
+		description: rawThreadPolicy.description,
+	} : undefined;
 	let registeredSummary: Record<string, unknown> | undefined;
 	if (registered) {
 		const names = registered.strategyNames;
@@ -182,6 +215,7 @@ function safeVerification(raw: Buffer): Record<string, unknown> | undefined {
 		const plan = registered.plan;
 		if (!boundedStatus(registered.status)) return undefined;
 		if (registered.status !== "passed") registeredSummary = { status: registered.status,
+			...(threadPolicy ? { threadPolicy } : {}),
 			...(typeof registered.reason === "string" ? { reason: redactExplicitText(registered.reason).text.slice(0, 4_000) } : {}),
 			...(Array.isArray(timings) && exportSafe(timings) && timings.length <= 432 ? { timings } : {}),
 			...(plan && exportSafe(plan) ? { plan } : {}) };
@@ -191,6 +225,7 @@ function safeVerification(raw: Buffer): Record<string, unknown> | undefined {
 			!plan || typeof plan !== "object" || !exportSafe(plan) ||
 			Buffer.byteLength(JSON.stringify({ plan, timings }), "utf8") > 900_000) return undefined;
 		else registeredSummary = { status: registered.status, strategyNames: names, plan, timings,
+			...(threadPolicy ? { threadPolicy } : {}),
 			...copy(registered, ["accounting", "freshProcessPerSelection", "metric", "measurementAuthority", "baselineIsolation", "runtimeFiles"]),
 			...(Array.isArray(registered.compileFlags) ? { compileFlags: registered.compileFlags.filter(value => typeof value === "string") } : {}) };
 	}
@@ -218,7 +253,7 @@ function safeVerification(raw: Buffer): Record<string, unknown> | undefined {
 		...(feedback && exportSafe(feedback) && Buffer.byteLength(JSON.stringify(feedback), "utf8") <= 64_000 ? { hostFeedback: feedback } : {}),
 		...(typeof parsed.version === "number" ? { version: parsed.version } : {}),
 		...(boundedStatus(parsed.status) ? { status: boundedStatus(parsed.status) } : {}),
-		...(copy(parsed.sourceShape, ["ok", "targetCount"]) ? { sourceShape: copy(parsed.sourceShape, ["ok", "targetCount"]) } : {}),
+		...(sourceShapeSummary ? { sourceShape: sourceShapeSummary } : {}),
 		...(copy(parsed.compile, ["success"]) ? { compile: copy(parsed.compile, ["success"]) } : {}),
 		...(independent ? { independent: { ...copy(independent, ["mutationPasses"]),
 			...(boundedStatus(independent.status) ? { status: boundedStatus(independent.status) } : {}),

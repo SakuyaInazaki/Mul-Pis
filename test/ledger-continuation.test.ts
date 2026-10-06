@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { deflateRawSync } from "node:zlib";
 import test, { type TestContext } from "node:test";
-import { CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation } from "../src/runner/ledger-continuation.ts";
+import { authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation } from "../src/runner/ledger-continuation.ts";
 import type { RequestAuditSnapshot } from "../src/runner/ledger-continuation.ts";
 import { DeepSeekCampaignBudget } from "../src/runner/deepseek-campaign.ts";
 import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, ONE_USE_PUSH_MARKER } from "../src/runner/signed-mission-ledger.ts";
@@ -74,7 +74,8 @@ function github(runs: object[], options: { missingCarry?: boolean; duplicateCarr
 				...(options.duplicateCarry ? [{ id: 9012, name: CARRY_ARTIFACT_NAME,
 					expired: false, workflow_run: { id: 7002 } }] : [])] };
 		else if (address.endsWith("/runs/7002/jobs?per_page=100"))
-			data = { total_count: 1, jobs: [{ name: "private-campaign", status: "completed",
+			data = { total_count: 1, jobs: [{ id: 6002, run_id: 7002, run_attempt: 1, head_sha: sha("b"),
+				name: "private-campaign", status: "completed",
 				conclusion: options.cancelled ? "cancelled" : "failure",
 				steps: [{ name: "Run bounded private campaign", status: "completed",
 					conclusion: options.step ?? "success" }] }] };
@@ -122,7 +123,9 @@ test("v2 signed seed privately bootstraps exact source-bound research files", as
 	const privateFiles = { "candidate.cpp": "synthetic candidate", "verification.json": "{}",
 		"objective-checkpoint.json": "{}", "workflow-archive.json": "{}",
 		"experiment-plan.json": "{}", "assessment-receipts.json": "{}",
-		"research-history.json": JSON.stringify({ version: 1, records: [{ source: "synthetic-history" }] }) };
+		"research-history.json": JSON.stringify({ version: 1, records: [{ source: "synthetic-history" }] }),
+		"independent-restart-quarantine.json": JSON.stringify({ version: 1, synthetic: true }),
+		"independent-restart-goal-binding.json": JSON.stringify({ version: 1, synthetic: true, goalRunId: "fresh-goal" }) };
 	const binding = { contractId: "synthetic-original-contract", sourceSha256: "d".repeat(64) };
 	const v2 = { ...f.payload, version: 2, rootReviewedAnchor: { commit: sha("a"), artifactSha256: "e".repeat(64),
 		digestScope: "encrypted-result-envelope" }, bootstrap: { ...binding,
@@ -442,7 +445,7 @@ async function compactedFixture(t: TestContext) {
 		if (address.includes("/runs/7001/artifacts?") || address.includes("/runs/7002/artifacts?"))
 			throw new Error("expired ancestor artifact must not be requested");
 		if (address.includes("/runs/7003/jobs?")) return new Response(JSON.stringify({ total_count: 1,
-			jobs: [{ name: "private-campaign", status: "completed", conclusion: "success", steps: [
+			jobs: [{ id: 6003, run_id: 7003, run_attempt: 1, head_sha: sha("c"), name: "private-campaign", status: "completed", conclusion: "success", steps: [
 				{ name: "Run bounded private campaign", status: "completed", conclusion: "success" }] }] }));
 		if (address.includes("/runs/7003/artifacts?")) return new Response(JSON.stringify({ total_count: 1,
 			artifacts: [{ id: 9003, name: CARRY_ARTIFACT_NAME, expired: false, workflow_run: { id: 7003 } }] }));
@@ -552,4 +555,121 @@ test("historical v2 seeds without root attestation keep their old availability r
 		? new Response(JSON.stringify({ total_count: 1, artifacts: [{ id: 9001, name: MISSION_ARTIFACT,
 			expired: true, workflow_run: { id: 7001 } }] })) : base(url, init);
 	await assert.rejects(openLedgerContinuation({ ...input, request: expired }), /artifact is unavailable/);
+});
+
+test("authenticated prior carry proof is immutable, bundle-bound, and distinct from raw model JSON", async t => {
+	const f = await compactedFixture(t);
+	const opened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token", current: current(7005, sha("e")),
+		loadCarryArtifact: async () => f.secondCarry.envelopeB64 });
+	const proof = opened.priorCarryProof;
+	assert(proof);
+	assert(isAuthenticatedPriorCarryProof(proof));
+	assert.equal(isAuthenticatedPriorCarryProof({ ...proof }), false);
+	assert.equal(isAuthenticatedPriorCarryProof(JSON.parse(JSON.stringify(proof))), false);
+	assert.equal(authenticatedPriorCarryBindsBundle(proof, opened.priorPrivateBundle), true);
+	assert.equal(authenticatedPriorCarryBindsBundle(proof, { "candidate.cpp": "changed evidence" }), false);
+	assert.deepEqual(proof.source, { runId: "7003", runAttempt: 1, runNumber: 3, commit: sha("c") });
+	assert.equal(proof.envelopeSha256, createHash("sha256").update(Buffer.from(f.secondCarry.envelopeB64, "base64")).digest("hex"));
+	assert.deepEqual(proof.artifact, { repository: MISSION_REPOSITORY, artifactId: "9003", artifactName: CARRY_ARTIFACT_NAME, runId: "7003" });
+	assert.equal(proof.terminal.jobId, "6003");
+	assert.equal(proof.terminal.jobRunId, "7003");
+	assert.equal(proof.terminal.jobHeadSha, sha("c"));
+	assert.equal(proof.terminal.jobStatus, "completed");
+	assert.equal(proof.admittedCurrent.runId, "7005");
+	assert.equal(proof.priorCommittedCny, opened.priorCommittedCny);
+	assert.equal(proof.priorUnknownHeldCny, 0.25);
+	assert.throws(() => { (proof.source as { commit: string }).commit = sha("a"); }, TypeError);
+	assert.throws(() => { (proof.terminal as { jobId: string }).jobId = "0"; }, TypeError);
+	assert.doesNotMatch(JSON.stringify(proof), /synthetic root evidence|synthetic-token|signature_b64|payload_b64/);
+});
+
+test("missing or mismatched terminal job metadata cannot mint restart proof", async t => {
+	const f = await compactedFixture(t);
+	for (const change of [
+		(job: Record<string, unknown>) => { delete job.id; },
+		(job: Record<string, unknown>) => { job.run_id = 7002; },
+		(job: Record<string, unknown>) => { job.run_attempt = 2; },
+		(job: Record<string, unknown>) => { job.head_sha = sha("a"); },
+	]) {
+		const request: typeof fetch = async (url, init) => {
+			const response = await f.request(url, init);
+			if (!String(url).includes("/runs/7003/jobs?")) return response;
+			const body = await response.json() as { jobs: Array<Record<string, unknown>> };
+			change(body.jobs[0]);
+			return new Response(JSON.stringify(body));
+		};
+		const opened = await openLedgerContinuation({ ...f, request, githubToken: "synthetic-token",
+			current: current(7005, sha("e")), loadCarryArtifact: async () => f.secondCarry.envelopeB64 });
+		assert.equal(opened.priorCarryProof, undefined);
+		assert.equal(opened.priorUnknownHeldCny, 0.25);
+		await assert.rejects(opened.claimOneUse("0".repeat(64)), /exact authenticated prior carry/);
+	}
+});
+
+test("result artifact proof uses only the exact GitHub archive digest and source identity", async t => {
+	const f = await compactedFixture(t);
+	for (const variation of ["valid", "missing-digest", "wrong-commit", "expired", "duplicate"] as const) {
+		const request: typeof fetch = async (url, init) => {
+			const response = await f.request(url, init);
+			if (!String(url).includes("/runs/7003/artifacts?")) return response;
+			const body = await response.json() as { total_count: number; artifacts: object[] };
+			const result = { id: 9103, name: MISSION_ARTIFACT, expired: variation === "expired",
+				...(variation === "missing-digest" ? {} : { digest: `sha256:${"d".repeat(64)}` }),
+				workflow_run: { id: 7003, head_sha: sha(variation === "wrong-commit" ? "b" : "c") } };
+			body.artifacts.push(result);
+			if (variation === "duplicate") body.artifacts.push({ ...result, id: 9203 });
+			body.total_count = body.artifacts.length;
+			return new Response(JSON.stringify(body));
+		};
+		const opened = await openLedgerContinuation({ ...f, request, githubToken: "synthetic-token",
+			current: current(7005, sha("e")), loadCarryArtifact: async () => f.secondCarry.envelopeB64 });
+		assert(opened.priorCarryProof);
+		if (variation !== "valid") { assert.equal(opened.priorCarryProof.resultArtifact, undefined); continue; }
+		assert.deepEqual(opened.priorCarryProof.resultArtifact, { repository: MISSION_REPOSITORY, artifactId: "9103",
+			artifactName: MISSION_ARTIFACT, runId: "7003", archiveSha256: "d".repeat(64), digestScope: "github-artifact-archive" });
+		assert(Object.isFrozen(opened.priorCarryProof.resultArtifact));
+	}
+});
+
+test("Actions-backed restart claim is one-use, live-job-bound, and never refunds unknown holds", async t => {
+	const f = await compactedFixture(t);
+	let active = false;
+	let jobMatches = false;
+	let stepActive = false;
+	const request: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.endsWith("/runs/7005")) return new Response(JSON.stringify({ ...third, status: active ? "in_progress" : "completed" }));
+		if (address.includes("/runs/7005/jobs?")) return new Response(JSON.stringify({ total_count: 1, jobs: [{
+			id: 6005, run_id: jobMatches ? 7005 : 7003, run_attempt: 1, head_sha: sha("e"), name: "private-campaign", status: "in_progress",
+			steps: [{ name: "Run bounded private campaign", status: stepActive ? "in_progress" : "completed" }],
+		}] }));
+		return f.request(url, init);
+	};
+	const input = { ...f, request, githubToken: "synthetic-token", current: current(7005, sha("e")),
+		loadCarryArtifact: async () => f.secondCarry.envelopeB64 };
+	const opened = await openLedgerContinuation(input);
+	const duplicate = await openLedgerContinuation(input);
+	const proof = opened.priorCarryProof!;
+	await assert.rejects(opened.claimOneUse("0".repeat(64)), /exact authenticated prior carry/);
+	await assert.rejects(opened.claimOneUse(proof.envelopeSha256), /no longer active/);
+	active = true;
+	await assert.rejects(opened.claimOneUse(proof.envelopeSha256), /job identity is incomplete/);
+	jobMatches = true;
+	await assert.rejects(opened.claimOneUse(proof.envelopeSha256), /job identity is incomplete/);
+	stepActive = true;
+	const outcomes = await Promise.allSettled([opened.claimOneUse(proof.envelopeSha256), duplicate.claimOneUse(proof.envelopeSha256)]);
+	assert(outcomes[0].status === "fulfilled");
+	assert(outcomes[1].status === "rejected");
+	const claim = outcomes[0].value;
+	assert.equal(claim.priorEnvelopeSha256, proof.envelopeSha256);
+	assert.equal(claim.currentJobId, "6005");
+	assert.equal(claim.currentRunId, "7005");
+	assert.equal(claim.currentCommit, sha("e"));
+	assert.match(claim.claimId, /^[0-9a-f]{64}$/);
+	assert(Object.isFrozen(claim));
+	await assert.rejects(opened.claimOneUse(proof.envelopeSha256), /already consumed/);
+	await assert.rejects(duplicate.claimOneUse(proof.envelopeSha256), /already consumed/);
+	assert.equal(opened.priorUnknownHeldCny, 0.25);
+	assert.equal(opened.sealCurrent({ settledCny: 0, unknownOrInFlightCny: 0,
+		requestAudit: audit(0, 0) }).carryForwardCny, 5.875);
 });

@@ -28,7 +28,7 @@ jobs:
       github.run_attempt == 1 &&
       github.ref == 'refs/heads/improve/workflow-learning-reliability' &&
       ((github.event_name == 'workflow_dispatch' && inputs.authorize_bounded_run == true) ||
-       (github.event_name == 'push' && github.event.head_commit.message == 'Continue capability-aware workflow with private recovery (mul-pis-20261006-recovery-run1)'))
+       (github.event_name == 'push' && github.event.head_commit.message == 'Continue workflow after precise feedback and deadline repair (mul-pis-20261006-recovery-run2)'))
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

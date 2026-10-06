@@ -41,6 +41,7 @@ RESULT_ALLOWLIST = (
     "branch-child-candidate.cpp", "branch-child-verification.json", "branch-child-lesson-delta.json", "branch-child-experiment-plan.json", "workflow-branch-child-archive.json",
     "branch-child-review-decision.json",
     "campaign-status.json", "original-objective.json", "objective-checkpoint.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "mission-ledger-out.json", "execution-capabilities.json", "research-history.json", "restored-candidate-verification.json",
+    "independent-restart-quarantine.json", "independent-restart-goal-binding.json",
 ) + tuple(f"iteration-{iteration}-{suffix}" for iteration in range(1, 65)
     for suffix in ("candidate.cpp", "verification.json", "lesson-delta.json", "experiment-plan.json", "review-decision.json", "m04-adopted-knowledge.json")) + \
     tuple(f"workflow-iteration-{iteration}-archive.json" for iteration in range(1, 65)) + \

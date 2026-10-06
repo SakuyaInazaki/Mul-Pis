@@ -12,6 +12,83 @@ import type { StageContext } from "../src/stages/context.ts";
 import { HarnessError } from "../src/types.ts";
 import { Workspace } from "../src/workspace.ts";
 
+test("independent new-goal checkpoint retains quarantined historical operation IDs", () => {
+	const contract = createOriginalObjective({ goal: "Continue a synthetic task", goalSource: "user-intent-summary",
+		inputNames: ["synthetic.txt"], obligations: [{ id: "original", description: "Satisfy synthetic task" }],
+		closure: "open-ended" });
+	const progress = offlineChecks.campaignObjectiveProgress(contract, ["prior-run/O002"], {
+		boundedRuns: [{ runId: "prior-run", outcome: "active", unresolvedOperationIds: ["prior-run/O002"] },
+			{ runId: "fresh-run", outcome: "partial" }],
+		selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
+		stopReason: "bounded-run-incomplete" });
+	assert.deepEqual(progress.continuation.unresolvedOperationIds, ["prior-run/O002"]);
+	assert.equal(progress.continuation.requiresOperationReconciliation, true);
+	assert.equal(progress.boundedRuns[0].outcome, "active");
+	const later = offlineChecks.campaignObjectiveProgress(contract, progress.continuation.unresolvedOperationIds, {
+		boundedRuns: progress.boundedRuns, selectedArtifacts: progress.selectedArtifacts,
+		unresolvedOperationIds: ["fresh-run/O003"], stopReason: "bounded-run-incomplete" });
+	assert.deepEqual(later.continuation.unresolvedOperationIds, ["prior-run/O002", "fresh-run/O003"]);
+});
+
+test("failed initial task is checkpointed before finish and keeps selected prior artifacts", async t => {
+	const root = await mkdtemp(path.join(tmpdir(), "m07-failed-first-task-"));
+	t.after(async () => rm(root, { recursive: true, force: true }));
+	const ws = new Workspace(path.join(root, "workspace"));
+	const runId = "R001";
+	const taskDir = path.join(root, "task");
+	const outputDir = path.join(root, "output");
+	await mkdir(taskDir, { recursive: true });
+	await mkdir(outputDir);
+	await mkdir(ws.runDir("M07", runId), { recursive: true });
+	await writeFile(path.join(taskDir, "candidate.cpp"), "// unverified attempted source\n");
+	await writeFile(path.join(taskDir, "experiment-plan.json"), JSON.stringify({ registeredStrategies: ["synthetic"] }));
+	await writeFile(path.join(taskDir, "verification.json"), JSON.stringify({ version: 1, status: "failed",
+		sourceShape: { ok: false, reason: "synthetic source gate", targetCount: 0,
+			diagnostic: { kind: "csr-validation-diagnostic", phase: "source-validation", ruleId: "synthetic-rule",
+				disposition: "rejected-source", source: { name: "candidate.cpp", line: 1, column: 1 },
+				compilationStatus: "not_run", correctnessStatus: "not_run", measurementStatus: "not_run" } },
+		compile: { success: false }, independent: { status: "not_run" },
+		registeredExperiment: { status: "not_run", reason: "synthetic source gate",
+			threadPolicy: { threadsMeaning: "requested-default-and-openmp-cap", actualThreads: "not_observed",
+				description: "Synthetic requested thread policy" } },
+		hostFeedback: { version: 1, kind: "execution-result-feedback", status: "failed",
+			measurementMetric: "not_run", timingInterpretation: "No registered candidate timing was run",
+			diagnostics: [{ phase: "source-boundary", detail: { kind: "csr-validation-diagnostic",
+				ruleId: "synthetic-rule", source: { name: "candidate.cpp", line: 1, column: 1 } } }] } }));
+	await writeFile(path.join(ws.runDir("M07", runId), "goal.json"), JSON.stringify({ runId,
+		lifecycle: "active", tasks: [{ taskId: "T001", mode: "execute", status: "failed", workDir: taskDir,
+			loopStopReason: "deadline", executionRounds: [] }],
+		executionState: { operations: [{ id: "O001", taskId: "T001", status: "unknown" }] },
+		branchSelections: [] }));
+	const contract = createOriginalObjective({ goal: "Finish synthetic original objective", goalSource: "user-intent-summary",
+		inputNames: ["synthetic.txt"], obligations: [{ id: "original", description: "Satisfy synthetic task" }],
+		closure: "open-ended" });
+	await writeOriginalObjectiveContract(path.join(outputDir, "original-objective.json"), contract);
+	const prior = objectiveProgress(contract, { boundedRuns: [{ runId: "R000", outcome: "fulfilled",
+		selectedTaskId: "T001" }], selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
+		stopReason: "bounded-run-incomplete" });
+	await writeObjectiveProgress(path.join(outputDir, "objective-checkpoint.json"), prior);
+	const boundary = await offlineChecks.preserveUnsettledGoalCheckpoint({ ws, runId, outputDir, contract });
+	assert.equal(boundary.checkpoint.objectiveOutcome, "incomplete");
+	assert.deepEqual(boundary.unresolvedOperationIds, ["O001"]);
+	assert.deepEqual(boundary.checkpoint.selectedArtifacts, prior.selectedArtifacts);
+	assert.equal(boundary.checkpoint.continuation.requiresOperationReconciliation, true);
+	assert.equal(boundary.checkpoint.boundedRuns.find(item => item.runId === runId)?.outcome, "active");
+	assert.equal(await readFile(path.join(outputDir, "candidate.cpp"), "utf8"), "// unverified attempted source\n");
+	assert.equal((JSON.parse(await readFile(path.join(outputDir, "workflow-archive.json"), "utf8")) as
+		{ controllerEvidence: { reviewStatus: string } }).controllerEvidence.reviewStatus, "unreviewed");
+	const archivedVerification = JSON.parse(await readFile(path.join(outputDir, "verification.json"), "utf8"));
+	assert.equal(archivedVerification.hostFeedback.measurementMetric, "not_run");
+	assert.equal(archivedVerification.hostFeedback.diagnostics[0].detail.ruleId, "synthetic-rule");
+	assert.equal(archivedVerification.sourceShape.diagnostic.ruleId, "synthetic-rule");
+	assert.equal(archivedVerification.sourceShape.diagnostic.source.line, 1);
+	assert.equal(archivedVerification.registeredExperiment.threadPolicy.actualThreads, "not_observed");
+	await offlineChecks.salvageObjectiveCheckpoint(ws, outputDir, undefined, false);
+	const salvaged = JSON.parse(await readFile(path.join(outputDir, "objective-checkpoint.json"), "utf8")) as typeof boundary.checkpoint;
+	assert.ok(salvaged.availableArtifacts.includes("experiment-plan.json"));
+	assert.equal(salvaged.continuation.requiresOperationReconciliation, true);
+});
+
 test("failed fork prompt leaves parent evidence intact but cannot select across unknown operation", async t => {
 	const root = await mkdtemp(path.join(tmpdir(), "m07-failed-fork-"));
 	t.after(async () => rm(root, { recursive: true, force: true }));

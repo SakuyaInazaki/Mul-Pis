@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { buildCsrChecker, CSR_EXPERIMENT_LIMITS, inspectCsrTaskContract, validateCsrCandidateSource, validateCsrTargetBodies, type CsrExperimentPlan } from "../src/workflow-archive/csr-checker.ts";
+import { buildCsrChecker, CsrValidationError, CSR_EXPERIMENT_LIMITS, getCsrValidationDiagnostic, inspectCsrTaskContract, validateCsrCandidateSource, validateCsrTargetBodies, type CsrExperimentPlan } from "../src/workflow-archive/csr-checker.ts";
 
 // Synthetic source only. Private task inputs and strategy implementations are never fixtures.
 const task = "Register at most toy_strategy_5; original functions are toy_strategy_1 and toy_strategy_2.";
@@ -242,7 +242,6 @@ test("central gate preserves originals and rejects benchmark tampering and globa
 		candidate('extern int clock_gettime(int, void*); toy_serial(a, x, y);'),
 		candidate('auto x = std::chrono::steady_clock::now(); toy_serial(a, x, y);'),
 		candidate('[[gnu::constructor]]; toy_serial(a, x, y);'),
-		candidate('#pragma omp parallel num_threads(999)\n { toy_serial(a, x, y); }'),
 		candidate('#define private public\n toy_serial(a, x, y);'),
 		candidate('_Pragma("GCC optimize(\"fast-math\")") toy_serial(a, x, y);'),
 		candidate('#pragma GCC optimize("fast-math")\n toy_serial(a, x, y);'),
@@ -357,4 +356,98 @@ test("truncated raw output cannot pass parent-side comparison", async t => {
 	assert.equal(result.run?.status, 1);
 	assert.doesNotMatch(String(result.run?.stdout), /CSR_CHECK_PASS|CSR_TIMING/);
 	assert.match(String(result.run?.stderr), /protocol incomplete/);
+});
+
+test("source diagnostics identify the exact construct and state that measurement never ran", () => {
+	const source = candidate("#pragma omp teams thread_limit(2)\n { toy_serial(a, x, y); }");
+	const offset = source.indexOf("#pragma omp teams");
+	assert.throws(() => buildCsrChecker(starter(), source, task, plan), error => {
+		assert.ok(error instanceof CsrValidationError);
+		const diagnostic = getCsrValidationDiagnostic(error)!;
+		assert.equal(diagnostic.ruleId, "source.openmp.unsupported-construct");
+		assert.equal(diagnostic.disposition, "unsupported-capability");
+		assert.equal(diagnostic.functionName, "toy_strategy_3");
+		assert.equal(diagnostic.source.startOffset, offset);
+		assert.equal(diagnostic.source.line, source.slice(0, offset).split("\n").length);
+		assert.equal(diagnostic.source.column, offset - source.lastIndexOf("\n", offset) );
+		assert.equal(diagnostic.directive, "#pragma omp teams thread_limit(2)");
+		assert.equal(diagnostic.offendingToken, diagnostic.directive);
+		assert.equal(diagnostic.compilationStatus, "not_run");
+		assert.equal(diagnostic.correctnessStatus, "not_run");
+		assert.equal(diagnostic.measurementStatus, "not_run");
+		assert.match(diagnostic.nextAction, /capability gap/);
+		assert.match(error.message, /candidate\.cpp:\d+:\d+ in toy_strategy_3/);
+		assert.match(error.message, /measurement were not run/);
+		return true;
+	});
+	assert.equal(getCsrValidationDiagnostic(new Error("unrelated")), undefined);
+});
+
+test("forbidden token and immutable-region diagnostics retain source locations", () => {
+	const source = candidate("auto stamp = std::chrono::steady_clock::now(); toy_serial(a, x, y);");
+	assert.throws(() => buildCsrChecker(starter(), source, task, plan), error => {
+		const diagnostic = getCsrValidationDiagnostic(error)!;
+		assert.equal(diagnostic.ruleId, "source.facility.forbidden-token");
+		assert.equal(diagnostic.offendingToken, "chrono");
+		assert.equal(diagnostic.source.startOffset, source.indexOf("chrono"));
+		assert.equal(diagnostic.functionName, "toy_strategy_3");
+		return true;
+	});
+	const changed = candidate().replace("return expected == actual;", "return false;");
+	assert.throws(() => buildCsrChecker(starter(), changed, task, plan), error => {
+		const diagnostic = getCsrValidationDiagnostic(error)!;
+		assert.equal(diagnostic.ruleId, "source.preservation.immutable-region");
+		assert.equal(diagnostic.functionName, "toy_check");
+		assert.match(diagnostic.source.excerpt, /static bool toy_check/);
+		return true;
+	});
+});
+
+test("host parallel thread-selection and schedule clauses pass with explicit runtime caps", async t => {
+	const source = candidate(`
+#ifdef _OPENMP
+  const int workers = omp_get_max_threads();
+  omp_set_num_threads(workers);
+  omp_set_dynamic(0);
+  #pragma omp parallel num_threads(workers)
+  {
+    #pragma omp single
+    toy_serial(a, x, y);
+  }
+  #pragma omp parallel for schedule(static, 3) num_threads(workers)
+  for (int i = 0; i < 0; ++i) {}
+#else
+  toy_serial(a, x, y);
+#endif
+`);
+	const checker = buildCsrChecker(starter(), source, task, plan);
+	assert.equal(checker.metadata.threadPolicy.actualThreads, "not_observed");
+	assert.equal(checker.metadata.timing.threadsMeaning, "requested-default-and-openmp-cap");
+	assert.match(checker.metadata.threadPolicy.description, /contention group/);
+	assert.match(checker.source, /setenv\("OMP_THREAD_LIMIT", thread_limit\.c_str\(\), 1\)/);
+	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
+	const result = await compiledCheck(source, ["--check"], plan, [["--timing", "skew_a", "strategy:3", "2"]]);
+	assert.equal(result.compile.status, 0, String(result.compile.stderr));
+	assert.equal(result.run?.status, 0, String(result.run?.stderr));
+	assert.equal(result.runs[0].status, 0, String(result.runs[0].stderr));
+});
+
+test("OpenMP runtime cap is installed before worker startup and can coexist with explicit team requests", async t => {
+	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
+	// This is a protocol/resource fixture, not an optimization strategy.
+	const source = candidate(`
+  if (omp_get_thread_limit() != 2) throw std::runtime_error("thread cap was not installed");
+  int observed = 0;
+  #pragma omp parallel num_threads(6)
+  {
+    #pragma omp single
+    observed = omp_get_num_threads();
+  }
+  if (observed < 1 || observed > 2) throw std::runtime_error("thread cap was not enforced");
+  toy_serial(a, x, y);
+`);
+	const result = await compiledCheck(source, ["--timing", "skew_a", "strategy:3", "2"]);
+	assert.equal(result.compile.status, 0, String(result.compile.stderr));
+	assert.equal(result.run?.status, 0, String(result.run?.stderr));
+	assert.match(String(result.run?.stdout), /threads=2/);
 });

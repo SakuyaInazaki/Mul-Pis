@@ -29,14 +29,64 @@ export interface CsrCheckerMetadata {
 	threadCounts: readonly [1, 2, 4];
 	shapes: readonly (readonly [number, number])[];
 	mutationPasses: 2;
+	threadPolicy: typeof CSR_THREAD_POLICY;
 	timing: { marker: "CSR_TIMING"; cases: readonly CsrExperimentCase[];
 		accounting: "first-call-and-warmups-separate-from-steady-state"; freshProcessPerSelection: true;
 		inputValuesMutatedBetweenCalls: true; perfScope: "one-selected-kernel-plus-host-generation-and-validation";
 		metric: "isolated-worker-roundtrip"; startupSeparate: true; trust: "parent-clock-and-raw-output-comparison";
-		baselineIsolation: "independently-compiled-immutable-original"; runtimeFiles: "read-only-evaluator-with-separate-writable-scratch" };
+		baselineIsolation: "independently-compiled-immutable-original"; runtimeFiles: "read-only-evaluator-with-separate-writable-scratch";
+		threadsMeaning: "requested-default-and-openmp-cap"; actualThreads: "not_observed" };
 }
 
 export interface CsrChecker { source: string; workerSource: string; baselineWorkerSource: string; metadata: CsrCheckerMetadata }
+
+export interface CsrValidationDiagnostic {
+	kind: "csr-validation-diagnostic";
+	phase: "source-validation";
+	ruleId: string;
+	disposition: "unsupported-capability" | "rejected-source";
+	message: string;
+	functionName?: string;
+	source: { name: "candidate.cpp"; line: number; column: number; startOffset: number; endOffset: number;
+		offsetEncoding: "utf16"; excerpt: string };
+	offendingToken: string;
+	directive?: string;
+	policy: string;
+	nextAction: string;
+	compilationStatus: "not_run";
+	correctnessStatus: "not_run";
+	measurementStatus: "not_run";
+}
+
+export class CsrValidationError extends Error {
+	readonly diagnostic: CsrValidationDiagnostic;
+	constructor(diagnostic: CsrValidationDiagnostic) {
+		super(`${diagnostic.ruleId} at ${diagnostic.source.name}:${diagnostic.source.line}:${diagnostic.source.column}` +
+			`${diagnostic.functionName ? ` in ${diagnostic.functionName}` : ""}: ${diagnostic.message}` +
+			` Offending source: ${diagnostic.offendingToken}. Candidate compilation, correctness and measurement were not run.`);
+		this.name = "CsrValidationError";
+		this.diagnostic = diagnostic;
+	}
+}
+
+export function getCsrValidationDiagnostic(error: unknown): CsrValidationDiagnostic | undefined {
+	return error instanceof CsrValidationError ? error.diagnostic : undefined;
+}
+
+function rejectSource(source: string, token: { start: number; end: number; text: string },
+	ruleId: string, message: string, policy: string, nextAction: string, functionName?: string,
+	disposition: CsrValidationDiagnostic["disposition"] = "rejected-source"): never {
+	const before = source.slice(0, token.start);
+	const lineStart = source.lastIndexOf("\n", token.start - 1) + 1;
+	const lineEnd = source.indexOf("\n", token.start);
+	throw new CsrValidationError({ kind: "csr-validation-diagnostic", phase: "source-validation", ruleId,
+		disposition, message, functionName,
+		source: { name: "candidate.cpp", line: before.split("\n").length, column: token.start - lineStart + 1,
+			startOffset: token.start, endOffset: token.end, offsetEncoding: "utf16",
+			excerpt: source.slice(lineStart, lineEnd < 0 ? source.length : lineEnd).slice(0, 800) },
+		offendingToken: token.text.slice(0, 800), ...(token.text.startsWith("#") ? { directive: token.text.slice(0, 800) } : {}),
+		policy, nextAction, compilationStatus: "not_run", correctnessStatus: "not_run", measurementStatus: "not_run" });
+}
 
 /** Engineering execution bounds, not a claim that this covers the scientific task. */
 export const CSR_EXPERIMENT_LIMITS = Object.freeze({
@@ -44,6 +94,12 @@ export const CSR_EXPERIMENT_LIMITS = Object.freeze({
 	maxNnz: 2_000_000, minRepeats: 3, maxRepeats: 50, minWarmups: 1, maxWarmups: 8,
 	maxThreadChoices: 4, maxThreads: 16, maxTimedWork: 200_000_000, maxSourceBytes: 512_000,
 	workerAddressSpaceBytes: 2 * 1024 * 1024 * 1024, workerCpuSeconds: 60, protocolTimeoutMs: 15_000,
+});
+
+export const CSR_THREAD_POLICY = Object.freeze({
+	threadsMeaning: "requested-default-and-openmp-cap" as const,
+	actualThreads: "not_observed" as const,
+	description: "Host parallel num_threads, scheduling clauses and ordinary OpenMP team-size runtime controls are permitted. Each worker starts with OMP_THREAD_LIMIT equal to the tested requested-thread budget, bounding its OpenMP contention group; the default team size starts at that budget, dynamic adjustment starts disabled and active nesting starts at one level. Strategies may use fewer threads or adjust these defaults within the runtime cap. The threads field is the requested default/cap, not an observation of actual team sizes or all operating-system threads. Memory, CPU and protocol limits remain separate. Teams/offload constructs require a separate capability decision.",
 });
 
 export interface CsrTaskContract {
@@ -56,6 +112,7 @@ export interface CsrTaskContract {
 	sourceScope: string;
 	timingScope: string;
 	metric: "isolated-worker-roundtrip";
+	threadPolicy: typeof CSR_THREAD_POLICY;
 }
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z_0-9]*$/;
@@ -252,15 +309,19 @@ export function inspectCsrTaskContract(starterSource: string, taskText: string):
 		originalTargets: [`${names.prefix}_1`, `${names.prefix}_2`], maxStrategies: names.maxStrategies,
 		baselines: { serial: names.serial, stdThread: names.stdThread }, limits: CSR_EXPERIMENT_LIMITS,
 		metric: "isolated-worker-roundtrip",
+		threadPolicy: CSR_THREAD_POLICY,
 		sourceScope: "Original declarations, generators, serial/std::thread references, checker and benchmark remain immutable. Edit the original student bodies and main; add bounded static functions or plain struct definitions. No new globals, includes, macros, external linkage, constructors with global instances, kernel-side I/O, process control or benchmark hooks; main may print results but is excluded from the trusted checker. This lexical source gate is not a memory-safety proof or a security sandbox. Unsupported source extensions remain an explicit task gap.",
 		timingScope: "A separate worker receives only bounded CSR/input packets and returns raw output values; the immutable parent owns comparison, status and clocks. Baselines are compiled independently from the immutable original, using the identical worker protocol. Evaluation files/binaries must be read-only at runtime, with separate writable scratch. Use a fresh parent process per --timing selector. Startup is separate. First-call, warmup and repeated samples measure persistent-worker round-trip time, including input serialization, IPC, worker input checks, kernel/preprocessing and output transfer. This is not kernel-only time. Values and inputs change between calls to reject cached answers. Whole-process perf additionally includes host generation and validation. First-call cost and startup cannot be silently discarded when making end-to-end claims.",
 	};
 }
 
-function safeExtensionTokens(tokens: CppToken[], immutableFunctionNames: readonly string[], mainBody = false): void {
-	const conditionals: boolean[] = [];
-	if (tokens.some((token, i) => token.text === "[" && tokens[i + 1]?.text === "["))
-		throw new Error("candidate extension contains unsupported C++ attributes");
+function safeExtensionTokens(tokens: CppToken[], immutableFunctionNames: readonly string[], source: string,
+	functionName?: string, mainBody = false): void {
+	const conditionals: Array<{ token: CppToken; elseSeen: boolean }> = [];
+	const attribute = tokens.find((token, i) => token.text === "[" && tokens[i + 1]?.text === "[");
+	if (attribute) rejectSource(source, attribute, "source.cpp.unsupported-attribute", "C++ attributes are outside this adapter's supported source surface",
+		"Attributes can alter linkage, initialization or compilation; this adapter does not validate them.",
+		"Request a capability decision for the exact attribute rather than changing the scientific strategy blindly.", functionName, "unsupported-capability");
 	for (const token of tokens) {
 		const text = token.text;
 		if (text === "_OPENMP") continue;
@@ -268,22 +329,33 @@ function safeExtensionTokens(tokens: CppToken[], immutableFunctionNames: readonl
 		if (mainBody && /^(?:cout|cerr|clog|printf|fprintf|puts|putchar|stdout|stderr|benchmark_ms|omp_set_num_threads)$/.test(text)) continue;
 		if (text.startsWith("#")) {
 			const directive = text.slice(1).trim();
-			if (/^pragma\s+omp\s+(?:parallel|for|simd|sections|section|single|master|critical|atomic|barrier|task|taskgroup|taskwait|taskyield|ordered|flush)\b/.test(directive) &&
-				! /\b(?:num_threads|thread_limit|num_teams)\b/.test(directive)) continue;
-			if (/^(?:ifdef\s+_OPENMP|if\s+defined\s*(?:\(\s*_OPENMP\s*\)|_OPENMP))\s*$/.test(directive)) { conditionals.push(false); continue; }
-			if (directive === "else" && conditionals.length && !conditionals.at(-1)) { conditionals[conditionals.length - 1] = true; continue; }
+			if (/^pragma\s+omp\s+(?:parallel|for|simd|sections|section|single|master|critical|atomic|barrier|task|taskgroup|taskwait|taskyield|ordered|flush)\b/.test(directive)) continue;
+			if (/^pragma\s+omp\b/.test(directive)) rejectSource(source, token, "source.openmp.unsupported-construct",
+				"This OpenMP construct is outside the currently supported host-CPU execution surface",
+				"Host parallel/loop/task constructs and their thread-selection clauses are supported. Teams/offload/declare constructs require a separate capability decision; this is not a correctness result.",
+				"Report this exact construct as a capability gap. Do not infer that schedule chunks or num_threads are forbidden.", functionName, "unsupported-capability");
+			if (/^(?:ifdef\s+_OPENMP|if\s+defined\s*(?:\(\s*_OPENMP\s*\)|_OPENMP))\s*$/.test(directive)) {
+				conditionals.push({ token, elseSeen: false }); continue;
+			}
+			if (directive === "else" && conditionals.length && !conditionals.at(-1)!.elseSeen) { conditionals.at(-1)!.elseSeen = true; continue; }
 			if (directive === "endif" && conditionals.length) { conditionals.pop(); continue; }
-			throw new Error("candidate extension contains an unsafe preprocessor directive");
+			rejectSource(source, token, "source.preprocessor.unsupported-directive", "Preprocessor directive is not admitted by this source boundary",
+				"Added includes, macro definitions and arbitrary conditionals are not supported; balanced _OPENMP conditionals and the documented host OpenMP pragmas are supported.",
+				"Inspect the exact directive and location shown here. If the task requires it, request adapter support instead of guessing which strategy to rewrite.", functionName, "unsupported-capability");
 		}
-		if (/^(?:extern|friend|asm|__asm|__asm__|__attribute__|__declspec|alignas|thread_local|operator|_Pragma|omp_set_num_threads|omp_set_dynamic|omp_set_nested|omp_set_max_active_levels)$/.test(text) ||
+		if (/^(?:extern|friend|asm|__asm|__asm__|__attribute__|__declspec|alignas|thread_local|operator|_Pragma)$/.test(text) ||
 			text === "[[" || /^(?:checker_|csr_check_|__|_[A-Z]|pthread_)/.test(text) ||
 			/^(?:putchar|putc|fputc|fputs|fputws|putwchar|fputwc|fwrite|fflush)(?:_unlocked)?$/.test(text) ||
 			/^(?:detach|setbuf|setvbuf|setbuffer|setlinebuf|perror|ioctl|prctl|ptrace|mmap|mprotect|process_vm_readv|process_vm_writev)$/.test(text) ||
 			/^(?:main|benchmark_ms|chrono|steady_clock|system_clock|high_resolution_clock|clock|clock_gettime|timespec_get|gettimeofday|rdtsc|printf|fprintf|sprintf|snprintf|vprintf|vfprintf|vsprintf|vsnprintf|wprintf|fwprintf|swprintf|vwprintf|vfwprintf|vswprintf|puts|fputs|putchar|fputc|putc|fputws|putwchar|fputwc|fwrite|write|writev|cout|cerr|clog|cin|wcout|wcerr|wclog|wcin|stdout|stderr|stdin|streambuf|ofstream|ifstream|fstream|freopen|fopen|open|close|dup|dup2|syscall|dlsym|dlopen|system|popen|fork|vfork|execve|execl|exit|_Exit|_exit|quick_exit|abort|atexit|at_quick_exit|signal|sigaction|raise|kill|getenv|setenv|putenv|unsetenv|setlocale|fesetround|feenableexcept)$/.test(text) ||
 			immutableFunctionNames.includes(text))
-			throw new Error(`candidate extension references a forbidden host or benchmark facility: ${text}`);
+			rejectSource(source, token, "source.facility.forbidden-token", `Candidate extension references a forbidden host or benchmark facility: ${text}`,
+				"Candidate kernels cannot access host I/O, process control, clocks, immutable checker/generator entry points or runtime controls that defeat the resource boundary.",
+				"Review this exact token in its function. Use the host measurement interface for clocks and output; report a capability gap when required functionality is unavailable.", functionName);
 	}
-	if (conditionals.length) throw new Error("candidate extension has unbalanced preprocessor conditionals");
+	if (conditionals.length) rejectSource(source, conditionals[0].token, "source.preprocessor.unbalanced-conditional",
+		"An _OPENMP conditional opened here is not closed inside this function", "Preprocessor conditionals must remain balanced inside each candidate function.",
+		"Close the conditional in the same function and rerun source validation; compilation and measurement have not started.", functionName);
 }
 
 /** Adds lexical host-facility protection to the separate legacy structural checker; never replaces it. */
@@ -307,7 +379,7 @@ export function validateCsrTargetBodies(starterSource: string, candidateSource: 
 		const matching = units.filter(unit => unit.name === name);
 		if (matching.length !== 1) throw new Error("missing or repeated original target");
 		const unit = matching[0];
-		safeExtensionTokens(candidateTokens.slice(unit.bodyOpen! + 1, unit.bodyClose), forbidden);
+		safeExtensionTokens(candidateTokens.slice(unit.bodyOpen! + 1, unit.bodyClose), forbidden, candidateSource, name);
 	}
 }
 
@@ -331,28 +403,37 @@ export function validateCsrCandidateSource(starterSource: string, candidateSourc
 		if (original && unit.name === original.name && (originalTargets.includes(unit.name ?? "") || unit.name === "main")) {
 			const originalHeader = originalTokens.slice(original.start, original.bodyOpen! + 1);
 			const candidateHeader = candidateTokens.slice(unit.start, unit.bodyOpen! + 1);
-			if (tokenText(originalHeader) !== tokenText(candidateHeader)) throw new Error("candidate changed an original function signature");
+			if (tokenText(originalHeader) !== tokenText(candidateHeader)) rejectSource(candidateSource, candidateTokens[unit.start],
+				"source.preservation.original-signature", "Candidate changed an original function signature",
+				"The original function interfaces remain immutable; student bodies and supported extensions may change.",
+				"Restore the original signature at this location, preserving the intended body implementation.", unit.name);
 			if (unit.name === "main") {
 				candidateMain = unit;
-				safeExtensionTokens(candidateTokens.slice(unit.bodyOpen! + 1, unit.bodyClose), [], true);
+				safeExtensionTokens(candidateTokens.slice(unit.bodyOpen! + 1, unit.bodyClose), [], candidateSource, unit.name, true);
 			}
-			else safeExtensionTokens(candidateTokens.slice(unit.bodyOpen! + 1, unit.bodyClose), forbiddenFunctions);
+			else safeExtensionTokens(candidateTokens.slice(unit.bodyOpen! + 1, unit.bodyClose), forbiddenFunctions, candidateSource, unit.name);
 			++originalCursor; continue;
 		}
 		if (original && tokenText(unit.tokens) === tokenText(original.tokens)) { ++originalCursor; continue; }
 		if (unit.name && unit.tokens[0].text === "static" && !originalFunctions.includes(unit.name) &&
 			!addedNames.includes(unit.name) && !unit.name.startsWith("checker_") && !unit.name.startsWith("csr_check_")) {
 			addedNames.push(unit.name);
-			safeExtensionTokens(unit.tokens, forbiddenFunctions);
+			safeExtensionTokens(unit.tokens, forbiddenFunctions, candidateSource, unit.name);
 			continue;
 		}
 		// Plain type declarations allow local preprocessing layouts, but no global objects or initialization.
 		if (unit.tokens[0]?.text === "struct" && IDENTIFIER.test(unit.tokens[1]?.text ?? "") && unit.tokens[2]?.text === "{" &&
 			unit.bodyClose !== undefined && unit.end === unit.bodyClose + 2 && unit.tokens.at(-1)?.text === ";") {
-			if (unit.tokens.some(token => token.text === "static")) throw new Error("added structs cannot create static storage");
-			safeExtensionTokens(unit.tokens, forbiddenFunctions); continue;
+			const staticStorage = unit.tokens.find(token => token.text === "static");
+			if (staticStorage) rejectSource(candidateSource, staticStorage, "source.storage.added-static-member",
+				"An added struct introduces static storage", "Added layout structs cannot introduce global/static initialization outside a measured call.",
+				"Report the required storage lifetime as a capability gap; the host has not compiled or measured this source.", undefined, "unsupported-capability");
+			safeExtensionTokens(unit.tokens, forbiddenFunctions, candidateSource); continue;
 		}
-		throw new Error("candidate changed frozen original source or added an unsupported global declaration");
+		rejectSource(candidateSource, candidateTokens[unit.start], "source.preservation.immutable-region",
+			"Candidate changed frozen original source or added an unsupported top-level declaration",
+			"Original types, generators, references, checker and benchmark are immutable; only declared student bodies, main and supported static functions/layout structs may change.",
+			"Compare this source location with the immutable original. Restore the frozen region or report the required new declaration as a capability gap.", unit.name);
 	}
 	if (originalCursor !== originalUnits.length || !candidateMain) throw new Error("candidate omitted frozen original source");
 	const actualStrategies = [...originalTargets, ...addedNames.filter(name => new RegExp(`^${escapeRegExp(names.prefix)}_\\d+$`).test(name))];
@@ -437,11 +518,12 @@ export function buildCsrChecker(starterSource: string, candidateSource: string, 
 		matrixType: names.matrixType, targets, maxStrategies: names.maxStrategies,
 		baselines: { serial: names.serial, stdThread: names.stdThread },
 		absTolerance, relTolerance, candidateInclude,
-		threadCounts: [1, 2, 4], shapes: SHAPES, mutationPasses: 2,
+		threadCounts: [1, 2, 4], shapes: SHAPES, mutationPasses: 2, threadPolicy: CSR_THREAD_POLICY,
 		timing: { marker: "CSR_TIMING", cases, accounting: "first-call-and-warmups-separate-from-steady-state", freshProcessPerSelection: true,
 			inputValuesMutatedBetweenCalls: true, perfScope: "one-selected-kernel-plus-host-generation-and-validation",
 			metric: "isolated-worker-roundtrip", startupSeparate: true, trust: "parent-clock-and-raw-output-comparison",
-			baselineIsolation: "independently-compiled-immutable-original", runtimeFiles: "read-only-evaluator-with-separate-writable-scratch" },
+			baselineIsolation: "independently-compiled-immutable-original", runtimeFiles: "read-only-evaluator-with-separate-writable-scratch",
+			threadsMeaning: "requested-default-and-openmp-cap", actualThreads: "not_observed" },
 	};
 	const caseCpp = cases.map(value => `    {"${value.id}", ${value.rows}, ${value.cols}, ${value.normalNnz}, ${value.longRows}, ${value.longNnz}, ${value.seed}u, {${value.threadCounts.join(", ")}}, ${value.warmups}, ${value.repeats}}`).join(",\n");
 	const targetCpp = targets.map((name, index) => `    {"strategy", ${index + 1}, "${name}", [](const ${names.matrixType}& a, const std::vector<double>& x, std::vector<double>& y, int) { ${name}(a, x, y); }}`).join(",\n");
@@ -544,6 +626,7 @@ int main(int argc, char** argv) {
 #include <omp.h>
 #include <cerrno>
 #include <csignal>
+#include <set>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/prctl.h>
@@ -593,11 +676,14 @@ class CheckerWorker {
     void send(const void* buffer, std::size_t bytes) { transfer(input, const_cast<void*>(buffer), bytes, true); }
 public:
     std::int64_t startup_ns = 0;
-    explicit CheckerWorker(int index) {
+    explicit CheckerWorker(int index, int requested_threads) {
+        if (requested_threads < 1 || requested_threads > ${CSR_EXPERIMENT_LIMITS.maxThreads})
+            throw std::runtime_error("requested OpenMP thread budget is outside the execution cap");
         const auto started = std::chrono::steady_clock::now();
         int to_worker[2], from_worker[2];
         if (::pipe2(to_worker, O_CLOEXEC) || ::pipe2(from_worker, O_CLOEXEC)) throw std::runtime_error("worker pipes unavailable");
         const std::string target = std::to_string(index);
+        const std::string thread_limit = std::to_string(requested_threads);
         const char* binary = index < 2 ? "./baseline-worker" : "./candidate-worker";
         pid = ::fork();
         if (pid == 0) {
@@ -606,6 +692,10 @@ public:
             const struct rlimit cpu_limit { 60, 60 }, core_limit { 0, 0 };
             if (::setrlimit(RLIMIT_AS, &memory_limit) || ::setrlimit(RLIMIT_CPU, &cpu_limit) ||
                 ::setrlimit(RLIMIT_CORE, &core_limit) || ::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) ::_exit(126);
+            // Set the OpenMP contention-group cap before the runtime is loaded by exec.
+            if (::setenv("OMP_THREAD_LIMIT", thread_limit.c_str(), 1) ||
+                ::setenv("OMP_NUM_THREADS", thread_limit.c_str(), 1) ||
+                ::setenv("OMP_DYNAMIC", "FALSE", 1) || ::setenv("OMP_MAX_ACTIVE_LEVELS", "1", 1)) ::_exit(126);
             if (::dup2(to_worker[0], STDIN_FILENO) < 0 || ::dup2(from_worker[1], STDOUT_FILENO) < 0) ::_exit(126);
             if (::syscall(SYS_close_range, 3u, ~0u, 0u) != 0) ::_exit(126);
             ::execl(binary, binary, target.c_str(), static_cast<char*>(nullptr));
@@ -754,7 +844,7 @@ static void checker_correctness(CheckerWorker& worker, const CheckerEntry& entry
 }
 struct CheckerTiming { std::int64_t startup_ns = 0, cold_ns = 0; std::vector<std::int64_t> warmups, samples; };
 static CheckerTiming checker_time(const CheckerEntry& entry, const CheckerCase& c, int threads) {
-    CheckerWorker worker(entry.worker_index);
+    CheckerWorker worker(entry.worker_index, threads);
     ${names.matrixType} a = checker_case_matrix(c);
     std::vector<double> x = checker_case_vector(c), y(static_cast<std::size_t>(c.rows));
     CheckerTiming timing; timing.startup_ns = worker.startup_ns;
@@ -841,17 +931,22 @@ int main(int argc, char** argv) {
             }
         }
         if (!selected_entry) {
+        std::set<int> checked_thread_budgets {1, 2, 4};
+        for (const auto& c : checker_cases) for (const int threads : c.threads) checked_thread_budgets.insert(threads);
         for (const auto& entry : checker_entries) {
-            CheckerWorker worker(entry.worker_index);
+          for (const int threads : checked_thread_budgets) {
+            CheckerWorker worker(entry.worker_index, threads);
             for (const auto& shape : std::vector<std::pair<int, int>>{{1, 1}, {7, 5}, {19, 23}, {32, 11}})
-                for (int threads : {1, 2, 4})
+                if (threads == 1 || threads == 2 || threads == 4)
                     checker_correctness(worker, entry, checker_small_matrix(shape.first, shape.second),
                         checker_small_vector(shape.second), threads);
             for (const auto& c : checker_cases) {
+                if (std::find(c.threads.begin(), c.threads.end(), threads) == c.threads.end()) continue;
                 const auto a = checker_case_matrix(c); const auto x = checker_case_vector(c);
-                for (int threads : c.threads) checker_correctness(worker, entry, a, x, threads);
+                checker_correctness(worker, entry, a, x, threads);
             }
             worker.finish();
+          }
         }
         }
         std::cout << "CSR_CHECK_PASS\\n";

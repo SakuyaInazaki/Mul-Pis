@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile, mkdir, stat, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { offlineChecks } from "../scripts/manual-private-campaign.ts";
 import { ONE_USE_PUSH_MARKER } from "../src/runner/signed-mission-ledger.ts";
@@ -23,6 +24,98 @@ test("shared-total campaign requires explicit manual admission and signed cumula
  assert.ok(workflow.includes("GITHUB_TOKEN: ${{ github.token }}"));
  assert.ok(workflow.includes("  actions: read"));
  assert.doesNotMatch(workflow, /up to [0-9.]+ CNY/);
+});
+
+test("execution deadlines use the remaining Actions campaign rather than a pilot phase cap", async () => {
+	const workflow = await readFile(new URL("../.github/workflows/manual-private-campaign.yml", import.meta.url), "utf8");
+	assert.match(workflow, /name: Run bounded private campaign\s+id: campaign\s+timeout-minutes: 30/);
+	const started = Date.parse("2030-01-01T00:00:00.000Z");
+	const stop = started + 25 * 60_000;
+	assert.equal(offlineChecks.executionDeadlineAt(stop, started), new Date(stop - 45_000).toISOString());
+	assert.equal(offlineChecks.executionDeadlineAt(stop, stop - 91_000), new Date(stop - 45_000).toISOString());
+	assert.equal(offlineChecks.newPhaseAdmitted(stop, stop - 91_000), true);
+	assert.equal(offlineChecks.newPhaseAdmitted(stop, stop - 90_000), false);
+	assert.throws(() => offlineChecks.executionDeadlineAt(stop, stop - 45_000), /settlement boundary/);
+	const source = await readFile(new URL("../scripts/manual-private-campaign.ts", import.meta.url), "utf8");
+	assert.doesNotMatch(source, /BUILDER_PHASE_MS|M04_PHASE_MS|campaignStopAt\s*-\s*9\s*\*\s*60_000/);
+});
+
+test("failed experiment enters untrusted history while selected prior tuple remains coherent", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-failed-continuation-fixture-"));
+	try {
+		const prior = {
+			"candidate.cpp": "// accepted prior\n",
+			"verification.json": JSON.stringify({ version: 1, status: "passed" }),
+			"workflow-archive.json": JSON.stringify({ version: 1, kind: "m07-private-candidate-archive",
+				goalRunId: "R001", taskId: "T001", controllerEvidence: { reviewStatus: "accepted" } }),
+			"objective-checkpoint.json": JSON.stringify({ contract: { id: "synthetic-contract" },
+				selectedArtifacts: ["candidate.cpp", "verification.json"],
+				boundedRuns: [{ runId: "R001", selectedTaskId: "T001" }] }),
+		};
+		await writeFile(path.join(directory, "candidate.cpp"), "// failed new attempt\n");
+		await writeFile(path.join(directory, "verification.json"), JSON.stringify({ version: 1, status: "failed" }));
+		await writeFile(path.join(directory, "experiment-plan.json"), JSON.stringify({ registeredStrategies: ["synthetic"] }));
+		await writeFile(path.join(directory, "round-1-reviewer-feedback.txt"), "Synthetic gate failure\n");
+		await writeFile(path.join(directory, "workflow-archive.json"), JSON.stringify({ version: 1,
+			kind: "m07-private-candidate-archive", goalRunId: "R002", taskId: "T001",
+			controllerEvidence: { reviewStatus: "unreviewed" } }));
+		await writeFile(path.join(directory, "objective-checkpoint.json"), JSON.stringify({
+			contract: { id: "synthetic-contract" }, selectedArtifacts: ["candidate.cpp", "verification.json"],
+			boundedRuns: [{ runId: "R001", selectedTaskId: "T001" }, { runId: "R002", outcome: "active",
+				unresolvedOperationIds: ["O001"] }],
+		}));
+		await writeFile(path.join(directory, "workflow-iteration-1-archive.json"), JSON.stringify({ version: 1,
+			kind: "m07-private-candidate-archive", goalRunId: "R003", taskId: "T001",
+			controllerEvidence: { reviewStatus: "unreviewed" } }));
+		await writeFile(path.join(directory, "iteration-1-candidate.cpp"), "// failed later attempt\n");
+		await writeFile(path.join(directory, "iteration-1-experiment-plan.json"), "{\"cases\":[]}");
+		const firstReservation = { version: 1, kind: "host-independent-goal-quarantine",
+			reuseKey: "1".repeat(64), prior: { envelopeSha256: "a".repeat(64) },
+			freshWorkspace: { workspaceId: "fresh-one" } };
+		const firstClaim = { claimId: "b".repeat(64), priorEnvelopeSha256: "a".repeat(64),
+			currentRunId: "1001", currentRunAttempt: 1, currentCommit: "e".repeat(40), currentJobId: "2001" };
+		await offlineChecks.appendRestartReservation(directory, prior, firstReservation,
+			firstClaim);
+		const carried = await offlineChecks.collectContinuationBundle(directory, prior);
+		assert.equal(carried?.["candidate.cpp"], prior["candidate.cpp"]);
+		assert.equal(carried?.["verification.json"], prior["verification.json"]);
+		assert.equal(carried?.["workflow-archive.json"], prior["workflow-archive.json"]);
+		assert.equal(carried?.["objective-checkpoint.json"], await readFile(path.join(directory, "objective-checkpoint.json"), "utf8"));
+		const history = JSON.parse(carried?.["research-history.json"] ?? "null");
+		const entry = history.entries.find((item: { goalRunId: string }) => item.goalRunId === "R002");
+		assert.equal(entry.interpretation.includes("Unselected"), true);
+		assert.equal(entry.files["candidate.cpp"], "// failed new attempt\n");
+		assert.equal(entry.files["round-1-reviewer-feedback.txt"], "Synthetic gate failure\n");
+		assert.ok(entry.files["experiment-plan.json"].includes("synthetic"));
+		assert.equal(history.entries.find((item: { goalRunId: string }) => item.goalRunId === "R003")
+			.files["candidate.cpp"], "// failed later attempt\n");
+		assert.equal(JSON.parse(carried?.["independent-restart-quarantine.json"] ?? "null").entries.length, 1);
+		assert.equal(carried?.["independent-restart-goal-binding.json"], undefined);
+		const next = path.join(directory, "next");
+		await mkdir(next);
+		const secondReservation = { version: 1, kind: "host-independent-goal-quarantine",
+			reuseKey: "2".repeat(64), prior: { envelopeSha256: "c".repeat(64) },
+			freshWorkspace: { workspaceId: "fresh-two" } };
+		const secondClaim = { claimId: "d".repeat(64), priorEnvelopeSha256: "c".repeat(64),
+			currentRunId: "1002", currentRunAttempt: 1, currentCommit: "e".repeat(40), currentJobId: "2002" };
+		await offlineChecks.appendRestartReservation(next, carried!, secondReservation,
+			secondClaim);
+		const digest = createHash("sha256").update(JSON.stringify(secondReservation)).digest("hex");
+		await offlineChecks.appendRestartGoalBinding(next, carried!, { version: 1, kind: "host-independent-goal-binding",
+			goalRunId: "R004", quarantineReceiptSha256: digest });
+		const twice = await offlineChecks.collectContinuationBundle(next, carried);
+		assert.equal(JSON.parse(twice?.["independent-restart-quarantine.json"] ?? "null").entries.length, 2);
+		assert.equal(JSON.parse(twice?.["independent-restart-goal-binding.json"] ?? "null").entries.length, 1);
+		assert.equal(twice?.["candidate.cpp"], prior["candidate.cpp"]);
+		const bad = path.join(directory, "bad");
+		await mkdir(bad);
+		const invalidPrior = { ...carried, "independent-restart-quarantine.json": JSON.stringify({ version: 1,
+			kind: "host-independent-restart-reservations", entries: [{ receipt: firstReservation,
+				claim: { ...firstClaim, priorEnvelopeSha256: "f".repeat(64) } }] }) };
+		await assert.rejects(offlineChecks.appendRestartReservation(bad, invalidPrior,
+			secondReservation, secondClaim),
+			/reservation is invalid/);
+	} finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 test("generic private campaign source-shape gate preserves non-target bodies", () => {
@@ -355,6 +448,8 @@ test("registered protocol accounts for startup, first call, warmups and every mo
 	assert.equal(result.timings.length, 4);
 	assert.equal(result.timings[0].startupNs, 11);
 	assert.equal(result.timings[0].coldNs, 9);
+	assert.equal(result.timings[0].requestedThreads, 1);
+	assert.equal(result.timings[0].actualThreads, "not_observed");
 	assert.deepEqual(result.timings[0].warmupSamplesNs, [8]);
 	for (const altered of [output.replace("startup_ns=11", "startup_ns=0"),
 		output.replace("warmup_samples_ns=8", "warmup_samples_ns=8,8"), output.replace("median_ns=5", "median_ns=6"),
@@ -366,8 +461,10 @@ test("registered protocol accounts for startup, first call, warmups and every mo
 test("registered comparison uses fresh compatible case metrics and cannot hide cold-call regression", () => {
 	const row = (target: number, medianNs: number, coldNs: number) => ({ kind: "strategy", target,
 		caseId: "shape-a", rows: 4, cols: 8, ordinaryNnz: 2, heavyRows: 1, heavyNnz: 5, seed: 7, threads: 1,
+		requestedThreads: 1, actualThreads: "not_observed",
 		warmups: 1, repeats: 3, medianNs, coldNs });
 	const evidence = (rows: object[], metric = "isolated-worker-roundtrip") => ({ registeredExperiment: { status: "passed", metric, timings: rows, freshProcessPerSelection: true,
+		threadPolicy: { threadsMeaning: "requested-default-and-openmp-cap", actualThreads: "not_observed", description: "synthetic fixed thread policy" },
 		compileFlags: ["-O2"], accounting: "first-call-and-warmups-separate-from-steady-state", measurementAuthority: "parent-clock-and-raw-output-comparison",
 		baselineIsolation: "independently-compiled-immutable-original", runtimeFiles: "read-only-evaluator-with-separate-writable-scratch" } });
 	const prior = evidence([row(1, 100, 200), row(2, 120, 240)]);
@@ -381,6 +478,11 @@ test("registered comparison uses fresh compatible case metrics and cannot hide c
 	const differentFlags = evidence([row(1, 50, 100)]);
 	differentFlags.registeredExperiment.compileFlags = ["-O0"];
 	assert.equal(offlineChecks.compareCandidateTimings(prior, differentFlags).state, "unavailable");
+	const missingPolicy = evidence([row(1, 50, 100)]) as any;
+	delete missingPolicy.registeredExperiment.threadPolicy;
+	assert.equal(offlineChecks.compareCandidateTimings(prior, missingPolicy).state, "unavailable");
+	const oldRows = evidence([{ ...row(1, 50, 100), actualThreads: undefined }]);
+	assert.equal(offlineChecks.compareCandidateTimings(prior, oldRows).state, "unavailable");
 	const regression = offlineChecks.compareCandidateTimings(prior, evidence([row(1, 50, 500)]));
 	assert.equal(offlineChecks.chooseFollowOnCandidate(true, true, true, regression), false);
 });

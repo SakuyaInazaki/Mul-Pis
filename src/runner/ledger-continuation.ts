@@ -2,7 +2,7 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:
 import { inflateRawSync } from "node:zlib";
 import { HarnessError } from "../types.ts";
 import type { CampaignRequestAudit } from "./deepseek-campaign.ts";
-import { authenticateSignedMissionSeed, MISSION_ID, MISSION_REPOSITORY,
+import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY,
 	MISSION_TOTAL_CNY, ONE_USE_PUSH_MARKER, PRIVATE_CONTINUATION_FILE_KEYS } from "./signed-mission-ledger.ts";
 import type { BootstrapBinding, PrivateContinuationBundle } from "./signed-mission-ledger.ts";
 
@@ -25,11 +25,50 @@ export type CurrentMissionRun = {
 type Run = { id?: number; run_number?: number; run_attempt?: number; workflow_id?: number;
 	status?: string; conclusion?: string; head_branch?: string; head_sha?: string; event?: string;
 	actor?: { login?: string }; head_commit?: { message?: string } };
-type Job = { name?: string; status?: string; conclusion?: string;
+type Job = { id?: number; run_id?: number; run_attempt?: number; head_sha?: string;
+	name?: string; status?: string; conclusion?: string;
 	steps?: Array<{ name?: string; status?: string; conclusion?: string }> };
-type Artifact = { id?: number; name?: string; expired?: boolean;
-	workflow_run?: { id?: number } };
+type Artifact = { id?: number; name?: string; expired?: boolean; digest?: string;
+	workflow_run?: { id?: number; head_sha?: string } };
 type Source = { runId: string; runAttempt: number; runNumber: number; commit: string };
+/** Host-only admission evidence. Terminal execution is not usage reconciliation,
+ * and this read-only proof is not an atomic durable restart claim.
+ */
+export type AuthenticatedPriorCarryProof = Readonly<{
+	version: 1; kind: "authenticated-prior-mission-carry"; repository: typeof MISSION_REPOSITORY;
+	source: Readonly<Source>; envelopeSha256: string; privateBundleSha256: string | null;
+	artifact: Readonly<{ repository: typeof MISSION_REPOSITORY; artifactId: string;
+		artifactName: typeof CARRY_ARTIFACT_NAME; runId: string }>;
+	/** GitHub's artifact archive digest, never the inner encrypted-envelope file digest. */
+	resultArtifact?: Readonly<{ repository: typeof MISSION_REPOSITORY; artifactId: string;
+		artifactName: typeof MISSION_ARTIFACT; runId: string; archiveSha256: string;
+		digestScope: "github-artifact-archive" }>;
+	terminal: Readonly<{ workflowId: string; runStatus: "completed"; runConclusion: string;
+		jobId: string; jobName: "private-campaign"; jobStatus: "completed"; jobConclusion: string;
+		jobRunId: string; jobRunAttempt: number; jobHeadSha: string;
+		providerStepStatus: "completed"; providerStepConclusion: string }>;
+	priorCommittedCny: number; priorUnknownHeldCny: number; admittedCurrent: Readonly<Source>;
+}>;
+const authenticatedCarryProofs = new WeakSet<object>();
+const claimedActionsAdmissions = new Set<string>();
+export type ActionsCarryRestartClaim = Readonly<{
+	claimId: string; currentRunId: string; currentRunAttempt: number; currentCommit: string;
+	currentJobId: string; priorEnvelopeSha256: string;
+}>;
+
+/** Reject copied, deserialized or model-authored objects; only this live verifier may attest a carry. */
+export function isAuthenticatedPriorCarryProof(value: unknown): value is AuthenticatedPriorCarryProof {
+	return Boolean(value) && typeof value === "object" && authenticatedCarryProofs.has(value as object);
+}
+
+/** Canonicalize only the fixed filename map; file contents remain exact UTF-8 strings. */
+function privateBundleDigest(bundle: PrivateContinuationBundle): string {
+	return digest(JSON.stringify(Object.fromEntries(Object.entries(bundle).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))));
+}
+export function authenticatedPriorCarryBindsBundle(proof: unknown, bundle: unknown): boolean {
+	return isAuthenticatedPriorCarryProof(proof) && proof.privateBundleSha256 !== null &&
+		validBundle(bundle) && privateBundleDigest(bundle) === proof.privateBundleSha256;
+}
 type Checkpoint = { version: 1 | 2; kind: "mul-pis-private-ledger-continuation";
 	missionId: typeof MISSION_ID; repository: typeof MISSION_REPOSITORY; seedDigest: string;
 	parentDigest: string; source: Source; committedNano: number; unknownHeldNano: number;
@@ -287,8 +326,44 @@ function providerDisposition(job: Job): "skipped" | "executed" {
 	if (steps[0]?.status !== "completed") reject("intervening provider execution is unresolved");
 	return "executed";
 }
+function priorCarryProof(input: { source: Source; current: Source; run: Run; job: Job;
+	artifactId: string; envelopeSha256: string; bundle?: PrivateContinuationBundle;
+	resultArtifact?: AuthenticatedPriorCarryProof["resultArtifact"];
+	committedNano: number; unknownHeldNano: number }): AuthenticatedPriorCarryProof | undefined {
+	const { source, current, run, job } = input;
+	const steps = job.steps?.filter(step => step.name === "Run bounded private campaign") ?? [];
+	const terminalConclusions = ["success", "failure", "neutral", "timed_out", "action_required", "stale"];
+	// Historical carry accounting remains readable without these extra API fields,
+	// but their absence or mismatch must never mint restart authority.
+	if (!Number.isSafeInteger(job.id) || job.id! <= 0 || job.run_id !== Number(source.runId) ||
+		job.run_attempt !== source.runAttempt || job.head_sha !== source.commit ||
+		run.id !== Number(source.runId) || run.run_attempt !== source.runAttempt || run.head_sha !== source.commit ||
+		!Number.isSafeInteger(run.workflow_id) || run.workflow_id! <= 0 ||
+		run.status !== "completed" || !terminalConclusions.includes(run.conclusion ?? "") ||
+		job.status !== "completed" || job.name !== "private-campaign" ||
+		!terminalConclusions.includes(job.conclusion ?? "") || steps.length !== 1 ||
+		steps[0].status !== "completed" ||
+		![...terminalConclusions, "cancelled"].includes(steps[0].conclusion ?? "")) return undefined;
+	const proof: AuthenticatedPriorCarryProof = Object.freeze({
+		version: 1, kind: "authenticated-prior-mission-carry", repository: MISSION_REPOSITORY,
+		source: Object.freeze({ ...source }), envelopeSha256: input.envelopeSha256,
+		privateBundleSha256: input.bundle ? privateBundleDigest(input.bundle) : null,
+		artifact: Object.freeze({ repository: MISSION_REPOSITORY, artifactId: input.artifactId,
+			artifactName: CARRY_ARTIFACT_NAME, runId: source.runId }),
+		...(input.resultArtifact ? { resultArtifact: input.resultArtifact } : {}),
+		terminal: Object.freeze({ workflowId: String(run.workflow_id), runStatus: "completed",
+			runConclusion: run.conclusion!, jobId: String(job.id), jobName: "private-campaign",
+			jobStatus: "completed", jobConclusion: job.conclusion!, jobRunId: String(job.run_id),
+			jobRunAttempt: job.run_attempt!, jobHeadSha: job.head_sha!,
+			providerStepStatus: "completed", providerStepConclusion: steps[0].conclusion! }),
+		priorCommittedCny: decimal(input.committedNano), priorUnknownHeldCny: decimal(input.unknownHeldNano),
+		admittedCurrent: Object.freeze({ ...current }),
+	});
+	authenticatedCarryProofs.add(proof);
+	return proof;
+}
 async function oneArtifact(runId: string, token: string, request: typeof fetch,
-	name: string, requiredId?: string): Promise<string> {
+	name: string, requiredId?: string, inspect?: (artifacts: Artifact[]) => void): Promise<string> {
 	const url = `https://api.github.com/repos/${MISSION_REPOSITORY}/actions/runs/${runId}/artifacts?per_page=100`;
 	const response = await githubJson(url, token, request);
 	if (!Array.isArray(response.artifacts) || response.artifacts.length > 100 ||
@@ -301,7 +376,17 @@ async function oneArtifact(runId: string, token: string, request: typeof fetch,
 	if (found.length !== 1 || !Number.isSafeInteger(found[0].id) || found[0].id! <= 0 ||
 		found[0].expired !== false || (requiredId !== undefined && String(found[0].id) !== requiredId))
 		reject("required private carry artifact is unavailable");
+	inspect?.(response.artifacts.filter(record) as Artifact[]);
 	return String(found[0].id);
+}
+function resultArtifactIdentity(artifacts: Artifact[], source: Source): AuthenticatedPriorCarryProof["resultArtifact"] {
+	const found = artifacts.filter(item => item.name === MISSION_ARTIFACT && item.workflow_run?.id === Number(source.runId));
+	if (found.length !== 1 || !Number.isSafeInteger(found[0].id) || found[0].id! <= 0 ||
+		found[0].expired !== false || found[0].workflow_run?.head_sha !== source.commit ||
+		typeof found[0].digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(found[0].digest)) return undefined;
+	return Object.freeze({ repository: MISSION_REPOSITORY, artifactId: String(found[0].id),
+		artifactName: MISSION_ARTIFACT, runId: source.runId, archiveSha256: found[0].digest.slice(7),
+		digestScope: "github-artifact-archive" });
 }
 
 export async function openLedgerContinuation(input: {
@@ -312,6 +397,13 @@ export async function openLedgerContinuation(input: {
 	/** Compatibility verifier may require every intervening run to be nonbillable. */
 	requireSeedOnly?: boolean;
 }): Promise<{ priorCommittedCny: number; priorUnknownHeldCny: number;
+	/** Present only for a fully authenticated carry with independently matched terminal job metadata. */
+	priorCarryProof?: AuthenticatedPriorCarryProof;
+	/** Under the reviewed shared-concurrency, single-driver Actions workflow only.
+	 * A later run must account for this durable run record or stop on missing carry.
+	 * This is not an atomic claim across arbitrary same-job host processes.
+	 */
+	claimOneUse: (carryDigest: string) => Promise<ActionsCarryRestartClaim>;
 	priorPrivateBundle?: PrivateContinuationBundle;
 	priorBootstrapBinding?: BootstrapBinding;
 	sealCurrent: (amounts: { settledCny: number; unknownOrInFlightCny: number;
@@ -401,6 +493,7 @@ export async function openLedgerContinuation(input: {
 	let priorPrivateBundle: PrivateContinuationBundle | undefined = seed.bootstrapPrivateBundle;
 	let priorBootstrapBinding: BootstrapBinding | undefined = seed.bootstrapBinding;
 	const executedSources: Source[] = [];
+	const executedMetadata = new Map<string, { run: Run; job: Job }>();
 	for (const run of ordered.slice(1, -1)) {
 		const source = sourceOf(run);
 		if (run.workflow_id !== current.workflow_id || run.run_attempt !== 1 || run.status !== "completed")
@@ -418,9 +511,14 @@ export async function openLedgerContinuation(input: {
 			if (run.head_commit.message === ONE_USE_PUSH_MARKER) reject("one-use push authorization was already consumed");
 		}
 		executedSources.push(source);
+		executedMetadata.set(source.runId, { run, job });
 	}
+	const loadedArtifacts = new Map<string, string>();
+	const resultArtifacts = new Map<string, AuthenticatedPriorCarryProof["resultArtifact"]>();
 	const load = async (source: Source): Promise<string> => {
-		const artifactId = await oneArtifact(source.runId, input.githubToken!, request, CARRY_ARTIFACT_NAME);
+		const artifactId = await oneArtifact(source.runId, input.githubToken!, request, CARRY_ARTIFACT_NAME,
+			undefined, artifacts => resultArtifacts.set(source.runId, resultArtifactIdentity(artifacts, source)));
+		loadedArtifacts.set(source.runId, artifactId);
 		try { return await input.loadCarryArtifact({ runId: source.runId, artifactId }); }
 		catch { return reject("private carry artifact could not be read"); }
 	};
@@ -454,12 +552,57 @@ export async function openLedgerContinuation(input: {
 		}
 	}
 	const currentSource = sourceOf(current);
+	const latestSource = executedSources.at(-1);
+	const proof = latestSource ? priorCarryProof({ source: latestSource, current: currentSource,
+		...executedMetadata.get(latestSource.runId)!, artifactId: loadedArtifacts.get(latestSource.runId)!,
+		resultArtifact: resultArtifacts.get(latestSource.runId),
+		envelopeSha256: parentDigest, bundle: priorPrivateBundle, committedNano, unknownHeldNano }) : undefined;
 	if (priorPrivateBundle) Object.freeze(priorPrivateBundle);
 	if (priorBootstrapBinding) Object.freeze(priorBootstrapBinding);
 	let sealed = false;
 	return { priorCommittedCny: decimal(committedNano), priorUnknownHeldCny: decimal(unknownHeldNano),
+		...(proof ? { priorCarryProof: proof } : {}),
 		...(priorPrivateBundle ? { priorPrivateBundle } : {}),
 		...(priorBootstrapBinding ? { priorBootstrapBinding } : {}),
+		claimOneUse: async carryDigest => {
+			if (!proof || !isAuthenticatedPriorCarryProof(proof) || carryDigest !== proof.envelopeSha256)
+				reject("restart claim requires the exact authenticated prior carry");
+			if (sealed) reject("restart claim cannot follow current carry sealing");
+			const admissionKey = JSON.stringify([MISSION_REPOSITORY, currentSource, carryDigest]);
+			if (claimedActionsAdmissions.has(admissionKey)) reject("current Actions restart admission was already consumed");
+			claimedActionsAdmissions.add(admissionKey);
+			try {
+				const observed = await githubJson(`${base}/runs/${currentSource.runId}`, input.githubToken!, request) as Run;
+				if (JSON.stringify(sourceOf(observed)) !== JSON.stringify(currentSource) ||
+					observed.status !== "in_progress" || (observed.conclusion !== undefined && observed.conclusion !== null) ||
+					observed.workflow_id !== current.workflow_id ||
+					observed.actor?.login !== c.actor || observed.event !== c.event || observed.head_branch !== BRANCH)
+					reject("current Actions restart admission is no longer active");
+				const disposition = await githubJson(`${base}/runs/${currentSource.runId}/jobs?per_page=100`, input.githubToken!, request);
+				if (disposition.total_count !== 1 || !Array.isArray(disposition.jobs) ||
+					disposition.jobs.length !== 1 || !record(disposition.jobs[0]))
+					reject("current Actions restart job identity is incomplete");
+				const job = disposition.jobs[0] as Job;
+				const steps = Array.isArray(job.steps) ? job.steps.filter(step => record(step) && step.name === "Run bounded private campaign") : [];
+				if (!Number.isSafeInteger(job.id) || job.id! <= 0 || job.run_id !== Number(currentSource.runId) ||
+					job.run_attempt !== currentSource.runAttempt || job.head_sha !== currentSource.commit ||
+					job.name !== "private-campaign" || job.status !== "in_progress" ||
+					(job.conclusion !== undefined && job.conclusion !== null) ||
+					!Array.isArray(job.steps) || job.steps.some(step => !record(step)) ||
+					job.steps.filter(step => step.status === "in_progress").length !== 1 ||
+					steps.length !== 1 || steps[0].status !== "in_progress" ||
+					(steps[0].conclusion !== undefined && steps[0].conclusion !== null))
+					reject("current Actions restart job identity is incomplete");
+				if (sealed) reject("restart claim cannot follow current carry sealing");
+				return Object.freeze({ claimId: digest(JSON.stringify([admissionKey, job.id])),
+					currentRunId: currentSource.runId, currentRunAttempt: currentSource.runAttempt,
+					currentCommit: currentSource.commit, currentJobId: String(job.id), priorEnvelopeSha256: carryDigest });
+			} catch (error) {
+				// These checks are read-only; a failed observation never minted a claim.
+				claimedActionsAdmissions.delete(admissionKey);
+				throw error;
+			}
+		},
 		sealCurrent: amounts => {
 			if (sealed) reject("current carry was already sealed");
 			const settledAddedNano = n(amounts.settledCny);

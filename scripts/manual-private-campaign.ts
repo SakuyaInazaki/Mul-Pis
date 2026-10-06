@@ -4,8 +4,8 @@
  * All private inputs are loaded at runtime from --input-dir and never printed.
  */
 import { existsSync } from "node:fs";
-import { createHash } from "node:crypto";
-import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { chmod, copyFile, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -26,8 +26,12 @@ import type { SessionCheckpoint, SessionHandle, SessionRunner, SessionSpec } fro
 import { DeepSeekCampaignBudget } from "../src/runner/deepseek-campaign.ts";
 import { MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, PRIVATE_CONTINUATION_FILE_KEYS } from
 	"../src/runner/signed-mission-ledger.ts";
-import { CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation,
+import { CARRY_FILE_NAME, authenticatedPriorCarryBindsBundle, downloadCarryArtifact,
+	isAuthenticatedPriorCarryProof, openLedgerContinuation,
 	type PrivateContinuationBundle } from "../src/runner/ledger-continuation.ts";
+import { bindIndependentRestartGoal, reserveIndependentRestart,
+	type AuthenticatedRestartCarryFacts, type IndependentRestartReservation,
+	type ReviewedRestartEffectPolicy } from "../src/m07/independent-restart.ts";
 import { createConfinedCampaignFileTools } from "../src/runner/confined-campaign-files.ts";
 import { archivePrivateM07Task, recordPrivateM04Outcome } from "../src/workflow-archive/m07-private.ts";
 import { buildCsrChecker as buildLegacyCsrChecker } from "../src/workflow-archive/csr-checker-legacy.ts";
@@ -37,10 +41,22 @@ import type { KnowledgeRef, KnowledgeStore } from "../src/knowledge/types.ts";
 import type { StageRunRecord } from "../src/types.ts";
 
 const MODEL = "deepseek/deepseek-flash:low";
-const CAMPAIGN_MS = 20 * 60_000;
-const BUILDER_PHASE_MS = 7 * 60_000;
-const M04_PHASE_MS = 5 * 60_000;
-const BUILDER_ROUNDS = 2;
+// Legacy compatibility only: review of this one immutable historical adapter.
+// Later source revisions require their own host effect review and must fail closed.
+const LEGACY_RESTART_POLICY = Object.freeze({ version: 1,
+	policyId: "mul-pis-legacy-confined-private-campaign-v1",
+	sourceCommit: "2fe7f132370b4598c942625fad1a7e9129978eaa",
+	reviewedBoundary: "Pi execution sessions received only confined text-file read/write/edit tools; built-in shell and network tools were not granted. The host verifier ran in a non-root bubblewrap user, network, PID and IPC namespace. Host output went only through the fixed encrypted Actions result archive. Provider billing remains unknown and held.",
+	effectClass: "confined-ephemeral-local", actorThirdPartyMutations: "none",
+	hostTransport: "immutable-versioned-archive" });
+// The GitHub campaign step has a 30-minute timeout. Keep time for preflight,
+// checkpoint/ledger sealing and encryption instead of imposing pilot phase caps.
+const ACTIONS_CAMPAIGN_STEP_MS = 30 * 60_000;
+const ACTIONS_TRANSPORT_RESERVE_MS = 5 * 60_000;
+const CAMPAIGN_MS = ACTIONS_CAMPAIGN_STEP_MS - ACTIONS_TRANSPORT_RESERVE_MS;
+const EXECUTION_SETTLEMENT_MS = 45_000;
+const NEW_PHASE_MINIMUM_MS = 90_000;
+const BUILDER_ROUNDS = 8; // M07 controller and bounded private archive both permit eight rounds.
 const MAX_PROVIDER_CALLS = 64;
 const FLAGS = ["-O2", "-std=c++17", "-fopenmp", "-pthread"];
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -70,6 +86,139 @@ let statusCredentialProbe: { httpStatus: number | null; accepted: boolean } | un
 let statusAuthSource: "runtime" | "unexpected" | undefined;
 let statusSdkAuthMatch: boolean | undefined;
 let statusArchiveFailure: string | undefined;
+let statusPriorSelectedValidation: "passed" | "failed" | "infrastructure-unavailable" | undefined;
+
+function executionDeadlineAt(campaignStopAt: number, now = Date.now()): string {
+	if (campaignStopAt - now <= EXECUTION_SETTLEMENT_MS) fail("campaign execution settlement boundary reached");
+	return new Date(campaignStopAt - EXECUTION_SETTLEMENT_MS).toISOString();
+}
+function newPhaseAdmitted(campaignStopAt: number, now = Date.now()): boolean {
+	return campaignStopAt - now > NEW_PHASE_MINIMUM_MS;
+}
+function unresolvedGoalControl(goal: CurrentGoal): { operationIds: string[]; taskIds: string[] } {
+	return {
+		operationIds: (goal.executionState?.operations ?? [])
+			.filter(item => ["prepared", "issued", "unknown"].includes(item.status)).map(item => item.id),
+		taskIds: goal.tasks.filter(item => ["running", "unknown"].includes(item.status)).map(item => item.taskId),
+	};
+}
+function campaignObjectiveProgress(contract: OriginalObjectiveContractV1, inheritedUnresolvedOperationIds: string[],
+	input: Parameters<typeof objectiveProgress>[1]): ObjectiveProgressV1 {
+	return objectiveProgress(contract, { ...input,
+		unresolvedOperationIds: [...new Set([...inheritedUnresolvedOperationIds,
+			...(input.unresolvedOperationIds ?? [])])] });
+}
+function sha256(value: string): string { return createHash("sha256").update(value).digest("hex"); }
+function reviewedLegacyRestartEffects(facts: AuthenticatedRestartCarryFacts,
+	operationRefs: readonly string[]): ReviewedRestartEffectPolicy {
+	if (facts.source.commit !== LEGACY_RESTART_POLICY.sourceCommit || !operationRefs.length ||
+		facts.unknownHeldNano < 1 || facts.resultArtifact.digestScope !== "github-artifact-archive")
+		fail("no reviewed legacy source/effect policy covers this independent restart");
+	const policySha256 = sha256(JSON.stringify(LEGACY_RESTART_POLICY));
+	return { sourceCommit: facts.source.commit, policyId: LEGACY_RESTART_POLICY.policyId,
+		policySha256, operationAttestations: operationRefs.map(operationRef => ({ operationRef,
+			sourceCommit: facts.source.commit,
+			evidenceSha256: sha256(JSON.stringify({ policySha256, operationRef,
+				resultArtifact: facts.resultArtifact })) })),
+		effectClass: "confined-ephemeral-local", unknownBillingHeld: true,
+		actorThirdPartyMutations: "none", hostTransport: "immutable-versioned-archive" };
+}
+function authenticatedLegacyCarryFacts(proof: unknown,
+	bundle: PrivateContinuationBundle): AuthenticatedRestartCarryFacts | undefined {
+	if (!isAuthenticatedPriorCarryProof(proof) || !authenticatedPriorCarryBindsBundle(proof, bundle) ||
+		!proof.resultArtifact || proof.resultArtifact.digestScope !== "github-artifact-archive") return undefined;
+	const artifact = proof.resultArtifact;
+	const immutableRef = `github-actions://${artifact.repository}/runs/${artifact.runId}/artifacts/${artifact.artifactId}/${artifact.artifactName}`;
+	return { source: { runId: proof.source.runId, runAttempt: proof.source.runAttempt,
+		commit: proof.source.commit },
+		currentRun: { runId: proof.admittedCurrent.runId, runAttempt: proof.admittedCurrent.runAttempt,
+			commit: proof.admittedCurrent.commit },
+		envelopeSha256: proof.envelopeSha256, privateBundleSha256: proof.privateBundleSha256!,
+		terminal: { state: "terminal", sourceRunId: proof.source.runId,
+			sourceRunAttempt: proof.source.runAttempt,
+			observationDigest: sha256(JSON.stringify({ source: proof.source,
+				terminal: proof.terminal, resultArtifact: artifact })),
+			observedAt: new Date().toISOString() },
+		resultArtifact: { immutableRef, digestScope: artifact.digestScope,
+			sha256: artifact.archiveSha256 },
+		committedNano: Math.ceil(proof.priorCommittedCny * 1_000_000_000),
+		unknownHeldNano: Math.ceil(proof.priorUnknownHeldCny * 1_000_000_000) };
+}
+async function writePrivateJsonOnce(directory: string, name: string, value: unknown): Promise<void> {
+	if (!/^[a-z][a-z0-9-]{0,100}\.json$/.test(name)) fail("invalid private receipt name");
+	const target = path.join(directory, name);
+	const temporary = `${target}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+	await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+	try { await link(temporary, target); }
+	finally { await rm(temporary, { force: true }); }
+}
+function readRestartChain(text: string | undefined, kind: string): any[] {
+	if (text === undefined) return [];
+	let value: Record<string, unknown>;
+	try { value = JSON.parse(text) as Record<string, unknown>; }
+	catch { return fail("authenticated independent-restart receipt chain is invalid JSON"); }
+	if (value?.version !== 1 || value.kind !== kind || !Array.isArray(value.entries) ||
+		value.entries.length > 64) fail("authenticated independent-restart receipt chain is invalid");
+	const ids = new Set<string>();
+	for (const entry of value.entries) {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry))
+			fail("authenticated independent-restart chain entry is invalid");
+		if (kind === "host-independent-restart-reservations") {
+			const receipt = entry.receipt, claim = entry.claim;
+			if (receipt?.version !== 1 || receipt.kind !== "host-independent-goal-quarantine" ||
+				typeof receipt.reuseKey !== "string" || !/^[0-9a-f]{64}$/.test(receipt.reuseKey) ||
+				typeof receipt.prior?.envelopeSha256 !== "string" ||
+				!/^[0-9a-f]{64}$/.test(receipt.prior.envelopeSha256) ||
+				claim?.priorEnvelopeSha256 !== receipt.prior.envelopeSha256 ||
+				typeof claim.claimId !== "string" || !/^[0-9a-f]{64}$/.test(claim.claimId) ||
+				typeof claim.currentRunId !== "string" || !/^[1-9][0-9]*$/.test(claim.currentRunId) ||
+				!Number.isSafeInteger(claim.currentRunAttempt) || claim.currentRunAttempt < 1 ||
+				typeof claim.currentCommit !== "string" || !/^[0-9a-f]{40}$/.test(claim.currentCommit) ||
+				typeof claim.currentJobId !== "string" || !/^[1-9][0-9]*$/.test(claim.currentJobId) ||
+				ids.has(receipt.reuseKey)) fail("authenticated independent-restart reservation is invalid or repeated");
+			ids.add(receipt.reuseKey);
+		} else if (kind === "host-independent-restart-goal-bindings") {
+			if (entry.version !== 1 || entry.kind !== "host-independent-goal-binding" ||
+				typeof entry.quarantineReceiptSha256 !== "string" ||
+				!/^[0-9a-f]{64}$/.test(entry.quarantineReceiptSha256) ||
+				typeof entry.goalRunId !== "string" || !entry.goalRunId ||
+				ids.has(entry.goalRunId)) fail("authenticated independent-restart goal binding is invalid or repeated");
+			ids.add(entry.goalRunId);
+		} else fail("unsupported independent-restart chain kind");
+	}
+	return value.entries;
+}
+async function appendRestartReservation(outputDir: string, prior: PrivateContinuationBundle,
+	receipt: unknown, claim: unknown): Promise<void> {
+	const name = "independent-restart-quarantine.json";
+	const entries = readRestartChain(prior[name], "host-independent-restart-reservations");
+	const priorBindings = readRestartChain(prior["independent-restart-goal-binding.json"],
+		"host-independent-restart-goal-bindings");
+	const priorHashes = new Set(entries.map(item => sha256(JSON.stringify(item.receipt))));
+	if (priorBindings.some(item => !priorHashes.has(item.quarantineReceiptSha256)))
+		fail("authenticated independent-restart goal binding lacks its prior reservation");
+	readRestartChain(JSON.stringify({ version: 1, kind: "host-independent-restart-reservations",
+		entries: [{ receipt, claim }] }), "host-independent-restart-reservations");
+	if (entries.some(item => item?.receipt?.reuseKey === (receipt as Record<string, unknown>)?.reuseKey))
+		fail("independent-restart reservation reuse key is already recorded");
+	await writePrivateJsonOnce(outputDir, name, { version: 1,
+		kind: "host-independent-restart-reservations", entries: [...entries, { receipt, claim }] });
+}
+async function appendRestartGoalBinding(outputDir: string, prior: PrivateContinuationBundle,
+	binding: unknown): Promise<void> {
+	const receipts = readRestartChain(await readFile(path.join(outputDir,
+		"independent-restart-quarantine.json"), "utf8"), "host-independent-restart-reservations");
+	const receiptHashes = new Set(receipts.map(item => sha256(JSON.stringify(item?.receipt))));
+	const name = "independent-restart-goal-binding.json";
+	const entries = readRestartChain(prior[name], "host-independent-restart-goal-bindings");
+	readRestartChain(JSON.stringify({ version: 1, kind: "host-independent-restart-goal-bindings",
+		entries: [binding] }), "host-independent-restart-goal-bindings");
+	if ([...entries, binding].some(item => !receiptHashes.has(item?.quarantineReceiptSha256)) ||
+		entries.some(item => item?.goalRunId === (binding as Record<string, unknown>)?.goalRunId))
+		fail("independent-restart goal binding does not match an immutable reservation");
+	await writePrivateJsonOnce(outputDir, name, { version: 1,
+		kind: "host-independent-restart-goal-bindings", entries: [...entries, binding] });
+}
 
 async function credentialProbe(key: string, request: typeof fetch = fetch): Promise<{ httpStatus: number | null; accepted: boolean }> {
 	const response = await request("https://api.deepseek.com/models", {
@@ -167,7 +316,8 @@ async function saveStatus(value: Record<string, unknown>): Promise<void> {
 	const target = path.join(statusOutputDir, "campaign-status.json");
 	const temporary = `${target}.${process.pid}.tmp`;
 	await writeFile(temporary, JSON.stringify({ version: 1, runId: statusRunId ?? null,
-		phase: statusPhase, budget: statusBudget?.snapshot() ?? { status: "unavailable" }, ...value }, null, 2),
+		phase: statusPhase, budget: statusBudget?.snapshot() ?? { status: "unavailable" },
+		...(statusPriorSelectedValidation ? { priorSelectedValidation: statusPriorSelectedValidation } : {}), ...value }, null, 2),
 		{ mode: 0o600 });
 	await rename(temporary, target);
 }
@@ -193,29 +343,29 @@ async function preserveCandidate(ws: Workspace, runId: string | undefined, outpu
 	}
 }
 
-/** Leave an auditable partial result when a child prompt has unresolved external-operation state. */
-async function preserveUnsettledBranchCheckpoint(input: {
+/** Leave an auditable active result when a task or external operation cannot be settled. */
+async function preserveUnsettledGoalCheckpoint(input: {
 	ws: Workspace; runId: string; outputDir: string; contract: OriginalObjectiveContractV1;
 	budgetStopReason?: string;
 }): Promise<{ checkpoint: ObjectiveProgressV1; acceptedTaskIds: string[];
-	unresolvedOperationIds: string[]; archiveFailure?: string }> {
+	unresolvedOperationIds: string[]; unresolvedTaskIds: string[]; archiveFailure?: string }> {
 	const goalFile = path.join(input.ws.runDir("M07", input.runId), "goal.json");
 	const goal = JSON.parse(await readFile(goalFile, "utf8")) as CurrentGoal;
-	const unresolvedOperationIds = (goal.executionState?.operations ?? [])
-		.filter(item => ["prepared", "issued", "unknown"].includes(item.status)).map(item => item.id);
-	if (goal.runId !== input.runId || !unresolvedOperationIds.length)
-		fail("unsettled branch checkpoint requires the matching goal and actual unresolved operations");
+	const { operationIds: unresolvedOperationIds, taskIds: unresolvedTaskIds } = unresolvedGoalControl(goal);
+	if (goal.runId !== input.runId || (!unresolvedOperationIds.length && !unresolvedTaskIds.length))
+		fail("unsettled checkpoint requires the matching goal and actual unresolved control state");
 	const acceptedTaskIds = goal.tasks.filter(item => item.status === "accepted").map(item => item.taskId);
 	let archiveFailure: string | undefined;
 	try { await preserveCandidate(input.ws, input.runId, input.outputDir); }
-	catch { archiveFailure = "unsettled-branch-archive-incomplete"; }
+	catch { archiveFailure = "unsettled-goal-archive-incomplete"; }
 	const availableArtifacts = ["candidate.cpp", "verification.json", "workflow-archive.json",
+		"experiment-plan.json", "round-1-reviewer-feedback.txt", "lesson-delta.json",
 		"branch-child-candidate.cpp", "branch-child-verification.json", "workflow-branch-child-archive.json"]
 		.filter(name => existsSync(path.join(input.outputDir, name)));
 	let prior: ObjectiveProgressV1 | undefined;
 	try { prior = JSON.parse(await readFile(path.join(input.outputDir, "objective-checkpoint.json"), "utf8")); } catch { /* First attempt has no checkpoint. */ }
 	if (prior?.contract.id !== input.contract.id) prior = undefined;
-	const checkpoint = objectiveProgress(input.contract, {
+	const checkpoint = campaignObjectiveProgress(input.contract, prior?.continuation.unresolvedOperationIds ?? [], {
 		...(prior?.assessment ? { assessment: prior.assessment } : {}), assessmentHistory: prior?.assessmentHistory,
 		boundedRuns: [...(prior?.boundedRuns.filter(run => run.runId !== input.runId) ?? []), { runId: input.runId, outcome: goal.lifecycle === "finished" ? goal.outcome ?? "unknown" : "active",
 			acceptedTaskIds, unresolvedOperationIds }],
@@ -223,7 +373,8 @@ async function preserveUnsettledBranchCheckpoint(input: {
 		stopReason: campaignObjectiveStop(input.budgetStopReason) ?? "bounded-run-incomplete",
 	});
 	await writeObjectiveProgress(path.join(input.outputDir, "objective-checkpoint.json"), checkpoint);
-	return { checkpoint, acceptedTaskIds, unresolvedOperationIds, ...(archiveFailure ? { archiveFailure } : {}) };
+	return { checkpoint, acceptedTaskIds, unresolvedOperationIds, unresolvedTaskIds,
+		...(archiveFailure ? { archiveFailure } : {}) };
 }
 
 async function salvageObjectiveCheckpoint(ws: Workspace, outputDir: string,
@@ -255,7 +406,7 @@ async function salvageObjectiveCheckpoint(ws: Workspace, outputDir: string,
 		!boundedRuns.some(live => live.runId === saved.runId)) : [];
 	const allBoundedRuns = [...historicalRuns, ...boundedRuns];
 	const availableArtifacts = (await readdir(outputDir)).filter(name =>
-		/^(?:candidate\.cpp|verification\.json|experiment-plan\.json|execution-capabilities\.json|research-history\.json|restored-candidate-verification\.json|workflow-(?:archive|[A-Za-z0-9-]+-archive)\.json|(?:branch-parent|branch-child|iteration-\d+|followon|initial)-(?:candidate\.cpp|verification\.json))$/.test(name));
+		/^(?:candidate\.cpp|verification\.json|experiment-plan\.json|lesson-delta\.json|execution-capabilities\.json|research-history\.json|restored-candidate-verification\.json|workflow-(?:archive|[A-Za-z0-9-]+-archive)\.json|round-[1-8]-(?:candidate\.cpp|verification\.json|reviewer-feedback\.txt)|(?:branch-parent|branch-child|iteration-\d+|followon|initial)-(?:candidate\.cpp|verification\.json|experiment-plan\.json|round-[1-8]-reviewer-feedback\.txt))$/.test(name));
 	const priorCoversLive = previous?.contract.id === contract.id &&
 		previous.stopReason !== "assessment-validation-pending" && unresolvedOperationIds.length === 0 &&
 		(!timedOut || previous.stopReason === "time-boundary") &&
@@ -271,7 +422,8 @@ async function salvageObjectiveCheckpoint(ws: Workspace, outputDir: string,
 			{ ...previous, availableArtifacts: [...previous.availableArtifacts, ...added] });
 		return;
 	}
-	const progress = objectiveProgress(contract, { boundedRuns: allBoundedRuns,
+	const progress = campaignObjectiveProgress(contract,
+		previous?.contract.id === contract.id ? previous.continuation.unresolvedOperationIds : [], { boundedRuns: allBoundedRuns,
 		selectedArtifacts: previous?.contract.id === contract.id ?
 			previous.selectedArtifacts : [],
 		availableArtifacts, unresolvedOperationIds,
@@ -482,11 +634,12 @@ function sourceShape(original: string, candidate: string): { ok: boolean; reason
 }
 /** The registered verifier owns its source preservation and extension boundary. */
 function registeredSourceShape(original: string, candidate: string, taskText: string, plan: CsrExperimentPlan):
-	{ ok: boolean; reason: string; targetCount: number } {
+	{ ok: boolean; reason: string; targetCount: number; diagnostic?: unknown } {
 	try {
 		const { ok, reason, targetCount } = validateCsrCandidateSource(original, candidate, taskText, plan.registeredStrategies);
 		return { ok, reason, targetCount };
-	} catch (error) { return { ok: false, reason: error instanceof Error ? error.message.slice(0, 2_000) : "source is outside the independently validated registered capability", targetCount: 0 }; }
+	} catch (error) { return { ok: false, reason: error instanceof Error ? error.message.slice(0, 2_000) : "source is outside the independently validated registered capability", targetCount: 0,
+		...(error && typeof error === "object" && "diagnostic" in error ? { diagnostic: error.diagnostic } : {}) }; }
 }
 
 function deriveRuntimeCases(original: string): string[][] | undefined {
@@ -604,6 +757,10 @@ function compareCandidateTimings(previous: unknown, current: unknown): { state: 
 		const priorProtocol = (previous as Record<string, any>).registeredExperiment;
 		const nextProtocol = (current as Record<string, any>).registeredExperiment;
 		if (priorProtocol.freshProcessPerSelection !== true || nextProtocol.freshProcessPerSelection !== true ||
+			priorProtocol.threadPolicy?.threadsMeaning !== "requested-default-and-openmp-cap" ||
+			priorProtocol.threadPolicy?.actualThreads !== "not_observed" ||
+			typeof priorProtocol.threadPolicy?.description !== "string" ||
+			JSON.stringify(priorProtocol.threadPolicy) !== JSON.stringify(nextProtocol.threadPolicy) ||
 			!Array.isArray(priorProtocol.compileFlags) || !Array.isArray(nextProtocol.compileFlags) ||
 			JSON.stringify(priorProtocol.compileFlags) !== JSON.stringify(nextProtocol.compileFlags) ||
 			typeof priorProtocol.accounting !== "string" || priorProtocol.accounting !== nextProtocol.accounting ||
@@ -616,7 +773,8 @@ function compareCandidateTimings(previous: unknown, current: unknown): { state: 
 		const fastest = (rows: Array<Record<string, any>>) => {
 			const grouped = new Map<string, Record<string, any>>();
 			for (const row of rows) {
-				if (!Number.isSafeInteger(row.medianNs) || row.medianNs < 1 || !Number.isSafeInteger(row.coldNs) || row.coldNs < 1)
+				if (!Number.isSafeInteger(row.medianNs) || row.medianNs < 1 || !Number.isSafeInteger(row.coldNs) || row.coldNs < 1 ||
+					row.requestedThreads !== row.threads || row.actualThreads !== "not_observed")
 					return undefined;
 				if (!grouped.has(key(row)) || grouped.get(key(row))!.medianNs > row.medianNs) grouped.set(key(row), row);
 			}
@@ -729,7 +887,8 @@ function parseRegisteredCheckerOutput(stdout: string, metadata: ReturnType<typeo
 			seen.has(key)) return { status: "failed", timings: [] };
 		seen.add(key);
 		timings.push({ caseId, kind, target: Number(targetText), name, rows, cols, ordinaryNnz, heavyRows,
-			heavyNnz, seed, threads, warmups, repeats, minNs, medianNs, maxNs, startupNs, coldNs, warmupSamplesNs: warmupSamples, samplesNs: samples });
+			heavyNnz, seed, threads, requestedThreads: threads, actualThreads: "not_observed" as const,
+			warmups, repeats, minNs, medianNs, maxNs, startupNs, coldNs, warmupSamplesNs: warmupSamples, samplesNs: samples });
 	}
 	const expectedCount = metadata.timing.cases.reduce((sum, item) => sum + item.threadCounts.length *
 		(metadata.targets.length + 2), 0);
@@ -756,16 +915,21 @@ async function checkCandidate(original: string, candidate: string, scratch: stri
 	if (!registered && candidateText !== originalText) try { validateCsrTargetBodies(originalText, candidateText); }
 	catch { shape = { ok: false, reason: "candidate body is outside the lexical host-safety capability", targetCount: shape.targetCount }; }
 	if (!shape.ok && candidateText !== originalText) return { version: 1, status: "failed", sourceShape: shape,
-		compile: { success: false }, independent: { status: "not_run" } };
+		compile: { success: false, status: "not_run" }, independent: { status: "not_run" },
+		...(registered ? { registeredExperiment: { status: "not_run", reason: shape.reason } } : {}) };
 	await mkdir(scratch, { recursive: true, mode: 0o700 });
 	await chmod(scratch, 0o777);
 	await copyFile(candidate, path.join(scratch, "candidate.cpp"));
 	await chmod(path.join(scratch, "candidate.cpp"), 0o644);
 	const compiled = path.join(scratch, "candidate-bin");
 	const build = isolated("/usr/bin/g++", [...FLAGS, "/work/candidate.cpp", "-o", "/work/candidate-bin"], 90_000, scratch);
+	const infrastructureFailure = Boolean(build.error) || build.status === null ||
+		/(?:^|\n)(?:bwrap|sudo):|failed to (?:create|unshare|mount)/i.test(build.stderr ?? "");
 	const verification: Record<string, unknown> = {
 		version: 1, status: "failed", sourceShape: shape,
-		compile: { success: build.status === 0, flags: FLAGS,
+		compile: { success: build.status === 0, flags: FLAGS, infrastructureFailure,
+			exitCode: build.status, signal: build.signal,
+			spawnError: build.error?.message?.slice(0, 1000),
 			stdoutTail: (build.stdout ?? "").slice(-4000), stderrTail: (build.stderr ?? "").slice(-8000) },
 		originalCheckerRuns: [], independent: { status: "not_run" }, environment: { platform: os.platform(), release: os.release(),
 			cpuModel: os.cpus()[0]?.model ?? "unknown", availableParallelism: os.availableParallelism() },
@@ -854,6 +1018,7 @@ async function checkCandidate(original: string, candidate: string, scratch: stri
 				verification.registeredExperiment = { status: passed ? parsed.status : "failed",
 					plan: experimentPlan, timings: parsed.timings, strategyNames: generated.metadata.targets,
 					baselineNames: generated.metadata.baselines, metric: generated.metadata.timing.metric, measurementAuthority: generated.metadata.timing.trust, accounting: generated.metadata.timing.accounting,
+					threadPolicy: generated.metadata.threadPolicy,
 					freshProcessPerSelection: true, compileFlags: FLAGS, executionFailures,
 					baselineIsolation: generated.metadata.timing.baselineIsolation, runtimeFiles: generated.metadata.timing.runtimeFiles,
 					correctness: { status: correctness.status === 0 ? "passed" : "failed",
@@ -870,7 +1035,7 @@ async function checkCandidate(original: string, candidate: string, scratch: stri
 }
 
 /** Authenticate transport elsewhere, then validate identities without promoting historical observations to current facts. */
-function validateContinuationSeed(bundle: PrivateContinuationBundle, inputNames: string[], binding: {
+function validateSelectedPriorTuple(bundle: PrivateContinuationBundle, inputNames: string[], binding: {
 	contractId: string; sourceSha256: string;
 }, originalSource: string): { checkpoint: ObjectiveProgressV1; archive: Record<string, any> } {
 	if (!bundle["candidate.cpp"] || !bundle["verification.json"] || !bundle["objective-checkpoint.json"] ||
@@ -891,9 +1056,6 @@ function validateContinuationSeed(bundle: PrivateContinuationBundle, inputNames:
 	if (bundle["original-objective.json"] &&
 		JSON.stringify(JSON.parse(bundle["original-objective.json"])) !== JSON.stringify(checkpoint.contract))
 		fail("prior original contract and checkpoint differ");
-	if (checkpoint.continuation.requiresOperationReconciliation || checkpoint.continuation.unresolvedOperationIds.length ||
-		checkpoint.boundedRuns.some(run => (run.unresolvedOperationIds?.length ?? 0) > 0))
-		fail("prior unresolved external operations require reconciliation before new execution");
 	const archive = JSON.parse(bundle["workflow-archive.json"]) as Record<string, any>;
 	const verification = JSON.parse(bundle["verification.json"]) as Record<string, any>;
 	if (archive?.version !== 1 || archive.kind !== "m07-private-candidate-archive" ||
@@ -915,6 +1077,17 @@ function validateContinuationSeed(bundle: PrivateContinuationBundle, inputNames:
 			fail("prior knowledge export lacks its historical M04 version binding");
 	}
 	return { checkpoint, archive };
+}
+
+function validateContinuationSeed(bundle: PrivateContinuationBundle, inputNames: string[], binding: {
+	contractId: string; sourceSha256: string;
+}, originalSource: string): { checkpoint: ObjectiveProgressV1; archive: Record<string, any> } {
+	const selected = validateSelectedPriorTuple(bundle, inputNames, binding, originalSource);
+	if (selected.checkpoint.continuation.requiresOperationReconciliation ||
+		selected.checkpoint.continuation.unresolvedOperationIds.length ||
+		selected.checkpoint.boundedRuns.some(run => (run.unresolvedOperationIds?.length ?? 0) > 0))
+		fail("prior unresolved external operations require reconciliation before new execution");
+	return selected;
 }
 
 /** A read-only, lossless range-readable view; the authenticated carry keeps the original historical bytes. */
@@ -972,8 +1145,43 @@ async function collectContinuationBundle(directory: string, prior?: PrivateConti
 					"experiment-plan.json", "m04-adopted-knowledge.json"].filter(name => prior[name as keyof typeof prior] !== undefined)
 					.map(name => [name, prior[name as keyof typeof prior]])) });
 	}
+	// Preserve failed experiments as version-bound development evidence, separate
+	// from the coherent selected source/verification/review tuple.
+	const checkpoint = JSON.parse(current["objective-checkpoint.json"] ?? prior?.["objective-checkpoint.json"] ?? "null");
+	const contractId = checkpoint?.contract?.id;
+	if (typeof contractId === "string" && contractId) {
+		const archives = ["workflow-archive.json", ...(await readdir(directory))
+			.filter(name => /^workflow-iteration-[1-9][0-9]*-archive\.json$/.test(name))];
+		for (const archiveName of archives) {
+			const archiveFile = path.join(directory, archiveName);
+			if (!existsSync(archiveFile)) continue;
+			const archiveText = await readFile(archiveFile, "utf8");
+			const archive = JSON.parse(archiveText) as Record<string, any>;
+			if (archive?.version !== 1 || archive.kind !== "m07-private-candidate-archive" ||
+				(accepted && archiveName === "workflow-archive.json") ||
+				!/^T\d{3,}$/.test(String(archive.taskId)) || typeof archive.goalRunId !== "string" ||
+				history.entries.some((entry: Record<string, unknown>) =>
+					entry.goalRunId === archive.goalRunId && entry.taskId === archive.taskId)) continue;
+			const prefix = archiveName === "workflow-archive.json" ? "" : archiveName.slice("workflow-".length, -"-archive.json".length) + "-";
+			const files: Record<string, string> = { "workflow-archive.json": archiveText };
+			for (const name of ["candidate.cpp", "verification.json", "experiment-plan.json", "lesson-delta.json",
+				...Array.from({ length: 8 }, (_, i) => `round-${i + 1}-reviewer-feedback.txt`)]) {
+				const file = path.join(directory, `${prefix}${name}`);
+				if (!existsSync(file)) continue;
+				const info = await lstat(file);
+				if (!info.isFile() || info.isSymbolicLink() || info.size > 1_000_000)
+					fail("unselected campaign evidence must be a bounded regular file");
+				files[name] = await readFile(file, "utf8");
+			}
+			history.entries.push({ originalContractId: contractId, goalRunId: archive.goalRunId,
+				taskId: archive.taskId,
+				interpretation: "Unselected or unresolved experiment; measurements and review do not establish a replacement for the selected candidate",
+				files });
+		}
+	}
 	if (history.entries.length) selected["research-history.json"] = JSON.stringify(history);
-	for (const name of ["original-objective.json", "objective-checkpoint.json", "objective-assessment-receipts.json"] as const)
+	for (const name of ["original-objective.json", "objective-checkpoint.json", "objective-assessment-receipts.json",
+		"independent-restart-quarantine.json", "independent-restart-goal-binding.json"] as const)
 		if (current[name]) selected[name] = current[name];
 	if (Buffer.byteLength(JSON.stringify(selected), "utf8") > 4 * 1024 * 1024)
 		fail("research continuation exceeds the authenticated carry capacity");
@@ -995,6 +1203,7 @@ async function inputs(inputDir: string) {
 }
 
 async function main() {
+	const campaignStartedAt = Date.now();
 	const inputDir = arg("--input-dir"), outputDir = arg("--output-dir");
 	statusOutputDir = outputDir;
 	await mkdir(outputDir, { recursive: true, mode: 0o700 });
@@ -1053,11 +1262,20 @@ async function main() {
 			{ mode: 0o600 });
 		const originalPath = path.join(ws.rawDir, found.source);
 		const originalText = await readFile(originalPath, "utf8");
+		const registeredTaskText = (await Promise.all(found.files.filter(name => /\.(?:md|txt)$/i.test(name))
+			.map(name => readFile(path.join(ws.rawDir, name), "utf8")))).join("\n\n");
 		const previousBundle = missionLedger.priorPrivateBundle;
 		if (!previousBundle || !missionLedger.priorBootstrapBinding)
 			fail("mission continuation lacks authenticated selected prior evidence");
-		const { checkpoint: previousCheckpoint } = validateContinuationSeed(previousBundle, found.files,
+		const selectedSeed = validateSelectedPriorTuple(previousBundle, found.files,
 			missionLedger.priorBootstrapBinding, originalText);
+		const previousCheckpoint = selectedSeed.checkpoint;
+		const priorNeedsQuarantine = previousCheckpoint.continuation.requiresOperationReconciliation ||
+			previousCheckpoint.continuation.unresolvedOperationIds.length > 0 ||
+			previousCheckpoint.boundedRuns.some(run => (run.unresolvedOperationIds?.length ?? 0) > 0);
+		if (!priorNeedsQuarantine) validateContinuationSeed(previousBundle, found.files,
+			missionLedger.priorBootstrapBinding, originalText);
+		const historicalUnresolvedOperationIds = [...previousCheckpoint.continuation.unresolvedOperationIds];
 		const priorSeedDir = path.join(ws.root, "objective-seeds");
 		await mkdir(priorSeedDir, { recursive: true, mode: 0o700 });
 		await writeFile(path.join(priorSeedDir, "prior-candidate.cpp"), previousBundle["candidate.cpp"]!, { mode: 0o600 });
@@ -1095,6 +1313,65 @@ async function main() {
 			originalSmoke.originalCheckerRuns.length !== 9 || originalSmoke.originalCheckerRuns.some(x => x.exitCode !== 0) ||
 			(originalSmoke.independent as { status?: string } | undefined)?.status !== "passed")
 			throw new SandboxPreflightError("original source compile/check failed; inspect encrypted verification.json");
+		statusPhase = "prior-selected-revalidation";
+		const priorScratch = await verifierScratch("candidate");
+		let priorSelectedCheck: Record<string, unknown>;
+		try {
+			priorSelectedCheck = await checkCandidate(originalPath, path.join(priorSeedDir, "prior-candidate.cpp"), priorScratch,
+				previousBundle["experiment-plan.json"] ? { taskText: registeredTaskText,
+					planFile: path.join(priorSeedDir, "prior-experiment-plan.json"),
+					deadlineAt: campaignStartedAt + CAMPAIGN_MS - EXECUTION_SETTLEMENT_MS } : undefined);
+		} finally { await rm(priorScratch, { recursive: true, force: true }); }
+		await writeFile(path.join(outputDir, "restored-candidate-verification.json"),
+			`${JSON.stringify({ ...priorSelectedCheck,
+				validationPurpose: "Fresh deterministic prior-source correctness guard; timings are not a new research study or historical speedup comparison" }, null, 2)}\n`,
+			{ mode: 0o600 });
+		const priorCompile = priorSelectedCheck.compile as Record<string, unknown> | undefined;
+		statusPriorSelectedValidation = priorSelectedCheck.status === "passed" ? "passed" :
+			priorCompile?.infrastructureFailure === true ? "infrastructure-unavailable" : "failed";
+		if (statusPriorSelectedValidation === "infrastructure-unavailable")
+			throw new SandboxPreflightError(`selected prior source revalidation sandbox unavailable; exit=${String(priorCompile?.exitCode)}, signal=${String(priorCompile?.signal)}, error=${privateFailureMessage(priorCompile?.spawnError, runtimeKey) ?? "none"}, stderr=${privateFailureMessage(priorCompile?.stderrTail, runtimeKey) ?? "none"}`);
+		if (statusPriorSelectedValidation !== "passed")
+			throw new SandboxPreflightError("selected prior source failed current host correctness revalidation; inspect encrypted restored-candidate-verification.json");
+		const priorSelectedValidationSha256 = createHash("sha256").update(JSON.stringify(priorSelectedCheck)).digest("hex");
+		let restartReservation: IndependentRestartReservation | undefined;
+		if (priorNeedsQuarantine) {
+			statusPhase = "independent-restart-admission";
+			const priorProof = missionLedger.priorCarryProof;
+			const facts = authenticatedLegacyCarryFacts(priorProof, previousBundle);
+			if (!facts) throw new SandboxPreflightError("authenticated terminal carry and fixed encrypted-result artifact proof unavailable; independent restart refused");
+			restartReservation = await reserveIndependentRestart({ authenticatedCarryProof: priorProof,
+				privateBundle: previousBundle, freshWorkspace: { workspaceId: path.basename(campaignRoot),
+					restartNonce: randomBytes(16).toString("hex") },
+				failedHistory: { state: "unavailable", reason: "The prior failed source, experiment plan and reviewer feedback are sealed in the encrypted result artifact and unavailable to this runner; the earlier accepted candidate is separate development evidence.",
+					immutableArtifactRef: facts.resultArtifact.immutableRef,
+					digestScope: facts.resultArtifact.digestScope,
+					artifactSha256: facts.resultArtifact.sha256 } }, {
+				authenticatedFacts: proof => proof === priorProof ? authenticatedLegacyCarryFacts(proof, previousBundle) : undefined,
+				reviewEffects: async (authenticated, operationRefs) => reviewedLegacyRestartEffects(authenticated, operationRefs),
+				revalidateSelection: async ({ privateBundle, checkpoint, tupleSha256 }) => {
+					if (privateBundle !== previousBundle || checkpoint.contract.id !== originalObjective.id ||
+						statusPriorSelectedValidation !== "passed") fail("selected prior tuple was not freshly validated");
+					return { status: "passed", contractId: originalObjective.id,
+						selectedRunId: selectedSeed.archive.goalRunId, selectedTaskId: selectedSeed.archive.taskId,
+						tupleSha256, currentValidationSha256: priorSelectedValidationSha256 };
+				},
+				commitOneUse: async receipt => {
+					const claim = await missionLedger.claimOneUse(receipt.prior.envelopeSha256);
+					const receiptRef = "independent-restart-quarantine.json";
+					await appendRestartReservation(outputDir, previousBundle, receipt, claim);
+					return { receiptRef, receiptSha256: sha256(JSON.stringify(receipt)), claim };
+				},
+			});
+			const gapFile = path.join(priorSeedDir, "prior-history-gap.json");
+			await writeFile(gapFile, `${JSON.stringify({ version: 1, kind: "untrusted-private-history-gap",
+				selectedCandidate: "earlier accepted bounded task; current correctness was revalidated without adopting old timings",
+				laterFailedAttempt: "encrypted and unavailable to this runner; source, plan, verification and feedback must not be inferred",
+				oldOperationOutcome: "unknown and quarantined; provider cost hold remains",
+				newExecution: "independent fresh workspace and goal only; old task is not resumed or reconciled" }, null, 2)}\n`,
+				{ mode: 0o600 });
+			priorSeedInputs.push("objective-seeds/prior-history-gap.json");
+		}
 		statusPhase = "source-and-isolation-preflight-passed";
 		statusPhase = "model-route-setup";
 		const profile = path.join(campaignRoot, "profile");
@@ -1120,16 +1397,14 @@ async function main() {
 		statusSdkAuthMatch = (await runtime.getAuth(resolved))?.auth.apiKey === runtimeKey;
 		if (!statusSdkAuthMatch) fail("SDK model credential resolution did not verify");
 		const abort = new AbortController();
-		const campaignStopAt = Date.now() + CAMPAIGN_MS;
+		const campaignStopAt = campaignStartedAt + CAMPAIGN_MS;
 		campaignDeadlineAt = campaignStopAt;
-		const timer = setTimeout(() => { campaignTimedOut = true; abort.abort(); }, CAMPAIGN_MS);
+		const timer = setTimeout(() => { campaignTimedOut = true; abort.abort(); }, Math.max(1, campaignStopAt - Date.now()));
 		try {
 			const actual = createPiSessionRunner({ modelRuntime: runtime, signal: abort.signal, campaignBudget: budget });
 			let followOnPriorCandidate = path.join(priorSeedDir, "prior-candidate.cpp");
 			let followOnPriorPlanFile: string | undefined = previousBundle["experiment-plan.json"] ? path.join(priorSeedDir, "prior-experiment-plan.json") : undefined;
 			let registeredScopeActive = false;
-			const registeredTaskText = (await Promise.all(found.files.filter(name => /\.(?:md|txt)$/i.test(name))
-				.map(name => readFile(path.join(ws.rawDir, name), "utf8")))).join("\n\n");
 			const remeasurePrior = async (priorSource: string, priorPlanFile: string | undefined,
 				registered: boolean, currentPlanFile: string): Promise<Record<string, unknown>> => {
 				if (Date.now() + 30_000 >= campaignStopAt) return { status: "not_run", reason: "time-boundary" };
@@ -1190,11 +1465,16 @@ async function main() {
 								const compile = result.compile as Record<string, unknown> | undefined;
 								const measured = result.registeredExperiment as Record<string, unknown> | undefined;
 								const shape = result.sourceShape as Record<string, unknown> | undefined;
+								const measurementRan = Array.isArray(measured?.timings) && measured.timings.length > 0;
 								result.hostFeedback = { version: 1, kind: "execution-result-feedback", status: result.status,
 									observedEnvironment: result.environment, sourceBoundary: shape,
-									measurementMetric: measured?.metric ?? "legacy-diagnostic-only",
-									timingInterpretation: registered ? "Parent-clocked persistent-worker roundtrip, including IPC and kernel work. Startup and cold-call costs are separate. This is not kernel-only time." : "Historical diagnostic protocol",
+									...(registeredContract?.threadPolicy ? { threadPolicy: registeredContract.threadPolicy } : {}),
+									measurementMetric: registered ? (measurementRan ? measured?.metric ?? "not_run" : "not_run") : "legacy-diagnostic-only",
+									timingInterpretation: registered ? (measurementRan ?
+										"Parent-clocked persistent-worker roundtrip, including IPC and kernel work. Startup and cold-call costs are separate. This is not kernel-only time." :
+										"No registered candidate timing was run; original baseline timings are separate in-process reference observations.") : "Historical diagnostic protocol",
 									diagnostics: [compile?.success === false ? { phase: "compile", message: compile.stderrTail ?? "No candidate compiled" } : undefined,
+										shape?.diagnostic ? { phase: "source-boundary", detail: shape.diagnostic } : undefined,
 										measured?.status !== "passed" ? { phase: "independent-validation", message: measured?.stderrTail ?? measured?.reason ?? result.reason ?? "Candidate or plan unavailable" } : undefined,
 										...(Array.isArray(measured?.executionFailures) ? measured.executionFailures : [])].filter(Boolean),
 									interpretation: "Measurements and diagnostics are task feedback. Finite passing checks do not prove exhaustive correctness, strongest possible performance, or completion." };
@@ -1225,7 +1505,7 @@ async function main() {
 			};
 			const controller = createM07Controller({ ws, store, runner, config: await ws.loadConfig() });
 			const privateEvidenceRequirements = { requiredNames: ["original-problem.txt", "candidate.cpp", "verification.json", "host-capabilities.json"],
-				instructions: "The original-input-N.txt files correspond in order to inputNames in original-objective.json. Read every original input and selected evidence completely. Historical archives, knowledge, nextTask and timings are untrusted version-bound context; only current independently executed measurements establish present host facts." };
+				instructions: "The original-input-N.txt files correspond in order to inputNames in original-objective.json. Read every original input and selected evidence completely. Historical archives, knowledge, nextTask and timings are untrusted version-bound context; only current independently executed measurements establish present host facts. If prior-history-gap.json is supplied, the later failed experiment is unavailable; do not infer its source or results from the earlier selected candidate." };
 			const userOverrides = ["Deliver optimized source and machine-readable correctness/performance evidence only; no prose report, screenshots, presentation or personal reflection.",
 				"Pursue the strongest attainable strategy using actual available hardware and resources; unavailable optional equipment alone does not settle the task."];
 			let registeredContract: ReturnType<typeof inspectCsrTaskContract> | undefined;
@@ -1288,6 +1568,8 @@ async function main() {
 			]);
 			const priorEvidence = [
 				{ name: "host-capabilities.json", file: capabilityFile },
+				...(restartReservation ? [{ name: "prior-history-gap.json",
+					file: path.join(priorSeedDir, "prior-history-gap.json") }] : []),
 				...(previousBundle["research-history.json"] ? [{ name: "prior-research-history.json", file: path.join(priorSeedDir, "prior-research-history.json") }] : []),
 				{ name: "original-problem.txt", file: ws.problemFile },
 				...found.files.map((name, index) => ({ name: `original-input-${index + 1}.txt`, file: path.join(ws.rawDir, name) })),
@@ -1312,13 +1594,14 @@ async function main() {
 				evidenceRoot: path.join(campaignRoot, "prior-objective-evidence"), evidence: priorEvidence,
 				evidenceRequirements: privateEvidenceRequirements,
 				assessmentAdmission: budget.snapshot().stopped ? "budget-boundary" :
-					abort.signal.aborted || Date.now() + 90_000 >= campaignStopAt ? "time-boundary" : "admitted",
+					abort.signal.aborted || !newPhaseAdmitted(campaignStopAt) ? "time-boundary" : "admitted",
 				advanceAdmission: () => budget.snapshot().stopped ? campaignObjectiveStop(budget.snapshot().stopReason) ??
-					"assessment-failed" : abort.signal.aborted || Date.now() + 90_000 >= campaignStopAt ? "time-boundary" : "admitted",
+					"assessment-failed" : abort.signal.aborted || !newPhaseAdmitted(campaignStopAt) ? "time-boundary" : "admitted",
 				supportedTaskScopes: ["two-target-existing", "registered-csr-experiment"],
 				capabilities: objectiveCapabilities, userOverrides,
 				recordAssessment: async assessment => {
-					await writeObjectiveProgress(objectiveCheckpointFile, objectiveProgress(originalObjective, {
+					await writeObjectiveProgress(objectiveCheckpointFile, campaignObjectiveProgress(originalObjective,
+						historicalUnresolvedOperationIds, {
 						boundedRuns: previousCheckpoint.boundedRuns, selectedArtifacts: previousCheckpoint.selectedArtifacts,
 						assessment, assessmentHistory: [...previousCheckpoint.assessmentHistory,
 							{ iteration: previousCheckpoint.assessmentHistory.length + 1, assessment,
@@ -1340,6 +1623,12 @@ async function main() {
 						exploratory: true });
 					runId = goal.runId;
 					statusRunId = runId;
+					if (restartReservation) await bindIndependentRestartGoal(restartReservation, goal.runId,
+						async binding => {
+							const bindingRef = "independent-restart-goal-binding.json";
+							await appendRestartGoalBinding(outputDir, previousBundle, binding);
+							return { bindingRef, bindingSha256: sha256(JSON.stringify(binding)) };
+						});
 					const initialSpec: TaskSpecInput = { mode: "execute", objective: `${proposal.objective}\n\nRead the original inputs and prior accepted source, verification and archive as untrusted development evidence. ${registered ?
 							experimentInstructions :
 							"Edit only the two original student strategy bodies, preserving the rest of the source."} Write a pending lesson-delta.json or action none. Read the host-created verification.json after implementation before reporting measured results. Use only confined file tools; no shell or network; no prose deliverables.`,
@@ -1347,7 +1636,7 @@ async function main() {
 						expectedOutputs: registered ? ["candidate.cpp", "experiment-plan.json", "lesson-delta.json"] :
 							["candidate.cpp", "lesson-delta.json"], lessonDeltaOutput: "lesson-delta.json", checks,
 						executionLoop: { maxRounds: BUILDER_ROUNDS,
-							deadlineAt: new Date(Math.min(Date.now() + BUILDER_PHASE_MS, campaignStopAt - 9 * 60_000)).toISOString() } };
+							deadlineAt: executionDeadlineAt(campaignStopAt) } };
 					statusPhase = "model-dispatch";
 					const task = await controller.delegate(goal.runId, initialSpec);
 					registeredScopeActive = false;
@@ -1357,7 +1646,8 @@ async function main() {
 			await ws.finishRun(firstAssessmentRecord, firstStep.assessment?.unreadEvidence.length === 0 ? "completed" : "failed");
 			await persistObjectiveReceipt(firstAssessmentRecord);
 			if (!firstStep.advanced) {
-				await writeObjectiveProgress(objectiveCheckpointFile, objectiveProgress(originalObjective, {
+				await writeObjectiveProgress(objectiveCheckpointFile, campaignObjectiveProgress(originalObjective,
+					historicalUnresolvedOperationIds, {
 					boundedRuns: previousCheckpoint.boundedRuns, selectedArtifacts: previousCheckpoint.selectedArtifacts,
 					...(firstStep.assessment ? { assessment: firstStep.assessment } : {}),
 					assessmentHistory: [...previousCheckpoint.assessmentHistory,
@@ -1395,7 +1685,9 @@ async function main() {
 			let branchComparison: { state?: string; medianRatio?: number; minRatio?: number } = { state: "unavailable" };
 			let branchState: Record<string, unknown> = { state: "not_run", reason: "no settled source checkpoint or remaining campaign boundary" };
 			let winner = accepted ? task : undefined;
-			if (task.branchSource && !budget.snapshot().stopped && !abort.signal.aborted && Date.now() + 5 * 60_000 < campaignStopAt) {
+			const parentControl = unresolvedGoalControl(await controller.status(runId));
+			if (task.branchSource && !parentControl.operationIds.length && !parentControl.taskIds.length &&
+				!budget.snapshot().stopped && !abort.signal.aborted && newPhaseAdmitted(campaignStopAt)) {
 				followOnPriorCandidate = parentCandidate;
 				followOnPriorPlanFile = initialRegistered ? path.join(task.workDir, "experiment-plan.json") : undefined;
 				statusPhase = "fork-dispatch";
@@ -1403,8 +1695,7 @@ async function main() {
 				const forked = await controller.delegate(runId, { ...initialSpec,
 					context: { mode: "fork", parentRunId: runId, parentTaskId: task.taskId,
 						checkpointId: task.branchSource.checkpoint.id },
-					executionLoop: { maxRounds: BUILDER_ROUNDS, deadlineAt: new Date(Math.min(Date.now() + 4 * 60_000,
-						campaignStopAt - 5 * 60_000)).toISOString() } });
+					executionLoop: { maxRounds: BUILDER_ROUNDS, deadlineAt: executionDeadlineAt(campaignStopAt) } });
 				registeredScopeActive = false;
 				branchTask = forked;
 				statusPhase = "fork-task-returned";
@@ -1438,11 +1729,10 @@ async function main() {
 					await writeFile(path.join(outputDir, "context-lineage.json"), `${JSON.stringify(lineageSummary, null, 2)}\n`, { mode: 0o600 });
 					const trueForkReceipt = lineageSummary.state === "verified";
 					const branchGoal = await controller.status(runId);
-					const unresolvedBranchOperations = (branchGoal.executionState?.operations ?? [])
-						.filter(item => ["prepared", "issued", "unknown"].includes(item.status)).map(item => item.id);
-					if (unresolvedBranchOperations.length) {
+					const unresolvedBranch = unresolvedGoalControl(branchGoal);
+					if (unresolvedBranch.operationIds.length || unresolvedBranch.taskIds.length) {
 						statusPhase = "branch-unsettled";
-						const boundary = await preserveUnsettledBranchCheckpoint({ ws, runId, outputDir,
+						const boundary = await preserveUnsettledGoalCheckpoint({ ws, runId, outputDir,
 							contract: originalObjective, budgetStopReason: budget.snapshot().stopReason });
 						if (boundary.archiveFailure) statusArchiveFailure = boundary.archiveFailure;
 						await saveStatus({ outcome: "incomplete", boundedRunOutcome: "partial",
@@ -1452,7 +1742,8 @@ async function main() {
 							branch: { state: "unsettled", parentTaskId: task.taskId, forkTaskId: forked.taskId,
 								parentAccepted: accepted, forkAccepted: branchAccepted, trueForkReceipt,
 								acceptedTaskIds: boundary.acceptedTaskIds,
-								unresolvedOperationIds: boundary.unresolvedOperationIds },
+								unresolvedOperationIds: boundary.unresolvedOperationIds,
+								unresolvedTaskIds: boundary.unresolvedTaskIds },
 							taskTelemetry: statusTaskTelemetry, branchTaskTelemetry: statusBranchTelemetry,
 							availableArtifacts: boundary.checkpoint.availableArtifacts,
 							...(boundary.archiveFailure ? { archiveFailure: boundary.archiveFailure } : {}),
@@ -1477,6 +1768,29 @@ async function main() {
 					measuredGainSupported: sourceChanged && accepted && preference === "fork",
 					measuredComparison: branchComparison,
 					selectedTaskId: winner?.taskId ?? null, taskTelemetry: statusBranchTelemetry };
+			}
+			// A failed or interrupted parent can leave an issued provider operation unknown.
+			// finish() must never be used to turn that state into a partial terminal goal.
+			const firstGoalControl = unresolvedGoalControl(await controller.status(runId));
+			if (firstGoalControl.operationIds.length || firstGoalControl.taskIds.length) {
+				statusPhase = "first-goal-unsettled";
+				const boundary = await preserveUnsettledGoalCheckpoint({ ws, runId, outputDir,
+					contract: originalObjective, budgetStopReason: budget.snapshot().stopReason });
+				if (boundary.archiveFailure) statusArchiveFailure = boundary.archiveFailure;
+				await saveStatus({ outcome: "incomplete", boundedRunOutcome: "partial",
+					originalObjective: { id: originalObjective.id, outcome: "incomplete",
+						stopReason: boundary.checkpoint.stopReason, checkpointFile: "objective-checkpoint.json",
+						continuation: boundary.checkpoint.continuation.mode },
+					m07Outcome: "active", taskStatus: task.status, loopStopReason: task.loopStopReason,
+					acceptedTaskIds: boundary.acceptedTaskIds,
+					unresolvedOperationIds: boundary.unresolvedOperationIds,
+					unresolvedTaskIds: boundary.unresolvedTaskIds,
+					taskTelemetry: statusTaskTelemetry, branch: branchState,
+					availableArtifacts: boundary.checkpoint.availableArtifacts,
+					...(boundary.archiveFailure ? { archiveFailure: boundary.archiveFailure } : {}),
+					independentValidation: "not-complete" });
+				process.exitCode = 1;
+				return;
 			}
 			const acceptedWinner = branchExerciseComplete && Boolean(winner);
 			const selectedTask = winner ?? task;
@@ -1514,10 +1828,11 @@ async function main() {
 			let m04: { status: "completed" | "failed" | "not_run"; runId?: string; proposalSubmitted?: boolean;
 				snapshotCreated?: boolean; evidenceReturned?: boolean; adoptedExperienceRefs?: KnowledgeRef[];
 				failure?: ReturnType<typeof privateExceptionDiagnostic> } = { status: "not_run" };
-			if (firstGoalReady && branchExerciseComplete && !budget.snapshot().stopped && !abort.signal.aborted) {
+			if (firstGoalReady && branchExerciseComplete && !budget.snapshot().stopped && !abort.signal.aborted &&
+				newPhaseAdmitted(campaignStopAt)) {
 				statusPhase = "m04-dispatch";
 				const m04Abort = new AbortController();
-				const m04Timer = setTimeout(() => m04Abort.abort(), M04_PHASE_MS);
+				const m04Timer = setTimeout(() => m04Abort.abort(), Math.max(1, campaignStopAt - Date.now()));
 				try {
 					const m04Runner = createPiSessionRunner({ modelRuntime: runtime,
 						signal: AbortSignal.any([abort.signal, m04Abort.signal]), campaignBudget: budget });
@@ -1574,7 +1889,7 @@ async function main() {
 				admission: () => {
 					if (budget.snapshot().stopped) return campaignObjectiveStop(budget.snapshot().stopReason) ??
 						"bounded-run-incomplete";
-					if (abort.signal.aborted || Date.now() + 90_000 >= campaignStopAt) return "time-boundary";
+					if (abort.signal.aborted || !newPhaseAdmitted(campaignStopAt)) return "time-boundary";
 					if (currentM04Status === "failed") return "m04-evidence-incomplete";
 					if (!firstGoalReady || currentM04Status !== "completed" || currentKnowledgeExport.state === "incomplete" ||
 						!currentM04Read || !existsSync(candidate) || !existsSync(verificationPath)) return "bounded-run-incomplete";
@@ -1621,7 +1936,7 @@ async function main() {
 						assessmentAdmission,
 						advanceAdmission: () => budget.snapshot().stopped ?
 							campaignObjectiveStop(budget.snapshot().stopReason) ?? "assessment-failed" :
-							abort.signal.aborted || Date.now() + 90_000 >= campaignStopAt ? "time-boundary" : "admitted",
+							abort.signal.aborted || !newPhaseAdmitted(campaignStopAt) ? "time-boundary" : "admitted",
 						supportedTaskScopes: ["two-target-existing", "registered-csr-experiment"],
 						userOverrides, capabilities: objectiveCapabilities,
 						recordAssessment: async assessment => {
@@ -1631,7 +1946,8 @@ async function main() {
 								assessmentHistory[assessmentHistory.length - 1] = { iteration, assessment,
 									stopReason: "assessment-validation-pending", advanced: false };
 							else assessmentHistory.push({ iteration, assessment, stopReason: "assessment-validation-pending", advanced: false });
-							await writeObjectiveProgress(objectiveCheckpointFile, objectiveProgress(originalObjective,
+							await writeObjectiveProgress(objectiveCheckpointFile, campaignObjectiveProgress(originalObjective,
+								historicalUnresolvedOperationIds,
 								{ boundedRuns: [...previousCheckpoint.boundedRuns, { runId: runId!, outcome: finished.outcome ?? "unknown",
 									...(firstGoalReady ? { selectedTaskId: selectedTask.taskId } : {}) }],
 									selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
@@ -1682,7 +1998,7 @@ async function main() {
 								expectedOutputs: registered ? ["candidate.cpp", "experiment-plan.json", "lesson-delta.json"] :
 									["candidate.cpp", "lesson-delta.json"], lessonDeltaOutput: "lesson-delta.json", checks: taskChecks,
 								...(pinnedRefs.length ? { experienceRefs: pinnedRefs, experienceTags: tags } : {}),
-								executionLoop: { maxRounds: 2, deadlineAt: new Date(Math.min(Date.now() + BUILDER_PHASE_MS, campaignStopAt - 45_000)).toISOString() },
+								executionLoop: { maxRounds: BUILDER_ROUNDS, deadlineAt: executionDeadlineAt(campaignStopAt) },
 							});
 							registeredScopeActive = false;
 							activeFollowOnTaskId = secondTask.taskId;
@@ -1727,7 +2043,10 @@ async function main() {
 							failures: secondReady ? [] : ["follow-on candidate did not pass all bounded checks"] });
 						if (secondReady && reviewed.status !== "accepted") fail("follow-on M07 review did not accept candidate");
 					}
-					const secondFinished = await controller.finish(secondGoal.runId, { outcome: secondReady ? "fulfilled" : "partial",
+						const secondControl = unresolvedGoalControl(await controller.status(secondGoal.runId));
+						if (secondControl.operationIds.length || secondControl.taskIds.length)
+							fail("follow-on goal has unresolved external operations or tasks");
+						const secondFinished = await controller.finish(secondGoal.runId, { outcome: secondReady ? "fulfilled" : "partial",
 						returnPath: "user", summary: secondReady ? "Fresh bounded follow-on checked prior context and produced verified candidate." :
 							"Fresh bounded follow-on did not complete all checks.",
 						goalChecks: taskChecks.map((criterion, index) => ({ criterion, result: secondReady ? "passed" : "not_run",
@@ -1739,12 +2058,13 @@ async function main() {
 						const nextArchiveDir = path.join(campaignRoot, `iteration-${iteration}-archive`);
 						await archivePrivateM07Task({ goal: nextFrozenGoal, task: nextFrozenTask, destination: nextArchiveDir });
 						let nextM04: typeof m04 = { status: "not_run" };
-						if (secondReady && nextFrozenTask.review && !budget.snapshot().stopped && !abort.signal.aborted) {
+						if (secondReady && nextFrozenTask.review && !budget.snapshot().stopped && !abort.signal.aborted &&
+							newPhaseAdmitted(campaignStopAt)) {
 							statusPhase = "model-proposed-m04-dispatch";
 							const requiredPaths = selectedM07ReviewReadPaths(ws.runDir("M07", secondGoal.runId), nextFrozenTask,
 								registered ? ["experiment-plan.json"] : []);
 							const m04Abort = new AbortController();
-							const m04Timer = setTimeout(() => m04Abort.abort(), M04_PHASE_MS);
+							const m04Timer = setTimeout(() => m04Abort.abort(), Math.max(1, campaignStopAt - Date.now()));
 							try {
 								const m04Runner = createPiSessionRunner({ modelRuntime: runtime,
 									signal: AbortSignal.any([abort.signal, m04Abort.signal]), campaignBudget: budget });
@@ -1913,7 +2233,8 @@ async function main() {
 				...followOnAttempts.filter(item => typeof item.goalRunId === "string").map(item => ({
 					runId: String(item.goalRunId), outcome: String(item.m07Outcome ?? "unknown"),
 					...(item.candidateSelected === true ? { selectedTaskId: String(item.taskId) } : {}) }))];
-			const objectiveCheckpoint = objectiveProgress(originalObjective, { boundedRuns,
+			const objectiveCheckpoint = campaignObjectiveProgress(originalObjective,
+				historicalUnresolvedOperationIds, { boundedRuns,
 				selectedArtifacts: finalCandidateAvailable ? ["candidate.cpp", "verification.json", "workflow-archive.json"] : previousCheckpoint.selectedArtifacts,
 				...(objectiveAssessment ? { assessment: objectiveAssessment } : {}), assessmentHistory,
 				nextTaskDispatched: latestAssessmentAdvanced, stopReason: objectiveStopReason });
@@ -1963,6 +2284,19 @@ async function main() {
 			budget.snapshot().stopReason, campaignTimedOut ||
 				(campaignDeadlineAt !== undefined && Date.now() >= campaignDeadlineAt)); }
 		catch { statusArchiveFailure = "objective-checkpoint-salvage-failed"; process.exitCode = 1; }
+		try {
+			const statusFile = path.join(outputDir, "campaign-status.json");
+			if (existsSync(statusFile)) {
+				const status = JSON.parse(await readFile(statusFile, "utf8")) as Record<string, any>;
+				const checkpoint = JSON.parse(await readFile(path.join(outputDir, "objective-checkpoint.json"), "utf8")) as ObjectiveProgressV1;
+				if (status.originalObjective?.checkpointFile === "objective-checkpoint.json" &&
+					(status.originalObjective.stopReason !== checkpoint.stopReason ||
+						status.originalObjective.outcome !== checkpoint.objectiveOutcome))
+					await saveStatus({ ...status, originalObjective: { ...status.originalObjective,
+						outcome: checkpoint.objectiveOutcome, stopReason: checkpoint.stopReason } });
+			}
+		}
+		catch { statusArchiveFailure = "objective-status-sync-failed"; process.exitCode = 1; }
 
 		await rm(campaignRoot, { recursive: true, force: true });
 	}
@@ -1991,17 +2325,23 @@ async function main() {
 }
 
 export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceReturned, inputs, stageProbe, verifierScratch,
+	checkCandidate, validateSelectedPriorTuple,
+	reviewedLegacyRestartEffects,
+	appendRestartReservation, appendRestartGoalBinding,
 	privateFailureMessage, privateExceptionDiagnostic, credentialProbe, parseCheckerOutput, compareCandidateTimings,
 	chooseForkWinner, chooseFollowOnCandidate, firstM07Accepted,
 	forkReceiptMatches, contextLineageSummary, selectedM07ReviewReadPaths, exportPrefixedArchive, preserveCandidate,
-	preserveUnsettledBranchCheckpoint, salvageObjectiveCheckpoint, collectContinuationBundle,
+	preserveUnsettledGoalCheckpoint, preserveUnsettledBranchCheckpoint: preserveUnsettledGoalCheckpoint,
+	salvageObjectiveCheckpoint, collectContinuationBundle,
+	executionDeadlineAt, newPhaseAdmitted, unresolvedGoalControl, campaignObjectiveProgress,
 	registeredSourceShape, parseRegisteredCheckerOutput, validateContinuationSeed, rangeReadableHistory, sandboxArguments };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	main().catch(async error => {
 		const preProvider = ["preflight", "mission-ledger-verification", "credential-probe", "credential-verified",
 			"isolated-preflight-passed", "workspace-init", "private-inputs-staged",
-			"original-source-smoke", "source-and-isolation-preflight-passed"].includes(statusPhase);
+			"original-source-smoke", "prior-selected-revalidation", "independent-restart-admission",
+			"source-and-isolation-preflight-passed"].includes(statusPhase);
 		const diagnostic = privateExceptionDiagnostic(error, statusRuntimeKey);
 		try { await saveStatus({ outcome: "incomplete", errorCategory: "campaign-exception",
 			...(existsSync(path.join(statusOutputDir ?? "", "objective-checkpoint.json")) ?
