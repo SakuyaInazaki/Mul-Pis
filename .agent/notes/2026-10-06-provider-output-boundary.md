@@ -1,0 +1,7 @@
+# Provider-owned output boundary and incomplete-response feedback
+
+The user asked to remove workflow-selected output-generation limits. The private campaign driver no longer sets a 64,000-token campaign maximum or a separate 384,000-token SDK model maximum. A read-only exact-model provider metadata check supplies the live provider output maximum and context window before budget or model setup. The request budget reserves the full provider maximum under the unchanged mission ceiling; an unaffordable request is refused before transport rather than shortened by the workflow. Safety limits on file sizes and encrypted transport remain separate from model-generation limits.
+
+A settled terminal length response is now an explicit incomplete output-limit boundary in campaign accounting, task telemetry, and original-objective checkpoints. It is never treated as a completed candidate or new scientific gain. For future attempts, bounded private tool telemetry records redacted read-error class, code and message plus complete-read byte count and truncation status when the audited confined read tool succeeds. It does not export raw read contents, write payloads, credentials, or model reasoning. Earlier missing read-error details cannot be reconstructed from a tool success flag alone.
+
+Only offline synthetic checks were used for this change. It does not raise the mission spending ceiling or release historical unknown reservations.

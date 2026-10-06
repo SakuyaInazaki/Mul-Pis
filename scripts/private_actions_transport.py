@@ -42,13 +42,17 @@ RESULT_ALLOWLIST = (
     "branch-child-review-decision.json",
     "campaign-status.json", "original-objective.json", "objective-checkpoint.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "mission-ledger-out.json", "execution-capabilities.json", "research-history.json", "restored-candidate-verification.json",
     "independent-restart-quarantine.json", "independent-restart-goal-binding.json",
-) + tuple(f"iteration-{iteration}-{suffix}" for iteration in range(1, 65)
-    for suffix in ("candidate.cpp", "verification.json", "lesson-delta.json", "experiment-plan.json", "review-decision.json", "m04-adopted-knowledge.json")) + \
-    tuple(f"workflow-iteration-{iteration}-archive.json" for iteration in range(1, 65)) + \
-    tuple(f"{prefix}round-{round_index}-{suffix}"
-    for prefix in ("", "initial-", "followon-", "branch-parent-", "branch-child-", *(f"iteration-{iteration}-" for iteration in range(1, 65))) for round_index in range(1, 9)
-    for suffix in ("candidate.cpp", "verification.json", "reviewer-feedback.txt", "reviewer-report.md"))
+)
+RESULT_DYNAMIC_RE = re.compile(
+    r"^(?:(?:iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,})-(?:candidate\.cpp|verification\.json|lesson-delta\.json|experiment-plan\.json|review-decision\.json|m04-adopted-knowledge\.json)|"
+    r"workflow-(?:iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,})-archive\.json|"
+    r"(?:initial-|followon-|branch-parent-|branch-child-|iteration-[1-9][0-9]*-|fallback-[0-9a-f]{12}-T[0-9]{3,}-)?round-[1-9][0-9]*-(?:candidate\.cpp|verification\.json|reviewer-feedback\.txt|reviewer-report\.md))$"
+)
 METADATA_RE = re.compile(r"^[A-Za-z0-9_./:@-]{1,160}$")
+
+
+def _allowed_result_name(name: str) -> bool:
+    return bool(name in RESULT_ALLOWLIST or RESULT_DYNAMIC_RE.fullmatch(name))
 
 
 def _review_text_file(name: str) -> bool:
@@ -141,7 +145,7 @@ def _result_tar(result_dir: Path) -> bytes:
     buf = io.BytesIO()
     count = 0
     with tarfile.open(fileobj=buf, mode="w:") as tar:
-        for name in RESULT_ALLOWLIST:
+        for name in sorted(entry.name for entry in os.scandir(result_dir) if _allowed_result_name(entry.name)):
             path = result_dir / name
             try:
                 fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -249,7 +253,7 @@ def decrypt_results(envelope_file: Path, private_key_file: Path, parent: Path) -
         names: set[str] = set()
         with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
             for member in tar:
-                if not member.isfile() or member.name not in RESULT_ALLOWLIST or member.name in names or member.size > MAX_FILE or (_review_text_file(member.name) and member.size > MAX_REVIEW_TEXT_FILE):
+                if not member.isfile() or not _allowed_result_name(member.name) or member.name in names or member.size > MAX_FILE or (_review_text_file(member.name) and member.size > MAX_REVIEW_TEXT_FILE):
                     raise TransportError()
                 names.add(member.name)
                 source = tar.extractfile(member)

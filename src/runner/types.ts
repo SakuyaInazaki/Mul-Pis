@@ -55,6 +55,12 @@ export interface ToolCallRecord {
 	ok: boolean;
 	at: string;
 	error?: string;
+	errorClass?: "harness" | "filesystem" | "tool-error";
+	errorCode?: string;
+	/** Bounded, redacted host diagnostic for a failed factory-confined read only. */
+	errorMessage?: string;
+	resultMetadata?: { kind: "confined-utf8-read"; relativePath: string;
+		utf8Bytes: number; truncated: false };
 }
 
 export interface SessionSpec {
@@ -73,7 +79,7 @@ export interface SessionSpec {
 	/** Explicit, frozen method identity. It never enables resource discovery. */
 	methodBinding?: { versionId: string; contentId?: string };
 	/** Opt-in request guard. A campaign reserves actual serialized input bytes; tool-free strict callers may still set a fixed input cap. */
-	strictRequest?: { maxProviderCallsPerPrompt: number; maxOutputTokens?: number; maxInputPayloadBytes?: number };
+	strictRequest?: { maxProviderCallsPerPrompt?: number; maxOutputTokens?: number; maxInputPayloadBytes?: number };
 }
 
 /** Enough to reopen a persisted session with the same boundary. */

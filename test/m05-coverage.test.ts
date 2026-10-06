@@ -33,19 +33,19 @@ describe("M05 task-scoped coverage and continuation", () => {
 				const links = Array.from({ length: 83 }, (_, i) => ({ text: `reply ${i}`, href: `${url}/${i}` }));
 				return { url, finalUrl: url, status: 200, title: "Thread", fetchedAt: "2026-09-20T00:00:00Z", engine: "http", kind: "page", contentType: "text/html", bytes: 10, markdownPath, links, linksTotal: 83, linksComplete: true, warnings: [], error: null };
 			},
-			async browseInteractive(url, task, outDir, options) {
+			async browseInteractive(url, task, outDir) {
 				const resultPath = path.join(outDir, "result.md");
 				const pagePath = path.join(outDir, "thread.html");
 				const screenshotPath = path.join(outDir, "thread.png");
 				await writeFile(resultPath, "agent summary");
 				await writeFile(pagePath, "<article>thread and replies</article>");
 				await writeFile(screenshotPath, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0]));
-				return { url, task, model: "stub/browser", finishedAt: "2026-09-20T00:00:00Z", steps: options?.maxSteps ?? null, resultPath, resultText: "agent summary", artifacts: [{ path: pagePath, kind: "html", url: `${url}/thread`, capturedAt: "2026-09-20T00:00:00Z", contentType: "text/html" }, { path: screenshotPath, kind: "screenshot", url: `${url}/thread`, contentType: "image/png" }], visitedUrls: [url, `${url}/thread`], warnings: ["attachment missing"], error: "stopped after partial capture" };
+				return { url, task, model: "stub/browser", finishedAt: "2026-09-20T00:00:00Z", steps: 7, resultPath, resultText: "agent summary", artifacts: [{ path: pagePath, kind: "html", url: `${url}/thread`, capturedAt: "2026-09-20T00:00:00Z", contentType: "text/html" }, { path: screenshotPath, kind: "screenshot", url: `${url}/thread`, contentType: "image/png" }], visitedUrls: [url, `${url}/thread`], warnings: ["attachment missing"], error: "stopped after partial capture" };
 			},
 			async downloadFile() { throw new Error("unused"); }, async extractPdf() { throw new Error("unused"); }, async findOpenAccess(input) { return { input, kind: "unknown", found: false, isOa: false, warnings: [] }; }, describe: () => ["stub coverage backend"],
 		};
 		const runner = new FakeSessionRunner(async ({ tools }) => {
-			const browser = await tools.browse_interactive({ url: "https://example.net", task: "capture thread context and replies", max_steps: 7 });
+			const browser = await tools.browse_interactive({ url: "https://example.net", task: "capture thread context and replies" });
 			seen.browser = browser.text;
 			const details = browser.details as { resultPath: string; artifacts: Array<{ path: string }> };
 			const displayedArtifacts = [...browser.text.matchAll(/^\d+\. (?:html|screenshot)：(references\/[^\n]+)/gm)].map((match) => match[1]);

@@ -205,12 +205,12 @@ test("failed fork prompt leaves parent evidence intact but cannot select across 
 	assert.equal(salvaged.objectiveOutcome, "incomplete");
 	assert.equal(salvaged.continuation.requiresOperationReconciliation, true);
 	await offlineChecks.salvageObjectiveCheckpoint(ws, outputDir, undefined, true);
-	const timedOut = JSON.parse(await readFile(path.join(outputDir, "objective-checkpoint.json"), "utf8")) as typeof boundary.checkpoint;
-	assert.equal(timedOut.stopReason, "time-boundary");
-	assert.equal(timedOut.continuation.requiresOperationReconciliation, true);
+	const cancelled = JSON.parse(await readFile(path.join(outputDir, "objective-checkpoint.json"), "utf8")) as typeof boundary.checkpoint;
+	assert.equal(cancelled.stopReason, "cancelled");
+	assert.equal(cancelled.continuation.requiresOperationReconciliation, true);
 });
 
-test("terminal timeout replaces a stale reassessment checkpoint after a completed bounded run", async t => {
+test("actual cancellation replaces stale reassessment while historical timeout remains readable", async t => {
 	const root = await mkdtemp(path.join(tmpdir(), "m07-stale-boundary-"));
 	t.after(async () => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(path.join(root, "workspace"));
@@ -227,12 +227,20 @@ test("terminal timeout replaces a stale reassessment checkpoint after a complete
 	await writeOriginalObjectiveContract(path.join(outputDir, "original-objective.json"), contract);
 	await writeObjectiveProgress(path.join(outputDir, "objective-checkpoint.json"), objectiveProgress(contract, {
 		boundedRuns: [{ runId: run.runId, outcome: "fulfilled" }], selectedArtifacts: [],
+		stopReason: "time-boundary",
+	}));
+	await offlineChecks.salvageObjectiveCheckpoint(ws, outputDir, undefined, false);
+	const historical = JSON.parse(await readFile(path.join(outputDir, "objective-checkpoint.json"), "utf8")) as
+		{ stopReason: string };
+	assert.equal(historical.stopReason, "time-boundary");
+	await writeObjectiveProgress(path.join(outputDir, "objective-checkpoint.json"), objectiveProgress(contract, {
+		boundedRuns: [{ runId: run.runId, outcome: "fulfilled" }], selectedArtifacts: [],
 		stopReason: "objective-reassessment-pending",
 	}));
 	await offlineChecks.salvageObjectiveCheckpoint(ws, outputDir, undefined, true);
 	const checkpoint = JSON.parse(await readFile(path.join(outputDir, "objective-checkpoint.json"), "utf8")) as
 		{ stopReason: string; objectiveOutcome: string; boundedRuns: Array<{ runId: string }> };
-	assert.equal(checkpoint.stopReason, "time-boundary");
+	assert.equal(checkpoint.stopReason, "cancelled");
 	assert.equal(checkpoint.objectiveOutcome, "incomplete");
 	assert.deepEqual(checkpoint.boundedRuns.map(item => item.runId), [run.runId]);
 });

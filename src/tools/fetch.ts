@@ -7,7 +7,7 @@ import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { ToolsConfig } from "../types.ts";
 import { writeFileAtomic } from "../workspace.ts";
-import { extensionForContentType, fetchText, htmlToText, downloadToFile } from "./http.ts";
+import { extensionForContentType, fetchText, fetchWithIdleTimeout, htmlToText, downloadToFile, MAX_HTTP_DOWNLOAD_BYTES } from "./http.ts";
 import { pythonScriptsDir, runScript, venvPython } from "./python.ts";
 
 export interface FetchResult {
@@ -32,6 +32,7 @@ export interface FetchResult {
 
 export interface FetchOptions {
 	timeoutMs?: number;
+	signal?: AbortSignal;
 	/** Skip the browser engine even if installed. */
 	noBrowser?: boolean;
 }
@@ -41,11 +42,10 @@ export async function fetchPage(url: string, outDir: string, tools: ToolsConfig,
 	const python = options.noBrowser ? undefined : venvPython(tools);
 	if (python) {
 		const args = [url, "--out", outDir, "--timeout", String(Math.ceil((options.timeoutMs ?? 60_000) / 1000))];
-		const run = await runScript(python, path.join(pythonScriptsDir(), "fetch_page.py"), args, { timeoutMs: (options.timeoutMs ?? 60_000) + 60_000 });
+		const run = await runScript(python, path.join(pythonScriptsDir(), "fetch_page.py"), args, { signal: options.signal });
 		if (run.json && typeof run.json.engine === "string") {
 			const meta = run.json as unknown as FetchResult;
 			meta.warnings = Array.isArray(meta.warnings) ? meta.warnings : [];
-			if (run.timedOut) meta.warnings.push("抓取脚本超时被终止");
 			return meta;
 		}
 		const fallback = await httpFetchPage(url, outDir, options);
@@ -59,13 +59,13 @@ export async function httpFetchPage(url: string, outDir: string, options: FetchO
 	const fetchedAt = new Date().toISOString();
 	const base: FetchResult = { url, finalUrl: url, status: null, title: "", fetchedAt, engine: "http", kind: "page", contentType: "", bytes: 0, links: [], warnings: ["使用纯 HTTP 抓取，未渲染 JavaScript；动态页面内容可能缺失"], error: null };
 	try {
-		const probe = await fetch(url, { method: "GET", redirect: "follow", signal: AbortSignal.timeout(options.timeoutMs ?? 60_000), headers: { "user-agent": "pre-rsi-research-harness/0.1" } });
+		const { response: probe, body } = await fetchWithIdleTimeout(url, { timeoutMs: options.timeoutMs ?? 60_000, signal: options.signal }, MAX_HTTP_DOWNLOAD_BYTES);
 		const contentType = probe.headers.get("content-type") ?? "";
 		base.status = probe.status;
 		base.finalUrl = probe.url || url;
 		base.contentType = contentType;
 		if (contentType.toLowerCase().includes("html")) {
-			const html = await probe.text();
+			const html = body.toString("utf8");
 			const { title, text } = htmlToText(html);
 			base.title = title;
 			base.bytes = Buffer.byteLength(html);
@@ -83,7 +83,7 @@ export async function httpFetchPage(url: string, outDir: string, options: FetchO
 			base.linksComplete = probe.status < 400;
 			if (!text.trim()) base.error = "页面没有可提取的正文";
 		} else {
-			const buffer = Buffer.from(await probe.arrayBuffer());
+			const buffer = body;
 			base.kind = "file";
 			base.bytes = buffer.length;
 			base.filePath = path.join(outDir, `download${extensionForContentType(contentType, base.finalUrl)}`);
@@ -128,7 +128,7 @@ export interface BrowserArtifact {
  * Interactive acquisition through browser-use. Raw observed pages, screenshots, and downloads are
  * returned separately from result.md, which is only the browser agent's summary.
  */
-export async function browseInteractive(url: string, task: string, outDir: string, tools: ToolsConfig, options: { timeoutMs?: number; maxSteps?: number } = {}): Promise<InteractiveResult> {
+export async function browseInteractive(url: string, task: string, outDir: string, tools: ToolsConfig, signal?: AbortSignal): Promise<InteractiveResult> {
 	await mkdir(outDir, { recursive: true });
 	const base: InteractiveResult = { url, task, model: tools.browserUseModel ?? "", finishedAt: new Date().toISOString(), steps: null, resultText: "", artifacts: [], visitedUrls: [], warnings: [], error: null };
 	if (!tools.browserUseModel) {
@@ -141,8 +141,7 @@ export async function browseInteractive(url: string, task: string, outDir: strin
 		return base;
 	}
 	const args = ["--url", url, "--task", task, "--out", outDir, "--model", tools.browserUseModel];
-	if (options.maxSteps !== undefined) args.push("--max-steps", String(options.maxSteps));
-	const run = await runScript(python, path.join(pythonScriptsDir(), "browser_task.py"), args, { timeoutMs: options.timeoutMs ?? 600_000 });
+	const run = await runScript(python, path.join(pythonScriptsDir(), "browser_task.py"), args, { signal });
 	let meta = (run.json ?? {}) as Record<string, unknown>;
 	try {
 		meta = JSON.parse(await readFile(path.join(outDir, "meta.json"), "utf8")) as Record<string, unknown>;
@@ -155,8 +154,7 @@ export async function browseInteractive(url: string, task: string, outDir: strin
 	base.warnings = Array.isArray(meta.warnings) ? meta.warnings.filter((item): item is string => typeof item === "string") : [];
 	if (typeof meta.complete === "boolean") base.complete = meta.complete;
 	base.artifacts = await validateBrowserArtifacts(meta.artifacts, outDir, base.warnings);
-	if (run.timedOut) base.warnings.push("browser-use 超时被终止；已保留超时前逐步写入的页面和下载，任务完整性未知");
-	base.error = typeof meta.error === "string" ? meta.error : run.code === 0 ? null : `browser_task.py 退出码 ${run.code ?? "null"}${run.timedOut ? "（超时）" : ""}：${run.stderr.trim().slice(-300)}`;
+	base.error = typeof meta.error === "string" ? meta.error : run.code === 0 ? null : `browser_task.py 退出码 ${run.code ?? "null"}：${run.stderr.trim().slice(-300)}`;
 	const resultPath = path.join(outDir, "result.md");
 	try {
 		base.resultText = await readFile(resultPath, "utf8");

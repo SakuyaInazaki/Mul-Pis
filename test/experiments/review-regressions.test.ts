@@ -5,8 +5,9 @@ import { reserveResearchPhases } from "../../src/experiments/budget-preflight.ts
 import { createCpuResponseEnvironment, type CpuResponseCase } from "../../src/experiments/local-environment.ts";
 import { FakeSessionRunner } from "../../src/runner/fake.ts";
 import { prepareModelRequest, runBoundedModelStep } from "../../src/improvement/research-model.ts";
+import { runExecutorEpisode } from "../../src/improvement/executor-eval.ts";
 
-const limits = { maxProviderCalls: 100, maxInputTokens: 400_000, maxOutputTokens: 400_000, maxSdkEstimatedCost: 2, maxProbeCalls: 100, maxCpuMillis: 100_000, maxWallMillis: 200_000 };
+const limits = { maxProviderCalls: 100, maxInputTokens: 400_000, maxSdkEstimatedCost: 2, maxProbeCalls: 100, maxCpuMillis: 100_000, maxWallMillis: 200_000 };
 const multi: CpuResponseCase = { id: "two-step", version: 1, truthHypothesisId: "truth", hypotheses: [
  { id: "truth", formula: { kind: "affine", slope: 1, intercept: 0 } },
  { id: "wrong-a", formula: { kind: "quadratic", coefficient: 1, intercept: 0 } },
@@ -34,46 +35,44 @@ test("finite CPU reference classifies initial, multi-step and budget-limited unc
  assert.equal((await bounded.protectedEvaluator.evaluateStop(b)).status, "justified-unknown");
 });
 
-test("dormant branch clocks and paused pilot exclude waiting while root elapsed remains real", () => {
+test("branch activation and pilot pause remain lifecycle controls without elapsed-time quotas", () => {
  const realNow = Date.now; let now = 1_000_000; Date.now = () => now;
  try {
-  const budget = new SharedBudget("clocks", limits);
-  const old = budget.createLease(budget.root, { ...limits, maxWallMillis: 60_000 });
-  const newer = budget.createLease(budget.root, { ...limits, maxWallMillis: 60_000 });
-  const pilot = budget.createLease(budget.root, { ...limits, maxWallMillis: 30_000 }, { clockMode: "active" });
-  budget.activateLease(old); now += 45_000;
-  assert.equal(budget.status(old).remaining.wallMillis, 15_000);
-  assert.equal(budget.status(newer).remaining.wallMillis, 60_000);
-  assert.equal(budget.status(budget.root).remaining.wallMillis, 155_000);
-  budget.activateLease(pilot); now += 5_000; budget.pauseLease(pilot); now += 40_000;
-  assert.equal(budget.status(pilot).remaining.wallMillis, 25_000);
-  assert.equal(budget.status(newer).remaining.wallMillis, 60_000);
-  assert.equal(budget.status(budget.root).remaining.wallMillis, 110_000);
+  const budget = new SharedBudget("lifecycle", { ...limits, maxWallMillis: 0 });
+  const old = budget.createLease(budget.root, { ...limits, maxWallMillis: 0 });
+  const newer = budget.createLease(budget.root, { ...limits, maxWallMillis: 0 });
+  const pilot = budget.createLease(budget.root, { ...limits, maxWallMillis: 0 }, { clockMode: "active" });
+  budget.activateLease(old); now += 1_000_000_000;
+  assert.equal(budget.status(old).lifecycle, "running");
+  assert.equal(budget.status(newer).lifecycle, "allocated");
+  assert.deepEqual(budget.status().remaining, { sdkEstimatedCost: limits.maxSdkEstimatedCost });
+  budget.activateLease(pilot); budget.pauseLease(pilot); now += 1_000_000_000;
+  assert.equal(budget.status(pilot).lifecycle, "allocated");
+  budget.activateLease(pilot);
+  assert.equal(budget.status(pilot).lifecycle, "running");
+  budget.reserveProbe(old);
+  assert.equal(budget.status(old).committed.probeCalls, 1);
  } finally { Date.now = realNow; }
 });
 
-test("completed branch freezes its own wall time while the root and other branch continue", () => {
- const realNow = Date.now; let now = 1_000_000; Date.now = () => now;
- try {
-  const budget = new SharedBudget("closed-clocks", limits);
-  const cap = { ...limits, maxWallMillis: 60_000 };
-  const old = budget.createLease(budget.root, cap), newer = budget.createLease(budget.root, cap);
-  budget.activateLease(old); now += 40_000;
-  const receipt = budget.closeLease(old);
-  assert.equal(receipt.lifecycle, "closed");
-  assert.equal(receipt.remaining.wallMillis, 20_000);
-  budget.activateLease(newer); now += 40_000;
-  assert.equal(budget.status(old).remaining.wallMillis, 20_000);
-  assert.equal(budget.status(newer).remaining.wallMillis, 20_000);
-  assert.equal(budget.status().remaining.wallMillis, 120_000);
-  assert.throws(() => budget.reserveProbe(old), /closed/);
-  assert.throws(() => budget.activateLease(old), /closed/);
-  const pending = budget.createLease(budget.root, cap);
-  const reservation = budget.reservePrompt(pending, { maxInputTokens: 10, maxOutputTokens: 10, maxSdkEstimatedCost: 0.01 });
-  assert.throws(() => budget.closeLease(pending), /pending/);
-  budget.markUnknown(reservation);
-  assert.throws(() => budget.closeLease(pending), /unknown/);
- } finally { Date.now = realNow; }
+test("completed branch closes independently while pending or unknown branches stay open", () => {
+ const budget = new SharedBudget("closed-branches", { ...limits, maxWallMillis: 0 });
+ const cap = { ...limits, maxWallMillis: 0 };
+ const old = budget.createLease(budget.root, cap), newer = budget.createLease(budget.root, cap);
+ budget.activateLease(old);
+ const receipt = budget.closeLease(old);
+ assert.equal(receipt.lifecycle, "closed");
+ assert.deepEqual(receipt.remaining, { sdkEstimatedCost: cap.maxSdkEstimatedCost });
+ budget.activateLease(newer);
+ assert.equal(budget.status(old).lifecycle, "closed");
+ assert.equal(budget.status(newer).lifecycle, "running");
+ assert.throws(() => budget.reserveProbe(old), /closed/);
+ assert.throws(() => budget.activateLease(old), /closed/);
+ const pending = budget.createLease(budget.root, cap);
+ const reservation = budget.reservePrompt(pending, { maxInputTokens: 10, maxSdkEstimatedCost: 0.01 });
+ assert.throws(() => budget.closeLease(pending), /pending/);
+ budget.markUnknown(reservation);
+ assert.throws(() => budget.closeLease(pending), /unknown/);
 });
 
 test("prepared request uses actual prompt bytes without a per-request token quota", async () => {
@@ -97,46 +96,63 @@ test("prepared request uses actual prompt bytes without a per-request token quot
  assert.equal(budget.status().committed.inputTokens, 2);
 });
 
-test("an uncapped reply is recorded, and an aggregate budget overrun blocks the next step", async () => {
+test("an uncapped reply is recorded without enforcing a legacy aggregate output quota", async () => {
  const spec = { label: "observed-output", role: "research" as const, model: "fake/research", systemPrompt: "s", persistDir: "/tmp" };
  const budget = new SharedBudget("observed-output", { ...limits, maxOutputTokens: 10 });
+ assert.equal("maxOutputTokens" in budget.status().limits, false);
+ assert.equal("outputTokens" in budget.status().remaining, false);
  let calls = 0;
  const runner = new FakeSessionRunner((ctx) => {
   calls++;
   assert.equal(ctx.spec.strictRequest?.maxOutputTokens, undefined);
   return { text: "x".repeat(20_000), usage: { input: 2, output: 11, cacheRead: 0, cacheWrite: 0, totalTokens: 13, cost: 0.001 } };
  });
- await assert.rejects(runBoundedModelStep({ runner, budget, lease: budget.root, spec, message: "m", timeoutMs: 1000 }), /provider usage or SDK-estimated cost is incomplete/);
+ await runBoundedModelStep({ runner, budget, lease: budget.root, spec, message: "m", timeoutMs: 1000 });
  assert.equal(budget.status().committed.outputTokens, 11);
- assert.equal(budget.status().settlement, "exceeded");
- await assert.rejects(runBoundedModelStep({ runner, budget, lease: budget.root, spec, message: "again", timeoutMs: 1000 }));
- assert.equal(calls, 1);
+ assert.equal(budget.status().settlement, "settled");
+ await runBoundedModelStep({ runner, budget, lease: budget.root, spec, message: "again", timeoutMs: 1000 });
+ assert.equal(calls, 2);
 });
 
-test("phase preflight checks protected call count and seals disjoint pools", async () => {
- const stage = { ...limits, maxProviderCalls: 2, maxInputTokens: 20_000, maxOutputTokens: 8_192, maxSdkEstimatedCost: 0.1, maxProbeCalls: 2, maxCpuMillis: 5_000, maxWallMillis: 10_000 };
- const budget = new SharedBudget("short", limits);
- const base = { kind: "meta-improvement" as const, outer: stage, pilot: stage, branch: stage, protected: { ...limits, maxProviderCalls: 24, maxInputTokens: 240_000, maxOutputTokens: 98_304, maxSdkEstimatedCost: 0.5, maxProbeCalls: 0, maxCpuMillis: 10_000, maxWallMillis: 20_000 }, searchReplicates: 2, outcomeReplicates: 2, admissionCases: [{ maxProbeCalls: 2 }] };
- await assert.rejects(reserveResearchPhases(budget, { ...base, protected: { ...base.protected, maxProviderCalls: 23 } }), /protected maxProviderCalls/);
- assert.equal(budget.status().committed.providerCalls, 0);
- assert.equal(budget.status().committed.providerCalls, 0);
- // An independent roomy root can reserve all stages before any request.
- const roomy = new SharedBudget("roomy", { ...limits, maxProviderCalls: 40, maxInputTokens: 360_000, maxOutputTokens: 150_000, maxSdkEstimatedCost: 2, maxProbeCalls: 20, maxCpuMillis: 50_000, maxWallMillis: 100_000 });
- const phases = await reserveResearchPhases(roomy, base);
+test("CPU executor accepts a valid action after a long provider reply", async () => {
+ const budget = new SharedBudget("long-action", limits);
+ const environment = createCpuResponseEnvironment(multi, budget);
+ const start = await environment.development.prepare("long-action");
+ const runner = new FakeSessionRunner(() => ({ text: JSON.stringify({ kind: "stop", actionId: "long.1", reason: "insufficient evidence" }) + " ".repeat(9_000),
+  usage: { input: 2, output: 9_000, cacheRead: 0, cacheWrite: 0, totalTokens: 9_002, cost: 0.01 } }));
+ const episode = await runExecutorEpisode({ development: environment.development, start, method: { version: 1, kind: "cpu-numerical-prompt", body: "Use visible observations." },
+  methodVersionId: "H-long", runner, model: "fake/research", persistDir: "/tmp", budget, lease: budget.root });
+ assert.equal(episode.status, "stopped", episode.failure ?? "unexpected episode status");
+ assert.equal(budget.status().settlement, "settled");
+});
+
+test("phase preflight creates accounting namespaces under one root monetary ceiling", async () => {
+ const stage = { maxSdkEstimatedCost: 0.1, maxProviderCalls: 0, maxInputTokens: 0, maxOutputTokens: 0, maxProbeCalls: 0, maxCpuMillis: 0, maxWallMillis: 0 };
+ const root = new SharedBudget("phases", { ...stage, maxSdkEstimatedCost: 2 });
+ const plan = { kind: "meta-improvement" as const, outer: stage, pilot: stage, branch: stage, protected: { ...stage, maxSdkEstimatedCost: 0.5 }, searchReplicates: 2, outcomeReplicates: 12, admissionCases: [{ maxProbeCalls: 20 }] };
+ const phases = await reserveResearchPhases(root, plan);
  assert.equal(phases.branches.length, 2);
- assert.equal(phases.protectedMaxProviderCalls, 24);
- assert.throws(() => roomy.reservePrompt(roomy.root, { maxInputTokens: 1, maxOutputTokens: 1, maxSdkEstimatedCost: 0.01 }), /direct root/);
- assert.throws(() => roomy.createLease(roomy.root), /sealed/);
+ assert.equal("protectedMaxProviderCalls" in phases, false);
+ assert.deepEqual(root.status(phases.protected).limits, { maxSdkEstimatedCost: 2 });
+ assert.deepEqual(root.status(phases.outer).remaining, { sdkEstimatedCost: 2 });
+ assert.throws(() => root.reservePrompt(root.root, { maxInputTokens: 1, maxSdkEstimatedCost: 0.01 }), /direct root/);
+ assert.throws(() => root.createLease(root.root), /sealed/);
 });
 
-test("meta plan reports full protected and search reservation overflow before any request", async () => {
- const root = new SharedBudget("infeasible-meta", { ...limits, maxProviderCalls: 100, maxInputTokens: 2_000_000, maxOutputTokens: 1_000_000, maxSdkEstimatedCost: 20, maxWallMillis: 1_000_000 });
- const stage = { ...limits, maxProviderCalls: 2, maxInputTokens: 20_000, maxOutputTokens: 8_192, maxSdkEstimatedCost: 0.1, maxProbeCalls: 2, maxCpuMillis: 5_000, maxWallMillis: 10_000 };
- await assert.rejects(reserveResearchPhases(root, { kind: "meta-improvement", outer: stage, pilot: stage, branch: stage,
-  protected: { ...limits, maxProviderCalls: 96, maxInputTokens: 960_000, maxOutputTokens: 393_216, maxSdkEstimatedCost: 10, maxWallMillis: 20_000 },
-  searchReplicates: 2, outcomeReplicates: 2, admissionCases: Array.from({ length: 4 }, () => ({ maxProbeCalls: 1 })),
-  }), /reserved phase maxProviderCalls ceilings exceed the shared root/);
- assert.equal(root.status().committed.providerCalls, 0);
+test("historical phase monetary sums cannot reject a valid shared-root campaign", async () => {
+ const root = new SharedBudget("shared-meta", { maxSdkEstimatedCost: 0.25 });
+ const stage = { maxSdkEstimatedCost: 0.1 };
+ const phases = await reserveResearchPhases(root, { kind: "meta-improvement", outer: stage, pilot: stage, branch: stage,
+  protected: { maxSdkEstimatedCost: 10 }, searchReplicates: 2, outcomeReplicates: 2, admissionCases: [{ maxProbeCalls: 1 }],
+  });
+ const first = root.reservePrompt(phases.outer, { maxInputTokens: 1, maxSdkEstimatedCost: 0.1 });
+ root.settlePrompt(first, { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: 0.15, reportedEvents: 1, unknownEvents: 0, complete: true, costComplete: true });
+ assert.deepEqual(root.status(phases.protected).remaining, { sdkEstimatedCost: 0.1 });
+ const second = root.reservePrompt(phases.protected, { maxInputTokens: 1, maxSdkEstimatedCost: 0.1 });
+ root.settlePrompt(second, { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: 0.1, reportedEvents: 1, unknownEvents: 0, complete: true, costComplete: true });
+ assert.equal(root.status().committed.sdkEstimatedCost, 0.25);
+ assert.equal(root.status().settlement, "settled");
+ assert.throws(() => root.reserveObservedTurn(phases.branches[0]!.old), /monetary budget exhausted/);
 });
 
 test("meta search freezes alternating settled no-winner arms before G and permits only measured efficiency", async (t) => {
@@ -146,7 +162,7 @@ test("meta search freezes alternating settled no-winner arms before G and permit
  const { runMetaImprovementAdmission } = await import("../../src/improvement/meta-eval.ts");
  const dir = await mkdtemp(path.join(os.tmpdir(), "meta-review-")); t.after(() => rm(dir, { recursive: true, force: true }));
  const budget = new SharedBudget("meta-review", { ...limits, maxProviderCalls: 100 });
- const armLimits = { ...limits, maxProviderCalls: 2, maxInputTokens: 2000, maxOutputTokens: 200, maxSdkEstimatedCost: 0.1, maxProbeCalls: 2, maxCpuMillis: 1000, maxWallMillis: 60_000 };
+ const armLimits = { ...limits, maxProviderCalls: 2, maxInputTokens: 2000, maxSdkEstimatedCost: 0.1, maxProbeCalls: 2, maxCpuMillis: 1000, maxWallMillis: 60_000 };
  const branchLeases = Array.from({ length: 2 }, () => ({ old: budget.createLease(budget.root, armLimits), new: budget.createLease(budget.root, armLimits) }));
  const protectedLease = budget.createLease(budget.root, { ...limits, maxProviderCalls: 20 });
  const events: string[] = [];
@@ -162,7 +178,7 @@ test("meta search freezes alternating settled no-winner arms before G and permit
   protocol: "efficiency", searchReplicates: 2, outcomeReplicates: 2, runner, researchModel: "fake/research", persistDir: dir, timeoutMs: 10_000,
   produceSuccessor: async (id, lease, _cases, index, arm) => {
    events.push(`search-${index}-${arm}`);
-   const reservation = budget.reservePrompt(lease, { maxInputTokens: 1000, maxOutputTokens: 100, maxSdkEstimatedCost: 0.1 });
+   const reservation = budget.reservePrompt(lease, { maxInputTokens: 1000, maxSdkEstimatedCost: 0.1 });
    budget.settlePrompt(reservation, { input: 10, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 20, cost: arm === "old" ? 0.02 : 0.01, reportedEvents: 1, unknownEvents: 0, complete: true, costComplete: true });
    return { improverVersionId: id, startingExecutorVersionId: "H0", decisionCount: 1, status: "no-winner" };
   },

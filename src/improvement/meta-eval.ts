@@ -38,14 +38,14 @@ export async function runMetaImprovementAdmission(args: {
  budget: SharedBudget; branchLeases: Array<{ old: BudgetLease; new: BudgetLease }>; protectedLease: BudgetLease;
  protocol: "quality" | "efficiency"; searchReplicates: number; outcomeReplicates: number;
  produceSuccessor: (improverVersionId: string, lease: BudgetLease, caseSet: CpuCaseSetV1, replicateIndex: number, arm: "old" | "new") => Promise<ProducedSuccessorV1>;
- runner: SessionRunner; researchModel: string; persistDir: string; timeoutMs: number;
+ runner: SessionRunner; researchModel: string; persistDir: string; timeoutMs?: number;
  persistSelection: (replicates: Array<{ old: ProducedSuccessorV1; new: ProducedSuccessorV1 }>) => Promise<string>;
  persistObservation: (record: { start: ExperimentStart; action: ScientificAction; feedback: DevelopmentFeedback }) => Promise<ArtifactRef>;
  beforeModelRequest?: (versionId: string) => Promise<void>;
 }): Promise<MetaImprovementResultV1> {
  const result: MetaImprovementResultV1 = { version: 1, experimentKind: "meta-improvement", protocol: args.protocol, status: "inconclusive", reason: "not evaluated", oldImproverVersionId: args.oldImproverVersionId, newImproverVersionId: args.newImproverVersionId,
   initialExecutorVersionId: args.initialExecutor.versionId, knowledgeSnapshot: args.knowledgeSnapshot, replicates: [], protectedQueriedAfterBothSelections: false, budgetSettlement: "settled" };
- const withinBudget = (lease?: BudgetLease, mustBeClosed = false) => { const status = args.budget.status(lease); return status.settlement === "settled" && status.remaining.wallMillis > 0 && (!mustBeClosed || status.lifecycle === "closed"); };
+ const withinBudget = (lease?: BudgetLease, mustBeClosed = false) => { const status = args.budget.status(lease); return status.settlement === "settled" && (!mustBeClosed || status.lifecycle === "closed"); };
  const settled = () => withinBudget() && withinBudget(args.protectedLease) && args.branchLeases.every((pair) => withinBudget(pair.old, true) && withinBudget(pair.new, true));
  const updateSettlement = () => { result.budgetSettlement = args.budget.status().settlement; return settled(); };
  if (args.developmentCaseSet.split !== "development" || args.admissionCaseSet.split !== "admission") { result.reason = "development/admission split mismatch"; return result; }

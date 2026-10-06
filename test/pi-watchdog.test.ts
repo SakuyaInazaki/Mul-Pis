@@ -32,3 +32,14 @@ test("main agent stall watchdog aborts a top-level stream with no progress", asy
   assert.equal(aborted, 1);
   await handler("session_shutdown")({ type: "session_shutdown", reason: "quit" }, ctx);
 });
+
+test("main agent has no implicit inactivity abort", async () => {
+  const service = new ResearchService({ defaultWorkspace: process.cwd() });
+  const { handlers } = capture(service, { mainAgentStallCheckMs: 5 });
+  let aborted = 0;
+  const ctx: any = { cwd: process.cwd(), isIdle: () => false, abort: () => { aborted += 1; } };
+  await handlers.get("agent_start")![0]({ type: "agent_start" }, ctx);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(aborted, 0);
+  await handlers.get("session_shutdown")![0]({ type: "session_shutdown", reason: "quit" }, ctx);
+});

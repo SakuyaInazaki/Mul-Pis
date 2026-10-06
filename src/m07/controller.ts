@@ -24,7 +24,7 @@ import type { KnowledgeRef, KnowledgeStore } from "../knowledge/types.ts";
 import { GenerationStore, isM07WorkflowStrategy } from "../improvement/generation.ts";
 import { probeProcessIdentity, readCurrentProcessIdentity, type ProcessIdentityV1 } from "../runtime/process-identity.ts";
 import { parseRunDescriptor, type RunDescriptorV1 } from "../runtime/run-descriptor.ts";
-import { parseRoundReview, promptBeforeDeadline, TaskDeadlineError } from "./execution-loop.ts";
+import { parseRoundReview } from "./execution-loop.ts";
 import { openBoundedSession, type EvidenceBindingV1 } from "../context/boundary.ts";
 
 const STATE = "goal.json";
@@ -84,15 +84,36 @@ function inside(root: string, candidate: string): boolean {
 	return candidate === root || candidate.startsWith(`${root}${path.sep}`);
 }
 
-async function snapshotRoundForReviewer(workDir: string, destination: string): Promise<void> {
-	let files = 0, bytes = 0;
+async function snapshotRoundForReviewer(workDir: string, destination: string): Promise<number> {
+	let bytes = 0;
 	await cp(workDir, destination, { recursive: true, filter: async (source) => {
 		const info = await lstat(source);
 		if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) throw new HarnessError("m07.loop-snapshot", "round snapshot contains a symlink or special file");
-		if (info.isFile()) { files++; bytes += info.size; }
-		if (files > 1_000 || bytes > 64_000_000) throw new HarnessError("m07.loop-snapshot", "round snapshot exceeds 1,000 files or 64 MB");
+		if (info.isFile()) bytes += info.size;
+		if (bytes > 64_000_000) throw new HarnessError("m07.loop-snapshot", "round snapshot exceeds 64 MB");
 		return true;
 	} });
+	return bytes;
+}
+
+/** Preserve a long builder report as exact, readable UTF-8 segments in the reviewer's frozen grant. */
+async function freezeBuilderReportForReviewer(report: string, reviewerRoot: string, snapshotBytes: number): Promise<string> {
+	const reportBytes = Buffer.byteLength(report, "utf8");
+	if (snapshotBytes + reportBytes > 64_000_000) throw new HarnessError("m07.loop-snapshot", "reviewer snapshot including full builder report exceeds 64 MB");
+	const folder = `.m07-builder-report-${randomUUID()}`;
+	const reportDir = path.join(reviewerRoot, folder);
+	await mkdir(reportDir);
+	const segments: string[] = [];
+	let current = "", currentBytes = 0;
+	for (const character of report) {
+		const size = Buffer.byteLength(character, "utf8");
+		if (currentBytes + size > 8_000 && current) { segments.push(current); current = ""; currentBytes = 0; }
+		current += character; currentBytes += size;
+	}
+	if (current) segments.push(current);
+	for (const [index, segment] of segments.entries())
+		await writeFileAtomic(path.join(reportDir, `part-${String(index + 1).padStart(6, "0")}.txt`), segment);
+	return `The complete builder report (${reportBytes} UTF-8 bytes) is frozen, without inserted or omitted characters, into ${segments.length} ordered files ${folder}/part-000001.txt through ${folder}/part-${String(segments.length).padStart(6, "0")}.txt so material_read can access even a very long line. Read every part (and use offset/limit within a part if needed) before deciding; concatenating the parts without separators reconstructs the original. If you cannot inspect all relevant content, return blocked and explain what was unread. A file path alone is not evidence of having read it.`;
 }
 
 interface BranchManifestV1 {
@@ -134,7 +155,7 @@ async function freezeBranchWork(goal: CurrentGoal, task: M07TaskRecord): Promise
 			totalBytes += info.size;
 			files.push({ relativePath: relative, historicalPath: path.join(sourceRoot, relative), frozenPath: path.join(workSnapshotRoot, relative), bytes: info.size });
 		}
-		if (files.length > 1_000 || totalBytes > 64_000_000) throw new HarnessError("m07.branch-evidence", "branch evidence exceeds 1,000 files or 64 MB");
+		if (totalBytes > 64_000_000) throw new HarnessError("m07.branch-evidence", "branch evidence exceeds 64 MB");
 		return true;
 	} });
 	const manifestPath = path.join(root, "manifest.json");
@@ -463,7 +484,9 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string,
 		section("待检查事项", task.checks.map((x) => `- ${x}`).join("\n") || "无"),
 	];
 	if (knowledgePack) boundary.push(section("本任务局部知识包", knowledgePack));
-	if (task.executionLoop) boundary.push(section("有界执行返工", `本任务显式允许最多 ${task.executionLoop.maxRounds} 轮同一候选局部修补，绝对截止 ${task.executionLoop.deadlineAt}。每轮后由全新只读 reviewer 给出反馈；只有控制器可决定是否再次提示。不得扩大任务义务、替换指南或假称 reviewer 的 ready 是最终采用。`));
+	if (task.executionLoop) boundary.push(section("执行返工", "mode" in task.executionLoop ?
+		"同一候选可持续局部修补，直至 reviewer 给出终态判断或发生真实阻断；每轮由全新只读 reviewer 反馈。不得扩大任务义务、替换指南或假称 reviewer 的 ready 是最终采用。" :
+		`历史记录中的轮数 ${task.executionLoop.maxRounds} 和截止时间 ${task.executionLoop.deadlineAt} 仅供审计，不是当前执行限制。同一候选可持续局部修补，直至 reviewer 给出终态判断或发生真实阻断；每轮后由全新只读 reviewer 给出反馈；只有控制器可决定是否再次提示。不得扩大任务义务、替换指南或假称 reviewer 的 ready 是最终采用。`));
 	if (task.lessonDeltaOutput) boundary.push(section("候选经验回流", `将本轮候选经验写入 ${task.lessonDeltaOutput}，JSON 格式为 {"version":1,"action":"none|propose|amend|contradict","observation":"...","hypothesis":"...","applicability":"...","evidencePaths":["本任务 work 内相对路径"]}。none 合法；不确定因果写为假设。仅修正本任务尚未入库的候选时仍用 propose；amend 或 contradict 只用于修订/反驳已存在且已固定身份的知识记录，必须加 "priorRef":{"storeId":"...","recordId":"...","version":1}，不得猜测 ID。此文件是待 M04 处理的候选，不能自称已采纳知识。`));
 	if (task.mode === "execute") boundary.push(section("外部执行与可消耗资源", `本任务控制操作 ID：${operationId ?? "旧目标无操作登记"}。若执行有真实副作用的远端动作，保存实际参数、外部请求/结果 ID、响应和可用的查询方法；在响应丢失后先查询，不能仅凭超时重发。任务级 ID 是恢复索引，只有远端明确支持时才能作为幂等键，不能声称 exactly-once。\n\n如任务涉及真实提交、评测、远程实验或其他可能消耗配额/费用/机会的动作：先用已提供的只读能力或额度接口核对接入和当前状态，并先做本地可完成的语法、类型、编译与兼容性预检。这不禁止任务已授权的真实实验，已授权平台评测/实验产生的结果属于本任务实测证据。每次真实动作都要记录实际结果和资源消耗；失败若仍消耗了资源，同样记录已消耗量、可见剩余量与恢复条件。平台配额不明时如实记录未知，不猜测统一配额。本地命令或客户端成功退出不等于远程实验通过。显式输入和原问题允许使用；若需取得新的外部研究参考资料并用于推理，将具体缺口报回主会话走 M05/M06→M04，不在 execute 任务里通过 bash 另造获取和采用链。`));
 	boundary.push("会话返回只表示任务已返回，不表示成果被主 Agent 接受。请如实列出实际动作、产物、失败、未执行项和限制。");
@@ -829,7 +852,17 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				await verifyFrozenWorkflowMethod(ctx, goal, options.registeredExperienceStores, spec);
 			const policy = frozenPolicy(goal);
 			await requireCurrentFormalBaseline(ctx, goal);
-			spec = { ...spec, objective: spec.objective.trim(), inputs: normalizedUnique(spec.inputs, "task input"), expectedOutputs: normalizedUnique(spec.expectedOutputs, "expected output"), checks: normalizedUnique(spec.checks, "task check") };
+			if (spec.executionLoop !== undefined) {
+				const loop = spec.executionLoop as unknown;
+				if (!loop || typeof loop !== "object" || Array.isArray(loop)) throw new HarnessError("m07.loop", "invalid execution-loop policy");
+				const fields = loop as Record<string, unknown>;
+				if (fields.mode === "until-ready" ? Object.keys(fields).length !== 1 :
+					Object.keys(fields).length !== 2 || !Number.isSafeInteger(fields.maxRounds) || Number(fields.maxRounds) < 1 ||
+					typeof fields.deadlineAt !== "string" || !Number.isFinite(Date.parse(fields.deadlineAt)))
+					throw new HarnessError("m07.loop", "invalid execution-loop policy");
+			}
+			spec = { ...spec, objective: spec.objective.trim(), inputs: normalizedUnique(spec.inputs, "task input"), expectedOutputs: normalizedUnique(spec.expectedOutputs, "expected output"), checks: normalizedUnique(spec.checks, "task check"),
+				executionLoop: spec.executionLoop ? { mode: "until-ready" } : undefined };
 			let branchParent: M07TaskRecord | undefined;
 			let branchManifest: BranchManifestV1 | undefined;
 			if (spec.context) {
@@ -839,7 +872,6 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				branchParent = goal.tasks.find((item) => item.taskId === reference.parentTaskId);
 				if (!branchParent || branchParent.mode !== "execute" || branchParent.context || !["returned", "accepted", "rejected"].includes(branchParent.status) || !branchParent.branchSource || branchParent.branchSource.checkpoint.id !== reference.checkpointId) throw new HarnessError("m07.branch", "parent is not a settled, frozen execute task at the requested checkpoint");
 				if (branchParent.branchSource.checkpoint.runId !== runId || branchParent.branchSource.checkpoint.taskId !== branchParent.taskId || branchParent.branchSource.checkpoint.inputManifest !== branchParent.branchSource.manifestPath) throw new HarnessError("m07.branch", "checkpoint receipt does not bind this run, task, and evidence manifest");
-				if (goal.tasks.filter((item) => item.context?.parentTaskId === reference.parentTaskId).length >= 4) throw new HarnessError("m07.branch", "one checkpoint supports at most four bounded candidates");
 				if (goal.branchSelections?.some((item) => item.parentTaskId === reference.parentTaskId)) throw new HarnessError("m07.branch", "branch selection is frozen; no later candidate may join this comparison");
 				if (spec.mode !== "execute" || spec.objective !== branchParent.objective || !sameStrings(spec.checks, branchParent.checks) || !sameStrings(spec.expectedOutputs, branchParent.expectedOutputs) || Boolean(spec.requireIndependentCheck) !== Boolean(branchParent.requireIndependentCheck) || !sameStrings(spec.inputs, branchParent.inputs) || (spec.parentTaskId && spec.parentTaskId !== branchParent.taskId) || (spec.supersedesTaskId && spec.supersedesTaskId !== branchParent.taskId)) throw new HarnessError("m07.branch", "fork candidates must retain the parent's objective, inputs, outputs, checks, execute mode, and independent-check obligation");
 				branchManifest = await loadBranchManifest(branchParent.branchSource, runId, branchParent.taskId);
@@ -860,13 +892,14 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				if (spec.planInput !== undefined) spec.planInput = frozenInputSource(spec.planInput);
 				if (spec.resourceInputs !== undefined) spec.resourceInputs = spec.resourceInputs.map((item) =>
 					({ ...item, input: frozenInputSource(item.input) }));
-				if (JSON.stringify(spec.knowledgeIds ?? []) !== JSON.stringify(branchParent.knowledgeIds ?? []) || JSON.stringify(spec.experienceRefs ?? []) !== JSON.stringify(branchParent.experienceRefs ?? []) || JSON.stringify(spec.experienceContextRefs ?? []) !== JSON.stringify(branchParent.experienceContextRefs ?? []) || JSON.stringify(spec.experienceTags ?? []) !== JSON.stringify(branchParent.experienceTags ?? []) || JSON.stringify(spec.resourceInputs ?? []) !== JSON.stringify(branchParent.resourceInputs ?? []) || spec.planInput !== branchParent.planInput || spec.lessonDeltaOutput !== branchParent.lessonDeltaOutput || Boolean(spec.executionLoop) !== Boolean(branchParent.executionLoop) || (spec.executionLoop && spec.executionLoop.maxRounds !== branchParent.executionLoop?.maxRounds)) throw new HarnessError("m07.branch", "fork cannot silently change frozen knowledge applicability, plan, resources, lesson output, or review-loop obligations");
+				if (JSON.stringify(spec.knowledgeIds ?? []) !== JSON.stringify(branchParent.knowledgeIds ?? []) || JSON.stringify(spec.experienceRefs ?? []) !== JSON.stringify(branchParent.experienceRefs ?? []) || JSON.stringify(spec.experienceContextRefs ?? []) !== JSON.stringify(branchParent.experienceContextRefs ?? []) || JSON.stringify(spec.experienceTags ?? []) !== JSON.stringify(branchParent.experienceTags ?? []) || JSON.stringify(spec.resourceInputs ?? []) !== JSON.stringify(branchParent.resourceInputs ?? []) || spec.planInput !== branchParent.planInput || spec.lessonDeltaOutput !== branchParent.lessonDeltaOutput || Boolean(spec.executionLoop) !== Boolean(branchParent.executionLoop)) throw new HarnessError("m07.branch", "fork cannot silently change frozen knowledge applicability, plan, resources, lesson output, or review-loop obligations");
 				if (branchParent.knowledgeSnapshot !== goal.knowledgeSnapshot || branchParent.m04BaselineRunId !== goal.m04BaselineRunId) throw new HarnessError("m07.branch", "goal baseline changed since the source task; establish a new task rather than fork old authority");
 				if (branchManifest.knowledgeSnapshot !== goal.knowledgeSnapshot || branchManifest.m04BaselineRunId !== goal.m04BaselineRunId || branchManifest.problemSourcePath !== goal.problemSnapshotPath) throw new HarnessError("m07.branch", "frozen source manifest no longer matches the goal's inputs and formal baseline");
 				spec = { ...spec, parentTaskId: branchParent.taskId, supersedesTaskId: branchParent.taskId };
 			}
 			if (spec.executionLoop) {
-				if (spec.mode !== "execute" || !Number.isInteger(spec.executionLoop.maxRounds) || spec.executionLoop.maxRounds < 1 || spec.executionLoop.maxRounds > 8 || !Number.isFinite(Date.parse(spec.executionLoop.deadlineAt)) || Date.parse(spec.executionLoop.deadlineAt) <= Date.now()) throw new HarnessError("m07.loop", "executionLoop requires execute mode, 1–8 rounds, and a future absolute deadline");
+				if (spec.mode !== "execute" || !("mode" in spec.executionLoop) || spec.executionLoop.mode !== "until-ready")
+					throw new HarnessError("m07.loop", "new executionLoop requires execute mode and until-ready policy");
 			}
 			if (spec.lessonDeltaOutput && (spec.mode !== "execute" || !spec.expectedOutputs.includes(spec.lessonDeltaOutput))) throw new HarnessError("m07.lesson-delta", "lessonDeltaOutput must be an exact expected output of an execute task");
 			for (const expectedOutput of spec.expectedOutputs) {
@@ -980,21 +1013,19 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				}
 				task.session = handle.ref; await save(ctx, goal);
 				if (spec.executionLoop) {
-					const deadlineMs = Date.parse(spec.executionLoop.deadlineAt);
 					const transcript: string[] = [];
 					task.executionRounds = [];
 					let nextMessage = message;
-					for (let index = 1; index <= spec.executionLoop.maxRounds; index++) {
+					for (let index = 1; ; index++) {
+						if (!Number.isSafeInteger(index)) throw new HarnessError("m07.loop", "round identity overflow");
 						const currentOperation: M07OperationV1 = index === 1 ? operation! : { version: 1, id: `O${String(goal.executionState!.operations.length + 1).padStart(3, "0")}`, taskId: id, status: "prepared", issuedAt: nowIso() };
 						activeOperation = currentOperation;
 						if (index > 1) { goal.executionState!.operations.push(currentOperation); await save(ctx, goal); }
-						if (Date.now() >= deadlineMs) { currentOperation.status = "not-issued"; task.loopStopReason = "deadline"; break; }
 						await verifyDispatchKnowledge();
-						if (Date.now() >= deadlineMs) { currentOperation.status = "not-issued"; task.loopStopReason = "deadline"; break; }
 						if (index === 1) { event.deliveryStatus = "submitted"; event.providerUsageSessionId = handle.ref.id; await writeProjectionEvent(ctx.ws, event); }
 						currentOperation.status = "issued"; await save(ctx, goal);
 						promptIssued = true;
-						const report = await promptBeforeDeadline(handle, nextMessage, deadlineMs);
+						const report = (await handle.prompt(nextMessage)).text;
 						currentOperation.status = "response-received";
 						await verifyFrozenInputs();
 						if (task.experienceSelection) task.experienceSelection.loadedAt = nowIso();
@@ -1004,13 +1035,15 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 						task.executionRounds.push(round);
 						transcript.push(`## Round ${index} builder\n\n${report}`);
 						await save(ctx, goal);
-						if (Date.now() >= deadlineMs) { task.loopStopReason = "deadline"; break; }
-						if (report.length > 16_000) { task.loopStopReason = "reviewer-invalid"; break; }
 						const reviewerRoot = path.join(dir, `round-${index}-snapshot`);
-						await snapshotRoundForReviewer(workDir, reviewerRoot);
+						const reviewerSnapshotBytes = await snapshotRoundForReviewer(workDir, reviewerRoot);
 						round.reviewerSnapshotPath = reviewerRoot;
-						const reviewerPrompt = `Review only this M07 task round and the copied work-directory snapshot. Goal: ${goal.goal}\nProblem relation: ${goal.problemRelation}\nFrozen goal constraints: ${goal.constraints.join("; ")}\nFrozen success criteria: ${goal.successCriteria.join("; ")}\nGoal plan at task creation: ${goal.plan}\nTask objective: ${spec.objective}\nChecks: ${spec.checks.join("; ")}\nExpected outputs: ${spec.expectedOutputs.join("; ")}\nFrozen plan input: ${task.planCopy ? path.relative(workDir, task.planCopy) : "none"}\nThe builder report follows. Inspect the copied files only as needed. Reply with only JSON {"verdict":"ready|revise|replan|blocked","feedback":"specific evidence-grounded reason"}, without extra prose or code fences. Escape paragraph breaks inside the feedback JSON string as \\n, never raw line breaks inside quotes. The entire JSON response must be at most 512,000 UTF-8 bytes. Keep feedback preferably within 2,000 characters: identify decisive checked files, measurements, failures and limitations rather than reproducing the builder report. Do not omit a decisive caveat just to meet that target; use blocked if a material uncertainty remains. ready only means ready for the controller's separate final review. Do not change the plan or task obligations.\n\n${report}`;
-						if (reviewerPrompt.length + systemPromptFor("reviewer").length > policy.maxPromptChars) { task.loopStopReason = "reviewer-invalid"; break; }
+						let reviewerPrompt = `Review only this M07 task round and the copied work-directory snapshot. Goal: ${goal.goal}\nProblem relation: ${goal.problemRelation}\nFrozen goal constraints: ${goal.constraints.join("; ")}\nFrozen success criteria: ${goal.successCriteria.join("; ")}\nGoal plan at task creation: ${goal.plan}\nTask objective: ${spec.objective}\nChecks: ${spec.checks.join("; ")}\nExpected outputs: ${spec.expectedOutputs.join("; ")}\nFrozen plan input: ${task.planCopy ? path.relative(workDir, task.planCopy) : "none"}\nThe builder report follows. Inspect the copied files only as needed. Reply with only JSON {"verdict":"ready|revise|replan|blocked","feedback":"specific evidence-grounded reason"}, without extra prose or code fences. Escape paragraph breaks inside the feedback JSON string as \\n, never raw line breaks inside quotes. Identify decisive checked files, measurements, failures and limitations. Use blocked if a material uncertainty remains. ready only means ready for the controller's separate final review. Do not change the plan or task obligations.\n\n${report}`;
+						if (reviewerPrompt.length + systemPromptFor("reviewer").length > policy.maxPromptChars) {
+							const handoff = await freezeBuilderReportForReviewer(report, reviewerRoot, reviewerSnapshotBytes);
+							reviewerPrompt = reviewerPrompt.slice(0, reviewerPrompt.length - report.length) + handoff;
+						}
+						if (reviewerPrompt.length + systemPromptFor("reviewer").length > policy.maxPromptChars) throw new HarnessError("context.budget", "reviewer control input exceeds the frozen prompt handoff size");
 						const reviewerSpec = sessionSpec(ctx, `M07-${id}-round-${index}-reviewer`, "reviewer", systemPromptFor("reviewer"), { kind: "read-dir", root: reviewerRoot });
 						if (goal.methodBinding) reviewerSpec.methodBinding = goal.methodBinding;
 						const reviewRunRecord = await ctx.ws.readRun("M07", runId);
@@ -1020,8 +1053,10 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 						let rawReview: string;
 						try {
 							await verifyDispatchKnowledge();
-							rawReview = await promptBeforeDeadline(reviewer, reviewerPrompt, deadlineMs);
+							rawReview = (await reviewer.prompt(reviewerPrompt)).text;
 						} finally { task.toolLog.push(...reviewer.toolLog().map((entry) => ({ ...entry, reviewerSessionId: reviewer.ref.id }))); reviewer.dispose(); }
+						if (Buffer.byteLength(rawReview, "utf8") > 512_000)
+							throw new HarnessError("m07.file-size", "reviewer report file exceeds 512,000 UTF-8 bytes");
 						const reviewerReportPath = path.join(dir, `round-${index}-reviewer.md`);
 						await writeFileAtomic(reviewerReportPath, rawReview);
 						round.reviewerReportPath = reviewerReportPath;
@@ -1031,16 +1066,12 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 						round.verdict = verdict.verdict; round.feedback = verdict.feedback;
 						transcript.push(`## Round ${index} reviewer\n\n${rawReview}`);
 						await save(ctx, goal);
-						if (Date.now() >= deadlineMs) { task.loopStopReason = "deadline"; break; }
 						if (verdict.verdict === "ready" || verdict.verdict === "replan" || verdict.verdict === "blocked") { task.loopStopReason = verdict.verdict; break; }
-						if (index === spec.executionLoop.maxRounds) { task.loopStopReason = "max-rounds"; break; }
 						nextMessage = `Continue only the same frozen task and plan. Fresh reviewer feedback from round ${index}: ${verdict.feedback}\nDo a bounded local repair, report concrete changes and verification. Do not expand scope or silently restart an external action whose outcome is unknown.`;
 					}
 					const reportPath = path.join(dir, "report.md");
-					if (Date.now() >= deadlineMs) task.loopStopReason = "deadline";
-					const renderReport = () => `# M07 bounded execution\n\nStop: ${task.loopStopReason ?? "deadline"}\n\n${transcript.join("\n\n")}\n`;
+					const renderReport = () => `# M07 execution\n\nStop: ${task.loopStopReason ?? "incomplete"}\n\n${transcript.join("\n\n")}\n`;
 					await writeFileAtomic(reportPath, renderReport());
-					if (Date.now() >= deadlineMs && task.loopStopReason !== "deadline") { task.loopStopReason = "deadline"; await writeFileAtomic(reportPath, renderReport()); }
 					task.reportPath = reportPath; task.status = "returned";
 				} else {
 					await verifyDispatchKnowledge();
@@ -1052,7 +1083,6 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				}
 			} catch (error) {
 				task.status = "failed"; task.executionFailure = (error as Error).message;
-				if (error instanceof TaskDeadlineError) task.loopStopReason = "deadline";
 				if (activeOperation?.status === "prepared") activeOperation.status = "not-issued";
 				if (activeOperation && promptIssued && activeOperation.status === "issued") {
 					const notIssued = localNotIssuedDetails(error);
@@ -1208,7 +1238,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 					const deltaSource = await realpath(path.join(task.workDir, task.lessonDeltaOutput));
 					if (!inside(await realpath(task.workDir), deltaSource)) throw new Error("candidate delta escaped task work directory");
 					const bytes = await readFile(deltaSource);
-					if (bytes.length > 16_000) throw new Error("candidate delta exceeds 16,000 bytes");
+							if (bytes.length > 16_000) throw new Error("candidate lesson-delta.json file exceeds 16,000 bytes");
 					const delta = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
 					if (delta.version !== 1 || !["none", "propose", "amend", "contradict"].includes(String(delta.action)) || !Array.isArray(delta.evidencePaths) || delta.evidencePaths.length > 20 || delta.evidencePaths.some((item) => typeof item !== "string" || !isSafeRelativeOutputPath(item))) throw new Error("candidate delta has invalid schema");
 					if (delta.action !== "none" && (typeof delta.observation !== "string" || !delta.observation.trim() || typeof delta.applicability !== "string" || !delta.applicability.trim() || delta.evidencePaths.length === 0)) throw new Error("candidate delta lacks observation, applicability, or evidence");
@@ -1242,7 +1272,6 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			if (goal.branchSelections?.some((item) => item.parentTaskId === parent.taskId)) throw new HarnessError("m07.branch", "branch selection has already been frozen");
 			if (input.selectedTaskId && !(input.selectedTaskId === parent.taskId && parent.status === "accepted") && !candidates.some((item) => item.taskId === input.selectedTaskId && item.status === "accepted")) throw new HarnessError("m07.branch", "selected source or branch must be an ordinarily reviewed and accepted candidate");
 			const rationale = nonempty(input.rationale, "branch selection rationale");
-			if (rationale.length > 2_000) throw new HarnessError("m07.branch", "branch selection rationale exceeds 2,000 characters");
 			const comparison = [parent, ...candidates].map((item) => ({ taskId: item.taskId, status: item.status, checks: item.review?.checks.map((check) => ({ criterion: check.criterion, result: check.result })) ?? [] }));
 			goal.branchSelections = [...(goal.branchSelections ?? []), { version: 1, parentTaskId: parent.taskId, ...(input.selectedTaskId ? { selectedTaskId: input.selectedTaskId } : {}), rationale, selectedAt: nowIso(), candidates: comparison }];
 			await save(ctx, goal); return goal;

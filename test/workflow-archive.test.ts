@@ -8,6 +8,23 @@ import { archivePrivateM07Task, loadPrivateM07Archive, recordPrivateM04Outcome, 
 import type { CurrentGoal, M07TaskRecord } from "../src/m07/types.ts";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 
+test("private archive retains ten actual reviewed rounds without a count ceiling", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-many-rounds-"));
+	try {
+		const workDir = path.join(root, "task", "work"), destination = path.join(root, "returned");
+		await mkdir(workDir, { recursive: true });
+		const task = { taskId: "T001", workDir, status: "returned", executionRounds:
+			Array.from({ length: 10 }, (_, index) => ({ index: index + 1, verdict: index === 9 ? "ready" : "revise",
+				feedback: `synthetic round ${index + 1}` })) } as M07TaskRecord;
+		const goal = { runId: "run-example", lifecycle: "active", tasks: [task] } as CurrentGoal;
+		const archived = await archivePrivateM07Task({ goal, task, destination });
+		assert.equal(archived.controllerEvidence.rounds.length, 10);
+		const loaded = await loadPrivateM07Archive(destination);
+		assert.equal(loaded.roundFiles[9].index, 10);
+		assert.equal(await readFile(path.join(destination, "round-10-reviewer-feedback.txt"), "utf8"), "synthetic round 10");
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("private M07 archive retains bounded artifacts and a pending lesson without adopting it", async () => {
 	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-test-"));
 	try {

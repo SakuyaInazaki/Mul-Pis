@@ -122,6 +122,16 @@ test("reviewed current source plus ancestor-bound quarantine cover exactly old a
 	assert.equal(result.actorThirdPartyMutations, "none");
 });
 
+test("restart chain parsing has no arbitrary sixty-four-entry stop", () => {
+	const f = fixture();
+	f.bundle["independent-restart-quarantine.json"] = JSON.stringify({ version: 1,
+		kind: "host-independent-restart-reservations",
+		entries: Array.from({ length: 65 }, () => ({ receipt: f.receipt, claim: f.claim })) });
+	assert.throws(() => reviewPrivateCampaignRestartEffects(f.input), error =>
+		error instanceof Error && !/invalid .* chain/.test(error.message),
+		"duplicate claims may fail semantic review, but count alone must not reject the chain");
+});
+
 test("unbranded bundle, unreviewed latest source, or missing ancestor proof fail closed", () => {
 	const unbranded = fixture();
 	unbranded.input.proof = { opaque: true };

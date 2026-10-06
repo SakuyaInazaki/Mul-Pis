@@ -172,7 +172,7 @@ export function createResearchExtension(options: ResearchExtensionOptions = {}) 
 			return new ImprovementService({ workspaceRoot, runner: createPiSessionRunner({ signal }) });
 		};
 
-const mainAgentStallTimeoutMs = options.mainAgentStallTimeoutMs ?? 10 * 60_000;
+const mainAgentStallTimeoutMs = options.mainAgentStallTimeoutMs ?? 0;
 const mainAgentStallCheckMs = options.mainAgentStallCheckMs ?? 1_000;
 let mainAgentWatchdog: NodeJS.Timeout | undefined;
 let mainAgentWatchdogCtx: ExtensionContext | undefined;
@@ -435,7 +435,7 @@ mainAgentWatchdog.unref?.();
 			label: "Bounded Research Method Improvement",
 			description: "Explicitly bootstrap, run, inspect, roll back, or manually transfer versioned H/I prompt strategies. Action run is the CPU method-research campaign; workflow-run explicitly runs the M07 evidence-handoff campaign. Neither is automatic or proof of scientific benefit.",
 			promptSnippet: "Run a caller-bounded H/I method-research campaign only when explicitly authorized",
-			promptGuidelines: ["Use caller-supplied method/plan files with exact provider-call, token and SDK-estimated-cost ceilings.", "Development feedback can guide candidates; protected admission results must not return to proposal prompts."],
+			promptGuidelines: ["Use caller-supplied method/plan files with one total SDK-estimated-cost ceiling. Keep required file-safety and scientific case bounds; do not divide the monetary ceiling among phases or arms.", "Development feedback can guide candidates; protected admission results must not return to proposal prompts."],
 			parameters: Type.Object({
 				action: Type.Union([Type.Literal("bootstrap"), Type.Literal("run"), Type.Literal("workflow-run"), Type.Literal("status"), Type.Literal("rollback"), Type.Literal("export"), Type.Literal("bind"), Type.Literal("advance-knowledge"), Type.Literal("transition-dependencies")]),
 				workspace: Type.Optional(Type.String()),
@@ -632,7 +632,7 @@ mainAgentWatchdog.unref?.();
 				workspace: Type.Optional(Type.String()), runId: Type.String(), objective: Type.String(), inputs: Type.Array(Type.String()), expectedOutputs: Type.Array(Type.String({ description: "Exact work-dir-relative output path; put explanations in objective or report.md" })), checks: Type.Array(Type.String()), mode: Type.Union([Type.Literal("execute"), Type.Literal("check"), Type.Literal("reason")]), parentTaskId: Type.Optional(Type.String()), supersedesTaskId: Type.Optional(Type.String()), requireIndependentCheck: Type.Optional(Type.Boolean()), knowledgeIds: Type.Optional(Type.Array(Type.String())),
 				planInput: Type.Optional(Type.String({ description: "Exact relative input path containing the approved plan for this task" })),
 				resourceInputs: Type.Optional(Type.Array(Type.Object({ id: Type.String(), version: Type.String(), input: Type.String() }))),
-				executionLoop: Type.Optional(Type.Object({ maxRounds: Type.Integer(), deadlineAt: Type.String() })),
+				executionLoop: Type.Optional(Type.Object({ mode: Type.Literal("until-ready") })),
 				lessonDeltaOutput: Type.Optional(Type.String({ description: "Exact relative output path for the task's lesson delta" })),
 				experienceRefs: Type.Optional(Type.Array(Type.Object({ storeId: Type.String(), recordId: Type.String(), version: Type.Integer() }))),
 				experienceContextRefs: Type.Optional(Type.Array(Type.Object({ storeId: Type.String(), recordId: Type.String(), version: Type.Integer() }))),

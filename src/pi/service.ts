@@ -123,8 +123,8 @@ class ProgressRunner implements SessionRunner {
 		report: (progress: ResearchProgress) => void,
 		stage: ResearchStage,
 		heartbeatMs = 15_000,
-		promptTimeoutMs = 60 * 60_000,
-		stallTimeoutMs = 10 * 60_000,
+		promptTimeoutMs = 0,
+		stallTimeoutMs = 0,
 		stallCheckMs = 30_000,
 		now: () => number = Date.now,
 		pauseMs: (now: number) => number = readTrustedPauseMs,
@@ -313,7 +313,6 @@ export class ResearchService {
 		return this.withMutation(root, async () => {
 			const retryGuard = new RetryGuard(root);
 			const fingerprint = stageFingerprint(request, await stageInputVersion(root, request));
-			await retryGuard.assertAllowed(fingerprint);
 			const ctx = await this.stageContext(root, request.stage, signal);
 			let result: unknown;
 			try { switch (request.stage) {
@@ -568,8 +567,8 @@ export class ResearchService {
 		if (!existsSync(ws.configFile)) throw new HarnessError("config.missing", `缺少 ${ws.configFile}；请明确配置各角色模型`);
 		const store = createFileKnowledgeStore(ws.knowledgeDir);
 		const base = this.options.runnerFactory?.(signal) ?? createPiSessionRunner({ signal });
-		const runner = new ProgressRunner(base, (progress) => this.options.onProgress?.(progress), stage, this.options.progressIntervalMs ?? 15_000, this.options.promptTimeoutMs ?? 60 * 60_000, this.options.stallTimeoutMs ?? 10 * 60_000, this.options.stallCheckMs ?? 30_000, this.options.watchdogNow ?? Date.now, this.options.trustedPauseMs ?? readTrustedPauseMs, this.options.watchdogTimers);
-		return { ws, store, runner, config: await ws.loadConfig() };
+		const runner = new ProgressRunner(base, (progress) => this.options.onProgress?.(progress), stage, this.options.progressIntervalMs ?? 15_000, this.options.promptTimeoutMs ?? 0, this.options.stallTimeoutMs ?? 0, this.options.stallCheckMs ?? 30_000, this.options.watchdogNow ?? Date.now, this.options.trustedPauseMs ?? readTrustedPauseMs, this.options.watchdogTimers);
+		return { ws, store, runner, config: await ws.loadConfig(), signal };
 	}
 
 	private async withMutation<T>(root: string, operation: () => Promise<T>, stage?: ResearchStage): Promise<T> {

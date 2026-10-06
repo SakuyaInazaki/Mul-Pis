@@ -30,7 +30,6 @@ export function buildMetaEpisode(run: ResearchRunV1, workspaceRoot: string, targ
  for (const item of outerCandidates) for (const id of item.developmentEvidence) visible.add(id);
  for (const item of run.feedback) if (item.id.startsWith("outer-initial-")) visible.add(item.id);
  const feedback = run.feedback.filter((f) => visible.has(f.id));
- if (outer.length > 30 || outerCandidates.length > 10 || feedback.length > 1_000) throw new HarnessError("improvement.meta-episode", "development episode exceeds bounded control index");
  const budget = run.developmentBudgetAtSelection as { committed?: { providerCalls?: number; inputTokens?: number; outputTokens?: number; sdkEstimatedCost?: number }; settlement?: string } | undefined;
  return { version: 1, id: `meta:${run.runId}`, runId: run.runId, workspaceRoot: path.resolve(workspaceRoot), createdAt: new Date().toISOString(), phase: "development", target,
   current: { bundleId: run.frozenBundle.bundleId, executorVersionId: run.frozenBundle.executorVersionId, improverVersionId: run.frozenBundle.improverVersionId,
@@ -52,7 +51,7 @@ export async function loadMetaEpisode(researchRoot: string, workspaceRoot: strin
  if ((await stat(file)).size > 120_000) throw new HarnessError("improvement.meta-episode", "development episode exceeds fixed size");
  const value = JSON.parse(await readFile(file, "utf8")) as MetaEpisodeV1;
  if (value.version !== 1 || value.phase !== "development" || value.runId !== runId || value.id !== `meta:${runId}` || value.workspaceRoot !== path.resolve(workspaceRoot) ||
-  !Array.isArray(value.decisions) || value.decisions.length > 30 || !Array.isArray(value.candidates) || value.candidates.length > 10 || !Array.isArray(value.feedbackIndex) || value.feedbackIndex.length > 1_000 ||
+  !Array.isArray(value.decisions) || !Array.isArray(value.candidates) || !Array.isArray(value.feedbackIndex) ||
   !Array.isArray(value.feedbackExcerpt) || value.feedbackExcerpt.length > 40 || value.feedbackTotal !== value.feedbackIndex.length || value.feedbackExcerptCount !== value.feedbackExcerpt.length ||
   !["selected", "no-winner", "inconclusive"].includes(value.terminal) || !value.usage || value.usage.costSource !== "sdk-estimate") throw new HarnessError("improvement.meta-episode", "cross-workspace or malformed development episode");
  const runFile = path.join(researchRoot, "runs", runId, "run.json");

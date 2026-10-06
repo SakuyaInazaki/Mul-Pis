@@ -1,0 +1,9 @@
+# Remove cumulative inspection readback quota
+
+The CPU method-research and M07 evidence-handoff improver paths previously subtracted every returned inspect character from a campaign-wide `maxReadbackChars` allowance. This could block further inspection even when each requested range and its registered material remained individually valid. New runs accept but discard the legacy plan field and do not expose a remaining-readback allowance in model decision views. The CPU fixed decision prompt no longer advertises it.
+
+Individual inspect requests remain bounded to 4,000 characters, and inspection is still limited to registered development objects. Existing source and material byte-size checks remain. Successful CPU inspections retain the exact returned range and text in the run record, so observed volume can be derived without imposing a quota. Workflow runs record the UTF-8 bytes returned by successful inspections as an observation, never a gate. Repeated reads remain possible under the campaign's monetary budget.
+
+Offline synthetic regressions repeat eleven 4,000-character reads in each campaign path, exceeding the former 40,000-character ceiling and an inert legacy plan value of one. Per-read requests of 4,001 characters are rejected. No provider network calls, scientific-case changes, or publication are part of this batch.
+
+The earlier budget-policy mechanism admission path also used `maxReadbackChars` to stop read requests both individually and cumulatively. New plans decode but discard that field. A requested range must still be within its registered material, with the unchanged 200,000-character material bound and 2 MB case-set file bound. Admission keeps its historical observed character field and additionally records observed UTF-8 readback bytes. An offline paired-case regression returns 11,000 characters in each of four arms (44,000 observed) despite a legacy plan value of one.

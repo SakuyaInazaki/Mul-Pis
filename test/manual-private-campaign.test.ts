@@ -7,6 +7,7 @@ import test from "node:test";
 import { offlineChecks } from "../scripts/manual-private-campaign.ts";
 import { reserveIndependentRestart } from "../src/m07/independent-restart.ts";
 import { verifyDeepSeekCnyBilling } from "../src/runner/deepseek-cny-pricing.ts";
+import { verifyDeepSeekProviderOutputLimit } from "../src/runner/deepseek-provider-limits.ts";
 import { ONE_USE_PUSH_MARKER } from "../src/runner/signed-mission-ledger.ts";
 
 test("shared-total campaign requires explicit manual admission and signed cumulative ledger", async () => {
@@ -28,18 +29,12 @@ test("shared-total campaign requires explicit manual admission and signed cumula
  assert.doesNotMatch(workflow, /up to [0-9.]+ CNY/);
 });
 
-test("execution deadlines use the remaining Actions campaign rather than a pilot phase cap", async () => {
+test("new campaign has no host time, call-count, iteration or round quota", async () => {
 	const workflow = await readFile(new URL("../.github/workflows/manual-private-campaign.yml", import.meta.url), "utf8");
-	assert.match(workflow, /name: Run bounded private campaign\s+id: campaign\s+timeout-minutes: 30/);
-	const started = Date.parse("2030-01-01T00:00:00.000Z");
-	const stop = started + 25 * 60_000;
-	assert.equal(offlineChecks.executionDeadlineAt(stop, started), new Date(stop - 45_000).toISOString());
-	assert.equal(offlineChecks.executionDeadlineAt(stop, stop - 91_000), new Date(stop - 45_000).toISOString());
-	assert.equal(offlineChecks.newPhaseAdmitted(stop, stop - 91_000), true);
-	assert.equal(offlineChecks.newPhaseAdmitted(stop, stop - 90_000), false);
-	assert.throws(() => offlineChecks.executionDeadlineAt(stop, stop - 45_000), /settlement boundary/);
+	assert.doesNotMatch(workflow, /timeout-minutes:/);
 	const source = await readFile(new URL("../scripts/manual-private-campaign.ts", import.meta.url), "utf8");
-	assert.doesNotMatch(source, /BUILDER_PHASE_MS|M04_PHASE_MS|campaignStopAt\s*-\s*9\s*\*\s*60_000/);
+	assert.doesNotMatch(source, /CAMPAIGN_MS|BUILDER_PHASE_MS|M04_PHASE_MS|MAX_PROVIDER_CALLS|BUILDER_ROUNDS|newPhaseAdmitted|executionDeadlineAt|maxProviderCallsPerPrompt|timeout:\s*[0-9]/);
+	assert.match(source, /executionLoop: \{ mode: "until-ready" \}/);
 });
 
 test("driver checkpoint synchronization matches a generic reservation with a proved bare alias", async () => {
@@ -121,6 +116,12 @@ test("failed experiment enters untrusted history while selected prior tuple rema
 			controllerEvidence: { reviewStatus: "unreviewed" } }));
 		await writeFile(path.join(directory, "iteration-1-candidate.cpp"), "// failed later attempt\n");
 		await writeFile(path.join(directory, "iteration-1-experiment-plan.json"), "{\"cases\":[]}");
+		const fallbackPrefix = "fallback-aaaaaaaaaaaa-T003";
+		await writeFile(path.join(directory, `workflow-${fallbackPrefix}-archive.json`), JSON.stringify({ version: 1,
+			kind: "m07-private-candidate-archive", goalRunId: "R004", taskId: "T003",
+			controllerEvidence: { reviewStatus: "unreviewed" } }));
+		await writeFile(path.join(directory, `${fallbackPrefix}-candidate.cpp`), "// third task\n");
+		await writeFile(path.join(directory, `${fallbackPrefix}-round-10-reviewer-feedback.txt`), "Later unselected feedback\n");
 		const firstReservation = { version: 1, kind: "host-independent-goal-quarantine",
 			reuseKey: "1".repeat(64), prior: { envelopeSha256: "a".repeat(64) },
 			freshWorkspace: { workspaceId: "fresh-one" } };
@@ -141,6 +142,8 @@ test("failed experiment enters untrusted history while selected prior tuple rema
 		assert.ok(entry.files["experiment-plan.json"].includes("synthetic"));
 		assert.equal(history.entries.find((item: { goalRunId: string }) => item.goalRunId === "R003")
 			.files["candidate.cpp"], "// failed later attempt\n");
+		assert.equal(history.entries.find((item: { goalRunId: string }) => item.goalRunId === "R004")
+			.files["round-10-reviewer-feedback.txt"], "Later unselected feedback\n");
 		assert.equal(JSON.parse(carried?.["independent-restart-quarantine.json"] ?? "null").entries.length, 1);
 		assert.equal(carried?.["independent-restart-goal-binding.json"], undefined);
 		const next = path.join(directory, "next");
@@ -180,6 +183,41 @@ test("no accepted current candidate reports prior tuple retention without a perf
 	assert.equal(status.currentAttemptGainEstablished, false);
 	assert.equal((status.comparison as { state: string }).state, "unavailable");
 	assert.equal(status.comparisonPerformed, false);
+});
+
+test("settled terminal length remains an incomplete output-limit boundary end to end", async () => {
+	assert.equal(offlineChecks.campaignObjectiveStop("output-limit"), "output-limit");
+	const telemetry = await offlineChecks.taskTelemetry({ sessionsDir: "/tmp/synthetic-mulpis-sessions" } as any,
+		{ taskId: "T001", status: "failed", loopStopReason: "output-limit",
+			executionFailure: "provider length response received and settled; task remains incomplete",
+			toolLog: [] }, "SYNTHETIC_KEY");
+	assert.equal(telemetry.status, "failed");
+	assert.equal(telemetry.loopStopReason, "output-limit");
+	assert.equal(telemetry.failureCategory, "output-limit");
+});
+
+test("private tool telemetry keeps bounded read diagnostics and full-return evidence without content", () => {
+	const key = "sk-SYNTHETIC_PRIVATE_TOKEN123";
+	const failed = offlineChecks.privateToolTelemetry({ name: "read", ok: false,
+		args: { path: "inputs/guide.txt", content: "DO_NOT_EXPORT" }, errorClass: "harness",
+		errorCode: "runner.campaign-files",
+		errorMessage: `File unavailable; Authorization: Bearer ${key}` }, 0, key);
+	assert.equal(failed.name, "read");
+	assert.equal(failed.errorClass, "harness");
+	assert.equal(failed.errorCode, "runner.campaign-files");
+	assert.equal(failed.requestedPath, "inputs/guide.txt");
+	assert.doesNotMatch(JSON.stringify(failed), /SYNTHETIC_PRIVATE_TOKEN|DO_NOT_EXPORT/);
+	const returned = offlineChecks.privateToolTelemetry({ name: "read", ok: true,
+		resultMetadata: { kind: "confined-utf8-read", relativePath: "inputs/guide.txt",
+			utf8Bytes: 123, truncated: false }, resultText: "DO_NOT_EXPORT" }, 1, key);
+	assert.deepEqual(returned.returnedEvidence, { kind: "full-utf8-text",
+		relativePath: "inputs/guide.txt", utf8Bytes: 123, truncated: false });
+	assert.doesNotMatch(JSON.stringify(returned), /DO_NOT_EXPORT/);
+	const untrusted = offlineChecks.privateToolTelemetry({ name: "custom_network", ok: true,
+		resultMetadata: { kind: "confined-utf8-read", relativePath: "secret.txt",
+			utf8Bytes: 3, truncated: false } }, 2, key);
+	assert.equal(untrusted.name, "other");
+	assert.equal(untrusted.returnedEvidence, undefined);
 });
 
 test("generic private campaign source-shape gate preserves non-target bodies", () => {
@@ -293,6 +331,7 @@ test("prefixed archive references its transported files and fallback keeps promo
 		await writeFile(path.join(source, "round-1-candidate.cpp"), "// second round\n");
 		await writeFile(path.join(source, "round-1-reviewer-feedback.txt"), "bounded feedback\n");
 		await writeFile(path.join(source, "round-1-reviewer-report.md"), "bounded reviewer report\n");
+		await writeFile(path.join(source, "round-10-reviewer-feedback.txt"), "later feedback\n");
 		await writeFile(path.join(source, "review-decision.json"), "{}\n");
 		await writeFile(path.join(source, "m04-adopted-knowledge.json"), "{}\n");
 		await writeFile(path.join(source, "workflow-archive.json"), JSON.stringify({
@@ -310,6 +349,12 @@ test("prefixed archive references its transported files and fallback keeps promo
 		assert.equal(index.controllerEvidence.rounds[0].reviewerReport.file, "followon-round-1-reviewer-report.md");
 		assert.equal(index.controllerEvidence.reviewDecision.file, "followon-review-decision.json");
 		assert.equal(await readFile(path.join(output, "followon-round-1-reviewer-feedback.txt"), "utf8"), "bounded feedback\n");
+		assert.equal(await readFile(path.join(output, "followon-round-10-reviewer-feedback.txt"), "utf8"), "later feedback\n");
+		await offlineChecks.exportPrefixedArchive(source, output, "iteration-65");
+		assert.equal(await readFile(path.join(output, "iteration-65-round-10-reviewer-feedback.txt"), "utf8"), "later feedback\n");
+		const available = await offlineChecks.availablePrivateArtifactNames(output);
+		assert.ok(available.includes("iteration-65-round-10-reviewer-feedback.txt"));
+		assert.ok(available.includes("workflow-iteration-65-archive.json"));
 		await offlineChecks.exportPrefixedArchive(source, output, "initial");
 		const initialIndex = JSON.parse(await readFile(path.join(output, "workflow-initial-archive.json"), "utf8"));
 		assert.equal(initialIndex.m04.knowledgeExport.file, "initial-m04-adopted-knowledge.json");
@@ -317,31 +362,31 @@ test("prefixed archive references its transported files and fallback keeps promo
 		assert.equal(index.transportLayout.defaultArchiveLoaderCompatible, false);
 		await writeFile(path.join(output, "candidate.cpp"), "// promoted second candidate\n");
 		await writeFile(path.join(output, "workflow-archive.json"), "{}\n");
-		await offlineChecks.preserveCandidate({} as any, "R001", output);
+		await offlineChecks.preserveCandidate({ runDir: () => path.join(root, "missing-goal") } as any, "R001", output);
 		assert.equal(await readFile(path.join(output, "candidate.cpp"), "utf8"), "// promoted second candidate\n");
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("fallback archive failure is observable before private workspace cleanup", async () => {
+test("fallback archive rejects repeated round identities but accepts later rounds", async () => {
 	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-fallback-archive-fixture-"));
 	try {
 		const workDir = path.join(root, "work"), output = path.join(root, "output");
 		await mkdir(workDir); await mkdir(output);
 		await writeFile(path.join(root, "goal.json"), JSON.stringify({ runId: "run-example", lifecycle: "active", tasks: [{
 			taskId: "T001", mode: "execute", workDir, status: "returned",
-			executionRounds: Array.from({ length: 9 }, (_, index) => ({ index: index + 1 })),
+			executionRounds: [...Array.from({ length: 9 }, (_, index) => ({ index: index + 1 })), { index: 9 }],
 		}] }));
 		await assert.rejects(offlineChecks.preserveCandidate({ runDir: () => root } as any, "run-example", output),
-			/too many execution rounds/);
+			/invalid execution round index/);
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("fallback archive retains both settled same-goal candidate files", async () => {
+test("fallback archive retains every settled same-goal candidate file", async () => {
 	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-fallback-pair-fixture-"));
 	try {
 		const output = path.join(root, "output"); await mkdir(output);
 		const tasks = [];
-		for (const [index, text] of ["parent", "child"].entries()) {
+		for (const [index, text] of ["parent", "child", "later"].entries()) {
 			const workDir = path.join(root, `work-${index}`); await mkdir(workDir);
 			await writeFile(path.join(workDir, "candidate.cpp"), `// ${text} candidate\n`);
 			tasks.push({ taskId: `T00${index + 1}`, mode: "execute", workDir, status: "returned" });
@@ -350,6 +395,9 @@ test("fallback archive retains both settled same-goal candidate files", async ()
 		await offlineChecks.preserveCandidate({ runDir: () => root } as any, "run-example", output);
 		assert.equal(await readFile(path.join(output, "candidate.cpp"), "utf8"), "// parent candidate\n");
 		assert.equal(await readFile(path.join(output, "branch-child-candidate.cpp"), "utf8"), "// child candidate\n");
+		const prefix = `fallback-${createHash("sha256").update("run-example").digest("hex").slice(0, 12)}-T003`;
+		assert.equal(await readFile(path.join(output, `${prefix}-candidate.cpp`), "utf8"), "// later candidate\n");
+		assert.equal((await offlineChecks.availablePrivateArtifactNames(output)).includes(`${prefix}-candidate.cpp`), true);
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -468,18 +516,31 @@ test("private campaign uses only a live verified native-CNY peak profile for new
 	}) as typeof fetch;
 	const profile = await verifyDeepSeekCnyBilling({ apiKey: "SYNTHETIC_KEY", request,
 		now: () => new Date("2026-10-06T11:00:00.000Z") });
-	const budget = offlineChecks.createPrivateCampaignBudget(29.1, profile);
+	const providerOutputLimit = await verifyDeepSeekProviderOutputLimit({ apiKey: "SYNTHETIC_KEY",
+		request: (async (url: string | URL | Request, options?: RequestInit) => {
+			assert.equal(String(url), "https://api.deepseek.com/models");
+			assert.equal(options?.method, "GET");
+			return new Response(JSON.stringify({ object: "list", data: [{ id: "deepseek-flash",
+				object: "model", name: "DeepSeek-V4.1-Flash", context_window: 1_048_576,
+				max_output_tokens: 393_216 }] }), { status: 200 });
+		}) as typeof fetch });
+	const budget = offlineChecks.createPrivateCampaignBudget(29.1, profile, providerOutputLimit);
 	assert.equal(budget.limits.estimatedInputCnyPerMillionTokens, 2);
 	assert.equal(budget.limits.estimatedCacheReadCnyPerMillionTokens, 0.04);
 	assert.equal(budget.limits.estimatedOutputCnyPerMillionTokens, 8);
 	assert.equal(budget.limits.estimatedCnyPerUsd, undefined);
+	assert.equal(budget.limits.maxOutputTokens, undefined);
+	assert.equal(budget.limits.providerOutputLimit?.maxOutputTokens, 393_216);
 	assert.equal(budget.snapshot().priorCommittedCny, 29.1);
 	assert.equal(budget.snapshot().missionCommittedCny, 29.1);
 	assert.equal(budget.requestAuditSnapshot().pricingProfile?.currency, "CNY");
+	assert.equal(budget.requestAuditSnapshot().providerOutputLimit?.maxOutputTokens, 393_216);
 	assert.doesNotMatch(JSON.stringify(budget.requestAuditSnapshot()), /SYNTHETIC_PRIVATE_AMOUNT|SYNTHETIC_KEY/);
 	const source = await readFile(new URL("../scripts/manual-private-campaign.ts", import.meta.url), "utf8");
+	assert.ok(source.indexOf("await verifyDeepSeekProviderOutputLimit({ apiKey: runtimeKey })") <
+		source.indexOf("const budget = createPrivateCampaignBudget(missionLedger.priorCommittedCny"));
 	assert.ok(source.indexOf("await verifyDeepSeekCnyBilling({ apiKey: runtimeKey })") <
-		source.indexOf("createPrivateCampaignBudget(missionLedger.priorCommittedCny, nativeCnyPricing)"));
+		source.indexOf("const budget = createPrivateCampaignBudget(missionLedger.priorCommittedCny"));
 });
 
 test("M04 evidence coverage requires exact task files and complete returned text ranges", async () => {

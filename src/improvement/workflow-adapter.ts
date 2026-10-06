@@ -36,7 +36,7 @@ export function workflowImproverSystemPrompt(body: string): string {
 	return `You are the versioned M07 evidence-handoff improver. Return exactly one JSON object using one of these four workflow-only action forms: ${WORKFLOW_ACTION_CONTRACT}. Inspect fields are top-level; no nested read object or probe action exists here. Candidate text may change only the evidence-handoff H body and cannot change goals, checks, tools, protected G, or budget. Cite only visible frozen development evidence or registered development MetaEpisode IDs. A hypothesis is a testable claim, not an established fact.\n\nLoaded improver strategy (versioned data-only method):\n${body}`;
 }
 export function workflowDecisionPrompt(view: unknown): string {
-	return `Choose one action under the workflow-only system contract. On the final decision, stop with a supported candidate or stop without one. The controller does not choose a candidate for you.\n${JSON.stringify(view)}`;
+	return `Choose one action under the workflow-only system contract. Stop with a supported candidate or stop without one when the evidence warrants it. The controller does not choose a candidate for you.\n${JSON.stringify(view)}`;
 }
 const id = () => `${new Date().toISOString().replace(/[-:.]/g, "")}-${randomBytes(3).toString("hex")}`;
 const relativeSafe = (file: string) => !!file && !path.isAbsolute(file) && file.split(/[\\/]/).every((part) => part !== "" && part !== "." && part !== "..");
@@ -44,10 +44,10 @@ const nested = (a: string, b: string) => a === b || b.startsWith(`${a}${path.sep
 const uniqueRefs = <T extends { storeId: string; recordId: string; version: number }>(refs: T[]): T[] => [...new Map(refs.map((ref) => [`${ref.storeId}/${ref.recordId}@${ref.version}`, ref])).values()];
 const uniqueRequirements = (refs: StrategyRecordV1["requiredExperienceRefs"]): StrategyRecordV1["requiredExperienceRefs"] => [...new Map(refs.map((item) => [`${item.targetKind}:${item.ref.storeId}/${item.ref.recordId}@${item.ref.version}`, item])).values()];
 
-export function validateWorkflowAction(input: unknown, visible: { sourceId: string; metaIds: string[]; methodIds: string[]; candidateIds: string[]; readbackRemaining: number }): Action {
+export function validateWorkflowAction(input: unknown, visible: { sourceId: string; metaIds: string[]; methodIds: string[]; candidateIds: string[] }): Action {
 	if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.workflow-action", "I must return one JSON action");
 	const v = input as Record<string, unknown>;
-	if (v.kind === "inspect" && Object.keys(v).sort().join(",") === "id,kind,maxChars,object,start" && ["method", "development-feedback", "meta-episode"].includes(String(v.object)) && typeof v.id === "string" && (v.object === "method" ? visible.methodIds.includes(v.id) : v.object === "meta-episode" ? visible.metaIds.includes(v.id) : v.id === visible.sourceId) && Number.isSafeInteger(v.start) && (v.start as number) >= 0 && Number.isSafeInteger(v.maxChars) && (v.maxChars as number) > 0 && (v.maxChars as number) <= 4_000 && visible.readbackRemaining > 0)
+	if (v.kind === "inspect" && Object.keys(v).sort().join(",") === "id,kind,maxChars,object,start" && ["method", "development-feedback", "meta-episode"].includes(String(v.object)) && typeof v.id === "string" && (v.object === "method" ? visible.methodIds.includes(v.id) : v.object === "meta-episode" ? visible.metaIds.includes(v.id) : v.id === visible.sourceId) && Number.isSafeInteger(v.start) && (v.start as number) >= 0 && Number.isSafeInteger(v.maxChars) && (v.maxChars as number) > 0 && (v.maxChars as number) <= 4_000)
 		return v as unknown as Action;
 	if (v.kind === "propose" && Object.keys(v).sort().join(",") === "body,hypothesis,kind,target" && v.target === "executor" && typeof v.body === "string" && v.body.trim() && v.body.length <= 4_000) {
 		const hypothesis = validateResearchHypothesis(v.hypothesis);
@@ -85,7 +85,6 @@ async function loadSource(ws: Workspace, plan: WorkflowEvidenceHandoffPlanV1): P
 	if (Buffer.byteLength(processing, "utf8") > 32_000) throw new HarnessError("improvement.workflow-source", "M04 processing output exceeds bounded development handoff");
 	const tasks = (goal.tasks as Array<Record<string, unknown>>).map((task) => ({ taskId: task.taskId, objective: task.objective, status: task.status, checks: (task.review as Record<string, unknown> | undefined)?.checks, failures: (task.review as Record<string, unknown> | undefined)?.failures, unexecuted: (task.review as Record<string, unknown> | undefined)?.unexecuted }));
 	const text = JSON.stringify({ m07RunId, checkpointId, m04RunId, tasks, processing: processing.slice(0, 8_000) });
-	if (text.length > 16_000) throw new HarnessError("improvement.workflow-source", "development handoff exceeds fixed I context limit");
 	return { id: `development:${m07RunId}:${checkpointId}`, text, m07RunId, m04RunId };
 }
 
@@ -165,27 +164,21 @@ async function protectAdmissionInputs(source: Workspace, plan: WorkflowEvidenceH
 	}
 }
 
-/** Each arm turn has its own timeout and may not outlive the campaign wall clock. */
-function workflowDeadlineMs(budget: SharedBudget, lease: BudgetLease, perPromptTimeoutMs: number): number {
-	const remaining = Math.min(budget.status().remaining.wallMillis, budget.status(lease).remaining.wallMillis);
-	if (remaining <= 0) throw new HarnessError("improvement.budget", "workflow campaign wall budget exhausted");
-	return Math.max(1, Math.min(perPromptTimeoutMs, remaining));
-}
-
 function assertWorkflowBudgetOpen(budget: SharedBudget, lease: BudgetLease): void {
-	if (budget.status().remaining.wallMillis <= 0 || budget.status(lease).remaining.wallMillis <= 0) throw new HarnessError("improvement.budget", "workflow campaign wall budget exhausted");
+	if (budget.status().settlement !== "settled" || budget.status(lease).settlement !== "settled" ||
+		budget.status().remaining.sdkEstimatedCost <= 0 || budget.status(lease).remaining.sdkEstimatedCost <= 0)
+		throw new HarnessError("improvement.budget", "workflow campaign monetary budget unavailable");
 }
 
-export function createWorkflowMeteredRunner(base: SessionRunner, budget: SharedBudget, lease: BudgetLease, events: UsageSummary[], perPromptTimeoutMs = 300_000): SessionRunner {
+export function createWorkflowMeteredRunner(base: SessionRunner, budget: SharedBudget, lease: BudgetLease, events: UsageSummary[], _legacyTimeoutMs?: number): SessionRunner {
 	const wrap = (handle: SessionHandle, spec: SessionSpec): SessionHandle => ({ ...handle, prompt: async (message) => {
-		const timeoutMs = workflowDeadlineMs(budget, lease, perPromptTimeoutMs);
+		assertWorkflowBudgetOpen(budget, lease);
 		const reservation = budget.reserveObservedTurn(lease);
 		let settled = false;
 		try {
-			const turn = await timedPrompt(handle, message, timeoutMs);
+			const turn = await timedPrompt(handle, message);
 			const usage = turn.usage ?? handle.usageSummary();
 			budget.settleObservedTurn(reservation, usage); settled = true; events.push(usage);
-			assertWorkflowBudgetOpen(budget, lease);
 			if (!usage.complete || !usage.costComplete || usage.reportedEvents < 1 || budget.status(lease).settlement !== "settled") throw new HarnessError("improvement.workflow-usage", "M07/M04 provider use is incomplete or over the reserved serial turn envelope");
 			return turn;
 		} catch (error) { if (!settled) budget.markObservedTurnUnknown(reservation); throw error; }
@@ -193,7 +186,7 @@ export function createWorkflowMeteredRunner(base: SessionRunner, budget: SharedB
 	return { create: async (spec) => wrap(await base.create(spec), spec), resume: async (ref) => { const handle = await base.resume(ref); const spec = JSON.parse(await readFile(ref.specFile!, "utf8")) as SessionSpec; return wrap(handle, spec); }, estimateMaxSdkCost: base.estimateMaxSdkCost?.bind(base) };
 }
 
-async function executeArm(args: { source: Workspace; root: string; bundle: NonNullable<Awaited<ReturnType<GenerationStore["active"]>>>["bundle"]; h: StrategyRecordV1; i: StrategyRecordV1; caseInput: WorkflowCaseSetV1["cases"][number]; arm: WorkflowArmReceiptV1["arm"]; runner: SessionRunner; budget: SharedBudget; lease: BudgetLease; perPromptTimeoutMs: number }): Promise<WorkflowArmReceiptV1> {
+async function executeArm(args: { source: Workspace; root: string; bundle: NonNullable<Awaited<ReturnType<GenerationStore["active"]>>>["bundle"]; h: StrategyRecordV1; i: StrategyRecordV1; caseInput: WorkflowCaseSetV1["cases"][number]; arm: WorkflowArmReceiptV1["arm"]; runner: SessionRunner; budget: SharedBudget; lease: BudgetLease; perPromptTimeoutMs?: number }): Promise<WorkflowArmReceiptV1> {
 	const receipt: WorkflowArmReceiptV1 = { caseId: args.caseInput.id, arm: args.arm, methodVersionId: args.h.versionId, workspaceRoot: args.root, checkResults: [], usage: { providerCalls: 0, inputTokens: 0, outputTokens: 0, sdkEstimatedCost: 0, complete: false }, status: "inconclusive" };
 	const events: UsageSummary[] = [];
 	try {
@@ -205,7 +198,7 @@ async function executeArm(args: { source: Workspace; root: string; bundle: NonNu
 		const task = await controller.delegate(goal.runId, args.caseInput.task);
 		if (task.status !== "returned" || !task.reportPath) throw new HarnessError("improvement.workflow-arm", "M07 task did not return an evidence report");
 		const report = await readFile(task.reportPath, "utf8");
-		if (report.length > 100_000) throw new HarnessError("improvement.workflow-arm", "M07 report exceeds fixed check limit");
+		if (report.length > 100_000) throw new HarnessError("improvement.workflow-arm", "M07 evidence report exceeds the retained-file size boundary");
 		receipt.checkResults = args.caseInput.checks.map((check) => ({ criterion: check.criterion, passed: check.contains.every((text) => report.includes(text)) && check.forbids.every((text) => !report.includes(text)) }));
 		await controller.review(goal.runId, { taskId: task.taskId, artifacts: [task.reportPath], checks: receipt.checkResults.map((check) => ({ criterion: check.criterion, result: check.passed ? "passed" : "failed", evidence: [task.reportPath!] })) });
 		const checkpoint = await controller.checkpoint(goal.runId, { taskIds: [task.taskId] });
@@ -238,7 +231,7 @@ async function executeArm(args: { source: Workspace; root: string; bundle: NonNu
 		if (args.budget.status(args.lease).settlement !== "settled") throw new HarnessError("improvement.workflow-usage", "arm resource use is not settled");
 		receipt.status = "complete";
 	} catch (error) { receipt.reason = (error as Error).message; }
-	receipt.usage = { providerCalls: events.reduce((n, x) => n + x.reportedEvents, 0), inputTokens: events.reduce((n, x) => n + x.input + x.cacheRead + x.cacheWrite, 0), outputTokens: events.reduce((n, x) => n + x.output, 0), sdkEstimatedCost: events.reduce((n, x) => n + x.cost, 0), complete: events.length >= 2 && events.every((x) => x.complete && x.costComplete && x.reportedEvents >= 1) && args.budget.status(args.lease).settlement === "settled" && args.budget.status().remaining.wallMillis > 0 && args.budget.status(args.lease).remaining.wallMillis > 0 };
+	receipt.usage = { providerCalls: events.reduce((n, x) => n + x.reportedEvents, 0), inputTokens: events.reduce((n, x) => n + x.input + x.cacheRead + x.cacheWrite, 0), outputTokens: events.reduce((n, x) => n + x.output, 0), sdkEstimatedCost: events.reduce((n, x) => n + x.cost, 0), complete: events.length >= 2 && events.every((x) => x.complete && x.costComplete && x.reportedEvents >= 1) && args.budget.status(args.lease).settlement === "settled" };
 	if (!receipt.usage.complete) { receipt.status = "inconclusive"; receipt.reason ??= "complete M07/M04 usage is unavailable"; }
 	return receipt;
 }
@@ -312,8 +305,8 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 		};
 		const candidates = new Map<string, StrategyRecordV1>();
 		let lastActionResult: unknown;
-		let inspectCount = 0, readbackChars = 0;
-		for (let index = 0; index < plan.maxDecisions; index++) {
+		let inspectCount = 0;
+		for (let index = 0; ; index++) {
 			await ensureLiveEpoch();
 			await verifyLive([h, i]);
 			await ensureLiveExperience();
@@ -322,25 +315,25 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 				developmentSource: { id: source.id, m07RunId: source.m07RunId, m04RunId: source.m04RunId, excerpt: source.text.slice(0, 4_000), totalChars: source.text.length },
 				metaEpisodes: priorEpisodes.map((episode) => ({ id: episode.id, runId: episode.runId, terminal: episode.terminal, decisionKinds: episode.decisions.map((d) => d.kind ?? "none"), candidateOutcomes: episode.candidates.map((c) => ({ id: c.id, claim: c.hypothesis.claim, developmentStatus: c.developmentStatus })), feedbackIds: episode.feedbackIndex.map((f) => f.id), sdkEstimatedCost: episode.usage.sdkEstimatedCost })),
 				feedback: run.developmentArms.slice(-plan.maxFeedbackItems).map((arm) => ({ caseId: arm.caseId, arm: arm.arm, methodVersionId: arm.methodVersionId, status: arm.status, checkResults: arm.checkResults, reason: arm.reason })),
-				experience: { markdown: experience.markdown, refs: experience.refs }, budget: budget.status(), remainingActions: { decisions: plan.maxDecisions - index, candidates: plan.maxCandidates - candidates.size, inspections: plan.maxInspectActions - inspectCount, readbackChars: plan.maxReadbackChars - readbackChars, finalDecision: index === plan.maxDecisions - 1 }, lastActionResult };
+				experience: { markdown: experience.markdown, refs: experience.refs }, budget: budget.status(), lastActionResult };
 			const decision = { index: index + 1, improverVersionId: i.versionId, outcome: "proposing" } as WorkflowRunV1["decisions"][number]; run.decisions.push(decision); await save();
 			await ensureLiveEpoch();
 			await ensureLiveExperience();
 			const step = await runBoundedModelStep({ runner, budget, lease: budget.root, spec: { label: `I-workflow-${runId}-${index}`, role: "improver", model: active.bundle.modelConfig.improver, systemPrompt: workflowImproverSystemPrompt(i.artifact.body), persistDir: ws.sessionsDir, methodBinding: { versionId: i.versionId } },
-				message: workflowDecisionPrompt(view), timeoutMs: workflowDeadlineMs(budget, budget.root, plan.perPromptTimeoutMs) });
-			assertWorkflowBudgetOpen(budget, budget.root);
+				message: workflowDecisionPrompt(view) });
 			decision.sessionId = step.sessionId;
-			const action = validateWorkflowAction(JSON.parse(step.text), { sourceId: source.id, metaIds: priorEpisodes.map((e) => e.id), methodIds: [h.versionId, i.versionId, ...candidates.keys()], candidateIds: [...candidates.keys()], readbackRemaining: plan.maxReadbackChars - readbackChars });
+			const action = validateWorkflowAction(JSON.parse(step.text), { sourceId: source.id, metaIds: priorEpisodes.map((e) => e.id), methodIds: [h.versionId, i.versionId, ...candidates.keys()], candidateIds: [...candidates.keys()] });
 			decision.action = action.kind; decision.outcome = "executed";
 			if (action.kind === "inspect") {
-				if (++inspectCount > plan.maxInspectActions) throw new HarnessError("improvement.workflow-inspect", "inspect count exhausted");
+				inspectCount++;
 				const content = action.object === "development-feedback" ? source.text : action.object === "meta-episode" ? JSON.stringify(metaEpisodeForModel(priorEpisodes.find((e) => e.id === action.id)!)) : action.id === h.versionId ? h.artifact.body : action.id === i.versionId ? i.artifact.body : candidates.get(action.id)!.artifact.body;
-				const text = content.slice(action.start, action.start + Math.min(action.maxChars, plan.maxReadbackChars - readbackChars));
+				const text = content.slice(action.start, action.start + action.maxChars);
 				if (!text) throw new HarnessError("improvement.workflow-inspect", "requested read range is empty");
-				readbackChars += text.length; lastActionResult = { kind: "inspect", id: action.id, start: action.start, end: action.start + text.length, totalChars: content.length, text }; await save(); continue;
+				run.inspectionReadbackBytesObserved = (run.inspectionReadbackBytesObserved ?? 0) + Buffer.byteLength(text, "utf8");
+				lastActionResult = { kind: "inspect", id: action.id, start: action.start, end: action.start + text.length, totalChars: content.length, text }; await save(); continue;
 			}
 			if (action.kind === "propose") {
-				if (candidates.size >= plan.maxCandidates || action.body === h.artifact.body || [...candidates.values()].some((c) => c.artifact.body === action.body)) { lastActionResult = { kind: "propose", outcome: "rejected", reason: "unchanged, repeated or over candidate cap" }; await save(); continue; }
+				if (action.body === h.artifact.body || [...candidates.values()].some((c) => c.artifact.body === action.body)) { lastActionResult = { kind: "propose", outcome: "rejected", reason: "unchanged or repeated candidate" }; await save(); continue; }
 				await ensureLiveEpoch();
 				await ensureLiveExperience();
 				const artifact = validateStrategy("executor", { version: 1, kind: "m07-workflow-prompt", slot: "evidence-handoff", body: action.body }) as M07WorkflowStrategyV1;
@@ -393,9 +386,8 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 				const before = receipts.find((r) => r.arm === "baseline")!, after = receipts.find((r) => r.arm === "candidate")!;
 				if (after.checkResults.some((r) => !r.passed) || !before.checkResults.some((r) => !r.passed)) { run.status = "rejected"; run.outcome = "candidate-rejected"; run.stopReason = "protected G found no strict gain or incomplete candidate checks"; return run; }
 			}
-			if (budget.status().settlement !== "settled" || budget.status().remaining.wallMillis <= 0) { run.status = "inconclusive"; run.stopReason = "campaign budget is unsettled or its wall clock is exhausted"; return run; }
+			if (budget.status().settlement !== "settled") { run.status = "inconclusive"; run.stopReason = "campaign monetary budget is unsettled"; return run; }
 			await verifyLive([h, i, candidateRecord]);
-			assertWorkflowBudgetOpen(budget, budget.root);
 			const current = await store.active();
 			if (current?.pointer.bundleId !== active.pointer.bundleId || current.pointer.runId !== active.pointer.runId) { run.status = "inconclusive"; run.stopReason = "active generation changed during isolated evaluation"; return run; }
 			const admitted = await store.writeStrategy({ versionId: store.newId("H-admitted"), kind: "executor", artifact: candidateRecord.artifact, parentVersionId: candidateRecord.versionId, origin: "agent-generated", applicability: candidateRecord.applicability, limitations: candidateRecord.limitations, sourceExperienceRefs: candidateRecord.sourceExperienceRefs, requiredExperienceRefs: candidateRecord.requiredExperienceRefs, requiredKnowledgeRefs: candidateRecord.requiredKnowledgeRefs, state: "admitted" });
@@ -406,12 +398,10 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 			const latest = await store.active();
 			if (latest?.pointer.bundleId !== active.pointer.bundleId || latest.pointer.runId !== active.pointer.runId) { run.status = "inconclusive"; run.stopReason = "active generation changed before workflow promotion"; return run; }
 			await ensureLiveEpoch();
-			assertWorkflowBudgetOpen(budget, budget.root);
 			if (budget.status().settlement !== "settled") { run.status = "inconclusive"; run.stopReason = "campaign budget is not settled before workflow promotion"; return run; }
 			await store.activate(next.bundleId, active.pointer, "local-workflow-handoff-admission", runId);
 			run.promotedMethodVersionId = admitted.versionId; run.status = "promoted"; run.outcome = "promoted"; run.stopReason = "local evidence-handoff mechanism checks passed in paired isolated arms; scientific benefit remains unverified"; return run;
 		}
-		await freezeDevelopment("inconclusive"); run.status = "inconclusive"; run.outcome = "search-incomplete"; run.stopReason = "I exhausted decisions without an explicit terminal choice"; return run;
 	} catch (error) { run.status = error instanceof HarnessError && ["improvement.budget", "improvement.usage", "improvement.timeout", "improvement.workflow-usage", "improvement.experience", "improvement.workflow-epoch"].includes(error.code) ? "inconclusive" : "failed"; run.outcome = "search-incomplete"; run.stopReason = (error as Error).message; return run; }
 	finally { run.finishedAt = nowIso(); await save(); }
 }

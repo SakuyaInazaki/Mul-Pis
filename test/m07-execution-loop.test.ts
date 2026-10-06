@@ -25,7 +25,96 @@ async function fixture(t: TestContext, reply: FakeReplyFn) {
  const guide = path.join(root,"guide.md"); await writeFile(guide,"Guide version one\n");
  return {root,ws,store,runner,controller,goal,guide};
 }
-const deadlineAt = () => new Date(Date.now()+60_000).toISOString();
+
+test("until-ready execution continues past eight rounds without a host deadline", async t => {
+ const f = await fixture(t, async ({spec, turnIndex}) => {
+  if (spec.label.includes("reviewer")) return JSON.stringify({verdict:spec.label.includes("round-10-")?"ready":"revise",feedback:"Review the same candidate"});
+  if (spec.tools.kind === "execution") await writeFile(path.join(spec.tools.root,"result.txt"),`candidate ${turnIndex}\n`);
+  return `builder round ${turnIndex}`;
+ });
+ const task = await f.controller.delegate(f.goal.runId,{objective:"continue one candidate",inputs:[],expectedOutputs:["result.txt"],
+  checks:["same candidate"],mode:"execute",executionLoop:{mode:"until-ready"}});
+ assert.equal(task.status,"returned");
+ assert.equal(task.loopStopReason,"ready");
+ assert.equal(task.executionRounds?.length,10);
+ assert.equal((await f.controller.status(f.goal.runId)).executionState?.operations.length,10);
+});
+
+test("reviewer snapshot preserves more than 1,000 small work files", async t => {
+ const f = await fixture(t, async ({spec}) => {
+  if (spec.label.includes("reviewer")) {
+   if (spec.tools.kind !== "read-dir") throw new Error("reviewer did not receive a read-dir snapshot");
+   assert.ok((await readdir(spec.tools.root)).length > 1_000);
+   assert.equal(await readFile(path.join(spec.tools.root,"piece-1000.txt"),"utf8"),"x");
+   return JSON.stringify({verdict:"ready",feedback:"checked the complete copied work directory"});
+  }
+  if (spec.tools.kind === "execution") {
+   const workRoot = spec.tools.root;
+   for (let start=0; start<1_001; start+=100) {
+    await Promise.all(Array.from({length: Math.min(100,1_001-start)},(_,offset) =>
+     writeFile(path.join(workRoot,`piece-${String(start+offset).padStart(4,"0")}.txt`),"x")));
+   }
+  }
+  return "candidate files ready for independent review";
+ });
+ const task = await f.controller.delegate(f.goal.runId,{objective:"review a many-file candidate",inputs:[],
+  expectedOutputs:["piece-1000.txt"],checks:["complete snapshot"],mode:"execute",executionLoop:{mode:"until-ready"}});
+ assert.equal(task.status,"returned",task.executionFailure ?? "M07 task failed");
+ assert.equal(task.loopStopReason,"ready");
+ assert.ok(task.executionRounds?.[0].reviewerSnapshotPath);
+ assert.ok(task.branchSource,task.branchUnavailableReason ?? "branch evidence was not frozen");
+});
+
+test("legacy caller quotas cannot stop a new M07 task or clip a long builder report", async t => {
+ const f = await fixture(t, async ({spec}) => {
+  if (spec.label.includes("reviewer")) return JSON.stringify({verdict:"ready",feedback:"checked"});
+  if (spec.tools.kind === "execution") await writeFile(path.join(spec.tools.root,"result.txt"),"candidate\n");
+  return "B".repeat(17_000);
+ });
+ const task = await f.controller.delegate(f.goal.runId,{objective:"new candidate",inputs:[],expectedOutputs:["result.txt"],checks:["checked"],
+  mode:"execute",executionLoop:{maxRounds:1,deadlineAt:"2000-01-01T00:00:00.000Z"}});
+ assert.deepEqual(task.executionLoop,{mode:"until-ready"});
+ assert.equal(task.status,"returned");
+ assert.equal(task.loopStopReason,"ready");
+ assert.match(await readFile(task.reportPath!,"utf8"),/B{17000}/);
+});
+
+test("long builder report reaches an independent reviewer as complete readable evidence", async t => {
+ const fullReport = "B".repeat(190_000);
+ const f = await fixture(t, async ({spec,message}) => {
+  if (spec.label.includes("reviewer")) {
+   if (spec.tools.kind !== "read-dir") throw new Error("reviewer did not receive a read-dir snapshot");
+   assert.ok(!message.includes("B".repeat(1_000)),"large report should not be inlined into reviewer prompt");
+   const folder = message.match(/\.m07-builder-report-[a-f0-9-]+\/part-000001\.txt/)?.[0].split("/")[0];
+   assert.ok(folder,"reviewer prompt should name the complete segmented report");
+   const root = path.join(spec.tools.root,folder);
+   const parts = (await readdir(root)).filter(name => name.startsWith("part-")).sort();
+   assert.ok(parts.length > 1,"long lines must have readable segments");
+   assert.equal((await Promise.all(parts.map(name => readFile(path.join(root,name),"utf8")))).join(""),fullReport);
+   return JSON.stringify({verdict:"ready",feedback:"checked complete frozen report and candidate"});
+  }
+  if (spec.tools.kind === "execution") await writeFile(path.join(spec.tools.root,"result.txt"),"candidate\n");
+  return fullReport;
+ });
+ const task = await f.controller.delegate(f.goal.runId,{objective:"review complete long report",inputs:[],
+  expectedOutputs:["result.txt"],checks:["complete report"],mode:"execute",executionLoop:{mode:"until-ready"}});
+ assert.equal(task.status,"returned",task.executionFailure ?? "M07 task failed");
+ assert.equal(task.loopStopReason,"ready");
+ assert.match(await readFile(task.executionRounds![0].builderReportPath,"utf8"),/^B{190000}$/);
+});
+
+test("oversized reviewer report is a file-size failure, not an invalid verdict", async t => {
+ const f = await fixture(t, async ({spec}) => {
+  if (spec.label.includes("reviewer")) return JSON.stringify({verdict:"ready",feedback:"R".repeat(512_000)});
+  if (spec.tools.kind === "execution") await writeFile(path.join(spec.tools.root,"result.txt"),"candidate\n");
+  return "candidate ready for review";
+ });
+ const task = await f.controller.delegate(f.goal.runId,{objective:"new candidate",inputs:[],expectedOutputs:["result.txt"],checks:["checked"],
+  mode:"execute",executionLoop:{mode:"until-ready"}});
+ assert.equal(task.status,"failed");
+ assert.match(task.executionFailure ?? "",/reviewer report file exceeds 512,000 UTF-8 bytes/);
+ assert.notEqual(task.loopStopReason,"reviewer-invalid");
+});
 
 test("reviewer JSON repairs only literal paragraph breaks inside bounded feedback", () => {
  const malformed = '{"verdict":"revise","feedback":"Inspect the measured cases.\nOne target regressed; revise the candidate."}';
@@ -36,9 +125,9 @@ test("reviewer JSON repairs only literal paragraph breaks inside bounded feedbac
   { verdict: "ready", feedback: "All bounded checks passed." });
  assert.throws(() => parseRoundReview('Reviewer says {"verdict":"ready","feedback":"looks good"}'), /JSON verdict/);
  assert.throws(() => parseRoundReview('{"verdict":"ready","feedback":"unterminated\nparagraph}'), /JSON verdict/);
- assert.throws(() => parseRoundReview('{"verdict":"accept","feedback":"looks good\nnow"}'), /bounded feedback/);
- assert.throws(() => parseRoundReview('{"verdict":["ready"],"feedback":"looks good"}'), /bounded feedback/);
- assert.throws(() => parseRoundReview('{"verdict":"ready","feedback":"' + "a".repeat(512_001) + '"}'), /bounded JSON size/);
+ assert.throws(() => parseRoundReview('{"verdict":"accept","feedback":"looks good\nnow"}'), /nonempty feedback/);
+ assert.throws(() => parseRoundReview('{"verdict":["ready"],"feedback":"looks good"}'), /nonempty feedback/);
+ assert.equal(parseRoundReview('{"verdict":"ready","feedback":"' + "a".repeat(512_001) + '"}').feedback.length,512_001);
 });
 
 test("nonrecoverable reviewer format still permits an honest rejected task and frozen fork", async t => {
@@ -48,7 +137,7 @@ test("nonrecoverable reviewer format still permits an honest rejected task and f
   return "builder finished";
  });
  const spec = { objective:"bounded candidate", inputs:[], expectedOutputs:["result.txt"], checks:["checked"], mode:"execute" as const,
-  executionLoop:{ maxRounds:2, deadlineAt:deadlineAt() } };
+  executionLoop:{ mode:"until-ready" as const } };
  const parent = await f.controller.delegate(f.goal.runId,spec);
  assert.equal(parent.status,"returned"); assert.equal(parent.loopStopReason,"reviewer-invalid");
  assert.ok(parent.branchSource, parent.branchUnavailableReason ?? "checkpoint unavailable");
@@ -57,7 +146,7 @@ test("nonrecoverable reviewer format still permits an honest rejected task and f
  assert.equal(reviewed.status,"rejected");
  const context = {mode:"fork" as const,parentRunId:f.goal.runId,
   parentTaskId:parent.taskId,checkpointId:parent.branchSource!.checkpoint.id};
- await assert.rejects(f.controller.delegate(f.goal.runId,{...spec,executionLoop:{...spec.executionLoop,maxRounds:1},context}),
+ await assert.rejects(f.controller.delegate(f.goal.runId,{...spec,executionLoop:undefined,context}),
   /review-loop obligations/);
  const child = await f.controller.delegate(f.goal.runId,{...spec,context});
  assert.equal(child.status,"returned", child.executionFailure ?? "fork failed");
@@ -72,7 +161,7 @@ test("opt-in M07 repair keeps one builder, creates fresh reviewers, and preserve
   }
   return `builder round ${turnIndex}`;
  });
- const task = await f.controller.delegate(f.goal.runId,{objective:"execute one candidate",inputs:[f.guide],planInput:f.guide,resourceInputs:[{id:"kernelwiki",version:"2026.04",input:f.guide}],expectedOutputs:["result.txt","delta.json"],lessonDeltaOutput:"delta.json",checks:["result inspected"],mode:"execute",executionLoop:{maxRounds:2,deadlineAt:deadlineAt()}});
+ const task = await f.controller.delegate(f.goal.runId,{objective:"execute one candidate",inputs:[f.guide],planInput:f.guide,resourceInputs:[{id:"kernelwiki",version:"2026.04",input:f.guide}],expectedOutputs:["result.txt","delta.json"],lessonDeltaOutput:"delta.json",checks:["result inspected"],mode:"execute",executionLoop:{mode:"until-ready"}});
  assert.equal(task.status,"returned"); assert.equal(task.loopStopReason,"ready");
  assert.equal(task.executionRounds?.length,2);
  assert.equal(task.executionRounds?.[0].verdict,"revise");
@@ -92,31 +181,31 @@ test("opt-in M07 repair keeps one builder, creates fresh reviewers, and preserve
 
 test("ready reviewer cannot approve candidate changed afterward", async t => {
  const f=await fixture(t,async ({spec})=>{if(spec.label.includes("reviewer"))return JSON.stringify({verdict:"ready",feedback:"reviewed snapshot"}); if(spec.tools.kind==="execution")await writeFile(path.join(spec.tools.root,"result.txt"),"reviewed"); return "done";});
- const task=await f.controller.delegate(f.goal.runId,{objective:"candidate",inputs:[f.guide],planInput:f.guide,expectedOutputs:["result.txt"],checks:["same candidate"],mode:"execute",executionLoop:{maxRounds:1,deadlineAt:deadlineAt()}});
+ const task=await f.controller.delegate(f.goal.runId,{objective:"candidate",inputs:[f.guide],planInput:f.guide,expectedOutputs:["result.txt"],checks:["same candidate"],mode:"execute",executionLoop:{mode:"until-ready"}});
  await writeFile(path.join(task.workDir,"result.txt"),"changed later");
  await assert.rejects(f.controller.review(f.goal.runId,{taskId:task.taskId,checks:[{criterion:"same candidate",result:"passed",evidence:[path.join(task.workDir,"result.txt")]}],artifacts:[path.join(task.workDir,"result.txt")]}),/changed after ready/);
 });
 
 test("ready reviewer cannot approve extra evidence added after its snapshot", async t => {
  const f=await fixture(t,async ({spec})=>{if(spec.label.includes("reviewer"))return JSON.stringify({verdict:"ready",feedback:"reviewed snapshot"}); if(spec.tools.kind==="execution")await writeFile(path.join(spec.tools.root,"result.txt"),"reviewed"); return "done";});
- const task=await f.controller.delegate(f.goal.runId,{objective:"candidate",inputs:[],expectedOutputs:["result.txt"],checks:["same candidate"],mode:"execute",executionLoop:{maxRounds:1,deadlineAt:deadlineAt()}});
+ const task=await f.controller.delegate(f.goal.runId,{objective:"candidate",inputs:[],expectedOutputs:["result.txt"],checks:["same candidate"],mode:"execute",executionLoop:{mode:"until-ready"}});
  await writeFile(path.join(task.workDir,"extra.txt"),"new unreviewed claim");
  await assert.rejects(f.controller.review(f.goal.runId,{taskId:task.taskId,checks:[{criterion:"same candidate",result:"passed",evidence:[path.join(task.workDir,"extra.txt")]}],artifacts:[path.join(task.workDir,"result.txt"),path.join(task.workDir,"extra.txt")]}),/added after ready/);
 });
 
-test("max-round stop can be reviewed as rejected but cannot be accepted", async t => {
- const f=await fixture(t,async ({spec})=>{if(spec.label.includes("reviewer"))return JSON.stringify({verdict:"revise",feedback:"still incomplete"}); if(spec.tools.kind==="execution")await writeFile(path.join(spec.tools.root,"result.txt"),"partial"); return "partial";});
- const task=await f.controller.delegate(f.goal.runId,{objective:"candidate",inputs:[],expectedOutputs:["result.txt"],checks:["checked"],mode:"execute",executionLoop:{maxRounds:1,deadlineAt:deadlineAt()}});
- assert.equal(task.loopStopReason,"max-rounds");
+test("blocked reviewer verdict can be reviewed as rejected but cannot be accepted", async t => {
+ const f=await fixture(t,async ({spec})=>{if(spec.label.includes("reviewer"))return JSON.stringify({verdict:"blocked",feedback:"still incomplete"}); if(spec.tools.kind==="execution")await writeFile(path.join(spec.tools.root,"result.txt"),"partial"); return "partial";});
+ const task=await f.controller.delegate(f.goal.runId,{objective:"candidate",inputs:[],expectedOutputs:["result.txt"],checks:["checked"],mode:"execute",executionLoop:{mode:"until-ready"}});
+ assert.equal(task.loopStopReason,"blocked");
  const result=path.join(task.workDir,"result.txt");
  const reviewed=await f.controller.review(f.goal.runId,{taskId:task.taskId,checks:[{criterion:"checked",result:"passed",evidence:[result]}],artifacts:[result]});
  assert.equal(reviewed.status,"rejected"); assert.match(reviewed.review?.failures.join(" ")??"",/without a ready handoff/);
 });
 
-test("round-two abort leaves unknown operation and blocks renewed execution", async t => {
- const f=await fixture(t,async ({spec,turnIndex})=>{if(spec.label.includes("reviewer"))return JSON.stringify({verdict:"revise",feedback:"try again"}); if(spec.tools.kind==="execution"&&turnIndex===2)return new Promise<string>(()=>{}); return "round one";});
- const task=await f.controller.delegate(f.goal.runId,{objective:"candidate",inputs:[f.guide],expectedOutputs:["result.txt"],checks:["checked"],mode:"execute",executionLoop:{maxRounds:2,deadlineAt:new Date(Date.now()+500).toISOString()}});
- assert.equal(task.status,"failed"); assert.equal(task.loopStopReason,"deadline");
+test("round-two execution failure leaves unknown operation and blocks renewed execution", async t => {
+ const f=await fixture(t,async ({spec,turnIndex})=>{if(spec.label.includes("reviewer"))return JSON.stringify({verdict:"revise",feedback:"try again"}); if(spec.tools.kind==="execution"&&turnIndex===2) throw new Error("synthetic interrupted execution"); return "round one";});
+ const task=await f.controller.delegate(f.goal.runId,{objective:"candidate",inputs:[f.guide],expectedOutputs:["result.txt"],checks:["checked"],mode:"execute",executionLoop:{mode:"until-ready"}});
+ assert.equal(task.status,"failed"); assert.match(task.executionFailure ?? "", /synthetic interrupted execution/);
  const state=await f.controller.status(f.goal.runId);
  assert.deepEqual(state.executionState?.operations.map(x=>x.status),["response-received","unknown"]);
  await assert.rejects(f.controller.delegate(f.goal.runId,{objective:"do not retry",inputs:[],expectedOutputs:["next.txt"],checks:["checked"],mode:"execute"}),/副作用状态未知/);
@@ -131,7 +220,7 @@ test("an unbranded local-stop claim cannot settle an issued M07 operation", asyn
 	});
 	const task = await f.controller.delegate(f.goal.runId, { objective: "synthetic task", inputs: [],
 		expectedOutputs: ["result.txt"], checks: ["checked"], mode: "execute",
-		executionLoop: { maxRounds: 1, deadlineAt: deadlineAt() } });
+		executionLoop: { mode: "until-ready" } });
 	assert.equal(task.status, "failed");
 	const goal = await f.controller.status(f.goal.runId);
 	assert.equal(goal.executionState?.operations[0].status, "unknown");
@@ -140,7 +229,7 @@ test("an unbranded local-stop claim cannot settle an issued M07 operation", asyn
 
 test("changed plan copy and invalid candidate delta fail closed", async t => {
  const f=await fixture(t,async ({spec})=>{if(spec.label.includes("reviewer"))return JSON.stringify({verdict:"ready",feedback:"ready"}); if(spec.tools.kind==="execution"){const [copy]=await readdir(path.join(spec.tools.root,"inputs")); await writeFile(path.join(spec.tools.root,"inputs",copy),"changed"); await writeFile(path.join(spec.tools.root,"result.txt"),"done");} return "done";});
- const task=await f.controller.delegate(f.goal.runId,{objective:"candidate",inputs:[f.guide],planInput:f.guide,expectedOutputs:["result.txt"],checks:["checked"],mode:"execute",executionLoop:{maxRounds:1,deadlineAt:deadlineAt()}});
+ const task=await f.controller.delegate(f.goal.runId,{objective:"candidate",inputs:[f.guide],planInput:f.guide,expectedOutputs:["result.txt"],checks:["checked"],mode:"execute",executionLoop:{mode:"until-ready"}});
  assert.equal(task.status,"failed"); assert.match(task.executionFailure??"",/changed a frozen plan/);
  const g=await fixture(t,async ({spec})=>{if(spec.tools.kind==="execution"){await writeFile(path.join(spec.tools.root,"result.txt"),"done"); await writeFile(path.join(spec.tools.root,"delta.json"),JSON.stringify({version:1,action:"propose",observation:"unsupported",applicability:"this case",evidencePaths:["../outside.txt"]}));}return "done";});
  const candidate=await g.controller.delegate(g.goal.runId,{objective:"candidate",inputs:[],expectedOutputs:["result.txt","delta.json"],lessonDeltaOutput:"delta.json",checks:["checked"],mode:"execute"});

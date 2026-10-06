@@ -23,22 +23,17 @@ campaign 的预算和账目只覆盖它启动的提议、两臂及读回调用�
 - CLI：`node src/cli.ts improve status|run|rollback|export|bind --workspace <dir>`；运行需 `improve run --plan <json>`。
 - Pi extension：显式加载后使用 `research_improve`，`run` 动作需提供 `planPath`；另有 `status`、`rollback`、`export`、`bind`。
 - `run` 读取工作区 `research.config.json` 的 `roles.improver`；准入案例还需 `roles.research`。harness 不替用户选择模型。
-- 无 `caseSetPath` 或实验调用预算时只做投影筛选，正常结束为无准入证据的状态，不会晋级。
+- 无 `caseSetPath` 时只做投影筛选，正常结束为无准入证据的状态，不会晋级。
 - 案例集结构及校验规则见 [`MechanismCaseSet` 与 `validateCaseSet`](../../src/improvement/admission.ts)；`checker` 是控制器私有的准入检查定义，不送给受测会话。
 
-一个通用的准入计划结构如下。示例中除 `caseSetPath` 外均为必填字段；该可选路径相对工作区根目录，指向调用方自己准备的私有案例集。具体预算需由调用方按任务和模型定值。
+一个通用的准入计划结构如下。示例中除 `caseSetPath` 外均为必填字段；该可选路径相对工作区根目录，指向调用方自己准备的私有案例集。具体预算需由调用方按任务和模型定值。旧计划中的 `maxTotalOutputTokens` 仅为历史字段，新请求不再按它截断或停止；输出用量仍记录，费用预算照常校验。
 
 ```json
 {
   "version": 1,
-  "maxCandidates": 2,
-  "maxTrialCalls": 12,
   "repetitions": 2,
   "maxReadbackChars": 20000,
-  "maxTotalInputTokens": 100000,
-  "maxTotalOutputTokens": 20000,
   "maxTotalCost": 10,
-  "timeoutMs": 120000,
   "caseSetPath": "./cases/admission.json"
 }
 ```
@@ -59,7 +54,7 @@ campaign 的预算和账目只覆盖它启动的提议、两臂及读回调用�
 
 当前 CPU 数值环境只在一组预先列出的仿射或二次响应假设间做主动辨识。初态可以不足以分辨真值；合法探针返回带单位的观测，开发反馈可报告与已见观测相容、矛盾或仍未定，但不暴露私有真值。每个对比臂从同一初态独立 fork；受保护答案只在两个候选都已固定后由控制器检查，不作为 I 的开发反馈。受控 I/H 子会话没有通用工具，只接收白名单内的开发材料，G 结果不回灌；这是子会话上下文隔离，不是同机文件的 OS 权限隔离。调用入口的主 Pi 若另有普通读文件或 bash 权限，仍可能访问私有案例；不能宣称隐藏集对整个主 agent 密封。策略正文也不能改变动作白名单、事实生成器或预算，源代码候选执行尚未开放。单位按案例公开的固定单位解释；不同单位输入的诊断与换算尚未实现。
 
-科研方法 campaign 另用调用方显式给出的根预算约束它启动的 I/H/meta 子请求：provider 调用、完整输入 token、输出 token、SDK 估计费用、探针、CPU 和壁钟；分支预算从同一根账扣除。缓存读写计入输入，推理输出已包含在 provider 的 output 口径，不重复加计；缺失 usage 或价格、超额和未结算调用均不能用于自动晋级。若由 extension 调用，主 Pi 编排会话另有 best-effort 主账，却不经同一根预算预约；CLI 没有主 Pi 会话。两者都不计 Codex 人工开发，也不是完整 workflow 或 provider 账单。`development` 仅供形成假设和观察结果。独立 `admission` 需要完整案例、交替顺序的重复双臂、受保护质量检查和冻结选择；H 质量与 I 产生后继 H 的能力分别评价，不能把一次碰巧作答或成本下降写成科研收益。证据仍不足时合理停止并明确报告未定，是应记录的部分质量，不等于错误答案，也不满足完整解题门槛。没有准入材料时运行保持 research-only。
+科研方法 campaign 只设置调用方显式给出的 SDK 估计费用总预算；I/H/meta 各阶段和分支都是同一根账下的用量归集名称，没有独立费用额度，也不预先切分总额度。旧计划的阶段费用字段仅供兼容读取，不参与准入。新计划不设置执行时长、调用/决策/候选/检查次数，或输入/输出 token 总量配额；历史相应字段仅供兼容读取，不进入活动预算或提示。调用次数、输入和输出 token、CPU 与耗时仍按实际用量记录，输出 token 计入 SDK 估计费用。缓存读写计入输入，推理输出已包含在 provider 的 output 口径，不重复加计；缺失 usage 或价格、超额和未结算调用均不能用于自动晋级。若由 extension 调用，主 Pi 编排会话另有 best-effort 主账，却不经同一根预算预约；CLI 没有主 Pi 会话。两者都不计 Codex 人工开发，也不是完整 workflow 或 provider 账单。`development` 仅供形成假设和观察结果。独立 `admission` 需要完整案例、交替顺序的重复双臂、受保护质量检查和冻结选择；H 质量与 I 产生后继 H 的能力分别评价，不能把一次碰巧作答或成本下降写成科研收益。证据仍不足时合理停止并明确报告未定，是应记录的部分质量，不等于错误答案，也不满足完整解题门槛。没有准入材料时运行保持 research-only。
 
 经验仍存于原 C/K/E/J/Q/D/X 知识库，M04 是现有提案、判断与合入路径；实验反馈不能直接升格为 adopted 或 verified。每个知识库懒初始化稳定 `storeId`，跨库引用须显式注册并固定 `{storeId, recordId, version}`。调用方显式指定目标与有限条经验；选择器检查适用阶段、标签、情境、声明的必要依赖闭包和当前限制，超界或缺失即不给完整经验包。撤回、停用和传递必要依赖会阻止新的使用，历史记录仍可只读追溯；反例与替换史引用不自动当作科学前提。H/I 版本分别保存装载来源 `sourceExperienceRefs`、既有版本保守继承的 `requiredExperienceRefs`，以及结构化声明的必要科学前提 `requiredKnowledgeRefs`；新选入的普通参考不因被阅读就变成必要前提，旧版已记录的必要约束也不会被自动降级。候选正文和后续计划省略引用，都不能清除必要约束；新的 I/H 调用、激活、回退和 V2 导入前重查。跨库注册必须显式注入服务，方法包本身不导入外库记录。仅有选中或装载不证明忠实使用、科学正确或因果收益。
 
@@ -73,11 +68,11 @@ M07 `evidence-handoff` 另有显式单槽入口：`improve research bootstrap --
 
 开发材料供 I 检视之前先核对 M07 冻结包与 M04 来源绑定。历史 `developmentSource` 仅提供反馈，不充当新执行臂的形式基线；在任何 I 调用前，控制器要求当前知识快照、冻结 H/K 与最新 completed 形式 M04 基线的知识纪元一致，执行臂复制该形式基线。基线和候选在独立新工作区、固定知识快照、模型配置与检查下执行 M07 委派、review、checkpoint 及 M04 处理；控制器检查冻结报告及 M04 对完整报告的实际接收记录。受保护 G 在 I 固定候选后才打开，结果不回灌 I。`contains`/`forbids` 是报告文字的机械完整性门，只能称本地交接机制证据，不能声称科学有效或泛化收益；没有独立 G、完整可见用量或每臂通过条件时不自动激活。开发及准入案例均由调用方从已有资料准备，不存在系统预写赢家。历史 P3 checkpoint 与处理它的 M04 run 可作 `developmentSource`，但独立 G、当前形式基线及预算仍须另行冻结；M04/K 可能带历史先验，不能把案例路径隔离称为语义盲测。
 
-该入口在每次带工具的 Pi prompt 前串行预留当前根账剩余 provider 调用及输入额度，结束按 SDK 可见事件（含缓存输入、输出、估计费用）结算并退回未用额度。缺 usage、超额或 SDK 内部多轮无法完整观测均为 inconclusive，不能晋级。Pi SDK 目前不能在单个 prompt 内精确物理截断第 N 次 provider 调用，因此这是可见成本的准入边界，而非 provider 账单或物理硬停。离线测试包含实际 Pi runner 与本地 fake provider 的两轮工具读取、服务级配对与无赢家路径、CLI bootstrap 至 workflow 入口的缺用量失败闭合。两次真实模型 P3 development 试跑累计有五次可见 provider 事件；首轮发现旧 CPU 系统动作格式冲突，次轮 I 完成 inspect→propose→evaluate-development，但独立臂因私有副本当前 K 与历史 M04 基线不同而未启动 M07/M04，最后的空候选 stop 也被过严解析拒绝。两处已按实际失败修正并有离线回归；不把修复后的入口称为已完成真实模型配对验证。真实 I 后继继承、独立 G 准入、完整真实 L5 收益仍未验证。
+该入口在每次带工具的 Pi prompt 前检查根账仍有可用费用并串行登记未结算请求，结束后按 SDK 可见事件（含缓存输入、输出、估计费用）结算。缺 usage、总费用超额或 SDK 内部多轮无法完整观测均为 inconclusive，不能晋级。单个 Pi prompt 及 CPU 模型回复的最终费用只能在结算后确认，故可能超过总额度；超额后阻止后续请求。这是 SDK 可见估计费用的事后准入边界，不是 provider 账单或物理硬停。离线测试包含实际 Pi runner 与本地 fake provider 的两轮工具读取、服务级配对与无赢家路径、CLI bootstrap 至 workflow 入口的缺用量失败闭合。两次真实模型 P3 development 试跑累计有五次可见 provider 事件；首轮发现旧 CPU 系统动作格式冲突，次轮 I 完成 inspect→propose→evaluate-development，但独立臂因私有副本当前 K 与历史 M04 基线不同而未启动 M07/M04，最后的空候选 stop 也被过严解析拒绝。两处已按实际失败修正并有离线回归；不把修复后的入口称为已完成真实模型配对验证。真实 I 后继继承、独立 G 准入、完整真实 L5 收益仍未验证。
 
 新路径的 CLI 与上文旧预算策略 `improve run` 分开：先以 `node src/cli.ts improve research bootstrap --workspace <dir> --methods <methods.json>` 显式写入 H/I 种子，再以 `node src/cli.ts improve research run --workspace <dir> --plan <plan.json>` 启动。`methods.json` 的字段由 [`ResearchBootstrapInput`](../../src/improvement/research-service.ts) 定义；案例集及校验见 [`CpuCaseSetV1` 与 `validateCpuCaseSet`](../../src/experiments/local-environment.ts)。`status`、`rollback`、`export --version <id> --out <package.json>` 和 `bind --package <package.json>` 同在 `improve research` 下；`bind` 是显式人工导入。跨轮知识更新用 `advance-knowledge --m04-run <id> --expected-bundle <id>`；精确前提变更用 `transition-dependencies --m04-run <id> --expected-bundle <id> --method-version <id> --decision-ref <ref.json>`，后者的输入和结构校验见 [`KnowledgeRef`](../../src/knowledge/types.ts) 与 [knowledge-epoch.ts](../../src/improvement/knowledge-epoch.ts)。这些操作也可由显式 Pi extension action 调用。
 
-例如，下列结构选择 H 的质量路径，假设准入集只有一个案例；**数值仅用于演示活动与阶段预算字段，没有经过真实多案例 H/I 工作负载校准，不应复制为默认上限，更不适用于主 Pi 科研工作流**。实际计划须先测组装请求和开发 pilot 的用量，再由调用方确定活动与阶段的总资源额度。`admissionCaseSetPath` 可省略，此时只保留开发记录而不晋级。案例文件必须由调用方私下提供，不应把真值或检查答案放进模型提示。元改进需另给 `target: "improver"`、`metaProtocol`、每臂候选上限与分支预算；两臂从同一冻结 H/K 与同一经验选择出发，各自建立开发 fork，先固定全部后继再查受保护案例。`MetaEpisode` 仅记录受保护检查前的有界开发历史，后续 plan 通过同工作区 `metaEpisodeRunIds` 显式选用；未有赢家和预算内不可判定均保留各自状态，历史不能充作新的 G 证据。
+例如，下列结构选择 H 的质量路径，假设准入集只有一个案例；**总费用数值仅用于演示，没有经过真实多案例 H/I 工作负载校准，不应复制为默认上限，更不适用于主 Pi 科研工作流**。实际计划须由调用方确定唯一的活动总费用额度。`admissionCaseSetPath` 可省略，此时只保留开发记录而不晋级。案例文件必须由调用方私下提供，不应把真值或检查答案放进模型提示。元改进需另给 `target: "improver"` 和 `metaProtocol`；两臂从同一冻结 H/K 与同一经验选择出发，各自建立开发 fork，先固定全部后继再查受保护案例。`MetaEpisode` 仅记录受保护检查前的有界开发历史，后续 plan 通过同工作区 `metaEpisodeRunIds` 显式选用；未有赢家和预算内不可判定均保留各自状态，历史不能充作新的 G 证据。
 
 ```json
 {
@@ -86,24 +81,12 @@ M07 `evidence-handoff` 另有显式单槽入口：`improve research bootstrap --
   "target": "executor",
   "developmentCaseSetPath": "./cases/development.json",
   "admissionCaseSetPath": "./cases/admission.json",
-  "maxDecisions": 6,
-  "maxCandidates": 2,
   "admissionRepetitions": 2,
   "maxFeedbackItems": 8,
-  "perPromptTimeoutMs": 120000,
   "searchReplicates": 1,
   "outcomeReplicates": 2,
-  "outerBudget": { "maxProviderCalls": 16, "maxInputTokens": 320000, "maxOutputTokens": 32768, "maxSdkEstimatedCost": 100, "maxProbeCalls": 16, "maxCpuMillis": 20000, "maxWallMillis": 240000 },
-  "pilotBudget": { "maxProviderCalls": 1, "maxInputTokens": 20000, "maxOutputTokens": 2048, "maxSdkEstimatedCost": 20, "maxProbeCalls": 0, "maxCpuMillis": 1000, "maxWallMillis": 120000 },
-  "protectedBudget": { "maxProviderCalls": 12, "maxInputTokens": 240000, "maxOutputTokens": 24576, "maxSdkEstimatedCost": 800, "maxProbeCalls": 16, "maxCpuMillis": 20000, "maxWallMillis": 240000 },
   "budget": {
-    "maxProviderCalls": 100,
-    "maxInputTokens": 1000000,
-    "maxOutputTokens": 200000,
-    "maxSdkEstimatedCost": 1000,
-    "maxProbeCalls": 32,
-    "maxCpuMillis": 60000,
-    "maxWallMillis": 600000
+    "maxSdkEstimatedCost": 1000
   },
   "experienceRefs": [],
   "experienceMaxRecords": 0,
@@ -111,8 +94,8 @@ M07 `evidence-handoff` 另有显式单槽入口：`improve research bootstrap --
 }
 ```
 
-I 的元改进路径需单独编制预算；上述 H 示例的 `pilotBudget.maxProviderCalls: 1` 不能支持一个实际内层搜索。将 `experimentKind` 改为 `meta-improvement`、`target` 改为 `improver` 时，还须提供足以覆盖候选提出、开发评价、终态选择及 H 执行的 pilot 额度。若提供受保护的 `admissionCaseSetPath`，还须显式提供 `metaProtocol`、`metaBranchBudget`（同一组预算字段）与 `maxCandidatesPerMetaArm`，两臂各自受该上限约束并共享根账。`experienceRefs` 可显式选择有界非空包，控制器在两臂使用同一次冻结选择并在新请求前复查 live 限制。`priorDevelopmentFeedbackPath` 若提供，只能装载受校验的开发反馈，不能把受保护答案移进 I 的上下文。
+I 的元改进路径同样只使用活动总费用额度；没有 pilot、受保护阶段或分支的独立费用门槛。将 `experimentKind` 改为 `meta-improvement`、`target` 改为 `improver` 且提供受保护的 `admissionCaseSetPath` 时，仍须显式提供 `metaProtocol`；两臂共享根费用账。`experienceRefs` 可显式选择有界非空包，控制器在两臂使用同一次冻结选择并在新请求前复查 live 限制。`priorDevelopmentFeedbackPath` 若提供，只能装载受校验的开发反馈，不能把受保护答案移进 I 的上下文。
 
-请求准备使用已组装提示词的 UTF-8 字节数加 2048 字节的 SDK/JSON 余量，作为实际 payload 的字节边界及保守输入 token 预留；这不是固定的单次输入额度，也不是 provider 实测 token。如果这一条已组装请求超过活动或阶段剩余的总输入预算，请求不会发出。模型返回后以独立 usage 结算输入、输出和 SDK 估算费用。
+请求准备使用已组装提示词的 UTF-8 字节数加 2048 字节的 SDK/JSON 余量，作为实际 payload 的字节边界与账务输入估计；这不是 provider 实测 token，也不限制累计输入 token。模型返回后以独立 usage 记录输入、输出和 SDK 估算费用。
 
-方法研究的提示词不再另受固定 4 万字符消息、8 千字符 system 或决策 JSON 长度门槛约束；完整组装请求只受模型上下文能力、实际 payload 检查及活动与阶段剩余总输入预算约束。有限的最近反馈与 inspect 页窗口会向 I 报告总数和省略数；旧开发材料仍留在控制器登记的对象中供按页读取。项目不再设置单次输入或输出 token 额度，也不再以固定的 16000 字符拒绝模型回复；Pi SDK 和 provider 的模型物理限制仍适用。输出和 SDK 估算费用在请求完成后按实测 usage 结算：最后一条回复可能超出活动或阶段预算，超额会被标记并停止后续请求，不能用于自动晋级。受保护阶段预检只保证声明的调用次数与各阶段总额度能装进活动总额度，不保证未知的实际 token 和费用能覆盖所有 G 请求；预算不足时结果不可判定。
+方法研究的提示词不再另受固定消息、system 或模型回复字符门槛约束；完整组装请求仍受模型物理上下文与实际 payload 字节检查约束。有限的最近反馈与 inspect 页窗口会向 I 报告总数和省略数；旧开发材料仍留在控制器登记的对象中供按页读取。项目不再设置单次或累计输入/输出 token 配额，也不以固定字符数拒绝模型回复；Pi SDK 和 provider 的模型物理限制仍适用。输出用量在请求完成后按实测 usage 记录并计入 SDK 估算费用；最后一条回复可能使费用预算超额，超额会被标记并停止后续请求，不能用于自动晋级。受保护阶段预检只创建各阶段用量归集名称，不预留或保证任何阶段的费用；总额度不足以完成全部 G 请求时结果不可判定。

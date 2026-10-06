@@ -18,9 +18,9 @@ const usage = { input: 100, output: 20, cacheRead: 0, cacheWrite: 0, totalTokens
 const goal = { goal: "核对一个固定材料的证据交接", problemRelation: "直接关联", constraints: ["原问题不变"], successCriteria: ["保留原始证据与未执行项"], plan: "单项证据交接", exploratory: false };
 const task = { objective: "交接固定证据", inputs: [], expectedOutputs: [], checks: ["报告包含核查结果"], mode: "reason" as const };
 const caseOf = (split: "development" | "admission", id: string, marker: string) => ({ version: 1, split, cases: [{ id, goal: { ...goal, plan: `${goal.plan} ${id}` }, task: { ...task, objective: `${task.objective} ${id}` }, checks: [{ criterion: task.checks[0], contains: [marker], forbids: ["伪造证据"] }] }] });
-const limits = { maxProviderCalls: 40, maxInputTokens: 2_000_000, maxOutputTokens: 100_000, maxSdkEstimatedCost: 10, maxProbeCalls: 0, maxCpuMillis: 100_000, maxWallMillis: 120_000 };
+const limits = { maxProviderCalls: 40, maxInputTokens: 2_000_000, maxSdkEstimatedCost: 10, maxProbeCalls: 0, maxCpuMillis: 100_000, maxWallMillis: 120_000 };
 
-async function fixture(t: import("node:test").TestContext, responder?: (ctx: FakeReplyContext) => string | Promise<string>, viaCli = false, withExperience = false) {
+async function fixture(t: import("node:test").TestContext, responder?: (ctx: FakeReplyContext) => string | Promise<string>, viaCli = false, withExperience = false, executorBody = "列出原始证据、限制和未执行项。") {
 	const parent = await mkdtemp(path.join(os.tmpdir(), "pre-rsi-workflow-"));
 	t.after(() => rm(parent, { recursive: true, force: true }));
 	const root = path.join(parent, "source");
@@ -39,7 +39,7 @@ async function fixture(t: import("node:test").TestContext, responder?: (ctx: Fak
 	const initial = await ws.startRun("M04", [{ label: "原问题", path: ws.problemFile }], (await knowledge.current())?.id);
 	await ws.finishRun(initial, "completed");
 	const gen = new GenerationStore(root);
-	const seed = { version: 1 as const, executor: { version: 1 as const, kind: "m07-workflow-prompt" as const, slot: "evidence-handoff" as const, body: "列出原始证据、限制和未执行项。" }, improver: { version: 1 as const, kind: "diagnostic-improver-prompt" as const, body: "依据开发反馈提出一个可检验的证据交接改进。" }, applicability: ["M07"] };
+	const seed = { version: 1 as const, executor: { version: 1 as const, kind: "m07-workflow-prompt" as const, slot: "evidence-handoff" as const, body: executorBody }, improver: { version: 1 as const, kind: "diagnostic-improver-prompt" as const, body: "依据开发反馈提出一个可检验的证据交接改进。" }, applicability: ["M07"] };
 	if (viaCli) { await writeFile(path.join(root, "methods.json"), JSON.stringify(seed)); assert.equal(await main(["improve", "research", "bootstrap", "--workspace", root, "--methods", path.join(root, "methods.json")]), 0); }
 	else await new ResearchImprovementService({ workspaceRoot: root, runner: new FakeSessionRunner(() => "unused") }).bootstrap(seed);
 	const bundle = (await gen.active())!.bundle;
@@ -59,6 +59,25 @@ async function fixture(t: import("node:test").TestContext, responder?: (ctx: Fak
 	await writeFile(path.join(root, "admission.json"), JSON.stringify(caseOf("admission", "holdout-b", "保护证据完整")));
 	return { parent, root, ws, gen, runner, plan, begun, bundle, knowledge, experienceRef };
 }
+
+test("workflow I can repeatedly inspect past the old cumulative readback limit", async (t) => {
+	let reads = 0;
+	const f = await fixture(t, (ctx) => {
+		if (ctx.spec.role !== "improver") return "offline source";
+		const view = JSON.parse(ctx.message.slice(ctx.message.indexOf("\n") + 1));
+		assert.equal("remainingActions" in view, false);
+		return JSON.stringify(reads++ < 11
+			? { kind: "inspect", object: "method", id: view.current.executorVersionId, start: 0, maxChars: 4_000 }
+			: { kind: "stop", reason: "eleven full method reads observed" });
+	}, false, false, "x".repeat(4_000));
+	const formal = await f.ws.startRun("M04", [{ label: "原问题", path: f.ws.problemFile }], (await f.knowledge.current())?.id);
+	await f.ws.finishRun(formal, "completed");
+	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).runWorkflow({ ...f.plan, maxReadbackChars: 1, maxInspectActions: 1 });
+	assert.equal(run.outcome, "completed-no-candidate", run.stopReason ?? "");
+	assert.equal(run.decisions.filter((decision) => decision.action === "inspect").length, 11);
+	assert.equal(run.inspectionReadbackBytesObserved, 44_000);
+	assert.equal(reads, 12);
+});
 
 test("explicit workflow adapter runs frozen M07/M04 arms, checks G after selection, and activates only a new H", async (t) => {
 	let proposed = false;
@@ -93,7 +112,7 @@ test("explicit workflow adapter runs frozen M07/M04 arms, checks G after selecti
 	assert.equal(await readFile(path.join(f.ws.runDir("M07", f.begun.runId), "goal.json"), "utf8"), sourceM07, "existing goal must not be hot-swapped");
 });
 
-test("workflow promotion stays closed when wall time expires after G but before pointer activation", async (t) => {
+test("workflow promotion is not blocked by a legacy wall-time quota after G", async (t) => {
 	const f = await fixture(t, (ctx) => {
 		if (ctx.spec.role === "improver") {
 			const index = Number(ctx.spec.label.split("-").at(-1));
@@ -119,9 +138,8 @@ test("workflow promotion stays closed when wall time expires after G but before 
 	});
 	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).runWorkflow(f.plan);
 	assert.equal(admittedBundleWritten, true, run.stopReason ?? "");
-	assert.equal(run.status, "inconclusive");
-	assert.match(run.stopReason ?? "", /wall budget exhausted/);
-	assert.equal((await f.gen.active())!.bundle.bundleId, before);
+	assert.equal(run.status, "promoted");
+	assert.notEqual((await f.gen.active())!.bundle.bundleId, before);
 });
 
 test("no winner, including an explicit null selection, performs no protected G work", async (t) => {

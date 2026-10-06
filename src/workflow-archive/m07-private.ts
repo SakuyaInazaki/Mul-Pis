@@ -13,7 +13,6 @@ import type { KnowledgeRecord, KnowledgeRef, KnowledgeStore, Limit, Snapshot } f
 const ARCHIVE_NAME = "workflow-archive.json";
 /** Fixed name for the private transport allowlist; never publish this file directly. */
 export const M04_KNOWLEDGE_EXPORT_NAME = "m04-adopted-knowledge.json";
-const MAX_ROUNDS = 8;
 const MAX_REVIEW_TEXT_BYTES = 512_000;
 const MAX_KNOWLEDGE_RECORDS = 48;
 const MAX_KNOWLEDGE_BYTES = 256_000;
@@ -309,12 +308,11 @@ async function archiveRoundArtifact(sourceRoot: string | undefined, index: numbe
 
 async function archiveRounds(task: M07TaskRecord, destination: string): Promise<PrivateM07ArchiveV1["controllerEvidence"]["rounds"]> {
 	const rounds = task.executionRounds ?? [];
-	if (rounds.length > MAX_ROUNDS) throw new Error("M07 archive has too many execution rounds");
 	const seen = new Set<number>();
 	const result: PrivateM07ArchiveV1["controllerEvidence"]["rounds"] = [];
 	const parentReal = await realpath(path.dirname(task.workDir));
 	for (const round of rounds) {
-		if (!Number.isSafeInteger(round.index) || round.index < 1 || round.index > MAX_ROUNDS || seen.has(round.index))
+		if (!Number.isSafeInteger(round.index) || round.index < 1 || seen.has(round.index))
 			throw new Error("M07 archive has invalid execution round index");
 		seen.add(round.index);
 		// The snapshot must be the controller's known sibling, not a path supplied by model output.
@@ -383,7 +381,6 @@ async function lessonState(raw: Buffer, workDir: string): Promise<PrivateM07Arch
 async function archivedOperationOutcomes(goal: CurrentGoal, task: M07TaskRecord): Promise<
 	NonNullable<PrivateM07ArchiveV1["controllerEvidence"]["operationOutcomes"]>> {
 	const operations = (goal.executionState?.operations ?? []).filter(item => item.taskId === task.taskId);
-	if (operations.length > MAX_ROUNDS) throw new Error("private M07 operation count exceeds bounded rounds");
 	return Promise.all(operations.map(async operation => {
 		if (operation.status === "not-issued" && operation.observationMethod === "host-local-admission-rejection") {
 			const expected = path.join(path.dirname(task.workDir), "local-not-issued-receipt.json");
@@ -709,11 +706,10 @@ export async function loadPrivateM07Archive(directory: string): Promise<{ archiv
 		if (item.name === "verification.json") result.verification = source.source;
 		if (item.name === "lesson-delta.json") result.lesson = source.source;
 	}
-	if (!Array.isArray(archive.controllerEvidence?.rounds) || archive.controllerEvidence.rounds.length > MAX_ROUNDS)
+	if (!Array.isArray(archive.controllerEvidence?.rounds))
 		throw new Error("private M07 archive round manifest is invalid");
 	if (archive.controllerEvidence.operationOutcomes !== undefined &&
 		(!Array.isArray(archive.controllerEvidence.operationOutcomes) ||
-			archive.controllerEvidence.operationOutcomes.length > MAX_ROUNDS ||
 			archive.controllerEvidence.operationOutcomes.some(item => !/^O\d{3,}$/.test(item.operationId) ||
 				!["prepared", "issued", "response-received", "partial-settled", "terminal-response-incomplete", "unknown", "confirmed", "not-issued"].includes(item.status) ||
 				(item.localNotIssued !== undefined && (item.status !== "not-issued" ||
@@ -738,7 +734,7 @@ export async function loadPrivateM07Archive(directory: string): Promise<{ archiv
 		throw new Error("private M07 archive operation outcomes are invalid");
 	const seen = new Set<number>();
 	for (const round of archive.controllerEvidence.rounds) {
-		if (!Number.isSafeInteger(round.index) || round.index < 1 || round.index > MAX_ROUNDS || seen.has(round.index))
+		if (!Number.isSafeInteger(round.index) || round.index < 1 || seen.has(round.index))
 			throw new Error("private M07 archive round identity is invalid");
 		seen.add(round.index);
 		const found: { index: number; candidate?: string; verification?: string; feedback?: string; reviewerReport?: string } = { index: round.index };

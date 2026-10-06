@@ -7,7 +7,6 @@ import type { StageRunRecord } from "../types.ts";
 import { HarnessError } from "../types.ts";
 
 const MAX_EVIDENCE_BYTES = 1_000_000;
-const MAX_ASSESSMENT_BYTES = 32_000;
 const safeAdapterId = (value: unknown): value is string => typeof value === "string" && /^[a-z][a-z0-9._/-]{0,95}$/.test(value);
 const safeName = (value: string) => /^[A-Za-z][A-Za-z0-9._-]{0,79}$/.test(value);
 const safeInputName = (value: string) => /^[A-Za-z0-9][A-Za-z0-9 ._()-]{0,119}$/.test(value);
@@ -56,7 +55,7 @@ export interface ModelObjectiveAssessmentV1 {
 }
 
 export type ObjectiveStopReason = "budget-boundary" | "provider-call-limit" | "accounting-integrity-error" |
-	"time-boundary" | "assessment-failed" |
+	"time-boundary" | "cancelled" | "output-limit" | "assessment-failed" |
 	"assessment-invalid" | "assessment-evidence-unread" | "model-reported-blocked" | "model-closure-unverified" |
 	"original-checks-unverified" | "assessment-validation-pending" | "next-task-pending" | "next-task-needs-capability" |
 	"objective-reassessment-pending" | "dispatch-failed" | "no-progress" | "capability-replan-stalled" |
@@ -87,15 +86,13 @@ export interface ObjectiveProgressV1 {
 
 /** Reassess the unchanged original goal after every bounded child until an actual stop boundary. */
 export async function runOriginalObjectiveLoop(input: {
-	maxIterations: number;
 	admission: () => "admitted" | ObjectiveStopReason;
 	step: (iteration: number) => Promise<{ advanced: boolean; stopReason: ObjectiveStopReason; evidenceRefs?: string[] }>;
 }): Promise<{ stopReason: ObjectiveStopReason; steps: Array<{ iteration: number; advanced: boolean;
 	stopReason: ObjectiveStopReason; evidenceRefs: string[] }> }> {
-	if (!Number.isSafeInteger(input.maxIterations) || input.maxIterations < 1 || input.maxIterations > 64)
-		throw new HarnessError("m07.objective", "objective loop capacity must fit the bounded campaign transport");
 	const steps: Array<{ iteration: number; advanced: boolean; stopReason: ObjectiveStopReason; evidenceRefs: string[] }> = [];
-	for (let iteration = 1; iteration <= input.maxIterations; iteration++) {
+	for (let iteration = 1; ; iteration++) {
+		if (!Number.isSafeInteger(iteration)) throw new HarnessError("m07.objective", "objective iteration identity overflow");
 		const admission = input.admission();
 		if (admission !== "admitted") return { stopReason: admission, steps };
 		const result = await input.step(iteration);
@@ -104,7 +101,6 @@ export async function runOriginalObjectiveLoop(input: {
 		if (!result.advanced || result.stopReason !== "objective-reassessment-pending")
 			return { stopReason: result.stopReason, steps };
 	}
-	return { stopReason: "artifact-capacity-boundary", steps };
 }
 
 export function createOriginalObjective(input: {
@@ -130,7 +126,6 @@ export function createOriginalObjective(input: {
 }
 
 function parseAssessment(text: string, contract: OriginalObjectiveContractV1, evidenceNames: string[]): ModelObjectiveAssessmentV1 {
-	if (Buffer.byteLength(text, "utf8") > MAX_ASSESSMENT_BYTES) throw new HarnessError("m07.objective-assessment", "assessment exceeds the bounded output size");
 	let value: unknown;
 	try { value = JSON.parse(text); } catch { throw new HarnessError("m07.objective-assessment", "assessment is not strict JSON"); }
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new HarnessError("m07.objective-assessment", "assessment object is invalid");
@@ -214,7 +209,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 	evidence: Array<{ name: string; file: string }>;
 	/** Task adapters own artifact names and semantic evidence contracts. */
 	evidenceRequirements?: { requiredNames: string[]; instructions?: string };
-	assessmentAdmission: "admitted" | "budget-boundary" | "time-boundary";
+	assessmentAdmission: "admitted" | ObjectiveStopReason;
 	advanceAdmission: () => "admitted" | ObjectiveStopReason;
 	supportedTaskScopes: ObjectiveNextTaskV1["adapterScope"][];
 	capabilities?: ObjectiveCapabilityV1[];
@@ -354,7 +349,6 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			blockedProposals.push(proposed);
 			assessment.blockedProposals = [...blockedProposals];
 			await input.recordAssessment?.(assessment);
-			if (proposals.length >= 16) return { assessment, stopReason: "artifact-capacity-boundary" };
 			const admission = input.advanceAdmission();
 			if (admission !== "admitted") return { assessment, stopReason: admission };
 			request = ["Your preceding nextTask cannot be dispatched by the observed host capabilities.",

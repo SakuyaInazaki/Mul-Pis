@@ -43,7 +43,7 @@ def split_model(spec: str) -> tuple[str, str]:
 
 async def run_agent(
     url: str, task: str, provider: str, model: str, out_dir: Path,
-    meta: dict[str, Any], max_steps: int,
+    meta: dict[str, Any],
 ) -> tuple[str, int | None, bool | None]:
     os.environ.setdefault(
         "PLAYWRIGHT_BROWSERS_PATH", str(Path(sys.prefix) / "ms-playwright")
@@ -70,7 +70,7 @@ async def run_agent(
         await recorder.capture(browser_session)
 
     try:
-        history = await agent.run(max_steps=max_steps, on_step_end=capture_step)
+        history = await run_until_done(agent, browser_session, capture_step)
         await recorder.capture(browser_session, final=True)
     finally:
         try:
@@ -88,6 +88,49 @@ async def run_agent(
     return str(final), steps, history.is_successful()
 
 
+async def run_until_done(agent: Any, browser_session: Any, capture_step: Any) -> Any:
+    """Drive browser-use's step API until the task ends, without Agent.run's step quota.
+
+    browser-use Agent.run(max_steps=...) forces a final response on its last
+    step. A feature check fails closed on incompatible versions before any
+    browser or model action, rather than silently restoring that quota.
+    """
+    required = (
+        (browser_session, "start"), (agent, "step"), (agent, "close"),
+        (agent, "_log_agent_run"),
+        (agent, "_register_skills_as_actions"), (agent, "_execute_initial_actions"),
+        (agent.history, "is_done"), (getattr(agent, "eventbus", None), "stop"),
+        (getattr(agent, "token_cost_service", None), "get_usage_summary"),
+    )
+    missing = [name for owner, name in required if not callable(getattr(owner, name, None))]
+    if missing:
+        raise RuntimeError(f"browser-use step adapter unavailable: {', '.join(missing)}")
+
+    started = False
+    try:
+        await agent._log_agent_run()
+        started = True
+        await browser_session.start()
+        await agent._register_skills_as_actions()
+        await agent._execute_initial_actions()
+        while not agent.history.is_done():
+            if agent.state.stopped:
+                raise RuntimeError("browser-use agent stopped before completing its task")
+            await agent.step()  # No last-step budget or forced completion.
+            await capture_step(agent)
+        return agent.history
+    finally:
+        if started:
+            # Preserve the usage summary and close the browser even on error or cancellation.
+            try:
+                agent.history.usage = await agent.token_cost_service.get_usage_summary()
+            finally:
+                try:
+                    await agent.eventbus.stop(clear=True, timeout=3.0)
+                finally:
+                    await agent.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run an LLM-driven browser-use task with raw artifact capture"
@@ -98,7 +141,6 @@ def main() -> int:
     parser.add_argument(
         "--model", required=True, help="provider/model; supports openai and anthropic"
     )
-    parser.add_argument("--max-steps", type=int, default=40)
     args = parser.parse_args()
 
     meta: dict[str, Any] = {
@@ -128,10 +170,8 @@ def main() -> int:
         return 3
 
     try:
-        if args.max_steps <= 0 or args.max_steps > 200:
-            raise ValueError("--max-steps must be between 1 and 200")
         result, steps, successful = asyncio.run(
-            run_agent(args.url, args.task, provider, model, args.out, meta, args.max_steps)
+            run_agent(args.url, args.task, provider, model, args.out, meta)
         )
         args.out.mkdir(parents=True, exist_ok=True)
         (args.out / "result.md").write_text(result.rstrip() + "\n", encoding="utf-8")

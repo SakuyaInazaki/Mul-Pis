@@ -30,16 +30,33 @@ const cpuCase = (split: "development" | "admission", id: string) => ({ version: 
  ], initialX: [0], allowedProbeX: [2], maxProbeCalls: 1, tolerance: 0.01, units: { x: "s", y: "m" } }] });
 const plan = (admissionCaseSetPath?: string): ResearchCampaignPlanV1 => ({ version: 1, experimentKind: "executor-quality", target: "executor", developmentCaseSetPath: "development.json",
  ...(admissionCaseSetPath ? { admissionCaseSetPath, searchReplicates: 1, outcomeReplicates: 2,
-  outerBudget: { maxProviderCalls: 8, maxInputTokens: 160_000, maxOutputTokens: 16_384, maxSdkEstimatedCost: 1, maxProbeCalls: 5, maxCpuMillis: 10_000, maxWallMillis: 60_000 },
-  pilotBudget: { maxProviderCalls: 5, maxInputTokens: 100_000, maxOutputTokens: 10_240, maxSdkEstimatedCost: 1, maxProbeCalls: 3, maxCpuMillis: 10_000, maxWallMillis: 60_000 },
-  protectedBudget: { maxProviderCalls: 12, maxInputTokens: 240_000, maxOutputTokens: 24_576, maxSdkEstimatedCost: 2, maxProbeCalls: 8, maxCpuMillis: 10_000, maxWallMillis: 60_000 } } : {}),
+  outerBudget: { maxProviderCalls: 8, maxInputTokens: 160_000, maxSdkEstimatedCost: 1, maxProbeCalls: 5, maxCpuMillis: 10_000, maxWallMillis: 60_000 },
+  pilotBudget: { maxProviderCalls: 5, maxInputTokens: 100_000, maxSdkEstimatedCost: 1, maxProbeCalls: 3, maxCpuMillis: 10_000, maxWallMillis: 60_000 },
+  protectedBudget: { maxProviderCalls: 12, maxInputTokens: 240_000, maxSdkEstimatedCost: 2, maxProbeCalls: 8, maxCpuMillis: 10_000, maxWallMillis: 60_000 } } : {}),
  maxDecisions: 4, maxCandidates: 2, admissionRepetitions: 2, maxFeedbackItems: 8, perPromptTimeoutMs: 10_000,
- budget: { maxProviderCalls: 80, maxInputTokens: 1_000_000, maxOutputTokens: 200_000, maxSdkEstimatedCost: 10, maxProbeCalls: 80, maxCpuMillis: 100_000, maxWallMillis: 500_000 },
+ budget: { maxProviderCalls: 80, maxInputTokens: 1_000_000, maxSdkEstimatedCost: 10, maxProbeCalls: 80, maxCpuMillis: 100_000, maxWallMillis: 500_000 },
  experienceRefs: [], experienceMaxRecords: 0, experienceMaxChars: 0 });
 
 test("research plans reject obsolete per-request token fields", () => {
  assert.throws(() => validateResearchPlan({ ...plan(), perPromptMaxOutputTokens: 2_048 }), /per-request token quotas have been removed/);
  assert.throws(() => validateResearchPlan({ ...plan(), perPromptMaxInputTokens: 20_000 }), /per-request token quotas have been removed/);
+});
+
+test("legacy method output quota is omitted from active research plan", () => {
+ const original = plan();
+ const validated = validateResearchPlan({ ...original, budget: { ...original.budget, maxOutputTokens: 1 } });
+ assert.equal("maxOutputTokens" in validated.budget, false);
+ assert.equal("maxOutputTokens" in new SharedBudget("legacy", validated.budget).status().limits, false);
+});
+
+test("research plans retain only the root monetary ceiling", () => {
+ const base = plan("admission.json");
+ const active = validateResearchPlan({ ...base, outerBudget: { maxSdkEstimatedCost: 0.001 }, pilotBudget: { maxSdkEstimatedCost: 0 }, protectedBudget: { maxSdkEstimatedCost: 1_000_000 } });
+ assert.deepEqual(active.budget, { maxSdkEstimatedCost: 10 });
+ for (const field of ["outerBudget", "pilotBudget", "protectedBudget", "metaBranchBudget"]) assert.equal(field in active, false);
+ const meta = validateResearchPlan({ ...base, experimentKind: "meta-improvement", target: "improver", metaProtocol: "quality", outerBudget: undefined, pilotBudget: undefined, protectedBudget: undefined, metaBranchBudget: undefined });
+ assert.equal(meta.budget.maxSdkEstimatedCost, 10);
+ assert.equal("metaBranchBudget" in meta, false);
 });
 
 function fakeReply(ctx: FakeReplyContext) {
@@ -161,7 +178,7 @@ test("meta arms see separate development histories and select successors before 
  const meta: ResearchCampaignPlanV1 = { ...base, experimentKind: "meta-improvement", target: "improver", maxDecisions: 3, maxCandidates: 1, maxCandidatesPerMetaArm: 1,
   metaProtocol: "quality", searchReplicates: 1,
   experienceRefs: [sharedRef], experienceMaxRecords: 1, experienceMaxChars: 2_000,
-  metaBranchBudget: { maxProviderCalls: 7, maxInputTokens: 180_000, maxOutputTokens: 14_336, maxSdkEstimatedCost: 1, maxProbeCalls: 7, maxCpuMillis: 20_000, maxWallMillis: 60_000 } };
+  metaBranchBudget: { maxProviderCalls: 7, maxInputTokens: 180_000, maxSdkEstimatedCost: 1, maxProbeCalls: 7, maxCpuMillis: 20_000, maxWallMillis: 60_000 } };
  const result = await service.run(meta);
  assert.equal(result.status, "promoted", `${result.stopReason}: ${JSON.stringify(result.decisions)}`);
  assert.ok(newArmPrompts.length > 0);
@@ -183,13 +200,13 @@ test("meta arms see separate development histories and select successors before 
  const script = `import { ResearchImprovementService } from ${JSON.stringify(pathToFileURL(path.resolve("src/improvement/research-service.ts")).href)};
 import { FakeSessionRunner } from ${JSON.stringify(pathToFileURL(path.resolve("src/runner/fake.ts")).href)};
 const [root, planRaw] = process.argv.slice(1); const plan = JSON.parse(planRaw);
-const runner = new FakeSessionRunner((ctx) => { const view = JSON.parse(ctx.message.slice(ctx.message.indexOf("\\n") + 1)); return { text: JSON.stringify({ kind: "propose", target: "executor", body: "Probe a fresh disambiguating point before selecting.", hypothesis: { claim: "new I can produce a new H", predictedObservation: "candidate is recorded", falsifier: "candidate cannot be constructed", applicability: ["cpu-response-identification"], motivatingEvidenceIds: [view.feedback[0].id] } }), usage: ${JSON.stringify(usage)} }; });
+const runner = new FakeSessionRunner((ctx) => { const view = JSON.parse(ctx.message.slice(ctx.message.indexOf("\\n") + 1)); return { text: JSON.stringify(view.candidates.length ? { kind: "stop", reason: "development evidence is insufficient" } : { kind: "propose", target: "executor", body: "Probe a fresh disambiguating point before selecting.", hypothesis: { claim: "new I can produce a new H", predictedObservation: "candidate is recorded", falsifier: "candidate cannot be constructed", applicability: ["cpu-response-identification"], motivatingEvidenceIds: [view.feedback[0].id] } }), usage: ${JSON.stringify(usage)} }; });
 const service = new ResearchImprovementService({ workspaceRoot: root, runner }); const active = (await service.status()).active; const run = await service.run(plan);
 process.stdout.write(JSON.stringify({ activeI: active.bundle.improverVersionId, decisionI: run.decisions[0]?.improverVersionId, candidateProducer: run.candidates[0]?.producedByImproverVersionId, origin: run.candidates[0]?.origin, status: run.status, bound: runner.created[0]?.methodBinding?.versionId, loaded: runner.created[0]?.systemPrompt.includes("Prefer general discriminating probes") }));`;
  const child = await execFileAsync(process.execPath, ["--input-type=module", "-e", script, root, JSON.stringify(childPlan)], { cwd: path.resolve("."), maxBuffer: 100_000 });
  const reentered = JSON.parse(child.stdout);
  assert.equal(reentered.activeI, promotedI); assert.equal(reentered.decisionI, promotedI); assert.equal(reentered.candidateProducer, promotedI);
- assert.equal(reentered.bound, promotedI); assert.equal(reentered.loaded, true); assert.equal(reentered.origin, "agent-generated"); assert.equal(reentered.status, "inconclusive", "decision exhaustion cannot be counted as a settled no-winner");
+ assert.equal(reentered.bound, promotedI); assert.equal(reentered.loaded, true); assert.equal(reentered.origin, "agent-generated"); assert.equal(reentered.status, "research-only");
 });
 
 test("meta refuses identical selected H bodies before any protected query", async () => {
@@ -229,7 +246,7 @@ test("one-decision I handoff reads only a matching persisted development world a
  const service = new ResearchImprovementService({ workspaceRoot: f.root, runner });
  const base = plan();
  const one: ResearchCampaignPlanV1 = { ...base, experimentKind: "meta-improvement", target: "improver", priorDevelopmentFeedbackPath: "l5-pilot-synthetic/visible-feedback.json", maxDecisions: 1, maxCandidates: 1,
-  pilotBudget: { maxProviderCalls: 1, maxInputTokens: 20_000, maxOutputTokens: 2_048, maxSdkEstimatedCost: 0.1, maxProbeCalls: 0, maxCpuMillis: 1_000, maxWallMillis: 10_000 },
+  pilotBudget: { maxProviderCalls: 1, maxInputTokens: 20_000, maxSdkEstimatedCost: 0.1, maxProbeCalls: 0, maxCpuMillis: 1_000, maxWallMillis: 10_000 },
   budget: { ...base.budget, maxProviderCalls: 1 } };
  const run = await service.run(one);
  assert.equal(run.status, "research-only", run.stopReason ?? ""); assert.equal(calls, 1);
@@ -287,11 +304,11 @@ test("same-workspace development MetaEpisode is inspectable and citable without 
   assert.equal(view.metaEpisodes[0].id, `meta:${first.runId}`);
   if (ctx.spec.label.endsWith("-0")) return { text: JSON.stringify({ kind: "inspect", read: { object: "meta-episode", id: `meta:${first.runId}`, start: 0, maxChars: 4_000 } }), usage };
   assert.equal(view.inspections[0].object, "meta-episode"); assert.doesNotMatch(view.inspections[0].text, /truthHypothesisId|protectedQuality|admissionCaseSetPath/);
-  return { text: JSON.stringify({ kind: "propose", target: "executor", body: "Use the observed episode to choose a bounded diagnostic probe.",
+  return { text: JSON.stringify(view.candidates.length ? { kind: "stop", reason: "development evidence is insufficient" } : { kind: "propose", target: "executor", body: "Use the observed episode to choose a bounded diagnostic probe.",
    hypothesis: { claim: "development episode suggests a probe", predictedObservation: "the probe separates responses", falsifier: "it does not separate them", applicability: ["cpu-response-identification"], motivatingEvidenceIds: [`meta:${first.runId}`] } }), usage };
  });
  const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner }).run({ ...plan(), maxDecisions: 2, metaEpisodeRunIds: [first.runId] });
- assert.equal(run.status, "inconclusive", "maxDecisions exhaustion is not a no-winner");
+ assert.equal(run.status, "research-only");
  assert.deepEqual(run.candidates[0].hypothesis.motivatingEvidenceIds, [`meta:${first.runId}`]);
  const episodeFile = path.join(new GenerationStore(f.root).root, "runs", first.runId, "meta-episode.development.json");
  const altered = JSON.parse(await readFile(episodeFile, "utf8")); altered.candidates[0].hypothesis.claim = "protected-evaluator-sentinel";

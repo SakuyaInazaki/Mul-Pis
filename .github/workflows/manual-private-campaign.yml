@@ -30,7 +30,6 @@ jobs:
       ((github.event_name == 'workflow_dispatch' && inputs.authorize_bounded_run == true) ||
        (github.event_name == 'push' && github.event.head_commit.message == 'Resume workflow with verified native CNY pricing and explicit admission feedback (mul-pis-20261006-recovery-run4)'))
     runs-on: ubuntu-latest
-    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,9 +65,8 @@ jobs:
         run: |
           umask 077
           python scripts/private_actions_transport.py decode --parent "$RUNNER_TEMP" --github-output "$GITHUB_OUTPUT"
-      - name: Run bounded private campaign
+      - name: Run private campaign
         id: campaign
-        timeout-minutes: 30
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           INPUT_DIR: ${{ steps.decode.outputs.input_dir }}

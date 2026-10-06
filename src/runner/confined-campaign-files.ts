@@ -55,7 +55,8 @@ function textField(value: unknown, label: string, maxBytes: number): string {
 export async function createConfinedCampaignFileTools(root: string, options: { writableFiles: string[] }): Promise<CustomToolSpec[]> {
 	const rootReal = await realpath(root);
 	if (!(await lstat(rootReal)).isDirectory()) throw new HarnessError("runner.campaign-files", "work root is not a directory");
-	if (!Array.isArray(options.writableFiles) || options.writableFiles.length < 1 || options.writableFiles.length > 16) throw new HarnessError("runner.campaign-files", "explicit writable file allowlist is required");
+	if (!Array.isArray(options.writableFiles) || options.writableFiles.length < 1)
+		throw new HarnessError("runner.campaign-files", "explicit writable file allowlist is required");
 	const writable = new Set(options.writableFiles.map((name) => requestedPath(rootReal, name)));
 	if (writable.size !== options.writableFiles.length) throw new HarnessError("runner.campaign-files", "duplicate writable file path");
 	const descriptor: GrantDescriptor = Object.freeze({ version: 1, kind: "confined-campaign-files", root: rootReal, writableFiles: Object.freeze([...options.writableFiles].sort()) as unknown as string[] });

@@ -61,14 +61,17 @@ export interface ImprovementHypothesis {
 
 export interface CampaignPlan {
 	version: 1;
-	maxCandidates: number;
-	maxTrialCalls: number;
+	/** Legacy execution quotas: ignored for new runs. */
+	maxCandidates?: number;
+	maxTrialCalls?: number;
 	repetitions: number;
-	maxReadbackChars: number;
-	maxTotalInputTokens: number;
-	maxTotalOutputTokens: number;
+	/** Historical cumulative readback quota, decoded but ignored in new campaigns. */
+	maxReadbackChars?: number;
+	maxTotalInputTokens?: number;
+	/** Archived plans may include this obsolete field; it has no enforcement effect. */
+	maxTotalOutputTokens?: number;
 	maxTotalCost: number;
-	timeoutMs: number;
+	timeoutMs?: number;
 	caseSetPath?: string;
 }
 

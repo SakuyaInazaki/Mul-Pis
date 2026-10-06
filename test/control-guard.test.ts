@@ -8,7 +8,7 @@ import { failureSignature, stageFingerprint, stageInputVersion } from "../src/pi
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 import { Workspace } from "../src/workspace.ts";
 
-test("same stage obligation and same failure is bounded after one correction retry", async () => {
+test("same stage obligation can be retried after repeated identical failures", async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-retry-"));
 	await mkdir(path.join(root, "problem", "raw"), { recursive: true });
 	await writeFile(path.join(root, "problem", "problem.md"), "problem\n");
@@ -17,11 +17,8 @@ test("same stage obligation and same failure is bounded after one correction ret
 	await service.init(root);
 	await assert.rejects(service.runStage({ stage: "M01" }), /same offline failure/);
 	await assert.rejects(service.runStage({ stage: "M01" }), /same offline failure/);
-	await assert.rejects(service.runStage({ stage: "M01" }), (error: unknown) => {
-		assert.equal((error as { code?: string }).code, "control.retry-loop");
-		return true;
-	});
-	assert.equal((await service.status(root)).stages.M01.count, 2);
+	await assert.rejects(service.runStage({ stage: "M01" }), /same offline failure/);
+	assert.equal((await service.status(root)).stages.M01.count, 3);
 });
 
 test("completed run records with failures count as failed attempts", () => {

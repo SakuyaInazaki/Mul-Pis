@@ -59,8 +59,14 @@ function num(args: Record<string, unknown>, key: string, fallback: number, max: 
 	return Math.min(Math.floor(value), max);
 }
 
+function positiveInteger(args: Record<string, unknown>, key: string): number {
+	const value = args[key];
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) throw new HarnessError("tool.args", `参数 ${key} 必须是正整数`);
+	return value;
+}
+
 export async function runM05(ctx: StageContext, options: M05Options = {}): Promise<M05Result> {
-	const backend = options.backend ?? defaultBackend(ctx.config.tools);
+	const backend = options.backend ?? defaultBackend(ctx.config.tools, ctx.signal);
 	const goal = options.goal?.trim() || "围绕原始问题、当前认识、候选判据与未决项，补齐能推进研究的外部材料；先判断缺口类型，再有限概览与定点查证。";
 	const { materials, inputs } = await loadProblemMaterials(ctx.ws);
 	const snapshot = await ctx.store.current();
@@ -252,7 +258,7 @@ export async function runM05(ctx: StageContext, options: M05Options = {}): Promi
 					async execute(args) {
 						const pdfPath = await confine(str(args, "path"));
 						if (!pdfPath.toLowerCase().endsWith(".pdf")) throw new HarnessError("tool.args", "只接受 .pdf 文件");
-						const maxPages = args.max_pages === undefined ? undefined : num(args, "max_pages", 3, 500);
+						const maxPages = args.max_pages === undefined ? undefined : positiveInteger(args, "max_pages");
 						const outDir = await nextDir("extract");
 						const result = await backend.extractPdf(pdfPath, outDir, { maxPages });
 						if (result.markdownPath) {
@@ -268,6 +274,7 @@ export async function runM05(ctx: StageContext, options: M05Options = {}): Promi
 				renderPageTool({
 					root: workDir,
 					tools: ctx.config.tools,
+					signal: ctx.signal,
 					extraRoots: [sourcesRoot],
 					onRendered: ({ pdf, page }) => logTool("render_pdf_page", { file: relPath(ctx, pdf), page }, {}),
 				}),
@@ -371,17 +378,16 @@ export async function runM05(ctx: StageContext, options: M05Options = {}): Promi
 							{
 								name: "browse_interactive",
 								description: "用 browser-use 完成适合交互浏览的定点任务（展开、翻页、站内检索、保留线程上下文、获取附件等）。尊重访问控制且不购买付费内容。result.md 是浏览器 agent 报告，不是原始材料；artifacts 才是可登记的实际材料。",
-								params: { url: { type: "string", description: "起始地址" }, task: { type: "string", description: "具体任务与计划取得范围" }, max_steps: { type: "number", description: "最多交互步数", optional: true } },
+								params: { url: { type: "string", description: "起始地址" }, task: { type: "string", description: "具体任务与计划取得范围" } },
 								async execute(args: Record<string, unknown>) {
 									const url = str(args, "url");
 									const task = str(args, "task");
 									if (!/^https?:\/\//i.test(url)) throw new HarnessError("tool.args", "只接受 http(s) 地址");
 									const outDir = await nextDir("browse");
-									const maxSteps = args.max_steps === undefined ? undefined : num(args, "max_steps", 20, 200);
-									const result = await backend.browseInteractive!(url, task, outDir, { maxSteps });
+									const result = await backend.browseInteractive!(url, task, outDir);
 									if (result.resultPath) browserReports.add(await confine(result.resultPath));
 									for (const artifact of result.artifacts ?? []) artifactFacts.set(await confine(artifact.path), { kind: artifact.kind, url: artifact.url, title: artifact.title, capturedAt: artifact.capturedAt, contentType: artifact.contentType });
-									await logTool("browse_interactive", { url, task, maxSteps }, { model: result.model, steps: result.steps, artifacts: result.artifacts?.length ?? 0, visitedUrls: result.visitedUrls?.length ?? 0, error: result.error, warnings: result.warnings });
+									await logTool("browse_interactive", { url, task }, { model: result.model, steps: result.steps, artifacts: result.artifacts?.length ?? 0, visitedUrls: result.visitedUrls?.length ?? 0, error: result.error, warnings: result.warnings });
 									const artifactLines = (result.artifacts ?? []).map((artifact, i) => `${i + 1}. ${artifact.kind}：${relPath(ctx, artifact.path)}${artifact.url ? `\n   来源：${artifact.url}` : ""}${artifact.contentType ? `；${artifact.contentType}` : ""}`);
 									const manifestPath = path.join(outDir, "artifacts.md");
 									await writeFileAtomic(manifestPath, `# 浏览器任务取得记录\n\n- 起始地址：${url}\n- 任务：${task}\n- 错误：${result.error ?? "无"}\n- 警告：${result.warnings.join("；") || "无"}\n\n## 实际材料\n\n${artifactLines.join("\n") || "无"}\n\n## 访问地址\n\n${result.visitedUrls?.map((visited) => `- ${visited}`).join("\n") || "未记录"}\n`);

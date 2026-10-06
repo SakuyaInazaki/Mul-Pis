@@ -14,6 +14,7 @@ import { FakeSessionRunner } from "../../src/runner/fake.ts";
 import type { CustomToolSpec, SessionSpec, ToolGrant } from "../../src/runner/types.ts";
 import { HarnessError } from "../../src/types.ts";
 import { readTelemetry } from "../../src/dashboard/telemetry.ts";
+import { createConfinedCampaignFileTools } from "../../src/runner/confined-campaign-files.ts";
 
 const MODEL = {
 	id: "offline-model",
@@ -176,7 +177,7 @@ test("a none grant disables every tool", async (t) => {
 	assert.equal(stub.calls[0].sessionManager?.getSessionDir(), persistDir);
 });
 
-test("strict DeepSeek request disables retries and compaction, verifies one capped payload", async (t) => {
+test("strict DeepSeek request rejects a caller output cap and uses the resolved model bound", async (t) => {
 	const persistDir = await fixture(t);
 	const model = { ...MODEL, id: "deepseek-flash", provider: "deepseek", api: "openai-completions", cost: { input: 0.2, output: 0.3, cacheRead: 0.1, cacheWrite: 0.1 } } as Model<"openai-completions">;
 	const seen: Array<{ maxTokens?: number; maxRetries?: number }> = [];
@@ -200,16 +201,19 @@ test("strict DeepSeek request disables retries and compaction, verifies one capp
 	const runner = new PiSessionRunner({ modelRuntime: runtime, createSession: factory });
 	const estimate = await runner.estimateMaxSdkCost("deepseek/deepseek-flash", { maxInputTokens: 200, maxOutputTokens: 20 });
 	assert(estimate && estimate > 0);
-	const handle = await runner.create(spec(persistDir, { model: "deepseek/deepseek-flash", strictRequest: { maxProviderCallsPerPrompt: 1, maxOutputTokens: 20, maxInputPayloadBytes: 500 } }));
+	await assert.rejects(runner.create(spec(persistDir, { model: "deepseek/deepseek-flash",
+		strictRequest: { maxOutputTokens: 20, maxInputPayloadBytes: 500 } })),
+		/strict request requires positive integer caps/);
+	const handle = await runner.create(spec(persistDir, { model: "deepseek/deepseek-flash", strictRequest: { maxInputPayloadBytes: 500 } }));
 	assert.equal(stub.calls[0].settingsManager?.getRetrySettings().enabled, false);
 	assert.equal(stub.calls[0].settingsManager?.getProviderRetrySettings().maxRetries, 0);
 	assert.equal(stub.calls[0].settingsManager?.getCompactionSettings().enabled, false);
 	await handle.prompt("one step");
-	assert.deepEqual(seen, [{ maxTokens: 20, maxRetries: 0 }]);
+	assert.deepEqual(seen, [{ maxTokens: model.maxTokens, maxRetries: 0 }]);
 	handle.dispose();
 });
 
-test("strict research request leaves output length to the model when no cap is supplied", async (t) => {
+test("strict research request explicitly uses the resolved model output bound", async (t) => {
 	const persistDir = await fixture(t);
 	const model = { ...MODEL, id: "deepseek-flash", provider: "deepseek", api: "openai-completions" } as Model<"openai-completions">;
 	const seen: Array<{ maxTokens?: number; maxRetries?: number }> = [];
@@ -217,7 +221,8 @@ test("strict research request leaves output length to the model when no cap is s
 		getModels: () => [model],
 		streamSimple(_model: unknown, _context: unknown, options: { maxTokens?: number; maxRetries?: number; onPayload?: (payload: unknown, model: unknown) => Promise<unknown> }) {
 			seen.push({ maxTokens: options.maxTokens, maxRetries: options.maxRetries });
-			return options.onPayload?.({ model: "deepseek-flash", messages: [{ role: "user", content: "short" }] }, model);
+			return options.onPayload?.({ model: "deepseek-flash", messages: [{ role: "user", content: "short" }],
+				max_tokens: options.maxTokens }, model);
 		},
 	} as unknown as ModelRuntime;
 	const stub = stubFactory();
@@ -231,9 +236,40 @@ test("strict research request leaves output length to the model when no cap is s
 		return created;
 	}) as typeof createAgentSession;
 	const runner = new PiSessionRunner({ modelRuntime: runtime, createSession: factory });
-	const handle = await runner.create(spec(persistDir, { model: "deepseek/deepseek-flash", strictRequest: { maxProviderCallsPerPrompt: 1, maxInputPayloadBytes: 500 } }));
+	const handle = await runner.create(spec(persistDir, { model: "deepseek/deepseek-flash", strictRequest: { maxInputPayloadBytes: 500 } }));
 	await handle.prompt("one step");
-	assert.deepEqual(seen, [{ maxTokens: undefined, maxRetries: 0 }]);
+	assert.deepEqual(seen, [{ maxTokens: model.maxTokens, maxRetries: 0 }]);
+	handle.dispose();
+});
+
+test("ordinary DeepSeek Pi requests explicitly use the resolved output maximum", async t => {
+	const persistDir = await fixture(t);
+	const model = { ...MODEL, id: "deepseek-flash", provider: "deepseek",
+		api: "openai-completions" } as Model<"openai-completions">;
+	const seen: number[] = [];
+	const runtime = { getModels: () => [model],
+		streamSimple(_model: unknown, _context: unknown,
+			options: { maxTokens?: number; onPayload?: (payload: unknown, model: unknown) => Promise<unknown> }) {
+			seen.push(options.maxTokens ?? 0);
+			return options.onPayload?.({ model: "deepseek-flash", max_tokens: options.maxTokens,
+				messages: [{ role: "user", content: "offline" }] }, model);
+		},
+	} as unknown as ModelRuntime;
+	const stub = stubFactory();
+	const factory = (async (options: CreateAgentSessionOptions = {}) => {
+		const created = await stub.factory(options);
+		const original = created.session.prompt.bind(created.session);
+		(created.session as unknown as { prompt: (text: string) => Promise<void> }).prompt = async text => {
+			await (options.modelRuntime as unknown as { streamSimple: (model: unknown, context: unknown,
+				options: unknown) => Promise<unknown> }).streamSimple(model, { messages: [] }, {});
+			await original(text);
+		};
+		return created;
+	}) as typeof createAgentSession;
+	const handle = await new PiSessionRunner({ modelRuntime: runtime, createSession: factory })
+		.create(spec(persistDir, { model: "deepseek/deepseek-flash" }));
+	await handle.prompt("ordinary request");
+	assert.deepEqual(seen, [model.maxTokens]);
 	handle.dispose();
 });
 
@@ -361,6 +397,49 @@ test("execution grants only requested native tools at the execution cwd and logs
 		{ name: "write", ok: true },
 	]);
 	await assert.rejects(runner.resume(handle.ref), /cannot be resumed/);
+});
+
+test("confined custom tool logs prove full UTF-8 reads without logging contents or write arguments", async t => {
+	const persistDir = await fixture(t);
+	const work = path.join(persistDir, "confined-work");
+	await mkdir(work);
+	await writeFile(path.join(work, "source.txt"), "PRIVATE-READ-CONTENT\n", "utf8");
+	const stub = stubFactory();
+	const tools = await createConfinedCampaignFileTools(work, { writableFiles: ["output.txt"] });
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory })
+		.create(spec(persistDir, { tools: { kind: "custom", tools } }));
+	const active = stub.calls[0].customTools ?? [];
+	const read = active.find(tool => tool.name === "read")!;
+	const write = active.find(tool => tool.name === "write")!;
+	await read.execute("read-one", { path: "source.txt" }, undefined, undefined, {} as never);
+	await assert.rejects(read.execute("read-missing", { path: "missing.txt" }, undefined, undefined, {} as never));
+	await write.execute("write-one", { path: "output.txt", content: "PRIVATE-WRITE-CONTENT" }, undefined, undefined, {} as never);
+	const rows = handle.toolLog();
+	assert.deepEqual(rows[0].resultMetadata, { kind: "confined-utf8-read", relativePath: "source.txt",
+		utf8Bytes: Buffer.byteLength("PRIVATE-READ-CONTENT\n", "utf8"), truncated: false });
+	assert.equal(rows[1].errorClass, "filesystem");
+	assert.equal(rows[1].errorCode, "ENOENT");
+	assert.match(rows[1].errorMessage ?? "", /File read failed/);
+	assert.deepEqual(rows[2].args, { path: "output.txt" });
+	assert.doesNotMatch(JSON.stringify(rows), /PRIVATE-READ-CONTENT|PRIVATE-WRITE-CONTENT/);
+	handle.dispose();
+});
+
+test("an arbitrary custom read-named tool cannot claim factory read completeness or log secret args", async t => {
+	const persistDir = await fixture(t);
+	const stub = stubFactory();
+	const arbitrary: CustomToolSpec = { name: "read", description: "synthetic untrusted tool",
+		params: { secret: { type: "string", description: "secret" } },
+		async execute() { return { text: "UNTRUSTED-RESULT" }; } };
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory })
+		.create(spec(persistDir, { tools: { kind: "custom", tools: [arbitrary] } }));
+	await stub.calls[0].customTools![0].execute("arbitrary", { secret: "PRIVATE-ARGUMENT" },
+		undefined, undefined, {} as never);
+	const row = handle.toolLog()[0];
+	assert.equal(row.resultMetadata, undefined);
+	assert.deepEqual(row.args, {});
+	assert.doesNotMatch(JSON.stringify(row), /PRIVATE-ARGUMENT|UNTRUSTED-RESULT/);
+	handle.dispose();
 });
 
 test("abort before prompt sends nothing and abort during prompt reaches the SDK", async (t) => {

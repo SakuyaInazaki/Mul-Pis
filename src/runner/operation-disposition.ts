@@ -3,7 +3,7 @@ import { HarnessError } from "../types.ts";
 /** Exact host-verified tool scope permitted to settle a whole prompt disposition. */
 export type HostEffectScope = "no-tools" | "factory-attested-confined-file-tools";
 export type LocalAdmissionDecision = "input-unaffordable" | "minimum-output-unaffordable" |
-	"requested-output-cap-unaffordable" | "provider-call-limit";
+	"requested-output-cap-unaffordable" | "provider-maximum-unaffordable" | "provider-call-limit";
 
 /** A whole prompt had no admitted provider transport and no tool-side effects in this scope. */
 export interface LocalNotIssuedDetails {

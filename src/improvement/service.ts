@@ -56,11 +56,13 @@ export async function collectAnonymousRunSamples(workspace: Workspace): Promise<
 function validatePlan(input: CampaignPlan): CampaignPlan {
  const integer = (name: keyof CampaignPlan, min: number, max: number) => { const n = input[name]; if (typeof n !== "number" || !Number.isSafeInteger(n) || n < min || n > max) throw new HarnessError("improvement.plan", `${name} must be an integer from ${min} to ${max}`); };
  if (!input || input.version !== 1) throw new HarnessError("improvement.plan", "CampaignPlan.version must be 1");
- integer("maxCandidates", 1, 20); integer("maxTrialCalls", 0, 1000); integer("repetitions", 1, 10); integer("maxReadbackChars", 0, 1_000_000);
- integer("maxTotalInputTokens", 1, 100_000_000); integer("maxTotalOutputTokens", 1, 100_000_000); integer("timeoutMs", 100, 3_600_000);
+ integer("repetitions", 1, Number.MAX_SAFE_INTEGER);
+ if (input.maxReadbackChars !== undefined) integer("maxReadbackChars", 0, Number.MAX_SAFE_INTEGER);
  if (typeof input.maxTotalCost !== "number" || !Number.isFinite(input.maxTotalCost) || input.maxTotalCost <= 0) throw new HarnessError("improvement.plan", "maxTotalCost must be positive");
  if (input.caseSetPath !== undefined && (typeof input.caseSetPath !== "string" || !input.caseSetPath.trim())) throw new HarnessError("improvement.plan", "caseSetPath must be a nonempty string");
- return input;
+ const { maxTotalOutputTokens: _legacyOutputLimit, maxCandidates: _legacyCandidates,
+  maxTrialCalls: _legacyCalls, maxTotalInputTokens: _legacyInput, maxReadbackChars: _legacyReadback, timeoutMs: _legacyTimeout, ...active } = input;
+ return active;
 }
 function validateHypothesis(input: unknown): ImprovementHypothesis {
  if (!input || typeof input !== "object") throw new HarnessError("improvement.hypothesis", "hypothesis missing");
@@ -116,7 +118,7 @@ export class ImprovementService {
   if (!plan) throw new HarnessError("improvement.plan-required", "improve run requires an explicit CampaignPlan; no model call was made");
   return this.runCampaign(plan);
  }
- async runCampaign(plan: CampaignPlan): Promise<ImprovementRunResult> { validatePlan(plan); return this.withMutation(() => this.runCampaignUnlocked(plan)); }
+ async runCampaign(plan: CampaignPlan): Promise<ImprovementRunResult> { const activePlan = validatePlan(plan); return this.withMutation(() => this.runCampaignUnlocked(activePlan)); }
  private async runCampaignUnlocked(plan: CampaignPlan): Promise<ImprovementRunResult> {
   const ws = new Workspace(this.root); await this.ensureBuiltinVersion();
   const baseline = await loadActiveBudgetPolicy(this.root), pointer = await this.readPointer();
@@ -148,7 +150,7 @@ export class ImprovementService {
    run.status = "failed"; run.stopReason = `setup failed: ${(error as Error).message}`; run.finishedAt = nowIso();
    await writeFileAtomic(statePath, `${JSON.stringify(run, null, 2)}\n`); throw error;
   }
-  const budget = { trialCalls: plan.maxTrialCalls, readbackChars: plan.maxReadbackChars, inputTokens: plan.maxTotalInputTokens, outputTokens: plan.maxTotalOutputTokens, cost: plan.maxTotalCost };
+  const budget = { cost: plan.maxTotalCost };
   const seen = new Set<string>();
   const previous = await this.status();
   const previousRuns = previous.runs.filter((r) => r.runId !== id);
@@ -169,8 +171,8 @@ export class ImprovementService {
     if (policyText) { try { seen.add(JSON.stringify(validateBudgetPolicy(JSON.parse(policyText)))); } catch { /* ignore corrupt record */ } }
    }
   }
-  for (let index = 1; index <= plan.maxCandidates; index++) {
-   if (budget.inputTokens <= 0 || budget.outputTokens <= 0 || budget.cost <= 0) { run.stopReason = "total proposer/trial resource budget exhausted"; break; }
+  for (let index = 1; ; index++) {
+   if (budget.cost <= 0) { run.stopReason = "total proposer/trial cost budget exhausted"; break; }
    const attempt: ImprovementAttempt = { index, status: "proposing", historyConsumed: [...priorHistory.map((h) => h.id), ...run.attempts.map((a) => `${id}#${a.index}`)] };
    run.attempts.push(attempt); await writeFileAtomic(statePath, `${JSON.stringify(run, null, 2)}\n`);
    const spec: SessionSpec = { label: `RSI-budget-${id}-${index}`, role: "improver", model, systemPrompt: IMPROVER_SYSTEM, tools: { kind: "none" }, persistDir: ws.sessionsDir };
@@ -188,14 +190,14 @@ export class ImprovementService {
      history: [...priorHistory, ...currentHistory] });
     let turn;
     run.campaignUsage!.proposerCalls++;
-    try { turn = await timedPrompt(handle, safePrompt, plan.timeoutMs); }
+    try { turn = await timedPrompt(handle, safePrompt); }
     finally {
      const usage = handle.usageSummary?.() ?? { input: 0, output: 0, cost: 0, complete: false, costComplete: false };
      run.campaignUsage!.input += usage.input; run.campaignUsage!.output += usage.output; run.campaignUsage!.cost += usage.cost; run.campaignUsage!.complete &&= usage.complete && usage.costComplete === true && usage.reportedEvents > 0;
      if (!usage.complete || !usage.costComplete || usage.reportedEvents === 0) run.campaignUsage!.usageSettlement = "pending-or-unknown";
-     budget.inputTokens -= usage.input; budget.outputTokens -= usage.output; budget.cost -= usage.cost;
+     budget.cost -= usage.cost;
     }
-    if (!run.campaignUsage!.complete || budget.inputTokens < 0 || budget.outputTokens < 0 || budget.cost < 0) { attempt.status = "inconclusive"; attempt.reason = "proposer usage incomplete or observed budget exceeded"; break; }
+    if (!run.campaignUsage!.complete || budget.cost < 0) { attempt.status = "inconclusive"; attempt.reason = "proposer usage incomplete or observed cost budget exceeded"; break; }
     let proposal: unknown;
     try { proposal = JSON.parse(turn.text); } catch { throw new HarnessError("improvement.candidate-json", "proposal must be one JSON object"); }
     if (!proposal || typeof proposal !== "object") throw new HarnessError("improvement.candidate-json", "proposal must be an object");
@@ -212,7 +214,7 @@ export class ImprovementService {
     attempt.evaluationPath = evaluationPath; run.evaluationPath = evaluationPath;
     if (!evaluation.passed) { attempt.status = evaluation.status === "insufficient-evidence" ? "inconclusive" : "rejected"; attempt.reason = evaluation.gates.filter((g) => !g.passed).map((g) => g.name).join(", "); continue; }
     attempt.status = "screened";
-    if (!caseSet || plan.maxTrialCalls === 0) { attempt.status = "inconclusive"; attempt.reason = "projection screen only; no caller-authorized paired admission case/budget"; continue; }
+    if (!caseSet) { attempt.status = "inconclusive"; attempt.reason = "projection screen only; no caller-authorized paired admission case"; break; }
     const admission = await runAdmission({ runner: this.runner, config, persistDir: ws.sessionsDir, caseSet, baseline, candidate, baselineVersionId: run.baselineVersionId, candidateVersionId: `candidate-${id}-${index}`, plan, remaining: budget });
     run.campaignUsage!.trialCalls += admission.trialCalls;
     for (const arm of admission.results) { run.campaignUsage!.input += arm.usage.input; run.campaignUsage!.output += arm.usage.output; run.campaignUsage!.cost += arm.usage.cost; run.campaignUsage!.complete &&= arm.usage.complete && !arm.failure;

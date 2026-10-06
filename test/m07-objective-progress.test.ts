@@ -19,6 +19,19 @@ const originalInputs: Record<string, string> = {
 };
 const lines = (text: string) => text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
 
+test("a settled length boundary stops reassessment with the original objective incomplete", async t => {
+	const f = await fixture(t);
+	let modelSteps = 0;
+	const loop = await runOriginalObjectiveLoop({
+		admission: () => "output-limit", step: async () => { modelSteps++; throw new Error("should not run"); } });
+	assert.equal(loop.stopReason, "output-limit");
+	assert.equal(modelSteps, 0);
+	const progress = objectiveProgress(f.contract, { boundedRuns: [{ runId: "synthetic-run", outcome: "partial" }],
+		selectedArtifacts: ["candidate.cpp", "verification.json"], stopReason: loop.stopReason });
+	assert.equal(progress.stopReason, "output-limit");
+	assert.equal(progress.objectiveOutcome, "incomplete");
+});
+
 async function fixture(t: TestContext) {
 	const root = await mkdtemp(path.join(tmpdir(), "m07-original-objective-"));
 	t.after(() => rm(root, { recursive: true, force: true }));
@@ -94,6 +107,15 @@ test("fresh assessor reads frozen original inputs and delegates only its valid c
 	assert.equal(f.runRecord.sessions[0].boundary?.intent, "independent-judgment");
 	assert.equal((await f.ws.readRun("M07Objective", f.runRecord.runId)).sessions.length, 1);
 	assert.equal((await readFile(f.contractFile, "utf8")), `${JSON.stringify(f.contract, null, 2)}\n`);
+});
+
+test("assessment parsing has no workflow-chosen raw response byte cap", async t => {
+	const f = await fixture(t);
+	const { result, advanced } = await invoke(f, {
+		text: JSON.stringify(assessment("continue")) + " ".repeat(33_000), readReturns: ranges(f),
+	});
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.equal(advanced.length, 1);
 });
 
 test("accepted finite pilot and even a model fulfilled claim cannot close an open original mission", async t => {
@@ -242,7 +264,7 @@ test("an original objective can advance through multiple fresh assessed child at
 
 test("the reusable objective loop refreshes evidence after each child and stops only at admission", async () => {
 	let latestEvidence = "initial", attempted = 0, admissions = 0;
-	const result = await runOriginalObjectiveLoop({ maxIterations: 8,
+	const result = await runOriginalObjectiveLoop({
 		admission: () => { admissions++; return admissions <= 2 ? "admitted" : "budget-boundary"; },
 		step: async iteration => {
 			attempted++;
@@ -261,17 +283,18 @@ test("the reusable objective loop never repeats a terminal no-advance assessment
 	for (const reason of ["model-reported-blocked", "model-closure-unverified",
 		"assessment-invalid", "assessment-evidence-unread", "next-task-needs-capability", "no-progress"] as const) {
 		let calls = 0;
-		const result = await runOriginalObjectiveLoop({ maxIterations: 64, admission: () => "admitted",
+		const result = await runOriginalObjectiveLoop({ admission: () => "admitted",
 			step: async () => { calls++; return { advanced: false, stopReason: reason, evidenceRefs: ["observed"] }; } });
 		assert.equal(calls, 1, reason);
 		assert.equal(result.stopReason, reason);
 		assert.deepEqual(result.steps.map(step => step.evidenceRefs), [["observed"]]);
 	}
-	const capacity = await runOriginalObjectiveLoop({ maxIterations: 2, admission: () => "admitted",
+	let admitted = 0;
+	const capacity = await runOriginalObjectiveLoop({ admission: () => ++admitted <= 70 ? "admitted" : "budget-boundary",
 		step: async iteration => ({ advanced: true, stopReason: "objective-reassessment-pending",
 			evidenceRefs: [`candidate-${iteration}`] }) });
-	assert.equal(capacity.stopReason, "artifact-capacity-boundary");
-	assert.equal(capacity.steps.length, 2);
+	assert.equal(capacity.stopReason, "budget-boundary");
+	assert.equal(capacity.steps.length, 70);
 });
 
 const availableCapabilities = [

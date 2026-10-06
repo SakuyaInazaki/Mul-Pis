@@ -202,7 +202,31 @@ async function createMaterialTools(root: string, requestedReadName?: string): Pr
 	return { tools: [materialRead, materialList], names: [readName, LIST_TOOL_NAME], readCoverage, readReturns };
 }
 
+function redactToolLogText(value: string, maxChars: number): string {
+	return value.replace(/Bearer\s+[^\s'"\r\n]+/gi, "Bearer [REDACTED]")
+		.replace(/sk-[A-Za-z0-9_-]{6,}/gi, "[REDACTED]")
+		.replace(/(?:api[_-]?key|password)\s*[:=]\s*[^\s'"\r\n]+/gi, "[REDACTED]")
+		.slice(0, maxChars);
+}
+
 function customToolsToPi(tools: CustomToolSpec[], log: ToolCallRecord[]): ToolDefinition<any, any>[] {
+	const confined = getConfinedCampaignFileGrantDescriptor(tools);
+	const safePath = (args: Record<string, unknown>): Record<string, unknown> =>
+		confined && typeof args.path === "string" && args.path.length <= 240 &&
+		!path.isAbsolute(args.path) && !args.path.split(/[\\/]/).some(segment => !segment || segment === "..")
+			? { path: redactToolLogText(args.path, 240) } : {};
+	const failure = (error: unknown): Pick<ToolCallRecord, "errorClass" | "errorCode" | "errorMessage"> => {
+		const nodeCode = (error as NodeJS.ErrnoException | null)?.code;
+		const fsCode = typeof nodeCode === "string" && ["ENOENT", "EACCES", "EPERM", "EISDIR", "ENOTDIR", "ELOOP"].includes(nodeCode)
+			? nodeCode : undefined;
+		const errorClass = error instanceof HarnessError ? "harness" as const : fsCode ? "filesystem" as const : "tool-error" as const;
+		const errorCode = error instanceof HarnessError && /^runner\.[a-z.-]{1,80}$/.test(error.code)
+			? error.code : fsCode;
+		const rawMessage = error instanceof HarnessError ? error.message :
+			fsCode ? `File read failed (${fsCode})` : "File read failed";
+		const errorMessage = redactToolLogText(rawMessage, 500);
+		return { errorClass, ...(errorCode ? { errorCode } : {}), ...(confined ? { errorMessage } : {}) };
+	};
 	return tools.map((tool) => {
 		const properties: Record<string, any> = {};
 		for (const [name, param] of Object.entries(tool.params)) {
@@ -227,14 +251,20 @@ function customToolsToPi(tools: CustomToolSpec[], log: ToolCallRecord[]): ToolDe
 				const at = new Date().toISOString();
 				try {
 					const result = await tool.execute(args, signal);
-					log.push({ name: tool.name, args, ok: true, at });
+					log.push({ name: tool.name, args: safePath(args), ok: true, at,
+						...(confined && tool.name === "read" && typeof args.path === "string" ?
+							{ resultMetadata: { kind: "confined-utf8-read" as const,
+								relativePath: redactToolLogText(args.path, 240),
+								utf8Bytes: Buffer.byteLength(result.text, "utf8"), truncated: false as const } } : {}) });
 					const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [{ type: "text", text: result.text }];
 					for (const image of result.images ?? []) {
 						content.push({ type: "image", data: (await readFile(image.path)).toString("base64"), mimeType: image.mimeType });
 					}
 					return { content, details: result.details ?? {} };
 				} catch (error) {
-					log.push({ name: tool.name, args, ok: false, at, error: (error as Error).message });
+					const detail = failure(error);
+					log.push({ name: tool.name, args: safePath(args), ok: false, at,
+						...detail, ...(confined && tool.name === "read" ? {} : { errorMessage: undefined }) });
 					throw error;
 				}
 			},
@@ -277,17 +307,23 @@ async function createExecutionTools(
 			...base,
 			async execute(toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: any, ctx: any) {
 				const args = params ?? {};
+				const safeArgs = name !== "bash" && typeof args.path === "string" && args.path.length <= 240
+					? { path: redactToolLogText(args.path, 240) } : {};
 				const at = new Date().toISOString();
 				try {
 					const result = await base.execute(toolCallId, args, signal, onUpdate, { ...ctx, cwd });
-					log.push({ name, args, ok: true, at });
+					log.push({ name, args: safeArgs, ok: true, at });
 					if (name === "read" && typeof args.path === "string") {
 						const resolved = path.isAbsolute(args.path) ? path.resolve(args.path) : path.resolve(cwd, args.path);
 						readCoverage.add(path.relative(cwd, resolved));
 					}
 					return result;
 				} catch (error) {
-					log.push({ name, args, ok: false, at, error: (error as Error).message });
+					const code = error instanceof HarnessError && /^runner\.[a-z.-]{1,80}$/.test(error.code)
+						? error.code : (error as NodeJS.ErrnoException | null)?.code;
+					log.push({ name, args: safeArgs, ok: false, at,
+						errorClass: error instanceof HarnessError ? "harness" : "tool-error",
+						...(typeof code === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(code) ? { errorCode: code } : {}) });
 					throw error;
 				}
 			},
@@ -670,7 +706,8 @@ export class PiSessionRunner implements SessionRunner {
 		const campaign = this.options.campaignBudget;
 		const strict = spec.strictRequest;
 		if (strict) {
-			if ((!campaign && (spec.tools.kind !== "none" || strict.maxProviderCallsPerPrompt !== 1 || strict.maxInputPayloadBytes === undefined)) || !Number.isInteger(strict.maxProviderCallsPerPrompt) || strict.maxProviderCallsPerPrompt < 1 ||
+			if ((!campaign && (spec.tools.kind !== "none" ||
+				strict.maxInputPayloadBytes === undefined || strict.maxOutputTokens !== undefined)) ||
 				(strict.maxOutputTokens !== undefined && (!Number.isInteger(strict.maxOutputTokens) || strict.maxOutputTokens < 1)) ||
 				(strict.maxInputPayloadBytes !== undefined && (!Number.isInteger(strict.maxInputPayloadBytes) || strict.maxInputPayloadBytes < 1))) {
 				throw new HarnessError("runner.model", "strict request requires positive integer caps; tools require a campaign budget");
@@ -694,7 +731,8 @@ export class PiSessionRunner implements SessionRunner {
 
 		const resolved = await this.resolveModel(spec);
 		campaign?.assertResolved(resolved.model);
-		if (strict && (resolved.model.provider !== "deepseek" || resolved.model.api !== "openai-completions" || (strict.maxOutputTokens !== undefined && strict.maxOutputTokens > resolved.model.maxTokens))) {
+		if (strict && (resolved.model.provider !== "deepseek" || resolved.model.api !== "openai-completions" ||
+			(campaign && strict.maxOutputTokens !== resolved.model.maxTokens))) {
 			throw new HarnessError("runner.model", "strict request currently supports only bounded DeepSeek openai-completions models");
 		}
 		let strictStreamCalls = 0;
@@ -704,58 +742,61 @@ export class PiSessionRunner implements SessionRunner {
 		let certifiedLocalStop: HarnessError | undefined;
 		let certifiedNotIssued: HarnessError | undefined;
 		let certifiedEffectScope: HostEffectScope | undefined;
-		const requestRuntime = strict ? new Proxy(resolved.modelRuntime, {
+		const requestRuntime = new Proxy(resolved.modelRuntime, {
 			get(target, property) {
 				if (property !== "streamSimple") {
 					const member = Reflect.get(target, property, target);
 					return typeof member === "function" ? member.bind(target) : member;
 				}
 				return (model: Parameters<ModelRuntime["streamSimple"]>[0], context: Parameters<ModelRuntime["streamSimple"]>[1], options?: Parameters<ModelRuntime["streamSimple"]>[2]) => {
-					const lease = currentLease;
+				if (!strict) return target.streamSimple(model, context, { ...options, maxTokens: model.maxTokens,
+					...(model.provider === "deepseek" && model.api === "openai-completions" ? {
+						onPayload: async (payload: unknown, payloadModel: typeof model) => {
+							const original = await options?.onPayload?.(payload as never, payloadModel as never);
+							const outgoing = (original ?? payload) as Record<string, unknown>;
+							const cap = outgoing.max_tokens ?? outgoing.max_completion_tokens;
+							if (payloadModel.id !== model.id || !Number.isSafeInteger(cap) || cap !== model.maxTokens)
+								throw new HarnessError("runner.model", "SDK DeepSeek request lowered or lost the resolved provider output maximum");
+							return outgoing;
+						},
+					} : {}) });
+				const lease = currentLease;
 					const requestIds = currentRequestIds;
 					let requestId: string | undefined;
 					strictStreamCalls++;
 					campaign?.assertResolved(model);
-					if (strictStreamCalls > strict.maxProviderCallsPerPrompt || model.provider !== resolved.model.provider || model.id !== resolved.model.id || model.api !== resolved.model.api || model.baseUrl !== resolved.model.baseUrl) throw new HarnessError("runner.model", "strict request would exceed provider call cap or change model");
+					if (model.provider !== resolved.model.provider || model.id !== resolved.model.id ||
+						model.api !== resolved.model.api || model.baseUrl !== resolved.model.baseUrl)
+						throw new HarnessError("runner.model", "strict request changed model");
 					const inner = target.streamSimple(model, context, {
-						...options, maxRetries: 0, ...(strict.maxOutputTokens === undefined ? {} : { maxTokens: strict.maxOutputTokens }),
+						...options, maxRetries: 0, maxTokens: model.maxTokens,
 						onPayload: async (payload, payloadModel) => {
 							strictPayloadChecks++;
 							campaign?.assertResolved(payloadModel);
-							if (strictPayloadChecks > strict.maxProviderCallsPerPrompt || payloadModel.provider !== model.provider || payloadModel.id !== model.id || payloadModel.api !== model.api || payloadModel.baseUrl !== model.baseUrl) throw new HarnessError("runner.model", "strict request payload changed model or repeated");
+							if (payloadModel.provider !== model.provider || payloadModel.id !== model.id ||
+								payloadModel.api !== model.api || payloadModel.baseUrl !== model.baseUrl)
+								throw new HarnessError("runner.model", "strict request payload changed model");
 							const record = payload as Record<string, unknown>;
 							if (campaign && record.model !== model.id) throw new HarnessError("runner.campaign", "provider payload model changed");
-							if (strict.maxOutputTokens !== undefined &&
-								((record.max_tokens === undefined && record.max_completion_tokens === undefined) ||
-									(record.max_tokens !== undefined && record.max_tokens !== strict.maxOutputTokens) ||
-									(record.max_completion_tokens !== undefined && record.max_completion_tokens !== strict.maxOutputTokens))) {
-								throw new HarnessError("runner.model", "strict request output cap missing or inconsistent in provider payload");
-							}
-							let outgoing: unknown = payload;
-							let outputCap = strict.maxOutputTokens;
-							if (campaign && outputCap !== undefined) {
-								// The pinned SDK invokes onPayload before HTTP transport and sends its
-								// returned object. Start with the provider minimum of one output token,
-								// then choose the largest cap affordable under the one global ledger.
-								const adapted = { ...record };
-								const setCap = (cap: number): void => {
-									if (record.max_tokens !== undefined) adapted.max_tokens = cap;
-									if (record.max_completion_tokens !== undefined) adapted.max_completion_tokens = cap;
-								};
-								setCap(1);
-								const minimum = JSON.stringify(adapted);
-								if (typeof minimum !== "string") throw new HarnessError("runner.model", "provider payload could not be serialized for reservation");
-								outputCap = Math.max(1, campaign.affordableOutputTokens(Buffer.byteLength(minimum, "utf8")));
-								while (true) {
-									setCap(outputCap);
-									const encoded = JSON.stringify(adapted);
-									if (typeof encoded !== "string") throw new HarnessError("runner.model", "provider payload could not be serialized for reservation");
-									const affordable = campaign.affordableOutputTokens(Buffer.byteLength(encoded, "utf8"));
-									if (affordable >= outputCap || outputCap === 1) break;
-									outputCap = Math.max(1, affordable);
-								}
-								outgoing = adapted;
-							}
+							const outputCap = model.maxTokens;
+							const hasMax = record.max_tokens !== undefined;
+							const hasCompletionMax = record.max_completion_tokens !== undefined;
+							if ((!hasMax && !hasCompletionMax) ||
+								(hasMax && (!Number.isSafeInteger(record.max_tokens) || Number(record.max_tokens) < 1)) ||
+								(hasCompletionMax && (!Number.isSafeInteger(record.max_completion_tokens) || Number(record.max_completion_tokens) < 1)) ||
+								(hasMax && hasCompletionMax && record.max_tokens !== record.max_completion_tokens) ||
+								(hasMax && Number(record.max_tokens) > outputCap) ||
+								(hasCompletionMax && Number(record.max_completion_tokens) > outputCap))
+								throw new HarnessError("runner.model", "strict request output bound missing or inconsistent in provider payload");
+							// The SDK may clamp for its own context estimate. A metered campaign
+							// must either send the verified provider maximum or refuse transport;
+							// it never shortens generation to fit the remaining CNY ledger.
+							if (!campaign && ((hasMax && record.max_tokens !== outputCap) ||
+								(hasCompletionMax && record.max_completion_tokens !== outputCap)))
+								throw new HarnessError("runner.model", "strict request output bound was lowered by the SDK");
+							const outgoing = campaign ? { ...record,
+								...(hasMax ? { max_tokens: outputCap } : {}),
+								...(hasCompletionMax ? { max_completion_tokens: outputCap } : {}) } : payload;
 							const serialized = JSON.stringify(outgoing);
 							if (typeof serialized !== "string") throw new HarnessError("runner.model", "provider payload could not be serialized for reservation");
 							const bytes = Buffer.byteLength(serialized, "utf8");
@@ -819,7 +860,7 @@ export class PiSessionRunner implements SessionRunner {
 					return outer;
 				};
 			},
-		}) : resolved.modelRuntime;
+		});
 		const priced = resolved.model.cost.input > 0 && resolved.model.cost.output > 0;
 		let materialTools: MaterialTools = { tools: [], names: [], readCoverage: new Set(), readReturns: [] };
 		const toolLog: ToolCallRecord[] = [];

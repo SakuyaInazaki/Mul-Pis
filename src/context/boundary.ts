@@ -112,7 +112,7 @@ async function verifiedConfinedNarrowing(runner: SessionRunner, handle: SessionH
 	const attested = await runner.attestConfinedGrant?.(handle);
 	if (!attested || attested.version !== 1 || attested.kind !== "confined-campaign-files" ||
 		JSON.stringify(attested) !== JSON.stringify(effective.toolAuthority) || !Array.isArray(attested.writableFiles) ||
-		attested.writableFiles.length < 1 || attested.writableFiles.length > 16) throw new HarnessError("context.capability", "runner did not attest the effective custom grant from its confined tool factory");
+		attested.writableFiles.length < 1) throw new HarnessError("context.capability", "runner did not attest the effective custom grant from its confined tool factory");
 	const canonicalRequested = await realpath(requested.root);
 	const canonicalActual = await realpath(attested.root);
 	if (canonicalRequested !== canonicalActual || canonicalActual !== attested.root || new Set(attested.writableFiles).size !== attested.writableFiles.length ||

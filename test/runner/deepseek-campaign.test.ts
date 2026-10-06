@@ -9,6 +9,8 @@ import { DeepSeekCampaignBudget, isSettledLocalCampaignBudgetStop, settledLocalC
 	type DeepSeekCampaignLimits } from "../../src/runner/deepseek-campaign.ts";
 import { isLocalNotIssued, localNotIssuedDetails, isSettledTerminalResponse,
 	settledTerminalResponseDetails } from "../../src/runner/operation-disposition.ts";
+import { verifyDeepSeekCnyBilling } from "../../src/runner/deepseek-cny-pricing.ts";
+import { verifyDeepSeekProviderOutputLimit } from "../../src/runner/deepseek-provider-limits.ts";
 import { createConfinedCampaignFileTools } from "../../src/runner/confined-campaign-files.ts";
 import { PiSessionRunner } from "../../src/runner/pi.ts";
 import { openBoundedSession } from "../../src/context/boundary.ts";
@@ -23,15 +25,21 @@ const MODEL = {
 	id: "deepseek-flash", name: "Offline DeepSeek", provider: "deepseek", api: "openai-completions",
 	baseUrl: "https://api.deepseek.com", reasoning: true, input: ["text"],
 	cost: { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 },
-	contextWindow: 10000, maxTokens: 100,
+	contextWindow: 10000, maxTokens: 20,
 } as Model<"openai-completions">;
 
-const LIMITS: DeepSeekCampaignLimits = {
+const TEST_PROVIDER_OUTPUT_LIMIT = await verifyDeepSeekProviderOutputLimit({ apiKey: "synthetic-only",
+	request: async () => new Response(JSON.stringify({ object: "list", data: [{ id: "deepseek-flash",
+		object: "model", name: "DeepSeek-V4.1-Flash", max_output_tokens: 20,
+		context_window: 10_000 }] }), { status: 200 }) });
+
+const LIMITS = {
 	model: "deepseek/deepseek-flash:low", endpoint: "https://api.deepseek.com",
 	maxCny: 0.006, priorCommittedCny: 0, maxProviderCalls: 2, maxProviderCallsPerPrompt: 2,
-	maxOutputTokens: 20, outputAccountingMarginTokens: 32,
+	maxOutputTokens: 20, providerOutputLimit: TEST_PROVIDER_OUTPUT_LIMIT,
+	outputAccountingMarginTokens: 32,
 	estimatedInputCnyPerMillionTokens: 4, estimatedOutputCnyPerMillionTokens: 16, estimatedCnyPerUsd: 10,
-};
+} satisfies DeepSeekCampaignLimits;
 
 function spec(dir: string, label: string, tools: SessionSpec["tools"] = { kind: "none" }): SessionSpec {
 	return { label, role: "execution", model: LIMITS.model, systemPrompt: "offline test", tools, persistDir: dir };
@@ -102,7 +110,7 @@ function streamFactory(rounds: number): typeof createAgentSession {
 	}) as typeof createAgentSession;
 }
 
-test("campaign reserves each tool-loop provider request before transport, then refuses a third", async (t) => {
+test("retired call counts do not stop a third metered provider request", async (t) => {
 	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-campaign-"));
 	t.after(() => rm(dir, { recursive: true, force: true }));
 	const sent = { count: 0, options: [] as Array<{ maxTokens?: number; maxRetries?: number }> };
@@ -115,10 +123,10 @@ test("campaign reserves each tool-loop provider request before transport, then r
 	assert.equal(budget.snapshot().reservations, 2);
 	assert.equal(budget.snapshot().stopped, false);
 	const reviewer = await runner.create(spec(dir, "reviewer"));
-	await assert.rejects(reviewer.prompt("review"), /campaign provider call limit exhausted/);
-	assert.equal(sent.count, 2, "denied request must not reach transport");
-	assert.equal(budget.snapshot().stopped, true);
-	assert.equal(budget.snapshot().stopReason, "provider-call-limit");
+	await reviewer.prompt("review");
+	assert.equal(sent.count, 4);
+	assert.equal(budget.snapshot().reservations, 4);
+	assert.equal(budget.snapshot().stopped, false);
 	builder.dispose(); reviewer.dispose();
 });
 
@@ -204,6 +212,29 @@ test("controller records a live-attested execution-to-confined-custom narrowing 
 	handle.dispose();
 });
 
+test("attested confined file grants may list more than sixteen files without weakening per-file checks", async t => {
+	const dir = await mkdtemp(path.join(tmpdir(), "campaign-file-grant-count-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const work = path.join(dir, "work"), sessions = path.join(dir, "sessions");
+	await Promise.all([mkdir(work), mkdir(sessions)]);
+	const writableFiles = Array.from({ length: 17 }, (_, index) => `candidate-${index}.cpp`);
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1 });
+	const sent = { count: 0, options: [] as Array<{ maxTokens?: number; maxRetries?: number }> };
+	const actual = new PiSessionRunner({ modelRuntime: offlineRuntime(sent),
+		createSession: offlineFactory(1), campaignBudget: budget });
+	const wrapper: SessionRunner = { create: async requested => actual.create({ ...requested,
+		tools: { kind: "custom", tools: await createConfinedCampaignFileTools(work, { writableFiles }) } }),
+		resume: ref => actual.resume(ref), attestConfinedGrant: handle => actual.attestConfinedGrant(handle) };
+	const run: StageRunRecord = { stage: "M07", runId: "R001", startedAt: new Date().toISOString(),
+		status: "running", inputs: [], outputs: [], sessions: [], failures: [], remarks: [] };
+	const handle = await openBoundedSession(wrapper, run, { mode: "fresh", intent: "new-work",
+		reason: "audited file list", evidence: [], spec: spec(sessions, "seventeen-files",
+			{ kind: "execution", root: work, tools: ["read", "write"] }) }, async () => {});
+	assert.equal(run.sessions[0].boundary?.capability?.writableFiles?.length, 17);
+	assert.equal(sent.count, 0);
+	handle.dispose();
+});
+
 test("campaign rejects endpoint changes and unavailable payload sizes closed", async (t) => {
 	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-campaign-"));
 	t.after(() => rm(dir, { recursive: true, force: true }));
@@ -225,6 +256,16 @@ test("campaign rejects endpoint changes and unavailable payload sizes closed", a
 	assert.equal(direct.snapshot().stopped, true);
 	assert.equal(direct.snapshot().stopReason, "payload-boundary");
 	assert.throws(() => direct.beginPrompt("direct", "2"), /campaign is stopped/);
+});
+
+test("retired output fields cannot replace a missing live provider maximum", () => {
+	assert.throws(() => new DeepSeekCampaignBudget({ ...LIMITS, maxOutputTokens: 1,
+		maxProviderCalls: 1, maxProviderCallsPerPrompt: 1,
+		providerOutputLimit: undefined as never }), /invalid DeepSeek campaign limits/);
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxOutputTokens: 1,
+		maxProviderCalls: 1, maxProviderCallsPerPrompt: 1 });
+	assert.equal(budget.strictRequest.maxOutputTokens, TEST_PROVIDER_OUTPUT_LIMIT.maxOutputTokens);
+	assert.equal(budget.strictRequest.maxProviderCallsPerPrompt, undefined);
 });
 
 test("campaign accepts input above the former 96 KB cap and reserves its actual serialized bytes", async (t) => {
@@ -266,7 +307,7 @@ test("campaign rejects inconsistent simultaneous provider output-cap fields befo
 	} as unknown as ModelRuntime;
 	const budget = new DeepSeekCampaignBudget(LIMITS);
 	const handle = await new PiSessionRunner({ modelRuntime: runtime, createSession: offlineFactory(1), campaignBudget: budget }).create(spec(dir, "inconsistent-cap"));
-	await assert.rejects(handle.prompt("offline"), /output cap missing or inconsistent/);
+	await assert.rejects(handle.prompt("offline"), /output bound missing or inconsistent/);
 	assert.equal(dispatched, 0);
 	assert.equal(budget.snapshot().reservations, 0);
 	assert.equal(budget.snapshot().stopped, true);
@@ -335,15 +376,20 @@ test("audited campaign file tools confine reads and allowlisted writes", async (
 	}
 });
 
-test("no-campaign strict path remains exactly one tool-free provider request", async (t) => {
+test("no-campaign strict path retains tool/data safety without an artificial call-count quota", async (t) => {
 	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-campaign-"));
 	t.after(() => rm(dir, { recursive: true, force: true }));
 	const sent = { count: 0, options: [] as Array<{ maxTokens?: number; maxRetries?: number }> };
 	const runner = new PiSessionRunner({ modelRuntime: offlineRuntime(sent), createSession: offlineFactory(2) });
 	await assert.rejects(runner.create({ ...spec(dir, "regression"), strictRequest: {
-		maxProviderCallsPerPrompt: 2, maxInputPayloadBytes: 500, maxOutputTokens: 20,
+		maxInputPayloadBytes: 500, maxOutputTokens: 20,
 	} }), /strict request requires positive integer caps/);
 	assert.equal(sent.count, 0);
+	const toolFree = await runner.create({ ...spec(dir, "two-calls", { kind: "none" }),
+		strictRequest: { maxInputPayloadBytes: 500 } });
+	t.after(() => toolFree.dispose());
+	await toolFree.prompt("offline");
+	assert.equal(sent.count, 2);
 });
 
 test("campaign halts when usage ledger cannot be persisted after a successful response", async (t) => {
@@ -409,7 +455,7 @@ function reported(id: string, promptIndex = 1, input = 10, stopReason = "stop") 
 		status: "reported" as const, costStatus: "priced" as const, costSource: "sdk-estimate" as const };
 }
 
-test("parallel branch leases reserve a single shared call/CNY ceiling with interleaved tool requests", () => {
+test("parallel branch leases retain one CNY ceiling without retired call quotas", () => {
 	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxProviderCalls: 3, maxProviderCallsPerPrompt: 2, maxCny: 1 });
 	const left = budget.beginPrompt("left-session", "1");
 	const right = budget.beginPrompt("right-session", "1");
@@ -426,9 +472,9 @@ test("parallel branch leases reserve a single shared call/CNY ceiling with inter
 	assert.equal(budget.snapshot().activePrompts, 0);
 	assert.equal(budget.snapshot().stopped, false);
 	const next = budget.beginPrompt("third-session", "1");
-	assert.throws(() => budget.reserve(next, 100, "third-1"), /campaign provider call limit exhausted/);
-	assert.equal(budget.snapshot().reservations, 3);
-	assert.equal(budget.snapshot().stopReason, "provider-call-limit");
+	budget.reserve(next, 100, "third-1");
+	assert.equal(budget.snapshot().reservations, 4);
+	assert.equal(budget.snapshot().stopped, false);
 });
 
 test("two Pi handles may prompt concurrently while sharing one budget", async (t) => {
@@ -456,7 +502,7 @@ test("two Pi handles may prompt concurrently while sharing one budget", async (t
 	assert.equal(budget.snapshot().stopped, false);
 });
 
-test("concurrent Pi handles cannot cross a single-call total limit", async (t) => {
+test("concurrent Pi handles may exceed retired single-call fields while sharing CNY", async (t) => {
 	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-parallel-cap-"));
 	t.after(() => rm(dir, { recursive: true, force: true }));
 	let dispatched = 0;
@@ -474,10 +520,10 @@ test("concurrent Pi handles cannot cross a single-call total limit", async (t) =
 	const right = await runner.create(spec(path.join(dir, "right"), "right"));
 	t.after(() => { left.dispose(); right.dispose(); });
 	const outcomes = await Promise.allSettled([left.prompt("A"), right.prompt("B")]);
-	assert.equal(dispatched, 1);
-	assert.equal(budget.snapshot().reservations, 1);
-	assert.equal(budget.snapshot().stopReason, "provider-call-limit");
-	assert(outcomes.some((item) => item.status === "rejected"));
+	assert.equal(dispatched, 2);
+	assert.equal(budget.snapshot().reservations, 2);
+	assert.equal(budget.snapshot().stopped, false);
+	assert(outcomes.every((item) => item.status === "fulfilled"));
 });
 
 test("duplicate lease or request ownership fails closed without granting an unmetered retry", () => {
@@ -528,7 +574,7 @@ test("failed branch retains reserve and stops other active branch without changi
 	assert.equal(budget.snapshot().activePrompts, 0);
 });
 
-test("interleaved branches obey independent per-prompt caps and one atomic CNY ceiling", () => {
+test("interleaved branches ignore retired per-prompt calls but obey one atomic CNY ceiling", () => {
 	const cap = (100 * LIMITS.estimatedInputCnyPerMillionTokens +
 		(LIMITS.maxOutputTokens + LIMITS.outputAccountingMarginTokens) * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000;
 	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: cap * 2, maxProviderCalls: 4, maxProviderCallsPerPrompt: 2 });
@@ -544,8 +590,8 @@ test("interleaved branches obey independent per-prompt caps and one atomic CNY c
 	const b = promptCap.beginPrompt("b", "1");
 	promptCap.reserve(a, 100, "a-1");
 	promptCap.reserve(b, 100, "b-1");
-	assert.throws(() => promptCap.reserve(a, 100, "a-2"), /campaign provider call limit exhausted/);
-	assert.equal(promptCap.snapshot().reservations, 2, "one branch may not borrow the other prompt's calls");
+	promptCap.reserve(a, 100, "a-2");
+	assert.equal(promptCap.snapshot().reservations, 3, "retired per-prompt field does not stop a priced third request");
 });
 
 test("usage receipts cannot be charged to another branch or replayed as fork ancestry", () => {
@@ -679,7 +725,7 @@ test("a known length terminal response settles its charge while the prompt fails
 	assert.equal(budget.snapshot().reservations, 1);
 	assert.equal(budget.snapshot().settledCny, (10 * LIMITS.estimatedInputCnyPerMillionTokens + 20 * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000);
 	assert.equal(budget.snapshot().unknownReservedCny, 0);
-	assert.equal(budget.snapshot().stopReason, "prompt-failure");
+	assert.equal(budget.snapshot().stopReason, "output-limit");
 });
 
 test("length response cannot certify a whole prompt with an earlier unsettled request", () => {
@@ -983,12 +1029,17 @@ test("real Pi tool request uses the synthetic runtime key at the fixed DeepSeek 
 		await Promise.all([mkdir(profile), mkdir(work), mkdir(sessions)]);
 		const modelsPath = path.join(profile, "models.json");
 		await writeFile(modelsPath, JSON.stringify({ providers: { deepseek: { models: [{ ...MODEL,
+			maxTokens: 393_216, contextWindow: 1_048_576,
 			compat: { supportsStore: false, supportsDeveloperRole: false, maxTokensField: "max_tokens", thinkingFormat: "deepseek" },
 		}] } } }));
 		const runtime = await ModelRuntime.create({ modelsPath, authPath: path.join(profile, "auth.json"),
 			modelsStorePath: path.join(profile, "models-store.json"), allowModelNetwork: false, refreshOnCreate: false });
 		const syntheticKey = "sk-SYNTHETIC-OFFLINE-ONLY";
 		await runtime.setRuntimeApiKey("deepseek", syntheticKey);
+		const provider = await verifyDeepSeekProviderOutputLimit({ apiKey: syntheticKey,
+			request: async () => new Response(JSON.stringify({ object: "list", data: [{ id: "deepseek-flash",
+				object: "model", name: "DeepSeek-V4.1-Flash", max_output_tokens: 393_216,
+				context_window: 1_048_576 }] }), { status: 200 }) });
 		const calls: Array<{ endpointMatches: boolean; authorizationMatches: boolean; hasTools: boolean }> = [];
 		const sentCaps: number[] = [];
 		let transportPayloadBytes: number | undefined;
@@ -1007,8 +1058,8 @@ test("real Pi tool request uses the synthetic runtime key at the fixed DeepSeek 
 		};
 		const originalStream = runtime.streamSimple.bind(runtime);
 		runtime.streamSimple = ((model, context, options) => originalStream(model, context, { ...options, fetch: fakeFetch })) as typeof runtime.streamSimple;
-		const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 1, maxProviderCalls: 1,
-			maxProviderCallsPerPrompt: 1, maxOutputTokens: 32 });
+		const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 10, maxProviderCalls: 1,
+			maxProviderCallsPerPrompt: 1, maxOutputTokens: 1, providerOutputLimit: provider });
 		const runner = new PiSessionRunner({ modelRuntime: runtime, campaignBudget: budget });
 		const tools = await createConfinedCampaignFileTools(work, { writableFiles: ["candidate.cpp"] });
 		handle = await runner.create(spec(sessions, "real-pi-auth", { kind: "custom", tools }));
@@ -1018,36 +1069,59 @@ test("real Pi tool request uses the synthetic runtime key at the fixed DeepSeek 
 		assert.equal(budget.snapshot().reservations, 1);
 		assert(transportPayloadBytes !== undefined && transportPayloadBytes > 0);
 		const expectedReserve = (transportPayloadBytes * LIMITS.estimatedInputCnyPerMillionTokens +
-			(32 + LIMITS.outputAccountingMarginTokens) * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000;
+			(provider.maxOutputTokens + LIMITS.outputAccountingMarginTokens) * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000;
 		assert.equal(budget.snapshot().reservedCny, expectedReserve, "onPayload must measure the HTTP body the pinned SDK actually sends");
 		const fullBytes = transportPayloadBytes;
-		assert.equal(sentCaps[0], 32);
+		assert.equal(sentCaps[0], provider.maxOutputTokens,
+			"retired caller cap of one token must not change the outgoing provider maximum");
 		handle.dispose();
 		const minCost = ((fullBytes - 1) * LIMITS.estimatedInputCnyPerMillionTokens +
 			(1 + LIMITS.outputAccountingMarginTokens) * LIMITS.estimatedOutputCnyPerMillionTokens) / 1_000_000;
-		const dynamic = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: (minCost + expectedReserve) / 2,
-			maxProviderCalls: 1, maxProviderCallsPerPrompt: 1, maxOutputTokens: 32 });
-		handle = await new PiSessionRunner({ modelRuntime: runtime, campaignBudget: dynamic })
-			.create(spec(sessions, "real-pi-adaptive", { kind: "custom", tools }));
-		await assert.rejects(handle.prompt("Offline authentication check."));
-		assert.equal(calls.length, 2);
-		assert(sentCaps[1] >= 1 && sentCaps[1] < 32, "the real SDK transport must carry the reduced cap");
-		assert.equal(dynamic.requestAuditSnapshot().requests[0].maxOutputTokens, sentCaps[1]);
-		assert.equal(dynamic.requestAuditSnapshot().requests[0].inputPayloadBytes, transportPayloadBytes);
-		assert(dynamic.snapshot().grossReservedCny <= dynamic.limits.maxCny);
+		const unaffordableFull = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: (minCost + expectedReserve) / 2,
+			maxProviderCalls: 1, maxProviderCallsPerPrompt: 1, maxOutputTokens: 1,
+			providerOutputLimit: provider });
+		handle = await new PiSessionRunner({ modelRuntime: runtime, campaignBudget: unaffordableFull })
+			.create(spec(sessions, "real-pi-full-bound-denied", { kind: "custom", tools }));
+		let fullDenied: unknown;
+		try { await handle.prompt("Offline authentication check."); } catch (error) { fullDenied = error; }
+		assert.equal(isLocalNotIssued(fullDenied), true);
+		assert.equal(calls.length, 1, "a full bound that cannot fit must never be shortened or transported");
+		assert.equal(unaffordableFull.snapshot().reservations, 0);
+		assert.equal(unaffordableFull.requestAuditSnapshot().admissionRejections[0].decision,
+			"provider-maximum-unaffordable");
 		handle.dispose();
 		const rejected = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: minCost / 2,
-			maxProviderCalls: 1, maxProviderCallsPerPrompt: 1, maxOutputTokens: 32 });
+			maxProviderCalls: 1, maxProviderCallsPerPrompt: 1, maxOutputTokens: 1,
+			providerOutputLimit: provider });
 		handle = await new PiSessionRunner({ modelRuntime: runtime, campaignBudget: rejected })
 			.create(spec(sessions, "real-pi-not-issued", { kind: "custom", tools }));
 		let denied: unknown;
 		try { await handle.prompt("Offline authentication check."); } catch (error) { denied = error; }
 		assert.equal(isLocalNotIssued(denied), true);
-		assert.equal(calls.length, 2, "zero-admitted rejection must never reach fake HTTP transport");
+		assert.equal(calls.length, 1, "zero-admitted rejection must never reach fake HTTP transport");
 		assert.equal(rejected.snapshot().reservations, 0);
 		assert.equal(rejected.snapshot().admissionRejection?.requestNotSent, true);
 		assert.equal(rejected.requestAuditSnapshot().admissionRejections[0].requestNotSent, true);
 		assert.equal(rejected.requestAuditSnapshot().admissionRejections[0].decision, "input-unaffordable");
+		handle.dispose();
+		const price = await verifyDeepSeekCnyBilling({ apiKey: syntheticKey,
+			now: () => new Date("2026-10-06T11:17:00.000Z"),
+			request: async () => new Response(JSON.stringify({ is_available: true, balance_infos: [{ currency: "CNY",
+				total_balance: "PRIVATE", granted_balance: "PRIVATE", topped_up_balance: "PRIVATE" }] }), { status: 200 }) });
+		const physical = new DeepSeekCampaignBudget({ model: LIMITS.model, endpoint: LIMITS.endpoint,
+			maxCny: 30, priorCommittedCny: 29.65,
+			outputAccountingMarginTokens: 32, estimatedInputCnyPerMillionTokens: 2,
+			estimatedCacheReadCnyPerMillionTokens: 0.04, estimatedOutputCnyPerMillionTokens: 8,
+			nativeCnyPricing: price, providerOutputLimit: provider });
+		handle = await new PiSessionRunner({ modelRuntime: runtime, campaignBudget: physical })
+			.create(spec(sessions, "real-pi-provider-max-denied", { kind: "custom", tools }));
+		let physicalDenied: unknown;
+		try { await handle.prompt("Offline authentication check."); } catch (error) { physicalDenied = error; }
+		assert.equal(isLocalNotIssued(physicalDenied), true);
+		assert.equal(calls.length, 1, "the physical provider maximum never fits this synthetic remaining total");
+		assert.equal(physical.snapshot().reservations, 0);
+		assert.equal(physical.requestAuditSnapshot().admissionRejections[0].requestedOutputTokens, 393_216);
+		assert.equal(physical.requestAuditSnapshot().admissionRejections[0].decision, "provider-maximum-unaffordable");
 	} finally {
 		handle?.dispose();
 		globalThis.fetch = originalFetch;
@@ -1088,8 +1162,8 @@ test("conflicting late price reports only increase unknown holds and never erase
 	assert.equal(budget.requestAuditSnapshot().requests[0].unknownHeldCny, 40);
 });
 
-test("campaign sends and reserves the affordable reduced output cap under the one total", async (t) => {
-	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-adaptive-cap-"));
+test("campaign refuses a full output bound rather than shortening it to the affordable allowance", async (t) => {
+	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-no-adaptive-cap-"));
 	t.after(() => rm(dir, { recursive: true, force: true }));
 	const payload = { model: MODEL.id, messages: [{ role: "user", content: "offline" }], max_tokens: 20 };
 	const minBytes = Buffer.byteLength(JSON.stringify({ ...payload, max_tokens: 1 }), "utf8");
@@ -1110,16 +1184,55 @@ test("campaign sends and reserves the affordable reduced output cap under the on
 		},
 	} as unknown as ModelRuntime;
 	const handle = await new PiSessionRunner({ modelRuntime: runtime, createSession: offlineFactory(1),
-		campaignBudget: budget }).create(spec(dir, "adaptive-cap"));
+		campaignBudget: budget }).create(spec(dir, "full-bound-only"));
 	t.after(() => handle.dispose());
-	assert.equal((await handle.prompt("offline")).text, "round 1");
-	assert(sentCap >= 4 && sentCap < 20);
-	const audit = budget.requestAuditSnapshot().requests[0];
-	assert.equal(audit.maxOutputTokens, sentCap);
-	assert.equal(audit.inputPayloadBytes, sentBytes);
-	assert.equal(audit.reservedCny, (sentBytes * 4 + (sentCap + 32) * 16) / 1_000_000);
-	assert(budget.snapshot().missionCommittedCny <= 30);
+	let denial: unknown;
+	try { await handle.prompt("offline"); } catch (error) { denial = error; }
+	assert.equal(isLocalNotIssued(denial), true);
+	assert.equal(sentCap, 0);
+	assert.equal(sentBytes, 0);
+	assert.equal(budget.snapshot().reservations, 0);
+	const diagnostic = budget.requestAuditSnapshot().admissionRejections[0];
+	assert.equal(diagnostic.requestedOutputTokens, 20);
+	assert(diagnostic.outputAllowanceTokens > 0 && diagnostic.outputAllowanceTokens < 20);
+	assert.equal(diagnostic.decision, "provider-maximum-unaffordable");
+	assert.equal(diagnostic.requestNotSent, true);
 	assert.equal(budget.snapshot().priorCommittedCny, 30 - (minCost + fullCost) / 2);
+});
+
+test("campaign restores the live provider maximum if SDK context heuristics lower its payload cap", async t => {
+	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-provider-bound-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const price = await verifyDeepSeekCnyBilling({ apiKey: "synthetic", now: () => new Date("2026-10-06T11:20:00.000Z"),
+		request: async () => new Response(JSON.stringify({ is_available: true, balance_infos: [{ currency: "CNY",
+			total_balance: "PRIVATE", granted_balance: "PRIVATE", topped_up_balance: "PRIVATE" }] }), { status: 200 }) });
+	const provider = await verifyDeepSeekProviderOutputLimit({ apiKey: "synthetic",
+		request: async () => new Response(JSON.stringify({ object: "list", data: [{ id: "deepseek-flash",
+			object: "model", name: "DeepSeek-V4.1-Flash", max_output_tokens: 393_216,
+			context_window: 1_048_576 }] }), { status: 200 }) });
+	const budget = new DeepSeekCampaignBudget({ model: LIMITS.model, endpoint: LIMITS.endpoint,
+		maxCny: 30, priorCommittedCny: 0,
+		outputAccountingMarginTokens: 32, estimatedInputCnyPerMillionTokens: 2,
+		estimatedCacheReadCnyPerMillionTokens: 0.04, estimatedOutputCnyPerMillionTokens: 8,
+		nativeCnyPricing: price, providerOutputLimit: provider });
+	const model = { ...MODEL, maxTokens: provider.maxOutputTokens,
+		contextWindow: provider.contextWindow } as Model<"openai-completions">;
+	let outgoingCap = 0;
+	const runtime = { getModels: () => [model],
+		async streamSimple(m: Model<"openai-completions">, _context: unknown,
+			options: { onPayload?: (payload: unknown, model: Model<"openai-completions">) => Promise<unknown> }) {
+			const outgoing = await options.onPayload?.({ model: m.id, messages: [{ role: "user", content: "offline" }],
+				max_tokens: 64_000 }, m) as { max_tokens: number };
+			outgoingCap = outgoing.max_tokens;
+		},
+	} as unknown as ModelRuntime;
+	const handle = await new PiSessionRunner({ modelRuntime: runtime, createSession: offlineFactory(1),
+		campaignBudget: budget }).create(spec(dir, "provider-max"));
+	t.after(() => handle.dispose());
+	await handle.prompt("offline");
+	assert.equal(outgoingCap, provider.maxOutputTokens);
+	assert.equal(budget.requestAuditSnapshot().requests[0].maxOutputTokens, provider.maxOutputTokens);
+	assert.equal(budget.requestAuditSnapshot().requests[0].admissionDecision, "provider-maximum");
 });
 
 test("local rejection after a settled subrequest carries a host-certified partial-settled receipt", async (t) => {

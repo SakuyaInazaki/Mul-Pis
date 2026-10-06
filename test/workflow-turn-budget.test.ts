@@ -26,42 +26,36 @@ function deadlineRunner(prompt: SessionHandle["prompt"], onAbort: () => void): S
 }
 const deadlineSpec = { label: "M07-offline", role: "execution" as const, model: "offline/offline-model", systemPrompt: "offline", tools: { kind: "none" as const }, persistDir: "/tmp" };
 
-test("workflow arm aborts a prompt that never returns and leaves usage ineligible", async () => {
+test("workflow arm does not abort progressing work at a legacy timeout", async () => {
 	let aborts = 0;
 	const budget = new SharedBudget("workflow-hang", deadlineLimits);
-	const runner = createWorkflowMeteredRunner(deadlineRunner(() => new Promise<never>(() => undefined), () => { aborts++; }), budget, budget.root, [], 20);
+	const runner = createWorkflowMeteredRunner(deadlineRunner(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); return { text: "report", stopReason: "stop", toolCalls: 0, usage: settledUsage }; }, () => { aborts++; }), budget, budget.root, [], 1);
 	const handle = await runner.create(deadlineSpec);
-	await assert.rejects(handle.prompt("bounded"), /timed out/);
-	assert.equal(aborts, 1);
-	assert.equal(budget.status().settlement, "pending-or-unknown");
+	await handle.prompt("progressing");
+	assert.equal(aborts, 0);
+	assert.equal(budget.status().settlement, "settled");
 });
 
-test("workflow arm rejects settled usage when the last return exhausts wall time", async (t) => {
+test("workflow arm accepts settled usage beyond a legacy wall quota", async (t) => {
 	let now = 1_000;
 	t.mock.method(Date, "now", () => now);
 	const budget = new SharedBudget("workflow-final-wall", { ...deadlineLimits, maxWallMillis: 50 });
 	const events: UsageSummary[] = [];
 	const runner = createWorkflowMeteredRunner(deadlineRunner(async () => { now += 51; return { text: "report", stopReason: "stop", toolCalls: 0, usage: settledUsage }; }, () => undefined), budget, budget.root, events, 1_000);
 	const handle = await runner.create(deadlineSpec);
-	await assert.rejects(handle.prompt("last arm turn"), /wall budget exhausted/);
+	await handle.prompt("last arm turn");
 	assert.equal(events.length, 1, "observed provider usage is still recorded");
 	assert.equal(budget.status().settlement, "settled");
-	assert.equal(budget.status().remaining.wallMillis, 0);
+	assert.equal("wallMillis" in budget.status().remaining, false);
 });
 
-test("bounded I request recomputes wall time at the provider boundary", async (t) => {
-	let now = 1_000, aborts = 0;
-	t.mock.method(Date, "now", () => now);
-	const budget = new SharedBudget("workflow-i-deadline", { ...deadlineLimits, maxInputTokens: 10_000, maxWallMillis: 100 });
-	const reserve = budget.reserveObservedPrompt.bind(budget);
-	budget.reserveObservedPrompt = (...args) => { const reservation = reserve(...args); now += 60; return reservation; };
-	const runner: SessionRunner = { ...deadlineRunner(() => new Promise<never>(() => undefined), () => { aborts++; }), estimateMaxSdkCost: async () => 0.1 };
-	const start = process.hrtime.bigint();
-	await assert.rejects(runBoundedModelStep({ runner, budget, lease: budget.root, spec: { label: "I-offline", role: "improver", model: "offline/offline-model", systemPrompt: "offline", persistDir: "/tmp" }, message: "Choose a bounded action", timeoutMs: 2_000 }), /timed out/);
-	const elapsedMs = Number(process.hrtime.bigint() - start) / 1_000_000;
-	assert.ok(elapsedMs < 500, `prompt used a stale 2-second timeout (${elapsedMs} ms)`);
-	assert.equal(aborts, 1);
-	assert.equal(budget.status().settlement, "pending-or-unknown");
+test("bounded I request ignores legacy elapsed-time quotas", async () => {
+ let aborts = 0;
+ const budget = new SharedBudget("workflow-i-deadline", { ...deadlineLimits, maxInputTokens: 10_000, maxWallMillis: 1 });
+ const runner: SessionRunner = { ...deadlineRunner(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); return { text: "decision", stopReason: "stop", toolCalls: 0, usage: settledUsage }; }, () => { aborts++; }), estimateMaxSdkCost: async () => 0.1 };
+ await runBoundedModelStep({ runner, budget, lease: budget.root, spec: { label: "I-offline", role: "improver", model: "offline/offline-model", systemPrompt: "offline", persistDir: "/tmp" }, message: "Choose a bounded action", timeoutMs: 1 });
+ assert.equal(aborts, 0);
+ assert.equal(budget.status().settlement, "settled");
 });
 
 test("real Pi runner SDK boundary accounts for two offline provider rounds with an actual granted file read", async (t) => {
@@ -102,14 +96,14 @@ test("real Pi runner SDK boundary accounts for two offline provider rounds with 
 	assert.equal(turn.usage?.reportedEvents, 2);
 	assert.equal(events[0]?.reportedEvents, 2);
 	assert.equal(budget.status().committed.providerCalls, 2, "unused serial call allowance is returned after settlement");
-	assert.equal(budget.status().remaining.providerCalls, 3);
+	assert.equal("providerCalls" in budget.status().remaining, false);
 	assert.equal(budget.status().settlement, "settled");
 	assert.deepEqual(handle.readCoverage(), ["evidence.txt"]);
 	assert.ok(handle.readReturnEvents().some((x) => x.path === "evidence.txt" && x.status === "returned"));
 	handle.dispose();
 });
 
-test("tool-turn reservation marks missing or excess SDK events ineligible for admission", () => {
+test("tool-turn reservation rejects missing usage but accepts additional settled SDK events", () => {
 	const limits = { maxProviderCalls: 2, maxInputTokens: 100, maxOutputTokens: 100, maxSdkEstimatedCost: 1, maxProbeCalls: 0, maxCpuMillis: 1_000, maxWallMillis: 20_000 };
 	const missing = new SharedBudget("unknown-turn", limits);
 	const first = missing.reserveObservedTurn(missing.root);
@@ -119,7 +113,8 @@ test("tool-turn reservation marks missing or excess SDK events ineligible for ad
 	const excess = new SharedBudget("excess-turn", limits);
 	const second = excess.reserveObservedTurn(excess.root);
 	excess.settleObservedTurn(second, { input: 20, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 25, cost: 0.03, reportedEvents: 3, unknownEvents: 0, complete: true, costComplete: true });
-	assert.equal(excess.status().settlement, "exceeded");
+	assert.equal(excess.status().settlement, "settled");
+	assert.equal(excess.status().committed.providerCalls, 3);
 });
 
 test("workflow I sends its own flat-action contract through the Pi SDK boundary", async (t) => {
@@ -127,9 +122,10 @@ test("workflow I sends its own flat-action contract through the Pi SDK boundary"
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const sourceId = "development:20260924T011834Z-4f90:C001";
 	const actualFirstAnswer = { kind: "inspect", read: { object: "development-feedback", id: sourceId, start: 0, maxChars: 4000 } };
-	const visible = { sourceId, metaIds: [], methodIds: ["H0", "I0"], candidateIds: [], readbackRemaining: 4000 };
+	const visible = { sourceId, metaIds: [], methodIds: ["H0", "I0"], candidateIds: [] };
 	assert.throws(() => validateWorkflowAction(actualFirstAnswer, visible), /outside the fixed/);
 	assert.deepEqual(validateWorkflowAction({ kind: "inspect", object: "development-feedback", id: sourceId, start: 0, maxChars: 4000 }, visible), { kind: "inspect", object: "development-feedback", id: sourceId, start: 0, maxChars: 4000 });
+	assert.throws(() => validateWorkflowAction({ kind: "inspect", object: "development-feedback", id: sourceId, start: 0, maxChars: 4001 }, visible), /outside the fixed/);
 	let deliveredSystem = "", deliveredUser = "";
 	const factory = (async (options: CreateAgentSessionOptions = {}) => {
 		deliveredSystem = options.resourceLoader?.getSystemPrompt() ?? "";

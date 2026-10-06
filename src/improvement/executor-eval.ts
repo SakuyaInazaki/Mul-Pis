@@ -1,5 +1,5 @@
 /** Scientific method episodes and a separate quality protocol; no mechanism-cost gate is reused. */
-import { isScientificActionId, MAX_EXECUTOR_EPISODE_ACTIONS, type BudgetLease, type DevelopmentEnvironment, type DevelopmentFeedback, type ExecutorStrategyV1, type ExperimentStart, type ProtectedEvaluator, type PublicTask, type ScientificAction } from "../experiments/contracts.ts";
+import { isScientificActionId, type BudgetLease, type DevelopmentEnvironment, type DevelopmentFeedback, type ExecutorStrategyV1, type ExperimentStart, type ProtectedEvaluator, type PublicTask, type ScientificAction } from "../experiments/contracts.ts";
 import { SharedBudget } from "../experiments/budget.ts";
 import type { CpuCaseSetV1 } from "../experiments/local-environment.ts";
 import { createCpuResponseEnvironment } from "../experiments/local-environment.ts";
@@ -25,7 +25,6 @@ export interface ExecutorQualityResult {
 }
 
 function parseAction(text: string, task: PublicTask): ScientificAction {
- if (text.length > 8_000) throw new HarnessError("improvement.executor-action", "executor action too large");
  let raw: unknown; try { raw = JSON.parse(text); } catch { throw new HarnessError("improvement.executor-action", "executor must return one JSON action"); }
  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new HarnessError("improvement.executor-action", "executor action must be an object");
  const value = raw as Record<string, unknown>;
@@ -42,7 +41,7 @@ export function executorSystemPrompt(method: ExecutorStrategyV1): string {
 
 export async function runExecutorEpisode(args: {
  development: DevelopmentEnvironment; start: ExperimentStart; method: ExecutorStrategyV1; methodVersionId: string;
- runner: SessionRunner; model: string; persistDir: string; budget: SharedBudget; lease: BudgetLease; timeoutMs: number;
+ runner: SessionRunner; model: string; persistDir: string; budget: SharedBudget; lease: BudgetLease; timeoutMs?: number;
  beforeModelRequest?: () => Promise<void>;
  maxActions?: number;
 }): Promise<ExecutorEpisodeResult> {
@@ -50,9 +49,8 @@ export async function runExecutorEpisode(args: {
  const result: ExecutorEpisodeResult = { caseId: task.caseId, startId: args.start.id, methodVersionId: args.methodVersionId, status: "inconclusive", feedback: [], sessionIds: [], usageSidecars: [], modelCalls: 0, usedProbeXs: [] };
  const initialCalls = args.budget.status(args.lease).committed.providerCalls;
  const seenActions = new Map<string, string>();
-	 const maxActions = Math.min(args.maxActions ?? MAX_EXECUTOR_EPISODE_ACTIONS, task.maxProbeCalls + 2, 8);
  try {
-  for (let index = 0; index < maxActions; index++) {
+  for (let index = 0; ; index++) {
    const message = JSON.stringify({ task, visibleFeedback: result.feedback, actionIndex: index, instruction: "Return one allowed JSON action." });
    await args.beforeModelRequest?.();
    const step = await runBoundedModelStep({ runner: args.runner, budget: args.budget, lease: args.lease, spec: { label: `H-${args.methodVersionId}-${task.caseId}-${index}`, role: "research", model: args.model, systemPrompt: executorSystemPrompt(args.method), persistDir: args.persistDir, methodBinding: { versionId: args.methodVersionId } }, message, timeoutMs: args.timeoutMs });
@@ -69,7 +67,7 @@ export async function runExecutorEpisode(args: {
    result.feedback.push(feedback);
    if (unique.kind !== "probe" || feedback.status !== "observed") break;
   }
-  if (result.status === "inconclusive" && !result.failure) result.failure = "bounded episode ended without submit or justified stop";
+  if (result.status === "inconclusive" && !result.failure) result.failure = "episode ended without submit or justified stop";
  } catch (error) { result.status = "inconclusive"; result.failure = (error as Error).message; }
  result.modelCalls = args.budget.status(args.lease).committed.providerCalls - initialCalls;
  return result;
@@ -79,7 +77,7 @@ export async function runExecutorEpisode(args: {
 export async function runExecutorQualityAdmission(args: {
  caseSet: CpuCaseSetV1; baseline: { versionId: string; artifact: ExecutorStrategyV1 }; candidate: { versionId: string; artifact: ExecutorStrategyV1 };
  runner: SessionRunner; model: string; persistDir: string; budget: SharedBudget; lease: BudgetLease;
- timeoutMs: number; repetitions: number;
+ timeoutMs?: number; repetitions: number;
  comparisonMode?: "gain" | "noninferiority";
  beforeModelRequest?: (versionId: string) => Promise<void>;
  persistObservation: (record: { start: ExperimentStart; action: ScientificAction; feedback: DevelopmentFeedback }) => Promise<{ storeId: string; id: string; version: string }>;
@@ -109,7 +107,7 @@ export async function runExecutorQualityAdmission(args: {
     if (arm === "baseline" && protectedStatus === "accepted") result.baselineAccepted++;
     if (arm === "candidate" && protectedStatus === "accepted") result.candidateAccepted++;
     const b = args.budget.status(args.lease); result.budgetSettlement = b.settlement;
-    if (b.settlement !== "settled" || b.remaining.wallMillis <= 0) { result.reason = "unknown, exceeded, or timed-out shared resource budget"; return result; }
+    if (b.settlement !== "settled") { result.reason = "unknown or exceeded shared monetary budget"; return result; }
    }
   }
  }

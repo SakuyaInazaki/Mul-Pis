@@ -3,6 +3,7 @@ import { inflateRawSync } from "node:zlib";
 import { HarnessError } from "../types.ts";
 import type { CampaignAdmissionRejection, CampaignRequestAudit } from "./deepseek-campaign.ts";
 import { isNativeCnyPricingRecord, type NativeCnyPricingProfile } from "./deepseek-cny-pricing.ts";
+import { isDeepSeekProviderOutputLimitRecord, type DeepSeekProviderOutputLimit } from "./deepseek-provider-limits.ts";
 import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY,
 	MISSION_TOTAL_CNY, ONE_USE_PUSH_MARKER, PRIVATE_CONTINUATION_FILE_KEYS } from "./signed-mission-ledger.ts";
 import type { BootstrapBinding, PrivateContinuationBundle } from "./signed-mission-ledger.ts";
@@ -102,7 +103,10 @@ type AncestorReceipt = Pick<Checkpoint, "parentDigest" | "source" | "committedNa
 export type RequestAuditSnapshot = { requests: CampaignRequestAudit[]; settledCny: number;
 	unknownReservedCny: number; inFlightReservedCny: number; reservations: number;
 	/** Absent in earlier encrypted carries. */ admissionRejections?: CampaignAdmissionRejection[];
-	/** Verified-at-run native CNY source metadata, without balances. */ pricingProfile?: NativeCnyPricingProfile };
+	/** Verified-at-run native CNY source metadata, without balances. */ pricingProfile?: NativeCnyPricingProfile;
+	/** Fresh provider maximum metadata for a new run; never a lower workflow output cap. */
+	providerOutputLimit?: DeepSeekProviderOutputLimit };
+
 function reject(reason: string): never { throw new HarnessError("runner.ledger-continuation", reason); }
 function record(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -150,20 +154,24 @@ function sameBinding(a: BootstrapBinding | undefined, b: BootstrapBinding): bool
 function validAudit(value: unknown, settledNano: number, unknownNano: number): value is RequestAuditSnapshot {
 	if (!record(value) || !exactKeys(value, ["requests", "settledCny", "unknownReservedCny",
 		"inFlightReservedCny", "reservations", ...(value.admissionRejections === undefined ? [] : ["admissionRejections"]),
-		...(value.pricingProfile === undefined ? [] : ["pricingProfile"])]) || !Array.isArray(value.requests) ||
-		value.requests.length > 1_000 || !Number.isSafeInteger(value.reservations) ||
+		...(value.pricingProfile === undefined ? [] : ["pricingProfile"]),
+		...(value.providerOutputLimit === undefined ? [] : ["providerOutputLimit"])]) || !Array.isArray(value.requests) ||
+		!Number.isSafeInteger(value.reservations) ||
 		value.reservations !== value.requests.length) return false;
 	const a = value as RequestAuditSnapshot;
 	if (a.pricingProfile !== undefined && !isNativeCnyPricingRecord(a.pricingProfile)) return false;
+	if (a.providerOutputLimit !== undefined &&
+		!isDeepSeekProviderOutputLimitRecord(a.providerOutputLimit)) return false;
 	if (a.admissionRejections !== undefined && (!Array.isArray(a.admissionRejections) ||
-		a.admissionRejections.length > 1_000 || a.admissionRejections.some(row =>
+		a.admissionRejections.some(row =>
 			!record(row) || !exactKeys(row, ["version", "kind", "decision", "requestNotSent",
 				"inputPayloadBytes", "inputUpperCny", "outputAllowanceTokens", "minimumOutputTokens",
 				"requestedOutputTokens", "outputAccountingMarginTokens", "marginUpperCny",
 				"availableCny", "requiredAtMinimumOutputCny", "globalMaxCny", "committedBeforeCny",
 				"settledProviderRequestCount", "pricingBasis"]) ||
 			row.version !== 1 || row.kind !== "campaign-admission-rejection" || row.requestNotSent !== true ||
-			!["input-unaffordable", "minimum-output-unaffordable", "requested-output-cap-unaffordable", "provider-call-limit"].includes(String(row.decision)) ||
+			!["input-unaffordable", "minimum-output-unaffordable", "requested-output-cap-unaffordable",
+				"provider-maximum-unaffordable", "provider-call-limit"].includes(String(row.decision)) ||
 			![row.inputPayloadBytes, row.requestedOutputTokens, row.settledProviderRequestCount]
 				.every(x => Number.isSafeInteger(x) && x >= 0) || row.inputPayloadBytes < 1 ||
 			row.requestedOutputTokens < 1 || row.settledProviderRequestCount > a.requests.length ||
@@ -201,7 +209,9 @@ function validAudit(value: unknown, settledNano: number, unknownNano: number): v
 			item.inputPayloadBytes <= 0 ||
 			(item.maxOutputTokens !== undefined &&
 				(!Number.isSafeInteger(item.maxOutputTokens) || item.maxOutputTokens < 1)) ||
-			(item.admissionDecision !== undefined && !["full-output", "reduced-output"].includes(String(item.admissionDecision))) ||
+			(item.admissionDecision !== undefined && !["full-output", "reduced-output", "provider-maximum"].includes(String(item.admissionDecision))) ||
+			(item.admissionDecision === "provider-maximum" &&
+				(!a.providerOutputLimit || item.maxOutputTokens !== a.providerOutputLimit.maxOutputTokens)) ||
 			typeof item.reservedCny !== "number" || !Number.isFinite(item.reservedCny) ||
 			item.reservedCny < 0 || item.reservedCny > MISSION_TOTAL_CNY ||
 			!["reserved", "settled", "unknown"].includes(String(item.status))) return false;
@@ -307,7 +317,7 @@ function readCheckpoint(envelopeB64: string, key: Buffer, seedDigest: string, ex
 	if (cp.version !== outer.version || cp.kind !== "mul-pis-private-ledger-continuation" ||
 		cp.missionId !== MISSION_ID || cp.repository !== MISSION_REPOSITORY || cp.seedDigest !== seedDigest ||
 		cp.parentDigest !== parentDigest ||
-		(cp.version === 2 && (!Array.isArray(cp.ancestry) || cp.ancestry.length > 2_000)) ||
+		(cp.version === 2 && !Array.isArray(cp.ancestry)) ||
 		(cp.privateBundle !== undefined && !validBundle(cp.privateBundle)) ||
 		(cp.bootstrapBinding !== undefined && !validBinding(cp.bootstrapBinding)) ||
 		(cp.privateBundle === undefined) !== (cp.bootstrapBinding === undefined))
@@ -489,7 +499,8 @@ export async function openLedgerContinuation(input: {
 	const pages: Run[] = [];
 	let foundSeed = false;
 	let totalCount: number | undefined;
-	for (let page = 1; page <= 20; page++) {
+	for (let page = 1; ; page++) {
+		if (!Number.isSafeInteger(page)) reject("workflow run pagination index is invalid");
 		const response = await githubJson(`${base}/workflows/${WORKFLOW}/runs?per_page=100&page=${page}`,
 			input.githubToken, request);
 		if (!Array.isArray(response.workflow_runs) || response.workflow_runs.length > 100 ||

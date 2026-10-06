@@ -69,8 +69,8 @@ test("research_delegate passes approved plan, versioned resources, bounded loop,
 	const seen: unknown[] = [];
 	const service = { delegate: async (_runId: string, task: unknown) => { seen.push(task); return { taskId: "task-offline", status: "returned" }; } } as unknown as ResearchService;
 	const tool = captureExtension(service).tools.get("research_delegate")!;
-	await tool.execute("d", { runId: "goal-offline", objective: "execute approved plan", inputs: ["plan.md", "guide.md"], expectedOutputs: ["lesson.md"], checks: ["evidence recorded"], mode: "execute", planInput: "plan.md", resourceInputs: [{ id: "operator-guide", version: "v2", input: "guide.md" }], executionLoop: { maxRounds: 3, deadlineAt: "2026-10-04T20:00:00.000Z" }, lessonDeltaOutput: "lesson.md" }, undefined, undefined, toolContext("/workspace"));
-	assert.deepEqual(seen, [{ objective: "execute approved plan", inputs: ["plan.md", "guide.md"], expectedOutputs: ["lesson.md"], checks: ["evidence recorded"], mode: "execute", planInput: "plan.md", resourceInputs: [{ id: "operator-guide", version: "v2", input: "guide.md" }], executionLoop: { maxRounds: 3, deadlineAt: "2026-10-04T20:00:00.000Z" }, lessonDeltaOutput: "lesson.md" }]);
+	await tool.execute("d", { runId: "goal-offline", objective: "execute approved plan", inputs: ["plan.md", "guide.md"], expectedOutputs: ["lesson.md"], checks: ["evidence recorded"], mode: "execute", planInput: "plan.md", resourceInputs: [{ id: "operator-guide", version: "v2", input: "guide.md" }], executionLoop: { mode: "until-ready" }, lessonDeltaOutput: "lesson.md" }, undefined, undefined, toolContext("/workspace"));
+	assert.deepEqual(seen, [{ objective: "execute approved plan", inputs: ["plan.md", "guide.md"], expectedOutputs: ["lesson.md"], checks: ["evidence recorded"], mode: "execute", planInput: "plan.md", resourceInputs: [{ id: "operator-guide", version: "v2", input: "guide.md" }], executionLoop: { mode: "until-ready" }, lessonDeltaOutput: "lesson.md" }]);
 });
 
 test("research tools dispatch a real same-goal fork and select an accepted branch without exposing session dumps", async () => {

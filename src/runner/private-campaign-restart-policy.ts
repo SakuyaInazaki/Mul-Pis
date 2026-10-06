@@ -62,7 +62,7 @@ function chain(raw: string | undefined, kind: string): unknown[] {
 	try { value = JSON.parse(raw) as Record<string, unknown>; }
 	catch { return reject(`invalid ${kind} chain JSON`); }
 	if (value.version !== 1 || value.kind !== kind || !Array.isArray(value.entries) ||
-		value.entries.length < 1 || value.entries.length > 64) return reject(`invalid ${kind} chain`);
+		value.entries.length < 1) return reject(`invalid ${kind} chain`);
 	return value.entries as unknown[];
 }
 

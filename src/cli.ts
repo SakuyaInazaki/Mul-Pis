@@ -145,7 +145,10 @@ function taskSpec(value: unknown, runId: string): TaskSpecInput {
 	for (const key of ["experienceRefs", "experienceContextRefs"]) if (value[key] !== undefined && !refs(value[key])) throw new HarnessError("cli.goal", `--task.${key} 必须是固定知识引用数组`);
 	if (value.requireIndependentCheck !== undefined && typeof value.requireIndependentCheck !== "boolean") throw new HarnessError("cli.goal", "--task.requireIndependentCheck 必须是布尔值");
 	if (value.resourceInputs !== undefined && (!Array.isArray(value.resourceInputs) || !value.resourceInputs.every((item: unknown) => object(item) && keys(item, ["id", "version", "input"]) && str(item.id) && str(item.version) && str(item.input)))) throw new HarnessError("cli.goal", "--task.resourceInputs 格式无效");
-	if (value.executionLoop !== undefined && (!object(value.executionLoop) || !keys(value.executionLoop, ["maxRounds", "deadlineAt"]) || !Number.isInteger(value.executionLoop.maxRounds) || !str(value.executionLoop.deadlineAt))) throw new HarnessError("cli.goal", "--task.executionLoop 格式无效");
+	if (value.executionLoop !== undefined && (!object(value.executionLoop) || !(
+		(value.executionLoop.mode === "until-ready" && Object.keys(value.executionLoop).length === 1) ||
+		(keys(value.executionLoop, ["maxRounds", "deadlineAt"]) && Number.isSafeInteger(value.executionLoop.maxRounds) && str(value.executionLoop.deadlineAt))
+	))) throw new HarnessError("cli.goal", "--task.executionLoop 格式无效");
 	if (value.context !== undefined && (!object(value.context) || !keys(value.context, ["mode", "parentRunId", "parentTaskId", "checkpointId"]) || Object.keys(value.context).length !== 4 || value.context.mode !== "fork" || value.context.parentRunId !== runId || !str(value.context.parentTaskId) || !str(value.context.checkpointId))) throw new HarnessError("cli.goal", "--task.context 必须给出同一 goal 的精确 fork checkpoint 引用");
 	return value as unknown as TaskSpecInput;
 }

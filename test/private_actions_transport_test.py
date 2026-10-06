@@ -127,6 +127,8 @@ class EncryptTests(unittest.TestCase):
             (results / "lesson-delta.json").write_bytes(b'{"action":"none"}')
             (results / "workflow-archive.json").write_bytes(b'{"trustedAdoption":false}')
             (results / "round-1-reviewer-feedback.txt").write_bytes(b"Full explicit reviewer rationale, beyond a short index.")
+            (results / "iteration-65-round-10-reviewer-feedback.txt").write_bytes(b"Later bounded feedback")
+            (results / "fallback-aaaaaaaaaaaa-T003-round-10-reviewer-feedback.txt").write_bytes(b"Later task feedback")
             (results / "review-decision.json").write_bytes(b'{"status":"rejected","reason":"Observed failure"}')
             (results / "context-lineage.json").write_bytes(b'{"version":1,"branchCount":2}')
             (results / "initial-m04-adopted-knowledge.json").write_bytes(b'{"version":1,"state":"complete"}')
@@ -158,7 +160,7 @@ class EncryptTests(unittest.TestCase):
             plain = AESGCM(key).decrypt(base64.b64decode(envelope["nonce_b64"]),
                 base64.b64decode(envelope["ciphertext_b64"]), aad)
             with tarfile.open(fileobj=io.BytesIO(plain), mode="r:") as tar:
-                self.assertEqual(sorted(tar.getnames()), ["branch-child-round-1-reviewer-feedback.txt", "branch-parent-round-1-reviewer-feedback.txt", "campaign-status.json", "candidate.cpp", "context-lineage.json", "independent-restart-goal-binding.json", "independent-restart-quarantine.json", "initial-m04-adopted-knowledge.json", "lesson-delta.json", "mission-ledger-out.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "objective-checkpoint.json", "original-objective.json", "review-decision.json", "round-1-reviewer-feedback.txt", "workflow-archive.json"])
+                self.assertEqual(sorted(tar.getnames()), ["branch-child-round-1-reviewer-feedback.txt", "branch-parent-round-1-reviewer-feedback.txt", "campaign-status.json", "candidate.cpp", "context-lineage.json", "fallback-aaaaaaaaaaaa-T003-round-10-reviewer-feedback.txt", "independent-restart-goal-binding.json", "independent-restart-quarantine.json", "initial-m04-adopted-knowledge.json", "iteration-65-round-10-reviewer-feedback.txt", "lesson-delta.json", "mission-ledger-out.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "objective-checkpoint.json", "original-objective.json", "review-decision.json", "round-1-reviewer-feedback.txt", "workflow-archive.json"])
                 self.assertEqual(tar.extractfile("candidate.cpp").read(), b"secret candidate")
             with self.assertRaises(Exception):
                 AESGCM(key).decrypt(base64.b64decode(envelope["nonce_b64"]),
@@ -172,6 +174,8 @@ class EncryptTests(unittest.TestCase):
             self.assertEqual((recovered / "lesson-delta.json").read_bytes(), b'{"action":"none"}')
             self.assertEqual((recovered / "workflow-archive.json").read_bytes(), b'{"trustedAdoption":false}')
             self.assertEqual((recovered / "round-1-reviewer-feedback.txt").read_bytes(), b"Full explicit reviewer rationale, beyond a short index.")
+            self.assertEqual((recovered / "iteration-65-round-10-reviewer-feedback.txt").read_bytes(), b"Later bounded feedback")
+            self.assertEqual((recovered / "fallback-aaaaaaaaaaaa-T003-round-10-reviewer-feedback.txt").read_bytes(), b"Later task feedback")
             self.assertEqual((recovered / "review-decision.json").read_bytes(), b'{"status":"rejected","reason":"Observed failure"}')
             self.assertEqual((recovered / "context-lineage.json").read_bytes(), b'{"version":1,"branchCount":2}')
             self.assertEqual((recovered / "initial-m04-adopted-knowledge.json").read_bytes(), b'{"version":1,"state":"complete"}')

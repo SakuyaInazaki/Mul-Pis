@@ -6,6 +6,8 @@ import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { ResearchService } from "../src/pi/service.ts";
 import { PiSessionRunner } from "../src/runner/pi.ts";
+import { DeepSeekCampaignBudget } from "../src/runner/deepseek-campaign.ts";
+import { verifyDeepSeekProviderOutputLimit, type DeepSeekProviderOutputLimit } from "../src/runner/deepseek-provider-limits.ts";
 import type { SessionRunner } from "../src/runner/types.ts";
 import { runInit } from "../src/stages/init.ts";
 import { HarnessError } from "../src/types.ts";
@@ -13,22 +15,14 @@ import { Workspace } from "../src/workspace.ts";
 
 export const SMOKE_MODEL = "deepseek/deepseek-flash:low";
 export const MAX_INPUT_PAYLOAD_BYTES = 12_000;
-export const MAX_OUTPUT_TOKENS = 8_192;
-// The provider reported 2,049 output tokens for a 2,048-token request cap in
-// the diagnostic run. Reserve a little extra for accounting variance.
-export const OBSERVED_OUTPUT_MARGIN_TOKENS = 32;
-export const MAX_PROVIDER_CALLS = 1;
 export const MAX_CNY_ESTIMATE = 2.1;
-// An intentionally pessimistic planning rate, not a billing guarantee.
-const USD_PER_MILLION_TOKENS_CEILING = 10;
 const CNY_PER_USD_CEILING = 10;
-export const MAX_PLANNING_CNY =
-  ((MAX_INPUT_PAYLOAD_BYTES + MAX_OUTPUT_TOKENS + OBSERVED_OUTPUT_MARGIN_TOKENS) * USD_PER_MILLION_TOKENS_CEILING / 1_000_000) * CNY_PER_USD_CEILING;
+const OUTPUT_ACCOUNTING_MARGIN_TOKENS = 32;
 
 export interface PublicUsage {
   provider: "deepseek";
   model: "deepseek-flash";
-  observedAssistantEvents: 1;
+  observedAssistantEvents: number;
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
@@ -42,7 +36,7 @@ export interface PublicUsage {
 type SmokePhase = "preflight" | "model-setup" | "m01-stage" | "usage-audit" | "cleanup";
 
 const SAFE_HARNESS_CODES = new Set([
-  "runner.model", "runner.stop", "runner.persistence", "runner.isolation", "runner.tools",
+  "runner.model", "runner.stop", "runner.campaign", "runner.provider-limit", "runner.persistence", "runner.isolation", "runner.tools",
   "config.missing", "config.model", "config.roles", "config.role-unset", "problem.missing",
   "prompt.missing", "run.interrupted", "m07.busy",
 ]);
@@ -86,8 +80,8 @@ export function safeFailure(error: unknown, phase: SmokePhase, rawUsage?: unknow
       if (typeof summary.complete === "boolean") report.usageComplete = summary.complete;
       if (typeof summary.costComplete === "boolean") report.sdkCostComplete = summary.costComplete;
     }
-    if (Array.isArray(row.events) && row.events.length === 1) {
-      const event = row.events[0];
+    if (Array.isArray(row.events) && row.events.length > 0) {
+      const event = row.events.at(-1);
       if (event && typeof event === "object" && !Array.isArray(event)) {
         const raw = event as Record<string, unknown>;
         if (raw.kind === "assistant" && typeof raw.stopReason === "string" && SAFE_STOP_REASONS.has(raw.stopReason)) report.stopReason = raw.stopReason;
@@ -114,22 +108,19 @@ export function publicUsageFromSidecar(raw: unknown): PublicUsage {
   const row = object(raw);
   const events = row.events;
   const summary = object(row.summary);
-  if (row.version !== 1 || row.promptIndex !== 1 || row.outcome !== "completed" || !Array.isArray(events) || events.length !== 1 ||
-      summary.complete !== true || summary.costComplete !== true || summary.reportedEvents !== 1 || summary.unknownEvents !== 0) {
+  if (row.version !== 1 || row.promptIndex !== 1 || row.outcome !== "completed" || !Array.isArray(events) || events.length < 1 ||
+      summary.complete !== true || summary.costComplete !== true || summary.reportedEvents !== events.length || summary.unknownEvents !== 0) {
     throw new Error("SDK usage evidence is incomplete");
   }
-  const event = object(events[0]);
-  if (event.kind !== "assistant" || event.status !== "reported" || event.costStatus !== "priced" ||
-      event.provider !== "deepseek" || event.model !== "deepseek-flash" || event.stopReason !== "stop") {
+  if (!events.every((raw) => { const event = object(raw); return event.kind === "assistant" && event.status === "reported" &&
+      event.costStatus === "priced" && event.provider === "deepseek" && event.model === "deepseek-flash"; }) ||
+      object(events.at(-1)).stopReason !== "stop") {
     throw new Error("unexpected SDK usage event");
   }
   const cost = summary.cost;
   if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) throw new Error("SDK cost estimate is missing");
-  if (count(summary.output) > MAX_OUTPUT_TOKENS + OBSERVED_OUTPUT_MARGIN_TOKENS) {
-    throw new Error("observed output exceeded accounting reserve");
-  }
   return {
-    provider: "deepseek", model: "deepseek-flash", observedAssistantEvents: 1,
+    provider: "deepseek", model: "deepseek-flash", observedAssistantEvents: events.length,
     inputTokens: count(summary.input), outputTokens: count(summary.output),
     cacheReadTokens: count(summary.cacheRead), cacheWriteTokens: count(summary.cacheWrite),
     totalTokens: count(summary.totalTokens), sdkEstimatedUsdCost: cost,
@@ -138,7 +129,7 @@ export function publicUsageFromSidecar(raw: unknown): PublicUsage {
 }
 
 export function assertPreflight(): void {
-  if (MAX_PROVIDER_CALLS !== 1 || MAX_PLANNING_CNY > MAX_CNY_ESTIMATE || MAX_CNY_ESTIMATE >= 30) {
+  if (!Number.isFinite(MAX_CNY_ESTIMATE) || MAX_CNY_ESTIMATE <= 0 || MAX_CNY_ESTIMATE >= 30) {
     throw new Error("smoke budget preflight failed");
   }
 }
@@ -152,7 +143,7 @@ export const MODEL_PROFILE = {
         id: "deepseek-flash", name: "DeepSeek V4.1 Flash", api: "openai-completions",
         baseUrl: "https://api.deepseek.com", reasoning: true, input: ["text"],
         cost: { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 },
-        contextWindow: 1_000_000, maxTokens: 384_000,
+        contextWindow: 1_048_576, maxTokens: 393_216,
         compat: { supportsStore: false, supportsDeveloperRole: false, maxTokensField: "max_tokens", requiresReasoningContentOnAssistantMessages: true, thinkingFormat: "deepseek" },
         thinkingLevelMap: { low: "low", high: "high", max: "max" },
       }],
@@ -160,18 +151,26 @@ export const MODEL_PROFILE = {
   },
 } as const;
 
-export function boundedStageRunner(runtime: ModelRuntime, signal: AbortSignal): SessionRunner {
-  const actual = new PiSessionRunner({ modelRuntime: runtime, signal });
+export function boundedStageRunner(runtime: ModelRuntime, providerOutputLimit: DeepSeekProviderOutputLimit): SessionRunner & { campaignBudget: DeepSeekCampaignBudget } {
+  const cost = MODEL_PROFILE.providers.deepseek.models[0].cost;
+  const campaignBudget = new DeepSeekCampaignBudget({
+    model: SMOKE_MODEL, endpoint: "https://api.deepseek.com", maxCny: MAX_CNY_ESTIMATE,
+    priorCommittedCny: 0, providerOutputLimit, maxInputPayloadBytes: MAX_INPUT_PAYLOAD_BYTES,
+    outputAccountingMarginTokens: OUTPUT_ACCOUNTING_MARGIN_TOKENS,
+    estimatedInputCnyPerMillionTokens: cost.input * CNY_PER_USD_CEILING,
+    estimatedCacheReadCnyPerMillionTokens: cost.cacheRead * CNY_PER_USD_CEILING,
+    estimatedOutputCnyPerMillionTokens: cost.output * CNY_PER_USD_CEILING,
+    estimatedCnyPerUsd: CNY_PER_USD_CEILING,
+  });
+  const actual = new PiSessionRunner({ modelRuntime: runtime, campaignBudget });
   return {
+    campaignBudget,
     estimateMaxSdkCost: (model, caps) => actual.estimateMaxSdkCost(model, caps),
     create: (spec) => {
       if (spec.label !== "M01" || spec.model !== SMOKE_MODEL || spec.tools.kind !== "none") {
         throw new Error("smoke supports only one tool-free M01 session");
       }
-      return actual.create({ ...spec, strictRequest: {
-        maxProviderCallsPerPrompt: 1, maxOutputTokens: MAX_OUTPUT_TOKENS,
-        maxInputPayloadBytes: MAX_INPUT_PAYLOAD_BYTES,
-      } });
+      return actual.create(spec);
     },
     resume: async () => { throw new Error("smoke cannot resume a session"); },
   };
@@ -194,42 +193,38 @@ async function run(): Promise<void> {
   let ws: Workspace | undefined;
   let success: Record<string, unknown> | undefined;
   let failure: Record<string, unknown> | undefined;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 90_000);
   try {
     assertPreflight();
     const key = process.env.DEEPSEEK_API_KEY;
     if (!key || !key.trim()) throw new Error("DEEPSEEK_API_KEY is absent");
     temp = await mkdtemp(path.join(os.tmpdir(), "mul-pis-public-smoke-"));
     phase = "model-setup";
+    const providerLimit = await verifyDeepSeekProviderOutputLimit({ apiKey: key });
     const profile = path.join(temp, "profile");
     await mkdir(profile, { mode: 0o700 });
-    await writeFile(path.join(profile, "models.json"), JSON.stringify(MODEL_PROFILE), { mode: 0o600 });
+    const liveProfile = { providers: { deepseek: { models: [{ ...MODEL_PROFILE.providers.deepseek.models[0],
+      maxTokens: providerLimit.maxOutputTokens, contextWindow: providerLimit.contextWindow }] } } };
+    await writeFile(path.join(profile, "models.json"), JSON.stringify(liveProfile), { mode: 0o600 });
     const runtime = await ModelRuntime.create({
       modelsPath: path.join(profile, "models.json"), authPath: path.join(profile, "auth.json"),
       modelsStorePath: path.join(profile, "models-store.json"), allowModelNetwork: false, refreshOnCreate: false,
     });
     const model = runtime.getModel("deepseek", "deepseek-flash");
     if (model?.provider !== "deepseek" || model.id !== "deepseek-flash" ||
-        model.api !== "openai-completions" || model.baseUrl !== "https://api.deepseek.com") {
+        model.api !== "openai-completions" || model.baseUrl !== "https://api.deepseek.com" ||
+        model.maxTokens !== providerLimit.maxOutputTokens) {
       throw new Error("unexpected model or endpoint");
     }
-    const runner = boundedStageRunner(runtime, controller.signal);
-    const sdkEstimate = await runner.estimateMaxSdkCost?.(SMOKE_MODEL, {
-      maxInputTokens: MAX_INPUT_PAYLOAD_BYTES, maxOutputTokens: MAX_OUTPUT_TOKENS + OBSERVED_OUTPUT_MARGIN_TOKENS,
-    });
-    if (sdkEstimate === undefined || !Number.isFinite(sdkEstimate) || sdkEstimate * CNY_PER_USD_CEILING > MAX_CNY_ESTIMATE) {
-      throw new Error("SDK pricing preflight failed");
-    }
+    const runner = boundedStageRunner(runtime, providerLimit);
     await runtime.setRuntimeApiKey("deepseek", key);
     ws = new Workspace(path.join(temp, "workspace"));
     await runInit(ws, createFileKnowledgeStore(ws.knowledgeDir));
     await writeFile(ws.configFile, JSON.stringify({ roles: { execution: SMOKE_MODEL }, concurrency: 1 }), { mode: 0o600 });
     await writeFile(ws.problemFile, "Generic public smoke: explain why 2 + 3 = 5, briefly. This is a connectivity check only.\n", { mode: 0o600 });
     const service = new ResearchService({ defaultWorkspace: ws.root, runnerFactory: () => runner,
-      promptTimeoutMs: 90_000, stallTimeoutMs: 60_000, progressIntervalMs: 0 });
+      progressIntervalMs: 0 });
     phase = "m01-stage";
-    const result = await service.runStage({ stage: "M01" }, controller.signal) as { record: { status: string; sessions: Array<{ file?: string }> }; output: string };
+    const result = await service.runStage({ stage: "M01" }) as { record: { status: string; sessions: Array<{ file?: string }> }; output: string };
     if (result.record.status !== "completed" || result.record.sessions.length !== 1 || !result.output.trim()) {
       throw new Error("M01 did not return a nonempty result");
     }
@@ -242,13 +237,18 @@ async function run(): Promise<void> {
     const usageRows = usageText.trim().split("\n");
     if (usageRows.length !== 1) throw new Error("expected one Pi usage row");
     const observedUsage = publicUsageFromSidecar(JSON.parse(usageRows[0]));
+    const costAudit = runner.campaignBudget.snapshot();
+    if (costAudit.stopped || costAudit.active || costAudit.unknownReservedCny > 0 ||
+        costAudit.inFlightReservedCny > 0 || costAudit.reservations !== observedUsage.observedAssistantEvents) {
+      throw new Error("campaign billing usage is incomplete");
+    }
     success = { check: "public-m01", ok: true, stage: "M01", model: SMOKE_MODEL,
-      providerCallsMaximum: MAX_PROVIDER_CALLS, planningCnyMaximum: Number(MAX_PLANNING_CNY.toFixed(4)), observedUsage };
+      providerOutputMaximum: providerLimit.maxOutputTokens, observedProviderRequests: costAudit.reservations,
+      planningCnyMaximum: MAX_CNY_ESTIMATE, committedCny: costAudit.committedCny, observedUsage };
   } catch (error) {
     const rawUsage = ws ? await failedRunUsage(ws).catch(() => undefined) : undefined;
     failure = safeFailure(error, phase, rawUsage);
   } finally {
-    clearTimeout(timer);
     if (temp) {
       try { await rm(temp, { recursive: true, force: true }); }
       catch { success = undefined; failure = safeFailure(undefined, "cleanup"); }
@@ -265,7 +265,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
   const mode = process.argv[2];
   if (mode === "--check") {
     assertPreflight();
-    process.stdout.write(JSON.stringify({ check: "offline-preflight", ok: true, planningCnyMaximum: Number(MAX_PLANNING_CNY.toFixed(4)) }) + "\n");
+    process.stdout.write(JSON.stringify({ check: "offline-preflight", ok: true, planningCnyMaximum: MAX_CNY_ESTIMATE,
+      note: "Live provider output maximum and pricing are checked before any model request." }) + "\n");
   } else if (mode === "--run") {
     run().catch(() => {
       // Last-resort fixed message; never print provider errors, prompts, paths or credentials.

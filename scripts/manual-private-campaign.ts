@@ -25,6 +25,8 @@ import { createPiSessionRunner } from "../src/runner/pi.ts";
 import type { SessionCheckpoint, SessionHandle, SessionRunner, SessionSpec } from "../src/runner/types.ts";
 import { DeepSeekCampaignBudget } from "../src/runner/deepseek-campaign.ts";
 import { verifyDeepSeekCnyBilling, type NativeCnyPricingProfile } from "../src/runner/deepseek-cny-pricing.ts";
+import { verifyDeepSeekProviderOutputLimit,
+	type DeepSeekProviderOutputLimit } from "../src/runner/deepseek-provider-limits.ts";
 import { MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, PRIVATE_CONTINUATION_FILE_KEYS } from
 	"../src/runner/signed-mission-ledger.ts";
 import { CARRY_FILE_NAME, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, downloadCarryArtifact,
@@ -51,15 +53,6 @@ const LEGACY_RESTART_POLICY = Object.freeze({ version: 1,
 	reviewedBoundary: "Pi execution sessions received only confined text-file read/write/edit tools; built-in shell and network tools were not granted. The host verifier ran in a non-root bubblewrap user, network, PID and IPC namespace. Host output went only through the fixed encrypted Actions result archive. Provider billing remains unknown and held.",
 	effectClass: "confined-ephemeral-local", actorThirdPartyMutations: "none",
 	hostTransport: "immutable-versioned-archive" });
-// The GitHub campaign step has a 30-minute timeout. Keep time for preflight,
-// checkpoint/ledger sealing and encryption instead of imposing pilot phase caps.
-const ACTIONS_CAMPAIGN_STEP_MS = 30 * 60_000;
-const ACTIONS_TRANSPORT_RESERVE_MS = 5 * 60_000;
-const CAMPAIGN_MS = ACTIONS_CAMPAIGN_STEP_MS - ACTIONS_TRANSPORT_RESERVE_MS;
-const EXECUTION_SETTLEMENT_MS = 45_000;
-const NEW_PHASE_MINIMUM_MS = 90_000;
-const BUILDER_ROUNDS = 8; // M07 controller and bounded private archive both permit eight rounds.
-const MAX_PROVIDER_CALLS = 64;
 const FLAGS = ["-O2", "-std=c++17", "-fopenmp", "-pthread"];
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CHECKS = [
@@ -72,11 +65,16 @@ const REGISTERED_CHECKS = [
 	"The original program checker and isolated independent full-row finite and mutation checks pass for every registered strategy and both original references",
 	"Host-owned isolated-worker roundtrip timings for model-authored cases and available threads use fair preserved references; startup, cold-call and steady-state costs are separate, and no kernel-only gain is inferred from IPC-inclusive observations",
 ];
-const ARCHIVE_EVIDENCE_FILES = ["candidate.cpp", "verification.json", "lesson-delta.json", "experiment-plan.json", "review-decision.json",
-	...Array.from({ length: 8 }, (_, index) => index + 1).flatMap(index => [
-		`round-${index}-candidate.cpp`, `round-${index}-verification.json`,
-		`round-${index}-reviewer-feedback.txt`, `round-${index}-reviewer-report.md`,
-	])];
+const ARCHIVE_BASE_EVIDENCE_FILES = ["candidate.cpp", "verification.json", "lesson-delta.json", "experiment-plan.json", "review-decision.json"];
+const roundEvidenceName = (name: string): boolean => /^round-[1-9][0-9]*-(?:candidate\.cpp|verification\.json|reviewer-feedback\.txt|reviewer-report\.md)$/.test(name);
+const availablePrivateArtifactName = (name: string): boolean =>
+	/^(?:candidate\.cpp|verification\.json|experiment-plan\.json|lesson-delta\.json|execution-capabilities\.json|research-history\.json|restored-candidate-verification\.json|workflow-(?:archive|[A-Za-z0-9-]+-archive)\.json|round-[1-9][0-9]*-(?:candidate\.cpp|verification\.json|reviewer-feedback\.txt|reviewer-report\.md)|(?:branch-parent|branch-child|iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,}|followon|initial)-(?:candidate\.cpp|verification\.json|experiment-plan\.json|round-[1-9][0-9]*-(?:reviewer-feedback\.txt|reviewer-report\.md)))$/.test(name);
+async function availablePrivateArtifactNames(directory: string): Promise<string[]> {
+	return (await readdir(directory)).filter(availablePrivateArtifactName);
+}
+async function archiveEvidenceFiles(directory: string): Promise<string[]> {
+	return [...ARCHIVE_BASE_EVIDENCE_FILES, ...(await readdir(directory)).filter(roundEvidenceName).sort()];
+}
 let statusOutputDir: string | undefined;
 let statusRunId: string | undefined;
 let statusBudget: DeepSeekCampaignBudget | undefined;
@@ -90,13 +88,6 @@ let statusSdkAuthMatch: boolean | undefined;
 let statusArchiveFailure: string | undefined;
 let statusPriorSelectedValidation: "passed" | "failed" | "infrastructure-unavailable" | undefined;
 
-function executionDeadlineAt(campaignStopAt: number, now = Date.now()): string {
-	if (campaignStopAt - now <= EXECUTION_SETTLEMENT_MS) fail("campaign execution settlement boundary reached");
-	return new Date(campaignStopAt - EXECUTION_SETTLEMENT_MS).toISOString();
-}
-function newPhaseAdmitted(campaignStopAt: number, now = Date.now()): boolean {
-	return campaignStopAt - now > NEW_PHASE_MINIMUM_MS;
-}
 function unresolvedGoalControl(goal: CurrentGoal): { operationIds: string[]; taskIds: string[] } {
 	return {
 		operationIds: (goal.executionState?.operations ?? [])
@@ -136,11 +127,11 @@ function campaignObjectiveProgress(contract: OriginalObjectiveContractV1, inheri
 }
 function sha256(value: string): string { return createHash("sha256").update(value).digest("hex"); }
 function createPrivateCampaignBudget(priorCommittedCny: number,
-	nativeCnyPricing: NativeCnyPricingProfile): DeepSeekCampaignBudget {
+	nativeCnyPricing: NativeCnyPricingProfile,
+	providerOutputLimit: DeepSeekProviderOutputLimit): DeepSeekCampaignBudget {
 	return new DeepSeekCampaignBudget({ model: MODEL, endpoint: "https://api.deepseek.com",
 		maxCny: MISSION_TOTAL_CNY, priorCommittedCny,
-		maxProviderCalls: MAX_PROVIDER_CALLS, maxProviderCallsPerPrompt: 32,
-		maxOutputTokens: 64_000, outputAccountingMarginTokens: 32,
+		providerOutputLimit, outputAccountingMarginTokens: 32,
 		estimatedInputCnyPerMillionTokens: 2,
 		estimatedCacheReadCnyPerMillionTokens: 0.04,
 		estimatedOutputCnyPerMillionTokens: 8,
@@ -195,7 +186,7 @@ function readRestartChain(text: string | undefined, kind: string): any[] {
 	try { value = JSON.parse(text) as Record<string, unknown>; }
 	catch { return fail("authenticated independent-restart receipt chain is invalid JSON"); }
 	if (value?.version !== 1 || value.kind !== kind || !Array.isArray(value.entries) ||
-		value.entries.length > 64) fail("authenticated independent-restart receipt chain is invalid");
+		Buffer.byteLength(text, "utf8") > 4 * 1024 * 1024) fail("authenticated independent-restart receipt chain is invalid");
 	const ids = new Set<string>();
 	for (const entry of value.entries) {
 		if (!entry || typeof entry !== "object" || Array.isArray(entry))
@@ -286,7 +277,7 @@ function taskFailureCategory(raw: unknown): string {
 	if (/price assumption/i.test(raw)) return "price-assumption-invalid";
 	if (/provider payload exceeds the campaign boundary|input payload exceeds/i.test(raw)) return "payload-ceiling";
 	if (/provider usage or call outcome is incomplete/i.test(raw)) return "usage-incomplete";
-	if (/stopReason=length|output cap/i.test(raw)) return "output-limit";
+	if (/stopReason=length|terminalStopReason=length|provider length response|output cap/i.test(raw)) return "output-limit";
 	if (/abort|deadline|timeout/i.test(raw)) return "abort-or-deadline";
 	if (/unsafe active tool set|campaign file|custom tool|tool execution/i.test(raw)) return "tool-grant";
 	if (/model.*not found|model.*resolved|model route/i.test(raw)) return "model-resolution";
@@ -296,6 +287,7 @@ function taskFailureCategory(raw: unknown): string {
 function campaignObjectiveStop(reason: string | undefined): ObjectiveStopReason | undefined {
 	if (reason === "total-cny-ceiling") return "budget-boundary";
 	if (reason === "provider-call-limit") return "provider-call-limit";
+	if (reason === "output-limit") return "output-limit";
 	if (reason === "price-assumption-invalid") return "accounting-integrity-error";
 	return undefined;
 }
@@ -307,6 +299,35 @@ function privateExceptionDiagnostic(error: unknown, runtimeKey: string | undefin
 		privateFailureMessage(candidateCode, runtimeKey) === candidateCode ?
 		candidateCode : "unavailable";
 	return { code, category: taskFailureCategory(raw), message: privateFailureMessage(raw, runtimeKey) ?? null };
+}
+function privateToolPath(raw: unknown, runtimeKey: string | undefined): string | undefined {
+	if (typeof raw !== "string" || !raw || raw.length > 240 || raw.includes("\0") ||
+		path.isAbsolute(raw) || raw.split(/[\\/]/).some(part => !part || part === "..")) return undefined;
+	return privateFailureMessage(raw, runtimeKey)?.slice(0, 240);
+}
+function privateToolTelemetry(item: Record<string, unknown>, index: number,
+	runtimeKey: string | undefined): Record<string, unknown> {
+	const name = ["read", "write", "edit", "material_read", "material_list"].includes(String(item.name)) ?
+		String(item.name) : "other";
+	const result = item.resultMetadata && typeof item.resultMetadata === "object" &&
+		!Array.isArray(item.resultMetadata) ? item.resultMetadata as Record<string, unknown> : undefined;
+	const returnedEvidence = name === "read" && item.ok === true && result?.kind === "confined-utf8-read" &&
+		Number.isSafeInteger(result.utf8Bytes) && Number(result.utf8Bytes) >= 0 &&
+		Number(result.utf8Bytes) <= 1_000_000 && result.truncated === false ? {
+		kind: "full-utf8-text", relativePath: privateToolPath(result.relativePath, runtimeKey) ?? null,
+		utf8Bytes: result.utf8Bytes, truncated: false } : undefined;
+	const args = item.args && typeof item.args === "object" && !Array.isArray(item.args) ?
+		item.args as Record<string, unknown> : undefined;
+	const errorClass = ["harness", "filesystem", "tool-error"].includes(String(item.errorClass)) ?
+		item.errorClass : "unknown";
+	const errorCode = typeof item.errorCode === "string" && /^[A-Za-z][A-Za-z0-9._-]{0,63}$/.test(item.errorCode) ?
+		item.errorCode : null;
+	const errorMessage = privateFailureMessage(item.errorMessage, runtimeKey)?.slice(0, 500) ?? null;
+	return { index, name, ok: item.ok === true,
+		...(name === "read" && item.ok === false ? {
+			requestedPath: privateToolPath(args?.path, runtimeKey) ?? null,
+			errorClass, errorCode, errorMessage } : {}),
+		...(returnedEvidence ? { returnedEvidence } : {}) };
 }
 async function taskTelemetry(ws: Workspace, task: any, runtimeKey: string | undefined): Promise<Record<string, unknown>> {
 	const failure = privateFailureMessage(task.executionFailure, runtimeKey);
@@ -338,12 +359,12 @@ async function taskTelemetry(ws: Workspace, task: any, runtimeKey: string | unde
 	return { taskId: typeof task.taskId === "string" ? task.taskId : null,
 		status: ["running", "returned", "failed", "accepted", "rejected", "unknown"].includes(task.status) ? task.status : "unknown",
 		loopStopReason: typeof task.loopStopReason === "string" ? task.loopStopReason : null,
-		failureCategory: taskFailureCategory(task.executionFailure),
+		failureCategory: task.loopStopReason === "output-limit" ? "output-limit" :
+			taskFailureCategory(task.executionFailure),
 		failure: failure ?? null, failureDiagnosticStatus: failure ? "redacted-private" : "unavailable",
 		sessionCreated: Boolean(sessionFile), roundCount: Array.isArray(task.executionRounds) ? task.executionRounds.length : 0,
-		tools: Array.isArray(task.toolLog) ? task.toolLog.map((item: Record<string, unknown>) => ({
-			name: ["read", "write", "edit", "material_read", "material_list"].includes(String(item.name)) ? item.name : "other",
-			ok: item.ok === true })) : [],
+		tools: Array.isArray(task.toolLog) ? task.toolLog.map((item: Record<string, unknown>, index: number) =>
+			privateToolTelemetry(item, index, runtimeKey)) : [],
 		usage };
 }
 
@@ -360,22 +381,38 @@ async function saveStatus(value: Record<string, unknown>): Promise<void> {
 }
 async function preserveCandidate(ws: Workspace, runId: string | undefined, outputDir: string): Promise<void> {
 	if (!runId) return;
-	if (existsSync(path.join(outputDir, "workflow-archive.json")) &&
-		(existsSync(path.join(outputDir, "workflow-branch-child-archive.json")) ||
-			existsSync(path.join(outputDir, "workflow-followon-archive.json")) ||
-			existsSync(path.join(outputDir, "workflow-initial-archive.json")))) return;
 	const goalFile = path.join(ws.runDir("M07", runId), "goal.json");
 	if (!existsSync(goalFile)) return;
 	const goal = JSON.parse(await readFile(goalFile, "utf8")) as CurrentGoal;
-	const tasks = goal.tasks.filter(item => item.mode === "execute").slice(0, 2);
+	const tasks = goal.tasks.filter(item => item.mode === "execute");
 	if (!tasks.length) return;
-	if (!existsSync(path.join(outputDir, "workflow-archive.json")))
-		await archivePrivateM07Task({ goal, task: tasks[0], destination: outputDir });
-	if (tasks[1] && !existsSync(path.join(outputDir, "workflow-branch-child-archive.json"))) {
+	const archivedIdentity = async (name: string): Promise<string | undefined> => {
+		const file = path.join(outputDir, name);
+		if (!existsSync(file)) return undefined;
+		const archive = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+		return archive.goalRunId === runId && typeof archive.taskId === "string" ? archive.taskId : undefined;
+	};
+	let canonicalTaskId = await archivedIdentity("workflow-archive.json");
+	let branchTaskId = await archivedIdentity("workflow-branch-child-archive.json");
+	for (const [index, task] of tasks.entries()) {
+		if (task.taskId === canonicalTaskId || task.taskId === branchTaskId) continue;
+		if (index === 0 && !existsSync(path.join(outputDir, "workflow-archive.json"))) {
+			await archivePrivateM07Task({ goal, task, destination: outputDir });
+			canonicalTaskId = task.taskId;
+			continue;
+		}
+		const prefix = index === 1 && !existsSync(path.join(outputDir, "workflow-branch-child-archive.json")) ?
+			"branch-child" : `fallback-${sha256(runId).slice(0, 12)}-${task.taskId}`;
+		const name = `workflow-${prefix}-archive.json`;
+		if (existsSync(path.join(outputDir, name))) {
+			if (await archivedIdentity(name) !== task.taskId) fail("fallback archive prefix is occupied by another task");
+			continue;
+		}
 		const temporary = await mkdtemp(path.join(os.tmpdir(), "mulpis-private-fallback-"));
 		try {
-			await archivePrivateM07Task({ goal, task: tasks[1], destination: temporary });
-			await exportPrefixedArchive(temporary, outputDir, "branch-child");
+			await archivePrivateM07Task({ goal, task, destination: temporary });
+			await exportPrefixedArchive(temporary, outputDir, prefix);
+			if (prefix === "branch-child") branchTaskId = task.taskId;
 		} finally { await rm(temporary, { recursive: true, force: true }); }
 	}
 }
@@ -395,10 +432,7 @@ async function preserveUnsettledGoalCheckpoint(input: {
 	let archiveFailure: string | undefined;
 	try { await preserveCandidate(input.ws, input.runId, input.outputDir); }
 	catch { archiveFailure = "unsettled-goal-archive-incomplete"; }
-	const availableArtifacts = ["candidate.cpp", "verification.json", "workflow-archive.json",
-		"experiment-plan.json", "round-1-reviewer-feedback.txt", "lesson-delta.json",
-		"branch-child-candidate.cpp", "branch-child-verification.json", "workflow-branch-child-archive.json"]
-		.filter(name => existsSync(path.join(input.outputDir, name)));
+	const availableArtifacts = await availablePrivateArtifactNames(input.outputDir);
 	let prior: ObjectiveProgressV1 | undefined;
 	try { prior = JSON.parse(await readFile(path.join(input.outputDir, "objective-checkpoint.json"), "utf8")); } catch { /* First attempt has no checkpoint. */ }
 	if (prior?.contract.id !== input.contract.id) prior = undefined;
@@ -417,7 +451,7 @@ async function preserveUnsettledGoalCheckpoint(input: {
 }
 
 async function salvageObjectiveCheckpoint(ws: Workspace, outputDir: string,
-	budgetStopReason: string | undefined, timedOut: boolean): Promise<void> {
+	budgetStopReason: string | undefined, cancelled: boolean): Promise<void> {
 	const contractFile = path.join(outputDir, "original-objective.json");
 	if (!existsSync(contractFile)) return;
 	const contract = JSON.parse(await readFile(contractFile, "utf8")) as OriginalObjectiveContractV1;
@@ -444,13 +478,13 @@ async function salvageObjectiveCheckpoint(ws: Workspace, outputDir: string,
 	const historicalRuns = previous?.contract.id === contract.id ? previous.boundedRuns.filter(saved =>
 		!boundedRuns.some(live => live.runId === saved.runId)) : [];
 	const allBoundedRuns = [...historicalRuns, ...boundedRuns];
-	const availableArtifacts = (await readdir(outputDir)).filter(name =>
-		/^(?:candidate\.cpp|verification\.json|experiment-plan\.json|lesson-delta\.json|execution-capabilities\.json|research-history\.json|restored-candidate-verification\.json|workflow-(?:archive|[A-Za-z0-9-]+-archive)\.json|round-[1-8]-(?:candidate\.cpp|verification\.json|reviewer-feedback\.txt)|(?:branch-parent|branch-child|iteration-\d+|followon|initial)-(?:candidate\.cpp|verification\.json|experiment-plan\.json|round-[1-8]-reviewer-feedback\.txt))$/.test(name));
+	const availableArtifacts = await availablePrivateArtifactNames(outputDir);
 	const priorCoversLive = previous?.contract.id === contract.id &&
 		previous.stopReason !== "assessment-validation-pending" && unresolvedOperationIds.length === 0 &&
-		(!timedOut || previous.stopReason === "time-boundary") &&
+		(!cancelled || previous.stopReason === "cancelled") &&
 		(budgetStopReason !== "total-cny-ceiling" || previous.stopReason === "budget-boundary") &&
 		(budgetStopReason !== "provider-call-limit" || previous.stopReason === "provider-call-limit") &&
+		(budgetStopReason !== "output-limit" || previous.stopReason === "output-limit") &&
 		(budgetStopReason !== "price-assumption-invalid" || previous.stopReason === "accounting-integrity-error") &&
 		boundedRuns.every(item => item.outcome !== "active" && item.outcome !== "record-unavailable") &&
 		boundedRuns.every(item =>
@@ -468,7 +502,7 @@ async function salvageObjectiveCheckpoint(ws: Workspace, outputDir: string,
 		availableArtifacts, unresolvedOperationIds,
 		...(previous?.contract.id === contract.id && previous.assessment ? { assessment: previous.assessment } : {}),
 		...(previous?.contract.id === contract.id ? { assessmentHistory: previous.assessmentHistory } : {}),
-		stopReason: campaignObjectiveStop(budgetStopReason) ?? (timedOut ? "time-boundary" : "bounded-run-incomplete") });
+		stopReason: campaignObjectiveStop(budgetStopReason) ?? (cancelled ? "cancelled" : "bounded-run-incomplete") });
 	await writeObjectiveProgress(checkpointFile, progress);
 }
 async function forkReceiptMatches(file: string | undefined, checkpoint: SessionCheckpoint, childSessionId: string | undefined): Promise<boolean> {
@@ -520,8 +554,9 @@ async function contextLineageSummary(file: string | undefined, checkpoint: Sessi
 async function exportPrefixedArchive(sourceDir: string, outputDir: string,
 	prefix: string): Promise<void> {
 	if (!(["initial", "followon", "branch-parent", "branch-child"].includes(prefix) ||
-		/^iteration-(?:[1-9]|[1-5][0-9]|6[0-4])$/.test(prefix))) fail("unsupported private archive transport prefix");
-	for (const name of ARCHIVE_EVIDENCE_FILES) if (existsSync(path.join(sourceDir, name)))
+		/^iteration-[1-9][0-9]*$/.test(prefix) ||
+		/^fallback-[0-9a-f]{12}-T[0-9]{3,}$/.test(prefix))) fail("unsupported private archive transport prefix");
+	for (const name of await archiveEvidenceFiles(sourceDir)) if (existsSync(path.join(sourceDir, name)))
 		await copyFile(path.join(sourceDir, name), path.join(outputDir, `${prefix}-${name}`));
 	const archive = JSON.parse(await readFile(path.join(sourceDir, "workflow-archive.json"), "utf8")) as Record<string, any>;
 	for (const item of archive.files ?? []) item.name = `${prefix}-${item.name}`;
@@ -566,25 +601,25 @@ function sandboxArguments(command: string, args: string[], mountedWork?: string,
 		...(mountedWork ? [readOnlyWork ? "--ro-bind" : "--bind", mountedWork, "/work", "--chdir", "/work"] : []),
 		"--", command, ...args];
 }
-function isolated(command: string, args: string[], timeout: number, mountedWork?: string, readOnlyWork = false) {
+function isolated(command: string, args: string[], mountedWork?: string, readOnlyWork = false) {
 	return spawnSync("sudo", sandboxArguments(command, args, mountedWork, readOnlyWork),
-		{ encoding: "utf8", timeout, maxBuffer: 100_000, env: cleanEnv() });
+		{ encoding: "utf8", maxBuffer: 100_000, env: cleanEnv() });
 }
 async function requireIsolation(): Promise<void> {
-	const id = isolated("/usr/bin/id", ["-u"], 15_000);
+	const id = isolated("/usr/bin/id", ["-u"]);
 	if (id.status !== 0 || id.stdout.trim() !== "65534")
 		throw new SandboxPreflightError(`uid probe: ${(id.stderr ?? "").slice(-2000)}`);
-	const environment = isolated("/usr/bin/env", [], 15_000);
+	const environment = isolated("/usr/bin/env", []);
 	if (environment.status !== 0 || /(?:KEY|TOKEN|SECRET|PASSWORD|AUTH)=/i.test(environment.stdout))
 		throw new SandboxPreflightError(`environment probe: ${(environment.stderr ?? "").slice(-2000)}`);
 	const scratch = await mkdtemp(path.join(os.tmpdir(), "mulpis-sandbox-preflight-"));
 	try {
 		await chmod(scratch, 0o777);
 		await stageProbe(scratch);
-		const compileProbe = isolated("/usr/bin/g++", [...FLAGS, "/work/probe.cpp", "-o", "/work/probe-bin"], 30_000, scratch);
+		const compileProbe = isolated("/usr/bin/g++", [...FLAGS, "/work/probe.cpp", "-o", "/work/probe-bin"], scratch);
 		if (compileProbe.status !== 0)
 			throw new SandboxPreflightError(`compiler probe: ${(compileProbe.stderr ?? "").slice(-2000)}`);
-		const runProbe = isolated("/work/probe-bin", [], 15_000, scratch, true);
+		const runProbe = isolated("/work/probe-bin", [], scratch, true);
 		if (runProbe.status !== 0)
 			throw new SandboxPreflightError(`executable probe: ${(runProbe.stderr ?? "").slice(-2000)}`);
 	} finally { await rm(scratch, { recursive: true, force: true }); }
@@ -945,7 +980,7 @@ function parseRegisteredCheckerOutput(stdout: string, metadata: ReturnType<typeo
 	return { status: lines.at(-1) === "CSR_CHECK_PASS" && timings.length === expectedCount ? "passed" : "failed", timings };
 }
 async function checkCandidate(original: string, candidate: string, scratch: string,
-	registered?: { taskText: string; planFile: string; deadlineAt?: number }) {
+	registered?: { taskText: string; planFile: string }) {
 	const originalText = await readFile(original, "utf8");
 	const candidateText = await readFile(candidate, "utf8");
 	let experimentPlan: CsrExperimentPlan | undefined;
@@ -972,7 +1007,7 @@ async function checkCandidate(original: string, candidate: string, scratch: stri
 	await copyFile(candidate, path.join(scratch, "candidate.cpp"));
 	await chmod(path.join(scratch, "candidate.cpp"), 0o644);
 	const compiled = path.join(scratch, "candidate-bin");
-	const build = isolated("/usr/bin/g++", [...FLAGS, "/work/candidate.cpp", "-o", "/work/candidate-bin"], 90_000, scratch);
+	const build = isolated("/usr/bin/g++", [...FLAGS, "/work/candidate.cpp", "-o", "/work/candidate-bin"], scratch);
 	const infrastructureFailure = Boolean(build.error) || build.status === null ||
 		/(?:^|\n)(?:bwrap|sudo):|failed to (?:create|unshare|mount)/i.test(build.stderr ?? "");
 	const verification: Record<string, unknown> = {
@@ -993,7 +1028,7 @@ async function checkCandidate(original: string, candidate: string, scratch: stri
 	const runs = [];
 	for (const args of cases) {
 		const started = process.hrtime.bigint();
-		const run = isolated("/work/candidate-bin", args, 60_000, scratch, true);
+		const run = isolated("/work/candidate-bin", args, scratch, true);
 		const isolatedProcessWallMs = Number(process.hrtime.bigint() - started) / 1e6;
 		const reportedKernelMs = (run.stdout ?? "").split(/\r?\n/).flatMap(line => {
 			const match = /^\s*(.*?)\s+([0-9]+(?:\.[0-9]+)?)\s+ms\s*$/.exec(line);
@@ -1010,11 +1045,11 @@ async function checkCandidate(original: string, candidate: string, scratch: stri
 		await writeFile(path.join(scratch, "checker.cpp"), checker.source, { mode: 0o644 });
 		await chmod(path.join(scratch, "checker.cpp"), 0o644);
 		const compiledChecker = isolated("/usr/bin/g++", [...FLAGS,
-			"/work/checker.cpp", "-o", "/work/independent-checker"], 90_000, scratch);
+			"/work/checker.cpp", "-o", "/work/independent-checker"], scratch);
 		if (compiledChecker.status !== 0) verification.independent = { status: "compile_failed",
 			stderrTail: (compiledChecker.stderr ?? "").slice(-4000) };
 		else {
-			const checked = isolated("/work/independent-checker", [], 60_000, scratch, true);
+			const checked = isolated("/work/independent-checker", [], scratch, true);
 			const parsed = parseCheckerOutput(checked.stdout ?? "", checker.metadata);
 			verification.independent = { status: checked.status === 0 ? parsed.status : "failed", timings: parsed.timings,
 				threadCounts: checker.metadata.threadCounts, shapes: checker.metadata.shapes,
@@ -1038,13 +1073,13 @@ async function checkCandidate(original: string, candidate: string, scratch: stri
 			await chmod(path.join(scratch, "baseline-worker.cpp"), 0o644);
 			await chmod(checkerFile, 0o644);
 			const buildRegistered = isolated("/usr/bin/g++", [...FLAGS,
-				"/work/registered-checker.cpp", "-o", "/work/registered-checker"], 90_000, scratch);
-			const buildWorker = isolated("/usr/bin/g++", [...FLAGS, "/work/candidate-worker.cpp", "-o", "/work/candidate-worker"], 90_000, scratch);
-			const buildBaseline = isolated("/usr/bin/g++", [...FLAGS, "/work/baseline-worker.cpp", "-o", "/work/baseline-worker"], 90_000, scratch);
+				"/work/registered-checker.cpp", "-o", "/work/registered-checker"], scratch);
+			const buildWorker = isolated("/usr/bin/g++", [...FLAGS, "/work/candidate-worker.cpp", "-o", "/work/candidate-worker"], scratch);
+			const buildBaseline = isolated("/usr/bin/g++", [...FLAGS, "/work/baseline-worker.cpp", "-o", "/work/baseline-worker"], scratch);
 			if (buildRegistered.status !== 0 || buildWorker.status !== 0 || buildBaseline.status !== 0) verification.registeredExperiment = { status: "compile_failed",
 				stderrTail: ((buildRegistered.stderr ?? "") + (buildWorker.stderr ?? "") + (buildBaseline.stderr ?? "")).slice(-4000) };
 			else {
-				const correctness = isolated("/work/registered-checker", ["--check"], 60_000, scratch, true);
+				const correctness = isolated("/work/registered-checker", ["--check"], scratch, true);
 				const output: string[] = [];
 				const executionFailures: Array<Record<string, unknown>> = [];
 				let passed = correctness.status === 0 && correctness.stdout.trim() === "CSR_CHECK_PASS";
@@ -1052,10 +1087,8 @@ async function checkCandidate(original: string, candidate: string, scratch: stri
 				for (const config of generated.metadata.timing.cases) {
 					for (const threads of config.threadCounts) for (const selector of selectors) {
 						if (!passed) break;
-						const remaining = (registered.deadlineAt ?? Number.POSITIVE_INFINITY) - Date.now();
-						if (remaining <= 0) { executionFailures.push({ phase: "timing", caseId: config.id, selector, threads, reason: "time-boundary" }); passed = false; break; }
 						const measured = isolated("/work/registered-checker", ["--timing", config.id, selector, String(threads)],
-							Math.min(60_000, remaining), scratch, true);
+							scratch, true);
 						const rows = measured.stdout.trim().split(/\r?\n/);
 						if (measured.status !== 0 || rows.length !== 2 || rows[1] !== "CSR_CHECK_PASS") {
 							executionFailures.push({ phase: "timing", caseId: config.id, selector, threads, exitCode: measured.status, signal: measured.signal,
@@ -1201,7 +1234,7 @@ async function collectContinuationBundle(directory: string, prior?: PrivateConti
 	const contractId = checkpoint?.contract?.id;
 	if (typeof contractId === "string" && contractId) {
 		const archives = ["workflow-archive.json", ...(await readdir(directory))
-			.filter(name => /^workflow-iteration-[1-9][0-9]*-archive\.json$/.test(name))];
+			.filter(name => /^workflow-(?:(?:initial|followon|branch-parent|branch-child)|iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,})-archive\.json$/.test(name))];
 		for (const archiveName of archives) {
 			const archiveFile = path.join(directory, archiveName);
 			if (!existsSync(archiveFile)) continue;
@@ -1215,7 +1248,9 @@ async function collectContinuationBundle(directory: string, prior?: PrivateConti
 			const prefix = archiveName === "workflow-archive.json" ? "" : archiveName.slice("workflow-".length, -"-archive.json".length) + "-";
 			const files: Record<string, string> = { "workflow-archive.json": archiveText };
 			for (const name of ["candidate.cpp", "verification.json", "experiment-plan.json", "lesson-delta.json",
-				...Array.from({ length: 8 }, (_, i) => `round-${i + 1}-reviewer-feedback.txt`)]) {
+				...(await readdir(directory)).filter(name => name.startsWith(prefix) &&
+					/^round-[1-9][0-9]*-reviewer-feedback\.txt$/.test(name.slice(prefix.length)))
+					.map(name => name.slice(prefix.length))]) {
 				const file = path.join(directory, `${prefix}${name}`);
 				if (!existsSync(file)) continue;
 				const info = await lstat(file);
@@ -1253,7 +1288,6 @@ async function inputs(inputDir: string) {
 }
 
 async function main() {
-	const campaignStartedAt = Date.now();
 	const inputDir = arg("--input-dir"), outputDir = arg("--output-dir");
 	statusOutputDir = outputDir;
 	await mkdir(outputDir, { recursive: true, mode: 0o700 });
@@ -1284,6 +1318,9 @@ async function main() {
 		fail("DeepSeek credential probe did not complete successfully");
 	}
 	statusPhase = "credential-verified";
+	statusPhase = "provider-output-limit-verification";
+	const providerOutputLimit = await verifyDeepSeekProviderOutputLimit({ apiKey: runtimeKey });
+	statusPhase = "provider-output-limit-verified";
 	statusPhase = "billing-currency-verification";
 	const nativeCnyPricing = await verifyDeepSeekCnyBilling({ apiKey: runtimeKey });
 	statusPhase = "billing-currency-verified";
@@ -1292,11 +1329,11 @@ async function main() {
 	statusPhase = "isolated-preflight-passed";
 	const campaignRoot = await mkdtemp(path.join(os.tmpdir(), "mulpis-private-campaign-"));
 	let runId: string | undefined;
-	const budget = createPrivateCampaignBudget(missionLedger.priorCommittedCny, nativeCnyPricing);
+	const budget = createPrivateCampaignBudget(missionLedger.priorCommittedCny,
+		nativeCnyPricing, providerOutputLimit);
 	statusBudget = budget;
 	finalBudget = budget;
-	let campaignDeadlineAt: number | undefined;
-	let campaignTimedOut = false;
+	let campaignCancelled = false;
 	try {
 		const ws = new Workspace(path.join(campaignRoot, "workspace"));
 		statusPhase = "workspace-init";
@@ -1367,8 +1404,7 @@ async function main() {
 		try {
 			priorSelectedCheck = await checkCandidate(originalPath, path.join(priorSeedDir, "prior-candidate.cpp"), priorScratch,
 				previousBundle["experiment-plan.json"] ? { taskText: registeredTaskText,
-					planFile: path.join(priorSeedDir, "prior-experiment-plan.json"),
-					deadlineAt: campaignStartedAt + CAMPAIGN_MS - EXECUTION_SETTLEMENT_MS } : undefined);
+					planFile: path.join(priorSeedDir, "prior-experiment-plan.json") } : undefined);
 		} finally { await rm(priorScratch, { recursive: true, force: true }); }
 		await writeFile(path.join(outputDir, "restored-candidate-verification.json"),
 			`${JSON.stringify({ ...priorSelectedCheck,
@@ -1435,7 +1471,8 @@ async function main() {
 		const models = { providers: { deepseek: { models: [{ id: "deepseek-flash", name: "DeepSeek Flash",
 			api: "openai-completions", baseUrl: "https://api.deepseek.com", reasoning: true, input: ["text"],
 			cost: { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 },
-			contextWindow: 1_000_000, maxTokens: 384_000,
+			contextWindow: providerOutputLimit.contextWindow,
+			maxTokens: providerOutputLimit.maxOutputTokens,
 			compat: { supportsStore: false, supportsDeveloperRole: false, maxTokensField: "max_tokens",
 				requiresReasoningContentOnAssistantMessages: true, thinkingFormat: "deepseek" },
 			thinkingLevelMap: { low: "low", high: "high", max: "max" },
@@ -1452,9 +1489,9 @@ async function main() {
 		statusSdkAuthMatch = (await runtime.getAuth(resolved))?.auth.apiKey === runtimeKey;
 		if (!statusSdkAuthMatch) fail("SDK model credential resolution did not verify");
 		const abort = new AbortController();
-		const campaignStopAt = campaignStartedAt + CAMPAIGN_MS;
-		campaignDeadlineAt = campaignStopAt;
-		const timer = setTimeout(() => { campaignTimedOut = true; abort.abort(); }, Math.max(1, campaignStopAt - Date.now()));
+		const cancel = () => { campaignCancelled = true; abort.abort(); };
+		process.once("SIGINT", cancel);
+		process.once("SIGTERM", cancel);
 		try {
 			const actual = createPiSessionRunner({ modelRuntime: runtime, signal: abort.signal, campaignBudget: budget });
 			let followOnPriorCandidate = path.join(priorSeedDir, "prior-candidate.cpp");
@@ -1462,7 +1499,6 @@ async function main() {
 			let registeredScopeActive = false;
 			const remeasurePrior = async (priorSource: string, priorPlanFile: string | undefined,
 				registered: boolean, currentPlanFile: string): Promise<Record<string, unknown>> => {
-				if (Date.now() + 30_000 >= campaignStopAt) return { status: "not_run", reason: "time-boundary" };
 				const scratch = await verifierScratch("candidate");
 				try {
 					if (!registered) return await checkCandidate(originalPath, priorSource, scratch);
@@ -1472,7 +1508,7 @@ async function main() {
 					const matchedPlanFile = path.join(scratch, "prior-matched-plan.json");
 					await writeFile(matchedPlanFile, JSON.stringify({ registeredStrategies: oldStrategies, cases: plan.cases }), { mode: 0o600 });
 					return await checkCandidate(originalPath, priorSource, scratch,
-						{ taskText: registeredTaskText, planFile: matchedPlanFile, deadlineAt: campaignStopAt });
+						{ taskText: registeredTaskText, planFile: matchedPlanFile });
 				} catch { return { status: "failed", reason: "prior source could not be revalidated under the current model-authored plan" }; }
 				finally { await rm(scratch, { recursive: true, force: true }); }
 			};
@@ -1499,7 +1535,7 @@ async function main() {
 								if (existsSync(candidate)) {
 									const candidateScratch = await verifierScratch("candidate");
 									try { result = await checkCandidate(originalPath, candidate, candidateScratch,
-										registered ? { taskText: registeredTaskText, planFile, deadlineAt: campaignStopAt } : undefined); }
+										registered ? { taskText: registeredTaskText, planFile } : undefined); }
 									finally { await rm(candidateScratch, { recursive: true, force: true }); }
 								}
 								result.originalBaselineRuns = originalSmoke.originalCheckerRuns;
@@ -1649,9 +1685,9 @@ async function main() {
 				evidenceRoot: path.join(campaignRoot, "prior-objective-evidence"), evidence: priorEvidence,
 				evidenceRequirements: privateEvidenceRequirements,
 				assessmentAdmission: budget.snapshot().stopped ? "budget-boundary" :
-					abort.signal.aborted || !newPhaseAdmitted(campaignStopAt) ? "time-boundary" : "admitted",
+					abort.signal.aborted ? "cancelled" : "admitted",
 				advanceAdmission: () => budget.snapshot().stopped ? campaignObjectiveStop(budget.snapshot().stopReason) ??
-					"assessment-failed" : abort.signal.aborted || !newPhaseAdmitted(campaignStopAt) ? "time-boundary" : "admitted",
+					"assessment-failed" : abort.signal.aborted ? "cancelled" : "admitted",
 				supportedTaskScopes: ["two-target-existing", "registered-csr-experiment"],
 				capabilities: objectiveCapabilities, userOverrides,
 				recordAssessment: async assessment => {
@@ -1690,8 +1726,7 @@ async function main() {
 						inputs: [...found.files.map(x => `problem/raw/${x}`), ...priorSeedInputs],
 						expectedOutputs: registered ? ["candidate.cpp", "experiment-plan.json", "lesson-delta.json"] :
 							["candidate.cpp", "lesson-delta.json"], lessonDeltaOutput: "lesson-delta.json", checks,
-						executionLoop: { maxRounds: BUILDER_ROUNDS,
-							deadlineAt: executionDeadlineAt(campaignStopAt) } };
+						executionLoop: { mode: "until-ready" } };
 					statusPhase = "model-dispatch";
 					const task = await controller.delegate(goal.runId, initialSpec);
 					registeredScopeActive = false;
@@ -1742,7 +1777,7 @@ async function main() {
 			let winner = accepted ? task : undefined;
 			const parentControl = unresolvedGoalControl(await controller.status(runId));
 			if (task.branchSource && !parentControl.operationIds.length && !parentControl.taskIds.length &&
-				!budget.snapshot().stopped && !abort.signal.aborted && newPhaseAdmitted(campaignStopAt)) {
+				!budget.snapshot().stopped && !abort.signal.aborted) {
 				followOnPriorCandidate = parentCandidate;
 				followOnPriorPlanFile = initialRegistered ? path.join(task.workDir, "experiment-plan.json") : undefined;
 				statusPhase = "fork-dispatch";
@@ -1750,7 +1785,7 @@ async function main() {
 				const forked = await controller.delegate(runId, { ...initialSpec,
 					context: { mode: "fork", parentRunId: runId, parentTaskId: task.taskId,
 						checkpointId: task.branchSource.checkpoint.id },
-					executionLoop: { maxRounds: BUILDER_ROUNDS, deadlineAt: executionDeadlineAt(campaignStopAt) } });
+					executionLoop: { mode: "until-ready" } });
 				registeredScopeActive = false;
 				branchTask = forked;
 				statusPhase = "fork-task-returned";
@@ -1883,14 +1918,11 @@ async function main() {
 			let m04: { status: "completed" | "failed" | "not_run"; runId?: string; proposalSubmitted?: boolean;
 				snapshotCreated?: boolean; evidenceReturned?: boolean; adoptedExperienceRefs?: KnowledgeRef[];
 				failure?: ReturnType<typeof privateExceptionDiagnostic> } = { status: "not_run" };
-			if (firstGoalReady && branchExerciseComplete && !budget.snapshot().stopped && !abort.signal.aborted &&
-				newPhaseAdmitted(campaignStopAt)) {
+			if (firstGoalReady && branchExerciseComplete && !budget.snapshot().stopped && !abort.signal.aborted) {
 				statusPhase = "m04-dispatch";
-				const m04Abort = new AbortController();
-				const m04Timer = setTimeout(() => m04Abort.abort(), Math.max(1, campaignStopAt - Date.now()));
 				try {
 					const m04Runner = createPiSessionRunner({ modelRuntime: runtime,
-						signal: AbortSignal.any([abort.signal, m04Abort.signal]), campaignBudget: budget });
+						signal: abort.signal, campaignBudget: budget });
 					const processed = await runM04({ ws, store, runner: m04Runner, config: await ws.loadConfig() },
 						{ feedback: { kind: "M07", runId }, freshSession: true,
 							requiredM07ReadPaths: selectedM04ReadPaths,
@@ -1906,7 +1938,6 @@ async function main() {
 							coverage.complete && selectedM04ReadPaths.every(item => coverage.paths.includes(item))) : [] };
 				} catch (error) { m04 = { status: "failed", adoptedExperienceRefs: [],
 					failure: privateExceptionDiagnostic(error, runtimeKey) }; }
-				finally { clearTimeout(m04Timer); }
 			}
 			const archivedM04 = await recordPrivateM04Outcome(outputDir, { state: m04.status === "not_run" ? "not-run" : m04.status,
 				...(m04.runId ? { runId: m04.runId } : {}), proposalSubmitted: m04.proposalSubmitted ?? false,
@@ -1920,7 +1951,7 @@ async function main() {
 			const reusableRefs = m04.evidenceReturned && knowledgeExport.state === "complete" ?
 				(m04.adoptedExperienceRefs ?? []).filter(ref => (archivedM04.m04?.adoptedExperienceRefs ?? []).some(exported =>
 					exported.storeId === ref.storeId && exported.recordId === ref.recordId && exported.version === ref.version)) : [];
-			let followOn: Record<string, unknown> = { state: "not_run", reason: "M04, seed, budget or time boundary unavailable" };
+			let followOn: Record<string, unknown> = { state: "not_run", reason: "M04, seed, budget or cancellation boundary unavailable" };
 			const followOnAttempts: Array<Record<string, unknown>> = [];
 			let followOnSourceChanged: boolean | null = null;
 			let objectiveAssessment: ObjectiveProgressV1["assessment"];
@@ -1940,11 +1971,11 @@ async function main() {
 			let currentSelectedTaskId = selectedTask.taskId;
 			let selectedRegisteredPlan = initialRegistered;
 			let latestAttemptEvidence: Array<{ name: string; file: string }> = [];
-			const loop = await runOriginalObjectiveLoop({ maxIterations: MAX_PROVIDER_CALLS,
+			const loop = await runOriginalObjectiveLoop({
 				admission: () => {
 					if (budget.snapshot().stopped) return campaignObjectiveStop(budget.snapshot().stopReason) ??
 						"bounded-run-incomplete";
-					if (abort.signal.aborted || !newPhaseAdmitted(campaignStopAt)) return "time-boundary";
+					if (abort.signal.aborted) return "cancelled";
 					if (currentM04Status === "failed") return "m04-evidence-incomplete";
 					if (!firstGoalReady || currentM04Status !== "completed" || currentKnowledgeExport.state === "incomplete" ||
 						!currentM04Read || !existsSync(candidate) || !existsSync(verificationPath)) return "bounded-run-incomplete";
@@ -1991,7 +2022,7 @@ async function main() {
 						assessmentAdmission,
 						advanceAdmission: () => budget.snapshot().stopped ?
 							campaignObjectiveStop(budget.snapshot().stopReason) ?? "assessment-failed" :
-							abort.signal.aborted || !newPhaseAdmitted(campaignStopAt) ? "time-boundary" : "admitted",
+							abort.signal.aborted ? "cancelled" : "admitted",
 						supportedTaskScopes: ["two-target-existing", "registered-csr-experiment"],
 						userOverrides, capabilities: objectiveCapabilities,
 						recordAssessment: async assessment => {
@@ -2053,7 +2084,7 @@ async function main() {
 								expectedOutputs: registered ? ["candidate.cpp", "experiment-plan.json", "lesson-delta.json"] :
 									["candidate.cpp", "lesson-delta.json"], lessonDeltaOutput: "lesson-delta.json", checks: taskChecks,
 								...(pinnedRefs.length ? { experienceRefs: pinnedRefs, experienceTags: tags } : {}),
-								executionLoop: { maxRounds: BUILDER_ROUNDS, deadlineAt: executionDeadlineAt(campaignStopAt) },
+								executionLoop: { mode: "until-ready" },
 							});
 							registeredScopeActive = false;
 							activeFollowOnTaskId = secondTask.taskId;
@@ -2073,7 +2104,7 @@ async function main() {
 					latestAssessmentAdvanced = Boolean(objectiveStep.advanced);
 					objectiveStopReason = objectiveStep.stopReason === "assessment-failed" && campaignObjectiveStop(budget.snapshot().stopReason) ?
 						campaignObjectiveStop(budget.snapshot().stopReason)! : objectiveStep.stopReason === "assessment-failed" &&
-						(abort.signal.aborted || Date.now() >= campaignStopAt) ? "time-boundary" : objectiveStep.stopReason;
+						(abort.signal.aborted) ? "cancelled" : objectiveStep.stopReason;
 					if (assessmentHistory.at(-1)?.iteration === iteration) {
 						assessmentHistory[assessmentHistory.length - 1].stopReason = objectiveStopReason;
 						assessmentHistory[assessmentHistory.length - 1].advanced = Boolean(objectiveStep.advanced);
@@ -2113,16 +2144,13 @@ async function main() {
 						const nextArchiveDir = path.join(campaignRoot, `iteration-${iteration}-archive`);
 						await archivePrivateM07Task({ goal: nextFrozenGoal, task: nextFrozenTask, destination: nextArchiveDir });
 						let nextM04: typeof m04 = { status: "not_run" };
-						if (secondReady && nextFrozenTask.review && !budget.snapshot().stopped && !abort.signal.aborted &&
-							newPhaseAdmitted(campaignStopAt)) {
+						if (secondReady && nextFrozenTask.review && !budget.snapshot().stopped && !abort.signal.aborted) {
 							statusPhase = "model-proposed-m04-dispatch";
 							const requiredPaths = selectedM07ReviewReadPaths(ws.runDir("M07", secondGoal.runId), nextFrozenTask,
 								registered ? ["experiment-plan.json"] : []);
-							const m04Abort = new AbortController();
-							const m04Timer = setTimeout(() => m04Abort.abort(), Math.max(1, campaignStopAt - Date.now()));
 							try {
 								const m04Runner = createPiSessionRunner({ modelRuntime: runtime,
-									signal: AbortSignal.any([abort.signal, m04Abort.signal]), campaignBudget: budget });
+									signal: abort.signal, campaignBudget: budget });
 								const processed = await runM04({ ws, store, runner: m04Runner, config: await ws.loadConfig() },
 									{ feedback: { kind: "M07", runId: secondGoal.runId }, freshSession: true,
 										requiredM07ReadPaths: requiredPaths,
@@ -2137,8 +2165,7 @@ async function main() {
 									adoptedExperienceRefs: complete ? await adoptedExperienceRefs(store, processed.record.runId, true) : [] };
 							} catch (error) { nextM04 = { status: "failed", adoptedExperienceRefs: [],
 								failure: privateExceptionDiagnostic(error, runtimeKey) }; }
-							finally { clearTimeout(m04Timer); }
-						}
+									}
 						const nextArchive = await recordPrivateM04Outcome(nextArchiveDir,
 							{ state: nextM04.status === "not_run" ? "not-run" : nextM04.status,
 								...(nextM04.runId ? { runId: nextM04.runId } : {}),
@@ -2164,7 +2191,7 @@ async function main() {
 						if (chooseFollowOn && nextArchive.files.some(item => item.name === "candidate.cpp" && item.status === "present") &&
 							nextArchive.files.some(item => item.name === "verification.json" && item.status === "present")) {
 							if (selectedCandidateSource !== "followon") await exportPrefixedArchive(outputDir, outputDir, "initial");
-							for (const name of [...ARCHIVE_EVIDENCE_FILES, "workflow-archive.json", "m04-adopted-knowledge.json"]) {
+							for (const name of [...await archiveEvidenceFiles(outputDir), "workflow-archive.json", "m04-adopted-knowledge.json"]) {
 								await rm(path.join(outputDir, name), { force: true });
 								if (existsSync(path.join(nextArchiveDir, name))) await copyFile(path.join(nextArchiveDir, name), path.join(outputDir, name));
 							}
@@ -2206,7 +2233,7 @@ async function main() {
 							assessmentHistory[assessmentHistory.length - 1].stopReason = objectiveStopReason;
 					}
 					} catch (error) { objectiveStopReason = campaignObjectiveStop(budget.snapshot().stopReason) ??
-						(abort.signal.aborted || Date.now() >= campaignStopAt ? "time-boundary" :
+						(abort.signal.aborted ? "cancelled" :
 							assessmentThisIteration ? "dispatch-failed" : "assessment-failed");
 					if (assessmentHistory.at(-1)?.iteration === iteration)
 						assessmentHistory[assessmentHistory.length - 1].stopReason = objectiveStopReason;
@@ -2261,7 +2288,7 @@ async function main() {
 					history.entries.push({ originalContractId: originalObjective.id, goalRunId: finalArchive.goalRunId, taskId: finalArchive.taskId,
 						interpretation: "Unselected current experiment; no confirmed replacement gain against the historical candidate", files: unselectedFiles });
 					await writeFile(path.join(outputDir, "research-history.json"), JSON.stringify(history), { mode: 0o600 });
-					for (const name of [...ARCHIVE_EVIDENCE_FILES, "workflow-archive.json", "m04-adopted-knowledge.json"]) {
+					for (const name of [...await archiveEvidenceFiles(outputDir), "workflow-archive.json", "m04-adopted-knowledge.json"]) {
 						await rm(path.join(outputDir, name), { force: true });
 						if (previousBundle[name as keyof PrivateContinuationBundle] !== undefined)
 							await writeFile(path.join(outputDir, name), previousBundle[name as keyof PrivateContinuationBundle]!, { mode: 0o600 });
@@ -2324,7 +2351,7 @@ async function main() {
 			console.log(JSON.stringify({ status: "private-campaign-bounded-run-ended", outcome: campaignOutcome,
 				boundedRunOutcome, stopReason: objectiveCheckpoint.stopReason, budget: budget.snapshot() }));
 			if (campaignOutcome !== "fulfilled") process.exitCode = 1;
-		} finally { clearTimeout(timer); }
+		} finally { process.off("SIGINT", cancel); process.off("SIGTERM", cancel); }
 	} finally {
 		if (runId && !statusTaskTelemetry) {
 			try {
@@ -2342,8 +2369,7 @@ async function main() {
 			process.exitCode = 1;
 		}
 		try { await salvageObjectiveCheckpoint(new Workspace(path.join(campaignRoot, "workspace")), outputDir,
-			budget.snapshot().stopReason, campaignTimedOut ||
-				(campaignDeadlineAt !== undefined && Date.now() >= campaignDeadlineAt)); }
+			budget.snapshot().stopReason, campaignCancelled); }
 		catch { statusArchiveFailure = "objective-checkpoint-salvage-failed"; process.exitCode = 1; }
 		try {
 			const statusFile = path.join(outputDir, "campaign-status.json");
@@ -2391,12 +2417,14 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	reviewedLegacyRestartEffects,
 	appendRestartReservation, appendRestartGoalBinding,
 	privateFailureMessage, privateExceptionDiagnostic, credentialProbe, parseCheckerOutput, compareCandidateTimings,
+	campaignObjectiveStop, taskTelemetry, privateToolTelemetry,
 	chooseForkWinner, chooseFollowOnCandidate, firstM07Accepted,
+	availablePrivateArtifactNames,
 	initialHistoricalSelection,
 	forkReceiptMatches, contextLineageSummary, selectedM07ReviewReadPaths, exportPrefixedArchive, preserveCandidate,
 	preserveUnsettledGoalCheckpoint, preserveUnsettledBranchCheckpoint: preserveUnsettledGoalCheckpoint,
 	salvageObjectiveCheckpoint, collectContinuationBundle,
-	executionDeadlineAt, newPhaseAdmitted, unresolvedGoalControl, campaignObjectiveProgress,
+	unresolvedGoalControl, campaignObjectiveProgress,
 	canonicalUnresolvedOperationRefs, qualifiedOperationRef, reservedCanonicalOperationRefs,
 	registeredSourceShape, parseRegisteredCheckerOutput, validateContinuationSeed, rangeReadableHistory, sandboxArguments };
 
@@ -2404,6 +2432,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
 	main().catch(async error => {
 		const preProvider = ["preflight", "mission-ledger-verification", "credential-probe", "credential-verified",
 			"isolated-preflight-passed", "workspace-init", "private-inputs-staged",
+			"provider-output-limit-verification", "provider-output-limit-verified",
 			"billing-currency-verification", "billing-currency-verified", "original-source-smoke",
 			"prior-selected-revalidation", "independent-restart-admission",
 			"source-and-isolation-preflight-passed"].includes(statusPhase);

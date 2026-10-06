@@ -6,18 +6,30 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { MAX_CNY_ESTIMATE, MAX_INPUT_PAYLOAD_BYTES, MAX_OUTPUT_TOKENS, MAX_PLANNING_CNY, MODEL_PROFILE, OBSERVED_OUTPUT_MARGIN_TOKENS, SMOKE_MODEL, assertPreflight, publicUsageFromSidecar, safeFailure } from "../scripts/manual-env-m01-smoke.ts";
+import { MAX_CNY_ESTIMATE, MAX_INPUT_PAYLOAD_BYTES, MODEL_PROFILE, SMOKE_MODEL, assertPreflight, boundedStageRunner, publicUsageFromSidecar, safeFailure } from "../scripts/manual-env-m01-smoke.ts";
+import { verifyDeepSeekProviderOutputLimit } from "../src/runner/deepseek-provider-limits.ts";
 import { HarnessError } from "../src/types.ts";
 
-test("public M01 smoke has a conservative single-call planning ceiling", () => {
+test("public M01 smoke has a monetary ceiling without a workflow call or output cap", () => {
   assertPreflight();
   assert.equal(SMOKE_MODEL, "deepseek/deepseek-flash:low");
   assert.equal(MAX_INPUT_PAYLOAD_BYTES, 12_000);
-  assert.equal(MAX_OUTPUT_TOKENS, 8_192);
-  assert.equal(OBSERVED_OUTPUT_MARGIN_TOKENS, 32);
-  assert.equal(Number(MAX_PLANNING_CNY.toFixed(4)), 2.0224);
-  assert.ok(MAX_PLANNING_CNY <= MAX_CNY_ESTIMATE);
+  assert.equal(MODEL_PROFILE.providers.deepseek.models[0].maxTokens, 393_216);
   assert.ok(MAX_CNY_ESTIMATE < 30);
+});
+
+test("public M01 reserves the live provider maximum per transport before spending", async () => {
+  const provider = await verifyDeepSeekProviderOutputLimit({ apiKey: "synthetic-offline-key", request: async () => new Response(JSON.stringify({
+    object: "list", data: [{ id: "deepseek-flash", object: "model", name: "DeepSeek-V4.1-Flash",
+      context_window: 1_048_576, max_output_tokens: 393_216 }],
+  }), { status: 200 }) });
+  const runner = boundedStageRunner({} as ModelRuntime, provider);
+  assert.equal(runner.campaignBudget.strictRequest.maxProviderCallsPerPrompt, undefined);
+  assert.equal(runner.campaignBudget.strictRequest.maxOutputTokens, provider.maxOutputTokens);
+  assert.equal(runner.campaignBudget.strictRequest.maxInputPayloadBytes, MAX_INPUT_PAYLOAD_BYTES);
+  const lease = runner.campaignBudget.beginPrompt("offline", "first");
+  assert.throws(() => runner.campaignBudget.reserve(lease, 100, "offline-request"), /CNY|ceiling|affordable/i);
+  assert.equal(runner.campaignBudget.snapshot().reservations, 0);
 });
 
 test("isolated profile resolves the current official DeepSeek model offline", async (t) => {
@@ -50,7 +62,10 @@ test("observed SDK usage prints only whitelisted scalars and rejects incomplete 
   assert.throws(() => publicUsageFromSidecar({ ...row, summary: { ...row.summary, complete: false } }));
   assert.throws(() => publicUsageFromSidecar({ ...row, summary: { ...row.summary, cost: undefined } }));
   assert.throws(() => publicUsageFromSidecar({ ...row, events: [] }));
-  assert.throws(() => publicUsageFromSidecar({ ...row, summary: { ...row.summary, output: MAX_OUTPUT_TOKENS + OBSERVED_OUTPUT_MARGIN_TOKENS + 1 } }));
+  assert.equal(publicUsageFromSidecar({ ...row, summary: { ...row.summary, output: 50_000 } }).outputTokens, 50_000);
+  const multi = { ...row, events: [{ ...row.events[0], stopReason: "toolUse" }, row.events[0]],
+    summary: { ...row.summary, reportedEvents: 2, input: 200, output: 40, totalTokens: 240, cost: 0.0002 } };
+  assert.equal(publicUsageFromSidecar(multi).observedAssistantEvents, 2);
 });
 
 test("live-failure diagnostics reveal only whitelisted code, status and numeric usage", () => {
@@ -72,6 +87,8 @@ test("live-failure diagnostics reveal only whitelisted code, status and numeric 
     summary: { input: "SECRET_COUNT" },
   });
   assert.deepEqual(unknown, { check: "public-m01", ok: false, phase: "m01-stage" });
+  assert.deepEqual(safeFailure(new HarnessError("runner.campaign", "SECRET_COST_CONTEXT"), "m01-stage"),
+    { check: "public-m01", ok: false, phase: "m01-stage", harnessCode: "runner.campaign" });
 });
 
 test("manual run fails closed on a missing environment key without exposing details", async () => {
