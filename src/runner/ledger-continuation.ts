@@ -757,8 +757,10 @@ function hostEffectReceipt(cp: AccountingCheckpoint,
 	previousBundle?: PrivateContinuationBundle): HostEffectReceiptV1 | undefined {
 	const raw = cp.privateBundle?.["host-effect-receipt.json"];
 	if (!raw || !cp.privateBundle?.["objective-checkpoint.json"] ||
-		cp.requestAudit.requests.some(row => row.responseReceived !== true ||
-			row.status === "in-flight" || !row.sessionId)) return undefined;
+		cp.requestAudit.requests.some(row => row.status === "in-flight" || !row.sessionId ||
+			(row.responseReceived !== true && (row.responseReceived !== false ||
+				row.status !== "unknown" || row.settledCny !== null ||
+				(row.unknownObservedCny !== null && row.unknownObservedCny <= 0))))) return undefined;
 	let receipt: unknown, checkpoint: unknown, priorCheckpoint: unknown;
 	try {
 		receipt = JSON.parse(raw); checkpoint = JSON.parse(cp.privateBundle["objective-checkpoint.json"]);
@@ -806,6 +808,12 @@ function hostEffectReceipt(cp: AccountingCheckpoint,
 		sessions.set(session.sessionId, session);
 	}
 	if (cp.requestAudit.requests.some(row => !sessions.has(row.sessionId!))) return undefined;
+	// Transport uncertainty is a billing/operation hold, not evidence of a remote
+	// actor effect. It is admissible only inside one factory-confined failed task.
+	const unreceivedSessions = new Set(cp.requestAudit.requests.filter(row =>
+		row.responseReceived === false).map(row => row.sessionId!));
+	if ([...unreceivedSessions].some(id => sessions.get(id)?.kind !== "confined-execution"))
+		return undefined;
 	const historicalGoalRunIds = receipt.historicalGoalRunIds as string[];
 	const expectedGoals = checkpoint.boundedRuns.filter(row =>
 		!historicalGoalRunIds.includes(row.runId));
@@ -832,15 +840,62 @@ function hostEffectReceipt(cp: AccountingCheckpoint,
 		for (const operation of goal.operations) {
 			if (!record(operation) || !exactKeys(operation, ["id", "taskId", "status"]) ||
 				!/^O\d{3,}$/.test(operation.id) || operationIds.has(operation.id) ||
-				!taskIds.has(operation.taskId) || operation.status !== "response-received") return undefined;
+				!taskIds.has(operation.taskId) ||
+				!(["response-received", "unknown"].includes(operation.status))) return undefined;
+			if (operation.status === "unknown") {
+				const task = goal.tasks.find(item => item.taskId === operation.taskId);
+				if (goal.outcome !== "active" || task?.mode !== "execute" ||
+					task.status !== "failed" || !unreceivedSessions.has(task.sessionId) ||
+					!expectedGoals.find(item => item.runId === goal.runId)?.unresolvedOperationIds?.includes(operation.id))
+					return undefined;
+			}
 			operationIds.add(operation.id);
 		}
 		if (goal.tasks.some(task => task.mode === "execute" &&
 			!goal.operations.some(operation => operation.taskId === task.taskId))) return undefined;
 	}
+	if ([...unreceivedSessions].some(id => !(receipt.goals as HostEffectReceiptV1["goals"]).some(goal =>
+		goal.tasks.some(task => task.sessionId === id && task.mode === "execute" &&
+			task.status === "failed" && goal.operations.some(operation =>
+				operation.taskId === task.taskId && operation.status === "unknown"))))) return undefined;
 	if ([...sessions.values()].some(session => session.kind === "confined-execution" &&
 		!usedSessions.has(session.sessionId as string))) return undefined;
 	return receipt as HostEffectReceiptV1;
+}
+/** An older writer omitted carryForwardOrigin when one provider response was lost.
+ * Recover only when the selected tuple is byte-for-byte the one sealed by the
+ * latest authenticated restart link. This does not settle the lost transport.
+ */
+/** The old-writer recovery path cannot change the signed original mission under a reused ID. */
+export function originalObjectiveMatchesSignedBootstrap(bundle: PrivateContinuationBundle | undefined,
+	signedOriginalObjective: string | undefined): boolean {
+	if (!bundle || typeof signedOriginalObjective !== "string" ||
+		bundle["original-objective.json"] !== signedOriginalObjective) return false;
+	let checkpoint: unknown, originalObjective: unknown;
+	try {
+		checkpoint = JSON.parse(bundle["objective-checkpoint.json"] ?? "");
+		originalObjective = JSON.parse(signedOriginalObjective);
+	}
+	catch { return false; }
+	return record(checkpoint) && record(originalObjective) &&
+		JSON.stringify(checkpoint.contract) === JSON.stringify(originalObjective);
+}
+function unchangedReviewedSelection(cp: AccountingCheckpoint,
+	signedOriginalObjective: string | undefined): boolean {
+	const prior = cp.reviewedEffectAncestry?.at(-1);
+	const bundle = cp.privateBundle;
+	if (!prior || !originalObjectiveMatchesSignedBootstrap(bundle, signedOriginalObjective)) return false;
+	const files = bundle! as Record<string, string | undefined>;
+	let checkpoint: unknown;
+	try { checkpoint = JSON.parse(files["objective-checkpoint.json"] ?? ""); }
+	catch { return false; }
+	if (!record(checkpoint)) return false;
+	const selected = checkpoint.selectedArtifacts;
+	if (!distinctStrings(selected, /^[A-Za-z0-9._-]{1,128}$/) || !selected.length ||
+		selected.some(name => typeof files[name] !== "string")) return false;
+	const tuple = selected.slice().sort().map(name => ({ name,
+		sha256: digest(files[name]!), bytes: Buffer.byteLength(files[name]!, "utf8") }));
+	return digest(JSON.stringify(tuple)) === prior.selectedTupleSha256;
 }
 function validateAncestryV3(cp: AccountingCheckpoint, sources: Source[], seedDigest: string,
 	seedCommittedNano: number, seedBinding?: BootstrapBinding): void {
@@ -1272,6 +1327,16 @@ export async function openLedgerContinuation(input: {
 						cp.carryForwardOrigin.envelopeSha256 === candidate.envelopeSha256 &&
 						cp.carryForwardOrigin.historicalCommittedNano === candidate.historicalCommittedNano &&
 						cp.carryForwardOrigin.historicalUnknownHeldNano === candidate.historicalUnknownHeldNano)
+						hostEffectEvidence = Object.freeze({ origin: candidate, receipt,
+							requestAudit: cp.requestAudit,
+							reviewedEffectAncestry: Object.freeze([...(cp.reviewedEffectAncestry ?? [])]) });
+				} else if (cp.requestAudit.requests.some(row => row.responseReceived === false) &&
+					cp.reviewedEffectAncestry?.length && unchangedReviewedSelection(cp,
+						seed.bootstrapPrivateBundle?.["original-objective.json"])) {
+					// Compatibility for an authenticated terminal carry sealed before
+					// unknown transport was separated from actor-side effect review.
+					const receipt = hostEffectReceipt(cp);
+					if (receipt && bundleSha256)
 						hostEffectEvidence = Object.freeze({ origin: candidate, receipt,
 							requestAudit: cp.requestAudit,
 							reviewedEffectAncestry: Object.freeze([...(cp.reviewedEffectAncestry ?? [])]) });

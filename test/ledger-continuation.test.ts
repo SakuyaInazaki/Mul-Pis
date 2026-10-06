@@ -5,16 +5,29 @@ import os from "node:os";
 import path from "node:path";
 import { deflateRawSync } from "node:zlib";
 import test, { type TestContext } from "node:test";
-import { authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE } from "../src/runner/ledger-continuation.ts";
+import { authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, originalObjectiveMatchesSignedBootstrap, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE } from "../src/runner/ledger-continuation.ts";
 import type { RequestAuditSnapshot } from "../src/runner/ledger-continuation.ts";
 import { DeepSeekCampaignBudget, campaignSessionEffectId, type CampaignAdmissionRejection } from "../src/runner/deepseek-campaign.ts";
 import { offlineChecks } from "../scripts/manual-private-campaign.ts";
 import { Workspace } from "../src/workspace.ts";
+import { reserveIndependentRestart, bindIndependentRestartGoal } from "../src/m07/independent-restart.ts";
 import { verifyDeepSeekCnyBilling, nativeCnyPricingRecord } from "../src/runner/deepseek-cny-pricing.ts";
 import { verifyDeepSeekProviderOutputLimit, providerOutputLimitRecord } from "../src/runner/deepseek-provider-limits.ts";
 import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, ONE_USE_PUSH_MARKER } from "../src/runner/signed-mission-ledger.ts";
 
 const sha = (letter: string) => letter.repeat(40);
+test("old-writer effect recovery cannot change signed objective text under the same contract ID", () => {
+	const signed = JSON.stringify({ version: 1, kind: "original-objective", id: "same-id",
+		goal: "synthetic original", constraints: ["frozen"] });
+	const current = { "original-objective.json": signed,
+		"objective-checkpoint.json": JSON.stringify({ contract: JSON.parse(signed) }) };
+	assert.equal(originalObjectiveMatchesSignedBootstrap(current, signed), true);
+	const changed = JSON.stringify({ ...JSON.parse(signed), constraints: ["changed"] });
+	assert.equal(originalObjectiveMatchesSignedBootstrap({ "original-objective.json": changed,
+		"objective-checkpoint.json": JSON.stringify({ contract: JSON.parse(changed) }) }, signed), false);
+	assert.equal(originalObjectiveMatchesSignedBootstrap({ ...current,
+		"objective-checkpoint.json": JSON.stringify({ contract: { ...JSON.parse(signed), goal: "different" } }) }, signed), false);
+});
 const TEST_PROVIDER_OUTPUT_LIMIT = await verifyDeepSeekProviderOutputLimit({ apiKey: "synthetic-only",
 	request: async () => new Response(JSON.stringify({ object: "list", data: [{ id: "deepseek-flash",
 		object: "model", name: "DeepSeek-V4.1-Flash", max_output_tokens: 20,
@@ -1186,10 +1199,16 @@ test("zero-activity v3 wrapper authenticates exact legacy bundle before carrying
 
 test("complete received host-effect census brands a nonzero v3 carry without releasing old holds", async t => {
 	const f = await fixture(t);
-	const oldCheckpoint = { boundedRuns: [{ runId: "old-goal", outcome: "active",
-		unresolvedOperationIds: ["O001"] }] };
+	const contract = { version: 1, kind: "original-objective", id: "old-contract" };
+	const oldCheckpoint = { version: 1, kind: "original-objective-progress", contract,
+		selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
+		boundedRuns: [{ runId: "selected-goal", outcome: "partial", selectedTaskId: "T001",
+			acceptedTaskIds: ["T001"], unresolvedOperationIds: [] },
+			{ runId: "old-goal", outcome: "active", unresolvedOperationIds: ["O001", "O002"] }],
+		continuation: { requiresOperationReconciliation: true,
+			unresolvedOperationIds: ["old-goal/O001", "old-goal/O002"] } };
 	const oldBundle = { "candidate.cpp": "old selected source", "verification.json": "{}",
-		"workflow-archive.json": "{}", "original-objective.json": "{}",
+		"workflow-archive.json": "{}", "original-objective.json": JSON.stringify(contract),
 		"objective-checkpoint.json": JSON.stringify(oldCheckpoint),
 		"independent-restart-quarantine.json": JSON.stringify({ version: 1,
 			kind: "host-independent-restart-reservations", entries: [] }),
@@ -1273,7 +1292,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 		root: "/tmp/synthetic/T001", writableFiles: ["candidate.cpp", "lesson-delta.json"] };
 	const receipt = await offlineChecks.buildHostEffectReceipt({ ws,
 		source: { runId: "7005", runAttempt: 1, commit: sha("e") }, priorEnvelopeSha256,
-		historicalGoalRunIds: ["old-goal"], requestIds: rows.map(row => row.requestId),
+		historicalGoalRunIds: oldCheckpoint.boundedRuns.map(row => row.runId), requestIds: rows.map(row => row.requestId),
 		sessions: new Map([
 			["exec session", { sessionId: "exec session", grantKind: "confined-execution" as const,
 				taskId: "T001", workRoot: grant.root, grant }],
@@ -1373,6 +1392,209 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 		observedUnknownResume.priorPrivateBundle));
 	assert.equal(observedUnknownResume.priorUnknownObservedCny, 0.25);
 	assert.equal(observedUnknownResume.historicalUnknownHeldCny, 0.25);
+	const transportRows: any[] = structuredClone(rows.slice(0, 17));
+	transportRows[16].responseReceived = false;
+	transportRows[16].status = "unknown";
+	transportRows[16].settledCny = null;
+	transportRows[16].unknownObservedCny = 0.25;
+	transportRows[16].reportedUsage = null;
+	const transportAudit: any = { ...requestAudit, requests: transportRows,
+		settledCny: 0.5, unknownObservedCny: 0.25 };
+	const transportReceipt = structuredClone(receipt);
+	transportReceipt.requestIds = transportRows.map(row => row.requestId);
+	transportReceipt.goals[0].outcome = "active";
+	transportReceipt.goals[0].tasks[0].status = "failed";
+	transportReceipt.goals[0].operations[0].status = "unknown";
+	const transportBundle = { ...nextBundle,
+		"objective-checkpoint.json": JSON.stringify({ ...oldCheckpoint,
+			boundedRuns: [...oldCheckpoint.boundedRuns,
+				{ runId: "new-goal", outcome: "active", unresolvedOperationIds: ["O001"] }],
+			continuation: { requiresOperationReconciliation: true,
+				unresolvedOperationIds: ["old-goal/O001", "old-goal/O002", "new-goal/O001"] } }),
+		"host-effect-receipt.json": JSON.stringify(transportReceipt) };
+	const transportOpen = await reopenWork();
+	const transportCarry = transportOpen.sealCurrent({ settledCny: 0.5,
+		unknownObservedCny: 0.25, unpricedRequestCount: 0,
+		requestAudit: transportAudit, privateBundle: transportBundle });
+	const transportResume = await resumeCarry(transportCarry.envelopeB64);
+	assert(authenticatedHostEffectEvidence(transportResume.priorCarryProof,
+		transportResume.priorPrivateBundle), "16 received plus one unknown transport retains confined actor-effect authority");
+	assert.equal(transportResume.priorUnknownObservedCny, 0.25);
+	assert.equal(transportResume.historicalUnknownHeldCny, 0.25);
+	const zeroAfterUnknown = transportResume.sealCurrent({ settledCny: 0,
+		unknownObservedCny: 0, unpricedRequestCount: 0,
+		requestAudit: emptyAudit, privateBundle: transportResume.priorPrivateBundle });
+	assert.equal(zeroAfterUnknown.observedUnknownHeldCny, 0.25,
+		"a later empty run cannot release the unknown transport observation");
+	const claimRequest: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.endsWith("/runs/7006"))
+			return new Response(JSON.stringify(next));
+		if (address.includes("/runs/7006/jobs?"))
+			return new Response(JSON.stringify({ total_count: 1, jobs: [{
+				id: 8006, run_id: 7006, run_attempt: 1, head_sha: sha("f"),
+				name: "private-campaign", status: "in_progress",
+				steps: [{ name: "Run private campaign", status: "in_progress" }],
+			}] }));
+		return requestFor([anchor, firstDone, secondDone,
+			{ ...work, status: "completed", conclusion: "failure" }, next])(url, init);
+	};
+	const claimed = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7006, sha("f")),
+		request: claimRequest, loadCarryArtifact: async () => transportCarry.envelopeB64 });
+	const priorProof = claimed.priorCarryProof!;
+	const priorBundle = claimed.priorPrivateBundle!;
+	assert(authenticatedHostEffectEvidence(priorProof, priorBundle));
+	const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+	const facts = {
+		source: { runId: priorProof.source.runId, runAttempt: priorProof.source.runAttempt,
+			commit: priorProof.source.commit },
+		currentRun: { runId: priorProof.admittedCurrent.runId,
+			runAttempt: priorProof.admittedCurrent.runAttempt, commit: priorProof.admittedCurrent.commit },
+		envelopeSha256: priorProof.envelopeSha256, privateBundleSha256: priorProof.privateBundleSha256!,
+		terminal: { state: "terminal" as const, sourceRunId: priorProof.source.runId,
+			sourceRunAttempt: priorProof.source.runAttempt,
+			observationDigest: digest(priorProof.terminal), observedAt: "2026-10-06T17:30:00Z" },
+		resultArtifact: { immutableRef: "synthetic-immutable-result", digestScope: "github-artifact-archive",
+			sha256: priorProof.resultArtifact!.archiveSha256 },
+		committedNano: Math.ceil(claimed.historicalCommittedCny! * 1_000_000_000),
+		unknownHeldNano: Math.ceil(claimed.historicalUnknownHeldCny! * 1_000_000_000),
+	};
+	const quarantineChain = JSON.parse(priorBundle["independent-restart-quarantine.json"]!);
+	const bindingChain = JSON.parse(priorBundle["independent-restart-goal-binding.json"]!);
+	const reservation = await reserveIndependentRestart({ authenticatedCarryProof: priorProof,
+		privateBundle: priorBundle, freshWorkspace: { workspaceId: "next-independent-workspace",
+			restartNonce: "independent-nonce" },
+		failedHistory: { state: "unavailable", reason: "synthetic prior result is unavailable",
+			immutableArtifactRef: facts.resultArtifact.immutableRef,
+			digestScope: facts.resultArtifact.digestScope,
+			artifactSha256: facts.resultArtifact.sha256 } }, {
+		authenticatedFacts: proof => proof === priorProof &&
+			authenticatedPriorCarryBindsBundle(proof, priorBundle) ? facts : undefined,
+		reviewEffects: async (reviewed, refs) => {
+			assert(authenticatedHostEffectEvidence(priorProof, priorBundle));
+			assert.deepEqual([...refs].sort(), ["new-goal/O001", "old-goal/O001", "old-goal/O002"]);
+			return { sourceCommit: reviewed.source.commit, policyId: "synthetic-confined-host-review",
+				policySha256: digest([reviewed.source, refs]),
+				operationAttestations: refs.map(operationRef => ({ operationRef,
+					sourceCommit: reviewed.source.commit, evidenceSha256: digest(operationRef) })),
+				effectClass: "confined-ephemeral-local", unknownBillingHeld: true,
+				actorThirdPartyMutations: "none", hostTransport: "immutable-versioned-archive" };
+		},
+		revalidateSelection: async ({ checkpoint, tupleSha256 }) => ({ status: "passed",
+			contractId: checkpoint.contract.id, selectedRunId: "selected-goal",
+			selectedTaskId: "T001", tupleSha256,
+			currentValidationSha256: digest("fresh independent checker") }),
+		commitOneUse: async receipt => {
+			const claim = await claimed.claimOneUse(receipt.prior.envelopeSha256);
+			quarantineChain.entries.push({ receipt, claim });
+			return { receiptRef: "independent-restart-quarantine.json",
+				receiptSha256: digest(receipt), claim };
+		},
+	});
+	assert.deepEqual(reservation.quarantinedOperationRefs,
+		["new-goal/O001", "old-goal/O001", "old-goal/O002"]);
+	await bindIndependentRestartGoal(reservation, "next-goal", async binding => {
+		bindingChain.entries.push(binding);
+		return { bindingRef: "independent-restart-goal-binding.json",
+			bindingSha256: digest(binding) };
+	});
+	const receivedSession = campaignSessionEffectId("after unknown transport");
+	const receivedRow = { requestId: "after-unknown-received", sessionId: receivedSession,
+		responseReceived: true, inputPayloadBytes: 100, status: "settled" as const,
+		settledCny: 0.25, unknownObservedCny: null,
+		reportedUsage: { input: 10, output: 10, cacheRead: 0, cacheWrite: 0,
+			totalTokens: 20, reportedUsdCost: 0.01, costStatus: "priced" } };
+	const afterUnknownAudit = { ...emptyAudit, requests: [receivedRow], settledCny: 0.25,
+		pricingProfile: nativeCnyPricingRecord(profile) };
+	const afterUnknownReceipt = { ...transportReceipt,
+		source: { runId: "7006", runAttempt: 1, commit: sha("f") },
+		priorEnvelopeSha256: priorProof.envelopeSha256,
+		historicalGoalRunIds: ["selected-goal", "old-goal", "new-goal"],
+		goals: [{ runId: "next-goal", outcome: "partial",
+			tasks: [{ taskId: "T002", mode: "execute", status: "rejected", sessionId: receivedSession }],
+			operations: [{ id: "O001", taskId: "T002", status: "response-received" }] }],
+		sessions: [{ sessionId: receivedSession, kind: "confined-execution",
+			goalRunId: "next-goal", taskId: "T002", workRoot: "/tmp/synthetic/T002",
+			grant: { version: 1, kind: "confined-campaign-files", root: "/tmp/synthetic/T002",
+				writableFiles: ["candidate.cpp", "lesson-delta.json"] } }],
+		requestIds: [receivedRow.requestId] };
+	const afterUnknownBundle = { ...priorBundle,
+		"independent-restart-quarantine.json": JSON.stringify(quarantineChain),
+		"independent-restart-goal-binding.json": JSON.stringify(bindingChain),
+		"objective-checkpoint.json": JSON.stringify({ ...oldCheckpoint,
+			boundedRuns: [...oldCheckpoint.boundedRuns,
+				{ runId: "new-goal", outcome: "active", unresolvedOperationIds: ["O001"] },
+				{ runId: "next-goal", outcome: "partial", unresolvedOperationIds: [] }],
+			continuation: { requiresOperationReconciliation: true,
+				unresolvedOperationIds: ["old-goal/O001", "old-goal/O002", "new-goal/O001"] } }),
+		"host-effect-receipt.json": JSON.stringify(afterUnknownReceipt) };
+	const afterUnknown = claimed.sealCurrent({ settledCny: 0.25,
+		unknownObservedCny: 0, unpricedRequestCount: 0,
+		requestAudit: afterUnknownAudit, privateBundle: afterUnknownBundle });
+	const reopenedAfterUnknown = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7007, sha("1")),
+		request: requestFor([anchor, firstDone, secondDone,
+			{ ...work, status: "completed", conclusion: "failure" },
+			{ ...next, status: "completed", conclusion: "failure" },
+			run(7007, 6, "in_progress", sha("1"))]),
+		loadCarryArtifact: async () => afterUnknown.envelopeB64 });
+	const afterEvidence = authenticatedHostEffectEvidence(reopenedAfterUnknown.priorCarryProof,
+		reopenedAfterUnknown.priorPrivateBundle);
+	assert(afterEvidence, "a new received run retains the reviewed unknown-transport ancestry");
+	assert.equal(afterEvidence.reviewedEffectAncestry.length, 1);
+	assert.equal(reopenedAfterUnknown.priorUnknownObservedCny, 0.25);
+	assert.equal(reopenedAfterUnknown.historicalUnknownHeldCny, 0.25);
+	assert.deepEqual(JSON.parse(reopenedAfterUnknown.priorPrivateBundle!["objective-checkpoint.json"]!)
+		.continuation.unresolvedOperationIds,
+		["old-goal/O001", "old-goal/O002", "new-goal/O001"]);
+	for (const [label, change] of [
+		["in-flight transport", (bundle: Record<string, string>, audit: any) => {
+			audit.requests[16].status = "in-flight";
+		}],
+		["unknown outside failed task", (bundle: Record<string, string>) => {
+			const census = JSON.parse(bundle["host-effect-receipt.json"]);
+			census.goals[0].tasks[0].status = "rejected";
+			bundle["host-effect-receipt.json"] = JSON.stringify(census);
+		}],
+		["unknown without unresolved checkpoint", (bundle: Record<string, string>) => {
+			const checkpoint = JSON.parse(bundle["objective-checkpoint.json"]);
+			checkpoint.boundedRuns.at(-1).unresolvedOperationIds = [];
+			bundle["objective-checkpoint.json"] = JSON.stringify(checkpoint);
+		}],
+		["unreceived read-only session", (bundle: Record<string, string>, audit: any) => {
+			audit.requests[16].sessionId = researchSession;
+		}],
+		["missing host census", (bundle: Record<string, string>) => {
+			delete bundle["host-effect-receipt.json"];
+		}],
+	] as Array<[string, (bundle: Record<string, string>, audit: any) => void]>) {
+		const bundle = { ...transportBundle };
+		const audit = structuredClone(transportAudit);
+		change(bundle, audit);
+		const opened = await reopenWork();
+		const carry = opened.sealCurrent({ settledCny: audit.settledCny,
+			unknownObservedCny: audit.unknownObservedCny,
+			unpricedRequestCount: audit.unpricedRequestCount,
+			requestAudit: audit, privateBundle: bundle });
+		const replay = await resumeCarry(carry.envelopeB64);
+		assert.equal(authenticatedHostEffectEvidence(replay.priorCarryProof,
+			replay.priorPrivateBundle), undefined, label);
+	}
+	const changedObjective = { ...transportBundle };
+	const alteredContract = { ...contract, constraint: "changed-but-same-id" };
+	const alteredProgress = JSON.parse(changedObjective["objective-checkpoint.json"]);
+	alteredProgress.contract = alteredContract;
+	changedObjective["original-objective.json"] = JSON.stringify(alteredContract);
+	changedObjective["objective-checkpoint.json"] = JSON.stringify(alteredProgress);
+	const alteredOpen = await reopenWork();
+	const alteredCarry = alteredOpen.sealCurrent({ settledCny: 0.5,
+		unknownObservedCny: 0.25, unpricedRequestCount: 0,
+		requestAudit: transportAudit, privateBundle: changedObjective });
+	const alteredResume = await resumeCarry(alteredCarry.envelopeB64);
+	assert.equal(authenticatedHostEffectEvidence(alteredResume.priorCarryProof,
+		alteredResume.priorPrivateBundle), undefined,
+		"same-ID objective mutation cannot mint effect authority beyond signed seed bytes");
 	const acceptedReceipt = structuredClone(receipt);
 	acceptedReceipt.goals[0].tasks[0].status = "accepted";
 	const acceptedArchive = JSON.stringify({ version: 1, kind: "m07-private-candidate-archive",
@@ -1425,7 +1647,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 	const nextReceipt = { ...receipt,
 		source: { runId: "7006", runAttempt: 1, commit: sha("f") },
 		priorEnvelopeSha256: reviewedPrior.envelopeSha256,
-		historicalGoalRunIds: ["old-goal", "new-goal"],
+		historicalGoalRunIds: ["selected-goal", "old-goal", "new-goal"],
 		goals: [{ runId: "next-goal", outcome: "partial",
 			tasks: [{ taskId: "T002", mode: "execute", status: "rejected", sessionId: nextExecutionSession }],
 			operations: [{ id: "O001", taskId: "T002", status: "response-received" }] }],
@@ -1479,7 +1701,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 	const emptyReceipt = await offlineChecks.buildHostEffectReceipt({ ws: emptyWs,
 		source: { runId: "7006", runAttempt: 1, commit: sha("f") },
 		priorEnvelopeSha256: reviewedPrior.envelopeSha256,
-		historicalGoalRunIds: ["old-goal", "new-goal"],
+		historicalGoalRunIds: ["selected-goal", "old-goal", "new-goal"],
 		requestIds: [], sessions: new Map([
 			["pre-request-assessor", { sessionId: "pre-request-assessor", grantKind: "none" as const }],
 		]) });
@@ -1535,7 +1757,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 	const thirdReceipt = { ...receipt,
 		source: { runId: "7007", runAttempt: 1, commit: sha("1") },
 		priorEnvelopeSha256: zeroProof.envelopeSha256,
-		historicalGoalRunIds: ["old-goal", "new-goal"],
+		historicalGoalRunIds: ["selected-goal", "old-goal", "new-goal"],
 		goals: [{ runId: "third-goal", outcome: "partial",
 			tasks: [{ taskId: "T003", mode: "execute", status: "rejected", sessionId: thirdSession }],
 			operations: [{ id: "O001", taskId: "T003", status: "response-received" }] }],

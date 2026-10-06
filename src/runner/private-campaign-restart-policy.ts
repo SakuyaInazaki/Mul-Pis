@@ -6,7 +6,8 @@
 import { createHash } from "node:crypto";
 import type { AuthenticatedRestartCarryFacts, ReviewedRestartEffectPolicy } from "../m07/independent-restart.ts";
 import { authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence,
-	authenticatedLegacyV3RunReview, type AuthenticatedLegacyV3RunReview } from "./ledger-continuation.ts";
+	authenticatedLegacyV3RunReview, type AuthenticatedHostEffectEvidence,
+	type AuthenticatedLegacyV3RunReview } from "./ledger-continuation.ts";
 
 const sha256 = (value: string): string => createHash("sha256").update(value).digest("hex");
 const hex64 = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
@@ -56,11 +57,12 @@ const ONE_TIME_LEGACY_V3_POLICY = Object.freeze({ version: 1,
 export const PRIOR_REVIEWED_POLICY_SHA256 = sha256(JSON.stringify(PRIOR_POLICY));
 
 interface PriorReservation {
-	receipt: {
+		receipt: {
 		version: 1; kind: "host-independent-goal-quarantine"; prior: {
 			source: { runId: string; runAttempt: number; commit: string };
 			envelopeSha256: string; contractId: string; reviewedPolicyId: string;
-			reviewedPolicySha256: string; unknownHeldNano: number; committedNano: number };
+			reviewedPolicySha256: string; selectedTupleSha256?: string;
+			unknownHeldNano: number; committedNano: number };
 		quarantine: { operationRefs: string[]; operationOutcome: "unknown";
 			selectedFromFailedAttempt: false;
 			historicalGoalOutcomes?: Array<{ runId: string; outcome: string }> };
@@ -465,11 +467,12 @@ export function reviewOneTimeLegacyV3Effects(input: PrivateCampaignEffectReviewI
 }
 
 /** Only the reviewed source pair and a fully linked inherited quarantine are admitted. */
-export function reviewPrivateCampaignRestartEffects(input: PrivateCampaignEffectReviewInput): ReviewedRestartEffectPolicy {
+function reviewPrivateCampaignRestartEffectsCore(input: PrivateCampaignEffectReviewInput,
+	offlineHostEffect?: AuthenticatedHostEffectEvidence): ReviewedRestartEffectPolicy {
 	const { facts, operationRefs, privateBundle: bundle } = input;
 	if (!input.authenticatedBundle(input.proof, bundle)) reject("bundle is not authenticated by live ledger proof");
 	const carryForward = authenticatedCarryForwardOrigin(input.proof, bundle);
-	const hostEffect = authenticatedHostEffectEvidence(input.proof, bundle);
+	const hostEffect = offlineHostEffect ?? authenticatedHostEffectEvidence(input.proof, bundle);
 	const oneTimeLegacyV3 = authenticatedLegacyV3RunReview(input.proof, bundle);
 	if (!(facts.source.commit === CURRENT_POLICY.sourceCommit ||
 		facts.source.commit === INHERITED_ONLY_POLICY.sourceCommit ||
@@ -522,19 +525,45 @@ export function reviewPrivateCampaignRestartEffects(input: PrivateCampaignEffect
 			!sameSet([...priorGoalIds, ...receipt.goals.map(goal => goal.runId)],
 				boundedRuns.map(row => row.runId ?? "")) ||
 			(latestReview ?? []).some(row => boundedRuns.find(saved => saved.runId === row.runId)?.outcome !== row.outcome) ||
-			receipt.goals.some(goal => (boundedRuns.find(row => row.runId === goal.runId)?.unresolvedOperationIds?.length ?? 0) !== 0))
+			receipt.goals.some(goal => !Array.isArray(boundedRuns.find(row => row.runId === goal.runId)?.unresolvedOperationIds)))
 			reject("host-effect census changed historical goals or left a new goal unresolved");
+		const newUnknownRefs = receipt.goals.flatMap(goal => goal.operations
+			.filter(operation => operation.status === "unknown")
+			.map(operation => `${goal.runId}/${operation.id}`));
+		const historicalUnknownRefs = reservations.at(-1)?.receipt?.quarantine?.operationRefs ?? [];
+		if (!Array.isArray(historicalUnknownRefs) || !historicalUnknownRefs.length ||
+			!sameSet([...historicalUnknownRefs, ...newUnknownRefs], operationRefs) ||
+			receipt.goals.some(goal => !sameSet(goal.operations.filter(operation =>
+				operation.status === "unknown").map(operation => operation.id),
+				boundedRuns.find(row => row.runId === goal.runId)?.unresolvedOperationIds ?? [])))
+			reject("host-effect unknown operations do not partition historical quarantine");
+		if (newUnknownRefs.length) {
+			const selected = checkpoint.selectedArtifacts;
+			const priorTuple = reservations.at(-1)?.receipt?.prior?.selectedTupleSha256;
+			if (!Array.isArray(selected) || !selected.length || new Set(selected).size !== selected.length ||
+				selected.some(name => !text(name) || name.length > 128 || typeof bundle[name] !== "string") ||
+				!hex64(priorTuple) ||
+				sha256(JSON.stringify(selected.slice().sort().map(name => ({ name,
+					sha256: sha256(bundle[name]), bytes: Buffer.byteLength(bundle[name], "utf8") })))) !== priorTuple)
+				reject("unknown transport changed the prior selected tuple");
+		}
 		const historicalCheckpoint = { ...checkpoint, boundedRuns: boundedRuns.filter(row =>
 			originalGoalIds.includes(row.runId ?? "")) };
 		const historicalFacts: AuthenticatedRestartCarryFacts = { ...facts,
 			source: { ...origin.source }, envelopeSha256: origin.envelopeSha256,
 			committedNano: origin.historicalCommittedNano,
 			unknownHeldNano: origin.historicalUnknownHeldNano };
-		const reviewed = reviewLengthSettled({ ...input, facts: historicalFacts },
+		const originalPrefixRefs = reservations[2]?.receipt?.quarantine?.operationRefs;
+		if (!Array.isArray(originalPrefixRefs) || !originalPrefixRefs.length ||
+			originalPrefixRefs.some(ref => !historicalUnknownRefs.includes(ref)))
+			reject("historical unknown-operation prefix is missing from later quarantine");
+		const historicalInput = { ...input, facts: historicalFacts,
+			operationRefs: originalPrefixRefs };
+		const reviewed = reviewLengthSettled(historicalInput,
 			historicalCheckpoint, reservations.slice(0, 3), bindings.slice(0, 3));
 		if (oneTimeAncestor) {
 			const prefix = { ...checkpoint, boundedRuns: boundedRuns.slice(0, 6) };
-			const fourth = reviewFourthZeroWrapperLink(input, prefix,
+			const fourth = reviewFourthZeroWrapperLink(historicalInput, prefix,
 				reservations.slice(0, 4), bindings.slice(0, 4),
 				origin.historicalCommittedNano, origin.historicalUnknownHeldNano);
 			if (fourth.newGoalId !== receipt.historicalGoalRunIds[5] ||
@@ -548,6 +577,11 @@ export function reviewPrivateCampaignRestartEffects(input: PrivateCampaignEffect
 			const current = reservations[baseLinks + index];
 			const binding = ancestor.abandonedWithoutGoal ? undefined : bindings[boundLinkIndex++];
 			const saved = current?.receipt, claim = current?.claim;
+			const savedGoals = saved?.quarantine?.historicalGoalOutcomes;
+			const savedRefs = Array.isArray(savedGoals) && savedGoals.every(row =>
+				boundedRuns.some(run => run.runId === row.runId && run.outcome === row.outcome)) ?
+				savedGoals.flatMap(row => (boundedRuns.find(run => run.runId === row.runId)?.unresolvedOperationIds ?? [])
+					.map(id => `${row.runId}/${id}`)) : undefined;
 			if (saved?.version !== 1 || saved.kind !== "host-independent-goal-quarantine" ||
 				saved.prior?.source?.runId !== ancestor.source.runId ||
 				saved.prior.source.runAttempt !== ancestor.source.runAttempt ||
@@ -558,7 +592,7 @@ export function reviewPrivateCampaignRestartEffects(input: PrivateCampaignEffect
 				saved.prior.committedNano !== facts.committedNano ||
 				saved.quarantine?.operationOutcome !== "unknown" ||
 				saved.quarantine.selectedFromFailedAttempt !== false ||
-				!sameSet(saved.quarantine.operationRefs ?? [], operationRefs) ||
+				!savedRefs || !sameSet(saved.quarantine.operationRefs ?? [], savedRefs) ||
 				(ancestor.abandonedWithoutGoal ? bindings.some(row =>
 					row?.quarantineReceiptSha256 === sha256(JSON.stringify(saved))) :
 					binding?.version !== 1 || binding.kind !== "host-independent-goal-binding" ||
@@ -636,13 +670,31 @@ export function reviewPrivateCampaignRestartEffects(input: PrivateCampaignEffect
 				expected.some(operation => !outcomes.some((row: any) =>
 					row?.operationId === operation.id && row.status === operation.status)))
 				reject("host-effect archive differs from the settled controller census");
+			if (expected.some(operation => operation.status === "unknown")) {
+				const session = receipt.sessions.find(row => row.sessionId === task.sessionId);
+				const hasUnknownTransport = requestAudit.requests.some(row =>
+					row.sessionId === task.sessionId && row.responseReceived === false &&
+					row.status === "unknown" && row.settledCny === null);
+				if (task.status !== "failed" || goal.outcome !== "active" || isSelected ||
+					archive.m04?.state !== "not-run" || archive.controllerEvidence.reviewStatus !== "unreviewed" ||
+					session?.kind !== "confined-execution" || !hasUnknownTransport ||
+					expected.some(operation => operation.status === "unknown" &&
+						!outcomes.some((row: any) => row.operationId === operation.id && row.status === "unknown")))
+					reject("unknown transport lacks one failed, confined, unselected task archive");
+			}
 		}
 		const policyId = "mul-pis-complete-host-effect-census-v1";
 		return { sourceCommit: facts.source.commit, policyId,
 			policySha256: sha256(JSON.stringify({ policyId, source: facts.source,
 				envelope: facts.envelopeSha256, resultArtifact: facts.resultArtifact,
 				historicalPolicy: reviewed.policySha256, receipt })),
-			operationAttestations: reviewed.operationAttestations,
+			operationAttestations: [
+				...reviewed.operationAttestations,
+				...newUnknownRefs.map(operationRef => ({ operationRef,
+					sourceCommit: facts.source.commit,
+					evidenceSha256: sha256(JSON.stringify({ source: facts.source,
+						resultArtifact: facts.resultArtifact, receipt, operationRef })) })),
+			],
 			effectClass: "confined-ephemeral-local", unknownBillingHeld: true,
 			actorThirdPartyMutations: "none", hostTransport: "immutable-versioned-archive" };
 	}
@@ -763,3 +815,16 @@ export function reviewPrivateCampaignRestartEffects(input: PrivateCampaignEffect
 		unknownBillingHeld: true, actorThirdPartyMutations: "none",
 		hostTransport: "immutable-versioned-archive" };
 }
+
+/** Production admission only accepts the live verifier's private proof brand. */
+export function reviewPrivateCampaignRestartEffects(input: PrivateCampaignEffectReviewInput): ReviewedRestartEffectPolicy {
+	return reviewPrivateCampaignRestartEffectsCore(input);
+}
+
+/** Pure classifier hook for synthetic, offline policy tests; never used by admission. */
+export const offlineRestartPolicyChecks = {
+	reviewWithHostEffect(input: PrivateCampaignEffectReviewInput,
+		evidence: AuthenticatedHostEffectEvidence): ReviewedRestartEffectPolicy {
+		return reviewPrivateCampaignRestartEffectsCore(input, evidence);
+	},
+};

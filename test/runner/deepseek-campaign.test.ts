@@ -774,19 +774,22 @@ test("real Pi transports one offline request with its runtime key, confined tool
 				context_window: 1_048_576 }] }), { status: 200 }) });
 		const calls: Array<{ endpoint: string; authorization: string | null; tools: number; cap: number }> = [];
 		const fakeFetch: typeof fetch = async (input, init) => {
+			const endpoint = input instanceof Request ? input.url : String(input);
+			if (endpoint !== "https://api.deepseek.com/chat/completions") {
+				unrelatedFetches++;
+				throw new Error("unexpected network route");
+			}
 			const headers = new Headers(input instanceof Request ? input.headers : undefined);
 			new Headers(init?.headers).forEach((value, name) => headers.set(name, value));
 			const payload = typeof init?.body === "string" ? JSON.parse(init.body) as { tools?: unknown[]; max_tokens?: number } : {};
-			calls.push({ endpoint: input instanceof Request ? input.url : String(input),
+			calls.push({ endpoint,
 				authorization: headers.get("authorization"), tools: payload.tools?.length ?? 0,
 				cap: payload.max_tokens ?? 0 });
 			return new Response(JSON.stringify({ error: { message: "offline synthetic rejection",
 				type: "invalid_request_error" } }),
 				{ status: 401, headers: { "content-type": "application/json" } });
 		};
-		const originalStream = runtime.streamSimple.bind(runtime);
-		runtime.streamSimple = ((model, context, options) => originalStream(model, context,
-			{ ...options, fetch: fakeFetch })) as typeof runtime.streamSimple;
+		globalThis.fetch = fakeFetch;
 		const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxCny: 0.000001, priorCommittedCny: 100,
 			maxOutputTokens: 1, providerOutputLimit: provider });
 		const tools = await createConfinedCampaignFileTools(work, { writableFiles: ["candidate.cpp"] });
@@ -800,6 +803,13 @@ test("real Pi transports one offline request with its runtime key, confined tool
 			provider.maxOutputTokens);
 		assert.equal(budget.requestAccountingAuditSnapshot().requests[0].status, "unknown");
 		assert.equal(budget.requestAccountingAuditSnapshot().unpricedRequestCount, 1);
+		const diagnostics = handle.transportDiagnostics?.() ?? [];
+		assert.equal(diagnostics.length, 1);
+		assert.equal(diagnostics[0].httpStatus, 401);
+		assert.equal(diagnostics[0].responseStarted, true);
+		assert.equal(diagnostics[0].bytesRead, Buffer.byteLength(JSON.stringify({ error: {
+			message: "offline synthetic rejection", type: "invalid_request_error" } })));
+		assert.doesNotMatch(JSON.stringify(diagnostics), /SYNTHETIC-OFFLINE|offline synthetic rejection|chat\/completions/);
 	} finally {
 		handle?.dispose();
 		globalThis.fetch = originalFetch;

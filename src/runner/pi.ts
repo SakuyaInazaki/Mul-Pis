@@ -22,12 +22,84 @@ import { parseModelSpec } from "../config.ts";
 import { HarnessError } from "../types.ts";
 import { writeFileAtomic } from "../workspace.ts";
 import { TelemetryWriter } from "../dashboard/telemetry.ts";
-import type { AssistantTurn, CustomToolSpec, ForkRequest, ForkWorkspaceBindingV1, ReadReturnEvent, RunnerCapabilities, SessionCheckpoint, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, TranscriptMessage, UsageEvent } from "./types.ts";
+import type { AssistantTurn, CustomToolSpec, ForkRequest, ForkWorkspaceBindingV1, ReadReturnEvent, RunnerCapabilities, SessionCheckpoint, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, TranscriptMessage, TransportFailureDiagnostic, UsageEvent } from "./types.ts";
 import { summarizeUsage, usageEventsFromEntries } from "./usage.ts";
 import { sampleRunnerResources, sessionClosed, sessionOpened } from "./resource.ts";
 import { DeepSeekCampaignBudget, type PromptLease } from "./deepseek-campaign.ts";
 import { getConfinedCampaignFileGrantDescriptor } from "./confined-campaign-files.ts";
 import type { HostEffectScope } from "./operation-disposition.ts";
+
+/** Capture only host-observable transport facts. Never retain an Error or response body. */
+class TransportProbe {
+	private phase: TransportFailureDiagnostic["phase"] = "unknown";
+	private httpStatus: number | null = null;
+	private responseStarted: boolean | null = null;
+	private bytesRead: number | null = null;
+	private errorCodes: string[] = [];
+
+	readonly fetch: typeof globalThis.fetch;
+
+	constructor(fetchImplementation: typeof globalThis.fetch = globalThis.fetch) {
+		this.fetch = async (input, init) => {
+			this.phase = "request";
+			this.responseStarted = false;
+			try {
+				const response = await fetchImplementation(input, init);
+				this.responseStarted = true;
+				this.httpStatus = response.status;
+				this.bytesRead = 0;
+				this.phase = "response-body";
+				if (!response.body) return response;
+				const reader = response.body.getReader();
+				const counted = new ReadableStream<Uint8Array>({
+					pull: async (controller) => {
+						try {
+							const { done, value } = await reader.read();
+							if (done) controller.close();
+							else { this.bytesRead = (this.bytesRead ?? 0) + value.byteLength; controller.enqueue(value); }
+						} catch (error) { this.captureErrorCodes(error); controller.error(error); }
+					},
+					cancel: (reason) => reader.cancel(reason),
+				});
+				const wrapped = new Response(counted, { status: response.status, statusText: response.statusText, headers: response.headers });
+				// Fetch responses carry read-only metadata outside ResponseInit. Preserve it for SDK compatibility.
+				for (const key of ["url", "redirected", "type"] as const) Object.defineProperty(wrapped, key, { value: response[key] });
+				return wrapped;
+			} catch (error) {
+				this.captureErrorCodes(error);
+				throw error;
+			}
+		};
+	}
+
+	observeResponse(status: number): void {
+		if (Number.isInteger(status) && status >= 100 && status <= 599) this.httpStatus = status;
+		this.responseStarted = true;
+		if (this.phase === "unknown" || this.phase === "request") this.phase = "provider-stream";
+	}
+
+	captureErrorCodes(error: unknown): void {
+		const seen = new Set<unknown>();
+		let current: unknown = error;
+		while (current && typeof current === "object" && !seen.has(current)) {
+			seen.add(current);
+			const fields = current as { code?: unknown; cause?: unknown };
+			if (typeof fields.code === "string" && SAFE_ERROR_CODES.has(fields.code) && !this.errorCodes.includes(fields.code)) this.errorCodes.push(fields.code);
+			current = fields.cause;
+		}
+	}
+
+	failure(promptIndex: number, abortSource: TransportFailureDiagnostic["abortSource"], requestId?: string): TransportFailureDiagnostic {
+		return { version: 1, promptIndex, ...(requestId ? { requestId } : {}), phase: this.phase,
+			httpStatus: this.httpStatus, responseStarted: this.responseStarted, bytesRead: this.bytesRead,
+			abortSource, errorCodes: [...this.errorCodes] };
+	}
+}
+
+const SAFE_ERROR_CODES = new Set([
+	"ECONNRESET", "ECONNREFUSED", "ECONNABORTED", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EPIPE",
+	"UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "UND_ERR_RESPONSE", "UND_ERR_ABORTED",
+]);
 
 const SCRATCH_PREFIX = ".pi-session-";
 const EMPTY_AGENT_DIR = ".empty-agent-dir";
@@ -354,7 +426,7 @@ function transcriptOf(messages: readonly unknown[]): TranscriptMessage[] {
 	return transcript;
 }
 
-function turnResult(messages: readonly unknown[], label: string, usage: AssistantTurn["usage"]): AssistantTurn {
+function turnResult(messages: readonly unknown[], label: string, usage: AssistantTurn["usage"], redactProviderError = false): AssistantTurn {
 	const assistants = messages.filter(
 		(message): message is {
 			role: "assistant";
@@ -366,7 +438,7 @@ function turnResult(messages: readonly unknown[], label: string, usage: Assistan
 	const last = assistants.at(-1);
 	if (!last) throw new HarnessError("runner.stop", `session ${label} produced no assistant message`);
 	if (last.stopReason !== "stop") {
-		const detail = last.errorMessage ? `: ${last.errorMessage}` : "";
+		const detail = !redactProviderError && last.errorMessage ? `: ${last.errorMessage}` : "";
 		throw new HarnessError(
 			"runner.stop",
 			`session ${label} did not stop normally (stopReason=${last.stopReason ?? "missing"})${detail}`,
@@ -742,6 +814,10 @@ export class PiSessionRunner implements SessionRunner {
 		let certifiedLocalStop: HarnessError | undefined;
 		let certifiedNotIssued: HarnessError | undefined;
 		let certifiedEffectScope: HostEffectScope | undefined;
+		const transportDiagnostics: TransportFailureDiagnostic[] = [];
+		const signal = this.options.signal;
+		let abortedByHandle = false;
+		let promptIndex = 0;
 		const requestRuntime = new Proxy(resolved.modelRuntime, {
 			get(target, property) {
 				if (property !== "streamSimple") {
@@ -763,6 +839,14 @@ export class PiSessionRunner implements SessionRunner {
 				const lease = currentLease;
 					const requestIds = currentRequestIds;
 					let requestId: string | undefined;
+					const probe = campaign ? new TransportProbe(options?.fetch ?? globalThis.fetch) : undefined;
+					let failureRecorded = false;
+					const recordFailure = (): void => {
+						if (!probe || failureRecorded) return;
+						failureRecorded = true;
+						const abortSource = abortedByHandle ? "handle" : signal?.aborted ? "host-signal" : options?.signal?.aborted ? "sdk-signal" : null;
+						transportDiagnostics.push(probe.failure(promptIndex, abortSource, requestId));
+					};
 					strictStreamCalls++;
 					campaign?.assertResolved(model);
 					if (model.provider !== resolved.model.provider || model.id !== resolved.model.id ||
@@ -770,6 +854,11 @@ export class PiSessionRunner implements SessionRunner {
 						throw new HarnessError("runner.model", "strict request changed model");
 					const inner = target.streamSimple(model, context, {
 						...options, maxRetries: 0, maxTokens: model.maxTokens,
+						...(probe ? { fetch: probe.fetch,
+							onResponse: async (response: Parameters<NonNullable<NonNullable<Parameters<ModelRuntime["streamSimple"]>[2]>["onResponse"]>>[0], responseModel: typeof model) => {
+								probe.observeResponse(response.status);
+								await options?.onResponse?.(response, responseModel);
+							} } : {}),
 						onPayload: async (payload, payloadModel) => {
 							strictPayloadChecks++;
 							campaign?.assertResolved(payloadModel);
@@ -820,10 +909,12 @@ export class PiSessionRunner implements SessionRunner {
 					let latest: AssistantMessage = { role: "assistant", content: [], api: model.api, provider: model.provider,
 						model: model.id, usage: emptyUsage, stopReason: "error", timestamp: Date.now() };
 					const failStream = (error: unknown): void => {
+						probe?.captureErrorCodes(error);
+						recordFailure();
 						certifiedLocalStop ??= campaign.certifySettledLocalBudgetStop(lease, certifiedEffectScope);
 						certifiedNotIssued ??= campaign.certifyLocalNotIssued(lease, certifiedEffectScope);
 						campaign.failPrompt(lease);
-						outer.push({ type: "error", reason: "error", error: { ...latest, stopReason: "error", errorMessage: error instanceof Error ? error.message : String(error) } });
+						outer.push({ type: "error", reason: "error", error: { ...latest, stopReason: "error", errorMessage: "provider stream failed" } });
 						outer.end();
 					};
 					void (async () => {
@@ -849,6 +940,7 @@ export class PiSessionRunner implements SessionRunner {
 								else campaign.settleReported(lease, requestId, report);
 							}
 							if (event.type === "error") { terminal = true; latest = event.error;
+								recordFailure();
 								certifiedLocalStop ??= campaign.certifySettledLocalBudgetStop(lease, certifiedEffectScope);
 								certifiedNotIssued ??= campaign.certifyLocalNotIssued(lease, certifiedEffectScope);
 								campaign.failPrompt(lease); }
@@ -941,7 +1033,7 @@ export class PiSessionRunner implements SessionRunner {
 				if (error.code === "ENOENT") return [];
 				throw error;
 			});
-		let promptIndex = usageRows.length;
+		promptIndex = usageRows.length;
 		if (!persistSpec && checkpointState.completed) {
 			let lastLedger: { sessionId?: string; outcome?: string; events?: Array<{ entryId?: string }> } | undefined;
 			try { lastLedger = usageRows.length ? JSON.parse(usageRows.at(-1)!) : undefined; } catch { /* malformed ledger cannot prove completion */ }
@@ -958,9 +1050,7 @@ export class PiSessionRunner implements SessionRunner {
 				telemetry = started;
 			} catch { await started?.end().catch(() => undefined); }
 		}
-		const signal = this.options.signal;
 		let disposed = false;
-		let abortedByHandle = false;
 		let promptActive = false;
 		let telemetryQueue = Promise.resolve();
 		const queueTelemetry = (operation: () => Promise<void>): Promise<void> => {
@@ -1026,7 +1116,7 @@ export class PiSessionRunner implements SessionRunner {
 						throw new HarnessError("runner.stop", `session ${spec.label} was aborted during prompt${detail}`);
 					}
 					collectUsage();
-					const result = turnResult(promptMessages, spec.label, summarizeUsage(promptEvents));
+					const result = turnResult(promptMessages, spec.label, summarizeUsage(promptEvents), Boolean(campaign));
 					if (campaign && currentLease) {
 						const assistants = promptEvents.filter((event) => event.kind === "assistant");
 						if (assistants.length !== currentRequestIds.length) throw new HarnessError("runner.campaign", "provider request and assistant usage counts differ");
@@ -1050,7 +1140,10 @@ export class PiSessionRunner implements SessionRunner {
 						throw new HarnessError("runner.stop", `session ${spec.label} was aborted during prompt${detail}`);
 					}
 					if (signal?.aborted || abortedByHandle) promptOutcome = "aborted";
-					throw localStop ?? localNotIssued ?? lengthStop ?? error;
+					if (localStop || localNotIssued || lengthStop) throw localStop ?? localNotIssued ?? lengthStop;
+					if (campaign && transportDiagnostics.some((item) => item.promptIndex === thisPrompt))
+						throw new HarnessError("runner.stop", `session ${spec.label} provider request failed (redacted transport diagnostics available)`);
+					throw error;
 				} finally {
 				try {
 					collectUsage();
@@ -1090,6 +1183,7 @@ export class PiSessionRunner implements SessionRunner {
 			readReturnEvents: () => [...materialTools.readReturns],
 			usageEvents: () => [...usageEvents],
 			usageSummary: () => summarizeUsage(usageEvents),
+			transportDiagnostics: () => transportDiagnostics.map((item) => ({ ...item, errorCodes: [...item.errorCodes] })),
 			toolLog: () => [...toolLog],
 			abort: async () => {
 				if (disposed || abortedByHandle) return;

@@ -1,0 +1,7 @@
+# Unknown transport and confined actor effects
+
+- A model transport can end without a received provider response while the research session has only factory-confined file tools. The HTTP outcome and fee remain unknown; the controller operation must remain recorded as unknown and must not be replayed.
+- Independent fresh research may be admitted only after the previous Actions run is terminal, its encrypted carry and complete host session/task/tool census are authenticated, every request is linked to an allowed session, the older selected tuple is freshly validated, and every new unknown operation is exactly quarantined. A failed local candidate is unselected development evidence, not a scientific result.
+- A received response with unavailable currency is a financial observation gap, not by itself an unknown actor effect. Conversely, a response that never arrived cannot be relabeled settled. Prior and current unknown fee holds remain in cumulative accounting.
+- Later private results record only structured host-observed transport diagnostics: status or error code when actually available, response/body progress, and abort origin. Missing information remains explicit. Raw prompts, responses, credentials, URLs, and provider error bodies are excluded.
+- This is an offline code-and-synthetic-test change. No real model call, publication, request replay, or historical ledger rewrite is part of this batch.

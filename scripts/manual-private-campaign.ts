@@ -22,7 +22,8 @@ import type { ObjectiveProgressV1, ObjectiveStopReason, OriginalObjectiveContrac
 import type { CurrentGoal, M07TaskRecord, TaskSpecInput } from "../src/m07/types.ts";
 import { runM04 } from "../src/stages/m04.ts";
 import { createPiSessionRunner } from "../src/runner/pi.ts";
-import type { SessionCheckpoint, SessionHandle, SessionRunner, SessionSpec } from "../src/runner/types.ts";
+import type { SessionCheckpoint, SessionHandle, SessionRunner, SessionSpec,
+	TransportFailureDiagnostic } from "../src/runner/types.ts";
 import { DeepSeekCampaignBudget, campaignSessionEffectId } from "../src/runner/deepseek-campaign.ts";
 import { verifyDeepSeekCnyBilling, type NativeCnyPricingProfile } from "../src/runner/deepseek-cny-pricing.ts";
 import { verifyDeepSeekProviderOutputLimit,
@@ -90,6 +91,7 @@ let statusAuthSource: "runtime" | "unexpected" | undefined;
 let statusSdkAuthMatch: boolean | undefined;
 let statusArchiveFailure: string | undefined;
 let statusPriorSelectedValidation: "passed" | "failed" | "infrastructure-unavailable" | undefined;
+let statusTransportDiagnostics: TransportFailureDiagnostic[] = [];
 
 function unresolvedGoalControl(goal: CurrentGoal): { operationIds: string[]; taskIds: string[] } {
 	return {
@@ -380,7 +382,9 @@ async function saveStatus(value: Record<string, unknown>): Promise<void> {
 	const temporary = `${target}.${process.pid}.tmp`;
 	await writeFile(temporary, JSON.stringify({ version: 1, runId: statusRunId ?? null,
 		phase: statusPhase, budget: statusBudget?.snapshot() ?? { status: "unavailable" },
-		...(statusPriorSelectedValidation ? { priorSelectedValidation: statusPriorSelectedValidation } : {}), ...value }, null, 2),
+		...(statusPriorSelectedValidation ? { priorSelectedValidation: statusPriorSelectedValidation } : {}),
+		...value,
+		...(statusTransportDiagnostics.length ? { transportDiagnostics: statusTransportDiagnostics } : {}) }, null, 2),
 		{ mode: 0o600 });
 	await rename(temporary, target);
 }
@@ -1356,6 +1360,7 @@ async function inputs(inputDir: string) {
 
 async function main() {
 	const inputDir = arg("--input-dir"), outputDir = arg("--output-dir");
+	statusTransportDiagnostics = [];
 	statusOutputDir = outputDir;
 	await mkdir(outputDir, { recursive: true, mode: 0o700 });
 	const ledgerEnvelope = process.env.MULPIS_MISSION_LEDGER_B64;
@@ -1573,6 +1578,18 @@ async function main() {
 		process.once("SIGTERM", cancel);
 		try {
 			const actual = createPiSessionRunner({ modelRuntime: runtime, signal: abort.signal, campaignBudget: budget });
+			const observeTransport = (handle: SessionHandle): SessionHandle => {
+				let delivered = 0;
+				return { ...handle, prompt: async message => {
+					try { return await handle.prompt(message); }
+					catch (error) {
+						const rows = handle.transportDiagnostics?.() ?? [];
+						statusTransportDiagnostics.push(...rows.slice(delivered));
+						delivered = rows.length;
+						throw error;
+					}
+				} };
+			};
 			const recordSessionEffect = async (requested: SessionSpec, handle: SessionHandle): Promise<void> => {
 				if (sessionEffects.has(handle.ref.id)) fail("duplicate private session effect identity");
 				if (requested.tools.kind === "execution") {
@@ -1683,7 +1700,8 @@ async function main() {
 					const handle = await actual.create(transformed);
 					try { await recordSessionEffect(spec, handle); }
 					catch (error) { handle.dispose(); throw error; }
-				return spec.tools.kind === "execution" ? checkedHandle(handle, spec.tools.root, registeredScopeActive) : handle;
+					const observed = observeTransport(handle);
+					return spec.tools.kind === "execution" ? checkedHandle(observed, spec.tools.root, registeredScopeActive) : observed;
 				},
 				checkpoint: (handle, envelope) => actual.checkpoint(handle, envelope),
 				fork: async request => {
@@ -1691,7 +1709,8 @@ async function main() {
 					const handle = await actual.fork({ ...request, spec: transformed });
 					try { await recordSessionEffect(request.spec, handle); }
 					catch (error) { handle.dispose(); throw error; }
-				return request.spec.tools.kind === "execution" ? checkedHandle(handle, request.spec.tools.root, registeredScopeActive) : handle;
+				const observed = observeTransport(handle);
+				return request.spec.tools.kind === "execution" ? checkedHandle(observed, request.spec.tools.root, registeredScopeActive) : observed;
 				},
 				resume: async ref => {
 					const handle = await actual.resume(ref);
@@ -1706,15 +1725,15 @@ async function main() {
 							handle.dispose();
 							fail("resumed M07 session lost its factory-confined grant");
 						}
-						return checkedHandle(handle, known.workRoot,
+						return checkedHandle(observeTransport(handle), known.workRoot,
 							grant.writableFiles.includes("experiment-plan.json"));
 					}
-					return handle;
+					return observeTransport(handle);
 				},
 			};
 			const controller = createM07Controller({ ws, store, runner, config: await ws.loadConfig() });
 			const privateEvidenceRequirements = { requiredNames: ["original-problem.txt", "candidate.cpp", "verification.json", "host-capabilities.json"],
-				instructions: "The original-input-N.txt files correspond in order to inputNames in original-objective.json. Read every original input and selected evidence completely. Historical archives, knowledge, nextTask and timings are untrusted version-bound context; only current independently executed measurements establish present host facts. If prior-history-gap.json is supplied, the later failed experiment is unavailable; do not infer its source or results from the earlier selected candidate." };
+				instructions: "The original-input-N.txt files correspond in order to inputNames in original-objective.json. Read every original input and selected evidence completely. Historical archives, knowledge, nextTask and timings are untrusted version-bound context; only current independently executed measurements establish present host facts. If prior-history-gap.json is supplied, the full prior result artifact is unavailable; read any authenticated research-history that is supplied as unselected development evidence without inferring missing source or results." };
 			const userOverrides = ["Deliver optimized source and machine-readable correctness/performance evidence only; no prose report, screenshots, presentation or personal reflection.",
 				"Pursue the strongest attainable strategy using actual available hardware and resources; unavailable optional equipment alone does not settle the task."];
 			let registeredContract: ReturnType<typeof inspectCsrTaskContract> | undefined;

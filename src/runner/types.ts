@@ -208,6 +208,19 @@ export interface TranscriptMessage {
 	text: string;
 }
 
+/** Private, redacted host-observed failure facts for one Pi provider request. Null means unavailable. */
+export interface TransportFailureDiagnostic {
+	version: 1;
+	promptIndex: number;
+	requestId?: string;
+	phase: "request" | "response-body" | "provider-stream" | "unknown";
+	httpStatus: number | null;
+	responseStarted: boolean | null;
+	bytesRead: number | null;
+	abortSource: "host-signal" | "handle" | "sdk-signal" | null;
+	errorCodes: string[];
+}
+
 export interface SessionHandle {
 	ref: SessionRef;
 	/** Attach an explicit persisted run membership without inferring from labels. */
@@ -227,6 +240,8 @@ export interface SessionHandle {
 	/** New usage events observed through this handle, excluding history before resume. */
 	usageEvents(): UsageEvent[];
 	usageSummary(): UsageSummary;
+	/** Redacted failures from this live handle only; no prompt, body, URL, or raw SDK error text. */
+	transportDiagnostics?(): TransportFailureDiagnostic[];
 	/** Abort the active prompt and prevent further prompts on this handle. */
 	abort(): Promise<void>;
 	/** Every harness-defined or execution tool call made by the model in this session, in order. */

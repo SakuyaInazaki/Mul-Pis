@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 import type { AuthenticatedRestartCarryFacts } from "../src/m07/independent-restart.ts";
 import { PRIOR_REVIEWED_POLICY_SHA256, reviewOneTimeLegacyV3Effects,
-	reviewPrivateCampaignRestartEffects } from
+	reviewPrivateCampaignRestartEffects, offlineRestartPolicyChecks } from
 	"../src/runner/private-campaign-restart-policy.ts";
 
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -253,6 +253,85 @@ function oneTimeLegacyV3Fixture() {
 			reservations, bindings) };
 }
 
+function unknownTransportFixture() {
+	const f = oneTimeLegacyV3Fixture();
+	const priorSource = { ...f.facts.source };
+	const priorPolicy = f.check();
+	const selected = ["candidate.cpp", "verification.json", "workflow-archive.json"];
+	f.bundle["candidate.cpp"] = "historically selected source";
+	f.bundle["verification.json"] = "historically selected verification";
+	const selectedTupleSha256 = hash(JSON.stringify(selected.slice().sort().map(name => ({ name,
+		sha256: hash(f.bundle[name]), bytes: Buffer.byteLength(f.bundle[name], "utf8") }))));
+	const priorEnvelope = hash("one-time source envelope");
+	const newGoalId = "fresh-transport-goal";
+	const fifthReceipt = { version: 1, kind: "host-independent-goal-quarantine",
+		prior: { source: priorSource, envelopeSha256: priorEnvelope,
+			contractId: "original-contract", reviewedPolicyId: priorPolicy.policyId,
+			reviewedPolicySha256: priorPolicy.policySha256, selectedTupleSha256,
+			unknownHeldNano: f.origin.historicalUnknownHeldNano,
+			committedNano: f.origin.historicalCommittedNano },
+		quarantine: { operationRefs: [oldRef, newRef], operationOutcome: "unknown",
+			selectedFromFailedAttempt: false,
+			historicalGoalOutcomes: f.checkpoint.boundedRuns.map(row => ({ runId: row.runId,
+				outcome: row.outcome })) },
+		freshWorkspace: { workspaceId: "fresh-unknown-workspace", restartNonce: "fresh-nonce" } };
+	f.facts.source = { runId: "synthetic-transport-job", runAttempt: 1, commit: "a".repeat(40) };
+	f.facts.committedNano = f.origin.historicalCommittedNano;
+	f.facts.unknownHeldNano = f.origin.historicalUnknownHeldNano;
+	const fifthClaim = { claimId: "fifth-claim", currentJobId: "fifth-job",
+		priorEnvelopeSha256: priorEnvelope, currentRunId: f.facts.source.runId,
+		currentRunAttempt: 1, currentCommit: f.facts.source.commit };
+	const fifthBinding = { version: 1, kind: "host-independent-goal-binding",
+		quarantineReceiptSha256: hash(JSON.stringify(fifthReceipt)),
+		freshWorkspace: fifthReceipt.freshWorkspace, goalRunId: newGoalId };
+	const reservationChain = JSON.parse(f.bundle["independent-restart-quarantine.json"]);
+	reservationChain.entries.push({ receipt: fifthReceipt, claim: fifthClaim });
+	f.bundle["independent-restart-quarantine.json"] = JSON.stringify(reservationChain);
+	const bindingChain = JSON.parse(f.bundle["independent-restart-goal-binding.json"]);
+	bindingChain.entries.push(fifthBinding);
+	f.bundle["independent-restart-goal-binding.json"] = JSON.stringify(bindingChain);
+	const checkpoint = { ...f.checkpoint, objectiveOutcome: "incomplete", selectedArtifacts: selected,
+		boundedRuns: [...f.checkpoint.boundedRuns,
+			{ runId: newGoalId, outcome: "active", selectedTaskId: null,
+				acceptedTaskIds: [], unresolvedOperationIds: ["O001"] }] };
+	f.bundle["objective-checkpoint.json"] = JSON.stringify(checkpoint);
+	const archive = { version: 1, kind: "m07-private-candidate-archive",
+		goalRunId: newGoalId, taskId: "T001", goalOutcome: "active", taskStatus: "failed",
+		m04: { state: "not-run" }, controllerEvidence: { reviewStatus: "unreviewed",
+			operationOutcomes: [{ operationId: "O001", status: "unknown" }] } };
+	const history = JSON.parse(f.bundle["research-history.json"]);
+	history.entries.push({ goalRunId: newGoalId, taskId: "T001",
+		files: { "workflow-archive.json": JSON.stringify(archive) } });
+	f.bundle["research-history.json"] = JSON.stringify(history);
+	const sessionId = hash("synthetic-confined-session");
+	const rows = Array.from({ length: 17 }, (_, index) => ({ requestId: `synthetic-transport-${index}`,
+		sessionId, responseReceived: index < 16, status: index < 16 ? "settled" : "unknown",
+		settledCny: index < 16 ? 0.001 : null,
+		unknownObservedCny: index < 16 ? null : 0.25 }));
+	const receipt = { version: 1, kind: "m07-host-effect-census", source: f.facts.source,
+		priorEnvelopeSha256: hash("prior-carry"),
+		historicalGoalRunIds: f.checkpoint.boundedRuns.map(row => row.runId),
+		goals: [{ runId: newGoalId, outcome: "active",
+			tasks: [{ taskId: "T001", mode: "execute", status: "failed", sessionId }],
+			operations: [{ id: "O001", taskId: "T001", status: "unknown" }] }],
+		sessions: [{ sessionId, kind: "confined-execution", goalRunId: newGoalId,
+			taskId: "T001", workRoot: "/tmp/synthetic/fresh-task",
+			grant: { version: 1, kind: "confined-campaign-files",
+				root: "/tmp/synthetic/fresh-task",
+				writableFiles: ["candidate.cpp", "lesson-delta.json"] } }],
+		requestIds: rows.map(row => row.requestId) };
+	f.input.operationRefs = [oldRef, newRef, `${newGoalId}/O001`];
+	const evidence: any = { origin: f.origin, receipt,
+		requestAudit: { version: 3, kind: "accounting-only-request-audit",
+			requests: rows, settledCny: 0.016, unknownObservedCny: 0.25,
+			unpricedRequestCount: 0 },
+		reviewedEffectAncestry: [{ source: priorSource, envelopeSha256: priorEnvelope,
+			privateBundleSha256: hash("prior bundle"), reviewedPolicySha256: priorPolicy.policySha256,
+			selectedTupleSha256, historicalOriginEnvelopeSha256: f.origin.envelopeSha256 }] };
+	return { ...f, receipt, archive, checkpoint, history, evidence,
+		check: () => offlineRestartPolicyChecks.reviewWithHostEffect(f.input, evidence) };
+}
+
 test("one-time reviewed v3 source preserves old quarantine and rejects two new tasks", () => {
 	const f = oneTimeLegacyV3Fixture();
 	const result = f.check();
@@ -298,6 +377,33 @@ test("unbranded host-effect JSON does not authorize an unknown restart source", 
 	f.bundle["host-effect-receipt.json"] = JSON.stringify({ version: 1,
 		kind: "m07-host-effect-census", source: f.facts.source });
 	assert.throws(() => reviewPrivateCampaignRestartEffects(f.input), /outside reviewed scope/);
+});
+
+test("one unknown transport attests confined actor effects while preserving all three unknown operations", () => {
+	const f = unknownTransportFixture();
+	const result = f.check();
+	assert.deepEqual(result.operationAttestations.map(row => row.operationRef),
+		[oldRef, newRef, "fresh-transport-goal/O001"]);
+	assert.equal(result.unknownBillingHeld, true);
+	assert.equal(result.actorThirdPartyMutations, "none");
+	assert.equal(f.evidence.requestAudit.requests.filter((row: any) => row.responseReceived === false).length, 1);
+});
+
+test("unknown transport policy rejects changed selection, missing failed archive, or unquarantined operation", () => {
+	const changed = unknownTransportFixture();
+	changed.bundle["candidate.cpp"] = "different selected source";
+	assert.throws(changed.check, /changed the prior selected tuple/);
+	const missing = unknownTransportFixture();
+	const history = JSON.parse(missing.bundle["research-history.json"]);
+	history.entries.pop();
+	missing.bundle["research-history.json"] = JSON.stringify(history);
+	assert.throws(missing.check, /does not cover every new execute task archive/);
+	const unquarantined = unknownTransportFixture();
+	unquarantined.input.operationRefs.pop();
+	assert.throws(unquarantined.check, /do not partition historical quarantine/);
+	const unconfined = unknownTransportFixture();
+	unconfined.evidence.receipt.sessions[0].kind = "read-dir";
+	assert.throws(unconfined.check, /failed, confined, unselected task archive/);
 });
 
 test("reviewed current source plus ancestor-bound quarantine cover exactly old and new unknowns", () => {
