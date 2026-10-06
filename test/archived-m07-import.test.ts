@@ -4,7 +4,8 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
-import { stageArchivedM07Import, validateArchivedM07Import } from "../src/runner/archived-m07-import.ts";
+import { historicalM04EvidenceIndex, stageArchivedM07Import,
+	validateArchivedM07Import } from "../src/runner/archived-m07-import.ts";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { createM07Controller } from "../src/m07/controller.ts";
 import { assessAndAdvanceOriginalObjective, writeOriginalObjectiveContract,
@@ -172,6 +173,55 @@ test("registered historical plan stages exact bytes and missing declared plan is
 		/experiment-plan.json missing or invalid/);
 });
 
+test("authenticated completed provenance M04 is indexed as historical evidence without store activation", async t => {
+	const bundle = bundleForImport();
+	const checkpoint = JSON.parse(bundle["objective-checkpoint.json"]!);
+	checkpoint.boundedRuns.push({ runId: "NEW-IMPORT", outcome: "fulfilled",
+		acceptedTaskIds: ["T001"], unresolvedOperationIds: [] });
+	bundle["objective-checkpoint.json"] = JSON.stringify(checkpoint);
+	const history = JSON.parse(bundle["research-history.json"]!);
+	const originalArchive = JSON.parse(history.entries[0].files["workflow-archive.json"]);
+	const published = { version: 1, kind: "m04-published-knowledge-export",
+		m04RunId: "M04-NEW", storeId: "synthetic-store", records: [{ synthetic: true }] };
+	const completedArchive = { ...originalArchive, goalRunId: "NEW-IMPORT",
+		transportLayout: { kind: "prefixed-flat-index", prefix: "provenance-import",
+			defaultArchiveLoaderCompatible: false },
+		m04: { state: "completed", runId: "M04-NEW", proposalSubmitted: true,
+			snapshotCreated: true, knowledgeExport: { state: "complete",
+				file: "provenance-import-m04-adopted-knowledge.json", recordCount: 1 } } };
+	history.entries.push({ originalContractId: contractId, goalRunId: "NEW-IMPORT", taskId: "T001",
+		files: { "workflow-archive.json": JSON.stringify(completedArchive),
+			"m04-adopted-knowledge.json": JSON.stringify(published) } });
+	bundle["research-history.json"] = JSON.stringify(history);
+	const f = await authenticatedFixture(t, bundle);
+	const index = historicalM04EvidenceIndex({ proof: f.proof, bundle: f.bundle });
+	assert.equal(index?.sourceGoalRunId, "NEW-IMPORT");
+	assert.equal(index?.sourceTaskId, "T001");
+	assert.equal(index?.m04.runId, "M04-NEW");
+	assert.equal(index?.m04.recordCount, 1);
+	assert.equal(index?.historyLocation.entryIndex, 1);
+	assert.equal(index?.historyLocation.knowledgeExportFileKey, "m04-adopted-knowledge.json");
+	assert.equal(index?.interpretation, "historical-published-evidence-only-not-live-adopted-knowledge");
+	assert.equal(JSON.stringify(index).includes("synthetic-store"), false,
+		"index must not expose or auto-import archived record contents");
+	const absent = structuredClone(bundle);
+	const absentHistory = JSON.parse(absent["research-history.json"]!);
+	delete absentHistory.entries[1].files["m04-adopted-knowledge.json"];
+	absent["research-history.json"] = JSON.stringify(absentHistory);
+	const missing = await authenticatedFixture(t, absent);
+	assert.throws(() => historicalM04EvidenceIndex({ proof: missing.proof, bundle: missing.bundle }),
+		/historical M04 knowledge export missing/);
+	const mismatch = structuredClone(bundle);
+	const mismatchHistory = JSON.parse(mismatch["research-history.json"]!);
+	const badExport = JSON.parse(mismatchHistory.entries[1].files["m04-adopted-knowledge.json"]);
+	badExport.m04RunId = "OTHER-M04";
+	mismatchHistory.entries[1].files["m04-adopted-knowledge.json"] = JSON.stringify(badExport);
+	mismatch["research-history.json"] = JSON.stringify(mismatchHistory);
+	const wrong = await authenticatedFixture(t, mismatch);
+	assert.throws(() => historicalM04EvidenceIndex({ proof: wrong.proof, bundle: wrong.bundle }),
+		/historical M04 knowledge export and archive disagree/);
+});
+
 test("archive import fails closed for forgery, changed bytes, wrong binding, unsafe state and missing source", async t => {
 	const f = await authenticatedFixture(t, bundleForImport());
 	const call = (bundle: PrivateContinuationBundle = f.bundle, proof: unknown = f.proof) =>
@@ -306,6 +356,28 @@ test("import retry targets only newest failed-M04 accepted run; completion or pa
 		"a newer partial goal returns scientific next-step choice to the model assessor");
 });
 
+test("one-use restart binder binds first fresh goal and reuses its ownership for later same-run goals", async () => {
+	const ids: string[] = [];
+	const binder = offlineChecks.createOneUseRestartGoalBinder(async goalRunId => {
+		ids.push(goalRunId);
+		return { binding: { goalRunId }, syntheticReceipt: "one-use" };
+	});
+	const first = await binder("fresh-import-goal");
+	const later = await binder("second-scientific-goal");
+	assert.equal(first.newlyBound, true);
+	assert.equal(later.newlyBound, false);
+	assert.equal(later.firstBinding, first.firstBinding,
+		"later goal reuses the actual first-goal binding object, not a new receipt");
+	assert.deepEqual(ids, ["fresh-import-goal"]);
+	const withoutImport: string[] = [];
+	const ordinaryFirst = offlineChecks.createOneUseRestartGoalBinder(async goalRunId => {
+		withoutImport.push(goalRunId);
+		return { binding: { goalRunId } };
+	});
+	assert.equal((await ordinaryFirst("first-ordinary-goal")).newlyBound, true);
+	assert.deepEqual(withoutImport, ["first-ordinary-goal"]);
+});
+
 test("frozen archived source gets fresh M07 review, full-read M04 and continued original-objective assessment", async t => {
 	const f = await authenticatedFixture(t, bundleForImport());
 	const descriptor = validateArchivedM07Import({ proof: f.proof, bundle: f.bundle,
@@ -378,6 +450,13 @@ test("frozen archived source gets fresh M07 review, full-read M04 and continued 
 		constraints: ["Exact source copy only", "No historical lesson adoption"],
 		successCriteria: checks, plan: "One exact-copy task, current host check, M04 adjudication",
 		exploratory: true });
+	const restartBindCalls: string[] = [];
+	const bindFirstGoal = offlineChecks.createOneUseRestartGoalBinder(async goalRunId => {
+		restartBindCalls.push(goalRunId);
+		return { binding: { goalRunId }, syntheticReceipt: "one-use" };
+	});
+	const initialBinding = await bindFirstGoal(goal.runId);
+	assert.equal(initialBinding.newlyBound, true);
 	const task = await controller.delegate(goal.runId, { mode: "execute",
 		objective: "Read inputs/001-candidate.cpp and copy its bytes to candidate.cpp; no optimization.",
 		inputs: [staged.candidatePath, staged.verificationPath, staged.provenancePath],
@@ -472,6 +551,7 @@ test("frozen archived source gets fresh M07 review, full-read M04 and continued 
 				objective: "Plan next independent scientific step", addresses: ["original-task"],
 				adapterScope: "registered-csr-experiment" } }), readReturns };
 	});
+	let secondGoalId: string | undefined;
 	const next = await assessAndAdvanceOriginalObjective({ contract, contractFile,
 		runner: objectiveRunner, runRecord: objectiveRecord, persistReceipt: () => ws.writeRun(objectiveRecord),
 		sessionSpec: { label: "synthetic-original-objective", role: "research", model: "fake/research",
@@ -479,11 +559,29 @@ test("frozen archived source gets fresh M07 review, full-read M04 and continued 
 		evidenceRoot: path.join(f.directory, "objective-evidence"), evidence: objectiveEvidence,
 		assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
 		supportedTaskScopes: ["registered-csr-experiment"],
-		advance: async () => { nextStageScheduled = true; } });
+		advance: async proposal => {
+			nextStageScheduled = true;
+			const secondGoal = await controller.begin({ goal: proposal.objective,
+				problemRelation: "Fresh model-proposed next step under unchanged original objective",
+				constraints: ["No automatic mission source replacement"], successCriteria: checks,
+				plan: "Execute separately after provenance M04", exploratory: true });
+			secondGoalId = secondGoal.runId;
+			const reused = await bindFirstGoal(secondGoal.runId);
+			assert.equal(reused.newlyBound, false);
+			assert.equal(reused.firstBinding, initialBinding.firstBinding);
+			const nextTask = await controller.delegate(secondGoal.runId, { mode: "execute",
+				objective: "Execute the next model-proposed bounded task as an independent goal",
+				inputs: [staged.candidatePath, staged.verificationPath, staged.provenancePath],
+				expectedOutputs: ["candidate.cpp", "lesson-delta.json"],
+				lessonDeltaOutput: "lesson-delta.json", checks });
+			assert.equal(nextTask.status, "returned", nextTask.executionFailure ?? "second task did not execute");
+		} });
 	assert.equal(next.assessment?.decision, "continue");
 	assert.equal(nextStageScheduled, true,
 		"completed import M04 must hand back to the original-objective continuation");
-	assert.equal(executionCalls, 1, "recovery stage has no optimization restart or fork");
+	assert.ok(secondGoalId && secondGoalId !== goal.runId);
+	assert.deepEqual(restartBindCalls, [goal.runId], "same-run second goal does not consume one-use reservation again");
+	assert.equal(executionCalls, 2, "one provenance execution and one separately planned next-stage execution");
 });
 
 test("import M04 effect disposition only continues on known safe failure or completed stage", () => {

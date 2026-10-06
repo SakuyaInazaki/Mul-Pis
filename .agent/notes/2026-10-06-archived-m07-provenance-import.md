@@ -6,4 +6,8 @@ The importer checks the exact original contract, bounded-run and task identity, 
 
 A fresh M07 provenance goal must reproduce the imported source and plan byte-for-byte, pass current host verification, and receive an ordinary controller review. M04 then reads the new frozen review evidence in a fresh session and alone decides whether any knowledge operation is warranted. The prior canonical mission source and archive remain selected until a separate supported comparison changes that decision. The unchanged original-objective assessment continues after this missing-evidence stage.
 
+Where a prior unresolved-operation quarantine is required, its one-use receipt binds the first fresh M07 goal in the live workspace. Later goals in that same run retain the first goal's verified binding ownership rather than attempting to bind the one-use reservation again. The historical unknowns remain held and auditable.
+
+A completed M04 from an archived provenance goal is indexed with control facts and its exact authenticated history location before the next original-objective assessment. The index identifies historical published evidence only; it never activates archived knowledge in the current store. A missing or mismatched claimed export stops this indexing rather than silently treating its records as live knowledge.
+
 Offline synthetic tests cover authenticated import, rejected or mismatched inputs, fresh controller review, M04 evidence reading, and preservation of the canonical selected tuple. No private task text, model credential, provider fee, or confidential source is included here.

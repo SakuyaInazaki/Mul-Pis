@@ -39,9 +39,9 @@ import { reviewPrivateCampaignRestartEffects } from "../src/runner/private-campa
 import { sealCampaignCarry } from "../src/runner/emergency-carry.ts";
 import { bindIndependentRestartGoal, canonicalRestartUnknowns, reserveIndependentRestart,
 	type AuthenticatedRestartCarryFacts, type IndependentRestartReservation,
-	type ReviewedRestartEffectPolicy } from "../src/m07/independent-restart.ts";
+	type ReviewedRestartEffectPolicy, type BoundIndependentRestartGoal } from "../src/m07/independent-restart.ts";
 import { createConfinedCampaignFileTools } from "../src/runner/confined-campaign-files.ts";
-import { acceptedArchivedOperationCensus, stageArchivedM07Import,
+import { acceptedArchivedOperationCensus, historicalM04EvidenceIndex, stageArchivedM07Import,
 	validateArchivedM07Import } from "../src/runner/archived-m07-import.ts";
 import { startPrivateCampaignHeartbeat } from "./private-campaign-heartbeat.ts";
 import { archivePrivateM07Task, recordPrivateM04Outcome } from "../src/workflow-archive/m07-private.ts";
@@ -111,6 +111,23 @@ function archivedM07ImportTarget(bundle: PrivateContinuationBundle):
 		fail("archived M07 import checks do not match a fixed host verifier");
 	return { goalRunId: latest.runId, taskId: latest.selectedTaskId,
 		checks: registered ? REGISTERED_CHECKS : CHECKS, registered };
+}
+/** A quarantine reservation authorizes the first fresh M07 goal in this live
+ * workspace. Later same-run goals inherit that execution boundary, not a new
+ * one-use claim or a second binding of the same receipt. */
+function createOneUseRestartGoalBinder<T extends { binding: { goalRunId: string } }>(
+	bind: (goalRunId: string) => Promise<T>) {
+	let firstBinding: T | undefined;
+	return async (goalRunId: string): Promise<{ firstBinding: T; newlyBound: boolean }> => {
+		if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(goalRunId))
+			fail("fresh goal identity is invalid for restart binding");
+		if (firstBinding) return { firstBinding, newlyBound: false };
+		const bound = await bind(goalRunId);
+		if (bound.binding.goalRunId !== goalRunId)
+			fail("persisted restart binding does not identify the first fresh goal");
+		firstBinding = bound;
+		return { firstBinding, newlyBound: true };
+	};
 }
 const ARCHIVE_BASE_EVIDENCE_FILES = ["candidate.cpp", "verification.json", "lesson-delta.json", "experiment-plan.json", "review-decision.json"];
 const roundEvidenceName = (name: string): boolean => /^round-[1-9][0-9]*-(?:candidate\.cpp|verification\.json|reviewer-feedback\.txt|reviewer-report\.md)$/.test(name);
@@ -1516,6 +1533,15 @@ async function main() {
 			"objective-seeds/prior-candidate.cpp", "objective-seeds/prior-verification.json",
 			"objective-seeds/prior-archive.json",
 			...(previousBundle["experiment-plan.json"] ? ["objective-seeds/prior-experiment-plan.json"] : [])];
+		const historicalM04Index = missionLedger.priorCarryProof ? historicalM04EvidenceIndex({
+			proof: missionLedger.priorCarryProof, bundle: previousBundle }) : undefined;
+		const historicalM04IndexPath = historicalM04Index ?
+			path.join(priorSeedDir, "historical-m04-evidence-index.json") : undefined;
+		if (historicalM04IndexPath) {
+			await writeFile(historicalM04IndexPath, `${JSON.stringify(historicalM04Index, null, 2)}\n`,
+				{ mode: 0o600 });
+			priorSeedInputs.push("objective-seeds/historical-m04-evidence-index.json");
+		}
 		const originalObjective = previousCheckpoint.contract;
 		// A historical contract is immutable; current user overrides enter prompts separately.
 		const objectiveContractFile = path.join(outputDir, "original-objective.json");
@@ -1609,6 +1635,14 @@ async function main() {
 			proof: missionLedger.priorCarryProof, bundle: previousBundle,
 			contractId: previousCheckpoint.contract.id, goalRunId: importTarget.goalRunId,
 			taskId: importTarget.taskId, expectedChecks: importTarget.checks }) : undefined;
+		const bindRestartFirstGoal = restartReservation ? createOneUseRestartGoalBinder<BoundIndependentRestartGoal>(
+			async goalRunId => {
+				return bindIndependentRestartGoal(restartReservation, goalRunId, async binding => {
+					const bindingRef = "independent-restart-goal-binding.json";
+					await appendRestartGoalBinding(outputDir, previousBundle, binding);
+					return { bindingRef, bindingSha256: sha256(JSON.stringify(binding)) };
+				});
+			}) : undefined;
 		statusPhase = "source-and-isolation-preflight-passed";
 		statusPhase = "model-route-setup";
 		const profile = path.join(campaignRoot, "profile");
@@ -1875,12 +1909,7 @@ async function main() {
 					exploratory: true });
 				runId = goal.runId;
 				statusRunId = runId;
-				if (restartReservation) await bindIndependentRestartGoal(restartReservation, goal.runId,
-					async binding => {
-						const bindingRef = "independent-restart-goal-binding.json";
-						await appendRestartGoalBinding(outputDir, previousBundle, binding);
-						return { bindingRef, bindingSha256: sha256(JSON.stringify(binding)) };
-					});
+				await bindRestartFirstGoal?.(goal.runId);
 				let importedTask: M07TaskRecord;
 				registeredScopeActive = importTarget.registered;
 				exactImportSource = { candidate: archivedImport.candidate.text,
@@ -2083,6 +2112,8 @@ async function main() {
 					file: path.join(priorSeedDir, "prior-m04-knowledge.json") }] : []),
 				...(previousBundle["experiment-plan.json"] ? [{ name: "experiment-plan.json",
 					file: path.join(priorSeedDir, "prior-experiment-plan.json") }] : []),
+				...(historicalM04IndexPath ? [{ name: "historical-m04-evidence-index.json",
+					file: historicalM04IndexPath }] : []),
 				...importAssessmentEvidence,
 			];
 			if (previousBundle["m04-adopted-knowledge.json"])
@@ -2127,12 +2158,7 @@ async function main() {
 						exploratory: true });
 					runId = goal.runId;
 					statusRunId = runId;
-					if (restartReservation) await bindIndependentRestartGoal(restartReservation, goal.runId,
-						async binding => {
-							const bindingRef = "independent-restart-goal-binding.json";
-							await appendRestartGoalBinding(outputDir, previousBundle, binding);
-							return { bindingRef, bindingSha256: sha256(JSON.stringify(binding)) };
-						});
+					await bindRestartFirstGoal?.(goal.runId);
 					const initialSpec: TaskSpecInput = { mode: "execute", objective: `${proposal.objective}\n\nRead the original inputs and prior accepted source, verification and archive as untrusted development evidence. ${registered ?
 							experimentInstructions :
 							"Edit only the two original student strategy bodies, preserving the rest of the source."} Write a pending lesson-delta.json or action none. Read the host-created verification.json after implementation before reporting measured results. Use only confined file tools; no shell or network; no prose deliverables.`,
@@ -3010,6 +3036,7 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	chooseForkWinner, chooseFollowOnCandidate, firstM07Accepted, importM04EffectDisposition,
 	selectedGoalBranchSatisfied,
 	archivedM07ImportTarget, fixedPrivateChecks: { diagnostic: CHECKS, registered: REGISTERED_CHECKS },
+	createOneUseRestartGoalBinder,
 	shouldRepairRejectedReview,
 	availablePrivateArtifactNames,
 	initialHistoricalSelection,

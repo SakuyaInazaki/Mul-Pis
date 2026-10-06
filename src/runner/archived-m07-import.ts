@@ -27,6 +27,19 @@ export interface ArchivedM07ImportV1 {
 	readonly plan?: Readonly<{ text: string; bytes: number }>;
 }
 
+export interface HistoricalM04EvidenceIndexV1 {
+	version: 1;
+	kind: "historical-provenance-m04-evidence-index";
+	originalContractId: string;
+	sourceGoalRunId: string;
+	sourceTaskId: string;
+	m04: { runId: string; status: "completed"; proposalSubmitted: boolean;
+		snapshotCreated: boolean; exportState: "complete" | "none"; recordCount?: number };
+	historyLocation: { entryIndex: number; archiveFileKey: "workflow-archive.json";
+		knowledgeExportFileKey?: "m04-adopted-knowledge.json" };
+	interpretation: "historical-published-evidence-only-not-live-adopted-knowledge";
+}
+
 type Input = { proof: unknown; bundle: PrivateContinuationBundle; contractId: string;
 	goalRunId: string; taskId: string; expectedChecks: readonly string[] };
 
@@ -73,6 +86,80 @@ function requireFile(archive: Record<string, unknown>, files: Record<string, unk
 	const found = exactText(files[name], name);
 	if (found.bytes !== entry.bytes) return reject(`${name} differs from archived byte identity`);
 	return found;
+}
+
+/** Metadata-only pointer into the exact authenticated history. It never loads
+ * archived knowledge into the current store or claims a new scientific review. */
+export function historicalM04EvidenceIndex(input: { proof: unknown;
+	bundle: PrivateContinuationBundle }): HistoricalM04EvidenceIndexV1 | undefined {
+	if (!authenticatedPriorCarryBindsBundle(input.proof, input.bundle))
+		return reject("live authenticated carry binding is required for historical M04 index");
+	if (input.bundle["research-history.json"] === undefined) return undefined;
+	const checkpoint = parseJson(input.bundle["objective-checkpoint.json"], "objective checkpoint");
+	const history = parseJson(input.bundle["research-history.json"], "research history");
+	if (checkpoint.version !== 1 || checkpoint.kind !== "original-objective-progress" ||
+		!object(checkpoint.contract) || typeof checkpoint.contract.id !== "string" ||
+		!Array.isArray(checkpoint.boundedRuns) || history.version !== 1 ||
+		history.kind !== "untrusted-version-bound-research-history" || !Array.isArray(history.entries))
+		return reject("historical M04 index contract, checkpoint, or history invalid");
+	for (let runIndex = checkpoint.boundedRuns.length - 1; runIndex >= 0; runIndex--) {
+		const run = checkpoint.boundedRuns[runIndex];
+		if (!object(run) || run.outcome !== "fulfilled" || typeof run.runId !== "string") continue;
+		const entries = history.entries.map((entry, index) => ({ entry, index })).filter(({ entry }) =>
+			object(entry) && entry.goalRunId === run.runId && /^T\d{3,}$/.test(String(entry.taskId)));
+		for (const { entry: raw, index } of entries) {
+			const entry = raw as Record<string, unknown>;
+			if (!object(entry.files) || typeof entry.files["workflow-archive.json"] !== "string") continue;
+			const archive = parseJson(entry.files["workflow-archive.json"], "provenance workflow archive");
+			if (!object(archive.transportLayout) || archive.transportLayout.kind !== "prefixed-flat-index" ||
+				archive.transportLayout.prefix !== "provenance-import") continue;
+			if (entry.originalContractId !== checkpoint.contract.id || archive.goalRunId !== run.runId ||
+				archive.taskId !== entry.taskId || archive.goalOutcome !== "fulfilled" ||
+				archive.taskStatus !== "accepted" || !object(archive.controllerEvidence) ||
+				archive.controllerEvidence.reviewStatus !== "accepted" ||
+				!(run.selectedTaskId === entry.taskId || Array.isArray(run.acceptedTaskIds) &&
+					run.acceptedTaskIds.includes(entry.taskId)) ||
+					!Array.isArray(run.unresolvedOperationIds ?? []) ||
+					(run.unresolvedOperationIds as unknown[] | undefined)?.length)
+				return reject("historical provenance goal and bounded run do not bind");
+			if (!object(archive.m04) || archive.m04.state !== "completed") continue;
+			if (typeof archive.m04.runId !== "string" || !archive.m04.runId ||
+				typeof archive.m04.proposalSubmitted !== "boolean" ||
+				typeof archive.m04.snapshotCreated !== "boolean" ||
+				!object(archive.m04.knowledgeExport))
+				return reject("completed historical M04 control outcome is incomplete");
+			const exportState = archive.m04.knowledgeExport.state;
+			if (exportState !== "complete" && exportState !== "none")
+				return reject("completed historical M04 export state is incomplete or invalid");
+			let recordCount: number | undefined;
+			let knowledgeExportFileKey: "m04-adopted-knowledge.json" | undefined;
+			if (exportState === "complete") {
+				if (archive.m04.knowledgeExport.file !== "provenance-import-m04-adopted-knowledge.json" ||
+					!Number.isSafeInteger(archive.m04.knowledgeExport.recordCount) ||
+					Number(archive.m04.knowledgeExport.recordCount) < 0)
+					return reject("historical M04 export declaration does not bind");
+				const payload = parseJson(entry.files["m04-adopted-knowledge.json"],
+					"historical M04 knowledge export");
+				if (payload.version !== 1 || payload.kind !== "m04-published-knowledge-export" ||
+					payload.m04RunId !== archive.m04.runId || !Array.isArray(payload.records) ||
+					payload.records.length !== archive.m04.knowledgeExport.recordCount)
+					return reject("historical M04 knowledge export and archive disagree");
+				recordCount = payload.records.length;
+				knowledgeExportFileKey = "m04-adopted-knowledge.json";
+			} else if (entry.files["m04-adopted-knowledge.json"] !== undefined)
+				return reject("undeclared historical M04 knowledge export supplied");
+			return { version: 1, kind: "historical-provenance-m04-evidence-index",
+				originalContractId: checkpoint.contract.id, sourceGoalRunId: run.runId,
+				sourceTaskId: entry.taskId as string, m04: { runId: archive.m04.runId,
+					status: "completed", proposalSubmitted: archive.m04.proposalSubmitted,
+					snapshotCreated: archive.m04.snapshotCreated, exportState,
+					...(recordCount !== undefined ? { recordCount } : {}) },
+				historyLocation: { entryIndex: index, archiveFileKey: "workflow-archive.json",
+					...(knowledgeExportFileKey ? { knowledgeExportFileKey } : {}) },
+				interpretation: "historical-published-evidence-only-not-live-adopted-knowledge" };
+		}
+	}
+	return undefined;
 }
 
 /** Pure validation: no filesystem mutation, model call, or scientific adoption. */
