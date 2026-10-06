@@ -33,9 +33,10 @@ import { MISSION_ID, MISSION_REPOSITORY, PRIVATE_CONTINUATION_FILE_KEYS } from
 import { CARRY_FILE_NAME, authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence,
 	authenticatedLegacyV3RunReview,
 	authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, downloadCarryArtifact,
-	isAuthenticatedPriorCarryProof, openLedgerContinuation,
+	isAuthenticatedPriorCarryProof, openLedgerContinuation, reviewKnownOpaqueGapSource,
 	type PrivateContinuationBundle, type HostEffectReceiptV1 } from "../src/runner/ledger-continuation.ts";
 import { reviewPrivateCampaignRestartEffects } from "../src/runner/private-campaign-restart-policy.ts";
+import { sealCampaignCarry } from "../src/runner/emergency-carry.ts";
 import { bindIndependentRestartGoal, canonicalRestartUnknowns, reserveIndependentRestart,
 	type AuthenticatedRestartCarryFacts, type IndependentRestartReservation,
 	type ReviewedRestartEffectPolicy } from "../src/m07/independent-restart.ts";
@@ -1373,6 +1374,7 @@ async function main() {
 	const missionLedger = await openLedgerContinuation({ seedEnvelopeB64: ledgerEnvelope,
 		publicKeyFile: path.join(HERE, "campaign-output-public.pem"), githubToken,
 		loadCarryArtifact: ({ artifactId }) => downloadCarryArtifact({ githubToken: githubToken ?? "", artifactId }),
+		reviewOpaqueGapSource: facts => reviewKnownOpaqueGapSource(facts, githubToken ?? ""),
 		current: { repository: process.env.GITHUB_REPOSITORY, runId: process.env.GITHUB_RUN_ID,
 			runAttempt: process.env.GITHUB_RUN_ATTEMPT, actor: process.env.GITHUB_ACTOR,
 			event: process.env.GITHUB_EVENT_NAME, ref: process.env.GITHUB_REF,
@@ -2655,14 +2657,33 @@ async function main() {
 			const requestAudit = finalBudget?.requestAccountingAuditSnapshot() ?? {
 				version: 3 as const, kind: "accounting-only-request-audit" as const,
 				requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
+			// Preserve the host's actual request observations in the RSA-encrypted
+			// outcome even if a later carry invariant refuses to seal. A missing
+			// carry must never turn an executed run into an apparent free skip.
+			const statusFile = path.join(outputDir, "campaign-status.json");
+			let savedStatus: Record<string, unknown> = {};
+			try {
+				if (existsSync(statusFile)) savedStatus = JSON.parse(await readFile(statusFile, "utf8")) as Record<string, unknown>;
+				if (!savedStatus || typeof savedStatus !== "object" || Array.isArray(savedStatus)) savedStatus = {};
+			} catch { savedStatus = {}; }
+			try { await saveStatus({ ...savedStatus, accountingAudit: requestAudit,
+				unquantifiedExecutedRunCount: missionLedger.opaqueExecutedRuns.length }); }
+			catch { statusArchiveFailure = "accounting-audit-status-write-failed"; process.exitCode = 1; }
 			let privateBundle = missionLedger.priorPrivateBundle;
 			try { privateBundle = await collectContinuationBundle(outputDir, missionLedger.priorPrivateBundle); }
 			catch { statusArchiveFailure = "research-continuation-collection-failed-prior-retained"; process.exitCode = 1; }
-			const carry = missionLedger.sealCurrent({ settledCny: requestAudit.settledCny,
+			const sealed = sealCampaignCarry(missionLedger, { settledCny: requestAudit.settledCny,
 				unknownObservedCny: requestAudit.unknownObservedCny,
 				unpricedRequestCount: requestAudit.unpricedRequestCount,
 				requestAudit, ...(privateBundle ? { privateBundle } : {}) });
-			await writeFile(path.join(outputDir, CARRY_FILE_NAME), `${JSON.stringify({ envelopeB64: carry.envelopeB64 })}\n`, { mode: 0o600 });
+			const carry = sealed.carry;
+			// Once an envelope has been sealed, an I/O retry must use these same
+			// ciphertext bytes; a second seal would create an ambiguous checkpoint.
+			const carryFile = path.join(outputDir, CARRY_FILE_NAME);
+			const temporaryCarry = `${carryFile}.${process.pid}.tmp`;
+			await writeFile(temporaryCarry, `${JSON.stringify({ envelopeB64: carry.envelopeB64 })}\n`,
+				{ mode: 0o600, flag: "wx" });
+			await rename(temporaryCarry, carryFile);
 			await writeFile(path.join(outputDir, "mission-ledger-out.json"), `${JSON.stringify({
 				version: 3, kind: "mul-pis-private-mission-ledger-observation", missionId: MISSION_ID,
 				repository: MISSION_REPOSITORY, accountingMode: "observed-only",
@@ -2671,9 +2692,33 @@ async function main() {
 				observedSettledCny: carry.observedSettledCny,
 				observedUnknownHeldCny: carry.observedUnknownHeldCny,
 				unpricedRequestCount: carry.unpricedRequestCount,
-				status: "sealed-encrypted-continuation",
+				unquantifiedExecutedRunCount: missionLedger.opaqueExecutedRuns.length,
+				status: sealed.mode === "normal" ? "sealed-encrypted-continuation" :
+					"sealed-emergency-effects-unreviewed",
 			}, null, 2)}\n`, { mode: 0o600 });
-		} catch { statusArchiveFailure = "mission-ledger-continuation-write-failed"; process.exitCode = 1; }
+			if (sealed.mode === "emergency-effects-unreviewed") {
+				statusArchiveFailure = "normal-continuation-seal-failed-emergency-preserved";
+				await saveStatus({ ...savedStatus, accountingAudit: requestAudit,
+					unquantifiedExecutedRunCount: missionLedger.opaqueExecutedRuns.length,
+					outcome: "incomplete",
+					archiveFailure: statusArchiveFailure,
+					continuationMode: "sealed-emergency-effects-unreviewed",
+					independentValidation: "not-complete" });
+				process.exitCode = 1;
+			}
+		} catch (error) {
+			statusArchiveFailure = "mission-ledger-continuation-write-failed";
+			const diagnostic = privateExceptionDiagnostic(error, statusRuntimeKey);
+			try {
+				const statusFile = path.join(outputDir, "campaign-status.json");
+				const savedStatus = existsSync(statusFile) ?
+					JSON.parse(await readFile(statusFile, "utf8")) as Record<string, unknown> : {};
+				await saveStatus({ ...savedStatus, outcome: "incomplete", archiveFailure: statusArchiveFailure,
+					continuationDiagnostic: diagnostic.message,
+					continuationDiagnosticCategory: diagnostic.category });
+			} catch { /* Encrypted outcome may contain only the earlier status. */ }
+			process.exitCode = 1;
+		}
 
 	}
 }

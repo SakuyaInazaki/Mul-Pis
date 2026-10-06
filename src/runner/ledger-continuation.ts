@@ -1,7 +1,10 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { inflateRawSync } from "node:zlib";
 import { HarnessError } from "../types.ts";
+import { canonicalRestartUnknowns } from "../m07/independent-restart.ts";
+import { objectiveProgress, type ObjectiveProgressV1 } from "../m07/objective-progress.ts";
 import type { CampaignAdmissionRejection, CampaignRequestAudit } from "./deepseek-campaign.ts";
+import { campaignSessionEffectId } from "./deepseek-campaign.ts";
 import { isNativeCnyPricingRecord, type NativeCnyPricingProfile } from "./deepseek-cny-pricing.ts";
 import { isDeepSeekProviderOutputLimitRecord, type DeepSeekProviderOutputLimit } from "./deepseek-provider-limits.ts";
 import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY,
@@ -34,10 +37,54 @@ type Run = { id?: number; run_number?: number; run_attempt?: number; workflow_id
 	actor?: { login?: string }; head_commit?: { message?: string } };
 type Job = { id?: number; run_id?: number; run_attempt?: number; head_sha?: string;
 	name?: string; status?: string; conclusion?: string;
-	steps?: Array<{ name?: string; status?: string; conclusion?: string }> };
+	steps?: Array<{ number?: number; name?: string; status?: string; conclusion?: string }> };
 type Artifact = { id?: number; name?: string; expired?: boolean; digest?: string;
 	workflow_run?: { id?: number; head_sha?: string } };
 type Source = { runId: string; runAttempt: number; runNumber: number; commit: string };
+export type OpaqueExecutedRunGap = Readonly<{
+	version: 1; kind: "opaque-executed-run-gap"; source: Readonly<Source>;
+	priorCarryEnvelopeSha256: string; carryArtifact: "absent";
+	accounting: "unquantified"; effects: "unreviewed" | "quarantined-source-reviewed";
+	terminal: AuthenticatedPriorCarryProof["terminal"];
+	resultArtifact: NonNullable<AuthenticatedPriorCarryProof["resultArtifact"]>;
+}>;
+export type AuthenticatedOpaqueGapSourceReview = Readonly<{
+	version: 1; kind: "authenticated-opaque-gap-source-review";
+	source: Readonly<Source>; resultArchiveSha256: string;
+	priorCarryEnvelopeSha256: string;
+}>;
+const authenticatedOpaqueGapSourceReviews = new WeakSet<object>();
+const authenticatedReviewedOpaqueGaps = new WeakMap<object, readonly OpaqueExecutedRunGap[]>();
+/** The underlying carry still belongs to its actual source. Gap effects have
+ * their own receipt and cannot be treated as measured research or a paid invoice. */
+export function authenticatedReviewedOpaqueRunGaps(proof: unknown,
+	bundle: unknown): readonly OpaqueExecutedRunGap[] | undefined {
+	if (!isAuthenticatedPriorCarryProof(proof) ||
+		!authenticatedPriorCarryBindsBundle(proof, bundle)) return undefined;
+	return authenticatedReviewedOpaqueGaps.get(proof);
+}
+/** Test-only brand. Production review must independently audit the exact
+ * immutable Actions source before it mints this authority. */
+export function authenticateOpaqueGapSourceForOfflineTests(source: Readonly<Source>,
+	resultArchiveSha256: string, priorCarryEnvelopeSha256: string): AuthenticatedOpaqueGapSourceReview {
+	if (!process.env.NODE_TEST_CONTEXT || !/^[0-9a-f]{64}$/.test(resultArchiveSha256) ||
+		!/^[0-9a-f]{64}$/.test(priorCarryEnvelopeSha256))
+		reject("opaque gap source review fixture is test-only");
+	const review = Object.freeze({ version: 1 as const,
+		kind: "authenticated-opaque-gap-source-review" as const,
+		source: Object.freeze({ ...source }), resultArchiveSha256, priorCarryEnvelopeSha256 });
+	authenticatedOpaqueGapSourceReviews.add(review);
+	return review;
+}
+function bindsOpaqueGapSourceReview(review: unknown, source: Source,
+	resultArtifact: NonNullable<AuthenticatedPriorCarryProof["resultArtifact"]>,
+	priorCarryEnvelopeSha256: string): boolean {
+	return Boolean(review) && typeof review === "object" &&
+		authenticatedOpaqueGapSourceReviews.has(review as object) &&
+		JSON.stringify((review as AuthenticatedOpaqueGapSourceReview).source) === JSON.stringify(source) &&
+		(review as AuthenticatedOpaqueGapSourceReview).resultArchiveSha256 === resultArtifact.archiveSha256 &&
+		(review as AuthenticatedOpaqueGapSourceReview).priorCarryEnvelopeSha256 === priorCarryEnvelopeSha256;
+}
 /** Host-only admission evidence. Terminal execution is not usage reconciliation,
  * and this read-only proof is not an atomic durable restart claim.
  */
@@ -192,6 +239,8 @@ export type AccountingCarrySealInput = { settledCny: number; unknownObservedCny:
 	privateBundle?: PrivateContinuationBundle; bootstrapBinding?: BootstrapBinding };
 export type LedgerContinuation = {
 	mode: "accounting-only";
+	/** A paid, terminal Actions run lacked its encrypted carry. Known totals exclude it. */
+	opaqueExecutedRuns: readonly OpaqueExecutedRunGap[];
 	priorCommittedCny?: number; priorUnknownHeldCny?: number;
 	priorSettledCny?: number; priorUnknownObservedCny?: number; priorUnpricedRequestCount?: number;
 	historicalCommittedCny?: number; historicalUnknownHeldCny?: number;
@@ -200,6 +249,9 @@ export type LedgerContinuation = {
 	priorPrivateBundle?: PrivateContinuationBundle; priorBootstrapBinding?: BootstrapBinding;
 	sealCurrent: (input: AccountingCarrySealInput) => { envelopeB64: string; observedSettledCny: number;
 			observedUnknownHeldCny: number; unpricedRequestCount: number };
+	sealEmergencyCurrent: (input: AccountingCarrySealInput, reason: "effect-review-incomplete") =>
+		{ envelopeB64: string; observedSettledCny: number; observedUnknownHeldCny: number;
+			unpricedRequestCount: number };
 };
 const historicalFixtureSealers = new WeakMap<LedgerContinuation,
 	(input: LegacyCarrySealInput) => { envelopeB64: string; carryForwardCny: number }>();
@@ -218,6 +270,9 @@ type AccountingCheckpoint = {
 	settledAddedNano: number; unknownObservedAddedNano: number; unpricedAddedCount: number;
 	requestAudit: AccountingOnlyRequestAuditSnapshot;
 	legacyAncestry: AncestorReceipt[]; ancestry: AccountingAncestorReceipt[];
+	opaqueExecutedRuns?: OpaqueExecutedRunGap[];
+	currentEffectReview?: "pending";
+	pendingEffectAncestry?: Source[];
 	/** Previously reviewed nonzero v3 runs, in accounting-source order. */
 	reviewedEffectAncestry?: ReviewedEffectAncestorReceipt[];
 	historical: { committedNano: number; unknownHeldNano: number; legacyParentDigest: string };
@@ -544,6 +599,9 @@ function readCheckpoint(envelopeB64: string, key: Buffer, seedDigest: string, ex
 			"settledNano", "unknownObservedNano", "unpricedRequestCount", "settledAddedNano",
 			"unknownObservedAddedNano", "unpricedAddedCount", "requestAudit", "ancestry",
 			"legacyAncestry", "historical",
+			...(parsed.opaqueExecutedRuns === undefined ? [] : ["opaqueExecutedRuns"]),
+			...(parsed.currentEffectReview === undefined ? [] : ["currentEffectReview"]),
+			...(parsed.pendingEffectAncestry === undefined ? [] : ["pendingEffectAncestry"]),
 			...(parsed.reviewedEffectAncestry === undefined ? [] : ["reviewedEffectAncestry"]),
 			...(parsed.carryForwardOrigin === undefined ? [] : ["carryForwardOrigin"]),
 			...(parsed.privateBundle === undefined ? [] : ["privateBundle"]),
@@ -560,7 +618,10 @@ function readCheckpoint(envelopeB64: string, key: Buffer, seedDigest: string, ex
 		cp.parentDigest !== parentDigest ||
 		(cp.version !== 1 && !Array.isArray(cp.ancestry)) ||
 		(cp.version === 3 && (!Array.isArray(cp.legacyAncestry) || !record(cp.historical) ||
-			(cp.reviewedEffectAncestry !== undefined && !Array.isArray(cp.reviewedEffectAncestry)))) ||
+			(cp.reviewedEffectAncestry !== undefined && !Array.isArray(cp.reviewedEffectAncestry)) ||
+			(cp.opaqueExecutedRuns !== undefined && !Array.isArray(cp.opaqueExecutedRuns)) ||
+			(cp.currentEffectReview !== undefined && cp.currentEffectReview !== "pending") ||
+			(cp.pendingEffectAncestry !== undefined && !Array.isArray(cp.pendingEffectAncestry)))) ||
 		(cp.version === 3 && cp.carryForwardOrigin !== undefined &&
 			(!record(cp.carryForwardOrigin) || !exactKeys(cp.carryForwardOrigin,
 				["source", "envelopeSha256", "historicalCommittedNano", "historicalUnknownHeldNano",
@@ -603,6 +664,41 @@ function accountingAncestorReceipt(cp: AccountingCheckpoint, envelopeDigest: str
 		unknownObservedAddedNano: cp.unknownObservedAddedNano, unpricedAddedCount: cp.unpricedAddedCount,
 		requestAudit: cp.requestAudit,
 		...(cp.bootstrapBinding ? { bootstrapBinding: cp.bootstrapBinding } : {}) };
+}
+function validOpaqueGap(value: unknown): value is OpaqueExecutedRunGap {
+	if (!record(value) || !exactKeys(value, ["version", "kind", "source",
+		"priorCarryEnvelopeSha256", "carryArtifact", "accounting", "effects",
+		"terminal", "resultArtifact"]) || value.version !== 1 ||
+		value.kind !== "opaque-executed-run-gap" || value.carryArtifact !== "absent" ||
+		value.accounting !== "unquantified" ||
+		!["unreviewed", "quarantined-source-reviewed"].includes(String(value.effects)) ||
+		!record(value.source) || !exactKeys(value.source, ["runId", "runAttempt", "runNumber", "commit"]) ||
+		!positiveId(value.source.runId) || !Number.isSafeInteger(value.source.runAttempt) ||
+		Number(value.source.runAttempt) < 1 || !Number.isSafeInteger(value.source.runNumber) ||
+		Number(value.source.runNumber) < 1 || typeof value.source.commit !== "string" ||
+		!/^[0-9a-f]{40}$/.test(value.source.commit) ||
+		typeof value.priorCarryEnvelopeSha256 !== "string" ||
+		!/^[0-9a-f]{64}$/.test(value.priorCarryEnvelopeSha256) ||
+		!record(value.terminal) || !exactKeys(value.terminal, ["workflowId", "runStatus",
+			"runConclusion", "jobId", "jobName", "jobStatus", "jobConclusion",
+			"jobRunId", "jobRunAttempt", "jobHeadSha", "providerStepStatus",
+			"providerStepConclusion"]) ||
+		value.terminal.runStatus !== "completed" || value.terminal.jobStatus !== "completed" ||
+		value.terminal.jobName !== "private-campaign" ||
+		value.terminal.providerStepStatus !== "completed" ||
+		value.terminal.jobRunId !== value.source.runId ||
+		value.terminal.jobRunAttempt !== value.source.runAttempt ||
+		value.terminal.jobHeadSha !== value.source.commit ||
+		!record(value.resultArtifact) || !exactKeys(value.resultArtifact, ["repository",
+			"artifactId", "artifactName", "runId", "archiveSha256", "digestScope"]) ||
+		value.resultArtifact.repository !== MISSION_REPOSITORY ||
+		value.resultArtifact.artifactName !== MISSION_ARTIFACT ||
+		value.resultArtifact.runId !== value.source.runId ||
+		!positiveId(value.resultArtifact.artifactId) ||
+		value.resultArtifact.digestScope !== "github-artifact-archive" ||
+		typeof value.resultArtifact.archiveSha256 !== "string" ||
+		!/^[0-9a-f]{64}$/.test(value.resultArtifact.archiveSha256)) return false;
+	return true;
 }
 function hasNoV3ProviderActivity(cp: Pick<AccountingCheckpoint, "settledAddedNano" |
 	"unknownObservedAddedNano" | "unpricedAddedCount" | "requestAudit">): boolean {
@@ -862,6 +958,82 @@ function hostEffectReceipt(cp: AccountingCheckpoint,
 		!usedSessions.has(session.sessionId as string))) return undefined;
 	return receipt as HostEffectReceiptV1;
 }
+/** A research-only assessor may consume received provider responses without
+ * creating an M07 goal. Its model grant is read-only and its unbound restart
+ * claim remains spent. The assessment changes research state, not old effects.
+ */
+function assessmentOnlyNoGoal(cp: AccountingCheckpoint, receipt: HostEffectReceiptV1 | undefined,
+	previousBundle?: PrivateContinuationBundle): boolean {
+	if (!receipt || receipt.goals.length !== 0 || cp.requestAudit.requests.length === 0 ||
+		receipt.sessions.some(session => session.kind !== "none" && session.kind !== "read-dir") ||
+		cp.requestAudit.requests.some(row => row.responseReceived !== true ||
+			row.status === "in-flight" || !row.sessionId)) return false;
+	let current: ObjectiveProgressV1, prior: ObjectiveProgressV1 | undefined;
+	let chain: unknown, priorChain: unknown;
+	try {
+		current = JSON.parse(cp.privateBundle?.["objective-checkpoint.json"] ?? "");
+		chain = JSON.parse(cp.privateBundle?.["objective-assessment-receipts.json"] ?? "");
+		if (previousBundle) {
+			prior = JSON.parse(previousBundle["objective-checkpoint.json"] ?? "");
+			priorChain = previousBundle["objective-assessment-receipts.json"] ?
+				JSON.parse(previousBundle["objective-assessment-receipts.json"]) :
+				{ version: 1, kind: "m07-original-objective-assessment-receipts", receipts: [] };
+		}
+	} catch { return false; }
+	if (current?.version !== 1 || current.kind !== "original-objective-progress" ||
+		current.objectiveOutcome !== "incomplete" || typeof current.stopReason !== "string" ||
+		!Array.isArray(current.boundedRuns) || !Array.isArray(current.selectedArtifacts) ||
+		!Array.isArray(current.availableArtifacts) || !Array.isArray(current.assessmentHistory) ||
+		!record(chain) || chain.version !== 1 ||
+		chain.kind !== "m07-original-objective-assessment-receipts" ||
+		!Array.isArray(chain.receipts) || chain.receipts.length < 1) return false;
+	const latest = chain.receipts.at(-1);
+	if (!record(latest) || !["completed", "failed"].includes(String(latest.status)) ||
+		!Array.isArray(latest.sessions) || latest.sessions.length < 1 ||
+		latest.sessions.some(session => !record(session) ||
+			(session.toolGrantKind !== "none" && session.toolGrantKind !== "read-dir") ||
+			(session.boundaryMode !== "fresh" || session.boundaryIntent !== "independent-judgment") ||
+			typeof session.sessionId !== "string" ||
+			!receipt.sessions.some(saved => saved.sessionId === campaignSessionEffectId(String(session.sessionId)) &&
+				saved.kind === session.toolGrantKind))) return false;
+	if (current.assessment && !latest.sessions.some(session =>
+		record(session) && session.sessionId === current.assessment?.sessionId)) return false;
+	if (new Set(current.availableArtifacts).size !== current.availableArtifacts.length ||
+		current.availableArtifacts.some(name => typeof name !== "string" || !name)) return false;
+	if (prior) {
+		if (prior.version !== 1 || prior.kind !== "original-objective-progress" ||
+			prior.objectiveOutcome !== "incomplete" || !record(priorChain) ||
+			priorChain.version !== 1 || priorChain.kind !== chain.kind ||
+			!Array.isArray(priorChain.receipts) ||
+			chain.receipts.length !== priorChain.receipts.length + 1 ||
+			!priorChain.receipts.every((row, index) =>
+				JSON.stringify(row) === JSON.stringify((chain.receipts as unknown[])[index])) ||
+			JSON.stringify(current.contract) !== JSON.stringify(prior.contract) ||
+			JSON.stringify(current.boundedRuns) !== JSON.stringify(prior.boundedRuns) ||
+			JSON.stringify(current.selectedArtifacts) !== JSON.stringify(prior.selectedArtifacts) ||
+			!prior.availableArtifacts.every(name => current.availableArtifacts.includes(name)) ||
+			current.availableArtifacts.some(name => !prior!.availableArtifacts.includes(name) &&
+				!["execution-capabilities.json", "restored-candidate-verification.json"].includes(name)) ||
+			!Array.isArray(prior.assessmentHistory) ||
+			current.assessmentHistory.length !== prior.assessmentHistory.length + 1 ||
+			prior.assessmentHistory.some((row, index) =>
+				JSON.stringify(row) !== JSON.stringify(current.assessmentHistory[index]))) return false;
+		const last = current.assessmentHistory.at(-1);
+		if (!last || last.iteration !== prior.assessmentHistory.length + 1 ||
+			last.advanced !== false || last.stopReason !== current.stopReason ||
+			JSON.stringify(last.assessment) !== JSON.stringify(current.assessment)) return false;
+	}
+	try {
+		const unresolved = prior ? canonicalRestartUnknowns(prior).operationRefs :
+			current.continuation.unresolvedOperationIds;
+		const recomputed = objectiveProgress(current.contract, {
+			boundedRuns: current.boundedRuns, selectedArtifacts: current.selectedArtifacts,
+			availableArtifacts: current.availableArtifacts, unresolvedOperationIds: unresolved,
+			assessment: current.assessment, assessmentHistory: current.assessmentHistory,
+			stopReason: current.stopReason });
+		return JSON.stringify(recomputed) === JSON.stringify(current);
+	} catch { return false; }
+}
 /** An older writer omitted carryForwardOrigin when one provider response was lost.
  * Recover only when the selected tuple is byte-for-byte the one sealed by the
  * latest authenticated restart link. This does not settle the lost transport.
@@ -920,7 +1092,19 @@ function validateAncestryV3(cp: AccountingCheckpoint, sources: Source[], seedDig
 		cp.historical.unknownHeldNano !== unknownHeldNano ||
 		cp.historical.legacyParentDigest !== legacyParentDigest)
 		reject("historical commitment transition is invalid");
-	const accountingSources = sources.slice(cp.legacyAncestry.length);
+	const gaps = cp.opaqueExecutedRuns ?? [];
+	let previousGapIndex = cp.legacyAncestry.length - 1;
+	for (const gap of gaps) {
+		const index = sources.findIndex(source => JSON.stringify(source) === JSON.stringify(gap.source));
+		if (!validOpaqueGap(gap) || index <= previousGapIndex || index >= sources.length - 1)
+			reject("opaque executed run gap is not an exact ordered workflow source");
+		previousGapIndex = index;
+	}
+	const gapRunIds = new Set(gaps.map(gap => gap.source.runId));
+	const accountingSources = sources.slice(cp.legacyAncestry.length)
+		.filter(source => !gapRunIds.has(source.runId));
+	if (!accountingSources.length || accountingSources.at(-1)?.runId !== cp.source.runId)
+		reject("opaque gap cannot replace the current authenticated carry source");
 	if (cp.ancestry.length !== accountingSources.length - 1)
 		reject("carry ancestry does not cover every executed workflow run");
 	let parentDigest = legacyParentDigest, settledNano = 0, unknownNano = 0;
@@ -940,6 +1124,25 @@ function validateAncestryV3(cp: AccountingCheckpoint, sources: Source[], seedDig
 	}
 	validateAccountingV3(cp, accountingSources.at(-1)!, parentDigest, settledNano, unknownNano,
 		unpricedCount, binding);
+	// A compacted gap keeps the digest of the actual preceding ciphertext. No
+	// later carry may silently re-anchor that gap to a different research state.
+	const carryReceipts = [...cp.legacyAncestry, ...cp.ancestry];
+	for (const gap of gaps) {
+		const gapIndex = sources.findIndex(source => source.runId === gap.source.runId);
+		const preceding = carryReceipts.map(receipt => ({ receipt,
+			index: sources.findIndex(source => source.runId === receipt.source.runId) }))
+			.filter(row => row.index >= 0 && row.index < gapIndex)
+			.sort((a, b) => b.index - a.index)[0]?.receipt;
+		if (!preceding || gap.priorCarryEnvelopeSha256 !== preceding.envelopeDigest)
+			reject("opaque gap predecessor digest is not the authenticated carry prefix");
+	}
+	let pendingIndex = -1;
+	for (const source of cp.pendingEffectAncestry ?? []) {
+		const index = cp.ancestry.findIndex(row => JSON.stringify(row.source) === JSON.stringify(source));
+		if (!record(source) || !exactKeys(source, ["runId", "runAttempt", "runNumber", "commit"]) ||
+			index <= pendingIndex) reject("pending effect ancestry is not an exact ordered carry source");
+		pendingIndex = index;
+	}
 	if (!reviewedEffectPrefixValid(cp))
 		reject("reviewed effect ancestry does not match prior accounting and host restart claims");
 }
@@ -985,6 +1188,87 @@ export async function reviewedLegacyV3SourceTree(token: string, request: typeof 
 		/^[0-9a-f]{40}$/.test(submitted.tree.sha) &&
 		submitted.tree.sha === source.tree.sha;
 }
+/** One root-reviewed missing-carry exception. The pinned prior envelope binds
+ * the selected tuple checked against the private result by the owner; Actions
+ * still independently proves the exact executable source tree and result ZIP.
+ * No other missing-carry source gains authority from this function. */
+export async function reviewKnownOpaqueGapSource(facts: { source: Readonly<Source>;
+	terminal: AuthenticatedPriorCarryProof["terminal"];
+	resultArtifact: NonNullable<AuthenticatedPriorCarryProof["resultArtifact"]>;
+	priorCarryEnvelopeSha256: string }, githubToken: string,
+	request: typeof fetch = fetch): Promise<AuthenticatedOpaqueGapSourceReview | undefined> {
+	const source = facts.source;
+	const requestCommit = "db8263c88d9872cd592b43c70f7831cf74e290eb";
+	const reviewedFirstParent = "6ee929545ec3a1d7194054aa4e98988ecd1bd665";
+	if (source.runId !== "37507828650" || source.runAttempt !== 1 ||
+		source.runNumber !== 26 ||
+		source.commit !== requestCommit ||
+		facts.priorCarryEnvelopeSha256 !==
+			"0f29b2f1b5ef0d3bee9b53e7d86168621f904c355bf55d46c5557d4cbd6d412c" ||
+		facts.resultArtifact.repository !== MISSION_REPOSITORY ||
+		facts.resultArtifact.artifactId !== "11431834153" ||
+		facts.resultArtifact.artifactName !== MISSION_ARTIFACT ||
+		facts.resultArtifact.runId !== source.runId ||
+		facts.resultArtifact.digestScope !== "github-artifact-archive" ||
+		facts.resultArtifact.archiveSha256 !==
+			"9c0c4e887c4a212148f0b52aa9e3f96448d50d153b3151e1a741d66bd5f472b5" ||
+		facts.terminal.workflowId !== "374865232" ||
+		facts.terminal.runStatus !== "completed" ||
+		facts.terminal.runConclusion !== "failure" ||
+		facts.terminal.jobId !== "112420914600" ||
+		facts.terminal.jobName !== "private-campaign" ||
+		facts.terminal.jobStatus !== "completed" ||
+		facts.terminal.jobConclusion !== "failure" ||
+		facts.terminal.providerStepStatus !== "completed" ||
+		facts.terminal.providerStepConclusion !== "success" ||
+		facts.terminal.jobRunId !== source.runId ||
+		facts.terminal.jobRunAttempt !== source.runAttempt ||
+		facts.terminal.jobHeadSha !== source.commit || !githubToken)
+		return undefined;
+	const repo = `https://api.github.com/repos/${MISSION_REPOSITORY}`;
+	const submitted = await githubJson(`${repo}/git/commits/${requestCommit}`, githubToken, request);
+	const parent = await githubJson(`${repo}/git/commits/${reviewedFirstParent}`, githubToken, request);
+	const reviewedRun = await githubJson(`${repo}/actions/runs/${source.runId}`, githubToken, request);
+	const reviewedJobs = await githubJson(`${repo}/actions/runs/${source.runId}/jobs?per_page=100`, githubToken, request);
+	const exactJob = Array.isArray(reviewedJobs.jobs) && reviewedJobs.jobs.length === 1 &&
+		record(reviewedJobs.jobs[0]) ? reviewedJobs.jobs[0] as Job : undefined;
+	const exactSteps = exactJob ? providerSteps(exactJob) : [];
+	if (submitted.sha !== requestCommit || parent.sha !== reviewedFirstParent ||
+		submitted.message !== REUSABLE_RUN_REQUEST_MESSAGE ||
+		reviewedRun.id !== Number(source.runId) ||
+		reviewedRun.run_number !== source.runNumber ||
+		reviewedRun.run_attempt !== source.runAttempt ||
+		reviewedRun.workflow_id !== 374865232 ||
+		reviewedRun.head_sha !== source.commit ||
+		reviewedRun.event !== "push" || reviewedRun.head_branch !== REQUEST_BRANCH ||
+		!record(reviewedRun.actor) || reviewedRun.actor.login !== "SakuyaInazaki" ||
+		reviewedRun.status !== "completed" || reviewedRun.conclusion !== "failure" ||
+		reviewedJobs.total_count !== 1 || !exactJob ||
+		exactJob.id !== 112420914600 || exactJob.run_id !== Number(source.runId) ||
+		exactJob.run_attempt !== source.runAttempt || exactJob.head_sha !== source.commit ||
+		exactJob.name !== "private-campaign" || exactJob.status !== "completed" ||
+		exactJob.conclusion !== "failure" || exactSteps.length !== 1 ||
+		exactSteps[0].number !== 10 || exactSteps[0].name !== "Run private campaign" ||
+		exactSteps[0].status !== "completed" || exactSteps[0].conclusion !== "success" ||
+		!Array.isArray(submitted.parents) || ![1, 2].includes(submitted.parents.length) ||
+		!record(submitted.parents[0]) || submitted.parents[0].sha !== reviewedFirstParent ||
+		!record(submitted.tree) || !record(parent.tree) ||
+		typeof submitted.tree.sha !== "string" ||
+		!/^[0-9a-f]{40}$/.test(submitted.tree.sha) ||
+		submitted.tree.sha !== parent.tree.sha) return undefined;
+	const ci = await githubJson(`${repo}/actions/workflows/workflow-regression.yml/runs?head_sha=${reviewedFirstParent}&per_page=100`,
+		githubToken, request);
+	if (!Array.isArray(ci.workflow_runs) || !ci.workflow_runs.some(row =>
+		record(row) && row.head_sha === reviewedFirstParent && row.head_branch === BRANCH &&
+		row.event === "push" && row.run_attempt === 1 && row.conclusion === "success")) return undefined;
+	const review = Object.freeze({ version: 1 as const,
+		kind: "authenticated-opaque-gap-source-review" as const,
+		source: Object.freeze({ ...source }),
+		resultArchiveSha256: facts.resultArtifact.archiveSha256,
+		priorCarryEnvelopeSha256: facts.priorCarryEnvelopeSha256 });
+	authenticatedOpaqueGapSourceReviews.add(review);
+	return review;
+}
 async function oneJob(runId: string, token: string, request: typeof fetch): Promise<Job> {
 	const url = `https://api.github.com/repos/${MISSION_REPOSITORY}/actions/runs/${runId}/jobs?per_page=100`;
 	const response = await githubJson(url, token, request);
@@ -1013,6 +1297,25 @@ function providerSteps(job: Job): NonNullable<Job["steps"]> {
 	return job.steps?.filter(step => step.name === "Run bounded private campaign" ||
 		step.name === "Run private campaign") ?? [];
 }
+function verifiedTerminal(run: Run, job: Job, source: Source):
+	AuthenticatedPriorCarryProof["terminal"] | undefined {
+	const steps = providerSteps(job);
+	const terminalConclusions = ["success", "failure", "neutral", "timed_out", "action_required", "stale"];
+	if (!Number.isSafeInteger(job.id) || job.id! <= 0 || job.run_id !== Number(source.runId) ||
+		job.run_attempt !== source.runAttempt || job.head_sha !== source.commit ||
+		run.id !== Number(source.runId) || run.run_attempt !== source.runAttempt ||
+		run.head_sha !== source.commit || !Number.isSafeInteger(run.workflow_id) ||
+		run.workflow_id! <= 0 || run.status !== "completed" ||
+		!terminalConclusions.includes(run.conclusion ?? "") || job.status !== "completed" ||
+		job.name !== "private-campaign" || !terminalConclusions.includes(job.conclusion ?? "") ||
+		steps.length !== 1 || steps[0].status !== "completed" ||
+		![...terminalConclusions, "cancelled"].includes(steps[0].conclusion ?? "")) return undefined;
+	return Object.freeze({ workflowId: String(run.workflow_id), runStatus: "completed",
+		runConclusion: run.conclusion!, jobId: String(job.id), jobName: "private-campaign",
+		jobStatus: "completed", jobConclusion: job.conclusion!, jobRunId: String(job.run_id),
+		jobRunAttempt: job.run_attempt!, jobHeadSha: job.head_sha!,
+		providerStepStatus: "completed", providerStepConclusion: steps[0].conclusion! });
+}
 function priorCarryProof(input: { source: Source; current: Source; run: Run; job: Job;
 	artifactId: string; envelopeSha256: string; bundle?: PrivateContinuationBundle;
 	resultArtifact?: AuthenticatedPriorCarryProof["resultArtifact"];
@@ -1020,19 +1323,10 @@ function priorCarryProof(input: { source: Source; current: Source; run: Run; job
 	accounting?: { settledNano: number; unknownObservedNano: number; unpricedRequestCount: number };
 	committedNano?: number; unknownHeldNano?: number }): AuthenticatedPriorCarryProof | undefined {
 	const { source, current, run, job } = input;
-	const steps = providerSteps(job);
-	const terminalConclusions = ["success", "failure", "neutral", "timed_out", "action_required", "stale"];
 	// Historical carry accounting remains readable without these extra API fields,
 	// but their absence or mismatch must never mint restart authority.
-	if (!Number.isSafeInteger(job.id) || job.id! <= 0 || job.run_id !== Number(source.runId) ||
-		job.run_attempt !== source.runAttempt || job.head_sha !== source.commit ||
-		run.id !== Number(source.runId) || run.run_attempt !== source.runAttempt || run.head_sha !== source.commit ||
-		!Number.isSafeInteger(run.workflow_id) || run.workflow_id! <= 0 ||
-		run.status !== "completed" || !terminalConclusions.includes(run.conclusion ?? "") ||
-		job.status !== "completed" || job.name !== "private-campaign" ||
-		!terminalConclusions.includes(job.conclusion ?? "") || steps.length !== 1 ||
-		steps[0].status !== "completed" ||
-		![...terminalConclusions, "cancelled"].includes(steps[0].conclusion ?? "")) return undefined;
+	const terminal = verifiedTerminal(run, job, source);
+	if (!terminal) return undefined;
 	const proof: AuthenticatedPriorCarryProof = Object.freeze({
 		version: input.accounting ? 2 : 1, kind: "authenticated-prior-mission-carry", repository: MISSION_REPOSITORY,
 		source: Object.freeze({ ...source }), envelopeSha256: input.envelopeSha256,
@@ -1040,11 +1334,7 @@ function priorCarryProof(input: { source: Source; current: Source; run: Run; job
 		artifact: Object.freeze({ repository: MISSION_REPOSITORY, artifactId: input.artifactId,
 			artifactName: CARRY_ARTIFACT_NAME, runId: source.runId }),
 		...(input.resultArtifact ? { resultArtifact: input.resultArtifact } : {}),
-		terminal: Object.freeze({ workflowId: String(run.workflow_id), runStatus: "completed",
-			runConclusion: run.conclusion!, jobId: String(job.id), jobName: "private-campaign",
-			jobStatus: "completed", jobConclusion: job.conclusion!, jobRunId: String(job.run_id),
-			jobRunAttempt: job.run_attempt!, jobHeadSha: job.head_sha!,
-			providerStepStatus: "completed", providerStepConclusion: steps[0].conclusion! }),
+		terminal,
 		...(input.accounting ? {
 			priorSettledCny: decimal(input.accounting.settledNano),
 			priorUnknownObservedCny: decimal(input.accounting.unknownObservedNano),
@@ -1059,21 +1349,25 @@ function priorCarryProof(input: { source: Source; current: Source; run: Run; job
 	}))));
 	return proof;
 }
-async function oneArtifact(runId: string, token: string, request: typeof fetch,
-	name: string, requiredId?: string, inspect?: (artifacts: Artifact[]) => void): Promise<string> {
+async function artifactsForRun(runId: string, token: string, request: typeof fetch): Promise<Artifact[]> {
 	const url = `https://api.github.com/repos/${MISSION_REPOSITORY}/actions/runs/${runId}/artifacts?per_page=100`;
 	const response = await githubJson(url, token, request);
 	if (!Array.isArray(response.artifacts) || response.artifacts.length > 100 ||
 		!Number.isSafeInteger(response.total_count) || response.total_count !== response.artifacts.length)
 		reject("workflow artifact list is incomplete");
-	const found = response.artifacts.filter(value => {
+	return response.artifacts.filter(record) as Artifact[];
+}
+async function oneArtifact(runId: string, token: string, request: typeof fetch,
+	name: string, requiredId?: string, inspect?: (artifacts: Artifact[]) => void): Promise<string> {
+	const artifacts = await artifactsForRun(runId, token, request);
+	const found = artifacts.filter(value => {
 		const a = value as Artifact;
 		return record(value) && a.name === name && a.workflow_run?.id === Number(runId);
 	}) as Artifact[];
 	if (found.length !== 1 || !Number.isSafeInteger(found[0].id) || found[0].id! <= 0 ||
 		found[0].expired !== false || (requiredId !== undefined && String(found[0].id) !== requiredId))
 		reject("required private carry artifact is unavailable");
-	inspect?.(response.artifacts.filter(record) as Artifact[]);
+	inspect?.(artifacts);
 	return String(found[0].id);
 }
 function resultArtifactIdentity(artifacts: Artifact[], source: Source): AuthenticatedPriorCarryProof["resultArtifact"] {
@@ -1090,6 +1384,12 @@ export async function openLedgerContinuation(input: {
 	seedEnvelopeB64: string | undefined; publicKeyFile: string; githubToken: string | undefined;
 	current: CurrentMissionRun;
 	loadCarryArtifact: (identity: { runId: string; artifactId: string }) => Promise<string>;
+	/** Absent by default. A live auditor must bind the exact source and result archive. */
+	reviewOpaqueGapSource?: (facts: { source: Readonly<Source>;
+		terminal: AuthenticatedPriorCarryProof["terminal"];
+		resultArtifact: NonNullable<AuthenticatedPriorCarryProof["resultArtifact"]>;
+		priorCarryEnvelopeSha256: string }) =>
+		Promise<AuthenticatedOpaqueGapSourceReview | undefined>;
 	request?: typeof fetch; expectedSpkiSha256?: string;
 	/** Compatibility verifier may require every intervening run to be nonbillable. */
 	requireSeedOnly?: boolean;
@@ -1229,12 +1529,39 @@ export async function openLedgerContinuation(input: {
 	const loadedArtifacts = new Map<string, string>();
 	const resultArtifacts = new Map<string, AuthenticatedPriorCarryProof["resultArtifact"]>();
 	const load = async (source: Source): Promise<string> => {
-		const artifactId = await oneArtifact(source.runId, input.githubToken!, request, CARRY_ARTIFACT_NAME,
-			undefined, artifacts => resultArtifacts.set(source.runId, resultArtifactIdentity(artifacts, source)));
+		const artifactId = loadedArtifacts.get(source.runId) ?? await oneArtifact(source.runId,
+			input.githubToken!, request, CARRY_ARTIFACT_NAME, undefined,
+			artifacts => resultArtifacts.set(source.runId, resultArtifactIdentity(artifacts, source)));
 		loadedArtifacts.set(source.runId, artifactId);
 		try { return await input.loadCarryArtifact({ runId: source.runId, artifactId }); }
 		catch { return reject("private carry artifact could not be read"); }
 	};
+	let sourcesWithCarry = executedSources;
+	let newlyOpaqueGap: Omit<OpaqueExecutedRunGap, "priorCarryEnvelopeSha256"> | undefined;
+	if (executedSources.length) {
+		const latest = executedSources.at(-1)!;
+		const artifacts = await artifactsForRun(latest.runId, input.githubToken, request);
+		const carries = artifacts.filter(item => item.name === CARRY_ARTIFACT_NAME);
+		if (carries.length === 1 && carries[0].workflow_run?.id === Number(latest.runId) &&
+			carries[0].expired === false && Number.isSafeInteger(carries[0].id) && carries[0].id! > 0) {
+			loadedArtifacts.set(latest.runId, String(carries[0].id));
+			resultArtifacts.set(latest.runId, resultArtifactIdentity(artifacts, latest));
+		} else if (carries.length === 0) {
+			if (executedSources.length < 2)
+				reject("required private carry artifact is unavailable without an earlier authenticated carry");
+			const results = artifacts.filter(item => item.name === MISSION_ARTIFACT);
+			const resultArtifact = results.length === 1 ? resultArtifactIdentity(artifacts, latest) : undefined;
+			const metadata = executedMetadata.get(latest.runId);
+			const terminal = metadata && verifiedTerminal(metadata.run, metadata.job, latest);
+			if (!resultArtifact || !terminal)
+				reject("missing carry run lacks an exact terminal encrypted result artifact");
+			newlyOpaqueGap = Object.freeze({ version: 1, kind: "opaque-executed-run-gap",
+				source: Object.freeze({ ...latest }), carryArtifact: "absent",
+				accounting: "unquantified", effects: "quarantined-source-reviewed",
+				terminal, resultArtifact });
+			sourcesWithCarry = executedSources.slice(0, -1);
+		} else reject("required private carry artifact is unavailable or ambiguous");
+	}
 	let legacyAncestry: AncestorReceipt[] = [];
 	let accountingAncestry: AccountingAncestorReceipt[] = [];
 	let ancestry: (AncestorReceipt | AccountingAncestorReceipt)[] = [];
@@ -1242,16 +1569,22 @@ export async function openLedgerContinuation(input: {
 	let hostEffectEvidence: AuthenticatedHostEffectEvidence | undefined;
 	let oneTimeLegacyV3Review: AuthenticatedLegacyV3RunReview | undefined;
 	let reviewedEffectAncestry: ReviewedEffectAncestorReceipt[] = [];
-	if (executedSources.length) {
-		const latest = executedSources.at(-1)!;
+	let opaqueExecutedRuns: OpaqueExecutedRunGap[] = [];
+	let currentEffectReviewPending = false;
+	let pendingEffectAncestry: Source[] = [];
+	if (sourcesWithCarry.length) {
+		const latest = sourcesWithCarry.at(-1)!;
 		const latestEnvelope = await load(latest);
 		const latestVersion = checkpointVersion(latestEnvelope);
 		if (latestVersion === 3) {
 			const opened = readCheckpoint(latestEnvelope, key, seed.seedDigest, latest);
 			if (opened.checkpoint.version !== 3) reject("accounting-only carry version is invalid");
-			validateAncestryV3(opened.checkpoint, executedSources, seed.seedDigest,
+			validateAncestryV3(opened.checkpoint, sourcesWithCarry, seed.seedDigest,
 				n(seed.payload.priorCommittedCny), seed.bootstrapBinding);
 			const cp = opened.checkpoint;
+			opaqueExecutedRuns = [...(cp.opaqueExecutedRuns ?? [])];
+			currentEffectReviewPending = cp.currentEffectReview === "pending";
+			pendingEffectAncestry = [...(cp.pendingEffectAncestry ?? [])];
 			const historicalOrigin = cp.legacyAncestry.at(-1);
 			const allPriorEffectsReviewed = cp.ancestry.filter(row => !hasNoV3ProviderActivity(row))
 				.every(row => cp.reviewedEffectAncestry?.some(entry =>
@@ -1326,7 +1659,8 @@ export async function openLedgerContinuation(input: {
 						JSON.stringify(cp.carryForwardOrigin.source) === JSON.stringify(candidate.source) &&
 						cp.carryForwardOrigin.envelopeSha256 === candidate.envelopeSha256 &&
 						cp.carryForwardOrigin.historicalCommittedNano === candidate.historicalCommittedNano &&
-						cp.carryForwardOrigin.historicalUnknownHeldNano === candidate.historicalUnknownHeldNano)
+						cp.carryForwardOrigin.historicalUnknownHeldNano === candidate.historicalUnknownHeldNano &&
+						(receipt.goals.length > 0 || assessmentOnlyNoGoal(cp, receipt)))
 						hostEffectEvidence = Object.freeze({ origin: candidate, receipt,
 							requestAudit: cp.requestAudit,
 							reviewedEffectAncestry: Object.freeze([...(cp.reviewedEffectAncestry ?? [])]) });
@@ -1357,7 +1691,7 @@ export async function openLedgerContinuation(input: {
 		} else if (latestVersion === 2) {
 			const opened = readCheckpoint(latestEnvelope, key, seed.seedDigest, latest);
 			if (opened.checkpoint.version !== 2) reject("legacy carry version is invalid");
-			validateAncestry(opened.checkpoint, executedSources, seed.seedDigest, committedNano, priorBootstrapBinding);
+			validateAncestry(opened.checkpoint, sourcesWithCarry, seed.seedDigest, committedNano, priorBootstrapBinding);
 			const cp = opened.checkpoint;
 			legacyAncestry = [...cp.ancestry!, ancestorReceipt(cp, opened.digest)];
 			ancestry = [...legacyAncestry];
@@ -1368,12 +1702,12 @@ export async function openLedgerContinuation(input: {
 		} else {
 			// Legacy carries have no compacted ancestry. Every original ciphertext
 			// must remain present until a verified v2 checkpoint carries its receipt.
-			for (const [index, source] of executedSources.entries()) {
-				const envelope = index === executedSources.length - 1 ? latestEnvelope : await load(source);
+			for (const [index, source] of sourcesWithCarry.entries()) {
+				const envelope = index === sourcesWithCarry.length - 1 ? latestEnvelope : await load(source);
 				const opened = readCheckpoint(envelope, key, seed.seedDigest, source, parentDigest);
 				const cp = opened.checkpoint;
 				if (cp.version === 3) reject("legacy activation cannot inherit an accounting-only carry");
-				if (cp.version === 2) validateAncestry(cp, executedSources.slice(0, index + 1),
+				if (cp.version === 2) validateAncestry(cp, sourcesWithCarry.slice(0, index + 1),
 					seed.seedDigest, n(seed.payload.priorCommittedCny), seed.bootstrapBinding);
 				validateAccounting(cp, source, parentDigest, committedNano, unknownHeldNano, priorBootstrapBinding);
 				legacyAncestry.push(ancestorReceipt(cp, opened.digest));
@@ -1385,9 +1719,22 @@ export async function openLedgerContinuation(input: {
 			historical = { committedNano, unknownHeldNano, legacyParentDigest: parentDigest };
 		}
 	}
+	if (newlyOpaqueGap) {
+		if (!input.reviewOpaqueGapSource || !bindsOpaqueGapSourceReview(
+			await input.reviewOpaqueGapSource({ source: newlyOpaqueGap.source,
+				terminal: newlyOpaqueGap.terminal, resultArtifact: newlyOpaqueGap.resultArtifact,
+				priorCarryEnvelopeSha256: parentDigest }), newlyOpaqueGap.source,
+			newlyOpaqueGap.resultArtifact, parentDigest))
+			reject("opaque executed run gap lacks independent exact-source authority");
+		opaqueExecutedRuns.push(Object.freeze({ ...newlyOpaqueGap,
+			priorCarryEnvelopeSha256: parentDigest,
+			effects: "quarantined-source-reviewed" as const }));
+	}
 	const currentSource = sourceOf(current);
-	const latestSource = executedSources.at(-1);
-	const proof = latestSource ? priorCarryProof({ source: latestSource, current: currentSource,
+	const latestSource = sourcesWithCarry.at(-1);
+	const proof = latestSource && opaqueExecutedRuns.every(gap =>
+		gap.effects === "quarantined-source-reviewed") && !currentEffectReviewPending &&
+		!pendingEffectAncestry.length ? priorCarryProof({ source: latestSource, current: currentSource,
 		...executedMetadata.get(latestSource.runId)!, artifactId: loadedArtifacts.get(latestSource.runId)!,
 		resultArtifact: resultArtifacts.get(latestSource.runId),
 		ancestry, envelopeSha256: parentDigest, bundle: priorPrivateBundle,
@@ -1400,10 +1747,13 @@ export async function openLedgerContinuation(input: {
 		authenticatedHostEffects.set(proof, hostEffectEvidence);
 	if (proof && oneTimeLegacyV3Review && priorPrivateBundle && proof.resultArtifact)
 		authenticatedLegacyV3RunReviews.set(proof, oneTimeLegacyV3Review);
+	if (proof && opaqueExecutedRuns.length && priorPrivateBundle && proof.resultArtifact)
+		authenticatedReviewedOpaqueGaps.set(proof, Object.freeze([...opaqueExecutedRuns]));
 	if (priorPrivateBundle) Object.freeze(priorPrivateBundle);
 	if (priorBootstrapBinding) Object.freeze(priorBootstrapBinding);
 	let sealed = false;
 	const result: LedgerContinuation = { mode: "accounting-only",
+		opaqueExecutedRuns: Object.freeze([...opaqueExecutedRuns]),
 		priorSettledCny: decimal(settledNano), priorUnknownObservedCny: decimal(unknownObservedNano),
 		priorUnpricedRequestCount: unpricedRequestCount,
 		historicalCommittedCny: decimal(historical.committedNano),
@@ -1414,6 +1764,9 @@ export async function openLedgerContinuation(input: {
 		...(priorPrivateBundle ? { priorPrivateBundle } : {}),
 		...(priorBootstrapBinding ? { priorBootstrapBinding } : {}),
 		claimOneUse: async carryDigest => {
+			if (opaqueExecutedRuns.some(gap => gap.effects !== "quarantined-source-reviewed") ||
+				currentEffectReviewPending || pendingEffectAncestry.length)
+				reject("opaque or unreviewed execution requires independent effect authority");
 			if (!proof || !isAuthenticatedPriorCarryProof(proof) || carryDigest !== proof.envelopeSha256)
 				reject("restart claim requires the exact authenticated prior carry");
 			if (sealed) reject("restart claim cannot follow current carry sealing");
@@ -1454,6 +1807,9 @@ export async function openLedgerContinuation(input: {
 			}
 		},
 		sealCurrent: amounts => {
+			if (opaqueExecutedRuns.some(gap => gap.effects !== "quarantined-source-reviewed") ||
+				currentEffectReviewPending || pendingEffectAncestry.length)
+				reject("ordinary carry cannot bypass opaque or pending effects");
 			if (sealed) reject("current carry was already sealed");
 			const privateBundle = amounts.privateBundle ?? priorPrivateBundle;
 			const bootstrapBinding = amounts.bootstrapBinding ?? priorBootstrapBinding;
@@ -1473,6 +1829,7 @@ export async function openLedgerContinuation(input: {
 					reject("current accounting-only carry is invalid");
 				const cp: AccountingCheckpoint = { version: 3, ancestry: accountingAncestry,
 					legacyAncestry, historical,
+					...(opaqueExecutedRuns.length ? { opaqueExecutedRuns: [...opaqueExecutedRuns] } : {}),
 					kind: "mul-pis-private-ledger-continuation", missionId: MISSION_ID,
 					repository: MISSION_REPOSITORY, seedDigest: seed.seedDigest, parentDigest,
 					source: currentSource, settledNano: nextSettledNano,
@@ -1497,6 +1854,10 @@ export async function openLedgerContinuation(input: {
 					currentEffectReceipt.requestIds.length === 0 && sameSelection &&
 					privateBundle?.["objective-checkpoint.json"] === priorPrivateBundle?.["objective-checkpoint.json"] &&
 					privateBundle?.["research-history.json"] === priorPrivateBundle?.["research-history.json"];
+				const readOnlyAssessmentNoGoal = sameSelection &&
+					privateBundle?.["research-history.json"] === priorPrivateBundle?.["research-history.json"] &&
+					assessmentOnlyNoGoal(cp, currentEffectReceipt, priorPrivateBundle);
+				const abandonedNoGoal = Boolean(emptyNoGoal || readOnlyAssessmentNoGoal);
 				const latestPrior = accountingAncestry.at(-1);
 				const earlierNonzeroReviewed = accountingAncestry.slice(0, -1)
 					.filter(row => !hasNoV3ProviderActivity(row)).every(row =>
@@ -1505,7 +1866,7 @@ export async function openLedgerContinuation(input: {
 					!reviewedEffectAncestry.some(entry => entry.envelopeSha256 === latestPrior.envelopeDigest) &&
 					reviewedOrigin?.envelopeSha256 === historical.legacyParentDigest) {
 					const added = newlyReviewedPriorEffect(proof, currentSource,
-						latestPrior, privateBundle, reviewedOrigin, Boolean(emptyNoGoal));
+						latestPrior, privateBundle, reviewedOrigin, abandonedNoGoal);
 					if (added) cp.reviewedEffectAncestry = [...reviewedEffectAncestry, added];
 				}
 				if (!reviewedEffectPrefixValid(cp))
@@ -1543,7 +1904,7 @@ export async function openLedgerContinuation(input: {
 						} catch { /* A missing old tuple never grants restart authority. */ }
 					}
 					if (zeroPassThrough || (historicalPreserved && (sameSelection || oldSelectionArchived) &&
-						(!hasNoV3ProviderActivity(cp) || emptyNoGoal) && currentEffectReceipt))
+						(currentEffectReceipt?.goals.length || abandonedNoGoal) && currentEffectReceipt))
 						cp.carryForwardOrigin = { ...originForCurrent,
 							privateBundleSha256: privateBundleDigest(privateBundle) };
 				}
@@ -1552,6 +1913,48 @@ export async function openLedgerContinuation(input: {
 				return { envelopeB64, observedSettledCny: decimal(nextSettledNano),
 					observedUnknownHeldCny: decimal(nextUnknownNano),
 					unpricedRequestCount: nextUnpricedCount };
+		},
+		sealEmergencyCurrent: (amounts, reason) => {
+			if (reason !== "effect-review-incomplete" || sealed)
+				reject("emergency carry requires an unsealed effect-review failure");
+			if (!priorPrivateBundle || !validBundle(priorPrivateBundle) ||
+				!priorBootstrapBinding || !validBinding(priorBootstrapBinding))
+				reject("emergency carry lacks authenticated prior research evidence");
+			const settledAddedNano = n(amounts.settledCny);
+			const unknownObservedAddedNano = n(amounts.unknownObservedCny);
+			const nextSettledNano = settledNano + settledAddedNano;
+			const nextUnknownNano = unknownObservedNano + unknownObservedAddedNano;
+			const nextUnpricedCount = unpricedRequestCount + amounts.unpricedRequestCount;
+			if (![nextSettledNano, nextUnknownNano, nextUnpricedCount].every(Number.isSafeInteger) ||
+				amounts.requestAudit.requests.some(row => row.status === "in-flight") ||
+				!validAccountingAudit(amounts.requestAudit, settledAddedNano,
+					unknownObservedAddedNano, amounts.unpricedRequestCount))
+				reject("emergency carry request audit is invalid or in-flight");
+			const pending = [...pendingEffectAncestry];
+			if (currentEffectReviewPending) {
+				const predecessor = accountingAncestry.at(-1)?.source;
+				if (!predecessor) reject("pending effect ancestry lacks its authenticated source");
+				pending.push({ ...predecessor });
+			}
+			const cp: AccountingCheckpoint = { version: 3, ancestry: accountingAncestry,
+				legacyAncestry, historical,
+				kind: "mul-pis-private-ledger-continuation", missionId: MISSION_ID,
+				repository: MISSION_REPOSITORY, seedDigest: seed.seedDigest, parentDigest,
+				source: currentSource, settledNano: nextSettledNano,
+				unknownObservedNano: nextUnknownNano, unpricedRequestCount: nextUnpricedCount,
+				settledAddedNano, unknownObservedAddedNano,
+				unpricedAddedCount: amounts.unpricedRequestCount,
+				requestAudit: amounts.requestAudit, currentEffectReview: "pending",
+				privateBundle: priorPrivateBundle, bootstrapBinding: priorBootstrapBinding,
+				...(opaqueExecutedRuns.length ? { opaqueExecutedRuns: [...opaqueExecutedRuns] } : {}),
+				...(reviewedEffectAncestry.length ?
+					{ reviewedEffectAncestry: [...reviewedEffectAncestry] } : {}),
+				...(pending.length ? { pendingEffectAncestry: pending } : {}) };
+			const envelopeB64 = sealCheckpoint(cp, key);
+			sealed = true;
+			return { envelopeB64, observedSettledCny: decimal(nextSettledNano),
+				observedUnknownHeldCny: decimal(nextUnknownNano),
+				unpricedRequestCount: nextUnpricedCount };
 		}
 	};
 	historicalFixtureSealers.set(result, amounts => {

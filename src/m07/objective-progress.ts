@@ -286,7 +286,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			"# Frozen bounded evidence", "Use objective_evidence_read to read the complete original-objective.json and every listed file. If a file is paginated, read every page including the untruncated end. The file names are:",
 			...materials.map(item => item.name),
 			"Return only strict JSON with version 1, decision (fulfilled, continue, or blocked), rationale, evidenceRefs (file names above), unresolvedObligations (IDs above), unresolvedDetails (your concrete open requirements from the full original assignment), and when continuing nextTask {objective, addresses, adapterScope}. Use a scope only when its observed host capability covers your proposed work. If a proposed task has no available registered executor, retain it as unresolved and name the unavailable capability explicitly. The host may ask you to replan feasible work; preserve unresolved requirements. Assess honestly. Propose the next scientific work yourself from unresolved original obligations; do not change task permissions or claim a global optimum from a finite evaluation."].join("\n\n");
-		const complete = (name: string, contents: string): boolean => {
+		const coverage = (name: string, contents: string): { complete: boolean; score: number } => {
 			const returned = handle.readReturnEvents();
 			const lines = contents.split("\n").length - (contents.endsWith("\n") ? 1 : 0);
 			const rows = returned.filter(item => item.toolName === "objective_evidence_read" && item.path === name &&
@@ -295,7 +295,9 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				item.returned.endLine >= item.returned.startLine && item.returned.endLine <= lines);
 			const covered = new Set<number>();
 			for (const row of rows) for (let line = row.returned.startLine!; line <= row.returned.endLine! && line <= lines; line++) covered.add(line);
-			return rows.some(item => item.returned.endLine === lines && item.returned.truncated === false) && covered.size === lines;
+			const reachedUntruncatedEnd = rows.some(item => item.returned.endLine === lines && item.returned.truncated === false);
+			return { complete: reachedUntruncatedEnd && covered.size === lines,
+				score: covered.size + Number(reachedUntruncatedEnd) };
 		};
 		const readMaterials = [{ name: "original-objective.json", text: contractBytes.toString("utf8") }, ...materials];
 		const proposals: ModelObjectiveAssessmentV1[] = [];
@@ -303,23 +305,54 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		const blockedProposals: ObjectiveNextTaskV1[] = [];
 		let challengedBlocked = false;
 		let latestAssessment: ObjectiveProgressV1["assessment"];
+		let priorUnreadScore: number | undefined;
+		let readEventCursor = 0;
 		let request = prompt;
 		for (;;) {
 			let response;
 			try { response = await handle.prompt(request); }
-			catch { return { assessment: latestAssessment, stopReason: "assessment-failed" }; }
-			let parsed;
+			catch {
+				const admission = input.advanceAdmission();
+				return { assessment: latestAssessment, stopReason: admission === "admitted" ? "assessment-failed" : admission };
+			}
+			const returned = handle.readReturnEvents();
+			const newReadEvents = returned.slice(readEventCursor);
+			readEventCursor = returned.length;
+			const fileCoverage = readMaterials.map(item => ({ name: item.name, ...coverage(item.name, item.text) }));
+			const evidenceRead = fileCoverage.filter(item => item.complete).map(item => item.name);
+			const unreadEvidence = fileCoverage.filter(item => !item.complete).map(item => item.name);
+			const unreadScore = fileCoverage.reduce((sum, item) => sum + item.score, 0);
+			let parsed: ModelObjectiveAssessmentV1 | undefined;
 			try { parsed = parseAssessment(response.text, input.contract, materials.map(item => item.name)); }
-			catch { return { assessment: latestAssessment, stopReason: "assessment-invalid" }; }
-			proposals.push(parsed);
-			const evidenceRead = readMaterials.filter(item => complete(item.name, item.text)).map(item => item.name);
-			const unreadEvidence = readMaterials.filter(item => !evidenceRead.includes(item.name)).map(item => item.name);
-			const assessment = { ...parsed, sessionId: handle.ref.id, model: handle.ref.model,
-				evidenceRead, unreadEvidence, proposalHistory: [...proposals],
-				...(blockedProposals.length ? { blockedProposals: [...blockedProposals] } : {}) };
-			latestAssessment = assessment;
-			await input.recordAssessment?.(assessment);
-			if (unreadEvidence.length) return { assessment, stopReason: "assessment-evidence-unread" };
+			catch { if (!unreadEvidence.length) return { assessment: latestAssessment, stopReason: "assessment-invalid" }; }
+			let assessment: ObjectiveProgressV1["assessment"];
+			if (parsed) {
+				proposals.push(parsed);
+				assessment = { ...parsed, sessionId: handle.ref.id, model: handle.ref.model,
+					evidenceRead, unreadEvidence, proposalHistory: [...proposals],
+					...(blockedProposals.length ? { blockedProposals: [...blockedProposals] } : {}) };
+				latestAssessment = assessment;
+				await input.recordAssessment?.(assessment);
+			}
+			if (unreadEvidence.length) {
+				// A provisional verdict cannot authorize work until every frozen file is fully read.
+				// An unchanged response is not a mission stop: keep prompting this same
+				// assessor until read proof arrives or a real host/tool boundary occurs.
+				if (newReadEvents.some(item => item.toolName === "objective_evidence_read" &&
+					item.status === "error" && unreadEvidence.includes(item.path)))
+					return { assessment: latestAssessment, stopReason: "assessment-evidence-unread" };
+				const noReadProgress = priorUnreadScore !== undefined && unreadScore <= priorUnreadScore;
+				priorUnreadScore = unreadScore;
+				const admission = input.advanceAdmission();
+				if (admission !== "admitted") return { assessment: latestAssessment, stopReason: admission };
+				request = ["Your previous assessment is provisional because required frozen evidence was not completely returned by objective_evidence_read.",
+					`Unread or incomplete files: ${unreadEvidence.join(", ")}.`,
+					...(!parsed ? ["Your last response also failed the required strict JSON schema. Repair its format after inspecting the missing evidence."] : []),
+					...(noReadProgress ? ["The last repair turn added no verified read coverage. Replan how to use objective_evidence_read rather than repeating the same unsupported verdict."] : []),
+					"In this same session, read every missing range of each named file, including an untruncated final page. Then reassess the unchanged original objective and return a new strict JSON assessment. Do not repeat the prior verdict without inspecting the missing evidence; no task may be dispatched or goal closed from an incomplete read."].join("\n\n");
+				continue;
+			}
+			if (!parsed || !assessment) return { assessment: latestAssessment, stopReason: "assessment-invalid" };
 			if (parsed.decision === "blocked") {
 				const available = input.capabilities?.filter(item => item.available && input.supportedTaskScopes.includes(item.scope)) ?? [];
 				if (challengedBlocked || !available.length) return { assessment, stopReason: "model-reported-blocked" };

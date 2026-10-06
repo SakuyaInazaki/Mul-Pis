@@ -6,8 +6,9 @@
 import { createHash } from "node:crypto";
 import type { AuthenticatedRestartCarryFacts, ReviewedRestartEffectPolicy } from "../m07/independent-restart.ts";
 import { authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence,
+	authenticatedReviewedOpaqueRunGaps,
 	authenticatedLegacyV3RunReview, type AuthenticatedHostEffectEvidence,
-	type AuthenticatedLegacyV3RunReview } from "./ledger-continuation.ts";
+	type AuthenticatedLegacyV3RunReview, type OpaqueExecutedRunGap } from "./ledger-continuation.ts";
 
 const sha256 = (value: string): string => createHash("sha256").update(value).digest("hex");
 const hex64 = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
@@ -495,9 +496,17 @@ function reviewPrivateCampaignRestartEffectsCore(input: PrivateCampaignEffectRev
 		"host-independent-restart-goal-bindings") as PriorBinding[];
 	if (hostEffect) {
 		const { origin, receipt, requestAudit, reviewedEffectAncestry } = hostEffect;
-		const emptyNoGoal = requestAudit.requests.length === 0 && receipt.goals.length === 0 &&
+		// A fresh assessor may read evidence and incur provider charges before it
+		// creates a research goal. Its no-goal receipt is an abandoned restart, not
+		// a free/zero-work wrapper. The live ledger verifier separately binds every
+		// row, session, checkpoint transition and assessment receipt.
+		const abandonedNoGoal = receipt.goals.length === 0 &&
 			receipt.sessions.every(session => session.kind === "none" || session.kind === "read-dir") &&
-			receipt.requestIds.length === 0 &&
+			receipt.requestIds.length === requestAudit.requests.length &&
+			requestAudit.requests.every(row => row.responseReceived === true &&
+				row.status !== "in-flight" &&
+				receipt.sessions.some(session => session.sessionId === row.sessionId &&
+					session.kind === "read-dir")) &&
 			reviewedEffectAncestry.at(-1)?.abandonedWithoutGoal === true;
 		const oneTimeAncestor = reviewedEffectAncestry[0]?.source.runId === ONE_TIME_LEGACY_V3_POLICY.runId &&
 			reviewedEffectAncestry[0]?.source.runAttempt === 1 &&
@@ -511,7 +520,7 @@ function reviewPrivateCampaignRestartEffectsCore(input: PrivateCampaignEffectRev
 			receipt.source.runId !== facts.source.runId ||
 			receipt.source.runAttempt !== facts.source.runAttempt ||
 			receipt.source.commit !== facts.source.commit ||
-			(!emptyNoGoal && (receipt.goals.length < 1 || requestAudit.requests.length < 1)))
+			(!abandonedNoGoal && (receipt.goals.length < 1 || requestAudit.requests.length < 1)))
 			reject("host-effect census is outside the authenticated historical restart scope");
 		const historical = reservations[2]?.receipt?.quarantine?.historicalGoalOutcomes;
 		const originalGoalIds = [...(historical ?? []).map(row => row.runId), bindings[2]?.goalRunId];
@@ -605,15 +614,19 @@ function reviewPrivateCampaignRestartEffectsCore(input: PrivateCampaignEffectRev
 				!text(claim?.claimId) || !text(claim?.currentJobId))
 				reject("reviewed-effect ancestry lacks an exact append-only quarantine link");
 		}
-		if (emptyNoGoal) {
+		if (abandonedNoGoal) {
 			if (checkpoint.objectiveOutcome === "fulfilled" ||
 				!sameSet(priorGoalIds, boundedRuns.map(row => row.runId ?? "")))
-				reject("abandoned restart changed an objective goal without a host session");
-			const policyId = "mul-pis-complete-host-no-goal-census-v1";
+				reject("abandoned restart changed an objective goal without a research goal");
+			const policyId = requestAudit.requests.length ?
+				"mul-pis-complete-host-no-goal-census-v2" :
+				"mul-pis-complete-host-no-goal-census-v1";
 			return { sourceCommit: facts.source.commit, policyId,
 				policySha256: sha256(JSON.stringify({ policyId, source: facts.source,
 					envelope: facts.envelopeSha256, resultArtifact: facts.resultArtifact,
-					historicalPolicy: reviewed.policySha256, receipt, reviewedEffectAncestry })),
+					historicalPolicy: reviewed.policySha256, receipt,
+					...(requestAudit.requests.length ? { requestAudit } : {}),
+					reviewedEffectAncestry })),
 				operationAttestations: reviewed.operationAttestations,
 				effectClass: "confined-ephemeral-local", unknownBillingHeld: true,
 				actorThirdPartyMutations: "none", hostTransport: "immutable-versioned-archive" };
@@ -816,9 +829,29 @@ function reviewPrivateCampaignRestartEffectsCore(input: PrivateCampaignEffectRev
 		hostTransport: "immutable-versioned-archive" };
 }
 
+/** A reviewed opaque gap permits fresh work from the last real carry, but its
+ * unquantified provider charge and discarded research state remain separate.
+ * Bind every such run into the next quarantine policy without making it a
+ * fabricated request-level audit or an accepted scientific result. */
+function bindReviewedOpaqueGaps(base: ReviewedRestartEffectPolicy,
+	gaps: readonly OpaqueExecutedRunGap[] | undefined): ReviewedRestartEffectPolicy {
+	if (!gaps?.length) return base;
+	if (gaps.some(gap => gap.kind !== "opaque-executed-run-gap" ||
+		gap.effects !== "quarantined-source-reviewed" || gap.accounting !== "unquantified" ||
+		gap.carryArtifact !== "absent") ||
+		new Set(gaps.map(gap => `${gap.source.runId}/${gap.source.runAttempt}`)).size !== gaps.length)
+		reject("opaque executed run lacks reviewed effect and unknown accounting quarantine");
+	const policyId = "mul-pis-reviewed-opaque-gap-fresh-restart-v1";
+	return { ...base, policyId,
+		policySha256: sha256(JSON.stringify({ policyId, basePolicyId: base.policyId,
+			basePolicySha256: base.policySha256, gaps })) };
+}
+
 /** Production admission only accepts the live verifier's private proof brand. */
 export function reviewPrivateCampaignRestartEffects(input: PrivateCampaignEffectReviewInput): ReviewedRestartEffectPolicy {
-	return reviewPrivateCampaignRestartEffectsCore(input);
+	const base = reviewPrivateCampaignRestartEffectsCore(input);
+	return bindReviewedOpaqueGaps(base,
+		authenticatedReviewedOpaqueRunGaps(input.proof, input.privateBundle));
 }
 
 /** Pure classifier hook for synthetic, offline policy tests; never used by admission. */
@@ -826,5 +859,10 @@ export const offlineRestartPolicyChecks = {
 	reviewWithHostEffect(input: PrivateCampaignEffectReviewInput,
 		evidence: AuthenticatedHostEffectEvidence): ReviewedRestartEffectPolicy {
 		return reviewPrivateCampaignRestartEffectsCore(input, evidence);
+	},
+	reviewWithHostEffectAndOpaqueGaps(input: PrivateCampaignEffectReviewInput,
+		evidence: AuthenticatedHostEffectEvidence,
+		gaps: readonly OpaqueExecutedRunGap[]): ReviewedRestartEffectPolicy {
+		return bindReviewedOpaqueGaps(reviewPrivateCampaignRestartEffectsCore(input, evidence), gaps);
 	},
 };

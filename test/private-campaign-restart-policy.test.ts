@@ -332,6 +332,66 @@ function unknownTransportFixture() {
 		check: () => offlineRestartPolicyChecks.reviewWithHostEffect(f.input, evidence) };
 }
 
+function readOnlyNoGoalFixture() {
+	const f = unknownTransportFixture();
+	const latestGoal = f.checkpoint.boundedRuns.at(-1)!.runId;
+	f.checkpoint.boundedRuns.pop();
+	f.bundle["objective-checkpoint.json"] = JSON.stringify(f.checkpoint);
+	const bindings = JSON.parse(f.bundle["independent-restart-goal-binding.json"]);
+	bindings.entries.pop();
+	f.bundle["independent-restart-goal-binding.json"] = JSON.stringify(bindings);
+	f.history.entries = f.history.entries.filter((entry: { goalRunId: string }) =>
+		entry.goalRunId !== latestGoal);
+	f.bundle["research-history.json"] = JSON.stringify(f.history);
+	f.receipt.goals = [];
+	f.receipt.sessions = [{ sessionId: f.receipt.sessions[0].sessionId, kind: "read-dir" }] as any;
+	f.evidence.requestAudit.requests = f.evidence.requestAudit.requests.map((row: any) => ({
+		...row, responseReceived: true, status: "settled", settledCny: 0.001,
+		unknownObservedCny: null }));
+	f.evidence.requestAudit.settledCny = f.evidence.requestAudit.requests.length * 0.001;
+	f.evidence.requestAudit.unknownObservedCny = 0;
+	f.evidence.reviewedEffectAncestry[0].abandonedWithoutGoal = true;
+	f.input.operationRefs = [oldRef, newRef];
+	return f;
+}
+
+test("read-only assessment without a goal carries observed charges and abandoned claim", () => {
+	const f = readOnlyNoGoalFixture();
+	const reviewed = f.check();
+	assert.equal(reviewed.policyId, "mul-pis-complete-host-no-goal-census-v2");
+	assert.equal(reviewed.unknownBillingHeld, true);
+	assert.deepEqual(reviewed.operationAttestations.map(row => row.operationRef), [oldRef, newRef]);
+	const undelivered = readOnlyNoGoalFixture();
+	undelivered.evidence.requestAudit.requests[0].responseReceived = false;
+	assert.throws(undelivered.check, /host-effect census is outside/);
+	const unconfined = readOnlyNoGoalFixture();
+	unconfined.receipt.sessions[0].kind = "custom";
+	assert.throws(unconfined.check, /host-effect census is outside/);
+	const unbound = readOnlyNoGoalFixture();
+	unbound.evidence.reviewedEffectAncestry[0].abandonedWithoutGoal = false;
+	assert.throws(unbound.check, /host-effect census is outside/);
+});
+
+test("a reviewed opaque executed gap changes fresh-restart policy without settling it", () => {
+	const f = unknownTransportFixture();
+	const base = f.check();
+	const gap: any = { version: 1, kind: "opaque-executed-run-gap",
+		source: { runId: "100000", runAttempt: 1, runNumber: 25, commit: "b".repeat(40) },
+		priorCarryEnvelopeSha256: hash("previous sealed carry"), carryArtifact: "absent",
+		accounting: "unquantified", effects: "quarantined-source-reviewed",
+		terminal: { state: "terminal" },
+		resultArtifact: { artifactId: "200000", archiveSha256: hash("encrypted archive") } };
+	const reviewed = offlineRestartPolicyChecks.reviewWithHostEffectAndOpaqueGaps(
+		f.input, f.evidence, [gap]);
+	assert.equal(reviewed.policyId, "mul-pis-reviewed-opaque-gap-fresh-restart-v1");
+	assert.notEqual(reviewed.policySha256, base.policySha256);
+	assert.deepEqual(reviewed.operationAttestations, base.operationAttestations);
+	assert.equal(reviewed.unknownBillingHeld, true);
+	gap.effects = "unreviewed";
+	assert.throws(() => offlineRestartPolicyChecks.reviewWithHostEffectAndOpaqueGaps(
+		f.input, f.evidence, [gap]), /opaque executed run lacks reviewed effect/);
+});
+
 test("one-time reviewed v3 source preserves old quarantine and rejects two new tasks", () => {
 	const f = oneTimeLegacyV3Fixture();
 	const result = f.check();

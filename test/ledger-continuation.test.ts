@@ -5,12 +5,13 @@ import os from "node:os";
 import path from "node:path";
 import { deflateRawSync } from "node:zlib";
 import test, { type TestContext } from "node:test";
-import { authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, originalObjectiveMatchesSignedBootstrap, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE } from "../src/runner/ledger-continuation.ts";
+import { authenticateOpaqueGapSourceForOfflineTests, authenticatedReviewedOpaqueRunGaps, authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, originalObjectiveMatchesSignedBootstrap, reviewKnownOpaqueGapSource, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE } from "../src/runner/ledger-continuation.ts";
 import type { RequestAuditSnapshot } from "../src/runner/ledger-continuation.ts";
 import { DeepSeekCampaignBudget, campaignSessionEffectId, type CampaignAdmissionRejection } from "../src/runner/deepseek-campaign.ts";
 import { offlineChecks } from "../scripts/manual-private-campaign.ts";
 import { Workspace } from "../src/workspace.ts";
 import { reserveIndependentRestart, bindIndependentRestartGoal } from "../src/m07/independent-restart.ts";
+import { objectiveProgress, type OriginalObjectiveContractV1 } from "../src/m07/objective-progress.ts";
 import { verifyDeepSeekCnyBilling, nativeCnyPricingRecord } from "../src/runner/deepseek-cny-pricing.ts";
 import { verifyDeepSeekProviderOutputLimit, providerOutputLimitRecord } from "../src/runner/deepseek-provider-limits.ts";
 import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, ONE_USE_PUSH_MARKER } from "../src/runner/signed-mission-ledger.ts";
@@ -1791,4 +1792,461 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 		afterAbandoned.priorPrivateBundle);
 	assert(resumedAfterAbandoned, "fresh bound goal after abandoned claim retains reviewed ancestry");
 	assert.equal(resumedAfterAbandoned.reviewedEffectAncestry.length, 2);
+});
+
+test("received read-only assessment without a new goal preserves an unbound reviewed claim", async t => {
+	const f = await fixture(t);
+	const contract: OriginalObjectiveContractV1 = { version: 1, kind: "original-objective",
+		id: "assessment-contract", createdAt: "2026-10-06T00:00:00Z", goal: "synthetic improvement",
+		goalSource: "user-intent-summary", inputNames: ["source.cpp", "problem.md", "notes.txt"],
+		obligations: [{ id: "speed", description: "Improve the synthetic case" }], closure: "open-ended" };
+	const selectedArtifacts = ["candidate.cpp", "verification.json", "workflow-archive.json"];
+	const oldRuns = [{ runId: "old-goal", outcome: "active", unresolvedOperationIds: ["O001"] }];
+	const oldCheckpoint = objectiveProgress(contract, { boundedRuns: oldRuns,
+		selectedArtifacts, unresolvedOperationIds: ["old-goal/O001"], stopReason: "bounded-run-incomplete" });
+	const emptyReservations = JSON.stringify({ version: 1,
+		kind: "host-independent-restart-reservations", entries: [] });
+	const emptyBindings = JSON.stringify({ version: 1,
+		kind: "host-independent-restart-goal-bindings", entries: [] });
+	const emptyAssessments = JSON.stringify({ version: 1,
+		kind: "m07-original-objective-assessment-receipts", receipts: [] });
+	const oldBundle = { "candidate.cpp": "synthetic selected source", "verification.json": "{}",
+		"workflow-archive.json": "{}", "original-objective.json": JSON.stringify(contract),
+		"objective-checkpoint.json": JSON.stringify(oldCheckpoint),
+		"objective-assessment-receipts.json": emptyAssessments,
+		"independent-restart-quarantine.json": emptyReservations,
+		"independent-restart-goal-binding.json": emptyBindings };
+	const seedEnvelopeB64 = f.signSeed({ ...f.payload, version: 2,
+		rootReviewedAnchor: { commit: sha("a"), artifactSha256: "e".repeat(64),
+			digestScope: "encrypted-result-envelope" },
+		bootstrap: { contractId: contract.id, sourceSha256: "d".repeat(64),
+			format: "deflate-raw-json-v1", filesB64: deflateRawSync(JSON.stringify(oldBundle)).toString("base64") } });
+	const firstOpened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7002, sha("b")),
+		request: github([anchor, first]), loadCarryArtifact: async () => "unused" });
+	const legacy = sealHistoricalCarryForOfflineTests(firstOpened, { settledCny: 0,
+		unknownOrInFlightCny: 0.25, requestAudit: audit(0, 0.25) });
+	const firstDone = { ...first, status: "completed", conclusion: "failure" };
+	const zeroOpened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7003, sha("c")),
+		request: github([anchor, firstDone, second]),
+		loadCarryArtifact: async () => legacy.envelopeB64 });
+	const emptyAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
+		requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
+	const zero = zeroOpened.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: emptyAudit });
+	const secondDone = { ...second, status: "completed", conclusion: "failure" };
+	const work = run(7005, 4, "in_progress", sha("e"));
+	const next = run(7006, 5, "in_progress", sha("f"));
+	const mock = (runs: object[]): typeof fetch => {
+		const base = github(runs);
+		return async (url, init) => {
+			const address = String(url);
+			for (const [id, commit, artifactId] of [[7003, sha("c"), 9003],
+				[7005, sha("e"), 9005], [7006, sha("f"), 9006]] as const) {
+				if (address.includes(`/runs/${id}/jobs?`)) return new Response(JSON.stringify({ total_count: 1,
+					jobs: [{ id: id + 1000, run_id: id, run_attempt: 1, head_sha: commit,
+						name: "private-campaign", status: "completed", conclusion: "failure",
+						steps: [{ name: "Run private campaign", status: "completed", conclusion: "failure" }] }] }));
+				if (address.includes(`/runs/${id}/artifacts?`)) return new Response(JSON.stringify({ total_count: 2,
+					artifacts: [{ id: artifactId, name: CARRY_ARTIFACT_NAME, expired: false,
+						workflow_run: { id, head_sha: commit } },
+						{ id: artifactId + 100, name: MISSION_ARTIFACT, expired: false,
+							digest: `sha256:${"a".repeat(64)}`, workflow_run: { id, head_sha: commit } }] }));
+			}
+			return base(url, init);
+		};
+	};
+	const openWork = () => openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7005, sha("e")),
+		request: mock([anchor, firstDone, secondDone, work]),
+		loadCarryArtifact: async ({ artifactId }) => artifactId === "9003" ? zero.envelopeB64 : legacy.envelopeB64 });
+	const profile = await verifyDeepSeekCnyBilling({ apiKey: "synthetic-key",
+		now: () => new Date("2026-10-06T10:30:00.000Z"),
+		request: async () => new Response(JSON.stringify({ is_available: true,
+			balance_infos: [{ currency: "CNY", total_balance: "PRIVATE-AMOUNT",
+				granted_balance: "PRIVATE-GRANT", topped_up_balance: "PRIVATE-TOPUP" }] }),
+			{ status: 200 }) });
+	const usage = { input: 10, output: 10, cacheRead: 0, cacheWrite: 0,
+		totalTokens: 20, reportedUsdCost: 0.01, costStatus: "priced" };
+	const builderSession = campaignSessionEffectId("builder-session");
+	const firstRow = { requestId: "builder-request", sessionId: builderSession,
+		responseReceived: true, inputPayloadBytes: 100, status: "settled" as const,
+		settledCny: 0.5, unknownObservedCny: null, reportedUsage: usage };
+	const firstAudit = { ...emptyAudit, requests: [firstRow], settledCny: 0.5,
+		pricingProfile: nativeCnyPricingRecord(profile) };
+	const workCheckpoint = objectiveProgress(contract, { boundedRuns: [...oldRuns,
+		{ runId: "new-goal", outcome: "partial", unresolvedOperationIds: [] }],
+		selectedArtifacts, unresolvedOperationIds: ["old-goal/O001"],
+		stopReason: "bounded-run-incomplete" });
+	const zeroDigest = createHash("sha256").update(Buffer.from(zero.envelopeB64, "base64")).digest("hex");
+	const workReceipt = { version: 1, kind: "m07-host-effect-census",
+		source: { runId: "7005", runAttempt: 1, commit: sha("e") },
+		priorEnvelopeSha256: zeroDigest, historicalGoalRunIds: ["old-goal"],
+		goals: [{ runId: "new-goal", outcome: "partial",
+			tasks: [{ taskId: "T001", mode: "execute", status: "rejected", sessionId: builderSession }],
+			operations: [{ id: "O001", taskId: "T001", status: "response-received" }] }],
+		sessions: [{ sessionId: builderSession, kind: "confined-execution",
+			goalRunId: "new-goal", taskId: "T001", workRoot: "/tmp/synthetic/assessment-T001",
+			grant: { version: 1, kind: "confined-campaign-files", root: "/tmp/synthetic/assessment-T001",
+				writableFiles: ["candidate.cpp", "lesson-delta.json"] } }],
+		requestIds: [firstRow.requestId] };
+	const workBundle = { ...oldBundle, "objective-checkpoint.json": JSON.stringify(workCheckpoint),
+		"host-effect-receipt.json": JSON.stringify(workReceipt) };
+	const workOpened = await openWork();
+	const sealedWork = workOpened.sealCurrent({ settledCny: 0.5, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: firstAudit, privateBundle: workBundle });
+	const openAssessment = () => openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7006, sha("f")),
+		request: mock([anchor, firstDone, secondDone,
+			{ ...work, status: "completed", conclusion: "failure" }, next]),
+		loadCarryArtifact: async () => sealedWork.envelopeB64 });
+	const assessmentOpened = await openAssessment();
+	assert(authenticatedHostEffectEvidence(assessmentOpened.priorCarryProof,
+		assessmentOpened.priorPrivateBundle));
+	const priorProof = assessmentOpened.priorCarryProof!;
+	const assessorRaw = "synthetic-assessor";
+	const assessorSession = campaignSessionEffectId(assessorRaw);
+	const rows = Array.from({ length: 12 }, (_, index) => ({ requestId: `assessment-${index}`,
+		sessionId: assessorSession, responseReceived: true, inputPayloadBytes: 100,
+		status: "settled" as const, settledCny: index === 0 ? 0.25 : 0,
+		unknownObservedCny: null, reportedUsage: usage }));
+	const assessmentAudit = { ...emptyAudit, requests: rows, settledCny: 0.25,
+		pricingProfile: nativeCnyPricingRecord(profile) };
+	const assessment = { version: 1 as const, decision: "continue" as const,
+		rationale: "Synthetic assessment needs more evidence", evidenceRefs: [],
+		unresolvedObligations: ["speed"], unresolvedDetails: ["Synthetic evidence unread"],
+		nextTask: { objective: "Improve synthetic case", addresses: ["speed"],
+			adapterScope: "registered-csr-experiment" }, sessionId: assessorRaw,
+		model: "synthetic-model", evidenceRead: [], unreadEvidence: ["candidate.cpp"] };
+	const assessmentStop = "assessment-evidence-unread" as const;
+	const assessmentCheckpoint = objectiveProgress(contract, { boundedRuns: workCheckpoint.boundedRuns,
+		selectedArtifacts, availableArtifacts: [...selectedArtifacts,
+			"execution-capabilities.json", "restored-candidate-verification.json"],
+		unresolvedOperationIds: ["old-goal/O001"], assessment,
+		assessmentHistory: [{ iteration: 1, assessment, stopReason: assessmentStop, advanced: false }],
+		stopReason: assessmentStop });
+	const assessmentChain = { version: 1, kind: "m07-original-objective-assessment-receipts",
+		receipts: [{ version: 1, kind: "m07-original-objective-assessment",
+			runId: "synthetic-assessment-run", status: "failed", sessions: [{
+				sessionId: assessorRaw, role: "research", model: "synthetic-model",
+				boundaryMode: "fresh", boundaryIntent: "independent-judgment",
+				toolGrantKind: "read-dir", evidenceLabels: [] }] }] };
+	const quarantineReceipt = { version: 1, kind: "host-independent-goal-quarantine",
+		prior: { source: { runId: priorProof.source.runId,
+			runAttempt: priorProof.source.runAttempt, commit: priorProof.source.commit },
+			envelopeSha256: priorProof.envelopeSha256,
+			privateBundleSha256: priorProof.privateBundleSha256,
+			reviewedPolicySha256: "b".repeat(64), selectedTupleSha256: "c".repeat(64) },
+		quarantine: { operationOutcome: "unknown", selectedFromFailedAttempt: false,
+			operationRefs: ["old-goal/O001"], historicalGoalOutcomes: workCheckpoint.boundedRuns },
+		freshWorkspace: { workspaceId: "assessment-workspace", restartNonce: "synthetic-nonce" } };
+	const claim = { claimId: "synthetic-reviewed-claim", currentJobId: "synthetic-job",
+		priorEnvelopeSha256: priorProof.envelopeSha256,
+		currentRunId: "7006", currentRunAttempt: 1, currentCommit: sha("f") };
+	const noGoalReceipt = { version: 1, kind: "m07-host-effect-census",
+		source: { runId: "7006", runAttempt: 1, commit: sha("f") },
+		priorEnvelopeSha256: priorProof.envelopeSha256,
+		historicalGoalRunIds: workCheckpoint.boundedRuns.map(row => row.runId), goals: [],
+		sessions: [{ sessionId: assessorSession, kind: "read-dir" }],
+		requestIds: rows.map(row => row.requestId) };
+	const assessmentBundle = { ...workBundle,
+		"objective-checkpoint.json": JSON.stringify(assessmentCheckpoint),
+		"objective-assessment-receipts.json": JSON.stringify(assessmentChain),
+		"independent-restart-quarantine.json": JSON.stringify({ version: 1,
+			kind: "host-independent-restart-reservations",
+			entries: [{ receipt: quarantineReceipt, claim }] }),
+		"host-effect-receipt.json": JSON.stringify(noGoalReceipt) };
+	const carry = assessmentOpened.sealCurrent({ settledCny: 0.25, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: assessmentAudit,
+		privateBundle: assessmentBundle });
+	const reopened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7007, sha("1")),
+		request: mock([anchor, firstDone, secondDone,
+			{ ...work, status: "completed", conclusion: "failure" },
+			{ ...next, status: "completed", conclusion: "failure" },
+			run(7007, 6, "in_progress", sha("1"))]),
+		loadCarryArtifact: async () => carry.envelopeB64 });
+	const effect = authenticatedHostEffectEvidence(reopened.priorCarryProof,
+		reopened.priorPrivateBundle);
+	assert(effect, "received read-only assessment with no M07 goal must retain review authority");
+	assert.equal(effect.receipt.goals.length, 0);
+	assert.equal(effect.requestAudit.requests.length, 12);
+	assert.equal(effect.reviewedEffectAncestry.at(-1)?.abandonedWithoutGoal, true);
+	const invalidAssessment = await openAssessment();
+	const badChain = { ...assessmentBundle,
+		"objective-assessment-receipts.json": emptyAssessments };
+	assert.throws(() => invalidAssessment.sealCurrent({ settledCny: 0.25,
+		unknownObservedCny: 0, unpricedRequestCount: 0,
+		requestAudit: assessmentAudit, privateBundle: badChain }),
+		/reviewed effect ancestry is not bound/);
+	for (const [label, change] of [
+		["unreceived assessor request", (bundle: Record<string, string>, audit: any) => {
+			audit.requests[0].responseReceived = false;
+		}],
+		["widened assessor grant", (bundle: Record<string, string>) => {
+			const row = JSON.parse(bundle["host-effect-receipt.json"]);
+			row.sessions[0].kind = "confined-execution";
+			bundle["host-effect-receipt.json"] = JSON.stringify(row);
+		}],
+		["changed historical unknown", (bundle: Record<string, string>) => {
+			const row = JSON.parse(bundle["objective-checkpoint.json"]);
+			row.continuation.unresolvedOperationIds = [];
+			bundle["objective-checkpoint.json"] = JSON.stringify(row);
+		}],
+		["changed selected tuple", (bundle: Record<string, string>) => {
+			bundle["candidate.cpp"] = "unselected source";
+		}],
+	] as Array<[string, (bundle: Record<string, string>, audit: any) => void]>) {
+		const candidate = { ...assessmentBundle };
+		const account = structuredClone(assessmentAudit);
+		change(candidate, account);
+		const opened = await openAssessment();
+		assert.throws(() => opened.sealCurrent({ settledCny: account.settledCny,
+			unknownObservedCny: account.unknownObservedCny,
+			unpricedRequestCount: account.unpricedRequestCount,
+			requestAudit: account, privateBundle: candidate }), /reviewed effect ancestry is not bound/,
+			label);
+	}
+});
+
+test("one exact missing-carry execution stays opaque and compacts into an emergency carry", async t => {
+	const f = await compactedFixture(t);
+	const firstDone = { ...first, status: "completed", conclusion: "success" };
+	const secondDone = { ...second, status: "completed", conclusion: "success" };
+	const gap = { ...third, status: "completed", conclusion: "failure" };
+	const next = run(7006, 5, "in_progress", sha("f"));
+	const gapArtifact = { id: 9505, name: MISSION_ARTIFACT, expired: false,
+		digest: `sha256:${"9".repeat(64)}`,
+		workflow_run: { id: 7005, head_sha: sha("e") } };
+	const requestFor = (runs: object[], carry: unknown[] = []): typeof fetch => async (url, init) => {
+		const address = String(url);
+		if (address.includes("/workflows/manual-private-campaign.yml/runs?"))
+			return new Response(JSON.stringify({ total_count: runs.length, workflow_runs: [...runs].reverse() }));
+		if (address.includes("/runs/7005/jobs?")) return new Response(JSON.stringify({ total_count: 1,
+			jobs: [{ id: 6005, run_id: 7005, run_attempt: 1, head_sha: sha("e"),
+				name: "private-campaign", status: "completed", conclusion: "failure",
+				steps: [{ name: "Run private campaign", status: "completed", conclusion: "failure" }] }] }));
+		if (address.includes("/runs/7005/artifacts?")) return new Response(JSON.stringify({
+			total_count: 1 + carry.length, artifacts: [gapArtifact, ...carry] }));
+		if (address.includes("/runs/7003/artifacts?")) return new Response(JSON.stringify({ total_count: 2,
+			artifacts: [{ id: 9003, name: CARRY_ARTIFACT_NAME, expired: false,
+				workflow_run: { id: 7003, head_sha: sha("c") } },
+				{ id: 9103, name: MISSION_ARTIFACT, expired: false,
+					digest: `sha256:${"7".repeat(64)}`,
+					workflow_run: { id: 7003, head_sha: sha("c") } }] }));
+		if (address.includes("/runs/7006/jobs?")) return new Response(JSON.stringify({ total_count: 1,
+			jobs: [{ id: 6006, run_id: 7006, run_attempt: 1, head_sha: sha("f"),
+				name: "private-campaign", status: "completed", conclusion: "failure",
+				steps: [{ name: "Run private campaign", status: "completed", conclusion: "failure" }] }] }));
+		if (address.includes("/runs/7006/artifacts?")) return new Response(JSON.stringify({ total_count: 2,
+			artifacts: [{ id: 9006, name: CARRY_ARTIFACT_NAME, expired: false,
+				workflow_run: { id: 7006, head_sha: sha("f") } },
+				{ id: 9106, name: MISSION_ARTIFACT, expired: false,
+					digest: `sha256:${"8".repeat(64)}`,
+					workflow_run: { id: 7006, head_sha: sha("f") } }] }));
+		return f.request(url, init);
+	};
+	const openGap = (request: typeof fetch, review = true) => openLedgerContinuation({ ...f,
+		githubToken: "synthetic-token", current: current(7006, sha("f")), request,
+		loadCarryArtifact: async () => f.secondCarry.envelopeB64,
+		...(review ? { reviewOpaqueGapSource: async (facts: any) =>
+			authenticateOpaqueGapSourceForOfflineTests(facts.source,
+				facts.resultArtifact.archiveSha256, facts.priorCarryEnvelopeSha256) } : {}) });
+	const runs = [anchor, firstDone, secondDone, gap, next];
+	await assert.rejects(openGap(requestFor(runs), false), /independent exact-source authority/);
+	for (const carry of [
+		[{ id: 9005, name: CARRY_ARTIFACT_NAME, expired: true,
+			workflow_run: { id: 7005, head_sha: sha("e") } }],
+		[{ id: 9005, name: CARRY_ARTIFACT_NAME, expired: false,
+			workflow_run: { id: 7005, head_sha: sha("e") } },
+			{ id: 9006, name: CARRY_ARTIFACT_NAME, expired: false,
+				workflow_run: { id: 7005, head_sha: sha("e") } }],
+	]) await assert.rejects(openGap(requestFor(runs, carry)), /artifact is unavailable or ambiguous/);
+	const opened = await openGap(requestFor(runs));
+	assert.equal(opened.opaqueExecutedRuns.length, 1);
+	assert.equal(opened.opaqueExecutedRuns[0].accounting, "unquantified");
+	assert.equal(opened.opaqueExecutedRuns[0].effects, "quarantined-source-reviewed");
+	assert.equal(opened.priorCarryProof?.source.runId, "7003");
+	assert.deepEqual(authenticatedReviewedOpaqueRunGaps(opened.priorCarryProof,
+		opened.priorPrivateBundle), opened.opaqueExecutedRuns);
+	assert.equal(authenticatedReviewedOpaqueRunGaps({ ...opened.priorCarryProof },
+		opened.priorPrivateBundle), undefined);
+	await assert.rejects(opened.claimOneUse("0".repeat(64)), /exact authenticated prior carry/);
+	const profile = await verifyDeepSeekCnyBilling({ apiKey: "synthetic-key",
+		now: () => new Date("2026-10-06T10:30:00.000Z"),
+		request: async () => new Response(JSON.stringify({ is_available: true,
+			balance_infos: [{ currency: "CNY", total_balance: "PRIVATE-AMOUNT",
+				granted_balance: "PRIVATE-GRANT", topped_up_balance: "PRIVATE-TOPUP" }] }),
+			{ status: 200 }) });
+	const currentAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
+		requests: [{ requestId: "current-priced", inputPayloadBytes: 100,
+			status: "settled" as const, settledCny: 0.5, unknownObservedCny: null,
+			reportedUsage: { input: 10, output: 10, cacheRead: 0, cacheWrite: 0,
+				totalTokens: 20, reportedUsdCost: 0.01, costStatus: "priced" } },
+			{ requestId: "current-unknown", inputPayloadBytes: 100,
+				status: "unknown" as const, settledCny: null, unknownObservedCny: 0.25,
+				reportedUsage: null }],
+		settledCny: 0.5, unknownObservedCny: 0.25, unpricedRequestCount: 0,
+		pricingProfile: nativeCnyPricingRecord(profile) };
+	const inFlight = structuredClone(currentAudit);
+	(inFlight.requests[1] as any).status = "in-flight";
+	assert.throws(() => opened.sealEmergencyCurrent({ settledCny: 0.5, unknownObservedCny: 0.25,
+		unpricedRequestCount: 0, requestAudit: inFlight }, "effect-review-incomplete"), /invalid or in-flight/);
+	const emergency = opened.sealEmergencyCurrent({ settledCny: 0.5, unknownObservedCny: 0.25,
+		unpricedRequestCount: 0, requestAudit: currentAudit,
+		privateBundle: { "candidate.cpp": "unreviewed replacement" } }, "effect-review-incomplete");
+	const authenticatedSeed = await authenticateSignedMissionSeed({ ...f,
+		envelopeB64: f.seedEnvelopeB64 });
+	const encrypted = JSON.parse(Buffer.from(emergency.envelopeB64, "base64").toString());
+	const decipher = createDecipheriv("aes-256-gcm",
+		authenticatedSeed.derivePrivateKey("mul-pis-ledger-continuation-v1"),
+		Buffer.from(encrypted.nonce, "base64"));
+	decipher.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
+		authenticatedSeed.seedDigest, 3, encrypted.parentDigest,
+		{ runId: "7006", runAttempt: 1, runNumber: 5, commit: sha("f") }])));
+	decipher.setAuthTag(Buffer.from(encrypted.tag, "base64"));
+	const emergencyCheckpoint = JSON.parse(Buffer.concat([
+		decipher.update(Buffer.from(encrypted.ciphertext, "base64")), decipher.final()]).toString());
+	assert.deepEqual(emergencyCheckpoint.requestAudit, currentAudit);
+	assert.equal(emergencyCheckpoint.currentEffectReview, "pending");
+	assert.deepEqual(emergencyCheckpoint.opaqueExecutedRuns, opened.opaqueExecutedRuns);
+	assert.throws(() => opened.sealEmergencyCurrent({ settledCny: 0.5, unknownObservedCny: 0.25,
+		unpricedRequestCount: 0, requestAudit: currentAudit }, "effect-review-incomplete"), /unsealed/);
+	const later = run(7007, 6, "in_progress", sha("1"));
+	const reopened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7007, sha("1")),
+		request: async (url, init) => {
+			if (String(url).includes("/runs/7005/artifacts?"))
+				throw new Error("compacted old gap artifact must not be fetched");
+			return requestFor([anchor, firstDone, secondDone, gap,
+				{ ...next, status: "completed", conclusion: "failure" }, later])(url, init);
+		},
+		loadCarryArtifact: async ({ artifactId }) => {
+			assert.equal(artifactId, "9006"); return emergency.envelopeB64;
+		} });
+	assert.equal(reopened.opaqueExecutedRuns.length, 1);
+	assert.equal(reopened.opaqueExecutedRuns[0].source.runId, "7005");
+	assert.equal(reopened.priorCarryProof, undefined);
+	assert.equal(reopened.priorSettledCny, 0.5);
+	assert.equal(reopened.priorUnknownObservedCny, 0.25);
+	assert.equal(reopened.priorPrivateBundle?.["candidate.cpp"], "synthetic root evidence");
+
+	const liveRequest: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.endsWith("/actions/runs/7006")) return new Response(JSON.stringify(next));
+		if (address.includes("/runs/7006/jobs?")) return new Response(JSON.stringify({ total_count: 1,
+			jobs: [{ id: 6006, run_id: 7006, run_attempt: 1, head_sha: sha("f"),
+				name: "private-campaign", status: "in_progress", conclusion: null,
+				steps: [{ name: "Run private campaign", status: "in_progress", conclusion: null }] }] }));
+		return requestFor(runs)(url, init);
+	};
+	const admitted = await openGap(liveRequest);
+	const claim = await admitted.claimOneUse(admitted.priorCarryProof!.envelopeSha256);
+	assert.equal(claim.priorEnvelopeSha256, admitted.priorCarryProof!.envelopeSha256);
+	assert.equal(claim.currentRunId, "7006");
+	const emptyAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
+		requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
+	const normal = admitted.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: emptyAudit });
+	assert.throws(() => admitted.sealEmergencyCurrent({ settledCny: 0,
+		unknownObservedCny: 0, unpricedRequestCount: 0, requestAudit: emptyAudit },
+		"effect-review-incomplete"), /unsealed/);
+	const normalReopened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7007, sha("1")),
+		request: async (url, init) => {
+			if (String(url).includes("/runs/7005/artifacts?"))
+				throw new Error("compacted old gap artifact must not be fetched");
+			return requestFor([anchor, firstDone, secondDone, gap,
+				{ ...next, status: "completed", conclusion: "failure" }, later])(url, init);
+		}, loadCarryArtifact: async ({ artifactId }) => {
+			assert.equal(artifactId, "9006"); return normal.envelopeB64;
+		} });
+	assert.equal(normalReopened.opaqueExecutedRuns[0].accounting, "unquantified");
+	assert.equal(normalReopened.opaqueExecutedRuns[0].effects, "quarantined-source-reviewed");
+	assert.equal(normalReopened.priorCarryProof?.source.runId, "7006");
+	assert.deepEqual(authenticatedReviewedOpaqueRunGaps(normalReopened.priorCarryProof,
+		normalReopened.priorPrivateBundle), normalReopened.opaqueExecutedRuns);
+	const normalOuter = JSON.parse(Buffer.from(normal.envelopeB64, "base64").toString());
+	const normalSource = { runId: "7006", runAttempt: 1, runNumber: 5, commit: sha("f") };
+	const key = authenticatedSeed.derivePrivateKey("mul-pis-ledger-continuation-v1");
+	const reader = createDecipheriv("aes-256-gcm", key, Buffer.from(normalOuter.nonce, "base64"));
+	reader.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
+		authenticatedSeed.seedDigest, 3, normalOuter.parentDigest, normalSource])));
+	reader.setAuthTag(Buffer.from(normalOuter.tag, "base64"));
+	const altered = JSON.parse(Buffer.concat([
+		reader.update(Buffer.from(normalOuter.ciphertext, "base64")), reader.final()]).toString());
+	altered.opaqueExecutedRuns[0].priorCarryEnvelopeSha256 = "0".repeat(64);
+	const nonce = randomBytes(12);
+	const writer = createCipheriv("aes-256-gcm", key, nonce);
+	writer.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
+		authenticatedSeed.seedDigest, 3, normalOuter.parentDigest, normalSource])));
+	const forgedCipher = Buffer.concat([writer.update(JSON.stringify(altered)), writer.final()]);
+	const forged = Buffer.from(JSON.stringify({ version: 3, parentDigest: normalOuter.parentDigest,
+		nonce: nonce.toString("base64"), ciphertext: forgedCipher.toString("base64"),
+		tag: writer.getAuthTag().toString("base64") })).toString("base64");
+	await assert.rejects(openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7007, sha("1")),
+		request: requestFor([anchor, firstDone, secondDone, gap,
+			{ ...next, status: "completed", conclusion: "failure" }, later]),
+		loadCarryArtifact: async () => forged }), /opaque gap predecessor digest/);
+});
+
+test("one-time opaque gap source authority pins the reviewed control request and terminal provider step", async () => {
+	const requestCommit = "db8263c88d9872cd592b43c70f7831cf74e290eb";
+	const firstParent = "6ee929545ec3a1d7194054aa4e98988ecd1bd665";
+	const source = { runId: "37507828650", runAttempt: 1, runNumber: 26, commit: requestCommit };
+	const terminal = { workflowId: "374865232", runStatus: "completed" as const,
+		runConclusion: "failure", jobId: "112420914600", jobName: "private-campaign" as const,
+		jobStatus: "completed" as const, jobConclusion: "failure", jobRunId: source.runId,
+		jobRunAttempt: 1, jobHeadSha: requestCommit,
+		providerStepStatus: "completed" as const, providerStepConclusion: "success" };
+	const resultArtifact = { repository: MISSION_REPOSITORY as typeof MISSION_REPOSITORY,
+		artifactId: "11431834153", artifactName: MISSION_ARTIFACT as typeof MISSION_ARTIFACT, runId: source.runId,
+		archiveSha256: "9c0c4e887c4a212148f0b52aa9e3f96448d50d153b3151e1a741d66bd5f472b5",
+		digestScope: "github-artifact-archive" as const };
+	const facts = { source, terminal, resultArtifact,
+		priorCarryEnvelopeSha256: "0f29b2f1b5ef0d3bee9b53e7d86168621f904c355bf55d46c5557d4cbd6d412c" };
+	const submitted = { sha: requestCommit, message: REUSABLE_RUN_REQUEST_MESSAGE,
+		parents: [{ sha: firstParent }], tree: { sha: sha("a") } };
+	const parent = { sha: firstParent, tree: { sha: sha("a") } };
+	const reviewedRun = { id: Number(source.runId), run_number: 26, run_attempt: 1,
+		workflow_id: 374865232, head_sha: requestCommit, event: "push",
+		head_branch: "run-requests/workflow-learning-reliability",
+		actor: { login: "SakuyaInazaki" }, status: "completed", conclusion: "failure" };
+	const job = { id: 112420914600, run_id: Number(source.runId), run_attempt: 1,
+		head_sha: requestCommit, name: "private-campaign", status: "completed",
+		conclusion: "failure", steps: [{ number: 10, name: "Run private campaign",
+			status: "completed", conclusion: "success" }] };
+	const requestFor = (change?: (rows: Record<string, any>) => void): typeof fetch => async url => {
+		const rows: Record<string, any> = { submitted: structuredClone(submitted),
+			parent: structuredClone(parent), reviewedRun: structuredClone(reviewedRun),
+			jobs: { total_count: 1, jobs: [structuredClone(job)] },
+			ci: { workflow_runs: [{ head_sha: firstParent,
+				head_branch: "improve/workflow-learning-reliability", event: "push",
+				run_attempt: 1, conclusion: "success" }] } };
+		change?.(rows);
+		const address = String(url);
+		const value = address.includes(`/git/commits/${requestCommit}`) ? rows.submitted :
+			address.includes(`/git/commits/${firstParent}`) ? rows.parent :
+			address.includes(`/actions/runs/${source.runId}/jobs?`) ? rows.jobs :
+			address.endsWith(`/actions/runs/${source.runId}`) ? rows.reviewedRun : rows.ci;
+		return new Response(JSON.stringify(value));
+	};
+	assert.equal((await reviewKnownOpaqueGapSource(facts, "synthetic-token", requestFor()))?.kind,
+		"authenticated-opaque-gap-source-review");
+	for (const change of [
+		(rows: Record<string, any>) => { rows.submitted.message = "unreviewed request"; },
+		(rows: Record<string, any>) => { rows.submitted.tree.sha = sha("b"); },
+		(rows: Record<string, any>) => { rows.reviewedRun.conclusion = "success"; },
+		(rows: Record<string, any>) => { rows.reviewedRun.head_branch = "improve/workflow-learning-reliability"; },
+		(rows: Record<string, any>) => { rows.jobs.jobs[0].conclusion = "success"; },
+		(rows: Record<string, any>) => { rows.jobs.jobs[0].steps[0].conclusion = "failure"; },
+		(rows: Record<string, any>) => { rows.jobs.jobs[0].steps[0].number = 9; },
+	]) assert.equal(await reviewKnownOpaqueGapSource(facts, "synthetic-token", requestFor(change)), undefined);
+	assert.equal(await reviewKnownOpaqueGapSource({ ...facts, source: { ...source, runNumber: 25 } },
+		"synthetic-token", requestFor()), undefined);
+	assert.equal(await reviewKnownOpaqueGapSource({ ...facts,
+		terminal: { ...terminal, providerStepConclusion: "failure" } },
+		"synthetic-token", requestFor()), undefined);
 });
