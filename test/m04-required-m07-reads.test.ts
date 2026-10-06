@@ -58,13 +58,16 @@ test("M04 can choose no proposal after full selected M07 reads and sees exact pa
 	assert.match(message, /完整读取/);
 });
 
-test("M04 rejects an adopted proposal before merge when a required final page is truncated", async t => {
+test("M04 rejects an adopted proposal before merge when a required read tool reports an error", async t => {
 	const f = await fixture(t);
-	const fake = new FakeSessionRunner(() => `\`\`\`knowledge-proposals\n${JSON.stringify([
+	const proposal = `\`\`\`knowledge-proposals\n${JSON.stringify([
 		{ op: "create", type: "K", title: "Synthetic method", body: "Bounded synthetic method", usageDecision: "adopted" },
-	])}\n\`\`\``);
-	const create = fake.create.bind(fake);
-	fake.create = async spec => ({ ...await create(spec), readReturnEvents: () => returnedRanges(f.relative, true) });
+	])}\n\`\`\``;
+	const fake = new FakeSessionRunner(({ turnIndex }) => ({ text: proposal,
+		readReturns: turnIndex === 1 ? returnedRanges(f.relative, true) : [{
+			toolName: "m07_evidence_read", status: "error", path: f.relative[0], requested: {},
+			returned: { kind: "unknown" }, at: new Date().toISOString(),
+		}] }));
 	f.ctx.runner = fake;
 	const snapshot = await f.store.current();
 	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId }, freshSession: true,
@@ -76,6 +79,52 @@ test("M04 rejects an adopted proposal before merge when a required final page is
 	assert.ok(attempt);
 	assert.equal(attempt.status, "failed");
 	assert.equal(attempt.outputs.some(item => item.label === "知识提案"), false);
+});
+
+test("M04 repeats same-session missing-page feedback and uses only the final fully read judgement", async t => {
+	const f = await fixture(t);
+	const provisional = `\`\`\`knowledge-proposals\n${JSON.stringify([
+		{ op: "create", type: "K", title: "Provisional method", body: "Unsupported provisional claim", usageDecision: "adopted" },
+	])}\n\`\`\``;
+	const fake = new FakeSessionRunner(({ turnIndex, message }) => {
+		if (turnIndex > 1) assert.match(message, /untruncated final page/);
+		if (turnIndex === 3) assert.match(message, /previous repair turn added no complete read proof/);
+		return { text: turnIndex < 3 ? provisional : "No transferable lesson after complete evidence review; no knowledge proposal.",
+			readReturns: turnIndex === 1 ? [
+				{ toolName: "m07_evidence_read", status: "returned", path: f.relative[0], requested: {},
+					returned: { kind: "text", startLine: 1, endLine: 1, truncated: true }, at: new Date().toISOString() },
+				...returnedRanges(f.relative.slice(1)),
+			] : turnIndex === 3 ? [{ toolName: "m07_evidence_read", status: "returned", path: f.relative[0],
+				requested: {}, returned: { kind: "text", startLine: 2, endLine: 2, truncated: false },
+				at: new Date().toISOString() }] : [] };
+	});
+	f.ctx.runner = fake;
+	const before = (await f.store.current())?.id;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId }, freshSession: true,
+		requiredM07ReadPaths: f.relative });
+	assert.equal(result.record.status, "completed");
+	assert.equal(result.proposalId, undefined, "provisional proposal must never be merged");
+	assert.equal((await f.store.current())?.id, before);
+	assert.equal(fake.created.filter(spec => spec.label === "M04-research").length, 1);
+	assert.equal([...fake.sessions.values()].find(item => item.spec.label === "M04-research")?.turns, 3);
+});
+
+test("malformed provisional M04 output cannot end the read repair or create a proposal", async t => {
+	const f = await fixture(t);
+	const fake = new FakeSessionRunner(({ turnIndex, message }) => {
+		if (turnIndex === 1) return { text: "```knowledge-proposals\nnot JSON\n```", readReturns: [] };
+		assert.match(message, /Next missing returned range/);
+		return { text: "No supported knowledge proposal after reading the frozen files.",
+			readReturns: returnedRanges(f.relative) };
+	});
+	f.ctx.runner = fake;
+	const before = (await f.store.current())?.id;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId }, freshSession: true,
+		requiredM07ReadPaths: f.relative });
+	assert.equal(result.record.status, "completed");
+	assert.equal(result.proposalId, undefined);
+	assert.equal((await f.store.current())?.id, before);
+	assert.equal([...fake.sessions.values()].find(item => item.spec.label === "M04-research")?.turns, 2);
 });
 
 test("M04 verifies more than twelve required frozen evidence files without weakening full-read checks", async t => {

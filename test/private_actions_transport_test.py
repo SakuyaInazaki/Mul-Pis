@@ -194,6 +194,41 @@ class EncryptTests(unittest.TestCase):
             self.assertEqual(recovered.stat().st_mode & 0o777, 0o700)
             self.assertEqual((recovered / "candidate.cpp").stat().st_mode & 0o777, 0o600)
 
+    def test_provenance_import_evidence_roundtrips_without_canonical_promotion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results = root / "results"
+            results.mkdir()
+            evidence = {
+                "workflow-provenance-import-archive.json": b'{"kind":"synthetic-unselected-archive"}',
+                "provenance-import-candidate.cpp": b"// synthetic imported source\n",
+                "provenance-import-verification.json": b'{"status":"passed"}',
+                "provenance-import-lesson-delta.json": b'{"action":"propose"}',
+                "provenance-import-review-decision.json": b'{"status":"accepted"}',
+                "provenance-import-m04-adopted-knowledge.json": b'{"state":"complete"}',
+                "provenance-import-round-1-reviewer-feedback.txt": b"Synthetic bounded review\n",
+            }
+            for name, content in evidence.items():
+                (results / name).write_bytes(content)
+            (results / "provenance-import-unlisted-secret.json").write_bytes(b"EXCLUDED_SYNTHETIC_SECRET")
+            public = root / "public.pem"
+            public.write_bytes(self.private_key.public_key().public_bytes(
+                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+            encrypted = root / "out.enc.json"
+            transport.encrypt_results(results, public, encrypted, self.metadata, self.fingerprint)
+            self.assertNotIn("EXCLUDED_SYNTHETIC_SECRET", encrypted.read_text())
+            private_file = root / "private.key"
+            private_file.write_bytes(self.private_key.private_bytes(
+                serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption()))
+            recovered = transport.decrypt_results(encrypted, private_file, root)
+            self.assertEqual({file.name for file in recovered.iterdir()}, set(evidence))
+            for name, content in evidence.items():
+                self.assertEqual((recovered / name).read_bytes(), content)
+            self.assertFalse((recovered / "candidate.cpp").exists())
+            self.assertFalse((recovered / "verification.json").exists())
+            self.assertFalse((recovered / "workflow-archive.json").exists())
+
     def test_reviewer_text_cannot_exceed_archive_hard_limit_in_transport(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

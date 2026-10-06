@@ -82,7 +82,14 @@ async function requiredM07Reads(root: string, requested: string[] | undefined): 
 	return requested;
 }
 
-async function assertFullM07Reads(root: string, required: string[], returned: ReadReturnEvent[]): Promise<void> {
+interface M07ReadGap {
+	relative: string;
+	missingRanges: Array<{ start: number; end: number }>;
+	terminalPageMissing: boolean;
+}
+
+async function m07ReadGaps(root: string, required: string[], returned: ReadReturnEvent[]): Promise<M07ReadGap[]> {
+	const gaps: M07ReadGap[] = [];
 	for (const relative of required) {
 		const content = await readFile(path.join(root, relative), "utf8");
 		const lineCount = content.split(/\r?\n/).length - (content.endsWith("\n") ? 1 : 0);
@@ -99,13 +106,20 @@ async function assertFullM07Reads(root: string, required: string[], returned: Re
 		}
 		ranges.sort((a, b) => a.start - b.start || a.end - b.end);
 		let nextUnread = 1;
+		const missingRanges: M07ReadGap["missingRanges"] = [];
 		for (const range of ranges) {
-			if (range.start > nextUnread) break;
+			if (range.start > nextUnread) missingRanges.push({ start: nextUnread, end: range.start - 1 });
 			nextUnread = Math.max(nextUnread, range.end + 1);
 		}
-		if (!completeTerminalPage || nextUnread <= lineCount)
-			throw new HarnessError("m04.m07-evidence", "required selected M07 evidence was not returned to the research session in full");
+		if (nextUnread <= lineCount) missingRanges.push({ start: nextUnread, end: lineCount });
+		if (!completeTerminalPage || missingRanges.length) gaps.push({ relative, missingRanges, terminalPageMissing: !completeTerminalPage });
 	}
+	return gaps;
+}
+
+async function assertFullM07Reads(root: string, required: string[], returned: ReadReturnEvent[]): Promise<void> {
+	if ((await m07ReadGaps(root, required, returned)).length)
+		throw new HarnessError("m04.m07-evidence", "required selected M07 evidence was not returned to the research session in full");
 }
 
 async function resolveM07Checkpoint(ctx: StageContext, runId: string, checkpointId: string): Promise<ResolvedFeedback> {
@@ -331,8 +345,28 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			let promptSucceeded = false;
 			try {
 				if (feedback.m07) await markFeedbackAssembled(ctx.ws, feedback.m07.runId, feedback.inputs[0].path, record.runId);
-				const turn = await handle.prompt(finalMessage);
-				output = turn.text;
+				let request = finalMessage;
+				let priorGaps: string | undefined;
+				let readEventCursor = 0;
+				for (;;) {
+					const turn = await handle.prompt(request);
+					if (!feedback.m07 || !requiredM07Paths.length) { output = turn.text; break; }
+					const returned = handle.readReturnEvents();
+					const newReadEvents = returned.slice(readEventCursor);
+					readEventCursor = returned.length;
+					const gaps = await m07ReadGaps(feedback.m07.rootDir, requiredM07Paths, returned);
+					if (!gaps.length) { output = turn.text; break; }
+					if (newReadEvents.some(item => item.toolName === "m07_evidence_read" && item.status === "error" && gaps.some(gap => gap.relative === item.path)))
+						throw new HarnessError("m04.m07-evidence", "required selected M07 evidence was not returned in full because its read tool reported an error");
+					const currentGaps = JSON.stringify(gaps);
+					const noProgress = priorGaps === currentGaps;
+					priorGaps = currentGaps;
+					request = ["Your M04 judgement is provisional. The host has not verified full m07_evidence_read returns for every required selected M07 file, so no knowledge proposal can be accepted yet.",
+						"Next missing returned range for each file (one-based lines; the host will recalculate further gaps after your next read):",
+						...gaps.map(gap => `- ${gap.relative}: ${gap.missingRanges.length ? `${gap.missingRanges[0].start}-${gap.missingRanges[0].end}; ${gap.missingRanges.length - 1} further gaps remain` : "all lines returned"}${gap.terminalPageMissing ? "; an untruncated final page is also required" : ""}`),
+						...(noProgress ? ["The previous repair turn added no complete read proof. Replan how to use m07_evidence_read rather than repeating the same judgement."] : []),
+						"Use the same read-only session to read the stated next missing range for each file, including an untruncated final page where needed. The host will give further ranges until all are complete. Then reconsider the evidence and return a revised M04 judgement in the required format. A path, summary, malformed response, or earlier proposal is not proof of a complete read. Do not force a knowledge proposal if the evidence does not support one."].join("\n\n");
+				}
 				await ctx.ws.writeOutput(record, "processing.md", output, "处理结果");
 				promptSucceeded = true;
 			} finally {

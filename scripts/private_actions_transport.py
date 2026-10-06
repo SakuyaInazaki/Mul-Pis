@@ -45,9 +45,9 @@ RESULT_ALLOWLIST = (
     "host-effect-receipt.json",
 )
 RESULT_DYNAMIC_RE = re.compile(
-    r"^(?:(?:iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,})-(?:candidate\.cpp|verification\.json|lesson-delta\.json|experiment-plan\.json|review-decision\.json|m04-adopted-knowledge\.json)|"
-    r"workflow-(?:iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,})-archive\.json|"
-    r"(?:initial-|followon-|branch-parent-|branch-child-|iteration-[1-9][0-9]*-|fallback-[0-9a-f]{12}-T[0-9]{3,}-)?round-[1-9][0-9]*-(?:candidate\.cpp|verification\.json|reviewer-feedback\.txt|reviewer-report\.md))$"
+    r"^(?:(?:provenance-import|iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,})-(?:candidate\.cpp|verification\.json|lesson-delta\.json|experiment-plan\.json|review-decision\.json|m04-adopted-knowledge\.json)|"
+    r"workflow-(?:provenance-import|iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,})-archive\.json|"
+    r"(?:initial-|followon-|branch-parent-|branch-child-|provenance-import-|iteration-[1-9][0-9]*-|fallback-[0-9a-f]{12}-T[0-9]{3,}-)?round-[1-9][0-9]*-(?:candidate\.cpp|verification\.json|reviewer-feedback\.txt|reviewer-report\.md))$"
 )
 METADATA_RE = re.compile(r"^[A-Za-z0-9_./:@-]{1,160}$")
 

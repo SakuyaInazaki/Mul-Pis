@@ -421,6 +421,63 @@ test("prefixed archive references its transported files and fallback keeps promo
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("provenance import keeps lesson, review and M04 bytes as unselected history", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-provenance-import-fixture-"));
+	try {
+		const source = path.join(root, "source"), output = path.join(root, "output");
+		await mkdir(source); await mkdir(output);
+		const sourceFiles = {
+			"candidate.cpp": "// synthetic imported source\n",
+			"verification.json": '{"version":1,"status":"passed"}\n',
+			"lesson-delta.json": '{"version":1,"action":"propose","observation":"synthetic"}\n',
+			"review-decision.json": '{"version":1,"status":"accepted"}\n',
+			"m04-adopted-knowledge.json": '{"version":1,"state":"complete","synthetic":true}\n',
+		};
+		for (const [name, content] of Object.entries(sourceFiles))
+			await writeFile(path.join(source, name), content);
+		await writeFile(path.join(source, "workflow-archive.json"), JSON.stringify({
+			version: 1, kind: "m07-private-candidate-archive", goalRunId: "R099", taskId: "T001",
+			goalOutcome: "fulfilled", taskStatus: "accepted",
+			files: Object.keys(sourceFiles).map(name => ({ name, status: "present" })),
+			controllerEvidence: { reviewStatus: "accepted", reviewDecision: { file: "review-decision.json" } },
+			m04: { state: "completed", knowledgeExport: { state: "complete", file: "m04-adopted-knowledge.json" } },
+		}));
+		await offlineChecks.exportPrefixedArchive(source, output, "provenance-import");
+		const prefixed = JSON.parse(await readFile(path.join(output, "workflow-provenance-import-archive.json"), "utf8"));
+		assert.equal(prefixed.controllerEvidence.reviewDecision.file, "provenance-import-review-decision.json");
+		assert.equal(prefixed.m04.knowledgeExport.file, "provenance-import-m04-adopted-knowledge.json");
+		for (const [name, content] of Object.entries(sourceFiles))
+			assert.equal(await readFile(path.join(output, `provenance-import-${name}`), "utf8"), content);
+		const prior = {
+			"candidate.cpp": "// previously selected source\n",
+			"verification.json": '{"version":1,"status":"passed","selection":"prior"}',
+			"workflow-archive.json": JSON.stringify({ version: 1, kind: "m07-private-candidate-archive",
+				goalRunId: "R001", taskId: "T001", controllerEvidence: { reviewStatus: "accepted" } }),
+			"objective-checkpoint.json": JSON.stringify({ contract: { id: "synthetic-contract" },
+				selectedArtifacts: ["candidate.cpp", "verification.json"],
+				boundedRuns: [{ runId: "R001", selectedTaskId: "T001" }] }),
+		};
+		await writeFile(path.join(output, "objective-checkpoint.json"), JSON.stringify({
+			contract: { id: "synthetic-contract" },
+			selectedArtifacts: ["candidate.cpp", "verification.json"],
+			boundedRuns: [{ runId: "R001", selectedTaskId: "T001" },
+				{ runId: "R099", outcome: "fulfilled", selectedTaskId: "T001" }],
+		}));
+		const carried = await offlineChecks.collectContinuationBundle(output, prior);
+		assert.equal(carried?.["candidate.cpp"], prior["candidate.cpp"]);
+		assert.equal(carried?.["verification.json"], prior["verification.json"]);
+		assert.equal(carried?.["workflow-archive.json"], prior["workflow-archive.json"]);
+		const history = JSON.parse(carried?.["research-history.json"] ?? "null");
+		const imported = history.entries.find((entry: { goalRunId: string }) => entry.goalRunId === "R099");
+		assert.equal(imported.taskId, "T001");
+		assert.match(imported.interpretation, /Unselected or unresolved experiment/);
+		assert.equal(imported.files["workflow-archive.json"], await readFile(path.join(output,
+			"workflow-provenance-import-archive.json"), "utf8"));
+		for (const [name, content] of Object.entries(sourceFiles))
+			assert.equal(imported.files[name], content);
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("fallback archive rejects repeated round identities but accepts later rounds", async () => {
 	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-fallback-archive-fixture-"));
 	try {

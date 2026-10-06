@@ -8,7 +8,8 @@ import type { AuthenticatedRestartCarryFacts, ReviewedRestartEffectPolicy } from
 import { authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence,
 	authenticatedReviewedOpaqueRunGaps,
 	authenticatedLegacyV3RunReview, type AuthenticatedHostEffectEvidence,
-	type AuthenticatedLegacyV3RunReview, type OpaqueExecutedRunGap } from "./ledger-continuation.ts";
+	type AuthenticatedLegacyV3RunReview, type OpaqueExecutedRunGap,
+	type ReviewedEffectAncestorReceipt } from "./ledger-continuation.ts";
 
 const sha256 = (value: string): string => createHash("sha256").update(value).digest("hex");
 const hex64 = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
@@ -85,6 +86,29 @@ function chain(raw: string | undefined, kind: string): unknown[] {
 	if (value.version !== 1 || value.kind !== kind || !Array.isArray(value.entries) ||
 		value.entries.length < 1) return reject(`invalid ${kind} chain`);
 	return value.entries as unknown[];
+}
+
+type ReviewedUnknownState = { refs: string[]; precedingGoalBinding?: PriorBinding };
+function advanceReviewedUnknowns(state: ReviewedUnknownState, savedRefs: string[],
+	currentBinding: PriorBinding | undefined, ancestor: ReviewedEffectAncestorReceipt,
+	saved: PriorReservation["receipt"], boundedRuns: Array<{ runId?: string;
+		unresolvedOperationIds?: string[] }>): { state: ReviewedUnknownState;
+		attestations: ReviewedRestartEffectPolicy["operationAttestations"] } {
+	if (state.refs.some(ref => !savedRefs.includes(ref)))
+		reject("reviewed-effect ancestry removed an earlier unknown operation");
+	const introduced = savedRefs.filter(ref => !state.refs.includes(ref));
+	const priorBoundGoal = state.precedingGoalBinding?.goalRunId;
+	const priorBoundRun = boundedRuns.find(run => run.runId === priorBoundGoal);
+	if (introduced.some(ref => !text(priorBoundGoal) || !ref.startsWith(`${priorBoundGoal}/`) ||
+			!Array.isArray(priorBoundRun?.unresolvedOperationIds) ||
+			!priorBoundRun.unresolvedOperationIds.includes(ref.slice(priorBoundGoal.length + 1))))
+		reject("reviewed-effect ancestry introduced an unbound unknown operation");
+	return { state: { refs: savedRefs, precedingGoalBinding: currentBinding },
+		attestations: introduced.map(operationRef => ({ operationRef,
+			sourceCommit: ancestor.source.commit,
+			evidenceSha256: sha256(JSON.stringify({ ancestor,
+				priorGoalBindingSha256: sha256(JSON.stringify(state.precedingGoalBinding)),
+				quarantineReceiptSha256: sha256(JSON.stringify(saved)), operationRef })) })) };
 }
 
 /** Exact source of the old selected tuple is preserved in the authenticated carry. */
@@ -534,7 +558,12 @@ function reviewPrivateCampaignRestartEffectsCore(input: PrivateCampaignEffectRev
 			!sameSet([...priorGoalIds, ...receipt.goals.map(goal => goal.runId)],
 				boundedRuns.map(row => row.runId ?? "")) ||
 			(latestReview ?? []).some(row => boundedRuns.find(saved => saved.runId === row.runId)?.outcome !== row.outcome) ||
-			receipt.goals.some(goal => !Array.isArray(boundedRuns.find(row => row.runId === goal.runId)?.unresolvedOperationIds)))
+			receipt.goals.some(goal => {
+				const unresolved = boundedRuns.find(row => row.runId === goal.runId)?.unresolvedOperationIds;
+				const hasUnknown = goal.operations.some(operation => operation.status === "unknown");
+				return hasUnknown ? !Array.isArray(unresolved) :
+					unresolved !== undefined && !Array.isArray(unresolved);
+			}))
 			reject("host-effect census changed historical goals or left a new goal unresolved");
 		const newUnknownRefs = receipt.goals.flatMap(goal => goal.operations
 			.filter(operation => operation.status === "unknown")
@@ -582,6 +611,12 @@ function reviewPrivateCampaignRestartEffectsCore(input: PrivateCampaignEffectRev
 		if (new Set(bindings.map(row => row?.goalRunId)).size !== bindings.length)
 			reject("reviewed-effect ancestry repeats a fresh goal binding");
 		let boundLinkIndex = baseLinks;
+		// Each reviewed ancestor describes the *prior* executed run. Its current
+		// reservation may be abandoned and consume no binding; the goal that could
+		// have introduced an unknown was bound by the preceding reservation.
+		let unknownState: ReviewedUnknownState = { refs: [...originalPrefixRefs],
+			precedingGoalBinding: bindings[baseLinks - 1] };
+		const inheritedAttestations: ReviewedRestartEffectPolicy["operationAttestations"] = [];
 		for (const [index, ancestor] of reviewedEffectAncestry.entries()) {
 			const current = reservations[baseLinks + index];
 			const binding = ancestor.abandonedWithoutGoal ? undefined : bindings[boundLinkIndex++];
@@ -613,7 +648,22 @@ function reviewPrivateCampaignRestartEffectsCore(input: PrivateCampaignEffectRev
 					(saved.quarantine.historicalGoalOutcomes ?? []).some(row => row.runId === binding.goalRunId)) ||
 				!text(claim?.claimId) || !text(claim?.currentJobId))
 				reject("reviewed-effect ancestry lacks an exact append-only quarantine link");
+			const exactSavedRefs: string[] = savedRefs ?? reject("reviewed-effect ancestry lacks historical unknown refs");
+			const advancedUnknowns = advanceReviewedUnknowns(unknownState, exactSavedRefs,
+				binding, ancestor, saved, boundedRuns);
+			inheritedAttestations.push(...advancedUnknowns.attestations);
+			unknownState = advancedUnknowns.state;
 		}
+		const allAttestations = [
+			...reviewed.operationAttestations,
+			...inheritedAttestations,
+			...newUnknownRefs.map(operationRef => ({ operationRef,
+				sourceCommit: facts.source.commit,
+				evidenceSha256: sha256(JSON.stringify({ source: facts.source,
+					resultArtifact: facts.resultArtifact, receipt, operationRef })) })),
+		];
+		if (!sameSet(allAttestations.map(row => row.operationRef), operationRefs))
+			reject("reviewed-effect ancestry does not attest every quarantined unknown operation");
 		if (abandonedNoGoal) {
 			if (checkpoint.objectiveOutcome === "fulfilled" ||
 				!sameSet(priorGoalIds, boundedRuns.map(row => row.runId ?? "")))
@@ -627,7 +677,7 @@ function reviewPrivateCampaignRestartEffectsCore(input: PrivateCampaignEffectRev
 					historicalPolicy: reviewed.policySha256, receipt,
 					...(requestAudit.requests.length ? { requestAudit } : {}),
 					reviewedEffectAncestry })),
-				operationAttestations: reviewed.operationAttestations,
+				operationAttestations: allAttestations,
 				effectClass: "confined-ephemeral-local", unknownBillingHeld: true,
 				actorThirdPartyMutations: "none", hostTransport: "immutable-versioned-archive" };
 		}
@@ -701,13 +751,7 @@ function reviewPrivateCampaignRestartEffectsCore(input: PrivateCampaignEffectRev
 			policySha256: sha256(JSON.stringify({ policyId, source: facts.source,
 				envelope: facts.envelopeSha256, resultArtifact: facts.resultArtifact,
 				historicalPolicy: reviewed.policySha256, receipt })),
-			operationAttestations: [
-				...reviewed.operationAttestations,
-				...newUnknownRefs.map(operationRef => ({ operationRef,
-					sourceCommit: facts.source.commit,
-					evidenceSha256: sha256(JSON.stringify({ source: facts.source,
-						resultArtifact: facts.resultArtifact, receipt, operationRef })) })),
-			],
+			operationAttestations: allAttestations,
 			effectClass: "confined-ephemeral-local", unknownBillingHeld: true,
 			actorThirdPartyMutations: "none", hostTransport: "immutable-versioned-archive" };
 	}
@@ -856,6 +900,7 @@ export function reviewPrivateCampaignRestartEffects(input: PrivateCampaignEffect
 
 /** Pure classifier hook for synthetic, offline policy tests; never used by admission. */
 export const offlineRestartPolicyChecks = {
+	advanceReviewedUnknowns,
 	reviewWithHostEffect(input: PrivateCampaignEffectReviewInput,
 		evidence: AuthenticatedHostEffectEvidence): ReviewedRestartEffectPolicy {
 		return reviewPrivateCampaignRestartEffectsCore(input, evidence);

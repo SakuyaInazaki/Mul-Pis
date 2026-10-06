@@ -41,13 +41,15 @@ import { bindIndependentRestartGoal, canonicalRestartUnknowns, reserveIndependen
 	type AuthenticatedRestartCarryFacts, type IndependentRestartReservation,
 	type ReviewedRestartEffectPolicy } from "../src/m07/independent-restart.ts";
 import { createConfinedCampaignFileTools } from "../src/runner/confined-campaign-files.ts";
+import { acceptedArchivedOperationCensus, stageArchivedM07Import,
+	validateArchivedM07Import } from "../src/runner/archived-m07-import.ts";
 import { startPrivateCampaignHeartbeat } from "./private-campaign-heartbeat.ts";
 import { archivePrivateM07Task, recordPrivateM04Outcome } from "../src/workflow-archive/m07-private.ts";
 import { buildCsrChecker as buildLegacyCsrChecker } from "../src/workflow-archive/csr-checker-legacy.ts";
 import { buildCsrChecker, inspectCsrTaskContract, validateCsrCandidateSource, validateCsrTargetBodies, CSR_EXPERIMENT_LIMITS, type CsrExperimentPlan } from "../src/workflow-archive/csr-checker.ts";
 import { createExperienceProvider } from "../src/knowledge/experience-index.ts";
 import type { KnowledgeRef, KnowledgeStore } from "../src/knowledge/types.ts";
-import type { StageRunRecord } from "../src/types.ts";
+import { HarnessError, type StageRunRecord } from "../src/types.ts";
 
 const MODEL = "deepseek/deepseek-flash:low";
 // Legacy compatibility only: review of this one immutable historical adapter.
@@ -70,10 +72,50 @@ const REGISTERED_CHECKS = [
 	"The original program checker and isolated independent full-row finite and mutation checks pass for every registered strategy and both original references",
 	"Host-owned isolated-worker roundtrip timings for model-authored cases and available threads use fair preserved references; startup, cold-call and steady-state costs are separate, and no kernel-only gain is inferred from IPC-inclusive observations",
 ];
+function archivedM07ImportTarget(bundle: PrivateContinuationBundle):
+	{ goalRunId: string; taskId: string; checks: string[]; registered: boolean } | undefined {
+	let checkpoint: Record<string, any>, history: Record<string, any>;
+	try {
+		checkpoint = JSON.parse(bundle["objective-checkpoint.json"] ?? "null");
+		history = JSON.parse(bundle["research-history.json"] ?? "null");
+	} catch { fail("authenticated archived M07 import metadata is invalid"); }
+	if (!Array.isArray(checkpoint?.boundedRuns) || !Array.isArray(history?.entries)) return undefined;
+	// Only the latest bounded run may need a missing M04 stage. Older failures
+	// remain development history, never a reason to re-import after later work.
+	const latest = checkpoint.boundedRuns.at(-1);
+	if (latest?.outcome !== "fulfilled" || typeof latest.runId !== "string" ||
+		!/^T\d{3,}$/.test(String(latest.selectedTaskId))) return undefined;
+	const matching = history.entries.filter((entry: Record<string, any>) =>
+		entry?.goalRunId === latest.runId && entry.taskId === latest.selectedTaskId);
+	if (matching.length !== 1) return undefined;
+	let archive: Record<string, any>;
+	try { archive = JSON.parse(matching[0].files?.["workflow-archive.json"] ?? "null"); }
+	catch { fail("authenticated archived M07 import manifest is invalid"); }
+	if (archive?.m04?.state !== "failed") return undefined;
+	if (archive.goalOutcome !== "fulfilled" || archive.taskStatus !== "accepted" ||
+		archive.controllerEvidence?.reviewStatus !== "accepted")
+		throw new HarnessError("campaign.m04-integrity",
+			"Newest fulfilled M07 task and historical archive review disagree; reconcile the authenticated record before continuing.");
+	if (!acceptedArchivedOperationCensus(archive.controllerEvidence.operationOutcomes))
+		throw new HarnessError("campaign.m04-integrity",
+			"Accepted historical task lacks a complete settled operation census; reconcile control effects before continuing.");
+	if (archive.m04.proposalSubmitted === true || archive.m04.snapshotCreated === true)
+		throw new HarnessError("campaign.m04-reconciliation",
+			"Failed M04 may already have submitted or merged a proposal; reconcile its existing knowledge transaction before any retry or new optimizer.");
+	if (archive.m04.proposalSubmitted !== false || archive.m04.snapshotCreated !== false)
+		throw new HarnessError("campaign.m04-integrity",
+			"Failed M04 proposal and snapshot outcomes are missing or malformed; reconcile the archived transaction before continuing.");
+	const received = archive.controllerEvidence.reviewChecks?.map((item: Record<string, unknown>) => item.criterion);
+	const registered = JSON.stringify(received) === JSON.stringify(REGISTERED_CHECKS);
+	if (!registered && JSON.stringify(received) !== JSON.stringify(CHECKS))
+		fail("archived M07 import checks do not match a fixed host verifier");
+	return { goalRunId: latest.runId, taskId: latest.selectedTaskId,
+		checks: registered ? REGISTERED_CHECKS : CHECKS, registered };
+}
 const ARCHIVE_BASE_EVIDENCE_FILES = ["candidate.cpp", "verification.json", "lesson-delta.json", "experiment-plan.json", "review-decision.json"];
 const roundEvidenceName = (name: string): boolean => /^round-[1-9][0-9]*-(?:candidate\.cpp|verification\.json|reviewer-feedback\.txt|reviewer-report\.md)$/.test(name);
 const availablePrivateArtifactName = (name: string): boolean =>
-	/^(?:candidate\.cpp|verification\.json|experiment-plan\.json|lesson-delta\.json|execution-capabilities\.json|research-history\.json|restored-candidate-verification\.json|workflow-(?:archive|[A-Za-z0-9-]+-archive)\.json|round-[1-9][0-9]*-(?:candidate\.cpp|verification\.json|reviewer-feedback\.txt|reviewer-report\.md)|(?:branch-parent|branch-child|iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,}|followon|initial)-(?:candidate\.cpp|verification\.json|experiment-plan\.json|round-[1-9][0-9]*-(?:reviewer-feedback\.txt|reviewer-report\.md)))$/.test(name);
+	/^(?:candidate\.cpp|verification\.json|experiment-plan\.json|lesson-delta\.json|execution-capabilities\.json|research-history\.json|restored-candidate-verification\.json|workflow-(?:archive|[A-Za-z0-9-]+-archive)\.json|round-[1-9][0-9]*-(?:candidate\.cpp|verification\.json|reviewer-feedback\.txt|reviewer-report\.md)|(?:branch-parent|branch-child|provenance-import|iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,}|followon|initial)-(?:candidate\.cpp|verification\.json|lesson-delta\.json|experiment-plan\.json|review-decision\.json|m04-adopted-knowledge\.json|round-[1-9][0-9]*-(?:reviewer-feedback\.txt|reviewer-report\.md)))$/.test(name);
 async function availablePrivateArtifactNames(directory: string): Promise<string[]> {
 	return (await readdir(directory)).filter(availablePrivateArtifactName);
 }
@@ -404,8 +446,10 @@ async function preserveCandidate(ws: Workspace, runId: string | undefined, outpu
 	};
 	let canonicalTaskId = await archivedIdentity("workflow-archive.json");
 	let branchTaskId = await archivedIdentity("workflow-branch-child-archive.json");
+	const provenanceImportTaskId = await archivedIdentity("workflow-provenance-import-archive.json");
 	for (const [index, task] of tasks.entries()) {
-		if (task.taskId === canonicalTaskId || task.taskId === branchTaskId) continue;
+		if (task.taskId === canonicalTaskId || task.taskId === branchTaskId ||
+			task.taskId === provenanceImportTaskId) continue;
 		if (index === 0 && !existsSync(path.join(outputDir, "workflow-archive.json"))) {
 			await archivePrivateM07Task({ goal, task, destination: outputDir });
 			canonicalTaskId = task.taskId;
@@ -563,7 +607,7 @@ async function contextLineageSummary(file: string | undefined, checkpoint: Sessi
 /** Flat encrypted-transport layout; the renamed manifest is an index, not a default loader input. */
 async function exportPrefixedArchive(sourceDir: string, outputDir: string,
 	prefix: string): Promise<void> {
-	if (!(["initial", "followon", "branch-parent", "branch-child"].includes(prefix) ||
+	if (!(["initial", "followon", "branch-parent", "branch-child", "provenance-import"].includes(prefix) ||
 		/^iteration-[1-9][0-9]*$/.test(prefix) ||
 		/^fallback-[0-9a-f]{12}-T[0-9]{3,}$/.test(prefix))) fail("unsupported private archive transport prefix");
 	for (const name of await archiveEvidenceFiles(sourceDir)) if (existsSync(path.join(sourceDir, name)))
@@ -927,6 +971,16 @@ function initialHistoricalSelection(selectedCandidateSource: "initial" | "fork" 
 function firstM07Accepted(acceptedWinner: boolean, finishedOutcome: unknown): boolean {
 	return acceptedWinner && finishedOutcome === "fulfilled";
 }
+function importM04EffectDisposition(input: { status: "not-run" | "completed" | "failed";
+	proposalSubmitted: boolean | undefined; snapshotCreated: boolean | undefined;
+	threw: boolean }): "continue" | "pending-merge-reconciliation" | "m04-integrity-unknown" {
+	if (input.status !== "failed") return "continue";
+	if (input.proposalSubmitted === true || input.snapshotCreated === true)
+		return "pending-merge-reconciliation";
+	if (input.threw || input.proposalSubmitted !== false || input.snapshotCreated !== false)
+		return "m04-integrity-unknown";
+	return "continue";
+}
 function selectedGoalBranchSatisfied(selectedGoalRunId: string, initialGoalRunId: string,
 	initialBranchExerciseComplete: boolean): boolean {
 	// A linked successor is a separate M07 goal. Its own finish() enforces any
@@ -1257,7 +1311,7 @@ async function collectContinuationBundle(directory: string, prior?: PrivateConti
 	const contractId = checkpoint?.contract?.id;
 	if (typeof contractId === "string" && contractId) {
 		const archives = ["workflow-archive.json", ...(await readdir(directory))
-			.filter(name => /^workflow-(?:(?:initial|followon|branch-parent|branch-child)|iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,})-archive\.json$/.test(name))];
+			.filter(name => /^workflow-(?:(?:initial|followon|branch-parent|branch-child|provenance-import)|iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,})-archive\.json$/.test(name))];
 		for (const archiveName of archives) {
 			const archiveFile = path.join(directory, archiveName);
 			if (!existsSync(archiveFile)) continue;
@@ -1271,6 +1325,7 @@ async function collectContinuationBundle(directory: string, prior?: PrivateConti
 			const prefix = archiveName === "workflow-archive.json" ? "" : archiveName.slice("workflow-".length, -"-archive.json".length) + "-";
 			const files: Record<string, string> = { "workflow-archive.json": archiveText };
 			for (const name of ["candidate.cpp", "verification.json", "experiment-plan.json", "lesson-delta.json",
+				"review-decision.json", "m04-adopted-knowledge.json",
 				...(await readdir(directory)).filter(name => name.startsWith(prefix) &&
 					/^round-[1-9][0-9]*-reviewer-feedback\.txt$/.test(name.slice(prefix.length)))
 					.map(name => name.slice(prefix.length))]) {
@@ -1438,6 +1493,7 @@ async function main() {
 		const selectedSeed = validateSelectedPriorTuple(previousBundle, found.files,
 			missionLedger.priorBootstrapBinding, originalText);
 		const previousCheckpoint = selectedSeed.checkpoint;
+		const importTarget = archivedM07ImportTarget(previousBundle);
 		receiptHistoricalGoalRunIds = previousCheckpoint.boundedRuns.map(item => item.runId);
 		const priorNeedsQuarantine = previousCheckpoint.continuation.requiresOperationReconciliation ||
 			previousCheckpoint.continuation.unresolvedOperationIds.length > 0 ||
@@ -1549,6 +1605,10 @@ async function main() {
 				{ mode: 0o600 });
 			priorSeedInputs.push("objective-seeds/prior-history-gap.json");
 		}
+		const archivedImport = importTarget ? validateArchivedM07Import({
+			proof: missionLedger.priorCarryProof, bundle: previousBundle,
+			contractId: previousCheckpoint.contract.id, goalRunId: importTarget.goalRunId,
+			taskId: importTarget.taskId, expectedChecks: importTarget.checks }) : undefined;
 		statusPhase = "source-and-isolation-preflight-passed";
 		statusPhase = "model-route-setup";
 		const profile = path.join(campaignRoot, "profile");
@@ -1613,6 +1673,7 @@ async function main() {
 			let followOnPriorCandidate = path.join(priorSeedDir, "prior-candidate.cpp");
 			let followOnPriorPlanFile: string | undefined = previousBundle["experiment-plan.json"] ? path.join(priorSeedDir, "prior-experiment-plan.json") : undefined;
 			let registeredScopeActive = false;
+			let exactImportSource: { candidate: string; plan?: string } | undefined;
 			const remeasurePrior = async (priorSource: string, priorPlanFile: string | undefined,
 				registered: boolean, currentPlanFile: string): Promise<Record<string, unknown>> => {
 				const scratch = await verifierScratch("candidate");
@@ -1649,10 +1710,18 @@ async function main() {
 								statusPhase = "host-verification";
 								let result: Record<string, unknown> = { version: 1, status: "failed", reason: "candidate missing" };
 								if (existsSync(candidate)) {
-									const candidateScratch = await verifierScratch("candidate");
-									try { result = await checkCandidate(originalPath, candidate, candidateScratch,
-										registered ? { taskText: registeredTaskText, planFile } : undefined); }
-									finally { await rm(candidateScratch, { recursive: true, force: true }); }
+									const exactCopy = !exactImportSource ||
+										(await readFile(candidate, "utf8")) === exactImportSource.candidate &&
+										(!registered || Boolean(exactImportSource.plan) && existsSync(planFile) &&
+											(await readFile(planFile, "utf8")) === exactImportSource.plan);
+									if (!exactCopy) result = { version: 1, status: "failed",
+										reason: "provenance import source or plan differs from authenticated carried bytes" };
+									else {
+										const candidateScratch = await verifierScratch("candidate");
+										try { result = await checkCandidate(originalPath, candidate, candidateScratch,
+											registered ? { taskText: registeredTaskText, planFile } : undefined); }
+										finally { await rm(candidateScratch, { recursive: true, force: true }); }
+									}
 								}
 								result.originalBaselineRuns = originalSmoke.originalCheckerRuns;
 								result.originalBaselineIndependent = {
@@ -1774,6 +1843,209 @@ async function main() {
 					description: "Changes or equipment outside the verified source and measurement adapters",
 					limits: ["requires a different verifier and capability proof"] },
 			];
+			const importBoundedRuns: ObjectiveProgressV1["boundedRuns"] = [];
+			const importAssessmentEvidence: Array<{ name: string; file: string }> = [];
+			let provenanceImportSummary: Record<string, unknown> | undefined;
+			if (archivedImport && importTarget) {
+				statusPhase = "provenance-import-staging";
+				// The archived accepted task is not the selected mission tuple. Keep
+				// the latter byte-for-byte separate while obtaining new review evidence.
+				for (const name of ["candidate.cpp", "verification.json", "workflow-archive.json",
+					"experiment-plan.json", "m04-adopted-knowledge.json"] as const) {
+					const prior = previousBundle[name];
+					if (prior !== undefined) await writeFile(path.join(outputDir, name), prior, { mode: 0o600 });
+					else await rm(path.join(outputDir, name), { force: true });
+				}
+				const staged = await stageArchivedM07Import(archivedImport, priorSeedDir);
+				if (importTarget.registered !== Boolean(staged.planPath) ||
+					(importTarget.registered && !registeredContract))
+					fail("archived provenance import plan cannot use the current verified adapter");
+				const importedInputs = [staged.candidatePath, staged.verificationPath,
+					staged.provenancePath, ...(staged.planPath ? [staged.planPath] : []),
+					...found.files.map(name => path.join(ws.rawDir, name)), capabilityFile];
+				statusPhase = "provenance-import-m07";
+				const goal = await controller.begin({
+					goal: `Revalidate an archived accepted source for original objective ${originalObjective.id}`,
+					problemRelation: `Fresh provenance check of archived goal ${importTarget.goalRunId}/${importTarget.taskId}; old M04 evidence was incomplete. This is not mission candidate selection.`,
+					constraints: ["Copy the archived candidate byte-for-byte; do not optimize or change its strategies.",
+						"The old review and lesson snapshot are unavailable as current authority; independent host verification and ordinary M07 review are required.",
+						"Keep the prior selected mission source separate until an actual comparison supports replacement."],
+					successCriteria: [...importTarget.checks],
+					plan: "Import the exact source and optional plan, run the current host checker, freeze a new ordinary review, then request M04 adjudication of only the new evidence.",
+					exploratory: true });
+				runId = goal.runId;
+				statusRunId = runId;
+				if (restartReservation) await bindIndependentRestartGoal(restartReservation, goal.runId,
+					async binding => {
+						const bindingRef = "independent-restart-goal-binding.json";
+						await appendRestartGoalBinding(outputDir, previousBundle, binding);
+						return { bindingRef, bindingSha256: sha256(JSON.stringify(binding)) };
+					});
+				let importedTask: M07TaskRecord;
+				registeredScopeActive = importTarget.registered;
+				exactImportSource = { candidate: archivedImport.candidate.text,
+					...(archivedImport.plan ? { plan: archivedImport.plan.text } : {}) };
+				try {
+					importedTask = await controller.delegate(goal.runId, {
+						mode: "execute", inputs: importedInputs,
+						objective: `Read the frozen work-directory input copy inputs/001-candidate.cpp and copy its complete bytes to candidate.cpp. ${staged.planPath ? "Read inputs/004-experiment-plan.json and copy its complete bytes to experiment-plan.json." : "Do not create an experiment plan."} Do not optimize or alter the archived source. Its old verification is historical context only. After the host writes a NEW verification.json, read it fully and write a NEW lesson-delta.json with action none or a precisely evidenced candidate lesson. The old lesson and review snapshot are unavailable. No scientific adoption or mission-source selection occurs here.`,
+						expectedOutputs: ["candidate.cpp", "lesson-delta.json",
+							...(staged.planPath ? ["experiment-plan.json"] : [])],
+						lessonDeltaOutput: "lesson-delta.json", checks: importTarget.checks,
+					});
+				} finally { registeredScopeActive = false; exactImportSource = undefined; }
+				statusTaskTelemetry = await taskTelemetry(ws, importedTask, runtimeKey);
+				const candidatePath = path.join(importedTask.workDir, "candidate.cpp");
+				const verificationPath = path.join(importedTask.workDir, "verification.json");
+				const lessonPath = path.join(importedTask.workDir, "lesson-delta.json");
+				const planPath = path.join(importedTask.workDir, "experiment-plan.json");
+				const exactCandidate = existsSync(candidatePath) &&
+					(await readFile(candidatePath, "utf8")) === archivedImport.candidate.text;
+				const exactPlan = !archivedImport.plan || existsSync(planPath) &&
+					(await readFile(planPath, "utf8")) === archivedImport.plan.text;
+				let checked: Record<string, any> = {};
+				try { checked = JSON.parse(await readFile(verificationPath, "utf8")); } catch { /* no host pass */ }
+				const hostPassed = importedTask.status === "returned" && exactCandidate && exactPlan &&
+					checked?.status === "passed" && checked?.independent?.status === "passed";
+				const unsettled = unresolvedGoalControl(await controller.status(goal.runId));
+				if (unsettled.operationIds.length || unsettled.taskIds.length) {
+					statusPhase = "provenance-import-unsettled";
+					await preserveUnsettledGoalCheckpoint({ ws, runId: goal.runId, outputDir,
+						contract: originalObjective, budgetStopReason: budget.snapshot().stopReason });
+					await saveStatus({ outcome: "incomplete", originalObjective: { id: originalObjective.id,
+						continuation: "reconcile-operations-before-new-run" },
+						provenanceImport: { state: "unsettled", sourceGoalRunId: importTarget.goalRunId,
+							newGoalRunId: goal.runId, unresolvedOperationIds: unsettled.operationIds,
+							unresolvedTaskIds: unsettled.taskIds } });
+					process.exitCode = 1;
+					return;
+				}
+				let reviewed: M07TaskRecord | undefined;
+				if (importedTask.status === "returned" && importedTask.reportPath) {
+					statusPhase = "provenance-import-review";
+					reviewed = await controller.review(goal.runId, { taskId: importedTask.taskId,
+						checks: importTarget.checks.map((criterion, index) => ({ criterion,
+							result: hostPassed ? "passed" : "failed",
+							evidence: hostPassed ? [index === 0 ? candidatePath : verificationPath] : [] })),
+						artifacts: [importedTask.reportPath, ...[candidatePath, verificationPath, lessonPath,
+							...(staged.planPath ? [planPath] : [])].filter(existsSync)],
+						failures: hostPassed ? [] : ["Current host did not independently verify an exact import of the archived candidate and plan"] });
+				}
+				const accepted = reviewed?.status === "accepted";
+				const finished = await controller.finish(goal.runId, { outcome: accepted ? "fulfilled" : "partial",
+					returnPath: "user", summary: accepted ?
+						"Exact archived source independently revalidated and newly reviewed; mission selection remains unchanged." :
+						"Archived source import did not pass exact-copy and ordinary current review gates.",
+						goalChecks: importTarget.checks.map((criterion, index) => ({ criterion,
+							result: accepted ? "passed" : "not_run",
+							evidence: accepted ? [index === 0 ? candidatePath : verificationPath] : [] })),
+						limitations: ["Historical lesson and review snapshot were not transported as current authority; the prior selected mission candidate was not replaced."] });
+				const archiveDir = path.join(campaignRoot, "provenance-import-archive");
+				await archivePrivateM07Task({ goal: finished, task: finished.tasks[0], destination: archiveDir });
+				let m04Status: "not-run" | "completed" | "failed" = "not-run";
+				let m04RunId: string | undefined;
+				let m04Coverage = false;
+				let m04ProposalSubmitted: boolean | undefined = false;
+				let m04SnapshotCreated: boolean | undefined = false;
+				let m04Threw = false;
+				let m04AdoptedRefs: KnowledgeRef[] = [];
+				if (accepted && !budget.snapshot().stopped && !abort.signal.aborted) {
+					statusPhase = "provenance-import-m04";
+					try {
+						const readPaths = selectedM07ReviewReadPaths(ws.runDir("M07", goal.runId), reviewed!,
+							staged.planPath ? ["experiment-plan.json"] : []);
+						const processed = await runM04({ ws, store, runner, config: await ws.loadConfig() },
+							{ feedback: { kind: "M07", runId: goal.runId }, freshSession: true,
+								requiredM07ReadPaths: readPaths,
+								purpose: "Adjudicate newly revalidated provenance evidence; do not infer historical lesson adoption" });
+						m04RunId = processed.record.runId;
+						m04ProposalSubmitted = Boolean(processed.proposalId);
+						m04SnapshotCreated = Boolean(processed.snapshotId);
+						const coverage = await m04EvidenceReturned(processed.record, importedTask.taskId,
+							staged.planPath ? ["experiment-plan.json"] : []);
+						m04Coverage = coverage.complete && readPaths.every(item => coverage.paths.includes(item));
+						m04Status = processed.record.status === "completed" && !processed.record.failures.length &&
+							m04Coverage ? "completed" : "failed";
+						if (m04Status === "completed") m04AdoptedRefs = await adoptedExperienceRefs(store,
+							processed.record.runId, m04Coverage);
+					} catch {
+						m04Status = "failed";
+						m04Threw = true;
+						m04ProposalSubmitted = undefined;
+						m04SnapshotCreated = undefined;
+						// A failed read repair normally precedes proposal submission. If a
+						// later write failed, retain any actual proposal/merge evidence so
+						// the next run cannot blindly retry and duplicate adoption.
+						const attempts = await ws.listRuns("M04");
+						if (attempts.length) {
+							const latest = await ws.readRun("M04", attempts.at(-1)!);
+							const source = latest.outputs.find(item => item.label === "M07 处理来源");
+							let sourceGoalRunId: string | undefined;
+							try { if (source) sourceGoalRunId = JSON.parse(await readFile(source.path, "utf8")).m07RunId; }
+							catch { /* unavailable source cannot be inferred */ }
+							if (sourceGoalRunId === goal.runId) {
+								m04RunId = latest.runId;
+								if (latest.outputs.some(item => item.label === "知识提案"))
+									m04ProposalSubmitted = true;
+								if (latest.outputs.some(item => item.label === "合入结果"))
+									m04SnapshotCreated = true;
+							}
+						}
+					}
+				}
+				await recordPrivateM04Outcome(archiveDir, { state: m04Status,
+					...(m04RunId ? { runId: m04RunId } : {}), proposalSubmitted: m04ProposalSubmitted,
+					snapshotCreated: m04SnapshotCreated, adoptedExperienceRefs: m04AdoptedRefs }, store);
+				const m04EffectDisposition = importM04EffectDisposition({ status: m04Status,
+					proposalSubmitted: m04ProposalSubmitted, snapshotCreated: m04SnapshotCreated,
+					threw: m04Threw });
+				// Export only after recording final M04 state. The canonical tuple above
+				// remains the earlier selected candidate until a later real comparison.
+				await exportPrefixedArchive(archiveDir, outputDir, "provenance-import");
+				importBoundedRuns.push({ runId: goal.runId, outcome: finished.outcome ?? "partial",
+					...(accepted ? { selectedTaskId: importedTask.taskId } : {}) });
+				const importSummary = path.join(priorSeedDir, "provenance-import-result.json");
+				provenanceImportSummary = { version: 1,
+					kind: "provenance-import-result", historicalGoalRunId: importTarget.goalRunId,
+					newGoalRunId: goal.runId, taskId: importedTask.taskId,
+					m07Outcome: finished.outcome, m04Status, m04Coverage,
+					m04EffectDisposition,
+					missionSelectionAtImport: "unchanged-prior", historicalLessonAuthority: "unavailable",
+					historicalReviewSnapshotAuthority: "unavailable" };
+				await writeFile(importSummary, `${JSON.stringify(provenanceImportSummary, null, 2)}\n`,
+					{ mode: 0o600 });
+				if (m04EffectDisposition !== "continue") {
+					statusPhase = m04EffectDisposition;
+					await writeObjectiveProgress(objectiveCheckpointFile, campaignObjectiveProgress(
+						originalObjective, historicalUnresolvedOperationIds, {
+							boundedRuns: [...previousCheckpoint.boundedRuns, ...importBoundedRuns],
+							selectedArtifacts: previousCheckpoint.selectedArtifacts,
+							assessmentHistory: previousCheckpoint.assessmentHistory,
+							stopReason: "m04-evidence-incomplete" }));
+					await saveStatus({ outcome: "incomplete", provenanceImport: provenanceImportSummary,
+						originalObjective: { id: originalObjective.id,
+							stopReason: "m04-evidence-incomplete", checkpointFile: "objective-checkpoint.json" },
+						blocker: m04EffectDisposition,
+						independentValidation: "prior selected source retained; M04 transaction needs reconciliation" });
+					process.exitCode = 1;
+					return;
+				}
+				importAssessmentEvidence.push({ name: "provenance-import-result.json", file: importSummary });
+				const reviewDecision = path.join(archiveDir, "review-decision.json");
+				if (existsSync(reviewDecision))
+					importAssessmentEvidence.push({ name: "provenance-import-review-decision.json",
+						file: reviewDecision });
+				if (m04RunId) {
+					const m04Run = await ws.readRun("M04", m04RunId);
+					for (const [label, name] of [["处理结果", "provenance-import-m04-processing.md"],
+						["M07 回流证据实际访问范围", "provenance-import-m04-coverage.json"]] as const) {
+						const item = m04Run.outputs.find(output => output.label === label);
+						if (item && existsSync(item.path))
+							importAssessmentEvidence.push({ name, file: item.path });
+					}
+				}
+				statusPhase = "provenance-import-assessment-ready";
+			}
 
 			const priorReceipts = previousBundle["objective-assessment-receipts.json"] ?
 				JSON.parse(previousBundle["objective-assessment-receipts.json"]) : undefined;
@@ -1811,6 +2083,7 @@ async function main() {
 					file: path.join(priorSeedDir, "prior-m04-knowledge.json") }] : []),
 				...(previousBundle["experiment-plan.json"] ? [{ name: "experiment-plan.json",
 					file: path.join(priorSeedDir, "prior-experiment-plan.json") }] : []),
+				...importAssessmentEvidence,
 			];
 			if (previousBundle["m04-adopted-knowledge.json"])
 				await writeFile(path.join(priorSeedDir, "prior-m04-knowledge.json"), previousBundle["m04-adopted-knowledge.json"], { mode: 0o600 });
@@ -1832,7 +2105,8 @@ async function main() {
 				recordAssessment: async assessment => {
 					await writeObjectiveProgress(objectiveCheckpointFile, campaignObjectiveProgress(originalObjective,
 						historicalUnresolvedOperationIds, {
-						boundedRuns: previousCheckpoint.boundedRuns, selectedArtifacts: previousCheckpoint.selectedArtifacts,
+						boundedRuns: [...previousCheckpoint.boundedRuns, ...importBoundedRuns],
+						selectedArtifacts: previousCheckpoint.selectedArtifacts,
 						assessment, assessmentHistory: [...previousCheckpoint.assessmentHistory,
 							{ iteration: previousCheckpoint.assessmentHistory.length + 1, assessment,
 								stopReason: "assessment-validation-pending", advanced: false }],
@@ -1877,7 +2151,8 @@ async function main() {
 			if (!firstStep.advanced) {
 				await writeObjectiveProgress(objectiveCheckpointFile, campaignObjectiveProgress(originalObjective,
 					historicalUnresolvedOperationIds, {
-					boundedRuns: previousCheckpoint.boundedRuns, selectedArtifacts: previousCheckpoint.selectedArtifacts,
+					boundedRuns: [...previousCheckpoint.boundedRuns, ...importBoundedRuns],
+					selectedArtifacts: previousCheckpoint.selectedArtifacts,
 					...(firstStep.assessment ? { assessment: firstStep.assessment } : {}),
 					assessmentHistory: [...previousCheckpoint.assessmentHistory,
 						...(firstStep.assessment ? [{ iteration: previousCheckpoint.assessmentHistory.length + 1,
@@ -1885,7 +2160,8 @@ async function main() {
 					stopReason: firstStep.stopReason }));
 				await saveStatus({ outcome: "incomplete", originalObjective: { id: originalObjective.id,
 					stopReason: firstStep.stopReason, checkpointFile: "objective-checkpoint.json" },
-				independentValidation: "prior selected source retained; no new bounded M07 dispatched" });
+				...(provenanceImportSummary ? { provenanceImport: provenanceImportSummary } : {}),
+				independentValidation: "prior selected source retained; no mission replacement established" });
 				process.exitCode = 1;
 				return;
 			}
@@ -2264,7 +2540,7 @@ async function main() {
 							else assessmentHistory.push({ iteration, assessment, stopReason: "assessment-validation-pending", advanced: false });
 							await writeObjectiveProgress(objectiveCheckpointFile, campaignObjectiveProgress(originalObjective,
 								historicalUnresolvedOperationIds,
-								{ boundedRuns: [...previousCheckpoint.boundedRuns, ...rejectedGoalOutcomes,
+								{ boundedRuns: [...previousCheckpoint.boundedRuns, ...importBoundedRuns, ...rejectedGoalOutcomes,
 									{ runId: runId!, outcome: finished.outcome ?? "unknown",
 									...(firstGoalReady ? { selectedTaskId: selectedTask.taskId } : {}) }],
 									selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
@@ -2540,7 +2816,7 @@ async function main() {
 				m04SelectedReadContractSatisfied && currentM04Status === "completed" && currentM04Read &&
 				currentKnowledgeExport.state !== "incomplete" && branchRequirementSatisfied &&
 				followOnCompleted ? "fulfilled" : "partial";
-			const boundedRuns = [...previousCheckpoint.boundedRuns, ...rejectedGoalOutcomes,
+			const boundedRuns = [...previousCheckpoint.boundedRuns, ...importBoundedRuns, ...rejectedGoalOutcomes,
 				{ runId: runId!, outcome: finished.outcome ?? "unknown",
 				...(firstGoalReady ? { selectedTaskId: selectedTask.taskId } : {}) },
 				...followOnAttempts.filter(item => typeof item.goalRunId === "string").map(item => ({
@@ -2554,6 +2830,7 @@ async function main() {
 			await writeObjectiveProgress(objectiveCheckpointFile, objectiveCheckpoint);
 			const campaignOutcome = objectiveCheckpoint.objectiveOutcome;
 			await saveStatus({ outcome: campaignOutcome, boundedRunOutcome,
+				...(provenanceImportSummary ? { provenanceImport: provenanceImportSummary } : {}),
 				originalObjective: { id: originalObjective.id, outcome: objectiveCheckpoint.objectiveOutcome,
 					stopReason: objectiveCheckpoint.stopReason, checkpointFile: "objective-checkpoint.json",
 					goalSource: originalObjective.goalSource, continuation: objectiveCheckpoint.continuation.mode },
@@ -2730,8 +3007,9 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	appendRestartReservation, appendRestartGoalBinding,
 	privateFailureMessage, privateExceptionDiagnostic, credentialProbe, parseCheckerOutput, compareCandidateTimings,
 	campaignObjectiveStop, taskTelemetry, privateToolTelemetry,
-	chooseForkWinner, chooseFollowOnCandidate, firstM07Accepted,
+	chooseForkWinner, chooseFollowOnCandidate, firstM07Accepted, importM04EffectDisposition,
 	selectedGoalBranchSatisfied,
+	archivedM07ImportTarget, fixedPrivateChecks: { diagnostic: CHECKS, registered: REGISTERED_CHECKS },
 	shouldRepairRejectedReview,
 	availablePrivateArtifactNames,
 	initialHistoricalSelection,
