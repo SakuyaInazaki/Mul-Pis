@@ -369,7 +369,7 @@ test("later same-run accepted goal can replace selection before another unknown 
 		"a rejected M04 draft cannot promote an unselected historical candidate");
 });
 
-test("branded selection survives zero and failed wrappers while forged transitions fail", () => {
+test("a long accepted source with merged M04 stays selected through zero and failed wrappers", () => {
 	const f = fixture(1);
 	const priorSelectedNames = [...f.checkpoint.selectedArtifacts];
 	const oldFiles = Object.fromEntries(priorSelectedNames.map(name => [name, f.bundle[name]]));
@@ -385,17 +385,21 @@ test("branded selection survives zero and failed wrappers while forged transitio
 		unresolvedOperationIds: ["O004"] });
 	f.checkpoint.continuation.unresolvedOperationIds = ["old-goal/O001", "later-failed/O004"];
 	f.input.operationRefs = ["old-goal/O001", "later-failed/O004"];
-	f.bundle["candidate.cpp"] = "new selected work from prior accepted run";
+	f.bundle["candidate.cpp"] = "// synthetic selected source\n" + "int synthetic_value = 1;\n".repeat(900);
+	assert(Buffer.byteLength(f.bundle["candidate.cpp"], "utf8") > 2_000);
 	f.bundle["verification.json"] = JSON.stringify({ version: 1, status: "passed" });
 	f.bundle["workflow-archive.json"] = JSON.stringify({ version: 1,
 		kind: "m07-private-candidate-archive", goalRunId: "later-selected", taskId: "T003",
 		goalOutcome: "fulfilled", taskStatus: "accepted",
 		controllerEvidence: { reviewStatus: "accepted" },
-		m04: { state: "completed", runId: "m04-prior-accepted", proposalSubmitted: false,
-			snapshotCreated: false, transaction: { file: "m04-transaction.json", state: "no-proposal" } } });
+		m04: { state: "completed", runId: "m04-prior-accepted", proposalSubmitted: true,
+			snapshotCreated: true, snapshotId: "snapshot-synthetic",
+			transaction: { file: "m04-transaction.json", state: "merged" } } });
 	f.bundle["m04-transaction.json"] = JSON.stringify({ version: 1,
 		kind: "m04-knowledge-transaction", m04RunId: "m04-prior-accepted",
-		state: "no-proposal", attempts: [] });
+		state: "merged", currentProposalId: "proposal-synthetic", snapshotId: "snapshot-synthetic",
+		attempts: [{ proposalId: "proposal-synthetic", state: "merged", structurallyValid: true,
+			snapshotId: "snapshot-synthetic" }] });
 	f.bundle["research-history.json"] = JSON.stringify({ version: 1,
 		kind: "untrusted-version-bound-research-history", entries: [{ goalRunId: "accepted-goal",
 			taskId: "T001", files: oldFiles }] });
@@ -433,7 +437,7 @@ test("branded selection survives zero and failed wrappers while forged transitio
 		selectedTupleSha256, priorSelectedArtifacts: priorSelectedNames, selectedArtifacts: selectedNames,
 		contractId: "original-contract", goalRunId: "later-selected", taskId: "T003",
 		archiveSha256: hash(f.bundle["workflow-archive.json"]),
-		m04RunId: "m04-prior-accepted", m04State: "no-proposal" };
+		m04RunId: "m04-prior-accepted", m04State: "merged" };
 	(f.evidence as any).selectedTransitions = [transition];
 	f.authorize();
 	assert.equal(review(f).effectClass, "historical-unknown-fresh-only");
@@ -447,7 +451,7 @@ test("branded selection survives zero and failed wrappers while forged transitio
 		{ priorSelectedTupleSha256: hash("forged predecessor") },
 		{ envelopeSha256: hash("forged carry") },
 		{ priorEnvelopeSha256: hash("forged parent") },
-		{ m04State: "merged" }]) {
+		{ m04State: "no-proposal" }]) {
 		(f.evidence as any).selectedTransitions = [{ ...transition, ...patch }];
 		assert.throws(() => review(f), /authenticated accepted goal/);
 	}

@@ -168,7 +168,7 @@ function reviewSelectedTransition(bundle: Readonly<Record<string, string>>, chec
 		currentArchive.goalOutcome === "fulfilled" && currentArchive.taskStatus === "accepted" &&
 		currentArchive.controllerEvidence?.reviewStatus === "accepted" &&
 		verification?.version === 1 && verification.status === "passed" &&
-		text(bundle["candidate.cpp"]) &&
+		typeof bundle["candidate.cpp"] === "string" && bundle["candidate.cpp"].length > 0 &&
 		currentArchive.m04?.state === "completed" &&
 		currentArchive.m04?.transaction?.file === "m04-transaction.json" &&
 		currentArchive.m04.transaction.state === transaction?.state &&
