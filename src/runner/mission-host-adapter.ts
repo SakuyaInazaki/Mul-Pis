@@ -9,15 +9,19 @@ import { open, realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { classifyPendingAction, type PendingActionV1 } from "../m07/objective-progress.ts";
-import { authenticateLatestTerminalCarry, authenticatedSupervisorProjection,
+import { authenticateLatestTerminalCarry, authenticateLatestTerminalInterruption,
+	authenticatedSupervisorProjection, authenticatedTerminalInterruptionSupervisorProjection,
 	REUSABLE_RUN_REQUEST_MESSAGE, type CarryArtifactPayload,
-	type CurrentMissionRun } from "./ledger-continuation.ts";
+	type CurrentMissionRun, type IncrementalPrefixFailure } from "./ledger-continuation.ts";
 import { MissionResumeJournal, type ResumeJournalRecord,
 	type TestedControlBinding } from "./mission-resume-journal.ts";
 import { pendingActionIdentity, planMissionContinuation, type CurrentDerivedActionV1,
+	type CurrentInterruptionActionV1, type TerminalInterruptionEvidenceV1,
 	type FreshIndependentLaunchContractV1, type ResumeDispatchRecord,
-	type SupervisorDecision, type TerminalCarryEvidenceV1 } from "./mission-supervisor.ts";
+	type SupervisorDecision, type TerminalCarryEvidenceV1, type MissionStatusV1 } from "./mission-supervisor.ts";
 import { validWorkflowRepairState, type WorkflowRepairStateV1 } from "./repair-liveness.ts";
+import { readReviewedInterruptedSourceCapability,
+	type VerifiedInterruptedSourceCapabilityV1 } from "./interrupted-source-review.ts";
 
 const REPOSITORY = "SakuyaInazaki/Mul-Pis";
 const SOURCE_BRANCH = "improve/workflow-learning-reliability";
@@ -34,13 +38,14 @@ export type HostPreparationRefusal = Readonly<{
 		"tested-source-tree-invalid" | "source-ci-list-invalid" |
 		"control-ref-unavailable" | "control-ref-uninitialized" |
 		"terminal-carry-projection-unavailable" |
+		"interruption-source-review-invalid" |
 		"legacy-action-checkpoint-unavailable" | "control-request-delivery-uncertain" |
 		"workflow-repair-plan-invalid" | "workflow-repair-plan-unrelated" |
 		"workflow-repair-plan-stale" | "workflow-repair-source-unchanged" |
 		"workflow-repair-review-evidence-invalid";
 	stage: "tested-source-ci" | "live-source-ref" | "live-source-commit" |
 		"live-control-ref" | "terminal-carry" | "legacy-action" | "dispatch-journal" |
-		"workflow-repair-plan";
+		"workflow-repair-plan" | "interruption-source-review";
 	ciRunId?: string;
 	ciStatus?: "requested" | "waiting" | "pending" | "queued" | "in_progress" |
 		"completed" | "unrecognized";
@@ -142,14 +147,14 @@ function validRepairPlan(value: unknown): value is HostReviewedWorkflowRepairPla
 		return false;
 	const codeRefs = review.codeEvidenceRefs;
 	const tests = review.offlineTests;
-	return Array.isArray(codeRefs) && codeRefs.length > 0 && codeRefs.length <= 16 &&
+	return Array.isArray(codeRefs) && codeRefs.length > 0 &&
 		codeRefs.every(row => exact(row, ["path", "symbol"]) && typeof row.path === "string" &&
 			/^src\/(?:runner|stages|m07)\/[A-Za-z0-9_-]+\.ts$/.test(row.path) &&
 			typeof row.symbol === "string" && /^[A-Za-z_$][A-Za-z0-9_$.]{0,119}$/.test(row.symbol)) &&
 		exact(tests, ["command", "conclusion", "sourceCommit", "tree", "testEvidenceRefs"]) &&
 		tests.command === "npm run typecheck && npm test" && tests.conclusion === "passed" &&
 		tests.sourceCommit === replacement.testedSourceCommit && tests.tree === replacement.testedTree &&
-		Array.isArray(tests.testEvidenceRefs) && tests.testEvidenceRefs.length > 0 && tests.testEvidenceRefs.length <= 16 &&
+		Array.isArray(tests.testEvidenceRefs) && tests.testEvidenceRefs.length > 0 &&
 		tests.testEvidenceRefs.every(row => exact(row, ["path", "name"]) && typeof row.path === "string" &&
 			/^test\/[A-Za-z0-9_-]+\.test\.ts$/.test(row.path) && typeof row.name === "string" &&
 			row.name.length > 0 && row.name.length <= 200 && !/[\r\n\0]/.test(row.name));
@@ -188,6 +193,8 @@ export type PreparedResumeRequest = Readonly<{
 	descriptor?: PublicResumeRequestDescriptor;
 	journalKey?: string;
 	journalState?: ResumeJournalRecord["state"];
+	/** Private, nonauthoritative explanation of a discarded partial observation. */
+	incrementalPrefixFailure?: IncrementalPrefixFailure;
 }>;
 
 export type PrepareAuthenticatedResumeInput = Readonly<{
@@ -204,6 +211,8 @@ export type PrepareAuthenticatedResumeInput = Readonly<{
 	readOnly?: boolean;
 	/** An explicit private operator review outside the checkout, never model output. */
 	repairPlanPrivateFile?: string;
+	/** Host review of the exact interrupted source capability, outside the checkout. */
+	interruptedSourceReviewPrivateFile?: string;
 }>;
 
 async function githubJson(url: string, token: string | undefined, request: typeof fetch,
@@ -285,12 +294,13 @@ function dispatchRecord(record: ResumeJournalRecord | undefined): ResumeDispatch
 }
 
 async function reviewedSourceText(file: string, commit: string,
-	input: PrepareAuthenticatedResumeInput, allowMissing = false): Promise<string> {
+	input: PrepareAuthenticatedResumeInput, allowMissing = false,
+	stage: HostPreparationRefusal["stage"] = "workflow-repair-plan"): Promise<string> {
 	const request = input.authenticatedHostRead?.request ?? input.request ?? fetch;
 	let row: unknown;
 	try {
 		row = await githubJson(`https://api.github.com/repos/${REPOSITORY}/contents/${file}?ref=${commit}`,
-			input.githubToken, request, "workflow-repair-plan");
+			input.githubToken, request, stage);
 	} catch (error) {
 		if (allowMissing && error instanceof MissionHostPreparationError && error.refusal.httpStatus === 404) return "";
 		throw error;
@@ -298,13 +308,15 @@ async function reviewedSourceText(file: string, commit: string,
 	if (!isObject(row) || row.type !== "file" || row.path !== file || row.encoding !== "base64" ||
 		typeof row.content !== "string" || row.content.length > 2 * 1024 * 1024 ||
 		!Number.isSafeInteger(row.size) || Number(row.size) < 1 || Number(row.size) > 1024 * 1024)
-		refuse("workflow-repair-review-evidence-invalid", "workflow-repair-plan");
+		refuse(stage === "interruption-source-review" ? "interruption-source-review-invalid" :
+			"workflow-repair-review-evidence-invalid", stage);
 	const encoded = row.content.replace(/\n/g, "");
 	const bytes = Buffer.from(encoded, "base64");
 	const text = bytes.toString("utf8");
 	if (bytes.toString("base64") !== encoded || bytes.length !== row.size ||
 		Buffer.byteLength(text, "utf8") !== bytes.length)
-		refuse("workflow-repair-review-evidence-invalid", "workflow-repair-plan");
+		refuse(stage === "interruption-source-review" ? "interruption-source-review-invalid" :
+			"workflow-repair-review-evidence-invalid", stage);
 	return text;
 }
 
@@ -397,20 +409,74 @@ async function verifyWorkflowRepairPlan(input: PrepareAuthenticatedResumeInput,
  * authenticated checkpoint and remain labelled as current host decisions. */
 export async function prepareAuthenticatedResumeRequest(input: PrepareAuthenticatedResumeInput):
 	Promise<PreparedResumeRequest> {
-	const authenticated = await authenticateLatestTerminalCarry({
+	const authenticationInput = {
 		source: input.source, seedEnvelopeB64: input.seedEnvelopeB64,
 		publicKeyFile: input.publicKeyFile, githubToken: input.githubToken,
 		loadCarryArtifact: input.loadCarryArtifact, request: input.request,
 		authenticatedHostRead: input.authenticatedHostRead,
-		expectedSpkiSha256: input.expectedSpkiSha256 });
-	const projected = authenticatedSupervisorProjection(authenticated.proof, authenticated.privateBundle);
-	if (!projected) refuse("terminal-carry-projection-unavailable", "terminal-carry");
-	const { status, terminalCarry, pendingAction } = projected;
+		expectedSpkiSha256: input.expectedSpkiSha256 };
+	let status: MissionStatusV1;
+	let terminalCarry: TerminalCarryEvidenceV1;
+	let pendingAction: PendingActionV1 | undefined;
+	let terminalInterruption: TerminalInterruptionEvidenceV1 | undefined;
+	let currentInterruptionAction: CurrentInterruptionActionV1 | undefined;
+	let incrementalPrefixFailure: IncrementalPrefixFailure | undefined;
+	let priorPrivateBundle: Readonly<Record<string, string>>;
+	try {
+		const authenticated = await authenticateLatestTerminalCarry(authenticationInput);
+		const projected = authenticatedSupervisorProjection(authenticated.proof, authenticated.privateBundle);
+		if (!projected) refuse("terminal-carry-projection-unavailable", "terminal-carry");
+		({ status, terminalCarry, pendingAction } = projected);
+		priorPrivateBundle = authenticated.privateBundle;
+	} catch (carryError) {
+		let interrupted: Awaited<ReturnType<typeof authenticateLatestTerminalInterruption>>;
+		try { interrupted = await authenticateLatestTerminalInterruption(authenticationInput); }
+		catch (interruptionError) {
+			throw new AggregateError([carryError, interruptionError],
+				"terminal carry and interruption authentication both failed");
+		}
+		const projected = authenticatedTerminalInterruptionSupervisorProjection(
+			interrupted.proof, interrupted.priorPrivateBundle);
+		if (!projected) refuse("terminal-carry-projection-unavailable", "terminal-carry");
+		incrementalPrefixFailure = interrupted.incrementalPrefixFailure;
+		status = projected.status;
+		pendingAction = undefined;
+		priorPrivateBundle = interrupted.priorPrivateBundle;
+		const priorAction = projected.pendingAction;
+		terminalCarry = { version: 1, kind: "host-verified-terminal-carry",
+			source: { runId: projected.priorSource.runId,
+				runAttempt: projected.priorSource.runAttempt,
+				commit: projected.priorSource.commit },
+			envelopeSha256: projected.priorEnvelopeSha256,
+			contractId: status.contractId, selectedTupleSha256: status.selectedTupleSha256,
+			pendingActionSha256: priorAction ? pendingActionIdentity(priorAction) : null,
+			checkpointSha256: projected.checkpointSha256,
+			terminal: { runStatus: "completed", jobStatus: "completed",
+				providerStepStatus: "completed" } };
+		const gap = interrupted.proof.gap;
+		terminalInterruption = { version: 1, kind: "host-verified-terminal-interruption",
+			source: { runId: gap.source.runId, runAttempt: gap.source.runAttempt,
+				commit: gap.source.commit },
+			priorCarrySource: terminalCarry.source,
+			priorCarryEnvelopeSha256: gap.priorCarryEnvelopeSha256,
+			resultArtifactId: gap.resultArtifact.artifactId,
+			resultArchiveSha256: gap.resultArtifact.archiveSha256,
+			accounting: "unquantified", effects: "unknown-unreconciled",
+			terminationOrigin: "unknown" };
+		currentInterruptionAction = { version: 1, kind: "current-host-interruption-action",
+			source: terminalInterruption.source,
+			priorCarryEnvelopeSha256: terminalCarry.envelopeSha256,
+			priorCheckpointSha256: projected.checkpointSha256,
+			resultArchiveSha256: terminalInterruption.resultArchiveSha256,
+			action: classifyPendingAction("execution-interrupted",
+				{ unresolvedOperationRefs: [...status.unresolvedOperationRefs] }) };
+	}
+	const privateObservation = incrementalPrefixFailure ? { incrementalPrefixFailure } : {};
 	let currentDerivedAction: CurrentDerivedActionV1 | undefined;
-	if (!pendingAction && status.objectiveOutcome === "incomplete" &&
+	if (!terminalInterruption && !pendingAction && status.objectiveOutcome === "incomplete" &&
 		status.stopReason === "bounded-run-incomplete" && status.unresolvedOperationRefs.length &&
 		terminalCarry.pendingActionSha256 === null) {
-		const checkpoint = authenticated.privateBundle["objective-checkpoint.json"];
+		const checkpoint = priorPrivateBundle["objective-checkpoint.json"];
 		if (typeof checkpoint !== "string" ||
 			terminalCarry.checkpointSha256 !== sha(checkpoint))
 			refuse("legacy-action-checkpoint-unavailable", "legacy-action");
@@ -421,33 +487,65 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 			action: classifyPendingAction("bounded-run-incomplete",
 				{ unresolvedOperationRefs: [...status.unresolvedOperationRefs] }) };
 	}
-	const action = pendingAction ?? currentDerivedAction?.action;
+	const action = currentInterruptionAction?.action ?? pendingAction ?? currentDerivedAction?.action;
 	if (input.repairPlanPrivateFile !== undefined && action?.kind !== "repair-workflow-state")
 		refuse("workflow-repair-plan-unrelated", "workflow-repair-plan");
+	if (input.interruptedSourceReviewPrivateFile !== undefined && !terminalInterruption)
+		refuse("interruption-source-review-invalid", "interruption-source-review");
 	if (!action) return { decision: planMissionContinuation({ status, terminalCarry,
-		pendingAction, dispatchRecord: { state: "not-requested" } }) };
+		pendingAction, terminalInterruption, currentInterruptionAction,
+		dispatchRecord: { state: "not-requested" } }), ...privateObservation };
+	if (terminalInterruption && input.interruptedSourceReviewPrivateFile === undefined)
+		return { decision: planMissionContinuation({ status, terminalCarry,
+			pendingAction, terminalInterruption, currentInterruptionAction,
+			dispatchRecord: { state: "not-requested" } }), ...privateObservation };
 	if (action.kind === "repair-workflow-state" && input.repairPlanPrivateFile === undefined)
 		return { decision: planMissionContinuation({ status, terminalCarry,
-			pendingAction, dispatchRecord: { state: "not-requested" } }) };
+			pendingAction, terminalInterruption, currentInterruptionAction,
+			dispatchRecord: { state: "not-requested" } }), ...privateObservation };
 	const binding = await readLiveTestedControlBinding(input.githubToken,
 		input.authenticatedHostRead?.request ?? input.request,
 		input.authenticatedHostRead?.kind === "authenticated-host-github-read");
+	let interruptedSourceReview: VerifiedInterruptedSourceCapabilityV1 | undefined;
+	if (terminalInterruption) {
+		const oldCommit = await githubJson(`https://api.github.com/repos/${REPOSITORY}/git/commits/${terminalInterruption.source.commit}`,
+			input.githubToken, input.authenticatedHostRead?.request ?? input.request ?? fetch,
+			"interruption-source-review");
+		if (!isObject(oldCommit) || oldCommit.sha !== terminalInterruption.source.commit ||
+			!isObject(oldCommit.tree) || !hex40(oldCommit.tree.sha))
+			refuse("interruption-source-review-invalid", "interruption-source-review");
+		try {
+			interruptedSourceReview = await readReviewedInterruptedSourceCapability({
+				privateReceiptFile: input.interruptedSourceReviewPrivateFile!,
+				interruption: terminalInterruption,
+				interruptedSourceTree: oldCommit.tree.sha,
+				priorCheckpointSha256: terminalCarry.checkpointSha256!,
+				readImmutableSourceFile: async (commit, file) => Buffer.from(
+					await reviewedSourceText(file, commit, input, false,
+						"interruption-source-review"), "utf8") });
+		} catch {
+			refuse("interruption-source-review-invalid", "interruption-source-review");
+		}
+	}
 	const launch: FreshIndependentLaunchContractV1 = {
 		version: 1, kind: "verified-fresh-launch-contract",
-		source: terminalCarry.source, envelopeSha256: terminalCarry.envelopeSha256,
+		source: terminalInterruption?.source ?? terminalCarry.source,
+		envelopeSha256: terminalCarry.envelopeSha256,
 		selectedTupleSha256: status.selectedTupleSha256,
 		pendingActionSha256: pendingActionIdentity(action),
 		testedSourceCommit: binding.testedSourceCommit, testedTree: binding.testedTree,
 		requiresRuntimeAttestationBeforeModel: true, mode: "fresh-work-only" };
 	const workflowRepairPlan = action.kind === "repair-workflow-state" ?
 		await verifyWorkflowRepairPlan(input, terminalCarry, binding,
-			authenticated.privateBundle["repair-state.json"], action) : undefined;
+			priorPrivateBundle["repair-state.json"], action) : undefined;
 	const snapshot = { status, terminalCarry, pendingAction, currentDerivedAction,
+		terminalInterruption, currentInterruptionAction, interruptedSourceReview,
 		freshLaunchContract: launch, workflowRepairPlan,
 		dispatchRecord: { state: "not-requested" } as const };
 	const prospective = planMissionContinuation(snapshot);
-	if (prospective.kind !== "dispatch") return { decision: prospective };
-	if (input.readOnly) return { decision: prospective, descriptor: publicDescriptor(binding) };
+	if (prospective.kind !== "dispatch") return { decision: prospective, ...privateObservation };
+	if (input.readOnly) return { decision: prospective, descriptor: publicDescriptor(binding),
+		...privateObservation };
 	const old = await input.journal.get(prospective.intent.idempotencyKey);
 	const unresolved = await input.journal.unresolvedForRef(CONTROL_REF);
 	if (unresolved && unresolved.idempotencyKey !== prospective.intent.idempotencyKey)
@@ -458,9 +556,10 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 		const matched = await input.journal.reserve(prospective.intent, binding);
 		return { decision: planMissionContinuation({ ...snapshot,
 			dispatchRecord: dispatchRecord(matched) }), journalKey: matched.idempotencyKey,
-			journalState: matched.state };
+			journalState: matched.state, ...privateObservation };
 	}
 	const reserved = await input.journal.reserve(prospective.intent, binding);
 	return { decision: prospective, descriptor: publicDescriptor(binding),
-		journalKey: reserved.idempotencyKey, journalState: reserved.state };
+		journalKey: reserved.idempotencyKey, journalState: reserved.state,
+		...privateObservation };
 }

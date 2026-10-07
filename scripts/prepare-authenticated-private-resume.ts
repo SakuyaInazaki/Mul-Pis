@@ -12,13 +12,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { MissionHostPreparationError, prepareAuthenticatedResumeRequest } from "../src/runner/mission-host-adapter.ts";
 import { MissionResumeJournal } from "../src/runner/mission-resume-journal.ts";
-import type { CurrentMissionRun } from "../src/runner/ledger-continuation.ts";
+import type { CarryArtifactPayload, CurrentMissionRun } from "../src/runner/ledger-continuation.ts";
 import { CARRY_LOGICAL_BYTES, CARRY_SEGMENT_FILE_BYTES, CARRY_SEGMENT_RAW_BYTES,
 	carrySidecarName } from "../src/runner/carry-sidecar-codec.ts";
 import { HarnessError } from "../src/types.ts";
 
 type Args = { source: string; seed: string; publicKey: string;
-	journalDir: string; outputPrivate: string; readOnly: boolean; repairPlanPrivate?: string };
+	journalDir: string; outputPrivate: string; readOnly: boolean; repairPlanPrivate?: string;
+	interruptedSourceReviewPrivate?: string };
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 class PrivateBridgeError extends Error {
 	readonly reasonCode: string;
@@ -26,7 +27,10 @@ class PrivateBridgeError extends Error {
 }
 type ArtifactSidecarFile = { name: string; file: string; sha256: string };
 type ArtifactFileReply = { file: string; sha256: string;
-	sidecars?: ArtifactSidecarFile[] };
+	name?: "incremental-control-prefix.json";
+	archiveSha256?: string;
+	sidecars?: ArtifactSidecarFile[];
+	prefix?: ArtifactSidecarFile };
 const maxSidecars = CARRY_LOGICAL_BYTES / CARRY_SEGMENT_RAW_BYTES;
 const maxSidecarTextBytes = Math.ceil(CARRY_SEGMENT_FILE_BYTES * 4 / 3) + 4;
 function privateFileReference<T>(value: T): value is T & {
@@ -89,18 +93,21 @@ function parseArgs(values: string[]): Args {
 		option.set(name, values[++i]!);
 	}
 	const keys = ["--source", "--seed", "--public-key", "--journal-dir", "--output-private"];
-	const allowed = [...keys, "--repair-plan-private"];
+	const allowed = [...keys, "--repair-plan-private", "--interrupted-source-review-private"];
 	if (!connectorStdio || keys.some(key => !option.has(key)) ||
 		[...option.keys()].some(key => !allowed.includes(key)))
 		throw new Error("missing private resume arguments");
 	const result = { source: option.get("--source")!, seed: option.get("--seed")!,
 		publicKey: option.get("--public-key")!, journalDir: option.get("--journal-dir")!,
 		outputPrivate: option.get("--output-private")!, readOnly,
-		...(option.has("--repair-plan-private") ? { repairPlanPrivate: option.get("--repair-plan-private")! } : {}) };
+		...(option.has("--repair-plan-private") ? { repairPlanPrivate: option.get("--repair-plan-private")! } : {}),
+		...(option.has("--interrupted-source-review-private") ?
+			{ interruptedSourceReviewPrivate: option.get("--interrupted-source-review-private")! } : {}) };
 	if (Object.entries(result).some(([key, value]) => key !== "readOnly" &&
 		!path.isAbsolute(String(value)))) throw new Error("private resume paths must be absolute");
 	if (underRepo(result.journalDir) || underRepo(result.outputPrivate) ||
-		(result.repairPlanPrivate !== undefined && underRepo(result.repairPlanPrivate)))
+		(result.repairPlanPrivate !== undefined && underRepo(result.repairPlanPrivate)) ||
+		(result.interruptedSourceReviewPrivate !== undefined && underRepo(result.interruptedSourceReviewPrivate)))
 		throw new Error("private resume records must be outside the source repository");
 	return result;
 }
@@ -108,8 +115,8 @@ function parseArgs(values: string[]): Args {
 /** All requests remain on the fixed repository's public metadata REST surface.
  * The connector response is trusted as the read-only GitHub account result. */
 function connectorBridge(): { request: typeof fetch;
-	artifact: (identity: { runId: string; artifactId: string }) => Promise<string | {
-		envelopeB64: string; sidecars: Record<string, string> }>;
+	artifact: (identity: { runId: string; artifactId: string;
+		expectedArchiveSha256?: string }) => Promise<CarryArtifactPayload>;
 	close: () => void } {
 	const pending = new Map<number, { kind: "github-get" | "artifact-file";
 		resolve: (value: unknown) => void;
@@ -118,7 +125,8 @@ function connectorBridge(): { request: typeof fetch;
 	const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 	lines.on("line", line => {
 		let reply: { id?: unknown; status?: unknown; body?: unknown;
-			file?: unknown; sha256?: unknown; sidecars?: unknown };
+			file?: unknown; sha256?: unknown; name?: unknown; sidecars?: unknown;
+			prefix?: unknown; archiveSha256?: unknown };
 		try { reply = JSON.parse(line) as typeof reply; }
 		catch { return; }
 		if (!Number.isSafeInteger(reply.id)) return;
@@ -133,8 +141,19 @@ function connectorBridge(): { request: typeof fetch;
 			awaiting.resolve(new Response(JSON.stringify(reply.body), { status: Number(reply.status) }));
 		} else {
 			const keys = Object.keys(reply).sort();
-			const expected = ["id", "file", "sha256", ...(reply.sidecars === undefined ? [] : ["sidecars"])].sort();
+			const expected = ["id", "file", "sha256",
+				...(reply.name === undefined ? [] : ["name"]),
+				...(reply.archiveSha256 === undefined ? [] : ["archiveSha256"]),
+				...(reply.sidecars === undefined ? [] : ["sidecars"]),
+				...(reply.prefix === undefined ? [] : ["prefix"])].sort();
 			if (!privateFileReference(reply) || keys.join("|") !== expected.join("|") ||
+				(reply.archiveSha256 !== undefined &&
+					(typeof reply.archiveSha256 !== "string" || !/^[0-9a-f]{64}$/.test(reply.archiveSha256))) ||
+				(reply.name !== undefined && reply.name !== "incremental-control-prefix.json") ||
+				(reply.name !== undefined && (reply.prefix !== undefined || reply.sidecars !== undefined)) ||
+				(reply.prefix !== undefined && (!privateFileReference(reply.prefix) ||
+					Object.keys(reply.prefix).sort().join("|") !== "file|name|sha256" ||
+					reply.prefix.name !== "incremental-control-prefix.json")) ||
 				(reply.sidecars !== undefined && (!Array.isArray(reply.sidecars) ||
 					reply.sidecars.length > maxSidecars ||
 					reply.sidecars.some((entry: unknown) => !privateFileReference(entry) ||
@@ -165,8 +184,10 @@ function connectorBridge(): { request: typeof fetch;
 		process.stdout.write(`${JSON.stringify({ kind: "github-get", id, url })}\n`);
 		return response;
 	};
-	const artifact = async (identity: { runId: string; artifactId: string }): Promise<string | {
-		envelopeB64: string; sidecars: Record<string, string> }> => {
+	const artifact = async (identity: { runId: string; artifactId: string;
+		expectedArchiveSha256?: string }): Promise<string | {
+		envelopeB64: string; sidecars: Record<string, string>;
+		incrementalControlPrefix?: string } | { incrementalControlPrefix: string }> => {
 		if (closed || process.stdin.readableEnded)
 			throw new PrivateBridgeError("authenticated-github-connector-stdin-closed");
 		const id = ++nextId;
@@ -174,18 +195,30 @@ function connectorBridge(): { request: typeof fetch;
 			pending.set(id, { kind: "artifact-file", resolve: value =>
 				resolve(value as ArtifactFileReply), reject }));
 		process.stdout.write(`${JSON.stringify({ kind: "artifact-file", id,
-			runId: identity.runId, artifactId: identity.artifactId })}\n`);
+			runId: identity.runId, artifactId: identity.artifactId,
+			...(identity.expectedArchiveSha256 ?
+				{ expectedArchiveSha256: identity.expectedArchiveSha256 } : {}) })}\n`);
 		const observed = await reply;
-		const bytes = await verifiedPrivateBytes(observed, 8 * 1024 * 1024);
+		if (identity.expectedArchiveSha256 &&
+			observed.archiveSha256 !== identity.expectedArchiveSha256)
+			throw new Error("artifact ZIP digest does not match authenticated GitHub metadata");
+		const bytes = await verifiedPrivateBytes(observed,
+			observed.name === "incremental-control-prefix.json" ? 64 * 1024 * 1024 : 8 * 1024 * 1024);
+		if (observed.name === "incremental-control-prefix.json")
+			return { incrementalControlPrefix: bytes.toString("utf8") };
 		const outer = JSON.parse(bytes.toString("utf8")) as unknown;
 		if (!outer || typeof outer !== "object" || Array.isArray(outer) ||
 			Object.keys(outer).length !== 1 ||
 			typeof (outer as { envelopeB64?: unknown }).envelopeB64 !== "string")
 			throw new Error("artifact file format is invalid");
 		const envelopeB64 = (outer as { envelopeB64: string }).envelopeB64;
-		if (observed.sidecars === undefined) return envelopeB64;
+		const prefix = observed.prefix ?
+			(await verifiedPrivateBytes(observed.prefix, 64 * 1024 * 1024)).toString("utf8") : undefined;
+		if (observed.sidecars === undefined)
+			return prefix === undefined ? envelopeB64 :
+				{ envelopeB64, sidecars: {}, incrementalControlPrefix: prefix };
 		const sidecars: Record<string, string> = Object.create(null) as Record<string, string>;
-		const paths = new Set([observed.file]);
+		const paths = new Set([observed.file, ...(observed.prefix ? [observed.prefix.file] : [])]);
 		for (const item of observed.sidecars) {
 			if (Object.hasOwn(sidecars, item.name) || paths.has(item.file))
 				throw new Error("artifact sidecar set is invalid");
@@ -195,7 +228,8 @@ function connectorBridge(): { request: typeof fetch;
 		for (let index = 0; index < observed.sidecars.length; index++)
 			if (!Object.hasOwn(sidecars, carrySidecarName(index)))
 				throw new Error("artifact sidecar set is invalid");
-		return { envelopeB64, sidecars };
+		return { envelopeB64, sidecars,
+			...(prefix === undefined ? {} : { incrementalControlPrefix: prefix }) };
 	};
 	return { request, artifact, close: () => lines.close() };
 }
@@ -225,6 +259,8 @@ export async function runPrivateResumeBridge(values: string[],
 			authenticatedHostRead: { kind: "authenticated-host-github-read", request: bridge.request },
 			loadCarryArtifact: identity => bridge.artifact(identity),
 			...(args.repairPlanPrivate ? { repairPlanPrivateFile: args.repairPlanPrivate } : {}),
+			...(args.interruptedSourceReviewPrivate ?
+				{ interruptedSourceReviewPrivateFile: args.interruptedSourceReviewPrivate } : {}),
 			journal: new MissionResumeJournal(args.journalDir), readOnly: args.readOnly });
 	} finally { bridge.close(); }
 	if (!args.readOnly) {
@@ -238,6 +274,9 @@ export async function runPrivateResumeBridge(values: string[],
 }
 
 export function privateHostPreparationDiagnostic(error: unknown): Record<string, unknown> {
+	if (error instanceof AggregateError && error.errors.length === 2)
+		return { code: "terminal-authentication-failed",
+			attempts: error.errors.map(item => privateHostPreparationDiagnostic(item)) };
 	if (error instanceof MissionHostPreparationError)
 		return { code: error.refusal.code, stage: error.refusal.stage,
 			...(error.refusal.ciRunId === undefined ? {} : { ciRunId: error.refusal.ciRunId }),

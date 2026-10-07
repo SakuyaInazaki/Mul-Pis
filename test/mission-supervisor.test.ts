@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test, { type TestContext } from "node:test";
 import { classifyPendingAction, type PendingActionV1 } from "../src/m07/objective-progress.ts";
 import { dispatchPlannedResume, pendingActionIdentity, planMissionContinuation,
 	type FreshIndependentWorkEvidenceV1, type MissionStatusV1,
 	type SupervisorSnapshot } from "../src/runner/mission-supervisor.ts";
 import type { VerifiedWorkflowRepairPlanV1 } from "../src/runner/mission-host-adapter.ts";
+import { readReviewedInterruptedSourceCapability,
+	type InterruptedSourceReviewReceiptV1 } from "../src/runner/interrupted-source-review.ts";
 
 const tuple = "a".repeat(64);
 const source = { runId: "7002", runAttempt: 1, commit: "b".repeat(40) };
@@ -41,6 +46,138 @@ test("transient provider error plans a fresh retry after authenticated terminal 
 	assert.equal(result.intent.actionKind, "retry-transport");
 	assert.equal(result.intent.boundary, "new-isolated-workspace-no-prior-session-resume");
 	assert.deepEqual(result.intent.quarantinedOperationRefs, []);
+});
+
+function interruptedSnapshot(priorReason: "bounded-run-incomplete" | "accounting-integrity-error" |
+	"m04-transaction-unresolved" | "workflow-repair-needed" = "bounded-run-incomplete") {
+	const refs = ["old-goal/O001"];
+	const prior = classifyPendingAction(priorReason, { unresolvedOperationRefs: refs });
+	const base = snapshot(prior, { unresolved: refs });
+	const interruptedSource = { runId: "7003", runAttempt: 1, commit: "d".repeat(40) };
+	const gap = { version: 1 as const, kind: "host-verified-terminal-interruption" as const,
+		source: interruptedSource, priorCarrySource: source,
+		priorCarryEnvelopeSha256: "c".repeat(64), resultArtifactId: "9103",
+		resultArchiveSha256: "e".repeat(64), accounting: "unquantified" as const,
+		effects: "unknown-unreconciled" as const, terminationOrigin: "unknown" as const };
+	const action = classifyPendingAction("execution-interrupted", { unresolvedOperationRefs: refs });
+	const currentInterruptionAction = { version: 1 as const,
+		kind: "current-host-interruption-action" as const, source: interruptedSource,
+		priorCarryEnvelopeSha256: gap.priorCarryEnvelopeSha256,
+		priorCheckpointSha256: "f".repeat(64),
+		resultArchiveSha256: gap.resultArchiveSha256, action };
+	return { ...base, terminalCarry: { ...base.terminalCarry!, checkpointSha256: "f".repeat(64) },
+		terminalInterruption: gap, currentInterruptionAction,
+		freshLaunchContract: { version: 1 as const, kind: "verified-fresh-launch-contract" as const,
+			source: interruptedSource, envelopeSha256: "c".repeat(64), selectedTupleSha256: tuple,
+			pendingActionSha256: pendingActionIdentity(action), testedSourceCommit: "b".repeat(40),
+			testedTree: "c".repeat(40), requiresRuntimeAttestationBeforeModel: true as const,
+			mode: "fresh-work-only" as const } };
+}
+
+async function reviewedSource(t: TestContext, state: ReturnType<typeof interruptedSnapshot>,
+	otherSource?: NonNullable<SupervisorSnapshot["terminalInterruption"]>["source"]) {
+	const gap = { ...state.terminalInterruption!,
+		...(otherSource ? { source: otherSource } : {}) };
+	const sourceTree = "9".repeat(40);
+	const roles = ["m07-local-tool-confinement", "read-only-model-sessions",
+		"fresh-workspace-store", "host-execution-confinement",
+		"encrypted-output-provider"] as const;
+	const codeEvidenceRefs = roles.map((role, index) => ({ role,
+		path: `src/review/role${index}.ts`, symbol: `codeSymbol${index}` }));
+	const testEvidenceRefs = roles.map((role, index) => ({ role,
+		path: `test/role${index}.test.ts`, name: `testName${index}` }));
+	const receipt: InterruptedSourceReviewReceiptV1 = {
+		version: 1, kind: "host-reviewed-interrupted-source-capability",
+		prior: { source: gap.source, sourceTree, priorCarrySource: gap.priorCarrySource,
+			priorCarryEnvelopeSha256: gap.priorCarryEnvelopeSha256,
+			priorCheckpointSha256: state.terminalCarry!.checkpointSha256!,
+			resultArtifactId: gap.resultArtifactId, resultArchiveSha256: gap.resultArchiveSha256 },
+		review: { kind: "operator-code-review", conclusion: "approved-for-fresh-only-execution",
+			codeEvidenceRefs, testEvidenceRefs },
+		grant: { mode: "fresh-only-confined-effects", oldResultUse: "untrusted-no-replay-no-adoption",
+			m07Tools: "factory-confined-local", modelSessions: "read-only",
+			state: "fresh-workspace-empty-store-no-resume", outputTransport: "encrypted-fixed",
+			providerInference: "fixed-configured-provider" }
+	};
+	const dir = await mkdtemp(path.join(os.tmpdir(), "supervisor-review-"));
+	t.after(async () => rm(dir, { recursive: true, force: true }));
+	const file = path.join(dir, "receipt.json");
+	await writeFile(file, JSON.stringify(receipt), { mode: 0o600 });
+	return readReviewedInterruptedSourceCapability({ privateReceiptFile: file,
+		interruption: gap, interruptedSourceTree: sourceTree,
+		priorCheckpointSha256: state.terminalCarry!.checkpointSha256!,
+		readImmutableSourceFile: async (commit, filePath) => {
+			assert.equal(commit, gap.source.commit);
+			const code = codeEvidenceRefs.find(ref => ref.path === filePath);
+			const test = testEvidenceRefs.find(ref => ref.path === filePath);
+			return new TextEncoder().encode(code?.symbol ?? test?.name ?? "");
+		} });
+}
+
+test("no-carry interruption gets a reviewed new action and an idempotent whole-run UNKNOWN quarantine", async t => {
+	const unreviewed = interruptedSnapshot();
+	assert.deepEqual(planMissionContinuation(unreviewed),
+		{ kind: "wait", reason: "interruption-source-review-required" });
+	const state = { ...unreviewed, interruptedSourceReview: await reviewedSource(t, unreviewed) };
+	const decision = planMissionContinuation(state);
+	assert.equal(decision.kind, "dispatch");
+	if (decision.kind !== "dispatch") return;
+	assert.equal(decision.intent.source.runId, "7003");
+	assert.equal(decision.intent.actionKind, "reconcile-interrupted-run");
+	assert.equal(decision.intent.pendingAction.reasonCode, "execution-interrupted");
+	assert.equal(decision.intent.actionProvenance?.kind, "current-host-interruption");
+	assert.equal(decision.intent.interruptedSourceReview?.source.commit,
+			state.terminalInterruption!.source.commit);
+	assert.equal(decision.intent.interruptedSourceReview?.receiptSha256,
+			state.interruptedSourceReview.receiptSha256);
+	assert.notEqual(state.interruptedSourceReview.source.commit,
+			state.freshLaunchContract.testedSourceCommit);
+	assert.equal(decision.intent.m04TransactionQuarantined, true);
+	assert.deepEqual(decision.intent.quarantinedOperationRefs, ["old-goal/O001"]);
+	assert.deepEqual(planMissionContinuation({ ...state, dispatchRecord: {
+		state: "reserved", idempotencyKey: decision.intent.idempotencyKey } }),
+		{ kind: "wait", reason: "dispatch-reserved", idempotencyKey: decision.intent.idempotencyKey });
+	assert.deepEqual(planMissionContinuation({ ...state, freshLaunchContract: undefined }),
+		{ kind: "wait", reason: "quarantined-operation-needs-reconciliation" });
+	assert.throws(() => planMissionContinuation({ ...state,
+		terminalInterruption: { ...state.terminalInterruption!, resultArchiveSha256: "0".repeat(64) } }),
+		/lacks host provenance|changed the safety class/);
+	assert.deepEqual(planMissionContinuation({ ...state, cancellationEvent: { version: 1,
+		kind: "host-verified-cancellation-origin", source: state.terminalInterruption!.source,
+		envelopeSha256: "c".repeat(64), evidenceRef: "verified-user-stop",
+		origin: "explicit-user-request" } }), { kind: "wait", reason: "user-cancelled" });
+});
+
+test("an interruption review must retain its live brand, exact source and fixed grant", async t => {
+	const base = interruptedSnapshot();
+	const reviewed = await reviewedSource(t, base);
+	assert.throws(() => planMissionContinuation({ ...base,
+		interruptedSourceReview: structuredClone(reviewed) }), /not verified/);
+	assert.throws(() => planMissionContinuation({ ...base,
+		interruptedSourceReview: { ...reviewed } }), /not verified/);
+	assert.throws(() => planMissionContinuation({ ...base,
+		interruptedSourceReview: { ...reviewed, grant: { ...reviewed.grant,
+			modelSessions: "read-only" } } }), /not verified/);
+	const other = await reviewedSource(t, base, { ...base.terminalInterruption!.source,
+		runId: "7004" });
+	assert.throws(() => planMissionContinuation({ ...base, interruptedSourceReview: other }),
+		/not verified for the terminal source/);
+	assert.deepEqual(planMissionContinuation({ ...base, cancellationEvent: { version: 1,
+		kind: "host-verified-cancellation-origin", source: base.terminalInterruption!.source,
+		envelopeSha256: "c".repeat(64), evidenceRef: "verified-user-stop",
+		origin: "explicit-user-request" } }), { kind: "wait", reason: "user-cancelled" });
+});
+
+test("an interruption does not erase earlier accounting, repair, or M04 blockers", async t => {
+	assert.deepEqual(planMissionContinuation(interruptedSnapshot("accounting-integrity-error")),
+		{ kind: "wait", reason: "accounting-chain-needs-reconciliation" });
+	assert.deepEqual(planMissionContinuation(interruptedSnapshot("workflow-repair-needed")),
+		{ kind: "wait", reason: "workflow-repair-plan-required" });
+	const unreviewed = interruptedSnapshot("m04-transaction-unresolved");
+	const state = { ...unreviewed, interruptedSourceReview: await reviewedSource(t, unreviewed) };
+	const decision = planMissionContinuation(state);
+	assert.equal(decision.kind, "dispatch");
+	if (decision.kind === "dispatch") assert.equal(decision.intent.m04TransactionQuarantined, true);
 });
 
 test("workflow repair requires a live host brand rather than a serialized assertion", () => {

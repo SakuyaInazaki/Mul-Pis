@@ -21,6 +21,7 @@ import { workflowRepairState, type WorkflowRepairFailure, type WorkflowRepairSta
 	type WorkflowRepairStrategy } from "../src/runner/repair-liveness.ts";
 import { decodeCarrySidecars } from "../src/runner/carry-sidecar-codec.ts";
 import { MissionResumeJournal } from "../src/runner/mission-resume-journal.ts";
+import { IncrementalPrivateCheckpointJournal } from "../src/runner/incremental-private-checkpoint.ts";
 import { MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, MISSION_ARTIFACT } from
 	"../src/runner/signed-mission-ledger.ts";
 
@@ -253,6 +254,157 @@ async function repairFixture(t: TestContext, options: { unknownOperation?: boole
 	return { ...f, plan, input: { ...f.input, repairPlanPrivateFile } };
 }
 
+async function interruptedFixture(t: TestContext) {
+	const f = await fixture(t, { carriedAction: true, unknownOperation: true });
+	const interruptedCommit = sha40("e");
+	const reviewFile = path.join(f.dir, "interrupted-source-review.json");
+	const priorDigest = createHash("sha256").update(Buffer.from(f.sealed.envelopeB64, "base64"))
+		.digest("hex");
+	const reviewFiles = new Map([
+		["src/runner/confined-campaign-files.ts", "createConfinedCampaignFileTools"],
+		["scripts/manual-private-campaign.ts",
+			"read-only-assessor mkdtemp createFileKnowledgeStore sandboxArguments checkCandidate"],
+		[".github/workflows/manual-private-campaign.yml", "Upload encrypted mission continuation"],
+		["test/confined-campaign-evidence-read.test.ts", "confined local tools"],
+		["test/manual-private-campaign.test.ts",
+			"read only session fresh state measurement mounts evaluator and immutable reference workers read-only while preserving separate temporary scratch"],
+		["test/private-campaign-workflow-manifest.test.ts", "ciphertext upload"]]);
+	await writeFile(reviewFile, JSON.stringify({ version: 1,
+		kind: "host-reviewed-interrupted-source-capability",
+		prior: { source: { runId: "7003", runAttempt: 1, commit: interruptedCommit },
+			sourceTree: testedTree,
+			priorCarrySource: { runId: "7002", runAttempt: 1, commit: sourceCommit },
+			priorCarryEnvelopeSha256: priorDigest,
+			priorCheckpointSha256: createHash("sha256")
+				.update(f.bundle["objective-checkpoint.json"]).digest("hex"),
+			resultArtifactId: "9103", resultArchiveSha256: "9".repeat(64) },
+		review: { kind: "operator-code-review", conclusion: "approved-for-fresh-only-execution",
+			codeEvidenceRefs: [
+				{ role: "m07-local-tool-confinement", path: "src/runner/confined-campaign-files.ts",
+					symbol: "createConfinedCampaignFileTools" },
+				{ role: "read-only-model-sessions", path: "scripts/manual-private-campaign.ts",
+					symbol: "read-only-assessor" },
+				{ role: "fresh-workspace-store", path: "scripts/manual-private-campaign.ts",
+					symbol: "createFileKnowledgeStore" },
+				{ role: "host-execution-confinement", path: "scripts/manual-private-campaign.ts",
+					symbol: "sandboxArguments" },
+				{ role: "host-execution-confinement", path: "scripts/manual-private-campaign.ts",
+					symbol: "checkCandidate" },
+				{ role: "encrypted-output-provider", path: ".github/workflows/manual-private-campaign.yml",
+					symbol: "Upload encrypted mission continuation" }],
+			testEvidenceRefs: [
+				{ role: "m07-local-tool-confinement", path: "test/confined-campaign-evidence-read.test.ts",
+					name: "confined local tools" },
+				{ role: "read-only-model-sessions", path: "test/manual-private-campaign.test.ts",
+					name: "read only session" },
+				{ role: "fresh-workspace-store", path: "test/manual-private-campaign.test.ts",
+					name: "fresh state" },
+				{ role: "host-execution-confinement", path: "test/manual-private-campaign.test.ts",
+					name: "measurement mounts evaluator and immutable reference workers read-only while preserving separate temporary scratch" },
+				{ role: "encrypted-output-provider", path: "test/private-campaign-workflow-manifest.test.ts",
+					name: "ciphertext upload" }] },
+		grant: { mode: "fresh-only-confined-effects", oldResultUse: "untrusted-no-replay-no-adoption",
+			m07Tools: "factory-confined-local", modelSessions: "read-only",
+			state: "fresh-workspace-empty-store-no-resume", outputTransport: "encrypted-fixed",
+			providerInference: "fixed-configured-provider" } }), { mode: 0o600 });
+	const interruptedRun = { ...run(7003, 3, "completed", interruptedCommit, "cancelled") };
+	const preceding = run(7002, 2, "completed", sourceCommit, "failure");
+	const anchor = run(7001, 1, "completed", sha40("a"), "success");
+	const request: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.includes("/contents/")) {
+			const file = new URL(address).pathname.split("/contents/")[1]!;
+			const body = reviewFiles.get(file);
+			if (body !== undefined) return new Response(JSON.stringify({ type: "file", path: file,
+				encoding: "base64", size: Buffer.byteLength(body),
+				content: Buffer.from(body).toString("base64") }));
+		}
+		if (address.includes("/workflows/manual-private-campaign.yml/runs?"))
+			return new Response(JSON.stringify({ total_count: 3,
+				workflow_runs: [interruptedRun, preceding, anchor] }));
+		if (address.endsWith("/runs/7003"))
+			return new Response(JSON.stringify(interruptedRun));
+		if (address.includes("/runs/7003/jobs?"))
+			return new Response(JSON.stringify({ total_count: 1, jobs: [{ id: 6003,
+				run_id: 7003, run_attempt: 1, head_sha: interruptedCommit,
+				name: "private-campaign", status: "completed", conclusion: "cancelled",
+				steps: [{ name: "Run private campaign", status: "completed",
+					conclusion: "cancelled" }] }] }));
+		if (address.includes("/runs/7003/artifacts?"))
+			return new Response(JSON.stringify({ total_count: 1, artifacts: [{
+				id: 9103, name: MISSION_ARTIFACT, expired: false,
+				digest: `sha256:${"9".repeat(64)}`,
+				workflow_run: { id: 7003, head_sha: interruptedCommit } }] }));
+		return f.request(url, init);
+	};
+	return { ...f, request, reviewFile, input: { ...f.input, source: { ...source, runId: "7003",
+		sha: interruptedCommit }, request,
+		interruptedSourceReviewPrivateFile: reviewFile,
+		loadCarryArtifact: async ({ runId, artifactId }: { runId: string; artifactId: string }) => {
+			assert.equal(runId, "7002"); assert.equal(artifactId, "9002");
+			return f.sealed;
+		} } };
+}
+
+test("cancelled no-carry host bridge plans one fresh isolated request from authenticated prior state", async t => {
+	const f = await interruptedFixture(t);
+	const inspected = await prepareAuthenticatedResumeRequest({ ...f.input, readOnly: true });
+	assert.equal(inspected.decision.kind, "dispatch");
+	if (inspected.decision.kind !== "dispatch") return;
+	assert.equal(inspected.decision.intent.source.runId, "7003");
+	assert.equal(inspected.decision.intent.terminalInterruption?.resultArchiveSha256, "9".repeat(64));
+	assert.equal(inspected.decision.intent.actionKind, "reconcile-interrupted-run");
+	assert.equal(inspected.decision.intent.pendingAction.reasonCode, "execution-interrupted");
+	assert.equal(inspected.decision.intent.actionProvenance?.kind, "current-host-interruption");
+	assert.deepEqual(inspected.decision.intent.quarantinedOperationRefs, ["old-goal/O001"]);
+	assert.equal(inspected.descriptor?.message, REUSABLE_RUN_REQUEST_MESSAGE);
+	assert.equal(inspected.journalKey, undefined);
+	const prepared = await prepareAuthenticatedResumeRequest(f.input);
+	assert.equal(prepared.decision.kind, "dispatch");
+	assert.equal(prepared.journalState, "reserved");
+	assert.equal((await f.journal.get(prepared.journalKey!))?.intentBinding.terminalInterruption?.source.runId,
+		"7003");
+	const repeated = await prepareAuthenticatedResumeRequest(f.input);
+	assert.deepEqual(repeated.decision, { kind: "wait", reason: "dispatch-reserved",
+		idempotencyKey: prepared.journalKey });
+	assert.equal(repeated.descriptor, undefined);
+});
+
+test("failed carry and interruption authentication retain both safe private causes", async t => {
+	const f = await interruptedFixture(t);
+	const request: typeof fetch = async (url, init) => {
+		if (String(url).includes("/runs/7003/artifacts?"))
+			return new Response(JSON.stringify({ total_count: 0, artifacts: [] }));
+		return f.input.request(url, init);
+	};
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...f.input, request }), error => {
+		const diagnostic = privateHostPreparationDiagnostic(error);
+		assert.equal(diagnostic.code, "terminal-authentication-failed");
+		assert.equal((diagnostic.attempts as unknown[]).length, 2);
+		assert(!JSON.stringify(diagnostic).includes("Synthetic original task"));
+		return true;
+	});
+});
+
+test("an interrupted run requires a private review of its own immutable source before dispatch", async t => {
+	const f = await interruptedFixture(t);
+	const { interruptedSourceReviewPrivateFile: _review, ...unreviewed } = f.input;
+	const waiting = await prepareAuthenticatedResumeRequest(unreviewed);
+	assert.deepEqual(waiting.decision,
+		{ kind: "wait", reason: "interruption-source-review-required" });
+	assert.equal(waiting.descriptor, undefined);
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	const raw = JSON.parse(await readFile(f.reviewFile, "utf8"));
+	raw.prior.source.commit = sha40("1");
+	await writeFile(f.reviewFile, JSON.stringify(raw), { mode: 0o600 });
+	await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error => {
+		assert.equal(privateHostPreparationDiagnostic(error).code,
+			"interruption-source-review-invalid");
+		return true;
+	});
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+});
+
 test("reviewed workflow repair releases one tested descriptor and durable reservation", async t => {
 	const f = await repairFixture(t);
 	const first = await prepareAuthenticatedResumeRequest(f.input);
@@ -423,6 +575,27 @@ test("workflow repair review must fit the authenticated stage and failure", asyn
 	assert.equal((await prepareAuthenticatedResumeRequest({ ...f.input, request })).decision.kind, "dispatch");
 });
 
+test("a physically bounded private repair review may cite more than sixteen relevant facts", async t => {
+	const f = await repairFixture(t);
+	const symbols = Array.from({ length: 17 }, (_, index) => `repairEvidence${index + 1}`);
+	const testNames = Array.from({ length: 17 }, (_, index) => `repair evidence ${index + 1}`);
+	f.reviewEvidence.sourceText += symbols.map(symbol => `export const ${symbol} = true;`).join("\n");
+	f.reviewEvidence.testText += testNames.map(name =>
+		`test(${JSON.stringify(name)}, () => {});`).join("\n");
+	const plan: HostReviewedWorkflowRepairPlanV1 = { ...f.plan, review: { ...f.plan.review,
+		codeEvidenceRefs: [
+			...f.plan.review.codeEvidenceRefs,
+			...symbols.map(symbol => ({ path: reviewedCodePath, symbol }))],
+		offlineTests: { ...f.plan.review.offlineTests,
+			testEvidenceRefs: [
+				...f.plan.review.offlineTests.testEvidenceRefs,
+				...testNames.map(name => ({ path: reviewedTestPath, name }))] } } };
+	await writeFile(f.input.repairPlanPrivateFile, JSON.stringify(plan));
+	const prepared = await prepareAuthenticatedResumeRequest({ ...f.input, readOnly: true });
+	assert.equal(prepared.decision.kind, "dispatch");
+	assert.equal(prepared.descriptor?.message, REUSABLE_RUN_REQUEST_MESSAGE);
+});
+
 test("live authenticated carried action reserves a constant-message empty-tree request", async t => {
 	const f = await fixture(t, { carriedAction: true });
 	const result = await prepareAuthenticatedResumeRequest(f.input);
@@ -451,11 +624,14 @@ test("a legacy unknown operation gets a current host decision bound to the exact
 	assert.deepEqual(result.decision.intent.quarantinedOperationRefs, ["old-goal/O001"]);
 	assert.equal(result.decision.intent.actionKind, "reconcile-m07-operation");
 	assert.equal(result.decision.intent.actionProvenance?.kind, "current-host-derived");
-	assert.equal(result.decision.intent.actionProvenance?.checkpointSha256,
+	assert.equal(result.decision.intent.actionProvenance?.kind === "current-host-derived" ?
+		result.decision.intent.actionProvenance.checkpointSha256 : undefined,
 		createHash("sha256").update(oldBytes).digest("hex"));
 	assert.equal(f.bundle["objective-checkpoint.json"], oldBytes);
-	assert.equal((await f.journal.get(result.journalKey!))?.intentBinding.actionProvenance?.checkpointSha256,
-		result.decision.intent.actionProvenance?.checkpointSha256);
+	const provenance = (await f.journal.get(result.journalKey!))?.intentBinding.actionProvenance;
+	assert.equal(provenance?.kind === "current-host-derived" ? provenance.checkpointSha256 : undefined,
+		result.decision.intent.actionProvenance?.kind === "current-host-derived" ?
+			result.decision.intent.actionProvenance.checkpointSha256 : undefined);
 });
 
 test("authenticated read-only planning never creates a journal reservation", async t => {
@@ -577,9 +753,13 @@ test("a repeated request returns the durable reservation and never replaces an a
 	assert(!stored.includes("Synthetic original task"));
 });
 
-async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>>,
+async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
+	Awaited<ReturnType<typeof interruptedFixture>>,
 	options: { wrongArtifactDigest?: boolean; readOnly?: boolean;
 		repairPlanPrivateFile?: string;
+		interruptedSourceReviewPrivateFile?: string;
+		prefixOnly?: { runId: string; artifactId: string; raw: string; archiveSha256: string };
+		prefixText?: string; archiveSha256?: string; wrongArchiveEcho?: boolean;
 		sidecarFault?: "missing" | "duplicate" | "tamper" } = {}) {
 	const sourceFile = path.join(f.dir, "source.json");
 	const seedFile = path.join(f.dir, "seed.txt");
@@ -590,6 +770,15 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>>,
 	const artifactBytes = JSON.stringify({ envelopeB64: f.sealed.envelopeB64 });
 	await writeFile(artifactFile, artifactBytes, { mode: 0o600 });
 	const artifactSha256 = createHash("sha256").update(artifactBytes).digest("hex");
+	const prefixOnlyFile = options.prefixOnly ? path.join(f.dir, "prefix-only.json") : undefined;
+	if (prefixOnlyFile) await writeFile(prefixOnlyFile, options.prefixOnly!.raw, { mode: 0o600 });
+	let prefixReference: { name: string; file: string; sha256: string } | undefined;
+	if (options.prefixText !== undefined) {
+		const file = path.join(f.dir, "incremental-control-prefix.json");
+		await writeFile(file, options.prefixText, { mode: 0o600 });
+		prefixReference = { name: "incremental-control-prefix.json", file,
+			sha256: createHash("sha256").update(options.prefixText).digest("hex") };
+	}
 	const sidecarReferences = await Promise.all(Object.entries(f.sealed.sidecars).map(async ([name, value]) => {
 		const file = path.join(f.dir, name);
 		await writeFile(file, value, { mode: 0o600 });
@@ -613,6 +802,8 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>>,
 		"--public-key", f.input.publicKeyFile, "--journal-dir", f.journal.directory,
 		"--output-private", outputPrivate, "--connector-stdio",
 		...(options.repairPlanPrivateFile ? ["--repair-plan-private", options.repairPlanPrivateFile] : []),
+		...(options.interruptedSourceReviewPrivateFile ?
+			["--interrupted-source-review-private", options.interruptedSourceReviewPrivateFile] : []),
 		...(options.readOnly ? ["--read-only"] : [])],
 		{ cwd: path.dirname(path.dirname(script)), stdio: ["pipe", "pipe", "pipe"] });
 	let stderr = "";
@@ -622,7 +813,7 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>>,
 	const lines: unknown[] = [];
 	for await (const line of createInterface({ input: child.stdout, crlfDelay: Infinity })) {
 		const row = JSON.parse(line) as { kind: string; id?: number; url?: string;
-			runId?: string; artifactId?: string };
+			runId?: string; artifactId?: string; expectedArchiveSha256?: string };
 		lines.push(row);
 		if (row.kind === "github-get") {
 			assert.equal(typeof row.url, "string");
@@ -631,13 +822,26 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>>,
 			child.stdin.write(`${JSON.stringify({ id: row.id, status: response.status,
 				body: JSON.parse(await response.text()) })}\n`);
 		} else if (row.kind === "artifact-file") {
-			assert.equal(row.runId, f.input.source.runId);
+			if (options.prefixOnly && row.runId === options.prefixOnly.runId) {
+				assert.equal(row.artifactId, options.prefixOnly.artifactId);
+				assert.equal(row.expectedArchiveSha256, options.prefixOnly.archiveSha256);
+				child.stdin.write(`${JSON.stringify({ id: row.id, name: "incremental-control-prefix.json",
+					file: prefixOnlyFile,
+					sha256: createHash("sha256").update(options.prefixOnly.raw).digest("hex"),
+					archiveSha256: options.prefixOnly.archiveSha256 })}\n`);
+				continue;
+			}
+			assert(row.runId === f.input.source.runId || options.prefixOnly && row.runId === "7002");
 			assert.equal(row.artifactId, row.runId === "7003" ? "9003" : "9002");
+			assert.equal(row.expectedArchiveSha256, options.archiveSha256);
 			const sidecars = options.sidecarFault === "missing" ? sidecarReferences.slice(0, -1) :
 				options.sidecarFault === "duplicate" ? [...sidecarReferences, sidecarReferences[0]!] :
 				sidecarReferences;
 			child.stdin.write(`${JSON.stringify({ id: row.id, file: artifactFile,
 				sha256: options.wrongArtifactDigest ? "0".repeat(64) : artifactSha256,
+				...(options.archiveSha256 ? { archiveSha256: options.wrongArchiveEcho ?
+					"0".repeat(64) : options.archiveSha256 } : {}),
+				...(prefixReference ? { prefix: prefixReference } : {}),
 				...(sidecarReferences.length ? { sidecars } : {}) })}\n`);
 		} else assert(["prepared", "planned-read-only", "no-dispatch"].includes(row.kind));
 	}
@@ -709,6 +913,87 @@ test("stdio bridge authenticates connector reads and prints only a public descri
 	assert.equal((await stat(bridge.outputPrivate)).mode & 0o077, 0);
 	assert.equal((await new MissionResumeJournal(f.journal.directory)
 		.get(privateResult.journalKey))?.state, "reserved");
+});
+
+test("stdio bridge accepts a combined final carry and prefix only with the expected ZIP digest", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const archiveSha256 = "8".repeat(64);
+	const request = f.request;
+	f.request = async (url, init) => {
+		if (String(url).endsWith("/runs/7002/artifacts?per_page=100"))
+			return new Response(JSON.stringify({ total_count: 1, artifacts: [{ id: 9002,
+				name: CARRY_ARTIFACT_NAME, expired: false,
+				digest: `sha256:${archiveSha256}`, workflow_run: { id: 7002, head_sha: sourceCommit } }] }));
+		return request(url, init);
+	};
+	const result = await runStdioBridge(f, { prefixText: '{"status":"incomplete"}',
+		archiveSha256, readOnly: true });
+	assert.equal(result.code, 0, result.stderr);
+	assert.equal((result.lines.at(-1) as { kind: string }).kind, "planned-read-only");
+	const invalid = await runStdioBridge(f, { prefixText: '{"status":"incomplete"}',
+		archiveSha256, wrongArchiveEcho: true, readOnly: true });
+	assert.equal(invalid.code, 1);
+});
+
+test("stdio bridge authenticates a prefix-only interrupted artifact without adopting its research", async t => {
+	const f = await interruptedFixture(t);
+	const signed = JSON.parse(Buffer.from(f.input.seedEnvelopeB64!, "base64").toString("utf8")) as {
+		signature_b64: string };
+	const seedDigest = createHash("sha256")
+		.update(Buffer.from(f.input.seedEnvelopeB64!, "base64")).digest("hex");
+	const key = Buffer.from(hkdfSync("sha256", Buffer.from(signed.signature_b64, "base64"),
+		Buffer.from(seedDigest, "hex"), "mul-pis-ledger-continuation-v1", 32));
+	const priorEnvelopeSha256 = createHash("sha256")
+		.update(Buffer.from(f.sealed.envelopeB64, "base64")).digest("hex");
+	const source = { repository: MISSION_REPOSITORY, runId: "7003", runAttempt: 1,
+		commit: sha40("e"), event: "workflow_dispatch" as const, priorEnvelopeSha256 };
+	const incremental = new IncrementalPrivateCheckpointJournal({ source,
+		outputDir: f.dir, authenticatedMissionKey: key });
+	await incremental.record("initial", { requestAudit: { version: 3,
+		kind: "accounting-only-request-audit", requests: [], settledCny: 0,
+		unknownObservedCny: 0, unpricedRequestCount: 0 },
+		hostEffects: { version: 1, kind: "host-effect-prefix-observation", complete: false,
+			selectionAuthority: false, source: { runId: source.runId,
+				runAttempt: source.runAttempt, commit: source.commit },
+			priorEnvelopeSha256, historicalGoalRunIds: [], goals: [], sessions: [], requestIds: [] } });
+	const raw = await readFile(path.join(f.dir, "incremental-control-prefix.json"), "utf8");
+	const archiveSha256 = "8".repeat(64);
+	const originalRequest = f.request;
+	f.request = async (url, init) => {
+		if (String(url).endsWith("/runs/7003/artifacts?per_page=100"))
+			return new Response(JSON.stringify({ total_count: 2, artifacts: [{ id: 9103,
+				name: MISSION_ARTIFACT, expired: false, digest: `sha256:${"9".repeat(64)}`,
+				workflow_run: { id: 7003, head_sha: sha40("e") } }, { id: 9603,
+				name: CARRY_ARTIFACT_NAME, expired: false, digest: `sha256:${archiveSha256}`,
+				workflow_run: { id: 7003, head_sha: sha40("e") } }] }));
+		return originalRequest(url, init);
+	};
+	const direct = await prepareAuthenticatedResumeRequest({ ...f.input, request: f.request,
+		readOnly: true, loadCarryArtifact: async ({ runId }) => runId === "7003" ?
+			{ incrementalControlPrefix: raw } : f.sealed });
+	assert.equal(direct.decision.kind, "dispatch");
+	const result = await runStdioBridge(f, { readOnly: true,
+		interruptedSourceReviewPrivateFile: f.reviewFile,
+		prefixOnly: { runId: "7003", artifactId: "9603", raw, archiveSha256 } });
+	assert.equal(result.code, 0, `${result.stderr}\n${JSON.stringify(result.lines)}`);
+	assert.equal((result.lines.at(-1) as { kind: string }).kind, "planned-read-only");
+	assert(!result.stdout.includes("incrementalControlEnvelope"));
+	assert(!result.stdout.includes("Synthetic original task"));
+	const discarded = await runStdioBridge(f, {
+		interruptedSourceReviewPrivateFile: f.reviewFile,
+		prefixOnly: { runId: "7003", artifactId: "9603",
+			raw: '{"status":"complete"}', archiveSha256 } });
+	assert.equal(discarded.code, 0, discarded.stderr);
+	assert.equal((discarded.lines.at(-1) as { kind: string }).kind, "prepared");
+	const privateResult = JSON.parse(await readFile(discarded.outputPrivate, "utf8")) as {
+		decision: { kind: string }; incrementalPrefixFailure: {
+			stage: string; reason: string; category: string } };
+	assert.equal(privateResult.decision.kind, "dispatch");
+	assert.equal(privateResult.incrementalPrefixFailure.category,
+		"decode-or-authentication-failed");
+	assert.equal(privateResult.incrementalPrefixFailure.stage, "envelope");
+	assert.equal(privateResult.incrementalPrefixFailure.reason, "invalid-format");
+	assert(!discarded.stdout.includes("invalid-format"));
 });
 
 test("stdio bridge accepts a private reviewed repair without publishing its receipt", async t => {

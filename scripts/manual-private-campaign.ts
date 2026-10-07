@@ -21,12 +21,16 @@ import { assessAndAdvanceOriginalObjective, createOriginalObjective, isCurrentOb
 	writeObjectiveProgress, writeOriginalObjectiveContract } from "../src/m07/objective-progress.ts";
 import type { CurrentObjectiveStopReason, HostPendingActionFactsV1, ObjectiveProgressV1,
 	OriginalObjectiveContractV1 } from "../src/m07/objective-progress.ts";
+import type { GroundedIssue, GroundingSourceKind } from "../src/m07/assessor-grounding.ts";
 import type { BeginGoalInput, CurrentGoal, M07TaskRecord, TaskSpecInput } from "../src/m07/types.ts";
 import { runM04 } from "../src/stages/m04.ts";
 import { createPiSessionRunner } from "../src/runner/pi.ts";
 import type { SessionCheckpoint, SessionHandle, SessionRunner, SessionSpec,
 	TransportFailureDiagnostic } from "../src/runner/types.ts";
 import { DeepSeekCampaignBudget, campaignSessionEffectId } from "../src/runner/deepseek-campaign.ts";
+import type { HostEffectPrefixObservationV1,
+	IncrementalCheckpointEvent } from "../src/runner/incremental-private-checkpoint.ts";
+import { locateHistoryEntries } from "../src/runner/research-history-locator.ts";
 import { verifyDeepSeekCnyBilling, type NativeCnyPricingProfile } from "../src/runner/deepseek-cny-pricing.ts";
 import { verifyDeepSeekProviderOutputLimit,
 	type DeepSeekProviderOutputLimit } from "../src/runner/deepseek-provider-limits.ts";
@@ -211,6 +215,81 @@ function campaignObjectiveProgress(contract: OriginalObjectiveContractV1, inheri
 		unresolvedOperationIds,
 		...(input.stopReason === "cancelled" ? {} : { pendingActionFacts: {
 			...input.pendingActionFacts, unresolvedOperationRefs: unresolvedOperationIds } }) });
+}
+
+/** New live assessments cite frozen materials. Historical free-text details
+ * remain visible until grounded, without becoming new mandatory obligations. */
+function assessorGroundingPolicy(evidence: readonly { name: string; file: string }[],
+	prior: ObjectiveProgressV1, latest?: ObjectiveProgressV1["assessment"],
+	newSelectedEvidence = false): {
+	require: true; sourceKinds: Record<string, GroundingSourceKind>;
+	legacyOpenDetails: string[]; previousIssues: NonNullable<NonNullable<ObjectiveProgressV1["assessment"]>["groundedAssessment"]>["issues"];
+	newEvidenceSourceIds: string[] } {
+	const grounded = latest?.groundedAssessment ?? prior.assessment?.groundedAssessment;
+	const selectedNames = ["candidate.cpp", "verification.json", "workflow-archive.json",
+		"experiment-plan.json", "m04-knowledge.json"];
+	return { require: true,
+		sourceKinds: Object.fromEntries(evidence.map(item => [item.name,
+			item.name === "host-capabilities.json" ? "host-capability" :
+			item.name === "original-problem.txt" || /^original-input-[1-9][0-9]*\.txt$/.test(item.name) ?
+				"supplied-task" : "selected-evidence"])) as Record<string, GroundingSourceKind>,
+		legacyOpenDetails: [...(grounded?.legacyOpenDetails ?? prior.continuation.unresolvedDetails)],
+		previousIssues: grounded?.issues.map(issue => structuredClone(issue)) ?? [],
+		newEvidenceSourceIds: evidence.filter(item => item.name === "host-capabilities.json" && !latest ||
+			newSelectedEvidence && selectedNames.includes(item.name)).map(item => item.name) };
+}
+
+function assessorEvidenceAccess(evidence: readonly { name: string; file: string }[]):
+	Record<string, "required" | "retrievable"> {
+	return Object.fromEntries(evidence.map(item => [item.name,
+		item.name === "prior-research-history.json" ||
+		/^prior-research-history-part-[0-9]+\.txt$/.test(item.name) ||
+		/^prior-research-history-catalog-[0-9]+\.json$/.test(item.name) ||
+		/^prior-grounding-part-[0-9]+\.jsonl$/.test(item.name) ?
+			"retrievable" : "required"]));
+}
+
+/** The complete prior issue record stays available under the existing per-file
+ * evidence bound. The required index is a locator, not scientific authority. */
+async function stagePriorGroundingRecords(directory: string, input: {
+	legacyOpenDetails: readonly string[]; previousIssues: readonly GroundedIssue[];
+}): Promise<{ evidence: Array<{ name: string; file: string }>;
+	priorGroundingIndex: { indexName: string; partNames: string[] } }> {
+	await mkdir(directory, { recursive: true, mode: 0o700 });
+	const partNames: string[] = [];
+	const parts: Array<{ name: string; file: string }> = [];
+	const legacyLocators: Array<{ partName: string; line: number }> = [];
+	const issueLocators: Array<{ id: string; partName: string; line: number }> = [];
+	let lines: string[] = [], bytes = 0;
+	const flush = async () => {
+		if (!lines.length) return;
+		const name = `prior-grounding-part-${String(partNames.length + 1).padStart(6, "0")}.jsonl`;
+		const file = path.join(directory, name);
+		await writeFile(file, `${lines.join("\n")}\n`, { mode: 0o600 });
+		partNames.push(name); parts.push({ name, file }); lines = []; bytes = 0;
+	};
+	const add = async (record: { kind: "legacy-detail"; value: string } |
+		{ kind: "issue"; value: GroundedIssue }): Promise<{ partName: string; line: number }> => {
+		const line = JSON.stringify(record), length = Buffer.byteLength(`${line}\n`, "utf8");
+		if (length > 1_000_000) fail("one prior grounding record exceeds the per-file evidence bound");
+		if (bytes + length > 1_000_000) await flush();
+		const partName = `prior-grounding-part-${String(partNames.length + 1).padStart(6, "0")}.jsonl`;
+		lines.push(line); bytes += length;
+		return { partName, line: lines.length };
+	};
+	for (const value of input.legacyOpenDetails)
+		legacyLocators.push(await add({ kind: "legacy-detail", value }));
+	for (const value of input.previousIssues)
+		issueLocators.push({ id: value.id, ...await add({ kind: "issue", value }) });
+	await flush();
+	const indexName = "prior-grounding-index.json";
+	const indexText = `${JSON.stringify({ version: 1, kind: "prior-grounding-index",
+		parts: partNames, legacyLocators, issueLocators })}\n`;
+	if (Buffer.byteLength(indexText, "utf8") > 1_000_000)
+		fail("prior grounding index exceeds the per-file evidence bound");
+	const index = { name: indexName, file: path.join(directory, indexName) };
+	await writeFile(index.file, indexText, { mode: 0o600 });
+	return { evidence: [index, ...parts], priorGroundingIndex: { indexName, partNames } };
 }
 function observedTransportActionFacts(stopReason: CurrentObjectiveStopReason,
 	diagnostics: readonly TransportFailureDiagnostic[],
@@ -1857,6 +1936,7 @@ async function stageRangeReadableHistory(directory: string, text: string): Promi
 		return { inputs: [`objective-seeds/${item.name}`], evidence: [item], partitioned: false };
 	}
 	const parts: Array<{ name: string; bytes: number }> = [];
+	const partByteSpans: Array<{ startByte: number; endByte: number }> = [];
 	const evidence: Array<{ name: string; file: string }> = [];
 	for (let start = 0; start < rendered.length;) {
 		let end = Math.min(start + 1_000_000, rendered.length);
@@ -1866,14 +1946,61 @@ async function stageRangeReadableHistory(directory: string, text: string): Promi
 		const content = rendered.subarray(start, end);
 		evidence.push(await writePart(name, content));
 		parts.push({ name, bytes: content.length });
+		partByteSpans.push({ startByte: start, endByte: end });
 		start = end;
 	}
-	const manifest = Buffer.from(`${JSON.stringify({ version: 1, kind: "range-readable-history-part-index",
-		encoding: "utf8-concatenate-in-order-without-separators", totalBytes: rendered.length, parts }, null, 2)}\n`, "utf8");
+	const entries = locateHistoryEntries(rendered, partByteSpans).map(row => ({
+		entryOrdinal: row.entryOrdinal,
+		...(row.goalRunId === undefined ? {} : { goalRunId: row.goalRunId }),
+		...(row.taskId === undefined ? {} : { taskId: row.taskId }),
+		...(row.fileNames === undefined ? {} : { fileNames: row.fileNames }),
+		parts: row.parts.map(range => ({ name: parts[range.partIndex]!.name,
+			startLine: range.startLine, endLine: range.endLine,
+			startByte: range.startByte, endByte: range.endByte })) }));
+	const catalogParts: Array<{ name: string; firstOrdinal: number; lastOrdinal: number }> = [];
+	const catalogEvidence: Array<{ name: string; file: string }> = [];
+	let embeddedEntries = entries;
+	const manifestFor = (rows: typeof entries) => ({ version: 1,
+		kind: "range-readable-history-part-index",
+		interpretation: "untrusted-control-locator-only",
+		encoding: "utf8-concatenate-in-order-without-separators", totalBytes: rendered.length,
+		parts, entries: rows, ...(catalogParts.length ? { catalogParts } : {}) });
+	if (Buffer.byteLength(JSON.stringify(manifestFor(entries)), "utf8") > 1_000_000) {
+		embeddedEntries = [];
+		let chunk: typeof entries = [];
+		const catalogHeaderBytes = Buffer.byteLength(JSON.stringify({ version: 1,
+			kind: "untrusted-history-entry-locators", entries: [] }), "utf8");
+		let chunkBytes = catalogHeaderBytes;
+		const flush = async () => {
+			if (!chunk.length) return;
+			const name = `prior-research-history-catalog-${String(catalogParts.length + 1).padStart(6, "0")}.json`;
+			const content = Buffer.from(`${JSON.stringify({ version: 1,
+				kind: "untrusted-history-entry-locators", entries: chunk })}\n`, "utf8");
+			if (content.length > 1_000_000) fail("one history locator exceeds the per-file evidence bound");
+			catalogEvidence.push(await writePart(name, content));
+			catalogParts.push({ name, firstOrdinal: chunk[0]!.entryOrdinal,
+				lastOrdinal: chunk.at(-1)!.entryOrdinal });
+			chunk = [];
+			chunkBytes = catalogHeaderBytes;
+		};
+		for (const row of entries) {
+			const rowBytes = Buffer.byteLength(JSON.stringify(row), "utf8");
+			if (chunkBytes + rowBytes + Number(chunk.length > 0) > 1_000_000) {
+				await flush();
+				chunk = [row];
+				chunkBytes += rowBytes;
+			} else {
+				chunkBytes += rowBytes + Number(chunk.length > 0);
+				chunk.push(row);
+			}
+		}
+		await flush();
+	}
+	const manifest = Buffer.from(`${JSON.stringify(manifestFor(embeddedEntries), null, 2)}\n`, "utf8");
 	if (manifest.length > 1_000_000) fail("range-readable history part index exceeds the per-file evidence bound");
 	const index = await writePart("prior-research-history-index.json", manifest);
-	return { inputs: [index, ...evidence].map(item => `objective-seeds/${item.name}`),
-		evidence: [index, ...evidence], partitioned: true };
+	return { inputs: [index, ...catalogEvidence, ...evidence].map(item => `objective-seeds/${item.name}`),
+		evidence: [index, ...catalogEvidence, ...evidence], partitioned: true };
 }
 
 /** A prior rejected draft is evidence for a NEW M04 decision, never a proposal
@@ -2128,6 +2255,35 @@ async function buildHostEffectReceipt(input: { ws: Workspace;
 		requestIds: input.requestIds };
 }
 
+/** A nonterminal observation may precede task/session linkage. Persist only
+ * controller rows that actually exist on disk; the final census still checks
+ * complete ownership before granting any restart authority. */
+async function observedPersistedM07Goals(ws: Workspace): Promise<HostEffectPrefixObservationV1["goals"]> {
+	const goals: HostEffectPrefixObservationV1["goals"] = [];
+	for (const runId of await ws.listRuns("M07")) {
+		const file = path.join(ws.runDir("M07", runId), "goal.json");
+		let raw: string;
+		try { raw = await readFile(file, "utf8"); }
+		catch (error) {
+			// startRun can create a run directory before the controller creates its
+			// first goal record. That unobserved interval stays outside the prefix.
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw error;
+		}
+		const goal = JSON.parse(raw) as CurrentGoal;
+		if (goal.runId !== runId || !Array.isArray(goal.tasks) ||
+			!Array.isArray(goal.executionState?.operations))
+			fail("incremental M07 goal observation is incomplete");
+		goals.push({ runId, outcome: goal.outcome ?? "active",
+			tasks: goal.tasks.map(task => ({ taskId: task.taskId, mode: task.mode,
+				status: task.status,
+				sessionId: task.session?.id ? campaignSessionEffectId(task.session.id) : "" })),
+			operations: goal.executionState.operations.map(operation => ({ id: operation.id,
+				taskId: operation.taskId, status: operation.status })) });
+	}
+	return goals;
+}
+
 async function inputs(inputDir: string) {
 	const entries = await readdir(inputDir, { withFileTypes: true });
 	const sources = entries.filter(x => x.name.endsWith(".cpp"));
@@ -2156,7 +2312,8 @@ async function main() {
 	statusPhase = "mission-ledger-verification";
 	const missionLedger = await openLedgerContinuation({ seedEnvelopeB64: ledgerEnvelope,
 		publicKeyFile: path.join(HERE, "campaign-output-public.pem"), githubToken,
-		loadCarryArtifact: ({ artifactId }) => downloadCarryArtifact({ githubToken: githubToken ?? "", artifactId }),
+		loadCarryArtifact: ({ artifactId, expectedArchiveSha256 }) => downloadCarryArtifact({
+			githubToken: githubToken ?? "", artifactId, expectedArchiveSha256 }),
 		current: { repository: process.env.GITHUB_REPOSITORY, runId: process.env.GITHUB_RUN_ID,
 			runAttempt: process.env.GITHUB_RUN_ATTEMPT, actor: process.env.GITHUB_ACTOR,
 			event: process.env.GITHUB_EVENT_NAME, ref: process.env.GITHUB_REF,
@@ -2199,9 +2356,43 @@ async function main() {
 		grantKind: "none" | "read-dir" | "confined-execution";
 		taskId?: string; workRoot?: string;
 		grant?: NonNullable<SessionSpec["toolAuthority"]> }>();
+	const incrementalJournal = missionLedger.createIncrementalControlJournal(outputDir);
+	let prefixObjectiveCheckpointFile: string | undefined;
+	let prefixWorkspace: Workspace | undefined;
+	const recordIncrementalPrefix = async (event: IncrementalCheckpointEvent,
+		audit = budget.requestAccountingAuditSnapshot()): Promise<void> => {
+		let objectiveCheckpointJson: string | undefined;
+		if (prefixObjectiveCheckpointFile) {
+			try { objectiveCheckpointJson = await readFile(prefixObjectiveCheckpointFile, "utf8"); }
+			catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+		}
+		const source = missionLedger.incrementalControlSource;
+		const prefixGoals = prefixWorkspace ? await observedPersistedM07Goals(prefixWorkspace) : [];
+		const hostEffects: HostEffectPrefixObservationV1 = { version: 1,
+			kind: "host-effect-prefix-observation", complete: false, selectionAuthority: false,
+			source: { runId: source.runId, runAttempt: source.runAttempt, commit: source.commit },
+			priorEnvelopeSha256: source.priorEnvelopeSha256,
+			historicalGoalRunIds: [...receiptHistoricalGoalRunIds],
+			goals: structuredClone(prefixGoals),
+			sessions: [...sessionEffects.values()].map(session => ({
+				sessionId: campaignSessionEffectId(session.sessionId), kind: session.grantKind,
+				...(session.taskId ? { taskId: session.taskId } : {}),
+				...(session.workRoot ? { workRoot: session.workRoot } : {}),
+				...(session.grant ? { grant: { version: 1 as const,
+					kind: "confined-campaign-files" as const,
+					root: session.grant.root,
+					writableFiles: [...session.grant.writableFiles] } } : {}) })),
+			requestIds: audit.requests.map(row => row.requestId) };
+		await incrementalJournal.record(event, { requestAudit: audit, hostEffects,
+			...(objectiveCheckpointJson === undefined ? {} : { objectiveCheckpointJson }) });
+	};
 	let campaignCancelled = false;
 	try {
+		await recordIncrementalPrefix("initial");
 		const ws = new Workspace(path.join(campaignRoot, "workspace"));
+		prefixWorkspace = ws;
 		statusPhase = "workspace-init";
 		const store = createFileKnowledgeStore(ws.knowledgeDir);
 		await runInit(ws, store);
@@ -2273,8 +2464,13 @@ async function main() {
 		// A historical contract is immutable; current user overrides enter prompts separately.
 		const objectiveContractFile = path.join(outputDir, "original-objective.json");
 		const objectiveCheckpointFile = path.join(outputDir, "objective-checkpoint.json");
+		prefixObjectiveCheckpointFile = objectiveCheckpointFile;
+		const writeCurrentObjectiveProgress = async (progress: ObjectiveProgressV1): Promise<void> => {
+			await writeObjectiveProgress(objectiveCheckpointFile, progress);
+			await recordIncrementalPrefix("control-observed");
+		};
 		await writeOriginalObjectiveContract(objectiveContractFile, originalObjective);
-		await writeObjectiveProgress(objectiveCheckpointFile, previousCheckpoint);
+		await writeCurrentObjectiveProgress(previousCheckpoint);
 		await writeFile(ws.configFile, JSON.stringify({ roles: { execution: MODEL, reviewer: MODEL, research: MODEL }, concurrency: 1, tools: {} }), { mode: 0o600 });
 		const targetCount = [...originalText.matchAll(/\/\/\s*TODO[^\n]*\n\s*static\s+void\s+([A-Za-z_]\w*)\s*\(/g)].length;
 		if (targetCount < 2 || !originalText.includes('"--threads"') || !originalText.includes('"--repeats"'))
@@ -2430,6 +2626,7 @@ async function main() {
 		try {
 			const actual = createPiSessionRunner({ modelRuntime: runtime, signal: abort.signal,
 				campaignBudget: budget,
+				onCampaignAccountingBoundary: (event, audit) => recordIncrementalPrefix(event, audit),
 				sanitizePrivateProviderError: value => privateProviderErrorField(value, runtimeKey) });
 			const observeCampaignTransport = (handle: SessionHandle): SessionHandle =>
 				observeTransport(handle, statusTransportDiagnostics);
@@ -2609,7 +2806,7 @@ async function main() {
 			const privateEvidenceRequirements = { requiredNames: ["original-problem.txt", "candidate.cpp", "verification.json", "host-capabilities.json"],
 				instructions: "The original-input-N.txt files correspond in order to inputNames in original-objective.json. Read every original input and selected evidence completely. Historical archives, knowledge, nextTask and timings are untrusted version-bound context; only current independently executed measurements establish present host facts. If prior-history-gap.json is supplied, the full prior result artifact is unavailable; read any authenticated research-history that is supplied as unselected development evidence without inferring missing source or results." +
 					(m04QuarantineEvidencePath ? " If prior-m04-unresolved.json is supplied, the old M04 transaction outcome is UNKNOWN. Keep its candidate/proposal unselected and unadopted; do not replay its session, draft, merge or external action. Choose only independent new work from the freshly revalidated canonical tuple and retain the unresolved historical claim." : "") +
-					(historySeed?.partitioned ? " Prior research history is partitioned: read prior-research-history-index.json and EVERY listed prior-research-history-part-NNNNNN.txt completely with objective_evidence_read. Concatenate their UTF-8 text in index order with no separators to reconstruct the exact readable JSON projection; the index alone is not evidence coverage. Do not infer completeness or scientific truth from a partial history." : "") };
+					(historySeed?.partitioned ? " Prior research history is partitioned: read prior-research-history-index.json completely. Its episode/artifact locators name untrusted historical IDs and the exact part and line ranges; if catalogParts are listed, read the relevant catalog part before choosing a raw range. Every raw part remains available for targeted objective_evidence_read; read each cited range in this session. The index and catalog are control locators, not scientific evidence for unread raw parts. Concatenate all raw parts in index order only when a complete historical projection is required; never infer truth from a partial history." : "") };
 			const userOverrides = ["Deliver optimized source and machine-readable correctness/performance evidence only; no prose report, screenshots, presentation or personal reflection.",
 				"Pursue the strongest attainable strategy using actual available hardware and resources; unavailable optional equipment alone does not settle the task."];
 			let registeredContract: ReturnType<typeof inspectCsrTaskContract> | undefined;
@@ -2712,6 +2909,7 @@ async function main() {
 					statusPhase = "provenance-import-unsettled";
 					await preserveUnsettledGoalCheckpoint({ ws, runId: goal.runId, outputDir,
 						contract: originalObjective, budgetStopReason: budget.snapshot().stopReason });
+					await recordIncrementalPrefix("control-observed");
 					await saveStatus({ outcome: "incomplete", originalObjective: { id: originalObjective.id,
 						continuation: "reconcile-operations-before-new-run" },
 						provenanceImport: { state: "unsettled", sourceGoalRunId: importTarget.goalRunId,
@@ -2817,7 +3015,7 @@ async function main() {
 					{ mode: 0o600 });
 				if (m04EffectDisposition !== "continue") {
 					statusPhase = m04EffectDisposition;
-					await writeObjectiveProgress(objectiveCheckpointFile, campaignObjectiveProgress(
+					await writeCurrentObjectiveProgress(campaignObjectiveProgress(
 						originalObjective, historicalUnresolvedOperationIds, {
 							boundedRuns: [...previousCheckpoint.boundedRuns, ...importBoundedRuns],
 							selectedArtifacts: previousCheckpoint.selectedArtifacts,
@@ -2895,6 +3093,12 @@ async function main() {
 					file: m04QuarantineEvidencePath }] : []),
 				...importAssessmentEvidence,
 			];
+			const priorGroundingBase = assessorGroundingPolicy(priorEvidence, previousCheckpoint);
+			const priorGrounding = await stagePriorGroundingRecords(
+				path.join(campaignRoot, "prior-grounding-evidence"), priorGroundingBase);
+			priorEvidence.push(...priorGrounding.evidence);
+			const priorGroundingPolicy = { ...assessorGroundingPolicy(priorEvidence, previousCheckpoint),
+				priorGroundingIndex: priorGrounding.priorGroundingIndex };
 			if (previousBundle["m04-adopted-knowledge.json"])
 				await writeFile(path.join(priorSeedDir, "prior-m04-knowledge.json"), previousBundle["m04-adopted-knowledge.json"], { mode: 0o600 });
 			statusPhase = "prior-objective-assessment";
@@ -2907,6 +3111,8 @@ async function main() {
 					systemPrompt: "Assess the unchanged user objective and all frozen prior evidence. Choose the next scientific work yourself under observed host capabilities. Read every supplied original input and selected evidence before deciding; report uncertainty honestly.",
 					persistDir: ws.sessionsDir },
 				evidenceRoot: path.join(campaignRoot, "prior-objective-evidence"), evidence: priorEvidence,
+				groundingPolicy: priorGroundingPolicy,
+				evidenceAccess: assessorEvidenceAccess(priorEvidence),
 				evidenceRequirements: privateEvidenceRequirements,
 				assessmentAdmission: budget.snapshot().stopped ? campaignObjectiveStop(budget.snapshot().stopReason) ?? "assessment-failed" :
 					abort.signal.aborted ? "cancelled" : "admitted",
@@ -2915,7 +3121,7 @@ async function main() {
 				supportedTaskScopes: ["two-target-existing", "registered-csr-experiment"],
 				capabilities: objectiveCapabilities, userOverrides,
 				recordAssessment: async assessment => {
-					await writeObjectiveProgress(objectiveCheckpointFile, campaignObjectiveProgress(originalObjective,
+					await writeCurrentObjectiveProgress(campaignObjectiveProgress(originalObjective,
 						historicalUnresolvedOperationIds, {
 						boundedRuns: [...previousCheckpoint.boundedRuns, ...importBoundedRuns],
 						selectedArtifacts: previousCheckpoint.selectedArtifacts,
@@ -2961,7 +3167,7 @@ async function main() {
 					statusTransportDiagnostics);
 				const firstStopReason = firstRequestContract && firstStep.stopReason === "assessment-failed" ?
 					"request-contract-invalid" : firstStep.stopReason;
-				await writeObjectiveProgress(objectiveCheckpointFile, campaignObjectiveProgress(originalObjective,
+				await writeCurrentObjectiveProgress(campaignObjectiveProgress(originalObjective,
 					historicalUnresolvedOperationIds, {
 					boundedRuns: [...previousCheckpoint.boundedRuns, ...importBoundedRuns],
 					selectedArtifacts: previousCheckpoint.selectedArtifacts,
@@ -3060,6 +3266,7 @@ async function main() {
 						statusPhase = "branch-unsettled";
 						const boundary = await preserveUnsettledGoalCheckpoint({ ws, runId, outputDir,
 							contract: originalObjective, budgetStopReason: budget.snapshot().stopReason });
+						await recordIncrementalPrefix("control-observed");
 						if (boundary.archiveFailure) statusArchiveFailure = boundary.archiveFailure;
 						await saveStatus({ outcome: "incomplete", boundedRunOutcome: "partial",
 							originalObjective: { id: originalObjective.id, outcome: "incomplete",
@@ -3189,6 +3396,7 @@ async function main() {
 				statusPhase = "first-goal-unsettled";
 				const boundary = await preserveUnsettledGoalCheckpoint({ ws, runId, outputDir,
 					contract: originalObjective, budgetStopReason: budget.snapshot().stopReason });
+				await recordIncrementalPrefix("control-observed");
 				if (boundary.archiveFailure) statusArchiveFailure = boundary.archiveFailure;
 				await saveStatus({ outcome: "incomplete", boundedRunOutcome: "partial",
 					originalObjective: { id: originalObjective.id, outcome: "incomplete",
@@ -3305,6 +3513,8 @@ async function main() {
 			const followOnAttempts: Array<Record<string, unknown>> = [];
 			let followOnSourceChanged: boolean | null = null;
 			let objectiveAssessment: ObjectiveProgressV1["assessment"];
+			let lastAssessedSelectedGoalRunId = previousCheckpoint.boundedRuns.findLast(row =>
+				row.selectedTaskId)?.runId;
 			let latestAssessmentAdvanced = false;
 			const assessmentHistory: ObjectiveProgressV1["assessmentHistory"] = [...previousCheckpoint.assessmentHistory,
 				...(firstStep.assessment ? [{ iteration: previousCheckpoint.assessmentHistory.length + 1,
@@ -3367,6 +3577,16 @@ async function main() {
 						...(currentKnowledgeFile ? [{ name: "m04-knowledge.json", file: currentKnowledgeFile }] : []),
 						...latestAttemptEvidence,
 					];
+					const latestGrounding = assessmentHistory.at(-1)?.assessment ?? firstStep.assessment;
+					const selectedEvidenceNew = currentSelectedGoalRunId !== lastAssessedSelectedGoalRunId;
+					const groundingBase = assessorGroundingPolicy(evidence, previousCheckpoint,
+						latestGrounding, selectedEvidenceNew);
+					const stagedGrounding = await stagePriorGroundingRecords(
+						path.join(campaignRoot, `objective-grounding-${iteration}`), groundingBase);
+					evidence.push(...stagedGrounding.evidence);
+					const groundedPolicy = { ...assessorGroundingPolicy(evidence, previousCheckpoint,
+						latestGrounding, selectedEvidenceNew),
+						priorGroundingIndex: stagedGrounding.priorGroundingIndex };
 					const assessmentAdmission = "admitted";
 					let objectiveStep;
 					try { objectiveStep = await assessAndAdvanceOriginalObjective({
@@ -3377,6 +3597,8 @@ async function main() {
 							systemPrompt: "Independently assess the original research goal using the frozen evidence. Read the complete supplied files before proposing further work. Return only the requested structured judgment; acknowledge uncertainty, bounded search scope and failed checks. Do not invent measurements or treat M04 adoption as proof of performance.",
 							persistDir: ws.sessionsDir },
 						evidenceRoot: path.join(campaignRoot, `objective-evidence-${iteration}`), evidence,
+						groundingPolicy: groundedPolicy,
+						evidenceAccess: assessorEvidenceAccess(evidence),
 						evidenceRequirements: privateEvidenceRequirements,
 						assessmentAdmission,
 						advanceAdmission: () => budget.snapshot().stopped ?
@@ -3391,7 +3613,7 @@ async function main() {
 								assessmentHistory[assessmentHistory.length - 1] = { iteration, assessment,
 									stopReason: "assessment-validation-pending", advanced: false };
 							else assessmentHistory.push({ iteration, assessment, stopReason: "assessment-validation-pending", advanced: false });
-							await writeObjectiveProgress(objectiveCheckpointFile, campaignObjectiveProgress(originalObjective,
+							await writeCurrentObjectiveProgress(campaignObjectiveProgress(originalObjective,
 								historicalUnresolvedOperationIds,
 								{ boundedRuns: [...previousCheckpoint.boundedRuns, ...importBoundedRuns, ...rejectedGoalOutcomes,
 									{ runId: runId!, outcome: finished.outcome ?? "unknown",
@@ -3465,6 +3687,8 @@ async function main() {
 						throw error;
 					}
 					objectiveAssessment = objectiveStep.assessment;
+					if (objectiveStep.assessment?.unreadEvidence.length === 0)
+						lastAssessedSelectedGoalRunId = currentSelectedGoalRunId;
 					latestAssessmentAdvanced = Boolean(objectiveStep.advanced);
 					objectiveStopReason = objectiveStep.stopReason === "assessment-failed" && campaignObjectiveStop(budget.snapshot().stopReason) ?
 						campaignObjectiveStop(budget.snapshot().stopReason)! : objectiveStep.stopReason === "assessment-failed" &&
@@ -3745,7 +3969,7 @@ async function main() {
 						{ pendingActionFacts: workflowRepairActionFacts("m04-judgment") } :
 					objectiveStopReason === "request-contract-invalid" && firstGoalRequestContract ?
 						{ pendingActionFacts: { requestContract: firstGoalRequestContract } } : {}) });
-			await writeObjectiveProgress(objectiveCheckpointFile, objectiveCheckpoint);
+			await writeCurrentObjectiveProgress(objectiveCheckpoint);
 			const campaignOutcome = objectiveCheckpoint.objectiveOutcome;
 			await saveStatus({ outcome: campaignOutcome, boundedRunOutcome,
 				...(provenanceImportSummary ? { provenanceImport: provenanceImportSummary } : {}),
@@ -3810,6 +4034,7 @@ async function main() {
 					missionLedger.priorPrivateBundle["objective-checkpoint.json"], { mode: 0o600 });
 			else await salvageObjectiveCheckpoint(workspace, outputDir,
 				budget.snapshot().stopReason, campaignCancelled);
+			await recordIncrementalPrefix("control-observed");
 		}
 		catch { statusArchiveFailure = recordFinalizationFailure(finalizationFailures,
 			"objective-checkpoint-salvage-failed"); process.exitCode = 1; }
@@ -4015,6 +4240,9 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	buildHostEffectReceipt, observeTransport,
 	unresolvedGoalControl, campaignObjectiveProgress, observedTransportActionFacts,
 	observedRequestContract, archivedRequestContract,
+	assessorGroundingPolicy,
+	assessorEvidenceAccess,
+	stagePriorGroundingRecords,
 	canonicalUnresolvedOperationRefs, qualifiedOperationRef, reservedCanonicalOperationRefs,
 	registeredSourceShape, parseRegisteredCheckerOutput, validateContinuationSeed, rangeReadableHistory,
 	stageRangeReadableHistory, stageHistoricalM04RejectionEvidence, sandboxArguments };

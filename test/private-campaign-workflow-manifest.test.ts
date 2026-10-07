@@ -28,6 +28,8 @@ test("manual private workflow preserves encrypted carry and runtime admission", 
 		"${{ runner.temp }}/private-campaign-output/" + CARRY_FILE_NAME,
 		"${{ runner.temp }}/private-campaign-output/ledger-continuation.part-" +
 			"[0-9]".repeat(8) + ".enc",
+		"${{ runner.temp }}/private-campaign-output/incremental-control-prefix.json",
 	]);
 	assert.ok(yaml.includes("if: always() && steps.continuation.outputs.available == 'true'"));
+	assert.ok(yaml.includes("-s \"$RUNNER_TEMP/private-campaign-output/incremental-control-prefix.json\""));
 });

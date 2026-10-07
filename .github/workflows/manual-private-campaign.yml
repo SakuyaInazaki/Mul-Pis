@@ -167,7 +167,8 @@ jobs:
         if: always() && steps.decode.outcome == 'success'
         id: continuation
         run: |
-          if [ -f "$RUNNER_TEMP/private-campaign-output/ledger-continuation.enc.json" ]; then
+          if [ -f "$RUNNER_TEMP/private-campaign-output/ledger-continuation.enc.json" ] || \
+             [ -s "$RUNNER_TEMP/private-campaign-output/incremental-control-prefix.json" ]; then
             echo 'available=true' >> "$GITHUB_OUTPUT"
           else
             echo 'available=false' >> "$GITHUB_OUTPUT"
@@ -180,6 +181,7 @@ jobs:
           path: |
             ${{ runner.temp }}/private-campaign-output/ledger-continuation.enc.json
             ${{ runner.temp }}/private-campaign-output/ledger-continuation.part-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].enc
+            ${{ runner.temp }}/private-campaign-output/incremental-control-prefix.json
           if-no-files-found: error
           retention-days: 1
       - name: Report generic campaign failure

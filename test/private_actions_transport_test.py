@@ -152,6 +152,7 @@ class EncryptTests(unittest.TestCase):
             (results / "objective-assessment-receipt.json").write_bytes(b'{"boundaryIntent":"independent-judgment"}')
             (results / "objective-assessment-receipts.json").write_bytes(b'{"receipts":[{"boundaryIntent":"independent-judgment"}]}')
             (results / "mission-ledger-out.json").write_bytes(b'{"carryForwardCny":21.25,"status":"pending-local-artifact-verification-and-new-signature"}')
+            (results / "incremental-control-prefix.json").write_bytes(b'{"status":"incomplete","incrementalControlEnvelope":{"synthetic":true}}')
             (results / "independent-restart-quarantine.json").write_bytes(b'{"synthetic":"quarantine","operationOutcome":"unknown"}')
             (results / "independent-restart-goal-binding.json").write_bytes(b'{"synthetic":"binding","goalRunId":"fresh-goal"}')
             (results / "host-effect-receipt.json").write_bytes(b'{"kind":"m07-host-effect-census"}')
@@ -179,7 +180,7 @@ class EncryptTests(unittest.TestCase):
             plain = AESGCM(key).decrypt(base64.b64decode(envelope["nonce_b64"]),
                 base64.b64decode(envelope["ciphertext_b64"]), aad)
             with tarfile.open(fileobj=io.BytesIO(plain), mode="r:") as tar:
-                self.assertEqual(sorted(tar.getnames()), sorted(["branch-child-round-1-reviewer-feedback.txt", "branch-parent-round-1-reviewer-feedback.txt", "campaign-status.json", "candidate.cpp", "context-lineage.json", "fallback-aaaaaaaaaaaa-T003-round-10-reviewer-feedback.txt", "host-effect-receipt.json", "independent-restart-goal-binding.json", "independent-restart-quarantine.json", "initial-m04-adopted-knowledge.json", "iteration-65-round-10-reviewer-feedback.txt", "lesson-delta.json", "mission-ledger-out.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "objective-checkpoint.json", "original-objective.json", "repair-state.json", "review-decision.json", "round-1-reviewer-feedback.txt", "workflow-archive.json", "m04-transaction.json", "initial-m04-transaction.json", "followon-m04-transaction.json", "iteration-65-m04-transaction.json", "fallback-aaaaaaaaaaaa-T003-m04-transaction.json", "m04-transaction-quarantine.json", *sidecars]))
+                self.assertEqual(sorted(tar.getnames()), sorted(["branch-child-round-1-reviewer-feedback.txt", "branch-parent-round-1-reviewer-feedback.txt", "campaign-status.json", "candidate.cpp", "context-lineage.json", "fallback-aaaaaaaaaaaa-T003-round-10-reviewer-feedback.txt", "host-effect-receipt.json", "incremental-control-prefix.json", "independent-restart-goal-binding.json", "independent-restart-quarantine.json", "initial-m04-adopted-knowledge.json", "iteration-65-round-10-reviewer-feedback.txt", "lesson-delta.json", "mission-ledger-out.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "objective-checkpoint.json", "original-objective.json", "repair-state.json", "review-decision.json", "round-1-reviewer-feedback.txt", "workflow-archive.json", "m04-transaction.json", "initial-m04-transaction.json", "followon-m04-transaction.json", "iteration-65-m04-transaction.json", "fallback-aaaaaaaaaaaa-T003-m04-transaction.json", "m04-transaction-quarantine.json", *sidecars]))
                 self.assertEqual(tar.extractfile("candidate.cpp").read(), b"secret candidate")
             with self.assertRaises(Exception):
                 AESGCM(key).decrypt(base64.b64decode(envelope["nonce_b64"]),
@@ -212,6 +213,7 @@ class EncryptTests(unittest.TestCase):
             self.assertEqual((recovered / "objective-assessment-receipt.json").read_bytes(), b'{"boundaryIntent":"independent-judgment"}')
             self.assertEqual((recovered / "objective-assessment-receipts.json").read_bytes(), b'{"receipts":[{"boundaryIntent":"independent-judgment"}]}')
             self.assertEqual((recovered / "mission-ledger-out.json").read_bytes(), b'{"carryForwardCny":21.25,"status":"pending-local-artifact-verification-and-new-signature"}')
+            self.assertEqual((recovered / "incremental-control-prefix.json").read_bytes(), b'{"status":"incomplete","incrementalControlEnvelope":{"synthetic":true}}')
             self.assertEqual((recovered / "branch-parent-round-1-reviewer-feedback.txt").read_bytes(), b"Parent rationale")
             self.assertEqual((recovered / "branch-child-round-1-reviewer-feedback.txt").read_bytes(), b"Child rationale")
             self.assertEqual((recovered / "host-effect-receipt.json").read_bytes(), b'{"kind":"m07-host-effect-census"}')

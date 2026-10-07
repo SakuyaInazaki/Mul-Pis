@@ -12,6 +12,7 @@ import type { ReadReturnEvent, SessionHandle, SessionSpec } from "../src/runner/
 import type { WorkflowRepairStateV1 } from "../src/runner/repair-liveness.ts";
 import { Workspace } from "../src/workspace.ts";
 import { HarnessError } from "../src/types.ts";
+import type { GroundedAssessmentProposal } from "../src/m07/assessor-grounding.ts";
 
 const originalInputs: Record<string, string> = {
 	"original-problem.txt": "Original mission allows more than the finite pilot.\n",
@@ -310,6 +311,390 @@ test("fresh assessor reads frozen original inputs and delegates only its valid c
 	assert.equal(f.runRecord.sessions[0].boundary?.intent, "independent-judgment");
 	assert.equal((await f.ws.readRun("M07Objective", f.runRecord.runId)).sessions.length, 1);
 	assert.equal((await readFile(f.contractFile, "utf8")), `${JSON.stringify(f.contract, null, 2)}\n`);
+});
+
+const groundingKinds = {
+	"original-problem.txt": "supplied-task" as const,
+	"original-source.cpp": "supplied-task" as const,
+	"second-text.txt": "supplied-task" as const,
+	"candidate.cpp": "selected-evidence" as const,
+	"verification.json": "selected-evidence" as const,
+};
+
+function groundedReply(f: Awaited<ReturnType<typeof fixture>>, decision: "continue" | "blocked",
+	classification: "explicit-requirement" | "optional-method") {
+	const base = assessment(decision);
+	const claim = base.unresolvedDetails[0]!;
+	const issue = classification === "explicit-requirement" ? {
+		id: "strategy-gap", claim, status: "open" as const, classification,
+		implication: "The requested strategy still needs support.",
+		sourceRefs: [{ sourceId: "current-user-overrides", startLine: 1, endLine: 1 }],
+	} : {
+		id: "method-limit", claim, status: "open" as const, classification,
+		implication: "A suggested method remains unavailable.",
+		optionalBasis: "The supplied material presents it as a possible method.",
+		sourceRefs: [{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }],
+	};
+	const groundedAssessment: GroundedAssessmentProposal = {
+		version: 1, kind: "grounded-assessment-proposal", contractId: f.contract.id,
+		missionStatus: "open", issues: [issue], legacyOpenDetails: ["Preserved old detail"],
+		...(decision === "continue" ? { nextTask: {
+			obligationIds: ["original-task"], addresses: ["strategy-gap"], adapterScope: "two-target-existing",
+			decisionChangingHypothesis: "A new comparison could change the strategy recommendation.",
+			expectedEvidence: "A correctness result and measured comparison.",
+			sourceRefs: [{ sourceId: "current-user-overrides", startLine: 1, endLine: 1 }],
+		} } : {}),
+		deliverableReady: { status: "proposed", ready: false, rationale: "Evidence remains incomplete.",
+			evidenceRefs: [{ sourceId: "verification.json", startLine: 1, endLine: 1 }],
+			remainingIssueIds: [issue.id] },
+	};
+	return { ...base, groundedAssessment };
+}
+
+test("grounded live proposal needs full frozen reads before its decision-changing task dispatches", async t => {
+	const f = await fixture(t);
+	let turns = 0, dispatched = 0;
+	const runner = new FakeSessionRunner(({ message }) => {
+		turns++;
+		if (turns === 1) assert.match(message, /groundedAssessment|Grounded assessment/);
+		return { text: JSON.stringify(groundedReply(f, "continue", "explicit-requirement")),
+			readReturns: turns === 1 ? ranges(f, ["second-text.txt"]) : ranges(f, ["original-objective.json",
+				"original-problem.txt", "original-source.cpp", "candidate.cpp", "verification.json"]) };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		userOverrides: ["Deliver the strongest supported strategy"],
+		groundingPolicy: { require: true, sourceKinds: groundingKinds,
+			legacyOpenDetails: ["Preserved old detail"] },
+		capabilities: [{ scope: "two-target-existing", available: true, description: "Synthetic runner", limits: [] }],
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { dispatched++; return "advanced"; } });
+	assert.equal(turns, 2);
+	assert.equal(dispatched, 1);
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.deepEqual(result.assessment?.unreadEvidence, []);
+	assert.equal(result.assessment?.groundedAssessment?.missionStatus, "open");
+});
+
+test("an optional method alone cannot force repeated work despite a generic available adapter", async t => {
+	const f = await fixture(t);
+	let turns = 0, dispatched = 0;
+	const runner = new FakeSessionRunner(() => {
+		turns++;
+		return { text: JSON.stringify(groundedReply(f, "blocked", "optional-method")), readReturns: ranges(f) };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		userOverrides: ["Deliver the strongest supported strategy"],
+		groundingPolicy: { require: true, sourceKinds: groundingKinds,
+			legacyOpenDetails: ["Preserved old detail"] },
+		capabilities: [{ scope: "two-target-existing", available: true, description: "Synthetic runner", limits: [] }],
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { dispatched++; } });
+	assert.equal(turns, 1);
+	assert.equal(dispatched, 0);
+	assert.equal(result.stopReason, "model-reported-blocked");
+	assert.equal(objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [],
+		assessment: result.assessment, stopReason: result.stopReason }).objectiveOutcome, "incomplete");
+});
+
+test("a previous verification issue can resolve from frozen evidence without closing the open mission", async t => {
+	const f = await fixture(t);
+	const verdict = assessment("fulfilled");
+	verdict.groundedAssessment = {
+		version: 1, kind: "grounded-assessment-proposal", contractId: f.contract.id,
+		missionStatus: "open", legacyOpenDetails: ["Preserved old detail"],
+		issues: [{ id: "prior-check", claim: "Verify the previous claim", status: "resolved",
+			classification: "necessary-verification", claimAtRisk: "The earlier recommendation is correct.",
+			implication: "The claim now has a check.",
+			sourceRefs: [{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }],
+			resolution: { explanation: "A selected result supplies the required check.",
+				evidenceRefs: [{ sourceId: "verification.json", startLine: 1, endLine: 1 }] } }],
+		deliverableReady: { status: "proposed", ready: true,
+			rationale: "The current selected result supports a deliverable recommendation.",
+			evidenceRefs: [{ sourceId: "verification.json", startLine: 1, endLine: 1 }],
+			remainingIssueIds: [] },
+	};
+	let dispatched = 0;
+	const runner = new FakeSessionRunner(() => ({ text: JSON.stringify(verdict), readReturns: ranges(f) }));
+	const previousIssue = { ...verdict.groundedAssessment.issues[0]!, status: "open" as const,
+		resolution: undefined };
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		userOverrides: ["Deliver the strongest supported strategy"],
+		groundingPolicy: { require: true, sourceKinds: groundingKinds,
+			legacyOpenDetails: ["Preserved old detail"], previousIssues: [previousIssue],
+			newEvidenceSourceIds: ["verification.json"] },
+		capabilities: [{ scope: "two-target-existing", available: true, description: "Synthetic runner", limits: [] }],
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { dispatched++; } });
+	assert.equal(dispatched, 0);
+	assert.equal(result.stopReason, "model-closure-unverified");
+	assert.equal(result.assessment?.groundedAssessment?.issues[0]?.status, "resolved");
+	assert.equal(objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [],
+		assessment: result.assessment, stopReason: result.stopReason }).objectiveOutcome, "incomplete");
+});
+
+async function addHistoryEvidence(f: Awaited<ReturnType<typeof fixture>>, partCount = 1) {
+	const indexName = "prior-research-history-index.json";
+	const partNames = Array.from({ length: partCount }, (_, i) => `prior-history-part-${i + 1}.txt`);
+	const indexFile = path.join(f.root, indexName);
+	await writeFile(indexFile, `${JSON.stringify({ parts: partNames })}\n`);
+	f.evidence.push({ name: indexName, file: indexFile });
+	for (const name of partNames) {
+		const file = path.join(f.root, name);
+		await writeFile(file, `${"x".repeat(700_000)}\n`);
+		f.evidence.push({ name, file });
+	}
+	const indexRead: ReadReturnEvent = { toolName: "objective_evidence_read", status: "returned",
+		path: indexName, requested: {}, returned: { kind: "text", startLine: 1, endLine: 1,
+			truncated: false }, at: new Date().toISOString() };
+	return { indexName, partNames, indexRead,
+		access: Object.fromEntries(partNames.map(name => [name, "retrievable" as const])) };
+}
+
+test("large retained history stays frozen and retrievable without an aggregate read requirement", async t => {
+	const f = await fixture(t);
+	const history = await addHistoryEvidence(f, 3);
+	let dispatched = 0;
+	const runner = new FakeSessionRunner(({ message }) => {
+		assert.match(message, /Additional frozen history is retrievable on demand/);
+		assert.ok(!message.includes(history.partNames[2]!));
+		return { text: JSON.stringify(assessment("continue")),
+			readReturns: [...ranges(f), history.indexRead] };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		evidenceAccess: history.access,
+		evidenceRequirements: { requiredNames: ["original-problem.txt", "candidate.cpp", "verification.json",
+			history.indexName] },
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { dispatched++; } });
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.equal(dispatched, 1);
+	assert.deepEqual(result.assessment?.unreadEvidence, []);
+	assert.ok(!result.assessment?.evidenceRead.includes(history.partNames[0]!));
+	for (const name of history.partNames)
+		assert.equal((await readFile(path.join(f.evidenceRoot, name))).length, 700_001);
+});
+
+test("citing a retrievable whole file requires its complete current-session read", async t => {
+	const f = await fixture(t);
+	const history = await addHistoryEvidence(f);
+	let turns = 0, dispatched = 0;
+	const partRead: ReadReturnEvent = { toolName: "objective_evidence_read", status: "returned",
+		path: history.partNames[0]!, requested: {}, returned: { kind: "text", startLine: 1,
+			endLine: 1, truncated: false }, at: new Date().toISOString() };
+	const modelReply = { ...assessment("continue"),
+		evidenceRefs: ["candidate.cpp", "verification.json", history.partNames[0]!] };
+	const runner = new FakeSessionRunner(() => ({ text: JSON.stringify(modelReply),
+		readReturns: ++turns === 1 ? [...ranges(f), history.indexRead] : [partRead] }));
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		evidenceAccess: history.access, persistReceipt: () => f.ws.writeRun(f.runRecord),
+		assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		supportedTaskScopes: ["two-target-existing"], advance: async () => { dispatched++; } });
+	assert.equal(turns, 2);
+	assert.equal(dispatched, 1);
+	assert.deepEqual(result.assessment?.unreadEvidence, []);
+});
+
+test("a retrievable grounded span requires its exact returned lines", async t => {
+	const f = await fixture(t);
+	const history = await addHistoryEvidence(f);
+	const part = history.partNames[0]!;
+	await writeFile(path.join(f.root, part), "first\nsecond\nthird\n");
+	const verdict = groundedReply(f, "continue", "explicit-requirement");
+	verdict.groundedAssessment!.issues[0] = {
+		id: "strategy-gap", claim: verdict.unresolvedDetails[0]!, status: "open",
+		classification: "necessary-verification", claimAtRisk: "The strategy recommendation is correct.",
+		implication: "Historical evidence could change the recommendation.",
+		sourceRefs: [{ sourceId: part, startLine: 3, endLine: 3 }],
+	};
+	let turns = 0, dispatched = 0;
+	const runner = new FakeSessionRunner(() => ({ text: JSON.stringify(verdict),
+		readReturns: ++turns === 1 ? [...ranges(f), history.indexRead,
+			{ toolName: "objective_evidence_read", status: "returned", path: part, requested: {},
+				returned: { kind: "text", startLine: 3, endLine: 3, truncated: true },
+				at: new Date().toISOString() } as ReadReturnEvent] :
+			[{ toolName: "objective_evidence_read", status: "returned", path: part, requested: {},
+				returned: { kind: "text", startLine: 3, endLine: 3, truncated: false },
+				at: new Date().toISOString() } as ReadReturnEvent] }));
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		userOverrides: ["Deliver the strongest supported strategy"],
+		groundingPolicy: { require: true,
+			sourceKinds: { ...groundingKinds, [history.indexName]: "selected-evidence", [part]: "selected-evidence" },
+			legacyOpenDetails: ["Preserved old detail"] },
+		evidenceAccess: history.access,
+		capabilities: [{ scope: "two-target-existing", available: true, description: "Synthetic runner", limits: [] }],
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { dispatched++; } });
+	assert.equal(turns, 2);
+	assert.equal(dispatched, 1);
+	assert.deepEqual(result.assessment?.unreadEvidence, []);
+	assert.ok(!result.assessment?.evidenceRead.includes(part), "span coverage does not pretend full-file coverage");
+});
+
+test("fresh assessor context must reread mandatory files even when history is retrievable", async t => {
+	const f = await fixture(t);
+	const history = await addHistoryEvidence(f);
+	let calls = 0, dispatched = 0;
+	const runner = new FakeSessionRunner(() => {
+		calls++;
+		if (calls <= 2) return { text: "invalid JSON", readReturns: calls === 1 ?
+			[...ranges(f), history.indexRead] : [] };
+		return { text: JSON.stringify(assessment("continue")), readReturns: calls === 3 ? [] :
+			[...ranges(f), history.indexRead] };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		evidenceAccess: history.access, persistReceipt: () => f.ws.writeRun(f.runRecord),
+		assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		supportedTaskScopes: ["two-target-existing"], advance: async () => { dispatched++; } });
+	assert.equal(runner.created.length, 2);
+	assert.equal(calls, 4);
+	assert.equal(dispatched, 1);
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+});
+
+async function addPriorGroundingIndex(f: Awaited<ReturnType<typeof fixture>>,
+	legacyOpenDetails: string[], previousIssues: GroundedAssessmentProposal["issues"]) {
+	const indexName = "prior-grounding-index.json";
+	const parts: Array<{ name: string; text: string }> = [];
+	const legacyLocators = legacyOpenDetails.map((value, n) => {
+		const name = `prior-grounding-legacy-${n + 1}.jsonl`;
+		parts.push({ name, text: `${JSON.stringify({ kind: "legacy-detail", value })}\n` });
+		return { partName: name, line: 1 };
+	});
+	const issueLocators = previousIssues.map((value, n) => {
+		const name = `prior-grounding-issue-${n + 1}.jsonl`;
+		parts.push({ name, text: `${JSON.stringify({ kind: "issue", value })}\n` });
+		return { id: value.id, partName: name, line: 1 };
+	});
+	const index = { version: 1, kind: "prior-grounding-index", parts: parts.map(item => item.name),
+		legacyLocators, issueLocators };
+	const indexFile = path.join(f.root, indexName);
+	await writeFile(indexFile, `${JSON.stringify(index)}\n`);
+	f.evidence.push({ name: indexName, file: indexFile });
+	for (const part of parts) {
+		const file = path.join(f.root, part.name);
+		await writeFile(file, part.text);
+		f.evidence.push({ name: part.name, file });
+	}
+	const indexRead: ReadReturnEvent = { toolName: "objective_evidence_read", status: "returned",
+		path: indexName, requested: {}, returned: { kind: "text", startLine: 1,
+			endLine: 1, truncated: false }, at: new Date().toISOString() };
+	return { indexName, parts, indexRead, issueLocators,
+		access: Object.fromEntries(parts.map(item => [item.name, "retrievable" as const])),
+		sourceKinds: { ...groundingKinds, [indexName]: "selected-evidence" as const,
+			...Object.fromEntries(parts.map(item => [item.name, "selected-evidence" as const])) },
+		priorGroundingIndex: { indexName, partNames: parts.map(item => item.name) } };
+}
+
+const deltaReply = (decision: "blocked" | "fulfilled", resolution?: {
+	id: string; priorRef: { sourceId: string; startLine: number; endLine: number } }) => ({
+	version: 1, decision, rationale: "Synthetic bounded assessment",
+	evidenceRefs: ["candidate.cpp", "verification.json"],
+	unresolvedObligations: decision === "blocked" ? ["original-task"] : [],
+	groundedAssessmentDelta: { version: 1, kind: "grounded-assessment-delta",
+		newIssues: [], resolutions: resolution ? [{ ...resolution,
+			explanation: "A new frozen result checks the prior claim.",
+			evidenceRefs: [{ sourceId: "verification.json", startLine: 1, endLine: 1 }] }] : [] },
+});
+
+test("indexed prior grounding stays out of prompt and omitted issues remain open", async t => {
+	const f = await fixture(t);
+	const legacy = ["L".repeat(700_000)];
+	const issues: GroundedAssessmentProposal["issues"] = [{ id: "old-method",
+		claim: "C".repeat(700_000), status: "open", classification: "optional-method",
+		optionalBasis: "A historical source called it optional.", implication: "No new task is forced.",
+		sourceRefs: [{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }] }];
+	const prior = await addPriorGroundingIndex(f, legacy, issues);
+	let dispatched = 0;
+	const runner = new FakeSessionRunner(({ message }) => {
+		assert.ok(!message.includes("L".repeat(50)));
+		assert.ok(!message.includes("C".repeat(50)));
+		assert.ok(!message.includes(prior.parts[0]!.name), "part names come from the required index");
+		return { text: JSON.stringify(deltaReply("blocked")),
+			readReturns: [...ranges(f), prior.indexRead] };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		evidenceAccess: prior.access, userOverrides: ["Deliver the strongest supported strategy"],
+		groundingPolicy: { require: true, sourceKinds: prior.sourceKinds,
+			legacyOpenDetails: legacy, previousIssues: issues,
+			priorGroundingIndex: prior.priorGroundingIndex },
+		capabilities: [{ scope: "two-target-existing", available: true, description: "Synthetic", limits: [] }],
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { dispatched++; } });
+	assert.equal(dispatched, 0);
+	assert.equal(result.stopReason, "model-reported-blocked");
+	assert.deepEqual(result.assessment?.groundedAssessment?.issues, issues);
+	assert.deepEqual(result.assessment?.groundedAssessment?.legacyOpenDetails, legacy);
+	assert.deepEqual(result.assessment?.unreadEvidence, []);
+});
+
+test("missing or tampered prior grounding part is rejected before an assessor prompt", async t => {
+	const f = await fixture(t);
+	const legacy = ["authenticated old detail"];
+	const prior = await addPriorGroundingIndex(f, legacy, []);
+	const runner = new FakeSessionRunner(() => { throw new Error("assessor must not start"); });
+	await writeFile(path.join(f.root, prior.parts[0]!.name),
+		`${JSON.stringify({ kind: "legacy-detail", value: "tampered" })}\n`);
+	const base = { ...f, runner, evidenceAccess: prior.access,
+		groundingPolicy: { require: true as const, sourceKinds: prior.sourceKinds,
+			legacyOpenDetails: legacy, previousIssues: [],
+			priorGroundingIndex: prior.priorGroundingIndex },
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted" as const,
+		advanceAdmission: () => "admitted" as const, supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { throw new Error("must not dispatch"); } };
+	await assert.rejects(assessAndAdvanceOriginalObjective(base), /partition differs/);
+	assert.equal(runner.created.length, 0);
+	await rm(path.join(f.root, prior.parts[0]!.name));
+	await assert.rejects(assessAndAdvanceOriginalObjective(base));
+	assert.equal(runner.created.length, 0);
+});
+
+test("indexed prior resolution needs its old line and new evidence returned in this session", async t => {
+	const f = await fixture(t);
+	const issues: GroundedAssessmentProposal["issues"] = [{ id: "old-check",
+		claim: "A previous claim needs verification.", status: "open",
+		classification: "necessary-verification", claimAtRisk: "The proposed recommendation is correct.",
+		implication: "Verification could change the recommendation.",
+		sourceRefs: [{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }] }];
+	const prior = await addPriorGroundingIndex(f, [], issues);
+	const oldPart = prior.issueLocators[0]!.partName;
+	const resolved = deltaReply("fulfilled", { id: "old-check",
+		priorRef: { sourceId: oldPart, startLine: 1, endLine: 1 } });
+	let prompts = 0;
+	const missingRunner = new FakeSessionRunner(() => {
+		prompts++;
+		if (prompts > 1) throw new Error("synthetic transport failure after missing prior line");
+		return { text: JSON.stringify(resolved), readReturns: [...ranges(f), prior.indexRead] };
+	});
+	const common = { ...f, evidenceAccess: prior.access,
+		userOverrides: ["Deliver the strongest supported strategy"],
+		groundingPolicy: { require: true as const, sourceKinds: prior.sourceKinds,
+			legacyOpenDetails: [], previousIssues: issues, newEvidenceSourceIds: ["verification.json"],
+			priorGroundingIndex: prior.priorGroundingIndex },
+		capabilities: [{ scope: "two-target-existing", available: true, description: "Synthetic", limits: [] }],
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted" as const,
+		advanceAdmission: () => "admitted" as const,
+		supportedTaskScopes: ["two-target-existing"], advance: async () => {
+			throw new Error("must not dispatch"); } };
+	const missing = await assessAndAdvanceOriginalObjective({ ...common, runner: missingRunner });
+	assert.equal(missing.stopReason, "assessment-failed");
+	assert.ok(missing.assessment?.unreadEvidence.includes(oldPart));
+	const validRunner = new FakeSessionRunner(() => ({ text: JSON.stringify(resolved),
+		readReturns: [...ranges(f), prior.indexRead,
+			{ toolName: "objective_evidence_read", status: "returned", path: oldPart, requested: {},
+				returned: { kind: "text", startLine: 1, endLine: 1, truncated: false },
+				at: new Date().toISOString() } as ReadReturnEvent] }));
+	const valid = await assessAndAdvanceOriginalObjective({ ...common, runner: validRunner,
+		evidenceRoot: path.join(f.root, "second-assessment-evidence") });
+	assert.equal(valid.stopReason, "model-closure-unverified");
+	assert.equal(valid.assessment?.groundedAssessment?.issues[0]?.status, "resolved");
+	assert.equal(objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [],
+		assessment: valid.assessment, stopReason: valid.stopReason }).objectiveOutcome, "incomplete");
 });
 
 test("assessment may cite the required frozen original-objective contract", async t => {

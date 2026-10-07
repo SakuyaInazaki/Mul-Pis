@@ -13,6 +13,7 @@ import { HarnessError } from "../src/types.ts";
 import { sealCampaignCarry } from "../src/runner/emergency-carry.ts";
 import { encodeCarrySidecars, decodeCarrySidecars } from "../src/runner/carry-sidecar-codec.ts";
 import { CARRY_SEGMENT_FILE_BYTES } from "../src/runner/carry-sidecar-codec.ts";
+import { validatePriorGroundingIndex } from "../src/m07/assessor-grounding.ts";
 
 test("shared-total campaign requires explicit manual admission and signed cumulative ledger", async () => {
  const workflow = await readFile(new URL("../.github/workflows/manual-private-campaign.yml", import.meta.url), "utf8");
@@ -41,12 +42,86 @@ test("shared-total campaign requires explicit manual admission and signed cumula
  assert.doesNotMatch(workflow, /up to [0-9.]+ CNY/);
 });
 
+test("production campaign forwards the live carry archive digest to its downloader", async () => {
+	const source = await readFile(new URL("../scripts/manual-private-campaign.ts", import.meta.url), "utf8");
+	assert.match(source,
+		/loadCarryArtifact:\s*\(\{\s*artifactId,\s*expectedArchiveSha256\s*\}\)\s*=>\s*downloadCarryArtifact\(\{\s*githubToken:[^}]*artifactId,\s*expectedArchiveSha256\s*\}\)/);
+});
+
 test("failed research collection retains typed unresolved M04 quarantine for emergency carry", () => {
 	const old = { "candidate.cpp": "synthetic selected source" };
 	const typed = '{"version":1,"kind":"unresolved-historical-m04-quarantine","entries":[]}';
 	const retained = offlineChecks.collectorFailureBundle(old, undefined, typed);
 	assert.equal(retained?.["candidate.cpp"], old["candidate.cpp"]);
 	assert.equal(retained?.["m04-transaction-quarantine.json"], typed);
+});
+
+test("both private assessor stages register frozen source roles and retain prior issue identity", () => {
+	const contract = { version: 1 as const, kind: "original-objective" as const,
+		id: "synthetic-grounding-contract", createdAt: "2030-01-01T00:00:00Z",
+		goal: "Synthetic research goal", goalSource: "user-intent-summary" as const,
+		inputNames: ["input.txt"], obligations: [{ id: "core", description: "Compare strategy" }],
+		closure: "open-ended" as const };
+	const previous = offlineChecks.campaignObjectiveProgress(contract, [], {
+		boundedRuns: [], selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
+		stopReason: "assessment-validation-pending" });
+	previous.continuation.unresolvedDetails = ["Legacy unclassified observation"];
+	const evidence = [
+		{ name: "host-capabilities.json", file: "/synthetic/capabilities" },
+		{ name: "original-problem.txt", file: "/synthetic/problem" },
+		{ name: "original-input-1.txt", file: "/synthetic/input" },
+		{ name: "candidate.cpp", file: "/synthetic/candidate" },
+		{ name: "workflow-archive.json", file: "/synthetic/archive" }];
+	const first = offlineChecks.assessorGroundingPolicy(evidence, previous);
+	assert.equal(first.require, true);
+	assert.deepEqual(first.sourceKinds, {
+		"host-capabilities.json": "host-capability", "original-problem.txt": "supplied-task",
+		"original-input-1.txt": "supplied-task", "candidate.cpp": "selected-evidence",
+		"workflow-archive.json": "selected-evidence" });
+	assert.deepEqual(first.legacyOpenDetails, ["Legacy unclassified observation"]);
+	assert.deepEqual(first.previousIssues, []);
+	assert.deepEqual(first.newEvidenceSourceIds, ["host-capabilities.json"]);
+	const latest = { groundedAssessment: { legacyOpenDetails: ["Legacy unclassified observation"],
+		issues: [{ id: "issue-1" }] } } as any;
+	const later = offlineChecks.assessorGroundingPolicy(evidence, previous, latest);
+	assert.deepEqual(later.previousIssues.map(issue => issue.id), ["issue-1"]);
+	assert.deepEqual(later.legacyOpenDetails, first.legacyOpenDetails);
+	const selected = offlineChecks.assessorGroundingPolicy(evidence, previous, latest, true);
+	assert.deepEqual(selected.newEvidenceSourceIds,
+		["candidate.cpp", "workflow-archive.json"]);
+	const access = offlineChecks.assessorEvidenceAccess([...evidence,
+		{ name: "prior-research-history-index.json", file: "/synthetic/history-index" },
+		{ name: "prior-research-history-part-000001.txt", file: "/synthetic/history-part" }]);
+	assert.equal(access["original-problem.txt"], "required");
+	assert.equal(access["candidate.cpp"], "required");
+	assert.equal(access["prior-research-history-index.json"], "required");
+	assert.equal(access["prior-research-history-part-000001.txt"], "retrievable");
+});
+
+test("prior assessor issue memory is frozen in indexed bounded parts without prompt echo", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-grounding-index-"));
+	try {
+		const legacyOpenDetails = ["Earlier unclassified method observation"];
+		const previousIssues = [{ id: "issue-1", claim: "Synthetic verification gap",
+			status: "open" as const, classification: "necessary-verification" as const,
+			sourceRefs: [{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }],
+			implication: "The result claim needs a check", claimAtRisk: "Synthetic result" }];
+		const staged = await offlineChecks.stagePriorGroundingRecords(root,
+			{ legacyOpenDetails, previousIssues });
+		const indexText = await readFile(staged.evidence[0]!.file, "utf8");
+		const parts = Object.fromEntries(await Promise.all(staged.evidence.slice(1).map(async row =>
+			[row.name, await readFile(row.file, "utf8")] as const)));
+		const locators = validatePriorGroundingIndex(indexText, parts,
+			{ legacyOpenDetails, previousIssues });
+		assert.deepEqual(locators["issue-1"], { sourceId: staged.priorGroundingIndex.partNames[0],
+			startLine: 2, endLine: 2 });
+		assert((await Promise.all(staged.evidence.map(async row =>
+			(await stat(row.file)).size))).every(size => size <= 1_000_000));
+		assert.equal(offlineChecks.assessorEvidenceAccess(staged.evidence)[staged.evidence[0]!.name],
+			"required");
+		assert.equal(offlineChecks.assessorEvidenceAccess(staged.evidence)[staged.evidence[1]!.name],
+			"retrievable");
+	} finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("stagnant assessment and M04 repair stay incomplete while retaining no-merge facts", () => {
@@ -462,10 +537,15 @@ test("range-readable prior history partitions losslessly into fully enumerated b
 		assert.equal(index.kind, "range-readable-history-part-index");
 		assert.equal(index.totalBytes, Buffer.byteLength(rendered, "utf8"));
 		assert.ok(index.parts.length > 1);
+		assert.equal(index.interpretation, "untrusted-control-locator-only");
+		assert.equal(index.entries.length, 1);
+		assert.equal(index.entries[0].goalRunId, "R001");
+		assert.equal(index.entries[0].taskId, "T001");
+		assert.deepEqual(index.entries[0].fileNames, ["candidate.cpp"]);
 		assert.deepEqual(staged.evidence.map(item => item.name), ["prior-research-history-index.json",
 			...index.parts.map((part: { name: string }) => part.name)]);
 		assert.deepEqual(staged.inputs, staged.evidence.map(item => `objective-seeds/${item.name}`));
-		const parts = [];
+		const parts: Buffer[] = [];
 		for (const part of index.parts as Array<{ name: string; bytes: number }>) {
 			const bytes = await readFile(path.join(root, part.name));
 			assert.equal(bytes.length, part.bytes);
@@ -474,8 +554,45 @@ test("range-readable prior history partitions losslessly into fully enumerated b
 			parts.push(bytes);
 		}
 		assert.deepEqual(Buffer.concat(parts), Buffer.from(rendered, "utf8"));
+		const located = Buffer.concat(index.entries[0].parts.map((range: {
+			name: string; startByte: number; endByte: number; startLine: number; endLine: number }) => {
+			const at = index.parts.findIndex((part: { name: string }) => part.name === range.name);
+			assert(at >= 0);
+			assert(range.startLine >= 1 && range.endLine >= range.startLine);
+			return parts[at]!.subarray(range.startByte, range.endByte);
+		}));
+		assert.equal(JSON.parse(located.toString("utf8")).goalRunId, "R001");
 		assert.equal((await stat(path.join(root, "prior-research-history-index.json"))).size <= 1_000_000, true);
 		assert.equal("sha256" in index, false, "index must not introduce a hash-manifest contract");
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("a large generic episode catalog stays in bounded locator parts without dropping entries", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-history-catalog-"));
+	try {
+		const entries = Array.from({ length: 12_000 }, (_, index) => ({
+			goalRunId: `G${index + 1}`, taskId: "T001", files: { "candidate.cpp": "x" } }));
+		const history = JSON.stringify({ version: 1,
+			kind: "untrusted-version-bound-research-history", entries });
+		const staged = await offlineChecks.stageRangeReadableHistory(root, history);
+		assert.equal(staged.partitioned, true);
+		const index = JSON.parse(await readFile(path.join(root,
+			"prior-research-history-index.json"), "utf8"));
+		assert(index.catalogParts.length > 0);
+		assert.equal(index.entries.length, 0);
+		assert.equal(index.parts.reduce((sum: number, part: { bytes: number }) => sum + part.bytes, 0),
+			Buffer.byteLength(offlineChecks.rangeReadableHistory(history), "utf8"));
+		const catalog = (await Promise.all(index.catalogParts.map(async (part: {
+			name: string; firstOrdinal: number; lastOrdinal: number }) => {
+			const file = path.join(root, part.name);
+			assert((await stat(file)).size <= 1_000_000);
+			return JSON.parse(await readFile(file, "utf8")).entries as Array<{
+				entryOrdinal: number; goalRunId: string; fileNames: string[] }>;
+		}))).flat();
+		assert.equal(catalog.length, entries.length);
+		assert.equal(catalog[0]?.goalRunId, "G1");
+		assert.equal(catalog.at(-1)?.goalRunId, `G${entries.length}`);
+		assert.deepEqual(catalog.at(-1)?.fileNames, ["candidate.cpp"]);
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
 

@@ -71,6 +71,54 @@ function repairIntentFor(control = binding()): ResumeIntent {
 			selectedTupleSha256: prior.selectedTupleSha256, pendingActionSha256, workflowRepair })) };
 }
 
+function interruptedIntentFor(): ResumeIntent {
+	const prior = intentFor();
+	const source = { runId: "7003", runAttempt: 1, commit: "f".repeat(40) };
+	const action = classifyPendingAction("execution-interrupted");
+	const pendingActionSha256 = pendingActionIdentity(action);
+	const terminalInterruption = { version: 1 as const,
+		kind: "host-verified-terminal-interruption" as const, source,
+		priorCarrySource: prior.source, priorCarryEnvelopeSha256: prior.envelopeSha256,
+		resultArtifactId: "9103", resultArchiveSha256: hash("opaque result"),
+		accounting: "unquantified" as const, effects: "unknown-unreconciled" as const,
+		terminationOrigin: "unknown" as const };
+	const actionProvenance = { kind: "current-host-interruption" as const,
+		priorCheckpointSha256: hash("prior checkpoint"),
+		resultArchiveSha256: terminalInterruption.resultArchiveSha256 };
+	const interruptedSourceReview = { source, sourceTree: "a".repeat(40),
+		receiptSha256: hash("private operator source review") };
+	return { ...prior, source, pendingAction: action, pendingActionSha256,
+		actionKind: action.kind, terminalInterruption, actionProvenance,
+		interruptedSourceReview, m04TransactionQuarantined: true,
+		idempotencyKey: hash(canonical({ source, envelopeSha256: prior.envelopeSha256,
+			contractId: prior.contractId, selectedTupleSha256: prior.selectedTupleSha256,
+			pendingActionSha256, terminalInterruption, actionProvenance,
+			interruptedSourceReview })) };
+}
+
+test("interrupted review is private, source-bound, durable and cannot be removed under the same key", async t => {
+	const { journal } = await fixture(t), intent = interruptedIntentFor();
+	const first = await journal.reserve(intent, binding());
+	assert.deepEqual(first.intentBinding.interruptedSourceReview, intent.interruptedSourceReview);
+	assert.deepEqual(await new MissionResumeJournal(journal.directory).reserve(intent, binding()), first);
+	assert.equal(first.control.testedSourceCommit, "c".repeat(40));
+	assert.notEqual(first.control.testedSourceCommit, intent.interruptedSourceReview!.source.commit);
+	await assert.rejects(journal.reserve({ ...intent, interruptedSourceReview: {
+		...intent.interruptedSourceReview!, receiptSha256: hash("changed receipt") } }, binding()),
+		/idempotency key/);
+	await assert.rejects(journal.reserve({ ...intent, interruptedSourceReview: undefined }, binding()),
+		/interruption action provenance/);
+	const file = path.join(journal.directory, `${intent.idempotencyKey}.json`);
+	const text = await readFile(file, "utf8");
+	assert(!text.includes("operator-code-review"));
+	assert(!JSON.stringify(first.control).includes(intent.interruptedSourceReview!.receiptSha256));
+	const stored = JSON.parse(text);
+	stored.intentBinding.interruptedSourceReview.sourceTree = "b".repeat(40);
+	await writeFile(file, JSON.stringify(stored));
+	await assert.rejects(new MissionResumeJournal(journal.directory).get(intent.idempotencyKey),
+		/idempotency binding/);
+});
+
 test("repair reservation binds the private review and replacement source through restart", async t => {
 	const { journal } = await fixture(t), intent = repairIntentFor();
 	const first = await journal.reserve(intent, binding());

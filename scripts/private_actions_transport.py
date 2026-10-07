@@ -40,7 +40,7 @@ RESULT_ALLOWLIST = (
     "branch-parent-review-decision.json", "branch-parent-m04-transaction.json",
     "branch-child-candidate.cpp", "branch-child-verification.json", "branch-child-lesson-delta.json", "branch-child-experiment-plan.json", "workflow-branch-child-archive.json",
     "branch-child-review-decision.json", "branch-child-m04-transaction.json",
-    "campaign-status.json", "original-objective.json", "objective-checkpoint.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "mission-ledger-out.json", "execution-capabilities.json", "research-history.json", "restored-candidate-verification.json",
+    "campaign-status.json", "original-objective.json", "objective-checkpoint.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "mission-ledger-out.json", "incremental-control-prefix.json", "execution-capabilities.json", "research-history.json", "restored-candidate-verification.json",
     "independent-restart-quarantine.json", "independent-restart-goal-binding.json",
     "host-effect-receipt.json", "m04-transaction-quarantine.json", "repair-state.json",
 )

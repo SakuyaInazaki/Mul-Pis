@@ -36,13 +36,15 @@ export type TestedControlBinding = Readonly<{
 
 export type ResumeJournalState = "reserved" | "ref-update-attempted" |
 	"delivery-unknown" | "acknowledged" | "reconciled-not-delivered";
-type ActionProvenance = Readonly<{ kind: "current-host-derived"; checkpointSha256: string }>;
+type ActionProvenance = NonNullable<ResumeIntent["actionProvenance"]>;
 export type ResumeJournalRecord = Readonly<{
 	version: 1;
 	idempotencyKey: string;
 	intentBinding: Readonly<{ source: ResumeIntent["source"]; envelopeSha256: string;
 		contractId: string; selectedTupleSha256: string; pendingActionSha256: string;
 		actionKind: ResumeIntent["actionKind"]; actionProvenance?: ActionProvenance;
+		terminalInterruption?: ResumeIntent["terminalInterruption"];
+		interruptedSourceReview?: ResumeIntent["interruptedSourceReview"];
 		workflowRepair?: ResumeIntent["workflowRepair"] }>;
 	control: TestedControlBinding;
 	state: ResumeJournalState;
@@ -91,16 +93,73 @@ function repairBinding(value: ResumeIntent["workflowRepair"]): ResumeIntent["wor
 			headCommit: value.successfulCi.headCommit, conclusion: "success" } };
 }
 
+function provenanceBinding(value: ActionProvenance | undefined): ActionProvenance | undefined {
+	if (value === undefined) return undefined;
+	if (value.kind === "current-host-derived" &&
+		Object.keys(value).sort().join("|") === "checkpointSha256|kind" &&
+		hex64(value.checkpointSha256))
+		return { kind: "current-host-derived", checkpointSha256: value.checkpointSha256 };
+	if (value.kind === "current-host-interruption" &&
+		Object.keys(value).sort().join("|") === "kind|priorCheckpointSha256|resultArchiveSha256" &&
+		hex64(value.priorCheckpointSha256) && hex64(value.resultArchiveSha256))
+		return { kind: "current-host-interruption",
+			priorCheckpointSha256: value.priorCheckpointSha256,
+			resultArchiveSha256: value.resultArchiveSha256 };
+	return refuse("invalid action provenance");
+}
+
+function interruptionBinding(value: ResumeIntent["terminalInterruption"],
+	source: ResumeIntent["source"], envelopeSha256: string): ResumeIntent["terminalInterruption"] {
+	if (value === undefined) return undefined;
+	if (Object.keys(value).sort().join("|") !== ["version", "kind", "source", "priorCarrySource",
+		"priorCarryEnvelopeSha256", "resultArtifactId", "resultArchiveSha256", "accounting",
+		"effects", "terminationOrigin"].sort().join("|") ||
+		value.version !== 1 || value.kind !== "host-verified-terminal-interruption" ||
+		value.accounting !== "unquantified" || value.effects !== "unknown-unreconciled" ||
+		value.terminationOrigin !== "unknown" || !runId(value.resultArtifactId) ||
+		!hex64(value.resultArchiveSha256) || !hex64(value.priorCarryEnvelopeSha256) ||
+		value.priorCarryEnvelopeSha256 !== envelopeSha256 ||
+		!runId(value.source?.runId) || value.source.runAttempt !== source.runAttempt ||
+		value.source.runId !== source.runId || value.source.commit !== source.commit ||
+		!runId(value.priorCarrySource?.runId) || value.priorCarrySource.runId === source.runId ||
+		!Number.isSafeInteger(value.priorCarrySource.runAttempt) ||
+		value.priorCarrySource.runAttempt < 1 || !hex40(value.priorCarrySource.commit))
+		refuse("terminal interruption binding is invalid");
+	return { version: 1, kind: "host-verified-terminal-interruption",
+		source: { ...value.source }, priorCarrySource: { ...value.priorCarrySource },
+		priorCarryEnvelopeSha256: value.priorCarryEnvelopeSha256,
+		resultArtifactId: value.resultArtifactId,
+		resultArchiveSha256: value.resultArchiveSha256,
+		accounting: "unquantified", effects: "unknown-unreconciled", terminationOrigin: "unknown" };
+}
+
+function interruptedSourceReviewBinding(value: ResumeIntent["interruptedSourceReview"],
+	source: ResumeIntent["source"]): ResumeIntent["interruptedSourceReview"] {
+	if (value === undefined) return undefined;
+	if (Object.keys(value).sort().join("|") !== "receiptSha256|source|sourceTree" ||
+		!hex64(value.receiptSha256) || !hex40(value.sourceTree) ||
+		Object.keys(value.source ?? {}).sort().join("|") !== "commit|runAttempt|runId" ||
+		value.source.runId !== source.runId ||
+		value.source.runAttempt !== source.runAttempt ||
+		value.source.commit !== source.commit)
+		refuse("interrupted source review binding is invalid");
+	return { source: { runId: value.source.runId, runAttempt: value.source.runAttempt,
+		commit: value.source.commit }, sourceTree: value.sourceTree,
+		receiptSha256: value.receiptSha256 };
+}
+
 function intentBinding(intent: ResumeIntent): ResumeJournalRecord["intentBinding"] {
-	const suppliedProvenance = (intent as ResumeIntent & {
-		actionProvenance?: ActionProvenance }).actionProvenance;
-	if (suppliedProvenance !== undefined &&
-		(suppliedProvenance?.kind !== "current-host-derived" ||
-			!hex64(suppliedProvenance.checkpointSha256)))
-		refuse("invalid action provenance");
-	const actionProvenance = suppliedProvenance ? { kind: "current-host-derived" as const,
-		checkpointSha256: suppliedProvenance.checkpointSha256 } : undefined;
+	const actionProvenance = provenanceBinding(intent.actionProvenance);
 	const workflowRepair = repairBinding(intent.workflowRepair);
+	const terminalInterruption = interruptionBinding(intent.terminalInterruption,
+		intent.source, intent.envelopeSha256);
+	const interruptedSourceReview = interruptedSourceReviewBinding(intent.interruptedSourceReview,
+		intent.source);
+	if (Boolean(terminalInterruption) !== (actionProvenance?.kind === "current-host-interruption") ||
+		Boolean(terminalInterruption) !== Boolean(interruptedSourceReview) ||
+		terminalInterruption && actionProvenance?.kind === "current-host-interruption" &&
+		terminalInterruption.resultArchiveSha256 !== actionProvenance.resultArchiveSha256)
+		refuse("interruption action provenance is invalid");
 	if (intent?.version !== 1 || intent.kind !== "fresh-independent-mission-resume" ||
 		!runId(intent.source?.runId) || !Number.isSafeInteger(intent.source.runAttempt) ||
 		intent.source.runAttempt < 1 || !hex40(intent.source.commit) ||
@@ -118,12 +177,16 @@ function intentBinding(intent: ResumeIntent): ResumeJournalRecord["intentBinding
 		envelopeSha256: intent.envelopeSha256, contractId: intent.contractId,
 		selectedTupleSha256: intent.selectedTupleSha256,
 		pendingActionSha256: intent.pendingActionSha256,
+		...(terminalInterruption ? { terminalInterruption } : {}),
+		...(interruptedSourceReview ? { interruptedSourceReview } : {}),
 		...(workflowRepair ? { workflowRepair } : {}) }));
 	if (expected !== intent.idempotencyKey) refuse("idempotency key does not bind the intent");
 	return { source, envelopeSha256: intent.envelopeSha256,
 		contractId: intent.contractId, selectedTupleSha256: intent.selectedTupleSha256,
 		pendingActionSha256: intent.pendingActionSha256, actionKind: intent.actionKind,
 		...(actionProvenance ? { actionProvenance } : {}),
+		...(terminalInterruption ? { terminalInterruption } : {}),
+		...(interruptedSourceReview ? { interruptedSourceReview } : {}),
 		...(workflowRepair ? { workflowRepair } : {}) };
 }
 
@@ -190,6 +253,10 @@ async function readRecord(file: string): Promise<ResumeJournalRecord> {
 		refuse("stored control descriptor has unexpected fields");
 	const bound = value.intentBinding;
 	const workflowRepair = repairBinding(bound.workflowRepair);
+	const terminalInterruption = interruptionBinding(bound.terminalInterruption,
+		bound.source, bound.envelopeSha256);
+	const interruptedSourceReview = interruptedSourceReviewBinding(bound.interruptedSourceReview,
+		bound.source);
 	if (workflowRepair && (workflowRepair.testedSourceCommit !== value.control.testedSourceCommit ||
 		workflowRepair.testedTree !== value.control.testedTree ||
 		canonical(workflowRepair.successfulCi) !== canonical(value.control.successfulCi)))
@@ -202,14 +269,22 @@ async function readRecord(file: string): Promise<ResumeJournalRecord> {
 		(bound.actionKind === "repair-workflow-state") !== Boolean(workflowRepair) ||
 		(workflowRepair !== undefined && canonical(workflowRepair) !== canonical(bound.workflowRepair)) ||
 		(bound.actionProvenance !== undefined &&
-			(bound.actionProvenance?.kind !== "current-host-derived" ||
-				!hex64(bound.actionProvenance?.checkpointSha256))))
+			canonical(provenanceBinding(bound.actionProvenance)) !== canonical(bound.actionProvenance)) ||
+		Boolean(terminalInterruption) !==
+			(bound.actionProvenance?.kind === "current-host-interruption") ||
+		Boolean(terminalInterruption) !== Boolean(interruptedSourceReview) ||
+		(interruptedSourceReview !== undefined &&
+			canonical(interruptedSourceReview) !== canonical(bound.interruptedSourceReview)) ||
+		terminalInterruption && bound.actionProvenance?.kind === "current-host-interruption" &&
+			terminalInterruption.resultArchiveSha256 !== bound.actionProvenance.resultArchiveSha256)
 		refuse("stored private intent binding is invalid");
 	const expected = digest(canonical({ ...(bound.actionProvenance ?
 		{ actionProvenance: bound.actionProvenance } : {}), source: bound.source,
 		envelopeSha256: bound.envelopeSha256, contractId: bound.contractId,
 		selectedTupleSha256: bound.selectedTupleSha256,
 		pendingActionSha256: bound.pendingActionSha256,
+		...(terminalInterruption ? { terminalInterruption } : {}),
+		...(interruptedSourceReview ? { interruptedSourceReview } : {}),
 		...(workflowRepair ? { workflowRepair } : {}) }));
 	if (expected !== value.idempotencyKey) refuse("stored idempotency binding changed");
 	if (value.state === "acknowledged" ?

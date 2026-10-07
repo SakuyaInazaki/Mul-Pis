@@ -276,6 +276,9 @@ export interface PiSessionRunnerOptions {
 	signal?: AbortSignal;
 	/** Shared by every builder, reviewer, and resumed handle in one in-process campaign. */
 	campaignBudget?: DeepSeekCampaignBudget;
+	/** Persist the host's private accounting prefix at each physical transport boundary. */
+	onCampaignAccountingBoundary?: (event: "request-reserved" | "request-observed",
+		audit: ReturnType<DeepSeekCampaignBudget["requestAccountingAuditSnapshot"]>) => Promise<void>;
 	/** Only the encrypted private result receives these credential-redacted provider fields. */
 	sanitizePrivateProviderError?: (value: string) => string | null;
 }
@@ -934,6 +937,11 @@ export class PiSessionRunner implements SessionRunner {
 		}
 
 		const campaign = this.options.campaignBudget;
+		const onCampaignAccountingBoundary = this.options.onCampaignAccountingBoundary;
+		const checkpointAccounting = async (event: "request-reserved" | "request-observed"): Promise<void> => {
+			if (campaign && onCampaignAccountingBoundary)
+				await onCampaignAccountingBoundary(event, campaign.requestAccountingAuditSnapshot());
+		};
 		const strict = spec.strictRequest;
 		if (strict) {
 			if ((!campaign && (spec.tools.kind !== "none" ||
@@ -1041,6 +1049,7 @@ export class PiSessionRunner implements SessionRunner {
 								const proof = { httpStatus: 400 as const, ...parsed };
 								campaign.recordContextRejected(lease, rejectedId, proof);
 								contextRejectedIds.add(rejectedId);
+								await checkpointAccounting("request-observed");
 								transportDiagnostics.push(probe!.failure(promptIndex, null, rejectedId));
 								failureRecorded = true;
 								const corrected = parsed.allowedCompletionTokens;
@@ -1057,6 +1066,7 @@ export class PiSessionRunner implements SessionRunner {
 								const retryId = randomUUID();
 								campaign.reserveContextRetry(lease, nextBytes, retryId, corrected, rejectedId, proof);
 								requestIds.push(retryId);
+								await checkpointAccounting("request-reserved");
 								void response.body?.cancel().catch(() => undefined);
 								requestId = retryId;
 								expectedPayloadSha256 = createHash("sha256").update(nextBody).digest("hex");
@@ -1112,6 +1122,7 @@ export class PiSessionRunner implements SessionRunner {
 								requestId = randomUUID();
 								campaign.reserve(lease, bytes, requestId, outputCap);
 								requestIds.push(requestId);
+								await checkpointAccounting("request-reserved");
 								expectedPayloadSha256 = createHash("sha256").update(serialized).digest("hex");
 							}
 							return outgoing;
@@ -1154,6 +1165,7 @@ export class PiSessionRunner implements SessionRunner {
 								};
 								if (event.message.stopReason === "length") campaign.stopAfterTerminalLength(lease, requestId, report);
 								else campaign.settleReported(lease, requestId, report);
+								await checkpointAccounting("request-observed");
 							}
 							if (event.type === "error") { terminal = true; latest = event.error;
 								recordFailure();

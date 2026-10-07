@@ -1,4 +1,8 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
+import { IncrementalCheckpointError, IncrementalPrivateCheckpointJournal,
+	INCREMENTAL_CHECKPOINT_FILE, openIncrementalControlPrefix,
+	type IncrementalCheckpointSource, type IncrementalCheckpointFailureReason,
+	type IncrementalCheckpointFailureStage, type HostEffectPrefixObservationV1 } from "./incremental-private-checkpoint.ts";
 import { inflateRawSync } from "node:zlib";
 import { CARRY_LOGICAL_BYTES, CARRY_SEGMENT_FILE_BYTES, carrySidecarName, decodeCarrySidecars,
 	encodeCarrySidecars, validCarrySidecarManifest } from "./carry-sidecar-codec.ts";
@@ -23,7 +27,8 @@ import type { BootstrapBinding, PrivateContinuationBundle } from "./signed-missi
 export const CARRY_ARTIFACT_NAME = "confidential-mission-carry";
 export const CARRY_FILE_NAME = "ledger-continuation.enc.json";
 export type CarryArtifactPayload = string | Readonly<{ envelopeB64: string;
-	sidecars: Readonly<Record<string, string>> }>;
+	sidecars: Readonly<Record<string, string>>; incrementalControlPrefix?: string }> |
+	Readonly<{ incrementalControlPrefix: string }>;
 const MAX_CARRY_BYTES = 8 * 1024 * 1024;
 const MAX_CARRY_ARCHIVE_BYTES = 96 * 1024 * 1024;
 const NANO = 1_000_000_000;
@@ -47,7 +52,64 @@ export type AuthenticatedTerminalCarryProof = Readonly<{
 export type AuthenticatedTerminalCarryResult = Readonly<{
 	proof: AuthenticatedTerminalCarryProof; privateBundle: PrivateContinuationBundle;
 }>;
+/** A finished executed run without a carry. The preceding AEAD carry remains the
+ * only source of private research state; the gap's effects and fee are UNKNOWN. */
+export type AuthenticatedTerminalInterruptionProof = Readonly<{
+	version: 1; kind: "authenticated-terminal-interruption";
+	gap: OpaqueExecutedRunGap;
+	priorCarry: Readonly<{ source: Readonly<Source>; envelopeSha256: string;
+		artifact: AuthenticatedPriorCarryProof["artifact"] }>;
+}>;
+export type AuthenticatedTerminalInterruptionResult = Readonly<{
+	proof: AuthenticatedTerminalInterruptionProof;
+	priorCarryProof: AuthenticatedPriorCarryProof;
+	priorPrivateBundle: PrivateContinuationBundle;
+	incrementalPrefixObservation?: AuthenticatedIncrementalPrefixObservation;
+	incrementalPrefixFailure?: IncrementalPrefixFailure;
+}>;
+export type IncrementalPrefixFailure = Readonly<{
+	kind: "unusable-incremental-host-prefix";
+	category: "decode-or-authentication-failed" | "unclassified-decoder-failure";
+	stage: IncrementalCheckpointFailureStage | null;
+	reason: IncrementalCheckpointFailureReason | null;
+	artifact: AuthenticatedIncrementalPrefixObservation["artifact"];
+}>;
+/** A partial host observation bound to the exact Actions archive and preceding AEAD.
+ * It does not settle billing, certify an unobserved suffix, or select research. */
+export type AuthenticatedIncrementalPrefixObservation = Readonly<{
+	version: 1; kind: "authenticated-incremental-host-prefix";
+	complete: false; selectionAuthority: false; accounting: "unquantified";
+	source: Readonly<Source>; priorCarryEnvelopeSha256: string;
+	artifact: Readonly<{ repository: typeof MISSION_REPOSITORY; artifactId: string;
+		artifactName: typeof CARRY_ARTIFACT_NAME; runId: string; archiveSha256: string;
+		digestScope: "github-artifact-archive" }>;
+	sequence: number; event: ReturnType<typeof openIncrementalControlPrefix>["event"];
+	prefixSha256: string;
+	requestAudit: ReturnType<typeof openIncrementalControlPrefix>["requestAudit"];
+	hostEffects: HostEffectPrefixObservationV1;
+}>;
+const authenticatedIncrementalPrefixes = new WeakSet<object>();
+const incrementalPrefixBundleDigests = new WeakMap<object, string>();
+export function isAuthenticatedIncrementalPrefixObservation(value: unknown):
+	value is AuthenticatedIncrementalPrefixObservation {
+	return Boolean(value) && typeof value === "object" &&
+		authenticatedIncrementalPrefixes.has(value as object);
+}
+export function authenticatedIncrementalPrefixBindsPriorBundle(observation: unknown,
+	bundle: unknown): boolean {
+	return isAuthenticatedIncrementalPrefixObservation(observation) && validBundle(bundle, true) &&
+		privateBundleDigest(bundle) === incrementalPrefixBundleDigests.get(observation);
+}
+export type AuthenticatedTerminalInterruptionSupervisorProjection = Readonly<{
+	status: MissionStatusV1;
+	pendingAction?: MissionStatusV1["pendingAction"];
+	priorSource: Readonly<Source>; priorEnvelopeSha256: string; checkpointSha256: string;
+}>;
 const authenticatedTerminalCarryProofs = new WeakSet<object>();
+const authenticatedTerminalInterruptionProofs = new WeakSet<object>();
+const terminalInterruptionBundleDigests = new WeakMap<object, string>();
+const terminalInterruptionProjections = new WeakMap<object,
+	AuthenticatedTerminalInterruptionSupervisorProjection>();
 const terminalBundleDigests = new WeakMap<object, string>();
 const terminalSupervisorProjections = new WeakMap<object, Readonly<{
 	status: MissionStatusV1; terminalCarry: TerminalCarryEvidenceV1;
@@ -55,6 +117,23 @@ const terminalSupervisorProjections = new WeakMap<object, Readonly<{
 }>>();
 export function isAuthenticatedTerminalCarryProof(value: unknown): value is AuthenticatedTerminalCarryProof {
 	return Boolean(value) && typeof value === "object" && authenticatedTerminalCarryProofs.has(value as object);
+}
+export function isAuthenticatedTerminalInterruptionProof(value: unknown):
+	value is AuthenticatedTerminalInterruptionProof {
+	return Boolean(value) && typeof value === "object" &&
+		authenticatedTerminalInterruptionProofs.has(value as object);
+}
+export function authenticatedTerminalInterruptionBindsPriorBundle(proof: unknown, bundle: unknown): boolean {
+	return isAuthenticatedTerminalInterruptionProof(proof) && validBundle(bundle, true) &&
+		privateBundleDigest(bundle) === terminalInterruptionBundleDigests.get(proof);
+}
+/** This is a projection of the preceding AEAD checkpoint, never of the
+ * interrupted run's encrypted result or missing carry. */
+export function authenticatedTerminalInterruptionSupervisorProjection(proof: unknown, bundle: unknown):
+	AuthenticatedTerminalInterruptionSupervisorProjection | undefined {
+	const projection = authenticatedTerminalInterruptionBindsPriorBundle(proof, bundle) ?
+		terminalInterruptionProjections.get(proof as object) : undefined;
+	return projection ? structuredClone(projection) : undefined;
 }
 export function authenticatedTerminalCarryBindsBundle(proof: unknown, bundle: unknown): boolean {
 	return isAuthenticatedTerminalCarryProof(proof) && validBundle(bundle, true) &&
@@ -78,6 +157,8 @@ type Artifact = { id?: number; name?: string; expired?: boolean; digest?: string
 type Source = { runId: string; runAttempt: number; runNumber: number; commit: string };
 export type OpaqueExecutedRunGap = Readonly<{
 	version: 1; kind: "opaque-executed-run-gap"; source: Readonly<Source>;
+	/** Historical field: the sealed terminal AEAD carry is absent. An artifact
+	 * under the shared carry name may contain only a nonterminal prefix. */
 	priorCarryEnvelopeSha256: string; carryArtifact: "absent";
 	accounting: "unquantified"; effects: "unreviewed" | "quarantined-source-reviewed";
 	terminal: AuthenticatedPriorCarryProof["terminal"];
@@ -197,6 +278,29 @@ function canonicalPrivateBundle(bundle: PrivateContinuationBundle): string {
 	return JSON.stringify(Object.fromEntries(Object.entries(bundle).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)));
 }
 function privateBundleDigest(bundle: PrivateContinuationBundle): string { return digest(canonicalPrivateBundle(bundle)); }
+function freezeIncrementalObservation<T>(value: T): T {
+	if (value && typeof value === "object" && !Object.isFrozen(value)) {
+		for (const child of Object.values(value)) freezeIncrementalObservation(child);
+		Object.freeze(value);
+	}
+	return value;
+}
+function brandIncrementalObservation(entry: StoredHistoricalIncrementalPrefix,
+	decoded: ReturnType<typeof openIncrementalControlPrefix>,
+	bundle: PrivateContinuationBundle): AuthenticatedIncrementalPrefixObservation {
+	const observation = freezeIncrementalObservation({
+		version: 1 as const, kind: "authenticated-incremental-host-prefix" as const,
+		complete: false as const, selectionAuthority: false as const,
+		accounting: "unquantified" as const,
+		source: { ...entry.source }, priorCarryEnvelopeSha256: entry.priorCarryEnvelopeSha256,
+		artifact: { ...entry.artifact }, sequence: decoded.sequence,
+		event: decoded.event, prefixSha256: digest(entry.prefixJson),
+		requestAudit: decoded.requestAudit, hostEffects: decoded.hostEffects
+	});
+	authenticatedIncrementalPrefixes.add(observation);
+	incrementalPrefixBundleDigests.set(observation, privateBundleDigest(bundle));
+	return observation;
+}
 export function authenticatedPriorCarryBindsBundle(proof: unknown, bundle: unknown): boolean {
 	return isAuthenticatedPriorCarryProof(proof) && proof.privateBundleSha256 !== null &&
 		validBundle(bundle, true) && privateBundleDigest(bundle) === proof.privateBundleSha256;
@@ -308,6 +412,13 @@ export type AccountingCarrySealInput = { settledCny: number; unknownObservedCny:
 	privateBundle?: PrivateContinuationBundle; bootstrapBinding?: BootstrapBinding };
 export type LedgerContinuation = {
 	mode: "accounting-only";
+	incrementalPrefixObservation?: AuthenticatedIncrementalPrefixObservation;
+	incrementalPrefixFailure?: IncrementalPrefixFailure;
+	/** AEAD-carried earlier observations, still partial and unquantified. */
+	historicalIncrementalPrefixes: readonly AuthenticatedIncrementalPrefixObservation[];
+	incrementalControlSource: IncrementalCheckpointSource;
+	/** Host-only nonterminal snapshots use the already authenticated mission key. */
+	createIncrementalControlJournal: (outputDir: string) => IncrementalPrivateCheckpointJournal;
 	/** Validated metadata only; never an invoice or authorization to replay an operation. */
 	priorTransportDiagnosticCensus?: HostTransportDiagnosticCensusV1;
 	appendTransportDiagnosticCensus: (audit: AccountingOnlyRequestAuditSnapshot,
@@ -347,6 +458,7 @@ type AccountingCheckpoint = {
 	legacyAncestry: AncestorReceipt[]; ancestry: AccountingAncestorReceipt[];
 	selectedTransitions?: StoredSelectedTransition[];
 	opaqueExecutedRuns?: OpaqueExecutedRunGap[];
+	historicalIncrementalPrefixes?: StoredHistoricalIncrementalPrefix[];
 	/** New writer's explicit safety interpretation; older gap receipts stay byte-exact. */
 	historicalOpaqueGapEffectInterpretation?: "unknown-unreconciled";
 	currentEffectReview?: "pending";
@@ -370,7 +482,16 @@ type AccountingAncestorReceipt = Pick<AccountingCheckpoint, "parentDigest" | "so
 	"settledNano" | "unknownObservedNano" | "unpricedRequestCount" | "settledAddedNano" |
 	"unknownObservedAddedNano" | "unpricedAddedCount" | "requestAudit" | "bootstrapBinding"> &
 	{ envelopeDigest: string; selectedTransitionCount?: number;
-		selectedTransitionDigest?: string };
+		selectedTransitionDigest?: string; incrementalPrefixCount?: number;
+		incrementalPrefixDigest?: string };
+type StoredHistoricalIncrementalPrefix = Readonly<{
+	version: 1; kind: "encrypted-historical-incremental-prefix";
+	source: Readonly<Source>; event: "push" | "workflow_dispatch";
+	priorCarryEnvelopeSha256: string;
+	artifact: AuthenticatedIncrementalPrefixObservation["artifact"];
+	/** Exact AEAD prefix bytes are retained inside the successor carry's AEAD. */
+	prefixJson: string;
+}>;
 type Checkpoint = LegacyCheckpoint | AccountingCheckpoint;
 export type RequestAuditSnapshot = { requests: CampaignRequestAudit[]; settledCny: number;
 	unknownReservedCny: number; inFlightReservedCny: number; reservations: number;
@@ -798,7 +919,9 @@ function validateAccountingV3(cp: Pick<AccountingCheckpoint, "source" | "parentD
 		reject("carry checkpoint accounting is invalid");
 }
 function carryEnvelope(payload: CarryArtifactPayload): string {
-	return typeof payload === "string" ? payload : payload.envelopeB64;
+	if (typeof payload === "string") return payload;
+	if ("envelopeB64" in payload) return payload.envelopeB64;
+	return reject("carry root file is missing");
 }
 function checkpointVersion(payload: CarryArtifactPayload): 1 | 2 | 3 | 4 {
 	const envelopeB64 = carryEnvelope(payload);
@@ -840,7 +963,7 @@ function readCheckpoint(payload: CarryArtifactPayload, key: Buffer, seedDigest: 
 		let manifest: unknown;
 		try { manifest = JSON.parse(bytes.toString("utf8")); }
 		catch { return reject("carry sidecar manifest is invalid"); }
-		const sidecars = typeof payload === "string" ? undefined : payload.sidecars;
+		const sidecars = typeof payload === "string" || !("sidecars" in payload) ? undefined : payload.sidecars;
 		if (!validCarrySidecarManifest(manifest) || !record(sidecars) ||
 			Object.keys(sidecars).length !== manifest.segmentCount ||
 			Object.keys(sidecars).some((name, index) =>
@@ -850,7 +973,7 @@ function readCheckpoint(payload: CarryArtifactPayload, key: Buffer, seedDigest: 
 		bytes = decodeCarrySidecars({ manifest, key, seedDigest, parentDigest,
 			source: expectedSource, load: name => canonicalBase64(sidecars[name],
 				CARRY_SEGMENT_FILE_BYTES) });
-	} else if (typeof payload !== "string" && Object.keys(payload.sidecars ?? {}).length)
+	} else if (typeof payload !== "string" && "sidecars" in payload && Object.keys(payload.sidecars ?? {}).length)
 		reject("legacy carry has unexpected sidecars");
 	let parsed: unknown;
 	try { parsed = JSON.parse(bytes.toString("utf8")); } catch { return reject("carry plaintext is invalid"); }
@@ -861,6 +984,7 @@ function readCheckpoint(payload: CarryArtifactPayload, key: Buffer, seedDigest: 
 			"legacyAncestry", "historical",
 			...(parsed.selectedTransitions === undefined ? [] : ["selectedTransitions"]),
 			...(parsed.opaqueExecutedRuns === undefined ? [] : ["opaqueExecutedRuns"]),
+			...(parsed.historicalIncrementalPrefixes === undefined ? [] : ["historicalIncrementalPrefixes"]),
 			...(parsed.historicalOpaqueGapEffectInterpretation === undefined ? [] :
 				["historicalOpaqueGapEffectInterpretation"]),
 			...(parsed.currentEffectReview === undefined ? [] : ["currentEffectReview"]),
@@ -883,6 +1007,8 @@ function readCheckpoint(payload: CarryArtifactPayload, key: Buffer, seedDigest: 
 		(cp.version !== 1 && !Array.isArray(cp.ancestry)) ||
 		(cp.version === 3 && (!Array.isArray(cp.legacyAncestry) || !record(cp.historical) ||
 			(cp.selectedTransitions !== undefined && !Array.isArray(cp.selectedTransitions)) ||
+			(cp.historicalIncrementalPrefixes !== undefined &&
+				!Array.isArray(cp.historicalIncrementalPrefixes)) ||
 			(cp.reviewedEffectAncestry !== undefined && !Array.isArray(cp.reviewedEffectAncestry)) ||
 			(cp.opaqueExecutedRuns !== undefined && !Array.isArray(cp.opaqueExecutedRuns)) ||
 			(cp.historicalOpaqueGapEffectInterpretation !== undefined &&
@@ -935,6 +1061,9 @@ function accountingAncestorReceipt(cp: AccountingCheckpoint, envelopeDigest: str
 		...(cp.selectedTransitions?.length ? {
 			selectedTransitionCount: cp.selectedTransitions.length,
 			selectedTransitionDigest: digest(JSON.stringify(cp.selectedTransitions)) } : {}),
+		...(cp.historicalIncrementalPrefixes?.length ? {
+			incrementalPrefixCount: cp.historicalIncrementalPrefixes.length,
+			incrementalPrefixDigest: digest(JSON.stringify(cp.historicalIncrementalPrefixes)) } : {}),
 		...(cp.bootstrapBinding ? { bootstrapBinding: cp.bootstrapBinding } : {}) };
 }
 function validOpaqueGap(value: unknown): value is OpaqueExecutedRunGap {
@@ -1773,6 +1902,8 @@ function validateAncestryV3(cp: AccountingCheckpoint, sources: Source[], seedDig
 			"unknownObservedAddedNano", "unpricedAddedCount", "requestAudit",
 			...(receipt.selectedTransitionCount === undefined ? [] : ["selectedTransitionCount"]),
 			...(receipt.selectedTransitionDigest === undefined ? [] : ["selectedTransitionDigest"]),
+			...(receipt.incrementalPrefixCount === undefined ? [] : ["incrementalPrefixCount"]),
+			...(receipt.incrementalPrefixDigest === undefined ? [] : ["incrementalPrefixDigest"]),
 			...(receipt.bootstrapBinding === undefined ? [] : ["bootstrapBinding"])]) ||
 			typeof receipt.envelopeDigest !== "string" || !/^[0-9a-f]{64}$/.test(receipt.envelopeDigest))
 			reject("carry ancestry receipt is invalid");
@@ -1795,6 +1926,43 @@ function validateAncestryV3(cp: AccountingCheckpoint, sources: Source[], seedDig
 			.sort((a, b) => b.index - a.index)[0]?.receipt;
 		if (!preceding || gap.priorCarryEnvelopeSha256 !== preceding.envelopeDigest)
 			reject("opaque gap predecessor digest is not the authenticated carry prefix");
+	}
+	const historicalPrefixes = cp.historicalIncrementalPrefixes ?? [];
+	if (!Array.isArray(historicalPrefixes) || historicalPrefixes.length > gaps.length)
+		reject("historical incremental prefix ancestry is invalid");
+	let priorPrefixRunNumber = 0;
+	for (const entry of historicalPrefixes) {
+		if (!record(entry) || !exactKeys(entry, ["version", "kind", "source", "event",
+			"priorCarryEnvelopeSha256", "artifact", "prefixJson"]) ||
+			entry.version !== 1 || entry.kind !== "encrypted-historical-incremental-prefix" ||
+			(entry.event !== "push" && entry.event !== "workflow_dispatch") ||
+			!record(entry.source) || !record(entry.artifact) ||
+			!exactKeys(entry.artifact, ["repository", "artifactId", "artifactName", "runId",
+				"archiveSha256", "digestScope"]) ||
+			entry.artifact.repository !== MISSION_REPOSITORY ||
+			entry.artifact.artifactName !== CARRY_ARTIFACT_NAME ||
+			entry.artifact.digestScope !== "github-artifact-archive" ||
+			!positiveId(entry.artifact.artifactId) ||
+			typeof entry.artifact.archiveSha256 !== "string" ||
+			! /^[0-9a-f]{64}$/.test(entry.artifact.archiveSha256) ||
+			typeof entry.prefixJson !== "string" ||
+			Buffer.byteLength(entry.prefixJson, "utf8") > 64 * 1024 * 1024)
+			reject("historical incremental prefix receipt is invalid");
+		const gap = gaps.find(row => JSON.stringify(row.source) === JSON.stringify(entry.source));
+		if (!gap || gap.source.runNumber <= priorPrefixRunNumber ||
+			entry.priorCarryEnvelopeSha256 !== gap.priorCarryEnvelopeSha256 ||
+			entry.artifact.runId !== gap.source.runId)
+			reject("historical incremental prefix does not match an exact opaque gap");
+		priorPrefixRunNumber = gap.source.runNumber;
+	}
+	for (const receipt of cp.ancestry) {
+		const expectedCount = historicalPrefixes.filter(entry =>
+			entry.source.runNumber < receipt.source.runNumber).length;
+		if ((receipt.incrementalPrefixCount ?? 0) !== expectedCount ||
+			(receipt.incrementalPrefixDigest === undefined) !== (expectedCount === 0) ||
+			(expectedCount > 0 && receipt.incrementalPrefixDigest !==
+				digest(JSON.stringify(historicalPrefixes.slice(0, expectedCount)))))
+			reject("historical incremental prefix ancestry was changed or dropped");
 	}
 	let pendingIndex = -1;
 	for (const source of cp.pendingEffectAncestry ?? []) {
@@ -1887,10 +2055,11 @@ function providerSteps(job: Job): NonNullable<Job["steps"]> {
 	return job.steps?.filter(step => step.name === "Run bounded private campaign" ||
 		step.name === "Run private campaign") ?? [];
 }
-function verifiedTerminal(run: Run, job: Job, source: Source):
+function verifiedTerminal(run: Run, job: Job, source: Source, allowCancelled = false):
 	AuthenticatedPriorCarryProof["terminal"] | undefined {
 	const steps = providerSteps(job);
-	const terminalConclusions = ["success", "failure", "neutral", "timed_out", "action_required", "stale"];
+	const terminalConclusions = ["success", "failure", "neutral", "timed_out", "action_required", "stale",
+		...(allowCancelled ? ["cancelled"] : [])];
 	if (!Number.isSafeInteger(job.id) || job.id! <= 0 || job.run_id !== Number(source.runId) ||
 		job.run_attempt !== source.runAttempt || job.head_sha !== source.commit ||
 		run.id !== Number(source.runId) || run.run_attempt !== source.runAttempt ||
@@ -1899,7 +2068,7 @@ function verifiedTerminal(run: Run, job: Job, source: Source):
 		!terminalConclusions.includes(run.conclusion ?? "") || job.status !== "completed" ||
 		job.name !== "private-campaign" || !terminalConclusions.includes(job.conclusion ?? "") ||
 		steps.length !== 1 || steps[0].status !== "completed" ||
-		![...terminalConclusions, "cancelled"].includes(steps[0].conclusion ?? "")) return undefined;
+		!terminalConclusions.includes(steps[0].conclusion ?? "")) return undefined;
 	return Object.freeze({ workflowId: String(run.workflow_id), runStatus: "completed",
 		runConclusion: run.conclusion!, jobId: String(job.id), jobName: "private-campaign",
 		jobStatus: "completed", jobConclusion: job.conclusion!, jobRunId: String(job.run_id),
@@ -1969,11 +2138,23 @@ function resultArtifactIdentity(artifacts: Artifact[], source: Source): Authenti
 		artifactName: MISSION_ARTIFACT, runId: source.runId, archiveSha256: found[0].digest.slice(7),
 		digestScope: "github-artifact-archive" });
 }
+function incrementalArtifactIdentity(artifact: Artifact, source: Source):
+	AuthenticatedIncrementalPrefixObservation["artifact"] {
+	if (artifact.name !== CARRY_ARTIFACT_NAME || artifact.workflow_run?.id !== Number(source.runId) ||
+		artifact.workflow_run.head_sha !== source.commit || artifact.expired !== false ||
+		!Number.isSafeInteger(artifact.id) || artifact.id! <= 0 ||
+		typeof artifact.digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(artifact.digest))
+		reject("incremental prefix artifact identity is incomplete");
+	return Object.freeze({ repository: MISSION_REPOSITORY, artifactId: String(artifact.id),
+		artifactName: CARRY_ARTIFACT_NAME, runId: source.runId,
+		archiveSha256: artifact.digest.slice(7), digestScope: "github-artifact-archive" });
+}
 
 type OpenLedgerInput = {
 	seedEnvelopeB64: string | undefined; publicKeyFile: string; githubToken: string | undefined;
 	current: CurrentMissionRun;
-	loadCarryArtifact: (identity: { runId: string; artifactId: string }) => Promise<CarryArtifactPayload>;
+	loadCarryArtifact: (identity: { runId: string; artifactId: string;
+		expectedArchiveSha256?: string }) => Promise<CarryArtifactPayload>;
 	request?: typeof fetch; expectedSpkiSha256?: string;
 	/** Terminal inspection may use the host's existing authenticated GitHub
 	 * connector. The running Actions admission still requires its GitHub token. */
@@ -1990,8 +2171,17 @@ export async function authenticateLatestTerminalCarry(input: Omit<OpenLedgerInpu
 	return openLedgerContinuationInternal({ ...input, current: input.source }, true) as
 		Promise<AuthenticatedTerminalCarryResult>;
 }
-async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMode: boolean):
-	Promise<LedgerContinuation | AuthenticatedTerminalCarryResult> {
+/** Authenticate a cancelled, executed terminal run whose carry is absent. This
+ * read-only proof does not mint a current carry or a dispatch admission. */
+export async function authenticateLatestTerminalInterruption(
+	input: Omit<OpenLedgerInput, "current" | "requireSeedOnly"> & { source: CurrentMissionRun }
+): Promise<AuthenticatedTerminalInterruptionResult> {
+	return openLedgerContinuationInternal({ ...input, current: input.source }, true, true) as
+		Promise<AuthenticatedTerminalInterruptionResult>;
+}
+async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMode: boolean,
+	terminalInterruption = false):
+	Promise<LedgerContinuation | AuthenticatedTerminalCarryResult | AuthenticatedTerminalInterruptionResult> {
 	const c = input.current;
 	if (input.authenticatedHostRead && (!terminalMode ||
 		input.authenticatedHostRead.kind !== "authenticated-host-github-read" ||
@@ -2129,6 +2319,7 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 	let priorPrivateBundle: PrivateContinuationBundle | undefined = seed.bootstrapPrivateBundle;
 	let priorBootstrapBinding: BootstrapBinding | undefined = seed.bootstrapBinding;
 	const executedSources: Source[] = [];
+	const cancelledExecutedRunIds = new Set<string>();
 	const executedMetadata = new Map<string, { run: Run; job: Job }>();
 	for (const run of ordered.slice(1, terminalMode ? undefined : -1)) {
 		const source = sourceOf(run);
@@ -2141,8 +2332,9 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 			continue;
 		}
 		if (input.requireSeedOnly) reject("intervening workflow may have executed a billable job");
-		if (run.conclusion === "cancelled" || job.conclusion === "cancelled")
-			reject("intervening workflow run is not settled");
+		if (run.conclusion === "cancelled" || job.conclusion === "cancelled" ||
+			providerSteps(job).some(step => step.conclusion === "cancelled"))
+			cancelledExecutedRunIds.add(source.runId);
 		if (![BRANCH, REQUEST_BRANCH].includes(run.head_branch ?? "") || run.actor?.login !== c.actor ||
 			(run.event !== "push" && run.event !== "workflow_dispatch"))
 			reject("intervening provider execution is unresolved");
@@ -2150,40 +2342,70 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 		executedMetadata.set(source.runId, { run, job });
 	}
 	const loadedArtifacts = new Map<string, string>();
+	const loadedPayloads = new Map<string, CarryArtifactPayload>();
 	const resultArtifacts = new Map<string, AuthenticatedPriorCarryProof["resultArtifact"]>();
-	const load = async (source: Source): Promise<CarryArtifactPayload> => {
+	const load = async (source: Source, expectedArchiveSha256?: string): Promise<CarryArtifactPayload> => {
+		const cached = loadedPayloads.get(source.runId);
+		if (cached) return cached;
 		const artifactId = loadedArtifacts.get(source.runId) ?? await oneArtifact(source.runId,
 			input.githubToken!, request, CARRY_ARTIFACT_NAME, undefined,
 			artifacts => resultArtifacts.set(source.runId, resultArtifactIdentity(artifacts, source)));
 		loadedArtifacts.set(source.runId, artifactId);
-		try { return await input.loadCarryArtifact({ runId: source.runId, artifactId }); }
+		try {
+			const payload = await input.loadCarryArtifact({ runId: source.runId, artifactId,
+				...(expectedArchiveSha256 ? { expectedArchiveSha256 } : {}) });
+			loadedPayloads.set(source.runId, payload);
+			return payload;
+		}
 		catch { return reject("private carry artifact could not be read"); }
 	};
 	let sourcesWithCarry = executedSources;
 	let newlyOpaqueGap: Omit<OpaqueExecutedRunGap, "priorCarryEnvelopeSha256"> | undefined;
+	let latestIncrementalRaw: string | undefined;
+	let latestIncrementalArtifact: AuthenticatedIncrementalPrefixObservation["artifact"] | undefined;
 	if (executedSources.length) {
 		const latest = executedSources.at(-1)!;
 		const artifacts = await artifactsForRun(latest.runId, input.githubToken, request);
 		const carries = artifacts.filter(item => item.name === CARRY_ARTIFACT_NAME);
+		let latestHasFinalCarry = false;
 		if (carries.length === 1 && carries[0].workflow_run?.id === Number(latest.runId) &&
 			carries[0].expired === false && Number.isSafeInteger(carries[0].id) && carries[0].id! > 0) {
 			loadedArtifacts.set(latest.runId, String(carries[0].id));
-			resultArtifacts.set(latest.runId, resultArtifactIdentity(artifacts, latest));
-		} else if (carries.length === 0 && !terminalMode) {
+			const payload = await load(latest, typeof carries[0].digest === "string" &&
+				/^sha256:[0-9a-f]{64}$/.test(carries[0].digest) ? carries[0].digest.slice(7) : undefined);
+			latestHasFinalCarry = typeof payload === "string" || "envelopeB64" in payload;
+			if (latestHasFinalCarry) {
+				if (cancelledExecutedRunIds.has(latest.runId))
+					reject("intervening cancelled workflow run is not an exact missing-carry opaque gap");
+				resultArtifacts.set(latest.runId, resultArtifactIdentity(artifacts, latest));
+			} else {
+				latestIncrementalArtifact = incrementalArtifactIdentity(carries[0], latest);
+				latestIncrementalRaw = typeof payload === "string" ? undefined :
+					"incrementalControlPrefix" in payload ? payload.incrementalControlPrefix : undefined;
+				if (typeof latestIncrementalRaw !== "string")
+					reject("incremental prefix file is missing");
+			}
+		}
+		if (!latestHasFinalCarry && (carries.length === 0 || latestIncrementalRaw !== undefined) &&
+			(!terminalMode || terminalInterruption)) {
 			if (executedSources.length < 2)
 				reject("required private carry artifact is unavailable without an earlier authenticated carry");
 			const results = artifacts.filter(item => item.name === MISSION_ARTIFACT);
 			const resultArtifact = results.length === 1 ? resultArtifactIdentity(artifacts, latest) : undefined;
 			const metadata = executedMetadata.get(latest.runId);
-			const terminal = metadata && verifiedTerminal(metadata.run, metadata.job, latest);
-			if (!resultArtifact || !terminal)
+			const terminal = metadata && verifiedTerminal(metadata.run, metadata.job, latest, true);
+			if (!resultArtifact || !terminal || (terminalInterruption &&
+				(latest.runId !== c.runId || latest.runAttempt !== Number(c.runAttempt) ||
+				latest.commit !== c.sha ||
+				(metadata?.run.conclusion !== "cancelled" && metadata?.job.conclusion !== "cancelled" &&
+					terminal.providerStepConclusion !== "cancelled"))))
 				reject("missing carry run lacks an exact terminal encrypted result artifact");
 			newlyOpaqueGap = Object.freeze({ version: 1, kind: "opaque-executed-run-gap",
 				source: Object.freeze({ ...latest }), carryArtifact: "absent",
 				accounting: "unquantified", effects: "unreviewed",
 				terminal, resultArtifact });
 			sourcesWithCarry = executedSources.slice(0, -1);
-		} else reject("required private carry artifact is unavailable or ambiguous");
+		} else if (!latestHasFinalCarry) reject("required private carry artifact is unavailable or ambiguous");
 	}
 	let latestCheckpoint: Checkpoint | undefined;
 	let legacyAncestry: AncestorReceipt[] = [];
@@ -2193,6 +2415,7 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 	let hostEffectEvidence: AuthenticatedHostEffectEvidence | undefined;
 	let historicalCarryOrigin: AuthenticatedCarryForwardOrigin | undefined;
 	let storedSelectedTransitions: StoredSelectedTransition[] = [];
+	let storedHistoricalIncrementalPrefixes: StoredHistoricalIncrementalPrefix[] = [];
 	let authenticatedSelectedTransitions: readonly AuthenticatedSelectedTransition[] | undefined;
 	let reviewedEffectAncestry: ReviewedEffectAncestorReceipt[] = [];
 	let priorTransportDiagnosticCensus: HostTransportDiagnosticCensusV1 | undefined;
@@ -2213,11 +2436,20 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 			const cp = opened.checkpoint;
 			authenticatedSelectedTransitions = validateSelectedTransitions(cp, opened.digest);
 			storedSelectedTransitions = [...(cp.selectedTransitions ?? [])];
+			storedHistoricalIncrementalPrefixes = [...(cp.historicalIncrementalPrefixes ?? [])];
 			priorTransportDiagnosticCensus = transportDiagnosticCensus(cp);
 			// Earlier writers recorded a source review as if it settled effects.
 			// Preserve its authenticated source/transport receipt but downgrade
 			// every such effects assertion to historical UNKNOWN on live reopen.
 			storedOpaqueExecutedRuns = [...(cp.opaqueExecutedRuns ?? [])];
+			for (const gap of storedOpaqueExecutedRuns) {
+				const metadata = executedMetadata.get(gap.source.runId);
+				const liveTerminal = metadata && verifiedTerminal(metadata.run, metadata.job, gap.source, true);
+				if (!liveTerminal || JSON.stringify(liveTerminal) !== JSON.stringify(gap.terminal))
+					reject("historical opaque gap terminal differs from live workflow metadata");
+				// The archived result artifact ID and digest remain an authenticated
+				// historical receipt; artifact retention can expire before this read.
+			}
 			opaqueExecutedRuns = storedOpaqueExecutedRuns.map(gap =>
 				Object.freeze({ ...gap, effects: "unreviewed" as const }));
 			currentEffectReviewPending = cp.currentEffectReview === "pending";
@@ -2361,6 +2593,11 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 		opaqueExecutedRuns.push(gap);
 		storedOpaqueExecutedRuns.push(gap);
 	}
+	// A cancelled execution can survive later carried successors only as an
+	// authenticated opaque gap. Never admit a cancelled source with its own carry.
+	for (const runId of cancelledExecutedRunIds)
+		if (!opaqueExecutedRuns.some(gap => gap.source.runId === runId))
+			reject("intervening cancelled workflow run is not an exact missing-carry opaque gap");
 	const currentSource = sourceOf(current);
 	const latestSource = sourcesWithCarry.at(-1);
 	const proof = latestSource ? priorCarryProof({ source: latestSource, current: currentSource,
@@ -2370,6 +2607,55 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 		...(accountingAncestry.length ?
 			{ accounting: { settledNano, unknownObservedNano, unpricedRequestCount } } :
 			{ committedNano, unknownHeldNano }) }) : undefined;
+	const historicalIncrementalPrefixes: AuthenticatedIncrementalPrefixObservation[] = [];
+	for (const entry of storedHistoricalIncrementalPrefixes) {
+		if (!proof || !priorPrivateBundle) reject("historical incremental prefix lacks authenticated carry");
+		const sourceRun = executedMetadata.get(entry.source.runId)?.run;
+		if (!sourceRun || sourceRun.event !== entry.event)
+			reject("historical incremental prefix source changed");
+		const decoded = openIncrementalControlPrefix(entry.prefixJson, key, {
+			repository: MISSION_REPOSITORY, runId: entry.source.runId,
+			runAttempt: entry.source.runAttempt, commit: entry.source.commit,
+			event: entry.event, priorEnvelopeSha256: entry.priorCarryEnvelopeSha256 });
+		historicalIncrementalPrefixes.push(brandIncrementalObservation(entry, decoded,
+			priorPrivateBundle));
+	}
+	let incrementalPrefixObservation: AuthenticatedIncrementalPrefixObservation | undefined;
+	let incrementalPrefixFailure: IncrementalPrefixFailure | undefined;
+	if (latestIncrementalRaw !== undefined) {
+		if (!newlyOpaqueGap || !latestIncrementalArtifact || !proof || !priorPrivateBundle ||
+			newlyOpaqueGap.source.runId === proof.source.runId ||
+			parentDigest !== proof.envelopeSha256)
+			reject("incremental prefix lacks its authenticated preceding carry");
+		const sourceRun = executedMetadata.get(newlyOpaqueGap.source.runId)?.run;
+		if (!sourceRun || (sourceRun.event !== "push" && sourceRun.event !== "workflow_dispatch"))
+			reject("incremental prefix source event is invalid");
+		let decoded: ReturnType<typeof openIncrementalControlPrefix> | undefined;
+		try { decoded = openIncrementalControlPrefix(latestIncrementalRaw, key, {
+			repository: MISSION_REPOSITORY, runId: newlyOpaqueGap.source.runId,
+			runAttempt: newlyOpaqueGap.source.runAttempt, commit: newlyOpaqueGap.source.commit,
+			event: sourceRun.event, priorEnvelopeSha256: proof.envelopeSha256 }); }
+		catch (error) {
+			// Preserve the live archive identity while leaving the entire run UNKNOWN.
+			const known = error instanceof IncrementalCheckpointError ? error : undefined;
+			incrementalPrefixFailure = Object.freeze({ kind: "unusable-incremental-host-prefix",
+				category: known ? "decode-or-authentication-failed" : "unclassified-decoder-failure",
+				stage: known?.stage ?? null, reason: known?.reason ?? null,
+				artifact: latestIncrementalArtifact });
+		}
+		if (decoded) {
+			const entry: StoredHistoricalIncrementalPrefix = {
+				version: 1, kind: "encrypted-historical-incremental-prefix",
+				source: { ...newlyOpaqueGap.source }, event: sourceRun.event,
+				priorCarryEnvelopeSha256: proof.envelopeSha256,
+				artifact: latestIncrementalArtifact, prefixJson: latestIncrementalRaw
+			};
+			incrementalPrefixObservation = brandIncrementalObservation(entry, decoded,
+				priorPrivateBundle);
+			storedHistoricalIncrementalPrefixes.push(entry);
+			historicalIncrementalPrefixes.push(incrementalPrefixObservation);
+		}
+	}
 	if (proof && carryForwardOrigin && priorPrivateBundle && proof.resultArtifact)
 		authenticatedCarryForwardOrigins.set(proof, carryForwardOrigin);
 	if (proof && hostEffectEvidence && priorPrivateBundle && proof.resultArtifact)
@@ -2390,20 +2676,11 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 		authenticatedPendingHistoricalEffects.set(proof, Object.freeze([
 			...pendingEffectAncestry.map(source => Object.freeze({ ...source })),
 			...(currentEffectReviewPending ? [Object.freeze({ ...proof.source })] : [])]));
-	if (terminalMode) {
-		if (!proof || !priorPrivateBundle || !latestCheckpoint || latestCheckpoint.version !== 3 ||
-			proof.source.runId !== c.runId || proof.source.runAttempt !== Number(c.runAttempt) ||
-			proof.source.commit !== c.sha || !verifiedTerminal(current, executedMetadata.get(c.runId!)!.job,
-				proof.source))
-			reject("terminal carry lacks an exact completed source and v3 checkpoint");
-		const observed = await githubJson(`${base}/runs/${proof.source.runId}`, input.githubToken!, request) as Run;
-		if (JSON.stringify(sourceOf(observed)) !== JSON.stringify(proof.source) ||
-			observed.status !== "completed" || observed.conclusion !== current.conclusion ||
-			observed.workflow_id !== current.workflow_id || observed.actor?.login !== c.actor ||
-			observed.event !== c.event || observed.head_branch !== current.head_branch)
-			reject("terminal Actions source changed after the workflow listing");
-		if (!originalObjectiveMatchesSignedBootstrap(priorPrivateBundle,
-			seed.bootstrapPrivateBundle?.["original-objective.json"]))
+	const projectAuthenticatedBundle = (): { status: MissionStatusV1;
+		pendingAction?: MissionStatusV1["pendingAction"]; checkpointSha256: string } => {
+		if (!priorPrivateBundle || !latestCheckpoint || latestCheckpoint.version !== 3 ||
+			!originalObjectiveMatchesSignedBootstrap(priorPrivateBundle,
+				seed.bootstrapPrivateBundle?.["original-objective.json"]))
 			reject("terminal objective is not the exact signed bootstrap objective");
 		const selected = selectedTuple(priorPrivateBundle, true);
 		if (!selected || !authenticatedSelectedTransitions?.length &&
@@ -2426,18 +2703,14 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 		try { unresolved = canonicalRestartUnknowns(checkpoint).operationRefs; }
 		catch { return reject("terminal objective operation ancestry is invalid"); }
 		const pendingAction = checkpoint.continuation.pendingAction;
-		let pendingActionSha256: string | null = null;
 		if (pendingAction) {
-			try { pendingActionSha256 = pendingActionIdentity(pendingAction); }
+			try { pendingActionIdentity(pendingAction); }
 			catch { return reject("terminal host pending action is invalid"); }
 			if (pendingAction.reasonCode !== checkpoint.stopReason)
 				reject("terminal pending action differs from objective stop");
 		}
-		// The sealed checkpoint records the host's earlier decision, but it does not
-		// carry the complete original-check inputs needed to re-prove closure here.
 		if (checkpoint.objectiveOutcome === "fulfilled")
 			reject("terminal objective closure lacks an independent host receipt");
-		const source = Object.freeze({ ...proof.source });
 		const status: MissionStatusV1 = {
 			version: 1, kind: "host-redacted-mission-status",
 			contractId: (selected.checkpoint.contract as Record<string, unknown>).id as string,
@@ -2445,11 +2718,59 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 			selectedTupleSha256: selected.sha256, unresolvedOperationRefs: unresolved,
 			...(pendingAction ? { pendingAction } : {})
 		};
+		return { status, ...(pendingAction ? { pendingAction } : {}),
+			checkpointSha256: digest(priorPrivateBundle["objective-checkpoint.json"]!) };
+	};
+	if (terminalInterruption) {
+		const gap = opaqueExecutedRuns.at(-1);
+		if (!newlyOpaqueGap || !gap || !proof || !priorPrivateBundle ||
+			proof.source.runId === c.runId || gap.source.runId !== c.runId ||
+			gap.priorCarryEnvelopeSha256 !== proof.envelopeSha256)
+			reject("terminal interruption lacks an exact preceding authenticated carry and opaque gap");
+		const observed = await githubJson(`${base}/runs/${gap.source.runId}`, input.githubToken!, request) as Run;
+		if (JSON.stringify(sourceOf(observed)) !== JSON.stringify(gap.source) ||
+			observed.status !== "completed" || observed.conclusion !== current.conclusion ||
+			observed.workflow_id !== current.workflow_id || observed.actor?.login !== c.actor ||
+			observed.event !== c.event || observed.head_branch !== current.head_branch)
+			reject("terminal Actions source changed after the workflow listing");
+		const projected = projectAuthenticatedBundle();
+		const interruptionProof: AuthenticatedTerminalInterruptionProof = Object.freeze({
+			version: 1, kind: "authenticated-terminal-interruption", gap,
+			priorCarry: Object.freeze({ source: Object.freeze({ ...proof.source }),
+				envelopeSha256: proof.envelopeSha256, artifact: proof.artifact })
+		});
+		authenticatedTerminalInterruptionProofs.add(interruptionProof);
+		terminalInterruptionBundleDigests.set(interruptionProof, privateBundleDigest(priorPrivateBundle));
+		terminalInterruptionProjections.set(interruptionProof, Object.freeze({
+			...projected, priorSource: Object.freeze({ ...proof.source }),
+			priorEnvelopeSha256: proof.envelopeSha256 }));
+		Object.freeze(priorPrivateBundle);
+		return { proof: interruptionProof, priorCarryProof: proof, priorPrivateBundle,
+			...(incrementalPrefixObservation ? { incrementalPrefixObservation } : {}),
+			...(incrementalPrefixFailure ? { incrementalPrefixFailure } : {}) };
+	}
+	if (terminalMode) {
+		if (!proof || !priorPrivateBundle || !latestCheckpoint || latestCheckpoint.version !== 3 ||
+			proof.source.runId !== c.runId || proof.source.runAttempt !== Number(c.runAttempt) ||
+			proof.source.commit !== c.sha || !verifiedTerminal(current, executedMetadata.get(c.runId!)!.job,
+				proof.source))
+			reject("terminal carry lacks an exact completed source and v3 checkpoint");
+		const observed = await githubJson(`${base}/runs/${proof.source.runId}`, input.githubToken!, request) as Run;
+		if (JSON.stringify(sourceOf(observed)) !== JSON.stringify(proof.source) ||
+			observed.status !== "completed" || observed.conclusion !== current.conclusion ||
+			observed.workflow_id !== current.workflow_id || observed.actor?.login !== c.actor ||
+			observed.event !== c.event || observed.head_branch !== current.head_branch)
+			reject("terminal Actions source changed after the workflow listing");
+		const projected = projectAuthenticatedBundle();
+		const { status, pendingAction } = projected;
+		let pendingActionSha256: string | null = null;
+		if (pendingAction) pendingActionSha256 = pendingActionIdentity(pendingAction);
+		const source = Object.freeze({ ...proof.source });
 		const terminalCarry: TerminalCarryEvidenceV1 = {
 			version: 1, kind: "host-verified-terminal-carry", source,
 			envelopeSha256: proof.envelopeSha256, contractId: status.contractId,
-			selectedTupleSha256: selected.sha256, pendingActionSha256,
-			checkpointSha256: digest(priorPrivateBundle["objective-checkpoint.json"]!),
+			selectedTupleSha256: status.selectedTupleSha256, pendingActionSha256,
+			checkpointSha256: projected.checkpointSha256,
 			terminal: { runStatus: "completed", jobStatus: "completed", providerStepStatus: "completed" }
 		};
 		const terminalProof: AuthenticatedTerminalCarryProof = Object.freeze({
@@ -2484,7 +2805,17 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 			preparedDiagnosticAuditSha256 !== digest(JSON.stringify(cp.requestAudit))))
 			reject("transport diagnostic census differs from the final host audit");
 	};
+	const incrementalControlSource: IncrementalCheckpointSource = {
+		repository: MISSION_REPOSITORY, runId: currentSource.runId,
+		runAttempt: currentSource.runAttempt, commit: currentSource.commit,
+		event: c.event as "push" | "workflow_dispatch", priorEnvelopeSha256: parentDigest };
 	const result: LedgerContinuation = { mode: "accounting-only",
+		...(incrementalPrefixObservation ? { incrementalPrefixObservation } : {}),
+		...(incrementalPrefixFailure ? { incrementalPrefixFailure } : {}),
+		historicalIncrementalPrefixes: Object.freeze([...historicalIncrementalPrefixes]),
+		incrementalControlSource,
+		createIncrementalControlJournal: outputDir => new IncrementalPrivateCheckpointJournal({
+			outputDir, authenticatedMissionKey: key, source: incrementalControlSource }),
 		...(priorTransportDiagnosticCensus ? { priorTransportDiagnosticCensus } : {}),
 		opaqueExecutedRuns: Object.freeze([...opaqueExecutedRuns]),
 		priorSettledCny: decimal(settledNano), priorUnknownObservedCny: decimal(unknownObservedNano),
@@ -2616,6 +2947,8 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 					reject("current accounting-only carry is invalid");
 				const cp: AccountingCheckpoint = { version: 3, ancestry: accountingAncestry,
 					legacyAncestry, historical,
+					...(storedHistoricalIncrementalPrefixes.length ?
+						{ historicalIncrementalPrefixes: [...storedHistoricalIncrementalPrefixes] } : {}),
 					...(opaqueExecutedRuns.length ? { opaqueExecutedRuns: [...storedOpaqueExecutedRuns],
 						historicalOpaqueGapEffectInterpretation: "unknown-unreconciled" as const } : {}),
 					kind: "mul-pis-private-ledger-continuation", missionId: MISSION_ID,
@@ -2766,6 +3099,8 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 				reject("emergency transport diagnostic bundle exceeds private bounds");
 			const cp: AccountingCheckpoint = { version: 3, ancestry: accountingAncestry,
 				legacyAncestry, historical,
+				...(storedHistoricalIncrementalPrefixes.length ?
+					{ historicalIncrementalPrefixes: [...storedHistoricalIncrementalPrefixes] } : {}),
 				...(storedSelectedTransitions.length ?
 					{ selectedTransitions: [...storedSelectedTransitions] } : {}),
 				kind: "mul-pis-private-ledger-continuation", missionId: MISSION_ID,
@@ -2826,9 +3161,14 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 
 /** Download only encrypted carry files; the token is used only for GitHub API. */
 export async function downloadCarryArtifact(input: { githubToken: string; artifactId: string;
+	/** GitHub's SHA-256 for the archive, when a live artifact listing supplied it. */
+	expectedArchiveSha256?: string;
 	request?: typeof fetch; /** Offline test override only. */ idleTimeoutMs?: number }): Promise<CarryArtifactPayload> {
 	if (!positiveId(input.artifactId) || !input.githubToken || input.githubToken.length > 4_000)
 		reject("invalid carry artifact request");
+	if (input.expectedArchiveSha256 !== undefined &&
+		! /^[0-9a-f]{64}$/.test(input.expectedArchiveSha256))
+		reject("invalid carry artifact archive digest");
 	const idleTimeoutMs = input.idleTimeoutMs ?? 15_000;
 	if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs < 1 || idleTimeoutMs > 15_000)
 		reject("invalid carry artifact idle timeout");
@@ -2895,21 +3235,29 @@ export async function downloadCarryArtifact(input: { githubToken: string; artifa
 		if (error instanceof HarnessError) throw error;
 		return reject("carry archive response is unreadable");
 	}
+	if (input.expectedArchiveSha256 && digest(zip) !== input.expectedArchiveSha256)
+		reject("carry archive digest differs from live Actions artifact");
 	const entries = carryZipEntries(zip);
 	const raw = entries.get(CARRY_FILE_NAME);
-	if (!raw) reject("carry root file is missing");
+	const incrementalRaw = entries.get(INCREMENTAL_CHECKPOINT_FILE);
+	if (!raw) {
+		if (!incrementalRaw || entries.size !== 1) reject("carry root file is missing");
+		return { incrementalControlPrefix: incrementalRaw.toString("utf8") };
+	}
 	let parsed: unknown;
 	try { parsed = JSON.parse(raw.toString("utf8")); } catch { return reject("carry file is invalid"); }
 	if (!record(parsed) || !exactKeys(parsed, ["envelopeB64"]) || typeof parsed.envelopeB64 !== "string")
 		reject("carry file fields are invalid");
 	if (entries.size === 1) return parsed.envelopeB64;
 	entries.delete(CARRY_FILE_NAME);
+	entries.delete(INCREMENTAL_CHECKPOINT_FILE);
 	return { envelopeB64: parsed.envelopeB64,
 		sidecars: Object.fromEntries([...entries].map(([name, bytes]) =>
-			[name, bytes.toString("utf8")])) };
+			[name, bytes.toString("utf8")])),
+		...(incrementalRaw ? { incrementalControlPrefix: incrementalRaw.toString("utf8") } : {}) };
 }
 
-/** Strict bounded ZIP reader. Every member must be an exact carry ciphertext file. */
+/** Strict bounded ZIP reader. Every member must be a fixed encrypted carry or prefix file. */
 function carryZipEntries(zip: Buffer): Map<string, Buffer> {
 	const eocd = zip.length - 22;
 	if (eocd < 0 || zip.readUInt32LE(eocd) !== 0x06054b50 || zip.readUInt16LE(eocd + 20) !== 0 ||
@@ -2937,9 +3285,11 @@ function carryZipEntries(zip: Buffer): Map<string, Buffer> {
 		const nameBytes = zip.subarray(cursor + 46, nameEnd);
 		const name = nameBytes.toString("utf8");
 		const entryLimit = name === CARRY_FILE_NAME ? MAX_CARRY_BYTES :
+			name === INCREMENTAL_CHECKPOINT_FILE ? 64 * 1024 * 1024 :
 			Math.ceil(CARRY_SEGMENT_FILE_BYTES * 4 / 3) + 4;
 		if (!nameBytes.equals(Buffer.from(name, "utf8")) || names.has(name) ||
-			(name !== CARRY_FILE_NAME && !/^ledger-continuation\.part-[0-9]{8,}\.enc$/.test(name)) ||
+			(name !== CARRY_FILE_NAME && name !== INCREMENTAL_CHECKPOINT_FILE &&
+				!/^ledger-continuation\.part-[0-9]{8,}\.enc$/.test(name)) ||
 			(flags & ~(0x800 | 0x8)) || ![0, 8].includes(method) ||
 			packed > entryLimit || unpacked > entryLimit ||
 			zip.readUInt16LE(cursor + 34) !== 0 || localOffset + 30 > cdOffset ||
@@ -2980,7 +3330,7 @@ function carryZipEntries(zip: Buffer): Map<string, Buffer> {
 		rows.push({ name, offset: localOffset, dataEnd: nextOffset, bytes });
 		cursor = nameEnd + extraLength + commentLength;
 	}
-	if (cursor !== eocd || !names.has(CARRY_FILE_NAME))
+	if (cursor !== eocd || (!names.has(CARRY_FILE_NAME) && !names.has(INCREMENTAL_CHECKPOINT_FILE)))
 		reject("carry archive directory is invalid");
 	rows.sort((a, b) => a.offset - b.offset);
 	let next = 0;

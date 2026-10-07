@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { createCipheriv, createDecipheriv, createHash, generateKeyPairSync, randomBytes, sign, constants } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { deflateRawSync } from "node:zlib";
 import test, { type TestContext } from "node:test";
-import { authenticateLatestTerminalCarry, authenticatedSupervisorProjection, authenticatedTerminalCarryBindsBundle, isAuthenticatedTerminalCarryProof, authenticatedAccountingObservation, authenticatedHistoricalOpaqueRunGaps, authenticatedHistoricalCarryOrigin, authenticatedPendingHistoricalEffectSources, authenticatedSelectedTransitions, authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, originalObjectiveMatchesSignedBootstrap, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE, retainedTransportDiagnosticWithinBundle } from "../src/runner/ledger-continuation.ts";
+import { authenticateLatestTerminalCarry, authenticateLatestTerminalInterruption, authenticatedSupervisorProjection, authenticatedTerminalCarryBindsBundle, authenticatedTerminalInterruptionBindsPriorBundle, authenticatedTerminalInterruptionSupervisorProjection, isAuthenticatedTerminalCarryProof, isAuthenticatedTerminalInterruptionProof, isAuthenticatedIncrementalPrefixObservation, authenticatedIncrementalPrefixBindsPriorBundle, authenticatedAccountingObservation, authenticatedHistoricalOpaqueRunGaps, authenticatedHistoricalCarryOrigin, authenticatedPendingHistoricalEffectSources, authenticatedSelectedTransitions, authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, originalObjectiveMatchesSignedBootstrap, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE, retainedTransportDiagnosticWithinBundle } from "../src/runner/ledger-continuation.ts";
+import { INCREMENTAL_CHECKPOINT_FILE, IncrementalPrivateCheckpointJournal } from "../src/runner/incremental-private-checkpoint.ts";
 import type { CarryArtifactPayload, RequestAuditSnapshot } from "../src/runner/ledger-continuation.ts";
 import { DeepSeekCampaignBudget, campaignSessionEffectId, type CampaignAdmissionRejection } from "../src/runner/deepseek-campaign.ts";
 import { offlineChecks } from "../scripts/manual-private-campaign.ts";
@@ -219,6 +220,10 @@ test("latest terminal carry is live-authenticated before supervisor projection",
 		request: live([anchor, done]), loadCarryArtifact: async () => carry };
 	const terminal = await authenticateLatestTerminalCarry(common);
 	assert.equal(isAuthenticatedTerminalCarryProof(terminal.proof), true);
+	const sealedWithStalePrefix = await authenticateLatestTerminalCarry({ ...common,
+		loadCarryArtifact: async () => ({ ...carry, incrementalControlPrefix: "stale-untrusted-prefix" }) });
+	assert.equal(isAuthenticatedTerminalCarryProof(sealedWithStalePrefix.proof), true);
+	assert.equal(sealedWithStalePrefix.proof.envelopeSha256, terminal.proof.envelopeSha256);
 	assert.doesNotMatch(JSON.stringify(terminal.proof), /synthetic candidate|Synthetic task/);
 	assert.equal(isAuthenticatedTerminalCarryProof({ ...terminal.proof }), false);
 	assert.equal(authenticatedTerminalCarryBindsBundle(terminal.proof, terminal.privateBundle), true);
@@ -607,7 +612,7 @@ test("skipped provider run is proven, but cancelled and incomplete histories fai
 	await assert.rejects(openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7003, sha("c")), request: github([anchor, { ...first,
 			status: "completed", conclusion: "cancelled" }, second]),
-		loadCarryArtifact: async () => "unused" }), /not settled/);
+		loadCarryArtifact: async () => "unused" }), /cancelled workflow run is not an exact missing-carry opaque gap/);
 	await assert.rejects(openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7005, sha("e")), request: github([anchor, skipped, third]),
 		loadCarryArtifact: async () => "unused" }), /order cannot be proved/);
@@ -699,6 +704,25 @@ test("carry ZIP accepts encrypted segments and rejects extra or duplicate member
 		carryZip([[CARRY_FILE_NAME, root], ["extra.txt", Buffer.from("x")]])])
 		await assert.rejects(downloadCarryArtifact({ githubToken: "synthetic-token", artifactId: "9002",
 			request: async () => new Response(invalid) }), /carry archive entry is invalid/);
+});
+
+test("carry ZIP distinguishes prefix-only from a sealed carry and checks archive bytes", async () => {
+	const prefix = Buffer.from(JSON.stringify({ status: "incomplete", incrementalControlEnvelope: {} }));
+	const root = Buffer.from(JSON.stringify({ envelopeB64: "sealed-root" }));
+	const prefixOnly = carryZip([[INCREMENTAL_CHECKPOINT_FILE, prefix]]);
+	const archived = async (zip: Buffer, expectedArchiveSha256?: string) =>
+		downloadCarryArtifact({ githubToken: "synthetic-token", artifactId: "9002",
+			expectedArchiveSha256, request: async () => new Response(zip) });
+	assert.deepEqual(await archived(prefixOnly, createHash("sha256").update(prefixOnly).digest("hex")),
+		{ incrementalControlPrefix: prefix.toString("utf8") });
+	assert.deepEqual(await archived(carryZip([[CARRY_FILE_NAME, root],
+		[INCREMENTAL_CHECKPOINT_FILE, prefix]])),
+		{ envelopeB64: "sealed-root", sidecars: {}, incrementalControlPrefix: prefix.toString("utf8") });
+	await assert.rejects(archived(prefixOnly, "0".repeat(64)), /archive digest differs/);
+	await assert.rejects(archived(carryZip([[INCREMENTAL_CHECKPOINT_FILE, prefix],
+		["ledger-continuation.part-00000000.enc", Buffer.from("x")]])), /root file is missing/);
+	await assert.rejects(archived(carryZip([[INCREMENTAL_CHECKPOINT_FILE, prefix],
+		[INCREMENTAL_CHECKPOINT_FILE, prefix]])), /archive entry is invalid/);
 });
 
 test("carry download uses per-chunk idle timing while a slow body progresses", async () => {
@@ -2726,6 +2750,244 @@ test("any exact terminal missing-carry execution stays unknown through seal and 
 		request: requestFor([anchor, firstDone, secondDone, gap,
 			{ ...next, status: "completed", conclusion: "failure" }, later]),
 		loadCarryArtifact: async () => forged }), /opaque gap predecessor digest/);
+});
+
+test("cancelled executed missing-carry run has a separate terminal proof and keeps the prior AEAD selection", async t => {
+	const f = await fixture(t);
+	const contract = createOriginalObjective({ goal: "Synthetic cancellation gap", goalSource: "user-intent-summary",
+		inputNames: ["input.txt"], obligations: [{ id: "O1", description: "Synthetic check" }],
+		closure: "open-ended" });
+	const bundle = { "original-objective.json": JSON.stringify(contract),
+		"objective-checkpoint.json": JSON.stringify(objectiveProgress(contract, {
+			boundedRuns: [], selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
+			stopReason: "bounded-run-incomplete" })),
+		"candidate.cpp": "prior authenticated candidate", "verification.json": "{}", "workflow-archive.json": "{}" };
+	const seedEnvelopeB64 = f.signSeed({ ...f.payload, version: 2,
+		rootReviewedAnchor: { commit: sha("a"), artifactSha256: "e".repeat(64),
+			digestScope: "encrypted-result-envelope" },
+		bootstrap: { contractId: contract.id, sourceSha256: "d".repeat(64),
+			format: "deflate-raw-json-v1", filesB64: deflateRawSync(JSON.stringify(bundle)).toString("base64") } });
+	const opening = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7002, sha("b")),
+		request: github([anchor, first]), loadCarryArtifact: async () => "unused" });
+	const carry = opening.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: { version: 3, kind: "accounting-only-request-audit",
+			requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 } });
+	const carried = { ...first, status: "completed", conclusion: "failure" };
+	const cancelled = { ...second, status: "completed", conclusion: "cancelled" };
+	const next = { ...third, status: "in_progress" };
+	const rsa = { id: 9503, name: MISSION_ARTIFACT, expired: false,
+		digest: `sha256:${"9".repeat(64)}`,
+		workflow_run: { id: 7003, head_sha: sha("c") } };
+	const requestFor = (runs: object[], options: { artifacts?: object[]; job?: object;
+		observed?: object } = {}): typeof fetch => async (url, init) => {
+		const address = String(url);
+		if (address.endsWith("/runs/7003/jobs?per_page=100")) return new Response(JSON.stringify({
+			total_count: 1, jobs: [options.job ?? { id: 6003, run_id: 7003, run_attempt: 1,
+				head_sha: sha("c"), name: "private-campaign", status: "completed", conclusion: "cancelled",
+				steps: [{ name: "Run private campaign", status: "completed", conclusion: "cancelled" }] }] }));
+		if (address.endsWith("/runs/7003/artifacts?per_page=100")) {
+			const artifacts = options.artifacts ?? [rsa];
+			return new Response(JSON.stringify({ total_count: artifacts.length, artifacts }));
+		}
+		if (address.endsWith("/actions/runs/7003"))
+			return new Response(JSON.stringify(options.observed ?? cancelled));
+		return github(runs)(url, init);
+	};
+	const runs = [anchor, carried, cancelled];
+	const terminalInput = { ...f, seedEnvelopeB64, githubToken: "synthetic-token",
+		source: current(7003, sha("c")), request: requestFor(runs),
+		loadCarryArtifact: async () => carry };
+	const terminal = await authenticateLatestTerminalInterruption(terminalInput);
+	assert.equal(isAuthenticatedTerminalInterruptionProof(terminal.proof), true);
+	assert.equal(isAuthenticatedTerminalInterruptionProof({ ...terminal.proof }), false);
+	assert.equal(isAuthenticatedTerminalCarryProof(terminal.proof), false);
+	assert.equal(terminal.proof.gap.source.runId, "7003");
+	assert.equal(terminal.proof.gap.terminal.runConclusion, "cancelled");
+	assert.equal(terminal.proof.gap.terminal.jobConclusion, "cancelled");
+	assert.equal(terminal.proof.gap.resultArtifact.artifactId, "9503");
+	assert.equal(terminal.proof.gap.resultArtifact.archiveSha256, "9".repeat(64));
+	assert.equal(terminal.proof.gap.priorCarryEnvelopeSha256, terminal.priorCarryProof.envelopeSha256);
+	assert.equal(terminal.proof.priorCarry.envelopeSha256, terminal.priorCarryProof.envelopeSha256);
+	assert.equal(terminal.proof.gap.effects, "unreviewed");
+	assert.equal(terminal.proof.gap.accounting, "unquantified");
+	assert.equal(terminal.priorPrivateBundle["candidate.cpp"], bundle["candidate.cpp"]);
+	assert.equal(authenticatedTerminalInterruptionBindsPriorBundle(terminal.proof,
+		terminal.priorPrivateBundle), true);
+	assert.equal(authenticatedTerminalInterruptionBindsPriorBundle(terminal.proof,
+		{ ...terminal.priorPrivateBundle, "candidate.cpp": "unreviewed result" }), false);
+	const projection = authenticatedTerminalInterruptionSupervisorProjection(terminal.proof,
+		terminal.priorPrivateBundle);
+	assert.equal(projection?.status.contractId, contract.id);
+	assert.equal(projection?.status.stopReason, "bounded-run-incomplete");
+	assert.equal(projection?.priorSource.runId, "7002");
+	assert.equal(authenticatedTerminalInterruptionSupervisorProjection({ ...terminal.proof },
+		terminal.priorPrivateBundle), undefined);
+	const ordinary = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7005, sha("e")),
+		request: requestFor([...runs, next]), loadCarryArtifact: async () => carry });
+	assert.equal(ordinary.opaqueExecutedRuns.length, 1);
+	assert.equal(ordinary.opaqueExecutedRuns[0].source.runId, "7003");
+	assert.equal(ordinary.opaqueExecutedRuns[0].accounting, "unquantified");
+	assert.equal(ordinary.priorCarryProof?.source.runId, "7002");
+	const incrementalDir = await mkdtemp(path.join(os.tmpdir(), "ledger-incremental-reopen-"));
+	t.after(async () => rm(incrementalDir, { recursive: true, force: true }));
+	const authenticatedSeed = await authenticateSignedMissionSeed({ ...f, envelopeB64: seedEnvelopeB64 });
+	const prefixSource = { repository: MISSION_REPOSITORY, runId: "7003", runAttempt: 1,
+		commit: sha("c"), event: "workflow_dispatch" as const,
+		priorEnvelopeSha256: ordinary.priorCarryProof!.envelopeSha256 };
+	const journal = new IncrementalPrivateCheckpointJournal({ source: prefixSource,
+		outputDir: incrementalDir,
+		authenticatedMissionKey: authenticatedSeed.derivePrivateKey("mul-pis-ledger-continuation-v1") });
+	const sessionId = campaignSessionEffectId("synthetic-prefix-request");
+	const prefixInput = (received: boolean) => {
+		const requests = [{ requestId: "prefix-request-1", sessionId, responseReceived: received,
+			inputPayloadBytes: 120, maxOutputTokens: 512,
+			status: (received ? "unknown" : "in-flight") as "unknown" | "in-flight",
+			settledCny: null, unknownObservedCny: received ? 0.002 : null,
+			reportedUsage: null }];
+		return { requestAudit: { version: 3 as const, kind: "accounting-only-request-audit" as const,
+			requests, settledCny: 0, unknownObservedCny: received ? 0.002 : 0,
+			unpricedRequestCount: received ? 0 : 1 },
+			hostEffects: { version: 1 as const, kind: "host-effect-prefix-observation" as const,
+				complete: false as const, selectionAuthority: false as const,
+				source: { runId: prefixSource.runId, runAttempt: prefixSource.runAttempt,
+					commit: prefixSource.commit },
+				priorEnvelopeSha256: prefixSource.priorEnvelopeSha256,
+				historicalGoalRunIds: [], goals: [], sessions: [],
+				requestIds: requests.map(row => row.requestId) } };
+	};
+	await journal.record("request-reserved", prefixInput(false));
+	const reservedRaw = await readFile(path.join(incrementalDir, INCREMENTAL_CHECKPOINT_FILE), "utf8");
+	await journal.record("request-observed", prefixInput(true));
+	const observedRaw = await readFile(path.join(incrementalDir, INCREMENTAL_CHECKPOINT_FILE), "utf8");
+	const prefixArtifact = { id: 9603, name: CARRY_ARTIFACT_NAME, expired: false,
+		digest: `sha256:${"8".repeat(64)}`,
+		workflow_run: { id: 7003, head_sha: sha("c") } };
+	let observedExpectedArchiveSha256: string | undefined;
+	const withPrefix = (raw: string, artifactList: object[] = [rsa, prefixArtifact]) => ({
+		...terminalInput, request: requestFor(runs, { artifacts: artifactList }),
+		loadCarryArtifact: async ({ runId, expectedArchiveSha256 }: { runId: string;
+			artifactId: string; expectedArchiveSha256?: string }) => {
+			if (runId === "7003") observedExpectedArchiveSha256 = expectedArchiveSha256;
+			return runId === "7003" ? { incrementalControlPrefix: raw } : carry;
+		} });
+	const reserved = await authenticateLatestTerminalInterruption(withPrefix(reservedRaw));
+	assert.equal(observedExpectedArchiveSha256, "8".repeat(64));
+	assert.equal(isAuthenticatedIncrementalPrefixObservation(reserved.incrementalPrefixObservation), true);
+	assert.equal(reserved.incrementalPrefixObservation?.event, "request-reserved");
+	assert.equal(reserved.incrementalPrefixObservation?.requestAudit.requests[0].status, "in-flight");
+	assert.equal(reserved.incrementalPrefixObservation?.artifact.artifactId, "9603");
+	assert.equal(reserved.incrementalPrefixObservation?.artifact.archiveSha256, "8".repeat(64));
+	assert.equal(reserved.incrementalPrefixObservation?.priorCarryEnvelopeSha256,
+		reserved.priorCarryProof.envelopeSha256);
+	assert.equal(isAuthenticatedIncrementalPrefixObservation({ ...reserved.incrementalPrefixObservation }), false);
+	assert.equal(authenticatedIncrementalPrefixBindsPriorBundle(reserved.incrementalPrefixObservation,
+		reserved.priorPrivateBundle), true);
+	assert.equal(authenticatedIncrementalPrefixBindsPriorBundle(reserved.incrementalPrefixObservation,
+		{ ...reserved.priorPrivateBundle, "candidate.cpp": "unreviewed replacement" }), false);
+	assert.equal(reserved.proof.gap.accounting, "unquantified");
+	const observed = await authenticateLatestTerminalInterruption(withPrefix(observedRaw));
+	assert.equal(observed.incrementalPrefixObservation?.event, "request-observed");
+	assert.equal(observed.incrementalPrefixObservation?.requestAudit.requests[0].responseReceived, true);
+	assert.equal(observed.incrementalPrefixObservation?.requestAudit.unknownObservedCny, 0.002);
+	assert.equal(observed.priorCarryProof.priorSettledCny, reserved.priorCarryProof.priorSettledCny);
+	const corrupted = JSON.stringify({ ...JSON.parse(observedRaw), status: "complete" });
+	const unusable = await authenticateLatestTerminalInterruption(withPrefix(corrupted));
+	assert.equal(unusable.incrementalPrefixObservation, undefined);
+	assert.equal(unusable.incrementalPrefixFailure?.category, "decode-or-authentication-failed");
+	assert.equal(unusable.incrementalPrefixFailure?.stage, "envelope");
+	assert.equal(unusable.incrementalPrefixFailure?.reason, "invalid-format");
+	assert.equal(unusable.incrementalPrefixFailure?.artifact.artifactId, "9603");
+	assert.equal(unusable.proof.gap.accounting, "unquantified");
+	const wrongParent = JSON.stringify({ ...JSON.parse(observedRaw), incrementalControlEnvelope: {
+		...JSON.parse(observedRaw).incrementalControlEnvelope,
+		source: { ...prefixSource, priorEnvelopeSha256: "f".repeat(64) } } });
+	const parentFailure = (await authenticateLatestTerminalInterruption(withPrefix(wrongParent)))
+		.incrementalPrefixFailure;
+	assert.equal(parentFailure?.category, "decode-or-authentication-failed");
+	assert.equal(parentFailure?.stage, "source");
+	assert.equal(parentFailure?.reason, "binding-mismatch");
+	const wrongSource = JSON.stringify({ ...JSON.parse(observedRaw), incrementalControlEnvelope: {
+		...JSON.parse(observedRaw).incrementalControlEnvelope,
+		source: { ...prefixSource, runId: "7002" } } });
+	const sourceFailure = (await authenticateLatestTerminalInterruption(withPrefix(wrongSource)))
+		.incrementalPrefixFailure;
+	assert.equal(sourceFailure?.category, "decode-or-authentication-failed");
+	assert.equal(sourceFailure?.stage, "source");
+	assert.equal(sourceFailure?.reason, "binding-mismatch");
+	await assert.rejects(authenticateLatestTerminalInterruption(withPrefix(observedRaw,
+		[rsa, prefixArtifact, { ...prefixArtifact, id: 9604 }])), /unavailable or ambiguous/);
+	for (const invalidArtifact of [
+		{ ...prefixArtifact, workflow_run: { id: 7003, head_sha: sha("9") } },
+		{ ...prefixArtifact, digest: "sha256:bad" },
+		{ ...prefixArtifact, expired: true },
+	]) await assert.rejects(authenticateLatestTerminalInterruption(withPrefix(observedRaw,
+		[rsa, invalidArtifact])), /incremental prefix artifact identity|unavailable or ambiguous/);
+	const successorWithPrefix = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7005, sha("e")),
+		request: requestFor([...runs, next], { artifacts: [rsa, prefixArtifact] }),
+		loadCarryArtifact: async ({ runId }) => runId === "7003" ?
+			{ incrementalControlPrefix: observedRaw } : carry });
+	assert.equal(successorWithPrefix.incrementalPrefixObservation?.event, "request-observed");
+	assert.equal(successorWithPrefix.priorSettledCny, ordinary.priorSettledCny);
+	assert.equal(successorWithPrefix.opaqueExecutedRuns[0].accounting, "unquantified");
+	const successorCarry = successorWithPrefix.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: { version: 3, kind: "accounting-only-request-audit",
+			requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 } });
+	const successorDone = { ...next, status: "completed", conclusion: "failure" };
+	const later = run(7006, 5, "in_progress", sha("f"));
+	const reopenRequest: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.endsWith("/runs/7005/jobs?per_page=100")) return new Response(JSON.stringify({
+			total_count: 1, jobs: [{ id: 6005, run_id: 7005, run_attempt: 1,
+				head_sha: sha("e"), name: "private-campaign", status: "completed", conclusion: "failure",
+				steps: [{ name: "Run private campaign", status: "completed", conclusion: "failure" }] }] }));
+		if (address.endsWith("/runs/7005/artifacts?per_page=100")) return new Response(JSON.stringify({
+			total_count: 1, artifacts: [{ id: 9005, name: CARRY_ARTIFACT_NAME,
+				expired: false, workflow_run: { id: 7005, head_sha: sha("e") } }] }));
+		return requestFor([...runs, successorDone, later])(url, init);
+	};
+	const reopened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7006, sha("f")),
+		request: reopenRequest, loadCarryArtifact: async identity =>
+			identity.runId === "7005" ? successorCarry : carry });
+	assert.equal(reopened.opaqueExecutedRuns.length, 1);
+	assert.equal(reopened.opaqueExecutedRuns[0].source.runId, "7003");
+	assert.equal(reopened.opaqueExecutedRuns[0].effects, "unreviewed");
+	assert.equal(reopened.opaqueExecutedRuns[0].accounting, "unquantified");
+	assert.equal(reopened.historicalIncrementalPrefixes.length, 1);
+	assert.equal(reopened.historicalIncrementalPrefixes[0].event, "request-observed");
+	assert.equal(reopened.historicalIncrementalPrefixes[0].requestAudit.requests[0].requestId,
+		"prefix-request-1");
+	assert.equal(reopened.historicalIncrementalPrefixes[0].requestAudit.unknownObservedCny, 0.002);
+	assert.deepEqual(reopened.historicalIncrementalPrefixes[0].hostEffects.requestIds,
+		["prefix-request-1"]);
+	assert.equal(reopened.historicalIncrementalPrefixes[0].prefixSha256,
+		createHash("sha256").update(observedRaw).digest("hex"));
+	assert.equal(reopened.historicalIncrementalPrefixes[0].accounting, "unquantified");
+	assert.equal(authenticatedIncrementalPrefixBindsPriorBundle(
+		reopened.historicalIncrementalPrefixes[0], reopened.priorPrivateBundle), true);
+	assert.equal(authenticatedAccountingObservation(reopened.priorCarryProof,
+		reopened.priorPrivateBundle)?.opaqueUnquantifiedRunCount, 1);
+	await assert.rejects(authenticateLatestTerminalCarry(terminalInput), /artifact is unavailable or ambiguous/);
+	for (const [label, options] of [
+		["carry present", { artifacts: [rsa, { id: 9003, name: CARRY_ARTIFACT_NAME,
+			expired: false, workflow_run: { id: 7003 } }] }],
+		["result absent", { artifacts: [] }],
+		["result duplicate", { artifacts: [rsa, { ...rsa, id: 9504 }] }],
+		["result SHA wrong", { artifacts: [{ ...rsa, workflow_run: { id: 7003, head_sha: sha("9") } }] }],
+		["result digest malformed", { artifacts: [{ ...rsa, digest: "sha256:bad" }] }],
+		["job SHA wrong", { job: { id: 6003, run_id: 7003, run_attempt: 1,
+			head_sha: sha("9"), name: "private-campaign", status: "completed", conclusion: "cancelled",
+			steps: [{ name: "Run private campaign", status: "completed", conclusion: "cancelled" }] } }],
+		["step missing", { job: { id: 6003, run_id: 7003, run_attempt: 1,
+			head_sha: sha("c"), name: "private-campaign", status: "completed", conclusion: "cancelled",
+			steps: [] } }],
+		["run reread changed", { observed: { ...cancelled, head_sha: sha("9") } }],
+	] as Array<[string, { artifacts?: object[]; job?: object; observed?: object }]>)
+		await assert.rejects(authenticateLatestTerminalInterruption({ ...terminalInput,
+			request: requestFor(runs, options) }), label);
 });
 
 test("optional encrypted transport cause census binds only unknown audit IDs and carries forward unchanged", async t => {

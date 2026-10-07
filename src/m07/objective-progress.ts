@@ -8,6 +8,10 @@ import { workflowRepairFingerprint, workflowRepairState, type WorkflowRepairFail
 	type WorkflowRepairStateV1 } from "../runner/repair-liveness.ts";
 import type { StageRunRecord } from "../types.ts";
 import { HarnessError } from "../types.ts";
+import { mergeGroundedAssessmentDelta, validateGroundedAssessment, validatePriorGroundingIndex,
+	type GroundedAssessmentDelta, type GroundedAssessmentProposal,
+	type GroundedIssue, type GroundingContext, type GroundingSourceKind,
+	type GroundingSpan } from "./assessor-grounding.ts";
 
 const MAX_EVIDENCE_BYTES = 1_000_000;
 const safeAdapterId = (value: unknown): value is string => typeof value === "string" && /^[a-z][a-z0-9._/-]{0,95}$/.test(value);
@@ -55,6 +59,10 @@ export interface ModelObjectiveAssessmentV1 {
 	/** Model-authored open issues from the full original assignment, never a host-chosen strategy list. */
 	unresolvedDetails: string[];
 	nextTask?: ObjectiveNextTaskV1;
+	/** New source-grounded proposal. Historical assessments remain readable without it. */
+	groundedAssessment?: GroundedAssessmentProposal;
+	/** Index-mode change record; authenticated prior records are host-merged. */
+	groundedAssessmentDelta?: GroundedAssessmentDelta;
 }
 
 /** Decoded old checkpoints may contain these retired quota reasons. New execution never emits them. */
@@ -66,6 +74,7 @@ export type CurrentObjectiveStopReason = "accounting-integrity-error" |
 	"original-checks-unverified" | "assessment-validation-pending" | "next-task-pending" | "next-task-needs-capability" |
 	"objective-reassessment-pending" | "dispatch-failed" |
 	"request-contract-invalid" | "workflow-repair-needed" |
+	"execution-interrupted" |
 	"artifact-capacity-boundary" | "m04-evidence-incomplete" | "m04-draft-rejected" |
 	"m04-transaction-unresolved" | "bounded-run-incomplete";
 export type ObjectiveStopReason = CurrentObjectiveStopReason | HistoricalObjectiveStopReason;
@@ -78,6 +87,7 @@ const historicalObjectiveStopReasons: readonly HistoricalObjectiveStopReason[] =
 export type PendingActionKindV1 = "retry-readonly-assessment" | "retry-evidence-read" |
 	"fresh-m07-task" | "repair-rejected-m04" | "repair-request-contract" | "reconcile-m07-operation" |
 	"reconcile-m04-transaction" | "restore-evidence" | "retry-transport" |
+	"reconcile-interrupted-run" |
 	"refresh-auth" | "supply-capability" | "repair-workflow-state";
 export type PendingActionSafetyV1 = "same-session-read-only" | "fresh-work-only" |
 	"no-replay-until-reconciled";
@@ -140,6 +150,7 @@ const safeControlRefs = (value: unknown): value is string[] => Array.isArray(val
 const pendingKinds: PendingActionKindV1[] = ["retry-readonly-assessment", "retry-evidence-read",
 	"fresh-m07-task", "repair-rejected-m04", "repair-request-contract",
 	"reconcile-m07-operation", "reconcile-m04-transaction",
+	"reconcile-interrupted-run",
 	"restore-evidence", "retry-transport", "refresh-auth", "supply-capability", "repair-workflow-state"];
 const pendingSafeties: PendingActionSafetyV1[] = ["same-session-read-only", "fresh-work-only",
 	"no-replay-until-reconciled"];
@@ -149,6 +160,7 @@ const objectiveStopReasons: CurrentObjectiveStopReason[] = [
 	"model-closure-unverified", "original-checks-unverified", "assessment-validation-pending",
 	"next-task-pending", "next-task-needs-capability", "objective-reassessment-pending", "dispatch-failed",
 	"request-contract-invalid", "workflow-repair-needed",
+	"execution-interrupted",
 	"artifact-capacity-boundary", "m04-evidence-incomplete",
 	"m04-draft-rejected", "m04-transaction-unresolved", "bounded-run-incomplete"];
 export const isCurrentObjectiveStopReason = (value: unknown): value is CurrentObjectiveStopReason =>
@@ -206,7 +218,10 @@ export function classifyPendingAction(stopReason: CurrentObjectiveStopReason,
 		throw new HarnessError("m07.objective", "pending action human blocker lacks host verification");
 	let kind: PendingActionKindV1;
 	let safety: PendingActionSafetyV1 = "fresh-work-only";
-	if (hostFacts.m04TransactionUnresolved || stopReason === "m04-transaction-unresolved") {
+	if (stopReason === "execution-interrupted") {
+		kind = "reconcile-interrupted-run";
+		safety = "no-replay-until-reconciled";
+	} else if (hostFacts.m04TransactionUnresolved || stopReason === "m04-transaction-unresolved") {
 		kind = "reconcile-m04-transaction";
 		safety = "no-replay-until-reconciled";
 	} else if (hostFacts.unresolvedOperationRefs?.length) {
@@ -270,6 +285,7 @@ export function validatePendingAction(action: PendingActionV1, stopReason: Objec
 		failedStage: action.failedStage, transportFailure: action.transportFailure,
 		requestContract: action.requestContract });
 	const reconciles = action.kind === "reconcile-m07-operation" || action.kind === "reconcile-m04-transaction" ||
+		action.kind === "reconcile-interrupted-run" ||
 		(stopReason === "accounting-integrity-error" && action.kind === "retry-transport");
 	const sameSession = action.kind === "retry-readonly-assessment" || action.kind === "retry-evidence-read";
 	const humanKind = action.verifiedHumanBlocker?.kind === "credential-unavailable" ? "refresh-auth" :
@@ -283,9 +299,10 @@ export function validatePendingAction(action: PendingActionV1, stopReason: Objec
 		throw new HarnessError("m07.objective", "pending action safety or human gate is inconsistent");
 	const operationRefs = action.target?.operationRefs ?? [];
 	if ((operationRefs.length > 0 && action.kind !== "reconcile-m07-operation" &&
-		action.kind !== "reconcile-m04-transaction") ||
+		 action.kind !== "reconcile-m04-transaction" && action.kind !== "reconcile-interrupted-run") ||
 		(action.kind === "reconcile-m07-operation" && operationRefs.length === 0) ||
-		(action.kind === "reconcile-m04-transaction" && stopReason !== "m04-transaction-unresolved"))
+		(action.kind === "reconcile-m04-transaction" && stopReason !== "m04-transaction-unresolved") ||
+		(action.kind === "reconcile-interrupted-run" && stopReason !== "execution-interrupted"))
 		throw new HarnessError("m07.objective", "pending action cannot relabel unresolved effects");
 	const requiredRepairKind: Partial<Record<CurrentObjectiveStopReason, PendingActionKindV1>> = {
 		"assessment-evidence-unread": "retry-evidence-read",
@@ -294,6 +311,7 @@ export function validatePendingAction(action: PendingActionV1, stopReason: Objec
 		"m04-draft-rejected": "repair-rejected-m04",
 		"request-contract-invalid": "repair-request-contract",
 		"workflow-repair-needed": "repair-workflow-state",
+		"execution-interrupted": "reconcile-interrupted-run",
 		"model-reported-blocked": "retry-readonly-assessment",
 		"model-closure-unverified": "retry-readonly-assessment",
 		"original-checks-unverified": "retry-readonly-assessment",
@@ -383,11 +401,25 @@ export function createOriginalObjective(input: {
 		obligations: input.obligations.map(item => ({ ...item })), closure: input.closure };
 }
 
-function parseAssessment(text: string, contract: OriginalObjectiveContractV1, evidenceNames: string[]): ModelObjectiveAssessmentV1 {
+function parseAssessment(text: string, contract: OriginalObjectiveContractV1, evidenceNames: string[],
+	grounding?: GroundingContext, priorGroundingIndex = false): ModelObjectiveAssessmentV1 {
 	let value: unknown;
 	try { value = JSON.parse(text); } catch { throw new HarnessError("m07.objective-assessment", "assessment is not strict JSON"); }
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new HarnessError("m07.objective-assessment", "assessment object is invalid");
-	const raw = value as Record<string, unknown>;
+	let raw = value as Record<string, unknown>;
+	let groundedAssessmentDelta: GroundedAssessmentDelta | undefined;
+	if (priorGroundingIndex) {
+		if (!grounding || raw.groundedAssessment !== undefined)
+			throw new HarnessError("m07.objective-assessment", "prior grounding delta is invalid");
+		try {
+			const merged = mergeGroundedAssessmentDelta(raw.groundedAssessmentDelta, grounding);
+			groundedAssessmentDelta = merged.delta;
+			const openClaims = merged.proposal.issues.filter(item => item.status === "open").map(item => item.claim);
+			if (raw.unresolvedDetails !== undefined && JSON.stringify(raw.unresolvedDetails) !== JSON.stringify(openClaims))
+				throw new Error("open claim mismatch");
+			raw = { ...raw, unresolvedDetails: openClaims, groundedAssessment: merged.proposal };
+		} catch { throw new HarnessError("m07.objective-assessment", "prior grounding delta is invalid"); }
+	}
 	const ids = new Set(contract.obligations.map(item => item.id));
 	const names = new Set(evidenceNames);
 	const strings = (item: unknown, allowed: Set<string>): item is string[] =>
@@ -415,9 +447,27 @@ function parseAssessment(text: string, contract: OriginalObjectiveContractV1, ev
 		(decision === "fulfilled" && (raw.unresolvedObligations.length || raw.unresolvedDetails.length || !raw.evidenceRefs.length || nextTask)) ||
 		(decision === "blocked" && (!raw.unresolvedObligations.length || !raw.unresolvedDetails.length || nextTask)))
 		throw new HarnessError("m07.objective-assessment", "decision and unresolved obligations conflict");
+	let groundedAssessment: GroundedAssessmentProposal | undefined;
+	if (grounding) {
+		try { groundedAssessment = validateGroundedAssessment(raw.groundedAssessment, grounding); }
+		catch { throw new HarnessError("m07.objective-assessment", "grounded assessment is invalid"); }
+		const claims = groundedAssessment.issues.filter(item => item.status === "open").map(item => item.claim);
+		if (JSON.stringify(claims) !== JSON.stringify(raw.unresolvedDetails))
+			throw new HarnessError("m07.objective-assessment", "grounded issues do not match unresolved details");
+		if (decision === "continue") {
+			const groundedTask = groundedAssessment.nextTask;
+			if (!nextTask || !groundedTask || groundedTask.adapterScope !== nextTask.adapterScope ||
+				JSON.stringify(groundedTask.obligationIds) !== JSON.stringify(nextTask.addresses) ||
+				!groundedTask.addresses.some(id => groundedAssessment!.issues.some(issue => issue.id === id && issue.status === "open" &&
+					["explicit-requirement", "necessary-verification"].includes(issue.classification))))
+				throw new HarnessError("m07.objective-assessment", "next task lacks a decision-changing original requirement");
+		} else if (groundedAssessment.nextTask)
+			throw new HarnessError("m07.objective-assessment", "grounded next task conflicts with verdict");
+	}
 	return { version: 1, decision, rationale: raw.rationale, evidenceRefs: raw.evidenceRefs,
 		unresolvedObligations: raw.unresolvedObligations, unresolvedDetails: raw.unresolvedDetails,
-		...(nextTask ? { nextTask } : {}) };
+		...(nextTask ? { nextTask } : {}), ...(groundedAssessment ? { groundedAssessment } : {}),
+		...(groundedAssessmentDelta ? { groundedAssessmentDelta } : {}) };
 }
 
 export function objectiveProgress(contract: OriginalObjectiveContractV1, input: {
@@ -486,6 +536,8 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 	persistReceipt: () => Promise<void>;
 	evidenceRoot: string;
 	evidence: Array<{ name: string; file: string }>;
+	/** Default is required. Only explicitly named historical evidence may be on demand. */
+	evidenceAccess?: Record<string, "required" | "retrievable">;
 	/** Task adapters own artifact names and semantic evidence contracts. */
 	evidenceRequirements?: { requiredNames: string[]; instructions?: string };
 	assessmentAdmission: "admitted" | CurrentObjectiveStopReason;
@@ -494,6 +546,11 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 	capabilities?: ObjectiveCapabilityV1[];
 	/** Current user policy, applied without rewriting a frozen prior contract. */
 	userOverrides?: string[];
+	/** Opt-in for new live assessors; old serialized assessments stay readable. */
+	groundingPolicy?: { require: true; sourceKinds: Record<string, GroundingSourceKind>;
+		legacyOpenDetails: string[]; previousIssues?: GroundedIssue[];
+		newEvidenceSourceIds?: string[];
+		priorGroundingIndex?: { indexName: string; partNames: string[] } };
 	recordAssessment?: (assessment: NonNullable<ObjectiveProgressV1["assessment"]>) => Promise<void>;
 	/** Durable control facts only; never substitutes for evidence reading or a valid verdict. */
 	recordRepairState?: (state: WorkflowRepairStateV1) => Promise<void>;
@@ -513,6 +570,27 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 	if (!Array.isArray(input.userOverrides ?? []) ||
 		(input.userOverrides ?? []).some(item => !nonemptyText(item)))
 		throw new HarnessError("m07.objective", "current user overrides are invalid");
+	if (input.groundingPolicy && (input.groundingPolicy.require !== true ||
+		!input.groundingPolicy.sourceKinds || typeof input.groundingPolicy.sourceKinds !== "object" ||
+		Array.isArray(input.groundingPolicy.sourceKinds) ||
+		!Array.isArray(input.groundingPolicy.legacyOpenDetails) ||
+		input.groundingPolicy.legacyOpenDetails.some(item => !nonemptyText(item)) ||
+		!Array.isArray(input.groundingPolicy.previousIssues ?? []) ||
+		(input.groundingPolicy.previousIssues ?? []).some(item => !item || !safeName(item.id) ||
+			!nonemptyText(item.claim) || !["open", "resolved"].includes(item.status)) ||
+		new Set((input.groundingPolicy.previousIssues ?? []).map(item => item.id)).size !==
+			(input.groundingPolicy.previousIssues ?? []).length ||
+		!Array.isArray(input.groundingPolicy.newEvidenceSourceIds ?? []) ||
+		(input.groundingPolicy.newEvidenceSourceIds ?? []).some(item => !safeName(item)) ||
+		new Set(input.groundingPolicy.newEvidenceSourceIds ?? []).size !==
+			(input.groundingPolicy.newEvidenceSourceIds ?? []).length ||
+		(input.groundingPolicy.priorGroundingIndex !== undefined &&
+			(!safeName(input.groundingPolicy.priorGroundingIndex.indexName) ||
+				!Array.isArray(input.groundingPolicy.priorGroundingIndex.partNames) ||
+				input.groundingPolicy.priorGroundingIndex.partNames.some(name => !safeName(name)) ||
+				new Set(input.groundingPolicy.priorGroundingIndex.partNames).size !==
+					input.groundingPolicy.priorGroundingIndex.partNames.length))))
+		throw new HarnessError("m07.objective", "assessor grounding policy is invalid");
 	if (input.supportedTaskScopes.some(scope => !safeAdapterId(scope)) ||
 		new Set(input.supportedTaskScopes).size !== input.supportedTaskScopes.length)
 		throw new HarnessError("m07.objective", "supported adapter IDs are invalid");
@@ -520,13 +598,25 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		input.evidenceRequirements.requiredNames.some(name => !safeName(name) || !input.evidence.some(item => item.name === name)) ||
 		(input.evidenceRequirements.instructions !== undefined && !nonemptyText(input.evidenceRequirements.instructions))))
 		throw new HarnessError("m07.objective", "required adapter evidence is missing or invalid");
+	if (input.evidenceAccess && (typeof input.evidenceAccess !== "object" ||
+		Array.isArray(input.evidenceAccess) || Object.entries(input.evidenceAccess).some(([name, access]) =>
+			!safeName(name) || !["required", "retrievable"].includes(access) ||
+			name !== "original-objective.json" && !input.evidence.some(item => item.name === name)) ||
+		input.evidenceAccess["original-objective.json"] === "retrievable" ||
+		input.evidenceRequirements?.requiredNames.some(name => input.evidenceAccess?.[name] === "retrievable") ||
+		input.evidence.some(item => (item.name === "original-problem.txt" ||
+			/^original-input-[1-9][0-9]*\.txt$/.test(item.name)) &&
+			input.evidenceAccess?.[item.name] === "retrievable")))
+		throw new HarnessError("m07.objective", "required objective evidence cannot become retrievable");
 	// The complete assessment plan stays frozen even if a caller mutates its input
 	// objects while a prompt or persistence callback is running.
 	const contract = structuredClone(input.contract);
 	const sourceEvidence = input.evidence.map(item => ({ ...item }));
+	const evidenceAccess = { ...input.evidenceAccess };
 	const capabilities = input.capabilities?.map(item => ({ ...item, limits: [...item.limits] }));
 	const supportedTaskScopes = [...input.supportedTaskScopes];
 	const userOverrides = [...(input.userOverrides ?? contract.userOverrides ?? [])];
+	const groundingPolicy = input.groundingPolicy ? structuredClone(input.groundingPolicy) : undefined;
 	const evidenceInstructions = input.evidenceRequirements?.instructions;
 	const sessionSpec = structuredClone(input.sessionSpec);
 	const evidenceRoot = input.evidenceRoot;
@@ -550,6 +640,19 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		materials.push({ ...item, lineCount: text.split("\n").length - (text.endsWith("\n") ? 1 : 0),
 			digest: createHash("sha256").update(bytes).digest("hex") });
 	}
+	if (groundingPolicy && (materials.some(item => ["original-objective.json", "current-user-overrides"].includes(item.name)) ||
+		Object.keys(groundingPolicy.sourceKinds).length !== materials.length ||
+		materials.some(item => !["user-instruction", "supplied-task", "selected-evidence", "host-capability"]
+			.includes(groundingPolicy.sourceKinds[item.name])) ||
+		(groundingPolicy.newEvidenceSourceIds ?? []).some(name => !materials.some(item => item.name === name &&
+			["selected-evidence", "host-capability"].includes(groundingPolicy.sourceKinds[name])))))
+		throw new HarnessError("m07.objective", "grounding source registry does not match frozen evidence");
+	const priorIndex = groundingPolicy?.priorGroundingIndex;
+	if (priorIndex && (!materials.some(item => item.name === priorIndex.indexName) ||
+		evidenceAccess[priorIndex.indexName] === "retrievable" ||
+		priorIndex.partNames.some(name => name === priorIndex.indexName ||
+			!materials.some(item => item.name === name) || evidenceAccess[name] !== "retrievable")))
+		throw new HarnessError("m07.objective", "prior grounding index and parts must be registered frozen evidence");
 	await mkdir(evidenceRoot, { mode: 0o700 });
 	const frozenContract = path.join(evidenceRoot, "original-objective.json");
 	await copyFile(input.contractFile, frozenContract);
@@ -566,6 +669,16 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			throw new HarnessError("m07.objective", "frozen objective evidence changed during copy");
 		evidence.push({ version: 1, label: item.name, path: copy, status: "frozen-copy", sourceVersion: contract.id });
 	}
+	let priorIssueLocators: Record<string, GroundingSpan> | undefined;
+	if (priorIndex) {
+		const parts: Record<string, string> = {};
+		for (const name of priorIndex.partNames) parts[name] = await readFile(path.join(evidenceRoot, name), "utf8");
+		try { priorIssueLocators = validatePriorGroundingIndex(
+			await readFile(path.join(evidenceRoot, priorIndex.indexName), "utf8"), parts,
+			{ legacyOpenDetails: groundingPolicy!.legacyOpenDetails,
+				previousIssues: groundingPolicy!.previousIssues ?? [] }); }
+		catch { throw new HarnessError("m07.objective", "prior grounding partition differs from authenticated records"); }
+	}
 	const spec: SessionSpec = { ...sessionSpec,
 		tools: { kind: "read-dir", root: evidenceRoot, toolName: "objective_evidence_read" } };
 	const openAssessor = (reason: string) => openBoundedSession(input.runner, input.runRecord, {
@@ -574,17 +687,58 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 	}, input.persistReceipt);
 	let handle = await openAssessor("Assess the original user goal from frozen bounded evidence before choosing further M07 work");
 	try {
+		const contractText = contractBytes.toString("utf8");
+		const grounding: GroundingContext | undefined = groundingPolicy ? {
+			contractId: contract.id,
+			sources: { "original-objective.json": { kind: "user-instruction",
+				lineCount: contractText.split("\n").length - (contractText.endsWith("\n") ? 1 : 0) },
+				...Object.fromEntries(materials.map(item => [item.name, { kind: groundingPolicy.sourceKinds[item.name],
+					lineCount: item.lineCount }])),
+				...(userOverrides.length ? { "current-user-overrides": { kind: "user-instruction" as const,
+					lineCount: userOverrides.length } } : {}) },
+			capabilities: Object.fromEntries((capabilities ?? []).map(item => [item.scope,
+				{ available: item.available }])),
+			legacyOpenDetails: groundingPolicy.legacyOpenDetails,
+			previousIssues: groundingPolicy.previousIssues ?? [],
+			newEvidenceSourceIds: groundingPolicy.newEvidenceSourceIds ?? [],
+			...(priorIssueLocators ? { priorIssueLocators } : {}),
+		} : undefined;
+		const requiredMaterials = materials.filter(item => evidenceAccess[item.name] !== "retrievable");
+		const retrievableMaterials = materials.filter(item => evidenceAccess[item.name] === "retrievable");
+		const retrievableIndex = requiredMaterials.find(item =>
+			item.name === "prior-research-history-index.json");
 		const prompt = ["# Original objective (unchanged)", contract.goal,
 			"# User overrides (higher priority than supplied task material)",
-			...userOverrides,
+			...userOverrides.map((item, index) => `${index + 1}: ${item}`),
 			"# Original obligations", ...contract.obligations.map(item => `${item.id}: ${item.description}`),
 			"# Observed execution capabilities", ...(capabilities ?? []).map(item =>
 				`${item.scope}: ${item.available ? "available" : "unavailable"}; ${item.description}; limits: ${item.limits.join("; ")}`),
 			`Closure policy: ${contract.closure}. A bounded child goal and accepted candidate do not alone establish original-goal completion.`,
 			evidenceInstructions ?? "Read all supplied material; the caller identifies the original inputs and the meaning of artifact names.",
-			"# Frozen bounded evidence", "Use objective_evidence_read to read the complete original-objective.json and every listed file. If a file is paginated, read every page including the untruncated end. The file names are:",
-			...materials.map(item => item.name),
-			"Return only strict JSON with version 1, decision (fulfilled, continue, or blocked), rationale, evidenceRefs (file names above), unresolvedObligations (IDs above), unresolvedDetails (your concrete open requirements from the full original assignment), and when continuing nextTask {objective, addresses, adapterScope}. Use a scope only when its observed host capability covers your proposed work. If a proposed task has no available registered executor, retain it as unresolved and name the unavailable capability explicitly. The host may ask you to replan feasible work; preserve unresolved requirements. Assess honestly. Propose the next scientific work yourself from unresolved original obligations; do not change task permissions or claim a global optimum from a finite evaluation."].join("\n\n");
+			"# Frozen bounded evidence", "Use objective_evidence_read to read the complete original-objective.json and every listed file below. This list contains the required files. If paginated, read every page including the untruncated end. Required files:",
+			...requiredMaterials.map(item => item.name),
+			...(retrievableMaterials.length ? [
+				"Additional frozen history is retrievable on demand. Its locator grants no scientific evidence credit.",
+				...(retrievableIndex ? ["Read prior-research-history-index.json for historical part filenames and byte order."] : []),
+				...(priorIndex ? [`Read ${priorIndex.indexName} for prior grounding record locators and part filenames.`] : []),
+				...(!retrievableIndex && !priorIndex ?
+					retrievableMaterials.map(item => `Retrievable file: ${item.name}, lines 1-${item.lineCount}.`) : []),
+				"A retrievable file cited in evidenceRefs needs a complete current-session read; a retrievable source span needs its exact cited lines returned in this session. Unread retrievable files have no authority." ] : []),
+			...(grounding ? ["# Grounded assessment requirement",
+				"For sourceRefs cite registered sourceId, startLine, endLine. current-user-overrides line N is override N above. Original problem and inputs are supplied-task material; host capability claims need observed host facts. These classifications annotate claims and cannot erase the original obligation.",
+				...Object.entries(grounding.sources).filter(([name]) => name === "original-objective.json" ||
+					name === "current-user-overrides" || evidenceAccess[name] !== "retrievable" ||
+					!retrievableIndex && !priorIndex)
+					.map(([name, source]) => `${name}: ${source.kind}, lines 1-${source.lineCount}`),
+				"Issue classes are explicit-requirement (cited user or supplied task requirement), necessary-verification (claimAtRisk), optional-method (cited optionalBasis), and physical-capability-gap (unavailable blockedScope plus host capabilityRef). Each new issue needs id, claim, status, classification, sourceRefs and implication. A proposed nextTask must identify an open decision-changing issue and expected evidence. Optional methods or unavailable equipment alone do not force another task.",
+				...(priorIndex ? [
+					`Authenticated prior grounding is in required index ${priorIndex.indexName} and ${priorIndex.partNames.length} retrievable parts. Read the index completely. Use its exact line locators to inspect a prior issue before changing its status. Omitted prior issues and legacy details are retained by the host. New frozen evidence IDs: ${JSON.stringify(grounding.newEvidenceSourceIds ?? [])}.`,
+					"Return groundedAssessmentDelta {version:1,kind:'grounded-assessment-delta',newIssues:[],resolutions:[],nextTask?,deliverableReady?} instead of groundedAssessment. A resolution is {id,priorRef,explanation,evidenceRefs}, where priorRef is exactly the indexed old issue line and evidenceRefs include new evidence. Do not echo old issue records or legacy details; the host merges and checks them. The host derives unresolvedDetails from all still-open issues."
+				] : [
+					`Retain these prior unresolved details verbatim under groundedAssessment.legacyOpenDetails: ${JSON.stringify(grounding.legacyOpenDetails)}. Retain every prior issue ID and claim, changing open to resolved only with new evidence: ${JSON.stringify(grounding.previousIssues ?? [])}. Newly produced frozen evidence IDs: ${JSON.stringify(grounding.newEvidenceSourceIds ?? [])}.`,
+					"Add groundedAssessment {version:1,kind:'grounded-assessment-proposal',contractId,missionStatus:'open',issues,legacyOpenDetails,nextTask?,deliverableReady?}. Each issue needs id,claim,status:'open'|'resolved',classification,sourceRefs,implication. A resolved issue retains its ID and adds resolution {explanation,evidenceRefs} citing a selected result or host observation; only OPEN issue claims appear in unresolvedDetails. Classifications: explicit-requirement (user instruction or supplied task), necessary-verification (claimAtRisk), optional-method (optionalBasis cited in task/user text), physical-capability-gap (blockedScope and capabilityRef citing host observation). For continue, groundedAssessment.nextTask needs obligationIds identical to nextTask.addresses, OPEN issue addresses, adapterScope identical to nextTask.adapterScope, and decisionChangingHypothesis, expectedEvidence, sourceRefs; it must address an explicit requirement or necessary verification. An optional method or unavailable capability alone does not justify another task. deliverableReady, if supplied, is only {status:'proposed',ready:boolean,rationale,evidenceRefs,remainingIssueIds}; it never closes this open-ended mission. Do not claim a global optimum from finite tests."
+				]) ] : []),
+			`Return only strict JSON with version 1, decision (fulfilled, continue, or blocked), rationale, evidenceRefs (frozen file names), unresolvedObligations (original obligation IDs), ${priorIndex ? "groundedAssessmentDelta" : "unresolvedDetails and, when grounding is enabled, groundedAssessment"}, and when continuing nextTask {objective, addresses, adapterScope}. Use a scope only when its observed host capability covers your proposed work. If a proposed task has no available registered executor, retain it as unresolved and name the unavailable capability explicitly. Preserve genuinely unresolved requirements. Assess honestly. Propose the next scientific work yourself from unresolved original obligations; do not change task permissions or claim a global optimum from a finite evaluation.`].join("\n\n");
 		const frozenFileAccessible = async (name: string, rejectUnknownIo = false): Promise<boolean> => {
 			try {
 				const file = path.join(evidenceRoot, name);
@@ -628,8 +782,24 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				score: covered.size + Number(reachedUntruncatedEnd),
 				nextRange: `${name}: objective_evidence_read path="${name}" offset=${offset} limit=${limit}${start > lines ? " (request the untruncated final page)" : ""}` };
 		};
-		const contractText = contractBytes.toString("utf8");
 		const readMaterials = [{ name: "original-objective.json", lineCount: contractText.split("\n").length - (contractText.endsWith("\n") ? 1 : 0) }, ...materials];
+		const citedSpans = (assessment?: ModelObjectiveAssessmentV1): GroundingSpan[] => {
+			const delta = assessment?.groundedAssessmentDelta;
+			if (delta) return [
+				...delta.newIssues.flatMap(item => [...item.sourceRefs,
+					...(item.capabilityRef ? [item.capabilityRef] : []),
+					...(item.resolution?.evidenceRefs ?? [])]),
+				...delta.resolutions.flatMap(item => [item.priorRef, ...item.evidenceRefs]),
+				...(delta.nextTask?.sourceRefs ?? []),
+				...(delta.deliverableReady?.evidenceRefs ?? [])];
+			const proposal = assessment?.groundedAssessment;
+			if (!proposal) return [];
+			return [...proposal.issues.flatMap(item => [...item.sourceRefs,
+				...(item.capabilityRef ? [item.capabilityRef] : []),
+				...(item.resolution?.evidenceRefs ?? [])]),
+				...(proposal.nextTask?.sourceRefs ?? []),
+				...(proposal.deliverableReady?.evidenceRefs ?? [])];
+		};
 		const proposals: ModelObjectiveAssessmentV1[] = [];
 		const unsupported = new Set<string>();
 		const blockedProposals: ObjectiveNextTaskV1[] = [];
@@ -654,15 +824,56 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			const returned = handle.readReturnEvents();
 			const newReadEvents = returned.slice(readEventCursor);
 			readEventCursor = returned.length;
-			const fileCoverage = readMaterials.map(item => ({ name: item.name, ...coverage(item.name, item.lineCount) }));
+			let parsed: ModelObjectiveAssessmentV1 | undefined;
+			let invalidReason: string | undefined;
+			try { parsed = parseAssessment(response.text, contract,
+				["original-objective.json", ...materials.map(item => item.name)], grounding, Boolean(priorIndex)); }
+			catch (error) {
+				if (!(error instanceof HarnessError) || error.code !== "m07.objective-assessment") throw error;
+				// Parser reasons are fixed host text, never the model's response or private evidence.
+				invalidReason = error.message;
+			}
+			const spans = citedSpans(parsed);
+			const fullRequired = new Set(["original-objective.json", ...requiredMaterials.map(item => item.name),
+				...(parsed?.evidenceRefs ?? [])]);
+			const fileCoverage = readMaterials.map(item => {
+				const read = coverage(item.name, item.lineCount);
+				const requiredSpans = spans.filter(ref => ref.sourceId === item.name);
+				const wholeFile = fullRequired.has(item.name);
+				const untruncatedRanges: Array<[number, number]> = [];
+				for (const event of returned.filter(event => event.toolName === "objective_evidence_read" &&
+					event.path === item.name && event.status === "returned" && event.returned.kind === "text" &&
+					event.returned.truncated === false && event.returned.startLine !== undefined &&
+					event.returned.endLine !== undefined && event.returned.startLine >= 1 &&
+					event.returned.endLine <= item.lineCount))
+					untruncatedRanges.push([event.returned.startLine!, event.returned.endLine!]);
+				untruncatedRanges.sort((a, b) => a[0] - b[0]);
+				const mergedRanges: Array<[number, number]> = [];
+				for (const range of untruncatedRanges) {
+					const prior = mergedRanges.at(-1);
+					if (prior && prior[1] + 1 >= range[0]) prior[1] = Math.max(prior[1], range[1]);
+					else mergedRanges.push([...range]);
+				}
+				const missingSpan = requiredSpans.find(ref => !mergedRanges.some(range =>
+					range[0] <= ref.startLine && range[1] >= ref.endLine));
+				const needed = wholeFile || requiredSpans.length > 0;
+				const satisfied = wholeFile ? read.complete : !missingSpan;
+				const spanScore = requiredSpans.reduce((sum, ref) => sum + mergedRanges.reduce((covered, range) =>
+					covered + Math.max(0, Math.min(range[1], ref.endLine) - Math.max(range[0], ref.startLine) + 1), 0), 0);
+				return { name: item.name, ...read, wholeFile, needed, satisfied,
+					score: wholeFile ? read.score : spanScore,
+					nextRange: wholeFile || !missingSpan ? read.nextRange :
+						`${item.name}: objective_evidence_read path="${item.name}" offset=${missingSpan.startLine} limit=${missingSpan.endLine - missingSpan.startLine + 1} (cited span)` };
+			});
 			const evidenceRead = fileCoverage.filter(item => item.complete).map(item => item.name);
-			const unreadEvidence = fileCoverage.filter(item => !item.complete).map(item => item.name);
+			const unreadEvidence = fileCoverage.filter(item => item.needed && !item.satisfied).map(item => item.name);
 			const unreadScore = fileCoverage.reduce((sum, item) => sum + item.score, 0);
 			const repairFailure = async (failure: WorkflowRepairFailure, failureFacts: unknown):
 				Promise<"same-session-feedback" | "fresh-context" | CurrentObjectiveStopReason> => {
 				const evidenceFingerprint = workflowRepairFingerprint({ frozen: frozenEvidenceIdentity,
-					coverage: fileCoverage.map(({ name, coveredRanges, reachedUntruncatedEnd }) =>
-						({ name, coveredRanges, reachedUntruncatedEnd })) });
+					coverage: fileCoverage.filter(item => item.needed).map(({ name, coveredRanges,
+						reachedUntruncatedEnd, wholeFile }) =>
+						({ name, coveredRanges, reachedUntruncatedEnd, wholeFile })) });
 				const planFingerprint = workflowRepairFingerprint({ frozen: frozenPlan, failureFacts });
 				// Host failure facts are canonical: timestamps, duplicate reads, JSON
 				// whitespace and unsupported rationale wording cannot create progress.
@@ -731,15 +942,6 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				}
 				return strategy;
 			};
-			let parsed: ModelObjectiveAssessmentV1 | undefined;
-			let invalidReason: string | undefined;
-			try { parsed = parseAssessment(response.text, contract,
-				["original-objective.json", ...materials.map(item => item.name)]); }
-			catch (error) {
-				if (!(error instanceof HarnessError) || error.code !== "m07.objective-assessment") throw error;
-				// Parser reasons are fixed host text, never the model's response or private evidence.
-				invalidReason = error.message;
-			}
 			let assessment: ObjectiveProgressV1["assessment"];
 			if (parsed) {
 				proposals.push(parsed);
@@ -768,13 +970,13 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				const repair = await repairFailure("unread-evidence", { unreadEvidence });
 				if (repair === "fresh-context") continue;
 				if (repair !== "same-session-feedback") return { assessment: latestAssessment, stopReason: repair };
-				request = ["Your previous assessment is provisional because required frozen evidence was not completely returned by objective_evidence_read.",
+				request = ["Your previous assessment is provisional because mandatory or cited frozen evidence was not sufficiently returned by objective_evidence_read.",
 					`Unread or incomplete files: ${unreadEvidence.join(", ")}.`,
-					...fileCoverage.filter(item => !item.complete).map(item => item.nextRange),
+					...fileCoverage.filter(item => item.needed && !item.satisfied).map(item => item.nextRange),
 					...(failedReads.length ? ["A read tool error occurred for a named file, but the host verified that frozen file is still available. Correct the path and requested range in this same session."] : []),
 					...(!parsed ? [`Your last response also failed the required strict JSON schema: ${invalidReason}. Repair its format after inspecting the missing evidence.`] : []),
 					...(noReadProgress ? ["The last repair turn added no verified read coverage. Replan how to use objective_evidence_read rather than repeating the same unsupported verdict."] : []),
-					"In this same session, read every missing range of each named file, including an untruncated final page. Then reassess the unchanged original objective and return a new strict JSON assessment. Do not repeat the prior verdict without inspecting the missing evidence; no task may be dispatched or goal closed from an incomplete read."].join("\n\n");
+					"In this same session, read every requested range. Whole-file requirements need an untruncated final page; cited spans need each cited line. Then reassess the unchanged original objective and return a new strict JSON assessment. Do not repeat the prior verdict without inspecting the missing evidence; no task may be dispatched or goal closed from incomplete required or cited evidence."].join("\n\n");
 				continue;
 			}
 			if (!parsed || !assessment) {
@@ -794,7 +996,10 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			}
 			if (parsed.decision === "blocked") {
 				const available = capabilities?.filter(item => item.available && supportedTaskScopes.includes(item.scope)) ?? [];
-				if (!available.length) return { assessment, stopReason: "model-reported-blocked" };
+				const actionable = parsed.groundedAssessment?.issues.some(item => item.status === "open" &&
+					(item.classification === "explicit-requirement" || item.classification === "necessary-verification"));
+				if (!available.length || parsed.groundedAssessment && !actionable)
+					return { assessment, stopReason: "model-reported-blocked" };
 				const admission = currentObjectiveAdmission(input.advanceAdmission());
 				if (admission !== "admitted") return { assessment, stopReason: admission };
 				const repair = await repairFailure("blocked-with-capability", {

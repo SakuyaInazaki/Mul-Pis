@@ -8,6 +8,8 @@ import { createHash } from "node:crypto";
 import { classifyPendingAction, validatePendingAction } from "../m07/objective-progress.ts";
 import type { ObjectiveStopReason, PendingActionV1 } from "../m07/objective-progress.ts";
 import { isVerifiedWorkflowRepairPlan, type VerifiedWorkflowRepairPlanV1 } from "./mission-host-adapter.ts";
+import { isVerifiedInterruptedSourceCapability,
+	type VerifiedInterruptedSourceCapabilityV1 } from "./interrupted-source-review.ts";
 
 type Source = Readonly<{ runId: string; runAttempt: number; commit: string }>;
 const hex64 = (value: unknown): value is string =>
@@ -48,6 +50,17 @@ export type TerminalCarryEvidenceV1 = Readonly<{
 		providerStepStatus: "completed" }>;
 }>;
 
+/** A later executed Actions run ended without a carry. This binds the opaque
+ * result archive to the last authenticated carry; it grants no authority from
+ * the interrupted run's research files or incomplete accounting. */
+export type TerminalInterruptionEvidenceV1 = Readonly<{
+	version: 1; kind: "host-verified-terminal-interruption";
+	source: Source; priorCarrySource: Source; priorCarryEnvelopeSha256: string;
+	resultArtifactId: string; resultArchiveSha256: string;
+	accounting: "unquantified"; effects: "unknown-unreconciled";
+	terminationOrigin: "unknown";
+}>;
+
 /** An Actions cancellation or process abort does not establish who requested it. */
 export type HostCancellationEventV1 = Readonly<{
 	version: 1; kind: "host-verified-cancellation-origin";
@@ -81,6 +94,15 @@ export type CurrentDerivedActionV1 = Readonly<{
 	checkpointSha256: string; action: PendingActionV1;
 }>;
 
+/** This decision is made NOW from a verified no-carry interruption. The older
+ * checkpoint's action remains history and is never replayed as the new action. */
+export type CurrentInterruptionActionV1 = Readonly<{
+	version: 1; kind: "current-host-interruption-action";
+	source: Source; priorCarryEnvelopeSha256: string;
+	priorCheckpointSha256: string; resultArchiveSha256: string;
+	action: PendingActionV1;
+}>;
+
 /** A verified launch contract promises a successor will enforce the existing
  * fresh-work boundary. It does not claim the future workspace already exists. */
 export type FreshIndependentLaunchContractV1 = Readonly<{
@@ -94,10 +116,13 @@ export type SupervisorSnapshot = Readonly<{
 	status: MissionStatusV1;
 	pendingAction?: PendingActionV1;
 	currentDerivedAction?: CurrentDerivedActionV1;
+	currentInterruptionAction?: CurrentInterruptionActionV1;
 	terminalCarry?: TerminalCarryEvidenceV1;
+	terminalInterruption?: TerminalInterruptionEvidenceV1;
 	cancellationEvent?: HostCancellationEventV1;
 	freshIndependentWork?: FreshIndependentWorkEvidenceV1;
 	freshLaunchContract?: FreshIndependentLaunchContractV1;
+	interruptedSourceReview?: VerifiedInterruptedSourceCapabilityV1;
 	workflowRepairPlan?: VerifiedWorkflowRepairPlanV1;
 	dispatchRecord: ResumeDispatchRecord;
 }>;
@@ -108,7 +133,12 @@ export type ResumeIntent = Readonly<{
 	contractId: string; selectedTupleSha256: string; pendingActionSha256: string;
 	actionKind: PendingActionV1["kind"];
 	pendingAction: PendingActionV1;
-	actionProvenance?: Readonly<{ kind: "current-host-derived"; checkpointSha256: string }>;
+	actionProvenance?: Readonly<{ kind: "current-host-derived"; checkpointSha256: string } |
+		{ kind: "current-host-interruption"; priorCheckpointSha256: string;
+			resultArchiveSha256: string }>;
+	terminalInterruption?: TerminalInterruptionEvidenceV1;
+	/** Private receipt identity and exact reviewed source; never enters the control descriptor. */
+	interruptedSourceReview?: Readonly<{ source: Source; sourceTree: string; receiptSha256: string }>;
 	/** Private review identity; never enters the public control descriptor. */
 	workflowRepair?: Readonly<{ reviewedPlanSha256: string; testedSourceCommit: string;
 		testedTree: string; successfulCi: VerifiedWorkflowRepairPlanV1["replacement"]["successfulCi"] }>;
@@ -124,7 +154,8 @@ export type SupervisorDecision =
 		"dispatch-delivery-unknown" | "successor-request-accepted" |
 		"quarantined-operation-needs-reconciliation" | "accounting-chain-needs-reconciliation" |
 		"user-cancelled" | "execution-interrupted" | "cancellation-origin-unverified" |
-		"terminal-action-needs-reclassification" | "workflow-repair-plan-required";
+		"terminal-action-needs-reclassification" | "workflow-repair-plan-required" |
+		"interruption-source-review-required";
 		idempotencyKey?: string; successorRunId?: string }>
 	| Readonly<{ kind: "restore-evidence"; evidenceRefs: readonly string[] }>
 	| Readonly<{ kind: "exclusive-external-input";
@@ -166,7 +197,7 @@ export function pendingActionIdentity(action: PendingActionV1): string {
  * Unknown external effects are quarantined while independent fresh work can
  * continue. No fixed retry, time, or fee count appears in this planner. */
 export function planMissionContinuation(snapshot: SupervisorSnapshot): SupervisorDecision {
-	const { status, pendingAction, terminalCarry, dispatchRecord } = snapshot;
+	const { status, pendingAction, terminalCarry, terminalInterruption, dispatchRecord } = snapshot;
 	if (status?.version !== 1 || status.kind !== "host-redacted-mission-status" ||
 		!ref(status.contractId) || !hex64(status.selectedTupleSha256) ||
 		!refs(status.unresolvedOperationRefs) ||
@@ -191,9 +222,39 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 		terminalCarry.terminal.jobStatus !== "completed" ||
 		terminalCarry.terminal.providerStepStatus !== "completed")
 		fail("terminal carry does not bind redacted mission status");
-	if (snapshot.cancellationEvent && status.stopReason !== "cancelled")
+	if (terminalInterruption && (terminalInterruption.version !== 1 ||
+		terminalInterruption.kind !== "host-verified-terminal-interruption" ||
+		!sourceId(terminalInterruption.source) || !sourceId(terminalInterruption.priorCarrySource) ||
+		terminalInterruption.priorCarrySource.runId !== terminalCarry.source.runId ||
+		terminalInterruption.priorCarrySource.runAttempt !== terminalCarry.source.runAttempt ||
+		terminalInterruption.priorCarrySource.commit !== terminalCarry.source.commit ||
+		terminalInterruption.priorCarryEnvelopeSha256 !== terminalCarry.envelopeSha256 ||
+		terminalInterruption.source.runId === terminalCarry.source.runId ||
+		!/^[1-9][0-9]{0,17}$/.test(terminalInterruption.resultArtifactId) ||
+		!hex64(terminalInterruption.resultArchiveSha256) ||
+		terminalInterruption.accounting !== "unquantified" ||
+		terminalInterruption.effects !== "unknown-unreconciled" ||
+		terminalInterruption.terminationOrigin !== "unknown"))
+		fail("terminal interruption does not bind the authenticated prior carry");
+	if (snapshot.cancellationEvent && !terminalInterruption && status.stopReason !== "cancelled")
 		fail("cancellation origin is unrelated to current terminal status");
+	if (terminalInterruption && snapshot.cancellationEvent) {
+		const event = snapshot.cancellationEvent;
+		if (event.version !== 1 || event.kind !== "host-verified-cancellation-origin" ||
+			!sourceId(event.source) || !ref(event.evidenceRef) ||
+			event.source.runId !== terminalInterruption.source.runId ||
+			event.source.runAttempt !== terminalInterruption.source.runAttempt ||
+			event.source.commit !== terminalInterruption.source.commit ||
+			event.envelopeSha256 !== terminalCarry.envelopeSha256)
+			fail("cancellation origin does not bind terminal interruption");
+		if (event.origin === "explicit-user-request")
+			return { kind: "wait", reason: "user-cancelled" };
+		if (event.origin !== "platform-interruption")
+			fail("cancellation origin is invalid");
+	}
 	if (status.objectiveOutcome === "fulfilled") {
+		if (terminalInterruption)
+			return { kind: "wait", reason: "accounting-chain-needs-reconciliation" };
 		if (status.stopReason !== null || status.pendingAction !== undefined ||
 			pendingAction !== undefined || terminalCarry.pendingActionSha256 !== null ||
 			status.unresolvedOperationRefs.length) fail("fulfilled mission still has pending work");
@@ -221,12 +282,50 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 		return { kind: "wait", reason: event.origin === "explicit-user-request" ?
 			"user-cancelled" : "execution-interrupted" };
 	}
-	let action: PendingActionV1;
-	let actionSha: string;
+	if (terminalInterruption && status.pendingAction?.humanRequired) {
+		pendingActionIdentity(status.pendingAction);
+		const blocker = status.pendingAction.verifiedHumanBlocker;
+		if (!blocker)
+			fail("authenticated prior exclusive input lacks host evidence");
+		return { kind: "exclusive-external-input",
+			blocker: blocker! };
+	}
+	if (terminalInterruption && status.stopReason === "accounting-integrity-error")
+		return { kind: "wait", reason: "accounting-chain-needs-reconciliation" };
+	if (terminalInterruption && status.stopReason === "workflow-repair-needed")
+		return { kind: "wait", reason: "workflow-repair-plan-required" };
+	if (terminalInterruption && status.stopReason === "assessment-evidence-suspended") {
+		if (status.pendingAction) pendingActionIdentity(status.pendingAction);
+		return { kind: "restore-evidence", evidenceRefs: status.pendingAction?.evidenceRefs ?? [] };
+	}
+	let action!: PendingActionV1;
+	let actionSha!: string;
 	let actionProvenance: ResumeIntent["actionProvenance"];
 	let workflowRepair: ResumeIntent["workflowRepair"];
 	const derived = snapshot.currentDerivedAction;
-	if (derived) {
+	const interrupted = snapshot.currentInterruptionAction;
+	if (terminalInterruption) {
+		if (!interrupted) return { kind: "wait", reason: "terminal-action-needs-reclassification" };
+		if (derived || interrupted.version !== 1 ||
+			interrupted.kind !== "current-host-interruption-action" ||
+			!sourceId(interrupted.source) ||
+			interrupted.source.runId !== terminalInterruption.source.runId ||
+			interrupted.source.runAttempt !== terminalInterruption.source.runAttempt ||
+			interrupted.source.commit !== terminalInterruption.source.commit ||
+			interrupted.priorCarryEnvelopeSha256 !== terminalCarry.envelopeSha256 ||
+			interrupted.priorCheckpointSha256 !== terminalCarry.checkpointSha256 ||
+			interrupted.resultArchiveSha256 !== terminalInterruption.resultArchiveSha256 ||
+			interrupted.action.reasonCode !== "execution-interrupted" ||
+			canonical(interrupted.action) !== canonical(classifyPendingAction("execution-interrupted",
+				{ unresolvedOperationRefs: [...status.unresolvedOperationRefs] })))
+			fail("current interruption action lacks host provenance or changed the safety class");
+		action = interrupted.action;
+		actionSha = pendingActionIdentity(action);
+		actionProvenance = { kind: "current-host-interruption",
+			priorCheckpointSha256: interrupted.priorCheckpointSha256,
+			resultArchiveSha256: interrupted.resultArchiveSha256 };
+	} else if (interrupted) fail("interruption action has no terminal gap");
+	else if (derived) {
 		if (status.pendingAction !== undefined || pendingAction !== undefined ||
 			terminalCarry.pendingActionSha256 !== null ||
 			status.stopReason !== "bounded-run-incomplete" ||
@@ -259,6 +358,9 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 			fail("pending action does not match authenticated checkpoint and carry");
 	}
 	const quarantinedOperationRefs = action.target?.operationRefs ?? [];
+	const selectedResumeSource = terminalInterruption?.source ?? terminalCarry.source;
+	const resumeSource = { runId: selectedResumeSource.runId,
+		runAttempt: selectedResumeSource.runAttempt, commit: selectedResumeSource.commit };
 	if (!sameSet(status.unresolvedOperationRefs, quarantinedOperationRefs) ||
 		(status.unresolvedOperationRefs.length > 0 &&
 			action.safety !== "no-replay-until-reconciled"))
@@ -275,6 +377,48 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 		return { kind: "wait", reason: "accounting-chain-needs-reconciliation" };
 	if (action.humanRequired) return { kind: "exclusive-external-input",
 		blocker: action.verifiedHumanBlocker! };
+	const launch = snapshot.freshLaunchContract;
+	const launchVerified = Boolean(launch && launch.version === 1 &&
+		launch.kind === "verified-fresh-launch-contract" &&
+		launch.source.runId === resumeSource.runId &&
+		launch.source.runAttempt === resumeSource.runAttempt &&
+		launch.source.commit === resumeSource.commit &&
+		launch.envelopeSha256 === terminalCarry.envelopeSha256 &&
+		launch.selectedTupleSha256 === status.selectedTupleSha256 &&
+		launch.pendingActionSha256 === actionSha &&
+		typeof launch.testedSourceCommit === "string" && /^[0-9a-f]{40}$/.test(launch.testedSourceCommit) &&
+		typeof launch.testedTree === "string" && /^[0-9a-f]{40}$/.test(launch.testedTree) &&
+		launch.requiresRuntimeAttestationBeforeModel === true &&
+		launch.mode === "fresh-work-only");
+	let interruptedSourceReview: ResumeIntent["interruptedSourceReview"];
+	if (terminalInterruption) {
+		const review = snapshot.interruptedSourceReview;
+		if (!review) return { kind: "wait", reason: "interruption-source-review-required" };
+		if (!isVerifiedInterruptedSourceCapability(review) ||
+			!sourceId(review.source) || !hex64(review.receiptSha256) ||
+			!(/^[0-9a-f]{40}$/.test(review.sourceTree)) ||
+			review.source.runId !== resumeSource.runId ||
+			review.source.runAttempt !== resumeSource.runAttempt ||
+			review.source.commit !== resumeSource.commit ||
+			Object.keys(review.grant ?? {}).sort().join("|") !== ["mode", "oldResultUse",
+				"m07Tools", "modelSessions", "state", "outputTransport", "providerInference"].sort().join("|") ||
+			review.grant.mode !== "fresh-only-confined-effects" ||
+			review.grant.oldResultUse !== "untrusted-no-replay-no-adoption" ||
+			review.grant.m07Tools !== "factory-confined-local" ||
+			review.grant.modelSessions !== "read-only" ||
+			review.grant.state !== "fresh-workspace-empty-store-no-resume" ||
+			review.grant.outputTransport !== "encrypted-fixed" ||
+			review.grant.providerInference !== "fixed-configured-provider")
+			fail("interrupted source review is not verified for the terminal source");
+		interruptedSourceReview = { source: { ...review.source }, sourceTree: review.sourceTree,
+			receiptSha256: review.receiptSha256 };
+	} else if (snapshot.interruptedSourceReview !== undefined)
+		fail("interrupted source review has no terminal gap");
+	// An executed run with no carry has an unknowable actor and billing suffix.
+	// A fresh launch must prove the next process enforces the isolation boundary
+	// even if the older carried action itself was read-only repair.
+	if (terminalInterruption && !launchVerified)
+		return { kind: "wait", reason: "quarantined-operation-needs-reconciliation" };
 	if (action.safety === "no-replay-until-reconciled") {
 		const fresh = snapshot.freshIndependentWork;
 		const actualVerified = Boolean(fresh && fresh.version === 1 &&
@@ -288,19 +432,6 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 			fresh.isolatedWorkspace === true && fresh.emptyStore === true &&
 			fresh.noPriorSessionResume === true && fresh.confinedGrants === true &&
 			fresh.nextTaskDependency === "independent");
-		const launch = snapshot.freshLaunchContract;
-		const launchVerified = Boolean(launch && launch.version === 1 &&
-			launch.kind === "verified-fresh-launch-contract" &&
-			launch.source.runId === terminalCarry.source.runId &&
-			launch.source.runAttempt === terminalCarry.source.runAttempt &&
-			launch.source.commit === terminalCarry.source.commit &&
-			launch.envelopeSha256 === terminalCarry.envelopeSha256 &&
-			launch.selectedTupleSha256 === status.selectedTupleSha256 &&
-			launch.pendingActionSha256 === actionSha &&
-			typeof launch.testedSourceCommit === "string" && /^[0-9a-f]{40}$/.test(launch.testedSourceCommit) &&
-			typeof launch.testedTree === "string" && /^[0-9a-f]{40}$/.test(launch.testedTree) &&
-			launch.requiresRuntimeAttestationBeforeModel === true &&
-			launch.mode === "fresh-work-only");
 		if (!actualVerified && !launchVerified)
 			return { kind: "wait", reason: "quarantined-operation-needs-reconciliation" };
 	}
@@ -325,9 +456,9 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 			plan.replacement.testedTree === prior.sourceTree ||
 			plan.boundary !== "new-isolated-workspace-no-prior-session-resume" ||
 			!launch || launch.version !== 1 || launch.kind !== "verified-fresh-launch-contract" ||
-			launch.source.runId !== terminalCarry.source.runId ||
-			launch.source.runAttempt !== terminalCarry.source.runAttempt ||
-			launch.source.commit !== terminalCarry.source.commit ||
+			launch.source.runId !== resumeSource.runId ||
+			launch.source.runAttempt !== resumeSource.runAttempt ||
+			launch.source.commit !== resumeSource.commit ||
 			launch.envelopeSha256 !== terminalCarry.envelopeSha256 ||
 			launch.selectedTupleSha256 !== status.selectedTupleSha256 ||
 			launch.pendingActionSha256 !== actionSha ||
@@ -343,12 +474,12 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 	if (action.kind === "restore-evidence" || action.kind === "retry-evidence-read" &&
 		action.evidenceRefs?.length)
 		return { kind: "restore-evidence", evidenceRefs: action.evidenceRefs ?? [] };
-	const resumeSource = { runId: terminalCarry.source.runId,
-		runAttempt: terminalCarry.source.runAttempt, commit: terminalCarry.source.commit };
 	const idempotencyKey = sha(canonical({ source: resumeSource,
 		envelopeSha256: terminalCarry.envelopeSha256,
 		contractId: status.contractId, selectedTupleSha256: status.selectedTupleSha256,
 		pendingActionSha256: actionSha,
+		...(terminalInterruption ? { terminalInterruption } : {}),
+		...(interruptedSourceReview ? { interruptedSourceReview } : {}),
 		...(actionProvenance ? { actionProvenance } : {}),
 		...(workflowRepair ? { workflowRepair } : {}) }));
 	if (dispatchRecord.state !== "not-requested") {
@@ -366,11 +497,14 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 		contractId: status.contractId, selectedTupleSha256: status.selectedTupleSha256,
 		pendingActionSha256: actionSha, actionKind: action.kind,
 		pendingAction: structuredClone(action),
+		...(terminalInterruption ? { terminalInterruption: structuredClone(terminalInterruption) } : {}),
+		...(interruptedSourceReview ? { interruptedSourceReview } : {}),
 		...(actionProvenance ? { actionProvenance } : {}),
 		...(workflowRepair ? { workflowRepair } : {}),
 		boundary: "new-isolated-workspace-no-prior-session-resume",
 		quarantinedOperationRefs: [...quarantinedOperationRefs],
-		m04TransactionQuarantined: action.kind === "reconcile-m04-transaction" } };
+		m04TransactionQuarantined: action.kind === "reconcile-m04-transaction" ||
+			Boolean(terminalInterruption) } };
 }
 
 export type ResumeTriggerReceipt = Readonly<
