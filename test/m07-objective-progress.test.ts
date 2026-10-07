@@ -689,6 +689,69 @@ test("indexed assessor repairs an old-schema response with the same grounded del
 	assert.equal(diagnostics[0].attempt, 1);
 });
 
+test("indexed prior citations get exact nested span feedback before a valid correction", async t => {
+	const f = await fixture(t);
+	const priorIssue: GroundedAssessmentProposal["issues"][number] = {
+		id: "prior-check", claim: "A prior result needs an independent check", status: "open",
+		classification: "necessary-verification", claimAtRisk: "The result is correct",
+		sourceRefs: [{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }],
+		implication: "A new result may settle the claim." };
+	const prior = await addPriorGroundingIndex(f, [], [priorIssue]);
+	const locator = prior.issueLocators[0]!;
+	const priorRef = { sourceId: locator.partName, startLine: locator.line, endLine: locator.line };
+	const correct = deltaReply("fulfilled", { id: priorIssue.id, priorRef });
+	const invalidPrior = structuredClone(correct) as any;
+	invalidPrior.groundedAssessmentDelta.resolutions[0].priorRef = `${locator.partName}:${locator.line}`;
+	const invalidEvidence = structuredClone(correct) as any;
+	invalidEvidence.groundedAssessmentDelta.resolutions[0].evidenceRefs = ["verification.json:1"];
+	const partRead: ReadReturnEvent = { toolName: "objective_evidence_read", status: "returned",
+		path: locator.partName, requested: {}, returned: { kind: "text", startLine: locator.line,
+			endLine: locator.line, truncated: false }, at: new Date().toISOString() };
+	const diagnostics: Array<{ validation: { path: string; detail?: string } }> = [];
+	let prompts = 0, dispatches = 0;
+	const runner = new FakeSessionRunner(({ message }) => {
+		prompts++;
+		if (prompts === 1) {
+			assert.match(message, /priorRef:\{sourceId,startLine,endLine\}/);
+			assert.match(message, /Do not use a 'part:line' string/);
+			return { text: JSON.stringify(invalidPrior),
+				readReturns: [...ranges(f), prior.indexRead, partRead] };
+		}
+		if (prompts === 2) {
+			assert.equal(diagnostics.length, 1);
+			assert.match(message, /groundedAssessmentDelta\/resolutions\/0\/priorRef/);
+			assert.match(message, /actual \{\"type\":\"string\"/);
+			assert.match(message, /"sourceId":"prior-grounding-issue-1.jsonl"/);
+			assert(!message.includes(`${locator.partName}:${locator.line}`),
+				"feedback uses host locators without replaying model-authored shorthand");
+			return { text: JSON.stringify(invalidEvidence) };
+		}
+		assert.equal(diagnostics.length, 2);
+		assert.match(message, /groundedAssessmentDelta\/resolutions\/0\/evidenceRefs\/0/);
+		return { text: JSON.stringify(correct) };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		evidenceAccess: prior.access,
+		groundingPolicy: { require: true, sourceKinds: prior.sourceKinds,
+			legacyOpenDetails: [], previousIssues: [priorIssue],
+			newEvidenceSourceIds: ["verification.json"],
+			priorGroundingIndex: prior.priorGroundingIndex },
+		capabilities: [{ scope: "two-target-existing", available: true,
+			description: "Synthetic adapter", limits: [] }],
+		recordValidationFailure: async diagnostic => { diagnostics.push(diagnostic); },
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { dispatches++; } });
+	assert.equal(prompts, 3);
+	assert.equal(dispatches, 0);
+	assert.equal(result.stopReason, "model-closure-unverified");
+	assert.equal(diagnostics[0]!.validation.path,
+		"/groundedAssessmentDelta/resolutions/0/priorRef");
+	assert.match(diagnostics[0]!.validation.detail ?? "", /"startLine":1,"endLine":1/);
+	assert.equal(diagnostics[1]!.validation.path,
+		"/groundedAssessmentDelta/resolutions/0/evidenceRefs/0");
+});
+
 test("indexed physical-gap feedback names the exact scope, field and host row before dispatch", async t => {
 	const f = await fixture(t);
 	const prior = await addPriorGroundingIndex(f, [], []);

@@ -9,6 +9,7 @@ import { workflowRepairFingerprint, workflowRepairState, type WorkflowRepairFail
 import type { StageRunRecord } from "../types.ts";
 import { HarnessError } from "../types.ts";
 import { mergeGroundedAssessmentDelta, validateGroundedAssessment, validatePriorGroundingIndex,
+	GroundingSpanError,
 	type GroundedAssessmentDelta, type GroundedAssessmentProposal,
 	type GroundedIssue, type GroundingContext, type GroundingSourceKind,
 	type GroundingSpan } from "./assessor-grounding.ts";
@@ -467,6 +468,8 @@ function parseAssessment(text: string, contract: OriginalObjectiveContractV1, ev
 		try {
 			merged = mergeGroundedAssessmentDelta(raw.groundedAssessmentDelta, grounding);
 		} catch (error) {
+			if (error instanceof GroundingSpanError)
+				assessmentFailure("prior grounding delta is invalid", error.pointer, error.safeDetail);
 			const detail = fixedGroundingDetail(error);
 			assessmentFailure("prior grounding delta is invalid", deltaValidationPath(detail), detail);
 		}
@@ -511,8 +514,12 @@ function parseAssessment(text: string, contract: OriginalObjectiveContractV1, ev
 	let groundedAssessment: GroundedAssessmentProposal | undefined;
 	if (grounding) {
 		try { groundedAssessment = validateGroundedAssessment(raw.groundedAssessment, grounding); }
-		catch (error) { assessmentFailure("grounded assessment is invalid", "$.groundedAssessment",
-			fixedGroundingDetail(error)); }
+		catch (error) {
+			if (error instanceof GroundingSpanError)
+				assessmentFailure("grounded assessment is invalid", error.pointer, error.safeDetail);
+			assessmentFailure("grounded assessment is invalid", "$.groundedAssessment",
+				fixedGroundingDetail(error));
+		}
 		const claims = groundedAssessment.issues.filter(item => item.status === "open").map(item => item.claim);
 		if (JSON.stringify(claims) !== JSON.stringify(raw.unresolvedDetails))
 			assessmentFailure("grounded issues do not match unresolved details", "$.unresolvedDetails");
@@ -784,12 +791,13 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			item.name === "prior-research-history-index.json");
 		const unavailableScopeIds = (capabilities ?? []).filter(item => !item.available)
 			.map(item => item.scope);
-		const groundedIssueSchema = "Each new issue has base fields {id,claim,status:'open'|'resolved',classification,sourceRefs:[{sourceId,startLine,endLine}],implication}. Add only the named fields for its classification: claimAtRisk for necessary-verification, optionalBasis for optional-method, or blockedScope and capabilityRef:{sourceId,startLine,endLine} for physical-capability-gap. Do not add a proof field. A resolved issue also needs resolution:{explanation,evidenceRefs}.";
+		const groundedIssueSchema = "Each new issue has base fields {id,claim,status:'open'|'resolved',classification,sourceRefs:[{sourceId,startLine,endLine}],implication}. Add only the named fields for its classification: claimAtRisk for necessary-verification, optionalBasis for optional-method, or blockedScope and capabilityRef:{sourceId,startLine,endLine} for physical-capability-gap. Do not add a proof field. A resolved issue also needs resolution:{explanation,evidenceRefs:[{sourceId,startLine,endLine}]}.";
 		const physicalGapRule = `For physical-capability-gap, blockedScope must be ONE exact unavailable registered scope ID, never a prose description or combined list: ${JSON.stringify(unavailableScopeIds)}. Cite that scope's own host-capability row with capabilityRef; if no registered ID matches a suspected limitation, do not invent a physical gap or claim the limitation is measured.`;
+		const priorResolutionSchema = "Each delta resolution is {id,priorRef:{sourceId,startLine,endLine},explanation,evidenceRefs:[{sourceId,startLine,endLine}]}. Copy priorRef exactly from the required prior-grounding-index locator: sourceId is that issue's partName and both line numbers equal its line. Do not use a 'part:line' string. Each evidenceRefs item is a separate span object for newly frozen evidence actually read in this session; do not use string shorthand or infer read credit from a path.";
 		const responseSchema = priorIndex ? [
 			"Return one strict JSON object only: version:1, decision:'fulfilled'|'continue'|'blocked', nonempty rationale, unique evidenceRefs from frozen file names, unique unresolvedObligations from the original obligation IDs, and groundedAssessmentDelta. Omit top-level unresolvedDetails and groundedAssessment; the host reconstructs the former from the authenticated prior issue index and this delta.",
-			"groundedAssessmentDelta is {version:1,kind:'grounded-assessment-delta',newIssues:[],resolutions:[],nextTask?,deliverableReady?}. Keep prior issues and legacy details by omission. A resolution requires id,priorRef,explanation,evidenceRefs with exact current-session returned ranges and new frozen evidence.",
-			groundedIssueSchema, physicalGapRule,
+			"groundedAssessmentDelta is {version:1,kind:'grounded-assessment-delta',newIssues:[],resolutions:[],nextTask?,deliverableReady?}. Keep prior issues and legacy details by omission.",
+			groundedIssueSchema, physicalGapRule, priorResolutionSchema,
 			"For continue, include top-level nextTask {objective,addresses,adapterScope} and delta.nextTask {obligationIds,addresses,adapterScope,decisionChangingHypothesis,expectedEvidence,sourceRefs}; they must identify the same feasible adapter and unresolved original obligations and address an open explicit requirement or necessary verification. For fulfilled, leave unresolvedObligations empty and omit both nextTask fields; for blocked, retain unresolvedObligations and omit both nextTask fields. deliverableReady is a proposal only and cannot close an open-ended mission."
 		] : grounding ? [
 			"Return one strict JSON object only: version:1, decision:'fulfilled'|'continue'|'blocked', nonempty rationale, unique evidenceRefs from frozen file names, unique unresolvedObligations from original obligation IDs, unique nonempty unresolvedDetails, and groundedAssessment. Do not supply groundedAssessmentDelta without a prior grounding index.",
@@ -826,7 +834,8 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				"Issue classes are explicit-requirement (cited user or supplied task requirement), necessary-verification (claimAtRisk), optional-method (cited optionalBasis), and physical-capability-gap (one exact unavailable registered blockedScope ID plus its host capabilityRef). Each new issue needs id, claim, status, classification, sourceRefs and implication. A proposed nextTask must identify an open decision-changing issue and expected evidence. Optional methods or unavailable equipment alone do not force another task.",
 				...(priorIndex ? [
 					`Authenticated prior grounding is in required index ${priorIndex.indexName} and ${priorIndex.partNames.length} retrievable parts. Read the index completely. Use its exact line locators to inspect a prior issue before changing its status. Omitted prior issues and legacy details are retained by the host. New frozen evidence IDs: ${JSON.stringify(grounding.newEvidenceSourceIds ?? [])}.`,
-					"Return groundedAssessmentDelta {version:1,kind:'grounded-assessment-delta',newIssues:[],resolutions:[],nextTask?,deliverableReady?} instead of groundedAssessment. A resolution is {id,priorRef,explanation,evidenceRefs}, where priorRef is exactly the indexed old issue line and evidenceRefs include new evidence. Do not echo old issue records or legacy details; the host merges and checks them. The host derives unresolvedDetails from all still-open issues."
+					"Return groundedAssessmentDelta {version:1,kind:'grounded-assessment-delta',newIssues:[],resolutions:[],nextTask?,deliverableReady?} instead of groundedAssessment. Do not echo old issue records or legacy details; the host merges and checks them. The host derives unresolvedDetails from all still-open issues.",
+					priorResolutionSchema
 				] : [
 					`Retain these prior unresolved details verbatim under groundedAssessment.legacyOpenDetails: ${JSON.stringify(grounding.legacyOpenDetails)}. Retain every prior issue ID and claim, changing open to resolved only with new evidence: ${JSON.stringify(grounding.previousIssues ?? [])}. Newly produced frozen evidence IDs: ${JSON.stringify(grounding.newEvidenceSourceIds ?? [])}.`,
 					"Add groundedAssessment {version:1,kind:'grounded-assessment-proposal',contractId,missionStatus:'open',issues,legacyOpenDetails,nextTask?,deliverableReady?}. Each issue needs id,claim,status:'open'|'resolved',classification,sourceRefs,implication. A resolved issue retains its ID and adds resolution {explanation,evidenceRefs} citing a selected result or host observation; only OPEN issue claims appear in unresolvedDetails. Classifications: explicit-requirement (user instruction or supplied task), necessary-verification (claimAtRisk), optional-method (optionalBasis cited in task/user text), physical-capability-gap (blockedScope and capabilityRef citing host observation). For continue, groundedAssessment.nextTask needs obligationIds identical to nextTask.addresses, OPEN issue addresses, adapterScope identical to nextTask.adapterScope, and decisionChangingHypothesis, expectedEvidence, sourceRefs; it must address an explicit requirement or necessary verification. An optional method or unavailable capability alone does not justify another task. deliverableReady, if supplied, is only {status:'proposed',ready:boolean,rationale,evidenceRefs,remainingIssueIds}; it never closes this open-ended mission. Do not claim a global optimum from finite tests."

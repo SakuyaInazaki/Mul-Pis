@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { mergeGroundedAssessmentDelta, validateGroundedAssessment, validatePriorGroundingIndex,
+	GroundingSpanError,
 	type GroundedAssessmentProposal,
 	type GroundingContext } from "../src/m07/assessor-grounding.ts";
 
@@ -60,11 +61,22 @@ test("accepts a traceable offline proposal without changing the open mission", (
 test("requires registered exact line ranges and class-specific evidence", () => {
 	const missingSource = proposal();
 	missingSource.issues[0]!.sourceRefs = [ref("unregistered")];
-	assert.throws(() => validateGroundedAssessment(missingSource, context), /registered frozen source/);
+	assert.throws(() => validateGroundedAssessment(missingSource, context), error =>
+		error instanceof GroundingSpanError && error.pointer === "/groundedAssessment/issues/0/sourceRefs/0" &&
+		error.safeDetail.includes("unregistered"));
+	const privateLooking = proposal();
+	privateLooking.issues[0]!.sourceRefs = [ref("PRIVATEACCOUNTID123")];
+	assert.throws(() => validateGroundedAssessment(privateLooking, context), error =>
+		error instanceof GroundingSpanError &&
+		error.safeDetail.includes("unregistered-or-invalid") &&
+		!error.safeDetail.includes("PRIVATEACCOUNTID123"));
 
 	const badRange = proposal();
 	badRange.issues[0]!.sourceRefs = [ref("user-directive", 2, 3)];
-	assert.throws(() => validateGroundedAssessment(badRange, context), /registered frozen source/);
+	assert.throws(() => validateGroundedAssessment(badRange, context), error =>
+		error instanceof GroundingSpanError && error.pointer === "/groundedAssessment/issues/0/sourceRefs/0" &&
+		error.safeDetail.includes('"endLineMax":2') &&
+		error.safeDetail.includes('"endLine":3'));
 
 	const unsupportedRequirement = proposal();
 	unsupportedRequirement.issues[0]!.sourceRefs = [ref("selected-result")];

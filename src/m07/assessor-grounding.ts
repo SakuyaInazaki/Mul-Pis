@@ -20,6 +20,18 @@ export interface GroundingSpan {
 	endLine: number;
 }
 
+/** Fixed, model-safe structural feedback. Paths identify a JSON value in the
+ * rejected reply; source bounds come only from frozen host evidence. */
+export class GroundingSpanError extends Error {
+	readonly pointer: string;
+	readonly safeDetail: string;
+	constructor(pointer: string, safeDetail: string) {
+		super("assessor-grounding: invalid source span");
+		this.pointer = pointer;
+		this.safeDetail = safeDetail;
+	}
+}
+
 export type GroundedIssue = {
 	id: string;
 	claim: string;
@@ -169,20 +181,43 @@ function onlyKeys(value: Record<string, unknown>, allowed: readonly string[]): b
 	return Object.keys(value).every(key => allowed.includes(key));
 }
 
-function span(value: unknown, sources: GroundingContext["sources"]): GroundingSpan {
+function spanError(value: unknown, sources: GroundingContext["sources"], pointer: string,
+	expectedLocator?: GroundingSpan): never {
+	const shape = value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+	const fields = obj(value) ? value : {};
+	const actualSourceId = id(fields.sourceId) && Object.hasOwn(sources, fields.sourceId) ?
+		fields.sourceId : undefined;
+	const source = actualSourceId ? sources[actualSourceId] : undefined;
+	const expected = expectedLocator ? { sourceId: expectedLocator.sourceId,
+		startLine: expectedLocator.startLine, endLine: expectedLocator.endLine } :
+		source ? { sourceId: actualSourceId, startLineMin: 1, endLineMax: source.lineCount } :
+			{ sourceId: "one registered frozen source ID", startLineMin: 1 };
+	const actual = { type: shape,
+		...(actualSourceId ? { sourceId: actualSourceId } : {}),
+		...(fields.sourceId !== undefined && !actualSourceId ?
+			{ sourceIdStatus: "unregistered-or-invalid" } : {}),
+		...(Number.isSafeInteger(fields.startLine) ? { startLine: fields.startLine } : {}),
+		...(Number.isSafeInteger(fields.endLine) ? { endLine: fields.endLine } : {}) };
+	throw new GroundingSpanError(pointer,
+		`Expected span object {sourceId,startLine,endLine} ${JSON.stringify(expected)}; actual ${JSON.stringify(actual)}`);
+}
+function span(value: unknown, sources: GroundingContext["sources"], pointer: string,
+	expectedLocator?: GroundingSpan): GroundingSpan {
 	if (!obj(value) || !onlyKeys(value, ["sourceId", "startLine", "endLine"]) || !id(value.sourceId) ||
 		!Number.isSafeInteger(value.startLine) || !Number.isSafeInteger(value.endLine))
-		fail("invalid source span");
+		spanError(value, sources, pointer, expectedLocator);
 	const source = sources[value.sourceId];
 	if (!source || !Number.isSafeInteger(source.lineCount) || source.lineCount < 1 ||
 		(value.startLine as number) < 1 || (value.endLine as number) < (value.startLine as number) ||
-		(value.endLine as number) > source.lineCount) fail("span is outside a registered frozen source");
+		(value.endLine as number) > source.lineCount ||
+		expectedLocator && !isDeepStrictEqual(expectedLocator, value))
+		spanError(value, sources, pointer, expectedLocator);
 	return value as unknown as GroundingSpan;
 }
 
-function spans(value: unknown, sources: GroundingContext["sources"]): GroundingSpan[] {
+function spans(value: unknown, sources: GroundingContext["sources"], pointer: string): GroundingSpan[] {
 	if (!Array.isArray(value) || !value.length) fail("source references are required");
-	const refs = value.map(item => span(item, sources));
+	const refs = value.map((item, index) => span(item, sources, `${pointer}/${index}`));
 	if (new Set(refs.map(item => `${item.sourceId}:${item.startLine}:${item.endLine}`)).size !== refs.length)
 		fail("duplicate source reference");
 	return refs;
@@ -195,7 +230,8 @@ function ids(value: unknown): string[] {
 }
 
 /** Validates a proposal's traceability and shape only, never the truth of cited text. */
-export function validateGroundedAssessment(value: unknown, context: GroundingContext): GroundedAssessmentProposal {
+export function validateGroundedAssessment(value: unknown, context: GroundingContext,
+	deltaPriorCount?: number): GroundedAssessmentProposal {
 	if (!obj(value) || !onlyKeys(value, ["version", "kind", "contractId", "missionStatus", "issues",
 		"legacyOpenDetails", "nextTask", "deliverableReady"]) ||
 		value.version !== 1 || value.kind !== "grounded-assessment-proposal" ||
@@ -206,7 +242,10 @@ export function validateGroundedAssessment(value: unknown, context: GroundingCon
 	const issueIds = new Set<string>();
 	const openIssueIds = new Set<string>();
 	const priorIssues = new Map((context.previousIssues ?? []).map(item => [item.id, item]));
-	for (const issue of value.issues) {
+	for (const [issueIndex, issue] of value.issues.entries()) {
+		const issuePointer = deltaPriorCount === undefined || issueIndex < deltaPriorCount ?
+			`/groundedAssessment/issues/${issueIndex}` :
+			`/groundedAssessmentDelta/newIssues/${issueIndex - deltaPriorCount}`;
 		if (!obj(issue) || !onlyKeys(issue, ["id", "claim", "status", "classification", "sourceRefs", "implication",
 			"claimAtRisk", "optionalBasis", "capabilityRef", "blockedScope", "resolution"]) ||
 			!id(issue.id) || issueIds.has(issue.id) || !prose(issue.claim) ||
@@ -229,13 +268,14 @@ export function validateGroundedAssessment(value: unknown, context: GroundingCon
 			if (!obj(issue.resolution) || !onlyKeys(issue.resolution, ["explanation", "evidenceRefs"]) ||
 				!prose(issue.resolution.explanation)) fail("resolved issue needs an evidence-backed explanation");
 			if (!prior || prior.status === "open") {
-				const resolutionRefs = spans(issue.resolution.evidenceRefs, context.sources);
+				const resolutionRefs = spans(issue.resolution.evidenceRefs, context.sources,
+					`${issuePointer}/resolution/evidenceRefs`);
 				if (!resolutionRefs.some(ref => ["selected-evidence", "host-capability"].includes(context.sources[ref.sourceId]!.kind)))
 					fail("resolution needs a selected result or host observation");
 			}
 		}
 		if (prior) continue; // The prior record was already authenticated; only a new resolution needs new proof.
-		const refs = spans(issue.sourceRefs, context.sources);
+		const refs = spans(issue.sourceRefs, context.sources, `${issuePointer}/sourceRefs`);
 		switch (issue.classification) {
 			case "explicit-requirement":
 				if (!refs.some(ref => ["user-instruction", "supplied-task"].includes(context.sources[ref.sourceId]!.kind)))
@@ -253,7 +293,7 @@ export function validateGroundedAssessment(value: unknown, context: GroundingCon
 				if (!prose(issue.blockedScope) || !issue.capabilityRef ||
 					!context.capabilities[issue.blockedScope] || context.capabilities[issue.blockedScope]!.available)
 					fail("physical gap needs an unavailable registered capability");
-				const ref = span(issue.capabilityRef, context.sources);
+				const ref = span(issue.capabilityRef, context.sources, `${issuePointer}/capabilityRef`);
 				if (context.sources[ref.sourceId]!.kind !== "host-capability")
 					fail("physical gap needs a host-capability source");
 				if (context.capabilityLocators) {
@@ -289,14 +329,18 @@ export function validateGroundedAssessment(value: unknown, context: GroundingCon
 		const addresses = ids(task.addresses);
 		if (!addresses.length || addresses.some(item => !openIssueIds.has(item)))
 			fail("next task must address an open grounded issue");
-		spans(task.sourceRefs, context.sources);
+		spans(task.sourceRefs, context.sources,
+			deltaPriorCount === undefined ? "/groundedAssessment/nextTask/sourceRefs" :
+				"/groundedAssessmentDelta/nextTask/sourceRefs");
 	}
 	if (value.deliverableReady !== undefined) {
 		const finding = value.deliverableReady;
 		if (!obj(finding) || !onlyKeys(finding, ["status", "ready", "rationale", "evidenceRefs",
 			"remainingIssueIds"]) || finding.status !== "proposed" || typeof finding.ready !== "boolean" ||
 			!prose(finding.rationale)) fail("deliverable readiness is only a proposed finding");
-		spans(finding.evidenceRefs, context.sources);
+		spans(finding.evidenceRefs, context.sources,
+			deltaPriorCount === undefined ? "/groundedAssessment/deliverableReady/evidenceRefs" :
+				"/groundedAssessmentDelta/deliverableReady/evidenceRefs");
 		const remaining = ids(finding.remainingIssueIds);
 		if (remaining.length !== openIssueIds.size || remaining.some(item => !openIssueIds.has(item)))
 			fail("deliverable finding must disclose every open issue");
@@ -315,17 +359,19 @@ export function mergeGroundedAssessmentDelta(value: unknown, context: GroundingC
 	const priorIds = new Set(previous.map(item => item.id));
 	const issues = previous.map(item => structuredClone(item));
 	const resolutions = new Set<string>();
-	for (const raw of value.resolutions) {
+	for (const [resolutionIndex, raw] of value.resolutions.entries()) {
 		if (!obj(raw) || !onlyKeys(raw, ["id", "priorRef", "explanation", "evidenceRefs"]) ||
 			!id(raw.id) || resolutions.has(raw.id) || !prose(raw.explanation))
 			fail("invalid prior issue resolution");
 		resolutions.add(raw.id);
 		const prior = issues.find(item => item.id === raw.id);
 		const locator = context.priorIssueLocators?.[raw.id];
-		const priorRef = span(raw.priorRef, context.sources);
-		if (!prior || prior.status !== "open" || !locator || !isDeepStrictEqual(locator, priorRef))
+		if (!prior || prior.status !== "open" || !locator)
 			fail("resolution lacks its authenticated prior issue locator");
-		const evidenceRefs = spans(raw.evidenceRefs, context.sources);
+		span(raw.priorRef, context.sources,
+			`/groundedAssessmentDelta/resolutions/${resolutionIndex}/priorRef`, locator);
+		const evidenceRefs = spans(raw.evidenceRefs, context.sources,
+			`/groundedAssessmentDelta/resolutions/${resolutionIndex}/evidenceRefs`);
 		if (!evidenceRefs.some(ref => (context.newEvidenceSourceIds ?? []).includes(ref.sourceId)))
 			fail("newly resolved issue needs new frozen evidence");
 		prior.status = "resolved";
@@ -340,6 +386,7 @@ export function mergeGroundedAssessmentDelta(value: unknown, context: GroundingC
 		contractId: context.contractId, missionStatus: "open", issues,
 		legacyOpenDetails: [...context.legacyOpenDetails],
 		...(value.nextTask === undefined ? {} : { nextTask: value.nextTask }),
-		...(value.deliverableReady === undefined ? {} : { deliverableReady: value.deliverableReady }) }, context);
+		...(value.deliverableReady === undefined ? {} : { deliverableReady: value.deliverableReady }) },
+		context, previous.length);
 	return { proposal, delta: value as unknown as GroundedAssessmentDelta };
 }
