@@ -19,7 +19,7 @@ import { runMeasuredEvidenceHandoff } from "../src/m07/evidence-finalization.ts"
 import { assessAndAdvanceOriginalObjective, createOriginalObjective, isCurrentObjectiveStopReason,
 	objectiveProgress, runOriginalObjectiveLoop,
 	writeObjectiveProgress, writeOriginalObjectiveContract } from "../src/m07/objective-progress.ts";
-import type { CurrentObjectiveStopReason, HostPendingActionFactsV1, ObjectiveProgressV1,
+import type { CurrentObjectiveStopReason, HostPendingActionFactsV1, ObjectiveCapabilityV1, ObjectiveProgressV1,
 	OriginalObjectiveContractV1, ObjectiveAssessmentValidationDiagnosticV1 } from "../src/m07/objective-progress.ts";
 import type { GroundedIssue, GroundingSourceKind } from "../src/m07/assessor-grounding.ts";
 import type { BeginGoalInput, CurrentGoal, M07TaskRecord, TaskSpecInput } from "../src/m07/types.ts";
@@ -254,6 +254,40 @@ function assessorEvidenceAccess(evidence: readonly { name: string; file: string 
 		/^prior-research-history-catalog-[0-9]+\.json$/.test(item.name) ||
 		/^prior-grounding-part-[0-9]+\.jsonl$/.test(item.name) ?
 			"retrievable" : "required"]));
+}
+
+const OBJECTIVE_SUPPORTED_TASK_SCOPES = ["two-target-existing", "registered-csr-experiment"] as const;
+
+function observedUnavailableCapabilities(adapters: readonly ObjectiveCapabilityV1[],
+	unsupported: readonly string[], limits: Readonly<Record<string, number>>): ObjectiveCapabilityV1[] {
+	const observations: ObjectiveCapabilityV1[] = unsupported.map((description, index) => ({
+		scope: `host.unavailable.observation-${index + 1}`, available: false,
+		description: `Observed unsupported capability: ${description}`,
+		limits: ["This observation limits the current host; it does not redefine the original task"] }));
+	const numeric: ObjectiveCapabilityV1[] = Object.entries(limits)
+		.filter((entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1]))
+		.map(([key, value]) => {
+			const bound = key.startsWith("min") ? "below" : "above";
+			const slug = key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`);
+			return { scope: `host.unavailable.${bound}-${slug}`, available: false,
+				description: `Outside the current registered ${key} bound (${bound} ${value})`,
+				limits: [`registeredLimits.${key}=${value}`,
+					"This is an executor allocation bound, not a scientific requirement"] };
+		});
+	const rows = [...adapters.filter(item => !item.available), ...observations, ...numeric];
+	if (new Set(rows.map(item => item.scope)).size !== rows.length)
+		fail("unavailable host capability scope collision");
+	return rows;
+}
+
+function frozenCapabilityLocators(hostText: string, unavailable: readonly ObjectiveCapabilityV1[]) {
+	const lines = hostText.split("\n");
+	return Object.fromEntries(unavailable.map(item => {
+		const scopeRow = `"scope": ${JSON.stringify(item.scope)},`;
+		const hits = lines.flatMap((line, index) => line.trim() === scopeRow ? [index + 1] : []);
+		if (hits.length !== 1) fail("unavailable capability scope is not uniquely frozen in host evidence");
+		return [item.scope, { sourceId: "host-capabilities.json", startLine: hits[0]!, endLine: hits[0]! }];
+	}));
 }
 
 /** The complete prior issue record stays available under the existing per-file
@@ -2869,18 +2903,42 @@ async function main() {
 				"Pursue the strongest attainable strategy using actual available hardware and resources; unavailable optional equipment alone does not settle the task."];
 			let registeredContract: ReturnType<typeof inspectCsrTaskContract> | undefined;
 			try { registeredContract = inspectCsrTaskContract(originalText, registeredTaskText); } catch { /* Explicit unavailable capability; the model may choose other feasible work. */ }
+			const observedLimits = { ...CSR_EXPERIMENT_LIMITS,
+				maxThreads: Math.min(os.availableParallelism(), CSR_EXPERIMENT_LIMITS.maxThreads),
+				maxSourceBytes: 128_000, maxPlanBytes: 16_000, maxVerificationBytes: 1_000_000 };
+			const unsupportedObservations = ["GPU execution", "privileged hardware counters"];
+			const adapterCapabilities: ObjectiveCapabilityV1[] = [
+				{ scope: "two-target-existing", available: false,
+					description: "Historical in-process adapter, retained only for original-source diagnostics",
+					limits: ["Use registered-csr-experiment for fresh execution of the same original bodies or wider permitted variants; model must choose the plan"] },
+				{ scope: "registered-csr-experiment", available: Boolean(registeredContract),
+					description: "Model-authored registered strategies/cases with a separate independent CPU checker and per-target measurements",
+					limits: [`observed CPU parallelism ${os.availableParallelism()}`,
+						registeredContract?.sourceScope ?? "task contract shape is unsupported",
+						"Read host-capabilities.json for the complete measured capability and allocation limits"] },
+				{ scope: "outside-current-adapter", available: false,
+					description: "Changes or equipment outside the verified source and measurement adapters",
+					limits: ["requires a different verifier and capability proof"] },
+			];
+			const unavailableCapabilities = observedUnavailableCapabilities(adapterCapabilities,
+				unsupportedObservations, observedLimits);
+			const adapterScopes = new Set(adapterCapabilities.map(item => item.scope));
+			const objectiveCapabilities: ObjectiveCapabilityV1[] = [...adapterCapabilities,
+				...unavailableCapabilities.filter(item => !adapterScopes.has(item.scope))];
 			const observedHost = { version: 1, kind: "observed-private-execution-capabilities",
 				platform: os.platform(), architecture: os.arch(), cpuModel: os.cpus()[0]?.model ?? "unknown",
 				availableParallelism: os.availableParallelism(), compiler: "/usr/bin/g++", compileFlags: FLAGS,
-				registeredLimits: { ...CSR_EXPERIMENT_LIMITS, maxThreads: Math.min(os.availableParallelism(), CSR_EXPERIMENT_LIMITS.maxThreads),
-					maxSourceBytes: 128_000, maxPlanBytes: 16_000, maxVerificationBytes: 1_000_000 },
+				registeredLimits: observedLimits,
 				registeredContract: registeredContract ?? null,
 				isolation: "Verified non-root uid; separate network/pid/ipc namespaces; credential-free environment; read-only evaluator binaries/source during execution and separate writable temporary scratch",
 				taskTools: "Confined text-file read/write/edit only; host compiles and executes candidate separately",
-				unsupported: ["GPU execution", "privileged hardware counters", "equipment absent from this capability descriptor"],
-				claimLimit: "Observed local capability only; unavailable optional equipment does not establish mission completion" };
+				unsupported: unsupportedObservations,
+				unavailableCapabilities,
+				claimLimit: "Observed local capability only. Equipment absent from this descriptor is unverified, not proven unavailable. Unavailable optional equipment does not establish mission completion" };
+			const observedHostText = `${JSON.stringify(observedHost, null, 2)}\n`;
+			const capabilityLocators = frozenCapabilityLocators(observedHostText, unavailableCapabilities);
 			const capabilityFile = path.join(priorSeedDir, "host-capabilities.json");
-			await writeFile(capabilityFile, `${JSON.stringify(observedHost, null, 2)}\n`, { mode: 0o600 });
+			await writeFile(capabilityFile, observedHostText, { mode: 0o600 });
 			await copyFile(capabilityFile, path.join(outputDir, "execution-capabilities.json"));
 			priorSeedInputs.push("objective-seeds/host-capabilities.json");
 			const experimentInstructions = [
@@ -2890,19 +2948,6 @@ async function main() {
 				registeredContract?.timingScope ?? "No registered measurement capability verified.",
 				"Total bounded timed work is sum(nonzeros * thread-choice-count * (1 + warmups + repeats) * (registered-strategy-count + 2)). Every strategy must be registered. Retain limitations and feasible untested work in machine-readable evidence.",
 			].join(" ");
-			const objectiveCapabilities = [
-				{ scope: "two-target-existing" as const, available: false,
-					description: "Historical in-process adapter, retained only for original-source diagnostics",
-					limits: ["Use registered-csr-experiment for fresh execution of the same original bodies or wider permitted variants; model must choose the plan"] },
-				{ scope: "registered-csr-experiment" as const, available: Boolean(registeredContract),
-					description: "Model-authored registered strategies/cases with a separate independent CPU checker and per-target measurements",
-					limits: [`observed CPU parallelism ${os.availableParallelism()}`,
-						registeredContract?.sourceScope ?? "task contract shape is unsupported",
-						"Read host-capabilities.json for the complete measured capability and allocation limits"] },
-				{ scope: "outside-current-adapter" as const, available: false,
-					description: "Changes or equipment outside the verified source and measurement adapters",
-					limits: ["requires a different verifier and capability proof"] },
-			];
 			const importBoundedRuns: ObjectiveProgressV1["boundedRuns"] = [];
 			const importAssessmentEvidence: Array<{ name: string; file: string }> = [];
 			let provenanceImportSummary: Record<string, unknown> | undefined;
@@ -3166,7 +3211,7 @@ async function main() {
 				path.join(campaignRoot, "prior-grounding-evidence"), priorGroundingBase);
 			priorEvidence.push(...priorGrounding.evidence);
 			const priorGroundingPolicy = { ...assessorGroundingPolicy(priorEvidence, previousCheckpoint),
-				priorGroundingIndex: priorGrounding.priorGroundingIndex };
+				priorGroundingIndex: priorGrounding.priorGroundingIndex, capabilityLocators };
 			if (previousBundle["m04-adopted-knowledge.json"])
 				await writeFile(path.join(priorSeedDir, "prior-m04-knowledge.json"), previousBundle["m04-adopted-knowledge.json"], { mode: 0o600 });
 			statusPhase = "prior-objective-assessment";
@@ -3187,7 +3232,7 @@ async function main() {
 					abort.signal.aborted ? "cancelled" : "admitted",
 				advanceAdmission: () => budget.snapshot().stopped ? campaignObjectiveStop(budget.snapshot().stopReason) ??
 					"assessment-failed" : abort.signal.aborted ? "cancelled" : "admitted",
-				supportedTaskScopes: ["two-target-existing", "registered-csr-experiment"],
+				supportedTaskScopes: [...OBJECTIVE_SUPPORTED_TASK_SCOPES],
 				capabilities: objectiveCapabilities, userOverrides,
 				recordAssessment: async assessment => {
 					await writeCurrentObjectiveProgress(campaignObjectiveProgress(originalObjective,
@@ -3665,7 +3710,7 @@ async function main() {
 					evidence.push(...stagedGrounding.evidence);
 					const groundedPolicy = { ...assessorGroundingPolicy(evidence, previousCheckpoint,
 						latestGrounding, selectedEvidenceNew),
-						priorGroundingIndex: stagedGrounding.priorGroundingIndex };
+						priorGroundingIndex: stagedGrounding.priorGroundingIndex, capabilityLocators };
 					const assessmentAdmission = "admitted";
 					let objectiveStep;
 					try { objectiveStep = await assessAndAdvanceOriginalObjective({
@@ -3684,7 +3729,7 @@ async function main() {
 						advanceAdmission: () => budget.snapshot().stopped ?
 							campaignObjectiveStop(budget.snapshot().stopReason) ?? "assessment-failed" :
 							abort.signal.aborted ? "cancelled" : "admitted",
-						supportedTaskScopes: ["two-target-existing", "registered-csr-experiment"],
+						supportedTaskScopes: [...OBJECTIVE_SUPPORTED_TASK_SCOPES],
 						userOverrides, capabilities: objectiveCapabilities,
 						recordAssessment: async assessment => {
 							objectiveAssessment = assessment;
@@ -4334,6 +4379,7 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	observedRequestContract, archivedRequestContract,
 	assessorGroundingPolicy,
 	assessorEvidenceAccess,
+	observedUnavailableCapabilities, frozenCapabilityLocators, OBJECTIVE_SUPPORTED_TASK_SCOPES,
 	stagePriorGroundingRecords,
 	canonicalUnresolvedOperationRefs, qualifiedOperationRef, reservedCanonicalOperationRefs,
 	registeredSourceShape, parseRegisteredCheckerOutput, validateContinuationSeed, rangeReadableHistory,

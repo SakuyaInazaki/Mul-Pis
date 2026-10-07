@@ -689,6 +689,75 @@ test("indexed assessor repairs an old-schema response with the same grounded del
 	assert.equal(diagnostics[0].attempt, 1);
 });
 
+test("indexed physical-gap feedback names the exact scope, field and host row before dispatch", async t => {
+	const f = await fixture(t);
+	const prior = await addPriorGroundingIndex(f, [], []);
+	const scope = "host.unavailable.observation-1";
+	const hostName = "host-capabilities.json";
+	const hostText = `{\n  "unavailableCapabilities": [\n    {"scope":"${scope}","available":false}\n  ]\n}\n`;
+	const hostFile = path.join(f.root, hostName);
+	await writeFile(hostFile, hostText);
+	f.evidence.push({ name: hostName, file: hostFile });
+	const hostRow = { sourceId: hostName, startLine: 3, endLine: 3 };
+	const requiredRead: ReadReturnEvent = { toolName: "objective_evidence_read", status: "returned",
+		path: hostName, requested: {}, returned: { kind: "text", startLine: 1,
+			endLine: 5, truncated: false }, at: new Date().toISOString() };
+	const necessary = { id: "verify-result", claim: "Check a proposed result", status: "open" as const,
+		classification: "necessary-verification" as const, claimAtRisk: "The proposed result is correct.",
+		sourceRefs: [{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }],
+		implication: "A check may change selection." };
+	const physical = { id: "unavailable-observation", claim: "One host observation is unavailable",
+		status: "open" as const, classification: "physical-capability-gap" as const,
+		sourceRefs: [hostRow], implication: "Do not infer an unmeasured value.",
+		blockedScope: scope, capabilityRef: hostRow };
+	const corrected = { version: 1, decision: "continue", rationale: "Choose a feasible check.",
+		evidenceRefs: ["candidate.cpp", "verification.json"],
+		unresolvedObligations: ["original-task"],
+		nextTask: { objective: "Run a synthetic independent check", addresses: ["original-task"],
+			adapterScope: "two-target-existing" },
+		groundedAssessmentDelta: { version: 1, kind: "grounded-assessment-delta",
+			newIssues: [necessary, physical], resolutions: [],
+			nextTask: { obligationIds: ["original-task"], addresses: [necessary.id],
+				adapterScope: "two-target-existing",
+				decisionChangingHypothesis: "The new check could change selection.",
+				expectedEvidence: "An independent result", sourceRefs: necessary.sourceRefs } } };
+	const invalid = structuredClone(corrected);
+	invalid.groundedAssessmentDelta.newIssues[1] = { ...physical,
+		blockedScope: "a descriptive unavailable device" };
+	const diagnostics: Array<{ validation: { path: string; detail?: string } }> = [];
+	let prompts = 0, dispatched = 0;
+	const runner = new FakeSessionRunner(({ message }) => {
+		prompts++;
+		if (prompts === 1) {
+			assert.match(message, /blockedScope must be ONE exact unavailable registered scope ID/);
+			assert.match(message, /status:'open'\|'resolved'/);
+			assert.match(message, /host\.unavailable\.observation-1/);
+			return { text: JSON.stringify(invalid), readReturns: [...ranges(f), prior.indexRead, requiredRead] };
+		}
+		assert.equal(diagnostics.length, 1, "private validator capture precedes correction");
+		assert.match(message, /Rejected field path: \$\.groundedAssessmentDelta\.newIssues/);
+		assert.match(message, /physical gap needs an unavailable registered capability/);
+		return { text: JSON.stringify(corrected) };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		evidenceAccess: prior.access,
+		groundingPolicy: { require: true, sourceKinds: { ...prior.sourceKinds,
+			[hostName]: "host-capability" }, legacyOpenDetails: [], previousIssues: [],
+			priorGroundingIndex: prior.priorGroundingIndex,
+			capabilityLocators: { [scope]: hostRow } },
+		capabilities: [{ scope: "two-target-existing", available: true,
+			description: "Synthetic adapter", limits: [] },
+			{ scope, available: false, description: "Synthetic unavailable observation", limits: [] }],
+		recordValidationFailure: async item => { diagnostics.push(item); },
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { dispatched++; } });
+	assert.equal(prompts, 2);
+	assert.equal(dispatched, 1);
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.equal(diagnostics[0]!.validation.path, "$.groundedAssessmentDelta.newIssues");
+});
+
 test("indexed assessor retains a precise nested validator path before correction", async t => {
 	const f = await fixture(t);
 	const prior = await addPriorGroundingIndex(f, [], []);

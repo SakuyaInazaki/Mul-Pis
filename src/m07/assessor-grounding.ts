@@ -75,6 +75,9 @@ export interface GroundingContext {
 	contractId: string;
 	sources: Readonly<Record<string, GroundingSource>>;
 	capabilities: Readonly<Record<string, { available: boolean }>>;
+	/** When supplied by the host, an unavailable scope must cite its own
+	 * frozen, line-addressable observation rather than any capability line. */
+	capabilityLocators?: Readonly<Record<string, GroundingSpan>>;
 	legacyOpenDetails: readonly string[];
 	/** Earlier grounded issues stay open until a separate resolution review exists. */
 	previousIssueIds?: readonly string[];
@@ -253,6 +256,12 @@ export function validateGroundedAssessment(value: unknown, context: GroundingCon
 				const ref = span(issue.capabilityRef, context.sources);
 				if (context.sources[ref.sourceId]!.kind !== "host-capability")
 					fail("physical gap needs a host-capability source");
+				if (context.capabilityLocators) {
+					const locator = context.capabilityLocators[issue.blockedScope];
+					if (!locator || ref.sourceId !== locator.sourceId ||
+						ref.startLine > locator.startLine || ref.endLine < locator.endLine)
+						fail("physical gap citation must cover the registered unavailable capability");
+				}
 				break;
 			}
 			default: fail("unknown issue classification");

@@ -5,9 +5,10 @@
  * No ref update or model request occurs here.
  */
 import { createInterface } from "node:readline";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { lstat, open, readFile, realpath } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { MissionHostPreparationError, prepareAuthenticatedResumeRequest } from "../src/runner/mission-host-adapter.ts";
@@ -18,12 +19,27 @@ import { CARRY_LOGICAL_BYTES, CARRY_SEGMENT_FILE_BYTES, CARRY_SEGMENT_RAW_BYTES,
 import { HarnessError } from "../src/types.ts";
 
 type Args = { source: string; seed: string; publicKey: string;
-	journalDir: string; outputPrivate: string; readOnly: boolean; repairPlanPrivate?: string;
+	journalDir: string; outputPrivate: string; readOnly: boolean; recoverReserved: boolean;
+	repairPlanPrivate?: string;
 	interruptedSourceReviewPrivate?: string; resultOnlyRepairReviewPrivate?: string };
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 class PrivateBridgeError extends Error {
 	readonly reasonCode: string;
-	constructor(reasonCode: string) { super(reasonCode); this.reasonCode = reasonCode; }
+	readonly osErrorCode?: string;
+	constructor(reasonCode: string, cause?: unknown) {
+		super(reasonCode); this.reasonCode = reasonCode;
+		this.osErrorCode = privateOsErrorCode(cause);
+	}
+}
+const SAFE_OS_CODES = ["EACCES", "EPERM", "ENOSPC", "EDQUOT", "EROFS", "EIO",
+	"EMFILE", "ENFILE", "ENOENT", "ENOTDIR", "EEXIST"] as const;
+function privateOsErrorCode(error: unknown): typeof SAFE_OS_CODES[number] | undefined {
+	try {
+		const code = error && (typeof error === "object" || typeof error === "function") ?
+			(error as { code?: unknown }).code : undefined;
+		return typeof code === "string" && SAFE_OS_CODES.some(value => value === code) ?
+			code as typeof SAFE_OS_CODES[number] : undefined;
+	} catch { return undefined; }
 }
 type ArtifactSidecarFile = { name: string; file: string; sha256: string };
 type ArtifactFileReply = { file: string; sha256: string;
@@ -84,10 +100,12 @@ function parseArgs(values: string[]): Args {
 	const option = new Map<string, string>();
 	let connectorStdio = false;
 	let readOnly = false;
+	let recoverReserved = false;
 	for (let i = 0; i < values.length; i++) {
 		const name = values[i]!;
 		if (name === "--connector-stdio") { connectorStdio = true; continue; }
 		if (name === "--read-only") { readOnly = true; continue; }
+		if (name === "--recover-reserved") { recoverReserved = true; continue; }
 		if (!name.startsWith("--") || option.has(name) || i + 1 >= values.length)
 			throw new Error("invalid private resume arguments");
 		option.set(name, values[++i]!);
@@ -95,18 +113,18 @@ function parseArgs(values: string[]): Args {
 	const keys = ["--source", "--seed", "--public-key", "--journal-dir", "--output-private"];
 	const allowed = [...keys, "--repair-plan-private", "--interrupted-source-review-private",
 		"--result-only-repair-review-private"];
-	if (!connectorStdio || keys.some(key => !option.has(key)) ||
+	if (!connectorStdio || readOnly && recoverReserved || keys.some(key => !option.has(key)) ||
 		[...option.keys()].some(key => !allowed.includes(key)))
 		throw new Error("missing private resume arguments");
 	const result = { source: option.get("--source")!, seed: option.get("--seed")!,
 		publicKey: option.get("--public-key")!, journalDir: option.get("--journal-dir")!,
-		outputPrivate: option.get("--output-private")!, readOnly,
+		outputPrivate: option.get("--output-private")!, readOnly, recoverReserved,
 		...(option.has("--repair-plan-private") ? { repairPlanPrivate: option.get("--repair-plan-private")! } : {}),
 		...(option.has("--interrupted-source-review-private") ?
 			{ interruptedSourceReviewPrivate: option.get("--interrupted-source-review-private")! } : {}),
 		...(option.has("--result-only-repair-review-private") ?
 			{ resultOnlyRepairReviewPrivate: option.get("--result-only-repair-review-private")! } : {}) };
-	if (Object.entries(result).some(([key, value]) => key !== "readOnly" &&
+	if (Object.entries(result).some(([key, value]) => key !== "readOnly" && key !== "recoverReserved" &&
 		!path.isAbsolute(String(value)))) throw new Error("private resume paths must be absolute");
 	if (underRepo(result.journalDir) || underRepo(result.outputPrivate) ||
 		(result.repairPlanPrivate !== undefined && underRepo(result.repairPlanPrivate)) ||
@@ -263,44 +281,78 @@ function connectorBridge(): { request: typeof fetch;
 
 /** The second argument is used only by synthetic signed-seed tests. The CLI
  * below always uses the mission's pinned production signing key. */
+async function writePrivateSlot(handle: FileHandle, value: unknown): Promise<void> {
+	const bytes = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+	await handle.truncate(0);
+	let offset = 0;
+	while (offset < bytes.length) {
+		const written = (await handle.write(bytes, offset, bytes.length - offset, offset)).bytesWritten;
+		if (written <= 0) throw new PrivateBridgeError("private-output-write-failed");
+		offset += written;
+	}
+	await handle.truncate(bytes.length);
+	await handle.sync();
+}
 export async function runPrivateResumeBridge(values: string[],
 	testOnly?: Readonly<{ expectedSpkiSha256: string }>): Promise<void> {
-	const args = parseArgs(values);
-	if (underRepo(await realpath(path.dirname(args.outputPrivate))) ||
-		underRepo(await realpath(path.dirname(args.journalDir))))
-		throw new Error("private resume directory resolves inside the source repository");
-	const seedInfo = await lstat(args.seed);
-	if (!seedInfo.isFile() || (seedInfo.mode & 0o077) !== 0)
-		throw new Error("signed mission seed file is not private and regular");
-	const source = JSON.parse(await readFile(args.source, "utf8")) as CurrentMissionRun;
-	if (source?.manualAuthorized !== "true")
-		throw new PrivateBridgeError("source-authorization-flag-missing");
-	const seedEnvelopeB64 = (await readFile(args.seed, "utf8")).trim();
-	const bridge = connectorBridge();
-	let result: Awaited<ReturnType<typeof prepareAuthenticatedResumeRequest>>;
+	let privateSlot: FileHandle | undefined;
+	let successWritten = false;
 	try {
-		result = await prepareAuthenticatedResumeRequest({ source, seedEnvelopeB64,
-			publicKeyFile: args.publicKey,
-			...(testOnly ? { expectedSpkiSha256: testOnly.expectedSpkiSha256 } : {}),
-			githubToken: undefined,
-			authenticatedHostRead: { kind: "authenticated-host-github-read", request: bridge.request },
-			loadCarryArtifact: identity => bridge.artifact(identity),
-			loadResultEnvelope: identity => bridge.resultEnvelope(identity),
-			...(args.repairPlanPrivate ? { repairPlanPrivateFile: args.repairPlanPrivate } : {}),
-			...(args.interruptedSourceReviewPrivate ?
-				{ interruptedSourceReviewPrivateFile: args.interruptedSourceReviewPrivate } : {}),
-			...(args.resultOnlyRepairReviewPrivate ?
-				{ resultOnlyRepairReviewPrivateFile: args.resultOnlyRepairReviewPrivate } : {}),
-			journal: new MissionResumeJournal(args.journalDir), readOnly: args.readOnly });
-	} finally { bridge.close(); }
-	if (!args.readOnly) {
-		const handle = await open(args.outputPrivate, "wx", 0o600);
-		try { await handle.writeFile(`${JSON.stringify(result)}\n`); await handle.sync(); }
-		finally { await handle.close(); }
+		const args = parseArgs(values);
+		if (underRepo(await realpath(path.dirname(args.outputPrivate))) ||
+			underRepo(await realpath(path.dirname(args.journalDir))))
+			throw new Error("private resume directory resolves inside the source repository");
+		// Claim the caller's private result before a journal reservation can occur.
+		if (!args.readOnly) try { privateSlot = await open(args.outputPrivate, "wx", 0o600); }
+			catch (error) { throw new PrivateBridgeError(privateOsErrorCode(error) === "EEXIST" ?
+				"private-output-exists" : "private-output-unavailable", error); }
+		const seedInfo = await lstat(args.seed);
+		if (!seedInfo.isFile() || (seedInfo.mode & 0o077) !== 0)
+			throw new Error("signed mission seed file is not private and regular");
+		const source = JSON.parse(await readFile(args.source, "utf8")) as CurrentMissionRun;
+		if (source?.manualAuthorized !== "true")
+			throw new PrivateBridgeError("source-authorization-flag-missing");
+		const seedEnvelopeB64 = (await readFile(args.seed, "utf8")).trim();
+		const bridge = connectorBridge();
+		let result: Awaited<ReturnType<typeof prepareAuthenticatedResumeRequest>>;
+		try {
+			result = await prepareAuthenticatedResumeRequest({ source, seedEnvelopeB64,
+				publicKeyFile: args.publicKey,
+				...(testOnly ? { expectedSpkiSha256: testOnly.expectedSpkiSha256 } : {}),
+				githubToken: undefined,
+				authenticatedHostRead: { kind: "authenticated-host-github-read", request: bridge.request },
+				loadCarryArtifact: identity => bridge.artifact(identity),
+				loadResultEnvelope: identity => bridge.resultEnvelope(identity),
+				...(args.repairPlanPrivate ? { repairPlanPrivateFile: args.repairPlanPrivate } : {}),
+				...(args.interruptedSourceReviewPrivate ?
+					{ interruptedSourceReviewPrivateFile: args.interruptedSourceReviewPrivate } : {}),
+				...(args.resultOnlyRepairReviewPrivate ?
+					{ resultOnlyRepairReviewPrivateFile: args.resultOnlyRepairReviewPrivate } : {}),
+				journal: new MissionResumeJournal(args.journalDir), readOnly: args.readOnly,
+				...(args.recoverReserved ? { recoverReservedDescriptor: true } : {}) });
+		} finally { bridge.close(); }
+		if (privateSlot) {
+			try { await writePrivateSlot(privateSlot, result); }
+			catch (error) { throw new PrivateBridgeError("private-output-write-failed", error); }
+			successWritten = true;
+			try { await privateSlot.close(); }
+			catch (error) { throw new PrivateBridgeError("private-output-close-failed", error); }
+			privateSlot = undefined;
+		}
+		process.stdout.write(`${JSON.stringify(result.descriptor ?
+			{ kind: args.readOnly ? "planned-read-only" :
+				result.decision.kind === "wait" && result.decision.reason === "dispatch-reserved" ?
+					"recovered-reservation" : "prepared", descriptor: result.descriptor } :
+			{ kind: "no-dispatch", decisionKind: result.decision.kind })}\n`);
+	} catch (error) {
+		if (privateSlot && !successWritten) try { await writePrivateSlot(privateSlot, {
+			version: 1, kind: "private-resume-preparation-diagnostic",
+			...privateHostPreparationDiagnostic(error) }); } catch { /* Keep the initiating failure. */ }
+		try { await savePrivateFailure(values, error); } catch { /* Private output may be unavailable. */ }
+		throw error;
+	} finally {
+		if (privateSlot) try { await privateSlot.close(); } catch { /* Preserve the initiating error. */ }
 	}
-	process.stdout.write(`${JSON.stringify(result.descriptor ?
-		{ kind: args.readOnly ? "planned-read-only" : "prepared", descriptor: result.descriptor } :
-		{ kind: "no-dispatch", decisionKind: result.decision.kind })}\n`);
 }
 
 export function privateHostPreparationDiagnostic(error: unknown): Record<string, unknown> {
@@ -313,7 +365,8 @@ export function privateHostPreparationDiagnostic(error: unknown): Record<string,
 			...(error.refusal.ciStatus === undefined ? {} : { ciStatus: error.refusal.ciStatus }),
 			...(error.refusal.ciConclusion === undefined ? {} : { ciConclusion: error.refusal.ciConclusion }),
 			...(error.refusal.httpStatus === undefined ? {} : { httpStatus: error.refusal.httpStatus }) };
-	if (error instanceof PrivateBridgeError) return { code: error.reasonCode };
+	if (error instanceof PrivateBridgeError) return { code: error.reasonCode,
+		...(error.osErrorCode ? { osErrorCode: error.osErrorCode } : {}) };
 	if (error instanceof HarnessError &&
 		/^(?:runner\.ledger-continuation|runner\.signed-mission-ledger|runner\.mission)/.test(error.code) &&
 		/^[A-Za-z0-9 .,;:()_\-]{1,250}$/.test(error.message))
@@ -327,7 +380,9 @@ async function savePrivateFailure(values: string[], error: unknown): Promise<voi
 	if (!target || !path.isAbsolute(target) || underRepo(target) ||
 		underRepo(await realpath(path.dirname(target)))) return;
 	const diagnostic = privateHostPreparationDiagnostic(error);
-	const handle = await open(target, "wx", 0o600);
+	const attemptFile = path.join(path.dirname(target),
+		`.${path.basename(target)}.attempt-${randomUUID()}.failure.json`);
+	const handle = await open(attemptFile, "wx", 0o600);
 	try { await handle.writeFile(`${JSON.stringify({ version: 1,
 		kind: "private-resume-preparation-diagnostic", ...diagnostic })}\n`); await handle.sync(); }
 	finally { await handle.close(); }
@@ -336,7 +391,6 @@ async function savePrivateFailure(values: string[], error: unknown): Promise<voi
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	const values = process.argv.slice(2);
 	runPrivateResumeBridge(values).catch(async error => {
-		try { await savePrivateFailure(values, error); } catch { /* Preserve the original failure. */ }
 		process.stderr.write("private resume preparation failed; no control request was sent; inspect private diagnostic\n");
 		process.exitCode = 1;
 	});

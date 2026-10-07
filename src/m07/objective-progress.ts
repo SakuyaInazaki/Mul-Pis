@@ -612,6 +612,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 	groundingPolicy?: { require: true; sourceKinds: Record<string, GroundingSourceKind>;
 		legacyOpenDetails: string[]; previousIssues?: GroundedIssue[];
 		newEvidenceSourceIds?: string[];
+		capabilityLocators?: Record<string, GroundingSpan>;
 		priorGroundingIndex?: { indexName: string; partNames: string[] } };
 	recordAssessment?: (assessment: NonNullable<ObjectiveProgressV1["assessment"]>) => Promise<void>;
 	/** Durable control facts only; never substitutes for evidence reading or a valid verdict. */
@@ -711,6 +712,14 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		(groundingPolicy.newEvidenceSourceIds ?? []).some(name => !materials.some(item => item.name === name &&
 			["selected-evidence", "host-capability"].includes(groundingPolicy.sourceKinds[name])))))
 		throw new HarnessError("m07.objective", "grounding source registry does not match frozen evidence");
+	if (groundingPolicy?.capabilityLocators &&
+		Object.entries(groundingPolicy.capabilityLocators).some(([scope, locator]) =>
+			!safeAdapterId(scope) || !capabilities?.some(item => item.scope === scope && !item.available) ||
+			!locator || groundingPolicy.sourceKinds[locator.sourceId] !== "host-capability" ||
+			!Number.isSafeInteger(locator.startLine) || !Number.isSafeInteger(locator.endLine) ||
+			locator.startLine < 1 || locator.endLine < locator.startLine ||
+			!materials.some(item => item.name === locator.sourceId && locator.endLine <= item.lineCount)))
+		throw new HarnessError("m07.objective", "unavailable capability locator does not match frozen host evidence");
 	const priorIndex = groundingPolicy?.priorGroundingIndex;
 	if (priorIndex && (!materials.some(item => item.name === priorIndex.indexName) ||
 		evidenceAccess[priorIndex.indexName] === "retrievable" ||
@@ -762,6 +771,8 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 					lineCount: userOverrides.length } } : {}) },
 			capabilities: Object.fromEntries((capabilities ?? []).map(item => [item.scope,
 				{ available: item.available }])),
+			...(groundingPolicy.capabilityLocators ?
+				{ capabilityLocators: structuredClone(groundingPolicy.capabilityLocators) } : {}),
 			legacyOpenDetails: groundingPolicy.legacyOpenDetails,
 			previousIssues: groundingPolicy.previousIssues ?? [],
 			newEvidenceSourceIds: groundingPolicy.newEvidenceSourceIds ?? [],
@@ -771,13 +782,19 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		const retrievableMaterials = materials.filter(item => evidenceAccess[item.name] === "retrievable");
 		const retrievableIndex = requiredMaterials.find(item =>
 			item.name === "prior-research-history-index.json");
+		const unavailableScopeIds = (capabilities ?? []).filter(item => !item.available)
+			.map(item => item.scope);
+		const groundedIssueSchema = "Each new issue has base fields {id,claim,status:'open'|'resolved',classification,sourceRefs:[{sourceId,startLine,endLine}],implication}. Add only the named fields for its classification: claimAtRisk for necessary-verification, optionalBasis for optional-method, or blockedScope and capabilityRef:{sourceId,startLine,endLine} for physical-capability-gap. Do not add a proof field. A resolved issue also needs resolution:{explanation,evidenceRefs}.";
+		const physicalGapRule = `For physical-capability-gap, blockedScope must be ONE exact unavailable registered scope ID, never a prose description or combined list: ${JSON.stringify(unavailableScopeIds)}. Cite that scope's own host-capability row with capabilityRef; if no registered ID matches a suspected limitation, do not invent a physical gap or claim the limitation is measured.`;
 		const responseSchema = priorIndex ? [
 			"Return one strict JSON object only: version:1, decision:'fulfilled'|'continue'|'blocked', nonempty rationale, unique evidenceRefs from frozen file names, unique unresolvedObligations from the original obligation IDs, and groundedAssessmentDelta. Omit top-level unresolvedDetails and groundedAssessment; the host reconstructs the former from the authenticated prior issue index and this delta.",
-			"groundedAssessmentDelta is {version:1,kind:'grounded-assessment-delta',newIssues:[],resolutions:[],nextTask?,deliverableReady?}. Keep prior issues and legacy details by omission. A new issue requires id,claim,status,classification,sourceRefs,implication and its class-specific proof. A resolution requires id,priorRef,explanation,evidenceRefs with exact current-session returned ranges and new frozen evidence.",
+			"groundedAssessmentDelta is {version:1,kind:'grounded-assessment-delta',newIssues:[],resolutions:[],nextTask?,deliverableReady?}. Keep prior issues and legacy details by omission. A resolution requires id,priorRef,explanation,evidenceRefs with exact current-session returned ranges and new frozen evidence.",
+			groundedIssueSchema, physicalGapRule,
 			"For continue, include top-level nextTask {objective,addresses,adapterScope} and delta.nextTask {obligationIds,addresses,adapterScope,decisionChangingHypothesis,expectedEvidence,sourceRefs}; they must identify the same feasible adapter and unresolved original obligations and address an open explicit requirement or necessary verification. For fulfilled, leave unresolvedObligations empty and omit both nextTask fields; for blocked, retain unresolvedObligations and omit both nextTask fields. deliverableReady is a proposal only and cannot close an open-ended mission."
 		] : grounding ? [
 			"Return one strict JSON object only: version:1, decision:'fulfilled'|'continue'|'blocked', nonempty rationale, unique evidenceRefs from frozen file names, unique unresolvedObligations from original obligation IDs, unique nonempty unresolvedDetails, and groundedAssessment. Do not supply groundedAssessmentDelta without a prior grounding index.",
-			"groundedAssessment is {version:1,kind:'grounded-assessment-proposal',contractId,missionStatus:'open',issues,legacyOpenDetails,nextTask?,deliverableReady?}. Preserve every prior issue and legacy detail. Each new issue needs id,claim,status,classification,sourceRefs,implication and its class-specific proof; unresolvedDetails must exactly list open issue claims.",
+			"groundedAssessment is {version:1,kind:'grounded-assessment-proposal',contractId,missionStatus:'open',issues,legacyOpenDetails,nextTask?,deliverableReady?}. Preserve every prior issue and legacy detail; unresolvedDetails must exactly list open issue claims.",
+			groundedIssueSchema, physicalGapRule,
 			"For continue, include top-level nextTask {objective,addresses,adapterScope} and groundedAssessment.nextTask {obligationIds,addresses,adapterScope,decisionChangingHypothesis,expectedEvidence,sourceRefs}; they must match the same feasible adapter and unresolved original obligations and address an open explicit requirement or necessary verification. For fulfilled, leave unresolvedObligations and unresolvedDetails empty and omit both nextTask fields; for blocked, retain unresolvedObligations and unresolvedDetails and omit both nextTask fields. deliverableReady is a proposal only."
 		] : [
 			"Return one strict JSON object only: version:1, decision:'fulfilled'|'continue'|'blocked', nonempty rationale, unique evidenceRefs from frozen file names, unique unresolvedObligations from original obligation IDs, and unique nonempty unresolvedDetails.",
@@ -806,7 +823,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 					name === "current-user-overrides" || evidenceAccess[name] !== "retrievable" ||
 					!retrievableIndex && !priorIndex)
 					.map(([name, source]) => `${name}: ${source.kind}, lines 1-${source.lineCount}`),
-				"Issue classes are explicit-requirement (cited user or supplied task requirement), necessary-verification (claimAtRisk), optional-method (cited optionalBasis), and physical-capability-gap (unavailable blockedScope plus host capabilityRef). Each new issue needs id, claim, status, classification, sourceRefs and implication. A proposed nextTask must identify an open decision-changing issue and expected evidence. Optional methods or unavailable equipment alone do not force another task.",
+				"Issue classes are explicit-requirement (cited user or supplied task requirement), necessary-verification (claimAtRisk), optional-method (cited optionalBasis), and physical-capability-gap (one exact unavailable registered blockedScope ID plus its host capabilityRef). Each new issue needs id, claim, status, classification, sourceRefs and implication. A proposed nextTask must identify an open decision-changing issue and expected evidence. Optional methods or unavailable equipment alone do not force another task.",
 				...(priorIndex ? [
 					`Authenticated prior grounding is in required index ${priorIndex.indexName} and ${priorIndex.partNames.length} retrievable parts. Read the index completely. Use its exact line locators to inspect a prior issue before changing its status. Omitted prior issues and legacy details are retained by the host. New frozen evidence IDs: ${JSON.stringify(grounding.newEvidenceSourceIds ?? [])}.`,
 					"Return groundedAssessmentDelta {version:1,kind:'grounded-assessment-delta',newIssues:[],resolutions:[],nextTask?,deliverableReady?} instead of groundedAssessment. A resolution is {id,priorRef,explanation,evidenceRefs}, where priorRef is exactly the indexed old issue line and evidenceRefs include new evidence. Do not echo old issue records or legacy details; the host merges and checks them. The host derives unresolvedDetails from all still-open issues."
@@ -915,6 +932,10 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				validationFailure = error instanceof AssessmentValidationError ? error :
 					new AssessmentValidationError(error.message, "$");
 			}
+			const fixedValidationFeedback = validationFailure ? [
+				`Rejected field path: ${validationFailure.validationPath}.`,
+				...(validationFailure.validationDetail ?
+					[`Host validator detail: ${validationFailure.validationDetail}.`] : [])] : [];
 			const spans = citedSpans(parsed);
 			const fullRequired = new Set(["original-objective.json", ...requiredMaterials.map(item => item.name),
 				...(parsed?.evidenceRefs ?? [])]);
@@ -1070,7 +1091,8 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 					`Unread or incomplete files: ${unreadEvidence.join(", ")}.`,
 					...fileCoverage.filter(item => item.needed && !item.satisfied).map(item => item.nextRange),
 					...(failedReads.length ? ["A read tool error occurred for a named file, but the host verified that frozen file is still available. Correct the path and requested range in this same session."] : []),
-					...(!parsed ? [`Your last response also failed the required strict JSON schema: ${invalidReason}. Repair its format after inspecting the missing evidence.`] : []),
+					...(!parsed ? [`Your last response also failed the required strict JSON schema: ${invalidReason}. Repair its format after inspecting the missing evidence.`,
+						...fixedValidationFeedback] : []),
 					...(noReadProgress ? ["The last repair turn added no verified read coverage. Replan how to use objective_evidence_read rather than repeating the same unsupported verdict."] : []),
 					"In this same session, read every requested range. Whole-file requirements need an untruncated final page; cited spans need each cited line. Then reassess the unchanged original objective and return a new strict JSON assessment. Do not repeat the prior verdict without inspecting the missing evidence; no task may be dispatched or goal closed from incomplete required or cited evidence."].join("\n\n");
 				continue;
@@ -1081,10 +1103,14 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				// session; no work or scientific claim is admitted from this response.
 				const admission = currentObjectiveAdmission(input.advanceAdmission());
 				if (admission !== "admitted") return { assessment: latestAssessment, stopReason: admission };
-				const repair = await repairFailure("invalid-assessment", { validation: invalidReason ?? "assessment schema invalid" });
+				const repair = await repairFailure("invalid-assessment", {
+					validation: invalidReason ?? "assessment schema invalid",
+					path: validationFailure?.validationPath ?? "$",
+					detail: validationFailure?.validationDetail ?? null });
 				if (repair === "fresh-context") continue;
 				if (repair !== "same-session-feedback") return { assessment: latestAssessment, stopReason: repair };
 				request = [`Your previous response failed host validation: ${invalidReason ?? "assessment schema invalid"}.`,
+					...fixedValidationFeedback,
 					...responseSchema,
 					"The frozen evidence was already returned in full in this session. Reassess the unchanged original objective and user overrides, repair your own schema or reasoning, and return a fresh valid assessment. This invalid response did not authorize a task or close the mission."].join("\n\n");
 				continue;

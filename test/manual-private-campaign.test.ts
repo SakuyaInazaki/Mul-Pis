@@ -58,6 +58,39 @@ test("both private original-objective assessor stages persist validation failure
 		/secondGoal\.runId,\s*nextArchiveDir,\s*outputDir,\s*`iteration-\$\{iteration\}`/);
 });
 
+test("frozen host capability rows ground unavailable scopes without granting dispatch", () => {
+	const adapters = [
+		{ scope: "two-target-existing", available: false, description: "Prior adapter", limits: ["diagnostic only"] },
+		{ scope: "registered-csr-experiment", available: true, description: "Current adapter", limits: ["CPU"] },
+		{ scope: "outside-current-adapter", available: false, description: "No executor", limits: ["no grant"] },
+	];
+	const unavailable = offlineChecks.observedUnavailableCapabilities(adapters,
+		["GPU execution", "privileged hardware counters"],
+		{ maxThreads: 4, maxTimedWork: 200_000_000, minRepeats: 3 });
+	const scopes = unavailable.map(row => row.scope);
+	assert.deepEqual(scopes, ["two-target-existing", "outside-current-adapter",
+		"host.unavailable.observation-1", "host.unavailable.observation-2",
+		"host.unavailable.above-max-threads", "host.unavailable.above-max-timed-work",
+		"host.unavailable.below-min-repeats"]);
+	assert.ok(unavailable.every(row => !row.available));
+	const serialized = `${JSON.stringify({ version: 1, unavailableCapabilities: unavailable }, null, 2)}\n`;
+	const locators = offlineChecks.frozenCapabilityLocators(serialized, unavailable);
+	const lines = serialized.split("\n");
+	for (const scope of scopes) {
+		const ref = locators[scope];
+		assert.equal(ref.sourceId, "host-capabilities.json");
+		assert.equal(ref.startLine, ref.endLine);
+		assert.equal(lines[ref.startLine - 1]!.trim(), `"scope": ${JSON.stringify(scope)},`);
+	}
+	const adapterIds = new Set(adapters.map(row => row.scope));
+	const runtime = [...adapters, ...unavailable.filter(row => !adapterIds.has(row.scope))];
+	const supported = offlineChecks.OBJECTIVE_SUPPORTED_TASK_SCOPES;
+	assert.deepEqual(supported, ["two-target-existing", "registered-csr-experiment"]);
+	for (const row of unavailable)
+		assert.equal(Boolean(runtime.find(item => item.scope === row.scope)?.available &&
+			supported.includes(row.scope as "two-target-existing" | "registered-csr-experiment")), false);
+});
+
 test("driver retains the initiating private validator cause when diagnostic storage fails", async t => {
 	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-assessor-status-"));
 	t.after(() => rm(root, { recursive: true, force: true }));

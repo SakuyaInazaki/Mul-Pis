@@ -79,6 +79,19 @@ test("requires registered exact line ranges and class-specific evidence", () => 
 	assert.throws(() => validateGroundedAssessment(unobservedGap, context), /host-capability source/);
 });
 
+test("a physical gap cites its own frozen unavailable capability row", () => {
+	const located = { ...context, capabilityLocators: { counters: ref("observed-host", 2) } };
+	assert.equal(validateGroundedAssessment(proposal(), located).issues[3]!.blockedScope, "counters");
+	const unrelatedLine = proposal();
+	unrelatedLine.issues[3]!.capabilityRef = ref("observed-host", 1);
+	assert.throws(() => validateGroundedAssessment(unrelatedLine, located),
+		/citation must cover the registered unavailable capability/);
+	const descriptiveScope = proposal();
+	descriptiveScope.issues[3]!.blockedScope = "hardware counters are unavailable";
+	assert.throws(() => validateGroundedAssessment(descriptiveScope, located),
+		/unavailable registered capability/);
+});
+
 test("next work needs an available scope and a decision-changing hypothesis", () => {
 	const noHypothesis = proposal();
 	noHypothesis.nextTask!.decisionChangingHypothesis = "";

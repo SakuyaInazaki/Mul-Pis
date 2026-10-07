@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { createCipheriv, createDecipheriv, createHash, generateKeyPairSync, hkdfSync,
 	randomBytes, sign, constants } from "node:crypto";
 import { once } from "node:events";
-import { chmod, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -925,9 +925,34 @@ test("a repeated request returns the durable reservation and never replaces an a
 	assert(!stored.includes("Synthetic original task"));
 });
 
+test("reserved descriptor recovery requires the same authenticated journal state", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...f.input,
+		readOnly: true, recoverReservedDescriptor: true }), error =>
+		privateHostPreparationDiagnostic(error).code === "reserved-descriptor-recovery-requires-journal");
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...f.input,
+		recoverReservedDescriptor: true }), error =>
+		privateHostPreparationDiagnostic(error).code === "reserved-descriptor-missing");
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	const first = await prepareAuthenticatedResumeRequest(f.input);
+	const recovered = await prepareAuthenticatedResumeRequest({ ...f.input,
+		recoverReservedDescriptor: true });
+	assert.deepEqual(recovered.descriptor, first.descriptor);
+	assert.deepEqual(recovered.decision, { kind: "wait", reason: "dispatch-reserved",
+		idempotencyKey: first.journalKey });
+	assert.equal((await f.journal.get(first.journalKey!))?.state, "reserved");
+	await f.journal.markAttempted(first.journalKey!);
+	const uncertain = await prepareAuthenticatedResumeRequest({ ...f.input,
+		recoverReservedDescriptor: true });
+	assert.equal(uncertain.descriptor, undefined);
+	assert.equal(uncertain.decision.kind, "wait");
+	assert.equal((await f.journal.get(first.journalKey!))?.state, "ref-update-attempted");
+});
+
 async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 	Awaited<ReturnType<typeof interruptedFixture>>,
 	options: { wrongArtifactDigest?: boolean; readOnly?: boolean;
+		outputPrivate?: string; recoverReserved?: boolean;
 		repairPlanPrivateFile?: string;
 		resultOnlyRepairReviewPrivateFile?: string;
 		resultEnvelopeBytes?: Buffer; wrongResultArchiveEcho?: boolean;
@@ -939,7 +964,7 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 	const sourceFile = path.join(f.dir, "source.json");
 	const seedFile = path.join(f.dir, "seed.txt");
 	const artifactFile = path.join(f.dir, "carry.json");
-	const outputPrivate = path.join(f.dir, "prepared-private.json");
+	const outputPrivate = options.outputPrivate ?? path.join(f.dir, "prepared-private.json");
 	await writeFile(sourceFile, JSON.stringify(f.input.source), { mode: 0o600 });
 	await writeFile(seedFile, f.input.seedEnvelopeB64!, { mode: 0o600 });
 	const artifactBytes = JSON.stringify({ envelopeB64: f.sealed.envelopeB64 });
@@ -979,6 +1004,7 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 		"--source", sourceFile, "--seed", seedFile,
 		"--public-key", f.input.publicKeyFile, "--journal-dir", f.journal.directory,
 		"--output-private", outputPrivate, "--connector-stdio",
+		...(options.recoverReserved ? ["--recover-reserved"] : []),
 		...(options.repairPlanPrivateFile ? ["--repair-plan-private", options.repairPlanPrivateFile] : []),
 		...(options.resultOnlyRepairReviewPrivateFile ?
 			["--result-only-repair-review-private", options.resultOnlyRepairReviewPrivateFile] : []),
@@ -1035,7 +1061,7 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 					"0".repeat(64) : options.archiveSha256 } : {}),
 				...(prefixReference ? { prefix: prefixReference } : {}),
 				...(sidecarReferences.length ? { sidecars } : {}) })}\n`);
-		} else assert(["prepared", "planned-read-only", "no-dispatch"].includes(row.kind));
+		} else assert(["prepared", "planned-read-only", "recovered-reservation", "no-dispatch"].includes(row.kind));
 	}
 	const [code] = await closed;
 	return { code, stderr, lines, stdout: lines.map(row => JSON.stringify(row)).join("\n"),
@@ -1105,6 +1131,49 @@ test("stdio bridge authenticates connector reads and prints only a public descri
 	assert.equal((await stat(bridge.outputPrivate)).mode & 0o077, 0);
 	assert.equal((await new MissionResumeJournal(f.journal.directory)
 		.get(privateResult.journalKey))?.state, "reserved");
+});
+
+test("private output collision is diagnosed before any connector read or journal reservation", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const outputPrivate = path.join(f.dir, "prepared-private.json");
+	const firstFailure = '{"kind":"earlier-private-failure"}\n';
+	await writeFile(outputPrivate, firstFailure, { mode: 0o600 });
+	for (const expectedCount of [1, 2]) {
+		const result = await runStdioBridge(f);
+		assert.equal(result.code, 1);
+		assert.deepEqual(result.lines, []);
+		assert.equal(await readFile(outputPrivate, "utf8"), firstFailure);
+		assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+		const names = (await readdir(f.dir)).filter(name =>
+			/^\.prepared-private\.json\.attempt-[0-9a-f-]+\.failure\.json$/.test(name));
+		assert.equal(names.length, expectedCount);
+		for (const name of names) {
+			const diagnostic = JSON.parse(await readFile(path.join(f.dir, name), "utf8"));
+			assert.deepEqual(diagnostic, { version: 1,
+				kind: "private-resume-preparation-diagnostic",
+				code: "private-output-exists", osErrorCode: "EEXIST" });
+			assert.equal((await stat(path.join(f.dir, name))).mode & 0o077, 0);
+		}
+	}
+});
+
+test("stdio bridge recovers a reserved descriptor only before any ref update attempt", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const prepared = await runStdioBridge(f);
+	assert.equal(prepared.code, 0, prepared.stderr);
+	const first = JSON.parse(await readFile(prepared.outputPrivate, "utf8")) as {
+		journalKey: string; descriptor: object };
+	const recovered = await runStdioBridge(f, { recoverReserved: true,
+		outputPrivate: path.join(f.dir, "recovered-private.json") });
+	assert.equal(recovered.code, 0, recovered.stderr);
+	assert.deepEqual(recovered.lines.at(-1), { kind: "recovered-reservation",
+		descriptor: first.descriptor });
+	assert.equal((await f.journal.get(first.journalKey))?.state, "reserved");
+	await f.journal.markAttempted(first.journalKey);
+	const afterAttempt = await runStdioBridge(f, { recoverReserved: true,
+		outputPrivate: path.join(f.dir, "after-attempt-private.json") });
+	assert.equal(afterAttempt.code, 0, afterAttempt.stderr);
+	assert.deepEqual(afterAttempt.lines.at(-1), { kind: "no-dispatch", decisionKind: "wait" });
 });
 
 test("stdio bridge accepts a combined final carry and prefix only with the expected ZIP digest", async t => {
@@ -1232,7 +1301,9 @@ test("stdio bridge rejects a result artifact ZIP or encrypted envelope mismatch"
 			wrongResultFileDigest: failure === "file" });
 		assert.equal(bridge.code, 1);
 		assert(!bridge.lines.some(row => (row as { kind: string }).kind === "prepared"));
-		await assert.rejects(readFile(bridge.outputPrivate), { code: "ENOENT" });
+		const privateFailure = JSON.parse(await readFile(bridge.outputPrivate, "utf8"));
+		assert.equal(privateFailure.kind, "private-resume-preparation-diagnostic");
+		assert.equal(privateFailure.descriptor, undefined);
 		assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
 	}
 });
@@ -1243,7 +1314,9 @@ test("stdio bridge refuses an artifact whose private digest changed", async t =>
 	assert.equal(bridge.code, 1);
 	assert(bridge.lines.some(row => (row as { kind: string }).kind === "artifact-file"));
 	assert(!bridge.lines.some(row => (row as { kind: string }).kind === "prepared"));
-	await assert.rejects(readFile(bridge.outputPrivate), { code: "ENOENT" });
+	const privateFailure = JSON.parse(await readFile(bridge.outputPrivate, "utf8"));
+	assert.equal(privateFailure.kind, "private-resume-preparation-diagnostic");
+	assert.equal(privateFailure.descriptor, undefined);
 	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
 });
 
@@ -1267,7 +1340,9 @@ test("stdio bridge rejects missing, duplicate and tampered ciphertext sidecars",
 		assert.equal(bridge.code, 1, sidecarFault);
 		assert(!bridge.lines.some(row => (row as { kind: string }).kind === "prepared"));
 		assert(!bridge.stderr.includes(f.sealed.sidecars["ledger-continuation.part-00000000.enc"]!));
-		await assert.rejects(readFile(bridge.outputPrivate), { code: "ENOENT" });
+		const privateFailure = JSON.parse(await readFile(bridge.outputPrivate, "utf8"));
+		assert.equal(privateFailure.kind, "private-resume-preparation-diagnostic");
+		assert.equal(privateFailure.descriptor, undefined);
 		assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
 	}
 });

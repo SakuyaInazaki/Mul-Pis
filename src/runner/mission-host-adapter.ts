@@ -46,7 +46,8 @@ export type HostPreparationRefusal = Readonly<{
 		"workflow-repair-plan-invalid" | "workflow-repair-plan-unrelated" |
 		"workflow-repair-plan-stale" | "workflow-repair-source-unchanged" |
 		"workflow-repair-review-evidence-invalid" |
-		"result-only-repair-review-invalid" | "result-only-repair-result-unavailable";
+		"result-only-repair-review-invalid" | "result-only-repair-result-unavailable" |
+		"reserved-descriptor-recovery-requires-journal" | "reserved-descriptor-missing";
 	stage: "tested-source-ci" | "live-source-ref" | "live-source-commit" |
 		"live-control-ref" | "terminal-carry" | "legacy-action" | "dispatch-journal" |
 		"workflow-repair-plan" | "interruption-source-review" | "result-only-repair-review";
@@ -202,6 +203,9 @@ export type PreparedResumeRequest = Readonly<{
 }>;
 
 export type PrepareAuthenticatedResumeInput = Readonly<{
+	/** Reissue only a descriptor whose identical private intent is still reserved.
+	 * The caller must durably markAttempted before any control-ref write. */
+	recoverReservedDescriptor?: true;
 	source: CurrentMissionRun;
 	seedEnvelopeB64: string | undefined;
 	publicKeyFile: string;
@@ -422,6 +426,8 @@ async function verifyWorkflowRepairPlan(input: PrepareAuthenticatedResumeInput,
  * authenticated checkpoint and remain labelled as current host decisions. */
 export async function prepareAuthenticatedResumeRequest(input: PrepareAuthenticatedResumeInput):
 	Promise<PreparedResumeRequest> {
+	if (input.readOnly && input.recoverReservedDescriptor)
+		refuse("reserved-descriptor-recovery-requires-journal", "dispatch-journal");
 	const authenticationInput = {
 		source: input.source, seedEnvelopeB64: input.seedEnvelopeB64,
 		publicKeyFile: input.publicKeyFile, githubToken: input.githubToken,
@@ -599,12 +605,17 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 	const unresolved = await input.journal.unresolvedForRef(CONTROL_REF);
 	if (unresolved && unresolved.idempotencyKey !== prospective.intent.idempotencyKey)
 		refuse("control-request-delivery-uncertain", "dispatch-journal");
+	if (input.recoverReservedDescriptor === true && !old)
+		refuse("reserved-descriptor-missing", "dispatch-journal");
 	if (old) {
 		// Re-validate the current tested source and ref against the durable record.
 		// A same-key lookup alone would miss a moved source or control ref.
 		const matched = await input.journal.reserve(prospective.intent, binding);
 		return { decision: planMissionContinuation({ ...snapshot,
-			dispatchRecord: dispatchRecord(matched) }), journalKey: matched.idempotencyKey,
+			dispatchRecord: dispatchRecord(matched) }),
+			...(input.recoverReservedDescriptor === true && matched.state === "reserved" ?
+				{ descriptor: publicDescriptor(binding) } : {}),
+			journalKey: matched.idempotencyKey,
 			journalState: matched.state, ...privateObservation };
 	}
 	const reserved = await input.journal.reserve(prospective.intent, binding);
