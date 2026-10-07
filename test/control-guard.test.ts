@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -89,4 +89,97 @@ test("normal shutdown marks only the owned active run failed and late completion
 	assert.equal(owned.status, "failed");
 	assert.match(owned.failures.join("\n"), /host-shutdown/);
 	assert.equal((await ws.readRun("M01", foreign.runId)).status, "running");
+});
+
+test("shutdown waits for a visible owned start before registration and rejects later starts", async t => {
+	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-start-race-"));
+	await mkdir(path.join(root, "problem", "raw"), { recursive: true });
+	await writeFile(path.join(root, "problem", "problem.md"), "problem\n");
+	await writeFile(path.join(root, "research.config.json"),
+		`${JSON.stringify({ roles: { execution: "fake/model" }, concurrency: 1 })}\n`);
+	const original = Workspace.prototype.startRun;
+	let visible!: () => void, releaseStart!: () => void;
+	const visiblePromise = new Promise<void>(resolve => { visible = resolve; });
+	const delayedStart = new Promise<void>(resolve => { releaseStart = resolve; });
+	let releasePrompt!: () => void;
+	const blockedPrompt = new Promise<void>(resolve => { releasePrompt = resolve; });
+	Workspace.prototype.startRun = async function(stage, inputs, knowledgeSnapshot) {
+		const record = await original.call(this, stage, inputs, knowledgeSnapshot);
+		if (stage === "M01" && inputs.length) { visible(); await delayedStart; }
+		return record;
+	};
+	t.after(() => { Workspace.prototype.startRun = original; releaseStart(); releasePrompt(); });
+	const service = new ResearchService({ defaultWorkspace: root,
+		runnerFactory: () => new FakeSessionRunner(async () => {
+			await blockedPrompt;
+			return "late answer";
+		}) });
+	await service.init(root);
+	const pending = service.runStage({ stage: "M01", workspace: root });
+	await visiblePromise;
+	const ws = new Workspace(root);
+	const foreign = await ws.startRun("M01", []);
+	const shutdown = service.interruptAllActive("test registration gap");
+	// The owned start is visible on disk, but the service has not received its
+	// returned record. Shutdown must retain ownership of exactly that start.
+	releaseStart();
+	await shutdown;
+	releasePrompt();
+	await assert.rejects(pending, /不能覆盖为|已经结束/);
+	const runs = await Promise.all((await ws.listRuns("M01")).map(id => ws.readRun("M01", id)));
+	assert.equal(runs.find(run => run.runId !== foreign.runId)?.status, "failed");
+	assert.equal((await ws.readRun("M01", foreign.runId)).status, "running");
+});
+
+test("a stale stage write and completion cannot reopen a shutdown-failed run", async () => {
+	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-terminal-race-"));
+	const ws = new Workspace(root);
+	const started = await ws.startRun("M01", []);
+	const stale = await ws.readRun("M01", started.runId);
+	const failed = await ws.finishRunIfRunning("M01", started.runId, "failed", current => {
+		current.failures.push("host-shutdown");
+		return current;
+	});
+	assert.equal(failed?.status, "failed");
+	await assert.rejects(ws.writeRun(stale), /不能覆盖为 running/);
+	await assert.rejects(ws.finishRun(stale, "completed"), /已经结束/);
+	const persisted = await ws.readRun("M01", started.runId);
+	assert.equal(persisted.status, "failed");
+	assert.deepEqual(persisted.failures, ["host-shutdown"]);
+});
+
+test("corrupt persisted run state is never treated as a fresh record by a late writer", async () => {
+	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-corrupt-run-"));
+	const ws = new Workspace(root);
+	const started = await ws.startRun("M01", []);
+	const file = path.join(ws.runDir("M01", started.runId), "run.json");
+	await writeFile(file, "{broken");
+	await assert.rejects(ws.writeRun(started), SyntaxError);
+	await assert.rejects(ws.finishRun(started, "completed"), SyntaxError);
+	assert.equal(await readFile(file, "utf8"), "{broken");
+	await writeFile(file, "");
+	await assert.rejects(ws.writeRun(started), SyntaxError);
+	await assert.rejects(ws.finishRun(started, "completed"), SyntaxError);
+	assert.equal(await readFile(file, "utf8"), "");
+});
+
+test("symlink aliases of one run share a single terminal transition", async t => {
+	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-alias-source-"));
+	const aliasParent = await mkdtemp(path.join(tmpdir(), "pre-rsi-alias-parent-"));
+	const alias = path.join(aliasParent, "workspace-link");
+	await symlink(root, alias, "dir");
+	t.after(async () => { await rm(aliasParent, { recursive: true, force: true }); });
+	const direct = new Workspace(root), throughAlias = new Workspace(alias);
+	const started = await direct.startRun("M01", []);
+	const [failed, completed] = await Promise.all([
+		direct.finishRunIfRunning("M01", started.runId, "failed", old => {
+			old.failures.push("host-shutdown");
+			return old;
+		}),
+		throughAlias.finishRunIfRunning("M01", started.runId, "completed", old => old),
+	]);
+	assert.equal(Number(Boolean(failed)) + Number(Boolean(completed)), 1,
+		"aliases must not each win a terminal transition for one physical run");
+	const persisted = await direct.readRun("M01", started.runId);
+	assert.equal(persisted.status, failed ? "failed" : "completed");
 });

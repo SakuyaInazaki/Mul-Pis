@@ -6,11 +6,14 @@ import test, { type TestContext } from "node:test";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { createM07Controller } from "../src/m07/controller.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
-import type { ReadReturnEvent } from "../src/runner/types.ts";
+import type { ReadReturnEvent, SessionHandle } from "../src/runner/types.ts";
+import { WorkflowRepairNeededError, type WorkflowRepairStateV1 } from "../src/runner/repair-liveness.ts";
 import { runM04 } from "../src/stages/m04.ts";
+import { runM01 } from "../src/stages/m01.ts";
 import { exportPortableM04Transaction } from "../src/workflow-archive/m04-transaction.ts";
 import type { StageContext } from "../src/stages/context.ts";
 import { Workspace } from "../src/workspace.ts";
+import { HarnessError } from "../src/types.ts";
 
 async function fixture(t: TestContext) {
 	const root = await mkdtemp(path.join(os.tmpdir(), "m04-required-m07-"));
@@ -188,6 +191,372 @@ test("a corrected structural draft merges once and retains rejected draft identi
 	assert.equal(result.record.outputs.filter(item => item.label === "M04 知识事务状态").length, 1);
 });
 
+test("repeated malformed proposal changes context without submitting malformed content", async t => {
+	const f = await fixture(t);
+	let firstSessionId: string | undefined;
+	const privateFragment = "private-model-fragment-123";
+	const states: WorkflowRepairStateV1[] = [];
+	const valid = `\`\`\`knowledge-proposals\n${JSON.stringify([{
+		op: "create", type: "K", title: "Fresh bounded candidate", body: "Synthetic evidence only",
+		usageDecision: "candidate" }])}\n\`\`\``;
+	const fake = new FakeSessionRunner(({ ref, turnIndex, message }) => {
+		firstSessionId ??= ref.id;
+		if (ref.id === firstSessionId) return { text: `\`\`\`knowledge-proposals\n${privateFragment}-${turnIndex}\n\`\`\``,
+			readReturns: turnIndex === 1 ? returnedRanges(f.relative) : [] };
+		assert.match(message, /fresh independent M04 judgment/);
+		assert.doesNotMatch(message, new RegExp(privateFragment));
+		return { text: valid, readReturns: returnedRanges(f.relative) };
+	});
+	f.ctx.runner = fake;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative,
+		onRepairState: async state => { states.push(state); } });
+	assert.ok(result.snapshotId);
+	assert.deepEqual(result.proposalAttempts.map(item => item.state), ["merged"]);
+	assert.deepEqual([...fake.sessions.values()].map(item => item.turns), [2, 1]);
+	assert.ok(states.some(item => item.failure === "malformed-proposal" && item.strategy === "fresh-context"));
+	const receipt = await readFile(result.record.outputs.find(item => item.label === "M04 修复状态")!.path, "utf8");
+	assert.doesNotMatch(receipt, new RegExp(privateFragment));
+});
+
+test("identical invalid drafts reuse their receipt before fresh valid correction and one merge", async t => {
+	const f = await fixture(t);
+	let firstSessionId: string | undefined;
+	let submissions = 0, merges = 0;
+	const submit = f.store.submitProposal.bind(f.store), merge = f.store.merge.bind(f.store);
+	f.store.submitProposal = async batch => { submissions += 1; return submit(batch); };
+	f.store.merge = async id => { merges += 1; return merge(id); };
+	const invalid = [{ op: "create", type: "K", title: "", body: "" }];
+	const valid = [{ op: "create", type: "K", title: "Fresh candidate", body: "Synthetic bounded evidence", usageDecision: "candidate" }];
+	const fake = new FakeSessionRunner(({ ref, turnIndex, message }) => {
+		firstSessionId ??= ref.id;
+		if (ref.id === firstSessionId) {
+			const ops = turnIndex === 1 ? invalid : [{ body: "", title: "", type: "K", op: "create" }];
+			return { text: `\`\`\`knowledge-proposals\n${JSON.stringify(ops)}\n\`\`\``,
+				readReturns: turnIndex === 1 ? returnedRanges(f.relative) : [] };
+		}
+		assert.match(message, /rejected draft remains historical evidence/);
+		return { text: `\`\`\`knowledge-proposals\n${JSON.stringify(valid)}\n\`\`\``, readReturns: returnedRanges(f.relative) };
+	});
+	f.ctx.runner = fake;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative });
+	assert.equal(submissions, 2, "one rejected draft and one corrected draft, with no duplicate submission");
+	assert.equal(merges, 1);
+	assert.deepEqual(result.proposalAttempts.map(item => item.state), ["rejected-draft", "merged"]);
+	assert.equal(result.proposalId, result.proposalAttempts[1].proposalId);
+	assert.notEqual(result.proposalAttempts[0].proposalId, result.proposalAttempts[1].proposalId);
+	assert.deepEqual([...fake.sessions.values()].map(item => item.turns), [2, 1]);
+});
+
+test("different invalid draft prose with unchanged structural issues cannot evade fresh repair", async t => {
+	const f = await fixture(t);
+	let firstSessionId: string | undefined;
+	const fake = new FakeSessionRunner(({ ref, turnIndex }) => {
+		firstSessionId ??= ref.id;
+		if (ref.id !== firstSessionId) return { text: "Fresh judgment: evidence supports no knowledge proposal.", readReturns: returnedRanges(f.relative) };
+		return { text: `\`\`\`knowledge-proposals\n${JSON.stringify([{
+			op: "create", type: "K", title: "", body: `Changing speculative prose ${turnIndex}`,
+		}])}\n\`\`\``, readReturns: turnIndex === 1 ? returnedRanges(f.relative) : [] };
+	});
+	f.ctx.runner = fake;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative });
+	assert.equal(result.snapshotId, undefined);
+	assert.equal(result.proposalAttempts.length, 2, "distinct rejected draft identities remain exact historical evidence");
+	assert.ok(result.proposalAttempts.every(item => item.state === "rejected-draft"));
+	assert.deepEqual([...fake.sessions.values()].map(item => item.turns), [2, 1]);
+});
+
+test("real structural correction allows a further fresh strategy for the new failure state", async t => {
+	const f = await fixture(t);
+	const sessionIds: string[] = [];
+	const fake = new FakeSessionRunner(({ ref, turnIndex }) => {
+		if (!sessionIds.includes(ref.id)) sessionIds.push(ref.id);
+		const context = sessionIds.indexOf(ref.id);
+		const ops = context === 0 ? [{ op: "create", type: "K", title: "", body: null }] :
+			context === 1 ? [{ op: "create", type: "K", title: "", body: "Corrected body structure" }] :
+			[{ op: "create", type: "K", title: "Corrected candidate", body: "Synthetic bounded evidence", usageDecision: "candidate" }];
+		return { text: `\`\`\`knowledge-proposals\n${JSON.stringify(ops)}\n\`\`\``,
+			readReturns: turnIndex === 1 ? returnedRanges(f.relative) : [] };
+	});
+	f.ctx.runner = fake;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative });
+	assert.ok(result.snapshotId);
+	assert.deepEqual([...fake.sessions.values()].map(item => item.turns), [2, 2, 1]);
+	assert.deepEqual(result.proposalAttempts.map(item => item.state), ["rejected-draft", "rejected-draft", "merged"]);
+});
+
+test("JSON syntax correction to a wrong top-level type is new format progress", async t => {
+	const f = await fixture(t);
+	const fake = new FakeSessionRunner(({ turnIndex }) => ({
+		text: turnIndex === 1 ? "```knowledge-proposals\n{broken\n```" :
+			turnIndex === 2 ? "```knowledge-proposals\n{}\n```" : "Corrected judgment: no supported knowledge proposal.",
+		readReturns: turnIndex === 1 ? returnedRanges(f.relative) : [],
+	}));
+	f.ctx.runner = fake;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative });
+	assert.equal(result.record.status, "completed");
+	assert.equal(fake.created.length, 1);
+	assert.equal([...fake.sessions.values()][0].turns, 3);
+	assert.deepEqual(result.proposalAttempts, []);
+});
+
+test("shuffling invalid operations and receipt order cannot disguise unchanged structural defects", async t => {
+	const f = await fixture(t);
+	let firstSessionId: string | undefined;
+	const badTitle = { op: "create", type: "K", title: "", body: "Synthetic body" };
+	const badBody = { op: "create", type: "K", title: "Synthetic title", body: null };
+	const submit = f.store.submitProposal.bind(f.store);
+	let submissions = 0;
+	f.store.submitProposal = async batch => {
+		submissions += 1;
+		const receipt = await submit(batch);
+		return { ...receipt, issues: submissions % 2 === 0 ? [...receipt.issues].reverse() : receipt.issues };
+	};
+	const fake = new FakeSessionRunner(({ ref, turnIndex }) => {
+		firstSessionId ??= ref.id;
+		if (ref.id !== firstSessionId) return { text: "Fresh judgment: no supported proposal.", readReturns: returnedRanges(f.relative) };
+		return { text: `\`\`\`knowledge-proposals\n${JSON.stringify(turnIndex === 1 ? [badTitle, badBody] : [badBody, badTitle])}\n\`\`\``,
+			readReturns: turnIndex === 1 ? returnedRanges(f.relative) : [] };
+	});
+	f.ctx.runner = fake;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative });
+	assert.equal(submissions, 2);
+	assert.equal(result.snapshotId, undefined);
+	assert.deepEqual([...fake.sessions.values()].map(item => item.turns), [2, 1]);
+});
+
+test("M01 continuation lazily prepares a snapshot-bound fresh context and reports its actual mode", async t => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "m04-m01-repair-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const ws = new Workspace(root);
+	await mkdir(path.dirname(ws.problemFile), { recursive: true });
+	await writeFile(ws.problemFile, "Original frozen M01 problem\n");
+	const feedbackPath = path.join(root, "feedback.md");
+	await writeFile(feedbackPath, "Frozen independent feedback\n");
+	const store = createFileKnowledgeStore(ws.knowledgeDir); await store.init();
+	const fake = new FakeSessionRunner(({ spec, turnIndex, message }) => {
+		if (spec.label === "M01" && turnIndex === 1) return "M01 private causal reasoning marker";
+		if (spec.label === "M01") {
+			assert.doesNotMatch(message, /^# 局部知识包/m);
+			assert.equal(reads, 0, "original continuation must not require knowledge retrieval");
+			return "```knowledge-proposals\n{broken\n```";
+		}
+		assert.match(message, /Original frozen M01 problem/);
+		assert.match(message, /# 局部知识包/);
+		assert.doesNotMatch(message, /M01 private causal reasoning marker/);
+		return "Fresh independent judgment: no knowledge operation.";
+	});
+	const ctx: StageContext = { ws, store, runner: fake, config: {
+		roles: { execution: "fake/execution", reviewer: "fake/reviewer", research: "fake/research" }, concurrency: 1, tools: {} } };
+	await runM01(ctx);
+	let reads = 0;
+	const list = store.list.bind(store);
+	store.list = async (...args) => { reads += 1; return list(...args); };
+	const result = await runM04(ctx, { feedback: { kind: "file", label: "Independent feedback", path: feedbackPath } });
+	assert.equal(result.mode, "research-session");
+	assert.equal(result.record.sessions[0].boundary?.mode, "continue");
+	assert.equal(result.record.sessions[1].boundary?.mode, "fresh");
+	assert.equal(fake.created.at(-1)?.tools.kind, "none");
+	assert.ok(reads > 0, "snapshot-bound knowledge is loaded only for the fresh handoff");
+	assert.deepEqual([...fake.sessions.values()].map(item => item.turns), [3, 1]);
+});
+
+test("unavailable knowledge retrieval only blocks an M01 fresh handoff, preserving original admission", async t => {
+	for (const needsRepair of [false, true]) await t.test(needsRepair ? "fresh handoff" : "original judgment", async child => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "m04-m01-admission-"));
+		child.after(() => rm(root, { recursive: true, force: true }));
+		const ws = new Workspace(root);
+		await mkdir(path.dirname(ws.problemFile), { recursive: true });
+		await writeFile(ws.problemFile, "Original question\n");
+		const feedbackPath = path.join(root, "feedback.md");
+		await writeFile(feedbackPath, "Independent feedback\n");
+		const store = createFileKnowledgeStore(ws.knowledgeDir); await store.init();
+		const fake = new FakeSessionRunner(({ turnIndex }) => turnIndex === 1 ? "Initial M01 reasoning" :
+			needsRepair ? "```knowledge-proposals\n{broken\n```" : "No supported knowledge proposal.");
+		const ctx: StageContext = { ws, store, runner: fake, config: {
+			roles: { execution: "fake/execution", reviewer: "fake/reviewer", research: "fake/research" }, concurrency: 1, tools: {} } };
+		await runM01(ctx);
+		store.list = async () => { throw new HarnessError("m04.knowledge", "private synthetic knowledge retrieval unavailable"); };
+		const action = runM04(ctx, { feedback: { kind: "file", label: "Independent feedback", path: feedbackPath } });
+		if (needsRepair) {
+			await assert.rejects(action, error => error instanceof WorkflowRepairNeededError);
+			const runs = await Promise.all((await ws.listRuns("M04")).map(id => ws.readRun("M04", id)));
+			const transaction = JSON.parse(await readFile(runs[0].outputs.find(item => item.label === "M04 知识事务状态")!.path, "utf8"));
+			assert.equal(transaction.state, "no-proposal");
+			assert.deepEqual(transaction.attempts, []);
+		} else {
+			const result = await action;
+			assert.equal(result.mode, "continue-m01");
+			assert.equal(result.record.status, "completed");
+		}
+		assert.equal(fake.created.length, 1, "a failed fresh handoff cannot create a replacement session");
+	});
+});
+
+test("repeated ineffective fresh judgment leaves typed open repair and an exact rejected transaction", async t => {
+	const f = await fixture(t);
+	const before = (await f.store.current())?.id;
+	const invalid = `\`\`\`knowledge-proposals\n${JSON.stringify([{
+		op: "create", type: "K", title: "", body: "Private rejected evidence" }])}\n\`\`\``;
+	const states: WorkflowRepairStateV1[] = [];
+	const fake = new FakeSessionRunner(({ turnIndex }) => ({ text: invalid,
+		readReturns: turnIndex === 1 ? returnedRanges(f.relative) : [] }));
+	f.ctx.runner = fake;
+	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative,
+		onRepairState: async state => { states.push(state); } }), error =>
+		error instanceof WorkflowRepairNeededError && error.code === "runner.workflow-repair-needed" && error.stage === "m04-judgment");
+	assert.equal((await f.store.current())?.id, before);
+	assert.deepEqual([...fake.sessions.values()].map(item => item.turns), [2, 1]);
+	const runs = await Promise.all((await f.ws.listRuns("M04")).map(id => f.ws.readRun("M04", id)));
+	const failed = runs.find(item => item.outputs.some(output => output.label === "M04 修复状态"))!;
+	assert.equal(failed.status, "failed");
+	const transaction = JSON.parse(await readFile(failed.outputs.find(item => item.label === "M04 知识事务状态")!.path, "utf8"));
+	assert.equal(transaction.state, "rejected-draft");
+	assert.equal(transaction.attempts.length, 1);
+	assert.equal(transaction.snapshotId, undefined);
+	assert.equal(transaction.attempts[0].state, "rejected-draft");
+	assert.equal(failed.outputs.some(item => item.label === "合入结果"), false);
+	assert.equal(states.at(-1)?.strategy, "workflow-repair-needed");
+});
+
+test("unread evidence stagnation preserves the driver-visible typed error after saving coverage", async t => {
+	const f = await fixture(t);
+	const fake = new FakeSessionRunner(() => "Provisional judgment without returned evidence.");
+	f.ctx.runner = fake;
+	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative }), error => {
+		assert.ok(error instanceof WorkflowRepairNeededError);
+		assert.equal(error.code, "runner.workflow-repair-needed");
+		assert.equal(error.stage, "m04-judgment");
+		return true;
+	});
+	assert.deepEqual([...fake.sessions.values()].map(item => item.turns), [2, 1]);
+	const runs = await Promise.all((await f.ws.listRuns("M04")).map(id => f.ws.readRun("M04", id)));
+	const failed = runs.find(item => item.outputs.some(output => output.label === "M04 修复状态"))!;
+	const transaction = JSON.parse(await readFile(failed.outputs.find(item => item.label === "M04 知识事务状态")!.path, "utf8"));
+	assert.equal(transaction.state, "no-proposal");
+	assert.deepEqual(transaction.attempts, []);
+	const coverage = JSON.parse(await readFile(failed.outputs.find(item => item.label === "M07 回流证据实际访问范围")!.path, "utf8"));
+	assert.equal(coverage.promptOutcome, "failed");
+	assert.deepEqual(coverage.returnedRanges, []);
+	const repair = JSON.parse(await readFile(failed.outputs.find(item => item.label === "M04 修复状态")!.path, "utf8"));
+	assert.equal(repair.failure, "unread-m07-evidence");
+	assert.equal(repair.strategy, "workflow-repair-needed");
+});
+
+test("unavailable fresh read-only context leaves typed open repair without store side effects", async t => {
+	const f = await fixture(t);
+	const states: WorkflowRepairStateV1[] = [];
+	const fake = new FakeSessionRunner(() => "```knowledge-proposals\n{broken\n```");
+	const create = fake.create.bind(fake);
+	fake.create = async spec => {
+		if (fake.created.length) throw new HarnessError("context.capability", "private synthetic host handoff failure");
+		return { ...await create(spec), readReturnEvents: () => returnedRanges(f.relative) };
+	};
+	f.ctx.runner = fake;
+	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative,
+		onRepairState: async state => { states.push(state); } }), error => {
+		assert.ok(error instanceof WorkflowRepairNeededError);
+		assert.doesNotMatch(error.message, /private synthetic host/);
+		return true;
+	});
+	assert.equal(fake.created.length, 1);
+	assert.equal(states.at(-1)?.failure, "context-handoff-unavailable");
+	assert.equal(states.at(-1)?.strategy, "workflow-repair-needed");
+	const runs = await Promise.all((await f.ws.listRuns("M04")).map(id => f.ws.readRun("M04", id)));
+	const failed = runs.find(item => item.outputs.some(output => output.label === "M04 修复状态"))!;
+	const transaction = JSON.parse(await readFile(failed.outputs.find(item => item.label === "M04 知识事务状态")!.path, "utf8"));
+	assert.equal(transaction.state, "no-proposal");
+	assert.deepEqual(transaction.attempts, []);
+	assert.ok(failed.failures.some(item => item.includes("private synthetic host handoff failure")));
+});
+
+test("transient fresh-session creation failures retain their original transport classification", async t => {
+	const f = await fixture(t);
+	const transient = new Error("synthetic transient session I/O failure");
+	const states: WorkflowRepairStateV1[] = [];
+	const fake = new FakeSessionRunner(() => "```knowledge-proposals\n{broken\n```");
+	const create = fake.create.bind(fake);
+	fake.create = async spec => {
+		if (fake.created.length) throw transient;
+		return { ...await create(spec), readReturnEvents: () => returnedRanges(f.relative) };
+	};
+	f.ctx.runner = fake;
+	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative,
+		onRepairState: async state => { states.push(state); } }), error => error === transient);
+	assert.equal(states.some(item => item.strategy === "workflow-repair-needed"), false);
+	assert.equal(fake.created.length, 1);
+	const runs = await Promise.all((await f.ws.listRuns("M04")).map(id => f.ws.readRun("M04", id)));
+	const failed = runs.find(item => item.outputs.some(output => output.label === "M04 修复状态"))!;
+	const transaction = JSON.parse(await readFile(failed.outputs.find(item => item.label === "M04 知识事务状态")!.path, "utf8"));
+	assert.equal(transaction.state, "no-proposal");
+	assert.deepEqual(transaction.attempts, []);
+});
+
+test("fresh M04 judgment rejects reused identity, inherited transcript, and inherited read proof", async t => {
+	for (const fault of ["reused-identity", "inherited-transcript", "inherited-read-proof"] as const)
+		await t.test(fault, async child => {
+			const f = await fixture(child);
+			const states: WorkflowRepairStateV1[] = [];
+			const fake = new FakeSessionRunner(({ turnIndex }) => ({
+				text: "```knowledge-proposals\n{broken\n```",
+				readReturns: turnIndex === 1 ? returnedRanges(f.relative) : [],
+			}));
+			const create = fake.create.bind(fake);
+			let original: SessionHandle | undefined;
+			fake.create = async spec => {
+				if (!original) return original = await create(spec);
+				if (fault === "reused-identity") return original;
+				const handle = await create(spec);
+				if (fault === "inherited-transcript") return { ...handle,
+					transcript: () => [{ role: "assistant", text: "Inherited provisional judgment" }] };
+				return { ...handle, readReturnEvents: () => returnedRanges(f.relative) };
+			};
+			f.ctx.runner = fake;
+			await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+				freshSession: true, requiredM07ReadPaths: f.relative,
+				onRepairState: async state => { states.push(state); } }), error => error instanceof WorkflowRepairNeededError);
+			assert.equal(states.at(-1)?.failure, "context-handoff-unavailable");
+			assert.equal(states.at(-1)?.strategy, "workflow-repair-needed");
+			assert.equal([...fake.sessions.values()][0].turns, 2);
+			assert.ok([...fake.sessions.values()].slice(1).every(item => item.turns === 0 && item.disposed));
+			const runs = await Promise.all((await f.ws.listRuns("M04")).map(id => f.ws.readRun("M04", id)));
+			const failed = runs.find(item => item.outputs.some(output => output.label === "M04 修复状态"))!;
+			const transaction = JSON.parse(await readFile(failed.outputs.find(item => item.label === "M04 知识事务状态")!.path, "utf8"));
+			assert.equal(transaction.state, "no-proposal");
+			assert.deepEqual(transaction.attempts, []);
+		});
+});
+
+test("observed required evidence size changes block acceptance with typed open repair", async t => {
+	const f = await fixture(t);
+	const proposal = `\`\`\`knowledge-proposals\n${JSON.stringify([{
+		op: "create", type: "K", title: "Unacceptable changed-input candidate", body: "Synthetic body",
+		usageDecision: "candidate" }])}\n\`\`\``;
+	const fake = new FakeSessionRunner(async () => {
+		await writeFile(path.join(f.ws.runDir("M07", f.goal.runId), f.relative[0]), "changed\ninput\nextra\n");
+		return { text: proposal, readReturns: returnedRanges(f.relative) };
+	});
+	f.ctx.runner = fake;
+	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative }), error => error instanceof WorkflowRepairNeededError);
+	assert.equal(fake.created.length, 1);
+	const runs = await Promise.all((await f.ws.listRuns("M04")).map(id => f.ws.readRun("M04", id)));
+	const failed = runs.find(item => item.outputs.some(output => output.label === "M04 修复状态"))!;
+	const transaction = JSON.parse(await readFile(failed.outputs.find(item => item.label === "M04 知识事务状态")!.path, "utf8"));
+	assert.equal(transaction.state, "no-proposal");
+	assert.deepEqual(transaction.attempts, []);
+	assert.equal(failed.outputs.some(item => item.label.startsWith("知识提案草案")), false);
+});
+
 test("merge exception leaves durable merge intent and does not retry in the model session", async t => {
 	const f = await fixture(t);
 	const valid = `\`\`\`knowledge-proposals\n${JSON.stringify([{
@@ -233,32 +602,54 @@ test("M04 rejects an adopted proposal before merge when a required read tool rep
 	assert.equal(attempt.outputs.some(item => item.label === "知识提案"), false);
 });
 
-test("M04 repeats same-session missing-page feedback and uses only the final fully read judgement", async t => {
+test("M04 replaces unchanged missing-page repair with fresh judgment and redoes full read proof", async t => {
 	const f = await fixture(t);
 	const provisional = `\`\`\`knowledge-proposals\n${JSON.stringify([
 		{ op: "create", type: "K", title: "Provisional method", body: "Unsupported provisional claim", usageDecision: "adopted" },
 	])}\n\`\`\``;
-	const fake = new FakeSessionRunner(({ turnIndex, message }) => {
-		if (turnIndex > 1) assert.match(message, /untruncated final page/);
-		if (turnIndex === 3) assert.match(message, /previous repair turn added no complete read proof/);
-		return { text: turnIndex < 3 ? provisional : "No transferable lesson after complete evidence review; no knowledge proposal.",
-			readReturns: turnIndex === 1 ? [
+	let firstSessionId: string | undefined;
+	const states: WorkflowRepairStateV1[] = [];
+	const fake = new FakeSessionRunner(({ ref, turnIndex, message }) => {
+		firstSessionId ??= ref.id;
+		if (ref.id === firstSessionId) {
+			if (turnIndex === 2) assert.match(message, /untruncated final page/);
+			return { text: provisional, readReturns: turnIndex === 1 ? [
 				{ toolName: "m07_evidence_read", status: "returned", path: f.relative[0], requested: {},
 					returned: { kind: "text", startLine: 1, endLine: 1, truncated: true }, at: new Date().toISOString() },
 				...returnedRanges(f.relative.slice(1)),
-			] : turnIndex === 3 ? [{ toolName: "m07_evidence_read", status: "returned", path: f.relative[0],
+			] : [] };
+		}
+		if (turnIndex === 1) {
+			assert.match(message, /fresh independent M04 judgment/);
+			assert.match(message, /previous-session returned ranges do not satisfy/);
+			assert.match(message, /Synthetic question/);
+			return { text: provisional, readReturns: [{ toolName: "m07_evidence_read", status: "returned", path: f.relative[0],
 				requested: {}, returned: { kind: "text", startLine: 2, endLine: 2, truncated: false },
-				at: new Date().toISOString() }] : [] };
+				at: new Date().toISOString() }] };
+		}
+		assert.match(message, /1-1/);
+		for (const item of f.relative.slice(1)) assert.ok(message.includes(item), "prior complete files must be read again");
+		return { text: "No transferable lesson after complete evidence review; no knowledge proposal.",
+			readReturns: returnedRanges(f.relative) };
 	});
 	f.ctx.runner = fake;
 	const before = (await f.store.current())?.id;
 	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId }, freshSession: true,
-		requiredM07ReadPaths: f.relative });
+		requiredM07ReadPaths: f.relative, onRepairState: async state => { states.push(state); } });
 	assert.equal(result.record.status, "completed");
 	assert.equal(result.proposalId, undefined, "provisional proposal must never be merged");
 	assert.equal((await f.store.current())?.id, before);
-	assert.equal(fake.created.filter(spec => spec.label === "M04-research").length, 1);
-	assert.equal([...fake.sessions.values()].find(item => item.spec.label === "M04-research")?.turns, 3);
+	assert.equal(fake.created.filter(spec => spec.label === "M04-research").length, 2);
+	const sessions = [...fake.sessions.values()];
+	assert.deepEqual(sessions.map(item => item.turns), [2, 2]);
+	assert.deepEqual(sessions[0].spec.tools, sessions[1].spec.tools);
+	assert.ok(sessions.every(item => item.disposed));
+	assert.ok(states.some(item => item.strategy === "fresh-context" && item.sessionGeneration === 2));
+	assert.equal(states.some(item => item.strategy === "workflow-repair-needed"), false);
+	const coverage = JSON.parse(await readFile(result.record.outputs.find(item => item.label === "M07 回流证据实际访问范围")!.path, "utf8"));
+	assert.equal(coverage.sessionId, sessions[1].ref.id);
+	assert.equal(coverage.earlierSessions[0].sessionId, sessions[0].ref.id);
+	assert.equal(coverage.returnedRanges.length, 4, "final proof must contain only fresh-session returns");
 });
 
 test("malformed provisional M04 output cannot end the read repair or create a proposal", async t => {

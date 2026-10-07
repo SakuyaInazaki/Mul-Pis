@@ -11,7 +11,7 @@
  *   .agent/sessions/              会话记录与会话边界规格
  *   .agent/notes/                 全项目行为记录
  */
-import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
@@ -38,6 +38,35 @@ export function newRunId(now: Date = new Date()): string {
 // callers can start runs concurrently. Serialize allocation within this process
 // and advance a persisted logical sequence rather than ordering by random ID.
 const startRunQueues = new Map<string, Promise<void>>();
+// Every writer for a run in this process shares one terminal transition. A
+// stale stage record must never restore running after host shutdown or replace
+// a failed run with a late completed answer.
+const runWriteQueues = new Map<string, Promise<void>>();
+async function canonicalRunWriteKey(file: string): Promise<string> {
+	let existing = path.resolve(file);
+	const missing: string[] = [];
+	while (!existsSync(existing)) {
+		const parent = path.dirname(existing);
+		if (parent === existing) throw new HarnessError("run.path", "run path has no existing ancestor");
+		missing.unshift(path.basename(existing));
+		existing = parent;
+	}
+	return path.join(await realpath(existing), ...missing);
+}
+
+async function withRunWrite<T>(key: string, body: () => Promise<T>): Promise<T> {
+	const prior = runWriteQueues.get(key) ?? Promise.resolve();
+	let release!: () => void;
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	const tail = prior.then(() => gate);
+	runWriteQueues.set(key, tail);
+	await prior;
+	try { return await body(); }
+	finally {
+		release();
+		if (runWriteQueues.get(key) === tail) runWriteQueues.delete(key);
+	}
+}
 
 function latestByStartOrder(records: StageRunRecord[], stage: string): StageRunRecord | undefined {
 	if (!records.length) return undefined;
@@ -74,6 +103,13 @@ export async function readTextIfExists(filePath: string): Promise<string | undef
 		return await readFile(filePath, "utf8");
 	} catch {
 		return undefined;
+	}
+}
+async function readRunTextOrAbsent(filePath: string): Promise<string | undefined> {
+	try { return await readFile(filePath, "utf8"); }
+	catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
 	}
 }
 
@@ -184,17 +220,51 @@ export class Workspace {
 	}
 
 	async writeRun(record: StageRunRecord): Promise<void> {
-		await writeFileAtomic(path.join(this.runDir(record.stage, record.runId), "run.json"), `${JSON.stringify(record, null, 2)}\n`);
+		const file = path.join(this.runDir(record.stage, record.runId), "run.json");
+		await withRunWrite(await canonicalRunWriteKey(file), async () => {
+			const oldText = await readRunTextOrAbsent(file);
+			if (oldText !== undefined) {
+				const old = JSON.parse(oldText) as StageRunRecord;
+				if (old.status !== "running" &&
+					(record.status === "running" || record.status !== old.status))
+					throw new HarnessError("run.interrupted",
+						`${record.stage} 运行 ${record.runId} 已在执行期间被记录为 ${old.status}，不能覆盖为 ${record.status}`);
+			}
+			await writeFileAtomic(file, `${JSON.stringify(record, null, 2)}\n`);
+		});
 	}
 
 	async finishRun(record: StageRunRecord, status: Exclude<StageRunRecord["status"], "running">): Promise<void> {
-		record.status = status;
-		record.finishedAt = nowIso();
-		await this.writeRun(record);
+		const finished = await this.finishRunIfRunning(record.stage, record.runId, status,
+			() => record);
+		if (!finished)
+			throw new HarnessError("run.interrupted",
+				`${record.stage} 运行 ${record.runId} 已经结束，不能覆盖为 ${status}`);
+		Object.assign(record, finished);
+	}
+
+	/** Atomic, owned terminal transition across Workspace instances in this process. */
+	async finishRunIfRunning(stage: string, runId: string,
+		status: Exclude<StageRunRecord["status"], "running">,
+		prepare: (persisted: StageRunRecord) => StageRunRecord): Promise<StageRunRecord | undefined> {
+		const file = path.join(this.runDir(stage, runId), "run.json");
+		return withRunWrite(await canonicalRunWriteKey(file), async () => {
+			const oldText = await readRunTextOrAbsent(file);
+			if (oldText === undefined) throw new HarnessError("run.missing", `找不到 ${stage} 运行 ${runId}`);
+			const old = JSON.parse(oldText) as StageRunRecord;
+			if (old.status !== "running") return undefined;
+			const next = prepare(old);
+			if (next.stage !== stage || next.runId !== runId)
+				throw new HarnessError("run.interrupted", "terminal transition changed the owned run identity");
+			next.status = status;
+			next.finishedAt = nowIso();
+			await writeFileAtomic(file, `${JSON.stringify(next, null, 2)}\n`);
+			return next;
+		});
 	}
 
 	async readRun(stage: string, runId: string): Promise<StageRunRecord> {
-		const text = await readTextIfExists(path.join(this.runDir(stage, runId), "run.json"));
+		const text = await readRunTextOrAbsent(path.join(this.runDir(stage, runId), "run.json"));
 		if (!text) throw new HarnessError("run.missing", `找不到 ${stage} 运行 ${runId}`);
 		return JSON.parse(text) as StageRunRecord;
 	}

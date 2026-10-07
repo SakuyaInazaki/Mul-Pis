@@ -18,8 +18,36 @@ import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_RE
 import { sealCampaignCarry } from "../src/runner/emergency-carry.ts";
 import { decodeCarrySidecars, encodeCarrySidecars } from "../src/runner/carry-sidecar-codec.ts";
 import { CARRY_LOGICAL_BYTES } from "../src/runner/carry-sidecar-codec.ts";
+import { workflowRepairState } from "../src/runner/repair-liveness.ts";
 
 const sha = (letter: string) => letter.repeat(40);
+test("private repair telemetry is schema checked and AEAD carried without granting selection authority", async t => {
+	const f = await compactedFixture(t);
+	const opened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7005, sha("e")), loadCarryArtifact: async () => f.secondCarry.envelopeB64 });
+	const receipt = workflowRepairState({ stage: "objective-assessment",
+		failure: "invalid-assessment", evidenceFingerprint: "a".repeat(64),
+		planFingerprint: "b".repeat(64), responseFingerprint: "c".repeat(64),
+		strategy: "fresh-context", sessionGeneration: 2 });
+	const bundle = { ...opened.priorPrivateBundle, "repair-state.json": JSON.stringify(receipt) };
+	const requestAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
+		requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
+	const sealed = opened.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit, privateBundle: bundle });
+	const seed = await authenticateSignedMissionSeed({ ...f, envelopeB64: f.seedEnvelopeB64 });
+	const checkpoint = decodeV4Checkpoint(sealed, seed.seedDigest,
+		seed.derivePrivateKey("mul-pis-ledger-continuation-v1"),
+		{ runId: "7005", runAttempt: 1, runNumber: 4, commit: sha("e") });
+	assert.equal(checkpoint.privateBundle["repair-state.json"], JSON.stringify(receipt));
+	assert.equal(checkpoint.privateBundle["candidate.cpp"],
+		opened.priorPrivateBundle?.["candidate.cpp"], "repair telemetry cannot replace selected science");
+	const malformed = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7005, sha("e")), loadCarryArtifact: async () => f.secondCarry.envelopeB64 });
+	assert.throws(() => malformed.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit,
+		privateBundle: { ...bundle, "repair-state.json": JSON.stringify({ ...receipt,
+			strategy: "scientific-acceptance" }) } }), /current carry accounting exceeds mission bounds/);
+});
 const HISTORICAL_PUSH_MESSAGE = "Synthetic old control request";
 function decodeV4Checkpoint(carry: { envelopeB64: string; sidecars: Readonly<Record<string, string>> },
 	seedDigest: string, key: Buffer, source: { runId: string; runAttempt: number;

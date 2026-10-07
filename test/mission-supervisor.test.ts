@@ -4,6 +4,7 @@ import { classifyPendingAction, type PendingActionV1 } from "../src/m07/objectiv
 import { dispatchPlannedResume, pendingActionIdentity, planMissionContinuation,
 	type FreshIndependentWorkEvidenceV1, type MissionStatusV1,
 	type SupervisorSnapshot } from "../src/runner/mission-supervisor.ts";
+import type { VerifiedWorkflowRepairPlanV1 } from "../src/runner/mission-host-adapter.ts";
 
 const tuple = "a".repeat(64);
 const source = { runId: "7002", runAttempt: 1, commit: "b".repeat(40) };
@@ -40,6 +41,17 @@ test("transient provider error plans a fresh retry after authenticated terminal 
 	assert.equal(result.intent.actionKind, "retry-transport");
 	assert.equal(result.intent.boundary, "new-isolated-workspace-no-prior-session-resume");
 	assert.deepEqual(result.intent.quarantinedOperationRefs, []);
+});
+
+test("workflow repair requires a live host brand rather than a serialized assertion", () => {
+	const action = classifyPendingAction("workflow-repair-needed", {
+		failedStage: "m04-judgment", evidenceRefs: ["repair-state.json"] });
+	const repair = snapshot(action);
+	assert.deepEqual(planMissionContinuation(repair),
+		{ kind: "wait", reason: "workflow-repair-plan-required" });
+	assert.throws(() => planMissionContinuation({ ...repair,
+		workflowRepairPlan: { version: 1, kind: "host-reviewed-workflow-repair-plan" } as VerifiedWorkflowRepairPlanV1 }),
+		/not host verified/);
 });
 
 test("an unsettled accounting chain cannot fund another run through fresh-work evidence", () => {

@@ -156,6 +156,8 @@ class EncryptTests(unittest.TestCase):
             (results / "independent-restart-goal-binding.json").write_bytes(b'{"synthetic":"binding","goalRunId":"fresh-goal"}')
             (results / "host-effect-receipt.json").write_bytes(b'{"kind":"m07-host-effect-census"}')
             (results / "m04-transaction-quarantine.json").write_bytes(b'{"kind":"unresolved-historical-m04-quarantine"}')
+            (results / "repair-state.json").write_bytes(b'{"kind":"workflow-repair-state","strategy":"fresh-context"}')
+            (results / "repair-state-copy.json").write_bytes(b"must remain excluded")
             (results / "ignored.txt").write_bytes(b"must be excluded")
             (results / "m04-transaction-copy.json").write_bytes(b"must also be excluded")
             public = root / "public.pem"
@@ -169,6 +171,7 @@ class EncryptTests(unittest.TestCase):
             self.assertNotIn("secret candidate", encrypted.read_text())
             self.assertNotIn("must be excluded", encrypted.read_text())
             self.assertNotIn("must also be excluded", encrypted.read_text())
+            self.assertNotIn("must remain excluded", encrypted.read_text())
             self.assertEqual(envelope["recipient_spki_sha256"], self.fingerprint)
             key = self.private_key.decrypt(base64.b64decode(envelope["wrapped_key_b64"]),
                 padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
@@ -176,7 +179,7 @@ class EncryptTests(unittest.TestCase):
             plain = AESGCM(key).decrypt(base64.b64decode(envelope["nonce_b64"]),
                 base64.b64decode(envelope["ciphertext_b64"]), aad)
             with tarfile.open(fileobj=io.BytesIO(plain), mode="r:") as tar:
-                self.assertEqual(sorted(tar.getnames()), sorted(["branch-child-round-1-reviewer-feedback.txt", "branch-parent-round-1-reviewer-feedback.txt", "campaign-status.json", "candidate.cpp", "context-lineage.json", "fallback-aaaaaaaaaaaa-T003-round-10-reviewer-feedback.txt", "host-effect-receipt.json", "independent-restart-goal-binding.json", "independent-restart-quarantine.json", "initial-m04-adopted-knowledge.json", "iteration-65-round-10-reviewer-feedback.txt", "lesson-delta.json", "mission-ledger-out.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "objective-checkpoint.json", "original-objective.json", "review-decision.json", "round-1-reviewer-feedback.txt", "workflow-archive.json", "m04-transaction.json", "initial-m04-transaction.json", "followon-m04-transaction.json", "iteration-65-m04-transaction.json", "fallback-aaaaaaaaaaaa-T003-m04-transaction.json", "m04-transaction-quarantine.json", *sidecars]))
+                self.assertEqual(sorted(tar.getnames()), sorted(["branch-child-round-1-reviewer-feedback.txt", "branch-parent-round-1-reviewer-feedback.txt", "campaign-status.json", "candidate.cpp", "context-lineage.json", "fallback-aaaaaaaaaaaa-T003-round-10-reviewer-feedback.txt", "host-effect-receipt.json", "independent-restart-goal-binding.json", "independent-restart-quarantine.json", "initial-m04-adopted-knowledge.json", "iteration-65-round-10-reviewer-feedback.txt", "lesson-delta.json", "mission-ledger-out.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "objective-checkpoint.json", "original-objective.json", "repair-state.json", "review-decision.json", "round-1-reviewer-feedback.txt", "workflow-archive.json", "m04-transaction.json", "initial-m04-transaction.json", "followon-m04-transaction.json", "iteration-65-m04-transaction.json", "fallback-aaaaaaaaaaaa-T003-m04-transaction.json", "m04-transaction-quarantine.json", *sidecars]))
                 self.assertEqual(tar.extractfile("candidate.cpp").read(), b"secret candidate")
             with self.assertRaises(Exception):
                 AESGCM(key).decrypt(base64.b64decode(envelope["nonce_b64"]),
@@ -213,10 +216,12 @@ class EncryptTests(unittest.TestCase):
             self.assertEqual((recovered / "branch-child-round-1-reviewer-feedback.txt").read_bytes(), b"Child rationale")
             self.assertEqual((recovered / "host-effect-receipt.json").read_bytes(), b'{"kind":"m07-host-effect-census"}')
             self.assertEqual((recovered / "m04-transaction-quarantine.json").read_bytes(), b'{"kind":"unresolved-historical-m04-quarantine"}')
+            self.assertEqual((recovered / "repair-state.json").read_bytes(), b'{"kind":"workflow-repair-state","strategy":"fresh-context"}')
             self.assertEqual((recovered / "independent-restart-quarantine.json").read_bytes(), b'{"synthetic":"quarantine","operationOutcome":"unknown"}')
             self.assertEqual((recovered / "independent-restart-goal-binding.json").read_bytes(), b'{"synthetic":"binding","goalRunId":"fresh-goal"}')
             self.assertFalse((recovered / "ignored.txt").exists())
             self.assertFalse((recovered / "m04-transaction-copy.json").exists())
+            self.assertFalse((recovered / "repair-state-copy.json").exists())
             self.assertEqual(recovered.stat().st_mode & 0o777, 0o700)
             self.assertEqual((recovered / "candidate.cpp").stat().st_mode & 0o777, 0o600)
 

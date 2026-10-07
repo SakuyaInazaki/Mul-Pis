@@ -13,7 +13,7 @@ export const PRIVATE_CONTINUATION_FILE_KEYS = ["candidate.cpp", "verification.js
 	"objective-assessment-receipts.json", "original-objective.json",
 	"experiment-plan.json", "research-history.json", "independent-restart-quarantine.json",
 	"independent-restart-goal-binding.json", "host-effect-receipt.json",
-	"transport-diagnostics.json", "m04-transaction.json",
+	"transport-diagnostics.json", "repair-state.json", "m04-transaction.json",
 	"m04-transaction-quarantine.json"] as const;
 export type PrivateContinuationBundle = Partial<Record<(typeof PRIVATE_CONTINUATION_FILE_KEYS)[number], string>>;
 export type BootstrapBinding = { contractId: string; sourceSha256: string };

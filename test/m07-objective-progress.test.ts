@@ -8,8 +8,10 @@ import { assessAndAdvanceOriginalObjective, classifyPendingAction, createOrigina
 import type { CurrentObjectiveStopReason, ModelObjectiveAssessmentV1,
 	ObjectiveNextTaskV1 } from "../src/m07/objective-progress.ts";
 import { FakeSessionRunner, type FakeReply } from "../src/runner/fake.ts";
-import type { ReadReturnEvent, SessionSpec } from "../src/runner/types.ts";
+import type { ReadReturnEvent, SessionHandle, SessionSpec } from "../src/runner/types.ts";
+import type { WorkflowRepairStateV1 } from "../src/runner/repair-liveness.ts";
 import { Workspace } from "../src/workspace.ts";
+import { HarnessError } from "../src/types.ts";
 
 const originalInputs: Record<string, string> = {
 	"original-problem.txt": "Original mission allows more than the finite pilot.\n",
@@ -473,22 +475,223 @@ test("invalid fully read assessment obeys real admission before retry and never 
 	assert.equal([...runner.sessions.values()][0].turns, 1);
 });
 
-test("unread objective evidence is fed back for same-session read and revised scientific judgement", async t => {
+test("repeated invalid assessment class survives wording changes and repairs in a fresh context", async t => {
 	const f = await fixture(t);
-	let dispatched = 0, recorded = 0;
-	const runner = new FakeSessionRunner(({ turnIndex, message }) => {
-		if (turnIndex === 1) return { text: JSON.stringify(assessment("blocked")), readReturns: ranges(f, ["second-text.txt"]) };
-		assert.match(message, /second-text\.txt/);
-		assert.match(message, /reassess the unchanged original objective/);
-		if (turnIndex === 2) return { text: JSON.stringify(assessment("blocked")), readReturns: [] };
-		assert.equal(turnIndex, 3);
-		assert.match(message, /last repair turn added no verified read coverage/);
-		return { text: JSON.stringify(assessment("continue")),
-			readReturns: ranges(f).filter(item => item.path === "second-text.txt") };
+	const repairs: WorkflowRepairStateV1[] = [];
+	let calls = 0, dispatches = 0;
+	const runner = new FakeSessionRunner(({ turnIndex, message, userMessages }) => {
+		calls++;
+		if (calls < 3) return { text: calls === 1 ? "not JSON" : "  still not JSON  ",
+			readReturns: calls === 1 ? ranges(f) : [] };
+		assert.equal(turnIndex, 1);
+		assert.equal(userMessages.length, 1);
+		assert.equal(repairs.at(-1)?.strategy, "fresh-context", "repair receipt precedes provider prompt");
+		assert.match(message, /complete original-objective\.json and every listed file/);
+		assert.doesNotMatch(message, /not JSON|failed host validation/);
+		return { text: JSON.stringify(assessment("continue")), readReturns: ranges(f) };
 	});
 	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
 		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
-		supportedTaskScopes: ["two-target-existing"], recordAssessment: async value => {
+		supportedTaskScopes: ["two-target-existing"], recordRepairState: async state => { repairs.push(state); },
+		advance: async () => { dispatches++; } });
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.equal(dispatches, 1);
+	assert.equal(runner.created.length, 2);
+	assert.equal(repairs[0].responseFingerprint, repairs[1].responseFingerprint);
+	assert.equal(repairs[0].evidenceFingerprint, repairs[1].evidenceFingerprint);
+	assert.ok(repairs.every(item => !JSON.stringify(item).includes("not JSON")));
+});
+
+test("fresh assessor cannot dispatch using its predecessor's full read proof", async t => {
+	const f = await fixture(t);
+	let calls = 0, dispatches = 0;
+	const runner = new FakeSessionRunner(({ turnIndex, message }) => {
+		calls++;
+		if (calls < 3) return { text: "not JSON", readReturns: calls === 1 ? ranges(f) : [] };
+		if (calls === 3) {
+			assert.equal(turnIndex, 1);
+			return { text: JSON.stringify(assessment("continue")),
+				readReturns: ranges(f).filter(item => item.path === "candidate.cpp") };
+		}
+		assert.equal(calls, 4);
+		assert.equal(dispatches, 0);
+		assert.match(message, /Unread or incomplete files: original-objective\.json/);
+		return { text: JSON.stringify(assessment("continue")),
+			readReturns: ranges(f).filter(item => item.path !== "candidate.cpp") };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		supportedTaskScopes: ["two-target-existing"], advance: async () => { dispatches++; } });
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.equal(dispatches, 1);
+	assert.equal(runner.created.length, 2);
+	assert.deepEqual(result.assessment?.unreadEvidence, []);
+	assert.equal(result.assessment?.evidenceRead.length, f.evidence.length + 1);
+});
+
+test("unavailable fresh assessor handoff leaves a typed workflow repair open without a human gate", async t => {
+	for (const unavailable of ["fresh-factory", "frozen-input"] as const) {
+		const f = await fixture(t);
+		const repairs: WorkflowRepairStateV1[] = [];
+		let calls = 0, creations = 0, dispatches = 0;
+		const runner = new FakeSessionRunner(async () => {
+			calls++;
+			if (calls === 2 && unavailable === "frozen-input")
+				await rm(path.join(f.evidenceRoot, "second-text.txt"));
+			return { text: "not JSON", readReturns: calls === 1 ? ranges(f) : [] };
+		});
+		const create = runner.create.bind(runner);
+		runner.create = async spec => {
+			creations++;
+			if (creations === 2 && unavailable === "fresh-factory")
+				throw new HarnessError("context.capability", "synthetic fresh read-only grant unavailable");
+			return create(spec);
+		};
+		const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+			persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+			supportedTaskScopes: ["two-target-existing"], recordRepairState: async state => { repairs.push(state); },
+			advance: async () => { dispatches++; } });
+		assert.equal(result.stopReason, "workflow-repair-needed");
+		assert.equal(dispatches, 0);
+		assert.equal(calls, 2);
+		assert.equal(repairs.at(-1)?.strategy, "workflow-repair-needed");
+		const checkpoint = objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [],
+			assessment: result.assessment, stopReason: result.stopReason, pendingActionFacts: {} });
+		assert.equal(checkpoint.objectiveOutcome, "incomplete");
+		assert.equal(checkpoint.continuation.pendingAction?.kind, "repair-workflow-state");
+		assert.equal(checkpoint.continuation.pendingAction?.humanRequired, undefined);
+		assert.equal(checkpoint.continuation.pendingAction?.verifiedHumanBlocker, undefined);
+	}
+});
+
+test("transient fresh assessor creation failure stays retryable and does not exhaust model repair", async t => {
+	const f = await fixture(t);
+	const repairs: WorkflowRepairStateV1[] = [];
+	let calls = 0, creations = 0, dispatches = 0;
+	const runner = new FakeSessionRunner(() => {
+		calls++;
+		return { text: "not JSON", readReturns: calls === 1 ? ranges(f) : [] };
+	});
+	const create = runner.create.bind(runner);
+	runner.create = async spec => {
+		creations++;
+		if (creations === 2) throw new Error("synthetic transient local I/O failure");
+		return create(spec);
+	};
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		supportedTaskScopes: ["two-target-existing"], recordRepairState: async state => { repairs.push(state); },
+		advance: async () => { dispatches++; } });
+	assert.equal(result.stopReason, "assessment-failed");
+	assert.equal(calls, 2, "failed fresh creation must not replay a provider prompt");
+	assert.equal(creations, 2, "the assessor must not blindly retry unknown creation failure");
+	assert.equal(dispatches, 0);
+	assert.equal(repairs.at(-1)?.failure, "context-handoff-unavailable");
+	assert.equal(repairs.at(-1)?.strategy, "fresh-context");
+	assert.ok(repairs.every(state => state.strategy !== "workflow-repair-needed"));
+	const checkpoint = objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [],
+		assessment: result.assessment, stopReason: result.stopReason,
+		pendingActionFacts: { failedStage: "read-only-assessor" } });
+	assert.equal(checkpoint.objectiveOutcome, "incomplete");
+	assert.equal(checkpoint.continuation.pendingAction?.kind, "retry-readonly-assessment");
+	assert.equal(checkpoint.continuation.pendingAction?.humanRequired, undefined);
+});
+
+test("transient fresh-boundary persistence failure does not authorize another prompt or exhaust repair", async t => {
+	const f = await fixture(t);
+	const repairs: WorkflowRepairStateV1[] = [];
+	let calls = 0;
+	const runner = new FakeSessionRunner(() => {
+		calls++;
+		return { text: "not JSON", readReturns: ranges(f) };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: async () => {
+			if (f.runRecord.sessions.length === 2) throw Object.assign(new Error("synthetic transient receipt failure"), { code: "EIO" });
+			await f.ws.writeRun(f.runRecord);
+		}, assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		supportedTaskScopes: ["two-target-existing"], recordRepairState: async state => { repairs.push(state); },
+		advance: async () => { throw new Error("must not dispatch"); } });
+	assert.equal(result.stopReason, "assessment-failed");
+	assert.equal(calls, 2);
+	assert.equal(runner.created.length, 2);
+	assert.equal([...runner.sessions.values()][1].turns, 0);
+	assert.equal([...runner.sessions.values()][1].disposed, true);
+	assert.equal(repairs.at(-1)?.failure, "context-handoff-unavailable");
+	assert.ok(repairs.every(state => state.strategy !== "workflow-repair-needed"));
+});
+
+test("a runner that reuses the old session cannot authorize a fresh assessment prompt", async t => {
+	const f = await fixture(t);
+	let calls = 0;
+	const runner = new FakeSessionRunner(() => {
+		calls++;
+		return { text: "not JSON", readReturns: ranges(f) };
+	});
+	const create = runner.create.bind(runner);
+	let first: SessionHandle | undefined;
+	runner.create = async spec => first ??= await create(spec);
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		supportedTaskScopes: ["two-target-existing"], advance: async () => { throw new Error("must not dispatch"); } });
+	assert.equal(result.stopReason, "workflow-repair-needed");
+	assert.equal(calls, 2, "the reused handle must never receive another prompt");
+	assert.equal(runner.created.length, 1);
+});
+
+test("fresh repair keeps the frozen goal, model, capability facts and user overrides", async t => {
+	const f = await fixture(t);
+	const initialGoal = f.contract.goal;
+	const capabilities = [{ scope: "two-target-existing", available: true, description: "Original CPU executor", limits: ["CPU only"] }];
+	const overrides = ["Original user override"];
+	let calls = 0;
+	const runner = new FakeSessionRunner(({ spec, message }) => {
+		calls++;
+		if (calls < 3) return { text: "not JSON", readReturns: ranges(f) };
+		assert.equal(spec.model, "fake/research");
+		assert.ok(message.includes(initialGoal));
+		assert.match(message, /Original CPU executor|Original user override/);
+		assert.doesNotMatch(message, /Mutated/);
+		return { text: JSON.stringify(assessment("continue")), readReturns: ranges(f) };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner, capabilities, userOverrides: overrides,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		supportedTaskScopes: ["two-target-existing"], recordRepairState: async state => {
+			if (state.strategy === "same-session-feedback") {
+				f.contract.goal = "Mutated goal";
+				f.sessionSpec.model = "fake/mutated";
+				capabilities[0].available = false;
+				capabilities[0].description = "Mutated executor";
+				overrides[0] = "Mutated override";
+			}
+		}, advance: async () => "continued" });
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.equal(result.advanced, "continued");
+	assert.equal(runner.created.length, 2);
+});
+
+test("repeated unchanged unread evidence replaces context and requires every frozen file again", async t => {
+	const f = await fixture(t);
+	let dispatched = 0, recorded = 0;
+	let calls = 0;
+	const repairs: WorkflowRepairStateV1[] = [];
+	const runner = new FakeSessionRunner(({ turnIndex, message }) => {
+		calls++;
+		if (calls === 1) return { text: JSON.stringify(assessment("blocked")), readReturns: ranges(f, ["second-text.txt"]) };
+		assert.match(message, /second-text\.txt/);
+		if (calls === 2) {
+			assert.match(message, /reassess the unchanged original objective/);
+			return { text: JSON.stringify(assessment("blocked")), readReturns: [] };
+		}
+		assert.equal(calls, 3);
+		assert.equal(turnIndex, 1);
+		assert.match(message, /Original objective \(unchanged\)/);
+		assert.doesNotMatch(message, /previous assessment|last repair turn/);
+		return { text: JSON.stringify(assessment("continue")), readReturns: ranges(f) };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		supportedTaskScopes: ["two-target-existing"], recordRepairState: async state => { repairs.push(state); }, recordAssessment: async value => {
 			recorded++;
 			if (recorded === 1) assert.deepEqual(value.unreadEvidence, ["second-text.txt"]);
 		}, advance: async () => { dispatched++; } });
@@ -498,7 +701,11 @@ test("unread objective evidence is fed back for same-session read and revised sc
 	assert.equal(result.assessment?.proposalHistory?.length, 3);
 	assert.equal(recorded, 3);
 	assert.equal(dispatched, 1);
-	assert.equal(runner.created.length, 1);
+	assert.equal(runner.created.length, 2);
+	assert.deepEqual(repairs.map(item => item.strategy), ["same-session-feedback", "fresh-context"]);
+	assert.deepEqual(repairs.map(item => item.sessionGeneration), [1, 2]);
+	assert.equal([...runner.sessions.values()][0].disposed, true);
+	assert.equal([...runner.sessions.values()][1].transcript.length, 2);
 });
 
 test("a read tool error receives the correct frozen path and range, then continues in the same session", async t => {
@@ -822,18 +1029,23 @@ test("unsupported model proposal replans in the same session and retains blocked
 	assert.deepEqual(checkpoint.continuation.blockedProposals, [blocked.nextTask]);
 });
 
-test("repeated blocked verdicts replan with verified capability until a feasible task is chosen", async t => {
+test("repeated blocked verdicts use a fresh assessor before dispatching a feasible task", async t => {
 	const f = await fixture(t);
 	let prompts = 0, dispatches = 0;
-	const runner = new FakeSessionRunner(({ message }) => {
+	const runner = new FakeSessionRunner(({ message, turnIndex, userMessages }) => {
 		prompts++;
 		if (prompts === 2) {
 			assert.match(message, /Reassess every remaining requirement/);
 			assert.match(message, /original-task: Satisfy all original supplied requirements/);
 		}
-		if (prompts === 3) assert.match(message, /blocked verdict remains provisional/);
+		if (prompts === 3) {
+			assert.equal(turnIndex, 1);
+			assert.equal(userMessages.length, 1);
+			assert.match(message, /Original objective \(unchanged\)/);
+			assert.doesNotMatch(message, /blocked verdict remains provisional/);
+		}
 		return { text: JSON.stringify(assessment(prompts === 3 ? "continue" : "blocked")),
-			readReturns: prompts === 1 ? ranges(f) : [] };
+			readReturns: prompts === 2 ? [] : ranges(f) };
 	});
 	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
 		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
@@ -841,7 +1053,7 @@ test("repeated blocked verdicts replan with verified capability until a feasible
 		advance: async () => { dispatches++; } });
 	assert.equal(prompts, 3);
 	assert.equal(dispatches, 1);
-	assert.equal(runner.created.length, 1);
+	assert.equal(runner.created.length, 2);
 	assert.equal(result.assessment?.proposalHistory?.length, 3);
 	assert.equal(result.stopReason, "objective-reassessment-pending");
 });
@@ -865,13 +1077,16 @@ test("transport failure after a blocked assessment retains its prior checkpoint 
 	assert.equal([...runner.sessions.values()][0].turns, 2);
 });
 
-test("repeated unsupported proposals receive feedback until a feasible task is chosen", async t => {
+test("repeated unsupported proposals replace context before a feasible task is chosen", async t => {
 	const f = await fixture(t);
 	let calls = 0;
-	const runner = new FakeSessionRunner(({ message }) => {
+	const runner = new FakeSessionRunner(({ message, turnIndex }) => {
 		calls++;
-		if (calls === 4) assert.match(message, /repeats an unavailable proposal/);
-		return { text: JSON.stringify(assessment("continue", calls < 4 ? "registered-csr-experiment" : "two-target-existing")), readReturns: ranges(f) };
+		if (calls === 3) {
+			assert.equal(turnIndex, 1);
+			assert.match(message, /Original objective \(unchanged\)/);
+		}
+		return { text: JSON.stringify(assessment("continue", calls < 3 ? "registered-csr-experiment" : "two-target-existing")), readReturns: ranges(f) };
 	});
 	let dispatched = false;
 	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
@@ -879,11 +1094,101 @@ test("repeated unsupported proposals receive feedback until a feasible task is c
 		supportedTaskScopes: ["two-target-existing", "registered-csr-experiment"], capabilities: availableCapabilities.slice(0, 1),
 		advance: async task => { assert.equal(task.adapterScope, "two-target-existing"); dispatched = true; } });
 	assert.equal(dispatched, true);
-	assert.equal(calls, 4);
+	assert.equal(calls, 3);
+	assert.equal(runner.created.length, 2);
 	assert.equal(result.stopReason, "objective-reassessment-pending");
-	assert.equal(result.assessment?.proposalHistory?.length, 4);
+	assert.equal(result.assessment?.proposalHistory?.length, 3);
 	assert.equal(objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [], assessment: result.assessment,
 		stopReason: result.stopReason }).objectiveOutcome, "incomplete");
+});
+
+test("unchanged unsupported proposal after fresh reread remains repair-needed with no executable next task", async t => {
+	const f = await fixture(t);
+	const repairs: WorkflowRepairStateV1[] = [];
+	let calls = 0, dispatches = 0;
+	const runner = new FakeSessionRunner(() => {
+		calls++;
+		const proposal = assessment("continue", "outside-current-adapter");
+		proposal.rationale = `Changed rationale ${calls} does not supply a capability`;
+		if (calls === 2) proposal.nextTask!.objective = "Different prose still requests the same unavailable adapter";
+		return { text: JSON.stringify(proposal, null, calls === 2 ? 2 : undefined), readReturns: ranges(f) };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		supportedTaskScopes: ["two-target-existing"], capabilities: availableCapabilities,
+		recordRepairState: async state => { repairs.push(state); }, advance: async () => { dispatches++; } });
+	assert.equal(result.stopReason, "workflow-repair-needed");
+	assert.equal(calls, 3);
+	assert.equal(runner.created.length, 2);
+	assert.equal(dispatches, 0);
+	assert.deepEqual(repairs.map(item => item.strategy),
+		["same-session-feedback", "fresh-context", "workflow-repair-needed"]);
+	assert.equal(repairs[0].responseFingerprint, repairs[1].responseFingerprint);
+	assert.equal(repairs[1].evidenceFingerprint, repairs[2].evidenceFingerprint);
+	assert.equal(result.assessment?.proposalHistory?.length, 3);
+	assert.ok(result.assessment?.nextTask, "stale proposal remains available as assessment context");
+	const checkpoint = objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [],
+		assessment: result.assessment, stopReason: result.stopReason, pendingActionFacts: {} });
+	assert.equal(checkpoint.objectiveOutcome, "incomplete");
+	assert.equal(checkpoint.continuation.nextTask, undefined);
+	assert.equal(checkpoint.continuation.pendingAction?.kind, "repair-workflow-state");
+	assert.equal(checkpoint.continuation.pendingAction?.humanRequired, undefined);
+	assert.throws(() => objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [],
+		stopReason: result.stopReason, pendingAction: { ...checkpoint.continuation.pendingAction!, kind: "fresh-m07-task" } }),
+		/required stage repair/);
+	assert.throws(() => objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [],
+		stopReason: result.stopReason, pendingAction: { ...checkpoint.continuation.pendingAction!, humanRequired: true,
+			verifiedHumanBlocker: { kind: "input-unavailable", verifiedBy: "host", evidenceRef: "host-check", exclusiveRequiredAction: true } } }),
+		/workflow repair|human gate/);
+});
+
+test("a changed addressed obligation permits its own fresh repair strategy without a session quota", async t => {
+	const f = await fixture(t);
+	f.contract = { ...f.contract, obligations: [...f.contract.obligations,
+		{ id: "second-task", description: "Resolve a second independently open requirement" }] };
+	await writeFile(f.contractFile, `${JSON.stringify(f.contract, null, 2)}\n`);
+	const repairs: WorkflowRepairStateV1[] = [];
+	let calls = 0, dispatches = 0;
+	const runner = new FakeSessionRunner(({ turnIndex }) => {
+		calls++;
+		const proposal = assessment("continue", calls === 5 ? "two-target-existing" : "outside-current-adapter");
+		proposal.unresolvedObligations = ["original-task", "second-task"];
+		proposal.nextTask!.addresses = [calls < 3 ? "original-task" : "second-task"];
+		if (calls === 3 || calls === 5) assert.equal(turnIndex, 1);
+		return { text: JSON.stringify(proposal), readReturns: ranges(f) };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		supportedTaskScopes: ["two-target-existing"], capabilities: availableCapabilities,
+		recordRepairState: async state => { repairs.push(state); }, advance: async () => { dispatches++; } });
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.equal(dispatches, 1);
+	assert.equal(runner.created.length, 3);
+	assert.deepEqual(repairs.map(item => item.strategy),
+		["same-session-feedback", "fresh-context", "same-session-feedback", "fresh-context"]);
+	assert.deepEqual(repairs.map(item => item.sessionGeneration), [1, 2, 2, 3]);
+	assert.notEqual(repairs[1].planFingerprint, repairs[2].planFingerprint);
+});
+
+test("cycling unsupported host states receives a fresh strategy even without adjacent identical replies", async t => {
+	const f = await fixture(t);
+	const repairs: WorkflowRepairStateV1[] = [];
+	let calls = 0;
+	const runner = new FakeSessionRunner(({ turnIndex }) => {
+		calls++;
+		if (calls === 4) assert.equal(turnIndex, 1);
+		const scope = calls === 2 ? "registered-csr-experiment" : "outside-current-adapter";
+		return { text: JSON.stringify(assessment("continue", scope)), readReturns: ranges(f) };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		supportedTaskScopes: ["two-target-existing"], capabilities: availableCapabilities.slice(0, 1),
+		recordRepairState: async state => { repairs.push(state); }, advance: async () => { throw new Error("must not dispatch"); } });
+	assert.equal(result.stopReason, "workflow-repair-needed");
+	assert.equal(calls, 4);
+	assert.equal(runner.created.length, 2);
+	assert.deepEqual(repairs.map(item => item.strategy),
+		["same-session-feedback", "same-session-feedback", "fresh-context", "workflow-repair-needed"]);
 });
 
 test("current user override accompanies an unchanged legacy frozen contract", async t => {

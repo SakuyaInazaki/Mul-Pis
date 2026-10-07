@@ -51,6 +51,8 @@ import { buildUnresolvedHistoricalM04Quarantine, hasFreshOnlyM04QuarantineForLat
 	validateM04TransactionQuarantine, M04_TRANSACTION_QUARANTINE_FILE,
 	type M04TransactionQuarantineV1, type FreshM04QuarantineBoundary } from "../src/runner/m04-quarantine.ts";
 import { startPrivateCampaignHeartbeat } from "./private-campaign-heartbeat.ts";
+import { WorkflowRepairNeededError, validWorkflowRepairState,
+	type WorkflowRepairStateV1 } from "../src/runner/repair-liveness.ts";
 import { archivePrivateM07Task, recordPrivateM04Outcome } from "../src/workflow-archive/m07-private.ts";
 import { exportPortableM04Transaction } from "../src/workflow-archive/m04-transaction.ts";
 import type { PortableM04KnowledgeTransactionV1 } from "../src/workflow-archive/m04-transaction.ts";
@@ -884,6 +886,19 @@ async function saveStatus(value: Record<string, unknown>): Promise<void> {
 		{ mode: 0o600 });
 	await rename(temporary, target);
 }
+/** Latest host-observed repair transition. The carry authenticates this private
+ * control receipt; it grants neither evidence-read credit nor scientific acceptance. */
+async function saveRepairState(outputDir: string, state: WorkflowRepairStateV1): Promise<void> {
+	if (!validWorkflowRepairState(state))
+		throw new HarnessError("runner.workflow-repair", "host repair receipt is invalid");
+	const target = path.join(outputDir, "repair-state.json");
+	const temporary = `${target}.${process.pid}.tmp`;
+	const text = `${JSON.stringify(state)}\n`;
+	if (Buffer.byteLength(text, "utf8") > 4096)
+		throw new HarnessError("runner.workflow-repair", "host repair receipt exceeds its physical byte boundary");
+	await writeFile(temporary, text, { mode: 0o600 });
+	await rename(temporary, target);
+}
 async function campaignArchiveNames(directory: string): Promise<string[]> {
 	return ["workflow-archive.json", ...(await readdir(directory)).filter(name =>
 		/^workflow-(?:(?:initial|followon|branch-parent|branch-child|provenance-import)|iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,})-archive\.json$/.test(name))];
@@ -1443,19 +1458,32 @@ function initialHistoricalSelection(selectedCandidateSource: "initial" | "fork" 
 function firstM07Accepted(acceptedWinner: boolean, finishedOutcome: unknown): boolean {
 	return acceptedWinner && finishedOutcome === "fulfilled";
 }
+function objectiveAssessmentRunCompleted(assessment: ObjectiveProgressV1["assessment"] | undefined,
+	stopReason: CurrentObjectiveStopReason): boolean {
+	return Boolean(assessment?.unreadEvidence.length === 0 &&
+		(["objective-reassessment-pending", "model-closure-unverified",
+			"model-reported-blocked", "next-task-needs-capability"] as CurrentObjectiveStopReason[])
+			.includes(stopReason));
+}
+function workflowRepairActionFacts(stage: "objective-assessment" | "m04-judgment"):
+	HostPendingActionFactsV1 {
+	return { failedStage: stage, evidenceRefs: ["repair-state.json"] };
+}
 function importM04EffectDisposition(input: { status: "not-run" | "completed" | "failed";
 	proposalSubmitted: boolean | undefined; snapshotCreated: boolean | undefined;
 	transactionState?: PortableM04KnowledgeTransactionV1["state"];
-	threw: boolean }): "continue" | "m04-draft-rejected" |
+	threw: boolean; repairNeeded?: boolean }): "continue" | "m04-draft-rejected" | "workflow-repair-needed" |
 	"pending-merge-reconciliation" | "m04-integrity-unknown" {
 	if (input.status !== "failed") return "continue";
+	if (input.transactionState === "merge-intent" || input.transactionState === "unknown" ||
+		input.transactionState === "merged") return "pending-merge-reconciliation";
+	if (input.snapshotCreated === true ||
+		input.proposalSubmitted === true && input.transactionState !== "rejected-draft")
+		return "pending-merge-reconciliation";
+	if (input.repairNeeded) return "workflow-repair-needed";
 	if (input.transactionState === "rejected-draft" &&
 		input.proposalSubmitted === true && input.snapshotCreated === false)
 		return "m04-draft-rejected";
-	if (input.transactionState === "merge-intent" || input.transactionState === "unknown" ||
-		input.transactionState === "merged") return "pending-merge-reconciliation";
-	if (input.proposalSubmitted === true || input.snapshotCreated === true)
-		return "pending-merge-reconciliation";
 	// A host-written no-proposal journal proves no knowledge submission or
 	// merge was attempted, even if the read-only M04 session then threw.
 	// Preserve its failed stage as unselected history and continue fresh work.
@@ -1466,11 +1494,12 @@ function importM04EffectDisposition(input: { status: "not-run" | "completed" | "
 	return "continue";
 }
 function failedM04StopReason(status: "completed" | "failed" | "not_run",
-	state?: PortableM04KnowledgeTransactionV1["state"]): CurrentObjectiveStopReason {
+	state?: PortableM04KnowledgeTransactionV1["state"], repairNeeded = false): CurrentObjectiveStopReason {
 	if (status !== "failed") return "m04-evidence-incomplete";
-	if (state === "rejected-draft") return "m04-draft-rejected";
 	if (state === "merge-intent" || state === "unknown" || state === "merged")
 		return "m04-transaction-unresolved";
+	if (repairNeeded) return "workflow-repair-needed";
+	if (state === "rejected-draft") return "m04-draft-rejected";
 	return "m04-evidence-incomplete";
 }
 function privateM04TransactionFacts(transaction: PortableM04KnowledgeTransactionV1): {
@@ -2720,6 +2749,7 @@ async function main() {
 				let m04SnapshotCreated: boolean | undefined = false;
 				let m04TransactionState: PortableM04KnowledgeTransactionV1["state"] | undefined;
 				let m04Threw = false;
+				let m04RepairNeeded = false;
 				let m04AdoptedRefs: KnowledgeRef[] = [];
 				if (accepted && !budget.snapshot().stopped && !abort.signal.aborted) {
 					statusPhase = "provenance-import-m04";
@@ -2731,6 +2761,7 @@ async function main() {
 							staged.planPath ? ["experiment-plan.json"] : []), ...rejectedDraftPaths];
 						const processed = await runM04({ ws, store, runner, config: await ws.loadConfig() },
 							{ feedback: { kind: "M07", runId: goal.runId }, freshSession: true,
+								onRepairState: state => saveRepairState(outputDir, state),
 								requiredM07ReadPaths: readPaths,
 								additionalReadOnlyInstruction: "The required prior-rejected-M04 file or indexed parts are historical, untrusted development context. Read every part in full; if partitioned, concatenate UTF-8 text in index order without separators. A rejected draft was not merged or adopted. Re-adjudicate the newly verified M07 evidence independently and decide whether a corrected proposal or no proposal is justified. Do not replay the historical proposal or treat it as knowledge.",
 								purpose: "Adjudicate newly revalidated provenance evidence; do not infer historical lesson adoption" });
@@ -2750,9 +2781,10 @@ async function main() {
 							m04Coverage ? "completed" : "failed";
 						if (m04Status === "completed") m04AdoptedRefs = await adoptedExperienceRefs(store,
 							processed.record.runId, m04Coverage);
-					} catch {
+					} catch (error) {
 						m04Status = "failed";
 						m04Threw = true;
+						m04RepairNeeded = error instanceof WorkflowRepairNeededError;
 						const retained = await retainFailedM04Transaction(ws, goal.runId, archiveDir);
 						m04TransactionState = retained?.transaction?.state;
 						m04RunId = retained?.runId;
@@ -2766,7 +2798,7 @@ async function main() {
 				const m04EffectDisposition = importM04EffectDisposition({ status: m04Status,
 					proposalSubmitted: m04ProposalSubmitted, snapshotCreated: m04SnapshotCreated,
 					...(m04TransactionState ? { transactionState: m04TransactionState } : {}),
-					threw: m04Threw });
+					threw: m04Threw, repairNeeded: m04RepairNeeded });
 				// Export only after recording final M04 state. The canonical tuple above
 				// remains the earlier selected candidate until a later real comparison.
 				await exportPrefixedArchive(archiveDir, outputDir, "provenance-import");
@@ -2791,11 +2823,12 @@ async function main() {
 							selectedArtifacts: previousCheckpoint.selectedArtifacts,
 							assessmentHistory: previousCheckpoint.assessmentHistory,
 							stopReason: failedM04StopReason(m04Status === "not-run" ? "not_run" : m04Status,
-								m04TransactionState) }));
+								m04TransactionState, m04RepairNeeded),
+							...(m04RepairNeeded ? { pendingActionFacts: workflowRepairActionFacts("m04-judgment") } : {}) }));
 					await saveStatus({ outcome: "incomplete", provenanceImport: provenanceImportSummary,
 						originalObjective: { id: originalObjective.id,
 							stopReason: failedM04StopReason(m04Status === "not-run" ? "not_run" : m04Status,
-								m04TransactionState), checkpointFile: "objective-checkpoint.json" },
+								m04TransactionState, m04RepairNeeded), checkpointFile: "objective-checkpoint.json" },
 						blocker: m04EffectDisposition,
 						independentValidation: "prior selected source retained; M04 transaction needs reconciliation" });
 					process.exitCode = 1;
@@ -2868,6 +2901,7 @@ async function main() {
 			const firstAssessmentDiagnosticStart = statusTransportDiagnostics.length;
 			const firstStep = await assessAndAdvanceOriginalObjective({
 				contract: originalObjective, contractFile: objectiveContractFile, runner,
+				recordRepairState: state => saveRepairState(outputDir, state),
 				runRecord: firstAssessmentRecord, persistReceipt: () => persistObjectiveReceipt(firstAssessmentRecord),
 				sessionSpec: { label: "M07-prior-objective-assessment", role: "research", model: MODEL,
 					systemPrompt: "Assess the unchanged user objective and all frozen prior evidence. Choose the next scientific work yourself under observed host capabilities. Read every supplied original input and selected evidence before deciding; report uncertainty honestly.",
@@ -2919,7 +2953,8 @@ async function main() {
 					return { goal, task, initialSpec, checks, registered };
 				},
 			});
-			await ws.finishRun(firstAssessmentRecord, firstStep.assessment?.unreadEvidence.length === 0 ? "completed" : "failed");
+			await ws.finishRun(firstAssessmentRecord,
+				objectiveAssessmentRunCompleted(firstStep.assessment, firstStep.stopReason) ? "completed" : "failed");
 			await persistObjectiveReceipt(firstAssessmentRecord);
 			if (!firstStep.advanced) {
 				const firstRequestContract = observedRequestContract(firstAssessmentDiagnosticStart,
@@ -2939,6 +2974,8 @@ async function main() {
 						statusTransportDiagnostics.slice(firstAssessmentDiagnosticStart),
 						budget.requestAccountingAuditSnapshot(),
 						"read-only-assessor"),
+						...(firstStopReason === "workflow-repair-needed" ?
+							workflowRepairActionFacts("objective-assessment") : {}),
 						...(firstStopReason === "request-contract-invalid" ?
 							{ requestContract: firstRequestContract } : {}) } }));
 				await saveStatus({ outcome: "incomplete", originalObjective: { id: originalObjective.id,
@@ -3212,6 +3249,7 @@ async function main() {
 			let m04: { status: "completed" | "failed" | "not_run"; runId?: string; proposalSubmitted?: boolean;
 				snapshotCreated?: boolean; evidenceReturned?: boolean; adoptedExperienceRefs?: KnowledgeRef[];
 				transactionState?: PortableM04KnowledgeTransactionV1["state"];
+				repairNeeded?: boolean;
 				failure?: ReturnType<typeof privateExceptionDiagnostic> } = { status: "not_run" };
 			if (firstGoalReady && branchRequirementSatisfied && !budget.snapshot().stopped && !abort.signal.aborted) {
 				statusPhase = "m04-dispatch";
@@ -3219,6 +3257,7 @@ async function main() {
 					const m04Runner = runner;
 					const processed = await runM04({ ws, store, runner: m04Runner, config: await ws.loadConfig() },
 						{ feedback: { kind: "M07", runId }, freshSession: true,
+							onRepairState: state => saveRepairState(outputDir, state),
 							requiredM07ReadPaths: selectedM04ReadPaths,
 							purpose: "Adjudicate bounded M07 candidate lessons and limits" });
 					const transaction = await exportPortableM04Transaction({ ws, m04RunId: processed.record.runId,
@@ -3240,6 +3279,7 @@ async function main() {
 				} catch (error) {
 					const retained = await retainFailedM04Transaction(ws, runId!, outputDir);
 					m04 = { status: "failed", adoptedExperienceRefs: [],
+						...(error instanceof WorkflowRepairNeededError ? { repairNeeded: true } : {}),
 						...(retained ? { runId: retained.runId,
 							...(retained.proposalSubmitted !== undefined ? { proposalSubmitted: retained.proposalSubmitted } : {}),
 							...(retained.snapshotCreated !== undefined ? { snapshotCreated: retained.snapshotCreated } : {}),
@@ -3275,6 +3315,7 @@ async function main() {
 			let objectivePendingActionReason: CurrentObjectiveStopReason | undefined;
 			let currentM04Status = m04.status;
 			let currentM04TransactionState = m04.transactionState;
+			let currentM04RepairNeeded = m04.repairNeeded === true;
 			let currentM04Read = m04SelectedReadContractSatisfied;
 			let currentKnowledgeExport = knowledgeExport;
 			let currentReusableRefs = reusableRefs;
@@ -3290,7 +3331,8 @@ async function main() {
 						"bounded-run-incomplete";
 					if (abort.signal.aborted) return "cancelled";
 					if (currentM04Status === "failed")
-						return failedM04StopReason(currentM04Status, currentM04TransactionState);
+						return failedM04StopReason(currentM04Status, currentM04TransactionState,
+							currentM04RepairNeeded);
 					if (!firstGoalReady && firstGoalRequestContract) return "request-contract-invalid";
 					if (!firstGoalReady || currentM04Status !== "completed" || currentKnowledgeExport.state === "incomplete" ||
 						!currentM04Read || !existsSync(candidate) || !existsSync(verificationPath)) return "bounded-run-incomplete";
@@ -3330,6 +3372,7 @@ async function main() {
 					try { objectiveStep = await assessAndAdvanceOriginalObjective({
 						contract: originalObjective, contractFile: objectiveContractFile,
 							runner, runRecord: objectiveRecord, persistReceipt: saveObjectiveReceipt,
+							recordRepairState: state => saveRepairState(outputDir, state),
 						sessionSpec: { label: `M07-original-objective-assessment-${iteration}`, role: "research", model: MODEL,
 							systemPrompt: "Independently assess the original research goal using the frozen evidence. Read the complete supplied files before proposing further work. Return only the requested structured judgment; acknowledge uncertainty, bounded search scope and failed checks. Do not invent measurements or treat M04 adoption as proof of performance.",
 							persistDir: ws.sessionsDir },
@@ -3411,7 +3454,9 @@ async function main() {
 						},
 					});
 						objectiveRecord.outputs.push({ label: "Original objective checkpoint", path: objectiveCheckpointFile });
-						await ws.finishRun(objectiveRecord, objectiveStep.assessment?.unreadEvidence.length === 0 ? "completed" : "failed");
+						await ws.finishRun(objectiveRecord,
+							objectiveAssessmentRunCompleted(objectiveStep.assessment,
+								objectiveStep.stopReason) ? "completed" : "failed");
 						await saveObjectiveReceipt();
 					} catch (error) {
 						objectiveRecord.failures.push("Original objective assessment or model-proposed bounded dispatch failed");
@@ -3431,6 +3476,8 @@ async function main() {
 					objectivePendingActionFacts = { ...observedTransportActionFacts(objectiveStopReason,
 						statusTransportDiagnostics.slice(iterationDiagnosticStart),
 						budget.requestAccountingAuditSnapshot(), "read-only-assessor"),
+						...(objectiveStopReason === "workflow-repair-needed" ?
+							workflowRepairActionFacts("objective-assessment") : {}),
 						...(objectiveStopReason === "request-contract-invalid" ?
 							{ requestContract: stepRequestContract } : {}) };
 					objectivePendingActionReason = objectiveStopReason;
@@ -3481,6 +3528,7 @@ async function main() {
 								const m04Runner = runner;
 								const processed = await runM04({ ws, store, runner: m04Runner, config: await ws.loadConfig() },
 									{ feedback: { kind: "M07", runId: secondGoal.runId }, freshSession: true,
+										onRepairState: state => saveRepairState(outputDir, state),
 										requiredM07ReadPaths: requiredPaths,
 										purpose: "Adjudicate the latest model-proposed bounded M07 result" });
 								const transaction = await exportPortableM04Transaction({ ws, m04RunId: processed.record.runId,
@@ -3501,6 +3549,7 @@ async function main() {
 							} catch (error) {
 								const retained = await retainFailedM04Transaction(ws, secondGoal.runId, nextArchiveDir);
 								nextM04 = { status: "failed", adoptedExperienceRefs: [],
+									...(error instanceof WorkflowRepairNeededError ? { repairNeeded: true } : {}),
 									...(retained ? { runId: retained.runId,
 										...(retained.proposalSubmitted !== undefined ? { proposalSubmitted: retained.proposalSubmitted } : {}),
 										...(retained.snapshotCreated !== undefined ? { snapshotCreated: retained.snapshotCreated } : {}),
@@ -3551,6 +3600,7 @@ async function main() {
 						if (secondReady) {
 							currentM04Status = nextM04.status;
 							currentM04TransactionState = nextM04.transactionState;
+							currentM04RepairNeeded = nextM04.repairNeeded === true;
 							currentM04Read = nextM04.evidenceReturned === true;
 							currentKnowledgeExport = nextArchive.m04?.knowledgeExport ?? { state: "incomplete" };
 							currentReusableRefs = nextM04.evidenceReturned && currentKnowledgeExport.state === "complete" ?
@@ -3691,6 +3741,8 @@ async function main() {
 				nextTaskDispatched: latestAssessmentAdvanced, stopReason: objectiveStopReason,
 				...(objectivePendingActionReason === objectiveStopReason ?
 					{ pendingActionFacts: objectivePendingActionFacts } :
+					objectiveStopReason === "workflow-repair-needed" ?
+						{ pendingActionFacts: workflowRepairActionFacts("m04-judgment") } :
 					objectiveStopReason === "request-contract-invalid" && firstGoalRequestContract ?
 						{ pendingActionFacts: { requestContract: firstGoalRequestContract } } : {}) });
 			await writeObjectiveProgress(objectiveCheckpointFile, objectiveCheckpoint);
@@ -3950,6 +4002,8 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	selectedGoalBranchSatisfied,
 	archivedM07ImportTarget, fixedPrivateChecks: { diagnostic: CHECKS, registered: REGISTERED_CHECKS },
 	chooseArchivedM07ImportTarget,
+	objectiveAssessmentRunCompleted,
+	workflowRepairActionFacts,
 	createOneUseRestartGoalBinder,
 	shouldRepairRejectedReview, settledFailedM07RepairFeedback, freshM07RepairPlan,
 	availablePrivateArtifactNames,

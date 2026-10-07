@@ -42,7 +42,8 @@ export type ResumeJournalRecord = Readonly<{
 	idempotencyKey: string;
 	intentBinding: Readonly<{ source: ResumeIntent["source"]; envelopeSha256: string;
 		contractId: string; selectedTupleSha256: string; pendingActionSha256: string;
-		actionKind: ResumeIntent["actionKind"]; actionProvenance?: ActionProvenance }>;
+		actionKind: ResumeIntent["actionKind"]; actionProvenance?: ActionProvenance;
+		workflowRepair?: ResumeIntent["workflowRepair"] }>;
 	control: TestedControlBinding;
 	state: ResumeJournalState;
 	negativeReconciliations: number;
@@ -78,6 +79,18 @@ function canonical(value: unknown): string {
 	return refuse("unsupported binding value");
 }
 
+function repairBinding(value: ResumeIntent["workflowRepair"]): ResumeIntent["workflowRepair"] {
+	if (value === undefined) return undefined;
+	if (!hex64(value?.reviewedPlanSha256) || !hex40(value.testedSourceCommit) || !hex40(value.testedTree) ||
+		value.successfulCi?.workflow !== "workflow-regression.yml" || !runId(value.successfulCi.runId) ||
+		value.successfulCi.runAttempt !== 1 || value.successfulCi.headCommit !== value.testedSourceCommit ||
+		value.successfulCi.conclusion !== "success") refuse("invalid workflow repair binding");
+	return { reviewedPlanSha256: value.reviewedPlanSha256, testedSourceCommit: value.testedSourceCommit,
+		testedTree: value.testedTree, successfulCi: { workflow: value.successfulCi.workflow,
+			runId: value.successfulCi.runId, runAttempt: value.successfulCi.runAttempt,
+			headCommit: value.successfulCi.headCommit, conclusion: "success" } };
+}
+
 function intentBinding(intent: ResumeIntent): ResumeJournalRecord["intentBinding"] {
 	const suppliedProvenance = (intent as ResumeIntent & {
 		actionProvenance?: ActionProvenance }).actionProvenance;
@@ -87,6 +100,7 @@ function intentBinding(intent: ResumeIntent): ResumeJournalRecord["intentBinding
 		refuse("invalid action provenance");
 	const actionProvenance = suppliedProvenance ? { kind: "current-host-derived" as const,
 		checkpointSha256: suppliedProvenance.checkpointSha256 } : undefined;
+	const workflowRepair = repairBinding(intent.workflowRepair);
 	if (intent?.version !== 1 || intent.kind !== "fresh-independent-mission-resume" ||
 		!runId(intent.source?.runId) || !Number.isSafeInteger(intent.source.runAttempt) ||
 		intent.source.runAttempt < 1 || !hex40(intent.source.commit) ||
@@ -94,7 +108,8 @@ function intentBinding(intent: ResumeIntent): ResumeJournalRecord["intentBinding
 		!hex64(intent.selectedTupleSha256) || !hex64(intent.pendingActionSha256) ||
 		!intent.contractId || intent.boundary !== "new-isolated-workspace-no-prior-session-resume" ||
 		pendingActionIdentity(intent.pendingAction) !== intent.pendingActionSha256 ||
-		intent.pendingAction.kind !== intent.actionKind)
+		intent.pendingAction.kind !== intent.actionKind ||
+		(intent.actionKind === "repair-workflow-state") !== Boolean(workflowRepair))
 		refuse("invalid or changed private intent");
 	const source = { runId: intent.source.runId, runAttempt: intent.source.runAttempt,
 		commit: intent.source.commit };
@@ -102,12 +117,14 @@ function intentBinding(intent: ResumeIntent): ResumeJournalRecord["intentBinding
 		source,
 		envelopeSha256: intent.envelopeSha256, contractId: intent.contractId,
 		selectedTupleSha256: intent.selectedTupleSha256,
-		pendingActionSha256: intent.pendingActionSha256 }));
+		pendingActionSha256: intent.pendingActionSha256,
+		...(workflowRepair ? { workflowRepair } : {}) }));
 	if (expected !== intent.idempotencyKey) refuse("idempotency key does not bind the intent");
 	return { source, envelopeSha256: intent.envelopeSha256,
 		contractId: intent.contractId, selectedTupleSha256: intent.selectedTupleSha256,
 		pendingActionSha256: intent.pendingActionSha256, actionKind: intent.actionKind,
-		...(actionProvenance ? { actionProvenance } : {}) };
+		...(actionProvenance ? { actionProvenance } : {}),
+		...(workflowRepair ? { workflowRepair } : {}) };
 }
 
 function controlBinding(input: TestedControlBinding): TestedControlBinding {
@@ -172,11 +189,18 @@ async function readRecord(file: string): Promise<ResumeJournalRecord> {
 	if (canonical(controlBinding(value.control)) !== canonical(value.control))
 		refuse("stored control descriptor has unexpected fields");
 	const bound = value.intentBinding;
+	const workflowRepair = repairBinding(bound.workflowRepair);
+	if (workflowRepair && (workflowRepair.testedSourceCommit !== value.control.testedSourceCommit ||
+		workflowRepair.testedTree !== value.control.testedTree ||
+		canonical(workflowRepair.successfulCi) !== canonical(value.control.successfulCi)))
+		refuse("stored workflow repair does not bind the tested control source");
 	if (!runId(bound.source?.runId) || !Number.isSafeInteger(bound.source.runAttempt) ||
 		bound.source.runAttempt < 1 || !hex40(bound.source.commit) ||
 		!hex64(bound.envelopeSha256) || !hex64(bound.selectedTupleSha256) ||
 		!hex64(bound.pendingActionSha256) || typeof bound.contractId !== "string" ||
 		!bound.contractId || typeof bound.actionKind !== "string" || !bound.actionKind ||
+		(bound.actionKind === "repair-workflow-state") !== Boolean(workflowRepair) ||
+		(workflowRepair !== undefined && canonical(workflowRepair) !== canonical(bound.workflowRepair)) ||
 		(bound.actionProvenance !== undefined &&
 			(bound.actionProvenance?.kind !== "current-host-derived" ||
 				!hex64(bound.actionProvenance?.checkpointSha256))))
@@ -185,7 +209,8 @@ async function readRecord(file: string): Promise<ResumeJournalRecord> {
 		{ actionProvenance: bound.actionProvenance } : {}), source: bound.source,
 		envelopeSha256: bound.envelopeSha256, contractId: bound.contractId,
 		selectedTupleSha256: bound.selectedTupleSha256,
-		pendingActionSha256: bound.pendingActionSha256 }));
+		pendingActionSha256: bound.pendingActionSha256,
+		...(workflowRepair ? { workflowRepair } : {}) }));
 	if (expected !== value.idempotencyKey) refuse("stored idempotency binding changed");
 	if (value.state === "acknowledged" ?
 		!runId(value.successorRunId) || !hex40(value.observedControlCommit) ||
@@ -286,6 +311,11 @@ export class MissionResumeJournal {
 	}
 	async reserve(intent: ResumeIntent, binding: TestedControlBinding): Promise<ResumeJournalRecord> {
 		const privateBinding = intentBinding(intent), control = controlBinding(binding);
+		if (privateBinding.workflowRepair &&
+			(privateBinding.workflowRepair.testedSourceCommit !== control.testedSourceCommit ||
+				privateBinding.workflowRepair.testedTree !== control.testedTree ||
+				canonical(privateBinding.workflowRepair.successfulCi) !== canonical(control.successfulCi)))
+			refuse("workflow repair does not bind the tested control source");
 		return this.lock(async () => {
 			const records = await this.records();
 			const old = records.find(record => record.idempotencyKey === intent.idempotencyKey);

@@ -255,7 +255,9 @@ class ProgressRunner implements SessionRunner {
 
 export class ResearchService {
 	private readonly options: ResearchServiceOptions;
-	private readonly activeStageOperations = new Map<string, { root: string; runs: Array<{ stage: string; runId: string }> }>();
+	private readonly activeStageOperations = new Map<string, {
+		root: string; runs: Array<{ stage: string; runId: string }>;
+		pendingStarts: Set<Promise<void>>; closing: boolean }>();
 	private readonly activeGoalRuns = new Map<string, { root: string; runIds: Set<string> }>();
 
 	constructor(options: ResearchServiceOptions) {
@@ -385,7 +387,9 @@ export class ResearchService {
 
 	/** Interrupt every exact run registered by this service instance, regardless of Pi cwd. */
 	async interruptAllActive(reason: string, includeActiveGoals = true): Promise<void> {
-		for (const active of [...this.activeStageOperations.values()]) await this.interruptOwned(active, reason);
+		const stages = [...this.activeStageOperations.values()];
+		for (const active of stages) active.closing = true;
+		for (const active of stages) await this.interruptOwned(active, reason);
 		if (includeActiveGoals === false) return;
 		const goals = [...this.activeGoalRuns.values()];
 		let firstError: unknown;
@@ -396,15 +400,21 @@ export class ResearchService {
 		if (firstError) throw firstError;
 	}
 
-	private async interruptOwned(active: { root: string; runs: Array<{ stage: string; runId: string }> }, reason: string): Promise<void> {
+	private async interruptOwned(active: { root: string; runs: Array<{ stage: string; runId: string }>;
+		pendingStarts: Set<Promise<void>>; closing: boolean }, reason: string): Promise<void> {
+		active.closing = true;
+		// A run.json can become visible before startRun returns its record. Wait for
+		// those exact owned starts to register; never infer ownership from a
+		// workspace scan that may include another actor's run.
+		await Promise.all([...active.pendingStarts]);
 		const ws = new Workspace(active.root);
 		for (const owned of active.runs) {
-			const run = await ws.readRun(owned.stage, owned.runId);
-			if (run.status !== "running") continue;
-			run.failures.push(`运行中断（host-shutdown）：${reason}`);
-			run.remarks.push("由拥有本次活动操作的 Pi extension 依照已登记 runId 在正常 session_shutdown 路径记录；未自动重跑。SIGKILL 或进程崩溃不在此保证内。");
-			await ws.finishRun(run, "failed");
-			await ws.writeNote(run, "主 Pi 会话在阶段仍运行时正常关闭；harness 记录中断事实，没有把阶段标为完成，也没有自动重放。 ");
+			const run = await ws.finishRunIfRunning(owned.stage, owned.runId, "failed", persisted => {
+				persisted.failures.push(`运行中断（host-shutdown）：${reason}`);
+				persisted.remarks.push("由拥有本次活动操作的 Pi extension 依照已登记 runId 在正常 session_shutdown 路径记录；未自动重跑。SIGKILL 或进程崩溃不在此保证内。");
+				return persisted;
+			});
+			if (run) await ws.writeNote(run, "主 Pi 会话在阶段仍运行时正常关闭；harness 记录中断事实，没有把阶段标为完成，也没有自动重放。 ");
 		}
 	}
 
@@ -558,11 +568,21 @@ export class ResearchService {
 	private async stageContext(root: string, stage: ResearchStage, signal?: AbortSignal): Promise<StageContext> {
 		const ws = new Workspace(root);
 		const originalStartRun = ws.startRun.bind(ws);
-		ws.startRun = async (...args) => {
-			const record = await originalStartRun(...args);
-			const key = await canonicalMutationKey(root);
-			this.activeStageOperations.get(key)?.runs.push({ stage: record.stage, runId: record.runId });
-			return record;
+		const key = await canonicalMutationKey(root);
+		const active = this.activeStageOperations.get(key);
+		ws.startRun = (runStage, inputs, knowledgeSnapshot) => {
+			if (active?.closing)
+				return Promise.reject(new HarnessError("run.interrupted", "owned stage operation is shutting down"));
+			const registered = originalStartRun(runStage, inputs, knowledgeSnapshot).then(record => {
+				active?.runs.push({ stage: record.stage, runId: record.runId });
+				return record;
+			});
+			if (active) {
+				const settled = registered.then(() => undefined, () => undefined);
+				active.pendingStarts.add(settled);
+				void settled.then(() => { active.pendingStarts.delete(settled); });
+			}
+			return registered;
 		};
 		if (!existsSync(ws.configFile)) throw new HarnessError("config.missing", `缺少 ${ws.configFile}；请明确配置各角色模型`);
 		const store = createFileKnowledgeStore(ws.knowledgeDir);
@@ -575,7 +595,8 @@ export class ResearchService {
 		const key = await canonicalMutationKey(root);
 		if (activeMutations.has(key)) throw new HarnessError("m07.busy", `工作区已有同步研究操作：${root}`);
 		activeMutations.add(key);
-		if (stage) this.activeStageOperations.set(key, { root: path.resolve(root), runs: [] });
+		if (stage) this.activeStageOperations.set(key, { root: path.resolve(root), runs: [],
+			pendingStarts: new Set(), closing: false });
 		try { return await operation(); } finally { activeMutations.delete(key); this.activeStageOperations.delete(key); }
 	}
 }

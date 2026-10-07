@@ -4,6 +4,8 @@ import path from "node:path";
 import { openBoundedSession, type EvidenceBindingV1 } from "../context/boundary.ts";
 import type { SessionRunner, SessionSpec } from "../runner/types.ts";
 import type { DeepSeekRequestViolation } from "../runner/deepseek-request-contract.ts";
+import { workflowRepairFingerprint, workflowRepairState, type WorkflowRepairFailure,
+	type WorkflowRepairStateV1 } from "../runner/repair-liveness.ts";
 import type { StageRunRecord } from "../types.ts";
 import { HarnessError } from "../types.ts";
 
@@ -63,7 +65,7 @@ export type CurrentObjectiveStopReason = "accounting-integrity-error" |
 	"assessment-invalid" | "assessment-evidence-unread" | "assessment-evidence-suspended" | "model-reported-blocked" | "model-closure-unverified" |
 	"original-checks-unverified" | "assessment-validation-pending" | "next-task-pending" | "next-task-needs-capability" |
 	"objective-reassessment-pending" | "dispatch-failed" |
-	"request-contract-invalid" |
+	"request-contract-invalid" | "workflow-repair-needed" |
 	"artifact-capacity-boundary" | "m04-evidence-incomplete" | "m04-draft-rejected" |
 	"m04-transaction-unresolved" | "bounded-run-incomplete";
 export type ObjectiveStopReason = CurrentObjectiveStopReason | HistoricalObjectiveStopReason;
@@ -76,7 +78,7 @@ const historicalObjectiveStopReasons: readonly HistoricalObjectiveStopReason[] =
 export type PendingActionKindV1 = "retry-readonly-assessment" | "retry-evidence-read" |
 	"fresh-m07-task" | "repair-rejected-m04" | "repair-request-contract" | "reconcile-m07-operation" |
 	"reconcile-m04-transaction" | "restore-evidence" | "retry-transport" |
-	"refresh-auth" | "supply-capability";
+	"refresh-auth" | "supply-capability" | "repair-workflow-state";
 export type PendingActionSafetyV1 = "same-session-read-only" | "fresh-work-only" |
 	"no-replay-until-reconciled";
 
@@ -99,7 +101,7 @@ export interface PendingActionV1 {
 	target?: { goalRunId?: string; taskId?: string; operationRefs?: string[] };
 	evidenceRefs?: string[];
 	/** Observed host stage and transport failure; no provider message or prompt. */
-	failedStage?: "read-only-assessor" | "m07-execution";
+	failedStage?: "read-only-assessor" | "objective-assessment" | "m04-judgment" | "m07-execution";
 	transportFailure?: true;
 	requestContract?: { violation: DeepSeekRequestViolation; messageIndex: number | null };
 	/** Optional provenance when the host has authenticated the prior carry. */
@@ -138,7 +140,7 @@ const safeControlRefs = (value: unknown): value is string[] => Array.isArray(val
 const pendingKinds: PendingActionKindV1[] = ["retry-readonly-assessment", "retry-evidence-read",
 	"fresh-m07-task", "repair-rejected-m04", "repair-request-contract",
 	"reconcile-m07-operation", "reconcile-m04-transaction",
-	"restore-evidence", "retry-transport", "refresh-auth", "supply-capability"];
+	"restore-evidence", "retry-transport", "refresh-auth", "supply-capability", "repair-workflow-state"];
 const pendingSafeties: PendingActionSafetyV1[] = ["same-session-read-only", "fresh-work-only",
 	"no-replay-until-reconciled"];
 const objectiveStopReasons: CurrentObjectiveStopReason[] = [
@@ -146,7 +148,7 @@ const objectiveStopReasons: CurrentObjectiveStopReason[] = [
 	"assessment-invalid", "assessment-evidence-unread", "assessment-evidence-suspended", "model-reported-blocked",
 	"model-closure-unverified", "original-checks-unverified", "assessment-validation-pending",
 	"next-task-pending", "next-task-needs-capability", "objective-reassessment-pending", "dispatch-failed",
-	"request-contract-invalid",
+	"request-contract-invalid", "workflow-repair-needed",
 	"artifact-capacity-boundary", "m04-evidence-incomplete",
 	"m04-draft-rejected", "m04-transaction-unresolved", "bounded-run-incomplete"];
 export const isCurrentObjectiveStopReason = (value: unknown): value is CurrentObjectiveStopReason =>
@@ -170,8 +172,9 @@ export function classifyPendingAction(stopReason: CurrentObjectiveStopReason,
 		throw new HarnessError("m07.objective", "pending action operation references are invalid");
 	if (hostFacts.evidenceRefs !== undefined && !safeControlRefs(hostFacts.evidenceRefs))
 		throw new HarnessError("m07.objective", "pending action evidence references are invalid");
-	if (hostFacts.failedStage !== undefined && hostFacts.failedStage !== "read-only-assessor" &&
-		hostFacts.failedStage !== "m07-execution")
+	if (hostFacts.failedStage !== undefined &&
+		!(["read-only-assessor", "objective-assessment", "m04-judgment", "m07-execution"] as const)
+			.includes(hostFacts.failedStage))
 		throw new HarnessError("m07.objective", "pending action failed stage is invalid");
 	if (hostFacts.transportFailure !== undefined && typeof hostFacts.transportFailure !== "boolean")
 		throw new HarnessError("m07.objective", "pending action transport fact is invalid");
@@ -212,6 +215,8 @@ export function classifyPendingAction(stopReason: CurrentObjectiveStopReason,
 	} else if (stopReason === "accounting-integrity-error") {
 		kind = "retry-transport";
 		safety = "no-replay-until-reconciled";
+	} else if (stopReason === "workflow-repair-needed") {
+		kind = "repair-workflow-state";
 	} else if (human) {
 		kind = human.kind === "credential-unavailable" ? "refresh-auth" :
 			human.kind === "input-unavailable" ? "restore-evidence" : "supply-capability";
@@ -246,7 +251,7 @@ export function classifyPendingAction(stopReason: CurrentObjectiveStopReason,
 		...(hostFacts.transportFailure ? { transportFailure: true as const } : {}),
 		...(requestContract ? { requestContract: { ...requestContract } } : {}),
 		...(source ? { source: { ...source } } : {}),
-		...(human && safety !== "no-replay-until-reconciled" ?
+		...(human && safety !== "no-replay-until-reconciled" && stopReason !== "workflow-repair-needed" ?
 			{ humanRequired: true as const, verifiedHumanBlocker: { ...human } } : {}) };
 }
 
@@ -288,6 +293,7 @@ export function validatePendingAction(action: PendingActionV1, stopReason: Objec
 		"m04-evidence-incomplete": "retry-evidence-read",
 		"m04-draft-rejected": "repair-rejected-m04",
 		"request-contract-invalid": "repair-request-contract",
+		"workflow-repair-needed": "repair-workflow-state",
 		"model-reported-blocked": "retry-readonly-assessment",
 		"model-closure-unverified": "retry-readonly-assessment",
 		"original-checks-unverified": "retry-readonly-assessment",
@@ -296,6 +302,9 @@ export function validatePendingAction(action: PendingActionV1, stopReason: Objec
 		"output-limit": "retry-transport",
 	};
 	const required = requiredRepairKind[stopReason];
+	if ((action.kind === "repair-workflow-state" && stopReason !== "workflow-repair-needed") ||
+		(stopReason === "workflow-repair-needed" && (action.humanRequired || action.verifiedHumanBlocker)))
+		throw new HarnessError("m07.objective", "workflow repair cannot become a human gate or unrelated stage repair");
 	if (required && !operationRefs.length && !action.verifiedHumanBlocker && action.kind !== required)
 		throw new HarnessError("m07.objective", "pending action does not preserve the required stage repair");
 	if (!operationRefs.length && !action.verifiedHumanBlocker &&
@@ -462,7 +471,8 @@ export function objectiveProgress(contract: OriginalObjectiveContractV1, input: 
 			unresolvedDetails: fulfilled ? [] : [...new Set([...(input.assessment?.unresolvedDetails ?? []),
 				...(input.assessment?.blockedProposals ?? []).map(item => item.objective)])],
 			...(input.assessment?.blockedProposals?.length ? { blockedProposals: input.assessment.blockedProposals } : {}),
-			...(input.assessment?.nextTask && input.assessment.unreadEvidence.length === 0 && !input.nextTaskDispatched ?
+			...(input.assessment?.nextTask && input.assessment.unreadEvidence.length === 0 && !input.nextTaskDispatched &&
+				effectiveStopReason !== "workflow-repair-needed" ?
 				{ nextTask: input.assessment.nextTask } : {}),
 			requiresOriginalInputs: true, requiresBudgetAdmission: true,
 			requiresOperationReconciliation: Boolean(input.unresolvedOperationIds?.length),
@@ -485,6 +495,8 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 	/** Current user policy, applied without rewriting a frozen prior contract. */
 	userOverrides?: string[];
 	recordAssessment?: (assessment: NonNullable<ObjectiveProgressV1["assessment"]>) => Promise<void>;
+	/** Durable control facts only; never substitutes for evidence reading or a valid verdict. */
+	recordRepairState?: (state: WorkflowRepairStateV1) => Promise<void>;
 	advance: (task: ObjectiveNextTaskV1) => Promise<T>;
 }): Promise<{ assessment?: ObjectiveProgressV1["assessment"]; advanced?: T; stopReason: CurrentObjectiveStopReason }> {
 	const assessmentAdmission = currentObjectiveAdmission(input.assessmentAdmission);
@@ -508,15 +520,25 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		input.evidenceRequirements.requiredNames.some(name => !safeName(name) || !input.evidence.some(item => item.name === name)) ||
 		(input.evidenceRequirements.instructions !== undefined && !nonemptyText(input.evidenceRequirements.instructions))))
 		throw new HarnessError("m07.objective", "required adapter evidence is missing or invalid");
+	// The complete assessment plan stays frozen even if a caller mutates its input
+	// objects while a prompt or persistence callback is running.
+	const contract = structuredClone(input.contract);
+	const sourceEvidence = input.evidence.map(item => ({ ...item }));
+	const capabilities = input.capabilities?.map(item => ({ ...item, limits: [...item.limits] }));
+	const supportedTaskScopes = [...input.supportedTaskScopes];
+	const userOverrides = [...(input.userOverrides ?? contract.userOverrides ?? [])];
+	const evidenceInstructions = input.evidenceRequirements?.instructions;
+	const sessionSpec = structuredClone(input.sessionSpec);
+	const evidenceRoot = input.evidenceRoot;
 
 	const contractBytes = await readFile(input.contractFile);
 	if (contractBytes.length > MAX_EVIDENCE_BYTES) throw new HarnessError("m07.objective", "original objective contract exceeds evidence file size boundary");
-	if (contractBytes.toString("utf8") !== `${JSON.stringify(input.contract, null, 2)}\n`)
+	if (contractBytes.toString("utf8") !== `${JSON.stringify(contract, null, 2)}\n`)
 		throw new HarnessError("m07.objective", "original objective contract changed after freezing");
 	// Keep only per-file metadata. Evidence is read through a paged tool by the assessor;
 	// an aggregate byte cap would reject a valid collection before any such read.
 	const materials: Array<{ name: string; file: string; lineCount: number; digest: string }> = [];
-	for (const item of input.evidence) {
+	for (const item of sourceEvidence) {
 		const info = await lstat(item.file);
 		if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_EVIDENCE_BYTES)
 			throw new HarnessError("m07.objective", "objective evidence is not a bounded regular file");
@@ -528,43 +550,44 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		materials.push({ ...item, lineCount: text.split("\n").length - (text.endsWith("\n") ? 1 : 0),
 			digest: createHash("sha256").update(bytes).digest("hex") });
 	}
-	await mkdir(input.evidenceRoot, { mode: 0o700 });
-	const frozenContract = path.join(input.evidenceRoot, "original-objective.json");
+	await mkdir(evidenceRoot, { mode: 0o700 });
+	const frozenContract = path.join(evidenceRoot, "original-objective.json");
 	await copyFile(input.contractFile, frozenContract);
 	if (!(await readFile(frozenContract)).equals(contractBytes))
 		throw new HarnessError("m07.objective", "frozen original objective changed during copy");
 	const evidence: EvidenceBindingV1[] = [
-		{ version: 1, label: "frozen original objective", path: frozenContract, status: "frozen-copy", sourceVersion: input.contract.id },
+		{ version: 1, label: "frozen original objective", path: frozenContract, status: "frozen-copy", sourceVersion: contract.id },
 	];
 	for (const item of materials) {
-		const copy = path.join(input.evidenceRoot, item.name);
+		const copy = path.join(evidenceRoot, item.name);
 		await copyFile(item.file, copy);
 		const frozen = await readFile(copy);
 		if (frozen.length > MAX_EVIDENCE_BYTES || createHash("sha256").update(frozen).digest("hex") !== item.digest)
 			throw new HarnessError("m07.objective", "frozen objective evidence changed during copy");
-		evidence.push({ version: 1, label: item.name, path: copy, status: "frozen-copy", sourceVersion: input.contract.id });
+		evidence.push({ version: 1, label: item.name, path: copy, status: "frozen-copy", sourceVersion: contract.id });
 	}
-	const spec: SessionSpec = { ...input.sessionSpec,
-		tools: { kind: "read-dir", root: input.evidenceRoot, toolName: "objective_evidence_read" } };
-	const handle = await openBoundedSession(input.runner, input.runRecord, {
-		mode: "fresh", intent: "independent-judgment", reason: "Assess the original user goal from frozen bounded evidence before choosing further M07 work",
-		evidence, spec,
+	const spec: SessionSpec = { ...sessionSpec,
+		tools: { kind: "read-dir", root: evidenceRoot, toolName: "objective_evidence_read" } };
+	const openAssessor = (reason: string) => openBoundedSession(input.runner, input.runRecord, {
+		mode: "fresh", intent: "independent-judgment", reason,
+		evidence: structuredClone(evidence), spec: structuredClone(spec),
 	}, input.persistReceipt);
+	let handle = await openAssessor("Assess the original user goal from frozen bounded evidence before choosing further M07 work");
 	try {
-		const prompt = ["# Original objective (unchanged)", input.contract.goal,
+		const prompt = ["# Original objective (unchanged)", contract.goal,
 			"# User overrides (higher priority than supplied task material)",
-			...(input.userOverrides ?? input.contract.userOverrides ?? []),
-			"# Original obligations", ...input.contract.obligations.map(item => `${item.id}: ${item.description}`),
-			"# Observed execution capabilities", ...(input.capabilities ?? []).map(item =>
+			...userOverrides,
+			"# Original obligations", ...contract.obligations.map(item => `${item.id}: ${item.description}`),
+			"# Observed execution capabilities", ...(capabilities ?? []).map(item =>
 				`${item.scope}: ${item.available ? "available" : "unavailable"}; ${item.description}; limits: ${item.limits.join("; ")}`),
-			`Closure policy: ${input.contract.closure}. A bounded child goal and accepted candidate do not alone establish original-goal completion.`,
-			input.evidenceRequirements?.instructions ?? "Read all supplied material; the caller identifies the original inputs and the meaning of artifact names.",
+			`Closure policy: ${contract.closure}. A bounded child goal and accepted candidate do not alone establish original-goal completion.`,
+			evidenceInstructions ?? "Read all supplied material; the caller identifies the original inputs and the meaning of artifact names.",
 			"# Frozen bounded evidence", "Use objective_evidence_read to read the complete original-objective.json and every listed file. If a file is paginated, read every page including the untruncated end. The file names are:",
 			...materials.map(item => item.name),
 			"Return only strict JSON with version 1, decision (fulfilled, continue, or blocked), rationale, evidenceRefs (file names above), unresolvedObligations (IDs above), unresolvedDetails (your concrete open requirements from the full original assignment), and when continuing nextTask {objective, addresses, adapterScope}. Use a scope only when its observed host capability covers your proposed work. If a proposed task has no available registered executor, retain it as unresolved and name the unavailable capability explicitly. The host may ask you to replan feasible work; preserve unresolved requirements. Assess honestly. Propose the next scientific work yourself from unresolved original obligations; do not change task permissions or claim a global optimum from a finite evaluation."].join("\n\n");
-		const frozenFileAccessible = async (name: string): Promise<boolean> => {
+		const frozenFileAccessible = async (name: string, rejectUnknownIo = false): Promise<boolean> => {
 			try {
-				const file = path.join(input.evidenceRoot, name);
+				const file = path.join(evidenceRoot, name);
 				const info = await lstat(file);
 				if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_EVIDENCE_BYTES) return false;
 				const bytes = await readFile(file);
@@ -572,9 +595,14 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				const expected = materials.find(item => item.name === name)?.digest;
 				return bytes.length <= MAX_EVIDENCE_BYTES && expected !== undefined &&
 					createHash("sha256").update(bytes).digest("hex") === expected;
-			} catch { return false; }
+			} catch (error) {
+				if (rejectUnknownIo && !["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(
+					(error as NodeJS.ErrnoException)?.code ?? "")) throw error;
+				return false;
+			}
 		};
-		const coverage = (name: string, lines: number): { complete: boolean; score: number; nextRange: string } => {
+		const coverage = (name: string, lines: number): { complete: boolean; score: number; nextRange: string;
+			coveredRanges: Array<[number, number]>; reachedUntruncatedEnd: boolean } => {
 			const returned = handle.readReturnEvents();
 			const rows = returned.filter(item => item.toolName === "objective_evidence_read" && item.path === name &&
 				item.status === "returned" && item.returned.kind === "text" && item.returned.startLine !== undefined &&
@@ -583,6 +611,12 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			const covered = new Set<number>();
 			for (const row of rows) for (let line = row.returned.startLine!; line <= row.returned.endLine! && line <= lines; line++) covered.add(line);
 			const reachedUntruncatedEnd = rows.some(item => item.returned.endLine === lines && item.returned.truncated === false);
+			const coveredRanges: Array<[number, number]> = [];
+			for (const line of [...covered].sort((a, b) => a - b)) {
+				const last = coveredRanges.at(-1);
+				if (last && last[1] + 1 === line) last[1] = line;
+				else coveredRanges.push([line, line]);
+			}
 			let start = 1;
 			while (start <= lines && covered.has(start)) start++;
 			let end = start;
@@ -590,6 +624,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			const offset = start <= lines ? start : Math.max(1, lines);
 			const limit = start <= lines ? end - start + 1 : 1;
 			return { complete: reachedUntruncatedEnd && covered.size === lines,
+				coveredRanges, reachedUntruncatedEnd,
 				score: covered.size + Number(reachedUntruncatedEnd),
 				nextRange: `${name}: objective_evidence_read path="${name}" offset=${offset} limit=${limit}${start > lines ? " (request the untruncated final page)" : ""}` };
 		};
@@ -603,6 +638,12 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		let priorUnreadScore: number | undefined;
 		let readEventCursor = 0;
 		let request = prompt;
+		let sessionGeneration = 1;
+		const failedStrategies = new Map<string, Set<WorkflowRepairStateV1["strategy"]>>();
+		const frozenEvidenceIdentity = [{ name: "original-objective.json",
+			digest: createHash("sha256").update(contractBytes).digest("hex") },
+			...materials.map(({ name, digest }) => ({ name, digest }))];
+		const frozenPlan = { prompt, spec, supportedTaskScopes };
 		for (;;) {
 			let response;
 			try { response = await handle.prompt(request); }
@@ -617,9 +658,82 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			const evidenceRead = fileCoverage.filter(item => item.complete).map(item => item.name);
 			const unreadEvidence = fileCoverage.filter(item => !item.complete).map(item => item.name);
 			const unreadScore = fileCoverage.reduce((sum, item) => sum + item.score, 0);
+			const repairFailure = async (failure: WorkflowRepairFailure, failureFacts: unknown):
+				Promise<"same-session-feedback" | "fresh-context" | CurrentObjectiveStopReason> => {
+				const evidenceFingerprint = workflowRepairFingerprint({ frozen: frozenEvidenceIdentity,
+					coverage: fileCoverage.map(({ name, coveredRanges, reachedUntruncatedEnd }) =>
+						({ name, coveredRanges, reachedUntruncatedEnd })) });
+				const planFingerprint = workflowRepairFingerprint({ frozen: frozenPlan, failureFacts });
+				// Host failure facts are canonical: timestamps, duplicate reads, JSON
+				// whitespace and unsupported rationale wording cannot create progress.
+				const responseFingerprint = workflowRepairFingerprint(failureFacts);
+				const identity = JSON.stringify({ failure, evidenceFingerprint, planFingerprint, responseFingerprint });
+				const tried = failedStrategies.get(identity) ?? new Set<WorkflowRepairStateV1["strategy"]>();
+				let strategy: WorkflowRepairStateV1["strategy"] =
+					tried.has("fresh-context") ? "workflow-repair-needed" :
+					tried.has("same-session-feedback") ? "fresh-context" : "same-session-feedback";
+				let unsafeHandoff = false, transientHandoffFailure = false;
+				if (strategy === "fresh-context") {
+					try {
+						for (const item of readMaterials) if (!(await frozenFileAccessible(item.name, true))) {
+							strategy = "workflow-repair-needed";
+							unsafeHandoff = true;
+							break;
+						}
+					} catch {
+						transientHandoffFailure = true;
+					}
+				}
+				const persist = (selected: WorkflowRepairStateV1["strategy"], generation = sessionGeneration,
+					observedFailure: WorkflowRepairFailure = failure) =>
+					input.recordRepairState?.(workflowRepairState({ stage: "objective-assessment", failure: observedFailure,
+						evidenceFingerprint, planFingerprint, responseFingerprint, strategy: selected,
+						sessionGeneration: generation }));
+				if (transientHandoffFailure) {
+					await persist("fresh-context", sessionGeneration + 1, "context-handoff-unavailable");
+					const admission = currentObjectiveAdmission(input.advanceAdmission());
+					return admission === "admitted" ? "assessment-failed" : admission;
+				}
+				await persist(strategy, sessionGeneration + Number(strategy === "fresh-context"),
+					unsafeHandoff ? "context-handoff-unavailable" : failure);
+				tried.add(strategy);
+				failedStrategies.set(identity, tried);
+				if (strategy === "fresh-context") {
+					const previous = handle.ref;
+					handle.dispose();
+					try {
+						const fresh = await openAssessor("Replace ineffective read-only assessment context while preserving the frozen original objective and evidence");
+						if (fresh.ref.id === previous.id || previous.file !== undefined && fresh.ref.file === previous.file ||
+							fresh.transcript().length || fresh.readReturnEvents().length) {
+							fresh.dispose();
+							throw new HarnessError("context.boundary", "fresh assessor reused prior dialogue or read proof");
+						}
+						handle = fresh;
+					} catch (error) {
+						// Only a known deterministic boundary proves the fresh handoff
+						// unsafe. Transient creation/persistence/transport uncertainty
+						// remains an assessment failure for the host's accounting-safe
+						// retry or reconciliation path; no request is reissued here.
+						if (error instanceof HarnessError && ["context.capability", "context.boundary",
+							"context.parent", "context.evidence"].includes(error.code)) {
+							await persist("workflow-repair-needed", sessionGeneration, "context-handoff-unavailable");
+							return "workflow-repair-needed";
+						}
+						await persist("fresh-context", sessionGeneration + 1, "context-handoff-unavailable");
+						const admission = currentObjectiveAdmission(input.advanceAdmission());
+						return admission === "admitted" ? "assessment-failed" : admission;
+					}
+					sessionGeneration++;
+					priorUnreadScore = undefined;
+					readEventCursor = 0;
+					challengedBlocked = false;
+					request = prompt;
+				}
+				return strategy;
+			};
 			let parsed: ModelObjectiveAssessmentV1 | undefined;
 			let invalidReason: string | undefined;
-			try { parsed = parseAssessment(response.text, input.contract,
+			try { parsed = parseAssessment(response.text, contract,
 				["original-objective.json", ...materials.map(item => item.name)]); }
 			catch (error) {
 				if (!(error instanceof HarnessError) || error.code !== "m07.objective-assessment") throw error;
@@ -637,8 +751,8 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			}
 			if (unreadEvidence.length) {
 				// A provisional verdict cannot authorize work until every frozen file is fully read.
-				// An unchanged response is not a mission stop: keep prompting this same
-				// assessor until read proof arrives or a real host/tool boundary occurs.
+				// Repeated unchanged read failure changes the context strategy; it
+				// never establishes scientific closure or supplies missing read proof.
 				const failedReads = newReadEvents.filter(item => item.toolName === "objective_evidence_read" &&
 					item.status === "error");
 				// Pi records an unresolved path when confinement or file access fails
@@ -651,6 +765,9 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				priorUnreadScore = unreadScore;
 				const admission = currentObjectiveAdmission(input.advanceAdmission());
 				if (admission !== "admitted") return { assessment: latestAssessment, stopReason: admission };
+				const repair = await repairFailure("unread-evidence", { unreadEvidence });
+				if (repair === "fresh-context") continue;
+				if (repair !== "same-session-feedback") return { assessment: latestAssessment, stopReason: repair };
 				request = ["Your previous assessment is provisional because required frozen evidence was not completely returned by objective_evidence_read.",
 					`Unread or incomplete files: ${unreadEvidence.join(", ")}.`,
 					...fileCoverage.filter(item => !item.complete).map(item => item.nextRange),
@@ -666,6 +783,9 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				// session; no work or scientific claim is admitted from this response.
 				const admission = currentObjectiveAdmission(input.advanceAdmission());
 				if (admission !== "admitted") return { assessment: latestAssessment, stopReason: admission };
+				const repair = await repairFailure("invalid-assessment", { validation: invalidReason ?? "assessment schema invalid" });
+				if (repair === "fresh-context") continue;
+				if (repair !== "same-session-feedback") return { assessment: latestAssessment, stopReason: repair };
 				request = [`Your previous response failed host validation: ${invalidReason ?? "assessment schema invalid"}.`,
 					"Return one strict JSON object only, with version 1, decision (fulfilled, continue, or blocked), a nonempty rationale, unique evidenceRefs chosen from the frozen file names, unique unresolvedObligations chosen from the original obligation IDs, and unique nonempty unresolvedDetails.",
 					"For continue, include unresolved obligations and details plus nextTask {objective, addresses, adapterScope}; addresses must be nonempty and contained in unresolvedObligations. For fulfilled, leave unresolved obligations and details empty, cite evidence, and omit nextTask. For blocked, retain unresolved obligations and details and omit nextTask.",
@@ -673,13 +793,17 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				continue;
 			}
 			if (parsed.decision === "blocked") {
-				const available = input.capabilities?.filter(item => item.available && input.supportedTaskScopes.includes(item.scope)) ?? [];
+				const available = capabilities?.filter(item => item.available && supportedTaskScopes.includes(item.scope)) ?? [];
 				if (!available.length) return { assessment, stopReason: "model-reported-blocked" };
 				const admission = currentObjectiveAdmission(input.advanceAdmission());
 				if (admission !== "admitted") return { assessment, stopReason: admission };
+				const repair = await repairFailure("blocked-with-capability", {
+					unresolvedObligations: [...parsed.unresolvedObligations].sort() });
+				if (repair === "fresh-context") continue;
+				if (repair !== "same-session-feedback") return { assessment, stopReason: repair };
 				request = [challengedBlocked ? "Your blocked verdict remains provisional while verified execution capabilities are available. Reassess the unchanged objective and choose a feasible next task." :
 					"Reassess every remaining requirement against the available capabilities before treating the original objective as blocked.",
-					`Unresolved obligations: ${parsed.unresolvedObligations.map(id => `${id}: ${input.contract.obligations.find(item => item.id === id)!.description}`).join("; ")}`,
+					`Unresolved obligations: ${parsed.unresolvedObligations.map(id => `${id}: ${contract.obligations.find(item => item.id === id)!.description}`).join("; ")}`,
 					...parsed.unresolvedDetails.map(detail => `Open issue: ${detail}`),
 					"Unavailable optional equipment alone does not establish that all feasible work is exhausted. Choose a feasible pending part and return it as nextTask. Keep any genuinely unavailable work unresolved.",
 					...available.map(item => `${item.scope}: ${item.description}; limits: ${item.limits.join("; ")}`),
@@ -689,15 +813,15 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			}
 			if (parsed.decision === "fulfilled") return { assessment, stopReason: "model-closure-unverified" };
 			const proposed = parsed.nextTask!;
-			const supported = input.supportedTaskScopes.includes(proposed.adapterScope) &&
-				(input.capabilities === undefined || input.capabilities.some(item => item.scope === proposed.adapterScope && item.available));
+			const supported = supportedTaskScopes.includes(proposed.adapterScope) &&
+				(capabilities === undefined || capabilities.some(item => item.scope === proposed.adapterScope && item.available));
 			if (supported) {
 				const admission = currentObjectiveAdmission(input.advanceAdmission());
 				if (admission !== "admitted") return { assessment, stopReason: admission };
 				const advanced = await input.advance(proposed);
 				return { assessment, advanced, stopReason: "objective-reassessment-pending" };
 			}
-			if (!input.capabilities?.some(item => item.available && input.supportedTaskScopes.includes(item.scope)))
+			if (!capabilities?.some(item => item.available && supportedTaskScopes.includes(item.scope)))
 				return { assessment, stopReason: "next-task-needs-capability" };
 			const key = JSON.stringify(proposed);
 			const repeatedUnsupported = unsupported.has(key);
@@ -707,10 +831,14 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			await input.recordAssessment?.(assessment);
 			const admission = currentObjectiveAdmission(input.advanceAdmission());
 			if (admission !== "admitted") return { assessment, stopReason: admission };
+			const repair = await repairFailure("unsupported-next-task", {
+				addresses: [...proposed.addresses].sort(), adapterScope: proposed.adapterScope });
+			if (repair === "fresh-context") continue;
+			if (repair !== "same-session-feedback") return { assessment, stopReason: repair };
 			request = ["Your preceding nextTask cannot be dispatched by the observed host capabilities.",
 				...(repeatedUnsupported ? ["This repeats an unavailable proposal. Revisit the evidence and choose an actually available next action; repetition alone does not close the original objective."] : []),
 				"Keep that proposal and its unresolved requirement in your assessment history. Choose another feasible pending part of the same original task if one exists. Do not treat unavailable optional equipment as proof the entire mission is blocked. If no feasible pending work exists, explain which host limits block each remaining part before returning blocked.",
-				"Available adapters:", ...(input.capabilities ?? []).filter(item => item.available).map(item =>
+				"Available adapters:", ...(capabilities ?? []).filter(item => item.available).map(item =>
 					`${item.scope}: ${item.description}; limits: ${item.limits.join("; ")}`),
 				"Preserve the user's overrides and return the same strict JSON schema. Read frozen evidence again if needed."].join("\n\n");
 		}

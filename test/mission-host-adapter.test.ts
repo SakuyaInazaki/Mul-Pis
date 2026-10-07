@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { createCipheriv, createDecipheriv, createHash, generateKeyPairSync, hkdfSync,
 	randomBytes, sign, constants } from "node:crypto";
 import { once } from "node:events";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -11,10 +11,14 @@ import { pathToFileURL } from "node:url";
 import test, { type TestContext } from "node:test";
 import { deflateRawSync } from "node:zlib";
 import { createOriginalObjective, objectiveProgress } from "../src/m07/objective-progress.ts";
-import { MissionHostPreparationError, prepareAuthenticatedResumeRequest } from "../src/runner/mission-host-adapter.ts";
+import { MissionHostPreparationError, prepareAuthenticatedResumeRequest,
+	type HostReviewedWorkflowRepairPlanV1 } from "../src/runner/mission-host-adapter.ts";
 import { privateHostPreparationDiagnostic } from "../scripts/prepare-authenticated-private-resume.ts";
-import { CARRY_ARTIFACT_NAME, openLedgerContinuation, REUSABLE_RUN_REQUEST_MESSAGE,
+import { authenticateLatestTerminalCarry, authenticatedSupervisorProjection,
+	CARRY_ARTIFACT_NAME, openLedgerContinuation, REUSABLE_RUN_REQUEST_MESSAGE,
 	type CurrentMissionRun } from "../src/runner/ledger-continuation.ts";
+import { workflowRepairState, type WorkflowRepairFailure, type WorkflowRepairStage,
+	type WorkflowRepairStrategy } from "../src/runner/repair-liveness.ts";
 import { decodeCarrySidecars } from "../src/runner/carry-sidecar-codec.ts";
 import { MissionResumeJournal } from "../src/runner/mission-resume-journal.ts";
 import { MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, MISSION_ARTIFACT } from
@@ -39,7 +43,12 @@ type LiveState = {
 	ciStatus: string;
 	ciRunAttempt: number;
 	ciCount: number;
+	sourceTree: string;
+	commitReplySha?: string;
 };
+const reviewedCodePath = "src/stages/m04.ts";
+const reviewedTestPath = "test/m04-required-m07-reads.test.ts";
+const reviewedTestName = "reviewed fresh handoff reads all evidence";
 
 function run(id: number, number: number, status: string, commit: string,
 	conclusion?: string): object {
@@ -51,7 +60,10 @@ function run(id: number, number: number, status: string, commit: string,
 async function fixture(t: TestContext, options: { carriedAction?: boolean;
 	unknownOperation?: boolean; controlRequest?: boolean;
 	largePayload?: boolean; legacyV3?: boolean;
-	stopReason?: "bounded-run-incomplete" | "assessment-failed" } = {}) {
+	repairStage?: WorkflowRepairStage; repairFailure?: WorkflowRepairFailure;
+	repairActionStage?: WorkflowRepairStage; repairStrategy?: WorkflowRepairStrategy;
+	omitRepairStage?: boolean; omitRepairEvidence?: boolean;
+	stopReason?: "bounded-run-incomplete" | "assessment-failed" | "workflow-repair-needed" } = {}) {
 	const dir = await mkdtemp(path.join(os.tmpdir(), "mission-host-adapter-"));
 	t.after(() => rm(dir, { recursive: true, force: true }));
 	const { publicKey, privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
@@ -69,12 +81,21 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 		selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
 		unresolvedOperationIds: operationRefs,
 		stopReason: options.stopReason ?? "bounded-run-incomplete",
-		...(options.carriedAction ? { pendingActionFacts: { unresolvedOperationRefs: operationRefs } } : {}),
+		...(options.carriedAction ? { pendingActionFacts: { unresolvedOperationRefs: operationRefs,
+			...(options.stopReason === "workflow-repair-needed" ? {
+				...(options.omitRepairStage ? {} : { failedStage: options.repairActionStage ?? options.repairStage ?? "m04-judgment" }),
+				...(options.omitRepairEvidence ? {} : { evidenceRefs: ["repair-state.json"] }) } : {}) } } : {}),
 	});
+	const repairState = options.stopReason === "workflow-repair-needed" ? workflowRepairState({
+		stage: options.repairStage ?? "m04-judgment", failure: options.repairFailure ??
+			(options.repairStage === "objective-assessment" ? "unread-evidence" : "unread-m07-evidence"), evidenceFingerprint: "1".repeat(64),
+		planFingerprint: "2".repeat(64), responseFingerprint: "3".repeat(64),
+		strategy: options.repairStrategy ?? "workflow-repair-needed", sessionGeneration: 2 }) : undefined;
 	const bundle = { "original-objective.json": JSON.stringify(contract),
 		"objective-checkpoint.json": JSON.stringify(checkpoint),
 		"candidate.cpp": "synthetic candidate", "verification.json": "{}",
-		"workflow-archive.json": "{}" };
+		"workflow-archive.json": "{}",
+		...(repairState ? { "repair-state.json": JSON.stringify(repairState) } : {}) };
 	const payload = { version: 2, kind: "mul-pis-private-mission-ledger", missionId: MISSION_ID,
 		repository: MISSION_REPOSITORY, globalMaxCny: MISSION_TOTAL_CNY,
 		priorCommittedCny: 4.125, revision: 1,
@@ -102,7 +123,9 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 	const done = currentRun("completed", "failure");
 	const live: LiveState = { sourceTip: sourceCommit, controlTip: priorControlCommit,
 		ciHead: sourceCommit, ciConclusion: "success", ciStatus: "completed",
-		ciRunAttempt: 1, ciCount: 1 };
+		ciRunAttempt: 1, ciCount: 1, sourceTree: testedTree };
+	const reviewEvidence = { sourceText: "export async function runM04() { return 'reviewed-handoff'; }\n",
+		testText: `test(${JSON.stringify(reviewedTestName)}, async () => {});\n` };
 	let terminal = false;
 	const request: typeof fetch = async url => {
 		const address = String(url);
@@ -126,11 +149,20 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 			if (live.controlTip === null) return new Response(JSON.stringify({ message: "Not Found" }),
 				{ status: 404 });
 			data = { ref: controlRef, object: { type: "commit", sha: live.controlTip } };
+		} else if (address.includes("/contents/")) {
+			const parsed = new URL(address);
+			const file = parsed.pathname.split("/contents/")[1]!;
+			const content = file === reviewedCodePath ? parsed.searchParams.get("ref") === sourceCommit ?
+				"export async function runM04() { return 'prior-handoff'; }\n" : reviewEvidence.sourceText :
+				file === reviewedTestPath ? reviewEvidence.testText : "";
+			data = { type: "file", path: file, encoding: "base64", size: Buffer.byteLength(content),
+				content: Buffer.from(content).toString("base64") };
 		} else if (address.includes("/git/commits/"))
 			data = address.endsWith(`/git/commits/${requestCommit}`) ?
 				{ sha: requestCommit, tree: { sha: testedTree },
 					parents: [{ sha: sourceCommit }, { sha: priorControlCommit }] } :
-				{ sha: sourceCommit, tree: { sha: testedTree }, parents: [] };
+				{ sha: live.commitReplySha ?? address.split("/git/commits/")[1],
+					tree: { sha: address.endsWith(`/git/commits/${sourceCommit}`) ? testedTree : live.sourceTree }, parents: [] };
 		else if (address.includes("/workflows/workflow-regression.yml/runs?"))
 			data = { total_count: live.ciCount, workflow_runs: live.ciCount ? [{ id: 9003,
 				run_attempt: live.ciRunAttempt, head_sha: live.ciHead,
@@ -181,11 +213,215 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 	}
 	terminal = true;
 	const journal = new MissionResumeJournal(path.join(dir, "journal"));
-	return { dir, journal, live, checkpoint, bundle, sealed, request,
+	return { dir, journal, live, checkpoint, bundle, sealed, request, reviewEvidence,
 		input: { source: actualSource, seedEnvelopeB64, publicKeyFile, expectedSpkiSha256,
 			githubToken: "synthetic-token", request, journal,
 			loadCarryArtifact: async () => options.legacyV3 ? sealed.envelopeB64 : sealed } };
 }
+
+async function repairFixture(t: TestContext, options: { unknownOperation?: boolean;
+	repairStage?: WorkflowRepairStage; repairFailure?: WorkflowRepairFailure;
+	repairActionStage?: WorkflowRepairStage; repairStrategy?: WorkflowRepairStrategy;
+	omitRepairStage?: boolean; omitRepairEvidence?: boolean } = {}) {
+	const f = await fixture(t, { carriedAction: true, stopReason: "workflow-repair-needed", ...options });
+	f.live.sourceTip = sha40("e");
+	f.live.sourceTree = sha40("1");
+	f.live.ciHead = f.live.sourceTip;
+	const authenticated = await authenticateLatestTerminalCarry(f.input);
+	const projected = authenticatedSupervisorProjection(authenticated.proof, authenticated.privateBundle)!;
+	const carry = projected.terminalCarry;
+	const bytes = f.bundle["repair-state.json"]!;
+	const plan: HostReviewedWorkflowRepairPlanV1 = {
+		version: 1, kind: "host-reviewed-workflow-repair-plan",
+		prior: { source: { runId: carry.source.runId, runAttempt: carry.source.runAttempt,
+			commit: carry.source.commit }, sourceTree: testedTree,
+			envelopeSha256: carry.envelopeSha256, checkpointSha256: carry.checkpointSha256!,
+			contractId: carry.contractId, selectedTupleSha256: carry.selectedTupleSha256,
+			pendingActionSha256: carry.pendingActionSha256! },
+		repair: { stateSha256: createHash("sha256").update(bytes).digest("hex"), state: JSON.parse(bytes) },
+		replacement: { testedSourceCommit: f.live.sourceTip, testedTree: f.live.sourceTree,
+			successfulCi: { workflow: "workflow-regression.yml", runId: "9003", runAttempt: 1,
+				headCommit: f.live.sourceTip, conclusion: "success" } },
+		review: { kind: "operator-code-review", strategyClass: "evidence-read-handoff",
+			codeEvidenceRefs: [{ path: reviewedCodePath, symbol: "runM04" }],
+			offlineTests: { command: "npm run typecheck && npm test", conclusion: "passed",
+				sourceCommit: f.live.sourceTip, tree: f.live.sourceTree,
+				testEvidenceRefs: [{ path: reviewedTestPath, name: reviewedTestName }] } },
+		boundary: "new-isolated-workspace-no-prior-session-resume" };
+	const repairPlanPrivateFile = path.join(f.dir, "operator-reviewed-repair.json");
+	await writeFile(repairPlanPrivateFile, JSON.stringify(plan), { mode: 0o600 });
+	return { ...f, plan, input: { ...f.input, repairPlanPrivateFile } };
+}
+
+test("reviewed workflow repair releases one tested descriptor and durable reservation", async t => {
+	const f = await repairFixture(t);
+	const first = await prepareAuthenticatedResumeRequest(f.input);
+	assert.equal(first.decision.kind, "dispatch");
+	assert.equal(first.descriptor?.message, REUSABLE_RUN_REQUEST_MESSAGE);
+	assert.equal(first.descriptor?.sourceCommit, f.plan.replacement.testedSourceCommit);
+	assert.equal(first.descriptor?.tree, f.plan.replacement.testedTree);
+	assert.deepEqual(first.descriptor?.parents, [f.live.sourceTip, priorControlCommit]);
+	assert(!JSON.stringify(first.descriptor).includes("repair"));
+	assert(!JSON.stringify(first.descriptor).includes("Synthetic original task"));
+	assert.equal((await f.journal.get(first.journalKey!))?.intentBinding.workflowRepair?.testedSourceCommit,
+		f.plan.replacement.testedSourceCommit);
+	const second = await prepareAuthenticatedResumeRequest({ ...f.input,
+		journal: new MissionResumeJournal(f.journal.directory) });
+	assert.deepEqual(second.decision, { kind: "wait", reason: "dispatch-reserved", idempotencyKey: first.journalKey });
+	assert.equal(second.descriptor, undefined);
+	assert.equal(second.journalKey, first.journalKey);
+	await f.journal.markAttempted(first.journalKey!);
+	const third = await prepareAuthenticatedResumeRequest(f.input);
+	assert.deepEqual(third.decision, { kind: "wait", reason: "dispatch-delivery-unknown", idempotencyKey: first.journalKey });
+});
+
+test("workflow repair missing a private plan remains open without reservation", async t => {
+	const f = await repairFixture(t);
+	const { repairPlanPrivateFile: _file, ...input } = f.input;
+	f.live.ciStatus = "in_progress";
+	f.live.ciConclusion = null;
+	assert.deepEqual(await prepareAuthenticatedResumeRequest(input),
+		{ decision: { kind: "wait", reason: "workflow-repair-plan-required" } });
+	await assert.rejects(stat(f.journal.directory), { code: "ENOENT" });
+});
+
+test("workflow repair refuses stale carry, action, receipt, source tree and CI identities", async t => {
+	const changes: Array<(plan: HostReviewedWorkflowRepairPlanV1) => HostReviewedWorkflowRepairPlanV1> = [
+		plan => ({ ...plan, prior: { ...plan.prior, source: { ...plan.prior.source, runAttempt: 2 } } }),
+		plan => ({ ...plan, prior: { ...plan.prior, envelopeSha256: "4".repeat(64) } }),
+		plan => ({ ...plan, prior: { ...plan.prior, checkpointSha256: "4".repeat(64) } }),
+		plan => ({ ...plan, prior: { ...plan.prior, pendingActionSha256: "4".repeat(64) } }),
+		plan => ({ ...plan, prior: { ...plan.prior, selectedTupleSha256: "4".repeat(64) } }),
+		plan => ({ ...plan, repair: { ...plan.repair, stateSha256: "4".repeat(64) } }),
+		plan => ({ ...plan, repair: { ...plan.repair, state: { ...plan.repair.state, planFingerprint: "4".repeat(64) } } }),
+		plan => ({ ...plan, repair: { ...plan.repair, state: { ...plan.repair.state, stage: "objective-assessment" } } }),
+		plan => ({ ...plan, prior: { ...plan.prior, sourceTree: sha40("2") } }),
+		plan => ({ ...plan, replacement: { ...plan.replacement, testedTree: sha40("2") },
+			review: { ...plan.review, offlineTests: { ...plan.review.offlineTests, tree: sha40("2") } } }),
+		plan => ({ ...plan, replacement: { ...plan.replacement,
+			successfulCi: { ...plan.replacement.successfulCi, runId: "9004" } } }),
+	];
+	for (const change of changes) {
+		const f = await repairFixture(t);
+		await writeFile(f.input.repairPlanPrivateFile, JSON.stringify(change(f.plan)));
+		await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error =>
+			error instanceof MissionHostPreparationError && error.refusal.code === "workflow-repair-plan-stale");
+		await assert.rejects(stat(f.journal.directory), { code: "ENOENT" });
+	}
+});
+
+test("workflow repair refuses the same source or tree and unrelated review evidence", async t => {
+	for (const bad of ["same-source", "same-tree", "same-code", "missing-symbol", "missing-test",
+		"unrelated-code", "unrelated-test", "strategy-failure"] as const) {
+		const f = await repairFixture(t);
+		let plan = f.plan;
+		if (bad === "same-source" || bad === "same-tree") {
+			if (bad === "same-source") f.live.sourceTip = sourceCommit;
+			f.live.sourceTree = testedTree;
+			f.live.ciHead = f.live.sourceTip;
+			plan = { ...plan, replacement: { testedSourceCommit: f.live.sourceTip, testedTree: testedTree,
+				successfulCi: { ...plan.replacement.successfulCi, headCommit: f.live.sourceTip } },
+				review: { ...plan.review, offlineTests: { ...plan.review.offlineTests,
+					sourceCommit: f.live.sourceTip, tree: testedTree } } };
+		} else if (bad === "same-code") f.reviewEvidence.sourceText = "export async function runM04() { return 'prior-handoff'; }\n";
+		else if (bad === "missing-symbol") f.reviewEvidence.sourceText = "export async function unrelated() {}\n";
+		else if (bad === "missing-test") f.reviewEvidence.testText = "test('unrelated', () => {});\n";
+		else if (bad === "unrelated-code") plan = { ...plan, review: { ...plan.review,
+			codeEvidenceRefs: [{ path: "src/runner/mission-host-adapter.ts", symbol: "prepareAuthenticatedResumeRequest" }] } };
+		else if (bad === "unrelated-test") plan = { ...plan, review: { ...plan.review,
+			offlineTests: { ...plan.review.offlineTests,
+				testEvidenceRefs: [{ path: "test/mission-supervisor.test.ts", name: reviewedTestName }] } } };
+		else plan = { ...plan, repair: { ...plan.repair,
+			state: { ...plan.repair.state, failure: "invalid-assessment" } } };
+		await writeFile(f.input.repairPlanPrivateFile, JSON.stringify(plan));
+		await assert.rejects(prepareAuthenticatedResumeRequest(f.input), bad);
+		await assert.rejects(stat(f.journal.directory), { code: "ENOENT" });
+	}
+});
+
+test("workflow repair cannot clear unknown effects or reuse a changed review reservation", async t => {
+	const unknown = await repairFixture(t, { unknownOperation: true });
+	await assert.rejects(prepareAuthenticatedResumeRequest(unknown.input), error =>
+		error instanceof MissionHostPreparationError && error.refusal.code === "workflow-repair-plan-unrelated");
+	await assert.rejects(stat(unknown.journal.directory), { code: "ENOENT" });
+	const f = await repairFixture(t);
+	const first = await prepareAuthenticatedResumeRequest(f.input);
+	const changed = { ...f.plan, review: { ...f.plan.review, strategyClass: "fresh-context-handoff" } };
+	await writeFile(f.input.repairPlanPrivateFile, JSON.stringify(changed));
+	await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error =>
+		error instanceof MissionHostPreparationError && error.refusal.code === "control-request-delivery-uncertain");
+	assert.equal((await f.journal.get(first.journalKey!))?.state, "reserved");
+});
+
+test("workflow repair rejects nonprivate, symlinked and expanded plan files", async t => {
+	for (const fault of ["mode", "symlink", "inside-repo", "missing-field", "unknown-field", "model-review"] as const) {
+		const f = await repairFixture(t);
+		if (fault === "mode") await chmod(f.input.repairPlanPrivateFile, 0o644);
+		else if (fault === "symlink") {
+			const link = path.join(f.dir, "repair-link.json");
+			await symlink(f.input.repairPlanPrivateFile, link);
+			f.input.repairPlanPrivateFile = link;
+		} else if (fault === "inside-repo") f.input.repairPlanPrivateFile = path.resolve("src/runner/mission-host-adapter.ts");
+		else if (fault === "missing-field") {
+			const { prior: _prior, ...partial } = f.plan;
+			await writeFile(f.input.repairPlanPrivateFile, JSON.stringify(partial));
+		} else await writeFile(f.input.repairPlanPrivateFile, JSON.stringify(fault === "unknown-field" ?
+			{ ...f.plan, scientificTask: "not allowed" } :
+			{ ...f.plan, review: { ...f.plan.review, kind: "model-reviewed" } }));
+		await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error =>
+			error instanceof MissionHostPreparationError && error.refusal.code === "workflow-repair-plan-invalid");
+		await assert.rejects(stat(f.journal.directory), { code: "ENOENT" });
+	}
+});
+
+test("inherited repair telemetry cannot override a different current action stage or strategy", async t => {
+	for (const option of [{ repairActionStage: "objective-assessment" as const },
+		{ repairStrategy: "fresh-context" as const }]) {
+		const f = await repairFixture(t, option);
+		const plan = { ...f.plan, repair: { ...f.plan.repair,
+			state: { ...f.plan.repair.state, strategy: "workflow-repair-needed" } } };
+		await writeFile(f.input.repairPlanPrivateFile, JSON.stringify(plan));
+		await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error =>
+			error instanceof MissionHostPreparationError && error.refusal.code === "workflow-repair-plan-stale");
+		await assert.rejects(stat(f.journal.directory), { code: "ENOENT" });
+	}
+});
+
+test("workflow repair receipt requires the authenticated action stage and evidence reference", async t => {
+	for (const option of [{ omitRepairStage: true }, { omitRepairEvidence: true }]) {
+		const f = await repairFixture(t, option);
+		await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error =>
+			error instanceof MissionHostPreparationError && error.refusal.code === "workflow-repair-plan-stale");
+		await assert.rejects(stat(f.journal.directory), { code: "ENOENT" });
+	}
+});
+
+test("workflow repair review must fit the authenticated stage and failure", async t => {
+	for (const failure of ["invalid-assessment", "malformed-proposal"] as const) {
+		const f = await repairFixture(t, { repairFailure: failure });
+		await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error =>
+			error instanceof MissionHostPreparationError && error.refusal.code === "workflow-repair-review-evidence-invalid");
+		await assert.rejects(stat(f.journal.directory), { code: "ENOENT" });
+	}
+	const f = await repairFixture(t, { repairStage: "objective-assessment" });
+	const plan = { ...f.plan, review: { ...f.plan.review,
+		codeEvidenceRefs: [{ path: "src/m07/objective-progress.ts", symbol: "objectiveProgress" }],
+		offlineTests: { ...f.plan.review.offlineTests,
+			testEvidenceRefs: [{ path: "test/m07-objective-progress.test.ts", name: reviewedTestName }] } } };
+	await writeFile(f.input.repairPlanPrivateFile, JSON.stringify(plan));
+	const request: typeof fetch = async url => {
+		const address = String(url);
+		if (!address.includes("/contents/")) return f.request(url);
+		const parsed = new URL(address);
+		const file = parsed.pathname.split("/contents/")[1]!;
+		const text = file.startsWith("src/") ?
+			`export function objectiveProgress() { return '${parsed.searchParams.get("ref") === sourceCommit ? "prior" : "repaired"}'; }\n` :
+			`test(${JSON.stringify(reviewedTestName)}, () => {});\n`;
+		return new Response(JSON.stringify({ type: "file", path: file, encoding: "base64",
+			size: Buffer.byteLength(text), content: Buffer.from(text).toString("base64") }));
+	};
+	assert.equal((await prepareAuthenticatedResumeRequest({ ...f.input, request })).decision.kind, "dispatch");
+});
 
 test("live authenticated carried action reserves a constant-message empty-tree request", async t => {
 	const f = await fixture(t, { carriedAction: true });
@@ -343,6 +579,7 @@ test("a repeated request returns the durable reservation and never replaces an a
 
 async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>>,
 	options: { wrongArtifactDigest?: boolean; readOnly?: boolean;
+		repairPlanPrivateFile?: string;
 		sidecarFault?: "missing" | "duplicate" | "tamper" } = {}) {
 	const sourceFile = path.join(f.dir, "source.json");
 	const seedFile = path.join(f.dir, "seed.txt");
@@ -375,6 +612,7 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>>,
 		"--source", sourceFile, "--seed", seedFile,
 		"--public-key", f.input.publicKeyFile, "--journal-dir", f.journal.directory,
 		"--output-private", outputPrivate, "--connector-stdio",
+		...(options.repairPlanPrivateFile ? ["--repair-plan-private", options.repairPlanPrivateFile] : []),
 		...(options.readOnly ? ["--read-only"] : [])],
 		{ cwd: path.dirname(path.dirname(script)), stdio: ["pipe", "pipe", "pipe"] });
 	let stderr = "";
@@ -471,6 +709,20 @@ test("stdio bridge authenticates connector reads and prints only a public descri
 	assert.equal((await stat(bridge.outputPrivate)).mode & 0o077, 0);
 	assert.equal((await new MissionResumeJournal(f.journal.directory)
 		.get(privateResult.journalKey))?.state, "reserved");
+});
+
+test("stdio bridge accepts a private reviewed repair without publishing its receipt", async t => {
+	const f = await repairFixture(t);
+	const bridge = await runStdioBridge(f, { repairPlanPrivateFile: f.input.repairPlanPrivateFile });
+	assert.equal(bridge.code, 0, bridge.stderr);
+	assert.equal((bridge.lines.at(-1) as { kind: string }).kind, "prepared");
+	assert(!bridge.stdout.includes("operator-code-review"));
+	assert(!bridge.stdout.includes("reviewedPlanSha256"));
+	assert(!bridge.stdout.includes("repair-state.json"));
+	assert(!bridge.stdout.includes(reviewedTestName));
+	const repeated = await prepareAuthenticatedResumeRequest(f.input);
+	assert.equal(repeated.decision.kind, "wait");
+	assert.equal(repeated.descriptor, undefined);
 });
 
 test("stdio bridge refuses an artifact whose private digest changed", async t => {

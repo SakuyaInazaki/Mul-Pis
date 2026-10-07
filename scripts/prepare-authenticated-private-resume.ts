@@ -18,7 +18,7 @@ import { CARRY_LOGICAL_BYTES, CARRY_SEGMENT_FILE_BYTES, CARRY_SEGMENT_RAW_BYTES,
 import { HarnessError } from "../src/types.ts";
 
 type Args = { source: string; seed: string; publicKey: string;
-	journalDir: string; outputPrivate: string; readOnly: boolean };
+	journalDir: string; outputPrivate: string; readOnly: boolean; repairPlanPrivate?: string };
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 class PrivateBridgeError extends Error {
 	readonly reasonCode: string;
@@ -89,15 +89,18 @@ function parseArgs(values: string[]): Args {
 		option.set(name, values[++i]!);
 	}
 	const keys = ["--source", "--seed", "--public-key", "--journal-dir", "--output-private"];
-	if (!connectorStdio || option.size !== keys.length || keys.some(key => !option.has(key)) ||
-		[...option.keys()].some(key => !keys.includes(key)))
+	const allowed = [...keys, "--repair-plan-private"];
+	if (!connectorStdio || keys.some(key => !option.has(key)) ||
+		[...option.keys()].some(key => !allowed.includes(key)))
 		throw new Error("missing private resume arguments");
 	const result = { source: option.get("--source")!, seed: option.get("--seed")!,
 		publicKey: option.get("--public-key")!, journalDir: option.get("--journal-dir")!,
-		outputPrivate: option.get("--output-private")!, readOnly };
+		outputPrivate: option.get("--output-private")!, readOnly,
+		...(option.has("--repair-plan-private") ? { repairPlanPrivate: option.get("--repair-plan-private")! } : {}) };
 	if (Object.entries(result).some(([key, value]) => key !== "readOnly" &&
 		!path.isAbsolute(String(value)))) throw new Error("private resume paths must be absolute");
-	if (underRepo(result.journalDir) || underRepo(result.outputPrivate))
+	if (underRepo(result.journalDir) || underRepo(result.outputPrivate) ||
+		(result.repairPlanPrivate !== undefined && underRepo(result.repairPlanPrivate)))
 		throw new Error("private resume records must be outside the source repository");
 	return result;
 }
@@ -221,6 +224,7 @@ export async function runPrivateResumeBridge(values: string[],
 			githubToken: undefined,
 			authenticatedHostRead: { kind: "authenticated-host-github-read", request: bridge.request },
 			loadCarryArtifact: identity => bridge.artifact(identity),
+			...(args.repairPlanPrivate ? { repairPlanPrivateFile: args.repairPlanPrivate } : {}),
 			journal: new MissionResumeJournal(args.journalDir), readOnly: args.readOnly });
 	} finally { bridge.close(); }
 	if (!args.readOnly) {

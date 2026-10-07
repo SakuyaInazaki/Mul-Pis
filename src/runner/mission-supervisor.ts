@@ -7,6 +7,7 @@
 import { createHash } from "node:crypto";
 import { classifyPendingAction, validatePendingAction } from "../m07/objective-progress.ts";
 import type { ObjectiveStopReason, PendingActionV1 } from "../m07/objective-progress.ts";
+import { isVerifiedWorkflowRepairPlan, type VerifiedWorkflowRepairPlanV1 } from "./mission-host-adapter.ts";
 
 type Source = Readonly<{ runId: string; runAttempt: number; commit: string }>;
 const hex64 = (value: unknown): value is string =>
@@ -97,6 +98,7 @@ export type SupervisorSnapshot = Readonly<{
 	cancellationEvent?: HostCancellationEventV1;
 	freshIndependentWork?: FreshIndependentWorkEvidenceV1;
 	freshLaunchContract?: FreshIndependentLaunchContractV1;
+	workflowRepairPlan?: VerifiedWorkflowRepairPlanV1;
 	dispatchRecord: ResumeDispatchRecord;
 }>;
 
@@ -107,6 +109,9 @@ export type ResumeIntent = Readonly<{
 	actionKind: PendingActionV1["kind"];
 	pendingAction: PendingActionV1;
 	actionProvenance?: Readonly<{ kind: "current-host-derived"; checkpointSha256: string }>;
+	/** Private review identity; never enters the public control descriptor. */
+	workflowRepair?: Readonly<{ reviewedPlanSha256: string; testedSourceCommit: string;
+		testedTree: string; successfulCi: VerifiedWorkflowRepairPlanV1["replacement"]["successfulCi"] }>;
 	/** The new process must start with no prior session or shared store. */
 	boundary: "new-isolated-workspace-no-prior-session-resume";
 	/** These effects stay UNKNOWN. The new run may work on independent tasks. */
@@ -119,7 +124,7 @@ export type SupervisorDecision =
 		"dispatch-delivery-unknown" | "successor-request-accepted" |
 		"quarantined-operation-needs-reconciliation" | "accounting-chain-needs-reconciliation" |
 		"user-cancelled" | "execution-interrupted" | "cancellation-origin-unverified" |
-		"terminal-action-needs-reclassification";
+		"terminal-action-needs-reclassification" | "workflow-repair-plan-required";
 		idempotencyKey?: string; successorRunId?: string }>
 	| Readonly<{ kind: "restore-evidence"; evidenceRefs: readonly string[] }>
 	| Readonly<{ kind: "exclusive-external-input";
@@ -219,6 +224,7 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 	let action: PendingActionV1;
 	let actionSha: string;
 	let actionProvenance: ResumeIntent["actionProvenance"];
+	let workflowRepair: ResumeIntent["workflowRepair"];
 	const derived = snapshot.currentDerivedAction;
 	if (derived) {
 		if (status.pendingAction !== undefined || pendingAction !== undefined ||
@@ -298,6 +304,42 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 		if (!actualVerified && !launchVerified)
 			return { kind: "wait", reason: "quarantined-operation-needs-reconciliation" };
 	}
+	// A serialized assertion or a changed source tip does not release a repair.
+	// The host verifies an explicit private operator review against this exact
+	// terminal carry, repair receipt and different tested source before branding.
+	if (action.kind === "repair-workflow-state") {
+		const plan = snapshot.workflowRepairPlan;
+		if (!plan) return { kind: "wait", reason: "workflow-repair-plan-required" };
+		if (!isVerifiedWorkflowRepairPlan(plan)) fail("workflow repair plan is not host verified");
+		const prior = plan.prior;
+		const launch = snapshot.freshLaunchContract;
+		if (prior.source.runId !== terminalCarry.source.runId ||
+			prior.source.runAttempt !== terminalCarry.source.runAttempt ||
+			prior.source.commit !== terminalCarry.source.commit ||
+			prior.envelopeSha256 !== terminalCarry.envelopeSha256 ||
+			prior.checkpointSha256 !== terminalCarry.checkpointSha256 ||
+			prior.contractId !== status.contractId ||
+			prior.selectedTupleSha256 !== status.selectedTupleSha256 ||
+			prior.pendingActionSha256 !== actionSha ||
+			plan.replacement.testedSourceCommit === terminalCarry.source.commit ||
+			plan.replacement.testedTree === prior.sourceTree ||
+			plan.boundary !== "new-isolated-workspace-no-prior-session-resume" ||
+			!launch || launch.version !== 1 || launch.kind !== "verified-fresh-launch-contract" ||
+			launch.source.runId !== terminalCarry.source.runId ||
+			launch.source.runAttempt !== terminalCarry.source.runAttempt ||
+			launch.source.commit !== terminalCarry.source.commit ||
+			launch.envelopeSha256 !== terminalCarry.envelopeSha256 ||
+			launch.selectedTupleSha256 !== status.selectedTupleSha256 ||
+			launch.pendingActionSha256 !== actionSha ||
+			launch.testedSourceCommit !== plan.replacement.testedSourceCommit ||
+			launch.testedTree !== plan.replacement.testedTree ||
+			launch.requiresRuntimeAttestationBeforeModel !== true || launch.mode !== "fresh-work-only")
+			fail("workflow repair plan does not bind the fresh launch and terminal carry");
+		workflowRepair = { reviewedPlanSha256: sha(canonical(plan)),
+			testedSourceCommit: plan.replacement.testedSourceCommit,
+			testedTree: plan.replacement.testedTree,
+			successfulCi: structuredClone(plan.replacement.successfulCi) };
+	} else if (snapshot.workflowRepairPlan !== undefined) fail("workflow repair plan is unrelated to pending action");
 	if (action.kind === "restore-evidence" || action.kind === "retry-evidence-read" &&
 		action.evidenceRefs?.length)
 		return { kind: "restore-evidence", evidenceRefs: action.evidenceRefs ?? [] };
@@ -307,7 +349,8 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 		envelopeSha256: terminalCarry.envelopeSha256,
 		contractId: status.contractId, selectedTupleSha256: status.selectedTupleSha256,
 		pendingActionSha256: actionSha,
-		...(actionProvenance ? { actionProvenance } : {}) }));
+		...(actionProvenance ? { actionProvenance } : {}),
+		...(workflowRepair ? { workflowRepair } : {}) }));
 	if (dispatchRecord.state !== "not-requested") {
 		if (dispatchRecord.idempotencyKey !== idempotencyKey)
 			fail("dispatch record belongs to a different pending action");
@@ -324,6 +367,7 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 		pendingActionSha256: actionSha, actionKind: action.kind,
 		pendingAction: structuredClone(action),
 		...(actionProvenance ? { actionProvenance } : {}),
+		...(workflowRepair ? { workflowRepair } : {}),
 		boundary: "new-isolated-workspace-no-prior-session-resume",
 		quarantinedOperationRefs: [...quarantinedOperationRefs],
 		m04TransactionQuarantined: action.kind === "reconcile-m04-transaction" } };

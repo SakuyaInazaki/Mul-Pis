@@ -49,6 +49,42 @@ test("failed research collection retains typed unresolved M04 quarantine for eme
 	assert.equal(retained?.["m04-transaction-quarantine.json"], typed);
 });
 
+test("stagnant assessment and M04 repair stay incomplete while retaining no-merge facts", () => {
+	const fullRead = { unreadEvidence: [] } as any;
+	assert.equal(offlineChecks.objectiveAssessmentRunCompleted(fullRead,
+		"workflow-repair-needed"), false);
+	assert.equal(offlineChecks.objectiveAssessmentRunCompleted(fullRead,
+		"assessment-failed"), false);
+	assert.equal(offlineChecks.objectiveAssessmentRunCompleted(fullRead,
+		"objective-reassessment-pending"), true);
+	assert.equal(offlineChecks.importM04EffectDisposition({ status: "failed",
+		transactionState: "rejected-draft", proposalSubmitted: true,
+		snapshotCreated: false, threw: true, repairNeeded: true }), "workflow-repair-needed");
+	assert.equal(offlineChecks.failedM04StopReason("failed", "rejected-draft", true),
+		"workflow-repair-needed");
+	assert.equal(offlineChecks.importM04EffectDisposition({ status: "failed",
+		transactionState: "merge-intent", proposalSubmitted: true,
+		snapshotCreated: false, threw: true, repairNeeded: true }), "pending-merge-reconciliation");
+	assert.equal(offlineChecks.failedM04StopReason("failed", "merge-intent", true),
+		"m04-transaction-unresolved");
+	const contract = { version: 1 as const, kind: "original-objective" as const,
+		id: "synthetic-repair-contract", createdAt: "2030-01-01T00:00:00Z",
+		goal: "Synthetic objective", goalSource: "user-intent-summary" as const,
+		inputNames: ["input.txt"], obligations: [{ id: "remaining", description: "Continue checking" }],
+		closure: "open-ended" as const };
+	for (const stage of ["objective-assessment", "m04-judgment"] as const) {
+		const progress = offlineChecks.campaignObjectiveProgress(contract, [], {
+			boundedRuns: [], selectedArtifacts: [], stopReason: "workflow-repair-needed",
+			pendingActionFacts: offlineChecks.workflowRepairActionFacts(stage) });
+		assert.equal(progress.objectiveOutcome, "incomplete");
+		assert.equal(progress.continuation.nextTask, undefined);
+		assert.equal(progress.continuation.pendingAction?.kind, "repair-workflow-state");
+		assert.equal(progress.continuation.pendingAction?.failedStage, stage);
+		assert.deepEqual(progress.continuation.pendingAction?.evidenceRefs, ["repair-state.json"]);
+		assert.equal(progress.continuation.pendingAction?.humanRequired, undefined);
+	}
+});
+
 test("private driver checkpoints keep inherited and current unknown operations in a host pending action", () => {
 	const contract = { version: 1 as const, kind: "original-objective" as const,
 		id: "synthetic-contract", createdAt: "2030-01-01T00:00:00Z", goal: "Synthetic research goal",

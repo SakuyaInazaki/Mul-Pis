@@ -57,6 +57,42 @@ async function fixture(t: TestContext) {
 	return { dir, journal: new MissionResumeJournal(path.join(dir, "private")) };
 }
 
+function repairIntentFor(control = binding()): ResumeIntent {
+	const prior = intentFor();
+	const action = classifyPendingAction("workflow-repair-needed", {
+		failedStage: "m04-judgment", evidenceRefs: ["repair-state.json"] });
+	const pendingActionSha256 = pendingActionIdentity(action);
+	const workflowRepair = { reviewedPlanSha256: hash("private operator review"),
+		testedSourceCommit: control.testedSourceCommit, testedTree: control.testedTree,
+		successfulCi: control.successfulCi };
+	return { ...prior, actionKind: action.kind, pendingAction: action, pendingActionSha256,
+		workflowRepair, idempotencyKey: hash(canonical({ source: prior.source,
+			envelopeSha256: prior.envelopeSha256, contractId: prior.contractId,
+			selectedTupleSha256: prior.selectedTupleSha256, pendingActionSha256, workflowRepair })) };
+}
+
+test("repair reservation binds the private review and replacement source through restart", async t => {
+	const { journal } = await fixture(t), intent = repairIntentFor();
+	const first = await journal.reserve(intent, binding());
+	assert.deepEqual(first.intentBinding.workflowRepair, intent.workflowRepair);
+	assert.deepEqual(await new MissionResumeJournal(journal.directory).reserve(intent, binding()), first);
+	await assert.rejects(journal.reserve({ ...intent, workflowRepair: {
+		...intent.workflowRepair!, reviewedPlanSha256: hash("changed review") } }, binding()), /idempotency key/);
+	await assert.rejects(journal.reserve({ ...intent, workflowRepair: undefined }, binding()), /private intent/);
+	await assert.rejects(journal.reserve(intent, binding("f".repeat(40))), /repair does not bind/);
+	const text = await readFile(path.join(journal.directory, `${intent.idempotencyKey}.json`), "utf8");
+	assert(!text.includes("operator-code-review"));
+	assert(!text.includes("repair-state.json"));
+	const stored = JSON.parse(text);
+	stored.control.testedTree = "f".repeat(40);
+	await writeFile(path.join(journal.directory, `${intent.idempotencyKey}.json`), JSON.stringify(stored));
+	await assert.rejects(new MissionResumeJournal(journal.directory).get(intent.idempotencyKey), /stored workflow repair/);
+	stored.control.testedTree = binding().testedTree;
+	stored.intentBinding.workflowRepair.reviewedPlanSha256 = hash("tampered review");
+	await writeFile(path.join(journal.directory, `${intent.idempotencyKey}.json`), JSON.stringify(stored));
+	await assert.rejects(new MissionResumeJournal(journal.directory).get(intent.idempotencyKey), /idempotency binding/);
+});
+
 test("reservation is durable across restart and never stores the raw pending action", async t => {
 	const { journal } = await fixture(t), intent = intentFor();
 	const control = { ...binding(), goal: "SECRET_GOAL",

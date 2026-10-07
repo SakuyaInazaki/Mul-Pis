@@ -6,6 +6,7 @@ import { HarnessError } from "../types.ts";
 import { canonicalRestartUnknowns } from "../m07/independent-restart.ts";
 import { objectiveProgress, type ObjectiveProgressV1 } from "../m07/objective-progress.ts";
 import { pendingActionIdentity, type MissionStatusV1, type TerminalCarryEvidenceV1 } from "./mission-supervisor.ts";
+import { validWorkflowRepairState } from "./repair-liveness.ts";
 import type { CampaignAdmissionRejection, CampaignRequestAudit } from "./deepseek-campaign.ts";
 import type { TransportFailureDiagnostic } from "./types.ts";
 import { campaignSessionEffectId } from "./deepseek-campaign.ts";
@@ -423,6 +424,10 @@ function canonicalBase64(value: unknown, max: number): Buffer {
 function validBundle(bundle: unknown, segmented = false): bundle is PrivateContinuationBundle {
 	return record(bundle) && Object.keys(bundle).length > 0 && Object.keys(bundle).every(key =>
 		(PRIVATE_CONTINUATION_FILE_KEYS as readonly string[]).includes(key) && typeof bundle[key] === "string" &&
+		(key !== "repair-state.json" || (() => {
+			try { return validWorkflowRepairState(JSON.parse(bundle[key] as string)); }
+			catch { return false; }
+		})()) &&
 		(segmented && key === "research-history.json" ||
 			Buffer.byteLength(bundle[key] as string, "utf8") <= 4 * 1024 * 1024)) &&
 		(segmented || Buffer.byteLength(JSON.stringify(bundle), "utf8") <= 4 * 1024 * 1024);
