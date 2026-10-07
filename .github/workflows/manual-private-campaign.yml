@@ -177,7 +177,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: confidential-mission-carry
-          path: ${{ runner.temp }}/private-campaign-output/ledger-continuation.enc.json
+          path: |
+            ${{ runner.temp }}/private-campaign-output/ledger-continuation.enc.json
+            ${{ runner.temp }}/private-campaign-output/ledger-continuation.part-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].enc
           if-no-files-found: error
           retention-days: 1
       - name: Report generic campaign failure

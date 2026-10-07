@@ -6,7 +6,8 @@ import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { deflateRawSync } from "node:zlib";
 import { CARRY_ARTIFACT_NAME, openLedgerContinuation,
-	type AccountingOnlyRequestAuditSnapshot } from "../../src/runner/ledger-continuation.ts";
+	type AccountingOnlyRequestAuditSnapshot, type CarryArtifactPayload } from "../../src/runner/ledger-continuation.ts";
+import { decodeCarrySidecars, encodeCarrySidecars } from "../../src/runner/carry-sidecar-codec.ts";
 import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY,
 	MISSION_TOTAL_CNY } from "../../src/runner/signed-mission-ledger.ts";
 
@@ -86,7 +87,7 @@ async function fixture(t: TestContext) {
 	return { publicKeyFile, expectedSpkiSha256, seedEnvelopeB64 };
 }
 
-test("v3 carry authenticates a context-rejected UNKNOWN transport and its accounted retry", async t => {
+test("segmented carry authenticates a context-rejected UNKNOWN transport and its accounted retry", async t => {
 	const f = await fixture(t);
 	const first = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7002, sha("b")), request: github([anchor, currentRun]),
@@ -129,32 +130,40 @@ test("v3 carry authenticates a context-rejected UNKNOWN transport and its accoun
 	const key = seed.derivePrivateKey("mul-pis-ledger-continuation-v1");
 	const outer = JSON.parse(Buffer.from(sealed.envelopeB64, "base64").toString("utf8")) as {
 		version: number; parentDigest: string; nonce: string; ciphertext: string; tag: string };
+	assert.equal(outer.version, 4);
 	const aad = Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY, seed.seedDigest,
-		3, seed.seedDigest, firstSource]));
+		4, outer.parentDigest, firstSource]));
 	const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(outer.nonce, "base64"));
 	decipher.setAAD(aad);
 	decipher.setAuthTag(Buffer.from(outer.tag, "base64"));
-	const plaintext = Buffer.concat([decipher.update(Buffer.from(outer.ciphertext, "base64")), decipher.final()]);
+	const manifest = JSON.parse(Buffer.concat([decipher.update(Buffer.from(outer.ciphertext, "base64")),
+		decipher.final()]).toString("utf8"));
+	const plaintext = decodeCarrySidecars({ manifest, key, seedDigest: seed.seedDigest,
+		parentDigest: outer.parentDigest, source: firstSource,
+		load: name => Buffer.from(sealed.sidecars[name]!, "base64") });
 	const checkpoint = JSON.parse(plaintext.toString("utf8")) as {
 		requestAudit: AccountingOnlyRequestAuditSnapshot };
 	assert.deepEqual(checkpoint.requestAudit.requests, requestAudit.requests);
-	const reopen = (envelopeB64: string) => openLedgerContinuation({ ...f,
+	const reopen = (carry: CarryArtifactPayload) => openLedgerContinuation({ ...f,
 		githubToken: "synthetic-token", current: current(7003, sha("c")),
-		request: github([anchor, completedRun, nextRun]), loadCarryArtifact: async () => envelopeB64 });
-	const resumed = await reopen(sealed.envelopeB64);
+		request: github([anchor, completedRun, nextRun]), loadCarryArtifact: async () => carry });
+	const resumed = await reopen(sealed);
 	assert.equal(resumed.priorUnpricedRequestCount, 2);
 	assert.equal(resumed.priorSettledCny, 0);
 	assert.equal(resumed.priorTransportDiagnosticCensus?.entries[0].rows[0].availability,
 		"observed");
-	const tamper = (change: (copy: AccountingOnlyRequestAuditSnapshot) => void): string => {
+	const tamper = (change: (copy: AccountingOnlyRequestAuditSnapshot) => void): CarryArtifactPayload => {
 		const copy = structuredClone(checkpoint);
 		change(copy.requestAudit);
+		const encoded = encodeCarrySidecars({ plaintext: Buffer.from(JSON.stringify(copy)),
+			key, seedDigest: seed.seedDigest, parentDigest: outer.parentDigest, source: firstSource });
 		const nonce = randomBytes(12);
 		const cipher = createCipheriv("aes-256-gcm", key, nonce);
 		cipher.setAAD(aad);
-		const ciphertext = Buffer.concat([cipher.update(JSON.stringify(copy)), cipher.final()]);
-		return Buffer.from(JSON.stringify({ ...outer, nonce: nonce.toString("base64"),
-			ciphertext: ciphertext.toString("base64"), tag: cipher.getAuthTag().toString("base64") })).toString("base64");
+		const ciphertext = Buffer.concat([cipher.update(JSON.stringify(encoded.manifest)), cipher.final()]);
+		return { envelopeB64: Buffer.from(JSON.stringify({ ...outer, nonce: nonce.toString("base64"),
+			ciphertext: ciphertext.toString("base64"), tag: cipher.getAuthTag().toString("base64") })).toString("base64"),
+			sidecars: Object.fromEntries(encoded.sidecars.map(part => [part.name, part.bytes.toString("base64")])) };
 	};
 	await assert.rejects(reopen(tamper(a => { a.requests[0].contextOverflow!.allowedCompletionTokens = 37; })), /accounting|retry/);
 	await assert.rejects(reopen(tamper(a => { a.requests[1].maxOutputTokens = 37; })), /accounting|retry/);

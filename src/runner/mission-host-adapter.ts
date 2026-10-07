@@ -6,7 +6,8 @@
 import { createHash } from "node:crypto";
 import { classifyPendingAction } from "../m07/objective-progress.ts";
 import { authenticateLatestTerminalCarry, authenticatedSupervisorProjection,
-	REUSABLE_RUN_REQUEST_MESSAGE, type CurrentMissionRun } from "./ledger-continuation.ts";
+	REUSABLE_RUN_REQUEST_MESSAGE, type CarryArtifactPayload,
+	type CurrentMissionRun } from "./ledger-continuation.ts";
 import { MissionResumeJournal, type ResumeJournalRecord,
 	type TestedControlBinding } from "./mission-resume-journal.ts";
 import { pendingActionIdentity, planMissionContinuation, type CurrentDerivedActionV1,
@@ -49,7 +50,7 @@ export type PrepareAuthenticatedResumeInput = Readonly<{
 	seedEnvelopeB64: string | undefined;
 	publicKeyFile: string;
 	githubToken: string | undefined;
-	loadCarryArtifact: (identity: { runId: string; artifactId: string }) => Promise<string>;
+	loadCarryArtifact: (identity: { runId: string; artifactId: string }) => Promise<CarryArtifactPayload>;
 	request?: typeof fetch;
 	authenticatedHostRead?: Readonly<{ kind: "authenticated-host-github-read"; request: typeof fetch }>;
 	expectedSpkiSha256?: string;

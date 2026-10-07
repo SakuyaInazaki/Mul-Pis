@@ -139,6 +139,14 @@ class EncryptTests(unittest.TestCase):
             (results / "branch-parent-round-1-reviewer-feedback.txt").write_bytes(b"Parent rationale")
             (results / "branch-child-round-1-reviewer-feedback.txt").write_bytes(b"Child rationale")
             (results / "campaign-status.json").write_bytes(b'{"status":"complete"}')
+            sidecars = {
+                "ledger-continuation.part-00000000.enc": b"c2VnbWVudC0w",
+                "ledger-continuation.part-00000001.enc": b"c2VnbWVudC0x",
+            }
+            for name, content in sidecars.items():
+                (results / name).write_bytes(content)
+            (results / "ledger-continuation.part-0000000.enc").write_bytes(b"excluded-short-index")
+            (results / "ledger-continuation.part-00000000.enc.json").write_bytes(b"excluded-extra-suffix")
             (results / "original-objective.json").write_bytes(b'{"kind":"original-objective"}')
             (results / "objective-checkpoint.json").write_bytes(b'{"objectiveOutcome":"incomplete"}')
             (results / "objective-assessment-receipt.json").write_bytes(b'{"boundaryIntent":"independent-judgment"}')
@@ -168,7 +176,7 @@ class EncryptTests(unittest.TestCase):
             plain = AESGCM(key).decrypt(base64.b64decode(envelope["nonce_b64"]),
                 base64.b64decode(envelope["ciphertext_b64"]), aad)
             with tarfile.open(fileobj=io.BytesIO(plain), mode="r:") as tar:
-                self.assertEqual(sorted(tar.getnames()), sorted(["branch-child-round-1-reviewer-feedback.txt", "branch-parent-round-1-reviewer-feedback.txt", "campaign-status.json", "candidate.cpp", "context-lineage.json", "fallback-aaaaaaaaaaaa-T003-round-10-reviewer-feedback.txt", "host-effect-receipt.json", "independent-restart-goal-binding.json", "independent-restart-quarantine.json", "initial-m04-adopted-knowledge.json", "iteration-65-round-10-reviewer-feedback.txt", "lesson-delta.json", "mission-ledger-out.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "objective-checkpoint.json", "original-objective.json", "review-decision.json", "round-1-reviewer-feedback.txt", "workflow-archive.json", "m04-transaction.json", "initial-m04-transaction.json", "followon-m04-transaction.json", "iteration-65-m04-transaction.json", "fallback-aaaaaaaaaaaa-T003-m04-transaction.json", "m04-transaction-quarantine.json"]))
+                self.assertEqual(sorted(tar.getnames()), sorted(["branch-child-round-1-reviewer-feedback.txt", "branch-parent-round-1-reviewer-feedback.txt", "campaign-status.json", "candidate.cpp", "context-lineage.json", "fallback-aaaaaaaaaaaa-T003-round-10-reviewer-feedback.txt", "host-effect-receipt.json", "independent-restart-goal-binding.json", "independent-restart-quarantine.json", "initial-m04-adopted-knowledge.json", "iteration-65-round-10-reviewer-feedback.txt", "lesson-delta.json", "mission-ledger-out.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "objective-checkpoint.json", "original-objective.json", "review-decision.json", "round-1-reviewer-feedback.txt", "workflow-archive.json", "m04-transaction.json", "initial-m04-transaction.json", "followon-m04-transaction.json", "iteration-65-m04-transaction.json", "fallback-aaaaaaaaaaaa-T003-m04-transaction.json", "m04-transaction-quarantine.json", *sidecars]))
                 self.assertEqual(tar.extractfile("candidate.cpp").read(), b"secret candidate")
             with self.assertRaises(Exception):
                 AESGCM(key).decrypt(base64.b64decode(envelope["nonce_b64"]),
@@ -179,6 +187,10 @@ class EncryptTests(unittest.TestCase):
                 serialization.NoEncryption()))
             recovered = transport.decrypt_results(encrypted, private_file, root)
             self.assertEqual((recovered / "candidate.cpp").read_bytes(), b"secret candidate")
+            for name, content in sidecars.items():
+                self.assertEqual((recovered / name).read_bytes(), content)
+            self.assertFalse((recovered / "ledger-continuation.part-0000000.enc").exists())
+            self.assertFalse((recovered / "ledger-continuation.part-00000000.enc.json").exists())
             self.assertEqual((recovered / "lesson-delta.json").read_bytes(), b'{"action":"none"}')
             self.assertEqual((recovered / "workflow-archive.json").read_bytes(), b'{"trustedAdoption":false}')
             self.assertEqual((recovered / "round-1-reviewer-feedback.txt").read_bytes(), b"Full explicit reviewer rationale, beyond a short index.")

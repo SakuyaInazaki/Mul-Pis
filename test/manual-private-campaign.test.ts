@@ -9,6 +9,10 @@ import { reserveIndependentRestart } from "../src/m07/independent-restart.ts";
 import { verifyDeepSeekCnyBilling } from "../src/runner/deepseek-cny-pricing.ts";
 import { verifyDeepSeekProviderOutputLimit } from "../src/runner/deepseek-provider-limits.ts";
 import { Workspace } from "../src/workspace.ts";
+import { HarnessError } from "../src/types.ts";
+import { sealCampaignCarry } from "../src/runner/emergency-carry.ts";
+import { encodeCarrySidecars, decodeCarrySidecars } from "../src/runner/carry-sidecar-codec.ts";
+import { CARRY_SEGMENT_FILE_BYTES } from "../src/runner/carry-sidecar-codec.ts";
 
 test("shared-total campaign requires explicit manual admission and signed cumulative ledger", async () => {
  const workflow = await readFile(new URL("../.github/workflows/manual-private-campaign.yml", import.meta.url), "utf8");
@@ -980,6 +984,240 @@ test("post-provider controller exceptions retain only encrypted redacted code an
 		"unavailable");
 	assert.equal(offlineChecks.privateExceptionDiagnostic(Object.assign(new Error("x"), { code: "sk-ANOTHERSECRET123456" }), key).code,
 		"unavailable");
+});
+
+test("normal carry diagnostic retains the exact trusted static ledger invariant", () => {
+	const diagnostic = offlineChecks.privateSealDiagnostic(new HarnessError(
+		"runner.ledger-continuation", "new selected tuple lacks a completed authenticated transition"),
+		"normal-continuation-seal");
+	assert.equal(diagnostic.stage, "normal-continuation-seal");
+	assert.equal(diagnostic.kind, "harness-invariant");
+	assert.equal(diagnostic.code, "runner.ledger-continuation");
+	assert.equal(diagnostic.invariantClass, "selected-transition");
+	assert.equal(diagnostic.message, "new selected tuple lacks a completed authenticated transition");
+	assert.equal(diagnostic.exceptionClass, "HarnessError");
+	assert.equal(diagnostic.messageSha256, createHash("sha256").update(diagnostic.message!).digest("hex"));
+});
+
+test("carry diagnostic discards arbitrary errors and secret-containing forged invariants", () => {
+	const secret = "private-task-and-credential-sk-SYNTHETICSECRET123";
+	for (const error of [new Error(`normal failed ${secret}`),
+		new HarnessError("runner.ledger-continuation", `current accounting-only carry is invalid: ${secret}`),
+		new HarnessError(`runner.ledger-continuation.${secret}`, "current accounting-only carry is invalid")]) {
+		const diagnostic = offlineChecks.privateSealDiagnostic(error, "normal-continuation-seal");
+		assert.equal(diagnostic.stage, "normal-continuation-seal");
+		assert.equal(diagnostic.kind, "unclassified-error");
+		assert.equal(diagnostic.code, null);
+		assert.equal(diagnostic.invariantClass, null);
+		assert.equal(diagnostic.message, null);
+		assert.match(diagnostic.messageSha256 ?? "", /^[0-9a-f]{64}$/);
+		assert.equal(diagnostic.redactedMessage, null);
+		assert.doesNotMatch(JSON.stringify(diagnostic), /private-task|SYNTHETICSECRET|sk-/);
+	}
+	assert.equal(offlineChecks.privateSealDiagnostic(new Error(secret), "emergency-continuation-seal").stage,
+		"emergency-continuation-seal");
+});
+
+test("normal seal failure survives emergency success with its exact private invariant", () => {
+	const sealed = sealCampaignCarry({
+		sealCurrent: () => { throw new HarnessError("runner.ledger-continuation",
+			"current selected tuple differs from authenticated transition"); },
+		sealEmergencyCurrent: () => ({ envelopeB64: "synthetic-emergency", sidecars: {}, observedSettledCny: 0,
+			observedUnknownHeldCny: 0, unpricedRequestCount: 0 }),
+	}, { settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0,
+		requestAudit: { version: 3, kind: "accounting-only-request-audit", requests: [],
+			settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 } } as any);
+	assert.equal(sealed.mode, "emergency-effects-unreviewed");
+	if (sealed.mode !== "emergency-effects-unreviewed") return;
+	const status = offlineChecks.privateEmergencyStatusDiagnostics(undefined, sealed);
+	assert.equal(status.archiveFailure, "normal-continuation-seal-failed-emergency-preserved");
+	assert.equal("collectionFailure" in status, false);
+	assert.equal(status.normalSealFailure?.message,
+		"current selected tuple differs from authenticated transition");
+	assert.equal(status.normalSealFailure?.stage, "normal-continuation-seal");
+});
+
+test("collection failure forces emergency carry even when zero-request normal seal would succeed", () => {
+	const collectionFailure = offlineChecks.privateCollectionDiagnostic(
+		new Error("research continuation exceeds the authenticated carry capacity"));
+	let normalCalls = 0, emergencyCalls = 0;
+	const input = { settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0,
+		requestAudit: { version: 3, kind: "accounting-only-request-audit", requests: [],
+			settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 } } as any;
+	const sealed = sealCampaignCarry({
+		sealCurrent: () => { normalCalls++; return { envelopeB64: "incorrect-normal", sidecars: {},
+			observedSettledCny: 0, observedUnknownHeldCny: 0, unpricedRequestCount: 0 }; },
+		sealEmergencyCurrent: received => { emergencyCalls++; assert.equal(received, input);
+			return { envelopeB64: "synthetic-emergency", sidecars: {}, observedSettledCny: 0,
+				observedUnknownHeldCny: 0, unpricedRequestCount: 0 }; },
+	}, input, offlineChecks.privateSealOptions(collectionFailure));
+	assert.equal(normalCalls, 0);
+	assert.equal(emergencyCalls, 1);
+	assert.equal(sealed.mode, "emergency-effects-unreviewed");
+	if (sealed.mode !== "emergency-effects-unreviewed") return;
+	assert.equal(sealed.forcedReason, "research-collection-incomplete");
+	const status = offlineChecks.privateEmergencyStatusDiagnostics(collectionFailure, sealed);
+	assert.equal(status.archiveFailure, "research-continuation-collection-failed-emergency-preserved");
+	assert.equal(status.collectionFailure?.stage, "research-continuation-collection");
+	assert.equal(status.collectionFailure?.kind, "host-invariant");
+	assert.equal(status.collectionFailure?.invariantClass, "capacity");
+	assert.equal(status.collectionFailure?.message,
+		"research continuation exceeds the authenticated carry capacity");
+	assert.equal("normalSealFailure" in status, false);
+});
+
+test("ordered finalizer failures retain earlier stages after later failures overwrite the summary", () => {
+	const failures: Array<Parameters<typeof offlineChecks.recordFinalizationFailure>[1]> = [];
+	let archiveFailure: string = offlineChecks.recordFinalizationFailure(failures,
+		"objective-checkpoint-salvage-failed");
+	archiveFailure = offlineChecks.recordFinalizationFailure(failures, "host-effect-census-unavailable");
+	archiveFailure = offlineChecks.recordFinalizationFailure(failures,
+		"research-continuation-collection-failed-prior-retained");
+	archiveFailure = offlineChecks.recordFinalizationFailure(failures,
+		"emergency-continuation-seal-failed");
+	assert.equal(archiveFailure, "emergency-continuation-seal-failed");
+	assert.deepEqual(failures, ["objective-checkpoint-salvage-failed", "host-effect-census-unavailable",
+		"research-continuation-collection-failed-prior-retained", "emergency-continuation-seal-failed"]);
+});
+
+test("collection diagnostic omits arbitrary private task text and credentials", () => {
+	const secret = "private-task-sk-SYNTHETICSECRET456";
+	const diagnostic = offlineChecks.privateCollectionDiagnostic(
+		new Error(`research continuation exceeds the authenticated carry capacity: ${secret}`));
+	assert.equal(diagnostic.stage, "research-continuation-collection");
+	assert.equal(diagnostic.kind, "unclassified-error");
+	assert.equal(diagnostic.invariantClass, null);
+	assert.equal(diagnostic.message, null);
+	assert.match(diagnostic.messageSha256 ?? "", /^[0-9a-f]{64}$/);
+	assert.doesNotMatch(JSON.stringify(diagnostic), /private-task|SYNTHETICSECRET|sk-/);
+});
+
+test("future unlisted seal errors retain redacted cause, safe code, and relative source", () => {
+	const key = "sk-SYNTHETICFUTUREKEY999";
+	const cause = new TypeError(`upstream Bearer ${key}`);
+	const error = new HarnessError("runner.future-invariant",
+		`Future seal invariant failed Authorization: Bearer ${key}`) as HarnessError & { cause?: Error };
+	error.cause = cause;
+	error.stack = `HarnessError: ${error.message}\n    at seal (file://${new URL("../scripts/manual-private-campaign.ts", import.meta.url).pathname}:812:19)`;
+	const diagnostic = offlineChecks.privateSealDiagnostic(error, "normal-continuation-seal", key);
+	assert.equal(diagnostic.kind, "unclassified-error");
+	assert.equal(diagnostic.message, null);
+	assert.equal(diagnostic.exceptionClass, "HarnessError");
+	assert.equal(diagnostic.safeCode, "runner.future-invariant");
+	assert.equal(diagnostic.source, "scripts/manual-private-campaign.ts:812:19");
+	assert.equal(diagnostic.messageSha256, createHash("sha256").update(error.message).digest("hex"));
+	assert.match(diagnostic.redactedMessage ?? "", /Future seal invariant failed/);
+	assert.equal(diagnostic.causeChain.length, 1);
+	assert.equal(diagnostic.causeChain[0].exceptionClass, "TypeError");
+	assert.doesNotMatch(JSON.stringify(diagnostic), /SYNTHETICFUTUREKEY999|file:\/\/|\/workspace\//);
+});
+
+test("future collection error keeps bounded redacted text only in its private diagnostic", () => {
+	const key = "sk-SYNTHETICCOLLECTIONKEY999";
+	const error = new Error(`collector failed Bearer ${key}`);
+	const diagnostic = offlineChecks.privateCollectionDiagnostic(error, key);
+	assert.equal(diagnostic.kind, "unclassified-error");
+	assert.equal(diagnostic.message, null);
+	assert.equal(diagnostic.exceptionClass, "Error");
+	assert.match(diagnostic.messageSha256 ?? "", /^[0-9a-f]{64}$/);
+	assert.match(diagnostic.redactedMessage ?? "", /collector failed Bearer \[REDACTED_KEY\]/);
+	assert.doesNotMatch(JSON.stringify(diagnostic), /SYNTHETICCOLLECTIONKEY999/);
+});
+
+test("synthetic 4.26 MiB continuation survives collection and compressed sidecar transport", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-large-history-fixture-"));
+	try {
+		const prior = {
+			"candidate.cpp": "C".repeat(1_020_000),
+			"objective-checkpoint.json": JSON.stringify({ contract: { id: "synthetic" },
+				padding: "P".repeat(900_000) }),
+			"research-history.json": JSON.stringify({ version: 1,
+				kind: "untrusted-version-bound-research-history",
+				entries: [{ goalRunId: "R001", taskId: "T001",
+					files: { "synthetic.txt": "H".repeat(2_600_000) } }] }),
+		};
+		const carried = await offlineChecks.collectContinuationBundle(directory, prior);
+		assert.ok(carried);
+		const plaintext = Buffer.from(JSON.stringify(carried), "utf8");
+		assert.ok(plaintext.length > 4.26 * 1024 * 1024);
+		const binding = { key: Buffer.alloc(32, 7), seedDigest: "a".repeat(64),
+			parentDigest: "b".repeat(64), source: { runId: "7", runAttempt: 1,
+				runNumber: 7, commit: "c".repeat(40) } };
+		const encoded = encodeCarrySidecars({ ...binding, plaintext });
+		assert.ok(encoded.sidecars.length >= 5);
+		assert.ok(encoded.sidecars.reduce((sum, part) => sum + part.bytes.length, 0) < plaintext.length);
+		const parts = new Map(encoded.sidecars.map(part => [part.name, part.bytes]));
+		assert.deepEqual(decodeCarrySidecars({ ...binding, manifest: encoded.manifest,
+			load: name => parts.get(name)! }), plaintext);
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("research history above 4 MiB retains exact bytes and full ordered range-readable parts", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-large-history-part-fixture-"));
+	try {
+		const sourceText = "雪 and synthetic data 🌙".repeat(175_000);
+		const history = JSON.stringify({ version: 1, kind: "untrusted-version-bound-research-history",
+			entries: [{ goalRunId: "R001", taskId: "T001", files: { "synthetic.txt": sourceText } }] });
+		assert.ok(Buffer.byteLength(history, "utf8") > 4 * 1024 * 1024);
+		await writeFile(path.join(directory, "research-history.json"), history);
+		const carried = await offlineChecks.collectContinuationBundle(directory,
+			{ "candidate.cpp": "synthetic selected source" });
+		assert.equal(carried?.["research-history.json"], history);
+		const staged = await offlineChecks.stageRangeReadableHistory(directory, carried!["research-history.json"]!);
+		assert.equal(staged.partitioned, true);
+		const index = JSON.parse(await readFile(path.join(directory,
+			"prior-research-history-index.json"), "utf8"));
+		const contents = await Promise.all(index.parts.map((part: { name: string; bytes: number }) =>
+			readFile(path.join(directory, part.name))));
+		assert.ok(contents.every((part: Buffer) => part.length <= 1_000_000));
+		assert.equal(Buffer.concat(contents).toString("utf8"), offlineChecks.rangeReadableHistory(history));
+		const readable = JSON.parse(Buffer.concat(contents).toString("utf8"));
+		assert.equal(readable.entries[0].files["synthetic.txt"].segments.join(""), sourceText);
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("driver persists canonical encrypted sidecars before publishing root carry", async () => {
+	const data = Buffer.alloc(28, 11).toString("base64");
+	const calls: string[] = [];
+	const writer = { write: async (target: string, text: string,
+		options: { mode: number; flag: "wx" }) => {
+		assert.deepEqual(options, { mode: 0o600, flag: "wx" });
+		const name = path.basename(target);
+		calls.push(`write:${name}`);
+		if (name.endsWith(".enc")) assert.equal(text, data);
+	}, rename: async (source: string, destination: string) => {
+		calls.push(`rename:${path.basename(source)}:${path.basename(destination)}`);
+	} };
+	const carry = { envelopeB64: "synthetic-root", sidecars: {
+		"ledger-continuation.part-00000001.enc": data,
+		"ledger-continuation.part-00000000.enc": data } };
+	await offlineChecks.writeSealedCarryFiles("/synthetic-output", carry, writer);
+	assert.deepEqual(calls, ["write:ledger-continuation.part-00000000.enc",
+		"write:ledger-continuation.part-00000001.enc",
+		`write:ledger-continuation.enc.json.${process.pid}.tmp`,
+		`rename:ledger-continuation.enc.json.${process.pid}.tmp:ledger-continuation.enc.json`]);
+	const partialCalls: string[] = [];
+	await assert.rejects(offlineChecks.writeSealedCarryFiles("/synthetic-output", carry, {
+		write: async target => { const name = path.basename(target); partialCalls.push(name);
+			if (name === "ledger-continuation.part-00000001.enc") throw Error("synthetic write failure"); },
+		rename: async () => { throw Error("root must not publish"); },
+	}));
+	assert.deepEqual(partialCalls, ["ledger-continuation.part-00000000.enc",
+		"ledger-continuation.part-00000001.enc"]);
+	const unsafeCalls: string[] = [];
+	await assert.rejects(offlineChecks.writeSealedCarryFiles("/synthetic-output", {
+		envelopeB64: "root", sidecars: { "../ledger-continuation.part-00000000.enc": data } }, {
+		write: async target => { unsafeCalls.push(target); }, rename: async () => undefined }));
+	assert.deepEqual(unsafeCalls, []);
+	const nearLimit = Buffer.alloc(CARRY_SEGMENT_FILE_BYTES - 1, 13).toString("base64");
+	let nearLimitWritten = false;
+	await offlineChecks.writeSealedCarryFiles("/synthetic-output", { envelopeB64: "root", sidecars: {
+		"ledger-continuation.part-00000000.enc": nearLimit } }, {
+		write: async (target, content) => { if (target.endsWith(".enc")) {
+			assert.equal(content, nearLimit); nearLimitWritten = true; } },
+		rename: async () => undefined,
+	});
+	assert.equal(nearLimitWritten, true);
 });
 
 test("read-only credential probe uses one official model-list request and stores only status", async () => {

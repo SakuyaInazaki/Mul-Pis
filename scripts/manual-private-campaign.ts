@@ -39,7 +39,8 @@ import { CARRY_FILE_NAME, authenticatedHistoricalCarryOrigin,
 	type PrivateContinuationBundle, type HostEffectReceiptV1,
 	type OpaqueExecutedRunGap } from "../src/runner/ledger-continuation.ts";
 import { reviewPrivateCampaignRestartEffects } from "../src/runner/private-campaign-restart-policy.ts";
-import { sealCampaignCarry } from "../src/runner/emergency-carry.ts";
+import { sealCampaignCarry, type CampaignCarrySeal } from "../src/runner/emergency-carry.ts";
+import { CARRY_LOGICAL_BYTES, CARRY_SEGMENT_FILE_BYTES, carrySidecarName } from "../src/runner/carry-sidecar-codec.ts";
 import { bindIndependentRestartGoal, canonicalRestartUnknowns, reserveIndependentRestart,
 	type AuthenticatedRestartCarryFacts, type IndependentRestartReservation,
 	type BoundIndependentRestartGoal } from "../src/m07/independent-restart.ts";
@@ -463,6 +464,345 @@ function privateExceptionDiagnostic(error: unknown, runtimeKey: string | undefin
 		candidateCode : "unavailable";
 	return { code, category: taskFailureCategory(raw), message: privateFailureMessage(raw, runtimeKey) ?? null };
 }
+/** Only literal, host-owned ledger rejection phrases can appear in the private
+ * sealing diagnostic. Provider errors, task text and arbitrary Error.message
+ * values must never be copied into it, even if they resemble an invariant. */
+const STATIC_LEDGER_INVARIANT_MESSAGES = new Set([
+	"GitHub carry freshness check could not complete",
+	"GitHub carry freshness check was not accepted",
+	"GitHub carry freshness response is invalid",
+	"abandoned reviewed restart lacks an empty host effect census",
+	"accounting-only carry version is invalid",
+	"accounting-only transition receipt is invalid",
+	"authenticated carry-forward origin is inconsistent",
+	"authenticated carry-forward origin lacks a complete host-effect receipt",
+	"authenticated host GitHub read channel closed before a response",
+	"authenticated host GitHub read transport is invalid",
+	"authenticated predecessor selected tuple is incomplete",
+	"carry ancestry does not cover every executed workflow run",
+	"carry ancestry receipt is invalid",
+	"carry archive decompression failed",
+	"carry archive descriptor is invalid",
+	"carry archive directory is invalid",
+	"carry archive download failed",
+	"carry archive entry is invalid",
+	"carry archive exceeds limit",
+	"carry archive layout is invalid",
+	"carry archive length is invalid",
+	"carry archive local entry is invalid",
+	"carry archive local sizes are invalid",
+	"carry archive response is invalid",
+	"carry archive response is unreadable",
+	"carry authentication failed",
+	"carry authentication fields are invalid",
+	"carry checkpoint accounting is invalid",
+	"carry checkpoint fields are invalid",
+	"carry envelope fields are invalid",
+	"carry envelope is invalid",
+	"carry exceeds private artifact limit",
+	"carry file fields are invalid",
+	"carry file is invalid",
+	"carry parent digest is invalid",
+	"carry plaintext is invalid",
+	"current Actions identity is not admitted for the mission ledger",
+	"current Actions restart admission is no longer active",
+	"current Actions restart admission was already consumed",
+	"current Actions restart job identity is incomplete",
+	"current M04 quarantine is not an exact append-only prior-effect record",
+	"current accounting-only carry is invalid",
+	"current carry accounting exceeds mission bounds",
+	"current carry was already sealed",
+	"current reviewed effect ancestry is not bound to restart claims",
+	"current selected tuple differs from authenticated transition",
+	"emergency M04 quarantine is not an exact append-only prior-effect record",
+	"emergency carry lacks authenticated prior research evidence",
+	"emergency carry request audit is invalid or in-flight",
+	"emergency carry requires an unsealed effect-review failure",
+	"emergency transport diagnostic bundle exceeds private bounds",
+	"historical carry ancestry receipt is invalid",
+	"historical commitment transition is invalid",
+	"historical fixture cannot follow v3 sealing",
+	"historical fixture sealer is unavailable",
+	"historical fixture sealing is test-only",
+	"intervening provider execution is unresolved",
+	"intervening workflow may have executed a billable job",
+	"intervening workflow run is not settled",
+	"invalid carry archive redirect",
+	"invalid carry artifact request",
+	"invalid carry bytes",
+	"invalid carry encoding",
+	"invalid monetary amount",
+	"invalid monetary precision",
+	"legacy activation cannot inherit an accounting-only carry",
+	"legacy carry version is invalid",
+	"missing carry run lacks an exact terminal encrypted result artifact",
+	"new selected tuple lacks a completed authenticated transition",
+	"new selected tuple omitted required source or checker evidence",
+	"newer workflow run disposition is unresolved",
+	"newer workflow run may have executed a billable job",
+	"opaque executed run gap is not an exact ordered workflow source",
+	"opaque gap cannot replace the current authenticated carry source",
+	"opaque gap predecessor digest is not the authenticated carry prefix",
+	"pending effect ancestry is not an exact ordered carry source",
+	"pending effect ancestry lacks its authenticated source",
+	"prior transport diagnostic census lacks v3 ancestry authentication",
+	"private carry artifact could not be read",
+	"required private carry artifact is unavailable",
+	"required private carry artifact is unavailable or ambiguous",
+	"required private carry artifact is unavailable without an earlier authenticated carry",
+	"restart claim cannot follow current carry sealing",
+	"restart claim requires the exact authenticated prior carry",
+	"reviewed effect ancestry does not match prior accounting and host restart claims",
+	"run request commit was already used by an earlier workflow run",
+	"run request is not a fast-forward empty commit of the accepted source tree",
+	"run request source commit is invalid",
+	"run request source lacks a successful offline regression run",
+	"run request source ref is unavailable",
+	"selected plan changed without a completed authenticated transition",
+	"selected transition ancestry dropped its authenticated prefix",
+	"selected transition ancestry omitted a selection",
+	"selected transition ancestry prefix is invalid",
+	"selected transition archive is missing or ambiguous",
+	"selected transition current tuple is incomplete",
+	"selected transition has no authenticated research bundle",
+	"selected transition history is invalid",
+	"selected transition predecessor tuple is missing or ambiguous",
+	"selected transition receipt is invalid",
+	"selected transition source or predecessor is not authenticated",
+	"selected transition tuple or completed M04 archive changed",
+	"signed seed run is outside verified workflow history",
+	"terminal Actions source changed after the workflow listing",
+	"terminal carry lacks an exact completed source and v3 checkpoint",
+	"terminal host pending action is invalid",
+	"terminal objective checkpoint is incomplete",
+	"terminal objective checkpoint is invalid",
+	"terminal objective closure lacks an independent host receipt",
+	"terminal objective is not the exact signed bootstrap objective",
+	"terminal objective operation ancestry is invalid",
+	"terminal pending action differs from objective stop",
+	"terminal selected tuple has no authenticated provenance",
+	"terminal source is not the latest completed workflow run",
+	"terminal workflow provider step did not execute",
+	"transport diagnostic census JSON is invalid",
+	"transport diagnostic census cannot follow carry sealing",
+	"transport diagnostic census did not preserve its authenticated prefix",
+	"transport diagnostic census differs from the final host audit",
+	"transport diagnostic census fields are invalid",
+	"transport diagnostic census has an invalid current request audit",
+	"transport diagnostic census repeats one unknown request",
+	"transport diagnostic rows do not match unknown request audit",
+	"transport diagnostic source is not bound to accounting ancestry",
+	"transport diagnostic source or rows are invalid",
+	"unreviewed historical effect requires the live V2 fresh-only reservation",
+	"untrusted carry archive redirect",
+	"workflow artifact list is incomplete",
+	"workflow identity or signed seed freshness is invalid",
+	"workflow job disposition is incomplete",
+	"workflow provider step disposition is ambiguous",
+	"workflow run identity is incomplete",
+	"workflow run listing changed during pagination",
+	"workflow run listing is duplicated or changed during pagination",
+	"workflow run listing is incomplete",
+	"workflow run listing is not strictly ordered",
+	"workflow run listing page is incomplete",
+	"workflow run order cannot be proved exclusive",
+	"workflow run pagination index is invalid",
+ ]);
+function privateExceptionClass(error: unknown): string | null {
+	if (error instanceof HarnessError) return "HarnessError";
+	if (error instanceof TypeError) return "TypeError";
+	if (error instanceof RangeError) return "RangeError";
+	if (error instanceof SyntaxError) return "SyntaxError";
+	if (error instanceof ReferenceError) return "ReferenceError";
+	if (error instanceof AggregateError) return "AggregateError";
+	return error instanceof Error ? "Error" : null;
+}
+function privateExceptionSource(error: unknown): string | null {
+	if (!(error instanceof Error)) return null;
+	let stack: string | undefined;
+	try { stack = error.stack; } catch { return null; }
+	if (typeof stack !== "string") return null;
+	const root = path.dirname(HERE);
+	for (const line of stack.split("\n").slice(1, 8)) {
+		const match = /(?:\(|\s)(file:\/\/\/[^()\s]+|\/[^()\s]+):(\d+):(\d+)\)?$/.exec(line.trim());
+		if (!match) continue;
+		let source: string;
+		try { source = match[1].startsWith("file:") ? fileURLToPath(match[1]) : match[1]; }
+		catch { continue; }
+		const relative = path.relative(root, source).replaceAll(path.sep, "/");
+		if (!/^(?:src|scripts|extensions)\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.tsx?$/.test(relative) ||
+			relative.length > 180) continue;
+		const row = Number(match[2]), column = Number(match[3]);
+		if (!Number.isSafeInteger(row) || row < 1 || !Number.isSafeInteger(column) || column < 1)
+			continue;
+		return `${relative}:${row}:${column}`;
+	}
+	return null;
+}
+function privateErrorCore(error: unknown, runtimeKey: string | undefined, knownMessage: boolean) {
+	let raw: string | undefined, code: string | null = null;
+	try { raw = error instanceof Error ? error.message : undefined; } catch { /* Do not trust thrown accessors. */ }
+	try {
+		const candidate = error instanceof HarnessError ? error.code : undefined;
+		if (typeof candidate === "string" && /^(?:runner|campaign|m07|m04)\.[A-Za-z0-9._-]{1,63}$/.test(candidate) &&
+			!/(?:sk-|token|secret)/i.test(candidate) && (!runtimeKey || !candidate.includes(runtimeKey)))
+			code = candidate;
+	} catch { /* Do not trust thrown accessors. */ }
+	// Provider payloads and multi-line request bodies are not useful error messages.
+	const resemblesPayload = raw && (/[{}\r\n]/.test(raw) ||
+		/\b(?:messages|prompt|requestBody)\s*[:=]/i.test(raw));
+	const redacted = !knownMessage && raw && !resemblesPayload ?
+		privateFailureMessage(raw, runtimeKey) : undefined;
+	return { exceptionClass: privateExceptionClass(error), safeCode: code,
+		source: privateExceptionSource(error), messageSha256: raw === undefined ? null : sha256(raw),
+		redactedMessage: redacted ? redacted.slice(0, 1_000) : null };
+}
+function privateErrorMetadata(error: unknown, runtimeKey: string | undefined, knownMessage: boolean) {
+	const causeChain: Array<ReturnType<typeof privateErrorCore>> = [];
+	const seen = new Set<object>();
+	let current = error;
+	for (let depth = 0; depth < 3 && current instanceof Error; depth++) {
+		if (seen.has(current)) break;
+		seen.add(current);
+		let cause: unknown;
+		try { cause = (current as Error & { cause?: unknown }).cause; } catch { break; }
+		if (!(cause instanceof Error) || seen.has(cause)) break;
+		causeChain.push(privateErrorCore(cause, runtimeKey, false));
+		current = cause;
+	}
+	return { ...privateErrorCore(error, runtimeKey, knownMessage), causeChain };
+}
+function privateSealDiagnostic(error: unknown,
+	stage: "normal-continuation-seal" | "emergency-continuation-seal",
+	runtimeKey: string | undefined = statusRuntimeKey): {
+	stage: "normal-continuation-seal" | "emergency-continuation-seal";
+	kind: "harness-invariant" | "unclassified-error";
+	code: "runner.ledger-continuation" | null;
+	invariantClass: "selected-transition" | "transport-diagnostic" | "effect-ancestry" | "accounting" | "other-ledger-invariant" | null;
+	message: string | null;
+	} & ReturnType<typeof privateErrorMetadata> {
+	const message = error instanceof HarnessError && error.code === "runner.ledger-continuation" &&
+		STATIC_LEDGER_INVARIANT_MESSAGES.has(error.message) ? error.message : null;
+	return { stage,
+		kind: message ? "harness-invariant" : "unclassified-error",
+		code: message ? "runner.ledger-continuation" : null,
+		invariantClass: !message ? null : message.startsWith("selected transition") ||
+			message.startsWith("new selected tuple") || message.startsWith("current selected tuple") ||
+			message.startsWith("selected plan") || message.startsWith("authenticated predecessor selected tuple") ?
+			"selected-transition" : message.startsWith("transport diagnostic") ?
+			"transport-diagnostic" : message.includes("effect ancestry") ||
+			message.includes("effect review") || message.includes("historical effect") ?
+			"effect-ancestry" : message.includes("accounting") || message.includes("request audit") ?
+			"accounting" : "other-ledger-invariant",
+		message, ...privateErrorMetadata(error, runtimeKey, Boolean(message)) };
+}
+
+const STATIC_COLLECTION_INVARIANT_MESSAGES = new Set([
+	"continuation evidence must be a bounded regular file",
+	"prior research history is invalid",
+	"prior research history entry identity is invalid",
+	"historical tuple lacks version binding",
+	"unselected campaign evidence must be a bounded regular file",
+	"research continuation exceeds the authenticated carry capacity",
+	"research continuation exceeds the segmented carry capacity",
+	"same-task historical archives disagree on original contract",
+	"same-task historical archive has no files",
+	...(["candidate.cpp", "verification.json", "experiment-plan.json"] as const)
+		.map(name => `same-task historical archives disagree on ${name}`),
+	"same-task historical M04 transaction bytes conflict",
+	"same-task historical archive manifest is invalid",
+	"same-task historical archive identity differs from its entry",
+	"same-task historical M04 state is invalid",
+	"same-task historical M04 transaction is undeclared",
+	"same-task historical M04 outcomes conflict",
+	"same-task historical M04 run identity conflicts",
+	"same-task historical M04 transaction evidence was dropped",
+]);
+function privateCollectionDiagnostic(error: unknown, runtimeKey: string | undefined = statusRuntimeKey): {
+	stage: "research-continuation-collection";
+	kind: "host-invariant" | "unclassified-error";
+	invariantClass: "capacity" | "evidence-integrity" | null;
+	message: string | null;
+	} & ReturnType<typeof privateErrorMetadata> {
+	const message = error instanceof Error && STATIC_COLLECTION_INVARIANT_MESSAGES.has(error.message) ?
+		error.message : null;
+	return { stage: "research-continuation-collection",
+		kind: message ? "host-invariant" : "unclassified-error",
+		invariantClass: !message ? null : message === "research continuation exceeds the authenticated carry capacity" ||
+			message === "research continuation exceeds the segmented carry capacity" ?
+			"capacity" : "evidence-integrity", message,
+		...privateErrorMetadata(error, runtimeKey, Boolean(message)) };
+}
+function privateSealOptions(collectionFailure: ReturnType<typeof privateCollectionDiagnostic> | undefined):
+	{ forceEmergencyReason: "research-collection-incomplete" } | undefined {
+	return collectionFailure ? { forceEmergencyReason: "research-collection-incomplete" } : undefined;
+}
+function privateEmergencyStatusDiagnostics(collectionFailure: ReturnType<typeof privateCollectionDiagnostic> | undefined,
+	sealed: Extract<CampaignCarrySeal, { mode: "emergency-effects-unreviewed" }>) {
+	return { archiveFailure: sealed.forcedReason === "research-collection-incomplete" ?
+			"research-continuation-collection-failed-emergency-preserved" :
+			"normal-continuation-seal-failed-emergency-preserved",
+		...(collectionFailure ? { collectionFailure } : {}),
+		...(sealed.forcedReason ? {} : { normalSealFailure: privateSealDiagnostic(sealed.normalFailure,
+			"normal-continuation-seal") }) };
+}
+const FINALIZATION_FAILURE_CODES = [
+	"bounded-fallback-archive-failed", "objective-checkpoint-salvage-failed",
+	"objective-status-sync-failed", "host-effect-census-unavailable",
+	"accounting-audit-status-write-failed", "m04-quarantine-receipt-unavailable",
+	"research-continuation-collection-failed-prior-retained",
+	"normal-continuation-seal-failed", "emergency-continuation-seal-failed",
+	"carry-sidecar-write-failed",
+	"mission-ledger-continuation-write-failed",
+] as const;
+type FinalizationFailureCode = (typeof FINALIZATION_FAILURE_CODES)[number];
+function recordFinalizationFailure(failures: FinalizationFailureCode[], code: FinalizationFailureCode): FinalizationFailureCode {
+	failures.push(code);
+	return code;
+}
+class CarrySidecarPersistenceError extends Error {
+	constructor() { super("carry sidecar could not be persisted safely"); }
+}
+function canonicalCarrySidecarBase64(text: unknown): text is string {
+	if (typeof text !== "string" || text.length === 0 || text.length % 4 !== 0 ||
+		text.length > Math.ceil(CARRY_SEGMENT_FILE_BYTES / 3) * 4) return false;
+	let padding = false;
+	for (let index = 0; index < text.length; index++) {
+		const char = text.charCodeAt(index);
+		if (char === 61) {
+			padding = true;
+			if (index < text.length - 2) return false;
+		} else if (padding || !(char >= 65 && char <= 90 || char >= 97 && char <= 122 ||
+			char >= 48 && char <= 57 || char === 43 || char === 47)) return false;
+	}
+	const bytes = Buffer.from(text, "base64");
+	return bytes.length >= 28 && bytes.length <= CARRY_SEGMENT_FILE_BYTES &&
+		bytes.toString("base64") === text;
+}
+async function writeSealedCarryFiles(outputDir: string,
+	carry: { envelopeB64: string; sidecars?: Readonly<Record<string, string>> },
+	io: { write: (target: string, data: string, options: { mode: number; flag: "wx" }) => Promise<void>;
+		rename: (source: string, destination: string) => Promise<void> } =
+		{ write: writeFile, rename }): Promise<void> {
+	const sidecars = Object.entries(carry.sidecars ?? {}).sort(([left], [right]) => left.localeCompare(right));
+	const files: Array<{ name: string; text: string }> = [];
+	for (const [index, [name, text]] of sidecars.entries()) {
+		if (path.basename(name) !== name || !/^ledger-continuation\.part-[0-9]{8}\.enc$/.test(name) ||
+			name !== carrySidecarName(index) || !canonicalCarrySidecarBase64(text))
+			throw new CarrySidecarPersistenceError();
+		files.push({ name, text });
+	}
+	for (const file of files) {
+		try { await io.write(path.join(outputDir, file.name), file.text, { mode: 0o600, flag: "wx" }); }
+		catch { throw new CarrySidecarPersistenceError(); }
+	}
+	const carryFile = path.join(outputDir, CARRY_FILE_NAME);
+	const temporaryCarry = `${carryFile}.${process.pid}.tmp`;
+	await io.write(temporaryCarry, `${JSON.stringify({ envelopeB64: carry.envelopeB64 })}\n`,
+		{ mode: 0o600, flag: "wx" });
+	await io.rename(temporaryCarry, carryFile);
+}
+
 function privateToolPath(raw: unknown, runtimeKey: string | undefined): string | undefined {
 	if (typeof raw !== "string" || !raw || raw.length > 240 || raw.includes("\0") ||
 		path.isAbsolute(raw) || raw.split(/[\\/]/).some(part => !part || part === "..")) return undefined;
@@ -1613,7 +1953,8 @@ async function collectContinuationBundle(directory: string, prior?: PrivateConti
 		const file = path.join(directory, name);
 		if (!existsSync(file)) continue;
 		const info = await lstat(file);
-		if (!info.isFile() || info.isSymbolicLink() || info.size > 4 * 1024 * 1024)
+		if (!info.isFile() || info.isSymbolicLink() ||
+			info.size > (name === "research-history.json" ? CARRY_LOGICAL_BYTES : 4 * 1024 * 1024))
 			fail("continuation evidence must be a bounded regular file");
 		current[name] = await readFile(file, "utf8");
 	}
@@ -1697,8 +2038,8 @@ async function collectContinuationBundle(directory: string, prior?: PrivateConti
 	// A receipt describes one Actions execution. An older receipt cannot attest
 	// this process merely because its historical selected tuple was retained.
 	if (!current["host-effect-receipt.json"]) delete selected["host-effect-receipt.json"];
-	if (Buffer.byteLength(JSON.stringify(selected), "utf8") > 4 * 1024 * 1024)
-		fail("research continuation exceeds the authenticated carry capacity");
+	if (Buffer.byteLength(JSON.stringify(selected), "utf8") > CARRY_LOGICAL_BYTES)
+		fail("research continuation exceeds the segmented carry capacity");
 	return selected;
 }
 
@@ -1795,6 +2136,7 @@ async function main() {
 	// Old signed ceilings remain authenticated history, not a runnable fee policy.
 	if (missionLedger.mode !== "accounting-only") fail("explicit signed accounting-only mission transition is required");
 	let finalBudget: DeepSeekCampaignBudget | undefined;
+	const finalizationFailures: FinalizationFailureCode[] = [];
 	try {
 	if (!runtimeKey?.trim()) fail("DeepSeek credential absent");
 	statusRuntimeKey = runtimeKey;
@@ -3397,8 +3739,9 @@ async function main() {
 		}
 		try { await preserveCandidate(new Workspace(path.join(campaignRoot, "workspace")), runId, outputDir); }
 		catch {
-			statusArchiveFailure = "bounded-fallback-archive-failed";
+			statusArchiveFailure = recordFinalizationFailure(finalizationFailures, "bounded-fallback-archive-failed");
 			await saveStatus({ outcome: "incomplete", archiveFailure: "bounded-fallback-archive-failed",
+				finalizationFailures,
 				independentValidation: "not-complete" }).catch(() => undefined);
 			process.exitCode = 1;
 		}
@@ -3416,7 +3759,8 @@ async function main() {
 			else await salvageObjectiveCheckpoint(workspace, outputDir,
 				budget.snapshot().stopReason, campaignCancelled);
 		}
-		catch { statusArchiveFailure = "objective-checkpoint-salvage-failed"; process.exitCode = 1; }
+		catch { statusArchiveFailure = recordFinalizationFailure(finalizationFailures,
+			"objective-checkpoint-salvage-failed"); process.exitCode = 1; }
 		try {
 			const statusFile = path.join(outputDir, "campaign-status.json");
 			if (existsSync(statusFile)) {
@@ -3429,7 +3773,8 @@ async function main() {
 						outcome: checkpoint.objectiveOutcome, stopReason: checkpoint.stopReason } });
 			}
 		}
-		catch { statusArchiveFailure = "objective-status-sync-failed"; process.exitCode = 1; }
+		catch { statusArchiveFailure = recordFinalizationFailure(finalizationFailures,
+			"objective-status-sync-failed"); process.exitCode = 1; }
 		try {
 			if (process.env.GITHUB_ACTIONS === "true") {
 				const source = { runId: process.env.GITHUB_RUN_ID ?? "",
@@ -3448,11 +3793,17 @@ async function main() {
 				await writeFile(path.join(outputDir, "host-effect-receipt.json"),
 					`${JSON.stringify(receipt)}\n`, { mode: 0o600 });
 			}
-		} catch { statusArchiveFailure = "host-effect-census-unavailable"; process.exitCode = 1; }
+		} catch { statusArchiveFailure = recordFinalizationFailure(finalizationFailures,
+			"host-effect-census-unavailable"); process.exitCode = 1; }
 
 		await rm(campaignRoot, { recursive: true, force: true });
 	}
 	} finally {
+		let normalSealFailed = false;
+		let normalSealFailure: unknown;
+		let emergencySealFailed = false;
+		let emergencySealFailure: unknown;
+		let collectionFailure: ReturnType<typeof privateCollectionDiagnostic> | undefined;
 		try {
 			const snapshot = finalBudget?.snapshot();
 			const requestAudit = finalBudget?.requestAccountingAuditSnapshot() ?? {
@@ -3469,7 +3820,8 @@ async function main() {
 			} catch { savedStatus = {}; }
 			try { await saveStatus({ ...savedStatus, accountingAudit: requestAudit,
 				unquantifiedExecutedRunCount: missionLedger.opaqueExecutedRuns.length }); }
-			catch { statusArchiveFailure = "accounting-audit-status-write-failed"; process.exitCode = 1; }
+			catch { statusArchiveFailure = recordFinalizationFailure(finalizationFailures,
+				"accounting-audit-status-write-failed"); process.exitCode = 1; }
 			const transportCensus = missionLedger.appendTransportDiagnosticCensus(
 				requestAudit, statusTransportDiagnostics);
 			if (transportCensus !== undefined)
@@ -3483,24 +3835,50 @@ async function main() {
 					if (!info.isFile() || info.isSymbolicLink() || info.size > 4 * 1024 * 1024)
 						throw Error("M04 quarantine receipt is not a bounded regular file");
 					m04QuarantineText = await readFile(m04QuarantineFile, "utf8");
-				} catch { statusArchiveFailure = "m04-quarantine-receipt-unavailable"; process.exitCode = 1; }
+				} catch { statusArchiveFailure = recordFinalizationFailure(finalizationFailures,
+					"m04-quarantine-receipt-unavailable"); process.exitCode = 1; }
 			}
 			let privateBundle = collectorFailureBundle(missionLedger.priorPrivateBundle,
 				transportCensus, m04QuarantineText);
 			try { privateBundle = await collectContinuationBundle(outputDir, missionLedger.priorPrivateBundle); }
-			catch { statusArchiveFailure = "research-continuation-collection-failed-prior-retained"; process.exitCode = 1; }
-			const sealed = sealCampaignCarry(missionLedger, { settledCny: requestAudit.settledCny,
+			catch (error) {
+				collectionFailure = privateCollectionDiagnostic(error);
+				statusArchiveFailure = recordFinalizationFailure(finalizationFailures,
+					"research-continuation-collection-failed-prior-retained");
+				process.exitCode = 1;
+			}
+			const sealed = sealCampaignCarry({
+				sealCurrent: input => {
+					try { return missionLedger.sealCurrent(input); }
+					catch (error) {
+						normalSealFailed = true;
+						normalSealFailure = error;
+						recordFinalizationFailure(finalizationFailures, "normal-continuation-seal-failed");
+						throw error;
+					}
+				},
+				sealEmergencyCurrent: (input, reason) => {
+					try { return missionLedger.sealEmergencyCurrent(input, reason); }
+					catch (error) {
+						emergencySealFailed = true;
+						emergencySealFailure = error;
+						recordFinalizationFailure(finalizationFailures, "emergency-continuation-seal-failed");
+						throw error;
+					}
+				},
+			}, { settledCny: requestAudit.settledCny,
 				unknownObservedCny: requestAudit.unknownObservedCny,
 				unpricedRequestCount: requestAudit.unpricedRequestCount,
-				requestAudit, ...(privateBundle ? { privateBundle } : {}) });
+				requestAudit, ...(privateBundle ? { privateBundle } : {}) }, privateSealOptions(collectionFailure));
 			const carry = sealed.carry;
 			// Once an envelope has been sealed, an I/O retry must use these same
 			// ciphertext bytes; a second seal would create an ambiguous checkpoint.
-			const carryFile = path.join(outputDir, CARRY_FILE_NAME);
-			const temporaryCarry = `${carryFile}.${process.pid}.tmp`;
-			await writeFile(temporaryCarry, `${JSON.stringify({ envelopeB64: carry.envelopeB64 })}\n`,
-				{ mode: 0o600, flag: "wx" });
-			await rename(temporaryCarry, carryFile);
+			try { await writeSealedCarryFiles(outputDir, carry); }
+			catch (error) {
+				if (error instanceof CarrySidecarPersistenceError)
+					recordFinalizationFailure(finalizationFailures, "carry-sidecar-write-failed");
+				throw error;
+			}
 			await writeFile(path.join(outputDir, "mission-ledger-out.json"), `${JSON.stringify({
 				version: 3, kind: "mul-pis-private-mission-ledger-observation", missionId: MISSION_ID,
 				repository: MISSION_REPOSITORY, accountingMode: "observed-only",
@@ -3514,25 +3892,41 @@ async function main() {
 					"sealed-emergency-effects-unreviewed",
 			}, null, 2)}\n`, { mode: 0o600 });
 			if (sealed.mode === "emergency-effects-unreviewed") {
-				statusArchiveFailure = "normal-continuation-seal-failed-emergency-preserved";
+				const emergencyStatus = privateEmergencyStatusDiagnostics(collectionFailure, sealed);
+				statusArchiveFailure = emergencyStatus.archiveFailure;
 				await saveStatus({ ...savedStatus, accountingAudit: requestAudit,
 					unquantifiedExecutedRunCount: missionLedger.opaqueExecutedRuns.length,
 					outcome: "incomplete",
-					archiveFailure: statusArchiveFailure,
+					...emergencyStatus,
+					finalizationFailures,
 					continuationMode: "sealed-emergency-effects-unreviewed",
 					independentValidation: "not-complete" });
 				process.exitCode = 1;
+			} else if (finalizationFailures.length) {
+				await saveStatus({ ...savedStatus, accountingAudit: requestAudit,
+					unquantifiedExecutedRunCount: missionLedger.opaqueExecutedRuns.length,
+					outcome: "incomplete", archiveFailure: statusArchiveFailure,
+					...(collectionFailure ? { collectionFailure } : {}), finalizationFailures,
+					independentValidation: "not-complete" });
 			}
 		} catch (error) {
-			statusArchiveFailure = "mission-ledger-continuation-write-failed";
-			const diagnostic = privateExceptionDiagnostic(error, statusRuntimeKey);
+			statusArchiveFailure = recordFinalizationFailure(finalizationFailures,
+				"mission-ledger-continuation-write-failed");
+			const diagnostic = normalSealFailed ? undefined : privateExceptionDiagnostic(error, statusRuntimeKey);
 			try {
 				const statusFile = path.join(outputDir, "campaign-status.json");
 				const savedStatus = existsSync(statusFile) ?
 					JSON.parse(await readFile(statusFile, "utf8")) as Record<string, unknown> : {};
 				await saveStatus({ ...savedStatus, outcome: "incomplete", archiveFailure: statusArchiveFailure,
-					continuationDiagnostic: diagnostic.message,
-					continuationDiagnosticCategory: diagnostic.category });
+					finalizationFailures,
+					...(collectionFailure ? { collectionFailure } : {}),
+					...(normalSealFailed ? { normalSealFailure: privateSealDiagnostic(normalSealFailure,
+						"normal-continuation-seal") } : {}),
+					...(emergencySealFailed ? { emergencySealFailure: privateSealDiagnostic(emergencySealFailure,
+						"emergency-continuation-seal") } : {}),
+					continuationDiagnostic: diagnostic?.message ?? null,
+					continuationDiagnosticCategory: normalSealFailed ?
+						(emergencySealFailed ? "emergency-seal-failed" : "emergency-carry-not-persisted") : diagnostic?.category });
 			} catch { /* Encrypted outcome may contain only the earlier status. */ }
 			process.exitCode = 1;
 		}
@@ -3545,7 +3939,10 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	createPrivateCampaignBudget,
 	historicalGapEvidence,
 	appendRestartReservation, appendRestartGoalBinding,
-	privateFailureMessage, privateProviderErrorField, privateExceptionDiagnostic,
+	privateFailureMessage, privateProviderErrorField, privateExceptionDiagnostic, privateSealDiagnostic,
+	privateCollectionDiagnostic, privateSealOptions, privateEmergencyStatusDiagnostics,
+	recordFinalizationFailure,
+	writeSealedCarryFiles,
 	credentialProbe, parseCheckerOutput, compareCandidateTimings,
 	campaignObjectiveStop, taskTelemetry, privateToolTelemetry,
 	chooseForkWinner, chooseFollowOnCandidate, firstM07Accepted, importM04EffectDisposition,

@@ -18,7 +18,16 @@ test("manual private workflow preserves encrypted carry and runtime admission", 
 	const uploadPaths = [...yaml.matchAll(/^\s+path: (.+)$/gm)].map(match => match[1]);
 	assert.deepEqual(uploadPaths, [
 		"${{ runner.temp }}/private-campaign-outcome.enc.json",
+		"|",
+	]);
+	const carryUpload = yaml.split("- name: Upload encrypted mission continuation")[1]!
+		.split("if-no-files-found:")[0]!;
+	const uploadLines = carryUpload.split("\n").map(line => line.trim())
+		.filter(line => line.startsWith("${{ runner.temp }}/private-campaign-output/"));
+	assert.deepEqual(uploadLines, [
 		"${{ runner.temp }}/private-campaign-output/" + CARRY_FILE_NAME,
+		"${{ runner.temp }}/private-campaign-output/ledger-continuation.part-" +
+			"[0-9]".repeat(8) + ".enc",
 	]);
 	assert.ok(yaml.includes("if: always() && steps.continuation.outputs.available == 'true'"));
 });

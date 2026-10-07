@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { createHash, generateKeyPairSync, sign, constants } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, generateKeyPairSync, hkdfSync,
+	randomBytes, sign, constants } from "node:crypto";
 import { once } from "node:events";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -13,6 +14,7 @@ import { createOriginalObjective, objectiveProgress } from "../src/m07/objective
 import { prepareAuthenticatedResumeRequest } from "../src/runner/mission-host-adapter.ts";
 import { CARRY_ARTIFACT_NAME, openLedgerContinuation, REUSABLE_RUN_REQUEST_MESSAGE,
 	type CurrentMissionRun } from "../src/runner/ledger-continuation.ts";
+import { decodeCarrySidecars } from "../src/runner/carry-sidecar-codec.ts";
 import { MissionResumeJournal } from "../src/runner/mission-resume-journal.ts";
 import { MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, MISSION_ARTIFACT } from
 	"../src/runner/signed-mission-ledger.ts";
@@ -47,6 +49,7 @@ function run(id: number, number: number, status: string, commit: string,
 
 async function fixture(t: TestContext, options: { carriedAction?: boolean;
 	unknownOperation?: boolean; controlRequest?: boolean;
+	largePayload?: boolean; legacyV3?: boolean;
 	stopReason?: "bounded-run-incomplete" | "assessment-failed" } = {}) {
 	const dir = await mkdtemp(path.join(os.tmpdir(), "mission-host-adapter-"));
 	t.after(() => rm(dir, { recursive: true, force: true }));
@@ -138,16 +141,49 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 	const opening = await openLedgerContinuation({ seedEnvelopeB64, publicKeyFile,
 		expectedSpkiSha256, githubToken: "synthetic-token", current: actualSource, request,
 		loadCarryArtifact: async () => "unused" });
-	const sealed = opening.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+	let sealed = opening.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
 		unpricedRequestCount: 0, requestAudit: { version: 3,
 			kind: "accounting-only-request-audit", requests: [], settledCny: 0,
-			unknownObservedCny: 0, unpricedRequestCount: 0 } });
+			unknownObservedCny: 0, unpricedRequestCount: 0 },
+		...(options.largePayload ? { privateBundle: { ...bundle,
+			"m04-export.json": randomBytes(1_250_000).toString("base64") },
+			bootstrapBinding: opening.priorBootstrapBinding } : {}) });
+	if (options.legacyV3) {
+		const signed = JSON.parse(Buffer.from(seedEnvelopeB64, "base64").toString("utf8")) as {
+			signature_b64: string };
+		const seedDigest = createHash("sha256").update(Buffer.from(seedEnvelopeB64, "base64"))
+			.digest("hex");
+		const key = Buffer.from(hkdfSync("sha256", Buffer.from(signed.signature_b64, "base64"),
+			Buffer.from(seedDigest, "hex"), "mul-pis-ledger-continuation-v1", 32));
+		const v4 = JSON.parse(Buffer.from(sealed.envelopeB64, "base64").toString("utf8")) as {
+			parentDigest: string; nonce: string; ciphertext: string; tag: string };
+		const carrySource = { runId: "7002", runAttempt: 1, runNumber: 2,
+			commit: options.controlRequest ? requestCommit : sourceCommit };
+		const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(v4.nonce, "base64"));
+		decipher.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY, seedDigest,
+			4, v4.parentDigest, carrySource])));
+		decipher.setAuthTag(Buffer.from(v4.tag, "base64"));
+		const manifest = JSON.parse(Buffer.concat([decipher.update(Buffer.from(v4.ciphertext, "base64")),
+			decipher.final()]).toString("utf8")) as unknown;
+		const plaintext = decodeCarrySidecars({ manifest, key, seedDigest,
+			parentDigest: v4.parentDigest, source: carrySource,
+			load: name => Buffer.from(sealed.sidecars[name]!, "base64") });
+		const nonce = randomBytes(12);
+		const cipher = createCipheriv("aes-256-gcm", key, nonce);
+		cipher.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY, seedDigest,
+			3, v4.parentDigest, carrySource])));
+		const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+		sealed = { ...sealed, sidecars: {}, envelopeB64: Buffer.from(JSON.stringify({
+			version: 3, parentDigest: v4.parentDigest, nonce: nonce.toString("base64"),
+			ciphertext: ciphertext.toString("base64"),
+			tag: cipher.getAuthTag().toString("base64") })).toString("base64") };
+	}
 	terminal = true;
 	const journal = new MissionResumeJournal(path.join(dir, "journal"));
 	return { dir, journal, live, checkpoint, bundle, sealed, request,
 		input: { source: actualSource, seedEnvelopeB64, publicKeyFile, expectedSpkiSha256,
 			githubToken: "synthetic-token", request, journal,
-			loadCarryArtifact: async () => sealed.envelopeB64 } };
+			loadCarryArtifact: async () => options.legacyV3 ? sealed.envelopeB64 : sealed } };
 }
 
 test("live authenticated carried action reserves a constant-message empty-tree request", async t => {
@@ -275,7 +311,8 @@ test("a repeated request returns the durable reservation and never replaces an a
 });
 
 async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>>,
-	options: { wrongArtifactDigest?: boolean; readOnly?: boolean } = {}) {
+	options: { wrongArtifactDigest?: boolean; readOnly?: boolean;
+		sidecarFault?: "missing" | "duplicate" | "tamper" } = {}) {
 	const sourceFile = path.join(f.dir, "source.json");
 	const seedFile = path.join(f.dir, "seed.txt");
 	const artifactFile = path.join(f.dir, "carry.json");
@@ -285,6 +322,19 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>>,
 	const artifactBytes = JSON.stringify({ envelopeB64: f.sealed.envelopeB64 });
 	await writeFile(artifactFile, artifactBytes, { mode: 0o600 });
 	const artifactSha256 = createHash("sha256").update(artifactBytes).digest("hex");
+	const sidecarReferences = await Promise.all(Object.entries(f.sealed.sidecars).map(async ([name, value]) => {
+		const file = path.join(f.dir, name);
+		await writeFile(file, value, { mode: 0o600 });
+		return { name, file, sha256: createHash("sha256").update(value).digest("hex") };
+	}));
+	if (options.sidecarFault === "tamper" && sidecarReferences.length) {
+		const first = sidecarReferences[0]!;
+		const ciphertext = Buffer.from(f.sealed.sidecars[first.name]!, "base64");
+		ciphertext[20] ^= 1;
+		const tampered = ciphertext.toString("base64");
+		await writeFile(first.file, tampered);
+		first.sha256 = createHash("sha256").update(tampered).digest("hex");
+	}
 	const script = path.resolve("scripts/prepare-authenticated-private-resume.ts");
 	const wrapper = `import { runPrivateResumeBridge } from ${JSON.stringify(pathToFileURL(script).href)};\n` +
 		`runPrivateResumeBridge(process.argv.slice(1), { expectedSpkiSha256: ` +
@@ -314,8 +364,12 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>>,
 		} else if (row.kind === "artifact-file") {
 			assert.equal(row.runId, f.input.source.runId);
 			assert.equal(row.artifactId, row.runId === "7003" ? "9003" : "9002");
+			const sidecars = options.sidecarFault === "missing" ? sidecarReferences.slice(0, -1) :
+				options.sidecarFault === "duplicate" ? [...sidecarReferences, sidecarReferences[0]!] :
+				sidecarReferences;
 			child.stdin.write(`${JSON.stringify({ id: row.id, file: artifactFile,
-				sha256: options.wrongArtifactDigest ? "0".repeat(64) : artifactSha256 })}\n`);
+				sha256: options.wrongArtifactDigest ? "0".repeat(64) : artifactSha256,
+				...(sidecarReferences.length ? { sidecars } : {}) })}\n`);
 		} else assert(["prepared", "planned-read-only", "no-dispatch"].includes(row.kind));
 	}
 	const [code] = await closed;
@@ -353,7 +407,7 @@ async function twoCarryFixture(t: TestContext) {
 		publicKeyFile: first.input.publicKeyFile,
 		expectedSpkiSha256: first.input.expectedSpkiSha256,
 		githubToken: first.input.githubToken, current: source3, request: request3,
-		loadCarryArtifact: async () => first.sealed.envelopeB64 });
+		loadCarryArtifact: async () => first.sealed });
 	const sealed3 = opening.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
 		unpricedRequestCount: 0, requestAudit: { version: 3,
 			kind: "accounting-only-request-audit", requests: [], settledCny: 0,
@@ -361,7 +415,7 @@ async function twoCarryFixture(t: TestContext) {
 	terminal3 = true;
 	return { ...first, request: request3, sealed: sealed3,
 		input: { ...first.input, source: source3, request: request3,
-			loadCarryArtifact: async () => sealed3.envelopeB64 } };
+			loadCarryArtifact: async () => sealed3 } };
 }
 
 test("stdio bridge authenticates connector reads and prints only a public descriptor", async t => {
@@ -396,6 +450,39 @@ test("stdio bridge refuses an artifact whose private digest changed", async t =>
 	assert(!bridge.lines.some(row => (row as { kind: string }).kind === "prepared"));
 	await assert.rejects(readFile(bridge.outputPrivate), { code: "ENOENT" });
 	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+});
+
+test("stdio bridge authenticates multiple near-limit ciphertext sidecars without exposing bytes", async t => {
+	const f = await fixture(t, { carriedAction: true, largePayload: true });
+	assert(Object.keys(f.sealed.sidecars).length >= 2);
+	assert(Buffer.from(f.sealed.sidecars["ledger-continuation.part-00000000.enc"]!, "base64")
+		.length > 700_000);
+	const bridge = await runStdioBridge(f);
+	assert.equal(bridge.code, 0, bridge.stderr);
+	assert.equal((bridge.lines.at(-1) as { kind: string }).kind, "prepared");
+	assert(!bridge.stdout.includes(f.sealed.envelopeB64));
+	assert(!bridge.stdout.includes(f.sealed.sidecars["ledger-continuation.part-00000000.enc"]!));
+	assert(!bridge.stderr.includes(f.sealed.sidecars["ledger-continuation.part-00000000.enc"]!));
+});
+
+test("stdio bridge rejects missing, duplicate and tampered ciphertext sidecars", async t => {
+	for (const sidecarFault of ["missing", "duplicate", "tamper"] as const) {
+		const f = await fixture(t, { carriedAction: true, largePayload: true });
+		const bridge = await runStdioBridge(f, { sidecarFault });
+		assert.equal(bridge.code, 1, sidecarFault);
+		assert(!bridge.lines.some(row => (row as { kind: string }).kind === "prepared"));
+		assert(!bridge.stderr.includes(f.sealed.sidecars["ledger-continuation.part-00000000.enc"]!));
+		await assert.rejects(readFile(bridge.outputPrivate), { code: "ENOENT" });
+		assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	}
+});
+
+test("stdio bridge keeps the single-file v3 continuation route", async t => {
+	const f = await fixture(t, { carriedAction: true, legacyV3: true });
+	assert.equal(Object.keys(f.sealed.sidecars).length, 0);
+	const bridge = await runStdioBridge(f);
+	assert.equal(bridge.code, 0, bridge.stderr);
+	assert.equal((bridge.lines.at(-1) as { kind: string }).kind, "prepared");
 });
 
 test("stdio bridge read-only smoke emits a public plan without local writes", async t => {

@@ -1,5 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { inflateRawSync } from "node:zlib";
+import { CARRY_LOGICAL_BYTES, CARRY_SEGMENT_FILE_BYTES, carrySidecarName, decodeCarrySidecars,
+	encodeCarrySidecars, validCarrySidecarManifest } from "./carry-sidecar-codec.ts";
 import { HarnessError } from "../types.ts";
 import { canonicalRestartUnknowns } from "../m07/independent-restart.ts";
 import { objectiveProgress, type ObjectiveProgressV1 } from "../m07/objective-progress.ts";
@@ -19,7 +21,10 @@ import type { BootstrapBinding, PrivateContinuationBundle } from "./signed-missi
  */
 export const CARRY_ARTIFACT_NAME = "confidential-mission-carry";
 export const CARRY_FILE_NAME = "ledger-continuation.enc.json";
+export type CarryArtifactPayload = string | Readonly<{ envelopeB64: string;
+	sidecars: Readonly<Record<string, string>> }>;
 const MAX_CARRY_BYTES = 8 * 1024 * 1024;
+const MAX_CARRY_ARCHIVE_BYTES = 96 * 1024 * 1024;
 const NANO = 1_000_000_000;
 const BRANCH = "improve/workflow-learning-reliability";
 const REQUEST_BRANCH = "run-requests/workflow-learning-reliability";
@@ -51,7 +56,7 @@ export function isAuthenticatedTerminalCarryProof(value: unknown): value is Auth
 	return Boolean(value) && typeof value === "object" && authenticatedTerminalCarryProofs.has(value as object);
 }
 export function authenticatedTerminalCarryBindsBundle(proof: unknown, bundle: unknown): boolean {
-	return isAuthenticatedTerminalCarryProof(proof) && validBundle(bundle) &&
+	return isAuthenticatedTerminalCarryProof(proof) && validBundle(bundle, true) &&
 		privateBundleDigest(bundle) === terminalBundleDigests.get(proof);
 }
 export function authenticatedSupervisorProjection(proof: unknown, bundle: unknown):
@@ -193,7 +198,7 @@ function canonicalPrivateBundle(bundle: PrivateContinuationBundle): string {
 function privateBundleDigest(bundle: PrivateContinuationBundle): string { return digest(canonicalPrivateBundle(bundle)); }
 export function authenticatedPriorCarryBindsBundle(proof: unknown, bundle: unknown): boolean {
 	return isAuthenticatedPriorCarryProof(proof) && proof.privateBundleSha256 !== null &&
-		validBundle(bundle) && privateBundleDigest(bundle) === proof.privateBundleSha256;
+		validBundle(bundle, true) && privateBundleDigest(bundle) === proof.privateBundleSha256;
 }
 /** A verified v3 transport-only chain may retain a historical restart origin.
  * This does not confer scientific acceptance or settle the old billing unknown.
@@ -314,10 +319,12 @@ export type LedgerContinuation = {
 	priorCarryProof?: AuthenticatedPriorCarryProof;
 	claimOneUse: (carryDigest: string) => Promise<ActionsCarryRestartClaim>;
 	priorPrivateBundle?: PrivateContinuationBundle; priorBootstrapBinding?: BootstrapBinding;
-	sealCurrent: (input: AccountingCarrySealInput) => { envelopeB64: string; observedSettledCny: number;
+	sealCurrent: (input: AccountingCarrySealInput) => { envelopeB64: string;
+			sidecars: Readonly<Record<string, string>>; observedSettledCny: number;
 			observedUnknownHeldCny: number; unpricedRequestCount: number };
 	sealEmergencyCurrent: (input: AccountingCarrySealInput, reason: "effect-review-incomplete") =>
-		{ envelopeB64: string; observedSettledCny: number; observedUnknownHeldCny: number;
+		{ envelopeB64: string; sidecars: Readonly<Record<string, string>>;
+			observedSettledCny: number; observedUnknownHeldCny: number;
 			unpricedRequestCount: number };
 };
 const historicalFixtureSealers = new WeakMap<LedgerContinuation,
@@ -413,17 +420,32 @@ function canonicalBase64(value: unknown, max: number): Buffer {
 		reject("invalid carry bytes");
 	return bytes;
 }
-function validBundle(bundle: unknown): bundle is PrivateContinuationBundle {
+function validBundle(bundle: unknown, segmented = false): bundle is PrivateContinuationBundle {
 	return record(bundle) && Object.keys(bundle).length > 0 && Object.keys(bundle).every(key =>
 		(PRIVATE_CONTINUATION_FILE_KEYS as readonly string[]).includes(key) && typeof bundle[key] === "string" &&
-		Buffer.byteLength(bundle[key] as string, "utf8") <= 4 * 1024 * 1024) &&
-		Buffer.byteLength(JSON.stringify(bundle), "utf8") <= 4 * 1024 * 1024;
+		(segmented && key === "research-history.json" ||
+			Buffer.byteLength(bundle[key] as string, "utf8") <= 4 * 1024 * 1024)) &&
+		(segmented || Buffer.byteLength(JSON.stringify(bundle), "utf8") <= 4 * 1024 * 1024);
 }
 /** Optional cause metadata must yield before it could prevent a fee carry. */
 export function retainedTransportDiagnosticWithinBundle(prior: PrivateContinuationBundle | undefined,
 	next: string): string | undefined {
-	return validBundle({ ...prior, "transport-diagnostics.json": next }) ? next :
+	const proposed = { ...prior, "transport-diagnostics.json": next };
+	return validBundle(proposed, true) &&
+		Buffer.byteLength(JSON.stringify(proposed), "utf8") <= CARRY_LOGICAL_BYTES ? next :
 		prior?.["transport-diagnostics.json"];
+}
+/** A transport cause is optional. Retain exactly the authenticated older
+ * census if the newly proposed cause would crowd out the final checkpoint. */
+function withoutNewTransportDiagnostic(bundle: PrivateContinuationBundle | undefined,
+	prior: PrivateContinuationBundle | undefined): PrivateContinuationBundle | undefined {
+	if (!bundle || bundle["transport-diagnostics.json"] ===
+		prior?.["transport-diagnostics.json"]) return undefined;
+	const next = { ...bundle };
+	if (prior?.["transport-diagnostics.json"] === undefined)
+		delete next["transport-diagnostics.json"];
+	else next["transport-diagnostics.json"] = prior["transport-diagnostics.json"];
+	return next;
 }
 function validBinding(value: unknown): value is BootstrapBinding {
 	return record(value) && exactKeys(value, ["contractId", "sourceSha256"]) &&
@@ -770,21 +792,28 @@ function validateAccountingV3(cp: Pick<AccountingCheckpoint, "source" | "parentD
 		(expectedBinding !== undefined && !sameBinding(cp.bootstrapBinding, expectedBinding)))
 		reject("carry checkpoint accounting is invalid");
 }
-function checkpointVersion(envelopeB64: string): 1 | 2 | 3 {
+function carryEnvelope(payload: CarryArtifactPayload): string {
+	return typeof payload === "string" ? payload : payload.envelopeB64;
+}
+function checkpointVersion(payload: CarryArtifactPayload): 1 | 2 | 3 | 4 {
+	const envelopeB64 = carryEnvelope(payload);
 	const bytes = canonicalBase64(envelopeB64, MAX_CARRY_BYTES);
 	let outer: unknown;
 	try { outer = JSON.parse(bytes.toString("utf8")); }
 	catch { return reject("carry envelope is invalid"); }
-	if (!record(outer) || (outer.version !== 1 && outer.version !== 2 && outer.version !== 3))
+	if (!record(outer) || (outer.version !== 1 && outer.version !== 2 && outer.version !== 3 &&
+		outer.version !== 4))
 		reject("carry envelope fields are invalid");
 	return outer.version;
 }
-function readCheckpoint(envelopeB64: string, key: Buffer, seedDigest: string, expectedSource: Source,
+function readCheckpoint(payload: CarryArtifactPayload, key: Buffer, seedDigest: string, expectedSource: Source,
 	legacyParentDigest?: string): { checkpoint: Checkpoint; digest: string } {
+	const envelopeB64 = carryEnvelope(payload);
 	const envelopeBytes = canonicalBase64(envelopeB64, MAX_CARRY_BYTES);
 	let outer: unknown;
 	try { outer = JSON.parse(envelopeBytes.toString("utf8")); } catch { return reject("carry envelope is invalid"); }
-	if (!record(outer) || (outer.version !== 1 && outer.version !== 2 && outer.version !== 3) ||
+	if (!record(outer) || (outer.version !== 1 && outer.version !== 2 && outer.version !== 3 &&
+		outer.version !== 4) ||
 		!exactKeys(outer, ["version", "nonce", "ciphertext", "tag", ...(outer.version !== 1 ? ["parentDigest"] : [])]))
 		reject("carry envelope fields are invalid");
 	const parentDigest = outer.version !== 1 ? outer.parentDigest : legacyParentDigest;
@@ -802,6 +831,22 @@ function readCheckpoint(envelopeB64: string, key: Buffer, seedDigest: string, ex
 		decipher.setAuthTag(tag);
 		bytes = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 	} catch { return reject("carry authentication failed"); }
+	if (outer.version === 4) {
+		let manifest: unknown;
+		try { manifest = JSON.parse(bytes.toString("utf8")); }
+		catch { return reject("carry sidecar manifest is invalid"); }
+		const sidecars = typeof payload === "string" ? undefined : payload.sidecars;
+		if (!validCarrySidecarManifest(manifest) || !record(sidecars) ||
+			Object.keys(sidecars).length !== manifest.segmentCount ||
+			Object.keys(sidecars).some((name, index) =>
+				!Object.hasOwn(sidecars, carrySidecarName(index)) ||
+				!/^ledger-continuation\.part-[0-9]{8,}\.enc$/.test(name)))
+			reject("carry sidecar set is invalid");
+		bytes = decodeCarrySidecars({ manifest, key, seedDigest, parentDigest,
+			source: expectedSource, load: name => canonicalBase64(sidecars[name],
+				CARRY_SEGMENT_FILE_BYTES) });
+	} else if (typeof payload !== "string" && Object.keys(payload.sidecars ?? {}).length)
+		reject("legacy carry has unexpected sidecars");
 	let parsed: unknown;
 	try { parsed = JSON.parse(bytes.toString("utf8")); } catch { return reject("carry plaintext is invalid"); }
 	if (!record(parsed) || !exactKeys(parsed, parsed.version === 3 ?
@@ -826,7 +871,8 @@ function readCheckpoint(envelopeB64: string, key: Buffer, seedDigest: string, ex
 			...(parsed.bootstrapBinding === undefined ? [] : ["bootstrapBinding"])]))
 		reject("carry checkpoint fields are invalid");
 	const cp = parsed as unknown as Checkpoint;
-	if (cp.version !== outer.version || cp.kind !== "mul-pis-private-ledger-continuation" ||
+	if (cp.version !== (outer.version === 4 ? 3 : outer.version) ||
+		cp.kind !== "mul-pis-private-ledger-continuation" ||
 		cp.missionId !== MISSION_ID || cp.repository !== MISSION_REPOSITORY || cp.seedDigest !== seedDigest ||
 		cp.parentDigest !== parentDigest ||
 		(cp.version !== 1 && !Array.isArray(cp.ancestry)) ||
@@ -844,7 +890,7 @@ function readCheckpoint(envelopeB64: string, key: Buffer, seedDigest: string, ex
 			(!record(cp.carryForwardOrigin) || !exactKeys(cp.carryForwardOrigin,
 				["source", "envelopeSha256", "historicalCommittedNano", "historicalUnknownHeldNano",
 					"privateBundleSha256"]))) ||
-		(cp.privateBundle !== undefined && !validBundle(cp.privateBundle)) ||
+		(cp.privateBundle !== undefined && !validBundle(cp.privateBundle, outer.version === 4)) ||
 		(cp.bootstrapBinding !== undefined && !validBinding(cp.bootstrapBinding)) ||
 		(cp.privateBundle === undefined) !== (cp.bootstrapBinding === undefined))
 		reject("carry checkpoint fields are invalid");
@@ -1770,6 +1816,27 @@ function sealCheckpoint(cp: Checkpoint, key: Buffer): string {
 		reject("carry exceeds private artifact limit");
 	return envelopeB64;
 }
+function sealSegmentedCheckpoint(cp: AccountingCheckpoint, key: Buffer): Readonly<{
+	envelopeB64: string; sidecars: Readonly<Record<string, string>>;
+}> {
+	const encoded = encodeCarrySidecars({ plaintext: Buffer.from(JSON.stringify(cp), "utf8"),
+		key, seedDigest: cp.seedDigest, parentDigest: cp.parentDigest, source: cp.source });
+	const nonce = randomBytes(12);
+	const cipher = createCipheriv("aes-256-gcm", key, nonce);
+	cipher.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY, cp.seedDigest,
+		4, cp.parentDigest, cp.source])));
+	const ciphertext = Buffer.concat([cipher.update(JSON.stringify(encoded.manifest), "utf8"),
+		cipher.final()]);
+	const outer = { version: 4, parentDigest: cp.parentDigest,
+		nonce: nonce.toString("base64"), ciphertext: ciphertext.toString("base64"),
+		tag: cipher.getAuthTag().toString("base64") };
+	const bytes = Buffer.from(JSON.stringify(outer));
+	const envelopeB64 = bytes.toString("base64");
+	if (bytes.length > MAX_CARRY_BYTES || Buffer.byteLength(JSON.stringify({ envelopeB64 })) > MAX_CARRY_BYTES)
+		reject("segmented carry root exceeds private artifact limit");
+	return { envelopeB64, sidecars: Object.fromEntries(encoded.sidecars.map(part =>
+		[part.name, part.bytes.toString("base64")])) };
+}
 async function githubJson(url: string, token: string | undefined, request: typeof fetch): Promise<Record<string, unknown>> {
 	let response: Response;
 	try { response = await request(url, { method: "GET", redirect: "error", signal: AbortSignal.timeout(15_000),
@@ -1901,7 +1968,7 @@ function resultArtifactIdentity(artifacts: Artifact[], source: Source): Authenti
 type OpenLedgerInput = {
 	seedEnvelopeB64: string | undefined; publicKeyFile: string; githubToken: string | undefined;
 	current: CurrentMissionRun;
-	loadCarryArtifact: (identity: { runId: string; artifactId: string }) => Promise<string>;
+	loadCarryArtifact: (identity: { runId: string; artifactId: string }) => Promise<CarryArtifactPayload>;
 	request?: typeof fetch; expectedSpkiSha256?: string;
 	/** Terminal inspection may use the host's existing authenticated GitHub
 	 * connector. The running Actions admission still requires its GitHub token. */
@@ -2079,7 +2146,7 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 	}
 	const loadedArtifacts = new Map<string, string>();
 	const resultArtifacts = new Map<string, AuthenticatedPriorCarryProof["resultArtifact"]>();
-	const load = async (source: Source): Promise<string> => {
+	const load = async (source: Source): Promise<CarryArtifactPayload> => {
 		const artifactId = loadedArtifacts.get(source.runId) ?? await oneArtifact(source.runId,
 			input.githubToken!, request, CARRY_ARTIFACT_NAME, undefined,
 			artifacts => resultArtifacts.set(source.runId, resultArtifactIdentity(artifacts, source)));
@@ -2132,7 +2199,7 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 		const latest = sourcesWithCarry.at(-1)!;
 		const latestEnvelope = await load(latest);
 		const latestVersion = checkpointVersion(latestEnvelope);
-		if (latestVersion === 3) {
+		if (latestVersion === 3 || latestVersion === 4) {
 			const opened = readCheckpoint(latestEnvelope, key, seed.seedDigest, latest);
 			latestCheckpoint = opened.checkpoint;
 			if (opened.checkpoint.version !== 3) reject("accounting-only carry version is invalid");
@@ -2183,7 +2250,7 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 				} else if (hasNoV3ProviderActivity(cp) && bundleSha256) {
 					// Old v3 wrappers did not record a bundle digest. Authenticate the
 					// legacy ciphertext itself before claiming its files were passed through.
-					let legacyEnvelope: string | undefined;
+						let legacyEnvelope: CarryArtifactPayload | undefined;
 					try {
 						const id = await oneArtifact(historicalOrigin.source.runId, input.githubToken!, request,
 							CARRY_ARTIFACT_NAME);
@@ -2524,7 +2591,7 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 					opaqueExecutedRuns.length + pendingEffectAncestry.length +
 					(currentEffectReviewPending ? 1 : 0)))
 				reject("unreviewed historical effect requires the live V2 fresh-only reservation");
-			if ((privateBundle !== undefined && !validBundle(privateBundle)) ||
+			if ((privateBundle !== undefined && !validBundle(privateBundle, true)) ||
 				(bootstrapBinding !== undefined && !validBinding(bootstrapBinding)) ||
 				(priorBootstrapBinding !== undefined && !sameBinding(bootstrapBinding, priorBootstrapBinding)) ||
 				(privateBundle === undefined) !== (bootstrapBinding === undefined))
@@ -2638,16 +2705,28 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 						cp.carryForwardOrigin = { ...originForCurrent,
 							privateBundleSha256: privateBundleDigest(privateBundle) };
 				}
-				const envelopeB64 = sealCheckpoint(cp, key);
+				if (Buffer.byteLength(JSON.stringify(cp), "utf8") > CARRY_LOGICAL_BYTES) {
+					const smaller = withoutNewTransportDiagnostic(privateBundle, priorPrivateBundle);
+					if (smaller) {
+						const originalPreparedDiagnosticText = preparedDiagnosticText;
+						preparedDiagnosticText = smaller["transport-diagnostics.json"];
+						try { return result.sealCurrent({ ...amounts, privateBundle: smaller }); }
+						catch (error) {
+							preparedDiagnosticText = originalPreparedDiagnosticText;
+							throw error;
+						}
+					}
+				}
+				const { envelopeB64, sidecars } = sealSegmentedCheckpoint(cp, key);
 				sealed = true;
-				return { envelopeB64, observedSettledCny: decimal(nextSettledNano),
+				return { envelopeB64, sidecars, observedSettledCny: decimal(nextSettledNano),
 					observedUnknownHeldCny: decimal(nextUnknownNano),
 					unpricedRequestCount: nextUnpricedCount };
 		},
 		sealEmergencyCurrent: (amounts, reason) => {
 			if (reason !== "effect-review-incomplete" || sealed)
 				reject("emergency carry requires an unsealed effect-review failure");
-			if (!priorPrivateBundle || !validBundle(priorPrivateBundle) ||
+			if (!priorPrivateBundle || !validBundle(priorPrivateBundle, true) ||
 				!priorBootstrapBinding || !validBinding(priorBootstrapBinding))
 				reject("emergency carry lacks authenticated prior research evidence");
 			const settledAddedNano = n(amounts.settledCny);
@@ -2678,7 +2757,7 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 				emergencyBundle["m04-transaction-quarantine.json"] =
 					amounts.privateBundle["m04-transaction-quarantine.json"];
 			}
-			if (!validBundle(emergencyBundle))
+			if (!validBundle(emergencyBundle, true))
 				reject("emergency transport diagnostic bundle exceeds private bounds");
 			const cp: AccountingCheckpoint = { version: 3, ancestry: accountingAncestry,
 				legacyAncestry, historical,
@@ -2697,10 +2776,17 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 				...(reviewedEffectAncestry.length ?
 					{ reviewedEffectAncestry: [...reviewedEffectAncestry] } : {}),
 				...(pending.length ? { pendingEffectAncestry: pending } : {}) };
+			if (Buffer.byteLength(JSON.stringify(cp), "utf8") > CARRY_LOGICAL_BYTES) {
+				const smaller = withoutNewTransportDiagnostic(emergencyBundle, priorPrivateBundle);
+				if (smaller) {
+					cp.privateBundle = smaller;
+					preparedDiagnosticText = smaller["transport-diagnostics.json"];
+				}
+			}
 			validateCurrentDiagnostic(cp);
-			const envelopeB64 = sealCheckpoint(cp, key);
+			const { envelopeB64, sidecars } = sealSegmentedCheckpoint(cp, key);
 			sealed = true;
-			return { envelopeB64, observedSettledCny: decimal(nextSettledNano),
+			return { envelopeB64, sidecars, observedSettledCny: decimal(nextSettledNano),
 				observedUnknownHeldCny: decimal(nextUnknownNano),
 				unpricedRequestCount: nextUnpricedCount };
 		}
@@ -2733,18 +2819,25 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 	return result;
 }
 
-/** Download the one fixed encrypted carry file; the token is used only for GitHub API. */
+/** Download only encrypted carry files; the token is used only for GitHub API. */
 export async function downloadCarryArtifact(input: { githubToken: string; artifactId: string;
-	request?: typeof fetch }): Promise<string> {
+	request?: typeof fetch; /** Offline test override only. */ idleTimeoutMs?: number }): Promise<CarryArtifactPayload> {
 	if (!positiveId(input.artifactId) || !input.githubToken || input.githubToken.length > 4_000)
 		reject("invalid carry artifact request");
+	const idleTimeoutMs = input.idleTimeoutMs ?? 15_000;
+	if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs < 1 || idleTimeoutMs > 15_000)
+		reject("invalid carry artifact idle timeout");
 	const request = input.request ?? fetch;
 	const url = `https://api.github.com/repos/${MISSION_REPOSITORY}/actions/artifacts/${input.artifactId}/zip`;
 	let initial: Response;
-	try { initial = await request(url, { method: "GET", redirect: "manual", signal: AbortSignal.timeout(15_000),
+	const initialAbort = new AbortController();
+	const initialHeaderTimer = setTimeout(() => initialAbort.abort(), 15_000);
+	try { initial = await request(url, { method: "GET", redirect: "manual", signal: initialAbort.signal,
 		headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${input.githubToken}` } }); }
 	catch { return reject("carry archive download failed"); }
+	finally { clearTimeout(initialHeaderTimer); }
 	let response = initial;
+	let bodyAbort = initialAbort;
 	if ([301, 302, 303, 307, 308].includes(initial.status)) {
 		const location = initial.headers.get("location");
 		let parsed: URL;
@@ -2755,11 +2848,15 @@ export async function downloadCarryArtifact(input: { githubToken: string; artifa
 			parsed.hostname.endsWith(".amazonaws.com") ||
 			parsed.hostname === "objects.githubusercontent.com"))
 			reject("untrusted carry archive redirect");
+		initialAbort.abort();
+		bodyAbort = new AbortController();
+		const redirectedHeaderTimer = setTimeout(() => bodyAbort.abort(), 15_000);
 		try { response = await request(parsed.toString(), { method: "GET", redirect: "error",
-			signal: AbortSignal.timeout(15_000) }); }
+			signal: bodyAbort.signal }); }
 		catch { return reject("carry archive download failed"); }
+		finally { clearTimeout(redirectedHeaderTimer); }
 	}
-	if (response.status !== 200 || Number(response.headers.get("content-length") ?? 0) > MAX_CARRY_BYTES)
+	if (response.status !== 200 || Number(response.headers.get("content-length") ?? 0) > MAX_CARRY_ARCHIVE_BYTES)
 		reject("carry archive response is invalid");
 	let zip: Buffer;
 	try {
@@ -2769,11 +2866,20 @@ export async function downloadCarryArtifact(input: { githubToken: string; artifa
 		let length = 0;
 		try {
 			while (true) {
-				const { value, done } = await reader.read();
+				let idleTimer: ReturnType<typeof setTimeout> | undefined;
+				const { value, done } = await Promise.race([reader.read(), new Promise<never>((_, failIdle) => {
+					idleTimer = setTimeout(() => {
+						failIdle(new HarnessError("runner.ledger-continuation",
+							"carry archive body stalled"));
+						bodyAbort.abort();
+						void reader.cancel().catch(() => undefined);
+					}, idleTimeoutMs);
+				})]).finally(() => clearTimeout(idleTimer));
 				if (done) break;
 				length += value.byteLength;
-				if (length > MAX_CARRY_BYTES) {
-					await reader.cancel().catch(() => undefined);
+				if (length > MAX_CARRY_ARCHIVE_BYTES) {
+					bodyAbort.abort();
+					void reader.cancel().catch(() => undefined);
 					reject("carry archive exceeds limit");
 				}
 				chunks.push(Buffer.from(value));
@@ -2784,59 +2890,99 @@ export async function downloadCarryArtifact(input: { githubToken: string; artifa
 		if (error instanceof HarnessError) throw error;
 		return reject("carry archive response is unreadable");
 	}
-	const raw = oneZipEntry(zip, CARRY_FILE_NAME);
+	const entries = carryZipEntries(zip);
+	const raw = entries.get(CARRY_FILE_NAME);
+	if (!raw) reject("carry root file is missing");
 	let parsed: unknown;
 	try { parsed = JSON.parse(raw.toString("utf8")); } catch { return reject("carry file is invalid"); }
 	if (!record(parsed) || !exactKeys(parsed, ["envelopeB64"]) || typeof parsed.envelopeB64 !== "string")
 		reject("carry file fields are invalid");
-	return parsed.envelopeB64;
+	if (entries.size === 1) return parsed.envelopeB64;
+	entries.delete(CARRY_FILE_NAME);
+	return { envelopeB64: parsed.envelopeB64,
+		sidecars: Object.fromEntries([...entries].map(([name, bytes]) =>
+			[name, bytes.toString("utf8")])) };
 }
 
-/** Minimal strict ZIP reader for GitHub's single-file artifact; rejects ZIP64, encryption and extra entries. */
-function oneZipEntry(zip: Buffer, expectedName: string): Buffer {
+/** Strict bounded ZIP reader. Every member must be an exact carry ciphertext file. */
+function carryZipEntries(zip: Buffer): Map<string, Buffer> {
 	const eocd = zip.length - 22;
 	if (eocd < 0 || zip.readUInt32LE(eocd) !== 0x06054b50 || zip.readUInt16LE(eocd + 20) !== 0 ||
 		zip.readUInt16LE(eocd + 4) !== 0 || zip.readUInt16LE(eocd + 6) !== 0 ||
-		zip.readUInt16LE(eocd + 8) !== 1 || zip.readUInt16LE(eocd + 10) !== 1)
+		zip.readUInt16LE(eocd + 8) < 1 ||
+		zip.readUInt16LE(eocd + 8) !== zip.readUInt16LE(eocd + 10) ||
+		zip.readUInt16LE(eocd + 8) > 65)
 		reject("carry archive layout is invalid");
+	const count = zip.readUInt16LE(eocd + 8);
 	const cdSize = zip.readUInt32LE(eocd + 12), cdOffset = zip.readUInt32LE(eocd + 16);
-	if (cdSize < 46 || cdOffset < 30 || cdOffset + cdSize !== eocd ||
-		zip.readUInt32LE(cdOffset) !== 0x02014b50)
+	if (cdSize < 46 * count || cdOffset < 30 || cdOffset + cdSize !== eocd)
 		reject("carry archive directory is invalid");
-	const flags = zip.readUInt16LE(cdOffset + 8), method = zip.readUInt16LE(cdOffset + 10);
-	const packed = zip.readUInt32LE(cdOffset + 20), unpacked = zip.readUInt32LE(cdOffset + 24);
-	const nameLength = zip.readUInt16LE(cdOffset + 28), extraLength = zip.readUInt16LE(cdOffset + 30);
-	const commentLength = zip.readUInt16LE(cdOffset + 32), localOffset = zip.readUInt32LE(cdOffset + 42);
-	const name = zip.subarray(cdOffset + 46, cdOffset + 46 + nameLength).toString("utf8");
-	if (name !== expectedName || cdOffset + 46 + nameLength + extraLength + commentLength !== eocd ||
-		(flags & ~(0x800 | 0x8)) || ![0, 8].includes(method) || packed > MAX_CARRY_BYTES || unpacked > MAX_CARRY_BYTES ||
-		zip.readUInt16LE(cdOffset + 34) !== 0 || localOffset !== 0 ||
-		zip.readUInt32LE(localOffset) !== 0x04034b50 ||
-		zip.readUInt16LE(localOffset + 6) !== flags || zip.readUInt16LE(localOffset + 8) !== method)
-		reject("carry archive entry is invalid");
-	const localNameLength = zip.readUInt16LE(localOffset + 26);
-	const localExtraLength = zip.readUInt16LE(localOffset + 28);
-	const localName = zip.subarray(localOffset + 30, localOffset + 30 + localNameLength).toString("utf8");
-	const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
-	if (localName !== expectedName || dataOffset + packed > cdOffset)
-		reject("carry archive local entry is invalid");
-	const end = dataOffset + packed;
-	if (flags & 0x8) {
-		const descriptor = cdOffset - end;
-		if (![12, 16].includes(descriptor) ||
-			(descriptor === 16 && zip.readUInt32LE(end) !== 0x08074b50))
+	const rows: Array<{ name: string; offset: number; dataEnd: number; bytes: Buffer }> = [];
+	const names = new Set<string>();
+	let cursor = cdOffset;
+	for (let index = 0; index < count; index++) {
+		if (cursor + 46 > eocd || zip.readUInt32LE(cursor) !== 0x02014b50)
+			reject("carry archive directory is invalid");
+		const flags = zip.readUInt16LE(cursor + 8), method = zip.readUInt16LE(cursor + 10);
+		const packed = zip.readUInt32LE(cursor + 20), unpacked = zip.readUInt32LE(cursor + 24);
+		const nameLength = zip.readUInt16LE(cursor + 28), extraLength = zip.readUInt16LE(cursor + 30);
+		const commentLength = zip.readUInt16LE(cursor + 32), localOffset = zip.readUInt32LE(cursor + 42);
+		const nameEnd = cursor + 46 + nameLength;
+		if (nameEnd + extraLength + commentLength > eocd) reject("carry archive directory is invalid");
+		const nameBytes = zip.subarray(cursor + 46, nameEnd);
+		const name = nameBytes.toString("utf8");
+		const entryLimit = name === CARRY_FILE_NAME ? MAX_CARRY_BYTES :
+			Math.ceil(CARRY_SEGMENT_FILE_BYTES * 4 / 3) + 4;
+		if (!nameBytes.equals(Buffer.from(name, "utf8")) || names.has(name) ||
+			(name !== CARRY_FILE_NAME && !/^ledger-continuation\.part-[0-9]{8,}\.enc$/.test(name)) ||
+			(flags & ~(0x800 | 0x8)) || ![0, 8].includes(method) ||
+			packed > entryLimit || unpacked > entryLimit ||
+			zip.readUInt16LE(cursor + 34) !== 0 || localOffset + 30 > cdOffset ||
+			zip.readUInt32LE(localOffset) !== 0x04034b50 ||
+			zip.readUInt16LE(localOffset + 6) !== flags ||
+			zip.readUInt16LE(localOffset + 8) !== method)
+			reject("carry archive entry is invalid");
+		names.add(name);
+		const localNameLength = zip.readUInt16LE(localOffset + 26);
+		const localExtraLength = zip.readUInt16LE(localOffset + 28);
+		const localName = zip.subarray(localOffset + 30,
+			localOffset + 30 + localNameLength).toString("utf8");
+		const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
+		if (localName !== name || dataOffset + packed > cdOffset)
+			reject("carry archive local entry is invalid");
+		const end = dataOffset + packed;
+		if ((flags & 0x8) && end + 12 > cdOffset)
 			reject("carry archive descriptor is invalid");
-		const offset = end + (descriptor === 16 ? 4 : 0);
-		if (zip.readUInt32LE(offset) !== zip.readUInt32LE(cdOffset + 16) ||
-			zip.readUInt32LE(offset + 4) !== packed || zip.readUInt32LE(offset + 8) !== unpacked)
-			reject("carry archive descriptor is invalid");
-	} else if (end !== cdOffset || zip.readUInt32LE(localOffset + 14) !== zip.readUInt32LE(cdOffset + 16) ||
-		zip.readUInt32LE(localOffset + 18) !== packed || zip.readUInt32LE(localOffset + 22) !== unpacked)
-		reject("carry archive local sizes are invalid");
-	const packedBytes = zip.subarray(dataOffset, dataOffset + packed);
-	let bytes: Buffer;
-	try { bytes = method === 0 ? packedBytes : inflateRawSync(packedBytes, { maxOutputLength: MAX_CARRY_BYTES }); }
-	catch { return reject("carry archive decompression failed"); }
-	if (bytes.length !== unpacked) reject("carry archive length is invalid");
-	return bytes;
+		const nextOffset = flags & 0x8 ? end +
+			(zip.readUInt32LE(end) === 0x08074b50 ? 16 : 12) : end;
+		if (nextOffset > cdOffset) reject("carry archive descriptor is invalid");
+		if (flags & 0x8) {
+			const descriptorOffset = end + (zip.readUInt32LE(end) === 0x08074b50 ? 4 : 0);
+			if (zip.readUInt32LE(descriptorOffset) !== zip.readUInt32LE(cursor + 16) ||
+				zip.readUInt32LE(descriptorOffset + 4) !== packed ||
+				zip.readUInt32LE(descriptorOffset + 8) !== unpacked)
+				reject("carry archive descriptor is invalid");
+		} else if (zip.readUInt32LE(localOffset + 14) !== zip.readUInt32LE(cursor + 16) ||
+			zip.readUInt32LE(localOffset + 18) !== packed ||
+			zip.readUInt32LE(localOffset + 22) !== unpacked)
+			reject("carry archive local sizes are invalid");
+		const packedBytes = zip.subarray(dataOffset, end);
+		let bytes: Buffer;
+		try { bytes = method === 0 ? packedBytes : inflateRawSync(packedBytes,
+			{ maxOutputLength: entryLimit }); }
+		catch { return reject("carry archive decompression failed"); }
+		if (bytes.length !== unpacked) reject("carry archive length is invalid");
+		rows.push({ name, offset: localOffset, dataEnd: nextOffset, bytes });
+		cursor = nameEnd + extraLength + commentLength;
+	}
+	if (cursor !== eocd || !names.has(CARRY_FILE_NAME))
+		reject("carry archive directory is invalid");
+	rows.sort((a, b) => a.offset - b.offset);
+	let next = 0;
+	for (const row of rows) {
+		if (row.offset !== next) reject("carry archive contains unlisted bytes");
+		next = row.dataEnd;
+	}
+	if (next !== cdOffset) reject("carry archive contains unlisted bytes");
+	return new Map(rows.map(row => [row.name, row.bytes]));
 }

@@ -6,12 +6,15 @@
  */
 import { createInterface } from "node:readline";
 import { createHash } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import { lstat, open, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { prepareAuthenticatedResumeRequest } from "../src/runner/mission-host-adapter.ts";
 import { MissionResumeJournal } from "../src/runner/mission-resume-journal.ts";
 import type { CurrentMissionRun } from "../src/runner/ledger-continuation.ts";
+import { CARRY_LOGICAL_BYTES, CARRY_SEGMENT_FILE_BYTES, CARRY_SEGMENT_RAW_BYTES,
+	carrySidecarName } from "../src/runner/carry-sidecar-codec.ts";
 import { HarnessError } from "../src/types.ts";
 
 type Args = { source: string; seed: string; publicKey: string;
@@ -20,6 +23,52 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 class PrivateBridgeError extends Error {
 	readonly reasonCode: string;
 	constructor(reasonCode: string) { super(reasonCode); this.reasonCode = reasonCode; }
+}
+type ArtifactSidecarFile = { name: string; file: string; sha256: string };
+type ArtifactFileReply = { file: string; sha256: string;
+	sidecars?: ArtifactSidecarFile[] };
+const maxSidecars = CARRY_LOGICAL_BYTES / CARRY_SEGMENT_RAW_BYTES;
+const maxSidecarTextBytes = Math.ceil(CARRY_SEGMENT_FILE_BYTES * 4 / 3) + 4;
+function privateFileReference(value: unknown): value is { file: string; sha256: string } {
+	return Boolean(value) && typeof value === "object" &&
+		typeof (value as { file?: unknown }).file === "string" &&
+		path.isAbsolute((value as { file: string }).file) &&
+		typeof (value as { sha256?: unknown }).sha256 === "string" &&
+		/^[0-9a-f]{64}$/.test((value as { sha256: string }).sha256);
+}
+async function verifiedPrivateBytes(reference: { file: string; sha256: string }, max: number): Promise<Buffer> {
+	const handle = await open(reference.file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+	try {
+		const meta = await handle.stat();
+		if (!meta.isFile() || (meta.mode & 0o077) !== 0 || meta.size < 1 || meta.size > max)
+			throw new Error("artifact file is not private and regular");
+		const bytes = await handle.readFile();
+		if (bytes.length !== meta.size ||
+			createHash("sha256").update(bytes).digest("hex") !== reference.sha256)
+			throw new Error("artifact file changed after connector verification");
+		return bytes;
+	} finally { await handle.close(); }
+}
+function canonicalSidecarText(bytes: Buffer): string {
+	const value = bytes.toString("utf8");
+	if (Buffer.byteLength(value, "utf8") !== bytes.length || !value.length || value.length % 4 !== 0)
+		throw new Error("artifact sidecar encoding is invalid");
+	const paddingAt = value.indexOf("=");
+	const dataEnd = paddingAt < 0 ? value.length : paddingAt;
+	if (value.length - dataEnd > 2) throw new Error("artifact sidecar encoding is invalid");
+	for (let index = 0; index < dataEnd; index++) {
+		const code = value.charCodeAt(index);
+		if (!((code >= 65 && code <= 90) || (code >= 97 && code <= 122) ||
+			(code >= 48 && code <= 57) || code === 43 || code === 47))
+			throw new Error("artifact sidecar encoding is invalid");
+	}
+	for (let index = dataEnd; index < value.length; index++)
+		if (value.charCodeAt(index) !== 61) throw new Error("artifact sidecar encoding is invalid");
+	const decoded = Buffer.from(value, "base64");
+	if (decoded.length < 29 || decoded.length > CARRY_SEGMENT_FILE_BYTES ||
+		decoded.toString("base64") !== value)
+		throw new Error("artifact sidecar encoding is invalid");
+	return value;
 }
 function underRepo(file: string): boolean {
 	const relative = path.relative(repoRoot, file);
@@ -55,7 +104,8 @@ function parseArgs(values: string[]): Args {
 /** All requests remain on the fixed repository's public metadata REST surface.
  * The connector response is trusted as the read-only GitHub account result. */
 function connectorBridge(): { request: typeof fetch;
-	artifact: (identity: { runId: string; artifactId: string }) => Promise<string>;
+	artifact: (identity: { runId: string; artifactId: string }) => Promise<string | {
+		envelopeB64: string; sidecars: Record<string, string> }>;
 	close: () => void } {
 	const pending = new Map<number, { kind: "github-get" | "artifact-file";
 		resolve: (value: unknown) => void;
@@ -64,7 +114,7 @@ function connectorBridge(): { request: typeof fetch;
 	const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 	lines.on("line", line => {
 		let reply: { id?: unknown; status?: unknown; body?: unknown;
-			file?: unknown; sha256?: unknown };
+			file?: unknown; sha256?: unknown; sidecars?: unknown };
 		try { reply = JSON.parse(line) as typeof reply; }
 		catch { return; }
 		if (!Number.isSafeInteger(reply.id)) return;
@@ -78,12 +128,18 @@ function connectorBridge(): { request: typeof fetch;
 			}
 			awaiting.resolve(new Response(JSON.stringify(reply.body), { status: Number(reply.status) }));
 		} else {
-			if (typeof reply.file !== "string" || !path.isAbsolute(reply.file) ||
-				typeof reply.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(reply.sha256) ||
-				reply.body !== undefined || reply.status !== undefined) {
+			const keys = Object.keys(reply).sort();
+			const expected = ["id", "file", "sha256", ...(reply.sidecars === undefined ? [] : ["sidecars"])].sort();
+			if (!privateFileReference(reply) || keys.join("|") !== expected.join("|") ||
+				(reply.sidecars !== undefined && (!Array.isArray(reply.sidecars) ||
+					reply.sidecars.length > maxSidecars ||
+					reply.sidecars.some((entry: unknown) => !privateFileReference(entry) ||
+						Object.keys(entry).sort().join("|") !== "file|name|sha256" ||
+						typeof (entry as { name?: unknown }).name !== "string" ||
+						!/^ledger-continuation\.part-[0-9]{8}\.enc$/.test((entry as { name: string }).name))))) {
 				awaiting.reject(new Error("artifact file reply is invalid")); return;
 			}
-			awaiting.resolve({ file: reply.file, sha256: reply.sha256 });
+			awaiting.resolve(reply as ArtifactFileReply);
 		}
 	});
 	lines.on("close", () => {
@@ -105,28 +161,37 @@ function connectorBridge(): { request: typeof fetch;
 		process.stdout.write(`${JSON.stringify({ kind: "github-get", id, url })}\n`);
 		return response;
 	};
-	const artifact = async (identity: { runId: string; artifactId: string }): Promise<string> => {
+	const artifact = async (identity: { runId: string; artifactId: string }): Promise<string | {
+		envelopeB64: string; sidecars: Record<string, string> }> => {
 		if (closed || process.stdin.readableEnded)
 			throw new PrivateBridgeError("authenticated-github-connector-stdin-closed");
 		const id = ++nextId;
-		const reply = new Promise<{ file: string; sha256: string }>((resolve, reject) =>
+		const reply = new Promise<ArtifactFileReply>((resolve, reject) =>
 			pending.set(id, { kind: "artifact-file", resolve: value =>
-				resolve(value as { file: string; sha256: string }), reject }));
+				resolve(value as ArtifactFileReply), reject }));
 		process.stdout.write(`${JSON.stringify({ kind: "artifact-file", id,
 			runId: identity.runId, artifactId: identity.artifactId })}\n`);
 		const observed = await reply;
-		const meta = await lstat(observed.file);
-		if (!meta.isFile() || (meta.mode & 0o077) !== 0 || meta.size > 8 * 1024 * 1024)
-			throw new Error("artifact file is not private and regular");
-		const bytes = await readFile(observed.file);
-		if (createHash("sha256").update(bytes).digest("hex") !== observed.sha256)
-			throw new Error("artifact file changed after connector verification");
+		const bytes = await verifiedPrivateBytes(observed, 8 * 1024 * 1024);
 		const outer = JSON.parse(bytes.toString("utf8")) as unknown;
 		if (!outer || typeof outer !== "object" || Array.isArray(outer) ||
 			Object.keys(outer).length !== 1 ||
 			typeof (outer as { envelopeB64?: unknown }).envelopeB64 !== "string")
 			throw new Error("artifact file format is invalid");
-		return (outer as { envelopeB64: string }).envelopeB64;
+		const envelopeB64 = (outer as { envelopeB64: string }).envelopeB64;
+		if (observed.sidecars === undefined) return envelopeB64;
+		const sidecars: Record<string, string> = Object.create(null) as Record<string, string>;
+		const paths = new Set([observed.file]);
+		for (const item of observed.sidecars) {
+			if (Object.hasOwn(sidecars, item.name) || paths.has(item.file))
+				throw new Error("artifact sidecar set is invalid");
+			paths.add(item.file);
+			sidecars[item.name] = canonicalSidecarText(await verifiedPrivateBytes(item, maxSidecarTextBytes));
+		}
+		for (let index = 0; index < observed.sidecars.length; index++)
+			if (!Object.hasOwn(sidecars, carrySidecarName(index)))
+				throw new Error("artifact sidecar set is invalid");
+		return { envelopeB64, sidecars };
 	};
 	return { request, artifact, close: () => lines.close() };
 }

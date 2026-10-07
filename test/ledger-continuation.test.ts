@@ -6,7 +6,7 @@ import path from "node:path";
 import { deflateRawSync } from "node:zlib";
 import test, { type TestContext } from "node:test";
 import { authenticateLatestTerminalCarry, authenticatedSupervisorProjection, authenticatedTerminalCarryBindsBundle, isAuthenticatedTerminalCarryProof, authenticatedAccountingObservation, authenticatedHistoricalOpaqueRunGaps, authenticatedHistoricalCarryOrigin, authenticatedPendingHistoricalEffectSources, authenticatedSelectedTransitions, authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, originalObjectiveMatchesSignedBootstrap, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE, retainedTransportDiagnosticWithinBundle } from "../src/runner/ledger-continuation.ts";
-import type { RequestAuditSnapshot } from "../src/runner/ledger-continuation.ts";
+import type { CarryArtifactPayload, RequestAuditSnapshot } from "../src/runner/ledger-continuation.ts";
 import { DeepSeekCampaignBudget, campaignSessionEffectId, type CampaignAdmissionRejection } from "../src/runner/deepseek-campaign.ts";
 import { offlineChecks } from "../scripts/manual-private-campaign.ts";
 import { Workspace } from "../src/workspace.ts";
@@ -16,9 +16,42 @@ import { verifyDeepSeekCnyBilling, nativeCnyPricingRecord } from "../src/runner/
 import { verifyDeepSeekProviderOutputLimit, providerOutputLimitRecord } from "../src/runner/deepseek-provider-limits.ts";
 import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY } from "../src/runner/signed-mission-ledger.ts";
 import { sealCampaignCarry } from "../src/runner/emergency-carry.ts";
+import { decodeCarrySidecars, encodeCarrySidecars } from "../src/runner/carry-sidecar-codec.ts";
+import { CARRY_LOGICAL_BYTES } from "../src/runner/carry-sidecar-codec.ts";
 
 const sha = (letter: string) => letter.repeat(40);
 const HISTORICAL_PUSH_MESSAGE = "Synthetic old control request";
+function decodeV4Checkpoint(carry: { envelopeB64: string; sidecars: Readonly<Record<string, string>> },
+	seedDigest: string, key: Buffer, source: { runId: string; runAttempt: number;
+		runNumber: number; commit: string }): Record<string, any> {
+	const outer = JSON.parse(Buffer.from(carry.envelopeB64, "base64").toString("utf8"));
+	assert.equal(outer.version, 4);
+	const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(outer.nonce, "base64"));
+	decipher.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY, seedDigest,
+		4, outer.parentDigest, source])));
+	decipher.setAuthTag(Buffer.from(outer.tag, "base64"));
+	const manifest = JSON.parse(Buffer.concat([decipher.update(Buffer.from(outer.ciphertext, "base64")),
+		decipher.final()]).toString("utf8"));
+	const bytes = decodeCarrySidecars({ manifest, key, seedDigest,
+		parentDigest: outer.parentDigest, source,
+		load: name => Buffer.from(carry.sidecars[name]!, "base64") });
+	return JSON.parse(bytes.toString("utf8"));
+}
+function resealV4Checkpoint(checkpoint: Record<string, any>, seedDigest: string,
+	key: Buffer, source: { runId: string; runAttempt: number; runNumber: number; commit: string }) {
+	const encoded = encodeCarrySidecars({ plaintext: Buffer.from(JSON.stringify(checkpoint)),
+		key, seedDigest, parentDigest: checkpoint.parentDigest, source });
+	const nonce = randomBytes(12);
+	const cipher = createCipheriv("aes-256-gcm", key, nonce);
+	cipher.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY, seedDigest,
+		4, checkpoint.parentDigest, source])));
+	const ciphertext = Buffer.concat([cipher.update(JSON.stringify(encoded.manifest)), cipher.final()]);
+	return { envelopeB64: Buffer.from(JSON.stringify({ version: 4,
+		parentDigest: checkpoint.parentDigest, nonce: nonce.toString("base64"),
+		ciphertext: ciphertext.toString("base64"), tag: cipher.getAuthTag().toString("base64") })).toString("base64"),
+		sidecars: Object.fromEntries(encoded.sidecars.map(part =>
+			[part.name, part.bytes.toString("base64")])) };
+}
 test("old-writer effect recovery cannot change signed objective text under the same contract ID", () => {
 	const signed = JSON.stringify({ version: 1, kind: "original-objective", id: "same-id",
 		goal: "synthetic original", constraints: ["frozen"] });
@@ -155,7 +188,7 @@ test("latest terminal carry is live-authenticated before supervisor projection",
 			Promise.resolve(new Response(JSON.stringify({ ...done, actor: { login: actor } }))) : base(url, init);
 	};
 	const common = { ...f, seedEnvelopeB64, githubToken: "synthetic-token", source,
-		request: live([anchor, done]), loadCarryArtifact: async () => carry.envelopeB64 };
+		request: live([anchor, done]), loadCarryArtifact: async () => carry };
 	const terminal = await authenticateLatestTerminalCarry(common);
 	assert.equal(isAuthenticatedTerminalCarryProof(terminal.proof), true);
 	assert.doesNotMatch(JSON.stringify(terminal.proof), /synthetic candidate|Synthetic task/);
@@ -188,52 +221,23 @@ test("latest terminal carry is live-authenticated before supervisor projection",
 		publicKeyFile: f.publicKeyFile, expectedSpkiSha256: f.expectedSpkiSha256 });
 	const key = seed.derivePrivateKey("mul-pis-ledger-continuation-v1");
 	const expectedSource = { runId: "7002", runAttempt: 1, runNumber: 2, commit: sha("b") };
-	const decoder = createDecipheriv("aes-256-gcm", key, Buffer.from(outer.nonce, "base64"));
-	decoder.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY, seed.seedDigest,
-		3, seed.seedDigest, expectedSource])));
-	const originalOuter = JSON.parse(Buffer.from(carry.envelopeB64, "base64").toString("utf8"));
-	decoder.setAuthTag(Buffer.from(originalOuter.tag, "base64"));
-	const plaintext = Buffer.concat([decoder.update(Buffer.from(originalOuter.ciphertext, "base64")), decoder.final()]);
-	const checkpoint = JSON.parse(plaintext.toString("utf8"));
+	const checkpoint = decodeV4Checkpoint(carry, seed.seedDigest, key, expectedSource);
 	const changedParent = "f".repeat(64);
 	checkpoint.parentDigest = changedParent;
-	const nonce = randomBytes(12);
-	const encoder = createCipheriv("aes-256-gcm", key, nonce);
-	encoder.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY, seed.seedDigest,
-		3, changedParent, expectedSource])));
-	const ciphertext = Buffer.concat([encoder.update(JSON.stringify(checkpoint)), encoder.final()]);
-	const brokenChain = Buffer.from(JSON.stringify({ version: 3, parentDigest: changedParent,
-		nonce: nonce.toString("base64"), ciphertext: ciphertext.toString("base64"),
-		tag: encoder.getAuthTag().toString("base64") })).toString("base64");
+	const brokenChain = resealV4Checkpoint(checkpoint, seed.seedDigest, key, expectedSource);
 	await assert.rejects(authenticateLatestTerminalCarry({ ...common,
 		loadCarryArtifact: async () => brokenChain }), /ancestry|accounting/);
-	const changedSelection = JSON.parse(plaintext.toString("utf8"));
+	const changedSelection = decodeV4Checkpoint(carry, seed.seedDigest, key, expectedSource);
 	changedSelection.privateBundle["candidate.cpp"] = "unreviewed replacement";
-	const selectionNonce = randomBytes(12);
-	const selectionEncoder = createCipheriv("aes-256-gcm", key, selectionNonce);
-	selectionEncoder.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
-		seed.seedDigest, 3, seed.seedDigest, expectedSource])));
-	const selectionCiphertext = Buffer.concat([selectionEncoder.update(JSON.stringify(changedSelection)),
-		selectionEncoder.final()]);
-	const unprovenSelection = Buffer.from(JSON.stringify({ version: 3, parentDigest: seed.seedDigest,
-		nonce: selectionNonce.toString("base64"), ciphertext: selectionCiphertext.toString("base64"),
-		tag: selectionEncoder.getAuthTag().toString("base64") })).toString("base64");
+	const unprovenSelection = resealV4Checkpoint(changedSelection, seed.seedDigest, key, expectedSource);
 	await assert.rejects(authenticateLatestTerminalCarry({ ...common,
 		loadCarryArtifact: async () => unprovenSelection }), /selected tuple.*provenance/);
-	const unsupportedClosure = JSON.parse(plaintext.toString("utf8"));
+	const unsupportedClosure = decodeV4Checkpoint(carry, seed.seedDigest, key, expectedSource);
 	const closureCheckpoint = JSON.parse(unsupportedClosure.privateBundle["objective-checkpoint.json"]);
 	closureCheckpoint.objectiveOutcome = "fulfilled";
 	closureCheckpoint.stopReason = null;
 	unsupportedClosure.privateBundle["objective-checkpoint.json"] = JSON.stringify(closureCheckpoint);
-	const closureNonce = randomBytes(12);
-	const closureEncoder = createCipheriv("aes-256-gcm", key, closureNonce);
-	closureEncoder.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
-		seed.seedDigest, 3, seed.seedDigest, expectedSource])));
-	const closureCiphertext = Buffer.concat([closureEncoder.update(JSON.stringify(unsupportedClosure)),
-		closureEncoder.final()]);
-	const unprovedClosure = Buffer.from(JSON.stringify({ version: 3, parentDigest: seed.seedDigest,
-		nonce: closureNonce.toString("base64"), ciphertext: closureCiphertext.toString("base64"),
-		tag: closureEncoder.getAuthTag().toString("base64") })).toString("base64");
+	const unprovedClosure = resealV4Checkpoint(unsupportedClosure, seed.seedDigest, key, expectedSource);
 	await assert.rejects(authenticateLatestTerminalCarry({ ...common,
 		loadCarryArtifact: async () => unprovedClosure }), /closure lacks an independent host receipt/);
 	const newer = run(7003, 3, "completed", sha("c"), "failure");
@@ -300,7 +304,7 @@ test("terminal control request authenticates its immutable tested source after f
 		requestAudit: { version: 3, kind: "accounting-only-request-audit", requests: [],
 			settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 } });
 	const terminalInput = { ...f, seedEnvelopeB64, githubToken: "synthetic-token", source,
-		loadCarryArtifact: async () => carry.envelopeB64 };
+		loadCarryArtifact: async () => carry };
 	const terminal = await authenticateLatestTerminalCarry({ ...terminalInput, request: requestFor(true) });
 	assert.equal(authenticatedSupervisorProjection(terminal.proof, terminal.privateBundle)?.status.contractId,
 		contract.id);
@@ -441,7 +445,7 @@ test("verified legacy carry transitions monotonically to accounting-only v3 with
 	};
 	const next = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7005, sha("e")), request,
-		loadCarryArtifact: async () => sealed.envelopeB64 });
+		loadCarryArtifact: async () => sealed });
 	assert.equal(next.historicalCommittedCny, 6.125);
 	assert.equal(next.historicalUnknownHeldCny, 0.75);
 	assert.equal(next.priorSettledCny, 42.25);
@@ -495,7 +499,7 @@ test("verified legacy carry transitions monotonically to accounting-only v3 with
 	};
 	const reopened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7006, sha("f")), request: newestRequest,
-		loadCarryArtifact: async () => sealedAgain.envelopeB64 });
+		loadCarryArtifact: async () => sealedAgain });
 	assert.deepEqual(authenticatedAccountingObservation(reopened.priorCarryProof,
 		reopened.priorPrivateBundle), authenticatedAccountingObservation(next.priorCarryProof,
 		next.priorPrivateBundle));
@@ -522,7 +526,7 @@ test("v3 records wholly unpriced provider requests without fabricating CNY or re
 	const reopened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7003, sha("c")),
 		request: github([anchor, { ...first, status: "completed", conclusion: "failure" }, second]),
-		loadCarryArtifact: async () => sealed.envelopeB64 });
+		loadCarryArtifact: async () => sealed });
 	assert.equal(reopened.historicalCommittedCny, 4.125);
 	assert.equal(reopened.priorSettledCny, 0);
 	assert.equal(reopened.priorUnpricedRequestCount, 2);
@@ -629,6 +633,141 @@ test("private ZIP downloader extracts exactly one bounded carry envelope", async
 	const request: typeof fetch = async () => new Response(zip, { status: 200 });
 	assert.equal(await downloadCarryArtifact({ githubToken: "synthetic-token", artifactId: "9002",
 		request }), "synthetic-envelope");
+});
+
+function carryZip(entries: Array<[string, Buffer]>): Buffer {
+	const locals: Buffer[] = [], centrals: Buffer[] = [];
+	let offset = 0;
+	for (const [label, content] of entries) {
+		const name = Buffer.from(label);
+		const local = Buffer.alloc(30);
+		local.writeUInt32LE(0x04034b50, 0);
+		local.writeUInt32LE(content.length, 18); local.writeUInt32LE(content.length, 22);
+		local.writeUInt16LE(name.length, 26);
+		locals.push(local, name, content);
+		const central = Buffer.alloc(46);
+		central.writeUInt32LE(0x02014b50, 0);
+		central.writeUInt32LE(content.length, 20); central.writeUInt32LE(content.length, 24);
+		central.writeUInt16LE(name.length, 28); central.writeUInt32LE(offset, 42);
+		centrals.push(central, name);
+		offset += local.length + name.length + content.length;
+	}
+	const directory = Buffer.concat(centrals);
+	const end = Buffer.alloc(22);
+	end.writeUInt32LE(0x06054b50, 0);
+	end.writeUInt16LE(entries.length, 8); end.writeUInt16LE(entries.length, 10);
+	end.writeUInt32LE(directory.length, 12); end.writeUInt32LE(offset, 16);
+	return Buffer.concat([...locals, directory, end]);
+}
+
+test("carry ZIP accepts encrypted segments and rejects extra or duplicate members", async () => {
+	const root = Buffer.from(JSON.stringify({ envelopeB64: "v4-root" }));
+	const part = ["ledger-continuation.part-00000000.enc", Buffer.from("c2lkZWNhcg==")] as const;
+	const archive = carryZip([[CARRY_FILE_NAME, root], [...part]]);
+	const request: typeof fetch = async () => new Response(archive);
+	assert.deepEqual(await downloadCarryArtifact({ githubToken: "synthetic-token", artifactId: "9002", request }),
+		{ envelopeB64: "v4-root", sidecars: { [part[0]]: part[1].toString("utf8") } });
+	for (const invalid of [carryZip([[CARRY_FILE_NAME, root], [...part], [...part]]),
+		carryZip([[CARRY_FILE_NAME, root], ["extra.txt", Buffer.from("x")]])])
+		await assert.rejects(downloadCarryArtifact({ githubToken: "synthetic-token", artifactId: "9002",
+			request: async () => new Response(invalid) }), /carry archive entry is invalid/);
+});
+
+test("carry download uses per-chunk idle timing while a slow body progresses", async () => {
+	const archive = carryZip([[CARRY_FILE_NAME,
+		Buffer.from(JSON.stringify({ envelopeB64: "slow-valid-root" }))]]);
+	let start = 0;
+	const request: typeof fetch = async () => new Response(new ReadableStream<Uint8Array>({
+		async pull(controller) {
+			await new Promise(resolve => setTimeout(resolve, 4));
+			const end = Math.min(start + 8, archive.length);
+			controller.enqueue(archive.subarray(start, end)); start = end;
+			if (start === archive.length) controller.close();
+		},
+	}));
+	assert.equal(await downloadCarryArtifact({ githubToken: "synthetic-token", artifactId: "9002",
+		request, idleTimeoutMs: 20 }), "slow-valid-root");
+	let cancelled = false;
+	const stalled: typeof fetch = async () => new Response(new ReadableStream<Uint8Array>({
+		start() {},
+		cancel() { cancelled = true; },
+	}));
+	await assert.rejects(downloadCarryArtifact({ githubToken: "synthetic-token", artifactId: "9002",
+		request: stalled, idleTimeoutMs: 5 }), /body stalled/);
+	assert.equal(cancelled, true);
+});
+
+test("normal and emergency carries discard only an optional diagnostic at the exact v4 capacity", async t => {
+	const f = await fixture(t);
+	const zeroAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
+		requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
+	const firstOpened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7002, sha("b")), request: github([anchor, first]),
+		loadCarryArtifact: async () => "unused" });
+	const historicalText = "h".repeat(CARRY_LOGICAL_BYTES - 250_000);
+	const firstCarry = firstOpened.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: zeroAudit,
+		bootstrapBinding: { contractId: "synthetic-near-capacity", sourceSha256: "d".repeat(64) },
+		privateBundle: { "research-history.json": historicalText } });
+	const firstDone = { ...first, status: "completed", conclusion: "failure" };
+	const openSecond = () => openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7003, sha("c")), request: github([anchor, firstDone, second]),
+		loadCarryArtifact: async () => firstCarry });
+	const requests = Array.from({ length: 700 }, (_, index) => ({
+		requestId: `q${String(index).padStart(4, "0")}${"x".repeat(118)}`,
+		inputPayloadBytes: 1, responseReceived: false, status: "unknown" as const,
+		settledCny: null, unknownObservedCny: null, reportedUsage: null }));
+	const audit = { ...zeroAudit, requests, unpricedRequestCount: requests.length };
+	const diagnostic = (parentDigest: string) => JSON.stringify({ version: 1,
+		kind: "host-transport-diagnostic-census", entries: [{
+		source: { runId: "7003", runAttempt: 1, commit: sha("c") },
+		priorEnvelopeSha256: parentDigest,
+		rows: requests.map(row => ({ requestId: row.requestId, availability: "unavailable" })) }] });
+	const normalOpened = await openSecond();
+	const bundle = { ...normalOpened.priorPrivateBundle!,
+		"transport-diagnostics.json": diagnostic(normalOpened.priorCarryProof!.envelopeSha256) };
+	assert.ok(Buffer.byteLength(JSON.stringify(bundle), "utf8") < CARRY_LOGICAL_BYTES);
+	assert.equal(normalOpened.appendTransportDiagnosticCensus(audit, []),
+		bundle["transport-diagnostics.json"]);
+	const normal = normalOpened.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: requests.length, requestAudit: audit, privateBundle: bundle });
+	const seed = await authenticateSignedMissionSeed({ ...f, envelopeB64: f.seedEnvelopeB64 });
+	const source = { runId: "7003", runAttempt: 1, runNumber: 3, commit: sha("c") };
+	const normalCheckpoint = decodeV4Checkpoint(normal, seed.seedDigest,
+		seed.derivePrivateKey("mul-pis-ledger-continuation-v1"), source);
+	assert.equal(normalCheckpoint.privateBundle["research-history.json"], historicalText);
+	assert.equal(normalCheckpoint.privateBundle["transport-diagnostics.json"], undefined);
+	assert.equal(normalCheckpoint.unpricedRequestCount, requests.length);
+	const emergencyOpened = await openSecond();
+	const emergency = emergencyOpened.sealEmergencyCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: requests.length, requestAudit: audit, privateBundle: bundle },
+		"effect-review-incomplete");
+	const emergencyCheckpoint = decodeV4Checkpoint(emergency, seed.seedDigest,
+		seed.derivePrivateKey("mul-pis-ledger-continuation-v1"), source);
+	assert.equal(emergencyCheckpoint.privateBundle["research-history.json"], historicalText);
+	assert.equal(emergencyCheckpoint.privateBundle["transport-diagnostics.json"], undefined);
+	assert.equal(emergencyCheckpoint.unpricedRequestCount, requests.length);
+	const interrupted = await openSecond();
+	assert.equal(interrupted.appendTransportDiagnosticCensus(audit, []),
+		bundle["transport-diagnostics.json"]);
+	const actualNormalSeal = interrupted.sealCurrent;
+	let sealAttempts = 0;
+	interrupted.sealCurrent = input => {
+		sealAttempts++;
+		if (sealAttempts === 2) throw Error("synthetic selected-effect invariant on smaller retry");
+		return actualNormalSeal(input);
+	};
+	const recovered = sealCampaignCarry(interrupted, { settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: requests.length, requestAudit: audit, privateBundle: bundle });
+	assert.equal(sealAttempts, 2);
+	assert.equal(recovered.mode, "emergency-effects-unreviewed");
+	if (recovered.mode === "emergency-effects-unreviewed")
+		assert.match(String(recovered.normalFailure), /synthetic selected-effect invariant/);
+	const recoveredCheckpoint = decodeV4Checkpoint(recovered.carry, seed.seedDigest,
+		seed.derivePrivateKey("mul-pis-ledger-continuation-v1"), source);
+	assert.equal(recoveredCheckpoint.privateBundle["research-history.json"], historicalText);
+	assert.equal(recoveredCheckpoint.privateBundle["transport-diagnostics.json"], undefined);
+	assert.equal(recoveredCheckpoint.unpricedRequestCount, requests.length);
 });
 
 test("host audit retains each reservation after a failed prompt without content", () => {
@@ -1347,11 +1486,11 @@ test("zero-activity v3 wrapper authenticates exact legacy bundle before carrying
 					workflow_run: { id: 7005, head_sha: sha("e") } }] }));
 		return base(url, init);
 	};
-	const reopen = async (envelopeB64: string, legacyEnvelope = f.secondCarry.envelopeB64) =>
+	const reopen = async (carryPayload: CarryArtifactPayload, legacyEnvelope = f.secondCarry.envelopeB64) =>
 		openLedgerContinuation({ ...f, githubToken: "synthetic-token", request,
 			current: current(7006, sha("f")), loadCarryArtifact: async ({ artifactId }) =>
-				artifactId === "9005" ? envelopeB64 : legacyEnvelope });
-	const passThrough = await reopen(wrapped.envelopeB64);
+				artifactId === "9005" ? carryPayload : legacyEnvelope });
+	const passThrough = await reopen(wrapped);
 	const proof = passThrough.priorCarryProof!;
 	assert.equal(proof.version, 2);
 	assert.equal(proof.source.runId, "7005");
@@ -1368,7 +1507,7 @@ test("zero-activity v3 wrapper authenticates exact legacy bundle before carrying
 	const changedCarry = changed.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
 		unpricedRequestCount: 0, requestAudit: emptyAudit,
 		privateBundle: { "candidate.cpp": "different goal evidence" } });
-	const changedNext = await reopen(changedCarry.envelopeB64);
+	const changedNext = await reopen(changedCarry);
 	assert.equal(authenticatedCarryForwardOrigin(changedNext.priorCarryProof,
 		changedNext.priorPrivateBundle), undefined);
 	const requestBearing = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
@@ -1377,29 +1516,18 @@ test("zero-activity v3 wrapper authenticates exact legacy bundle before carrying
 		unpricedRequestCount: 1, requestAudit: { ...emptyAudit, unpricedRequestCount: 1,
 			requests: [{ requestId: "synthetic-request", inputPayloadBytes: 1, status: "in-flight" as const,
 				settledCny: null, unknownObservedCny: null, reportedUsage: null }] } });
-	const requestNext = await reopen(observedRequest.envelopeB64);
+	const requestNext = await reopen(observedRequest);
 	assert.equal(authenticatedCarryForwardOrigin(requestNext.priorCarryProof,
 		requestNext.priorPrivateBundle), undefined);
 	const seed = await authenticateSignedMissionSeed({ ...f, envelopeB64: f.seedEnvelopeB64 });
 	const key = seed.derivePrivateKey("mul-pis-ledger-continuation-v1");
 	const outer = JSON.parse(Buffer.from(wrapped.envelopeB64, "base64").toString());
 	const source = { runId: "7005", runAttempt: 1, runNumber: 4, commit: sha("e") };
-	const oldCipher = createDecipheriv("aes-256-gcm", key, Buffer.from(outer.nonce, "base64"));
-	oldCipher.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
-		seed.seedDigest, 3, outer.parentDigest, source])));
-	oldCipher.setAuthTag(Buffer.from(outer.tag, "base64"));
-	const tampered = JSON.parse(Buffer.concat([oldCipher.update(Buffer.from(outer.ciphertext, "base64")),
-		oldCipher.final()]).toString());
+	const tampered = decodeV4Checkpoint(wrapped, seed.seedDigest, key, source);
 	tampered.historical.committedNano++;
-	const nonce = randomBytes(12);
-	const newCipher = createCipheriv("aes-256-gcm", key, nonce);
-	newCipher.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
-		seed.seedDigest, 3, outer.parentDigest, source])));
-	const ciphertext = Buffer.concat([newCipher.update(JSON.stringify(tampered)), newCipher.final()]);
-	const changedHistory = Buffer.from(JSON.stringify({ ...outer, nonce: nonce.toString("base64"),
-		ciphertext: ciphertext.toString("base64"), tag: newCipher.getAuthTag().toString("base64") })).toString("base64");
+	const changedHistory = resealV4Checkpoint(tampered, seed.seedDigest, key, source);
 	await assert.rejects(reopen(changedHistory), /historical commitment transition is invalid/);
-	const wrongLegacy = await reopen(wrapped.envelopeB64, f.firstCarry.envelopeB64);
+	const wrongLegacy = await reopen(wrapped, f.firstCarry.envelopeB64);
 	assert.equal(authenticatedCarryForwardOrigin(wrongLegacy.priorCarryProof,
 		wrongLegacy.priorPrivateBundle), undefined);
 	const pinned = passThrough.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
@@ -1429,7 +1557,7 @@ test("zero-activity v3 wrapper authenticates exact legacy bundle before carrying
 	const later = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		request: laterRequest, current: current(7007, sha("1")),
 		loadCarryArtifact: async ({ artifactId }) => {
-			assert.equal(artifactId, "9006"); return pinned.envelopeB64;
+			assert.equal(artifactId, "9006"); return pinned;
 		} });
 	assert.deepEqual(authenticatedCarryForwardOrigin(later.priorCarryProof, later.priorPrivateBundle),
 		authenticatedCarryForwardOrigin(proof, passThrough.priorPrivateBundle));
@@ -1497,7 +1625,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 	const workOpened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
 		githubToken: "synthetic-token", current: current(7005, sha("e")),
 		request: requestFor([anchor, firstDone, secondDone, work]),
-		loadCarryArtifact: async ({ artifactId }) => artifactId === "9003" ? zero.envelopeB64 : legacy.envelopeB64 });
+		loadCarryArtifact: async ({ artifactId }) => artifactId === "9003" ? zero : legacy.envelopeB64 });
 	assert(authenticatedCarryForwardOrigin(workOpened.priorCarryProof, workOpened.priorPrivateBundle));
 	const profile = await verifyDeepSeekCnyBilling({ apiKey: "synthetic-key",
 		now: () => new Date("2026-10-06T10:30:00.000Z"),
@@ -1546,7 +1674,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 		githubToken: "synthetic-token", current: current(7006, sha("f")),
 		request: requestFor([anchor, firstDone, secondDone,
 			{ ...work, status: "completed", conclusion: "failure" }, next]),
-		loadCarryArtifact: async () => sealed.envelopeB64 });
+		loadCarryArtifact: async () => sealed });
 	assert.equal(resumed.priorSettledCny, 0.5);
 	assert.equal(resumed.historicalUnknownHeldCny, 0.25);
 	assert.equal(authenticatedCarryForwardOrigin(resumed.priorCarryProof, resumed.priorPrivateBundle), undefined);
@@ -1559,12 +1687,12 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 	const reopenWork = () => openLedgerContinuation({ ...f, seedEnvelopeB64,
 		githubToken: "synthetic-token", current: current(7005, sha("e")),
 		request: requestFor([anchor, firstDone, secondDone, work]),
-		loadCarryArtifact: async ({ artifactId }) => artifactId === "9003" ? zero.envelopeB64 : legacy.envelopeB64 });
-	const resumeCarry = (envelopeB64: string) => openLedgerContinuation({ ...f, seedEnvelopeB64,
+		loadCarryArtifact: async ({ artifactId }) => artifactId === "9003" ? zero : legacy.envelopeB64 });
+	const resumeCarry = (carryPayload: CarryArtifactPayload) => openLedgerContinuation({ ...f, seedEnvelopeB64,
 		githubToken: "synthetic-token", current: current(7006, sha("f")),
 		request: requestFor([anchor, firstDone, secondDone,
 			{ ...work, status: "completed", conclusion: "failure" }, next]),
-		loadCarryArtifact: async () => envelopeB64 });
+		loadCarryArtifact: async () => carryPayload });
 	{
 		const priorProof = resumed.priorCarryProof!;
 		const entry = { source: priorProof.source, envelopeSha256: priorProof.envelopeSha256,
@@ -1575,23 +1703,17 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 			kind: "unresolved-historical-m04-quarantine", entries: [entry] });
 		const withQuarantine = { ...resumed.priorPrivateBundle,
 			"m04-transaction-quarantine.json": quarantineText };
-		const emergencyOpen = await resumeCarry(sealed.envelopeB64);
+		const emergencyOpen = await resumeCarry(sealed);
 		const emergency = emergencyOpen.sealEmergencyCurrent({ settledCny: 0,
 			unknownObservedCny: 0, unpricedRequestCount: 0,
 			requestAudit: emptyAudit, privateBundle: withQuarantine }, "effect-review-incomplete");
 		const seed = await authenticateSignedMissionSeed({ ...f, envelopeB64: seedEnvelopeB64 });
-		const outer = JSON.parse(Buffer.from(emergency.envelopeB64, "base64").toString());
-		const reader = createDecipheriv("aes-256-gcm",
-			seed.derivePrivateKey("mul-pis-ledger-continuation-v1"), Buffer.from(outer.nonce, "base64"));
-		reader.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
-			seed.seedDigest, 3, outer.parentDigest,
-			{ runId: "7006", runAttempt: 1, runNumber: 5, commit: sha("f") }])));
-		reader.setAuthTag(Buffer.from(outer.tag, "base64"));
-		const emergencyCheckpoint = JSON.parse(Buffer.concat([
-			reader.update(Buffer.from(outer.ciphertext, "base64")), reader.final()]).toString());
+		const emergencyCheckpoint = decodeV4Checkpoint(emergency, seed.seedDigest,
+			seed.derivePrivateKey("mul-pis-ledger-continuation-v1"),
+			{ runId: "7006", runAttempt: 1, runNumber: 5, commit: sha("f") });
 		assert.equal(emergencyCheckpoint.privateBundle["m04-transaction-quarantine.json"], quarantineText);
 		assert.equal(emergencyCheckpoint.currentEffectReview, "pending");
-		const normalOpen = await resumeCarry(sealed.envelopeB64);
+		const normalOpen = await resumeCarry(sealed);
 		const normal = normalOpen.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
 			unpricedRequestCount: 0, requestAudit: emptyAudit, privateBundle: withQuarantine });
 		const later = run(7007, 6, "in_progress", sha("1"));
@@ -1600,7 +1722,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 			request: requestFor([anchor, firstDone, secondDone,
 				{ ...work, status: "completed", conclusion: "failure" },
 				{ ...next, status: "completed", conclusion: "failure" }, later]),
-			loadCarryArtifact: async () => normal.envelopeB64 });
+			loadCarryArtifact: async () => normal });
 		const inherited = await reopen();
 		assert.equal(inherited.priorPrivateBundle?.["m04-transaction-quarantine.json"], quarantineText);
 		const { "m04-transaction-quarantine.json": _removed, ...without } = inherited.priorPrivateBundle!;
@@ -1659,7 +1781,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 			unknownObservedCny: badAudit.unknownObservedCny,
 			unpricedRequestCount: badAudit.unpricedRequestCount,
 			requestAudit: badAudit, privateBundle: badBundle });
-		const replay = await resumeCarry(bad.envelopeB64);
+		const replay = await resumeCarry(bad);
 		assert.equal(authenticatedHostEffectEvidence(replay.priorCarryProof, replay.priorPrivateBundle),
 			undefined, label);
 	}
@@ -1672,7 +1794,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 	const unknownBillingCarry = unknownBillingOpen.sealCurrent({ settledCny: 0.5,
 		unknownObservedCny: 0, unpricedRequestCount: 1,
 		requestAudit: unknownBillingAudit, privateBundle: nextBundle });
-	const unknownBillingResume = await resumeCarry(unknownBillingCarry.envelopeB64);
+	const unknownBillingResume = await resumeCarry(unknownBillingCarry);
 	assert(authenticatedHostEffectEvidence(unknownBillingResume.priorCarryProof,
 		unknownBillingResume.priorPrivateBundle), "received response with unknown CNY retains effect authority");
 	assert.equal(unknownBillingResume.priorUnpricedRequestCount, 1);
@@ -1685,7 +1807,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 	const observedUnknownCarry = observedUnknownOpen.sealCurrent({ settledCny: 0.5,
 		unknownObservedCny: 0.25, unpricedRequestCount: 0,
 		requestAudit: observedUnknownAudit, privateBundle: nextBundle });
-	const observedUnknownResume = await resumeCarry(observedUnknownCarry.envelopeB64);
+	const observedUnknownResume = await resumeCarry(observedUnknownCarry);
 	assert(authenticatedHostEffectEvidence(observedUnknownResume.priorCarryProof,
 		observedUnknownResume.priorPrivateBundle));
 	assert.equal(observedUnknownResume.priorUnknownObservedCny, 0.25);
@@ -1714,7 +1836,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 	const transportCarry = transportOpen.sealCurrent({ settledCny: 0.5,
 		unknownObservedCny: 0.25, unpricedRequestCount: 0,
 		requestAudit: transportAudit, privateBundle: transportBundle });
-	const transportResume = await resumeCarry(transportCarry.envelopeB64);
+	const transportResume = await resumeCarry(transportCarry);
 	assert(authenticatedHostEffectEvidence(transportResume.priorCarryProof,
 		transportResume.priorPrivateBundle), "16 received plus one unknown transport retains confined actor-effect authority");
 	assert.equal(transportResume.priorUnknownObservedCny, 0.25);
@@ -1739,7 +1861,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 	};
 	const claimed = await openLedgerContinuation({ ...f, seedEnvelopeB64,
 		githubToken: "synthetic-token", current: current(7006, sha("f")),
-		request: claimRequest, loadCarryArtifact: async () => transportCarry.envelopeB64 });
+		request: claimRequest, loadCarryArtifact: async () => transportCarry });
 	const priorProof = claimed.priorCarryProof!;
 	const priorBundle = claimed.priorPrivateBundle!;
 	assert(authenticatedHostEffectEvidence(priorProof, priorBundle));
@@ -1844,7 +1966,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 			{ ...work, status: "completed", conclusion: "failure" },
 			{ ...next, status: "completed", conclusion: "failure" },
 			run(7007, 6, "in_progress", sha("1"))]),
-		loadCarryArtifact: async () => afterUnknown.envelopeB64 });
+		loadCarryArtifact: async () => afterUnknown });
 	const afterEvidence = authenticatedHostEffectEvidence(reopenedAfterUnknown.priorCarryProof,
 		reopenedAfterUnknown.priorPrivateBundle);
 	assert(afterEvidence, "a new received run retains the reviewed unknown-transport ancestry");
@@ -1883,7 +2005,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 			unknownObservedCny: audit.unknownObservedCny,
 			unpricedRequestCount: audit.unpricedRequestCount,
 			requestAudit: audit, privateBundle: bundle });
-		const replay = await resumeCarry(carry.envelopeB64);
+		const replay = await resumeCarry(carry);
 		assert.equal(authenticatedHostEffectEvidence(replay.priorCarryProof,
 			replay.priorPrivateBundle), undefined, label);
 	}
@@ -1897,7 +2019,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 	const alteredCarry = alteredOpen.sealCurrent({ settledCny: 0.5,
 		unknownObservedCny: 0.25, unpricedRequestCount: 0,
 		requestAudit: transportAudit, privateBundle: changedObjective });
-	const alteredResume = await resumeCarry(alteredCarry.envelopeB64);
+	const alteredResume = await resumeCarry(alteredCarry);
 	assert.equal(authenticatedHostEffectEvidence(alteredResume.priorCarryProof,
 		alteredResume.priorPrivateBundle), undefined,
 		"same-ID objective mutation cannot mint effect authority beyond signed seed bytes");
@@ -1979,12 +2101,12 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 			{ ...work, status: "completed", conclusion: "failure" },
 			{ ...next, status: "completed", conclusion: "failure" },
 			run(7007, 6, "in_progress", sha("1"))]),
-		loadCarryArtifact: async () => secondNonzero.envelopeB64 });
+		loadCarryArtifact: async () => secondNonzero });
 	const cumulative = authenticatedHostEffectEvidence(later.priorCarryProof, later.priorPrivateBundle);
 	assert(cumulative, "a reviewed first nonzero run permits a separately receipted second one");
 	assert.equal(cumulative.reviewedEffectAncestry.length, 1);
 	assert.equal(cumulative.reviewedEffectAncestry[0].envelopeSha256, reviewedPrior.envelopeSha256);
-	const unreviewedSuccessor = await resumeCarry(sealed.envelopeB64);
+	const unreviewedSuccessor = await resumeCarry(sealed);
 	const brokenBundle = { ...secondBundle };
 	const brokenChain = JSON.parse(brokenBundle["independent-restart-quarantine.json"]);
 	brokenChain.entries[0].claim.currentCommit = sha("0");
@@ -1998,7 +2120,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 			{ ...work, status: "completed", conclusion: "failure" },
 			{ ...next, status: "completed", conclusion: "failure" },
 			run(7007, 6, "in_progress", sha("1"))]),
-		loadCarryArtifact: async () => broken.envelopeB64 });
+		loadCarryArtifact: async () => broken });
 	assert.equal(authenticatedHostEffectEvidence(brokenLater.priorCarryProof,
 		brokenLater.priorPrivateBundle), undefined,
 	"a claim for another successor cannot review an accounting ancestor");
@@ -2021,13 +2143,13 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 		workRoot: "/tmp/synthetic/T999", grant: { version: 1,
 			kind: "confined-campaign-files", root: "/tmp/synthetic/T999",
 			writableFiles: ["candidate.cpp", "lesson-delta.json"] } });
-	const unsafeEmptyOpen = await resumeCarry(sealed.envelopeB64);
+	const unsafeEmptyOpen = await resumeCarry(sealed);
 	assert.throws(() => unsafeEmptyOpen.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
 		unpricedRequestCount: 0, requestAudit: emptyAudit,
 		privateBundle: { ...abandonedBundle,
 			"host-effect-receipt.json": JSON.stringify(unsafeEmptyReceipt) } }),
 		/reviewed effect ancestry is not bound/);
-	const emptySuccessor = await resumeCarry(sealed.envelopeB64);
+	const emptySuccessor = await resumeCarry(sealed);
 	const emptyCarry = emptySuccessor.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
 		unpricedRequestCount: 0, requestAudit: emptyAudit, privateBundle: abandonedBundle });
 	const zeroCurrent = await openLedgerContinuation({ ...f, seedEnvelopeB64,
@@ -2036,7 +2158,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 			{ ...work, status: "completed", conclusion: "failure" },
 			{ ...next, status: "completed", conclusion: "failure" },
 			run(7007, 6, "in_progress", sha("1"))]),
-		loadCarryArtifact: async () => emptyCarry.envelopeB64 });
+		loadCarryArtifact: async () => emptyCarry });
 	const abandoned = authenticatedHostEffectEvidence(zeroCurrent.priorCarryProof,
 		zeroCurrent.priorPrivateBundle);
 	assert(abandoned, "host census attests a claimed run with no new goal or model call");
@@ -2091,7 +2213,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 			{ ...next, status: "completed", conclusion: "failure" },
 			{ ...run(7007, 6, "in_progress", sha("1")), status: "completed", conclusion: "failure" },
 			run(7008, 7, "in_progress", sha("2"))]),
-		loadCarryArtifact: async () => thirdCarry.envelopeB64 });
+		loadCarryArtifact: async () => thirdCarry });
 	const resumedAfterAbandoned = authenticatedHostEffectEvidence(afterAbandoned.priorCarryProof,
 		afterAbandoned.priorPrivateBundle);
 	assert(resumedAfterAbandoned, "fresh bound goal after abandoned claim retains reviewed ancestry");
@@ -2164,7 +2286,7 @@ test("received read-only assessment without a new goal preserves an unbound revi
 	const openWork = () => openLedgerContinuation({ ...f, seedEnvelopeB64,
 		githubToken: "synthetic-token", current: current(7005, sha("e")),
 		request: mock([anchor, firstDone, secondDone, work]),
-		loadCarryArtifact: async ({ artifactId }) => artifactId === "9003" ? zero.envelopeB64 : legacy.envelopeB64 });
+		loadCarryArtifact: async ({ artifactId }) => artifactId === "9003" ? zero : legacy.envelopeB64 });
 	const profile = await verifyDeepSeekCnyBilling({ apiKey: "synthetic-key",
 		now: () => new Date("2026-10-06T10:30:00.000Z"),
 		request: async () => new Response(JSON.stringify({ is_available: true,
@@ -2204,7 +2326,7 @@ test("received read-only assessment without a new goal preserves an unbound revi
 		githubToken: "synthetic-token", current: current(7006, sha("f")),
 		request: mock([anchor, firstDone, secondDone,
 			{ ...work, status: "completed", conclusion: "failure" }, next]),
-		loadCarryArtifact: async () => sealedWork.envelopeB64 });
+		loadCarryArtifact: async () => sealedWork });
 	const assessmentOpened = await openAssessment();
 	assert(authenticatedHostEffectEvidence(assessmentOpened.priorCarryProof,
 		assessmentOpened.priorPrivateBundle));
@@ -2272,7 +2394,7 @@ test("received read-only assessment without a new goal preserves an unbound revi
 			{ ...work, status: "completed", conclusion: "failure" },
 			{ ...next, status: "completed", conclusion: "failure" },
 			run(7007, 6, "in_progress", sha("1"))]),
-		loadCarryArtifact: async () => carry.envelopeB64 });
+		loadCarryArtifact: async () => carry });
 	const effect = authenticatedHostEffectEvidence(reopened.priorCarryProof,
 		reopened.priorPrivateBundle);
 	assert(effect, "received read-only assessment with no M07 goal must retain review authority");
@@ -2419,16 +2541,9 @@ test("any exact terminal missing-carry execution stays unknown through seal and 
 		privateBundle: { "candidate.cpp": "unreviewed replacement" } }, "effect-review-incomplete");
 	const authenticatedSeed = await authenticateSignedMissionSeed({ ...f,
 		envelopeB64: f.seedEnvelopeB64 });
-	const encrypted = JSON.parse(Buffer.from(emergency.envelopeB64, "base64").toString());
-	const decipher = createDecipheriv("aes-256-gcm",
+	const emergencyCheckpoint = decodeV4Checkpoint(emergency, authenticatedSeed.seedDigest,
 		authenticatedSeed.derivePrivateKey("mul-pis-ledger-continuation-v1"),
-		Buffer.from(encrypted.nonce, "base64"));
-	decipher.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
-		authenticatedSeed.seedDigest, 3, encrypted.parentDigest,
-		{ runId: "7006", runAttempt: 1, runNumber: 5, commit: sha("f") }])));
-	decipher.setAuthTag(Buffer.from(encrypted.tag, "base64"));
-	const emergencyCheckpoint = JSON.parse(Buffer.concat([
-		decipher.update(Buffer.from(encrypted.ciphertext, "base64")), decipher.final()]).toString());
+		{ runId: "7006", runAttempt: 1, runNumber: 5, commit: sha("f") });
 	assert.deepEqual(emergencyCheckpoint.requestAudit, currentAudit);
 	assert.equal(emergencyCheckpoint.currentEffectReview, "pending");
 	assert.deepEqual(emergencyCheckpoint.opaqueExecutedRuns, opened.opaqueExecutedRuns);
@@ -2444,7 +2559,7 @@ test("any exact terminal missing-carry execution stays unknown through seal and 
 				{ ...next, status: "completed", conclusion: "failure" }, later])(url, init);
 		},
 		loadCarryArtifact: async ({ artifactId }) => {
-			assert.equal(artifactId, "9006"); return emergency.envelopeB64;
+			assert.equal(artifactId, "9006"); return emergency;
 		} });
 	assert.equal(reopened.opaqueExecutedRuns.length, 1);
 	assert.equal(reopened.opaqueExecutedRuns[0].source.runId, "7005");
@@ -2467,7 +2582,7 @@ test("any exact terminal missing-carry execution stays unknown through seal and 
 	};
 	const pendingFresh = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7007, sha("1")), request: pendingLiveRequest,
-		loadCarryArtifact: async () => emergency.envelopeB64 });
+		loadCarryArtifact: async () => emergency });
 	const pendingClaim = await pendingFresh.claimOneUse(pendingFresh.priorCarryProof!.envelopeSha256);
 	const pendingV2 = { version: 2, kind: "host-independent-goal-quarantine",
 		prior: { source: pendingFresh.priorCarryProof!.source,
@@ -2483,17 +2598,9 @@ test("any exact terminal missing-carry execution stays unknown through seal and 
 	const pendingSealed = pendingFresh.sealCurrent({ settledCny: 0.5,
 		unknownObservedCny: 0.25, unpricedRequestCount: 0,
 		requestAudit: currentAudit, privateBundle: pendingBundle });
-	const pendingOuter = JSON.parse(Buffer.from(pendingSealed.envelopeB64, "base64").toString());
-	const pendingReader = createDecipheriv("aes-256-gcm",
+	const pendingCheckpoint = decodeV4Checkpoint(pendingSealed, authenticatedSeed.seedDigest,
 		authenticatedSeed.derivePrivateKey("mul-pis-ledger-continuation-v1"),
-		Buffer.from(pendingOuter.nonce, "base64"));
-	pendingReader.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
-		authenticatedSeed.seedDigest, 3, pendingOuter.parentDigest,
-		{ runId: "7007", runAttempt: 1, runNumber: 6, commit: sha("1") }])));
-	pendingReader.setAuthTag(Buffer.from(pendingOuter.tag, "base64"));
-	const pendingCheckpoint = JSON.parse(Buffer.concat([
-		pendingReader.update(Buffer.from(pendingOuter.ciphertext, "base64")),
-		pendingReader.final()]).toString());
+		{ runId: "7007", runAttempt: 1, runNumber: 6, commit: sha("1") });
 	assert.deepEqual(pendingCheckpoint.pendingEffectAncestry.map((source: any) => source.runId), ["7006"]);
 	assert.equal(pendingCheckpoint.currentEffectReview, "pending");
 	assert.equal(pendingCheckpoint.settledNano, 1_000_000_000);
@@ -2536,7 +2643,7 @@ test("any exact terminal missing-carry execution stays unknown through seal and 
 			return requestFor([anchor, firstDone, secondDone, gap,
 				{ ...next, status: "completed", conclusion: "failure" }, later])(url, init);
 		}, loadCarryArtifact: async ({ artifactId }) => {
-			assert.equal(artifactId, "9006"); return normal.envelopeB64;
+			assert.equal(artifactId, "9006"); return normal;
 		} });
 	assert.equal(normalReopened.opaqueExecutedRuns[0].accounting, "unquantified");
 	assert.equal(normalReopened.opaqueExecutedRuns[0].effects, "unreviewed");
@@ -2553,31 +2660,17 @@ test("any exact terminal missing-carry execution stays unknown through seal and 
 				workflow_run: { id: 7006, head_sha: sha("f") } }] })) :
 			requestFor([anchor, firstDone, secondDone, gap,
 				{ ...next, status: "completed", conclusion: "failure" }, later])(url, init),
-		loadCarryArtifact: async () => normal.envelopeB64 });
+		loadCarryArtifact: async () => normal });
 	assert.equal(withoutLatestResult.priorCarryProof?.resultArtifact, undefined);
 	assert.deepEqual(authenticatedHistoricalOpaqueRunGaps(withoutLatestResult.priorCarryProof,
 		withoutLatestResult.priorPrivateBundle)?.map(item => item.source.runId), ["7005"]);
-	const normalOuter = JSON.parse(Buffer.from(normal.envelopeB64, "base64").toString());
 	const normalSource = { runId: "7006", runAttempt: 1, runNumber: 5, commit: sha("f") };
 	const key = authenticatedSeed.derivePrivateKey("mul-pis-ledger-continuation-v1");
-	const reader = createDecipheriv("aes-256-gcm", key, Buffer.from(normalOuter.nonce, "base64"));
-	reader.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
-		authenticatedSeed.seedDigest, 3, normalOuter.parentDigest, normalSource])));
-	reader.setAuthTag(Buffer.from(normalOuter.tag, "base64"));
-	const altered = JSON.parse(Buffer.concat([
-		reader.update(Buffer.from(normalOuter.ciphertext, "base64")), reader.final()]).toString());
+	const altered = decodeV4Checkpoint(normal, authenticatedSeed.seedDigest, key, normalSource);
 	const historicalReviewedClaim = structuredClone(altered);
 	historicalReviewedClaim.opaqueExecutedRuns[0].effects = "quarantined-source-reviewed";
-	const wrapCheckpoint = (checkpoint: unknown): string => {
-		const nonce = randomBytes(12);
-		const writer = createCipheriv("aes-256-gcm", key, nonce);
-		writer.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
-			authenticatedSeed.seedDigest, 3, normalOuter.parentDigest, normalSource])));
-		const ciphertext = Buffer.concat([writer.update(JSON.stringify(checkpoint)), writer.final()]);
-		return Buffer.from(JSON.stringify({ version: 3, parentDigest: normalOuter.parentDigest,
-			nonce: nonce.toString("base64"), ciphertext: ciphertext.toString("base64"),
-			tag: writer.getAuthTag().toString("base64") })).toString("base64");
-	};
+	const wrapCheckpoint = (checkpoint: Record<string, any>) =>
+		resealV4Checkpoint(checkpoint, authenticatedSeed.seedDigest, key, normalSource);
 	const oldWriterGap = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7007, sha("1")),
 		request: requestFor([anchor, firstDone, secondDone, gap,
@@ -2590,16 +2683,8 @@ test("any exact terminal missing-carry execution stays unknown through seal and 
 		unknownObservedCny: 0, unpricedRequestCount: 0,
 		requestAudit: { version: 3, kind: "accounting-only-request-audit",
 			requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 } });
-	const successorOuter = JSON.parse(Buffer.from(oldGapPassThrough.envelopeB64, "base64").toString());
-	const successorReader = createDecipheriv("aes-256-gcm", key,
-		Buffer.from(successorOuter.nonce, "base64"));
-	successorReader.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
-		authenticatedSeed.seedDigest, 3, successorOuter.parentDigest,
-		{ runId: "7007", runAttempt: 1, runNumber: 6, commit: sha("1") }])));
-	successorReader.setAuthTag(Buffer.from(successorOuter.tag, "base64"));
-	const successorCheckpoint = JSON.parse(Buffer.concat([
-		successorReader.update(Buffer.from(successorOuter.ciphertext, "base64")),
-		successorReader.final()]).toString());
+	const successorCheckpoint = decodeV4Checkpoint(oldGapPassThrough, authenticatedSeed.seedDigest,
+		key, { runId: "7007", runAttempt: 1, runNumber: 6, commit: sha("1") });
 	assert.equal(successorCheckpoint.opaqueExecutedRuns[0].effects,
 		"quarantined-source-reviewed", "the old signed statement is retained as history");
 	assert.equal(successorCheckpoint.historicalOpaqueGapEffectInterpretation,
@@ -2658,8 +2743,11 @@ test("optional encrypted transport cause census binds only unknown audit IDs and
 	assert.equal(emergency.mode, "emergency-effects-unreviewed");
 	assert.equal(emergency.carry.unpricedRequestCount, (collectorFailure.priorUnpricedRequestCount ?? 0) + 1);
 	const nearLimit = { "candidate.cpp": "x".repeat(4 * 1024 * 1024 - 200) };
-	assert.equal(retainedTransportDiagnosticWithinBundle(nearLimit, text), undefined,
-		"optional cause metadata yields before it could prevent a bounded fee carry");
+	assert.equal(retainedTransportDiagnosticWithinBundle(nearLimit, text), text,
+		"segmented carry retains the optional cause beyond the old aggregate bound");
+	assert.equal(retainedTransportDiagnosticWithinBundle(nearLimit,
+		"x".repeat(4 * 1024 * 1024 + 1)), undefined,
+		"optional cause yields when its own file exceeds the byte bound");
 	assert.equal(offlineChecks.collectorFailureBundle(nearLimit,
 		retainedTransportDiagnosticWithinBundle(nearLimit, text))?.["candidate.cpp"],
 		nearLimit["candidate.cpp"]);
@@ -2668,10 +2756,12 @@ test("optional encrypted transport cause census binds only unknown audit IDs and
 	});
 	const nearLimitOpened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7005, sha("e")), loadCarryArtifact: async () => nearLimitCarry });
-	assert.equal(nearLimitOpened.appendTransportDiagnosticCensus(currentAudit, [diagnostic]), undefined);
+	const nearPrepared = nearLimitOpened.appendTransportDiagnosticCensus(currentAudit, [diagnostic]);
+	assert.ok(nearPrepared);
 	const feeSafe = nearLimitOpened.sealEmergencyCurrent({ settledCny: 0, unknownObservedCny: 0,
 		unpricedRequestCount: 1, requestAudit: currentAudit,
-		privateBundle: nearLimitOpened.priorPrivateBundle }, "effect-review-incomplete");
+		privateBundle: { ...nearLimitOpened.priorPrivateBundle,
+			"transport-diagnostics.json": nearPrepared } }, "effect-review-incomplete");
 	assert.equal(feeSafe.unpricedRequestCount, (nearLimitOpened.priorUnpricedRequestCount ?? 0) + 1);
 	assert.throws(() => opened.appendTransportDiagnosticCensus(currentAudit, [diagnostic, diagnostic]),
 		/repeats one unknown request/);
@@ -2714,7 +2804,7 @@ test("optional encrypted transport cause census binds only unknown audit IDs and
 					workflow_run: { id: 7005, head_sha: sha("e") } }] }));
 			return f.request(url, init);
 		}, loadCarryArtifact: async ({ artifactId }) => {
-			assert.equal(artifactId, "9005"); return sealed.envelopeB64;
+			assert.equal(artifactId, "9005"); return sealed;
 		} });
 	assert.equal(reopened.priorTransportDiagnosticCensus?.entries.length, 1);
 	assert.equal(reopened.priorTransportDiagnosticCensus?.entries[0].rows.length, 1);
@@ -2881,7 +2971,7 @@ test("accepted selection remains authenticated across zero and emergency wrapper
 	const newOpened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
 		githubToken: "synthetic-token", current: current(7005, sha("e")),
 		request: requestFor([anchor, firstDone, secondDone, thirdRun]),
-		loadCarryArtifact: async () => firstSelected.envelopeB64 });
+		loadCarryArtifact: async () => firstSelected });
 	const selected = authenticatedSelectedTransitions(newOpened.priorCarryProof,
 		newOpened.priorPrivateBundle);
 	assert.equal(selected?.length, 1);
@@ -2900,14 +2990,14 @@ test("accepted selection remains authenticated across zero and emergency wrapper
 		githubToken: "synthetic-token", current: current(7006, sha("f")),
 		request: requestFor([anchor, firstDone, secondDone,
 			{ ...thirdRun, status: "completed", conclusion: "failure" }, fourthRun]),
-		loadCarryArtifact: async () => zero.envelopeB64 });
+		loadCarryArtifact: async () => zero });
 	assert.deepEqual(authenticatedSelectedTransitions(zeroOpened.priorCarryProof,
 		zeroOpened.priorPrivateBundle), selected);
 	const secondSelection = await openLedgerContinuation({ ...f, seedEnvelopeB64,
 		githubToken: "synthetic-token", current: current(7006, sha("f")),
 		request: requestFor([anchor, firstDone, secondDone,
 			{ ...thirdRun, status: "completed", conclusion: "failure" }, fourthRun]),
-		loadCarryArtifact: async () => zero.envelopeB64 });
+		loadCarryArtifact: async () => zero });
 	const secondSession = campaignSessionEffectId("second accepted selection");
 	const secondArchive = { ...selectedArchive, goalRunId: "third-goal", taskId: "T003",
 		m04: { ...selectedArchive.m04, runId: "M04-next" } };
@@ -2955,7 +3045,7 @@ test("accepted selection remains authenticated across zero and emergency wrapper
 		request: requestFor([anchor, firstDone, secondDone,
 			{ ...thirdRun, status: "completed", conclusion: "failure" },
 			{ ...fourthRun, status: "completed", conclusion: "failure" }, fifthRun]),
-		loadCarryArtifact: async () => failed.envelopeB64 });
+		loadCarryArtifact: async () => failed });
 	assert.deepEqual(authenticatedSelectedTransitions(failedOpened.priorCarryProof,
 		failedOpened.priorPrivateBundle), selected);
 	const secondOpened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
@@ -2963,56 +3053,26 @@ test("accepted selection remains authenticated across zero and emergency wrapper
 		request: requestFor([anchor, firstDone, secondDone,
 			{ ...thirdRun, status: "completed", conclusion: "failure" },
 			{ ...fourthRun, status: "completed", conclusion: "failure" }, fifthRun]),
-		loadCarryArtifact: async () => secondCarry.envelopeB64 });
+		loadCarryArtifact: async () => secondCarry });
 	assert.equal(authenticatedSelectedTransitions(secondOpened.priorCarryProof,
 		secondOpened.priorPrivateBundle)?.length, 2);
 	const seed = await authenticateSignedMissionSeed({ ...f, envelopeB64: seedEnvelopeB64 });
 	const key = seed.derivePrivateKey("mul-pis-ledger-continuation-v1");
-	const outer = JSON.parse(Buffer.from(zero.envelopeB64, "base64").toString());
 	const source = { runId: "7005", runAttempt: 1, runNumber: 4, commit: sha("e") };
-	const reader = createDecipheriv("aes-256-gcm", key, Buffer.from(outer.nonce, "base64"));
-	reader.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
-		seed.seedDigest, 3, outer.parentDigest, source])));
-	reader.setAuthTag(Buffer.from(outer.tag, "base64"));
-	const corrupted = JSON.parse(Buffer.concat([reader.update(Buffer.from(outer.ciphertext, "base64")),
-		reader.final()]).toString());
+	const corrupted = decodeV4Checkpoint(zero, seed.seedDigest, key, source);
 	corrupted.selectedTransitions[0].archiveSha256 = "0".repeat(64);
-	const nonce = randomBytes(12);
-	const writer = createCipheriv("aes-256-gcm", key, nonce);
-	writer.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
-		seed.seedDigest, 3, outer.parentDigest, source])));
-	const ciphertext = Buffer.concat([writer.update(JSON.stringify(corrupted)), writer.final()]);
-	const forged = Buffer.from(JSON.stringify({ version: 3, parentDigest: outer.parentDigest,
-		nonce: nonce.toString("base64"), ciphertext: ciphertext.toString("base64"),
-		tag: writer.getAuthTag().toString("base64") })).toString("base64");
+	const forged = resealV4Checkpoint(corrupted, seed.seedDigest, key, source);
 	await assert.rejects(openLedgerContinuation({ ...f, seedEnvelopeB64,
 		githubToken: "synthetic-token", current: current(7006, sha("f")),
 		request: requestFor([anchor, firstDone, secondDone,
 			{ ...thirdRun, status: "completed", conclusion: "failure" }, fourthRun]),
 		loadCarryArtifact: async () => forged }), /selected transition ancestry prefix/);
-	const secondOuter = JSON.parse(Buffer.from(secondCarry.envelopeB64, "base64").toString());
 	const secondSource = { runId: "7006", runAttempt: 1, runNumber: 5, commit: sha("f") };
-	const secondReader = createDecipheriv("aes-256-gcm", key,
-		Buffer.from(secondOuter.nonce, "base64"));
-	secondReader.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
-		seed.seedDigest, 3, secondOuter.parentDigest, secondSource])));
-	secondReader.setAuthTag(Buffer.from(secondOuter.tag, "base64"));
-	const alteredHistory = JSON.parse(Buffer.concat([
-		secondReader.update(Buffer.from(secondOuter.ciphertext, "base64")),
-		secondReader.final()]).toString());
+	const alteredHistory = decodeV4Checkpoint(secondCarry, seed.seedDigest, key, secondSource);
 	const archived = JSON.parse(alteredHistory.privateBundle["research-history.json"]);
 	archived.entries[1].files["candidate.cpp"] = "tampered prior selection";
 	alteredHistory.privateBundle["research-history.json"] = JSON.stringify(archived);
-	const historyNonce = randomBytes(12);
-	const historyWriter = createCipheriv("aes-256-gcm", key, historyNonce);
-	historyWriter.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
-		seed.seedDigest, 3, secondOuter.parentDigest, secondSource])));
-	const historyCiphertext = Buffer.concat([
-		historyWriter.update(JSON.stringify(alteredHistory)), historyWriter.final()]);
-	const forgedHistory = Buffer.from(JSON.stringify({ version: 3,
-		parentDigest: secondOuter.parentDigest, nonce: historyNonce.toString("base64"),
-		ciphertext: historyCiphertext.toString("base64"),
-		tag: historyWriter.getAuthTag().toString("base64") })).toString("base64");
+	const forgedHistory = resealV4Checkpoint(alteredHistory, seed.seedDigest, key, secondSource);
 	await assert.rejects(openLedgerContinuation({ ...f, seedEnvelopeB64,
 		githubToken: "synthetic-token", current: current(7007, sha("1")),
 		request: requestFor([anchor, firstDone, secondDone,

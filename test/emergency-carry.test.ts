@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { sealCampaignCarry } from "../src/runner/emergency-carry.ts";
+import { CampaignCarryRecoveryError, sealCampaignCarry } from "../src/runner/emergency-carry.ts";
 import type { AccountingCarrySealInput } from "../src/runner/ledger-continuation.ts";
 import { nativeCnyPricingRecord, verifyDeepSeekCnyBilling } from "../src/runner/deepseek-cny-pricing.ts";
 
@@ -24,7 +24,7 @@ function observation(): AccountingCarrySealInput {
 			settledCny: 0.02, unknownObservedCny: 0.01,
 			unpricedRequestCount: 0, pricingProfile: nativeCnyPricingRecord(profile) } };
 }
-const output = { envelopeB64: "synthetic", observedSettledCny: 0.02,
+const output = { envelopeB64: "synthetic", sidecars: {}, observedSettledCny: 0.02,
 	observedUnknownHeldCny: 0.01, unpricedRequestCount: 0 };
 
 test("successful normal carry never calls the emergency sealer", () => {
@@ -48,6 +48,25 @@ test("failed normal carry invokes the emergency sealer with the exact same audit
 	assert.equal(result.carry.observedSettledCny, input.settledCny);
 	assert.equal(result.carry.observedUnknownHeldCny, input.unknownObservedCny);
 });
+test("failed research collection forces emergency even when normal sealing would accept old evidence", () => {
+	const input = observation();
+	let normalCalls = 0;
+	let emergencyCalls = 0;
+	const result = sealCampaignCarry({ sealCurrent: () => {
+		normalCalls++; return output;
+	}, sealEmergencyCurrent: (received, reason) => {
+		assert.equal(received, input);
+		assert.equal(reason, "effect-review-incomplete");
+		emergencyCalls++; return output;
+	} }, input, { forceEmergencyReason: "research-collection-incomplete" });
+	assert.equal(normalCalls, 0);
+	assert.equal(emergencyCalls, 1);
+	assert.equal(result.mode, "emergency-effects-unreviewed");
+	if (result.mode === "emergency-effects-unreviewed") {
+		assert.equal(result.forcedReason, "research-collection-incomplete");
+		assert.equal(result.normalFailure, undefined);
+	}
+});
 test("changed audit or failed emergency seal cannot yield a carry", () => {
 	const input = observation();
 	assert.throws(() => sealCampaignCarry({ sealCurrent: received => {
@@ -56,5 +75,9 @@ test("changed audit or failed emergency seal cannot yield a carry", () => {
 		throw Error("normal failed");
 	}, sealEmergencyCurrent: () => output }, input), /changed the audited observation/);
 	assert.throws(() => sealCampaignCarry({ sealCurrent: () => { throw Error("normal failed"); },
-		sealEmergencyCurrent: () => { throw Error("emergency failed"); } }, observation()), /emergency failed/);
+		sealEmergencyCurrent: () => { throw Error("emergency failed"); } }, observation()),
+		(error: unknown) => error instanceof CampaignCarryRecoveryError &&
+			(error.normalFailure as Error).message === "normal failed" &&
+			(error.emergencyFailure as Error).message === "emergency failed" &&
+			error.message === "emergency continuation sealing failed");
 });
