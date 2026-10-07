@@ -16,9 +16,11 @@ import { runInit } from "../src/stages/init.ts";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { createM07Controller } from "../src/m07/controller.ts";
 import { runMeasuredEvidenceHandoff } from "../src/m07/evidence-finalization.ts";
-import { assessAndAdvanceOriginalObjective, createOriginalObjective, objectiveProgress, runOriginalObjectiveLoop,
+import { assessAndAdvanceOriginalObjective, createOriginalObjective, isCurrentObjectiveStopReason,
+	objectiveProgress, runOriginalObjectiveLoop,
 	writeObjectiveProgress, writeOriginalObjectiveContract } from "../src/m07/objective-progress.ts";
-import type { ObjectiveProgressV1, ObjectiveStopReason, OriginalObjectiveContractV1 } from "../src/m07/objective-progress.ts";
+import type { CurrentObjectiveStopReason, HostPendingActionFactsV1, ObjectiveProgressV1,
+	OriginalObjectiveContractV1 } from "../src/m07/objective-progress.ts";
 import type { BeginGoalInput, CurrentGoal, M07TaskRecord, TaskSpecInput } from "../src/m07/types.ts";
 import { runM04 } from "../src/stages/m04.ts";
 import { createPiSessionRunner } from "../src/runner/pi.ts";
@@ -198,10 +200,43 @@ function reservedCanonicalOperationRefs(progress: ObjectiveProgressV1,
 	return [...actual];
 }
 function campaignObjectiveProgress(contract: OriginalObjectiveContractV1, inheritedUnresolvedOperationIds: string[],
-	input: Parameters<typeof objectiveProgress>[1]): ObjectiveProgressV1 {
+	input: Omit<Parameters<typeof objectiveProgress>[1], "stopReason"> &
+		{ stopReason: CurrentObjectiveStopReason }): ObjectiveProgressV1 {
+	const unresolvedOperationIds = [...new Set([...inheritedUnresolvedOperationIds,
+		...(input.unresolvedOperationIds ?? [])])];
 	return objectiveProgress(contract, { ...input,
-		unresolvedOperationIds: [...new Set([...inheritedUnresolvedOperationIds,
-			...(input.unresolvedOperationIds ?? [])])] });
+		unresolvedOperationIds,
+		...(input.stopReason === "cancelled" ? {} : { pendingActionFacts: {
+			...input.pendingActionFacts, unresolvedOperationRefs: unresolvedOperationIds } }) });
+}
+function observedTransportActionFacts(stopReason: CurrentObjectiveStopReason,
+	diagnosticsBefore: number, diagnosticsAfter: number,
+	failedStage: "read-only-assessor" | "m07-execution"): HostPendingActionFactsV1 {
+	if (!Number.isSafeInteger(diagnosticsBefore) || !Number.isSafeInteger(diagnosticsAfter) ||
+		diagnosticsBefore < 0 || diagnosticsAfter < diagnosticsBefore)
+		fail("transport diagnostic cursor is invalid");
+	if (stopReason !== "assessment-failed" && stopReason !== "dispatch-failed") return {};
+	return { failedStage,
+		...(diagnosticsAfter > diagnosticsBefore ? { transportFailure: true } : {}) };
+}
+function observedRequestContract(diagnosticsBefore: number,
+	diagnostics: readonly TransportFailureDiagnostic[]): HostPendingActionFactsV1["requestContract"] {
+	if (!Number.isSafeInteger(diagnosticsBefore) || diagnosticsBefore < 0 ||
+		diagnosticsBefore > diagnostics.length) fail("request contract diagnostic cursor is invalid");
+	const row = diagnostics.slice(diagnosticsBefore).findLast(item =>
+		item.wholePromptNotIssued === true && item.requestContractViolation !== undefined);
+	return row?.requestContractViolation ? { violation: row.requestContractViolation,
+		messageIndex: row.requestContractMessageIndex ?? null } : undefined;
+}
+function archivedRequestContract(archive: Awaited<ReturnType<typeof archivePrivateM07Task>>):
+	HostPendingActionFactsV1["requestContract"] {
+	if (archive.loopStopReason !== "request-contract-invalid") return undefined;
+	const rows = archive.controllerEvidence.operationOutcomes?.filter(item =>
+		item.status === "not-issued" && item.requestContractNotIssued) ?? [];
+	if (rows.length !== 1 || !rows[0].requestContractNotIssued)
+		fail("request-contract repair lacks its validated private archive receipt");
+	return { violation: rows[0].requestContractNotIssued.violation,
+		messageIndex: rows[0].requestContractNotIssued.messageIndex };
 }
 function sha256(value: string): string { return createHash("sha256").update(value).digest("hex"); }
 function createPrivateCampaignBudget(nativeCnyPricing: NativeCnyPricingProfile | undefined,
@@ -353,11 +388,19 @@ function privateFailureMessage(raw: unknown, runtimeKey: string | undefined): st
 	let value = raw.replaceAll(runtimeKey, "[REDACTED_KEY]")
 		.replace(/sk-[A-Za-z0-9_-]{6,}/gi, "[REDACTED_KEY]")
 		.replace(/Bearer\s+[^\s'"\r\n]+/gi, "Bearer [REDACTED_KEY]")
-		.replace(/Authorization\s*[:=]\s*[^\r\n]+/gi, "Authorization: [REDACTED_KEY]");
+		.replace(/Authorization\s*[:=]\s*[^\r\n]+/gi, "Authorization: [REDACTED_KEY]")
+		.replace(/\b(api[_-]?key|access[_-]?token|password|client[_-]?secret)\s*[:=]\s*[^\s,}&]+/gi,
+			"$1=[REDACTED_KEY]");
 	value = value.slice(0, 4000);
 	if (value.includes(runtimeKey) || /sk-[A-Za-z0-9_-]{6,}/i.test(value) ||
 		/Bearer\s+(?!\[REDACTED_KEY\])/i.test(value)) return undefined;
 	return value;
+}
+function privateProviderErrorField(raw: string, runtimeKey: string): string | null {
+	const redacted = privateFailureMessage(raw, runtimeKey);
+	if (redacted === undefined) return null;
+	const field = Buffer.from(redacted, "utf8").subarray(0, 4_000).toString("utf8");
+	return field.includes(runtimeKey) ? null : field;
 }
 function taskFailureCategory(raw: unknown): string {
 	if (typeof raw !== "string") return "none";
@@ -375,7 +418,7 @@ function taskFailureCategory(raw: unknown): string {
 	if (/did not stop normally|runner.stop/i.test(raw)) return "sdk-stop";
 	return "unclassified";
 }
-function campaignObjectiveStop(reason: string | undefined): ObjectiveStopReason | undefined {
+function campaignObjectiveStop(reason: string | undefined): CurrentObjectiveStopReason | undefined {
 	if (reason === "output-limit") return "output-limit";
 	if (reason === "usage-reconciliation" || reason === "payload-boundary") return "accounting-integrity-error";
 	return undefined;
@@ -579,10 +622,9 @@ async function salvageObjectiveCheckpoint(ws: Workspace, outputDir: string,
 	const allBoundedRuns = [...historicalRuns, ...boundedRuns];
 	const availableArtifacts = await availablePrivateArtifactNames(outputDir);
 	const priorCoversLive = previous?.contract.id === contract.id &&
+		isCurrentObjectiveStopReason(previous.stopReason) &&
 		previous.stopReason !== "assessment-validation-pending" && unresolvedOperationIds.length === 0 &&
 		(!cancelled || previous.stopReason === "cancelled") &&
-		(budgetStopReason !== "total-cny-ceiling" || previous.stopReason === "budget-boundary") &&
-		(budgetStopReason !== "provider-call-limit" || previous.stopReason === "provider-call-limit") &&
 		(budgetStopReason !== "output-limit" || previous.stopReason === "output-limit") &&
 		(budgetStopReason !== "price-assumption-invalid" || previous.stopReason === "accounting-integrity-error") &&
 		boundedRuns.every(item => item.outcome !== "active" && item.outcome !== "record-unavailable") &&
@@ -1053,7 +1095,7 @@ function importM04EffectDisposition(input: { status: "not-run" | "completed" | "
 	return "continue";
 }
 function failedM04StopReason(status: "completed" | "failed" | "not_run",
-	state?: PortableM04KnowledgeTransactionV1["state"]): ObjectiveStopReason {
+	state?: PortableM04KnowledgeTransactionV1["state"]): CurrentObjectiveStopReason {
 	if (status !== "failed") return "m04-evidence-incomplete";
 	if (state === "rejected-draft") return "m04-draft-rejected";
 	if (state === "merge-intent" || state === "unknown" || state === "merged")
@@ -1812,7 +1854,7 @@ async function main() {
 			await writeFile(priorTransportObservationPath, `${JSON.stringify({ version: 1,
 				kind: "authenticated-prior-transport-observation",
 				source: priorTransportObservation.source, rows: priorTransportObservation.rows,
-				interpretation: "Host-observed transport metadata only; an unreceived assistant response leaves billing and operation outcome unresolved. Do not replay the old request or treat HTTP status as a scientific verdict. A null provider error code leaves the reason unavailable.",
+				interpretation: "Host-observed transport metadata only; an unreceived assistant response leaves billing and operation outcome unresolved. Do not replay the old request or treat HTTP status as a scientific verdict. An unknown reason class leaves the provider cause unavailable.",
 			}, null, 2)}\n`, { mode: 0o600 });
 			priorSeedInputs.push("objective-seeds/prior-transport-observation.json");
 		}
@@ -1984,7 +2026,9 @@ async function main() {
 		process.once("SIGINT", cancel);
 		process.once("SIGTERM", cancel);
 		try {
-			const actual = createPiSessionRunner({ modelRuntime: runtime, signal: abort.signal, campaignBudget: budget });
+			const actual = createPiSessionRunner({ modelRuntime: runtime, signal: abort.signal,
+				campaignBudget: budget,
+				sanitizePrivateProviderError: value => privateProviderErrorField(value, runtimeKey) });
 			const observeTransport = (handle: SessionHandle): SessionHandle => {
 				let delivered = 0;
 				return { ...handle, prompt: async message => {
@@ -2458,6 +2502,7 @@ async function main() {
 			if (previousBundle["m04-adopted-knowledge.json"])
 				await writeFile(path.join(priorSeedDir, "prior-m04-knowledge.json"), previousBundle["m04-adopted-knowledge.json"], { mode: 0o600 });
 			statusPhase = "prior-objective-assessment";
+			const firstAssessmentDiagnosticStart = statusTransportDiagnostics.length;
 			const firstStep = await assessAndAdvanceOriginalObjective({
 				contract: originalObjective, contractFile: objectiveContractFile, runner,
 				runRecord: firstAssessmentRecord, persistReceipt: () => persistObjectiveReceipt(firstAssessmentRecord),
@@ -2514,6 +2559,10 @@ async function main() {
 			await ws.finishRun(firstAssessmentRecord, firstStep.assessment?.unreadEvidence.length === 0 ? "completed" : "failed");
 			await persistObjectiveReceipt(firstAssessmentRecord);
 			if (!firstStep.advanced) {
+				const firstRequestContract = observedRequestContract(firstAssessmentDiagnosticStart,
+					statusTransportDiagnostics);
+				const firstStopReason = firstRequestContract && firstStep.stopReason === "assessment-failed" ?
+					"request-contract-invalid" : firstStep.stopReason;
 				await writeObjectiveProgress(objectiveCheckpointFile, campaignObjectiveProgress(originalObjective,
 					historicalUnresolvedOperationIds, {
 					boundedRuns: [...previousCheckpoint.boundedRuns, ...importBoundedRuns],
@@ -2521,10 +2570,15 @@ async function main() {
 					...(firstStep.assessment ? { assessment: firstStep.assessment } : {}),
 					assessmentHistory: [...previousCheckpoint.assessmentHistory,
 						...(firstStep.assessment ? [{ iteration: previousCheckpoint.assessmentHistory.length + 1,
-							assessment: firstStep.assessment, stopReason: firstStep.stopReason, advanced: false }] : [])],
-					stopReason: firstStep.stopReason }));
+							assessment: firstStep.assessment, stopReason: firstStopReason, advanced: false }] : [])],
+					stopReason: firstStopReason,
+					pendingActionFacts: { ...observedTransportActionFacts(firstStopReason,
+						firstAssessmentDiagnosticStart, statusTransportDiagnostics.length,
+						"read-only-assessor"),
+						...(firstStopReason === "request-contract-invalid" ?
+							{ requestContract: firstRequestContract } : {}) } }));
 				await saveStatus({ outcome: "incomplete", originalObjective: { id: originalObjective.id,
-					stopReason: firstStep.stopReason, checkpointFile: "objective-checkpoint.json" },
+					stopReason: firstStopReason, checkpointFile: "objective-checkpoint.json" },
 				...(provenanceImportSummary ? { provenanceImport: provenanceImportSummary } : {}),
 				independentValidation: "prior selected source retained; no mission replacement established" });
 				process.exitCode = 1;
@@ -2774,6 +2828,7 @@ async function main() {
 				initialRegistered ? ["experiment-plan.json"] : []) : [];
 			statusPhase = "private-archive";
 			const privateArchive = await archivePrivateM07Task({ goal: frozenGoal, task: frozenTask, destination: outputDir });
+			const firstGoalRequestContract = archivedRequestContract(privateArchive);
 			if (runId === initialGoalRunId) {
 				const parentArchiveDir = path.join(campaignRoot, "branch-parent-archive");
 				await archivePrivateM07Task({ goal: frozenGoal, task: frozenGoal.tasks.find(item => item.taskId === task.taskId)!,
@@ -2851,7 +2906,9 @@ async function main() {
 				...(firstStep.assessment ? [{ iteration: previousCheckpoint.assessmentHistory.length + 1,
 					assessment: firstStep.assessment, stopReason: firstStep.stopReason, advanced: true }] : [])];
 			const priorAssessmentCount = assessmentHistory.length;
-			let objectiveStopReason: ObjectiveStopReason = "bounded-run-incomplete";
+			let objectiveStopReason: CurrentObjectiveStopReason = "bounded-run-incomplete";
+			let objectivePendingActionFacts: HostPendingActionFactsV1 = {};
+			let objectivePendingActionReason: CurrentObjectiveStopReason | undefined;
 			let currentM04Status = m04.status;
 			let currentM04TransactionState = m04.transactionState;
 			let currentM04Read = m04SelectedReadContractSatisfied;
@@ -2870,6 +2927,7 @@ async function main() {
 					if (abort.signal.aborted) return "cancelled";
 					if (currentM04Status === "failed")
 						return failedM04StopReason(currentM04Status, currentM04TransactionState);
+					if (!firstGoalReady && firstGoalRequestContract) return "request-contract-invalid";
 					if (!firstGoalReady || currentM04Status !== "completed" || currentKnowledgeExport.state === "incomplete" ||
 						!currentM04Read || !existsSync(candidate) || !existsSync(verificationPath)) return "bounded-run-incomplete";
 					return "admitted";
@@ -2880,6 +2938,7 @@ async function main() {
 				let assessmentThisIteration = false;
 				let activeFollowOnGoalId: string | undefined;
 				let activeFollowOnTaskId: string | undefined;
+				const iterationDiagnosticStart = statusTransportDiagnostics.length;
 				statusPhase = "original-objective-assessment";
 				try {
 					const objectiveRecord = await ws.startRun("M07Objective", [
@@ -3001,6 +3060,15 @@ async function main() {
 					objectiveStopReason = objectiveStep.stopReason === "assessment-failed" && campaignObjectiveStop(budget.snapshot().stopReason) ?
 						campaignObjectiveStop(budget.snapshot().stopReason)! : objectiveStep.stopReason === "assessment-failed" &&
 						(abort.signal.aborted) ? "cancelled" : objectiveStep.stopReason;
+					const stepRequestContract = observedRequestContract(iterationDiagnosticStart,
+						statusTransportDiagnostics);
+					if (stepRequestContract && objectiveStopReason === "assessment-failed")
+						objectiveStopReason = "request-contract-invalid";
+					objectivePendingActionFacts = { ...observedTransportActionFacts(objectiveStopReason,
+						iterationDiagnosticStart, statusTransportDiagnostics.length, "read-only-assessor"),
+						...(objectiveStopReason === "request-contract-invalid" ?
+							{ requestContract: stepRequestContract } : {}) };
+					objectivePendingActionReason = objectiveStopReason;
 					if (assessmentHistory.at(-1)?.iteration === iteration) {
 						assessmentHistory[assessmentHistory.length - 1].stopReason = objectiveStopReason;
 						assessmentHistory[assessmentHistory.length - 1].advanced = Boolean(objectiveStep.advanced);
@@ -3146,6 +3214,16 @@ async function main() {
 					} catch (error) { objectiveStopReason = campaignObjectiveStop(budget.snapshot().stopReason) ??
 						(abort.signal.aborted ? "cancelled" :
 							assessmentThisIteration ? "dispatch-failed" : "assessment-failed");
+					const stepRequestContract = observedRequestContract(iterationDiagnosticStart,
+						statusTransportDiagnostics);
+					if (stepRequestContract && (objectiveStopReason === "assessment-failed" ||
+						objectiveStopReason === "dispatch-failed")) objectiveStopReason = "request-contract-invalid";
+					objectivePendingActionFacts = { ...observedTransportActionFacts(objectiveStopReason,
+						iterationDiagnosticStart, statusTransportDiagnostics.length,
+						activeFollowOnGoalId ? "m07-execution" : "read-only-assessor"),
+						...(objectiveStopReason === "request-contract-invalid" ?
+							{ requestContract: stepRequestContract } : {}) };
+					objectivePendingActionReason = objectiveStopReason;
 					if (assessmentHistory.at(-1)?.iteration === iteration)
 						assessmentHistory[assessmentHistory.length - 1].stopReason = objectiveStopReason;
 					let failedAttemptArchive = "unavailable";
@@ -3244,7 +3322,11 @@ async function main() {
 				historicalUnresolvedOperationIds, { boundedRuns,
 				selectedArtifacts: finalCandidateAvailable ? selectedArtifactNames : previousCheckpoint.selectedArtifacts,
 				...(objectiveAssessment ? { assessment: objectiveAssessment } : {}), assessmentHistory,
-				nextTaskDispatched: latestAssessmentAdvanced, stopReason: objectiveStopReason });
+				nextTaskDispatched: latestAssessmentAdvanced, stopReason: objectiveStopReason,
+				...(objectivePendingActionReason === objectiveStopReason ?
+					{ pendingActionFacts: objectivePendingActionFacts } :
+					objectiveStopReason === "request-contract-invalid" && firstGoalRequestContract ?
+						{ pendingActionFacts: { requestContract: firstGoalRequestContract } } : {}) });
 			await writeObjectiveProgress(objectiveCheckpointFile, objectiveCheckpoint);
 			const campaignOutcome = objectiveCheckpoint.objectiveOutcome;
 			await saveStatus({ outcome: campaignOutcome, boundedRunOutcome,
@@ -3439,7 +3521,8 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	createPrivateCampaignBudget,
 	historicalGapEvidence,
 	appendRestartReservation, appendRestartGoalBinding,
-	privateFailureMessage, privateExceptionDiagnostic, credentialProbe, parseCheckerOutput, compareCandidateTimings,
+	privateFailureMessage, privateProviderErrorField, privateExceptionDiagnostic,
+	credentialProbe, parseCheckerOutput, compareCandidateTimings,
 	campaignObjectiveStop, taskTelemetry, privateToolTelemetry,
 	chooseForkWinner, chooseFollowOnCandidate, firstM07Accepted, importM04EffectDisposition,
 	retainPriorSelectionUntilM04Ready,
@@ -3455,7 +3538,8 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	salvageObjectiveCheckpoint, collectContinuationBundle, collectorFailureBundle,
 	privateM04TransactionFacts, retainFailedM04Transaction, failedM04StopReason,
 	buildHostEffectReceipt,
-	unresolvedGoalControl, campaignObjectiveProgress,
+	unresolvedGoalControl, campaignObjectiveProgress, observedTransportActionFacts,
+	observedRequestContract, archivedRequestContract,
 	canonicalUnresolvedOperationRefs, qualifiedOperationRef, reservedCanonicalOperationRefs,
 	registeredSourceShape, parseRegisteredCheckerOutput, validateContinuationSeed, rangeReadableHistory,
 	stageRangeReadableHistory, stageHistoricalM04RejectionEvidence, sandboxArguments };

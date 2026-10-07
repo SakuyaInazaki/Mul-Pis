@@ -372,7 +372,8 @@ test("two Pi handles may prompt concurrently while sharing one budget", async (t
 	const runtime = {
 		getModels: () => [MODEL],
 		async streamSimple(model: Model<"openai-completions">, _context: unknown, options: { onPayload?: (payload: unknown, model: Model<"openai-completions">) => Promise<unknown> }) {
-			await options.onPayload?.({ model: model.id, messages: [], max_tokens: 20 }, model);
+			await options.onPayload?.({ model: model.id,
+				messages: [{ role: "user", content: "synthetic request" }], max_tokens: 20 }, model);
 			dispatched++;
 			await new Promise((resolve) => setTimeout(resolve, 20));
 		},
@@ -397,7 +398,8 @@ test("concurrent Pi handles may exceed retired single-call fields", async (t) =>
 	const runtime = {
 		getModels: () => [MODEL],
 		async streamSimple(model: Model<"openai-completions">, _context: unknown, options: { onPayload?: (payload: unknown, model: Model<"openai-completions">) => Promise<unknown> }) {
-			await options.onPayload?.({ model: model.id, messages: [], max_tokens: 20 }, model);
+			await options.onPayload?.({ model: model.id,
+				messages: [{ role: "user", content: "synthetic request" }], max_tokens: 20 }, model);
 			dispatched++;
 			await new Promise((resolve) => setTimeout(resolve, 20));
 		},
@@ -599,6 +601,35 @@ test("a large serialized payload is observed without the retired fee ceiling or 
 	assert(rows.every(row => /^[0-9a-f]{64}$/.test(row.sessionId) && row.sessionId !== handle.ref.id));
 });
 
+test("Pi rejects an orphan DeepSeek tool result before reservation or transport", async t => {
+	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-request-preflight-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	let transmitted = 0;
+	const runtime = { getModels: () => [MODEL],
+		async streamSimple(model: Model<"openai-completions">, _context: unknown,
+			options: { onPayload?: (payload: unknown, model: Model<"openai-completions">) => Promise<unknown> }) {
+			await options.onPayload?.({ model: model.id,
+				messages: [{ role: "tool", tool_call_id: "synthetic-call", content: "private synthetic result" }],
+				max_tokens: 20, thinking: { type: "enabled" }, tools: [] }, model);
+			transmitted++;
+		},
+	} as unknown as ModelRuntime;
+	const budget = new DeepSeekCampaignBudget(LIMITS);
+	const handle = await new PiSessionRunner({ modelRuntime: runtime,
+		createSession: offlineFactory(1), campaignBudget: budget }).create(spec(dir, "request-preflight"));
+	t.after(() => handle.dispose());
+	await assert.rejects(handle.prompt("synthetic prompt"), /DeepSeek request contract rejected before provider transport/);
+	assert.equal(transmitted, 0);
+	assert.equal(budget.snapshot().reservations, 0);
+	assert.deepEqual(budget.requestAccountingAuditSnapshot().requests, []);
+	const [diagnostic] = handle.transportDiagnostics?.() ?? [];
+	assert.equal(diagnostic?.requestContractViolation, "orphan-tool-result");
+	assert.equal(diagnostic?.attemptedRequestNotSent, true);
+	assert.equal(diagnostic?.wholePromptNotIssued, true);
+	assert.equal(diagnostic?.responseStarted, null);
+	assert.doesNotMatch(JSON.stringify(diagnostic), /synthetic-call|private synthetic result|synthetic prompt/);
+});
+
 test("unpriced CNY retains raw usage and unknown status rather than reporting a zero charge", () => {
 	const budget = new DeepSeekCampaignBudget(LIMITS);
 	const lease = budget.beginPrompt("session", "one");
@@ -716,7 +747,8 @@ test("a usage-ledger write failure retains an unpriced unknown transport", async
 test("a reported terminal tool-loop usage is reconciled before the next request", async t => {
 	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-stream-accounting-"));
 	t.after(() => rm(dir, { recursive: true, force: true }));
-	const payload = { model: MODEL.id, messages: [], max_tokens: 20 };
+	const payload = { model: MODEL.id,
+		messages: [{ role: "user", content: "synthetic request" }], max_tokens: 20 };
 	const budget = new DeepSeekCampaignBudget(LIMITS);
 	let called = 0;
 	let observedBeforeSecond = false;

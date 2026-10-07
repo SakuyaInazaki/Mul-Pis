@@ -515,3 +515,44 @@ test("private archive distinguishes host-proven zero-request not-issued from a p
 	assert.deepEqual((await loadPrivateM07Archive(destination)).archive.controllerEvidence.operationOutcomes,
 		archived.controllerEvidence.operationOutcomes);
 });
+
+test("private archive carries only static host request-contract preflight controls and validates them on read", async t => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "request-contract-archive-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const taskDir = path.join(root, "T001"), workDir = path.join(taskDir, "work"), destination = path.join(root, "out");
+	await mkdir(workDir, { recursive: true });
+	const evidencePath = path.join(taskDir, "request-contract-not-issued-receipt.json");
+	const receipt = { version: 1, kind: "m07-host-request-contract-not-issued",
+		goalRunId: "synthetic-goal", taskId: "T001", operationId: "O001",
+		requestNotSent: true, noProviderRequestsInPrompt: true,
+		violation: "orphan-tool-result", messageIndex: 2,
+		effectScope: "factory-attested-confined-file-tools", observedAt: new Date().toISOString() };
+	await writeFile(evidencePath, JSON.stringify(receipt));
+	const task = { taskId: "T001", mode: "execute", workDir, status: "failed" } as M07TaskRecord;
+	const goal = { runId: "synthetic-goal", lifecycle: "active", tasks: [task],
+		executionState: { operations: [{ id: "O001", taskId: "T001", status: "not-issued",
+			observationMethod: "host-request-contract-preflight", evidencePath }] } } as unknown as CurrentGoal;
+	const archived = await archivePrivateM07Task({ goal, task, destination });
+	assert.deepEqual(archived.controllerEvidence.operationOutcomes, [{ operationId: "O001", status: "not-issued",
+		requestContractNotIssued: { requestNotSent: true, noProviderRequestsInPrompt: true,
+			violation: "orphan-tool-result", messageIndex: 2,
+			effectScope: "factory-attested-confined-file-tools" } }]);
+	assert.equal(existsSync(path.join(destination, "request-contract-not-issued-receipt.json")), false);
+	assert.deepEqual((await loadPrivateM07Archive(destination)).archive.controllerEvidence.operationOutcomes,
+		archived.controllerEvidence.operationOutcomes);
+	const manifestPath = path.join(destination, "workflow-archive.json");
+	const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+	manifest.controllerEvidence.operationOutcomes[0].requestContractNotIssued.toolCallId = "private-tool-id";
+	await writeFile(manifestPath, JSON.stringify(manifest));
+	await assert.rejects(loadPrivateM07Archive(destination), /operation outcomes are invalid/);
+	delete manifest.controllerEvidence.operationOutcomes[0].requestContractNotIssued.toolCallId;
+	manifest.controllerEvidence.operationOutcomes[0].providerText = "private provider response";
+	await writeFile(manifestPath, JSON.stringify(manifest));
+	await assert.rejects(loadPrivateM07Archive(destination), /operation outcomes are invalid/);
+	await writeFile(evidencePath, JSON.stringify({ ...receipt, prompt: "private prompt text" }));
+	await assert.rejects(archivePrivateM07Task({ goal, task, destination: path.join(root, "unsafe") }),
+		/request contract not-issued receipt does not match/);
+	await writeFile(evidencePath, JSON.stringify({ ...receipt, violation: "unrecognized-reason" }));
+	await assert.rejects(archivePrivateM07Task({ goal, task, destination: path.join(root, "bad-enum") }),
+		/request contract not-issued receipt does not match/);
+});

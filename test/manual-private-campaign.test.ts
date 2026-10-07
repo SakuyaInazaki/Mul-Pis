@@ -45,6 +45,81 @@ test("failed research collection retains typed unresolved M04 quarantine for eme
 	assert.equal(retained?.["m04-transaction-quarantine.json"], typed);
 });
 
+test("private driver checkpoints keep inherited and current unknown operations in a host pending action", () => {
+	const contract = { version: 1 as const, kind: "original-objective" as const,
+		id: "synthetic-contract", createdAt: "2030-01-01T00:00:00Z", goal: "Synthetic research goal",
+		goalSource: "user-intent-summary" as const, inputNames: ["synthetic.txt"],
+		obligations: [{ id: "quality", description: "Continue checking the result" }],
+		closure: "open-ended" as const };
+	const checkpoint = offlineChecks.campaignObjectiveProgress(contract,
+		["prior-goal/O001", "prior-goal/O002"], {
+			boundedRuns: [{ runId: "current-goal", outcome: "active", unresolvedOperationIds: ["O003"] }],
+			selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
+			unresolvedOperationIds: ["current-goal/O003"], stopReason: "dispatch-failed" });
+	assert.equal(checkpoint.objectiveOutcome, "incomplete");
+	assert.equal(checkpoint.stopReason, "dispatch-failed");
+	assert.deepEqual(checkpoint.continuation.unresolvedOperationIds,
+		["prior-goal/O001", "prior-goal/O002", "current-goal/O003"]);
+	assert.equal(checkpoint.continuation.pendingAction?.author, "host");
+	assert.equal(checkpoint.continuation.pendingAction?.kind, "reconcile-m07-operation");
+	assert.equal(checkpoint.continuation.pendingAction?.safety, "no-replay-until-reconciled");
+	assert.deepEqual(checkpoint.continuation.pendingAction?.target?.operationRefs,
+		checkpoint.continuation.unresolvedOperationIds);
+	assert.equal(checkpoint.continuation.pendingAction?.humanRequired, undefined);
+	const cancelled = offlineChecks.campaignObjectiveProgress(contract, [], {
+		boundedRuns: [], selectedArtifacts: [], stopReason: "cancelled" });
+	assert.equal(cancelled.continuation.pendingAction, undefined);
+});
+
+test("observed read-only transport failure cannot become a new optimizer task", () => {
+	const contract = { version: 1 as const, kind: "original-objective" as const,
+		id: "synthetic-contract", createdAt: "2030-01-01T00:00:00Z", goal: "Synthetic research goal",
+		goalSource: "user-intent-summary" as const, inputNames: ["synthetic.txt"],
+		obligations: [{ id: "quality", description: "Continue checking the result" }],
+		closure: "open-ended" as const };
+	const checkpoint = (before: number, after: number,
+		stage: "read-only-assessor" | "m07-execution", unknowns: string[] = []) =>
+		offlineChecks.campaignObjectiveProgress(contract, [], { boundedRuns: [],
+			selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
+			stopReason: "dispatch-failed", unresolvedOperationIds: unknowns,
+			pendingActionFacts: offlineChecks.observedTransportActionFacts("dispatch-failed",
+				before, after, stage) });
+	assert.equal(checkpoint(4, 5, "read-only-assessor").continuation.pendingAction?.kind,
+		"retry-transport");
+	assert.equal(checkpoint(4, 4, "read-only-assessor").continuation.pendingAction?.kind,
+		"retry-readonly-assessment");
+	assert.equal(checkpoint(4, 4, "m07-execution").continuation.pendingAction?.kind,
+		"fresh-m07-task");
+	assert.equal(checkpoint(4, 5, "m07-execution", ["goal/O001"]).continuation.pendingAction?.kind,
+		"reconcile-m07-operation");
+	assert.throws(() => offlineChecks.observedTransportActionFacts("dispatch-failed", 5, 4,
+		"read-only-assessor"), /diagnostic cursor/);
+});
+
+test("host preflight violation becomes a concrete incomplete repair plan without request replay", () => {
+	const diagnostic = { wholePromptNotIssued: true, requestContractViolation: "orphan-tool-result",
+		requestContractMessageIndex: 3 } as any;
+	const staticReason = offlineChecks.observedRequestContract(1, [{}, diagnostic] as any);
+	assert.deepEqual(staticReason, { violation: "orphan-tool-result", messageIndex: 3 });
+	assert.equal(offlineChecks.observedRequestContract(1, [{},
+		{ ...diagnostic, wholePromptNotIssued: undefined }] as any), undefined);
+	const archiveReason = offlineChecks.archivedRequestContract({ loopStopReason: "request-contract-invalid",
+		controllerEvidence: { operationOutcomes: [{ status: "not-issued", requestContractNotIssued: {
+			violation: "orphan-tool-result", messageIndex: 3 } }] } } as any);
+	assert.deepEqual(archiveReason, staticReason);
+	const contract = { version: 1 as const, kind: "original-objective" as const,
+		id: "synthetic-contract", createdAt: "2030-01-01T00:00:00Z", goal: "Synthetic research goal",
+		goalSource: "user-intent-summary" as const, inputNames: ["synthetic.txt"],
+		obligations: [{ id: "quality", description: "Continue checking the result" }],
+		closure: "open-ended" as const };
+	const checkpoint = offlineChecks.campaignObjectiveProgress(contract, [], { boundedRuns: [],
+		selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
+		stopReason: "request-contract-invalid", pendingActionFacts: { requestContract: staticReason } });
+	assert.equal(checkpoint.objectiveOutcome, "incomplete");
+	assert.equal(checkpoint.continuation.pendingAction?.kind, "repair-request-contract");
+	assert.equal(checkpoint.continuation.pendingAction?.humanRequired, undefined);
+});
+
 test("private history evidence distinguishes the sealed baseline from unquantified executed gaps", () => {
 	const baseline = { source: { runId: "7001", runAttempt: 1, commit: "a".repeat(40) },
 		resultArtifact: { immutableRef: "synthetic-baseline-result", digestScope: "github-artifact-archive",
@@ -840,6 +915,15 @@ test("private diagnostic redacts a key crossing the 4000-character output bounda
 	assert.equal(redacted.length, 4000);
 	assert.equal(redacted.includes(key), false);
 	assert.equal(redacted.slice(-5).includes("sk-"), false);
+});
+
+test("encrypted provider reason keeps concrete text after credential redaction", () => {
+	const key = "sk-SYNTHETIC_PROVIDER_SECRET123456";
+	const field = offlineChecks.privateProviderErrorField(
+		`Invalid reasoning_content at messages[3]; Authorization: Bearer ${key}\napi_key=othersecret&password=hiddenvalue`, key);
+	assert.match(field ?? "", /Invalid reasoning_content at messages\[3\]/);
+	assert.doesNotMatch(field ?? "", /SYNTHETIC_PROVIDER_SECRET|othersecret|hiddenvalue|Bearer sk-/);
+	assert.match(field ?? "", /REDACTED_KEY/);
 });
 
 test("post-provider controller exceptions retain only encrypted redacted code and message", () => {

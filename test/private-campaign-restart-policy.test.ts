@@ -111,6 +111,39 @@ test("dynamic authenticated chains carry UNKNOWN effects into fresh-only mode", 
 	}
 });
 
+test("an unknown from a later fresh goal in the same bound run remains quarantined", () => {
+	const f = fixture(2);
+	const later = { runId: "later-linked-goal", outcome: "active", unresolvedOperationIds: ["O009"] };
+	f.checkpoint.boundedRuns.splice(3, 0, later);
+	f.refs.push("later-linked-goal/O009");
+	f.reservations[1].receipt.quarantine.historicalGoalOutcomes.push({ runId: later.runId,
+		outcome: later.outcome });
+	f.reservations[1].receipt.quarantine.operationRefs.push("later-linked-goal/O009");
+	f.bindings[1].quarantineReceiptSha256 = hash(JSON.stringify(f.reservations[1].receipt));
+	f.bundle["objective-checkpoint.json"] = JSON.stringify(f.checkpoint);
+	f.bundle["independent-restart-quarantine.json"] = JSON.stringify({ version: 1,
+		kind: "host-independent-restart-reservations", entries: f.reservations });
+	f.bundle["independent-restart-goal-binding.json"] = JSON.stringify({ version: 1,
+		kind: "host-independent-restart-goal-bindings", entries: f.bindings });
+	f.authorize();
+	assert.equal(review(f).effectClass, "historical-unknown-fresh-only");
+	assert.ok(review(f).operationAttestations.some(row => row.operationRef === "later-linked-goal/O009"));
+
+	const forged = fixture(2);
+	forged.checkpoint.boundedRuns[1].unresolvedOperationIds.push("O009");
+	forged.refs.push("old-goal/O009");
+	forged.reservations[1].receipt.quarantine.operationRefs.push("old-goal/O009");
+	forged.bindings[1].quarantineReceiptSha256 = hash(JSON.stringify(forged.reservations[1].receipt));
+	forged.bundle["objective-checkpoint.json"] = JSON.stringify(forged.checkpoint);
+	forged.bundle["independent-restart-quarantine.json"] = JSON.stringify({ version: 1,
+		kind: "host-independent-restart-reservations", entries: forged.reservations });
+	forged.bundle["independent-restart-goal-binding.json"] = JSON.stringify({ version: 1,
+		kind: "host-independent-restart-goal-bindings", entries: forged.bindings });
+	forged.authorize();
+	assert.throws(() => review(forged), /preceding authenticated run/,
+		"a newly claimed unknown cannot be attached to an older historical goal");
+});
+
 test("copied proof and tampered bundle cannot mint an effect policy", () => {
 	const f = fixture();
 	assert.throws(() => offlineRestartPolicyChecks.reviewWithEvidence(
@@ -338,8 +371,11 @@ test("later same-run accepted goal can replace selection before another unknown 
 
 test("branded selection survives zero and failed wrappers while forged transitions fail", () => {
 	const f = fixture(1);
+	const priorSelectedNames = [...f.checkpoint.selectedArtifacts];
+	const oldFiles = Object.fromEntries(priorSelectedNames.map(name => [name, f.bundle[name]]));
+	f.checkpoint.selectedArtifacts.push("experiment-plan.json");
+	f.bundle["experiment-plan.json"] = "new registered experiment plan";
 	const selectedNames = [...f.checkpoint.selectedArtifacts];
-	const oldFiles = Object.fromEntries(selectedNames.map(name => [name, f.bundle[name]]));
 	const bound = f.checkpoint.boundedRuns.at(-1)!;
 	bound.outcome = "partial";
 	bound.unresolvedOperationIds = [];
@@ -394,13 +430,19 @@ test("branded selection survives zero and failed wrappers while forged transitio
 		source: { ...selectionSource, runNumber: 2 }, envelopeSha256: selectionEnvelope,
 		priorEnvelopeSha256: f.envelopes[0],
 		priorSelectedTupleSha256: f.reservations[0].receipt.prior.selectedTupleSha256,
-		selectedTupleSha256, priorSelectedArtifacts: selectedNames, selectedArtifacts: selectedNames,
+		selectedTupleSha256, priorSelectedArtifacts: priorSelectedNames, selectedArtifacts: selectedNames,
 		contractId: "original-contract", goalRunId: "later-selected", taskId: "T003",
 		archiveSha256: hash(f.bundle["workflow-archive.json"]),
 		m04RunId: "m04-prior-accepted", m04State: "no-proposal" };
 	(f.evidence as any).selectedTransitions = [transition];
 	f.authorize();
 	assert.equal(review(f).effectClass, "historical-unknown-fresh-only");
+	const plan = f.bundle["experiment-plan.json"];
+	f.bundle["experiment-plan.json"] = "changed registered plan";
+	f.authorize();
+	assert.throws(() => review(f), /authenticated accepted goal/);
+	f.bundle["experiment-plan.json"] = plan;
+	f.authorize();
 	for (const patch of [{ archiveSha256: hash("forged archive") },
 		{ priorSelectedTupleSha256: hash("forged predecessor") },
 		{ envelopeSha256: hash("forged carry") },

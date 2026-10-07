@@ -2046,7 +2046,9 @@ test("received read-only assessment without a new goal preserves an unbound revi
 			"execution-capabilities.json", "restored-candidate-verification.json"],
 		unresolvedOperationIds: ["old-goal/O001"], assessment,
 		assessmentHistory: [{ iteration: 1, assessment, stopReason: assessmentStop, advanced: false }],
+		pendingActionFacts: { unresolvedOperationRefs: ["old-goal/O001"] },
 		stopReason: assessmentStop });
+	assert.equal(assessmentCheckpoint.continuation.pendingAction?.kind, "reconcile-m07-operation");
 	const assessmentChain = { version: 1, kind: "m07-original-objective-assessment-receipts",
 		receipts: [{ version: 1, kind: "m07-original-objective-assessment",
 			runId: "synthetic-assessment-run", status: "failed", sessions: [{
@@ -2444,13 +2446,22 @@ test("optional encrypted transport cause census binds only unknown audit IDs and
 	const diagnostic = { version: 1 as const, promptIndex: 9, requestId: "synthetic-lost",
 		phase: "response-body" as const, httpStatus: 400, responseStarted: true,
 		bytesRead: 64, abortSource: null, providerErrorCode: "invalid_parameter",
-		providerErrorType: "invalid_request_error", providerRequestId: "a".repeat(32),
-		errorCodes: [], message: "RAW_PRIVATE_MESSAGE_MUST_NOT_PERSIST" };
+		providerErrorType: "invalid_request_error", providerErrorReasonClass: "input-schema" as const,
+		providerRequestId: "a".repeat(32),
+		errorCodes: [], message: "RAW_PRIVATE_MESSAGE_MUST_NOT_PERSIST",
+		privateProviderError: { code: "invalid_parameter", type: "invalid_request_error",
+			message: "PRIVATE_RSA_REASON_ONLY", param: "messages[3]",
+			numericLimits: { max_context_tokens: 128000 } } };
 	const unavailable = opened.appendTransportDiagnosticCensus(currentAudit, []);
 	assert.equal(JSON.parse(unavailable!).entries[0].rows[0].availability, "unavailable");
+	const { providerErrorReasonClass: _omitted, ...legacyDiagnostic } = diagnostic;
+	const legacyText = opened.appendTransportDiagnosticCensus(currentAudit, [legacyDiagnostic]);
+	assert.equal(JSON.parse(legacyText!).entries[0].rows[0].providerErrorReasonClass, undefined,
+		"older v1 observed rows remain valid without rewriting them");
 	const text = opened.appendTransportDiagnosticCensus(currentAudit, [diagnostic]);
 	assert.ok(text);
-	assert.doesNotMatch(text, /RAW_PRIVATE_MESSAGE_MUST_NOT_PERSIST|providerRequestId|promptIndex/);
+	assert.doesNotMatch(text, /RAW_PRIVATE_MESSAGE_MUST_NOT_PERSIST|PRIVATE_RSA_REASON_ONLY|privateProviderError|providerRequestId|promptIndex/);
+	assert.equal(JSON.parse(text).entries[0].rows[0].providerErrorReasonClass, "input-schema");
 	const collectorFailure = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7005, sha("e")), loadCarryArtifact: async () => f.secondCarry.envelopeB64 });
 	const prepared = collectorFailure.appendTransportDiagnosticCensus(currentAudit, [diagnostic]);
@@ -2483,6 +2494,9 @@ test("optional encrypted transport cause census binds only unknown audit IDs and
 		/repeats one unknown request/);
 	const badCode = { ...diagnostic, providerErrorCode: "raw_private_parameter" };
 	assert.throws(() => opened.appendTransportDiagnosticCensus(currentAudit, [badCode]),
+		/transport diagnostic rows/);
+	const badReason = { ...diagnostic, providerErrorReasonClass: "raw_private_reason" as never };
+	assert.throws(() => opened.appendTransportDiagnosticCensus(currentAudit, [badReason]),
 		/transport diagnostic rows/);
 	const badBundle = { ...opened.priorPrivateBundle!, "transport-diagnostics.json":
 		text.replace('"availability":"observed"', '"availability":"observed","message":"raw"') };

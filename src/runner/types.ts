@@ -8,6 +8,7 @@
  */
 import type { Role } from "../types.ts";
 import type { EvidenceBindingV1 } from "../context/boundary.ts";
+import type { DeepSeekRequestViolation } from "./deepseek-request-contract.ts";
 
 /**
  * What a session may touch besides the text it is given.
@@ -221,9 +222,20 @@ export interface TransportFailureDiagnostic {
 	/** Exact, allowlisted JSON error values observed on a non-2xx response; never free-form text. */
 	providerErrorCode: string | null;
 	providerErrorType: string | null;
+	/** Host-classified, bounded cause; unknown when the provider metadata is ambiguous. */
+	providerErrorReasonClass?: "context-window" | "input-schema" | "tool-reasoning" | "unknown";
 	/** Validated server x-request-id, if it is a UUID or hexadecimal identifier. */
 	providerRequestId: string | null;
 	errorCodes: string[];
+	/** Encrypted private result only. Never copy into a model-facing carry or public log. */
+	privateProviderError?: { code: string | null; type: string | null; message: string | null;
+		param: string | null; numericLimits: Record<string, number> };
+	/** Static request-schema rejection of one attempted payload. */
+	requestContractViolation?: DeepSeekRequestViolation;
+	requestContractMessageIndex?: number | null;
+	attemptedRequestNotSent?: true;
+	/** True only when this entire prompt had no earlier reserved provider request. */
+	wholePromptNotIssued?: true;
 }
 
 export interface SessionHandle {

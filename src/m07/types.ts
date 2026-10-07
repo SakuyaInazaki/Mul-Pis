@@ -133,8 +133,8 @@ export interface M07OperationV1 {
 	version: 1;
 	id: string;
 	taskId: string;
-	/** partial-settled means some provider responses arrived and were billed, then the
-	 * next request was refused locally before transport; the M07 task is incomplete. */
+	/** Historical partial-settled receipts remain readable; new execution does not
+	 * create a monetary or call-count local refusal. */
 	status: "prepared" | "issued" | "response-received" | "partial-settled" |
 		"terminal-response-incomplete" | "unknown" | "confirmed" | "not-issued";
 	issuedAt: string;
@@ -142,7 +142,7 @@ export interface M07OperationV1 {
 	evidencePath?: string;
 	externalId?: string;
 	observationMethod?: "external-query" | "local-tool-log" | "host-local-admission-rejection" |
-		"host-terminal-response";
+		"host-terminal-response" | "host-request-contract-preflight";
 }
 
 export interface M07AttemptV1 {
@@ -197,7 +197,7 @@ export interface M07TaskRecord extends TaskSpecInput {
 	toolLog: unknown[];
 	executionRounds?: M07ExecutionRound[];
 	loopStopReason?: "ready" | "max-rounds" | "deadline" | "budget-boundary" | "provider-call-limit" |
-		"output-limit" | "replan" | "blocked" | "reviewer-invalid";
+		"output-limit" | "replan" | "blocked" | "reviewer-invalid" | "request-contract-invalid";
 	/** Available only after a stable task completed and its evidence was frozen. */
 	branchSource?: M07BranchSourceV1;
 	branchUnavailableReason?: string;

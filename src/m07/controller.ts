@@ -13,8 +13,7 @@ import { isTextFile, mediaType } from "../media.ts";
 import { sessionSpec, type StageContext } from "../stages/context.ts";
 import { isSafeRelativeOutputPath, resolveExpectedOutputFiles, type ExpectedOutputResolution } from "./expected-output.ts";
 import type { BeginGoalInput, CurrentGoal, DecisionInput, EvidenceFile, FinishInput, HostStopReasonKind, HostStopReceipt, InterruptInput, M07CheckpointRecord, M07Controller, M07TaskRecord, TaskCheck, TaskReviewInput, TaskSpecInput, M07OperationV1 } from "./types.ts";
-import { localNotIssuedDetails, settledLocalAdmissionStopDetails,
-	settledTerminalResponseDetails } from "../runner/operation-disposition.ts";
+import { requestNotSentDetails, settledTerminalResponseDetails } from "../runner/operation-disposition.ts";
 import type { StageRunRecord } from "../types.ts";
 import { loadActiveBudgetPolicy, projectInline, validateActiveBudgetPointer, validateBudgetPolicy, type BudgetPolicy } from "../improvement/policy.ts";
 import { capturedRunBytes, DEFAULT_PROJECTION_SNAPSHOT_LIMITS, newProjectionEvent, nextProjectionOrdinal, writeProjectionEvent, type ProjectionEventV1, type ProjectionMaterialV1, type ProjectionSnapshotLimits } from "../improvement/observations.ts";
@@ -1133,51 +1132,34 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				task.status = "failed"; task.executionFailure = (error as Error).message;
 				if (activeOperation?.status === "prepared") activeOperation.status = "not-issued";
 				if (activeOperation && promptIssued && activeOperation.status === "issued") {
-					const notIssued = localNotIssuedDetails(error);
-					const localStop = settledLocalAdmissionStopDetails(error);
+					const requestNotSent = requestNotSentDetails(error);
 					const terminalResponse = settledTerminalResponseDetails(error);
 					let confinedGrantVerified = false;
-					if ((notIssued || localStop || terminalResponse) && handle && ctx.runner.attestConfinedGrant) {
+					if ((requestNotSent || terminalResponse) && handle && ctx.runner.attestConfinedGrant) {
 						try {
 							const grant = await ctx.runner.attestConfinedGrant(handle);
 							confinedGrantVerified = grant?.version === 1 && grant.kind === "confined-campaign-files" &&
 								await realpath(grant.root) === await realpath(task.workDir);
 						} catch { /* A missing or failed live grant attestation leaves the operation unknown. */ }
 					}
-					if (notIssued?.effectScope === "factory-attested-confined-file-tools" && confinedGrantVerified) {
+					if (requestNotSent?.requestNotSent === true &&
+						requestNotSent.noProviderRequestsInPrompt === true &&
+						requestNotSent.effectScope === "factory-attested-confined-file-tools" &&
+						confinedGrantVerified) {
 						try {
-							const receiptPath = path.join(dir, "local-not-issued-receipt.json");
+							const receiptPath = path.join(dir, "request-contract-not-issued-receipt.json");
 							await writeFileAtomic(receiptPath, `${JSON.stringify({ version: 1,
-								kind: "m07-host-local-not-issued", goalRunId: runId,
+								kind: "m07-host-request-contract-not-issued", goalRunId: runId,
 								taskId: id, operationId: activeOperation.id,
-								settledProviderRequestCount: 0, requestNotSent: true,
-								stopReason: notIssued.stopReason,
-								admissionDecision: notIssued.admissionDecision,
-								effectScope: notIssued.effectScope,
+								requestNotSent: true, noProviderRequestsInPrompt: true,
+								violation: requestNotSent.violation, messageIndex: requestNotSent.messageIndex,
+								effectScope: requestNotSent.effectScope,
 								observedAt: nowIso() }, null, 2)}\n`);
 							activeOperation.status = "not-issued";
 							activeOperation.resolvedAt = nowIso();
-							activeOperation.observationMethod = "host-local-admission-rejection";
+							activeOperation.observationMethod = "host-request-contract-preflight";
 							activeOperation.evidencePath = receiptPath;
-							task.loopStopReason = notIssued.stopReason === "provider-call-limit" ?
-								"provider-call-limit" : "budget-boundary";
-						} catch { activeOperation.status = "unknown"; }
-					} else if (localStop?.effectScope === "factory-attested-confined-file-tools" && confinedGrantVerified) {
-						try {
-							const receiptPath = path.join(dir, "local-admission-stop-receipt.json");
-							await writeFileAtomic(receiptPath, `${JSON.stringify({ version: 1,
-								kind: "m07-partial-settled-local-admission-stop", goalRunId: runId,
-								taskId: id, operationId: activeOperation.id,
-								settledProviderRequestCount: localStop.settledProviderRequestCount,
-								rejectedBeforeTransport: true, stopReason: localStop.stopReason,
-								effectScope: localStop.effectScope,
-								observedAt: nowIso() }, null, 2)}\n`);
-							activeOperation.status = "partial-settled";
-							activeOperation.resolvedAt = nowIso();
-							activeOperation.observationMethod = "host-local-admission-rejection";
-							activeOperation.evidencePath = receiptPath;
-							task.loopStopReason = localStop.stopReason === "provider-call-limit" ?
-								"provider-call-limit" : "budget-boundary";
+							task.loopStopReason = "request-contract-invalid";
 						} catch { activeOperation.status = "unknown"; }
 					} else if (terminalResponse?.effectScope === "factory-attested-confined-file-tools" && confinedGrantVerified) {
 						try {

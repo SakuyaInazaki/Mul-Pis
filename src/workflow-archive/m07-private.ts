@@ -9,6 +9,7 @@ import type { CurrentGoal, M07TaskRecord } from "../m07/types.ts";
 import { isSafeRelativeOutputPath } from "../m07/expected-output.ts";
 import { isKnowledgeRef } from "../knowledge/experience-index.ts";
 import type { KnowledgeRecord, KnowledgeRef, KnowledgeStore, Limit, Snapshot } from "../knowledge/types.ts";
+import type { DeepSeekRequestViolation } from "../runner/deepseek-request-contract.ts";
 
 const ARCHIVE_NAME = "workflow-archive.json";
 const MAX_ARCHIVE_BYTES = 32_000;
@@ -16,6 +17,12 @@ const MAX_ARCHIVE_BYTES = 32_000;
 export const M04_KNOWLEDGE_EXPORT_NAME = "m04-adopted-knowledge.json";
 const MAX_REVIEW_TEXT_BYTES = 512_000;
 const MAX_KNOWLEDGE_BYTES = 256_000;
+const REQUEST_CONTRACT_VIOLATIONS: ReadonlySet<string> = new Set([
+	"request-shape", "message-shape", "tool-call-shape", "duplicate-tool-call",
+	"orphan-tool-result", "duplicate-tool-result", "incomplete-tool-results",
+	"thinking-tool-choice", "missing-reasoning", "unsigned-reasoning",
+	"reasoning-replay-mismatch",
+]);
 const FILES = [
 	{ name: "candidate.cpp", maxBytes: 128_000 },
 	{ name: "verification.json", maxBytes: 1_000_000 },
@@ -35,6 +42,9 @@ export interface PrivateM07ArchiveV1 {
 	files: Array<{ name: typeof FILES[number]["name"]; status: "present" | "missing" | "invalid"; bytes?: number }>;
 	controllerEvidence: {
 		operationOutcomes?: Array<{ operationId: string; status: string;
+			requestContractNotIssued?: { requestNotSent: true; noProviderRequestsInPrompt: true;
+				violation: DeepSeekRequestViolation; messageIndex: number | null;
+				effectScope: "factory-attested-confined-file-tools" };
 			localNotIssued?: { settledProviderRequestCount: 0; requestNotSent: true;
 				stopReason: "total-cny-ceiling" | "provider-call-limit";
 				admissionDecision: "input-unaffordable" | "minimum-output-unaffordable" |
@@ -393,11 +403,50 @@ async function lessonState(raw: Buffer, workDir: string): Promise<PrivateM07Arch
 		evidencePaths: delta.evidencePaths as string[] };
 }
 
+function exactFields(value: unknown, fields: readonly string[]): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value) &&
+		Object.keys(value).length === fields.length &&
+		fields.every(field => Object.hasOwn(value, field));
+}
+
+function validRequestContractNotIssued(value: unknown): value is NonNullable<
+	NonNullable<PrivateM07ArchiveV1["controllerEvidence"]["operationOutcomes"]>[number]["requestContractNotIssued"]> {
+	return exactFields(value, ["requestNotSent", "noProviderRequestsInPrompt", "violation", "messageIndex", "effectScope"]) &&
+		value.requestNotSent === true && value.noProviderRequestsInPrompt === true &&
+		value.effectScope === "factory-attested-confined-file-tools" &&
+		typeof value.violation === "string" && REQUEST_CONTRACT_VIOLATIONS.has(value.violation) &&
+		(value.messageIndex === null ||
+			(Number.isSafeInteger(value.messageIndex) && Number(value.messageIndex) >= 0));
+}
+
 /** Copy only explicit bounded work products, never session/auth/profile files. */
 async function archivedOperationOutcomes(goal: CurrentGoal, task: M07TaskRecord): Promise<
 	NonNullable<PrivateM07ArchiveV1["controllerEvidence"]["operationOutcomes"]>> {
 	const operations = (goal.executionState?.operations ?? []).filter(item => item.taskId === task.taskId);
 	return Promise.all(operations.map(async operation => {
+		if (operation.status === "not-issued" && operation.observationMethod === "host-request-contract-preflight") {
+			const expected = path.join(path.dirname(task.workDir), "request-contract-not-issued-receipt.json");
+			if (operation.evidencePath !== expected) throw new Error("request contract not-issued operation lacks its controller receipt");
+			const source = await privateFile(path.dirname(task.workDir), "request-contract-not-issued-receipt.json", 4_000);
+			if (!source) throw new Error("request contract not-issued receipt is unavailable");
+			const receipt: unknown = JSON.parse(await readFile(source.source, "utf8"));
+			if (!exactFields(receipt, ["version", "kind", "goalRunId", "taskId", "operationId", "requestNotSent",
+				"noProviderRequestsInPrompt", "violation", "messageIndex", "effectScope", "observedAt"]) ||
+				receipt.version !== 1 || receipt.kind !== "m07-host-request-contract-not-issued" ||
+				receipt.goalRunId !== goal.runId || receipt.taskId !== task.taskId ||
+				receipt.operationId !== operation.id ||
+				typeof receipt.observedAt !== "string" || !receipt.observedAt ||
+				!validRequestContractNotIssued({ requestNotSent: receipt.requestNotSent,
+					noProviderRequestsInPrompt: receipt.noProviderRequestsInPrompt,
+					violation: receipt.violation, messageIndex: receipt.messageIndex,
+					effectScope: receipt.effectScope }))
+				throw new Error("request contract not-issued receipt does not match the operation");
+			return { operationId: operation.id, status: "not-issued", requestContractNotIssued: {
+				requestNotSent: true as const, noProviderRequestsInPrompt: true as const,
+				violation: receipt.violation as DeepSeekRequestViolation,
+				messageIndex: receipt.messageIndex as number | null,
+				effectScope: "factory-attested-confined-file-tools" as const } };
+		}
 		if (operation.status === "not-issued" && operation.observationMethod === "host-local-admission-rejection") {
 			const expected = path.join(path.dirname(task.workDir), "local-not-issued-receipt.json");
 			if (operation.evidencePath !== expected) throw new Error("local not-issued operation lacks its controller receipt");
@@ -758,8 +807,13 @@ export async function loadPrivateM07Archive(directory: string): Promise<{ archiv
 		throw new Error("private M07 archive round manifest is invalid");
 	if (archive.controllerEvidence.operationOutcomes !== undefined &&
 		(!Array.isArray(archive.controllerEvidence.operationOutcomes) ||
-			archive.controllerEvidence.operationOutcomes.some(item => !/^O\d{3,}$/.test(item.operationId) ||
+			archive.controllerEvidence.operationOutcomes.some(item => !item || typeof item !== "object" ||
+				!/^O\d{3,}$/.test(item.operationId) ||
 				!["prepared", "issued", "response-received", "partial-settled", "terminal-response-incomplete", "unknown", "confirmed", "not-issued"].includes(item.status) ||
+				(item.requestContractNotIssued !== undefined &&
+					(item.status !== "not-issued" ||
+						!exactFields(item, ["operationId", "status", "requestContractNotIssued"]) ||
+						!validRequestContractNotIssued(item.requestContractNotIssued))) ||
 				(item.localNotIssued !== undefined && (item.status !== "not-issued" ||
 					item.localNotIssued.settledProviderRequestCount !== 0 ||
 					item.localNotIssued.requestNotSent !== true ||

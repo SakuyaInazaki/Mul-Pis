@@ -3,10 +3,20 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
+import { createAgentSession, type CreateAgentSessionOptions, type ModelRuntime } from "@earendil-works/pi-coding-agent";
+import type { Model } from "@earendil-works/pi-ai";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { createM07Controller } from "../src/m07/controller.ts";
 import { parseRoundReview } from "../src/m07/execution-loop.ts";
 import { FakeSessionRunner, type FakeReplyFn } from "../src/runner/fake.ts";
+import { certifyLocalNotIssued, certifyRequestNotSent, certifySettledLocalAdmissionStop,
+	certifySettledTerminalResponse } from "../src/runner/operation-disposition.ts";
+import { DeepSeekRequestContractError } from "../src/runner/deepseek-request-contract.ts";
+import { DeepSeekCampaignBudget } from "../src/runner/deepseek-campaign.ts";
+import { verifyDeepSeekProviderOutputLimit } from "../src/runner/deepseek-provider-limits.ts";
+import { createConfinedCampaignFileTools } from "../src/runner/confined-campaign-files.ts";
+import { PiSessionRunner } from "../src/runner/pi.ts";
+import type { SessionRunner } from "../src/runner/types.ts";
 import type { StageContext } from "../src/stages/context.ts";
 import { Workspace } from "../src/workspace.ts";
 
@@ -23,7 +33,77 @@ async function fixture(t: TestContext, reply: FakeReplyFn) {
  const controller = createM07Controller(ctx);
  const goal = await controller.begin({goal:"Evaluate a bounded candidate",problemRelation:"direct",constraints:["keep the plan"],successCriteria:["verified"],plan:"one candidate"});
  const guide = path.join(root,"guide.md"); await writeFile(guide,"Guide version one\n");
- return {root,ws,store,runner,controller,goal,guide};
+ return {root,ws,store,runner,controller,goal,guide,ctx};
+}
+
+function attestConfinedExecutionGrant(runner: FakeSessionRunner): void {
+	(runner as SessionRunner).attestConfinedGrant = async handle => {
+		const spec = JSON.parse(await readFile(handle.ref.specFile!, "utf8"));
+		return spec.tools.kind === "execution" ? { version: 1, kind: "confined-campaign-files",
+			root: spec.tools.root, writableFiles: ["result.txt"] } : undefined;
+	};
+}
+
+const OFFLINE_DEEPSEEK = { id: "deepseek-flash", name: "Offline DeepSeek", provider: "deepseek",
+	api: "openai-completions", baseUrl: "https://api.deepseek.com", reasoning: true,
+	input: ["text"], cost: { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 },
+	contextWindow: 10_000, maxTokens: 20 } as Model<"openai-completions">;
+
+/** Exercise the actual Pi payload hook and campaign ledger, with no network. */
+async function offlineM07PiRunner(invalidRequest: 1 | 2): Promise<{
+	runner: SessionRunner; budget: DeepSeekCampaignBudget; httpRequests: () => number;
+}> {
+	const outputLimit = await verifyDeepSeekProviderOutputLimit({ apiKey: "synthetic-only",
+		request: async () => new Response(JSON.stringify({ object: "list", data: [{
+			id: "deepseek-flash", object: "model", name: "DeepSeek-V4.1-Flash",
+			max_output_tokens: 20, context_window: 10_000,
+		}] }), { status: 200 }) });
+	const budget = new DeepSeekCampaignBudget({ model: "deepseek/deepseek-flash:low",
+		endpoint: "https://api.deepseek.com", accountingMode: "accounting-only",
+		providerOutputLimit: outputLimit, outputAccountingMarginTokens: 32 });
+	let httpRequests = 0;
+	const runtime = { getModels: () => [OFFLINE_DEEPSEEK],
+		async streamSimple(model: Model<"openai-completions">, _context: unknown,
+			options: { maxTokens?: number; onPayload?: (payload: unknown,
+				model: Model<"openai-completions">) => Promise<unknown> }) {
+			for (let index = 1; index <= invalidRequest; index++) {
+				const messages: unknown[] = [{ role: "user", content: "offline" }];
+				if (index === invalidRequest) messages.push({ role: "tool",
+					tool_call_id: "orphan", content: "offline" });
+				await options.onPayload?.({ model: model.id, messages,
+					max_tokens: options.maxTokens }, model);
+				httpRequests++;
+			}
+		},
+	} as unknown as ModelRuntime;
+	const sessionFactory = (async (options: CreateAgentSessionOptions = {}) => {
+		const manager = options.sessionManager!;
+		const messages: unknown[] = [];
+		return { session: {
+			sessionId: manager.getSessionId(), sessionFile: manager.getSessionFile(), messages,
+			getActiveToolNames: () => options.tools ?? [],
+			async prompt(text: string) {
+				const user = { role: "user", content: text, timestamp: Date.now() };
+				messages.push(user); manager.appendMessage(user as never);
+				await (options.modelRuntime as ModelRuntime).streamSimple(options.model!,
+					{ messages } as never, {});
+			},
+			abort() {}, dispose() {},
+		} } as unknown as Awaited<ReturnType<typeof createAgentSession>>;
+	}) as typeof createAgentSession;
+	const pi = new PiSessionRunner({ modelRuntime: runtime, createSession: sessionFactory,
+		campaignBudget: budget });
+	const runner: SessionRunner = {
+		create: async spec => spec.tools.kind === "execution" ? pi.create({ ...spec,
+			tools: { kind: "custom", tools: await createConfinedCampaignFileTools(spec.tools.root,
+				{ writableFiles: ["result.txt", "lesson-delta.json"] }) } }) : pi.create(spec),
+		resume: ref => pi.resume(ref),
+		capabilities: () => pi.capabilities(),
+		attestConfinedGrant: handle => pi.attestConfinedGrant(handle),
+		checkpoint: (handle, envelope) => pi.checkpoint(handle, envelope),
+		fork: request => pi.fork(request),
+	};
+	return { runner, budget, httpRequests: () => httpRequests };
 }
 
 test("until-ready execution continues past eight rounds without a host deadline", async t => {
@@ -290,6 +370,145 @@ test("an unbranded local-stop claim cannot settle an issued M07 operation", asyn
 	const goal = await f.controller.status(f.goal.runId);
 	assert.equal(goal.executionState?.operations[0].status, "unknown");
 	assert.equal(goal.executionState?.operations[0].observationMethod, undefined);
+});
+
+test("legacy branded quota errors cannot certify a new M07 operation", async t => {
+	for (const [label, makeError] of [
+		["unsent provider-call quota", () => certifyLocalNotIssued({
+			settledProviderRequestCount: 0, requestNotSent: true, stopReason: "provider-call-limit",
+			admissionDecision: "provider-call-limit",
+			effectScope: "factory-attested-confined-file-tools",
+		}, "legacy call quota")],
+		["partial settled CNY quota", () => certifySettledLocalAdmissionStop({
+			settledProviderRequestCount: 1, rejectedBeforeTransport: true,
+			stopReason: "total-cny-ceiling", effectScope: "factory-attested-confined-file-tools",
+		}, "legacy CNY quota")],
+	] as const) {
+		await t.test(label, async sub => {
+			const f = await fixture(sub, () => { throw makeError(); });
+			// Make the old controller path's grant condition true. The receipt must
+			// still be refused because quota certifications are historical only.
+			attestConfinedExecutionGrant(f.runner);
+			const task = await f.controller.delegate(f.goal.runId, { objective: "new task", inputs: [],
+				expectedOutputs: ["result.txt"], checks: ["checked"], mode: "execute",
+				executionLoop: { mode: "until-ready" } });
+			assert.equal(task.status, "failed");
+			assert.equal(task.loopStopReason, undefined);
+			const goal = await f.controller.status(f.goal.runId);
+			assert.equal(goal.lifecycle, "active");
+			const operation = goal.executionState?.operations[0];
+			assert.equal(operation?.status, "unknown");
+			assert.equal(operation.observationMethod, undefined);
+			assert.equal(operation.evidencePath, undefined);
+			await assert.rejects(f.controller.delegate(f.goal.runId, { objective: "unsafe replay",
+				inputs: [], expectedOutputs: ["result.txt"], checks: ["checked"], mode: "execute" }),
+				/副作用状态未知/);
+		});
+	}
+});
+
+test("host-branded zero-request contract rejection is not issued and retains static controls", async t => {
+	let prompts = 0;
+	const f = await fixture(t, async ({ spec }) => {
+		prompts++;
+		if (prompts === 1) throw certifyRequestNotSent({ requestNotSent: true,
+			noProviderRequestsInPrompt: true, effectScope: "factory-attested-confined-file-tools",
+			violation: "missing-reasoning", messageIndex: 3 });
+		if (spec.tools.kind === "execution") await writeFile(path.join(spec.tools.root, "result.txt"), "candidate\n");
+		return "new task completed";
+	});
+	attestConfinedExecutionGrant(f.runner);
+	const task = await f.controller.delegate(f.goal.runId, { objective: "validate final request", inputs: [],
+		expectedOutputs: ["result.txt"], checks: ["checked"], mode: "execute",
+		executionLoop: { mode: "until-ready" } });
+	assert.equal(task.status, "failed");
+	assert.equal(task.loopStopReason, "request-contract-invalid");
+	const goal = await f.controller.status(f.goal.runId);
+	assert.equal(goal.lifecycle, "active");
+	const operation = goal.executionState?.operations[0];
+	assert.equal(operation?.status, "not-issued");
+	assert.equal(operation.observationMethod, "host-request-contract-preflight");
+	assert.equal(path.basename(operation.evidencePath!), "request-contract-not-issued-receipt.json");
+	const receipt = JSON.parse(await readFile(operation.evidencePath!, "utf8"));
+	assert.deepEqual(Object.keys(receipt).sort(), ["version", "kind", "goalRunId", "taskId",
+		"operationId", "requestNotSent", "noProviderRequestsInPrompt", "violation", "messageIndex",
+		"effectScope", "observedAt"].sort());
+	assert.equal(receipt.violation, "missing-reasoning");
+	assert.equal(receipt.messageIndex, 3);
+	assert.equal(receipt.requestNotSent, true);
+	assert.equal(receipt.noProviderRequestsInPrompt, true);
+	assert.doesNotMatch(await readFile(operation.evidencePath!, "utf8"), /secret|prompt text|tool_call_id/);
+	const next = await f.controller.delegate(f.goal.runId, { objective: "fresh task", inputs: [],
+		expectedOutputs: ["result.txt"], checks: ["checked"], mode: "execute" });
+	assert.equal(next.status, "returned");
+});
+
+test("a bare preflight error with forged not-sent flags leaves an issued operation UNKNOWN", async t => {
+	const f = await fixture(t, () => {
+		throw Object.assign(new DeepSeekRequestContractError("missing-reasoning", 3), {
+			requestNotSent: true, noProviderRequestsInPrompt: true,
+		});
+	});
+	attestConfinedExecutionGrant(f.runner);
+	const task = await f.controller.delegate(f.goal.runId, { objective: "synthetic request", inputs: [],
+		expectedOutputs: ["result.txt"], checks: ["checked"], mode: "execute",
+		executionLoop: { mode: "until-ready" } });
+	assert.equal(task.status, "failed");
+	assert.equal(task.loopStopReason, undefined);
+	const operation = (await f.controller.status(f.goal.runId)).executionState?.operations[0];
+	assert.equal(operation?.status, "unknown");
+	assert.equal(operation.observationMethod, undefined);
+	assert.equal(operation.evidencePath, undefined);
+});
+
+test("offline M07 plus Pi request preflight distinguishes zero transport from an earlier unreceived request", async t => {
+	for (const invalidRequest of [1, 2] as const) {
+		await t.test(invalidRequest === 1 ? "first request rejected" : "second request rejected", async sub => {
+			const f = await fixture(sub, () => "unused");
+			const live = await offlineM07PiRunner(invalidRequest);
+			f.ctx.runner = live.runner;
+			f.ctx.config.roles.execution = "deepseek/deepseek-flash:low";
+			const task = await f.controller.delegate(f.goal.runId, { objective: "offline request preflight",
+				inputs: [], expectedOutputs: ["result.txt"], checks: ["checked"],
+				mode: "execute", executionLoop: { mode: "until-ready" } });
+			assert.equal(task.status, "failed");
+			assert.equal(task.loopStopReason,
+				invalidRequest === 1 ? "request-contract-invalid" : undefined);
+			const operation = (await f.controller.status(f.goal.runId)).executionState?.operations[0];
+			assert.equal(live.httpRequests(), invalidRequest - 1);
+			assert.equal(live.budget.requestAccountingAuditSnapshot().requests.length, invalidRequest - 1);
+			assert.equal(operation?.status, invalidRequest === 1 ? "not-issued" : "unknown");
+			if (invalidRequest === 1) {
+				assert.equal(operation.observationMethod, "host-request-contract-preflight");
+				const receipt = JSON.parse(await readFile(operation.evidencePath!, "utf8"));
+				assert.equal(receipt.violation, "orphan-tool-result");
+				assert.equal(receipt.messageIndex, 1);
+				assert.equal(receipt.noProviderRequestsInPrompt, true);
+			} else {
+				assert.equal(operation.observationMethod, undefined);
+				assert.equal(operation.evidencePath, undefined);
+				assert.equal(live.budget.requestAccountingAuditSnapshot().requests[0].status, "unknown");
+			}
+		});
+	}
+});
+
+test("a certified terminal-length response remains incomplete and distinct from an unknown", async t => {
+	const f = await fixture(t, () => { throw certifySettledTerminalResponse({
+		settledProviderRequestCount: 1, responseReceived: true,
+		terminalStopReason: "length", taskComplete: false,
+		effectScope: "factory-attested-confined-file-tools",
+	}, "provider length response"); });
+	attestConfinedExecutionGrant(f.runner);
+	const task = await f.controller.delegate(f.goal.runId, { objective: "new task", inputs: [],
+		expectedOutputs: ["result.txt"], checks: ["checked"], mode: "execute",
+		executionLoop: { mode: "until-ready" } });
+	assert.equal(task.status, "failed");
+	assert.equal(task.loopStopReason, "output-limit");
+	const operation = (await f.controller.status(f.goal.runId)).executionState?.operations[0];
+	assert.equal(operation?.status, "terminal-response-incomplete");
+	assert.equal(operation.observationMethod, "host-terminal-response");
+	assert.ok(operation.evidencePath);
 });
 
 test("changed plan copy and invalid candidate delta fail closed", async t => {

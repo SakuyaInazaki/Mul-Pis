@@ -225,6 +225,8 @@ export type HostTransportDiagnosticCensusV1 = Readonly<{
 				responseStarted: boolean | null; bytesRead: number | null;
 				abortSource: TransportFailureDiagnostic["abortSource"];
 				providerErrorCode: string | null; providerErrorType: string | null;
+				/** Optional so authenticated older v1 entries retain their exact bytes. */
+				providerErrorReasonClass?: TransportFailureDiagnostic["providerErrorReasonClass"];
 				errorCodes: string[] }>>;
 	}>>;
 }>;
@@ -582,6 +584,7 @@ const TRANSPORT_PROVIDER_CODES = new Set(["invalid_request_error", "invalid_form
 	"rate_limit_exceeded", "insufficient_quota", "content_filter"]);
 const TRANSPORT_PROVIDER_TYPES = new Set(["invalid_request_error", "authentication_error",
 	"permission_error", "not_found_error", "rate_limit_error", "server_error"]);
+const TRANSPORT_PROVIDER_REASONS = new Set(["context-window", "input-schema", "tool-reasoning", "unknown"]);
 const TRANSPORT_NETWORK_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "ECONNABORTED",
 	"ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EPIPE",
 	"UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT",
@@ -626,9 +629,12 @@ function transportDiagnosticCensus(cp: Pick<AccountingCheckpoint,
 		if (!expectedIds.length || entry.rows.length !== expectedIds.length ||
 			entry.rows.some((row, rowIndex) => !record(row) || row.requestId !== expectedIds[rowIndex] ||
 				(row.availability === "unavailable" ? !exactKeys(row, ["requestId", "availability"]) :
-					row.availability !== "observed" || !exactKeys(row, ["requestId", "availability",
+					row.availability !== "observed" || !(exactKeys(row, ["requestId", "availability",
 						"phase", "httpStatus", "responseStarted", "bytesRead", "abortSource",
 						"providerErrorCode", "providerErrorType", "errorCodes"]) ||
+					exactKeys(row, ["requestId", "availability", "phase", "httpStatus",
+						"responseStarted", "bytesRead", "abortSource", "providerErrorCode",
+						"providerErrorType", "providerErrorReasonClass", "errorCodes"])) ||
 					!TRANSPORT_PHASES.has(String(row.phase)) ||
 					(row.httpStatus !== null && (!Number.isSafeInteger(row.httpStatus) ||
 						Number(row.httpStatus) < 100 || Number(row.httpStatus) > 599)) ||
@@ -637,6 +643,8 @@ function transportDiagnosticCensus(cp: Pick<AccountingCheckpoint,
 					(row.abortSource !== null && !TRANSPORT_ABORTS.has(String(row.abortSource))) ||
 					(row.providerErrorCode !== null && !TRANSPORT_PROVIDER_CODES.has(String(row.providerErrorCode))) ||
 					(row.providerErrorType !== null && !TRANSPORT_PROVIDER_TYPES.has(String(row.providerErrorType))) ||
+					(row.providerErrorReasonClass !== undefined &&
+						!TRANSPORT_PROVIDER_REASONS.has(String(row.providerErrorReasonClass))) ||
 					!Array.isArray(row.errorCodes) || new Set(row.errorCodes).size !== row.errorCodes.length ||
 					row.errorCodes.some(code => !TRANSPORT_NETWORK_CODES.has(String(code))))))
 			reject("transport diagnostic rows do not match unknown request audit");
@@ -1557,6 +1565,8 @@ function assessmentOnlyNoGoal(cp: AccountingCheckpoint, receipt: HostEffectRecei
 			boundedRuns: current.boundedRuns, selectedArtifacts: current.selectedArtifacts,
 			availableArtifacts: current.availableArtifacts, unresolvedOperationIds: unresolved,
 			assessment: current.assessment, assessmentHistory: current.assessmentHistory,
+			...(current.continuation.pendingAction ?
+				{ pendingAction: current.continuation.pendingAction } : {}),
 			stopReason: current.stopReason });
 		return JSON.stringify(recomputed) === JSON.stringify(current);
 	} catch { return false; }
@@ -2248,7 +2258,10 @@ export async function openLedgerContinuation(input: {
 					phase: observed.phase, httpStatus: observed.httpStatus,
 					responseStarted: observed.responseStarted, bytesRead: observed.bytesRead,
 					abortSource: observed.abortSource, providerErrorCode: observed.providerErrorCode,
-					providerErrorType: observed.providerErrorType, errorCodes: [...observed.errorCodes] } :
+					providerErrorType: observed.providerErrorType,
+					...(observed.providerErrorReasonClass === undefined ? {} :
+						{ providerErrorReasonClass: observed.providerErrorReasonClass }),
+					errorCodes: [...observed.errorCodes] } :
 					{ requestId, availability: "unavailable" as const };
 			});
 			const source = { runId: currentSource.runId, runAttempt: currentSource.runAttempt,

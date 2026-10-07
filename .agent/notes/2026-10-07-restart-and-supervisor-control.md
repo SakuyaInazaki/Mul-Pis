@@ -1,0 +1,15 @@
+# Restart and mission continuation control
+
+This batch repairs generic restart validation for a valid selected-artifact transition and for unknown operations created by later fresh goals in one authenticated run. The prior selected tuple is checked with its own authenticated artifact names; a new unknown operation must appear in the later run's archived goal outcomes and current checkpoint. Earlier unknown references remain quarantined.
+
+New host-authored checkpoint actions keep recoverable failures as incomplete work. A finite model completion claim cannot erase a concrete host failure or unresolved operation. The private driver carries inherited and current unknown references into the action. A process-boundary supervisor plans a fresh request only from verified terminal carry facts and a durable dispatch state. It has an injected trigger interface; the current read-only Actions job does not itself submit a successor request.
+
+Carried actions cannot relabel unread evidence or a rejected M04 draft as a fresh task. A terminal same-session repair requires a new host decision before a fresh process can run it. Cancellation origin stays unverified until a host event distinguishes an explicit user request from a platform interruption; neither state silently dispatches. Any outstanding previous launch is reconciled before completion is reported.
+
+Transport diagnostics now classify only narrowly recognized provider error codes or documented error text shapes. Ambiguous HTTP errors remain unknown. Raw provider messages and request content are excluded from these control fields. No cause class asserts a fee or authorizes replay.
+
+The private driver records an observed transport diagnostic count change and the host stage at each objective assessor/dispatch boundary. A failed read-only assessor keeps an assessor or transport retry action; a new M07 task action requires a host-observed started M07 goal. An unknown external operation still takes precedence and stays quarantined. Carried action schemas reject extra fields, including nested commands or private text.
+
+The live original-objective admission and loop interfaces now exclude monetary, elapsed-time, provider-call-count, and unchanged-round quota reasons. Old checkpoint reasons remain readable as historical observations and cannot mint a new pending action. Private M07 no longer certifies a branded legacy quota error as a local stop; an issued request without a terminal response remains UNKNOWN. A genuine terminal provider-length response still records an incomplete physical output boundary and a pending transport action. Synthetic continuation tests use explicit interruption and host integrity boundaries, without encoding a workflow attempt count.
+
+Synthetic checks cover selected tuple name changes, later-goal unknown effects, pending action safety, finite closure with host barriers, driver checkpoint union, supervisor idempotency and transport classification. No model or paid provider request was made during this change batch.

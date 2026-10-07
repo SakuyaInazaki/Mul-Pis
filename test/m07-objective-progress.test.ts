@@ -3,9 +3,10 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
-import { assessAndAdvanceOriginalObjective, createOriginalObjective, objectiveProgress,
+import { assessAndAdvanceOriginalObjective, classifyPendingAction, createOriginalObjective, objectiveProgress,
 	runOriginalObjectiveLoop, writeOriginalObjectiveContract } from "../src/m07/objective-progress.ts";
-import type { ModelObjectiveAssessmentV1, ObjectiveNextTaskV1 } from "../src/m07/objective-progress.ts";
+import type { CurrentObjectiveStopReason, ModelObjectiveAssessmentV1,
+	ObjectiveNextTaskV1 } from "../src/m07/objective-progress.ts";
 import { FakeSessionRunner, type FakeReply } from "../src/runner/fake.ts";
 import type { ReadReturnEvent, SessionSpec } from "../src/runner/types.ts";
 import { Workspace } from "../src/workspace.ts";
@@ -30,6 +31,206 @@ test("a settled length boundary stops reassessment with the original objective i
 		selectedArtifacts: ["candidate.cpp", "verification.json"], stopReason: loop.stopReason });
 	assert.equal(progress.stopReason, "output-limit");
 	assert.equal(progress.objectiveOutcome, "incomplete");
+});
+
+test("host pending actions keep routine bad verdicts, rejected drafts and transient failures automatic", () => {
+	const cases = [
+		{ reason: "assessment-invalid" as const, expected: "retry-readonly-assessment" },
+		{ reason: "model-reported-blocked" as const, expected: "retry-readonly-assessment" },
+		{ reason: "m04-draft-rejected" as const, expected: "repair-rejected-m04" },
+		{ reason: "assessment-failed" as const, expected: "retry-transport", transportFailure: true },
+	];
+	for (const row of cases) {
+		const action = classifyPendingAction(row.reason, { transportFailure: row.transportFailure });
+		assert.equal(action.author, "host");
+		assert.equal(action.kind, row.expected);
+		assert.equal(action.safety, "fresh-work-only");
+		assert.equal(action.humanRequired, undefined);
+		assert.equal(action.verifiedHumanBlocker, undefined);
+	}
+});
+
+test("unknown host effects prohibit replay and outrank a simultaneous verified input need", () => {
+	const action = classifyPendingAction("bounded-run-incomplete", {
+		unresolvedOperationRefs: ["goal/O001"],
+		verifiedHumanBlocker: { kind: "input-unavailable", verifiedBy: "host",
+			evidenceRef: "host-input-audit.json", exclusiveRequiredAction: true },
+	});
+	assert.equal(action.kind, "reconcile-m07-operation");
+	assert.equal(action.safety, "no-replay-until-reconciled");
+	assert.deepEqual(action.target?.operationRefs, ["goal/O001"]);
+	assert.equal(action.humanRequired, undefined);
+	assert.equal(classifyPendingAction("m04-transaction-unresolved", {}).kind, "reconcile-m04-transaction");
+	assert.equal(classifyPendingAction("m04-transaction-unresolved", {}).safety, "no-replay-until-reconciled");
+	const accounting = classifyPendingAction("accounting-integrity-error", { transportFailure: true });
+	assert.equal(accounting.kind, "retry-transport");
+	assert.equal(accounting.safety, "no-replay-until-reconciled");
+	assert.equal(accounting.humanRequired, undefined);
+});
+
+test("only an exclusive independently verified missing credential or input requests a person", () => {
+	for (const blocker of [
+		{ kind: "credential-unavailable" as const, expected: "refresh-auth" },
+		{ kind: "input-unavailable" as const, expected: "restore-evidence" },
+	]) {
+		const action = classifyPendingAction("assessment-failed", {
+			verifiedHumanBlocker: { kind: blocker.kind, verifiedBy: "host",
+				evidenceRef: "host-availability-check.json", exclusiveRequiredAction: true },
+		});
+		assert.equal(action.kind, blocker.expected);
+		assert.equal(action.humanRequired, true);
+		assert.equal(action.verifiedHumanBlocker?.evidenceRef, "host-availability-check.json");
+	}
+	assert.throws(() => classifyPendingAction("assessment-failed", { verifiedHumanBlocker: {
+		kind: "credential-unavailable", verifiedBy: "host", evidenceRef: "model said login needed",
+		exclusiveRequiredAction: false as true,
+	} }), /lacks host verification/);
+});
+
+test("checkpoint pending action is optional for old carries and uses the effective host stop reason", async t => {
+	const f = await fixture(t);
+	const base = { boundedRuns: [], selectedArtifacts: [], stopReason: "model-reported-blocked" as const };
+	assert.equal(objectiveProgress(f.contract, base).continuation.pendingAction, undefined);
+	const blocked = objectiveProgress(f.contract, { ...base,
+		pendingActionFacts: { evidenceRefs: ["host-capabilities.json"] } });
+	assert.equal(blocked.objectiveOutcome, "incomplete");
+	assert.equal(blocked.continuation.pendingAction?.kind, "retry-readonly-assessment");
+	assert.equal(blocked.continuation.pendingAction?.humanRequired, undefined);
+	assert.deepEqual(blocked.continuation.pendingAction?.evidenceRefs, ["host-capabilities.json"]);
+	const modelClaimsHuman = objectiveProgress(f.contract, { ...base,
+		assessment: { version: 1, decision: "blocked", rationale: "Only a human can continue",
+			evidenceRefs: [], unresolvedObligations: ["original-task"],
+			unresolvedDetails: ["Ask a person for permission"], sessionId: "assessor", model: "fake/research",
+			evidenceRead: [], unreadEvidence: [] }, pendingActionFacts: {} });
+	assert.equal(modelClaimsHuman.continuation.pendingAction?.kind, "retry-readonly-assessment");
+	assert.equal(modelClaimsHuman.continuation.pendingAction?.humanRequired, undefined);
+	const same = objectiveProgress(f.contract, { ...base, pendingAction: blocked.continuation.pendingAction });
+	assert.deepEqual(same, blocked);
+	assert.throws(() => objectiveProgress(f.contract, { ...base, pendingAction: {
+		...blocked.continuation.pendingAction!, kind: "reconcile-m07-operation", safety: "fresh-work-only",
+	} }), /safety or human gate is inconsistent/);
+	assert.throws(() => objectiveProgress(f.contract, { ...base, pendingAction: {
+		...blocked.continuation.pendingAction!, kind: "fresh-m07-task", humanRequired: true,
+	} }), /safety or human gate is inconsistent/);
+});
+
+test("model fulfilled claim cannot erase a failed dispatch or permit replay of its unknown operation", async t => {
+	const f = await fixture(t);
+	const modelClaim = { ...assessment("fulfilled"), sessionId: "assessor", model: "fake/research",
+		evidenceRead: ["original-objective.json"], unreadEvidence: [] };
+	const checkpoint = objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [],
+		assessment: modelClaim, stopReason: "dispatch-failed", unresolvedOperationIds: ["goal/O001"],
+		pendingActionFacts: { unresolvedOperationRefs: ["goal/O001"] } });
+	assert.equal(checkpoint.objectiveOutcome, "incomplete");
+	assert.equal(checkpoint.stopReason, "dispatch-failed");
+	assert.equal(checkpoint.continuation.pendingAction?.reasonCode, "dispatch-failed");
+	assert.equal(checkpoint.continuation.pendingAction?.kind, "reconcile-m07-operation");
+	assert.equal(checkpoint.continuation.pendingAction?.safety, "no-replay-until-reconciled");
+});
+
+test("finite original checks cannot close a mission while host work or effects remain unresolved", async t => {
+	const f = await fixture(t);
+	const finite = { ...f.contract, closure: "finite-evidence" as const };
+	const modelClaim = { ...assessment("fulfilled"), sessionId: "assessor", model: "fake/research",
+		evidenceRead: ["original-objective.json", "candidate.cpp", "verification.json"], unreadEvidence: [] };
+	const checked = [{ obligationId: "original-task", passed: true, evidenceRefs: ["verification.json"] }];
+	const base = { boundedRuns: [], selectedArtifacts: ["candidate.cpp", "verification.json"],
+		assessment: modelClaim, originalChecks: checked };
+	const clear = objectiveProgress(finite, { ...base, stopReason: "original-checks-unverified" });
+	assert.equal(clear.objectiveOutcome, "fulfilled");
+	for (const blocked of [
+		{ stopReason: "dispatch-failed" as const, unresolvedOperationIds: ["goal/O001"] },
+		{ stopReason: "m04-transaction-unresolved" as const },
+		{ stopReason: "assessment-failed" as const },
+		{ stopReason: "original-checks-unverified" as const,
+			pendingActionFacts: { m04TransactionUnresolved: true } },
+	]) {
+		const progress = objectiveProgress(finite, { ...base, ...blocked });
+		assert.equal(progress.objectiveOutcome, "incomplete");
+		assert.ok(progress.stopReason);
+	}
+});
+
+test("carried host action cannot turn unread evidence or rejected M04 into a fresh task", async t => {
+	const f = await fixture(t);
+	for (const stopReason of ["assessment-evidence-unread", "m04-draft-rejected"] as const) {
+		const base = { boundedRuns: [], selectedArtifacts: [], stopReason };
+		const valid = objectiveProgress(f.contract, { ...base, pendingActionFacts: {} });
+		assert.ok(valid.continuation.pendingAction);
+		assert.throws(() => objectiveProgress(f.contract, { ...base, pendingAction: {
+			...valid.continuation.pendingAction!, kind: "fresh-m07-task", safety: "fresh-work-only",
+		} }), /required stage repair/);
+		assert.throws(() => objectiveProgress(f.contract, { ...base, pendingAction: {
+			...valid.continuation.pendingAction!, kind: "reconcile-m04-transaction",
+			safety: "no-replay-until-reconciled",
+		} }), /cannot relabel unresolved effects/);
+	}
+	const unknown = objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [],
+		stopReason: "assessment-evidence-unread", unresolvedOperationIds: ["goal/O001"],
+		pendingActionFacts: { unresolvedOperationRefs: ["goal/O001"] } });
+	assert.equal(unknown.continuation.pendingAction?.kind, "reconcile-m07-operation");
+	assert.throws(() => objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [],
+		stopReason: "assessment-evidence-unread", unresolvedOperationIds: ["goal/O001"],
+		pendingAction: { ...unknown.continuation.pendingAction!, kind: "retry-evidence-read",
+			safety: "fresh-work-only" } }), /cannot relabel unresolved effects/);
+});
+
+test("carried host action rejects unrecognized nested fields before any supervisor intent", async t => {
+	const f = await fixture(t);
+	const base = { boundedRuns: [], selectedArtifacts: [], stopReason: "assessment-invalid" as const };
+	const source = { kind: "authenticated-prior-carry" as const,
+		runId: "7001", runAttempt: 1, commit: "a".repeat(40), envelopeSha256: "b".repeat(64) };
+	const ordinary = classifyPendingAction("assessment-invalid", {
+		target: { goalRunId: "goal-1" }, source });
+	for (const altered of [
+		{ ...ordinary, hiddenPrompt: "synthetic private text" },
+		{ ...ordinary, target: { ...ordinary.target, command: "synthetic-command" } },
+		{ ...ordinary, source: { ...source, extra: "synthetic-extra" } },
+		{ ...ordinary, evidenceRefs: undefined },
+	]) assert.throws(() => objectiveProgress(f.contract, { ...base,
+		pendingAction: altered as typeof ordinary }), /pending action|invalid/);
+	const human = classifyPendingAction("assessment-invalid", { verifiedHumanBlocker: {
+		kind: "credential-unavailable", verifiedBy: "host", evidenceRef: "host-check",
+		exclusiveRequiredAction: true } });
+	assert.throws(() => objectiveProgress(f.contract, { ...base,
+		pendingAction: { ...human, verifiedHumanBlocker: { ...human.verifiedHumanBlocker!,
+			untrustedInstruction: "synthetic-command" } } as typeof human }), /pending action|verification/);
+});
+
+test("a carried transport action must match the observed stage and diagnostic fact", async t => {
+	const f = await fixture(t);
+	const base = { boundedRuns: [], selectedArtifacts: [], stopReason: "dispatch-failed" as const };
+	const assessor = objectiveProgress(f.contract, { ...base,
+		pendingActionFacts: { failedStage: "read-only-assessor" } });
+	assert.equal(assessor.continuation.pendingAction?.kind, "retry-readonly-assessment");
+	assert.throws(() => objectiveProgress(f.contract, { ...base, pendingAction: {
+		...assessor.continuation.pendingAction!, kind: "fresh-m07-task",
+	} }), /observed failed stage/);
+	const transport = objectiveProgress(f.contract, { ...base,
+		pendingActionFacts: { failedStage: "read-only-assessor", transportFailure: true } });
+	assert.equal(transport.continuation.pendingAction?.kind, "retry-transport");
+	assert.throws(() => objectiveProgress(f.contract, { ...base, pendingAction: {
+		...transport.continuation.pendingAction!, transportFailure: undefined,
+	} }), /does not match/);
+});
+
+test("request-contract repair carries only the exact static host violation", async t => {
+	const f = await fixture(t);
+	const input = { boundedRuns: [], selectedArtifacts: [],
+		stopReason: "request-contract-invalid" as const,
+		pendingActionFacts: { requestContract: { violation: "orphan-tool-result" as const,
+			messageIndex: 3 } } };
+	const checkpoint = objectiveProgress(f.contract, input);
+	assert.equal(checkpoint.objectiveOutcome, "incomplete");
+	assert.equal(checkpoint.continuation.pendingAction?.kind, "repair-request-contract");
+	assert.equal(checkpoint.continuation.pendingAction?.safety, "fresh-work-only");
+	assert.deepEqual(checkpoint.continuation.pendingAction?.requestContract,
+		{ violation: "orphan-tool-result", messageIndex: 3 });
+	assert.throws(() => objectiveProgress(f.contract, { ...input, pendingActionFacts: {} }),
+		/static host violation/);
+	assert.throws(() => objectiveProgress(f.contract, { ...input,
+		pendingAction: { ...checkpoint.continuation.pendingAction!, kind: "fresh-m07-task" } }),
+		/required stage repair/);
 });
 
 async function fixture(t: TestContext) {
@@ -73,8 +274,8 @@ function ranges(f: Awaited<ReturnType<typeof fixture>>, omitted: string[] = []):
 }
 
 async function invoke(f: Awaited<ReturnType<typeof fixture>>, reply: FakeReply, options: {
-	assessmentAdmission?: "admitted" | "budget-boundary" | "time-boundary";
-	advanceAdmission?: "admitted" | "budget-boundary" | "time-boundary";
+	assessmentAdmission?: "admitted" | CurrentObjectiveStopReason;
+	advanceAdmission?: "admitted" | CurrentObjectiveStopReason;
 	supportedTaskScopes?: ObjectiveNextTaskV1["adapterScope"][];
 } = {}) {
 	const runner = new FakeSessionRunner(() => reply);
@@ -368,16 +569,16 @@ test("malformed provisional assessment still repairs unread evidence before judg
 	assert.equal([...runner.sessions.values()][0].turns, 2);
 });
 
-test("unread-evidence repair obeys admission before another assessor prompt", async t => {
+test("unread-evidence repair preserves a physical output boundary before another assessor prompt", async t => {
 	const f = await fixture(t);
 	let dispatched = false;
 	const runner = new FakeSessionRunner(() => ({ text: JSON.stringify(assessment("continue")),
 		readReturns: ranges(f, ["second-text.txt"]) }));
 	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
 		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
-		advanceAdmission: () => "budget-boundary", supportedTaskScopes: ["two-target-existing"],
+		advanceAdmission: () => "output-limit", supportedTaskScopes: ["two-target-existing"],
 		advance: async () => { dispatched = true; } });
-	assert.equal(result.stopReason, "budget-boundary");
+	assert.equal(result.stopReason, "output-limit");
 	assert.deepEqual(result.assessment?.unreadEvidence, ["second-text.txt"]);
 	assert.equal([...runner.sessions.values()][0].turns, 1);
 	assert.equal(dispatched, false);
@@ -421,7 +622,9 @@ test("finite objective closure still requires original checks and complete selec
 	assert.equal(objectiveProgress(finite, { ...input, originalChecks: [] }).objectiveOutcome, "incomplete");
 	assert.equal(objectiveProgress(finite, { ...input, assessment: { ...accepted,
 		unreadEvidence: ["verification.json"], evidenceRead: ["original-objective.json", "candidate.cpp"] } }).objectiveOutcome, "incomplete");
-	assert.equal(objectiveProgress(finite, input).objectiveOutcome, "fulfilled");
+	const fulfilled = objectiveProgress(finite, { ...input, pendingActionFacts: {} });
+	assert.equal(fulfilled.objectiveOutcome, "fulfilled");
+	assert.equal(fulfilled.continuation.pendingAction, undefined);
 });
 
 test("missing original input and changed frozen contract reject before a prompt or delegation", async t => {
@@ -448,8 +651,8 @@ test("missing original input and changed frozen contract reject before a prompt 
 	assert.equal(changedRunner.created.length, 0);
 });
 
-test("budget, time and unsupported adapter scope retain model proposal without execution", async t => {
-	for (const boundary of ["budget-boundary", "time-boundary"] as const) {
+test("real host interruption and unsupported adapter scope retain model proposal without execution", async t => {
+	for (const boundary of ["cancelled", "accounting-integrity-error"] as const) {
 		const f = await fixture(t);
 		const reply = { text: JSON.stringify(assessment("continue")), readReturns: ranges(f) };
 		const before = await invoke(f, reply, { assessmentAdmission: boundary });
@@ -457,7 +660,7 @@ test("budget, time and unsupported adapter scope retain model proposal without e
 		assert.equal(before.runner.created.length, 0);
 		assert.equal(before.advanced.length, 0);
 	}
-	for (const boundary of ["budget-boundary", "time-boundary"] as const) {
+	for (const boundary of ["cancelled", "accounting-integrity-error"] as const) {
 		const f = await fixture(t);
 		const after = await invoke(f, { text: JSON.stringify(assessment("continue")), readReturns: ranges(f) },
 			{ advanceAdmission: boundary });
@@ -473,6 +676,30 @@ test("budget, time and unsupported adapter scope retain model proposal without e
 	assert.equal(unsupported.advanced.length, 0);
 });
 
+test("a stale quota callback cannot halt a new original-objective assessment or dispatch", async t => {
+	const f = await fixture(t);
+	const runner = new FakeSessionRunner(() => ({ text: JSON.stringify(assessment("continue")),
+		readReturns: ranges(f) }));
+	let dispatched = 0;
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord),
+		assessmentAdmission: "time-boundary" as never,
+		advanceAdmission: () => "provider-call-limit" as never,
+		supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { dispatched++; return "synthetic-goal"; } });
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.equal(dispatched, 1);
+	let stepped = 0;
+	const loop = await runOriginalObjectiveLoop({ admission: () => "budget-boundary" as never,
+		step: async () => { stepped++; return { advanced: false,
+			stopReason: "model-closure-unverified" as const }; } });
+	assert.equal(stepped, 1);
+	assert.equal(loop.stopReason, "model-closure-unverified");
+	await assert.rejects(runOriginalObjectiveLoop({ admission: () => "admitted",
+		step: async () => ({ advanced: false, stopReason: "no-progress" as never }) }),
+		/retired quota boundary/);
+});
+
 test("an original objective can advance through multiple fresh assessed child attempts until a real boundary", async t => {
 	const f = await fixture(t);
 	let assessorCalls = 0;
@@ -485,19 +712,21 @@ test("an original objective can advance through multiple fresh assessed child at
 	});
 	const candidate = f.evidence.find(item => item.name === "candidate.cpp")!.file;
 	const boundedRuns: Array<{ runId: string; outcome: string }> = [];
+	const operatorCancellation = new AbortController();
 	let dispatched = 0, terminalReason: string | undefined;
-	for (let iteration = 1; iteration <= 3; iteration++) {
+	for (let iteration = 1; ; iteration++) {
 		const runRecord = iteration === 1 ? f.runRecord : await f.ws.startRun("M07Objective", []);
 		const step = await assessAndAdvanceOriginalObjective({ contract: f.contract, contractFile: f.contractFile,
 			runner, sessionSpec: { ...f.sessionSpec, label: `objective-assessor-${iteration}` }, runRecord,
 			persistReceipt: () => f.ws.writeRun(runRecord), evidenceRoot: path.join(f.root, `assessment-evidence-${iteration}`),
-			evidence: f.evidence, assessmentAdmission: iteration <= 2 ? "admitted" : "budget-boundary",
+			evidence: f.evidence, assessmentAdmission: operatorCancellation.signal.aborted ? "cancelled" : "admitted",
 			advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
 			advance: async task => {
 				dispatched++;
 				assert.equal(task.objective, `Model-proposed bounded investigation ${dispatched}`);
 				boundedRuns.push({ runId: `bounded-${dispatched}`, outcome: "fulfilled" });
 				await writeFile(candidate, `// Synthetic child candidate ${dispatched}\n`);
+				if (dispatched === 2) operatorCancellation.abort();
 				return `bounded-${dispatched}`;
 			} });
 		if (!step.advanced) { terminalReason = step.stopReason; break; }
@@ -512,34 +741,37 @@ test("an original objective can advance through multiple fresh assessed child at
 		originalInputs["candidate.cpp"]);
 	assert.equal(await readFile(path.join(f.root, "assessment-evidence-2", "candidate.cpp"), "utf8"),
 		"// Synthetic child candidate 1\n");
-	assert.equal(terminalReason, "budget-boundary");
+	assert.equal(terminalReason, "cancelled");
 	const progress = objectiveProgress(f.contract, { boundedRuns, selectedArtifacts: ["candidate.cpp"],
-		stopReason: "budget-boundary" });
+		stopReason: "cancelled" });
 	assert.equal(progress.contract.id, f.contract.id);
 	assert.equal(progress.objectiveOutcome, "incomplete");
 	assert.equal(progress.boundedRuns.length, 2);
 });
 
-test("the reusable objective loop refreshes evidence after each child and stops only at admission", async () => {
+test("the reusable objective loop refreshes evidence until an explicit cancellation", async () => {
 	let latestEvidence = "initial", attempted = 0, admissions = 0;
+	const operatorCancellation = new AbortController();
 	const result = await runOriginalObjectiveLoop({
-		admission: () => { admissions++; return admissions <= 2 ? "admitted" : "budget-boundary"; },
+		admission: () => { admissions++; return operatorCancellation.signal.aborted ? "cancelled" : "admitted"; },
 		step: async iteration => {
 			attempted++;
 			assert.equal(latestEvidence, iteration === 1 ? "initial" : "candidate-1");
 			latestEvidence = `candidate-${iteration}`;
+			if (iteration === 2) operatorCancellation.abort();
 			return { advanced: true, stopReason: "objective-reassessment-pending", evidenceRefs: [latestEvidence] };
 		} });
 	assert.equal(attempted, 2);
 	assert.equal(admissions, 3);
 	assert.equal(latestEvidence, "candidate-2");
-	assert.equal(result.stopReason, "budget-boundary");
+	assert.equal(result.stopReason, "cancelled");
 	assert.deepEqual(result.steps.map(step => step.evidenceRefs), [["candidate-1"], ["candidate-2"]]);
 });
 
-test("the reusable objective loop never repeats a terminal no-advance assessment", async () => {
+test("the reusable objective loop returns an incomplete no-advance stage to the supervisor", async () => {
 	for (const reason of ["model-reported-blocked", "model-closure-unverified",
-		"assessment-invalid", "assessment-evidence-unread", "next-task-needs-capability", "no-progress"] as const) {
+		"assessment-invalid", "assessment-evidence-unread", "next-task-needs-capability",
+		"assessment-evidence-suspended"] as const) {
 		let calls = 0;
 		const result = await runOriginalObjectiveLoop({ admission: () => "admitted",
 			step: async () => { calls++; return { advanced: false, stopReason: reason, evidenceRefs: ["observed"] }; } });
@@ -547,12 +779,16 @@ test("the reusable objective loop never repeats a terminal no-advance assessment
 		assert.equal(result.stopReason, reason);
 		assert.deepEqual(result.steps.map(step => step.evidenceRefs), [["observed"]]);
 	}
-	let admitted = 0;
-	const capacity = await runOriginalObjectiveLoop({ admission: () => ++admitted <= 70 ? "admitted" : "budget-boundary",
-		step: async iteration => ({ advanced: true, stopReason: "objective-reassessment-pending",
-			evidenceRefs: [`candidate-${iteration}`] }) });
-	assert.equal(capacity.stopReason, "budget-boundary");
-	assert.equal(capacity.steps.length, 70);
+	const operatorCancellation = new AbortController();
+	const extended = await runOriginalObjectiveLoop({
+		admission: () => operatorCancellation.signal.aborted ? "cancelled" : "admitted",
+		step: async iteration => {
+			if (iteration === 71) operatorCancellation.abort();
+			return { advanced: true, stopReason: "objective-reassessment-pending",
+				evidenceRefs: [`candidate-${iteration}`] };
+		} });
+	assert.equal(extended.stopReason, "cancelled");
+	assert.equal(extended.steps.length, 71);
 });
 
 const availableCapabilities = [

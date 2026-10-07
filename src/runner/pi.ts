@@ -27,7 +27,10 @@ import { summarizeUsage, usageEventsFromEntries } from "./usage.ts";
 import { sampleRunnerResources, sessionClosed, sessionOpened } from "./resource.ts";
 import { DeepSeekCampaignBudget, type PromptLease } from "./deepseek-campaign.ts";
 import { getConfinedCampaignFileGrantDescriptor } from "./confined-campaign-files.ts";
+import { assertDeepSeekRequestContract, DeepSeekRequestContractError,
+	type DeepSeekRequestViolation } from "./deepseek-request-contract.ts";
 import type { HostEffectScope } from "./operation-disposition.ts";
+import { certifyRequestNotSent } from "./operation-disposition.ts";
 
 /** Capture only host-observable transport facts. Never retain an Error or response body. */
 class TransportProbe {
@@ -38,12 +41,20 @@ class TransportProbe {
 	private errorCodes: string[] = [];
 	private providerErrorCode: string | null = null;
 	private providerErrorType: string | null = null;
+	private providerErrorReasonClass: NonNullable<TransportFailureDiagnostic["providerErrorReasonClass"]> = "unknown";
 	private providerRequestId: string | null = null;
+	private privateProviderError?: TransportFailureDiagnostic["privateProviderError"];
+	private requestContractViolation?: DeepSeekRequestViolation;
+	private requestContractMessageIndex?: number | null;
+	private wholePromptNotIssued = false;
+	private readonly privateSanitize?: (value: string) => string | null;
 	private dropPendingBody?: () => void;
 
 	readonly fetch: typeof globalThis.fetch;
 
-	constructor(fetchImplementation: typeof globalThis.fetch = globalThis.fetch) {
+	constructor(fetchImplementation: typeof globalThis.fetch = globalThis.fetch,
+		privateSanitize?: (value: string) => string | null) {
+		this.privateSanitize = privateSanitize;
 		this.fetch = async (input, init) => {
 			this.phase = "request";
 			this.responseStarted = false;
@@ -102,9 +113,28 @@ class TransportProbe {
 			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
 			const error = (parsed as { error?: unknown }).error;
 			if (!error || typeof error !== "object" || Array.isArray(error)) return;
-			const { code, type } = error as { code?: unknown; type?: unknown };
+			const { code, type, message, param } = error as {
+				code?: unknown; type?: unknown; message?: unknown; param?: unknown };
 			if (typeof code === "string" && SAFE_PROVIDER_ERROR_CODES.has(code)) this.providerErrorCode = code;
 			if (typeof type === "string" && SAFE_PROVIDER_ERROR_TYPES.has(type)) this.providerErrorType = type;
+			this.providerErrorReasonClass = classifyProviderErrorReason(this.providerErrorCode, this.providerErrorType, message);
+			if (this.privateSanitize) {
+				const scrub = (value: unknown): string | null => {
+					if (typeof value !== "string") return null;
+					try {
+						const clean = this.privateSanitize!(value);
+						return typeof clean === "string" && !clean.includes("\0") &&
+							Buffer.byteLength(clean, "utf8") <= MAX_PRIVATE_ERROR_FIELD_BYTES ? clean : null;
+					} catch { return null; }
+				};
+				const numericLimits: Record<string, number> = {};
+				for (const key of PRIVATE_ERROR_NUMBER_KEYS) {
+					const value = (error as Record<string, unknown>)[key];
+					if (Number.isSafeInteger(value) && Number(value) >= 0) numericLimits[key] = Number(value);
+				}
+				this.privateProviderError = { code: scrub(code), type: scrub(type),
+					message: scrub(message), param: scrub(param), numericLimits };
+			}
 		} catch { /* Malformed JSON is unavailable metadata, never a provider classification. */ }
 	}
 
@@ -124,6 +154,12 @@ class TransportProbe {
 			current = fields.cause;
 		}
 	}
+	captureRequestContractError(error: unknown, wholePromptNotIssued: boolean): void {
+		if (!(error instanceof DeepSeekRequestContractError)) return;
+		this.requestContractViolation = error.violation;
+		this.requestContractMessageIndex = error.messageIndex;
+		this.wholePromptNotIssued = wholePromptNotIssued;
+	}
 
 	failure(promptIndex: number, abortSource: TransportFailureDiagnostic["abortSource"], requestId?: string): TransportFailureDiagnostic {
 		this.dropPendingBody?.();
@@ -131,11 +167,20 @@ class TransportProbe {
 		return { version: 1, promptIndex, ...(requestId ? { requestId } : {}), phase: this.phase,
 			httpStatus: this.httpStatus, responseStarted: this.responseStarted, bytesRead: this.bytesRead,
 			abortSource, providerErrorCode: this.providerErrorCode, providerErrorType: this.providerErrorType,
-			providerRequestId: this.providerRequestId, errorCodes: [...this.errorCodes] };
+			providerErrorReasonClass: this.providerErrorReasonClass,
+			providerRequestId: this.providerRequestId, errorCodes: [...this.errorCodes],
+			...(this.privateProviderError ? { privateProviderError: this.privateProviderError } : {}),
+			...(this.requestContractViolation ? { requestContractViolation: this.requestContractViolation,
+				requestContractMessageIndex: this.requestContractMessageIndex ?? null,
+				attemptedRequestNotSent: true as const,
+				...(this.wholePromptNotIssued ? { wholePromptNotIssued: true as const } : {}) } : {}) };
 	}
 }
 
 const MAX_ERROR_METADATA_JSON_BYTES = 8_192;
+const MAX_PRIVATE_ERROR_FIELD_BYTES = 4_000;
+const PRIVATE_ERROR_NUMBER_KEYS = ["max_context_tokens", "context_window", "prompt_tokens",
+	"completion_tokens", "max_tokens", "requested_tokens", "allowed_tokens"] as const;
 const JSON_CONTENT_TYPE = /^application\/(?:json|[a-z0-9.+-]+\+json)(?:\s*;|$)/i;
 const SAFE_REQUEST_ID = /^(?:[0-9a-f]{16,64}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 const SAFE_PROVIDER_ERROR_TYPES = new Set([
@@ -145,6 +190,18 @@ const SAFE_PROVIDER_ERROR_CODES = new Set([
 	"invalid_request_error", "invalid_format", "invalid_parameter", "invalid_api_key", "model_not_found",
 	"context_length_exceeded", "rate_limit_exceeded", "insufficient_quota", "content_filter",
 ]);
+
+/** Provider error text is untrusted and may echo a prompt. Use only a documented,
+ * complete error sentence, never a substring match, and discard the text. */
+function classifyProviderErrorReason(code: string | null, type: string | null, message: unknown):
+	NonNullable<TransportFailureDiagnostic["providerErrorReasonClass"]> {
+	if (code === "context_length_exceeded") return "context-window";
+	if (code === "invalid_format" || code === "invalid_parameter") return "input-schema";
+	if (type === "invalid_request_error" &&
+		message === "The reasoning_content in the thinking mode must be passed back to the API.")
+		return "tool-reasoning";
+	return "unknown";
+}
 
 const SAFE_ERROR_CODES = new Set([
 	"ECONNRESET", "ECONNREFUSED", "ECONNABORTED", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EPIPE",
@@ -170,6 +227,8 @@ export interface PiSessionRunnerOptions {
 	signal?: AbortSignal;
 	/** Shared by every builder, reviewer, and resumed handle in one in-process campaign. */
 	campaignBudget?: DeepSeekCampaignBudget;
+	/** Only the encrypted private result receives these credential-redacted provider fields. */
+	sanitizePrivateProviderError?: (value: string) => string | null;
 }
 
 interface MaterialTools {
@@ -861,11 +920,10 @@ export class PiSessionRunner implements SessionRunner {
 		let strictPayloadChecks = 0;
 		let currentLease: PromptLease | undefined;
 		let currentRequestIds: string[] = [];
-		let certifiedLocalStop: HarnessError | undefined;
-		let certifiedNotIssued: HarnessError | undefined;
 		let certifiedEffectScope: HostEffectScope | undefined;
 		const transportDiagnostics: TransportFailureDiagnostic[] = [];
 		const signal = this.options.signal;
+		const sanitizePrivateProviderError = this.options.sanitizePrivateProviderError;
 		let abortedByHandle = false;
 		let promptIndex = 0;
 		const requestRuntime = new Proxy(resolved.modelRuntime, {
@@ -889,7 +947,8 @@ export class PiSessionRunner implements SessionRunner {
 				const lease = currentLease;
 					const requestIds = currentRequestIds;
 					let requestId: string | undefined;
-					const probe = campaign ? new TransportProbe(options?.fetch ?? globalThis.fetch) : undefined;
+					const probe = campaign ? new TransportProbe(options?.fetch ?? globalThis.fetch,
+						sanitizePrivateProviderError) : undefined;
 					let failureRecorded = false;
 					const recordFailure = (): void => {
 						if (!probe || failureRecorded) return;
@@ -938,6 +997,13 @@ export class PiSessionRunner implements SessionRunner {
 								...(hasCompletionMax ? { max_completion_tokens: outputCap } : {}) } : payload;
 							const serialized = JSON.stringify(outgoing);
 							if (typeof serialized !== "string") throw new HarnessError("runner.model", "provider payload could not be serialized for reservation");
+							if (campaign) try { assertDeepSeekRequestContract(serialized,
+								{ sourceMessages: context.messages }); }
+							catch (error) {
+								probe?.captureRequestContractError(error, Boolean(lease) &&
+									currentRequestIds.length === 0 && campaign.requestCount(lease!) === 0);
+								recordFailure(); throw error;
+							}
 							const bytes = Buffer.byteLength(serialized, "utf8");
 							if (strict.maxInputPayloadBytes !== undefined && bytes > strict.maxInputPayloadBytes) throw new HarnessError("runner.model", "strict request input payload exceeds reserved byte cap");
 							if (campaign) {
@@ -961,8 +1027,6 @@ export class PiSessionRunner implements SessionRunner {
 					const failStream = (error: unknown): void => {
 						probe?.captureErrorCodes(error);
 						recordFailure();
-						certifiedLocalStop ??= campaign.certifySettledLocalBudgetStop(lease, certifiedEffectScope);
-						certifiedNotIssued ??= campaign.certifyLocalNotIssued(lease, certifiedEffectScope);
 						campaign.failPrompt(lease);
 						outer.push({ type: "error", reason: "error", error: { ...latest, stopReason: "error", errorMessage: "provider stream failed" } });
 						outer.end();
@@ -991,8 +1055,6 @@ export class PiSessionRunner implements SessionRunner {
 							}
 							if (event.type === "error") { terminal = true; latest = event.error;
 								recordFailure();
-								certifiedLocalStop ??= campaign.certifySettledLocalBudgetStop(lease, certifiedEffectScope);
-								certifiedNotIssued ??= campaign.certifyLocalNotIssued(lease, certifiedEffectScope);
 								campaign.failPrompt(lease); }
 							outer.push(event);
 						}
@@ -1126,8 +1188,6 @@ export class PiSessionRunner implements SessionRunner {
 				const thisPrompt = promptIndex + 1;
 				currentLease = campaign?.beginPrompt(ref.id, `${thisPrompt}-${randomUUID()}`);
 				currentRequestIds = [];
-				certifiedLocalStop = undefined;
-				certifiedNotIssued = undefined;
 				promptActive = true;
 				checkpointState.active = true;
 				checkpointState.completed = false;
@@ -1175,10 +1235,6 @@ export class PiSessionRunner implements SessionRunner {
 					promptOutcome = "completed";
 					return result;
 				} catch (error) {
-					const localStop = campaign && currentLease && !signal?.aborted && !abortedByHandle
-						? certifiedLocalStop ?? campaign.certifySettledLocalBudgetStop(currentLease, certifiedEffectScope) : undefined;
-					const localNotIssued = campaign && currentLease && !signal?.aborted && !abortedByHandle
-						? certifiedNotIssued ?? campaign.certifyLocalNotIssued(currentLease, certifiedEffectScope) : undefined;
 					const lengthStop = campaign && currentLease && !signal?.aborted && !abortedByHandle &&
 						error instanceof HarnessError && error.code === "runner.stop" && /stopReason=length/.test(error.message)
 						? campaign.certifySettledTerminalResponse(currentLease, certifiedEffectScope) : undefined;
@@ -1190,7 +1246,14 @@ export class PiSessionRunner implements SessionRunner {
 						throw new HarnessError("runner.stop", `session ${spec.label} was aborted during prompt${detail}`);
 					}
 					if (signal?.aborted || abortedByHandle) promptOutcome = "aborted";
-					if (localStop || localNotIssued || lengthStop) throw localStop ?? localNotIssued ?? lengthStop;
+					if (lengthStop) throw lengthStop;
+					const preflight = transportDiagnostics.find((item) => item.promptIndex === thisPrompt &&
+						item.wholePromptNotIssued === true && item.requestContractViolation !== undefined);
+					if (campaign && currentLease && currentRequestIds.length === 0 &&
+						campaign.requestCount(currentLease) === 0 && preflight?.requestContractViolation && certifiedEffectScope)
+						throw certifyRequestNotSent({ requestNotSent: true, noProviderRequestsInPrompt: true,
+							effectScope: certifiedEffectScope, violation: preflight.requestContractViolation,
+							messageIndex: preflight.requestContractMessageIndex ?? null });
 					if (campaign && transportDiagnostics.some((item) => item.promptIndex === thisPrompt))
 						throw new HarnessError("runner.stop", `session ${spec.label} provider request failed (redacted transport diagnostics available)`);
 					throw error;
@@ -1222,8 +1285,6 @@ export class PiSessionRunner implements SessionRunner {
 					} finally {
 						currentLease = undefined;
 						currentRequestIds = [];
-						certifiedLocalStop = undefined;
-						certifiedNotIssued = undefined;
 					}
 				}
 				}
@@ -1233,7 +1294,10 @@ export class PiSessionRunner implements SessionRunner {
 			readReturnEvents: () => [...materialTools.readReturns],
 			usageEvents: () => [...usageEvents],
 			usageSummary: () => summarizeUsage(usageEvents),
-			transportDiagnostics: () => transportDiagnostics.map((item) => ({ ...item, errorCodes: [...item.errorCodes] })),
+			transportDiagnostics: () => transportDiagnostics.map((item) => ({ ...item,
+				errorCodes: [...item.errorCodes],
+				...(item.privateProviderError ? { privateProviderError: { ...item.privateProviderError,
+					numericLimits: { ...item.privateProviderError.numericLimits } } } : {}) })),
 			toolLog: () => [...toolLog],
 			abort: async () => {
 				if (disposed || abortedByHandle) return;

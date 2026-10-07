@@ -244,7 +244,14 @@ export class DeepSeekCampaignBudget {
 		return lease;
 	}
 
-	/** Largest cap this exact serialized payload can afford, including the margin and all prior holds. */
+	/** Host-only proof of whether this exact prompt leased any provider request. */
+	requestCount(lease: PromptLease): number {
+		const state = this.leases.get(lease);
+		if (!state) throw new HarnessError("runner.campaign", "prompt lease is unavailable");
+		return state.requests.length;
+	}
+
+	/** Estimated upper exposure for this request when a native price profile is valid; observation only. */
 	private worstCny(payloadBytes: number, maxOutputTokens: number): number {
 		return (payloadBytes * Math.max(this.rates.input, this.rates.cacheRead) +
 			(maxOutputTokens + this.limits.outputAccountingMarginTokens) * this.rates.output) / 1_000_000;
@@ -279,16 +286,6 @@ export class DeepSeekCampaignBudget {
 			status: "reserved" as const };
 		state.requests.push(request);
 		this.auditRequests.push(request);
-	}
-
-	/** Certified only for an unsent first request in a live prompt and safe tool scope. */
-	certifyLocalNotIssued(_lease: PromptLease, _effectScope: HostEffectScope | undefined): HarnessError | undefined {
-		return undefined;
-	}
-
-	/** Evidence is limited to this live lease; no caller-created status can certify it. */
-	certifySettledLocalBudgetStop(_lease: PromptLease, _effectScope: HostEffectScope | undefined): HarnessError | undefined {
-		return undefined;
 	}
 
 	/** A received length response is incomplete, even when every provider charge is settled. */

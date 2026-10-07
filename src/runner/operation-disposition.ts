@@ -1,4 +1,5 @@
 import { HarnessError } from "../types.ts";
+import type { DeepSeekRequestViolation } from "./deepseek-request-contract.ts";
 
 /** Exact host-verified tool scope permitted to settle a whole prompt disposition. */
 export type HostEffectScope = "no-tools" | "factory-attested-confined-file-tools";
@@ -32,9 +33,49 @@ export interface SettledTerminalResponseDetails {
 	readonly effectScope: HostEffectScope;
 }
 
+/** A final serialized DeepSeek request failed a static host check before any
+ * provider request in this prompt. This never settles an earlier issued call. */
+export interface RequestNotSentDetails {
+	readonly requestNotSent: true;
+	readonly noProviderRequestsInPrompt: true;
+	readonly effectScope: HostEffectScope;
+	readonly violation: DeepSeekRequestViolation;
+	readonly messageIndex: number | null;
+}
+
+const REQUEST_VIOLATIONS: ReadonlySet<string> = new Set([
+	"request-shape", "message-shape", "tool-call-shape", "duplicate-tool-call",
+	"orphan-tool-result", "duplicate-tool-result", "incomplete-tool-results",
+	"thinking-tool-choice", "missing-reasoning", "unsigned-reasoning",
+	"reasoning-replay-mismatch",
+]);
+
 const localStops = new WeakMap<object, SettledLocalAdmissionStopDetails>();
 const terminalResponses = new WeakMap<object, SettledTerminalResponseDetails>();
 const localNotIssued = new WeakMap<object, LocalNotIssuedDetails>();
+const requestNotSent = new WeakMap<object, RequestNotSentDetails>();
+
+/** Brand only the runner's verified zero-request preflight disposition. The
+ * fixed message and copied control fields cannot disclose request contents. */
+export function certifyRequestNotSent(details: RequestNotSentDetails): HarnessError {
+	if (details.requestNotSent !== true || details.noProviderRequestsInPrompt !== true ||
+		(details.effectScope !== "no-tools" &&
+			details.effectScope !== "factory-attested-confined-file-tools") ||
+		!REQUEST_VIOLATIONS.has(details.violation) ||
+		(details.messageIndex !== null &&
+			(!Number.isSafeInteger(details.messageIndex) || details.messageIndex < 0)))
+		throw new HarnessError("runner.request-contract", "invalid host request preflight disposition");
+	const error = new HarnessError("runner.request-contract.not-issued",
+		"DeepSeek request contract rejected before provider transport");
+	requestNotSent.set(error, Object.freeze({ requestNotSent: true,
+		noProviderRequestsInPrompt: true, effectScope: details.effectScope,
+		violation: details.violation, messageIndex: details.messageIndex }));
+	return error;
+}
+
+export function requestNotSentDetails(error: unknown): RequestNotSentDetails | undefined {
+	return error !== null && typeof error === "object" ? requestNotSent.get(error) : undefined;
+}
 
 /** Call only after the owning runner verifies the first request was refused before transport. */
 export function certifyLocalNotIssued(details: LocalNotIssuedDetails, message: string): HarnessError {

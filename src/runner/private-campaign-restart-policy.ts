@@ -192,11 +192,22 @@ function reviewSelectedTransition(bundle: Readonly<Record<string, string>>, chec
 		reject("new selected tuple lacks an authenticated accepted goal");
 	const prior = history.entries.filter((row: any) => row?.goalRunId === last.prior.selectedRunId &&
 		row?.taskId === last.prior.selectedTaskId && record(row.files));
-	if (prior.length !== 1 ||
-		selected.some(name => typeof prior[0].files[name] !== "string") ||
-		sha256(JSON.stringify(selected.slice().sort().map(name => ({ name,
+	const lastIndex = ancestry.findIndex(row => sourceMatches(row.source, last.prior.source) &&
+		row.envelopeSha256 === last.prior.envelopeSha256);
+	const firstTransition = transitions?.find(row => ancestry.findIndex(item =>
+		sourceMatches(item.source, row.source) && item.envelopeSha256 === row.envelopeSha256) > lastIndex);
+	// The predecessor can have a historically valid three-file tuple while the
+	// new registered selection includes a plan. Bind to the old names recorded
+	// in the authenticated transition, never hash old bytes using new names.
+	const nameCandidates = [firstTransition?.priorSelectedArtifacts, selected,
+		["candidate.cpp", "verification.json", "workflow-archive.json"]]
+		.filter((names): names is string[] => Array.isArray(names) && names.length > 0);
+	const priorTupleMatches = prior.length === 1 && nameCandidates.some(names =>
+		new Set(names).size === names.length && names.every(name => typeof prior[0].files[name] === "string") &&
+		sha256(JSON.stringify([...names].sort().map(name => ({ name,
 			sha256: sha256(prior[0].files[name]),
-			bytes: Buffer.byteLength(prior[0].files[name], "utf8") })))) !== last.prior.selectedTupleSha256)
+			bytes: Buffer.byteLength(prior[0].files[name], "utf8") })))) === last.prior.selectedTupleSha256);
+	if (!priorTupleMatches)
 		reject("prior selected tuple is absent from authenticated history");
 }
 function sourceMatches(a: Source, b: Source): boolean {
@@ -273,11 +284,6 @@ function reviewChain(input: PrivateCampaignEffectReviewInput, checkpoint: Object
 				reject("historical v3 accounting observation was lost or rewritten");
 			priorV3Accounting = observed as AuthenticatedAccountingObservation;
 		}
-		if (index > 0 && refs.filter(ref => !priorRefs.includes(ref)).some(ref =>
-			!precedingBindingGoal || !ref.startsWith(`${precedingBindingGoal}/`) ||
-			!runById.get(precedingBindingGoal)?.unresolvedOperationIds?.includes(
-				ref.slice(precedingBindingGoal.length + 1))))
-			reject("historical unknown operation was not introduced by the preceding bound goal");
 		const sourcePositions = ancestry.map((row, position) => ({ row, position })).filter(row =>
 			sourceMatches(row.row.source, source) && row.row.envelopeSha256 === receipt.prior.envelopeSha256);
 		if (sourcePositions.length !== 1 || sourcePositions[0].position <= priorAncestryIndex)
@@ -298,6 +304,23 @@ function reviewChain(input: PrivateCampaignEffectReviewInput, checkpoint: Object
 			(precedingBindingGoal !== undefined &&
 				!historicalGoals.some(row => row.runId === precedingBindingGoal))))
 			reject("historical goal outcomes changed after quarantine");
+		if (index > 0) {
+			const newlyUnknown = refs.filter(ref => !priorRefs.includes(ref));
+			const newlyRecordedGoals = historicalGoals?.slice(priorGoalPrefix.length).map(row => row.runId) ?? [];
+			// The preceding Actions run can create several fresh linked M07 goals.
+			// Its first goal is bound to the previous reservation; a later goal may
+			// carry the newly unknown operation. The AEAD goal-prefix extension and
+			// original controller checkpoint retain its actual goal/op identity.
+			if ((newlyRecordedGoals.length || newlyUnknown.length) &&
+				(!precedingBindingGoal || !newlyRecordedGoals.includes(precedingBindingGoal)) ||
+				newlyUnknown.some(ref => {
+					const split = ref.lastIndexOf("/");
+					const goalRunId = ref.slice(0, split), operationId = ref.slice(split + 1);
+					return !newlyRecordedGoals.includes(goalRunId) ||
+						!runById.get(goalRunId)?.unresolvedOperationIds?.includes(operationId);
+				}))
+				reject("historical unknown operation was not introduced by the preceding authenticated run");
+		}
 		if (historicalGoals) priorGoalPrefix = historicalGoals.map(row => row.runId);
 		const receiptSha = sha256(JSON.stringify(receipt));
 		const matches = bindings.map((binding, bindingIndex) => ({ binding, bindingIndex })).filter(row =>
@@ -316,7 +339,7 @@ function reviewChain(input: PrivateCampaignEffectReviewInput, checkpoint: Object
 			usedGoals.add(binding.goalRunId);
 			usedBindings.add(bindingIndex);
 			precedingBindingGoal = binding.goalRunId;
-		}
+		} else precedingBindingGoal = undefined;
 		for (const ref of refs) if (!provenance.has(ref)) provenance.set(ref, {
 			sourceCommit: source.commit,
 			evidenceSha256: sha256(JSON.stringify({ receiptSha, operationRef: ref })) });

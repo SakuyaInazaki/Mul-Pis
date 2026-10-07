@@ -231,10 +231,21 @@ test("actual cancellation replaces stale reassessment while historical timeout r
 		boundedRuns: [{ runId: run.runId, outcome: "fulfilled" }], selectedArtifacts: [],
 		stopReason: "time-boundary",
 	}));
+	const legacyBytes = await readFile(path.join(outputDir, "objective-checkpoint.json"), "utf8");
+	const historicalRecord = path.join(root, "sealed-prior-checkpoint.json");
+	await writeFile(historicalRecord, legacyBytes);
 	await offlineChecks.salvageObjectiveCheckpoint(ws, outputDir, undefined, false);
-	const historical = JSON.parse(await readFile(path.join(outputDir, "objective-checkpoint.json"), "utf8")) as
-		{ stopReason: string };
-	assert.equal(historical.stopReason, "time-boundary");
+	const active = JSON.parse(await readFile(path.join(outputDir, "objective-checkpoint.json"), "utf8")) as
+		{ stopReason: string; objectiveOutcome: string; boundedRuns: Array<{ runId: string }>;
+			continuation: { pendingAction?: { kind: string } } };
+	assert.equal(active.stopReason, "bounded-run-incomplete",
+		"a decoded historical time quota cannot become the new run's stop policy");
+	assert.equal(active.objectiveOutcome, "incomplete");
+	assert.deepEqual(active.boundedRuns.map(item => item.runId), [run.runId]);
+	assert.equal(active.continuation.pendingAction?.kind, "fresh-m07-task");
+	assert.equal(await readFile(historicalRecord, "utf8"), legacyBytes);
+	assert.equal(JSON.parse(legacyBytes).stopReason, "time-boundary",
+		"the frozen prior record remains readable without rewriting its historical reason");
 	await writeObjectiveProgress(path.join(outputDir, "objective-checkpoint.json"), objectiveProgress(contract, {
 		boundedRuns: [{ runId: run.runId, outcome: "fulfilled" }], selectedArtifacts: [],
 		stopReason: "objective-reassessment-pending",
