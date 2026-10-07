@@ -5,7 +5,8 @@ import path from "node:path";
 import test from "node:test";
 import { createAgentSession, ModelRuntime, type CreateAgentSessionOptions } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type Model } from "@earendil-works/pi-ai";
-import { DeepSeekCampaignBudget, type DeepSeekCampaignLimits } from "../../src/runner/deepseek-campaign.ts";
+import { DeepSeekCampaignBudget, type ContextWindowRejectionProof,
+	type DeepSeekCampaignLimits } from "../../src/runner/deepseek-campaign.ts";
 import { verifyDeepSeekCnyBilling } from "../../src/runner/deepseek-cny-pricing.ts";
 import { verifyDeepSeekProviderOutputLimit } from "../../src/runner/deepseek-provider-limits.ts";
 import { createConfinedCampaignFileTools } from "../../src/runner/confined-campaign-files.ts";
@@ -342,6 +343,139 @@ function reported(id: string, promptIndex = 1, input = 10, stopReason = "stop") 
 		usage: { input, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: input + 4, cost: 0.0000078 },
 		status: "reported" as const, costStatus: "priced" as const, costSource: "sdk-estimate" as const };
 }
+
+const CONTEXT_PROOF: ContextWindowRejectionProof = {
+	httpStatus: 400, contextWindow: 10_000, messagesTokens: 9_990,
+	completionTokens: 20, requestedTokens: 10_010, allowedCompletionTokens: 10,
+};
+
+test("a certified context rejection and its corrected retry remain separate transport observations", () => {
+	const budget = new DeepSeekCampaignBudget(LIMITS);
+	const lease = budget.beginPrompt("session", "context-retry");
+	budget.reserve(lease, 12_000, "first", 20);
+	budget.recordContextRejected(lease, "first", CONTEXT_PROOF);
+	let audit = budget.requestAccountingAuditSnapshot();
+	assert.equal(audit.requests[0].responseReceived, true);
+	assert.equal(audit.requests[0].status, "unknown");
+	assert.equal(audit.requests[0].contextRejected, true);
+	assert.deepEqual(audit.requests[0].contextOverflow, {
+		contextWindow: 10_000, messagesTokens: 9_990, completionTokens: 20,
+		requestedTokens: 10_010, allowedCompletionTokens: 10,
+	});
+	assert.equal(audit.requests[0].reportedUsage, null);
+	budget.reserveContextRetry(lease, 11_997, "retry", 10, "first", CONTEXT_PROOF);
+	budget.finishPrompt(lease, [{ requestId: "retry", event: reported("retry-assistant") }]);
+	audit = budget.requestAccountingAuditSnapshot();
+	assert.equal(budget.snapshot().reservations, 2);
+	assert.deepEqual(audit.requests.map((row) => row.responseReceived), [true, true]);
+	assert.deepEqual(audit.requests.map((row) => row.status), ["unknown", "unknown"]);
+	assert.equal(audit.requests[0].retryOfRequestId, undefined);
+	assert.equal(audit.requests[0].contextRejected, true);
+	assert.equal(audit.requests[1].retryOfRequestId, "first");
+	assert.equal(audit.requests[1].contextRejected, undefined);
+	assert.equal(audit.requests[1].contextOverflow, undefined);
+	assert.equal(audit.requests[1].maxOutputTokens, 10);
+	assert.deepEqual(budget.requestAuditSnapshot().requests.map((row) => row.admissionDecision),
+		["provider-maximum", "reduced-output"]);
+	assert.equal(budget.snapshot().stopped, false);
+});
+
+test("context retry requires an exact matching provider proof, lower cap and unique request ID", () => {
+	for (const variant of [
+		{ proof: { ...CONTEXT_PROOF, httpStatus: 401 as 400 }, cap: 10, newId: "retry" },
+		{ proof: { ...CONTEXT_PROOF, messagesTokens: 9_989 }, cap: 10, newId: "retry" },
+		{ proof: CONTEXT_PROOF, cap: 9, newId: "retry" },
+		{ proof: CONTEXT_PROOF, cap: 10, newId: "first" },
+	]) {
+		const budget = new DeepSeekCampaignBudget(LIMITS);
+		const lease = budget.beginPrompt("session", "1");
+		budget.reserve(lease, 12_000, "first");
+		budget.recordContextRejected(lease, "first", CONTEXT_PROOF);
+		assert.throws(() => budget.reserveContextRetry(lease, 11_997, variant.newId,
+			variant.cap, "first", variant.proof));
+		assert.equal(budget.snapshot().reservations, 1);
+		assert.equal(budget.requestAccountingAuditSnapshot().requests[0].status, "unknown");
+	}
+	const budget = new DeepSeekCampaignBudget(LIMITS);
+	const lease = budget.beginPrompt("session", "1");
+	budget.reserve(lease, 12_000, "first");
+	assert.throws(() => budget.recordContextRejected(lease, "first",
+		{ ...CONTEXT_PROOF, contextWindow: 9_999 }), /does not match/);
+	assert.equal(budget.snapshot().reservations, 1);
+});
+
+test("a context rejection cannot masquerade as an assistant receipt or a completed prompt", () => {
+	const budget = new DeepSeekCampaignBudget(LIMITS);
+	const lease = budget.beginPrompt("session", "1");
+	budget.reserve(lease, 12_000, "first");
+	budget.recordContextRejected(lease, "first", CONTEXT_PROOF);
+	budget.reserveContextRetry(lease, 11_997, "retry", 10, "first", CONTEXT_PROOF);
+	assert.throws(() => budget.finishPrompt(lease, [
+		{ requestId: "first", event: reported("forged-assistant") },
+	]), /incomplete or exceeds/);
+	assert.deepEqual(budget.requestAccountingAuditSnapshot().requests.map((row) => row.status),
+		["unknown", "unknown"]);
+	assert.equal(budget.snapshot().stopReason, "usage-reconciliation");
+});
+
+test("a certified context rejection remains received and unknown when no corrected request is sent", () => {
+	const budget = new DeepSeekCampaignBudget(LIMITS);
+	const lease = budget.beginPrompt("session", "rejected-only");
+	budget.reserve(lease, 12_000, "first");
+	budget.recordContextRejected(lease, "first", CONTEXT_PROOF);
+	budget.failPrompt(lease);
+	const rows = budget.requestAccountingAuditSnapshot().requests;
+	assert.equal(rows.length, 1);
+	assert.equal(rows[0].status, "unknown");
+	assert.equal(rows[0].responseReceived, true);
+	assert.equal(rows[0].contextRejected, true);
+	assert.deepEqual(rows[0].contextOverflow, {
+		contextWindow: CONTEXT_PROOF.contextWindow,
+		messagesTokens: CONTEXT_PROOF.messagesTokens,
+		completionTokens: CONTEXT_PROOF.completionTokens,
+		requestedTokens: CONTEXT_PROOF.requestedTokens,
+		allowedCompletionTokens: CONTEXT_PROOF.allowedCompletionTokens,
+	});
+});
+
+test("a context retry can finish with an assistant whose fee usage remains unknown", () => {
+	const budget = new DeepSeekCampaignBudget(LIMITS);
+	const lease = budget.beginPrompt("session", "unknown-fee-retry");
+	budget.reserve(lease, 12_000, "first");
+	budget.recordContextRejected(lease, "first", CONTEXT_PROOF);
+	budget.reserveContextRetry(lease, 11_997, "retry", 10, "first", CONTEXT_PROOF);
+	budget.finishPrompt(lease, [{ requestId: "retry", event: {
+		...reported("assistant-unknown-fee"), status: "unknown", costStatus: "unknown", costSource: "unknown",
+	} }]);
+	const rows = budget.requestAccountingAuditSnapshot().requests;
+	assert.equal(rows.length, 2);
+	assert.deepEqual(rows.map((row) => row.status), ["unknown", "unknown"]);
+	assert.equal(rows[0].responseReceived, true);
+	assert.equal(rows[1].reportedUsage?.totalTokens, 14);
+	assert.equal(budget.snapshot().stopped, false);
+});
+
+test("a priced context rejection retains its full unknown hold after a separately priced retry", async () => {
+	const price = await verifyDeepSeekCnyBilling({ apiKey: "synthetic", now: () => new Date("2026-10-06T11:20:00.000Z"),
+		request: async () => new Response(JSON.stringify({ is_available: true, balance_infos: [{ currency: "CNY",
+			total_balance: "PRIVATE", granted_balance: "PRIVATE", topped_up_balance: "PRIVATE" }] }), { status: 200 }) });
+	const budget = new DeepSeekCampaignBudget({ ...LIMITS, nativeCnyPricing: price });
+	const lease = budget.beginPrompt("session", "priced-context-retry");
+	budget.reserve(lease, 12_000, "first");
+	const firstHold = budget.snapshot().inFlightReservedCny;
+	assert(firstHold > 0);
+	budget.recordContextRejected(lease, "first", CONTEXT_PROOF);
+	assert.equal(budget.snapshot().unknownReservedCny, firstHold);
+	budget.reserveContextRetry(lease, 11_997, "retry", 10, "first", CONTEXT_PROOF);
+	assert(budget.snapshot().inFlightReservedCny > 0);
+	budget.finishPrompt(lease, [{ requestId: "retry", event: reported("priced-retry") }]);
+	assert.equal(budget.snapshot().unknownReservedCny, firstHold);
+	assert(budget.snapshot().settledCny > 0);
+	const rows = budget.requestAccountingAuditSnapshot().requests;
+	assert.deepEqual(rows.map((row) => row.status), ["unknown", "settled"]);
+	assert.equal(rows[0].unknownObservedCny, firstHold);
+	assert(rows[1].settledCny! > 0);
+});
 
 test("parallel branch leases reconcile independently without retired call quotas", () => {
 	const budget = new DeepSeekCampaignBudget({ ...LIMITS, maxProviderCalls: 3, maxProviderCallsPerPrompt: 2, maxCny: 1 });

@@ -210,14 +210,34 @@ function campaignObjectiveProgress(contract: OriginalObjectiveContractV1, inheri
 			...input.pendingActionFacts, unresolvedOperationRefs: unresolvedOperationIds } }) });
 }
 function observedTransportActionFacts(stopReason: CurrentObjectiveStopReason,
-	diagnosticsBefore: number, diagnosticsAfter: number,
+	diagnostics: readonly TransportFailureDiagnostic[],
+	requestAudit: ReturnType<DeepSeekCampaignBudget["requestAccountingAuditSnapshot"]>,
 	failedStage: "read-only-assessor" | "m07-execution"): HostPendingActionFactsV1 {
-	if (!Number.isSafeInteger(diagnosticsBefore) || !Number.isSafeInteger(diagnosticsAfter) ||
-		diagnosticsBefore < 0 || diagnosticsAfter < diagnosticsBefore)
-		fail("transport diagnostic cursor is invalid");
 	if (stopReason !== "assessment-failed" && stopReason !== "dispatch-failed") return {};
+	const byId = new Map(requestAudit.requests.map(request => [request.requestId, request]));
+	const successors = new Map<string, (typeof requestAudit.requests)[number]>();
+	for (const request of requestAudit.requests) {
+		if (request.retryOfRequestId && byId.has(request.retryOfRequestId))
+			successors.set(request.retryOfRequestId, request);
+	}
+	const recovered = (requestId: string): boolean => {
+		const visited = new Set<string>();
+		let current = requestId;
+		while (!visited.has(current)) {
+			visited.add(current);
+			const next = successors.get(current);
+			if (!next) return false;
+			if (next.responseReceived && next.reportedUsage !== null &&
+				!next.contextRejected) return true;
+			if (!next.contextRejected || !next.responseReceived) return false;
+			current = next.requestId;
+		}
+		return false;
+	};
+	const unrecovered = diagnostics.some(row =>
+		!row.requestId || !recovered(row.requestId));
 	return { failedStage,
-		...(diagnosticsAfter > diagnosticsBefore ? { transportFailure: true } : {}) };
+		...(unrecovered ? { transportFailure: true } : {}) };
 }
 function observedRequestContract(diagnosticsBefore: number,
 	diagnostics: readonly TransportFailureDiagnostic[]): HostPendingActionFactsV1["requestContract"] {
@@ -227,6 +247,17 @@ function observedRequestContract(diagnosticsBefore: number,
 		item.wholePromptNotIssued === true && item.requestContractViolation !== undefined);
 	return row?.requestContractViolation ? { violation: row.requestContractViolation,
 		messageIndex: row.requestContractMessageIndex ?? null } : undefined;
+}
+function observeTransport(handle: SessionHandle, diagnostics: TransportFailureDiagnostic[]): SessionHandle {
+	let delivered = 0;
+	return { ...handle, prompt: async message => {
+		try { return await handle.prompt(message); }
+		finally {
+			const rows = handle.transportDiagnostics?.() ?? [];
+			diagnostics.push(...rows.slice(delivered));
+			delivered = rows.length;
+		}
+	} };
 }
 function archivedRequestContract(archive: Awaited<ReturnType<typeof archivePrivateM07Task>>):
 	HostPendingActionFactsV1["requestContract"] {
@@ -2029,18 +2060,8 @@ async function main() {
 			const actual = createPiSessionRunner({ modelRuntime: runtime, signal: abort.signal,
 				campaignBudget: budget,
 				sanitizePrivateProviderError: value => privateProviderErrorField(value, runtimeKey) });
-			const observeTransport = (handle: SessionHandle): SessionHandle => {
-				let delivered = 0;
-				return { ...handle, prompt: async message => {
-					try { return await handle.prompt(message); }
-					catch (error) {
-						const rows = handle.transportDiagnostics?.() ?? [];
-						statusTransportDiagnostics.push(...rows.slice(delivered));
-						delivered = rows.length;
-						throw error;
-					}
-				} };
-			};
+			const observeCampaignTransport = (handle: SessionHandle): SessionHandle =>
+				observeTransport(handle, statusTransportDiagnostics);
 			const recordSessionEffect = async (requested: SessionSpec, handle: SessionHandle): Promise<void> => {
 				if (sessionEffects.has(handle.ref.id)) fail("duplicate private session effect identity");
 				if (requested.tools.kind === "execution") {
@@ -2160,7 +2181,7 @@ async function main() {
 					const handle = await actual.create(transformed);
 					try { await recordSessionEffect(spec, handle); }
 					catch (error) { handle.dispose(); throw error; }
-					const observed = observeTransport(handle);
+					const observed = observeCampaignTransport(handle);
 					return spec.tools.kind === "execution" ? checkedHandle(observed, spec.tools.root, registeredScopeActive) : observed;
 				},
 				checkpoint: (handle, envelope) => actual.checkpoint(handle, envelope),
@@ -2169,7 +2190,7 @@ async function main() {
 					const handle = await actual.fork({ ...request, spec: transformed });
 					try { await recordSessionEffect(request.spec, handle); }
 					catch (error) { handle.dispose(); throw error; }
-				const observed = observeTransport(handle);
+				const observed = observeCampaignTransport(handle);
 				return request.spec.tools.kind === "execution" ? checkedHandle(observed, request.spec.tools.root, registeredScopeActive) : observed;
 				},
 				resume: async ref => {
@@ -2185,10 +2206,10 @@ async function main() {
 							handle.dispose();
 							fail("resumed M07 session lost its factory-confined grant");
 						}
-						return checkedHandle(observeTransport(handle), known.workRoot,
+						return checkedHandle(observeCampaignTransport(handle), known.workRoot,
 							grant.writableFiles.includes("experiment-plan.json"));
 					}
-					return observeTransport(handle);
+					return observeCampaignTransport(handle);
 				},
 			};
 			// A disputed historical M04 transaction is never imported or replayed.
@@ -2573,7 +2594,8 @@ async function main() {
 							assessment: firstStep.assessment, stopReason: firstStopReason, advanced: false }] : [])],
 					stopReason: firstStopReason,
 					pendingActionFacts: { ...observedTransportActionFacts(firstStopReason,
-						firstAssessmentDiagnosticStart, statusTransportDiagnostics.length,
+						statusTransportDiagnostics.slice(firstAssessmentDiagnosticStart),
+						budget.requestAccountingAuditSnapshot(),
 						"read-only-assessor"),
 						...(firstStopReason === "request-contract-invalid" ?
 							{ requestContract: firstRequestContract } : {}) } }));
@@ -3065,7 +3087,8 @@ async function main() {
 					if (stepRequestContract && objectiveStopReason === "assessment-failed")
 						objectiveStopReason = "request-contract-invalid";
 					objectivePendingActionFacts = { ...observedTransportActionFacts(objectiveStopReason,
-						iterationDiagnosticStart, statusTransportDiagnostics.length, "read-only-assessor"),
+						statusTransportDiagnostics.slice(iterationDiagnosticStart),
+						budget.requestAccountingAuditSnapshot(), "read-only-assessor"),
 						...(objectiveStopReason === "request-contract-invalid" ?
 							{ requestContract: stepRequestContract } : {}) };
 					objectivePendingActionReason = objectiveStopReason;
@@ -3219,7 +3242,8 @@ async function main() {
 					if (stepRequestContract && (objectiveStopReason === "assessment-failed" ||
 						objectiveStopReason === "dispatch-failed")) objectiveStopReason = "request-contract-invalid";
 					objectivePendingActionFacts = { ...observedTransportActionFacts(objectiveStopReason,
-						iterationDiagnosticStart, statusTransportDiagnostics.length,
+						statusTransportDiagnostics.slice(iterationDiagnosticStart),
+						budget.requestAccountingAuditSnapshot(),
 						activeFollowOnGoalId ? "m07-execution" : "read-only-assessor"),
 						...(objectiveStopReason === "request-contract-invalid" ?
 							{ requestContract: stepRequestContract } : {}) };
@@ -3537,7 +3561,7 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	preserveUnsettledGoalCheckpoint, preserveUnsettledBranchCheckpoint: preserveUnsettledGoalCheckpoint,
 	salvageObjectiveCheckpoint, collectContinuationBundle, collectorFailureBundle,
 	privateM04TransactionFacts, retainFailedM04Transaction, failedM04StopReason,
-	buildHostEffectReceipt,
+	buildHostEffectReceipt, observeTransport,
 	unresolvedGoalControl, campaignObjectiveProgress, observedTransportActionFacts,
 	observedRequestContract, archivedRequestContract,
 	canonicalUnresolvedOperationRefs, qualifiedOperationRef, reservedCanonicalOperationRefs,

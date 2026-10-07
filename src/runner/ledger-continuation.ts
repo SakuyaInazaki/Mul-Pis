@@ -3,6 +3,7 @@ import { inflateRawSync } from "node:zlib";
 import { HarnessError } from "../types.ts";
 import { canonicalRestartUnknowns } from "../m07/independent-restart.ts";
 import { objectiveProgress, type ObjectiveProgressV1 } from "../m07/objective-progress.ts";
+import { pendingActionIdentity, type MissionStatusV1, type TerminalCarryEvidenceV1 } from "./mission-supervisor.ts";
 import type { CampaignAdmissionRejection, CampaignRequestAudit } from "./deepseek-campaign.ts";
 import type { TransportFailureDiagnostic } from "./types.ts";
 import { campaignSessionEffectId } from "./deepseek-campaign.ts";
@@ -30,6 +31,36 @@ export type CurrentMissionRun = {
 	actor: string | undefined; event: string | undefined; ref: string | undefined;
 	sha: string | undefined; manualAuthorized: string | undefined; before?: string | undefined;
 };
+/** Live, read-only authentication of a finished Actions carry. The brand is not serializable. */
+export type AuthenticatedTerminalCarryProof = Readonly<{
+	version: 1; kind: "authenticated-terminal-mission-carry";
+	source: Readonly<Source>; envelopeSha256: string;
+	artifact: AuthenticatedPriorCarryProof["artifact"];
+	terminal: AuthenticatedPriorCarryProof["terminal"];
+}>;
+export type AuthenticatedTerminalCarryResult = Readonly<{
+	proof: AuthenticatedTerminalCarryProof; privateBundle: PrivateContinuationBundle;
+}>;
+const authenticatedTerminalCarryProofs = new WeakSet<object>();
+const terminalBundleDigests = new WeakMap<object, string>();
+const terminalSupervisorProjections = new WeakMap<object, Readonly<{
+	status: MissionStatusV1; terminalCarry: TerminalCarryEvidenceV1;
+	pendingAction?: MissionStatusV1["pendingAction"];
+}>>();
+export function isAuthenticatedTerminalCarryProof(value: unknown): value is AuthenticatedTerminalCarryProof {
+	return Boolean(value) && typeof value === "object" && authenticatedTerminalCarryProofs.has(value as object);
+}
+export function authenticatedTerminalCarryBindsBundle(proof: unknown, bundle: unknown): boolean {
+	return isAuthenticatedTerminalCarryProof(proof) && validBundle(bundle) &&
+		privateBundleDigest(bundle) === terminalBundleDigests.get(proof);
+}
+export function authenticatedSupervisorProjection(proof: unknown, bundle: unknown):
+	Readonly<{ status: MissionStatusV1; terminalCarry: TerminalCarryEvidenceV1;
+		pendingAction?: MissionStatusV1["pendingAction"] }> | undefined {
+	const projection = authenticatedTerminalCarryBindsBundle(proof, bundle) ?
+		terminalSupervisorProjections.get(proof as object) : undefined;
+	return projection ? structuredClone(projection) : undefined;
+}
 type Run = { id?: number; run_number?: number; run_attempt?: number; workflow_id?: number;
 	status?: string; conclusion?: string; head_branch?: string; head_sha?: string; event?: string;
 	actor?: { login?: string }; head_commit?: { message?: string } };
@@ -202,6 +233,10 @@ export type AccountingOnlyRequestAuditSnapshot = {
 	version: 3; kind: "accounting-only-request-audit";
 	requests: Array<{
 		requestId: string; inputPayloadBytes: number; maxOutputTokens?: number;
+		/** A provider-declined HTTP 400 is still an UNKNOWN invoice observation. */
+		contextRejected?: true;
+		contextOverflow?: NonNullable<TransportFailureDiagnostic["providerContextOverflow"]>;
+		retryOfRequestId?: string;
 		/** New receipts separate received transport from possibly unknown billing. */
 		sessionId?: string; responseReceived?: boolean;
 		status: "settled" | "unknown" | "in-flight";
@@ -513,23 +548,57 @@ function validAccountingAudit(value: unknown, settledNano: number, unknownNano: 
 		value.unpricedRequestCount !== unpricedCount) return false;
 	const audit = value as AccountingOnlyRequestAuditSnapshot;
 	const ids = new Set<string>();
+	const retriedPredecessors = new Set<string>();
 	let settled = 0, unknown = 0, unpriced = 0;
 	for (const item of audit.requests) {
 		if (!record(item) || !exactKeys(item, ["requestId", "inputPayloadBytes",
 			"status", "settledCny", "unknownObservedCny", "reportedUsage",
 			...(item.maxOutputTokens === undefined ? [] : ["maxOutputTokens"]),
 			...(item.sessionId === undefined ? [] : ["sessionId"]),
-			...(item.responseReceived === undefined ? [] : ["responseReceived"])]) ||
+			...(item.responseReceived === undefined ? [] : ["responseReceived"]),
+			...(item.contextRejected === undefined ? [] : ["contextRejected"]),
+			...(item.contextOverflow === undefined ? [] : ["contextOverflow"]),
+			...(item.retryOfRequestId === undefined ? [] : ["retryOfRequestId"])]) ||
 			typeof item.requestId !== "string" || !item.requestId ||
 			item.requestId.length > 128 || ids.has(item.requestId) ||
 			(item.sessionId !== undefined && (typeof item.sessionId !== "string" ||
 				!/^[0-9a-f]{64}$/.test(item.sessionId))) ||
 			(item.responseReceived !== undefined && typeof item.responseReceived !== "boolean") ||
+			(item.contextRejected !== undefined && (item.contextRejected !== true ||
+				item.status !== "unknown" || item.responseReceived !== true ||
+				item.reportedUsage !== null)) ||
+			(item.contextRejected === true) !== (item.contextOverflow !== undefined) ||
+			(item.retryOfRequestId !== undefined &&
+				(typeof item.retryOfRequestId !== "string" || !item.retryOfRequestId)) ||
 			!Number.isSafeInteger(item.inputPayloadBytes) || item.inputPayloadBytes <= 0 ||
 			(item.maxOutputTokens !== undefined &&
 				(!Number.isSafeInteger(item.maxOutputTokens) || item.maxOutputTokens < 1)) ||
 			!["settled", "unknown", "in-flight"].includes(String(item.status))) return false;
 		ids.add(item.requestId);
+		if (item.contextOverflow !== undefined) {
+			const proof = item.contextOverflow;
+			if (!record(proof) || !exactKeys(proof, ["contextWindow", "messagesTokens",
+				"completionTokens", "requestedTokens", "allowedCompletionTokens"]) ||
+				![proof.contextWindow, proof.messagesTokens, proof.completionTokens,
+					proof.requestedTokens, proof.allowedCompletionTokens].every(value =>
+						Number.isSafeInteger(value) && Number(value) > 0) ||
+				proof.messagesTokens >= proof.contextWindow ||
+				proof.requestedTokens !== proof.messagesTokens + proof.completionTokens ||
+				proof.requestedTokens <= proof.contextWindow ||
+				proof.allowedCompletionTokens !== proof.contextWindow - proof.messagesTokens ||
+				proof.allowedCompletionTokens >= proof.completionTokens ||
+				item.maxOutputTokens !== proof.completionTokens) return false;
+		}
+		if (item.retryOfRequestId !== undefined) {
+			const predecessor = audit.requests.find(row => row.requestId === item.retryOfRequestId);
+			if (!predecessor || !ids.has(predecessor.requestId) || !predecessor.contextRejected ||
+				retriedPredecessors.has(predecessor.requestId) ||
+				!item.sessionId || item.sessionId !== predecessor.sessionId ||
+				item.maxOutputTokens === undefined || predecessor.maxOutputTokens === undefined ||
+				item.maxOutputTokens !== predecessor.contextOverflow?.allowedCompletionTokens)
+				return false;
+			retriedPredecessors.add(predecessor.requestId);
+		}
 		if (item.reportedUsage !== null) {
 			const u = item.reportedUsage;
 			const raw = u as Record<string, unknown>;
@@ -590,7 +659,8 @@ const TRANSPORT_NETWORK_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "ECONNABO
 	"UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT",
 	"UND_ERR_BODY_TIMEOUT", "UND_ERR_RESPONSE", "UND_ERR_ABORTED"]);
 function transportUnknownIds(audit: AccountingOnlyRequestAuditSnapshot): string[] {
-	return audit.requests.filter(row => row.responseReceived === false && row.status === "unknown")
+	return audit.requests.filter(row => row.status === "unknown" &&
+		(row.responseReceived === false || row.contextRejected === true))
 		.map(row => row.requestId);
 }
 /** An optional, strictly enum-only private cause census. Earlier ciphertexts
@@ -1700,18 +1770,24 @@ function sealCheckpoint(cp: Checkpoint, key: Buffer): string {
 		reject("carry exceeds private artifact limit");
 	return envelopeB64;
 }
-async function githubJson(url: string, token: string, request: typeof fetch): Promise<Record<string, unknown>> {
+async function githubJson(url: string, token: string | undefined, request: typeof fetch): Promise<Record<string, unknown>> {
 	let response: Response;
 	try { response = await request(url, { method: "GET", redirect: "error", signal: AbortSignal.timeout(15_000),
-		headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${token}` } }); }
-	catch { return reject("GitHub carry freshness check could not complete"); }
+		headers: { Accept: "application/vnd.github+json",
+			...(token ? { Authorization: `Bearer ${token}` } : {}) } }); }
+	catch (error) {
+		if ((error as { reasonCode?: unknown } | null)?.reasonCode ===
+			"authenticated-github-connector-stdin-closed")
+			reject("authenticated host GitHub read channel closed before a response");
+		return reject("GitHub carry freshness check could not complete");
+	}
 	if (response.status !== 200) reject("GitHub carry freshness check was not accepted");
 	let value: unknown;
 	try { value = await response.json(); } catch { return reject("GitHub carry freshness response is invalid"); }
 	if (!record(value)) reject("GitHub carry freshness response is invalid");
 	return value;
 }
-async function oneJob(runId: string, token: string, request: typeof fetch): Promise<Job> {
+async function oneJob(runId: string, token: string | undefined, request: typeof fetch): Promise<Job> {
 	const url = `https://api.github.com/repos/${MISSION_REPOSITORY}/actions/runs/${runId}/jobs?per_page=100`;
 	const response = await githubJson(url, token, request);
 	if (response.total_count !== 1 || !Array.isArray(response.jobs) ||
@@ -1791,7 +1867,7 @@ function priorCarryProof(input: { source: Source; current: Source; run: Run; job
 	}))));
 	return proof;
 }
-async function artifactsForRun(runId: string, token: string, request: typeof fetch): Promise<Artifact[]> {
+async function artifactsForRun(runId: string, token: string | undefined, request: typeof fetch): Promise<Artifact[]> {
 	const url = `https://api.github.com/repos/${MISSION_REPOSITORY}/actions/runs/${runId}/artifacts?per_page=100`;
 	const response = await githubJson(url, token, request);
 	if (!Array.isArray(response.artifacts) || response.artifacts.length > 100 ||
@@ -1799,7 +1875,7 @@ async function artifactsForRun(runId: string, token: string, request: typeof fet
 		reject("workflow artifact list is incomplete");
 	return response.artifacts.filter(record) as Artifact[];
 }
-async function oneArtifact(runId: string, token: string, request: typeof fetch,
+async function oneArtifact(runId: string, token: string | undefined, request: typeof fetch,
 	name: string, requiredId?: string, inspect?: (artifacts: Artifact[]) => void): Promise<string> {
 	const artifacts = await artifactsForRun(runId, token, request);
 	const found = artifacts.filter(value => {
@@ -1822,15 +1898,34 @@ function resultArtifactIdentity(artifacts: Artifact[], source: Source): Authenti
 		digestScope: "github-artifact-archive" });
 }
 
-export async function openLedgerContinuation(input: {
+type OpenLedgerInput = {
 	seedEnvelopeB64: string | undefined; publicKeyFile: string; githubToken: string | undefined;
 	current: CurrentMissionRun;
 	loadCarryArtifact: (identity: { runId: string; artifactId: string }) => Promise<string>;
 	request?: typeof fetch; expectedSpkiSha256?: string;
+	/** Terminal inspection may use the host's existing authenticated GitHub
+	 * connector. The running Actions admission still requires its GitHub token. */
+	authenticatedHostRead?: Readonly<{ kind: "authenticated-host-github-read"; request: typeof fetch }>;
 	/** Compatibility verifier may require every intervening run to be nonbillable. */
 	requireSeedOnly?: boolean;
-}): Promise<LedgerContinuation> {
+};
+export async function openLedgerContinuation(input: OpenLedgerInput): Promise<LedgerContinuation> {
+	return openLedgerContinuationInternal(input, false) as Promise<LedgerContinuation>;
+}
+/** Authenticate the latest finished run without inventing a running successor or sealing a carry. */
+export async function authenticateLatestTerminalCarry(input: Omit<OpenLedgerInput, "current" | "requireSeedOnly"> &
+	{ source: CurrentMissionRun }): Promise<AuthenticatedTerminalCarryResult> {
+	return openLedgerContinuationInternal({ ...input, current: input.source }, true) as
+		Promise<AuthenticatedTerminalCarryResult>;
+}
+async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMode: boolean):
+	Promise<LedgerContinuation | AuthenticatedTerminalCarryResult> {
 	const c = input.current;
+	if (input.authenticatedHostRead && (!terminalMode ||
+		input.authenticatedHostRead.kind !== "authenticated-host-github-read" ||
+		typeof input.authenticatedHostRead.request !== "function"))
+		reject("authenticated host GitHub read transport is invalid");
+	const hostRead = terminalMode ? input.authenticatedHostRead : undefined;
 	const authorizedDispatch = c.event === "workflow_dispatch" &&
 		c.ref === `refs/heads/${BRANCH}` && c.manualAuthorized === "true";
 	const authorizedControlRequest = c.event === "push" &&
@@ -1839,12 +1934,14 @@ export async function openLedgerContinuation(input: {
 	if (c.repository !== MISSION_REPOSITORY || c.actor !== "SakuyaInazaki" ||
 		(!authorizedDispatch && !authorizedControlRequest) ||
 		c.runAttempt !== "1" || !positiveId(c.runId) ||
-		!/^[0-9a-f]{40}$/.test(c.sha ?? "") || !input.githubToken || input.githubToken.length > 4_000)
+		!/^[0-9a-f]{40}$/.test(c.sha ?? "") ||
+		(!input.githubToken && !hostRead) || (input.githubToken?.length ?? 0) > 4_000 ||
+		(!terminalMode && Boolean(input.authenticatedHostRead)))
 		reject("current Actions identity is not admitted for the mission ledger");
 	const seed = await authenticateSignedMissionSeed({ envelopeB64: input.seedEnvelopeB64,
 		publicKeyFile: input.publicKeyFile, expectedSpkiSha256: input.expectedSpkiSha256 });
 	const key = seed.derivePrivateKey("mul-pis-ledger-continuation-v1");
-	const request = input.request ?? fetch;
+	const request = hostRead?.request ?? input.request ?? fetch;
 	const base = `https://api.github.com/repos/${MISSION_REPOSITORY}/actions`;
 	const pages: Run[] = [];
 	let foundSeed = false;
@@ -1878,7 +1975,7 @@ export async function openLedgerContinuation(input: {
 	const anchor = pages.find(x => String(x.id) === seed.payload.previous.runId);
 	if (!current || !anchor || !Number.isSafeInteger(current.run_number) ||
 		!Number.isSafeInteger(anchor.run_number) || anchor.run_number! >= current.run_number! ||
-		current.run_attempt !== 1 || current.status !== "in_progress" ||
+		current.run_attempt !== 1 || current.status !== (terminalMode ? "completed" : "in_progress") ||
 		current.event !== c.event || current.head_sha !== c.sha || current.actor?.login !== c.actor ||
 		current.head_branch !== (authorizedControlRequest ? REQUEST_BRANCH : BRANCH) ||
 		(authorizedControlRequest && current.head_commit?.message !== REUSABLE_RUN_REQUEST_MESSAGE) ||
@@ -1900,15 +1997,26 @@ export async function openLedgerContinuation(input: {
 		reject("run request commit was already used by an earlier workflow run");
 	if (authorizedControlRequest) {
 		const repo = `https://api.github.com/repos/${MISSION_REPOSITORY}`;
-		const featureRef = await githubJson(`${repo}/git/ref/heads/${BRANCH}`, input.githubToken, request);
-		const source = record(featureRef.object) ? featureRef.object.sha : undefined;
-		if (typeof source !== "string" || !/^[0-9a-f]{40}$/.test(source))
-			reject("run request source ref is unavailable");
+		let liveSource: unknown;
+		if (!terminalMode) {
+			const featureRef = await githubJson(`${repo}/git/ref/heads/${BRANCH}`, input.githubToken, request);
+			liveSource = record(featureRef.object) ? featureRef.object.sha : undefined;
+			if (typeof liveSource !== "string" || !/^[0-9a-f]{40}$/.test(liveSource))
+				reject("run request source ref is unavailable");
+		}
 		const submitted = await githubJson(`${repo}/git/commits/${current.head_sha}`, input.githubToken, request);
-		const sourceCommit = await githubJson(`${repo}/git/commits/${source}`, input.githubToken, request);
 		const parents = submitted.parents;
 		if (!Array.isArray(parents) || ![1, 2].includes(parents.length) ||
-			parents.some(parent => !record(parent) || typeof parent.sha !== "string") ||
+			parents.some(parent => !record(parent) || typeof parent.sha !== "string" ||
+				!/^[0-9a-f]{40}$/.test(parent.sha)))
+			reject("run request source commit is invalid");
+		// A finished request retains its tested first parent even after the feature
+		// branch moves. Running admission still requires the live feature ref.
+		const source = terminalMode ? parents[0].sha : liveSource;
+		if (typeof source !== "string" || !/^[0-9a-f]{40}$/.test(source))
+			reject("run request source commit is invalid");
+		const sourceCommit = await githubJson(`${repo}/git/commits/${source}`, input.githubToken, request);
+		if (
 			parents[0].sha !== source ||
 			(parents.length === 1 ? c.before !== source : parents[1].sha !== c.before) ||
 			!record(submitted.tree) || !record(sourceCommit.tree) ||
@@ -1918,13 +2026,16 @@ export async function openLedgerContinuation(input: {
 			input.githubToken, request);
 		if (!Array.isArray(ci.workflow_runs) || !ci.workflow_runs.some(row =>
 			record(row) && row.head_sha === source && row.head_branch === BRANCH &&
-			row.event === "push" && row.run_attempt === 1 && row.conclusion === "success"))
+			row.event === "push" && row.run_attempt === 1 && row.conclusion === "success" &&
+			(!terminalMode || row.status === "completed")))
 			reject("run request source lacks a successful offline regression run");
 	}
 	// Workflow concurrency prevents simultaneous execution, but it does not promise
 	// run-number order. A newer completed paid run cannot be silently omitted just
 	// because this older queued run finally acquired the concurrency slot.
 	for (const successor of pages.filter(run => run.run_number! > current.run_number!)) {
+		if (terminalMode && successor.status === "completed")
+			reject("terminal source is not the latest completed workflow run");
 		if (successor.run_attempt !== 1) reject("newer workflow run disposition is unresolved");
 		if (successor.status === "queued" || successor.status === "pending") continue;
 		if (successor.status !== "completed" || providerDisposition(
@@ -1947,12 +2058,16 @@ export async function openLedgerContinuation(input: {
 	let priorBootstrapBinding: BootstrapBinding | undefined = seed.bootstrapBinding;
 	const executedSources: Source[] = [];
 	const executedMetadata = new Map<string, { run: Run; job: Job }>();
-	for (const run of ordered.slice(1, -1)) {
+	for (const run of ordered.slice(1, terminalMode ? undefined : -1)) {
 		const source = sourceOf(run);
 		if (run.workflow_id !== current.workflow_id || run.run_attempt !== 1 || run.status !== "completed")
 			reject("intervening workflow run is not settled");
 		const job = await oneJob(source.runId, input.githubToken, request);
-		if (providerDisposition(job) === "skipped") continue;
+		if (providerDisposition(job) === "skipped") {
+			if (terminalMode && run.id === current.id)
+				reject("terminal workflow provider step did not execute");
+			continue;
+		}
 		if (input.requireSeedOnly) reject("intervening workflow may have executed a billable job");
 		if (run.conclusion === "cancelled" || job.conclusion === "cancelled")
 			reject("intervening workflow run is not settled");
@@ -1982,7 +2097,7 @@ export async function openLedgerContinuation(input: {
 			carries[0].expired === false && Number.isSafeInteger(carries[0].id) && carries[0].id! > 0) {
 			loadedArtifacts.set(latest.runId, String(carries[0].id));
 			resultArtifacts.set(latest.runId, resultArtifactIdentity(artifacts, latest));
-		} else if (carries.length === 0) {
+		} else if (carries.length === 0 && !terminalMode) {
 			if (executedSources.length < 2)
 				reject("required private carry artifact is unavailable without an earlier authenticated carry");
 			const results = artifacts.filter(item => item.name === MISSION_ARTIFACT);
@@ -1998,6 +2113,7 @@ export async function openLedgerContinuation(input: {
 			sourcesWithCarry = executedSources.slice(0, -1);
 		} else reject("required private carry artifact is unavailable or ambiguous");
 	}
+	let latestCheckpoint: Checkpoint | undefined;
 	let legacyAncestry: AncestorReceipt[] = [];
 	let accountingAncestry: AccountingAncestorReceipt[] = [];
 	let ancestry: (AncestorReceipt | AccountingAncestorReceipt)[] = [];
@@ -2018,6 +2134,7 @@ export async function openLedgerContinuation(input: {
 		const latestVersion = checkpointVersion(latestEnvelope);
 		if (latestVersion === 3) {
 			const opened = readCheckpoint(latestEnvelope, key, seed.seedDigest, latest);
+			latestCheckpoint = opened.checkpoint;
 			if (opened.checkpoint.version !== 3) reject("accounting-only carry version is invalid");
 			validateAncestryV3(opened.checkpoint, sourcesWithCarry, seed.seedDigest,
 				n(seed.payload.priorCommittedCny), seed.bootstrapBinding);
@@ -2131,6 +2248,7 @@ export async function openLedgerContinuation(input: {
 			parentDigest = opened.digest;
 		} else if (latestVersion === 2) {
 			const opened = readCheckpoint(latestEnvelope, key, seed.seedDigest, latest);
+			latestCheckpoint = opened.checkpoint;
 			if (opened.checkpoint.version !== 2) reject("legacy carry version is invalid");
 			validateAncestry(opened.checkpoint, sourcesWithCarry, seed.seedDigest, committedNano, priorBootstrapBinding);
 			const cp = opened.checkpoint;
@@ -2149,6 +2267,7 @@ export async function openLedgerContinuation(input: {
 			for (const [index, source] of sourcesWithCarry.entries()) {
 				const envelope = index === sourcesWithCarry.length - 1 ? latestEnvelope : await load(source);
 				const opened = readCheckpoint(envelope, key, seed.seedDigest, source, parentDigest);
+				latestCheckpoint = opened.checkpoint;
 				const cp = opened.checkpoint;
 				if (cp.version === 3) reject("legacy activation cannot inherit an accounting-only carry");
 				if (cp.version === 2) validateAncestry(cp, sourcesWithCarry.slice(0, index + 1),
@@ -2199,6 +2318,80 @@ export async function openLedgerContinuation(input: {
 		authenticatedPendingHistoricalEffects.set(proof, Object.freeze([
 			...pendingEffectAncestry.map(source => Object.freeze({ ...source })),
 			...(currentEffectReviewPending ? [Object.freeze({ ...proof.source })] : [])]));
+	if (terminalMode) {
+		if (!proof || !priorPrivateBundle || !latestCheckpoint || latestCheckpoint.version !== 3 ||
+			proof.source.runId !== c.runId || proof.source.runAttempt !== Number(c.runAttempt) ||
+			proof.source.commit !== c.sha || !verifiedTerminal(current, executedMetadata.get(c.runId!)!.job,
+				proof.source))
+			reject("terminal carry lacks an exact completed source and v3 checkpoint");
+		const observed = await githubJson(`${base}/runs/${proof.source.runId}`, input.githubToken!, request) as Run;
+		if (JSON.stringify(sourceOf(observed)) !== JSON.stringify(proof.source) ||
+			observed.status !== "completed" || observed.conclusion !== current.conclusion ||
+			observed.workflow_id !== current.workflow_id || observed.actor?.login !== c.actor ||
+			observed.event !== c.event || observed.head_branch !== current.head_branch)
+			reject("terminal Actions source changed after the workflow listing");
+		if (!originalObjectiveMatchesSignedBootstrap(priorPrivateBundle,
+			seed.bootstrapPrivateBundle?.["original-objective.json"]))
+			reject("terminal objective is not the exact signed bootstrap objective");
+		const selected = selectedTuple(priorPrivateBundle, true);
+		if (!selected || !authenticatedSelectedTransitions?.length &&
+			selected.sha256 !== selectedTuple(seed.bootstrapPrivateBundle ?? {})?.sha256)
+			reject("terminal selected tuple has no authenticated provenance");
+		let progress: unknown;
+		try { progress = JSON.parse(priorPrivateBundle["objective-checkpoint.json"] ?? ""); }
+		catch { return reject("terminal objective checkpoint is invalid"); }
+		if (!record(progress) || progress.version !== 1 ||
+			progress.kind !== "original-objective-progress" ||
+			JSON.stringify(progress.contract) !== JSON.stringify(selected.checkpoint.contract) ||
+			!record(progress.continuation) ||
+			!Array.isArray(progress.boundedRuns) ||
+			!Array.isArray(progress.continuation.unresolvedOperationIds) ||
+			!(["incomplete", "fulfilled"] as unknown[]).includes(progress.objectiveOutcome) ||
+			(progress.stopReason !== null && typeof progress.stopReason !== "string"))
+			reject("terminal objective checkpoint is incomplete");
+		const checkpoint = progress as unknown as ObjectiveProgressV1;
+		let unresolved: string[];
+		try { unresolved = canonicalRestartUnknowns(checkpoint).operationRefs; }
+		catch { return reject("terminal objective operation ancestry is invalid"); }
+		const pendingAction = checkpoint.continuation.pendingAction;
+		let pendingActionSha256: string | null = null;
+		if (pendingAction) {
+			try { pendingActionSha256 = pendingActionIdentity(pendingAction); }
+			catch { return reject("terminal host pending action is invalid"); }
+			if (pendingAction.reasonCode !== checkpoint.stopReason)
+				reject("terminal pending action differs from objective stop");
+		}
+		// The sealed checkpoint records the host's earlier decision, but it does not
+		// carry the complete original-check inputs needed to re-prove closure here.
+		if (checkpoint.objectiveOutcome === "fulfilled")
+			reject("terminal objective closure lacks an independent host receipt");
+		const source = Object.freeze({ ...proof.source });
+		const status: MissionStatusV1 = {
+			version: 1, kind: "host-redacted-mission-status",
+			contractId: (selected.checkpoint.contract as Record<string, unknown>).id as string,
+			objectiveOutcome: checkpoint.objectiveOutcome, stopReason: checkpoint.stopReason,
+			selectedTupleSha256: selected.sha256, unresolvedOperationRefs: unresolved,
+			...(pendingAction ? { pendingAction } : {})
+		};
+		const terminalCarry: TerminalCarryEvidenceV1 = {
+			version: 1, kind: "host-verified-terminal-carry", source,
+			envelopeSha256: proof.envelopeSha256, contractId: status.contractId,
+			selectedTupleSha256: selected.sha256, pendingActionSha256,
+			checkpointSha256: digest(priorPrivateBundle["objective-checkpoint.json"]!),
+			terminal: { runStatus: "completed", jobStatus: "completed", providerStepStatus: "completed" }
+		};
+		const terminalProof: AuthenticatedTerminalCarryProof = Object.freeze({
+			version: 1, kind: "authenticated-terminal-mission-carry", source,
+			envelopeSha256: proof.envelopeSha256,
+			artifact: proof.artifact, terminal: proof.terminal
+		});
+		authenticatedTerminalCarryProofs.add(terminalProof);
+		terminalBundleDigests.set(terminalProof, privateBundleDigest(priorPrivateBundle));
+		terminalSupervisorProjections.set(terminalProof, { status, terminalCarry,
+			...(pendingAction ? { pendingAction } : {}) });
+		Object.freeze(priorPrivateBundle);
+		return { proof: terminalProof, privateBundle: priorPrivateBundle };
+	}
 	if (priorPrivateBundle) Object.freeze(priorPrivateBundle);
 	if (priorBootstrapBinding) Object.freeze(priorBootstrapBinding);
 	let sealed = false;

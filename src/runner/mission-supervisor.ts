@@ -5,7 +5,7 @@
  * nor grants a resumed session access to an earlier operation or store.
  */
 import { createHash } from "node:crypto";
-import { validatePendingAction } from "../m07/objective-progress.ts";
+import { classifyPendingAction, validatePendingAction } from "../m07/objective-progress.ts";
 import type { ObjectiveStopReason, PendingActionV1 } from "../m07/objective-progress.ts";
 
 type Source = Readonly<{ runId: string; runAttempt: number; commit: string }>;
@@ -42,6 +42,7 @@ export type TerminalCarryEvidenceV1 = Readonly<{
 	source: Source; envelopeSha256: string;
 	contractId: string; selectedTupleSha256: string;
 	pendingActionSha256: string | null;
+	checkpointSha256?: string;
 	terminal: Readonly<{ runStatus: "completed"; jobStatus: "completed";
 		providerStepStatus: "completed" }>;
 }>;
@@ -71,12 +72,31 @@ export type FreshIndependentWorkEvidenceV1 = Readonly<{
 	nextTaskDependency: "independent" | "dependent" | "unknown";
 }>;
 
+/** A current host decision for an authenticated legacy checkpoint that predates
+ * pendingAction. It is a new decision, never attributed to the old ciphertext. */
+export type CurrentDerivedActionV1 = Readonly<{
+	version: 1; kind: "current-host-derived-action";
+	source: Source; envelopeSha256: string; selectedTupleSha256: string;
+	checkpointSha256: string; action: PendingActionV1;
+}>;
+
+/** A verified launch contract promises a successor will enforce the existing
+ * fresh-work boundary. It does not claim the future workspace already exists. */
+export type FreshIndependentLaunchContractV1 = Readonly<{
+	version: 1; kind: "verified-fresh-launch-contract";
+	source: Source; envelopeSha256: string; selectedTupleSha256: string;
+	pendingActionSha256: string; testedSourceCommit: string; testedTree: string;
+	requiresRuntimeAttestationBeforeModel: true; mode: "fresh-work-only";
+}>;
+
 export type SupervisorSnapshot = Readonly<{
 	status: MissionStatusV1;
 	pendingAction?: PendingActionV1;
+	currentDerivedAction?: CurrentDerivedActionV1;
 	terminalCarry?: TerminalCarryEvidenceV1;
 	cancellationEvent?: HostCancellationEventV1;
 	freshIndependentWork?: FreshIndependentWorkEvidenceV1;
+	freshLaunchContract?: FreshIndependentLaunchContractV1;
 	dispatchRecord: ResumeDispatchRecord;
 }>;
 
@@ -86,6 +106,7 @@ export type ResumeIntent = Readonly<{
 	contractId: string; selectedTupleSha256: string; pendingActionSha256: string;
 	actionKind: PendingActionV1["kind"];
 	pendingAction: PendingActionV1;
+	actionProvenance?: Readonly<{ kind: "current-host-derived"; checkpointSha256: string }>;
 	/** The new process must start with no prior session or shared store. */
 	boundary: "new-isolated-workspace-no-prior-session-resume";
 	/** These effects stay UNKNOWN. The new run may work on independent tasks. */
@@ -158,6 +179,7 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 	if (terminalCarry.version !== 1 || terminalCarry.kind !== "host-verified-terminal-carry" ||
 		!sourceId(terminalCarry.source) || !hex64(terminalCarry.envelopeSha256) ||
 		!hex64(terminalCarry.selectedTupleSha256) ||
+		(terminalCarry.checkpointSha256 !== undefined && !hex64(terminalCarry.checkpointSha256)) ||
 		terminalCarry.contractId !== status.contractId ||
 		terminalCarry.selectedTupleSha256 !== status.selectedTupleSha256 ||
 		terminalCarry.terminal?.runStatus !== "completed" ||
@@ -194,52 +216,98 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 		return { kind: "wait", reason: event.origin === "explicit-user-request" ?
 			"user-cancelled" : "execution-interrupted" };
 	}
-	if (!status.stopReason || !status.pendingAction || !pendingAction)
-		return { kind: "restore-evidence", evidenceRefs: [] };
-	const actionSha = pendingActionIdentity(pendingAction);
-	if (pendingActionIdentity(status.pendingAction) !== actionSha ||
-		pendingAction.reasonCode !== status.stopReason ||
-		terminalCarry.pendingActionSha256 !== actionSha)
-		fail("pending action does not match authenticated checkpoint and carry");
-	const quarantinedOperationRefs = pendingAction.target?.operationRefs ?? [];
+	let action: PendingActionV1;
+	let actionSha: string;
+	let actionProvenance: ResumeIntent["actionProvenance"];
+	const derived = snapshot.currentDerivedAction;
+	if (derived) {
+		if (status.pendingAction !== undefined || pendingAction !== undefined ||
+			terminalCarry.pendingActionSha256 !== null ||
+			status.stopReason !== "bounded-run-incomplete" ||
+			status.unresolvedOperationRefs.length === 0 ||
+			!sourceId(derived.source) || derived.version !== 1 ||
+			derived.kind !== "current-host-derived-action" ||
+			!hex64(derived.checkpointSha256) ||
+			derived.checkpointSha256 !== terminalCarry.checkpointSha256 ||
+			derived.source.runId !== terminalCarry.source.runId ||
+			derived.source.runAttempt !== terminalCarry.source.runAttempt ||
+			derived.source.commit !== terminalCarry.source.commit ||
+			derived.envelopeSha256 !== terminalCarry.envelopeSha256 ||
+			derived.selectedTupleSha256 !== status.selectedTupleSha256)
+			fail("current host derivation does not bind the authenticated legacy checkpoint");
+		const expected = classifyPendingAction("bounded-run-incomplete",
+			{ unresolvedOperationRefs: [...status.unresolvedOperationRefs] });
+		if (canonical(derived.action) !== canonical(expected))
+			fail("current host derivation changed the deterministic unknown-operation action");
+		action = derived.action;
+		actionSha = pendingActionIdentity(action);
+		actionProvenance = { kind: "current-host-derived", checkpointSha256: derived.checkpointSha256 };
+	} else {
+		if (!status.stopReason || !status.pendingAction || !pendingAction)
+			return { kind: "restore-evidence", evidenceRefs: [] };
+		action = pendingAction;
+		actionSha = pendingActionIdentity(action);
+		if (pendingActionIdentity(status.pendingAction) !== actionSha ||
+			action.reasonCode !== status.stopReason ||
+			terminalCarry.pendingActionSha256 !== actionSha)
+			fail("pending action does not match authenticated checkpoint and carry");
+	}
+	const quarantinedOperationRefs = action.target?.operationRefs ?? [];
 	if (!sameSet(status.unresolvedOperationRefs, quarantinedOperationRefs) ||
 		(status.unresolvedOperationRefs.length > 0 &&
-			pendingAction.safety !== "no-replay-until-reconciled"))
+			action.safety !== "no-replay-until-reconciled"))
 		fail("unresolved M07 operations are missing from quarantine");
-	if (pendingAction.kind === "reconcile-m07-operation" &&
-		(!quarantinedOperationRefs.length || pendingAction.safety !== "no-replay-until-reconciled"))
+	if (action.kind === "reconcile-m07-operation" &&
+		(!quarantinedOperationRefs.length || action.safety !== "no-replay-until-reconciled"))
 		fail("M07 operation reconciliation is unsafe");
-	if (pendingAction.kind === "reconcile-m04-transaction" &&
-		pendingAction.safety !== "no-replay-until-reconciled")
+	if (action.kind === "reconcile-m04-transaction" &&
+		action.safety !== "no-replay-until-reconciled")
 		fail("M04 transaction reconciliation is unsafe");
-	if (pendingAction.safety === "same-session-read-only")
+	if (action.safety === "same-session-read-only")
 		return { kind: "wait", reason: "terminal-action-needs-reclassification" };
-	if (pendingAction.reasonCode === "accounting-integrity-error")
+	if (action.reasonCode === "accounting-integrity-error")
 		return { kind: "wait", reason: "accounting-chain-needs-reconciliation" };
-	if (pendingAction.humanRequired) return { kind: "exclusive-external-input",
-		blocker: pendingAction.verifiedHumanBlocker! };
-	if (pendingAction.safety === "no-replay-until-reconciled") {
+	if (action.humanRequired) return { kind: "exclusive-external-input",
+		blocker: action.verifiedHumanBlocker! };
+	if (action.safety === "no-replay-until-reconciled") {
 		const fresh = snapshot.freshIndependentWork;
-		if (!fresh || fresh.version !== 1 ||
-			fresh.kind !== "host-verified-fresh-independent-work" ||
-			fresh.source.runId !== terminalCarry.source.runId ||
-			fresh.source.runAttempt !== terminalCarry.source.runAttempt ||
-			fresh.source.commit !== terminalCarry.source.commit ||
-			fresh.envelopeSha256 !== terminalCarry.envelopeSha256 ||
-			fresh.selectedTupleSha256 !== status.selectedTupleSha256 ||
-			fresh.pendingActionSha256 !== actionSha ||
-			fresh.isolatedWorkspace !== true || fresh.emptyStore !== true ||
-			fresh.noPriorSessionResume !== true || fresh.confinedGrants !== true ||
-			fresh.nextTaskDependency !== "independent")
+		const actualVerified = Boolean(fresh && fresh.version === 1 &&
+			fresh.kind === "host-verified-fresh-independent-work" &&
+			fresh.source.runId === terminalCarry.source.runId &&
+			fresh.source.runAttempt === terminalCarry.source.runAttempt &&
+			fresh.source.commit === terminalCarry.source.commit &&
+			fresh.envelopeSha256 === terminalCarry.envelopeSha256 &&
+			fresh.selectedTupleSha256 === status.selectedTupleSha256 &&
+			fresh.pendingActionSha256 === actionSha &&
+			fresh.isolatedWorkspace === true && fresh.emptyStore === true &&
+			fresh.noPriorSessionResume === true && fresh.confinedGrants === true &&
+			fresh.nextTaskDependency === "independent");
+		const launch = snapshot.freshLaunchContract;
+		const launchVerified = Boolean(launch && launch.version === 1 &&
+			launch.kind === "verified-fresh-launch-contract" &&
+			launch.source.runId === terminalCarry.source.runId &&
+			launch.source.runAttempt === terminalCarry.source.runAttempt &&
+			launch.source.commit === terminalCarry.source.commit &&
+			launch.envelopeSha256 === terminalCarry.envelopeSha256 &&
+			launch.selectedTupleSha256 === status.selectedTupleSha256 &&
+			launch.pendingActionSha256 === actionSha &&
+			typeof launch.testedSourceCommit === "string" && /^[0-9a-f]{40}$/.test(launch.testedSourceCommit) &&
+			typeof launch.testedTree === "string" && /^[0-9a-f]{40}$/.test(launch.testedTree) &&
+			launch.requiresRuntimeAttestationBeforeModel === true &&
+			launch.mode === "fresh-work-only");
+		if (!actualVerified && !launchVerified)
 			return { kind: "wait", reason: "quarantined-operation-needs-reconciliation" };
 	}
-	if (pendingAction.kind === "restore-evidence" || pendingAction.kind === "retry-evidence-read" &&
-		pendingAction.evidenceRefs?.length)
-		return { kind: "restore-evidence", evidenceRefs: pendingAction.evidenceRefs ?? [] };
-	const idempotencyKey = sha(canonical({ source: terminalCarry.source,
+	if (action.kind === "restore-evidence" || action.kind === "retry-evidence-read" &&
+		action.evidenceRefs?.length)
+		return { kind: "restore-evidence", evidenceRefs: action.evidenceRefs ?? [] };
+	const resumeSource = { runId: terminalCarry.source.runId,
+		runAttempt: terminalCarry.source.runAttempt, commit: terminalCarry.source.commit };
+	const idempotencyKey = sha(canonical({ source: resumeSource,
 		envelopeSha256: terminalCarry.envelopeSha256,
 		contractId: status.contractId, selectedTupleSha256: status.selectedTupleSha256,
-		pendingActionSha256: actionSha }));
+		pendingActionSha256: actionSha,
+		...(actionProvenance ? { actionProvenance } : {}) }));
 	if (dispatchRecord.state !== "not-requested") {
 		if (dispatchRecord.idempotencyKey !== idempotencyKey)
 			fail("dispatch record belongs to a different pending action");
@@ -251,13 +319,14 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 	}
 	return { kind: "dispatch", intent: {
 		version: 1, kind: "fresh-independent-mission-resume", idempotencyKey,
-		source: terminalCarry.source, envelopeSha256: terminalCarry.envelopeSha256,
+		source: resumeSource, envelopeSha256: terminalCarry.envelopeSha256,
 		contractId: status.contractId, selectedTupleSha256: status.selectedTupleSha256,
-		pendingActionSha256: actionSha, actionKind: pendingAction.kind,
-		pendingAction: structuredClone(pendingAction),
+		pendingActionSha256: actionSha, actionKind: action.kind,
+		pendingAction: structuredClone(action),
+		...(actionProvenance ? { actionProvenance } : {}),
 		boundary: "new-isolated-workspace-no-prior-session-resume",
 		quarantinedOperationRefs: [...quarantinedOperationRefs],
-		m04TransactionQuarantined: pendingAction.kind === "reconcile-m04-transaction" } };
+		m04TransactionQuarantined: action.kind === "reconcile-m04-transaction" } };
 }
 
 export type ResumeTriggerReceipt = Readonly<

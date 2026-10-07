@@ -77,23 +77,62 @@ test("observed read-only transport failure cannot become a new optimizer task", 
 		goalSource: "user-intent-summary" as const, inputNames: ["synthetic.txt"],
 		obligations: [{ id: "quality", description: "Continue checking the result" }],
 		closure: "open-ended" as const };
-	const checkpoint = (before: number, after: number,
+	const checkpoint = (diagnosticCount: number,
 		stage: "read-only-assessor" | "m07-execution", unknowns: string[] = []) =>
 		offlineChecks.campaignObjectiveProgress(contract, [], { boundedRuns: [],
 			selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
 			stopReason: "dispatch-failed", unresolvedOperationIds: unknowns,
 			pendingActionFacts: offlineChecks.observedTransportActionFacts("dispatch-failed",
-				before, after, stage) });
-	assert.equal(checkpoint(4, 5, "read-only-assessor").continuation.pendingAction?.kind,
+				Array.from({ length: diagnosticCount }, (_, index) => ({ requestId: `request-${index}` })) as any,
+				{ version: 3, kind: "accounting-only-request-audit", requests: [] } as any, stage) });
+	assert.equal(checkpoint(1, "read-only-assessor").continuation.pendingAction?.kind,
 		"retry-transport");
-	assert.equal(checkpoint(4, 4, "read-only-assessor").continuation.pendingAction?.kind,
+	assert.equal(checkpoint(0, "read-only-assessor").continuation.pendingAction?.kind,
 		"retry-readonly-assessment");
-	assert.equal(checkpoint(4, 4, "m07-execution").continuation.pendingAction?.kind,
+	assert.equal(checkpoint(0, "m07-execution").continuation.pendingAction?.kind,
 		"fresh-m07-task");
-	assert.equal(checkpoint(4, 5, "m07-execution", ["goal/O001"]).continuation.pendingAction?.kind,
+	assert.equal(checkpoint(1, "m07-execution", ["goal/O001"]).continuation.pendingAction?.kind,
 		"reconcile-m07-operation");
-	assert.throws(() => offlineChecks.observedTransportActionFacts("dispatch-failed", 5, 4,
-		"read-only-assessor"), /diagnostic cursor/);
+});
+
+test("recovered context rejection does not recast a later stage failure as transport failure", () => {
+	const diagnostics = [{ requestId: "rejected-400" }];
+	const audit = { version: 3, kind: "accounting-only-request-audit", requests: [
+		{ requestId: "rejected-400", contextRejected: true, responseReceived: true,
+			reportedUsage: null },
+		{ requestId: "reserved-retry", retryOfRequestId: "rejected-400",
+			responseReceived: true, reportedUsage: { totalTokens: 14 } },
+	] };
+	const unrelatedFailure = offlineChecks.observedTransportActionFacts("assessment-failed",
+		diagnostics as any, audit as any, "read-only-assessor");
+	assert.deepEqual(unrelatedFailure, { failedStage: "read-only-assessor" });
+	const retryFailed = offlineChecks.observedTransportActionFacts("assessment-failed",
+		[...diagnostics, { requestId: "reserved-retry" }] as any, audit as any, "read-only-assessor");
+	assert.deepEqual(retryFailed, { failedStage: "read-only-assessor", transportFailure: true });
+	const retryNotReceived = { ...audit, requests: [audit.requests[0],
+		{ ...audit.requests[1], responseReceived: false, reportedUsage: null }] };
+	assert.deepEqual(offlineChecks.observedTransportActionFacts("assessment-failed",
+		diagnostics as any, retryNotReceived as any, "read-only-assessor"),
+		{ failedStage: "read-only-assessor", transportFailure: true });
+});
+
+test("private campaign collects a recovered transport failure once per handle", async () => {
+	const recovered = { version: 1, promptIndex: 1, phase: "response-body", httpStatus: 400,
+		responseStarted: true, bytesRead: 120, abortSource: null, providerErrorCode: "invalid_request_error",
+		providerErrorType: "invalid_request_error", providerErrorReasonClass: "context-window",
+		providerRequestId: null, errorCodes: [] } as const;
+	const rows = [recovered];
+	const diagnostics: typeof recovered[] = [];
+	let prompts = 0;
+	const handle = { prompt: async () => {
+		prompts++;
+		return { text: `reply ${prompts}` };
+	}, transportDiagnostics: () => [...rows] } as any;
+	const observed = offlineChecks.observeTransport(handle, diagnostics as any);
+	assert.deepEqual(await observed.prompt("first"), { text: "reply 1" });
+	assert.deepEqual(diagnostics, [recovered]);
+	assert.deepEqual(await observed.prompt("second"), { text: "reply 2" });
+	assert.deepEqual(diagnostics, [recovered]);
 });
 
 test("host preflight violation becomes a concrete incomplete repair plan without request replay", () => {

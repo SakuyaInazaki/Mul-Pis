@@ -1,6 +1,6 @@
 import { appendFile, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import {
 	createAgentSession,
@@ -42,6 +42,7 @@ class TransportProbe {
 	private providerErrorCode: string | null = null;
 	private providerErrorType: string | null = null;
 	private providerErrorReasonClass: NonNullable<TransportFailureDiagnostic["providerErrorReasonClass"]> = "unknown";
+	private providerContextOverflow?: TransportFailureDiagnostic["providerContextOverflow"];
 	private providerRequestId: string | null = null;
 	private privateProviderError?: TransportFailureDiagnostic["privateProviderError"];
 	private requestContractViolation?: DeepSeekRequestViolation;
@@ -117,7 +118,10 @@ class TransportProbe {
 				code?: unknown; type?: unknown; message?: unknown; param?: unknown };
 			if (typeof code === "string" && SAFE_PROVIDER_ERROR_CODES.has(code)) this.providerErrorCode = code;
 			if (typeof type === "string" && SAFE_PROVIDER_ERROR_TYPES.has(type)) this.providerErrorType = type;
-			this.providerErrorReasonClass = classifyProviderErrorReason(this.providerErrorCode, this.providerErrorType, message);
+			this.providerContextOverflow = this.providerErrorType === "invalid_request_error" ?
+				parseProviderContextOverflow(message) : undefined;
+			this.providerErrorReasonClass = classifyProviderErrorReason(this.providerErrorCode,
+				this.providerErrorType, message, Boolean(this.providerContextOverflow));
 			if (this.privateSanitize) {
 				const scrub = (value: unknown): string | null => {
 					if (typeof value !== "string") return null;
@@ -144,6 +148,10 @@ class TransportProbe {
 		if (this.phase === "unknown" || this.phase === "request") this.phase = "provider-stream";
 	}
 
+	contextOverflow(): TransportFailureDiagnostic["providerContextOverflow"] {
+		return this.providerContextOverflow ? { ...this.providerContextOverflow } : undefined;
+	}
+
 	captureErrorCodes(error: unknown): void {
 		const seen = new Set<unknown>();
 		let current: unknown = error;
@@ -168,6 +176,7 @@ class TransportProbe {
 			httpStatus: this.httpStatus, responseStarted: this.responseStarted, bytesRead: this.bytesRead,
 			abortSource, providerErrorCode: this.providerErrorCode, providerErrorType: this.providerErrorType,
 			providerErrorReasonClass: this.providerErrorReasonClass,
+			...(this.providerContextOverflow ? { providerContextOverflow: { ...this.providerContextOverflow } } : {}),
 			providerRequestId: this.providerRequestId, errorCodes: [...this.errorCodes],
 			...(this.privateProviderError ? { privateProviderError: this.privateProviderError } : {}),
 			...(this.requestContractViolation ? { requestContractViolation: this.requestContractViolation,
@@ -191,16 +200,56 @@ const SAFE_PROVIDER_ERROR_CODES = new Set([
 	"context_length_exceeded", "rate_limit_exceeded", "insufficient_quota", "content_filter",
 ]);
 
+/** Drain only a bounded copy of a rejected response so TransportProbe can
+ * classify it before the SDK receives a response. The original stays intact. */
+async function observeBoundedRejectedResponse(response: Response): Promise<boolean> {
+	if (!response.body) return false;
+	let reader: ReadableStreamDefaultReader<Uint8Array>;
+	try { reader = response.clone().body!.getReader(); }
+	catch { return false; }
+	let bytes = 0;
+	try {
+		for (;;) {
+			const part = await reader.read();
+			if (part.done) return true;
+			bytes += part.value.byteLength;
+			if (bytes > MAX_ERROR_METADATA_JSON_BYTES) {
+				void reader.cancel().catch(() => undefined);
+				return false;
+			}
+		}
+	} catch { return false; }
+}
+
 /** Provider error text is untrusted and may echo a prompt. Use only a documented,
  * complete error sentence, never a substring match, and discard the text. */
-function classifyProviderErrorReason(code: string | null, type: string | null, message: unknown):
+function classifyProviderErrorReason(code: string | null, type: string | null, message: unknown,
+	contextOverflow: boolean):
 	NonNullable<TransportFailureDiagnostic["providerErrorReasonClass"]> {
+	if (contextOverflow) return "context-window";
 	if (code === "context_length_exceeded") return "context-window";
 	if (code === "invalid_format" || code === "invalid_parameter") return "input-schema";
 	if (type === "invalid_request_error" &&
 		message === "The reasoning_content in the thinking mode must be passed back to the API.")
 		return "tool-reasoning";
 	return "unknown";
+}
+
+/** Parse only the provider's complete numeric context rejection. The optional
+ * request UUID is checked as syntax and discarded. No untrusted text escapes. */
+function parseProviderContextOverflow(message: unknown): TransportFailureDiagnostic["providerContextOverflow"] {
+	if (typeof message !== "string" || message.length > 512) return undefined;
+	const match = /^This model's maximum context length is ([1-9]\d{0,15}) tokens\. However, you requested ([1-9]\d{0,15}) tokens \(([1-9]\d{0,15}) in the messages, ([1-9]\d{0,15}) in the completion\)\. Please reduce the length of the messages or completion\.(?: \(request_id: [0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\))?$/.exec(message);
+	if (!match) return undefined;
+	const [contextWindow, requestedTokens, messagesTokens, completionTokens] = match.slice(1, 5).map(Number);
+	if (![contextWindow, requestedTokens, messagesTokens, completionTokens].every(Number.isSafeInteger) ||
+		!Number.isSafeInteger(messagesTokens + completionTokens) ||
+		messagesTokens >= contextWindow || completionTokens > contextWindow ||
+		requestedTokens !== messagesTokens + completionTokens || requestedTokens <= contextWindow)
+		return undefined;
+	const allowedCompletionTokens = contextWindow - messagesTokens;
+	if (allowedCompletionTokens < 1 || completionTokens <= allowedCompletionTokens) return undefined;
+	return { contextWindow, messagesTokens, completionTokens, requestedTokens, allowedCompletionTokens };
 }
 
 const SAFE_ERROR_CODES = new Set([
@@ -920,6 +969,7 @@ export class PiSessionRunner implements SessionRunner {
 		let strictPayloadChecks = 0;
 		let currentLease: PromptLease | undefined;
 		let currentRequestIds: string[] = [];
+		let currentContextRejectedIds = new Set<string>();
 		let certifiedEffectScope: HostEffectScope | undefined;
 		const transportDiagnostics: TransportFailureDiagnostic[] = [];
 		const signal = this.options.signal;
@@ -946,9 +996,12 @@ export class PiSessionRunner implements SessionRunner {
 					} : {}) });
 				const lease = currentLease;
 					const requestIds = currentRequestIds;
+					const contextRejectedIds = currentContextRejectedIds;
 					let requestId: string | undefined;
-					const probe = campaign ? new TransportProbe(options?.fetch ?? globalThis.fetch,
+					const rawFetch = options?.fetch ?? globalThis.fetch;
+					let probe = campaign ? new TransportProbe(rawFetch,
 						sanitizePrivateProviderError) : undefined;
+					let expectedPayloadSha256: string | undefined;
 					let failureRecorded = false;
 					const recordFailure = (): void => {
 						if (!probe || failureRecorded) return;
@@ -963,9 +1016,57 @@ export class PiSessionRunner implements SessionRunner {
 						throw new HarnessError("runner.model", "strict request changed model");
 					const inner = target.streamSimple(model, context, {
 						...options, maxRetries: 0, maxTokens: model.maxTokens,
-						...(probe ? { fetch: probe.fetch,
+						...(probe ? { fetch: async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+							let attempt = init;
+							for (;;) {
+								const response = await probe!.fetch(input, attempt);
+								if (response.status !== 400 || !campaign || !lease || !requestId ||
+									!expectedPayloadSha256 || typeof attempt?.body !== "string") return response;
+								if (!await observeBoundedRejectedResponse(response)) return response;
+								const parsed = probe!.contextOverflow();
+								if (!parsed || parsed.contextWindow !== model.contextWindow ||
+									createHash("sha256").update(attempt.body).digest("hex") !== expectedPayloadSha256)
+									return response;
+								let prior: Record<string, unknown>;
+								try { prior = JSON.parse(attempt.body) as Record<string, unknown>; }
+								catch { return response; }
+								if (!prior || typeof prior !== "object" || Array.isArray(prior) ||
+									prior.max_tokens !== parsed.completionTokens ||
+									(prior.max_completion_tokens !== undefined &&
+										prior.max_completion_tokens !== parsed.completionTokens)) return response;
+								// This provider-declined HTTP request was received even if the
+								// corrected transport later fails local validation. Preserve
+								// its UNKNOWN invoice and numeric rejection immediately.
+								const rejectedId = requestId;
+								const proof = { httpStatus: 400 as const, ...parsed };
+								campaign.recordContextRejected(lease, rejectedId, proof);
+								contextRejectedIds.add(rejectedId);
+								transportDiagnostics.push(probe!.failure(promptIndex, null, rejectedId));
+								failureRecorded = true;
+								const corrected = parsed.allowedCompletionTokens;
+								const next = { ...prior, max_tokens: corrected,
+									...(prior.max_completion_tokens === undefined ? {} :
+										{ max_completion_tokens: corrected }) };
+								const nextBody = JSON.stringify(next);
+								try { assertDeepSeekRequestContract(nextBody,
+									{ sourceMessages: context.messages }); }
+								catch { return response; }
+								const nextBytes = Buffer.byteLength(nextBody, "utf8");
+								if (strict.maxInputPayloadBytes !== undefined &&
+									nextBytes > strict.maxInputPayloadBytes) return response;
+								const retryId = randomUUID();
+								campaign.reserveContextRetry(lease, nextBytes, retryId, corrected, rejectedId, proof);
+								requestIds.push(retryId);
+								void response.body?.cancel().catch(() => undefined);
+								requestId = retryId;
+								expectedPayloadSha256 = createHash("sha256").update(nextBody).digest("hex");
+								probe = new TransportProbe(rawFetch, sanitizePrivateProviderError);
+								failureRecorded = false;
+								attempt = { ...attempt, body: nextBody };
+							}
+						},
 							onResponse: async (response: Parameters<NonNullable<NonNullable<Parameters<ModelRuntime["streamSimple"]>[2]>["onResponse"]>>[0], responseModel: typeof model) => {
-								probe.observeResponse(response.status);
+								probe!.observeResponse(response.status);
 								await options?.onResponse?.(response, responseModel);
 							} } : {}),
 						onPayload: async (payload, payloadModel) => {
@@ -986,9 +1087,9 @@ export class PiSessionRunner implements SessionRunner {
 								(hasMax && Number(record.max_tokens) > outputCap) ||
 								(hasCompletionMax && Number(record.max_completion_tokens) > outputCap))
 								throw new HarnessError("runner.model", "strict request output bound missing or inconsistent in provider payload");
-							// The SDK may clamp for its own context estimate. A metered campaign
-							// must either send the verified provider maximum or refuse transport;
-							// it never shortens generation to fit the remaining CNY ledger.
+							// The first transport uses the verified provider maximum. Only an
+							// exact provider 400 for this same payload can justify a smaller
+							// separately accounted physical-capacity retry.
 							if (!campaign && ((hasMax && record.max_tokens !== outputCap) ||
 								(hasCompletionMax && record.max_completion_tokens !== outputCap)))
 								throw new HarnessError("runner.model", "strict request output bound was lowered by the SDK");
@@ -1011,6 +1112,7 @@ export class PiSessionRunner implements SessionRunner {
 								requestId = randomUUID();
 								campaign.reserve(lease, bytes, requestId, outputCap);
 								requestIds.push(requestId);
+								expectedPayloadSha256 = createHash("sha256").update(serialized).digest("hex");
 							}
 							return outgoing;
 						},
@@ -1188,6 +1290,7 @@ export class PiSessionRunner implements SessionRunner {
 				const thisPrompt = promptIndex + 1;
 				currentLease = campaign?.beginPrompt(ref.id, `${thisPrompt}-${randomUUID()}`);
 				currentRequestIds = [];
+				currentContextRejectedIds = new Set();
 				promptActive = true;
 				checkpointState.active = true;
 				checkpointState.completed = false;
@@ -1229,8 +1332,14 @@ export class PiSessionRunner implements SessionRunner {
 					const result = turnResult(promptMessages, spec.label, summarizeUsage(promptEvents), Boolean(campaign));
 					if (campaign && currentLease) {
 						const assistants = promptEvents.filter((event) => event.kind === "assistant");
-						if (assistants.length !== currentRequestIds.length) throw new HarnessError("runner.campaign", "provider request and assistant usage counts differ");
-						campaign.finishPrompt(currentLease, currentRequestIds.map((requestId, index) => ({ requestId, event: assistants[index] ?? { entryId: `missing-${requestId}`, kind: "assistant", promptIndex: thisPrompt, at: new Date().toISOString(), status: "unknown" } })));
+						const answeredRequestIds = currentRequestIds.filter((requestId) =>
+							!currentContextRejectedIds.has(requestId));
+						if (assistants.length !== answeredRequestIds.length)
+							throw new HarnessError("runner.campaign", "provider request and assistant usage counts differ");
+						campaign.finishPrompt(currentLease, answeredRequestIds.map((requestId, index) => ({
+							requestId, event: assistants[index] ?? { entryId: `missing-${requestId}`,
+								kind: "assistant", promptIndex: thisPrompt, at: new Date().toISOString(),
+								status: "unknown" } })));
 					}
 					promptOutcome = "completed";
 					return result;
@@ -1285,6 +1394,7 @@ export class PiSessionRunner implements SessionRunner {
 					} finally {
 						currentLease = undefined;
 						currentRequestIds = [];
+						currentContextRejectedIds = new Set();
 					}
 				}
 				}
@@ -1296,6 +1406,7 @@ export class PiSessionRunner implements SessionRunner {
 			usageSummary: () => summarizeUsage(usageEvents),
 			transportDiagnostics: () => transportDiagnostics.map((item) => ({ ...item,
 				errorCodes: [...item.errorCodes],
+				...(item.providerContextOverflow ? { providerContextOverflow: { ...item.providerContextOverflow } } : {}),
 				...(item.privateProviderError ? { privateProviderError: { ...item.privateProviderError,
 					numericLimits: { ...item.privateProviderError.numericLimits } } } : {}) })),
 			toolLog: () => [...toolLog],

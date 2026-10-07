@@ -5,13 +5,13 @@ import os from "node:os";
 import path from "node:path";
 import { deflateRawSync } from "node:zlib";
 import test, { type TestContext } from "node:test";
-import { authenticatedAccountingObservation, authenticatedHistoricalOpaqueRunGaps, authenticatedHistoricalCarryOrigin, authenticatedPendingHistoricalEffectSources, authenticatedSelectedTransitions, authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, originalObjectiveMatchesSignedBootstrap, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE, retainedTransportDiagnosticWithinBundle } from "../src/runner/ledger-continuation.ts";
+import { authenticateLatestTerminalCarry, authenticatedSupervisorProjection, authenticatedTerminalCarryBindsBundle, isAuthenticatedTerminalCarryProof, authenticatedAccountingObservation, authenticatedHistoricalOpaqueRunGaps, authenticatedHistoricalCarryOrigin, authenticatedPendingHistoricalEffectSources, authenticatedSelectedTransitions, authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, originalObjectiveMatchesSignedBootstrap, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE, retainedTransportDiagnosticWithinBundle } from "../src/runner/ledger-continuation.ts";
 import type { RequestAuditSnapshot } from "../src/runner/ledger-continuation.ts";
 import { DeepSeekCampaignBudget, campaignSessionEffectId, type CampaignAdmissionRejection } from "../src/runner/deepseek-campaign.ts";
 import { offlineChecks } from "../scripts/manual-private-campaign.ts";
 import { Workspace } from "../src/workspace.ts";
 import { reserveIndependentRestart, bindIndependentRestartGoal } from "../src/m07/independent-restart.ts";
-import { objectiveProgress, type OriginalObjectiveContractV1 } from "../src/m07/objective-progress.ts";
+import { createOriginalObjective, objectiveProgress, type OriginalObjectiveContractV1 } from "../src/m07/objective-progress.ts";
 import { verifyDeepSeekCnyBilling, nativeCnyPricingRecord } from "../src/runner/deepseek-cny-pricing.ts";
 import { verifyDeepSeekProviderOutputLimit, providerOutputLimitRecord } from "../src/runner/deepseek-provider-limits.ts";
 import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY } from "../src/runner/signed-mission-ledger.ts";
@@ -126,6 +126,189 @@ function github(runs: object[], options: { missingCarry?: boolean; duplicateCarr
 	};
 	return request;
 }
+
+test("latest terminal carry is live-authenticated before supervisor projection", async t => {
+	const f = await fixture(t);
+	const contract = createOriginalObjective({ goal: "Synthetic task", goalSource: "user-intent-summary",
+		inputNames: ["input.txt"], obligations: [{ id: "O1", description: "Synthetic check" }],
+		closure: "open-ended" });
+	const bundle = { "original-objective.json": JSON.stringify(contract),
+		"objective-checkpoint.json": JSON.stringify(objectiveProgress(contract, {
+			boundedRuns: [], selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
+			stopReason: "bounded-run-incomplete" })),
+		"candidate.cpp": "synthetic candidate", "verification.json": "{}", "workflow-archive.json": "{}" };
+	const seedEnvelopeB64 = f.signSeed({ ...f.payload, version: 2,
+		rootReviewedAnchor: { commit: sha("a"), artifactSha256: "e".repeat(64),
+			digestScope: "encrypted-result-envelope" },
+		bootstrap: { contractId: contract.id, sourceSha256: "d".repeat(64),
+			format: "deflate-raw-json-v1", filesB64: deflateRawSync(JSON.stringify(bundle)).toString("base64") } });
+	const source = current(7002, sha("b"));
+	const opening = await openLedgerContinuation({ ...f, seedEnvelopeB64, githubToken: "synthetic-token",
+		current: source, request: github([anchor, first]), loadCarryArtifact: async () => "unused" });
+	const carry = opening.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: { version: 3, kind: "accounting-only-request-audit",
+			requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 } });
+	const done = { ...first, status: "completed", conclusion: "failure" };
+	const live = (runs: object[], actor = "SakuyaInazaki"): typeof fetch => {
+		const base = github(runs);
+		return (url, init) => String(url).endsWith("/actions/runs/7002") ?
+			Promise.resolve(new Response(JSON.stringify({ ...done, actor: { login: actor } }))) : base(url, init);
+	};
+	const common = { ...f, seedEnvelopeB64, githubToken: "synthetic-token", source,
+		request: live([anchor, done]), loadCarryArtifact: async () => carry.envelopeB64 };
+	const terminal = await authenticateLatestTerminalCarry(common);
+	assert.equal(isAuthenticatedTerminalCarryProof(terminal.proof), true);
+	assert.doesNotMatch(JSON.stringify(terminal.proof), /synthetic candidate|Synthetic task/);
+	assert.equal(isAuthenticatedTerminalCarryProof({ ...terminal.proof }), false);
+	assert.equal(authenticatedTerminalCarryBindsBundle(terminal.proof, terminal.privateBundle), true);
+	assert.equal(authenticatedTerminalCarryBindsBundle(terminal.proof,
+		{ ...terminal.privateBundle, "candidate.cpp": "changed" }), false);
+	const projection = authenticatedSupervisorProjection(terminal.proof, terminal.privateBundle);
+	assert.equal(projection?.status.contractId, contract.id);
+	assert.equal(projection?.status.objectiveOutcome, "incomplete");
+	assert.equal(projection?.pendingAction, undefined);
+	assert.equal(projection?.terminalCarry.source.runId, "7002");
+	assert.equal(projection?.terminalCarry.checkpointSha256,
+		createHash("sha256").update(terminal.privateBundle["objective-checkpoint.json"]!).digest("hex"));
+	assert.equal(authenticatedSupervisorProjection({ ...terminal.proof }, terminal.privateBundle), undefined);
+	assert.equal(authenticatedSupervisorProjection(terminal.proof,
+		{ ...terminal.privateBundle, "candidate.cpp": "changed" }), undefined);
+	await assert.rejects(authenticateLatestTerminalCarry({ ...common,
+		source: { ...source, sha: sha("c") } }), /identity|source/);
+	await assert.rejects(authenticateLatestTerminalCarry({ ...common,
+		request: live([anchor, { ...done, actor: { login: "other" } }]) }), /identity|source/);
+	await assert.rejects(authenticateLatestTerminalCarry({ ...common,
+		request: github([anchor, done], { duplicateCarry: true }) }), /artifact/);
+	const outer = JSON.parse(Buffer.from(carry.envelopeB64, "base64").toString("utf8"));
+	outer.tag = `${outer.tag[0] === "A" ? "B" : "A"}${outer.tag.slice(1)}`;
+	const altered = Buffer.from(JSON.stringify(outer)).toString("base64");
+	await assert.rejects(authenticateLatestTerminalCarry({ ...common,
+		loadCarryArtifact: async () => altered }), /authentication/);
+	const seed = await authenticateSignedMissionSeed({ envelopeB64: seedEnvelopeB64,
+		publicKeyFile: f.publicKeyFile, expectedSpkiSha256: f.expectedSpkiSha256 });
+	const key = seed.derivePrivateKey("mul-pis-ledger-continuation-v1");
+	const expectedSource = { runId: "7002", runAttempt: 1, runNumber: 2, commit: sha("b") };
+	const decoder = createDecipheriv("aes-256-gcm", key, Buffer.from(outer.nonce, "base64"));
+	decoder.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY, seed.seedDigest,
+		3, seed.seedDigest, expectedSource])));
+	const originalOuter = JSON.parse(Buffer.from(carry.envelopeB64, "base64").toString("utf8"));
+	decoder.setAuthTag(Buffer.from(originalOuter.tag, "base64"));
+	const plaintext = Buffer.concat([decoder.update(Buffer.from(originalOuter.ciphertext, "base64")), decoder.final()]);
+	const checkpoint = JSON.parse(plaintext.toString("utf8"));
+	const changedParent = "f".repeat(64);
+	checkpoint.parentDigest = changedParent;
+	const nonce = randomBytes(12);
+	const encoder = createCipheriv("aes-256-gcm", key, nonce);
+	encoder.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY, seed.seedDigest,
+		3, changedParent, expectedSource])));
+	const ciphertext = Buffer.concat([encoder.update(JSON.stringify(checkpoint)), encoder.final()]);
+	const brokenChain = Buffer.from(JSON.stringify({ version: 3, parentDigest: changedParent,
+		nonce: nonce.toString("base64"), ciphertext: ciphertext.toString("base64"),
+		tag: encoder.getAuthTag().toString("base64") })).toString("base64");
+	await assert.rejects(authenticateLatestTerminalCarry({ ...common,
+		loadCarryArtifact: async () => brokenChain }), /ancestry|accounting/);
+	const changedSelection = JSON.parse(plaintext.toString("utf8"));
+	changedSelection.privateBundle["candidate.cpp"] = "unreviewed replacement";
+	const selectionNonce = randomBytes(12);
+	const selectionEncoder = createCipheriv("aes-256-gcm", key, selectionNonce);
+	selectionEncoder.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
+		seed.seedDigest, 3, seed.seedDigest, expectedSource])));
+	const selectionCiphertext = Buffer.concat([selectionEncoder.update(JSON.stringify(changedSelection)),
+		selectionEncoder.final()]);
+	const unprovenSelection = Buffer.from(JSON.stringify({ version: 3, parentDigest: seed.seedDigest,
+		nonce: selectionNonce.toString("base64"), ciphertext: selectionCiphertext.toString("base64"),
+		tag: selectionEncoder.getAuthTag().toString("base64") })).toString("base64");
+	await assert.rejects(authenticateLatestTerminalCarry({ ...common,
+		loadCarryArtifact: async () => unprovenSelection }), /selected tuple.*provenance/);
+	const unsupportedClosure = JSON.parse(plaintext.toString("utf8"));
+	const closureCheckpoint = JSON.parse(unsupportedClosure.privateBundle["objective-checkpoint.json"]);
+	closureCheckpoint.objectiveOutcome = "fulfilled";
+	closureCheckpoint.stopReason = null;
+	unsupportedClosure.privateBundle["objective-checkpoint.json"] = JSON.stringify(closureCheckpoint);
+	const closureNonce = randomBytes(12);
+	const closureEncoder = createCipheriv("aes-256-gcm", key, closureNonce);
+	closureEncoder.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
+		seed.seedDigest, 3, seed.seedDigest, expectedSource])));
+	const closureCiphertext = Buffer.concat([closureEncoder.update(JSON.stringify(unsupportedClosure)),
+		closureEncoder.final()]);
+	const unprovedClosure = Buffer.from(JSON.stringify({ version: 3, parentDigest: seed.seedDigest,
+		nonce: closureNonce.toString("base64"), ciphertext: closureCiphertext.toString("base64"),
+		tag: closureEncoder.getAuthTag().toString("base64") })).toString("base64");
+	await assert.rejects(authenticateLatestTerminalCarry({ ...common,
+		loadCarryArtifact: async () => unprovedClosure }), /closure lacks an independent host receipt/);
+	const newer = run(7003, 3, "completed", sha("c"), "failure");
+	const withNewer: typeof fetch = (url, init) => String(url).endsWith("/runs/7003/jobs?per_page=100") ?
+		Promise.resolve(new Response(JSON.stringify({ total_count: 1, jobs: [{ id: 6003, run_id: 7003,
+			run_attempt: 1, head_sha: sha("c"), name: "private-campaign", status: "completed",
+			conclusion: "failure", steps: [{ name: "Run private campaign", status: "completed",
+				conclusion: "failure" }] }] }))) : live([anchor, done, newer])(url, init);
+	await assert.rejects(authenticateLatestTerminalCarry({ ...common, request: withNewer }),
+		/latest completed workflow run/);
+});
+
+test("terminal control request authenticates its immutable tested source after feature publication", async t => {
+	const f = await fixture(t);
+	const contract = createOriginalObjective({ goal: "Synthetic control task",
+		goalSource: "user-intent-summary", inputNames: ["input.txt"],
+		obligations: [{ id: "O1", description: "Synthetic check" }], closure: "open-ended" });
+	const bundle = { "original-objective.json": JSON.stringify(contract),
+		"objective-checkpoint.json": JSON.stringify(objectiveProgress(contract, {
+			boundedRuns: [], selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
+			stopReason: "bounded-run-incomplete" })),
+		"candidate.cpp": "synthetic candidate", "verification.json": "{}", "workflow-archive.json": "{}" };
+	const seedEnvelopeB64 = f.signSeed({ ...f.payload, version: 2,
+		rootReviewedAnchor: { commit: sha("a"), artifactSha256: "e".repeat(64),
+			digestScope: "encrypted-result-envelope" },
+		bootstrap: { contractId: contract.id, sourceSha256: "d".repeat(64),
+			format: "deflate-raw-json-v1", filesB64: deflateRawSync(JSON.stringify(bundle)).toString("base64") } });
+	const testedSource = sha("f"), advancedTip = sha("e"), tree = sha("1");
+	const control = { ...first, event: "push", head_branch: "run-requests/workflow-learning-reliability",
+		head_commit: { message: REUSABLE_RUN_REQUEST_MESSAGE } };
+	const completedControl = { ...control, status: "completed", conclusion: "failure" };
+	const source = { ...current(7002, sha("b")), event: "push", before: testedSource,
+		ref: "refs/heads/run-requests/workflow-learning-reliability" };
+	const requestFor = (terminal: boolean, sourceTree = tree, ciSuccess = true,
+		featureTip = terminal ? advancedTip : testedSource): typeof fetch => {
+		const run = terminal ? completedControl : control;
+		const base = github([anchor, run]);
+		return async (url, init) => {
+			const address = String(url);
+			if (address.endsWith("/git/ref/heads/improve/workflow-learning-reliability"))
+				return new Response(JSON.stringify({ object: { sha: featureTip } }));
+			if (address.endsWith(`/git/commits/${sha("b")}`))
+				return new Response(JSON.stringify({ parents: [{ sha: testedSource }], tree: { sha: tree } }));
+			if (address.endsWith(`/git/commits/${testedSource}`) ||
+				address.endsWith(`/git/commits/${advancedTip}`))
+				return new Response(JSON.stringify({ tree: { sha: sourceTree } }));
+			if (address.includes("/actions/workflows/workflow-regression.yml/runs?")) {
+				assert.match(address, new RegExp(`head_sha=${testedSource}`));
+				return new Response(JSON.stringify({ workflow_runs: ciSuccess ? [{ head_sha: testedSource,
+					head_branch: "improve/workflow-learning-reliability", event: "push", run_attempt: 1,
+					status: "completed", conclusion: "success" }] : [] }));
+			}
+			if (address.endsWith("/actions/runs/7002"))
+				return new Response(JSON.stringify(completedControl));
+			return base(url, init);
+		};
+	};
+	const opening = await openLedgerContinuation({ ...f, seedEnvelopeB64, githubToken: "synthetic-token",
+		current: source, request: requestFor(false), loadCarryArtifact: async () => "unused" });
+	await assert.rejects(openLedgerContinuation({ ...f, seedEnvelopeB64, githubToken: "synthetic-token",
+		current: source, request: requestFor(false, tree, true, advancedTip),
+		loadCarryArtifact: async () => "unused" }), /accepted source tree/);
+	const carry = opening.sealCurrent({ settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0,
+		requestAudit: { version: 3, kind: "accounting-only-request-audit", requests: [],
+			settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 } });
+	const terminalInput = { ...f, seedEnvelopeB64, githubToken: "synthetic-token", source,
+		loadCarryArtifact: async () => carry.envelopeB64 };
+	const terminal = await authenticateLatestTerminalCarry({ ...terminalInput, request: requestFor(true) });
+	assert.equal(authenticatedSupervisorProjection(terminal.proof, terminal.privateBundle)?.status.contractId,
+		contract.id);
+	await assert.rejects(authenticateLatestTerminalCarry({ ...terminalInput,
+		request: requestFor(true, sha("2")) }), /accepted source tree/);
+	await assert.rejects(authenticateLatestTerminalCarry({ ...terminalInput,
+		request: requestFor(true, tree, false) }), /successful offline regression/);
+});
 
 test("signed seed and finished carry chain preserve the single cumulative ceiling and private bundle", async t => {
 	const f = await fixture(t);

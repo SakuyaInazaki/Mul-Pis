@@ -224,6 +224,9 @@ export interface TransportFailureDiagnostic {
 	providerErrorType: string | null;
 	/** Host-classified, bounded cause; unknown when the provider metadata is ambiguous. */
 	providerErrorReasonClass?: "context-window" | "input-schema" | "tool-reasoning" | "unknown";
+	/** Arithmetic checked from the provider's complete context-limit sentence; no provider text or request ID. */
+	providerContextOverflow?: { contextWindow: number; messagesTokens: number; completionTokens: number;
+		requestedTokens: number; allowedCompletionTokens: number };
 	/** Validated server x-request-id, if it is a UUID or hexadecimal identifier. */
 	providerRequestId: string | null;
 	errorCodes: string[];

@@ -18,8 +18,11 @@ const OUTPUT_LIMIT = await verifyDeepSeekProviderOutputLimit({ apiKey: "syntheti
 	new Response(JSON.stringify({ object: "list", data: [{ id: MODEL.id, object: "model", name: "DeepSeek-V4.1-Flash",
 		max_output_tokens: MODEL.maxTokens, context_window: MODEL.contextWindow }] }), { status: 200 }) });
 type Mode = "http" | "network" | "generic" | "allowlisted" | "input-schema" |
-	"tool-reasoning" | "reasoning-echo" | "malicious" | "oversize" | "malformed" | "absent";
+	"tool-reasoning" | "reasoning-echo" | "malicious" | "oversize" | "malformed" | "absent" |
+	"context-overflow" | "context-overflow-inconsistent" | "context-overflow-echo" |
+	"context-overflow-unsafe" | "context-overflow-large-safe";
 const VALID_REQUEST_ID = "12345678-1234-1234-1234-123456789abc";
+const CONTEXT_OVERFLOW_SENTENCE = "This model's maximum context length is 1048576 tokens. However, you requested 1078729 tokens (685513 in the messages, 393216 in the completion). Please reduce the length of the messages or completion.";
 
 function factory(mode: Mode): typeof createAgentSession {
 	const fakeFetch: typeof fetch = async () => {
@@ -29,6 +32,16 @@ function factory(mode: Mode): typeof createAgentSession {
 			headers: { "content-type": "application/json" } });
 		const error = mode === "allowlisted" ? { code: "context_length_exceeded", type: "invalid_request_error",
 			message: "HIDDEN private prompt", param: "HIDDEN parameter" } :
+			mode === "context-overflow" ? { code: null, type: "invalid_request_error",
+				message: `${CONTEXT_OVERFLOW_SENTENCE} (request_id: ${VALID_REQUEST_ID})` } :
+			mode === "context-overflow-inconsistent" ? { code: null, type: "invalid_request_error",
+				message: CONTEXT_OVERFLOW_SENTENCE.replace("1078729", "1078730") } :
+			mode === "context-overflow-echo" ? { code: null, type: "invalid_request_error",
+				message: `HIDDEN ${CONTEXT_OVERFLOW_SENTENCE}` } :
+			mode === "context-overflow-unsafe" ? { code: null, type: "invalid_request_error",
+				message: "This model's maximum context length is 9007199254740992 tokens. However, you requested 9007199254740993 tokens (9007199254740991 in the messages, 2 in the completion). Please reduce the length of the messages or completion." } :
+			mode === "context-overflow-large-safe" ? { code: null, type: "invalid_request_error",
+				message: "This model's maximum context length is 100000000 tokens. However, you requested 100000001 tokens (99999999 in the messages, 2 in the completion). Please reduce the length of the messages or completion." } :
 			mode === "input-schema" ? { code: "invalid_parameter", type: "invalid_request_error",
 				message: "HIDDEN private prompt", param: "HIDDEN parameter",
 				max_context_tokens: 128000, prompt_tokens: 130000 } :
@@ -178,6 +191,34 @@ test("documented whole reasoning error sentence classifies while echoed text doe
 	const echo = (await run("reasoning-echo")).diagnostics[0];
 	assert.equal(echo.providerErrorReasonClass, "unknown");
 	assert.doesNotMatch(JSON.stringify(echo), /HIDDEN|reasoning_content|passed back/);
+});
+
+test("complete provider context rejection exposes checked token counts without raw text", async () => {
+	const row = (await run("context-overflow")).diagnostics[0];
+	assert.equal(row.providerErrorCode, null);
+	assert.equal(row.providerErrorType, "invalid_request_error");
+	assert.equal(row.providerErrorReasonClass, "context-window");
+	assert.deepEqual(row.providerContextOverflow, { contextWindow: 1_048_576,
+		messagesTokens: 685_513, completionTokens: 393_216, requestedTokens: 1_078_729,
+		allowedCompletionTokens: 363_063 });
+	assert.doesNotMatch(JSON.stringify(row), /maximum context length|However|request_id|in the messages/);
+});
+
+test("inconsistent, echoed and unsafe-number context sentences stay unclassified", async () => {
+	for (const mode of ["context-overflow-inconsistent", "context-overflow-echo", "context-overflow-unsafe"] as const) {
+		const row = (await run(mode)).diagnostics[0];
+		assert.equal(row.providerErrorReasonClass, "unknown");
+		assert.equal(row.providerContextOverflow, undefined);
+		assert.doesNotMatch(JSON.stringify(row), /maximum context length|However|request_id|HIDDEN/);
+	}
+});
+
+test("safe future context sizes have no fixed parser ceiling", async () => {
+	const row = (await run("context-overflow-large-safe")).diagnostics[0];
+	assert.equal(row.providerErrorReasonClass, "context-window");
+	assert.deepEqual(row.providerContextOverflow, { contextWindow: 100_000_000,
+		messagesTokens: 99_999_999, completionTokens: 2, requestedTokens: 100_000_001,
+		allowedCompletionTokens: 1 });
 });
 
 test("body echo in code, type, message, param and request ID is discarded", async () => {

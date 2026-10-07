@@ -59,6 +59,16 @@ export interface PromptUsageReceipt {
 	readonly event: UsageEvent;
 }
 
+/** Numeric proof parsed from the provider's complete HTTP 400 context rejection. */
+export interface ContextWindowRejectionProof {
+	readonly httpStatus: 400;
+	readonly contextWindow: number;
+	readonly messagesTokens: number;
+	readonly completionTokens: number;
+	readonly requestedTokens: number;
+	readonly allowedCompletionTokens: number;
+}
+
 interface LeaseState {
 	readonly requests: RequestState[];
 	active: boolean;
@@ -70,6 +80,9 @@ interface RequestState {
 	readonly sessionId: string;
 	readonly inputPayloadBytes: number;
 	readonly maxOutputTokens: number;
+	readonly retryOfRequestId?: string;
+	contextRejection?: ContextWindowRejectionProof;
+	retrySuccessorId?: string;
 	worstCny: number;
 	rates: { input: number; cacheRead: number; output: number };
 	/** Whether the native CNY rate was verified when this transport was admitted. */
@@ -265,6 +278,63 @@ export class DeepSeekCampaignBudget {
 			this.stop("payload-boundary");
 			throw new HarnessError("runner.campaign", "provider payload byte count is unavailable");
 		}
+		this.reserveRequest(lease, state, payloadBytes, providerRequestId, maxOutputTokens);
+	}
+
+	/** A received HTTP 400 is still a transport with unknown invoice exposure. */
+	recordContextRejected(lease: PromptLease, originalRequestId: string, proof: ContextWindowRejectionProof): void {
+		const state = this.leases.get(lease);
+		const request = state?.requests.at(-1);
+		if (!state?.active || this.stopped || !request || request.id !== originalRequestId ||
+			request.status !== "reserved" || request.responseReceived || !this.validContextProof(request, proof)) {
+			this.stop("usage-reconciliation");
+			throw new HarnessError("runner.campaign", "provider context rejection does not match the reserved transport");
+		}
+		this.markUnknown(request);
+		request.responseReceived = true;
+		request.contextRejection = { ...proof };
+	}
+
+	/** Reserve the corrected payload as a new, separately accounted HTTP transport. */
+	reserveContextRetry(lease: PromptLease, payloadBytes: number, newRequestId: string,
+		correctedMax: number, predecessorRequestId: string, proof: ContextWindowRejectionProof): void {
+		const state = this.leases.get(lease);
+		const predecessor = state?.requests.at(-1);
+		if (!state?.active || this.stopped || !predecessor || predecessor.id !== predecessorRequestId ||
+			!predecessor.contextRejection || predecessor.retrySuccessorId || !predecessor.responseReceived ||
+			predecessor.status !== "unknown" || !this.validContextProof(predecessor, proof) ||
+			!this.sameContextProof(predecessor.contextRejection, proof) ||
+			!count(payloadBytes) || !count(correctedMax) || correctedMax !== proof.allowedCompletionTokens ||
+			correctedMax >= predecessor.maxOutputTokens || typeof newRequestId !== "string" || !newRequestId) {
+			this.stop("payload-boundary");
+			throw new HarnessError("runner.campaign", "context retry lacks a matching rejected predecessor and exact provider cap");
+		}
+		this.reserveRequest(lease, state, payloadBytes, newRequestId, correctedMax, predecessorRequestId);
+		predecessor.retrySuccessorId = newRequestId;
+	}
+
+	private validContextProof(request: RequestState, proof: ContextWindowRejectionProof): boolean {
+		return !!proof && proof.httpStatus === 400 &&
+			[proof.contextWindow, proof.messagesTokens, proof.completionTokens,
+				proof.requestedTokens, proof.allowedCompletionTokens].every(Number.isSafeInteger) &&
+			proof.contextWindow === this.outputProfile.contextWindow &&
+			proof.messagesTokens > 0 && proof.messagesTokens < proof.contextWindow &&
+			proof.completionTokens === request.maxOutputTokens &&
+			proof.requestedTokens === proof.messagesTokens + proof.completionTokens &&
+			proof.requestedTokens > proof.contextWindow &&
+			proof.allowedCompletionTokens === proof.contextWindow - proof.messagesTokens &&
+			proof.allowedCompletionTokens > 0 && proof.allowedCompletionTokens < request.maxOutputTokens;
+	}
+
+	private sameContextProof(left: ContextWindowRejectionProof, right: ContextWindowRejectionProof): boolean {
+		return left.httpStatus === right.httpStatus && left.contextWindow === right.contextWindow &&
+			left.messagesTokens === right.messagesTokens && left.completionTokens === right.completionTokens &&
+			left.requestedTokens === right.requestedTokens &&
+			left.allowedCompletionTokens === right.allowedCompletionTokens;
+	}
+
+	private reserveRequest(lease: PromptLease, state: LeaseState, payloadBytes: number,
+		providerRequestId: string, maxOutputTokens: number, retryOfRequestId?: string): void {
 		// Reusing an ID must never authorize another transport attempt for free.
 		if (this.requestIds.has(providerRequestId)) {
 			this.stop("payload-boundary");
@@ -281,6 +351,7 @@ export class DeepSeekCampaignBudget {
 		this.requestIds.add(providerRequestId);
 		const request = { id: providerRequestId, sessionId: lease.sessionId, responseReceived: false,
 			inputPayloadBytes: payloadBytes, maxOutputTokens, worstCny,
+			...(retryOfRequestId ? { retryOfRequestId } : {}),
 			nativeCnyVerified,
 			rates: nativeCnyVerified ? { ...this.rates } : { input: 0, cacheRead: 0, output: 0 },
 			status: "reserved" as const };
@@ -322,7 +393,7 @@ export class DeepSeekCampaignBudget {
 	settleReported(lease: PromptLease, requestId: string, event: UsageEvent): void {
 		const state = this.leases.get(lease);
 		const request = state?.requests.find((item) => item.id === requestId);
-		if (!state?.active || !request) {
+		if (!state?.active || !request || request.contextRejection) {
 			this.stop("usage-reconciliation");
 			throw new HarnessError("runner.campaign", "provider usage has no active reserved request");
 		}
@@ -414,10 +485,12 @@ export class DeepSeekCampaignBudget {
 		const state = this.leases.get(lease);
 		try {
 			if (!state?.active) throw new HarnessError("runner.campaign", "campaign prompt lease is invalid or already finished");
-			if (receipts.length !== state.requests.length || receipts.length === 0 ||
+			const assistantRequests = state.requests.filter((request) => !request.contextRejection);
+			if (receipts.length !== assistantRequests.length || receipts.length === 0 ||
 				new Set(receipts.map(({ event }) => event.entryId)).size !== receipts.length ||
-				receipts.some(({ requestId, event }, index) => requestId !== state.requests[index].id ||
-					this.usageEntryIds.has(event.entryId) || !event.entryId)) {
+				receipts.some(({ requestId, event }, index) => requestId !== assistantRequests[index].id ||
+					this.usageEntryIds.has(event.entryId) || !event.entryId ||
+					event.kind !== "assistant")) {
 				throw new HarnessError("runner.campaign", "provider usage or call outcome is incomplete or exceeds the campaign reserve");
 			}
 			for (const { requestId, event } of receipts) this.settleReported(lease, requestId, event);
@@ -484,7 +557,7 @@ export class DeepSeekCampaignBudget {
 		return { requests: this.auditRequests.map(request => ({
 			requestId: request.id, inputPayloadBytes: request.inputPayloadBytes,
 			maxOutputTokens: request.maxOutputTokens,
-			admissionDecision: "provider-maximum" as const,
+			admissionDecision: request.retryOfRequestId ? "reduced-output" as const : "provider-maximum" as const,
 			reservedCny: request.worstCny, status: request.status,
 			settledCny: request.settledCny ?? null,
 			unknownHeldCny: request.unknownHeldCny ?? null,
@@ -501,6 +574,9 @@ export class DeepSeekCampaignBudget {
 		version: 3; kind: "accounting-only-request-audit";
 		requests: Array<{ requestId: string; sessionId: string; responseReceived: boolean;
 			inputPayloadBytes: number; maxOutputTokens: number;
+			contextRejected?: true;
+			contextOverflow?: Omit<ContextWindowRejectionProof, "httpStatus">;
+			retryOfRequestId?: string;
 			status: "settled" | "unknown" | "in-flight"; settledCny: number | null;
 			unknownObservedCny: number | null; reportedUsage: NonNullable<RequestState["reportedUsage"]> | null }>;
 		settledCny: number; unknownObservedCny: number; unpricedRequestCount: number;
@@ -511,6 +587,15 @@ export class DeepSeekCampaignBudget {
 			responseReceived: request.responseReceived,
 			inputPayloadBytes: request.inputPayloadBytes,
 			maxOutputTokens: request.maxOutputTokens,
+			...(request.contextRejection ? { contextRejected: true as const } : {}),
+			...(request.contextRejection ? { contextOverflow: {
+				contextWindow: request.contextRejection.contextWindow,
+				messagesTokens: request.contextRejection.messagesTokens,
+				completionTokens: request.contextRejection.completionTokens,
+				requestedTokens: request.contextRejection.requestedTokens,
+				allowedCompletionTokens: request.contextRejection.allowedCompletionTokens,
+			} } : {}),
+			...(request.retryOfRequestId ? { retryOfRequestId: request.retryOfRequestId } : {}),
 			status: request.status === "reserved" ? "in-flight" as const : request.status,
 			settledCny: request.nativeCnyVerified && request.status === "settled" ? request.settledCny ?? null : null,
 			unknownObservedCny: request.nativeCnyVerified && request.status !== "settled"
