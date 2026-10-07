@@ -414,6 +414,14 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 			receiptSha256: review.receiptSha256 };
 	} else if (snapshot.interruptedSourceReview !== undefined)
 		fail("interrupted source review has no terminal gap");
+	if (action.kind === "repair-workflow-state" && status.stopReason !== "workflow-repair-needed")
+		fail("workflow repair action has an unrelated objective stop");
+	if (status.stopReason === "workflow-repair-needed") {
+		if (!snapshot.workflowRepairPlan)
+			return { kind: "wait", reason: "workflow-repair-plan-required" };
+		if (!isVerifiedWorkflowRepairPlan(snapshot.workflowRepairPlan))
+			fail("workflow repair plan is not host verified");
+	}
 	// An executed run with no carry has an unknowable actor and billing suffix.
 	// A fresh launch must prove the next process enforces the isolation boundary
 	// even if the older carried action itself was read-only repair.
@@ -438,7 +446,7 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 	// A serialized assertion or a changed source tip does not release a repair.
 	// The host verifies an explicit private operator review against this exact
 	// terminal carry, repair receipt and different tested source before branding.
-	if (action.kind === "repair-workflow-state") {
+	if (status.stopReason === "workflow-repair-needed") {
 		const plan = snapshot.workflowRepairPlan;
 		if (!plan) return { kind: "wait", reason: "workflow-repair-plan-required" };
 		if (!isVerifiedWorkflowRepairPlan(plan)) fail("workflow repair plan is not host verified");

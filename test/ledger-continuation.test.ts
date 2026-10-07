@@ -220,6 +220,20 @@ test("latest terminal carry is live-authenticated before supervisor projection",
 		request: live([anchor, done]), loadCarryArtifact: async () => carry };
 	const terminal = await authenticateLatestTerminalCarry(common);
 	assert.equal(isAuthenticatedTerminalCarryProof(terminal.proof), true);
+	const withResultArtifact: typeof fetch = async (url, init) =>
+		String(url).endsWith("/runs/7002/artifacts?per_page=100") ?
+			new Response(JSON.stringify({ total_count: 2, artifacts: [
+				{ id: 9002, name: CARRY_ARTIFACT_NAME, expired: false,
+					workflow_run: { id: 7002, head_sha: sha("b") } },
+				{ id: 9202, name: MISSION_ARTIFACT, expired: false,
+					digest: `sha256:${"9".repeat(64)}`,
+					workflow_run: { id: 7002, head_sha: sha("b") } }] })) :
+			common.request(url, init);
+	const resultBound = await authenticateLatestTerminalCarry({ ...common,
+		request: withResultArtifact });
+	assert.equal(resultBound.proof.resultArtifact?.artifactId, "9202");
+	assert.equal(resultBound.proof.resultArtifact?.archiveSha256, "9".repeat(64));
+	assert.equal(terminal.proof.resultArtifact, undefined);
 	const sealedWithStalePrefix = await authenticateLatestTerminalCarry({ ...common,
 		loadCarryArtifact: async () => ({ ...carry, incrementalControlPrefix: "stale-untrusted-prefix" }) });
 	assert.equal(isAuthenticatedTerminalCarryProof(sealedWithStalePrefix.proof), true);
@@ -2453,6 +2467,45 @@ test("received read-only assessment without a new goal preserves an unbound revi
 	assert.equal(effect.receipt.goals.length, 0);
 	assert.equal(effect.requestAudit.requests.length, 12);
 	assert.equal(effect.reviewedEffectAncestry.at(-1)?.abandonedWithoutGoal, true);
+	const repairCheckpoint = objectiveProgress(contract, {
+		boundedRuns: workCheckpoint.boundedRuns, selectedArtifacts,
+		unresolvedOperationIds: ["old-goal/O001"], assessment,
+		assessmentHistory: [{ iteration: 1, assessment, stopReason: "workflow-repair-needed",
+			advanced: false }], stopReason: "workflow-repair-needed",
+		pendingActionFacts: { unresolvedOperationRefs: ["old-goal/O001"],
+			failedStage: "objective-assessment", evidenceRefs: ["repair-state.json"] } });
+	assert.equal(repairCheckpoint.continuation.pendingAction?.kind, "reconcile-m07-operation");
+	const repairBundle = { ...assessmentBundle,
+		"objective-checkpoint.json": JSON.stringify(repairCheckpoint) };
+	assert.equal(Object.hasOwn(repairBundle, "repair-state.json"), false,
+		"the historical writer omitted this host repair receipt");
+	const repairing = await openAssessment();
+	const repairCarry = repairing.sealCurrent({ settledCny: 0.25, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: assessmentAudit, privateBundle: repairBundle });
+	const nextRunning = run(7007, 6, "in_progress", sha("1"));
+	const liveNext: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.endsWith("/actions/runs/7007"))
+			return new Response(JSON.stringify(nextRunning));
+		if (address.endsWith("/actions/runs/7007/jobs?per_page=100"))
+			return new Response(JSON.stringify({ total_count: 1, jobs: [{ id: 8007,
+				run_id: 7007, run_attempt: 1, head_sha: sha("1"), name: "private-campaign",
+				status: "in_progress", conclusion: null,
+				steps: [{ name: "Run private campaign", status: "in_progress", conclusion: null }] }] }));
+		return mock([anchor, firstDone, secondDone,
+			{ ...work, status: "completed", conclusion: "failure" },
+			{ ...next, status: "completed", conclusion: "failure" }, nextRunning])(url, init);
+	};
+	const freshFromMissingRepair = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7007, sha("1")),
+		request: liveNext, loadCarryArtifact: async () => repairCarry });
+	assert.equal(freshFromMissingRepair.priorPrivateBundle?.["repair-state.json"], undefined);
+	assert.equal(JSON.parse(freshFromMissingRepair.priorPrivateBundle!["objective-checkpoint.json"]!)
+		.continuation.pendingAction.kind, "reconcile-m07-operation");
+	assert.deepEqual(freshFromMissingRepair.priorCarryProof?.source.runId, "7006");
+	const repairClaim = await freshFromMissingRepair.claimOneUse(
+		freshFromMissingRepair.priorCarryProof!.envelopeSha256);
+	assert.equal(repairClaim.currentRunId, "7007");
 	const invalidAssessment = await openAssessment();
 	const badChain = { ...assessmentBundle,
 		"objective-assessment-receipts.json": emptyAssessments };

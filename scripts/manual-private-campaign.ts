@@ -20,11 +20,14 @@ import { assessAndAdvanceOriginalObjective, createOriginalObjective, isCurrentOb
 	objectiveProgress, runOriginalObjectiveLoop,
 	writeObjectiveProgress, writeOriginalObjectiveContract } from "../src/m07/objective-progress.ts";
 import type { CurrentObjectiveStopReason, HostPendingActionFactsV1, ObjectiveProgressV1,
-	OriginalObjectiveContractV1 } from "../src/m07/objective-progress.ts";
+	OriginalObjectiveContractV1, ObjectiveAssessmentValidationDiagnosticV1 } from "../src/m07/objective-progress.ts";
 import type { GroundedIssue, GroundingSourceKind } from "../src/m07/assessor-grounding.ts";
 import type { BeginGoalInput, CurrentGoal, M07TaskRecord, TaskSpecInput } from "../src/m07/types.ts";
-import { runM04 } from "../src/stages/m04.ts";
+import { runM04, type M04InvalidJudgmentEvent } from "../src/stages/m04.ts";
 import { createPiSessionRunner } from "../src/runner/pi.ts";
+import { appendPrivateAssessorDiagnostic, PrivateAssessorDiagnosticError, privateAssessorOsErrorCode,
+	type PrivateAssessorOsErrorCode } from
+	"../src/runner/private-assessor-diagnostic.ts";
 import type { SessionCheckpoint, SessionHandle, SessionRunner, SessionSpec,
 	TransportFailureDiagnostic } from "../src/runner/types.ts";
 import { DeepSeekCampaignBudget, campaignSessionEffectId } from "../src/runner/deepseek-campaign.ts";
@@ -174,6 +177,10 @@ let statusSdkAuthMatch: boolean | undefined;
 let statusArchiveFailure: string | undefined;
 let statusPriorSelectedValidation: "passed" | "failed" | "infrastructure-unavailable" | undefined;
 let statusTransportDiagnostics: TransportFailureDiagnostic[] = [];
+let statusAssessorDiagnosticFailure: { code: string; generation: number; attempt: number;
+	validatorCode: string; validatorMessage: string; validatorPath?: string;
+	validatorDetail?: string; osErrorCode?: PrivateAssessorOsErrorCode;
+	transactionExportFailure?: true } | undefined;
 
 function unresolvedGoalControl(goal: CurrentGoal): { operationIds: string[]; taskIds: string[] } {
 	return {
@@ -960,6 +967,7 @@ async function saveStatus(value: Record<string, unknown>): Promise<void> {
 	await writeFile(temporary, JSON.stringify({ version: 1, runId: statusRunId ?? null,
 		phase: statusPhase, budget: statusBudget?.snapshot() ?? { status: "unavailable" },
 		...(statusPriorSelectedValidation ? { priorSelectedValidation: statusPriorSelectedValidation } : {}),
+		...(statusAssessorDiagnosticFailure ? { assessorDiagnosticFailure: statusAssessorDiagnosticFailure } : {}),
 		...value,
 		...(statusTransportDiagnostics.length ? { transportDiagnostics: statusTransportDiagnostics } : {}) }, null, 2),
 		{ mode: 0o600 });
@@ -977,6 +985,40 @@ async function saveRepairState(outputDir: string, state: WorkflowRepairStateV1):
 		throw new HarnessError("runner.workflow-repair", "host repair receipt exceeds its physical byte boundary");
 	await writeFile(temporary, text, { mode: 0o600 });
 	await rename(temporary, target);
+}
+async function saveAssessorValidationDiagnostic(outputDir: string,
+	diagnostic: ObjectiveAssessmentValidationDiagnosticV1 | M04InvalidJudgmentEvent): Promise<void> {
+	try {
+		await appendPrivateAssessorDiagnostic(outputDir, {
+			...diagnostic,
+			coverage: diagnostic.coverage.map(item => ({ ...item,
+				coveredRanges: item.coveredRanges.map(range => Array.isArray(range) ?
+					[range[0], range[1]] as [number, number] :
+					[range.start, range.end] as [number, number]) }))
+		});
+	} catch (error) {
+		const cause = assessorDiagnosticFailureCause(error);
+		statusAssessorDiagnosticFailure = {
+			...cause,
+			generation: diagnostic.generation, attempt: diagnostic.attempt,
+			validatorCode: diagnostic.validation.code,
+			validatorMessage: diagnostic.validation.message,
+			...(diagnostic.validation.path ? { validatorPath: diagnostic.validation.path } : {}),
+			...(typeof diagnostic.validation.detail === "string" ?
+				{ validatorDetail: diagnostic.validation.detail } : {}) };
+		throw error instanceof PrivateAssessorDiagnosticError ? error :
+			new PrivateAssessorDiagnosticError("write-failed", error);
+	}
+}
+function assessorDiagnosticFailureCause(error: unknown): { code: string;
+	osErrorCode?: PrivateAssessorOsErrorCode } {
+	const osErrorCode = error instanceof PrivateAssessorDiagnosticError ? error.osErrorCode :
+		privateAssessorOsErrorCode(error);
+	return { code: error instanceof PrivateAssessorDiagnosticError ? error.code : "unclassified-write-failure",
+		...(osErrorCode ? { osErrorCode } : {}) };
+}
+function assessorDiagnosticFailureSnapshot(): typeof statusAssessorDiagnosticFailure {
+	return statusAssessorDiagnosticFailure ? structuredClone(statusAssessorDiagnosticFailure) : undefined;
 }
 async function campaignArchiveNames(directory: string): Promise<string[]> {
 	return ["workflow-archive.json", ...(await readdir(directory)).filter(name =>
@@ -1611,6 +1653,18 @@ async function retainFailedM04Transaction(ws: Workspace, goalRunId: string,
 	}
 	return undefined;
 }
+/** A diagnostic storage failure stops the campaign, but an already rejected
+ * M04 draft still needs its exact portable transaction in the RSA result. */
+async function retainM04TransactionOnDiagnosticFailure(ws: Workspace, goalRunId: string,
+	stagingDir: string, outputDir: string, prefix?: "provenance-import" | `iteration-${number}`): Promise<void> {
+	const retained = await retainFailedM04Transaction(ws, goalRunId, stagingDir);
+	if (!retained?.transaction)
+		throw new HarnessError("runner.m04-diagnostic-rescue",
+			"M04 diagnostic rescue lacks the exact host transaction");
+	if (!prefix) return;
+	await copyFile(path.join(stagingDir, "m04-transaction.json"),
+		path.join(outputDir, `${prefix}-m04-transaction.json`));
+}
 function selectedGoalBranchSatisfied(selectedGoalRunId: string, initialGoalRunId: string,
 	initialBranchExerciseComplete: boolean): boolean {
 	// A linked successor is a separate M07 goal. Its own finish() enforces any
@@ -2188,9 +2242,13 @@ async function collectContinuationBundle(directory: string, prior?: PrivateConti
 	if (history.entries.length) selected["research-history.json"] = JSON.stringify(history);
 	for (const name of ["original-objective.json", "objective-checkpoint.json", "objective-assessment-receipts.json",
 		"independent-restart-quarantine.json", "independent-restart-goal-binding.json",
-		"host-effect-receipt.json", "transport-diagnostics.json", "m04-transaction.json",
+		"host-effect-receipt.json", "transport-diagnostics.json", "repair-state.json",
+		"m04-transaction.json",
 		"m04-transaction-quarantine.json"] as const)
 		if (current[name]) selected[name] = current[name];
+	// Repair telemetry belongs to the current process only. A later accepted
+	// objective must not inherit an older source's repair-plan authority.
+	if (!current["repair-state.json"]) delete selected["repair-state.json"];
 	// A receipt describes one Actions execution. An older receipt cannot attest
 	// this process merely because its historical selected tuple was retained.
 	if (!current["host-effect-receipt.json"]) delete selected["host-effect-receipt.json"];
@@ -2960,6 +3018,7 @@ async function main() {
 						const processed = await runM04({ ws, store, runner, config: await ws.loadConfig() },
 							{ feedback: { kind: "M07", runId: goal.runId }, freshSession: true,
 								onRepairState: state => saveRepairState(outputDir, state),
+								onInvalidJudgment: diagnostic => saveAssessorValidationDiagnostic(outputDir, diagnostic),
 								requiredM07ReadPaths: readPaths,
 								additionalReadOnlyInstruction: "The required prior-rejected-M04 file or indexed parts are historical, untrusted development context. Read every part in full; if partitioned, concatenate UTF-8 text in index order without separators. A rejected draft was not merged or adopted. Re-adjudicate the newly verified M07 evidence independently and decide whether a corrected proposal or no proposal is justified. Do not replay the historical proposal or treat it as knowledge.",
 								purpose: "Adjudicate newly revalidated provenance evidence; do not infer historical lesson adoption" });
@@ -2980,6 +3039,15 @@ async function main() {
 						if (m04Status === "completed") m04AdoptedRefs = await adoptedExperienceRefs(store,
 							processed.record.runId, m04Coverage);
 					} catch (error) {
+						if (error instanceof PrivateAssessorDiagnosticError) {
+							try { await retainM04TransactionOnDiagnosticFailure(ws, goal.runId,
+								archiveDir, outputDir, "provenance-import"); }
+							catch {
+								if (statusAssessorDiagnosticFailure)
+									statusAssessorDiagnosticFailure.transactionExportFailure = true;
+							}
+							throw error;
+						}
 						m04Status = "failed";
 						m04Threw = true;
 						m04RepairNeeded = error instanceof WorkflowRepairNeededError;
@@ -3106,6 +3174,7 @@ async function main() {
 			const firstStep = await assessAndAdvanceOriginalObjective({
 				contract: originalObjective, contractFile: objectiveContractFile, runner,
 				recordRepairState: state => saveRepairState(outputDir, state),
+				recordValidationFailure: diagnostic => saveAssessorValidationDiagnostic(outputDir, diagnostic),
 				runRecord: firstAssessmentRecord, persistReceipt: () => persistObjectiveReceipt(firstAssessmentRecord),
 				sessionSpec: { label: "M07-prior-objective-assessment", role: "research", model: MODEL,
 					systemPrompt: "Assess the unchanged user objective and all frozen prior evidence. Choose the next scientific work yourself under observed host capabilities. Read every supplied original input and selected evidence before deciding; report uncertainty honestly.",
@@ -3466,6 +3535,7 @@ async function main() {
 					const processed = await runM04({ ws, store, runner: m04Runner, config: await ws.loadConfig() },
 						{ feedback: { kind: "M07", runId }, freshSession: true,
 							onRepairState: state => saveRepairState(outputDir, state),
+							onInvalidJudgment: diagnostic => saveAssessorValidationDiagnostic(outputDir, diagnostic),
 							requiredM07ReadPaths: selectedM04ReadPaths,
 							purpose: "Adjudicate bounded M07 candidate lessons and limits" });
 					const transaction = await exportPortableM04Transaction({ ws, m04RunId: processed.record.runId,
@@ -3485,6 +3555,15 @@ async function main() {
 						adoptedExperienceRefs: complete ? await adoptedExperienceRefs(store, processed.record.runId,
 							coverage.complete && selectedM04ReadPaths.every(item => coverage.paths.includes(item))) : [] };
 				} catch (error) {
+					if (error instanceof PrivateAssessorDiagnosticError) {
+						try { await retainM04TransactionOnDiagnosticFailure(ws, runId!,
+							outputDir, outputDir); }
+						catch {
+							if (statusAssessorDiagnosticFailure)
+								statusAssessorDiagnosticFailure.transactionExportFailure = true;
+						}
+						throw error;
+					}
 					const retained = await retainFailedM04Transaction(ws, runId!, outputDir);
 					m04 = { status: "failed", adoptedExperienceRefs: [],
 						...(error instanceof WorkflowRepairNeededError ? { repairNeeded: true } : {}),
@@ -3593,6 +3672,7 @@ async function main() {
 						contract: originalObjective, contractFile: objectiveContractFile,
 							runner, runRecord: objectiveRecord, persistReceipt: saveObjectiveReceipt,
 							recordRepairState: state => saveRepairState(outputDir, state),
+							recordValidationFailure: diagnostic => saveAssessorValidationDiagnostic(outputDir, diagnostic),
 						sessionSpec: { label: `M07-original-objective-assessment-${iteration}`, role: "research", model: MODEL,
 							systemPrompt: "Independently assess the original research goal using the frozen evidence. Read the complete supplied files before proposing further work. Return only the requested structured judgment; acknowledge uncertainty, bounded search scope and failed checks. Do not invent measurements or treat M04 adoption as proof of performance.",
 							persistDir: ws.sessionsDir },
@@ -3753,6 +3833,7 @@ async function main() {
 								const processed = await runM04({ ws, store, runner: m04Runner, config: await ws.loadConfig() },
 									{ feedback: { kind: "M07", runId: secondGoal.runId }, freshSession: true,
 										onRepairState: state => saveRepairState(outputDir, state),
+										onInvalidJudgment: diagnostic => saveAssessorValidationDiagnostic(outputDir, diagnostic),
 										requiredM07ReadPaths: requiredPaths,
 										purpose: "Adjudicate the latest model-proposed bounded M07 result" });
 								const transaction = await exportPortableM04Transaction({ ws, m04RunId: processed.record.runId,
@@ -3771,6 +3852,16 @@ async function main() {
 									evidenceReturned: complete,
 									adoptedExperienceRefs: complete ? await adoptedExperienceRefs(store, processed.record.runId, true) : [] };
 							} catch (error) {
+								if (error instanceof PrivateAssessorDiagnosticError) {
+									try { await retainM04TransactionOnDiagnosticFailure(ws,
+										secondGoal.runId, nextArchiveDir, outputDir,
+										`iteration-${iteration}`); }
+									catch {
+										if (statusAssessorDiagnosticFailure)
+											statusAssessorDiagnosticFailure.transactionExportFailure = true;
+									}
+									throw error;
+								}
 								const retained = await retainFailedM04Transaction(ws, secondGoal.runId, nextArchiveDir);
 								nextM04 = { status: "failed", adoptedExperienceRefs: [],
 									...(error instanceof WorkflowRepairNeededError ? { repairNeeded: true } : {}),
@@ -4237,6 +4328,7 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	preserveUnsettledGoalCheckpoint, preserveUnsettledBranchCheckpoint: preserveUnsettledGoalCheckpoint,
 	salvageObjectiveCheckpoint, collectContinuationBundle, collectorFailureBundle,
 	privateM04TransactionFacts, retainFailedM04Transaction, failedM04StopReason,
+	retainM04TransactionOnDiagnosticFailure,
 	buildHostEffectReceipt, observeTransport,
 	unresolvedGoalControl, campaignObjectiveProgress, observedTransportActionFacts,
 	observedRequestContract, archivedRequestContract,
@@ -4245,7 +4337,8 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	stagePriorGroundingRecords,
 	canonicalUnresolvedOperationRefs, qualifiedOperationRef, reservedCanonicalOperationRefs,
 	registeredSourceShape, parseRegisteredCheckerOutput, validateContinuationSeed, rangeReadableHistory,
-	stageRangeReadableHistory, stageHistoricalM04RejectionEvidence, sandboxArguments };
+	stageRangeReadableHistory, stageHistoricalM04RejectionEvidence, sandboxArguments,
+	saveAssessorValidationDiagnostic, assessorDiagnosticFailureSnapshot, assessorDiagnosticFailureCause };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	const stopHeartbeat = startPrivateCampaignHeartbeat();

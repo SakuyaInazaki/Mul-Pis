@@ -633,6 +633,119 @@ test("indexed prior grounding stays out of prompt and omitted issues remain open
 	assert.deepEqual(result.assessment?.unreadEvidence, []);
 });
 
+test("indexed assessor repairs an old-schema response with the same grounded delta contract", async t => {
+	const f = await fixture(t);
+	const issues: GroundedAssessmentProposal["issues"] = [{ id: "prior-check",
+		claim: "A prior finding still needs validation.", status: "open",
+		classification: "necessary-verification", claimAtRisk: "A recommendation is supported.",
+		implication: "A new check can change which result is selected.",
+		sourceRefs: [{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }] }];
+	const prior = await addPriorGroundingIndex(f, [], issues);
+	const oldSchema = { ...assessment("continue"),
+		unresolvedDetails: [issues[0]!.claim] };
+	const corrected = { version: 1, decision: "continue", rationale: "Synthetic checked plan",
+		evidenceRefs: ["candidate.cpp", "verification.json"],
+		unresolvedObligations: ["original-task"],
+		nextTask: { objective: "Run a synthetic independent check", addresses: ["original-task"],
+			adapterScope: "two-target-existing" },
+		groundedAssessmentDelta: { version: 1, kind: "grounded-assessment-delta",
+			newIssues: [], resolutions: [], nextTask: { obligationIds: ["original-task"],
+				addresses: ["prior-check"], adapterScope: "two-target-existing",
+				decisionChangingHypothesis: "The new check could change candidate selection.",
+				expectedEvidence: "Independent machine check", sourceRefs: [
+					{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }] } } };
+	const diagnostics: Array<{ sessionId: string; generation: number; attempt: number;
+		rawResponse: string; validation: { code: string; path: string; message: string } }> = [];
+	let prompts = 0, dispatched = 0;
+	const runner = new FakeSessionRunner(({ message }) => {
+		prompts++;
+		if (prompts === 1) return { text: JSON.stringify(oldSchema),
+			readReturns: [...ranges(f), prior.indexRead] };
+		assert.equal(diagnostics.length, 1, "invalid reply was retained before another prompt");
+		assert.match(message, /groundedAssessmentDelta/);
+		assert.match(message, /decisionChangingHypothesis/);
+		assert.match(message, /Omit top-level unresolvedDetails/);
+		return { text: JSON.stringify(corrected) };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		evidenceAccess: prior.access, groundingPolicy: { require: true,
+			sourceKinds: prior.sourceKinds, legacyOpenDetails: [], previousIssues: issues,
+			priorGroundingIndex: prior.priorGroundingIndex },
+		capabilities: [{ scope: "two-target-existing", available: true,
+			description: "Synthetic confined adapter", limits: [] }],
+		recordValidationFailure: async value => { diagnostics.push(value); },
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { dispatched++; } });
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.equal(dispatched, 1);
+	assert.equal(prompts, 2);
+	assert.equal(runner.created.length, 1);
+	assert.deepEqual(result.assessment?.unreadEvidence, []);
+	assert.equal(diagnostics[0].validation.path, "$.groundedAssessmentDelta");
+	assert.equal(diagnostics[0].validation.code, "m07.objective-assessment");
+	assert.equal(diagnostics[0].rawResponse, JSON.stringify(oldSchema));
+	assert.equal(diagnostics[0].generation, 1);
+	assert.equal(diagnostics[0].attempt, 1);
+});
+
+test("indexed assessor retains a precise nested validator path before correction", async t => {
+	const f = await fixture(t);
+	const prior = await addPriorGroundingIndex(f, [], []);
+	const corrected = deltaReply("fulfilled");
+	const invalid = { ...corrected, groundedAssessmentDelta: {
+		...corrected.groundedAssessmentDelta, nextTask: { obligationIds: ["original-task"],
+			addresses: ["new-issue"], adapterScope: "two-target-existing",
+			expectedEvidence: "Synthetic result", sourceRefs: [
+				{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }] } } };
+	const diagnostics: Array<{ validation: { path: string; detail?: string }; rawResponse: string }> = [];
+	let prompts = 0;
+	const runner = new FakeSessionRunner(() => {
+		prompts++;
+		return prompts === 1 ? { text: JSON.stringify(invalid),
+			readReturns: [...ranges(f), prior.indexRead] } :
+			{ text: JSON.stringify(corrected) };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		evidenceAccess: prior.access, groundingPolicy: { require: true,
+			sourceKinds: prior.sourceKinds, legacyOpenDetails: [], previousIssues: [],
+			priorGroundingIndex: prior.priorGroundingIndex },
+		capabilities: [{ scope: "two-target-existing", available: true,
+			description: "Synthetic confined adapter", limits: [] }],
+		recordValidationFailure: async item => { diagnostics.push(item); },
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { throw new Error("invalid assessor response must not dispatch"); } });
+	assert.equal(result.stopReason, "model-closure-unverified");
+	assert.equal(prompts, 2);
+	assert.equal(diagnostics.length, 1);
+	assert.equal(diagnostics[0].validation.path, "$.groundedAssessmentDelta.nextTask");
+	assert.equal(diagnostics[0].validation.detail,
+		"assessor-grounding: next task needs a feasible scope and decision-changing hypothesis");
+	assert.equal(diagnostics[0].rawResponse, JSON.stringify(invalid));
+});
+
+test("a failed private rejection write prevents another assessor prompt or task dispatch", async t => {
+	const f = await fixture(t);
+	let prompts = 0, dispatches = 0, writes = 0;
+	const runner = new FakeSessionRunner(() => {
+		prompts++;
+		return { text: "not JSON", readReturns: ranges(f) };
+	});
+	await assert.rejects(assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		recordValidationFailure: async item => {
+			writes++;
+			assert.equal(item.validation.path, "$");
+			throw new Error("synthetic private diagnostic storage failure");
+		}, advance: async () => { dispatches++; } }),
+		/synthetic private diagnostic storage failure/);
+	assert.equal(prompts, 1);
+	assert.equal(writes, 1);
+	assert.equal(dispatches, 0);
+});
+
 test("missing or tampered prior grounding part is rejected before an assessor prompt", async t => {
 	const f = await fixture(t);
 	const legacy = ["authenticated old detail"];

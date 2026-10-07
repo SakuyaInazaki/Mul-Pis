@@ -48,6 +48,21 @@ test("private M04 transaction exports the exact rejected draft and receipt witho
 	assert.equal(recovered?.transaction?.state, "rejected-draft");
 	assert.equal(offlineChecks.failedM04StopReason("failed", recovered?.transaction?.state),
 		"m04-draft-rejected");
+	for (const prefix of ["provenance-import", "iteration-23"] as const) {
+		const temporary = path.join(root, `${prefix}-temporary`);
+		await mkdir(temporary);
+		await offlineChecks.retainM04TransactionOnDiagnosticFailure(ws,
+			"synthetic-goal", temporary, out, prefix);
+		await rm(temporary, { recursive: true, force: true });
+		const exported = JSON.parse(await readFile(path.join(out,
+			`${prefix}-m04-transaction.json`), "utf8"));
+		assert.equal(exported.state, "rejected-draft");
+		assert.equal(exported.attempts[0].proposalDraftJson, draft);
+		assert.equal(exported.attempts[0].validationReceiptJson, receipt);
+	}
+	await assert.rejects(offlineChecks.retainM04TransactionOnDiagnosticFailure(ws,
+		"unrelated-goal", out, out, "iteration-24"),
+		/M04 diagnostic rescue lacks the exact host transaction/);
 	await writeFile(path.join(ws.runDir("M04", run.runId), "proposal-validation-0001.json"),
 		receipt.replace("synthetic structural field missing", "different issue"));
 	await assert.rejects(exportPortableM04Transaction({ ws, m04RunId: run.runId, destination: out }),

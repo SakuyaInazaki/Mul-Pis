@@ -168,7 +168,7 @@ function intentBinding(intent: ResumeIntent): ResumeJournalRecord["intentBinding
 		!intent.contractId || intent.boundary !== "new-isolated-workspace-no-prior-session-resume" ||
 		pendingActionIdentity(intent.pendingAction) !== intent.pendingActionSha256 ||
 		intent.pendingAction.kind !== intent.actionKind ||
-		(intent.actionKind === "repair-workflow-state") !== Boolean(workflowRepair))
+		(intent.pendingAction.reasonCode === "workflow-repair-needed") !== Boolean(workflowRepair))
 		refuse("invalid or changed private intent");
 	const source = { runId: intent.source.runId, runAttempt: intent.source.runAttempt,
 		commit: intent.source.commit };
@@ -266,7 +266,9 @@ async function readRecord(file: string): Promise<ResumeJournalRecord> {
 		!hex64(bound.envelopeSha256) || !hex64(bound.selectedTupleSha256) ||
 		!hex64(bound.pendingActionSha256) || typeof bound.contractId !== "string" ||
 		!bound.contractId || typeof bound.actionKind !== "string" || !bound.actionKind ||
-		(bound.actionKind === "repair-workflow-state") !== Boolean(workflowRepair) ||
+		(bound.actionKind === "repair-workflow-state" && !workflowRepair) ||
+		(Boolean(workflowRepair) && !["repair-workflow-state", "reconcile-m07-operation",
+			"reconcile-m04-transaction"].includes(bound.actionKind)) ||
 		(workflowRepair !== undefined && canonical(workflowRepair) !== canonical(bound.workflowRepair)) ||
 		(bound.actionProvenance !== undefined &&
 			canonical(provenanceBinding(bound.actionProvenance)) !== canonical(bound.actionProvenance)) ||

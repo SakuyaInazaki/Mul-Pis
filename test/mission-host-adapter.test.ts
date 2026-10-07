@@ -19,6 +19,8 @@ import { authenticateLatestTerminalCarry, authenticatedSupervisorProjection,
 	type CurrentMissionRun } from "../src/runner/ledger-continuation.ts";
 import { workflowRepairState, type WorkflowRepairFailure, type WorkflowRepairStage,
 	type WorkflowRepairStrategy } from "../src/runner/repair-liveness.ts";
+import { isVerifiedResultOnlyRepairState, readReviewedResultOnlyRepairState,
+	type ResultOnlyRepairReviewReceiptV1 } from "../src/runner/result-only-repair-review.ts";
 import { decodeCarrySidecars } from "../src/runner/carry-sidecar-codec.ts";
 import { MissionResumeJournal } from "../src/runner/mission-resume-journal.ts";
 import { IncrementalPrivateCheckpointJournal } from "../src/runner/incremental-private-checkpoint.ts";
@@ -64,6 +66,7 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 	repairStage?: WorkflowRepairStage; repairFailure?: WorkflowRepairFailure;
 	repairActionStage?: WorkflowRepairStage; repairStrategy?: WorkflowRepairStrategy;
 	omitRepairStage?: boolean; omitRepairEvidence?: boolean;
+	resultOnlyRepair?: boolean;
 	stopReason?: "bounded-run-incomplete" | "assessment-failed" | "workflow-repair-needed" } = {}) {
 	const dir = await mkdtemp(path.join(os.tmpdir(), "mission-host-adapter-"));
 	t.after(() => rm(dir, { recursive: true, force: true }));
@@ -96,7 +99,8 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 		"objective-checkpoint.json": JSON.stringify(checkpoint),
 		"candidate.cpp": "synthetic candidate", "verification.json": "{}",
 		"workflow-archive.json": "{}",
-		...(repairState ? { "repair-state.json": JSON.stringify(repairState) } : {}) };
+		...(repairState && !options.resultOnlyRepair ?
+			{ "repair-state.json": JSON.stringify(repairState) } : {}) };
 	const payload = { version: 2, kind: "mul-pis-private-mission-ledger", missionId: MISSION_ID,
 		repository: MISSION_REPOSITORY, globalMaxCny: MISSION_TOTAL_CNY,
 		priorCommittedCny: 4.125, revision: 1,
@@ -125,7 +129,13 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 	const live: LiveState = { sourceTip: sourceCommit, controlTip: priorControlCommit,
 		ciHead: sourceCommit, ciConclusion: "success", ciStatus: "completed",
 		ciRunAttempt: 1, ciCount: 1, sourceTree: testedTree };
-	const reviewEvidence = { sourceText: "export async function runM04() { return 'reviewed-handoff'; }\n",
+	const codePath = options.repairStage === "objective-assessment" ?
+		"src/m07/objective-progress.ts" : reviewedCodePath;
+	const testPath = options.repairStage === "objective-assessment" ?
+		"test/m07-objective-progress.test.ts" : reviewedTestPath;
+	const symbol = options.repairStage === "objective-assessment" ? "objectiveProgress" : "runM04";
+	const reviewEvidence = { codePath, testPath, symbol, testName: reviewedTestName,
+		sourceText: `export async function ${symbol}() { return 'reviewed-handoff'; }\n`,
 		testText: `test(${JSON.stringify(reviewedTestName)}, async () => {});\n` };
 	let terminal = false;
 	const request: typeof fetch = async url => {
@@ -135,8 +145,12 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 			data = { total_count: 2, workflow_runs: [terminal ? done : running, anchor] };
 		else if (address.endsWith("/runs/7002")) data = done;
 		else if (address.endsWith("/runs/7002/artifacts?per_page=100"))
-			data = { total_count: 1, artifacts: [{ id: 9002, name: CARRY_ARTIFACT_NAME,
-				expired: false, workflow_run: { id: 7002 } }] };
+			data = { total_count: options.resultOnlyRepair ? 2 : 1, artifacts: [
+				{ id: 9002, name: CARRY_ARTIFACT_NAME,
+					expired: false, workflow_run: { id: 7002 } },
+				...(options.resultOnlyRepair ? [{ id: 9202, name: MISSION_ARTIFACT,
+					expired: false, digest: `sha256:${"9".repeat(64)}`,
+					workflow_run: { id: 7002, head_sha: options.controlRequest ? requestCommit : sourceCommit } }] : [])] };
 		else if (address.endsWith("/runs/7002/jobs?per_page=100"))
 			data = { total_count: 1, jobs: [{ id: 6002, run_id: 7002,
 				run_attempt: 1, head_sha: options.controlRequest ? requestCommit : sourceCommit,
@@ -153,9 +167,9 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 		} else if (address.includes("/contents/")) {
 			const parsed = new URL(address);
 			const file = parsed.pathname.split("/contents/")[1]!;
-			const content = file === reviewedCodePath ? parsed.searchParams.get("ref") === sourceCommit ?
-				"export async function runM04() { return 'prior-handoff'; }\n" : reviewEvidence.sourceText :
-				file === reviewedTestPath ? reviewEvidence.testText : "";
+			const content = file === reviewEvidence.codePath ? parsed.searchParams.get("ref") === sourceCommit ?
+				`export async function ${symbol}() { return 'prior-handoff'; }\n` : reviewEvidence.sourceText :
+				file === reviewEvidence.testPath ? reviewEvidence.testText : "";
 			data = { type: "file", path: file, encoding: "base64", size: Buffer.byteLength(content),
 				content: Buffer.from(content).toString("base64") };
 		} else if (address.includes("/git/commits/"))
@@ -214,7 +228,7 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 	}
 	terminal = true;
 	const journal = new MissionResumeJournal(path.join(dir, "journal"));
-	return { dir, journal, live, checkpoint, bundle, sealed, request, reviewEvidence,
+	return { dir, journal, live, checkpoint, bundle, repairState, sealed, request, reviewEvidence,
 		input: { source: actualSource, seedEnvelopeB64, publicKeyFile, expectedSpkiSha256,
 			githubToken: "synthetic-token", request, journal,
 			loadCarryArtifact: async () => options.legacyV3 ? sealed.envelopeB64 : sealed } };
@@ -222,8 +236,9 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 
 async function repairFixture(t: TestContext, options: { unknownOperation?: boolean;
 	repairStage?: WorkflowRepairStage; repairFailure?: WorkflowRepairFailure;
-	repairActionStage?: WorkflowRepairStage; repairStrategy?: WorkflowRepairStrategy;
-	omitRepairStage?: boolean; omitRepairEvidence?: boolean } = {}) {
+		repairActionStage?: WorkflowRepairStage; repairStrategy?: WorkflowRepairStrategy;
+		omitRepairStage?: boolean; omitRepairEvidence?: boolean;
+		resultOnlyRepair?: boolean } = {}) {
 	const f = await fixture(t, { carriedAction: true, stopReason: "workflow-repair-needed", ...options });
 	f.live.sourceTip = sha40("e");
 	f.live.sourceTree = sha40("1");
@@ -231,7 +246,7 @@ async function repairFixture(t: TestContext, options: { unknownOperation?: boole
 	const authenticated = await authenticateLatestTerminalCarry(f.input);
 	const projected = authenticatedSupervisorProjection(authenticated.proof, authenticated.privateBundle)!;
 	const carry = projected.terminalCarry;
-	const bytes = f.bundle["repair-state.json"]!;
+	const bytes = f.bundle["repair-state.json"] ?? JSON.stringify(f.repairState);
 	const plan: HostReviewedWorkflowRepairPlanV1 = {
 		version: 1, kind: "host-reviewed-workflow-repair-plan",
 		prior: { source: { runId: carry.source.runId, runAttempt: carry.source.runAttempt,
@@ -244,14 +259,54 @@ async function repairFixture(t: TestContext, options: { unknownOperation?: boole
 			successfulCi: { workflow: "workflow-regression.yml", runId: "9003", runAttempt: 1,
 				headCommit: f.live.sourceTip, conclusion: "success" } },
 		review: { kind: "operator-code-review", strategyClass: "evidence-read-handoff",
-			codeEvidenceRefs: [{ path: reviewedCodePath, symbol: "runM04" }],
+			codeEvidenceRefs: [{ path: f.reviewEvidence.codePath,
+				symbol: f.reviewEvidence.symbol }],
 			offlineTests: { command: "npm run typecheck && npm test", conclusion: "passed",
 				sourceCommit: f.live.sourceTip, tree: f.live.sourceTree,
-				testEvidenceRefs: [{ path: reviewedTestPath, name: reviewedTestName }] } },
+				testEvidenceRefs: [{ path: f.reviewEvidence.testPath,
+					name: f.reviewEvidence.testName }] } },
 		boundary: "new-isolated-workspace-no-prior-session-resume" };
 	const repairPlanPrivateFile = path.join(f.dir, "operator-reviewed-repair.json");
 	await writeFile(repairPlanPrivateFile, JSON.stringify(plan), { mode: 0o600 });
 	return { ...f, plan, input: { ...f.input, repairPlanPrivateFile } };
+}
+
+async function resultOnlyRepairFixture(t: TestContext) {
+	const f = await repairFixture(t, { unknownOperation: true,
+		repairStage: "objective-assessment", repairFailure: "unread-evidence",
+		resultOnlyRepair: true });
+	assert.equal(f.bundle["repair-state.json"], undefined);
+	const envelopeBytes = Buffer.from(JSON.stringify({
+		format: "mul-pis-private-campaign-v1", key_wrap: "RSA-3072-OAEP-SHA256",
+		content_cipher: "AES-256-GCM", recipient_spki_sha256: "8".repeat(64),
+		metadata: { repository: MISSION_REPOSITORY, run_id: "7002", run_attempt: "1",
+			commit: sourceCommit, event: "workflow_dispatch" },
+		wrapped_key_b64: randomBytes(384).toString("base64"),
+		nonce_b64: randomBytes(12).toString("base64"),
+		ciphertext_b64: randomBytes(32).toString("base64"),
+	}));
+	const receipt: ResultOnlyRepairReviewReceiptV1 = {
+		version: 1, kind: "host-reviewed-result-only-repair-state",
+		prior: { source: f.plan.prior.source, sourceTree: f.plan.prior.sourceTree,
+			carryEnvelopeSha256: f.plan.prior.envelopeSha256,
+			checkpointSha256: f.plan.prior.checkpointSha256,
+			contractId: f.plan.prior.contractId,
+			selectedTupleSha256: f.plan.prior.selectedTupleSha256,
+			pendingActionSha256: f.plan.prior.pendingActionSha256 },
+		result: { artifactId: "9202", archiveSha256: "9".repeat(64),
+			envelopeSha256: createHash("sha256").update(envelopeBytes).digest("hex"),
+			envelopeFile: "private-campaign-outcome.enc.json" },
+		repair: { file: "repair-state.json", bytesUtf8: JSON.stringify(f.repairState),
+			sha256: createHash("sha256").update(JSON.stringify(f.repairState)).digest("hex") },
+		review: { kind: "operator-rsa-decryption-review",
+			conclusion: "control-only-repair-state-reviewed",
+			researchResultUse: "untrusted-no-scientific-adoption" }
+	};
+	const resultOnlyRepairReviewPrivateFile = path.join(f.dir, "result-only-review.json");
+	await writeFile(resultOnlyRepairReviewPrivateFile, JSON.stringify(receipt), { mode: 0o600 });
+	return { ...f, receipt, envelopeBytes, resultOnlyRepairReviewPrivateFile,
+		input: { ...f.input, resultOnlyRepairReviewPrivateFile,
+			loadResultEnvelope: async () => envelopeBytes } };
 }
 
 async function interruptedFixture(t: TestContext) {
@@ -491,11 +546,15 @@ test("workflow repair refuses the same source or tree and unrelated review evide
 	}
 });
 
-test("workflow repair cannot clear unknown effects or reuse a changed review reservation", async t => {
+test("workflow repair retains unknown effects and cannot reuse a changed review reservation", async t => {
 	const unknown = await repairFixture(t, { unknownOperation: true });
-	await assert.rejects(prepareAuthenticatedResumeRequest(unknown.input), error =>
-		error instanceof MissionHostPreparationError && error.refusal.code === "workflow-repair-plan-unrelated");
-	await assert.rejects(stat(unknown.journal.directory), { code: "ENOENT" });
+	const preserving = await prepareAuthenticatedResumeRequest(unknown.input);
+	assert.equal(preserving.decision.kind, "dispatch");
+	if (preserving.decision.kind === "dispatch") {
+		assert.equal(preserving.decision.intent.pendingAction.kind, "reconcile-m07-operation");
+		assert.deepEqual(preserving.decision.intent.pendingAction.target?.operationRefs,
+			["old-goal/O001"]);
+	}
 	const f = await repairFixture(t);
 	const first = await prepareAuthenticatedResumeRequest(f.input);
 	const changed = { ...f.plan, review: { ...f.plan.review, strategyClass: "fresh-context-handoff" } };
@@ -503,6 +562,119 @@ test("workflow repair cannot clear unknown effects or reuse a changed review res
 	await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error =>
 		error instanceof MissionHostPreparationError && error.refusal.code === "control-request-delivery-uncertain");
 	assert.equal((await f.journal.get(first.journalKey!))?.state, "reserved");
+});
+
+test("reviewed result-only repair state permits the carried reconcile action without changing AEAD science", async t => {
+	const f = await resultOnlyRepairFixture(t);
+	const authenticated = await authenticateLatestTerminalCarry(f.input);
+	const branded = await readReviewedResultOnlyRepairState({
+		privateReceiptFile: f.resultOnlyRepairReviewPrivateFile,
+		terminalProof: authenticated.proof, privateBundle: authenticated.privateBundle,
+		terminalSourceTree: testedTree, terminalEvent: "workflow_dispatch",
+		encryptedEnvelopeBytes: f.envelopeBytes });
+	assert.equal(isVerifiedResultOnlyRepairState(branded), true);
+	assert.equal(isVerifiedResultOnlyRepairState({ ...branded }), false);
+	assert.equal(authenticated.privateBundle["repair-state.json"], undefined);
+	const prepared = await prepareAuthenticatedResumeRequest(f.input);
+	assert.equal(prepared.decision.kind, "dispatch");
+	assert.equal(prepared.descriptor?.sourceCommit, f.plan.replacement.testedSourceCommit);
+	if (prepared.decision.kind === "dispatch") {
+		assert.equal(prepared.decision.intent.pendingAction.kind, "reconcile-m07-operation");
+		assert.deepEqual(prepared.decision.intent.pendingAction.target?.operationRefs,
+			["old-goal/O001"]);
+	}
+	assert.equal((await f.journal.get(prepared.journalKey!))?.state, "reserved");
+	assert(!JSON.stringify(prepared.descriptor).includes("repair-state"));
+});
+
+test("result-only review without a receipt waits, and altered artifact, repair and carry are refused", async t => {
+	const f = await resultOnlyRepairFixture(t);
+	const { resultOnlyRepairReviewPrivateFile: _review, ...withoutReview } = f.input;
+	const waiting = await prepareAuthenticatedResumeRequest(withoutReview);
+	assert.deepEqual(waiting.decision,
+		{ kind: "wait", reason: "workflow-repair-plan-required" });
+	assert.equal(waiting.descriptor, undefined);
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	const changes: Array<(receipt: ResultOnlyRepairReviewReceiptV1) => ResultOnlyRepairReviewReceiptV1> = [
+		receipt => ({ ...receipt, prior: { ...receipt.prior,
+			sourceTree: sha40("0") } }),
+		receipt => ({ ...receipt, prior: { ...receipt.prior,
+			carryEnvelopeSha256: "0".repeat(64) } }),
+		receipt => ({ ...receipt, prior: { ...receipt.prior,
+			checkpointSha256: "0".repeat(64) } }),
+		receipt => ({ ...receipt, prior: { ...receipt.prior,
+			pendingActionSha256: "0".repeat(64) } }),
+		receipt => ({ ...receipt, result: { ...receipt.result,
+			artifactId: "9203" } }),
+		receipt => ({ ...receipt, result: { ...receipt.result,
+			archiveSha256: "0".repeat(64) } }),
+		receipt => ({ ...receipt, result: { ...receipt.result,
+			envelopeSha256: "0".repeat(64) } }),
+		receipt => ({ ...receipt, repair: { ...receipt.repair,
+			sha256: "0".repeat(64) } }),
+		receipt => ({ ...receipt, repair: { ...receipt.repair,
+			bytesUtf8: JSON.stringify({ ...f.repairState, stage: "m04-judgment" }) } }),
+	];
+	for (const change of changes) {
+		await writeFile(f.resultOnlyRepairReviewPrivateFile, JSON.stringify(change(f.receipt)));
+		await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error =>
+			error instanceof MissionHostPreparationError &&
+			error.refusal.code === "result-only-repair-review-invalid");
+		assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	}
+});
+
+test("result-only repair requires one live, unexpired result artifact", async t => {
+	for (const fault of ["missing", "expired", "duplicate"] as const) {
+		const f = await resultOnlyRepairFixture(t);
+		const request: typeof fetch = async (url, init) => {
+			if (!String(url).endsWith("/runs/7002/artifacts?per_page=100"))
+				return f.request(url, init);
+			const carry = { id: 9002, name: CARRY_ARTIFACT_NAME,
+				expired: false, workflow_run: { id: 7002 } };
+			const result = { id: 9202, name: MISSION_ARTIFACT,
+				expired: fault === "expired", digest: `sha256:${"9".repeat(64)}`,
+				workflow_run: { id: 7002, head_sha: sourceCommit } };
+			const artifacts = [carry, ...(fault === "missing" ? [] : [result]),
+				...(fault === "duplicate" ? [{ ...result, id: 9203 }] : [])];
+			return new Response(JSON.stringify({ total_count: artifacts.length, artifacts }));
+		};
+		await assert.rejects(prepareAuthenticatedResumeRequest({ ...f.input, request }), error =>
+			error instanceof MissionHostPreparationError &&
+			error.refusal.code === "result-only-repair-result-unavailable");
+		assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	}
+});
+
+test("a changed reviewed repair with its own updated hash cannot bypass the separately reviewed plan", async t => {
+	const f = await resultOnlyRepairFixture(t);
+	const changedBytes = JSON.stringify({ ...f.repairState,
+		planFingerprint: "7".repeat(64) });
+	await writeFile(f.resultOnlyRepairReviewPrivateFile, JSON.stringify({ ...f.receipt,
+		repair: { ...f.receipt.repair, bytesUtf8: changedBytes,
+			sha256: createHash("sha256").update(changedBytes).digest("hex") } }));
+	await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error =>
+		error instanceof MissionHostPreparationError &&
+		error.refusal.code === "workflow-repair-plan-stale");
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+});
+
+test("result-only review rejects nonprivate, linked and repository-local receipts", async t => {
+	for (const fault of ["mode", "symlink", "inside-repo"] as const) {
+		const f = await resultOnlyRepairFixture(t);
+		let receiptFile = f.resultOnlyRepairReviewPrivateFile;
+		if (fault === "mode") await chmod(receiptFile, 0o644);
+		else if (fault === "symlink") {
+			const link = path.join(f.dir, "result-only-link.json");
+			await symlink(receiptFile, link);
+			receiptFile = link;
+		} else receiptFile = path.resolve("src/runner/result-only-repair-review.ts");
+		await assert.rejects(prepareAuthenticatedResumeRequest({ ...f.input,
+			resultOnlyRepairReviewPrivateFile: receiptFile }), error =>
+			error instanceof MissionHostPreparationError &&
+			error.refusal.code === "result-only-repair-review-invalid");
+		assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	}
 });
 
 test("workflow repair rejects nonprivate, symlinked and expanded plan files", async t => {
@@ -757,6 +929,9 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 	Awaited<ReturnType<typeof interruptedFixture>>,
 	options: { wrongArtifactDigest?: boolean; readOnly?: boolean;
 		repairPlanPrivateFile?: string;
+		resultOnlyRepairReviewPrivateFile?: string;
+		resultEnvelopeBytes?: Buffer; wrongResultArchiveEcho?: boolean;
+		wrongResultFileDigest?: boolean;
 		interruptedSourceReviewPrivateFile?: string;
 		prefixOnly?: { runId: string; artifactId: string; raw: string; archiveSha256: string };
 		prefixText?: string; archiveSha256?: string; wrongArchiveEcho?: boolean;
@@ -770,6 +945,9 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 	const artifactBytes = JSON.stringify({ envelopeB64: f.sealed.envelopeB64 });
 	await writeFile(artifactFile, artifactBytes, { mode: 0o600 });
 	const artifactSha256 = createHash("sha256").update(artifactBytes).digest("hex");
+	const resultEnvelopeFile = options.resultEnvelopeBytes ? path.join(f.dir,
+		"private-campaign-outcome.enc.json") : undefined;
+	if (resultEnvelopeFile) await writeFile(resultEnvelopeFile, options.resultEnvelopeBytes!, { mode: 0o600 });
 	const prefixOnlyFile = options.prefixOnly ? path.join(f.dir, "prefix-only.json") : undefined;
 	if (prefixOnlyFile) await writeFile(prefixOnlyFile, options.prefixOnly!.raw, { mode: 0o600 });
 	let prefixReference: { name: string; file: string; sha256: string } | undefined;
@@ -802,6 +980,8 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 		"--public-key", f.input.publicKeyFile, "--journal-dir", f.journal.directory,
 		"--output-private", outputPrivate, "--connector-stdio",
 		...(options.repairPlanPrivateFile ? ["--repair-plan-private", options.repairPlanPrivateFile] : []),
+		...(options.resultOnlyRepairReviewPrivateFile ?
+			["--result-only-repair-review-private", options.resultOnlyRepairReviewPrivateFile] : []),
 		...(options.interruptedSourceReviewPrivateFile ?
 			["--interrupted-source-review-private", options.interruptedSourceReviewPrivateFile] : []),
 		...(options.readOnly ? ["--read-only"] : [])],
@@ -822,6 +1002,18 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 			child.stdin.write(`${JSON.stringify({ id: row.id, status: response.status,
 				body: JSON.parse(await response.text()) })}\n`);
 		} else if (row.kind === "artifact-file") {
+			if (row.artifactId === "9202") {
+				assert.equal(row.runId, "7002");
+				assert.equal(row.expectedArchiveSha256, "9".repeat(64));
+				assert(resultEnvelopeFile && options.resultEnvelopeBytes);
+				child.stdin.write(`${JSON.stringify({ id: row.id,
+					name: "private-campaign-outcome.enc.json", file: resultEnvelopeFile,
+					sha256: options.wrongResultFileDigest ? "0".repeat(64) :
+						createHash("sha256").update(options.resultEnvelopeBytes).digest("hex"),
+					archiveSha256: options.wrongResultArchiveEcho ? "0".repeat(64) :
+						"9".repeat(64) })}\n`);
+				continue;
+			}
 			if (options.prefixOnly && row.runId === options.prefixOnly.runId) {
 				assert.equal(row.artifactId, options.prefixOnly.artifactId);
 				assert.equal(row.expectedArchiveSha256, options.prefixOnly.archiveSha256);
@@ -1008,6 +1200,41 @@ test("stdio bridge accepts a private reviewed repair without publishing its rece
 	const repeated = await prepareAuthenticatedResumeRequest(f.input);
 	assert.equal(repeated.decision.kind, "wait");
 	assert.equal(repeated.descriptor, undefined);
+});
+
+test("stdio bridge binds a reviewed result-only repair to its separate encrypted result artifact", async t => {
+	const f = await resultOnlyRepairFixture(t);
+	const bridge = await runStdioBridge(f, {
+		repairPlanPrivateFile: f.input.repairPlanPrivateFile,
+		resultOnlyRepairReviewPrivateFile: f.resultOnlyRepairReviewPrivateFile,
+		resultEnvelopeBytes: f.envelopeBytes });
+	assert.equal(bridge.code, 0, bridge.stderr);
+	assert.equal((bridge.lines.at(-1) as { kind: string }).kind, "prepared");
+	assert(bridge.lines.some(row => (row as { artifactId?: string }).artifactId === "9202"));
+	assert(!bridge.stdout.includes("bytesUtf8"));
+	assert(!bridge.stdout.includes("operator-rsa-decryption-review"));
+	assert(!bridge.stdout.includes("old-goal/O001"));
+	const privateResult = JSON.parse(await readFile(bridge.outputPrivate, "utf8")) as {
+		decision: { kind: string; intent: { pendingAction: { kind: string } } } };
+	assert.equal(privateResult.decision.kind, "dispatch");
+	assert.equal(privateResult.decision.intent.pendingAction.kind, "reconcile-m07-operation");
+});
+
+test("stdio bridge rejects a result artifact ZIP or encrypted envelope mismatch", async t => {
+	for (const failure of ["archive", "file", "receipt-as-envelope"] as const) {
+		const f = await resultOnlyRepairFixture(t);
+		const bridge = await runStdioBridge(f, {
+			repairPlanPrivateFile: f.input.repairPlanPrivateFile,
+			resultOnlyRepairReviewPrivateFile: f.resultOnlyRepairReviewPrivateFile,
+			resultEnvelopeBytes: failure === "receipt-as-envelope" ?
+				Buffer.from(JSON.stringify(f.receipt)) : f.envelopeBytes,
+			wrongResultArchiveEcho: failure === "archive",
+			wrongResultFileDigest: failure === "file" });
+		assert.equal(bridge.code, 1);
+		assert(!bridge.lines.some(row => (row as { kind: string }).kind === "prepared"));
+		await assert.rejects(readFile(bridge.outputPrivate), { code: "ENOENT" });
+		assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	}
 });
 
 test("stdio bridge refuses an artifact whose private digest changed", async t => {

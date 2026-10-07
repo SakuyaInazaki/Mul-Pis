@@ -401,24 +401,80 @@ export function createOriginalObjective(input: {
 		obligations: input.obligations.map(item => ({ ...item })), closure: input.closure };
 }
 
+class AssessmentValidationError extends HarnessError {
+	readonly validationPath: string;
+	readonly validationDetail: string | null;
+	constructor(message: string, validationPath: string, validationDetail: string | null = null) {
+		super("m07.objective-assessment", message);
+		this.validationPath = validationPath;
+		this.validationDetail = validationDetail;
+	}
+}
+/** Private callback payload. The driver encrypts it with the existing result transport.
+ * It cannot authorize a model task, read credit, or scientific selection. */
+export type ObjectiveAssessmentValidationDiagnosticV1 = Readonly<{
+	sessionId: string;
+	generation: number;
+	attempt: number;
+	rawResponse: string;
+		validation: Readonly<{ code: "m07.objective-assessment" | "m07.objective-control"; message: string;
+		path: string; detail?: string }>;
+	coverage: readonly Readonly<{ sourceId: string; required: boolean;
+		coveredRanges: readonly [number, number][]; complete: boolean }>[];
+	transcriptPath?: string;
+}>;
+function assessmentFailure(message: string, path: string, detail: string | null = null): never {
+	throw new AssessmentValidationError(message, path, detail);
+}
+function fixedGroundingDetail(error: unknown): string | null {
+	const message = error instanceof Error ? error.message : "";
+	return /^assessor-grounding: [A-Za-z0-9 ,;._-]{1,160}$/.test(message) ? message : null;
+}
+function deltaValidationPath(detail: string | null): string {
+	if (!detail) return "$.groundedAssessmentDelta";
+	if (/(?:prior issue resolution|authenticated prior issue locator|newly resolved issue)/.test(detail))
+		return "$.groundedAssessmentDelta.resolutions";
+	if (/(?:new issue|grounded issue|explicit requirement|necessary verification|optional method|physical gap|issue classification)/.test(detail))
+		return "$.groundedAssessmentDelta.newIssues";
+	if (/(?:next task|open grounded issue)/.test(detail))
+		return "$.groundedAssessmentDelta.nextTask";
+	if (/(?:deliverable|finding)/.test(detail))
+		return "$.groundedAssessmentDelta.deliverableReady";
+	return "$.groundedAssessmentDelta";
+}
 function parseAssessment(text: string, contract: OriginalObjectiveContractV1, evidenceNames: string[],
 	grounding?: GroundingContext, priorGroundingIndex = false): ModelObjectiveAssessmentV1 {
 	let value: unknown;
-	try { value = JSON.parse(text); } catch { throw new HarnessError("m07.objective-assessment", "assessment is not strict JSON"); }
-	if (!value || typeof value !== "object" || Array.isArray(value)) throw new HarnessError("m07.objective-assessment", "assessment object is invalid");
+	try { value = JSON.parse(text); } catch { assessmentFailure("assessment is not strict JSON", "$"); }
+	if (!value || typeof value !== "object" || Array.isArray(value)) assessmentFailure("assessment object is invalid", "$");
 	let raw = value as Record<string, unknown>;
 	let groundedAssessmentDelta: GroundedAssessmentDelta | undefined;
 	if (priorGroundingIndex) {
 		if (!grounding || raw.groundedAssessment !== undefined)
-			throw new HarnessError("m07.objective-assessment", "prior grounding delta is invalid");
+			assessmentFailure("prior grounding delta is invalid", "$.groundedAssessment");
+		const delta = raw.groundedAssessmentDelta;
+		if (!delta || typeof delta !== "object" || Array.isArray(delta))
+			assessmentFailure("prior grounding delta is invalid", "$.groundedAssessmentDelta");
+		const fields = delta as Record<string, unknown>;
+		if (fields.version !== 1) assessmentFailure("prior grounding delta is invalid", "$.groundedAssessmentDelta.version");
+		if (fields.kind !== "grounded-assessment-delta")
+			assessmentFailure("prior grounding delta is invalid", "$.groundedAssessmentDelta.kind");
+		if (!Array.isArray(fields.newIssues))
+			assessmentFailure("prior grounding delta is invalid", "$.groundedAssessmentDelta.newIssues");
+		if (!Array.isArray(fields.resolutions))
+			assessmentFailure("prior grounding delta is invalid", "$.groundedAssessmentDelta.resolutions");
+		let merged: ReturnType<typeof mergeGroundedAssessmentDelta>;
 		try {
-			const merged = mergeGroundedAssessmentDelta(raw.groundedAssessmentDelta, grounding);
-			groundedAssessmentDelta = merged.delta;
-			const openClaims = merged.proposal.issues.filter(item => item.status === "open").map(item => item.claim);
-			if (raw.unresolvedDetails !== undefined && JSON.stringify(raw.unresolvedDetails) !== JSON.stringify(openClaims))
-				throw new Error("open claim mismatch");
-			raw = { ...raw, unresolvedDetails: openClaims, groundedAssessment: merged.proposal };
-		} catch { throw new HarnessError("m07.objective-assessment", "prior grounding delta is invalid"); }
+			merged = mergeGroundedAssessmentDelta(raw.groundedAssessmentDelta, grounding);
+		} catch (error) {
+			const detail = fixedGroundingDetail(error);
+			assessmentFailure("prior grounding delta is invalid", deltaValidationPath(detail), detail);
+		}
+		groundedAssessmentDelta = merged.delta;
+		const openClaims = merged.proposal.issues.filter(item => item.status === "open").map(item => item.claim);
+		if (raw.unresolvedDetails !== undefined && JSON.stringify(raw.unresolvedDetails) !== JSON.stringify(openClaims))
+			assessmentFailure("prior grounding delta is invalid", "$.unresolvedDetails", "open claim mismatch");
+		raw = { ...raw, unresolvedDetails: openClaims, groundedAssessment: merged.proposal };
 	}
 	const ids = new Set(contract.obligations.map(item => item.id));
 	const names = new Set(evidenceNames);
@@ -426,43 +482,49 @@ function parseAssessment(text: string, contract: OriginalObjectiveContractV1, ev
 		Array.isArray(item) && item.every(part => typeof part === "string" && allowed.has(part)) && new Set(item).size === item.length;
 	const details = (item: unknown): item is string[] => Array.isArray(item) &&
 		item.every(part => nonemptyText(part)) && new Set(item).size === item.length;
-	if (raw.version !== 1 || typeof raw.decision !== "string" || !["fulfilled", "continue", "blocked"].includes(raw.decision) ||
-		!nonemptyText(raw.rationale) || !strings(raw.evidenceRefs, names) ||
-		!strings(raw.unresolvedObligations, ids) || !details(raw.unresolvedDetails))
-		throw new HarnessError("m07.objective-assessment", "assessment fields are invalid");
+	if (raw.version !== 1) assessmentFailure("assessment fields are invalid", "$.version");
+	if (typeof raw.decision !== "string" || !["fulfilled", "continue", "blocked"].includes(raw.decision))
+		assessmentFailure("assessment fields are invalid", "$.decision");
+	if (!nonemptyText(raw.rationale)) assessmentFailure("assessment fields are invalid", "$.rationale");
+	if (!strings(raw.evidenceRefs, names)) assessmentFailure("assessment fields are invalid", "$.evidenceRefs");
+	if (!strings(raw.unresolvedObligations, ids)) assessmentFailure("assessment fields are invalid", "$.unresolvedObligations");
+	if (!details(raw.unresolvedDetails)) assessmentFailure("assessment fields are invalid", "$.unresolvedDetails");
 	const decision = raw.decision as ModelObjectiveAssessmentV1["decision"];
 	let nextTask: ObjectiveNextTaskV1 | undefined;
 	if (raw.nextTask !== undefined) {
 		if (!raw.nextTask || typeof raw.nextTask !== "object" || Array.isArray(raw.nextTask))
-			throw new HarnessError("m07.objective-assessment", "next task object is invalid");
+			assessmentFailure("next task object is invalid", "$.nextTask");
 		const task = raw.nextTask as Record<string, unknown>;
-		if (!nonemptyText(task.objective) || !strings(task.addresses, ids) ||
-			!safeAdapterId(task.adapterScope) ||
-			!task.addresses.length || task.addresses.some(item => !(raw.unresolvedObligations as string[]).includes(item)))
-			throw new HarnessError("m07.objective-assessment", "next task does not address unresolved original obligations");
+		if (!nonemptyText(task.objective)) assessmentFailure("next task does not address unresolved original obligations", "$.nextTask.objective");
+		if (!strings(task.addresses, ids) || !task.addresses.length ||
+			task.addresses.some(item => !(raw.unresolvedObligations as string[]).includes(item)))
+			assessmentFailure("next task does not address unresolved original obligations", "$.nextTask.addresses");
+		if (!safeAdapterId(task.adapterScope))
+			assessmentFailure("next task does not address unresolved original obligations", "$.nextTask.adapterScope");
 		nextTask = { objective: task.objective, addresses: task.addresses,
 			adapterScope: task.adapterScope as ObjectiveNextTaskV1["adapterScope"] };
 	}
 	if ((decision === "continue" && (!raw.unresolvedObligations.length || !raw.unresolvedDetails.length || !nextTask)) ||
 		(decision === "fulfilled" && (raw.unresolvedObligations.length || raw.unresolvedDetails.length || !raw.evidenceRefs.length || nextTask)) ||
 		(decision === "blocked" && (!raw.unresolvedObligations.length || !raw.unresolvedDetails.length || nextTask)))
-		throw new HarnessError("m07.objective-assessment", "decision and unresolved obligations conflict");
+		assessmentFailure("decision and unresolved obligations conflict", "$.decision");
 	let groundedAssessment: GroundedAssessmentProposal | undefined;
 	if (grounding) {
 		try { groundedAssessment = validateGroundedAssessment(raw.groundedAssessment, grounding); }
-		catch { throw new HarnessError("m07.objective-assessment", "grounded assessment is invalid"); }
+		catch (error) { assessmentFailure("grounded assessment is invalid", "$.groundedAssessment",
+			fixedGroundingDetail(error)); }
 		const claims = groundedAssessment.issues.filter(item => item.status === "open").map(item => item.claim);
 		if (JSON.stringify(claims) !== JSON.stringify(raw.unresolvedDetails))
-			throw new HarnessError("m07.objective-assessment", "grounded issues do not match unresolved details");
+			assessmentFailure("grounded issues do not match unresolved details", "$.unresolvedDetails");
 		if (decision === "continue") {
 			const groundedTask = groundedAssessment.nextTask;
 			if (!nextTask || !groundedTask || groundedTask.adapterScope !== nextTask.adapterScope ||
 				JSON.stringify(groundedTask.obligationIds) !== JSON.stringify(nextTask.addresses) ||
 				!groundedTask.addresses.some(id => groundedAssessment!.issues.some(issue => issue.id === id && issue.status === "open" &&
 					["explicit-requirement", "necessary-verification"].includes(issue.classification))))
-				throw new HarnessError("m07.objective-assessment", "next task lacks a decision-changing original requirement");
+				assessmentFailure("next task lacks a decision-changing original requirement", "$.groundedAssessment.nextTask");
 		} else if (groundedAssessment.nextTask)
-			throw new HarnessError("m07.objective-assessment", "grounded next task conflicts with verdict");
+			assessmentFailure("grounded next task conflicts with verdict", "$.groundedAssessment.nextTask");
 	}
 	return { version: 1, decision, rationale: raw.rationale, evidenceRefs: raw.evidenceRefs,
 		unresolvedObligations: raw.unresolvedObligations, unresolvedDetails: raw.unresolvedDetails,
@@ -554,6 +616,8 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 	recordAssessment?: (assessment: NonNullable<ObjectiveProgressV1["assessment"]>) => Promise<void>;
 	/** Durable control facts only; never substitutes for evidence reading or a valid verdict. */
 	recordRepairState?: (state: WorkflowRepairStateV1) => Promise<void>;
+	/** Every rejected model reply, including the raw text, stays in encrypted private output. */
+	recordValidationFailure?: (diagnostic: ObjectiveAssessmentValidationDiagnosticV1) => Promise<void>;
 	advance: (task: ObjectiveNextTaskV1) => Promise<T>;
 }): Promise<{ assessment?: ObjectiveProgressV1["assessment"]; advanced?: T; stopReason: CurrentObjectiveStopReason }> {
 	const assessmentAdmission = currentObjectiveAdmission(input.assessmentAdmission);
@@ -707,6 +771,18 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		const retrievableMaterials = materials.filter(item => evidenceAccess[item.name] === "retrievable");
 		const retrievableIndex = requiredMaterials.find(item =>
 			item.name === "prior-research-history-index.json");
+		const responseSchema = priorIndex ? [
+			"Return one strict JSON object only: version:1, decision:'fulfilled'|'continue'|'blocked', nonempty rationale, unique evidenceRefs from frozen file names, unique unresolvedObligations from the original obligation IDs, and groundedAssessmentDelta. Omit top-level unresolvedDetails and groundedAssessment; the host reconstructs the former from the authenticated prior issue index and this delta.",
+			"groundedAssessmentDelta is {version:1,kind:'grounded-assessment-delta',newIssues:[],resolutions:[],nextTask?,deliverableReady?}. Keep prior issues and legacy details by omission. A new issue requires id,claim,status,classification,sourceRefs,implication and its class-specific proof. A resolution requires id,priorRef,explanation,evidenceRefs with exact current-session returned ranges and new frozen evidence.",
+			"For continue, include top-level nextTask {objective,addresses,adapterScope} and delta.nextTask {obligationIds,addresses,adapterScope,decisionChangingHypothesis,expectedEvidence,sourceRefs}; they must identify the same feasible adapter and unresolved original obligations and address an open explicit requirement or necessary verification. For fulfilled, leave unresolvedObligations empty and omit both nextTask fields; for blocked, retain unresolvedObligations and omit both nextTask fields. deliverableReady is a proposal only and cannot close an open-ended mission."
+		] : grounding ? [
+			"Return one strict JSON object only: version:1, decision:'fulfilled'|'continue'|'blocked', nonempty rationale, unique evidenceRefs from frozen file names, unique unresolvedObligations from original obligation IDs, unique nonempty unresolvedDetails, and groundedAssessment. Do not supply groundedAssessmentDelta without a prior grounding index.",
+			"groundedAssessment is {version:1,kind:'grounded-assessment-proposal',contractId,missionStatus:'open',issues,legacyOpenDetails,nextTask?,deliverableReady?}. Preserve every prior issue and legacy detail. Each new issue needs id,claim,status,classification,sourceRefs,implication and its class-specific proof; unresolvedDetails must exactly list open issue claims.",
+			"For continue, include top-level nextTask {objective,addresses,adapterScope} and groundedAssessment.nextTask {obligationIds,addresses,adapterScope,decisionChangingHypothesis,expectedEvidence,sourceRefs}; they must match the same feasible adapter and unresolved original obligations and address an open explicit requirement or necessary verification. For fulfilled, leave unresolvedObligations and unresolvedDetails empty and omit both nextTask fields; for blocked, retain unresolvedObligations and unresolvedDetails and omit both nextTask fields. deliverableReady is a proposal only."
+		] : [
+			"Return one strict JSON object only: version:1, decision:'fulfilled'|'continue'|'blocked', nonempty rationale, unique evidenceRefs from frozen file names, unique unresolvedObligations from original obligation IDs, and unique nonempty unresolvedDetails.",
+			"For continue, include nextTask {objective,addresses,adapterScope} with nonempty addresses contained in unresolvedObligations. For fulfilled, leave unresolvedObligations and unresolvedDetails empty, cite evidence, and omit nextTask. For blocked, retain unresolvedObligations and unresolvedDetails and omit nextTask."
+		];
 		const prompt = ["# Original objective (unchanged)", contract.goal,
 			"# User overrides (higher priority than supplied task material)",
 			...userOverrides.map((item, index) => `${index + 1}: ${item}`),
@@ -738,7 +814,8 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 					`Retain these prior unresolved details verbatim under groundedAssessment.legacyOpenDetails: ${JSON.stringify(grounding.legacyOpenDetails)}. Retain every prior issue ID and claim, changing open to resolved only with new evidence: ${JSON.stringify(grounding.previousIssues ?? [])}. Newly produced frozen evidence IDs: ${JSON.stringify(grounding.newEvidenceSourceIds ?? [])}.`,
 					"Add groundedAssessment {version:1,kind:'grounded-assessment-proposal',contractId,missionStatus:'open',issues,legacyOpenDetails,nextTask?,deliverableReady?}. Each issue needs id,claim,status:'open'|'resolved',classification,sourceRefs,implication. A resolved issue retains its ID and adds resolution {explanation,evidenceRefs} citing a selected result or host observation; only OPEN issue claims appear in unresolvedDetails. Classifications: explicit-requirement (user instruction or supplied task), necessary-verification (claimAtRisk), optional-method (optionalBasis cited in task/user text), physical-capability-gap (blockedScope and capabilityRef citing host observation). For continue, groundedAssessment.nextTask needs obligationIds identical to nextTask.addresses, OPEN issue addresses, adapterScope identical to nextTask.adapterScope, and decisionChangingHypothesis, expectedEvidence, sourceRefs; it must address an explicit requirement or necessary verification. An optional method or unavailable capability alone does not justify another task. deliverableReady, if supplied, is only {status:'proposed',ready:boolean,rationale,evidenceRefs,remainingIssueIds}; it never closes this open-ended mission. Do not claim a global optimum from finite tests."
 				]) ] : []),
-			`Return only strict JSON with version 1, decision (fulfilled, continue, or blocked), rationale, evidenceRefs (frozen file names), unresolvedObligations (original obligation IDs), ${priorIndex ? "groundedAssessmentDelta" : "unresolvedDetails and, when grounding is enabled, groundedAssessment"}, and when continuing nextTask {objective, addresses, adapterScope}. Use a scope only when its observed host capability covers your proposed work. If a proposed task has no available registered executor, retain it as unresolved and name the unavailable capability explicitly. Preserve genuinely unresolved requirements. Assess honestly. Propose the next scientific work yourself from unresolved original obligations; do not change task permissions or claim a global optimum from a finite evaluation.`].join("\n\n");
+			...responseSchema,
+			"Use a scope only when its observed host capability covers your proposed work. If a proposed task has no available registered executor, retain it as unresolved and name the unavailable capability explicitly. Preserve genuinely unresolved requirements. Assess honestly. Propose the next scientific work yourself from unresolved original obligations; do not change task permissions or claim a global optimum from a finite evaluation."].join("\n\n");
 		const frozenFileAccessible = async (name: string, rejectUnknownIo = false): Promise<boolean> => {
 			try {
 				const file = path.join(evidenceRoot, name);
@@ -809,6 +886,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		let readEventCursor = 0;
 		let request = prompt;
 		let sessionGeneration = 1;
+		let assessmentAttempt = 0;
 		const failedStrategies = new Map<string, Set<WorkflowRepairStateV1["strategy"]>>();
 		const frozenEvidenceIdentity = [{ name: "original-objective.json",
 			digest: createHash("sha256").update(contractBytes).digest("hex") },
@@ -821,17 +899,21 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				const admission = currentObjectiveAdmission(input.advanceAdmission());
 				return { assessment: latestAssessment, stopReason: admission === "admitted" ? "assessment-failed" : admission };
 			}
+			assessmentAttempt++;
 			const returned = handle.readReturnEvents();
 			const newReadEvents = returned.slice(readEventCursor);
 			readEventCursor = returned.length;
 			let parsed: ModelObjectiveAssessmentV1 | undefined;
 			let invalidReason: string | undefined;
+			let validationFailure: AssessmentValidationError | undefined;
 			try { parsed = parseAssessment(response.text, contract,
 				["original-objective.json", ...materials.map(item => item.name)], grounding, Boolean(priorIndex)); }
 			catch (error) {
 				if (!(error instanceof HarnessError) || error.code !== "m07.objective-assessment") throw error;
 				// Parser reasons are fixed host text, never the model's response or private evidence.
 				invalidReason = error.message;
+				validationFailure = error instanceof AssessmentValidationError ? error :
+					new AssessmentValidationError(error.message, "$");
 			}
 			const spans = citedSpans(parsed);
 			const fullRequired = new Set(["original-objective.json", ...requiredMaterials.map(item => item.name),
@@ -868,6 +950,17 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			const evidenceRead = fileCoverage.filter(item => item.complete).map(item => item.name);
 			const unreadEvidence = fileCoverage.filter(item => item.needed && !item.satisfied).map(item => item.name);
 			const unreadScore = fileCoverage.reduce((sum, item) => sum + item.score, 0);
+			const recordRejectedReply = async (validation: ObjectiveAssessmentValidationDiagnosticV1["validation"]) =>
+				input.recordValidationFailure?.({ sessionId: handle.ref.id,
+					generation: sessionGeneration, attempt: assessmentAttempt, rawResponse: response.text,
+					validation, coverage: fileCoverage.map(item => ({ sourceId: item.name,
+						required: item.needed, coveredRanges: item.coveredRanges.map(range =>
+							[range[0], range[1]] as [number, number]), complete: item.satisfied })),
+					...(handle.ref.file ? { transcriptPath: handle.ref.file } : {}) });
+			if (validationFailure) await recordRejectedReply({
+				code: "m07.objective-assessment", message: validationFailure.message,
+				path: validationFailure.validationPath,
+				...(validationFailure.validationDetail ? { detail: validationFailure.validationDetail } : {}) });
 			const repairFailure = async (failure: WorkflowRepairFailure, failureFacts: unknown):
 				Promise<"same-session-feedback" | "fresh-context" | CurrentObjectiveStopReason> => {
 				const evidenceFingerprint = workflowRepairFingerprint({ frozen: frozenEvidenceIdentity,
@@ -965,6 +1058,9 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 						return { assessment: latestAssessment, stopReason: "assessment-evidence-suspended" };
 				const noReadProgress = priorUnreadScore !== undefined && unreadScore <= priorUnreadScore;
 				priorUnreadScore = unreadScore;
+				if (!validationFailure) await recordRejectedReply({ code: "m07.objective-control",
+					message: "required or cited objective evidence was not returned in full",
+					path: "$.evidenceRefs" });
 				const admission = currentObjectiveAdmission(input.advanceAdmission());
 				if (admission !== "admitted") return { assessment: latestAssessment, stopReason: admission };
 				const repair = await repairFailure("unread-evidence", { unreadEvidence });
@@ -989,8 +1085,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				if (repair === "fresh-context") continue;
 				if (repair !== "same-session-feedback") return { assessment: latestAssessment, stopReason: repair };
 				request = [`Your previous response failed host validation: ${invalidReason ?? "assessment schema invalid"}.`,
-					"Return one strict JSON object only, with version 1, decision (fulfilled, continue, or blocked), a nonempty rationale, unique evidenceRefs chosen from the frozen file names, unique unresolvedObligations chosen from the original obligation IDs, and unique nonempty unresolvedDetails.",
-					"For continue, include unresolved obligations and details plus nextTask {objective, addresses, adapterScope}; addresses must be nonempty and contained in unresolvedObligations. For fulfilled, leave unresolved obligations and details empty, cite evidence, and omit nextTask. For blocked, retain unresolved obligations and details and omit nextTask.",
+					...responseSchema,
 					"The frozen evidence was already returned in full in this session. Reassess the unchanged original objective and user overrides, repair your own schema or reasoning, and return a fresh valid assessment. This invalid response did not authorize a task or close the mission."].join("\n\n");
 				continue;
 			}
@@ -1000,6 +1095,9 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 					(item.classification === "explicit-requirement" || item.classification === "necessary-verification"));
 				if (!available.length || parsed.groundedAssessment && !actionable)
 					return { assessment, stopReason: "model-reported-blocked" };
+				await recordRejectedReply({ code: "m07.objective-control",
+					message: "blocked verdict still has an available actionable capability",
+					path: "$.decision" });
 				const admission = currentObjectiveAdmission(input.advanceAdmission());
 				if (admission !== "admitted") return { assessment, stopReason: admission };
 				const repair = await repairFailure("blocked-with-capability", {
@@ -1028,6 +1126,9 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			}
 			if (!capabilities?.some(item => item.available && supportedTaskScopes.includes(item.scope)))
 				return { assessment, stopReason: "next-task-needs-capability" };
+			await recordRejectedReply({ code: "m07.objective-control",
+				message: "next task has no observed available adapter",
+				path: "$.nextTask.adapterScope" });
 			const key = JSON.stringify(proposed);
 			const repeatedUnsupported = unsupported.has(key);
 			unsupported.add(key);

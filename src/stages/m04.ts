@@ -46,6 +46,22 @@ export interface M04Options {
 	additionalReadOnlyInstruction?: string;
 	/** Private host receipt for evidence-triggered read-only judgment repair. */
 	onRepairState?: (state: WorkflowRepairStateV1) => Promise<void>;
+	/** Private, lossless validation diagnostic; awaited before any further judgment or proposal action. */
+	onInvalidJudgment?: (event: M04InvalidJudgmentEvent) => Promise<void>;
+}
+
+export interface M04InvalidJudgmentEvent {
+	stage: "m04-judgment";
+	sessionId: string;
+	generation: number;
+	/** Prompt ordinal within this session generation, including valid replies. */
+	attempt: number;
+	rawResponse: string;
+	/** Exact host validation response and any underlying private issue details. */
+	validation: { code: string; message: string; path: string; detail?: unknown };
+	coverage: Array<{ sourceId: string; required: boolean;
+		coveredRanges: Array<{ start: number; end: number }>; complete: boolean }>;
+	transcriptPath?: string;
 }
 
 export interface M04Result {
@@ -137,6 +153,29 @@ async function m07ReadGaps(root: string, required: string[], returned: ReadRetur
 		if (!completeTerminalPage || missingRanges.length) gaps.push({ relative, missingRanges, terminalPageMissing: !completeTerminalPage });
 	}
 	return gaps;
+}
+
+async function m07ValidationCoverage(root: string, required: string[], returned: ReadReturnEvent[],
+	gaps: M07ReadGap[]): Promise<M04InvalidJudgmentEvent["coverage"]> {
+	const incomplete = new Set(gaps.map(gap => gap.relative));
+	return Promise.all(required.map(async relative => {
+		const content = await readFile(path.join(root, relative), "utf8");
+		const lineCount = content.split(/\r?\n/).length - (content.endsWith("\n") ? 1 : 0);
+		const ranges = returned.filter(event => event.toolName === "m07_evidence_read" &&
+			event.path === relative && event.status === "returned" && event.returned.kind === "text")
+			.map(event => ({ start: event.returned.startLine, end: event.returned.endLine }))
+			.filter((range): range is { start: number; end: number } =>
+				Number.isSafeInteger(range.start) && Number.isSafeInteger(range.end) &&
+				range.start! >= 1 && range.end! >= range.start! && range.end! <= lineCount)
+			.sort((a, b) => a.start - b.start || a.end - b.end);
+		const coveredRanges: Array<{ start: number; end: number }> = [];
+		for (const range of ranges) {
+			const last = coveredRanges.at(-1);
+			if (last && range.start <= last.end + 1) last.end = Math.max(last.end, range.end);
+			else coveredRanges.push({ ...range });
+		}
+		return { sourceId: relative, required: true, coveredRanges, complete: !incomplete.has(relative) };
+	}));
 }
 
 async function assertFullM07Reads(root: string, required: string[], returned: ReadReturnEvent[]): Promise<void> {
@@ -514,6 +553,17 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 				if (feedback.m07) await markFeedbackAssembled(ctx.ws, feedback.m07.runId, feedback.inputs[0].path, record.runId);
 				let request = finalMessage;
 				let readEventCursor = 0;
+				let promptAttempt = 0;
+				const captureInvalidJudgment = async (rawResponse: string,
+					validation: M04InvalidJudgmentEvent["validation"], gaps: M07ReadGap[] = []): Promise<void> => {
+					if (!options.onInvalidJudgment) return;
+					await options.onInvalidJudgment({ stage: "m04-judgment", sessionId: handle.ref.id,
+						generation: sessionGeneration, attempt: promptAttempt, rawResponse,
+						validation, coverage: feedback.m07 && requiredM07Paths.length
+							? await m07ValidationCoverage(feedback.m07.rootDir, requiredM07Paths,
+								handle.readReturnEvents(), gaps) : [],
+						...(handle.ref.file ? { transcriptPath: handle.ref.file } : {}) });
+				};
 				const observedContextFailures = new Set<string>();
 				const freshStrategyStates = new Set<string>();
 				let currentStrategy: "same-session-feedback" | "fresh-context" = "same-session-feedback";
@@ -588,6 +638,7 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 					observedContextFailures.clear();
 					observedContextFailures.add(failureFingerprint);
 					readEventCursor = 0;
+					promptAttempt = 0;
 					acceptedReceipt = undefined;
 					extracted = undefined;
 					await persistRepair(failure, planFingerprint, responseFingerprint, "fresh-context");
@@ -596,6 +647,7 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 						guidance.replaceAll("same session", "fresh session")].join("\n\n");
 				};
 				for (;;) {
+					promptAttempt += 1;
 					const turn = await handle.prompt(request);
 					if (feedback.m07 && requiredM07Paths.length) {
 						await requireFrozenM07Bindings();
@@ -604,7 +656,17 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 						readEventCursor = returned.length;
 						const gaps = await m07ReadGaps(feedback.m07.rootDir, requiredM07Paths, returned);
 						if (gaps.length) {
-							if (newReadEvents.some(item => item.toolName === "m07_evidence_read" && item.status === "error" && gaps.some(gap => gap.relative === item.path)))
+							const readToolError = newReadEvents.some(item => item.toolName === "m07_evidence_read" && item.status === "error" && gaps.some(gap => gap.relative === item.path));
+							await captureInvalidJudgment(turn.text, {
+								code: "m04.m07-evidence",
+								message: readToolError
+									? "required selected M07 evidence was not returned in full because its read tool reported an error"
+									: "required selected M07 evidence was not returned to the research session in full",
+								path: gaps[0].relative, detail: { gaps, readToolErrors: newReadEvents.filter(item =>
+									item.toolName === "m07_evidence_read" && item.status === "error" &&
+									gaps.some(gap => gap.relative === item.path)) },
+							}, gaps);
+							if (readToolError)
 								throw new HarnessError("m04.m07-evidence", "required selected M07 evidence was not returned in full because its read tool reported an error");
 							const guidance = ["Your M04 judgement is provisional. The host has not verified full m07_evidence_read returns for every required selected M07 file, so no knowledge proposal can be accepted yet.",
 								"Next missing returned range for each file (one-based lines; the host will recalculate further gaps after your next read):",
@@ -616,6 +678,11 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 						}
 					}
 					const parsed = extractKnowledgeProposals(turn.text);
+					if (parsed.error) await captureInvalidJudgment(turn.text, {
+						code: parsed.error === "knowledge-proposals 代码块不是 JSON 数组"
+							? "m04.proposal-top-level-not-array" : "m04.proposal-invalid-json",
+						message: parsed.error, path: "knowledge-proposals",
+					});
 					if (parsed.error && !feedback.m08) {
 						const guidance = ["Your last M04 answer contained an explicit knowledge-proposals fenced block, but its contents were not a valid JSON array. No proposal was submitted or merged.",
 							"This is a format repair in the same session over the same frozen evidence. Return a complete revised M04 judgment. If evidence supports a knowledge operation, include exactly one knowledge-proposals fenced block containing a valid JSON array. If it does not, omit that block. Do not treat your earlier malformed block or a file path as an accepted proposal, and do not invent scientific support."].join("\n\n");
@@ -634,6 +701,12 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 						const receipt = rejectedDrafts.get(draftFingerprint) ?? await submitDraft(parsed.ops);
 						if (!receipt.structurallyValid) {
 							rejectedDrafts.set(draftFingerprint, receipt);
+							await captureInvalidJudgment(turn.text, {
+								code: "m04.proposal-structure",
+								message: "knowledge proposal draft failed structural validation",
+								path: receipt.file,
+								detail: { proposalId: receipt.proposalId, issues: receipt.issues },
+							});
 							record.remarks.push(`知识提案草案 ${receipt.proposalId} 结构无效；确切问题已保留在私有校验回执；未尝试合入。`);
 							const guidance = ["The host submitted your explicit knowledge-proposals array as a private draft and rejected it on structural validation. No merge or knowledge adoption was attempted.",
 								`Private draft ID: ${receipt.proposalId}. Structural issues (bounded, sensitive values withheld):\n${structuralIssueFeedback(receipt.issues)}`,

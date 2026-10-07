@@ -47,6 +47,8 @@ export type AuthenticatedTerminalCarryProof = Readonly<{
 	version: 1; kind: "authenticated-terminal-mission-carry";
 	source: Readonly<Source>; envelopeSha256: string;
 	artifact: AuthenticatedPriorCarryProof["artifact"];
+	/** Exact live GitHub archive identity; ciphertext identity only, never result-science authority. */
+	resultArtifact?: NonNullable<AuthenticatedPriorCarryProof["resultArtifact"]>;
 	terminal: AuthenticatedPriorCarryProof["terminal"];
 }>;
 export type AuthenticatedTerminalCarryResult = Readonly<{
@@ -2776,7 +2778,9 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 		const terminalProof: AuthenticatedTerminalCarryProof = Object.freeze({
 			version: 1, kind: "authenticated-terminal-mission-carry", source,
 			envelopeSha256: proof.envelopeSha256,
-			artifact: proof.artifact, terminal: proof.terminal
+			artifact: proof.artifact,
+			...(proof.resultArtifact ? { resultArtifact: proof.resultArtifact } : {}),
+			terminal: proof.terminal
 		});
 		authenticatedTerminalCarryProofs.add(terminalProof);
 		terminalBundleDigests.set(terminalProof, privateBundleDigest(priorPrivateBundle));

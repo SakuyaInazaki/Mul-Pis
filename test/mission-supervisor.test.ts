@@ -191,6 +191,20 @@ test("workflow repair requires a live host brand rather than a serialized assert
 		/not host verified/);
 });
 
+test("inherited unknown operations cannot bypass a simultaneous workflow repair plan", () => {
+	const unresolved = ["old-goal/O001"];
+	const action = classifyPendingAction("workflow-repair-needed", {
+		unresolvedOperationRefs: unresolved, failedStage: "objective-assessment",
+		evidenceRefs: ["repair-state.json"] });
+	assert.equal(action.kind, "reconcile-m07-operation");
+	const state = snapshot(action, { unresolved, fresh: freshFor(action) });
+	assert.deepEqual(planMissionContinuation(state),
+		{ kind: "wait", reason: "workflow-repair-plan-required" });
+	assert.throws(() => planMissionContinuation({ ...state,
+		workflowRepairPlan: { version: 1, kind: "host-reviewed-workflow-repair-plan" } as VerifiedWorkflowRepairPlanV1 }),
+		/not host verified/);
+});
+
 test("an unsettled accounting chain cannot fund another run through fresh-work evidence", () => {
 	const action = classifyPendingAction("accounting-integrity-error");
 	assert.deepEqual(planMissionContinuation(snapshot(action, { fresh: freshFor(action) })),

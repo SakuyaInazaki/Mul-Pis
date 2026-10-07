@@ -51,11 +51,15 @@ RESULT_DYNAMIC_RE = re.compile(
 )
 METADATA_RE = re.compile(r"^[A-Za-z0-9_./:@-]{1,160}$")
 RESULT_SIDECAR_RE = re.compile(r"^ledger-continuation\.part-[0-9]{8}\.enc$")
+RESULT_ASSESSOR_DIAGNOSTIC_RE = re.compile(
+    r"^assessor-(?:diagnostic-[0-9]{6,}\.json|transcript-[0-9]{6,}\.bin)$"
+)
 
 
 def _allowed_result_name(name: str) -> bool:
     return bool(name in RESULT_ALLOWLIST or RESULT_DYNAMIC_RE.fullmatch(name) or
-                RESULT_SIDECAR_RE.fullmatch(name))
+                RESULT_SIDECAR_RE.fullmatch(name) or
+                RESULT_ASSESSOR_DIAGNOSTIC_RE.fullmatch(name))
 
 
 def _review_text_file(name: str) -> bool:

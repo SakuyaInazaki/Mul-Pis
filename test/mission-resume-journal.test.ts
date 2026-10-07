@@ -141,6 +141,32 @@ test("repair reservation binds the private review and replacement source through
 	await assert.rejects(new MissionResumeJournal(journal.directory).get(intent.idempotencyKey), /idempotency binding/);
 });
 
+test("a workflow repair plan composes with inherited unknown-operation quarantine", async t => {
+	const { journal } = await fixture(t);
+	const prior = repairIntentFor();
+	const unresolved = ["old-goal/O001"];
+	const action = classifyPendingAction("workflow-repair-needed", {
+		unresolvedOperationRefs: unresolved, failedStage: "m04-judgment",
+		evidenceRefs: ["repair-state.json"] });
+	assert.equal(action.kind, "reconcile-m07-operation");
+	const pendingActionSha256 = pendingActionIdentity(action);
+	const intent: ResumeIntent = { ...prior, actionKind: action.kind, pendingAction: action,
+		pendingActionSha256, quarantinedOperationRefs: unresolved,
+		idempotencyKey: hash(canonical({ source: prior.source,
+			envelopeSha256: prior.envelopeSha256, contractId: prior.contractId,
+			selectedTupleSha256: prior.selectedTupleSha256, pendingActionSha256,
+			workflowRepair: prior.workflowRepair })) };
+	const reserved = await journal.reserve(intent, binding());
+	assert.equal(reserved.intentBinding.actionKind, "reconcile-m07-operation");
+	assert.deepEqual(await new MissionResumeJournal(journal.directory).get(intent.idempotencyKey),
+		reserved);
+	assert.deepEqual(intent.pendingAction.target?.operationRefs, unresolved);
+	assert.equal(reserved.intentBinding.workflowRepair?.reviewedPlanSha256,
+		prior.workflowRepair?.reviewedPlanSha256);
+	await assert.rejects(journal.reserve({ ...intent, workflowRepair: undefined }, binding()),
+		/private intent/);
+});
+
 test("reservation is durable across restart and never stores the raw pending action", async t => {
 	const { journal } = await fixture(t), intent = intentFor();
 	const control = { ...binding(), goal: "SECRET_GOAL",

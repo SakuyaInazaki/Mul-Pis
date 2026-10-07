@@ -14,6 +14,7 @@ import { sealCampaignCarry } from "../src/runner/emergency-carry.ts";
 import { encodeCarrySidecars, decodeCarrySidecars } from "../src/runner/carry-sidecar-codec.ts";
 import { CARRY_SEGMENT_FILE_BYTES } from "../src/runner/carry-sidecar-codec.ts";
 import { validatePriorGroundingIndex } from "../src/m07/assessor-grounding.ts";
+import { PrivateAssessorDiagnosticError } from "../src/runner/private-assessor-diagnostic.ts";
 
 test("shared-total campaign requires explicit manual admission and signed cumulative ledger", async () => {
  const workflow = await readFile(new URL("../.github/workflows/manual-private-campaign.yml", import.meta.url), "utf8");
@@ -46,6 +47,57 @@ test("production campaign forwards the live carry archive digest to its download
 	const source = await readFile(new URL("../scripts/manual-private-campaign.ts", import.meta.url), "utf8");
 	assert.match(source,
 		/loadCarryArtifact:\s*\(\{\s*artifactId,\s*expectedArchiveSha256\s*\}\)\s*=>\s*downloadCarryArtifact\(\{\s*githubToken:[^}]*artifactId,\s*expectedArchiveSha256\s*\}\)/);
+});
+
+test("both private original-objective assessor stages persist validation failures", async () => {
+	const source = await readFile(new URL("../scripts/manual-private-campaign.ts", import.meta.url), "utf8");
+	const callbacks = [...source.matchAll(/recordValidationFailure:\s*diagnostic\s*=>\s*saveAssessorValidationDiagnostic\(outputDir,\s*diagnostic\)/g)];
+	assert.equal(callbacks.length, 2);
+	assert.match(source, /assessorDiagnosticFailure:\s*statusAssessorDiagnosticFailure/);
+	assert.match(source,
+		/secondGoal\.runId,\s*nextArchiveDir,\s*outputDir,\s*`iteration-\$\{iteration\}`/);
+});
+
+test("driver retains the initiating private validator cause when diagnostic storage fails", async t => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-assessor-status-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const blockedOutput = path.join(root, "not-an-output-directory");
+	await writeFile(blockedOutput, "file");
+	await assert.rejects(offlineChecks.saveAssessorValidationDiagnostic(blockedOutput, {
+		sessionId: "synthetic-session", generation: 2, attempt: 3,
+		rawResponse: "PRIVATE_INVALID_REPLY_MARKER",
+		validation: { code: "m07.objective-assessment",
+			message: "prior grounding delta is invalid", path: "$.groundedAssessmentDelta.nextTask",
+			detail: "assessor-grounding: next task needs a feasible scope and decision-changing hypothesis" },
+		coverage: [{ sourceId: "original-objective.json", required: true,
+			coveredRanges: [[1, 2]], complete: true }]
+	}), error => error instanceof Error && "code" in error && error.code === "invalid-root");
+	const status = offlineChecks.assessorDiagnosticFailureSnapshot();
+	assert.deepEqual(status, { code: "invalid-root", generation: 2, attempt: 3,
+		validatorCode: "m07.objective-assessment", validatorMessage: "prior grounding delta is invalid",
+		validatorPath: "$.groundedAssessmentDelta.nextTask",
+		validatorDetail: "assessor-grounding: next task needs a feasible scope and decision-changing hypothesis" });
+	assert(!JSON.stringify(status).includes("PRIVATE_INVALID_REPLY_MARKER"));
+});
+
+test("private diagnostic failure retains only fixed OS codes, never error text or paths", () => {
+	for (const code of ["EACCES", "ENOSPC"] as const) {
+		const raw = Object.assign(new Error("private location and reply text"), { code,
+			path: "/private/model/reply" });
+		assert.deepEqual(offlineChecks.assessorDiagnosticFailureCause(raw),
+			{ code: "unclassified-write-failure", osErrorCode: code });
+		assert.deepEqual(offlineChecks.assessorDiagnosticFailureCause(
+			new PrivateAssessorDiagnosticError("write-failed", raw)),
+			{ code: "write-failed", osErrorCode: code });
+	}
+	for (const value of [45, { secret: "private" }, "RAW_PRIVATE_PATH", null]) {
+		const raw = Object.assign(new Error("private location"), { code: value });
+		assert.deepEqual(offlineChecks.assessorDiagnosticFailureCause(raw),
+			{ code: "unclassified-write-failure" });
+	}
+	assert.deepEqual(offlineChecks.assessorDiagnosticFailureCause(
+		{ get code(): never { throw new Error("private getter"); } }),
+		{ code: "unclassified-write-failure" });
 });
 
 test("failed research collection retains typed unresolved M04 quarantine for emergency carry", () => {
@@ -377,6 +429,7 @@ test("failed experiment enters untrusted history while selected prior tuple rema
 			"objective-checkpoint.json": JSON.stringify({ contract: { id: "synthetic-contract" },
 				selectedArtifacts: ["candidate.cpp", "verification.json"],
 				boundedRuns: [{ runId: "R001", selectedTaskId: "T001" }] }),
+			"repair-state.json": "old synthetic repair telemetry",
 		};
 		await writeFile(path.join(directory, "candidate.cpp"), "// failed new attempt\n");
 		await writeFile(path.join(directory, "verification.json"), JSON.stringify({ version: 1, status: "failed" }));
@@ -400,6 +453,7 @@ test("failed experiment enters untrusted history while selected prior tuple rema
 				priorEnvelopeSha256: "b".repeat(64), rows: [{ requestId: "synthetic-unknown",
 					availability: "unavailable" }] }] });
 		await writeFile(path.join(directory, "transport-diagnostics.json"), transportCensus);
+		await writeFile(path.join(directory, "repair-state.json"), "current synthetic repair telemetry");
 		const fallbackPrefix = "fallback-aaaaaaaaaaaa-T003";
 		await writeFile(path.join(directory, `workflow-${fallbackPrefix}-archive.json`), JSON.stringify({ version: 1,
 			kind: "m07-private-candidate-archive", goalRunId: "R004", taskId: "T003",
@@ -420,6 +474,10 @@ test("failed experiment enters untrusted history while selected prior tuple rema
 		assert.equal(carried?.["objective-checkpoint.json"], await readFile(path.join(directory, "objective-checkpoint.json"), "utf8"));
 		assert.equal(carried?.["transport-diagnostics.json"], transportCensus,
 			"sanitized host observations travel separately from the selected research tuple");
+		assert.equal(carried?.["repair-state.json"], "current synthetic repair telemetry");
+		await rm(path.join(directory, "repair-state.json"));
+		assert.equal((await offlineChecks.collectContinuationBundle(directory, prior))?.["repair-state.json"],
+			undefined, "an older run's repair state cannot become this run's authority");
 		const history = JSON.parse(carried?.["research-history.json"] ?? "null");
 		const entry = history.entries.find((item: { goalRunId: string }) => item.goalRunId === "R002");
 		assert.equal(entry.interpretation.includes("Unselected"), true);

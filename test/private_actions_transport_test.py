@@ -118,6 +118,36 @@ class EncryptTests(unittest.TestCase):
             serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
         self.fingerprint = hashlib.sha256(spki).hexdigest()
 
+    def test_assessor_diagnostics_roundtrip_only_under_exact_allowlisted_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results = root / "results"
+            results.mkdir()
+            diagnostic = b'{"kind":"private-assessor-diagnostic","rawResponse":"secret invalid answer"}\n'
+            transcript = b'{"session":"secret transcript"}\n'
+            (results / "assessor-diagnostic-000001.json").write_bytes(diagnostic)
+            (results / "assessor-transcript-000001.bin").write_bytes(transcript)
+            (results / "assessor-diagnostic-000001.json.bak").write_bytes(b"excluded")
+            (results / "assessor-transcript-1.bin").write_bytes(b"excluded")
+            (results / "assessor-diagnostic-evil.json").write_bytes(b"excluded")
+            public = root / "public.pem"
+            public.write_bytes(self.private_key.public_key().public_bytes(
+                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+            encrypted = root / "out.enc.json"
+            transport.encrypt_results(results, public, encrypted, self.metadata, self.fingerprint)
+            self.assertNotIn("secret invalid answer", encrypted.read_text())
+            self.assertNotIn("secret transcript", encrypted.read_text())
+            private = root / "private.pem"
+            private.write_bytes(self.private_key.private_bytes(serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+            recovered = transport.decrypt_results(encrypted, private, root)
+            self.assertEqual((recovered / "assessor-diagnostic-000001.json").read_bytes(), diagnostic)
+            self.assertEqual((recovered / "assessor-transcript-000001.bin").read_bytes(), transcript)
+            self.assertEqual((recovered / "assessor-diagnostic-000001.json").stat().st_mode & 0o777, 0o600)
+            self.assertFalse((recovered / "assessor-diagnostic-000001.json.bak").exists())
+            self.assertFalse((recovered / "assessor-transcript-1.bin").exists())
+            self.assertFalse((recovered / "assessor-diagnostic-evil.json").exists())
+
     def test_roundtrip_and_allowlist(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

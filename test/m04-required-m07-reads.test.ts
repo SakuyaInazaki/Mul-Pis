@@ -8,7 +8,7 @@ import { createM07Controller } from "../src/m07/controller.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 import type { ReadReturnEvent, SessionHandle } from "../src/runner/types.ts";
 import { WorkflowRepairNeededError, type WorkflowRepairStateV1 } from "../src/runner/repair-liveness.ts";
-import { runM04 } from "../src/stages/m04.ts";
+import { runM04, type M04InvalidJudgmentEvent } from "../src/stages/m04.ts";
 import { runM01 } from "../src/stages/m01.ts";
 import { exportPortableM04Transaction } from "../src/workflow-archive/m04-transaction.ts";
 import type { StageContext } from "../src/stages/context.ts";
@@ -66,6 +66,100 @@ test("M04 can choose no proposal after full selected M07 reads and sees exact pa
 	const message = session?.transcript[0]?.text ?? "";
 	for (const item of f.relative) assert.ok(message.includes(item));
 	assert.match(message, /完整读取/);
+});
+
+test("every invalid M04 reply reaches the private callback before another prompt", async t => {
+	const f = await fixture(t);
+	const raw = ["Read proof remains incomplete despite this judgment.",
+		"```knowledge-proposals\n{broken\n```",
+		"```knowledge-proposals\n[{\"op\":\"create\",\"type\":\"K\",\"title\":\"\",\"body\":\"\"}]\n```"];
+	const events: M04InvalidJudgmentEvent[] = [];
+	const fake = new FakeSessionRunner(({ turnIndex }) => {
+		assert.equal(events.length, turnIndex - 1, "each invalid reply is captured before the next prompt");
+		if (turnIndex === 1) return { text: raw[0], readReturns: returnedRanges(f.relative.slice(0, 1)) };
+		if (turnIndex === 2) return { text: raw[1], readReturns: returnedRanges(f.relative.slice(1)) };
+		if (turnIndex === 3) return { text: raw[2], readReturns: [] };
+		return "Final independent judgment: no supported proposal.";
+	});
+	f.ctx.runner = fake;
+	const before = (await f.store.current())?.id;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative,
+		onInvalidJudgment: async event => { events.push(event); } });
+	assert.deepEqual(events.map(event => event.rawResponse), raw);
+	assert.deepEqual(events.map(event => event.validation.code),
+		["m04.m07-evidence", "m04.proposal-invalid-json", "m04.proposal-structure"]);
+	assert.deepEqual(events.map(event => event.attempt), [1, 2, 3]);
+	assert.ok(events.every(event => event.stage === "m04-judgment" && event.generation === 1 &&
+		event.sessionId === events[0].sessionId));
+	assert.deepEqual(events[0].coverage.map(item => item.complete), [true, false, false]);
+	assert.deepEqual(events[0].coverage[0].coveredRanges, [{ start: 1, end: 2 }]);
+	assert.ok(events[1].coverage.every(item => item.complete));
+	assert.equal(events[0].validation.path, f.relative[1]);
+	assert.equal(events[1].validation.path, "knowledge-proposals");
+	assert.match(JSON.stringify(events[2].validation.detail), /create\.title/);
+	assert.ok(events.every(event => event.transcriptPath === undefined || typeof event.transcriptPath === "string"));
+	assert.equal(result.snapshotId, undefined);
+	assert.equal((await f.store.current())?.id, before);
+	assert.deepEqual(result.proposalAttempts.map(item => item.state), ["rejected-draft"]);
+	assert.equal(result.record.outputs.some(item => item.label === "合入结果"), false);
+	assert.equal(await readFile(result.record.outputs.find(item => item.label === "处理结果")!.path, "utf8"),
+		"Final independent judgment: no supported proposal.\n");
+});
+
+test("failed M04 private diagnostic write prevents another prompt and knowledge adoption", async t => {
+	const f = await fixture(t);
+	const invalid = "```knowledge-proposals\n{broken\n```";
+	const fake = new FakeSessionRunner(() => ({ text: invalid, readReturns: returnedRanges(f.relative) }));
+	f.ctx.runner = fake;
+	const before = (await f.store.current())?.id;
+	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative,
+		onInvalidJudgment: async () => { throw new Error("private diagnostic unavailable"); } }),
+		/private diagnostic unavailable/);
+	assert.equal([...fake.sessions.values()][0].turns, 1);
+	assert.equal((await f.store.current())?.id, before);
+	const records = await Promise.all((await f.ws.listRuns("M04")).map(id => f.ws.readRun("M04", id)));
+	const failed = records.find(record => record.status === "failed" &&
+		record.outputs.some(item => item.label === "M04 知识事务状态"))!;
+	const tx = JSON.parse(await readFile(failed.outputs.find(item => item.label === "M04 知识事务状态")!.path, "utf8"));
+	assert.equal(tx.state, "no-proposal");
+	assert.deepEqual(tx.attempts, []);
+	assert.equal(failed.outputs.some(item => item.label === "处理结果"), false);
+});
+
+test("failed diagnostic after structural rejection retains the exact draft and blocks retry", async t => {
+	const f = await fixture(t);
+	const invalid = "```knowledge-proposals\n[{\"op\":\"create\",\"type\":\"K\",\"title\":\"\",\"body\":\"\"}]\n```";
+	let submissions = 0, merges = 0;
+	const submit = f.store.submitProposal.bind(f.store), merge = f.store.merge.bind(f.store);
+	f.store.submitProposal = async batch => { submissions += 1; return submit(batch); };
+	f.store.merge = async id => { merges += 1; return merge(id); };
+	const fake = new FakeSessionRunner(() => ({ text: invalid, readReturns: returnedRanges(f.relative) }));
+	f.ctx.runner = fake;
+	const before = (await f.store.current())?.id;
+	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative,
+		onInvalidJudgment: async event => {
+			assert.equal(event.rawResponse, invalid);
+			assert.equal(event.validation.code, "m04.proposal-structure");
+			throw new Error("private draft diagnostic unavailable");
+		} }), /private draft diagnostic unavailable/);
+	assert.equal([...fake.sessions.values()][0].turns, 1);
+	assert.equal(submissions, 1);
+	assert.equal(merges, 0);
+	assert.equal((await f.store.current())?.id, before);
+	const records = await Promise.all((await f.ws.listRuns("M04")).map(id => f.ws.readRun("M04", id)));
+	const failed = records.find(record => record.status === "failed" &&
+		record.outputs.some(item => item.label === "M04 知识事务状态"))!;
+	const tx = JSON.parse(await readFile(failed.outputs.find(item => item.label === "M04 知识事务状态")!.path, "utf8"));
+	assert.equal(tx.state, "rejected-draft");
+	assert.equal(tx.attempts.length, 1);
+	assert.equal(tx.attempts[0].state, "rejected-draft");
+	const receipt = JSON.parse(await readFile(path.join(path.dirname(failed.outputs.find(item =>
+		item.label === "M04 知识事务状态")!.path), tx.attempts[0].receiptFile), "utf8"));
+	assert.deepEqual(receipt.issues, tx.attempts[0].issues);
+	assert.equal(failed.outputs.some(item => item.label === "处理结果" || item.label === "合入结果"), false);
 });
 
 test("a failed first M04 prompt leaves an exact no-proposal receipt for fresh adjudication", async t => {
@@ -223,6 +317,8 @@ test("identical invalid drafts reuse their receipt before fresh valid correction
 	const f = await fixture(t);
 	let firstSessionId: string | undefined;
 	let submissions = 0, merges = 0;
+	const captured: M04InvalidJudgmentEvent[] = [];
+	const invalidRaw: string[] = [];
 	const submit = f.store.submitProposal.bind(f.store), merge = f.store.merge.bind(f.store);
 	f.store.submitProposal = async batch => { submissions += 1; return submit(batch); };
 	f.store.merge = async id => { merges += 1; return merge(id); };
@@ -231,8 +327,11 @@ test("identical invalid drafts reuse their receipt before fresh valid correction
 	const fake = new FakeSessionRunner(({ ref, turnIndex, message }) => {
 		firstSessionId ??= ref.id;
 		if (ref.id === firstSessionId) {
+			assert.equal(captured.length, turnIndex - 1);
 			const ops = turnIndex === 1 ? invalid : [{ body: "", title: "", type: "K", op: "create" }];
-			return { text: `\`\`\`knowledge-proposals\n${JSON.stringify(ops)}\n\`\`\``,
+			const text = `\`\`\`knowledge-proposals\n${JSON.stringify(ops)}\n\`\`\``;
+			invalidRaw.push(text);
+			return { text,
 				readReturns: turnIndex === 1 ? returnedRanges(f.relative) : [] };
 		}
 		assert.match(message, /rejected draft remains historical evidence/);
@@ -240,13 +339,23 @@ test("identical invalid drafts reuse their receipt before fresh valid correction
 	});
 	f.ctx.runner = fake;
 	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
-		freshSession: true, requiredM07ReadPaths: f.relative });
+		freshSession: true, requiredM07ReadPaths: f.relative,
+		onInvalidJudgment: async event => { captured.push(event); } });
 	assert.equal(submissions, 2, "one rejected draft and one corrected draft, with no duplicate submission");
 	assert.equal(merges, 1);
 	assert.deepEqual(result.proposalAttempts.map(item => item.state), ["rejected-draft", "merged"]);
 	assert.equal(result.proposalId, result.proposalAttempts[1].proposalId);
 	assert.notEqual(result.proposalAttempts[0].proposalId, result.proposalAttempts[1].proposalId);
 	assert.deepEqual([...fake.sessions.values()].map(item => item.turns), [2, 1]);
+	assert.deepEqual(captured.map(event => event.rawResponse), invalidRaw);
+	assert.notEqual(captured[0].rawResponse, captured[1].rawResponse);
+	assert.deepEqual(captured.map(event => event.validation.code),
+		["m04.proposal-structure", "m04.proposal-structure"]);
+	assert.deepEqual(captured.map(event => [event.generation, event.attempt]), [[1, 1], [1, 2]]);
+	assert.ok(captured.every(event => event.sessionId === firstSessionId &&
+		event.coverage.every(item => item.complete)));
+	const draftIds = captured.map(event => (event.validation.detail as { proposalId: string }).proposalId);
+	assert.equal(draftIds[0], draftIds[1], "the same rejected receipt is reused without another submission");
 });
 
 test("different invalid draft prose with unchanged structural issues cannot evade fresh repair", async t => {
@@ -604,6 +713,7 @@ test("M04 rejects an adopted proposal before merge when a required read tool rep
 
 test("M04 replaces unchanged missing-page repair with fresh judgment and redoes full read proof", async t => {
 	const f = await fixture(t);
+	const diagnostics: M04InvalidJudgmentEvent[] = [];
 	const provisional = `\`\`\`knowledge-proposals\n${JSON.stringify([
 		{ op: "create", type: "K", title: "Provisional method", body: "Unsupported provisional claim", usageDecision: "adopted" },
 	])}\n\`\`\``;
@@ -635,7 +745,8 @@ test("M04 replaces unchanged missing-page repair with fresh judgment and redoes 
 	f.ctx.runner = fake;
 	const before = (await f.store.current())?.id;
 	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId }, freshSession: true,
-		requiredM07ReadPaths: f.relative, onRepairState: async state => { states.push(state); } });
+		requiredM07ReadPaths: f.relative, onRepairState: async state => { states.push(state); },
+		onInvalidJudgment: async event => { diagnostics.push(event); } });
 	assert.equal(result.record.status, "completed");
 	assert.equal(result.proposalId, undefined, "provisional proposal must never be merged");
 	assert.equal((await f.store.current())?.id, before);
@@ -650,6 +761,11 @@ test("M04 replaces unchanged missing-page repair with fresh judgment and redoes 
 	assert.equal(coverage.sessionId, sessions[1].ref.id);
 	assert.equal(coverage.earlierSessions[0].sessionId, sessions[0].ref.id);
 	assert.equal(coverage.returnedRanges.length, 4, "final proof must contain only fresh-session returns");
+	assert.deepEqual(diagnostics.map(event => [event.generation, event.attempt]), [[1, 1], [1, 2], [2, 1]]);
+	assert.equal(diagnostics[2].sessionId, sessions[1].ref.id);
+	assert.deepEqual(diagnostics[2].coverage.map(item => item.coveredRanges),
+		[[{ start: 2, end: 2 }], [], []], "a fresh judgment cannot inherit earlier read ranges");
+	assert.ok(diagnostics[2].coverage.every(item => !item.complete));
 });
 
 test("malformed provisional M04 output cannot end the read repair or create a proposal", async t => {

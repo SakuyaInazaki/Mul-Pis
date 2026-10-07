@@ -12,7 +12,8 @@ import { classifyPendingAction, type PendingActionV1 } from "../m07/objective-pr
 import { authenticateLatestTerminalCarry, authenticateLatestTerminalInterruption,
 	authenticatedSupervisorProjection, authenticatedTerminalInterruptionSupervisorProjection,
 	REUSABLE_RUN_REQUEST_MESSAGE, type CarryArtifactPayload,
-	type CurrentMissionRun, type IncrementalPrefixFailure } from "./ledger-continuation.ts";
+	type AuthenticatedTerminalCarryProof, type CurrentMissionRun,
+	type IncrementalPrefixFailure } from "./ledger-continuation.ts";
 import { MissionResumeJournal, type ResumeJournalRecord,
 	type TestedControlBinding } from "./mission-resume-journal.ts";
 import { pendingActionIdentity, planMissionContinuation, type CurrentDerivedActionV1,
@@ -22,6 +23,8 @@ import { pendingActionIdentity, planMissionContinuation, type CurrentDerivedActi
 import { validWorkflowRepairState, type WorkflowRepairStateV1 } from "./repair-liveness.ts";
 import { readReviewedInterruptedSourceCapability,
 	type VerifiedInterruptedSourceCapabilityV1 } from "./interrupted-source-review.ts";
+import { readReviewedResultOnlyRepairState, isVerifiedResultOnlyRepairState,
+	type VerifiedResultOnlyRepairStateV1 } from "./result-only-repair-review.ts";
 
 const REPOSITORY = "SakuyaInazaki/Mul-Pis";
 const SOURCE_BRANCH = "improve/workflow-learning-reliability";
@@ -42,10 +45,11 @@ export type HostPreparationRefusal = Readonly<{
 		"legacy-action-checkpoint-unavailable" | "control-request-delivery-uncertain" |
 		"workflow-repair-plan-invalid" | "workflow-repair-plan-unrelated" |
 		"workflow-repair-plan-stale" | "workflow-repair-source-unchanged" |
-		"workflow-repair-review-evidence-invalid";
+		"workflow-repair-review-evidence-invalid" |
+		"result-only-repair-review-invalid" | "result-only-repair-result-unavailable";
 	stage: "tested-source-ci" | "live-source-ref" | "live-source-commit" |
 		"live-control-ref" | "terminal-carry" | "legacy-action" | "dispatch-journal" |
-		"workflow-repair-plan" | "interruption-source-review";
+		"workflow-repair-plan" | "interruption-source-review" | "result-only-repair-review";
 	ciRunId?: string;
 	ciStatus?: "requested" | "waiting" | "pending" | "queued" | "in_progress" |
 		"completed" | "unrecognized";
@@ -203,6 +207,9 @@ export type PrepareAuthenticatedResumeInput = Readonly<{
 	publicKeyFile: string;
 	githubToken: string | undefined;
 	loadCarryArtifact: (identity: { runId: string; artifactId: string }) => Promise<CarryArtifactPayload>;
+	/** Existing read-only connector, exact result artifact and live ZIP digest. */
+	loadResultEnvelope?: (identity: { runId: string; artifactId: string;
+		expectedArchiveSha256: string }) => Promise<Uint8Array>;
 	request?: typeof fetch;
 	authenticatedHostRead?: Readonly<{ kind: "authenticated-host-github-read"; request: typeof fetch }>;
 	expectedSpkiSha256?: string;
@@ -211,6 +218,8 @@ export type PrepareAuthenticatedResumeInput = Readonly<{
 	readOnly?: boolean;
 	/** An explicit private operator review outside the checkout, never model output. */
 	repairPlanPrivateFile?: string;
+	/** Private operator RSA decryption review for a result-only repair diagnostic. */
+	resultOnlyRepairReviewPrivateFile?: string;
 	/** Host review of the exact interrupted source capability, outside the checkout. */
 	interruptedSourceReviewPrivateFile?: string;
 }>;
@@ -330,7 +339,8 @@ function freezeReview(value: unknown): void {
 async function verifyWorkflowRepairPlan(input: PrepareAuthenticatedResumeInput,
 	terminalCarry: TerminalCarryEvidenceV1, binding: TestedControlBinding,
 	repairStateBytes: string | undefined,
-	action: PendingActionV1): Promise<VerifiedWorkflowRepairPlanV1> {
+	action: PendingActionV1,
+	resultOnlyRepair?: VerifiedResultOnlyRepairStateV1): Promise<VerifiedWorkflowRepairPlanV1> {
 	let plan: HostReviewedWorkflowRepairPlanV1;
 	try { plan = await readPrivateRepairPlan(input.repairPlanPrivateFile!); }
 	catch (error) {
@@ -340,6 +350,9 @@ async function verifyWorkflowRepairPlan(input: PrepareAuthenticatedResumeInput,
 	let state: unknown;
 	try { state = JSON.parse(repairStateBytes ?? "null") as unknown; }
 	catch { return refuse("workflow-repair-plan-stale", "workflow-repair-plan"); }
+	if (resultOnlyRepair && (!isVerifiedResultOnlyRepairState(resultOnlyRepair) ||
+		resultOnlyRepair.stateBytes !== repairStateBytes))
+		refuse("result-only-repair-review-invalid", "result-only-repair-review");
 	const prior = plan.prior;
 	if (!validWorkflowRepairState(state) || state.strategy !== "workflow-repair-needed" ||
 		action.reasonCode !== "workflow-repair-needed" || action.failedStage !== state.stage ||
@@ -422,12 +435,14 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 	let currentInterruptionAction: CurrentInterruptionActionV1 | undefined;
 	let incrementalPrefixFailure: IncrementalPrefixFailure | undefined;
 	let priorPrivateBundle: Readonly<Record<string, string>>;
+	let terminalProof: AuthenticatedTerminalCarryProof | undefined;
 	try {
 		const authenticated = await authenticateLatestTerminalCarry(authenticationInput);
 		const projected = authenticatedSupervisorProjection(authenticated.proof, authenticated.privateBundle);
 		if (!projected) refuse("terminal-carry-projection-unavailable", "terminal-carry");
 		({ status, terminalCarry, pendingAction } = projected);
 		priorPrivateBundle = authenticated.privateBundle;
+		terminalProof = authenticated.proof;
 	} catch (carryError) {
 		let interrupted: Awaited<ReturnType<typeof authenticateLatestTerminalInterruption>>;
 		try { interrupted = await authenticateLatestTerminalInterruption(authenticationInput); }
@@ -488,8 +503,13 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 				{ unresolvedOperationRefs: [...status.unresolvedOperationRefs] }) };
 	}
 	const action = currentInterruptionAction?.action ?? pendingAction ?? currentDerivedAction?.action;
-	if (input.repairPlanPrivateFile !== undefined && action?.kind !== "repair-workflow-state")
+	const workflowRepair = !terminalInterruption && status.stopReason === "workflow-repair-needed" &&
+		action?.reasonCode === "workflow-repair-needed";
+	if (input.repairPlanPrivateFile !== undefined && !workflowRepair)
 		refuse("workflow-repair-plan-unrelated", "workflow-repair-plan");
+	if (input.resultOnlyRepairReviewPrivateFile !== undefined &&
+		(!workflowRepair || priorPrivateBundle["repair-state.json"] !== undefined || !terminalProof))
+		refuse("result-only-repair-review-invalid", "result-only-repair-review");
 	if (input.interruptedSourceReviewPrivateFile !== undefined && !terminalInterruption)
 		refuse("interruption-source-review-invalid", "interruption-source-review");
 	if (!action) return { decision: planMissionContinuation({ status, terminalCarry,
@@ -499,7 +519,9 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 		return { decision: planMissionContinuation({ status, terminalCarry,
 			pendingAction, terminalInterruption, currentInterruptionAction,
 			dispatchRecord: { state: "not-requested" } }), ...privateObservation };
-	if (action.kind === "repair-workflow-state" && input.repairPlanPrivateFile === undefined)
+	if (workflowRepair && (input.repairPlanPrivateFile === undefined ||
+		(priorPrivateBundle["repair-state.json"] === undefined &&
+			input.resultOnlyRepairReviewPrivateFile === undefined)))
 		return { decision: planMissionContinuation({ status, terminalCarry,
 			pendingAction, terminalInterruption, currentInterruptionAction,
 			dispatchRecord: { state: "not-requested" } }), ...privateObservation };
@@ -527,6 +549,32 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 			refuse("interruption-source-review-invalid", "interruption-source-review");
 		}
 	}
+	let resultOnlyRepair: VerifiedResultOnlyRepairStateV1 | undefined;
+	if (workflowRepair && input.resultOnlyRepairReviewPrivateFile) {
+		const artifact = terminalProof?.resultArtifact;
+		if (!terminalProof || !artifact || !input.loadResultEnvelope)
+			refuse("result-only-repair-result-unavailable", "result-only-repair-review");
+		const oldCommit = await githubJson(`https://api.github.com/repos/${REPOSITORY}/git/commits/${terminalCarry.source.commit}`,
+			input.githubToken, input.authenticatedHostRead?.request ?? input.request ?? fetch,
+			"result-only-repair-review");
+		if (!isObject(oldCommit) || oldCommit.sha !== terminalCarry.source.commit ||
+			!isObject(oldCommit.tree) || !hex40(oldCommit.tree.sha))
+			refuse("result-only-repair-review-invalid", "result-only-repair-review");
+		if (input.source.event !== "workflow_dispatch" && input.source.event !== "push")
+			refuse("result-only-repair-review-invalid", "result-only-repair-review");
+		try {
+			const encryptedEnvelopeBytes = await input.loadResultEnvelope({
+				runId: artifact.runId, artifactId: artifact.artifactId,
+				expectedArchiveSha256: artifact.archiveSha256 });
+			resultOnlyRepair = await readReviewedResultOnlyRepairState({
+				privateReceiptFile: input.resultOnlyRepairReviewPrivateFile,
+				terminalProof, privateBundle: priorPrivateBundle,
+				terminalSourceTree: oldCommit.tree.sha, terminalEvent: input.source.event,
+				encryptedEnvelopeBytes });
+		} catch {
+			refuse("result-only-repair-review-invalid", "result-only-repair-review");
+		}
+	}
 	const launch: FreshIndependentLaunchContractV1 = {
 		version: 1, kind: "verified-fresh-launch-contract",
 		source: terminalInterruption?.source ?? terminalCarry.source,
@@ -535,9 +583,10 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 		pendingActionSha256: pendingActionIdentity(action),
 		testedSourceCommit: binding.testedSourceCommit, testedTree: binding.testedTree,
 		requiresRuntimeAttestationBeforeModel: true, mode: "fresh-work-only" };
-	const workflowRepairPlan = action.kind === "repair-workflow-state" ?
+	const workflowRepairPlan = workflowRepair ?
 		await verifyWorkflowRepairPlan(input, terminalCarry, binding,
-			priorPrivateBundle["repair-state.json"], action) : undefined;
+			priorPrivateBundle["repair-state.json"] ?? resultOnlyRepair?.stateBytes,
+			action, resultOnlyRepair) : undefined;
 	const snapshot = { status, terminalCarry, pendingAction, currentDerivedAction,
 		terminalInterruption, currentInterruptionAction, interruptedSourceReview,
 		freshLaunchContract: launch, workflowRepairPlan,

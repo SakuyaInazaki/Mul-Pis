@@ -19,7 +19,7 @@ import { HarnessError } from "../src/types.ts";
 
 type Args = { source: string; seed: string; publicKey: string;
 	journalDir: string; outputPrivate: string; readOnly: boolean; repairPlanPrivate?: string;
-	interruptedSourceReviewPrivate?: string };
+	interruptedSourceReviewPrivate?: string; resultOnlyRepairReviewPrivate?: string };
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 class PrivateBridgeError extends Error {
 	readonly reasonCode: string;
@@ -27,7 +27,7 @@ class PrivateBridgeError extends Error {
 }
 type ArtifactSidecarFile = { name: string; file: string; sha256: string };
 type ArtifactFileReply = { file: string; sha256: string;
-	name?: "incremental-control-prefix.json";
+	name?: "incremental-control-prefix.json" | "private-campaign-outcome.enc.json";
 	archiveSha256?: string;
 	sidecars?: ArtifactSidecarFile[];
 	prefix?: ArtifactSidecarFile };
@@ -93,7 +93,8 @@ function parseArgs(values: string[]): Args {
 		option.set(name, values[++i]!);
 	}
 	const keys = ["--source", "--seed", "--public-key", "--journal-dir", "--output-private"];
-	const allowed = [...keys, "--repair-plan-private", "--interrupted-source-review-private"];
+	const allowed = [...keys, "--repair-plan-private", "--interrupted-source-review-private",
+		"--result-only-repair-review-private"];
 	if (!connectorStdio || keys.some(key => !option.has(key)) ||
 		[...option.keys()].some(key => !allowed.includes(key)))
 		throw new Error("missing private resume arguments");
@@ -102,12 +103,15 @@ function parseArgs(values: string[]): Args {
 		outputPrivate: option.get("--output-private")!, readOnly,
 		...(option.has("--repair-plan-private") ? { repairPlanPrivate: option.get("--repair-plan-private")! } : {}),
 		...(option.has("--interrupted-source-review-private") ?
-			{ interruptedSourceReviewPrivate: option.get("--interrupted-source-review-private")! } : {}) };
+			{ interruptedSourceReviewPrivate: option.get("--interrupted-source-review-private")! } : {}),
+		...(option.has("--result-only-repair-review-private") ?
+			{ resultOnlyRepairReviewPrivate: option.get("--result-only-repair-review-private")! } : {}) };
 	if (Object.entries(result).some(([key, value]) => key !== "readOnly" &&
 		!path.isAbsolute(String(value)))) throw new Error("private resume paths must be absolute");
 	if (underRepo(result.journalDir) || underRepo(result.outputPrivate) ||
 		(result.repairPlanPrivate !== undefined && underRepo(result.repairPlanPrivate)) ||
-		(result.interruptedSourceReviewPrivate !== undefined && underRepo(result.interruptedSourceReviewPrivate)))
+		(result.interruptedSourceReviewPrivate !== undefined && underRepo(result.interruptedSourceReviewPrivate)) ||
+		(result.resultOnlyRepairReviewPrivate !== undefined && underRepo(result.resultOnlyRepairReviewPrivate)))
 		throw new Error("private resume records must be outside the source repository");
 	return result;
 }
@@ -117,6 +121,8 @@ function parseArgs(values: string[]): Args {
 function connectorBridge(): { request: typeof fetch;
 	artifact: (identity: { runId: string; artifactId: string;
 		expectedArchiveSha256?: string }) => Promise<CarryArtifactPayload>;
+	resultEnvelope: (identity: { runId: string; artifactId: string;
+		expectedArchiveSha256: string }) => Promise<Uint8Array>;
 	close: () => void } {
 	const pending = new Map<number, { kind: "github-get" | "artifact-file";
 		resolve: (value: unknown) => void;
@@ -149,7 +155,8 @@ function connectorBridge(): { request: typeof fetch;
 			if (!privateFileReference(reply) || keys.join("|") !== expected.join("|") ||
 				(reply.archiveSha256 !== undefined &&
 					(typeof reply.archiveSha256 !== "string" || !/^[0-9a-f]{64}$/.test(reply.archiveSha256))) ||
-				(reply.name !== undefined && reply.name !== "incremental-control-prefix.json") ||
+				(reply.name !== undefined && !["incremental-control-prefix.json",
+					"private-campaign-outcome.enc.json"].includes(String(reply.name))) ||
 				(reply.name !== undefined && (reply.prefix !== undefined || reply.sidecars !== undefined)) ||
 				(reply.prefix !== undefined && (!privateFileReference(reply.prefix) ||
 					Object.keys(reply.prefix).sort().join("|") !== "file|name|sha256" ||
@@ -199,6 +206,8 @@ function connectorBridge(): { request: typeof fetch;
 			...(identity.expectedArchiveSha256 ?
 				{ expectedArchiveSha256: identity.expectedArchiveSha256 } : {}) })}\n`);
 		const observed = await reply;
+		if (observed.name === "private-campaign-outcome.enc.json")
+			throw new Error("carry artifact reply supplied a result envelope");
 		if (identity.expectedArchiveSha256 &&
 			observed.archiveSha256 !== identity.expectedArchiveSha256)
 			throw new Error("artifact ZIP digest does not match authenticated GitHub metadata");
@@ -231,7 +240,25 @@ function connectorBridge(): { request: typeof fetch;
 		return { envelopeB64, sidecars,
 			...(prefix === undefined ? {} : { incrementalControlPrefix: prefix }) };
 	};
-	return { request, artifact, close: () => lines.close() };
+	const resultEnvelope = async (identity: { runId: string; artifactId: string;
+		expectedArchiveSha256: string }): Promise<Uint8Array> => {
+		if (closed || process.stdin.readableEnded)
+			throw new PrivateBridgeError("authenticated-github-connector-stdin-closed");
+		const id = ++nextId;
+		const reply = new Promise<ArtifactFileReply>((resolve, reject) =>
+			pending.set(id, { kind: "artifact-file", resolve: value =>
+				resolve(value as ArtifactFileReply), reject }));
+		process.stdout.write(`${JSON.stringify({ kind: "artifact-file", id,
+			runId: identity.runId, artifactId: identity.artifactId,
+			expectedArchiveSha256: identity.expectedArchiveSha256 })}\n`);
+		const observed = await reply;
+		if (observed.name !== "private-campaign-outcome.enc.json" ||
+			observed.sidecars !== undefined || observed.prefix !== undefined ||
+			observed.archiveSha256 !== identity.expectedArchiveSha256)
+			throw new Error("encrypted result artifact reply does not match live ZIP identity");
+		return verifiedPrivateBytes(observed, 132 * 1024 * 1024);
+	};
+	return { request, artifact, resultEnvelope, close: () => lines.close() };
 }
 
 /** The second argument is used only by synthetic signed-seed tests. The CLI
@@ -258,9 +285,12 @@ export async function runPrivateResumeBridge(values: string[],
 			githubToken: undefined,
 			authenticatedHostRead: { kind: "authenticated-host-github-read", request: bridge.request },
 			loadCarryArtifact: identity => bridge.artifact(identity),
+			loadResultEnvelope: identity => bridge.resultEnvelope(identity),
 			...(args.repairPlanPrivate ? { repairPlanPrivateFile: args.repairPlanPrivate } : {}),
 			...(args.interruptedSourceReviewPrivate ?
 				{ interruptedSourceReviewPrivateFile: args.interruptedSourceReviewPrivate } : {}),
+			...(args.resultOnlyRepairReviewPrivate ?
+				{ resultOnlyRepairReviewPrivateFile: args.resultOnlyRepairReviewPrivate } : {}),
 			journal: new MissionResumeJournal(args.journalDir), readOnly: args.readOnly });
 	} finally { bridge.close(); }
 	if (!args.readOnly) {
