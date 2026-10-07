@@ -10,6 +10,7 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import type { ObjectiveProgressV1 } from "./objective-progress.ts";
+import { validUnobservedControlDelivery, type UnobservedControlDelivery } from "../runner/ledger-continuation.ts";
 
 const sha256 = (value: string): string => createHash("sha256").update(value).digest("hex");
 const digest = (value: unknown): string => sha256(JSON.stringify(value));
@@ -53,6 +54,15 @@ export interface ReviewedRestartEffectPolicy {
 	actorThirdPartyMutations: "unknown";
 	hostTransport: "immutable-versioned-archive" | "none";
 	accountingObservation: RestartAccountingObservation;
+	/** Full live-ledger lineage, separately reviewed from operation and executed-run gaps. */
+	unobservedControlLineage: RestartUnobservedControlLineage;
+}
+
+export interface RestartUnobservedControlLineage {
+	priorSource: AuthenticatedRestartCarryFacts["source"];
+	admissionSource: AuthenticatedRestartCarryFacts["currentRun"];
+	count: number;
+	sha256: string;
 }
 
 /** Legacy hold, current v3 observations, and missing-carry gaps remain distinct. */
@@ -78,6 +88,8 @@ export interface IndependentRestartInput {
 	authenticatedCarryProof: unknown;
 	/** Exact privateBundle returned with that authenticated proof. */
 	privateBundle: Record<string, string>;
+	/** Exact live ledger result; the review host authenticates its identity and history. */
+	unobservedControlDeliveries: readonly UnobservedControlDelivery[];
 	/** New isolated workspace and nonce, allocated before any new provider request. */
 	freshWorkspace: { workspaceId: string; restartNonce: string };
 	/** Host-observed boundary checked again before the first fresh model call. */
@@ -124,6 +136,7 @@ export interface IndependentRestartReceiptV2 extends Omit<IndependentRestartRece
 		failedHistory: IndependentRestartInput["failedHistory"];
 		historicalEffectState: "unknown-unreconciled";
 		executionMode: "fresh-work-only";
+		unobservedControlLineage: RestartUnobservedControlLineage;
 	};
 }
 
@@ -156,7 +169,8 @@ export interface IndependentRestartHost<Proof> {
 	authenticatedFacts(proof: unknown): AuthenticatedRestartCarryFacts | undefined;
 	/** Adapter-reviewed immutable source/effect policy; must not read model text as authority. */
 	reviewEffects(facts: AuthenticatedRestartCarryFacts,
-		operationRefs: readonly string[]): Promise<ReviewedRestartEffectPolicy>;
+		operationRefs: readonly string[],
+		unobservedControlDeliveries: readonly UnobservedControlDelivery[]): Promise<ReviewedRestartEffectPolicy>;
 	/** Re-run the selected source against current trusted checks before new dispatch. */
 	revalidateSelection(input: { privateBundle: Readonly<Record<string, string>>;
 		checkpoint: Readonly<ObjectiveProgressV1>; tupleSha256: string }): Promise<RevalidatedRestartSelection>;
@@ -292,6 +306,15 @@ export async function reserveIndependentRestart<Proof>(input: IndependentRestart
 	if (JSON.stringify(originalContract) !== JSON.stringify(checkpoint.contract))
 		fail("original contract and historical checkpoint disagree");
 	const { operationRefs: unresolved, aliases } = canonicalRestartUnknowns(checkpoint);
+	const deliveries = input.unobservedControlDeliveries;
+	if (!Array.isArray(deliveries) || deliveries.some(row => !validUnobservedControlDelivery(row)) ||
+		new Set(deliveries.map(row => row.controlCommit)).size !== deliveries.length ||
+		deliveries.some((row, index) => index > 0 &&
+			row.admittedBy.runNumber < deliveries[index - 1].admittedBy.runNumber))
+		fail("unobserved control-delivery lineage is invalid");
+	const unobservedControlLineage: RestartUnobservedControlLineage = {
+		priorSource: { ...facts.source }, admissionSource: { ...facts.currentRun },
+		count: deliveries.length, sha256: digest(deliveries) };
 	if (unresolved.length > 0 && checkpoint.continuation.requiresOperationReconciliation !== true)
 		fail("checkpoint did not retain the unresolved-operation hold");
 	for (const name of checkpoint.selectedArtifacts)
@@ -308,7 +331,7 @@ export async function reserveIndependentRestart<Proof>(input: IndependentRestart
 			run.acceptedTaskIds?.includes(selection.selectedTaskId) &&
 			!run.unresolvedOperationIds?.length))
 		fail("old accepted tuple was not independently revalidated");
-	const policy = await host.reviewEffects(facts, unresolved);
+	const policy = await host.reviewEffects(facts, unresolved, deliveries);
 	if (policy.sourceCommit !== facts.source.commit || !text(policy.policyId) ||
 		!hex64(policy.policySha256) ||
 		!Array.isArray(policy.operationAttestations) ||
@@ -322,14 +345,21 @@ export async function reserveIndependentRestart<Proof>(input: IndependentRestart
 			!Number.isSafeInteger(value) || value < 0) ||
 		policy.accountingObservation.historicalCommittedNano !== facts.committedNano ||
 		policy.accountingObservation.historicalUnknownHeldNano !== facts.unknownHeldNano ||
-		(unresolved.length === 0 && policy.accountingObservation.opaqueUnquantifiedRunCount === 0) ||
+		(!policy.unobservedControlLineage ||
+			!sourceEqual(policy.unobservedControlLineage.priorSource, facts.source) ||
+			!sourceEqual(policy.unobservedControlLineage.admissionSource, facts.currentRun) ||
+			policy.unobservedControlLineage.count !== deliveries.length ||
+			policy.unobservedControlLineage.sha256 !== unobservedControlLineage.sha256) ||
+		(unresolved.length === 0 && policy.accountingObservation.opaqueUnquantifiedRunCount === 0 &&
+			deliveries.length === 0) ||
 		policy.hostTransport !== (facts.resultArtifact ? "immutable-versioned-archive" : "none"))
 		fail("source-policy review does not cover every unknown effect");
 
 	const receipt: IndependentRestartReceiptV2 = {
 		version: 2, kind: "host-independent-goal-quarantine", issuedAt: new Date().toISOString(),
 		reuseKey: digest({ kind: "host-independent-goal-quarantine", source: facts.source,
-			envelopeSha256: facts.envelopeSha256, operationRefs: [...unresolved].sort() }),
+			envelopeSha256: facts.envelopeSha256, operationRefs: [...unresolved].sort(),
+			unobservedControlLineage }),
 		prior: { source: { ...facts.source }, envelopeSha256: facts.envelopeSha256,
 			privateBundleSha256: facts.privateBundleSha256, checkpointSha256: sha256(checkpointText),
 			contractId: checkpoint.contract.id, selectedRunId: selection.selectedRunId,
@@ -342,6 +372,7 @@ export async function reserveIndependentRestart<Proof>(input: IndependentRestart
 			historicalGoalOutcomes: checkpoint.boundedRuns.map(run => ({ runId: run.runId, outcome: run.outcome })),
 			operationOutcome: "unknown", selectedFromFailedAttempt: false,
 			historicalEffectState: "unknown-unreconciled", executionMode: "fresh-work-only",
+			unobservedControlLineage,
 			...(aliases.length ? { legacyQualifiedAliases: aliases } : {}),
 			failedHistory: { ...input.failedHistory } },
 		freshWorkspace: { ...input.freshWorkspace }, currentValidationSha256: selection.currentValidationSha256,

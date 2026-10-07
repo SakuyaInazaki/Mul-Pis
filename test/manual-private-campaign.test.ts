@@ -367,7 +367,14 @@ test("private history evidence distinguishes the sealed baseline from unquantifi
 		resultArtifact: { repository: "synthetic/repository", runId: "7002", artifactId: "8002",
 			artifactName: "synthetic-result", digestScope: "github-artifact-archive",
 			archiveSha256: "d".repeat(64) } } as any;
-	const evidence = offlineChecks.historicalGapEvidence(baseline, [gap], true) as any;
+	const acceptedNoRun = { version: 1 as const, kind: "unobserved-control-delivery" as const,
+		controlCommit: "e".repeat(40), testedSourceCommit: "f".repeat(40),
+		testedSourceTree: "1".repeat(40), previousControlParent: "2".repeat(40),
+		admittedBy: { runId: "7003", runAttempt: 1, runNumber: 3, commit: "3".repeat(40) },
+		observedRunsAtAdmission: 0 as const, effects: "unknown-unreconciled" as const,
+		accounting: "unquantified" as const };
+	const evidence = offlineChecks.historicalGapEvidence(baseline, [gap], true,
+		[acceptedNoRun]) as any;
 	assert.equal(evidence.baselineCarry.source.runId, "7001");
 	assert.equal(evidence.baselineCarry.resultArtifact.immutableArtifactRef, "synthetic-baseline-result");
 	assert.equal(evidence.opaqueExecutedRuns[0].source.runId, "7002");
@@ -375,6 +382,12 @@ test("private history evidence distinguishes the sealed baseline from unquantifi
 	assert.equal(evidence.opaqueExecutedRuns[0].accounting, "unquantified");
 	assert.equal(evidence.opaqueExecutedRuns[0].effectState, "unknown-unreconciled");
 	assert.doesNotMatch(JSON.stringify(evidence.opaqueExecutedRuns[0]), /settledCny|chargedCny|effects.*reviewed/);
+	assert.equal(evidence.unobservedControlDeliveries[0].controlCommit, acceptedNoRun.controlCommit);
+	assert.equal(evidence.unobservedControlDeliveries[0].observedRunsAtAdmission, 0);
+	assert.equal(evidence.unobservedControlDeliveries[0].accounting, "unquantified");
+	assert.equal(evidence.unobservedControlDeliveries[0].effectState, "unknown-unreconciled");
+	assert.equal(evidence.opaqueExecutedRuns.length, 1,
+		"a missing Actions run is not an opaque executed-run fee observation");
 	const expired = offlineChecks.historicalGapEvidence({ ...baseline,
 		resultArtifact: undefined }, [gap], false) as any;
 	assert.equal(expired.baselineCarry.resultArtifact.state, "expired-or-unavailable");
@@ -414,6 +427,7 @@ test("driver checkpoint synchronization matches a generic reservation with a pro
 		resultArtifact: { immutableRef: "synthetic-artifact", digestScope: "github-artifact-archive",
 			sha256: hash("encrypted-archive") }, committedNano: 1000, unknownHeldNano: 1 };
 	const input = { authenticatedCarryProof: { fixture: true }, privateBundle: bundle,
+		unobservedControlDeliveries: [],
 		freshWorkspace: { workspaceId: "mulpis-private-campaign-synthetic", restartNonce: "nonce" },
 		freshBoundary: { campaignRoot: "/tmp/mulpis-private-campaign-synthetic",
 			workspaceRoot: "/tmp/mulpis-private-campaign-synthetic/workspace",
@@ -430,6 +444,8 @@ test("driver checkpoint synchronization matches a generic reservation with a pro
 		authenticatedFacts: proof => proof === input.authenticatedCarryProof ? facts : undefined,
 		reviewEffects: async (_facts, refs) => ({ sourceCommit: facts.source.commit,
 			policyId: "synthetic-reviewed-policy", policySha256: hash("policy"),
+			unobservedControlLineage: { priorSource: { ...facts.source },
+				admissionSource: { ...facts.currentRun }, count: 0, sha256: hash(JSON.stringify([])) },
 			operationAttestations: refs.map(operationRef => ({ operationRef,
 				sourceCommit: facts.source.commit, evidenceSha256: hash(operationRef) })),
 			effectClass: "historical-unknown-fresh-only", unknownBillingHeld: true,

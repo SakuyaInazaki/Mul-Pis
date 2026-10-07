@@ -6,13 +6,14 @@
  */
 import { createHash } from "node:crypto";
 import { canonicalRestartUnknowns, type AuthenticatedRestartCarryFacts,
-	type ReviewedRestartEffectPolicy } from "../m07/independent-restart.ts";
+	type ReviewedRestartEffectPolicy, type RestartUnobservedControlLineage } from "../m07/independent-restart.ts";
 import { authenticatedAccountingObservation, authenticatedCarryAncestry,
 	authenticatedHistoricalCarryOrigin, authenticatedHistoricalOpaqueRunGaps,
 	authenticatedHostEffectEvidence, authenticatedSelectedTransitions,
+	authenticatedUnknownControlDeliveries, validUnobservedControlDelivery,
 	type AuthenticatedAccountingObservation, type AuthenticatedSelectedTransition,
 	type AuthenticatedCarryForwardOrigin, type AuthenticatedHostEffectEvidence,
-	type OpaqueExecutedRunGap } from "./ledger-continuation.ts";
+	type OpaqueExecutedRunGap, type UnobservedControlDelivery } from "./ledger-continuation.ts";
 import type { ObjectiveProgressV1 } from "../m07/objective-progress.ts";
 
 const sha256 = (value: string): string => createHash("sha256").update(value).digest("hex");
@@ -30,8 +31,13 @@ const reject = (reason: string): never => { throw new Error(`private restart eff
 export interface PrivateCampaignEffectReviewInput {
 	facts: AuthenticatedRestartCarryFacts;
 	operationRefs: readonly string[];
+	/** Exact live ledger output, including control deliveries discovered in this run. */
+	unobservedControlDeliveries: readonly UnobservedControlDelivery[];
 	privateBundle: Readonly<Record<string, string>>;
 	proof: unknown;
+	/** Live ledger brand: rejects JSON copies and caller-created suffixes. */
+	authenticatedControlDeliveries: (proof: unknown, bundle: unknown,
+		deliveries: unknown) => boolean;
 	/** Live ledger proof and exact authenticated private bundle, never model JSON. */
 	authenticatedBundle: (proof: unknown, bundle: unknown) => boolean;
 	/** Live ledger proof binding a source and carry envelope in complete ancestry. */
@@ -48,7 +54,8 @@ type Reservation = { receipt: { version: number; kind: string; prior: {
 	accountingObservation?: AuthenticatedAccountingObservation };
 	quarantine: { operationRefs: string[]; operationOutcome: string;
 		selectedFromFailedAttempt: boolean; historicalGoalOutcomes?: Array<{ runId: string; outcome: string }>;
-		historicalEffectState?: string; executionMode?: string };
+		historicalEffectState?: string; executionMode?: string;
+		unobservedControlLineage?: RestartUnobservedControlLineage };
 	freshWorkspace: { workspaceId: string; restartNonce: string } };
 	claim: { claimId: string; priorEnvelopeSha256: string; currentRunId: string;
 		currentRunAttempt: number; currentCommit: string; currentJobId: string } };
@@ -57,6 +64,7 @@ type Binding = { version: number; kind: string; quarantineReceiptSha256: string;
 type Ancestry = readonly Readonly<{ source: Readonly<Source>; envelopeSha256: string }>[];
 type Evidence = { ancestry: Ancestry; accounting: AuthenticatedAccountingObservation;
 	origin?: AuthenticatedCarryForwardOrigin; gaps: readonly OpaqueExecutedRunGap[];
+	priorControlDeliveries?: readonly UnobservedControlDelivery[];
 	hostEffect?: AuthenticatedHostEffectEvidence;
 	selectedTransitions?: readonly AuthenticatedSelectedTransition[] };
 
@@ -213,6 +221,23 @@ function reviewSelectedTransition(bundle: Readonly<Record<string, string>>, chec
 function sourceMatches(a: Source, b: Source): boolean {
 	return a.runId === b.runId && a.runAttempt === b.runAttempt && a.commit === b.commit;
 }
+function reviewControlLineage(input: PrivateCampaignEffectReviewInput, evidence: Evidence):
+	RestartUnobservedControlLineage {
+	const deliveries = input.unobservedControlDeliveries;
+	const prior = evidence.priorControlDeliveries;
+	if (!input.authenticatedControlDeliveries(input.proof, input.privateBundle, deliveries) ||
+		!Array.isArray(deliveries) || !Array.isArray(prior) || prior.length > deliveries.length ||
+		prior.some((row, index) => JSON.stringify(row) !== JSON.stringify(deliveries[index])) ||
+		deliveries.some(row => !validUnobservedControlDelivery(row)) ||
+		new Set(deliveries.map(row => row.controlCommit)).size !== deliveries.length ||
+		deliveries.some((row, index) => index > 0 &&
+			row.admittedBy.runNumber < deliveries[index - 1].admittedBy.runNumber) ||
+		deliveries.some(row => ![...evidence.ancestry.map(item => item.source), input.facts.currentRun]
+			.some(source => sourceMatches(row.admittedBy, source))))
+		reject("unobserved control-delivery lineage is not live authenticated or source-bound");
+	return { priorSource: { ...input.facts.source }, admissionSource: { ...input.facts.currentRun },
+		count: deliveries.length, sha256: sha256(JSON.stringify(deliveries)) };
+}
 function reviewChain(input: PrivateCampaignEffectReviewInput, checkpoint: ObjectiveProgressV1,
 	currentRefs: readonly string[], ancestry: Ancestry,
 	currentAccounting: AuthenticatedAccountingObservation): { reservations: Reservation[]; bindings: Binding[];
@@ -233,6 +258,7 @@ function reviewChain(input: PrivateCampaignEffectReviewInput, checkpoint: Object
 	let priorHeld = 0;
 	let priorAncestryIndex = -1;
 	let priorV3Accounting: AuthenticatedAccountingObservation | undefined;
+	let priorControlCount = 0;
 	let priorGoalPrefix: string[] = [];
 	let precedingBindingGoal: string | undefined;
 	const usedGoals = new Set<string>();
@@ -293,6 +319,22 @@ function reviewChain(input: PrivateCampaignEffectReviewInput, checkpoint: Object
 		if (!next || claim.currentRunId !== next.runId || claim.currentRunAttempt !== next.runAttempt ||
 			claim.currentCommit !== next.commit)
 			reject("historical claims do not form the authenticated source chain");
+		const controls = receipt.quarantine.unobservedControlLineage;
+		if (controls !== undefined) {
+			if (receipt.version !== 2 || !record(controls) ||
+				!record(controls.priorSource) || !sourceMatches(controls.priorSource, source) ||
+				!record(controls.admissionSource) || !sourceMatches(controls.admissionSource, next) ||
+				!Number.isSafeInteger(controls.count) || controls.count < priorControlCount ||
+				controls.count > input.unobservedControlDeliveries.length ||
+				!hex64(controls.sha256) || controls.sha256 !== sha256(JSON.stringify(
+					input.unobservedControlDeliveries.slice(0, controls.count))) ||
+				input.unobservedControlDeliveries.slice(0, controls.count).some(row => {
+					const admittedIndex = ancestry.findIndex(item => sourceMatches(item.source, row.admittedBy));
+					return admittedIndex < 0 || admittedIndex > sourceIndex + 1;
+				}))
+				reject("historical unobserved control lineage was omitted or rewritten");
+			priorControlCount = controls.count;
+		}
 		priorAncestryIndex = sourceIndex;
 		const historicalGoals = receipt.quarantine.historicalGoalOutcomes;
 		if (historicalGoals !== undefined && (!Array.isArray(historicalGoals) ||
@@ -406,6 +448,7 @@ function reviewCore(input: PrivateCampaignEffectReviewInput, evidence: Evidence)
 		ancestry.some(row => !input.bindsAncestor(input.proof, row.source, row.envelopeSha256)) ||
 		new Set(ancestry.map(row => `${row.source.runId}/${row.source.runAttempt}`)).size !== ancestry.length)
 		reject("ordered authenticated carry ancestry is incomplete");
+	const unobservedControlLineage = reviewControlLineage(input, evidence);
 	if (!accounting || Object.values(accounting).some(value =>
 			!Number.isSafeInteger(value) || value < 0) ||
 		accounting.historicalCommittedNano !== facts.committedNano ||
@@ -447,10 +490,11 @@ function reviewCore(input: PrivateCampaignEffectReviewInput, evidence: Evidence)
 		sourceCommit: facts.source.commit,
 		evidenceSha256: sha256(JSON.stringify({ source: facts.source,
 			checkpointSha256: sha256(bundle["objective-checkpoint.json"]), operationRef: ref })) });
-	const policyId = "mul-pis-historical-unknown-fresh-only-v2";
+	const policyId = "mul-pis-historical-unknown-fresh-only-v3";
 	return { sourceCommit: facts.source.commit, policyId,
 		policySha256: sha256(JSON.stringify({ policyId, source: facts.source,
 			envelopeSha256: facts.envelopeSha256, selectedSha, origin, gaps, accounting,
+			unobservedControlLineage,
 			selectedTransitions,
 			reservationSha256: reservations.map(row => sha256(JSON.stringify(row))),
 			bindingSha256: bindings.map(row => sha256(JSON.stringify(row))),
@@ -460,7 +504,7 @@ function reviewCore(input: PrivateCampaignEffectReviewInput, evidence: Evidence)
 		effectClass: "historical-unknown-fresh-only", unknownBillingHeld: true,
 		actorThirdPartyMutations: "unknown",
 		hostTransport: facts.resultArtifact ? "immutable-versioned-archive" : "none",
-		accountingObservation: { ...accounting } };
+		accountingObservation: { ...accounting }, unobservedControlLineage };
 }
 
 /** Production path: only the ledger's live, exact-bundle proof mints this policy. */
@@ -472,6 +516,7 @@ export function reviewPrivateCampaignRestartEffects(input: PrivateCampaignEffect
 	return reviewCore(input, { ancestry, accounting,
 		origin: authenticatedHistoricalCarryOrigin(input.proof, bundle),
 		gaps: authenticatedHistoricalOpaqueRunGaps(input.proof, bundle) ?? [],
+		priorControlDeliveries: authenticatedUnknownControlDeliveries(input.proof, bundle),
 		hostEffect: authenticatedHostEffectEvidence(input.proof, bundle),
 		selectedTransitions: authenticatedSelectedTransitions(input.proof, bundle) });
 }

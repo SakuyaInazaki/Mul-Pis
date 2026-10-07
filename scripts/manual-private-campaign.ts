@@ -44,7 +44,7 @@ import { CARRY_FILE_NAME, authenticatedHistoricalCarryOrigin,
 	authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, downloadCarryArtifact,
 	isAuthenticatedPriorCarryProof, openLedgerContinuation,
 	type PrivateContinuationBundle, type HostEffectReceiptV1,
-	type OpaqueExecutedRunGap } from "../src/runner/ledger-continuation.ts";
+	type OpaqueExecutedRunGap, type UnobservedControlDelivery } from "../src/runner/ledger-continuation.ts";
 import { reviewPrivateCampaignRestartEffects } from "../src/runner/private-campaign-restart-policy.ts";
 import { sealCampaignCarry, type CampaignCarrySeal } from "../src/runner/emergency-carry.ts";
 import { CARRY_LOGICAL_BYTES, CARRY_SEGMENT_FILE_BYTES, carrySidecarName } from "../src/runner/carry-sidecar-codec.ts";
@@ -430,7 +430,8 @@ function authenticatedHistoricalCarryFacts(proof: unknown,
 }
 function historicalGapEvidence(facts: AuthenticatedRestartCarryFacts,
 	opaqueGaps: readonly Pick<OpaqueExecutedRunGap, "source" | "resultArtifact">[],
-	historyAvailable: boolean): Record<string, unknown> {
+	historyAvailable: boolean,
+	unobservedControls: readonly UnobservedControlDelivery[] = []): Record<string, unknown> {
 	return { version: 1, kind: "untrusted-private-history-gap",
 		selectedCandidate: "authenticated currently selected bounded task; current correctness was revalidated without adopting old timings",
 		baselineCarry: { source: facts.source, envelopeSha256: facts.envelopeSha256,
@@ -442,10 +443,15 @@ function historicalGapEvidence(facts: AuthenticatedRestartCarryFacts,
 				digestScope: gap.resultArtifact.digestScope,
 				artifactSha256: gap.resultArtifact.archiveSha256 },
 			accounting: "unquantified", effectState: "unknown-unreconciled" })),
+		unobservedControlDeliveries: unobservedControls.map(row => ({
+			controlCommit: row.controlCommit, testedSourceCommit: row.testedSourceCommit,
+			admittedBy: row.admittedBy, observedRunsAtAdmission: row.observedRunsAtAdmission,
+			accounting: "unquantified", effectState: "unknown-unreconciled",
+			interpretation: "A control ref accepted this request, but a model-capable Actions run was not observed at admission. The earlier delivery and any hidden suffix remain UNKNOWN; do not replay or adopt its result." })),
 		laterFailedAttempt: historyAvailable ?
 			"The authenticated carry has bounded unselected history files. They may be read as development evidence, never inferred as adopted truth or as the contents of an opaque run." :
 			"Encrypted result content is unavailable to this runner; source, plan, verification and feedback must not be inferred.",
-		oldOperationOutcome: "Historical operation outcomes remain unknown; existing quantified holds remain recorded and opaque executed-run charges stay unquantified.",
+		oldOperationOutcome: "Historical operation and accepted-control delivery outcomes remain unknown; existing quantified holds remain recorded and opaque or unobserved exposure stays unquantified.",
 		providerTransportCause: "unavailable in the authenticated prior carry; do not infer an HTTP status or replay an unreceived request",
 		newExecution: "independent fresh workspace and goal only; old task is not resumed or reconciled" };
 }
@@ -2478,6 +2484,7 @@ async function main() {
 					writableFiles: [...session.grant.writableFiles] } } : {}) })),
 			requestIds: audit.requests.map(row => row.requestId) };
 		await incrementalJournal.record(event, { requestAudit: audit, hostEffects,
+			unobservedControlDeliveries: missionLedger.unobservedControlDeliveries,
 			...(objectiveCheckpointJson === undefined ? {} : { objectiveCheckpointJson }) });
 	};
 	let campaignCancelled = false;
@@ -2511,6 +2518,7 @@ async function main() {
 			previousCheckpoint.continuation.unresolvedOperationIds.length > 0 ||
 			previousCheckpoint.boundedRuns.some(run => (run.unresolvedOperationIds?.length ?? 0) > 0) ||
 			missionLedger.opaqueExecutedRuns.length > 0 ||
+			missionLedger.unobservedControlDeliveries.length > 0 ||
 			Boolean(authenticatedPendingHistoricalEffectSources(missionLedger.priorCarryProof,
 				previousBundle)?.length);
 		if (!priorNeedsQuarantine) validateContinuationSeed(previousBundle, found.files,
@@ -2641,6 +2649,7 @@ async function main() {
 			if (!facts) throw new SandboxPreflightError("authenticated terminal carry and selected prior proof unavailable; independent restart suspended");
 			restartReservation = await reserveIndependentRestart({ authenticatedCarryProof: priorProof,
 				privateBundle: previousBundle, freshBoundary: initialFreshBoundary,
+				unobservedControlDeliveries: missionLedger.unobservedControlDeliveries,
 				freshWorkspace: { workspaceId: path.basename(campaignRoot),
 					restartNonce: randomBytes(16).toString("hex") },
 				failedHistory: facts.resultArtifact ? { state: "unavailable",
@@ -2651,9 +2660,13 @@ async function main() {
 					state: "result-unavailable", reason: "The last authenticated carry is available, but its separate encrypted result artifact is unavailable. Historical research remains untrusted; continue only from the revalidated selected tuple without replay.",
 					carrySource: facts.source, carryEnvelopeSha256: facts.envelopeSha256 } }, {
 				authenticatedFacts: proof => proof === priorProof ? authenticatedHistoricalCarryFacts(proof, previousBundle) : undefined,
-				reviewEffects: async (authenticated, operationRefs) =>
+				reviewEffects: async (authenticated, operationRefs, unobservedControlDeliveries) =>
 					reviewPrivateCampaignRestartEffects({ facts: authenticated, operationRefs,
+						unobservedControlDeliveries,
 						privateBundle: previousBundle, proof: priorProof,
+						authenticatedControlDeliveries: (proof, bundle, value) =>
+							proof === priorProof && bundle === previousBundle &&
+							missionLedger.authenticatedUnobservedControlDeliveries(value),
 						authenticatedBundle: authenticatedPriorCarryBindsBundle,
 							bindsAncestor: authenticatedPriorCarryBindsAncestor }),
 				revalidateSelection: async ({ privateBundle, checkpoint, tupleSha256 }) => {
@@ -2673,7 +2686,8 @@ async function main() {
 			historicalUnresolvedOperationIds = reservedCanonicalOperationRefs(previousCheckpoint, restartReservation);
 			const gapFile = path.join(priorSeedDir, "prior-history-gap.json");
 			await writeFile(gapFile, `${JSON.stringify(historicalGapEvidence(facts,
-				missionLedger.opaqueExecutedRuns, Boolean(previousBundle["research-history.json"])), null, 2)}\n`,
+				missionLedger.opaqueExecutedRuns, Boolean(previousBundle["research-history.json"]),
+				missionLedger.unobservedControlDeliveries), null, 2)}\n`,
 				{ mode: 0o600 });
 			priorSeedInputs.push("objective-seeds/prior-history-gap.json");
 		}
@@ -4232,7 +4246,8 @@ async function main() {
 				if (!savedStatus || typeof savedStatus !== "object" || Array.isArray(savedStatus)) savedStatus = {};
 			} catch { savedStatus = {}; }
 			try { await saveStatus({ ...savedStatus, accountingAudit: requestAudit,
-				unquantifiedExecutedRunCount: missionLedger.opaqueExecutedRuns.length }); }
+				unquantifiedExecutedRunCount: missionLedger.opaqueExecutedRuns.length,
+				unobservedControlDeliveryCount: missionLedger.unobservedControlDeliveries.length }); }
 			catch { statusArchiveFailure = recordFinalizationFailure(finalizationFailures,
 				"accounting-audit-status-write-failed"); process.exitCode = 1; }
 			const transportCensus = missionLedger.appendTransportDiagnosticCensus(
@@ -4301,6 +4316,7 @@ async function main() {
 				observedUnknownHeldCny: carry.observedUnknownHeldCny,
 				unpricedRequestCount: carry.unpricedRequestCount,
 				unquantifiedExecutedRunCount: missionLedger.opaqueExecutedRuns.length,
+				unobservedControlDeliveryCount: missionLedger.unobservedControlDeliveries.length,
 				status: sealed.mode === "normal" ? "sealed-encrypted-continuation" :
 					"sealed-emergency-effects-unreviewed",
 			}, null, 2)}\n`, { mode: 0o600 });
@@ -4309,6 +4325,7 @@ async function main() {
 				statusArchiveFailure = emergencyStatus.archiveFailure;
 				await saveStatus({ ...savedStatus, accountingAudit: requestAudit,
 					unquantifiedExecutedRunCount: missionLedger.opaqueExecutedRuns.length,
+					unobservedControlDeliveryCount: missionLedger.unobservedControlDeliveries.length,
 					outcome: "incomplete",
 					...emergencyStatus,
 					finalizationFailures,
@@ -4318,6 +4335,7 @@ async function main() {
 			} else if (finalizationFailures.length) {
 				await saveStatus({ ...savedStatus, accountingAudit: requestAudit,
 					unquantifiedExecutedRunCount: missionLedger.opaqueExecutedRuns.length,
+					unobservedControlDeliveryCount: missionLedger.unobservedControlDeliveries.length,
 					outcome: "incomplete", archiveFailure: statusArchiveFailure,
 					...(collectionFailure ? { collectionFailure } : {}), finalizationFailures,
 					independentValidation: "not-complete" });

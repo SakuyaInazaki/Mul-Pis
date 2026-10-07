@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { deflateRawSync } from "node:zlib";
 import test, { type TestContext } from "node:test";
-import { authenticateLatestTerminalCarry, authenticateLatestTerminalInterruption, authenticatedSupervisorProjection, authenticatedTerminalCarryBindsBundle, authenticatedTerminalInterruptionBindsPriorBundle, authenticatedTerminalInterruptionSupervisorProjection, isAuthenticatedTerminalCarryProof, isAuthenticatedTerminalInterruptionProof, isAuthenticatedIncrementalPrefixObservation, authenticatedIncrementalPrefixBindsPriorBundle, authenticatedAccountingObservation, authenticatedHistoricalOpaqueRunGaps, authenticatedHistoricalCarryOrigin, authenticatedPendingHistoricalEffectSources, authenticatedSelectedTransitions, authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, originalObjectiveMatchesSignedBootstrap, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE, retainedTransportDiagnosticWithinBundle } from "../src/runner/ledger-continuation.ts";
+import { authenticateLatestTerminalCarry, authenticateLatestTerminalInterruption, authenticatedSupervisorProjection, authenticatedTerminalCarryBindsBundle, authenticatedTerminalInterruptionBindsPriorBundle, authenticatedTerminalInterruptionSupervisorProjection, isAuthenticatedTerminalCarryProof, isAuthenticatedTerminalInterruptionProof, isAuthenticatedIncrementalPrefixObservation, authenticatedIncrementalPrefixBindsPriorBundle, authenticatedAccountingObservation, authenticatedHistoricalOpaqueRunGaps, authenticatedHistoricalCarryOrigin, authenticatedPendingHistoricalEffectSources, authenticatedSelectedTransitions, authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, authenticatedUnknownControlDeliveries, authenticatedTerminalUnknownControlDeliveries, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, originalObjectiveMatchesSignedBootstrap, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE, retainedTransportDiagnosticWithinBundle } from "../src/runner/ledger-continuation.ts";
 import { INCREMENTAL_CHECKPOINT_FILE, IncrementalPrivateCheckpointJournal } from "../src/runner/incremental-private-checkpoint.ts";
 import type { CarryArtifactPayload, RequestAuditSnapshot } from "../src/runner/ledger-continuation.ts";
 import { DeepSeekCampaignBudget, campaignSessionEffectId, type CampaignAdmissionRejection } from "../src/runner/deepseek-campaign.ts";
@@ -355,10 +355,46 @@ test("terminal control request authenticates its immutable tested source after f
 	const terminal = await authenticateLatestTerminalCarry({ ...terminalInput, request: requestFor(true) });
 	assert.equal(authenticatedSupervisorProjection(terminal.proof, terminal.privateBundle)?.status.contractId,
 		contract.id);
+	assert.deepEqual(authenticatedTerminalUnknownControlDeliveries(terminal.proof,
+		terminal.privateBundle), []);
+	assert.equal(authenticatedTerminalUnknownControlDeliveries({ ...terminal.proof },
+		terminal.privateBundle), undefined);
 	await assert.rejects(authenticateLatestTerminalCarry({ ...terminalInput,
 		request: requestFor(true, sha("2")) }), /accepted source tree/);
 	await assert.rejects(authenticateLatestTerminalCarry({ ...terminalInput,
 		request: requestFor(true, tree, false) }), /successful offline regression/);
+	const oldControl = sha("d"), oldSource = sha("e");
+	const linkedSource = { ...source, before: oldControl };
+	const linkedRequest = (done: boolean): typeof fetch => async (url, init) => {
+		const address = String(url);
+		if (address.endsWith(`/git/commits/${sha("b")}`))
+			return new Response(JSON.stringify({ parents: [{ sha: testedSource }, { sha: oldControl }],
+				tree: { sha: tree } }));
+		if (address.endsWith(`/git/commits/${oldControl}`))
+			return new Response(JSON.stringify({ sha: oldControl, message: REUSABLE_RUN_REQUEST_MESSAGE,
+				parents: [{ sha: oldSource }], tree: { sha: tree } }));
+		if (address.endsWith(`/git/commits/${oldSource}`))
+			return new Response(JSON.stringify({ sha: oldSource, tree: { sha: tree } }));
+		if (address.includes(`/workflows/manual-private-campaign.yml/runs?head_sha=${oldControl}`))
+			return new Response(JSON.stringify({ total_count: 0, workflow_runs: [] }));
+		if (address.includes(`/workflows/workflow-regression.yml/runs?head_sha=${oldSource}`))
+			return new Response(JSON.stringify({ workflow_runs: [{ head_sha: oldSource,
+				head_branch: "improve/workflow-learning-reliability", event: "push",
+				run_attempt: 1, status: "completed", conclusion: "success" }] }));
+		return requestFor(done)(url, init);
+	};
+	const linkedOpening = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: linkedSource,
+		request: linkedRequest(false), loadCarryArtifact: async () => "unused" });
+	const linkedCarry = linkedOpening.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: { version: 3,
+			kind: "accounting-only-request-audit", requests: [], settledCny: 0,
+			unknownObservedCny: 0, unpricedRequestCount: 0 } });
+	const linkedTerminal = await authenticateLatestTerminalCarry({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", source: linkedSource,
+		request: linkedRequest(true), loadCarryArtifact: async () => linkedCarry });
+	assert.deepEqual(authenticatedTerminalUnknownControlDeliveries(linkedTerminal.proof,
+		linkedTerminal.privateBundle)?.map(row => row.controlCommit), [oldControl]);
 });
 
 test("signed seed and finished carry chain preserve the single cumulative ceiling and private bundle", async t => {
@@ -1315,12 +1351,15 @@ test("next request fast-forwards the prior control ref while selecting a newly t
 			return new Response(JSON.stringify({ object: { sha: source } }));
 		if (target.endsWith(`/git/commits/${sha("c")}`))
 			return new Response(JSON.stringify({ parents: [{ sha: source }, { sha: before }], tree: { sha: tree } }));
+		if (target.endsWith(`/git/commits/${before}`))
+			return new Response(JSON.stringify({ sha: before, message: REUSABLE_RUN_REQUEST_MESSAGE,
+				parents: [{ sha: source }], tree: { sha: tree } }));
 		if (target.endsWith(`/git/commits/${source}`))
-			return new Response(JSON.stringify({ parents: [], tree: { sha: tree } }));
+			return new Response(JSON.stringify({ sha: source, parents: [], tree: { sha: tree } }));
 		if (target.includes("/actions/workflows/workflow-regression.yml/runs?"))
 			return new Response(JSON.stringify({ workflow_runs: [{ head_sha: source,
 				head_branch: "improve/workflow-learning-reliability", event: "push",
-				run_attempt: 1, conclusion: "success" }] }));
+				run_attempt: 1, status: "completed", conclusion: "success" }] }));
 		return base(url, init);
 	};
 	const opened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token", request,
@@ -1328,6 +1367,231 @@ test("next request fast-forwards the prior control ref while selecting a newly t
 			ref: "refs/heads/run-requests/workflow-learning-reliability" },
 		loadCarryArtifact: async () => { throw Error("skipped prior control job has no carry"); } });
 	assert.equal(opened.mode, "accounting-only");
+});
+
+test("linked accepted control with no observed Action stays UNKNOWN across ordinary and emergency carries", async t => {
+	const f = await fixture(t), seedEnvelopeB64 = attestedSeed(f);
+	const priorOpen = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7002, sha("b")),
+		request: github([anchor, first]), loadCarryArtifact: async () => "unused" });
+	const emptyAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
+		requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
+	const priorCarry = priorOpen.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: emptyAudit });
+	const priorDone = { ...first, status: "completed", conclusion: "success" };
+	const linked = { ...second, event: "push", head_branch: "run-requests/workflow-learning-reliability",
+		head_commit: { message: REUSABLE_RUN_REQUEST_MESSAGE } };
+	const oldControl = sha("d"), oldSource = sha("f"), oldFirst = sha("6"),
+		oldFirstSource = sha("7"), oldFirstTree = sha("8"), newSource = sha("e");
+	const oldTree = sha("1"), newTree = sha("2");
+	const linkedCurrent = { ...current(7003, sha("c")), event: "push", before: oldControl,
+		ref: "refs/heads/run-requests/workflow-learning-reliability" };
+	const requests = (runs: object[], options: { oldRuns?: number; late?: "preprovider" | "provider-started";
+		twoUnknowns?: boolean; lateFirst?: boolean; bothLate?: boolean; badOldTree?: boolean;
+		badOldCommitSha?: boolean; badOldSourceSha?: boolean;
+		badOldCi?: boolean; badOldBranch?: boolean } = {}): typeof fetch => {
+		const base = github(runs);
+		return async (url, init) => {
+			const address = String(url);
+			if (address.endsWith("/git/ref/heads/improve/workflow-learning-reliability"))
+				return new Response(JSON.stringify({ object: { sha: newSource } }));
+			if (address.endsWith(`/git/commits/${sha("c")}`))
+				return new Response(JSON.stringify({ parents: [{ sha: newSource }, { sha: oldControl }],
+					tree: { sha: newTree } }));
+			if (address.endsWith(`/git/commits/${newSource}`))
+				return new Response(JSON.stringify({ tree: { sha: newTree } }));
+			if (address.endsWith(`/git/commits/${oldControl}`))
+				return new Response(JSON.stringify({ sha: options.badOldCommitSha ? sha("9") : oldControl,
+					message: REUSABLE_RUN_REQUEST_MESSAGE,
+					parents: [{ sha: oldSource }, ...(options.twoUnknowns ? [{ sha: oldFirst }] : [])],
+					tree: { sha: options.badOldTree ? sha("3") : oldTree } }));
+			if (address.endsWith(`/git/commits/${oldSource}`))
+				return new Response(JSON.stringify({ sha: options.badOldSourceSha ? sha("9") : oldSource,
+					tree: { sha: oldTree } }));
+			if (address.endsWith(`/git/commits/${oldFirst}`))
+				return new Response(JSON.stringify({ sha: oldFirst, message: REUSABLE_RUN_REQUEST_MESSAGE,
+					parents: [{ sha: oldFirstSource }], tree: { sha: oldFirstTree } }));
+			if (address.endsWith(`/git/commits/${oldFirstSource}`))
+				return new Response(JSON.stringify({ sha: oldFirstSource, tree: { sha: oldFirstTree } }));
+			if (address.includes(`/workflows/manual-private-campaign.yml/runs?head_sha=${oldControl}`))
+				return new Response(JSON.stringify({ total_count: options.bothLate ? 1 : options.oldRuns ?? 0,
+					workflow_runs: options.bothLate ? [secondLateRun] : options.oldRuns ?
+						options.late ? [lateRun] : [{ head_sha: oldControl }] : [] }));
+			if (address.includes(`/workflows/manual-private-campaign.yml/runs?head_sha=${oldFirst}`))
+				return new Response(JSON.stringify({ total_count: options.lateFirst || options.bothLate ? 1 : 0,
+					workflow_runs: options.bothLate ? [firstLateRun] :
+						options.lateFirst ? [{ head_sha: oldFirst }] : [] }));
+			if (address.includes(`/workflows/workflow-regression.yml/runs?head_sha=${newSource}`))
+				return new Response(JSON.stringify({ workflow_runs: [{ head_sha: newSource,
+					head_branch: "improve/workflow-learning-reliability", event: "push",
+					run_attempt: 1, status: "completed", conclusion: "success" }] }));
+			if (address.includes(`/workflows/workflow-regression.yml/runs?head_sha=${oldSource}`))
+				return new Response(JSON.stringify({ workflow_runs: options.badOldCi ? [] : [{
+					head_sha: oldSource, head_branch: options.badOldBranch ? "main" :
+						"improve/workflow-learning-reliability", event: "push", run_attempt: 1,
+					status: "completed", conclusion: "success" }] }));
+			if (address.includes(`/workflows/workflow-regression.yml/runs?head_sha=${oldFirstSource}`))
+				return new Response(JSON.stringify({ workflow_runs: [{ head_sha: oldFirstSource,
+					head_branch: "improve/workflow-learning-reliability", event: "push",
+					run_attempt: 1, status: "completed", conclusion: "success" }] }));
+			if (address.includes("/runs/7003/jobs?")) return new Response(JSON.stringify({ total_count: 1,
+				jobs: [{ id: 6003, run_id: 7003, run_attempt: 1, head_sha: sha("c"),
+					name: "private-campaign", status: "completed", conclusion: "success",
+					steps: [{ name: "Run private campaign", status: "completed", conclusion: "success" }] }] }));
+			if (address.includes("/runs/7003/artifacts?")) return new Response(JSON.stringify({ total_count: 1,
+				artifacts: [{ id: 9003, name: CARRY_ARTIFACT_NAME, expired: false,
+					workflow_run: { id: 7003, head_sha: sha("c") } }] }));
+			if (address.includes("/runs/7004/jobs?")) return new Response(JSON.stringify({ total_count: 1,
+				jobs: [{ id: 6004, run_id: 7004, run_attempt: 1,
+					head_sha: options.bothLate ? oldFirst : oldControl,
+					name: "private-campaign", status: "completed", conclusion: "failure", steps: [
+						{ name: "Verify reusable control-branch request and accepted source CI",
+							status: "completed", conclusion: "failure" },
+						{ name: "Decode confidential input without logging it", status: "completed",
+							conclusion: "skipped" },
+						{ name: "Run private campaign", status: "completed", conclusion:
+								options.late === "provider-started" ? "success" : "skipped" }] }] }));
+			if (address.includes("/runs/7005/jobs?") && options.bothLate)
+				return new Response(JSON.stringify({ total_count: 1,
+					jobs: [{ id: 6005, run_id: 7005, run_attempt: 1, head_sha: oldControl,
+						name: "private-campaign", status: "completed", conclusion: "failure", steps: [
+							{ name: "Verify reusable control-branch request and accepted source CI",
+								status: "completed", conclusion: "failure" },
+							{ name: "Decode confidential input without logging it", status: "completed",
+								conclusion: "skipped" },
+							{ name: "Run private campaign", status: "completed", conclusion: "skipped" }] }] }));
+			return base(url, init);
+		};
+	};
+	const lateRun = { ...run(7004, 4, "completed", oldControl, "failure"),
+		event: "push", head_branch: "run-requests/workflow-learning-reliability",
+		head_commit: { message: REUSABLE_RUN_REQUEST_MESSAGE } };
+	const firstLateRun = { ...lateRun, head_sha: oldFirst };
+	const secondLateRun = { ...lateRun, id: 7005, run_number: 5 };
+	const opening = () => openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: linkedCurrent,
+		request: requests([anchor, priorDone, linked]),
+		loadCarryArtifact: async () => priorCarry });
+	const opened = await opening();
+	assert.equal(opened.authenticatedUnobservedControlDeliveries(
+		opened.unobservedControlDeliveries), true);
+	assert.equal(opened.authenticatedUnobservedControlDeliveries(
+		JSON.parse(JSON.stringify(opened.unobservedControlDeliveries))), false);
+	assert.equal(Object.isFrozen(opened.unobservedControlDeliveries[0]), true);
+	assert.equal(Object.isFrozen(opened.unobservedControlDeliveries[0].admittedBy), true);
+	assert.deepEqual(opened.unobservedControlDeliveries.map(row => ({
+		commit: row.controlCommit, source: row.testedSourceCommit, runs: row.observedRunsAtAdmission,
+		effects: row.effects, accounting: row.accounting })), [{ commit: oldControl,
+		source: oldSource, runs: 0, effects: "unknown-unreconciled", accounting: "unquantified" }]);
+	const ordinary = opened.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: emptyAudit });
+	const seed = await authenticateSignedMissionSeed({ ...f, envelopeB64: seedEnvelopeB64 });
+	const key = seed.derivePrivateKey("mul-pis-ledger-continuation-v1");
+	const linkedSource = { runId: "7003", runAttempt: 1, runNumber: 3, commit: sha("c") };
+	const altered = decodeV4Checkpoint(ordinary, seed.seedDigest, key, linkedSource);
+	altered.unobservedControlDeliveries[0].effects = "no-effects";
+	const forged = resealV4Checkpoint(altered, seed.seedDigest, key, linkedSource);
+	const emergency = (await opening()).sealEmergencyCurrent({ settledCny: 0,
+		unknownObservedCny: 0, unpricedRequestCount: 0, requestAudit: emptyAudit },
+		"effect-review-incomplete");
+	for (const carry of [ordinary, emergency]) {
+		const next = run(7005, 4, "in_progress", sha("5"));
+		const reopened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+			githubToken: "synthetic-token", current: current(7005, sha("5")),
+			request: requests([anchor, priorDone, { ...linked, status: "completed", conclusion: "success" }, next]),
+			loadCarryArtifact: async ({ runId }) => runId === "7003" ? carry : priorCarry });
+		assert.equal(reopened.unobservedControlDeliveries.length, 1);
+		assert.deepEqual(authenticatedUnknownControlDeliveries(reopened.priorCarryProof,
+			reopened.priorPrivateBundle), reopened.unobservedControlDeliveries);
+		await assert.rejects(openLedgerContinuation({ ...f, seedEnvelopeB64,
+			githubToken: "synthetic-token", current: current(7005, sha("5")),
+			request: requests([anchor, priorDone, { ...linked, status: "completed", conclusion: "success" }, next],
+				{ oldRuns: 1 }), loadCarryArtifact: async ({ runId }) => runId === "7003" ? carry : priorCarry }),
+			/late prior control Action requires explicit UNKNOWN-effect reconciliation/);
+	}
+	const lateHistory = [anchor, priorDone, { ...linked, status: "completed", conclusion: "success" },
+		lateRun, run(7005, 5, "in_progress", sha("5"))];
+	const preprovider = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7005, sha("5")),
+		request: requests(lateHistory, { oldRuns: 1, late: "preprovider" }),
+		loadCarryArtifact: async ({ runId }) => runId === "7003" ? ordinary : priorCarry });
+	assert.equal(preprovider.unobservedControlDeliveries[0].effects, "unknown-unreconciled");
+	assert.equal(preprovider.lateControlPreproviderDispositions[0].providerStep, "skipped");
+	const reconciledCarry = preprovider.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: emptyAudit });
+	const reconciledPlaintext = decodeV4Checkpoint(reconciledCarry, seed.seedDigest, key,
+		{ runId: "7005", runAttempt: 1, runNumber: 5, commit: sha("5") });
+	assert.equal(reconciledPlaintext.lateControlPreproviderDispositions[0].effects,
+		"unknown-unreconciled");
+	await assert.rejects(openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7005, sha("5")),
+		request: requests(lateHistory, { oldRuns: 1, late: "provider-started" }),
+		loadCarryArtifact: async ({ runId }) => runId === "7003" ? ordinary : priorCarry }),
+		/UNKNOWN-effect reconciliation/);
+	for (const emergencyMode of [false, true]) {
+		const chainOpen = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+			githubToken: "synthetic-token", current: linkedCurrent,
+			request: requests([anchor, priorDone, linked], { twoUnknowns: true }),
+			loadCarryArtifact: async () => priorCarry });
+		assert.deepEqual(chainOpen.unobservedControlDeliveries.map(row => row.controlCommit),
+			[oldFirst, oldControl]);
+		const chainCarry = emergencyMode ? chainOpen.sealEmergencyCurrent({ settledCny: 0,
+			unknownObservedCny: 0, unpricedRequestCount: 0, requestAudit: emptyAudit },
+			"effect-review-incomplete") : chainOpen.sealCurrent({ settledCny: 0,
+				unknownObservedCny: 0, unpricedRequestCount: 0, requestAudit: emptyAudit });
+		const successor = [anchor, priorDone,
+			{ ...linked, status: "completed", conclusion: "success" },
+			run(7005, 4, "in_progress", sha("5"))];
+		const recovered = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+			githubToken: "synthetic-token", current: current(7005, sha("5")),
+			request: requests(successor, { twoUnknowns: true }),
+			loadCarryArtifact: async ({ runId }) => runId === "7003" ? chainCarry : priorCarry });
+		assert.deepEqual(recovered.unobservedControlDeliveries.map(row => row.controlCommit),
+			[oldFirst, oldControl]);
+		for (const late of [{ twoUnknowns: true, lateFirst: true },
+			{ twoUnknowns: true, oldRuns: 1 }])
+			await assert.rejects(openLedgerContinuation({ ...f, seedEnvelopeB64,
+				githubToken: "synthetic-token", current: current(7005, sha("5")),
+				request: requests(successor, late),
+				loadCarryArtifact: async ({ runId }) => runId === "7003" ? chainCarry : priorCarry }),
+				/UNKNOWN-effect reconciliation/);
+		const twoLate = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+			githubToken: "synthetic-token", current: current(7006, sha("5")),
+			request: requests([anchor, priorDone,
+				{ ...linked, status: "completed", conclusion: "success" },
+				firstLateRun, secondLateRun, run(7006, 6, "in_progress", sha("5"))],
+				{ twoUnknowns: true, bothLate: true }),
+			loadCarryArtifact: async ({ runId }) => runId === "7003" ? chainCarry : priorCarry });
+		assert.deepEqual(twoLate.lateControlPreproviderDispositions.map(row => row.controlCommit),
+			[oldFirst, oldControl]);
+		const twoLateCarry = twoLate.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+			unpricedRequestCount: 0, requestAudit: emptyAudit });
+		const twoLatePlaintext = decodeV4Checkpoint(twoLateCarry, seed.seedDigest, key,
+			{ runId: "7006", runAttempt: 1, runNumber: 6, commit: sha("5") });
+		assert.equal(twoLatePlaintext.lateControlPreproviderDispositions.length, 2);
+	}
+	await assert.rejects(openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7005, sha("5")),
+		request: requests([anchor, priorDone, { ...linked, status: "completed", conclusion: "success" },
+			run(7005, 4, "in_progress", sha("5"))]),
+		loadCarryArtifact: async ({ runId }) => runId === "7003" ? forged : priorCarry }),
+		/unobserved control delivery/);
+	for (const option of [{ badOldTree: true }, { badOldCi: true }, { badOldBranch: true },
+		{ badOldCommitSha: true }, { badOldSourceSha: true }])
+		await assert.rejects(openLedgerContinuation({ ...f, seedEnvelopeB64,
+			githubToken: "synthetic-token", current: linkedCurrent,
+			request: requests([anchor, priorDone, linked], option),
+			loadCarryArtifact: async () => priorCarry }), /unobserved prior control/);
+	const wrongRow = { ...run(7004, 4, "queued", oldControl), event: "workflow_dispatch" };
+	await assert.rejects(openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: linkedCurrent,
+		request: requests([anchor, priorDone, linked, wrongRow], { oldRuns: 1 }),
+		loadCarryArtifact: async () => priorCarry }),
+		/prior control Action lies outside authenticated workflow history/);
+	await assert.rejects(openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: { ...linkedCurrent, before: sha("4") },
+		request: requests([anchor, priorDone, linked]),
+		loadCarryArtifact: async () => priorCarry }), /not a fast-forward empty commit/);
 });
 
 test("historical v2 seeds without root attestation keep their old availability requirement", async t => {
@@ -1951,7 +2215,8 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 	const freshCampaignRoot = path.join(os.tmpdir(), "mulpis-private-campaign-synthetic-ledger");
 	const freshWorkspaceRoot = path.join(freshCampaignRoot, "workspace");
 	const reservation = await reserveIndependentRestart({ authenticatedCarryProof: priorProof,
-		privateBundle: priorBundle, freshWorkspace: { workspaceId: path.basename(freshCampaignRoot),
+		privateBundle: priorBundle, unobservedControlDeliveries: [],
+		freshWorkspace: { workspaceId: path.basename(freshCampaignRoot),
 			restartNonce: "independent-nonce" },
 		freshBoundary: { campaignRoot: freshCampaignRoot, workspaceRoot: freshWorkspaceRoot,
 			storeRoot: path.join(freshWorkspaceRoot, ".agent", "knowledge"),
@@ -1969,6 +2234,8 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 			assert.deepEqual([...refs].sort(), ["new-goal/O001", "old-goal/O001", "old-goal/O002"]);
 			return { sourceCommit: reviewed.source.commit, policyId: "synthetic-confined-host-review",
 				policySha256: digest([reviewed.source, refs]),
+				unobservedControlLineage: { priorSource: { ...facts.source },
+					admissionSource: { ...facts.currentRun }, count: 0, sha256: digest([]) },
 				operationAttestations: refs.map(operationRef => ({ operationRef,
 					sourceCommit: reviewed.source.commit, evidenceSha256: digest(operationRef) })),
 				effectClass: "historical-unknown-fresh-only", unknownBillingHeld: true,

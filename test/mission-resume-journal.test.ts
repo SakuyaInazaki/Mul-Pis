@@ -264,6 +264,122 @@ test("a crash after attempt and unknown delivery cannot cause a second update", 
 		"reserved");
 });
 
+test("an acknowledged linked successor does not silently settle the old unknown attempt", async t => {
+	const { journal } = await fixture(t), prior = intentFor();
+	await journal.reserve(prior, binding());
+	await journal.markAttempted(prior.idempotencyKey);
+	const oldControlCommit = "f".repeat(40);
+	const changed = { ...binding("a".repeat(40)), previousControlCommit: oldControlCommit,
+		expectedBefore: oldControlCommit, parents: ["a".repeat(40), oldControlCommit],
+		successfulCi: { ...binding("a".repeat(40)).successfulCi, runId: "9002" } };
+	const linkedUnknownDelivery = { version: 1 as const,
+		kind: "host-verified-linked-unknown-delivery" as const,
+		oldJournalKey: prior.idempotencyKey, oldControlCommit,
+		oldSourceReviewReceiptSha256: hash("reviewed old source"),
+		ancestry: [{ oldJournalKey: prior.idempotencyKey, oldControlCommit }],
+		oldTestedSourceCommit: binding().testedSourceCommit, oldTestedTree: binding().testedTree,
+		liveControlHead: oldControlCommit,
+		census: { kind: "authenticated-complete-actions-run-census" as const,
+			headCommit: oldControlCommit, totalCount: 0 as const, pagesRead: 1 as const,
+			sha256: hash("authenticated census") },
+		newTestedSourceCommit: changed.testedSourceCommit, newTestedTree: changed.testedTree,
+		newSuccessfulCi: changed.successfulCi, sourceRefTip: changed.sourceRefTip,
+		accounting: "unquantified" as const, effects: "unknown-unreconciled" as const };
+	const linked: ResumeIntent = { ...prior, linkedUnknownDelivery,
+		idempotencyKey: hash(canonical({ source: prior.source,
+			envelopeSha256: prior.envelopeSha256, contractId: prior.contractId,
+			selectedTupleSha256: prior.selectedTupleSha256,
+			pendingActionSha256: prior.pendingActionSha256, linkedUnknownDelivery })) };
+	await journal.reserve(linked, changed);
+	assert.equal((await journal.get(prior.idempotencyKey))?.state, "delivery-unknown");
+	await assert.rejects(journal.acknowledge(prior.idempotencyKey, {
+		kind: "read-only-accepted-control", controlRef: binding().controlRef,
+		controlCommit: oldControlCommit, tree: binding().testedTree,
+		parents: binding().parents, message: binding().message,
+		successorRunId: "9005" }), /remains delivery-unknown/);
+	await assert.rejects(journal.reconcileNotDelivered(prior.idempotencyKey, {
+		kind: "read-only-not-delivered", controlRef: binding().controlRef,
+		observedHead: binding().expectedBefore, matchingRunCount: 0,
+		pendingDeliveryExcluded: true }), /remains delivery-unknown/);
+	await journal.markAttempted(linked.idempotencyKey);
+	await journal.acknowledge(linked.idempotencyKey, {
+		kind: "read-only-accepted-control", controlRef: binding().controlRef,
+		controlCommit: "1".repeat(40), tree: changed.testedTree,
+		parents: changed.parents, message: changed.message, successorRunId: "9004" });
+	const fakeCarry = { proof: { source: { runId: "9004", runAttempt: 1,
+		commit: "1".repeat(40) }, envelopeSha256: hash("fake carry") }, privateBundle: {} } as
+		unknown as Parameters<MissionResumeJournal["markUnknownLineageCarried"]>[1];
+	await assert.rejects(journal.markUnknownLineageCarried(linked.idempotencyKey, fakeCarry),
+		/does not seal/);
+	assert.equal((await journal.unresolvedForRef(binding().controlRef))?.idempotencyKey,
+		prior.idempotencyKey);
+	assert.equal((await journal.get(prior.idempotencyKey))?.state, "delivery-unknown");
+	const third = { ...changed, previousControlCommit: "1".repeat(40),
+		expectedBefore: "1".repeat(40), parents: [changed.testedSourceCommit, "1".repeat(40)] };
+	await assert.rejects(journal.reserve(intentFor("model-reported-blocked"), third),
+		/unresolved reservation/);
+});
+
+test("two consecutive accepted zero-run controls retain the full oldest-to-newest ancestry", async t => {
+	const { journal } = await fixture(t), original = intentFor();
+	await journal.reserve(original, binding());
+	await journal.markAttempted(original.idempotencyKey);
+	const firstCommit = "f".repeat(40);
+	const firstControl: TestedControlBinding = { ...binding("a".repeat(40)),
+		previousControlCommit: firstCommit, expectedBefore: firstCommit,
+		parents: ["a".repeat(40), firstCommit],
+		successfulCi: { ...binding("a".repeat(40)).successfulCi, runId: "9002" } };
+	const firstLink: NonNullable<ResumeIntent["linkedUnknownDelivery"]> = {
+		version: 1, kind: "host-verified-linked-unknown-delivery",
+		oldJournalKey: original.idempotencyKey, oldControlCommit: firstCommit,
+		oldSourceReviewReceiptSha256: hash("first old source review"),
+		ancestry: [{ oldJournalKey: original.idempotencyKey, oldControlCommit: firstCommit }],
+		oldTestedSourceCommit: binding().testedSourceCommit,
+		oldTestedTree: binding().testedTree, liveControlHead: firstCommit,
+		census: { kind: "authenticated-complete-actions-run-census", headCommit: firstCommit,
+			totalCount: 0, pagesRead: 1, sha256: hash("first census") },
+		newTestedSourceCommit: firstControl.testedSourceCommit,
+		newTestedTree: firstControl.testedTree, newSuccessfulCi: firstControl.successfulCi,
+		sourceRefTip: firstControl.sourceRefTip,
+		accounting: "unquantified", effects: "unknown-unreconciled" };
+	const linkedIntent = (linkedUnknownDelivery: NonNullable<ResumeIntent["linkedUnknownDelivery"]>):
+		ResumeIntent => ({ ...original, linkedUnknownDelivery,
+		idempotencyKey: hash(canonical({ source: original.source,
+			envelopeSha256: original.envelopeSha256, contractId: original.contractId,
+			selectedTupleSha256: original.selectedTupleSha256,
+			pendingActionSha256: original.pendingActionSha256, linkedUnknownDelivery })) });
+	const first = linkedIntent(firstLink);
+	await journal.reserve(first, firstControl);
+	await journal.markAttempted(first.idempotencyKey);
+	const secondCommit = "2".repeat(40);
+	const secondControl: TestedControlBinding = { ...binding("3".repeat(40)),
+		previousControlCommit: secondCommit, expectedBefore: secondCommit,
+		parents: ["3".repeat(40), secondCommit],
+		successfulCi: { ...binding("3".repeat(40)).successfulCi, runId: "9006" } };
+	const secondLink: NonNullable<ResumeIntent["linkedUnknownDelivery"]> = {
+		...firstLink, oldJournalKey: first.idempotencyKey, oldControlCommit: secondCommit,
+		oldSourceReviewReceiptSha256: hash("second old source review"),
+		ancestry: [...firstLink.ancestry,
+			{ oldJournalKey: first.idempotencyKey, oldControlCommit: secondCommit }],
+		oldTestedSourceCommit: firstControl.testedSourceCommit,
+		oldTestedTree: firstControl.testedTree, liveControlHead: secondCommit,
+		census: { ...firstLink.census, headCommit: secondCommit, sha256: hash("second census") },
+		newTestedSourceCommit: secondControl.testedSourceCommit,
+		newTestedTree: secondControl.testedTree,
+		newSuccessfulCi: secondControl.successfulCi,
+		sourceRefTip: secondControl.sourceRefTip };
+	const second = linkedIntent(secondLink);
+	assert.deepEqual(await journal.ancestryForAcceptedUnknown(first.idempotencyKey, secondCommit),
+		secondLink.ancestry);
+	await journal.reserve(second, secondControl);
+	assert.equal((await journal.get(first.idempotencyKey))?.state, "delivery-unknown");
+	assert.equal((await journal.unresolvedForRef(binding().controlRef))?.idempotencyKey,
+		second.idempotencyKey);
+	const tampered = linkedIntent({ ...secondLink,
+		ancestry: secondLink.ancestry.slice(1) });
+	await assert.rejects(journal.reserve(tampered, secondControl), /linked|ancestry/);
+});
+
 test("read-only reconciliation must match the expected control commit facts", async t => {
 	const { journal } = await fixture(t), intent = intentFor();
 	await journal.reserve(intent, binding());

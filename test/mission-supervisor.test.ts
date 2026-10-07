@@ -48,6 +48,34 @@ test("transient provider error plans a fresh retry after authenticated terminal 
 	assert.deepEqual(result.intent.quarantinedOperationRefs, []);
 });
 
+test("a serialized zero-run claim cannot supersede an accepted unknown control delivery", () => {
+	const action = classifyPendingAction("dispatch-failed", { transportFailure: true });
+	const base = snapshot(action);
+	const candidate = { ...base,
+		freshLaunchContract: { version: 1 as const, kind: "verified-fresh-launch-contract" as const,
+			source, envelopeSha256: "c".repeat(64), selectedTupleSha256: tuple,
+			pendingActionSha256: pendingActionIdentity(action),
+			testedSourceCommit: "e".repeat(40), testedTree: "f".repeat(40),
+			requiresRuntimeAttestationBeforeModel: true as const, mode: "fresh-work-only" as const },
+		linkedUnknownDelivery: { version: 1 as const,
+			kind: "host-verified-linked-unknown-delivery" as const,
+			oldJournalKey: "1".repeat(64), oldControlCommit: "2".repeat(40),
+			oldSourceReviewReceiptSha256: "6".repeat(64),
+			ancestry: [{ oldJournalKey: "1".repeat(64), oldControlCommit: "2".repeat(40) }],
+			oldTestedSourceCommit: "3".repeat(40), oldTestedTree: "4".repeat(40),
+			liveControlHead: "2".repeat(40), census: {
+				kind: "authenticated-complete-actions-run-census" as const,
+				headCommit: "2".repeat(40), totalCount: 0 as const,
+				pagesRead: 1 as const, sha256: "5".repeat(64) },
+			newTestedSourceCommit: "e".repeat(40), newTestedTree: "f".repeat(40),
+			newSuccessfulCi: { workflow: "workflow-regression.yml", runId: "8001",
+				runAttempt: 1, headCommit: "e".repeat(40), conclusion: "success" as const },
+			sourceRefTip: "e".repeat(40), accounting: "unquantified" as const,
+			effects: "unknown-unreconciled" as const } };
+	assert.throws(() => planMissionContinuation(candidate),
+		/linked unknown delivery lacks a fresh authenticated source fence/);
+});
+
 function interruptedSnapshot(priorReason: "bounded-run-incomplete" | "accounting-integrity-error" |
 	"m04-transaction-unresolved" | "workflow-repair-needed" = "bounded-run-incomplete") {
 	const refs = ["old-goal/O001"];

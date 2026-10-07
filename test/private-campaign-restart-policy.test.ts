@@ -82,7 +82,11 @@ function fixture(linkCount = 2) {
 		unknownHeldNano: linkCount + 1 };
 	const ancestors = new Set(sources.map((item, index) => key(item, envelopes[index])));
 	let bundleDigest = hash(JSON.stringify(bundle));
-	const input = { facts, operationRefs: refs, privateBundle: bundle, proof,
+	const unobservedControlDeliveries: import("../src/runner/ledger-continuation.ts").UnobservedControlDelivery[] = [];
+	const input = { facts, operationRefs: refs, unobservedControlDeliveries,
+		privateBundle: bundle, proof,
+		authenticatedControlDeliveries: (value: unknown, data: unknown, rows: unknown) =>
+			value === proof && data === bundle && rows === unobservedControlDeliveries,
 		authenticatedBundle: (value: unknown, data: unknown) => value === proof && data === bundle &&
 			hash(JSON.stringify(data)) === bundleDigest,
 		bindsAncestor: (value: unknown, item: { runId: string; runAttempt: number; commit: string },
@@ -92,12 +96,90 @@ function fixture(linkCount = 2) {
 		accounting: { historicalCommittedNano: facts.committedNano,
 			historicalUnknownHeldNano: facts.unknownHeldNano,
 			settledNano: 235, unknownObservedNano: 89, unpricedRequestCount: 1,
-			opaqueUnquantifiedRunCount: 0 }, gaps: [] as OpaqueExecutedRunGap[] };
+			opaqueUnquantifiedRunCount: 0 }, gaps: [] as OpaqueExecutedRunGap[],
+		priorControlDeliveries: [] as import("../src/runner/ledger-continuation.ts").UnobservedControlDelivery[] };
 	return { input, bundle, checkpoint, reservations, bindings, sources, envelopes, refs,
 		evidence, authorize: () => { bundleDigest = hash(JSON.stringify(bundle)); }, ancestors };
 }
 
 const review = (f: ReturnType<typeof fixture>) => offlineRestartPolicyChecks.reviewWithEvidence(f.input, f.evidence);
+
+function controlOnlyFixture(controlCommit = "a".repeat(40)) {
+	const f = fixture(0);
+	f.checkpoint.boundedRuns[1].unresolvedOperationIds = [];
+	f.checkpoint.continuation.unresolvedOperationIds = [];
+	f.checkpoint.continuation.requiresOperationReconciliation = false;
+	f.refs.length = 0;
+	f.bundle["objective-checkpoint.json"] = JSON.stringify(f.checkpoint);
+	f.input.facts.currentRun = source("99999", "f".repeat(40));
+	const delivery = { version: 1 as const, kind: "unobserved-control-delivery" as const,
+		controlCommit, testedSourceCommit: "b".repeat(40), testedSourceTree: "c".repeat(40),
+		previousControlParent: null, admittedBy: { ...f.input.facts.currentRun, runNumber: 99 },
+		observedRunsAtAdmission: 0 as const, effects: "unknown-unreconciled" as const,
+		accounting: "unquantified" as const };
+	f.input.unobservedControlDeliveries.push(delivery);
+	f.authorize();
+	return { ...f, delivery };
+}
+
+test("live control-only UNKNOWN receives separate source-bound review with zero operation refs", () => {
+	const f = controlOnlyFixture();
+	const policy = review(f);
+	assert.deepEqual(policy.operationAttestations, []);
+	assert.equal(policy.accountingObservation.opaqueUnquantifiedRunCount, 0);
+	assert.equal(policy.unobservedControlLineage.count, 1);
+	assert.equal(policy.unobservedControlLineage.sha256,
+		hash(JSON.stringify([f.delivery])));
+	assert.equal(policy.actorThirdPartyMutations, "unknown");
+});
+
+test("control review rejects missing, copied, altered, or unbound live records", () => {
+	const f = controlOnlyFixture();
+	assert.throws(() => offlineRestartPolicyChecks.reviewWithEvidence({ ...f.input,
+		unobservedControlDeliveries: [] }, f.evidence), /control-delivery lineage/);
+	assert.throws(() => offlineRestartPolicyChecks.reviewWithEvidence({ ...f.input,
+		unobservedControlDeliveries: structuredClone(f.input.unobservedControlDeliveries) }, f.evidence),
+		/control-delivery lineage/);
+	const unbound = controlOnlyFixture("d".repeat(40));
+	unbound.input.unobservedControlDeliveries[0] = { ...unbound.delivery,
+		admittedBy: { ...unbound.delivery.admittedBy, commit: "e".repeat(40) } };
+	assert.throws(() => review(unbound), /control-delivery lineage/);
+});
+
+test("reviewed control ancestry gives each repeated chain its own policy identity", () => {
+	const first = controlOnlyFixture("a".repeat(40));
+	const second = controlOnlyFixture("d".repeat(40));
+	assert.notEqual(review(first).policySha256, review(second).policySha256);
+});
+
+test("a later authenticated review preserves the exact historical control prefix", () => {
+	const f = fixture(2);
+	const row = { version: 1 as const, kind: "unobserved-control-delivery" as const,
+		controlCommit: "a".repeat(40), testedSourceCommit: "b".repeat(40),
+		testedSourceTree: "c".repeat(40), previousControlParent: null,
+		admittedBy: { ...f.sources[2], runNumber: 3 }, observedRunsAtAdmission: 0 as const,
+		effects: "unknown-unreconciled" as const, accounting: "unquantified" as const };
+	f.input.unobservedControlDeliveries.push(row);
+	f.evidence.priorControlDeliveries.push(row);
+	f.reservations[1].receipt.quarantine.unobservedControlLineage = {
+		priorSource: f.sources[1], admissionSource: f.sources[2], count: 1,
+		sha256: hash(JSON.stringify([row])) };
+	f.bindings[1].quarantineReceiptSha256 = hash(JSON.stringify(f.reservations[1].receipt));
+	f.bundle["independent-restart-quarantine.json"] = JSON.stringify({ version: 1,
+		kind: "host-independent-restart-reservations", entries: f.reservations });
+	f.bundle["independent-restart-goal-binding.json"] = JSON.stringify({ version: 1,
+		kind: "host-independent-restart-goal-bindings", entries: f.bindings });
+	f.authorize();
+	assert.equal(review(f).unobservedControlLineage.count, 1);
+	f.reservations[1].receipt.quarantine.unobservedControlLineage.sha256 = hash("wrong-prefix");
+	f.bindings[1].quarantineReceiptSha256 = hash(JSON.stringify(f.reservations[1].receipt));
+	f.bundle["independent-restart-quarantine.json"] = JSON.stringify({ version: 1,
+		kind: "host-independent-restart-reservations", entries: f.reservations });
+	f.bundle["independent-restart-goal-binding.json"] = JSON.stringify({ version: 1,
+		kind: "host-independent-restart-goal-bindings", entries: f.bindings });
+	f.authorize();
+	assert.throws(() => review(f), /historical unobserved control lineage/);
+});
 
 test("dynamic authenticated chains carry UNKNOWN effects into fresh-only mode", () => {
 	for (const length of [1, 2, 5]) {

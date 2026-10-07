@@ -4,6 +4,7 @@ import path from "node:path";
 import { isNativeCnyPricingRecord } from "./deepseek-cny-pricing.ts";
 import type { DeepSeekCampaignBudget } from "./deepseek-campaign.ts";
 import { MISSION_ID } from "./signed-mission-ledger.ts";
+import { validUnobservedControlDelivery, type UnobservedControlDelivery } from "./ledger-continuation.ts";
 import { HarnessError } from "../types.ts";
 
 const hex64 = /^[0-9a-f]{64}$/;
@@ -12,7 +13,9 @@ const id = /^[A-Za-z0-9._:-]{1,128}$/;
 const hash = (bytes: string | Buffer): string => createHash("sha256").update(bytes).digest("hex");
 const journalKeys = new WeakMap<object, Buffer>();
 type Projected = Readonly<{ audit: ReturnType<typeof projectAudit>;
-	effects: ReturnType<typeof projectEffects>; objectiveCheckpointJson?: string }>;
+	effects: ReturnType<typeof projectEffects>;
+	unobservedControlDeliveries: readonly UnobservedControlDelivery[];
+	objectiveCheckpointJson?: string }>;
 const journalLast = new WeakMap<object, Projected>();
 export type IncrementalCheckpointFailureStage = "envelope" | "source" |
 	"authentication" | "decoded-schema" | "monotonic-regression" | "file-io";
@@ -21,6 +24,7 @@ export type IncrementalCheckpointFailureReason =
 	"binding-mismatch" | "key-invalid" | "tag-verification-failed" |
 	"payload-json-invalid" | "payload-structure-invalid" |
 	"request-audit-invalid" | "host-effect-invalid" | "objective-checkpoint-invalid" |
+	"unobserved-control-invalid" | "unobserved-control-regressed" |
 	"request-prefix-regressed" | "host-effect-prefix-regressed" |
 	"file-bound-exceeded" | "storage-io-failed" | "unsafe-output-path" |
 	"existing-prefix-mismatch" | "publish-failed";
@@ -104,6 +108,9 @@ export type HostEffectPrefixObservationV1 = Readonly<{
 export type IncrementalCheckpointInput = Readonly<{
 	requestAudit: ReturnType<DeepSeekCampaignBudget["requestAccountingAuditSnapshot"]>;
 	hostEffects: HostEffectPrefixObservationV1;
+	/** Host-authenticated accepted control commits with no observed run. This
+	 * nonterminal prefix grants no fee, effect, or scientific authority. */
+	unobservedControlDeliveries?: readonly UnobservedControlDelivery[];
 	/** The latest controller-written text, if a complete control checkpoint exists. */
 	objectiveCheckpointJson?: string;
 }>;
@@ -129,6 +136,7 @@ export function openIncrementalControlPrefix(raw: string, key: Buffer,
 	event: IncrementalCheckpointEvent;
 	requestAudit: IncrementalCheckpointInput["requestAudit"];
 	hostEffects: HostEffectPrefixObservationV1;
+	unobservedControlDeliveries: readonly UnobservedControlDelivery[];
 	objectiveCheckpointJson?: string;
 	replayAllowed: false; scientificAcceptance: "unreviewed";
 }> {
@@ -176,6 +184,7 @@ export function openIncrementalControlPrefix(raw: string, key: Buffer,
 			Object.keys(payload).sort().join("|") !== ["version", "kind", "source",
 				"sequence", "previousCheckpointSha256", "event", "requestAudit",
 				"hostEffects", "replayAllowed", "scientificAcceptance",
+				...(payload.unobservedControlDeliveries === undefined ? [] : ["unobservedControlDeliveries"]),
 				...(payload.objectiveCheckpointJson === undefined ? [] : ["objectiveCheckpointJson"])]
 				.sort().join("|") || payload.version !== 1 ||
 			payload.kind !== "mul-pis-incremental-private-control-checkpoint" ||
@@ -193,12 +202,18 @@ export function openIncrementalControlPrefix(raw: string, key: Buffer,
 		try { hostEffects = projectEffects(payload.hostEffects as HostEffectPrefixObservationV1,
 			expectedSource, requestAudit.requests.map(row => row.requestId)); }
 		catch { return fail("decoded-schema", "host-effect-invalid"); }
+		const deliveries = payload.unobservedControlDeliveries === undefined ? [] :
+			payload.unobservedControlDeliveries;
+		if (!Array.isArray(deliveries) || !deliveries.every(validUnobservedControlDelivery) ||
+			new Set(deliveries.map(item => item.controlCommit)).size !== deliveries.length)
+			fail("decoded-schema", "unobserved-control-invalid");
 		if (payload.objectiveCheckpointJson !== undefined &&
 			!validObjectiveCheckpoint(payload.objectiveCheckpointJson))
 			fail("decoded-schema", "objective-checkpoint-invalid");
 		return { sequence: Number(envelope.sequence),
 			previousCheckpointSha256: envelope.previousCheckpointSha256 as string | null,
 			event: payload.event as IncrementalCheckpointEvent, requestAudit, hostEffects,
+			unobservedControlDeliveries: structuredClone(deliveries),
 			...(payload.objectiveCheckpointJson === undefined ? {} :
 				{ objectiveCheckpointJson: payload.objectiveCheckpointJson as string }),
 			replayAllowed: false, scientificAcceptance: "unreviewed" };
@@ -371,6 +386,10 @@ const operationEdges: Readonly<Record<string, readonly string[]>> = {
 	unknown: ["confirmed", "not-issued"],
 };
 function retainsPrefix(prior: Projected, next: Projected): void {
+	if (next.unobservedControlDeliveries.length < prior.unobservedControlDeliveries.length ||
+		prior.unobservedControlDeliveries.some((item, index) =>
+			JSON.stringify(item) !== JSON.stringify(next.unobservedControlDeliveries[index])))
+		fail("monotonic-regression", "unobserved-control-regressed");
 	const before = prior.audit.requests, after = next.audit.requests;
 	if (after.length < before.length || before.some((row, index) => {
 		const current = after[index];
@@ -455,6 +474,7 @@ export class IncrementalPrivateCheckpointJournal {
 		let audit: ReturnType<typeof projectAudit>;
 		let effects: ReturnType<typeof projectEffects>;
 		let objectiveCheckpointJson: string | undefined;
+		let unobservedControlDeliveries: readonly UnobservedControlDelivery[];
 		try { audit = projectAudit(input.requestAudit); }
 		catch {
 			this.failure = new IncrementalCheckpointError("decoded-schema", "request-audit-invalid");
@@ -465,6 +485,18 @@ export class IncrementalPrivateCheckpointJournal {
 				audit.requests.map(row => row.requestId));
 		} catch {
 			this.failure = new IncrementalCheckpointError("decoded-schema", "host-effect-invalid");
+			return Promise.reject(this.failure);
+		}
+		try {
+			unobservedControlDeliveries = input.unobservedControlDeliveries ?? [];
+			if (!Array.isArray(unobservedControlDeliveries) ||
+				!unobservedControlDeliveries.every(validUnobservedControlDelivery) ||
+				new Set(unobservedControlDeliveries.map(item => item.controlCommit)).size !==
+					unobservedControlDeliveries.length)
+				fail("decoded-schema", "unobserved-control-invalid");
+			unobservedControlDeliveries = structuredClone(unobservedControlDeliveries);
+		} catch (error) {
+			this.failure = diagnostic(error, "decoded-schema", "unobserved-control-invalid");
 			return Promise.reject(this.failure);
 		}
 		try {
@@ -479,7 +511,7 @@ export class IncrementalPrivateCheckpointJournal {
 		const work = this.tail.then(async (): Promise<StoredIncrementalCheckpoint> => {
 			if (this.failure) throw this.failure;
 			const prior = journalLast.get(this);
-			const projected: Projected = { audit, effects,
+			const projected: Projected = { audit, effects, unobservedControlDeliveries,
 				...(objectiveCheckpointJson === undefined ?
 					(prior?.objectiveCheckpointJson === undefined ? {} :
 						{ objectiveCheckpointJson: prior.objectiveCheckpointJson }) :
@@ -510,6 +542,7 @@ export class IncrementalPrivateCheckpointJournal {
 						source: { ...this.options.source }, sequence,
 						previousCheckpointSha256: this.currentSha256,
 						event, requestAudit: audit, hostEffects: effects,
+						unobservedControlDeliveries: projected.unobservedControlDeliveries,
 						...(projected.objectiveCheckpointJson === undefined ? {} :
 							{ objectiveCheckpointJson: projected.objectiveCheckpointJson }),
 						replayAllowed: false as const, scientificAcceptance: "unreviewed" as const };

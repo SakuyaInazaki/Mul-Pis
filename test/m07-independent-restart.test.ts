@@ -52,6 +52,7 @@ function fixture() {
 	const campaignRoot = path.join("/tmp", "mulpis-private-campaign-synthetic-restart");
 	const workspaceRoot = path.join(campaignRoot, "workspace");
 	const input: IndependentRestartInput = { authenticatedCarryProof: proof, privateBundle: bundle,
+		unobservedControlDeliveries: [],
 		freshWorkspace: { workspaceId: path.basename(campaignRoot), restartNonce: "fresh-nonce" },
 		freshBoundary: { campaignRoot, workspaceRoot,
 			storeRoot: path.join(workspaceRoot, ".agent", "knowledge"),
@@ -71,7 +72,9 @@ function fixture() {
 		actorThirdPartyMutations: "unknown", hostTransport: "immutable-versioned-archive",
 		accountingObservation: { historicalCommittedNano: facts.committedNano,
 			historicalUnknownHeldNano: facts.unknownHeldNano, settledNano: 0,
-			unknownObservedNano: 0, unpricedRequestCount: 0, opaqueUnquantifiedRunCount: 0 } };
+			unknownObservedNano: 0, unpricedRequestCount: 0, opaqueUnquantifiedRunCount: 0 },
+		unobservedControlLineage: { priorSource: { ...facts.source },
+			admissionSource: { ...facts.currentRun }, count: 0, sha256: hash("[]") } };
 	const host: IndependentRestartHost<typeof proof> = {
 		authenticatedFacts: value => value === proof ? facts : undefined,
 		reviewEffects: async () => policy,
@@ -89,6 +92,63 @@ function fixture() {
 	};
 	return { input, host, facts, policy, proof, claims, checkpointText: bundle["objective-checkpoint.json"] };
 }
+
+function controlOnlyFixture(controlCommit = "c".repeat(40)) {
+	const f = fixture();
+	f.facts.currentRun.runId = "12345";
+	const checkpoint = JSON.parse(f.input.privateBundle["objective-checkpoint.json"]);
+	checkpoint.boundedRuns[1].unresolvedOperationIds = [];
+	checkpoint.continuation.unresolvedOperationIds = [];
+	checkpoint.continuation.requiresOperationReconciliation = false;
+	f.input.privateBundle["objective-checkpoint.json"] = JSON.stringify(checkpoint);
+	f.facts.privateBundleSha256 = bundleHash(f.input.privateBundle);
+	const delivery = { version: 1 as const, kind: "unobserved-control-delivery" as const,
+		controlCommit, testedSourceCommit: "d".repeat(40), testedSourceTree: "e".repeat(40),
+		previousControlParent: null, admittedBy: { ...f.facts.currentRun, runNumber: 2 },
+		observedRunsAtAdmission: 0 as const, effects: "unknown-unreconciled" as const,
+		accounting: "unquantified" as const };
+	f.input.unobservedControlDeliveries = [delivery];
+	f.policy.operationAttestations = [];
+	f.policy.unobservedControlLineage = { priorSource: { ...f.facts.source },
+		admissionSource: { ...f.facts.currentRun }, count: 1, sha256: hash(JSON.stringify([delivery])) };
+	return { ...f, delivery };
+}
+
+test("control-only UNKNOWN reserves, claims, and seals fresh goal without settling effects", async () => {
+	const f = controlOnlyFixture();
+	const admission = await reserveIndependentRestart(f.input, f.host);
+	assert.deepEqual(admission.quarantinedOperationRefs, []);
+	assert.equal(admission.receipt.quarantine.unobservedControlLineage.count, 1);
+	assert.equal(admission.receipt.quarantine.unobservedControlLineage.sha256,
+		hash(JSON.stringify([f.delivery])));
+	assert.equal(admission.receipt.quarantine.historicalEffectState, "unknown-unreconciled");
+	assert.equal(admission.receipt.prior.accountingObservation.opaqueUnquantifiedRunCount, 0);
+	assert.equal(admission.receipt.prior.unknownHeldNano, f.facts.unknownHeldNano);
+	const bound = await bindIndependentRestartGoal(admission, "fresh-control-goal", async binding =>
+		({ bindingRef: "sealed:fresh-control-goal", bindingSha256: hash(JSON.stringify(binding)) }));
+	assert.equal(bound.binding.goalRunId, "fresh-control-goal");
+	await assert.rejects(reserveIndependentRestart(f.input, f.host), /reused receipt/);
+});
+
+test("missing or altered control delivery cannot use the authenticated review", async () => {
+	const missing = controlOnlyFixture();
+	await assert.rejects(reserveIndependentRestart({ ...missing.input,
+		unobservedControlDeliveries: [] }, missing.host), /source-policy review/);
+	const altered = controlOnlyFixture();
+	await assert.rejects(reserveIndependentRestart({ ...altered.input,
+		unobservedControlDeliveries: [{ ...altered.delivery,
+			controlCommit: "f".repeat(40) }] }, altered.host), /source-policy review/);
+});
+
+test("control lineage contributes distinct reuse identity for repeated fresh chains", async () => {
+	const first = controlOnlyFixture("c".repeat(40));
+	const second = controlOnlyFixture("f".repeat(40));
+	const a = await reserveIndependentRestart(first.input, first.host);
+	const b = await reserveIndependentRestart(second.input, second.host);
+	assert.notEqual(a.receipt.reuseKey, b.receipt.reuseKey);
+	assert.notEqual(a.receipt.quarantine.unobservedControlLineage.sha256,
+		b.receipt.quarantine.unobservedControlLineage.sha256);
+});
 
 test("independent restart seals a one-use quarantine and preserves unknown old state and cost", async () => {
 	const f = fixture();
@@ -268,6 +328,8 @@ test("a later independent restart retains both historical and newly unknown oper
 	second.facts.currentRun = { runId: "third-job", runAttempt: 1, commit: "d".repeat(40) };
 	second.facts.terminal.sourceRunId = second.facts.source.runId;
 	second.policy.sourceCommit = second.facts.source.commit;
+	second.policy.unobservedControlLineage = { priorSource: { ...second.facts.source },
+		admissionSource: { ...second.facts.currentRun }, count: 0, sha256: hash("[]") };
 	second.policy.operationAttestations = [
 		{ operationRef: unknown, sourceCommit, evidenceSha256: hash(JSON.stringify(old.receipt)) },
 		{ operationRef: "newly-ended-goal/O005", sourceCommit: second.facts.source.commit,

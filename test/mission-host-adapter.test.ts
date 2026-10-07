@@ -15,6 +15,7 @@ import { MissionHostPreparationError, prepareAuthenticatedResumeRequest,
 	type HostReviewedWorkflowRepairPlanV1 } from "../src/runner/mission-host-adapter.ts";
 import { privateHostPreparationDiagnostic } from "../scripts/prepare-authenticated-private-resume.ts";
 import { authenticateLatestTerminalCarry, authenticatedSupervisorProjection,
+	authenticatedTerminalUnknownControlDeliveries,
 	CARRY_ARTIFACT_NAME, openLedgerContinuation, REUSABLE_RUN_REQUEST_MESSAGE,
 	type CurrentMissionRun } from "../src/runner/ledger-continuation.ts";
 import { workflowRepairState, type WorkflowRepairFailure, type WorkflowRepairStage,
@@ -22,7 +23,8 @@ import { workflowRepairState, type WorkflowRepairFailure, type WorkflowRepairSta
 import { isVerifiedResultOnlyRepairState, readReviewedResultOnlyRepairState,
 	type ResultOnlyRepairReviewReceiptV1 } from "../src/runner/result-only-repair-review.ts";
 import { decodeCarrySidecars } from "../src/runner/carry-sidecar-codec.ts";
-import { MissionResumeJournal } from "../src/runner/mission-resume-journal.ts";
+import { MissionResumeJournal, type TestedControlBinding } from "../src/runner/mission-resume-journal.ts";
+import type { ResumeIntent } from "../src/runner/mission-supervisor.ts";
 import { IncrementalPrivateCheckpointJournal } from "../src/runner/incremental-private-checkpoint.ts";
 import { MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, MISSION_ARTIFACT } from
 	"../src/runner/signed-mission-ledger.ts";
@@ -37,6 +39,25 @@ const controlRef = "refs/heads/run-requests/workflow-learning-reliability";
 const source: CurrentMissionRun = { repository: MISSION_REPOSITORY, runId: "7002",
 	runAttempt: "1", actor: "SakuyaInazaki", event: "workflow_dispatch",
 	ref: sourceRef, sha: sourceCommit, manualAuthorized: "true" };
+const canonicalForJournal = (value: unknown): string => {
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(canonicalForJournal).join(",")}]`;
+	return `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b))
+		.map(([key, part]) => `${JSON.stringify(key)}:${canonicalForJournal(part)}`).join(",")}}`;
+};
+function rekeyIntent(intent: ResumeIntent): ResumeIntent {
+	const { source, envelopeSha256, contractId, selectedTupleSha256,
+		pendingActionSha256, actionProvenance, terminalInterruption,
+		interruptedSourceReview, workflowRepair, linkedUnknownDelivery } = intent;
+	const bound = { source, envelopeSha256, contractId, selectedTupleSha256,
+		pendingActionSha256,
+		...(actionProvenance ? { actionProvenance } : {}),
+		...(terminalInterruption ? { terminalInterruption } : {}),
+		...(interruptedSourceReview ? { interruptedSourceReview } : {}),
+		...(workflowRepair ? { workflowRepair } : {}),
+		...(linkedUnknownDelivery ? { linkedUnknownDelivery } : {}) };
+	return { ...intent, idempotencyKey: createHash("sha256").update(canonicalForJournal(bound)).digest("hex") };
+}
 
 type LiveState = {
 	sourceTip: string;
@@ -46,6 +67,7 @@ type LiveState = {
 	ciStatus: string;
 	ciRunAttempt: number;
 	ciCount: number;
+	ciRunId: number;
 	sourceTree: string;
 	commitReplySha?: string;
 };
@@ -62,6 +84,7 @@ function run(id: number, number: number, status: string, commit: string,
 
 async function fixture(t: TestContext, options: { carriedAction?: boolean;
 	unknownOperation?: boolean; controlRequest?: boolean;
+	oldControlSource?: string;
 	largePayload?: boolean; legacyV3?: boolean;
 	repairStage?: WorkflowRepairStage; repairFailure?: WorkflowRepairFailure;
 	repairActionStage?: WorkflowRepairStage; repairStrategy?: WorkflowRepairStrategy;
@@ -128,7 +151,7 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 	const done = currentRun("completed", "failure");
 	const live: LiveState = { sourceTip: sourceCommit, controlTip: priorControlCommit,
 		ciHead: sourceCommit, ciConclusion: "success", ciStatus: "completed",
-		ciRunAttempt: 1, ciCount: 1, sourceTree: testedTree };
+		ciRunAttempt: 1, ciCount: 1, ciRunId: 9003, sourceTree: testedTree };
 	const codePath = options.repairStage === "objective-assessment" ?
 		"src/m07/objective-progress.ts" : reviewedCodePath;
 	const testPath = options.repairStage === "objective-assessment" ?
@@ -142,7 +165,9 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 		const address = String(url);
 		let data: unknown;
 		if (address.includes("/workflows/manual-private-campaign.yml/runs?"))
-			data = { total_count: 2, workflow_runs: [terminal ? done : running, anchor] };
+			data = address.includes(`head_sha=${priorControlCommit}`) ?
+				{ total_count: 0, workflow_runs: [] } :
+				{ total_count: 2, workflow_runs: [terminal ? done : running, anchor] };
 		else if (address.endsWith("/runs/7002")) data = done;
 		else if (address.endsWith("/runs/7002/artifacts?per_page=100"))
 			data = { total_count: options.resultOnlyRepair ? 2 : 1, artifacts: [
@@ -172,14 +197,25 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 				file === reviewEvidence.testPath ? reviewEvidence.testText : "";
 			data = { type: "file", path: file, encoding: "base64", size: Buffer.byteLength(content),
 				content: Buffer.from(content).toString("base64") };
-		} else if (address.includes("/git/commits/"))
+		} else if (address.endsWith(`/git/commits/${priorControlCommit}`))
+			data = { sha: priorControlCommit, tree: { sha: testedTree },
+				message: REUSABLE_RUN_REQUEST_MESSAGE,
+				parents: [{ sha: options.oldControlSource ?? sourceCommit }] };
+		else if (address.includes("/git/commits/"))
 			data = address.endsWith(`/git/commits/${requestCommit}`) ?
 				{ sha: requestCommit, tree: { sha: testedTree },
 					parents: [{ sha: sourceCommit }, { sha: priorControlCommit }] } :
 				{ sha: live.commitReplySha ?? address.split("/git/commits/")[1],
 					tree: { sha: address.endsWith(`/git/commits/${sourceCommit}`) ? testedTree : live.sourceTree }, parents: [] };
 		else if (address.includes("/workflows/workflow-regression.yml/runs?"))
-			data = { total_count: live.ciCount, workflow_runs: live.ciCount ? [{ id: 9003,
+			data = address.includes(`head_sha=${priorControlCommit}`) ?
+				{ total_count: 0, workflow_runs: [] } :
+				options.oldControlSource && address.includes(`head_sha=${options.oldControlSource}`) ?
+				{ total_count: 1, workflow_runs: [{ id: 9010, run_attempt: 1,
+					head_sha: options.oldControlSource,
+					head_branch: "improve/workflow-learning-reliability", event: "push",
+					status: "completed", conclusion: "success" }] } :
+				{ total_count: live.ciCount, workflow_runs: live.ciCount ? [{ id: live.ciRunId,
 				run_attempt: live.ciRunAttempt, head_sha: live.ciHead,
 				head_branch: "improve/workflow-learning-reliability", event: "push",
 				status: live.ciStatus, conclusion: live.ciConclusion }] : [] };
@@ -232,6 +268,44 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 		input: { source: actualSource, seedEnvelopeB64, publicKeyFile, expectedSpkiSha256,
 			githubToken: "synthetic-token", request, journal,
 			loadCarryArtifact: async () => options.legacyV3 ? sealed.envelopeB64 : sealed } };
+}
+
+async function oldSourceReviewFixture(f: Awaited<ReturnType<typeof fixture>>,
+	oldKey: string, oldControlCommit = requestCommit): Promise<{ file: string; codePath: string; testPath: string;
+		oldSourceCommit: string;
+		codeText: string; testText: string }> {
+	const roles = ["host-native-execution-confinement", "m07-local-tool-grant",
+		"fresh-workspace-store", "session-constraints",
+		"encrypted-output-provider-transport"] as const;
+	const codePath = "src/runner/reviewed-old-source.ts";
+	const testPath = "test/reviewed-old-source.test.ts";
+	const codeText = "export function reviewedOldSource() { return true; }\n";
+	const testText = "test('reviewed old source', () => {});\n";
+	const old = await f.journal.get(oldKey);
+	assert(old);
+	const file = path.join(f.dir, `old-source-review-${oldKey}.json`);
+	await writeFile(file, JSON.stringify({
+		version: 1, kind: "host-reviewed-unobserved-control-source-capability",
+		prior: { oldJournalKey: oldKey,
+			oldAcceptedControl: { commit: oldControlCommit, tree: old.control.testedTree,
+				parents: [...old.control.parents] },
+			oldTestedSource: { commit: old.control.testedSourceCommit,
+				tree: old.control.testedTree },
+			priorCarrySource: old.intentBinding.source,
+			priorCarryEnvelopeSha256: old.intentBinding.envelopeSha256 },
+		review: { kind: "operator-code-review", conclusion: "approved-for-fresh-only-execution",
+			codeEvidenceRefs: roles.map(role => ({ role, path: codePath,
+				symbol: "reviewedOldSource" })),
+			testEvidenceRefs: roles.map(role => ({ role, path: testPath,
+				name: "reviewed old source" })) },
+		grant: { mode: "fresh-only-confined-effects", oldExecution: "unknown-may-run-later",
+			oldAccounting: "unquantified", oldScience: "untrusted-no-adoption",
+			m07Tools: "factory-confined-local", researchAndReviewerSessions: "read-only",
+			state: "fresh-workspace-empty-store-no-resume", outputTransport: "encrypted-fixed",
+			providerInference: "fixed-configured-provider" }
+	}), { mode: 0o600 });
+	return { file, codePath, testPath, oldSourceCommit: old.control.testedSourceCommit,
+		codeText, testText };
 }
 
 async function repairFixture(t: TestContext, options: { unknownOperation?: boolean;
@@ -787,6 +861,345 @@ test("live authenticated carried action reserves a constant-message empty-tree r
 	assert.equal(stored?.state, "reserved");
 });
 
+test("accepted old control with no observed run creates a distinct linked private intent", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const old = await prepareAuthenticatedResumeRequest(f.input);
+	assert.equal(old.decision.kind, "dispatch");
+	const review = await oldSourceReviewFixture(f, old.journalKey!);
+	await f.journal.markAttempted(old.journalKey!);
+	f.live.controlTip = requestCommit;
+	f.live.sourceTip = sha40("e");
+	f.live.ciHead = f.live.sourceTip;
+	f.live.ciRunId = 9004;
+	const request: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.includes(`/contents/${review.codePath}?ref=${sourceCommit}`) ||
+			address.includes(`/contents/${review.testPath}?ref=${sourceCommit}`)) {
+			const file = address.includes(review.codePath) ? review.codePath : review.testPath;
+			const body = file === review.codePath ? review.codeText : review.testText;
+			return new Response(JSON.stringify({ type: "file", path: file, encoding: "base64",
+				size: Buffer.byteLength(body), content: Buffer.from(body).toString("base64") }));
+		}
+		if (address.endsWith(`/git/commits/${requestCommit}`))
+			return new Response(JSON.stringify({ sha: requestCommit,
+				tree: { sha: testedTree }, message: REUSABLE_RUN_REQUEST_MESSAGE,
+				parents: [{ sha: sourceCommit }, { sha: priorControlCommit }] }));
+		if (address.includes(`/actions/runs?head_sha=${requestCommit}&per_page=100&page=1`))
+			return new Response(JSON.stringify({ total_count: 0, workflow_runs: [] }));
+		return f.request(url, init);
+	};
+	const linked = await prepareAuthenticatedResumeRequest({ ...f.input, request,
+		linkedUnknownDeliveryOldControlCommit: requestCommit,
+		unobservedControlSourceReviewPrivateFile: review.file });
+	assert.equal(linked.decision.kind, "dispatch");
+	assert.notEqual(linked.journalKey, old.journalKey);
+	assert.equal(linked.descriptor?.expectedBefore, requestCommit);
+	assert.deepEqual(linked.descriptor?.parents, [f.live.sourceTip, requestCommit]);
+	assert.equal((await f.journal.get(old.journalKey!))?.state, "delivery-unknown");
+	assert.equal((await f.journal.get(linked.journalKey!))?.intentBinding.linkedUnknownDelivery?.oldJournalKey,
+		old.journalKey);
+	assert(!JSON.stringify(linked.descriptor).includes(old.journalKey!));
+	assert(!JSON.stringify(linked.descriptor).includes("unknown-unreconciled"));
+	const restarted = new MissionResumeJournal(f.journal.directory);
+	assert.equal((await restarted.unresolvedForRef(controlRef))?.idempotencyKey, linked.journalKey);
+	await restarted.reconcileNotDelivered(linked.journalKey!, {
+		kind: "read-only-not-delivered", controlRef, observedHead: requestCommit,
+		matchingRunCount: 0, pendingDeliveryExcluded: true });
+	assert.equal((await restarted.unresolvedForRef(controlRef))?.idempotencyKey, old.journalKey);
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...f.input, request }),
+		/linked|different binding|uncertain/);
+});
+
+test("linked recovery refuses an observed old Actions run", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const old = await prepareAuthenticatedResumeRequest(f.input);
+	const review = await oldSourceReviewFixture(f, old.journalKey!);
+	await f.journal.markAttempted(old.journalKey!);
+	f.live.controlTip = requestCommit;
+	f.live.sourceTip = sha40("e");
+	f.live.ciHead = f.live.sourceTip;
+	f.live.ciRunId = 9004;
+	const request: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.includes(`/contents/${review.codePath}?ref=${sourceCommit}`) ||
+			address.includes(`/contents/${review.testPath}?ref=${sourceCommit}`)) {
+			const file = address.includes(review.codePath) ? review.codePath : review.testPath;
+			const body = file === review.codePath ? review.codeText : review.testText;
+			return new Response(JSON.stringify({ type: "file", path: file, encoding: "base64",
+				size: Buffer.byteLength(body), content: Buffer.from(body).toString("base64") }));
+		}
+		if (address.endsWith(`/git/commits/${requestCommit}`))
+			return new Response(JSON.stringify({ sha: requestCommit,
+				tree: { sha: testedTree }, message: REUSABLE_RUN_REQUEST_MESSAGE,
+				parents: [{ sha: sourceCommit }, { sha: priorControlCommit }] }));
+		if (address.includes(`/actions/runs?head_sha=${requestCommit}&per_page=100&page=1`))
+			return new Response(JSON.stringify({ total_count: 1,
+				workflow_runs: [{ id: 9910, head_sha: requestCommit }] }));
+		return f.request(url, init);
+	};
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...f.input, request,
+		linkedUnknownDeliveryOldControlCommit: requestCommit,
+		unobservedControlSourceReviewPrivateFile: review.file }), error =>
+		error instanceof MissionHostPreparationError &&
+		error.refusal.code === "linked-unknown-delivery-observed-run");
+	assert.equal((await f.journal.get(old.journalKey!))?.state, "ref-update-attempted");
+});
+
+test("host links two consecutive accepted zero-run control commits in order", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const first = await prepareAuthenticatedResumeRequest(f.input);
+	await f.journal.markAttempted(first.journalKey!);
+	const firstReview = await oldSourceReviewFixture(f, first.journalKey!);
+	const accepted = new Map<string, { tree: string; parents: readonly string[] }>([
+		[requestCommit, { tree: testedTree, parents: [sourceCommit, priorControlCommit] }]
+	]);
+	const reviews = new Map<string, Awaited<ReturnType<typeof oldSourceReviewFixture>>>([
+		[firstReview.oldSourceCommit, firstReview]
+	]);
+	const request: typeof fetch = async (url, init) => {
+		const address = String(url);
+		for (const [commit, review] of reviews) {
+			if (address.includes(`/contents/${review.codePath}?ref=${commit}`) ||
+				address.includes(`/contents/${review.testPath}?ref=${commit}`)) {
+				const file = address.includes(review.codePath) ? review.codePath : review.testPath;
+				const body = file === review.codePath ? review.codeText : review.testText;
+				return new Response(JSON.stringify({ type: "file", path: file,
+					encoding: "base64", size: Buffer.byteLength(body),
+					content: Buffer.from(body).toString("base64") }));
+			}
+		}
+		for (const [commit, fact] of accepted) {
+			if (address.endsWith(`/git/commits/${commit}`))
+				return new Response(JSON.stringify({ sha: commit, tree: { sha: fact.tree },
+					message: REUSABLE_RUN_REQUEST_MESSAGE,
+					parents: fact.parents.map(sha => ({ sha })) }));
+			if (address.includes(`/actions/runs?head_sha=${commit}&per_page=100&page=1`))
+				return new Response(JSON.stringify({ total_count: 0, workflow_runs: [] }));
+		}
+		return f.request(url, init);
+	};
+	f.live.controlTip = requestCommit;
+	f.live.sourceTip = sha40("e");
+	f.live.ciHead = f.live.sourceTip;
+	f.live.ciRunId = 9004;
+	const second = await prepareAuthenticatedResumeRequest({ ...f.input, request,
+		linkedUnknownDeliveryOldControlCommit: requestCommit,
+		unobservedControlSourceReviewPrivateFile: firstReview.file });
+	assert.equal(second.decision.kind, "dispatch");
+	await f.journal.markAttempted(second.journalKey!);
+	const secondControlCommit = sha40("1");
+	accepted.set(secondControlCommit, { tree: testedTree,
+		parents: [f.live.sourceTip, requestCommit] });
+	const secondReview = await oldSourceReviewFixture(f, second.journalKey!, secondControlCommit);
+	reviews.set(secondReview.oldSourceCommit, secondReview);
+	f.live.controlTip = secondControlCommit;
+	f.live.sourceTip = sha40("2");
+	f.live.ciHead = f.live.sourceTip;
+	f.live.ciRunId = 9005;
+	const third = await prepareAuthenticatedResumeRequest({ ...f.input, request,
+		linkedUnknownDeliveryOldControlCommit: secondControlCommit,
+		unobservedControlSourceReviewPrivateFile: secondReview.file });
+	assert.equal(third.decision.kind, "dispatch");
+	if (third.decision.kind !== "dispatch") return;
+	assert.deepEqual(third.decision.intent.linkedUnknownDelivery?.ancestry, [
+		{ oldJournalKey: first.journalKey, oldControlCommit: requestCommit },
+		{ oldJournalKey: second.journalKey, oldControlCommit: secondControlCommit }
+	]);
+	assert.equal((await f.journal.get(first.journalKey!))?.state, "delivery-unknown");
+	assert.equal((await f.journal.get(second.journalKey!))?.state, "delivery-unknown");
+	assert.equal((await f.journal.unresolvedForRef(controlRef))?.idempotencyKey, third.journalKey);
+});
+
+test("authenticated linked successor carry releases its old UNKNOWN dispatch block", async t => {
+	const oldSource = sha40("e");
+	const f = await fixture(t, { carriedAction: true, controlRequest: true,
+		oldControlSource: oldSource });
+	const authenticated = await authenticateLatestTerminalCarry(f.input);
+	assert.deepEqual(authenticatedTerminalUnknownControlDeliveries(authenticated.proof,
+		authenticated.privateBundle)?.map(row => row.controlCommit), [priorControlCommit]);
+	const planned = await prepareAuthenticatedResumeRequest({ ...f.input, readOnly: true });
+	assert.equal(planned.decision.kind, "dispatch");
+	if (planned.decision.kind !== "dispatch") return;
+	const old = rekeyIntent({ ...planned.decision.intent,
+		source: { runId: "7001", runAttempt: 1, commit: sha40("a") } });
+	const oldBinding: TestedControlBinding = { controlRef, message: REUSABLE_RUN_REQUEST_MESSAGE,
+		testedSourceCommit: oldSource, testedTree,
+		successfulCi: { workflow: "workflow-regression.yml", runId: "9010",
+			runAttempt: 1, headCommit: oldSource, conclusion: "success" as const },
+		previousControlCommit: null, expectedBefore: null,
+		parents: [oldSource], sourceRef, sourceRefTip: oldSource };
+	await f.journal.reserve(old, oldBinding);
+	await f.journal.markAttempted(old.idempotencyKey);
+	const linkedUnknownDelivery: NonNullable<ResumeIntent["linkedUnknownDelivery"]> = {
+		version: 1, kind: "host-verified-linked-unknown-delivery",
+		oldJournalKey: old.idempotencyKey, oldControlCommit: priorControlCommit,
+		oldSourceReviewReceiptSha256: createHash("sha256").update("old review").digest("hex"),
+		ancestry: [{ oldJournalKey: old.idempotencyKey, oldControlCommit: priorControlCommit }],
+		oldTestedSourceCommit: oldSource, oldTestedTree: testedTree,
+		liveControlHead: priorControlCommit,
+		census: { kind: "authenticated-complete-actions-run-census", headCommit: priorControlCommit,
+			totalCount: 0, pagesRead: 1,
+			sha256: createHash("sha256").update("old census").digest("hex") },
+		newTestedSourceCommit: sourceCommit, newTestedTree: testedTree,
+		newSuccessfulCi: { workflow: "workflow-regression.yml", runId: "9003",
+			runAttempt: 1, headCommit: sourceCommit, conclusion: "success" },
+		sourceRefTip: sourceCommit,
+		accounting: "unquantified", effects: "unknown-unreconciled" };
+	const linked = rekeyIntent({ ...old, linkedUnknownDelivery });
+	const linkedBinding = { ...oldBinding, testedSourceCommit: sourceCommit,
+		successfulCi: linkedUnknownDelivery.newSuccessfulCi,
+		previousControlCommit: priorControlCommit, expectedBefore: priorControlCommit,
+		parents: [sourceCommit, priorControlCommit], sourceRefTip: sourceCommit };
+	await f.journal.reserve(linked, linkedBinding);
+	await f.journal.markAttempted(linked.idempotencyKey);
+	await f.journal.acknowledge(linked.idempotencyKey, {
+		kind: "read-only-accepted-control", controlRef, controlCommit: requestCommit,
+		tree: testedTree, parents: linkedBinding.parents,
+		message: REUSABLE_RUN_REQUEST_MESSAGE, successorRunId: "7002" });
+	assert.equal((await f.journal.unresolvedForRef(controlRef))?.idempotencyKey, old.idempotencyKey);
+	await f.journal.markUnknownLineageCarried(linked.idempotencyKey, authenticated);
+	assert.equal((await f.journal.get(old.idempotencyKey))?.state, "delivery-unknown");
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	const nextBinding = { ...linkedBinding, previousControlCommit: requestCommit,
+		expectedBefore: requestCommit, parents: [sourceCommit, requestCommit] };
+	const next = await f.journal.reserve(planned.decision.intent, nextBinding);
+	assert.equal(next.state, "reserved");
+	await f.journal.markAttempted(next.idempotencyKey);
+	const secondOldControl = sha40("8"), secondCarrierCommit = sha40("7");
+	const secondSource = sha40("9"), secondTree = sha40("6");
+	const secondCurrent: CurrentMissionRun = { ...f.input.source,
+		runId: "7003", sha: secondCarrierCommit, before: secondOldControl };
+	const priorRun = { ...run(7002, 2, "completed", requestCommit, "failure"),
+		event: "push", head_branch: "run-requests/workflow-learning-reliability",
+		head_commit: { message: REUSABLE_RUN_REQUEST_MESSAGE } };
+	let terminal = false;
+	const secondRequest: typeof fetch = async (url, init) => {
+		const address = String(url);
+		const activeRun = { ...run(7003, 3, terminal ? "completed" : "in_progress",
+			secondCarrierCommit, terminal ? "failure" : undefined),
+			event: "push", head_branch: "run-requests/workflow-learning-reliability",
+			head_commit: { message: REUSABLE_RUN_REQUEST_MESSAGE } };
+		if (address.includes("/workflows/manual-private-campaign.yml/runs?")) {
+			const head = new URL(address).searchParams.get("head_sha");
+			const rows = head === secondOldControl || head === priorControlCommit ? [] :
+				head === requestCommit ? [priorRun] :
+				[activeRun, priorRun, run(7001, 1, "completed", sha40("a"), "success")];
+			return new Response(JSON.stringify({ total_count: rows.length, workflow_runs: rows }));
+		}
+		if (address.endsWith("/git/ref/heads/improve/workflow-learning-reliability"))
+			return new Response(JSON.stringify({ object: { type: "commit", sha: secondSource } }));
+		if (address.endsWith("/git/ref/heads/run-requests/workflow-learning-reliability"))
+			return new Response(JSON.stringify({ object: { type: "commit", sha: secondCarrierCommit } }));
+		const commits = new Map<string, { tree: string; parents: string[]; message?: string }>([
+			[secondCarrierCommit, { tree: secondTree, parents: [secondSource, secondOldControl],
+				message: REUSABLE_RUN_REQUEST_MESSAGE }],
+			[secondOldControl, { tree: testedTree, parents: [sourceCommit, requestCommit],
+				message: REUSABLE_RUN_REQUEST_MESSAGE }],
+			[requestCommit, { tree: testedTree, parents: [sourceCommit, priorControlCommit],
+				message: REUSABLE_RUN_REQUEST_MESSAGE }],
+			[secondSource, { tree: secondTree, parents: [] }]
+		]);
+		for (const [commit, fact] of commits)
+			if (address.endsWith(`/git/commits/${commit}`))
+				return new Response(JSON.stringify({ sha: commit, tree: { sha: fact.tree },
+					parents: fact.parents.map(sha => ({ sha })), message: fact.message }));
+		if (address.includes("/workflows/workflow-regression.yml/runs?")) {
+			const head = new URL(address).searchParams.get("head_sha");
+			return new Response(JSON.stringify({ workflow_runs: [{ head_sha: head,
+				head_branch: "improve/workflow-learning-reliability", event: "push",
+				run_attempt: 1, status: "completed", conclusion: "success" }] }));
+		}
+		if (address.endsWith("/runs/7003")) return new Response(JSON.stringify(activeRun));
+		if (address.endsWith("/runs/7003/artifacts?per_page=100"))
+			return new Response(JSON.stringify({ total_count: 1, artifacts: [{ id: 9003,
+				name: CARRY_ARTIFACT_NAME, expired: false,
+				workflow_run: { id: 7003, head_sha: secondCarrierCommit } }] }));
+		if (address.endsWith("/runs/7003/jobs?per_page=100"))
+			return new Response(JSON.stringify({ total_count: 1, jobs: [{ id: 6003,
+				run_id: 7003, run_attempt: 1, head_sha: secondCarrierCommit,
+				name: "private-campaign", status: "completed", conclusion: "failure",
+				steps: [{ name: "Run bounded private campaign", status: "completed",
+					conclusion: "success" }] }] }));
+		return f.request(url, init);
+	};
+	const secondOpening = await openLedgerContinuation({
+		seedEnvelopeB64: f.input.seedEnvelopeB64,
+		publicKeyFile: f.input.publicKeyFile,
+		expectedSpkiSha256: f.input.expectedSpkiSha256,
+		githubToken: f.input.githubToken, current: secondCurrent,
+		request: secondRequest, loadCarryArtifact: async () => f.sealed });
+	assert.deepEqual(secondOpening.unobservedControlDeliveries.map(row => row.controlCommit),
+		[priorControlCommit, secondOldControl]);
+	const secondCarry = secondOpening.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: { version: 3,
+			kind: "accounting-only-request-audit", requests: [], settledCny: 0,
+			unknownObservedCny: 0, unpricedRequestCount: 0 } });
+	terminal = true;
+	const secondAuthenticated = await authenticateLatestTerminalCarry({
+		seedEnvelopeB64: f.input.seedEnvelopeB64,
+		publicKeyFile: f.input.publicKeyFile,
+		expectedSpkiSha256: f.input.expectedSpkiSha256,
+		githubToken: f.input.githubToken, source: secondCurrent,
+		request: secondRequest, loadCarryArtifact: async ({ runId }) => runId === "7003" ?
+			secondCarry : f.sealed });
+	assert.deepEqual(authenticatedTerminalUnknownControlDeliveries(secondAuthenticated.proof,
+		secondAuthenticated.privateBundle)?.map(row => row.controlCommit),
+		[priorControlCommit, secondOldControl]);
+	await assert.rejects(f.journal.markUnknownLineageCarried(linked.idempotencyKey,
+		secondAuthenticated), /does not seal/);
+	const secondLink: NonNullable<ResumeIntent["linkedUnknownDelivery"]> = {
+		...linkedUnknownDelivery, oldJournalKey: next.idempotencyKey,
+		oldControlCommit: secondOldControl, oldTestedSourceCommit: sourceCommit,
+		oldSourceReviewReceiptSha256: createHash("sha256").update("second review").digest("hex"),
+		ancestry: [{ oldJournalKey: next.idempotencyKey, oldControlCommit: secondOldControl }],
+		liveControlHead: secondOldControl,
+		census: { ...linkedUnknownDelivery.census, headCommit: secondOldControl },
+		newTestedSourceCommit: secondSource, newTestedTree: secondTree,
+		newSuccessfulCi: { workflow: "workflow-regression.yml", runId: "9011",
+			runAttempt: 1, headCommit: secondSource, conclusion: "success" },
+		sourceRefTip: secondSource };
+	const secondLinked = rekeyIntent({ ...planned.decision.intent,
+		linkedUnknownDelivery: secondLink });
+	const secondBinding: TestedControlBinding = { ...nextBinding,
+		testedSourceCommit: secondSource, testedTree: secondTree,
+		successfulCi: secondLink.newSuccessfulCi,
+		previousControlCommit: secondOldControl, expectedBefore: secondOldControl,
+		parents: [secondSource, secondOldControl], sourceRefTip: secondSource };
+	await f.journal.reserve(secondLinked, secondBinding);
+	await f.journal.markAttempted(secondLinked.idempotencyKey);
+	await f.journal.acknowledge(secondLinked.idempotencyKey, {
+		kind: "read-only-accepted-control", controlRef,
+		controlCommit: secondCarrierCommit, tree: secondTree,
+		parents: secondBinding.parents, message: REUSABLE_RUN_REQUEST_MESSAGE,
+		successorRunId: "7003" });
+	assert.equal((await f.journal.unresolvedForRef(controlRef))?.idempotencyKey,
+		next.idempotencyKey);
+	await f.journal.markUnknownLineageCarried(secondLinked.idempotencyKey, secondAuthenticated);
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	const shadow = new MissionResumeJournal(path.join(f.dir, "wrong-lineage-journal"));
+	await shadow.reserve(planned.decision.intent, nextBinding);
+	await shadow.markAttempted(next.idempotencyKey);
+	const wrongOldControl = sha40("0");
+	const wrongLink: NonNullable<ResumeIntent["linkedUnknownDelivery"]> = {
+		...secondLink, oldControlCommit: wrongOldControl, liveControlHead: wrongOldControl,
+		ancestry: [{ oldJournalKey: next.idempotencyKey, oldControlCommit: wrongOldControl }],
+		census: { ...secondLink.census, headCommit: wrongOldControl } };
+	const wrongIntent = rekeyIntent({ ...planned.decision.intent,
+		linkedUnknownDelivery: wrongLink });
+	const wrongBinding: TestedControlBinding = { ...secondBinding,
+		previousControlCommit: wrongOldControl, expectedBefore: wrongOldControl,
+		parents: [secondSource, wrongOldControl] };
+	await shadow.reserve(wrongIntent, wrongBinding);
+	await shadow.markAttempted(wrongIntent.idempotencyKey);
+	await shadow.acknowledge(wrongIntent.idempotencyKey, {
+		kind: "read-only-accepted-control", controlRef,
+		controlCommit: secondCarrierCommit, tree: secondTree,
+		parents: wrongBinding.parents, message: REUSABLE_RUN_REQUEST_MESSAGE,
+		successorRunId: "7003" });
+	await assert.rejects(shadow.markUnknownLineageCarried(wrongIntent.idempotencyKey,
+		secondAuthenticated), /does not seal/);
+});
+
 test("a legacy unknown operation gets a current host decision bound to the exact old checkpoint", async t => {
 	const f = await fixture(t, { unknownOperation: true });
 	const oldBytes = f.bundle["objective-checkpoint.json"];
@@ -958,6 +1371,9 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 		resultEnvelopeBytes?: Buffer; wrongResultArchiveEcho?: boolean;
 		wrongResultFileDigest?: boolean;
 		interruptedSourceReviewPrivateFile?: string;
+		linkedUnknownDeliveryOldControlCommit?: string;
+		unobservedControlSourceReviewPrivateFile?: string;
+		request?: typeof fetch;
 		prefixOnly?: { runId: string; artifactId: string; raw: string; archiveSha256: string };
 		prefixText?: string; archiveSha256?: string; wrongArchiveEcho?: boolean;
 		sidecarFault?: "missing" | "duplicate" | "tamper" } = {}) {
@@ -1010,6 +1426,11 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 			["--result-only-repair-review-private", options.resultOnlyRepairReviewPrivateFile] : []),
 		...(options.interruptedSourceReviewPrivateFile ?
 			["--interrupted-source-review-private", options.interruptedSourceReviewPrivateFile] : []),
+		...(options.linkedUnknownDeliveryOldControlCommit ?
+			["--linked-unknown-control-commit", options.linkedUnknownDeliveryOldControlCommit] : []),
+		...(options.unobservedControlSourceReviewPrivateFile ?
+			["--unobserved-control-source-review-private",
+				options.unobservedControlSourceReviewPrivateFile] : []),
 		...(options.readOnly ? ["--read-only"] : [])],
 		{ cwd: path.dirname(path.dirname(script)), stdio: ["pipe", "pipe", "pipe"] });
 	let stderr = "";
@@ -1024,7 +1445,7 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 		if (row.kind === "github-get") {
 			assert.equal(typeof row.url, "string");
 			assert(row.url!.startsWith(`https://api.github.com/repos/${MISSION_REPOSITORY}/`));
-			const response = await f.request(row.url!);
+			const response = await (options.request ?? f.request)(row.url!);
 			child.stdin.write(`${JSON.stringify({ id: row.id, status: response.status,
 				body: JSON.parse(await response.text()) })}\n`);
 		} else if (row.kind === "artifact-file") {
@@ -1131,6 +1552,65 @@ test("stdio bridge authenticates connector reads and prints only a public descri
 	assert.equal((await stat(bridge.outputPrivate)).mode & 0o077, 0);
 	assert.equal((await new MissionResumeJournal(f.journal.directory)
 		.get(privateResult.journalKey))?.state, "reserved");
+});
+
+test("stdio bridge keeps linked recovery private and refuses missing operator review", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const old = await prepareAuthenticatedResumeRequest(f.input);
+	await f.journal.markAttempted(old.journalKey!);
+	const review = await oldSourceReviewFixture(f, old.journalKey!);
+	f.live.controlTip = requestCommit;
+	f.live.sourceTip = sha40("e");
+	f.live.ciHead = f.live.sourceTip;
+	f.live.ciRunId = 9004;
+	const request: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.includes(`/contents/${review.codePath}?ref=${sourceCommit}`) ||
+			address.includes(`/contents/${review.testPath}?ref=${sourceCommit}`)) {
+			const file = address.includes(review.codePath) ? review.codePath : review.testPath;
+			const body = file === review.codePath ? review.codeText : review.testText;
+			return new Response(JSON.stringify({ type: "file", path: file, encoding: "base64",
+				size: Buffer.byteLength(body), content: Buffer.from(body).toString("base64") }));
+		}
+		if (address.endsWith(`/git/commits/${requestCommit}`))
+			return new Response(JSON.stringify({ sha: requestCommit,
+				tree: { sha: testedTree }, message: REUSABLE_RUN_REQUEST_MESSAGE,
+				parents: [{ sha: sourceCommit }, { sha: priorControlCommit }] }));
+		if (address.includes(`/actions/runs?head_sha=${requestCommit}&per_page=100&page=1`))
+			return new Response(JSON.stringify({ total_count: 0, workflow_runs: [] }));
+		return f.request(url, init);
+	};
+	const invalid = await runStdioBridge(f, { request,
+		outputPrivate: path.join(f.dir, "invalid-linked-private.json"),
+		linkedUnknownDeliveryOldControlCommit: requestCommit,
+		unobservedControlSourceReviewPrivateFile: path.join(f.dir, "missing-review.json") });
+	assert.equal(invalid.code, 1);
+	assert(!invalid.stdout.includes('"kind":"prepared"'));
+	assert.equal((await f.journal.get(old.journalKey!))?.state, "ref-update-attempted");
+	const prepared = await runStdioBridge(f, { request,
+		outputPrivate: path.join(f.dir, "linked-private.json"),
+		linkedUnknownDeliveryOldControlCommit: requestCommit,
+		unobservedControlSourceReviewPrivateFile: review.file });
+	assert.equal(prepared.code, 0, prepared.stderr);
+	const final = prepared.lines.at(-1) as { kind: string; descriptor: Record<string, unknown> };
+	assert.equal(final.kind, "prepared");
+	assert.deepEqual(Object.keys(final.descriptor).sort(),
+		["expectedBefore", "message", "parents", "previousControlCommit", "ref",
+			"sourceCommit", "tree"]);
+	assert(!prepared.stdout.includes(old.journalKey!));
+	assert(!prepared.stdout.includes(review.file));
+	assert(!prepared.stdout.includes("unknown-unreconciled"));
+	const privateResult = JSON.parse(await readFile(prepared.outputPrivate, "utf8")) as {
+		journalKey: string; descriptor: object };
+	assert.notEqual(privateResult.journalKey, old.journalKey);
+	assert.deepEqual(privateResult.descriptor, final.descriptor);
+	const recovered = await runStdioBridge(f, { request, recoverReserved: true,
+		outputPrivate: path.join(f.dir, "linked-recovered-private.json"),
+		linkedUnknownDeliveryOldControlCommit: requestCommit,
+		unobservedControlSourceReviewPrivateFile: review.file });
+	assert.equal(recovered.code, 0, recovered.stderr);
+	assert.deepEqual((recovered.lines.at(-1) as { descriptor: object }).descriptor,
+		final.descriptor);
 });
 
 test("private output collision is diagnosed before any connector read or journal reservation", async t => {

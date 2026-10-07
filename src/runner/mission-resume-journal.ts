@@ -8,7 +8,8 @@ import { lstat, mkdir, open, readFile, readdir, rename, rm } from "node:fs/promi
 import { hostname } from "node:os";
 import path from "node:path";
 import { pendingActionIdentity, type ResumeIntent } from "./mission-supervisor.ts";
-import { REUSABLE_RUN_REQUEST_MESSAGE } from "./ledger-continuation.ts";
+import { authenticatedTerminalUnknownControlDeliveries,
+	REUSABLE_RUN_REQUEST_MESSAGE, type AuthenticatedTerminalCarryResult } from "./ledger-continuation.ts";
 
 const CONTROL_REF = "refs/heads/run-requests/workflow-learning-reliability";
 const SOURCE_REF = "refs/heads/improve/workflow-learning-reliability";
@@ -45,12 +46,18 @@ export type ResumeJournalRecord = Readonly<{
 		actionKind: ResumeIntent["actionKind"]; actionProvenance?: ActionProvenance;
 		terminalInterruption?: ResumeIntent["terminalInterruption"];
 		interruptedSourceReview?: ResumeIntent["interruptedSourceReview"];
-		workflowRepair?: ResumeIntent["workflowRepair"] }>;
+		workflowRepair?: ResumeIntent["workflowRepair"];
+		linkedUnknownDelivery?: ResumeIntent["linkedUnknownDelivery"] }>;
 	control: TestedControlBinding;
 	state: ResumeJournalState;
 	negativeReconciliations: number;
 	successorRunId?: string;
 	observedControlCommit?: string;
+	/** Authenticated successor carry sealed this exact uncertain-control ancestry.
+	 * Historical delivery, effects, and accounting remain UNKNOWN. */
+	carriedUnknownLineage?: Readonly<{ kind: "host-authenticated-unknown-control-lineage";
+		carrierRunId: string; carrierControlCommit: string; envelopeSha256: string;
+		ancestry: readonly Readonly<{ oldJournalKey: string; oldControlCommit: string }>[] }>;
 }>;
 
 /** A read-only verifier external to this module must establish this exact
@@ -148,6 +155,55 @@ function interruptedSourceReviewBinding(value: ResumeIntent["interruptedSourceRe
 		receiptSha256: value.receiptSha256 };
 }
 
+function linkedUnknownDeliveryBinding(value: ResumeIntent["linkedUnknownDelivery"]):
+	ResumeIntent["linkedUnknownDelivery"] {
+	if (value === undefined) return undefined;
+	if (Object.keys(value).sort().join("|") !== ["version", "kind", "oldJournalKey",
+		"oldSourceReviewReceiptSha256",
+		"oldControlCommit", "oldTestedSourceCommit", "oldTestedTree", "liveControlHead",
+		"census", "ancestry", "newTestedSourceCommit", "newTestedTree", "newSuccessfulCi",
+		"sourceRefTip", "accounting", "effects"].sort().join("|") ||
+		value.version !== 1 || value.kind !== "host-verified-linked-unknown-delivery" ||
+		!hex64(value.oldJournalKey) || !hex64(value.oldSourceReviewReceiptSha256) ||
+		!hex40(value.oldControlCommit) ||
+		!hex40(value.oldTestedSourceCommit) || !hex40(value.oldTestedTree) ||
+		!hex40(value.liveControlHead) || value.liveControlHead !== value.oldControlCommit ||
+		!hex40(value.newTestedSourceCommit) || !hex40(value.newTestedTree) ||
+		value.newTestedSourceCommit === value.oldTestedSourceCommit ||
+		value.sourceRefTip !== value.newTestedSourceCommit ||
+		value.accounting !== "unquantified" || value.effects !== "unknown-unreconciled" ||
+		Object.keys(value.census ?? {}).sort().join("|") !==
+			"headCommit|kind|pagesRead|sha256|totalCount" ||
+		value.census.kind !== "authenticated-complete-actions-run-census" ||
+		value.census.headCommit !== value.oldControlCommit || value.census.totalCount !== 0 ||
+		value.census.pagesRead !== 1 || !hex64(value.census.sha256) ||
+		!Array.isArray(value.ancestry) || value.ancestry.length < 1 ||
+		value.ancestry.some(row => Object.keys(row ?? {}).sort().join("|") !==
+			"oldControlCommit|oldJournalKey" || !hex64(row.oldJournalKey) ||
+			!hex40(row.oldControlCommit)) ||
+		new Set(value.ancestry.map(row => row.oldJournalKey)).size !== value.ancestry.length ||
+		new Set(value.ancestry.map(row => row.oldControlCommit)).size !== value.ancestry.length ||
+		value.ancestry.at(-1)?.oldJournalKey !== value.oldJournalKey ||
+		value.ancestry.at(-1)?.oldControlCommit !== value.oldControlCommit ||
+		Object.keys(value.newSuccessfulCi ?? {}).sort().join("|") !==
+			"conclusion|headCommit|runAttempt|runId|workflow" ||
+		value.newSuccessfulCi.workflow !== "workflow-regression.yml" ||
+		!runId(value.newSuccessfulCi.runId) || value.newSuccessfulCi.runAttempt !== 1 ||
+		value.newSuccessfulCi.headCommit !== value.newTestedSourceCommit ||
+		value.newSuccessfulCi.conclusion !== "success")
+		refuse("invalid linked unknown-delivery binding");
+	return { version: 1, kind: "host-verified-linked-unknown-delivery",
+		oldJournalKey: value.oldJournalKey, oldControlCommit: value.oldControlCommit,
+		oldSourceReviewReceiptSha256: value.oldSourceReviewReceiptSha256,
+		oldTestedSourceCommit: value.oldTestedSourceCommit, oldTestedTree: value.oldTestedTree,
+		liveControlHead: value.liveControlHead, census: { ...value.census },
+		ancestry: value.ancestry.map(row => ({ ...row })),
+		newTestedSourceCommit: value.newTestedSourceCommit,
+		newTestedTree: value.newTestedTree, newSuccessfulCi: { ...value.newSuccessfulCi },
+		sourceRefTip: value.sourceRefTip, accounting: "unquantified",
+		effects: "unknown-unreconciled" };
+}
+
 function intentBinding(intent: ResumeIntent): ResumeJournalRecord["intentBinding"] {
 	const actionProvenance = provenanceBinding(intent.actionProvenance);
 	const workflowRepair = repairBinding(intent.workflowRepair);
@@ -155,6 +211,7 @@ function intentBinding(intent: ResumeIntent): ResumeJournalRecord["intentBinding
 		intent.source, intent.envelopeSha256);
 	const interruptedSourceReview = interruptedSourceReviewBinding(intent.interruptedSourceReview,
 		intent.source);
+	const linkedUnknownDelivery = linkedUnknownDeliveryBinding(intent.linkedUnknownDelivery);
 	if (Boolean(terminalInterruption) !== (actionProvenance?.kind === "current-host-interruption") ||
 		Boolean(terminalInterruption) !== Boolean(interruptedSourceReview) ||
 		terminalInterruption && actionProvenance?.kind === "current-host-interruption" &&
@@ -179,7 +236,9 @@ function intentBinding(intent: ResumeIntent): ResumeJournalRecord["intentBinding
 		pendingActionSha256: intent.pendingActionSha256,
 		...(terminalInterruption ? { terminalInterruption } : {}),
 		...(interruptedSourceReview ? { interruptedSourceReview } : {}),
-		...(workflowRepair ? { workflowRepair } : {}) }));
+		...(workflowRepair ? { workflowRepair } : {}),
+		...(linkedUnknownDelivery ? { linkedUnknownDelivery } : {}) }));
+	// A linked request has a new identity even when its scientific action is unchanged.
 	if (expected !== intent.idempotencyKey) refuse("idempotency key does not bind the intent");
 	return { source, envelopeSha256: intent.envelopeSha256,
 		contractId: intent.contractId, selectedTupleSha256: intent.selectedTupleSha256,
@@ -187,7 +246,8 @@ function intentBinding(intent: ResumeIntent): ResumeJournalRecord["intentBinding
 		...(actionProvenance ? { actionProvenance } : {}),
 		...(terminalInterruption ? { terminalInterruption } : {}),
 		...(interruptedSourceReview ? { interruptedSourceReview } : {}),
-		...(workflowRepair ? { workflowRepair } : {}) };
+		...(workflowRepair ? { workflowRepair } : {}),
+		...(linkedUnknownDelivery ? { linkedUnknownDelivery } : {}) };
 }
 
 function controlBinding(input: TestedControlBinding): TestedControlBinding {
@@ -257,6 +317,7 @@ async function readRecord(file: string): Promise<ResumeJournalRecord> {
 		bound.source, bound.envelopeSha256);
 	const interruptedSourceReview = interruptedSourceReviewBinding(bound.interruptedSourceReview,
 		bound.source);
+	const linkedUnknownDelivery = linkedUnknownDeliveryBinding(bound.linkedUnknownDelivery);
 	if (workflowRepair && (workflowRepair.testedSourceCommit !== value.control.testedSourceCommit ||
 		workflowRepair.testedTree !== value.control.testedTree ||
 		canonical(workflowRepair.successfulCi) !== canonical(value.control.successfulCi)))
@@ -277,6 +338,8 @@ async function readRecord(file: string): Promise<ResumeJournalRecord> {
 		Boolean(terminalInterruption) !== Boolean(interruptedSourceReview) ||
 		(interruptedSourceReview !== undefined &&
 			canonical(interruptedSourceReview) !== canonical(bound.interruptedSourceReview)) ||
+		(linkedUnknownDelivery !== undefined &&
+			canonical(linkedUnknownDelivery) !== canonical(bound.linkedUnknownDelivery)) ||
 		terminalInterruption && bound.actionProvenance?.kind === "current-host-interruption" &&
 			terminalInterruption.resultArchiveSha256 !== bound.actionProvenance.resultArchiveSha256)
 		refuse("stored private intent binding is invalid");
@@ -287,14 +350,79 @@ async function readRecord(file: string): Promise<ResumeJournalRecord> {
 		pendingActionSha256: bound.pendingActionSha256,
 		...(terminalInterruption ? { terminalInterruption } : {}),
 		...(interruptedSourceReview ? { interruptedSourceReview } : {}),
-		...(workflowRepair ? { workflowRepair } : {}) }));
+		...(workflowRepair ? { workflowRepair } : {}),
+		...(linkedUnknownDelivery ? { linkedUnknownDelivery } : {}) }));
 	if (expected !== value.idempotencyKey) refuse("stored idempotency binding changed");
+	if (linkedUnknownDelivery &&
+		(linkedUnknownDelivery.oldJournalKey === value.idempotencyKey ||
+		linkedUnknownDelivery.newTestedSourceCommit !== value.control.testedSourceCommit ||
+		linkedUnknownDelivery.newTestedTree !== value.control.testedTree ||
+		canonical(linkedUnknownDelivery.newSuccessfulCi) !== canonical(value.control.successfulCi) ||
+		linkedUnknownDelivery.liveControlHead !== value.control.expectedBefore ||
+		linkedUnknownDelivery.sourceRefTip !== value.control.sourceRefTip))
+		refuse("stored linked control binding changed");
 	if (value.state === "acknowledged" ?
 		!runId(value.successorRunId) || !hex40(value.observedControlCommit) ||
 		value.observedControlCommit === value.control.expectedBefore :
 		value.successorRunId !== undefined || value.observedControlCommit !== undefined)
 		refuse("stored acknowledgment is invalid");
+	if (value.carriedUnknownLineage !== undefined &&
+		(value.state !== "acknowledged" || !linkedUnknownDelivery ||
+		Object.keys(value.carriedUnknownLineage).sort().join("|") !==
+			"ancestry|carrierControlCommit|carrierRunId|envelopeSha256|kind" ||
+		value.carriedUnknownLineage.kind !== "host-authenticated-unknown-control-lineage" ||
+		value.carriedUnknownLineage.carrierRunId !== value.successorRunId ||
+		value.carriedUnknownLineage.carrierControlCommit !== value.observedControlCommit ||
+		!hex64(value.carriedUnknownLineage.envelopeSha256) ||
+		canonical(value.carriedUnknownLineage.ancestry) !== canonical(linkedUnknownDelivery.ancestry)))
+		refuse("stored unknown-control carry is invalid");
 	return value;
+}
+
+function expectedLinkedAncestry(records: readonly ResumeJournalRecord[],
+	old: ResumeJournalRecord, oldSha: string):
+	readonly Readonly<{ oldJournalKey: string; oldControlCommit: string }>[] {
+	const backwards: Array<{ oldJournalKey: string; oldControlCommit: string }> = [];
+	const seen = new Set<string>();
+	let cursor: ResumeJournalRecord | undefined = old;
+	let commit = oldSha;
+	while (cursor) {
+		if (seen.has(cursor.idempotencyKey)) refuse("linked ancestry has a cycle");
+		seen.add(cursor.idempotencyKey);
+		backwards.push({ oldJournalKey: cursor.idempotencyKey, oldControlCommit: commit });
+		const previous: NonNullable<ResumeJournalRecord["intentBinding"]["linkedUnknownDelivery"]> |
+			undefined = cursor.intentBinding.linkedUnknownDelivery;
+		if (!previous) break;
+		if (previous.liveControlHead !== cursor.control.expectedBefore ||
+			previous.newTestedSourceCommit !== cursor.control.testedSourceCommit ||
+			previous.newTestedTree !== cursor.control.testedTree ||
+			canonical(previous.newSuccessfulCi) !== canonical(cursor.control.successfulCi))
+			refuse("linked ancestry has an inconsistent control binding");
+		commit = previous.oldControlCommit;
+		cursor = records.find(record => record.idempotencyKey === previous.oldJournalKey);
+		if (!cursor) refuse("linked ancestry is missing a predecessor");
+	}
+	const ancestry = backwards.reverse();
+	for (let i = 1; i < ancestry.length; i++) {
+		const descendant = records.find(record => record.idempotencyKey === ancestry[i]!.oldJournalKey)!;
+		if (canonical(descendant.intentBinding.linkedUnknownDelivery?.ancestry) !==
+			canonical(ancestry.slice(0, i)))
+			refuse("linked ancestry changed across reservations");
+	}
+	return ancestry;
+}
+
+function supersededOldKeys(records: readonly ResumeJournalRecord[]): Set<string> {
+	const keys = new Set<string>();
+	for (const record of records) {
+		const link = record.intentBinding.linkedUnknownDelivery;
+		if (link && ["reserved", "ref-update-attempted", "delivery-unknown"].includes(record.state))
+			for (const ancestor of link.ancestry) keys.add(ancestor.oldJournalKey);
+		if (record.state === "acknowledged" && record.carriedUnknownLineage)
+			for (const ancestor of record.carriedUnknownLineage.ancestry)
+				keys.add(ancestor.oldJournalKey);
+	}
+	return keys;
 }
 
 /** Process-local writes are serialized by an exclusive directory lock. A dead
@@ -382,9 +510,95 @@ export class MissionResumeJournal {
 		});
 	}
 	async unresolvedForRef(ref: string): Promise<ResumeJournalRecord | undefined> {
-		return this.lock(async () => (await this.records()).find(record =>
+		return this.lock(async () => {
+			const records = await this.records();
+			const linkedOldKeys = supersededOldKeys(records);
+			return records.find(record =>
 			record.control.controlRef === ref && record.state !== "acknowledged" &&
-			record.state !== "reconciled-not-delivered"));
+			record.state !== "reconciled-not-delivered" &&
+			!linkedOldKeys.has(record.idempotencyKey));
+		});
+	}
+	async linkedSuccessorFor(oldKey: string): Promise<ResumeJournalRecord | undefined> {
+		if (!hex64(oldKey)) refuse("invalid old journal key");
+		return this.lock(async () => {
+			const matches = (await this.records()).filter(record =>
+				record.intentBinding.linkedUnknownDelivery?.oldJournalKey === oldKey);
+			if (matches.length > 1) refuse("old request has multiple linked successors");
+			return matches[0];
+		});
+	}
+	async acknowledgedLinkedCarrier(run: { runId: string; commit: string }):
+		Promise<ResumeJournalRecord | undefined> {
+		if (!runId(run.runId) || !hex40(run.commit)) refuse("invalid carrier query");
+		return this.lock(async () => {
+			const matches = (await this.records()).filter(record =>
+				record.state === "acknowledged" && Boolean(record.intentBinding.linkedUnknownDelivery) &&
+				record.successorRunId === run.runId && record.observedControlCommit === run.commit);
+			if (matches.length > 1) refuse("multiple linked carriers match one run");
+			return matches[0];
+		});
+	}
+	async ancestryForAcceptedUnknown(oldKey: string, oldControlCommit: string):
+		Promise<readonly Readonly<{ oldJournalKey: string; oldControlCommit: string }>[]> {
+		if (!hex64(oldKey) || !hex40(oldControlCommit)) refuse("invalid linked ancestry query");
+		return this.lock(async () => {
+			const records = await this.records();
+			const old = records.find(record => record.idempotencyKey === oldKey);
+			if (!old) return refuse("linked predecessor is not an uncertain attempt");
+			if (!["ref-update-attempted", "delivery-unknown"].includes(old.state))
+				refuse("linked predecessor is not an uncertain attempt");
+			return expectedLinkedAncestry(records, old, oldControlCommit);
+		});
+	}
+	/** Only an authenticated terminal carry for the acknowledged linked request
+	 * releases the ancestry's dispatch block. It never settles their effects. */
+	async markUnknownLineageCarried(carrierKey: string,
+		carry: AuthenticatedTerminalCarryResult): Promise<ResumeJournalRecord> {
+		return this.lock(async () => {
+			const records = await this.records();
+			const carrier = records.find(record => record.idempotencyKey === carrierKey);
+			const lineage = carrier?.intentBinding.linkedUnknownDelivery?.ancestry;
+			const rows = authenticatedTerminalUnknownControlDeliveries(carry.proof, carry.privateBundle);
+			if (!carrier || !lineage || !rows)
+				return refuse("authenticated carry does not seal the exact unknown-control lineage");
+			if (carrier.state !== "acknowledged" ||
+				carry.proof.source.runId !== carrier.successorRunId ||
+				carry.proof.source.commit !== carrier.observedControlCommit ||
+				rows.length < lineage.length ||
+				new Set(rows.map(row => row.controlCommit)).size !== rows.length ||
+				rows.some(row => row.observedRunsAtAdmission !== 0 ||
+					row.effects !== "unknown-unreconciled" || row.accounting !== "unquantified") ||
+				lineage.some((ancestor, i) => {
+					const row = rows[rows.length - lineage.length + i];
+					const historical = records.find(record =>
+						record.idempotencyKey === ancestor.oldJournalKey);
+					return !row || !historical || historical.state !== "delivery-unknown" ||
+						row.controlCommit !== ancestor.oldControlCommit ||
+						row.testedSourceCommit !== historical.control.testedSourceCommit ||
+						row.testedSourceTree !== historical.control.testedTree ||
+						row.previousControlParent !== historical.control.previousControlCommit ||
+						row.admittedBy.runId !== carry.proof.source.runId ||
+						row.admittedBy.runAttempt !== carry.proof.source.runAttempt ||
+						row.admittedBy.commit !== carry.proof.source.commit ||
+						row.observedRunsAtAdmission !== 0 ||
+						row.effects !== "unknown-unreconciled" || row.accounting !== "unquantified";
+				})) refuse("authenticated carry does not seal the exact unknown-control lineage");
+			const receipt: NonNullable<ResumeJournalRecord["carriedUnknownLineage"]> = {
+				kind: "host-authenticated-unknown-control-lineage",
+				carrierRunId: carry.proof.source.runId,
+				carrierControlCommit: carry.proof.source.commit,
+				envelopeSha256: carry.proof.envelopeSha256,
+				ancestry: lineage.map(row => ({ ...row })) };
+			if (carrier.carriedUnknownLineage) {
+				if (canonical(carrier.carriedUnknownLineage) !== canonical(receipt))
+					refuse("conflicting authenticated unknown-control carry");
+				return carrier;
+			}
+			const updated = { ...carrier, carriedUnknownLineage: receipt };
+			await atomicJson(this.file(carrierKey), updated);
+			return updated;
+		});
 	}
 	async reserve(intent: ResumeIntent, binding: TestedControlBinding): Promise<ResumeJournalRecord> {
 		const privateBinding = intentBinding(intent), control = controlBinding(binding);
@@ -401,28 +615,64 @@ export class MissionResumeJournal {
 					canonical(old.control) !== canonical(control)) refuse("same key has a different binding");
 				return old;
 			}
+			const linked = privateBinding.linkedUnknownDelivery;
+			let oldLinked: ResumeJournalRecord | undefined;
+			if (linked) {
+				oldLinked = records.find(record => record.idempotencyKey === linked.oldJournalKey);
+				if (!oldLinked || !["ref-update-attempted", "delivery-unknown"].includes(oldLinked.state) ||
+					oldLinked.control.controlRef !== control.controlRef ||
+					oldLinked.control.expectedBefore === linked.oldControlCommit ||
+					oldLinked.control.testedSourceCommit !== linked.oldTestedSourceCommit ||
+					oldLinked.control.testedTree !== linked.oldTestedTree ||
+					control.expectedBefore !== linked.oldControlCommit ||
+					control.testedSourceCommit !== linked.newTestedSourceCommit ||
+					control.testedTree !== linked.newTestedTree ||
+					canonical(control.successfulCi) !== canonical(linked.newSuccessfulCi) ||
+					control.sourceRefTip !== linked.sourceRefTip ||
+					control.successfulCi.runId === oldLinked.control.successfulCi.runId ||
+					canonical(linked.ancestry) !==
+						canonical(expectedLinkedAncestry(records, oldLinked, linked.oldControlCommit)) ||
+					["source", "envelopeSha256", "contractId", "selectedTupleSha256",
+						"pendingActionSha256", "actionKind", "actionProvenance",
+						"terminalInterruption", "interruptedSourceReview"].some(field =>
+						canonical((privateBinding as unknown as Record<string, unknown>)[field] ?? null) !==
+						canonical((oldLinked!.intentBinding as unknown as Record<string, unknown>)[field] ?? null)))
+					refuse("linked request does not bind the old uncertain attempt");
+			}
+			const superseded = supersededOldKeys(records);
 			if (records.some(record => record.control.controlRef === control.controlRef &&
-				record.state !== "acknowledged" && record.state !== "reconciled-not-delivered"))
+				record.state !== "acknowledged" && record.state !== "reconciled-not-delivered" &&
+				record.idempotencyKey !== oldLinked?.idempotencyKey &&
+				!superseded.has(record.idempotencyKey)))
 				refuse("control ref has an unresolved reservation");
+			if (oldLinked && records.some(record =>
+				record.intentBinding.linkedUnknownDelivery?.oldJournalKey === oldLinked.idempotencyKey))
+				refuse("old request already has a linked successor");
 			const acknowledged = records.filter(record => record.control.controlRef === control.controlRef &&
 				record.state === "acknowledged");
 			if (acknowledged.length) {
 				const tips = acknowledged.filter(record => !acknowledged.some(next =>
 					next.control.previousControlCommit === record.observedControlCommit));
-				if (tips.length !== 1 || control.previousControlCommit !== tips[0]!.observedControlCommit)
+				if (tips.length !== 1 ||
+					(oldLinked?.control.previousControlCommit ?? control.previousControlCommit) !==
+						tips[0]!.observedControlCommit)
 					refuse("control ref does not continue the acknowledged tip");
 			}
 			const fresh: ResumeJournalRecord = { version: 1,
 				idempotencyKey: intent.idempotencyKey, intentBinding: privateBinding,
 				control, state: "reserved", negativeReconciliations: 0 };
+			if (oldLinked?.state === "ref-update-attempted")
+				await atomicJson(this.file(oldLinked.idempotencyKey),
+					{ ...oldLinked, state: "delivery-unknown" });
 			await atomicJson(this.file(intent.idempotencyKey), fresh);
 			return fresh;
 		});
 	}
-	private async transition(key: string, update: (old: ResumeJournalRecord) => ResumeJournalRecord): Promise<ResumeJournalRecord> {
+	private async transition(key: string, update: (old: ResumeJournalRecord,
+		records: readonly ResumeJournalRecord[]) => ResumeJournalRecord): Promise<ResumeJournalRecord> {
 		return this.lock(async () => {
 			const old = await readRecord(this.file(key));
-			const next = update(old);
+			const next = update(old, await this.records());
 			if (next !== old) await atomicJson(this.file(key), next);
 			return next;
 		});
@@ -441,7 +691,10 @@ export class MissionResumeJournal {
 	}
 	/** The caller must independently verify the live control ref and run. */
 	acknowledge(key: string, observed: AcceptedControlObservation): Promise<ResumeJournalRecord> {
-		return this.transition(key, old => {
+		return this.transition(key, (old, records) => {
+			if (records.some(record =>
+				record.intentBinding.linkedUnknownDelivery?.oldJournalKey === key))
+				refuse("a linked old request remains delivery-unknown");
 			if (old.state === "acknowledged") {
 				if (old.successorRunId === observed.successorRunId &&
 					old.observedControlCommit === observed.controlCommit) return old;
@@ -464,7 +717,10 @@ export class MissionResumeJournal {
 	/** A negative read-only reconciliation can release an uncertain attempt.
 	 * The host verifier must prove pending delivery is excluded. */
 	reconcileNotDelivered(key: string, observed: NotDeliveredObservation): Promise<ResumeJournalRecord> {
-		return this.transition(key, old => {
+		return this.transition(key, (old, records) => {
+			if (records.some(record =>
+				record.intentBinding.linkedUnknownDelivery?.oldJournalKey === key))
+				refuse("a linked old request remains delivery-unknown");
 			if (old.state === "reconciled-not-delivered") return old;
 			if (old.state === "acknowledged") refuse("an acknowledged request cannot be negated");
 			if (observed.kind !== "read-only-not-delivered" ||
@@ -481,6 +737,9 @@ export class MissionResumeJournal {
 	async rearmAfterReconciliation(key: string): Promise<ResumeJournalRecord> {
 		return this.lock(async () => {
 			const old = await readRecord(this.file(key));
+			if ((await this.records()).some(record =>
+				record.intentBinding.linkedUnknownDelivery?.oldJournalKey === key))
+				refuse("a linked old request cannot be rearmed");
 			if (old.state !== "reconciled-not-delivered" || old.negativeReconciliations < 1)
 				refuse("request has no negative reconciliation");
 			const records = await this.records();

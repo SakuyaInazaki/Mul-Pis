@@ -5,7 +5,7 @@
  */
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { open, realpath } from "node:fs/promises";
+import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { classifyPendingAction, type PendingActionV1 } from "../m07/objective-progress.ts";
@@ -19,12 +19,15 @@ import { MissionResumeJournal, type ResumeJournalRecord,
 import { pendingActionIdentity, planMissionContinuation, type CurrentDerivedActionV1,
 	type CurrentInterruptionActionV1, type TerminalInterruptionEvidenceV1,
 	type FreshIndependentLaunchContractV1, type ResumeDispatchRecord,
-	type SupervisorDecision, type TerminalCarryEvidenceV1, type MissionStatusV1 } from "./mission-supervisor.ts";
+	type SupervisorDecision, type TerminalCarryEvidenceV1, type MissionStatusV1,
+	type LinkedUnknownDeliveryV1 } from "./mission-supervisor.ts";
 import { validWorkflowRepairState, type WorkflowRepairStateV1 } from "./repair-liveness.ts";
 import { readReviewedInterruptedSourceCapability,
 	type VerifiedInterruptedSourceCapabilityV1 } from "./interrupted-source-review.ts";
 import { readReviewedResultOnlyRepairState, isVerifiedResultOnlyRepairState,
 	type VerifiedResultOnlyRepairStateV1 } from "./result-only-repair-review.ts";
+import { isVerifiedUnobservedControlSourceCapability,
+	readReviewedUnobservedControlSourceCapability } from "./unobserved-control-source-review.ts";
 
 const REPOSITORY = "SakuyaInazaki/Mul-Pis";
 const SOURCE_BRANCH = "improve/workflow-learning-reliability";
@@ -47,10 +50,14 @@ export type HostPreparationRefusal = Readonly<{
 		"workflow-repair-plan-stale" | "workflow-repair-source-unchanged" |
 		"workflow-repair-review-evidence-invalid" |
 		"result-only-repair-review-invalid" | "result-only-repair-result-unavailable" |
-		"reserved-descriptor-recovery-requires-journal" | "reserved-descriptor-missing";
+		"reserved-descriptor-recovery-requires-journal" | "reserved-descriptor-missing" |
+		"linked-unknown-delivery-invalid" | "linked-unknown-delivery-observed-run" |
+		"linked-unknown-delivery-census-invalid" | "linked-unknown-delivery-source-raced" |
+		"linked-unknown-delivery-control-raced" | "linked-unknown-source-review-invalid";
 	stage: "tested-source-ci" | "live-source-ref" | "live-source-commit" |
 		"live-control-ref" | "terminal-carry" | "legacy-action" | "dispatch-journal" |
-		"workflow-repair-plan" | "interruption-source-review" | "result-only-repair-review";
+		"workflow-repair-plan" | "interruption-source-review" | "result-only-repair-review" |
+		"linked-unknown-delivery";
 	ciRunId?: string;
 	ciStatus?: "requested" | "waiting" | "pending" | "queued" | "in_progress" |
 		"completed" | "unrecognized";
@@ -226,6 +233,11 @@ export type PrepareAuthenticatedResumeInput = Readonly<{
 	resultOnlyRepairReviewPrivateFile?: string;
 	/** Host review of the exact interrupted source capability, outside the checkout. */
 	interruptedSourceReviewPrivateFile?: string;
+	/** Explicit exact commit of an accepted old ref update with no observed Actions run.
+	 * This requests a distinct, linked fresh intent after authenticated host review. */
+	linkedUnknownDeliveryOldControlCommit?: string;
+	/** Private mode-0600 operator review of confinement in the old tested source. */
+	unobservedControlSourceReviewPrivateFile?: string;
 }>;
 
 async function githubJson(url: string, token: string | undefined, request: typeof fetch,
@@ -287,6 +299,101 @@ export async function readLiveTestedControlBinding(token: string | undefined,
 			runAttempt: 1, headCommit: sourceCommit, conclusion: "success" },
 		previousControlCommit: previous, parents, expectedBefore: previous,
 		sourceRef: SOURCE_REF, sourceRefTip: sourceCommit };
+}
+
+const verifiedLinkedUnknownDeliveries = new WeakSet<object>();
+/** A process-local host review. Persisted JSON cannot mint this capability. */
+export function isVerifiedLinkedUnknownDelivery(value: unknown): value is LinkedUnknownDeliveryV1 {
+	return isObject(value) && verifiedLinkedUnknownDeliveries.has(value);
+}
+
+async function verifyLinkedUnknownDelivery(input: PrepareAuthenticatedResumeInput,
+	binding: TestedControlBinding, old: ResumeJournalRecord): Promise<LinkedUnknownDeliveryV1> {
+	const oldSha = input.linkedUnknownDeliveryOldControlCommit;
+	if (!hex40(oldSha) || !input.unobservedControlSourceReviewPrivateFile ||
+		!["ref-update-attempted", "delivery-unknown"].includes(old.state) ||
+		binding.previousControlCommit !== oldSha || old.control.expectedBefore === oldSha ||
+		binding.testedSourceCommit === old.control.testedSourceCommit ||
+		binding.successfulCi.runId === old.control.successfulCi.runId)
+		refuse("linked-unknown-delivery-invalid", "linked-unknown-delivery");
+	const request = input.authenticatedHostRead?.request ?? input.request ?? fetch;
+	const base = `https://api.github.com/repos/${REPOSITORY}`;
+	const oldCommit = await githubJson(`${base}/git/commits/${oldSha}`, input.githubToken,
+		request, "linked-unknown-delivery");
+	if (!isObject(oldCommit) || oldCommit.sha !== oldSha ||
+		!isObject(oldCommit.tree) || oldCommit.tree.sha !== old.control.testedTree ||
+		oldCommit.message !== old.control.message || !Array.isArray(oldCommit.parents) ||
+		JSON.stringify(oldCommit.parents.map(row => isObject(row) ? row.sha : null)) !==
+			JSON.stringify(old.control.parents))
+		refuse("linked-unknown-delivery-invalid", "linked-unknown-delivery");
+	let sourceReview;
+	try {
+		sourceReview = await readReviewedUnobservedControlSourceCapability({
+			privateReceiptFile: input.unobservedControlSourceReviewPrivateFile,
+			oldJournalKey: old.idempotencyKey,
+			oldAcceptedControl: { commit: oldSha, tree: old.control.testedTree,
+				parents: [...old.control.parents] },
+			oldTestedSource: { commit: old.control.testedSourceCommit,
+				tree: old.control.testedTree },
+			priorCarrySource: old.intentBinding.source,
+			priorCarryEnvelopeSha256: old.intentBinding.envelopeSha256,
+			readImmutableSourceTree: async commit => {
+				const result = await githubJson(`${base}/git/commits/${commit}`,
+					input.githubToken, request, "linked-unknown-delivery");
+				if (!isObject(result) || result.sha !== commit || !isObject(result.tree) ||
+					!hex40(result.tree.sha)) throw new Error("invalid immutable source tree");
+				return result.tree.sha;
+			},
+			readImmutableSourceFile: async (commit, file) => Buffer.from(
+				await reviewedSourceText(file, commit, input), "utf8") });
+	} catch {
+		refuse("linked-unknown-source-review-invalid", "linked-unknown-delivery");
+	}
+	if (!isVerifiedUnobservedControlSourceCapability(sourceReview) ||
+		sourceReview.oldJournalKey !== old.idempotencyKey ||
+		sourceReview.oldAcceptedControl.commit !== oldSha)
+		refuse("linked-unknown-source-review-invalid", "linked-unknown-delivery");
+	// An exact-SHA query with zero returned rows is a complete one-page census at
+	// this observation. It does not prove future delivery or old effects absent.
+	const census = await githubJson(`${base}/actions/runs?head_sha=${oldSha}&per_page=100&page=1`,
+		input.githubToken, request, "linked-unknown-delivery");
+	if (!isObject(census) || !Number.isSafeInteger(census.total_count) ||
+		Number(census.total_count) < 0 || !Array.isArray(census.workflow_runs))
+		refuse("linked-unknown-delivery-census-invalid", "linked-unknown-delivery");
+	if (census.total_count !== 0 || census.workflow_runs.length !== 0)
+		refuse("linked-unknown-delivery-observed-run", "linked-unknown-delivery");
+	const fenced = await readLiveTestedControlBinding(input.githubToken, request,
+		input.authenticatedHostRead?.kind === "authenticated-host-github-read");
+	if (fenced.sourceRefTip !== binding.sourceRefTip ||
+		fenced.testedTree !== binding.testedTree ||
+		JSON.stringify(fenced.successfulCi) !== JSON.stringify(binding.successfulCi))
+		refuse("linked-unknown-delivery-source-raced", "linked-unknown-delivery");
+	if (fenced.previousControlCommit !== binding.previousControlCommit)
+		refuse("linked-unknown-delivery-control-raced", "linked-unknown-delivery");
+	const finalSource = await githubJson(`${base}/git/ref/heads/${SOURCE_BRANCH}`,
+		input.githubToken, request, "linked-unknown-delivery");
+	if (!isObject(finalSource) || !isObject(finalSource.object) ||
+		finalSource.object.sha !== binding.sourceRefTip)
+		refuse("linked-unknown-delivery-source-raced", "linked-unknown-delivery");
+	const ancestry = await input.journal.ancestryForAcceptedUnknown(old.idempotencyKey, oldSha);
+	const review: LinkedUnknownDeliveryV1 = {
+		version: 1, kind: "host-verified-linked-unknown-delivery",
+		oldJournalKey: old.idempotencyKey, oldControlCommit: oldSha,
+		oldSourceReviewReceiptSha256: sourceReview.receiptSha256,
+		oldTestedSourceCommit: old.control.testedSourceCommit,
+		oldTestedTree: old.control.testedTree,
+		liveControlHead: binding.previousControlCommit!,
+		census: { kind: "authenticated-complete-actions-run-census",
+			headCommit: oldSha, totalCount: 0, pagesRead: 1,
+			sha256: sha(JSON.stringify(census)) },
+		ancestry,
+		newTestedSourceCommit: binding.testedSourceCommit,
+		newTestedTree: binding.testedTree, newSuccessfulCi: { ...binding.successfulCi },
+		sourceRefTip: fenced.sourceRefTip,
+		accounting: "unquantified", effects: "unknown-unreconciled" };
+	freezeReview(review);
+	verifiedLinkedUnknownDeliveries.add(review);
+	return review;
 }
 
 function publicDescriptor(binding: TestedControlBinding): PublicResumeRequestDescriptor {
@@ -428,6 +535,9 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 	Promise<PreparedResumeRequest> {
 	if (input.readOnly && input.recoverReservedDescriptor)
 		refuse("reserved-descriptor-recovery-requires-journal", "dispatch-journal");
+	if (Boolean(input.linkedUnknownDeliveryOldControlCommit) !==
+		Boolean(input.unobservedControlSourceReviewPrivateFile))
+		refuse("linked-unknown-source-review-invalid", "linked-unknown-delivery");
 	const authenticationInput = {
 		source: input.source, seedEnvelopeB64: input.seedEnvelopeB64,
 		publicKeyFile: input.publicKeyFile, githubToken: input.githubToken,
@@ -442,6 +552,7 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 	let incrementalPrefixFailure: IncrementalPrefixFailure | undefined;
 	let priorPrivateBundle: Readonly<Record<string, string>>;
 	let terminalProof: AuthenticatedTerminalCarryProof | undefined;
+	let authenticatedTerminalCarry: Awaited<ReturnType<typeof authenticateLatestTerminalCarry>> | undefined;
 	try {
 		const authenticated = await authenticateLatestTerminalCarry(authenticationInput);
 		const projected = authenticatedSupervisorProjection(authenticated.proof, authenticated.privateBundle);
@@ -449,6 +560,7 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 		({ status, terminalCarry, pendingAction } = projected);
 		priorPrivateBundle = authenticated.privateBundle;
 		terminalProof = authenticated.proof;
+		authenticatedTerminalCarry = authenticated;
 	} catch (carryError) {
 		let interrupted: Awaited<ReturnType<typeof authenticateLatestTerminalInterruption>>;
 		try { interrupted = await authenticateLatestTerminalInterruption(authenticationInput); }
@@ -491,6 +603,21 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 			resultArchiveSha256: terminalInterruption.resultArchiveSha256,
 			action: classifyPendingAction("execution-interrupted",
 				{ unresolvedOperationRefs: [...status.unresolvedOperationRefs] }) };
+	}
+	if (authenticatedTerminalCarry && !input.readOnly) {
+		let journalExists = false;
+		try { await lstat(input.journal.directory); journalExists = true; }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		if (journalExists) {
+			const carrier = await input.journal.acknowledgedLinkedCarrier({
+				runId: authenticatedTerminalCarry.proof.source.runId,
+				commit: authenticatedTerminalCarry.proof.source.commit });
+			if (carrier && !carrier.carriedUnknownLineage)
+				await input.journal.markUnknownLineageCarried(carrier.idempotencyKey,
+					authenticatedTerminalCarry);
+		}
 	}
 	const privateObservation = incrementalPrefixFailure ? { incrementalPrefixFailure } : {};
 	let currentDerivedAction: CurrentDerivedActionV1 | undefined;
@@ -593,17 +720,38 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 		await verifyWorkflowRepairPlan(input, terminalCarry, binding,
 			priorPrivateBundle["repair-state.json"] ?? resultOnlyRepair?.stateBytes,
 			action, resultOnlyRepair) : undefined;
-	const snapshot = { status, terminalCarry, pendingAction, currentDerivedAction,
+	let snapshot = { status, terminalCarry, pendingAction, currentDerivedAction,
 		terminalInterruption, currentInterruptionAction, interruptedSourceReview,
 		freshLaunchContract: launch, workflowRepairPlan,
-		dispatchRecord: { state: "not-requested" } as const };
+		dispatchRecord: { state: "not-requested" } as const,
+		linkedUnknownDelivery: undefined as LinkedUnknownDeliveryV1 | undefined };
+	if (input.linkedUnknownDeliveryOldControlCommit !== undefined) {
+		try { await lstat(input.journal.directory); }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT")
+				refuse("linked-unknown-delivery-invalid", "linked-unknown-delivery");
+			throw error;
+		}
+		const unresolved = await input.journal.unresolvedForRef(CONTROL_REF);
+		const sameReservedSuccessor = unresolved?.state === "reserved" &&
+			unresolved.intentBinding.linkedUnknownDelivery?.oldControlCommit ===
+				input.linkedUnknownDeliveryOldControlCommit &&
+			unresolved.control.expectedBefore === input.linkedUnknownDeliveryOldControlCommit;
+		const oldKey = sameReservedSuccessor ?
+			unresolved.intentBinding.linkedUnknownDelivery?.oldJournalKey : unresolved?.idempotencyKey;
+		const old = oldKey ? await input.journal.get(oldKey) : undefined;
+		if (!old) refuse("linked-unknown-delivery-invalid", "linked-unknown-delivery");
+		const linkedUnknownDelivery = await verifyLinkedUnknownDelivery(input, binding, old);
+		snapshot = { ...snapshot, linkedUnknownDelivery };
+	}
 	const prospective = planMissionContinuation(snapshot);
 	if (prospective.kind !== "dispatch") return { decision: prospective, ...privateObservation };
 	if (input.readOnly) return { decision: prospective, descriptor: publicDescriptor(binding),
 		...privateObservation };
 	const old = await input.journal.get(prospective.intent.idempotencyKey);
 	const unresolved = await input.journal.unresolvedForRef(CONTROL_REF);
-	if (unresolved && unresolved.idempotencyKey !== prospective.intent.idempotencyKey)
+	if (unresolved && unresolved.idempotencyKey !== prospective.intent.idempotencyKey &&
+		prospective.intent.linkedUnknownDelivery?.oldJournalKey !== unresolved.idempotencyKey)
 		refuse("control-request-delivery-uncertain", "dispatch-journal");
 	if (input.recoverReservedDescriptor === true && !old)
 		refuse("reserved-descriptor-missing", "dispatch-journal");

@@ -45,6 +45,32 @@ function snapshot(request = false): IncrementalCheckpointInput {
 			priorEnvelopeSha256: source.priorEnvelopeSha256, historicalGoalRunIds: [],
 			goals: [], sessions: [], requestIds: requests.map(row => row.requestId) } };
 }
+
+const unknownControl = { version: 1 as const, kind: "unobserved-control-delivery" as const,
+	controlCommit: "d".repeat(40), testedSourceCommit: "e".repeat(40),
+	testedSourceTree: "f".repeat(40), previousControlParent: "c".repeat(40),
+	admittedBy: { runId: source.runId, runAttempt: source.runAttempt,
+		runNumber: 8, commit: source.commit }, observedRunsAtAdmission: 0 as const,
+	effects: "unknown-unreconciled" as const, accounting: "unquantified" as const };
+
+test("initial private prefix seals accepted unobserved control before later requests", async t => {
+	const f = await fixture(t);
+	const initial = { ...snapshot(), unobservedControlDeliveries: [unknownControl] };
+	await f.journal.record("initial", initial);
+	let raw = await readFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE), "utf8");
+	let opened = openIncrementalControlPrefix(raw, f.authenticatedMissionKey, source);
+	assert.deepEqual(opened.unobservedControlDeliveries, [unknownControl]);
+	assert.equal(opened.requestAudit.requests.length, 0);
+	const later = { ...snapshot(true), unobservedControlDeliveries: [unknownControl] };
+	await f.journal.record("request-reserved", later);
+	raw = await readFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE), "utf8");
+	opened = openIncrementalControlPrefix(raw, f.authenticatedMissionKey, source);
+	assert.deepEqual(opened.unobservedControlDeliveries, [unknownControl]);
+	assert.equal(opened.requestAudit.requests.length, 1);
+	await assert.rejects(f.journal.record("control-observed", snapshot(true)),
+		expectDiagnostic("monotonic-regression", "unobserved-control-regressed"));
+	assert.equal(await readFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE), "utf8"), raw);
+});
 async function fixture(t: TestContext, publish?: ConstructorParameters<
 	typeof IncrementalPrivateCheckpointJournal>[0]["publish"]) {
 	const dir = await mkdtemp(path.join(os.tmpdir(), "incremental-private-test-"));

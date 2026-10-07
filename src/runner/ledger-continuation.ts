@@ -166,6 +166,23 @@ export type OpaqueExecutedRunGap = Readonly<{
 	terminal: AuthenticatedPriorCarryProof["terminal"];
 	resultArtifact: NonNullable<AuthenticatedPriorCarryProof["resultArtifact"]>;
 }>;
+/** A control ref was accepted, but no Action for its exact commit was visible
+ * when a linked successor was admitted. Absence of a run is only an observation
+ * at admission: effects and charges remain UNKNOWN, including a late run. */
+export type UnobservedControlDelivery = Readonly<{
+	version: 1; kind: "unobserved-control-delivery";
+	controlCommit: string; testedSourceCommit: string; testedSourceTree: string;
+	previousControlParent: string | null; admittedBy: Readonly<Source>;
+	observedRunsAtAdmission: 0; effects: "unknown-unreconciled";
+	accounting: "unquantified";
+}>;
+export type LateControlPreproviderDisposition = Readonly<{
+	version: 1; kind: "late-control-preprovider-failure"; controlCommit: string;
+	source: Readonly<Source>; reconciledBy: Readonly<Source>;
+	jobId: string; verifierStep: "failure";
+	decodeStep: "skipped"; providerStep: "skipped";
+	effects: "unknown-unreconciled"; accounting: "unquantified";
+}>;
 export type AuthenticatedSelectedTransition = Readonly<{
 	version: 1; kind: "host-selected-tuple-transition";
 	source: Readonly<Source>; envelopeSha256: string; priorEnvelopeSha256: string;
@@ -176,6 +193,8 @@ export type AuthenticatedSelectedTransition = Readonly<{
 }>;
 type StoredSelectedTransition = Omit<AuthenticatedSelectedTransition, "envelopeSha256">;
 const authenticatedHistoricalOpaqueGaps = new WeakMap<object, readonly OpaqueExecutedRunGap[]>();
+const authenticatedUnobservedControlDeliveries = new WeakMap<object, readonly UnobservedControlDelivery[]>();
+const authenticatedTerminalControlDeliveries = new WeakMap<object, readonly UnobservedControlDelivery[]>();
 const authenticatedSelectedTransitionChains = new WeakMap<object,
 	readonly AuthenticatedSelectedTransition[]>();
 const authenticatedPendingHistoricalEffects = new WeakMap<object, ReadonlyArray<Readonly<Source>>>();
@@ -186,6 +205,18 @@ export function authenticatedHistoricalOpaqueRunGaps(proof: unknown,
 	if (!isAuthenticatedPriorCarryProof(proof) ||
 		!authenticatedPriorCarryBindsBundle(proof, bundle)) return undefined;
 	return authenticatedHistoricalOpaqueGaps.get(proof);
+}
+export function authenticatedUnknownControlDeliveries(proof: unknown,
+	bundle: unknown): readonly UnobservedControlDelivery[] | undefined {
+	if (!isAuthenticatedPriorCarryProof(proof) ||
+		!authenticatedPriorCarryBindsBundle(proof, bundle)) return undefined;
+	return authenticatedUnobservedControlDeliveries.get(proof);
+}
+export function authenticatedTerminalUnknownControlDeliveries(proof: unknown,
+	bundle: unknown): readonly UnobservedControlDelivery[] | undefined {
+	if (!isAuthenticatedTerminalCarryProof(proof) ||
+		!authenticatedTerminalCarryBindsBundle(proof, bundle)) return undefined;
+	return authenticatedTerminalControlDeliveries.get(proof);
 }
 /** Append-only selected tuple transitions verified against AEAD carry ancestry.
  * This is selected evidence provenance, never M04 knowledge adoption authority. */
@@ -427,6 +458,11 @@ export type LedgerContinuation = {
 		diagnostics: readonly TransportFailureDiagnostic[]) => string | undefined;
 	/** A paid, terminal Actions run lacked its encrypted carry. Known totals exclude it. */
 	opaqueExecutedRuns: readonly OpaqueExecutedRunGap[];
+	/** Ref acceptance with no observed Action is an unresolved historical delivery. */
+	unobservedControlDeliveries: readonly UnobservedControlDelivery[];
+	/** Accept only this opening's exact, frozen authenticated output array. */
+	authenticatedUnobservedControlDeliveries: (value: unknown) => boolean;
+	lateControlPreproviderDispositions: readonly LateControlPreproviderDisposition[];
 	priorCommittedCny?: number; priorUnknownHeldCny?: number;
 	priorSettledCny?: number; priorUnknownObservedCny?: number; priorUnpricedRequestCount?: number;
 	historicalCommittedCny?: number; historicalUnknownHeldCny?: number;
@@ -460,6 +496,8 @@ type AccountingCheckpoint = {
 	legacyAncestry: AncestorReceipt[]; ancestry: AccountingAncestorReceipt[];
 	selectedTransitions?: StoredSelectedTransition[];
 	opaqueExecutedRuns?: OpaqueExecutedRunGap[];
+	unobservedControlDeliveries?: UnobservedControlDelivery[];
+	lateControlPreproviderDispositions?: LateControlPreproviderDisposition[];
 	historicalIncrementalPrefixes?: StoredHistoricalIncrementalPrefix[];
 	/** New writer's explicit safety interpretation; older gap receipts stay byte-exact. */
 	historicalOpaqueGapEffectInterpretation?: "unknown-unreconciled";
@@ -485,7 +523,9 @@ type AccountingAncestorReceipt = Pick<AccountingCheckpoint, "parentDigest" | "so
 	"unknownObservedAddedNano" | "unpricedAddedCount" | "requestAudit" | "bootstrapBinding"> &
 	{ envelopeDigest: string; selectedTransitionCount?: number;
 		selectedTransitionDigest?: string; incrementalPrefixCount?: number;
-		incrementalPrefixDigest?: string };
+		incrementalPrefixDigest?: string; controlDeliveryCount?: number;
+		controlDeliveryDigest?: string; lateControlCount?: number;
+		lateControlDigest?: string };
 type StoredHistoricalIncrementalPrefix = Readonly<{
 	version: 1; kind: "encrypted-historical-incremental-prefix";
 	source: Readonly<Source>; event: "push" | "workflow_dispatch";
@@ -503,6 +543,19 @@ export type RequestAuditSnapshot = { requests: CampaignRequestAudit[]; settledCn
 	providerOutputLimit?: DeepSeekProviderOutputLimit };
 
 function reject(reason: string): never { throw new HarnessError("runner.ledger-continuation", reason); }
+/** Retains the last authenticated carry for a later observation or explicit
+ * quarantine review; no older Action is replayed as the selected successor. */
+export class LateControlReconciliationPendingError extends HarnessError {
+	readonly controlCommit: string;
+	readonly observedRunCount: number;
+	constructor(controlCommit: string, observedRunCount: number) {
+		super("runner.late-control-reconciliation-pending",
+			"late prior control Action requires explicit UNKNOWN-effect reconciliation");
+		this.name = "LateControlReconciliationPendingError";
+		this.controlCommit = controlCommit;
+		this.observedRunCount = observedRunCount;
+	}
+}
 function record(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -986,6 +1039,8 @@ function readCheckpoint(payload: CarryArtifactPayload, key: Buffer, seedDigest: 
 			"legacyAncestry", "historical",
 			...(parsed.selectedTransitions === undefined ? [] : ["selectedTransitions"]),
 			...(parsed.opaqueExecutedRuns === undefined ? [] : ["opaqueExecutedRuns"]),
+			...(parsed.unobservedControlDeliveries === undefined ? [] : ["unobservedControlDeliveries"]),
+			...(parsed.lateControlPreproviderDispositions === undefined ? [] : ["lateControlPreproviderDispositions"]),
 			...(parsed.historicalIncrementalPrefixes === undefined ? [] : ["historicalIncrementalPrefixes"]),
 			...(parsed.historicalOpaqueGapEffectInterpretation === undefined ? [] :
 				["historicalOpaqueGapEffectInterpretation"]),
@@ -1013,6 +1068,10 @@ function readCheckpoint(payload: CarryArtifactPayload, key: Buffer, seedDigest: 
 				!Array.isArray(cp.historicalIncrementalPrefixes)) ||
 			(cp.reviewedEffectAncestry !== undefined && !Array.isArray(cp.reviewedEffectAncestry)) ||
 			(cp.opaqueExecutedRuns !== undefined && !Array.isArray(cp.opaqueExecutedRuns)) ||
+			(cp.unobservedControlDeliveries !== undefined &&
+				!Array.isArray(cp.unobservedControlDeliveries)) ||
+			(cp.lateControlPreproviderDispositions !== undefined &&
+				!Array.isArray(cp.lateControlPreproviderDispositions)) ||
 			(cp.historicalOpaqueGapEffectInterpretation !== undefined &&
 				cp.historicalOpaqueGapEffectInterpretation !== "unknown-unreconciled") ||
 			(cp.historicalOpaqueGapEffectInterpretation !== undefined &&
@@ -1066,7 +1125,51 @@ function accountingAncestorReceipt(cp: AccountingCheckpoint, envelopeDigest: str
 		...(cp.historicalIncrementalPrefixes?.length ? {
 			incrementalPrefixCount: cp.historicalIncrementalPrefixes.length,
 			incrementalPrefixDigest: digest(JSON.stringify(cp.historicalIncrementalPrefixes)) } : {}),
+		...(cp.unobservedControlDeliveries?.length ? {
+			controlDeliveryCount: cp.unobservedControlDeliveries.length,
+			controlDeliveryDigest: digest(JSON.stringify(cp.unobservedControlDeliveries)) } : {}),
+		...(cp.lateControlPreproviderDispositions?.length ? {
+			lateControlCount: cp.lateControlPreproviderDispositions.length,
+			lateControlDigest: digest(JSON.stringify(cp.lateControlPreproviderDispositions)) } : {}),
 		...(cp.bootstrapBinding ? { bootstrapBinding: cp.bootstrapBinding } : {}) };
+}
+export function validUnobservedControlDelivery(value: unknown): value is UnobservedControlDelivery {
+	return record(value) && exactKeys(value, ["version", "kind", "controlCommit",
+		"testedSourceCommit", "testedSourceTree", "previousControlParent", "admittedBy",
+		"observedRunsAtAdmission", "effects", "accounting"]) &&
+		value.version === 1 && value.kind === "unobserved-control-delivery" &&
+		[value.controlCommit, value.testedSourceCommit, value.testedSourceTree].every(item =>
+			typeof item === "string" && /^[0-9a-f]{40}$/.test(item)) &&
+		(value.previousControlParent === null ||
+			(typeof value.previousControlParent === "string" && /^[0-9a-f]{40}$/.test(value.previousControlParent))) &&
+		record(value.admittedBy) && exactKeys(value.admittedBy,
+			["runId", "runAttempt", "runNumber", "commit"]) &&
+		positiveId(value.admittedBy.runId) && Number.isSafeInteger(value.admittedBy.runAttempt) &&
+		Number(value.admittedBy.runAttempt) > 0 && Number.isSafeInteger(value.admittedBy.runNumber) &&
+		Number(value.admittedBy.runNumber) > 0 && typeof value.admittedBy.commit === "string" &&
+		/^[0-9a-f]{40}$/.test(value.admittedBy.commit) &&
+		value.observedRunsAtAdmission === 0 && value.effects === "unknown-unreconciled" &&
+		value.accounting === "unquantified";
+}
+function validLateControlPreproviderDisposition(value: unknown): value is LateControlPreproviderDisposition {
+	return record(value) && exactKeys(value, ["version", "kind", "controlCommit", "source",
+		"reconciledBy",
+		"jobId", "verifierStep", "decodeStep", "providerStep", "effects", "accounting"]) &&
+		value.version === 1 && value.kind === "late-control-preprovider-failure" &&
+		typeof value.controlCommit === "string" && /^[0-9a-f]{40}$/.test(value.controlCommit) &&
+		record(value.source) && exactKeys(value.source, ["runId", "runAttempt", "runNumber", "commit"]) &&
+		positiveId(value.source.runId) && Number.isSafeInteger(value.source.runAttempt) &&
+		Number(value.source.runAttempt) > 0 && Number.isSafeInteger(value.source.runNumber) &&
+		Number(value.source.runNumber) > 0 && value.source.commit === value.controlCommit &&
+		record(value.reconciledBy) && exactKeys(value.reconciledBy,
+			["runId", "runAttempt", "runNumber", "commit"]) &&
+		positiveId(value.reconciledBy.runId) && Number.isSafeInteger(value.reconciledBy.runAttempt) &&
+		Number(value.reconciledBy.runAttempt) > 0 && Number.isSafeInteger(value.reconciledBy.runNumber) &&
+		Number(value.reconciledBy.runNumber) > 0 && typeof value.reconciledBy.commit === "string" &&
+		/^[0-9a-f]{40}$/.test(value.reconciledBy.commit) &&
+		positiveId(value.jobId) && value.verifierStep === "failure" &&
+		value.decodeStep === "skipped" && value.providerStep === "skipped" &&
+		value.effects === "unknown-unreconciled" && value.accounting === "unquantified";
 }
 function validOpaqueGap(value: unknown): value is OpaqueExecutedRunGap {
 	if (!record(value) || !exactKeys(value, ["version", "kind", "source",
@@ -1906,6 +2009,10 @@ function validateAncestryV3(cp: AccountingCheckpoint, sources: Source[], seedDig
 			...(receipt.selectedTransitionDigest === undefined ? [] : ["selectedTransitionDigest"]),
 			...(receipt.incrementalPrefixCount === undefined ? [] : ["incrementalPrefixCount"]),
 			...(receipt.incrementalPrefixDigest === undefined ? [] : ["incrementalPrefixDigest"]),
+			...(receipt.controlDeliveryCount === undefined ? [] : ["controlDeliveryCount"]),
+			...(receipt.controlDeliveryDigest === undefined ? [] : ["controlDeliveryDigest"]),
+			...(receipt.lateControlCount === undefined ? [] : ["lateControlCount"]),
+			...(receipt.lateControlDigest === undefined ? [] : ["lateControlDigest"]),
 			...(receipt.bootstrapBinding === undefined ? [] : ["bootstrapBinding"])]) ||
 			typeof receipt.envelopeDigest !== "string" || !/^[0-9a-f]{64}$/.test(receipt.envelopeDigest))
 			reject("carry ancestry receipt is invalid");
@@ -1965,6 +2072,53 @@ function validateAncestryV3(cp: AccountingCheckpoint, sources: Source[], seedDig
 			(expectedCount > 0 && receipt.incrementalPrefixDigest !==
 				digest(JSON.stringify(historicalPrefixes.slice(0, expectedCount)))))
 			reject("historical incremental prefix ancestry was changed or dropped");
+	}
+	const deliveries = cp.unobservedControlDeliveries ?? [];
+	if (!Array.isArray(deliveries) || new Set(deliveries.map(row => row.controlCommit)).size !== deliveries.length)
+		reject("unobserved control delivery ancestry is invalid");
+	let lastDeliveryRunNumber = 0;
+	for (const [index, row] of deliveries.entries()) {
+		const previous = deliveries[index - 1];
+		if (!validUnobservedControlDelivery(row) || row.admittedBy.runNumber < lastDeliveryRunNumber ||
+			(previous && row.admittedBy.runNumber === previous.admittedBy.runNumber &&
+				row.previousControlParent !== previous.controlCommit) ||
+			!accountingSources.some(source => JSON.stringify(source) === JSON.stringify(row.admittedBy)) ||
+			row.admittedBy.runNumber > cp.source.runNumber || row.controlCommit === row.admittedBy.commit)
+			reject("unobserved control delivery is not an ordered authenticated source");
+		lastDeliveryRunNumber = row.admittedBy.runNumber;
+	}
+	for (const receipt of cp.ancestry) {
+		const prefix = deliveries.filter(row => row.admittedBy.runNumber <= receipt.source.runNumber);
+		if ((receipt.controlDeliveryCount ?? 0) !== prefix.length ||
+			(receipt.controlDeliveryDigest === undefined) !== (prefix.length === 0) ||
+			(prefix.length > 0 && receipt.controlDeliveryDigest !== digest(JSON.stringify(prefix))))
+			reject("unobserved control delivery ancestry was changed or dropped");
+	}
+	const late = cp.lateControlPreproviderDispositions ?? [];
+	if (!Array.isArray(late) || new Set(late.map(row => row.controlCommit)).size !== late.length)
+		reject("late control disposition ancestry is invalid");
+	let lastLateReconciliationNumber = 0;
+	let lastLateDeliveryIndex = -1;
+	for (const row of late) {
+		const original = deliveries.find(delivery => delivery.controlCommit === row.controlCommit);
+		const deliveryIndex = deliveries.findIndex(delivery => delivery.controlCommit === row.controlCommit);
+		if (!validLateControlPreproviderDisposition(row) || !original ||
+			row.reconciledBy.runNumber <= original.admittedBy.runNumber ||
+			row.reconciledBy.runNumber < lastLateReconciliationNumber ||
+			(row.reconciledBy.runNumber === lastLateReconciliationNumber &&
+				deliveryIndex <= lastLateDeliveryIndex) ||
+			!accountingSources.some(source => JSON.stringify(source) === JSON.stringify(row.reconciledBy)) ||
+			row.reconciledBy.runNumber > cp.source.runNumber)
+			reject("late control disposition lacks an ordered UNKNOWN delivery");
+		lastLateReconciliationNumber = row.reconciledBy.runNumber;
+		lastLateDeliveryIndex = deliveryIndex;
+	}
+	for (const receipt of cp.ancestry) {
+		const prefix = late.filter(row => row.reconciledBy.runNumber <= receipt.source.runNumber);
+		if ((receipt.lateControlCount ?? 0) !== prefix.length ||
+			(receipt.lateControlDigest === undefined) !== (prefix.length === 0) ||
+			(prefix.length > 0 && receipt.lateControlDigest !== digest(JSON.stringify(prefix))))
+			reject("late control disposition ancestry was changed or dropped");
 	}
 	let pendingIndex = -1;
 	for (const source of cp.pendingEffectAncestry ?? []) {
@@ -2029,6 +2183,30 @@ async function githubJson(url: string, token: string | undefined, request: typeo
 	if (!record(value)) reject("GitHub carry freshness response is invalid");
 	return value;
 }
+/** An exact-sha census is separate from the bounded seed-to-current run list:
+ * the old ref may have been accepted before that list's signed anchor. */
+async function exactControlRunCensus(commit: string, token: string | undefined,
+	request: typeof fetch): Promise<Run[]> {
+	const rows: Run[] = [];
+	let total: number | undefined;
+	for (let page = 1; ; page++) {
+		if (!Number.isSafeInteger(page)) reject("exact prior control Action census index is invalid");
+		const response = await githubJson(`https://api.github.com/repos/${MISSION_REPOSITORY}/actions/workflows/${WORKFLOW}/runs?head_sha=${commit}&per_page=100&page=${page}`,
+			token, request);
+		if (!Number.isSafeInteger(response.total_count) || Number(response.total_count) < 0 ||
+			(total !== undefined && total !== response.total_count) ||
+			!Array.isArray(response.workflow_runs) ||
+			response.workflow_runs.length !== Math.min(100, Math.max(0, Number(response.total_count) - rows.length)) ||
+			response.workflow_runs.some(row => !record(row) || row.head_sha !== commit))
+			reject("exact prior control Action census is incomplete");
+		total = Number(response.total_count);
+		rows.push(...response.workflow_runs as Run[]);
+		if (rows.length === total) break;
+	}
+	if (new Set(rows.map(row => row.id)).size !== rows.length)
+		reject("exact prior control Action census is duplicated");
+	return rows;
+}
 async function oneJob(runId: string, token: string | undefined, request: typeof fetch): Promise<Job> {
 	const url = `https://api.github.com/repos/${MISSION_REPOSITORY}/actions/runs/${runId}/jobs?per_page=100`;
 	const response = await githubJson(url, token, request);
@@ -2040,6 +2218,39 @@ async function oneJob(runId: string, token: string | undefined, request: typeof 
 		(job.steps !== undefined && (!Array.isArray(job.steps) || job.steps.some(step => !record(step)))))
 		reject("workflow job disposition is incomplete");
 	return job;
+}
+async function preproviderLateControlDisposition(controlCommit: string, runs: Run[],
+	currentSource: Source, workflowId: number, actor: string, token: string | undefined,
+	request: typeof fetch): Promise<LateControlPreproviderDisposition | undefined> {
+	if (runs.length !== 1) return undefined;
+	const run = runs[0];
+	if (run.head_sha !== controlCommit || run.event !== "push" ||
+		run.head_branch !== REQUEST_BRANCH || run.actor?.login !== actor ||
+		run.workflow_id !== workflowId || run.status !== "completed" ||
+		run.conclusion !== "failure" || run.run_attempt !== 1 ||
+		!Number.isSafeInteger(run.id) || !Number.isSafeInteger(run.run_number)) return undefined;
+	let job: Job;
+	try { job = await oneJob(String(run.id), token, request); }
+	catch { return undefined; }
+	const steps = job.steps;
+	if (!Number.isSafeInteger(job.id) || job.id! <= 0 || job.run_id !== run.id ||
+		job.run_attempt !== 1 || job.head_sha !== controlCommit ||
+		job.conclusion !== "failure" || !Array.isArray(steps)) return undefined;
+	const exactStep = (name: string, conclusion: string): boolean => {
+		const found = steps.filter(step => step.name === name);
+		return found.length === 1 && found[0].status === "completed" &&
+			found[0].conclusion === conclusion;
+	};
+	const providers = providerSteps(job);
+	if (!exactStep("Verify reusable control-branch request and accepted source CI", "failure") ||
+		!exactStep("Decode confidential input without logging it", "skipped") ||
+		providers.length !== 1 || providers[0].status !== "completed" ||
+		providers[0].conclusion !== "skipped") return undefined;
+	return Object.freeze({ version: 1, kind: "late-control-preprovider-failure",
+		controlCommit, source: Object.freeze({ ...sourceOf(run) }),
+		reconciledBy: Object.freeze({ ...currentSource }), jobId: String(job.id),
+		verifierStep: "failure", decodeStep: "skipped", providerStep: "skipped",
+		effects: "unknown-unreconciled", accounting: "unquantified" });
 }
 function providerDisposition(job: Job): "skipped" | "executed" {
 	const steps = providerSteps(job);
@@ -2259,6 +2470,7 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 	if (authorizedControlRequest && pages.some(run => run.id !== current.id &&
 		run.event === "push" && run.head_sha === current.head_sha))
 		reject("run request commit was already used by an earlier workflow run");
+	const newlyUnobservedControlDeliveries: UnobservedControlDelivery[] = [];
 	if (authorizedControlRequest) {
 		const repo = `https://api.github.com/repos/${MISSION_REPOSITORY}`;
 		let liveSource: unknown;
@@ -2293,6 +2505,53 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 			row.event === "push" && row.run_attempt === 1 && row.conclusion === "success" &&
 			(!terminalMode || row.status === "completed")))
 			reject("run request source lacks a successful offline regression run");
+		if (parents.length === 2) {
+			const reverseChain: UnobservedControlDelivery[] = [];
+			const visited = new Set<string>();
+			let cursor: string | null = c.before!;
+			while (cursor !== null) {
+				if (visited.has(cursor)) reject("linked unobserved control ancestry is cyclic");
+				visited.add(cursor);
+				const observedHere = pages.some(run => run.head_sha === cursor &&
+					run.event === "push" && run.head_branch === REQUEST_BRANCH &&
+					run.actor?.login === c.actor && run.run_attempt === 1 &&
+					run.workflow_id === current.workflow_id);
+				if (!observedHere &&
+					(await exactControlRunCensus(cursor, input.githubToken, request)).length !== 0)
+					reject("prior control Action lies outside authenticated workflow history");
+				const old = await githubJson(`${repo}/git/commits/${cursor}`, input.githubToken, request);
+				if (old.sha !== cursor || old.message !== REUSABLE_RUN_REQUEST_MESSAGE || !Array.isArray(old.parents) ||
+					![1, 2].includes(old.parents.length) || old.parents.some(parent =>
+						!record(parent) || typeof parent.sha !== "string" || !/^[0-9a-f]{40}$/.test(parent.sha)) ||
+					!record(old.tree) || typeof old.tree.sha !== "string" ||
+					!/^[0-9a-f]{40}$/.test(old.tree.sha))
+					reject("unobserved prior control commit structure is invalid");
+				const oldSource = (old.parents[0] as { sha: string }).sha;
+				const oldSourceCommit = await githubJson(`${repo}/git/commits/${oldSource}`,
+					input.githubToken, request);
+				if (oldSourceCommit.sha !== oldSource || !record(oldSourceCommit.tree) ||
+					oldSourceCommit.tree.sha !== old.tree.sha)
+					reject("unobserved prior control is not an empty tested-source commit");
+				const oldCi = await githubJson(`${base}/workflows/workflow-regression.yml/runs?head_sha=${oldSource}&per_page=100`,
+					input.githubToken, request);
+				if (!Array.isArray(oldCi.workflow_runs) || !oldCi.workflow_runs.some(row =>
+					record(row) && row.head_sha === oldSource && row.head_branch === BRANCH &&
+					row.event === "push" && row.run_attempt === 1 && row.status === "completed" &&
+					row.conclusion === "success"))
+					reject("unobserved prior control source lacks successful offline regression");
+				const previousControlParent: string | null = old.parents.length === 2 ?
+					(old.parents[1] as { sha: string }).sha : null;
+				if (!observedHere)
+					reverseChain.push(Object.freeze({ version: 1, kind: "unobserved-control-delivery",
+						controlCommit: cursor, testedSourceCommit: oldSource,
+						testedSourceTree: old.tree.sha, previousControlParent,
+						admittedBy: Object.freeze({ ...sourceOf(current) }), observedRunsAtAdmission: 0,
+						effects: "unknown-unreconciled", accounting: "unquantified" }));
+				cursor = previousControlParent;
+			}
+			const orderedUnknowns = reverseChain.reverse();
+			newlyUnobservedControlDeliveries.push(...orderedUnknowns);
+		}
 	}
 	// Workflow concurrency prevents simultaneous execution, but it does not promise
 	// run-number order. A newer completed paid run cannot be silently omitted just
@@ -2342,6 +2601,20 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 			reject("intervening provider execution is unresolved");
 		executedSources.push(source);
 		executedMetadata.set(source.runId, { run, job });
+	}
+	// If a delayed old control executes after its linked successor, do not
+	// select that old run as the latest carry or replay its provider work.
+	for (const old of executedSources.filter(source =>
+		executedMetadata.get(source.runId)?.run.head_branch === REQUEST_BRANCH)) {
+		const linked = ordered.filter(run => run.event === "push" &&
+			run.head_branch === REQUEST_BRANCH && run.run_number! < old.runNumber);
+		for (const candidate of linked) {
+			const commit = await githubJson(`https://api.github.com/repos/${MISSION_REPOSITORY}/git/commits/${candidate.head_sha}`,
+				input.githubToken, request);
+			if (Array.isArray(commit.parents) && commit.parents.length === 2 &&
+				record(commit.parents[1]) && commit.parents[1].sha === old.commit)
+				throw new LateControlReconciliationPendingError(old.commit, 1);
+		}
 	}
 	const loadedArtifacts = new Map<string, string>();
 	const loadedPayloads = new Map<string, CarryArtifactPayload>();
@@ -2418,6 +2691,8 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 	let historicalCarryOrigin: AuthenticatedCarryForwardOrigin | undefined;
 	let storedSelectedTransitions: StoredSelectedTransition[] = [];
 	let storedHistoricalIncrementalPrefixes: StoredHistoricalIncrementalPrefix[] = [];
+	let storedUnobservedControlDeliveries: UnobservedControlDelivery[] = [];
+	let storedLateControlPreproviderDispositions: LateControlPreproviderDisposition[] = [];
 	let authenticatedSelectedTransitions: readonly AuthenticatedSelectedTransition[] | undefined;
 	let reviewedEffectAncestry: ReviewedEffectAncestorReceipt[] = [];
 	let priorTransportDiagnosticCensus: HostTransportDiagnosticCensusV1 | undefined;
@@ -2439,6 +2714,22 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 			authenticatedSelectedTransitions = validateSelectedTransitions(cp, opened.digest);
 			storedSelectedTransitions = [...(cp.selectedTransitions ?? [])];
 			storedHistoricalIncrementalPrefixes = [...(cp.historicalIncrementalPrefixes ?? [])];
+			storedUnobservedControlDeliveries = [...(cp.unobservedControlDeliveries ?? [])];
+			storedLateControlPreproviderDispositions = [...(cp.lateControlPreproviderDispositions ?? [])];
+			for (const delivery of storedUnobservedControlDeliveries) {
+				const runs = await exactControlRunCensus(delivery.controlCommit,
+					input.githubToken, request);
+				const saved = storedLateControlPreproviderDispositions.find(row =>
+					row.controlCommit === delivery.controlCommit);
+				if (!runs.length && !saved) continue;
+				const disposition = await preproviderLateControlDisposition(delivery.controlCommit,
+					runs, saved?.reconciledBy ?? sourceOf(current), current.workflow_id!, c.actor!,
+					input.githubToken, request);
+				if (!disposition || (saved && JSON.stringify(disposition) !== JSON.stringify(saved)) ||
+					(!saved && terminalMode))
+					throw new LateControlReconciliationPendingError(delivery.controlCommit, runs.length);
+				if (!saved) storedLateControlPreproviderDispositions.push(disposition);
+			}
 			priorTransportDiagnosticCensus = transportDiagnosticCensus(cp);
 			// Earlier writers recorded a source review as if it settled effects.
 			// Preserve its authenticated source/transport receipt but downgrade
@@ -2457,7 +2748,8 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 			currentEffectReviewPending = cp.currentEffectReview === "pending";
 			pendingEffectAncestry = [...(cp.pendingEffectAncestry ?? [])];
 			const historicalOrigin = cp.legacyAncestry.at(-1);
-			const allPriorEffectsReviewed = cp.ancestry.filter(row => !hasNoV3ProviderActivity(row))
+			const allPriorEffectsReviewed = storedUnobservedControlDeliveries.length === 0 &&
+				cp.ancestry.filter(row => !hasNoV3ProviderActivity(row))
 				.every(row => cp.reviewedEffectAncestry?.some(entry =>
 					entry.envelopeSha256 === row.envelopeDigest &&
 					entry.historicalEffectState === undefined) ?? false);
@@ -2595,6 +2887,32 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 		opaqueExecutedRuns.push(gap);
 		storedOpaqueExecutedRuns.push(gap);
 	}
+	if (newlyUnobservedControlDeliveries.length && !terminalMode) {
+		const uncarried = newlyUnobservedControlDeliveries.filter(delivery =>
+			!storedUnobservedControlDeliveries.some(row => row.controlCommit === delivery.controlCommit));
+		for (let index = 1; index < uncarried.length; index++)
+			if (uncarried[index].previousControlParent !== uncarried[index - 1].controlCommit)
+				reject("observed control between unreviewed UNKNOWN ancestors requires explicit repair review");
+		for (const delivery of newlyUnobservedControlDeliveries) {
+			const carried = storedUnobservedControlDeliveries.find(row =>
+				row.controlCommit === delivery.controlCommit);
+			if (carried) {
+				if (carried.testedSourceCommit !== delivery.testedSourceCommit ||
+					carried.testedSourceTree !== delivery.testedSourceTree ||
+					carried.previousControlParent !== delivery.previousControlParent)
+					reject("unobserved control delivery conflicts with carried ancestry");
+				continue;
+			}
+			storedUnobservedControlDeliveries.push(delivery);
+		}
+	}
+	if (terminalMode && newlyUnobservedControlDeliveries.some(delivery =>
+		!storedUnobservedControlDeliveries.some(carried =>
+			carried.controlCommit === delivery.controlCommit &&
+			carried.testedSourceCommit === delivery.testedSourceCommit &&
+			carried.testedSourceTree === delivery.testedSourceTree &&
+			carried.previousControlParent === delivery.previousControlParent)))
+		reject("terminal control carry omitted verified UNKNOWN delivery ancestry");
 	// A cancelled execution can survive later carried successors only as an
 	// authenticated opaque gap. Never admit a cancelled source with its own carry.
 	for (const runId of cancelledExecutedRunIds)
@@ -2674,6 +2992,9 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 			opaqueUnquantifiedRunCount: opaqueExecutedRuns.length }));
 	if (proof && opaqueExecutedRuns.length && priorPrivateBundle)
 		authenticatedHistoricalOpaqueGaps.set(proof, Object.freeze([...opaqueExecutedRuns]));
+	if (proof && priorPrivateBundle)
+		authenticatedUnobservedControlDeliveries.set(proof,
+			Object.freeze([...storedUnobservedControlDeliveries]));
 	if (proof && priorPrivateBundle && (pendingEffectAncestry.length || currentEffectReviewPending))
 		authenticatedPendingHistoricalEffects.set(proof, Object.freeze([
 			...pendingEffectAncestry.map(source => Object.freeze({ ...source })),
@@ -2784,6 +3105,8 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 		});
 		authenticatedTerminalCarryProofs.add(terminalProof);
 		terminalBundleDigests.set(terminalProof, privateBundleDigest(priorPrivateBundle));
+		authenticatedTerminalControlDeliveries.set(terminalProof,
+			Object.freeze([...storedUnobservedControlDeliveries]));
 		terminalSupervisorProjections.set(terminalProof, { status, terminalCarry,
 			...(pendingAction ? { pendingAction } : {}) });
 		Object.freeze(priorPrivateBundle);
@@ -2813,6 +3136,8 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 		repository: MISSION_REPOSITORY, runId: currentSource.runId,
 		runAttempt: currentSource.runAttempt, commit: currentSource.commit,
 		event: c.event as "push" | "workflow_dispatch", priorEnvelopeSha256: parentDigest };
+	const liveUnobservedControlDeliveries = Object.freeze(storedUnobservedControlDeliveries.map(row =>
+		Object.freeze({ ...row, admittedBy: Object.freeze({ ...row.admittedBy }) })));
 	const result: LedgerContinuation = { mode: "accounting-only",
 		...(incrementalPrefixObservation ? { incrementalPrefixObservation } : {}),
 		...(incrementalPrefixFailure ? { incrementalPrefixFailure } : {}),
@@ -2822,6 +3147,9 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 			outputDir, authenticatedMissionKey: key, source: incrementalControlSource }),
 		...(priorTransportDiagnosticCensus ? { priorTransportDiagnosticCensus } : {}),
 		opaqueExecutedRuns: Object.freeze([...opaqueExecutedRuns]),
+		unobservedControlDeliveries: liveUnobservedControlDeliveries,
+		authenticatedUnobservedControlDeliveries: value => value === liveUnobservedControlDeliveries,
+		lateControlPreproviderDispositions: Object.freeze([...storedLateControlPreproviderDispositions]),
 		priorSettledCny: decimal(settledNano), priorUnknownObservedCny: decimal(unknownObservedNano),
 		priorUnpricedRequestCount: unpricedRequestCount,
 		historicalCommittedCny: decimal(historical.committedNano),
@@ -2925,10 +3253,10 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 			if (sealed) reject("current carry was already sealed");
 			const privateBundle = amounts.privateBundle ?? priorPrivateBundle;
 			const bootstrapBinding = amounts.bootstrapBinding ?? priorBootstrapBinding;
-			if ((opaqueExecutedRuns.length || currentEffectReviewPending ||
+			if ((opaqueExecutedRuns.length || storedUnobservedControlDeliveries.length || currentEffectReviewPending ||
 				pendingEffectAncestry.length) && amounts.requestAudit.requests.length > 0 &&
 				!hasCurrentFreshOnlyReservation(privateBundle, proof, currentSource, mintedCurrentClaim,
-					opaqueExecutedRuns.length + pendingEffectAncestry.length +
+					opaqueExecutedRuns.length + storedUnobservedControlDeliveries.length + pendingEffectAncestry.length +
 					(currentEffectReviewPending ? 1 : 0)))
 				reject("unreviewed historical effect requires the live V2 fresh-only reservation");
 			if ((privateBundle !== undefined && !validBundle(privateBundle, true)) ||
@@ -2953,6 +3281,10 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 					legacyAncestry, historical,
 					...(storedHistoricalIncrementalPrefixes.length ?
 						{ historicalIncrementalPrefixes: [...storedHistoricalIncrementalPrefixes] } : {}),
+					...(storedUnobservedControlDeliveries.length ?
+						{ unobservedControlDeliveries: [...storedUnobservedControlDeliveries] } : {}),
+					...(storedLateControlPreproviderDispositions.length ?
+						{ lateControlPreproviderDispositions: [...storedLateControlPreproviderDispositions] } : {}),
 					...(opaqueExecutedRuns.length ? { opaqueExecutedRuns: [...storedOpaqueExecutedRuns],
 						historicalOpaqueGapEffectInterpretation: "unknown-unreconciled" as const } : {}),
 					kind: "mul-pis-private-ledger-continuation", missionId: MISSION_ID,
@@ -3006,7 +3338,8 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 				if (!reviewedEffectPrefixValid(cp))
 					reject("current reviewed effect ancestry is not bound to restart claims");
 				validateCurrentDiagnostic(cp);
-				const allPriorEffectsReviewed = priorNonzero.every(row =>
+				const allPriorEffectsReviewed = storedUnobservedControlDeliveries.length === 0 &&
+					priorNonzero.every(row =>
 					cp.reviewedEffectAncestry?.some(entry =>
 						entry.envelopeSha256 === row.envelopeDigest &&
 						entry.historicalEffectState === undefined) ?? false);
@@ -3105,6 +3438,10 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 				legacyAncestry, historical,
 				...(storedHistoricalIncrementalPrefixes.length ?
 					{ historicalIncrementalPrefixes: [...storedHistoricalIncrementalPrefixes] } : {}),
+				...(storedUnobservedControlDeliveries.length ?
+					{ unobservedControlDeliveries: [...storedUnobservedControlDeliveries] } : {}),
+				...(storedLateControlPreproviderDispositions.length ?
+					{ lateControlPreproviderDispositions: [...storedLateControlPreproviderDispositions] } : {}),
 				...(storedSelectedTransitions.length ?
 					{ selectedTransitions: [...storedSelectedTransitions] } : {}),
 				kind: "mul-pis-private-ledger-continuation", missionId: MISSION_ID,

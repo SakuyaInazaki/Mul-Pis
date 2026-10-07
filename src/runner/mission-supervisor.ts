@@ -7,7 +7,9 @@
 import { createHash } from "node:crypto";
 import { classifyPendingAction, validatePendingAction } from "../m07/objective-progress.ts";
 import type { ObjectiveStopReason, PendingActionV1 } from "../m07/objective-progress.ts";
-import { isVerifiedWorkflowRepairPlan, type VerifiedWorkflowRepairPlanV1 } from "./mission-host-adapter.ts";
+import { isVerifiedLinkedUnknownDelivery, isVerifiedWorkflowRepairPlan,
+	type VerifiedWorkflowRepairPlanV1 } from "./mission-host-adapter.ts";
+import type { TestedControlBinding } from "./mission-resume-journal.ts";
 import { isVerifiedInterruptedSourceCapability,
 	type VerifiedInterruptedSourceCapabilityV1 } from "./interrupted-source-review.ts";
 
@@ -112,6 +114,26 @@ export type FreshIndependentLaunchContractV1 = Readonly<{
 	requiresRuntimeAttestationBeforeModel: true; mode: "fresh-work-only";
 }>;
 
+/** A host-authenticated observation that an earlier control commit reached the
+ * ref but still has no observed Actions run. Its delivery/effects remain UNKNOWN.
+ * A serialized object is not authority; the host adapter must brand it. */
+export type LinkedUnknownDeliveryV1 = Readonly<{
+	version: 1; kind: "host-verified-linked-unknown-delivery";
+	oldJournalKey: string; oldControlCommit: string;
+	/** Digest of a private, source-bound operator confinement review. */
+	oldSourceReviewReceiptSha256: string;
+	/** Complete unresolved accepted-control lineage, oldest to immediate parent. */
+	ancestry: readonly Readonly<{ oldJournalKey: string; oldControlCommit: string }>[];
+	oldTestedSourceCommit: string; oldTestedTree: string;
+	liveControlHead: string;
+	census: Readonly<{ kind: "authenticated-complete-actions-run-census";
+		headCommit: string; totalCount: 0; pagesRead: 1; sha256: string }>;
+	newTestedSourceCommit: string; newTestedTree: string;
+	newSuccessfulCi: TestedControlBinding["successfulCi"];
+	sourceRefTip: string;
+	accounting: "unquantified"; effects: "unknown-unreconciled";
+}>;
+
 export type SupervisorSnapshot = Readonly<{
 	status: MissionStatusV1;
 	pendingAction?: PendingActionV1;
@@ -124,6 +146,7 @@ export type SupervisorSnapshot = Readonly<{
 	freshLaunchContract?: FreshIndependentLaunchContractV1;
 	interruptedSourceReview?: VerifiedInterruptedSourceCapabilityV1;
 	workflowRepairPlan?: VerifiedWorkflowRepairPlanV1;
+	linkedUnknownDelivery?: LinkedUnknownDeliveryV1;
 	dispatchRecord: ResumeDispatchRecord;
 }>;
 
@@ -142,6 +165,7 @@ export type ResumeIntent = Readonly<{
 	/** Private review identity; never enters the public control descriptor. */
 	workflowRepair?: Readonly<{ reviewedPlanSha256: string; testedSourceCommit: string;
 		testedTree: string; successfulCi: VerifiedWorkflowRepairPlanV1["replacement"]["successfulCi"] }>;
+	linkedUnknownDelivery?: LinkedUnknownDeliveryV1;
 	/** The new process must start with no prior session or shared store. */
 	boundary: "new-isolated-workspace-no-prior-session-resume";
 	/** These effects stay UNKNOWN. The new run may work on independent tasks. */
@@ -253,6 +277,8 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 			fail("cancellation origin is invalid");
 	}
 	if (status.objectiveOutcome === "fulfilled") {
+		if (snapshot.linkedUnknownDelivery)
+			fail("an unobserved old control delivery cannot close the mission");
 		if (terminalInterruption)
 			return { kind: "wait", reason: "accounting-chain-needs-reconciliation" };
 		if (status.stopReason !== null || status.pendingAction !== undefined ||
@@ -479,6 +505,41 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 			testedTree: plan.replacement.testedTree,
 			successfulCi: structuredClone(plan.replacement.successfulCi) };
 	} else if (snapshot.workflowRepairPlan !== undefined) fail("workflow repair plan is unrelated to pending action");
+	let linkedUnknownDelivery: ResumeIntent["linkedUnknownDelivery"];
+	if (snapshot.linkedUnknownDelivery) {
+		const linked = snapshot.linkedUnknownDelivery;
+		if (!isVerifiedLinkedUnknownDelivery(linked) || !launchVerified ||
+			linked.version !== 1 || linked.kind !== "host-verified-linked-unknown-delivery" ||
+			!hex64(linked.oldJournalKey) || !/^[0-9a-f]{40}$/.test(linked.oldControlCommit) ||
+			!hex64(linked.oldSourceReviewReceiptSha256) ||
+			!Array.isArray(linked.ancestry) || !linked.ancestry.length ||
+			linked.ancestry.some(row => !hex64(row.oldJournalKey) ||
+				!/^[0-9a-f]{40}$/.test(row.oldControlCommit)) ||
+			new Set(linked.ancestry.map(row => row.oldJournalKey)).size !== linked.ancestry.length ||
+			new Set(linked.ancestry.map(row => row.oldControlCommit)).size !== linked.ancestry.length ||
+			linked.ancestry.at(-1)?.oldJournalKey !== linked.oldJournalKey ||
+			linked.ancestry.at(-1)?.oldControlCommit !== linked.oldControlCommit ||
+			linked.liveControlHead !== linked.oldControlCommit ||
+			!(/^[0-9a-f]{40}$/.test(linked.oldTestedSourceCommit)) ||
+			!(/^[0-9a-f]{40}$/.test(linked.oldTestedTree)) ||
+			linked.oldTestedSourceCommit === linked.newTestedSourceCommit ||
+			linked.census?.kind !== "authenticated-complete-actions-run-census" ||
+			linked.census.headCommit !== linked.oldControlCommit ||
+			linked.census.totalCount !== 0 || linked.census.pagesRead !== 1 ||
+			!hex64(linked.census.sha256) ||
+			linked.newTestedSourceCommit !== launch!.testedSourceCommit ||
+			linked.newTestedTree !== launch!.testedTree ||
+			linked.sourceRefTip !== linked.newTestedSourceCommit ||
+			linked.newSuccessfulCi?.workflow !== "workflow-regression.yml" ||
+			!/^[1-9][0-9]{0,17}$/.test(linked.newSuccessfulCi.runId) ||
+			linked.newSuccessfulCi.runAttempt !== 1 ||
+			linked.newSuccessfulCi.headCommit !== linked.newTestedSourceCommit ||
+			linked.newSuccessfulCi.conclusion !== "success" ||
+			linked.accounting !== "unquantified" || linked.effects !== "unknown-unreconciled" ||
+			workflowRepair && canonical(workflowRepair.successfulCi) !== canonical(linked.newSuccessfulCi))
+			fail("linked unknown delivery lacks a fresh authenticated source fence");
+		linkedUnknownDelivery = structuredClone(linked);
+	}
 	if (action.kind === "restore-evidence" || action.kind === "retry-evidence-read" &&
 		action.evidenceRefs?.length)
 		return { kind: "restore-evidence", evidenceRefs: action.evidenceRefs ?? [] };
@@ -489,7 +550,8 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 		...(terminalInterruption ? { terminalInterruption } : {}),
 		...(interruptedSourceReview ? { interruptedSourceReview } : {}),
 		...(actionProvenance ? { actionProvenance } : {}),
-		...(workflowRepair ? { workflowRepair } : {}) }));
+		...(workflowRepair ? { workflowRepair } : {}),
+		...(linkedUnknownDelivery ? { linkedUnknownDelivery } : {}) }));
 	if (dispatchRecord.state !== "not-requested") {
 		if (dispatchRecord.idempotencyKey !== idempotencyKey)
 			fail("dispatch record belongs to a different pending action");
@@ -509,6 +571,7 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 		...(interruptedSourceReview ? { interruptedSourceReview } : {}),
 		...(actionProvenance ? { actionProvenance } : {}),
 		...(workflowRepair ? { workflowRepair } : {}),
+		...(linkedUnknownDelivery ? { linkedUnknownDelivery } : {}),
 		boundary: "new-isolated-workspace-no-prior-session-resume",
 		quarantinedOperationRefs: [...quarantinedOperationRefs],
 		m04TransactionQuarantined: action.kind === "reconcile-m04-transaction" ||

@@ -21,7 +21,9 @@ import { HarnessError } from "../src/types.ts";
 type Args = { source: string; seed: string; publicKey: string;
 	journalDir: string; outputPrivate: string; readOnly: boolean; recoverReserved: boolean;
 	repairPlanPrivate?: string;
-	interruptedSourceReviewPrivate?: string; resultOnlyRepairReviewPrivate?: string };
+	interruptedSourceReviewPrivate?: string; resultOnlyRepairReviewPrivate?: string;
+	linkedUnknownDeliveryOldControlCommit?: string;
+	unobservedControlSourceReviewPrivate?: string };
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 class PrivateBridgeError extends Error {
 	readonly reasonCode: string;
@@ -112,9 +114,12 @@ function parseArgs(values: string[]): Args {
 	}
 	const keys = ["--source", "--seed", "--public-key", "--journal-dir", "--output-private"];
 	const allowed = [...keys, "--repair-plan-private", "--interrupted-source-review-private",
-		"--result-only-repair-review-private"];
+		"--result-only-repair-review-private", "--linked-unknown-control-commit",
+		"--unobserved-control-source-review-private"];
 	if (!connectorStdio || readOnly && recoverReserved || keys.some(key => !option.has(key)) ||
-		[...option.keys()].some(key => !allowed.includes(key)))
+		[...option.keys()].some(key => !allowed.includes(key)) ||
+		option.has("--linked-unknown-control-commit") !==
+			option.has("--unobserved-control-source-review-private"))
 		throw new Error("missing private resume arguments");
 	const result = { source: option.get("--source")!, seed: option.get("--seed")!,
 		publicKey: option.get("--public-key")!, journalDir: option.get("--journal-dir")!,
@@ -123,13 +128,23 @@ function parseArgs(values: string[]): Args {
 		...(option.has("--interrupted-source-review-private") ?
 			{ interruptedSourceReviewPrivate: option.get("--interrupted-source-review-private")! } : {}),
 		...(option.has("--result-only-repair-review-private") ?
-			{ resultOnlyRepairReviewPrivate: option.get("--result-only-repair-review-private")! } : {}) };
-	if (Object.entries(result).some(([key, value]) => key !== "readOnly" && key !== "recoverReserved" &&
+			{ resultOnlyRepairReviewPrivate: option.get("--result-only-repair-review-private")! } : {}),
+		...(option.has("--linked-unknown-control-commit") ?
+			{ linkedUnknownDeliveryOldControlCommit: option.get("--linked-unknown-control-commit")! } : {}),
+		...(option.has("--unobserved-control-source-review-private") ?
+			{ unobservedControlSourceReviewPrivate: option.get("--unobserved-control-source-review-private")! } : {}) };
+	if (result.linkedUnknownDeliveryOldControlCommit !== undefined &&
+		!/^[0-9a-f]{40}$/.test(result.linkedUnknownDeliveryOldControlCommit))
+		throw new Error("linked control commit is invalid");
+	if (Object.entries(result).some(([key, value]) => !["readOnly", "recoverReserved",
+		"linkedUnknownDeliveryOldControlCommit"].includes(key) &&
 		!path.isAbsolute(String(value)))) throw new Error("private resume paths must be absolute");
 	if (underRepo(result.journalDir) || underRepo(result.outputPrivate) ||
 		(result.repairPlanPrivate !== undefined && underRepo(result.repairPlanPrivate)) ||
 		(result.interruptedSourceReviewPrivate !== undefined && underRepo(result.interruptedSourceReviewPrivate)) ||
-		(result.resultOnlyRepairReviewPrivate !== undefined && underRepo(result.resultOnlyRepairReviewPrivate)))
+		(result.resultOnlyRepairReviewPrivate !== undefined && underRepo(result.resultOnlyRepairReviewPrivate)) ||
+		(result.unobservedControlSourceReviewPrivate !== undefined &&
+			underRepo(result.unobservedControlSourceReviewPrivate)))
 		throw new Error("private resume records must be outside the source repository");
 	return result;
 }
@@ -328,6 +343,10 @@ export async function runPrivateResumeBridge(values: string[],
 					{ interruptedSourceReviewPrivateFile: args.interruptedSourceReviewPrivate } : {}),
 				...(args.resultOnlyRepairReviewPrivate ?
 					{ resultOnlyRepairReviewPrivateFile: args.resultOnlyRepairReviewPrivate } : {}),
+				...(args.linkedUnknownDeliveryOldControlCommit ?
+					{ linkedUnknownDeliveryOldControlCommit: args.linkedUnknownDeliveryOldControlCommit } : {}),
+				...(args.unobservedControlSourceReviewPrivate ?
+					{ unobservedControlSourceReviewPrivateFile: args.unobservedControlSourceReviewPrivate } : {}),
 				journal: new MissionResumeJournal(args.journalDir), readOnly: args.readOnly,
 				...(args.recoverReserved ? { recoverReservedDescriptor: true } : {}) });
 		} finally { bridge.close(); }
