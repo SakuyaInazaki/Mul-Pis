@@ -12,12 +12,12 @@ import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { linkedEvidence, openBoundedSession } from "../context/boundary.ts";
 import type { ReadReturnEvent } from "../runner/types.ts";
-import type { ProposalOp } from "../knowledge/types.ts";
+import type { ProposalOp, ProposalReceipt, ValidationIssue } from "../knowledge/types.ts";
 import { retrieveKnowledge } from "../knowledge/retrieval.ts";
 import { buildM04Message, extractKnowledgeProposals, systemPromptFor } from "../prompts.ts";
 import type { ProblemMaterials } from "../prompts.ts";
 import { HarnessError, type InputRef, type StageRunRecord } from "../types.ts";
-import { readTextIfExists } from "../workspace.ts";
+import { readTextIfExists, writeFileAtomic } from "../workspace.ts";
 import { loadProblemMaterials, readOutput, relPath, requireCompletedRun, sessionSpec, withRun, type StageContext } from "./context.ts";
 import { specFileFor } from "./m03.ts";
 import { readFrozenArtifactManifest, type FrozenArtifactManifest } from "./artifacts.ts";
@@ -40,6 +40,8 @@ export interface M04Options {
 	purpose?: string;
 	/** Optional exact frozen M07 files that must be returned in full before any M04 merge. */
 	requiredM07ReadPaths?: string[];
+	/** Host-authored provenance instruction; it cannot authorize a historical proposal. */
+	additionalReadOnlyInstruction?: string;
 }
 
 export interface M04Result {
@@ -48,6 +50,22 @@ export interface M04Result {
 	proposalId?: string;
 	snapshotId?: string;
 	mode: "continue-m01" | "research-session";
+	/** Exact submitted draft identities, including rejected structural drafts. */
+	proposalAttempts: M04KnowledgeTransactionV1["attempts"];
+}
+
+export interface M04KnowledgeTransactionV1 {
+	version: 1;
+	kind: "m04-knowledge-transaction";
+	m04RunId: string;
+	state: "no-proposal" | "rejected-draft" | "merge-intent" | "merged" | "unknown";
+	currentProposalId?: string;
+	/** Present only after the serial merge returned a published snapshot. */
+	snapshotId?: string;
+	attempts: Array<{ ordinal: number; proposalId: string; proposalFile: string;
+		receiptFile: string; structurallyValid: boolean; issues: ValidationIssue[];
+		state: "drafted" | "rejected-draft" | "merge-intent" | "merged" }>;
+	updatedAt: string;
 }
 
 interface ResolvedFeedback {
@@ -120,6 +138,19 @@ async function m07ReadGaps(root: string, required: string[], returned: ReadRetur
 async function assertFullM07Reads(root: string, required: string[], returned: ReadReturnEvent[]): Promise<void> {
 	if ((await m07ReadGaps(root, required, returned)).length)
 		throw new HarnessError("m04.m07-evidence", "required selected M07 evidence was not returned to the research session in full");
+}
+
+/** The private receipt retains every issue verbatim; only safe bounded guidance
+ * enters the next model prompt. Unknown user-chosen field names may be secrets. */
+function structuralIssueFeedback(issues: ValidationIssue[]): string {
+	const errors = issues.filter(item => item.level === "error");
+	const lines = errors.map(item => {
+		const raw = item.message;
+		const safe = !/(?:authorization|bearer|password|passwd|secret|credential|api[_-]?key|access[_-]?token|sk-[A-Za-z0-9_-]{6,})/i.test(raw)
+			? raw : "Issue detail is retained in the private validation receipt; revise the cited operation conservatively.";
+		return `- ${item.opIndex === undefined ? "batch" : `operation ${item.opIndex + 1}`}: ${safe}`;
+	});
+	return lines.join("\n") || "- Structural validation rejected the draft; exact issues are retained in the private receipt.";
 }
 
 async function resolveM07Checkpoint(ctx: StageContext, runId: string, checkpointId: string): Promise<ResolvedFeedback> {
@@ -325,7 +356,9 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			const m07EvidenceInstruction = feedback.m07 ? `\n\n【M07 证据按需读取契约】\n上方反馈包中的材料清单是索引，不代表你已读取未内联的证据。需要依赖某项材料时，使用 m07_evidence_read 按清单中的相对路径读取；大文件按 offset/limit 继续读取。工具记录文件访问，但当前覆盖记录只能证明访问过该文件，不能证明读取了全文；除非实际分段读至文件末尾，否则必须把未读范围列为限制。不得把路径存在、清单摘要或一次局部读取写成“已完整核验”。${feedback.m07.checkpointId ? `\n本 checkpoint 仅冻结选定任务的评审证据；选定任务 ${feedback.m07.selectedTaskIds?.length ?? 0} 项、省略任务 ${feedback.m07.omittedTaskIds?.length ?? 0} 项。完整 ID 列表见 checkpoint manifest.json 及 M04 来源记录；省略任务仅保留控制状态，不得把其未提供的证据当作已交接或可读取。` : ""}${feedback.m07.skippedRaw?.length ? `\ncheckpoint 未复制的非文本原始信息：${feedback.m07.skippedRaw.join("、")}；须作为材料缺口，不得推断已核对。` : ""}` : "";
 			const m07ExperienceInstruction = feedback.m07 ? `\n\n【M07 候选经验处理】\n如果反馈证据中有 lesson-delta.json，它只是待判断的候选；先用 m07_evidence_read 实际读取相关版本与验证证据，再决定是否提出知识操作。没有充分证据、不可推广或 action=none 时，可不提出任何知识提案；不要为让运行“成功”而强行创建记录。若确有可复用的执行方法经验并决定提出 create/revise，fields.experience 必须使用结构 {"version":1,"targetKind":"executor","applicableStages":["M07"],"requiredTags":[],"excludedTags":[],"requiredRefs":[]}，按真实适用条件填写 tags 和已存在的必要 pinned refs，不得编造依赖。usageDecision=adopted 需要写明本轮独立证据、适用边界和保留限制；仅有 builder 自述或 reviewer ready 不足以采用。candidate 或不提案都是有效结果。即使入库，后续 M07 也必须显式 pinned 引用、通过适用性和生效限制检查；装载不等于忠实使用或收益。` : "";
 			const requiredM07Instruction = requiredM07Paths.length ? `\n\n【本轮指定 M07 证据完整读取】\n在判断采用、候选或无提案之前，请用 m07_evidence_read 按以下精确相对路径读取每个文件的全文；大文件须分段读至末尾。只看索引、摘要或文件名不足以满足此要求。完整读取后可以选择不提案，不得为满足流程强行采用。\n${requiredM07Paths.map((item) => `- ${item}`).join("\n")}` : "";
-			const finalMessage = message + m08DispositionInstruction + m07EvidenceInstruction + m07ExperienceInstruction + requiredM07Instruction;
+			const finalMessage = message + m08DispositionInstruction + m07EvidenceInstruction +
+				m07ExperienceInstruction + requiredM07Instruction +
+				(options.additionalReadOnlyInstruction ? `\n\n${options.additionalReadOnlyInstruction}` : "");
 			await ctx.ws.writeOutput(record, "message.md", finalMessage, "发送给研究会话的完整消息");
 			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-message.md", finalMessage, "发送给 M04 的固定 M08 消息");
 			const m08RenderedPages: string[] = [];
@@ -338,12 +371,63 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			const handle = mode === "continue-m01" && m01Session?.file
 				? await openBoundedSession(ctx.runner, record, { mode: "continue", intent: "causal-continuation", reason: "First M04 processing may retain M01 causal reasoning when its original tool boundary is sufficient", evidence: linkedEvidence(record.inputs), parent: { label: "M01", role: "execution", id: m01Session.id, model: m01Session.model, file: m01Session.file, specFile: specFileFor(m01Session.file) }, expectedToolGrantKind: "none" }, () => ctx.ws.writeRun(record))
 				: await openBoundedSession(ctx.runner, record, { mode: "fresh", intent: "independent-judgment", reason: feedback.m07 || feedback.m08 ? "M04 independently judges frozen feedback and actually reads needed evidence without inheriting executor or reviewer history" : "Later M04 reasoning starts from current selected knowledge and explicit feedback rather than unbounded prior dialogue", evidence: linkedEvidence(record.inputs), spec: sessionSpec(ctx, "M04-research", "research", systemPromptFor("research"), feedbackTools) }, () => ctx.ws.writeRun(record));
+			const transactionPath = path.join(ctx.ws.runDir("M04", record.runId), "m04-transaction.json");
+			// The read-only judgement may fail before any proposal reaches the store.
+			const transaction: M04KnowledgeTransactionV1 = { version: 1,
+				kind: "m04-knowledge-transaction", m04RunId: record.runId,
+				state: "no-proposal", attempts: [], updatedAt: new Date().toISOString() };
+			record.outputs.push({ label: "M04 知识事务状态", path: transactionPath });
+			const persistTransaction = async (): Promise<void> => {
+				transaction.updatedAt = new Date().toISOString();
+				const contents = `${JSON.stringify(transaction, null, 2)}\n`;
+				if (Buffer.byteLength(contents, "utf8") > 1_000_000)
+					throw new HarnessError("m04.transaction", "M04 private transaction control file exceeds its physical byte boundary; merge not attempted");
+				await writeFileAtomic(transactionPath, contents);
+				await ctx.ws.writeRun(record);
+			};
+			await persistTransaction();
+			const submitDraft = async (ops: unknown[]): Promise<ProposalReceipt> => {
+				// Unknown is durable before the single store entry: a crashed submit
+				// cannot masquerade as a known no-proposal outcome.
+				transaction.state = "unknown";
+				delete transaction.currentProposalId;
+				await persistTransaction();
+				const receipt = await ctx.store.submitProposal({ stage: "M04", runId: record.runId,
+					session: handle.ref.label, baseSnapshot: snapshot?.id,
+					ops: ops as ProposalOp[], summary: feedback.label });
+				const proposalFile = path.relative(ctx.ws.root, receipt.file).replaceAll("\\", "/");
+				if (proposalFile.startsWith("../") || path.isAbsolute(proposalFile) ||
+					!(await lstat(receipt.file)).isFile())
+					throw new HarnessError("m04.transaction", "submitted proposal file is outside the private workspace");
+				const ordinal = transaction.attempts.length + 1;
+				const receiptFile = `proposal-validation-${String(ordinal).padStart(4, "0")}.json`;
+				const receiptPath = path.join(ctx.ws.runDir("M04", record.runId), receiptFile);
+				const validation = `${JSON.stringify({ version: 1, kind: "m04-proposal-validation",
+					m04RunId: record.runId, proposalId: receipt.proposalId, proposalFile,
+					structurallyValid: receipt.structurallyValid, issues: receipt.issues }, null, 2)}\n`;
+				if (Buffer.byteLength(validation, "utf8") > 1_000_000)
+					throw new HarnessError("m04.transaction", "M04 private proposal receipt exceeds its physical byte boundary; merge not attempted");
+				await writeFileAtomic(receiptPath, validation);
+			record.outputs.push({ label: `知识提案草案 ${ordinal}`, path: receipt.file },
+				{ label: `知识提案结构校验回执 ${ordinal}`, path: receiptPath });
+			transaction.currentProposalId = receipt.proposalId;
+			transaction.state = "unknown";
+			transaction.attempts.push({ ordinal, proposalId: receipt.proposalId, proposalFile,
+				receiptFile, structurallyValid: receipt.structurallyValid,
+				issues: receipt.issues, state: "drafted" });
+			await persistTransaction();
+			transaction.state = receipt.structurallyValid ? "merge-intent" : "rejected-draft";
+			transaction.attempts.at(-1)!.state = transaction.state;
+			await persistTransaction();
+			return receipt;
+			};
 			let output: string;
 			let m08ReadCoverage: string[] = [];
 			let m08ToolLog: ReturnType<typeof handle.toolLog> = [];
 			let m07ReturnedRanges: ReturnType<NonNullable<typeof handle.readReturnEvents>> = [];
 			let promptSucceeded = false;
 			let extracted: ReturnType<typeof extractKnowledgeProposals> | undefined;
+			let acceptedReceipt: ProposalReceipt | undefined;
 			try {
 				if (feedback.m07) await markFeedbackAssembled(ctx.ws, feedback.m07.runId, feedback.inputs[0].path, record.runId);
 				let request = finalMessage;
@@ -376,6 +460,17 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 							"This is a format repair in the same session over the same frozen evidence. Return a complete revised M04 judgment. If evidence supports a knowledge operation, include exactly one knowledge-proposals fenced block containing a valid JSON array. If it does not, omit that block. Do not treat your earlier malformed block or a file path as an accepted proposal, and do not invent scientific support."].join("\n\n");
 						continue;
 					}
+					if (!feedback.m08 && parsed.ops) {
+						const receipt = await submitDraft(parsed.ops);
+						if (!receipt.structurallyValid) {
+							record.remarks.push(`知识提案草案 ${receipt.proposalId} 结构无效；确切问题已保留在私有校验回执；未尝试合入。`);
+							request = ["The host submitted your explicit knowledge-proposals array as a private draft and rejected it on structural validation. No merge or knowledge adoption was attempted.",
+								`Private draft ID: ${receipt.proposalId}. Structural issues (bounded, sensitive values withheld):\n${structuralIssueFeedback(receipt.issues)}`,
+								"Continue in this same session over the same frozen evidence. Return a complete revised M04 judgment and a corrected knowledge-proposals JSON array only if the evidence still supports it; otherwise omit the block. The rejected draft remains historical evidence, not an adopted record. Do not claim it was merged or repeat it unchanged."].join("\n\n");
+							continue;
+						}
+						acceptedReceipt = receipt;
+					}
 					extracted = parsed;
 					output = turn.text;
 					break;
@@ -393,7 +488,7 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			if (feedback.m07 && requiredM07Paths.length)
 				await assertFullM07Reads(feedback.m07.rootDir, requiredM07Paths, m07ReturnedRanges);
 
-			const result: M04Result = { record, output, mode };
+			const result: M04Result = { record, output, mode, proposalAttempts: [] };
 			if (feedback.m08) {
 				const disposition = await requireDispositionEvidence(parseM08Disposition(output, feedback.m08), feedback.m08.manifest, m08ReadCoverage, m08RenderedPages);
 				await ctx.ws.writeOutput(record, "m08-disposition.json", JSON.stringify(disposition, null, 2), "M08 用途处置");
@@ -401,12 +496,18 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			}
 			if (extracted!.error) {
 				record.failures.push(`知识提案未入库：${extracted!.error}`);
+				transaction.state = "no-proposal";
+				await persistTransaction();
 			} else if (extracted!.ops) {
-				const receipt = await ctx.store.submitProposal({ stage: "M04", runId: record.runId, session: handle.ref.label, baseSnapshot: snapshot?.id, ops: extracted!.ops as ProposalOp[], summary: feedback.label });
-				result.proposalId = receipt.proposalId;
-				record.outputs.push({ label: "知识提案", path: receipt.file });
+				const receipt = acceptedReceipt ?? await submitDraft(extracted!.ops);
 				if (receipt.structurallyValid) {
+					// The durable intent is already written. A merge exception leaves
+					// it unresolved for host reconciliation; never retry implicitly.
 					const merged = await ctx.store.merge(receipt.proposalId);
+					transaction.state = "merged";
+					transaction.snapshotId = merged.snapshot.id;
+					transaction.attempts.at(-1)!.state = "merged";
+					await persistTransaction();
 					result.snapshotId = merged.snapshot.id;
 					await ctx.ws.writeOutput(record, "merge.json", JSON.stringify(merged, null, 2), "合入结果");
 					record.remarks.push(`已经串行合入，快照 ${merged.snapshot.id}；受影响待复核 ${merged.impacts.length} 项；先行生效的限制 ${merged.limitsWrittenFirst.length} 项。合入不是科学认证。`);
@@ -415,8 +516,16 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 					record.failures.push(`知识提案未合入：结构校验未通过：${receipt.issues.filter((i) => i.level === "error").map((i) => i.message).join("；")}`);
 				}
 			} else {
-				record.remarks.push("本轮没有知识提案；处理结果只以文本保存（没有知识变化也可完成）。");
+				if (!transaction.attempts.length) {
+					transaction.state = "no-proposal";
+					await persistTransaction();
+				}
+				record.remarks.push(transaction.attempts.length ?
+					"本轮最终没有可合入的知识提案；结构无效草案与校验回执已保留，未尝试合入。" :
+					"本轮没有知识提案；处理结果只以文本保存（没有知识变化也可完成）。");
 			}
+			result.proposalId = transaction.currentProposalId;
+			result.proposalAttempts = transaction.attempts.map(item => ({ ...item, issues: item.issues.map(issue => ({ ...issue })) }));
 			return result;
 		},
 		() =>

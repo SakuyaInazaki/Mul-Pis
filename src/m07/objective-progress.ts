@@ -56,10 +56,11 @@ export interface ModelObjectiveAssessmentV1 {
 
 export type ObjectiveStopReason = "budget-boundary" | "provider-call-limit" | "accounting-integrity-error" |
 	"time-boundary" | "cancelled" | "output-limit" | "assessment-failed" |
-	"assessment-invalid" | "assessment-evidence-unread" | "model-reported-blocked" | "model-closure-unverified" |
+	"assessment-invalid" | "assessment-evidence-unread" | "assessment-evidence-suspended" | "model-reported-blocked" | "model-closure-unverified" |
 	"original-checks-unverified" | "assessment-validation-pending" | "next-task-pending" | "next-task-needs-capability" |
 	"objective-reassessment-pending" | "dispatch-failed" | "no-progress" | "capability-replan-stalled" |
-	"artifact-capacity-boundary" | "m04-evidence-incomplete" | "bounded-run-incomplete";
+	"artifact-capacity-boundary" | "m04-evidence-incomplete" | "m04-draft-rejected" |
+	"m04-transaction-unresolved" | "bounded-run-incomplete";
 
 export interface ObjectiveProgressV1 {
 	version: 1;
@@ -183,7 +184,7 @@ export function objectiveProgress(contract: OriginalObjectiveContractV1, input: 
 		input.assessment.evidenceRefs.every(ref => input.selectedArtifacts.includes(ref));
 	const unresolved = fulfilled ? [] : input.assessment?.unresolvedObligations.length ? input.assessment.unresolvedObligations : required;
 	return { version: 1, kind: "original-objective-progress", contract, objectiveOutcome: fulfilled ? "fulfilled" : "incomplete",
-		stopReason: fulfilled ? null : input.assessment?.decision === "fulfilled" ?
+		stopReason: fulfilled ? null : input.stopReason === "assessment-evidence-suspended" ? input.stopReason : input.assessment?.decision === "fulfilled" ?
 			contract.closure === "open-ended" ? "model-closure-unverified" : "original-checks-unverified" : input.stopReason,
 		...(input.assessment ? { assessment: input.assessment } : {}), boundedRuns: input.boundedRuns,
 		assessmentHistory: input.assessmentHistory ? input.assessmentHistory.map(item => ({ ...item })) : [],
@@ -292,7 +293,19 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			"# Frozen bounded evidence", "Use objective_evidence_read to read the complete original-objective.json and every listed file. If a file is paginated, read every page including the untruncated end. The file names are:",
 			...materials.map(item => item.name),
 			"Return only strict JSON with version 1, decision (fulfilled, continue, or blocked), rationale, evidenceRefs (file names above), unresolvedObligations (IDs above), unresolvedDetails (your concrete open requirements from the full original assignment), and when continuing nextTask {objective, addresses, adapterScope}. Use a scope only when its observed host capability covers your proposed work. If a proposed task has no available registered executor, retain it as unresolved and name the unavailable capability explicitly. The host may ask you to replan feasible work; preserve unresolved requirements. Assess honestly. Propose the next scientific work yourself from unresolved original obligations; do not change task permissions or claim a global optimum from a finite evaluation."].join("\n\n");
-		const coverage = (name: string, lines: number): { complete: boolean; score: number } => {
+		const frozenFileAccessible = async (name: string): Promise<boolean> => {
+			try {
+				const file = path.join(input.evidenceRoot, name);
+				const info = await lstat(file);
+				if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_EVIDENCE_BYTES) return false;
+				const bytes = await readFile(file);
+				if (name === "original-objective.json") return bytes.equals(contractBytes);
+				const expected = materials.find(item => item.name === name)?.digest;
+				return bytes.length <= MAX_EVIDENCE_BYTES && expected !== undefined &&
+					createHash("sha256").update(bytes).digest("hex") === expected;
+			} catch { return false; }
+		};
+		const coverage = (name: string, lines: number): { complete: boolean; score: number; nextRange: string } => {
 			const returned = handle.readReturnEvents();
 			const rows = returned.filter(item => item.toolName === "objective_evidence_read" && item.path === name &&
 				item.status === "returned" && item.returned.kind === "text" && item.returned.startLine !== undefined &&
@@ -301,8 +314,15 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			const covered = new Set<number>();
 			for (const row of rows) for (let line = row.returned.startLine!; line <= row.returned.endLine! && line <= lines; line++) covered.add(line);
 			const reachedUntruncatedEnd = rows.some(item => item.returned.endLine === lines && item.returned.truncated === false);
+			let start = 1;
+			while (start <= lines && covered.has(start)) start++;
+			let end = start;
+			while (end < lines && !covered.has(end + 1)) end++;
+			const offset = start <= lines ? start : Math.max(1, lines);
+			const limit = start <= lines ? end - start + 1 : 1;
 			return { complete: reachedUntruncatedEnd && covered.size === lines,
-				score: covered.size + Number(reachedUntruncatedEnd) };
+				score: covered.size + Number(reachedUntruncatedEnd),
+				nextRange: `${name}: objective_evidence_read path="${name}" offset=${offset} limit=${limit}${start > lines ? " (request the untruncated final page)" : ""}` };
 		};
 		const contractText = contractBytes.toString("utf8");
 		const readMaterials = [{ name: "original-objective.json", lineCount: contractText.split("\n").length - (contractText.endsWith("\n") ? 1 : 0) }, ...materials];
@@ -350,15 +370,22 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				// A provisional verdict cannot authorize work until every frozen file is fully read.
 				// An unchanged response is not a mission stop: keep prompting this same
 				// assessor until read proof arrives or a real host/tool boundary occurs.
-				if (newReadEvents.some(item => item.toolName === "objective_evidence_read" &&
-					item.status === "error" && unreadEvidence.includes(item.path)))
-					return { assessment: latestAssessment, stopReason: "assessment-evidence-unread" };
+				const failedReads = newReadEvents.filter(item => item.toolName === "objective_evidence_read" &&
+					item.status === "error");
+				// Pi records an unresolved path when confinement or file access fails
+				// before the read callback captures its name. Check the frozen unread
+				// files themselves rather than trusting an error event's path.
+				if (failedReads.length) for (const name of unreadEvidence)
+					if (!(await frozenFileAccessible(name)))
+						return { assessment: latestAssessment, stopReason: "assessment-evidence-suspended" };
 				const noReadProgress = priorUnreadScore !== undefined && unreadScore <= priorUnreadScore;
 				priorUnreadScore = unreadScore;
 				const admission = input.advanceAdmission();
 				if (admission !== "admitted") return { assessment: latestAssessment, stopReason: admission };
 				request = ["Your previous assessment is provisional because required frozen evidence was not completely returned by objective_evidence_read.",
 					`Unread or incomplete files: ${unreadEvidence.join(", ")}.`,
+					...fileCoverage.filter(item => !item.complete).map(item => item.nextRange),
+					...(failedReads.length ? ["A read tool error occurred for a named file, but the host verified that frozen file is still available. Correct the path and requested range in this same session."] : []),
 					...(!parsed ? [`Your last response also failed the required strict JSON schema: ${invalidReason}. Repair its format after inspecting the missing evidence.`] : []),
 					...(noReadProgress ? ["The last repair turn added no verified read coverage. Replan how to use objective_evidence_read rather than repeating the same unsupported verdict."] : []),
 					"In this same session, read every missing range of each named file, including an untruncated final page. Then reassess the unchanged original objective and return a new strict JSON assessment. Do not repeat the prior verdict without inspecting the missing evidence; no task may be dispatched or goal closed from an incomplete read."].join("\n\n");
@@ -378,14 +405,17 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			}
 			if (parsed.decision === "blocked") {
 				const available = input.capabilities?.filter(item => item.available && input.supportedTaskScopes.includes(item.scope)) ?? [];
-				if (challengedBlocked || !available.length) return { assessment, stopReason: "model-reported-blocked" };
+				if (!available.length) return { assessment, stopReason: "model-reported-blocked" };
 				const admission = input.advanceAdmission();
 				if (admission !== "admitted") return { assessment, stopReason: admission };
-				challengedBlocked = true;
-				request = ["Before making this blocked result terminal, reassess every remaining requirement against the available capabilities.",
-					"Unavailable optional equipment alone does not establish that all feasible work is exhausted. Choose another feasible pending part if one exists; otherwise retain the unresolved work and explain which limit blocks each part.",
+				request = [challengedBlocked ? "Your blocked verdict remains provisional while verified execution capabilities are available. Reassess the unchanged objective and choose a feasible next task." :
+					"Reassess every remaining requirement against the available capabilities before treating the original objective as blocked.",
+					`Unresolved obligations: ${parsed.unresolvedObligations.map(id => `${id}: ${input.contract.obligations.find(item => item.id === id)!.description}`).join("; ")}`,
+					...parsed.unresolvedDetails.map(detail => `Open issue: ${detail}`),
+					"Unavailable optional equipment alone does not establish that all feasible work is exhausted. Choose a feasible pending part and return it as nextTask. Keep any genuinely unavailable work unresolved.",
 					...available.map(item => `${item.scope}: ${item.description}; limits: ${item.limits.join("; ")}`),
 					"Preserve user overrides and return the same strict JSON schema."].join("\n\n");
+				challengedBlocked = true;
 				continue;
 			}
 			if (parsed.decision === "fulfilled") return { assessment, stopReason: "model-closure-unverified" };

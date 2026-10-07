@@ -1,0 +1,5 @@
+# Generic unresolved historical M04 quarantine
+
+An authenticated continuation may contain a failed M04 archive without a portable transaction receipt. The control record now retains that historical outcome as unknown and permits only a fresh independent route after the host checks the selected tuple, empty current store and workspace, safe current tools, complete provider/session census, and unchanged unresolved operations. It does not establish that the older draft was rejected without a merge, import its candidate or knowledge, clear fees, or authorize replay.
+
+The private continuation carries an append-only typed quarantine record. Normal and emergency seals preserve its exact prefix; emergency sealing retains pending effect review. Tests cover both proposal flags, missing and altered control evidence, unreceived transport, unsafe tool/store descriptors, branded-only import bypass, repeated no-goal successors, and encrypted carry persistence. No historical source or request identifier is accepted by a new exception.

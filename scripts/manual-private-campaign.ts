@@ -19,7 +19,7 @@ import { runMeasuredEvidenceHandoff } from "../src/m07/evidence-finalization.ts"
 import { assessAndAdvanceOriginalObjective, createOriginalObjective, objectiveProgress, runOriginalObjectiveLoop,
 	writeObjectiveProgress, writeOriginalObjectiveContract } from "../src/m07/objective-progress.ts";
 import type { ObjectiveProgressV1, ObjectiveStopReason, OriginalObjectiveContractV1 } from "../src/m07/objective-progress.ts";
-import type { CurrentGoal, M07TaskRecord, TaskSpecInput } from "../src/m07/types.ts";
+import type { BeginGoalInput, CurrentGoal, M07TaskRecord, TaskSpecInput } from "../src/m07/types.ts";
 import { runM04 } from "../src/stages/m04.ts";
 import { createPiSessionRunner } from "../src/runner/pi.ts";
 import type { SessionCheckpoint, SessionHandle, SessionRunner, SessionSpec,
@@ -30,21 +30,27 @@ import { verifyDeepSeekProviderOutputLimit,
 	type DeepSeekProviderOutputLimit } from "../src/runner/deepseek-provider-limits.ts";
 import { MISSION_ID, MISSION_REPOSITORY, PRIVATE_CONTINUATION_FILE_KEYS } from
 	"../src/runner/signed-mission-ledger.ts";
-import { CARRY_FILE_NAME, authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence,
-	authenticatedLegacyV3RunReview,
+import { CARRY_FILE_NAME, authenticatedHistoricalCarryOrigin,
+	authenticatedPendingHistoricalEffectSources,
 	authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, downloadCarryArtifact,
-	isAuthenticatedPriorCarryProof, openLedgerContinuation, reviewKnownOpaqueGapSource,
-	type PrivateContinuationBundle, type HostEffectReceiptV1 } from "../src/runner/ledger-continuation.ts";
+	isAuthenticatedPriorCarryProof, openLedgerContinuation,
+	type PrivateContinuationBundle, type HostEffectReceiptV1,
+	type OpaqueExecutedRunGap } from "../src/runner/ledger-continuation.ts";
 import { reviewPrivateCampaignRestartEffects } from "../src/runner/private-campaign-restart-policy.ts";
 import { sealCampaignCarry } from "../src/runner/emergency-carry.ts";
 import { bindIndependentRestartGoal, canonicalRestartUnknowns, reserveIndependentRestart,
 	type AuthenticatedRestartCarryFacts, type IndependentRestartReservation,
-	type ReviewedRestartEffectPolicy, type BoundIndependentRestartGoal } from "../src/m07/independent-restart.ts";
+	type BoundIndependentRestartGoal } from "../src/m07/independent-restart.ts";
 import { createConfinedCampaignFileTools } from "../src/runner/confined-campaign-files.ts";
 import { acceptedArchivedOperationCensus, historicalM04EvidenceIndex, stageArchivedM07Import,
 	validateArchivedM07Import } from "../src/runner/archived-m07-import.ts";
+import { buildUnresolvedHistoricalM04Quarantine, hasFreshOnlyM04QuarantineForLatest,
+	validateM04TransactionQuarantine, M04_TRANSACTION_QUARANTINE_FILE,
+	type M04TransactionQuarantineV1, type FreshM04QuarantineBoundary } from "../src/runner/m04-quarantine.ts";
 import { startPrivateCampaignHeartbeat } from "./private-campaign-heartbeat.ts";
 import { archivePrivateM07Task, recordPrivateM04Outcome } from "../src/workflow-archive/m07-private.ts";
+import { exportPortableM04Transaction } from "../src/workflow-archive/m04-transaction.ts";
+import type { PortableM04KnowledgeTransactionV1 } from "../src/workflow-archive/m04-transaction.ts";
 import { buildCsrChecker as buildLegacyCsrChecker } from "../src/workflow-archive/csr-checker-legacy.ts";
 import { buildCsrChecker, inspectCsrTaskContract, validateCsrCandidateSource, validateCsrTargetBodies, CSR_EXPERIMENT_LIMITS, type CsrExperimentPlan } from "../src/workflow-archive/csr-checker.ts";
 import { createExperienceProvider } from "../src/knowledge/experience-index.ts";
@@ -52,14 +58,6 @@ import type { KnowledgeRef, KnowledgeStore } from "../src/knowledge/types.ts";
 import { HarnessError, type StageRunRecord } from "../src/types.ts";
 
 const MODEL = "deepseek/deepseek-flash:low";
-// Legacy compatibility only: review of this one immutable historical adapter.
-// Later source revisions require their own host effect review and must fail closed.
-const LEGACY_RESTART_POLICY = Object.freeze({ version: 1,
-	policyId: "mul-pis-legacy-confined-private-campaign-v1",
-	sourceCommit: "2fe7f132370b4598c942625fad1a7e9129978eaa",
-	reviewedBoundary: "Pi execution sessions received only confined text-file read/write/edit tools; built-in shell and network tools were not granted. The host verifier ran in a non-root bubblewrap user, network, PID and IPC namespace. Host output went only through the fixed encrypted Actions result archive. Provider billing remains unknown and held.",
-	effectClass: "confined-ephemeral-local", actorThirdPartyMutations: "none",
-	hostTransport: "immutable-versioned-archive" });
 const FLAGS = ["-O2", "-std=c++17", "-fopenmp", "-pthread"];
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CHECKS = [
@@ -72,7 +70,7 @@ const REGISTERED_CHECKS = [
 	"The original program checker and isolated independent full-row finite and mutation checks pass for every registered strategy and both original references",
 	"Host-owned isolated-worker roundtrip timings for model-authored cases and available threads use fair preserved references; startup, cold-call and steady-state costs are separate, and no kernel-only gain is inferred from IPC-inclusive observations",
 ];
-function archivedM07ImportTarget(bundle: PrivateContinuationBundle):
+function archivedM07ImportTarget(bundle: PrivateContinuationBundle, proof?: unknown):
 	{ goalRunId: string; taskId: string; checks: string[]; registered: boolean } | undefined {
 	let checkpoint: Record<string, any>, history: Record<string, any>;
 	try {
@@ -99,18 +97,33 @@ function archivedM07ImportTarget(bundle: PrivateContinuationBundle):
 	if (!acceptedArchivedOperationCensus(archive.controllerEvidence.operationOutcomes))
 		throw new HarnessError("campaign.m04-integrity",
 			"Accepted historical task lacks a complete settled operation census; reconcile control effects before continuing.");
-	if (archive.m04.proposalSubmitted === true || archive.m04.snapshotCreated === true)
+	if (archive.m04.snapshotCreated === true || archive.m04.proposalSubmitted === true && !proof)
 		throw new HarnessError("campaign.m04-reconciliation",
 			"Failed M04 may already have submitted or merged a proposal; reconcile its existing knowledge transaction before any retry or new optimizer.");
-	if (archive.m04.proposalSubmitted !== false || archive.m04.snapshotCreated !== false)
+	if (archive.m04.proposalSubmitted !== false && archive.m04.proposalSubmitted !== true ||
+		archive.m04.snapshotCreated !== false)
 		throw new HarnessError("campaign.m04-integrity",
 			"Failed M04 proposal and snapshot outcomes are missing or malformed; reconcile the archived transaction before continuing.");
 	const received = archive.controllerEvidence.reviewChecks?.map((item: Record<string, unknown>) => item.criterion);
 	const registered = JSON.stringify(received) === JSON.stringify(REGISTERED_CHECKS);
 	if (!registered && JSON.stringify(received) !== JSON.stringify(CHECKS))
 		fail("archived M07 import checks do not match a fixed host verifier");
+	if (archive.m04.proposalSubmitted === true) {
+		// A rejected, never-merged draft is recoverable only through the live
+		// authenticated source review or a host-sealed rejected transaction.
+		validateArchivedM07Import({ proof, bundle, contractId: checkpoint.contract.id,
+			goalRunId: latest.runId, taskId: latest.selectedTaskId,
+			expectedChecks: registered ? REGISTERED_CHECKS : CHECKS });
+	}
 	return { goalRunId: latest.runId, taskId: latest.selectedTaskId,
 		checks: registered ? REGISTERED_CHECKS : CHECKS, registered };
+}
+function chooseArchivedM07ImportTarget(bundle: PrivateContinuationBundle, proof: unknown,
+	quarantine: M04TransactionQuarantineV1 | undefined): ReturnType<typeof archivedM07ImportTarget> {
+	// An authenticated UNKNOWN transaction authorizes only a fresh task from
+	// the older selected tuple. It cannot authorize this historical import.
+	return hasFreshOnlyM04QuarantineForLatest(quarantine, bundle) ? undefined :
+		archivedM07ImportTarget(bundle, proof);
 }
 /** A quarantine reservation authorizes the first fresh M07 goal in this live
  * workspace. Later same-run goals inherit that execution boundary, not a new
@@ -201,31 +214,16 @@ function createPrivateCampaignBudget(nativeCnyPricing: NativeCnyPricingProfile |
 		estimatedOutputCnyPerMillionTokens: nativeCnyPricing?.rates.output ?? 0,
 		...(nativeCnyPricing ? { nativeCnyPricing } : {}) });
 }
-function reviewedLegacyRestartEffects(facts: AuthenticatedRestartCarryFacts,
-	operationRefs: readonly string[]): ReviewedRestartEffectPolicy {
-	if (facts.source.commit !== LEGACY_RESTART_POLICY.sourceCommit || !operationRefs.length ||
-		facts.unknownHeldNano < 1 || facts.resultArtifact.digestScope !== "github-artifact-archive")
-		fail("no reviewed legacy source/effect policy covers this independent restart");
-	const policySha256 = sha256(JSON.stringify(LEGACY_RESTART_POLICY));
-	return { sourceCommit: facts.source.commit, policyId: LEGACY_RESTART_POLICY.policyId,
-		policySha256, operationAttestations: operationRefs.map(operationRef => ({ operationRef,
-			sourceCommit: facts.source.commit,
-			evidenceSha256: sha256(JSON.stringify({ policySha256, operationRef,
-				resultArtifact: facts.resultArtifact })) })),
-		effectClass: "confined-ephemeral-local", unknownBillingHeld: true,
-		actorThirdPartyMutations: "none", hostTransport: "immutable-versioned-archive" };
-}
-function authenticatedLegacyCarryFacts(proof: unknown,
+function authenticatedHistoricalCarryFacts(proof: unknown,
 	bundle: PrivateContinuationBundle): AuthenticatedRestartCarryFacts | undefined {
-	const carriedOrigin = authenticatedCarryForwardOrigin(proof, bundle) ??
-		authenticatedHostEffectEvidence(proof, bundle)?.origin ??
-		authenticatedLegacyV3RunReview(proof, bundle)?.origin;
+	const carriedOrigin = authenticatedHistoricalCarryOrigin(proof, bundle);
 	if (!isAuthenticatedPriorCarryProof(proof) || !authenticatedPriorCarryBindsBundle(proof, bundle) ||
-		!proof.resultArtifact || proof.resultArtifact.digestScope !== "github-artifact-archive" ||
+		(proof.resultArtifact !== undefined && proof.resultArtifact.digestScope !== "github-artifact-archive") ||
 		(!carriedOrigin && (proof.priorCommittedCny === undefined ||
 			proof.priorUnknownHeldCny === undefined))) return undefined;
 	const artifact = proof.resultArtifact;
-	const immutableRef = `github-actions://${artifact.repository}/runs/${artifact.runId}/artifacts/${artifact.artifactId}/${artifact.artifactName}`;
+	const immutableRef = artifact ?
+		`github-actions://${artifact.repository}/runs/${artifact.runId}/artifacts/${artifact.artifactId}/${artifact.artifactName}` : undefined;
 	return { source: { runId: proof.source.runId, runAttempt: proof.source.runAttempt,
 		commit: proof.source.commit },
 		currentRun: { runId: proof.admittedCurrent.runId, runAttempt: proof.admittedCurrent.runAttempt,
@@ -236,10 +234,31 @@ function authenticatedLegacyCarryFacts(proof: unknown,
 			observationDigest: sha256(JSON.stringify({ source: proof.source,
 				terminal: proof.terminal, resultArtifact: artifact })),
 			observedAt: new Date().toISOString() },
-		resultArtifact: { immutableRef, digestScope: artifact.digestScope,
-			sha256: artifact.archiveSha256 },
+		...(artifact && immutableRef ? { resultArtifact: { immutableRef,
+			digestScope: artifact.digestScope, sha256: artifact.archiveSha256 } } : {}),
 		committedNano: carriedOrigin?.historicalCommittedNano ?? Math.ceil(proof.priorCommittedCny! * 1_000_000_000),
 		unknownHeldNano: carriedOrigin?.historicalUnknownHeldNano ?? Math.ceil(proof.priorUnknownHeldCny! * 1_000_000_000) };
+}
+function historicalGapEvidence(facts: AuthenticatedRestartCarryFacts,
+	opaqueGaps: readonly Pick<OpaqueExecutedRunGap, "source" | "resultArtifact">[],
+	historyAvailable: boolean): Record<string, unknown> {
+	return { version: 1, kind: "untrusted-private-history-gap",
+		selectedCandidate: "authenticated currently selected bounded task; current correctness was revalidated without adopting old timings",
+		baselineCarry: { source: facts.source, envelopeSha256: facts.envelopeSha256,
+			resultArtifact: facts.resultArtifact ? { immutableArtifactRef: facts.resultArtifact.immutableRef,
+				digestScope: facts.resultArtifact.digestScope,
+				artifactSha256: facts.resultArtifact.sha256 } : { state: "expired-or-unavailable" } },
+		opaqueExecutedRuns: opaqueGaps.map(gap => ({ source: gap.source,
+			resultArtifact: { immutableArtifactRef: `github-actions://${gap.resultArtifact.repository}/runs/${gap.resultArtifact.runId}/artifacts/${gap.resultArtifact.artifactId}/${gap.resultArtifact.artifactName}`,
+				digestScope: gap.resultArtifact.digestScope,
+				artifactSha256: gap.resultArtifact.archiveSha256 },
+			accounting: "unquantified", effectState: "unknown-unreconciled" })),
+		laterFailedAttempt: historyAvailable ?
+			"The authenticated carry has bounded unselected history files. They may be read as development evidence, never inferred as adopted truth or as the contents of an opaque run." :
+			"Encrypted result content is unavailable to this runner; source, plan, verification and feedback must not be inferred.",
+		oldOperationOutcome: "Historical operation outcomes remain unknown; existing quantified holds remain recorded and opaque executed-run charges stay unquantified.",
+		providerTransportCause: "unavailable in the authenticated prior carry; do not infer an HTTP status or replay an unreceived request",
+		newExecution: "independent fresh workspace and goal only; old task is not resumed or reconciled" };
 }
 async function writePrivateJsonOnce(directory: string, name: string, value: unknown): Promise<void> {
 	if (!/^[a-z][a-z0-9-]{0,100}\.json$/.test(name)) fail("invalid private receipt name");
@@ -262,7 +281,10 @@ function readRestartChain(text: string | undefined, kind: string): any[] {
 			fail("authenticated independent-restart chain entry is invalid");
 		if (kind === "host-independent-restart-reservations") {
 			const receipt = entry.receipt, claim = entry.claim;
-			if (receipt?.version !== 1 || receipt.kind !== "host-independent-goal-quarantine" ||
+			if ((receipt?.version !== 1 && receipt?.version !== 2) ||
+				receipt.kind !== "host-independent-goal-quarantine" ||
+				(receipt.version === 2 && (receipt.quarantine?.historicalEffectState !== "unknown-unreconciled" ||
+					receipt.quarantine?.executionMode !== "fresh-work-only")) ||
 				typeof receipt.reuseKey !== "string" || !/^[0-9a-f]{64}$/.test(receipt.reuseKey) ||
 				typeof receipt.prior?.envelopeSha256 !== "string" ||
 				!/^[0-9a-f]{64}$/.test(receipt.prior.envelopeSha256) ||
@@ -448,6 +470,11 @@ async function saveStatus(value: Record<string, unknown>): Promise<void> {
 		{ mode: 0o600 });
 	await rename(temporary, target);
 }
+async function campaignArchiveNames(directory: string): Promise<string[]> {
+	return ["workflow-archive.json", ...(await readdir(directory)).filter(name =>
+		/^workflow-(?:(?:initial|followon|branch-parent|branch-child|provenance-import)|iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,})-archive\.json$/.test(name))];
+}
+
 async function preserveCandidate(ws: Workspace, runId: string | undefined, outputDir: string): Promise<void> {
 	if (!runId) return;
 	const goalFile = path.join(ws.runDir("M07", runId), "goal.json");
@@ -461,15 +488,16 @@ async function preserveCandidate(ws: Workspace, runId: string | undefined, outpu
 		const archive = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
 		return archive.goalRunId === runId && typeof archive.taskId === "string" ? archive.taskId : undefined;
 	};
-	let canonicalTaskId = await archivedIdentity("workflow-archive.json");
-	let branchTaskId = await archivedIdentity("workflow-branch-child-archive.json");
-	const provenanceImportTaskId = await archivedIdentity("workflow-provenance-import-archive.json");
+	const archivedTaskIds = new Set<string>();
+	for (const name of await campaignArchiveNames(outputDir)) {
+		const id = await archivedIdentity(name);
+		if (id) archivedTaskIds.add(id);
+	}
 	for (const [index, task] of tasks.entries()) {
-		if (task.taskId === canonicalTaskId || task.taskId === branchTaskId ||
-			task.taskId === provenanceImportTaskId) continue;
+		if (archivedTaskIds.has(task.taskId)) continue;
 		if (index === 0 && !existsSync(path.join(outputDir, "workflow-archive.json"))) {
 			await archivePrivateM07Task({ goal, task, destination: outputDir });
-			canonicalTaskId = task.taskId;
+			archivedTaskIds.add(task.taskId);
 			continue;
 		}
 		const prefix = index === 1 && !existsSync(path.join(outputDir, "workflow-branch-child-archive.json")) ?
@@ -483,7 +511,7 @@ async function preserveCandidate(ws: Workspace, runId: string | undefined, outpu
 		try {
 			await archivePrivateM07Task({ goal, task, destination: temporary });
 			await exportPrefixedArchive(temporary, outputDir, prefix);
-			if (prefix === "branch-child") branchTaskId = task.taskId;
+			archivedTaskIds.add(task.taskId);
 		} finally { await rm(temporary, { recursive: true, force: true }); }
 	}
 }
@@ -645,6 +673,12 @@ async function exportPrefixedArchive(sourceDir: string, outputDir: string,
 		await copyFile(path.join(sourceDir, "m04-adopted-knowledge.json"),
 			path.join(outputDir, `${prefix}-m04-adopted-knowledge.json`));
 		archive.m04.knowledgeExport.file = `${prefix}-m04-adopted-knowledge.json`;
+	}
+	if (archive.m04?.transaction?.file === "m04-transaction.json") {
+		const transactionFile = path.join(sourceDir, "m04-transaction.json");
+		if (!existsSync(transactionFile)) fail("declared M04 transaction is unavailable for prefixed archive");
+		await copyFile(transactionFile, path.join(outputDir, `${prefix}-m04-transaction.json`));
+		archive.m04.transaction.file = `${prefix}-m04-transaction.json`;
 	}
 	archive.transportLayout = { kind: "prefixed-flat-index", prefix, defaultArchiveLoaderCompatible: false };
 	await writeFile(path.join(outputDir, `workflow-${prefix}-archive.json`), JSON.stringify(archive, null, 2), { mode: 0o600 });
@@ -974,6 +1008,14 @@ function chooseFollowOnCandidate(previousAccepted: boolean, followOnAccepted: bo
 		comparison.medianRatio !== undefined && comparison.medianRatio > 1.03 &&
 		comparison.minRatio !== undefined && comparison.minRatio >= 0.95));
 }
+function retainPriorSelectionUntilM04Ready(m04: { status: "not_run" | "completed" | "failed";
+	fullSelectedRead: boolean; knowledgeExportState: "complete" | "none" | "incomplete" },
+	previousAccepted: boolean, candidateAccepted: boolean, sourceChanged: boolean,
+	comparison: { state?: string; medianRatio?: number; minRatio?: number }): boolean {
+	return m04.status !== "completed" || !m04.fullSelectedRead ||
+		m04.knowledgeExportState === "incomplete" ||
+		!chooseFollowOnCandidate(previousAccepted, candidateAccepted, sourceChanged, comparison);
+}
 function initialHistoricalSelection(selectedCandidateSource: "initial" | "fork" | "repair" | "followon" | "none",
 	priorValidation: "passed" | "failed" | "infrastructure-unavailable" | undefined): Record<string, unknown> {
 	return selectedCandidateSource === "none" ? {
@@ -990,13 +1032,63 @@ function firstM07Accepted(acceptedWinner: boolean, finishedOutcome: unknown): bo
 }
 function importM04EffectDisposition(input: { status: "not-run" | "completed" | "failed";
 	proposalSubmitted: boolean | undefined; snapshotCreated: boolean | undefined;
-	threw: boolean }): "continue" | "pending-merge-reconciliation" | "m04-integrity-unknown" {
+	transactionState?: PortableM04KnowledgeTransactionV1["state"];
+	threw: boolean }): "continue" | "m04-draft-rejected" |
+	"pending-merge-reconciliation" | "m04-integrity-unknown" {
 	if (input.status !== "failed") return "continue";
+	if (input.transactionState === "rejected-draft" &&
+		input.proposalSubmitted === true && input.snapshotCreated === false)
+		return "m04-draft-rejected";
+	if (input.transactionState === "merge-intent" || input.transactionState === "unknown" ||
+		input.transactionState === "merged") return "pending-merge-reconciliation";
 	if (input.proposalSubmitted === true || input.snapshotCreated === true)
 		return "pending-merge-reconciliation";
+	// A host-written no-proposal journal proves no knowledge submission or
+	// merge was attempted, even if the read-only M04 session then threw.
+	// Preserve its failed stage as unselected history and continue fresh work.
+	if (input.transactionState === "no-proposal" && input.proposalSubmitted === false &&
+		input.snapshotCreated === false) return "continue";
 	if (input.threw || input.proposalSubmitted !== false || input.snapshotCreated !== false)
 		return "m04-integrity-unknown";
 	return "continue";
+}
+function failedM04StopReason(status: "completed" | "failed" | "not_run",
+	state?: PortableM04KnowledgeTransactionV1["state"]): ObjectiveStopReason {
+	if (status !== "failed") return "m04-evidence-incomplete";
+	if (state === "rejected-draft") return "m04-draft-rejected";
+	if (state === "merge-intent" || state === "unknown" || state === "merged")
+		return "m04-transaction-unresolved";
+	return "m04-evidence-incomplete";
+}
+function privateM04TransactionFacts(transaction: PortableM04KnowledgeTransactionV1): {
+	proposalSubmitted: boolean | undefined; snapshotCreated: boolean | undefined;
+} {
+	return {
+		proposalSubmitted: transaction.attempts.length ? true : transaction.state === "no-proposal" ? false : undefined,
+		snapshotCreated: transaction.state === "merged" ? true :
+			transaction.state === "rejected-draft" || transaction.state === "no-proposal" ? false : undefined,
+	};
+}
+
+/** A thrown M04 call does not supply completed booleans. Retain only the last
+ * matching host-written transaction, preserving uncertainty around merge. */
+async function retainFailedM04Transaction(ws: Workspace, goalRunId: string,
+	destination: string): Promise<{ runId: string; transaction?: PortableM04KnowledgeTransactionV1;
+	proposalSubmitted?: boolean; snapshotCreated?: boolean } | undefined> {
+	for (const runId of (await ws.listRuns("M04")).reverse()) {
+		const record = await ws.readRun("M04", runId);
+		const source = record.outputs.find(item => item.label === "M07 处理来源");
+		if (!source) continue;
+		let sourceGoalRunId: string | undefined;
+		try { sourceGoalRunId = JSON.parse(await readFile(source.path, "utf8")).m07RunId; }
+		catch { /* A malformed source cannot identify this failed transaction. */ }
+		if (sourceGoalRunId !== goalRunId) continue;
+		const hostFile = path.join(ws.runDir("M04", runId), "m04-transaction.json");
+		if (!existsSync(hostFile)) return { runId };
+		const transaction = await exportPortableM04Transaction({ ws, m04RunId: runId, destination });
+		return { runId, transaction, ...privateM04TransactionFacts(transaction) };
+	}
+	return undefined;
 }
 function selectedGoalBranchSatisfied(selectedGoalRunId: string, initialGoalRunId: string,
 	initialBranchExerciseComplete: boolean): boolean {
@@ -1010,6 +1102,34 @@ function shouldRepairRejectedReview(input: { winner: boolean; stopped: boolean; 
 	return !input.winner && !input.stopped && !input.aborted &&
 		input.rejected?.status === "rejected" && input.rejected.loopStopReason === "ready" &&
 		Boolean(input.rejected.review) && !input.unresolvedOperationIds.length && !input.unresolvedTaskIds.length;
+}
+function settledFailedM07RepairFeedback(goal: CurrentGoal, taskId: string,
+	input: { winner: boolean; stopped: boolean; aborted: boolean }): Record<string, unknown> | undefined {
+	const task = goal.tasks.find(item => item.taskId === taskId);
+	const unresolved = unresolvedGoalControl(goal);
+	if (input.winner || input.stopped || input.aborted || task?.mode !== "execute" ||
+		task.status !== "failed" || task.review || unresolved.operationIds.length || unresolved.taskIds.length)
+		return undefined;
+	const operations = (goal.executionState?.operations ?? []).filter(item => item.taskId === taskId);
+	if (operations.some(item => !["response-received", "partial-settled", "terminal-response-incomplete",
+		"confirmed", "not-issued"].includes(item.status))) return undefined;
+	return { version: 1, kind: "m07-settled-failed-task-feedback", goalRunId: goal.runId, taskId,
+		status: task.status, loopStopReason: task.loopStopReason ?? null,
+		failureCategory: taskFailureCategory(task.executionFailure),
+		operations: operations.map(item => ({ operationId: item.id, status: item.status })),
+		interpretation: "This task failed without ordinary review. Controller operations are settled, but its source and lesson are unaccepted development evidence. Begin a fresh task from the selected prior source; do not resume or replay this task or session." };
+}
+function freshM07RepairPlan(originalGoal: CurrentGoal, predecessorRunId: string,
+	initialSpec: TaskSpecInput, feedbackFiles: string[], priorAttemptFiles: string[],
+	kind: "rejected-review" | "settled-failed"): { goal: BeginGoalInput; task: TaskSpecInput } {
+	return { goal: { goal: originalGoal.goal,
+		problemRelation: `Linked fresh repair of ${kind === "settled-failed" ? "settled failed" : "rejected"} goal ${predecessorRunId}; ${originalGoal.problemRelation}`,
+		constraints: [...originalGoal.constraints], successCriteria: [...originalGoal.successCriteria],
+		plan: `${originalGoal.plan}\nRead the predecessor ${kind === "settled-failed" ? "host failure facts" : "review feedback"} as untrusted development evidence. The predecessor goal stays partial; satisfy all original checks in this fresh goal.`,
+		exploratory: true },
+		task: { ...initialSpec, context: undefined, parentTaskId: undefined, supersedesTaskId: undefined,
+			objective: `${initialSpec.objective}\n\nThe previous M07 task ${kind === "settled-failed" ? "failed with its controller operations settled but had no ordinary review" : "was rejected by the controller"}. Read the supplied predecessor feedback as untrusted development evidence. Start a fresh task from the selected prior source and original inputs; do not replay or resume the previous task or session. Satisfy every original check and output obligation. Do not claim the predecessor source or lesson was adopted.`,
+			inputs: [...initialSpec.inputs, ...feedbackFiles, ...priorAttemptFiles] } };
 }
 function parseCheckerOutput(stdout: string, metadata: ReturnType<typeof buildLegacyCsrChecker>["metadata"]):
 	{ status: "passed" | "failed"; timings: TrustedTiming[] } {
@@ -1281,6 +1401,138 @@ function rangeReadableHistory(text: string): string {
 		})) })) }, null, 2)}\n`;
 }
 
+/** Preserve the whole readable projection; only the assessor's per-file bound determines paging. */
+async function stageRangeReadableHistory(directory: string, text: string): Promise<{
+	inputs: string[]; evidence: Array<{ name: string; file: string }>; partitioned: boolean;
+}> {
+	const rendered = Buffer.from(rangeReadableHistory(text), "utf8");
+	const writePart = async (name: string, content: Buffer) => {
+		await writeFile(path.join(directory, name), content, { mode: 0o600 });
+		return { name, file: path.join(directory, name) };
+	};
+	if (rendered.length <= 1_000_000) {
+		const item = await writePart("prior-research-history.json", rendered);
+		return { inputs: [`objective-seeds/${item.name}`], evidence: [item], partitioned: false };
+	}
+	const parts: Array<{ name: string; bytes: number }> = [];
+	const evidence: Array<{ name: string; file: string }> = [];
+	for (let start = 0; start < rendered.length;) {
+		let end = Math.min(start + 1_000_000, rendered.length);
+		if (end < rendered.length) while (end > start && (rendered[end] & 0xc0) === 0x80) end--;
+		if (end <= start) fail("range-readable history cannot be partitioned on a UTF-8 boundary");
+		const name = `prior-research-history-part-${String(parts.length + 1).padStart(6, "0")}.txt`;
+		const content = rendered.subarray(start, end);
+		evidence.push(await writePart(name, content));
+		parts.push({ name, bytes: content.length });
+		start = end;
+	}
+	const manifest = Buffer.from(`${JSON.stringify({ version: 1, kind: "range-readable-history-part-index",
+		encoding: "utf8-concatenate-in-order-without-separators", totalBytes: rendered.length, parts }, null, 2)}\n`, "utf8");
+	if (manifest.length > 1_000_000) fail("range-readable history part index exceeds the per-file evidence bound");
+	const index = await writePart("prior-research-history-index.json", manifest);
+	return { inputs: [index, ...evidence].map(item => `objective-seeds/${item.name}`),
+		evidence: [index, ...evidence], partitioned: true };
+}
+
+/** A prior rejected draft is evidence for a NEW M04 decision, never a proposal
+ * to replay. The old writer lacked exact issues, so that absence stays explicit. */
+async function stageHistoricalM04RejectionEvidence(input: {
+	goalRoot: string; bundle: PrivateContinuationBundle;
+	goalRunId: string; taskId: string;
+}): Promise<string[]> {
+	const history = JSON.parse(input.bundle["research-history.json"] ?? "null") as
+		{ entries?: Array<{ goalRunId: string; taskId: string; files?: Record<string, string> }> };
+	const matches = history.entries?.filter(entry => entry.goalRunId === input.goalRunId &&
+		entry.taskId === input.taskId) ?? [];
+	if (matches.length !== 1) fail("historical rejected M04 entry is ambiguous");
+	const archive = JSON.parse(matches[0].files?.["workflow-archive.json"] ?? "null") as
+		{ m04?: { runId?: string } };
+	const m04RunId = archive?.m04?.runId;
+	if (typeof m04RunId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(m04RunId))
+		fail("historical rejected M04 run identity is invalid");
+	const portable = matches[0].files?.["m04-transaction.json"];
+	if (portable === undefined)
+		fail("historical rejected M04 has no portable host transaction receipt");
+	const body = portable;
+	const bytes = Buffer.from(body, "utf8");
+	const write = async (name: string, content: Buffer) => {
+		await writeFile(path.join(input.goalRoot, name), content, { mode: 0o600 });
+		return name;
+	};
+	if (bytes.length <= 1_000_000)
+		return [await write("prior-rejected-m04-transaction.json", bytes)];
+	const parts: Array<{ name: string; bytes: number }> = [];
+	for (let start = 0; start < bytes.length;) {
+		let end = Math.min(start + 1_000_000, bytes.length);
+		if (end < bytes.length) while (end > start && (bytes[end] & 0xc0) === 0x80) end--;
+		if (end <= start) fail("historical M04 evidence cannot split on a UTF-8 boundary");
+		const name = `prior-rejected-m04-transaction-part-${String(parts.length + 1).padStart(6, "0")}.txt`;
+		await write(name, bytes.subarray(start, end));
+		parts.push({ name, bytes: end - start });
+		start = end;
+	}
+	const index = Buffer.from(`${JSON.stringify({ version: 1, kind: "prior-rejected-m04-part-index",
+		encoding: "utf8-concatenate-in-order-without-separators", totalBytes: bytes.length,
+		parts }, null, 2)}\n`, "utf8");
+	if (index.length > 1_000_000) fail("historical M04 evidence index exceeds the per-file bound");
+	return [await write("prior-rejected-m04-transaction-index.json", index),
+		...parts.map(item => item.name)];
+}
+
+/** One goal/task has one final historical state, regardless of transport filename. */
+function retainHistoricalArchiveEntry(entries: Array<Record<string, any>>, incoming: Record<string, any>): void {
+	const index = entries.findIndex(entry => entry.goalRunId === incoming.goalRunId && entry.taskId === incoming.taskId);
+	if (index < 0) { entries.push(incoming); return; }
+	const existing = entries[index];
+	if (existing.originalContractId !== incoming.originalContractId) fail("same-task historical archives disagree on original contract");
+	const files = (entry: Record<string, any>): Record<string, string> => {
+		if (!entry.files || typeof entry.files !== "object" || Array.isArray(entry.files)) fail("same-task historical archive has no files");
+		return entry.files as Record<string, string>;
+	};
+	const oldFiles = files(existing), newFiles = files(incoming);
+	for (const name of ["candidate.cpp", "verification.json", "experiment-plan.json"]) {
+		if (oldFiles[name] !== newFiles[name]) fail(`same-task historical archives disagree on ${name}`);
+	}
+	if (oldFiles["m04-transaction.json"] && newFiles["m04-transaction.json"] &&
+		oldFiles["m04-transaction.json"] !== newFiles["m04-transaction.json"])
+		fail("same-task historical M04 transaction bytes conflict");
+	const facts = (entry: Record<string, any>) => {
+		let archive: Record<string, any>;
+		try { archive = JSON.parse(files(entry)["workflow-archive.json"]); }
+		catch { return fail("same-task historical archive manifest is invalid"); }
+		if (archive?.goalRunId !== entry.goalRunId || archive.taskId !== entry.taskId)
+			fail("same-task historical archive identity differs from its entry");
+		const m04 = archive.m04 ?? { state: "not-run" };
+		const stateRank = { "not-run": 0, failed: 1, completed: 2 }[m04.state as "not-run" | "failed" | "completed"];
+		if (stateRank === undefined || (m04.proposalSubmitted !== undefined && typeof m04.proposalSubmitted !== "boolean") ||
+			(m04.snapshotCreated !== undefined && typeof m04.snapshotCreated !== "boolean"))
+			fail("same-task historical M04 state is invalid");
+		if (files(entry)["m04-transaction.json"] &&
+			(!m04.transaction || m04.transaction.state === undefined ||
+				typeof m04.transaction.file !== "string" ||
+				!m04.transaction.file.endsWith("m04-transaction.json")))
+			fail("same-task historical M04 transaction is undeclared");
+		return { stateRank, proposal: Number(m04.proposalSubmitted === true), snapshot: Number(m04.snapshotCreated === true),
+			runId: typeof m04.runId === "string" ? m04.runId : undefined,
+			exportComplete: m04.knowledgeExport?.state === "complete",
+			transactionPresent: typeof files(entry)["m04-transaction.json"] === "string" };
+	};
+	const old = facts(existing), next = facts(incoming);
+	const dominates = (a: typeof old, b: typeof old) => a.stateRank >= b.stateRank &&
+		a.proposal >= b.proposal && a.snapshot >= b.snapshot;
+	if (!dominates(old, next) && !dominates(next, old)) fail("same-task historical M04 outcomes conflict");
+	const oldStrict = old.stateRank > next.stateRank || old.proposal > next.proposal || old.snapshot > next.snapshot;
+	const nextStrict = next.stateRank > old.stateRank || next.proposal > old.proposal || next.snapshot > old.snapshot;
+	if (!oldStrict && !nextStrict && old.runId && next.runId && old.runId !== next.runId)
+		fail("same-task historical M04 run identity conflicts");
+	if (nextStrict && old.transactionPresent && !next.transactionPresent)
+		fail("same-task historical M04 transaction evidence was dropped");
+	if (nextStrict || (!oldStrict && !nextStrict && ((!old.runId && next.runId) ||
+		(!old.exportComplete && next.exportComplete) ||
+		(!old.transactionPresent && next.transactionPresent))))
+		entries[index] = incoming;
+}
+
 /** Keep selected evidence as one coherent tuple, never combine a new failed source with an old acceptance. */
 async function collectContinuationBundle(directory: string, prior?: PrivateContinuationBundle): Promise<PrivateContinuationBundle | undefined> {
 	const current: PrivateContinuationBundle = {};
@@ -1311,15 +1563,21 @@ async function collectContinuationBundle(directory: string, prior?: PrivateConti
 		{ version: 1, kind: "untrusted-version-bound-research-history", entries: [] };
 	if (history?.version !== 1 || history.kind !== "untrusted-version-bound-research-history" || !Array.isArray(history.entries))
 		fail("prior research history is invalid");
+	const priorHistoryEntries = [...history.entries];
+	history.entries = [];
+	for (const entry of priorHistoryEntries) {
+		if (!entry || typeof entry.goalRunId !== "string" || !/^T\d{3,}$/.test(String(entry.taskId)))
+			fail("prior research history entry identity is invalid");
+		retainHistoricalArchiveEntry(history.entries, entry);
+	}
 	if (prior && accepted && prior["workflow-archive.json"] !== current["workflow-archive.json"]) {
 		const archived = JSON.parse(prior["workflow-archive.json"] ?? "null");
 		const checkpoint = JSON.parse(prior["objective-checkpoint.json"] ?? "null");
 		if (!archived?.goalRunId || !archived.taskId || !checkpoint?.contract?.id) fail("historical tuple lacks version binding");
-		if (!history.entries.some((entry: Record<string, unknown>) => entry.goalRunId === archived.goalRunId && entry.taskId === archived.taskId))
-			history.entries.push({ originalContractId: checkpoint.contract.id, goalRunId: archived.goalRunId,
+		retainHistoricalArchiveEntry(history.entries, { originalContractId: checkpoint.contract.id, goalRunId: archived.goalRunId,
 				taskId: archived.taskId, interpretation: "Untrusted historical development evidence; prior adoption is not current truth",
 				files: Object.fromEntries(["candidate.cpp", "verification.json", "workflow-archive.json",
-					"experiment-plan.json", "m04-adopted-knowledge.json"].filter(name => prior[name as keyof typeof prior] !== undefined)
+					"experiment-plan.json", "m04-adopted-knowledge.json", "m04-transaction.json"].filter(name => prior[name as keyof typeof prior] !== undefined)
 					.map(name => [name, prior[name as keyof typeof prior]])) });
 	}
 	// Preserve failed experiments as version-bound development evidence, separate
@@ -1327,8 +1585,7 @@ async function collectContinuationBundle(directory: string, prior?: PrivateConti
 	const checkpoint = JSON.parse(current["objective-checkpoint.json"] ?? prior?.["objective-checkpoint.json"] ?? "null");
 	const contractId = checkpoint?.contract?.id;
 	if (typeof contractId === "string" && contractId) {
-		const archives = ["workflow-archive.json", ...(await readdir(directory))
-			.filter(name => /^workflow-(?:(?:initial|followon|branch-parent|branch-child|provenance-import)|iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,})-archive\.json$/.test(name))];
+		const archives = await campaignArchiveNames(directory);
 		for (const archiveName of archives) {
 			const archiveFile = path.join(directory, archiveName);
 			if (!existsSync(archiveFile)) continue;
@@ -1336,24 +1593,23 @@ async function collectContinuationBundle(directory: string, prior?: PrivateConti
 			const archive = JSON.parse(archiveText) as Record<string, any>;
 			if (archive?.version !== 1 || archive.kind !== "m07-private-candidate-archive" ||
 				(accepted && archiveName === "workflow-archive.json") ||
-				!/^T\d{3,}$/.test(String(archive.taskId)) || typeof archive.goalRunId !== "string" ||
-				history.entries.some((entry: Record<string, unknown>) =>
-					entry.goalRunId === archive.goalRunId && entry.taskId === archive.taskId)) continue;
+				!/^T\d{3,}$/.test(String(archive.taskId)) || typeof archive.goalRunId !== "string") continue;
 			const prefix = archiveName === "workflow-archive.json" ? "" : archiveName.slice("workflow-".length, -"-archive.json".length) + "-";
 			const files: Record<string, string> = { "workflow-archive.json": archiveText };
 			for (const name of ["candidate.cpp", "verification.json", "experiment-plan.json", "lesson-delta.json",
-				"review-decision.json", "m04-adopted-knowledge.json",
+				"review-decision.json", "m04-adopted-knowledge.json", "m04-transaction.json",
 				...(await readdir(directory)).filter(name => name.startsWith(prefix) &&
 					/^round-[1-9][0-9]*-reviewer-feedback\.txt$/.test(name.slice(prefix.length)))
 					.map(name => name.slice(prefix.length))]) {
 				const file = path.join(directory, `${prefix}${name}`);
 				if (!existsSync(file)) continue;
 				const info = await lstat(file);
-				if (!info.isFile() || info.isSymbolicLink() || info.size > 1_000_000)
+				if (!info.isFile() || info.isSymbolicLink() ||
+					info.size > (name === "m04-transaction.json" ? 4 * 1024 * 1024 : 1_000_000))
 					fail("unselected campaign evidence must be a bounded regular file");
 				files[name] = await readFile(file, "utf8");
 			}
-			history.entries.push({ originalContractId: contractId, goalRunId: archive.goalRunId,
+			retainHistoricalArchiveEntry(history.entries, { originalContractId: contractId, goalRunId: archive.goalRunId,
 				taskId: archive.taskId,
 				interpretation: "Unselected or unresolved experiment; measurements and review do not establish a replacement for the selected candidate",
 				files });
@@ -1362,7 +1618,8 @@ async function collectContinuationBundle(directory: string, prior?: PrivateConti
 	if (history.entries.length) selected["research-history.json"] = JSON.stringify(history);
 	for (const name of ["original-objective.json", "objective-checkpoint.json", "objective-assessment-receipts.json",
 		"independent-restart-quarantine.json", "independent-restart-goal-binding.json",
-		"host-effect-receipt.json", "transport-diagnostics.json"] as const)
+		"host-effect-receipt.json", "transport-diagnostics.json", "m04-transaction.json",
+		"m04-transaction-quarantine.json"] as const)
 		if (current[name]) selected[name] = current[name];
 	// A receipt describes one Actions execution. An older receipt cannot attest
 	// this process merely because its historical selected tuple was retained.
@@ -1375,9 +1632,12 @@ async function collectContinuationBundle(directory: string, prior?: PrivateConti
 /** Collection failure retains the authenticated old research and only the new
  * host-prepared transport metadata for an emergency accounting/effect seal. */
 function collectorFailureBundle(prior: PrivateContinuationBundle | undefined,
-	transportCensus: string | undefined): PrivateContinuationBundle | undefined {
-	return transportCensus === undefined ? prior :
-		{ ...prior, "transport-diagnostics.json": transportCensus };
+	transportCensus: string | undefined,
+	m04QuarantineText?: string): PrivateContinuationBundle | undefined {
+	if (transportCensus === undefined && m04QuarantineText === undefined) return prior;
+	return { ...prior,
+		...(transportCensus === undefined ? {} : { "transport-diagnostics.json": transportCensus }),
+		...(m04QuarantineText === undefined ? {} : { [M04_TRANSACTION_QUARANTINE_FILE]: m04QuarantineText }) };
 }
 
 /** Host-side task and tool census; the encrypted carry later authenticates these exact bytes. */
@@ -1454,7 +1714,6 @@ async function main() {
 	const missionLedger = await openLedgerContinuation({ seedEnvelopeB64: ledgerEnvelope,
 		publicKeyFile: path.join(HERE, "campaign-output-public.pem"), githubToken,
 		loadCarryArtifact: ({ artifactId }) => downloadCarryArtifact({ githubToken: githubToken ?? "", artifactId }),
-		reviewOpaqueGapSource: facts => reviewKnownOpaqueGapSource(facts, githubToken ?? ""),
 		current: { repository: process.env.GITHUB_REPOSITORY, runId: process.env.GITHUB_RUN_ID,
 			runAttempt: process.env.GITHUB_RUN_ATTEMPT, actor: process.env.GITHUB_ACTOR,
 			event: process.env.GITHUB_EVENT_NAME, ref: process.env.GITHUB_REF,
@@ -1518,11 +1777,15 @@ async function main() {
 		const selectedSeed = validateSelectedPriorTuple(previousBundle, found.files,
 			missionLedger.priorBootstrapBinding, originalText);
 		const previousCheckpoint = selectedSeed.checkpoint;
-		const importTarget = archivedM07ImportTarget(previousBundle);
+		let importTarget: ReturnType<typeof archivedM07ImportTarget>;
+		let m04QuarantineEvidencePath: string | undefined;
 		receiptHistoricalGoalRunIds = previousCheckpoint.boundedRuns.map(item => item.runId);
 		const priorNeedsQuarantine = previousCheckpoint.continuation.requiresOperationReconciliation ||
 			previousCheckpoint.continuation.unresolvedOperationIds.length > 0 ||
-			previousCheckpoint.boundedRuns.some(run => (run.unresolvedOperationIds?.length ?? 0) > 0);
+			previousCheckpoint.boundedRuns.some(run => (run.unresolvedOperationIds?.length ?? 0) > 0) ||
+			missionLedger.opaqueExecutedRuns.length > 0 ||
+			Boolean(authenticatedPendingHistoricalEffectSources(missionLedger.priorCarryProof,
+				previousBundle)?.length);
 		if (!priorNeedsQuarantine) validateContinuationSeed(previousBundle, found.files,
 			missionLedger.priorBootstrapBinding, originalText);
 		let historicalUnresolvedOperationIds = canonicalUnresolvedOperationRefs(previousCheckpoint);
@@ -1534,9 +1797,10 @@ async function main() {
 		if (previousBundle["experiment-plan.json"])
 			await writeFile(path.join(priorSeedDir, "prior-experiment-plan.json"), previousBundle["experiment-plan.json"], { mode: 0o600 });
 		await writeFile(path.join(priorSeedDir, "prior-objective-checkpoint.json"), previousBundle["objective-checkpoint.json"]!, { mode: 0o600 });
-		if (previousBundle["research-history.json"]) await writeFile(path.join(priorSeedDir, "prior-research-history.json"), rangeReadableHistory(previousBundle["research-history.json"]), { mode: 0o600 });
+		const historySeed = previousBundle["research-history.json"] ?
+			await stageRangeReadableHistory(priorSeedDir, previousBundle["research-history.json"]) : undefined;
 		const priorSeedInputs = ["objective-seeds/prior-objective-checkpoint.json",
-			...(previousBundle["research-history.json"] ? ["objective-seeds/prior-research-history.json"] : []),
+			...(historySeed?.inputs ?? []),
 			...(previousBundle["m04-adopted-knowledge.json"] ? ["objective-seeds/prior-m04-knowledge.json"] : []),
 			"objective-seeds/prior-candidate.cpp", "objective-seeds/prior-verification.json",
 			"objective-seeds/prior-archive.json",
@@ -1603,26 +1867,62 @@ async function main() {
 		if (statusPriorSelectedValidation !== "passed")
 			throw new SandboxPreflightError("selected prior source failed current host correctness revalidation; inspect encrypted restored-candidate-verification.json");
 		const priorSelectedValidationSha256 = createHash("sha256").update(JSON.stringify(priorSelectedCheck)).digest("hex");
+		const verifiedFreshBoundary = async (): Promise<FreshM04QuarantineBoundary> => {
+			const campaignReal = await realpath(campaignRoot);
+			const workspaceReal = await realpath(ws.root);
+			const storeReal = await realpath(ws.knowledgeDir);
+			const proposalDir = path.join(ws.knowledgeDir, "proposals");
+			const rootsAreDirectories = (await Promise.all([campaignRoot, ws.root, ws.knowledgeDir]
+				.map(item => lstat(item)))).every(info => info.isDirectory() && !info.isSymbolicLink());
+			let emptyStore = false;
+			try { emptyStore = (await store.current()) === undefined &&
+				(await store.list()).length === 0 && (await readdir(proposalDir)).length === 0; }
+			catch { /* Unknown store state cannot grant fresh work. */ }
+			const privateConfig = await ws.loadConfig();
+			const freshStoreVerified = emptyStore && rootsAreDirectories &&
+				path.dirname(campaignReal) === await realpath(os.tmpdir()) &&
+				workspaceReal === path.join(campaignReal, "workspace") &&
+				storeReal === path.join(workspaceReal, ".agent", "knowledge");
+			const noExternalWriteTools = Object.keys(privateConfig.tools ?? {}).length === 0;
+			if (!freshStoreVerified || sessionEffects.size !== 0 || !noExternalWriteTools ||
+				statusPriorSelectedValidation !== "passed")
+				fail("fresh independent campaign store or grant boundary is unavailable");
+			return { campaignRoot: campaignReal, workspaceRoot: workspaceReal,
+				storeRoot: storeReal, storeEmpty: true, sessionCensusEmpty: true,
+				sessionMode: "no-prior-session-resume", grantProfile: "private-confined-read-dir",
+				externalWriteTools: false, sharedStore: false, selectedRevalidated: true };
+		};
+		// Classify historical M04 state before consuming the one-use Actions claim.
+		// The old proposal remains UNKNOWN; this preflight only chooses fresh work.
+		const initialFreshBoundary = await verifiedFreshBoundary();
+		const freshOnlyM04Quarantine = missionLedger.priorCarryProof ?
+			buildUnresolvedHistoricalM04Quarantine({ proof: missionLedger.priorCarryProof,
+				bundle: previousBundle, freshBoundary: initialFreshBoundary }) : undefined;
+		const inheritedM04Quarantine = missionLedger.priorCarryProof ?
+			validateM04TransactionQuarantine({ proof: missionLedger.priorCarryProof,
+				bundle: previousBundle }) : undefined;
 		let restartReservation: IndependentRestartReservation | undefined;
 		if (priorNeedsQuarantine) {
 			statusPhase = "independent-restart-admission";
 			const priorProof = missionLedger.priorCarryProof;
-			const facts = authenticatedLegacyCarryFacts(priorProof, previousBundle);
-			if (!facts) throw new SandboxPreflightError("authenticated terminal carry and fixed encrypted-result artifact proof unavailable; independent restart refused");
+			const facts = authenticatedHistoricalCarryFacts(priorProof, previousBundle);
+			if (!facts) throw new SandboxPreflightError("authenticated terminal carry and selected prior proof unavailable; independent restart suspended");
 			restartReservation = await reserveIndependentRestart({ authenticatedCarryProof: priorProof,
-				privateBundle: previousBundle, freshWorkspace: { workspaceId: path.basename(campaignRoot),
+				privateBundle: previousBundle, freshBoundary: initialFreshBoundary,
+				freshWorkspace: { workspaceId: path.basename(campaignRoot),
 					restartNonce: randomBytes(16).toString("hex") },
-				failedHistory: { state: "unavailable", reason: "The full prior result artifact is unavailable to this runner. Any failed source, verification or reviewer feedback retained in authenticated research-history is separate, unselected development evidence; the earlier accepted candidate remains the selected tuple.",
+				failedHistory: facts.resultArtifact ? { state: "unavailable",
+					reason: "This reference identifies the last authenticated carry run's encrypted result, which this runner cannot decrypt. Any later executed run without a carry is a separate unquantified, unresolved gap. Retained research-history files are unselected development evidence; only the authenticated currently selected candidate is selected.",
 					immutableArtifactRef: facts.resultArtifact.immutableRef,
 					digestScope: facts.resultArtifact.digestScope,
-					artifactSha256: facts.resultArtifact.sha256 } }, {
-				authenticatedFacts: proof => proof === priorProof ? authenticatedLegacyCarryFacts(proof, previousBundle) : undefined,
+					artifactSha256: facts.resultArtifact.sha256 } : {
+					state: "result-unavailable", reason: "The last authenticated carry is available, but its separate encrypted result artifact is unavailable. Historical research remains untrusted; continue only from the revalidated selected tuple without replay.",
+					carrySource: facts.source, carryEnvelopeSha256: facts.envelopeSha256 } }, {
+				authenticatedFacts: proof => proof === priorProof ? authenticatedHistoricalCarryFacts(proof, previousBundle) : undefined,
 				reviewEffects: async (authenticated, operationRefs) =>
-					authenticated.source.commit === LEGACY_RESTART_POLICY.sourceCommit ?
-						reviewedLegacyRestartEffects(authenticated, operationRefs) :
-						reviewPrivateCampaignRestartEffects({ facts: authenticated, operationRefs,
-							privateBundle: previousBundle, proof: priorProof,
-							authenticatedBundle: authenticatedPriorCarryBindsBundle,
+					reviewPrivateCampaignRestartEffects({ facts: authenticated, operationRefs,
+						privateBundle: previousBundle, proof: priorProof,
+						authenticatedBundle: authenticatedPriorCarryBindsBundle,
 							bindsAncestor: authenticatedPriorCarryBindsAncestor }),
 				revalidateSelection: async ({ privateBundle, checkpoint, tupleSha256 }) => {
 					if (privateBundle !== previousBundle || checkpoint.contract.id !== originalObjective.id ||
@@ -1640,21 +1940,12 @@ async function main() {
 			});
 			historicalUnresolvedOperationIds = reservedCanonicalOperationRefs(previousCheckpoint, restartReservation);
 			const gapFile = path.join(priorSeedDir, "prior-history-gap.json");
-			await writeFile(gapFile, `${JSON.stringify({ version: 1, kind: "untrusted-private-history-gap",
-				selectedCandidate: "earlier accepted bounded task; current correctness was revalidated without adopting old timings",
-				laterFailedAttempt: previousBundle["research-history.json"] ?
-					"full encrypted result artifact unavailable; bounded unselected files in authenticated research-history may be read as development evidence, never inferred as adopted truth" :
-					"encrypted and unavailable to this runner; source, plan, verification and feedback must not be inferred",
-				oldOperationOutcome: "unknown and quarantined; provider cost hold remains",
-				providerTransportCause: "unavailable in the authenticated prior carry; do not infer an HTTP status or replay an unreceived request",
-				newExecution: "independent fresh workspace and goal only; old task is not resumed or reconciled" }, null, 2)}\n`,
+			await writeFile(gapFile, `${JSON.stringify(historicalGapEvidence(facts,
+				missionLedger.opaqueExecutedRuns, Boolean(previousBundle["research-history.json"])), null, 2)}\n`,
 				{ mode: 0o600 });
 			priorSeedInputs.push("objective-seeds/prior-history-gap.json");
 		}
-		const archivedImport = importTarget ? validateArchivedM07Import({
-			proof: missionLedger.priorCarryProof, bundle: previousBundle,
-			contractId: previousCheckpoint.contract.id, goalRunId: importTarget.goalRunId,
-			taskId: importTarget.taskId, expectedChecks: importTarget.checks }) : undefined;
+		let archivedImport: ReturnType<typeof validateArchivedM07Import> | undefined;
 		const bindRestartFirstGoal = restartReservation ? createOneUseRestartGoalBinder<BoundIndependentRestartGoal>(
 			async goalRunId => {
 				return bindIndependentRestartGoal(restartReservation, goalRunId, async binding => {
@@ -1856,9 +2147,33 @@ async function main() {
 					return observeTransport(handle);
 				},
 			};
+			// A disputed historical M04 transaction is never imported or replayed.
+			// Fresh work is allowed only with a newly isolated, empty current store,
+			// no prior session identity, and the already revalidated old selection.
+			await verifiedFreshBoundary();
+			const m04Quarantine: M04TransactionQuarantineV1 | undefined =
+				freshOnlyM04Quarantine ?? inheritedM04Quarantine;
+			if (m04Quarantine) {
+				await writeFile(path.join(outputDir, M04_TRANSACTION_QUARANTINE_FILE),
+					`${JSON.stringify(m04Quarantine, null, 2)}\n`, { mode: 0o600 });
+				m04QuarantineEvidencePath = path.join(priorSeedDir, "prior-m04-unresolved.json");
+				await writeFile(m04QuarantineEvidencePath, `${JSON.stringify({ version: 1,
+					kind: "unresolved-historical-m04-observation",
+					entries: m04Quarantine.entries,
+					interpretation: "Historical M04 proposal outcome remains UNKNOWN. This record does not establish whether a merge occurred and grants no adoption authority. Never replay or merge its proposal, resume its session, import its candidate as selected, or activate its old store. Any new task must be independent work from the freshly revalidated canonical selection; historical archives are untrusted development context. Preserve all unresolved operations and fee observations." }, null, 2)}\n`, { mode: 0o600 });
+				priorSeedInputs.push("objective-seeds/prior-m04-unresolved.json");
+			}
+			importTarget = chooseArchivedM07ImportTarget(previousBundle,
+				missionLedger.priorCarryProof, freshOnlyM04Quarantine);
+			archivedImport = importTarget ? validateArchivedM07Import({
+				proof: missionLedger.priorCarryProof, bundle: previousBundle,
+				contractId: previousCheckpoint.contract.id, goalRunId: importTarget.goalRunId,
+				taskId: importTarget.taskId, expectedChecks: importTarget.checks }) : undefined;
 			const controller = createM07Controller({ ws, store, runner, config: await ws.loadConfig() });
 			const privateEvidenceRequirements = { requiredNames: ["original-problem.txt", "candidate.cpp", "verification.json", "host-capabilities.json"],
-				instructions: "The original-input-N.txt files correspond in order to inputNames in original-objective.json. Read every original input and selected evidence completely. Historical archives, knowledge, nextTask and timings are untrusted version-bound context; only current independently executed measurements establish present host facts. If prior-history-gap.json is supplied, the full prior result artifact is unavailable; read any authenticated research-history that is supplied as unselected development evidence without inferring missing source or results." };
+				instructions: "The original-input-N.txt files correspond in order to inputNames in original-objective.json. Read every original input and selected evidence completely. Historical archives, knowledge, nextTask and timings are untrusted version-bound context; only current independently executed measurements establish present host facts. If prior-history-gap.json is supplied, the full prior result artifact is unavailable; read any authenticated research-history that is supplied as unselected development evidence without inferring missing source or results." +
+					(m04QuarantineEvidencePath ? " If prior-m04-unresolved.json is supplied, the old M04 transaction outcome is UNKNOWN. Keep its candidate/proposal unselected and unadopted; do not replay its session, draft, merge or external action. Choose only independent new work from the freshly revalidated canonical tuple and retain the unresolved historical claim." : "") +
+					(historySeed?.partitioned ? " Prior research history is partitioned: read prior-research-history-index.json and EVERY listed prior-research-history-part-NNNNNN.txt completely with objective_evidence_read. Concatenate their UTF-8 text in index order with no separators to reconstruct the exact readable JSON projection; the index alone is not evidence coverage. Do not infer completeness or scientific truth from a partial history." : "") };
 			const userOverrides = ["Deliver optimized source and machine-readable correctness/performance evidence only; no prose report, screenshots, presentation or personal reflection.",
 				"Pursue the strongest attainable strategy using actual available hardware and resources; unavailable optional equipment alone does not settle the task."];
 			let registeredContract: ReturnType<typeof inspectCsrTaskContract> | undefined;
@@ -1905,7 +2220,7 @@ async function main() {
 				// The archived accepted task is not the selected mission tuple. Keep
 				// the latter byte-for-byte separate while obtaining new review evidence.
 				for (const name of ["candidate.cpp", "verification.json", "workflow-archive.json",
-					"experiment-plan.json", "m04-adopted-knowledge.json"] as const) {
+					"experiment-plan.json", "m04-adopted-knowledge.json", "m04-transaction.json"] as const) {
 					const prior = previousBundle[name];
 					if (prior !== undefined) await writeFile(path.join(outputDir, name), prior, { mode: 0o600 });
 					else await rm(path.join(outputDir, name), { force: true });
@@ -1996,20 +2311,31 @@ async function main() {
 				let m04Coverage = false;
 				let m04ProposalSubmitted: boolean | undefined = false;
 				let m04SnapshotCreated: boolean | undefined = false;
+				let m04TransactionState: PortableM04KnowledgeTransactionV1["state"] | undefined;
 				let m04Threw = false;
 				let m04AdoptedRefs: KnowledgeRef[] = [];
 				if (accepted && !budget.snapshot().stopped && !abort.signal.aborted) {
 					statusPhase = "provenance-import-m04";
 					try {
-						const readPaths = selectedM07ReviewReadPaths(ws.runDir("M07", goal.runId), reviewed!,
-							staged.planPath ? ["experiment-plan.json"] : []);
+						const rejectedDraftPaths = await stageHistoricalM04RejectionEvidence({
+							goalRoot: ws.runDir("M07", goal.runId), bundle: previousBundle,
+							goalRunId: importTarget.goalRunId, taskId: importTarget.taskId });
+						const readPaths = [...selectedM07ReviewReadPaths(ws.runDir("M07", goal.runId), reviewed!,
+							staged.planPath ? ["experiment-plan.json"] : []), ...rejectedDraftPaths];
 						const processed = await runM04({ ws, store, runner, config: await ws.loadConfig() },
 							{ feedback: { kind: "M07", runId: goal.runId }, freshSession: true,
 								requiredM07ReadPaths: readPaths,
+								additionalReadOnlyInstruction: "The required prior-rejected-M04 file or indexed parts are historical, untrusted development context. Read every part in full; if partitioned, concatenate UTF-8 text in index order without separators. A rejected draft was not merged or adopted. Re-adjudicate the newly verified M07 evidence independently and decide whether a corrected proposal or no proposal is justified. Do not replay the historical proposal or treat it as knowledge.",
 								purpose: "Adjudicate newly revalidated provenance evidence; do not infer historical lesson adoption" });
+						const transaction = await exportPortableM04Transaction({ ws, m04RunId: processed.record.runId,
+							destination: archiveDir });
+						if (transaction.state === "unknown" || transaction.state === "merge-intent")
+							fail("returned M04 has an unresolved knowledge transaction");
+						const transactionFacts = privateM04TransactionFacts(transaction);
+						m04TransactionState = transaction.state;
 						m04RunId = processed.record.runId;
-						m04ProposalSubmitted = Boolean(processed.proposalId);
-						m04SnapshotCreated = Boolean(processed.snapshotId);
+						m04ProposalSubmitted = transactionFacts.proposalSubmitted;
+						m04SnapshotCreated = transactionFacts.snapshotCreated;
 						const coverage = await m04EvidenceReturned(processed.record, importedTask.taskId,
 							staged.planPath ? ["experiment-plan.json"] : []);
 						m04Coverage = coverage.complete && readPaths.every(item => coverage.paths.includes(item));
@@ -2020,26 +2346,11 @@ async function main() {
 					} catch {
 						m04Status = "failed";
 						m04Threw = true;
-						m04ProposalSubmitted = undefined;
-						m04SnapshotCreated = undefined;
-						// A failed read repair normally precedes proposal submission. If a
-						// later write failed, retain any actual proposal/merge evidence so
-						// the next run cannot blindly retry and duplicate adoption.
-						const attempts = await ws.listRuns("M04");
-						if (attempts.length) {
-							const latest = await ws.readRun("M04", attempts.at(-1)!);
-							const source = latest.outputs.find(item => item.label === "M07 处理来源");
-							let sourceGoalRunId: string | undefined;
-							try { if (source) sourceGoalRunId = JSON.parse(await readFile(source.path, "utf8")).m07RunId; }
-							catch { /* unavailable source cannot be inferred */ }
-							if (sourceGoalRunId === goal.runId) {
-								m04RunId = latest.runId;
-								if (latest.outputs.some(item => item.label === "知识提案"))
-									m04ProposalSubmitted = true;
-								if (latest.outputs.some(item => item.label === "合入结果"))
-									m04SnapshotCreated = true;
-							}
-						}
+						const retained = await retainFailedM04Transaction(ws, goal.runId, archiveDir);
+						m04TransactionState = retained?.transaction?.state;
+						m04RunId = retained?.runId;
+						m04ProposalSubmitted = retained?.proposalSubmitted;
+						m04SnapshotCreated = retained?.snapshotCreated;
 					}
 				}
 				await recordPrivateM04Outcome(archiveDir, { state: m04Status,
@@ -2047,11 +2358,13 @@ async function main() {
 					snapshotCreated: m04SnapshotCreated, adoptedExperienceRefs: m04AdoptedRefs }, store);
 				const m04EffectDisposition = importM04EffectDisposition({ status: m04Status,
 					proposalSubmitted: m04ProposalSubmitted, snapshotCreated: m04SnapshotCreated,
+					...(m04TransactionState ? { transactionState: m04TransactionState } : {}),
 					threw: m04Threw });
 				// Export only after recording final M04 state. The canonical tuple above
 				// remains the earlier selected candidate until a later real comparison.
 				await exportPrefixedArchive(archiveDir, outputDir, "provenance-import");
 				importBoundedRuns.push({ runId: goal.runId, outcome: finished.outcome ?? "partial",
+					acceptedTaskIds: accepted ? [importedTask.taskId] : [],
 					...(accepted ? { selectedTaskId: importedTask.taskId } : {}) });
 				const importSummary = path.join(priorSeedDir, "provenance-import-result.json");
 				provenanceImportSummary = { version: 1,
@@ -2070,10 +2383,12 @@ async function main() {
 							boundedRuns: [...previousCheckpoint.boundedRuns, ...importBoundedRuns],
 							selectedArtifacts: previousCheckpoint.selectedArtifacts,
 							assessmentHistory: previousCheckpoint.assessmentHistory,
-							stopReason: "m04-evidence-incomplete" }));
+							stopReason: failedM04StopReason(m04Status === "not-run" ? "not_run" : m04Status,
+								m04TransactionState) }));
 					await saveStatus({ outcome: "incomplete", provenanceImport: provenanceImportSummary,
 						originalObjective: { id: originalObjective.id,
-							stopReason: "m04-evidence-incomplete", checkpointFile: "objective-checkpoint.json" },
+							stopReason: failedM04StopReason(m04Status === "not-run" ? "not_run" : m04Status,
+								m04TransactionState), checkpointFile: "objective-checkpoint.json" },
 						blocker: m04EffectDisposition,
 						independentValidation: "prior selected source retained; M04 transaction needs reconciliation" });
 					process.exitCode = 1;
@@ -2121,7 +2436,7 @@ async function main() {
 				{ name: "host-capabilities.json", file: capabilityFile },
 				...(restartReservation ? [{ name: "prior-history-gap.json",
 					file: path.join(priorSeedDir, "prior-history-gap.json") }] : []),
-				...(previousBundle["research-history.json"] ? [{ name: "prior-research-history.json", file: path.join(priorSeedDir, "prior-research-history.json") }] : []),
+				...(historySeed?.evidence ?? []),
 				{ name: "original-problem.txt", file: ws.problemFile },
 				...found.files.map((name, index) => ({ name: `original-input-${index + 1}.txt`, file: path.join(ws.rawDir, name) })),
 				{ name: "candidate.cpp", file: path.join(priorSeedDir, "prior-candidate.cpp") },
@@ -2136,6 +2451,8 @@ async function main() {
 					file: historicalM04IndexPath }] : []),
 				...(priorTransportObservationPath ? [{ name: "prior-transport-observation.json",
 					file: priorTransportObservationPath }] : []),
+				...(m04QuarantineEvidencePath ? [{ name: "prior-m04-unresolved.json",
+					file: m04QuarantineEvidencePath }] : []),
 				...importAssessmentEvidence,
 			];
 			if (previousBundle["m04-adopted-knowledge.json"])
@@ -2336,26 +2653,32 @@ async function main() {
 				const currentGoal = await controller.status(runId);
 				const rejected = currentGoal.tasks.find(item => item.taskId === rejectedForRepair.taskId);
 				const unresolved = unresolvedGoalControl(currentGoal);
-				if (!shouldRepairRejectedReview({ winner: Boolean(winner), stopped: budget.snapshot().stopped,
+				const rejectedReview = shouldRepairRejectedReview({ winner: Boolean(winner), stopped: budget.snapshot().stopped,
 					aborted: abort.signal.aborted, rejected, unresolvedOperationIds: unresolved.operationIds,
-					unresolvedTaskIds: unresolved.taskIds })) break;
-				if (!rejected?.review) break;
+					unresolvedTaskIds: unresolved.taskIds });
+				const settledFailure = settledFailedM07RepairFeedback(currentGoal, rejectedForRepair.taskId,
+					{ winner: Boolean(winner), stopped: budget.snapshot().stopped, aborted: abort.signal.aborted });
+				if (!rejectedReview && !settledFailure) break;
 				const feedbackFile = path.join(priorSeedDir, `review-repair-${repairTaskIds.length + 1}.json`);
-				await writeFile(feedbackFile, `${JSON.stringify({ version: 1, kind: "m07-rejected-review-feedback",
-					goalRunId: runId, taskId: rejected.taskId, status: rejected.status,
-					checks: rejected.review.checks.map(check => ({ criterion: check.criterion, result: check.result })),
-					failures: rejected.review.failures, unexecuted: rejected.review.unexecuted,
-					interpretation: "Rejected development attempt. Preserve the frozen objective and all checks; no source or lesson is adopted." }, null, 2)}\n`, { mode: 0o600 });
+				const feedback = settledFailure ?? { version: 1, kind: "m07-rejected-review-feedback",
+					goalRunId: runId, taskId: rejected!.taskId, status: rejected!.status,
+					checks: rejected!.review!.checks.map(check => ({ criterion: check.criterion, result: check.result })),
+					failures: rejected!.review!.failures, unexecuted: rejected!.review!.unexecuted,
+					interpretation: "Rejected development attempt. Preserve the frozen objective and all checks; no source or lesson is adopted." };
+				await writeFile(feedbackFile, `${JSON.stringify(feedback, null, 2)}\n`, { mode: 0o600 });
 				repairFeedbackFiles.push(feedbackFile);
-				const priorAttemptFiles = currentGoal.tasks.filter(item => item.mode === "execute" &&
+				const priorAttemptFiles = (rejectedReview ? currentGoal.tasks : []).filter(item => item.mode === "execute" &&
 					["rejected", "failed"].includes(item.status)).flatMap(item =>
 					["candidate.cpp", "verification.json", "experiment-plan.json", "lesson-delta.json"]
 						.map(name => path.join(item.workDir, name)).filter(existsSync));
 				statusPhase = "review-repair-predecessor-finishing";
 				const partial = await controller.finish(runId, { outcome: "partial", returnPath: "user",
-					summary: "Ordinary M07 review rejected the bounded candidates; their exact failures remain development evidence for a linked successor goal.",
+					summary: rejectedReview ?
+						"Ordinary M07 review rejected the bounded candidates; their exact failures remain development evidence for a linked successor goal." :
+						"A settled M07 task failed without ordinary review; its host failure facts remain development evidence for a linked fresh goal.",
 					goalChecks: initialChecks.map(criterion => ({ criterion, result: "not_run", evidence: [] })),
-					limitations: ["No candidate from this goal was accepted or selected."] });
+					limitations: ["No candidate from this goal was accepted or selected.",
+						...(settledFailure ? ["The failed task's source and lesson were not reviewed or adopted."] : [])] });
 				rejectedGoalOutcomes.push({ runId, outcome: partial.outcome ?? "partial" });
 				for (const failedTask of partial.tasks.filter(item => item.mode === "execute")) {
 					const archiveDir = path.join(campaignRoot, `review-repair-${rejectedGoalOutcomes.length}-${failedTask.taskId}-archive`);
@@ -2363,11 +2686,9 @@ async function main() {
 					await exportPrefixedArchive(archiveDir, outputDir,
 						`fallback-${sha256(runId).slice(0, 12)}-${failedTask.taskId}`);
 				}
-				const successor = await controller.begin({ goal: goal.goal,
-					problemRelation: `Linked fresh repair of rejected goal ${runId}; ${goal.problemRelation}`,
-					constraints: [...goal.constraints], successCriteria: [...goal.successCriteria],
-					plan: `${goal.plan}\nRead the exact predecessor review feedback as untrusted development evidence. The rejected goal stays partial; satisfy all original checks in this fresh goal.`,
-					exploratory: true });
+				const repairPlan = freshM07RepairPlan(goal, runId, initialSpec, repairFeedbackFiles,
+					priorAttemptFiles, settledFailure ? "settled-failed" : "rejected-review");
+				const successor = await controller.begin(repairPlan.goal);
 				runId = successor.runId;
 				statusRunId = runId;
 				followOnPriorCandidate = path.join(priorSeedDir, "prior-candidate.cpp");
@@ -2377,9 +2698,7 @@ async function main() {
 				registeredScopeActive = initialRegistered;
 				let repairTask: Awaited<ReturnType<typeof controller.delegate>>;
 				try {
-					repairTask = await controller.delegate(runId, { ...initialSpec, context: undefined,
-						objective: `${initialSpec.objective}\n\nThe previous M07 task was rejected by the controller. Read the supplied review-repair feedback and prior attempt files as untrusted development evidence. Repair the exact frozen task; satisfy every original check and output obligation. Do not claim the rejected source or lesson was adopted.`,
-						inputs: [...initialSpec.inputs, ...repairFeedbackFiles, ...priorAttemptFiles] });
+					repairTask = await controller.delegate(runId, repairPlan.task);
 				} finally { registeredScopeActive = false; }
 				repairTaskIds.push(repairTask.taskId);
 				statusPhase = "review-repair-task-returned";
@@ -2391,6 +2710,8 @@ async function main() {
 				catch { /* no verified repair */ }
 				const repairHostPassed = repairTask.status === "returned" && repairTask.loopStopReason === "ready" &&
 					repairResult?.status === "passed";
+				rejectedForRepair = repairTask;
+				if (repairTask.status === "failed") continue;
 				if (repairTask.status !== "returned" || !repairTask.reportPath) break;
 				statusPhase = "review-repair-review";
 				const reviewed = await controller.review(runId, { taskId: repairTask.taskId,
@@ -2404,7 +2725,6 @@ async function main() {
 							[path.join(repairTask.workDir, "experiment-plan.json")] : [])],
 					failures: repairHostPassed ? [] : ["repair candidate did not pass all observed checks"] });
 				if (reviewed.status === "accepted") winner = repairTask;
-				rejectedForRepair = repairTask;
 			}
 			statusPhase = "review-repair-reviewed";
 			// A failed or interrupted parent can leave an issued provider operation unknown.
@@ -2472,6 +2792,7 @@ async function main() {
 				selectedTask.taskId === task.taskId ? "initial" : "fork" : "none";
 			let m04: { status: "completed" | "failed" | "not_run"; runId?: string; proposalSubmitted?: boolean;
 				snapshotCreated?: boolean; evidenceReturned?: boolean; adoptedExperienceRefs?: KnowledgeRef[];
+				transactionState?: PortableM04KnowledgeTransactionV1["state"];
 				failure?: ReturnType<typeof privateExceptionDiagnostic> } = { status: "not_run" };
 			if (firstGoalReady && branchRequirementSatisfied && !budget.snapshot().stopped && !abort.signal.aborted) {
 				statusPhase = "m04-dispatch";
@@ -2481,21 +2802,37 @@ async function main() {
 						{ feedback: { kind: "M07", runId }, freshSession: true,
 							requiredM07ReadPaths: selectedM04ReadPaths,
 							purpose: "Adjudicate bounded M07 candidate lessons and limits" });
+					const transaction = await exportPortableM04Transaction({ ws, m04RunId: processed.record.runId,
+						destination: outputDir });
+					if (transaction.state === "unknown" || transaction.state === "merge-intent")
+						fail("returned M04 has an unresolved knowledge transaction");
+					const transactionFacts = privateM04TransactionFacts(transaction);
 					const complete = processed.record.status === "completed" && processed.record.failures.length === 0;
 					const coverage = firstGoalReady ? await m04EvidenceReturned(processed.record, selectedTask.taskId,
 						initialRegistered ? ["experiment-plan.json"] : []) :
 						{ complete: false, paths: [] };
 					m04 = { status: complete ? "completed" : "failed", runId: processed.record.runId,
-						proposalSubmitted: Boolean(processed.proposalId), snapshotCreated: Boolean(processed.snapshotId),
+						proposalSubmitted: transactionFacts.proposalSubmitted,
+						snapshotCreated: transactionFacts.snapshotCreated,
+						transactionState: transaction.state,
 						evidenceReturned: coverage.complete && selectedM04ReadPaths.every(item => coverage.paths.includes(item)),
 						adoptedExperienceRefs: complete ? await adoptedExperienceRefs(store, processed.record.runId,
 							coverage.complete && selectedM04ReadPaths.every(item => coverage.paths.includes(item))) : [] };
-				} catch (error) { m04 = { status: "failed", adoptedExperienceRefs: [],
-					failure: privateExceptionDiagnostic(error, runtimeKey) }; }
+				} catch (error) {
+					const retained = await retainFailedM04Transaction(ws, runId!, outputDir);
+					m04 = { status: "failed", adoptedExperienceRefs: [],
+						...(retained ? { runId: retained.runId,
+							...(retained.proposalSubmitted !== undefined ? { proposalSubmitted: retained.proposalSubmitted } : {}),
+							...(retained.snapshotCreated !== undefined ? { snapshotCreated: retained.snapshotCreated } : {}),
+							...(retained.transaction ? { transactionState: retained.transaction.state } : {}) } : {}),
+						failure: privateExceptionDiagnostic(error, runtimeKey) };
+				}
 			}
 			const archivedM04 = await recordPrivateM04Outcome(outputDir, { state: m04.status === "not_run" ? "not-run" : m04.status,
-				...(m04.runId ? { runId: m04.runId } : {}), proposalSubmitted: m04.proposalSubmitted ?? false,
-				snapshotCreated: m04.snapshotCreated ?? false, adoptedExperienceRefs: m04.adoptedExperienceRefs ?? [] }, store);
+				...(m04.runId ? { runId: m04.runId } : {}),
+				...(m04.proposalSubmitted !== undefined ? { proposalSubmitted: m04.proposalSubmitted } : {}),
+				...(m04.snapshotCreated !== undefined ? { snapshotCreated: m04.snapshotCreated } : {}),
+				adoptedExperienceRefs: m04.adoptedExperienceRefs ?? [] }, store);
 			const knowledgeExport = archivedM04.m04?.knowledgeExport ?? { state: "incomplete", reason: "M04 export state unavailable" };
 			const m04AdoptedExperienceCount = m04.runId ? (await store.list()).filter(record =>
 				record.source.stage === "M04" && record.source.runId === m04.runId &&
@@ -2516,6 +2853,7 @@ async function main() {
 			const priorAssessmentCount = assessmentHistory.length;
 			let objectiveStopReason: ObjectiveStopReason = "bounded-run-incomplete";
 			let currentM04Status = m04.status;
+			let currentM04TransactionState = m04.transactionState;
 			let currentM04Read = m04SelectedReadContractSatisfied;
 			let currentKnowledgeExport = knowledgeExport;
 			let currentReusableRefs = reusableRefs;
@@ -2530,7 +2868,8 @@ async function main() {
 					if (budget.snapshot().stopped) return campaignObjectiveStop(budget.snapshot().stopReason) ??
 						"bounded-run-incomplete";
 					if (abort.signal.aborted) return "cancelled";
-					if (currentM04Status === "failed") return "m04-evidence-incomplete";
+					if (currentM04Status === "failed")
+						return failedM04StopReason(currentM04Status, currentM04TransactionState);
 					if (!firstGoalReady || currentM04Status !== "completed" || currentKnowledgeExport.state === "incomplete" ||
 						!currentM04Read || !existsSync(candidate) || !existsSync(verificationPath)) return "bounded-run-incomplete";
 					return "admitted";
@@ -2590,8 +2929,10 @@ async function main() {
 								historicalUnresolvedOperationIds,
 								{ boundedRuns: [...previousCheckpoint.boundedRuns, ...importBoundedRuns, ...rejectedGoalOutcomes,
 									{ runId: runId!, outcome: finished.outcome ?? "unknown",
+									acceptedTaskIds: finished.tasks.filter(item => item.status === "accepted").map(item => item.taskId),
 									...(firstGoalReady ? { selectedTaskId: selectedTask.taskId } : {}) }],
-									selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
+									selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json",
+										...(selectedRegisteredPlan ? ["experiment-plan.json"] : [])],
 									assessment, assessmentHistory, stopReason: "assessment-validation-pending" }));
 						},
 						advance: async proposal => {
@@ -2709,22 +3050,36 @@ async function main() {
 									{ feedback: { kind: "M07", runId: secondGoal.runId }, freshSession: true,
 										requiredM07ReadPaths: requiredPaths,
 										purpose: "Adjudicate the latest model-proposed bounded M07 result" });
+								const transaction = await exportPortableM04Transaction({ ws, m04RunId: processed.record.runId,
+									destination: nextArchiveDir });
+								if (transaction.state === "unknown" || transaction.state === "merge-intent")
+									fail("returned M04 has an unresolved knowledge transaction");
+								const transactionFacts = privateM04TransactionFacts(transaction);
 								const coverage = await m04EvidenceReturned(processed.record, secondTask.taskId,
 									registered ? ["experiment-plan.json"] : []);
 								const complete = processed.record.status === "completed" && processed.record.failures.length === 0 &&
 									coverage.complete && requiredPaths.every(item => coverage.paths.includes(item));
 								nextM04 = { status: complete ? "completed" : "failed", runId: processed.record.runId,
-									proposalSubmitted: Boolean(processed.proposalId), snapshotCreated: Boolean(processed.snapshotId),
+									proposalSubmitted: transactionFacts.proposalSubmitted,
+									snapshotCreated: transactionFacts.snapshotCreated,
+									transactionState: transaction.state,
 									evidenceReturned: complete,
 									adoptedExperienceRefs: complete ? await adoptedExperienceRefs(store, processed.record.runId, true) : [] };
-							} catch (error) { nextM04 = { status: "failed", adoptedExperienceRefs: [],
-								failure: privateExceptionDiagnostic(error, runtimeKey) }; }
+							} catch (error) {
+								const retained = await retainFailedM04Transaction(ws, secondGoal.runId, nextArchiveDir);
+								nextM04 = { status: "failed", adoptedExperienceRefs: [],
+									...(retained ? { runId: retained.runId,
+										...(retained.proposalSubmitted !== undefined ? { proposalSubmitted: retained.proposalSubmitted } : {}),
+										...(retained.snapshotCreated !== undefined ? { snapshotCreated: retained.snapshotCreated } : {}),
+										...(retained.transaction ? { transactionState: retained.transaction.state } : {}) } : {}),
+									failure: privateExceptionDiagnostic(error, runtimeKey) };
+							}
 									}
 						const nextArchive = await recordPrivateM04Outcome(nextArchiveDir,
 							{ state: nextM04.status === "not_run" ? "not-run" : nextM04.status,
 								...(nextM04.runId ? { runId: nextM04.runId } : {}),
-								proposalSubmitted: nextM04.proposalSubmitted ?? false,
-								snapshotCreated: nextM04.snapshotCreated ?? false,
+								...(nextM04.proposalSubmitted !== undefined ? { proposalSubmitted: nextM04.proposalSubmitted } : {}),
+								...(nextM04.snapshotCreated !== undefined ? { snapshotCreated: nextM04.snapshotCreated } : {}),
 								adoptedExperienceRefs: nextM04.adoptedExperienceRefs ?? [] }, store);
 						const iterationPrefix = `iteration-${localIteration}`;
 						await exportPrefixedArchive(nextArchiveDir, outputDir, iterationPrefix);
@@ -2745,7 +3100,8 @@ async function main() {
 						if (chooseFollowOn && nextArchive.files.some(item => item.name === "candidate.cpp" && item.status === "present") &&
 							nextArchive.files.some(item => item.name === "verification.json" && item.status === "present")) {
 							if (selectedCandidateSource !== "followon") await exportPrefixedArchive(outputDir, outputDir, "initial");
-							for (const name of [...await archiveEvidenceFiles(outputDir), "workflow-archive.json", "m04-adopted-knowledge.json"]) {
+							for (const name of [...await archiveEvidenceFiles(outputDir), "workflow-archive.json",
+								"m04-adopted-knowledge.json", "m04-transaction.json"]) {
 								await rm(path.join(outputDir, name), { force: true });
 								if (existsSync(path.join(nextArchiveDir, name))) await copyFile(path.join(nextArchiveDir, name), path.join(outputDir, name));
 							}
@@ -2761,6 +3117,7 @@ async function main() {
 						followOnSourceChanged = sourceChanged;
 						if (secondReady) {
 							currentM04Status = nextM04.status;
+							currentM04TransactionState = nextM04.transactionState;
 							currentM04Read = nextM04.evidenceReturned === true;
 							currentKnowledgeExport = nextArchive.m04?.knowledgeExport ?? { state: "incomplete" };
 							currentReusableRefs = nextM04.evidenceReturned && currentKnowledgeExport.state === "complete" ?
@@ -2828,8 +3185,13 @@ async function main() {
 				await writeFile(path.join(outputDir, "restored-candidate-verification.json"), JSON.stringify(prior), { mode: 0o600 });
 				const comparison = compareCandidateTimings(prior, finalVerification);
 				const changed = !(await readFile(candidate)).equals(await readFile(path.join(priorSeedDir, "prior-candidate.cpp")));
-				historicalSelection = { priorRetained: !chooseFollowOnCandidate(true, finalVerification.status === "passed", changed, comparison),
-					retentionReason: comparison.state === "measured" ? "measured-comparison" : "no-supported-current-gain",
+				const m04SelectionReady = currentM04Status === "completed" && currentM04Read &&
+					currentKnowledgeExport.state !== "incomplete";
+				historicalSelection = { priorRetained: retainPriorSelectionUntilM04Ready({ status: currentM04Status,
+					fullSelectedRead: currentM04Read, knowledgeExportState: currentKnowledgeExport.state },
+					true, finalVerification.status === "passed", changed, comparison),
+					retentionReason: !m04SelectionReady ? "m04-stage-unresolved" :
+						comparison.state === "measured" ? "measured-comparison" : "no-supported-current-gain",
 					comparison, comparisonPerformed: comparison.state === "measured",
 					historicalTimingUsed: false, priorRevalidated: prior.status === "passed" };
 				if (historicalSelection.priorRetained) {
@@ -2837,12 +3199,14 @@ async function main() {
 					const history = previousBundle["research-history.json"] ? JSON.parse(previousBundle["research-history.json"]) :
 						{ version: 1, kind: "untrusted-version-bound-research-history", entries: [] };
 					const unselectedFiles: Record<string, string> = {};
-					for (const name of ["candidate.cpp", "verification.json", "workflow-archive.json", "experiment-plan.json", "m04-adopted-knowledge.json"])
+					for (const name of ["candidate.cpp", "verification.json", "workflow-archive.json",
+						"experiment-plan.json", "m04-adopted-knowledge.json", "m04-transaction.json"])
 						if (existsSync(path.join(outputDir, name))) unselectedFiles[name] = await readFile(path.join(outputDir, name), "utf8");
 					history.entries.push({ originalContractId: originalObjective.id, goalRunId: finalArchive.goalRunId, taskId: finalArchive.taskId,
 						interpretation: "Unselected current experiment; no confirmed replacement gain against the historical candidate", files: unselectedFiles });
 					await writeFile(path.join(outputDir, "research-history.json"), JSON.stringify(history), { mode: 0o600 });
-					for (const name of [...await archiveEvidenceFiles(outputDir), "workflow-archive.json", "m04-adopted-knowledge.json"]) {
+					for (const name of [...await archiveEvidenceFiles(outputDir), "workflow-archive.json",
+						"m04-adopted-knowledge.json", "m04-transaction.json"]) {
 						await rm(path.join(outputDir, name), { force: true });
 						if (previousBundle[name as keyof PrivateContinuationBundle] !== undefined)
 							await writeFile(path.join(outputDir, name), previousBundle[name as keyof PrivateContinuationBundle]!, { mode: 0o600 });
@@ -2850,10 +3214,13 @@ async function main() {
 					finalArchive = JSON.parse(previousBundle["workflow-archive.json"]!) as typeof finalArchive;
 				}
 			}
+			const selectedArtifactNames = historicalSelection.priorRetained === true ?
+				previousCheckpoint.selectedArtifacts : ["candidate.cpp", "verification.json", "workflow-archive.json",
+					...(selectedRegisteredPlan ? ["experiment-plan.json"] : [])];
 			const finalCandidateAvailable = selectedCandidateSource !== "none" &&
 				finalArchive.controllerEvidence.reviewStatus === "accepted" &&
 				(historicalSelection.priorRetained === true || Boolean(finalArchive.controllerEvidence.reviewDecision?.file && existsSync(path.join(outputDir, "review-decision.json")))) &&
-				["candidate.cpp", "verification.json"].every(name =>
+				selectedArtifactNames.filter(name => name !== "workflow-archive.json").every(name =>
 					finalArchive.files.some(item => item.name === name && item.status === "present") &&
 					existsSync(path.join(outputDir, name)));
 			const finalCandidateVerified = finalCandidateAvailable && (historicalSelection.priorRetained !== true || historicalSelection.priorRevalidated === true);
@@ -2866,13 +3233,16 @@ async function main() {
 				followOnCompleted ? "fulfilled" : "partial";
 			const boundedRuns = [...previousCheckpoint.boundedRuns, ...importBoundedRuns, ...rejectedGoalOutcomes,
 				{ runId: runId!, outcome: finished.outcome ?? "unknown",
+				acceptedTaskIds: finished.tasks.filter(item => item.status === "accepted").map(item => item.taskId),
 				...(firstGoalReady ? { selectedTaskId: selectedTask.taskId } : {}) },
 				...followOnAttempts.filter(item => typeof item.goalRunId === "string").map(item => ({
 					runId: String(item.goalRunId), outcome: String(item.m07Outcome ?? "unknown"),
+					acceptedTaskIds: item.m07Outcome === "fulfilled" && typeof item.taskId === "string" ?
+						[String(item.taskId)] : [],
 					...(item.candidateSelected === true ? { selectedTaskId: String(item.taskId) } : {}) }))];
 			const objectiveCheckpoint = campaignObjectiveProgress(originalObjective,
 				historicalUnresolvedOperationIds, { boundedRuns,
-				selectedArtifacts: finalCandidateAvailable ? ["candidate.cpp", "verification.json", "workflow-archive.json"] : previousCheckpoint.selectedArtifacts,
+				selectedArtifacts: finalCandidateAvailable ? selectedArtifactNames : previousCheckpoint.selectedArtifacts,
 				...(objectiveAssessment ? { assessment: objectiveAssessment } : {}), assessmentHistory,
 				nextTaskDispatched: latestAssessmentAdvanced, stopReason: objectiveStopReason });
 			await writeObjectiveProgress(objectiveCheckpointFile, objectiveCheckpoint);
@@ -2999,7 +3369,18 @@ async function main() {
 			if (transportCensus !== undefined)
 				await writeFile(path.join(outputDir, "transport-diagnostics.json"), transportCensus,
 					{ mode: 0o600 });
-			let privateBundle = collectorFailureBundle(missionLedger.priorPrivateBundle, transportCensus);
+			let m04QuarantineText: string | undefined;
+			const m04QuarantineFile = path.join(outputDir, M04_TRANSACTION_QUARANTINE_FILE);
+			if (existsSync(m04QuarantineFile)) {
+				try {
+					const info = await lstat(m04QuarantineFile);
+					if (!info.isFile() || info.isSymbolicLink() || info.size > 4 * 1024 * 1024)
+						throw Error("M04 quarantine receipt is not a bounded regular file");
+					m04QuarantineText = await readFile(m04QuarantineFile, "utf8");
+				} catch { statusArchiveFailure = "m04-quarantine-receipt-unavailable"; process.exitCode = 1; }
+			}
+			let privateBundle = collectorFailureBundle(missionLedger.priorPrivateBundle,
+				transportCensus, m04QuarantineText);
 			try { privateBundle = await collectContinuationBundle(outputDir, missionLedger.priorPrivateBundle); }
 			catch { statusArchiveFailure = "research-continuation-collection-failed-prior-retained"; process.exitCode = 1; }
 			const sealed = sealCampaignCarry(missionLedger, { settledCny: requestAudit.settledCny,
@@ -3056,24 +3437,28 @@ async function main() {
 export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceReturned, inputs, stageProbe, verifierScratch,
 	checkCandidate, validateSelectedPriorTuple,
 	createPrivateCampaignBudget,
-	reviewedLegacyRestartEffects,
+	historicalGapEvidence,
 	appendRestartReservation, appendRestartGoalBinding,
 	privateFailureMessage, privateExceptionDiagnostic, credentialProbe, parseCheckerOutput, compareCandidateTimings,
 	campaignObjectiveStop, taskTelemetry, privateToolTelemetry,
 	chooseForkWinner, chooseFollowOnCandidate, firstM07Accepted, importM04EffectDisposition,
+	retainPriorSelectionUntilM04Ready,
 	selectedGoalBranchSatisfied,
 	archivedM07ImportTarget, fixedPrivateChecks: { diagnostic: CHECKS, registered: REGISTERED_CHECKS },
+	chooseArchivedM07ImportTarget,
 	createOneUseRestartGoalBinder,
-	shouldRepairRejectedReview,
+	shouldRepairRejectedReview, settledFailedM07RepairFeedback, freshM07RepairPlan,
 	availablePrivateArtifactNames,
 	initialHistoricalSelection,
 	forkReceiptMatches, contextLineageSummary, selectedM07ReviewReadPaths, exportPrefixedArchive, preserveCandidate,
 	preserveUnsettledGoalCheckpoint, preserveUnsettledBranchCheckpoint: preserveUnsettledGoalCheckpoint,
 	salvageObjectiveCheckpoint, collectContinuationBundle, collectorFailureBundle,
+	privateM04TransactionFacts, retainFailedM04Transaction, failedM04StopReason,
 	buildHostEffectReceipt,
 	unresolvedGoalControl, campaignObjectiveProgress,
 	canonicalUnresolvedOperationRefs, qualifiedOperationRef, reservedCanonicalOperationRefs,
-	registeredSourceShape, parseRegisteredCheckerOutput, validateContinuationSeed, rangeReadableHistory, sandboxArguments };
+	registeredSourceShape, parseRegisteredCheckerOutput, validateContinuationSeed, rangeReadableHistory,
+	stageRangeReadableHistory, stageHistoricalM04RejectionEvidence, sandboxArguments };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	const stopHeartbeat = startPrivateCampaignHeartbeat();

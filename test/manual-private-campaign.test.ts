@@ -37,6 +37,36 @@ test("shared-total campaign requires explicit manual admission and signed cumula
  assert.doesNotMatch(workflow, /up to [0-9.]+ CNY/);
 });
 
+test("failed research collection retains typed unresolved M04 quarantine for emergency carry", () => {
+	const old = { "candidate.cpp": "synthetic selected source" };
+	const typed = '{"version":1,"kind":"unresolved-historical-m04-quarantine","entries":[]}';
+	const retained = offlineChecks.collectorFailureBundle(old, undefined, typed);
+	assert.equal(retained?.["candidate.cpp"], old["candidate.cpp"]);
+	assert.equal(retained?.["m04-transaction-quarantine.json"], typed);
+});
+
+test("private history evidence distinguishes the sealed baseline from unquantified executed gaps", () => {
+	const baseline = { source: { runId: "7001", runAttempt: 1, commit: "a".repeat(40) },
+		resultArtifact: { immutableRef: "synthetic-baseline-result", digestScope: "github-artifact-archive",
+			sha256: "b".repeat(64) } } as any;
+	const gap = { source: { runId: "7002", runAttempt: 1, runNumber: 2, commit: "c".repeat(40) },
+		resultArtifact: { repository: "synthetic/repository", runId: "7002", artifactId: "8002",
+			artifactName: "synthetic-result", digestScope: "github-artifact-archive",
+			archiveSha256: "d".repeat(64) } } as any;
+	const evidence = offlineChecks.historicalGapEvidence(baseline, [gap], true) as any;
+	assert.equal(evidence.baselineCarry.source.runId, "7001");
+	assert.equal(evidence.baselineCarry.resultArtifact.immutableArtifactRef, "synthetic-baseline-result");
+	assert.equal(evidence.opaqueExecutedRuns[0].source.runId, "7002");
+	assert.match(evidence.opaqueExecutedRuns[0].resultArtifact.immutableArtifactRef, /\/runs\/7002\/artifacts\/8002\//);
+	assert.equal(evidence.opaqueExecutedRuns[0].accounting, "unquantified");
+	assert.equal(evidence.opaqueExecutedRuns[0].effectState, "unknown-unreconciled");
+	assert.doesNotMatch(JSON.stringify(evidence.opaqueExecutedRuns[0]), /settledCny|chargedCny|effects.*reviewed/);
+	const expired = offlineChecks.historicalGapEvidence({ ...baseline,
+		resultArtifact: undefined }, [gap], false) as any;
+	assert.equal(expired.baselineCarry.resultArtifact.state, "expired-or-unavailable");
+	assert.equal(expired.opaqueExecutedRuns[0].resultArtifact.artifactSha256, "d".repeat(64));
+});
+
 test("new campaign has no host time, call-count, iteration or round quota", async () => {
 	const workflow = await readFile(new URL("../.github/workflows/manual-private-campaign.yml", import.meta.url), "utf8");
 	assert.doesNotMatch(workflow, /timeout-minutes:/);
@@ -70,7 +100,15 @@ test("driver checkpoint synchronization matches a generic reservation with a pro
 		resultArtifact: { immutableRef: "synthetic-artifact", digestScope: "github-artifact-archive",
 			sha256: hash("encrypted-archive") }, committedNano: 1000, unknownHeldNano: 1 };
 	const input = { authenticatedCarryProof: { fixture: true }, privateBundle: bundle,
-		freshWorkspace: { workspaceId: "fresh-workspace", restartNonce: "nonce" },
+		freshWorkspace: { workspaceId: "mulpis-private-campaign-synthetic", restartNonce: "nonce" },
+		freshBoundary: { campaignRoot: "/tmp/mulpis-private-campaign-synthetic",
+			workspaceRoot: "/tmp/mulpis-private-campaign-synthetic/workspace",
+			storeRoot: "/tmp/mulpis-private-campaign-synthetic/workspace/.agent/knowledge",
+			storeEmpty: true as const, sessionCensusEmpty: true as const,
+			sessionMode: "no-prior-session-resume" as const,
+			grantProfile: "private-confined-read-dir" as const,
+			externalWriteTools: false as const, sharedStore: false as const,
+			selectedRevalidated: true as const },
 		failedHistory: { state: "unavailable" as const, reason: "Synthetic encrypted evidence gap",
 			immutableArtifactRef: facts.resultArtifact.immutableRef, digestScope: facts.resultArtifact.digestScope,
 			artifactSha256: facts.resultArtifact.sha256 } };
@@ -80,8 +118,12 @@ test("driver checkpoint synchronization matches a generic reservation with a pro
 			policyId: "synthetic-reviewed-policy", policySha256: hash("policy"),
 			operationAttestations: refs.map(operationRef => ({ operationRef,
 				sourceCommit: facts.source.commit, evidenceSha256: hash(operationRef) })),
-			effectClass: "confined-ephemeral-local", unknownBillingHeld: true,
-			actorThirdPartyMutations: "none", hostTransport: "immutable-versioned-archive" }),
+			effectClass: "historical-unknown-fresh-only", unknownBillingHeld: true,
+			actorThirdPartyMutations: "unknown", hostTransport: "immutable-versioned-archive",
+			accountingObservation: { historicalCommittedNano: facts.committedNano,
+				historicalUnknownHeldNano: facts.unknownHeldNano, settledNano: 0,
+				unknownObservedNano: 0, unpricedRequestCount: 0,
+				opaqueUnquantifiedRunCount: 0 } }),
 		revalidateSelection: async ({ tupleSha256 }) => ({ status: "passed", contractId: contract.id,
 			selectedRunId: "selected-goal", selectedTaskId: "T001", tupleSha256,
 			currentValidationSha256: hash("fresh-check") }),
@@ -190,6 +232,134 @@ test("failed experiment enters untrusted history while selected prior tuple rema
 	} finally { await rm(directory, { recursive: true, force: true }); }
 });
 
+test("same-task fallback cannot erase actual failed M04 proposal state in historical carry", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-history-final-state-"));
+	try {
+		const prior = {
+			"candidate.cpp": "// prior selected\n",
+			"verification.json": JSON.stringify({ version: 1, status: "passed" }),
+			"workflow-archive.json": JSON.stringify({ version: 1, kind: "m07-private-candidate-archive",
+				goalRunId: "R001", taskId: "T001", controllerEvidence: { reviewStatus: "accepted" } }),
+			"objective-checkpoint.json": JSON.stringify({ contract: { id: "synthetic-contract" },
+				selectedArtifacts: ["candidate.cpp", "verification.json"], boundedRuns: [{ runId: "R001", selectedTaskId: "T001" }] }),
+		};
+		await writeFile(path.join(directory, "objective-checkpoint.json"), prior["objective-checkpoint.json"]);
+		const goalRunId = "R002", taskId = "T003";
+		const prefix = `fallback-${createHash("sha256").update(goalRunId).digest("hex").slice(0, 12)}-${taskId}`;
+		const actual = { version: 1, kind: "m07-private-candidate-archive", goalRunId, taskId,
+			controllerEvidence: { reviewStatus: "accepted" },
+			m04: { state: "failed", runId: "M04-actual", proposalSubmitted: true, snapshotCreated: false } };
+		const stale = { ...actual, m04: { state: "not-run", proposalSubmitted: false, snapshotCreated: false } };
+		await writeFile(path.join(directory, "workflow-followon-archive.json"), JSON.stringify(actual));
+		await writeFile(path.join(directory, "followon-candidate.cpp"), "// same candidate\n");
+		await writeFile(path.join(directory, "followon-verification.json"), JSON.stringify({ status: "passed" }));
+		await writeFile(path.join(directory, `workflow-${prefix}-archive.json`), JSON.stringify(stale));
+		await writeFile(path.join(directory, `${prefix}-candidate.cpp`), "// same candidate\n");
+		await writeFile(path.join(directory, `${prefix}-verification.json`), JSON.stringify({ status: "passed" }));
+		const carried = await offlineChecks.collectContinuationBundle(directory, prior);
+		const history = JSON.parse(carried?.["research-history.json"] ?? "null");
+		const matches = history.entries.filter((entry: { goalRunId: string; taskId: string }) =>
+			entry.goalRunId === goalRunId && entry.taskId === taskId);
+		assert.equal(matches.length, 1);
+		assert.deepEqual(JSON.parse(matches[0].files["workflow-archive.json"]).m04, actual.m04);
+		const next = path.join(directory, "next"); await mkdir(next);
+		await writeFile(path.join(next, "objective-checkpoint.json"), prior["objective-checkpoint.json"]);
+		await writeFile(path.join(next, `workflow-${prefix}-archive.json`), JSON.stringify(stale));
+		await writeFile(path.join(next, `${prefix}-candidate.cpp`), "// same candidate\n");
+		await writeFile(path.join(next, `${prefix}-verification.json`), JSON.stringify({ status: "passed" }));
+		const carriedAgain = await offlineChecks.collectContinuationBundle(next, carried);
+		const retained = JSON.parse(carriedAgain?.["research-history.json"] ?? "null").entries.filter(
+			(entry: { goalRunId: string; taskId: string }) => entry.goalRunId === goalRunId && entry.taskId === taskId);
+		assert.equal(retained.length, 1);
+		assert.deepEqual(JSON.parse(retained[0].files["workflow-archive.json"]).m04, actual.m04);
+		const withTransaction = { ...actual,
+			m04: { ...actual.m04, transaction: { file: "followon-m04-transaction.json",
+				state: "rejected-draft" } } };
+		await writeFile(path.join(directory, "workflow-followon-archive.json"), JSON.stringify(withTransaction));
+		await writeFile(path.join(directory, "followon-m04-transaction.json"),
+			'{"version":1,"kind":"m04-knowledge-transaction","state":"rejected-draft"}\n');
+		const withReceipt = await offlineChecks.collectContinuationBundle(directory, prior);
+		const receiptEntries = JSON.parse(withReceipt?.["research-history.json"] ?? "null").entries;
+		const receiptEntry = receiptEntries.find((entry: { goalRunId: string; taskId: string }) =>
+			entry.goalRunId === goalRunId && entry.taskId === taskId);
+		assert.match(receiptEntry.files["m04-transaction.json"], /rejected-draft/);
+		await writeFile(path.join(directory, `${prefix}-candidate.cpp`), "// conflicting candidate\n");
+		await assert.rejects(offlineChecks.collectContinuationBundle(directory, prior), /archives disagree on candidate\.cpp/);
+		await writeFile(path.join(directory, `${prefix}-candidate.cpp`), "// same candidate\n");
+		await writeFile(path.join(directory, `${prefix}-verification.json`), JSON.stringify({ status: "failed" }));
+		await assert.rejects(offlineChecks.collectContinuationBundle(directory, prior), /archives disagree on verification\.json/);
+		await writeFile(path.join(directory, `${prefix}-verification.json`), JSON.stringify({ status: "passed" }));
+		await writeFile(path.join(directory, `workflow-${prefix}-archive.json`), JSON.stringify({ ...stale,
+			m04: { state: "completed", proposalSubmitted: false, snapshotCreated: true } }));
+		await assert.rejects(offlineChecks.collectContinuationBundle(directory, prior), /historical M04 outcomes conflict/);
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("range-readable prior history partitions losslessly into fully enumerated bounded UTF-8 files", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-history-parts-"));
+	try {
+		const history = JSON.stringify({ version: 1, kind: "untrusted-version-bound-research-history",
+			entries: [{ goalRunId: "R001", taskId: "T001", files: { "candidate.cpp": "漢".repeat(340_000) } }] });
+		const rendered = offlineChecks.rangeReadableHistory(history);
+		assert.ok(Buffer.byteLength(rendered, "utf8") > 1_000_000);
+		const staged = await offlineChecks.stageRangeReadableHistory(root, history);
+		assert.equal(staged.partitioned, true);
+		const index = JSON.parse(await readFile(path.join(root, "prior-research-history-index.json"), "utf8"));
+		assert.equal(index.kind, "range-readable-history-part-index");
+		assert.equal(index.totalBytes, Buffer.byteLength(rendered, "utf8"));
+		assert.ok(index.parts.length > 1);
+		assert.deepEqual(staged.evidence.map(item => item.name), ["prior-research-history-index.json",
+			...index.parts.map((part: { name: string }) => part.name)]);
+		assert.deepEqual(staged.inputs, staged.evidence.map(item => `objective-seeds/${item.name}`));
+		const parts = [];
+		for (const part of index.parts as Array<{ name: string; bytes: number }>) {
+			const bytes = await readFile(path.join(root, part.name));
+			assert.equal(bytes.length, part.bytes);
+			assert.ok(bytes.length <= 1_000_000);
+			assert.doesNotMatch(bytes.toString("utf8"), /\uFFFD/, "parts must not split UTF-8 characters");
+			parts.push(bytes);
+		}
+		assert.deepEqual(Buffer.concat(parts), Buffer.from(rendered, "utf8"));
+		assert.equal((await stat(path.join(root, "prior-research-history-index.json"))).size <= 1_000_000, true);
+		assert.equal("sha256" in index, false, "index must not introduce a hash-manifest contract");
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("rejected historical M04 draft is staged as complete read-only bounded evidence", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-rejected-m04-evidence-"));
+	try {
+		const portable = JSON.stringify({ version: 1, kind: "m04-knowledge-transaction",
+			m04RunId: "M04-synthetic", state: "rejected-draft",
+			padding: "回".repeat(380_000) });
+		const bundle = { "research-history.json": JSON.stringify({ entries: [{
+			goalRunId: "G-synthetic", taskId: "T001", files: {
+				"workflow-archive.json": JSON.stringify({ m04: { runId: "M04-synthetic" } }),
+				"m04-transaction.json": portable,
+			} }] }) };
+		const names = await offlineChecks.stageHistoricalM04RejectionEvidence({ goalRoot: root,
+			bundle, goalRunId: "G-synthetic", taskId: "T001" });
+		assert.ok(names[0].endsWith("-index.json"));
+		const index = JSON.parse(await readFile(path.join(root, names[0]), "utf8"));
+		assert.deepEqual(index.parts.map((part: { name: string }) => part.name), names.slice(1));
+		const parts = await Promise.all(names.slice(1).map(name => readFile(path.join(root, name))));
+		assert.ok(parts.every(part => part.length <= 1_000_000));
+		assert.equal(Buffer.concat(parts).toString("utf8"), portable);
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("small prior history retains the original single-file assessor path", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-history-single-"));
+	try {
+		const history = JSON.stringify({ version: 1, kind: "untrusted-version-bound-research-history", entries: [] });
+		const staged = await offlineChecks.stageRangeReadableHistory(root, history);
+		assert.equal(staged.partitioned, false);
+		assert.deepEqual(staged.evidence.map(item => item.name), ["prior-research-history.json"]);
+		assert.deepEqual(staged.inputs, ["objective-seeds/prior-research-history.json"]);
+		assert.equal(await readFile(path.join(root, "prior-research-history.json"), "utf8"),
+			offlineChecks.rangeReadableHistory(history));
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("no accepted current candidate reports prior tuple retention without a performance claim", () => {
 	const status = offlineChecks.initialHistoricalSelection("none", "passed");
 	assert.equal(status.priorRetained, true);
@@ -288,6 +458,18 @@ test("follow-on cannot promote byte-identical code on a noisy measured speedup",
 	assert.equal(offlineChecks.chooseFollowOnCandidate(true, false, true, apparentGain), false);
 });
 
+test("an accepted measured candidate stays unselected until M04 and its read/export finish", () => {
+	const favorable = { state: "measured", medianRatio: 1.25, minRatio: 1.02 };
+	const retain = offlineChecks.retainPriorSelectionUntilM04Ready;
+	for (const m04 of [
+		{ status: "failed", fullSelectedRead: true, knowledgeExportState: "none" },
+		{ status: "completed", fullSelectedRead: false, knowledgeExportState: "none" },
+		{ status: "completed", fullSelectedRead: true, knowledgeExportState: "incomplete" },
+	] as const) assert.equal(retain(m04, true, true, true, favorable), true);
+	assert.equal(retain({ status: "completed", fullSelectedRead: true,
+		knowledgeExportState: "complete" }, true, true, true, favorable), false);
+});
+
 test("a real fork with no accepted M07 winner cannot unlock a fulfilled follow-on", () => {
 	assert.equal(offlineChecks.firstM07Accepted(false, "partial"), false);
 	assert.equal(offlineChecks.firstM07Accepted(false, "fulfilled"), false);
@@ -307,6 +489,53 @@ test("controller rejection after ready host pass remains repairable until actual
 		rejected: { ...rejected, loopStopReason: "blocked" } }), false);
 	assert.equal(offlineChecks.shouldRepairRejectedReview({ ...base, unresolvedOperationIds: ["O001"] }), false);
 	assert.equal(offlineChecks.shouldRepairRejectedReview({ ...base, stopped: true }), false);
+});
+
+test("settled no-report M07 failure starts a linked fresh task from the selected prior and can reach acceptance", () => {
+	const goal = { runId: "R001", goal: "Preserve the original research objective",
+		problemRelation: "Original objective", constraints: ["preserve source provenance"],
+		successCriteria: ["verified source", "measured result"], plan: "Compare measured candidates",
+		tasks: [{ taskId: "T001", mode: "execute", status: "failed", review: undefined,
+			executionFailure: "HTTP 502; hidden sk-synthetic-secret", loopStopReason: "output-limit" }],
+		executionState: { operations: [{ id: "O001", taskId: "T001", status: "response-received" },
+			{ id: "O002", taskId: "T001", status: "partial-settled" }] } } as any;
+	const feedback = offlineChecks.settledFailedM07RepairFeedback(goal, "T001",
+		{ winner: false, stopped: false, aborted: false });
+	assert.equal(feedback?.kind, "m07-settled-failed-task-feedback");
+	assert.equal(feedback?.failureCategory, "http-502");
+	assert.deepEqual(feedback?.operations, [{ operationId: "O001", status: "response-received" },
+		{ operationId: "O002", status: "partial-settled" }]);
+	assert.doesNotMatch(JSON.stringify(feedback), /synthetic-secret/);
+	const selectedPrior = "/isolated/workspace/objective-seeds/prior-candidate.cpp";
+	const spec = { mode: "execute", objective: "Improve this measured candidate",
+		inputs: [selectedPrior], expectedOutputs: ["candidate.cpp", "lesson-delta.json"],
+		checks: ["verified source", "measured result"], executionLoop: { mode: "until-ready" } } as any;
+	const repair = offlineChecks.freshM07RepairPlan(goal, "R001", spec,
+		["/isolated/workspace/objective-seeds/review-repair-1.json"], [], "settled-failed");
+	assert.equal(repair.goal.goal, goal.goal);
+	assert.deepEqual(repair.goal.successCriteria, goal.successCriteria);
+	assert.match(repair.goal.problemRelation, /Linked fresh repair.*R001/);
+	assert.deepEqual(repair.task.checks, spec.checks);
+	assert.deepEqual(repair.task.expectedOutputs, spec.expectedOutputs);
+	assert.deepEqual(repair.task.inputs[0], selectedPrior);
+	assert.equal(repair.task.context, undefined);
+	assert.equal(repair.task.parentTaskId, undefined);
+	assert.equal(repair.task.supersedesTaskId, undefined);
+	assert.match(repair.task.objective, /do not replay or resume/);
+	const acceptedSuccessor = { runId: "R002", tasks: [{ taskId: "T001", status: "accepted" }], outcome: "fulfilled" };
+	assert.equal(offlineChecks.firstM07Accepted(acceptedSuccessor.tasks[0].status === "accepted",
+		acceptedSuccessor.outcome), true);
+});
+
+test("unknown M07 operation or task prevents fresh settled-failure repair", () => {
+	const goal = { runId: "R001", tasks: [{ taskId: "T001", mode: "execute", status: "failed" }],
+		executionState: { operations: [{ id: "O001", taskId: "T001", status: "unknown" }] } } as any;
+	const eligible = (value: any) => offlineChecks.settledFailedM07RepairFeedback(value, "T001",
+		{ winner: false, stopped: false, aborted: false });
+	assert.equal(eligible(goal), undefined);
+	assert.equal(eligible({ ...goal, executionState: { operations: [{ ...goal.executionState.operations[0], status: "issued" }] } }), undefined);
+	assert.equal(eligible({ ...goal, executionState: { operations: [{ ...goal.executionState.operations[0], status: "response-received" }] },
+		tasks: [...goal.tasks, { taskId: "T002", mode: "execute", status: "unknown" }] }), undefined);
 });
 
 test("host effect receipt captures complete task and live session census without replaying a prior receipt", async () => {
@@ -397,12 +626,14 @@ test("prefixed archive references its transported files and fallback keeps promo
 		await writeFile(path.join(source, "round-10-reviewer-feedback.txt"), "later feedback\n");
 		await writeFile(path.join(source, "review-decision.json"), "{}\n");
 		await writeFile(path.join(source, "m04-adopted-knowledge.json"), "{}\n");
+		await writeFile(path.join(source, "m04-transaction.json"), '{"version":1,"kind":"m04-knowledge-transaction","state":"merged"}\n');
 		await writeFile(path.join(source, "workflow-archive.json"), JSON.stringify({
 			files: [{ name: "candidate.cpp", status: "present" }],
 			controllerEvidence: { rounds: [{ candidate: { file: "round-1-candidate.cpp" }, verification: { status: "missing" },
 				feedbackFile: "round-1-reviewer-feedback.txt", reviewerReport: { file: "round-1-reviewer-report.md" } }],
 				reviewDecision: { file: "review-decision.json" } },
-			m04: { knowledgeExport: { state: "complete", file: "m04-adopted-knowledge.json" } },
+			m04: { knowledgeExport: { state: "complete", file: "m04-adopted-knowledge.json" },
+				transaction: { file: "m04-transaction.json", state: "merged" } },
 		}));
 		await offlineChecks.exportPrefixedArchive(source, output, "followon");
 		const index = JSON.parse(await readFile(path.join(output, "workflow-followon-archive.json"), "utf8"));
@@ -422,6 +653,8 @@ test("prefixed archive references its transported files and fallback keeps promo
 		const initialIndex = JSON.parse(await readFile(path.join(output, "workflow-initial-archive.json"), "utf8"));
 		assert.equal(initialIndex.m04.knowledgeExport.file, "initial-m04-adopted-knowledge.json");
 		assert.equal(await readFile(path.join(output, "initial-m04-adopted-knowledge.json"), "utf8"), "{}\n");
+		assert.equal(initialIndex.m04.transaction.file, "initial-m04-transaction.json");
+		assert.match(await readFile(path.join(output, "initial-m04-transaction.json"), "utf8"), /"merged"/);
 		assert.equal(index.transportLayout.defaultArchiveLoaderCompatible, false);
 		await writeFile(path.join(output, "candidate.cpp"), "// promoted second candidate\n");
 		await writeFile(path.join(output, "workflow-archive.json"), "{}\n");
@@ -518,6 +751,25 @@ test("fallback archive retains every settled same-goal candidate file", async ()
 		const prefix = `fallback-${createHash("sha256").update("run-example").digest("hex").slice(0, 12)}-T003`;
 		assert.equal(await readFile(path.join(output, `${prefix}-candidate.cpp`), "utf8"), "// later candidate\n");
 		assert.equal((await offlineChecks.availablePrivateArtifactNames(output)).includes(`${prefix}-candidate.cpp`), true);
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("fallback finalizer recognizes an existing followon archive for the same task identity", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-followon-no-duplicate-"));
+	try {
+		const output = path.join(root, "output"), workDir = path.join(root, "work");
+		await mkdir(output); await mkdir(workDir);
+		await writeFile(path.join(workDir, "candidate.cpp"), "// same candidate\n");
+		await writeFile(path.join(root, "goal.json"), JSON.stringify({ runId: "R002", lifecycle: "active", tasks: [
+			{ taskId: "T003", mode: "execute", workDir, status: "returned" }] }));
+		const actual = { version: 1, kind: "m07-private-candidate-archive", goalRunId: "R002", taskId: "T003",
+			m04: { state: "failed", runId: "M04-actual", proposalSubmitted: true, snapshotCreated: false } };
+		await writeFile(path.join(output, "workflow-followon-archive.json"), JSON.stringify(actual));
+		await offlineChecks.preserveCandidate({ runDir: () => root } as any, "R002", output);
+		assert.deepEqual(JSON.parse(await readFile(path.join(output, "workflow-followon-archive.json"), "utf8")).m04, actual.m04);
+		await assert.rejects(readFile(path.join(output, "workflow-archive.json")), /ENOENT/);
+		const prefix = `fallback-${createHash("sha256").update("R002").digest("hex").slice(0, 12)}-T003`;
+		await assert.rejects(readFile(path.join(output, `workflow-${prefix}-archive.json`)), /ENOENT/);
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
 

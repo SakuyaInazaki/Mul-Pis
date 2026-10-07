@@ -300,19 +300,51 @@ test("unread objective evidence is fed back for same-session read and revised sc
 	assert.equal(runner.created.length, 1);
 });
 
-test("host-observed error reading required objective evidence stops without dispatch", async t => {
+test("a read tool error receives the correct frozen path and range, then continues in the same session", async t => {
+	const f = await fixture(t);
+	let dispatched = 0;
+	const runner = new FakeSessionRunner(({ turnIndex, message }) => {
+		if (turnIndex === 1) return { text: JSON.stringify(assessment("continue")),
+			readReturns: [...ranges(f, ["second-text.txt"]), { toolName: "objective_evidence_read",
+				status: "error", path: "<unresolved>", requested: { offset: 2, limit: 10 },
+				returned: { kind: "unknown" }, at: new Date().toISOString() }] };
+		assert.match(message, /objective_evidence_read path="second-text\.txt" offset=1 limit=1/);
+		assert.match(message, /host verified that frozen file is still available/);
+		return { text: JSON.stringify(assessment("continue")),
+			readReturns: ranges(f).filter(item => item.path === "second-text.txt") };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { dispatched++; } });
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.deepEqual(result.assessment?.unreadEvidence, []);
+	assert.equal([...runner.sessions.values()][0].turns, 2);
+	assert.equal(runner.created.length, 1);
+	assert.equal(dispatched, 1);
+});
+
+test("host-inaccessible frozen evidence suspends assessment and preserves the provisional verdict", async t => {
 	const f = await fixture(t);
 	let dispatched = false;
-	const runner = new FakeSessionRunner(() => ({ text: JSON.stringify(assessment("continue")),
-		readReturns: [...ranges(f, ["second-text.txt"]), { toolName: "objective_evidence_read",
-			status: "error", path: "second-text.txt", requested: {},
-			returned: { kind: "unknown" }, at: new Date().toISOString() }] }));
+	const runner = new FakeSessionRunner(async () => {
+		await rm(path.join(f.evidenceRoot, "second-text.txt"));
+		return { text: JSON.stringify(assessment("fulfilled")),
+			readReturns: [...ranges(f, ["second-text.txt"]), { toolName: "objective_evidence_read",
+				status: "error", path: "<unresolved>", requested: { offset: 1, limit: 1 },
+				returned: { kind: "unknown" }, at: new Date().toISOString() }] };
+	});
 	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
 		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
 		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
 		advance: async () => { dispatched = true; } });
-	assert.equal(result.stopReason, "assessment-evidence-unread");
+	assert.equal(result.stopReason, "assessment-evidence-suspended");
+	assert.equal(result.assessment?.decision, "fulfilled");
 	assert.deepEqual(result.assessment?.unreadEvidence, ["second-text.txt"]);
+	const checkpoint = objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [],
+		assessment: result.assessment, stopReason: result.stopReason });
+	assert.equal(checkpoint.objectiveOutcome, "incomplete");
+	assert.equal(checkpoint.stopReason, "assessment-evidence-suspended");
 	assert.equal([...runner.sessions.values()][0].turns, 1);
 	assert.equal(dispatched, false);
 });
@@ -554,23 +586,47 @@ test("unsupported model proposal replans in the same session and retains blocked
 	assert.deepEqual(checkpoint.continuation.blockedProposals, [blocked.nextTask]);
 });
 
-test("blocked decision checks other feasible capabilities before becoming terminal", async t => {
-	for (const feasible of [true, false]) {
-		const f = await fixture(t);
-		let prompts = 0, dispatches = 0;
-		const runner = new FakeSessionRunner(({ message }) => {
-			prompts++;
-			if (prompts === 2) assert.match(message, /Before making this blocked result terminal/);
-			return { text: JSON.stringify(assessment(prompts === 2 && feasible ? "continue" : "blocked")), readReturns: ranges(f) };
-		});
-		const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
-			persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
-			supportedTaskScopes: ["two-target-existing"], capabilities: availableCapabilities,
-			advance: async () => { dispatches++; } });
-		assert.equal(prompts, 2);
-		assert.equal(dispatches, feasible ? 1 : 0);
-		assert.equal(result.stopReason, feasible ? "objective-reassessment-pending" : "model-reported-blocked");
-	}
+test("repeated blocked verdicts replan with verified capability until a feasible task is chosen", async t => {
+	const f = await fixture(t);
+	let prompts = 0, dispatches = 0;
+	const runner = new FakeSessionRunner(({ message }) => {
+		prompts++;
+		if (prompts === 2) {
+			assert.match(message, /Reassess every remaining requirement/);
+			assert.match(message, /original-task: Satisfy all original supplied requirements/);
+		}
+		if (prompts === 3) assert.match(message, /blocked verdict remains provisional/);
+		return { text: JSON.stringify(assessment(prompts === 3 ? "continue" : "blocked")),
+			readReturns: prompts === 1 ? ranges(f) : [] };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		supportedTaskScopes: ["two-target-existing"], capabilities: availableCapabilities,
+		advance: async () => { dispatches++; } });
+	assert.equal(prompts, 3);
+	assert.equal(dispatches, 1);
+	assert.equal(runner.created.length, 1);
+	assert.equal(result.assessment?.proposalHistory?.length, 3);
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+});
+
+test("transport failure after a blocked assessment retains its prior checkpoint without dispatch", async t => {
+	const f = await fixture(t);
+	let recorded = 0;
+	const runner = new FakeSessionRunner(({ turnIndex }) => {
+		if (turnIndex === 1) return { text: JSON.stringify(assessment("blocked")), readReturns: ranges(f) };
+		throw new Error("synthetic provider transport failure");
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		supportedTaskScopes: ["two-target-existing"], capabilities: availableCapabilities,
+		recordAssessment: async () => { recorded++; },
+		advance: async () => { throw new Error("must not dispatch"); } });
+	assert.equal(result.stopReason, "assessment-failed");
+	assert.equal(result.assessment?.decision, "blocked");
+	assert.equal(recorded, 1);
+	assert.equal(runner.created.length, 1);
+	assert.equal([...runner.sessions.values()][0].turns, 2);
 });
 
 test("repeated unsupported proposals receive feedback until a feasible task is chosen", async t => {

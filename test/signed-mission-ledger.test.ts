@@ -5,7 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY,
-	ONE_USE_PUSH_MARKER, verifySignedMissionLedger } from "../src/runner/signed-mission-ledger.ts";
+	verifySignedMissionLedger } from "../src/runner/signed-mission-ledger.ts";
+
+const historicalMessage = "Synthetic historical request";
 
 const current = { repository: MISSION_REPOSITORY, runId: "8001004", runAttempt: "1",
 	actor: "SakuyaInazaki", event: "workflow_dispatch", ref: "refs/heads/improve/workflow-learning-reliability",
@@ -46,12 +48,12 @@ function fakeGithub(options: { currentNumber?: number; skipped?: "skipped" | "su
 				{ id: Number(current.runId), run_number: options.currentNumber ?? 12, run_attempt: 1,
 					workflow_id: 71, status: "in_progress", head_branch: "improve/workflow-learning-reliability",
 					event: options.event ?? "workflow_dispatch", head_sha: current.sha,
-					actor: { login: "SakuyaInazaki" }, head_commit: { message: options.message ?? ONE_USE_PUSH_MARKER } },
+					actor: { login: "SakuyaInazaki" }, head_commit: { message: options.message ?? historicalMessage } },
 				...(options.currentNumber === 13 ? [{ id: 8001003, run_number: 12, run_attempt: 1,
 					workflow_id: 71, status: "completed", head_sha: "b".repeat(40), head_branch: "improve/workflow-learning-reliability" }] : []),
 				{ id: 8001001, run_number: 11, run_attempt: 1,
 					workflow_id: 71, status: "completed", head_sha: "b".repeat(40), head_branch: "improve/workflow-learning-reliability",
-					event: options.anchorEvent, head_commit: { message: ONE_USE_PUSH_MARKER } },
+					event: options.anchorEvent, head_commit: { message: historicalMessage } },
 			] };
 		} else if (address.endsWith("/runs/8001003/jobs?per_page=100")) {
 			data = { total_count: 1, jobs: [{ name: "private-campaign", status: "completed",

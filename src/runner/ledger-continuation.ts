@@ -23,9 +23,6 @@ const NANO = 1_000_000_000;
 const BRANCH = "improve/workflow-learning-reliability";
 const REQUEST_BRANCH = "run-requests/workflow-learning-reliability";
 const WORKFLOW = "manual-private-campaign.yml";
-const ONE_TIME_LEGACY_V3_RUN = "37490692145";
-const ONE_TIME_LEGACY_V3_REQUEST = "f9d29bfd58449dba072c80f62a7db524f0a668c4";
-const ONE_TIME_LEGACY_V3_SOURCE = "00d4309390bb06536abbe5e86f97213298e901a0";
 export const REUSABLE_RUN_REQUEST_MESSAGE = "Run confidential workflow";
 export type { PrivateContinuationBundle, BootstrapBinding } from "./signed-mission-ledger.ts";
 export type CurrentMissionRun = {
@@ -49,42 +46,41 @@ export type OpaqueExecutedRunGap = Readonly<{
 	terminal: AuthenticatedPriorCarryProof["terminal"];
 	resultArtifact: NonNullable<AuthenticatedPriorCarryProof["resultArtifact"]>;
 }>;
-export type AuthenticatedOpaqueGapSourceReview = Readonly<{
-	version: 1; kind: "authenticated-opaque-gap-source-review";
-	source: Readonly<Source>; resultArchiveSha256: string;
-	priorCarryEnvelopeSha256: string;
+export type AuthenticatedSelectedTransition = Readonly<{
+	version: 1; kind: "host-selected-tuple-transition";
+	source: Readonly<Source>; envelopeSha256: string; priorEnvelopeSha256: string;
+	priorSelectedTupleSha256: string; selectedTupleSha256: string;
+	priorSelectedArtifacts: readonly string[]; selectedArtifacts: readonly string[];
+	contractId: string; goalRunId: string; taskId: string; archiveSha256: string;
+	m04RunId: string; m04State: "no-proposal" | "merged";
 }>;
-const authenticatedOpaqueGapSourceReviews = new WeakSet<object>();
-const authenticatedReviewedOpaqueGaps = new WeakMap<object, readonly OpaqueExecutedRunGap[]>();
-/** The underlying carry still belongs to its actual source. Gap effects have
- * their own receipt and cannot be treated as measured research or a paid invoice. */
-export function authenticatedReviewedOpaqueRunGaps(proof: unknown,
+type StoredSelectedTransition = Omit<AuthenticatedSelectedTransition, "envelopeSha256">;
+const authenticatedHistoricalOpaqueGaps = new WeakMap<object, readonly OpaqueExecutedRunGap[]>();
+const authenticatedSelectedTransitionChains = new WeakMap<object,
+	readonly AuthenticatedSelectedTransition[]>();
+const authenticatedPendingHistoricalEffects = new WeakMap<object, ReadonlyArray<Readonly<Source>>>();
+/** A carry authenticates gap metadata and ordering, but cannot determine its
+ * remote effects or cost. Every historical gap is exposed as unresolved. */
+export function authenticatedHistoricalOpaqueRunGaps(proof: unknown,
 	bundle: unknown): readonly OpaqueExecutedRunGap[] | undefined {
 	if (!isAuthenticatedPriorCarryProof(proof) ||
 		!authenticatedPriorCarryBindsBundle(proof, bundle)) return undefined;
-	return authenticatedReviewedOpaqueGaps.get(proof);
+	return authenticatedHistoricalOpaqueGaps.get(proof);
 }
-/** Test-only brand. Production review must independently audit the exact
- * immutable Actions source before it mints this authority. */
-export function authenticateOpaqueGapSourceForOfflineTests(source: Readonly<Source>,
-	resultArchiveSha256: string, priorCarryEnvelopeSha256: string): AuthenticatedOpaqueGapSourceReview {
-	if (!process.env.NODE_TEST_CONTEXT || !/^[0-9a-f]{64}$/.test(resultArchiveSha256) ||
-		!/^[0-9a-f]{64}$/.test(priorCarryEnvelopeSha256))
-		reject("opaque gap source review fixture is test-only");
-	const review = Object.freeze({ version: 1 as const,
-		kind: "authenticated-opaque-gap-source-review" as const,
-		source: Object.freeze({ ...source }), resultArchiveSha256, priorCarryEnvelopeSha256 });
-	authenticatedOpaqueGapSourceReviews.add(review);
-	return review;
+/** Append-only selected tuple transitions verified against AEAD carry ancestry.
+ * This is selected evidence provenance, never M04 knowledge adoption authority. */
+export function authenticatedSelectedTransitions(proof: unknown,
+	bundle: unknown): readonly AuthenticatedSelectedTransition[] | undefined {
+	if (!isAuthenticatedPriorCarryProof(proof) ||
+		!authenticatedPriorCarryBindsBundle(proof, bundle)) return undefined;
+	return authenticatedSelectedTransitionChains.get(proof);
 }
-function bindsOpaqueGapSourceReview(review: unknown, source: Source,
-	resultArtifact: NonNullable<AuthenticatedPriorCarryProof["resultArtifact"]>,
-	priorCarryEnvelopeSha256: string): boolean {
-	return Boolean(review) && typeof review === "object" &&
-		authenticatedOpaqueGapSourceReviews.has(review as object) &&
-		JSON.stringify((review as AuthenticatedOpaqueGapSourceReview).source) === JSON.stringify(source) &&
-		(review as AuthenticatedOpaqueGapSourceReview).resultArchiveSha256 === resultArtifact.archiveSha256 &&
-		(review as AuthenticatedOpaqueGapSourceReview).priorCarryEnvelopeSha256 === priorCarryEnvelopeSha256;
+/** Encrypted carry sources whose historical host effects remain UNKNOWN. */
+export function authenticatedPendingHistoricalEffectSources(proof: unknown,
+	bundle: unknown): ReadonlyArray<Readonly<Source>> | undefined {
+	if (!isAuthenticatedPriorCarryProof(proof) ||
+		!authenticatedPriorCarryBindsBundle(proof, bundle)) return undefined;
+	return authenticatedPendingHistoricalEffects.get(proof);
 }
 /** Host-only admission evidence. Terminal execution is not usage reconciliation,
  * and this read-only proof is not an atomic durable restart claim.
@@ -110,9 +106,16 @@ export type AuthenticatedCarryForwardOrigin = Readonly<{
 	source: Readonly<Source>; envelopeSha256: string;
 	historicalCommittedNano: number; historicalUnknownHeldNano: number;
 }>;
+export type AuthenticatedAccountingObservation = Readonly<{
+	historicalCommittedNano: number; historicalUnknownHeldNano: number;
+	settledNano: number; unknownObservedNano: number; unpricedRequestCount: number;
+	opaqueUnquantifiedRunCount: number;
+}>;
 type StoredCarryForwardOrigin = AuthenticatedCarryForwardOrigin & { privateBundleSha256: string };
 const authenticatedCarryProofs = new WeakSet<object>();
 const authenticatedCarryForwardOrigins = new WeakMap<object, AuthenticatedCarryForwardOrigin>();
+const authenticatedHistoricalCarryOrigins = new WeakMap<object, AuthenticatedCarryForwardOrigin>();
+const authenticatedAccountingObservations = new WeakMap<object, AuthenticatedAccountingObservation>();
 const authenticatedCarryAncestors = new WeakMap<object, ReadonlyArray<Readonly<{
 	source: Readonly<Source>; envelopeSha256: string;
 }>>>();
@@ -143,6 +146,14 @@ export function authenticatedPriorCarryBindsAncestor(proof: unknown, source: unk
 		ancestor.source.runAttempt === source.runAttempt && ancestor.source.commit === source.commit &&
 		(source.runNumber === undefined || ancestor.source.runNumber === source.runNumber)) ?? false;
 }
+/** Ordered authenticated carry sources, including the latest prior source.
+ * Opaque missing-carry runs are separate historical UNKNOWN gaps. */
+export function authenticatedCarryAncestry(proof: unknown,
+	bundle: unknown): ReadonlyArray<Readonly<{ source: Readonly<Source>; envelopeSha256: string }>> | undefined {
+	if (!isAuthenticatedPriorCarryProof(proof) ||
+		!authenticatedPriorCarryBindsBundle(proof, bundle)) return undefined;
+	return authenticatedCarryAncestors.get(proof);
+}
 
 /** Canonicalize only the fixed filename map; file contents remain exact UTF-8 strings. */
 function canonicalPrivateBundle(bundle: PrivateContinuationBundle): string {
@@ -161,6 +172,22 @@ export function authenticatedCarryForwardOrigin(proof: unknown,
 	if (!isAuthenticatedPriorCarryProof(proof) || proof.version !== 2 ||
 		!authenticatedPriorCarryBindsBundle(proof, bundle)) return undefined;
 	return authenticatedCarryForwardOrigins.get(proof);
+}
+/** Accounting ancestry only. This origin does not review legacy model, host,
+ * transaction or third-party effects; callers must use a fresh-only boundary. */
+export function authenticatedHistoricalCarryOrigin(proof: unknown,
+	bundle: unknown): AuthenticatedCarryForwardOrigin | undefined {
+	if (!isAuthenticatedPriorCarryProof(proof) ||
+		!authenticatedPriorCarryBindsBundle(proof, bundle)) return undefined;
+	return authenticatedHistoricalCarryOrigins.get(proof);
+}
+/** Exact carried accounting. Legacy held amounts, v3 observed amounts and
+ * unquantified missing-carry runs remain separate, without float conversion. */
+export function authenticatedAccountingObservation(proof: unknown,
+	bundle: unknown): AuthenticatedAccountingObservation | undefined {
+	if (!isAuthenticatedPriorCarryProof(proof) ||
+		!authenticatedPriorCarryBindsBundle(proof, bundle)) return undefined;
+	return authenticatedAccountingObservations.get(proof);
 }
 type LegacyCheckpoint = { version: 1 | 2; kind: "mul-pis-private-ledger-continuation";
 	missionId: typeof MISSION_ID; repository: typeof MISSION_REPOSITORY; seedDigest: string;
@@ -219,6 +246,8 @@ export type AuthenticatedHostEffectEvidence = Readonly<{
 	receipt: Readonly<HostEffectReceiptV1>;
 	requestAudit: Readonly<AccountingOnlyRequestAuditSnapshot>;
 	reviewedEffectAncestry: ReadonlyArray<ReviewedEffectAncestorReceipt>;
+	/** The current census is structural; inherited effects remain UNKNOWN. */
+	historicalEffectState?: "unknown-unreconciled";
 }>;
 const authenticatedHostEffects = new WeakMap<object, AuthenticatedHostEffectEvidence>();
 /** A copied receipt or proof cannot mint this authority. */
@@ -227,24 +256,6 @@ export function authenticatedHostEffectEvidence(proof: unknown,
 	if (!isAuthenticatedPriorCarryProof(proof) || proof.version !== 2 ||
 		!authenticatedPriorCarryBindsBundle(proof, bundle)) return undefined;
 	return authenticatedHostEffects.get(proof);
-}
-/** Exact, non-reusable host review of one pre-census v3 Actions run. This is
- * minted only by the live verifier after the GitHub request commit's first
- * parent and tree have been checked. It does not validate research output. */
-export type AuthenticatedLegacyV3RunReview = Readonly<{
-	origin: AuthenticatedCarryForwardOrigin;
-	/** The immediately preceding v3 carry is authenticated and has no provider activity. */
-	immediateZeroActivitySource: Readonly<{ source: Readonly<Source>; envelopeSha256: string }>;
-	reviewedSourceCommit: "00d4309390bb06536abbe5e86f97213298e901a0";
-	requestAudit: Readonly<AccountingOnlyRequestAuditSnapshot>;
-	settledAddedNano: number; unknownObservedAddedNano: number; unpricedAddedCount: number;
-}>;
-const authenticatedLegacyV3RunReviews = new WeakMap<object, AuthenticatedLegacyV3RunReview>();
-export function authenticatedLegacyV3RunReview(proof: unknown,
-	bundle: unknown): AuthenticatedLegacyV3RunReview | undefined {
-	if (!isAuthenticatedPriorCarryProof(proof) || proof.version !== 2 ||
-		!authenticatedPriorCarryBindsBundle(proof, bundle)) return undefined;
-	return authenticatedLegacyV3RunReviews.get(proof);
 }
 export type LegacyCarrySealInput = { settledCny: number; unknownOrInFlightCny: number;
 	requestAudit: RequestAuditSnapshot; privateBundle?: PrivateContinuationBundle;
@@ -289,7 +300,10 @@ type AccountingCheckpoint = {
 	settledAddedNano: number; unknownObservedAddedNano: number; unpricedAddedCount: number;
 	requestAudit: AccountingOnlyRequestAuditSnapshot;
 	legacyAncestry: AncestorReceipt[]; ancestry: AccountingAncestorReceipt[];
+	selectedTransitions?: StoredSelectedTransition[];
 	opaqueExecutedRuns?: OpaqueExecutedRunGap[];
+	/** New writer's explicit safety interpretation; older gap receipts stay byte-exact. */
+	historicalOpaqueGapEffectInterpretation?: "unknown-unreconciled";
 	currentEffectReview?: "pending";
 	pendingEffectAncestry?: Source[];
 	/** Previously reviewed nonzero v3 runs, in accounting-source order. */
@@ -302,13 +316,16 @@ export type ReviewedEffectAncestorReceipt = Readonly<{
 	source: Readonly<Source>; envelopeSha256: string; privateBundleSha256: string;
 	reviewedPolicySha256: string; selectedTupleSha256: string;
 	historicalOriginEnvelopeSha256: string;
+	/** V2 fresh-only linkage carries an unknown historical effect forward. */
+	historicalEffectState?: "unknown-unreconciled";
 	/** The next run claimed this source but ended before a fresh M07 goal existed. */
 	abandonedWithoutGoal?: true;
 }>;
 type AccountingAncestorReceipt = Pick<AccountingCheckpoint, "parentDigest" | "source" |
 	"settledNano" | "unknownObservedNano" | "unpricedRequestCount" | "settledAddedNano" |
 	"unknownObservedAddedNano" | "unpricedAddedCount" | "requestAudit" | "bootstrapBinding"> &
-	{ envelopeDigest: string };
+	{ envelopeDigest: string; selectedTransitionCount?: number;
+		selectedTransitionDigest?: string };
 type Checkpoint = LegacyCheckpoint | AccountingCheckpoint;
 export type RequestAuditSnapshot = { requests: CampaignRequestAudit[]; settledCny: number;
 	unknownReservedCny: number; inFlightReservedCny: number; reservations: number;
@@ -714,7 +731,10 @@ function readCheckpoint(envelopeB64: string, key: Buffer, seedDigest: string, ex
 			"settledNano", "unknownObservedNano", "unpricedRequestCount", "settledAddedNano",
 			"unknownObservedAddedNano", "unpricedAddedCount", "requestAudit", "ancestry",
 			"legacyAncestry", "historical",
+			...(parsed.selectedTransitions === undefined ? [] : ["selectedTransitions"]),
 			...(parsed.opaqueExecutedRuns === undefined ? [] : ["opaqueExecutedRuns"]),
+			...(parsed.historicalOpaqueGapEffectInterpretation === undefined ? [] :
+				["historicalOpaqueGapEffectInterpretation"]),
 			...(parsed.currentEffectReview === undefined ? [] : ["currentEffectReview"]),
 			...(parsed.pendingEffectAncestry === undefined ? [] : ["pendingEffectAncestry"]),
 			...(parsed.reviewedEffectAncestry === undefined ? [] : ["reviewedEffectAncestry"]),
@@ -733,8 +753,13 @@ function readCheckpoint(envelopeB64: string, key: Buffer, seedDigest: string, ex
 		cp.parentDigest !== parentDigest ||
 		(cp.version !== 1 && !Array.isArray(cp.ancestry)) ||
 		(cp.version === 3 && (!Array.isArray(cp.legacyAncestry) || !record(cp.historical) ||
+			(cp.selectedTransitions !== undefined && !Array.isArray(cp.selectedTransitions)) ||
 			(cp.reviewedEffectAncestry !== undefined && !Array.isArray(cp.reviewedEffectAncestry)) ||
 			(cp.opaqueExecutedRuns !== undefined && !Array.isArray(cp.opaqueExecutedRuns)) ||
+			(cp.historicalOpaqueGapEffectInterpretation !== undefined &&
+				cp.historicalOpaqueGapEffectInterpretation !== "unknown-unreconciled") ||
+			(cp.historicalOpaqueGapEffectInterpretation !== undefined &&
+				!cp.opaqueExecutedRuns?.length) ||
 			(cp.currentEffectReview !== undefined && cp.currentEffectReview !== "pending") ||
 			(cp.pendingEffectAncestry !== undefined && !Array.isArray(cp.pendingEffectAncestry)))) ||
 		(cp.version === 3 && cp.carryForwardOrigin !== undefined &&
@@ -778,6 +803,9 @@ function accountingAncestorReceipt(cp: AccountingCheckpoint, envelopeDigest: str
 		unpricedRequestCount: cp.unpricedRequestCount, settledAddedNano: cp.settledAddedNano,
 		unknownObservedAddedNano: cp.unknownObservedAddedNano, unpricedAddedCount: cp.unpricedAddedCount,
 		requestAudit: cp.requestAudit,
+		...(cp.selectedTransitions?.length ? {
+			selectedTransitionCount: cp.selectedTransitions.length,
+			selectedTransitionDigest: digest(JSON.stringify(cp.selectedTransitions)) } : {}),
 		...(cp.bootstrapBinding ? { bootstrapBinding: cp.bootstrapBinding } : {}) };
 }
 function validOpaqueGap(value: unknown): value is OpaqueExecutedRunGap {
@@ -831,7 +859,10 @@ function reviewedEffectPrefixValid(cp: AccountingCheckpoint): boolean {
 		reviewed.some(item => !record(item) || !exactKeys(item, ["source", "envelopeSha256",
 			"privateBundleSha256", "reviewedPolicySha256", "selectedTupleSha256",
 			"historicalOriginEnvelopeSha256",
+			...(item.historicalEffectState === undefined ? [] : ["historicalEffectState"]),
 			...(item.abandonedWithoutGoal === undefined ? [] : ["abandonedWithoutGoal"])]) ||
+			(item.historicalEffectState !== undefined &&
+				item.historicalEffectState !== "unknown-unreconciled") ||
 			(item.abandonedWithoutGoal !== undefined && item.abandonedWithoutGoal !== true))) return false;
 	if (!reviewed.length) return true;
 	let chain: unknown;
@@ -878,7 +909,11 @@ function reviewedEffectPrefixValid(cp: AccountingCheckpoint): boolean {
 				binding.freshWorkspace.restartNonce === workspace.restartNonce &&
 				typeof binding.goalRunId === "string" && binding.goalRunId.length > 0);
 			const quarantine = receipt.quarantine as Record<string, unknown>;
-			return receipt.version === 1 &&
+			return (receipt.version === 1 || (receipt.version === 2 &&
+				quarantine.historicalEffectState === "unknown-unreconciled" &&
+				quarantine.executionMode === "fresh-work-only")) &&
+				(entry.historicalEffectState === undefined ? receipt.version === 1 :
+					receipt.version === 2 && entry.historicalEffectState === "unknown-unreconciled") &&
 				receipt.kind === "host-independent-goal-quarantine" &&
 				quarantine.operationOutcome === "unknown" &&
 				quarantine.selectedFromFailedAttempt === false &&
@@ -943,11 +978,267 @@ function newlyReviewedPriorEffect(proof: AuthenticatedPriorCarryProof | undefine
 		reviewedPolicySha256: p.reviewedPolicySha256,
 		selectedTupleSha256: p.selectedTupleSha256,
 		historicalOriginEnvelopeSha256: origin.envelopeSha256,
+		...(matches[0].receipt.version === 2 ?
+			{ historicalEffectState: "unknown-unreconciled" as const } : {}),
 		...(abandonedWithoutGoal ? { abandonedWithoutGoal: true as const } : {}) };
 }
 function distinctStrings(values: unknown, pattern: RegExp): values is string[] {
 	return Array.isArray(values) && values.every(value => typeof value === "string" &&
 		pattern.test(value)) && new Set(values).size === values.length;
+}
+const SELECTED_NAME = /^[A-Za-z0-9._-]{1,128}$/;
+function completeSelectedNames(files: Record<string, unknown>, names: readonly string[],
+	requireDeclaredPlan = false): boolean {
+	if (!["candidate.cpp", "verification.json", "workflow-archive.json"]
+		.every(name => names.includes(name))) return false;
+	if (!requireDeclaredPlan) return true;
+	let archive: unknown;
+	try { archive = JSON.parse(String(files["workflow-archive.json"] ?? "")); }
+	catch { archive = undefined; }
+	return !record(archive) || !Array.isArray(archive.files) ||
+		!archive.files.some(item => record(item) &&
+			item.name === "experiment-plan.json" && item.status === "present") ||
+		names.includes("experiment-plan.json");
+}
+function selectedTuple(bundle: PrivateContinuationBundle, requireDeclaredPlan = false): {
+	sha256: string; names: string[]; checkpoint: Record<string, unknown> } | undefined {
+	let checkpoint: unknown;
+	try { checkpoint = JSON.parse(bundle["objective-checkpoint.json"] ?? ""); }
+	catch { return undefined; }
+	if (!record(checkpoint) || checkpoint.version !== 1 ||
+		checkpoint.kind !== "original-objective-progress" || !record(checkpoint.contract) ||
+		typeof checkpoint.contract.id !== "string" ||
+		!distinctStrings(checkpoint.selectedArtifacts, SELECTED_NAME) ||
+		!checkpoint.selectedArtifacts.length ||
+		!completeSelectedNames(bundle, checkpoint.selectedArtifacts, requireDeclaredPlan) ||
+		checkpoint.selectedArtifacts.some(name =>
+			typeof (bundle as Record<string, string | undefined>)[name] !== "string")) return undefined;
+	const names = [...checkpoint.selectedArtifacts];
+	const files = bundle as Record<string, string | undefined>;
+	return { sha256: digest(JSON.stringify(names.slice().sort().map(name => ({ name,
+		sha256: digest(files[name]!), bytes: Buffer.byteLength(files[name]!, "utf8") })))),
+		names, checkpoint };
+}
+function selectedTupleFromFiles(files: Record<string, unknown>, names: readonly string[],
+	requireDeclaredPlan = false): string | undefined {
+	if (!completeSelectedNames(files, names, requireDeclaredPlan) ||
+		names.some(name => typeof files[name] !== "string")) return undefined;
+	return digest(JSON.stringify([...names].sort().map(name => ({ name,
+		sha256: digest(files[name] as string),
+		bytes: Buffer.byteLength(files[name] as string, "utf8") }))));
+}
+function completedSelectedArchive(files: Record<string, unknown>, entry: {
+	goalRunId: string; taskId: string; archiveSha256: string;
+	m04RunId: string; m04State: "no-proposal" | "merged" }): boolean {
+	let archive: unknown, verification: unknown, transaction: unknown;
+	try {
+		archive = JSON.parse(String(files["workflow-archive.json"] ?? ""));
+		verification = JSON.parse(String(files["verification.json"] ?? ""));
+		transaction = JSON.parse(String(files["m04-transaction.json"] ?? ""));
+	} catch { return false; }
+	if (!record(archive) || !record(archive.controllerEvidence) || !record(archive.m04) ||
+		!record(archive.m04.transaction) || !record(verification) || !record(transaction) ||
+		archive.version !== 1 || archive.kind !== "m07-private-candidate-archive" ||
+		archive.goalRunId !== entry.goalRunId || archive.taskId !== entry.taskId ||
+		archive.goalOutcome !== "fulfilled" || archive.taskStatus !== "accepted" ||
+		archive.controllerEvidence.reviewStatus !== "accepted" ||
+		verification.version !== 1 || verification.status !== "passed" ||
+		archive.m04.state !== "completed" || archive.m04.runId !== entry.m04RunId ||
+		archive.m04.transaction.file !== "m04-transaction.json" ||
+		archive.m04.transaction.state !== entry.m04State ||
+		transaction.version !== 1 || transaction.kind !== "m04-knowledge-transaction" ||
+		transaction.m04RunId !== entry.m04RunId || transaction.state !== entry.m04State ||
+		!Array.isArray(transaction.attempts) ||
+		entry.archiveSha256 !== digest(files["workflow-archive.json"] as string)) return false;
+	return entry.m04State === "no-proposal" ?
+		transaction.attempts.length === 0 && archive.m04.proposalSubmitted === false &&
+		archive.m04.snapshotCreated === false && archive.m04.snapshotId === undefined &&
+		transaction.currentProposalId === undefined && transaction.snapshotId === undefined :
+		transaction.attempts.length > 0 &&
+		record(transaction.attempts.at(-1)) &&
+		transaction.attempts.at(-1)?.state === "merged" &&
+		transaction.attempts.at(-1)?.structurallyValid === true &&
+		typeof transaction.currentProposalId === "string" &&
+		transaction.currentProposalId === transaction.attempts.at(-1)?.proposalId &&
+		typeof transaction.snapshotId === "string" && Boolean(transaction.snapshotId) &&
+		archive.m04.snapshotId === transaction.snapshotId &&
+		archive.m04.proposalSubmitted === true && archive.m04.snapshotCreated === true;
+}
+function validStoredSelectedTransition(value: unknown): value is StoredSelectedTransition {
+	return record(value) && exactKeys(value, ["version", "kind", "source",
+		"priorEnvelopeSha256", "priorSelectedTupleSha256", "selectedTupleSha256",
+		"priorSelectedArtifacts", "selectedArtifacts", "contractId", "goalRunId",
+		"taskId", "archiveSha256", "m04RunId", "m04State"]) &&
+		value.version === 1 && value.kind === "host-selected-tuple-transition" &&
+		record(value.source) && exactKeys(value.source, ["runId", "runAttempt", "runNumber", "commit"]) &&
+		positiveId(value.source.runId) && Number.isSafeInteger(value.source.runAttempt) &&
+		Number(value.source.runAttempt) > 0 && Number.isSafeInteger(value.source.runNumber) &&
+		Number(value.source.runNumber) > 0 && typeof value.source.commit === "string" &&
+		/^[0-9a-f]{40}$/.test(value.source.commit) &&
+		[value.priorEnvelopeSha256, value.priorSelectedTupleSha256,
+			value.selectedTupleSha256, value.archiveSha256].every(item =>
+			typeof item === "string" && /^[0-9a-f]{64}$/.test(item)) &&
+		distinctStrings(value.priorSelectedArtifacts, SELECTED_NAME) &&
+		value.priorSelectedArtifacts.length > 0 &&
+		distinctStrings(value.selectedArtifacts, SELECTED_NAME) &&
+		value.selectedArtifacts.length > 0 &&
+		[value.contractId, value.goalRunId, value.m04RunId].every(item =>
+			typeof item === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(item)) &&
+		typeof value.taskId === "string" && /^T\d{3,}$/.test(value.taskId) &&
+		(value.m04State === "no-proposal" || value.m04State === "merged");
+}
+function validateSelectedTransitions(cp: AccountingCheckpoint, envelopeSha256: string):
+	readonly AuthenticatedSelectedTransition[] | undefined {
+	const saved = cp.selectedTransitions ?? [];
+	const carried = [...cp.ancestry.map(row => ({ source: row.source,
+		parentDigest: row.parentDigest, envelopeSha256: row.envelopeDigest,
+		count: row.selectedTransitionCount, prefixDigest: row.selectedTransitionDigest })),
+		{ source: cp.source, parentDigest: cp.parentDigest, envelopeSha256,
+			count: saved.length || undefined,
+			prefixDigest: saved.length ? digest(JSON.stringify(saved)) : undefined }];
+	let anchored = 0;
+	for (const row of carried) {
+		if (row.count === undefined && row.prefixDigest === undefined) {
+			if (anchored > 0) reject("selected transition ancestry dropped its authenticated prefix");
+			continue;
+		}
+		if (!Number.isSafeInteger(row.count) || Number(row.count) < 1 ||
+			Number(row.count) > saved.length || row.count! < anchored ||
+			row.count! > anchored + 1 ||
+			row.prefixDigest !== digest(JSON.stringify(saved.slice(0, row.count))))
+			reject("selected transition ancestry prefix is invalid");
+		anchored = row.count!;
+	}
+	if (anchored !== saved.length) reject("selected transition ancestry omitted a selection");
+	if (!saved.length) return undefined;
+	if (!cp.privateBundle) reject("selected transition has no authenticated research bundle");
+	const selected = selectedTuple(cp.privateBundle, true);
+	if (!selected) reject("selected transition current tuple is incomplete");
+	let history: unknown;
+	try { history = JSON.parse(cp.privateBundle["research-history.json"] ?? ""); }
+	catch { return reject("selected transition history is invalid"); }
+	if (!record(history) || history.version !== 1 ||
+		history.kind !== "untrusted-version-bound-research-history" ||
+		!Array.isArray(history.entries)) reject("selected transition history is invalid");
+	let priorIndex = -1;
+	const resolved: AuthenticatedSelectedTransition[] = [];
+	for (const [index, entry] of saved.entries()) {
+		if (!validStoredSelectedTransition(entry)) reject("selected transition receipt is invalid");
+		if (index === 0) {
+			const predecessors = history.entries.filter(item => record(item) &&
+				record(item.files) &&
+				selectedTupleFromFiles(item.files, entry.priorSelectedArtifacts) ===
+					entry.priorSelectedTupleSha256);
+			if (predecessors.length !== 1)
+				reject("selected transition predecessor tuple is missing or ambiguous");
+		}
+		const sourceIndex = carried.findIndex(row => JSON.stringify(row.source) === JSON.stringify(entry.source));
+		const source = carried[sourceIndex];
+		if (!source || sourceIndex <= priorIndex || source.parentDigest !== entry.priorEnvelopeSha256 ||
+			source.count !== index + 1 ||
+			(index > 0 && entry.priorSelectedTupleSha256 !== saved[index - 1].selectedTupleSha256))
+			reject("selected transition source or predecessor is not authenticated");
+		priorIndex = sourceIndex;
+		const files: Record<string, unknown> = index === saved.length - 1 ?
+			cp.privateBundle : (() => {
+				const candidates = history.entries.filter(item => record(item) &&
+					item.goalRunId === entry.goalRunId && item.taskId === entry.taskId &&
+					record(item.files));
+				if (candidates.length !== 1) reject("selected transition archive is missing or ambiguous");
+				return (candidates[0] as { files: Record<string, unknown> }).files;
+			})();
+		if (selectedTupleFromFiles(files, entry.selectedArtifacts, true) !== entry.selectedTupleSha256 ||
+			!completedSelectedArchive(files, entry))
+			reject("selected transition tuple or completed M04 archive changed");
+		resolved.push(Object.freeze({ ...entry, envelopeSha256: source.envelopeSha256 }));
+	}
+	const latest = saved.at(-1)!;
+	const selectedRun = Array.isArray(selected.checkpoint.boundedRuns) ?
+		selected.checkpoint.boundedRuns.filter(row => record(row) &&
+			row.runId === latest.goalRunId) : [];
+	if (selected.sha256 !== latest.selectedTupleSha256 ||
+		selected.names.length !== latest.selectedArtifacts.length ||
+		selected.names.some(name => !latest.selectedArtifacts.includes(name)) ||
+		(selected.checkpoint.contract as Record<string, unknown>).id !== latest.contractId ||
+		selectedRun.length !== 1 || selectedRun[0].outcome !== "fulfilled" ||
+		selectedRun[0].selectedTaskId !== latest.taskId ||
+		!Array.isArray(selectedRun[0].acceptedTaskIds) ||
+		!selectedRun[0].acceptedTaskIds.includes(latest.taskId))
+		reject("current selected tuple differs from authenticated transition");
+	return Object.freeze(resolved);
+}
+function appendSelectedTransition(cp: AccountingCheckpoint,
+	priorBundle: PrivateContinuationBundle | undefined,
+	priorTransitions: readonly StoredSelectedTransition[],
+	currentEffect: HostEffectReceiptV1 | undefined): void {
+	if (priorTransitions.length) cp.selectedTransitions = [...priorTransitions];
+	if (!priorBundle || !cp.privateBundle) return;
+	const prior = selectedTuple(priorBundle);
+	if (!prior) {
+		if (priorBundle["objective-checkpoint.json"] !== undefined ||
+			cp.privateBundle["objective-checkpoint.json"] !== undefined)
+			reject("authenticated predecessor selected tuple is incomplete");
+		return;
+	}
+	const carried = selectedTuple(cp.privateBundle);
+	if (carried && carried.sha256 === prior.sha256 &&
+		carried.names.length === prior.names.length &&
+		carried.names.every(name => prior.names.includes(name)) &&
+		prior.names.every(name =>
+			(cp.privateBundle as Record<string, string | undefined>)[name] ===
+				(priorBundle as Record<string, string | undefined>)[name])) {
+		if (cp.privateBundle["experiment-plan.json"] !== priorBundle["experiment-plan.json"])
+			reject("selected plan changed without a completed authenticated transition");
+		return;
+	}
+	const current = selectedTuple(cp.privateBundle, true);
+	if (!current) reject("new selected tuple omitted required source or checker evidence");
+	let archive: unknown, history: unknown;
+	try {
+		archive = JSON.parse(cp.privateBundle["workflow-archive.json"] ?? "");
+		history = JSON.parse(cp.privateBundle["research-history.json"] ?? "");
+	} catch { return reject("new selected tuple lacks a completed authenticated transition"); }
+	if (!record(archive) || !record(archive.m04) || !record(archive.m04.transaction) ||
+		!record(history) || history.version !== 1 ||
+		history.kind !== "untrusted-version-bound-research-history" ||
+		!Array.isArray(history.entries) ||
+		!record(current.checkpoint.contract) ||
+		current.checkpoint.contract.id !==
+			(prior.checkpoint.contract as Record<string, unknown>).id ||
+		!Array.isArray(current.checkpoint.boundedRuns))
+		reject("new selected tuple lacks a completed authenticated transition");
+	const goalRunId = archive.goalRunId, taskId = archive.taskId, m04RunId = archive.m04.runId;
+	if (typeof goalRunId !== "string" || typeof taskId !== "string" ||
+		typeof m04RunId !== "string" ||
+		(archive.m04.transaction.state !== "no-proposal" &&
+			archive.m04.transaction.state !== "merged"))
+		reject("new selected tuple lacks a completed authenticated transition");
+	const run = current.checkpoint.boundedRuns.filter(row => record(row) && row.runId === goalRunId);
+	const predecessorArchive: unknown = (() => {
+		try { return JSON.parse(priorBundle["workflow-archive.json"] ?? ""); }
+		catch { return undefined; }
+	})();
+	const oldHistory = history.entries.filter(row => record(row) && record(row.files) &&
+		record(predecessorArchive) && row.goalRunId === predecessorArchive.goalRunId &&
+		row.taskId === predecessorArchive.taskId &&
+		selectedTupleFromFiles(row.files, prior.names) === prior.sha256);
+	const next: StoredSelectedTransition = { version: 1,
+		kind: "host-selected-tuple-transition", source: { ...cp.source },
+		priorEnvelopeSha256: cp.parentDigest,
+		priorSelectedTupleSha256: prior.sha256, selectedTupleSha256: current.sha256,
+		priorSelectedArtifacts: [...prior.names], selectedArtifacts: [...current.names],
+		contractId: current.checkpoint.contract.id as string, goalRunId, taskId,
+		archiveSha256: digest(cp.privateBundle["workflow-archive.json"]!),
+		m04RunId, m04State: archive.m04.transaction.state };
+	if (oldHistory.length !== 1 || run.length !== 1 || run[0].outcome !== "fulfilled" ||
+		run[0].selectedTaskId !== taskId || !Array.isArray(run[0].acceptedTaskIds) ||
+		!run[0].acceptedTaskIds.includes(taskId) ||
+		!currentEffect?.goals.some(goal => goal.runId === goalRunId &&
+			goal.outcome === "fulfilled" && goal.tasks.some(task =>
+				task.taskId === taskId && task.status === "accepted")) ||
+		!completedSelectedArchive(cp.privateBundle, next))
+		reject("new selected tuple lacks a completed authenticated transition");
+	cp.selectedTransitions = [...priorTransitions, next];
 }
 function restartChainExtends(prior: string | undefined, current: string | undefined,
 	kind: string, added: number): boolean {
@@ -963,6 +1254,127 @@ function restartChainExtends(prior: string | undefined, current: string | undefi
 		Array.isArray(after.entries) && after.entries.length === before.entries.length + added &&
 		before.entries.every((entry, index) => JSON.stringify(entry) ===
 			JSON.stringify((after.entries as unknown[])[index]));
+}
+/** A missing-carry gap never becomes reviewed. Before recording fresh model
+ * work, bind the host's V2 fresh-only reservation to this live Actions claim. */
+function hasCurrentFreshOnlyReservation(bundle: PrivateContinuationBundle | undefined,
+	proof: AuthenticatedPriorCarryProof | undefined, currentSource: Source,
+	claim: ActionsCarryRestartClaim | undefined,
+	historicalUnknownSourceCount: number): boolean {
+	if (!bundle || !proof || !claim) return false;
+	let chain: unknown;
+	try { chain = JSON.parse(bundle["independent-restart-quarantine.json"] ?? ""); }
+	catch { return false; }
+	if (!record(chain) || chain.version !== 1 ||
+		chain.kind !== "host-independent-restart-reservations" ||
+		!Array.isArray(chain.entries)) return false;
+	return chain.entries.filter(entry => {
+		if (!record(entry) || !record(entry.receipt) || !record(entry.claim)) return false;
+		const receipt = entry.receipt, savedClaim = entry.claim;
+		if (!record(receipt.prior) || !record(receipt.prior.source) ||
+			!record(receipt.quarantine) || !Array.isArray(receipt.quarantine.operationRefs) ||
+			(!receipt.quarantine.operationRefs.length && historicalUnknownSourceCount === 0) ||
+			!distinctStrings(receipt.quarantine.operationRefs,
+				/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\/O\d{3,}$/)) return false;
+		return receipt.version === 2 && receipt.kind === "host-independent-goal-quarantine" &&
+			receipt.quarantine.historicalEffectState === "unknown-unreconciled" &&
+			receipt.quarantine.executionMode === "fresh-work-only" &&
+			receipt.quarantine.operationOutcome === "unknown" &&
+			receipt.quarantine.selectedFromFailedAttempt === false &&
+			receipt.prior.source.runId === proof.source.runId &&
+			receipt.prior.source.runAttempt === proof.source.runAttempt &&
+			receipt.prior.source.commit === proof.source.commit &&
+			receipt.prior.envelopeSha256 === proof.envelopeSha256 &&
+			receipt.prior.privateBundleSha256 === proof.privateBundleSha256 &&
+			savedClaim.claimId === claim.claimId &&
+			savedClaim.currentRunId === currentSource.runId &&
+			savedClaim.currentRunAttempt === currentSource.runAttempt &&
+			savedClaim.currentCommit === currentSource.commit &&
+			savedClaim.currentJobId === claim.currentJobId &&
+			savedClaim.priorEnvelopeSha256 === proof.envelopeSha256;
+	}).length === 1;
+}
+function hasSealedFreshOnlyReservation(cp: AccountingCheckpoint): boolean {
+	let chain: unknown;
+	try { chain = JSON.parse(cp.privateBundle?.["independent-restart-quarantine.json"] ?? ""); }
+	catch { return false; }
+	if (!record(chain) || chain.version !== 1 ||
+		chain.kind !== "host-independent-restart-reservations" ||
+		!Array.isArray(chain.entries)) return false;
+	return chain.entries.filter(entry => {
+		if (!record(entry) || !record(entry.receipt) || !record(entry.claim) ||
+			!record(entry.receipt.prior) || !record(entry.receipt.prior.source) ||
+			!record(entry.receipt.quarantine)) return false;
+		const receipt = entry.receipt as Record<string, unknown>;
+		const prior = receipt.prior as Record<string, unknown>;
+		const priorSource = prior.source as Record<string, unknown>;
+		const quarantine = receipt.quarantine as Record<string, unknown>;
+		const claim = entry.claim as Record<string, unknown>;
+		const predecessor = cp.ancestry.at(-1)?.source ?? cp.legacyAncestry.at(-1)?.source;
+		return receipt.version === 2 && receipt.kind === "host-independent-goal-quarantine" &&
+			quarantine.historicalEffectState === "unknown-unreconciled" &&
+			quarantine.executionMode === "fresh-work-only" &&
+			quarantine.operationOutcome === "unknown" &&
+			quarantine.selectedFromFailedAttempt === false &&
+			predecessor?.runId === priorSource.runId &&
+			predecessor?.runAttempt === priorSource.runAttempt &&
+			predecessor?.commit === priorSource.commit &&
+			prior.envelopeSha256 === cp.parentDigest &&
+			typeof prior.privateBundleSha256 === "string" &&
+			/^[0-9a-f]{64}$/.test(prior.privateBundleSha256) &&
+			claim.priorEnvelopeSha256 === cp.parentDigest &&
+			claim.currentRunId === cp.source.runId &&
+			claim.currentRunAttempt === cp.source.runAttempt &&
+			claim.currentCommit === cp.source.commit &&
+			positiveId(claim.currentJobId) &&
+			typeof claim.claimId === "string" && /^[0-9a-f]{64}$/.test(claim.claimId);
+	}).length === 1;
+}
+/** Only a host-checked fresh-work UNKNOWN record may extend the private M04
+ * quarantine. Full archive/source review is performed by m04-quarantine.ts;
+ * this guard prevents a later seal from deleting or rewriting old receipts. */
+function m04QuarantineExtends(prior: string | undefined, current: string | undefined,
+	priorSource?: Source, priorEnvelopeSha256?: string): boolean {
+	if (prior === undefined && current === undefined) return true;
+	if (current === undefined) return false;
+	let before: unknown, after: unknown;
+	try {
+		before = prior === undefined ? { version: 1, kind: "unresolved-historical-m04-quarantine", entries: [] } : JSON.parse(prior);
+		after = JSON.parse(current);
+	} catch { return false; }
+	const valid = (value: unknown): value is { entries: unknown[] } => record(value) &&
+		exactKeys(value, ["version", "kind", "entries"]) && value.version === 1 &&
+		value.kind === "unresolved-historical-m04-quarantine" && Array.isArray(value.entries) &&
+		value.entries.every(entry => record(entry) && exactKeys(entry,
+			["source", "envelopeSha256", "contractId", "goalRunId", "taskId", "m04RunId",
+				"state", "route", "proposalSubmitted", "selectedTupleSha256", "inheritedOperationRefs"]) &&
+			record(entry.source) && exactKeys(entry.source, ["runId", "runAttempt", "runNumber", "commit"]) &&
+			positiveId(entry.source.runId) && Number.isSafeInteger(entry.source.runAttempt) &&
+			Number(entry.source.runAttempt) > 0 && Number.isSafeInteger(entry.source.runNumber) &&
+			Number(entry.source.runNumber) > 0 && typeof entry.source.commit === "string" &&
+			/^[0-9a-f]{40}$/.test(entry.source.commit) && typeof entry.envelopeSha256 === "string" &&
+			/^[0-9a-f]{64}$/.test(entry.envelopeSha256) &&
+			[entry.contractId, entry.goalRunId, entry.m04RunId].every(value =>
+				typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(value)) &&
+			typeof entry.taskId === "string" && /^T\d{3,}$/.test(entry.taskId) &&
+			entry.state === "unknown-unreconciled" && entry.route === "fresh-work-only" &&
+			typeof entry.proposalSubmitted === "boolean" &&
+			typeof entry.selectedTupleSha256 === "string" && /^[0-9a-f]{64}$/.test(entry.selectedTupleSha256) &&
+			Array.isArray(entry.inheritedOperationRefs) &&
+			entry.inheritedOperationRefs.every(ref => typeof ref === "string" &&
+				/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\/O\d{3,}$/.test(ref)) &&
+			new Set(entry.inheritedOperationRefs).size === entry.inheritedOperationRefs.length);
+	if (!valid(before) || !valid(after) || after.entries.length < before.entries.length ||
+		after.entries.length > before.entries.length + 1 ||
+		before.entries.some((entry, index) => JSON.stringify(entry) !== JSON.stringify(after.entries[index])))
+		return false;
+	if (after.entries.length === before.entries.length) return true;
+	const added = after.entries.at(-1) as Record<string, unknown>;
+	return Boolean(priorSource && priorEnvelopeSha256 &&
+		JSON.stringify(added.source) === JSON.stringify(priorSource) &&
+		added.envelopeSha256 === priorEnvelopeSha256 &&
+		!before.entries.some(entry => record(entry) && entry.goalRunId === added.goalRunId &&
+			entry.taskId === added.taskId && entry.m04RunId === added.m04RunId));
 }
 function hostEffectReceipt(cp: AccountingCheckpoint,
 	previousBundle?: PrivateContinuationBundle): HostEffectReceiptV1 | undefined {
@@ -1228,6 +1640,8 @@ function validateAncestryV3(cp: AccountingCheckpoint, sources: Source[], seedDig
 		if (!record(receipt) || !exactKeys(receipt, ["source", "parentDigest", "envelopeDigest",
 			"settledNano", "unknownObservedNano", "unpricedRequestCount", "settledAddedNano",
 			"unknownObservedAddedNano", "unpricedAddedCount", "requestAudit",
+			...(receipt.selectedTransitionCount === undefined ? [] : ["selectedTransitionCount"]),
+			...(receipt.selectedTransitionDigest === undefined ? [] : ["selectedTransitionDigest"]),
 			...(receipt.bootstrapBinding === undefined ? [] : ["bootstrapBinding"])]) ||
 			typeof receipt.envelopeDigest !== "string" || !/^[0-9a-f]{64}$/.test(receipt.envelopeDigest))
 			reject("carry ancestry receipt is invalid");
@@ -1286,104 +1700,6 @@ async function githubJson(url: string, token: string, request: typeof fetch): Pr
 	try { value = await response.json(); } catch { return reject("GitHub carry freshness response is invalid"); }
 	if (!record(value)) reject("GitHub carry freshness response is invalid");
 	return value;
-}
-/** Read-only GitHub check. Its boolean alone never brands or authorizes a carry. */
-export async function reviewedLegacyV3SourceTree(token: string, request: typeof fetch): Promise<boolean> {
-	const base = `https://api.github.com/repos/${MISSION_REPOSITORY}/git/commits`;
-	const submitted = await githubJson(`${base}/${ONE_TIME_LEGACY_V3_REQUEST}`, token, request);
-	const source = await githubJson(`${base}/${ONE_TIME_LEGACY_V3_SOURCE}`, token, request);
-	const parents = submitted.parents;
-	return submitted.sha === ONE_TIME_LEGACY_V3_REQUEST &&
-		source.sha === ONE_TIME_LEGACY_V3_SOURCE &&
-		Array.isArray(parents) && [1, 2].includes(parents.length) &&
-		parents.every(parent => record(parent) && typeof parent.sha === "string" &&
-			/^[0-9a-f]{40}$/.test(parent.sha)) &&
-		parents[0].sha === ONE_TIME_LEGACY_V3_SOURCE &&
-		record(submitted.tree) && record(source.tree) &&
-		typeof submitted.tree.sha === "string" &&
-		/^[0-9a-f]{40}$/.test(submitted.tree.sha) &&
-		submitted.tree.sha === source.tree.sha;
-}
-/** One root-reviewed missing-carry exception. The pinned prior envelope binds
- * the selected tuple checked against the private result by the owner; Actions
- * still independently proves the exact executable source tree and result ZIP.
- * No other missing-carry source gains authority from this function. */
-export async function reviewKnownOpaqueGapSource(facts: { source: Readonly<Source>;
-	terminal: AuthenticatedPriorCarryProof["terminal"];
-	resultArtifact: NonNullable<AuthenticatedPriorCarryProof["resultArtifact"]>;
-	priorCarryEnvelopeSha256: string }, githubToken: string,
-	request: typeof fetch = fetch): Promise<AuthenticatedOpaqueGapSourceReview | undefined> {
-	const source = facts.source;
-	const requestCommit = "db8263c88d9872cd592b43c70f7831cf74e290eb";
-	const reviewedFirstParent = "6ee929545ec3a1d7194054aa4e98988ecd1bd665";
-	if (source.runId !== "37507828650" || source.runAttempt !== 1 ||
-		source.runNumber !== 26 ||
-		source.commit !== requestCommit ||
-		facts.priorCarryEnvelopeSha256 !==
-			"0f29b2f1b5ef0d3bee9b53e7d86168621f904c355bf55d46c5557d4cbd6d412c" ||
-		facts.resultArtifact.repository !== MISSION_REPOSITORY ||
-		facts.resultArtifact.artifactId !== "11431834153" ||
-		facts.resultArtifact.artifactName !== MISSION_ARTIFACT ||
-		facts.resultArtifact.runId !== source.runId ||
-		facts.resultArtifact.digestScope !== "github-artifact-archive" ||
-		facts.resultArtifact.archiveSha256 !==
-			"9c0c4e887c4a212148f0b52aa9e3f96448d50d153b3151e1a741d66bd5f472b5" ||
-		facts.terminal.workflowId !== "374865232" ||
-		facts.terminal.runStatus !== "completed" ||
-		facts.terminal.runConclusion !== "failure" ||
-		facts.terminal.jobId !== "112420914600" ||
-		facts.terminal.jobName !== "private-campaign" ||
-		facts.terminal.jobStatus !== "completed" ||
-		facts.terminal.jobConclusion !== "failure" ||
-		facts.terminal.providerStepStatus !== "completed" ||
-		facts.terminal.providerStepConclusion !== "success" ||
-		facts.terminal.jobRunId !== source.runId ||
-		facts.terminal.jobRunAttempt !== source.runAttempt ||
-		facts.terminal.jobHeadSha !== source.commit || !githubToken)
-		return undefined;
-	const repo = `https://api.github.com/repos/${MISSION_REPOSITORY}`;
-	const submitted = await githubJson(`${repo}/git/commits/${requestCommit}`, githubToken, request);
-	const parent = await githubJson(`${repo}/git/commits/${reviewedFirstParent}`, githubToken, request);
-	const reviewedRun = await githubJson(`${repo}/actions/runs/${source.runId}`, githubToken, request);
-	const reviewedJobs = await githubJson(`${repo}/actions/runs/${source.runId}/jobs?per_page=100`, githubToken, request);
-	const exactJob = Array.isArray(reviewedJobs.jobs) && reviewedJobs.jobs.length === 1 &&
-		record(reviewedJobs.jobs[0]) ? reviewedJobs.jobs[0] as Job : undefined;
-	const exactSteps = exactJob ? providerSteps(exactJob) : [];
-	if (submitted.sha !== requestCommit || parent.sha !== reviewedFirstParent ||
-		submitted.message !== REUSABLE_RUN_REQUEST_MESSAGE ||
-		reviewedRun.id !== Number(source.runId) ||
-		reviewedRun.run_number !== source.runNumber ||
-		reviewedRun.run_attempt !== source.runAttempt ||
-		reviewedRun.workflow_id !== 374865232 ||
-		reviewedRun.head_sha !== source.commit ||
-		reviewedRun.event !== "push" || reviewedRun.head_branch !== REQUEST_BRANCH ||
-		!record(reviewedRun.actor) || reviewedRun.actor.login !== "SakuyaInazaki" ||
-		reviewedRun.status !== "completed" || reviewedRun.conclusion !== "failure" ||
-		reviewedJobs.total_count !== 1 || !exactJob ||
-		exactJob.id !== 112420914600 || exactJob.run_id !== Number(source.runId) ||
-		exactJob.run_attempt !== source.runAttempt || exactJob.head_sha !== source.commit ||
-		exactJob.name !== "private-campaign" || exactJob.status !== "completed" ||
-		exactJob.conclusion !== "failure" || exactSteps.length !== 1 ||
-		exactSteps[0].number !== 10 || exactSteps[0].name !== "Run private campaign" ||
-		exactSteps[0].status !== "completed" || exactSteps[0].conclusion !== "success" ||
-		!Array.isArray(submitted.parents) || ![1, 2].includes(submitted.parents.length) ||
-		!record(submitted.parents[0]) || submitted.parents[0].sha !== reviewedFirstParent ||
-		!record(submitted.tree) || !record(parent.tree) ||
-		typeof submitted.tree.sha !== "string" ||
-		!/^[0-9a-f]{40}$/.test(submitted.tree.sha) ||
-		submitted.tree.sha !== parent.tree.sha) return undefined;
-	const ci = await githubJson(`${repo}/actions/workflows/workflow-regression.yml/runs?head_sha=${reviewedFirstParent}&per_page=100`,
-		githubToken, request);
-	if (!Array.isArray(ci.workflow_runs) || !ci.workflow_runs.some(row =>
-		record(row) && row.head_sha === reviewedFirstParent && row.head_branch === BRANCH &&
-		row.event === "push" && row.run_attempt === 1 && row.conclusion === "success")) return undefined;
-	const review = Object.freeze({ version: 1 as const,
-		kind: "authenticated-opaque-gap-source-review" as const,
-		source: Object.freeze({ ...source }),
-		resultArchiveSha256: facts.resultArtifact.archiveSha256,
-		priorCarryEnvelopeSha256: facts.priorCarryEnvelopeSha256 });
-	authenticatedOpaqueGapSourceReviews.add(review);
-	return review;
 }
 async function oneJob(runId: string, token: string, request: typeof fetch): Promise<Job> {
 	const url = `https://api.github.com/repos/${MISSION_REPOSITORY}/actions/runs/${runId}/jobs?per_page=100`;
@@ -1500,12 +1816,6 @@ export async function openLedgerContinuation(input: {
 	seedEnvelopeB64: string | undefined; publicKeyFile: string; githubToken: string | undefined;
 	current: CurrentMissionRun;
 	loadCarryArtifact: (identity: { runId: string; artifactId: string }) => Promise<string>;
-	/** Absent by default. A live auditor must bind the exact source and result archive. */
-	reviewOpaqueGapSource?: (facts: { source: Readonly<Source>;
-		terminal: AuthenticatedPriorCarryProof["terminal"];
-		resultArtifact: NonNullable<AuthenticatedPriorCarryProof["resultArtifact"]>;
-		priorCarryEnvelopeSha256: string }) =>
-		Promise<AuthenticatedOpaqueGapSourceReview | undefined>;
 	request?: typeof fetch; expectedSpkiSha256?: string;
 	/** Compatibility verifier may require every intervening run to be nonbillable. */
 	requireSeedOnly?: boolean;
@@ -1673,7 +1983,7 @@ export async function openLedgerContinuation(input: {
 				reject("missing carry run lacks an exact terminal encrypted result artifact");
 			newlyOpaqueGap = Object.freeze({ version: 1, kind: "opaque-executed-run-gap",
 				source: Object.freeze({ ...latest }), carryArtifact: "absent",
-				accounting: "unquantified", effects: "quarantined-source-reviewed",
+				accounting: "unquantified", effects: "unreviewed",
 				terminal, resultArtifact });
 			sourcesWithCarry = executedSources.slice(0, -1);
 		} else reject("required private carry artifact is unavailable or ambiguous");
@@ -1683,10 +1993,13 @@ export async function openLedgerContinuation(input: {
 	let ancestry: (AncestorReceipt | AccountingAncestorReceipt)[] = [];
 	let carryForwardOrigin: AuthenticatedCarryForwardOrigin | undefined;
 	let hostEffectEvidence: AuthenticatedHostEffectEvidence | undefined;
-	let oneTimeLegacyV3Review: AuthenticatedLegacyV3RunReview | undefined;
+	let historicalCarryOrigin: AuthenticatedCarryForwardOrigin | undefined;
+	let storedSelectedTransitions: StoredSelectedTransition[] = [];
+	let authenticatedSelectedTransitions: readonly AuthenticatedSelectedTransition[] | undefined;
 	let reviewedEffectAncestry: ReviewedEffectAncestorReceipt[] = [];
 	let priorTransportDiagnosticCensus: HostTransportDiagnosticCensusV1 | undefined;
 	let opaqueExecutedRuns: OpaqueExecutedRunGap[] = [];
+	let storedOpaqueExecutedRuns: OpaqueExecutedRunGap[] = [];
 	let currentEffectReviewPending = false;
 	let pendingEffectAncestry: Source[] = [];
 	if (sourcesWithCarry.length) {
@@ -1699,41 +2012,31 @@ export async function openLedgerContinuation(input: {
 			validateAncestryV3(opened.checkpoint, sourcesWithCarry, seed.seedDigest,
 				n(seed.payload.priorCommittedCny), seed.bootstrapBinding);
 			const cp = opened.checkpoint;
+			authenticatedSelectedTransitions = validateSelectedTransitions(cp, opened.digest);
+			storedSelectedTransitions = [...(cp.selectedTransitions ?? [])];
 			priorTransportDiagnosticCensus = transportDiagnosticCensus(cp);
-			opaqueExecutedRuns = [...(cp.opaqueExecutedRuns ?? [])];
+			// Earlier writers recorded a source review as if it settled effects.
+			// Preserve its authenticated source/transport receipt but downgrade
+			// every such effects assertion to historical UNKNOWN on live reopen.
+			storedOpaqueExecutedRuns = [...(cp.opaqueExecutedRuns ?? [])];
+			opaqueExecutedRuns = storedOpaqueExecutedRuns.map(gap =>
+				Object.freeze({ ...gap, effects: "unreviewed" as const }));
 			currentEffectReviewPending = cp.currentEffectReview === "pending";
 			pendingEffectAncestry = [...(cp.pendingEffectAncestry ?? [])];
 			const historicalOrigin = cp.legacyAncestry.at(-1);
 			const allPriorEffectsReviewed = cp.ancestry.filter(row => !hasNoV3ProviderActivity(row))
 				.every(row => cp.reviewedEffectAncestry?.some(entry =>
-					entry.envelopeSha256 === row.envelopeDigest) ?? false);
-			if (historicalOrigin && allPriorEffectsReviewed &&
+					entry.envelopeSha256 === row.envelopeDigest &&
+					entry.historicalEffectState === undefined) ?? false);
+			if (historicalOrigin &&
 				cp.historical.legacyParentDigest === historicalOrigin.envelopeDigest) {
 				const candidate = Object.freeze({ source: Object.freeze({ ...historicalOrigin.source }),
 					envelopeSha256: historicalOrigin.envelopeDigest,
 					historicalCommittedNano: cp.historical.committedNano,
 					historicalUnknownHeldNano: cp.historical.unknownHeldNano });
+				historicalCarryOrigin = candidate;
 				const bundleSha256 = cp.privateBundle ? privateBundleDigest(cp.privateBundle) : undefined;
-				const immediateZero = cp.ancestry.at(-1);
-				if (cp.ancestry.every(hasNoV3ProviderActivity) &&
-					immediateZero && cp.parentDigest === immediateZero.envelopeDigest &&
-					cp.source.runId === ONE_TIME_LEGACY_V3_RUN &&
-					cp.source.runAttempt === 1 && cp.source.commit === ONE_TIME_LEGACY_V3_REQUEST &&
-					executedMetadata.get(cp.source.runId)?.run.event === "push" &&
-					executedMetadata.get(cp.source.runId)?.run.head_branch === REQUEST_BRANCH &&
-					cp.privateBundle && bundleSha256 && cp.historical.unknownHeldNano > 0) {
-					if (!await reviewedLegacyV3SourceTree(input.githubToken!, request))
-						reject("one-time reviewed request commit is not the first-parent source tree");
-					oneTimeLegacyV3Review = Object.freeze({ origin: candidate,
-						immediateZeroActivitySource: Object.freeze({
-							source: Object.freeze({ ...immediateZero.source }),
-							envelopeSha256: immediateZero.envelopeDigest }),
-						reviewedSourceCommit: ONE_TIME_LEGACY_V3_SOURCE,
-						requestAudit: cp.requestAudit, settledAddedNano: cp.settledAddedNano,
-						unknownObservedAddedNano: cp.unknownObservedAddedNano,
-						unpricedAddedCount: cp.unpricedAddedCount });
-				}
-				if (hasNoV3ProviderActivity(cp) && cp.carryForwardOrigin !== undefined) {
+				if (allPriorEffectsReviewed && hasNoV3ProviderActivity(cp) && cp.carryForwardOrigin !== undefined) {
 					if (!bundleSha256 || cp.carryForwardOrigin.privateBundleSha256 !== bundleSha256 ||
 						JSON.stringify(cp.carryForwardOrigin.source) !== JSON.stringify(candidate.source) ||
 						cp.carryForwardOrigin.envelopeSha256 !== candidate.envelopeSha256 ||
@@ -1771,7 +2074,7 @@ export async function openLedgerContinuation(input: {
 							canonicalPrivateBundle(old.checkpoint.privateBundle) === canonicalPrivateBundle(cp.privateBundle))
 							carryForwardOrigin = candidate;
 					}
-				} else if (cp.carryForwardOrigin !== undefined) {
+				} else if (allPriorEffectsReviewed && cp.carryForwardOrigin !== undefined) {
 					const receipt = hostEffectReceipt(cp);
 					if (receipt && bundleSha256 && cp.carryForwardOrigin.privateBundleSha256 === bundleSha256 &&
 						JSON.stringify(cp.carryForwardOrigin.source) === JSON.stringify(candidate.source) &&
@@ -1782,7 +2085,7 @@ export async function openLedgerContinuation(input: {
 						hostEffectEvidence = Object.freeze({ origin: candidate, receipt,
 							requestAudit: cp.requestAudit,
 							reviewedEffectAncestry: Object.freeze([...(cp.reviewedEffectAncestry ?? [])]) });
-				} else if (cp.requestAudit.requests.some(row => row.responseReceived === false) &&
+				} else if (allPriorEffectsReviewed && cp.requestAudit.requests.some(row => row.responseReceived === false) &&
 					cp.reviewedEffectAncestry?.length && unchangedReviewedSelection(cp,
 						seed.bootstrapPrivateBundle?.["original-objective.json"])) {
 					// Compatibility for an authenticated terminal carry sealed before
@@ -1793,8 +2096,18 @@ export async function openLedgerContinuation(input: {
 							requestAudit: cp.requestAudit,
 							reviewedEffectAncestry: Object.freeze([...(cp.reviewedEffectAncestry ?? [])]) });
 				}
+				if (!hostEffectEvidence && cp.privateBundle && bundleSha256 &&
+					hasSealedFreshOnlyReservation(cp)) {
+					const receipt = hostEffectReceipt(cp);
+					if (receipt && (receipt.goals.length > 0 || assessmentOnlyNoGoal(cp, receipt)))
+						hostEffectEvidence = Object.freeze({ origin: candidate, receipt,
+							requestAudit: cp.requestAudit,
+							reviewedEffectAncestry: Object.freeze([...(cp.reviewedEffectAncestry ?? [])]),
+							...(!allPriorEffectsReviewed || opaqueExecutedRuns.length ?
+								{ historicalEffectState: "unknown-unreconciled" as const } : {}) });
+				}
 			}
-			if (cp.carryForwardOrigin !== undefined && !carryForwardOrigin && !hostEffectEvidence)
+			if (allPriorEffectsReviewed && cp.carryForwardOrigin !== undefined && !carryForwardOrigin && !hostEffectEvidence)
 				reject("authenticated carry-forward origin lacks a complete host-effect receipt");
 			legacyAncestry = cp.legacyAncestry;
 			reviewedEffectAncestry = [...(cp.reviewedEffectAncestry ?? [])];
@@ -1811,6 +2124,9 @@ export async function openLedgerContinuation(input: {
 			if (opened.checkpoint.version !== 2) reject("legacy carry version is invalid");
 			validateAncestry(opened.checkpoint, sourcesWithCarry, seed.seedDigest, committedNano, priorBootstrapBinding);
 			const cp = opened.checkpoint;
+			historicalCarryOrigin = Object.freeze({ source: Object.freeze({ ...cp.source }),
+				envelopeSha256: opened.digest, historicalCommittedNano: cp.committedNano,
+				historicalUnknownHeldNano: cp.unknownHeldNano });
 			legacyAncestry = [...cp.ancestry!, ancestorReceipt(cp, opened.digest)];
 			ancestry = [...legacyAncestry];
 			committedNano = cp.committedNano; unknownHeldNano = cp.unknownHeldNano;
@@ -1838,21 +2154,15 @@ export async function openLedgerContinuation(input: {
 		}
 	}
 	if (newlyOpaqueGap) {
-		if (!input.reviewOpaqueGapSource || !bindsOpaqueGapSourceReview(
-			await input.reviewOpaqueGapSource({ source: newlyOpaqueGap.source,
-				terminal: newlyOpaqueGap.terminal, resultArtifact: newlyOpaqueGap.resultArtifact,
-				priorCarryEnvelopeSha256: parentDigest }), newlyOpaqueGap.source,
-			newlyOpaqueGap.resultArtifact, parentDigest))
-			reject("opaque executed run gap lacks independent exact-source authority");
-		opaqueExecutedRuns.push(Object.freeze({ ...newlyOpaqueGap,
+		const gap = Object.freeze({ ...newlyOpaqueGap,
 			priorCarryEnvelopeSha256: parentDigest,
-			effects: "quarantined-source-reviewed" as const }));
+			effects: "unreviewed" as const });
+		opaqueExecutedRuns.push(gap);
+		storedOpaqueExecutedRuns.push(gap);
 	}
 	const currentSource = sourceOf(current);
 	const latestSource = sourcesWithCarry.at(-1);
-	const proof = latestSource && opaqueExecutedRuns.every(gap =>
-		gap.effects === "quarantined-source-reviewed") && !currentEffectReviewPending &&
-		!pendingEffectAncestry.length ? priorCarryProof({ source: latestSource, current: currentSource,
+	const proof = latestSource ? priorCarryProof({ source: latestSource, current: currentSource,
 		...executedMetadata.get(latestSource.runId)!, artifactId: loadedArtifacts.get(latestSource.runId)!,
 		resultArtifact: resultArtifacts.get(latestSource.runId),
 		ancestry, envelopeSha256: parentDigest, bundle: priorPrivateBundle,
@@ -1863,13 +2173,26 @@ export async function openLedgerContinuation(input: {
 		authenticatedCarryForwardOrigins.set(proof, carryForwardOrigin);
 	if (proof && hostEffectEvidence && priorPrivateBundle && proof.resultArtifact)
 		authenticatedHostEffects.set(proof, hostEffectEvidence);
-	if (proof && oneTimeLegacyV3Review && priorPrivateBundle && proof.resultArtifact)
-		authenticatedLegacyV3RunReviews.set(proof, oneTimeLegacyV3Review);
-	if (proof && opaqueExecutedRuns.length && priorPrivateBundle && proof.resultArtifact)
-		authenticatedReviewedOpaqueGaps.set(proof, Object.freeze([...opaqueExecutedRuns]));
+	if (proof && historicalCarryOrigin && priorPrivateBundle)
+		authenticatedHistoricalCarryOrigins.set(proof, historicalCarryOrigin);
+	if (proof && authenticatedSelectedTransitions && priorPrivateBundle)
+		authenticatedSelectedTransitionChains.set(proof, authenticatedSelectedTransitions);
+	if (proof && priorPrivateBundle)
+		authenticatedAccountingObservations.set(proof, Object.freeze({
+			historicalCommittedNano: historical.committedNano,
+			historicalUnknownHeldNano: historical.unknownHeldNano,
+			settledNano, unknownObservedNano, unpricedRequestCount,
+			opaqueUnquantifiedRunCount: opaqueExecutedRuns.length }));
+	if (proof && opaqueExecutedRuns.length && priorPrivateBundle)
+		authenticatedHistoricalOpaqueGaps.set(proof, Object.freeze([...opaqueExecutedRuns]));
+	if (proof && priorPrivateBundle && (pendingEffectAncestry.length || currentEffectReviewPending))
+		authenticatedPendingHistoricalEffects.set(proof, Object.freeze([
+			...pendingEffectAncestry.map(source => Object.freeze({ ...source })),
+			...(currentEffectReviewPending ? [Object.freeze({ ...proof.source })] : [])]));
 	if (priorPrivateBundle) Object.freeze(priorPrivateBundle);
 	if (priorBootstrapBinding) Object.freeze(priorBootstrapBinding);
 	let sealed = false;
+	let mintedCurrentClaim: ActionsCarryRestartClaim | undefined;
 	let diagnosticPrepared = false;
 	let preparedDiagnosticText: string | undefined;
 	let preparedDiagnosticAuditSha256: string | undefined;
@@ -1944,9 +2267,6 @@ export async function openLedgerContinuation(input: {
 			return retained;
 		},
 		claimOneUse: async carryDigest => {
-			if (opaqueExecutedRuns.some(gap => gap.effects !== "quarantined-source-reviewed") ||
-				currentEffectReviewPending || pendingEffectAncestry.length)
-				reject("opaque or unreviewed execution requires independent effect authority");
 			if (!proof || !isAuthenticatedPriorCarryProof(proof) || carryDigest !== proof.envelopeSha256)
 				reject("restart claim requires the exact authenticated prior carry");
 			if (sealed) reject("restart claim cannot follow current carry sealing");
@@ -1977,9 +2297,11 @@ export async function openLedgerContinuation(input: {
 					(steps[0].conclusion !== undefined && steps[0].conclusion !== null))
 					reject("current Actions restart job identity is incomplete");
 				if (sealed) reject("restart claim cannot follow current carry sealing");
-				return Object.freeze({ claimId: digest(JSON.stringify([admissionKey, job.id])),
+				const claim = Object.freeze({ claimId: digest(JSON.stringify([admissionKey, job.id])),
 					currentRunId: currentSource.runId, currentRunAttempt: currentSource.runAttempt,
 					currentCommit: currentSource.commit, currentJobId: String(job.id), priorEnvelopeSha256: carryDigest });
+				mintedCurrentClaim = claim;
+				return claim;
 			} catch (error) {
 				// These checks are read-only; a failed observation never minted a claim.
 				claimedActionsAdmissions.delete(admissionKey);
@@ -1987,17 +2309,24 @@ export async function openLedgerContinuation(input: {
 			}
 		},
 		sealCurrent: amounts => {
-			if (opaqueExecutedRuns.some(gap => gap.effects !== "quarantined-source-reviewed") ||
-				currentEffectReviewPending || pendingEffectAncestry.length)
-				reject("ordinary carry cannot bypass opaque or pending effects");
 			if (sealed) reject("current carry was already sealed");
 			const privateBundle = amounts.privateBundle ?? priorPrivateBundle;
 			const bootstrapBinding = amounts.bootstrapBinding ?? priorBootstrapBinding;
+			if ((opaqueExecutedRuns.length || currentEffectReviewPending ||
+				pendingEffectAncestry.length) && amounts.requestAudit.requests.length > 0 &&
+				!hasCurrentFreshOnlyReservation(privateBundle, proof, currentSource, mintedCurrentClaim,
+					opaqueExecutedRuns.length + pendingEffectAncestry.length +
+					(currentEffectReviewPending ? 1 : 0)))
+				reject("unreviewed historical effect requires the live V2 fresh-only reservation");
 			if ((privateBundle !== undefined && !validBundle(privateBundle)) ||
 				(bootstrapBinding !== undefined && !validBinding(bootstrapBinding)) ||
 				(priorBootstrapBinding !== undefined && !sameBinding(bootstrapBinding, priorBootstrapBinding)) ||
 				(privateBundle === undefined) !== (bootstrapBinding === undefined))
 				reject("current carry accounting exceeds mission bounds");
+			if (!m04QuarantineExtends(priorPrivateBundle?.["m04-transaction-quarantine.json"],
+				privateBundle?.["m04-transaction-quarantine.json"], proof?.source,
+				proof?.envelopeSha256))
+				reject("current M04 quarantine is not an exact append-only prior-effect record");
 				const settledAddedNano = n(amounts.settledCny);
 				const unknownObservedAddedNano = n(amounts.unknownObservedCny);
 				const nextSettledNano = settledNano + settledAddedNano;
@@ -2009,20 +2338,30 @@ export async function openLedgerContinuation(input: {
 					reject("current accounting-only carry is invalid");
 				const cp: AccountingCheckpoint = { version: 3, ancestry: accountingAncestry,
 					legacyAncestry, historical,
-					...(opaqueExecutedRuns.length ? { opaqueExecutedRuns: [...opaqueExecutedRuns] } : {}),
+					...(opaqueExecutedRuns.length ? { opaqueExecutedRuns: [...storedOpaqueExecutedRuns],
+						historicalOpaqueGapEffectInterpretation: "unknown-unreconciled" as const } : {}),
 					kind: "mul-pis-private-ledger-continuation", missionId: MISSION_ID,
 					repository: MISSION_REPOSITORY, seedDigest: seed.seedDigest, parentDigest,
 					source: currentSource, settledNano: nextSettledNano,
 					unknownObservedNano: nextUnknownNano, unpricedRequestCount: nextUnpricedCount,
 					settledAddedNano, unknownObservedAddedNano, unpricedAddedCount: amounts.unpricedRequestCount,
 					requestAudit: amounts.requestAudit,
+					...((pendingEffectAncestry.length || currentEffectReviewPending) ?
+						{ pendingEffectAncestry: [...pendingEffectAncestry,
+							...(currentEffectReviewPending && accountingAncestry.length ?
+								[{ ...accountingAncestry.at(-1)!.source }] : [])] } : {}),
 					...(privateBundle ? { privateBundle, bootstrapBinding } : {}) };
 				if (reviewedEffectAncestry.length)
 					cp.reviewedEffectAncestry = [...reviewedEffectAncestry];
 				const priorNonzero = accountingAncestry.filter(row => !hasNoV3ProviderActivity(row));
-				const reviewedOrigin = hostEffectEvidence?.origin ?? oneTimeLegacyV3Review?.origin ??
-					carryForwardOrigin;
+				const reviewedOrigin = hostEffectEvidence?.origin ??
+					carryForwardOrigin ?? historicalCarryOrigin;
 				const currentEffectReceipt = hostEffectReceipt(cp, priorPrivateBundle);
+				if (amounts.requestAudit.requests.length > 0 && !currentEffectReceipt)
+					cp.currentEffectReview = "pending";
+				appendSelectedTransition(cp, priorPrivateBundle,
+					storedSelectedTransitions, currentEffectReceipt);
+				validateSelectedTransitions(cp, "0".repeat(64));
 				const selectedKeys = ["candidate.cpp", "verification.json", "workflow-archive.json",
 					"experiment-plan.json", "m04-adopted-knowledge.json"] as const;
 				const sameSelection = privateBundle && priorPrivateBundle &&
@@ -2053,8 +2392,12 @@ export async function openLedgerContinuation(input: {
 					reject("current reviewed effect ancestry is not bound to restart claims");
 				validateCurrentDiagnostic(cp);
 				const allPriorEffectsReviewed = priorNonzero.every(row =>
-					cp.reviewedEffectAncestry?.some(entry => entry.envelopeSha256 === row.envelopeDigest) ?? false);
-				const originForCurrent = carryForwardOrigin ?? reviewedOrigin;
+					cp.reviewedEffectAncestry?.some(entry =>
+						entry.envelopeSha256 === row.envelopeDigest &&
+						entry.historicalEffectState === undefined) ?? false);
+				const originForCurrent = carryForwardOrigin ??
+					(hostEffectEvidence?.historicalEffectState === undefined ?
+						hostEffectEvidence?.origin : undefined);
 				if (originForCurrent && privateBundle && priorPrivateBundle && allPriorEffectsReviewed) {
 					const zeroPassThrough = privateBundleDigest(privateBundle) === privateBundleDigest(priorPrivateBundle) &&
 						hasNoV3ProviderActivity(cp);
@@ -2121,10 +2464,20 @@ export async function openLedgerContinuation(input: {
 			if (amounts.privateBundle?.["transport-diagnostics.json"] !== undefined)
 				emergencyBundle["transport-diagnostics.json"] =
 					amounts.privateBundle["transport-diagnostics.json"];
+			if (amounts.privateBundle?.["m04-transaction-quarantine.json"] !== undefined) {
+				if (!m04QuarantineExtends(priorPrivateBundle["m04-transaction-quarantine.json"],
+					amounts.privateBundle["m04-transaction-quarantine.json"], proof?.source,
+					proof?.envelopeSha256))
+					reject("emergency M04 quarantine is not an exact append-only prior-effect record");
+				emergencyBundle["m04-transaction-quarantine.json"] =
+					amounts.privateBundle["m04-transaction-quarantine.json"];
+			}
 			if (!validBundle(emergencyBundle))
 				reject("emergency transport diagnostic bundle exceeds private bounds");
 			const cp: AccountingCheckpoint = { version: 3, ancestry: accountingAncestry,
 				legacyAncestry, historical,
+				...(storedSelectedTransitions.length ?
+					{ selectedTransitions: [...storedSelectedTransitions] } : {}),
 				kind: "mul-pis-private-ledger-continuation", missionId: MISSION_ID,
 				repository: MISSION_REPOSITORY, seedDigest: seed.seedDigest, parentDigest,
 				source: currentSource, settledNano: nextSettledNano,
@@ -2133,7 +2486,8 @@ export async function openLedgerContinuation(input: {
 				unpricedAddedCount: amounts.unpricedRequestCount,
 				requestAudit: amounts.requestAudit, currentEffectReview: "pending",
 				privateBundle: emergencyBundle, bootstrapBinding: priorBootstrapBinding,
-				...(opaqueExecutedRuns.length ? { opaqueExecutedRuns: [...opaqueExecutedRuns] } : {}),
+				...(opaqueExecutedRuns.length ? { opaqueExecutedRuns: [...storedOpaqueExecutedRuns],
+					historicalOpaqueGapEffectInterpretation: "unknown-unreconciled" as const } : {}),
 				...(reviewedEffectAncestry.length ?
 					{ reviewedEffectAncestry: [...reviewedEffectAncestry] } : {}),
 				...(pending.length ? { pendingEffectAncestry: pending } : {}) };

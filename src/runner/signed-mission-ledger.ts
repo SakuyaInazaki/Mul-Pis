@@ -7,14 +7,14 @@ export const MISSION_ID = "mul-pis-private-original-objective-2026-10-05";
 export const MISSION_REPOSITORY = "SakuyaInazaki/Mul-Pis";
 export const MISSION_TOTAL_CNY = 30;
 export const MISSION_ARTIFACT = "confidential-campaign-envelope";
-export const ONE_USE_PUSH_MARKER = "Resume workflow with verified native CNY pricing and explicit admission feedback (mul-pis-20261006-recovery-run4)";
 export const PRIVATE_CONTINUATION_FILE_KEYS = ["candidate.cpp", "verification.json",
 	"objective-checkpoint.json", "workflow-archive.json", "m04-export.json",
 	"m04-adopted-knowledge.json", "assessment-receipts.json",
 	"objective-assessment-receipts.json", "original-objective.json",
 	"experiment-plan.json", "research-history.json", "independent-restart-quarantine.json",
 	"independent-restart-goal-binding.json", "host-effect-receipt.json",
-	"transport-diagnostics.json"] as const;
+	"transport-diagnostics.json", "m04-transaction.json",
+	"m04-transaction-quarantine.json"] as const;
 export type PrivateContinuationBundle = Partial<Record<(typeof PRIVATE_CONTINUATION_FILE_KEYS)[number], string>>;
 export type BootstrapBinding = { contractId: string; sourceSha256: string };
 export type RootReviewedAnchor = { commit: string; artifactSha256: string;

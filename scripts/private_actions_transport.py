@@ -31,21 +31,21 @@ MAX_REVIEW_TEXT_FILE = 512_000
 EXPECTED_INPUT_FILES = 3
 MAX_ENVELOPE = 132 * 1024 * 1024
 RESULT_ALLOWLIST = (
-    "candidate.cpp", "verification.json", "lesson-delta.json", "experiment-plan.json", "workflow-archive.json", "m04-adopted-knowledge.json", "review-decision.json", "context-lineage.json",
+    "candidate.cpp", "verification.json", "lesson-delta.json", "experiment-plan.json", "workflow-archive.json", "m04-adopted-knowledge.json", "m04-transaction.json", "review-decision.json", "context-lineage.json",
     "followon-candidate.cpp", "followon-verification.json", "followon-lesson-delta.json", "followon-experiment-plan.json", "workflow-followon-archive.json",
-    "followon-review-decision.json",
+    "followon-review-decision.json", "followon-m04-transaction.json",
     "initial-candidate.cpp", "initial-verification.json", "initial-lesson-delta.json", "initial-experiment-plan.json", "workflow-initial-archive.json",
-    "initial-review-decision.json", "initial-m04-adopted-knowledge.json",
+    "initial-review-decision.json", "initial-m04-adopted-knowledge.json", "initial-m04-transaction.json",
     "branch-parent-candidate.cpp", "branch-parent-verification.json", "branch-parent-lesson-delta.json", "branch-parent-experiment-plan.json", "workflow-branch-parent-archive.json",
-    "branch-parent-review-decision.json",
+    "branch-parent-review-decision.json", "branch-parent-m04-transaction.json",
     "branch-child-candidate.cpp", "branch-child-verification.json", "branch-child-lesson-delta.json", "branch-child-experiment-plan.json", "workflow-branch-child-archive.json",
-    "branch-child-review-decision.json",
+    "branch-child-review-decision.json", "branch-child-m04-transaction.json",
     "campaign-status.json", "original-objective.json", "objective-checkpoint.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "mission-ledger-out.json", "execution-capabilities.json", "research-history.json", "restored-candidate-verification.json",
     "independent-restart-quarantine.json", "independent-restart-goal-binding.json",
-    "host-effect-receipt.json",
+    "host-effect-receipt.json", "m04-transaction-quarantine.json",
 )
 RESULT_DYNAMIC_RE = re.compile(
-    r"^(?:(?:provenance-import|iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,})-(?:candidate\.cpp|verification\.json|lesson-delta\.json|experiment-plan\.json|review-decision\.json|m04-adopted-knowledge\.json)|"
+    r"^(?:(?:provenance-import|iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,})-(?:candidate\.cpp|verification\.json|lesson-delta\.json|experiment-plan\.json|review-decision\.json|m04-adopted-knowledge\.json|m04-transaction\.json)|"
     r"workflow-(?:provenance-import|iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,})-archive\.json|"
     r"(?:initial-|followon-|branch-parent-|branch-child-|provenance-import-|iteration-[1-9][0-9]*-|fallback-[0-9a-f]{12}-T[0-9]{3,}-)?round-[1-9][0-9]*-(?:candidate\.cpp|verification\.json|reviewer-feedback\.txt|reviewer-report\.md))$"
 )

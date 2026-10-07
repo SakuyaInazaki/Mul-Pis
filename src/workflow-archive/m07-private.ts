@@ -60,7 +60,9 @@ export interface PrivateM07ArchiveV1 {
 	};
 	lesson: { state: "pending-m04" | "none" | "missing" | "invalid"; action?: "propose" | "amend" | "contradict"; evidencePaths?: string[] };
 	m04?: { state: "not-run" | "completed" | "failed"; runId?: string; proposalSubmitted?: boolean; snapshotCreated?: boolean;
+		snapshotId?: string;
 		adoptedExperienceRefs?: KnowledgeRef[];
+		transaction?: { file: "m04-transaction.json"; state: "no-proposal" | "rejected-draft" | "merge-intent" | "merged" | "unknown" };
 		knowledgeExport?: { state: "complete" | "none" | "incomplete"; file?: typeof M04_KNOWLEDGE_EXPORT_NAME; recordCount?: number; reason?: string } };
 	knowledgeReuse: { trustedAdoption: false; adoptionPath: "M04"; nextUse: "explicit-candidate-context-only" };
 }
@@ -662,14 +664,49 @@ export async function recordPrivateM04Outcome(destination: string, m04: NonNulla
 	const archive = loaded.archive;
 	if (!["not-run", "completed", "failed"].includes(m04.state) ||
 		(m04.runId !== undefined && (typeof m04.runId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(m04.runId))) ||
+		(m04.snapshotId !== undefined && (typeof m04.snapshotId !== "string" ||
+			!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(m04.snapshotId))) ||
 		(m04.adoptedExperienceRefs !== undefined && (!Array.isArray(m04.adoptedExperienceRefs) ||
 			m04.adoptedExperienceRefs.some(ref => typeof ref.storeId !== "string" || typeof ref.recordId !== "string" || !/^[CKEJQDX]\d{3,}$/.test(ref.recordId) || !Number.isSafeInteger(ref.version) || ref.version < 1))))
 		throw new Error("invalid bounded M04 archive outcome");
 	const exported = await exportM04Knowledge(m04, store);
+	let transaction: NonNullable<PrivateM07ArchiveV1["m04"]>["transaction"];
+	let mergedSnapshotId: string | undefined;
+	const transactionFile = path.join(destination, "m04-transaction.json");
+	if (m04.runId && (await lstat(transactionFile).then(() => true, () => false))) {
+		const info = await lstat(transactionFile);
+		if (!info.isFile() || info.isSymbolicLink() || info.size > 4 * 1024 * 1024)
+			throw new Error("private M04 transaction is not a bounded regular file");
+		let value: Record<string, unknown>;
+		try { value = JSON.parse(await readFile(transactionFile, "utf8")); }
+		catch { throw new Error("private M04 transaction JSON is invalid"); }
+		if (value.version !== 1 || value.kind !== "m04-knowledge-transaction" ||
+			value.m04RunId !== m04.runId ||
+			!["no-proposal", "rejected-draft", "merge-intent", "merged", "unknown"].includes(String(value.state)))
+			throw new Error("private M04 transaction and archive outcome disagree");
+		const known = value.state === "no-proposal" ? [false, false] :
+			value.state === "rejected-draft" ? [true, false] :
+			value.state === "merged" ? [true, true] : undefined;
+		if (known && (m04.proposalSubmitted !== known[0] || m04.snapshotCreated !== known[1]) ||
+			(value.state === "merge-intent" || value.state === "unknown") &&
+			(m04.state !== "failed" || m04.snapshotCreated !== undefined))
+			throw new Error("private M04 transaction facts conflict with the archived effect state");
+		if (value.state === "merged") {
+			if (m04.state !== "completed" || typeof value.snapshotId !== "string" ||
+				!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value.snapshotId) ||
+				(m04.snapshotId !== undefined && m04.snapshotId !== value.snapshotId))
+				throw new Error("merged M04 snapshot identity differs from the archived transaction");
+			mergedSnapshotId = value.snapshotId;
+		} else if (m04.snapshotId !== undefined)
+			throw new Error("unmerged M04 cannot declare a snapshot identity");
+		transaction = { file: "m04-transaction.json", state: value.state as NonNullable<typeof transaction>["state"] };
+	}
 	archive.m04 = { state: m04.state, ...(m04.runId ? { runId: m04.runId } : {}),
 		...(m04.proposalSubmitted !== undefined ? { proposalSubmitted: m04.proposalSubmitted } : {}),
 		...(m04.snapshotCreated !== undefined ? { snapshotCreated: m04.snapshotCreated } : {}),
-		adoptedExperienceRefs: exported.refs, knowledgeExport: exported.status };
+		...(mergedSnapshotId ? { snapshotId: mergedSnapshotId } : {}),
+		adoptedExperienceRefs: exported.refs, knowledgeExport: exported.status,
+		...(transaction ? { transaction } : {}) };
 	archive.knowledgeReuse = { trustedAdoption: false, adoptionPath: "M04", nextUse: "explicit-candidate-context-only" };
 	// Check the existing manifest file bound before changing its separately stored knowledge payload.
 	archiveManifestText(archive);

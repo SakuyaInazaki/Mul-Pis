@@ -132,6 +132,10 @@ class EncryptTests(unittest.TestCase):
             (results / "review-decision.json").write_bytes(b'{"status":"rejected","reason":"Observed failure"}')
             (results / "context-lineage.json").write_bytes(b'{"version":1,"branchCount":2}')
             (results / "initial-m04-adopted-knowledge.json").write_bytes(b'{"version":1,"state":"complete"}')
+            for name in ("m04-transaction.json", "initial-m04-transaction.json",
+                         "followon-m04-transaction.json", "iteration-65-m04-transaction.json",
+                         "fallback-aaaaaaaaaaaa-T003-m04-transaction.json"):
+                (results / name).write_bytes(b'{"kind":"m04-knowledge-transaction","state":"rejected-draft","synthetic":true}')
             (results / "branch-parent-round-1-reviewer-feedback.txt").write_bytes(b"Parent rationale")
             (results / "branch-child-round-1-reviewer-feedback.txt").write_bytes(b"Child rationale")
             (results / "campaign-status.json").write_bytes(b'{"status":"complete"}')
@@ -143,7 +147,9 @@ class EncryptTests(unittest.TestCase):
             (results / "independent-restart-quarantine.json").write_bytes(b'{"synthetic":"quarantine","operationOutcome":"unknown"}')
             (results / "independent-restart-goal-binding.json").write_bytes(b'{"synthetic":"binding","goalRunId":"fresh-goal"}')
             (results / "host-effect-receipt.json").write_bytes(b'{"kind":"m07-host-effect-census"}')
+            (results / "m04-transaction-quarantine.json").write_bytes(b'{"kind":"unresolved-historical-m04-quarantine"}')
             (results / "ignored.txt").write_bytes(b"must be excluded")
+            (results / "m04-transaction-copy.json").write_bytes(b"must also be excluded")
             public = root / "public.pem"
             public.write_bytes(self.private_key.public_key().public_bytes(
                 encoding=serialization.Encoding.PEM,
@@ -154,6 +160,7 @@ class EncryptTests(unittest.TestCase):
             envelope = json.loads(encrypted.read_text())
             self.assertNotIn("secret candidate", encrypted.read_text())
             self.assertNotIn("must be excluded", encrypted.read_text())
+            self.assertNotIn("must also be excluded", encrypted.read_text())
             self.assertEqual(envelope["recipient_spki_sha256"], self.fingerprint)
             key = self.private_key.decrypt(base64.b64decode(envelope["wrapped_key_b64"]),
                 padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
@@ -161,7 +168,7 @@ class EncryptTests(unittest.TestCase):
             plain = AESGCM(key).decrypt(base64.b64decode(envelope["nonce_b64"]),
                 base64.b64decode(envelope["ciphertext_b64"]), aad)
             with tarfile.open(fileobj=io.BytesIO(plain), mode="r:") as tar:
-                self.assertEqual(sorted(tar.getnames()), ["branch-child-round-1-reviewer-feedback.txt", "branch-parent-round-1-reviewer-feedback.txt", "campaign-status.json", "candidate.cpp", "context-lineage.json", "fallback-aaaaaaaaaaaa-T003-round-10-reviewer-feedback.txt", "host-effect-receipt.json", "independent-restart-goal-binding.json", "independent-restart-quarantine.json", "initial-m04-adopted-knowledge.json", "iteration-65-round-10-reviewer-feedback.txt", "lesson-delta.json", "mission-ledger-out.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "objective-checkpoint.json", "original-objective.json", "review-decision.json", "round-1-reviewer-feedback.txt", "workflow-archive.json"])
+                self.assertEqual(sorted(tar.getnames()), sorted(["branch-child-round-1-reviewer-feedback.txt", "branch-parent-round-1-reviewer-feedback.txt", "campaign-status.json", "candidate.cpp", "context-lineage.json", "fallback-aaaaaaaaaaaa-T003-round-10-reviewer-feedback.txt", "host-effect-receipt.json", "independent-restart-goal-binding.json", "independent-restart-quarantine.json", "initial-m04-adopted-knowledge.json", "iteration-65-round-10-reviewer-feedback.txt", "lesson-delta.json", "mission-ledger-out.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "objective-checkpoint.json", "original-objective.json", "review-decision.json", "round-1-reviewer-feedback.txt", "workflow-archive.json", "m04-transaction.json", "initial-m04-transaction.json", "followon-m04-transaction.json", "iteration-65-m04-transaction.json", "fallback-aaaaaaaaaaaa-T003-m04-transaction.json", "m04-transaction-quarantine.json"]))
                 self.assertEqual(tar.extractfile("candidate.cpp").read(), b"secret candidate")
             with self.assertRaises(Exception):
                 AESGCM(key).decrypt(base64.b64decode(envelope["nonce_b64"]),
@@ -180,6 +187,11 @@ class EncryptTests(unittest.TestCase):
             self.assertEqual((recovered / "review-decision.json").read_bytes(), b'{"status":"rejected","reason":"Observed failure"}')
             self.assertEqual((recovered / "context-lineage.json").read_bytes(), b'{"version":1,"branchCount":2}')
             self.assertEqual((recovered / "initial-m04-adopted-knowledge.json").read_bytes(), b'{"version":1,"state":"complete"}')
+            for name in ("m04-transaction.json", "initial-m04-transaction.json",
+                         "followon-m04-transaction.json", "iteration-65-m04-transaction.json",
+                         "fallback-aaaaaaaaaaaa-T003-m04-transaction.json"):
+                self.assertEqual((recovered / name).read_bytes(),
+                                 b'{"kind":"m04-knowledge-transaction","state":"rejected-draft","synthetic":true}')
             self.assertEqual((recovered / "original-objective.json").read_bytes(), b'{"kind":"original-objective"}')
             self.assertEqual((recovered / "objective-checkpoint.json").read_bytes(), b'{"objectiveOutcome":"incomplete"}')
             self.assertEqual((recovered / "objective-assessment-receipt.json").read_bytes(), b'{"boundaryIntent":"independent-judgment"}')
@@ -188,9 +200,11 @@ class EncryptTests(unittest.TestCase):
             self.assertEqual((recovered / "branch-parent-round-1-reviewer-feedback.txt").read_bytes(), b"Parent rationale")
             self.assertEqual((recovered / "branch-child-round-1-reviewer-feedback.txt").read_bytes(), b"Child rationale")
             self.assertEqual((recovered / "host-effect-receipt.json").read_bytes(), b'{"kind":"m07-host-effect-census"}')
+            self.assertEqual((recovered / "m04-transaction-quarantine.json").read_bytes(), b'{"kind":"unresolved-historical-m04-quarantine"}')
             self.assertEqual((recovered / "independent-restart-quarantine.json").read_bytes(), b'{"synthetic":"quarantine","operationOutcome":"unknown"}')
             self.assertEqual((recovered / "independent-restart-goal-binding.json").read_bytes(), b'{"synthetic":"binding","goalRunId":"fresh-goal"}')
             self.assertFalse((recovered / "ignored.txt").exists())
+            self.assertFalse((recovered / "m04-transaction-copy.json").exists())
             self.assertEqual(recovered.stat().st_mode & 0o777, 0o700)
             self.assertEqual((recovered / "candidate.cpp").stat().st_mode & 0o777, 0o600)
 
@@ -206,6 +220,7 @@ class EncryptTests(unittest.TestCase):
                 "provenance-import-lesson-delta.json": b'{"action":"propose"}',
                 "provenance-import-review-decision.json": b'{"status":"accepted"}',
                 "provenance-import-m04-adopted-knowledge.json": b'{"state":"complete"}',
+                "provenance-import-m04-transaction.json": b'{"kind":"m04-knowledge-transaction","state":"rejected-draft"}',
                 "provenance-import-round-1-reviewer-feedback.txt": b"Synthetic bounded review\n",
             }
             for name, content in evidence.items():

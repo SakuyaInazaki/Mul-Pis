@@ -1,5 +1,5 @@
 /**
- * Host-only admission for an independent goal after a terminal, confined attempt.
+ * Host-only admission for an independent goal after a terminal attempt.
  * This is deliberately separate from M07 operation reconciliation and attempt recovery.
  * The old checkpoint is read but never edited; its operations remain unknown.
  *
@@ -8,6 +8,7 @@
  * those facts may be supplied by an execution model or inferred from a tool log.
  */
 import { createHash } from "node:crypto";
+import path from "node:path";
 import type { ObjectiveProgressV1 } from "./objective-progress.ts";
 
 const sha256 = (value: string): string => createHash("sha256").update(value).digest("hex");
@@ -20,6 +21,9 @@ const text = (value: unknown, max = 512): value is string =>
 const sameSet = (left: string[], right: string[]): boolean =>
 	left.length === right.length && new Set(left).size === left.length &&
 	new Set(right).size === right.length && left.every(item => right.includes(item));
+const sourceEqual = (a: AuthenticatedRestartCarryFacts["source"] | undefined,
+	b: AuthenticatedRestartCarryFacts["source"]): boolean => Boolean(a) &&
+	a!.runId === b.runId && a!.runAttempt === b.runAttempt && a!.commit === b.commit;
 
 export interface AuthenticatedRestartCarryFacts {
 	source: { runId: string; runAttempt: number; commit: string };
@@ -30,24 +34,32 @@ export interface AuthenticatedRestartCarryFacts {
 	privateBundleSha256: string;
 	terminal: { state: "terminal"; sourceRunId: string; sourceRunAttempt: number;
 		observationDigest: string; observedAt: string };
-	resultArtifact: { immutableRef: string; digestScope: string; sha256: string };
+	resultArtifact?: { immutableRef: string; digestScope: string; sha256: string };
 	/** Authenticated cumulative upper bound. Unknown usage is already included. */
 	committedNano: number;
 	unknownHeldNano: number;
 }
 
 export interface ReviewedRestartEffectPolicy {
-	/** Exact immutable source revision reviewed by the adapter's host-policy registry. */
+	/** Authenticated source whose effects remain quarantined as unknown. */
 	sourceCommit: string;
 	policyId: string;
 	policySha256: string;
-	/** Each unknown is covered by its own source review or prior sealed quarantine. */
+	/** Each unknown is carried by a live authenticated origin or a prior sealed quarantine. */
 	operationAttestations: Array<{ operationRef: string; sourceCommit: string; evidenceSha256: string }>;
-	effectClass: "confined-ephemeral-local";
-	/** Provider billing is held; any fixed host archival transport is versioned and immutable. */
+	effectClass: "historical-unknown-fresh-only";
+	/** Historical billing observations and holds remain unchanged. */
 	unknownBillingHeld: true;
-	actorThirdPartyMutations: "none";
+	actorThirdPartyMutations: "unknown";
 	hostTransport: "immutable-versioned-archive" | "none";
+	accountingObservation: RestartAccountingObservation;
+}
+
+/** Legacy hold, current v3 observations, and missing-carry gaps remain distinct. */
+export interface RestartAccountingObservation {
+	historicalCommittedNano: number; historicalUnknownHeldNano: number;
+	settledNano: number; unknownObservedNano: number; unpricedRequestCount: number;
+	opaqueUnquantifiedRunCount: number;
 }
 
 export interface RevalidatedRestartSelection {
@@ -68,9 +80,21 @@ export interface IndependentRestartInput {
 	privateBundle: Record<string, string>;
 	/** New isolated workspace and nonce, allocated before any new provider request. */
 	freshWorkspace: { workspaceId: string; restartNonce: string };
+	/** Host-observed boundary checked again before the first fresh model call. */
+	freshBoundary: IndependentRestartFreshBoundary;
 	/** Historical failed source is unavailable to this runner, but the sealed output remains referenced. */
 	failedHistory: { state: "unavailable"; reason: string; immutableArtifactRef: string;
-		digestScope: string; artifactSha256: string };
+		digestScope: string; artifactSha256: string } |
+		{ state: "result-unavailable"; reason: string;
+			carrySource: AuthenticatedRestartCarryFacts["source"]; carryEnvelopeSha256: string };
+}
+
+export interface IndependentRestartFreshBoundary {
+	campaignRoot: string; workspaceRoot: string; storeRoot: string;
+	storeEmpty: true; sessionCensusEmpty: true;
+	sessionMode: "no-prior-session-resume";
+	grantProfile: "private-confined-read-dir";
+	externalWriteTools: false; sharedStore: false; selectedRevalidated: true;
 }
 
 export interface IndependentRestartReceiptV1 {
@@ -87,13 +111,26 @@ export interface IndependentRestartReceiptV1 {
 		operationOutcome: "unknown"; selectedFromFailedAttempt: false;
 		/** Input-only duplicate aliases; checkpoint bytes remain unchanged and hashed. */
 		legacyQualifiedAliases?: Array<{ bareOperationId: string; qualifiedOperationRef: string }>;
-		failedHistory: IndependentRestartInput["failedHistory"] };
+		failedHistory: Extract<IndependentRestartInput["failedHistory"], { state: "unavailable" }> };
 	freshWorkspace: IndependentRestartInput["freshWorkspace"];
 	currentValidationSha256: string;
 }
 
+/** A fresh-only reservation carries old effects without claiming their confinement. */
+export interface IndependentRestartReceiptV2 extends Omit<IndependentRestartReceiptV1, "version" | "prior" | "quarantine"> {
+	version: 2;
+	prior: IndependentRestartReceiptV1["prior"] & { accountingObservation: RestartAccountingObservation };
+	quarantine: Omit<IndependentRestartReceiptV1["quarantine"], "failedHistory"> & {
+		failedHistory: IndependentRestartInput["failedHistory"];
+		historicalEffectState: "unknown-unreconciled";
+		executionMode: "fresh-work-only";
+	};
+}
+
+export type IndependentRestartReceipt = IndependentRestartReceiptV1 | IndependentRestartReceiptV2;
+
 export interface IndependentRestartReservation {
-	receipt: IndependentRestartReceiptV1;
+	receipt: IndependentRestartReceiptV2;
 	receiptRef: string;
 	receiptSha256: string;
 	quarantinedOperationRefs: string[];
@@ -128,7 +165,7 @@ export interface IndependentRestartHost<Proof> {
 	 * authenticated carry. Cross-run one-use needs serialized workflow admission and
 	 * full-history carry freshness; a local mkdir alone is insufficient.
 	 */
-	commitOneUse(receipt: Readonly<IndependentRestartReceiptV1>): Promise<{
+	commitOneUse(receipt: Readonly<IndependentRestartReceiptV2>): Promise<{
 		receiptRef: string; receiptSha256: string;
 		claim: { claimId: string; priorEnvelopeSha256: string; currentRunId: string;
 			currentRunAttempt: number; currentCommit: string; currentJobId: string };
@@ -149,11 +186,15 @@ export function canonicalRestartUnknowns(checkpoint: ObjectiveProgressV1): {
 	const historicalRefs = checkpoint.boundedRuns.flatMap(run =>
 		(run.unresolvedOperationIds ?? []).map(id => `${run.runId}/${id}`));
 	const continuationRefs = checkpoint.continuation.unresolvedOperationIds;
-	if (!historicalRefs.length || new Set(historicalRefs).size !== historicalRefs.length ||
+	if (new Set(historicalRefs).size !== historicalRefs.length ||
 		new Set(continuationRefs).size !== continuationRefs.length ||
-		!checkpoint.boundedRuns.some(run => run.outcome === "active" &&
-			(run.unresolvedOperationIds?.length ?? 0) > 0))
+		(historicalRefs.length > 0 && !checkpoint.boundedRuns.some(run => run.outcome === "active" &&
+			(run.unresolvedOperationIds?.length ?? 0) > 0)))
 		fail("unknown operations are missing, duplicated, or hidden in historical state");
+	if (historicalRefs.length === 0) {
+		if (continuationRefs.length) fail("continuation invented an unknown operation");
+		return { operationRefs: [], aliases: [] };
+	}
 	const qualified: string[] = [];
 	const aliases: Array<{ bareOperationId: string; qualifiedOperationRef: string }> = [];
 	for (const ref of continuationRefs) {
@@ -200,18 +241,38 @@ export async function reserveIndependentRestart<Proof>(input: IndependentRestart
 		!hex64(facts.terminal.observationDigest) || !Number.isFinite(Date.parse(facts.terminal.observedAt)))
 		fail("prior execution is not independently proven terminal");
 	if (![facts.committedNano, facts.unknownHeldNano].every(value => Number.isSafeInteger(value) && value >= 0) ||
-		facts.unknownHeldNano === 0 || facts.unknownHeldNano > facts.committedNano)
-		fail("unknown provider cost was not retained in the authenticated upper bound");
+		facts.unknownHeldNano > facts.committedNano)
+		fail("historical provider accounting is inconsistent");
 	if (!text(input.freshWorkspace.workspaceId) || !text(input.freshWorkspace.restartNonce) ||
 		input.freshWorkspace.workspaceId === facts.source.runId)
 		fail("fresh workspace and restart nonce are required");
-	if (input.failedHistory.state !== "unavailable" || !text(input.failedHistory.reason, 1000) ||
-		!text(input.failedHistory.immutableArtifactRef, 2000) || !text(input.failedHistory.digestScope) ||
-		!hex64(input.failedHistory.artifactSha256) ||
-		input.failedHistory.immutableArtifactRef !== facts.resultArtifact.immutableRef ||
-		input.failedHistory.digestScope !== facts.resultArtifact.digestScope ||
-		input.failedHistory.artifactSha256 !== facts.resultArtifact.sha256)
-		fail("unread failed history must have an immutable artifact reference and explicit gap");
+	const fresh = input.freshBoundary;
+	if (!fresh || fresh.storeEmpty !== true || fresh.sessionCensusEmpty !== true ||
+		fresh.sessionMode !== "no-prior-session-resume" ||
+		fresh.grantProfile !== "private-confined-read-dir" ||
+		fresh.externalWriteTools !== false || fresh.sharedStore !== false ||
+		fresh.selectedRevalidated !== true ||
+		!text(fresh.campaignRoot, 4000) ||
+		fresh.campaignRoot !== path.resolve(fresh.campaignRoot) ||
+		!path.basename(fresh.campaignRoot).startsWith("mulpis-private-campaign-") ||
+		input.freshWorkspace.workspaceId !== path.basename(fresh.campaignRoot) ||
+		fresh.workspaceRoot !== path.join(fresh.campaignRoot, "workspace") ||
+		fresh.storeRoot !== path.join(fresh.workspaceRoot, ".agent", "knowledge"))
+		fail("fresh-only workspace, empty store, or no-resume boundary is absent");
+	if (!text(input.failedHistory.reason, 1000))
+		fail("unread failed history lacks an explicit gap");
+	if (facts.resultArtifact) {
+		if (input.failedHistory.state !== "unavailable" ||
+			!text(input.failedHistory.immutableArtifactRef, 2000) ||
+			!text(input.failedHistory.digestScope) || !hex64(input.failedHistory.artifactSha256) ||
+			input.failedHistory.immutableArtifactRef !== facts.resultArtifact.immutableRef ||
+			input.failedHistory.digestScope !== facts.resultArtifact.digestScope ||
+			input.failedHistory.artifactSha256 !== facts.resultArtifact.sha256)
+			fail("unread failed history must bind the authenticated result artifact");
+	} else if (input.failedHistory.state !== "result-unavailable" ||
+		!sourceEqual(input.failedHistory.carrySource, facts.source) ||
+		input.failedHistory.carryEnvelopeSha256 !== facts.envelopeSha256)
+		fail("expired result history must bind the authenticated carry source and envelope");
 
 	const checkpointText = input.privateBundle["objective-checkpoint.json"];
 	if (typeof checkpointText !== "string") fail("authenticated bundle lacks objective checkpoint");
@@ -223,7 +284,7 @@ export async function reserveIndependentRestart<Proof>(input: IndependentRestart
 		!text(checkpoint.contract.id) || !Array.isArray(checkpoint.boundedRuns) ||
 		!Array.isArray(checkpoint.selectedArtifacts) || !checkpoint.selectedArtifacts.length ||
 		!Array.isArray(checkpoint.continuation?.unresolvedOperationIds) ||
-		checkpoint.continuation.requiresOperationReconciliation !== true)
+		typeof checkpoint.continuation.requiresOperationReconciliation !== "boolean")
 		fail("checkpoint does not preserve unresolved original-goal state");
 	let originalContract: unknown;
 	try { originalContract = JSON.parse(input.privateBundle["original-objective.json"]); }
@@ -231,6 +292,8 @@ export async function reserveIndependentRestart<Proof>(input: IndependentRestart
 	if (JSON.stringify(originalContract) !== JSON.stringify(checkpoint.contract))
 		fail("original contract and historical checkpoint disagree");
 	const { operationRefs: unresolved, aliases } = canonicalRestartUnknowns(checkpoint);
+	if (unresolved.length > 0 && checkpoint.continuation.requiresOperationReconciliation !== true)
+		fail("checkpoint did not retain the unresolved-operation hold");
 	for (const name of checkpoint.selectedArtifacts)
 		if (!text(name, 128) || typeof input.privateBundle[name] !== "string")
 			fail("selected historical tuple is incomplete");
@@ -252,13 +315,19 @@ export async function reserveIndependentRestart<Proof>(input: IndependentRestart
 		!sameSet(policy.operationAttestations.map(item => item.operationRef), unresolved) ||
 		policy.operationAttestations.some(item => !(/^[0-9a-f]{40}$/).test(item.sourceCommit) ||
 			!hex64(item.evidenceSha256)) ||
-		policy.effectClass !== "confined-ephemeral-local" || policy.unknownBillingHeld !== true ||
-		policy.actorThirdPartyMutations !== "none" ||
-		!["immutable-versioned-archive", "none"].includes(policy.hostTransport))
+		policy.effectClass !== "historical-unknown-fresh-only" || policy.unknownBillingHeld !== true ||
+		policy.actorThirdPartyMutations !== "unknown" ||
+		!policy.accountingObservation ||
+		Object.values(policy.accountingObservation).some(value =>
+			!Number.isSafeInteger(value) || value < 0) ||
+		policy.accountingObservation.historicalCommittedNano !== facts.committedNano ||
+		policy.accountingObservation.historicalUnknownHeldNano !== facts.unknownHeldNano ||
+		(unresolved.length === 0 && policy.accountingObservation.opaqueUnquantifiedRunCount === 0) ||
+		policy.hostTransport !== (facts.resultArtifact ? "immutable-versioned-archive" : "none"))
 		fail("source-policy review does not cover every unknown effect");
 
-	const receipt: IndependentRestartReceiptV1 = {
-		version: 1, kind: "host-independent-goal-quarantine", issuedAt: new Date().toISOString(),
+	const receipt: IndependentRestartReceiptV2 = {
+		version: 2, kind: "host-independent-goal-quarantine", issuedAt: new Date().toISOString(),
 		reuseKey: digest({ kind: "host-independent-goal-quarantine", source: facts.source,
 			envelopeSha256: facts.envelopeSha256, operationRefs: [...unresolved].sort() }),
 		prior: { source: { ...facts.source }, envelopeSha256: facts.envelopeSha256,
@@ -267,10 +336,12 @@ export async function reserveIndependentRestart<Proof>(input: IndependentRestart
 			selectedTaskId: selection.selectedTaskId, selectedTupleSha256: tupleSha256,
 			terminalObservationSha256: facts.terminal.observationDigest,
 			reviewedPolicyId: policy.policyId, reviewedPolicySha256: policy.policySha256,
-			committedNano: facts.committedNano, unknownHeldNano: facts.unknownHeldNano },
+			committedNano: facts.committedNano, unknownHeldNano: facts.unknownHeldNano,
+			accountingObservation: { ...policy.accountingObservation } },
 		quarantine: { operationRefs: [...unresolved].sort(),
 			historicalGoalOutcomes: checkpoint.boundedRuns.map(run => ({ runId: run.runId, outcome: run.outcome })),
 			operationOutcome: "unknown", selectedFromFailedAttempt: false,
+			historicalEffectState: "unknown-unreconciled", executionMode: "fresh-work-only",
 			...(aliases.length ? { legacyQualifiedAliases: aliases } : {}),
 			failedHistory: { ...input.failedHistory } },
 		freshWorkspace: { ...input.freshWorkspace }, currentValidationSha256: selection.currentValidationSha256,

@@ -43,6 +43,74 @@ export interface HistoricalM04EvidenceIndexV1 {
 type Input = { proof: unknown; bundle: PrivateContinuationBundle; contractId: string;
 	goalRunId: string; taskId: string; expectedChecks: readonly string[] };
 
+function noAdoptedM04Evidence(m04: Record<string, unknown>, files: Record<string, unknown>): boolean {
+	const exportState = m04.knowledgeExport;
+	return (m04.adoptedExperienceRefs === undefined || Array.isArray(m04.adoptedExperienceRefs) &&
+		m04.adoptedExperienceRefs.length === 0) &&
+		(exportState === undefined || object(exportState) && exportState.state === "none" &&
+			exportState.file === undefined && exportState.recordCount === undefined) &&
+		files["m04-adopted-knowledge.json"] === undefined && m04.snapshotId === undefined;
+}
+
+function safeRelativeFile(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0 && value.length <= 240 &&
+		!path.isAbsolute(value) && !path.win32.isAbsolute(value) && !value.includes("\\") &&
+		value.split("/").every(part => part !== "" && part !== "." && part !== "..");
+}
+
+function transactionTransportFile(archive: Record<string, unknown>): string | undefined {
+	if (archive.transportLayout === undefined) return "m04-transaction.json";
+	const layout = archive.transportLayout;
+	if (!object(layout) || layout.kind !== "prefixed-flat-index" ||
+		typeof layout.prefix !== "string" ||
+		!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(layout.prefix)) return undefined;
+	return `${layout.prefix}-m04-transaction.json`;
+}
+
+/** Portable host copy of a failed M04's precise no-merge transaction. The
+ * embedded files are evidence only; this validates controls, not scientific merit. */
+function rejectedM04Transaction(raw: unknown, m04RunId: string): boolean {
+	if (typeof raw !== "string") return false;
+	let transaction: Record<string, unknown>;
+	try { transaction = parseJson(raw, "historical M04 transaction"); }
+	catch { return false; }
+	if (transaction.version !== 1 || transaction.kind !== "m04-knowledge-transaction" ||
+		transaction.m04RunId !== m04RunId || transaction.state !== "rejected-draft" ||
+		transaction.snapshotId !== undefined || !Array.isArray(transaction.attempts) ||
+		transaction.attempts.length < 1) return false;
+	const proposalIds = new Set<string>();
+	for (const [index, rawAttempt] of transaction.attempts.entries()) {
+		if (!object(rawAttempt) || rawAttempt.ordinal !== index + 1 ||
+			typeof rawAttempt.proposalId !== "string" || !/^P\d{4,}$/.test(rawAttempt.proposalId) ||
+			proposalIds.has(rawAttempt.proposalId) || rawAttempt.snapshotId !== undefined ||
+			!safeRelativeFile(rawAttempt.proposalFile) ||
+			path.posix.basename(rawAttempt.proposalFile) !== `${rawAttempt.proposalId}.json` ||
+			rawAttempt.receiptFile !== `proposal-validation-${String(index + 1).padStart(4, "0")}.json` ||
+			rawAttempt.state !== "rejected-draft" || rawAttempt.structurallyValid !== false ||
+			!Array.isArray(rawAttempt.issues) || !rawAttempt.issues.length ||
+			!rawAttempt.issues.some(issue => object(issue) && issue.level === "error") ||
+			rawAttempt.issues.some(issue => !object(issue) || !["error", "warning"].includes(String(issue.level)) ||
+				typeof issue.message !== "string" || !issue.message ||
+				(issue.opIndex !== undefined && (!Number.isSafeInteger(issue.opIndex) || Number(issue.opIndex) < 0))) ||
+			typeof rawAttempt.proposalDraftJson !== "string" ||
+			typeof rawAttempt.validationReceiptJson !== "string") return false;
+		proposalIds.add(rawAttempt.proposalId);
+		let draft: Record<string, unknown>, receipt: Record<string, unknown>;
+		try {
+			draft = parseJson(rawAttempt.proposalDraftJson, "historical M04 proposal draft");
+			receipt = parseJson(rawAttempt.validationReceiptJson, "historical M04 validation receipt");
+		} catch { return false; }
+		if (draft.id !== rawAttempt.proposalId || draft.stage !== "M04" || draft.runId !== m04RunId ||
+			!Array.isArray(draft.ops) ||
+			receipt.version !== 1 || receipt.kind !== "m04-proposal-validation" ||
+			receipt.m04RunId !== m04RunId || receipt.proposalId !== rawAttempt.proposalId ||
+			receipt.proposalFile !== rawAttempt.proposalFile || receipt.structurallyValid !== false ||
+			JSON.stringify(receipt.issues) !== JSON.stringify(rawAttempt.issues)) return false;
+	}
+	const latest = transaction.attempts.at(-1) as Record<string, unknown>;
+	return transaction.currentProposalId === latest.proposalId;
+}
+
 function reject(reason: string): never { throw new Error(`archived M07 import: ${reason}`); }
 function object(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -212,8 +280,29 @@ export function validateArchivedM07Import(input: Input): ArchivedM07ImportV1 {
 		!object(archive.knowledgeReuse) || archive.knowledgeReuse.trustedAdoption !== false ||
 		archive.knowledgeReuse.adoptionPath !== "M04" ||
 		!object(archive.m04) || archive.m04.state !== "failed" ||
-		archive.m04.proposalSubmitted !== false || archive.m04.snapshotCreated !== false)
+		typeof archive.m04.proposalSubmitted !== "boolean" || archive.m04.snapshotCreated !== false ||
+		!noAdoptedM04Evidence(archive.m04, files))
 		return reject("archive is not an unadopted accepted/fulfilled task awaiting failed M04");
+	const transaction = files["m04-transaction.json"];
+	const declaration = archive.m04.transaction;
+	const expectedFile = transactionTransportFile(archive);
+	if (typeof archive.m04.runId !== "string" ||
+		!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(archive.m04.runId) ||
+		transaction === undefined || !object(declaration) || !expectedFile ||
+		declaration.file !== expectedFile ||
+		declaration.state !== (archive.m04.proposalSubmitted ? "rejected-draft" : "no-proposal"))
+		return reject("historical M04 transaction payload and archive declaration disagree");
+	if (archive.m04.proposalSubmitted === true) {
+		if (!rejectedM04Transaction(transaction, archive.m04.runId))
+			return reject("historical M04 rejection transaction is missing or ambiguous");
+	} else {
+		const receipt = parseJson(transaction, "historical M04 transaction");
+		if (receipt.version !== 1 || receipt.kind !== "m04-knowledge-transaction" ||
+			receipt.m04RunId !== archive.m04.runId || receipt.state !== "no-proposal" ||
+			receipt.currentProposalId !== undefined || receipt.snapshotId !== undefined ||
+			!Array.isArray(receipt.attempts) || receipt.attempts.length !== 0)
+			return reject("unsubmitted historical M04 transaction conflicts with archive");
+	}
 	if (!acceptedArchivedOperationCensus(control.operationOutcomes))
 		return reject("accepted historical task lacks a complete settled operation census");
 	const candidate = requireFile(archive, files, "candidate.cpp");

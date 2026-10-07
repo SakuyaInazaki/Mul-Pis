@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import path from "node:path";
 import test from "node:test";
 import { bindIndependentRestartGoal, reserveIndependentRestart, type AuthenticatedRestartCarryFacts,
 	type IndependentRestartHost, type IndependentRestartInput,
@@ -48,19 +49,29 @@ function fixture() {
 			digestScope: "artifact-archive", sha256: hash("ciphertext-archive") },
 		committedNano: 25_000_000_000, unknownHeldNano: 3_000_000_000,
 	};
+	const campaignRoot = path.join("/tmp", "mulpis-private-campaign-synthetic-restart");
+	const workspaceRoot = path.join(campaignRoot, "workspace");
 	const input: IndependentRestartInput = { authenticatedCarryProof: proof, privateBundle: bundle,
-		freshWorkspace: { workspaceId: "fresh-workspace", restartNonce: "fresh-nonce" },
+		freshWorkspace: { workspaceId: path.basename(campaignRoot), restartNonce: "fresh-nonce" },
+		freshBoundary: { campaignRoot, workspaceRoot,
+			storeRoot: path.join(workspaceRoot, ".agent", "knowledge"),
+			storeEmpty: true, sessionCensusEmpty: true,
+			sessionMode: "no-prior-session-resume", grantProfile: "private-confined-read-dir",
+			externalWriteTools: false, sharedStore: false, selectedRevalidated: true },
 		failedHistory: { state: "unavailable", reason: "Encrypted prior outcome cannot be read by this runner",
-			immutableArtifactRef: facts.resultArtifact.immutableRef,
-			digestScope: facts.resultArtifact.digestScope,
-			artifactSha256: facts.resultArtifact.sha256 } };
+			immutableArtifactRef: facts.resultArtifact!.immutableRef,
+			digestScope: facts.resultArtifact!.digestScope,
+			artifactSha256: facts.resultArtifact!.sha256 } };
 	const claims = new Set<string>();
 	const policy: ReviewedRestartEffectPolicy = { sourceCommit, policyId: "reviewed-commit-policy",
 		policySha256: hash("reviewed immutable source"),
 		operationAttestations: [{ operationRef: unknown, sourceCommit,
 			evidenceSha256: hash("reviewed exact operation policy") }],
-		effectClass: "confined-ephemeral-local", unknownBillingHeld: true,
-		actorThirdPartyMutations: "none", hostTransport: "immutable-versioned-archive" };
+		effectClass: "historical-unknown-fresh-only", unknownBillingHeld: true,
+		actorThirdPartyMutations: "unknown", hostTransport: "immutable-versioned-archive",
+		accountingObservation: { historicalCommittedNano: facts.committedNano,
+			historicalUnknownHeldNano: facts.unknownHeldNano, settledNano: 0,
+			unknownObservedNano: 0, unpricedRequestCount: 0, opaqueUnquantifiedRunCount: 0 } };
 	const host: IndependentRestartHost<typeof proof> = {
 		authenticatedFacts: value => value === proof ? facts : undefined,
 		reviewEffects: async () => policy,
@@ -89,7 +100,10 @@ test("independent restart seals a one-use quarantine and preserves unknown old s
 	assert.equal(admission.receipt.prior.unknownHeldNano, 3_000_000_000);
 	assert.equal(admission.receipt.prior.committedNano, 25_000_000_000);
 	assert.equal(admission.receipt.prior.selectedRunId, "accepted-goal");
-	assert.equal(admission.receipt.freshWorkspace.workspaceId, "fresh-workspace");
+	assert.equal(admission.receipt.version, 2);
+	assert.equal(admission.receipt.quarantine.executionMode, "fresh-work-only");
+	assert.equal(admission.receipt.quarantine.historicalEffectState, "unknown-unreconciled");
+	assert.equal(admission.receipt.freshWorkspace.workspaceId, "mulpis-private-campaign-synthetic-restart");
 	assert.equal(f.input.privateBundle["objective-checkpoint.json"], f.checkpointText);
 	const bound = await bindIndependentRestartGoal(admission, "fresh-goal", async binding =>
 		({ bindingRef: "sealed:fresh-goal", bindingSha256: hash(JSON.stringify(binding)) }));
@@ -97,6 +111,75 @@ test("independent restart seals a one-use quarantine and preserves unknown old s
 	await assert.rejects(bindIndependentRestartGoal(admission, "second-goal", async () =>
 		({ bindingRef: "ref", bindingSha256: hash("other") })), /already bound/);
 	await assert.rejects(reserveIndependentRestart(f.input, f.host), /reused receipt/);
+});
+
+test("fresh-only admission requires an empty local store and no prior session replay", async () => {
+	for (const changed of [
+		{ storeEmpty: false }, { sessionCensusEmpty: false },
+		{ sessionMode: "resume-prior-session" }, { externalWriteTools: true },
+		{ sharedStore: true }, { selectedRevalidated: false },
+	]) {
+		const f = fixture();
+		f.input.freshBoundary = { ...f.input.freshBoundary, ...changed } as typeof f.input.freshBoundary;
+		await assert.rejects(reserveIndependentRestart(f.input, f.host), /fresh-only workspace/);
+		assert.equal(f.claims.size, 0);
+	}
+});
+
+test("zero historical unknown fee is allowed while the unknown operation remains quarantined", async () => {
+	const f = fixture();
+	f.facts.unknownHeldNano = 0;
+	f.policy.accountingObservation.historicalUnknownHeldNano = 0;
+	const receipt = await reserveIndependentRestart(f.input, f.host);
+	assert.equal(receipt.receipt.prior.unknownHeldNano, 0);
+	assert.deepEqual(receipt.receipt.quarantine.operationRefs, [unknown]);
+});
+
+test("an authenticated opaque gap permits fresh work with no M07 operation refs", async () => {
+	const f = fixture();
+	const checkpoint = JSON.parse(f.input.privateBundle["objective-checkpoint.json"]);
+	checkpoint.boundedRuns[1].unresolvedOperationIds = [];
+	checkpoint.continuation.unresolvedOperationIds = [];
+	checkpoint.continuation.requiresOperationReconciliation = false;
+	f.input.privateBundle["objective-checkpoint.json"] = JSON.stringify(checkpoint);
+	f.facts.privateBundleSha256 = bundleHash(f.input.privateBundle);
+	f.policy.operationAttestations = [];
+	f.policy.accountingObservation.opaqueUnquantifiedRunCount = 1;
+	const reservation = await reserveIndependentRestart(f.input, f.host);
+	assert.deepEqual(reservation.receipt.quarantine.operationRefs, []);
+	assert.equal(reservation.receipt.prior.accountingObservation.opaqueUnquantifiedRunCount, 1);
+	const forged = fixture();
+	const forgedCheckpoint = JSON.parse(forged.input.privateBundle["objective-checkpoint.json"]);
+	forgedCheckpoint.boundedRuns[1].unresolvedOperationIds = [];
+	forgedCheckpoint.continuation.unresolvedOperationIds = [];
+	forged.input.privateBundle["objective-checkpoint.json"] = JSON.stringify(forgedCheckpoint);
+	forged.facts.privateBundleSha256 = bundleHash(forged.input.privateBundle);
+	forged.policy.operationAttestations = [];
+	await assert.rejects(reserveIndependentRestart(forged.input, forged.host), /source-policy review/);
+});
+
+test("expired result archive binds the AEAD carry without inventing an archive digest", async () => {
+	const f = fixture();
+	f.facts.resultArtifact = undefined;
+	f.policy.hostTransport = "none";
+	f.input.failedHistory = { state: "result-unavailable", reason: "result artifact expired",
+		carrySource: { ...f.facts.source }, carryEnvelopeSha256: f.facts.envelopeSha256 };
+	const reservation = await reserveIndependentRestart(f.input, f.host);
+	assert.equal(reservation.receipt.quarantine.failedHistory.state, "result-unavailable");
+	const forged = fixture();
+	forged.facts.resultArtifact = undefined;
+	forged.policy.hostTransport = "none";
+	forged.input.failedHistory = { state: "result-unavailable", reason: "result artifact expired",
+		carrySource: { ...forged.facts.source }, carryEnvelopeSha256: hash("wrong carry") };
+	await assert.rejects(reserveIndependentRestart(forged.input, forged.host),
+		/expired result history must bind/);
+});
+
+test("a historical confinement claim cannot mint a fresh-only receipt", async () => {
+	const f = fixture();
+	f.policy.effectClass = "confined-ephemeral-local" as ReviewedRestartEffectPolicy["effectClass"];
+	await assert.rejects(reserveIndependentRestart(f.input, f.host), /source-policy review/);
+	assert.equal(f.claims.size, 0);
 });
 
 test("unbranded proof, live run, and tampered authenticated bundle fail before commit", async () => {
@@ -146,8 +229,9 @@ test("receipt must bind a distinct goal and an immutable unread-history referenc
 		({ bindingRef: "ref", bindingSha256: hash("unused") })), /aliases historical identity/);
 
 	const gap = fixture();
+	if (gap.input.failedHistory.state !== "unavailable") throw new Error("fixture mismatch");
 	gap.input.failedHistory.artifactSha256 = "";
-	await assert.rejects(reserveIndependentRestart(gap.input, gap.host), /immutable artifact reference/);
+	await assert.rejects(reserveIndependentRestart(gap.input, gap.host), /authenticated result artifact/);
 
 	const falseReceipt = fixture();
 	falseReceipt.host.commitOneUse = async () => ({ receiptRef: "ref", receiptSha256: hash("other receipt"),
@@ -215,7 +299,7 @@ test("duplicate or absent operation references fail closed", async () => {
 	absent.input.privateBundle["objective-checkpoint.json"] = JSON.stringify(noOperation);
 	absent.facts.privateBundleSha256 = bundleHash(absent.input.privateBundle);
 	await assert.rejects(reserveIndependentRestart(absent.input, absent.host),
-		/missing, duplicated, or hidden/);
+		/source-policy review does not cover every unknown effect/);
 });
 
 test("legacy bare alias requires the exact qualified ref and one active origin", async () => {

@@ -55,6 +55,27 @@ test("private M07 archive retains bounded artifacts and a pending lesson without
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("a merged M04 archive binds the portable snapshot identity exactly", async t => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-m04-snapshot-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const workDir = path.join(root, "task", "work"), destination = path.join(root, "returned");
+	await mkdir(workDir, { recursive: true });
+	const task = { taskId: "T001", workDir, status: "returned" } as M07TaskRecord;
+	const goal = { runId: "synthetic-goal", lifecycle: "finished", outcome: "fulfilled",
+		tasks: [task] } as CurrentGoal;
+	await archivePrivateM07Task({ goal, task, destination });
+	const portable = { version: 1, kind: "m04-knowledge-transaction", m04RunId: "synthetic-m04",
+		state: "merged", currentProposalId: "P0001", snapshotId: "G001",
+		attempts: [{ ordinal: 1, proposalId: "P0001", state: "merged", structurallyValid: true }] };
+	await writeFile(path.join(destination, "m04-transaction.json"), JSON.stringify(portable));
+	const archived = await recordPrivateM04Outcome(destination, { state: "completed",
+		runId: "synthetic-m04", proposalSubmitted: true, snapshotCreated: true });
+	assert.equal(archived.m04?.snapshotId, "G001");
+	await assert.rejects(recordPrivateM04Outcome(destination, { state: "completed",
+		runId: "synthetic-m04", proposalSubmitted: true, snapshotCreated: true,
+		snapshotId: "G002" }), /snapshot identity differs/);
+});
+
 test("private M07 archive records missing lesson rather than inventing adoption", async () => {
 	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-missing-"));
 	try {

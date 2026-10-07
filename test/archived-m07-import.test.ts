@@ -51,13 +51,17 @@ function bundleForImport(withPlan = false): PrivateContinuationBundle {
 		controllerEvidence: { reviewStatus: "accepted", reviewChecks: checks.map(criterion =>
 			({ criterion, result: "passed" })), reviewDecision: { file: "review-decision.json", bytes: 100 },
 			operationOutcomes: [{ operationId: "O001", status: "response-received" }] },
-		m04: { state: "failed", proposalSubmitted: false, snapshotCreated: false },
+		m04: { state: "failed", runId: "M04-NO-PROPOSAL", proposalSubmitted: false,
+			snapshotCreated: false, transaction: { file: "m04-transaction.json", state: "no-proposal" } },
 		knowledgeReuse: { trustedAdoption: false, adoptionPath: "M04", nextUse: "explicit-candidate-context-only" },
 	};
 	const history = { version: 1, kind: "untrusted-version-bound-research-history",
 		entries: [{ originalContractId: contractId, goalRunId: originalRunId, taskId,
 			files: { "candidate.cpp": candidate, "verification.json": verification,
 				...(withPlan ? { "experiment-plan.json": plan } : {}),
+				"m04-transaction.json": JSON.stringify({ version: 1, kind: "m04-knowledge-transaction",
+					m04RunId: archive.m04.runId, state: "no-proposal", attempts: [],
+					updatedAt: "2026-10-06T00:00:00.000Z" }),
 				"workflow-archive.json": JSON.stringify(archive) } }] };
 	return { "original-objective.json": JSON.stringify(original),
 		"objective-checkpoint.json": JSON.stringify(checkpoint),
@@ -66,6 +70,30 @@ function bundleForImport(withPlan = false): PrivateContinuationBundle {
 		"verification.json": verification,
 		"workflow-archive.json": JSON.stringify({ version: 1, kind: "m07-private-candidate-archive",
 			goalRunId: "OLD", taskId: "T001", controllerEvidence: { reviewStatus: "accepted" } }) };
+}
+
+function bundleForRejectedM04Transaction(): PrivateContinuationBundle {
+	const bundle = bundleForImport();
+	const history = JSON.parse(bundle["research-history.json"]!);
+	const files = history.entries[0].files;
+	const archive = JSON.parse(files["workflow-archive.json"]);
+	archive.m04 = { state: "failed", runId: "M04-REJECTED", proposalSubmitted: true,
+		snapshotCreated: false, adoptedExperienceRefs: [], knowledgeExport: { state: "none" },
+		transaction: { file: "m04-transaction.json", state: "rejected-draft" } };
+	files["workflow-archive.json"] = JSON.stringify(archive);
+	const proposalId = "P0001", proposalFile = `knowledge/proposals/${proposalId}.json`;
+	const issues = [{ level: "error", message: "synthetic structural issue", opIndex: 0 }];
+	files["m04-transaction.json"] = JSON.stringify({ version: 1, kind: "m04-knowledge-transaction",
+		m04RunId: archive.m04.runId, state: "rejected-draft", currentProposalId: proposalId,
+		attempts: [{ ordinal: 1, proposalId, proposalFile, receiptFile: "proposal-validation-0001.json",
+			structurallyValid: false, issues, state: "rejected-draft",
+			proposalDraftJson: JSON.stringify({ id: proposalId, stage: "M04", runId: archive.m04.runId,
+				ops: [{ op: "create", type: "K", title: "", body: "" }] }),
+			validationReceiptJson: JSON.stringify({ version: 1, kind: "m04-proposal-validation",
+				m04RunId: archive.m04.runId, proposalId, proposalFile, structurallyValid: false, issues }) }],
+		updatedAt: "2026-10-06T00:00:00.000Z" });
+	bundle["research-history.json"] = JSON.stringify(history);
+	return bundle;
 }
 
 async function authenticatedFixture(t: TestContext, bundle: PrivateContinuationBundle) {
@@ -154,6 +182,155 @@ test("authenticated archived accepted source stages exact untrusted inputs witho
 	assert.equal(provenance.historicalReviewSnapshotAuthority, "unavailable");
 	const another = await stageArchivedM07Import(descriptor, f.directory);
 	assert.notEqual(another.root, staged.root, "each import is staged in a fresh private directory");
+});
+
+test("failed M04 with no proposal still requires a matching no-proposal transaction", async t => {
+	for (const state of ["missing", "merge-intent", "unknown", "rejected-draft"] as const) {
+		const bundle = bundleForImport();
+		const history = JSON.parse(bundle["research-history.json"]!);
+		if (state === "missing") {
+			delete history.entries[0].files["m04-transaction.json"];
+			const archive = JSON.parse(history.entries[0].files["workflow-archive.json"]);
+			delete archive.m04.transaction;
+			history.entries[0].files["workflow-archive.json"] = JSON.stringify(archive);
+		} else {
+			const receipt = JSON.parse(history.entries[0].files["m04-transaction.json"]);
+			receipt.state = state;
+			history.entries[0].files["m04-transaction.json"] = JSON.stringify(receipt);
+		}
+		bundle["research-history.json"] = JSON.stringify(history);
+		const f = await authenticatedFixture(t, bundle);
+		assert.throws(() => validateArchivedM07Import({ proof: f.proof, bundle: f.bundle,
+			contractId, goalRunId: originalRunId, taskId, expectedChecks: checks }), /archived M07 import:/, state);
+	}
+});
+
+test("authenticated future rejected-draft transaction allows only fresh untrusted provenance import", async t => {
+	const f = await authenticatedFixture(t, bundleForRejectedM04Transaction());
+	const descriptor = validateArchivedM07Import({ proof: f.proof, bundle: f.bundle,
+		contractId, goalRunId: originalRunId, taskId, expectedChecks: checks });
+	assert.equal(descriptor.candidate.text, candidate);
+	assert.equal(descriptor.historicalLessonAuthority, "unavailable");
+	assert.equal(descriptor.historicalReviewSnapshotAuthority, "unavailable");
+	const staged = await stageArchivedM07Import(descriptor, f.directory);
+	assert.equal(await readFile(staged.candidatePath, "utf8"), candidate);
+	assert.equal((await readFile(staged.provenancePath, "utf8")).includes("synthetic structural issue"), false,
+		"rejected proposal details do not become trusted import context");
+	const prefixed = bundleForRejectedM04Transaction();
+	const prefixedHistory = JSON.parse(prefixed["research-history.json"]!);
+	const prefixedArchive = JSON.parse(prefixedHistory.entries[0].files["workflow-archive.json"]);
+	prefixedArchive.transportLayout = { kind: "prefixed-flat-index", prefix: "provenance-import",
+		defaultArchiveLoaderCompatible: false };
+	prefixedArchive.m04.transaction.file = "provenance-import-m04-transaction.json";
+	prefixedHistory.entries[0].files["workflow-archive.json"] = JSON.stringify(prefixedArchive);
+	prefixed["research-history.json"] = JSON.stringify(prefixedHistory);
+	const prefixedBinding = await authenticatedFixture(t, prefixed);
+	assert.equal(validateArchivedM07Import({ proof: prefixedBinding.proof, bundle: prefixedBinding.bundle,
+		contractId, goalRunId: originalRunId, taskId, expectedChecks: checks }).candidate.text, candidate);
+	const multi = bundleForRejectedM04Transaction();
+	const history = JSON.parse(multi["research-history.json"]!);
+	const tx = JSON.parse(history.entries[0].files["m04-transaction.json"]);
+	const second = structuredClone(tx.attempts[0]);
+	second.ordinal = 2; second.proposalId = "P0002";
+	second.proposalFile = "knowledge/proposals/P0002.json";
+	second.receiptFile = "proposal-validation-0002.json";
+	const draft = JSON.parse(second.proposalDraftJson); draft.id = second.proposalId;
+	second.proposalDraftJson = JSON.stringify(draft);
+	const receipt = JSON.parse(second.validationReceiptJson);
+	receipt.proposalId = second.proposalId; receipt.proposalFile = second.proposalFile;
+	second.validationReceiptJson = JSON.stringify(receipt);
+	tx.attempts.push(second); tx.currentProposalId = second.proposalId;
+	history.entries[0].files["m04-transaction.json"] = JSON.stringify(tx);
+	multi["research-history.json"] = JSON.stringify(history);
+	const rebound = await authenticatedFixture(t, multi);
+	assert.equal(validateArchivedM07Import({ proof: rebound.proof, bundle: rebound.bundle,
+		contractId, goalRunId: originalRunId, taskId, expectedChecks: checks }).candidate.text, candidate,
+		"multiple truly rejected drafts have no arbitrary attempt-count stop");
+});
+
+test("future M04 proposal import refuses missing, malformed, conflicting, or merge-possible receipts", async t => {
+	const mutations: Array<[string, (bundle: PrivateContinuationBundle) => void]> = [
+		["no transaction and no declaration stays pending reconciliation", bundle => {
+			const h = JSON.parse(bundle["research-history.json"]!);
+			const archive = JSON.parse(h.entries[0].files["workflow-archive.json"]);
+			delete archive.m04.transaction;
+			h.entries[0].files["workflow-archive.json"] = JSON.stringify(archive);
+			delete h.entries[0].files["m04-transaction.json"];
+			bundle["research-history.json"] = JSON.stringify(h);
+		}],
+		["undeclared transaction", bundle => { const h = JSON.parse(bundle["research-history.json"]!);
+			const archive = JSON.parse(h.entries[0].files["workflow-archive.json"]);
+			delete archive.m04.transaction; h.entries[0].files["workflow-archive.json"] = JSON.stringify(archive);
+			bundle["research-history.json"] = JSON.stringify(h); }],
+		["wrong transaction pointer", bundle => { const h = JSON.parse(bundle["research-history.json"]!);
+			const archive = JSON.parse(h.entries[0].files["workflow-archive.json"]);
+			archive.m04.transaction.file = "other-m04-transaction.json";
+			h.entries[0].files["workflow-archive.json"] = JSON.stringify(archive);
+			bundle["research-history.json"] = JSON.stringify(h); }],
+		["wrong transaction declaration state", bundle => { const h = JSON.parse(bundle["research-history.json"]!);
+			const archive = JSON.parse(h.entries[0].files["workflow-archive.json"]);
+			archive.m04.transaction.state = "merge-intent";
+			h.entries[0].files["workflow-archive.json"] = JSON.stringify(archive);
+			bundle["research-history.json"] = JSON.stringify(h); }],
+		["prefixed layout with unprefixed pointer", bundle => { const h = JSON.parse(bundle["research-history.json"]!);
+			const archive = JSON.parse(h.entries[0].files["workflow-archive.json"]);
+			archive.transportLayout = { kind: "prefixed-flat-index", prefix: "provenance-import" };
+			h.entries[0].files["workflow-archive.json"] = JSON.stringify(archive);
+			bundle["research-history.json"] = JSON.stringify(h); }],
+		["missing matched transaction despite top-level copy", bundle => { const h = JSON.parse(bundle["research-history.json"]!);
+			bundle["m04-transaction.json"] = h.entries[0].files["m04-transaction.json"];
+			delete h.entries[0].files["m04-transaction.json"]; bundle["research-history.json"] = JSON.stringify(h); }],
+		["malformed transaction", bundle => { const h = JSON.parse(bundle["research-history.json"]!);
+			h.entries[0].files["m04-transaction.json"] = "{invalid"; bundle["research-history.json"] = JSON.stringify(h); }],
+		["different M04 run", bundle => { const h = JSON.parse(bundle["research-history.json"]!);
+			const tx = JSON.parse(h.entries[0].files["m04-transaction.json"]); tx.m04RunId = "M04-OTHER";
+			h.entries[0].files["m04-transaction.json"] = JSON.stringify(tx); bundle["research-history.json"] = JSON.stringify(h); }],
+		["merge intent", bundle => { const h = JSON.parse(bundle["research-history.json"]!);
+			const tx = JSON.parse(h.entries[0].files["m04-transaction.json"]); tx.state = "merge-intent";
+			h.entries[0].files["m04-transaction.json"] = JSON.stringify(tx); bundle["research-history.json"] = JSON.stringify(h); }],
+		["unknown transaction", bundle => { const h = JSON.parse(bundle["research-history.json"]!);
+			const tx = JSON.parse(h.entries[0].files["m04-transaction.json"]); tx.state = "unknown";
+			h.entries[0].files["m04-transaction.json"] = JSON.stringify(tx); bundle["research-history.json"] = JSON.stringify(h); }],
+		["earlier merged attempt", bundle => { const h = JSON.parse(bundle["research-history.json"]!);
+			const tx = JSON.parse(h.entries[0].files["m04-transaction.json"]);
+			tx.attempts.unshift({ ...tx.attempts[0], ordinal: 1, state: "merged" }); tx.attempts[1].ordinal = 2;
+			h.entries[0].files["m04-transaction.json"] = JSON.stringify(tx); bundle["research-history.json"] = JSON.stringify(h); }],
+		["proposal identity mismatch", bundle => { const h = JSON.parse(bundle["research-history.json"]!);
+			const tx = JSON.parse(h.entries[0].files["m04-transaction.json"]);
+			const draft = JSON.parse(tx.attempts[0].proposalDraftJson); draft.id = "P9999";
+			tx.attempts[0].proposalDraftJson = JSON.stringify(draft);
+			h.entries[0].files["m04-transaction.json"] = JSON.stringify(tx); bundle["research-history.json"] = JSON.stringify(h); }],
+		["duplicate proposal identity", bundle => { const h = JSON.parse(bundle["research-history.json"]!);
+			const tx = JSON.parse(h.entries[0].files["m04-transaction.json"]);
+			tx.attempts.push({ ...tx.attempts[0], ordinal: 2, receiptFile: "proposal-validation-0002.json" });
+			h.entries[0].files["m04-transaction.json"] = JSON.stringify(tx); bundle["research-history.json"] = JSON.stringify(h); }],
+		["validation receipt mismatch", bundle => { const h = JSON.parse(bundle["research-history.json"]!);
+			const tx = JSON.parse(h.entries[0].files["m04-transaction.json"]);
+			const receipt = JSON.parse(tx.attempts[0].validationReceiptJson); receipt.proposalId = "P9999";
+			tx.attempts[0].validationReceiptJson = JSON.stringify(receipt);
+			h.entries[0].files["m04-transaction.json"] = JSON.stringify(tx); bundle["research-history.json"] = JSON.stringify(h); }],
+		["no structural error", bundle => { const h = JSON.parse(bundle["research-history.json"]!);
+			const tx = JSON.parse(h.entries[0].files["m04-transaction.json"]);
+			tx.attempts[0].issues = [{ level: "warning", message: "not an error" }];
+			h.entries[0].files["m04-transaction.json"] = JSON.stringify(tx); bundle["research-history.json"] = JSON.stringify(h); }],
+		["archive snapshot conflict", bundle => { const h = JSON.parse(bundle["research-history.json"]!);
+			const archive = JSON.parse(h.entries[0].files["workflow-archive.json"]); archive.m04.snapshotCreated = true;
+			h.entries[0].files["workflow-archive.json"] = JSON.stringify(archive); bundle["research-history.json"] = JSON.stringify(h); }],
+		["adopted refs", bundle => { const h = JSON.parse(bundle["research-history.json"]!);
+			const archive = JSON.parse(h.entries[0].files["workflow-archive.json"]);
+			archive.m04.adoptedExperienceRefs = [{ storeId: "S", recordId: "K001", version: 1 }];
+			h.entries[0].files["workflow-archive.json"] = JSON.stringify(archive); bundle["research-history.json"] = JSON.stringify(h); }],
+		["knowledge export", bundle => { const h = JSON.parse(bundle["research-history.json"]!);
+			h.entries[0].files["m04-adopted-knowledge.json"] = "{}"; bundle["research-history.json"] = JSON.stringify(h); }],
+		["ambiguous history", bundle => { const h = JSON.parse(bundle["research-history.json"]!);
+			h.entries.push(structuredClone(h.entries[0])); bundle["research-history.json"] = JSON.stringify(h); }],
+	];
+	for (const [label, mutate] of mutations) {
+		const bundle = bundleForRejectedM04Transaction(); mutate(bundle);
+		const f = await authenticatedFixture(t, bundle);
+		assert.throws(() => validateArchivedM07Import({ proof: f.proof, bundle: f.bundle,
+			contractId, goalRunId: originalRunId, taskId, expectedChecks: checks }), /archived M07 import:/, label);
+	}
 });
 
 test("registered historical plan stages exact bytes and missing declared plan is rejected", async t => {
@@ -588,8 +765,19 @@ test("import M04 effect disposition only continues on known safe failure or comp
 	assert.equal(offlineChecks.importM04EffectDisposition({ status: "failed",
 		proposalSubmitted: false, snapshotCreated: false, threw: false }), "continue");
 	assert.equal(offlineChecks.importM04EffectDisposition({ status: "failed",
+		proposalSubmitted: false, snapshotCreated: false, transactionState: "no-proposal",
+		threw: true }), "continue",
+		"a durable preproposal failure cannot turn read-only M04 work into an unknown merge");
+	assert.equal(offlineChecks.importM04EffectDisposition({ status: "failed",
 		proposalSubmitted: true, snapshotCreated: false, threw: false }),
 		"pending-merge-reconciliation");
+	assert.equal(offlineChecks.importM04EffectDisposition({ status: "failed",
+		proposalSubmitted: true, snapshotCreated: false, transactionState: "rejected-draft",
+		threw: true }), "m04-draft-rejected",
+		"a host-sealed rejected draft is known unmerged but still needs a fresh M04 judgment");
+	assert.equal(offlineChecks.importM04EffectDisposition({ status: "failed",
+		proposalSubmitted: true, snapshotCreated: undefined, transactionState: "merge-intent",
+		threw: true }), "pending-merge-reconciliation");
 	assert.equal(offlineChecks.importM04EffectDisposition({ status: "failed",
 		proposalSubmitted: undefined, snapshotCreated: undefined, threw: true }),
 		"m04-integrity-unknown");
@@ -629,13 +817,17 @@ test("failed M04 with a submitted proposal blocks assessor dispatch pending reco
 	await archivePrivateM07Task({ goal: finished, task: finished.tasks[0], destination: archiveDir });
 	const malformedProposal = `\`\`\`knowledge-proposals\n${JSON.stringify([{
 		op: "create", type: "K", title: "", body: "" }])}\n\`\`\``;
-	ctx.runner = new FakeSessionRunner(() => malformedProposal);
+	let m04Turns = 0;
+	ctx.runner = new FakeSessionRunner(() => ++m04Turns === 1 ? malformedProposal :
+		"No supported knowledge operation follows from the checked report; retain the rejected draft only as history.");
 	const processed = await runM04(ctx, { feedback: { kind: "M07", runId: goal.runId },
 		freshSession: true });
 	assert.ok(processed.proposalId, "a proposal was actually submitted before failed validation");
-	assert.equal(processed.record.status, "completed",
-		"the stage returned, but structural proposal failure still makes M04 incomplete");
-	assert.ok(processed.record.failures.length);
+	assert.equal(m04Turns, 2, "one correction turn resolves the rejected draft without a count stop");
+	assert.equal(processed.record.status, "completed", "M04 returned after a safe no-proposal correction");
+	assert.equal(processed.snapshotId, undefined, "the rejected draft was never merged");
+	assert.equal(processed.proposalAttempts?.length, 1);
+	assert.equal(processed.proposalAttempts?.[0].structurallyValid, false);
 	const disposition = offlineChecks.importM04EffectDisposition({ status: "failed",
 		proposalSubmitted: Boolean(processed.proposalId), snapshotCreated: Boolean(processed.snapshotId),
 		threw: false });

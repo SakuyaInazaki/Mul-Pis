@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { deflateRawSync } from "node:zlib";
 import test, { type TestContext } from "node:test";
-import { authenticateOpaqueGapSourceForOfflineTests, authenticatedReviewedOpaqueRunGaps, authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, originalObjectiveMatchesSignedBootstrap, reviewKnownOpaqueGapSource, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE, retainedTransportDiagnosticWithinBundle } from "../src/runner/ledger-continuation.ts";
+import { authenticatedAccountingObservation, authenticatedHistoricalOpaqueRunGaps, authenticatedHistoricalCarryOrigin, authenticatedPendingHistoricalEffectSources, authenticatedSelectedTransitions, authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, originalObjectiveMatchesSignedBootstrap, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE, retainedTransportDiagnosticWithinBundle } from "../src/runner/ledger-continuation.ts";
 import type { RequestAuditSnapshot } from "../src/runner/ledger-continuation.ts";
 import { DeepSeekCampaignBudget, campaignSessionEffectId, type CampaignAdmissionRejection } from "../src/runner/deepseek-campaign.ts";
 import { offlineChecks } from "../scripts/manual-private-campaign.ts";
@@ -14,10 +14,11 @@ import { reserveIndependentRestart, bindIndependentRestartGoal } from "../src/m0
 import { objectiveProgress, type OriginalObjectiveContractV1 } from "../src/m07/objective-progress.ts";
 import { verifyDeepSeekCnyBilling, nativeCnyPricingRecord } from "../src/runner/deepseek-cny-pricing.ts";
 import { verifyDeepSeekProviderOutputLimit, providerOutputLimitRecord } from "../src/runner/deepseek-provider-limits.ts";
-import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, ONE_USE_PUSH_MARKER } from "../src/runner/signed-mission-ledger.ts";
+import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY } from "../src/runner/signed-mission-ledger.ts";
 import { sealCampaignCarry } from "../src/runner/emergency-carry.ts";
 
 const sha = (letter: string) => letter.repeat(40);
+const HISTORICAL_PUSH_MESSAGE = "Synthetic old control request";
 test("old-writer effect recovery cannot change signed objective text under the same contract ID", () => {
 	const signed = JSON.stringify({ version: 1, kind: "original-objective", id: "same-id",
 		goal: "synthetic original", constraints: ["frozen"] });
@@ -195,7 +196,9 @@ test("verified legacy carry transitions monotonically to accounting-only v3 with
 		current: current(7002, sha("b")), request: github([anchor, first]),
 		loadCarryArtifact: async () => "unused" });
 	const legacyCarry = sealHistoricalCarryForOfflineTests(legacy, { settledCny: 1.25,
-		unknownOrInFlightCny: 0.75, requestAudit: audit(1.25, 0.75) });
+		unknownOrInFlightCny: 0.75, requestAudit: audit(1.25, 0.75),
+		bootstrapBinding: { contractId: "synthetic-history", sourceSha256: "d".repeat(64) },
+		privateBundle: { "candidate.cpp": "synthetic prior research" } });
 	const completedFirst = { ...first, status: "completed", conclusion: "failure" };
 	const start = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7003, sha("c")), request: github([anchor, completedFirst, second]),
@@ -263,6 +266,56 @@ test("verified legacy carry transitions monotonically to accounting-only v3 with
 	assert.equal(next.priorUnpricedRequestCount, 1);
 	assert.equal(next.priorCarryProof?.version, 2);
 	assert.equal(next.priorCarryProof?.priorSettledCny, 42.25);
+	const historicalOrigin = authenticatedHistoricalCarryOrigin(next.priorCarryProof,
+		next.priorPrivateBundle);
+	assert.equal(historicalOrigin?.source.runId, "7002");
+	assert.equal(historicalOrigin?.historicalCommittedNano, 6_125_000_000);
+	assert.equal(historicalOrigin?.historicalUnknownHeldNano, 750_000_000);
+	assert.equal(authenticatedHistoricalCarryOrigin({ ...next.priorCarryProof },
+		next.priorPrivateBundle), undefined);
+	assert.equal(authenticatedHistoricalCarryOrigin(next.priorCarryProof,
+		{ "candidate.cpp": "changed" }), undefined);
+	assert.deepEqual(authenticatedAccountingObservation(next.priorCarryProof,
+		next.priorPrivateBundle), {
+		historicalCommittedNano: 6_125_000_000,
+		historicalUnknownHeldNano: 750_000_000,
+		settledNano: 42_250_000_000, unknownObservedNano: 1_500_000_000,
+		unpricedRequestCount: 1, opaqueUnquantifiedRunCount: 0 });
+	assert.equal(authenticatedAccountingObservation({ ...next.priorCarryProof },
+		next.priorPrivateBundle), undefined);
+	assert.equal(authenticatedAccountingObservation(next.priorCarryProof,
+		{ "candidate.cpp": "changed" }), undefined);
+	const zeroAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
+		requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
+	const sealedAgain = next.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: zeroAudit });
+	const finishedThird = { ...third, status: "completed", conclusion: "failure" };
+	const fourth = run(7006, 5, "in_progress", sha("f"));
+	const newestRequest: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.includes("/workflows/manual-private-campaign.yml/runs?"))
+			return new Response(JSON.stringify({ total_count: 5,
+				workflow_runs: [fourth, finishedThird, completedSecond, completedFirst, anchor] }));
+		if (address.includes("/runs/7005/jobs?"))
+			return new Response(JSON.stringify({ total_count: 1, jobs: [{ id: 6005,
+				run_id: 7005, run_attempt: 1, head_sha: sha("e"), name: "private-campaign",
+				status: "completed", conclusion: "failure", steps: [{ name: "Run private campaign",
+					status: "completed", conclusion: "failure" }] }] }));
+		if (address.includes("/runs/7005/artifacts?"))
+			return new Response(JSON.stringify({ total_count: 2, artifacts: [
+				{ id: 9005, name: CARRY_ARTIFACT_NAME, expired: false,
+					workflow_run: { id: 7005, head_sha: sha("e") } },
+				{ id: 9105, name: MISSION_ARTIFACT, expired: false,
+					digest: `sha256:${"8".repeat(64)}`,
+					workflow_run: { id: 7005, head_sha: sha("e") } }] }));
+		return request(url, init);
+	};
+	const reopened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7006, sha("f")), request: newestRequest,
+		loadCarryArtifact: async () => sealedAgain.envelopeB64 });
+	assert.deepEqual(authenticatedAccountingObservation(reopened.priorCarryProof,
+		reopened.priorPrivateBundle), authenticatedAccountingObservation(next.priorCarryProof,
+		next.priorPrivateBundle));
 });
 
 test("v3 records wholly unpriced provider requests without fabricating CNY or requiring a price profile", async t => {
@@ -798,8 +851,8 @@ test("legacy carry remains readable only with every required old artifact availa
 
 test("current push is never admitted, while an authenticated historical push carry remains readable", async t => {
 	const f = await fixture(t);
-	const request = github([anchor, { ...first, event: "push", head_commit: { message: ONE_USE_PUSH_MARKER },
-		status: "completed", conclusion: "success" }, { ...second, event: "push", head_commit: { message: ONE_USE_PUSH_MARKER } }]);
+	const request = github([anchor, { ...first, event: "push", head_commit: { message: HISTORICAL_PUSH_MESSAGE },
+		status: "completed", conclusion: "success" }, { ...second, event: "push", head_commit: { message: HISTORICAL_PUSH_MESSAGE } }]);
 	await assert.rejects(openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: { ...current(7003, sha("c")), event: "push", manualAuthorized: undefined }, request,
 		loadCarryArtifact: async () => "unused" }), /current Actions identity/);
@@ -811,7 +864,7 @@ test("current push is never admitted, while an authenticated historical push car
 	const accepted = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7003, sha("c")),
 		request: github([anchor, { ...first, event: "push",
-			head_commit: { message: ONE_USE_PUSH_MARKER },
+			head_commit: { message: HISTORICAL_PUSH_MESSAGE },
 			status: "completed", conclusion: "success" }, second]),
 		loadCarryArtifact: async () => prior.envelopeB64 });
 	assert.equal(accepted.historicalCommittedCny, f.payload.priorCommittedCny);
@@ -850,7 +903,7 @@ test("reusable control request admits only an exact empty tested source tree", a
 	await assert.rejects(openLedgerContinuation({ ...input, request: async (url, init) => {
 		if (String(url).includes("/actions/workflows/manual-private-campaign.yml/runs?"))
 			return new Response(JSON.stringify({ total_count: 2, workflow_runs: [
-				{ ...requested, head_commit: { message: ONE_USE_PUSH_MARKER } }, anchor] }));
+				{ ...requested, head_commit: { message: HISTORICAL_PUSH_MESSAGE } }, anchor] }));
 		return request(url, init);
 	} }), /workflow identity or signed seed freshness/);
 	await assert.rejects(openLedgerContinuation({ ...input, current: { ...proposed, before: sha("d") } }),
@@ -1301,7 +1354,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 			["read-only session", { sessionId: "read-only session", grantKind: "read-dir" as const }],
 		]) });
 	const nextBundle = { ...oldBundle,
-		"objective-checkpoint.json": JSON.stringify({ boundedRuns: [...oldCheckpoint.boundedRuns,
+		"objective-checkpoint.json": JSON.stringify({ ...oldCheckpoint, boundedRuns: [...oldCheckpoint.boundedRuns,
 			{ runId: "new-goal", outcome: "partial", unresolvedOperationIds: [] }] }),
 		"host-effect-receipt.json": JSON.stringify(receipt) };
 	const sealed = workOpened.sealCurrent({ settledCny: 0.5, unknownObservedCny: 0,
@@ -1329,6 +1382,58 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 		request: requestFor([anchor, firstDone, secondDone,
 			{ ...work, status: "completed", conclusion: "failure" }, next]),
 		loadCarryArtifact: async () => envelopeB64 });
+	{
+		const priorProof = resumed.priorCarryProof!;
+		const entry = { source: priorProof.source, envelopeSha256: priorProof.envelopeSha256,
+			contractId: "old-contract", goalRunId: "new-goal", taskId: "T001", m04RunId: "M04-synthetic",
+			state: "unknown-unreconciled", route: "fresh-work-only", proposalSubmitted: true,
+			selectedTupleSha256: "a".repeat(64), inheritedOperationRefs: ["old-goal/O001"] };
+		const quarantineText = JSON.stringify({ version: 1,
+			kind: "unresolved-historical-m04-quarantine", entries: [entry] });
+		const withQuarantine = { ...resumed.priorPrivateBundle,
+			"m04-transaction-quarantine.json": quarantineText };
+		const emergencyOpen = await resumeCarry(sealed.envelopeB64);
+		const emergency = emergencyOpen.sealEmergencyCurrent({ settledCny: 0,
+			unknownObservedCny: 0, unpricedRequestCount: 0,
+			requestAudit: emptyAudit, privateBundle: withQuarantine }, "effect-review-incomplete");
+		const seed = await authenticateSignedMissionSeed({ ...f, envelopeB64: seedEnvelopeB64 });
+		const outer = JSON.parse(Buffer.from(emergency.envelopeB64, "base64").toString());
+		const reader = createDecipheriv("aes-256-gcm",
+			seed.derivePrivateKey("mul-pis-ledger-continuation-v1"), Buffer.from(outer.nonce, "base64"));
+		reader.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
+			seed.seedDigest, 3, outer.parentDigest,
+			{ runId: "7006", runAttempt: 1, runNumber: 5, commit: sha("f") }])));
+		reader.setAuthTag(Buffer.from(outer.tag, "base64"));
+		const emergencyCheckpoint = JSON.parse(Buffer.concat([
+			reader.update(Buffer.from(outer.ciphertext, "base64")), reader.final()]).toString());
+		assert.equal(emergencyCheckpoint.privateBundle["m04-transaction-quarantine.json"], quarantineText);
+		assert.equal(emergencyCheckpoint.currentEffectReview, "pending");
+		const normalOpen = await resumeCarry(sealed.envelopeB64);
+		const normal = normalOpen.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+			unpricedRequestCount: 0, requestAudit: emptyAudit, privateBundle: withQuarantine });
+		const later = run(7007, 6, "in_progress", sha("1"));
+		const reopen = () => openLedgerContinuation({ ...f, seedEnvelopeB64,
+			githubToken: "synthetic-token", current: current(7007, sha("1")),
+			request: requestFor([anchor, firstDone, secondDone,
+				{ ...work, status: "completed", conclusion: "failure" },
+				{ ...next, status: "completed", conclusion: "failure" }, later]),
+			loadCarryArtifact: async () => normal.envelopeB64 });
+		const inherited = await reopen();
+		assert.equal(inherited.priorPrivateBundle?.["m04-transaction-quarantine.json"], quarantineText);
+		const { "m04-transaction-quarantine.json": _removed, ...without } = inherited.priorPrivateBundle!;
+		assert.throws(() => inherited.sealCurrent({ settledCny: 0,
+			unknownObservedCny: 0, unpricedRequestCount: 0, requestAudit: emptyAudit,
+			privateBundle: without }), /M04 quarantine/);
+		const rewritten = JSON.parse(quarantineText);
+		rewritten.entries[0].taskId = "T999";
+		assert.throws(() => inherited.sealCurrent({ settledCny: 0,
+			unknownObservedCny: 0, unpricedRequestCount: 0, requestAudit: emptyAudit,
+			privateBundle: { ...inherited.priorPrivateBundle,
+				"m04-transaction-quarantine.json": JSON.stringify(rewritten) } }), /M04 quarantine/);
+		assert.doesNotThrow(() => inherited.sealCurrent({ settledCny: 0,
+			unknownObservedCny: 0, unpricedRequestCount: 0, requestAudit: emptyAudit,
+			privateBundle: inherited.priorPrivateBundle }));
+	}
 	for (const [label, change] of [
 		["untracked audit session", (bundle: Record<string, string>, audit: any) => {
 			audit.requests[1].sessionId = createHash("sha256").update("untracked").digest("hex");
@@ -1359,6 +1464,14 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 		const badAudit = structuredClone(requestAudit);
 		change(badBundle, badAudit);
 		const opened = await reopenWork();
+		if (label === "changed old selected tuple") {
+			assert.throws(() => opened.sealCurrent({ settledCny: badAudit.settledCny,
+				unknownObservedCny: badAudit.unknownObservedCny,
+				unpricedRequestCount: badAudit.unpricedRequestCount,
+				requestAudit: badAudit, privateBundle: badBundle }),
+				/new selected tuple lacks a completed authenticated transition/);
+			continue;
+		}
 		const bad = opened.sealCurrent({ settledCny: badAudit.settledCny,
 			unknownObservedCny: badAudit.unknownObservedCny,
 			unpricedRequestCount: badAudit.unpricedRequestCount,
@@ -1464,9 +1577,16 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 	};
 	const quarantineChain = JSON.parse(priorBundle["independent-restart-quarantine.json"]!);
 	const bindingChain = JSON.parse(priorBundle["independent-restart-goal-binding.json"]!);
+	const freshCampaignRoot = path.join(os.tmpdir(), "mulpis-private-campaign-synthetic-ledger");
+	const freshWorkspaceRoot = path.join(freshCampaignRoot, "workspace");
 	const reservation = await reserveIndependentRestart({ authenticatedCarryProof: priorProof,
-		privateBundle: priorBundle, freshWorkspace: { workspaceId: "next-independent-workspace",
+		privateBundle: priorBundle, freshWorkspace: { workspaceId: path.basename(freshCampaignRoot),
 			restartNonce: "independent-nonce" },
+		freshBoundary: { campaignRoot: freshCampaignRoot, workspaceRoot: freshWorkspaceRoot,
+			storeRoot: path.join(freshWorkspaceRoot, ".agent", "knowledge"),
+			storeEmpty: true, sessionCensusEmpty: true,
+			sessionMode: "no-prior-session-resume", grantProfile: "private-confined-read-dir",
+			externalWriteTools: false, sharedStore: false, selectedRevalidated: true },
 		failedHistory: { state: "unavailable", reason: "synthetic prior result is unavailable",
 			immutableArtifactRef: facts.resultArtifact.immutableRef,
 			digestScope: facts.resultArtifact.digestScope,
@@ -1480,8 +1600,9 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 				policySha256: digest([reviewed.source, refs]),
 				operationAttestations: refs.map(operationRef => ({ operationRef,
 					sourceCommit: reviewed.source.commit, evidenceSha256: digest(operationRef) })),
-				effectClass: "confined-ephemeral-local", unknownBillingHeld: true,
-				actorThirdPartyMutations: "none", hostTransport: "immutable-versioned-archive" };
+				effectClass: "historical-unknown-fresh-only", unknownBillingHeld: true,
+				actorThirdPartyMutations: "unknown", hostTransport: "immutable-versioned-archive",
+				accountingObservation: authenticatedAccountingObservation(priorProof, priorBundle)! };
 		},
 		revalidateSelection: async ({ checkpoint, tupleSha256 }) => ({ status: "passed",
 			contractId: checkpoint.contract.id, selectedRunId: "selected-goal",
@@ -1606,7 +1727,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 	const acceptedBundle = { ...nextBundle, "candidate.cpp": "new selected source",
 		"verification.json": JSON.stringify({ version: 1, status: "passed" }),
 		"workflow-archive.json": acceptedArchive,
-		"objective-checkpoint.json": JSON.stringify({ boundedRuns: [...oldCheckpoint.boundedRuns,
+		"objective-checkpoint.json": JSON.stringify({ ...oldCheckpoint, boundedRuns: [...oldCheckpoint.boundedRuns,
 			{ runId: "new-goal", outcome: "partial", selectedTaskId: "T001", unresolvedOperationIds: [] }],
 			selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"] }),
 		"research-history.json": JSON.stringify({ version: 1,
@@ -1616,12 +1737,11 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 					"workflow-archive.json": oldBundle["workflow-archive.json"] } }] }),
 		"host-effect-receipt.json": JSON.stringify(acceptedReceipt) };
 	const acceptedOpen = await reopenWork();
-	const acceptedCarry = acceptedOpen.sealCurrent({ settledCny: 0.5,
+	assert.throws(() => acceptedOpen.sealCurrent({ settledCny: 0.5,
 		unknownObservedCny: 0, unpricedRequestCount: 0,
-		requestAudit, privateBundle: acceptedBundle });
-	const acceptedResume = await resumeCarry(acceptedCarry.envelopeB64);
-	assert(authenticatedHostEffectEvidence(acceptedResume.priorCarryProof,
-		acceptedResume.priorPrivateBundle), "coherent new selected tuple can retain effect authority");
+		requestAudit, privateBundle: acceptedBundle }),
+		/new selected tuple lacks a completed authenticated transition/,
+		"M07 acceptance without completed portable M04 cannot change the selected tuple");
 	const reviewedPrior = resumed.priorCarryProof!;
 	const reviewReceipt = { version: 1, kind: "host-independent-goal-quarantine",
 		prior: { source: { runId: reviewedPrior.source.runId,
@@ -1659,7 +1779,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 				writableFiles: ["candidate.cpp", "lesson-delta.json"] } }],
 		requestIds: [nextRow.requestId] };
 	const secondBundle = { ...nextBundle,
-		"objective-checkpoint.json": JSON.stringify({ boundedRuns: [...oldCheckpoint.boundedRuns,
+		"objective-checkpoint.json": JSON.stringify({ ...oldCheckpoint, boundedRuns: [...oldCheckpoint.boundedRuns,
 			{ runId: "new-goal", outcome: "partial", unresolvedOperationIds: [] },
 			{ runId: "next-goal", outcome: "partial", unresolvedOperationIds: [] }] }),
 		"independent-restart-quarantine.json": JSON.stringify({ version: 1,
@@ -1769,7 +1889,7 @@ test("complete received host-effect census brands a nonzero v3 carry without rel
 				writableFiles: ["candidate.cpp", "lesson-delta.json"] } }],
 		requestIds: [thirdRow.requestId] };
 	const thirdBundle = { ...abandonedBundle,
-		"objective-checkpoint.json": JSON.stringify({ boundedRuns: [...oldCheckpoint.boundedRuns,
+		"objective-checkpoint.json": JSON.stringify({ ...oldCheckpoint, boundedRuns: [...oldCheckpoint.boundedRuns,
 			{ runId: "new-goal", outcome: "partial", unresolvedOperationIds: [] },
 			{ runId: "third-goal", outcome: "partial", unresolvedOperationIds: [] }] }),
 		"host-effect-receipt.json": JSON.stringify(thirdReceipt),
@@ -2006,12 +2126,13 @@ test("received read-only assessment without a new goal preserves an unbound revi
 		assert.throws(() => opened.sealCurrent({ settledCny: account.settledCny,
 			unknownObservedCny: account.unknownObservedCny,
 			unpricedRequestCount: account.unpricedRequestCount,
-			requestAudit: account, privateBundle: candidate }), /reviewed effect ancestry is not bound/,
+			requestAudit: account, privateBundle: candidate }),
+			/reviewed effect ancestry is not bound|new selected tuple lacks a completed authenticated transition/,
 			label);
 	}
 });
 
-test("one exact missing-carry execution stays opaque and compacts into an emergency carry", async t => {
+test("any exact terminal missing-carry execution stays unknown through seal and reopen", async t => {
 	const f = await compactedFixture(t);
 	const firstDone = { ...first, status: "completed", conclusion: "success" };
 	const secondDone = { ...second, status: "completed", conclusion: "success" };
@@ -2048,14 +2169,25 @@ test("one exact missing-carry execution stays opaque and compacts into an emerge
 					workflow_run: { id: 7006, head_sha: sha("f") } }] }));
 		return f.request(url, init);
 	};
-	const openGap = (request: typeof fetch, review = true) => openLedgerContinuation({ ...f,
+	const openGap = (request: typeof fetch) => openLedgerContinuation({ ...f,
 		githubToken: "synthetic-token", current: current(7006, sha("f")), request,
-		loadCarryArtifact: async () => f.secondCarry.envelopeB64,
-		...(review ? { reviewOpaqueGapSource: async (facts: any) =>
-			authenticateOpaqueGapSourceForOfflineTests(facts.source,
-				facts.resultArtifact.archiveSha256, facts.priorCarryEnvelopeSha256) } : {}) });
+		loadCarryArtifact: async () => f.secondCarry.envelopeB64 });
 	const runs = [anchor, firstDone, secondDone, gap, next];
-	await assert.rejects(openGap(requestFor(runs), false), /independent exact-source authority/);
+	for (const [pathPart, change] of [
+		["/artifacts?", (row: any) => { row.artifacts[0].digest = "not-a-github-digest"; }],
+		["/artifacts?", (row: any) => { row.artifacts[0].workflow_run.head_sha = sha("9"); }],
+		["/jobs?", (row: any) => { row.jobs[0].head_sha = sha("9"); }],
+	] as Array<[string, (row: any) => void]>) {
+		const invalid: typeof fetch = async (url, init) => {
+			const response = await requestFor(runs)(url, init);
+			const address = String(url);
+			if (!address.includes(`/runs/7005${pathPart}`)) return response;
+			const body = await response.json() as any;
+			change(body);
+			return new Response(JSON.stringify(body));
+		};
+		await assert.rejects(openGap(invalid), /exact terminal encrypted result artifact/);
+	}
 	for (const carry of [
 		[{ id: 9005, name: CARRY_ARTIFACT_NAME, expired: true,
 			workflow_run: { id: 7005, head_sha: sha("e") } }],
@@ -2067,11 +2199,11 @@ test("one exact missing-carry execution stays opaque and compacts into an emerge
 	const opened = await openGap(requestFor(runs));
 	assert.equal(opened.opaqueExecutedRuns.length, 1);
 	assert.equal(opened.opaqueExecutedRuns[0].accounting, "unquantified");
-	assert.equal(opened.opaqueExecutedRuns[0].effects, "quarantined-source-reviewed");
+	assert.equal(opened.opaqueExecutedRuns[0].effects, "unreviewed");
 	assert.equal(opened.priorCarryProof?.source.runId, "7003");
-	assert.deepEqual(authenticatedReviewedOpaqueRunGaps(opened.priorCarryProof,
+	assert.deepEqual(authenticatedHistoricalOpaqueRunGaps(opened.priorCarryProof,
 		opened.priorPrivateBundle), opened.opaqueExecutedRuns);
-	assert.equal(authenticatedReviewedOpaqueRunGaps({ ...opened.priorCarryProof },
+	assert.equal(authenticatedHistoricalOpaqueRunGaps({ ...opened.priorCarryProof },
 		opened.priorPrivateBundle), undefined);
 	await assert.rejects(opened.claimOneUse("0".repeat(64)), /exact authenticated prior carry/);
 	const profile = await verifyDeepSeekCnyBilling({ apiKey: "synthetic-key",
@@ -2092,6 +2224,9 @@ test("one exact missing-carry execution stays opaque and compacts into an emerge
 		pricingProfile: nativeCnyPricingRecord(profile) };
 	const inFlight = structuredClone(currentAudit);
 	(inFlight.requests[1] as any).status = "in-flight";
+	assert.throws(() => opened.sealCurrent({ settledCny: 0.5,
+		unknownObservedCny: 0.25, unpricedRequestCount: 0,
+		requestAudit: currentAudit }), /live V2 fresh-only reservation/);
 	assert.throws(() => opened.sealEmergencyCurrent({ settledCny: 0.5, unknownObservedCny: 0.25,
 		unpricedRequestCount: 0, requestAudit: inFlight }, "effect-review-incomplete"), /invalid or in-flight/);
 	const emergency = opened.sealEmergencyCurrent({ settledCny: 0.5, unknownObservedCny: 0.25,
@@ -2128,10 +2263,56 @@ test("one exact missing-carry execution stays opaque and compacts into an emerge
 		} });
 	assert.equal(reopened.opaqueExecutedRuns.length, 1);
 	assert.equal(reopened.opaqueExecutedRuns[0].source.runId, "7005");
-	assert.equal(reopened.priorCarryProof, undefined);
+	assert.equal(reopened.priorCarryProof?.source.runId, "7006");
+	assert.deepEqual(authenticatedPendingHistoricalEffectSources(reopened.priorCarryProof,
+		reopened.priorPrivateBundle)?.map(source => source.runId), ["7006"]);
 	assert.equal(reopened.priorSettledCny, 0.5);
 	assert.equal(reopened.priorUnknownObservedCny, 0.25);
 	assert.equal(reopened.priorPrivateBundle?.["candidate.cpp"], "synthetic root evidence");
+	const pendingLiveRequest: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.endsWith("/actions/runs/7007")) return new Response(JSON.stringify(later));
+		if (address.includes("/runs/7007/jobs?")) return new Response(JSON.stringify({
+			total_count: 1, jobs: [{ id: 6007, run_id: 7007, run_attempt: 1,
+				head_sha: sha("1"), name: "private-campaign", status: "in_progress",
+				conclusion: null, steps: [{ name: "Run private campaign",
+					status: "in_progress", conclusion: null }] }] }));
+		return requestFor([anchor, firstDone, secondDone, gap,
+			{ ...next, status: "completed", conclusion: "failure" }, later])(url, init);
+	};
+	const pendingFresh = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7007, sha("1")), request: pendingLiveRequest,
+		loadCarryArtifact: async () => emergency.envelopeB64 });
+	const pendingClaim = await pendingFresh.claimOneUse(pendingFresh.priorCarryProof!.envelopeSha256);
+	const pendingV2 = { version: 2, kind: "host-independent-goal-quarantine",
+		prior: { source: pendingFresh.priorCarryProof!.source,
+			envelopeSha256: pendingFresh.priorCarryProof!.envelopeSha256,
+			privateBundleSha256: pendingFresh.priorCarryProof!.privateBundleSha256 },
+		quarantine: { historicalEffectState: "unknown-unreconciled",
+			executionMode: "fresh-work-only", operationOutcome: "unknown",
+			selectedFromFailedAttempt: false, operationRefs: ["synthetic/O001"] } };
+	const pendingBundle = { ...pendingFresh.priorPrivateBundle,
+		"independent-restart-quarantine.json": JSON.stringify({ version: 1,
+			kind: "host-independent-restart-reservations",
+			entries: [{ receipt: pendingV2, claim: pendingClaim }] }) };
+	const pendingSealed = pendingFresh.sealCurrent({ settledCny: 0.5,
+		unknownObservedCny: 0.25, unpricedRequestCount: 0,
+		requestAudit: currentAudit, privateBundle: pendingBundle });
+	const pendingOuter = JSON.parse(Buffer.from(pendingSealed.envelopeB64, "base64").toString());
+	const pendingReader = createDecipheriv("aes-256-gcm",
+		authenticatedSeed.derivePrivateKey("mul-pis-ledger-continuation-v1"),
+		Buffer.from(pendingOuter.nonce, "base64"));
+	pendingReader.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
+		authenticatedSeed.seedDigest, 3, pendingOuter.parentDigest,
+		{ runId: "7007", runAttempt: 1, runNumber: 6, commit: sha("1") }])));
+	pendingReader.setAuthTag(Buffer.from(pendingOuter.tag, "base64"));
+	const pendingCheckpoint = JSON.parse(Buffer.concat([
+		pendingReader.update(Buffer.from(pendingOuter.ciphertext, "base64")),
+		pendingReader.final()]).toString());
+	assert.deepEqual(pendingCheckpoint.pendingEffectAncestry.map((source: any) => source.runId), ["7006"]);
+	assert.equal(pendingCheckpoint.currentEffectReview, "pending");
+	assert.equal(pendingCheckpoint.settledNano, 1_000_000_000);
+	assert.equal(pendingCheckpoint.unknownObservedNano, 500_000_000);
 
 	const liveRequest: typeof fetch = async (url, init) => {
 		const address = String(url);
@@ -2146,12 +2327,21 @@ test("one exact missing-carry execution stays opaque and compacts into an emerge
 	const claim = await admitted.claimOneUse(admitted.priorCarryProof!.envelopeSha256);
 	assert.equal(claim.priorEnvelopeSha256, admitted.priorCarryProof!.envelopeSha256);
 	assert.equal(claim.currentRunId, "7006");
-	const emptyAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
-		requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
-	const normal = admitted.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
-		unpricedRequestCount: 0, requestAudit: emptyAudit });
+	const freshOnlyReceipt = { version: 2, kind: "host-independent-goal-quarantine",
+		prior: { source: admitted.priorCarryProof!.source,
+			envelopeSha256: admitted.priorCarryProof!.envelopeSha256,
+			privateBundleSha256: admitted.priorCarryProof!.privateBundleSha256 },
+		quarantine: { historicalEffectState: "unknown-unreconciled",
+			executionMode: "fresh-work-only", operationOutcome: "unknown",
+			selectedFromFailedAttempt: false, operationRefs: [] } };
+	const freshOnlyBundle = { ...admitted.priorPrivateBundle,
+		"independent-restart-quarantine.json": JSON.stringify({ version: 1,
+			kind: "host-independent-restart-reservations",
+			entries: [{ receipt: freshOnlyReceipt, claim }] }) };
+	const normal = admitted.sealCurrent({ settledCny: 0.5, unknownObservedCny: 0.25,
+		unpricedRequestCount: 0, requestAudit: currentAudit, privateBundle: freshOnlyBundle });
 	assert.throws(() => admitted.sealEmergencyCurrent({ settledCny: 0,
-		unknownObservedCny: 0, unpricedRequestCount: 0, requestAudit: emptyAudit },
+		unknownObservedCny: 0, unpricedRequestCount: 0, requestAudit: currentAudit },
 		"effect-review-incomplete"), /unsealed/);
 	const normalReopened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7007, sha("1")),
@@ -2164,10 +2354,24 @@ test("one exact missing-carry execution stays opaque and compacts into an emerge
 			assert.equal(artifactId, "9006"); return normal.envelopeB64;
 		} });
 	assert.equal(normalReopened.opaqueExecutedRuns[0].accounting, "unquantified");
-	assert.equal(normalReopened.opaqueExecutedRuns[0].effects, "quarantined-source-reviewed");
+	assert.equal(normalReopened.opaqueExecutedRuns[0].effects, "unreviewed");
+	assert.equal(authenticatedAccountingObservation(normalReopened.priorCarryProof,
+		normalReopened.priorPrivateBundle)?.opaqueUnquantifiedRunCount, 1);
 	assert.equal(normalReopened.priorCarryProof?.source.runId, "7006");
-	assert.deepEqual(authenticatedReviewedOpaqueRunGaps(normalReopened.priorCarryProof,
+	assert.deepEqual(authenticatedHistoricalOpaqueRunGaps(normalReopened.priorCarryProof,
 		normalReopened.priorPrivateBundle), normalReopened.opaqueExecutedRuns);
+	const withoutLatestResult = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7007, sha("1")),
+		request: async (url, init) => String(url).includes("/runs/7006/artifacts?") ?
+			new Response(JSON.stringify({ total_count: 1, artifacts: [{ id: 9006,
+				name: CARRY_ARTIFACT_NAME, expired: false,
+				workflow_run: { id: 7006, head_sha: sha("f") } }] })) :
+			requestFor([anchor, firstDone, secondDone, gap,
+				{ ...next, status: "completed", conclusion: "failure" }, later])(url, init),
+		loadCarryArtifact: async () => normal.envelopeB64 });
+	assert.equal(withoutLatestResult.priorCarryProof?.resultArtifact, undefined);
+	assert.deepEqual(authenticatedHistoricalOpaqueRunGaps(withoutLatestResult.priorCarryProof,
+		withoutLatestResult.priorPrivateBundle)?.map(item => item.source.runId), ["7005"]);
 	const normalOuter = JSON.parse(Buffer.from(normal.envelopeB64, "base64").toString());
 	const normalSource = { runId: "7006", runAttempt: 1, runNumber: 5, commit: sha("f") };
 	const key = authenticatedSeed.derivePrivateKey("mul-pis-ledger-continuation-v1");
@@ -2177,79 +2381,53 @@ test("one exact missing-carry execution stays opaque and compacts into an emerge
 	reader.setAuthTag(Buffer.from(normalOuter.tag, "base64"));
 	const altered = JSON.parse(Buffer.concat([
 		reader.update(Buffer.from(normalOuter.ciphertext, "base64")), reader.final()]).toString());
+	const historicalReviewedClaim = structuredClone(altered);
+	historicalReviewedClaim.opaqueExecutedRuns[0].effects = "quarantined-source-reviewed";
+	const wrapCheckpoint = (checkpoint: unknown): string => {
+		const nonce = randomBytes(12);
+		const writer = createCipheriv("aes-256-gcm", key, nonce);
+		writer.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
+			authenticatedSeed.seedDigest, 3, normalOuter.parentDigest, normalSource])));
+		const ciphertext = Buffer.concat([writer.update(JSON.stringify(checkpoint)), writer.final()]);
+		return Buffer.from(JSON.stringify({ version: 3, parentDigest: normalOuter.parentDigest,
+			nonce: nonce.toString("base64"), ciphertext: ciphertext.toString("base64"),
+			tag: writer.getAuthTag().toString("base64") })).toString("base64");
+	};
+	const oldWriterGap = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7007, sha("1")),
+		request: requestFor([anchor, firstDone, secondDone, gap,
+			{ ...next, status: "completed", conclusion: "failure" }, later]),
+		loadCarryArtifact: async () => wrapCheckpoint(historicalReviewedClaim) });
+	assert.equal(oldWriterGap.opaqueExecutedRuns[0].effects, "unreviewed");
+	assert.equal(authenticatedHistoricalOpaqueRunGaps(oldWriterGap.priorCarryProof,
+		oldWriterGap.priorPrivateBundle)?.[0].effects, "unreviewed");
+	const oldGapPassThrough = oldWriterGap.sealCurrent({ settledCny: 0,
+		unknownObservedCny: 0, unpricedRequestCount: 0,
+		requestAudit: { version: 3, kind: "accounting-only-request-audit",
+			requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 } });
+	const successorOuter = JSON.parse(Buffer.from(oldGapPassThrough.envelopeB64, "base64").toString());
+	const successorReader = createDecipheriv("aes-256-gcm", key,
+		Buffer.from(successorOuter.nonce, "base64"));
+	successorReader.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
+		authenticatedSeed.seedDigest, 3, successorOuter.parentDigest,
+		{ runId: "7007", runAttempt: 1, runNumber: 6, commit: sha("1") }])));
+	successorReader.setAuthTag(Buffer.from(successorOuter.tag, "base64"));
+	const successorCheckpoint = JSON.parse(Buffer.concat([
+		successorReader.update(Buffer.from(successorOuter.ciphertext, "base64")),
+		successorReader.final()]).toString());
+	assert.equal(successorCheckpoint.opaqueExecutedRuns[0].effects,
+		"quarantined-source-reviewed", "the old signed statement is retained as history");
+	assert.equal(successorCheckpoint.historicalOpaqueGapEffectInterpretation,
+		"unknown-unreconciled", "the new safety interpretation is explicit");
+	assert.equal(successorCheckpoint.opaqueExecutedRuns[0].resultArtifact.archiveSha256,
+		historicalReviewedClaim.opaqueExecutedRuns[0].resultArtifact.archiveSha256);
 	altered.opaqueExecutedRuns[0].priorCarryEnvelopeSha256 = "0".repeat(64);
-	const nonce = randomBytes(12);
-	const writer = createCipheriv("aes-256-gcm", key, nonce);
-	writer.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
-		authenticatedSeed.seedDigest, 3, normalOuter.parentDigest, normalSource])));
-	const forgedCipher = Buffer.concat([writer.update(JSON.stringify(altered)), writer.final()]);
-	const forged = Buffer.from(JSON.stringify({ version: 3, parentDigest: normalOuter.parentDigest,
-		nonce: nonce.toString("base64"), ciphertext: forgedCipher.toString("base64"),
-		tag: writer.getAuthTag().toString("base64") })).toString("base64");
+	const forged = wrapCheckpoint(altered);
 	await assert.rejects(openLedgerContinuation({ ...f, githubToken: "synthetic-token",
 		current: current(7007, sha("1")),
 		request: requestFor([anchor, firstDone, secondDone, gap,
 			{ ...next, status: "completed", conclusion: "failure" }, later]),
 		loadCarryArtifact: async () => forged }), /opaque gap predecessor digest/);
-});
-
-test("one-time opaque gap source authority pins the reviewed control request and terminal provider step", async () => {
-	const requestCommit = "db8263c88d9872cd592b43c70f7831cf74e290eb";
-	const firstParent = "6ee929545ec3a1d7194054aa4e98988ecd1bd665";
-	const source = { runId: "37507828650", runAttempt: 1, runNumber: 26, commit: requestCommit };
-	const terminal = { workflowId: "374865232", runStatus: "completed" as const,
-		runConclusion: "failure", jobId: "112420914600", jobName: "private-campaign" as const,
-		jobStatus: "completed" as const, jobConclusion: "failure", jobRunId: source.runId,
-		jobRunAttempt: 1, jobHeadSha: requestCommit,
-		providerStepStatus: "completed" as const, providerStepConclusion: "success" };
-	const resultArtifact = { repository: MISSION_REPOSITORY as typeof MISSION_REPOSITORY,
-		artifactId: "11431834153", artifactName: MISSION_ARTIFACT as typeof MISSION_ARTIFACT, runId: source.runId,
-		archiveSha256: "9c0c4e887c4a212148f0b52aa9e3f96448d50d153b3151e1a741d66bd5f472b5",
-		digestScope: "github-artifact-archive" as const };
-	const facts = { source, terminal, resultArtifact,
-		priorCarryEnvelopeSha256: "0f29b2f1b5ef0d3bee9b53e7d86168621f904c355bf55d46c5557d4cbd6d412c" };
-	const submitted = { sha: requestCommit, message: REUSABLE_RUN_REQUEST_MESSAGE,
-		parents: [{ sha: firstParent }], tree: { sha: sha("a") } };
-	const parent = { sha: firstParent, tree: { sha: sha("a") } };
-	const reviewedRun = { id: Number(source.runId), run_number: 26, run_attempt: 1,
-		workflow_id: 374865232, head_sha: requestCommit, event: "push",
-		head_branch: "run-requests/workflow-learning-reliability",
-		actor: { login: "SakuyaInazaki" }, status: "completed", conclusion: "failure" };
-	const job = { id: 112420914600, run_id: Number(source.runId), run_attempt: 1,
-		head_sha: requestCommit, name: "private-campaign", status: "completed",
-		conclusion: "failure", steps: [{ number: 10, name: "Run private campaign",
-			status: "completed", conclusion: "success" }] };
-	const requestFor = (change?: (rows: Record<string, any>) => void): typeof fetch => async url => {
-		const rows: Record<string, any> = { submitted: structuredClone(submitted),
-			parent: structuredClone(parent), reviewedRun: structuredClone(reviewedRun),
-			jobs: { total_count: 1, jobs: [structuredClone(job)] },
-			ci: { workflow_runs: [{ head_sha: firstParent,
-				head_branch: "improve/workflow-learning-reliability", event: "push",
-				run_attempt: 1, conclusion: "success" }] } };
-		change?.(rows);
-		const address = String(url);
-		const value = address.includes(`/git/commits/${requestCommit}`) ? rows.submitted :
-			address.includes(`/git/commits/${firstParent}`) ? rows.parent :
-			address.includes(`/actions/runs/${source.runId}/jobs?`) ? rows.jobs :
-			address.endsWith(`/actions/runs/${source.runId}`) ? rows.reviewedRun : rows.ci;
-		return new Response(JSON.stringify(value));
-	};
-	assert.equal((await reviewKnownOpaqueGapSource(facts, "synthetic-token", requestFor()))?.kind,
-		"authenticated-opaque-gap-source-review");
-	for (const change of [
-		(rows: Record<string, any>) => { rows.submitted.message = "unreviewed request"; },
-		(rows: Record<string, any>) => { rows.submitted.tree.sha = sha("b"); },
-		(rows: Record<string, any>) => { rows.reviewedRun.conclusion = "success"; },
-		(rows: Record<string, any>) => { rows.reviewedRun.head_branch = "improve/workflow-learning-reliability"; },
-		(rows: Record<string, any>) => { rows.jobs.jobs[0].conclusion = "success"; },
-		(rows: Record<string, any>) => { rows.jobs.jobs[0].steps[0].conclusion = "failure"; },
-		(rows: Record<string, any>) => { rows.jobs.jobs[0].steps[0].number = 9; },
-	]) assert.equal(await reviewKnownOpaqueGapSource(facts, "synthetic-token", requestFor(change)), undefined);
-	assert.equal(await reviewKnownOpaqueGapSource({ ...facts, source: { ...source, runNumber: 25 } },
-		"synthetic-token", requestFor()), undefined);
-	assert.equal(await reviewKnownOpaqueGapSource({ ...facts,
-		terminal: { ...terminal, providerStepConclusion: "failure" } },
-		"synthetic-token", requestFor()), undefined);
 });
 
 test("optional encrypted transport cause census binds only unknown audit IDs and carries forward unchanged", async t => {
@@ -2346,4 +2524,303 @@ test("optional encrypted transport cause census binds only unknown audit IDs and
 	const emptyAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
 		requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
 	assert.equal(reopened.appendTransportDiagnosticCensus(emptyAudit, []), text);
+});
+
+test("accepted selection remains authenticated across zero and emergency wrappers", async t => {
+	const f = await fixture(t);
+	const contract = { version: 1, kind: "original-objective", id: "selection-contract" };
+	const priorArchive = JSON.stringify({ goalRunId: "prior-goal", taskId: "T001" });
+	const priorCheckpoint = { version: 1, kind: "original-objective-progress", contract,
+		selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
+		boundedRuns: [{ runId: "prior-goal", outcome: "fulfilled", selectedTaskId: "T001",
+			acceptedTaskIds: ["T001"], unresolvedOperationIds: [] }] };
+	const oldBundle = { "candidate.cpp": "prior selected source", "verification.json": "{}",
+		"workflow-archive.json": priorArchive,
+		"objective-checkpoint.json": JSON.stringify(priorCheckpoint) };
+	const seedEnvelopeB64 = f.signSeed({ ...f.payload, version: 2,
+		rootReviewedAnchor: { commit: sha("a"), artifactSha256: "e".repeat(64),
+			digestScope: "encrypted-result-envelope" },
+		bootstrap: { contractId: contract.id, sourceSha256: "d".repeat(64),
+			format: "deflate-raw-json-v1",
+			filesB64: deflateRawSync(JSON.stringify(oldBundle)).toString("base64") } });
+	const oldRun = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7002, sha("b")),
+		request: github([anchor, first]), loadCarryArtifact: async () => "unused" });
+	const oldCarry = sealHistoricalCarryForOfflineTests(oldRun, { settledCny: 0,
+		unknownOrInFlightCny: 0, requestAudit: audit(0, 0) });
+	const firstDone = { ...first, status: "completed", conclusion: "failure" };
+	const secondDone = { ...second, status: "completed", conclusion: "failure" };
+	const selectedArchive = { version: 1, kind: "m07-private-candidate-archive",
+		goalRunId: "new-goal", taskId: "T002", goalOutcome: "fulfilled", taskStatus: "accepted",
+		controllerEvidence: { reviewStatus: "accepted" }, files: [
+			{ name: "candidate.cpp", status: "present" },
+			{ name: "verification.json", status: "present" }],
+		m04: { state: "completed", runId: "M04-new", proposalSubmitted: false,
+			snapshotCreated: false, transaction: { file: "m04-transaction.json", state: "no-proposal" } } };
+	const selectedCheckpoint = { ...priorCheckpoint,
+		boundedRuns: [...priorCheckpoint.boundedRuns,
+			{ runId: "new-goal", outcome: "fulfilled", selectedTaskId: "T002",
+				acceptedTaskIds: ["T002"], unresolvedOperationIds: [] }] };
+	const history = { version: 1, kind: "untrusted-version-bound-research-history",
+		entries: [{ goalRunId: "prior-goal", taskId: "T001",
+			files: { "candidate.cpp": oldBundle["candidate.cpp"],
+				"verification.json": oldBundle["verification.json"],
+				"workflow-archive.json": oldBundle["workflow-archive.json"] } }] };
+	const tx = { version: 1, kind: "m04-knowledge-transaction", m04RunId: "M04-new",
+		state: "no-proposal", attempts: [] };
+	const selectedBundle: Record<string, string> = { ...oldBundle, "candidate.cpp": "new selected source",
+		"verification.json": JSON.stringify({ version: 1, status: "passed" }),
+		"workflow-archive.json": JSON.stringify(selectedArchive),
+		"objective-checkpoint.json": JSON.stringify(selectedCheckpoint),
+		"research-history.json": JSON.stringify(history),
+		"m04-transaction.json": JSON.stringify(tx) };
+	const sessionId = campaignSessionEffectId("new accepted selection");
+	const profile = await verifyDeepSeekCnyBilling({ apiKey: "synthetic-key",
+		now: () => new Date("2026-10-06T10:30:00.000Z"),
+		request: async () => new Response(JSON.stringify({ is_available: true,
+			balance_infos: [{ currency: "CNY", total_balance: "PRIVATE-AMOUNT",
+				granted_balance: "PRIVATE-GRANT", topped_up_balance: "PRIVATE-TOPUP" }] })) });
+	const requestAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
+		requests: [{ requestId: "accepted-request", sessionId, responseReceived: true,
+			inputPayloadBytes: 100, status: "settled" as const, settledCny: 0.25,
+			unknownObservedCny: null, reportedUsage: { input: 10, output: 10,
+				cacheRead: 0, cacheWrite: 0, totalTokens: 20, reportedUsdCost: 0.01,
+				costStatus: "priced" } }], settledCny: 0.25, unknownObservedCny: 0,
+		unpricedRequestCount: 0, pricingProfile: nativeCnyPricingRecord(profile) };
+	const emptyAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
+		requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
+	const openSelection = () => openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7003, sha("c")),
+		request: github([anchor, firstDone, second]),
+		loadCarryArtifact: async () => oldCarry.envelopeB64 });
+	const chosen = await openSelection();
+	selectedBundle["host-effect-receipt.json"] = JSON.stringify({ version: 1,
+		kind: "m07-host-effect-census", source: { runId: "7003", runAttempt: 1, commit: sha("c") },
+		priorEnvelopeSha256: chosen.priorCarryProof!.envelopeSha256,
+		historicalGoalRunIds: ["prior-goal"],
+		goals: [{ runId: "new-goal", outcome: "fulfilled",
+			tasks: [{ taskId: "T002", mode: "execute", status: "accepted", sessionId }],
+			operations: [{ id: "O001", taskId: "T002", status: "response-received" }] }],
+		sessions: [{ sessionId, kind: "confined-execution", goalRunId: "new-goal",
+			taskId: "T002", workRoot: "/tmp/synthetic/T002",
+			grant: { version: 1, kind: "confined-campaign-files", root: "/tmp/synthetic/T002",
+				writableFiles: ["candidate.cpp", "lesson-delta.json"] } }],
+		requestIds: ["accepted-request"] });
+	for (const name of ["candidate.cpp", "verification.json"] as const) {
+		const invalid = { ...selectedBundle, "objective-checkpoint.json": JSON.stringify({
+			...selectedCheckpoint, selectedArtifacts: selectedCheckpoint.selectedArtifacts.filter(item => item !== name) }) };
+		assert.throws(() => chosen.sealCurrent({ settledCny: 0.25, unknownObservedCny: 0,
+			unpricedRequestCount: 0, requestAudit, privateBundle: invalid }),
+			/selected tuple omitted required source or checker/);
+	}
+	const unchangedFilesBadList = { ...oldBundle,
+		"objective-checkpoint.json": JSON.stringify({ ...priorCheckpoint,
+			selectedArtifacts: ["verification.json", "workflow-archive.json"] }) };
+	assert.throws(() => chosen.sealCurrent({ settledCny: 0,
+		unknownObservedCny: 0, unpricedRequestCount: 0,
+		requestAudit: emptyAudit, privateBundle: unchangedFilesBadList }),
+		/selected tuple omitted required source or checker/);
+	const reorderedOld = { ...oldBundle,
+		"objective-checkpoint.json": JSON.stringify({ ...priorCheckpoint,
+			selectedArtifacts: [...priorCheckpoint.selectedArtifacts].reverse() }) };
+	const reorderOpen = await openSelection();
+	assert.doesNotThrow(() => reorderOpen.sealCurrent({ settledCny: 0,
+		unknownObservedCny: 0, unpricedRequestCount: 0,
+		requestAudit: emptyAudit, privateBundle: reorderedOld }));
+	const planChangedOpen = await openSelection();
+	assert.throws(() => planChangedOpen.sealCurrent({ settledCny: 0,
+		unknownObservedCny: 0, unpricedRequestCount: 0,
+		requestAudit: emptyAudit,
+		privateBundle: { ...oldBundle, "experiment-plan.json": "changed unselected plan" } }),
+		/selected plan changed without a completed authenticated transition/);
+	const malformedOldRun = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7002, sha("b")),
+		request: github([anchor, first]), loadCarryArtifact: async () => "unused" });
+	const malformedOldCarry = sealHistoricalCarryForOfflineTests(malformedOldRun, {
+		settledCny: 0, unknownOrInFlightCny: 0, requestAudit: audit(0, 0),
+		privateBundle: unchangedFilesBadList });
+	const malformedPrior = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7003, sha("c")),
+		request: github([anchor, firstDone, second]),
+		loadCarryArtifact: async () => malformedOldCarry.envelopeB64 });
+	assert.throws(() => malformedPrior.sealCurrent({ settledCny: 0.25,
+		unknownObservedCny: 0, unpricedRequestCount: 0,
+		requestAudit, privateBundle: selectedBundle }),
+		/authenticated predecessor selected tuple is incomplete/);
+	const wrongArchive = { ...selectedArchive, m04: { ...selectedArchive.m04,
+		state: "completed", proposalSubmitted: true, snapshotCreated: true,
+		snapshotId: "snapshot-A", transaction: { file: "m04-transaction.json", state: "merged" } } };
+	const wrongMerged = { ...selectedBundle,
+		"workflow-archive.json": JSON.stringify(wrongArchive),
+		"m04-transaction.json": JSON.stringify({ ...tx, state: "merged", snapshotId: "snapshot-B",
+			currentProposalId: "P0001", attempts: [{ state: "merged", proposalId: "P0001",
+				structurallyValid: true }] }) };
+	assert.throws(() => chosen.sealCurrent({ settledCny: 0.25, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit, privateBundle: wrongMerged }),
+		/new selected tuple lacks a completed authenticated transition/);
+	const firstSelected = chosen.sealCurrent({ settledCny: 0.25, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit, privateBundle: selectedBundle });
+	const requestFor = (runs: object[]): typeof fetch => async (url, init) => {
+		const address = String(url);
+		if (address.includes("/workflows/manual-private-campaign.yml/runs?"))
+			return new Response(JSON.stringify({ total_count: runs.length, workflow_runs: [...runs].reverse() }));
+		for (const [id, commit, artifactId] of [[7003, sha("c"), 9003],
+			[7005, sha("e"), 9005], [7006, sha("f"), 9006]] as const) {
+			if (address.includes(`/runs/${id}/jobs?`)) return new Response(JSON.stringify({
+				total_count: 1, jobs: [{ id: id + 1000, run_id: id, run_attempt: 1,
+					head_sha: commit, name: "private-campaign", status: "completed",
+					conclusion: "failure", steps: [{ name: "Run private campaign",
+						status: "completed", conclusion: "failure" }] }] }));
+			if (address.includes(`/runs/${id}/artifacts?`)) return new Response(JSON.stringify({
+				total_count: 2, artifacts: [{ id: artifactId, name: CARRY_ARTIFACT_NAME,
+					expired: false, workflow_run: { id, head_sha: commit } },
+					{ id: artifactId + 100, name: MISSION_ARTIFACT, expired: false,
+						digest: `sha256:${"a".repeat(64)}`,
+						workflow_run: { id, head_sha: commit } }] }));
+		}
+		return github(runs)(url, init);
+	};
+	const thirdRun = run(7005, 4, "in_progress", sha("e"));
+	const newOpened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7005, sha("e")),
+		request: requestFor([anchor, firstDone, secondDone, thirdRun]),
+		loadCarryArtifact: async () => firstSelected.envelopeB64 });
+	const selected = authenticatedSelectedTransitions(newOpened.priorCarryProof,
+		newOpened.priorPrivateBundle);
+	assert.equal(selected?.length, 1);
+	assert.equal(selected?.[0].source.runId, "7003");
+	assert.equal(selected?.[0].envelopeSha256, newOpened.priorCarryProof?.envelopeSha256);
+	assert.equal(authenticatedSelectedTransitions({ ...newOpened.priorCarryProof },
+		newOpened.priorPrivateBundle), undefined);
+	const reorderedSelection = { ...newOpened.priorPrivateBundle!,
+		"objective-checkpoint.json": JSON.stringify({ ...selectedCheckpoint,
+			selectedArtifacts: [...selectedCheckpoint.selectedArtifacts].reverse() }) };
+	const zero = newOpened.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: emptyAudit,
+		privateBundle: reorderedSelection });
+	const fourthRun = run(7006, 5, "in_progress", sha("f"));
+	const zeroOpened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7006, sha("f")),
+		request: requestFor([anchor, firstDone, secondDone,
+			{ ...thirdRun, status: "completed", conclusion: "failure" }, fourthRun]),
+		loadCarryArtifact: async () => zero.envelopeB64 });
+	assert.deepEqual(authenticatedSelectedTransitions(zeroOpened.priorCarryProof,
+		zeroOpened.priorPrivateBundle), selected);
+	const secondSelection = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7006, sha("f")),
+		request: requestFor([anchor, firstDone, secondDone,
+			{ ...thirdRun, status: "completed", conclusion: "failure" }, fourthRun]),
+		loadCarryArtifact: async () => zero.envelopeB64 });
+	const secondSession = campaignSessionEffectId("second accepted selection");
+	const secondArchive = { ...selectedArchive, goalRunId: "third-goal", taskId: "T003",
+		m04: { ...selectedArchive.m04, runId: "M04-next" } };
+	const secondCheckpoint = { ...selectedCheckpoint,
+		boundedRuns: [...selectedCheckpoint.boundedRuns,
+			{ runId: "third-goal", outcome: "fulfilled", selectedTaskId: "T003",
+				acceptedTaskIds: ["T003"], unresolvedOperationIds: [] }] };
+	const secondHistory = { ...history, entries: [...history.entries,
+		{ goalRunId: "new-goal", taskId: "T002", files: {
+			"candidate.cpp": selectedBundle["candidate.cpp"],
+			"verification.json": selectedBundle["verification.json"],
+			"workflow-archive.json": selectedBundle["workflow-archive.json"],
+			"m04-transaction.json": selectedBundle["m04-transaction.json"] } }] };
+	const secondBundle: Record<string, string> = { ...selectedBundle,
+		"candidate.cpp": "second selected source",
+		"workflow-archive.json": JSON.stringify(secondArchive),
+		"m04-transaction.json": JSON.stringify({ ...tx, m04RunId: "M04-next" }),
+		"objective-checkpoint.json": JSON.stringify(secondCheckpoint),
+		"research-history.json": JSON.stringify(secondHistory),
+		"host-effect-receipt.json": JSON.stringify({ version: 1,
+			kind: "m07-host-effect-census", source: { runId: "7006", runAttempt: 1, commit: sha("f") },
+			priorEnvelopeSha256: secondSelection.priorCarryProof!.envelopeSha256,
+			historicalGoalRunIds: ["prior-goal", "new-goal"],
+			goals: [{ runId: "third-goal", outcome: "fulfilled",
+				tasks: [{ taskId: "T003", mode: "execute", status: "accepted",
+					sessionId: secondSession }],
+				operations: [{ id: "O001", taskId: "T003", status: "response-received" }] }],
+			sessions: [{ sessionId: secondSession, kind: "confined-execution",
+				goalRunId: "third-goal", taskId: "T003", workRoot: "/tmp/synthetic/T003",
+				grant: { version: 1, kind: "confined-campaign-files",
+					root: "/tmp/synthetic/T003",
+					writableFiles: ["candidate.cpp", "lesson-delta.json"] } }],
+			requestIds: ["second-accepted-request"] }) };
+	const secondAudit = { ...requestAudit, requests: [{ ...requestAudit.requests[0],
+		requestId: "second-accepted-request", sessionId: secondSession }] };
+	const secondCarry = secondSelection.sealCurrent({ settledCny: 0.25,
+		unknownObservedCny: 0, unpricedRequestCount: 0,
+		requestAudit: secondAudit, privateBundle: secondBundle });
+	const failed = zeroOpened.sealEmergencyCurrent({ settledCny: 0,
+		unknownObservedCny: 0, unpricedRequestCount: 0,
+		requestAudit: emptyAudit }, "effect-review-incomplete");
+	const fifthRun = run(7007, 6, "in_progress", sha("1"));
+	const failedOpened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7007, sha("1")),
+		request: requestFor([anchor, firstDone, secondDone,
+			{ ...thirdRun, status: "completed", conclusion: "failure" },
+			{ ...fourthRun, status: "completed", conclusion: "failure" }, fifthRun]),
+		loadCarryArtifact: async () => failed.envelopeB64 });
+	assert.deepEqual(authenticatedSelectedTransitions(failedOpened.priorCarryProof,
+		failedOpened.priorPrivateBundle), selected);
+	const secondOpened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7007, sha("1")),
+		request: requestFor([anchor, firstDone, secondDone,
+			{ ...thirdRun, status: "completed", conclusion: "failure" },
+			{ ...fourthRun, status: "completed", conclusion: "failure" }, fifthRun]),
+		loadCarryArtifact: async () => secondCarry.envelopeB64 });
+	assert.equal(authenticatedSelectedTransitions(secondOpened.priorCarryProof,
+		secondOpened.priorPrivateBundle)?.length, 2);
+	const seed = await authenticateSignedMissionSeed({ ...f, envelopeB64: seedEnvelopeB64 });
+	const key = seed.derivePrivateKey("mul-pis-ledger-continuation-v1");
+	const outer = JSON.parse(Buffer.from(zero.envelopeB64, "base64").toString());
+	const source = { runId: "7005", runAttempt: 1, runNumber: 4, commit: sha("e") };
+	const reader = createDecipheriv("aes-256-gcm", key, Buffer.from(outer.nonce, "base64"));
+	reader.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
+		seed.seedDigest, 3, outer.parentDigest, source])));
+	reader.setAuthTag(Buffer.from(outer.tag, "base64"));
+	const corrupted = JSON.parse(Buffer.concat([reader.update(Buffer.from(outer.ciphertext, "base64")),
+		reader.final()]).toString());
+	corrupted.selectedTransitions[0].archiveSha256 = "0".repeat(64);
+	const nonce = randomBytes(12);
+	const writer = createCipheriv("aes-256-gcm", key, nonce);
+	writer.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
+		seed.seedDigest, 3, outer.parentDigest, source])));
+	const ciphertext = Buffer.concat([writer.update(JSON.stringify(corrupted)), writer.final()]);
+	const forged = Buffer.from(JSON.stringify({ version: 3, parentDigest: outer.parentDigest,
+		nonce: nonce.toString("base64"), ciphertext: ciphertext.toString("base64"),
+		tag: writer.getAuthTag().toString("base64") })).toString("base64");
+	await assert.rejects(openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7006, sha("f")),
+		request: requestFor([anchor, firstDone, secondDone,
+			{ ...thirdRun, status: "completed", conclusion: "failure" }, fourthRun]),
+		loadCarryArtifact: async () => forged }), /selected transition ancestry prefix/);
+	const secondOuter = JSON.parse(Buffer.from(secondCarry.envelopeB64, "base64").toString());
+	const secondSource = { runId: "7006", runAttempt: 1, runNumber: 5, commit: sha("f") };
+	const secondReader = createDecipheriv("aes-256-gcm", key,
+		Buffer.from(secondOuter.nonce, "base64"));
+	secondReader.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
+		seed.seedDigest, 3, secondOuter.parentDigest, secondSource])));
+	secondReader.setAuthTag(Buffer.from(secondOuter.tag, "base64"));
+	const alteredHistory = JSON.parse(Buffer.concat([
+		secondReader.update(Buffer.from(secondOuter.ciphertext, "base64")),
+		secondReader.final()]).toString());
+	const archived = JSON.parse(alteredHistory.privateBundle["research-history.json"]);
+	archived.entries[1].files["candidate.cpp"] = "tampered prior selection";
+	alteredHistory.privateBundle["research-history.json"] = JSON.stringify(archived);
+	const historyNonce = randomBytes(12);
+	const historyWriter = createCipheriv("aes-256-gcm", key, historyNonce);
+	historyWriter.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY,
+		seed.seedDigest, 3, secondOuter.parentDigest, secondSource])));
+	const historyCiphertext = Buffer.concat([
+		historyWriter.update(JSON.stringify(alteredHistory)), historyWriter.final()]);
+	const forgedHistory = Buffer.from(JSON.stringify({ version: 3,
+		parentDigest: secondOuter.parentDigest, nonce: historyNonce.toString("base64"),
+		ciphertext: historyCiphertext.toString("base64"),
+		tag: historyWriter.getAuthTag().toString("base64") })).toString("base64");
+	await assert.rejects(openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7007, sha("1")),
+		request: requestFor([anchor, firstDone, secondDone,
+			{ ...thirdRun, status: "completed", conclusion: "failure" },
+			{ ...fourthRun, status: "completed", conclusion: "failure" }, fifthRun]),
+		loadCarryArtifact: async () => forgedHistory }),
+		/selected transition tuple or completed M04 archive changed/);
 });

@@ -8,6 +8,7 @@ import { createM07Controller } from "../src/m07/controller.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 import type { ReadReturnEvent } from "../src/runner/types.ts";
 import { runM04 } from "../src/stages/m04.ts";
+import { exportPortableM04Transaction } from "../src/workflow-archive/m04-transaction.ts";
 import type { StageContext } from "../src/stages/context.ts";
 import { Workspace } from "../src/workspace.ts";
 
@@ -52,11 +53,53 @@ test("M04 can choose no proposal after full selected M07 reads and sees exact pa
 		requiredM07ReadPaths: f.relative });
 	assert.equal(result.record.status, "completed");
 	assert.equal(result.proposalId, undefined);
+	const transactionPath = result.record.outputs.find(item => item.label === "M04 知识事务状态")?.path;
+	assert.ok(transactionPath);
+	const transaction = JSON.parse(await readFile(transactionPath, "utf8"));
+	assert.equal(transaction.state, "no-proposal");
+	assert.deepEqual(transaction.attempts, []);
 	const session = [...fake.sessions.values()].find(item => item.spec.label === "M04-research");
 	assert.equal(session?.turns, 1, "a missing proposal block is a valid no-proposal result");
 	const message = session?.transcript[0]?.text ?? "";
 	for (const item of f.relative) assert.ok(message.includes(item));
 	assert.match(message, /完整读取/);
+});
+
+test("a failed first M04 prompt leaves an exact no-proposal receipt for fresh adjudication", async t => {
+	const f = await fixture(t);
+	const snapshot = await f.store.current();
+	f.ctx.runner = new FakeSessionRunner(() => { throw new Error("synthetic prompt transport failure"); });
+	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative }), /synthetic prompt transport failure/);
+	const records = await Promise.all((await f.ws.listRuns("M04")).map(id => f.ws.readRun("M04", id)));
+	const failed = records.find(record => record.status === "failed" &&
+		record.outputs.some(item => item.label === "M04 知识事务状态"));
+	assert.ok(failed);
+	const txFile = failed.outputs.find(item => item.label === "M04 知识事务状态")!.path;
+	const tx = JSON.parse(await readFile(txFile, "utf8"));
+	assert.equal(tx.state, "no-proposal");
+	assert.deepEqual(tx.attempts, []);
+	assert.equal(tx.currentProposalId, undefined);
+	assert.equal(tx.snapshotId, undefined);
+	assert.equal((await f.store.current())?.id, snapshot?.id);
+	const destination = path.join(f.ws.root, "private-m04-transport");
+	await mkdir(destination);
+	const portable = await exportPortableM04Transaction({ ws: f.ws,
+		m04RunId: failed.runId, destination });
+	assert.equal(portable.state, "no-proposal");
+	assert.deepEqual(portable.attempts, []);
+
+	const next = new FakeSessionRunner(() => ({
+		text: "Fresh adjudication: evidence does not support a knowledge proposal.",
+		readReturns: returnedRanges(f.relative),
+	}));
+	f.ctx.runner = next;
+	const fresh = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative });
+	assert.equal(fresh.record.status, "completed");
+	assert.equal(fresh.proposalAttempts.length, 0);
+	assert.equal((await f.store.current())?.id, snapshot?.id);
+	assert.equal(next.created.filter(spec => spec.label === "M04-research").length, 1);
 });
 
 test("malformed explicit proposal JSON gets same-session format repair only after full M07 reads", async t => {
@@ -86,16 +129,84 @@ test("malformed explicit proposal JSON gets same-session format repair only afte
 	assert.equal(result.record.outputs.some(item => item.label === "知识提案"), false);
 });
 
-test("parsed but structurally invalid proposal is submitted once and never format-retried", async t => {
+test("structurally invalid draft gets exact receipt and same-session correction without merge", async t => {
 	const f = await fixture(t);
 	const invalid = `\`\`\`knowledge-proposals\n${JSON.stringify([{
 		op: "create", type: "K", title: "", body: "" }])}\n\`\`\``;
-	const fake = new FakeSessionRunner(() => ({ text: invalid, readReturns: returnedRanges(f.relative) }));
+	const fake = new FakeSessionRunner(({ turnIndex, message }) => {
+		if (turnIndex === 1) return { text: invalid, readReturns: returnedRanges(f.relative) };
+		assert.match(message, /private draft and rejected it on structural validation/);
+		assert.match(message, /create\.title/);
+		return "Revised complete judgment: no supported knowledge operation.";
+	});
+	f.ctx.runner = fake;
+	const prior = (await f.store.current())?.id;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative });
+	assert.ok(result.proposalId, "a parsed array reached draft-only structural validation");
+	assert.equal(result.snapshotId, undefined);
+	assert.equal((await f.store.current())?.id, prior);
+	assert.equal([...fake.sessions.values()].find(item => item.spec.label === "M04-research")?.turns, 2);
+	assert.equal(result.proposalAttempts.length, 1);
+	assert.equal(result.proposalAttempts[0].state, "rejected-draft");
+	const txPath = result.record.outputs.find(item => item.label === "M04 知识事务状态")?.path;
+	assert.ok(txPath);
+	const tx = JSON.parse(await readFile(txPath, "utf8"));
+	assert.equal(tx.state, "rejected-draft");
+	assert.equal(tx.attempts[0].proposalId, result.proposalId);
+	assert.ok(tx.attempts[0].issues.some((item: { message: string }) => item.message.includes("create.title")));
+	const receipt = JSON.parse(await readFile(path.join(path.dirname(txPath), tx.attempts[0].receiptFile), "utf8"));
+	assert.deepEqual(receipt.issues, tx.attempts[0].issues);
+	assert.equal(result.record.outputs.some(item => item.label === "合入结果"), false);
+});
+
+test("a corrected structural draft merges once and retains rejected draft identity", async t => {
+	const f = await fixture(t);
+	const invalid = `\`\`\`knowledge-proposals\n${JSON.stringify([{
+		op: "create", type: "K", title: "", body: "" }])}\n\`\`\``;
+	const valid = `\`\`\`knowledge-proposals\n${JSON.stringify([{
+		op: "create", type: "K", title: "Synthetic bounded method", body: "Finite synthetic observation",
+		usageDecision: "candidate" }])}\n\`\`\``;
+	const fake = new FakeSessionRunner(({ turnIndex }) => ({
+		text: turnIndex === 1 ? invalid : valid,
+		readReturns: turnIndex === 1 ? returnedRanges(f.relative) : [],
+	}));
 	f.ctx.runner = fake;
 	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
 		freshSession: true, requiredM07ReadPaths: f.relative });
-	assert.ok(result.proposalId, "a parsed array reached structural validation");
-	assert.ok(result.record.failures.some(item => item.includes("结构校验未通过")));
+	assert.ok(result.snapshotId, "only the corrected valid proposal reaches merge");
+	assert.equal(result.proposalAttempts.length, 2);
+	assert.equal(result.proposalAttempts[0].state, "rejected-draft");
+	assert.equal(result.proposalAttempts[1].state, "merged");
+	assert.equal(result.proposalId, result.proposalAttempts[1].proposalId);
+	const txPath = result.record.outputs.find(item => item.label === "M04 知识事务状态")?.path;
+	assert.ok(txPath);
+	const tx = JSON.parse(await readFile(txPath, "utf8"));
+	assert.equal(tx.state, "merged");
+	assert.equal(tx.snapshotId, result.snapshotId);
+	assert.equal(result.record.outputs.filter(item => item.label.startsWith("知识提案草案 ")).length, 2);
+	assert.equal(result.record.outputs.filter(item => item.label === "M04 知识事务状态").length, 1);
+});
+
+test("merge exception leaves durable merge intent and does not retry in the model session", async t => {
+	const f = await fixture(t);
+	const valid = `\`\`\`knowledge-proposals\n${JSON.stringify([{
+		op: "create", type: "K", title: "Synthetic bounded method", body: "Finite synthetic observation",
+		usageDecision: "candidate" }])}\n\`\`\``;
+	const fake = new FakeSessionRunner(() => ({ text: valid, readReturns: returnedRanges(f.relative) }));
+	f.ctx.runner = fake;
+	f.store.merge = async () => { throw new Error("synthetic merge outcome unknown"); };
+	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative }), /synthetic merge outcome unknown/);
+	const runs = await Promise.all((await f.ws.listRuns("M04")).map(id => f.ws.readRun("M04", id)));
+	const attempt = runs.find(run => run.outputs.some(item => item.label === "M04 知识事务状态"));
+	assert.ok(attempt);
+	const txPath = attempt.outputs.find(item => item.label === "M04 知识事务状态")!.path;
+	const tx = JSON.parse(await readFile(txPath, "utf8"));
+	assert.equal(tx.state, "merge-intent");
+	assert.equal(tx.snapshotId, undefined);
+	assert.equal(tx.attempts.length, 1);
+	assert.equal(tx.attempts[0].state, "merge-intent");
 	assert.equal([...fake.sessions.values()].find(item => item.spec.label === "M04-research")?.turns, 1);
 });
 
