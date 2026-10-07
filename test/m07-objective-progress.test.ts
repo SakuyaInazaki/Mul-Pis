@@ -339,6 +339,7 @@ function groundedReply(f: Awaited<ReturnType<typeof fixture>>, decision: "contin
 		version: 1, kind: "grounded-assessment-proposal", contractId: f.contract.id,
 		missionStatus: "open", issues: [issue], legacyOpenDetails: ["Preserved old detail"],
 		...(decision === "continue" ? { nextTask: {
+			objective: base.nextTask!.objective,
 			obligationIds: ["original-task"], addresses: ["strategy-gap"], adapterScope: "two-target-existing",
 			decisionChangingHypothesis: "A new comparison could change the strategy recommendation.",
 			expectedEvidence: "A correctness result and measured comparison.",
@@ -649,7 +650,8 @@ test("indexed assessor repairs an old-schema response with the same grounded del
 		nextTask: { objective: "Run a synthetic independent check", addresses: ["original-task"],
 			adapterScope: "two-target-existing" },
 		groundedAssessmentDelta: { version: 1, kind: "grounded-assessment-delta",
-			newIssues: [], resolutions: [], nextTask: { obligationIds: ["original-task"],
+			newIssues: [], resolutions: [], nextTask: { objective: "Run a synthetic independent check",
+				obligationIds: ["original-task"],
 				addresses: ["prior-check"], adapterScope: "two-target-existing",
 				decisionChangingHypothesis: "The new check could change candidate selection.",
 				expectedEvidence: "Independent machine check", sourceRefs: [
@@ -705,7 +707,8 @@ test("indexed assessor repairs grounded task mirrors, deliverable schema and evi
 		nextTask: { objective: canonicalTask.objective },
 		groundedAssessmentDelta: { version: 1, kind: "grounded-assessment-delta",
 			newIssues: [], resolutions: [],
-			nextTask: { obligationIds: ["original-task"], addresses: [issue.id],
+			nextTask: { objective: canonicalTask.objective,
+				obligationIds: ["original-task"], addresses: [issue.id],
 				adapterScope: "two-target-existing",
 				decisionChangingHypothesis: "An independent check could select a different answer.",
 				expectedEvidence: "Independent synthetic result",
@@ -738,9 +741,10 @@ test("indexed assessor repairs grounded task mirrors, deliverable schema and evi
 		assert.equal(diagnostics.length, prompts, "each rejected reply is recorded before repair");
 		assert.equal(dispatched.length, 0, "no invalid proposal dispatches");
 		if (prompts === 0) {
-			assert.match(message, /top-level nextTask only as \{objective:string\}/);
-			assert.match(message, /obligationIds are original obligation IDs/);
-			assert.match(message, /addresses are OPEN grounded issue IDs/);
+			assert.match(message, /write ONE task in groundedAssessment\.nextTask or groundedAssessmentDelta\.nextTask/);
+			assert.match(message, /obligationIds:\[original obligation ID strings\]/);
+			assert.match(message, /addresses:\[OPEN grounded issue ID strings\]/);
+			assert.match(message, /Omit top-level nextTask; the host derives its full task record/);
 			assert.match(message, /Optional deliverableReady is an OBJECT \{status:'proposed',ready:boolean,rationale:string,evidenceRefs:/);
 			assert.match(message, /Top-level evidenceRefs is an array of exact frozen FILE NAME STRINGS/);
 		} else {
@@ -785,6 +789,222 @@ test("indexed assessor repairs grounded task mirrors, deliverable schema and evi
 	assert.deepEqual(result.assessment?.groundedAssessment?.issues, [issue]);
 	assert.deepEqual(result.assessment?.groundedAssessment?.deliverableReady,
 		corrected.groundedAssessmentDelta.deliverableReady);
+});
+
+test("indexed assessor repairs canonical grounded task fields before dispatching its objective", async t => {
+	const cases = [
+		{ name: "conflicting legacy objective", path: "$.nextTask.objective", reason: "legacy mirror",
+			alter: (reply: any) => { reply.nextTask = { objective: "Run a conflicting synthetic task" }; } },
+		{ name: "unknown grounded field", path: "/groundedAssessmentDelta/nextTask",
+			reason: "unsupported field", alter: (reply: any) => {
+				reply.groundedAssessmentDelta.nextTask.unsupportedInstruction = "synthetic extra"; } },
+		{ name: "empty grounded objective", path: "/groundedAssessmentDelta/nextTask/objective",
+			reason: "objective must be nonempty text", alter: (reply: any) => {
+				reply.groundedAssessmentDelta.nextTask.objective = "  "; } },
+		{ name: "empty scope", path: "/groundedAssessmentDelta/nextTask/adapterScope",
+			reason: "registered scope ID", alter: (reply: any) => {
+				reply.groundedAssessmentDelta.nextTask.adapterScope = ""; } },
+		{ name: "unavailable scope", path: "/groundedAssessmentDelta/nextTask/adapterScope",
+			reason: "unavailable registered scope", alter: (reply: any) => {
+				reply.groundedAssessmentDelta.nextTask.adapterScope = "host.unavailable.synthetic"; } },
+		{ name: "empty hypothesis", path: "/groundedAssessmentDelta/nextTask/decisionChangingHypothesis",
+			reason: "nonempty text", alter: (reply: any) => {
+				reply.groundedAssessmentDelta.nextTask.decisionChangingHypothesis = "  "; } },
+	];
+	for (const scenario of cases) await t.test(scenario.name, async child => {
+		const f = await fixture(child);
+		const issue: GroundedAssessmentProposal["issues"][number] = {
+			id: "prior-check", claim: "An independent result could change the selected answer.", status: "open",
+			classification: "necessary-verification", claimAtRisk: "The selected answer is supported.",
+			implication: "An independent check can change the recommendation.",
+			sourceRefs: [{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }] };
+		const prior = await addPriorGroundingIndex(f, [], [issue]);
+		const canonical = { version: 1, decision: "continue", rationale: "The prior check remains open.",
+			evidenceRefs: ["candidate.cpp", "verification.json"], unresolvedObligations: ["original-task"],
+			groundedAssessmentDelta: { version: 1, kind: "grounded-assessment-delta",
+				newIssues: [], resolutions: [], nextTask: {
+					objective: "Run the independent synthetic check", obligationIds: ["original-task"],
+					addresses: [issue.id], adapterScope: "two-target-existing",
+					decisionChangingHypothesis: "An independent check could select a different answer.",
+					expectedEvidence: "Independent synthetic result", sourceRefs: issue.sourceRefs } } };
+		const invalid = structuredClone(canonical);
+		scenario.alter(invalid);
+		const diagnostics: Array<{ generation: number; attempt: number; rawResponse: string;
+			validation: { code: string; path: string; detail?: string };
+			coverage: readonly { sourceId: string; required: boolean; complete: boolean }[] }> = [];
+		const dispatched: ObjectiveNextTaskV1[] = [];
+		const locator = prior.issueLocators[0]!;
+		const partRead: ReadReturnEvent = { toolName: "objective_evidence_read", status: "returned",
+			path: locator.partName, requested: {}, returned: { kind: "text", startLine: locator.line,
+				endLine: locator.line, truncated: false }, at: new Date().toISOString() };
+		const requests: string[] = [];
+		const recordedBeforePrompt: number[] = [];
+		const dispatchedBeforePrompt: number[] = [];
+		const runner = new FakeSessionRunner(({ message }) => {
+			requests.push(message);
+			recordedBeforePrompt.push(diagnostics.length);
+			dispatchedBeforePrompt.push(dispatched.length);
+			return requests.length === 1 ? { text: JSON.stringify(invalid),
+				readReturns: [...ranges(f), prior.indexRead, partRead] } :
+				{ text: JSON.stringify(canonical) };
+		});
+		const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+			evidenceAccess: prior.access,
+			groundingPolicy: { require: true, sourceKinds: prior.sourceKinds,
+				legacyOpenDetails: [], previousIssues: [issue],
+				priorGroundingIndex: prior.priorGroundingIndex },
+			capabilities: [{ scope: "two-target-existing", available: true,
+				description: "Synthetic independent check", limits: [] },
+				{ scope: "host.unavailable.synthetic", available: false,
+					description: "Synthetic unavailable adapter", limits: [] }],
+			recordValidationFailure: async item => { diagnostics.push(item); },
+			persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+			advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+			advance: async task => { dispatched.push(task); } });
+		assert.equal(result.stopReason, "objective-reassessment-pending");
+		assert.equal(runner.created.length, 1, "the correction stays in the same read-only session");
+		assert.deepEqual(recordedBeforePrompt, [0, 1]);
+		assert.deepEqual(dispatchedBeforePrompt, [0, 0], "invalid replies cannot dispatch a task");
+		assert.equal(diagnostics.length, 1);
+		assert.equal(diagnostics[0]!.validation.code, "m07.objective-assessment");
+		assert.equal(diagnostics[0]!.validation.path, scenario.path);
+		assert.ok((diagnostics[0]!.validation.detail ?? "").includes(scenario.reason));
+		assert.equal(diagnostics[0]!.rawResponse, JSON.stringify(invalid));
+		assert.equal(diagnostics[0]!.generation, 1);
+		assert.equal(diagnostics[0]!.attempt, 1);
+		assert.ok(diagnostics[0]!.coverage.filter(source => source.required)
+			.every(source => source.complete), "rejection follows complete current-session reads");
+		assert.ok(requests[1]!.includes(`Rejected field path: ${scenario.path}.`));
+		assert.ok(requests[1]!.includes(scenario.reason));
+		assert.deepEqual(dispatched, [{ objective: canonical.groundedAssessmentDelta.nextTask.objective,
+			addresses: ["original-task"], adapterScope: "two-target-existing" }]);
+		assert.deepEqual(result.assessment?.nextTask, dispatched[0]);
+		assert.deepEqual(result.assessment?.unreadEvidence, []);
+	});
+});
+
+test("distinct grounded field repairs keep a live assessor session and its read proof", async t => {
+	const f = await fixture(t);
+	const issue: GroundedAssessmentProposal["issues"][number] = {
+		id: "prior-check", claim: "An independent result could change the selected answer.", status: "open",
+		classification: "necessary-verification", claimAtRisk: "The selected answer is supported.",
+		implication: "An independent check can change the recommendation.",
+		sourceRefs: [{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }] };
+	const prior = await addPriorGroundingIndex(f, [], [issue]);
+	const canonical = { version: 1, decision: "continue", rationale: "The prior check remains open.",
+		evidenceRefs: ["candidate.cpp", "verification.json"], unresolvedObligations: ["original-task"],
+		groundedAssessmentDelta: { version: 1, kind: "grounded-assessment-delta",
+			newIssues: [], resolutions: [], nextTask: {
+				objective: "Run the independent synthetic check", obligationIds: ["original-task"],
+				addresses: [issue.id], adapterScope: "two-target-existing",
+				decisionChangingHypothesis: "An independent check could select a different answer.",
+				expectedEvidence: "Independent synthetic result", sourceRefs: issue.sourceRefs } } };
+	const extraField = { ...canonical, groundedAssessmentDelta: {
+		...canonical.groundedAssessmentDelta, nextTask: {
+			...canonical.groundedAssessmentDelta.nextTask, unsupportedInstruction: "synthetic extra" } } };
+	const emptyScope = { ...canonical, groundedAssessmentDelta: {
+		...canonical.groundedAssessmentDelta, nextTask: {
+			...canonical.groundedAssessmentDelta.nextTask, adapterScope: "" } } };
+	const replies = [extraField, emptyScope, canonical];
+	const diagnostics: Array<{ generation: number; attempt: number; rawResponse: string;
+		validation: { code: string; path: string; detail?: string };
+		coverage: readonly { sourceId: string; required: boolean; complete: boolean }[] }> = [];
+	const dispatched: ObjectiveNextTaskV1[] = [];
+	const locator = prior.issueLocators[0]!;
+	const partRead: ReadReturnEvent = { toolName: "objective_evidence_read", status: "returned",
+		path: locator.partName, requested: {}, returned: { kind: "text", startLine: locator.line,
+			endLine: locator.line, truncated: false }, at: new Date().toISOString() };
+	const requests: string[] = [];
+	const recordedBeforePrompt: number[] = [];
+	const dispatchedBeforePrompt: number[] = [];
+	const runner = new FakeSessionRunner(({ message }) => {
+		requests.push(message);
+		recordedBeforePrompt.push(diagnostics.length);
+		dispatchedBeforePrompt.push(dispatched.length);
+		return { text: JSON.stringify(replies[requests.length - 1]!),
+			...(requests.length === 1 ? { readReturns: [...ranges(f), prior.indexRead, partRead] } : {}) };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		evidenceAccess: prior.access,
+		groundingPolicy: { require: true, sourceKinds: prior.sourceKinds,
+			legacyOpenDetails: [], previousIssues: [issue],
+			priorGroundingIndex: prior.priorGroundingIndex },
+		capabilities: [{ scope: "two-target-existing", available: true,
+			description: "Synthetic independent check", limits: [] }],
+		recordValidationFailure: async item => { diagnostics.push(item); },
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async task => { dispatched.push(task); } });
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.equal(runner.created.length, 1, "different field repairs stay in the live session");
+	assert.equal(requests.length, 3);
+	assert.deepEqual(recordedBeforePrompt, [0, 1, 2], "each rejection is recorded before repair");
+	assert.deepEqual(dispatchedBeforePrompt, [0, 0, 0], "no invalid task dispatches");
+	assert.deepEqual(diagnostics.map(item => item.validation.path), [
+		"/groundedAssessmentDelta/nextTask", "/groundedAssessmentDelta/nextTask/adapterScope"]);
+	assert.deepEqual(diagnostics.map(item => item.validation.detail), [
+		"grounded nextTask has an unsupported field",
+		"grounded nextTask adapterScope must be a registered scope ID"]);
+	assert.ok(requests[1]!.includes("Rejected field path: /groundedAssessmentDelta/nextTask."));
+	assert.ok(requests[1]!.includes("grounded nextTask has an unsupported field"));
+	assert.ok(requests[2]!.includes("Rejected field path: /groundedAssessmentDelta/nextTask/adapterScope."));
+	assert.ok(requests[2]!.includes("grounded nextTask adapterScope must be a registered scope ID"));
+	assert.deepEqual(diagnostics.map(item => item.rawResponse),
+		replies.slice(0, 2).map(item => JSON.stringify(item)));
+	assert.deepEqual(diagnostics.map(item => item.generation), [1, 1]);
+	assert.deepEqual(diagnostics.map(item => item.attempt), [1, 2]);
+	assert.ok(diagnostics.every(item => item.validation.code === "m07.objective-assessment" &&
+		item.coverage.filter(source => source.required).every(source => source.complete)),
+	"both corrections retain complete current-session read proof");
+	assert.deepEqual(dispatched, [{ objective: canonical.groundedAssessmentDelta.nextTask.objective,
+		addresses: ["original-task"], adapterScope: "two-target-existing" }]);
+	assert.deepEqual(result.assessment?.nextTask, dispatched[0]);
+	assert.deepEqual(result.assessment?.unreadEvidence, []);
+});
+
+test("indexed assessor accepts a matching legacy top-level task mirror", async t => {
+	const f = await fixture(t);
+	const issue: GroundedAssessmentProposal["issues"][number] = {
+		id: "prior-check", claim: "An independent result could change the selected answer.", status: "open",
+		classification: "necessary-verification", claimAtRisk: "The selected answer is supported.",
+		implication: "An independent check can change the recommendation.",
+		sourceRefs: [{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }] };
+	const prior = await addPriorGroundingIndex(f, [], [issue]);
+	const nextTask: ObjectiveNextTaskV1 = { objective: "Run the independent synthetic check",
+		addresses: ["original-task"], adapterScope: "two-target-existing" };
+	const reply = { version: 1, decision: "continue", rationale: "The prior check remains open.",
+		evidenceRefs: ["candidate.cpp", "verification.json"], unresolvedObligations: ["original-task"],
+		nextTask, groundedAssessmentDelta: { version: 1, kind: "grounded-assessment-delta",
+			newIssues: [], resolutions: [], nextTask: {
+				objective: nextTask.objective, obligationIds: ["original-task"],
+				addresses: [issue.id], adapterScope: nextTask.adapterScope,
+				decisionChangingHypothesis: "An independent check could select a different answer.",
+				expectedEvidence: "Independent synthetic result", sourceRefs: issue.sourceRefs } } };
+	const locator = prior.issueLocators[0]!;
+	const partRead: ReadReturnEvent = { toolName: "objective_evidence_read", status: "returned",
+		path: locator.partName, requested: {}, returned: { kind: "text", startLine: locator.line,
+			endLine: locator.line, truncated: false }, at: new Date().toISOString() };
+	const diagnostics: string[] = [];
+	const dispatched: ObjectiveNextTaskV1[] = [];
+	const runner = new FakeSessionRunner(() => ({ text: JSON.stringify(reply),
+		readReturns: [...ranges(f), prior.indexRead, partRead] }));
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		evidenceAccess: prior.access,
+		groundingPolicy: { require: true, sourceKinds: prior.sourceKinds,
+			legacyOpenDetails: [], previousIssues: [issue],
+			priorGroundingIndex: prior.priorGroundingIndex },
+		capabilities: [{ scope: "two-target-existing", available: true,
+			description: "Synthetic independent check", limits: [] }],
+		recordValidationFailure: async item => { diagnostics.push(item.validation.path); },
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async task => { dispatched.push(task); } });
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.equal(runner.created.length, 1);
+	assert.deepEqual(diagnostics, []);
+	assert.deepEqual(dispatched, [nextTask]);
+	assert.deepEqual(result.assessment?.nextTask, nextTask);
+	assert.deepEqual(result.assessment?.unreadEvidence, []);
 });
 
 test("indexed prior citations get exact nested span feedback before a valid correction", async t => {
@@ -878,7 +1098,8 @@ test("indexed physical-gap feedback names the exact scope, field and host row be
 			adapterScope: "two-target-existing" },
 		groundedAssessmentDelta: { version: 1, kind: "grounded-assessment-delta",
 			newIssues: [necessary, physical], resolutions: [],
-			nextTask: { obligationIds: ["original-task"], addresses: [necessary.id],
+			nextTask: { objective: "Run a synthetic independent check",
+				obligationIds: ["original-task"], addresses: [necessary.id],
 				adapterScope: "two-target-existing",
 				decisionChangingHypothesis: "The new check could change selection.",
 				expectedEvidence: "An independent result", sourceRefs: necessary.sourceRefs } } };
@@ -924,7 +1145,8 @@ test("indexed assessor retains a precise nested validator path before correction
 	const prior = await addPriorGroundingIndex(f, [], []);
 	const corrected = deltaReply("fulfilled");
 	const invalid = { ...corrected, groundedAssessmentDelta: {
-		...corrected.groundedAssessmentDelta, nextTask: { obligationIds: ["original-task"],
+		...corrected.groundedAssessmentDelta, nextTask: { objective: "Synthetic ungrounded task",
+			obligationIds: ["original-task"],
 			addresses: ["new-issue"], adapterScope: "two-target-existing",
 			expectedEvidence: "Synthetic result", sourceRefs: [
 				{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }] } } };
@@ -949,9 +1171,9 @@ test("indexed assessor retains a precise nested validator path before correction
 	assert.equal(result.stopReason, "model-closure-unverified");
 	assert.equal(prompts, 2);
 	assert.equal(diagnostics.length, 1);
-	assert.equal(diagnostics[0].validation.path, "$.groundedAssessmentDelta.nextTask");
+	assert.equal(diagnostics[0].validation.path, "/groundedAssessmentDelta/nextTask/addresses");
 	assert.equal(diagnostics[0].validation.detail,
-		"assessor-grounding: next task needs a feasible scope and decision-changing hypothesis");
+		"grounded nextTask addresses must be OPEN grounded issue IDs");
 	assert.equal(diagnostics[0].rawResponse, JSON.stringify(invalid));
 });
 

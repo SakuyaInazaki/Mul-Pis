@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { mergeGroundedAssessmentDelta, validateGroundedAssessment, validatePriorGroundingIndex,
-	GroundingSpanError,
+	GroundingSpanError, GroundingFieldError,
 	type GroundedAssessmentProposal,
 	type GroundingContext } from "../src/m07/assessor-grounding.ts";
 
@@ -37,7 +37,8 @@ function proposal(): GroundedAssessmentProposal {
 				sourceRefs: [ref("task-material", 3)], implication: "Claims needing it remain limited.",
 				blockedScope: "counters", capabilityRef: ref("observed-host", 2) },
 		],
-		nextTask: { obligationIds: ["original-task"], addresses: ["deliverable", "validation"],
+		nextTask: { objective: "Run a synthetic independent check",
+			obligationIds: ["original-task"], addresses: ["deliverable", "validation"],
 			adapterScope: "registered-experiment",
 			decisionChangingHypothesis: "A new check could change the recommended result.",
 			expectedEvidence: "A new measured comparison and validity check.",
@@ -107,15 +108,24 @@ test("a physical gap cites its own frozen unavailable capability row", () => {
 test("next work needs an available scope and a decision-changing hypothesis", () => {
 	const noHypothesis = proposal();
 	noHypothesis.nextTask!.decisionChangingHypothesis = "";
-	assert.throws(() => validateGroundedAssessment(noHypothesis, context), /decision-changing hypothesis/);
+	assert.throws(() => validateGroundedAssessment(noHypothesis, context), error =>
+		error instanceof GroundingFieldError &&
+		error.pointer === "/groundedAssessment/nextTask/decisionChangingHypothesis" &&
+		error.safeDetail.includes("nonempty text"));
 
 	const unavailable = proposal();
 	unavailable.nextTask!.adapterScope = "counters";
-	assert.throws(() => validateGroundedAssessment(unavailable, context), /feasible scope/);
+	assert.throws(() => validateGroundedAssessment(unavailable, context), error =>
+		error instanceof GroundingFieldError &&
+		error.pointer === "/groundedAssessment/nextTask/adapterScope" &&
+		error.safeDetail.includes("unavailable registered scope"));
 
 	const unknownIssue = proposal();
 	unknownIssue.nextTask!.addresses = ["not-an-issue"];
-	assert.throws(() => validateGroundedAssessment(unknownIssue, context), /grounded issue/);
+	assert.throws(() => validateGroundedAssessment(unknownIssue, context), error =>
+		error instanceof GroundingFieldError &&
+		error.pointer === "/groundedAssessment/nextTask/addresses" &&
+		error.safeDetail.includes("OPEN grounded issue IDs"));
 });
 
 test("cannot drop legacy claims or smuggle in mission closure or accepted readiness", () => {
@@ -156,7 +166,10 @@ test("a prior issue can resolve with cited evidence while retaining its ID and o
 		/authenticated prior issue/);
 
 	candidate.nextTask!.addresses = ["validation"];
-	assert.throws(() => validateGroundedAssessment(candidate, context), /open grounded issue/);
+	assert.throws(() => validateGroundedAssessment(candidate, context), error =>
+		error instanceof GroundingFieldError &&
+		error.pointer === "/groundedAssessment/nextTask/addresses" &&
+		error.safeDetail.includes("OPEN grounded issue IDs"));
 	candidate.nextTask!.addresses = ["deliverable"];
 	verification.resolution = { explanation: "Unsupported self assertion.",
 		evidenceRefs: [ref("task-material")] };

@@ -22,6 +22,124 @@ import { CARRY_LOGICAL_BYTES } from "../src/runner/carry-sidecar-codec.ts";
 import { workflowRepairState } from "../src/runner/repair-liveness.ts";
 
 const sha = (letter: string) => letter.repeat(40);
+test("historical six-field grounded nextTask survives v4/v3 carry without acquiring authority", async t => {
+	const f = await fixture(t);
+	const contract = createOriginalObjective({ goal: "Synthetic source-grounded mission",
+		goalSource: "user-intent-summary", inputNames: ["input.txt"],
+		obligations: [{ id: "O1", description: "Check the synthetic result" }],
+		closure: "open-ended" });
+	// This is the old accepted form: the objective was mirrored at the top level,
+	// while groundedAssessment.nextTask had the six other fields only.
+	const historicalAssessment = {
+		version: 1, decision: "continue", rationale: "An original requirement remains open",
+		evidenceRefs: [], unresolvedObligations: ["O1"],
+		unresolvedDetails: ["Check the synthetic result"],
+		nextTask: { objective: "Check the synthetic result", addresses: ["O1"],
+			adapterScope: "synthetic-scope" },
+		groundedAssessment: { version: 1, kind: "grounded-assessment-proposal",
+			contractId: contract.id, missionStatus: "open", legacyOpenDetails: [],
+			issues: [{ id: "I1", claim: "Check the synthetic result", status: "open",
+				classification: "explicit-requirement", implication: "The result is unresolved",
+				sourceRefs: [{ sourceId: "input.txt", startLine: 1, endLine: 1 }] }],
+			nextTask: { obligationIds: ["O1"], addresses: ["I1"],
+				adapterScope: "synthetic-scope",
+				decisionChangingHypothesis: "A check can resolve I1",
+				expectedEvidence: "A checked synthetic result",
+				sourceRefs: [{ sourceId: "input.txt", startLine: 1, endLine: 1 }] } },
+		sessionId: "historical-assessor", model: "synthetic-model", evidenceRead: [],
+		unreadEvidence: [], blockedProposals: [] };
+	const selectedArtifacts = ["candidate.cpp", "verification.json", "workflow-archive.json"];
+	const checkpoint = objectiveProgress(contract, { boundedRuns: [], selectedArtifacts,
+		assessment: historicalAssessment as unknown as NonNullable<ReturnType<typeof objectiveProgress>["assessment"]>,
+		assessmentHistory: [{ iteration: 1,
+			assessment: historicalAssessment as unknown as NonNullable<ReturnType<typeof objectiveProgress>["assessment"]>,
+			stopReason: "next-task-pending", advanced: false }], stopReason: "next-task-pending" });
+	const checkpointBytes = JSON.stringify(checkpoint);
+	assert.equal(Object.hasOwn(historicalAssessment.groundedAssessment.nextTask, "objective"), false);
+	const bundle = { "candidate.cpp": "synthetic accepted source",
+		"verification.json": "{}", "workflow-archive.json": "{}",
+		"original-objective.json": JSON.stringify(contract),
+		"objective-checkpoint.json": checkpointBytes };
+	const seedEnvelopeB64 = f.signSeed({ ...f.payload, version: 2,
+		rootReviewedAnchor: { commit: sha("a"), artifactSha256: "e".repeat(64),
+			digestScope: "encrypted-result-envelope" },
+		bootstrap: { contractId: contract.id, sourceSha256: "d".repeat(64),
+			format: "deflate-raw-json-v1",
+			filesB64: deflateRawSync(JSON.stringify(bundle)).toString("base64") } });
+	const firstOpened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7002, sha("b")),
+		request: github([anchor, first]), loadCarryArtifact: async () => "unused" });
+	const firstCarry = sealHistoricalCarryForOfflineTests(firstOpened, { settledCny: 0,
+		unknownOrInFlightCny: 0.25, requestAudit: audit(0, 0.25) });
+	const firstDone = { ...first, status: "completed", conclusion: "success" };
+	const secondOpened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7003, sha("c")),
+		request: github([anchor, firstDone, second]),
+		loadCarryArtifact: async () => firstCarry.envelopeB64 });
+	const secondCarry = sealHistoricalCarryForOfflineTests(secondOpened, { settledCny: 0,
+		unknownOrInFlightCny: 0, requestAudit: audit(0, 0) });
+	const secondDone = { ...second, status: "completed", conclusion: "success" };
+	const priorBase = github([anchor, firstDone, secondDone, third]);
+	const priorRequest: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.includes("/runs/7003/jobs?")) return new Response(JSON.stringify({ total_count: 1,
+			jobs: [{ id: 6003, run_id: 7003, run_attempt: 1, head_sha: sha("c"),
+				name: "private-campaign", status: "completed", conclusion: "success",
+				steps: [{ name: "Run private campaign", status: "completed", conclusion: "success" }] }] }));
+		if (address.includes("/runs/7003/artifacts?")) return new Response(JSON.stringify({ total_count: 1,
+			artifacts: [{ id: 9003, name: CARRY_ARTIFACT_NAME, expired: false,
+				workflow_run: { id: 7003, head_sha: sha("c") } }] }));
+		return priorBase(url, init);
+	};
+	const opened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7005, sha("e")),
+		request: priorRequest, loadCarryArtifact: async () => secondCarry.envelopeB64 });
+	const emptyAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
+		requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
+	const carry = opened.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: emptyAudit });
+	const seed = await authenticateSignedMissionSeed({ ...f, envelopeB64: seedEnvelopeB64 });
+	const source = { runId: "7005", runAttempt: 1, runNumber: 4, commit: sha("e") };
+	assert.equal(decodeV4Checkpoint(carry, seed.seedDigest,
+		seed.derivePrivateKey("mul-pis-ledger-continuation-v1"), source)
+		.privateBundle["objective-checkpoint.json"], checkpointBytes);
+	const next = run(7006, 5, "in_progress", sha("f"));
+	const base = github([anchor, firstDone, secondDone,
+		{ ...third, status: "completed", conclusion: "failure" }, next]);
+	const request: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.includes("/runs/7003/jobs?") || address.includes("/runs/7003/artifacts?"))
+			return priorRequest(url, init);
+		if (address.includes("/runs/7005/jobs?")) return new Response(JSON.stringify({ total_count: 1,
+			jobs: [{ id: 6005, run_id: 7005, run_attempt: 1, head_sha: sha("e"),
+				name: "private-campaign", status: "completed", conclusion: "failure",
+				steps: [{ name: "Run private campaign", status: "completed", conclusion: "failure" }] }] }));
+		if (address.includes("/runs/7005/artifacts?")) return new Response(JSON.stringify({ total_count: 1,
+			artifacts: [{ id: 9005, name: CARRY_ARTIFACT_NAME, expired: false,
+				workflow_run: { id: 7005, head_sha: sha("e") } }] }));
+		return base(url, init);
+	};
+	const reopened = await openLedgerContinuation({ ...f, seedEnvelopeB64, githubToken: "synthetic-token",
+		current: current(7006, sha("f")), request, loadCarryArtifact: async () => carry });
+	assert.equal(reopened.priorPrivateBundle?.["objective-checkpoint.json"], checkpointBytes);
+	assert.equal(JSON.parse(reopened.priorPrivateBundle!["objective-checkpoint.json"]!)
+		.assessment.groundedAssessment.nextTask.objective, undefined);
+	assert.equal(authenticatedPriorCarryBindsBundle(reopened.priorCarryProof, reopened.priorPrivateBundle), true);
+	assert.deepEqual(authenticatedSelectedTransitions(reopened.priorCarryProof, reopened.priorPrivateBundle),
+		authenticatedSelectedTransitions(opened.priorCarryProof, opened.priorPrivateBundle));
+	for (const name of selectedArtifacts)
+		assert.equal((reopened.priorPrivateBundle as Record<string, string>)[name],
+			(opened.priorPrivateBundle as Record<string, string>)[name]);
+	assert.equal(reopened.historicalUnknownHeldCny, opened.historicalUnknownHeldCny);
+	assert.equal(reopened.historicalUnknownHeldCny, 0.25);
+	assert.equal(reopened.priorUnknownObservedCny, 0);
+	const forwarded = reopened.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: emptyAudit });
+	assert.equal(decodeV4Checkpoint(forwarded, seed.seedDigest,
+		seed.derivePrivateKey("mul-pis-ledger-continuation-v1"),
+		{ runId: "7006", runAttempt: 1, runNumber: 5, commit: sha("f") })
+		.privateBundle["objective-checkpoint.json"], checkpointBytes);
+});
 test("private repair telemetry is schema checked and AEAD carried without granting selection authority", async t => {
 	const f = await compactedFixture(t);
 	const opened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",

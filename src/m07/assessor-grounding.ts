@@ -32,6 +32,17 @@ export class GroundingSpanError extends Error {
 	}
 }
 
+/** Static schema feedback. Paths identify structure without echoing model text. */
+export class GroundingFieldError extends Error {
+	readonly pointer: string;
+	readonly safeDetail: string;
+	constructor(pointer: string, safeDetail: string) {
+		super("assessor-grounding: invalid field");
+		this.pointer = pointer;
+		this.safeDetail = safeDetail;
+	}
+}
+
 export type GroundedIssue = {
 	id: string;
 	claim: string;
@@ -53,6 +64,8 @@ export type GroundedIssue = {
 };
 
 export interface GroundedNextTask {
+	/** The model-authored bounded objective lives in this single task record. */
+	objective: string;
 	/** Original contract obligation IDs, matched by the live assessor parser. */
 	obligationIds: string[];
 	/** IDs of grounded issues this task could change. */
@@ -319,19 +332,39 @@ export function validateGroundedAssessment(value: unknown, context: GroundingCon
 			fail("newly resolved issue needs new frozen evidence");
 	}
 	if (value.nextTask !== undefined) {
-		const task = value.nextTask;
-		if (!obj(task) || !onlyKeys(task, ["obligationIds", "addresses", "adapterScope", "decisionChangingHypothesis",
-			"expectedEvidence", "sourceRefs"]) ||
-			!prose(task.decisionChangingHypothesis) || !prose(task.expectedEvidence) ||
-			!id(task.adapterScope) || !context.capabilities[task.adapterScope]?.available)
-			fail("next task needs a feasible scope and decision-changing hypothesis");
-		if (!ids(task.obligationIds).length) fail("next task needs original obligation IDs");
-		const addresses = ids(task.addresses);
-		if (!addresses.length || addresses.some(item => !openIssueIds.has(item)))
-			fail("next task must address an open grounded issue");
-		spans(task.sourceRefs, context.sources,
-			deltaPriorCount === undefined ? "/groundedAssessment/nextTask/sourceRefs" :
-				"/groundedAssessmentDelta/nextTask/sourceRefs");
+		const pointer = deltaPriorCount === undefined ? "/groundedAssessment/nextTask" :
+			"/groundedAssessmentDelta/nextTask";
+		const task: unknown = value.nextTask;
+		if (!obj(task))
+			throw new GroundingFieldError(pointer, "grounded nextTask must be an object");
+		if (!onlyKeys(task, ["objective", "obligationIds", "addresses", "adapterScope",
+			"decisionChangingHypothesis", "expectedEvidence", "sourceRefs"]))
+			throw new GroundingFieldError(pointer, "grounded nextTask has an unsupported field");
+		if (!prose(task.objective))
+			throw new GroundingFieldError(`${pointer}/objective`,
+				"grounded nextTask objective must be nonempty text");
+		if (!Array.isArray(task.obligationIds) || !task.obligationIds.length ||
+			!task.obligationIds.every(id) || new Set(task.obligationIds).size !== task.obligationIds.length)
+			throw new GroundingFieldError(`${pointer}/obligationIds`,
+				"grounded nextTask obligationIds must be unique original obligation IDs");
+		if (!Array.isArray(task.addresses) || !task.addresses.length || !task.addresses.every(id) ||
+			new Set(task.addresses).size !== task.addresses.length ||
+			task.addresses.some(item => !openIssueIds.has(item)))
+			throw new GroundingFieldError(`${pointer}/addresses`,
+				"grounded nextTask addresses must be OPEN grounded issue IDs");
+		if (!id(task.adapterScope) || !context.capabilities[task.adapterScope])
+			throw new GroundingFieldError(`${pointer}/adapterScope`,
+				"grounded nextTask adapterScope must be a registered scope ID");
+		if (!context.capabilities[task.adapterScope]!.available)
+			throw new GroundingFieldError(`${pointer}/adapterScope`,
+				"grounded nextTask adapterScope names an unavailable registered scope");
+		if (!prose(task.decisionChangingHypothesis))
+			throw new GroundingFieldError(`${pointer}/decisionChangingHypothesis`,
+				"grounded nextTask decisionChangingHypothesis must be nonempty text");
+		if (!prose(task.expectedEvidence))
+			throw new GroundingFieldError(`${pointer}/expectedEvidence`,
+				"grounded nextTask expectedEvidence must be nonempty text");
+		spans(task.sourceRefs, context.sources, `${pointer}/sourceRefs`);
 	}
 	if (value.deliverableReady !== undefined) {
 		const finding = value.deliverableReady;

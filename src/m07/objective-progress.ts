@@ -9,7 +9,7 @@ import { workflowRepairFingerprint, workflowRepairState, type WorkflowRepairFail
 import type { StageRunRecord } from "../types.ts";
 import { HarnessError } from "../types.ts";
 import { mergeGroundedAssessmentDelta, validateGroundedAssessment, validatePriorGroundingIndex,
-	GroundingSpanError,
+	GroundingSpanError, GroundingFieldError,
 	type GroundedAssessmentDelta, type GroundedAssessmentProposal,
 	type GroundedIssue, type GroundingContext, type GroundingSourceKind,
 	type GroundingSpan } from "./assessor-grounding.ts";
@@ -473,7 +473,7 @@ function parseAssessment(text: string, contract: OriginalObjectiveContractV1, ev
 		try {
 			merged = mergeGroundedAssessmentDelta(raw.groundedAssessmentDelta, grounding);
 		} catch (error) {
-			if (error instanceof GroundingSpanError)
+			if (error instanceof GroundingSpanError || error instanceof GroundingFieldError)
 				assessmentFailure("prior grounding delta is invalid", error.pointer, error.safeDetail);
 			const detail = fixedGroundingDetail(error);
 			assessmentFailure("prior grounding delta is invalid", deltaValidationPath(detail), detail);
@@ -503,7 +503,7 @@ function parseAssessment(text: string, contract: OriginalObjectiveContractV1, ev
 	if (grounding) {
 		try { groundedAssessment = validateGroundedAssessment(raw.groundedAssessment, grounding); }
 		catch (error) {
-			if (error instanceof GroundingSpanError)
+			if (error instanceof GroundingSpanError || error instanceof GroundingFieldError)
 				assessmentFailure("grounded assessment is invalid", error.pointer, error.safeDetail);
 			assessmentFailure("grounded assessment is invalid", "$.groundedAssessment",
 				fixedGroundingDetail(error));
@@ -513,32 +513,40 @@ function parseAssessment(text: string, contract: OriginalObjectiveContractV1, ev
 			assessmentFailure("grounded issues do not match unresolved details", "$.unresolvedDetails");
 	}
 	let nextTask: ObjectiveNextTaskV1 | undefined;
-	if (raw.nextTask !== undefined) {
-		if (!raw.nextTask || typeof raw.nextTask !== "object" || Array.isArray(raw.nextTask))
-			assessmentFailure("next task object is invalid", "$.nextTask");
-		const task = raw.nextTask as Record<string, unknown>;
-		if (!nonemptyText(task.objective)) assessmentFailure("next task does not address unresolved original obligations", "$.nextTask.objective");
-		if (groundedAssessment) {
-			// The grounded task is the one model-authored source for original
-			// obligation IDs and the execution scope. Old full-shape replies stay
-			// readable only when their duplicate fields agree exactly.
-			const groundedTask = groundedAssessment.nextTask;
-			if (!groundedTask)
-				assessmentFailure("next task lacks a grounded proposal", "$.groundedAssessment.nextTask");
+	if (groundedAssessment) {
+		const groundedTask = groundedAssessment.nextTask;
+		if (raw.nextTask !== undefined) {
+			if (!groundedTask || !raw.nextTask || typeof raw.nextTask !== "object" ||
+				Array.isArray(raw.nextTask))
+				assessmentFailure("legacy next task has no matching grounded task", "$.nextTask");
+			const mirror = raw.nextTask as Record<string, unknown>;
+			if (Object.keys(mirror).some(key => !["objective", "addresses", "adapterScope"].includes(key)))
+				assessmentFailure("legacy next task contains unsupported fields", "$.nextTask");
+			if (mirror.objective !== groundedTask.objective)
+				assessmentFailure("legacy next task objective conflicts with grounded task", "$.nextTask.objective",
+					"Top-level nextTask is a legacy mirror; its objective must equal grounded nextTask.objective");
+			if (mirror.addresses !== undefined &&
+				JSON.stringify(mirror.addresses) !== JSON.stringify(groundedTask.obligationIds))
+				assessmentFailure("legacy next task addresses conflict with grounded task", "$.nextTask.addresses",
+					"Top-level addresses, when supplied, must equal grounded nextTask.obligationIds; grounded nextTask.addresses are open issue IDs");
+			if (mirror.adapterScope !== undefined && mirror.adapterScope !== groundedTask.adapterScope)
+				assessmentFailure("legacy next task scope conflicts with grounded task", "$.nextTask.adapterScope");
+		}
+		if (groundedTask) {
 			if (!strings(groundedTask.obligationIds, ids) || !groundedTask.obligationIds.length ||
 				groundedTask.obligationIds.some(item => !(raw.unresolvedObligations as string[]).includes(item)))
 				assessmentFailure("next task does not address unresolved original obligations",
 					priorGroundingIndex ? "$.groundedAssessmentDelta.nextTask.obligationIds" :
 						"$.groundedAssessment.nextTask.obligationIds");
-			if (task.addresses !== undefined &&
-				JSON.stringify(task.addresses) !== JSON.stringify(groundedTask.obligationIds))
-				assessmentFailure("next task mirror conflicts with grounded obligation IDs", "$.nextTask.addresses",
-					"Top-level addresses, when supplied, must equal grounded nextTask.obligationIds; grounded nextTask.addresses are open issue IDs");
-			if (task.adapterScope !== undefined && task.adapterScope !== groundedTask.adapterScope)
-				assessmentFailure("next task mirror conflicts with grounded adapter scope", "$.nextTask.adapterScope");
-			nextTask = { objective: task.objective,
+			nextTask = { objective: groundedTask.objective,
 				addresses: [...groundedTask.obligationIds], adapterScope: groundedTask.adapterScope };
-		} else {
+		}
+	} else if (raw.nextTask !== undefined) {
+		if (!raw.nextTask || typeof raw.nextTask !== "object" || Array.isArray(raw.nextTask))
+			assessmentFailure("next task object is invalid", "$.nextTask");
+		const task = raw.nextTask as Record<string, unknown>;
+		if (!nonemptyText(task.objective))
+			assessmentFailure("next task does not address unresolved original obligations", "$.nextTask.objective");
 			if (!strings(task.addresses, ids) || !task.addresses.length ||
 				task.addresses.some(item => !(raw.unresolvedObligations as string[]).includes(item)))
 				assessmentFailure("next task does not address unresolved original obligations", "$.nextTask.addresses");
@@ -546,7 +554,6 @@ function parseAssessment(text: string, contract: OriginalObjectiveContractV1, ev
 				assessmentFailure("next task does not address unresolved original obligations", "$.nextTask.adapterScope");
 			nextTask = { objective: task.objective, addresses: task.addresses,
 				adapterScope: task.adapterScope as ObjectiveNextTaskV1["adapterScope"] };
-		}
 	}
 	if ((decision === "continue" && (!raw.unresolvedObligations.length || !raw.unresolvedDetails.length || !nextTask)) ||
 		(decision === "fulfilled" && (raw.unresolvedObligations.length || raw.unresolvedDetails.length || !raw.evidenceRefs.length || nextTask)) ||
@@ -823,7 +830,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		const groundedIssueSchema = "Each new issue has base fields {id,claim,status:'open'|'resolved',classification,sourceRefs:[{sourceId,startLine,endLine}],implication}. Add only the named fields for its classification: claimAtRisk for necessary-verification, optionalBasis for optional-method, or blockedScope and capabilityRef:{sourceId,startLine,endLine} for physical-capability-gap. Do not add a proof field. A resolved issue also needs resolution:{explanation,evidenceRefs:[{sourceId,startLine,endLine}]}.";
 		const physicalGapRule = `For physical-capability-gap, blockedScope must be ONE exact unavailable registered scope ID, never a prose description or combined list: ${JSON.stringify(unavailableScopeIds)}. Cite that scope's own host-capability row with capabilityRef; if no registered ID matches a suspected limitation, do not invent a physical gap or claim the limitation is measured.`;
 		const priorResolutionSchema = "Each delta resolution is {id,priorRef:{sourceId,startLine,endLine},explanation,evidenceRefs:[{sourceId,startLine,endLine}]}. Copy priorRef exactly from the required prior-grounding-index locator: sourceId is that issue's partName and both line numbers equal its line. Do not use a 'part:line' string. Each evidenceRefs item is a separate span object for newly frozen evidence actually read in this session; do not use string shorthand or infer read credit from a path.";
-		const groundedTaskSchema = "For continue, include top-level nextTask only as {objective:string}. Put the task's obligationIds, open issue addresses, adapterScope, decisionChangingHypothesis, expectedEvidence and sourceRefs:[{sourceId,startLine,endLine}] in groundedAssessment.nextTask or groundedAssessmentDelta.nextTask. obligationIds are original obligation IDs contained in unresolvedObligations; addresses are OPEN grounded issue IDs; adapterScope is one available registered scope. The host derives top-level nextTask.addresses and adapterScope from this grounded task. If you include those two legacy mirror fields, they must match obligationIds and adapterScope exactly. For blocked or fulfilled, omit both nextTask objects.";
+		const groundedTaskSchema = "For continue, write ONE task in groundedAssessment.nextTask or groundedAssessmentDelta.nextTask: {objective:string,obligationIds:[original obligation ID strings],addresses:[OPEN grounded issue ID strings],adapterScope:one available registered scope,decisionChangingHypothesis:string,expectedEvidence:string,sourceRefs:[{sourceId,startLine,endLine}]}. objective, hypothesis and expectedEvidence must be nonempty. obligationIds must be contained in unresolvedObligations. Omit top-level nextTask; the host derives its full task record from this grounded task after validation. A legacy top-level nextTask is accepted only when its objective and any supplied addresses/scope exactly match the grounded task. For blocked or fulfilled, omit both nextTask objects.";
 		const groundedReferenceSchema = "Top-level evidenceRefs is an array of exact frozen FILE NAME STRINGS, not source-span objects; it may be [] for continue or blocked. Grounded sourceRefs, resolution evidenceRefs and deliverableReady evidenceRefs are arrays of {sourceId,startLine,endLine} objects for cited lines actually returned in this session. Never put a span object in top-level evidenceRefs or a filename string in a grounded span array.";
 		const deliverableSchema = "Optional deliverableReady is an OBJECT {status:'proposed',ready:boolean,rationale:string,evidenceRefs:[{sourceId,startLine,endLine}],remainingIssueIds:[open issue ID strings]}. List every still-open issue ID in remainingIssueIds. A bare boolean is invalid; omit the field if you have no evidence-backed finding. This proposal never closes the open-ended mission.";
 		const responseSchema = priorIndex ? [
@@ -872,7 +879,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 					priorResolutionSchema
 				] : [
 					`Retain these prior unresolved details verbatim under groundedAssessment.legacyOpenDetails: ${JSON.stringify(grounding.legacyOpenDetails)}. Retain every prior issue ID and claim, changing open to resolved only with new evidence: ${JSON.stringify(grounding.previousIssues ?? [])}. Newly produced frozen evidence IDs: ${JSON.stringify(grounding.newEvidenceSourceIds ?? [])}.`,
-					"Add groundedAssessment {version:1,kind:'grounded-assessment-proposal',contractId,missionStatus:'open',issues,legacyOpenDetails,nextTask?,deliverableReady?}. Each issue needs id,claim,status:'open'|'resolved',classification,sourceRefs,implication. A resolved issue retains its ID and adds resolution {explanation,evidenceRefs} citing a selected result or host observation; only OPEN issue claims appear in unresolvedDetails. Classifications: explicit-requirement (user instruction or supplied task), necessary-verification (claimAtRisk), optional-method (optionalBasis cited in task/user text), physical-capability-gap (blockedScope and capabilityRef citing host observation). For continue, groundedAssessment.nextTask carries the original obligation IDs, OPEN issue addresses, available adapterScope, decisionChangingHypothesis, expectedEvidence and sourceRefs. The host derives the top-level task's mirrored addresses and scope from it. An optional method or unavailable capability alone does not justify another task. Do not claim a global optimum from finite tests."
+					"Add groundedAssessment {version:1,kind:'grounded-assessment-proposal',contractId,missionStatus:'open',issues,legacyOpenDetails,nextTask?,deliverableReady?}. Each issue needs id,claim,status:'open'|'resolved',classification,sourceRefs,implication. A resolved issue retains its ID and adds resolution {explanation,evidenceRefs} citing a selected result or host observation; only OPEN issue claims appear in unresolvedDetails. Classifications: explicit-requirement (user instruction or supplied task), necessary-verification (claimAtRisk), optional-method (optionalBasis cited in task/user text), physical-capability-gap (blockedScope and capabilityRef citing host observation). For continue, groundedAssessment.nextTask carries the sole model-authored objective, original obligation IDs, OPEN issue addresses, available adapterScope, decisionChangingHypothesis, expectedEvidence and sourceRefs. The host derives the top-level task from it. An optional method or unavailable capability alone does not justify another task. Do not claim a global optimum from finite tests."
 				]) ] : []),
 			...responseSchema,
 			"Use a scope only when its observed host capability covers your proposed work. If a proposed task has no available registered executor, retain it as unresolved and name the unavailable capability explicitly. Preserve genuinely unresolved requirements. Assess honestly. Propose the next scientific work yourself from unresolved original obligations; do not change task permissions or claim a global optimum from a finite evaluation."].join("\n\n");
