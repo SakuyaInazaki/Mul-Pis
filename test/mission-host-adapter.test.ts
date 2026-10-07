@@ -11,7 +11,8 @@ import { pathToFileURL } from "node:url";
 import test, { type TestContext } from "node:test";
 import { deflateRawSync } from "node:zlib";
 import { createOriginalObjective, objectiveProgress } from "../src/m07/objective-progress.ts";
-import { prepareAuthenticatedResumeRequest } from "../src/runner/mission-host-adapter.ts";
+import { MissionHostPreparationError, prepareAuthenticatedResumeRequest } from "../src/runner/mission-host-adapter.ts";
+import { privateHostPreparationDiagnostic } from "../scripts/prepare-authenticated-private-resume.ts";
 import { CARRY_ARTIFACT_NAME, openLedgerContinuation, REUSABLE_RUN_REQUEST_MESSAGE,
 	type CurrentMissionRun } from "../src/runner/ledger-continuation.ts";
 import { decodeCarrySidecars } from "../src/runner/carry-sidecar-codec.ts";
@@ -34,7 +35,7 @@ type LiveState = {
 	sourceTip: string;
 	controlTip: string | null;
 	ciHead: string;
-	ciConclusion: string;
+	ciConclusion: string | null;
 	ciStatus: string;
 	ciRunAttempt: number;
 	ciCount: number;
@@ -260,6 +261,36 @@ test("stale source and unsuccessful CI reads fail closed before a reservation", 
 		const f = await fixture(t, { carriedAction: true });
 		alter(f.live);
 		await assert.rejects(prepareAuthenticatedResumeRequest(f.input));
+		assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	}
+});
+
+test("host preparation retains fixed CI-pending, failed, and absent causes privately", async t => {
+	for (const [alter, expected] of [
+		[(state: LiveState) => { state.ciStatus = "in_progress"; state.ciConclusion = null; },
+			"source-ci-pending"],
+		[(state: LiveState) => { state.ciConclusion = "failure"; },
+			"source-ci-completed-without-success"],
+		[(state: LiveState) => { state.ciCount = 0; }, "source-ci-run-absent"],
+	] as const) {
+		const f = await fixture(t, { carriedAction: true });
+		alter(f.live);
+		await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error => {
+			assert(error instanceof MissionHostPreparationError);
+			assert.equal(error.refusal.code, expected);
+			const privateDiagnostic = privateHostPreparationDiagnostic(error);
+			assert.equal(privateDiagnostic.code, expected);
+			assert.equal(privateDiagnostic.stage, "tested-source-ci");
+			if (expected === "source-ci-pending") {
+				assert.equal(privateDiagnostic.ciStatus, "in_progress");
+				assert.equal(privateDiagnostic.ciRunId, "9003");
+				assert.equal(privateDiagnostic.ciConclusion, null);
+			}
+			if (expected === "source-ci-completed-without-success")
+				assert.equal(privateDiagnostic.ciConclusion, "failure");
+			assert.doesNotMatch(JSON.stringify(privateDiagnostic), /Synthetic original task|synthetic candidate/);
+			return true;
+		});
 		assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
 	}
 });

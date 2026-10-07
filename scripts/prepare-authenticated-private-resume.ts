@@ -10,7 +10,7 @@ import { constants as fsConstants } from "node:fs";
 import { lstat, open, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { prepareAuthenticatedResumeRequest } from "../src/runner/mission-host-adapter.ts";
+import { MissionHostPreparationError, prepareAuthenticatedResumeRequest } from "../src/runner/mission-host-adapter.ts";
 import { MissionResumeJournal } from "../src/runner/mission-resume-journal.ts";
 import type { CurrentMissionRun } from "../src/runner/ledger-continuation.ts";
 import { CARRY_LOGICAL_BYTES, CARRY_SEGMENT_FILE_BYTES, CARRY_SEGMENT_RAW_BYTES,
@@ -29,7 +29,8 @@ type ArtifactFileReply = { file: string; sha256: string;
 	sidecars?: ArtifactSidecarFile[] };
 const maxSidecars = CARRY_LOGICAL_BYTES / CARRY_SEGMENT_RAW_BYTES;
 const maxSidecarTextBytes = Math.ceil(CARRY_SEGMENT_FILE_BYTES * 4 / 3) + 4;
-function privateFileReference(value: unknown): value is { file: string; sha256: string } {
+function privateFileReference<T>(value: T): value is T & {
+	file: string; sha256: string; name?: unknown } {
 	return Boolean(value) && typeof value === "object" &&
 		typeof (value as { file?: unknown }).file === "string" &&
 		path.isAbsolute((value as { file: string }).file) &&
@@ -135,8 +136,8 @@ function connectorBridge(): { request: typeof fetch;
 					reply.sidecars.length > maxSidecars ||
 					reply.sidecars.some((entry: unknown) => !privateFileReference(entry) ||
 						Object.keys(entry).sort().join("|") !== "file|name|sha256" ||
-						typeof (entry as { name?: unknown }).name !== "string" ||
-						!/^ledger-continuation\.part-[0-9]{8}\.enc$/.test((entry as { name: string }).name))))) {
+						typeof entry.name !== "string" ||
+						!/^ledger-continuation\.part-[0-9]{8}\.enc$/.test(entry.name))))) {
 				awaiting.reject(new Error("artifact file reply is invalid")); return;
 			}
 			awaiting.resolve(reply as ArtifactFileReply);
@@ -232,17 +233,27 @@ export async function runPrivateResumeBridge(values: string[],
 		{ kind: "no-dispatch", decisionKind: result.decision.kind })}\n`);
 }
 
+export function privateHostPreparationDiagnostic(error: unknown): Record<string, unknown> {
+	if (error instanceof MissionHostPreparationError)
+		return { code: error.refusal.code, stage: error.refusal.stage,
+			...(error.refusal.ciRunId === undefined ? {} : { ciRunId: error.refusal.ciRunId }),
+			...(error.refusal.ciStatus === undefined ? {} : { ciStatus: error.refusal.ciStatus }),
+			...(error.refusal.ciConclusion === undefined ? {} : { ciConclusion: error.refusal.ciConclusion }),
+			...(error.refusal.httpStatus === undefined ? {} : { httpStatus: error.refusal.httpStatus }) };
+	if (error instanceof PrivateBridgeError) return { code: error.reasonCode };
+	if (error instanceof HarnessError &&
+		/^(?:runner\.ledger-continuation|runner\.signed-mission-ledger|runner\.mission)/.test(error.code) &&
+		/^[A-Za-z0-9 .,;:()_\-]{1,250}$/.test(error.message))
+		return { code: error.code, detail: error.message };
+	return { code: "unclassified-host-preparation-error" };
+}
+
 async function savePrivateFailure(values: string[], error: unknown): Promise<void> {
 	const index = values.indexOf("--output-private");
 	const target = index >= 0 ? values[index + 1] : undefined;
 	if (!target || !path.isAbsolute(target) || underRepo(target) ||
 		underRepo(await realpath(path.dirname(target)))) return;
-	const diagnostic = error instanceof PrivateBridgeError ?
-		{ code: error.reasonCode } : error instanceof HarnessError &&
-		/^(?:runner\.ledger-continuation|runner\.signed-mission-ledger|runner\.mission)/.test(error.code) &&
-		/^[A-Za-z0-9 .,;:()_\-]{1,250}$/.test(error.message) ?
-		{ code: error.code, detail: error.message } :
-		{ code: "unclassified-host-preparation-error" };
+	const diagnostic = privateHostPreparationDiagnostic(error);
 	const handle = await open(target, "wx", 0o600);
 	try { await handle.writeFile(`${JSON.stringify({ version: 1,
 		kind: "private-resume-preparation-diagnostic", ...diagnostic })}\n`); await handle.sync(); }
