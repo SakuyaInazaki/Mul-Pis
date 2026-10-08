@@ -9,7 +9,7 @@ import { reconcileInterruptedLocalMission, reconcileLegacyInterruptedLocalMissio
 	type InterruptedLocalReviewRequestV1, type LegacyInterruptedLocalReviewRequestV1 } from
 	"../src/m07/local-interrupted-reconcile.ts";
 import { fullLocalMissionCensus, LEGACY_SERIAL_AUDIT_SHA256, LEGACY_SERIAL_COMMIT,
-	LEGACY_SERIAL_TREE, type LegacyEffectReviewV1 } from "../src/m07/local-legacy-review.ts";
+	LEGACY_SERIAL_TREE, verifyLegacySerialSource, type LegacyEffectReviewV1 } from "../src/m07/local-legacy-review.ts";
 import { LOCAL_M07_MISSION_BINDING_PREFIX } from "../src/m07/local-m07-adapter.ts";
 import { assessorTaskHash, localLineageBytes, localLineageHash, missionLineageFile,
 	recordLocalDispatchLineage } from "../src/m07/local-dispatch-lineage.ts";
@@ -24,6 +24,17 @@ const p3: ProcessIdentityV1 = { ...p1, pid: 1003, processStartToken: "333" };
 const p4: ProcessIdentityV1 = { ...p1, pid: 1004, processStartToken: "444" };
 const dead = async (): Promise<ProcessProbe> => ({ status: "dead", identityMatch: false, reason: "synthetic death" });
 const options = { currentIdentity: async () => p3, probePrior: dead };
+test("reviewed legacy source snapshot is self-contained and rejects changed bytes", async t => {
+	await verifyLegacySerialSource();
+	const root = await mkdtemp(path.join(os.tmpdir(), "local-legacy-source-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const original = await readFile(new URL("../src/m07/legacy-reviewed-serial-source-v1.json.gz", import.meta.url));
+	const changed = Buffer.from(original);
+	changed[changed.length - 1] ^= 1;
+	const file = path.join(root, "changed-source.json.gz");
+	await writeFile(file, changed, { mode: 0o600 });
+	await assert.rejects(verifyLegacySerialSource(file), /archive differs from reviewed bytes/);
+});
 async function fixture(t: TestContext, link: "committed" | "missing" | "mission-side" | "both-uncommitted" = "committed") {
 	const root = await mkdtemp(path.join(os.tmpdir(), "local-interrupted-review-"));
 	t.after(() => rm(root, { recursive: true, force: true }));

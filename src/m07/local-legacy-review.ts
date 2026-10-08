@@ -1,18 +1,16 @@
 /** Host-side checks for a narrowly reviewed pre-lineage serial dispatch.
  * Operator effect classifications are explicit in the receipt and pinned to
  * every retained tool record. Missing records or uncertain effects fail closed. */
-import { execFile } from "node:child_process";
 import { constants } from "node:fs";
 import { lstat, open, readdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
+import { gunzipSync } from "node:zlib";
 import type { Workspace } from "../workspace.ts";
 import type { CurrentGoal, M07TaskRecord } from "./types.ts";
 import type { ToolCallRecord } from "../runner/types.ts";
 import { localLineageHash } from "./local-dispatch-lineage.ts";
 
-const exec = promisify(execFile);
 const exact = (value: unknown, keys: string[]): value is Record<string, unknown> =>
 	value !== null && typeof value === "object" && !Array.isArray(value) &&
 	Object.keys(value).sort().join("|") === keys.sort().join("|");
@@ -29,6 +27,12 @@ const serialBlobs = [
 	["src/runner/pi.ts", "ba7483c2f32d1576c8e5bc423574d5f21ebdfe125925be6946867cde0fed1bb0"],
 ] as const;
 export const LEGACY_SERIAL_AUDIT_SHA256 = localLineageHash(JSON.stringify(serialBlobs));
+/** An exact copy of the eight public source files used in the one reviewed
+ * pre-lineage run. It lets a shallow or offline checkout verify those bytes
+ * without fetching an older Git commit. The commit/tree are historical
+ * locators; the pinned archive and per-file hashes are the byte authority. */
+const LEGACY_SERIAL_ARCHIVE_SHA256 = "6318f987462d2f93aa90bef84c36ea01e53709067a71c607d89a1c3a9e5b2795";
+const LEGACY_SERIAL_ARCHIVE_BYTES = 173621;
 export interface LegacyEffectReviewV1 {
 	version: 1; kind: "local-legacy-effect-review";
 	source: { commit: string; tree: string; serialEntryAuditSha256: string };
@@ -59,15 +63,32 @@ async function bytes(file: string): Promise<Buffer> {
 		return value;
 	} finally { await handle.close(); }
 }
-export async function verifyLegacySerialSource(): Promise<void> {
-	const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-	const tree = (await exec("git", ["-C", repo, "rev-parse", `${LEGACY_SERIAL_COMMIT}^{tree}`],
-		{ timeout: 5000 })).stdout.trim();
-	if (tree !== LEGACY_SERIAL_TREE) throw new Error("legacy serial source tree differs from reviewed commit");
-	for (const [file, expected] of serialBlobs) {
-		const blob = (await exec("git", ["-C", repo, "show", `${LEGACY_SERIAL_COMMIT}:${file}`],
-			{ timeout: 5000, maxBuffer: 8 * 1024 * 1024 })).stdout;
-		if (localLineageHash(blob) !== expected)
+export async function verifyLegacySerialSource(archiveFile = path.join(
+	path.dirname(fileURLToPath(import.meta.url)), "legacy-reviewed-serial-source-v1.json.gz")): Promise<void> {
+	const handle = await open(archiveFile, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+	let archive: Buffer;
+	try {
+		const st = await handle.stat();
+		if (!st.isFile() || st.nlink !== 1 || st.size !== LEGACY_SERIAL_ARCHIVE_BYTES)
+			throw new Error("legacy serial source archive has the wrong physical identity");
+		archive = await handle.readFile();
+	} finally { await handle.close(); }
+	if (archive.length !== LEGACY_SERIAL_ARCHIVE_BYTES ||
+		localLineageHash(archive) !== LEGACY_SERIAL_ARCHIVE_SHA256)
+		throw new Error("legacy serial source archive differs from reviewed bytes");
+	const value: unknown = JSON.parse(gunzipSync(archive).toString("utf8"));
+	if (!exact(value, ["version", "kind", "commit", "tree", "files"]) ||
+		value.version !== 1 || value.kind !== "legacy-reviewed-serial-source" ||
+		value.commit !== LEGACY_SERIAL_COMMIT || value.tree !== LEGACY_SERIAL_TREE ||
+		!Array.isArray(value.files) || value.files.length !== serialBlobs.length)
+		throw new Error("legacy serial source manifest differs from reviewed source");
+	for (const [index, [file, expected]] of serialBlobs.entries()) {
+		const entry: unknown = value.files[index];
+		if (!exact(entry, ["path", "sha256", "base64"]) || entry.path !== file ||
+			entry.sha256 !== expected || typeof entry.base64 !== "string")
+			throw new Error("legacy serial source file identity differs from reviewed source");
+		const blob = Buffer.from(entry.base64, "base64");
+		if (blob.toString("base64") !== entry.base64 || localLineageHash(blob) !== expected)
 			throw new Error("legacy serial source blob differs from reviewed code");
 	}
 }
