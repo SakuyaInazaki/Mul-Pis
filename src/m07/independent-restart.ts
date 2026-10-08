@@ -10,7 +10,7 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import type { ObjectiveProgressV1 } from "./objective-progress.ts";
-import { validUnobservedControlDelivery, type UnobservedControlDelivery } from "../runner/ledger-continuation.ts";
+import { validUnobservedControlDelivery, type UnobservedControlDelivery } from "../runner/mission-state.ts";
 
 const sha256 = (value: string): string => createHash("sha256").update(value).digest("hex");
 const digest = (value: unknown): string => sha256(JSON.stringify(value));

@@ -30,6 +30,8 @@ import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_RE
 	MISSION_TOTAL_CNY, PRIVATE_CONTINUATION_FILE_KEYS } from "./signed-mission-ledger.ts";
 import type { BootstrapBinding, PrivateContinuationBundle } from "./signed-mission-ledger.ts";
 import { reconcileHistoricalResearchEntries } from "./research-history-reconciliation.ts";
+import { validUnobservedControlDelivery, type UnobservedControlDelivery } from "./mission-state.ts";
+export { validUnobservedControlDelivery, type UnobservedControlDelivery } from "./mission-state.ts";
 
 /** Keep seed, derived key, ledger bookkeeping and raw carry plaintext host-only.
  * Verified restored research files may enter a separately authorized, confined
@@ -232,13 +234,6 @@ export type OpaqueExecutedRunGap = ResultBackedOpaqueExecutedRunGap |
 /** A control ref was accepted, but no Action for its exact commit was visible
  * when a linked successor was admitted. Absence of a run is only an observation
  * at admission: effects and charges remain UNKNOWN, including a late run. */
-export type UnobservedControlDelivery = Readonly<{
-	version: 1; kind: "unobserved-control-delivery";
-	controlCommit: string; testedSourceCommit: string; testedSourceTree: string;
-	previousControlParent: string | null; admittedBy: Readonly<Source>;
-	observedRunsAtAdmission: 0; effects: "unknown-unreconciled";
-	accounting: "unquantified";
-}>;
 export type LateControlPreproviderDisposition = Readonly<{
 	version: 1; kind: "late-control-preprovider-failure"; controlCommit: string;
 	source: Readonly<Source>; reconciledBy: Readonly<Source>;
@@ -1385,24 +1380,6 @@ function accountingAncestorReceipt(cp: AccountingCheckpoint, envelopeDigest: str
 			lateControlCount: cp.lateControlPreproviderDispositions.length,
 			lateControlDigest: digest(JSON.stringify(cp.lateControlPreproviderDispositions)) } : {}),
 		...(cp.bootstrapBinding ? { bootstrapBinding: cp.bootstrapBinding } : {}) };
-}
-export function validUnobservedControlDelivery(value: unknown): value is UnobservedControlDelivery {
-	return record(value) && exactKeys(value, ["version", "kind", "controlCommit",
-		"testedSourceCommit", "testedSourceTree", "previousControlParent", "admittedBy",
-		"observedRunsAtAdmission", "effects", "accounting"]) &&
-		value.version === 1 && value.kind === "unobserved-control-delivery" &&
-		[value.controlCommit, value.testedSourceCommit, value.testedSourceTree].every(item =>
-			typeof item === "string" && /^[0-9a-f]{40}$/.test(item)) &&
-		(value.previousControlParent === null ||
-			(typeof value.previousControlParent === "string" && /^[0-9a-f]{40}$/.test(value.previousControlParent))) &&
-		record(value.admittedBy) && exactKeys(value.admittedBy,
-			["runId", "runAttempt", "runNumber", "commit"]) &&
-		positiveId(value.admittedBy.runId) && Number.isSafeInteger(value.admittedBy.runAttempt) &&
-		Number(value.admittedBy.runAttempt) > 0 && Number.isSafeInteger(value.admittedBy.runNumber) &&
-		Number(value.admittedBy.runNumber) > 0 && typeof value.admittedBy.commit === "string" &&
-		/^[0-9a-f]{40}$/.test(value.admittedBy.commit) &&
-		value.observedRunsAtAdmission === 0 && value.effects === "unknown-unreconciled" &&
-		value.accounting === "unquantified";
 }
 function validLateControlPreproviderDisposition(value: unknown): value is LateControlPreproviderDisposition {
 	return record(value) && exactKeys(value, ["version", "kind", "controlCommit", "source",

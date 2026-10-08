@@ -27,9 +27,28 @@ test("extension registration is inert and exposes bounded tools", async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-extension-"));
 	const service = new ResearchService({ defaultWorkspace: root });
 	const registered = captureExtension(service);
-	assert.deepEqual([...registered.tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_review", "research_stage", "research_status"]);
+	assert.deepEqual([...registered.tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_mission", "research_review", "research_stage", "research_status"]);
 	assert.equal(registered.commands.has("research"), true);
 	assert.equal((await service.status(root)).initialized, false);
+});
+
+test("research_mission routes local controls and returns only a compact status", async () => {
+	const calls: string[] = [];
+	const progress = { contract: { id: "local-id", goal: "private original goal" },
+		objectiveOutcome: "incomplete", stopReason: "next-task-pending", boundedRuns: [],
+		continuation: { unresolvedOperationIds: ["private-operation"],
+			pendingAction: { kind: "reconcile-m07-operation", safety: "no-replay-until-reconciled" } } };
+	const service = { missionStatus: async (id: string) => { calls.push(`status:${id}`); return progress; },
+		missionStart: async () => { calls.push("start"); return progress; },
+		missionAdvance: async (action: string, id: string) => { calls.push(`${action}:${id}`); return progress; } } as unknown as ResearchService;
+	const tool = captureExtension(service).tools.get("research_mission")!;
+	const status = JSON.stringify(await tool.execute("status", { action: "status", missionId: "local-id" },
+		undefined, undefined, toolContext("/workspace")));
+	assert.match(status, /reconcile-m07-operation/);
+	assert.doesNotMatch(status, /private original goal|private-operation/);
+	await tool.execute("step", { action: "step", missionId: "local-id" },
+		undefined, undefined, toolContext("/workspace"));
+	assert.deepEqual(calls, ["status:local-id", "step:local-id"]);
 });
 
 test("research_improve exposes the separate bounded run, status and rollback actions", async () => {
@@ -329,7 +348,7 @@ test("Pi DefaultResourceLoader loads the inline extension without prompting or n
 	const loaded = loader.getExtensions();
 	assert.equal(loaded.errors.length, 0);
 	assert.equal(loaded.extensions.length, 1);
-	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_review", "research_stage", "research_status"]);
+	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_mission", "research_review", "research_stage", "research_status"]);
 });
 
 test("Pi DefaultResourceLoader loads the actual extensions/research.ts entrypoint", async () => {
@@ -345,7 +364,7 @@ test("Pi DefaultResourceLoader loads the actual extensions/research.ts entrypoin
 	const loaded = loader.getExtensions();
 	assert.equal(loaded.errors.length, 0);
 	assert.equal(loaded.extensions.length, 1);
-	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_review", "research_stage", "research_status"]);
+	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_mission", "research_review", "research_stage", "research_status"]);
 });
 
 test("research_delegate accepts exact expected output path strings", async () => {

@@ -399,6 +399,30 @@ test("execution grants only requested native tools at the execution cwd and logs
 	await assert.rejects(runner.resume(handle.ref), /cannot be resumed/);
 });
 
+test("local execution bash does not inherit model process credentials", async t => {
+	const persistDir = await fixture(t);
+	const executionRoot = path.join(persistDir, "execution");
+	await mkdir(executionRoot);
+	const key = "MULPIS_LOCAL_MISSION_SECRET_CANARY";
+	const before = process.env[key];
+	process.env[key] = "synthetic-private-value";
+	try {
+		const stub = stubFactory();
+		const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME,
+			createSession: stub.factory });
+		await runner.create(spec(persistDir, { tools: { kind: "execution",
+			root: executionRoot, tools: ["bash"] } }));
+		const bash = stub.calls[0].customTools?.find(tool => tool.name === "bash");
+		assert(bash);
+		const output = await bash.execute("canary", { command: "env" }, undefined,
+			undefined, { cwd: executionRoot } as never);
+		assert.doesNotMatch(JSON.stringify(output), /MULPIS_LOCAL_MISSION_SECRET_CANARY|synthetic-private-value/);
+	} finally {
+		if (before === undefined) delete process.env[key];
+		else process.env[key] = before;
+	}
+});
+
 test("confined custom tool logs prove full UTF-8 reads without logging contents or write arguments", async t => {
 	const persistDir = await fixture(t);
 	const work = path.join(persistDir, "confined-work");

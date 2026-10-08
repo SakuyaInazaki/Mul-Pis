@@ -34,6 +34,7 @@ function result(value: unknown): ToolResult {
 function compact(value: unknown): Record<string, unknown> {
 	if (!value || typeof value !== "object") return { value };
 	const item = value as Record<string, unknown>;
+	if ("missionId" in item && "objectiveOutcome" in item) return item;
 	if ("workspace" in item && "stages" in item) return item;
 	if ("activeVersionId" in item && "runs" in item) return {
 		activeVersionId: item.activeVersionId, activeProvenance: item.activeProvenance, previousVersionId: item.previousVersionId, runs: item.runs,
@@ -140,7 +141,7 @@ export interface ResearchExtensionOptions {
 
 export function createResearchExtension(options: ResearchExtensionOptions = {}) {
 	return function researchExtension(pi: ExtensionAPI): void {
-		const orchestrationTools = new Set(["research_status", "research_init", "research_stage", "research_goal", "research_delegate", "research_review", "research_improve", "research_method_improve"]);
+		const orchestrationTools = new Set(["research_status", "research_init", "research_stage", "research_goal", "research_mission", "research_delegate", "research_review", "research_improve", "research_method_improve"]);
 		const inspectionTools = new Set(["read", "grep", "find", "ls"]);
 		let researchActive = false;
 		let activePiCwd: string | undefined;
@@ -543,6 +544,44 @@ mainAgentWatchdog.unref?.();
 					researchActive = true; activePiCwd = ctx.cwd;
 					return result(value);
 				} finally { activeUpdate = undefined; }
+			},
+		});
+
+		pi.registerTool({
+			name: "research_mission",
+			label: "Local Original Objective",
+			description: "Continue a user-authored original research objective already frozen by the local CLI. Each step uses evidence-grounded assessment and bounded M07/M04 work without GitHub Actions.",
+			promptSnippet: "Inspect or advance a locally persisted original objective",
+			promptGuidelines: ["Use the exact mission ID created from the user's original objective file by the local CLI.", "An M07 task or M04 merge does not by itself prove the original objective fulfilled.", "Unresolved external operations require host reconciliation before fresh execution."],
+			parameters: Type.Object({
+				action: Type.Union([Type.Literal("status"), Type.Literal("step"), Type.Literal("run")]),
+				workspace: Type.Optional(Type.String()),
+				missionId: Type.String(),
+			}),
+			executionMode: "sequential",
+			async execute(_id, params, signal, onUpdate, ctx) {
+				const workspace = workspaceFrom(params.workspace, ctx.cwd);
+				if (continuationEnabled(ctx) && params.action !== "status")
+					throw new Error("The bound M07 continuation must settle before starting a separate local mission action.");
+				let value: unknown;
+				if (params.action === "status") {
+					value = await service.missionStatus(params.missionId, workspace);
+				} else {
+					activeUpdate = onUpdate as typeof activeUpdate;
+					try {
+						value = await service.missionAdvance(params.action, params.missionId, workspace, signal);
+					} finally { activeUpdate = undefined; }
+					researchActive = true; activePiCwd = ctx.cwd;
+				}
+				const checkpoint = value as { contract?: { id?: unknown }; objectiveOutcome?: unknown;
+					stopReason?: unknown; boundedRuns?: unknown[]; continuation?: { unresolvedOperationIds?: unknown[];
+					pendingAction?: { kind?: unknown; safety?: unknown } } };
+				return result({ missionId: checkpoint.contract?.id, objectiveOutcome: checkpoint.objectiveOutcome,
+					stopReason: checkpoint.stopReason, boundedRunCount: checkpoint.boundedRuns?.length ?? 0,
+					unresolvedOperationCount: checkpoint.continuation?.unresolvedOperationIds?.length ?? 0,
+					pendingAction: checkpoint.continuation?.pendingAction ? {
+						kind: checkpoint.continuation.pendingAction.kind,
+						safety: checkpoint.continuation.pendingAction.safety } : undefined });
 			},
 		});
 

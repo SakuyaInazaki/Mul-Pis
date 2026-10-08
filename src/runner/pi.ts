@@ -528,7 +528,7 @@ async function createExecutionTools(
 	const readCoverage = new Set<string>();
 	const tools = names.map((name) => {
 		// The model-bearing parent's credential environment must not reach a
-		// campaign bash child. This is environment hygiene, not an OS sandbox.
+		// bash child. This is environment hygiene, not an OS sandbox.
 		const base = (name === "bash" && isolatedToolEnvironment
 			? createBashToolDefinition(cwd, {
 				exposeSessionEnvironment: false,
@@ -1197,7 +1197,7 @@ export class PiSessionRunner implements SessionRunner {
 			const definitions = customToolsToPi(spec.tools.tools, toolLog);
 			materialTools = { tools: definitions, names: definitions.map((d) => d.name), readCoverage: new Set(), readReturns: [] };
 		} else if (spec.tools.kind === "execution") {
-			const execution = await createExecutionTools(spec.tools.root, spec.tools.tools, toolLog, Boolean(campaign));
+			const execution = await createExecutionTools(spec.tools.root, spec.tools.tools, toolLog, true);
 			materialTools = execution;
 			sessionCwd = execution.cwd;
 		}

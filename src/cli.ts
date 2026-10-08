@@ -24,6 +24,9 @@
  *   status                       runs, snapshot, limits
  *   goal status|delegate|select-branch|reconcile|recover|successor
  *                                inspect or control one M07 goal; delegate accepts --task <json>
+ *   mission start [--original <json>]  freeze workspace problem.md or structured user objective
+ *   mission run|resume|status --mission <id>
+ *                                run or inspect one local mission without a GitHub control ref
  *   improve run|status|rollback|export|bind  run a bounded campaign (--plan <json>) or manage a budget method
  *   knowledge pack --purpose <text> [--ids C001,K002] [--terms a,b]
  *   knowledge views              regenerate derived views
@@ -56,6 +59,8 @@ import type { ResearchCampaignPlanV1 } from "./improvement/research-types.ts";
 import { publicResearchRun, publicResearchStatus } from "./improvement/research-public.ts";
 import type { KnowledgeRef } from "./knowledge/types.ts";
 import { createM07Controller } from "./m07/controller.ts";
+import { publicLocalMissionStatus, validateLocalObjectiveRequest } from "./m07/local-original-objective.ts";
+import { openDefaultLocalMission } from "./m07/local-mission.ts";
 import { summarizeGoalExecution } from "./m07/status.ts";
 import type { CurrentGoal, TaskSpecInput } from "./m07/types.ts";
 import type { RunDescriptorV1 } from "./runtime/run-descriptor.ts";
@@ -111,7 +116,7 @@ async function makeRunner(kind: string): Promise<SessionRunner> {
 }
 
 function usage(): string {
-	return `用法：node src/cli.ts <init|m01|m02|m03|m04|m05|m06|m08|m09|status|knowledge|improve|goal> [选项]\n  --workspace <dir>   工作区（默认当前目录）\n  --runner pi|fake    会话运行器（默认 pi）\n  goal status --run <id>：只显示控制摘要，不输出原始会话或 toolLog\n  goal delegate --run <id> --task <json> [--runner pi|fake]：执行有界任务；fork 须在 task.context 中给出 mode=fork、同一 parentRunId、parentTaskId、checkpointId，并保持原 objective/inputs/outputs/checks 等义务\n  goal select-branch --run <id> --parent-task <T-id> --rationale <text> [--selected-task <T-id>]：选择已评审接受的候选；省略 selected-task 即明确不选\n  goal reconcile --run <id> --operation <id> --evidence <json>；recover --run <id> --attempt <old-id> --descriptor <new-pi-json>；successor --run <id> --descriptor <new-pi-json>\n  improve run|status|rollback|export|bind（旧预算机制实验；run 必须给 --plan <json>）\n  improve research bootstrap --methods <json>；run --plan <json>；workflow run --plan <json>；status|rollback|export|bind\n  research run 研究 CPU H/I；workflow run 显式研究 M07 evidence-handoff 单槽，缺独立 G 时仅留档\n  m08 的 materials/self-checks/reviewers 是显式 JSON 文件\n  m09 的 delivery-scope/reproduction 是显式 JSON 文件；instructions 是预授权的精确 shell 命令，read-only 时应为空；不会自动发布\n详见 src/cli.ts 顶部说明。`;
+	return `用法：node src/cli.ts <init|m01|m02|m03|m04|m05|m06|m08|m09|status|knowledge|improve|goal|mission> [选项]\n  --workspace <dir>   工作区（默认当前目录）\n  --runner pi|fake    会话运行器（默认 pi）\n  mission start [--original <json>]：默认固定工作区 problem.md 原文作为开放目标；JSON 可给出明确义务和有限收口条件\n  mission run|resume|status --mission <id>：执行、继续或只查看一项本地任务；无需 GitHub 参数\n  goal status --run <id>：只显示控制摘要，不输出原始会话或 toolLog\n  goal delegate --run <id> --task <json> [--runner pi|fake]：执行有界任务；fork 须在 task.context 中给出 mode=fork、同一 parentRunId、parentTaskId、checkpointId，并保持原 objective/inputs/outputs/checks 等义务\n  goal select-branch --run <id> --parent-task <T-id> --rationale <text> [--selected-task <T-id>]：选择已评审接受的候选；省略 selected-task 即明确不选\n  goal reconcile --run <id> --operation <id> --evidence <json>；recover --run <id> --attempt <old-id> --descriptor <new-pi-json>；successor --run <id> --descriptor <new-pi-json>\n  improve run|status|rollback|export|bind（旧预算机制实验；run 必须给 --plan <json>）\n  improve research bootstrap --methods <json>；run --plan <json>；workflow run --plan <json>；status|rollback|export|bind\n  research run 研究 CPU H/I；workflow run 显式研究 M07 evidence-handoff 单槽，缺独立 G 时仅留档\n  m08 的 materials/self-checks/reviewers 是显式 JSON 文件\n  m09 的 delivery-scope/reproduction 是显式 JSON 文件；instructions 是预授权的精确 shell 命令，read-only 时应为空；不会自动发布\n详见 src/cli.ts 顶部说明。`;
 }
 
 function publicGoal(goal: CurrentGoal): Record<string, unknown> {
@@ -131,6 +136,19 @@ function publicGoal(goal: CurrentGoal): Record<string, unknown> {
 
 function strictFlags(args: ParsedArgs, names: string[], counts: number[] = [2]): void {
 	if (!counts.includes(args.positional.length) || [...args.flags].some(([name, values]) => !names.includes(name) || values.length !== 1 || !values[0]?.trim())) throw new HarnessError("cli.goal", "goal 子命令包含多余、重复或空参数");
+}
+
+function missionFlags(args: ParsedArgs, action: string): void {
+	const names = action === "start" ? ["workspace", "runner", "original"] :
+		action === "status" ? ["workspace", "mission"] : ["workspace", "runner", "mission"];
+	if (args.positional.length !== 2 ||
+		!["start", "run", "resume", "status"].includes(action) ||
+		[...args.flags].some(([name, values]) => !names.includes(name) ||
+			values.length !== 1 || !values[0]?.trim()) ||
+		(action !== "start" && !flag(args, "mission")))
+		throw new HarnessError("cli.mission", "mission 需要 start [--original <json>] 或 run|resume|status --mission <id>；不接受多余或重复参数");
+	if (action !== "status" && !["pi", "fake"].includes(flag(args, "runner") ?? "pi"))
+		throw new HarnessError("cli.mission", "mission 的 --runner 仅可为 pi 或 fake");
 }
 
 function taskSpec(value: unknown, runId: string): TaskSpecInput {
@@ -197,6 +215,32 @@ export async function main(argv: string[]): Promise<number> {
 			}
 		}
 		console.log("限制：running 状态不会自动重跑；M08 completed 不等于科研通过；M09 不发布或关闭 Pi，full-recomputation 请求不等于已完整复现。");
+		return 0;
+	}
+	if (command === "mission") {
+		const action = args.positional[1] ?? "";
+		missionFlags(args, action);
+		if (action === "status") {
+			const host = openDefaultLocalMission({ workspaceRoot: ws.root });
+			console.log(JSON.stringify(publicLocalMissionStatus(await host.status(flag(args, "mission")!)), null, 2));
+			return 0;
+		}
+		const request = action === "start" ? flag(args, "original") ?
+			validateLocalObjectiveRequest(await jsonFile<unknown>(args, "original")) :
+			validateLocalObjectiveRequest({ version: 1, kind: "local-original-objective-request",
+				goal: (await ws.readProblem()).content, goalSource: "verbatim-private-input",
+				obligations: [{ id: "original-task", description: (await ws.readProblem()).content }],
+				closure: "open-ended" }) : undefined;
+		const host = openDefaultLocalMission({ workspaceRoot: ws.root,
+			runner: await makeRunner(flag(args, "runner") ?? "pi"), config: await ws.loadConfig() });
+		if (action === "start") {
+			const progress = await host.begin(request!);
+			console.log(JSON.stringify({ missionId: progress.contract.id }, null, 2));
+			return 0;
+		}
+		const missionId = flag(args, "mission")!;
+		const progress = action === "run" ? await host.run(missionId) : await host.step(missionId);
+		console.log(JSON.stringify(publicLocalMissionStatus(progress), null, 2));
 		return 0;
 	}
 	if (command === "improve") {

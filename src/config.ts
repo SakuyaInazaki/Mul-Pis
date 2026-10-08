@@ -82,7 +82,17 @@ export function validateConfig(input: unknown): HarnessConfig {
 		}
 		concurrency = obj.concurrency;
 	}
-	return { roles, ...(m03Reviewers ? { m03Reviewers } : {}), concurrency, tools };
+	let localMission: HarnessConfig["localMission"];
+	if (obj.localMission !== undefined) {
+		const policy = obj.localMission;
+		if (!policy || typeof policy !== "object" || Array.isArray(policy) ||
+			Object.keys(policy).sort().join("|") !== "execution" ||
+			(policy as { execution?: unknown }).execution !== "task-root-bash")
+			throw new HarnessError("config.local-mission", "localMission.execution must explicitly be task-root-bash");
+		localMission = { execution: "task-root-bash" };
+	}
+	return { roles, ...(m03Reviewers ? { m03Reviewers } : {}),
+		...(localMission ? { localMission } : {}), concurrency, tools };
 }
 
 export async function loadConfig(path: string): Promise<HarnessConfig> {

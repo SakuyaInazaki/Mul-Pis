@@ -22,6 +22,7 @@ import { HarnessError, type StageRunRecord } from "../types.ts";
 import { failureSignature, RetryGuard, stageFingerprint, stageInputVersion, thrownSignature } from "./retry-guard.ts";
 import { Workspace } from "../workspace.ts";
 import { readTrustedPauseMs } from "../runtime/run-descriptor.ts";
+import { openDefaultLocalMission } from "../m07/local-mission.ts";
 
 export type ResearchStage = "M01" | "M02" | "M03" | "M04" | "M05" | "M06" | "M07" | "M08" | "M09";
 export type RunnableStage = Exclude<ResearchStage, "M07">;
@@ -472,6 +473,21 @@ export class ResearchService {
 			resume: async () => { throw new HarnessError("m07.runner", "status 不运行会话"); },
 		};
 		return createM07Controller({ ws, store, runner: unavailable, config: { roles: {}, concurrency: 1, tools: {} } }).status(runId);
+	}
+
+	/** Local original-objective control uses the same workspace and Pi runner as M07. */
+	async missionStatus(missionId: string, requested?: string): Promise<unknown> {
+		return openDefaultLocalMission({ workspaceRoot: this.resolveWorkspace(requested) }).status(missionId);
+	}
+
+	async missionAdvance(action: "step" | "run", missionId: string, requested?: string,
+		signal?: AbortSignal): Promise<unknown> {
+		const root = this.resolveWorkspace(requested);
+		return this.withMutation(root, async () => {
+			const ctx = await this.stageContext(root, "M07", signal);
+			const mission = openDefaultLocalMission({ workspaceRoot: root, runner: ctx.runner, config: ctx.config });
+			return action === "step" ? mission.step(missionId) : mission.run(missionId);
+		}, "M07");
 	}
 
 	async goalAction(action: "begin" | "plan" | "checkpoint" | "decision" | "finish" | "interrupt" | "select-branch", requested: string | undefined, input: BeginGoalInput | { runId: string; plan: string; refreshBaseline?: boolean; checkpointId?: string; m04RunId?: string } | { runId: string; taskIds?: string[] } | ({ runId: string } & DecisionInput) | ({ runId: string } & FinishInput) | ({ runId: string } & InterruptInput) | { runId: string; parentTaskId: string; selectedTaskId?: string; rationale: string }, signal?: AbortSignal, authority?: { executionContract: "continuous" }): Promise<unknown> {
