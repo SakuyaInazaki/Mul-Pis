@@ -9,9 +9,10 @@ import { DeepSeekCampaignBudget } from "../../src/runner/deepseek-campaign.ts";
 import { verifyDeepSeekProviderOutputLimit } from "../../src/runner/deepseek-provider-limits.ts";
 import { PiSessionRunner } from "../../src/runner/pi.ts";
 
-const WINDOW = 128;
+// Leave room for Pi 0.85.1's 4096-token context safety reserve in this retry fixture.
+const WINDOW = 8192;
 const MAX = 64;
-const MESSAGES = 90;
+const MESSAGES = WINDOW - 38;
 const CORRECTED = WINDOW - MESSAGES;
 const KEY = "sk-SYNTHETIC-CONTEXT-RETRY";
 const MODEL = {
@@ -22,8 +23,9 @@ const MODEL = {
 	compat: { supportsStore: false, supportsDeveloperRole: false, maxTokensField: "max_tokens", thinkingFormat: "deepseek" },
 } as Model<"openai-completions">;
 
-function rejection(messages: number, completion = MAX, requested = messages + completion): Response {
-	const message = `This model's maximum context length is ${WINDOW} tokens. However, you requested ${requested} tokens (${messages} in the messages, ${completion} in the completion). Please reduce the length of the messages or completion.`;
+function rejection(messages: number, completion = MAX, requested = messages + completion,
+	window = WINDOW): Response {
+	const message = `This model's maximum context length is ${window} tokens. However, you requested ${requested} tokens (${messages} in the messages, ${completion} in the completion). Please reduce the length of the messages or completion.`;
 	return new Response(JSON.stringify({ error: { type: "invalid_request_error", code: "context_length_exceeded", message } }),
 		{ status: 400, headers: { "content-type": "application/json" } });
 }
@@ -37,7 +39,7 @@ function completion(): Response {
 }
 
 async function scenario(t: TestContext, first: () => Response,
-	allowSuccess: boolean) {
+	allowSuccess: boolean, model: Model<"openai-completions"> = MODEL) {
 	const dir = await mkdtemp(path.join(tmpdir(), "pi-context-retry-"));
 	const originalFetch = globalThis.fetch;
 	const calls: Array<{ raw: string; payload: Record<string, unknown> }> = [];
@@ -50,7 +52,7 @@ async function scenario(t: TestContext, first: () => Response,
 	});
 	const profile = path.join(dir, "profile"), sessions = path.join(dir, "sessions");
 	await Promise.all([mkdir(profile), mkdir(sessions)]);
-	await writeFile(path.join(profile, "models.json"), JSON.stringify({ providers: { deepseek: { models: [MODEL] } } }));
+	await writeFile(path.join(profile, "models.json"), JSON.stringify({ providers: { deepseek: { models: [model] } } }));
 	const runtime = await ModelRuntime.create({ modelsPath: path.join(profile, "models.json"),
 		authPath: path.join(profile, "auth.json"), modelsStorePath: path.join(profile, "models-store.json"),
 		allowModelNetwork: false, refreshOnCreate: false });
@@ -58,7 +60,7 @@ async function scenario(t: TestContext, first: () => Response,
 	const provider = await verifyDeepSeekProviderOutputLimit({ apiKey: KEY,
 		request: async () => new Response(JSON.stringify({ object: "list", data: [{ id: MODEL.id,
 			object: "model", name: "DeepSeek-V4.1-Flash", max_output_tokens: MAX,
-			context_window: WINDOW }] }), { status: 200 }) });
+			context_window: model.contextWindow }] }), { status: 200 }) });
 	const budget = new DeepSeekCampaignBudget({ model: "deepseek/deepseek-flash:low",
 		endpoint: "https://api.deepseek.com", providerOutputLimit: provider,
 		outputAccountingMarginTokens: 0 });
@@ -85,6 +87,23 @@ async function scenario(t: TestContext, first: () => Response,
 	});
 	return { calls, budget, handle, sessions, unrelatedFetches: () => unrelatedFetches };
 }
+
+test("real Pi context clamp is observed and exhausted context remains incomplete", async t => {
+	const smallWindow = 128;
+	const model = { ...MODEL, contextWindow: smallWindow };
+	const run = await scenario(t, () => rejection(smallWindow, 1, smallWindow + 1, smallWindow), false, model);
+	await assert.rejects(run.handle.prompt("synthetic request"), /provider request failed/);
+	assert.equal(run.calls.length, 1);
+	assert.equal(run.calls[0].payload.max_tokens, 1);
+	assert.deepEqual(run.handle.providerOutputRequests?.(), [{ resolvedMaxTokens: MAX,
+		outputField: "max_tokens", outgoingMaxTokens: 1 }]);
+	const audit = run.budget.requestAccountingAuditSnapshot();
+	assert.equal(audit.requests.length, 1);
+	assert.equal(audit.requests[0].maxOutputTokens, 1);
+	assert.equal(audit.requests[0].status, "unknown");
+	assert.equal(audit.requests[0].reportedUsage, null);
+	assert.equal(run.handle.transportDiagnostics?.()[0]?.responseStarted, true);
+});
 
 test("real Pi retries an exact provider context rejection with only the output cap reduced", async t => {
 	const run = await scenario(t, () => rejection(MESSAGES), true);
@@ -119,6 +138,19 @@ test("real Pi retries an exact provider context rejection with only the output c
 	assert.equal(run.unrelatedFetches(), 0);
 	const usage = await readFile(run.handle.ref.file!.replace(/\.jsonl$/, ".usage.jsonl"), "utf8");
 	assert.deepEqual(JSON.parse(usage.trim()).requestIds, audit.requests.map(r => r.requestId));
+});
+
+test("context retry preserves Pi's alternate output field", async t => {
+	const model = { ...MODEL, compat: { ...MODEL.compat, maxTokensField: "max_completion_tokens" as const } };
+	const run = await scenario(t, () => rejection(MESSAGES), true, model);
+	await run.handle.prompt("synthetic request");
+	assert.equal(run.calls.length, 2);
+	assert.equal(run.calls[0].payload.max_completion_tokens, MAX);
+	assert.equal(run.calls[1].payload.max_completion_tokens, CORRECTED);
+	assert.equal(run.calls[0].payload.max_tokens, undefined);
+	assert.equal(run.calls[1].payload.max_tokens, undefined);
+	assert.deepEqual(run.budget.requestAccountingAuditSnapshot().requests.map(r => r.outputTokenField),
+		["max_completion_tokens", "max_completion_tokens"]);
 });
 
 for (const [label, first] of [

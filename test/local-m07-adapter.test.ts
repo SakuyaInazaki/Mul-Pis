@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { createM07Controller } from "../src/m07/controller.ts";
+import { goalLineageFile, localLineageHash, missionLineageFile,
+	readLocalDispatchLineage, recordLocalDispatchLineage,
+	type LocalDispatchLineageV1 } from "../src/m07/local-dispatch-lineage.ts";
 import { createLocalM07Adapter, createLocalM07Adapters, LOCAL_M07_EXECUTE_SCOPE,
 	LOCAL_M07_MISSION_BINDING_PREFIX, LOCAL_M07_REASON_SCOPE } from "../src/m07/local-m07-adapter.ts";
 import type { LocalObjectiveFrozenEvidence } from "../src/m07/local-original-objective.ts";
@@ -227,4 +230,67 @@ test("execute rechecks workspace policy immediately before task delegation", asy
 		task: { ...f.task, adapterScope: LOCAL_M07_EXECUTE_SCOPE } }), /task-root-bash opt-in/);
 	assert.equal((await f.ws.listRuns("M07")).length, 1);
 	assert.equal(f.runner.created.some(spec => spec.label.startsWith("M07-")), false);
+});
+
+test("lineage hook runs after durable task allocation and before any runner session", async t => {
+	const f = await fixture(t);
+	f.ctx.config.localMission = { execution: "task-root-bash" };
+	const frozen = { ...f.frozen, capabilities: [...f.frozen.capabilities,
+		{ scope: LOCAL_M07_EXECUTE_SCOPE, available: true,
+			description: "Synthetic task-root tools", limits: [] }] };
+	let called = 0;
+	await assert.rejects(createLocalM07Adapter("execute").advance({ ctx: f.ctx,
+		controller: f.controller, runM04, contract: f.contract, frozen,
+		task: { ...f.task, adapterScope: LOCAL_M07_EXECUTE_SCOPE },
+		recordDispatchLineage: async (runId, taskId) => {
+			called++;
+			const persisted = await f.controller.status(runId);
+			assert.equal(persisted.tasks.length, 1);
+			assert.equal(persisted.tasks[0].taskId, taskId);
+			assert.equal(persisted.tasks[0].status, "running");
+			assert.equal(persisted.tasks[0].session, undefined);
+			assert.deepEqual(persisted.executionState?.operations.map(operation =>
+				({ taskId: operation.taskId, status: operation.status })),
+				[{ taskId, status: "prepared" }]);
+			throw new Error("synthetic lineage failure");
+		} }), /synthetic lineage failure/);
+	assert.equal(called, 1);
+	assert.equal(f.runner.created.length, 0);
+});
+
+test("partial lineage write stops dispatch and retry completes the same edge once", async t => {
+	const f = await fixture(t);
+	const missionRoot = path.join(f.root, "synthetic-mission");
+	const intentId = "synthetic-intent";
+	let lineage: LocalDispatchLineageV1 | undefined;
+	let m07Dir = "";
+	await assert.rejects(createLocalM07Adapter().advance({ ctx: f.ctx,
+		controller: f.controller, runM04, contract: f.contract, frozen: f.frozen,
+		task: f.task, recordDispatchLineage: async (runId, taskId) => {
+			m07Dir = f.ws.runDir("M07", runId);
+			const task = (await f.controller.status(runId)).tasks.find(item => item.taskId === taskId)!;
+			const owner = { hostId: "synthetic-host", bootId: "synthetic-boot",
+				pid: 1, processStartToken: "synthetic-start" };
+			lineage = { version: 1, kind: "local-mission-m07-dispatch-lineage",
+				missionId: f.contract.id, intentId,
+				oldAttempt: { version: 1, missionId: f.contract.id, attemptId: "A001",
+					predecessorAttemptId: null, codeRevision: "synthetic", process: owner },
+				intentCheckpoint: { sequence: 1, sha256: "a".repeat(64) },
+				m07RunId: runId, taskId, assessorTaskSha256: "b".repeat(64),
+				m07TaskInputsSha256: localLineageHash(JSON.stringify(task.inputs)),
+				m07TaskChecksSha256: localLineageHash(JSON.stringify(task.checks)),
+				m07Owner: owner };
+			await mkdir(goalLineageFile(m07Dir));
+			await recordLocalDispatchLineage({ missionRoot, m07Dir, lineage });
+		} }), /EISDIR|directory/);
+	assert.equal(f.runner.created.length, 0);
+	assert.ok(lineage);
+	const firstBytes = await readFile(missionLineageFile(missionRoot, intentId));
+	await rm(goalLineageFile(m07Dir), { recursive: true });
+	await recordLocalDispatchLineage({ missionRoot, m07Dir, lineage });
+	await recordLocalDispatchLineage({ missionRoot, m07Dir, lineage });
+	assert((await readFile(missionLineageFile(missionRoot, intentId))).equals(firstBytes));
+	assert.equal((await readLocalDispatchLineage({ missionRoot, m07Dir, intentId })).lineage.taskId,
+		lineage.taskId);
+	assert.equal((await readdir(path.join(missionRoot, "dispatch-links"))).length, 2);
 });

@@ -493,6 +493,7 @@ export type AccountingOnlyRequestAuditSnapshot = {
 	version: 3; kind: "accounting-only-request-audit";
 	requests: Array<{
 		requestId: string; inputPayloadBytes: number; maxOutputTokens?: number;
+		outputTokenField?: "max_tokens" | "max_completion_tokens" | "both" | "omitted";
 		/** A provider-declined HTTP 400 is still an UNKNOWN invoice observation. */
 		contextRejected?: true;
 		contextOverflow?: NonNullable<TransportFailureDiagnostic["providerContextOverflow"]>;
@@ -834,12 +835,17 @@ function validAudit(value: unknown, settledNano: number, unknownNano: number): v
 		if (!record(item) || !exactKeys(item, ["requestId", "inputPayloadBytes", "reservedCny",
 			"status", "settledCny", "unknownHeldCny", "reportedUsage",
 			...(item.maxOutputTokens === undefined ? [] : ["maxOutputTokens"]),
+			...(item.outputTokenField === undefined ? [] : ["outputTokenField"]),
 			...(item.admissionDecision === undefined ? [] : ["admissionDecision"])]) ||
 			typeof item.requestId !== "string" || item.requestId.length > 128 || !item.requestId ||
 			ids.has(item.requestId) || !Number.isSafeInteger(item.inputPayloadBytes) ||
 			item.inputPayloadBytes <= 0 ||
 			(item.maxOutputTokens !== undefined &&
-				(!Number.isSafeInteger(item.maxOutputTokens) || item.maxOutputTokens < 1)) ||
+				(!Number.isSafeInteger(item.maxOutputTokens) || item.maxOutputTokens < 1 ||
+					(a.providerOutputLimit !== undefined && item.maxOutputTokens > a.providerOutputLimit.maxOutputTokens))) ||
+			(item.outputTokenField !== undefined && item.maxOutputTokens === undefined) ||
+			(item.outputTokenField !== undefined && !["max_tokens", "max_completion_tokens", "both", "omitted"].includes(String(item.outputTokenField))) ||
+			(item.outputTokenField === "omitted" && item.maxOutputTokens !== a.providerOutputLimit?.maxOutputTokens) ||
 			(item.admissionDecision !== undefined && !["full-output", "reduced-output", "provider-maximum"].includes(String(item.admissionDecision))) ||
 			(item.admissionDecision === "provider-maximum" &&
 				(!a.providerOutputLimit || item.maxOutputTokens !== a.providerOutputLimit.maxOutputTokens)) ||
@@ -902,6 +908,7 @@ function validAccountingAudit(value: unknown, settledNano: number, unknownNano: 
 		if (!record(item) || !exactKeys(item, ["requestId", "inputPayloadBytes",
 			"status", "settledCny", "unknownObservedCny", "reportedUsage",
 			...(item.maxOutputTokens === undefined ? [] : ["maxOutputTokens"]),
+			...(item.outputTokenField === undefined ? [] : ["outputTokenField"]),
 			...(item.sessionId === undefined ? [] : ["sessionId"]),
 			...(item.responseReceived === undefined ? [] : ["responseReceived"]),
 			...(item.contextRejected === undefined ? [] : ["contextRejected"]),
@@ -921,6 +928,8 @@ function validAccountingAudit(value: unknown, settledNano: number, unknownNano: 
 			!Number.isSafeInteger(item.inputPayloadBytes) || item.inputPayloadBytes <= 0 ||
 			(item.maxOutputTokens !== undefined &&
 				(!Number.isSafeInteger(item.maxOutputTokens) || item.maxOutputTokens < 1)) ||
+			(item.outputTokenField !== undefined && item.maxOutputTokens === undefined) ||
+			(item.outputTokenField !== undefined && !["max_tokens", "max_completion_tokens", "both", "omitted"].includes(String(item.outputTokenField))) ||
 			!["settled", "unknown", "in-flight"].includes(String(item.status))) return false;
 		ids.add(item.requestId);
 		if (item.contextOverflow !== undefined) {

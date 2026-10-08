@@ -19,11 +19,11 @@ const requestAudit: AccountingOnlyRequestAuditSnapshot = {
 	version: 3, kind: "accounting-only-request-audit",
 	requests: [
 		{ requestId: "rejected-http-400", sessionId: "a".repeat(64), inputPayloadBytes: 240,
-			maxOutputTokens: 64, status: "unknown", responseReceived: true,
+			maxOutputTokens: 64, outputTokenField: "max_tokens", status: "unknown", responseReceived: true,
 			contextRejected: true, contextOverflow: proof,
 			settledCny: null, unknownObservedCny: null, reportedUsage: null },
 		{ requestId: "corrected-retry", sessionId: "a".repeat(64), inputPayloadBytes: 240,
-			maxOutputTokens: 38, retryOfRequestId: "rejected-http-400",
+			maxOutputTokens: 38, outputTokenField: "max_tokens", retryOfRequestId: "rejected-http-400",
 			status: "unknown", responseReceived: true,
 			settledCny: null, unknownObservedCny: null,
 			reportedUsage: { input: 11, output: 3, cacheRead: 0, cacheWrite: 0,
@@ -101,6 +101,7 @@ test("segmented carry authenticates a context-rejected UNKNOWN transport and its
 	};
 	assert.throws(() => seal(altered(a => { a.requests[0].contextOverflow!.requestedTokens = 155; })), /accounting-only carry is invalid/);
 	assert.throws(() => seal(altered(a => { a.requests[1].maxOutputTokens = 37; })), /accounting-only carry is invalid/);
+	assert.throws(() => seal(altered(a => { a.requests[1].outputTokenField = "unsafe" as never; })), /accounting-only carry is invalid/);
 	assert.throws(() => seal(altered(a => { a.requests[1].retryOfRequestId = "missing"; })), /accounting-only carry is invalid/);
 	assert.throws(() => seal(altered(a => { a.requests[1].sessionId = "b".repeat(64); })), /accounting-only carry is invalid/);
 	assert.throws(() => seal(altered(a => {

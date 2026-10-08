@@ -80,6 +80,7 @@ interface RequestState {
 	readonly sessionId: string;
 	readonly inputPayloadBytes: number;
 	readonly maxOutputTokens: number;
+	readonly outputTokenField?: "max_tokens" | "max_completion_tokens" | "both" | "omitted";
 	readonly retryOfRequestId?: string;
 	contextRejection?: ContextWindowRejectionProof;
 	retrySuccessorId?: string;
@@ -104,8 +105,10 @@ export function campaignSessionEffectId(sessionId: string): string {
 /** Host-only accounting evidence. Encrypt before persistence; never log or expose to a model. */
 export interface CampaignRequestAudit {
 	requestId: string; inputPayloadBytes: number; reservedCny: number;
-	/** Absent only in older sealed carry rows. The actual HTTP output cap when present. */
+	/** Actual outgoing cap when stated, or the verified provider maximum when omitted. */
 	maxOutputTokens?: number;
+	/** Final SDK field selection; absent in older records. */
+	outputTokenField?: RequestState["outputTokenField"];
 	status: "reserved" | "settled" | "unknown";
 	settledCny: number | null; unknownHeldCny: number | null;
 	reportedUsage: RequestState["reportedUsage"] | null;
@@ -271,14 +274,18 @@ export class DeepSeekCampaignBudget {
 	}
 
 	/** Called synchronously by onPayload, before the HTTP request can begin. */
-	reserve(lease: PromptLease, payloadBytes: number, providerRequestId: string, maxOutputTokens = this.outputBoundTokens): void {
+	reserve(lease: PromptLease, payloadBytes: number, providerRequestId: string,
+		maxOutputTokens = this.outputBoundTokens, outputTokenField?: RequestState["outputTokenField"]): void {
 		const state = this.leases.get(lease);
 		if (!state?.active || this.stopped || !count(payloadBytes) || !count(maxOutputTokens) ||
-			maxOutputTokens !== this.outputBoundTokens || typeof providerRequestId !== "string" || !providerRequestId) {
+			maxOutputTokens > this.outputBoundTokens ||
+			(outputTokenField !== undefined && !["max_tokens", "max_completion_tokens", "both", "omitted"].includes(outputTokenField)) ||
+			(outputTokenField === "omitted" && maxOutputTokens !== this.outputBoundTokens) ||
+			typeof providerRequestId !== "string" || !providerRequestId) {
 			this.stop("payload-boundary");
 			throw new HarnessError("runner.campaign", "provider payload byte count is unavailable");
 		}
-		this.reserveRequest(lease, state, payloadBytes, providerRequestId, maxOutputTokens);
+		this.reserveRequest(lease, state, payloadBytes, providerRequestId, maxOutputTokens, undefined, outputTokenField);
 	}
 
 	/** A received HTTP 400 is still a transport with unknown invoice exposure. */
@@ -309,7 +316,9 @@ export class DeepSeekCampaignBudget {
 			this.stop("payload-boundary");
 			throw new HarnessError("runner.campaign", "context retry lacks a matching rejected predecessor and exact provider cap");
 		}
-		this.reserveRequest(lease, state, payloadBytes, newRequestId, correctedMax, predecessorRequestId);
+		this.reserveRequest(lease, state, payloadBytes, newRequestId, correctedMax, predecessorRequestId,
+			predecessor.outputTokenField === "both" ? "both" :
+				predecessor.outputTokenField === "max_completion_tokens" ? "max_completion_tokens" : "max_tokens");
 		predecessor.retrySuccessorId = newRequestId;
 	}
 
@@ -334,7 +343,8 @@ export class DeepSeekCampaignBudget {
 	}
 
 	private reserveRequest(lease: PromptLease, state: LeaseState, payloadBytes: number,
-		providerRequestId: string, maxOutputTokens: number, retryOfRequestId?: string): void {
+		providerRequestId: string, maxOutputTokens: number, retryOfRequestId?: string,
+		outputTokenField?: RequestState["outputTokenField"]): void {
 		// Reusing an ID must never authorize another transport attempt for free.
 		if (this.requestIds.has(providerRequestId)) {
 			this.stop("payload-boundary");
@@ -350,7 +360,7 @@ export class DeepSeekCampaignBudget {
 		this.inFlightReservedCny += worstCny;
 		this.requestIds.add(providerRequestId);
 		const request = { id: providerRequestId, sessionId: lease.sessionId, responseReceived: false,
-			inputPayloadBytes: payloadBytes, maxOutputTokens, worstCny,
+			inputPayloadBytes: payloadBytes, maxOutputTokens, ...(outputTokenField ? { outputTokenField } : {}), worstCny,
 			...(retryOfRequestId ? { retryOfRequestId } : {}),
 			nativeCnyVerified,
 			rates: nativeCnyVerified ? { ...this.rates } : { input: 0, cacheRead: 0, output: 0 },
@@ -557,7 +567,8 @@ export class DeepSeekCampaignBudget {
 		return { requests: this.auditRequests.map(request => ({
 			requestId: request.id, inputPayloadBytes: request.inputPayloadBytes,
 			maxOutputTokens: request.maxOutputTokens,
-			admissionDecision: request.retryOfRequestId ? "reduced-output" as const : "provider-maximum" as const,
+			...(request.outputTokenField ? { outputTokenField: request.outputTokenField } : {}),
+			admissionDecision: request.maxOutputTokens < this.outputBoundTokens ? "reduced-output" as const : "provider-maximum" as const,
 			reservedCny: request.worstCny, status: request.status,
 			settledCny: request.settledCny ?? null,
 			unknownHeldCny: request.unknownHeldCny ?? null,
@@ -574,6 +585,7 @@ export class DeepSeekCampaignBudget {
 		version: 3; kind: "accounting-only-request-audit";
 		requests: Array<{ requestId: string; sessionId: string; responseReceived: boolean;
 			inputPayloadBytes: number; maxOutputTokens: number;
+			outputTokenField?: RequestState["outputTokenField"];
 			contextRejected?: true;
 			contextOverflow?: Omit<ContextWindowRejectionProof, "httpStatus">;
 			retryOfRequestId?: string;
@@ -587,6 +599,7 @@ export class DeepSeekCampaignBudget {
 			responseReceived: request.responseReceived,
 			inputPayloadBytes: request.inputPayloadBytes,
 			maxOutputTokens: request.maxOutputTokens,
+			...(request.outputTokenField ? { outputTokenField: request.outputTokenField } : {}),
 			...(request.contextRejection ? { contextRejected: true as const } : {}),
 			...(request.contextRejection ? { contextOverflow: {
 				contextWindow: request.contextRejection.contextWindow,

@@ -284,7 +284,9 @@ export interface M07Controller {
 	status(runId: string): Promise<CurrentGoal>;
 	plan(runId: string, plan: string, options?: { refreshBaseline?: boolean; checkpointId?: string; m04RunId?: string }): Promise<CurrentGoal>;
 	checkpoint(runId: string, options?: { taskIds?: string[] }): Promise<M07CheckpointRecord>;
-	delegate(runId: string, task: TaskSpecInput): Promise<M07TaskRecord>;
+	/** Called after the task and prepared operation are saved, before any runner session starts. */
+	delegate(runId: string, task: TaskSpecInput,
+		afterPrepared?: (runId: string, taskId: string) => Promise<void>): Promise<M07TaskRecord>;
 	/** Select among reviewed candidates. No selection is a valid partial/blocked outcome. */
 	selectBranch(runId: string, input: { parentTaskId: string; selectedTaskId?: string; rationale: string }): Promise<CurrentGoal>;
 	review(runId: string, input: TaskReviewInput): Promise<M07TaskRecord>;

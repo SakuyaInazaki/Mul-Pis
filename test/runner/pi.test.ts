@@ -273,6 +273,89 @@ test("ordinary DeepSeek Pi requests explicitly use the resolved output maximum",
 	handle.dispose();
 });
 
+async function runOfflineDeepSeekPayload(t: TestContext, strict: boolean, fields: Record<string, unknown>,
+	requestModelChange: Record<string, unknown> = {}) {
+	const persistDir = await fixture(t);
+	const model = { ...MODEL, id: "deepseek-flash", provider: "deepseek",
+		api: "openai-completions", baseUrl: "https://api.deepseek.com" } as Model<"openai-completions">;
+	let dispatched = 0;
+	let outgoing: unknown;
+	let requestedMaxTokens: number | undefined;
+	const runtime = { getModels: () => [model],
+		async streamSimple(_model: unknown, _context: unknown, options: { maxTokens?: number;
+			onPayload?: (payload: unknown, model: Model<"openai-completions">) => Promise<unknown> }) {
+			requestedMaxTokens = options.maxTokens;
+			outgoing = await options.onPayload?.({ model: model.id,
+				messages: [{ role: "user", content: "offline" }], ...fields },
+				{ ...model, ...requestModelChange });
+			dispatched++;
+		},
+	} as unknown as ModelRuntime;
+	const stub = stubFactory();
+	const factory = (async (options: CreateAgentSessionOptions = {}) => {
+		const created = await stub.factory(options);
+		const original = created.session.prompt.bind(created.session);
+		(created.session as unknown as { prompt: (text: string) => Promise<void> }).prompt = async text => {
+			await (options.modelRuntime as unknown as { streamSimple: (model: unknown, context: unknown,
+				options: unknown) => Promise<unknown> }).streamSimple(model, { messages: [] }, {});
+			await original(text);
+		};
+		return created;
+	}) as typeof createAgentSession;
+	const handle = await new PiSessionRunner({ modelRuntime: runtime, createSession: factory })
+		.create(spec(persistDir, { model: "deepseek/deepseek-flash",
+			...(strict ? { strictRequest: { maxInputPayloadBytes: 1000 } } : {}) }));
+	let error: unknown;
+	try { await handle.prompt("offline request"); }
+	catch (caught) { error = caught; }
+	const observations = handle.providerOutputRequests?.();
+	handle.dispose();
+	return { error, dispatched, outgoing, requestedMaxTokens, observations, resolvedMaxTokens: model.maxTokens };
+}
+
+for (const strict of [false, true]) {
+	test(`${strict ? "strict" : "ordinary"} DeepSeek request keeps Pi's adjusted or omitted output field`, async t => {
+		for (const [name, fields, outputField, outgoingMaxTokens] of [
+			["context-adjusted max_tokens", { max_tokens: 75 }, "max_tokens", 75],
+			["alternate max_completion_tokens", { max_completion_tokens: 60 }, "max_completion_tokens", 60],
+			["omitted", {}, "omitted", null],
+		] as const) {
+			await t.test(name, async subtest => {
+				const run = await runOfflineDeepSeekPayload(subtest, strict, fields);
+				assert.equal(run.error, undefined);
+				assert.equal(run.dispatched, 1);
+				assert.equal(run.requestedMaxTokens, run.resolvedMaxTokens);
+				assert.deepEqual(run.observations, [{ resolvedMaxTokens: run.resolvedMaxTokens,
+					outputField, outgoingMaxTokens }]);
+				assert.equal((run.outgoing as Record<string, unknown>).max_tokens, fields.max_tokens);
+				assert.equal((run.outgoing as Record<string, unknown>).max_completion_tokens, fields.max_completion_tokens);
+			});
+		}
+	});
+
+	test(`${strict ? "strict" : "ordinary"} DeepSeek request rejects unsafe output and identity changes`, async t => {
+		for (const [name, fields, modelChange] of [
+			["fractional", { max_tokens: 1.5 }, {}],
+			["nonfinite", { max_tokens: Infinity }, {}],
+			["nonpositive", { max_tokens: 0 }, {}],
+			["above resolved provider capability", { max_tokens: 1001 }, {}],
+			["conflicting fields", { max_tokens: 75, max_completion_tokens: 60 }, {}],
+			["changed payload model", { model: "other" }, {}],
+			["changed runtime model", { max_tokens: 75 }, { id: "other" }],
+			["changed provider", { max_tokens: 75 }, { provider: "other" }],
+			["changed endpoint", { max_tokens: 75 }, { baseUrl: "https://invalid.example" }],
+		] as const) {
+			await t.test(name, async subtest => {
+				const run = await runOfflineDeepSeekPayload(subtest, strict, fields, modelChange);
+				assert(run.error instanceof Error);
+				assert.match(run.error.message, /DeepSeek provider request|strict request/);
+				assert.equal(run.dispatched, 0);
+				assert.deepEqual(run.observations, []);
+			});
+		}
+	});
+}
+
 test("a read-dir grant confines both tools, rejects PDFs, and records successful reads", async (t) => {
 	const persistDir = await fixture(t);
 	const materialRoot = path.join(persistDir, "materials");

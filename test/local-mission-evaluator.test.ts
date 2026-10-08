@@ -22,6 +22,15 @@ import { Workspace } from "../src/workspace.ts";
 
 const answer = "A synthetic finite answer with exact bytes.\n";
 const digest = createHash("sha256").update(answer).digest("hex");
+const syntheticTaskContract = {
+	version: 1 as const, kind: "local-evaluator-task-input-contract" as const,
+	instructions: "Write the declared JSON plan before submitting the candidate.",
+	artifacts: [{ path: "task-input.json", format: "json" as const,
+		schema: { type: "object", required: ["items", "checks"],
+			properties: { items: { type: "array", items: { type: "string" } },
+				checks: { type: "array", items: { type: "object" } } }, additionalProperties: false },
+		example: { items: ["SyntheticItem"], checks: [] } }],
+};
 const lineCount = (text: string) => text.split(/\r?\n/).length - Number(text.endsWith("\n"));
 const selectedCandidate = (names: readonly string[]) => names.find(name =>
 	/^candidate-001-[0-9a-f]{16}\.md$/.test(name));
@@ -79,6 +88,7 @@ async function finiteFixture(t: TestContext, options: {
 	candidate?: string; evaluatorId?: string | null; closure?: "finite-evidence" | "open-ended";
 	partialObligations?: boolean; exploratory?: boolean; m04FullRead?: boolean;
 	obligationType?: string; m04SkipObservation?: boolean;
+	expectTaskContract?: boolean; forgeTaskContractAfterAssessment?: boolean;
 } = {}) {
 	const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-finite-"));
 	t.after(() => rm(root, { recursive: true, force: true }));
@@ -92,7 +102,7 @@ async function finiteFixture(t: TestContext, options: {
 			evaluatorId: options.evaluatorId ?? "host:file-sha256" } }), concurrency: 1, tools: {} };
 	let missionId = "";
 	let assessorCalls = 0, m04Calls = 0, builderCalls = 0;
-	const runner = new FakeSessionRunner(async ({ spec }) => {
+	const runner = new FakeSessionRunner(async ({ spec, message }) => {
 		if (spec.label === "M04-research") {
 			m04Calls++;
 			return spec.tools.kind === "read-dir" ? {
@@ -102,12 +112,33 @@ async function finiteFixture(t: TestContext, options: {
 						!options.m04SkipObservation || !event.path.includes("observation-")) } :
 				"Initial synthetic M04 baseline; no knowledge proposal.";
 		}
-		if (spec.label.startsWith("M07-")) { builderCalls++; return options.candidate ?? answer; }
+		if (spec.label.startsWith("M07-")) {
+			builderCalls++;
+			if (options.expectTaskContract) {
+				assert.match(message, /Before producing files, read the complete host-evaluator-task-input-/);
+				assert.equal(spec.tools.kind, "read-dir");
+				if (spec.tools.kind !== "read-dir") throw new Error("synthetic builder must have copied inputs");
+				const inputs = path.join(spec.tools.root, "inputs");
+				const name = (await readdir(inputs)).find(item => item.includes("host-evaluator-task-input-"));
+				assert(name, "the frozen contract copy must exist before the builder reply");
+				const delivered = JSON.parse(await readFile(path.join(inputs, name), "utf8")) as {
+					binding: { missionId: string }; contract: unknown };
+				assert.equal(delivered.binding.missionId, missionId);
+				assert.deepEqual(delivered.contract, syntheticTaskContract);
+			}
+			return options.candidate ?? answer;
+		}
 		if (spec.label.startsWith("local-original-objective-")) {
 			assessorCalls++;
 			assert.equal(spec.tools.kind, "read-dir");
 			if (spec.tools.kind !== "read-dir") throw new Error("assessor lacks frozen evidence");
 			const readReturns = await readEvents(spec.tools.root, "objective_evidence_read");
+			if (options.forgeTaskContractAfterAssessment && assessorCalls === 1) {
+				const dir = path.join(ws.agentDir, "missions", missionId, "evidence");
+				const name = (await readdir(dir)).find(item => item.startsWith("host-evaluator-task-input-"));
+				assert(name);
+				await writeFile(path.join(dir, name), "{\"forged\":true}\n");
+			}
 			const candidateName = selectedCandidate(await readdir(spec.tools.root));
 			const issue = { id: "finite-gap", claim: "Exact answer has not been checked", status: "open",
 				classification: "explicit-requirement", sourceRefs: [{ sourceId: "original-problem.txt",
@@ -168,6 +199,69 @@ test("default host completes a finite exact-file objective only after evaluator,
 		throw new Error("restart must not prompt"); }), config: f.config });
 	assert.deepEqual(await reopened.status(f.missionId), finished);
 	assert.deepEqual(await reopened.step(f.missionId), finished);
+});
+
+test("future M07 task receives the exact trusted input shape before model work and keeps it on reopen", async t => {
+	const declared = structuredClone(syntheticTaskContract);
+	registerTrustedLocalMissionEvaluator({ id: "test:declared-task-shape", version: "1",
+		supportedObligationTypes: ["file-sha256"], taskInputContract: declared,
+		async preflight() { return { available: true }; },
+		async evaluate({ contract, candidate, observationOutputDir }) {
+			const name = "observation-task-shape.json";
+			await writeFile(path.join(observationOutputDir, name), "{\"validated\":true}\n", { mode: 0o600 });
+			return { observations: [{ name, kind: "json" as const }], limitations: [],
+			checks: contract.obligations.map(item => ({ obligationId: item.id,
+				result: "passed" as const, evidenceRefs: [candidate[0]!.name, name], limitations: [] })) }; } });
+	const f = await finiteFixture(t, { evaluatorId: "test:declared-task-shape", expectTaskContract: true });
+	const first = await f.mission.step(f.missionId);
+	assert.equal(f.builderCalls, 1);
+	const runId = first.boundedRuns[0]!.runId;
+	const goal = await createM07Controller({ ws: f.ws, runner: f.runner,
+		store: createFileKnowledgeStore(f.ws.knowledgeDir), config: f.config }).status(runId);
+	const copy = goal.tasks[0]!.inputCopies.find(item => path.basename(item.source).startsWith("host-evaluator-task-input-"));
+	assert(copy, "task must receive a copied frozen contract");
+	const delivered = JSON.parse(await readFile(copy.copy, "utf8")) as { binding: { missionId: string;
+		evaluatorId: string; evaluatorVersion: string; contractSha256: string }; contract: unknown };
+	assert.deepEqual(delivered.contract, declared);
+	assert.equal(delivered.binding.missionId, f.missionId);
+	assert.equal(delivered.binding.evaluatorId, "test:declared-task-shape");
+	assert.equal(delivered.binding.evaluatorVersion, "1");
+	assert.equal(delivered.binding.contractSha256,
+		createHash("sha256").update(JSON.stringify(declared)).digest("hex"));
+	const reopened = openDefaultLocalMission({ workspaceRoot: f.root, runner: f.runner, config: f.config });
+	assert.deepEqual(await reopened.status(f.missionId), first);
+	declared.instructions = "Altered without an evaluator version change.";
+	await assert.rejects(reopened.step(f.missionId), /task input contract identity changed across reopen/);
+	assert.equal(f.builderCalls, 1);
+});
+
+test("malformed declarations and forged frozen task contract fail closed", async t => {
+	assert.throws(() => registerTrustedLocalMissionEvaluator({ id: "test:bad-task-shape", version: "1",
+		supportedObligationTypes: ["file-sha256"],
+		taskInputContract: { ...syntheticTaskContract, artifacts: [
+			{ ...syntheticTaskContract.artifacts[0]!, path: "../outside.json" }] },
+		async preflight() { return { available: true }; },
+		async evaluate() { throw new Error("never evaluate"); } }), /task input contract is invalid/);
+	const f = await finiteFixture(t, { evaluatorId: "test:declared-task-shape",
+		forgeTaskContractAfterAssessment: true });
+	await assert.rejects(f.mission.step(f.missionId), /task input contract bytes changed/);
+	assert.equal(f.builderCalls, 0);
+});
+
+test("evaluator schema mismatch reaches bounded M07 repair feedback", async t => {
+	registerTrustedLocalMissionEvaluator({ id: "test:schema-mismatch", version: "1",
+		supportedObligationTypes: ["file-sha256"], taskInputContract: syntheticTaskContract,
+		async preflight() { return { available: true }; },
+		async evaluate({ contract }) { return { observations: [], limitations: [],
+			checks: contract.obligations.map(item => ({ obligationId: item.id,
+				result: "failed" as const, evidenceRefs: [], limitations: [], schemaErrors: [
+					{ artifact: "task-input.json", path: "$.items",
+						message: "required top-level array is missing" }] })) }; } });
+	const f = await finiteFixture(t, { evaluatorId: "test:schema-mismatch", expectTaskContract: true });
+	const first = await f.mission.step(f.missionId);
+	const runId = first.boundedRuns[0]!.runId;
+	const feedback = await readFile(path.join(f.ws.runDir("M07", runId), "m04-feedback.md"), "utf8");
+	assert.match(feedback, /Schema error in task-input\.json at \$\.items: required top-level array is missing/);
 });
 
 test("finite mission without a registered evaluator reports a capability gap before assessment", async t => {

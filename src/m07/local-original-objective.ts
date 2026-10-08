@@ -94,6 +94,9 @@ export interface LocalObjectiveFrozenEvidence {
 	selectionReview?: LocalObjectiveSelectionReviewV1;
 	/** Precise host-observed evaluator capability gap; no assessor call is made. */
 	evaluatorCapabilityGap?: string;
+	/** Exact host-authored task shape copied into each new M07 task. */
+	evaluatorTaskInputContract?: { name: string; sha256: string; evaluatorId: string;
+		evaluatorVersion: string; sourceIdentitySha256: string; contractSha256: string };
 	availableArtifacts?: string[];
 	unresolvedOperationIds: string[];
 	/** Host census of M07/M04 work not yet represented in boundedRuns. */
@@ -120,6 +123,9 @@ export interface LocalObjectiveHostPort {
 	/** Read-only current-evidence check; never rewrites a historical completion. */
 	verifyCurrentFulfillment(progress: ObjectiveProgressV1): Promise<void>;
 	recordCheckpoint(progress: ObjectiveProgressV1): Promise<void>;
+	/** Future dispatch edge; built-in adapter records it after task ID allocation. */
+	recordDispatchLineage?(input: { intentId: string; m07RunId: string;
+		taskId: string; assessorTask: ObjectiveNextTaskV1 }): Promise<void>;
 	/** Recheck trusted local control immediately before any new M07 dispatch. */
 	currentUnknownOperationIds(): Promise<string[]>;
 	currentUnrepresentedM07RunIds(progress: ObjectiveProgressV1): Promise<string[]>;
@@ -231,7 +237,8 @@ export interface LocalObjectiveAdapter {
 	readonly scope: string;
 	advance(input: { ctx: StageContext; controller: M07Controller; runM04: typeof runM04;
 		contract: OriginalObjectiveContractV1; frozen: LocalObjectiveFrozenEvidence;
-		task: ObjectiveNextTaskV1 }): Promise<LocalObjectiveAdvanceResult>;
+		task: ObjectiveNextTaskV1;
+		recordDispatchLineage?: (m07RunId: string, taskId: string) => Promise<void> }): Promise<LocalObjectiveAdvanceResult>;
 }
 
 export interface LocalOriginalObjectiveCaller {
@@ -398,7 +405,10 @@ export function createLocalOriginalObjectiveCaller(input: { ws: Workspace;
 						pendingActionFacts: { unresolvedOperationRefs: [record.runId],
 							target: { goalRunId: record.runId }, failedStage: "m07-execution" } }));
 					const result = await adapter.advance({ ctx, controller, runM04,
-						contract: previous.contract, frozen, task });
+						contract: previous.contract, frozen, task,
+						recordDispatchLineage: host.recordDispatchLineage ?
+							(m07RunId, taskId) => host.recordDispatchLineage!({ intentId: record.runId,
+								m07RunId, taskId, assessorTask: task }) : undefined });
 					if (!result || typeof result.runId !== "string" || !result.runId ||
 						typeof result.outcome !== "string" || !result.outcome ||
 						!Array.isArray(result.acceptedTaskIds) ||

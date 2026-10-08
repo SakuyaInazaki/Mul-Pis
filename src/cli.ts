@@ -61,6 +61,8 @@ import type { KnowledgeRef } from "./knowledge/types.ts";
 import { createM07Controller } from "./m07/controller.ts";
 import { publicLocalMissionStatus, validateLocalObjectiveRequest } from "./m07/local-original-objective.ts";
 import { openDefaultLocalMission } from "./m07/local-mission.ts";
+import { reconcileInterruptedLocalMission, reconcileLegacyInterruptedLocalMission,
+	type InterruptedLocalReviewRequestV1, type LegacyInterruptedLocalReviewRequestV1 } from "./m07/local-interrupted-reconcile.ts";
 import { summarizeGoalExecution } from "./m07/status.ts";
 import type { CurrentGoal, TaskSpecInput } from "./m07/types.ts";
 import type { RunDescriptorV1 } from "./runtime/run-descriptor.ts";
@@ -118,7 +120,7 @@ async function makeRunner(kind: string): Promise<SessionRunner> {
 }
 
 function usage(): string {
-	return `用法：node src/cli.ts <init|m01|m02|m03|m04|m05|m06|m08|m09|status|knowledge|improve|goal|mission> [选项]\n  --workspace <dir>   工作区（默认当前目录）\n  --runner pi|fake    会话运行器（默认 pi）\n  mission start [--original <json>]：默认固定工作区 problem.md 原文作为开放目标；JSON 可给出明确义务和有限收口条件\n  mission run|resume|status --mission <id>：执行、继续或只查看一项本地任务；无需 GitHub 参数\n  goal status --run <id>：只显示控制摘要，不输出原始会话或 toolLog\n  goal delegate --run <id> --task <json> [--runner pi|fake]：执行有界任务；fork 须在 task.context 中给出 mode=fork、同一 parentRunId、parentTaskId、checkpointId，并保持原 objective/inputs/outputs/checks 等义务\n  goal select-branch --run <id> --parent-task <T-id> --rationale <text> [--selected-task <T-id>]：选择已评审接受的候选；省略 selected-task 即明确不选\n  goal reconcile --run <id> --operation <id> --evidence <json>；recover --run <id> --attempt <old-id> --descriptor <new-pi-json>；successor --run <id> --descriptor <new-pi-json>\n  improve run|status|rollback|export|bind（旧预算机制实验；run 必须给 --plan <json>）\n  improve research bootstrap --methods <json>；run --plan <json>；workflow run --plan <json>；status|rollback|export|bind\n  research run 研究 CPU H/I；workflow run 显式研究 M07 evidence-handoff 单槽，缺独立 G 时仅留档\n  m08 的 materials/self-checks/reviewers 是显式 JSON 文件\n  m09 的 delivery-scope/reproduction 是显式 JSON 文件；instructions 是预授权的精确 shell 命令，read-only 时应为空；不会自动发布\n详见 src/cli.ts 顶部说明。`;
+	return `用法：node src/cli.ts <init|m01|m02|m03|m04|m05|m06|m08|m09|status|knowledge|improve|goal|mission> [选项]\n  --workspace <dir>   工作区（默认当前目录）\n  --runner pi|fake    会话运行器（默认 pi）\n  mission start [--original <json>]：默认固定工作区 problem.md 原文作为开放目标；JSON 可给出明确义务和有限收口条件\n  mission run|resume|status --mission <id>：执行、继续或只查看一项本地任务；无需 GitHub 参数\n  mission reconcile --mission <id> --review <json>：核对未来版本化双向派发血缘与旧终态，写入仅供新工作使用的 checkpoint\n  mission reconcile-legacy --mission <id> --review <json> [--apply]：默认只读 dry-run；仅在完整旧源代码、串行归属与效果审查通过后，显式 --apply 才写入独立的 legacy 审查 checkpoint\n  goal status --run <id>：只显示控制摘要，不输出原始会话或 toolLog\n  goal delegate --run <id> --task <json> [--runner pi|fake]：执行有界任务；fork 须在 task.context 中给出 mode=fork、同一 parentRunId、parentTaskId、checkpointId，并保持原 objective/inputs/outputs/checks 等义务\n  goal select-branch --run <id> --parent-task <T-id> --rationale <text> [--selected-task <T-id>]：选择已评审接受的候选；省略 selected-task 即明确不选\n  goal reconcile --run <id> --operation <id> --evidence <json>；recover --run <id> --attempt <old-id> --descriptor <new-pi-json>；successor --run <id> --descriptor <new-pi-json>\n  improve run|status|rollback|export|bind（旧预算机制实验；run 必须给 --plan <json>）\n  improve research bootstrap --methods <json>；run --plan <json>；workflow run --plan <json>；status|rollback|export|bind\n  research run 研究 CPU H/I；workflow run 显式研究 M07 evidence-handoff 单槽，缺独立 G 时仅留档\n  m08 的 materials/self-checks/reviewers 是显式 JSON 文件\n  m09 的 delivery-scope/reproduction 是显式 JSON 文件；instructions 是预授权的精确 shell 命令，read-only 时应为空；不会自动发布\n详见 src/cli.ts 顶部说明。`;
 }
 
 function publicGoal(goal: CurrentGoal): Record<string, unknown> {
@@ -142,14 +144,20 @@ function strictFlags(args: ParsedArgs, names: string[], counts: number[] = [2]):
 
 function missionFlags(args: ParsedArgs, action: string): void {
 	const names = action === "start" ? ["workspace", "runner", "original"] :
-		action === "status" ? ["workspace", "mission"] : ["workspace", "runner", "mission"];
+		action === "status" ? ["workspace", "mission"] :
+			["reconcile", "reconcile-legacy"].includes(action) ?
+				["workspace", "mission", "review", ...(action === "reconcile-legacy" ? ["apply"] : [])] :
+				["workspace", "runner", "mission"];
 	if (args.positional.length !== 2 ||
-		!["start", "run", "resume", "status"].includes(action) ||
+		!["start", "run", "resume", "status", "reconcile", "reconcile-legacy"].includes(action) ||
 		[...args.flags].some(([name, values]) => !names.includes(name) ||
 			values.length !== 1 || !values[0]?.trim()) ||
-		(action !== "start" && !flag(args, "mission")))
+		(action !== "start" && !flag(args, "mission")) ||
+		(["reconcile", "reconcile-legacy"].includes(action) && !flag(args, "review")) ||
+		(action === "reconcile-legacy" && has(args, "apply") && flag(args, "apply") !== "true"))
 		throw new HarnessError("cli.mission", "mission 需要 start [--original <json>] 或 run|resume|status --mission <id>；不接受多余或重复参数");
-	if (action !== "status" && !["pi", "fake"].includes(flag(args, "runner") ?? "pi"))
+	if (action !== "status" && action !== "reconcile" && action !== "reconcile-legacy" &&
+		!["pi", "fake"].includes(flag(args, "runner") ?? "pi"))
 		throw new HarnessError("cli.mission", "mission 的 --runner 仅可为 pi 或 fake");
 }
 
@@ -222,6 +230,34 @@ export async function main(argv: string[]): Promise<number> {
 	if (command === "mission") {
 		const action = args.positional[1] ?? "";
 		missionFlags(args, action);
+		if (action === "reconcile") {
+			const request = await jsonFile<InterruptedLocalReviewRequestV1>(args, "review");
+			if (request.missionId !== flag(args, "mission"))
+				throw new HarnessError("cli.mission", "mission review belongs to another mission");
+			const reviewed = await reconcileInterruptedLocalMission({ workspaceRoot: ws.root, request });
+			console.log(JSON.stringify({ ...publicLocalMissionStatus(reviewed.progress),
+				review: { kind: reviewed.receipt.kind, intentId: reviewed.receipt.intentId,
+					oldAttemptId: reviewed.receipt.oldAttempt.attemptId,
+					newAttemptId: reviewed.receipt.newAttempt.attemptId } }, null, 2));
+			return 0;
+		}
+		if (action === "reconcile-legacy") {
+			const request = await jsonFile<LegacyInterruptedLocalReviewRequestV1>(args, "review");
+			if (request.missionId !== flag(args, "mission"))
+				throw new HarnessError("cli.mission", "legacy mission review belongs to another mission");
+			const dryRun = !has(args, "apply");
+			const reviewed = await reconcileLegacyInterruptedLocalMission({ workspaceRoot: ws.root,
+				request, dryRun });
+			console.log(JSON.stringify({ ...publicLocalMissionStatus(reviewed.progress), dryRun,
+				review: { kind: reviewed.receipt.kind, intentId: reviewed.receipt.intentId,
+					oldAttemptId: reviewed.receipt.oldAttempt.attemptId,
+					newAttemptId: reviewed.receipt.newAttempt.attemptId,
+					historicalExplicitDispatchBinding: false,
+					association: reviewed.receipt.association,
+					effectState: reviewed.receipt.effects,
+					authority: reviewed.receipt.authority } }, null, 2));
+			return 0;
+		}
 		if (action === "status") {
 			const host = openDefaultLocalMission({ workspaceRoot: ws.root });
 			console.log(JSON.stringify(publicLocalMissionStatus(await host.status(flag(args, "mission")!)), null, 2));

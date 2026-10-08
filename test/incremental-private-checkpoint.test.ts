@@ -35,6 +35,7 @@ const source: IncrementalCheckpointSource = {
 function snapshot(request = false): IncrementalCheckpointInput {
 	const requests = request ? [{ requestId: "request-1", sessionId: "c".repeat(64),
 		responseReceived: false, inputPayloadBytes: 120, maxOutputTokens: 8192,
+		outputTokenField: "max_completion_tokens" as const,
 		status: "in-flight" as const, settledCny: null, unknownObservedCny: null,
 		reportedUsage: null }] : [];
 	return { requestAudit: { version: 3, kind: "accounting-only-request-audit",
@@ -68,6 +69,7 @@ test("initial private prefix seals accepted unobserved control before later requ
 	opened = openIncrementalControlPrefix(raw, f.authenticatedMissionKey, source);
 	assert.deepEqual(opened.unobservedControlDeliveries, [unknownControl]);
 	assert.equal(opened.requestAudit.requests.length, 1);
+	assert.equal(opened.requestAudit.requests[0].outputTokenField, "max_completion_tokens");
 	await assert.rejects(f.journal.record("control-observed", snapshot(true)),
 		expectDiagnostic("monotonic-regression", "unobserved-control-regressed"));
 	assert.equal(await readFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE), "utf8"), raw);

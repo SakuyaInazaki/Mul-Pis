@@ -651,7 +651,7 @@ test("dispose and resume can continue the same session with a fresh prompt lease
 	assert.equal(budget.snapshot().stopped, false);
 });
 
-test("campaign restores the live provider maximum if SDK context heuristics lower its payload cap", async t => {
+test("campaign preserves an SDK context adjustment below the verified provider maximum", async t => {
 	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-provider-bound-"));
 	t.after(() => rm(dir, { recursive: true, force: true }));
 	const price = await verifyDeepSeekCnyBilling({ apiKey: "synthetic", now: () => new Date("2026-10-06T11:20:00.000Z"),
@@ -681,8 +681,33 @@ test("campaign restores the live provider maximum if SDK context heuristics lowe
 		campaignBudget: budget }).create(spec(dir, "provider-max"));
 	t.after(() => handle.dispose());
 	await handle.prompt("offline");
-	assert.equal(outgoingCap, provider.maxOutputTokens);
-	assert.equal(budget.requestAccountingAuditSnapshot().requests[0].maxOutputTokens, provider.maxOutputTokens);
+	assert.equal(outgoingCap, 64_000);
+	assert.equal(budget.requestAccountingAuditSnapshot().requests[0].maxOutputTokens, 64_000);
+	assert.equal(budget.requestAccountingAuditSnapshot().requests[0].outputTokenField, "max_tokens");
+	assert.equal(budget.snapshot().providerOutputLimit?.maxOutputTokens, provider.maxOutputTokens);
+});
+
+test("campaign accounts conservatively when Pi omits an output field", async t => {
+	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-output-omitted-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const budget = new DeepSeekCampaignBudget(LIMITS);
+	let outgoing: unknown;
+	const runtime = { getModels: () => [MODEL],
+		async streamSimple(model: Model<"openai-completions">, _context: unknown,
+			options: { onPayload?: (payload: unknown, model: Model<"openai-completions">) => Promise<unknown> }) {
+			outgoing = await options.onPayload?.({ model: model.id,
+				messages: [{ role: "user", content: "offline" }] }, model);
+		},
+	} as unknown as ModelRuntime;
+	const handle = await new PiSessionRunner({ modelRuntime: runtime, createSession: offlineFactory(1),
+		campaignBudget: budget }).create(spec(dir, "omitted-output"));
+	t.after(() => handle.dispose());
+	await handle.prompt("offline");
+	assert.equal((outgoing as Record<string, unknown>).max_tokens, undefined);
+	assert.equal(budget.requestAccountingAuditSnapshot().requests[0].maxOutputTokens, MODEL.maxTokens);
+	assert.equal(budget.requestAccountingAuditSnapshot().requests[0].outputTokenField, "omitted");
+	assert.deepEqual(handle.providerOutputRequests?.(), [{ resolvedMaxTokens: MODEL.maxTokens,
+		outputField: "omitted", outgoingMaxTokens: null }]);
 });
 
 
@@ -858,7 +883,7 @@ test("conflicting provider output-cap fields fail before transport", async t => 
 	const handle = await new PiSessionRunner({ modelRuntime: runtime, createSession: offlineFactory(1),
 		campaignBudget: budget }).create(spec(dir, "conflicting-output-cap"));
 	t.after(() => handle.dispose());
-	await assert.rejects(handle.prompt("offline"), /output bound missing or inconsistent/);
+	await assert.rejects(handle.prompt("offline"), /output bound is invalid or exceeds provider maximum/);
 	assert.equal(dispatched, 0);
 	assert.equal(budget.snapshot().reservations, 0);
 });

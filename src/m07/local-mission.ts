@@ -13,9 +13,12 @@ import type { StageContext } from "../stages/context.ts";
 import { Workspace } from "../workspace.ts";
 import { createLocalM07Adapters, LOCAL_M07_MISSION_BINDING_PREFIX } from "./local-m07-adapter.ts";
 import { requireLocalEvaluator } from "./local-evaluator-run.ts";
+import { validatedTaskInputContract, type LocalMissionEvaluator } from "./local-mission-evaluator.ts";
 import { recordDefaultSelectionReview, recoverDefaultSelectionReview,
 	defaultSelectionEvidenceFiles } from "./local-selection-review.ts";
 import { createM07Controller } from "./controller.ts";
+import { assessorTaskHash, localLineageHash, recordLocalDispatchLineage } from "./local-dispatch-lineage.ts";
+import type { CurrentGoal } from "./types.ts";
 import { freezeLocalMaterialBundle, readLocalMaterialBundle,
 	type LocalMaterialSelection } from "./local-material-bundle.ts";
 import { createLocalOriginalObjectiveCaller, type LocalObjectiveFrozenEvidence,
@@ -160,6 +163,38 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 			return missing;
 		};
 		return {
+			async recordDispatchLineage({ intentId, m07RunId, taskId, assessorTask }) {
+				const host = await writable();
+				const status = await host.status();
+				const checkpoint = status.latestCheckpoint;
+				if (!checkpoint || checkpoint.source.attemptId !== host.source.attemptId ||
+					status.repairRequired || status.unresolvedOperationIds.length)
+					throw new Error("local mission dispatch has no exact current intent checkpoint");
+				const progress = await parseProgress(await host.readCheckpoint(checkpoint.sequence), missionId);
+				if (!progress || progress.stopReason !== "execution-interrupted" ||
+					progress.continuation.pendingAction?.target?.goalRunId !== intentId ||
+					JSON.stringify(progress.continuation.unresolvedOperationIds) !== JSON.stringify([intentId]) ||
+					!progress.assessment?.nextTask ||
+					assessorTaskHash(progress.assessment.nextTask) !== assessorTaskHash(assessorTask))
+					throw new Error("local mission dispatch does not match the frozen assessor task");
+				const m07Dir = ws.runDir("M07", m07RunId);
+				const goal = JSON.parse(await safeText(path.join(m07Dir, "goal.json"))) as CurrentGoal;
+				const task = goal.tasks.find(row => row.taskId === taskId);
+				if (goal.runId !== m07RunId || goal.goal !== assessorTask.objective ||
+					goal.problemRelation !== `${LOCAL_M07_MISSION_BINDING_PREFIX}${missionId}\n${progress.contract.goal}` ||
+					goal.tasks.length !== 1 || !task || !task.objective.startsWith(assessorTask.objective) ||
+					goal.executionState?.attempts.filter(row => JSON.stringify(row.runDescriptor.process) ===
+						JSON.stringify(host.source.process)).length !== 1)
+					throw new Error("local M07 task or execution owner does not match the mission dispatch");
+				await recordLocalDispatchLineage({ missionRoot: root, m07Dir, lineage: {
+					version: 1, kind: "local-mission-m07-dispatch-lineage", missionId,
+					intentId, oldAttempt: host.source,
+					intentCheckpoint: { sequence: checkpoint.sequence, sha256: checkpoint.sha256 },
+					m07RunId, taskId, assessorTaskSha256: assessorTaskHash(assessorTask),
+					m07TaskInputsSha256: localLineageHash(JSON.stringify(task.inputs)),
+					m07TaskChecksSha256: localLineageHash(JSON.stringify(task.checks)),
+					m07Owner: host.source.process } });
+			},
 			async verifyCurrentFulfillment(progress) {
 				try {
 					const readContext: StageContext = context ?? { ws,
@@ -305,13 +340,19 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 							"selected-evidence" : "host-control");
 				}
 				const unrepresentedM07RunIds = await unrepresentedM07(progress);
+				const reviewedMissionIntents = new Set(status.checkpointReceipts
+					.flatMap(item => item.interruptedReview ? [item.interruptedReview.intentId] :
+						item.legacyInterruptedReview ? [item.legacyInterruptedReview.intentId] : []));
 				for (const runId of await ws.listRuns("MISSION")) {
 					const run = await ws.readRun("MISSION", runId);
-					if (run.status === "running" && run.inputs.some(item => item.path === contractFile))
+					if (run.status === "running" && !reviewedMissionIntents.has(runId) &&
+						run.inputs.some(item => item.path === contractFile))
 						unrepresentedM07RunIds.push(`MISSION:${runId}`);
 				}
 				const previousCapabilities = (await readdir(evidenceDir)).filter(name =>
 					/^host-capability-[1-9][0-9]*(?:-[0-9a-f]{16})?\.txt$/.test(name));
+				const previousTaskContracts = (await readdir(evidenceDir)).filter(name =>
+					/^host-evaluator-task-input-[1-9][0-9]*-[0-9a-f]{16}\.json$/.test(name));
 				const hasModel = (role: "research" | "execution") =>
 					Boolean(context?.config.roles[role] ?? context?.config.roles.default);
 				const hostCapabilities = [
@@ -323,16 +364,49 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 						limits: ["Bash is not an OS sandbox and can access same-user files outside the task root; keep unrelated secrets outside this worker environment", "External effects require authorization and host reconciliation"] },
 				];
 				let evaluatorCapabilityGap: string | undefined;
+				let evaluator: LocalMissionEvaluator | undefined;
 				{
-					try { await requireLocalEvaluator(contract, context?.config.localMission?.evaluatorId, {
+					try { evaluator = await requireLocalEvaluator(contract, context?.config.localMission?.evaluatorId, {
 						frozenOriginalInputs: originalIdentities,
 						capabilities: hostCapabilities }); }
 					catch (error) { evaluatorCapabilityGap = (error as Error).message; }
 				}
+				const declaredTaskContract = validatedTaskInputContract(evaluator?.taskInputContract);
+				const sourceIdentitySha256 = sha256(Buffer.from(JSON.stringify(originalIdentities)));
+				const taskContractIdentity = declaredTaskContract && evaluator ? {
+					missionId: contract.id, evaluatorId: evaluator.id, evaluatorVersion: evaluator.version,
+					sourceIdentitySha256,
+					contractSha256: sha256(Buffer.from(JSON.stringify(declaredTaskContract))) } : undefined;
+				let taskContractEvidenceName: string | undefined;
+				for (const name of previousTaskContracts) {
+					const priorText = await safeText(path.join(evidenceDir, name));
+					const prior = JSON.parse(priorText) as { binding?: {
+						missionId?: string; evaluatorId?: string; evaluatorVersion?: string;
+						sourceIdentitySha256?: string; contractSha256?: string }; contract?: unknown };
+					if (sha256(Buffer.from(priorText)).slice(0, 16) !==
+						name.match(/-([0-9a-f]{16})\.json$/)?.[1] || !prior.binding || !prior.contract ||
+						sha256(Buffer.from(JSON.stringify(prior.contract))) !== prior.binding.contractSha256 ||
+						prior.binding.missionId !== contract.id ||
+						prior.binding.sourceIdentitySha256 !== sourceIdentitySha256 ||
+						(evaluator && prior.binding.evaluatorId === evaluator.id &&
+						 prior.binding.evaluatorVersion === evaluator.version &&
+						 prior.binding.contractSha256 !== taskContractIdentity?.contractSha256))
+						throw new Error("local evaluator task input contract identity changed across reopen");
+					original.push({ name, file: path.join(evidenceDir, name) });
+				}
+				if (declaredTaskContract && taskContractIdentity) {
+					const contractText = `${JSON.stringify({ binding: taskContractIdentity,
+						contract: declaredTaskContract }, null, 2)}\n`;
+					const name = `host-evaluator-task-input-${iteration}-${sha256(Buffer.from(contractText)).slice(0, 16)}.json`;
+					taskContractEvidenceName = name;
+					await ensureFrozen(path.join(evidenceDir, name), contractText);
+					if (!previousTaskContracts.includes(name)) original.push({ name, file: path.join(evidenceDir, name) });
+				}
 				const capabilities = [
 				{ scope: "local-mission-evaluator", available: !evaluatorCapabilityGap,
 					description: evaluatorCapabilityGap ?? `Trusted host evaluator ${context?.config.localMission?.evaluatorId ?? "unconfigured"}`,
-					limits: ["Evaluator results are observations until M07 review, M04 reads and host selection"] },
+					limits: ["Evaluator results are observations until M07 review, M04 reads and host selection",
+						...(taskContractEvidenceName ? [`Read ${taskContractEvidenceName} for the exact host-declared task input shape before proposing or executing work.`] : [])] },
 					...hostCapabilities,
 				];
 				const capabilityText = `${JSON.stringify(capabilities)}\n`;
@@ -347,7 +421,7 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 				}
 				original.push({ name: path.basename(capabilityFile), file: capabilityFile });
 				const sourceKinds = Object.fromEntries(original.map(item => [item.name,
-					item.name.startsWith("host-capability-") ? "host-capability" :
+					item.name.startsWith("host-capability-") || item.name.startsWith("host-evaluator-task-input-") ? "host-capability" :
 					selectedEvidenceNames.get(item.name) ?? materialNames.get(item.name) ?? (item.name.startsWith("prior-run-") ?
 						item.name.includes("-control-") ? "host-control" : "unselected-evidence" :
 						"supplied-task")])) as
@@ -360,6 +434,13 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 					evidenceRoot: path.join(assessmentsDir,
 					`attempt-${iteration}-${randomUUID()}`), evidence: original,
 					capabilities, ...(evaluatorCapabilityGap ? { evaluatorCapabilityGap } : {}),
+					...(taskContractEvidenceName && taskContractIdentity ? { evaluatorTaskInputContract: {
+						name: taskContractEvidenceName,
+						sha256: sha256(Buffer.from(await safeText(path.join(evidenceDir, taskContractEvidenceName)))),
+						evaluatorId: taskContractIdentity.evaluatorId,
+						evaluatorVersion: taskContractIdentity.evaluatorVersion,
+						sourceIdentitySha256: taskContractIdentity.sourceIdentitySha256,
+						contractSha256: taskContractIdentity.contractSha256 } } : {}),
 					...(selectionReview ? { selectionReview } : {}),
 					selectedArtifacts: [...progress.selectedArtifacts],
 					availableArtifacts: [...progress.availableArtifacts], unresolvedOperationIds: unknown,

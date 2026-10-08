@@ -9,9 +9,10 @@ import { DeepSeekCampaignBudget } from "../../src/runner/deepseek-campaign.ts";
 import { verifyDeepSeekProviderOutputLimit } from "../../src/runner/deepseek-provider-limits.ts";
 import { PiSessionRunner, type PiSessionRunnerOptions } from "../../src/runner/pi.ts";
 
-const WINDOW = 128;
+// Pi 0.85.1 keeps 4096 context tokens in reserve before building this request.
+const WINDOW = 8192;
 const MAX = 64;
-const MESSAGES = 90;
+const MESSAGES = WINDOW - 38;
 const MODEL = {
 	id: "deepseek-flash", name: "Offline DeepSeek", provider: "deepseek", api: "openai-completions",
 	baseUrl: "https://api.deepseek.com", reasoning: true, input: ["text"],

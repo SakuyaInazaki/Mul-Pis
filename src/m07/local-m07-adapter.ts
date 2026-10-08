@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { latestFormalBaseline } from "./controller.ts";
@@ -6,6 +7,8 @@ import type { CurrentGoal } from "./types.ts";
 import { HarnessError } from "../types.ts";
 import { evaluateLocalM07Task, verifyLocalEvaluatorReceipt } from "./local-evaluator-run.ts";
 import { verifyDefaultM04Evidence } from "./local-selection-review.ts";
+import { trustedLocalMissionEvaluator, validatedTaskInputContract } from "./local-mission-evaluator.ts";
+import type { LocalObjectiveFrozenEvidence } from "./local-original-objective.ts";
 
 export const LOCAL_M07_REASON_SCOPE = "local-m07-reason";
 export const LOCAL_M07_EXECUTE_SCOPE = "local-m07-execute";
@@ -20,6 +23,37 @@ function unresolvedRefs(goal: CurrentGoal, taskId: string): string[] {
 		["prepared", "issued", "unknown"].includes(item.status))
 		.map(item => `${goal.runId}/${item.id}`) ?? [];
 	return [...new Set([`${goal.runId}/${taskId}`, ...operations])];
+}
+
+async function verifyTaskInputContract(frozen: LocalObjectiveFrozenEvidence, missionId: string,
+	evaluatorId?: string): Promise<string | undefined> {
+	const evaluator = trustedLocalMissionEvaluator(evaluatorId);
+	const declared = validatedTaskInputContract(evaluator?.taskInputContract);
+	const binding = frozen.evaluatorTaskInputContract;
+	if (!declared && !binding) return undefined;
+	if (!declared || !binding || !evaluator || evaluator.id !== binding.evaluatorId ||
+		evaluator.version !== binding.evaluatorVersion ||
+		createHash("sha256").update(JSON.stringify(declared)).digest("hex") !== binding.contractSha256 ||
+		createHash("sha256").update(JSON.stringify(frozen.frozenOriginalInputs ?? [])).digest("hex") !==
+			binding.sourceIdentitySha256)
+		fail("trusted evaluator task input contract or source identity changed");
+	const evidence = frozen.evidence.find(item => item.name === binding.name);
+	if (!evidence) fail("frozen evaluator task input contract is missing");
+	const bytes = await readFile(evidence.file);
+	if (createHash("sha256").update(bytes).digest("hex") !== binding.sha256)
+		fail("frozen evaluator task input contract bytes changed");
+	let value: unknown;
+	try { value = JSON.parse(bytes.toString("utf8")); }
+	catch { fail("frozen evaluator task input contract is invalid JSON"); }
+	const wrapper = value as { binding?: Record<string, unknown>; contract?: unknown };
+	if (!wrapper || JSON.stringify(wrapper.contract) !== JSON.stringify(declared) ||
+		wrapper.binding?.missionId !== missionId ||
+		wrapper.binding.evaluatorId !== binding.evaluatorId ||
+		wrapper.binding.evaluatorVersion !== binding.evaluatorVersion ||
+		wrapper.binding.sourceIdentitySha256 !== binding.sourceIdentitySha256 ||
+		wrapper.binding.contractSha256 !== binding.contractSha256)
+		fail("frozen evaluator task input contract binding is invalid");
+	return binding.name;
 }
 
 /** One stateless, built-in local step. Model reports become frozen evidence;
@@ -57,6 +91,8 @@ export function createLocalM07Adapter(mode: "reason" | "execute" = "reason"): Lo
 		const evidenceFiles = await Promise.all(frozen.evidence.map(async item => realpath(item.file)));
 		if (evidenceFiles.some(file => !insideWorkspace(file)))
 			fail("host-frozen task evidence escaped the workspace");
+		const taskInputContractName = await verifyTaskInputContract(frozen, contract.id,
+			ctx.config.localMission?.evaluatorId);
 		const baseline = await latestFormalBaseline(ctx);
 		const goal = await controller.begin({ goal: task.objective,
 			problemRelation: `${LOCAL_M07_MISSION_BINDING_PREFIX}${contract.id}\n${contract.goal}`,
@@ -68,10 +104,11 @@ export function createLocalM07Adapter(mode: "reason" | "execute" = "reason"): Lo
 		if (mode === "execute" && ctx.config.localMission?.execution !== "task-root-bash")
 			fail("local execute requires current workspace task-root-bash opt-in");
 		const report = await controller.delegate(goal.runId, {
-			objective: mode === "execute" ? `${task.objective}\n\nSave tangible result files in the deliverable/ directory. The report is evidence only; it does not establish that the original checks passed.` : task.objective,
+			objective: `${task.objective}${taskInputContractName ? `\n\nBefore producing files, read the complete ${taskInputContractName} host evidence input. Follow its versioned task input contract and examples; the evaluator checks the declared artifact shape.` : ""}${mode === "execute" ? "\n\nSave tangible result files in the deliverable/ directory. The report is evidence only; it does not establish that the original checks passed." : ""}`,
 			mode, inputs: [...new Set([goal.problemSnapshotPath,
 				...beforeRaw.items.map(item => item.path), ...evidenceFiles])],
-			expectedOutputs: mode === "execute" ? ["deliverable"] : [], checks: addressed });
+			expectedOutputs: mode === "execute" ? ["deliverable"] : [], checks: addressed },
+			input.recordDispatchLineage);
 		for (const expected of [{ source: goal.problemSnapshotPath, content: beforeProblem.content },
 			...beforeRaw.items.map(item => ({ source: item.path, content: item.content }))]) {
 			const source = await realpath(expected.source);
@@ -88,6 +125,7 @@ export function createLocalM07Adapter(mode: "reason" | "execute" = "reason"): Lo
 				unresolvedOperationRefs: unresolvedRefs(observed, report.taskId) };
 		}
 		const evaluatorId = ctx.config.localMission?.evaluatorId;
+		await verifyTaskInputContract(frozen, contract.id, evaluatorId);
 		const evaluated = evaluatorId ? await evaluateLocalM07Task({ contract, goal: observed,
 			task: report, evidence: frozen.evidence, evaluatorId,
 			frozenOriginalInputs: frozen.frozenOriginalInputs ?? [],

@@ -872,7 +872,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			});
 		},
 
-			async delegate(runId, spec) {
+			async delegate(runId, spec, afterPrepared) {
 			return withGoalDispatch(ctx, runId, async () => {
 				const goal = await load(ctx, runId); requireActive(goal); nonempty(spec.objective, "task objective");
 				if (spec.context && spec.context.mode !== "fork") throw new HarnessError("m07.branch", "unsupported task context mode");
@@ -1018,6 +1018,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			const operation: M07OperationV1 | undefined = operationId ? { version: 1, id: operationId, taskId: id, status: "prepared", issuedAt: nowIso() } : undefined;
 			if (operation) goal.executionState!.operations.push(operation);
 			goal.tasks.push(task); await save(ctx, goal);
+			if (afterPrepared) await afterPrepared(runId, id);
 			let handle;
 			let promptIssued = false;
 			let activeOperation = operation;

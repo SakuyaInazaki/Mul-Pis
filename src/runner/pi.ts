@@ -32,6 +32,32 @@ import { assertDeepSeekRequestContract, DeepSeekRequestContractError,
 import type { HostEffectScope } from "./operation-disposition.ts";
 import { certifyRequestNotSent } from "./operation-disposition.ts";
 
+type OutputTokenField = "max_tokens" | "max_completion_tokens" | "both" | "omitted";
+
+/** Inspect Pi's final request without changing its provider/context negotiation. */
+function inspectDeepSeekOutputRequest(payload: unknown, expected: { provider: string; id: string;
+	api: string; baseUrl: string; maxTokens: number }, actual: typeof expected):
+	{ payload: Record<string, unknown>; outputTokens: number; outputField: OutputTokenField } {
+	if (!payload || typeof payload !== "object" || Array.isArray(payload) ||
+		actual.provider !== expected.provider || actual.id !== expected.id ||
+		actual.api !== expected.api || actual.baseUrl !== expected.baseUrl)
+		throw new HarnessError("runner.model", "DeepSeek provider request changed model");
+	const record = payload as Record<string, unknown>;
+	if (record.model !== expected.id || !Number.isSafeInteger(expected.maxTokens) || expected.maxTokens < 1)
+		throw new HarnessError("runner.model", "DeepSeek provider request changed model or resolved output maximum");
+	const hasMax = record.max_tokens !== undefined;
+	const hasCompletionMax = record.max_completion_tokens !== undefined;
+	if ((hasMax && (!Number.isSafeInteger(record.max_tokens) || Number(record.max_tokens) < 1 ||
+		Number(record.max_tokens) > expected.maxTokens)) ||
+		(hasCompletionMax && (!Number.isSafeInteger(record.max_completion_tokens) ||
+			Number(record.max_completion_tokens) < 1 || Number(record.max_completion_tokens) > expected.maxTokens)) ||
+		(hasMax && hasCompletionMax && record.max_tokens !== record.max_completion_tokens))
+		throw new HarnessError("runner.model", "DeepSeek provider request output bound is invalid or exceeds provider maximum");
+	return { payload: record, outputTokens: (record.max_tokens ?? record.max_completion_tokens ?? expected.maxTokens) as number,
+		outputField: hasMax && hasCompletionMax ? "both" : hasMax ? "max_tokens" :
+			hasCompletionMax ? "max_completion_tokens" : "omitted" };
+}
+
 /** Capture only host-observable transport facts. Never retain an Error or response body. */
 class TransportProbe {
 	private phase: TransportFailureDiagnostic["phase"] = "unknown";
@@ -984,6 +1010,8 @@ export class PiSessionRunner implements SessionRunner {
 		let currentContextRejectedIds = new Set<string>();
 		let certifiedEffectScope: HostEffectScope | undefined;
 		const transportDiagnostics: TransportFailureDiagnostic[] = [];
+		const providerOutputRequests: Array<{ resolvedMaxTokens: number; outputField: OutputTokenField;
+			outgoingMaxTokens: number | null }> = [];
 		const signal = this.options.signal;
 		const sanitizePrivateProviderError = this.options.sanitizePrivateProviderError;
 		let abortedByHandle = false;
@@ -999,11 +1027,11 @@ export class PiSessionRunner implements SessionRunner {
 					...(model.provider === "deepseek" && model.api === "openai-completions" ? {
 						onPayload: async (payload: unknown, payloadModel: typeof model) => {
 							const original = await options?.onPayload?.(payload as never, payloadModel as never);
-							const outgoing = (original ?? payload) as Record<string, unknown>;
-							const cap = outgoing.max_tokens ?? outgoing.max_completion_tokens;
-							if (payloadModel.id !== model.id || !Number.isSafeInteger(cap) || cap !== model.maxTokens)
-								throw new HarnessError("runner.model", "SDK DeepSeek request lowered or lost the resolved provider output maximum");
-							return outgoing;
+							const inspected = inspectDeepSeekOutputRequest(original ?? payload, model, payloadModel);
+							providerOutputRequests.push({ resolvedMaxTokens: model.maxTokens,
+								outputField: inspected.outputField,
+								outgoingMaxTokens: inspected.outputField === "omitted" ? null : inspected.outputTokens });
+							return inspected.payload;
 						},
 					} : {}) });
 				const lease = currentLease;
@@ -1043,7 +1071,8 @@ export class PiSessionRunner implements SessionRunner {
 								try { prior = JSON.parse(attempt.body) as Record<string, unknown>; }
 								catch { return response; }
 								if (!prior || typeof prior !== "object" || Array.isArray(prior) ||
-									prior.max_tokens !== parsed.completionTokens ||
+									(prior.max_tokens === undefined && prior.max_completion_tokens === undefined) ||
+									(prior.max_tokens !== undefined && prior.max_tokens !== parsed.completionTokens) ||
 									(prior.max_completion_tokens !== undefined &&
 										prior.max_completion_tokens !== parsed.completionTokens)) return response;
 								// This provider-declined HTTP request was received even if the
@@ -1057,7 +1086,8 @@ export class PiSessionRunner implements SessionRunner {
 								transportDiagnostics.push(probe!.failure(promptIndex, null, rejectedId));
 								failureRecorded = true;
 								const corrected = parsed.allowedCompletionTokens;
-								const next = { ...prior, max_tokens: corrected,
+								const next = { ...prior,
+									...(prior.max_tokens === undefined ? {} : { max_tokens: corrected }),
 									...(prior.max_completion_tokens === undefined ? {} :
 										{ max_completion_tokens: corrected }) };
 								const nextBody = JSON.stringify(next);
@@ -1070,6 +1100,10 @@ export class PiSessionRunner implements SessionRunner {
 								const retryId = randomUUID();
 								campaign.reserveContextRetry(lease, nextBytes, retryId, corrected, rejectedId, proof);
 								requestIds.push(retryId);
+								providerOutputRequests.push({ resolvedMaxTokens: model.maxTokens,
+									outputField: prior.max_tokens !== undefined && prior.max_completion_tokens !== undefined ? "both" :
+										prior.max_tokens !== undefined ? "max_tokens" : "max_completion_tokens",
+									outgoingMaxTokens: corrected });
 								await checkpointAccounting("request-reserved");
 								void response.body?.cancel().catch(() => undefined);
 								requestId = retryId;
@@ -1089,27 +1123,8 @@ export class PiSessionRunner implements SessionRunner {
 							if (payloadModel.provider !== model.provider || payloadModel.id !== model.id ||
 								payloadModel.api !== model.api || payloadModel.baseUrl !== model.baseUrl)
 								throw new HarnessError("runner.model", "strict request payload changed model");
-							const record = payload as Record<string, unknown>;
-							if (campaign && record.model !== model.id) throw new HarnessError("runner.campaign", "provider payload model changed");
-							const outputCap = model.maxTokens;
-							const hasMax = record.max_tokens !== undefined;
-							const hasCompletionMax = record.max_completion_tokens !== undefined;
-							if ((!hasMax && !hasCompletionMax) ||
-								(hasMax && (!Number.isSafeInteger(record.max_tokens) || Number(record.max_tokens) < 1)) ||
-								(hasCompletionMax && (!Number.isSafeInteger(record.max_completion_tokens) || Number(record.max_completion_tokens) < 1)) ||
-								(hasMax && hasCompletionMax && record.max_tokens !== record.max_completion_tokens) ||
-								(hasMax && Number(record.max_tokens) > outputCap) ||
-								(hasCompletionMax && Number(record.max_completion_tokens) > outputCap))
-								throw new HarnessError("runner.model", "strict request output bound missing or inconsistent in provider payload");
-							// The first transport uses the verified provider maximum. Only an
-							// exact provider 400 for this same payload can justify a smaller
-							// separately accounted physical-capacity retry.
-							if (!campaign && ((hasMax && record.max_tokens !== outputCap) ||
-								(hasCompletionMax && record.max_completion_tokens !== outputCap)))
-								throw new HarnessError("runner.model", "strict request output bound was lowered by the SDK");
-							const outgoing = campaign ? { ...record,
-								...(hasMax ? { max_tokens: outputCap } : {}),
-								...(hasCompletionMax ? { max_completion_tokens: outputCap } : {}) } : payload;
+							const inspected = inspectDeepSeekOutputRequest(payload, model, payloadModel);
+							const outgoing = inspected.payload;
 							const serialized = JSON.stringify(outgoing);
 							if (typeof serialized !== "string") throw new HarnessError("runner.model", "provider payload could not be serialized for reservation");
 							if (campaign) try { assertDeepSeekRequestContract(serialized,
@@ -1121,14 +1136,18 @@ export class PiSessionRunner implements SessionRunner {
 							}
 							const bytes = Buffer.byteLength(serialized, "utf8");
 							if (strict.maxInputPayloadBytes !== undefined && bytes > strict.maxInputPayloadBytes) throw new HarnessError("runner.model", "strict request input payload exceeds reserved byte cap");
+							const outputObservation = { resolvedMaxTokens: model.maxTokens,
+								outputField: inspected.outputField,
+								outgoingMaxTokens: inspected.outputField === "omitted" ? null : inspected.outputTokens };
 							if (campaign) {
 								if (!lease) throw new HarnessError("runner.campaign", "provider request has no active prompt lease");
 								requestId = randomUUID();
-								campaign.reserve(lease, bytes, requestId, outputCap);
+								campaign.reserve(lease, bytes, requestId, inspected.outputTokens, inspected.outputField);
 								requestIds.push(requestId);
+								providerOutputRequests.push(outputObservation);
 								await checkpointAccounting("request-reserved");
 								expectedPayloadSha256 = createHash("sha256").update(serialized).digest("hex");
-							}
+							} else providerOutputRequests.push(outputObservation);
 							return outgoing;
 						},
 					});
@@ -1425,6 +1444,7 @@ export class PiSessionRunner implements SessionRunner {
 				...(item.providerContextOverflow ? { providerContextOverflow: { ...item.providerContextOverflow } } : {}),
 				...(item.privateProviderError ? { privateProviderError: { ...item.privateProviderError,
 					numericLimits: { ...item.privateProviderError.numericLimits } } } : {}) })),
+			providerOutputRequests: () => providerOutputRequests.map(row => ({ ...row })),
 			toolLog: () => [...toolLog],
 			abort: async () => {
 				if (disposed || abortedByHandle) return;

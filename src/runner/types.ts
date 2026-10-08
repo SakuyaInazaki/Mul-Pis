@@ -263,6 +263,10 @@ export interface SessionHandle {
 	usageSummary(): UsageSummary;
 	/** Redacted failures from this live handle only; no prompt, body, URL, or raw SDK error text. */
 	transportDiagnostics?(): TransportFailureDiagnostic[];
+	/** Non-secret Pi request negotiation evidence; null means the SDK omitted an output field. */
+	providerOutputRequests?(): Array<{ resolvedMaxTokens: number;
+		outputField: "max_tokens" | "max_completion_tokens" | "both" | "omitted";
+		outgoingMaxTokens: number | null }>;
 	/** Abort the active prompt and prevent further prompts on this handle. */
 	abort(): Promise<void>;
 	/** Every harness-defined or execution tool call made by the model in this session, in order. */

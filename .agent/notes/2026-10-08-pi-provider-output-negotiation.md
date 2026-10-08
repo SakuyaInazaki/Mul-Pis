@@ -1,0 +1,9 @@
+# Pi provider output negotiation repair
+
+This batch starts from published commit `15ef0a58bef67c601f5f5eafbcc3d517f5065159` and changes only the offline request boundary and its regression tests. No provider request or publication was made.
+
+Pi 0.85.1's `buildBaseOptions` clamps the requested output count to available context after an internal 4,096-token safety reserve. Its OpenAI Completions adapter then uses `max_tokens` or `max_completion_tokens` according to compatibility metadata, and sampling parameters can override the named fields. The prior harness compared that final field to the catalog maximum and rejected normal SDK negotiation before HTTP. This safety reserve is SDK behavior, not a workflow quota or evidence of a provider hard limit.
+
+The runner still asks Pi for the resolved maximum, but validates the final payload without rewriting it. For DeepSeek it requires the resolved model, provider, API, endpoint and payload model identity, and rejects invalid, conflicting or above-cap output fields. A smaller valid integer or omitted field proceeds. The current campaign accounts for a smaller stated cap directly; when the field is omitted, it reserves the verified provider maximum conservatively. The field choice and numerical cap are recorded as non-secret host evidence, alongside the resolved model capability. Strict request contract validation, byte safety, transport reservations and context rejection recovery remain in force. Exhausted context still leaves an incomplete prompt with unknown request accounting.
+
+Offline regressions cover normal and strict adjusted, alternate and omitted fields, unsafe values and identity changes, SDK context exhaustion, provider context retries through either output field, accounting checkpoint order, and authenticated carry field validation. No new monetary, time or output quota was added.

@@ -6,6 +6,7 @@ import test from "node:test";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { registerTrustedLocalMissionEvaluator } from "../src/m07/local-mission-evaluator.ts";
 import { openDefaultLocalMission } from "../src/m07/local-mission.ts";
+import { readLocalDispatchLineage } from "../src/m07/local-dispatch-lineage.ts";
 import { publicLocalMissionStatus } from "../src/m07/local-original-objective.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 import type { ReadReturnEvent } from "../src/runner/types.ts";
@@ -148,6 +149,14 @@ test("local mission freezes authored inputs, reviews a bounded reason result, an
 	assert.deepEqual(final.boundedRuns[0]!.acceptedTaskIds, []);
 	assert.equal((await ws.listRuns("M07")).length, 1);
 	assert.equal((await ws.listRuns("M04")).length, 1);
+	const m07Dir = ws.runDir("M07", final.boundedRuns[0]!.runId);
+	const linkedRaw = JSON.parse(await readFile(path.join(m07Dir, "mission-dispatch-link.json"), "utf8")) as
+		{ intentId: string; taskId: string; m07RunId: string };
+	const linked = await readLocalDispatchLineage({ missionRoot: path.join(ws.agentDir, "missions", missionId),
+		m07Dir, intentId: linkedRaw.intentId });
+	assert.equal(linked.lineage.m07RunId, final.boundedRuns[0]!.runId);
+	assert.equal(linked.lineage.taskId, "T001");
+	assert.equal(linked.lineage.intentId, linkedRaw.intentId);
 	const goalRecord = JSON.parse(await readFile(path.join(ws.runDir("M07", final.boundedRuns[0]!.runId),
 		"goal.json"), "utf8")) as { tasks: Array<{ mode: string; status: string;
 		checks: string[]; review?: { checks: Array<{ result: string }> } }>;

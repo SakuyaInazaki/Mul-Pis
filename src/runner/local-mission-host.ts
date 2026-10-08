@@ -3,10 +3,12 @@
  * provider settlement, or safe replay of an external operation. */
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { link, lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
+import { link, lstat, mkdir, open, readdir, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { readCurrentProcessIdentity, probeProcessIdentity,
 	type ProcessIdentityV1, type ProcessProbe } from "../runtime/process-identity.ts";
+import type { ObjectiveProgressV1 } from "../m07/objective-progress.ts";
+import type { LegacyEffectReviewV1 } from "../m07/local-legacy-review.ts";
 
 const CHECKPOINT_BYTES = 64 * 1024 * 1024;
 /** Bounds one physical payload file; exceeding it is a transport repair need,
@@ -23,9 +25,47 @@ export type LocalMissionAttempt = Readonly<{
 	codeRevision: string; process: ProcessIdentityV1;
 }>;
 export type LocalCheckpointReceipt = Readonly<{
-	version: 1; kind: "local-mission-checkpoint"; source: LocalMissionAttempt;
+	version: 1 | 2 | 3; kind: "local-mission-checkpoint"; source: LocalMissionAttempt;
 	sequence: number; previousSha256: string | null; sha256: string; bytes: number;
 	unresolvedOperationIds: readonly string[];
+	/** V2 commits the host review with the successor checkpoint, never with the old attempt. */
+	interruptedReview?: LocalInterruptedReviewV1;
+	legacyInterruptedReview?: LocalLegacyInterruptedReviewV1;
+}>;
+export type LocalInterruptedReviewV1 = Readonly<{
+	version: 1; kind: "local-interrupted-dispatch-review";
+	missionId: string; intentId: string;
+	missionRunSha256: string;
+	lineageSha256: string;
+	oldAttempt: LocalMissionAttempt;
+	oldCheckpoint: { sequence: number; sha256: string };
+	newAttempt: LocalMissionAttempt;
+	m07: { runId: string; taskId: string; operationId: string; checkpointId: string;
+		goalSha256: string; snapshotSha256: string; manifestSha256: string; feedbackSha256: string;
+		result: "rejected-with-complete-feedback"; effect: "response-received" };
+	m04: { runId: string; sourceSha256: string; transactionSha256: string;
+		runSha256: string; result: "failed-no-proposal";
+		lastRequest: "sdk-output-max-guard-before-http"; providerProofSha256: string };
+	boundary: "new-work-only-no-old-task-or-session-replay";
+}>;
+export type LocalLegacyInterruptedReviewV1 = Readonly<Omit<LocalInterruptedReviewV1,
+	"kind" | "lineageSha256"> & {
+	kind: "local-legacy-interruption-host-review";
+	historicalExplicitDispatchBinding: false;
+	actualArgvRecorded: false;
+	association: "host-reviewed-inferred";
+	effects: "observed-settled-within-trusted-host-scope";
+	authority: "fresh-follow-up-only";
+	source: { commit: string; tree: string; serialEntryAuditSha256: string };
+	associationEvidence: { kind: "host-reviewed-serial-dispatch-inference";
+		assessorTaskSha256: string; m07OwnerSha256: string; taskInputsSha256: string;
+		workspaceCensusSha256: string; launcher: "single-default-cli-serial-objective-loop" };
+	effectReview: LegacyEffectReviewV1;
+	effectEvidence: { toolLogSha256: string; toolReviewSha256: string; m04SessionSha256: string;
+		toolTranscriptCensusSha256: string; pairedToolCallCount: number;
+		childProcessReviewSha256: string; networkReviewSha256: string;
+		toolCallCount: number; failedToolOrdinals: number[]; numericExitUnknownOrdinals: number[];
+		trustLimit: "same-uid-reviewed-observations-no-os-noninterference-proof" };
 }>;
 export type LocalContractReceipt = Readonly<{
 	version: 1; kind: "local-mission-original-contract";
@@ -50,6 +90,7 @@ export type LocalMissionStatus = Readonly<{
 	final: "none" | "reserved" | "attempted-unknown" | "committed";
 	finalReceipt: LocalFinalReceipt | null; finalReceipts: readonly LocalFinalReceipt[];
 	repairRequired: boolean; writerLockPresent: boolean;
+	preparedReviewPending: boolean;
 	selectionAuthority: false; accounting: "unquantified";
 }>;
 
@@ -66,6 +107,7 @@ type Scan = { status: LocalMissionStatus; attempts: LocalMissionAttempt[];
 	intent: LocalFinalIntent | null; attempted: FinalAttempt | null };
 
 function reject(reason: string): never { throw new Error(`local mission host refused: ${reason}`); }
+class SyntheticReviewCrash extends Error {}
 function digest(bytes: Buffer | string): string { return createHash("sha256").update(bytes).digest("hex"); }
 function exact(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value) &&
@@ -98,6 +140,118 @@ function same(a: unknown, b: unknown): boolean { return JSON.stringify(a) === JS
 function validIds(value: unknown): value is string[] {
 	return Array.isArray(value) && value.every(item => typeof item === "string" && SAFE_ID.test(item)) &&
 		new Set(value).size === value.length && [...value].sort().join("|") === value.join("|");
+}
+function validInterruptedReview(value: unknown): value is LocalInterruptedReviewV1 {
+	if (!exact(value, ["version", "kind", "missionId", "intentId", "missionRunSha256", "lineageSha256", "oldAttempt",
+		"oldCheckpoint", "newAttempt", "m07", "m04", "boundary"]) ||
+		value.version !== 1 || value.kind !== "local-interrupted-dispatch-review" ||
+		!validSource(value.oldAttempt) || !validSource(value.newAttempt) ||
+		value.missionId !== value.oldAttempt.missionId || value.missionId !== value.newAttempt.missionId ||
+		!SAFE_ID.test(String(value.intentId)) || !HEX64.test(String(value.missionRunSha256)) ||
+		!HEX64.test(String(value.lineageSha256)) ||
+		!exact(value.oldCheckpoint, ["sequence", "sha256"]) ||
+		!Number.isSafeInteger(value.oldCheckpoint.sequence) || Number(value.oldCheckpoint.sequence) < 1 ||
+		!HEX64.test(String(value.oldCheckpoint.sha256)) ||
+		!exact(value.m07, ["runId", "taskId", "operationId", "checkpointId", "goalSha256", "snapshotSha256",
+			"manifestSha256", "feedbackSha256", "result", "effect"]) ||
+		![value.m07.runId, value.m07.taskId, value.m07.operationId, value.m07.checkpointId].every(x =>
+			typeof x === "string" && SAFE_ID.test(x)) ||
+		![value.m07.goalSha256, value.m07.snapshotSha256, value.m07.manifestSha256,
+			value.m07.feedbackSha256].every(x =>
+			typeof x === "string" && HEX64.test(x)) ||
+		value.m07.result !== "rejected-with-complete-feedback" || value.m07.effect !== "response-received" ||
+		!exact(value.m04, ["runId", "sourceSha256", "transactionSha256", "runSha256",
+			"result", "lastRequest", "providerProofSha256"]) ||
+		typeof value.m04.runId !== "string" || !SAFE_ID.test(value.m04.runId) ||
+		![value.m04.sourceSha256, value.m04.transactionSha256, value.m04.runSha256,
+			value.m04.providerProofSha256].every(x => typeof x === "string" && HEX64.test(x)) ||
+		value.m04.result !== "failed-no-proposal" ||
+		value.m04.lastRequest !== "sdk-output-max-guard-before-http" ||
+		value.boundary !== "new-work-only-no-old-task-or-session-replay") return false;
+	return true;
+}
+function validLegacyInterruptedReview(value: unknown): value is LocalLegacyInterruptedReviewV1 {
+	if (!exact(value, ["version", "kind", "missionId", "intentId", "missionRunSha256",
+		"oldAttempt", "oldCheckpoint", "newAttempt", "m07", "m04", "boundary",
+		"historicalExplicitDispatchBinding", "actualArgvRecorded", "association", "effects", "authority",
+		"source", "associationEvidence", "effectReview", "effectEvidence"]) ||
+		value.kind !== "local-legacy-interruption-host-review" ||
+		value.historicalExplicitDispatchBinding !== false ||
+		value.actualArgvRecorded !== false || value.association !== "host-reviewed-inferred" ||
+		value.effects !== "observed-settled-within-trusted-host-scope" ||
+		value.authority !== "fresh-follow-up-only" ||
+		!exact(value.source, ["commit", "tree", "serialEntryAuditSha256"]) ||
+		![value.source.commit, value.source.tree].every(x => typeof x === "string" && /^[0-9a-f]{40}$/.test(x)) ||
+		!HEX64.test(String(value.source.serialEntryAuditSha256)) ||
+		!exact(value.associationEvidence, ["kind", "assessorTaskSha256", "m07OwnerSha256",
+			"taskInputsSha256", "workspaceCensusSha256", "launcher"]) ||
+		value.associationEvidence.kind !== "host-reviewed-serial-dispatch-inference" ||
+		value.associationEvidence.launcher !== "single-default-cli-serial-objective-loop" ||
+		![value.associationEvidence.assessorTaskSha256, value.associationEvidence.m07OwnerSha256,
+			value.associationEvidence.taskInputsSha256, value.associationEvidence.workspaceCensusSha256]
+			.every(x => typeof x === "string" && HEX64.test(x)) ||
+		!exact(value.effectEvidence, ["toolLogSha256", "toolReviewSha256", "m04SessionSha256",
+			"toolTranscriptCensusSha256", "pairedToolCallCount", "childProcessReviewSha256",
+			"networkReviewSha256", "toolCallCount", "failedToolOrdinals", "numericExitUnknownOrdinals",
+			"trustLimit"]) ||
+		value.effectEvidence.trustLimit !== "same-uid-reviewed-observations-no-os-noninterference-proof" ||
+		!exact(value.effectReview, ["version", "kind", "source", "censusSha256", "toolLogSha256",
+			"m04SessionSha256", "toolTranscriptCensusSha256", "pairedToolCallCount",
+			"toolCalls", "childProcess", "network", "failedToolOrdinals",
+			"numericExitUnknownOrdinals", "trustLimit", "conclusion"]) ||
+		digest(JSON.stringify(value.effectReview)) !== value.effectEvidence.toolReviewSha256 ||
+		!Array.isArray(value.effectReview.toolCalls) ||
+		value.effectReview.toolCalls.length !== value.effectEvidence.toolCallCount ||
+		!same(value.effectReview.failedToolOrdinals, value.effectEvidence.failedToolOrdinals) ||
+		!same(value.effectReview.numericExitUnknownOrdinals, value.effectEvidence.numericExitUnknownOrdinals) ||
+		value.effectReview.censusSha256 !== value.associationEvidence.workspaceCensusSha256 ||
+		value.effectReview.toolLogSha256 !== value.effectEvidence.toolLogSha256 ||
+		value.effectReview.m04SessionSha256 !== value.effectEvidence.m04SessionSha256 ||
+		value.effectReview.toolTranscriptCensusSha256 !== value.effectEvidence.toolTranscriptCensusSha256 ||
+		value.effectReview.pairedToolCallCount !== value.effectEvidence.pairedToolCallCount ||
+		value.effectEvidence.pairedToolCallCount !== value.effectEvidence.toolCallCount ||
+		!Number.isSafeInteger(value.effectEvidence.toolCallCount) || Number(value.effectEvidence.toolCallCount) < 0 ||
+		![value.effectEvidence.failedToolOrdinals, value.effectEvidence.numericExitUnknownOrdinals].every(ids =>
+			Array.isArray(ids) && ids.every(x => Number.isSafeInteger(x) && x > 0)) ||
+		![value.effectEvidence.toolLogSha256, value.effectEvidence.toolReviewSha256,
+			value.effectEvidence.m04SessionSha256,
+			value.effectEvidence.toolTranscriptCensusSha256,
+			value.effectEvidence.childProcessReviewSha256, value.effectEvidence.networkReviewSha256]
+			.every(x => typeof x === "string" && HEX64.test(x))) return false;
+	const { historicalExplicitDispatchBinding: _binding, actualArgvRecorded: _argv,
+		association: _association, effects: _effects, authority: _authority, source: _source,
+		associationEvidence: _associationEvidence, effectReview: _review,
+		effectEvidence: _effectEvidence, ...common } = value;
+	return validInterruptedReview({ ...common, kind: "local-interrupted-dispatch-review",
+		lineageSha256: value.associationEvidence.workspaceCensusSha256 });
+}
+function validReviewedProgressTransition(oldBytes: Buffer, newBytes: Buffer,
+	review: LocalInterruptedReviewV1 | LocalLegacyInterruptedReviewV1): boolean {
+	try {
+		const old = JSON.parse(oldBytes.toString("utf8")) as ObjectiveProgressV1;
+		const next = JSON.parse(newBytes.toString("utf8")) as ObjectiveProgressV1;
+		return old.version === 1 && next.version === 1 &&
+			old.kind === "original-objective-progress" && next.kind === old.kind &&
+			old.contract?.id === review.missionId && same(old.contract, next.contract) &&
+			old.objectiveOutcome === "incomplete" && next.objectiveOutcome === "incomplete" &&
+			old.stopReason === "execution-interrupted" &&
+			old.continuation?.pendingAction?.kind === "reconcile-interrupted-run" &&
+			old.continuation?.pendingAction?.safety === "no-replay-until-reconciled" &&
+			old.continuation?.pendingAction?.target?.goalRunId === review.intentId &&
+			same(old.continuation?.unresolvedOperationIds, [review.intentId]) &&
+			next.stopReason === "objective-reassessment-pending" &&
+			next.continuation?.pendingAction?.safety === "fresh-work-only" &&
+			same(next.continuation?.unresolvedOperationIds, []) &&
+			same(old.selectedArtifacts, next.selectedArtifacts) &&
+			same(old.availableArtifacts, next.availableArtifacts) &&
+			same(old.assessment, next.assessment) &&
+			same(old.assessmentHistory, next.assessmentHistory) &&
+			Array.isArray(old.boundedRuns) && Array.isArray(next.boundedRuns) &&
+			next.boundedRuns.length === old.boundedRuns.length + 1 &&
+			same(next.boundedRuns.slice(0, -1), old.boundedRuns) &&
+			same(next.boundedRuns.at(-1), { runId: review.m07.runId,
+				outcome: "partial", acceptedTaskIds: [] });
+	} catch { return false; }
 }
 
 async function privateDir(directory: string, create = false): Promise<void> {
@@ -133,6 +287,56 @@ async function optionalBytes(file: string, max: number): Promise<Buffer | undefi
 	try { return await privateBytes(file, max); }
 	catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
 }
+/** Stage files need not use host-private mode, but cannot be links or mutable during read. */
+async function stageBytes(file: string): Promise<Buffer> {
+	const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+	try {
+		const before = await handle.stat();
+		if (!before.isFile() || before.nlink !== 1 || before.size < 1 || before.size > CHECKPOINT_BYTES)
+			reject("reviewed stage evidence is not a bounded regular file");
+		const bytes = await handle.readFile();
+		const after = await handle.stat();
+		if (bytes.length !== before.size || after.dev !== before.dev || after.ino !== before.ino ||
+			after.size !== before.size || after.mtimeMs !== before.mtimeMs)
+			reject("reviewed stage evidence changed during read");
+		return bytes;
+	} finally { await handle.close(); }
+}
+async function stageDigest(file: string): Promise<string> { return digest(await stageBytes(file)); }
+async function validLegacyStageEvidence(root: string, review: LocalLegacyInterruptedReviewV1): Promise<boolean> {
+	try {
+		const ws = path.resolve(root, "../../..");
+		const m07 = path.join(ws, "stages", "M07", review.m07.runId);
+		const cp = path.join(m07, "checkpoints", review.m07.checkpointId);
+		const m04 = path.join(ws, "stages", "M04", review.m04.runId);
+		const pinned: Array<[string, string]> = [
+			[path.join(ws, "stages", "MISSION", review.intentId, "run.json"), review.missionRunSha256],
+			[path.join(m07, "goal.json"), review.m07.goalSha256],
+			[path.join(cp, "goal.json"), review.m07.snapshotSha256],
+			[path.join(cp, "manifest.json"), review.m07.manifestSha256],
+			[path.join(cp, "m04-feedback.md"), review.m07.feedbackSha256],
+			[path.join(m04, "run.json"), review.m04.runSha256],
+			[path.join(m04, "m07-source.json"), review.m04.sourceSha256],
+			[path.join(m04, "m04-transaction.json"), review.m04.transactionSha256],
+		];
+		for (const [file, expected] of pinned) if (await stageDigest(file) !== expected) return false;
+		const m04Run = JSON.parse((await stageBytes(path.join(m04, "run.json"))).toString("utf8")) as
+			{ sessions?: Array<{ file?: string }> };
+		const sessionFile = m04Run.sessions?.length === 1 ? m04Run.sessions[0]?.file : undefined;
+		const relativeSession = sessionFile ? path.relative(ws, sessionFile) : "..";
+		if (!sessionFile || !path.isAbsolute(sessionFile) ||
+			relativeSession === ".." || relativeSession.startsWith(`..${path.sep}`) ||
+			path.isAbsolute(relativeSession) ||
+			await stageDigest(sessionFile) !== review.effectEvidence.m04SessionSha256) return false;
+		const goal = JSON.parse((await stageBytes(path.join(m07, "goal.json"))).toString("utf8")) as
+			{ tasks?: Array<{ taskId: string; toolLog?: unknown[] }>;
+				executionState?: { attempts?: Array<{ runDescriptor?: { process?: ProcessIdentityV1 } }> } };
+		const task = goal.tasks?.find(item => item.taskId === review.m07.taskId);
+		return !!task && digest(JSON.stringify(task.toolLog)) === review.effectEvidence.toolLogSha256 &&
+			goal.executionState?.attempts?.some(item => same(item.runDescriptor?.process,
+				review.oldAttempt.process)) === true;
+	} catch { return false; }
+}
 async function json(file: string): Promise<unknown | undefined> {
 	const bytes = await optionalBytes(file, CONTROL_BYTES);
 	if (!bytes) return undefined;
@@ -157,7 +361,8 @@ async function onceJson(file: string, value: unknown): Promise<void> {
 	await once(file, bytes);
 }
 
-async function lock<T>(root: string, work: (mutation: () => void) => Promise<T>): Promise<T> {
+async function lock<T>(root: string, work: (mutation: () => void) => Promise<T>,
+	review?: { owner: ProcessIdentityV1; intentId: string; oldCheckpointSha256: string }): Promise<T> {
 	const file = path.join(root, ".writer.lock");
 	let handle;
 	try { handle = await open(file,
@@ -167,19 +372,24 @@ async function lock<T>(root: string, work: (mutation: () => void) => Promise<T>)
 		throw error;
 	}
 	const identity = await handle.stat();
-	await handle.writeFile(`${JSON.stringify({ pid: process.pid, at: new Date().toISOString() })}\n`);
+	await handle.writeFile(`${JSON.stringify(review ? { version: 2,
+		kind: "review-successor-writer-lock", owner: review.owner,
+		intentId: review.intentId, oldCheckpointSha256: review.oldCheckpointSha256 } :
+		{ pid: process.pid, at: new Date().toISOString() })}\n`);
 	await handle.sync();
 	await handle.close();
 	await syncDir(root);
 	let mutationStarted = false;
 	let succeeded = false;
+	let simulatedCrash = false;
 	try {
 		const result = await work(() => { mutationStarted = true; });
 		succeeded = true;
 		return result;
 	}
+	catch (error) { simulatedCrash = error instanceof SyntheticReviewCrash; throw error; }
 	finally {
-		if (succeeded || !mutationStarted) {
+		if (!simulatedCrash && (succeeded || !mutationStarted || review)) {
 			const current = await lstat(file);
 			if (current.dev === identity.dev && current.ino === identity.ino) {
 				await unlink(file); await syncDir(root);
@@ -197,6 +407,19 @@ function checkpointPaths(root: string, attemptId: string, sequence: number) {
 	const directory = path.join(attemptPath(root, attemptId), "checkpoints");
 	return { bin: path.join(directory, `${stem}.bin`), receipt: path.join(directory, `${stem}.json`) };
 }
+async function archivePreparedReviews(root: string): Promise<void> {
+	const source = path.join(root, "attempts");
+	const entries = (await readdir(source)).filter(name => name.startsWith(".review-prepared-"));
+	if (!entries.length) return;
+	const archive = path.join(root, "review-abandoned");
+	await privateDir(archive, true);
+	for (const entry of entries) {
+		if (!/^\.review-prepared-A[0-9]{3,}-[0-9a-f-]{36}$/.test(entry))
+			reject("prepared review has an unexpected identity");
+		await rename(path.join(source, entry), path.join(archive, `${entry}-${randomUUID()}`));
+	}
+	await syncDir(source); await syncDir(archive);
+}
 
 async function scan(root: string, ignoreCurrentLock = false): Promise<Scan> {
 	await privateDir(root);
@@ -204,18 +427,25 @@ async function scan(root: string, ignoreCurrentLock = false): Promise<Scan> {
 	const writerLockPresent = rootEntries.includes(".writer.lock");
 	const attemptsRoot = path.join(root, "attempts");
 	await privateDir(attemptsRoot);
-	const names = (await readdir(attemptsRoot)).sort((a, b) =>
+	let repairRequired = false;
+	const attemptEntries = await readdir(attemptsRoot);
+	if (attemptEntries.some(name => !validAttemptId(name) &&
+		!/^\.review-prepared-A[0-9]{3,}-[0-9a-f-]{36}$/.test(name)))
+		reject("attempts directory has an unexpected entry");
+	const preparedReviewPending = attemptEntries.some(name => name.startsWith(".review-prepared-"));
+	if (preparedReviewPending) repairRequired = true;
+	const names = attemptEntries.filter(validAttemptId).sort((a, b) =>
 		Number(a.slice(1)) - Number(b.slice(1)));
 	const attempts: LocalMissionAttempt[] = [];
 	const checkpoints: LocalCheckpointReceipt[] = [];
 	const unknown = new Set<string>();
 	const interruptedAttemptIds: string[] = [];
-	let repairRequired = false;
 	if (rootEntries.some(entry => !["attempts", "original-contract.json",
-		"original-contract.receipt.json", "evidence", "assessments", "materials",
+		"original-contract.receipt.json", "evidence", "assessments", "materials", "dispatch-links",
+		"review-abandoned",
 		".writer.lock"].includes(entry)))
 		repairRequired = true;
-	for (const adjunct of ["evidence", "assessments", "materials"])
+	for (const adjunct of ["evidence", "assessments", "materials", "dispatch-links", "review-abandoned"])
 		if (rootEntries.includes(adjunct)) await privateDir(path.join(root, adjunct));
 	if (writerLockPresent && !ignoreCurrentLock) repairRequired = true;
 	let intent: LocalFinalIntent | null = null;
@@ -248,9 +478,13 @@ async function scan(root: string, ignoreCurrentLock = false): Promise<Scan> {
 			const receipt = await json(path.join(checkpointsDir, entry));
 			const previous = checkpoints.at(-1);
 			const sequence = checkpoints.length + 1;
-			if (!exact(receipt, ["version", "kind", "source", "sequence", "previousSha256",
-				"sha256", "bytes", "unresolvedOperationIds"]) ||
-				receipt.version !== 1 || receipt.kind !== "local-mission-checkpoint" ||
+			if (!(exact(receipt, ["version", "kind", "source", "sequence", "previousSha256",
+				"sha256", "bytes", "unresolvedOperationIds"]) && receipt.version === 1 ||
+				exact(receipt, ["version", "kind", "source", "sequence", "previousSha256",
+					"sha256", "bytes", "unresolvedOperationIds", "interruptedReview"]) && receipt.version === 2 ||
+				exact(receipt, ["version", "kind", "source", "sequence", "previousSha256",
+					"sha256", "bytes", "unresolvedOperationIds", "legacyInterruptedReview"]) && receipt.version === 3) ||
+				receipt.kind !== "local-mission-checkpoint" ||
 				!same(receipt.source, value) || receipt.sequence !== sequence ||
 				receipt.previousSha256 !== (previous?.sha256 ?? null) ||
 				typeof receipt.sha256 !== "string" || !HEX64.test(receipt.sha256) ||
@@ -258,9 +492,31 @@ async function scan(root: string, ignoreCurrentLock = false): Promise<Scan> {
 				Number(receipt.bytes) > CHECKPOINT_BYTES || !validIds(receipt.unresolvedOperationIds) ||
 				entry !== `C${String(sequence).padStart(8, "0")}.json`)
 				reject("checkpoint receipt sequence or identity is invalid");
+			const review = receipt.version === 2 ? receipt.interruptedReview : receipt.legacyInterruptedReview;
+			if (receipt.version === 2 || receipt.version === 3) {
+				if (!(receipt.version === 2 ? validInterruptedReview(review) :
+					validLegacyInterruptedReview(review)))
+					reject("interrupted review schema is invalid");
+				const bound = review as LocalInterruptedReviewV1 | LocalLegacyInterruptedReviewV1;
+				if (!same(bound.newAttempt, value) || !same(bound.oldAttempt, previous?.source) ||
+					bound.oldCheckpoint.sequence !== previous?.sequence ||
+					bound.oldCheckpoint.sha256 !== previous?.sha256 ||
+					checkpoints.some(row => row.interruptedReview?.intentId === bound.intentId ||
+						row.legacyInterruptedReview?.intentId === bound.intentId))
+					reject("interrupted review does not bind the preceding checkpoint and successor");
+			}
 			const bytes = await optionalBytes(path.join(checkpointsDir, entry.replace(/\.json$/, ".bin")), CHECKPOINT_BYTES);
 			if (!bytes || bytes.length !== receipt.bytes || digest(bytes) !== receipt.sha256)
 				repairRequired = true;
+			if ((receipt.version === 2 && validInterruptedReview(review) ||
+				receipt.version === 3 && validLegacyInterruptedReview(review)) && bytes && previous) {
+				const priorBytes = await optionalBytes(checkpointPaths(root, previous.source.attemptId,
+					previous.sequence).bin, CHECKPOINT_BYTES);
+				if (!priorBytes || !validReviewedProgressTransition(priorBytes, bytes, review))
+					reject("reviewed checkpoint changed historical progress or replay boundary");
+			}
+			if (receipt.version === 3 && validLegacyInterruptedReview(review) &&
+				!await validLegacyStageEvidence(root, review)) repairRequired = true;
 			checkpoints.push(receipt as LocalCheckpointReceipt);
 		}
 		for (const entry of await readdir(operationsDir)) {
@@ -344,6 +600,7 @@ async function scan(root: string, ignoreCurrentLock = false): Promise<Scan> {
 			latestCheckpoint: checkpoints.at(-1) ?? null, checkpointReceipts: checkpoints,
 			unresolvedOperationIds: [...unknown].sort(), interruptedAttemptIds,
 			final: finalState, finalReceipt, finalReceipts, repairRequired, writerLockPresent,
+			preparedReviewPending,
 			selectionAuthority: false, accounting: "unquantified" } };
 }
 
@@ -356,6 +613,41 @@ export class LocalMissionHost {
 		this.root = root;
 		this.source = source;
 		this.currentIdentity = currentIdentity;
+	}
+
+	/** Only this exact dead review writer may release its stale lock. A prepared
+	 * directory is archived, never mistaken for a committed successor. */
+	static async recoverReviewLock(input: { root: string; intentId: string;
+		oldCheckpointSha256: string; currentIdentity?: () => Promise<ProcessIdentityV1>;
+		probePrior?: (identity: ProcessIdentityV1) => Promise<ProcessProbe> }): Promise<void> {
+		const root = path.resolve(input.root);
+		const file = path.join(root, ".writer.lock");
+		const lockValue = await json(file);
+		if (lockValue === undefined) return;
+		if (!exact(lockValue, ["version", "kind", "owner", "intentId", "oldCheckpointSha256"]) ||
+			lockValue.version !== 2 || lockValue.kind !== "review-successor-writer-lock" ||
+			!validProcess(lockValue.owner) || lockValue.intentId !== input.intentId ||
+			lockValue.oldCheckpointSha256 !== input.oldCheckpointSha256)
+			reject("writer lock has no exact reviewed-successor recovery authority");
+		const current = await (input.currentIdentity ?? readCurrentProcessIdentity)();
+		const probe = await (input.probePrior ?? probeProcessIdentity)(lockValue.owner);
+		if (probe.status !== "dead" || probe.identityMatch ||
+			lockValue.owner.hostId !== current.hostId || lockValue.owner.bootId !== current.bootId)
+			reject("review writer may still be live or its birth identity is unknown");
+		const identity = await lstat(file);
+		await archivePreparedReviews(root);
+		const observed = await scan(root, true);
+		const committed = observed.status.checkpointReceipts.find(row =>
+			(row.interruptedReview?.intentId === input.intentId ||
+				row.legacyInterruptedReview?.intentId === input.intentId) &&
+			row.previousSha256 === input.oldCheckpointSha256);
+		if (observed.status.repairRequired || !committed &&
+			observed.status.latestCheckpoint?.sha256 !== input.oldCheckpointSha256)
+			reject("stale review lock accompanies unrelated or damaged host evidence");
+		const again = await lstat(file);
+		if (identity.dev !== again.dev || identity.ino !== again.ino)
+			reject("writer lock changed during recovery");
+		await unlink(file); await syncDir(root);
 	}
 
 	static async begin(input: Readonly<{ root: string; missionId: string; attemptId: string;
@@ -543,6 +835,97 @@ export class LocalMissionHost {
 			await onceJson(files.receipt, receipt); // receipt is the commit marker.
 			return receipt;
 		});
+	}
+
+	/** Build a complete successor off to the side, then publish the attempt and
+	 * its review checkpoint with one directory rename. Before rename there is no
+	 * successor; afterward the progress and receipt are both committed. */
+	static async commitReviewedSuccessor(input: Readonly<{ root: string; missionId: string;
+		bytes: Buffer; review: LocalInterruptedReviewV1 | LocalLegacyInterruptedReviewV1;
+		currentIdentity?: () => Promise<ProcessIdentityV1>;
+		probePrior?: (identity: ProcessIdentityV1) => Promise<ProcessProbe>;
+		verifyEvidence: () => Promise<void>;
+		/** Synthetic crash-window injection; never used by the CLI. */
+		testCrashAt?: "after-prepare" | "after-rename"; }>): Promise<LocalCheckpointReceipt> {
+		if (!path.isAbsolute(input.root) || !SAFE_ID.test(input.missionId) ||
+			!Buffer.isBuffer(input.bytes) || input.bytes.length < 1 || input.bytes.length > CHECKPOINT_BYTES ||
+			!(validInterruptedReview(input.review) || validLegacyInterruptedReview(input.review)) ||
+			input.review.missionId !== input.missionId || typeof input.verifyEvidence !== "function")
+			reject("reviewed successor input is invalid");
+		const root = path.resolve(input.root);
+		const current = await (input.currentIdentity ?? readCurrentProcessIdentity)();
+		if (!same(current, input.review.newAttempt.process))
+			reject("reviewed successor process changed before preparation");
+		return lock(root, async mutation => {
+			await archivePreparedReviews(root);
+			const state = await scan(root, true);
+			const prior = state.status.latestCheckpoint;
+			const nextSource = input.review.newAttempt;
+			if (state.status.repairRequired || !state.status.contractReceipt ||
+				state.status.unresolvedOperationIds.length || state.status.final !== "none" || !prior ||
+				!same(prior.source, input.review.oldAttempt) ||
+				prior.sequence !== input.review.oldCheckpoint.sequence ||
+				prior.sha256 !== input.review.oldCheckpoint.sha256 ||
+				state.status.checkpointReceipts.some(row => row.interruptedReview?.intentId === input.review.intentId ||
+					row.legacyInterruptedReview?.intentId === input.review.intentId) ||
+				nextSource.attemptId !== `A${String(state.attempts.length + 1).padStart(3, "0")}` ||
+				nextSource.predecessorAttemptId !== state.status.currentAttempt?.attemptId ||
+				!same(nextSource.process, current))
+				reject("reviewed successor is stale or another operation remains unresolved");
+			const oldIndex = state.attempts.findIndex(row => same(row, input.review.oldAttempt));
+			if (oldIndex < 0) reject("reviewed old attempt is absent");
+			for (const prepared of state.attempts.slice(oldIndex + 1)) {
+				const directory = attemptPath(root, prepared.attemptId);
+				if (state.status.checkpointReceipts.some(row => same(row.source, prepared)) ||
+					(await readdir(path.join(directory, "operations"))).length ||
+					(await readdir(path.join(directory, "final"))).length)
+					reject("prior prepared successor has work or external effects");
+				if (!same(prepared.process, current)) {
+					const probe = await (input.probePrior ?? probeProcessIdentity)(prepared.process);
+					if (probe.status !== "dead" || probe.identityMatch ||
+						prepared.process.hostId !== current.hostId || prepared.process.bootId !== current.bootId)
+						reject("prior prepared successor may still be executing");
+				}
+			}
+			const oldProbe = await (input.probePrior ?? probeProcessIdentity)(input.review.oldAttempt.process);
+			if (oldProbe.status !== "dead" || oldProbe.identityMatch ||
+				input.review.oldAttempt.process.hostId !== current.hostId ||
+				input.review.oldAttempt.process.bootId !== current.bootId)
+				reject("old attempt death changed before successor publication");
+			await input.verifyEvidence();
+			const priorBytes = await privateBytes(checkpointPaths(root, prior.source.attemptId,
+				prior.sequence).bin, CHECKPOINT_BYTES);
+			if (!validReviewedProgressTransition(priorBytes, input.bytes, input.review))
+				reject("reviewed successor changes historical progress or replay boundary");
+			const legacy = input.review.kind === "local-legacy-interruption-host-review";
+			const receipt: LocalCheckpointReceipt = {
+				version: legacy ? 3 : 2, kind: "local-mission-checkpoint", source: nextSource,
+				sequence: prior.sequence + 1, previousSha256: prior.sha256,
+				sha256: digest(input.bytes), bytes: input.bytes.length,
+				unresolvedOperationIds: state.status.unresolvedOperationIds,
+				...(legacy ? { legacyInterruptedReview: input.review as LocalLegacyInterruptedReviewV1 } :
+					{ interruptedReview: input.review as LocalInterruptedReviewV1 })
+			};
+			const attemptsRoot = path.join(root, "attempts");
+			const preparedDir = path.join(attemptsRoot,
+				`.review-prepared-${nextSource.attemptId}-${randomUUID()}`);
+			await mkdir(preparedDir, { mode: 0o700 }); await syncDir(attemptsRoot);
+			for (const part of ["checkpoints", "operations", "final"]) {
+				await mkdir(path.join(preparedDir, part), { mode: 0o700 }); await syncDir(preparedDir);
+			}
+			await onceJson(path.join(preparedDir, "source.json"), nextSource);
+			const stem = `C${String(receipt.sequence).padStart(8, "0")}`;
+			await once(path.join(preparedDir, "checkpoints", `${stem}.bin`), input.bytes);
+			await onceJson(path.join(preparedDir, "checkpoints", `${stem}.json`), receipt);
+			await syncDir(path.join(preparedDir, "checkpoints")); await syncDir(preparedDir);
+			if (input.testCrashAt === "after-prepare") throw new SyntheticReviewCrash("synthetic crash after review preparation");
+			mutation();
+			await rename(preparedDir, attemptPath(root, nextSource.attemptId));
+			await syncDir(attemptsRoot);
+			if (input.testCrashAt === "after-rename") throw new SyntheticReviewCrash("synthetic crash after reviewed successor publication");
+			return receipt;
+		}, { owner: current, intentId: input.review.intentId,
+			oldCheckpointSha256: input.review.oldCheckpoint.sha256 });
 	}
 
 	async readCheckpoint(sequence: number): Promise<Buffer> {

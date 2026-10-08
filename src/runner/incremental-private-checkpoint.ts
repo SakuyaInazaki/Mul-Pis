@@ -250,6 +250,8 @@ function projectAudit(input: IncrementalCheckpointInput["requestAudit"]) {
 		if (!id.test(row.requestId) || seen.has(row.requestId) || !hex64.test(row.sessionId) ||
 			!natural(row.inputPayloadBytes) || row.inputPayloadBytes === 0 ||
 			!natural(row.maxOutputTokens) || row.maxOutputTokens === 0 ||
+			(row.outputTokenField !== undefined &&
+				!["max_tokens", "max_completion_tokens", "both", "omitted"].includes(row.outputTokenField)) ||
 			typeof row.responseReceived !== "boolean" ||
 			!["settled", "unknown", "in-flight"].includes(row.status) ||
 			(row.settledCny !== null && !finiteNonnegative(row.settledCny)) ||
@@ -273,6 +275,7 @@ function projectAudit(input: IncrementalCheckpointInput["requestAudit"]) {
 		return { requestId: row.requestId, sessionId: row.sessionId,
 			responseReceived: row.responseReceived, inputPayloadBytes: row.inputPayloadBytes,
 			maxOutputTokens: row.maxOutputTokens,
+			...(row.outputTokenField ? { outputTokenField: row.outputTokenField } : {}),
 			...(row.contextRejected ? { contextRejected: true as const } : {}),
 			...(overflow ? { contextOverflow: { contextWindow: overflow.contextWindow,
 				messagesTokens: overflow.messagesTokens, completionTokens: overflow.completionTokens,

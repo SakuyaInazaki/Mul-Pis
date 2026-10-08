@@ -7,6 +7,7 @@ import { mediaType } from "../media.ts";
 import type { CurrentGoal, M07TaskRecord, TaskReviewInput } from "./types.ts";
 import { resolveExpectedOutputFiles } from "./expected-output.ts";
 import { trustedLocalMissionEvaluator, type LocalCandidateSnapshot,
+	validEvaluatorSchemaErrors, validatedTaskInputContract,
 	type LocalEvaluatorCheck, type LocalMissionEvaluator } from "./local-mission-evaluator.ts";
 import type { LocalFrozenOriginalIdentity } from "./local-mission-evaluator.ts";
 import { HarnessError } from "../types.ts";
@@ -111,6 +112,8 @@ export async function verifyLocalEvaluatorReceipt(receipt: LocalEvaluatorReceipt
 		receipt.checks.some(item => !contract.obligations.some(ob => ob.id === item.obligationId) ||
 			!["passed", "failed", "not_run", "unknown"].includes(item.result) ||
 			!Array.isArray(item.evidenceRefs) || !Array.isArray(item.limitations) ||
+			(item.schemaErrors !== undefined && (!validEvaluatorSchemaErrors(item.schemaErrors) ||
+				item.schemaErrors.some(error => item.result === "passed"))) ||
 			item.evidenceRefs.some(ref => !receipt.candidate.some(candidate => candidate.name === ref) &&
 				!receipt.frozenEvidence.some(file => file.name === ref) &&
 				!receipt.observations.some(file => file.name === ref)) ||
@@ -189,6 +192,13 @@ export async function evaluateLocalM07Task(input: { contract: OriginalObjectiveC
 	await mkdir(observationSnapshotDir, { mode: 0o700 });
 	const result = await evaluator.evaluate({ contract, missionId: contract.id, runId: goal.runId,
 		taskId: task.taskId, candidate, frozenEvidence, observationOutputDir });
+	const taskContract = validatedTaskInputContract(evaluator.taskInputContract);
+	const contractedPaths = new Set(taskContract?.artifacts.map(item => item.path) ?? []);
+	if (!Array.isArray(result.checks) || result.checks.some(item => item.schemaErrors !== undefined &&
+		(!validEvaluatorSchemaErrors(item.schemaErrors) || item.result === "passed" ||
+			!taskContract || item.schemaErrors.some((error: { artifact: string }) =>
+				!contractedPaths.has(error.artifact)))))
+		throw new HarnessError("local.evaluator.receipt", "evaluator returned invalid schema-error feedback");
 	if (!Array.isArray(result.observations) || result.observations.some(item =>
 		!item || typeof item.name !== "string" || !observationName.test(item.name) ||
 		!["text", "json"].includes(item.kind) ||
@@ -220,7 +230,10 @@ export async function evaluateLocalM07Task(input: { contract: OriginalObjectiveC
 		evaluator: { id: evaluator.id, version: evaluator.version }, candidate, observations,
 		frozenEvidence, checks: result.checks.map(item => ({ obligationId: item.obligationId,
 			result: item.result, evidenceRefs: [...item.evidenceRefs],
-			limitations: [...item.limitations] })), limitations: [...result.limitations] };
+			limitations: [...item.limitations],
+			...(item.schemaErrors ? { schemaErrors: item.schemaErrors.map((error: {
+				artifact: string; path: string; message: string }) => ({ ...error })) } : {}) })),
+		limitations: [...result.limitations] };
 	await verifyLocalEvaluatorReceipt(receipt, contract, goal, task);
 	const frozenCopies = new Map<string, string>();
 	for (const name of new Set(receipt.checks.flatMap(item => item.evidenceRefs))) {
@@ -246,7 +259,9 @@ export async function evaluateLocalM07Task(input: { contract: OriginalObjectiveC
 		review: { taskId: task.taskId, artifacts: [receiptFile, ...sources,
 			...observations.map(item => item.file), ...frozenCopies.values()], checks,
 			failures: resolved.flatMap(item => item.error ? [item.error] : []),
-			limitations: [...receipt.limitations, ...receipt.checks.flatMap(item => item.limitations)] } };
+			limitations: [...receipt.limitations, ...receipt.checks.flatMap(item => [
+				...item.limitations, ...(item.schemaErrors ?? []).map(error =>
+					`Schema error in ${error.artifact} at ${error.path}: ${error.message}`)])] } };
 }
 
 export async function readLocalEvaluatorReceipt(file: string): Promise<{ receipt: LocalEvaluatorReceiptV1; sha256: string }> {
