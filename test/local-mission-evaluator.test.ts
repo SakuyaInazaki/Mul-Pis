@@ -53,9 +53,10 @@ function reopenedInNewProcess(root: string, missionId: string, action: "status" 
 }
 
 function cliWithTrustedPreload(root: string, action: "start" | "run" | "resume" | "status",
-	argument: string) {
+	argument: string, twoStep = false) {
 	const env = { ...process.env };
 	for (const name of Object.keys(env)) if (/KEY|TOKEN|SECRET|PASSWORD/i.test(name)) delete env[name];
+	if (twoStep) env.MULPIS_SYNTHETIC_TWO_STEP = "1";
 	const repo = path.join(import.meta.dirname, "..");
 	const child = spawnSync(process.execPath, ["--import", path.join(import.meta.dirname,
 		"fixtures", "trusted-cli-evaluator-preload.ts"), path.join(repo, "src", "cli.ts"),
@@ -65,6 +66,15 @@ function cliWithTrustedPreload(root: string, action: "start" | "run" | "resume" 
 		{ cwd: repo, env, encoding: "utf8" });
 	assert.equal(child.status, 0, `${action}: ${child.stderr}\n${child.stdout}`);
 	return JSON.parse(child.stdout.trim()) as Record<string, unknown>;
+}
+
+async function readMissionCheckpoint(root: string, missionId: string) {
+	const bytes = await LocalMissionHost.readLatestCheckpoint(path.join(root, ".agent", "missions", missionId));
+	assert(bytes);
+	return JSON.parse(bytes.toString("utf8")) as {
+		assessmentHistory: unknown[]; boundedRuns: Array<{ runId: string }>;
+		continuation: { unresolvedOperationIds: string[] }; stopReason: string;
+	};
 }
 
 async function readEvents(root: string, toolName: string): Promise<ReadReturnEvent[]> {
@@ -853,4 +863,79 @@ test("real CLI start, run and resume load trusted preloader and select a host-cr
 		{ cwd: repo, env, encoding: "utf8" });
 	assert.notEqual(invalidStatus.status, 0);
 	assert.match(invalidStatus.stderr, /fulfilled checkpoint was recorded.*current evidence is invalid/i);
+});
+
+test("fresh CLI resumes dispatch one settled M07/M04 at a time and hold on unknown effects", async t => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-cli-steps-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const ws = new Workspace(root);
+	await mkdir(path.dirname(ws.problemFile), { recursive: true });
+	await writeFile(ws.problemFile, "Produce two distinct synthetic candidates.\n");
+	const store = createFileKnowledgeStore(ws.knowledgeDir);
+	await runInit(ws, store);
+	const config = { roles: { research: "fake/research", execution: "fake/execution" },
+		localMission: { evaluatorId: "test:byte-observation" }, concurrency: 1, tools: {} };
+	await writeFile(ws.configFile, `${JSON.stringify(config, null, 2)}\n`);
+	await runM04({ ws, runner: new FakeSessionRunner(() => "Offline baseline; no proposal."),
+		store, config }, { feedback: { kind: "file", label: "Synthetic baseline",
+			path: ws.problemFile }, freshSession: true });
+	const requestFile = path.join(root, "original-request.json");
+	await writeFile(requestFile, `${JSON.stringify({ version: 1,
+		kind: "local-original-objective-request", goal: "Produce two distinct synthetic candidates",
+		goalSource: "verbatim-private-input", obligations: [{ id: "answer",
+			description: "Produce measured synthetic candidates", type: "test-byte-count" }],
+		closure: "open-ended" }, null, 2)}\n`);
+	const missionId = cliWithTrustedPreload(root, "start", requestFile, true).missionId as string;
+	const baselineM04 = (await ws.listRuns("M04")).length;
+	const first = cliWithTrustedPreload(root, "resume", missionId, true);
+	const firstCheckpoint = await readMissionCheckpoint(root, missionId);
+	assert.equal(first.objectiveOutcome, "incomplete");
+	assert.equal(firstCheckpoint.boundedRuns.length, 1);
+	assert.equal((await ws.listRuns("M07")).length, 1);
+	assert.equal((await ws.listRuns("M04")).length, baselineM04 + 1);
+	assert.equal((await ws.listRuns("MISSION")).length, 1);
+	const firstRunId = firstCheckpoint.boundedRuns[0]!.runId;
+	const firstGoalFile = path.join(ws.runDir("M07", firstRunId), "goal.json");
+	const firstGoalBytes = await readFile(firstGoalFile);
+	const firstGoal = JSON.parse(firstGoalBytes.toString("utf8")) as {
+		lifecycle: string; tasks: Array<{ objective: string; status: string }> };
+	assert.equal(firstGoal.lifecycle, "finished");
+	assert.equal(firstGoal.tasks[0]!.status, "accepted");
+
+	const second = cliWithTrustedPreload(root, "resume", missionId, true);
+	const secondCheckpoint = await readMissionCheckpoint(root, missionId);
+	assert.equal(second.objectiveOutcome, "incomplete");
+	assert.equal(secondCheckpoint.boundedRuns.length, 2);
+	assert.equal(secondCheckpoint.boundedRuns[0]!.runId, firstRunId);
+	assert.equal((await ws.listRuns("M07")).length, 2);
+	assert.equal((await ws.listRuns("M04")).length, baselineM04 + 2);
+	assert.equal((await ws.listRuns("MISSION")).length, 2);
+	assert.deepEqual(await readFile(firstGoalFile), firstGoalBytes, "fresh owner did not replay first task");
+	const secondRunId = secondCheckpoint.boundedRuns[1]!.runId;
+	assert.notEqual(secondRunId, firstRunId);
+	const secondGoal = JSON.parse(await readFile(path.join(ws.runDir("M07", secondRunId),
+		"goal.json"), "utf8")) as { lifecycle: string;
+			tasks: Array<{ objective: string; status: string }> };
+	assert.equal(secondGoal.lifecycle, "finished");
+	assert.equal(secondGoal.tasks[0]!.status, "accepted");
+	assert.notEqual(secondGoal.tasks[0]!.objective, firstGoal.tasks[0]!.objective);
+	for (const runId of await ws.listRuns("M04"))
+		assert.equal((await ws.readRun("M04", runId)).status, "completed");
+
+	const repo = path.join(import.meta.dirname, "..");
+	const env = { ...process.env };
+	for (const name of Object.keys(env)) if (/KEY|TOKEN|SECRET|PASSWORD/i.test(name)) delete env[name];
+	const injected = spawnSync(process.execPath, [path.join(import.meta.dirname, "fixtures",
+		"local-mission-record-unknown.ts"), root, missionId],
+		{ cwd: repo, env, encoding: "utf8", timeout: 30_000 });
+	assert.equal(injected.status, 0, injected.stderr);
+	const held = cliWithTrustedPreload(root, "resume", missionId, true);
+	const heldCheckpoint = await readMissionCheckpoint(root, missionId);
+	assert.equal(held.stopReason, "execution-interrupted");
+	assert(heldCheckpoint.continuation.unresolvedOperationIds.includes("synthetic-unsettled-effect"));
+	assert.equal(heldCheckpoint.assessmentHistory.length, secondCheckpoint.assessmentHistory.length);
+	assert.equal(heldCheckpoint.boundedRuns.length, 2);
+	assert.equal((await ws.listRuns("MISSION")).length, 2, "unknown effect blocked assessor");
+	assert.equal((await ws.listRuns("M07")).length, 2, "unknown effect blocked dispatch");
+	assert.equal((await ws.listRuns("M04")).length, baselineM04 + 2);
 });

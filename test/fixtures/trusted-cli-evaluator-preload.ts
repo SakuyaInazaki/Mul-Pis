@@ -64,6 +64,7 @@ registerTrustedCliFakeRunnerFactory(() => new FakeSessionRunner(async ({ spec })
 			"original-objective.json"), "utf8")) as { id: string };
 		const ref = { sourceId: "original-problem.txt", startLine: 1, endLine: 1 };
 		const first = spec.label.endsWith("-1");
+		const twoStep = process.env.MULPIS_SYNTHETIC_TWO_STEP === "1";
 		const selectedObservation = (await readdir(spec.tools.root)).find(name =>
 			/^observation-byte-count-[0-9a-f]{16}\.json$/.test(name));
 		const issue = { id: "synthetic-gap", claim: "Synthetic byte count needs observation",
@@ -71,6 +72,28 @@ registerTrustedCliFakeRunnerFactory(() => new FakeSessionRunner(async ({ spec })
 			sourceRefs: [ref], implication: "A host observation can settle the synthetic check",
 			...(first ? {} : { resolution: { explanation: "The selected host observation records the synthetic result.",
 				evidenceRefs: [{ sourceId: selectedObservation, startLine: 1, endLine: 1 }] } }) };
+		if (twoStep && !first) {
+			const priorIssue = { id: "synthetic-gap", claim: "Synthetic byte count needs observation",
+				status: "open", classification: "explicit-requirement", sourceRefs: [ref],
+				implication: "A host observation can settle the synthetic check" };
+			const secondIssue = { id: "synthetic-second-gap",
+				claim: "A distinct synthetic candidate still needs observation", status: "open",
+				classification: "explicit-requirement", sourceRefs: [ref],
+				implication: "A second bounded task can test a separate candidate" };
+			return { text: JSON.stringify({ version: 1, decision: "continue",
+				rationale: "The first reviewed task is settled; test a distinct candidate.",
+				evidenceRefs: ["original-problem.txt"], unresolvedObligations: ["answer"],
+				unresolvedDetails: [priorIssue.claim, secondIssue.claim],
+				groundedAssessment: { version: 1, kind: "grounded-assessment-proposal",
+					contractId: contract.id, missionStatus: "open", issues: [priorIssue, secondIssue],
+					legacyOpenDetails: [],
+					nextTask: { objective: "Produce a second distinct synthetic byte-count candidate",
+						obligationIds: ["answer"], addresses: [secondIssue.id],
+						adapterScope: "local-m07-reason",
+						decisionChangingHypothesis: "A second observation can test a distinct candidate",
+						expectedEvidence: "Second host-created JSON observation", sourceRefs: [ref] } } }),
+				readReturns: await readEvents(spec.tools.root, "objective_evidence_read") };
+		}
 		return { text: JSON.stringify(first ? { version: 1, decision: "continue",
 			rationale: "The synthetic candidate needs a host measurement.",
 			evidenceRefs: ["original-problem.txt"], unresolvedObligations: ["answer"],
