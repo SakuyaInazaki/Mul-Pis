@@ -223,7 +223,8 @@ export interface TransportFailureDiagnostic {
 	providerErrorCode: string | null;
 	providerErrorType: string | null;
 	/** Host-classified, bounded cause; unknown when the provider metadata is ambiguous. */
-	providerErrorReasonClass?: "context-window" | "input-schema" | "tool-reasoning" | "unknown";
+	providerErrorReasonClass?: "context-window" | "input-schema" | "tool-reasoning" |
+		"insufficient-balance" | "unknown";
 	/** Arithmetic checked from the provider's complete context-limit sentence; no provider text or request ID. */
 	providerContextOverflow?: { contextWindow: number; messagesTokens: number; completionTokens: number;
 		requestedTokens: number; allowedCompletionTokens: number };

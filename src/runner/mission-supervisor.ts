@@ -12,6 +12,8 @@ import { isVerifiedLinkedUnknownDelivery, isVerifiedWorkflowRepairPlan,
 import type { TestedControlBinding } from "./mission-resume-journal.ts";
 import { isVerifiedInterruptedSourceCapability,
 	type VerifiedInterruptedSourceCapabilityV1 } from "./interrupted-source-review.ts";
+import { isVerifiedProviderAvailabilityProof,
+	type VerifiedProviderAvailabilityProofV1 } from "./provider-availability-proof.ts";
 
 type Source = Readonly<{ runId: string; runAttempt: number; commit: string }>;
 const hex64 = (value: unknown): value is string =>
@@ -36,6 +38,10 @@ export type MissionStatusV1 = Readonly<{
 	stopReason: ObjectiveStopReason | null;
 	selectedTupleSha256: string;
 	unresolvedOperationRefs: readonly string[];
+	/** A terminal provider payment rejection, separately observed from pending scientific or operation work. */
+	providerPaymentHold?: Readonly<{ kind: "provider-payment-required";
+		evidence: "authenticated-http-402" | "exact-insufficient-balance" |
+			"runtime-availability-unverified" }>;
 	pendingAction?: PendingActionV1;
 }>;
 
@@ -146,6 +152,7 @@ export type SupervisorSnapshot = Readonly<{
 	freshLaunchContract?: FreshIndependentLaunchContractV1;
 	interruptedSourceReview?: VerifiedInterruptedSourceCapabilityV1;
 	workflowRepairPlan?: VerifiedWorkflowRepairPlanV1;
+	providerAvailabilityProof?: VerifiedProviderAvailabilityProofV1;
 	linkedUnknownDelivery?: LinkedUnknownDeliveryV1;
 	dispatchRecord: ResumeDispatchRecord;
 }>;
@@ -179,7 +186,7 @@ export type SupervisorDecision =
 		"quarantined-operation-needs-reconciliation" | "accounting-chain-needs-reconciliation" |
 		"user-cancelled" | "execution-interrupted" | "cancellation-origin-unverified" |
 		"terminal-action-needs-reclassification" | "workflow-repair-plan-required" |
-		"interruption-source-review-required";
+		"interruption-source-review-required" | "provider-payment-required";
 		idempotencyKey?: string; successorRunId?: string }>
 	| Readonly<{ kind: "restore-evidence"; evidenceRefs: readonly string[] }>
 	| Readonly<{ kind: "exclusive-external-input";
@@ -225,6 +232,11 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 	if (status?.version !== 1 || status.kind !== "host-redacted-mission-status" ||
 		!ref(status.contractId) || !hex64(status.selectedTupleSha256) ||
 		!refs(status.unresolvedOperationRefs) ||
+		(status.providerPaymentHold !== undefined &&
+			(status.providerPaymentHold.kind !== "provider-payment-required" ||
+			 !["authenticated-http-402", "exact-insufficient-balance",
+				"runtime-availability-unverified"].includes(
+				status.providerPaymentHold.evidence) || status.objectiveOutcome !== "incomplete")) ||
 		!["incomplete", "fulfilled"].includes(status.objectiveOutcome))
 		fail("redacted mission status is invalid");
 	if (dispatchRecord?.state !== "not-requested" && dispatchRecord?.state !== "reserved" &&
@@ -307,6 +319,17 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 			fail("cancellation origin does not bind terminal carry");
 		return { kind: "wait", reason: event.origin === "explicit-user-request" ?
 			"user-cancelled" : "execution-interrupted" };
+	}
+	if (status.providerPaymentHold) {
+		const availability = snapshot.providerAvailabilityProof;
+		if (!availability) return { kind: "wait", reason: "provider-payment-required" };
+		if (!isVerifiedProviderAvailabilityProof(availability) ||
+			availability.terminalSource.runId !== terminalCarry.source.runId ||
+			availability.terminalSource.runAttempt !== terminalCarry.source.runAttempt ||
+			availability.terminalSource.commit !== terminalCarry.source.commit ||
+			availability.terminalEnvelopeSha256 !== terminalCarry.envelopeSha256 ||
+			availability.testedSourceCommit !== snapshot.freshLaunchContract?.testedSourceCommit)
+			fail("provider availability proof does not bind the held terminal carry and tested source");
 	}
 	if (terminalInterruption && status.pendingAction?.humanRequired) {
 		pendingActionIdentity(status.pendingAction);

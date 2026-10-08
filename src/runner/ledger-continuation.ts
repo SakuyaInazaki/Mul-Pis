@@ -16,6 +16,7 @@ import type { TransportFailureDiagnostic } from "./types.ts";
 import { campaignSessionEffectId } from "./deepseek-campaign.ts";
 import { isNativeCnyPricingRecord, type NativeCnyPricingProfile } from "./deepseek-cny-pricing.ts";
 import { isDeepSeekProviderOutputLimitRecord, type DeepSeekProviderOutputLimit } from "./deepseek-provider-limits.ts";
+import { claimVerifiedDeepSeekAvailability, type VerifiedDeepSeekAvailability } from "./deepseek-availability.ts";
 import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY,
 	MISSION_TOTAL_CNY, PRIVATE_CONTINUATION_FILE_KEYS } from "./signed-mission-ledger.ts";
 import type { BootstrapBinding, PrivateContinuationBundle } from "./signed-mission-ledger.ts";
@@ -511,6 +512,10 @@ export type PriorRunControlObservation = Readonly<{
 }>;
 export type LedgerContinuation = {
 	mode: "accounting-only";
+	/** A provider payment hold derived only from authenticated prior control evidence. */
+	priorProviderPaymentHold: boolean;
+	/** Seal one process-verified read-only availability observation before model work. */
+	appendProviderAvailabilityObservation: (observation: VerifiedDeepSeekAvailability) => string;
 	priorRunControlObservation?: PriorRunControlObservation;
 	incrementalPrefixObservation?: AuthenticatedIncrementalPrefixObservation;
 	incrementalPrefixFailure?: IncrementalPrefixFailure;
@@ -938,7 +943,8 @@ const TRANSPORT_PROVIDER_CODES = new Set(["invalid_request_error", "invalid_form
 	"rate_limit_exceeded", "insufficient_quota", "content_filter"]);
 const TRANSPORT_PROVIDER_TYPES = new Set(["invalid_request_error", "authentication_error",
 	"permission_error", "not_found_error", "rate_limit_error", "server_error"]);
-const TRANSPORT_PROVIDER_REASONS = new Set(["context-window", "input-schema", "tool-reasoning", "unknown"]);
+const TRANSPORT_PROVIDER_REASONS = new Set(["context-window", "input-schema", "tool-reasoning",
+	"insufficient-balance", "unknown"]);
 const TRANSPORT_NETWORK_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "ECONNABORTED",
 	"ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EPIPE",
 	"UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT",
@@ -1014,6 +1020,67 @@ function transportDiagnosticCensus(cp: Pick<AccountingCheckpoint,
 	}
 	Object.freeze(census.entries);
 	return Object.freeze(census);
+}
+
+type ProviderAvailabilityEntry = Readonly<{ source: Readonly<{ runId: string; runAttempt: number;
+	commit: string }>; priorEnvelopeSha256: string;
+	availability: VerifiedDeepSeekAvailability["availability"] }>;
+function providerAvailabilityEntries(cp: Pick<AccountingCheckpoint,
+	"privateBundle" | "ancestry" | "source" | "parentDigest">): ProviderAvailabilityEntry[] {
+	const raw = cp.privateBundle?.["provider-availability-observation.json"];
+	if (raw === undefined) return [];
+	let value: unknown;
+	try { value = JSON.parse(raw); } catch { return reject("provider availability observation JSON is invalid"); }
+	if (!record(value) || !exactKeys(value, ["version", "kind", "entries"]) ||
+		value.version !== 1 || value.kind !== "provider-availability-observation" ||
+		!Array.isArray(value.entries) || !value.entries.length)
+		reject("provider availability observation fields are invalid");
+	const sources = [...cp.ancestry, cp];
+	let lastIndex = -1;
+	for (const entry of value.entries) {
+		if (!record(entry) || !exactKeys(entry, ["source", "priorEnvelopeSha256", "availability"]) ||
+			!record(entry.source) || !exactKeys(entry.source, ["runId", "runAttempt", "commit"]) ||
+			!positiveId(entry.source.runId) || !Number.isSafeInteger(entry.source.runAttempt) ||
+			Number(entry.source.runAttempt) < 1 || typeof entry.source.commit !== "string" ||
+			!/^[0-9a-f]{40}$/.test(entry.source.commit) ||
+			typeof entry.priorEnvelopeSha256 !== "string" ||
+			!/^[0-9a-f]{64}$/.test(entry.priorEnvelopeSha256) ||
+			!["available", "unavailable", "unknown"].includes(String(entry.availability)))
+			reject("provider availability entry is invalid");
+		const entrySource = entry.source as Record<string, unknown>;
+		const index = sources.findIndex(row => row.source.runId === entrySource.runId &&
+			row.source.runAttempt === entrySource.runAttempt && row.source.commit === entrySource.commit);
+		if (index <= lastIndex || sources[index]?.parentDigest !== entry.priorEnvelopeSha256)
+			reject("provider availability entry is not bound to exact carry ancestry");
+		lastIndex = index;
+	}
+	return value.entries as ProviderAvailabilityEntry[];
+}
+
+function providerPaymentHold(cp: AccountingCheckpoint): MissionStatusV1["providerPaymentHold"] {
+	const sources = [...cp.ancestry, cp];
+	const availability = providerAvailabilityEntries(cp);
+	const census = transportDiagnosticCensus(cp);
+	let held: MissionStatusV1["providerPaymentHold"];
+	for (const row of sources) {
+		const observed = availability.find(item => item.source.runId === row.source.runId &&
+			item.source.runAttempt === row.source.runAttempt && item.source.commit === row.source.commit);
+		if (observed?.availability === "available") held = undefined;
+		else if (observed && !held) held = { kind: "provider-payment-required",
+			evidence: "runtime-availability-unverified" };
+		const terminalRequest = row.requestAudit.requests.at(-1);
+		const diagnostic = census?.entries.find(item => item.source.runId === row.source.runId &&
+			item.source.runAttempt === row.source.runAttempt && item.source.commit === row.source.commit);
+		if (terminalRequest?.status === "unknown" && terminalRequest.responseReceived === false) {
+			const last = diagnostic?.rows.findLast(item => item.requestId === terminalRequest.requestId &&
+				item.availability === "observed" && item.httpStatus === 402 &&
+				item.responseStarted === true);
+			if (last?.availability === "observed") held = { kind: "provider-payment-required",
+				evidence: last.providerErrorReasonClass === "insufficient-balance" ?
+					"exact-insufficient-balance" : "authenticated-http-402" };
+		}
+	}
+	return held;
 }
 function sourceOf(run: Run): Source {
 	if (!Number.isSafeInteger(run.id) || run.id! <= 0 ||
@@ -2212,6 +2279,7 @@ function validateAncestryV3(cp: AccountingCheckpoint, sources: Source[], seedDig
 	if (!reviewedEffectPrefixValid(cp))
 		reject("reviewed effect ancestry does not match prior accounting and host restart claims");
 	transportDiagnosticCensus(cp);
+	providerAvailabilityEntries(cp);
 }
 function sealCheckpoint(cp: Checkpoint, key: Buffer): string {
 	const nonce = randomBytes(12);
@@ -3155,11 +3223,13 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 		}
 		if (checkpoint.objectiveOutcome === "fulfilled")
 			reject("terminal objective closure lacks an independent host receipt");
+		const paymentHold = providerPaymentHold(latestCheckpoint);
 		const status: MissionStatusV1 = {
 			version: 1, kind: "host-redacted-mission-status",
 			contractId: (selected.checkpoint.contract as Record<string, unknown>).id as string,
 			objectiveOutcome: checkpoint.objectiveOutcome, stopReason: checkpoint.stopReason,
 			selectedTupleSha256: selected.sha256, unresolvedOperationRefs: unresolved,
+			...(paymentHold ? { providerPaymentHold: paymentHold } : {}),
 			...(pendingAction ? { pendingAction } : {})
 		};
 		return { status, ...(pendingAction ? { pendingAction } : {}),
@@ -3240,6 +3310,7 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 	let diagnosticPrepared = false;
 	let preparedDiagnosticText: string | undefined;
 	let preparedDiagnosticAuditSha256: string | undefined;
+	let preparedAvailabilityText: string | undefined;
 	const validateCurrentDiagnostic = (cp: AccountingCheckpoint): void => {
 		const latest = transportDiagnosticCensus(cp);
 		const inherited = priorTransportDiagnosticCensus?.entries ?? [];
@@ -3528,6 +3599,28 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 		catch { return undefined; }
 	};
 	const result: LedgerContinuation = { mode: "accounting-only",
+		priorProviderPaymentHold: latestCheckpoint?.version === 3 ?
+			Boolean(providerPaymentHold(latestCheckpoint)) : false,
+		appendProviderAvailabilityObservation: observation => {
+			if (sealed || preparedAvailabilityText !== undefined ||
+				!claimVerifiedDeepSeekAvailability(observation))
+				reject("provider availability observation lacks one live verified check");
+			const prior = latestCheckpoint?.version === 3 ?
+				providerAvailabilityEntries(latestCheckpoint) : [];
+			const source = { runId: currentSource.runId, runAttempt: currentSource.runAttempt,
+				commit: currentSource.commit };
+			const next = JSON.stringify({ version: 1, kind: "provider-availability-observation",
+				entries: [...prior, { source, priorEnvelopeSha256: parentDigest,
+					availability: observation.availability }] });
+			providerAvailabilityEntries({ privateBundle: {
+				"provider-availability-observation.json": next }, ancestry: accountingAncestry,
+				source: currentSource, parentDigest });
+			if (!validBundle({ ...priorPrivateBundle,
+				"provider-availability-observation.json": next }, true))
+				reject("provider availability observation exceeds the physical carry bound");
+			preparedAvailabilityText = next;
+			return next;
+		},
 		...(proof && latestCheckpoint?.version === 3 ? {
 			priorRunControlObservation: Object.freeze({
 				source: Object.freeze({ ...latestCheckpoint.source }),
@@ -3653,7 +3746,17 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 		},
 		sealCurrent: (amounts, restoredHistory) => {
 			if (sealed) reject("current carry was already sealed");
-			const privateBundle = amounts.privateBundle ?? priorPrivateBundle;
+			const proposedBundle = amounts.privateBundle ?? priorPrivateBundle;
+			if ((preparedAvailabilityText === undefined &&
+				proposedBundle?.["provider-availability-observation.json"] !==
+					priorPrivateBundle?.["provider-availability-observation.json"]) ||
+				(proposedBundle?.["provider-availability-observation.json"] !== undefined &&
+				proposedBundle["provider-availability-observation.json"] !== preparedAvailabilityText &&
+				proposedBundle["provider-availability-observation.json"] !==
+					priorPrivateBundle?.["provider-availability-observation.json"]))
+				reject("provider availability observation changed without a live verified check");
+			const privateBundle = preparedAvailabilityText === undefined ? proposedBundle :
+				{ ...proposedBundle, "provider-availability-observation.json": preparedAvailabilityText };
 			const bootstrapBinding = amounts.bootstrapBinding ?? priorBootstrapBinding;
 			if ((opaqueExecutedRuns.length || storedUnobservedControlDeliveries.length || currentEffectReviewPending ||
 				pendingEffectAncestry.length) && amounts.requestAudit.requests.length > 0 &&
@@ -3831,6 +3934,13 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 				pending.push({ ...predecessor });
 			}
 			const emergencyBundle = { ...priorPrivateBundle };
+			if (amounts.privateBundle?.["provider-availability-observation.json"] !== undefined &&
+				amounts.privateBundle["provider-availability-observation.json"] !== preparedAvailabilityText &&
+				amounts.privateBundle["provider-availability-observation.json"] !==
+					priorPrivateBundle["provider-availability-observation.json"])
+				reject("emergency availability observation changed without a live verified check");
+			if (preparedAvailabilityText !== undefined)
+				emergencyBundle["provider-availability-observation.json"] = preparedAvailabilityText;
 			if (restoredHistory !== undefined) {
 				const verified = emergencyResearchHistoryReceipts.get(restoredHistory);
 				if (!verified || !proof || verified.priorProof !== proof ||

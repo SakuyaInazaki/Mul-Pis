@@ -120,8 +120,8 @@ class TransportProbe {
 			if (typeof type === "string" && SAFE_PROVIDER_ERROR_TYPES.has(type)) this.providerErrorType = type;
 			this.providerContextOverflow = this.providerErrorType === "invalid_request_error" ?
 				parseProviderContextOverflow(message) : undefined;
-			this.providerErrorReasonClass = classifyProviderErrorReason(this.providerErrorCode,
-				this.providerErrorType, message, Boolean(this.providerContextOverflow));
+			this.providerErrorReasonClass = classifyProviderErrorReason(this.httpStatus,
+				this.providerErrorCode, type, message, Boolean(this.providerContextOverflow));
 			if (this.privateSanitize) {
 				const scrub = (value: unknown): string | null => {
 					if (typeof value !== "string") return null;
@@ -223,12 +223,16 @@ async function observeBoundedRejectedResponse(response: Response): Promise<boole
 
 /** Provider error text is untrusted and may echo a prompt. Use only a documented,
  * complete error sentence, never a substring match, and discard the text. */
-function classifyProviderErrorReason(code: string | null, type: string | null, message: unknown,
+function classifyProviderErrorReason(status: number | null, code: string | null, type: unknown, message: unknown,
 	contextOverflow: boolean):
 	NonNullable<TransportFailureDiagnostic["providerErrorReasonClass"]> {
 	if (contextOverflow) return "context-window";
 	if (code === "context_length_exceeded") return "context-window";
 	if (code === "invalid_format" || code === "invalid_parameter") return "input-schema";
+	if (status === 402 && code === "invalid_request_error" && type === "unknown_error" &&
+		typeof message === "string" &&
+		/^Insufficient Balance(?: \(request_id: [0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\))?$/.test(message))
+		return "insufficient-balance";
 	if (type === "invalid_request_error" &&
 		message === "The reasoning_content in the thinking mode must be passed back to the API.")
 		return "tool-reasoning";

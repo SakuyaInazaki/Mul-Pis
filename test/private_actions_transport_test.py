@@ -1,4 +1,5 @@
 import base64
+import contextlib
 import gzip
 import hashlib
 import importlib.util
@@ -19,6 +20,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/private_actions_transport.py"
+sys.path.insert(0, str(SCRIPT.parent))
+import provider_balance_probe as balance_probe
 spec = importlib.util.spec_from_file_location("private_actions_transport", SCRIPT)
 transport = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(transport)
@@ -429,6 +432,239 @@ class EncryptTests(unittest.TestCase):
                 serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
             with self.assertRaises(transport.TransportError):
                 transport.encrypt_results(results, public, root / "out", self.metadata, self.fingerprint)
+
+    def test_small_provider_observation_is_sealed_in_campaign_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results = root / "results"
+            results.mkdir()
+            observation = b'{"kind":"provider-availability-observation","status":"unknown"}'
+            (results / "provider-availability-observation.json").write_bytes(observation)
+            public = root / "public.pem"
+            public.write_bytes(self.private_key.public_key().public_bytes(
+                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+            output = root / "campaign.enc.json"
+            transport.encrypt_results(results, public, output, self.metadata, self.fingerprint)
+            self.assertNotIn(observation, output.read_bytes())
+            private = root / "private.pem"
+            private.write_bytes(self.private_key.private_bytes(serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+            recovered = transport.decrypt_results(output, private, root)
+            self.assertEqual((recovered / "provider-availability-observation.json").read_bytes(),
+                             observation)
+            (results / "provider-availability-observation.json").write_bytes(b"x" * 4097)
+            transport.encrypt_results(results, public, root / "history.enc.json", self.metadata,
+                                      self.fingerprint)
+
+
+class BalanceProbeTests(unittest.TestCase):
+    def test_initial_probe_branch_creation_and_existing_tip_binding(self):
+        source, old_tip, wrong_tip = "a" * 40, "b" * 40, "c" * 40
+        self.assertTrue(balance_probe.valid_probe_request_before([source], "0" * 40))
+        self.assertTrue(balance_probe.valid_probe_request_before([source], source))
+        self.assertTrue(balance_probe.valid_probe_request_before([source, old_tip], old_tip))
+        self.assertFalse(balance_probe.valid_probe_request_before([source], wrong_tip))
+        self.assertFalse(balance_probe.valid_probe_request_before([source, old_tip], "0" * 40))
+        self.assertFalse(balance_probe.valid_probe_request_before([source, old_tip], source))
+        self.assertFalse(balance_probe.valid_probe_request_before([source, source], source))
+        self.assertFalse(balance_probe.valid_probe_request_before([], "0" * 40))
+
+    def test_exact_source_ci_success_after_first_hundred_runs(self):
+        source = "a" * 40
+        rows = [{"id": index, "head_sha": source,
+                 "head_branch": "improve/workflow-learning-reliability", "event": "push",
+                 "run_attempt": 1, "conclusion": "failure"} for index in range(1, 202)]
+        rows[-1]["conclusion"] = "success"
+        requested = []
+        def get_json(path):
+            requested.append(path)
+            page = int(path.split("&page=")[-1])
+            return {"total_count": len(rows), "workflow_runs": rows[(page - 1) * 100:page * 100]}
+        self.assertTrue(balance_probe.accepted_offline_ci(get_json, source))
+        self.assertEqual(len(requested), 3)
+        self.assertTrue(requested[2].endswith("&page=3"))
+
+        def duplicate_page(path):
+            page = int(path.split("&page=")[-1])
+            if page == 2:
+                return {"total_count": 201, "workflow_runs": rows[:100]}
+            return get_json(path)
+        with self.assertRaises(ValueError):
+            balance_probe.accepted_offline_ci(duplicate_page, source)
+
+        def changing_count(path):
+            page = int(path.split("&page=")[-1])
+            result = get_json(path)
+            if page == 2:
+                result["total_count"] = 202
+            return result
+        with self.assertRaises(ValueError):
+            balance_probe.accepted_offline_ci(changing_count, source)
+
+    def test_probe_workflow_has_no_custom_admission_quotas(self):
+        workflow = (SCRIPT.parent.parent / ".github/workflows/provider-balance-check.yml").read_text()
+        self.assertNotIn("  workflow_dispatch:", workflow)
+        self.assertNotIn("inputs.", workflow)
+        for forbidden in ("timeout-minutes:", "max-parallel:", "max-cost:",
+                          "max-tokens:", "budget:", "price:"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, workflow)
+
+    class _Response:
+        def __init__(self, body, status=200):
+            self.body = body
+            self.status = status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, count):
+            return self.body[:count]
+
+    class _Opener:
+        def __init__(self, response=None, error=None):
+            self.response = response
+            self.error = error
+            self.calls = []
+
+        def open(self, request, timeout):
+            self.calls.append((request, timeout))
+            if self.error is not None:
+                raise self.error
+            return self.response
+
+    def test_true_false_and_only_one_read_only_request(self):
+        for flag, expected in ((True, "available"), (False, "unavailable")):
+            with self.subTest(flag=flag):
+                response = self._Response(json.dumps({"is_available": flag,
+                    "balance_infos": [{"currency": "CNY", "total_balance": "SECRET-AMOUNT-412.15",
+                                       "granted_balance": "0.00", "topped_up_balance": "412.15"}]}).encode())
+                opener = self._Opener(response)
+                self.assertEqual(balance_probe.probe_balance("SECRET-CREDENTIAL", opener), expected)
+                self.assertEqual(len(opener.calls), 1)
+                request, timeout = opener.calls[0]
+                self.assertEqual(request.full_url, "https://api.deepseek.com/user/balance")
+                self.assertEqual(request.get_method(), "GET")
+                self.assertEqual(request.get_header("Authorization"), "Bearer SECRET-CREDENTIAL")
+                self.assertEqual(timeout, balance_probe.TIMEOUT_SECONDS)
+
+    def test_malformed_network_redirect_and_missing_key_are_unknown(self):
+        bodies = [b"not-json", b"[]", b'{"is_available":"true"}',
+                  b'{"is_available":1}', b'{"is_available":true,"is_available":false}',
+                  b'{"is_available":true}', b'{"is_available":true,"balance_infos":[]}',
+                  b'{"is_available":true,"balance_infos":[{"currency":"CNY"}]}',
+                  b"x" * (balance_probe.MAX_RESPONSE_BYTES + 1)]
+        for body in bodies:
+            with self.subTest(body=body[:20]):
+                self.assertEqual(balance_probe.probe_balance("KEY", self._Opener(self._Response(body))),
+                                 "unknown")
+        self.assertEqual(balance_probe.probe_balance("KEY", self._Opener(self._Response(b"{}", 503))),
+                         "unknown")
+        self.assertEqual(balance_probe.probe_balance("KEY", self._Opener(self._Response(
+            b'{"is_available":false,"balance_infos":[]}'))), "unavailable")
+        self.assertEqual(balance_probe.probe_balance("KEY", self._Opener(error=OSError(
+            "SECRET-CREDENTIAL SECRET-AMOUNT-412.15"))), "unknown")
+        no_key = self._Opener(error=AssertionError("must not request"))
+        self.assertEqual(balance_probe.probe_balance("", no_key), "unknown")
+        self.assertEqual(no_key.calls, [])
+        self.assertIsNone(balance_probe._NoRedirect().redirect_request(None, None, 302, "", {},
+                                                                        "https://example.com"))
+
+    def test_verdict_roundtrips_and_artifact_contains_no_secret_or_amount(self):
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+        spki = private_key.public_key().public_bytes(serialization.Encoding.DER,
+                                                      serialization.PublicFormat.SubjectPublicKeyInfo)
+        fingerprint = hashlib.sha256(spki).hexdigest()
+        metadata = {"repository": "SakuyaInazaki/Mul-Pis", "run_id": "123",
+                    "run_attempt": "1", "commit": "a" * 40, "event": "push"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            public = root / "public.pem"
+            public.write_bytes(private_key.public_key().public_bytes(serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo))
+            output = root / "provider-balance.enc.json"
+            transport.encrypt_balance_verdict("available", public, output, metadata, fingerprint)
+            private = root / "private.pem"
+            private.write_bytes(private_key.private_bytes(serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+            self.assertEqual(transport.decrypt_balance_verdict(output, private, fingerprint),
+                             ("available", metadata))
+            raw = output.read_bytes()
+            self.assertNotIn(b"SECRET-CREDENTIAL", raw)
+            self.assertNotIn(b"SECRET-AMOUNT-412.15", raw)
+            self.assertNotIn(b'"availability"', raw)
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            envelope = json.loads(raw)
+            self.assertEqual(set(envelope), {"format", "key_wrap", "content_cipher",
+                "recipient_spki_sha256", "metadata", "wrapped_key_b64", "nonce_b64",
+                "ciphertext_b64"})
+            self.assertEqual(envelope["format"], "mul-pis-provider-balance-v1")
+            self.assertEqual(envelope["metadata"], metadata)
+            aes_key = private_key.decrypt(base64.b64decode(envelope["wrapped_key_b64"]),
+                padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                             algorithm=hashes.SHA256(), label=None))
+            aad = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode()
+            plaintext = AESGCM(aes_key).decrypt(base64.b64decode(envelope["nonce_b64"]),
+                base64.b64decode(envelope["ciphertext_b64"]), aad)
+            self.assertEqual(json.loads(plaintext), {"kind": "provider-balance-availability",
+                "version": 1, "availability": "available"})
+            with self.assertRaises(Exception):
+                AESGCM(aes_key).decrypt(base64.b64decode(envelope["nonce_b64"]),
+                    base64.b64decode(envelope["ciphertext_b64"]), b"other run")
+            tampered = root / "tampered.enc.json"
+            altered = dict(envelope)
+            altered["metadata"] = dict(metadata, run_id="456")
+            tampered.write_text(json.dumps(altered))
+            with self.assertRaises(transport.TransportError):
+                transport.decrypt_balance_verdict(tampered, private, fingerprint)
+            altered = dict(envelope, format="mul-pis-private-campaign-v1")
+            tampered.write_text(json.dumps(altered))
+            with self.assertRaises(transport.TransportError):
+                transport.decrypt_balance_verdict(tampered, private, fingerprint)
+            with self.assertRaises(transport.TransportError):
+                transport.encrypt_balance_verdict("available", public, output, metadata, fingerprint)
+            with self.assertRaises(transport.TransportError):
+                transport.encrypt_balance_verdict("42", public, root / "invalid", metadata,
+                                                  fingerprint)
+
+    def test_cli_never_logs_verdict_credential_or_provider_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            private_key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+            public = root / "public.pem"
+            public.write_bytes(private_key.public_key().public_bytes(serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo))
+            spki = private_key.public_key().public_bytes(serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo)
+            output = root / "provider-balance.enc.json"
+            args = ["provider_balance_probe.py", "--public-key", str(public),
+                    "--expected-spki-sha256", hashlib.sha256(spki).hexdigest(),
+                    "--output", str(output), "--repository", "SakuyaInazaki/Mul-Pis",
+                    "--run-id", "123", "--run-attempt", "1", "--commit", "a" * 40,
+                    "--event", "push", "--source-commit", "b" * 40]
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with (patch.object(sys, "argv", args), patch.dict(os.environ, {
+                    "DEEPSEEK_API_KEY": "SECRET-CREDENTIAL"}), patch.object(
+                        balance_probe, "probe_balance", return_value="unknown") as fake_probe,
+                    contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr)):
+                code = balance_probe.main()
+            self.assertEqual(code, 0)
+            fake_probe.assert_called_once_with("SECRET-CREDENTIAL")
+            self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
+            self.assertTrue(output.exists())
+            output.unlink()
+            with (patch.object(sys, "argv", args), patch.dict(os.environ, {
+                    "DEEPSEEK_API_KEY": "SECRET-CREDENTIAL"}), patch.object(
+                        balance_probe, "probe_balance", side_effect=RuntimeError(
+                            "SECRET-CREDENTIAL SECRET-AMOUNT-412.15")),
+                    contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr)):
+                code = balance_probe.main()
+            self.assertEqual(code, 1)
+            self.assertNotIn("SECRET-CREDENTIAL", stdout.getvalue() + stderr.getvalue())
+            self.assertNotIn("SECRET-AMOUNT-412.15", stdout.getvalue() + stderr.getvalue())
 
 
 if __name__ == "__main__":

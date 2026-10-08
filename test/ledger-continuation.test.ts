@@ -15,6 +15,7 @@ import { reserveIndependentRestart, bindIndependentRestartGoal } from "../src/m0
 import { createOriginalObjective, objectiveProgress, type OriginalObjectiveContractV1 } from "../src/m07/objective-progress.ts";
 import { verifyDeepSeekCnyBilling, nativeCnyPricingRecord } from "../src/runner/deepseek-cny-pricing.ts";
 import { verifyDeepSeekProviderOutputLimit, providerOutputLimitRecord } from "../src/runner/deepseek-provider-limits.ts";
+import { checkDeepSeekAvailability } from "../src/runner/deepseek-availability.ts";
 import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY } from "../src/runner/signed-mission-ledger.ts";
 import { sealCampaignCarry } from "../src/runner/emergency-carry.ts";
 import { decodeCarrySidecars, encodeCarrySidecars } from "../src/runner/carry-sidecar-codec.ts";
@@ -4071,6 +4072,123 @@ test("optional encrypted transport cause census binds only unknown audit IDs and
 	const emptyAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
 		requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
 	assert.equal(reopened.appendTransportDiagnosticCensus(emptyAudit, []), text);
+});
+
+test("a terminal HTTP 402 hold survives a zero-request unavailable wrapper and clears only after a newer live available check", async t => {
+	const f = await compactedFixture(t);
+	const emptyAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
+		requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
+	const failedAudit = { ...emptyAudit, requests: [{ requestId: "payment-rejected", sessionId:
+		campaignSessionEffectId("payment-session"), inputPayloadBytes: 100,
+		responseReceived: false, status: "unknown" as const, settledCny: null,
+		unknownObservedCny: null, reportedUsage: null }], unpricedRequestCount: 1 };
+	const opening = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7005, sha("e")), loadCarryArtifact: async () => f.secondCarry.envelopeB64 });
+	const cause = opening.appendTransportDiagnosticCensus(failedAudit, [{ version: 1, promptIndex: 1,
+		requestId: "payment-rejected", phase: "response-body", httpStatus: 402,
+		responseStarted: true, bytesRead: 162, abortSource: null,
+		providerErrorCode: "invalid_request_error", providerErrorType: null,
+		providerErrorReasonClass: "unknown", providerRequestId: null, errorCodes: [] }]);
+	assert.ok(cause);
+	const sameRunAvailable = await checkDeepSeekAvailability({ apiKey: "synthetic-only", request: async () =>
+		new Response(JSON.stringify({ is_available: true, balance_infos: [{ currency: "CNY",
+			total_balance: "synthetic", granted_balance: "synthetic", topped_up_balance: "synthetic" }] }),
+			{ status: 200 }) });
+	opening.appendProviderAvailabilityObservation(sameRunAvailable);
+	const replayOpening = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7005, sha("e")), loadCarryArtifact: async () => f.secondCarry.envelopeB64 });
+	assert.throws(() => replayOpening.appendProviderAvailabilityObservation(sameRunAvailable),
+		/lacks one live verified check/, "one read-only GET cannot attest a second run reservation");
+	const heldCarry = opening.sealEmergencyCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 1, requestAudit: failedAudit,
+		privateBundle: { ...opening.priorPrivateBundle!, "transport-diagnostics.json": cause } },
+		"effect-review-incomplete");
+	const done5 = { ...third, status: "completed", conclusion: "failure" };
+	const commitOf = (runId: number): string => sha(({ 7005: "e", 7006: "f", 7007: "1", 7008: "2" } as
+		Record<number, string>)[runId]!);
+	const readNext = async (runId: number, carry: CarryArtifactPayload, priorDone: object[]) => {
+		return openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+			current: current(runId, commitOf(runId)),
+			request: async (url, init) => {
+				const address = String(url);
+				if (address.includes("/workflows/manual-private-campaign.yml/runs?"))
+					return new Response(JSON.stringify({ total_count: priorDone.length + 1,
+						workflow_runs: [run(runId, runId - 7001, "in_progress",
+							commitOf(runId)), ...priorDone] }));
+				for (const id of [7005, 7006, 7007]) {
+					if (address.includes(`/runs/${id}/jobs?`))
+						return new Response(JSON.stringify({ total_count: 1, jobs: [{ id: id - 1000,
+							run_id: id, run_attempt: 1, head_sha: commitOf(id),
+							name: "private-campaign", status: "completed", conclusion: "failure",
+							steps: [{ name: "Run private campaign", status: "completed", conclusion: "failure" }] }] }));
+					if (address.includes(`/runs/${id}/artifacts?`))
+						return new Response(JSON.stringify({ total_count: 1, artifacts: [{ id: id + 2000,
+							name: CARRY_ARTIFACT_NAME, expired: false,
+							workflow_run: { id, head_sha: commitOf(id) } }] }));
+				}
+				return f.request(url, init);
+			}, loadCarryArtifact: async () => carry });
+	};
+	const older = [{ ...second, status: "completed", conclusion: "success" },
+		{ ...first, status: "completed", conclusion: "success" }, anchor];
+	const held = await readNext(7006, heldCarry, [done5, ...older]);
+	assert.equal(held.priorProviderPaymentHold, true,
+		"a terminal 402 outranks an earlier available probe in the same run");
+	const unavailable = await checkDeepSeekAvailability({ apiKey: "synthetic-only", request: async () =>
+		new Response(JSON.stringify({ is_available: false, balance_infos: [] }), { status: 200 }) });
+	const observation = held.appendProviderAvailabilityObservation(unavailable);
+	assert.equal(JSON.parse(observation).entries.at(-1).availability, "unavailable");
+	assert.throws(() => held.sealEmergencyCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: emptyAudit, privateBundle: {
+			...held.priorPrivateBundle, "provider-availability-observation.json": observation.replace(
+				'"unavailable"', '"available"') } }, "effect-review-incomplete"),
+		/availability observation changed/);
+	const unavailableCarry = held.sealEmergencyCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: emptyAudit }, "effect-review-incomplete");
+	const nextHeld = await readNext(7007, unavailableCarry,
+		[{ ...run(7006, 5, "completed", commitOf(7006), "failure") }, done5, ...older]);
+	assert.equal(nextHeld.priorProviderPaymentHold, true,
+		"a zero-request emergency wrapper cannot erase the earlier payment hold");
+	assert.equal(nextHeld.priorPrivateBundle?.["provider-availability-observation.json"], observation);
+	const available = await checkDeepSeekAvailability({ apiKey: "synthetic-only", request: async () =>
+		new Response(JSON.stringify({ is_available: true, balance_infos: [{ currency: "CNY",
+			total_balance: "synthetic", granted_balance: "synthetic", topped_up_balance: "synthetic" }] }),
+			{ status: 200 }) });
+	const clearText = nextHeld.appendProviderAvailabilityObservation(available);
+	assert.equal(JSON.parse(clearText).entries.length, 3);
+	const clearCarry = nextHeld.sealEmergencyCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: emptyAudit }, "effect-review-incomplete");
+	const cleared = await readNext(7008, clearCarry,
+		[run(7007, 6, "completed", commitOf(7007), "failure"),
+		 run(7006, 5, "completed", commitOf(7006), "failure"), done5, ...older]);
+	assert.equal(cleared.priorProviderPaymentHold, false,
+		"only a newer process-verified available result clears the payment hold");
+	assert.equal(cleared.priorPrivateBundle?.["provider-availability-observation.json"], clearText);
+	const omittedAvailability = { ...cleared.priorPrivateBundle! };
+	delete omittedAvailability["provider-availability-observation.json"];
+	assert.throws(() => cleared.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: emptyAudit,
+		privateBundle: omittedAvailability }), /availability observation changed/,
+		"a normal sealer cannot silently erase carried provider availability history");
+	const recoveredAudit = { ...failedAudit, requests: [...failedAudit.requests, {
+		requestId: "later-response", sessionId: campaignSessionEffectId("second-session"),
+		inputPayloadBytes: 120, responseReceived: true, status: "unknown" as const,
+		settledCny: null, unknownObservedCny: null,
+		reportedUsage: { input: 10, output: 10, totalTokens: 20 } }], unpricedRequestCount: 2 };
+	const recoveredOpening = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7005, sha("e")), loadCarryArtifact: async () => f.secondCarry.envelopeB64 });
+	const earlier402 = recoveredOpening.appendTransportDiagnosticCensus(recoveredAudit, [{
+		version: 1, promptIndex: 1, requestId: "payment-rejected", phase: "response-body",
+		httpStatus: 402, responseStarted: true, bytesRead: 162, abortSource: null,
+		providerErrorCode: "invalid_request_error", providerErrorType: null,
+		providerErrorReasonClass: "unknown", providerRequestId: null, errorCodes: [] }]);
+	const recoveredCarry = recoveredOpening.sealEmergencyCurrent({ settledCny: 0,
+		unknownObservedCny: 0, unpricedRequestCount: 2, requestAudit: recoveredAudit,
+		privateBundle: { ...recoveredOpening.priorPrivateBundle!, "transport-diagnostics.json": earlier402 } },
+		"effect-review-incomplete");
+	const noFalseHold = await readNext(7006, recoveredCarry, [done5, ...older]);
+	assert.equal(noFalseHold.priorProviderPaymentHold, false,
+		"an earlier 402 followed by a received terminal response cannot mint a payment hold");
 });
 
 test("accepted selection remains authenticated across zero and emergency wrappers", async t => {

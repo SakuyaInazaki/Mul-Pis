@@ -22,6 +22,7 @@ type Args = { source: string; seed: string; publicKey: string;
 	journalDir: string; outputPrivate: string; readOnly: boolean; recoverReserved: boolean;
 	repairPlanPrivate?: string;
 	interruptedSourceReviewPrivate?: string; resultOnlyRepairReviewPrivate?: string;
+	providerAvailabilityReceiptPrivate?: string;
 	linkedUnknownDeliveryOldControlCommit?: string;
 	unobservedControlSourceReviewPrivate?: string };
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -45,7 +46,8 @@ function privateOsErrorCode(error: unknown): typeof SAFE_OS_CODES[number] | unde
 }
 type ArtifactSidecarFile = { name: string; file: string; sha256: string };
 type ArtifactFileReply = { file: string; sha256: string;
-	name?: "incremental-control-prefix.json" | "private-campaign-outcome.enc.json";
+	name?: "incremental-control-prefix.json" | "private-campaign-outcome.enc.json" |
+		"provider-balance.enc.json";
 	archiveSha256?: string;
 	sidecars?: ArtifactSidecarFile[];
 	prefix?: ArtifactSidecarFile };
@@ -115,7 +117,7 @@ function parseArgs(values: string[]): Args {
 	const keys = ["--source", "--seed", "--public-key", "--journal-dir", "--output-private"];
 	const allowed = [...keys, "--repair-plan-private", "--interrupted-source-review-private",
 		"--result-only-repair-review-private", "--linked-unknown-control-commit",
-		"--unobserved-control-source-review-private"];
+		"--unobserved-control-source-review-private", "--provider-availability-receipt-private"];
 	if (!connectorStdio || readOnly && recoverReserved || keys.some(key => !option.has(key)) ||
 		[...option.keys()].some(key => !allowed.includes(key)) ||
 		option.has("--linked-unknown-control-commit") !==
@@ -129,6 +131,8 @@ function parseArgs(values: string[]): Args {
 			{ interruptedSourceReviewPrivate: option.get("--interrupted-source-review-private")! } : {}),
 		...(option.has("--result-only-repair-review-private") ?
 			{ resultOnlyRepairReviewPrivate: option.get("--result-only-repair-review-private")! } : {}),
+		...(option.has("--provider-availability-receipt-private") ?
+			{ providerAvailabilityReceiptPrivate: option.get("--provider-availability-receipt-private")! } : {}),
 		...(option.has("--linked-unknown-control-commit") ?
 			{ linkedUnknownDeliveryOldControlCommit: option.get("--linked-unknown-control-commit")! } : {}),
 		...(option.has("--unobserved-control-source-review-private") ?
@@ -143,6 +147,7 @@ function parseArgs(values: string[]): Args {
 		(result.repairPlanPrivate !== undefined && underRepo(result.repairPlanPrivate)) ||
 		(result.interruptedSourceReviewPrivate !== undefined && underRepo(result.interruptedSourceReviewPrivate)) ||
 		(result.resultOnlyRepairReviewPrivate !== undefined && underRepo(result.resultOnlyRepairReviewPrivate)) ||
+		(result.providerAvailabilityReceiptPrivate !== undefined && underRepo(result.providerAvailabilityReceiptPrivate)) ||
 		(result.unobservedControlSourceReviewPrivate !== undefined &&
 			underRepo(result.unobservedControlSourceReviewPrivate)))
 		throw new Error("private resume records must be outside the source repository");
@@ -155,6 +160,8 @@ function connectorBridge(): { request: typeof fetch;
 	artifact: (identity: { runId: string; artifactId: string;
 		expectedArchiveSha256?: string }) => Promise<CarryArtifactPayload>;
 	resultEnvelope: (identity: { runId: string; artifactId: string;
+		expectedArchiveSha256: string }) => Promise<Uint8Array>;
+	providerAvailabilityEnvelope: (identity: { runId: string; artifactId: string;
 		expectedArchiveSha256: string }) => Promise<Uint8Array>;
 	close: () => void } {
 	const pending = new Map<number, { kind: "github-get" | "artifact-file";
@@ -189,7 +196,7 @@ function connectorBridge(): { request: typeof fetch;
 				(reply.archiveSha256 !== undefined &&
 					(typeof reply.archiveSha256 !== "string" || !/^[0-9a-f]{64}$/.test(reply.archiveSha256))) ||
 				(reply.name !== undefined && !["incremental-control-prefix.json",
-					"private-campaign-outcome.enc.json"].includes(String(reply.name))) ||
+					"private-campaign-outcome.enc.json", "provider-balance.enc.json"].includes(String(reply.name))) ||
 				(reply.name !== undefined && (reply.prefix !== undefined || reply.sidecars !== undefined)) ||
 				(reply.prefix !== undefined && (!privateFileReference(reply.prefix) ||
 					Object.keys(reply.prefix).sort().join("|") !== "file|name|sha256" ||
@@ -239,7 +246,8 @@ function connectorBridge(): { request: typeof fetch;
 			...(identity.expectedArchiveSha256 ?
 				{ expectedArchiveSha256: identity.expectedArchiveSha256 } : {}) })}\n`);
 		const observed = await reply;
-		if (observed.name === "private-campaign-outcome.enc.json")
+		if (observed.name === "private-campaign-outcome.enc.json" ||
+			observed.name === "provider-balance.enc.json")
 			throw new Error("carry artifact reply supplied a result envelope");
 		if (identity.expectedArchiveSha256 &&
 			observed.archiveSha256 !== identity.expectedArchiveSha256)
@@ -291,7 +299,27 @@ function connectorBridge(): { request: typeof fetch;
 			throw new Error("encrypted result artifact reply does not match live ZIP identity");
 		return verifiedPrivateBytes(observed, 132 * 1024 * 1024);
 	};
-	return { request, artifact, resultEnvelope, close: () => lines.close() };
+	const providerAvailabilityEnvelope = async (identity: { runId: string; artifactId: string;
+		expectedArchiveSha256: string }): Promise<Uint8Array> => {
+		if (closed || process.stdin.readableEnded)
+			throw new PrivateBridgeError("authenticated-github-connector-stdin-closed");
+		const id = ++nextId;
+		const reply = new Promise<ArtifactFileReply>((resolve, reject) =>
+			pending.set(id, { kind: "artifact-file", resolve: value =>
+				resolve(value as ArtifactFileReply), reject }));
+		process.stdout.write(`${JSON.stringify({ kind: "artifact-file", id,
+			runId: identity.runId, artifactId: identity.artifactId,
+			name: "provider-balance.enc.json",
+			expectedArchiveSha256: identity.expectedArchiveSha256 })}\n`);
+		const observed = await reply;
+		if (observed.name !== "provider-balance.enc.json" ||
+			observed.sidecars !== undefined || observed.prefix !== undefined ||
+			observed.archiveSha256 !== identity.expectedArchiveSha256)
+			throw new Error("encrypted balance artifact reply does not match live ZIP identity");
+		return verifiedPrivateBytes(observed, 64 * 1024);
+	};
+	return { request, artifact, resultEnvelope, providerAvailabilityEnvelope,
+		close: () => lines.close() };
 }
 
 /** The second argument is used only by synthetic signed-seed tests. The CLI
@@ -338,6 +366,9 @@ export async function runPrivateResumeBridge(values: string[],
 				authenticatedHostRead: { kind: "authenticated-host-github-read", request: bridge.request },
 				loadCarryArtifact: identity => bridge.artifact(identity),
 				loadResultEnvelope: identity => bridge.resultEnvelope(identity),
+				loadProviderAvailabilityEnvelope: identity => bridge.providerAvailabilityEnvelope(identity),
+				...(args.providerAvailabilityReceiptPrivate ?
+					{ providerAvailabilityReceiptPrivateFile: args.providerAvailabilityReceiptPrivate } : {}),
 				...(args.repairPlanPrivate ? { repairPlanPrivateFile: args.repairPlanPrivate } : {}),
 				...(args.interruptedSourceReviewPrivate ?
 					{ interruptedSourceReviewPrivateFile: args.interruptedSourceReviewPrivate } : {}),

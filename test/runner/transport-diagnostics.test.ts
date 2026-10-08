@@ -19,6 +19,7 @@ const OUTPUT_LIMIT = await verifyDeepSeekProviderOutputLimit({ apiKey: "syntheti
 		max_output_tokens: MODEL.maxTokens, context_window: MODEL.contextWindow }] }), { status: 200 }) });
 type Mode = "http" | "network" | "generic" | "allowlisted" | "input-schema" |
 	"tool-reasoning" | "reasoning-echo" | "malicious" | "oversize" | "malformed" | "absent" |
+	"insufficient-balance" | "balance-echo" | "balance-wrong-status" |
 	"context-overflow" | "context-overflow-inconsistent" | "context-overflow-echo" |
 	"context-overflow-unsafe" | "context-overflow-large-safe";
 const VALID_REQUEST_ID = "12345678-1234-1234-1234-123456789abc";
@@ -32,6 +33,10 @@ function factory(mode: Mode): typeof createAgentSession {
 			headers: { "content-type": "application/json" } });
 		const error = mode === "allowlisted" ? { code: "context_length_exceeded", type: "invalid_request_error",
 			message: "HIDDEN private prompt", param: "HIDDEN parameter" } :
+			mode === "insufficient-balance" || mode === "balance-echo" || mode === "balance-wrong-status" ?
+				{ code: "invalid_request_error", type: "unknown_error", message: mode === "balance-echo" ?
+					`HIDDEN Insufficient Balance (request_id: ${VALID_REQUEST_ID})` :
+					`Insufficient Balance (request_id: ${VALID_REQUEST_ID})` } :
 			mode === "context-overflow" ? { code: null, type: "invalid_request_error",
 				message: `${CONTEXT_OVERFLOW_SENTENCE} (request_id: ${VALID_REQUEST_ID})` } :
 			mode === "context-overflow-inconsistent" ? { code: null, type: "invalid_request_error",
@@ -52,7 +57,8 @@ function factory(mode: Mode): typeof createAgentSession {
 			mode === "malicious" ? { code: "HIDDEN private prompt", type: "HIDDEN", message: "HIDDEN private prompt", param: "HIDDEN parameter" } :
 			mode === "oversize" ? { code: "context_length_exceeded", type: "invalid_request_error", message: "HIDDEN".repeat(2000) } :
 			{ message: "HIDDEN private prompt" };
-		return new Response(JSON.stringify({ error }), { status: 400, headers: { "content-type": "application/json",
+		return new Response(JSON.stringify({ error }), { status: mode === "insufficient-balance" || mode === "balance-echo" ? 402 : 400,
+			headers: { "content-type": "application/json",
 			"x-request-id": mode === "malicious" ? "sk-HIDDENprivatekey" : VALID_REQUEST_ID } });
 	};
 	return (async (options: CreateAgentSessionOptions = {}) => {
@@ -168,6 +174,17 @@ test("specific error code classifies input schema without retaining provider tex
 	assert.equal(row.providerErrorCode, "invalid_parameter");
 	assert.equal(row.providerErrorReasonClass, "input-schema");
 	assert.doesNotMatch(JSON.stringify(row), /HIDDEN|private prompt|HIDDEN parameter/);
+});
+
+test("only an exact completed HTTP 402 balance response yields a static funding reason", async () => {
+	const row = (await run("insufficient-balance")).diagnostics[0];
+	assert.equal(row.httpStatus, 402);
+	assert.equal(row.providerErrorCode, "invalid_request_error");
+	assert.equal(row.providerErrorType, null, "the unsupported raw type is not promoted");
+	assert.equal(row.providerErrorReasonClass, "insufficient-balance");
+	assert.doesNotMatch(JSON.stringify(row), /Insufficient Balance|request_id/);
+	for (const mode of ["balance-echo", "balance-wrong-status"] as const)
+		assert.equal((await run(mode)).diagnostics[0].providerErrorReasonClass, "unknown");
 });
 
 test("redacted provider reason and numeric limits survive only in an opted-in private diagnostic", async () => {

@@ -272,6 +272,21 @@ test("a real exclusive credential blocker needs verified host evidence", () => {
 	assert.throws(() => pendingActionIdentity(unverified), /inconsistent|does not match/);
 });
 
+test("a provider payment hold outranks fresh retry without erasing older unknown operations", () => {
+	const refs = ["prior-goal/O001", "prior-goal/O002"];
+	const action = classifyPendingAction("assessment-failed", {
+		unresolvedOperationRefs: refs, transportFailure: true, failedStage: "read-only-assessor" });
+	const base = snapshot(action, { unresolved: refs, fresh: freshFor(action) });
+	const held = { ...base, status: { ...base.status, providerPaymentHold: {
+		kind: "provider-payment-required" as const,
+		evidence: "authenticated-http-402" as const } } };
+	assert.deepEqual(planMissionContinuation(held), { kind: "wait", reason: "provider-payment-required" });
+	assert.equal(held.status.pendingAction?.kind, "reconcile-m07-operation");
+	assert.deepEqual(held.status.unresolvedOperationRefs, refs);
+	assert.throws(() => planMissionContinuation({ ...held, status: {
+		...held.status, objectiveOutcome: "fulfilled" } }), /redacted mission status is invalid/);
+});
+
 test("unknown M07 operation permits independent fresh work and carries the quarantine", () => {
 	const old = ["old-goal/O001", "older-goal/O002"];
 	const action = classifyPendingAction("bounded-run-incomplete", { unresolvedOperationRefs: old });

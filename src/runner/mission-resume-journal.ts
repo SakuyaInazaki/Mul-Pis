@@ -10,6 +10,8 @@ import path from "node:path";
 import { pendingActionIdentity, type ResumeIntent } from "./mission-supervisor.ts";
 import { authenticatedTerminalUnknownControlDeliveries,
 	REUSABLE_RUN_REQUEST_MESSAGE, type AuthenticatedTerminalCarryResult } from "./ledger-continuation.ts";
+import { isVerifiedProviderAvailabilityProof,
+	type VerifiedProviderAvailabilityProofV1 } from "./provider-availability-proof.ts";
 
 const CONTROL_REF = "refs/heads/run-requests/workflow-learning-reliability";
 const SOURCE_REF = "refs/heads/improve/workflow-learning-reliability";
@@ -38,6 +40,15 @@ export type TestedControlBinding = Readonly<{
 export type ResumeJournalState = "reserved" | "ref-update-attempted" |
 	"delivery-unknown" | "acknowledged" | "reconciled-not-delivered";
 type ActionProvenance = NonNullable<ResumeIntent["actionProvenance"]>;
+export type ProviderAvailabilityAuditV1 = Readonly<{
+	kind: "host-verified-provider-availability-audit";
+	receiptSha256: string; terminalSource: Readonly<{ runId: string;
+		runAttempt: number; commit: string }>; terminalEnvelopeSha256: string;
+	testedSourceCommit: string; probeSource: Readonly<{ runId: string;
+		runAttempt: number; commit: string }>;
+	workflowId: string; jobId: string; artifactId: string;
+	archiveSha256: string; envelopeSha256: string;
+}>;
 export type ResumeJournalRecord = Readonly<{
 	version: 1;
 	idempotencyKey: string;
@@ -49,6 +60,8 @@ export type ResumeJournalRecord = Readonly<{
 		workflowRepair?: ResumeIntent["workflowRepair"];
 		linkedUnknownDelivery?: ResumeIntent["linkedUnknownDelivery"] }>;
 	control: TestedControlBinding;
+	/** First verified positive probe used for this intent. Private provenance, outside stable idempotency. */
+	providerAvailabilityAudit?: ProviderAvailabilityAuditV1;
 	state: ResumeJournalState;
 	negativeReconciliations: number;
 	successorRunId?: string;
@@ -276,6 +289,52 @@ function controlBinding(input: TestedControlBinding): TestedControlBinding {
 		sourceRef: SOURCE_REF, sourceRefTip: input.sourceRefTip };
 }
 
+function validProviderAvailabilityAudit(value: unknown,
+	privateBinding: ResumeJournalRecord["intentBinding"],
+	control: TestedControlBinding): value is ProviderAvailabilityAuditV1 {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const v = value as ProviderAvailabilityAuditV1;
+	const keys = ["kind", "receiptSha256", "terminalSource", "terminalEnvelopeSha256",
+		"testedSourceCommit", "probeSource", "workflowId", "jobId", "artifactId",
+		"archiveSha256", "envelopeSha256"];
+	const validSource = (s: typeof v.terminalSource) => s &&
+		Object.keys(s).sort().join("|") === "commit|runAttempt|runId" &&
+		runId(s.runId) && Number.isSafeInteger(s.runAttempt) && s.runAttempt > 0 && hex40(s.commit);
+	return Object.keys(v).sort().join("|") === keys.sort().join("|") &&
+		v.kind === "host-verified-provider-availability-audit" &&
+		hex64(v.receiptSha256) && validSource(v.terminalSource) &&
+		validSource(v.probeSource) && hex64(v.terminalEnvelopeSha256) &&
+		hex40(v.testedSourceCommit) && runId(v.workflowId) && runId(v.jobId) &&
+		runId(v.artifactId) && hex64(v.archiveSha256) && hex64(v.envelopeSha256) &&
+		v.terminalSource.runId === privateBinding.source.runId &&
+		v.terminalSource.runAttempt === privateBinding.source.runAttempt &&
+		v.terminalSource.commit === privateBinding.source.commit &&
+		v.terminalEnvelopeSha256 === privateBinding.envelopeSha256 &&
+		v.testedSourceCommit === control.testedSourceCommit;
+}
+
+function providerAvailabilityAudit(proof: VerifiedProviderAvailabilityProofV1 | undefined,
+	privateBinding: ResumeJournalRecord["intentBinding"],
+	control: TestedControlBinding): ProviderAvailabilityAuditV1 | undefined {
+	if (!proof) return;
+	if (!isVerifiedProviderAvailabilityProof(proof))
+		refuse("provider availability proof is not host verified");
+	const audit: ProviderAvailabilityAuditV1 = {
+		kind: "host-verified-provider-availability-audit",
+		receiptSha256: proof.receiptSha256,
+		terminalSource: { runId: proof.terminalSource.runId,
+			runAttempt: proof.terminalSource.runAttempt, commit: proof.terminalSource.commit },
+		terminalEnvelopeSha256: proof.terminalEnvelopeSha256,
+		testedSourceCommit: proof.testedSourceCommit,
+		probeSource: { runId: proof.probeSource.runId,
+			runAttempt: proof.probeSource.runAttempt, commit: proof.probeSource.commit },
+		workflowId: proof.workflowId, jobId: proof.jobId, artifactId: proof.artifactId,
+		archiveSha256: proof.archiveSha256, envelopeSha256: proof.envelopeSha256 };
+	if (!validProviderAvailabilityAudit(audit, privateBinding, control))
+		refuse("provider availability proof does not bind the reserved intent");
+	return audit;
+}
+
 async function syncDir(dir: string): Promise<void> {
 	const handle = await open(dir, "r");
 	try { await handle.sync(); } finally { await handle.close(); }
@@ -312,6 +371,9 @@ async function readRecord(file: string): Promise<ResumeJournalRecord> {
 	if (canonical(controlBinding(value.control)) !== canonical(value.control))
 		refuse("stored control descriptor has unexpected fields");
 	const bound = value.intentBinding;
+	if (value.providerAvailabilityAudit !== undefined &&
+		!validProviderAvailabilityAudit(value.providerAvailabilityAudit, bound, value.control))
+		refuse("stored provider availability audit is invalid");
 	const workflowRepair = repairBinding(bound.workflowRepair);
 	const terminalInterruption = interruptionBinding(bound.terminalInterruption,
 		bound.source, bound.envelopeSha256);
@@ -600,8 +662,11 @@ export class MissionResumeJournal {
 			return updated;
 		});
 	}
-	async reserve(intent: ResumeIntent, binding: TestedControlBinding): Promise<ResumeJournalRecord> {
+	async reserve(intent: ResumeIntent, binding: TestedControlBinding,
+		providerAvailabilityProof?: VerifiedProviderAvailabilityProofV1): Promise<ResumeJournalRecord> {
 		const privateBinding = intentBinding(intent), control = controlBinding(binding);
+		const availabilityAudit = providerAvailabilityAudit(providerAvailabilityProof,
+			privateBinding, control);
 		if (privateBinding.workflowRepair &&
 			(privateBinding.workflowRepair.testedSourceCommit !== control.testedSourceCommit ||
 				privateBinding.workflowRepair.testedTree !== control.testedTree ||
@@ -613,6 +678,13 @@ export class MissionResumeJournal {
 			if (old) {
 				if (canonical(old.intentBinding) !== canonical(privateBinding) ||
 					canonical(old.control) !== canonical(control)) refuse("same key has a different binding");
+				if (canonical(old.providerAvailabilityAudit ?? null) !==
+					canonical(availabilityAudit ?? null) &&
+					(!old.providerAvailabilityAudit || !availabilityAudit))
+					refuse("same key has a different provider availability audit");
+				// A fresh positive recheck may supersede an expired probe for the
+				// same intent. Its existing state still controls delivery. Keep the
+				// first receipt for durable audit.
 				return old;
 			}
 			const linked = privateBinding.linkedUnknownDelivery;
@@ -660,7 +732,8 @@ export class MissionResumeJournal {
 			}
 			const fresh: ResumeJournalRecord = { version: 1,
 				idempotencyKey: intent.idempotencyKey, intentBinding: privateBinding,
-				control, state: "reserved", negativeReconciliations: 0 };
+				control, state: "reserved", negativeReconciliations: 0,
+				...(availabilityAudit ? { providerAvailabilityAudit: availabilityAudit } : {}) };
 			if (oldLinked?.state === "ref-update-attempted")
 				await atomicJson(this.file(oldLinked.idempotencyKey),
 					{ ...oldLinked, state: "delivery-unknown" });

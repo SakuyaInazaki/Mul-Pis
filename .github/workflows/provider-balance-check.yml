@@ -1,0 +1,134 @@
+name: Confidential provider balance check
+run-name: Confidential provider balance check
+
+on:
+  push:
+    branches:
+      - run-requests/provider-balance-availability
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: confidential-provider-balance-check-once
+  cancel-in-progress: false
+
+jobs:
+  provider-balance-check:
+    if: >-
+      github.repository == 'SakuyaInazaki/Mul-Pis' &&
+      github.actor == 'SakuyaInazaki' &&
+      github.run_attempt == 1 &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/run-requests/provider-balance-availability'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Verify exact source and accepted offline CI
+        id: source
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RUN_COMMIT: ${{ github.sha }}
+          REQUEST_BEFORE: ${{ github.event.before }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import urllib.request
+
+          sys.path.insert(0, 'scripts')
+          from provider_balance_probe import accepted_offline_ci, valid_probe_request_before
+
+          run_commit = os.environ['RUN_COMMIT']
+          if not re.fullmatch(r'[0-9a-f]{40}', run_commit):
+              raise SystemExit(1)
+          def git(*args):
+              return subprocess.check_output(['git', *args]).strip().decode('ascii')
+          if git('rev-parse', 'HEAD') != run_commit:
+              raise SystemExit(1)
+          raw = subprocess.check_output(['git', 'cat-file', '-p', 'HEAD'])
+          message = raw.partition(b'\n\n')[2]
+          match = re.fullmatch(
+              rb'Check provider availability\n\n'
+              rb'Terminal-Run-Id: ([1-9][0-9]*)\n'
+              rb'Terminal-Run-Attempt: ([1-9][0-9]*)\n'
+              rb'Terminal-Commit: ([0-9a-f]{40})\n'
+              rb'Terminal-Envelope-SHA256: ([0-9a-f]{64})\n'
+              rb'Request-Nonce: ([0-9a-f]{32})\n', message)
+          if match is None:
+              raise SystemExit(1)
+          terminal_run_id, terminal_attempt, terminal_commit, _, _ = (
+              value.decode('ascii') for value in match.groups())
+          parents = git('show', '-s', '--format=%P', 'HEAD').split()
+          if not valid_probe_request_before(parents, os.environ['REQUEST_BEFORE']):
+              raise SystemExit(1)
+          source = parents[0]
+          if git('rev-parse', 'HEAD^{tree}') != git('rev-parse', source + '^{tree}'):
+              raise SystemExit(1)
+          repo = 'SakuyaInazaki/Mul-Pis'
+          headers = {'Authorization': 'Bearer ' + os.environ['GITHUB_TOKEN'],
+                     'Accept': 'application/vnd.github+json'}
+          def get(path):
+              req = urllib.request.Request('https://api.github.com/repos/' + repo + '/' + path,
+                                           headers=headers)
+              with urllib.request.urlopen(req, timeout=10) as response:
+                  return json.load(response)
+          ref = get('git/ref/heads/improve/workflow-learning-reliability')
+          if ref.get('object', {}).get('sha') != source:
+              raise SystemExit(1)
+          if not accepted_offline_ci(get, source):
+              raise SystemExit(1)
+          terminal = get('actions/runs/' + terminal_run_id)
+          if (str(terminal.get('id')) != terminal_run_id or
+                  str(terminal.get('run_attempt')) != terminal_attempt or
+                  terminal.get('head_sha') != terminal_commit or
+                  terminal.get('status') != 'completed' or
+                  terminal.get('actor', {}).get('login') != 'SakuyaInazaki' or
+                  (terminal.get('event'), terminal.get('head_branch')) not in {
+                      ('push', 'run-requests/workflow-learning-reliability'),
+                      ('workflow_dispatch', 'improve/workflow-learning-reliability')} or
+                  terminal.get('path', '').split('@', 1)[0] !=
+                      '.github/workflows/manual-private-campaign.yml'):
+              raise SystemExit(1)
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as out:
+              out.write('source_commit=' + source + '\n')
+          PY
+      - name: Install pinned encryption dependency
+        run: python -m pip install --disable-pip-version-check --no-input 'cryptography==50.0.0'
+      - name: Check once and seal availability
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+          RUN_REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_COMMIT: ${{ github.sha }}
+        run: |
+          umask 077
+          python scripts/provider_balance_probe.py \
+            --public-key scripts/campaign-output-public.pem \
+            --expected-spki-sha256 095541a341d91f128aa9cd1f0c6d34f6b7291fc5d667365ef5a67efd42fd0d23 \
+            --output "$RUNNER_TEMP/provider-balance.enc.json" \
+            --repository "$RUN_REPOSITORY" \
+            --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT" \
+            --commit "$RUN_COMMIT" \
+            --event push \
+            --source-commit "$SOURCE_COMMIT"
+      - name: Upload ciphertext only
+        uses: actions/upload-artifact@v4
+        with:
+          name: confidential-provider-balance-envelope
+          path: ${{ runner.temp }}/provider-balance.enc.json
+          if-no-files-found: error
+          retention-days: 1

@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { createCipheriv, createDecipheriv, createHash, generateKeyPairSync, hkdfSync,
 	randomBytes, sign, constants } from "node:crypto";
 import { once } from "node:events";
-import { chmod, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -28,6 +28,10 @@ import type { ResumeIntent } from "../src/runner/mission-supervisor.ts";
 import { IncrementalPrivateCheckpointJournal } from "../src/runner/incremental-private-checkpoint.ts";
 import { MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, MISSION_ARTIFACT } from
 	"../src/runner/signed-mission-ledger.ts";
+import { campaignSessionEffectId } from "../src/runner/deepseek-campaign.ts";
+import { offlineChecks } from "../scripts/manual-private-campaign.ts";
+import { verifyProviderAvailabilityProof, type ProviderAvailabilityReviewReceiptV1 } from
+	"../src/runner/provider-availability-proof.ts";
 
 const sha40 = (letter: string): string => letter.repeat(40);
 const sourceCommit = sha40("b");
@@ -90,6 +94,7 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 	repairActionStage?: WorkflowRepairStage; repairStrategy?: WorkflowRepairStrategy;
 	omitRepairStage?: boolean; omitRepairEvidence?: boolean;
 	resultOnlyRepair?: boolean;
+	provider402?: boolean; fiveUnknownOperations?: boolean;
 	stopReason?: "bounded-run-incomplete" | "assessment-failed" | "workflow-repair-needed" } = {}) {
 	const dir = await mkdtemp(path.join(os.tmpdir(), "mission-host-adapter-"));
 	t.after(() => rm(dir, { recursive: true, force: true }));
@@ -101,10 +106,12 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 	const contract = createOriginalObjective({ goal: "Synthetic original task",
 		goalSource: "user-intent-summary", inputNames: ["input.txt"],
 		obligations: [{ id: "O1", description: "Synthetic check" }], closure: "open-ended" });
-	const operationRefs = options.unknownOperation ? ["old-goal/O001"] : [];
+	const operationRefs = options.fiveUnknownOperations ?
+		Array.from({ length: 5 }, (_, index) => `old-goal/O${String(index + 1).padStart(3, "0")}`) :
+		options.unknownOperation ? ["old-goal/O001"] : [];
 	const checkpoint = objectiveProgress(contract, {
-		boundedRuns: options.unknownOperation ? [{ runId: "old-goal", outcome: "active",
-			unresolvedOperationIds: ["O001"] }] : [],
+		boundedRuns: operationRefs.length ? [{ runId: "old-goal", outcome: "active",
+			unresolvedOperationIds: operationRefs.map(ref => ref.split("/")[1]!) }] : [],
 		selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
 		unresolvedOperationIds: operationRefs,
 		stopReason: options.stopReason ?? "bounded-run-incomplete",
@@ -225,12 +232,26 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 	const opening = await openLedgerContinuation({ seedEnvelopeB64, publicKeyFile,
 		expectedSpkiSha256, githubToken: "synthetic-token", current: actualSource, request,
 		loadCarryArtifact: async () => "unused" });
+	const requestAudit = options.provider402 ? { version: 3 as const,
+		kind: "accounting-only-request-audit" as const,
+		requests: [{ requestId: "payment-rejected", sessionId: campaignSessionEffectId("payment-session"),
+			inputPayloadBytes: 100, responseReceived: false, status: "unknown" as const,
+			settledCny: null, unknownObservedCny: null, reportedUsage: null }],
+		settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 1 } :
+		{ version: 3 as const, kind: "accounting-only-request-audit" as const,
+			requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
+	const diagnostic = options.provider402 ? opening.appendTransportDiagnosticCensus(requestAudit,
+		[{ version: 1, promptIndex: 1, requestId: "payment-rejected", phase: "response-body",
+			httpStatus: 402, responseStarted: true, bytesRead: 162, abortSource: null,
+			providerErrorCode: "invalid_request_error", providerErrorType: null,
+			providerErrorReasonClass: "insufficient-balance", providerRequestId: null,
+			errorCodes: [] }]) : undefined;
 	let sealed = opening.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
-		unpricedRequestCount: 0, requestAudit: { version: 3,
-			kind: "accounting-only-request-audit", requests: [], settledCny: 0,
-			unknownObservedCny: 0, unpricedRequestCount: 0 },
-		...(options.largePayload ? { privateBundle: { ...bundle,
-			"m04-export.json": randomBytes(1_250_000).toString("base64") },
+		unpricedRequestCount: options.provider402 ? 1 : 0, requestAudit,
+		...(options.provider402 || options.largePayload ? { privateBundle: { ...bundle,
+			...(diagnostic ? { "transport-diagnostics.json": diagnostic } : {}),
+			...(options.largePayload ?
+				{ "m04-export.json": randomBytes(1_250_000).toString("base64") } : {}) },
 			bootstrapBinding: opening.priorBootstrapBinding } : {}) });
 	if (options.legacyV3) {
 		const signed = JSON.parse(Buffer.from(seedEnvelopeB64, "base64").toString("utf8")) as {
@@ -1368,6 +1389,10 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 		outputPrivate?: string; recoverReserved?: boolean;
 		repairPlanPrivateFile?: string;
 		resultOnlyRepairReviewPrivateFile?: string;
+		providerAvailabilityReceiptPrivateFile?: string;
+		providerAvailabilityEnvelopeBytes?: Buffer;
+		providerProbe?: { runId: string; artifactId: string; archiveSha256: string };
+		wrongProviderArchiveEcho?: boolean;
 		resultEnvelopeBytes?: Buffer; wrongResultArchiveEcho?: boolean;
 		wrongResultFileDigest?: boolean;
 		interruptedSourceReviewPrivateFile?: string;
@@ -1389,6 +1414,10 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 	const resultEnvelopeFile = options.resultEnvelopeBytes ? path.join(f.dir,
 		"private-campaign-outcome.enc.json") : undefined;
 	if (resultEnvelopeFile) await writeFile(resultEnvelopeFile, options.resultEnvelopeBytes!, { mode: 0o600 });
+	const providerEnvelopeFile = options.providerAvailabilityEnvelopeBytes ? path.join(f.dir,
+		"provider-balance.enc.json") : undefined;
+	if (providerEnvelopeFile)
+		await writeFile(providerEnvelopeFile, options.providerAvailabilityEnvelopeBytes!, { mode: 0o600 });
 	const prefixOnlyFile = options.prefixOnly ? path.join(f.dir, "prefix-only.json") : undefined;
 	if (prefixOnlyFile) await writeFile(prefixOnlyFile, options.prefixOnly!.raw, { mode: 0o600 });
 	let prefixReference: { name: string; file: string; sha256: string } | undefined;
@@ -1424,6 +1453,9 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 		...(options.repairPlanPrivateFile ? ["--repair-plan-private", options.repairPlanPrivateFile] : []),
 		...(options.resultOnlyRepairReviewPrivateFile ?
 			["--result-only-repair-review-private", options.resultOnlyRepairReviewPrivateFile] : []),
+		...(options.providerAvailabilityReceiptPrivateFile ?
+			["--provider-availability-receipt-private",
+				options.providerAvailabilityReceiptPrivateFile] : []),
 		...(options.interruptedSourceReviewPrivateFile ?
 			["--interrupted-source-review-private", options.interruptedSourceReviewPrivateFile] : []),
 		...(options.linkedUnknownDeliveryOldControlCommit ?
@@ -1440,7 +1472,7 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 	const lines: unknown[] = [];
 	for await (const line of createInterface({ input: child.stdout, crlfDelay: Infinity })) {
 		const row = JSON.parse(line) as { kind: string; id?: number; url?: string;
-			runId?: string; artifactId?: string; expectedArchiveSha256?: string };
+			runId?: string; artifactId?: string; expectedArchiveSha256?: string; name?: string };
 		lines.push(row);
 		if (row.kind === "github-get") {
 			assert.equal(typeof row.url, "string");
@@ -1449,6 +1481,19 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 			child.stdin.write(`${JSON.stringify({ id: row.id, status: response.status,
 				body: JSON.parse(await response.text()) })}\n`);
 		} else if (row.kind === "artifact-file") {
+			if (row.name === "provider-balance.enc.json") {
+				assert.equal(row.artifactId, options.providerProbe?.artifactId ?? "9302");
+				assert.equal(row.runId, options.providerProbe?.runId ?? "8002");
+				assert.equal(row.expectedArchiveSha256,
+					options.providerProbe?.archiveSha256 ?? "8".repeat(64));
+				assert(providerEnvelopeFile && options.providerAvailabilityEnvelopeBytes);
+				child.stdin.write(`${JSON.stringify({ id: row.id, name: "provider-balance.enc.json",
+					file: providerEnvelopeFile,
+					sha256: createHash("sha256").update(options.providerAvailabilityEnvelopeBytes).digest("hex"),
+					archiveSha256: options.wrongProviderArchiveEcho ? "0".repeat(64) :
+						options.providerProbe?.archiveSha256 ?? "8".repeat(64) })}\n`);
+				continue;
+			}
 			if (row.artifactId === "9202") {
 				assert.equal(row.runId, "7002");
 				assert.equal(row.expectedArchiveSha256, "9".repeat(64));
@@ -1786,6 +1831,279 @@ test("stdio bridge rejects a result artifact ZIP or encrypted envelope mismatch"
 		assert.equal(privateFailure.descriptor, undefined);
 		assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
 	}
+});
+
+test("provider availability review is refused when the authenticated carry has no payment hold", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const receiptFile = path.join(f.dir, "provider-availability-review.json");
+	await writeFile(receiptFile, "{}", { mode: 0o600 });
+	const direct = await assert.rejects(prepareAuthenticatedResumeRequest({ ...f.input,
+		providerAvailabilityReceiptPrivateFile: receiptFile,
+		loadProviderAvailabilityEnvelope: async () => Buffer.from("{}") }), error =>
+		privateHostPreparationDiagnostic(error).code === "provider-availability-review-unrelated");
+	assert.equal(direct, undefined);
+	const bridge = await runStdioBridge(f, { providerAvailabilityReceiptPrivateFile: receiptFile });
+	assert.equal(bridge.code, 1);
+	assert(!bridge.stdout.includes(receiptFile));
+	assert(!bridge.lines.some(row => (row as { kind: string }).kind === "prepared"));
+	const failure = JSON.parse(await readFile(bridge.outputPrivate, "utf8"));
+	assert.equal(failure.code, "provider-availability-review-unrelated");
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+});
+
+test("authenticated current 402 carry waits without a balance receipt or reservation", async t => {
+	const f = await fixture(t, { carriedAction: true, provider402: true,
+		fiveUnknownOperations: true });
+	const authenticated = await authenticateLatestTerminalCarry(f.input);
+	const projected = authenticatedSupervisorProjection(authenticated.proof,
+		authenticated.privateBundle);
+	assert.equal(projected?.status.providerPaymentHold?.evidence, "exact-insufficient-balance");
+	assert.equal(projected?.status.unresolvedOperationRefs.length, 5);
+	const prepared = await prepareAuthenticatedResumeRequest(f.input);
+	assert.deepEqual(prepared.decision, { kind: "wait", reason: "provider-payment-required" });
+	assert.equal(prepared.descriptor, undefined);
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+});
+
+test("fresh source-bound probe releases only the 402 hold and preserves five unknown actions", async t => {
+	const f = await fixture(t, { carriedAction: true, provider402: true,
+		fiveUnknownOperations: true });
+	const authenticated = await authenticateLatestTerminalCarry(f.input);
+	const projected = authenticatedSupervisorProjection(authenticated.proof,
+		authenticated.privateBundle);
+	assert.equal(projected?.status.providerPaymentHold?.evidence, "exact-insufficient-balance");
+	assert.equal(projected?.status.unresolvedOperationRefs.length, 5);
+	const terminalSource = { runId: authenticated.proof.source.runId,
+		runAttempt: authenticated.proof.source.runAttempt,
+		commit: authenticated.proof.source.commit };
+	let probeSource = { runId: "8002", runAttempt: 1, commit: sha40("5") };
+	let artifactId = "9302", jobId = "8202", archiveSha256 = "8".repeat(64);
+	let nonce = "6".repeat(32);
+	const messageFor = (value: string) => `Check provider availability\n\n` +
+		`Terminal-Run-Id: ${terminalSource.runId}\n` +
+		`Terminal-Run-Attempt: ${terminalSource.runAttempt}\n` +
+		`Terminal-Commit: ${terminalSource.commit}\n` +
+		`Terminal-Envelope-SHA256: ${authenticated.proof.envelopeSha256}\n` +
+		`Request-Nonce: ${value}\n`;
+	const envelopeFor = (probe: typeof probeSource) => Buffer.from(JSON.stringify({
+		format: "mul-pis-provider-balance-v1",
+		key_wrap: "RSA-3072-OAEP-SHA256", content_cipher: "AES-256-GCM",
+		recipient_spki_sha256: "095541a341d91f128aa9cd1f0c6d34f6b7291fc5d667365ef5a67efd42fd0d23",
+		metadata: { repository: MISSION_REPOSITORY, run_id: probe.runId,
+			run_attempt: "1", commit: probe.commit, event: "push" },
+		wrapped_key_b64: Buffer.alloc(384, 5).toString("base64"),
+		nonce_b64: Buffer.alloc(12, 6).toString("base64"),
+		ciphertext_b64: Buffer.alloc(100, 7).toString("base64") }));
+	let encrypted = envelopeFor(probeSource);
+	const receiptFor = (): ProviderAvailabilityReviewReceiptV1 => ({
+		version: 1, kind: "host-reviewed-provider-availability",
+		terminal: { source: terminalSource, envelopeSha256: authenticated.proof.envelopeSha256 },
+		probe: { source: probeSource, workflowId: "92", jobId, artifactId,
+			archiveSha256,
+			envelopeSha256: createHash("sha256").update(encrypted).digest("hex"),
+			envelopeFile: "provider-balance.enc.json", testedSourceCommit: sourceCommit,
+			requestNonce: nonce },
+		verdict: { kind: "provider-balance-availability", version: 1,
+			availability: "available" },
+		review: { kind: "operator-rsa-decryption-review", conclusion: "exact-envelope-available" } });
+	let receipt = receiptFor();
+	const receiptFile = path.join(f.dir, "reviewed-provider-availability.json");
+	await writeFile(receiptFile, JSON.stringify(receipt), { mode: 0o600 });
+	const request: typeof fetch = async (url, init) => {
+		const address = String(url);
+		let data: unknown;
+		if (address.endsWith("/actions/workflows/provider-balance-check.yml"))
+			data = { id: 92, name: "Confidential provider balance check",
+				path: ".github/workflows/provider-balance-check.yml", state: "active" };
+		else if (address.endsWith("/git/ref/heads/run-requests/provider-balance-availability"))
+			data = { object: { sha: probeSource.commit } };
+		else if (address.endsWith(`/git/commits/${probeSource.commit}`))
+			data = { sha: probeSource.commit, message: messageFor(nonce),
+				tree: { sha: testedTree }, parents: probeSource.runId === "8002" ?
+					[{ sha: sourceCommit }] : [{ sha: sourceCommit }, { sha: sha40("5") }] };
+		else if (address.endsWith("/actions/jobs/6002"))
+			data = { id: 6002, run_id: 7002, run_attempt: 1, head_sha: sourceCommit,
+				name: "private-campaign", status: "completed",
+				completed_at: "2026-10-08T00:01:00Z" };
+		else if (address.endsWith(`/actions/runs/${probeSource.runId}`))
+			data = { id: Number(probeSource.runId), run_attempt: 1, workflow_id: 92,
+				name: "Confidential provider balance check",
+				display_title: "Confidential provider balance check",
+				head_branch: "run-requests/provider-balance-availability",
+				head_sha: probeSource.commit, event: "push",
+				actor: { login: "SakuyaInazaki" },
+				status: "completed", conclusion: "success",
+				created_at: probeSource.runId === "8002" ?
+					"2026-10-08T00:02:00Z" : "2026-10-08T00:04:00Z" };
+		else if (address.endsWith(`/actions/runs/${probeSource.runId}/jobs?per_page=100`))
+			data = { total_count: 1, jobs: [{ id: Number(jobId),
+				run_id: Number(probeSource.runId), run_attempt: 1,
+				head_sha: probeSource.commit, name: "provider-balance-check",
+				status: "completed", conclusion: "success",
+				started_at: probeSource.runId === "8002" ?
+					"2026-10-08T00:03:00Z" : "2026-10-08T00:05:00Z", steps: [
+					{ name: "Verify exact source and accepted offline CI", status: "completed", conclusion: "success" },
+					{ name: "Check once and seal availability", status: "completed", conclusion: "success" },
+					{ name: "Upload ciphertext only", status: "completed", conclusion: "success" } ] }] };
+		else if (address.endsWith(`/actions/runs/${probeSource.runId}/artifacts?per_page=100`))
+			data = { total_count: 1, artifacts: [{ id: Number(artifactId),
+				name: "confidential-provider-balance-envelope", expired: false,
+				digest: `sha256:${archiveSha256}`,
+				workflow_run: { id: Number(probeSource.runId), head_sha: probeSource.commit } }] };
+		else return f.request(url, init);
+		return new Response(JSON.stringify(data));
+	};
+	const input = { ...f.input, request, providerAvailabilityReceiptPrivateFile: receiptFile,
+		loadProviderAvailabilityEnvelope: async () => encrypted };
+	const noReceipt = await prepareAuthenticatedResumeRequest({ ...f.input, request });
+	assert.deepEqual(noReceipt.decision, { kind: "wait", reason: "provider-payment-required" });
+	assert.equal(noReceipt.descriptor, undefined);
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	const wrongSource = sha40("e");
+	f.live.sourceTip = wrongSource;
+	f.live.ciHead = wrongSource;
+	await assert.rejects(prepareAuthenticatedResumeRequest(input), error =>
+		privateHostPreparationDiagnostic(error).code === "provider-availability-review-invalid");
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	f.live.sourceTip = sourceCommit;
+	f.live.ciHead = sourceCommit;
+	await writeFile(receiptFile, JSON.stringify({ ...receipt, terminal: {
+		...receipt.terminal, source: { ...terminalSource, runId: "7001" } } }));
+	await assert.rejects(prepareAuthenticatedResumeRequest(input), error =>
+		privateHostPreparationDiagnostic(error).code === "provider-availability-review-invalid");
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	await writeFile(receiptFile, JSON.stringify(receipt));
+	await verifyProviderAvailabilityProof({ privateReceiptFile: receiptFile,
+		terminalSource, terminalEnvelopeSha256: authenticated.proof.envelopeSha256,
+		terminalWorkflowId: authenticated.proof.terminal.workflowId,
+		terminalJobId: authenticated.proof.terminal.jobId,
+		testedSourceCommit: sourceCommit, request, githubToken: "synthetic-token",
+		loadEncryptedEnvelope: async () => encrypted });
+	const planned = await prepareAuthenticatedResumeRequest({ ...input, readOnly: true });
+	assert.equal(planned.decision.kind, "dispatch");
+	if (planned.decision.kind !== "dispatch") throw new Error("expected fresh-only dispatch");
+	assert.deepEqual(planned.decision.intent.pendingAction.target?.operationRefs,
+		projected?.status.unresolvedOperationRefs);
+	const bridge = await runStdioBridge(f, { request,
+		providerAvailabilityReceiptPrivateFile: receiptFile,
+		providerAvailabilityEnvelopeBytes: encrypted });
+	assert.equal(bridge.code, 0, bridge.stderr);
+	assert.equal((bridge.lines.at(-1) as { kind: string }).kind, "prepared");
+	assert(!bridge.stdout.includes(receiptFile));
+	assert(!bridge.stdout.includes(encrypted.toString("utf8")));
+	const saved = JSON.parse(await readFile(bridge.outputPrivate, "utf8")) as {
+		decision: { kind: string; intent: { pendingAction: { target: { operationRefs: string[] } } } } };
+	assert.equal(saved.decision.kind, "dispatch");
+	assert.deepEqual(saved.decision.intent.pendingAction.target.operationRefs,
+		projected?.status.unresolvedOperationRefs);
+	const reserved = await f.journal.unresolvedForRef(controlRef);
+	assert.equal(reserved?.state, "reserved");
+	assert.equal(reserved.providerAvailabilityAudit?.receiptSha256,
+		createHash("sha256").update(JSON.stringify(receipt)).digest("hex"));
+	assert.deepEqual(reserved.providerAvailabilityAudit?.probeSource, probeSource);
+	assert.equal(reserved.providerAvailabilityAudit?.artifactId, "9302");
+	// The first artifact is gone; a new source-bound check may reauthenticate
+	// the still-reserved semantic intent without replacing its first audit.
+	probeSource = { runId: "8003", runAttempt: 1, commit: sha40("7") };
+	artifactId = "9303";
+	jobId = "8203";
+	archiveSha256 = "9".repeat(64);
+	nonce = "a".repeat(32);
+	encrypted = envelopeFor(probeSource);
+	receipt = receiptFor();
+	await writeFile(receiptFile, JSON.stringify(receipt));
+	const renewed = await prepareAuthenticatedResumeRequest({ ...input,
+		recoverReservedDescriptor: true });
+	assert.equal(renewed.decision.kind, "wait");
+	assert.deepEqual(renewed.descriptor, bridge.lines.at(-1) &&
+		(bridge.lines.at(-1) as { descriptor: object }).descriptor);
+	const changed = await runStdioBridge(f, { request,
+		outputPrivate: path.join(f.dir, "changed-probe-private.json"),
+		recoverReserved: true,
+		providerAvailabilityReceiptPrivateFile: receiptFile,
+		providerAvailabilityEnvelopeBytes: encrypted,
+		providerProbe: { runId: probeSource.runId, artifactId, archiveSha256 } });
+	assert.equal(changed.code, 0, changed.stderr);
+	assert.equal((changed.lines.at(-1) as { kind: string }).kind, "recovered-reservation");
+	assert.deepEqual((await f.journal.get(reserved.idempotencyKey))?.providerAvailabilityAudit,
+		reserved.providerAvailabilityAudit);
+	await f.journal.markAttempted(reserved.idempotencyKey);
+	const afterAttempt = await prepareAuthenticatedResumeRequest({ ...input,
+		recoverReservedDescriptor: true });
+	assert.deepEqual(afterAttempt.decision, { kind: "wait",
+		reason: "dispatch-delivery-unknown", idempotencyKey: reserved.idempotencyKey });
+	assert.equal(afterAttempt.descriptor, undefined);
+	assert.deepEqual((await f.journal.get(reserved.idempotencyKey))?.providerAvailabilityAudit,
+		reserved.providerAvailabilityAudit);
+	assert.equal((await f.journal.get(reserved.idempotencyKey))?.state, "ref-update-attempted");
+	const done2 = run(7002, 2, "completed", sourceCommit, "failure");
+	const anchor = run(7001, 1, "completed", sha40("a"), "success");
+	const nextSource = { ...f.input.source, runId: "7003", sha: sourceCommit };
+	const nextRequest: typeof fetch = async (url, init) => {
+		if (String(url).includes("/workflows/manual-private-campaign.yml/runs?"))
+			return new Response(JSON.stringify({ total_count: 3,
+				workflow_runs: [run(7003, 3, "in_progress", sourceCommit), done2, anchor] }));
+		return f.request(url, init);
+	};
+	const next = await openLedgerContinuation({ seedEnvelopeB64: f.input.seedEnvelopeB64,
+		publicKeyFile: f.input.publicKeyFile,
+		expectedSpkiSha256: f.input.expectedSpkiSha256,
+		githubToken: "synthetic-token", current: nextSource, request: nextRequest,
+		loadCarryArtifact: async () => f.sealed });
+	assert.equal(next.priorProviderPaymentHold, true);
+	const outputDir = path.join(f.dir, "unavailable-next-run");
+	await mkdir(outputDir, { mode: 0o700 });
+	let balanceReads = 0;
+	await assert.rejects(offlineChecks.checkHeldProviderAvailability({ ledger: next,
+		apiKey: "synthetic-only", outputDir,
+		request: async url => {
+			assert.equal(String(url), "https://api.deepseek.com/user/balance");
+			balanceReads++;
+			return new Response(JSON.stringify({ is_available: false, balance_infos: [] }),
+				{ status: 200 });
+		} }), error => (error as { code?: string }).code === "runner.provider-availability");
+	assert.equal(balanceReads, 1);
+	const observation = JSON.parse(await readFile(path.join(outputDir,
+		"provider-availability-observation.json"), "utf8"));
+	assert.equal(observation.entries.at(-1).availability, "unavailable");
+	const emptyAudit = { version: 3 as const,
+		kind: "accounting-only-request-audit" as const, requests: [],
+		settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
+	const sealed3 = next.sealEmergencyCurrent({ settledCny: 0,
+		unknownObservedCny: 0, unpricedRequestCount: 0,
+		requestAudit: emptyAudit }, "effect-review-incomplete");
+	const done3 = run(7003, 3, "completed", sourceCommit, "failure");
+	const fourthSource = { ...f.input.source, runId: "7004", sha: sourceCommit };
+	const fourthRequest: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.includes("/workflows/manual-private-campaign.yml/runs?"))
+			return new Response(JSON.stringify({ total_count: 4,
+				workflow_runs: [run(7004, 4, "in_progress", sourceCommit), done3,
+					done2, anchor] }));
+		if (address.endsWith("/actions/runs/7003/jobs?per_page=100"))
+			return new Response(JSON.stringify({ total_count: 1, jobs: [{ id: 6003,
+				run_id: 7003, run_attempt: 1, head_sha: sourceCommit,
+				name: "private-campaign", status: "completed", conclusion: "failure",
+				steps: [{ name: "Run private campaign", status: "completed",
+					conclusion: "failure" }] }] }));
+		if (address.endsWith("/actions/runs/7003/artifacts?per_page=100"))
+			return new Response(JSON.stringify({ total_count: 1, artifacts: [{ id: 9003,
+				name: CARRY_ARTIFACT_NAME, expired: false,
+				workflow_run: { id: 7003, head_sha: sourceCommit } }] }));
+		return f.request(url, init);
+	};
+	const fourth = await openLedgerContinuation({ seedEnvelopeB64: f.input.seedEnvelopeB64,
+		publicKeyFile: f.input.publicKeyFile,
+		expectedSpkiSha256: f.input.expectedSpkiSha256,
+		githubToken: "synthetic-token", current: fourthSource, request: fourthRequest,
+		loadCarryArtifact: async ({ runId }) => runId === "7003" ? sealed3 : f.sealed });
+	assert.equal(fourth.priorProviderPaymentHold, true);
+	for (const file of ["candidate.cpp", "verification.json", "workflow-archive.json",
+		"objective-checkpoint.json"] as const)
+		assert.equal(fourth.priorPrivateBundle?.[file], f.bundle[file]);
+	assert.deepEqual(JSON.parse(fourth.priorPrivateBundle!["objective-checkpoint.json"]!),
+		f.checkpoint);
+	assert.equal(fourth.priorTransportDiagnosticCensus?.entries.length, 1);
 });
 
 test("stdio bridge refuses an artifact whose private digest changed", async t => {

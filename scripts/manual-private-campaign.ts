@@ -41,6 +41,8 @@ import { locateHistoryEntries } from "../src/runner/research-history-locator.ts"
 import { reconcileHistoricalResearchEntries, restoreHistoricalArchivePredecessor,
 	retainHistoricalArchiveEntry } from "../src/runner/research-history-reconciliation.ts";
 import { verifyDeepSeekCnyBilling, type NativeCnyPricingProfile } from "../src/runner/deepseek-cny-pricing.ts";
+import { checkDeepSeekAvailability } from "../src/runner/deepseek-availability.ts";
+import type { VerifiedDeepSeekAvailability } from "../src/runner/deepseek-availability.ts";
 import { verifyDeepSeekProviderOutputLimit,
 	type DeepSeekProviderOutputLimit } from "../src/runner/deepseek-provider-limits.ts";
 import { MISSION_ID, MISSION_REPOSITORY, PRIVATE_CONTINUATION_FILE_KEYS } from
@@ -2532,7 +2534,8 @@ async function collectContinuationBundle(directory: string, prior?: PrivateConti
 	if (history.entries.length) selected["research-history.json"] = JSON.stringify(history);
 	for (const name of ["original-objective.json", "objective-checkpoint.json", "objective-assessment-receipts.json",
 		"independent-restart-quarantine.json", "independent-restart-goal-binding.json",
-		"host-effect-receipt.json", "transport-diagnostics.json", "repair-state.json",
+		"host-effect-receipt.json", "transport-diagnostics.json",
+		"provider-availability-observation.json", "repair-state.json",
 		"m04-transaction.json",
 		"m04-transaction-quarantine.json"] as const)
 		if (current[name]) selected[name] = current[name];
@@ -2646,6 +2649,24 @@ async function inputs(inputDir: string) {
 	return { source: sources[0].name, files: entries.map(x => x.name).sort() };
 }
 
+/** The authenticated carry supplies the hold; the Actions key supplies a fresh
+ * account observation. Record the result before refusing a paid transport. */
+async function checkHeldProviderAvailability(input: {
+	ledger: Pick<LedgerContinuation, "priorProviderPaymentHold" | "appendProviderAvailabilityObservation">;
+	apiKey: string; outputDir: string; request?: typeof fetch;
+}): Promise<VerifiedDeepSeekAvailability | undefined> {
+	if (!input.ledger.priorProviderPaymentHold) return undefined;
+	const observation = await checkDeepSeekAvailability({ apiKey: input.apiKey,
+		...(input.request ? { request: input.request } : {}) });
+	const text = input.ledger.appendProviderAvailabilityObservation(observation);
+	await writeFile(path.join(input.outputDir, "provider-availability-observation.json"), text,
+		{ flag: "wx", mode: 0o600 });
+	if (observation.availability !== "available")
+		throw new HarnessError("runner.provider-availability",
+			"DeepSeek account availability is not verified; no model request is allowed");
+	return observation;
+}
+
 async function main() {
 	const inputDir = arg("--input-dir"), outputDir = arg("--output-dir");
 	let historicalEvidenceBundle: PrivateContinuationBundle | undefined;
@@ -2676,6 +2697,12 @@ async function main() {
 	try {
 	if (!runtimeKey?.trim()) fail("DeepSeek credential absent");
 	statusRuntimeKey = runtimeKey;
+	if (missionLedger.priorProviderPaymentHold) {
+		statusPhase = "provider-availability-verification";
+		try { await checkHeldProviderAvailability({ ledger: missionLedger, apiKey: runtimeKey, outputDir });
+			statusPhase = "provider-availability-verified"; }
+		catch (error) { statusPhase = "provider-availability-blocked"; throw error; }
+	}
 	statusPhase = "credential-probe";
 	try { statusCredentialProbe = await credentialProbe(runtimeKey); }
 	catch { statusCredentialProbe = { httpStatus: null, accepted: false }; }
@@ -4704,7 +4731,7 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	privateCollectionDiagnostic, privateSealOptions, privateEmergencyStatusDiagnostics,
 	recordFinalizationFailure,
 	writeSealedCarryFiles,
-	credentialProbe, parseCheckerOutput, compareCandidateTimings,
+	credentialProbe, checkHeldProviderAvailability, parseCheckerOutput, compareCandidateTimings,
 	campaignObjectiveStop, taskTelemetry, privateToolTelemetry,
 	chooseForkWinner, chooseFollowOnCandidate, firstM07Accepted, importM04EffectDisposition,
 	chooseDurableFollowOnCandidate, replaceSelectedM04AfterFollowOn, selectedM04AfterFollowOn,
@@ -4743,6 +4770,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
 	const stopHeartbeat = startPrivateCampaignHeartbeat();
 	main().catch(async error => {
 		const preProvider = ["preflight", "mission-ledger-verification", "credential-probe", "credential-verified",
+			"provider-availability-verification", "provider-availability-blocked", "provider-availability-verified",
 			"isolated-preflight-passed", "workspace-init", "private-inputs-staged",
 			"provider-output-limit-verification", "provider-output-limit-verified",
 			"billing-currency-verification", "billing-currency-verified", "billing-currency-unverified", "original-source-smoke",

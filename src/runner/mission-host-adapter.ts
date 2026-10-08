@@ -28,6 +28,8 @@ import { readReviewedResultOnlyRepairState, isVerifiedResultOnlyRepairState,
 	type VerifiedResultOnlyRepairStateV1 } from "./result-only-repair-review.ts";
 import { isVerifiedUnobservedControlSourceCapability,
 	readReviewedUnobservedControlSourceCapability } from "./unobserved-control-source-review.ts";
+import { verifyProviderAvailabilityProof, type VerifiedProviderAvailabilityProofV1 } from
+	"./provider-availability-proof.ts";
 
 const REPOSITORY = "SakuyaInazaki/Mul-Pis";
 const SOURCE_BRANCH = "improve/workflow-learning-reliability";
@@ -53,11 +55,12 @@ export type HostPreparationRefusal = Readonly<{
 		"reserved-descriptor-recovery-requires-journal" | "reserved-descriptor-missing" |
 		"linked-unknown-delivery-invalid" | "linked-unknown-delivery-observed-run" |
 		"linked-unknown-delivery-census-invalid" | "linked-unknown-delivery-source-raced" |
-		"linked-unknown-delivery-control-raced" | "linked-unknown-source-review-invalid";
+		"linked-unknown-delivery-control-raced" | "linked-unknown-source-review-invalid" |
+		"provider-availability-review-invalid" | "provider-availability-review-unrelated";
 	stage: "tested-source-ci" | "live-source-ref" | "live-source-commit" |
 		"live-control-ref" | "terminal-carry" | "legacy-action" | "dispatch-journal" |
 		"workflow-repair-plan" | "interruption-source-review" | "result-only-repair-review" |
-		"linked-unknown-delivery";
+		"linked-unknown-delivery" | "provider-availability-review";
 	ciRunId?: string;
 	ciStatus?: "requested" | "waiting" | "pending" | "queued" | "in_progress" |
 		"completed" | "unrecognized";
@@ -231,6 +234,10 @@ export type PrepareAuthenticatedResumeInput = Readonly<{
 	repairPlanPrivateFile?: string;
 	/** Private operator RSA decryption review for a result-only repair diagnostic. */
 	resultOnlyRepairReviewPrivateFile?: string;
+	/** Mode-0600 operator review of the separate encrypted balance verdict. */
+	providerAvailabilityReceiptPrivateFile?: string;
+	loadProviderAvailabilityEnvelope?: (identity: { runId: string; artifactId: string;
+		expectedArchiveSha256: string }) => Promise<Uint8Array>;
 	/** Host review of the exact interrupted source capability, outside the checkout. */
 	interruptedSourceReviewPrivateFile?: string;
 	/** Explicit exact commit of an accepted old ref update with no observed Actions run.
@@ -645,6 +652,14 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 		refuse("result-only-repair-review-invalid", "result-only-repair-review");
 	if (input.interruptedSourceReviewPrivateFile !== undefined && !terminalInterruption)
 		refuse("interruption-source-review-invalid", "interruption-source-review");
+	if (input.providerAvailabilityReceiptPrivateFile !== undefined &&
+		(!status.providerPaymentHold || terminalInterruption || !terminalProof ||
+			!input.loadProviderAvailabilityEnvelope))
+		refuse("provider-availability-review-unrelated", "provider-availability-review");
+	if (status.providerPaymentHold && !input.providerAvailabilityReceiptPrivateFile)
+		return { decision: planMissionContinuation({ status, terminalCarry, pendingAction,
+			terminalInterruption, currentInterruptionAction,
+			dispatchRecord: { state: "not-requested" } }), ...privateObservation };
 	if (!action) return { decision: planMissionContinuation({ status, terminalCarry,
 		pendingAction, terminalInterruption, currentInterruptionAction,
 		dispatchRecord: { state: "not-requested" } }), ...privateObservation };
@@ -716,13 +731,33 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 		pendingActionSha256: pendingActionIdentity(action),
 		testedSourceCommit: binding.testedSourceCommit, testedTree: binding.testedTree,
 		requiresRuntimeAttestationBeforeModel: true, mode: "fresh-work-only" };
+	let providerAvailabilityProof: VerifiedProviderAvailabilityProofV1 | undefined;
+	if (status.providerPaymentHold && input.providerAvailabilityReceiptPrivateFile) {
+		try {
+			providerAvailabilityProof = await verifyProviderAvailabilityProof({
+				privateReceiptFile: input.providerAvailabilityReceiptPrivateFile,
+				terminalSource: { runId: terminalCarry.source.runId,
+					runAttempt: terminalCarry.source.runAttempt,
+					commit: terminalCarry.source.commit },
+				terminalEnvelopeSha256: terminalCarry.envelopeSha256,
+				terminalWorkflowId: terminalProof!.terminal.workflowId,
+				terminalJobId: terminalProof!.terminal.jobId,
+				testedSourceCommit: binding.testedSourceCommit,
+				request: input.authenticatedHostRead?.request ?? input.request ?? fetch,
+				githubToken: input.githubToken,
+				authenticatedHostRead: input.authenticatedHostRead?.kind === "authenticated-host-github-read",
+				loadEncryptedEnvelope: input.loadProviderAvailabilityEnvelope! });
+		} catch {
+			refuse("provider-availability-review-invalid", "provider-availability-review");
+		}
+	}
 	const workflowRepairPlan = workflowRepair ?
 		await verifyWorkflowRepairPlan(input, terminalCarry, binding,
 			priorPrivateBundle["repair-state.json"] ?? resultOnlyRepair?.stateBytes,
 			action, resultOnlyRepair) : undefined;
 	let snapshot = { status, terminalCarry, pendingAction, currentDerivedAction,
 		terminalInterruption, currentInterruptionAction, interruptedSourceReview,
-		freshLaunchContract: launch, workflowRepairPlan,
+		freshLaunchContract: launch, workflowRepairPlan, providerAvailabilityProof,
 		dispatchRecord: { state: "not-requested" } as const,
 		linkedUnknownDelivery: undefined as LinkedUnknownDeliveryV1 | undefined };
 	if (input.linkedUnknownDeliveryOldControlCommit !== undefined) {
@@ -758,7 +793,8 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 	if (old) {
 		// Re-validate the current tested source and ref against the durable record.
 		// A same-key lookup alone would miss a moved source or control ref.
-		const matched = await input.journal.reserve(prospective.intent, binding);
+		const matched = await input.journal.reserve(prospective.intent, binding,
+			providerAvailabilityProof);
 		return { decision: planMissionContinuation({ ...snapshot,
 			dispatchRecord: dispatchRecord(matched) }),
 			...(input.recoverReservedDescriptor === true && matched.state === "reserved" ?
@@ -766,7 +802,8 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 			journalKey: matched.idempotencyKey,
 			journalState: matched.state, ...privateObservation };
 	}
-	const reserved = await input.journal.reserve(prospective.intent, binding);
+	const reserved = await input.journal.reserve(prospective.intent, binding,
+		providerAvailabilityProof);
 	return { decision: prospective, descriptor: publicDescriptor(binding),
 		journalKey: reserved.idempotencyKey, journalState: reserved.state,
 		...privateObservation };

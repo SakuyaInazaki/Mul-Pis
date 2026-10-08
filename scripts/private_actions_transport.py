@@ -43,6 +43,7 @@ RESULT_ALLOWLIST = (
     "campaign-status.json", "original-objective.json", "objective-checkpoint.json", "objective-assessment-receipt.json", "objective-assessment-receipts.json", "mission-ledger-out.json", "incremental-control-prefix.json", "execution-capabilities.json", "research-history.json", "restored-candidate-verification.json",
     "independent-restart-quarantine.json", "independent-restart-goal-binding.json",
     "host-effect-receipt.json", "m04-transaction-quarantine.json", "repair-state.json",
+    "provider-availability-observation.json",
 )
 RESULT_DYNAMIC_RE = re.compile(
     r"^(?:(?:provenance-import|iteration-[1-9][0-9]*|fallback-[0-9a-f]{12}-T[0-9]{3,})-(?:candidate\.cpp|verification\.json|lesson-delta\.json|experiment-plan\.json|review-decision\.json|m04-adopted-knowledge\.json|m04-transaction\.json)|"
@@ -317,6 +318,118 @@ def encrypt_results(result_dir: Path, public_key_file: Path, output_file: Path, 
             json.dump(envelope, out, separators=(",", ":"))
             out.write("\n")
     except (OSError, ValueError, TypeError, tarfile.TarError) as exc:
+        raise TransportError() from exc
+
+
+def encrypt_balance_verdict(availability: str, public_key_file: Path, output_file: Path,
+                            metadata: dict[str, str], expected_spki_sha256: str) -> None:
+    """Seal only a fixed availability verdict using the campaign's pinned RSA recipient."""
+    if not isinstance(availability, str) or availability not in {"available", "unavailable", "unknown"}:
+        raise TransportError()
+    if set(metadata) != {"repository", "run_id", "run_attempt", "commit", "event"}:
+        raise TransportError()
+    if not all(isinstance(v, str) and METADATA_RE.fullmatch(v) for v in metadata.values()):
+        raise TransportError()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_spki_sha256):
+        raise TransportError()
+    try:
+        public_key = serialization.load_pem_public_key(public_key_file.read_bytes())
+        if not isinstance(public_key, rsa.RSAPublicKey) or public_key.key_size != 3072:
+            raise TransportError()
+        spki_der = public_key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        if hashlib.sha256(spki_der).hexdigest() != expected_spki_sha256:
+            raise TransportError()
+        plaintext = json.dumps({"kind": "provider-balance-availability", "version": 1,
+                                "availability": availability}, sort_keys=True,
+                               separators=(",", ":")).encode("utf-8")
+        aad = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        key = AESGCM.generate_key(bit_length=256)
+        nonce = os.urandom(12)
+        encrypted = AESGCM(key).encrypt(nonce, plaintext, aad)
+        wrapped = public_key.encrypt(key, padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                                                       algorithm=hashes.SHA256(), label=None))
+        envelope = {
+            "format": "mul-pis-provider-balance-v1",
+            "key_wrap": "RSA-3072-OAEP-SHA256",
+            "content_cipher": "AES-256-GCM",
+            "recipient_spki_sha256": expected_spki_sha256,
+            "metadata": metadata,
+            "wrapped_key_b64": base64.b64encode(wrapped).decode("ascii"),
+            "nonce_b64": base64.b64encode(nonce).decode("ascii"),
+            "ciphertext_b64": base64.b64encode(encrypted).decode("ascii"),
+        }
+        output_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(output_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(envelope, out, separators=(",", ":"))
+            out.write("\n")
+    except (OSError, ValueError, TypeError) as exc:
+        raise TransportError() from exc
+
+
+def decrypt_balance_verdict(envelope_file: Path, private_key_file: Path,
+                            expected_spki_sha256: str) -> tuple[str, dict[str, str]]:
+    """Offline-only exact review of a standalone balance envelope, without writes."""
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for name, value in pairs:
+            if name in result:
+                raise TransportError()
+            result[name] = value
+        return result
+
+    try:
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_spki_sha256):
+            raise TransportError()
+        if envelope_file.stat().st_size > 16 * 1024:
+            raise TransportError()
+        envelope = json.loads(envelope_file.read_bytes(), object_pairs_hook=unique_object)
+        if not isinstance(envelope, dict) or set(envelope) != {
+                "format", "key_wrap", "content_cipher", "recipient_spki_sha256", "metadata",
+                "wrapped_key_b64", "nonce_b64", "ciphertext_b64"}:
+            raise TransportError()
+        if (envelope["format"] != "mul-pis-provider-balance-v1" or
+                envelope["key_wrap"] != "RSA-3072-OAEP-SHA256" or
+                envelope["content_cipher"] != "AES-256-GCM" or
+                envelope["recipient_spki_sha256"] != expected_spki_sha256):
+            raise TransportError()
+        metadata = envelope["metadata"]
+        if (not isinstance(metadata, dict) or
+                set(metadata) != {"repository", "run_id", "run_attempt", "commit", "event"} or
+                not all(isinstance(v, str) and METADATA_RE.fullmatch(v) for v in metadata.values()) or
+                metadata["repository"] != "SakuyaInazaki/Mul-Pis" or
+                not re.fullmatch(r"[1-9][0-9]*", metadata["run_id"]) or
+                metadata["run_attempt"] != "1" or
+                not re.fullmatch(r"[0-9a-f]{40}", metadata["commit"]) or
+                metadata["event"] != "push"):
+            raise TransportError()
+        key = serialization.load_pem_private_key(private_key_file.read_bytes(), password=None)
+        if not isinstance(key, rsa.RSAPrivateKey) or key.key_size != 3072:
+            raise TransportError()
+        spki = key.public_key().public_bytes(serialization.Encoding.DER,
+                                              serialization.PublicFormat.SubjectPublicKeyInfo)
+        if hashlib.sha256(spki).hexdigest() != expected_spki_sha256:
+            raise TransportError()
+        wrapped = base64.b64decode(envelope["wrapped_key_b64"], validate=True)
+        nonce = base64.b64decode(envelope["nonce_b64"], validate=True)
+        ciphertext = base64.b64decode(envelope["ciphertext_b64"], validate=True)
+        if len(wrapped) != 384 or len(nonce) != 12 or not 16 < len(ciphertext) <= 512:
+            raise TransportError()
+        aes_key = key.decrypt(wrapped, padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                                                   algorithm=hashes.SHA256(), label=None))
+        if len(aes_key) != 32:
+            raise TransportError()
+        aad = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        plaintext = AESGCM(aes_key).decrypt(nonce, ciphertext, aad)
+        verdict = json.loads(plaintext.decode("utf-8"), object_pairs_hook=unique_object)
+        if (not isinstance(verdict, dict) or
+                set(verdict) != {"kind", "version", "availability"} or
+                verdict["kind"] != "provider-balance-availability" or
+                type(verdict["version"]) is not int or verdict["version"] != 1 or
+                verdict["availability"] not in {"available", "unavailable", "unknown"}):
+            raise TransportError()
+        return verdict["availability"], metadata
+    except Exception as exc:
         raise TransportError() from exc
 
 

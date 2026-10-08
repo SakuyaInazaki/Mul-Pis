@@ -238,6 +238,31 @@ test("a changed private record fails closed on restart", async t => {
 		/control descriptor/);
 });
 
+test("a stored provider availability audit cannot claim a different terminal or tested source", async t => {
+	const { journal } = await fixture(t);
+	const intent = intentFor();
+	await journal.reserve(intent, binding());
+	const file = path.join(journal.directory, `${intent.idempotencyKey}.json`);
+	const stored = JSON.parse(await readFile(file, "utf8"));
+	stored.providerAvailabilityAudit = {
+		kind: "host-verified-provider-availability-audit",
+		receiptSha256: hash("operator review"),
+		terminalSource: { ...source, runId: "7003" },
+		terminalEnvelopeSha256: intent.envelopeSha256,
+		testedSourceCommit: binding().testedSourceCommit,
+		probeSource: { runId: "8002", runAttempt: 1, commit: "f".repeat(40) },
+		workflowId: "92", jobId: "8202", artifactId: "9302",
+		archiveSha256: hash("archive"), envelopeSha256: hash("envelope") };
+	await writeFile(file, JSON.stringify(stored));
+	await assert.rejects(new MissionResumeJournal(journal.directory).get(intent.idempotencyKey),
+		/stored provider availability audit is invalid/);
+	stored.providerAvailabilityAudit.terminalSource = source;
+	stored.providerAvailabilityAudit.testedSourceCommit = "a".repeat(40);
+	await writeFile(file, JSON.stringify(stored));
+	await assert.rejects(new MissionResumeJournal(journal.directory).get(intent.idempotencyKey),
+		/stored provider availability audit is invalid/);
+});
+
 test("a crash after attempt and unknown delivery cannot cause a second update", async t => {
 	const { journal } = await fixture(t), intent = intentFor();
 	await journal.reserve(intent, binding());

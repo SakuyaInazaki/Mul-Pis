@@ -7,6 +7,7 @@ import test from "node:test";
 import { offlineChecks } from "../scripts/manual-private-campaign.ts";
 import { reserveIndependentRestart } from "../src/m07/independent-restart.ts";
 import { verifyDeepSeekCnyBilling } from "../src/runner/deepseek-cny-pricing.ts";
+import { isVerifiedDeepSeekAvailability } from "../src/runner/deepseek-availability.ts";
 import { verifyDeepSeekProviderOutputLimit } from "../src/runner/deepseek-provider-limits.ts";
 import { Workspace } from "../src/workspace.ts";
 import { HarnessError } from "../src/types.ts";
@@ -1586,6 +1587,80 @@ test("private campaign uses only a live verified native-CNY peak profile for new
 		source.indexOf("const budget = createPrivateCampaignBudget(nativeCnyPricing"));
 	assert.ok(source.indexOf("await verifyDeepSeekCnyBilling({ apiKey: runtimeKey })") <
 		source.indexOf("const budget = createPrivateCampaignBudget(nativeCnyPricing"));
+});
+
+test("held campaign records a branded fresh availability observation before proceeding", async t => {
+	const outputDir = await mkdtemp(path.join(os.tmpdir(), "mulpis-availability-"));
+	t.after(() => rm(outputDir, { recursive: true, force: true }));
+	let fetches = 0, appends = 0;
+	const payload = JSON.stringify({ version: 1, kind: "provider-availability-observation",
+		entries: [{ source: { runId: "47", runAttempt: 1, commit: "a".repeat(40) },
+			priorEnvelopeSha256: "b".repeat(64), availability: "available" }] });
+	const ledger = { priorProviderPaymentHold: true,
+		appendProviderAvailabilityObservation(observation: unknown) {
+			appends++;
+			assert.equal(isVerifiedDeepSeekAvailability(observation), true);
+			assert.deepEqual(observation, { availability: "available" });
+			return payload;
+		} } as Parameters<typeof offlineChecks.checkHeldProviderAvailability>[0]["ledger"];
+	const checked = await offlineChecks.checkHeldProviderAvailability({ ledger,
+		apiKey: "synthetic-secret", outputDir, request: async (url, init) => {
+			fetches++;
+			assert.equal(String(url), "https://api.deepseek.com/user/balance");
+			assert.equal(init?.method, "GET");
+			return new Response(JSON.stringify({ is_available: true, balance_infos: [{ currency: "USD",
+				total_balance: "SECRET_AMOUNT", granted_balance: "SECRET_GRANT",
+				topped_up_balance: "SECRET_TOPUP" }] }), { status: 200 });
+		} });
+	assert.equal(checked?.availability, "available");
+	assert.equal(fetches, 1);
+	assert.equal(appends, 1);
+	const file = path.join(outputDir, "provider-availability-observation.json");
+	assert.equal(await readFile(file, "utf8"), payload);
+	assert.equal((await stat(file)).mode & 0o077, 0);
+	assert.doesNotMatch(await readFile(file, "utf8"), /SECRET_|synthetic-secret/);
+	const carried = await offlineChecks.collectContinuationBundle(outputDir,
+		{ "candidate.cpp": "// retained selected source" });
+	assert.equal(carried?.["provider-availability-observation.json"], payload);
+});
+
+test("held campaign records false and ambiguous results before blocking model work", async t => {
+	const outputDir = await mkdtemp(path.join(os.tmpdir(), "mulpis-availability-"));
+	t.after(() => rm(outputDir, { recursive: true, force: true }));
+	for (const [label, response, expected] of [
+		["false", new Response(JSON.stringify({ is_available: false, balance_infos: [] }),
+			{ status: 200 }), "unavailable"],
+		["http error", new Response("PRIVATE_BODY", { status: 402 }), "unknown"],
+	] as const) {
+		const target = path.join(outputDir, label);
+		await mkdir(target);
+		let recorded = "";
+		const ledger = { priorProviderPaymentHold: true,
+			appendProviderAvailabilityObservation(observation: unknown) {
+				assert.equal(isVerifiedDeepSeekAvailability(observation), true);
+				recorded = (observation as { availability: string }).availability;
+				return JSON.stringify({ availability: recorded });
+			} } as Parameters<typeof offlineChecks.checkHeldProviderAvailability>[0]["ledger"];
+		await assert.rejects(offlineChecks.checkHeldProviderAvailability({ ledger,
+			apiKey: "synthetic-secret", outputDir: target, request: async () => response }),
+			/no model request is allowed/);
+		assert.equal(recorded, expected, label);
+		assert.equal(JSON.parse(await readFile(path.join(target,
+			"provider-availability-observation.json"), "utf8")).availability, expected);
+	}
+});
+
+test("campaign without an authenticated payment hold does not probe or emit a release", async t => {
+	const outputDir = await mkdtemp(path.join(os.tmpdir(), "mulpis-no-availability-"));
+	t.after(() => rm(outputDir, { recursive: true, force: true }));
+	const ledger = { priorProviderPaymentHold: false,
+		appendProviderAvailabilityObservation() { throw Error("unexpected append"); }
+	} as Parameters<typeof offlineChecks.checkHeldProviderAvailability>[0]["ledger"];
+	const checked = await offlineChecks.checkHeldProviderAvailability({ ledger, apiKey: "synthetic-secret",
+		outputDir, request: async () => { throw Error("unexpected fetch"); } });
+	assert.equal(checked, undefined);
+	assert.deepEqual(await readFile(path.join(outputDir,
+		"provider-availability-observation.json"), "utf8").catch(() => undefined), undefined);
 });
 
 test("M04 evidence coverage requires exact task files and complete returned text ranges", async () => {
