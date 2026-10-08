@@ -411,6 +411,10 @@ export function privateHostPreparationDiagnostic(error: unknown): Record<string,
 			attempts: error.errors.map(item => privateHostPreparationDiagnostic(item)) };
 	if (error instanceof MissionHostPreparationError)
 		return { code: error.refusal.code, stage: error.refusal.stage,
+			...(error.refusal.providerAvailabilityCause === undefined ? {} :
+				{ providerAvailabilityCause: error.refusal.providerAvailabilityCause }),
+			...(error.refusal.providerAvailabilityCheck === undefined ? {} :
+				{ providerAvailabilityCheck: error.refusal.providerAvailabilityCheck }),
 			...(error.refusal.ciRunId === undefined ? {} : { ciRunId: error.refusal.ciRunId }),
 			...(error.refusal.ciStatus === undefined ? {} : { ciStatus: error.refusal.ciStatus }),
 			...(error.refusal.ciConclusion === undefined ? {} : { ciConclusion: error.refusal.ciConclusion }),

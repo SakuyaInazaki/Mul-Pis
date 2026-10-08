@@ -1885,6 +1885,7 @@ test("fresh source-bound probe releases only the 402 hold and preserves five unk
 		`Terminal-Commit: ${terminalSource.commit}\n` +
 		`Terminal-Envelope-SHA256: ${authenticated.proof.envelopeSha256}\n` +
 		`Request-Nonce: ${value}\n`;
+	let probeMessage = messageFor(nonce).slice(0, -1);
 	const envelopeFor = (probe: typeof probeSource) => Buffer.from(JSON.stringify({
 		format: "mul-pis-provider-balance-v1",
 		key_wrap: "RSA-3072-OAEP-SHA256", content_cipher: "AES-256-GCM",
@@ -1918,7 +1919,7 @@ test("fresh source-bound probe releases only the 402 hold and preserves five unk
 		else if (address.endsWith("/git/ref/heads/run-requests/provider-balance-availability"))
 			data = { object: { sha: probeSource.commit } };
 		else if (address.endsWith(`/git/commits/${probeSource.commit}`))
-			data = { sha: probeSource.commit, message: messageFor(nonce),
+			data = { sha: probeSource.commit, message: probeMessage,
 				tree: { sha: testedTree }, parents: probeSource.runId === "8002" ?
 					[{ sha: sourceCommit }] : [{ sha: sourceCommit }, { sha: sha40("5") }] };
 		else if (address.endsWith("/actions/jobs/6002"))
@@ -1973,6 +1974,37 @@ test("fresh source-bound probe releases only the 402 hold and preserves five unk
 		privateHostPreparationDiagnostic(error).code === "provider-availability-review-invalid");
 	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
 	await writeFile(receiptFile, JSON.stringify(receipt));
+	probeMessage = `${messageFor(nonce)}Reviewer: available\n`;
+	await assert.rejects(prepareAuthenticatedResumeRequest(input), error => {
+		const diagnostic = privateHostPreparationDiagnostic(error);
+		assert.deepEqual(diagnostic, { code: "provider-availability-review-invalid",
+			stage: "provider-availability-review",
+			providerAvailabilityCause: "live-source-invalid",
+			providerAvailabilityCheck: "request-commit-message" });
+		return true;
+	});
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	const refusedBridge = await runStdioBridge(f, { request,
+		outputPrivate: path.join(f.dir, "refused-provider-private.json"),
+		providerAvailabilityReceiptPrivateFile: receiptFile,
+		providerAvailabilityEnvelopeBytes: encrypted });
+	assert.equal(refusedBridge.code, 1);
+	assert(!refusedBridge.lines.some(row => (row as { kind: string }).kind === "prepared"));
+	assert(!refusedBridge.stdout.includes(receiptFile));
+	assert(!refusedBridge.stdout.includes("Reviewer: available"));
+	assert(!refusedBridge.stdout.includes("live-source-invalid"));
+	assert(!refusedBridge.stdout.includes("request-commit-message"));
+	assert(!refusedBridge.stdout.includes(nonce));
+	assert(!refusedBridge.stderr.includes("Reviewer: available"));
+	const privateRefusal = JSON.parse(await readFile(refusedBridge.outputPrivate, "utf8"));
+	assert.deepEqual(privateRefusal, { version: 1,
+		kind: "private-resume-preparation-diagnostic",
+		code: "provider-availability-review-invalid",
+		stage: "provider-availability-review",
+		providerAvailabilityCause: "live-source-invalid",
+		providerAvailabilityCheck: "request-commit-message" });
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	probeMessage = messageFor(nonce).slice(0, -1);
 	await verifyProviderAvailabilityProof({ privateReceiptFile: receiptFile,
 		terminalSource, terminalEnvelopeSha256: authenticated.proof.envelopeSha256,
 		terminalWorkflowId: authenticated.proof.terminal.workflowId,
@@ -2009,6 +2041,7 @@ test("fresh source-bound probe releases only the 402 hold and preserves five unk
 	jobId = "8203";
 	archiveSha256 = "9".repeat(64);
 	nonce = "a".repeat(32);
+	probeMessage = messageFor(nonce).slice(0, -1);
 	encrypted = envelopeFor(probeSource);
 	receipt = receiptFor();
 	await writeFile(receiptFile, JSON.stringify(receipt));

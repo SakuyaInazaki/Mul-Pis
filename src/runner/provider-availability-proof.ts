@@ -68,13 +68,16 @@ export function isVerifiedProviderAvailabilityProof(value: unknown): value is Ve
 export class ProviderAvailabilityProofError extends Error {
 	readonly code: "invalid-receipt" | "unrelated-receipt" | "live-source-invalid" |
 		"probe-not-fresh" | "artifact-invalid" | "envelope-invalid";
-	constructor(code: ProviderAvailabilityProofError["code"]) {
+	readonly check?: "request-commit-message";
+	constructor(code: ProviderAvailabilityProofError["code"], check?: ProviderAvailabilityProofError["check"]) {
 		super(`provider availability proof refused: ${code}`);
 		this.code = code;
+		this.check = check;
 	}
 }
-const reject = (code: ProviderAvailabilityProofError["code"]): never => {
-	throw new ProviderAvailabilityProofError(code);
+const reject = (code: ProviderAvailabilityProofError["code"],
+	check?: ProviderAvailabilityProofError["check"]): never => {
+	throw new ProviderAvailabilityProofError(code, check);
 };
 
 function receiptValid(v: unknown): v is ProviderAvailabilityReviewReceiptV1 {
@@ -207,9 +210,14 @@ export async function verifyProviderAvailabilityProof(input: Readonly<{
 		`Terminal-Commit: ${input.terminalSource.commit}\n` +
 		`Terminal-Envelope-SHA256: ${input.terminalEnvelopeSha256}\n` +
 		`Request-Nonce: ${p.requestNonce}\n`;
+	// GitHub's git/commits JSON may omit the final LF from the raw commit
+	// message. Accept that one API normalization only; never trim other bytes.
+	const restMessage = expectedMessage.slice(0, -1);
+	if (requestCommit.message !== expectedMessage && requestCommit.message !== restMessage)
+		reject("live-source-invalid", "request-commit-message");
 	if (testedCommit.sha !== input.testedSourceCommit || !sha40(testedCommit.tree &&
 		object(testedCommit.tree) ? testedCommit.tree.sha : undefined) ||
-		requestCommit.sha !== p.source.commit || requestCommit.message !== expectedMessage ||
+		requestCommit.sha !== p.source.commit ||
 		!object(requestCommit.tree) || !object(testedCommit.tree) ||
 		requestCommit.tree.sha !== testedCommit.tree.sha ||
 		!Array.isArray(requestCommit.parents) || requestCommit.parents.length < 1 ||

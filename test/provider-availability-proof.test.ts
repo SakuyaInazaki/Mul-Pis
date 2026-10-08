@@ -99,6 +99,32 @@ test("available verdict is branded only after fresh exact live source and privat
 	assert.equal(proof.availability, "available");
 });
 
+test("GitHub REST commit message without its terminal LF verifies the exact source", async t => {
+	const f = await fixture(t);
+	const requestCommit = f.rows[`/git/commits/${probeSource.commit}`] as Record<string, unknown>;
+	requestCommit.message = requestMessage.slice(0, -1);
+	const proof = await f.verify();
+	assert.equal(isVerifiedProviderAvailabilityProof(proof), true);
+	assert.deepEqual(proof.probeSource, probeSource);
+	assert.equal(proof.availability, "available");
+});
+
+test("REST message normalization rejects changed line endings, excess LF, and injected trailers", async t => {
+	const f = await fixture(t);
+	const requestCommit = f.rows[`/git/commits/${probeSource.commit}`] as Record<string, unknown>;
+	for (const message of [
+		requestMessage.replaceAll("\n", "\r\n"),
+		`${requestMessage}\n`,
+		`${requestMessage}Reviewer: available\n`,
+		`${requestMessage.slice(0, -1)}\nReviewer: available`,
+		`Before\n${requestMessage.slice(0, -1)}\nAfter`,
+	]) {
+		requestCommit.message = message;
+		await assert.rejects(f.verify(), { code: "live-source-invalid",
+			check: "request-commit-message" });
+	}
+});
+
 test("old or nonmatching probe cannot release a later held terminal", async t => {
 	const f = await fixture(t);
 	const probe = f.rows[`/actions/runs/${probeSource.runId}`] as Record<string, unknown>;

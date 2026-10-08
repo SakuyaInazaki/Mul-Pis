@@ -28,7 +28,8 @@ import { readReviewedResultOnlyRepairState, isVerifiedResultOnlyRepairState,
 	type VerifiedResultOnlyRepairStateV1 } from "./result-only-repair-review.ts";
 import { isVerifiedUnobservedControlSourceCapability,
 	readReviewedUnobservedControlSourceCapability } from "./unobserved-control-source-review.ts";
-import { verifyProviderAvailabilityProof, type VerifiedProviderAvailabilityProofV1 } from
+import { ProviderAvailabilityProofError, verifyProviderAvailabilityProof,
+	type VerifiedProviderAvailabilityProofV1 } from
 	"./provider-availability-proof.ts";
 
 const REPOSITORY = "SakuyaInazaki/Mul-Pis";
@@ -67,6 +68,9 @@ export type HostPreparationRefusal = Readonly<{
 	ciConclusion?: "success" | "failure" | "cancelled" | "timed_out" | "skipped" |
 		"neutral" | "action_required" | "unrecognized" | null;
 	httpStatus?: number;
+	/** Static private cause from the balance-proof verifier; no provider body or URL. */
+	providerAvailabilityCause?: ProviderAvailabilityProofError["code"];
+	providerAvailabilityCheck?: ProviderAvailabilityProofError["check"];
 }>;
 export class MissionHostPreparationError extends Error {
 	readonly refusal: HostPreparationRefusal;
@@ -747,7 +751,11 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 				githubToken: input.githubToken,
 				authenticatedHostRead: input.authenticatedHostRead?.kind === "authenticated-host-github-read",
 				loadEncryptedEnvelope: input.loadProviderAvailabilityEnvelope! });
-		} catch {
+		} catch (error) {
+			if (error instanceof ProviderAvailabilityProofError)
+				throw new MissionHostPreparationError({ code: "provider-availability-review-invalid",
+					stage: "provider-availability-review", providerAvailabilityCause: error.code,
+					...(error.check ? { providerAvailabilityCheck: error.check } : {}) });
 			refuse("provider-availability-review-invalid", "provider-availability-review");
 		}
 	}
