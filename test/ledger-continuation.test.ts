@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { deflateRawSync } from "node:zlib";
 import test, { type TestContext } from "node:test";
-import { authenticateLatestTerminalCarry, authenticateLatestTerminalInterruption, authenticatedSupervisorProjection, authenticatedTerminalCarryBindsBundle, authenticatedTerminalInterruptionBindsPriorBundle, authenticatedTerminalInterruptionSupervisorProjection, isAuthenticatedTerminalCarryProof, isAuthenticatedTerminalInterruptionProof, isAuthenticatedIncrementalPrefixObservation, authenticatedIncrementalPrefixBindsPriorBundle, authenticatedAccountingObservation, authenticatedHistoricalOpaqueRunGaps, authenticatedHistoricalCarryOrigin, authenticatedPendingHistoricalEffectSources, authenticatedSelectedTransitions, authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, authenticatedUnknownControlDeliveries, authenticatedTerminalUnknownControlDeliveries, isAuthenticatedPriorCarryProof, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, originalObjectiveMatchesSignedBootstrap, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE, retainedTransportDiagnosticWithinBundle } from "../src/runner/ledger-continuation.ts";
+import { authenticateLatestTerminalCarry, authenticateLatestTerminalInterruption, authenticatedSupervisorProjection, authenticatedTerminalCarryBindsBundle, authenticatedTerminalInterruptionBindsPriorBundle, authenticatedTerminalInterruptionSupervisorProjection, isAuthenticatedTerminalCarryProof, isAuthenticatedTerminalInterruptionProof, isAuthenticatedIncrementalPrefixObservation, authenticatedIncrementalPrefixBindsPriorBundle, authenticatedAccountingObservation, authenticatedHistoricalOpaqueRunGaps, authenticatedHistoricalCarryOrigin, authenticatedPendingHistoricalEffectSources, authenticatedSelectedTransitions, authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, authenticatedUnknownControlDeliveries, authenticatedTerminalUnknownControlDeliveries, isAuthenticatedPriorCarryProof, isAuthenticatedPredecessorResearchHistory, PredecessorResearchHistoryAccessError, PredecessorResearchHistoryIntegrityError, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, originalObjectiveMatchesSignedBootstrap, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE, retainedTransportDiagnosticWithinBundle } from "../src/runner/ledger-continuation.ts";
 import { INCREMENTAL_CHECKPOINT_FILE, IncrementalPrivateCheckpointJournal } from "../src/runner/incremental-private-checkpoint.ts";
 import type { CarryArtifactPayload, RequestAuditSnapshot } from "../src/runner/ledger-continuation.ts";
 import { DeepSeekCampaignBudget, campaignSessionEffectId, type CampaignAdmissionRejection } from "../src/runner/deepseek-campaign.ts";
@@ -22,6 +22,190 @@ import { CARRY_LOGICAL_BYTES } from "../src/runner/carry-sidecar-codec.ts";
 import { workflowRepairState } from "../src/runner/repair-liveness.ts";
 
 const sha = (letter: string) => letter.repeat(40);
+test("immediate predecessor history is recovered only from exact authenticated v4 ancestry", async t => {
+	const f = await fixture(t);
+	const seedEnvelopeB64 = attestedSeed(f);
+	const emptyAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
+		requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
+	const oldHistory = JSON.stringify({ version: 1, kind: "untrusted-version-bound-research-history",
+		entries: [{ taskId: "synthetic-task", version: 1, files: { "candidate.cpp": "old version" } }] });
+	const newHistory = JSON.stringify({ version: 1, kind: "untrusted-version-bound-research-history",
+		entries: [{ taskId: "synthetic-task", version: 2, files: { "candidate.cpp": "new version" } }] });
+	const firstOpening = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7002, sha("b")),
+		request: github([anchor, first]), loadCarryArtifact: async () => "unused" });
+	const firstCarry = firstOpening.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: emptyAudit,
+		privateBundle: { ...firstOpening.priorPrivateBundle!, "research-history.json": oldHistory } });
+	const firstDone = { ...first, status: "completed", conclusion: "success" };
+	const secondRun = run(7003, 3, "in_progress", sha("c"));
+	const secondOpening = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7003, sha("c")),
+		request: github([anchor, firstDone, secondRun]),
+		loadCarryArtifact: async () => firstCarry });
+	const secondCarry = secondOpening.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: emptyAudit,
+		privateBundle: { ...secondOpening.priorPrivateBundle!, "research-history.json": newHistory } });
+	const secondDone = { ...secondRun, status: "completed", conclusion: "success" };
+	const thirdRun = run(7004, 4, "in_progress", sha("d"));
+	const base = github([anchor, firstDone, secondDone, thirdRun]);
+	const artifact = (runId: number, commit: string) => new Response(JSON.stringify({ total_count: 1,
+		artifacts: [{ id: runId + 2000, name: CARRY_ARTIFACT_NAME, expired: false,
+			workflow_run: { id: runId, head_sha: commit } }] }));
+	let predecessorCommit = sha("b");
+	let predecessorExpired = false;
+	let predecessorMissing = false;
+	let listingFailure: unknown;
+	let predecessorPages: Array<{ id: number; name: string; expired: boolean;
+		workflow_run: { id: number; head_sha: string } }> | undefined;
+	let changeSecondPagePass = false, changePageTwoTotal = false, pageOneCalls = 0;
+	const request: typeof fetch = (url, init) => {
+		const address = String(url);
+		if (address.includes("/runs/7002/artifacts?") && listingFailure)
+			return Promise.reject(listingFailure);
+		if (address.includes("/runs/7002/artifacts?") && predecessorMissing)
+			return Promise.resolve(new Response(JSON.stringify({ total_count: 0, artifacts: [] })));
+		if (address.includes("/runs/7002/artifacts?") && predecessorPages) {
+			const page = Number(new URL(address).searchParams.get("page") ?? "1");
+			const pageRows = predecessorPages.slice((page - 1) * 100, page * 100);
+			if (page === 1) pageOneCalls++;
+			return Promise.resolve(new Response(JSON.stringify({
+				total_count: predecessorPages.length + (changePageTwoTotal && page === 2 ? 1 : 0),
+				artifacts: changeSecondPagePass && page === 1 && pageOneCalls === 2 ?
+					[{ ...pageRows[0], name: "changed-between-passes" }, ...pageRows.slice(1)] : pageRows })));
+		}
+		if (address.includes("/runs/7002/artifacts?")) return Promise.resolve(predecessorExpired ?
+			new Response(JSON.stringify({ total_count: 1, artifacts: [{ id: 9002,
+				name: CARRY_ARTIFACT_NAME, expired: true,
+				workflow_run: { id: 7002, head_sha: predecessorCommit } }] })) :
+			artifact(7002, predecessorCommit));
+		if (address.includes("/runs/7003/artifacts?")) return Promise.resolve(artifact(7003, sha("c")));
+		if (address.includes("/runs/7003/jobs?")) return Promise.resolve(new Response(JSON.stringify({
+			total_count: 1, jobs: [{ id: 6003, run_id: 7003, run_attempt: 1, head_sha: sha("c"),
+				name: "private-campaign", status: "completed", conclusion: "success",
+				steps: [{ name: "Run bounded private campaign", status: "completed", conclusion: "success" }] }] })));
+		return base(url, init);
+	};
+	let predecessorPayload: CarryArtifactPayload = firstCarry;
+	let downloadFailure: unknown;
+	const reopened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7004, sha("d")), request,
+		loadCarryArtifact: async ({ runId }) => {
+			if (runId === "7002" && downloadFailure) throw downloadFailure;
+			return runId === "7002" ? predecessorPayload : secondCarry;
+		} });
+	assert.equal(reopened.priorPrivateBundle?.["research-history.json"], newHistory);
+	const recovered = await reopened.recoverImmediatePredecessorResearchHistory();
+	assert.equal(isAuthenticatedPredecessorResearchHistory(recovered), true);
+	if (!isAuthenticatedPredecessorResearchHistory(recovered)) return;
+	assert.equal(isAuthenticatedPredecessorResearchHistory({ ...recovered }), false);
+	assert.equal(recovered.text, oldHistory);
+	assert.equal(recovered.source.runId, "7002");
+	assert.equal(recovered.selectionAuthority, false);
+	assert.equal(recovered.envelopeSha256,
+		createHash("sha256").update(Buffer.from(firstCarry.envelopeB64, "base64")).digest("hex"));
+	predecessorPages = [...Array.from({ length: 100 }, (_, index) => ({
+		id: 12000 - index, name: `unrelated-${index}`, expired: false,
+		workflow_run: { id: 7002, head_sha: sha("b") } })),
+		{ id: 9002, name: CARRY_ARTIFACT_NAME, expired: false,
+			workflow_run: { id: 7002, head_sha: sha("b") } }];
+	const beyondOnePage = await reopened.recoverImmediatePredecessorResearchHistory();
+	assert.equal(beyondOnePage.kind === "authenticated-predecessor-research-history" ?
+		beyondOnePage.text : undefined, oldHistory);
+	assert.equal(pageOneCalls, 2, "both complete pagination passes were checked");
+	predecessorPages[100] = { ...predecessorPages[100], id: predecessorPages[0].id };
+	await assert.rejects(reopened.recoverImmediatePredecessorResearchHistory(),
+		(error: unknown) => error instanceof PredecessorResearchHistoryIntegrityError);
+	predecessorPages[100] = { ...predecessorPages[100], id: 9002 };
+	changeSecondPagePass = true; pageOneCalls = 0;
+	await assert.rejects(reopened.recoverImmediatePredecessorResearchHistory(),
+		(error: unknown) => error instanceof PredecessorResearchHistoryIntegrityError);
+	changeSecondPagePass = false; changePageTwoTotal = true;
+	await assert.rejects(reopened.recoverImmediatePredecessorResearchHistory(),
+		(error: unknown) => error instanceof PredecessorResearchHistoryIntegrityError);
+	changePageTwoTotal = false; predecessorPages = undefined;
+	listingFailure = Error("private synthetic connector detail");
+	await assert.rejects(reopened.recoverImmediatePredecessorResearchHistory(),
+		(error: unknown) => error instanceof PredecessorResearchHistoryAccessError &&
+			error.stage === "artifact-list" && error.cause === listingFailure &&
+			!error.message.includes("private synthetic connector detail") &&
+			!JSON.stringify(error).includes("private synthetic connector detail"));
+	listingFailure = undefined;
+	downloadFailure = Error("private synthetic downloader detail");
+	await assert.rejects(reopened.recoverImmediatePredecessorResearchHistory(),
+		(error: unknown) => error instanceof PredecessorResearchHistoryAccessError &&
+			error.stage === "artifact-download" && error.cause === downloadFailure &&
+			!error.message.includes("private synthetic downloader detail") &&
+			!JSON.stringify(error).includes("private synthetic downloader detail"));
+	downloadFailure = undefined;
+	predecessorCommit = sha("f");
+	await assert.rejects(reopened.recoverImmediatePredecessorResearchHistory(),
+		(error: unknown) => error instanceof PredecessorResearchHistoryIntegrityError);
+	predecessorCommit = sha("b");
+	predecessorPayload = { ...firstCarry, envelopeB64: secondCarry.envelopeB64 };
+	await assert.rejects(reopened.recoverImmediatePredecessorResearchHistory(),
+		(error: unknown) => error instanceof PredecessorResearchHistoryIntegrityError);
+	const tamperedOuter = JSON.parse(Buffer.from(firstCarry.envelopeB64, "base64").toString("utf8"));
+	tamperedOuter.tag = `${tamperedOuter.tag[0] === "A" ? "B" : "A"}${tamperedOuter.tag.slice(1)}`;
+	predecessorPayload = { ...firstCarry,
+		envelopeB64: Buffer.from(JSON.stringify(tamperedOuter)).toString("base64") };
+	await assert.rejects(reopened.recoverImmediatePredecessorResearchHistory(),
+		(error: unknown) => error instanceof PredecessorResearchHistoryIntegrityError);
+	const seed = await authenticateSignedMissionSeed({ ...f, envelopeB64: seedEnvelopeB64 });
+	const predecessorSource = { runId: "7002", runAttempt: 1, runNumber: 2, commit: sha("b") };
+	const key = seed.derivePrivateKey("mul-pis-ledger-continuation-v1");
+	predecessorPayload = resealV4Checkpoint(decodeV4Checkpoint(firstCarry,
+		seed.seedDigest, key, predecessorSource), seed.seedDigest, key, predecessorSource);
+	await assert.rejects(reopened.recoverImmediatePredecessorResearchHistory(),
+		(error: unknown) => error instanceof PredecessorResearchHistoryIntegrityError &&
+			/differs from authenticated ancestry/.test(error.message));
+	predecessorExpired = true;
+	const expectedUnavailable = {
+		version: 1, kind: "predecessor-research-history-unavailable",
+		reason: "artifact-expired", predecessor: {
+			source: { runId: "7002", runAttempt: 1, runNumber: 2, commit: sha("b") },
+			envelopeSha256: recovered.envelopeSha256 } };
+	const expired = await reopened.recoverImmediatePredecessorResearchHistory();
+	assert.deepEqual(expired, expectedUnavailable);
+	assert.equal(isAuthenticatedPredecessorResearchHistory(expired), false);
+	predecessorExpired = false;
+	predecessorMissing = true;
+	const missing = await reopened.recoverImmediatePredecessorResearchHistory();
+	assert.deepEqual(missing, { ...expectedUnavailable, reason: "artifact-not-observed" });
+	assert.equal(isAuthenticatedPredecessorResearchHistory(missing), false);
+	predecessorMissing = false;
+	predecessorPayload = firstCarry;
+	const thirdCarry = reopened.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: emptyAudit });
+	const thirdDone = { ...thirdRun, status: "completed", conclusion: "success" };
+	const fourthRun = run(7005, 5, "in_progress", sha("e"));
+	const fourthBase = github([anchor, firstDone, secondDone, thirdDone, fourthRun]);
+	const fourthRequest: typeof fetch = (url, init) => {
+		const address = String(url);
+		if (address.includes("/workflows/manual-private-campaign.yml/runs?"))
+			return fourthBase(url, init);
+		if (address.includes("/runs/7004/artifacts?"))
+			return Promise.resolve(artifact(7004, sha("d")));
+		if (address.includes("/runs/7004/jobs?")) return Promise.resolve(new Response(JSON.stringify({
+			total_count: 1, jobs: [{ id: 6004, run_id: 7004, run_attempt: 1, head_sha: sha("d"),
+				name: "private-campaign", status: "completed", conclusion: "success",
+				steps: [{ name: "Run bounded private campaign", status: "completed", conclusion: "success" }] }] })));
+		return request(url, init);
+	};
+	const successor = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7005, sha("e")), request: fourthRequest,
+		loadCarryArtifact: async ({ runId }) => runId === "7004" ? thirdCarry : firstCarry });
+	const olderTarget = { source: recovered.source, envelopeSha256: recovered.envelopeSha256 };
+	const older = await successor.recoverImmediatePredecessorResearchHistory(olderTarget);
+	assert.equal(isAuthenticatedPredecessorResearchHistory(older), true);
+	assert.equal(older.kind === "authenticated-predecessor-research-history" ? older.text : undefined,
+		oldHistory);
+	await assert.rejects(successor.recoverImmediatePredecessorResearchHistory({
+		...olderTarget, envelopeSha256: "f".repeat(64) }), /target is not an earlier authenticated/);
+	predecessorMissing = true;
+	assert.deepEqual(await successor.recoverImmediatePredecessorResearchHistory(olderTarget),
+		{ ...expectedUnavailable, reason: "artifact-not-observed" });
+});
 test("historical six-field grounded nextTask survives v4/v3 carry without acquiring authority", async t => {
 	const f = await fixture(t);
 	const contract = createOriginalObjective({ goal: "Synthetic source-grounded mission",

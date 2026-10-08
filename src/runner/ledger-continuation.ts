@@ -253,6 +253,48 @@ export type AuthenticatedPriorCarryProof = Readonly<{
 	priorSettledCny?: number; priorUnknownObservedCny?: number; priorUnpricedRequestCount?: number;
 	admittedCurrent: Readonly<Source>;
 }>;
+/** Raw research-history bytes from the immediate preceding AEAD carry. This
+ * proves transport provenance only; its entries have no selection authority. */
+export type AuthenticatedPredecessorResearchHistory = Readonly<{
+	version: 1; kind: "authenticated-predecessor-research-history";
+	source: Readonly<Source>; envelopeSha256: string; text: string;
+	selectionAuthority: false;
+}>;
+export type PredecessorResearchHistoryUnavailable = Readonly<{
+	version: 1; kind: "predecessor-research-history-unavailable";
+	reason: "no-authenticated-prior-carry" | "no-predecessor" |
+		"artifact-not-observed" | "artifact-expired" | "history-absent";
+	/** Exact authenticated ancestry receipt, without any claim about lost bytes. */
+	predecessor?: Readonly<{ source: Readonly<Source>; envelopeSha256: string }>;
+}>;
+const authenticatedPredecessorResearchHistories = new WeakSet<object>();
+export function isAuthenticatedPredecessorResearchHistory(value: unknown):
+	value is AuthenticatedPredecessorResearchHistory {
+	return Boolean(value) && typeof value === "object" &&
+		authenticatedPredecessorResearchHistories.has(value as object);
+}
+/** An available archive with contradictory metadata or bytes must never be
+ * treated like an expired archive. */
+export class PredecessorResearchHistoryIntegrityError extends HarnessError {
+	constructor(reason: string) {
+		super("runner.predecessor-research-history-integrity", reason);
+		this.name = "PredecessorResearchHistoryIntegrityError";
+	}
+}
+/** A failed authenticated GitHub read is an access blocker, not evidence that
+ * the predecessor's authenticated bytes contradict the latest carry. */
+export class PredecessorResearchHistoryAccessError extends HarnessError {
+	readonly stage: "artifact-list" | "artifact-download";
+	readonly cause: unknown;
+	constructor(stage: "artifact-list" | "artifact-download", cause: unknown) {
+		super("runner.predecessor-research-history-access",
+			`predecessor research history ${stage} could not complete`);
+		this.name = "PredecessorResearchHistoryAccessError";
+		this.stage = stage;
+		this.cause = cause;
+		Object.defineProperty(this, "cause", { enumerable: false });
+	}
+}
 export type AuthenticatedCarryForwardOrigin = Readonly<{
 	source: Readonly<Source>; envelopeSha256: string;
 	historicalCommittedNano: number; historicalUnknownHeldNano: number;
@@ -467,6 +509,11 @@ export type LedgerContinuation = {
 	priorSettledCny?: number; priorUnknownObservedCny?: number; priorUnpricedRequestCount?: number;
 	historicalCommittedCny?: number; historicalUnknownHeldCny?: number;
 	priorCarryProof?: AuthenticatedPriorCarryProof;
+	/** Read the immediately preceding archived history through authenticated
+	 * ancestry and the existing Actions artifact transport. */
+	recoverImmediatePredecessorResearchHistory: (target?: Readonly<{
+		source: Readonly<Source>; envelopeSha256: string }>) => Promise<
+		AuthenticatedPredecessorResearchHistory | PredecessorResearchHistoryUnavailable>;
 	claimOneUse: (carryDigest: string) => Promise<ActionsCarryRestartClaim>;
 	priorPrivateBundle?: PrivateContinuationBundle; priorBootstrapBinding?: BootstrapBinding;
 	sealCurrent: (input: AccountingCarrySealInput) => { envelopeB64: string;
@@ -2329,6 +2376,45 @@ async function artifactsForRun(runId: string, token: string | undefined, request
 		reject("workflow artifact list is incomplete");
 	return response.artifacts.filter(record) as Artifact[];
 }
+/** Enumerate a predecessor's entire artifact list without an arbitrary count
+ * cutoff. Repeat the ordered census so page shifts cannot silently hide a
+ * carry while preserving the same reported total. */
+async function paginatedArtifactsForRun(runId: string, token: string | undefined,
+	request: typeof fetch): Promise<Artifact[]> {
+	const snapshot = async (): Promise<Artifact[]> => {
+		const rows: Artifact[] = [];
+		const ids = new Set<number>();
+		let totalCount: number | undefined;
+		for (let page = 1; ; page++) {
+			if (!Number.isSafeInteger(page)) reject("workflow artifact pagination index is invalid");
+			const response = await githubJson(
+				`https://api.github.com/repos/${MISSION_REPOSITORY}/actions/runs/${runId}/artifacts?per_page=100&page=${page}`,
+				token, request);
+			if (!Number.isSafeInteger(response.total_count) || Number(response.total_count) < 0 ||
+				!Array.isArray(response.artifacts) || response.artifacts.length > 100 ||
+				response.artifacts.some(artifact => !record(artifact) ||
+					!Number.isSafeInteger(artifact.id) || Number(artifact.id) <= 0 ||
+					typeof artifact.name !== "string" || !artifact.name))
+				reject("workflow artifact pagination page is invalid");
+			if (totalCount !== undefined && totalCount !== response.total_count)
+				reject("workflow artifact listing changed during pagination");
+			totalCount = Number(response.total_count);
+			if (response.artifacts.length !== Math.min(100, totalCount - rows.length))
+				reject("workflow artifact pagination page is incomplete");
+			for (const artifact of response.artifacts as Artifact[]) {
+				if (ids.has(artifact.id!)) reject("workflow artifact listing repeats an artifact ID");
+				ids.add(artifact.id!);
+				rows.push(artifact);
+			}
+			if (rows.length === totalCount) return rows;
+		}
+	};
+	const first = await snapshot();
+	const second = await snapshot();
+	if (JSON.stringify(first) !== JSON.stringify(second))
+		reject("workflow artifact listing changed between pagination passes");
+	return first;
+}
 async function oneArtifact(runId: string, token: string | undefined, request: typeof fetch,
 	name: string, requiredId?: string, inspect?: (artifacts: Artifact[]) => void): Promise<string> {
 	const artifacts = await artifactsForRun(runId, token, request);
@@ -3138,6 +3224,100 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 		event: c.event as "push" | "workflow_dispatch", priorEnvelopeSha256: parentDigest };
 	const liveUnobservedControlDeliveries = Object.freeze(storedUnobservedControlDeliveries.map(row =>
 		Object.freeze({ ...row, admittedBy: Object.freeze({ ...row.admittedBy }) })));
+	const unavailablePredecessorHistory = (reason: PredecessorResearchHistoryUnavailable["reason"],
+		predecessor?: Readonly<{ source: Readonly<Source>; envelopeSha256: string }>):
+		PredecessorResearchHistoryUnavailable => Object.freeze({ version: 1,
+			kind: "predecessor-research-history-unavailable", reason,
+			...(predecessor ? { predecessor: Object.freeze({
+				source: Object.freeze({ ...predecessor.source }),
+				envelopeSha256: predecessor.envelopeSha256 }) } : {}) });
+	const recoverImmediatePredecessorResearchHistory = async (target?: Readonly<{
+		source: Readonly<Source>; envelopeSha256: string }> ):
+		Promise<AuthenticatedPredecessorResearchHistory | PredecessorResearchHistoryUnavailable> => {
+		if (!proof || !priorPrivateBundle || !authenticatedPriorCarryBindsBundle(proof, priorPrivateBundle))
+			return unavailablePredecessorHistory("no-authenticated-prior-carry");
+		const authenticatedAncestry = authenticatedCarryAncestors.get(proof);
+		if (!authenticatedAncestry)
+			throw new PredecessorResearchHistoryIntegrityError("authenticated predecessor ancestry is missing");
+		if (target !== undefined && (!record(target) ||
+			!exactKeys(target, ["source", "envelopeSha256"]) ||
+			!authenticatedPriorCarryBindsAncestor(proof, target.source, target.envelopeSha256)))
+			reject("predecessor history target is not an earlier authenticated carry ancestor");
+		if (authenticatedAncestry.length < 2)
+			return unavailablePredecessorHistory("no-predecessor");
+		const latest = authenticatedAncestry.at(-1)!;
+		const predecessorIndex = target === undefined ? authenticatedAncestry.length - 2 :
+			authenticatedAncestry.slice(0, -1).findIndex(ancestor =>
+				ancestor.envelopeSha256 === target.envelopeSha256 &&
+				ancestor.source.runId === target.source?.runId &&
+				ancestor.source.runAttempt === target.source?.runAttempt &&
+				ancestor.source.runNumber === target.source?.runNumber &&
+				ancestor.source.commit === target.source?.commit);
+		if (predecessorIndex < 0)
+			reject("predecessor history target is not an earlier authenticated carry ancestor");
+		const predecessor = authenticatedAncestry[predecessorIndex]!;
+		if (latest.envelopeSha256 !== proof.envelopeSha256 ||
+			JSON.stringify(latest.source) !== JSON.stringify(proof.source) ||
+			!authenticatedPriorCarryBindsAncestor(proof, predecessor.source, predecessor.envelopeSha256) ||
+			ancestry[predecessorIndex]?.envelopeDigest !== predecessor.envelopeSha256 ||
+			JSON.stringify(ancestry[predecessorIndex]?.source) !== JSON.stringify(predecessor.source))
+			throw new PredecessorResearchHistoryIntegrityError("authenticated predecessor ancestry is inconsistent");
+		let artifacts: Artifact[];
+		let listingRequestFailed = false, listingCause: unknown, listingStatus: number | undefined;
+		const trackedRequest: typeof fetch = async (url, init) => {
+			try {
+				const response = await request(url, init);
+				listingStatus = response.status;
+				return response;
+			} catch (error) {
+				listingRequestFailed = true;
+				listingCause = error;
+				throw error;
+			}
+		};
+		try { artifacts = await paginatedArtifactsForRun(predecessor.source.runId,
+			input.githubToken, trackedRequest); }
+		catch (error) {
+			if (listingRequestFailed || listingStatus !== 200)
+				throw new PredecessorResearchHistoryAccessError("artifact-list",
+					listingRequestFailed ? listingCause : error);
+			throw new PredecessorResearchHistoryIntegrityError("predecessor artifact listing is invalid");
+		}
+		const matching = artifacts.filter(artifact => artifact.name === CARRY_ARTIFACT_NAME);
+		if (!matching.length)
+			return unavailablePredecessorHistory("artifact-not-observed", predecessor);
+		if (matching.length === 1 && matching[0].expired === true)
+			return unavailablePredecessorHistory("artifact-expired", predecessor);
+		if (matching.length !== 1 || matching[0].expired !== false ||
+			!Number.isSafeInteger(matching[0].id) || matching[0].id! <= 0 ||
+			matching[0].workflow_run?.id !== Number(predecessor.source.runId) ||
+			matching[0].workflow_run?.head_sha !== predecessor.source.commit ||
+			(matching[0].digest !== undefined &&
+				(typeof matching[0].digest !== "string" ||
+					!/^sha256:[0-9a-f]{64}$/.test(matching[0].digest))))
+			throw new PredecessorResearchHistoryIntegrityError("predecessor artifact identity is invalid");
+		let payload: CarryArtifactPayload;
+		try {
+			payload = await input.loadCarryArtifact({ runId: predecessor.source.runId,
+				artifactId: String(matching[0].id),
+				...(matching[0].digest ? { expectedArchiveSha256: matching[0].digest.slice(7) } : {}) });
+		} catch (error) { throw new PredecessorResearchHistoryAccessError("artifact-download", error); }
+		let opened: ReturnType<typeof readCheckpoint>;
+		try {
+			opened = readCheckpoint(payload, key, seed.seedDigest, predecessor.source,
+				ancestry[predecessorIndex]?.parentDigest);
+		} catch { throw new PredecessorResearchHistoryIntegrityError("predecessor carry authentication failed"); }
+		if (opened.digest !== predecessor.envelopeSha256 ||
+			JSON.stringify(opened.checkpoint.source) !== JSON.stringify(predecessor.source))
+			throw new PredecessorResearchHistoryIntegrityError("predecessor carry differs from authenticated ancestry");
+		const text = opened.checkpoint.privateBundle?.["research-history.json"];
+		if (text === undefined) return unavailablePredecessorHistory("history-absent", predecessor);
+		const history: AuthenticatedPredecessorResearchHistory = Object.freeze({ version: 1,
+			kind: "authenticated-predecessor-research-history", source: Object.freeze({ ...predecessor.source }),
+			envelopeSha256: predecessor.envelopeSha256, text, selectionAuthority: false });
+		authenticatedPredecessorResearchHistories.add(history);
+		return history;
+	};
 	const result: LedgerContinuation = { mode: "accounting-only",
 		...(incrementalPrefixObservation ? { incrementalPrefixObservation } : {}),
 		...(incrementalPrefixFailure ? { incrementalPrefixFailure } : {}),
@@ -3157,6 +3337,7 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 		priorCommittedCny: decimal(historical.committedNano),
 		priorUnknownHeldCny: decimal(historical.unknownHeldNano),
 		...(proof ? { priorCarryProof: proof } : {}),
+		recoverImmediatePredecessorResearchHistory,
 		...(priorPrivateBundle ? { priorPrivateBundle } : {}),
 		...(priorBootstrapBinding ? { priorBootstrapBinding } : {}),
 		appendTransportDiagnosticCensus: (audit, diagnostics) => {

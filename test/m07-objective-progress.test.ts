@@ -602,6 +602,86 @@ const deltaReply = (decision: "blocked" | "fulfilled", resolution?: {
 			evidenceRefs: [{ sourceId: "verification.json", startLine: 1, endLine: 1 }] }] : [] },
 });
 
+test("a prior 84-character grounded issue ID survives indexed assessment and read repair", async t => {
+	const f = await fixture(t);
+	const issueId = `issue-${"a".repeat(78)}`;
+	assert.equal(issueId.length, 84);
+	const issue: GroundedAssessmentProposal["issues"][number] = {
+		id: issueId, claim: "An original requirement still needs an independent check.",
+		status: "open", classification: "explicit-requirement",
+		implication: "A new check can change the selected answer.",
+		sourceRefs: [{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }] };
+	const prior = await addPriorGroundingIndex(f, [], [issue]);
+	const nextTask = { objective: "Run a synthetic independent check", obligationIds: ["original-task"],
+		addresses: [issueId], adapterScope: "two-target-existing",
+		decisionChangingHypothesis: "The new check could change candidate selection.",
+		expectedEvidence: "Independent machine check",
+		sourceRefs: [{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }] };
+	const reply = { version: 1, decision: "continue", rationale: "Continue the original requirement",
+		evidenceRefs: ["candidate.cpp", "verification.json"], unresolvedObligations: ["original-task"],
+		groundedAssessmentDelta: { version: 1, kind: "grounded-assessment-delta",
+			newIssues: [], resolutions: [], nextTask } };
+	let prompts = 0;
+	const dispatched: ObjectiveNextTaskV1[] = [];
+	const exceptions: Array<{ stage: string; error: unknown }> = [];
+	const runner = new FakeSessionRunner(({ message }) => {
+		prompts++;
+		assert.equal(dispatched.length, 0, "unread selected evidence cannot authorize dispatch");
+		if (prompts === 1) return { text: JSON.stringify(reply),
+			readReturns: [...ranges(f, ["verification.json"]), prior.indexRead] };
+		assert.match(message, /verification\.json/);
+		return { text: JSON.stringify(reply),
+			readReturns: ranges(f).filter(item => item.path === "verification.json") };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		evidenceAccess: prior.access,
+		groundingPolicy: { require: true, sourceKinds: prior.sourceKinds,
+			legacyOpenDetails: [], previousIssues: [issue],
+			priorGroundingIndex: prior.priorGroundingIndex },
+		capabilities: [{ scope: "two-target-existing", available: true,
+			description: "Synthetic independent check", limits: [] }],
+		recordException: (stage, error) => { exceptions.push({ stage, error }); },
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async task => { dispatched.push(task); } });
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.equal(prompts, 2);
+	assert.equal(runner.created.length, 1);
+	assert.deepEqual(exceptions, []);
+	assert.deepEqual(dispatched, [{ objective: nextTask.objective,
+		addresses: nextTask.obligationIds, adapterScope: nextTask.adapterScope }]);
+	assert.deepEqual(result.assessment?.groundedAssessment?.issues, [issue]);
+	assert.deepEqual(result.assessment?.groundedAssessment?.nextTask?.addresses, [issueId]);
+	assert.deepEqual(result.assessment?.unreadEvidence, []);
+	assert.deepEqual(result.assessment?.evidenceRead,
+		["original-objective.json", ...f.evidence.map(item => item.name)].filter(name =>
+			!prior.parts.some(part => part.name === name)));
+});
+
+test("oversize or forbidden prior issue IDs fail input validation without a session", async t => {
+	for (const issueId of ["a".repeat(129), "issue with spaces"]) {
+		const f = await fixture(t);
+		let prompts = 0;
+		const runner = new FakeSessionRunner(() => { prompts++; throw new Error("model must not run"); });
+		const exceptions: Array<{ stage: string; error: unknown }> = [];
+		await assert.rejects(assessAndAdvanceOriginalObjective({ ...f, runner,
+			groundingPolicy: { require: true, sourceKinds: groundingKinds,
+				legacyOpenDetails: [], previousIssues: [{ id: issueId,
+					claim: "Synthetic prior issue", status: "open", classification: "explicit-requirement",
+					implication: "Synthetic consequence", sourceRefs: [
+						{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }] }] },
+			recordException: (stage, error) => { exceptions.push({ stage, error }); },
+			persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+			advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+			advance: async () => { throw new Error("task must not dispatch"); } }),
+			/assessor grounding policy is invalid/);
+		assert.equal(runner.created.length, 0);
+		assert.equal(prompts, 0);
+		assert.equal(exceptions.length, 1);
+		assert.equal(exceptions[0]?.stage, "input-validation");
+	}
+});
+
 test("indexed prior grounding stays out of prompt and omitted issues remain open", async t => {
 	const f = await fixture(t);
 	const legacy = ["L".repeat(700_000)];
@@ -1202,10 +1282,13 @@ test("missing or tampered prior grounding part is rejected before an assessor pr
 	const f = await fixture(t);
 	const legacy = ["authenticated old detail"];
 	const prior = await addPriorGroundingIndex(f, legacy, []);
-	const runner = new FakeSessionRunner(() => { throw new Error("assessor must not start"); });
+	let prompts = 0;
+	const runner = new FakeSessionRunner(() => { prompts++; throw new Error("assessor must not start"); });
+	const exceptions: Array<{ stage: string; error: unknown }> = [];
 	await writeFile(path.join(f.root, prior.parts[0]!.name),
 		`${JSON.stringify({ kind: "legacy-detail", value: "tampered" })}\n`);
 	const base = { ...f, runner, evidenceAccess: prior.access,
+		recordException: (stage: string, error: unknown) => { exceptions.push({ stage, error }); },
 		groundingPolicy: { require: true as const, sourceKinds: prior.sourceKinds,
 			legacyOpenDetails: legacy, previousIssues: [],
 			priorGroundingIndex: prior.priorGroundingIndex },
@@ -1214,9 +1297,15 @@ test("missing or tampered prior grounding part is rejected before an assessor pr
 		advance: async () => { throw new Error("must not dispatch"); } };
 	await assert.rejects(assessAndAdvanceOriginalObjective(base), /partition differs/);
 	assert.equal(runner.created.length, 0);
+	assert.equal(exceptions.length, 1);
+	assert.equal(exceptions[0]?.stage, "prior-index");
+	assert.match((exceptions[0]?.error as Error).message, /partition differs/);
 	await rm(path.join(f.root, prior.parts[0]!.name));
 	await assert.rejects(assessAndAdvanceOriginalObjective(base));
 	assert.equal(runner.created.length, 0);
+	assert.equal(prompts, 0);
+	assert.equal(exceptions.length, 2);
+	assert.equal(exceptions[1]?.stage, "evidence-scan");
 });
 
 test("indexed prior resolution needs its old line and new evidence returned in this session", async t => {
@@ -1348,13 +1437,98 @@ test("objective assessor still rejects a single evidence file over 1 MB", async 
 	const f = await fixture(t);
 	const file = path.join(f.root, "source", "oversize-control.json");
 	await writeFile(file, "x".repeat(1_000_001));
-	const runner = new FakeSessionRunner(() => "must not dispatch");
+	let prompts = 0;
+	const runner = new FakeSessionRunner(() => { prompts++; return "must not dispatch"; });
+	const exceptions: Array<{ stage: string; error: unknown }> = [];
 	await assert.rejects(assessAndAdvanceOriginalObjective({ ...f,
 		evidence: [...f.evidence, { name: "oversize-control.json", file }], runner,
+		recordException: (stage, error) => { exceptions.push({ stage, error }); },
 		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
 		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
 		advance: async task => task.objective }), /bounded regular file/);
 	assert.equal(runner.created.length, 0);
+	assert.equal(prompts, 0);
+	assert.equal(exceptions.length, 1);
+	assert.equal(exceptions[0]?.stage, "evidence-scan");
+	assert.match((exceptions[0]?.error as Error).message, /bounded regular file/);
+});
+
+test("missing and invalid UTF-8 evidence report evidence-scan before session creation", async t => {
+	for (const invalidContent of [undefined, Buffer.from([0xff, 0xfe])]) {
+		const f = await fixture(t);
+		const file = f.evidence.find(item => item.name === "second-text.txt")!.file;
+		if (invalidContent) await writeFile(file, invalidContent);
+		else await rm(file);
+		let prompts = 0;
+		const runner = new FakeSessionRunner(() => { prompts++; throw new Error("model must not run"); });
+		const exceptions: Array<{ stage: string; error: unknown }> = [];
+		const call = assessAndAdvanceOriginalObjective({ ...f, runner,
+			recordException: (stage, error) => { exceptions.push({ stage, error }); },
+			persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+			advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+			advance: async () => { throw new Error("task must not dispatch"); } });
+		await assert.rejects(call, invalidContent ? /valid UTF-8 text/ : /ENOENT/);
+		assert.equal(runner.created.length, 0);
+		assert.equal(prompts, 0);
+		assert.equal(exceptions.length, 1);
+		assert.equal(exceptions[0]?.stage, "evidence-scan");
+	}
+});
+
+test("occupied frozen-copy destination reports before session creation", async t => {
+	const f = await fixture(t);
+	await writeFile(f.evidenceRoot, "occupied");
+	let prompts = 0;
+	const runner = new FakeSessionRunner(() => { prompts++; throw new Error("model must not run"); });
+	const exceptions: Array<{ stage: string; error: unknown }> = [];
+	await assert.rejects(assessAndAdvanceOriginalObjective({ ...f, runner,
+		recordException: (stage, error) => { exceptions.push({ stage, error }); },
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { throw new Error("task must not dispatch"); } }), /EEXIST/);
+	assert.equal(runner.created.length, 0);
+	assert.equal(prompts, 0);
+	assert.equal(exceptions.length, 1);
+	assert.equal(exceptions[0]?.stage, "frozen-copy");
+});
+
+test("an exception recorder failure cannot mask the initiating evidence error", async t => {
+	const f = await fixture(t);
+	const file = path.join(f.root, "source", "oversize-control.json");
+	await writeFile(file, "x".repeat(1_000_001));
+	const runner = new FakeSessionRunner(() => { throw new Error("model must not run"); });
+	let initiatingError: unknown;
+	await assert.rejects(assessAndAdvanceOriginalObjective({ ...f, runner,
+		evidence: [...f.evidence, { name: "oversize-control.json", file }],
+		recordException: (_stage, error) => {
+			initiatingError = error;
+			throw new Error("synthetic recorder failure");
+		},
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { throw new Error("task must not dispatch"); } }), error => {
+		assert.strictEqual(error, initiatingError);
+		assert.match((error as Error).message, /bounded regular file/);
+		return true;
+	});
+	assert.equal(runner.created.length, 0);
+});
+
+test("prompt failure reports its stage after session creation and a provider attempt", async t => {
+	const f = await fixture(t);
+	const providerError = new Error("synthetic provider failure");
+	let prompts = 0;
+	const runner = new FakeSessionRunner(() => { prompts++; throw providerError; });
+	const exceptions: Array<{ stage: string; error: unknown }> = [];
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		recordException: (stage, error) => { exceptions.push({ stage, error }); },
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { throw new Error("task must not dispatch"); } });
+	assert.equal(result.stopReason, "assessment-failed");
+	assert.equal(runner.created.length, 1);
+	assert.equal(prompts, 1);
+	assert.deepEqual(exceptions, [{ stage: "prompt", error: providerError }]);
 });
 
 test("accepted finite pilot and even a model fulfilled claim cannot close an open original mission", async t => {

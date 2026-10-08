@@ -32,6 +32,55 @@ test("locates every top-level entry and its file names without nested quoted fak
 	}
 });
 
+test("advertises superseded artifact names across catalog parts without changing current files", () => {
+	const oldNames = ["review.md", "old-z.txt", "feedback.json", "old-y.txt", "lesson.md",
+		"old-x.txt", "old-w.txt", "old-v.txt", "old-u.txt", "old-t.txt"];
+	const currentNames = ["current-z.txt", "current-review.md", "current-feedback.json",
+		"current-lesson.md", "current-b.txt", "current-a.txt"];
+	const oldFiles = Object.fromEntries(oldNames.map(name =>
+		[name, name === "lesson.md" ? "old lesson\n" + "x".repeat(1_100_000) : `old ${name}`]));
+	const currentFiles = Object.fromEntries(currentNames.map(name => [name, `current ${name}`]));
+	const entries = [{ goalRunId: "R001", taskId: "T001", files: currentFiles,
+		supersededVersions: [
+			{ interpretation: "previous review", files: oldFiles },
+			{ interpretation: "initial review", files: { "first-feedback.json": "old feedback" } },
+		] }];
+	const rendered = Buffer.from(`${JSON.stringify({ entries }, null, 2)}\n`, "utf8");
+	assert.ok(rendered.length > 1_048_576);
+	const partSpans = spans(rendered.length, [1_048_576]);
+	const [located] = locateHistoryEntries(rendered, partSpans);
+	assert.ok(located);
+	assert.deepEqual(located.fileNames, currentNames);
+	assert.equal(located.supersededVersionCount, 2);
+	assert.deepEqual(located.supersededVersions, [
+		{ versionOrdinal: 0, fileNames: [...oldNames].sort() },
+		{ versionOrdinal: 1, fileNames: ["first-feedback.json"] },
+	]);
+	assert.deepEqual(located.parts.map(part => part.partIndex), [0, 1]);
+	const entryBytes = Buffer.concat(located.parts.map(range => {
+		const part = partSpans[range.partIndex]!;
+		return rendered.subarray(part.startByte + range.startByte, part.startByte + range.endByte);
+	}));
+	assert.deepEqual(entryBytes, rendered.subarray(located.startByte, located.endByte));
+	assert.deepEqual(JSON.parse(entryBytes.toString("utf8")), entries[0]);
+});
+
+test("locates every superseded version without a version count limit", () => {
+	const supersededVersions = Array.from({ length: 40 }, (_, index) => ({
+		interpretation: `old interpretation ${index}`,
+		files: { [`old-feedback-${index}.json`]: `old feedback ${index}` },
+	}));
+	const rendered = Buffer.from(JSON.stringify({ entries: [{ files: { "current.txt": "current" },
+		supersededVersions }] }), "utf8");
+	const [located] = locateHistoryEntries(rendered, spans(rendered.length, []));
+	assert.equal(located?.supersededVersionCount, supersededVersions.length);
+	assert.deepEqual(located?.supersededVersions,
+		supersededVersions.map((version, versionOrdinal) => ({
+			versionOrdinal, fileNames: Object.keys(version.files),
+		})));
+	assert.deepEqual(located?.fileNames, ["current.txt"]);
+});
+
 test("ranges cover an entry across parts, including a cut inside a UTF-8 character", () => {
 	const entries = [
 		{ goalRunId: "R001", taskId: "T001", files: { "a.txt": "雪".repeat(50) } },

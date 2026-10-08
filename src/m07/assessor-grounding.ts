@@ -183,8 +183,9 @@ export function validatePriorGroundingIndex(indexText: string,
 	return locators;
 }
 
-const id = (value: unknown): value is string => typeof value === "string" &&
+export const isGroundedIssueId = (value: unknown): value is string => typeof value === "string" &&
 	/^[A-Za-z][A-Za-z0-9._/-]{0,127}$/.test(value);
+const id = isGroundedIssueId;
 const prose = (value: unknown): value is string => typeof value === "string" &&
 	value.trim().length > 0 && !value.includes("\0");
 const obj = (value: unknown): value is Record<string, unknown> =>

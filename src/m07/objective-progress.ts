@@ -9,6 +9,7 @@ import { workflowRepairFingerprint, workflowRepairState, type WorkflowRepairFail
 import type { StageRunRecord } from "../types.ts";
 import { HarnessError } from "../types.ts";
 import { mergeGroundedAssessmentDelta, validateGroundedAssessment, validatePriorGroundingIndex,
+	isGroundedIssueId,
 	GroundingSpanError, GroundingFieldError,
 	type GroundedAssessmentDelta, type GroundedAssessmentProposal,
 	type GroundedIssue, type GroundingContext, type GroundingSourceKind,
@@ -424,6 +425,10 @@ export type ObjectiveAssessmentValidationDiagnosticV1 = Readonly<{
 		coveredRanges: readonly [number, number][]; complete: boolean }>[];
 	transcriptPath?: string;
 }>;
+/** Host-only boundary for an exception before a usable assessor reply exists. */
+export type ObjectiveAssessmentExceptionStage = "input-validation" | "contract-read" |
+	"evidence-scan" | "source-registry" | "frozen-copy" | "prior-index" |
+	"session-create" | "prompt";
 function assessmentFailure(message: string, path: string, detail: string | null = null): never {
 	throw new AssessmentValidationError(message, path, detail);
 }
@@ -662,8 +667,13 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 	recordRepairState?: (state: WorkflowRepairStateV1) => Promise<void>;
 	/** Every rejected model reply, including the raw text, stays in encrypted private output. */
 	recordValidationFailure?: (diagnostic: ObjectiveAssessmentValidationDiagnosticV1) => Promise<void>;
+	/** Synchronous control observation. A reporting failure must not mask the initiating exception. */
+	recordException?: (stage: ObjectiveAssessmentExceptionStage, error: unknown) => void;
 	advance: (task: ObjectiveNextTaskV1) => Promise<T>;
 }): Promise<{ assessment?: ObjectiveProgressV1["assessment"]; advanced?: T; stopReason: CurrentObjectiveStopReason }> {
+	let preSessionStage: ObjectiveAssessmentExceptionStage = "input-validation";
+	let sessionCreated = false;
+	try {
 	const assessmentAdmission = currentObjectiveAdmission(input.assessmentAdmission);
 	if (assessmentAdmission !== "admitted") return { stopReason: assessmentAdmission };
 	if (input.sessionSpec.role !== "research" ||
@@ -684,7 +694,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		!Array.isArray(input.groundingPolicy.legacyOpenDetails) ||
 		input.groundingPolicy.legacyOpenDetails.some(item => !nonemptyText(item)) ||
 		!Array.isArray(input.groundingPolicy.previousIssues ?? []) ||
-		(input.groundingPolicy.previousIssues ?? []).some(item => !item || !safeName(item.id) ||
+		(input.groundingPolicy.previousIssues ?? []).some(item => !item || !isGroundedIssueId(item.id) ||
 			!nonemptyText(item.claim) || !["open", "resolved"].includes(item.status)) ||
 		new Set((input.groundingPolicy.previousIssues ?? []).map(item => item.id)).size !==
 			(input.groundingPolicy.previousIssues ?? []).length ||
@@ -729,12 +739,14 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 	const sessionSpec = structuredClone(input.sessionSpec);
 	const evidenceRoot = input.evidenceRoot;
 
+	preSessionStage = "contract-read";
 	const contractBytes = await readFile(input.contractFile);
 	if (contractBytes.length > MAX_EVIDENCE_BYTES) throw new HarnessError("m07.objective", "original objective contract exceeds evidence file size boundary");
 	if (contractBytes.toString("utf8") !== `${JSON.stringify(contract, null, 2)}\n`)
 		throw new HarnessError("m07.objective", "original objective contract changed after freezing");
 	// Keep only per-file metadata. Evidence is read through a paged tool by the assessor;
 	// an aggregate byte cap would reject a valid collection before any such read.
+	preSessionStage = "evidence-scan";
 	const materials: Array<{ name: string; file: string; lineCount: number; digest: string }> = [];
 	for (const item of sourceEvidence) {
 		const info = await lstat(item.file);
@@ -748,6 +760,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		materials.push({ ...item, lineCount: text.split("\n").length - (text.endsWith("\n") ? 1 : 0),
 			digest: createHash("sha256").update(bytes).digest("hex") });
 	}
+	preSessionStage = "source-registry";
 	if (groundingPolicy && (materials.some(item => ["original-objective.json", "current-user-overrides"].includes(item.name)) ||
 		Object.keys(groundingPolicy.sourceKinds).length !== materials.length ||
 		materials.some(item => !["user-instruction", "supplied-task", "selected-evidence", "host-capability"]
@@ -769,6 +782,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		priorIndex.partNames.some(name => name === priorIndex.indexName ||
 			!materials.some(item => item.name === name) || evidenceAccess[name] !== "retrievable")))
 		throw new HarnessError("m07.objective", "prior grounding index and parts must be registered frozen evidence");
+	preSessionStage = "frozen-copy";
 	await mkdir(evidenceRoot, { mode: 0o700 });
 	const frozenContract = path.join(evidenceRoot, "original-objective.json");
 	await copyFile(input.contractFile, frozenContract);
@@ -785,6 +799,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			throw new HarnessError("m07.objective", "frozen objective evidence changed during copy");
 		evidence.push({ version: 1, label: item.name, path: copy, status: "frozen-copy", sourceVersion: contract.id });
 	}
+	preSessionStage = "prior-index";
 	let priorIssueLocators: Record<string, GroundingSpan> | undefined;
 	if (priorIndex) {
 		const parts: Record<string, string> = {};
@@ -801,7 +816,9 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		mode: "fresh", intent: "independent-judgment", reason,
 		evidence: structuredClone(evidence), spec: structuredClone(spec),
 	}, input.persistReceipt);
+	preSessionStage = "session-create";
 	let handle = await openAssessor("Assess the original user goal from frozen bounded evidence before choosing further M07 work");
+	sessionCreated = true;
 	try {
 		const contractText = contractBytes.toString("utf8");
 		const grounding: GroundingContext | undefined = groundingPolicy ? {
@@ -825,6 +842,8 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		const retrievableMaterials = materials.filter(item => evidenceAccess[item.name] === "retrievable");
 		const retrievableIndex = requiredMaterials.find(item =>
 			item.name === "prior-research-history-index.json");
+		const checkpointIndex = requiredMaterials.find(item =>
+			item.name === "prior-objective-checkpoint-index.json");
 		const unavailableScopeIds = (capabilities ?? []).filter(item => !item.available)
 			.map(item => item.scope);
 		const groundedIssueSchema = "Each new issue has base fields {id,claim,status:'open'|'resolved',classification,sourceRefs:[{sourceId,startLine,endLine}],implication}. Add only the named fields for its classification: claimAtRisk for necessary-verification, optionalBasis for optional-method, or blockedScope and capabilityRef:{sourceId,startLine,endLine} for physical-capability-gap. Do not add a proof field. A resolved issue also needs resolution:{explanation,evidenceRefs:[{sourceId,startLine,endLine}]}.";
@@ -862,6 +881,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			...(retrievableMaterials.length ? [
 				"Additional frozen history is retrievable on demand. Its locator grants no scientific evidence credit.",
 				...(retrievableIndex ? ["Read prior-research-history-index.json for historical part filenames and byte order."] : []),
+				...(checkpointIndex ? ["Read prior-objective-checkpoint-index.json for the byte-exact historical checkpoint part names and order. The host already checks the current selected tuple and unresolved control state. Read historical parts only when they can affect your reasoning, and cite every historical claim using actual returned lines."] : []),
 				...(priorIndex ? [`Read ${priorIndex.indexName} for prior grounding record locators and part filenames.`] : []),
 				...(!retrievableIndex && !priorIndex ?
 					retrievableMaterials.map(item => `Retrievable file: ${item.name}, lines 1-${item.lineCount}.`) : []),
@@ -962,7 +982,8 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		for (;;) {
 			let response;
 			try { response = await handle.prompt(request); }
-			catch {
+			catch (error) {
+				try { input.recordException?.("prompt", error); } catch { /* Keep the initiating prompt error. */ }
 				const admission = currentObjectiveAdmission(input.advanceAdmission());
 				return { assessment: latestAssessment, stopReason: admission === "admitted" ? "assessment-failed" : admission };
 			}
@@ -1228,6 +1249,13 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				"Preserve the user's overrides and return a fresh strict JSON assessment. Read frozen evidence again if needed."].join("\n\n");
 		}
 	} finally { handle.dispose(); }
+	} catch (error) {
+		if (!sessionCreated) {
+			try { input.recordException?.(preSessionStage, error); }
+			catch { /* Preserve the initiating pre-session exception. */ }
+		}
+		throw error;
+	}
 }
 
 export async function writeOriginalObjectiveContract(file: string, contract: OriginalObjectiveContractV1): Promise<void> {

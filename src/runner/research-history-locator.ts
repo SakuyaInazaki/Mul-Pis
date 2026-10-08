@@ -15,18 +15,30 @@ export interface HistoryEntryPartRange {
 }
 
 /** A control locator only: claims still require reading the named evidence bytes. */
+export interface HistorySupersededVersionLocator {
+	/** Zero-based order in the entry's supersededVersions array. */
+	versionOrdinal: number;
+	/** Names are discovery aids, not evidence-read credit or adopted artifacts. */
+	fileNames: string[];
+}
+
+/** A control locator only: claims still require reading the named evidence bytes. */
 export interface HistoryEntryLocator {
 	entryOrdinal: number;
 	goalRunId?: string;
 	taskId?: string;
 	fileNames?: string[];
+	/** Older raw artifacts, in stored order; entry.files remains the current authority. */
+	supersededVersions?: HistorySupersededVersionLocator[];
+	supersededVersionCount?: number;
 	/** Absolute byte offsets in the complete rendered projection; end is exclusive. */
 	startByte: number;
 	endByte: number;
 	parts: HistoryEntryPartRange[];
 }
 
-type ScanMode = "ordinary" | "root" | "entries" | "entry" | "files";
+type ScanMode = "ordinary" | "root" | "entries" | "entry" | "files" |
+	"supersededVersions" | "supersededVersion" | "supersededFiles";
 type EntryDraft = Omit<HistoryEntryLocator, "parts">;
 
 const isWhitespace = (byte: number): boolean => byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d;
@@ -102,17 +114,20 @@ export function locateHistoryEntries(renderedUtf8: Uint8Array,
 			while (isDigit(bytes[offset] ?? -1)) offset++;
 		}
 	};
-	const scanValue = (mode: ScanMode = "ordinary", entry?: EntryDraft): void => {
+	const scanValue = (mode: ScanMode = "ordinary", entry?: EntryDraft,
+		version?: HistorySupersededVersionLocator): void => {
 		skipWhitespace();
 		const current = bytes[offset];
-		if (mode === "root" || mode === "entry" || mode === "files") {
+		if (mode === "root" || mode === "entry" || mode === "files" ||
+			mode === "supersededVersion" || mode === "supersededFiles") {
 			if (current !== 0x7b) fail();
-		} else if (mode === "entries" && current !== 0x5b) fail();
+		} else if ((mode === "entries" || mode === "supersededVersions") && current !== 0x5b) fail();
 		if (current === 0x7b) {
 			offset++;
 			skipWhitespace();
 			if (bytes[offset] === 0x7d) { offset++; return; }
-			const seen = mode === "entry" || mode === "files" ? new Set<string>() : undefined;
+			const seen = mode === "entry" || mode === "files" || mode === "supersededVersion" ||
+				mode === "supersededFiles" ? new Set<string>() : undefined;
 			for (;;) {
 				const key = stringToken(mode !== "ordinary")!;
 				if (seen?.has(key)) throw new Error(`duplicate history ${mode} key`);
@@ -133,8 +148,16 @@ export function locateHistoryEntries(renderedUtf8: Uint8Array,
 				} else if (mode === "entry" && key === "files") {
 					entry!.fileNames = [];
 					scanValue("files", entry);
+				} else if (mode === "entry" && key === "supersededVersions") {
+					entry!.supersededVersions = [];
+					scanValue("supersededVersions", entry);
+					entry!.supersededVersionCount = entry!.supersededVersions.length;
+				} else if (mode === "supersededVersion" && key === "files") {
+					version!.fileNames = [];
+					scanValue("supersededFiles", entry, version);
 				} else {
 					if (mode === "files") entry!.fileNames!.push(key);
+					if (mode === "supersededFiles") version!.fileNames.push(key);
 					scanValue();
 				}
 				skipWhitespace();
@@ -153,6 +176,12 @@ export function locateHistoryEntries(renderedUtf8: Uint8Array,
 					scanValue("entry", draft);
 					draft.endByte = offset;
 					drafts.push(draft);
+				} else if (mode === "supersededVersions") {
+					const oldVersion: HistorySupersededVersionLocator = {
+						versionOrdinal: entry!.supersededVersions!.length, fileNames: [] };
+					scanValue("supersededVersion", entry, oldVersion);
+					oldVersion.fileNames.sort();
+					entry!.supersededVersions!.push(oldVersion);
 				} else scanValue();
 				skipWhitespace();
 				if (bytes[offset] === 0x5d) { offset++; return; }
