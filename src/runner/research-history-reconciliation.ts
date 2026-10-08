@@ -53,6 +53,16 @@ function sameHistoricalSnapshot(a: HistoricalArchiveVersion, b: HistoricalArchiv
 		aNames.every((name, index) => name === bNames[index] && a.files[name] === b.files[name]);
 }
 
+function orderedHistoricalSubsequence(older: HistoricalArchiveVersion[], newer: HistoricalArchiveVersion[]): boolean {
+	let next = 0;
+	for (const version of older) {
+		while (next < newer.length && !sameHistoricalSnapshot(version, newer[next]!)) next++;
+		if (next === newer.length) return false;
+		next++;
+	}
+	return true;
+}
+
 function historicalArchiveFacts(entry: Record<string, any>, version: HistoricalArchiveVersion) {
 	let archive: Record<string, any>;
 	try { archive = JSON.parse(version.files["workflow-archive.json"]); }
@@ -132,6 +142,10 @@ export function restoreHistoricalArchivePredecessor(current: Record<string, any>
 		if (typeof currentTimeline.at(-1)!.files[name] !== "string" ||
 			typeof predecessorTimeline.at(-1)!.files[name] !== "string")
 			fail(`same-task historical archives lack ${name}`);
+	// A newer authenticated carry can already contain revisions recovered from an
+	// older ancestor. Keep its exact timeline when every predecessor snapshot is
+	// present in order, including when it retained additional intervening versions.
+	if (orderedHistoricalSubsequence(predecessorTimeline, currentTimeline)) return current;
 	let overlap = 0;
 	for (let length = Math.min(currentTimeline.length, predecessorTimeline.length); length > 0; length--)
 		if (predecessorTimeline.slice(-length).every((version, index) =>

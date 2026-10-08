@@ -82,6 +82,48 @@ test("authenticated predecessor recovery enriches current entry without rewritin
 	assert.deepEqual(rows[0], recovered, "the next pass preserves recovered old bytes");
 });
 
+test("recovery keeps already restored versions when an older carry has a contained timeline", () => {
+	const old = historicalEntry(oldTenFiles(), "Old review bytes");
+	const failed = historicalEntry({ ...oldTenFiles(),
+		"workflow-archive.json": archive({ state: "failed", runId: "M04-failed" }) }, "Failed review bytes");
+	const complete = historicalEntry(newSixFiles(), "Current completed M04 bytes");
+	const current = { ...complete, supersededVersions: [
+		{ interpretation: old.interpretation, files: old.files },
+		{ interpretation: failed.interpretation, files: failed.files },
+	] };
+	const sparse = { ...complete, supersededVersions: [
+		{ interpretation: old.interpretation, files: old.files },
+	] };
+	assert.deepEqual(offlineChecks.restoreHistoricalArchivePredecessor(current, complete), current,
+		"an older unversioned final snapshot is already in the current suffix");
+	assert.deepEqual(offlineChecks.restoreHistoricalArchivePredecessor(current, failed), current,
+		"an older snapshot can be contained in the interior");
+	assert.deepEqual(offlineChecks.restoreHistoricalArchivePredecessor(current, sparse), current,
+		"an older sparse timeline can omit a version already restored in the current carry");
+	const run44 = [current, { ...old, goalRunId: "R044", taskId: "T004" }];
+	const run43 = [complete];
+	const run42 = [complete];
+	const run41 = [old];
+	const after43 = offlineChecks.reconcileHistoricalResearchEntries(run44, run43);
+	const after42 = offlineChecks.reconcileHistoricalResearchEntries(after43, run42);
+	const after41 = offlineChecks.reconcileHistoricalResearchEntries(after42, run41);
+	assert.deepEqual(after41, run44,
+		"a recovered run44 entry and new task survive the full 44→43→42→41 ancestor walk");
+	assert.deepEqual(run44[0], current, "the chronological walk cannot mutate its input");
+	const reversed = { ...complete, supersededVersions: [
+		{ interpretation: failed.interpretation, files: failed.files },
+		{ interpretation: old.interpretation, files: old.files },
+	] };
+	assert.throws(() => offlineChecks.restoreHistoricalArchivePredecessor(reversed, sparse),
+		/historical version order conflicts|historical M04 version rollback/,
+		"a reversed or conflicting timeline cannot be treated as contained");
+	const divergent = historicalEntry({ ...newSixFiles(), "candidate.cpp": "// different candidate bytes\n" },
+		complete.interpretation);
+	assert.throws(() => offlineChecks.restoreHistoricalArchivePredecessor(current, divergent),
+		/archives disagree on candidate\.cpp/,
+		"a conflicting predecessor source cannot gain chronological authority");
+});
+
 test("legacy singleton history keeps omitted interpretation and unranked M04 bytes without adoption", () => {
 	const files = { ...sourceFiles, "workflow-archive.json": archive({ runId: "M04-legacy" }) };
 	const legacy = { originalContractId, goalRunId, taskId, files };
