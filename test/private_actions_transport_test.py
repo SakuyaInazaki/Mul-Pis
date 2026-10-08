@@ -221,9 +221,12 @@ class EncryptTests(unittest.TestCase):
             transcript = b'{"session":"secret transcript"}\n'
             (results / "assessor-diagnostic-000001.json").write_bytes(diagnostic)
             (results / "assessor-transcript-000001.bin").write_bytes(transcript)
+            source_diagnostic = b'{"kind":"private-task-source-handoff-diagnostic","errno":"ENOSPC"}\n'
+            (results / "task-source-handoff-diagnostic-1.json").write_bytes(source_diagnostic)
             (results / "assessor-diagnostic-000001.json.bak").write_bytes(b"excluded")
             (results / "assessor-transcript-1.bin").write_bytes(b"excluded")
             (results / "assessor-diagnostic-evil.json").write_bytes(b"excluded")
+            (results / "task-source-handoff-diagnostic-01.json").write_bytes(b"excluded")
             public = root / "public.pem"
             public.write_bytes(self.private_key.public_key().public_bytes(
                 serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
@@ -237,10 +240,12 @@ class EncryptTests(unittest.TestCase):
             recovered = transport.decrypt_results(encrypted, private, root)
             self.assertEqual((recovered / "assessor-diagnostic-000001.json").read_bytes(), diagnostic)
             self.assertEqual((recovered / "assessor-transcript-000001.bin").read_bytes(), transcript)
+            self.assertEqual((recovered / "task-source-handoff-diagnostic-1.json").read_bytes(), source_diagnostic)
             self.assertEqual((recovered / "assessor-diagnostic-000001.json").stat().st_mode & 0o777, 0o600)
             self.assertFalse((recovered / "assessor-diagnostic-000001.json.bak").exists())
             self.assertFalse((recovered / "assessor-transcript-1.bin").exists())
             self.assertFalse((recovered / "assessor-diagnostic-evil.json").exists())
+            self.assertFalse((recovered / "task-source-handoff-diagnostic-01.json").exists())
 
     def test_roundtrip_and_allowlist(self):
         with tempfile.TemporaryDirectory() as tmp:

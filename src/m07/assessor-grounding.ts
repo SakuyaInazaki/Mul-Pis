@@ -6,7 +6,7 @@
 import { isDeepStrictEqual } from "node:util";
 
 export type GroundingSourceKind = "user-instruction" | "supplied-task" |
-	"selected-evidence" | "host-capability" | "host-control";
+	"selected-evidence" | "unselected-evidence" | "host-capability" | "host-control";
 
 export interface GroundingSource {
 	kind: GroundingSourceKind;
@@ -19,6 +19,12 @@ export interface GroundingSpan {
 	startLine: number;
 	endLine: number;
 }
+
+/** A development input choice. This never selects a mission candidate. */
+export type TaskSourceBindingV1 =
+	| { kind: "selected"; sourceSha256: string }
+	| { kind: "unselected-attempt"; attemptId: string; sourceSha256: string;
+		planSha256?: string };
 
 /** Fixed, model-safe structural feedback. Paths identify a JSON value in the
  * rejected reply; source bounds come only from frozen host evidence. */
@@ -75,6 +81,8 @@ export interface GroundedNextTask {
 	decisionChangingHypothesis: string;
 	expectedEvidence: string;
 	sourceRefs: GroundingSpan[];
+	/** Required only by live callers that supply a host-frozen source catalog. */
+	sourceBinding?: TaskSourceBindingV1;
 }
 
 export interface GroundedAssessmentProposal {
@@ -112,6 +120,13 @@ export interface GroundingContext {
 	newEvidenceSourceIds?: readonly string[];
 	/** Authenticated location of each prior issue in the current frozen evidence. */
 	priorIssueLocators?: Readonly<Record<string, GroundingSpan>>;
+	/** Live dispatch authority: legacy serialized assessments omit this. */
+	taskSourceBindings?: { selected: TaskSourceBindingV1;
+		attempts: readonly TaskSourceBindingV1[];
+		catalogSha256?: string;
+		attemptEvidence?: Readonly<Record<string, { source: string; verification: string;
+			archive: string; plan?: string; catalogPart?: string;
+			catalogLine?: number; catalogRowSha256?: string }>> };
 }
 
 export interface GroundedAssessmentDelta {
@@ -339,7 +354,7 @@ export function validateGroundedAssessment(value: unknown, context: GroundingCon
 		if (!obj(task))
 			throw new GroundingFieldError(pointer, "grounded nextTask must be an object");
 		if (!onlyKeys(task, ["objective", "obligationIds", "addresses", "adapterScope",
-			"decisionChangingHypothesis", "expectedEvidence", "sourceRefs"]))
+			"decisionChangingHypothesis", "expectedEvidence", "sourceRefs", "sourceBinding"]))
 			throw new GroundingFieldError(pointer, "grounded nextTask has an unsupported field");
 		if (!prose(task.objective))
 			throw new GroundingFieldError(`${pointer}/objective`,
@@ -366,6 +381,27 @@ export function validateGroundedAssessment(value: unknown, context: GroundingCon
 			throw new GroundingFieldError(`${pointer}/expectedEvidence`,
 				"grounded nextTask expectedEvidence must be nonempty text");
 		spans(task.sourceRefs, context.sources, `${pointer}/sourceRefs`);
+		if (context.taskSourceBindings) {
+			const choice = task.sourceBinding;
+			if (!obj(choice) || ![context.taskSourceBindings.selected,
+				...context.taskSourceBindings.attempts].some(binding => isDeepStrictEqual(binding, choice)))
+				throw new GroundingFieldError(`${pointer}/sourceBinding`,
+					"task source binding must identify an available host-frozen selected or unselected source exactly");
+			if (choice.kind === "unselected-attempt") {
+				const evidence = context.taskSourceBindings.attemptEvidence?.[String(choice.attemptId)];
+				if (evidence && ![evidence.source, evidence.verification, evidence.archive].every(name =>
+					(task.sourceRefs as GroundingSpan[]).some(ref => ref.sourceId === name)))
+					throw new GroundingFieldError(`${pointer}/sourceRefs`,
+						"unselected task source must cite its frozen source, verification and archive");
+				if (evidence?.catalogPart && !(task.sourceRefs as GroundingSpan[]).some(ref =>
+					ref.sourceId === evidence.catalogPart && ref.startLine <= evidence.catalogLine! &&
+					ref.endLine >= evidence.catalogLine!))
+					throw new GroundingFieldError(`${pointer}/sourceRefs`,
+						"unselected task source must cite its exact frozen catalog row");
+			}
+		} else if (task.sourceBinding !== undefined)
+			throw new GroundingFieldError(`${pointer}/sourceBinding`,
+				"task source binding has no host-frozen catalog");
 	}
 	if (value.deliverableReady !== undefined) {
 		const finding = value.deliverableReady;

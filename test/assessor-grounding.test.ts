@@ -192,6 +192,68 @@ test("a partial host-control summary cannot resolve a scientific issue", () => {
 		/resolution needs a selected result or host observation/);
 });
 
+test("an unselected attempt cannot alone resolve a selected scientific issue", () => {
+	const candidate = proposal();
+	const previous = structuredClone(candidate.issues[1]!);
+	candidate.issues[1]!.status = "resolved";
+	candidate.issues[1]!.resolution = { explanation: "A development candidate reported a new check.",
+		evidenceRefs: [ref("latest-attempt-verification.json")] };
+	candidate.nextTask!.addresses = ["deliverable"];
+	candidate.deliverableReady!.remainingIssueIds = ["deliverable", "optional", "equipment"];
+	assert.throws(() => validateGroundedAssessment(candidate, { ...context,
+		previousIssues: [previous], newEvidenceSourceIds: ["latest-attempt-verification.json"],
+		sources: { ...context.sources, "latest-attempt-verification.json":
+			{ kind: "unselected-evidence", lineCount: 1 } } }),
+		/resolution needs a selected result or host observation/);
+});
+
+test("authenticated historical resolved issue remains readable after source-kind tightening", () => {
+	const carried = proposal();
+	carried.issues[1]!.status = "resolved";
+	carried.issues[1]!.resolution = { explanation: "Previously authenticated under its original source registry.",
+		evidenceRefs: [ref("prior-research-history.json")] };
+	carried.nextTask!.addresses = ["deliverable"];
+	carried.deliverableReady!.remainingIssueIds = ["deliverable", "optional", "equipment"];
+	const restoredContext = { ...context, previousIssues: [structuredClone(carried.issues[1]!)],
+		sources: { ...context.sources,
+			"prior-research-history.json": { kind: "unselected-evidence" as const, lineCount: 1 } } };
+	assert.equal(validateGroundedAssessment(carried, restoredContext).issues[1]!.status, "resolved");
+});
+
+test("live source binding needs an exact available attempt and grounded attempt citations", () => {
+	const selected = { kind: "selected" as const, sourceSha256: "a".repeat(64) };
+	const attempt = { kind: "unselected-attempt" as const, attemptId: "R2:T1",
+		sourceSha256: "b".repeat(64), planSha256: "c".repeat(64) };
+	const taskEvidence = { source: "task-attempt-1-source.cpp",
+		verification: "task-attempt-1-verification.json",
+		archive: "task-attempt-1-archive.json", plan: "task-attempt-1-plan.json" };
+	const live = { ...context, taskSourceBindings: { selected, attempts: [attempt],
+		attemptEvidence: { [attempt.attemptId]: taskEvidence } },
+		sources: { ...context.sources, ...Object.fromEntries(Object.values(taskEvidence).map(name =>
+			[name, { kind: "unselected-evidence" as const, lineCount: 1 }])) } };
+	const missing = proposal();
+	assert.throws(() => validateGroundedAssessment(missing, live), error =>
+		error instanceof GroundingFieldError && error.pointer.endsWith("/sourceBinding"));
+	const stale = proposal();
+	stale.nextTask!.sourceBinding = { ...attempt, sourceSha256: "d".repeat(64) };
+	assert.throws(() => validateGroundedAssessment(stale, live), error =>
+		error instanceof GroundingFieldError && error.safeDetail.includes(
+			"available host-frozen selected or unselected source"));
+	const cited = proposal();
+	cited.nextTask!.sourceBinding = attempt;
+	assert.throws(() => validateGroundedAssessment(cited, live), error =>
+		error instanceof GroundingFieldError && error.safeDetail.includes(
+			"must cite its frozen source, verification and archive"));
+	cited.nextTask!.sourceRefs.push(ref(taskEvidence.source), ref(taskEvidence.verification),
+		ref(taskEvidence.archive));
+	assert.equal(validateGroundedAssessment(cited, live).nextTask!.sourceBinding, attempt);
+	const baseline = proposal();
+	baseline.nextTask!.sourceBinding = selected;
+	assert.equal(validateGroundedAssessment(baseline, live).nextTask!.sourceBinding, selected);
+	assert.equal(validateGroundedAssessment(proposal(), context).nextTask!.sourceBinding, undefined,
+		"historical assessments remain readable without the live source binding policy");
+});
+
 test("line-addressed prior grounding reassembles exactly and delta omission retains old records", () => {
 	const oldIssue = proposal().issues[1]!;
 	const legacy = ["old detail"];

@@ -11,9 +11,9 @@ import { isVerifiedLinkedUnknownDelivery, isVerifiedWorkflowRepairPlan,
 	type VerifiedWorkflowRepairPlanV1 } from "./mission-host-adapter.ts";
 import type { TestedControlBinding } from "./mission-resume-journal.ts";
 import { isVerifiedInterruptedSourceCapability,
-	type VerifiedInterruptedSourceCapabilityV1 } from "./interrupted-source-review.ts";
+	type VerifiedInterruptedSourceCapabilityV2 } from "./interrupted-source-review.ts";
 import { isVerifiedTerminalPrefixSourceCapability,
-	type VerifiedTerminalPrefixSourceCapabilityV1 } from "./terminal-prefix-source-review.ts";
+	type VerifiedTerminalPrefixSourceCapabilityV2 } from "./terminal-prefix-source-review.ts";
 import { isVerifiedProviderAvailabilityProof,
 	type VerifiedProviderAvailabilityProofV1 } from "./provider-availability-proof.ts";
 
@@ -177,8 +177,8 @@ export type SupervisorSnapshot = Readonly<{
 	cancellationEvent?: HostCancellationEventV1;
 	freshIndependentWork?: FreshIndependentWorkEvidenceV1;
 	freshLaunchContract?: FreshIndependentLaunchContractV1;
-	interruptedSourceReview?: VerifiedInterruptedSourceCapabilityV1;
-	terminalPrefixSourceReview?: VerifiedTerminalPrefixSourceCapabilityV1;
+	interruptedSourceReview?: VerifiedInterruptedSourceCapabilityV2;
+	terminalPrefixSourceReview?: VerifiedTerminalPrefixSourceCapabilityV2;
 	workflowRepairPlan?: VerifiedWorkflowRepairPlanV1;
 	providerAvailabilityProof?: VerifiedProviderAvailabilityProofV1;
 	linkedUnknownDelivery?: LinkedUnknownDeliveryV1;
@@ -537,11 +537,14 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 			review.source.runAttempt !== resumeSource.runAttempt ||
 			review.source.commit !== resumeSource.commit ||
 			Object.keys(review.grant ?? {}).sort().join("|") !== ["mode", "oldResultUse",
-				"m07Tools", "modelSessions", "state", "outputTransport", "providerInference"].sort().join("|") ||
+				"m07BuilderToolGrant", "objectiveAssessorToolGrant", "m04ReviewerToolGrant",
+				"m07ReviewerToolGrant", "state", "outputTransport", "providerInference"].sort().join("|") ||
 			review.grant.mode !== "fresh-only-confined-effects" ||
 			review.grant.oldResultUse !== "untrusted-no-replay-no-adoption" ||
-			review.grant.m07Tools !== "factory-confined-local" ||
-			review.grant.modelSessions !== "read-only" ||
+			review.grant.m07BuilderToolGrant !== "factory-confined-task-file-writes" ||
+			review.grant.objectiveAssessorToolGrant !== "read-only" ||
+			review.grant.m04ReviewerToolGrant !== "read-only" ||
+			review.grant.m07ReviewerToolGrant !== "read-only" ||
 			review.grant.state !== "fresh-workspace-empty-store-no-resume" ||
 			review.grant.outputTransport !== "encrypted-fixed" ||
 			review.grant.providerInference !== "fixed-configured-provider")
@@ -558,11 +561,16 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 			!sourceId(review.source) || !hex64(review.receiptSha256) ||
 			!/^[0-9a-f]{40}$/.test(review.sourceTree) ||
 			canonical(review.source) !== canonical(resumeSource) ||
+			Object.keys(review.grant ?? {}).sort().join("|") !== ["mode", "oldResultUse",
+				"m07BuilderToolGrant", "objectiveAssessorToolGrant", "m04ReviewerToolGrant",
+				"m07ReviewerToolGrant", "state", "outputTransport", "providerInference"].sort().join("|") ||
 			review.grant.mode !== "fresh-only-confined-effects" ||
 			review.grant.oldResultUse !== "untrusted-no-replay-no-adoption" ||
 			review.grant.state !== "fresh-workspace-empty-store-no-resume" ||
-			review.grant.m07Tools !== "factory-confined-local" ||
-			review.grant.assessorAndM04ReviewerSessions !== "read-only" ||
+			review.grant.m07BuilderToolGrant !== "factory-confined-task-file-writes" ||
+			review.grant.objectiveAssessorToolGrant !== "read-only" ||
+			review.grant.m04ReviewerToolGrant !== "read-only" ||
+			review.grant.m07ReviewerToolGrant !== "read-only" ||
 			review.grant.outputTransport !== "encrypted-fixed" ||
 			review.grant.providerInference !== "fixed-configured-provider")
 			fail("terminal prefix source review is not verified for the source");

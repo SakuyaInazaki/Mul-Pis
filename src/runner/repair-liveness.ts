@@ -8,6 +8,7 @@ export type WorkflowRepairStage = "objective-assessment" | "m04-judgment";
 export type WorkflowRepairFailure =
 	"unread-evidence" | "invalid-assessment" | "blocked-with-capability" |
 	"unsupported-next-task" | "unread-m07-evidence" | "malformed-proposal" |
+	"unavailable-task-source" |
 	"rejected-draft" | "context-handoff-unavailable" | "provider-context-full";
 export type WorkflowRepairStrategy = "same-session-feedback" | "fresh-context" |
 	"workflow-repair-needed";
@@ -26,6 +27,7 @@ export type WorkflowRepairStateV1 = Readonly<{
 const stages: readonly WorkflowRepairStage[] = ["objective-assessment", "m04-judgment"];
 const failures: readonly WorkflowRepairFailure[] = ["unread-evidence", "invalid-assessment",
 	"blocked-with-capability", "unsupported-next-task", "unread-m07-evidence",
+	"unavailable-task-source",
 	"malformed-proposal", "rejected-draft", "context-handoff-unavailable", "provider-context-full"];
 const strategies: readonly WorkflowRepairStrategy[] = ["same-session-feedback", "fresh-context",
 	"workflow-repair-needed"];

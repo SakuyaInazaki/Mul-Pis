@@ -12,25 +12,30 @@ import type { TerminalInterruptionEvidenceV1 } from "./mission-supervisor.ts";
 
 type Source = TerminalInterruptionEvidenceV1["source"];
 export type InterruptedSourceReviewRole =
-	"m07-local-tool-confinement" | "read-only-model-sessions" |
+	"m07-builder-confined-writes" | "objective-assessor-read-only" |
+	"m04-reviewer-read-only" | "m07-reviewer-read-only" |
 	"fresh-workspace-store" | "host-execution-confinement" |
 	"encrypted-output-provider";
 const roles: readonly InterruptedSourceReviewRole[] = [
-	"m07-local-tool-confinement", "read-only-model-sessions",
+	"m07-builder-confined-writes", "objective-assessor-read-only",
+	"m04-reviewer-read-only", "m07-reviewer-read-only",
 	"fresh-workspace-store", "host-execution-confinement",
 	"encrypted-output-provider"
 ];
-export type InterruptedSourceGrantV1 = Readonly<{
+/** Separately names the writable builder and each read-only review role. */
+export type InterruptedSourceGrantV2 = Readonly<{
 	mode: "fresh-only-confined-effects";
 	oldResultUse: "untrusted-no-replay-no-adoption";
-	m07Tools: "factory-confined-local";
-	modelSessions: "read-only";
+	m07BuilderToolGrant: "factory-confined-task-file-writes";
+	objectiveAssessorToolGrant: "read-only";
+	m04ReviewerToolGrant: "read-only";
+	m07ReviewerToolGrant: "read-only";
 	state: "fresh-workspace-empty-store-no-resume";
 	outputTransport: "encrypted-fixed";
 	providerInference: "fixed-configured-provider";
 }>;
-export type InterruptedSourceReviewReceiptV1 = Readonly<{
-	version: 1;
+export type InterruptedSourceReviewReceiptV2 = Readonly<{
+	version: 2;
 	kind: "host-reviewed-interrupted-source-capability";
 	prior: Readonly<{
 		source: Source;
@@ -47,18 +52,18 @@ export type InterruptedSourceReviewReceiptV1 = Readonly<{
 		codeEvidenceRefs: readonly Readonly<{ role: InterruptedSourceReviewRole; path: string; symbol: string }>[];
 		testEvidenceRefs: readonly Readonly<{ role: InterruptedSourceReviewRole; path: string; name: string }>[];
 	}>;
-	grant: InterruptedSourceGrantV1;
+	grant: InterruptedSourceGrantV2;
 }>;
 declare const verifiedInterruptedSource: unique symbol;
-export type VerifiedInterruptedSourceCapabilityV1 = Readonly<{
+export type VerifiedInterruptedSourceCapabilityV2 = Readonly<{
 	source: Source;
 	sourceTree: string;
-	grant: InterruptedSourceGrantV1;
+	grant: InterruptedSourceGrantV2;
 	receiptSha256: string;
 	[verifiedInterruptedSource]: true;
 }>;
 const verified = new WeakSet<object>();
-export function isVerifiedInterruptedSourceCapability(value: unknown): value is VerifiedInterruptedSourceCapabilityV1 {
+export function isVerifiedInterruptedSourceCapability(value: unknown): value is VerifiedInterruptedSourceCapabilityV2 {
 	return !!value && typeof value === "object" && verified.has(value);
 }
 
@@ -103,9 +108,9 @@ const testPath = (value: unknown): value is string => typeof value === "string" 
 	(/^test\/(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+\.test\.ts$/.test(value) ||
 	/^test\/[A-Za-z0-9_-]+_test\.py$/.test(value));
 const refText = (value: unknown): value is string => typeof value === "string" &&
-	value.length >= 4 && value.length <= 200 && !/[\r\n\0]/.test(value);
-function validReceipt(value: unknown): value is InterruptedSourceReviewReceiptV1 {
-	if (!exact(value, ["version", "kind", "prior", "review", "grant"]) || value.version !== 1 ||
+	value.length > 0 && !/[\r\n\0]/.test(value);
+function validReceipt(value: unknown): value is InterruptedSourceReviewReceiptV2 {
+	if (!exact(value, ["version", "kind", "prior", "review", "grant"]) || value.version !== 2 ||
 		value.kind !== "host-reviewed-interrupted-source-capability") return false;
 	const p = value.prior, r = value.review, g = value.grant;
 	if (!exact(p, ["source", "sourceTree", "priorCarrySource", "priorCarryEnvelopeSha256",
@@ -113,11 +118,15 @@ function validReceipt(value: unknown): value is InterruptedSourceReviewReceiptV1
 		!source(p.source) || !source(p.priorCarrySource) || !hex40(p.sourceTree) ||
 		!hex64(p.priorCarryEnvelopeSha256) || !hex64(p.priorCheckpointSha256) ||
 		!numericId(p.resultArtifactId) || !hex64(p.resultArchiveSha256) ||
-		!exact(g, ["mode", "oldResultUse", "m07Tools", "modelSessions", "state",
+		!exact(g, ["mode", "oldResultUse", "m07BuilderToolGrant",
+			"objectiveAssessorToolGrant", "m04ReviewerToolGrant", "m07ReviewerToolGrant", "state",
 			"outputTransport", "providerInference"]) ||
 		g.mode !== "fresh-only-confined-effects" ||
 		g.oldResultUse !== "untrusted-no-replay-no-adoption" ||
-		g.m07Tools !== "factory-confined-local" || g.modelSessions !== "read-only" ||
+		g.m07BuilderToolGrant !== "factory-confined-task-file-writes" ||
+		g.objectiveAssessorToolGrant !== "read-only" ||
+		g.m04ReviewerToolGrant !== "read-only" ||
+		g.m07ReviewerToolGrant !== "read-only" ||
 		g.state !== "fresh-workspace-empty-store-no-resume" ||
 		g.outputTransport !== "encrypted-fixed" || g.providerInference !== "fixed-configured-provider" ||
 		!exact(r, ["kind", "conclusion", "codeEvidenceRefs", "testEvidenceRefs"]) ||
@@ -142,7 +151,7 @@ function inside(file: string, root: string): boolean {
 	const relative = path.relative(root, file);
 	return relative === "" || relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
-async function readPrivateReceipt(file: string): Promise<{ receipt: InterruptedSourceReviewReceiptV1; digest: string }> {
+async function readPrivateReceipt(file: string): Promise<{ receipt: InterruptedSourceReviewReceiptV2; digest: string }> {
 	if (!path.isAbsolute(file)) reject("invalid-receipt");
 	let handle;
 	try {
@@ -171,7 +180,7 @@ async function readPrivateReceipt(file: string): Promise<{ receipt: InterruptedS
  * This validates the private operator receipt and resolves its references at
  * those exact source bytes. Only the operator judges the code's semantics. */
 export async function readReviewedInterruptedSourceCapability(input: ReviewInterruptedSourceInput):
-	Promise<VerifiedInterruptedSourceCapabilityV1> {
+	Promise<VerifiedInterruptedSourceCapabilityV2> {
 	const { receipt, digest } = await readPrivateReceipt(input.privateReceiptFile);
 	const interruption = input.interruption;
 	if (interruption?.version !== 1 || interruption.kind !== "host-verified-terminal-interruption" ||
@@ -214,5 +223,5 @@ export async function readReviewedInterruptedSourceCapability(input: ReviewInter
 	const result = Object.freeze({ source: Object.freeze({ ...p.source }), sourceTree: p.sourceTree,
 		grant, receiptSha256: digest });
 	verified.add(result);
-	return result as VerifiedInterruptedSourceCapabilityV1;
+	return result as VerifiedInterruptedSourceCapabilityV2;
 }

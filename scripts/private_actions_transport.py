@@ -55,6 +55,9 @@ RESULT_SIDECAR_RE = re.compile(r"^ledger-continuation\.part-[0-9]{8}\.enc$")
 RESULT_ASSESSOR_DIAGNOSTIC_RE = re.compile(
     r"^assessor-(?:diagnostic-[0-9]{6,}\.json|transcript-[0-9]{6,}\.bin)$"
 )
+RESULT_TASK_SOURCE_DIAGNOSTIC_RE = re.compile(
+    r"^task-source-handoff-diagnostic-[1-9][0-9]*\.json$"
+)
 OBJECTIVE_PART_RE = re.compile(r"^objective-checkpoint\.part-([0-9a-f]{32})-([0-9]{6})\.txt$")
 OBJECTIVE_PART_BYTES = 1024 * 1024
 OBJECTIVE_TOTAL_BYTES = 64 * 1024 * 1024
@@ -64,6 +67,7 @@ def _allowed_result_name(name: str) -> bool:
     return bool(name in RESULT_ALLOWLIST or RESULT_DYNAMIC_RE.fullmatch(name) or
                 RESULT_SIDECAR_RE.fullmatch(name) or
                 RESULT_ASSESSOR_DIAGNOSTIC_RE.fullmatch(name) or
+                RESULT_TASK_SOURCE_DIAGNOSTIC_RE.fullmatch(name) or
                 OBJECTIVE_PART_RE.fullmatch(name))
 
 

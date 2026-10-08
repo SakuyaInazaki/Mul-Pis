@@ -14,25 +14,27 @@ type Source = TerminalPrefixInterruptionEvidenceV1["source"];
 export type TerminalPrefixSourceReviewRole = InterruptedSourceReviewRole |
 	"periodic-prefix-transport" | "trusted-artifact-runtime-parent" |
 	"child-runtime-credential-exclusion";
-/** M07 builder sessions use factory-confined local tools. Only the separate
- * assessor and M04 reviewer sessions are read-only. */
-export type TerminalPrefixSourceGrantV1 = Readonly<{
+/** Separately names the writable builder and each read-only review role. */
+export type TerminalPrefixSourceGrantV2 = Readonly<{
 	mode: "fresh-only-confined-effects";
 	oldResultUse: "untrusted-no-replay-no-adoption";
-	m07Tools: "factory-confined-local";
-	assessorAndM04ReviewerSessions: "read-only";
+	m07BuilderToolGrant: "factory-confined-task-file-writes";
+	objectiveAssessorToolGrant: "read-only";
+	m04ReviewerToolGrant: "read-only";
+	m07ReviewerToolGrant: "read-only";
 	state: "fresh-workspace-empty-store-no-resume";
 	outputTransport: "encrypted-fixed";
 	providerInference: "fixed-configured-provider";
 }>;
 /** The operator must review each semantic boundary in the interrupted commit.
  * Paths are evidence references, not a fixed source-layout or run-specific pin. */
-const roles: readonly TerminalPrefixSourceReviewRole[] = ["m07-local-tool-confinement",
-	"read-only-model-sessions", "fresh-workspace-store", "host-execution-confinement",
+const roles: readonly TerminalPrefixSourceReviewRole[] = ["m07-builder-confined-writes",
+	"objective-assessor-read-only", "m04-reviewer-read-only", "m07-reviewer-read-only",
+	"fresh-workspace-store", "host-execution-confinement",
 	"encrypted-output-provider", "periodic-prefix-transport",
 	"trusted-artifact-runtime-parent", "child-runtime-credential-exclusion"];
-export type TerminalPrefixSourceReviewReceiptV1 = Readonly<{
-	version: 1; kind: "host-reviewed-terminal-prefix-source-capability";
+export type TerminalPrefixSourceReviewReceiptV2 = Readonly<{
+	version: 2; kind: "host-reviewed-terminal-prefix-source-capability";
 	prior: Readonly<{ interruption: TerminalPrefixInterruptionEvidenceV1;
 		sourceTree: string; priorCheckpointSha256: string }>;
 	review: Readonly<{ kind: "operator-code-review";
@@ -41,16 +43,16 @@ export type TerminalPrefixSourceReviewReceiptV1 = Readonly<{
 			path: string; symbol: string }>[];
 		testEvidenceRefs: readonly Readonly<{ role: TerminalPrefixSourceReviewRole;
 			path: string; name: string }>[] }>;
-	grant: TerminalPrefixSourceGrantV1;
+	grant: TerminalPrefixSourceGrantV2;
 }>;
 declare const terminalPrefixSourceBrand: unique symbol;
-export type VerifiedTerminalPrefixSourceCapabilityV1 = Readonly<{
-	source: Source; sourceTree: string; grant: TerminalPrefixSourceGrantV1;
+export type VerifiedTerminalPrefixSourceCapabilityV2 = Readonly<{
+	source: Source; sourceTree: string; grant: TerminalPrefixSourceGrantV2;
 	receiptSha256: string; [terminalPrefixSourceBrand]: true;
 }>;
 const branded = new WeakSet<object>();
 export function isVerifiedTerminalPrefixSourceCapability(value: unknown):
-	value is VerifiedTerminalPrefixSourceCapabilityV1 {
+	value is VerifiedTerminalPrefixSourceCapabilityV2 {
 	return !!value && typeof value === "object" && branded.has(value);
 }
 export class TerminalPrefixSourceReviewError extends Error {
@@ -87,8 +89,8 @@ function canonical(v: unknown): string {
 		.map(([k, item]) => `${JSON.stringify(k)}:${canonical(item)}`).join(",")}}`;
 	return reject("invalid-receipt");
 }
-function validReceipt(v: unknown): v is TerminalPrefixSourceReviewReceiptV1 {
-	if (!exact(v, ["version", "kind", "prior", "review", "grant"]) || v.version !== 1 ||
+function validReceipt(v: unknown): v is TerminalPrefixSourceReviewReceiptV2 {
+	if (!exact(v, ["version", "kind", "prior", "review", "grant"]) || v.version !== 2 ||
 		v.kind !== "host-reviewed-terminal-prefix-source-capability" ||
 		!exact(v.prior, ["interruption", "sourceTree", "priorCheckpointSha256"]) ||
 		!hex40(v.prior.sourceTree) || !hex64(v.prior.priorCheckpointSha256) ||
@@ -97,13 +99,15 @@ function validReceipt(v: unknown): v is TerminalPrefixSourceReviewReceiptV1 {
 		v.review.conclusion !== "approved-for-fresh-only-execution" ||
 		!Array.isArray(v.review.codeEvidenceRefs) ||
 		!Array.isArray(v.review.testEvidenceRefs) ||
-		!exact(v.grant, ["mode", "oldResultUse", "m07Tools",
-			"assessorAndM04ReviewerSessions", "state",
+		!exact(v.grant, ["mode", "oldResultUse", "m07BuilderToolGrant",
+			"objectiveAssessorToolGrant", "m04ReviewerToolGrant", "m07ReviewerToolGrant", "state",
 			"outputTransport", "providerInference"]) ||
 		v.grant.mode !== "fresh-only-confined-effects" ||
 		v.grant.oldResultUse !== "untrusted-no-replay-no-adoption" ||
-		v.grant.m07Tools !== "factory-confined-local" ||
-		v.grant.assessorAndM04ReviewerSessions !== "read-only" ||
+		v.grant.m07BuilderToolGrant !== "factory-confined-task-file-writes" ||
+		v.grant.objectiveAssessorToolGrant !== "read-only" ||
+		v.grant.m04ReviewerToolGrant !== "read-only" ||
+		v.grant.m07ReviewerToolGrant !== "read-only" ||
 		v.grant.state !== "fresh-workspace-empty-store-no-resume" ||
 		v.grant.outputTransport !== "encrypted-fixed" ||
 		v.grant.providerInference !== "fixed-configured-provider") return false;
@@ -129,10 +133,10 @@ export async function readReviewedTerminalPrefixSourceCapability(input: Readonly
 	privateReceiptFile: string; interruption: TerminalPrefixInterruptionEvidenceV1;
 	interruptedSourceTree: string; priorCheckpointSha256: string;
 	readImmutableSourceFile: (commit: string, file: string) => Promise<Uint8Array>;
-}>): Promise<VerifiedTerminalPrefixSourceCapabilityV1> {
+}>): Promise<VerifiedTerminalPrefixSourceCapabilityV2> {
 	const file = input.privateReceiptFile;
 	if (!path.isAbsolute(file)) reject("invalid-receipt");
-	let receipt: TerminalPrefixSourceReviewReceiptV1;
+	let receipt: TerminalPrefixSourceReviewReceiptV2;
 	let digest: string;
 	let handle;
 	try {
@@ -177,5 +181,5 @@ export async function readReviewedTerminalPrefixSourceCapability(input: Readonly
 		sourceTree: receipt.prior.sourceTree, grant: Object.freeze({ ...receipt.grant }),
 		receiptSha256: digest });
 	branded.add(result);
-	return result as VerifiedTerminalPrefixSourceCapabilityV1;
+	return result as VerifiedTerminalPrefixSourceCapabilityV2;
 }

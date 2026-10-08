@@ -25,7 +25,7 @@ import { assessAndAdvanceOriginalObjective, createOriginalObjective, isCurrentOb
 import type { CurrentObjectiveStopReason, HostPendingActionFactsV1, ObjectiveCapabilityV1, ObjectiveProgressV1,
 	OriginalObjectiveContractV1, ObjectiveAssessmentValidationDiagnosticV1,
 	ObjectiveAssessmentExceptionStage } from "../src/m07/objective-progress.ts";
-import type { GroundedIssue, GroundingSourceKind } from "../src/m07/assessor-grounding.ts";
+import type { GroundedIssue, GroundingSourceKind, TaskSourceBindingV1 } from "../src/m07/assessor-grounding.ts";
 import type { BeginGoalInput, CurrentGoal, M07TaskRecord, TaskSpecInput } from "../src/m07/types.ts";
 import { runM04, type M04InvalidJudgmentEvent } from "../src/stages/m04.ts";
 import { createPiSessionRunner } from "../src/runner/pi.ts";
@@ -270,7 +270,14 @@ function assessorGroundingPolicy(evidence: readonly { name: string; file: string
 	return { require: true,
 		sourceKinds: Object.fromEntries(evidence.map(item => [item.name,
 			item.name === "host-capabilities.json" ? "host-capability" :
-			item.name === "prior-incomplete-run-control.json" ? "host-control" :
+			item.name === "prior-incomplete-run-control.json" ||
+			item.name === "task-source-bindings.json" ||
+			item.name.startsWith("prior-objective-checkpoint-") ||
+			item.name.startsWith("prior-grounding-") ||
+			/^task-source-binding-part-[0-9]+\.jsonl$/.test(item.name) ? "host-control" :
+			item.name.startsWith("latest-attempt") ||
+			item.name.startsWith("prior-research-history") ||
+			/^task-attempt-[0-9]+-/.test(item.name) ? "unselected-evidence" :
 			item.name === "original-problem.txt" || /^original-input-[1-9][0-9]*\.txt$/.test(item.name) ?
 				"supplied-task" : "selected-evidence"])) as Record<string, GroundingSourceKind>,
 		legacyOpenDetails: [...(grounded?.legacyOpenDetails ?? prior.continuation.unresolvedDetails)],
@@ -286,6 +293,8 @@ function assessorEvidenceAccess(evidence: readonly { name: string; file: string 
 		/^prior-research-history-part-[0-9]+\.txt$/.test(item.name) ||
 		/^prior-research-history-catalog-[0-9]+\.json$/.test(item.name) ||
 		/^prior-objective-checkpoint-part-[0-9]+\.txt$/.test(item.name) ||
+		/^task-source-binding-part-[0-9]+\.jsonl$/.test(item.name) ||
+		/^task-attempt-[0-9]+-(source\.cpp|verification\.json|archive\.json|plan\.json)$/.test(item.name) ||
 		/^prior-grounding-part-[0-9]+\.jsonl$/.test(item.name) ?
 			"retrievable" : "required"]));
 }
@@ -427,6 +436,156 @@ function archivedRequestContract(archive: Awaited<ReturnType<typeof archivePriva
 		messageIndex: rows[0].requestContractNotIssued.messageIndex };
 }
 function sha256(value: string): string { return createHash("sha256").update(value).digest("hex"); }
+
+type UnselectedAttemptBinding = Extract<TaskSourceBindingV1, { kind: "unselected-attempt" }>;
+type ArchivedTaskInput = { file: string; sha256: string };
+type ArchivedUnselectedAttempt = { binding: UnselectedAttemptBinding; source: ArchivedTaskInput;
+	plan?: ArchivedTaskInput; verification?: ArchivedTaskInput; archive: ArchivedTaskInput };
+const OBJECTIVE_TASK_INPUT_BYTES = 1_000_000;
+class TaskSourceArchiveReadError extends Error {
+	readonly code = "private-task-source-archive-read-failed";
+	readonly errno: string;
+	constructor(errno: string) {
+		super(`task source archive read failed: errno=${errno}`);
+		this.errno = errno;
+	}
+}
+async function boundedArchivedTaskInput(file: string): Promise<ArchivedTaskInput | undefined> {
+	try {
+		const info = await lstat(file);
+		if (!info.isFile() || info.isSymbolicLink() || info.size > OBJECTIVE_TASK_INPUT_BYTES) return undefined;
+		const bytes = await readFile(file);
+		if (bytes.length > OBJECTIVE_TASK_INPUT_BYTES) return undefined;
+		return { file, sha256: createHash("sha256").update(bytes).digest("hex") };
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") return undefined;
+		throw new TaskSourceArchiveReadError(["EACCES", "EPERM", "ENOSPC", "EIO"].includes(code ?? "") ?
+			code! : "other");
+	}
+}
+async function archivedTaskInputAvailable(input: ArchivedTaskInput | undefined): Promise<boolean> {
+	return input === undefined || (await boundedArchivedTaskInput(input.file))?.sha256 === input.sha256;
+}
+type TaskInputReadStatus = "ready" | "missing" | "digest-mismatch" | "io-error";
+type TaskInputReadOutcome = { status: TaskInputReadStatus;
+	cause?: "not-regular" | "size" | "digest" | "postcopy" | "os";
+	errno?: "EACCES" | "EPERM" | "ENOSPC" | "EIO" | "ENOENT" | "other" };
+class TaskSourceDiagnosticWriteError extends Error {
+	readonly code = "private-task-source-diagnostic-write-failed";
+	readonly member: string;
+	readonly sourceStatus: TaskInputReadStatus;
+	readonly sourceCause: TaskInputReadOutcome["cause"];
+	readonly sourceErrno: TaskInputReadOutcome["errno"];
+	readonly writerErrno: string;
+	constructor(member: string, sourceStatus: TaskInputReadStatus,
+		sourceCause: TaskInputReadOutcome["cause"],
+		sourceErrno: TaskInputReadOutcome["errno"], writerErrno: string) {
+		super(`task source diagnostic write failed: member=${member}; status=${sourceStatus}; ` +
+			`cause=${sourceCause ?? "none"}; sourceErrno=${sourceErrno ?? "none"}; writerErrno=${writerErrno}`);
+		this.member = member;
+		this.sourceStatus = sourceStatus;
+		this.sourceCause = sourceCause;
+		this.sourceErrno = sourceErrno;
+		this.writerErrno = writerErrno;
+	}
+}
+async function writeTaskSourceDiagnostic(outputDir: string, sequence: number, iteration: number,
+	member: string, expectedSha256: string | undefined, outcome: TaskInputReadOutcome,
+	writer: (file: string, bytes: string) => Promise<void> =
+		(file, bytes) => writeFile(file, bytes, { flag: "wx", mode: 0o600 })): Promise<void> {
+	const file = path.join(outputDir, `task-source-handoff-diagnostic-${sequence}.json`);
+	const body = JSON.stringify({ version: 1, kind: "private-task-source-handoff-diagnostic",
+		iteration, stage: "frozen-source-copy", member,
+		expectedSha256: expectedSha256 ?? null, status: outcome.status,
+		cause: outcome.cause ?? null, errno: outcome.errno ?? null });
+	try { await writer(file, body); }
+	catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		const safeCode = ["EACCES", "EPERM", "ENOSPC", "EIO", "ENOENT"].includes(code ?? "") ? code! : "other";
+		throw new TaskSourceDiagnosticWriteError(member, outcome.status, outcome.cause,
+			outcome.errno, safeCode);
+	}
+}
+async function stageBoundedTaskInput(source: string, destination: string,
+	expectedSha256?: string,
+	io: { stat: (file: string) => Promise<{ isFile(): boolean; isSymbolicLink(): boolean; size: number }>;
+		read: (file: string) => Promise<Buffer>;
+		write: (file: string, bytes: Buffer) => Promise<void> } = {
+		stat: file => lstat(file), read: file => readFile(file),
+		write: (file, bytes) => writeFile(file, bytes, { flag: "wx", mode: 0o600 })
+	}): Promise<TaskInputReadOutcome> {
+	try {
+		const info = await io.stat(source);
+		if (!info.isFile() || info.isSymbolicLink())
+			return { status: "digest-mismatch", cause: "not-regular" };
+		if (info.size > OBJECTIVE_TASK_INPUT_BYTES)
+			return { status: "digest-mismatch", cause: "size" };
+		const bytes = await io.read(source);
+		if (bytes.length > OBJECTIVE_TASK_INPUT_BYTES)
+			return { status: "digest-mismatch", cause: "size" };
+		if (expectedSha256 && createHash("sha256").update(bytes).digest("hex") !== expectedSha256)
+			return { status: "digest-mismatch", cause: "digest" };
+		await io.write(destination, bytes);
+		if (!(await io.read(destination)).equals(bytes))
+			return { status: "digest-mismatch", cause: "postcopy" };
+		return { status: "ready" };
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		const errno = ["EACCES", "EPERM", "ENOSPC", "EIO", "ENOENT"].includes(code ?? "") ?
+			code as TaskInputReadOutcome["errno"] : "other";
+		return { status: code === "ENOENT" ? "missing" : "io-error", cause: "os", errno };
+	}
+}
+async function availableArchivedAttempt(attempt: ArchivedUnselectedAttempt): Promise<boolean> {
+	return Boolean(await archivedTaskInputAvailable(attempt.source) &&
+		await archivedTaskInputAvailable(attempt.plan) &&
+		await archivedTaskInputAvailable(attempt.verification) &&
+		await archivedTaskInputAvailable(attempt.archive));
+}
+
+async function writeTaskSourceCatalog(dir: string, selected: TaskSourceBindingV1,
+	attempts: readonly ArchivedUnselectedAttempt[],
+	evidenceNames: Readonly<Record<string, { source: string; verification: string;
+		archive: string; plan?: string; catalogPart?: string }>>): Promise<{ evidence: Array<{ name: string; file: string }>;
+		attemptLocator: Record<string, { part: string; line: number; rowSha256: string }> }> {
+	const records = attempts.map(item => ({ sourceBinding: item.binding,
+		evidenceNames: evidenceNames[item.binding.attemptId],
+		authority: "unselected-development-evidence" }));
+	const indexFile = path.join(dir, "task-source-bindings.json");
+	const parts: Array<{ name: string; file: string; firstAttemptId: string; lastAttemptId: string }> = [];
+	let lines: string[] = [];
+	let bytes = 0;
+	const attemptLocator: Record<string, { part: string; line: number; rowSha256: string }> = {};
+	const flush = async () => {
+		if (!lines.length) return;
+		const name = `task-source-binding-part-${parts.length + 1}.jsonl`;
+		const file = path.join(dir, name);
+		await writeFile(file, `${lines.join("\n")}\n`, { mode: 0o600 });
+		for (const [index, line] of lines.entries())
+			attemptLocator[JSON.parse(line).sourceBinding.attemptId] = { part: name, line: index + 1,
+				rowSha256: sha256(line) };
+		parts.push({ name, file, firstAttemptId: JSON.parse(lines[0]!).sourceBinding.attemptId,
+			lastAttemptId: JSON.parse(lines.at(-1)!).sourceBinding.attemptId });
+		lines = []; bytes = 0;
+	};
+	for (const record of records) {
+		const line = JSON.stringify(record);
+		const size = Buffer.byteLength(line) + 1;
+		if (size > OBJECTIVE_TASK_INPUT_BYTES) throw new Error("task source binding record exceeds evidence file bound");
+		if (bytes + size > OBJECTIVE_TASK_INPUT_BYTES) await flush();
+		lines.push(line); bytes += size;
+	}
+	await flush();
+	const index = `${JSON.stringify({ version: 1, kind: "task-source-bindings-index",
+		scope: "current-run-host-archive-only", selected, parts: parts.map(({ name, firstAttemptId, lastAttemptId }) =>
+			({ name, firstAttemptId, lastAttemptId })), attemptLocator })}\n`;
+	if (Buffer.byteLength(index) > OBJECTIVE_TASK_INPUT_BYTES)
+		throw new Error("task source binding index exceeds evidence file bound");
+	await writeFile(indexFile, index, { mode: 0o600 });
+	return { evidence: [{ name: "task-source-bindings.json", file: indexFile },
+		...parts.map(({ name, file }) => ({ name, file }))], attemptLocator };
+}
 function createPrivateCampaignBudget(nativeCnyPricing: NativeCnyPricingProfile | undefined,
 	providerOutputLimit: DeepSeekProviderOutputLimit): DeepSeekCampaignBudget {
 	return new DeepSeekCampaignBudget({ model: MODEL, endpoint: "https://api.deepseek.com",
@@ -4021,6 +4180,8 @@ async function main() {
 			let currentSelectedTaskId = selectedTask.taskId;
 			let selectedRegisteredPlan = initialRegistered;
 			let latestAttemptEvidence: Array<{ name: string; file: string }> = [];
+			let latestObservedArchive: Array<{ name: string; input: ArchivedTaskInput }> = [];
+			const archivedUnselectedAttempts: ArchivedUnselectedAttempt[] = [];
 			const loop = await runOriginalObjectiveLoop({
 				admission: () => {
 					if (budget.snapshot().stopped) return campaignObjectiveStop(budget.snapshot().stopReason) ??
@@ -4045,6 +4206,47 @@ async function main() {
 				const iterationDiagnosticStart = statusTransportDiagnostics.length;
 				statusPhase = "original-objective-assessment";
 				try {
+						const selectedSourceBytes = await readFile(candidate);
+						const selectedBinding: TaskSourceBindingV1 = { kind: "selected",
+							sourceSha256: createHash("sha256").update(selectedSourceBytes).digest("hex") };
+						const selectedExpected: Record<string, string> = {
+							"candidate.cpp": selectedBinding.sourceSha256,
+							"verification.json": createHash("sha256").update(await readFile(verificationPath)).digest("hex"),
+							"workflow-archive.json": createHash("sha256").update(await readFile(
+								path.join(outputDir, "workflow-archive.json"))).digest("hex"),
+							...(selectedRegisteredPlan ? { "experiment-plan.json": createHash("sha256").update(
+								await readFile(path.join(path.dirname(candidate), "experiment-plan.json"))).digest("hex") } : {})
+						};
+						const availableAttempts: ArchivedUnselectedAttempt[] = [];
+						for (const attempt of archivedUnselectedAttempts)
+							if (await availableArchivedAttempt(attempt)) availableAttempts.push(attempt);
+						const attemptEvidence: Record<string, { source: string; verification: string;
+							archive: string; plan?: string; catalogPart?: string;
+							catalogLine?: number; catalogRowSha256?: string }> = {};
+						const archivedEvidence: Array<{ name: string; file: string }> = [];
+						for (const [index, attempt] of availableAttempts.entries()) {
+							const prefix = `task-attempt-${index + 1}`;
+							const names = { source: `${prefix}-source.cpp`,
+								verification: `${prefix}-verification.json`, archive: `${prefix}-archive.json`,
+								...(attempt.plan ? { plan: `${prefix}-plan.json` } : {}) };
+							attemptEvidence[attempt.binding.attemptId] = names;
+							archivedEvidence.push({ name: names.source, file: attempt.source.file },
+								{ name: names.verification, file: attempt.verification!.file },
+								{ name: names.archive, file: attempt.archive.file });
+							if (attempt.plan) archivedEvidence.push({ name: names.plan!, file: attempt.plan.file });
+						}
+						latestAttemptEvidence = [];
+						for (const item of latestObservedArchive)
+							if (await archivedTaskInputAvailable(item.input))
+								latestAttemptEvidence.push({ name: item.name, file: item.input.file });
+						const catalogDir = path.join(campaignRoot, `task-source-catalog-${iteration}`);
+						await mkdir(catalogDir, { recursive: true, mode: 0o700 });
+						const catalog = await writeTaskSourceCatalog(catalogDir,
+							selectedBinding, availableAttempts, attemptEvidence);
+						const catalogEvidence = catalog.evidence;
+						for (const [attemptId, locator] of Object.entries(catalog.attemptLocator))
+							Object.assign(attemptEvidence[attemptId]!, { catalogPart: locator.part,
+								catalogLine: locator.line, catalogRowSha256: locator.rowSha256 });
 					const objectiveRecord = await ws.startRun("M07Objective", [
 						{ label: "Frozen original objective", path: objectiveContractFile },
 						{ label: "Original private problem", path: ws.problemFile },
@@ -4066,6 +4268,8 @@ async function main() {
 							[{ name: "experiment-plan.json", file: path.join(path.dirname(candidate), "experiment-plan.json") }] : []),
 						{ name: "workflow-archive.json", file: path.join(outputDir, "workflow-archive.json") },
 						...(currentKnowledgeFile ? [{ name: "m04-knowledge.json", file: currentKnowledgeFile }] : []),
+							...catalogEvidence,
+							...archivedEvidence,
 						...latestAttemptEvidence,
 					];
 					const latestGrounding = assessmentHistory.at(-1)?.assessment ?? firstStep.assessment;
@@ -4076,11 +4280,22 @@ async function main() {
 					const stagedGrounding = await stagePriorGroundingRecords(
 						path.join(campaignRoot, `objective-grounding-${iteration}`), groundingBase);
 					evidence.push(...stagedGrounding.evidence);
-					const groundedPolicy = { ...assessorGroundingPolicy(evidence, previousCheckpoint,
+						const groundedPolicy = { ...assessorGroundingPolicy(evidence, previousCheckpoint,
 						latestGrounding, selectedEvidenceNew),
-						priorGroundingIndex: stagedGrounding.priorGroundingIndex, capabilityLocators };
+							priorGroundingIndex: stagedGrounding.priorGroundingIndex, capabilityLocators,
+							taskSourceBindings: { selected: selectedBinding,
+								attempts: availableAttempts.map(item => item.binding), attemptEvidence,
+								catalogSha256: createHash("sha256").update(await readFile(
+									catalogEvidence[0]!.file)).digest("hex") } };
 					const assessmentAdmission = "admitted";
 					let objectiveStep;
+					const frozenAssessmentRoot = path.join(campaignRoot, `objective-evidence-${iteration}`);
+					let preparedInputs: string[] = [];
+					let preparedBinding: TaskSourceBindingV1 | undefined;
+					let preparedDir: string | undefined;
+					let preparedLatestNames: string[] = [];
+					let unavailableLatestNames: string[] = [];
+					let taskSourceDiagnosticCount = 0;
 					objectiveExceptionStage = "assessor-or-dispatch";
 					try { objectiveStep = await assessAndAdvanceOriginalObjective({
 						contract: originalObjective, contractFile: objectiveContractFile,
@@ -4092,7 +4307,7 @@ async function main() {
 						sessionSpec: { label: `M07-original-objective-assessment-${iteration}`, role: "research", model: MODEL,
 							systemPrompt: "Independently assess the original research goal using the frozen evidence. Read the complete supplied files before proposing further work. Return only the requested structured judgment; acknowledge uncertainty, bounded search scope and failed checks. Do not invent measurements or treat M04 adoption as proof of performance.",
 							persistDir: ws.sessionsDir },
-						evidenceRoot: path.join(campaignRoot, `objective-evidence-${iteration}`), evidence,
+						evidenceRoot: frozenAssessmentRoot, evidence,
 						groundingPolicy: groundedPolicy,
 						evidenceAccess: assessorEvidenceAccess(evidence),
 						evidenceRequirements: privateEvidenceRequirements,
@@ -4100,6 +4315,71 @@ async function main() {
 						advanceAdmission: () => budget.snapshot().stopped ?
 							campaignObjectiveStop(budget.snapshot().stopReason) ?? "assessment-failed" :
 							abort.signal.aborted ? "cancelled" : "admitted",
+						prepareNextTask: async proposal => {
+							if (preparedDir) await rm(preparedDir, { recursive: true, force: true });
+							preparedInputs = []; preparedBinding = undefined;
+							preparedLatestNames = []; unavailableLatestNames = [];
+							const binding = proposal.sourceBinding;
+							if (!binding) return { status: "missing" };
+							const chosenNames = binding.kind === "unselected-attempt" ?
+								attemptEvidence[binding.attemptId] : undefined;
+							const chosenArchive = binding.kind === "unselected-attempt" ?
+								availableAttempts.find(item => item.binding.attemptId === binding.attemptId) : undefined;
+							if (binding.kind === "unselected-attempt" && (!chosenNames || !chosenArchive))
+								return { status: "missing" };
+							const seedRoot = path.join(ws.root, "objective-seeds");
+							await mkdir(seedRoot, { recursive: true, mode: 0o700 });
+							preparedDir = await mkdtemp(path.join(seedRoot, "task-source-"));
+							const stage = async (name: string, destinationName: string, digest?: string,
+								essential = true) => {
+								const output = path.join(preparedDir!, destinationName);
+								const result = await stageBoundedTaskInput(path.join(frozenAssessmentRoot, name),
+									output, digest);
+								if (result.status === "ready") preparedInputs.push(path.relative(ws.root, output));
+								else if (essential) {
+									taskSourceDiagnosticCount++;
+									await writeTaskSourceDiagnostic(outputDir, taskSourceDiagnosticCount,
+										iteration, destinationName, digest, result);
+								}
+								return result.status;
+							};
+							const files: Array<[string, string, string?]> = [
+								["candidate.cpp", "selected-candidate.cpp", selectedExpected["candidate.cpp"]],
+								["verification.json", "selected-verification.json", selectedExpected["verification.json"]],
+								["workflow-archive.json", "selected-workflow-archive.json",
+									selectedExpected["workflow-archive.json"]],
+								...(selectedRegisteredPlan ? [
+									["experiment-plan.json", "selected-experiment-plan.json",
+										selectedExpected["experiment-plan.json"]] as [string, string, string]
+								] : []),
+								...(chosenNames ? [
+									[chosenNames.source, "chosen-unselected-candidate.cpp", binding.sourceSha256],
+									[chosenNames.verification, "chosen-unselected-verification.json",
+										chosenArchive?.verification?.sha256],
+									[chosenNames.archive, "chosen-unselected-archive.json", chosenArchive?.archive.sha256],
+									...(chosenNames.plan ? [[chosenNames.plan,
+										"chosen-unselected-experiment-plan.json",
+										binding.kind === "unselected-attempt" ? binding.planSha256 : undefined]] : [])
+								] as Array<[string, string, string?]> : [])
+							];
+							for (const [name, destinationName, digest] of files) {
+								const status = await stage(name, destinationName, digest);
+								if (status !== "ready") {
+									await rm(preparedDir, { recursive: true, force: true });
+									preparedInputs = []; preparedDir = undefined;
+									return { status: destinationName.startsWith("selected-") ?
+										"selected-evidence-unavailable" as const : status };
+								}
+							}
+							for (const item of latestAttemptEvidence) {
+								const digest = latestObservedArchive.find(archived => archived.name === item.name)?.input.sha256;
+								const status = await stage(item.name, item.name, digest, false);
+								if (status === "ready") preparedLatestNames.push(item.name);
+								else unavailableLatestNames.push(item.name);
+							}
+							preparedBinding = binding;
+							return { status: "ready" };
+						},
 						supportedTaskScopes: [...OBJECTIVE_SUPPORTED_TASK_SCOPES],
 						userOverrides, capabilities: objectiveCapabilities,
 						recordAssessment: async assessment => {
@@ -4121,6 +4401,9 @@ async function main() {
 									assessment, assessmentHistory, stopReason: "assessment-validation-pending" }));
 						},
 						advance: async proposal => {
+							if (!preparedBinding || JSON.stringify(preparedBinding) !== JSON.stringify(proposal.sourceBinding) ||
+								!preparedInputs.length)
+								throw new Error("validated frozen task source binding is unavailable");
 							statusPhase = "model-proposed-m07-dispatch";
 							const registered = proposal.adapterScope === "registered-csr-experiment";
 							const taskChecks = registered ? REGISTERED_CHECKS : CHECKS;
@@ -4138,6 +4421,7 @@ async function main() {
 								goal: `Bounded continuation of original objective ${originalObjective.id}: ${proposal.objective}`,
 								problemRelation: `Model-proposed work addressing unresolved original obligations ${proposal.addresses.join(", ")}; original goal: ${originalObjective.goal}`,
 								constraints: ["Prior candidate and measurements are development evidence, not adopted truth.",
+									"Selected baseline and each unselected attempt input are distinct; an unselected revision is not a mission-selected source or adopted knowledge.",
 									"Use only M04-adopted pinned experience refs that pass current applicability and live-limit checks.",
 									registered ? "Use the independently validated source capability and model-authored registered experiment plan; keep original generators/references/checker immutable." :
 										"Keep this adapter's two-target scope and preserve non-target code and built-in checker.",
@@ -4153,12 +4437,11 @@ async function main() {
 								applicability: { stage: "M07", tags }, requestedRefs: proposedRefs,
 								expectedSnapshotId: secondGoal.knowledgeSnapshot, maxRecords: 24, maxChars: 24_000 });
 							const pinnedRefs = selection.status === "ready" ? proposedRefs : [];
-						const seedInputs = [path.relative(ws.root, candidate), path.relative(ws.root, seedPath),
-								"objective-seeds/host-capabilities.json",
-								...(selectedRegisteredPlan ? [path.relative(ws.root, path.join(path.dirname(candidate), "experiment-plan.json"))] : [])];
+							const seedInputs = [...preparedInputs, path.relative(ws.root, seedPath),
+								"objective-seeds/host-capabilities.json"];
 							registeredScopeActive = registered;
 							const secondTask = await controller.delegate(secondGoal.runId, { mode: "execute",
-								objective: `${proposal.objective}\n\nInspect the supplied prior candidate and prior-candidate-seed.json as untrusted development evidence. Address original obligations ${proposal.addresses.join(", ")}. Produce a complete candidate.cpp and pending lesson-delta.json. ${registered ?
+								objective: `${proposal.objective}\n\nThe host-frozen source binding for this task is ${JSON.stringify(preparedBinding)}. Read selected-candidate.cpp and selected-verification.json as the selected baseline; read chosen-unselected-candidate.cpp plus its verification/archive/plan when the binding names an unselected attempt. Available latest-attempt development files: ${preparedLatestNames.join(", ") || "none"}. Unavailable latest-attempt files: ${unavailableLatestNames.join(", ") || "none"}. These are negative or development feedback, never selected authority. Inspect prior-candidate-seed.json as untrusted development evidence. Address original obligations ${proposal.addresses.join(", ")}. Produce a complete candidate.cpp and pending lesson-delta.json. ${registered ?
 									experimentInstructions :
 									"Keep this adapter's two-target original-source scope."} Report negative or mixed measured results honestly. Use only confined read/write/edit; the host writes verification.json; no shell, network or prose deliverables.`,
 								inputs: [...found.files.map(x => `problem/raw/${x}`), ...seedInputs],
@@ -4298,14 +4581,16 @@ async function main() {
 								adoptedExperienceRefs: nextM04.adoptedExperienceRefs ?? [] }, store);
 						const iterationPrefix = `iteration-${localIteration}`;
 						await exportPrefixedArchive(nextArchiveDir, outputDir, iterationPrefix);
-						latestAttemptEvidence = [{ name: "latest-attempt-archive.json",
-							file: path.join(outputDir, `workflow-${iterationPrefix}-archive.json`) },
-							...(existsSync(path.join(outputDir, `${iterationPrefix}-candidate.cpp`)) ?
-								[{ name: "latest-attempt.cpp", file: path.join(outputDir, `${iterationPrefix}-candidate.cpp`) }] : []),
-							...(existsSync(path.join(outputDir, `${iterationPrefix}-verification.json`)) ?
-								[{ name: "latest-attempt-verification.json", file: path.join(outputDir, `${iterationPrefix}-verification.json`) }] : []),
-							...(registered && existsSync(path.join(outputDir, `${iterationPrefix}-experiment-plan.json`)) ?
-								[{ name: "latest-attempt-plan.json", file: path.join(outputDir, `${iterationPrefix}-experiment-plan.json`) }] : [])];
+						latestObservedArchive = [];
+						for (const [name, file] of [
+							["latest-attempt-archive.json", `workflow-${iterationPrefix}-archive.json`],
+							["latest-attempt.cpp", `${iterationPrefix}-candidate.cpp`],
+							["latest-attempt-verification.json", `${iterationPrefix}-verification.json`],
+							["latest-attempt-plan.json", `${iterationPrefix}-experiment-plan.json`]
+						] as const) {
+							const input = await boundedArchivedTaskInput(path.join(outputDir, file));
+							if (input) latestObservedArchive.push({ name, input });
+						}
 						const sourceChanged = !existsSync(candidate) || !existsSync(nextCandidate) ||
 							!(await readFile(candidate)).equals(await readFile(nextCandidate));
 						const nextKnowledgeExport = nextArchive.m04?.knowledgeExport ?? { state: "incomplete" as const };
@@ -4330,6 +4615,24 @@ async function main() {
 							currentSelectedTaskId = secondTask.taskId;
 							selectedRegisteredPlan = registered;
 							promoted = true;
+						}
+						if (!promoted) {
+							const source = await boundedArchivedTaskInput(path.join(outputDir,
+								`${iterationPrefix}-candidate.cpp`));
+							const archive = await boundedArchivedTaskInput(path.join(outputDir,
+								`workflow-${iterationPrefix}-archive.json`));
+							const verification = await boundedArchivedTaskInput(path.join(outputDir,
+								`${iterationPrefix}-verification.json`));
+							const plan = registered ? await boundedArchivedTaskInput(path.join(outputDir,
+								`${iterationPrefix}-experiment-plan.json`)) : undefined;
+							if (source && archive && verification && (!registered || plan)) {
+								const binding: UnselectedAttemptBinding = { kind: "unselected-attempt",
+									attemptId: `${secondGoal.runId}:${secondTask.taskId}`,
+									sourceSha256: source.sha256,
+									...(plan ? { planSha256: plan.sha256 } : {}) };
+								archivedUnselectedAttempts.push({ binding, source, archive, verification,
+									...(plan ? { plan } : {}) });
+							}
 						}
 						followOnSourceChanged = sourceChanged;
 						const selectedM04 = selectedM04AfterFollowOn({
@@ -4378,7 +4681,9 @@ async function main() {
 					} catch (error) {
 						if (statusObjectiveAssessmentFailures.length === objectiveFailureCount)
 							observeObjectiveAssessmentFailure(iteration, objectiveExceptionStage, error);
-						objectiveStopReason = campaignObjectiveStop(budget.snapshot().stopReason) ??
+						objectiveStopReason = error instanceof TaskSourceArchiveReadError ||
+							error instanceof TaskSourceDiagnosticWriteError ?
+							"assessment-evidence-suspended" : campaignObjectiveStop(budget.snapshot().stopReason) ??
 						(abort.signal.aborted ? "cancelled" :
 							assessmentThisIteration ? "dispatch-failed" : "assessment-failed");
 					const stepRequestContract = observedRequestContract(iterationDiagnosticStart,
@@ -4759,6 +5064,8 @@ async function main() {
 }
 
 export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceReturned, inputs, stageProbe, verifierScratch,
+	stageBoundedTaskInput, writeTaskSourceDiagnostic, writeTaskSourceCatalog,
+	boundedArchivedTaskInput, availableArchivedAttempt,
 	checkCandidate, validateSelectedPriorTuple,
 	createPrivateCampaignBudget,
 	historicalGapEvidence,

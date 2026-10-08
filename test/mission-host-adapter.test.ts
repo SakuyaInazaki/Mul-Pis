@@ -451,14 +451,20 @@ async function interruptedFixture(t: TestContext) {
 		.digest("hex");
 	const reviewFiles = new Map([
 		["src/runner/confined-campaign-files.ts", "createConfinedCampaignFileTools"],
+		["src/m07/objective-progress.ts", "objective_evidence_read"],
+		["src/stages/m04.ts", "m07_evidence_read"],
+		["src/m07/controller.ts", "reviewerSpec"],
 		["scripts/manual-private-campaign.ts",
-			"read-only-assessor mkdtemp createFileKnowledgeStore sandboxArguments checkCandidate"],
+			"M07 execution session lacks the live factory-confined file grant mkdtemp createFileKnowledgeStore sandboxArguments checkCandidate"],
 		[".github/workflows/manual-private-campaign.yml", "Upload encrypted mission continuation"],
 		["test/confined-campaign-evidence-read.test.ts", "confined local tools"],
+		["test/m07-objective-progress.test.ts", "objective evidence"],
+		["test/m04-checkpoint.test.ts", "frozen feedback"],
+		["test/m07-execution-loop.test.ts", "fresh reviewer"],
 		["test/manual-private-campaign.test.ts",
 			"read only session fresh state measurement mounts evaluator and immutable reference workers read-only while preserving separate temporary scratch"],
 		["test/private-campaign-workflow-manifest.test.ts", "ciphertext upload"]]);
-	await writeFile(reviewFile, JSON.stringify({ version: 1,
+	await writeFile(reviewFile, JSON.stringify({ version: 2,
 		kind: "host-reviewed-interrupted-source-capability",
 		prior: { source: { runId: "7003", runAttempt: 1, commit: interruptedCommit },
 			sourceTree: testedTree,
@@ -469,10 +475,16 @@ async function interruptedFixture(t: TestContext) {
 			resultArtifactId: "9103", resultArchiveSha256: "9".repeat(64) },
 		review: { kind: "operator-code-review", conclusion: "approved-for-fresh-only-execution",
 			codeEvidenceRefs: [
-				{ role: "m07-local-tool-confinement", path: "src/runner/confined-campaign-files.ts",
+				{ role: "m07-builder-confined-writes", path: "src/runner/confined-campaign-files.ts",
 					symbol: "createConfinedCampaignFileTools" },
-				{ role: "read-only-model-sessions", path: "scripts/manual-private-campaign.ts",
-					symbol: "read-only-assessor" },
+				{ role: "m07-builder-confined-writes", path: "scripts/manual-private-campaign.ts",
+					symbol: "M07 execution session lacks the live factory-confined file grant" },
+				{ role: "objective-assessor-read-only", path: "src/m07/objective-progress.ts",
+					symbol: "objective_evidence_read" },
+				{ role: "m04-reviewer-read-only", path: "src/stages/m04.ts",
+					symbol: "m07_evidence_read" },
+				{ role: "m07-reviewer-read-only", path: "src/m07/controller.ts",
+					symbol: "reviewerSpec" },
 				{ role: "fresh-workspace-store", path: "scripts/manual-private-campaign.ts",
 					symbol: "createFileKnowledgeStore" },
 				{ role: "host-execution-confinement", path: "scripts/manual-private-campaign.ts",
@@ -482,10 +494,14 @@ async function interruptedFixture(t: TestContext) {
 				{ role: "encrypted-output-provider", path: ".github/workflows/manual-private-campaign.yml",
 					symbol: "Upload encrypted mission continuation" }],
 			testEvidenceRefs: [
-				{ role: "m07-local-tool-confinement", path: "test/confined-campaign-evidence-read.test.ts",
+				{ role: "m07-builder-confined-writes", path: "test/confined-campaign-evidence-read.test.ts",
 					name: "confined local tools" },
-				{ role: "read-only-model-sessions", path: "test/manual-private-campaign.test.ts",
-					name: "read only session" },
+				{ role: "objective-assessor-read-only", path: "test/m07-objective-progress.test.ts",
+					name: "objective evidence" },
+				{ role: "m04-reviewer-read-only", path: "test/m04-checkpoint.test.ts",
+					name: "frozen feedback" },
+				{ role: "m07-reviewer-read-only", path: "test/m07-execution-loop.test.ts",
+					name: "fresh reviewer" },
 				{ role: "fresh-workspace-store", path: "test/manual-private-campaign.test.ts",
 					name: "fresh state" },
 				{ role: "host-execution-confinement", path: "test/manual-private-campaign.test.ts",
@@ -493,7 +509,9 @@ async function interruptedFixture(t: TestContext) {
 				{ role: "encrypted-output-provider", path: "test/private-campaign-workflow-manifest.test.ts",
 					name: "ciphertext upload" }] },
 		grant: { mode: "fresh-only-confined-effects", oldResultUse: "untrusted-no-replay-no-adoption",
-			m07Tools: "factory-confined-local", modelSessions: "read-only",
+			m07BuilderToolGrant: "factory-confined-task-file-writes",
+			objectiveAssessorToolGrant: "read-only", m04ReviewerToolGrant: "read-only",
+			m07ReviewerToolGrant: "read-only",
 			state: "fresh-workspace-empty-store-no-resume", outputTransport: "encrypted-fixed",
 			providerInference: "fixed-configured-provider" } }), { mode: 0o600 });
 	const interruptedRun = { ...run(7003, 3, "completed", interruptedCommit, "cancelled") };
@@ -677,7 +695,7 @@ test("resultless periodic prefix needs exact private source review and prepares 
 		prefixSha256, prefixSequence: 1, terminal, accounting: "unquantified",
 		effects: "unknown-unreconciled", terminationOrigin: "unknown" };
 	const reviewFile = path.join(f.dir, "terminal-prefix-source-review.json");
-	const receipt = { version: 1, kind: "host-reviewed-terminal-prefix-source-capability",
+	const receipt = { version: 2, kind: "host-reviewed-terminal-prefix-source-capability",
 		prior: { interruption, sourceTree: testedTree,
 			priorCheckpointSha256: createHash("sha256")
 				.update(f.bundle["objective-checkpoint.json"]).digest("hex") },
@@ -704,12 +722,36 @@ test("resultless periodic prefix needs exact private source review and prepares 
 					path: "test/private-campaign-observer.test.ts",
 					name: "child has only one-shot inputs" }] },
 		grant: { mode: "fresh-only-confined-effects",
-			oldResultUse: "untrusted-no-replay-no-adoption", m07Tools: "factory-confined-local",
-			assessorAndM04ReviewerSessions: "read-only",
+			oldResultUse: "untrusted-no-replay-no-adoption",
+			m07BuilderToolGrant: "factory-confined-task-file-writes",
+			objectiveAssessorToolGrant: "read-only", m04ReviewerToolGrant: "read-only",
+			m07ReviewerToolGrant: "read-only",
 			state: "fresh-workspace-empty-store-no-resume", outputTransport: "encrypted-fixed",
 			providerInference: "fixed-configured-provider" } };
 	await writeFile(reviewFile, JSON.stringify(receipt), { mode: 0o600 });
 	const input = { ...withoutReview, terminalPrefixSourceReviewPrivateFile: reviewFile };
+	for (const field of ["m07BuilderToolGrant", "objectiveAssessorToolGrant",
+		"m04ReviewerToolGrant", "m07ReviewerToolGrant"] as const) {
+		const missing = structuredClone(receipt);
+		delete (missing.grant as Record<string, unknown>)[field];
+		await writeFile(reviewFile, JSON.stringify(missing), { mode: 0o600 });
+		await assert.rejects(prepareAuthenticatedResumeRequest({ ...input, readOnly: true }),
+			/terminal-prefix-source-review-invalid/);
+		const weaker = structuredClone(receipt);
+		(weaker.grant as Record<string, unknown>)[field] = "unrestricted-write";
+		await writeFile(reviewFile, JSON.stringify(weaker), { mode: 0o600 });
+		await assert.rejects(prepareAuthenticatedResumeRequest({ ...input, readOnly: true }),
+			/terminal-prefix-source-review-invalid/);
+	}
+	await writeFile(reviewFile, JSON.stringify({ ...receipt, version: 1,
+		grant: { mode: "fresh-only-confined-effects",
+			oldResultUse: "untrusted-no-replay-no-adoption", m07Tools: "factory-confined-local",
+			assessorAndM04ReviewerSessions: "read-only",
+			state: "fresh-workspace-empty-store-no-resume", outputTransport: "encrypted-fixed",
+			providerInference: "fixed-configured-provider" } }), { mode: 0o600 });
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...input, readOnly: true }),
+		/terminal-prefix-source-review-invalid/);
+	await writeFile(reviewFile, JSON.stringify(receipt), { mode: 0o600 });
 	const planned = await prepareAuthenticatedResumeRequest({ ...input, readOnly: true });
 	assert.equal(planned.decision.kind, "dispatch");
 	if (planned.decision.kind !== "dispatch") return;
@@ -771,7 +813,8 @@ test("resultless periodic prefix needs exact private source review and prepares 
 	await writeFile(reviewFile, JSON.stringify(spoof), { mode: 0o600 });
 	await assert.rejects(prepareAuthenticatedResumeRequest({ ...input, readOnly: true }),
 		/terminal-prefix-source-review-invalid/);
-	for (const role of ["trusted-artifact-runtime-parent",
+	for (const role of ["m07-builder-confined-writes", "objective-assessor-read-only",
+		"m04-reviewer-read-only", "m07-reviewer-read-only", "trusted-artifact-runtime-parent",
 		"child-runtime-credential-exclusion"]) {
 		const incomplete = structuredClone(receipt);
 		incomplete.review.codeEvidenceRefs = incomplete.review.codeEvidenceRefs

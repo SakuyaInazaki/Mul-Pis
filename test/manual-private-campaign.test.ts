@@ -925,6 +925,69 @@ test("a real fork with no accepted M07 winner cannot unlock a fulfilled follow-o
 	assert.equal(offlineChecks.firstM07Accepted(true, "fulfilled"), true);
 });
 
+test("failed promotion keeps selected bytes while exact archived attempt bytes reach the next task input", async t => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-source-binding-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const selected = Buffer.from("// selected source\n");
+	const attempted = Buffer.from("// newer unselected source\n");
+	const selectedFile = path.join(root, "selected.cpp");
+	const attemptFile = path.join(root, "iteration-1-candidate.cpp");
+	const inputFile = path.join(root, "next-task-input.cpp");
+	await writeFile(selectedFile, selected);
+	await writeFile(attemptFile, attempted);
+	assert.equal(offlineChecks.chooseDurableFollowOnCandidate(true, true, true,
+		{ state: "measured", medianRatio: 1.04, minRatio: 0.90 }, "complete"), false);
+	const archived = await offlineChecks.boundedArchivedTaskInput(attemptFile);
+	assert.equal(archived?.sha256, createHash("sha256").update(attempted).digest("hex"));
+	assert.equal((await offlineChecks.stageBoundedTaskInput(attemptFile, inputFile,
+		archived!.sha256)).status, "ready");
+	assert.deepEqual(await readFile(inputFile), attempted);
+	assert.deepEqual(await readFile(selectedFile), selected);
+	await writeFile(attemptFile, "// tampered source\n");
+	assert.equal((await offlineChecks.stageBoundedTaskInput(attemptFile,
+		path.join(root, "tampered-input.cpp"), archived!.sha256)).status, "digest-mismatch");
+	assert.equal((await offlineChecks.stageBoundedTaskInput(path.join(root, "missing.cpp"),
+		path.join(root, "missing-input.cpp"), archived!.sha256)).status, "missing");
+	for (const member of ["chosen-verification.json", "chosen-archive.json", "selected-plan.json"]) {
+		const source = path.join(root, member);
+		const expected = `{"member":"${member}","status":"frozen"}\n`;
+		await writeFile(source, expected);
+		await writeFile(source, expected.replace("frozen", "changed"));
+		const outcome = await offlineChecks.stageBoundedTaskInput(source,
+			path.join(root, `${member}.input`), createHash("sha256").update(expected).digest("hex"));
+		assert.deepEqual(outcome, { status: "digest-mismatch", cause: "digest" }, member);
+	}
+});
+
+test("source handoff retains safe IO causes and fails closed when essential private diagnostic cannot be saved", async t => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-source-diagnostic-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const source = path.join(root, "source.cpp");
+	const output = path.join(root, "input.cpp");
+	const bytes = Buffer.from("// source\n");
+	const fakeStat = async () => ({ isFile: () => true, isSymbolicLink: () => false, size: bytes.length });
+	for (const errno of ["EACCES", "ENOSPC"] as const) {
+		const outcome = await offlineChecks.stageBoundedTaskInput(source, output, undefined, {
+			stat: fakeStat, read: async () => bytes,
+			write: async () => { throw Object.assign(new Error("private details"), { code: errno }); } });
+		assert.deepEqual(outcome, { status: "io-error", cause: "os", errno });
+		let nextModelPrompt = 0;
+		await assert.rejects(offlineChecks.writeTaskSourceDiagnostic(root, 1, 2,
+			"chosen-unselected-candidate.cpp", "a".repeat(64), outcome,
+			async () => { throw Object.assign(new Error("private sink detail"), { code: errno }); })
+			.then(() => { nextModelPrompt++; }), error =>
+				error instanceof Error && error.message.includes(`writerErrno=${errno}`) &&
+				!error.message.includes("private sink detail"));
+		assert.equal(nextModelPrompt, 0);
+	}
+	const optional = await offlineChecks.stageBoundedTaskInput(source, output, undefined, {
+		stat: fakeStat, read: async () => bytes,
+		write: async () => { throw Object.assign(new Error("observer only"), { code: "ENOSPC" }); } });
+	assert.equal(optional.status, "io-error");
+	assert.equal((await rm(output, { force: true })) ?? undefined, undefined,
+		"an optional observation can be omitted without writing an essential diagnostic");
+});
+
 test("controller rejection after ready host pass remains repairable until actual acceptance", () => {
 	const rejected = { status: "rejected", loopStopReason: "ready", review: { failures: ["invalid lesson delta"] } };
 	const base = { winner: false, stopped: false, aborted: false, rejected,

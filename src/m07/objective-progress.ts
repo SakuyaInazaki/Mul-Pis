@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { copyFile, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { openBoundedSession, type EvidenceBindingV1 } from "../context/boundary.ts";
 import type { SessionRunner, SessionSpec } from "../runner/types.ts";
 import type { DeepSeekRequestViolation } from "../runner/deepseek-request-contract.ts";
@@ -14,7 +15,7 @@ import { mergeGroundedAssessmentDelta, validateGroundedAssessment, validatePrior
 	GroundingSpanError, GroundingFieldError,
 	type GroundedAssessmentDelta, type GroundedAssessmentProposal,
 	type GroundedIssue, type GroundingContext, type GroundingSourceKind,
-	type GroundingSpan } from "./assessor-grounding.ts";
+	type GroundingSpan, type TaskSourceBindingV1 } from "./assessor-grounding.ts";
 
 const MAX_EVIDENCE_BYTES = 1_000_000;
 const safeAdapterId = (value: unknown): value is string => typeof value === "string" && /^[a-z][a-z0-9._/-]{0,95}$/.test(value);
@@ -44,6 +45,8 @@ export interface ObjectiveNextTaskV1 {
 	addresses: string[];
 	/** Opaque caller-registered capability ID. Legacy serialized adapter IDs remain readable. */
 	adapterScope: string;
+	/** Host-validated live input choice; absent in historical checkpoints. */
+	sourceBinding?: TaskSourceBindingV1;
 }
 
 export interface ObjectiveCapabilityV1 {
@@ -545,7 +548,8 @@ function parseAssessment(text: string, contract: OriginalObjectiveContractV1, ev
 					priorGroundingIndex ? "$.groundedAssessmentDelta.nextTask.obligationIds" :
 						"$.groundedAssessment.nextTask.obligationIds");
 			nextTask = { objective: groundedTask.objective,
-				addresses: [...groundedTask.obligationIds], adapterScope: groundedTask.adapterScope };
+				addresses: [...groundedTask.obligationIds], adapterScope: groundedTask.adapterScope,
+				...(groundedTask.sourceBinding ? { sourceBinding: groundedTask.sourceBinding } : {}) };
 		}
 	} else if (raw.nextTask !== undefined) {
 		if (!raw.nextTask || typeof raw.nextTask !== "object" || Array.isArray(raw.nextTask))
@@ -662,7 +666,12 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		legacyOpenDetails: string[]; previousIssues?: GroundedIssue[];
 		newEvidenceSourceIds?: string[];
 		capabilityLocators?: Record<string, GroundingSpan>;
+		taskSourceBindings?: GroundingContext["taskSourceBindings"];
 		priorGroundingIndex?: { indexName: string; partNames: string[] } };
+	/** Inspect and stage only host-frozen task inputs before any M07 dispatch. */
+	prepareNextTask?: (task: ObjectiveNextTaskV1) => Promise<
+		{ status: "ready" } | { status: "missing" | "digest-mismatch" | "io-error" |
+			"selected-evidence-unavailable" }>;
 	recordAssessment?: (assessment: NonNullable<ObjectiveProgressV1["assessment"]>) => Promise<void>;
 	/** Durable control facts only; never substitutes for evidence reading or a valid verdict. */
 	recordRepairState?: (state: WorkflowRepairStateV1) => Promise<void>;
@@ -764,7 +773,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 	preSessionStage = "source-registry";
 	if (groundingPolicy && (materials.some(item => ["original-objective.json", "current-user-overrides"].includes(item.name)) ||
 		Object.keys(groundingPolicy.sourceKinds).length !== materials.length ||
-		materials.some(item => !["user-instruction", "supplied-task", "selected-evidence", "host-capability",
+		materials.some(item => !["user-instruction", "supplied-task", "selected-evidence", "unselected-evidence", "host-capability",
 			"host-control"]
 			.includes(groundingPolicy.sourceKinds[item.name])) ||
 		(groundingPolicy.newEvidenceSourceIds ?? []).some(name => !materials.some(item => item.name === name &&
@@ -779,6 +788,72 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			!materials.some(item => item.name === locator.sourceId && locator.endLine <= item.lineCount)))
 		throw new HarnessError("m07.objective", "unavailable capability locator does not match frozen host evidence");
 	const priorIndex = groundingPolicy?.priorGroundingIndex;
+	const sourceBindings = groundingPolicy?.taskSourceBindings;
+	if (sourceBindings) {
+		const digest = /^[0-9a-f]{64}$/;
+		const attempts = sourceBindings.attempts;
+		if (!Array.isArray(attempts))
+			throw new HarnessError("m07.objective", "task source catalog does not match frozen host evidence");
+		const IDs = attempts.map(item => item.kind === "unselected-attempt" ? item.attemptId : "");
+		const evidence = sourceBindings.attemptEvidence ?? {};
+		const byName = new Map(materials.map(item => [item.name, item]));
+		if (sourceBindings.selected.kind !== "selected" || !digest.test(sourceBindings.selected.sourceSha256) ||
+			byName.get("candidate.cpp")?.digest !== sourceBindings.selected.sourceSha256 ||
+			!sourceBindings.catalogSha256 || !digest.test(sourceBindings.catalogSha256) ||
+			byName.get("task-source-bindings.json")?.digest !== sourceBindings.catalogSha256 ||
+			IDs.some(id => !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(id)) ||
+			new Set(IDs).size !== IDs.length ||
+			Object.keys(evidence).length !== attempts.length ||
+			attempts.some(item => item.kind !== "unselected-attempt" ||
+				!digest.test(item.sourceSha256) || item.planSha256 !== undefined && !digest.test(item.planSha256) ||
+				!evidence[item.attemptId] ||
+				byName.get(evidence[item.attemptId]!.source)?.digest !== item.sourceSha256 ||
+				(item.planSha256 === undefined) !== (evidence[item.attemptId]!.plan === undefined) ||
+				item.planSha256 !== undefined &&
+					byName.get(evidence[item.attemptId]!.plan!)?.digest !== item.planSha256 ||
+				!byName.has(evidence[item.attemptId]!.verification) ||
+				!byName.has(evidence[item.attemptId]!.archive)))
+			throw new HarnessError("m07.objective", "task source catalog does not match frozen host evidence");
+		try {
+			const index = JSON.parse(await readFile(byName.get("task-source-bindings.json")!.file, "utf8"));
+			if (index.version !== 1 || index.kind !== "task-source-bindings-index" ||
+				index.scope !== "current-run-host-archive-only" ||
+				!isDeepStrictEqual(index.selected, sourceBindings.selected) ||
+				!Array.isArray(index.parts) || index.parts.some((part: { name?: string }) =>
+					!part || typeof part.name !== "string" || !byName.has(part.name)) ||
+				!index.attemptLocator ||
+				Object.keys(index.attemptLocator).length !== attempts.length)
+				throw new Error("invalid index");
+			const partTexts = new Map<string, string[]>();
+			for (const item of attempts) {
+				if (item.kind !== "unselected-attempt") throw new Error("invalid attempt");
+				const named = evidence[item.attemptId]!;
+				const part = named.catalogPart;
+				if (!part || !/^task-source-binding-part-[1-9][0-9]*\.jsonl$/.test(part) ||
+					!byName.has(part) || !index.parts.some((row: { name: string }) => row.name === part) ||
+					!Number.isSafeInteger(named.catalogLine) ||
+						named.catalogLine! < 1 || !named.catalogRowSha256 ||
+						!digest.test(named.catalogRowSha256) ||
+						!isDeepStrictEqual(index.attemptLocator[item.attemptId],
+							{ part, line: named.catalogLine, rowSha256: named.catalogRowSha256 }))
+						throw new Error("invalid locator");
+				if (!partTexts.has(part)) partTexts.set(part,
+					(await readFile(byName.get(part)!.file, "utf8")).trimEnd().split("\n"));
+				const row = partTexts.get(part)![named.catalogLine! - 1];
+				if (!row || createHash("sha256").update(row).digest("hex") !== named.catalogRowSha256)
+					throw new Error("invalid row digest");
+				const parsed = JSON.parse(row);
+				if (!isDeepStrictEqual(parsed.sourceBinding, item) ||
+					!isDeepStrictEqual(parsed.evidenceNames, {
+						source: named.source, verification: named.verification,
+						archive: named.archive, ...(named.plan ? { plan: named.plan } : {}) }) ||
+						parsed.authority !== "unselected-development-evidence")
+					throw new Error("invalid row identity");
+			}
+		} catch {
+			throw new HarnessError("m07.objective", "task source catalog locator differs from frozen host evidence");
+		}
+	}
 	if (priorIndex && (!materials.some(item => item.name === priorIndex.indexName) ||
 		evidenceAccess[priorIndex.indexName] === "retrievable" ||
 		priorIndex.partNames.some(name => name === priorIndex.indexName ||
@@ -835,6 +910,8 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				{ available: item.available }])),
 			...(groundingPolicy.capabilityLocators ?
 				{ capabilityLocators: structuredClone(groundingPolicy.capabilityLocators) } : {}),
+			...(groundingPolicy.taskSourceBindings ?
+				{ taskSourceBindings: structuredClone(groundingPolicy.taskSourceBindings) } : {}),
 			legacyOpenDetails: groundingPolicy.legacyOpenDetails,
 			previousIssues: groundingPolicy.previousIssues ?? [],
 			newEvidenceSourceIds: groundingPolicy.newEvidenceSourceIds ?? [],
@@ -851,7 +928,9 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		const groundedIssueSchema = "Each new issue has base fields {id,claim,status:'open'|'resolved',classification,sourceRefs:[{sourceId,startLine,endLine}],implication}. Add only the named fields for its classification: claimAtRisk for necessary-verification, optionalBasis for optional-method, or blockedScope and capabilityRef:{sourceId,startLine,endLine} for physical-capability-gap. Do not add a proof field. A resolved issue also needs resolution:{explanation,evidenceRefs:[{sourceId,startLine,endLine}]}.";
 		const physicalGapRule = `For physical-capability-gap, blockedScope must be ONE exact unavailable registered scope ID, never a prose description or combined list: ${JSON.stringify(unavailableScopeIds)}. Cite that scope's own host-capability row with capabilityRef; if no registered ID matches a suspected limitation, do not invent a physical gap or claim the limitation is measured.`;
 		const priorResolutionSchema = "Each delta resolution is {id,priorRef:{sourceId,startLine,endLine},explanation,evidenceRefs:[{sourceId,startLine,endLine}]}. Copy priorRef exactly from the required prior-grounding-index locator: sourceId is that issue's partName and both line numbers equal its line. Do not use a 'part:line' string. Each evidenceRefs item is a separate span object for newly frozen evidence actually read in this session; do not use string shorthand or infer read credit from a path.";
-		const groundedTaskSchema = "For continue, write ONE task in groundedAssessment.nextTask or groundedAssessmentDelta.nextTask: {objective:string,obligationIds:[original obligation ID strings],addresses:[OPEN grounded issue ID strings],adapterScope:one available registered scope,decisionChangingHypothesis:string,expectedEvidence:string,sourceRefs:[{sourceId,startLine,endLine}]}. objective, hypothesis and expectedEvidence must be nonempty. obligationIds must be contained in unresolvedObligations. Omit top-level nextTask; the host derives its full task record from this grounded task after validation. A legacy top-level nextTask is accepted only when its objective and any supplied addresses/scope exactly match the grounded task. For blocked or fulfilled, omit both nextTask objects.";
+		const groundedTaskSchema = "For continue, write ONE task in groundedAssessment.nextTask or groundedAssessmentDelta.nextTask: {objective:string,obligationIds:[original obligation ID strings],addresses:[OPEN grounded issue ID strings],adapterScope:one available registered scope,decisionChangingHypothesis:string,expectedEvidence:string,sourceRefs:[{sourceId,startLine,endLine}]" +
+			(groundingPolicy?.taskSourceBindings ? ",sourceBinding:one exact available entry from task-source-bindings.json" : "") +
+			"}. objective, hypothesis and expectedEvidence must be nonempty. obligationIds must be contained in unresolvedObligations. When binding an unselected attempt, read its listed frozen source, verification, archive and plan completely in this session, and cite source, verification and archive spans in nextTask.sourceRefs. An unselected input is development evidence only and cannot become selected by citation. Omit top-level nextTask; the host derives its full task record from this grounded task after validation. A legacy top-level nextTask is accepted only when its objective and any supplied addresses/scope exactly match the grounded task. For blocked or fulfilled, omit both nextTask objects.";
 		const groundedReferenceSchema = "Top-level evidenceRefs is an array of exact frozen FILE NAME STRINGS, not source-span objects; it may be [] for continue or blocked. Grounded sourceRefs, resolution evidenceRefs and deliverableReady evidenceRefs are arrays of {sourceId,startLine,endLine} objects for cited lines actually returned in this session. Never put a span object in top-level evidenceRefs or a filename string in a grounded span array.";
 		const deliverableSchema = "Optional deliverableReady is an OBJECT {status:'proposed',ready:boolean,rationale:string,evidenceRefs:[{sourceId,startLine,endLine}],remainingIssueIds:[open issue ID strings]}. List every still-open issue ID in remainingIssueIds. A bare boolean is invalid; omit the field if you have no evidence-backed finding. This proposal never closes the open-ended mission.";
 		const responseSchema = priorIndex ? [
@@ -1013,8 +1092,14 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				...(validationFailure.validationDetail ?
 					[`Host validator detail: ${validationFailure.validationDetail}.`] : [])] : [];
 			const spans = citedSpans(parsed);
+			const chosenBinding = parsed?.nextTask?.sourceBinding;
+			const chosenAttemptEvidence = chosenBinding?.kind === "unselected-attempt" ?
+				groundingPolicy?.taskSourceBindings?.attemptEvidence?.[chosenBinding.attemptId] : undefined;
 			const fullRequired = new Set(["original-objective.json", ...requiredMaterials.map(item => item.name),
-				...(parsed?.evidenceRefs ?? [])]);
+				...(parsed?.evidenceRefs ?? []),
+				...(chosenAttemptEvidence ? [chosenAttemptEvidence.source,
+					chosenAttemptEvidence.verification, chosenAttemptEvidence.archive,
+					...(chosenAttemptEvidence.plan ? [chosenAttemptEvidence.plan] : [])] : [])]);
 			const fileCoverage = readMaterials.map(item => {
 				const read = coverage(item.name, item.lineCount);
 				const requiredSpans = spans.filter(ref => ref.sourceId === item.name);
@@ -1225,6 +1310,24 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			if (supported) {
 				const admission = currentObjectiveAdmission(input.advanceAdmission());
 				if (admission !== "admitted") return { assessment, stopReason: admission };
+				const preparedSource = await input.prepareNextTask?.(proposed);
+				if (preparedSource?.status === "io-error" ||
+					preparedSource?.status === "selected-evidence-unavailable")
+					return { assessment, stopReason: "assessment-evidence-suspended" };
+				if (preparedSource && preparedSource.status !== "ready") {
+					await recordRejectedReply({ code: "m07.objective-control",
+						message: preparedSource.status === "missing" ?
+							"task source is missing after freezing" : "task source digest changed after freezing",
+						path: "$.groundedAssessment.nextTask.sourceBinding" });
+					const repair = await repairFailure("unavailable-task-source", {
+						binding: proposed.sourceBinding ?? null, reason: preparedSource.status });
+					if (repair === "fresh-context") continue;
+					if (repair !== "same-session-feedback") return { assessment, stopReason: repair };
+					request = ["The proposed sourceBinding cannot be dispatched because its frozen bytes are unavailable or changed.",
+						"Read task-source-bindings.json again. Choose an available exact selected or unselected attempt binding and reassess the unchanged original objective. This reply did not dispatch any task.",
+						...responseSchema].join("\n\n");
+					continue;
+				}
 				const advanced = await input.advance(proposed);
 				return { assessment, advanced, stopReason: "objective-reassessment-pending" };
 			}

@@ -27,9 +27,9 @@ import { pendingActionIdentity, planMissionContinuation, type CurrentDerivedActi
 	type LinkedUnknownDeliveryV1 } from "./mission-supervisor.ts";
 import { validWorkflowRepairState, type WorkflowRepairStateV1 } from "./repair-liveness.ts";
 import { readReviewedInterruptedSourceCapability,
-	type VerifiedInterruptedSourceCapabilityV1 } from "./interrupted-source-review.ts";
+	type VerifiedInterruptedSourceCapabilityV2 } from "./interrupted-source-review.ts";
 import { readReviewedTerminalPrefixSourceCapability,
-	type VerifiedTerminalPrefixSourceCapabilityV1 } from "./terminal-prefix-source-review.ts";
+	type VerifiedTerminalPrefixSourceCapabilityV2 } from "./terminal-prefix-source-review.ts";
 import { readReviewedResultOnlyRepairState, isVerifiedResultOnlyRepairState,
 	type VerifiedResultOnlyRepairStateV1 } from "./result-only-repair-review.ts";
 import { isVerifiedUnobservedControlSourceCapability,
@@ -740,8 +740,8 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 	const binding = await readLiveTestedControlBinding(input.githubToken,
 		input.authenticatedHostRead?.request ?? input.request,
 		input.authenticatedHostRead?.kind === "authenticated-host-github-read");
-	let interruptedSourceReview: VerifiedInterruptedSourceCapabilityV1 | undefined;
-	let terminalPrefixSourceReview: VerifiedTerminalPrefixSourceCapabilityV1 | undefined;
+	let interruptedSourceReview: VerifiedInterruptedSourceCapabilityV2 | undefined;
+	let terminalPrefixSourceReview: VerifiedTerminalPrefixSourceCapabilityV2 | undefined;
 	if (terminalInterruption) {
 		const oldCommit = await githubJson(`https://api.github.com/repos/${REPOSITORY}/git/commits/${terminalInterruption.source.commit}`,
 			input.githubToken, input.authenticatedHostRead?.request ?? input.request ?? fetch,

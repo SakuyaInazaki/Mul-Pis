@@ -9,7 +9,7 @@ import { dispatchPlannedResume, pendingActionIdentity, planMissionContinuation,
 	type SupervisorSnapshot } from "../src/runner/mission-supervisor.ts";
 import type { VerifiedWorkflowRepairPlanV1 } from "../src/runner/mission-host-adapter.ts";
 import { readReviewedInterruptedSourceCapability,
-	type InterruptedSourceReviewReceiptV1 } from "../src/runner/interrupted-source-review.ts";
+	type InterruptedSourceReviewReceiptV2 } from "../src/runner/interrupted-source-review.ts";
 
 const tuple = "a".repeat(64);
 const source = { runId: "7002", runAttempt: 1, commit: "b".repeat(40) };
@@ -107,15 +107,16 @@ async function reviewedSource(t: TestContext, state: ReturnType<typeof interrupt
 	const gap = { ...state.terminalInterruption!,
 		...(otherSource ? { source: otherSource } : {}) };
 	const sourceTree = "9".repeat(40);
-	const roles = ["m07-local-tool-confinement", "read-only-model-sessions",
+	const roles = ["m07-builder-confined-writes", "objective-assessor-read-only",
+		"m04-reviewer-read-only", "m07-reviewer-read-only",
 		"fresh-workspace-store", "host-execution-confinement",
 		"encrypted-output-provider"] as const;
 	const codeEvidenceRefs = roles.map((role, index) => ({ role,
 		path: `src/review/role${index}.ts`, symbol: `codeSymbol${index}` }));
 	const testEvidenceRefs = roles.map((role, index) => ({ role,
 		path: `test/role${index}.test.ts`, name: `testName${index}` }));
-	const receipt: InterruptedSourceReviewReceiptV1 = {
-		version: 1, kind: "host-reviewed-interrupted-source-capability",
+	const receipt: InterruptedSourceReviewReceiptV2 = {
+		version: 2, kind: "host-reviewed-interrupted-source-capability",
 		prior: { source: gap.source, sourceTree, priorCarrySource: gap.priorCarrySource,
 			priorCarryEnvelopeSha256: gap.priorCarryEnvelopeSha256,
 			priorCheckpointSha256: state.terminalCarry!.checkpointSha256!,
@@ -123,7 +124,9 @@ async function reviewedSource(t: TestContext, state: ReturnType<typeof interrupt
 		review: { kind: "operator-code-review", conclusion: "approved-for-fresh-only-execution",
 			codeEvidenceRefs, testEvidenceRefs },
 		grant: { mode: "fresh-only-confined-effects", oldResultUse: "untrusted-no-replay-no-adoption",
-			m07Tools: "factory-confined-local", modelSessions: "read-only",
+			m07BuilderToolGrant: "factory-confined-task-file-writes",
+			objectiveAssessorToolGrant: "read-only", m04ReviewerToolGrant: "read-only",
+			m07ReviewerToolGrant: "read-only",
 			state: "fresh-workspace-empty-store-no-resume", outputTransport: "encrypted-fixed",
 			providerInference: "fixed-configured-provider" }
 	};
@@ -185,7 +188,7 @@ test("an interruption review must retain its live brand, exact source and fixed 
 		interruptedSourceReview: { ...reviewed } }), /not verified/);
 	assert.throws(() => planMissionContinuation({ ...base,
 		interruptedSourceReview: { ...reviewed, grant: { ...reviewed.grant,
-			modelSessions: "read-only" } } }), /not verified/);
+			m07BuilderToolGrant: "factory-confined-task-file-writes" } } }), /not verified/);
 	const other = await reviewedSource(t, base, { ...base.terminalInterruption!.source,
 		runId: "7004" });
 	assert.throws(() => planMissionContinuation({ ...base, interruptedSourceReview: other }),

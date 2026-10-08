@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import test, { type TestContext } from "node:test";
 import { assessAndAdvanceOriginalObjective, classifyPendingAction, createOriginalObjective, objectiveProgress,
-	runOriginalObjectiveLoop, writeOriginalObjectiveContract } from "../src/m07/objective-progress.ts";
+	runOriginalObjectiveLoop, writeObjectiveProgress,
+	writeOriginalObjectiveContract } from "../src/m07/objective-progress.ts";
+import { readObjectiveCheckpointFile } from "../src/m07/objective-checkpoint-store.ts";
 import type { CurrentObjectiveStopReason, ModelObjectiveAssessmentV1,
 	ObjectiveNextTaskV1 } from "../src/m07/objective-progress.ts";
 import { FakeSessionRunner, type FakeReply } from "../src/runner/fake.ts";
@@ -13,6 +16,7 @@ import type { WorkflowRepairStateV1 } from "../src/runner/repair-liveness.ts";
 import { Workspace } from "../src/workspace.ts";
 import { HarnessError } from "../src/types.ts";
 import type { GroundedAssessmentProposal } from "../src/m07/assessor-grounding.ts";
+import { offlineChecks } from "../scripts/manual-private-campaign.ts";
 
 const originalInputs: Record<string, string> = {
 	"original-problem.txt": "Original mission allows more than the finite pilot.\n",
@@ -115,6 +119,38 @@ test("checkpoint pending action is optional for old carries and uses the effecti
 	assert.throws(() => objectiveProgress(f.contract, { ...base, pendingAction: {
 		...blocked.continuation.pendingAction!, kind: "fresh-m07-task", humanRequired: true,
 	} }), /safety or human gate is inconsistent/);
+});
+
+test("historical accepted grounded checkpoint reopens byte-exact without a new source binding", async t => {
+	const f = await fixture(t);
+	const span = { sourceId: "prior-research-history.json", startLine: 1, endLine: 1 };
+	const settledIssue = { id: "settled", claim: "A historical claim was resolved",
+		status: "resolved" as const, classification: "necessary-verification" as const,
+		sourceRefs: [span], implication: "Retained as authenticated prior state",
+		claimAtRisk: "A prior claim", resolution: { explanation: "Previously accepted",
+			evidenceRefs: [span] } };
+	const openIssue = { id: "pending", claim: "An original obligation remains open",
+		status: "open" as const, classification: "explicit-requirement" as const,
+		sourceRefs: [{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }],
+		implication: "A later bounded task may change the result" };
+	const oldTask = { objective: "Continue the original goal", obligationIds: ["original-task"],
+		addresses: ["pending"], adapterScope: "two-target-existing",
+		decisionChangingHypothesis: "More evidence may change the answer",
+		expectedEvidence: "A bounded check", sourceRefs: openIssue.sourceRefs };
+	const priorAssessment = { ...assessment("continue"), unresolvedDetails: [openIssue.claim],
+		groundedAssessment: { version: 1 as const, kind: "grounded-assessment-proposal" as const,
+			contractId: f.contract.id, missionStatus: "open" as const,
+			issues: [settledIssue, openIssue], legacyOpenDetails: [], nextTask: oldTask },
+		sessionId: "old-assessor", model: "fake/research", evidenceRead: [], unreadEvidence: [] };
+	const progress = objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [],
+		assessment: priorAssessment, stopReason: "assessment-validation-pending" });
+	const file = path.join(f.root, "objective-checkpoint.json");
+	await writeObjectiveProgress(file, progress);
+	const exact = `${JSON.stringify(progress, null, 2)}\n`;
+	assert.equal(await readObjectiveCheckpointFile(file), exact);
+	const reopened = JSON.parse(await readObjectiveCheckpointFile(file));
+	assert.deepEqual(reopened.assessment.groundedAssessment.issues[0], settledIssue);
+	assert.equal(reopened.assessment.groundedAssessment.nextTask.sourceBinding, undefined);
 });
 
 test("model fulfilled claim cannot erase a failed dispatch or permit replay of its unknown operation", async t => {
@@ -311,6 +347,265 @@ test("fresh assessor reads frozen original inputs and delegates only its valid c
 	assert.equal(f.runRecord.sessions[0].boundary?.intent, "independent-judgment");
 	assert.equal((await f.ws.readRun("M07Objective", f.runRecord.runId)).sessions.length, 1);
 	assert.equal((await readFile(f.contractFile, "utf8")), `${JSON.stringify(f.contract, null, 2)}\n`);
+});
+
+test("missing chosen attempt gets same-session correction while missing selected baseline suspends", async t => {
+	const f = await fixture(t);
+	const reply = assessment("continue");
+	let prompts = 0, prepares = 0, dispatches = 0;
+	const messages: string[] = [];
+	const runner = new FakeSessionRunner(({ message }) => { prompts++; messages.push(message);
+		return { text: JSON.stringify(reply), ...(prompts === 1 ? { readReturns: ranges(f) } : {}) }; });
+	const base = { ...f, runner, persistReceipt: () => f.ws.writeRun(f.runRecord),
+		assessmentAdmission: "admitted" as const, advanceAdmission: () => "admitted" as const,
+		supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { dispatches++; } };
+	const corrected = await assessAndAdvanceOriginalObjective({ ...base,
+		prepareNextTask: async () => ({ status: ++prepares === 1 ? "missing" : "ready" }) });
+	assert.equal(corrected.stopReason, "objective-reassessment-pending");
+	assert.equal(prompts, 2);
+	assert.equal(runner.created.length, 1);
+	assert.equal(dispatches, 1);
+	assert.match(messages[1]!, /cannot be dispatched/);
+	const suspended = await fixture(t);
+	let secondPrompts = 0, secondDispatches = 0;
+	const second = new FakeSessionRunner(() => { secondPrompts++;
+		return { text: JSON.stringify(reply), readReturns: ranges(suspended) }; });
+	const result = await assessAndAdvanceOriginalObjective({ ...suspended, runner: second,
+		persistReceipt: () => suspended.ws.writeRun(suspended.runRecord),
+		assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		supportedTaskScopes: ["two-target-existing"],
+		prepareNextTask: async () => ({ status: "selected-evidence-unavailable" }),
+		advance: async () => { secondDispatches++; } });
+	assert.equal(result.stopReason, "assessment-evidence-suspended");
+	assert.equal(secondPrompts, 1);
+	assert.equal(secondDispatches, 0);
+	const unresolved = Array.from({ length: 5 }, (_, index) => `goal/O00${index + 1}`);
+	const checkpoint = objectiveProgress(suspended.contract, { boundedRuns: [], selectedArtifacts: [],
+		stopReason: result.stopReason, unresolvedOperationIds: unresolved,
+		pendingActionFacts: { unresolvedOperationRefs: unresolved } });
+	assert.deepEqual(checkpoint.continuation.pendingAction?.target?.operationRefs, unresolved);
+	assert.equal(checkpoint.continuation.pendingAction?.safety, "no-replay-until-reconciled");
+});
+
+test("essential task-source diagnostic sink failure prevents another paid assessor turn", async t => {
+	const f = await fixture(t);
+	let prompts = 0, dispatches = 0;
+	const runner = new FakeSessionRunner(() => { prompts++;
+		return { text: JSON.stringify(assessment("continue")), readReturns: ranges(f) }; });
+	await assert.rejects(assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		prepareNextTask: async () => {
+			await offlineChecks.writeTaskSourceDiagnostic(f.root, 1, 1,
+				"selected-verification.json", "a".repeat(64),
+				{ status: "io-error", cause: "os", errno: "EACCES" },
+				async () => { throw Object.assign(new Error("private path detail"), { code: "ENOSPC" }); });
+			return { status: "ready" };
+		},
+		advance: async () => { dispatches++; } }), error =>
+			error instanceof Error && error.message.includes("writerErrno=ENOSPC") &&
+			!error.message.includes("private path detail"));
+	assert.equal(prompts, 1);
+	assert.equal(dispatches, 0);
+});
+
+test("many archived attempts stay on demand while chosen unselected source, feedback and catalog part need full read", async t => {
+	const f = await fixture(t);
+	const hash = (text: string) => createHash("sha256").update(text).digest("hex");
+	const selected = { kind: "selected" as const, sourceSha256: hash(originalInputs["candidate.cpp"]!) };
+	const attempts: Array<{ kind: "unselected-attempt"; attemptId: string; sourceSha256: string;
+		planSha256: string }> = [];
+	const attemptEvidence: Record<string, { source: string; verification: string; archive: string;
+		plan: string; catalogPart: string; catalogLine?: number; catalogRowSha256?: string }> = {};
+	const bodies: Record<string, string> = {};
+	for (let i = 1; i <= 25; i++) {
+		const id = `R${i}:T1`, prefix = `task-attempt-${i}`;
+		const names = { source: `${prefix}-source.cpp`, verification: `${prefix}-verification.json`,
+			archive: `${prefix}-archive.json`, plan: `${prefix}-plan.json`,
+			catalogPart: "task-source-binding-part-1.jsonl" };
+		attemptEvidence[id] = names;
+		bodies[names.source] = `// attempt ${i} line 1\n// attempt ${i} line 2\n`;
+		bodies[names.verification] = `{"passed":true,"attempt":${i}}\n{"feedback":"bounded"}\n`;
+		bodies[names.archive] = `{"task":"${id}","status":"accepted"}\n`;
+		bodies[names.plan] = `{"plan":"${id}"}\n{"scope":"bounded"}\n`;
+		attempts.push({ kind: "unselected-attempt", attemptId: id,
+			sourceSha256: hash(bodies[names.source]!), planSha256: hash(bodies[names.plan]!) });
+	}
+	const catalogRows = attempts.map((item, index) => {
+		const named = attemptEvidence[item.attemptId]!;
+		const row = JSON.stringify({ sourceBinding: item, evidenceNames: {
+			source: named.source, verification: named.verification,
+			archive: named.archive, plan: named.plan },
+			authority: "unselected-development-evidence" });
+		named.catalogLine = index + 1;
+		named.catalogRowSha256 = hash(row);
+		return row;
+	});
+	bodies["task-source-binding-part-1.jsonl"] = catalogRows.join("\n") + "\n";
+	bodies["task-source-bindings.json"] = JSON.stringify({ version: 1,
+		kind: "task-source-bindings-index", scope: "current-run-host-archive-only", selected,
+		parts: [{ name: "task-source-binding-part-1.jsonl", firstAttemptId: "R1:T1",
+			lastAttemptId: "R25:T1" }],
+		attemptLocator: Object.fromEntries(attempts.map(item => [item.attemptId,
+			{ part: attemptEvidence[item.attemptId]!.catalogPart,
+				line: attemptEvidence[item.attemptId]!.catalogLine,
+				rowSha256: attemptEvidence[item.attemptId]!.catalogRowSha256 }])) }) + "\n";
+	for (const [name, body] of Object.entries(bodies)) {
+		const file = path.join(f.root, "source", name);
+		await writeFile(file, body);
+		f.evidence.push({ name, file });
+	}
+	const chosen = attempts[23]!;
+	const names = attemptEvidence[chosen.attemptId]!;
+	const sourceRefs = ["original-problem.txt", names.source, names.verification, names.archive]
+		.map(sourceId => ({ sourceId, startLine: 1, endLine: 1 }));
+	sourceRefs.push({ sourceId: names.catalogPart, startLine: names.catalogLine!,
+		endLine: names.catalogLine! });
+	const reply = { version: 1, decision: "continue", rationale: "An unselected attempt warrants a fresh check.",
+		evidenceRefs: ["candidate.cpp", "verification.json"],
+		unresolvedObligations: ["original-task"], unresolvedDetails: ["The original objective remains open."],
+		groundedAssessment: { version: 1, kind: "grounded-assessment-proposal",
+			contractId: f.contract.id, missionStatus: "open",
+			legacyOpenDetails: [], issues: [{ id: "open-check", claim: "The original objective remains open.",
+				status: "open", classification: "explicit-requirement",
+				sourceRefs: [{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }],
+				implication: "More evidence may change the result." }],
+			nextTask: { objective: "Extend the exact frozen unselected attempt", obligationIds: ["original-task"],
+				addresses: ["open-check"], adapterScope: "two-target-existing",
+				decisionChangingHypothesis: "The revision could improve the selected result.",
+				expectedEvidence: "Fresh independent comparison", sourceRefs, sourceBinding: chosen } } };
+	const fullRead = (name: string): ReadReturnEvent => ({ toolName: "objective_evidence_read",
+		status: "returned", path: name, requested: {}, returned: { kind: "text", startLine: 1,
+			endLine: lines(bodies[name]!), truncated: false }, at: new Date().toISOString() });
+	const requests: string[] = [];
+	const runner = new FakeSessionRunner(({ message }) => {
+		requests.push(message);
+		return { text: JSON.stringify(reply), readReturns: requests.length === 1 ?
+			[...ranges(f), fullRead("task-source-bindings.json"),
+				fullRead(names.source), fullRead(names.verification), fullRead(names.archive),
+				fullRead(names.plan)] :
+			[{ toolName: "objective_evidence_read", status: "returned",
+				path: names.catalogPart, requested: {}, returned: { kind: "text",
+					startLine: names.catalogLine, endLine: names.catalogLine,
+					truncated: false }, at: new Date().toISOString() }] };
+	});
+	let delegated = 0;
+	const staged = path.join(f.root, "chosen-task-input.cpp");
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		evidenceAccess: Object.fromEntries(Object.keys(bodies).map(name => [name,
+			name === "task-source-bindings.json" ? "required" : "retrievable"])) as Record<string, "required" | "retrievable">,
+		groundingPolicy: { require: true, legacyOpenDetails: [], previousIssues: [],
+			sourceKinds: Object.fromEntries(f.evidence.map(item => [item.name,
+				item.name === "task-source-bindings.json" || item.name === names.catalogPart ? "host-control" :
+				item.name.startsWith("task-attempt-") ? "unselected-evidence" :
+				["candidate.cpp", "verification.json"].includes(item.name) ? "selected-evidence" :
+				"supplied-task"])),
+			taskSourceBindings: { selected, attempts, attemptEvidence,
+				catalogSha256: hash(bodies["task-source-bindings.json"]!) } },
+		capabilities: [{ scope: "two-target-existing", available: true,
+			description: "Synthetic bounded adapter", limits: [] }],
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		prepareNextTask: async task => {
+			assert.deepEqual(task.sourceBinding, chosen);
+			await writeFile(staged, await readFile(path.join(f.evidenceRoot, names.source)));
+			assert.equal(hash((await readFile(staged)).toString()), chosen.sourceSha256);
+			return { status: "ready" };
+		},
+		advance: async task => { delegated++;
+			assert.deepEqual(task.sourceBinding, chosen);
+			assert.deepEqual(await readFile(staged), Buffer.from(bodies[names.source]!));
+			assert.deepEqual(await readFile(path.join(f.root, "source", "candidate.cpp")),
+				Buffer.from(originalInputs["candidate.cpp"]!));
+		} });
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.equal(delegated, 1);
+	assert.equal(requests.length, 2);
+	assert.match(requests[1]!, /task-source-binding-part-1\.jsonl/);
+	assert.doesNotMatch(requests[1]!, new RegExp(`${names.plan.replaceAll(".", "\\.")}: objective_evidence_read`),
+		"the chosen plan was fully read; only its catalog row needs correction");
+	assert.ok(!result.assessment?.evidenceRead.includes("task-attempt-1-source.cpp"),
+		"unselected alternatives stay retrievable without forced reading");
+});
+
+test("production source catalog admits zero and one attempt but rejects spoofed locator before a prompt", async t => {
+	for (const count of [0, 1]) {
+		const f = await fixture(t);
+		const hash = (bytes: string) => createHash("sha256").update(bytes).digest("hex");
+		const selected = { kind: "selected" as const,
+			sourceSha256: hash(originalInputs["candidate.cpp"]!) };
+		const attempts: Array<{ binding: { kind: "unselected-attempt"; attemptId: string;
+			sourceSha256: string; planSha256: string }; source: { file: string; sha256: string };
+			verification: { file: string; sha256: string }; archive: { file: string; sha256: string };
+			plan: { file: string; sha256: string } }> = [];
+		const evidenceNames: Record<string, { source: string; verification: string;
+			archive: string; plan: string; catalogPart?: string;
+			catalogLine?: number; catalogRowSha256?: string }> = {};
+		if (count) {
+			const files = { source: ["task-attempt-1-source.cpp", "// unselected\n"],
+				verification: ["task-attempt-1-verification.json", "{\"passed\":true}\n"],
+				archive: ["task-attempt-1-archive.json", "{\"review\":\"accepted\"}\n"],
+				plan: ["task-attempt-1-plan.json", "{\"case\":1}\n"] } as const;
+			const paths: Record<string, { file: string; sha256: string }> = {};
+			for (const [kind, [name, body]] of Object.entries(files)) {
+				const file = path.join(f.root, "source", name);
+				await writeFile(file, body);
+				f.evidence.push({ name, file });
+				paths[kind] = { file, sha256: hash(body) };
+			}
+			const binding = { kind: "unselected-attempt" as const, attemptId: "R1:T1",
+				sourceSha256: paths.source!.sha256, planSha256: paths.plan!.sha256 };
+			attempts.push({ binding, source: paths.source!, verification: paths.verification!,
+				archive: paths.archive!, plan: paths.plan! });
+			evidenceNames[binding.attemptId] = {
+				source: files.source[0], verification: files.verification[0],
+				archive: files.archive[0], plan: files.plan[0] };
+		}
+		const dir = path.join(f.root, "catalog");
+		await mkdir(dir);
+		const catalog = await offlineChecks.writeTaskSourceCatalog(dir, selected, attempts,
+			evidenceNames);
+		for (const item of catalog.evidence) f.evidence.push(item);
+		for (const [id, locator] of Object.entries(catalog.attemptLocator))
+			Object.assign(evidenceNames[id]!, { catalogPart: locator.part,
+				catalogLine: locator.line, catalogRowSha256: locator.rowSha256 });
+		const index = JSON.parse(await readFile(catalog.evidence[0]!.file, "utf8"));
+		assert.equal(index.kind, "task-source-bindings-index");
+		assert.equal(index.parts.length, count);
+		let prompts = 0;
+		const run = async (evidence: typeof evidenceNames) => {
+			const runner = new FakeSessionRunner(() => { prompts++;
+				return { text: "invalid", readReturns: [...ranges(f), {
+					toolName: "objective_evidence_read", status: "returned",
+					path: "task-source-bindings.json", requested: {},
+					returned: { kind: "text", startLine: 1, endLine: 1, truncated: false },
+					at: new Date().toISOString() }] }; });
+			return assessAndAdvanceOriginalObjective({ ...f, runner,
+				evidenceAccess: Object.fromEntries(catalog.evidence.slice(1).map(item =>
+					[item.name, "retrievable" as const])),
+				groundingPolicy: { require: true, legacyOpenDetails: [], previousIssues: [],
+					sourceKinds: Object.fromEntries(f.evidence.map(item => [item.name,
+						item.name === "task-source-bindings.json" || item.name.includes("binding-part") ?
+							"host-control" : item.name.startsWith("task-attempt-") ?
+							"unselected-evidence" : ["candidate.cpp", "verification.json"].includes(item.name) ?
+							"selected-evidence" : "supplied-task"])),
+					taskSourceBindings: { selected, attempts: attempts.map(item => item.binding),
+						attemptEvidence: evidence,
+						catalogSha256: hash(await readFile(catalog.evidence[0]!.file, "utf8")) } },
+				persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+				advanceAdmission: () => "cancelled", supportedTaskScopes: ["two-target-existing"],
+				advance: async () => { throw new Error("invalid reply cannot dispatch"); } });
+		};
+		assert.equal((await run(evidenceNames)).stopReason, "cancelled");
+		assert.equal(prompts, 1);
+		if (count) {
+			const spoof = structuredClone(evidenceNames);
+			spoof["R1:T1"]!.catalogPart = "task-source-binding-part-999.jsonl";
+			await assert.rejects(run(spoof), /catalog locator differs/);
+			assert.equal(prompts, 1, "spoofed part is rejected before a paid assessor prompt");
+		}
+	}
 });
 
 const groundingKinds = {
