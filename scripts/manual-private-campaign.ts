@@ -17,6 +17,8 @@ import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { createM07Controller } from "../src/m07/controller.ts";
 import { runMeasuredEvidenceHandoff } from "../src/m07/evidence-finalization.ts";
 import { stagePriorObjectiveCheckpointEvidence } from "../src/m07/prior-objective-checkpoint-evidence.ts";
+import { readObjectiveCheckpointFile, readObjectiveCheckpointTransport,
+	writeObjectiveCheckpointFile } from "../src/m07/objective-checkpoint-store.ts";
 import { assessAndAdvanceOriginalObjective, createOriginalObjective, isCurrentObjectiveStopReason,
 	objectiveProgress, runOriginalObjectiveLoop,
 	writeObjectiveProgress, writeOriginalObjectiveContract } from "../src/m07/objective-progress.ts";
@@ -33,21 +35,24 @@ import { appendPrivateAssessorDiagnostic, PrivateAssessorDiagnosticError, privat
 import type { SessionCheckpoint, SessionHandle, SessionRunner, SessionSpec,
 	TransportFailureDiagnostic } from "../src/runner/types.ts";
 import { DeepSeekCampaignBudget, campaignSessionEffectId } from "../src/runner/deepseek-campaign.ts";
-import type { HostEffectPrefixObservationV1,
-	IncrementalCheckpointEvent } from "../src/runner/incremental-private-checkpoint.ts";
+import { IncrementalCheckpointError, type HostEffectPrefixObservationV1,
+	type IncrementalCheckpointEvent } from "../src/runner/incremental-private-checkpoint.ts";
 import { locateHistoryEntries } from "../src/runner/research-history-locator.ts";
+import { reconcileHistoricalResearchEntries, restoreHistoricalArchivePredecessor,
+	retainHistoricalArchiveEntry } from "../src/runner/research-history-reconciliation.ts";
 import { verifyDeepSeekCnyBilling, type NativeCnyPricingProfile } from "../src/runner/deepseek-cny-pricing.ts";
 import { verifyDeepSeekProviderOutputLimit,
 	type DeepSeekProviderOutputLimit } from "../src/runner/deepseek-provider-limits.ts";
 import { MISSION_ID, MISSION_REPOSITORY, PRIVATE_CONTINUATION_FILE_KEYS } from
 	"../src/runner/signed-mission-ledger.ts";
-import { CARRY_FILE_NAME, authenticatedHistoricalCarryOrigin,
+import { CARRY_FILE_NAME, authenticatedCarryAncestry, authenticatedHistoricalCarryOrigin,
 	authenticatedPendingHistoricalEffectSources, authenticatedSelectedTransitions,
 	authenticatedHostEffectEvidence,
 	authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, downloadCarryArtifact,
 	isAuthenticatedPriorCarryProof, isAuthenticatedPredecessorResearchHistory,
 	openLedgerContinuation,
 	type LedgerContinuation, type PrivateContinuationBundle, type HostEffectReceiptV1,
+	type EmergencyResearchHistoryStep, type PredecessorResearchHistoryUnavailable,
 	type OpaqueExecutedRunGap, type UnobservedControlDelivery } from "../src/runner/ledger-continuation.ts";
 import { reviewPrivateCampaignRestartEffects } from "../src/runner/private-campaign-restart-policy.ts";
 import { sealCampaignCarry, type CampaignCarrySeal } from "../src/runner/emergency-carry.ts";
@@ -233,6 +238,18 @@ function campaignObjectiveProgress(contract: OriginalObjectiveContractV1, inheri
 			...input.pendingActionFacts, unresolvedOperationRefs: unresolvedOperationIds } }) });
 }
 
+/** Project already observed follow-on controllers into every durable objective
+ * snapshot. SelectedTaskId comes only from an earlier host selection decision. */
+function observedFollowOnBoundedRuns(attempts: readonly Record<string, unknown>[]):
+	ObjectiveProgressV1["boundedRuns"] {
+	return attempts.filter(item => typeof item.goalRunId === "string").map(item => ({
+		runId: String(item.goalRunId), outcome: String(item.m07Outcome ?? "unknown"),
+		acceptedTaskIds: item.m07Outcome === "fulfilled" && typeof item.taskId === "string" ?
+			[String(item.taskId)] : [],
+		...(item.candidateSelected === true && item.m07Outcome === "fulfilled" &&
+			typeof item.taskId === "string" ? { selectedTaskId: item.taskId } : {}) }));
+}
+
 /** New live assessments cite frozen materials. Historical free-text details
  * remain visible until grounded, without becoming new mandatory obligations. */
 function assessorGroundingPolicy(evidence: readonly { name: string; file: string }[],
@@ -247,6 +264,7 @@ function assessorGroundingPolicy(evidence: readonly { name: string; file: string
 	return { require: true,
 		sourceKinds: Object.fromEntries(evidence.map(item => [item.name,
 			item.name === "host-capabilities.json" ? "host-capability" :
+			item.name === "prior-incomplete-run-control.json" ? "host-control" :
 			item.name === "original-problem.txt" || /^original-input-[1-9][0-9]*\.txt$/.test(item.name) ?
 				"supplied-task" : "selected-evidence"])) as Record<string, GroundingSourceKind>,
 		legacyOpenDetails: [...(grounded?.legacyOpenDetails ?? prior.continuation.unresolvedDetails)],
@@ -465,6 +483,17 @@ function historicalGapEvidence(facts: AuthenticatedRestartCarryFacts,
 		providerTransportCause: "unavailable in the authenticated prior carry; do not infer an HTTP status or replay an unreceived request",
 		newExecution: "independent fresh workspace and goal only; old task is not resumed or reconciled" };
 }
+function priorIncompleteRunControlSummary(
+	observation: NonNullable<LedgerContinuation["priorRunControlObservation"]>): Record<string, unknown> {
+	return { version: 1, kind: "authenticated-prior-incomplete-run-control-summary",
+		binding: "latest-authenticated-carry", complete: false, selectionAuthority: false,
+		requestObservation: { total: observation.requestCount,
+			responsesReceived: observation.responseReceivedCount,
+			billingStateUnknown: observation.unknownCount },
+		currentEffectReview: observation.currentEffectReviewPending ? "pending" : "not-marked-pending",
+		goalTaskCensus: "unavailable-in-terminal-carry",
+		scientificOutcome: "unreviewed; absent current-run research files do not imply no work" };
+}
 async function writePrivateJsonOnce(directory: string, name: string, value: unknown): Promise<void> {
 	if (!/^[a-z][a-z0-9-]{0,100}\.json$/.test(name)) fail("invalid private receipt name");
 	const target = path.join(directory, name);
@@ -596,6 +625,9 @@ function campaignObjectiveStop(reason: string | undefined): CurrentObjectiveStop
 function privateExceptionDiagnostic(error: unknown, runtimeKey: string | undefined):
 	{ code: string; category: string; message: string | null } {
 	const raw = error instanceof Error ? error.message : undefined;
+	if (error instanceof IncrementalCheckpointError)
+		return { code: error.code, category: "incremental-checkpoint",
+			message: "private incremental checkpoint is incomplete" };
 	const candidateCode = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
 	const code = typeof candidateCode === "string" && /^[A-Za-z][A-Za-z0-9._-]{0,63}$/.test(candidateCode) &&
 		privateFailureMessage(candidateCode, runtimeKey) === candidateCode ?
@@ -630,6 +662,19 @@ function observeObjectiveAssessmentFailure(iteration: number, stage: ObjectiveEx
 }
 function objectiveAssessmentFailureSnapshot(): typeof statusObjectiveAssessmentFailures {
 	return structuredClone(statusObjectiveAssessmentFailures);
+}
+/** An outer process failure must retain earlier private finalizer causes. */
+function terminalFailureStatus(previous: unknown, failure: Record<string, unknown>): Record<string, unknown> {
+	if (!previous || typeof previous !== "object" || Array.isArray(previous)) return failure;
+	const { version: _version, runId: _runId, phase: _phase, budget: _budget,
+		...retained } = previous as Record<string, unknown>;
+	const oldObjective = retained.originalObjective;
+	const newObjective = failure.originalObjective;
+	return { ...retained, ...failure,
+		...(oldObjective && newObjective && typeof oldObjective === "object" &&
+			!Array.isArray(oldObjective) && typeof newObjective === "object" &&
+			!Array.isArray(newObjective) ?
+			{ originalObjective: { ...oldObjective, ...newObjective } } : {}) };
 }
 /** Only literal, host-owned ledger rejection phrases can appear in the private
  * sealing diagnostic. Provider errors, task text and arbitrary Error.message
@@ -1164,7 +1209,9 @@ async function preserveUnsettledGoalCheckpoint(input: {
 	catch { archiveFailure = "unsettled-goal-archive-incomplete"; }
 	const availableArtifacts = await availablePrivateArtifactNames(input.outputDir);
 	let prior: ObjectiveProgressV1 | undefined;
-	try { prior = JSON.parse(await readFile(path.join(input.outputDir, "objective-checkpoint.json"), "utf8")); } catch { /* First attempt has no checkpoint. */ }
+	const priorCheckpointFile = path.join(input.outputDir, "objective-checkpoint.json");
+	if (existsSync(priorCheckpointFile))
+		prior = JSON.parse(await readObjectiveCheckpointFile(priorCheckpointFile));
 	if (prior?.contract.id !== input.contract.id) prior = undefined;
 	const checkpoint = campaignObjectiveProgress(input.contract,
 		prior ? canonicalUnresolvedOperationRefs(prior) : [], {
@@ -1189,7 +1236,8 @@ async function salvageObjectiveCheckpoint(ws: Workspace, outputDir: string,
 		fail("frozen original objective is unavailable during checkpoint salvage");
 	const checkpointFile = path.join(outputDir, "objective-checkpoint.json");
 	let previous: ObjectiveProgressV1 | undefined;
-	try { previous = JSON.parse(await readFile(checkpointFile, "utf8")) as ObjectiveProgressV1; } catch { /* repair missing checkpoint */ }
+	if (existsSync(checkpointFile))
+		previous = JSON.parse(await readObjectiveCheckpointFile(checkpointFile)) as ObjectiveProgressV1;
 	const boundedRuns: ObjectiveProgressV1["boundedRuns"] = [];
 	const unresolvedOperationIds: string[] = [];
 	for (const id of await ws.listRuns("M07")) {
@@ -2190,230 +2238,41 @@ async function stageHistoricalM04RejectionEvidence(input: {
 		...parts.map(item => item.name)];
 }
 
-type HistoricalArchiveVersion = { interpretation?: string; files: Record<string, string> };
-const HISTORICAL_ARCHIVE_ENTRY_KEYS = new Set([
-	"originalContractId", "goalRunId", "taskId", "interpretation", "files", "supersededVersions",
-]);
-
-function assertHistoricalArchiveRevisionShape(entry: Record<string, any>): void {
-	if (!entry || typeof entry !== "object" || Array.isArray(entry) ||
-		Object.keys(entry).some(key => !HISTORICAL_ARCHIVE_ENTRY_KEYS.has(key)))
-		throw new HarnessError("campaign.historical-archive-integrity",
-			"same-task historical archive has unsupported outer metadata");
-}
-
-function historicalArchiveFiles(value: unknown): Record<string, string> {
-	if (!value || typeof value !== "object" || Array.isArray(value))
-		fail("same-task historical archive has no files");
-	const files = value as Record<string, unknown>;
-	for (const [name, content] of Object.entries(files))
-		if (!name || name.includes("/") || name.includes("\\") || typeof content !== "string")
-			fail("same-task historical archive file is invalid");
-	return files as Record<string, string>;
-}
-
-function historicalArchiveVersions(entry: Record<string, any>): HistoricalArchiveVersion[] {
-	if (entry.supersededVersions === undefined) return [];
-	if (!Array.isArray(entry.supersededVersions)) fail("same-task historical versions are invalid");
-	return entry.supersededVersions.map((version: unknown) => {
-		if (!version || typeof version !== "object" || Array.isArray(version) ||
-			!(["files", "files,interpretation"].includes(Object.keys(version).sort().join(","))) ||
-			(Object.hasOwn(version, "interpretation") &&
-				typeof (version as Record<string, unknown>).interpretation !== "string"))
-			fail("same-task historical version is invalid");
-		return { ...(Object.hasOwn(version, "interpretation") ?
-			{ interpretation: (version as HistoricalArchiveVersion).interpretation } : {}),
-			files: historicalArchiveFiles((version as HistoricalArchiveVersion).files) };
-	});
-}
-
-function historicalArchiveSnapshot(entry: Record<string, any>): HistoricalArchiveVersion {
-	if (Object.hasOwn(entry, "interpretation") && typeof entry.interpretation !== "string")
-		fail("same-task historical interpretation is invalid");
-	return { ...(Object.hasOwn(entry, "interpretation") ? { interpretation: entry.interpretation } : {}),
-		files: historicalArchiveFiles(entry.files) };
-}
-
-function sameHistoricalSnapshot(a: HistoricalArchiveVersion, b: HistoricalArchiveVersion): boolean {
-	const aNames = Object.keys(a.files).sort(), bNames = Object.keys(b.files).sort();
-	return a.interpretation === b.interpretation && aNames.length === bNames.length &&
-		aNames.every((name, index) => name === bNames[index] && a.files[name] === b.files[name]);
-}
-
-function historicalArchiveFacts(entry: Record<string, any>, version: HistoricalArchiveVersion) {
-	let archive: Record<string, any>;
-	try { archive = JSON.parse(version.files["workflow-archive.json"]); }
-	catch { return fail("same-task historical archive manifest is invalid"); }
-	if (archive?.version !== 1 || archive.kind !== "m07-private-candidate-archive" ||
-		archive.goalRunId !== entry.goalRunId || archive.taskId !== entry.taskId)
-		fail("same-task historical archive identity differs from its entry");
-	const m04 = archive.m04 ?? { state: "not-run" };
-	const stateRank = { "not-run": 0, failed: 1, completed: 2 }[m04.state as "not-run" | "failed" | "completed"];
-	if (stateRank === undefined || (m04.proposalSubmitted !== undefined && typeof m04.proposalSubmitted !== "boolean") ||
-		(m04.snapshotCreated !== undefined && typeof m04.snapshotCreated !== "boolean"))
-		fail("same-task historical M04 state is invalid");
-	if (version.files["m04-transaction.json"] &&
-		(!m04.transaction || m04.transaction.state === undefined ||
-			typeof m04.transaction.file !== "string" ||
-			!m04.transaction.file.endsWith("m04-transaction.json")))
-		fail("same-task historical M04 transaction is undeclared");
-	return { stateRank, proposal: Number(m04.proposalSubmitted === true), snapshot: Number(m04.snapshotCreated === true),
-		runId: typeof m04.runId === "string" ? m04.runId : undefined,
-		exportComplete: m04.knowledgeExport?.state === "complete",
-		transactionPresent: typeof version.files["m04-transaction.json"] === "string" };
-}
-
-function checkHistoricalArchiveProgression(entry: Record<string, any>, earlier: HistoricalArchiveVersion,
-	later: HistoricalArchiveVersion): void {
-	for (const name of ["candidate.cpp", "verification.json", "experiment-plan.json"])
-		if (earlier.files[name] !== later.files[name]) fail(`same-task historical archives disagree on ${name}`);
-	if (earlier.files["m04-transaction.json"] && later.files["m04-transaction.json"] &&
-		earlier.files["m04-transaction.json"] !== later.files["m04-transaction.json"])
-		fail("same-task historical M04 transaction bytes conflict");
-	const old = historicalArchiveFacts(entry, earlier), next = historicalArchiveFacts(entry, later);
-	if (next.stateRank < old.stateRank || next.proposal < old.proposal || next.snapshot < old.snapshot)
-		fail("same-task historical M04 version rollback or outcomes conflict");
-	if (next.stateRank === old.stateRank && next.proposal === old.proposal && next.snapshot === old.snapshot &&
-		old.runId && next.runId && old.runId !== next.runId)
-		fail("same-task historical M04 run identity conflicts");
-	if (old.transactionPresent && !next.transactionPresent)
-		fail("same-task historical M04 transaction evidence was dropped");
-}
-
-function validateHistoricalArchiveVersions(entry: Record<string, any>): HistoricalArchiveVersion[] {
-	const versions = historicalArchiveVersions(entry);
-	const files = historicalArchiveFiles(entry.files);
-	if (Buffer.byteLength(JSON.stringify(entry), "utf8") > CARRY_LOGICAL_BYTES)
-		fail("same-task historical entry exceeds the physical carry bound");
-	if (!versions.length) return versions;
-	const timeline = [...versions, historicalArchiveSnapshot(entry)];
-	for (let index = 1; index < timeline.length; index++) {
-		if (timeline.slice(0, index).some(prior => sameHistoricalSnapshot(prior, timeline[index]!)))
-			fail("same-task historical version is repeated");
-		checkHistoricalArchiveProgression(entry, timeline[index - 1]!, timeline[index]!);
-	}
-	return versions;
-}
-
-/** Reinsert an authenticated earlier entry without changing the current evidence authority.
- * Authentication and matching against the sealed predecessor are caller obligations. */
-function restoreHistoricalArchivePredecessor(current: Record<string, any>, predecessor: Record<string, any>): Record<string, any> {
-	assertHistoricalArchiveRevisionShape(current);
-	assertHistoricalArchiveRevisionShape(predecessor);
-	const currentVersions = validateHistoricalArchiveVersions(current);
-	const predecessorVersions = validateHistoricalArchiveVersions(predecessor);
-	if (current.goalRunId !== predecessor.goalRunId || current.taskId !== predecessor.taskId ||
-		current.originalContractId !== predecessor.originalContractId ||
-		typeof current.originalContractId !== "string" || typeof current.goalRunId !== "string" ||
-		!/^T\d{3,}$/.test(String(current.taskId)))
-		fail("same-task historical archives disagree on original contract or identity");
-	// Older histories also contain intentionally partial, unselected attempts.
-	// An identical authenticated entry needs no scientific tuple or M04 comparison;
-	// retain it exactly. A changed same-task state still needs those proofs below.
-	if (JSON.stringify(current) === JSON.stringify(predecessor)) return current;
-	const currentTimeline = [...currentVersions, historicalArchiveSnapshot(current)];
-	const predecessorTimeline = [...predecessorVersions, historicalArchiveSnapshot(predecessor)];
-	historicalArchiveFacts(current, currentTimeline.at(-1)!);
-	historicalArchiveFacts(predecessor, predecessorTimeline.at(-1)!);
-	for (const name of ["candidate.cpp", "verification.json", "experiment-plan.json"])
-		if (typeof currentTimeline.at(-1)!.files[name] !== "string" ||
-			typeof predecessorTimeline.at(-1)!.files[name] !== "string")
-			fail(`same-task historical archives lack ${name}`);
-	let overlap = 0;
-	for (let length = Math.min(currentTimeline.length, predecessorTimeline.length); length > 0; length--)
-		if (predecessorTimeline.slice(-length).every((version, index) =>
-			sameHistoricalSnapshot(version, currentTimeline[index]!))) { overlap = length; break; }
-	const merged = [...predecessorTimeline, ...currentTimeline.slice(overlap)];
-	if (!overlap && merged.some((version, index) => merged.slice(0, index).some(prior =>
-		sameHistoricalSnapshot(prior, version)))) fail("same-task historical version order conflicts");
-	for (let index = 1; index < merged.length; index++)
-		checkHistoricalArchiveProgression(current, merged[index - 1]!, merged[index]!);
-	const result = { ...current, supersededVersions: merged.slice(0, -1) };
-	validateHistoricalArchiveVersions(result);
-	return result;
-}
-
-/** One goal/task has one current state, with exact older revisions kept as untrusted data. */
-function retainHistoricalArchiveEntry(entries: Array<Record<string, any>>, incoming: Record<string, any>): void {
-	const incomingVersions = validateHistoricalArchiveVersions(incoming);
-	const index = entries.findIndex(entry => entry.goalRunId === incoming.goalRunId && entry.taskId === incoming.taskId);
-	if (index < 0) { entries.push(incoming); return; }
-	const existing = entries[index];
-	const oldVersions = validateHistoricalArchiveVersions(existing);
-	if (existing.originalContractId !== incoming.originalContractId)
-		fail("same-task historical archives disagree on original contract");
-	const oldCurrent = historicalArchiveSnapshot(existing), newCurrent = historicalArchiveSnapshot(incoming);
-	for (const name of ["candidate.cpp", "verification.json", "experiment-plan.json"])
-		if (oldCurrent.files[name] !== newCurrent.files[name]) fail(`same-task historical archives disagree on ${name}`);
-	if (oldCurrent.files["m04-transaction.json"] && newCurrent.files["m04-transaction.json"] &&
-		oldCurrent.files["m04-transaction.json"] !== newCurrent.files["m04-transaction.json"])
-		fail("same-task historical M04 transaction bytes conflict");
-	const old = historicalArchiveFacts(existing, oldCurrent), next = historicalArchiveFacts(incoming, newCurrent);
-	const dominates = (a: typeof old, b: typeof old) => a.stateRank >= b.stateRank &&
-		a.proposal >= b.proposal && a.snapshot >= b.snapshot;
-	if (!dominates(old, next) && !dominates(next, old)) fail("same-task historical M04 outcomes conflict");
-	const oldStrict = old.stateRank > next.stateRank || old.proposal > next.proposal || old.snapshot > next.snapshot;
-	const nextStrict = next.stateRank > old.stateRank || next.proposal > old.proposal || next.snapshot > old.snapshot;
-	if (!oldStrict && !nextStrict && old.runId && next.runId && old.runId !== next.runId)
-		fail("same-task historical M04 run identity conflicts");
-	if (nextStrict && old.transactionPresent && !next.transactionPresent)
-		fail("same-task historical M04 transaction evidence was dropped");
-	const replace = nextStrict || (!oldStrict && !nextStrict && ((!old.runId && next.runId) ||
-		(!old.exportComplete && next.exportComplete) ||
-		(!old.transactionPresent && next.transactionPresent)));
-	if (!replace) {
-		if (incomingVersions.length) {
-			const oldTimeline = [...oldVersions, oldCurrent], newTimeline = [...incomingVersions, newCurrent];
-			if (newTimeline.length > oldTimeline.length || !newTimeline.every((version, index) =>
-				sameHistoricalSnapshot(version, oldTimeline[index]!)))
-				fail("same-task historical version rollback or divergence");
-		}
-		return;
-	}
-	assertHistoricalArchiveRevisionShape(existing);
-	assertHistoricalArchiveRevisionShape(incoming);
-	const oldTimeline = [...oldVersions, oldCurrent];
-	if (incomingVersions.length && (incomingVersions.length !== oldTimeline.length ||
-		!incomingVersions.every((version, index) => sameHistoricalSnapshot(version, oldTimeline[index]!))))
-		fail("same-task historical version rollback or divergence");
-	const replacement = { ...incoming, supersededVersions: [...oldTimeline] };
-	validateHistoricalArchiveVersions(replacement);
-	entries[index] = replacement;
-}
-
-/** Reconcile plaintext entries only after the caller has authenticated both carry sources. */
-function reconcileHistoricalResearchEntries(currentEntries: unknown[], olderEntries: unknown[]):
-	Array<Record<string, any>> {
-	const entries = currentEntries.map(entry => structuredClone(entry)) as Array<Record<string, any>>;
-	const identities = new Set<string>();
-	for (const entry of entries) {
-		if (!entry || typeof entry !== "object" || typeof entry.goalRunId !== "string" ||
-			typeof entry.taskId !== "string") fail("authenticated current history entry identity is invalid");
-		const identity = JSON.stringify([entry.goalRunId, entry.taskId]);
-		if (identities.has(identity)) fail("authenticated current history entry identity is repeated");
-		identities.add(identity);
-	}
-	const oldIdentities = new Set<string>();
-	for (const oldEntry of olderEntries) {
-		if (!oldEntry || typeof oldEntry !== "object")
-			fail("authenticated predecessor history entry identity is invalid");
-		const oldRow = oldEntry as Record<string, any>;
-		if (typeof oldRow.goalRunId !== "string" || typeof oldRow.taskId !== "string")
-			fail("authenticated predecessor history entry identity is invalid");
-		const identity = JSON.stringify([oldRow.goalRunId, oldRow.taskId]);
-		if (oldIdentities.has(identity)) fail("authenticated predecessor history entry identity is repeated");
-		oldIdentities.add(identity);
-		const index = entries.findIndex(entry =>
-			entry.goalRunId === oldRow.goalRunId && entry.taskId === oldRow.taskId);
-		if (index < 0) entries.push(structuredClone(oldRow));
-		else entries[index] = restoreHistoricalArchivePredecessor(entries[index]!, oldRow);
-	}
-	return entries;
+function selectedTransitionPreimageTarget(
+	ancestry: ReturnType<typeof authenticatedCarryAncestry>,
+	transitions: ReturnType<typeof authenticatedSelectedTransitions>):
+	{ source: any; envelopeSha256: string } | undefined {
+	const latest = transitions?.at(-1);
+	if (!latest || !ancestry) return undefined;
+	const index = ancestry.findIndex(row => row.envelopeSha256 === latest.envelopeSha256 &&
+		row.source.runId === latest.source.runId &&
+		row.source.runAttempt === latest.source.runAttempt &&
+		row.source.commit === latest.source.commit);
+	if (index < 0) fail("selected transition source is missing from authenticated carry ancestry");
+	if (index === 0) return undefined;
+	const parent = ancestry[index - 1]!;
+	if (parent.envelopeSha256 !== latest.priorEnvelopeSha256)
+		fail("selected transition parent differs from authenticated carry ancestry");
+	return parent;
 }
 
 /** Upgrade a legacy host history from an AEAD-bound predecessor when available.
  * A reconciled marker ends artifact dependence. An unverified marker retains
  * exact missing ancestry and remains eligible for a later read-only retry. */
+const historicalRecoveryProofs = new WeakMap<PrivateContinuationBundle, {
+	originalBundle: PrivateContinuationBundle;
+	steps: EmergencyResearchHistoryStep[];
+	unavailable?: PredecessorResearchHistoryUnavailable;
+}>();
+function verifiedEmergencyResearchHistory(ledger: LedgerContinuation,
+	bundle: PrivateContinuationBundle) {
+	const recovery = historicalRecoveryProofs.get(bundle);
+	if (!recovery) return undefined;
+	const finalHistoryText = bundle["research-history.json"];
+	if (finalHistoryText === undefined)
+		fail("verified historical recovery has no research history");
+	return ledger.attestEmergencyRestoredResearchHistory({ ...recovery, finalHistoryText });
+}
 async function recoverAuthenticatedHistoricalVersions(ledger: LedgerContinuation,
 	currentBundle: PrivateContinuationBundle): Promise<PrivateContinuationBundle> {
 	const currentText = currentBundle["research-history.json"];
@@ -2426,23 +2285,47 @@ async function recoverAuthenticatedHistoricalVersions(ledger: LedgerContinuation
 	if (current?.version !== 1 || current.kind !== "untrusted-version-bound-research-history" ||
 		!Array.isArray(current.entries)) fail("authenticated current research history is invalid");
 	const marker = current.predecessorHistoryReconciliation;
-	let retryTarget: { source: any; envelopeSha256: string } | undefined;
+	const ancestry = authenticatedCarryAncestry(ledger.priorCarryProof, currentBundle);
+	if (!ancestry?.length || ancestry.at(-1)?.envelopeSha256 !== ledger.priorCarryProof.envelopeSha256)
+		fail("authenticated predecessor history ancestry is unavailable");
+	const transitions = authenticatedSelectedTransitions(ledger.priorCarryProof, currentBundle);
+	const selectedTransitionsSha256 = sha256(JSON.stringify(transitions ?? []));
+	let startIndex = ancestry.length - 2;
 	if (marker !== undefined) {
 		if (!marker || typeof marker !== "object" || Array.isArray(marker) ||
 			Object.keys(marker).sort().join(",") !==
-				(marker.kind === "historical-completeness-unverified" ?
-					"envelopeSha256,kind,reason,source,version" : "envelopeSha256,kind,source,version") ||
-			marker.version !== 1 || !["authenticated-predecessor-history-reconciled",
+				(marker.version === 2 ?
+					(marker.kind === "historical-completeness-unverified" ?
+						"entriesSha256,envelopeSha256,kind,reason,selectedTransitionsSha256,source,version" :
+						"entriesSha256,envelopeSha256,kind,selectedTransitionsSha256,source,version") :
+					(marker.kind === "historical-completeness-unverified" ?
+						"envelopeSha256,kind,reason,source,version" :
+						"envelopeSha256,kind,source,version")) ||
+			![1, 2].includes(marker.version) || !["authenticated-predecessor-history-reconciled",
 				"historical-completeness-unverified"].includes(marker.kind) ||
+			(marker.version === 2 && (typeof marker.entriesSha256 !== "string" ||
+				!(/^[0-9a-f]{64}$/).test(marker.entriesSha256) ||
+				typeof marker.selectedTransitionsSha256 !== "string" ||
+				!(/^[0-9a-f]{64}$/).test(marker.selectedTransitionsSha256))) ||
 			(marker.kind === "historical-completeness-unverified" &&
 				!["ambiguous-upgrade", "artifact-not-observed", "artifact-expired"].includes(marker.reason)) ||
 			!authenticatedPriorCarryBindsAncestor(ledger.priorCarryProof, marker.source,
 				marker.envelopeSha256))
 			fail("authenticated predecessor history reconciliation marker is invalid");
-		if (marker.kind === "authenticated-predecessor-history-reconciled") return currentBundle;
-		retryTarget = { source: marker.source, envelopeSha256: marker.envelopeSha256 };
+		const markerIndex = ancestry.findIndex(row => row.envelopeSha256 === marker.envelopeSha256 &&
+			row.source.runId === marker.source.runId && row.source.runAttempt === marker.source.runAttempt &&
+			row.source.commit === marker.source.commit);
+		if (markerIndex < 0) fail("authenticated predecessor history marker is outside carry ancestry");
+		if (marker.version === 2 && marker.entriesSha256 === sha256(JSON.stringify(current.entries)) &&
+			marker.selectedTransitionsSha256 === selectedTransitionsSha256) {
+			if (marker.kind === "authenticated-predecessor-history-reconciled") {
+				startIndex = markerIndex - 1;
+			} else startIndex = markerIndex;
+		}
 	}
-	const transitions = authenticatedSelectedTransitions(ledger.priorCarryProof, currentBundle);
+	const selectedPreimage = selectedTransitionPreimageTarget(
+		ancestry, transitions);
+	if (startIndex < 0) return currentBundle;
 	const latestSource = ledger.priorCarryProof.source;
 	const currentSelection = transitions?.at(-1)?.source;
 	const currentSelectionChanged = currentSelection?.runId === latestSource.runId &&
@@ -2465,51 +2348,67 @@ async function recoverAuthenticatedHistoricalVersions(ledger: LedgerContinuation
 	// These are possibility checks, never proof of an overwrite. An inherited
 	// M04-final archive alone cannot show whether this particular run upgraded
 	// that entry. Record the uncertainty without requiring an older artifact.
-	if (!retryTarget && !currentSelectionChanged && !potentiallyUpgradedHistory)
+	if (marker === undefined && !currentSelectionChanged && !selectedPreimage && !potentiallyUpgradedHistory)
 		return currentBundle;
-	const predecessor = await ledger.recoverImmediatePredecessorResearchHistory(retryTarget);
-	if (predecessor.kind === "predecessor-research-history-unavailable") {
-		if (predecessor.reason === "no-predecessor")
-			return currentBundle;
-		if (predecessor.reason === "history-absent") {
+	let lastChecked: (typeof ancestry)[number] | undefined;
+	const verifiedSteps: EmergencyResearchHistoryStep[] = [];
+	for (let index = startIndex; index >= 0; index--) {
+		const target = ancestry[index]!;
+		const predecessor = await ledger.recoverImmediatePredecessorResearchHistory(target);
+		if (predecessor.kind === "predecessor-research-history-unavailable") {
+			if (predecessor.reason === "no-predecessor") break;
 			if (!predecessor.predecessor ||
+				predecessor.predecessor.envelopeSha256 !== target.envelopeSha256 ||
 				!authenticatedPriorCarryBindsAncestor(ledger.priorCarryProof,
 					predecessor.predecessor.source, predecessor.predecessor.envelopeSha256))
-				fail("authenticated empty predecessor history receipt is invalid");
-			return { ...currentBundle, "research-history.json": JSON.stringify({ ...current,
-				predecessorHistoryReconciliation: { version: 1,
-					kind: "authenticated-predecessor-history-reconciled",
-					source: predecessor.predecessor.source,
-					envelopeSha256: predecessor.predecessor.envelopeSha256 } }) };
+				fail("authenticated predecessor history availability proof is invalid");
+			if (predecessor.reason === "history-absent") {
+				verifiedSteps.push({ absent: predecessor });
+				continue;
+			}
+			if (predecessor.reason !== "artifact-not-observed" && predecessor.reason !== "artifact-expired")
+				fail("authenticated predecessor history availability proof is invalid");
+			const uncertain = { ...current, predecessorHistoryReconciliation: { version: 2,
+				kind: "historical-completeness-unverified", source: target.source,
+				envelopeSha256: target.envelopeSha256, reason: predecessor.reason,
+				entriesSha256: sha256(JSON.stringify(current.entries)), selectedTransitionsSha256 } };
+			const text = JSON.stringify(uncertain);
+			if (Buffer.byteLength(text, "utf8") > CARRY_LOGICAL_BYTES)
+				fail("recovered research history exceeds the physical carry bound");
+			const result = { ...currentBundle, "research-history.json": text };
+			historicalRecoveryProofs.set(result, { originalBundle: currentBundle,
+				steps: verifiedSteps, unavailable: predecessor });
+			return result;
 		}
-		if (!["artifact-not-observed", "artifact-expired"].includes(predecessor.reason) ||
-			!predecessor.predecessor ||
-			!authenticatedPriorCarryBindsAncestor(ledger.priorCarryProof,
-				predecessor.predecessor.source, predecessor.predecessor.envelopeSha256))
-			fail("authenticated predecessor history availability proof is invalid");
-		const uncertain = { ...current, predecessorHistoryReconciliation: { version: 1,
-			kind: "historical-completeness-unverified", source: predecessor.predecessor.source,
-			envelopeSha256: predecessor.predecessor.envelopeSha256,
-			reason: predecessor.reason } };
-		return { ...currentBundle, "research-history.json": JSON.stringify(uncertain) };
+		if (!isAuthenticatedPredecessorResearchHistory(predecessor) || predecessor.selectionAuthority !== false ||
+			predecessor.envelopeSha256 !== target.envelopeSha256 ||
+			!authenticatedPriorCarryBindsAncestor(ledger.priorCarryProof, predecessor.source,
+				predecessor.envelopeSha256))
+			fail("predecessor research history lacks a live authenticated source");
+		let older: Record<string, any>;
+		try { older = JSON.parse(predecessor.text) as Record<string, any>; }
+		catch { return fail("authenticated predecessor research history is invalid JSON"); }
+		if (older?.version !== 1 || older.kind !== "untrusted-version-bound-research-history" ||
+			!Array.isArray(older.entries)) fail("authenticated predecessor research history is invalid");
+		current = { ...current, entries: reconcileHistoricalResearchEntries(current.entries, older.entries) };
+		lastChecked = target;
+		const stepText = JSON.stringify(current);
+		if (Buffer.byteLength(stepText, "utf8") > CARRY_LOGICAL_BYTES)
+			fail("recovered research history exceeds the physical carry bound");
+		verifiedSteps.push({ predecessor, resultingHistoryText: stepText });
 	}
-	if (!isAuthenticatedPredecessorResearchHistory(predecessor) || predecessor.selectionAuthority !== false ||
-		!authenticatedPriorCarryBindsAncestor(ledger.priorCarryProof, predecessor.source,
-			predecessor.envelopeSha256))
-		fail("predecessor research history lacks a live authenticated source");
-	let older: Record<string, any>;
-	try { older = JSON.parse(predecessor.text) as Record<string, any>; }
-	catch { return fail("authenticated predecessor research history is invalid JSON"); }
-	if (older?.version !== 1 || older.kind !== "untrusted-version-bound-research-history" ||
-		!Array.isArray(older.entries)) fail("authenticated predecessor research history is invalid");
-	const entries = reconcileHistoricalResearchEntries(current.entries, older.entries);
-	const recovered = { ...current, entries, predecessorHistoryReconciliation: { version: 1,
-		kind: "authenticated-predecessor-history-reconciled",
-		source: predecessor.source, envelopeSha256: predecessor.envelopeSha256 } };
+	if (!lastChecked) return currentBundle;
+	const recovered = { ...current, predecessorHistoryReconciliation: { version: 2,
+		kind: "authenticated-predecessor-history-reconciled", source: lastChecked.source,
+		envelopeSha256: lastChecked.envelopeSha256,
+		entriesSha256: sha256(JSON.stringify(current.entries)), selectedTransitionsSha256 } };
 	const text = JSON.stringify(recovered);
 	if (Buffer.byteLength(text, "utf8") > CARRY_LOGICAL_BYTES)
 		fail("recovered research history exceeds the physical carry bound");
-	return { ...currentBundle, "research-history.json": text };
+	const result = { ...currentBundle, "research-history.json": text };
+	if (verifiedSteps.length) historicalRecoveryProofs.set(result, {
+		originalBundle: currentBundle, steps: verifiedSteps });
+	return result;
 }
 
 /** Keep selected evidence as one coherent tuple, never combine a new failed source with an old acceptance. */
@@ -2518,6 +2417,10 @@ async function collectContinuationBundle(directory: string, prior?: PrivateConti
 	for (const name of PRIVATE_CONTINUATION_FILE_KEYS) {
 		const file = path.join(directory, name);
 		if (!existsSync(file)) continue;
+		if (name === "objective-checkpoint.json") {
+			current[name] = (await readObjectiveCheckpointTransport(file)).text;
+			continue;
+		}
 		const info = await lstat(file);
 		if (!info.isFile() || info.isSymbolicLink() ||
 			info.size > (name === "research-history.json" ? CARRY_LOGICAL_BYTES : 4 * 1024 * 1024))
@@ -2595,6 +2498,12 @@ async function collectContinuationBundle(directory: string, prior?: PrivateConti
 				files });
 		}
 	}
+	// A marker binds the exact historical entries it covered. New current-run
+	// archives retain all restored bytes but cannot inherit that old frontier.
+	if (history.predecessorHistoryReconciliation?.version === 2 &&
+		history.predecessorHistoryReconciliation.entriesSha256 !==
+			sha256(JSON.stringify(history.entries)))
+		delete history.predecessorHistoryReconciliation;
 	if (history.entries.length) selected["research-history.json"] = JSON.stringify(history);
 	for (const name of ["original-objective.json", "objective-checkpoint.json", "objective-assessment-receipts.json",
 		"independent-restart-quarantine.json", "independent-restart-goal-binding.json",
@@ -2779,7 +2688,7 @@ async function main() {
 		audit = budget.requestAccountingAuditSnapshot()): Promise<void> => {
 		let objectiveCheckpointJson: string | undefined;
 		if (prefixObjectiveCheckpointFile) {
-			try { objectiveCheckpointJson = await readFile(prefixObjectiveCheckpointFile, "utf8"); }
+			try { objectiveCheckpointJson = await readObjectiveCheckpointFile(prefixObjectiveCheckpointFile); }
 			catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 			}
@@ -2873,6 +2782,16 @@ async function main() {
 				interpretation: "Host-observed transport metadata only; an unreceived assistant response leaves billing and operation outcome unresolved. Do not replay the old request or treat HTTP status as a scientific verdict. An unknown reason class leaves the provider cause unavailable.",
 			}, null, 2)}\n`, { mode: 0o600 });
 			priorSeedInputs.push("objective-seeds/prior-transport-observation.json");
+		}
+		const priorRunControl = missionLedger.priorRunControlObservation;
+		const priorRunControlPath = priorRunControl &&
+			(priorRunControl.requestCount > 0 || priorRunControl.currentEffectReviewPending) ?
+			path.join(priorSeedDir, "prior-incomplete-run-control.json") : undefined;
+		if (priorRunControl && priorRunControlPath) {
+			await writeFile(priorRunControlPath,
+				`${JSON.stringify(priorIncompleteRunControlSummary(priorRunControl), null, 2)}\n`,
+				{ mode: 0o600 });
+			priorSeedInputs.push("objective-seeds/prior-incomplete-run-control.json");
 		}
 		const historicalM04Index = missionLedger.priorCarryProof ? historicalM04EvidenceIndex({
 			proof: missionLedger.priorCarryProof, bundle: previousBundle }) : undefined;
@@ -3522,6 +3441,8 @@ async function main() {
 			]);
 			const priorEvidence = [
 				{ name: "host-capabilities.json", file: capabilityFile },
+				...(priorRunControlPath ? [{ name: "prior-incomplete-run-control.json",
+					file: priorRunControlPath }] : []),
 				...(restartReservation ? [{ name: "prior-history-gap.json",
 					file: path.join(priorSeedDir, "prior-history-gap.json") }] : []),
 				...(historySeed?.evidence ?? []),
@@ -4043,6 +3964,8 @@ async function main() {
 					objectiveExceptionStage = "source-registry-build";
 					const evidence = [
 						{ name: "host-capabilities.json", file: capabilityFile },
+						...(priorRunControlPath ? [{ name: "prior-incomplete-run-control.json",
+							file: priorRunControlPath }] : []),
 						{ name: "original-problem.txt", file: ws.problemFile },
 						...found.files.map((name, index) => ({ name: `original-input-${index + 1}.txt`,
 							file: path.join(ws.rawDir, name) })),
@@ -4100,7 +4023,8 @@ async function main() {
 								{ boundedRuns: [...previousCheckpoint.boundedRuns, ...importBoundedRuns, ...rejectedGoalOutcomes,
 									{ runId: runId!, outcome: finished.outcome ?? "unknown",
 									acceptedTaskIds: finished.tasks.filter(item => item.status === "accepted").map(item => item.taskId),
-									...(firstGoalReady ? { selectedTaskId: selectedTask.taskId } : {}) }],
+									...(firstGoalReady ? { selectedTaskId: selectedTask.taskId } : {}) },
+									...observedFollowOnBoundedRuns(followOnAttempts)],
 									selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json",
 										...(selectedRegisteredPlan ? ["experiment-plan.json"] : [])],
 									assessment, assessmentHistory, stopReason: "assessment-validation-pending" }));
@@ -4451,11 +4375,7 @@ async function main() {
 				{ runId: runId!, outcome: finished.outcome ?? "unknown",
 				acceptedTaskIds: finished.tasks.filter(item => item.status === "accepted").map(item => item.taskId),
 				...(firstGoalReady ? { selectedTaskId: selectedTask.taskId } : {}) },
-				...followOnAttempts.filter(item => typeof item.goalRunId === "string").map(item => ({
-					runId: String(item.goalRunId), outcome: String(item.m07Outcome ?? "unknown"),
-					acceptedTaskIds: item.m07Outcome === "fulfilled" && typeof item.taskId === "string" ?
-						[String(item.taskId)] : [],
-					...(item.candidateSelected === true ? { selectedTaskId: String(item.taskId) } : {}) }))];
+				...observedFollowOnBoundedRuns(followOnAttempts)];
 			const objectiveCheckpoint = campaignObjectiveProgress(originalObjective,
 				historicalUnresolvedOperationIds, { boundedRuns,
 				selectedArtifacts: finalCandidateAvailable ? selectedArtifactNames : previousCheckpoint.selectedArtifacts,
@@ -4528,8 +4448,8 @@ async function main() {
 			// Fresh preflight files still travel in the encrypted result, not as a
 			// change to the selected research checkpoint.
 			if (noNewResearchEffect && missionLedger.priorPrivateBundle?.["objective-checkpoint.json"])
-				await writeFile(path.join(outputDir, "objective-checkpoint.json"),
-					missionLedger.priorPrivateBundle["objective-checkpoint.json"], { mode: 0o600 });
+				await writeObjectiveCheckpointFile(path.join(outputDir, "objective-checkpoint.json"),
+					missionLedger.priorPrivateBundle["objective-checkpoint.json"]);
 			else await salvageObjectiveCheckpoint(workspace, outputDir,
 				budget.snapshot().stopReason, campaignCancelled);
 			await recordIncrementalPrefix("control-observed");
@@ -4540,7 +4460,8 @@ async function main() {
 			const statusFile = path.join(outputDir, "campaign-status.json");
 			if (existsSync(statusFile)) {
 				const status = JSON.parse(await readFile(statusFile, "utf8")) as Record<string, any>;
-				const checkpoint = JSON.parse(await readFile(path.join(outputDir, "objective-checkpoint.json"), "utf8")) as ObjectiveProgressV1;
+				const checkpoint = JSON.parse(await readObjectiveCheckpointFile(path.join(outputDir,
+					"objective-checkpoint.json"))) as ObjectiveProgressV1;
 				if (status.originalObjective?.checkpointFile === "objective-checkpoint.json" &&
 					(status.originalObjective.stopReason !== checkpoint.stopReason ||
 						status.originalObjective.outcome !== checkpoint.objectiveOutcome))
@@ -4626,7 +4547,13 @@ async function main() {
 			}
 			const sealed = sealCampaignCarry({
 				sealCurrent: input => {
-					try { return missionLedger.sealCurrent(input); }
+					try {
+						const recoveredHistory = historicalEvidenceBundle?.["research-history.json"];
+						const receipt = recoveredHistory !== undefined &&
+							input.privateBundle?.["research-history.json"] === recoveredHistory ?
+							verifiedEmergencyResearchHistory(missionLedger, historicalEvidenceBundle!) : undefined;
+						return missionLedger.sealCurrent(input, receipt);
+					}
 					catch (error) {
 						normalSealFailed = true;
 						normalSealFailure = error;
@@ -4635,7 +4562,17 @@ async function main() {
 					}
 				},
 				sealEmergencyCurrent: (input, reason) => {
-					try { return missionLedger.sealEmergencyCurrent(input, reason); }
+					try {
+						const receipt = historicalEvidenceBundle &&
+							verifiedEmergencyResearchHistory(missionLedger, historicalEvidenceBundle);
+						if (!receipt) return missionLedger.sealEmergencyCurrent(input, reason);
+						const recoveredHistory = historicalEvidenceBundle!["research-history.json"];
+						if (recoveredHistory === undefined)
+							fail("verified historical recovery has no research history");
+						return missionLedger.sealEmergencyCurrent({ ...input,
+							privateBundle: { ...input.privateBundle,
+								"research-history.json": recoveredHistory } }, reason, receipt);
+					}
 					catch (error) {
 						emergencySealFailed = true;
 						emergencySealFailure = error;
@@ -4721,6 +4658,8 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	appendRestartReservation, appendRestartGoalBinding,
 	privateFailureMessage, privateProviderErrorField, privateExceptionDiagnostic, privateSealDiagnostic,
 	privateExceptionCauseChain, observeObjectiveAssessmentFailure, objectiveAssessmentFailureSnapshot,
+	terminalFailureStatus,
+	priorIncompleteRunControlSummary,
 	privateCollectionDiagnostic, privateSealOptions, privateEmergencyStatusDiagnostics,
 	recordFinalizationFailure,
 	writeSealedCarryFiles,
@@ -4742,6 +4681,7 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	salvageObjectiveCheckpoint, collectContinuationBundle, collectorFailureBundle,
 	retainHistoricalArchiveEntry, restoreHistoricalArchivePredecessor, reconcileHistoricalResearchEntries,
 	privateM04TransactionFacts, retainFailedM04Transaction, failedM04StopReason,
+	observedFollowOnBoundedRuns,
 	retainM04TransactionOnDiagnosticFailure,
 	buildHostEffectReceipt, observeTransport,
 	unresolvedGoalControl, campaignObjectiveProgress, observedTransportActionFacts,
@@ -4751,6 +4691,7 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	observedUnavailableCapabilities, frozenCapabilityLocators, OBJECTIVE_SUPPORTED_TASK_SCOPES,
 	stagePriorGroundingRecords,
 	recoverAuthenticatedHistoricalVersions,
+	verifiedEmergencyResearchHistory,
 	canonicalUnresolvedOperationRefs, qualifiedOperationRef, reservedCanonicalOperationRefs,
 	registeredSourceShape, parseRegisteredCheckerOutput, validateContinuationSeed, rangeReadableHistory,
 	stageRangeReadableHistory, stageHistoricalM04RejectionEvidence, sandboxArguments,
@@ -4766,7 +4707,15 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
 			"prior-selected-revalidation", "independent-restart-admission",
 			"source-and-isolation-preflight-passed"].includes(statusPhase);
 		const diagnostic = privateExceptionDiagnostic(error, statusRuntimeKey);
-		try { await saveStatus({ outcome: "incomplete", errorCategory: "campaign-exception",
+		try {
+			let previous: unknown;
+			try {
+				const file = path.join(statusOutputDir ?? "", "campaign-status.json");
+				const info = await lstat(file);
+				if (info.isFile() && !info.isSymbolicLink() && info.size <= 64 * 1024 * 1024)
+					previous = JSON.parse(await readFile(file, "utf8"));
+			} catch { /* Current typed failure remains available if older status is unreadable. */ }
+			await saveStatus(terminalFailureStatus(previous, { outcome: "incomplete", errorCategory: "campaign-exception",
 			...(existsSync(path.join(statusOutputDir ?? "", "objective-checkpoint.json")) ?
 				{ originalObjective: { outcome: "incomplete", checkpointFile: "objective-checkpoint.json" } } : {}),
 			...(preProvider ? { privateDiagnostic: error instanceof SandboxPreflightError
@@ -4779,7 +4728,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
 			...(statusCredentialProbe ? { credentialProbe: statusCredentialProbe } : {}),
 			...(statusAuthSource ? { sdkAuthSource: statusAuthSource } : {}),
 			...(statusSdkAuthMatch !== undefined ? { sdkAuthMatch: statusSdkAuthMatch } : {}),
-			independentValidation: "not-complete" }); } catch { /* transport synthesizes an incomplete status */ }
+			independentValidation: "not-complete" }));
+		} catch { /* transport synthesizes an incomplete status */ }
 		// Never print the model response, source, input paths, credential, or raw provider errors.
 		console.error(JSON.stringify({ status: "private-campaign-failed", category: "campaign-exception" }));
 		process.exitCode = 1;

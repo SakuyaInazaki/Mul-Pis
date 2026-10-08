@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { copyFile, lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { openBoundedSession, type EvidenceBindingV1 } from "../context/boundary.ts";
 import type { SessionRunner, SessionSpec } from "../runner/types.ts";
@@ -8,6 +8,7 @@ import { workflowRepairFingerprint, workflowRepairState, type WorkflowRepairFail
 	type WorkflowRepairStateV1 } from "../runner/repair-liveness.ts";
 import type { StageRunRecord } from "../types.ts";
 import { HarnessError } from "../types.ts";
+import { writeObjectiveCheckpointFile } from "./objective-checkpoint-store.ts";
 import { mergeGroundedAssessmentDelta, validateGroundedAssessment, validatePriorGroundingIndex,
 	isGroundedIssueId,
 	GroundingSpanError, GroundingFieldError,
@@ -763,7 +764,8 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 	preSessionStage = "source-registry";
 	if (groundingPolicy && (materials.some(item => ["original-objective.json", "current-user-overrides"].includes(item.name)) ||
 		Object.keys(groundingPolicy.sourceKinds).length !== materials.length ||
-		materials.some(item => !["user-instruction", "supplied-task", "selected-evidence", "host-capability"]
+		materials.some(item => !["user-instruction", "supplied-task", "selected-evidence", "host-capability",
+			"host-control"]
 			.includes(groundingPolicy.sourceKinds[item.name])) ||
 		(groundingPolicy.newEvidenceSourceIds ?? []).some(name => !materials.some(item => item.name === name &&
 			["selected-evidence", "host-capability"].includes(groundingPolicy.sourceKinds[name])))))
@@ -878,6 +880,9 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			evidenceInstructions ?? "Read all supplied material; the caller identifies the original inputs and the meaning of artifact names.",
 			"# Frozen bounded evidence", "Use objective_evidence_read to read the complete original-objective.json and every listed file below. This list contains the required files. If paginated, read every page including the untruncated end. Required files:",
 			...requiredMaterials.map(item => item.name),
+			...(materials.some(item => item.name === "prior-incomplete-run-control.json") ? [
+				"The prior-incomplete-run-control.json reports only host-observed request counts and unresolved effects from an earlier incomplete run. It does not attest that run's scientific results, select its candidate, or resolve an original obligation. Do not infer absent work or zero charges from missing research files."
+			] : []),
 			...(retrievableMaterials.length ? [
 				"Additional frozen history is retrievable on demand. Its locator grants no scientific evidence credit.",
 				...(retrievableIndex ? ["Read prior-research-history-index.json for historical part filenames and byte order."] : []),
@@ -1265,7 +1270,5 @@ export async function writeOriginalObjectiveContract(file: string, contract: Ori
 
 export async function writeObjectiveProgress(file: string, progress: ObjectiveProgressV1): Promise<void> {
 	if (path.basename(file) !== "objective-checkpoint.json") throw new HarnessError("m07.objective", "objective checkpoint file name is invalid");
-	const temporary = `${file}.${process.pid}.tmp`;
-	await writeFile(temporary, `${JSON.stringify(progress, null, 2)}\n`, { mode: 0o600 });
-	await rename(temporary, file);
+	await writeObjectiveCheckpointFile(file, `${JSON.stringify(progress, null, 2)}\n`);
 }

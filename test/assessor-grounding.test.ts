@@ -176,6 +176,22 @@ test("a prior issue can resolve with cited evidence while retaining its ID and o
 	assert.throws(() => validateGroundedAssessment(candidate, context), /selected result or host observation/);
 });
 
+test("a partial host-control summary cannot resolve a scientific issue", () => {
+	const candidate = proposal();
+	const previous = structuredClone(candidate.issues[1]!);
+	candidate.issues[1]!.status = "resolved";
+	candidate.issues[1]!.resolution = { explanation: "The prior run had observed calls.",
+		evidenceRefs: [ref("prior-incomplete-run-control")] };
+	candidate.nextTask!.addresses = ["deliverable"];
+	candidate.deliverableReady!.remainingIssueIds = ["deliverable", "optional", "equipment"];
+	assert.throws(() => validateGroundedAssessment(candidate, { ...context,
+		previousIssues: [previous],
+		newEvidenceSourceIds: ["prior-incomplete-run-control"],
+		sources: { ...context.sources,
+			"prior-incomplete-run-control": { kind: "host-control", lineCount: 1 } } }),
+		/resolution needs a selected result or host observation/);
+});
+
 test("line-addressed prior grounding reassembles exactly and delta omission retains old records", () => {
 	const oldIssue = proposal().issues[1]!;
 	const legacy = ["old detail"];

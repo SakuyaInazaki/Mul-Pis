@@ -1,6 +1,99 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { offlineChecks } from "../scripts/manual-private-campaign.ts";
+import { readObjectiveCheckpointFile, writeObjectiveCheckpointFile } from
+	"../src/m07/objective-checkpoint-store.ts";
+import { IncrementalCheckpointError } from "../src/runner/incremental-private-checkpoint.ts";
+
+test("campaign collector reads a multipart checkpoint as exact logical JSON", async t => {
+	const dir = await mkdtemp(path.join(os.tmpdir(), "synthetic-objective-collector-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const file = path.join(dir, "objective-checkpoint.json");
+	const checkpoint = `${JSON.stringify({ version: 1, kind: "original-objective-progress",
+		contract: { id: "synthetic-contract" },
+		boundedRuns: [{ runId: "synthetic-goal", selectedTaskId: "T001" }],
+		selectedArtifacts: ["candidate.cpp", "verification.json"],
+		historicalExplanation: "x".repeat(4_458_098) })}\n`;
+	assert.ok(Buffer.byteLength(checkpoint) > 4 * 1024 * 1024);
+	await writeObjectiveCheckpointFile(file, checkpoint);
+	await writeFile(path.join(dir, "candidate.cpp"), "// synthetic source\n");
+	await writeFile(path.join(dir, "verification.json"), JSON.stringify({ version: 1, status: "passed" }));
+	await writeFile(path.join(dir, "workflow-archive.json"), JSON.stringify({ version: 1,
+		kind: "m07-private-candidate-archive", goalRunId: "synthetic-goal", taskId: "T001",
+		controllerEvidence: { reviewStatus: "accepted" } }));
+	const names = await readdir(dir);
+	assert.ok(names.some(name => name.startsWith("objective-checkpoint.part-")));
+	assert.ok((await stat(file)).size < 4 * 1024 * 1024);
+	assert.equal(await readObjectiveCheckpointFile(file), checkpoint);
+	const collected = await offlineChecks.collectContinuationBundle(dir);
+	assert.equal(collected?.["objective-checkpoint.json"], checkpoint,
+		"collector gives selected-tuple validation the logical checkpoint, never the manifest");
+});
+
+test("the exact long typed incremental failure survives private cause reporting", () => {
+	const error = new IncrementalCheckpointError("decoded-schema", "objective-checkpoint-invalid");
+	const diagnostic = offlineChecks.privateExceptionDiagnostic(error, "sk-SYNTHETICCONTROLKEY999");
+	assert.equal(diagnostic.code,
+		"runner.incremental-checkpoint.decoded-schema.objective-checkpoint-invalid");
+	assert.equal(diagnostic.category, "incremental-checkpoint");
+	assert.equal(diagnostic.message, "private incremental checkpoint is incomplete");
+	assert.deepEqual(offlineChecks.privateExceptionCauseChain(error, undefined), [diagnostic]);
+});
+
+test("terminal failure retains prior private collection and accounting causes", () => {
+	const collectionFailure = { stage: "research-continuation-collection",
+		kind: "host-invariant", message: "continuation evidence must be a bounded regular file" };
+	const previous = { version: 1, runId: "prior", phase: "finalizing", budget: { sample: true },
+		collectionFailure, accountingAudit: { requests: [{ requestId: "synthetic-observed" }] },
+		originalObjective: { stopReason: "dispatch-failed", checkpointFile: "objective-checkpoint.json" } };
+	const merged = offlineChecks.terminalFailureStatus(previous, {
+		outcome: "incomplete", exceptionCode:
+			"runner.incremental-checkpoint.decoded-schema.objective-checkpoint-invalid",
+		originalObjective: { outcome: "incomplete", checkpointFile: "objective-checkpoint.json" },
+	});
+	assert.equal(merged.collectionFailure, collectionFailure);
+	assert.equal(merged.accountingAudit, previous.accountingAudit);
+	assert.deepEqual(merged.originalObjective, {
+		stopReason: "dispatch-failed", checkpointFile: "objective-checkpoint.json", outcome: "incomplete" });
+	for (const key of ["version", "runId", "phase", "budget"])
+		assert.equal(Object.hasOwn(merged, key), false, "saveStatus owns its fresh header");
+});
+
+test("each durable assessment can include settled follow-on controller runs", () => {
+	const rows = offlineChecks.observedFollowOnBoundedRuns([
+		{ state: "completed", goalRunId: "synthetic-A", taskId: "T002",
+			m07Outcome: "fulfilled", candidateSelected: true },
+		{ state: "completed", goalRunId: "synthetic-B", taskId: "T001",
+			m07Outcome: "partial", candidateSelected: false },
+		{ state: "failed", goalRunId: "synthetic-C", taskId: "T001",
+			candidateSelected: true },
+		{ state: "not_run" },
+	]);
+	assert.deepEqual(rows, [
+		{ runId: "synthetic-A", outcome: "fulfilled", acceptedTaskIds: ["T002"],
+			selectedTaskId: "T002" },
+		{ runId: "synthetic-B", outcome: "partial", acceptedTaskIds: [] },
+		{ runId: "synthetic-C", outcome: "unknown", acceptedTaskIds: [] },
+	]);
+});
+
+test("model-facing prior-run control counts omit source IDs and scientific authority", () => {
+	const source = { runId: "private-run-identifier", runAttempt: 1,
+		runNumber: 43, commit: "a".repeat(40) };
+	const summary = offlineChecks.priorIncompleteRunControlSummary({ source,
+		requestCount: 1019, responseReceivedCount: 1019, unknownCount: 1019,
+		currentEffectReviewPending: true, selectionAuthority: false, complete: false });
+	assert.deepEqual(summary.requestObservation,
+		{ total: 1019, responsesReceived: 1019, billingStateUnknown: 1019 });
+	assert.equal(summary.goalTaskCensus, "unavailable-in-terminal-carry");
+	assert.equal(summary.scientificOutcome,
+		"unreviewed; absent current-run research files do not imply no work");
+	assert.equal(summary.selectionAuthority, false);
+	assert.doesNotMatch(JSON.stringify(summary), /private-run-identifier|a{40}/);
+});
 
 test("objective failures retain chronological pre-session stages and initiating causes", () => {
 	const before = offlineChecks.objectiveAssessmentFailureSnapshot().length;

@@ -42,6 +42,25 @@ def archive(entries):
     return base64.b64encode(gzip.compress(buf.getvalue())).decode("ascii")
 
 
+def multipart_checkpoint(generation="a" * 32):
+    checkpoint = json.dumps({"version": 1, "kind": "original-objective-progress",
+                             "payload": "SYNTHETIC-CHECKPOINT-" + "x" * (4 * 1024 * 1024)},
+                            separators=(",", ":")).encode()
+    chunks = [checkpoint[i:i + 1024 * 1024] for i in range(0, len(checkpoint), 1024 * 1024)]
+    files = {}
+    parts = []
+    for index, chunk in enumerate(chunks, 1):
+        name = f"objective-checkpoint.part-{generation}-{index:06d}.txt"
+        files[name] = chunk
+        parts.append({"name": name, "bytes": len(chunk), "sha256": hashlib.sha256(chunk).hexdigest()})
+    manifest = {"version": 1, "kind": "objective-checkpoint-multipart",
+                "encoding": "utf8-concatenate-in-order", "generation": generation,
+                "totalBytes": len(checkpoint), "sha256": hashlib.sha256(checkpoint).hexdigest(),
+                "parts": parts}
+    files["objective-checkpoint.json"] = (json.dumps(manifest, separators=(",", ":")) + "\n").encode()
+    return files
+
+
 class DecodeTests(unittest.TestCase):
     def test_unicode_names_and_private_modes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -117,6 +136,78 @@ class EncryptTests(unittest.TestCase):
         spki = self.private_key.public_key().public_bytes(
             serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
         self.fingerprint = hashlib.sha256(spki).hexdigest()
+
+    def test_multipart_checkpoint_encrypts_only_published_generation_and_roundtrips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results = root / "results"
+            results.mkdir()
+            active = multipart_checkpoint()
+            for name, data in active.items():
+                (results / name).write_bytes(data)
+            orphan = "objective-checkpoint.part-" + "b" * 32 + "-000001.txt"
+            (results / orphan).symlink_to("missing-interrupted-part")
+            (results / "campaign-status.json").write_bytes(b'{"status":"incomplete"}')
+            public = root / "public.pem"
+            public.write_bytes(self.private_key.public_key().public_bytes(
+                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+            encrypted = root / "out.enc.json"
+            transport.encrypt_results(results, public, encrypted, self.metadata, self.fingerprint)
+            self.assertNotIn("SYNTHETIC-CHECKPOINT", encrypted.read_text())
+            private = root / "private.pem"
+            private.write_bytes(self.private_key.private_bytes(serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+            recovered = transport.decrypt_results(encrypted, private, root)
+            self.assertEqual({p.name for p in recovered.iterdir()}, set(active) | {"campaign-status.json"})
+            for name, data in active.items():
+                self.assertEqual((recovered / name).read_bytes(), data)
+            self.assertFalse((recovered / orphan).exists())
+
+    def test_multipart_checkpoint_rejects_missing_tampered_and_extra_active_parts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results = root / "results"
+            results.mkdir()
+            files = multipart_checkpoint()
+            for name, data in files.items():
+                (results / name).write_bytes(data)
+            parts = sorted(name for name in files if name.endswith(".txt"))
+            last = results / parts[-1]
+            saved = last.read_bytes()
+            last.unlink()
+            with self.assertRaises(transport.TransportError):
+                transport._result_tar(results)
+            last.write_bytes(saved)
+            last.write_bytes(b"Z" + saved[1:])
+            with self.assertRaises(transport.TransportError):
+                transport._result_tar(results)
+            last.write_bytes(saved)
+            (results / ("objective-checkpoint.part-" + "a" * 32 + "-000006.txt")).write_bytes(b"extra")
+            with self.assertRaises(transport.TransportError):
+                transport._result_tar(results)
+            (results / ("objective-checkpoint.part-" + "a" * 32 + "-000006.txt")).unlink()
+            front = results / "objective-checkpoint.json"
+            saved_manifest = front.read_bytes()
+            manifest = json.loads(saved_manifest)
+            manifest["sha256"] = "0" * 64
+            front.write_bytes((json.dumps(manifest) + "\n").encode())
+            with self.assertRaises(transport.TransportError):
+                transport._result_tar(results)
+            front.write_bytes(saved_manifest)
+            manifest = json.loads(saved_manifest)
+            manifest["kind"] = "objective-checkpoint-multipart-mutated"
+            front.write_bytes((json.dumps(manifest) + "\n").encode())
+            with self.assertRaises(transport.TransportError):
+                transport._result_tar(results)
+
+    def test_legacy_inline_checkpoint_and_orphan_part_stay_readable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "objective-checkpoint.json").write_bytes(b'{"objectiveOutcome":"incomplete"}')
+            orphan = "objective-checkpoint.part-" + "b" * 32 + "-000001.txt"
+            (root / orphan).write_bytes(b"incomplete-write")
+            with tarfile.open(fileobj=io.BytesIO(transport._result_tar(root)), mode="r:") as tar:
+                self.assertEqual(tar.getnames(), ["objective-checkpoint.json"])
 
     def test_assessor_diagnostics_roundtrip_only_under_exact_allowlisted_names(self):
         with tempfile.TemporaryDirectory() as tmp:

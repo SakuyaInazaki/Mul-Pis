@@ -19,6 +19,7 @@ import { isDeepSeekProviderOutputLimitRecord, type DeepSeekProviderOutputLimit }
 import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY,
 	MISSION_TOTAL_CNY, PRIVATE_CONTINUATION_FILE_KEYS } from "./signed-mission-ledger.ts";
 import type { BootstrapBinding, PrivateContinuationBundle } from "./signed-mission-ledger.ts";
+import { reconcileHistoricalResearchEntries } from "./research-history-reconciliation.ts";
 
 /** Keep seed, derived key, ledger bookkeeping and raw carry plaintext host-only.
  * Verified restored research files may enter a separately authorized, confined
@@ -240,7 +241,8 @@ export type AuthenticatedPriorCarryProof = Readonly<{
 	version: 1 | 2; kind: "authenticated-prior-mission-carry"; repository: typeof MISSION_REPOSITORY;
 	source: Readonly<Source>; envelopeSha256: string; privateBundleSha256: string | null;
 	artifact: Readonly<{ repository: typeof MISSION_REPOSITORY; artifactId: string;
-		artifactName: typeof CARRY_ARTIFACT_NAME; runId: string }>;
+		artifactName: typeof CARRY_ARTIFACT_NAME; runId: string;
+		archiveSha256?: string }>;
 	/** GitHub's artifact archive digest, never the inner encrypted-envelope file digest. */
 	resultArtifact?: Readonly<{ repository: typeof MISSION_REPOSITORY; artifactId: string;
 		artifactName: typeof MISSION_ARTIFACT; runId: string; archiveSha256: string;
@@ -258,8 +260,20 @@ export type AuthenticatedPriorCarryProof = Readonly<{
 export type AuthenticatedPredecessorResearchHistory = Readonly<{
 	version: 1; kind: "authenticated-predecessor-research-history";
 	source: Readonly<Source>; envelopeSha256: string; text: string;
+	artifact: Readonly<{ repository: typeof MISSION_REPOSITORY; artifactId: string;
+		artifactName: typeof CARRY_ARTIFACT_NAME; runId: string }>;
 	selectionAuthority: false;
 }>;
+/** In-memory authority to retain only byte-verified old research history in an emergency carry. */
+export type AuthenticatedEmergencyResearchHistoryReceipt = Readonly<{
+	version: 1; kind: "authenticated-emergency-research-history";
+	priorEnvelopeSha256: string; originalBundleSha256: string;
+	resultingHistorySha256: string; selectionAuthority: false;
+}>;
+export type EmergencyResearchHistoryStep = Readonly<{
+	predecessor: AuthenticatedPredecessorResearchHistory;
+	resultingHistoryText: string;
+}> | Readonly<{ absent: PredecessorResearchHistoryUnavailable }>;
 export type PredecessorResearchHistoryUnavailable = Readonly<{
 	version: 1; kind: "predecessor-research-history-unavailable";
 	reason: "no-authenticated-prior-carry" | "no-predecessor" |
@@ -268,6 +282,10 @@ export type PredecessorResearchHistoryUnavailable = Readonly<{
 	predecessor?: Readonly<{ source: Readonly<Source>; envelopeSha256: string }>;
 }>;
 const authenticatedPredecessorResearchHistories = new WeakSet<object>();
+const emergencyResearchHistoryReceipts = new WeakMap<object, Readonly<{
+	priorProof: AuthenticatedPriorCarryProof; originalBundleSha256: string;
+	resultingHistoryText: string; resultingHistorySha256: string;
+}>>();
 export function isAuthenticatedPredecessorResearchHistory(value: unknown):
 	value is AuthenticatedPredecessorResearchHistory {
 	return Boolean(value) && typeof value === "object" &&
@@ -485,8 +503,15 @@ export type LegacyCarrySealInput = { settledCny: number; unknownOrInFlightCny: n
 export type AccountingCarrySealInput = { settledCny: number; unknownObservedCny: number;
 	unpricedRequestCount: number; requestAudit: AccountingOnlyRequestAuditSnapshot;
 	privateBundle?: PrivateContinuationBundle; bootstrapBinding?: BootstrapBinding };
+/** Read-only host-control counts from the latest authenticated carry alone. */
+export type PriorRunControlObservation = Readonly<{
+	source: Readonly<Source>; requestCount: number; responseReceivedCount: number;
+	unknownCount: number; currentEffectReviewPending: boolean;
+	selectionAuthority: false; complete: false;
+}>;
 export type LedgerContinuation = {
 	mode: "accounting-only";
+	priorRunControlObservation?: PriorRunControlObservation;
 	incrementalPrefixObservation?: AuthenticatedIncrementalPrefixObservation;
 	incrementalPrefixFailure?: IncrementalPrefixFailure;
 	/** AEAD-carried earlier observations, still partial and unquantified. */
@@ -514,12 +539,20 @@ export type LedgerContinuation = {
 	recoverImmediatePredecessorResearchHistory: (target?: Readonly<{
 		source: Readonly<Source>; envelopeSha256: string }>) => Promise<
 		AuthenticatedPredecessorResearchHistory | PredecessorResearchHistoryUnavailable>;
+	attestEmergencyRestoredResearchHistory: (input: Readonly<{
+		originalBundle: PrivateContinuationBundle;
+		steps: readonly EmergencyResearchHistoryStep[];
+		unavailable?: PredecessorResearchHistoryUnavailable;
+		finalHistoryText: string;
+	}>) => AuthenticatedEmergencyResearchHistoryReceipt;
 	claimOneUse: (carryDigest: string) => Promise<ActionsCarryRestartClaim>;
 	priorPrivateBundle?: PrivateContinuationBundle; priorBootstrapBinding?: BootstrapBinding;
-	sealCurrent: (input: AccountingCarrySealInput) => { envelopeB64: string;
+	sealCurrent: (input: AccountingCarrySealInput,
+		restoredHistory?: AuthenticatedEmergencyResearchHistoryReceipt) => { envelopeB64: string;
 			sidecars: Readonly<Record<string, string>>; observedSettledCny: number;
 			observedUnknownHeldCny: number; unpricedRequestCount: number };
-	sealEmergencyCurrent: (input: AccountingCarrySealInput, reason: "effect-review-incomplete") =>
+	sealEmergencyCurrent: (input: AccountingCarrySealInput, reason: "effect-review-incomplete",
+		restoredHistory?: AuthenticatedEmergencyResearchHistoryReceipt) =>
 		{ envelopeB64: string; sidecars: Readonly<Record<string, string>>;
 			observedSettledCny: number; observedUnknownHeldCny: number;
 			unpricedRequestCount: number };
@@ -651,7 +684,9 @@ function validBundle(bundle: unknown, segmented = false): bundle is PrivateConti
 			try { return validWorkflowRepairState(JSON.parse(bundle[key] as string)); }
 			catch { return false; }
 		})()) &&
-		(segmented && key === "research-history.json" ||
+		(segmented && (key === "research-history.json" ||
+			(key === "objective-checkpoint.json" &&
+				Buffer.byteLength(bundle[key] as string, "utf8") <= CARRY_LOGICAL_BYTES)) ||
 			Buffer.byteLength(bundle[key] as string, "utf8") <= 4 * 1024 * 1024)) &&
 		(segmented || Buffer.byteLength(JSON.stringify(bundle), "utf8") <= 4 * 1024 * 1024);
 }
@@ -3224,13 +3259,29 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 		event: c.event as "push" | "workflow_dispatch", priorEnvelopeSha256: parentDigest };
 	const liveUnobservedControlDeliveries = Object.freeze(storedUnobservedControlDeliveries.map(row =>
 		Object.freeze({ ...row, admittedBy: Object.freeze({ ...row.admittedBy }) })));
+	const issuedUnavailableHistories = new WeakMap<object, Readonly<{
+		ancestryIndex: number; reason: PredecessorResearchHistoryUnavailable["reason"];
+	}>>();
 	const unavailablePredecessorHistory = (reason: PredecessorResearchHistoryUnavailable["reason"],
 		predecessor?: Readonly<{ source: Readonly<Source>; envelopeSha256: string }>):
-		PredecessorResearchHistoryUnavailable => Object.freeze({ version: 1,
+		PredecessorResearchHistoryUnavailable => {
+		const unavailable: PredecessorResearchHistoryUnavailable = Object.freeze({ version: 1,
 			kind: "predecessor-research-history-unavailable", reason,
 			...(predecessor ? { predecessor: Object.freeze({
 				source: Object.freeze({ ...predecessor.source }),
 				envelopeSha256: predecessor.envelopeSha256 }) } : {}) });
+		if (predecessor && proof) {
+			const ancestryIndex = authenticatedCarryAncestors.get(proof)?.findIndex(row =>
+				row.envelopeSha256 === predecessor.envelopeSha256 &&
+				JSON.stringify(row.source) === JSON.stringify(predecessor.source)) ?? -1;
+			if (ancestryIndex >= 0)
+				issuedUnavailableHistories.set(unavailable, { ancestryIndex, reason });
+		}
+		return unavailable;
+	};
+	const issuedPredecessorHistories = new WeakMap<object, Readonly<{
+		ancestryIndex: number; textSha256: string; artifactId: string;
+	}>>();
 	const recoverImmediatePredecessorResearchHistory = async (target?: Readonly<{
 		source: Readonly<Source>; envelopeSha256: string }> ):
 		Promise<AuthenticatedPredecessorResearchHistory | PredecessorResearchHistoryUnavailable> => {
@@ -3314,11 +3365,180 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 		if (text === undefined) return unavailablePredecessorHistory("history-absent", predecessor);
 		const history: AuthenticatedPredecessorResearchHistory = Object.freeze({ version: 1,
 			kind: "authenticated-predecessor-research-history", source: Object.freeze({ ...predecessor.source }),
-			envelopeSha256: predecessor.envelopeSha256, text, selectionAuthority: false });
+			envelopeSha256: predecessor.envelopeSha256, text,
+			artifact: Object.freeze({ repository: MISSION_REPOSITORY,
+				artifactId: String(matching[0].id), artifactName: CARRY_ARTIFACT_NAME,
+				runId: predecessor.source.runId,
+				...(matching[0].digest ? { archiveSha256: matching[0].digest.slice(7) } : {}) }),
+			selectionAuthority: false });
 		authenticatedPredecessorResearchHistories.add(history);
+		issuedPredecessorHistories.set(history, { ancestryIndex: predecessorIndex,
+			textSha256: digest(text), artifactId: String(matching[0].id) });
 		return history;
 	};
+	const attestEmergencyRestoredResearchHistory: LedgerContinuation[
+		"attestEmergencyRestoredResearchHistory"] = input => {
+		if (sealed || !proof || !priorPrivateBundle ||
+			!authenticatedPriorCarryBindsBundle(proof, priorPrivateBundle) ||
+			!validBundle(input.originalBundle, true) ||
+			privateBundleDigest(input.originalBundle) !== privateBundleDigest(priorPrivateBundle))
+			reject("restored history has no exact authenticated current bundle");
+		if (!Array.isArray(input.steps) || typeof input.finalHistoryText !== "string")
+			reject("restored history walk is invalid");
+		let text = priorPrivateBundle["research-history.json"];
+		if (text === undefined) reject("authenticated current research history is absent");
+		const authenticatedAncestry = authenticatedCarryAncestors.get(proof);
+		if (!authenticatedAncestry || authenticatedAncestry.length < 2)
+			reject("restored history has no authenticated predecessor ancestry");
+		let initial: Record<string, unknown>;
+		try { initial = JSON.parse(text); }
+		catch { return reject("authenticated current research history is invalid JSON"); }
+		if (!record(initial) || initial.version !== 1 ||
+			initial.kind !== "untrusted-version-bound-research-history" ||
+			!Array.isArray(initial.entries))
+			reject("authenticated current research history has an invalid schema");
+		let startIndex = authenticatedAncestry.length - 2;
+		const marker = initial.predecessorHistoryReconciliation;
+		if (record(marker) && marker.version === 2 &&
+			marker.entriesSha256 === digest(JSON.stringify(initial.entries)) &&
+			marker.selectedTransitionsSha256 ===
+				digest(JSON.stringify(authenticatedSelectedTransitions ?? [])) &&
+			record(marker.source) && typeof marker.envelopeSha256 === "string") {
+			const markerIndex = authenticatedAncestry.findIndex(row =>
+				row.envelopeSha256 === marker.envelopeSha256 &&
+				JSON.stringify(row.source) === JSON.stringify(marker.source));
+			if (markerIndex >= 0 && markerIndex < authenticatedAncestry.length - 1) {
+				if (marker.kind === "authenticated-predecessor-history-reconciled") {
+					startIndex = markerIndex - 1;
+				} else if (marker.kind === "historical-completeness-unverified" &&
+					["artifact-not-observed", "artifact-expired"].includes(String(marker.reason)))
+					startIndex = markerIndex;
+			}
+		}
+		let previousIndex = startIndex + 1;
+		let lastChecked: AuthenticatedPredecessorResearchHistory | undefined;
+		for (const step of input.steps) {
+			if ("absent" in step) {
+				const absent = step.absent;
+				const issued = issuedUnavailableHistories.get(absent);
+				if (!issued || issued.reason !== "history-absent" ||
+					absent.reason !== "history-absent" || !absent.predecessor ||
+					issued.ancestryIndex !== previousIndex - 1 ||
+					!authenticatedPriorCarryBindsAncestor(proof,
+						absent.predecessor.source, absent.predecessor.envelopeSha256))
+					reject("absent history hop lacks this opening's adjacent ancestor proof");
+				previousIndex = issued.ancestryIndex;
+				continue;
+			}
+			const predecessor = step?.predecessor;
+			const issued = predecessor && issuedPredecessorHistories.get(predecessor);
+			if (!issued || !isAuthenticatedPredecessorResearchHistory(predecessor) ||
+				predecessor.selectionAuthority !== false ||
+				issued.ancestryIndex !== previousIndex - 1 ||
+				issued.textSha256 !== digest(predecessor.text) ||
+				issued.artifactId !== predecessor.artifact.artifactId ||
+				!authenticatedPriorCarryBindsAncestor(proof, predecessor.source,
+					predecessor.envelopeSha256) ||
+				typeof step.resultingHistoryText !== "string")
+				reject("restored history step lacks this opening's exact predecessor proof");
+			let current: Record<string, unknown>, older: Record<string, unknown>;
+			try { current = JSON.parse(text); older = JSON.parse(predecessor.text); }
+			catch { return reject("restored research history is invalid JSON"); }
+			if (!record(current) || current.version !== 1 ||
+				current.kind !== "untrusted-version-bound-research-history" ||
+				!Array.isArray(current.entries) || !record(older) || older.version !== 1 ||
+				older.kind !== "untrusted-version-bound-research-history" ||
+				!Array.isArray(older.entries))
+				reject("restored research history has an invalid schema");
+			const entries = reconcileHistoricalResearchEntries(current.entries, older.entries);
+			const expected = JSON.stringify({ ...current, entries });
+			if (step.resultingHistoryText !== expected)
+				reject("restored research history differs from byte-exact monotone reconciliation");
+			text = expected;
+			previousIndex = issued.ancestryIndex;
+			lastChecked = predecessor;
+		}
+		if (input.unavailable) {
+			const unavailable = input.unavailable;
+			const issued = issuedUnavailableHistories.get(unavailable);
+			const predecessor = unavailable.predecessor;
+			if (!issued || !predecessor || issued.reason !== unavailable.reason ||
+				!["artifact-not-observed", "artifact-expired"].includes(unavailable.reason) ||
+				issued.ancestryIndex !== previousIndex - 1 ||
+				!authenticatedPriorCarryBindsAncestor(proof, predecessor.source,
+					predecessor.envelopeSha256))
+				reject("unavailable history lacks this opening's exact ancestor proof");
+			let current: Record<string, unknown>;
+			try { current = JSON.parse(text); }
+			catch { return reject("restored research history is invalid JSON"); }
+			if (!record(current) || current.version !== 1 ||
+				current.kind !== "untrusted-version-bound-research-history" ||
+				!Array.isArray(current.entries))
+				reject("restored research history has an invalid schema");
+			text = JSON.stringify({ ...current, predecessorHistoryReconciliation: {
+				version: 2, kind: "historical-completeness-unverified",
+				source: predecessor.source,
+				envelopeSha256: predecessor.envelopeSha256,
+				reason: unavailable.reason,
+				entriesSha256: digest(JSON.stringify(current.entries)),
+				selectedTransitionsSha256:
+					digest(JSON.stringify(authenticatedSelectedTransitions ?? [])) } });
+		} else if (lastChecked) {
+			let current: Record<string, unknown>;
+			try { current = JSON.parse(text); }
+			catch { return reject("restored research history is invalid JSON"); }
+			if (!record(current) || current.version !== 1 ||
+				current.kind !== "untrusted-version-bound-research-history" ||
+				!Array.isArray(current.entries))
+				reject("restored research history has an invalid schema");
+			text = JSON.stringify({ ...current, predecessorHistoryReconciliation: {
+				version: 2, kind: "authenticated-predecessor-history-reconciled",
+				source: lastChecked.source,
+				envelopeSha256: lastChecked.envelopeSha256,
+				entriesSha256: digest(JSON.stringify(current.entries)),
+				selectedTransitionsSha256:
+					digest(JSON.stringify(authenticatedSelectedTransitions ?? [])) } });
+		}
+		if (input.finalHistoryText !== text ||
+			Buffer.byteLength(text, "utf8") > CARRY_LOGICAL_BYTES)
+			reject("restored final research history differs from verified walk");
+		const receipt: AuthenticatedEmergencyResearchHistoryReceipt = Object.freeze({ version: 1,
+			kind: "authenticated-emergency-research-history",
+			priorEnvelopeSha256: proof.envelopeSha256,
+			originalBundleSha256: privateBundleDigest(priorPrivateBundle),
+			resultingHistorySha256: digest(text), selectionAuthority: false });
+		emergencyResearchHistoryReceipts.set(receipt, { priorProof: proof,
+			originalBundleSha256: privateBundleDigest(priorPrivateBundle),
+			resultingHistoryText: text, resultingHistorySha256: digest(text) });
+		return receipt;
+	};
+	const verifiedRestoredHistoryText = (receipt: AuthenticatedEmergencyResearchHistoryReceipt):
+		string => {
+		const verified = emergencyResearchHistoryReceipts.get(receipt);
+		if (!verified || !proof || !priorPrivateBundle || verified.priorProof !== proof ||
+			verified.originalBundleSha256 !== privateBundleDigest(priorPrivateBundle) ||
+			receipt.originalBundleSha256 !== verified.originalBundleSha256 ||
+			receipt.priorEnvelopeSha256 !== proof.envelopeSha256 ||
+			receipt.resultingHistorySha256 !== verified.resultingHistorySha256)
+			reject("restored research history lacks exact verified receipt");
+		return verified.resultingHistoryText;
+	};
+	const historyMarker = (bundle: PrivateContinuationBundle | undefined): unknown => {
+		try { return JSON.parse(bundle?.["research-history.json"] ?? "").predecessorHistoryReconciliation; }
+		catch { return undefined; }
+	};
 	const result: LedgerContinuation = { mode: "accounting-only",
+		...(proof && latestCheckpoint?.version === 3 ? {
+			priorRunControlObservation: Object.freeze({
+				source: Object.freeze({ ...latestCheckpoint.source }),
+				requestCount: latestCheckpoint.requestAudit.requests.length,
+				responseReceivedCount: latestCheckpoint.requestAudit.requests.filter(row =>
+					row.responseReceived === true).length,
+				unknownCount: latestCheckpoint.requestAudit.requests.filter(row =>
+					row.status === "unknown").length,
+				currentEffectReviewPending: latestCheckpoint.currentEffectReview === "pending",
+				selectionAuthority: false as const, complete: false as const
+			}) } : {}),
 		...(incrementalPrefixObservation ? { incrementalPrefixObservation } : {}),
 		...(incrementalPrefixFailure ? { incrementalPrefixFailure } : {}),
 		historicalIncrementalPrefixes: Object.freeze([...historicalIncrementalPrefixes]),
@@ -3338,6 +3558,7 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 		priorUnknownHeldCny: decimal(historical.unknownHeldNano),
 		...(proof ? { priorCarryProof: proof } : {}),
 		recoverImmediatePredecessorResearchHistory,
+		attestEmergencyRestoredResearchHistory,
 		...(priorPrivateBundle ? { priorPrivateBundle } : {}),
 		...(priorBootstrapBinding ? { priorBootstrapBinding } : {}),
 		appendTransportDiagnosticCensus: (audit, diagnostics) => {
@@ -3430,7 +3651,7 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 				throw error;
 			}
 		},
-		sealCurrent: amounts => {
+		sealCurrent: (amounts, restoredHistory) => {
 			if (sealed) reject("current carry was already sealed");
 			const privateBundle = amounts.privateBundle ?? priorPrivateBundle;
 			const bootstrapBinding = amounts.bootstrapBinding ?? priorBootstrapBinding;
@@ -3445,6 +3666,14 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 				(priorBootstrapBinding !== undefined && !sameBinding(bootstrapBinding, priorBootstrapBinding)) ||
 				(privateBundle === undefined) !== (bootstrapBinding === undefined))
 				reject("current carry accounting exceeds mission bounds");
+			const nextMarker = historyMarker(privateBundle);
+			const oldMarker = historyMarker(priorPrivateBundle);
+			if (record(nextMarker) && nextMarker.version === 2 &&
+				JSON.stringify(nextMarker) !== JSON.stringify(oldMarker) &&
+				(!restoredHistory || !privateBundle ||
+					privateBundle["research-history.json"] !==
+						verifiedRestoredHistoryText(restoredHistory)))
+				reject("new v2 research history marker lacks exact verified recovery receipt");
 			if (!m04QuarantineExtends(priorPrivateBundle?.["m04-transaction-quarantine.json"],
 				privateBundle?.["m04-transaction-quarantine.json"], proof?.source,
 				proof?.envelopeSha256))
@@ -3566,7 +3795,7 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 					if (smaller) {
 						const originalPreparedDiagnosticText = preparedDiagnosticText;
 						preparedDiagnosticText = smaller["transport-diagnostics.json"];
-						try { return result.sealCurrent({ ...amounts, privateBundle: smaller }); }
+						try { return result.sealCurrent({ ...amounts, privateBundle: smaller }, restoredHistory); }
 						catch (error) {
 							preparedDiagnosticText = originalPreparedDiagnosticText;
 							throw error;
@@ -3579,7 +3808,7 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 					observedUnknownHeldCny: decimal(nextUnknownNano),
 					unpricedRequestCount: nextUnpricedCount };
 		},
-		sealEmergencyCurrent: (amounts, reason) => {
+		sealEmergencyCurrent: (amounts, reason, restoredHistory) => {
 			if (reason !== "effect-review-incomplete" || sealed)
 				reject("emergency carry requires an unsealed effect-review failure");
 			if (!priorPrivateBundle || !validBundle(priorPrivateBundle, true) ||
@@ -3602,6 +3831,20 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 				pending.push({ ...predecessor });
 			}
 			const emergencyBundle = { ...priorPrivateBundle };
+			if (restoredHistory !== undefined) {
+				const verified = emergencyResearchHistoryReceipts.get(restoredHistory);
+				if (!verified || !proof || verified.priorProof !== proof ||
+					verified.originalBundleSha256 !== privateBundleDigest(priorPrivateBundle) ||
+					restoredHistory.originalBundleSha256 !== verified.originalBundleSha256 ||
+					restoredHistory.priorEnvelopeSha256 !== proof.envelopeSha256 ||
+					restoredHistory.resultingHistorySha256 !== verified.resultingHistorySha256 ||
+					(amounts.privateBundle?.["research-history.json"] !== undefined &&
+						amounts.privateBundle["research-history.json"] !== verified.resultingHistoryText &&
+						amounts.privateBundle["research-history.json"] !==
+							priorPrivateBundle["research-history.json"]))
+					reject("emergency restored research history lacks exact verified receipt");
+				emergencyBundle["research-history.json"] = verified.resultingHistoryText;
+			}
 			if (amounts.privateBundle?.["transport-diagnostics.json"] !== undefined)
 				emergencyBundle["transport-diagnostics.json"] =
 					amounts.privateBundle["transport-diagnostics.json"];

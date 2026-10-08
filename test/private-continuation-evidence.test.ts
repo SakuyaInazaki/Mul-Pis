@@ -188,6 +188,37 @@ test("accepted new evidence is carried as its own tuple rather than mixed with p
 	assert.equal(history.entries[0].files["m04-adopted-knowledge.json"], bundle["m04-adopted-knowledge.json"]);
 });
 
+test("collector keeps old raw evidence while retiring a stale history frontier marker", async t => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "synthetic-stale-history-frontier-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const { bundle, checkpoint, archive } = fixture();
+	bundle["research-history.json"] = JSON.stringify({ version: 1,
+		kind: "untrusted-version-bound-research-history", entries: [],
+		predecessorHistoryReconciliation: { version: 2,
+			kind: "authenticated-predecessor-history-reconciled",
+			source: { runId: "7001", runAttempt: 1, commit: "a".repeat(40) },
+			envelopeSha256: "b".repeat(64),
+			entriesSha256: createHash("sha256").update("[]").digest("hex"),
+			selectedTransitionsSha256: "c".repeat(64) } });
+	const current = { ...bundle,
+		"candidate.cpp": "// synthetic new accepted candidate\n",
+		"verification.json": json({ version: 1, status: "passed" }),
+		"workflow-archive.json": json({ ...archive, goalRunId: "synthetic-next-goal", taskId: "T002" }),
+		"objective-checkpoint.json": json({ ...checkpoint,
+			boundedRuns: [...checkpoint.boundedRuns,
+				{ runId: "synthetic-next-goal", outcome: "fulfilled", selectedTaskId: "T002" }] }),
+	};
+	for (const [name, value] of Object.entries(current))
+		if (name !== "research-history.json") await writeFile(path.join(root, name), value!);
+	const carry = await offlineChecks.collectContinuationBundle(root, bundle);
+	const history = JSON.parse(carry!["research-history.json"]!);
+	assert.equal(history.predecessorHistoryReconciliation, undefined,
+		"new entries cannot inherit an earlier reconciliation frontier");
+	assert.equal(history.entries.length, 1);
+	assert.equal(history.entries[0].files["candidate.cpp"], bundle["candidate.cpp"],
+		"retiring the marker does not erase older raw selected evidence");
+});
+
 test("unbound new acceptance cannot replace prior tuple and unsafe files cannot enter carry", async t => {
 	const root = await mkdtemp(path.join(os.tmpdir(), "synthetic-continuation-safety-"));
 	t.after(() => rm(root, { recursive: true, force: true }));

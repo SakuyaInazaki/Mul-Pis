@@ -6,7 +6,7 @@
 import { isDeepStrictEqual } from "node:util";
 
 export type GroundingSourceKind = "user-instruction" | "supplied-task" |
-	"selected-evidence" | "host-capability";
+	"selected-evidence" | "host-capability" | "host-control";
 
 export interface GroundingSource {
 	kind: GroundingSourceKind;

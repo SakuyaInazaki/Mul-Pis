@@ -2,6 +2,7 @@ import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes, ra
 import { lstat, open, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { isNativeCnyPricingRecord } from "./deepseek-cny-pricing.ts";
+import { CARRY_LOGICAL_BYTES } from "./carry-sidecar-codec.ts";
 import type { DeepSeekCampaignBudget } from "./deepseek-campaign.ts";
 import { MISSION_ID } from "./signed-mission-ledger.ts";
 import { validUnobservedControlDelivery, type UnobservedControlDelivery } from "./ledger-continuation.ts";
@@ -234,7 +235,7 @@ function text(value: unknown, max = 4096): value is string {
 	return typeof value === "string" && value.length > 0 && value.length <= max;
 }
 function validObjectiveCheckpoint(value: unknown): value is string {
-	if (typeof value !== "string" || Buffer.byteLength(value, "utf8") > 4 * 1024 * 1024)
+	if (typeof value !== "string" || Buffer.byteLength(value, "utf8") > CARRY_LOGICAL_BYTES)
 		return false;
 	try { return JSON.parse(value)?.kind === "original-objective-progress"; }
 	catch { return false; }

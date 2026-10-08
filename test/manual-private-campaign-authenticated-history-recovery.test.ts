@@ -116,6 +116,45 @@ test("branded predecessor recovery seals old same-task bytes and survives later 
 	carries.set("7003", secondCarry);
 	runs = [run(7001, "completed"), run(7002, "completed"), run(7003, "completed"),
 		run(7004, "in_progress")];
+	await t.test("an unchanged emergency wrapper cannot hide an older same-task version", async () => {
+		const third = await open(7004);
+		const copied = third.sealEmergencyCurrent({ settledCny: 0, unknownObservedCny: 0,
+			unpricedRequestCount: 0, requestAudit: audit, privateBundle: third.priorPrivateBundle },
+			"effect-review-incomplete");
+		carries.set("7004", copied);
+		runs = [run(7001, "completed"), run(7002, "completed"), run(7003, "completed"),
+			run(7004, "completed"), run(7005, "in_progress")];
+		const fourth = await open(7005);
+		assert.equal(fourth.priorPrivateBundle?.["research-history.json"], history(latestEntry));
+		const recovered = await offlineChecks.recoverAuthenticatedHistoricalVersions(fourth,
+			fourth.priorPrivateBundle!);
+		const recoveredHistory = JSON.parse(recovered["research-history.json"]!);
+		assert.deepEqual(recoveredHistory.entries[0].files, latestFiles);
+		assert.deepEqual(recoveredHistory.entries[0].supersededVersions,
+			[{ interpretation: oldEntry.interpretation, files: oldFiles }]);
+		assert.equal(recoveredHistory.predecessorHistoryReconciliation.source.runId, "7002");
+		const receipt = offlineChecks.verifiedEmergencyResearchHistory(fourth, recovered);
+		assert.ok(receipt, "the exact branded walk can retain old bytes in an emergency");
+		fourth.sealEmergencyCurrent({ settledCny: 0, unknownObservedCny: 0,
+			unpricedRequestCount: 0, requestAudit: audit, privateBundle: recovered },
+			"effect-review-incomplete", receipt);
+		expiredFirst = true;
+		const expired = await open(7005);
+		const uncertain = await offlineChecks.recoverAuthenticatedHistoricalVersions(expired,
+			expired.priorPrivateBundle!);
+		const marker = JSON.parse(uncertain["research-history.json"]!).predecessorHistoryReconciliation;
+		assert.equal(marker.kind, "historical-completeness-unverified");
+		assert.equal(marker.source.runId, "7002");
+		assert.equal(marker.reason, "artifact-expired");
+		const uncertainReceipt = offlineChecks.verifiedEmergencyResearchHistory(expired, uncertain);
+		assert.ok(uncertainReceipt, "an unavailable exact older artifact remains explicit in emergency history");
+		expired.sealEmergencyCurrent({ settledCny: 0, unknownObservedCny: 0,
+			unpricedRequestCount: 0, requestAudit: audit, privateBundle: uncertain },
+			"effect-review-incomplete", uncertainReceipt);
+		expiredFirst = false;
+		runs = [run(7001, "completed"), run(7002, "completed"), run(7003, "completed"),
+			run(7004, "in_progress")];
+	});
 	await t.test("available predecessor restores exact old bytes and seals a durable marker", async () => {
 		const third = await open(7004);
 		assert.equal(third.priorPrivateBundle?.["research-history.json"], history(latestEntry));
@@ -131,8 +170,10 @@ test("branded predecessor recovery seals old same-task bytes and survives later 
 		assert.equal(Object.keys(recoveredHistory.entries[0].supersededVersions[0].files).length, 10);
 		assert.equal(recoveredHistory.predecessorHistoryReconciliation.source.runId, "7002");
 		assert.match(recoveredHistory.predecessorHistoryReconciliation.envelopeSha256, /^[0-9a-f]{64}$/);
+		const receipt = offlineChecks.verifiedEmergencyResearchHistory(third, recovered);
+		assert.ok(receipt);
 		const thirdCarry = third.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
-			unpricedRequestCount: 0, requestAudit: audit, privateBundle: recovered });
+			unpricedRequestCount: 0, requestAudit: audit, privateBundle: recovered }, receipt);
 		carries.set("7004", thirdCarry);
 		runs = [run(7001, "completed"), run(7002, "completed"), run(7003, "completed"),
 			run(7004, "completed"), run(7005, "in_progress")];
@@ -162,8 +203,10 @@ test("branded predecessor recovery seals old same-task bytes and survives later 
 			"historical-completeness-unverified");
 		assert.equal(uncertainHistory.predecessorHistoryReconciliation.reason, "artifact-expired");
 		assert.equal(uncertainHistory.predecessorHistoryReconciliation.source.runId, "7002");
+		const receipt = offlineChecks.verifiedEmergencyResearchHistory(third, uncertain);
+		assert.ok(receipt);
 		const uncertainCarry = third.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
-			unpricedRequestCount: 0, requestAudit: audit, privateBundle: uncertain });
+			unpricedRequestCount: 0, requestAudit: audit, privateBundle: uncertain }, receipt);
 		carries.set("7004", uncertainCarry);
 		runs = [run(7001, "completed"), run(7002, "completed"), run(7003, "completed"),
 			run(7004, "completed"), run(7005, "in_progress")];

@@ -54,12 +54,81 @@ RESULT_SIDECAR_RE = re.compile(r"^ledger-continuation\.part-[0-9]{8}\.enc$")
 RESULT_ASSESSOR_DIAGNOSTIC_RE = re.compile(
     r"^assessor-(?:diagnostic-[0-9]{6,}\.json|transcript-[0-9]{6,}\.bin)$"
 )
+OBJECTIVE_PART_RE = re.compile(r"^objective-checkpoint\.part-([0-9a-f]{32})-([0-9]{6})\.txt$")
+OBJECTIVE_PART_BYTES = 1024 * 1024
+OBJECTIVE_TOTAL_BYTES = 64 * 1024 * 1024
 
 
 def _allowed_result_name(name: str) -> bool:
     return bool(name in RESULT_ALLOWLIST or RESULT_DYNAMIC_RE.fullmatch(name) or
                 RESULT_SIDECAR_RE.fullmatch(name) or
-                RESULT_ASSESSOR_DIAGNOSTIC_RE.fullmatch(name))
+                RESULT_ASSESSOR_DIAGNOSTIC_RE.fullmatch(name) or
+                OBJECTIVE_PART_RE.fullmatch(name))
+
+
+def _objective_checkpoint_files(files: dict[str, bytes], names: set[str] | None = None) -> set[str]:
+    """Select only the published generation; incomplete writes may leave orphan parts."""
+    raw = files.get("objective-checkpoint.json")
+    if raw is None:
+        return set()
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError) as exc:
+        raise TransportError() from exc
+    if not isinstance(manifest, dict):
+        raise TransportError()
+    if manifest.get("kind") != "objective-checkpoint-multipart":
+        if {"generation", "totalBytes", "sha256", "parts"} & set(manifest):
+            raise TransportError()
+        return set()
+    if (set(manifest) != {"version", "kind", "encoding", "generation", "totalBytes", "sha256", "parts"} or
+            type(manifest["version"]) is not int or manifest["version"] != 1 or
+            manifest["encoding"] != "utf8-concatenate-in-order" or
+            not isinstance(manifest["generation"], str) or
+            not re.fullmatch(r"[0-9a-f]{32}", manifest["generation"]) or
+            type(manifest["totalBytes"]) is not int or
+            not 4 * 1024 * 1024 < manifest["totalBytes"] <= OBJECTIVE_TOTAL_BYTES or
+            not isinstance(manifest["sha256"], str) or
+            not re.fullmatch(r"[0-9a-f]{64}", manifest["sha256"]) or
+            not isinstance(manifest["parts"], list) or
+            not 5 <= len(manifest["parts"]) <= 64 or
+            len(raw) > OBJECTIVE_PART_BYTES):
+        raise TransportError()
+    active: set[str] = set()
+    chunks: list[bytes] = []
+    for index, row in enumerate(manifest["parts"], 1):
+        name = f"objective-checkpoint.part-{manifest['generation']}-{index:06d}.txt"
+        if (not isinstance(row, dict) or set(row) != {"name", "bytes", "sha256"} or
+                row["name"] != name or type(row["bytes"]) is not int or
+                not 0 < row["bytes"] <= OBJECTIVE_PART_BYTES or
+                (index < len(manifest["parts"]) and row["bytes"] != OBJECTIVE_PART_BYTES) or
+                not isinstance(row["sha256"], str) or
+                not re.fullmatch(r"[0-9a-f]{64}", row["sha256"])):
+            raise TransportError()
+        chunk = files.get(name)
+        if (chunk is None or len(chunk) != row["bytes"] or
+                hashlib.sha256(chunk).hexdigest() != row["sha256"]):
+            raise TransportError()
+        active.add(name)
+        chunks.append(chunk)
+    active_prefix = f"objective-checkpoint.part-{manifest['generation']}-"
+    if any(name.startswith(active_prefix) and name not in active
+           for name in (names if names is not None else files)):
+        raise TransportError()
+    joined = b"".join(chunks)
+    if (len(raw) + len(joined) > OBJECTIVE_TOTAL_BYTES or
+            len(joined) != manifest["totalBytes"] or
+            hashlib.sha256(joined).hexdigest() != manifest["sha256"]):
+        raise TransportError()
+    try:
+        checkpoint = json.loads(joined.decode("utf-8"))
+    except (UnicodeError, ValueError) as exc:
+        raise TransportError() from exc
+    if (not isinstance(checkpoint, dict) or type(checkpoint.get("version")) is not int or
+            checkpoint["version"] != 1 or
+            checkpoint.get("kind") != "original-objective-progress"):
+        raise TransportError()
+    return active
 
 
 def _review_text_file(name: str) -> bool:
@@ -149,22 +218,56 @@ def _result_tar(result_dir: Path) -> bytes:
     result_dir = result_dir.resolve(strict=True)
     if not result_dir.is_dir():
         raise TransportError()
+    directory_names = {entry.name for entry in os.scandir(result_dir)}
+    names = {name for name in directory_names if _allowed_result_name(name)}
+    files: dict[str, bytes] = {}
+    total_read_bytes = 0
+    def read_result_file(name: str) -> None:
+        nonlocal total_read_bytes
+        path = result_dir / name
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            raise TransportError()
+        with os.fdopen(fd, "rb") as source:
+            info = os.fstat(source.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE or
+                    (_review_text_file(name) and info.st_size > MAX_REVIEW_TEXT_FILE) or
+                    (OBJECTIVE_PART_RE.fullmatch(name) and info.st_size > OBJECTIVE_PART_BYTES)):
+                raise TransportError()
+            data = source.read(MAX_FILE + 1)
+            if len(data) != info.st_size:
+                raise TransportError()
+        total_read_bytes += len(data)
+        if total_read_bytes > MAX_TAR:
+            raise TransportError()
+        files[name] = data
+    for name in sorted(names):
+        if not OBJECTIVE_PART_RE.fullmatch(name):
+            read_result_file(name)
+    raw = files.get("objective-checkpoint.json")
+    if raw is not None:
+        try:
+            candidate = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, ValueError):
+            candidate = None
+        if isinstance(candidate, dict) and candidate.get("kind") == "objective-checkpoint-multipart":
+            rows = candidate.get("parts")
+            if not isinstance(rows, list):
+                raise TransportError()
+            for row in rows:
+                name = row.get("name") if isinstance(row, dict) else None
+                if not isinstance(name, str) or not OBJECTIVE_PART_RE.fullmatch(name) or name not in names:
+                    raise TransportError()
+                if name not in files:
+                    read_result_file(name)
+    active_parts = _objective_checkpoint_files(files, directory_names)
     buf = io.BytesIO()
     count = 0
     with tarfile.open(fileobj=buf, mode="w:") as tar:
-        for name in sorted(entry.name for entry in os.scandir(result_dir) if _allowed_result_name(entry.name)):
-            path = result_dir / name
-            try:
-                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-            except FileNotFoundError:
+        for name, data in sorted(files.items()):
+            if OBJECTIVE_PART_RE.fullmatch(name) and name not in active_parts:
                 continue
-            with os.fdopen(fd, "rb") as source:
-                info = os.fstat(source.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE or (_review_text_file(name) and info.st_size > MAX_REVIEW_TEXT_FILE):
-                    raise TransportError()
-                data = source.read(MAX_FILE + 1)
-                if len(data) != info.st_size:
-                    raise TransportError()
             entry = tarfile.TarInfo(name)
             entry.size = len(data)
             entry.mode = 0o600
@@ -260,7 +363,10 @@ def decrypt_results(envelope_file: Path, private_key_file: Path, parent: Path) -
         names: set[str] = set()
         with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
             for member in tar:
-                if not member.isfile() or not _allowed_result_name(member.name) or member.name in names or member.size > MAX_FILE or (_review_text_file(member.name) and member.size > MAX_REVIEW_TEXT_FILE):
+                if (not member.isfile() or not _allowed_result_name(member.name) or member.name in names or
+                        member.size > MAX_FILE or
+                        (_review_text_file(member.name) and member.size > MAX_REVIEW_TEXT_FILE) or
+                        (OBJECTIVE_PART_RE.fullmatch(member.name) and member.size > OBJECTIVE_PART_BYTES)):
                     raise TransportError()
                 names.add(member.name)
                 source = tar.extractfile(member)
@@ -274,6 +380,10 @@ def decrypt_results(envelope_file: Path, private_key_file: Path, parent: Path) -
                 raise TransportError()
         if not files:
             raise TransportError()
+        file_map = dict(files)
+        active_parts = _objective_checkpoint_files(file_map)
+        files = [(name, data) for name, data in files if
+                 not OBJECTIVE_PART_RE.fullmatch(name) or name in active_parts]
         dest = Path(tempfile.mkdtemp(prefix="private-campaign-result-", dir=parent))
         os.chmod(dest, 0o700)
         for name, data in files:

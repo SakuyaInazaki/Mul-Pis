@@ -12,6 +12,7 @@ import { INCREMENTAL_CHECKPOINT_FILE, IncrementalPrivateCheckpointJournal,
 	type IncrementalCheckpointInput, type IncrementalCheckpointSource } from
 	"../src/runner/incremental-private-checkpoint.ts";
 import { MISSION_ID } from "../src/runner/signed-mission-ledger.ts";
+import { CARRY_LOGICAL_BYTES } from "../src/runner/carry-sidecar-codec.ts";
 
 const run = promisify(execFile);
 const sha = (bytes: Buffer | string) => createHash("sha256").update(bytes).digest("hex");
@@ -70,6 +71,39 @@ test("initial private prefix seals accepted unobserved control before later requ
 	await assert.rejects(f.journal.record("control-observed", snapshot(true)),
 		expectDiagnostic("monotonic-regression", "unobserved-control-regressed"));
 	assert.equal(await readFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE), "utf8"), raw);
+});
+
+test("incremental prefix preserves the exact run43-size objective checkpoint", async t => {
+	const f = await fixture(t);
+	const targetBytes = 4_458_098;
+	const base = JSON.stringify({ version: 1, kind: "original-objective-progress", detail: "" });
+	const objectiveCheckpointJson = JSON.stringify({ version: 1,
+		kind: "original-objective-progress", detail: "x".repeat(targetBytes - base.length) });
+	assert.equal(Buffer.byteLength(objectiveCheckpointJson, "utf8"), targetBytes);
+	await f.journal.record("initial", { ...snapshot(), objectiveCheckpointJson });
+	const raw = await readFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE), "utf8");
+	assert.ok(Buffer.byteLength(raw, "utf8") <= CARRY_LOGICAL_BYTES);
+	assert.equal(openIncrementalControlPrefix(raw, f.authenticatedMissionKey, source)
+		.objectiveCheckpointJson, objectiveCheckpointJson);
+});
+
+test("incremental prefix rejects an objective checkpoint beyond the logical carry bound", async t => {
+	const f = await fixture(t);
+	const oversized = JSON.stringify({ kind: "original-objective-progress",
+		detail: "x".repeat(CARRY_LOGICAL_BYTES) });
+	await assert.rejects(f.journal.record("initial", {
+		...snapshot(), objectiveCheckpointJson: oversized }),
+		expectDiagnostic("decoded-schema", "objective-checkpoint-invalid"));
+});
+
+test("incremental prefix keeps the 64 MiB physical file bound for an allowed objective", async t => {
+	const f = await fixture(t);
+	const physicallyOversized = JSON.stringify({ kind: "original-objective-progress",
+		detail: "x".repeat(48 * 1024 * 1024) });
+	assert.ok(Buffer.byteLength(physicallyOversized, "utf8") < CARRY_LOGICAL_BYTES);
+	await assert.rejects(f.journal.record("initial", {
+		...snapshot(), objectiveCheckpointJson: physicallyOversized }),
+		expectDiagnostic("file-io", "file-bound-exceeded"));
 });
 async function fixture(t: TestContext, publish?: ConstructorParameters<
 	typeof IncrementalPrivateCheckpointJournal>[0]["publish"]) {

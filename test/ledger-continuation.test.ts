@@ -20,8 +20,76 @@ import { sealCampaignCarry } from "../src/runner/emergency-carry.ts";
 import { decodeCarrySidecars, encodeCarrySidecars } from "../src/runner/carry-sidecar-codec.ts";
 import { CARRY_LOGICAL_BYTES } from "../src/runner/carry-sidecar-codec.ts";
 import { workflowRepairState } from "../src/runner/repair-liveness.ts";
+import { reconcileHistoricalResearchEntries } from "../src/runner/research-history-reconciliation.ts";
 
 const sha = (letter: string) => letter.repeat(40);
+test("v4 carry seals and opens the exact run43-size objective checkpoint in bounded sidecars", async t => {
+	const f = await fixture(t);
+	const targetBytes = 4_458_098;
+	const base = JSON.stringify({ version: 1, kind: "original-objective-progress", detail: "" });
+	const objectiveCheckpointJson = JSON.stringify({ version: 1,
+		kind: "original-objective-progress", detail: "x".repeat(targetBytes - base.length) });
+	assert.equal(Buffer.byteLength(objectiveCheckpointJson, "utf8"), targetBytes);
+	const open = () => openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7002, sha("b")), request: github([anchor, first]),
+		loadCarryArtifact: async () => "unused" });
+	const zeroAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
+		requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
+	const opened = await open();
+	const carry = opened.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: zeroAudit,
+		bootstrapBinding: { contractId: "synthetic-objective", sourceSha256: "d".repeat(64) },
+		privateBundle: { "objective-checkpoint.json": objectiveCheckpointJson } });
+	assert.ok(Object.keys(carry.sidecars).length > 4);
+	const seed = await authenticateSignedMissionSeed({ ...f, envelopeB64: f.seedEnvelopeB64 });
+	const decoded = decodeV4Checkpoint(carry, seed.seedDigest,
+		seed.derivePrivateKey("mul-pis-ledger-continuation-v1"),
+		{ runId: "7002", runAttempt: 1, runNumber: 2, commit: sha("b") });
+	assert.equal(decoded.privateBundle["objective-checkpoint.json"], objectiveCheckpointJson);
+	const next = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7003, sha("c")), request: github([anchor,
+			{ ...first, status: "completed", conclusion: "failure" }, second]),
+		loadCarryArtifact: async () => carry });
+	assert.equal(next.priorPrivateBundle?.["objective-checkpoint.json"], objectiveCheckpointJson);
+	assert.equal(authenticatedPriorCarryBindsBundle(next.priorCarryProof, next.priorPrivateBundle), true);
+	const ordinary = await open();
+	assert.throws(() => ordinary.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: zeroAudit,
+		bootstrapBinding: { contractId: "synthetic-objective", sourceSha256: "d".repeat(64) },
+		privateBundle: { "candidate.cpp": "x".repeat(4 * 1024 * 1024 + 1) } }),
+		/current carry accounting exceeds mission bounds/);
+	const legacy = await open();
+	assert.throws(() => sealHistoricalCarryForOfflineTests(legacy, {
+		settledCny: 0, unknownOrInFlightCny: 0, requestAudit: audit(0, 0),
+		bootstrapBinding: { contractId: "synthetic-objective", sourceSha256: "d".repeat(64) },
+		privateBundle: { "objective-checkpoint.json": objectiveCheckpointJson } }),
+		/current carry accounting exceeds mission bounds/);
+});
+
+test("v4 rejects an objective bundle above the 64 MiB decoded limit", async t => {
+	const f = await fixture(t);
+	const opened = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7002, sha("b")), request: github([anchor, first]),
+		loadCarryArtifact: async () => "unused" });
+	const oversized = JSON.stringify({ kind: "original-objective-progress",
+		detail: "x".repeat(CARRY_LOGICAL_BYTES) });
+	assert.throws(() => opened.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: { version: 3, kind: "accounting-only-request-audit",
+			requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 },
+		bootstrapBinding: { contractId: "synthetic-objective", sourceSha256: "d".repeat(64) },
+		privateBundle: { "objective-checkpoint.json": oversized } }),
+		/current carry accounting exceeds mission bounds/);
+	const withinKeyBound = JSON.stringify({ kind: "original-objective-progress",
+		detail: "x".repeat(4_458_098) });
+	assert.throws(() => opened.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: { version: 3, kind: "accounting-only-request-audit",
+			requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 },
+		bootstrapBinding: { contractId: "synthetic-objective", sourceSha256: "d".repeat(64) },
+		privateBundle: { "objective-checkpoint.json": withinKeyBound,
+			"research-history.json": "h".repeat(CARRY_LOGICAL_BYTES - 4_458_098) } }),
+		/sidecar plaintext is invalid/);
+});
+
 test("immediate predecessor history is recovered only from exact authenticated v4 ancestry", async t => {
 	const f = await fixture(t);
 	const seedEnvelopeB64 = attestedSeed(f);
@@ -34,6 +102,7 @@ test("immediate predecessor history is recovered only from exact authenticated v
 	const firstOpening = await openLedgerContinuation({ ...f, seedEnvelopeB64,
 		githubToken: "synthetic-token", current: current(7002, sha("b")),
 		request: github([anchor, first]), loadCarryArtifact: async () => "unused" });
+	assert.equal(firstOpening.priorRunControlObservation, undefined);
 	const firstCarry = firstOpening.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
 		unpricedRequestCount: 0, requestAudit: emptyAudit,
 		privateBundle: { ...firstOpening.priorPrivateBundle!, "research-history.json": oldHistory } });
@@ -206,6 +275,285 @@ test("immediate predecessor history is recovered only from exact authenticated v
 	assert.deepEqual(await successor.recoverImmediatePredecessorResearchHistory(olderTarget),
 		{ ...expectedUnavailable, reason: "artifact-not-observed" });
 });
+test("verified restored history alone survives emergency carry and next reopen", async t => {
+	const f = await fixture(t);
+	const seedEnvelopeB64 = attestedSeed(f);
+	const zeroAudit = { version: 3 as const, kind: "accounting-only-request-audit" as const,
+		requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
+	const older = { version: 1, kind: "untrusted-version-bound-research-history",
+		entries: [{ goalRunId: "old-goal", taskId: "T001", originalContractId: "old-contract",
+			files: Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`old-file-${i}.txt`, `old-${i}`])) }] };
+	const currentHistory = { version: 1, kind: "untrusted-version-bound-research-history",
+		entries: [{ goalRunId: "new-goal", taskId: "T002", originalContractId: "new-contract",
+			files: { "candidate.cpp": "new source", "verification.json": "{}",
+				"experiment-plan.json": "{}", "workflow-archive.json": "{}",
+				"lesson-delta.json": "{}", "execution-capabilities.json": "{}" } }] };
+	const firstOpening = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7002, sha("b")),
+		request: github([anchor, first]), loadCarryArtifact: async () => "unused" });
+	const firstCarry = firstOpening.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: zeroAudit,
+		privateBundle: { ...firstOpening.priorPrivateBundle!, "research-history.json": JSON.stringify(older) } });
+	const firstDone = { ...first, status: "completed", conclusion: "success" };
+	const secondRun = run(7003, 3, "in_progress", sha("c"));
+	const secondOpening = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7003, sha("c")),
+		request: github([anchor, firstDone, secondRun]), loadCarryArtifact: async () => firstCarry });
+	const secondCarry = secondOpening.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: zeroAudit,
+		privateBundle: { ...secondOpening.priorPrivateBundle!,
+			"research-history.json": JSON.stringify(currentHistory) } });
+	const secondDone = { ...secondRun, status: "completed", conclusion: "success" };
+	const thirdRun = run(7004, 4, "in_progress", sha("d"));
+	const base = github([anchor, firstDone, secondDone, thirdRun]);
+	let predecessorExpired = false;
+	const request: typeof fetch = (url, init) => {
+		const address = String(url);
+		if (address.includes("/runs/7002/artifacts?"))
+			return Promise.resolve(new Response(JSON.stringify({ total_count: 1, artifacts: [{
+				id: 9002, name: CARRY_ARTIFACT_NAME, expired: predecessorExpired,
+				workflow_run: { id: 7002, head_sha: sha("b") } }] })));
+		if (address.includes("/runs/7003/artifacts?"))
+			return Promise.resolve(new Response(JSON.stringify({ total_count: 1, artifacts: [{
+				id: 9003, name: CARRY_ARTIFACT_NAME, expired: false,
+				workflow_run: { id: 7003, head_sha: sha("c") } }] })));
+		if (address.includes("/runs/7003/jobs?"))
+			return Promise.resolve(new Response(JSON.stringify({ total_count: 1, jobs: [{ id: 6003,
+				run_id: 7003, run_attempt: 1, head_sha: sha("c"), name: "private-campaign",
+				status: "completed", conclusion: "success", steps: [{ name: "Run bounded private campaign",
+					status: "completed", conclusion: "success" }] }] })));
+		return base(url, init);
+	};
+	const openThird = () => openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7004, sha("d")), request,
+		loadCarryArtifact: async ({ runId }) => runId === "7002" ? firstCarry : secondCarry });
+	const third = await openThird();
+	const predecessor = await third.recoverImmediatePredecessorResearchHistory();
+	assert(isAuthenticatedPredecessorResearchHistory(predecessor));
+	assert.equal(predecessor.artifact.artifactId, "9002");
+	const entries = reconcileHistoricalResearchEntries(currentHistory.entries, older.entries);
+	const interim = JSON.stringify({ ...currentHistory, entries });
+	const finalHistoryText = JSON.stringify({ ...currentHistory, entries,
+		predecessorHistoryReconciliation: { version: 2,
+			kind: "authenticated-predecessor-history-reconciled",
+			source: predecessor.source, envelopeSha256: predecessor.envelopeSha256,
+			entriesSha256: createHash("sha256").update(JSON.stringify(entries)).digest("hex"),
+			selectedTransitionsSha256: createHash("sha256").update(JSON.stringify(
+				authenticatedSelectedTransitions(third.priorCarryProof, third.priorPrivateBundle) ?? []))
+				.digest("hex") } });
+	const steps = [{ predecessor, resultingHistoryText: interim }];
+	assert.throws(() => third.attestEmergencyRestoredResearchHistory({
+		originalBundle: third.priorPrivateBundle!, steps: [{ predecessor: { ...predecessor },
+			resultingHistoryText: interim }], finalHistoryText }), /exact predecessor proof/);
+	assert.throws(() => third.attestEmergencyRestoredResearchHistory({
+		originalBundle: third.priorPrivateBundle!, steps,
+		finalHistoryText: `${finalHistoryText} forged` }), /differs from verified walk/);
+	const receipt = third.attestEmergencyRestoredResearchHistory({
+		originalBundle: third.priorPrivateBundle!, steps, finalHistoryText });
+	const ordinaryRecovered = await openThird();
+	const ordinaryPredecessor = await ordinaryRecovered.recoverImmediatePredecessorResearchHistory();
+	assert(isAuthenticatedPredecessorResearchHistory(ordinaryPredecessor));
+	const ordinarySteps = [{ predecessor: ordinaryPredecessor,
+		resultingHistoryText: JSON.stringify({ ...currentHistory, entries }) }];
+	const ordinaryFinal = JSON.stringify({ ...currentHistory, entries,
+		predecessorHistoryReconciliation: { version: 2,
+			kind: "authenticated-predecessor-history-reconciled",
+			source: ordinaryPredecessor.source,
+			envelopeSha256: ordinaryPredecessor.envelopeSha256,
+			entriesSha256: createHash("sha256").update(JSON.stringify(entries)).digest("hex"),
+			selectedTransitionsSha256: createHash("sha256").update("[]").digest("hex") } });
+	const ordinaryReceipt = ordinaryRecovered.attestEmergencyRestoredResearchHistory({
+		originalBundle: ordinaryRecovered.priorPrivateBundle!, steps: ordinarySteps,
+		finalHistoryText: ordinaryFinal });
+	assert.throws(() => ordinaryRecovered.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: zeroAudit,
+		privateBundle: { ...ordinaryRecovered.priorPrivateBundle!,
+			"research-history.json": ordinaryFinal } }),
+		/new v2 research history marker lacks exact verified recovery receipt/);
+	const ordinarySealed = ordinaryRecovered.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: zeroAudit,
+		privateBundle: { ...ordinaryRecovered.priorPrivateBundle!,
+			"research-history.json": ordinaryFinal } }, ordinaryReceipt);
+	assert.ok(ordinarySealed.envelopeB64);
+	assert.throws(() => third.sealEmergencyCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: zeroAudit,
+		privateBundle: { ...third.priorPrivateBundle!, "research-history.json": "forged" } },
+		"effect-review-incomplete", receipt), /exact verified receipt/);
+	const emergency = third.sealEmergencyCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: zeroAudit,
+		privateBundle: { ...third.priorPrivateBundle!, "candidate.cpp": "forged selection" } },
+		"effect-review-incomplete", receipt);
+	const seed = await authenticateSignedMissionSeed({ ...f, envelopeB64: seedEnvelopeB64 });
+	const decoded = decodeV4Checkpoint(emergency, seed.seedDigest,
+		seed.derivePrivateKey("mul-pis-ledger-continuation-v1"),
+		{ runId: "7004", runAttempt: 1, runNumber: 4, commit: sha("d") });
+	assert.equal(decoded.privateBundle["research-history.json"], finalHistoryText);
+	assert.equal(decoded.privateBundle["candidate.cpp"], third.priorPrivateBundle!["candidate.cpp"]);
+	assert.equal(decoded.currentEffectReview, "pending");
+	const ordinary = await openThird();
+	const ordinaryEmergency = ordinary.sealEmergencyCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: zeroAudit,
+		privateBundle: { ...ordinary.priorPrivateBundle!, "research-history.json": finalHistoryText } },
+		"effect-review-incomplete");
+	const oldDecoded = decodeV4Checkpoint(ordinaryEmergency, seed.seedDigest,
+		seed.derivePrivateKey("mul-pis-ledger-continuation-v1"),
+		{ runId: "7004", runAttempt: 1, runNumber: 4, commit: sha("d") });
+	assert.equal(oldDecoded.privateBundle["research-history.json"], JSON.stringify(currentHistory));
+	predecessorExpired = true;
+	const incomplete = await openThird();
+	const unavailable = await incomplete.recoverImmediatePredecessorResearchHistory();
+	assert.equal(unavailable.kind, "predecessor-research-history-unavailable");
+	if (unavailable.kind !== "predecessor-research-history-unavailable" ||
+		!unavailable.predecessor) return;
+	const unverifiedHistoryText = JSON.stringify({ ...currentHistory,
+		predecessorHistoryReconciliation: { version: 2,
+			kind: "historical-completeness-unverified",
+			source: unavailable.predecessor.source,
+			envelopeSha256: unavailable.predecessor.envelopeSha256,
+			reason: unavailable.reason,
+			entriesSha256: createHash("sha256").update(JSON.stringify(currentHistory.entries)).digest("hex"),
+			selectedTransitionsSha256: createHash("sha256").update(JSON.stringify(
+				authenticatedSelectedTransitions(incomplete.priorCarryProof, incomplete.priorPrivateBundle) ?? []))
+				.digest("hex") } });
+	assert.throws(() => incomplete.attestEmergencyRestoredResearchHistory({
+		originalBundle: incomplete.priorPrivateBundle!, steps: [],
+		unavailable: { ...unavailable }, finalHistoryText: unverifiedHistoryText }),
+		/unavailable history lacks/);
+	const incompleteReceipt = incomplete.attestEmergencyRestoredResearchHistory({
+		originalBundle: incomplete.priorPrivateBundle!, steps: [], unavailable,
+		finalHistoryText: unverifiedHistoryText });
+	const incompleteCarry = incomplete.sealEmergencyCurrent({ settledCny: 0,
+		unknownObservedCny: 0, unpricedRequestCount: 0, requestAudit: zeroAudit },
+		"effect-review-incomplete", incompleteReceipt);
+	const incompleteDecoded = decodeV4Checkpoint(incompleteCarry, seed.seedDigest,
+		seed.derivePrivateKey("mul-pis-ledger-continuation-v1"),
+		{ runId: "7004", runAttempt: 1, runNumber: 4, commit: sha("d") });
+	assert.equal(incompleteDecoded.privateBundle["research-history.json"], unverifiedHistoryText);
+	predecessorExpired = false;
+	const thirdDone = { ...thirdRun, status: "completed", conclusion: "failure" };
+	const fourthRun = run(7005, 5, "in_progress", sha("e"));
+	const fourthBase = github([anchor, firstDone, secondDone, thirdDone, fourthRun]);
+	const fourthRequest: typeof fetch = (url, init) => {
+		const address = String(url);
+		if (address.includes("/workflows/manual-private-campaign.yml/runs?"))
+			return fourthBase(url, init);
+		if (address.includes("/runs/7004/artifacts?"))
+			return Promise.resolve(new Response(JSON.stringify({ total_count: 1, artifacts: [{
+				id: 9004, name: CARRY_ARTIFACT_NAME, expired: false,
+				workflow_run: { id: 7004, head_sha: sha("d") } }] })));
+		if (address.includes("/runs/7004/jobs?"))
+			return Promise.resolve(new Response(JSON.stringify({ total_count: 1, jobs: [{ id: 6004,
+				run_id: 7004, run_attempt: 1, head_sha: sha("d"), name: "private-campaign",
+				status: "completed", conclusion: "failure", steps: [{ name: "Run bounded private campaign",
+					status: "completed", conclusion: "failure" }] }] })));
+		return request(url, init);
+	};
+	const reopened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7005, sha("e")), request: fourthRequest,
+		loadCarryArtifact: async () => emergency });
+	assert.equal(reopened.priorPrivateBundle?.["research-history.json"], finalHistoryText);
+	assert.equal(reopened.priorPrivateBundle?.["candidate.cpp"], third.priorPrivateBundle!["candidate.cpp"]);
+	assert.deepEqual(reopened.priorRunControlObservation, {
+		source: { runId: "7004", runAttempt: 1, runNumber: 4, commit: sha("d") },
+		requestCount: 0, responseReceivedCount: 0, unknownCount: 0,
+		currentEffectReviewPending: true, selectionAuthority: false, complete: false });
+	assert.equal(authenticatedPriorCarryBindsBundle(reopened.priorCarryProof,
+		reopened.priorPrivateBundle), true);
+	predecessorExpired = true;
+	const secondEmergency = reopened.sealEmergencyCurrent({ settledCny: 0,
+		unknownObservedCny: 0, unpricedRequestCount: 0, requestAudit: zeroAudit },
+		"effect-review-incomplete");
+	const fourthDone = { ...fourthRun, status: "completed", conclusion: "failure" };
+	const fifthRun = run(7006, 6, "in_progress", sha("f"));
+	const fifthBase = github([anchor, firstDone, secondDone, thirdDone, fourthDone, fifthRun]);
+	const fifthRequest: typeof fetch = (url, init) => {
+		const address = String(url);
+		if (address.includes("/workflows/manual-private-campaign.yml/runs?"))
+			return fifthBase(url, init);
+		if (address.includes("/runs/7005/artifacts?"))
+			return Promise.resolve(new Response(JSON.stringify({ total_count: 1, artifacts: [{
+				id: 9005, name: CARRY_ARTIFACT_NAME, expired: false,
+				workflow_run: { id: 7005, head_sha: sha("e") } }] })));
+		if (address.includes("/runs/7005/jobs?"))
+			return Promise.resolve(new Response(JSON.stringify({ total_count: 1, jobs: [{ id: 6005,
+				run_id: 7005, run_attempt: 1, head_sha: sha("e"), name: "private-campaign",
+				status: "completed", conclusion: "failure", steps: [{ name: "Run bounded private campaign",
+					status: "completed", conclusion: "failure" }] }] })));
+		return fourthRequest(url, init);
+	};
+	const collectionDir = path.join(path.dirname(f.publicKeyFile), "unselected-collection");
+	await mkdir(collectionDir);
+	const newUnselectedEntry = { goalRunId: "unselected-goal", taskId: "T003",
+		originalContractId: "unselected-contract", files: { "workflow-archive.json": JSON.stringify({
+			version: 1, kind: "m07-private-candidate-archive",
+			goalRunId: "unselected-goal", taskId: "T003" }) } };
+	await writeFile(path.join(collectionDir, "research-history.json"), JSON.stringify({
+		...JSON.parse(finalHistoryText), entries: [...JSON.parse(finalHistoryText).entries,
+			newUnselectedEntry] }));
+	const collected = await offlineChecks.collectContinuationBundle(collectionDir,
+		reopened.priorPrivateBundle!);
+	assert(collected);
+	const collectedHistory = JSON.parse(collected["research-history.json"]!);
+	assert.equal(collectedHistory.predecessorHistoryReconciliation, undefined,
+		"a new unselected entry retires the covered v2 marker");
+	assert.equal(collectedHistory.entries[1].files["old-file-9.txt"], "old-9");
+	assert.equal(collectedHistory.entries[2].goalRunId, "unselected-goal");
+	const appendedOpening = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7005, sha("e")), request: fourthRequest,
+		loadCarryArtifact: async () => emergency });
+	const appendedCarry = appendedOpening.sealCurrent({ settledCny: 0,
+		unknownObservedCny: 0, unpricedRequestCount: 0, requestAudit: zeroAudit,
+		privateBundle: collected });
+	const appendedReopened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7006, sha("f")), request: fifthRequest,
+		loadCarryArtifact: async () => appendedCarry });
+	const appendedHistory = JSON.parse(appendedReopened.priorPrivateBundle!["research-history.json"]!);
+	assert.equal(appendedHistory.entries.length, 3);
+	assert.equal(appendedHistory.entries[1].files["old-file-9.txt"], "old-9");
+	assert.equal(appendedHistory.entries[2].goalRunId, "unselected-goal");
+	assert.equal(appendedReopened.priorPrivateBundle?.["candidate.cpp"],
+		reopened.priorPrivateBundle!["candidate.cpp"]);
+	assert.equal(appendedReopened.priorUnpricedRequestCount, reopened.priorUnpricedRequestCount);
+	const twiceReopened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7006, sha("f")), request: fifthRequest,
+		loadCarryArtifact: async () => secondEmergency });
+	const retained = JSON.parse(twiceReopened.priorPrivateBundle!["research-history.json"]!);
+	assert.equal(retained.entries.length, 2);
+	assert.equal(retained.entries[1].files["old-file-9.txt"], "old-9");
+	assert.equal(twiceReopened.priorPrivateBundle?.["candidate.cpp"],
+		third.priorPrivateBundle!["candidate.cpp"]);
+	assert.equal(twiceReopened.priorUnpricedRequestCount, reopened.priorUnpricedRequestCount);
+	assert.equal(await offlineChecks.recoverAuthenticatedHistoricalVersions(twiceReopened,
+		twiceReopened.priorPrivateBundle!), twiceReopened.priorPrivateBundle,
+		"a current v2 marker preserves restored bytes after the older archive expires");
+	predecessorExpired = false;
+	const skippedOpening = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+		githubToken: "synthetic-token", current: current(7005, sha("e")), request: fourthRequest,
+		loadCarryArtifact: async ({ runId }) => runId === "7002" ? firstCarry : ordinaryEmergency });
+	const skipped = await skippedOpening.recoverImmediatePredecessorResearchHistory({
+		source: predecessor.source, envelopeSha256: predecessor.envelopeSha256 });
+	assert(isAuthenticatedPredecessorResearchHistory(skipped));
+	assert.throws(() => skippedOpening.attestEmergencyRestoredResearchHistory({
+		originalBundle: skippedOpening.priorPrivateBundle!,
+		steps: [{ predecessor: skipped, resultingHistoryText: interim }],
+		finalHistoryText }), /adjacent|exact predecessor proof/,
+	"an older branded artifact cannot hide an available intermediate ancestry hop");
+	const staleMarkerHistory = { ...currentHistory, predecessorHistoryReconciliation: {
+		version: 2, kind: "authenticated-predecessor-history-reconciled",
+		source: { runId: "7003", runAttempt: 1, runNumber: 3, commit: sha("c") },
+		envelopeSha256: createHash("sha256").update(Buffer.from(secondCarry.envelopeB64,
+			"base64")).digest("hex"),
+		entriesSha256: createHash("sha256").update(JSON.stringify(currentHistory.entries)).digest("hex"),
+		selectedTransitionsSha256: "f".repeat(64) } };
+	const staleThird = await openThird();
+	assert.throws(() => staleThird.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: zeroAudit,
+		privateBundle: { ...staleThird.priorPrivateBundle!,
+			"research-history.json": JSON.stringify(staleMarkerHistory) } }),
+		/new v2 research history marker lacks exact verified recovery receipt/,
+	"ordinary sealing cannot authenticate a forged selected-transition frontier marker");
+});
+
 test("historical six-field grounded nextTask survives v4/v3 carry without acquiring authority", async t => {
 	const f = await fixture(t);
 	const contract = createOriginalObjective({ goal: "Synthetic source-grounded mission",
