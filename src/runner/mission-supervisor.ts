@@ -12,6 +12,8 @@ import { isVerifiedLinkedUnknownDelivery, isVerifiedWorkflowRepairPlan,
 import type { TestedControlBinding } from "./mission-resume-journal.ts";
 import { isVerifiedInterruptedSourceCapability,
 	type VerifiedInterruptedSourceCapabilityV1 } from "./interrupted-source-review.ts";
+import { isVerifiedTerminalPrefixSourceCapability,
+	type VerifiedTerminalPrefixSourceCapabilityV1 } from "./terminal-prefix-source-review.ts";
 import { isVerifiedProviderAvailabilityProof,
 	type VerifiedProviderAvailabilityProofV1 } from "./provider-availability-proof.ts";
 
@@ -69,6 +71,21 @@ export type TerminalInterruptionEvidenceV1 = Readonly<{
 	terminationOrigin: "unknown";
 }>;
 
+/** Resultless terminal execution with an authenticated periodic host prefix.
+ * The prefix is partial: the unobserved suffix, effects and fee stay UNKNOWN. */
+export type TerminalPrefixInterruptionEvidenceV1 = Readonly<{
+	version: 1; kind: "host-verified-terminal-prefix-interruption";
+	source: Source; priorCarrySource: Source; priorCarryEnvelopeSha256: string;
+	prefixArtifactId: string; prefixArchiveSha256: string;
+	prefixSha256: string; prefixSequence: number;
+	terminal: Readonly<{ workflowId: string; runStatus: "completed"; runConclusion: string;
+		jobId: string; jobName: "private-campaign"; jobStatus: "completed";
+		jobConclusion: string; jobRunId: string; jobRunAttempt: number; jobHeadSha: string;
+		providerStepStatus: "completed"; providerStepConclusion: string }>;
+	accounting: "unquantified"; effects: "unknown-unreconciled";
+	terminationOrigin: "unknown";
+}>;
+
 /** An Actions cancellation or process abort does not establish who requested it. */
 export type HostCancellationEventV1 = Readonly<{
 	version: 1; kind: "host-verified-cancellation-origin";
@@ -111,6 +128,14 @@ export type CurrentInterruptionActionV1 = Readonly<{
 	action: PendingActionV1;
 }>;
 
+export type CurrentPrefixInterruptionActionV1 = Readonly<{
+	version: 1; kind: "current-host-prefix-interruption-action";
+	source: Source; priorCarryEnvelopeSha256: string;
+	priorCheckpointSha256: string; prefixArchiveSha256: string;
+	prefixSha256: string; prefixSequence: number;
+	action: PendingActionV1;
+}>;
+
 /** A verified launch contract promises a successor will enforce the existing
  * fresh-work boundary. It does not claim the future workspace already exists. */
 export type FreshIndependentLaunchContractV1 = Readonly<{
@@ -145,12 +170,15 @@ export type SupervisorSnapshot = Readonly<{
 	pendingAction?: PendingActionV1;
 	currentDerivedAction?: CurrentDerivedActionV1;
 	currentInterruptionAction?: CurrentInterruptionActionV1;
+	currentPrefixInterruptionAction?: CurrentPrefixInterruptionActionV1;
 	terminalCarry?: TerminalCarryEvidenceV1;
 	terminalInterruption?: TerminalInterruptionEvidenceV1;
+	terminalPrefixInterruption?: TerminalPrefixInterruptionEvidenceV1;
 	cancellationEvent?: HostCancellationEventV1;
 	freshIndependentWork?: FreshIndependentWorkEvidenceV1;
 	freshLaunchContract?: FreshIndependentLaunchContractV1;
 	interruptedSourceReview?: VerifiedInterruptedSourceCapabilityV1;
+	terminalPrefixSourceReview?: VerifiedTerminalPrefixSourceCapabilityV1;
 	workflowRepairPlan?: VerifiedWorkflowRepairPlanV1;
 	providerAvailabilityProof?: VerifiedProviderAvailabilityProofV1;
 	linkedUnknownDelivery?: LinkedUnknownDeliveryV1;
@@ -165,10 +193,15 @@ export type ResumeIntent = Readonly<{
 	pendingAction: PendingActionV1;
 	actionProvenance?: Readonly<{ kind: "current-host-derived"; checkpointSha256: string } |
 		{ kind: "current-host-interruption"; priorCheckpointSha256: string;
-			resultArchiveSha256: string }>;
+			resultArchiveSha256: string } |
+		{ kind: "current-host-prefix-interruption"; priorCheckpointSha256: string;
+			prefixArchiveSha256: string; prefixSha256: string; prefixSequence: number }>;
 	terminalInterruption?: TerminalInterruptionEvidenceV1;
+	terminalPrefixInterruption?: TerminalPrefixInterruptionEvidenceV1;
 	/** Private receipt identity and exact reviewed source; never enters the control descriptor. */
 	interruptedSourceReview?: Readonly<{ source: Source; sourceTree: string; receiptSha256: string }>;
+	terminalPrefixSourceReview?: Readonly<{ source: Source; sourceTree: string;
+		receiptSha256: string }>;
 	/** Private review identity; never enters the public control descriptor. */
 	workflowRepair?: Readonly<{ reviewedPlanSha256: string; testedSourceCommit: string;
 		testedTree: string; successfulCi: VerifiedWorkflowRepairPlanV1["replacement"]["successfulCi"] }>;
@@ -228,7 +261,11 @@ export function pendingActionIdentity(action: PendingActionV1): string {
  * Unknown external effects are quarantined while independent fresh work can
  * continue. No fixed retry, time, or fee count appears in this planner. */
 export function planMissionContinuation(snapshot: SupervisorSnapshot): SupervisorDecision {
-	const { status, pendingAction, terminalCarry, terminalInterruption, dispatchRecord } = snapshot;
+	const { status, pendingAction, terminalCarry, terminalInterruption,
+		terminalPrefixInterruption, dispatchRecord } = snapshot;
+	if (terminalInterruption && terminalPrefixInterruption)
+		fail("terminal interruption variants are mutually exclusive");
+	const anyInterruption = Boolean(terminalInterruption || terminalPrefixInterruption);
 	if (status?.version !== 1 || status.kind !== "host-redacted-mission-status" ||
 		!ref(status.contractId) || !hex64(status.selectedTupleSha256) ||
 		!refs(status.unresolvedOperationRefs) ||
@@ -272,15 +309,39 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 		terminalInterruption.effects !== "unknown-unreconciled" ||
 		terminalInterruption.terminationOrigin !== "unknown"))
 		fail("terminal interruption does not bind the authenticated prior carry");
-	if (snapshot.cancellationEvent && !terminalInterruption && status.stopReason !== "cancelled")
+	if (terminalPrefixInterruption && (terminalPrefixInterruption.version !== 1 ||
+		terminalPrefixInterruption.kind !== "host-verified-terminal-prefix-interruption" ||
+		!sourceId(terminalPrefixInterruption.source) ||
+		!sourceId(terminalPrefixInterruption.priorCarrySource) ||
+		canonical(terminalPrefixInterruption.priorCarrySource) !== canonical(terminalCarry.source) ||
+		terminalPrefixInterruption.priorCarryEnvelopeSha256 !== terminalCarry.envelopeSha256 ||
+		terminalPrefixInterruption.source.runId === terminalCarry.source.runId ||
+		!/^[1-9][0-9]{0,17}$/.test(terminalPrefixInterruption.prefixArtifactId) ||
+		!hex64(terminalPrefixInterruption.prefixArchiveSha256) ||
+		!hex64(terminalPrefixInterruption.prefixSha256) ||
+		!Number.isSafeInteger(terminalPrefixInterruption.prefixSequence) ||
+		terminalPrefixInterruption.prefixSequence < 1 ||
+		terminalPrefixInterruption.terminal?.runStatus !== "completed" ||
+		terminalPrefixInterruption.terminal.jobStatus !== "completed" ||
+		terminalPrefixInterruption.terminal.providerStepStatus !== "completed" ||
+		!["timed_out", "cancelled"].includes(terminalPrefixInterruption.terminal.runConclusion) ||
+		terminalPrefixInterruption.terminal.jobRunId !== terminalPrefixInterruption.source.runId ||
+		terminalPrefixInterruption.terminal.jobRunAttempt !== terminalPrefixInterruption.source.runAttempt ||
+		terminalPrefixInterruption.terminal.jobHeadSha !== terminalPrefixInterruption.source.commit ||
+		terminalPrefixInterruption.accounting !== "unquantified" ||
+		terminalPrefixInterruption.effects !== "unknown-unreconciled" ||
+		terminalPrefixInterruption.terminationOrigin !== "unknown"))
+		fail("terminal prefix interruption does not bind the authenticated prior carry");
+	if (snapshot.cancellationEvent && !anyInterruption && status.stopReason !== "cancelled")
 		fail("cancellation origin is unrelated to current terminal status");
-	if (terminalInterruption && snapshot.cancellationEvent) {
+	if (anyInterruption && snapshot.cancellationEvent) {
 		const event = snapshot.cancellationEvent;
+		const interruptedSource = (terminalInterruption ?? terminalPrefixInterruption)!.source;
 		if (event.version !== 1 || event.kind !== "host-verified-cancellation-origin" ||
 			!sourceId(event.source) || !ref(event.evidenceRef) ||
-			event.source.runId !== terminalInterruption.source.runId ||
-			event.source.runAttempt !== terminalInterruption.source.runAttempt ||
-			event.source.commit !== terminalInterruption.source.commit ||
+			event.source.runId !== interruptedSource.runId ||
+			event.source.runAttempt !== interruptedSource.runAttempt ||
+			event.source.commit !== interruptedSource.commit ||
 			event.envelopeSha256 !== terminalCarry.envelopeSha256)
 			fail("cancellation origin does not bind terminal interruption");
 		if (event.origin === "explicit-user-request")
@@ -291,7 +352,7 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 	if (status.objectiveOutcome === "fulfilled") {
 		if (snapshot.linkedUnknownDelivery)
 			fail("an unobserved old control delivery cannot close the mission");
-		if (terminalInterruption)
+		if (anyInterruption)
 			return { kind: "wait", reason: "accounting-chain-needs-reconciliation" };
 		if (status.stopReason !== null || status.pendingAction !== undefined ||
 			pendingAction !== undefined || terminalCarry.pendingActionSha256 !== null ||
@@ -331,7 +392,7 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 			availability.testedSourceCommit !== snapshot.freshLaunchContract?.testedSourceCommit)
 			fail("provider availability proof does not bind the held terminal carry and tested source");
 	}
-	if (terminalInterruption && status.pendingAction?.humanRequired) {
+	if (anyInterruption && status.pendingAction?.humanRequired) {
 		pendingActionIdentity(status.pendingAction);
 		const blocker = status.pendingAction.verifiedHumanBlocker;
 		if (!blocker)
@@ -339,11 +400,11 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 		return { kind: "exclusive-external-input",
 			blocker: blocker! };
 	}
-	if (terminalInterruption && status.stopReason === "accounting-integrity-error")
+	if (anyInterruption && status.stopReason === "accounting-integrity-error")
 		return { kind: "wait", reason: "accounting-chain-needs-reconciliation" };
-	if (terminalInterruption && status.stopReason === "workflow-repair-needed")
+	if (anyInterruption && status.stopReason === "workflow-repair-needed")
 		return { kind: "wait", reason: "workflow-repair-plan-required" };
-	if (terminalInterruption && status.stopReason === "assessment-evidence-suspended") {
+	if (anyInterruption && status.stopReason === "assessment-evidence-suspended") {
 		if (status.pendingAction) pendingActionIdentity(status.pendingAction);
 		return { kind: "restore-evidence", evidenceRefs: status.pendingAction?.evidenceRefs ?? [] };
 	}
@@ -373,7 +434,32 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 		actionProvenance = { kind: "current-host-interruption",
 			priorCheckpointSha256: interrupted.priorCheckpointSha256,
 			resultArchiveSha256: interrupted.resultArchiveSha256 };
+	} else if (terminalPrefixInterruption) {
+		const prefixAction = snapshot.currentPrefixInterruptionAction;
+		if (!prefixAction) return { kind: "wait", reason: "terminal-action-needs-reclassification" };
+		if (derived || interrupted || prefixAction.version !== 1 ||
+			prefixAction.kind !== "current-host-prefix-interruption-action" ||
+			!sourceId(prefixAction.source) ||
+			canonical(prefixAction.source) !== canonical(terminalPrefixInterruption.source) ||
+			prefixAction.priorCarryEnvelopeSha256 !== terminalCarry.envelopeSha256 ||
+			prefixAction.priorCheckpointSha256 !== terminalCarry.checkpointSha256 ||
+			prefixAction.prefixArchiveSha256 !== terminalPrefixInterruption.prefixArchiveSha256 ||
+			prefixAction.prefixSha256 !== terminalPrefixInterruption.prefixSha256 ||
+			prefixAction.prefixSequence !== terminalPrefixInterruption.prefixSequence ||
+			prefixAction.action.reasonCode !== "execution-interrupted" ||
+			canonical(prefixAction.action) !== canonical(classifyPendingAction("execution-interrupted",
+				{ unresolvedOperationRefs: [...status.unresolvedOperationRefs] })))
+			fail("current prefix interruption action lacks host provenance");
+		action = prefixAction.action;
+		actionSha = pendingActionIdentity(action);
+		actionProvenance = { kind: "current-host-prefix-interruption",
+			priorCheckpointSha256: prefixAction.priorCheckpointSha256,
+			prefixArchiveSha256: prefixAction.prefixArchiveSha256,
+			prefixSha256: prefixAction.prefixSha256,
+			prefixSequence: prefixAction.prefixSequence };
 	} else if (interrupted) fail("interruption action has no terminal gap");
+	else if (snapshot.currentPrefixInterruptionAction)
+		fail("prefix interruption action has no terminal gap");
 	else if (derived) {
 		if (status.pendingAction !== undefined || pendingAction !== undefined ||
 			terminalCarry.pendingActionSha256 !== null ||
@@ -407,7 +493,8 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 			fail("pending action does not match authenticated checkpoint and carry");
 	}
 	const quarantinedOperationRefs = action.target?.operationRefs ?? [];
-	const selectedResumeSource = terminalInterruption?.source ?? terminalCarry.source;
+	const selectedResumeSource = terminalInterruption?.source ??
+		terminalPrefixInterruption?.source ?? terminalCarry.source;
 	const resumeSource = { runId: selectedResumeSource.runId,
 		runAttempt: selectedResumeSource.runAttempt, commit: selectedResumeSource.commit };
 	if (!sameSet(status.unresolvedOperationRefs, quarantinedOperationRefs) ||
@@ -463,6 +550,26 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 			receiptSha256: review.receiptSha256 };
 	} else if (snapshot.interruptedSourceReview !== undefined)
 		fail("interrupted source review has no terminal gap");
+	let terminalPrefixSourceReview: ResumeIntent["terminalPrefixSourceReview"];
+	if (terminalPrefixInterruption) {
+		const review = snapshot.terminalPrefixSourceReview;
+		if (!review) return { kind: "wait", reason: "interruption-source-review-required" };
+		if (!isVerifiedTerminalPrefixSourceCapability(review) ||
+			!sourceId(review.source) || !hex64(review.receiptSha256) ||
+			!/^[0-9a-f]{40}$/.test(review.sourceTree) ||
+			canonical(review.source) !== canonical(resumeSource) ||
+			review.grant.mode !== "fresh-only-confined-effects" ||
+			review.grant.oldResultUse !== "untrusted-no-replay-no-adoption" ||
+			review.grant.state !== "fresh-workspace-empty-store-no-resume" ||
+			review.grant.m07Tools !== "factory-confined-local" ||
+			review.grant.assessorAndM04ReviewerSessions !== "read-only" ||
+			review.grant.outputTransport !== "encrypted-fixed" ||
+			review.grant.providerInference !== "fixed-configured-provider")
+			fail("terminal prefix source review is not verified for the source");
+		terminalPrefixSourceReview = { source: { ...review.source },
+			sourceTree: review.sourceTree, receiptSha256: review.receiptSha256 };
+	} else if (snapshot.terminalPrefixSourceReview !== undefined)
+		fail("terminal prefix source review has no terminal gap");
 	if (action.kind === "repair-workflow-state" && status.stopReason !== "workflow-repair-needed")
 		fail("workflow repair action has an unrelated objective stop");
 	if (status.stopReason === "workflow-repair-needed") {
@@ -474,7 +581,7 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 	// An executed run with no carry has an unknowable actor and billing suffix.
 	// A fresh launch must prove the next process enforces the isolation boundary
 	// even if the older carried action itself was read-only repair.
-	if (terminalInterruption && !launchVerified)
+	if (anyInterruption && !launchVerified)
 		return { kind: "wait", reason: "quarantined-operation-needs-reconciliation" };
 	if (action.safety === "no-replay-until-reconciled") {
 		const fresh = snapshot.freshIndependentWork;
@@ -571,7 +678,9 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 		contractId: status.contractId, selectedTupleSha256: status.selectedTupleSha256,
 		pendingActionSha256: actionSha,
 		...(terminalInterruption ? { terminalInterruption } : {}),
+		...(terminalPrefixInterruption ? { terminalPrefixInterruption } : {}),
 		...(interruptedSourceReview ? { interruptedSourceReview } : {}),
+		...(terminalPrefixSourceReview ? { terminalPrefixSourceReview } : {}),
 		...(actionProvenance ? { actionProvenance } : {}),
 		...(workflowRepair ? { workflowRepair } : {}),
 		...(linkedUnknownDelivery ? { linkedUnknownDelivery } : {}) }));
@@ -591,14 +700,17 @@ export function planMissionContinuation(snapshot: SupervisorSnapshot): Superviso
 		pendingActionSha256: actionSha, actionKind: action.kind,
 		pendingAction: structuredClone(action),
 		...(terminalInterruption ? { terminalInterruption: structuredClone(terminalInterruption) } : {}),
+		...(terminalPrefixInterruption ?
+			{ terminalPrefixInterruption: structuredClone(terminalPrefixInterruption) } : {}),
 		...(interruptedSourceReview ? { interruptedSourceReview } : {}),
+		...(terminalPrefixSourceReview ? { terminalPrefixSourceReview } : {}),
 		...(actionProvenance ? { actionProvenance } : {}),
 		...(workflowRepair ? { workflowRepair } : {}),
 		...(linkedUnknownDelivery ? { linkedUnknownDelivery } : {}),
 		boundary: "new-isolated-workspace-no-prior-session-resume",
 		quarantinedOperationRefs: [...quarantinedOperationRefs],
 		m04TransactionQuarantined: action.kind === "reconcile-m04-transaction" ||
-			Boolean(terminalInterruption) } };
+			anyInterruption } };
 }
 
 export type ResumeTriggerReceipt = Readonly<

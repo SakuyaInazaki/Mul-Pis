@@ -6,6 +6,15 @@ import { IncrementalCheckpointError, IncrementalPrivateCheckpointJournal,
 import { inflateRawSync } from "node:zlib";
 import { CARRY_LOGICAL_BYTES, CARRY_SEGMENT_FILE_BYTES, carrySidecarName, decodeCarrySidecars,
 	encodeCarrySidecars, validCarrySidecarManifest } from "./carry-sidecar-codec.ts";
+import { PREFIX_SIDECAR_FILE_BYTES, decodeHistoricalPrefixSidecars,
+	encodeHistoricalPrefixSidecars, historicalPrefixSidecarName,
+	isHistoricalPrefixSidecarName, validHistoricalPrefixSidecarManifest,
+	type HistoricalPrefixSidecarManifest } from "./incremental-prefix-sidecar-codec.ts";
+import { ARTIFACT_PARTITION_MANIFEST_FILE, ARTIFACT_PARTITION_PAYLOAD_BYTES,
+	MAX_ARTIFACT_PARTITION_MANIFEST_BYTES, artifactPartitionPartFile,
+	isOpenedPartitionManifest, openPartitionManifest, restorePartitionFiles,
+	validatePartitionArtifactCensus, validArtifactPartitionFileName, validPartitionManifest,
+	type ArtifactPartitionManifestV1, type ArtifactTransportSource } from "./private-artifact-partition.ts";
 import { HarnessError } from "../types.ts";
 import { canonicalRestartUnknowns } from "../m07/independent-restart.ts";
 import { objectiveProgress, type ObjectiveProgressV1 } from "../m07/objective-progress.ts";
@@ -27,10 +36,28 @@ import { reconcileHistoricalResearchEntries } from "./research-history-reconcili
  * research handoff as untrusted evidence; never send keys or carry metadata there.
  */
 export const CARRY_ARTIFACT_NAME = "confidential-mission-carry";
+export const PERIODIC_PREFIX_ARTIFACT_STEM = "confidential-mission-prefix";
+export function periodicPrefixArtifactName(source: Pick<Source, "runId" | "runAttempt">,
+	sequence: number): string {
+	if (!positiveId(source.runId) || !Number.isSafeInteger(source.runAttempt) ||
+		source.runAttempt < 1 || !Number.isSafeInteger(sequence) || sequence < 1)
+		reject("periodic prefix artifact source or sequence is invalid");
+	return `${PERIODIC_PREFIX_ARTIFACT_STEM}-${source.runId}-${source.runAttempt}-${sequence}`;
+}
+function periodicPrefixSequenceFromName(name: string, source: Source): number | undefined {
+	const stem = `${PERIODIC_PREFIX_ARTIFACT_STEM}-${source.runId}-${source.runAttempt}-`;
+	if (!name.startsWith(stem)) return undefined;
+	const suffix = name.slice(stem.length);
+	if (!/^[1-9][0-9]*$/.test(suffix)) return undefined;
+	const sequence = Number(suffix);
+	return Number.isSafeInteger(sequence) && sequence > 0 &&
+		periodicPrefixArtifactName(source, sequence) === name ? sequence : undefined;
+}
 export const CARRY_FILE_NAME = "ledger-continuation.enc.json";
 export type CarryArtifactPayload = string | Readonly<{ envelopeB64: string;
-	sidecars: Readonly<Record<string, string>>; incrementalControlPrefix?: string }> |
-	Readonly<{ incrementalControlPrefix: string }>;
+	sidecars: Readonly<Record<string, string>>; incrementalControlPrefix?: string;
+	transportIndex?: ArtifactPartitionManifestV1 }> |
+	Readonly<{ incrementalControlPrefix: string; transportIndex?: ArtifactPartitionManifestV1 }>;
 const MAX_CARRY_BYTES = 8 * 1024 * 1024;
 const MAX_CARRY_ARCHIVE_BYTES = 96 * 1024 * 1024;
 const NANO = 1_000_000_000;
@@ -78,6 +105,28 @@ export type IncrementalPrefixFailure = Readonly<{
 	reason: IncrementalCheckpointFailureReason | null;
 	artifact: AuthenticatedIncrementalPrefixObservation["artifact"];
 }>;
+/** Safe, structured failure for the chosen latest partial archive. Older
+ * snapshots have no admission authority and are not downloaded. */
+export class PeriodicPrefixRecoveryError extends HarnessError {
+	readonly stage: "metadata" | "archive" | "authentication" | "sequence";
+	readonly reason: "invalid-identity" | "unavailable-or-digest-mismatch" |
+		"not-single-prefix" | "invalid-aead-prefix" | "locator-mismatch" |
+		"conflicting-highest-sequence";
+	readonly checkpointStage?: IncrementalCheckpointFailureStage;
+	readonly checkpointReason?: IncrementalCheckpointFailureReason;
+	constructor(stage: PeriodicPrefixRecoveryError["stage"],
+		reason: PeriodicPrefixRecoveryError["reason"], cause?: IncrementalCheckpointError) {
+		super(`runner.periodic-prefix-recovery.${stage}.${reason}`,
+			`periodic prefix ${stage} ${reason}`);
+		this.name = "PeriodicPrefixRecoveryError";
+		this.stage = stage;
+		this.reason = reason;
+		if (cause) {
+			this.checkpointStage = cause.stage;
+			this.checkpointReason = cause.reason;
+		}
+	}
+}
 /** A partial host observation bound to the exact Actions archive and preceding AEAD.
  * It does not settle billing, certify an unobserved suffix, or select research. */
 export type AuthenticatedIncrementalPrefixObservation = Readonly<{
@@ -85,7 +134,7 @@ export type AuthenticatedIncrementalPrefixObservation = Readonly<{
 	complete: false; selectionAuthority: false; accounting: "unquantified";
 	source: Readonly<Source>; priorCarryEnvelopeSha256: string;
 	artifact: Readonly<{ repository: typeof MISSION_REPOSITORY; artifactId: string;
-		artifactName: typeof CARRY_ARTIFACT_NAME; runId: string; archiveSha256: string;
+		artifactName: string; runId: string; archiveSha256: string;
 		digestScope: "github-artifact-archive" }>;
 	sequence: number; event: ReturnType<typeof openIncrementalControlPrefix>["event"];
 	prefixSha256: string;
@@ -159,15 +208,27 @@ type Job = { id?: number; run_id?: number; run_attempt?: number; head_sha?: stri
 type Artifact = { id?: number; name?: string; expired?: boolean; digest?: string;
 	workflow_run?: { id?: number; head_sha?: string } };
 type Source = { runId: string; runAttempt: number; runNumber: number; commit: string };
-export type OpaqueExecutedRunGap = Readonly<{
+type OpaqueGapBase = Readonly<{
+	source: Readonly<Source>; priorCarryEnvelopeSha256: string; carryArtifact: "absent";
+	accounting: "unquantified"; effects: "unreviewed" | "quarantined-source-reviewed";
+	terminal: AuthenticatedPriorCarryProof["terminal"];
+}>;
+export type ResultBackedOpaqueExecutedRunGap = OpaqueGapBase & Readonly<{
 	version: 1; kind: "opaque-executed-run-gap"; source: Readonly<Source>;
 	/** Historical field: the sealed terminal AEAD carry is absent. An artifact
 	 * under the shared carry name may contain only a nonterminal prefix. */
-	priorCarryEnvelopeSha256: string; carryArtifact: "absent";
-	accounting: "unquantified"; effects: "unreviewed" | "quarantined-source-reviewed";
-	terminal: AuthenticatedPriorCarryProof["terminal"];
 	resultArtifact: NonNullable<AuthenticatedPriorCarryProof["resultArtifact"]>;
 }>;
+/** Hard timeout or cancellation before post-steps: the partial AEAD prefix is
+ * only evidence that a host boundary was durable. All later effects and fees
+ * remain UNKNOWN, and the prior full carry remains the sole research state. */
+export type PrefixBackedOpaqueExecutedRunGap = OpaqueGapBase & Readonly<{
+	version: 2; kind: "opaque-prefix-backed-executed-run-gap";
+	prefixArtifact: AuthenticatedIncrementalPrefixObservation["artifact"];
+	prefixSequence: number;
+}>;
+export type OpaqueExecutedRunGap = ResultBackedOpaqueExecutedRunGap |
+	PrefixBackedOpaqueExecutedRunGap;
 /** A control ref was accepted, but no Action for its exact commit was visible
  * when a linked successor was admitted. Absence of a run is only an observation
  * at admission: effects and charges remain UNKNOWN, including a late run. */
@@ -381,14 +442,14 @@ function freezeIncrementalObservation<T>(value: T): T {
 }
 function brandIncrementalObservation(entry: StoredHistoricalIncrementalPrefix,
 	decoded: ReturnType<typeof openIncrementalControlPrefix>,
-	bundle: PrivateContinuationBundle): AuthenticatedIncrementalPrefixObservation {
+	bundle: PrivateContinuationBundle, raw: string): AuthenticatedIncrementalPrefixObservation {
 	const observation = freezeIncrementalObservation({
 		version: 1 as const, kind: "authenticated-incremental-host-prefix" as const,
 		complete: false as const, selectionAuthority: false as const,
 		accounting: "unquantified" as const,
 		source: { ...entry.source }, priorCarryEnvelopeSha256: entry.priorCarryEnvelopeSha256,
 		artifact: { ...entry.artifact }, sequence: decoded.sequence,
-		event: decoded.event, prefixSha256: digest(entry.prefixJson),
+		event: decoded.event, prefixSha256: digest(raw),
 		requestAudit: decoded.requestAudit, hostEffects: decoded.hostEffects
 	});
 	authenticatedIncrementalPrefixes.add(observation);
@@ -611,14 +672,16 @@ type AccountingAncestorReceipt = Pick<AccountingCheckpoint, "parentDigest" | "so
 		incrementalPrefixDigest?: string; controlDeliveryCount?: number;
 		controlDeliveryDigest?: string; lateControlCount?: number;
 		lateControlDigest?: string };
-type StoredHistoricalIncrementalPrefix = Readonly<{
-	version: 1; kind: "encrypted-historical-incremental-prefix";
+type HistoricalIncrementalPrefixCommon = Readonly<{
 	source: Readonly<Source>; event: "push" | "workflow_dispatch";
 	priorCarryEnvelopeSha256: string;
 	artifact: AuthenticatedIncrementalPrefixObservation["artifact"];
-	/** Exact AEAD prefix bytes are retained inside the successor carry's AEAD. */
-	prefixJson: string;
 }>;
+type StoredHistoricalIncrementalPrefix = HistoricalIncrementalPrefixCommon & (
+	Readonly<{ version: 1; kind: "encrypted-historical-incremental-prefix";
+		/** Legacy exact AEAD bytes inside the carry plaintext. */ prefixJson: string }> |
+	Readonly<{ version: 2; kind: "encrypted-historical-incremental-prefix-sidecar";
+		prefixSequence: number; prefixSidecarManifest: HistoricalPrefixSidecarManifest }>);
 type Checkpoint = LegacyCheckpoint | AccountingCheckpoint;
 export type RequestAuditSnapshot = { requests: CampaignRequestAudit[]; settledCny: number;
 	unknownReservedCny: number; inFlightReservedCny: number; reservations: number;
@@ -1139,7 +1202,9 @@ function checkpointVersion(payload: CarryArtifactPayload): 1 | 2 | 3 | 4 {
 	return outer.version;
 }
 function readCheckpoint(payload: CarryArtifactPayload, key: Buffer, seedDigest: string, expectedSource: Source,
-	legacyParentDigest?: string): { checkpoint: Checkpoint; digest: string } {
+	legacyParentDigest?: string): { checkpoint: Checkpoint; digest: string;
+	historicalPrefixRaws: ReadonlyMap<string, string>;
+	historicalPrefixSidecars: Readonly<Record<string, string>> } {
 	const envelopeB64 = carryEnvelope(payload);
 	const envelopeBytes = canonicalBase64(envelopeB64, MAX_CARRY_BYTES);
 	let outer: unknown;
@@ -1168,11 +1233,14 @@ function readCheckpoint(payload: CarryArtifactPayload, key: Buffer, seedDigest: 
 		try { manifest = JSON.parse(bytes.toString("utf8")); }
 		catch { return reject("carry sidecar manifest is invalid"); }
 		const sidecars = typeof payload === "string" || !("sidecars" in payload) ? undefined : payload.sidecars;
+		const mainNames = record(sidecars) ? Object.keys(sidecars).filter(name =>
+			/^ledger-continuation\.part-[0-9]{8,}\.enc$/.test(name)) : [];
 		if (!validCarrySidecarManifest(manifest) || !record(sidecars) ||
-			Object.keys(sidecars).length !== manifest.segmentCount ||
-			Object.keys(sidecars).some((name, index) =>
-				!Object.hasOwn(sidecars, carrySidecarName(index)) ||
-				!/^ledger-continuation\.part-[0-9]{8,}\.enc$/.test(name)))
+			mainNames.length !== manifest.segmentCount ||
+			mainNames.some((_, index) => !Object.hasOwn(sidecars, carrySidecarName(index))) ||
+			Object.keys(sidecars).some(name =>
+				!/^ledger-continuation\.part-[0-9]{8,}\.enc$/.test(name) &&
+				!isHistoricalPrefixSidecarName(name)))
 			reject("carry sidecar set is invalid");
 		bytes = decodeCarrySidecars({ manifest, key, seedDigest, parentDigest,
 			source: expectedSource, load: name => canonicalBase64(sidecars[name],
@@ -1235,7 +1303,43 @@ function readCheckpoint(payload: CarryArtifactPayload, key: Buffer, seedDigest: 
 		(cp.bootstrapBinding !== undefined && !validBinding(cp.bootstrapBinding)) ||
 		(cp.privateBundle === undefined) !== (cp.bootstrapBinding === undefined))
 		reject("carry checkpoint fields are invalid");
-	return { checkpoint: cp, digest: digest(envelopeBytes) };
+	const historicalPrefixRaws = new Map<string, string>();
+	const historicalPrefixSidecars: Record<string, string> = Object.create(null) as Record<string, string>;
+	const expectedPrefixNames = new Set<string>();
+	if (cp.version === 3) for (const entry of cp.historicalIncrementalPrefixes ?? []) {
+		if (!record(entry)) reject("historical prefix sidecar receipt is invalid");
+		if (entry.version !== 2) continue;
+		if (!record(entry.source) || !record(entry.artifact) ||
+			!Number.isSafeInteger(entry.prefixSequence) || entry.prefixSequence < 1 ||
+			!validHistoricalPrefixSidecarManifest(entry.prefixSidecarManifest) ||
+			historicalPrefixRaws.has(entry.source.runId))
+			reject("historical prefix sidecar receipt is invalid");
+		const sidecars = typeof payload === "string" || !("sidecars" in payload) ? undefined : payload.sidecars;
+		if (!record(sidecars)) reject("historical prefix sidecar set is unavailable");
+		for (let index = 0; index < entry.prefixSidecarManifest.segmentCount; index++) {
+			const name = historicalPrefixSidecarName(entry.source, entry.prefixSequence, index);
+			if (expectedPrefixNames.has(name) || !Object.hasOwn(sidecars, name))
+				reject("historical prefix sidecar set is incomplete or duplicated");
+			expectedPrefixNames.add(name);
+			historicalPrefixSidecars[name] = sidecars[name];
+		}
+		const rawBytes = decodeHistoricalPrefixSidecars({ key, seedDigest,
+			source: entry.source, event: entry.event,
+			priorCarryEnvelopeSha256: entry.priorCarryEnvelopeSha256,
+			artifact: entry.artifact, sequence: entry.prefixSequence,
+			manifest: entry.prefixSidecarManifest,
+			load: name => canonicalBase64(sidecars[name], PREFIX_SIDECAR_FILE_BYTES) });
+		const raw = rawBytes.toString("utf8");
+		if (!Buffer.from(raw, "utf8").equals(rawBytes))
+			reject("historical prefix sidecar bytes are not exact UTF-8");
+		historicalPrefixRaws.set(entry.source.runId, raw);
+	}
+	const allSidecars = typeof payload === "string" || !("sidecars" in payload) ? undefined : payload.sidecars;
+	if (record(allSidecars) && Object.keys(allSidecars).some(name =>
+		isHistoricalPrefixSidecarName(name) && !expectedPrefixNames.has(name)))
+		reject("carry includes an unclaimed historical prefix sidecar");
+	return { checkpoint: cp, digest: digest(envelopeBytes),
+		historicalPrefixRaws, historicalPrefixSidecars };
 }
 function ancestorReceipt(cp: LegacyCheckpoint, envelopeDigest: string): AncestorReceipt {
 	return { source: cp.source, parentDigest: cp.parentDigest, envelopeDigest,
@@ -1323,8 +1427,8 @@ function validLateControlPreproviderDisposition(value: unknown): value is LateCo
 function validOpaqueGap(value: unknown): value is OpaqueExecutedRunGap {
 	if (!record(value) || !exactKeys(value, ["version", "kind", "source",
 		"priorCarryEnvelopeSha256", "carryArtifact", "accounting", "effects",
-		"terminal", "resultArtifact"]) || value.version !== 1 ||
-		value.kind !== "opaque-executed-run-gap" || value.carryArtifact !== "absent" ||
+		"terminal", ...(value.kind === "opaque-executed-run-gap" ? ["resultArtifact"] :
+			["prefixArtifact", "prefixSequence"])]) || value.carryArtifact !== "absent" ||
 		value.accounting !== "unquantified" ||
 		!["unreviewed", "quarantined-source-reviewed"].includes(String(value.effects)) ||
 		!record(value.source) || !exactKeys(value.source, ["runId", "runAttempt", "runNumber", "commit"]) ||
@@ -1343,17 +1447,27 @@ function validOpaqueGap(value: unknown): value is OpaqueExecutedRunGap {
 		value.terminal.providerStepStatus !== "completed" ||
 		value.terminal.jobRunId !== value.source.runId ||
 		value.terminal.jobRunAttempt !== value.source.runAttempt ||
-		value.terminal.jobHeadSha !== value.source.commit ||
-		!record(value.resultArtifact) || !exactKeys(value.resultArtifact, ["repository",
+		value.terminal.jobHeadSha !== value.source.commit) return false;
+	if (value.version === 1 && value.kind === "opaque-executed-run-gap") return (
+		record(value.resultArtifact) && exactKeys(value.resultArtifact, ["repository",
+			"artifactId", "artifactName", "runId", "archiveSha256", "digestScope"]) &&
+		value.resultArtifact.repository === MISSION_REPOSITORY &&
+		value.resultArtifact.artifactName === MISSION_ARTIFACT &&
+		value.resultArtifact.runId === value.source.runId &&
+		positiveId(value.resultArtifact.artifactId) &&
+		value.resultArtifact.digestScope === "github-artifact-archive" &&
+		typeof value.resultArtifact.archiveSha256 === "string" &&
+		/^[0-9a-f]{64}$/.test(value.resultArtifact.archiveSha256));
+	if (value.version === 2 && value.kind === "opaque-prefix-backed-executed-run-gap") {
+		if (!record(value.prefixArtifact) || !exactKeys(value.prefixArtifact, ["repository",
 			"artifactId", "artifactName", "runId", "archiveSha256", "digestScope"]) ||
-		value.resultArtifact.repository !== MISSION_REPOSITORY ||
-		value.resultArtifact.artifactName !== MISSION_ARTIFACT ||
-		value.resultArtifact.runId !== value.source.runId ||
-		!positiveId(value.resultArtifact.artifactId) ||
-		value.resultArtifact.digestScope !== "github-artifact-archive" ||
-		typeof value.resultArtifact.archiveSha256 !== "string" ||
-		!/^[0-9a-f]{64}$/.test(value.resultArtifact.archiveSha256)) return false;
-	return true;
+			!Number.isSafeInteger(value.prefixSequence) || Number(value.prefixSequence) < 1 ||
+			!(["timed_out", "cancelled"] as unknown[]).includes(value.terminal.runConclusion)) return false;
+		const source = value.source as Source;
+		return validPrefixArtifactReceipt(value.prefixArtifact, source,
+			Number(value.prefixSequence));
+	}
+	return false;
 }
 function hasNoV3ProviderActivity(cp: Pick<AccountingCheckpoint, "settledAddedNano" |
 	"unknownObservedAddedNano" | "unpricedAddedCount" | "requestAudit">): boolean {
@@ -2191,28 +2305,40 @@ function validateAncestryV3(cp: AccountingCheckpoint, sources: Source[], seedDig
 	let priorPrefixRunNumber = 0;
 	for (const entry of historicalPrefixes) {
 		if (!record(entry) || !exactKeys(entry, ["version", "kind", "source", "event",
-			"priorCarryEnvelopeSha256", "artifact", "prefixJson"]) ||
-			entry.version !== 1 || entry.kind !== "encrypted-historical-incremental-prefix" ||
+			"priorCarryEnvelopeSha256", "artifact", ...(entry.version === 1 ? ["prefixJson"] :
+				["prefixSequence", "prefixSidecarManifest"])]) ||
+			!(entry.version === 1 && entry.kind === "encrypted-historical-incremental-prefix" ||
+				entry.version === 2 && entry.kind === "encrypted-historical-incremental-prefix-sidecar") ||
 			(entry.event !== "push" && entry.event !== "workflow_dispatch") ||
 			!record(entry.source) || !record(entry.artifact) ||
 			!exactKeys(entry.artifact, ["repository", "artifactId", "artifactName", "runId",
 				"archiveSha256", "digestScope"]) ||
 			entry.artifact.repository !== MISSION_REPOSITORY ||
-			entry.artifact.artifactName !== CARRY_ARTIFACT_NAME ||
 			entry.artifact.digestScope !== "github-artifact-archive" ||
 			!positiveId(entry.artifact.artifactId) ||
 			typeof entry.artifact.archiveSha256 !== "string" ||
 			! /^[0-9a-f]{64}$/.test(entry.artifact.archiveSha256) ||
-			typeof entry.prefixJson !== "string" ||
-			Buffer.byteLength(entry.prefixJson, "utf8") > 64 * 1024 * 1024)
+			(entry.version === 1 ?
+				(typeof entry.prefixJson !== "string" ||
+					Buffer.byteLength(entry.prefixJson, "utf8") > 64 * 1024 * 1024) :
+				(!Number.isSafeInteger(entry.prefixSequence) || entry.prefixSequence < 1 ||
+					!validHistoricalPrefixSidecarManifest(entry.prefixSidecarManifest))))
 			reject("historical incremental prefix receipt is invalid");
 		const gap = gaps.find(row => JSON.stringify(row.source) === JSON.stringify(entry.source));
 		if (!gap || gap.source.runNumber <= priorPrefixRunNumber ||
 			entry.priorCarryEnvelopeSha256 !== gap.priorCarryEnvelopeSha256 ||
-			entry.artifact.runId !== gap.source.runId)
+			entry.artifact.runId !== gap.source.runId ||
+			(gap.kind === "opaque-executed-run-gap" ?
+				entry.artifact.artifactName !== CARRY_ARTIFACT_NAME :
+				!validPrefixArtifactReceipt(entry.artifact, gap.source, gap.prefixSequence) ||
+				JSON.stringify(entry.artifact) !== JSON.stringify(gap.prefixArtifact) ||
+				(entry.version === 2 && entry.prefixSequence !== gap.prefixSequence)))
 			reject("historical incremental prefix does not match an exact opaque gap");
 		priorPrefixRunNumber = gap.source.runNumber;
 	}
+	if (gaps.some(gap => gap.kind === "opaque-prefix-backed-executed-run-gap" &&
+		!historicalPrefixes.some(entry => JSON.stringify(entry.source) === JSON.stringify(gap.source))))
+		reject("prefix-backed opaque gap lost its authenticated prefix receipt");
 	for (const receipt of cp.ancestry) {
 		const expectedCount = historicalPrefixes.filter(entry =>
 			entry.source.runNumber < receipt.source.runNumber).length;
@@ -2295,7 +2421,8 @@ function sealCheckpoint(cp: Checkpoint, key: Buffer): string {
 		reject("carry exceeds private artifact limit");
 	return envelopeB64;
 }
-function sealSegmentedCheckpoint(cp: AccountingCheckpoint, key: Buffer): Readonly<{
+function sealSegmentedCheckpoint(cp: AccountingCheckpoint, key: Buffer,
+	historicalPrefixSidecars: Readonly<Record<string, string>> = {}): Readonly<{
 	envelopeB64: string; sidecars: Readonly<Record<string, string>>;
 }> {
 	const encoded = encodeCarrySidecars({ plaintext: Buffer.from(JSON.stringify(cp), "utf8"),
@@ -2313,8 +2440,14 @@ function sealSegmentedCheckpoint(cp: AccountingCheckpoint, key: Buffer): Readonl
 	const envelopeB64 = bytes.toString("base64");
 	if (bytes.length > MAX_CARRY_BYTES || Buffer.byteLength(JSON.stringify({ envelopeB64 })) > MAX_CARRY_BYTES)
 		reject("segmented carry root exceeds private artifact limit");
-	return { envelopeB64, sidecars: Object.fromEntries(encoded.sidecars.map(part =>
-		[part.name, part.bytes.toString("base64")])) };
+	for (const [name, text] of Object.entries(historicalPrefixSidecars))
+		if (!isHistoricalPrefixSidecarName(name) ||
+			canonicalBase64(text, PREFIX_SIDECAR_FILE_BYTES).length < 29)
+			reject("historical prefix sidecar cannot be sealed");
+	return { envelopeB64, sidecars: {
+		...Object.fromEntries(encoded.sidecars.map(part =>
+			[part.name, part.bytes.toString("base64")])),
+		...historicalPrefixSidecars } };
 }
 async function githubJson(url: string, token: string | undefined, request: typeof fetch): Promise<Record<string, unknown>> {
 	let response: Response;
@@ -2475,9 +2608,17 @@ async function artifactsForRun(runId: string, token: string | undefined, request
 	const url = `https://api.github.com/repos/${MISSION_REPOSITORY}/actions/runs/${runId}/artifacts?per_page=100`;
 	const response = await githubJson(url, token, request);
 	if (!Array.isArray(response.artifacts) || response.artifacts.length > 100 ||
-		!Number.isSafeInteger(response.total_count) || response.total_count !== response.artifacts.length)
+		!Number.isSafeInteger(response.total_count) || Number(response.total_count) < 0 ||
+		response.artifacts.length !== Math.min(100, Number(response.total_count)) ||
+		response.artifacts.some(artifact => !record(artifact) ||
+			!Number.isSafeInteger(artifact.id) || Number(artifact.id) <= 0 ||
+			typeof artifact.name !== "string" || !artifact.name))
 		reject("workflow artifact list is incomplete");
-	return response.artifacts.filter(record) as Artifact[];
+	if (Number(response.total_count) <= 100) return response.artifacts as Artifact[];
+	const complete = await paginatedArtifactsForRun(runId, token, request);
+	if (JSON.stringify(complete.slice(0, 100)) !== JSON.stringify(response.artifacts))
+		reject("workflow artifact listing changed during pagination");
+	return complete;
 }
 /** Enumerate a predecessor's entire artifact list without an arbitrary count
  * cutoff. Repeat the ordered census so page shifts cannot silently hide a
@@ -2542,21 +2683,33 @@ function resultArtifactIdentity(artifacts: Artifact[], source: Source): Authenti
 }
 function incrementalArtifactIdentity(artifact: Artifact, source: Source):
 	AuthenticatedIncrementalPrefixObservation["artifact"] {
-	if (artifact.name !== CARRY_ARTIFACT_NAME || artifact.workflow_run?.id !== Number(source.runId) ||
+	if (artifact.workflow_run?.id !== Number(source.runId) ||
 		artifact.workflow_run.head_sha !== source.commit || artifact.expired !== false ||
 		!Number.isSafeInteger(artifact.id) || artifact.id! <= 0 ||
 		typeof artifact.digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(artifact.digest))
 		reject("incremental prefix artifact identity is incomplete");
 	return Object.freeze({ repository: MISSION_REPOSITORY, artifactId: String(artifact.id),
-		artifactName: CARRY_ARTIFACT_NAME, runId: source.runId,
+		artifactName: artifact.name!, runId: source.runId,
 		archiveSha256: artifact.digest.slice(7), digestScope: "github-artifact-archive" });
+}
+function validPrefixArtifactReceipt(artifact: unknown, source: Source, sequence: number): boolean {
+	return record(artifact) && exactKeys(artifact, ["repository", "artifactId", "artifactName",
+		"runId", "archiveSha256", "digestScope"]) &&
+		artifact.repository === MISSION_REPOSITORY && positiveId(artifact.artifactId) &&
+		artifact.runId === source.runId &&
+		(artifact.artifactName === CARRY_ARTIFACT_NAME ||
+			artifact.artifactName === periodicPrefixArtifactName(source, sequence)) &&
+		artifact.digestScope === "github-artifact-archive" &&
+		typeof artifact.archiveSha256 === "string" && /^[0-9a-f]{64}$/.test(artifact.archiveSha256);
 }
 
 type OpenLedgerInput = {
 	seedEnvelopeB64: string | undefined; publicKeyFile: string; githubToken: string | undefined;
 	current: CurrentMissionRun;
 	loadCarryArtifact: (identity: { runId: string; artifactId: string;
-		expectedArchiveSha256?: string }) => Promise<CarryArtifactPayload>;
+		expectedArchiveSha256?: string; missionKey?: Buffer; seedDigest?: string;
+		expectedSource?: ArtifactTransportSource;
+		expectedArtifactName?: string }) => Promise<CarryArtifactPayload>;
 	request?: typeof fetch; expectedSpkiSha256?: string;
 	/** Terminal inspection may use the host's existing authenticated GitHub
 	 * connector. The running Actions admission still requires its GitHub token. */
@@ -2808,66 +2961,146 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 	const loadedArtifacts = new Map<string, string>();
 	const loadedPayloads = new Map<string, CarryArtifactPayload>();
 	const resultArtifacts = new Map<string, AuthenticatedPriorCarryProof["resultArtifact"]>();
+	const transportSource = (source: Source): ArtifactTransportSource => {
+		const event = executedMetadata.get(source.runId)?.run.event;
+		if (event !== "push" && event !== "workflow_dispatch")
+			reject("artifact transport source event is invalid");
+		return { repository: MISSION_REPOSITORY, runId: source.runId,
+			runAttempt: source.runAttempt, commit: source.commit, event };
+	};
+	const verifyTransportIndex = async (payload: CarryArtifactPayload, source: Source,
+		artifactId: string, artifactName: string): Promise<void> => {
+		if (typeof payload === "string" || !("transportIndex" in payload) ||
+			payload.transportIndex === undefined) return;
+		const index = payload.transportIndex;
+		const expectedSource = transportSource(source);
+		if (!isOpenedPartitionManifest(index) ||
+			!validPartitionManifest(index, expectedSource, artifactName))
+			reject("multipart artifact index was not authenticated to its live source");
+		const census = await paginatedArtifactsForRun(source.runId, input.githubToken, request);
+		const root = census.filter(item => item.id === Number(artifactId) &&
+			item.name === artifactName);
+		if (root.length !== 1 || root[0].expired !== false ||
+			root[0].workflow_run?.id !== Number(source.runId) ||
+			root[0].workflow_run.head_sha !== source.commit ||
+			typeof root[0].digest !== "string" ||
+			!/^sha256:[0-9a-f]{64}$/.test(root[0].digest))
+			reject("multipart root artifact identity is invalid");
+		validatePartitionArtifactCensus(index, census);
+	};
 	const load = async (source: Source, expectedArchiveSha256?: string): Promise<CarryArtifactPayload> => {
 		const cached = loadedPayloads.get(source.runId);
 		if (cached) return cached;
+		let listing: Artifact[] | undefined;
 		const artifactId = loadedArtifacts.get(source.runId) ?? await oneArtifact(source.runId,
 			input.githubToken!, request, CARRY_ARTIFACT_NAME, undefined,
-			artifacts => resultArtifacts.set(source.runId, resultArtifactIdentity(artifacts, source)));
+			artifacts => { listing = artifacts;
+				resultArtifacts.set(source.runId, resultArtifactIdentity(artifacts, source)); });
 		loadedArtifacts.set(source.runId, artifactId);
+		const listed = listing ?? await artifactsForRun(source.runId, input.githubToken, request);
+		const root = listed.find(item => item.id === Number(artifactId) &&
+			item.name === CARRY_ARTIFACT_NAME);
+		const archiveSha256 = expectedArchiveSha256 ??
+			(typeof root?.digest === "string" && /^sha256:[0-9a-f]{64}$/.test(root.digest) ?
+				root.digest.slice(7) : undefined);
 		try {
 			const payload = await input.loadCarryArtifact({ runId: source.runId, artifactId,
-				...(expectedArchiveSha256 ? { expectedArchiveSha256 } : {}) });
+				...(archiveSha256 ? { expectedArchiveSha256: archiveSha256 } : {}),
+				missionKey: key, seedDigest: seed.seedDigest,
+				expectedSource: transportSource(source),
+				expectedArtifactName: CARRY_ARTIFACT_NAME });
+			await verifyTransportIndex(payload, source, artifactId, CARRY_ARTIFACT_NAME);
 			loadedPayloads.set(source.runId, payload);
 			return payload;
 		}
 		catch { return reject("private carry artifact could not be read"); }
 	};
 	let sourcesWithCarry = executedSources;
-	let newlyOpaqueGap: Omit<OpaqueExecutedRunGap, "priorCarryEnvelopeSha256"> | undefined;
+	let newlyOpaqueGap: Omit<ResultBackedOpaqueExecutedRunGap, "priorCarryEnvelopeSha256"> |
+		Omit<PrefixBackedOpaqueExecutedRunGap, "priorCarryEnvelopeSha256"> | undefined;
 	let latestIncrementalRaw: string | undefined;
 	let latestIncrementalArtifact: AuthenticatedIncrementalPrefixObservation["artifact"] | undefined;
+	let resultlessPrefixSource: Source | undefined;
+	let resultlessPrefixTerminal: AuthenticatedPriorCarryProof["terminal"] | undefined;
+	let resultlessPrefixArtifacts: Artifact[] = [];
 	if (executedSources.length) {
 		const latest = executedSources.at(-1)!;
 		const artifacts = await artifactsForRun(latest.runId, input.githubToken, request);
 		const carries = artifacts.filter(item => item.name === CARRY_ARTIFACT_NAME);
+		const resultRows = artifacts.filter(item => item.name === MISSION_ARTIFACT);
+		const exactResultArtifact = resultRows.length === 1 ?
+			resultArtifactIdentity(artifacts, latest) : undefined;
+		const hasPeriodicLocator = artifacts.some(item =>
+			item.name?.startsWith(`${PERIODIC_PREFIX_ARTIFACT_STEM}-`));
 		let latestHasFinalCarry = false;
 		if (carries.length === 1 && carries[0].workflow_run?.id === Number(latest.runId) &&
 			carries[0].expired === false && Number.isSafeInteger(carries[0].id) && carries[0].id! > 0) {
 			loadedArtifacts.set(latest.runId, String(carries[0].id));
-			const payload = await load(latest, typeof carries[0].digest === "string" &&
-				/^sha256:[0-9a-f]{64}$/.test(carries[0].digest) ? carries[0].digest.slice(7) : undefined);
-			latestHasFinalCarry = typeof payload === "string" || "envelopeB64" in payload;
+			let payload: CarryArtifactPayload | undefined;
+			try { payload = await load(latest, typeof carries[0].digest === "string" &&
+				/^sha256:[0-9a-f]{64}$/.test(carries[0].digest) ? carries[0].digest.slice(7) : undefined); }
+			catch (error) {
+				if (!hasPeriodicLocator || exactResultArtifact) throw error;
+				loadedArtifacts.delete(latest.runId);
+			}
+			latestHasFinalCarry = payload !== undefined &&
+				(typeof payload === "string" || "envelopeB64" in payload);
 			if (latestHasFinalCarry) {
 				if (cancelledExecutedRunIds.has(latest.runId))
 					reject("intervening cancelled workflow run is not an exact missing-carry opaque gap");
 				resultArtifacts.set(latest.runId, resultArtifactIdentity(artifacts, latest));
-			} else {
-				latestIncrementalArtifact = incrementalArtifactIdentity(carries[0], latest);
+			} else if (payload !== undefined) {
 				latestIncrementalRaw = typeof payload === "string" ? undefined :
 					"incrementalControlPrefix" in payload ? payload.incrementalControlPrefix : undefined;
 				if (typeof latestIncrementalRaw !== "string")
 					reject("incremental prefix file is missing");
+				try { latestIncrementalArtifact = incrementalArtifactIdentity(carries[0], latest); }
+				catch (error) {
+					if (!hasPeriodicLocator || exactResultArtifact) throw error;
+					latestIncrementalRaw = undefined;
+				}
 			}
 		}
-		if (!latestHasFinalCarry && (carries.length === 0 || latestIncrementalRaw !== undefined) &&
+		if (!latestHasFinalCarry && (carries.length === 0 || latestIncrementalRaw !== undefined ||
+			(hasPeriodicLocator && !exactResultArtifact && carries.length === 1)) &&
 			(!terminalMode || terminalInterruption)) {
 			if (executedSources.length < 2)
 				reject("required private carry artifact is unavailable without an earlier authenticated carry");
-			const results = artifacts.filter(item => item.name === MISSION_ARTIFACT);
-			const resultArtifact = results.length === 1 ? resultArtifactIdentity(artifacts, latest) : undefined;
+			const results = resultRows;
+			const resultArtifact = exactResultArtifact;
 			const metadata = executedMetadata.get(latest.runId);
 			const terminal = metadata && verifiedTerminal(metadata.run, metadata.job, latest, true);
-			if (!resultArtifact || !terminal || (terminalInterruption &&
+			if (!terminal || (terminalInterruption &&
 				(latest.runId !== c.runId || latest.runAttempt !== Number(c.runAttempt) ||
 				latest.commit !== c.sha ||
-				(metadata?.run.conclusion !== "cancelled" && metadata?.job.conclusion !== "cancelled" &&
-					terminal.providerStepConclusion !== "cancelled"))))
-				reject("missing carry run lacks an exact terminal encrypted result artifact");
-			newlyOpaqueGap = Object.freeze({ version: 1, kind: "opaque-executed-run-gap",
-				source: Object.freeze({ ...latest }), carryArtifact: "absent",
-				accounting: "unquantified", effects: "unreviewed",
-				terminal, resultArtifact });
+				(!["cancelled", "timed_out"].includes(metadata?.run.conclusion ?? "") &&
+					!["cancelled", "timed_out"].includes(metadata?.job.conclusion ?? "") &&
+					!["cancelled", "timed_out"].includes(terminal.providerStepConclusion)))))
+				reject("missing carry run lacks an exact terminal encrypted result artifact or execution metadata");
+			if (resultArtifact) {
+				newlyOpaqueGap = Object.freeze({ version: 1, kind: "opaque-executed-run-gap",
+					source: Object.freeze({ ...latest }), carryArtifact: "absent",
+					accounting: "unquantified", effects: "unreviewed",
+					terminal, resultArtifact });
+			} else {
+				if (results.length || !["cancelled", "timed_out"].includes(metadata!.run.conclusion ?? ""))
+					reject("missing carry run lacks an exact terminal encrypted result artifact");
+				if (latestIncrementalRaw !== undefined) {
+					const shared = loadedPayloads.get(latest.runId);
+					if (!record(shared) || !exactKeys(shared, ["incrementalControlPrefix"]))
+						reject("resultless shared carry artifact is not an exact prefix-only archive");
+				}
+				const stable = await paginatedArtifactsForRun(latest.runId, input.githubToken, request);
+				if (JSON.stringify(stable) !== JSON.stringify(artifacts))
+					reject("workflow artifact listing changed before prefix recovery");
+				const periodic = stable.filter(item => item.name?.startsWith(`${PERIODIC_PREFIX_ARTIFACT_STEM}-`));
+				if (!periodic.length && latestIncrementalRaw === undefined)
+					reject("resultless terminal run lacks an authenticated incremental prefix artifact");
+				resultlessPrefixArtifacts = [
+					...(latestIncrementalRaw !== undefined ? [carries[0]!] : []), ...periodic];
+				resultlessPrefixSource = latest;
+				resultlessPrefixTerminal = terminal;
+			}
 			sourcesWithCarry = executedSources.slice(0, -1);
 		} else if (!latestHasFinalCarry) reject("required private carry artifact is unavailable or ambiguous");
 	}
@@ -2880,6 +3113,8 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 	let historicalCarryOrigin: AuthenticatedCarryForwardOrigin | undefined;
 	let storedSelectedTransitions: StoredSelectedTransition[] = [];
 	let storedHistoricalIncrementalPrefixes: StoredHistoricalIncrementalPrefix[] = [];
+	let historicalPrefixRaws = new Map<string, string>();
+	let historicalPrefixSidecars: Record<string, string> = Object.create(null) as Record<string, string>;
 	let storedUnobservedControlDeliveries: UnobservedControlDelivery[] = [];
 	let storedLateControlPreproviderDispositions: LateControlPreproviderDisposition[] = [];
 	let authenticatedSelectedTransitions: readonly AuthenticatedSelectedTransition[] | undefined;
@@ -2903,6 +3138,8 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 			authenticatedSelectedTransitions = validateSelectedTransitions(cp, opened.digest);
 			storedSelectedTransitions = [...(cp.selectedTransitions ?? [])];
 			storedHistoricalIncrementalPrefixes = [...(cp.historicalIncrementalPrefixes ?? [])];
+			historicalPrefixRaws = new Map(opened.historicalPrefixRaws);
+			historicalPrefixSidecars = { ...opened.historicalPrefixSidecars };
 			storedUnobservedControlDeliveries = [...(cp.unobservedControlDeliveries ?? [])];
 			storedLateControlPreproviderDispositions = [...(cp.lateControlPreproviderDispositions ?? [])];
 			for (const delivery of storedUnobservedControlDeliveries) {
@@ -3069,6 +3306,86 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 			historical = { committedNano, unknownHeldNano, legacyParentDigest: parentDigest };
 		}
 	}
+	if (resultlessPrefixSource && resultlessPrefixTerminal) {
+		const source = resultlessPrefixSource;
+		const sourceRun = executedMetadata.get(source.runId)?.run;
+		if (!latestCheckpoint || !priorPrivateBundle || !sourcesWithCarry.length ||
+			!sourceRun || (sourceRun.event !== "push" && sourceRun.event !== "workflow_dispatch"))
+			reject("resultless prefix lacks an earlier authenticated full carry");
+		const decodedCandidates: Array<{ artifact: AuthenticatedIncrementalPrefixObservation["artifact"];
+			raw: string; sequence: number }> = [];
+		const sequences = new Map<number, string>();
+		const named = resultlessPrefixArtifacts.flatMap(item => {
+			if (item.name === CARRY_ARTIFACT_NAME) return [];
+			const sequence = periodicPrefixSequenceFromName(item.name ?? "", source);
+			return sequence === undefined ? [] : [{ item, sequence }];
+		});
+		const shared = resultlessPrefixArtifacts.find(item => item.name === CARRY_ARTIFACT_NAME);
+		let sharedSequence = 0;
+		if (shared) {
+			try { sharedSequence = openIncrementalControlPrefix(latestIncrementalRaw!, key, {
+				repository: MISSION_REPOSITORY, runId: source.runId, runAttempt: source.runAttempt,
+				commit: source.commit, event: sourceRun.event, priorEnvelopeSha256: parentDigest }).sequence; }
+			catch (error) {
+				if (!named.length)
+					throw new PeriodicPrefixRecoveryError("authentication", "invalid-aead-prefix",
+						error instanceof IncrementalCheckpointError ? error : undefined);
+			}
+		}
+		const highest = Math.max(sharedSequence, ...named.map(row => row.sequence));
+		if (highest < 1) reject("resultless terminal run lacks an exact live periodic prefix name");
+		const finalists = [
+			...(shared && sharedSequence === highest ? [shared] : []),
+			...named.filter(row => row.sequence === highest).map(row => row.item)];
+		for (const item of finalists) {
+			let identity: AuthenticatedIncrementalPrefixObservation["artifact"];
+			try { identity = incrementalArtifactIdentity(item, source); }
+			catch { throw new PeriodicPrefixRecoveryError("metadata", "invalid-identity"); }
+			let raw: string;
+			if (identity.artifactName === CARRY_ARTIFACT_NAME) raw = latestIncrementalRaw!;
+			else {
+				let payload: CarryArtifactPayload;
+				try { payload = await input.loadCarryArtifact({ runId: source.runId,
+					artifactId: identity.artifactId, expectedArchiveSha256: identity.archiveSha256,
+					missionKey: key, seedDigest: seed.seedDigest,
+					expectedSource: transportSource(source),
+					expectedArtifactName: identity.artifactName }); }
+				catch { throw new PeriodicPrefixRecoveryError("archive", "unavailable-or-digest-mismatch"); }
+				await verifyTransportIndex(payload, source, identity.artifactId, identity.artifactName);
+				if (!record(payload) || !exactKeys(payload, ["incrementalControlPrefix",
+					...(payload.transportIndex === undefined ? [] : ["transportIndex"])]) ||
+					typeof payload.incrementalControlPrefix !== "string")
+					throw new PeriodicPrefixRecoveryError("archive", "not-single-prefix");
+				raw = payload.incrementalControlPrefix;
+			}
+			let decoded: ReturnType<typeof openIncrementalControlPrefix>;
+			try { decoded = openIncrementalControlPrefix(raw, key, {
+				repository: MISSION_REPOSITORY, runId: source.runId, runAttempt: source.runAttempt,
+				commit: source.commit, event: sourceRun.event, priorEnvelopeSha256: parentDigest }); }
+			catch (error) { throw new PeriodicPrefixRecoveryError("authentication", "invalid-aead-prefix",
+				error instanceof IncrementalCheckpointError ? error : undefined); }
+			const prefixDigest = digest(raw);
+			if (!validPrefixArtifactReceipt(identity, source, decoded.sequence))
+				throw new PeriodicPrefixRecoveryError("sequence", "locator-mismatch");
+			if (sequences.has(decoded.sequence) && sequences.get(decoded.sequence) !== prefixDigest)
+				throw new PeriodicPrefixRecoveryError("sequence", "conflicting-highest-sequence");
+			sequences.set(decoded.sequence, prefixDigest);
+			decodedCandidates.push({ artifact: identity, raw, sequence: decoded.sequence });
+		}
+		const selected = decodedCandidates.sort((a, b) => b.sequence - a.sequence ||
+			Number(b.artifact.artifactName !== CARRY_ARTIFACT_NAME) -
+				Number(a.artifact.artifactName !== CARRY_ARTIFACT_NAME) ||
+			Number(a.artifact.artifactId) - Number(b.artifact.artifactId))[0];
+		if (!selected) reject("resultless terminal run lacks an authenticated prefix");
+		latestIncrementalRaw = selected.raw;
+		latestIncrementalArtifact = selected.artifact;
+		newlyOpaqueGap = Object.freeze({ version: 2,
+			kind: "opaque-prefix-backed-executed-run-gap",
+			source: Object.freeze({ ...source }), carryArtifact: "absent",
+			accounting: "unquantified", effects: "unreviewed",
+			terminal: resultlessPrefixTerminal, prefixArtifact: selected.artifact,
+			prefixSequence: selected.sequence });
+	}
 	if (newlyOpaqueGap) {
 		const gap = Object.freeze({ ...newlyOpaqueGap,
 			priorCarryEnvelopeSha256: parentDigest,
@@ -3122,12 +3439,21 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 		const sourceRun = executedMetadata.get(entry.source.runId)?.run;
 		if (!sourceRun || sourceRun.event !== entry.event)
 			reject("historical incremental prefix source changed");
-		const decoded = openIncrementalControlPrefix(entry.prefixJson, key, {
+		const raw = entry.version === 1 ? entry.prefixJson :
+			historicalPrefixRaws.get(entry.source.runId);
+		if (typeof raw !== "string") reject("historical incremental prefix bytes are unavailable");
+		const decoded = openIncrementalControlPrefix(raw, key, {
 			repository: MISSION_REPOSITORY, runId: entry.source.runId,
 			runAttempt: entry.source.runAttempt, commit: entry.source.commit,
 			event: entry.event, priorEnvelopeSha256: entry.priorCarryEnvelopeSha256 });
+		const gap = opaqueExecutedRuns.find(row => row.source.runId === entry.source.runId);
+		if (gap?.kind === "opaque-prefix-backed-executed-run-gap" &&
+			decoded.sequence !== gap.prefixSequence)
+			reject("historical prefix sequence differs from authenticated gap receipt");
+		if (entry.version === 2 && decoded.sequence !== entry.prefixSequence)
+			reject("historical sidecar sequence differs from its authenticated receipt");
 		historicalIncrementalPrefixes.push(brandIncrementalObservation(entry, decoded,
-			priorPrivateBundle));
+			priorPrivateBundle, raw));
 	}
 	let incrementalPrefixObservation: AuthenticatedIncrementalPrefixObservation | undefined;
 	let incrementalPrefixFailure: IncrementalPrefixFailure | undefined;
@@ -3145,6 +3471,8 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 			runAttempt: newlyOpaqueGap.source.runAttempt, commit: newlyOpaqueGap.source.commit,
 			event: sourceRun.event, priorEnvelopeSha256: proof.envelopeSha256 }); }
 		catch (error) {
+			if (newlyOpaqueGap.kind === "opaque-prefix-backed-executed-run-gap")
+				reject("resultless terminal prefix lost authentication");
 			// Preserve the live archive identity while leaving the entire run UNKNOWN.
 			const known = error instanceof IncrementalCheckpointError ? error : undefined;
 			incrementalPrefixFailure = Object.freeze({ kind: "unusable-incremental-host-prefix",
@@ -3153,14 +3481,31 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 				artifact: latestIncrementalArtifact });
 		}
 		if (decoded) {
+			if (newlyOpaqueGap.kind === "opaque-prefix-backed-executed-run-gap" &&
+				(decoded.sequence !== newlyOpaqueGap.prefixSequence ||
+					JSON.stringify(latestIncrementalArtifact) !==
+						JSON.stringify(newlyOpaqueGap.prefixArtifact)))
+				reject("resultless terminal prefix differs from its gap receipt");
+			const encoded = encodeHistoricalPrefixSidecars({
+				plaintext: Buffer.from(latestIncrementalRaw, "utf8"), key,
+				seedDigest: seed.seedDigest, source: newlyOpaqueGap.source,
+				event: sourceRun.event, priorCarryEnvelopeSha256: proof.envelopeSha256,
+				artifact: latestIncrementalArtifact, sequence: decoded.sequence });
 			const entry: StoredHistoricalIncrementalPrefix = {
-				version: 1, kind: "encrypted-historical-incremental-prefix",
+				version: 2, kind: "encrypted-historical-incremental-prefix-sidecar",
 				source: { ...newlyOpaqueGap.source }, event: sourceRun.event,
 				priorCarryEnvelopeSha256: proof.envelopeSha256,
-				artifact: latestIncrementalArtifact, prefixJson: latestIncrementalRaw
+				artifact: latestIncrementalArtifact, prefixSequence: decoded.sequence,
+				prefixSidecarManifest: encoded.manifest
 			};
+			for (const part of encoded.sidecars) {
+				if (Object.hasOwn(historicalPrefixSidecars, part.name))
+					reject("historical prefix sidecar name was reused");
+				historicalPrefixSidecars[part.name] = part.bytes.toString("base64");
+			}
+			historicalPrefixRaws.set(newlyOpaqueGap.source.runId, latestIncrementalRaw);
 			incrementalPrefixObservation = brandIncrementalObservation(entry, decoded,
-				priorPrivateBundle);
+				priorPrivateBundle, latestIncrementalRaw);
 			storedHistoricalIncrementalPrefixes.push(entry);
 			historicalIncrementalPrefixes.push(incrementalPrefixObservation);
 		}
@@ -3905,7 +4250,8 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 						}
 					}
 				}
-				const { envelopeB64, sidecars } = sealSegmentedCheckpoint(cp, key);
+				const { envelopeB64, sidecars } = sealSegmentedCheckpoint(cp, key,
+					historicalPrefixSidecars);
 				sealed = true;
 				return { envelopeB64, sidecars, observedSettledCny: decimal(nextSettledNano),
 					observedUnknownHeldCny: decimal(nextUnknownNano),
@@ -3999,7 +4345,8 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 				}
 			}
 			validateCurrentDiagnostic(cp);
-			const { envelopeB64, sidecars } = sealSegmentedCheckpoint(cp, key);
+			const { envelopeB64, sidecars } = sealSegmentedCheckpoint(cp, key,
+				historicalPrefixSidecars);
 			sealed = true;
 			return { envelopeB64, sidecars, observedSettledCny: decimal(nextSettledNano),
 				observedUnknownHeldCny: decimal(nextUnknownNano),
@@ -4034,19 +4381,25 @@ async function openLedgerContinuationInternal(input: OpenLedgerInput, terminalMo
 	return result;
 }
 
-/** Download only encrypted carry files; the token is used only for GitHub API. */
-export async function downloadCarryArtifact(input: { githubToken: string; artifactId: string;
+/** Download one bounded Actions artifact archive without forwarding the token
+ * to a redirected object-storage origin. */
+async function downloadArtifactZip(input: { githubToken: string; artifactId: string;
 	/** GitHub's SHA-256 for the archive, when a live artifact listing supplied it. */
 	expectedArchiveSha256?: string;
-	request?: typeof fetch; /** Offline test override only. */ idleTimeoutMs?: number }): Promise<CarryArtifactPayload> {
+	request?: typeof fetch; /** Offline test override only. */ idleTimeoutMs?: number;
+	maxArchiveBytes?: number }): Promise<Buffer> {
 	if (!positiveId(input.artifactId) || !input.githubToken || input.githubToken.length > 4_000)
 		reject("invalid carry artifact request");
 	if (input.expectedArchiveSha256 !== undefined &&
 		! /^[0-9a-f]{64}$/.test(input.expectedArchiveSha256))
 		reject("invalid carry artifact archive digest");
 	const idleTimeoutMs = input.idleTimeoutMs ?? 15_000;
+	const maxArchiveBytes = input.maxArchiveBytes ?? MAX_CARRY_ARCHIVE_BYTES;
 	if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs < 1 || idleTimeoutMs > 15_000)
 		reject("invalid carry artifact idle timeout");
+	if (!Number.isSafeInteger(maxArchiveBytes) || maxArchiveBytes < 1 ||
+		maxArchiveBytes > MAX_CARRY_ARCHIVE_BYTES)
+		reject("invalid carry artifact archive limit");
 	const request = input.request ?? fetch;
 	const url = `https://api.github.com/repos/${MISSION_REPOSITORY}/actions/artifacts/${input.artifactId}/zip`;
 	let initial: Response;
@@ -4076,7 +4429,7 @@ export async function downloadCarryArtifact(input: { githubToken: string; artifa
 		catch { return reject("carry archive download failed"); }
 		finally { clearTimeout(redirectedHeaderTimer); }
 	}
-	if (response.status !== 200 || Number(response.headers.get("content-length") ?? 0) > MAX_CARRY_ARCHIVE_BYTES)
+	if (response.status !== 200 || Number(response.headers.get("content-length") ?? 0) > maxArchiveBytes)
 		reject("carry archive response is invalid");
 	let zip: Buffer;
 	try {
@@ -4097,7 +4450,7 @@ export async function downloadCarryArtifact(input: { githubToken: string; artifa
 				})]).finally(() => clearTimeout(idleTimer));
 				if (done) break;
 				length += value.byteLength;
-				if (length > MAX_CARRY_ARCHIVE_BYTES) {
+				if (length > maxArchiveBytes) {
 					bodyAbort.abort();
 					void reader.cancel().catch(() => undefined);
 					reject("carry archive exceeds limit");
@@ -4112,24 +4465,113 @@ export async function downloadCarryArtifact(input: { githubToken: string; artifa
 	}
 	if (input.expectedArchiveSha256 && digest(zip) !== input.expectedArchiveSha256)
 		reject("carry archive digest differs from live Actions artifact");
+	return zip;
+}
+
+/** Download an old one-ZIP carry/prefix or an AEAD-indexed multipart artifact.
+ * The token is used only for GitHub API; each part is independently bounded. */
+export async function downloadCarryArtifact(input: { githubToken: string; artifactId: string;
+	expectedArchiveSha256?: string; request?: typeof fetch; idleTimeoutMs?: number;
+	missionKey?: Buffer; seedDigest?: string; expectedSource?: ArtifactTransportSource;
+	expectedArtifactName?: string }): Promise<CarryArtifactPayload> {
+	const zip = await downloadArtifactZip(input);
 	const entries = carryZipEntries(zip);
+	const encryptedIndex = entries.get(ARTIFACT_PARTITION_MANIFEST_FILE);
+	if (encryptedIndex) {
+		if (entries.size !== 1 || zip.length > 32 * 1024 * 1024 ||
+			!input.missionKey || !input.seedDigest || !input.expectedSource ||
+			!input.expectedArtifactName || !input.expectedArchiveSha256)
+			reject("multipart root lacks exact authenticated loading context");
+		const manifest = openPartitionManifest({ raw: encryptedIndex.toString("utf8"),
+			missionKey: input.missionKey, seedDigest: input.seedDigest,
+			expectedSource: input.expectedSource,
+			expectedArtifactName: input.expectedArtifactName });
+		const census = await paginatedArtifactsForRun(input.expectedSource.runId,
+			input.githubToken, input.request ?? fetch);
+		const root = census.filter(item => item.id === Number(input.artifactId) &&
+			item.name === input.expectedArtifactName);
+		if (root.length !== 1 || root[0].expired !== false ||
+			root[0].workflow_run?.id !== Number(input.expectedSource.runId) ||
+			root[0].workflow_run.head_sha !== input.expectedSource.commit ||
+			root[0].digest !== `sha256:${input.expectedArchiveSha256}`)
+			reject("multipart root differs from live artifact metadata");
+		validatePartitionArtifactCensus(manifest, census);
+		const chunks: Buffer[] = [];
+		for (const part of manifest.chunks) {
+			const partZip = await downloadArtifactZip({ ...input, artifactId: part.artifactId,
+				expectedArchiveSha256: part.archiveSha256,
+				maxArchiveBytes: 32 * 1024 * 1024 });
+			const partEntries = carryZipEntries(partZip);
+			if (partEntries.size !== 1 || !partEntries.has(artifactPartitionPartFile(part.index)))
+				reject("multipart part ZIP has unexpected files");
+			chunks.push(partEntries.get(part.fileName)!);
+		}
+		const restored = restorePartitionFiles(manifest, chunks,
+			input.expectedSource, input.expectedArtifactName);
+		return carryPayloadFromEntries(new Map(Object.entries(restored)), manifest);
+	}
+	if ([...entries.keys()].some(name => /^private-artifact\.part-[0-9]{8}\.bin$/.test(name)))
+		reject("multipart part cannot be used as a carry root");
+	return carryPayloadFromEntries(entries);
+}
+
+function carryPayloadFromEntries(entries: Map<string, Buffer>,
+	transportIndex?: ArtifactPartitionManifestV1): CarryArtifactPayload {
 	const raw = entries.get(CARRY_FILE_NAME);
 	const incrementalRaw = entries.get(INCREMENTAL_CHECKPOINT_FILE);
 	if (!raw) {
 		if (!incrementalRaw || entries.size !== 1) reject("carry root file is missing");
-		return { incrementalControlPrefix: incrementalRaw.toString("utf8") };
+		return { incrementalControlPrefix: incrementalRaw.toString("utf8"),
+			...(transportIndex ? { transportIndex } : {}) };
 	}
 	let parsed: unknown;
 	try { parsed = JSON.parse(raw.toString("utf8")); } catch { return reject("carry file is invalid"); }
 	if (!record(parsed) || !exactKeys(parsed, ["envelopeB64"]) || typeof parsed.envelopeB64 !== "string")
 		reject("carry file fields are invalid");
-	if (entries.size === 1) return parsed.envelopeB64;
+	if (entries.size === 1) return transportIndex ?
+		{ envelopeB64: parsed.envelopeB64, sidecars: {}, transportIndex } : parsed.envelopeB64;
 	entries.delete(CARRY_FILE_NAME);
 	entries.delete(INCREMENTAL_CHECKPOINT_FILE);
 	return { envelopeB64: parsed.envelopeB64,
 		sidecars: Object.fromEntries([...entries].map(([name, bytes]) =>
 			[name, bytes.toString("utf8")])),
-		...(incrementalRaw ? { incrementalControlPrefix: incrementalRaw.toString("utf8") } : {}) };
+		...(incrementalRaw ? { incrementalControlPrefix: incrementalRaw.toString("utf8") } : {}),
+		...(transportIndex ? { transportIndex } : {}) };
+}
+
+/** Trusted final Actions uploader check. This verifies the exact sealed root,
+ * main sidecars and historical prefix sidecars before any public artifact is
+ * created. It returns no decrypted task data. */
+export function authenticateSealedCarryFilesForUpload(input: Readonly<{
+	files: Readonly<Record<string, Buffer>>; missionKey: Buffer; seedDigest: string;
+	source: Readonly<{ runId: string; runAttempt: number; runNumber: number; commit: string }>;
+	legacyParentDigest?: string;
+}>): void {
+	if (!record(input.files) || !Object.hasOwn(input.files, CARRY_FILE_NAME) ||
+		Object.entries(input.files).some(([name, bytes]) =>
+			!validArtifactPartitionFileName(name) || !Buffer.isBuffer(bytes)))
+		reject("sealed carry upload file set is invalid");
+	const payload = carryPayloadFromEntries(new Map(Object.entries(input.files)));
+	const opened = readCheckpoint(payload, input.missionKey, input.seedDigest, input.source,
+		input.legacyParentDigest ?? input.seedDigest);
+	const storedSource = opened.checkpoint.source;
+	if (storedSource.runId !== input.source.runId ||
+		storedSource.runAttempt !== input.source.runAttempt ||
+		storedSource.runNumber !== input.source.runNumber ||
+		storedSource.commit !== input.source.commit)
+		reject("sealed carry upload root source is invalid");
+	if (opened.checkpoint.version !== 3) return;
+	for (const entry of opened.checkpoint.historicalIncrementalPrefixes ?? []) {
+		const raw = entry.version === 1 ? entry.prefixJson :
+			opened.historicalPrefixRaws.get(entry.source.runId);
+		if (typeof raw !== "string") reject("sealed carry upload historical prefix is unavailable");
+		const decoded = openIncrementalControlPrefix(raw, input.missionKey, {
+			repository: MISSION_REPOSITORY, runId: entry.source.runId,
+			runAttempt: entry.source.runAttempt, commit: entry.source.commit,
+			event: entry.event, priorEnvelopeSha256: entry.priorCarryEnvelopeSha256 });
+		if (entry.version === 2 && decoded.sequence !== entry.prefixSequence)
+			reject("sealed carry upload historical prefix sequence is invalid");
+	}
 }
 
 /** Strict bounded ZIP reader. Every member must be a fixed encrypted carry or prefix file. */
@@ -4138,8 +4580,7 @@ function carryZipEntries(zip: Buffer): Map<string, Buffer> {
 	if (eocd < 0 || zip.readUInt32LE(eocd) !== 0x06054b50 || zip.readUInt16LE(eocd + 20) !== 0 ||
 		zip.readUInt16LE(eocd + 4) !== 0 || zip.readUInt16LE(eocd + 6) !== 0 ||
 		zip.readUInt16LE(eocd + 8) < 1 ||
-		zip.readUInt16LE(eocd + 8) !== zip.readUInt16LE(eocd + 10) ||
-		zip.readUInt16LE(eocd + 8) > 65)
+		zip.readUInt16LE(eocd + 8) !== zip.readUInt16LE(eocd + 10))
 		reject("carry archive layout is invalid");
 	const count = zip.readUInt16LE(eocd + 8);
 	const cdSize = zip.readUInt32LE(eocd + 12), cdOffset = zip.readUInt32LE(eocd + 16);
@@ -4159,12 +4600,19 @@ function carryZipEntries(zip: Buffer): Map<string, Buffer> {
 		if (nameEnd + extraLength + commentLength > eocd) reject("carry archive directory is invalid");
 		const nameBytes = zip.subarray(cursor + 46, nameEnd);
 		const name = nameBytes.toString("utf8");
+		const isMainSidecar = /^ledger-continuation\.part-[0-9]{8,}\.enc$/.test(name);
+		const isPrefixSidecar = isHistoricalPrefixSidecarName(name);
+		const isPartFile = /^private-artifact\.part-[0-9]{8}\.bin$/.test(name);
 		const entryLimit = name === CARRY_FILE_NAME ? MAX_CARRY_BYTES :
 			name === INCREMENTAL_CHECKPOINT_FILE ? 64 * 1024 * 1024 :
+			name === ARTIFACT_PARTITION_MANIFEST_FILE ? MAX_ARTIFACT_PARTITION_MANIFEST_BYTES * 2 :
+			isPartFile ? ARTIFACT_PARTITION_PAYLOAD_BYTES :
+			isPrefixSidecar ? Math.ceil(PREFIX_SIDECAR_FILE_BYTES * 4 / 3) + 4 :
 			Math.ceil(CARRY_SEGMENT_FILE_BYTES * 4 / 3) + 4;
 		if (!nameBytes.equals(Buffer.from(name, "utf8")) || names.has(name) ||
 			(name !== CARRY_FILE_NAME && name !== INCREMENTAL_CHECKPOINT_FILE &&
-				!/^ledger-continuation\.part-[0-9]{8,}\.enc$/.test(name)) ||
+				name !== ARTIFACT_PARTITION_MANIFEST_FILE && !isMainSidecar &&
+				!isPrefixSidecar && !isPartFile) ||
 			(flags & ~(0x800 | 0x8)) || ![0, 8].includes(method) ||
 			packed > entryLimit || unpacked > entryLimit ||
 			zip.readUInt16LE(cursor + 34) !== 0 || localOffset + 30 > cdOffset ||
@@ -4205,7 +4653,10 @@ function carryZipEntries(zip: Buffer): Map<string, Buffer> {
 		rows.push({ name, offset: localOffset, dataEnd: nextOffset, bytes });
 		cursor = nameEnd + extraLength + commentLength;
 	}
-	if (cursor !== eocd || (!names.has(CARRY_FILE_NAME) && !names.has(INCREMENTAL_CHECKPOINT_FILE)))
+	if (cursor !== eocd || (!names.has(CARRY_FILE_NAME) &&
+		!names.has(INCREMENTAL_CHECKPOINT_FILE) &&
+		!names.has(ARTIFACT_PARTITION_MANIFEST_FILE) &&
+		![...names].some(name => /^private-artifact\.part-[0-9]{8}\.bin$/.test(name))))
 		reject("carry archive directory is invalid");
 	rows.sort((a, b) => a.offset - b.offset);
 	let next = 0;

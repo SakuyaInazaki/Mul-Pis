@@ -1,5 +1,8 @@
 import { writeSync } from "node:fs";
 import { createLiveControlFrameWriter } from "../../../src/runner/live-control-frame.ts";
+import { IncrementalPrivateCheckpointJournal } from
+	"../../../src/runner/incremental-private-checkpoint.ts";
+import { authenticateSignedMissionSeed } from "../../../src/runner/signed-mission-ledger.ts";
 
 const forbidden = Object.keys(process.env).some(key => /^ACTIONS_/.test(key) ||
 	["GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH", "GITHUB_STEP_SUMMARY", "NODE_OPTIONS",
@@ -9,13 +12,26 @@ if (forbidden || process.env.MULPIS_ACTIONS_PRIVATE_PROGRESS_FD !== "4") process
 const source = { repository: process.env.GITHUB_REPOSITORY, runId: process.env.GITHUB_RUN_ID,
 	runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT), commit: process.env.GITHUB_SHA,
 	event: process.env.GITHUB_EVENT_NAME, priorEnvelopeSha256: process.argv[4] };
+const seed = await authenticateSignedMissionSeed({
+	envelopeB64: process.env.MULPIS_MISSION_LEDGER_B64,
+	publicKeyFile: process.argv[2], expectedSpkiSha256: process.argv[3] });
+const journal = new IncrementalPrivateCheckpointJournal({ source, outputDir: process.argv[5],
+	authenticatedMissionKey: seed.derivePrivateKey("mul-pis-ledger-continuation-v1") });
+const stored = await journal.record("initial", {
+	requestAudit: { version: 3, kind: "accounting-only-request-audit", requests: [],
+		settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 },
+	hostEffects: { version: 1, kind: "host-effect-prefix-observation", complete: false,
+		selectionAuthority: false,
+		source: { runId: source.runId, runAttempt: source.runAttempt, commit: source.commit },
+		priorEnvelopeSha256: source.priorEnvelopeSha256, historicalGoalRunIds: [],
+		goals: [], sessions: [], requestIds: [] } });
 const writer = await createLiveControlFrameWriter({
 	seedEnvelopeB64: process.env.MULPIS_MISSION_LEDGER_B64,
 	publicKeyFile: process.argv[2], expectedSpkiSha256: process.argv[3], source,
 	emitFrame: line => { writeSync(4, `${line}\n`); },
 });
-await writer.emit({ sequence: 1, committedCheckpointBoundary: "initial",
-	checkpointSha256: process.argv[5], requestCount: 0, responseReceivedCount: 0,
+await writer.emit({ sequence: stored.sequence, committedCheckpointBoundary: "initial",
+	checkpointSha256: stored.sha256, requestCount: 0, responseReceivedCount: 0,
 	goalCount: 0, goalOutcomeCounts: { active: 0, partial: 0, blocked: 0, fulfilled: 0 },
 	taskCount: 0, taskStatusCounts: { running: 0, returned: 0, failed: 0,
 		accepted: 0, rejected: 0, unknown: 0 }, operationCount: 0,

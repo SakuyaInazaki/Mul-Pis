@@ -1,0 +1,5 @@
+name: Upload encrypted mission continuation
+description: Publish bounded encrypted carry chunks, then the final transport index
+runs:
+  using: node24
+  main: main.mjs

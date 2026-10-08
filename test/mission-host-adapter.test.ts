@@ -10,13 +10,15 @@ import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 import test, { type TestContext } from "node:test";
 import { deflateRawSync } from "node:zlib";
+import { crc32 } from "node:zlib";
 import { createOriginalObjective, objectiveProgress } from "../src/m07/objective-progress.ts";
 import { MissionHostPreparationError, prepareAuthenticatedResumeRequest,
 	type HostReviewedWorkflowRepairPlanV1 } from "../src/runner/mission-host-adapter.ts";
-import { privateHostPreparationDiagnostic } from "../scripts/prepare-authenticated-private-resume.ts";
+import { exactResultArchiveMember, privateHostPreparationDiagnostic } from
+	"../scripts/prepare-authenticated-private-resume.ts";
 import { authenticateLatestTerminalCarry, authenticatedSupervisorProjection,
 	authenticatedTerminalUnknownControlDeliveries,
-	CARRY_ARTIFACT_NAME, openLedgerContinuation, REUSABLE_RUN_REQUEST_MESSAGE,
+	CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, openLedgerContinuation, REUSABLE_RUN_REQUEST_MESSAGE,
 	type CurrentMissionRun } from "../src/runner/ledger-continuation.ts";
 import { workflowRepairState, type WorkflowRepairFailure, type WorkflowRepairStage,
 	type WorkflowRepairStrategy } from "../src/runner/repair-liveness.ts";
@@ -26,6 +28,9 @@ import { decodeCarrySidecars } from "../src/runner/carry-sidecar-codec.ts";
 import { MissionResumeJournal, type TestedControlBinding } from "../src/runner/mission-resume-journal.ts";
 import type { ResumeIntent } from "../src/runner/mission-supervisor.ts";
 import { IncrementalPrivateCheckpointJournal } from "../src/runner/incremental-private-checkpoint.ts";
+import { ARTIFACT_PARTITION_MANIFEST_FILE, finalizePartitionManifest,
+	partitionEncryptedFiles, sealPartitionManifest } from
+	"../src/runner/private-artifact-partition.ts";
 import { MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, MISSION_ARTIFACT } from
 	"../src/runner/signed-mission-ledger.ts";
 import { campaignSessionEffectId } from "../src/runner/deepseek-campaign.ts";
@@ -34,6 +39,33 @@ import { verifyProviderAvailabilityProof, type ProviderAvailabilityReviewReceipt
 	"../src/runner/provider-availability-proof.ts";
 
 const sha40 = (letter: string): string => letter.repeat(40);
+function syntheticOriginalResultZip(member: Buffer): Buffer {
+	const name = Buffer.from("private-campaign-outcome.enc.json");
+	const crc = crc32(member);
+	const local = Buffer.alloc(30);
+	local.writeUInt32LE(0x04034b50, 0);
+	local.writeUInt16LE(20, 4);
+	local.writeUInt32LE(crc, 14);
+	local.writeUInt32LE(member.length, 18);
+	local.writeUInt32LE(member.length, 22);
+	local.writeUInt16LE(name.length, 26);
+	const central = Buffer.alloc(46);
+	central.writeUInt32LE(0x02014b50, 0);
+	central.writeUInt16LE(20, 4);
+	central.writeUInt16LE(20, 6);
+	central.writeUInt32LE(crc, 16);
+	central.writeUInt32LE(member.length, 20);
+	central.writeUInt32LE(member.length, 24);
+	central.writeUInt16LE(name.length, 28);
+	const directoryOffset = local.length + name.length + member.length;
+	const eocd = Buffer.alloc(22);
+	eocd.writeUInt32LE(0x06054b50, 0);
+	eocd.writeUInt16LE(1, 8);
+	eocd.writeUInt16LE(1, 10);
+	eocd.writeUInt32LE(central.length + name.length, 12);
+	eocd.writeUInt32LE(directoryOffset, 16);
+	return Buffer.concat([local, name, member, central, name, eocd]);
+}
 const sourceCommit = sha40("b");
 const requestCommit = sha40("f");
 const testedTree = sha40("c");
@@ -52,12 +84,15 @@ const canonicalForJournal = (value: unknown): string => {
 function rekeyIntent(intent: ResumeIntent): ResumeIntent {
 	const { source, envelopeSha256, contractId, selectedTupleSha256,
 		pendingActionSha256, actionProvenance, terminalInterruption,
-		interruptedSourceReview, workflowRepair, linkedUnknownDelivery } = intent;
+		terminalPrefixInterruption, interruptedSourceReview,
+		terminalPrefixSourceReview, workflowRepair, linkedUnknownDelivery } = intent;
 	const bound = { source, envelopeSha256, contractId, selectedTupleSha256,
 		pendingActionSha256,
 		...(actionProvenance ? { actionProvenance } : {}),
 		...(terminalInterruption ? { terminalInterruption } : {}),
+		...(terminalPrefixInterruption ? { terminalPrefixInterruption } : {}),
 		...(interruptedSourceReview ? { interruptedSourceReview } : {}),
+		...(terminalPrefixSourceReview ? { terminalPrefixSourceReview } : {}),
 		...(workflowRepair ? { workflowRepair } : {}),
 		...(linkedUnknownDelivery ? { linkedUnknownDelivery } : {}) };
 	return { ...intent, idempotencyKey: createHash("sha256").update(canonicalForJournal(bound)).digest("hex") };
@@ -89,7 +124,7 @@ function run(id: number, number: number, status: string, commit: string,
 async function fixture(t: TestContext, options: { carriedAction?: boolean;
 	unknownOperation?: boolean; controlRequest?: boolean;
 	oldControlSource?: string;
-	largePayload?: boolean; legacyV3?: boolean;
+	largePayload?: boolean; multipartResearchBytes?: number; legacyV3?: boolean;
 	repairStage?: WorkflowRepairStage; repairFailure?: WorkflowRepairFailure;
 	repairActionStage?: WorkflowRepairStage; repairStrategy?: WorkflowRepairStrategy;
 	omitRepairStage?: boolean; omitRepairEvidence?: boolean;
@@ -248,10 +283,14 @@ async function fixture(t: TestContext, options: { carriedAction?: boolean;
 			errorCodes: [] }]) : undefined;
 	let sealed = opening.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
 		unpricedRequestCount: options.provider402 ? 1 : 0, requestAudit,
-		...(options.provider402 || options.largePayload ? { privateBundle: { ...bundle,
+		...(options.provider402 || options.largePayload || options.multipartResearchBytes ?
+			{ privateBundle: { ...bundle,
 			...(diagnostic ? { "transport-diagnostics.json": diagnostic } : {}),
 			...(options.largePayload ?
-				{ "m04-export.json": randomBytes(1_250_000).toString("base64") } : {}) },
+				{ "m04-export.json": randomBytes(1_250_000).toString("base64") } : {}),
+			...(options.multipartResearchBytes ?
+				{ "research-history.json": JSON.stringify({ syntheticPadding:
+					randomBytes(options.multipartResearchBytes).toString("base64") }) } : {}) },
 			bootstrapBinding: opening.priorBootstrapBinding } : {}) });
 	if (options.legacyV3) {
 		const signed = JSON.parse(Buffer.from(seedEnvelopeB64, "base64").toString("utf8")) as {
@@ -553,6 +592,196 @@ test("an interrupted run requires a private review of its own immutable source b
 		return true;
 	});
 	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+});
+
+test("resultless periodic prefix needs exact private source review and prepares only a fresh request", async t => {
+	const f = await interruptedFixture(t);
+	const seedDigest = createHash("sha256")
+		.update(Buffer.from(f.input.seedEnvelopeB64!, "base64")).digest("hex");
+	const signed = JSON.parse(Buffer.from(f.input.seedEnvelopeB64!, "base64").toString("utf8")) as {
+		signature_b64: string };
+	const key = Buffer.from(hkdfSync("sha256", Buffer.from(signed.signature_b64, "base64"),
+		Buffer.from(seedDigest, "hex"), "mul-pis-ledger-continuation-v1", 32));
+	const priorEnvelopeSha256 = createHash("sha256")
+		.update(Buffer.from(f.sealed.envelopeB64, "base64")).digest("hex");
+	const oldCommit = sha40("e");
+	const incremental = new IncrementalPrivateCheckpointJournal({
+		source: { repository: MISSION_REPOSITORY, runId: "7003", runAttempt: 1,
+			commit: oldCommit, event: "workflow_dispatch", priorEnvelopeSha256 },
+		outputDir: f.dir, authenticatedMissionKey: key });
+	await incremental.record("initial", { requestAudit: { version: 3,
+		kind: "accounting-only-request-audit", requests: [], settledCny: 0,
+		unknownObservedCny: 0, unpricedRequestCount: 0 },
+		hostEffects: { version: 1, kind: "host-effect-prefix-observation", complete: false,
+			selectionAuthority: false, source: { runId: "7003", runAttempt: 1, commit: oldCommit },
+			priorEnvelopeSha256, historicalGoalRunIds: [], goals: [], sessions: [], requestIds: [] } });
+	const raw = await readFile(path.join(f.dir, "incremental-control-prefix.json"), "utf8");
+	const prefixSha256 = createHash("sha256").update(raw).digest("hex");
+	const archiveSha256 = "8".repeat(64);
+	const originalRequest = f.request;
+	const request: typeof fetch = async (url, init) => {
+		const reviewed = new Map([
+			["scripts/private-campaign-observer.ts",
+				"export async function readAuthenticatedCommittedPrefix() {}\n" +
+				"export function privateCampaignChildEnv() {}"],
+			["scripts/private-campaign-observer-action.mjs",
+				"export async function runPrivateCampaignAction() { spawnObserver(process.execPath); }"],
+			["scripts/action.yml", "runs:\n  using: node24\n  main: private-campaign-observer-action.mjs\n"],
+			["test/private-campaign-observer.test.ts",
+				"test('prefix reader accepts one committed inode', () => {})\n" +
+				"test('local JS action keeps runtime credentials', () => {})\n" +
+				"test('child has only one-shot inputs', () => {})"]]);
+		const file = String(url).includes("/contents/") ?
+			new URL(String(url)).pathname.split("/contents/")[1] : undefined;
+		const content = file ? reviewed.get(file) : undefined;
+		if (file && content !== undefined) {
+			assert.equal(new URL(String(url)).searchParams.get("ref"), oldCommit);
+			return new Response(JSON.stringify({ type: "file", path: file, encoding: "base64",
+				size: Buffer.byteLength(content), content: Buffer.from(content).toString("base64") }));
+		}
+		if (String(url).includes("/runs/7003/artifacts?"))
+			return new Response(JSON.stringify({ total_count: 1, artifacts: [{ id: 9603,
+				name: "confidential-mission-prefix-7003-1-1", expired: false,
+				digest: `sha256:${archiveSha256}`,
+				workflow_run: { id: 7003, head_sha: oldCommit } }] }));
+		return originalRequest(url, init);
+	};
+	const loadCarryArtifact = async ({ runId, artifactId }: { runId: string; artifactId: string }) => {
+		if (runId === "7003") {
+			assert.equal(artifactId, "9603");
+			return { incrementalControlPrefix: raw };
+		}
+		assert.equal(runId, "7002"); assert.equal(artifactId, "9002");
+		return f.sealed;
+	};
+	const withoutReview = { ...f.input, request, loadCarryArtifact,
+		interruptedSourceReviewPrivateFile: undefined };
+	const waiting = await prepareAuthenticatedResumeRequest(withoutReview);
+	assert.deepEqual(waiting.decision,
+		{ kind: "wait", reason: "interruption-source-review-required" });
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	const oldReview = JSON.parse(await readFile(f.reviewFile, "utf8")) as {
+		review: { kind: string; conclusion: string;
+			codeEvidenceRefs: Array<{ role: string; path: string; symbol: string }>;
+			testEvidenceRefs: Array<{ role: string; path: string; name: string }> } };
+	const terminal = { workflowId: "91", runStatus: "completed", runConclusion: "cancelled",
+		jobId: "6003", jobName: "private-campaign", jobStatus: "completed",
+		jobConclusion: "cancelled", jobRunId: "7003", jobRunAttempt: 1,
+		jobHeadSha: oldCommit, providerStepStatus: "completed",
+		providerStepConclusion: "cancelled" };
+	const interruption = { version: 1, kind: "host-verified-terminal-prefix-interruption",
+		source: { runId: "7003", runAttempt: 1, commit: oldCommit },
+		priorCarrySource: { runId: "7002", runAttempt: 1, commit: sourceCommit },
+		priorCarryEnvelopeSha256: priorEnvelopeSha256,
+		prefixArtifactId: "9603", prefixArchiveSha256: archiveSha256,
+		prefixSha256, prefixSequence: 1, terminal, accounting: "unquantified",
+		effects: "unknown-unreconciled", terminationOrigin: "unknown" };
+	const reviewFile = path.join(f.dir, "terminal-prefix-source-review.json");
+	const receipt = { version: 1, kind: "host-reviewed-terminal-prefix-source-capability",
+		prior: { interruption, sourceTree: testedTree,
+			priorCheckpointSha256: createHash("sha256")
+				.update(f.bundle["objective-checkpoint.json"]).digest("hex") },
+		review: { ...oldReview.review,
+			codeEvidenceRefs: [...oldReview.review.codeEvidenceRefs,
+				{ role: "periodic-prefix-transport", path: "scripts/private-campaign-observer.ts",
+					symbol: "readAuthenticatedCommittedPrefix" },
+				{ role: "trusted-artifact-runtime-parent",
+					path: "scripts/private-campaign-observer-action.mjs",
+					symbol: "runPrivateCampaignAction" },
+				{ role: "trusted-artifact-runtime-parent", path: "scripts/action.yml",
+					symbol: "main: private-campaign-observer-action.mjs" },
+				{ role: "child-runtime-credential-exclusion",
+					path: "scripts/private-campaign-observer.ts",
+					symbol: "privateCampaignChildEnv" }],
+			testEvidenceRefs: [...oldReview.review.testEvidenceRefs,
+				{ role: "periodic-prefix-transport",
+					path: "test/private-campaign-observer.test.ts",
+					name: "prefix reader accepts one committed inode" },
+				{ role: "trusted-artifact-runtime-parent",
+					path: "test/private-campaign-observer.test.ts",
+					name: "local JS action keeps runtime credentials" },
+				{ role: "child-runtime-credential-exclusion",
+					path: "test/private-campaign-observer.test.ts",
+					name: "child has only one-shot inputs" }] },
+		grant: { mode: "fresh-only-confined-effects",
+			oldResultUse: "untrusted-no-replay-no-adoption", m07Tools: "factory-confined-local",
+			assessorAndM04ReviewerSessions: "read-only",
+			state: "fresh-workspace-empty-store-no-resume", outputTransport: "encrypted-fixed",
+			providerInference: "fixed-configured-provider" } };
+	await writeFile(reviewFile, JSON.stringify(receipt), { mode: 0o600 });
+	const input = { ...withoutReview, terminalPrefixSourceReviewPrivateFile: reviewFile };
+	const planned = await prepareAuthenticatedResumeRequest({ ...input, readOnly: true });
+	assert.equal(planned.decision.kind, "dispatch");
+	if (planned.decision.kind !== "dispatch") return;
+	assert.deepEqual(planned.decision.intent.terminalPrefixInterruption, interruption);
+	assert.equal(planned.decision.intent.terminalInterruption, undefined);
+	assert.equal(planned.decision.intent.actionProvenance?.kind,
+		"current-host-prefix-interruption");
+	assert.equal(planned.decision.intent.boundary,
+		"new-isolated-workspace-no-prior-session-resume");
+	assert.deepEqual(planned.decision.intent.quarantinedOperationRefs, ["old-goal/O001"]);
+	assert.equal(planned.decision.intent.pendingAction.reasonCode, "execution-interrupted");
+	assert(!JSON.stringify(planned.descriptor).includes("prefix"));
+	assert(!JSON.stringify(planned.descriptor).includes("operator"));
+	const bridge = await runStdioBridge(f, { request, terminalPrefixSourceReviewPrivateFile: reviewFile,
+		prefixOnly: { runId: "7003", artifactId: "9603", raw, archiveSha256 } });
+	assert.equal(bridge.code, 0, bridge.stderr);
+	assert.equal((bridge.lines.at(-1) as { kind: string }).kind, "prepared");
+	assert(!bridge.stdout.includes("prefixSha256"));
+	assert(!bridge.stdout.includes("terminal-prefix-source-review"));
+	assert(!bridge.stdout.includes("Synthetic original task"));
+	const privateOutput = JSON.parse(await readFile(bridge.outputPrivate, "utf8")) as {
+		decision: { intent: ResumeIntent } };
+	assert.equal(privateOutput.decision.intent.terminalPrefixInterruption?.prefixSha256,
+		prefixSha256);
+	const record = await f.journal.get(privateOutput.decision.intent.idempotencyKey);
+	assert.deepEqual(record?.intentBinding.terminalPrefixInterruption, interruption);
+	assert.equal(record?.intentBinding.terminalPrefixSourceReview?.source.commit, oldCommit);
+	const recordFile = path.join(f.journal.directory,
+		`${privateOutput.decision.intent.idempotencyKey}.json`);
+	const originalRecord = await readFile(recordFile, "utf8");
+	const changedRecord = JSON.parse(originalRecord) as { intentBinding: {
+		terminalPrefixInterruption: { terminal: { runConclusion: string } } } };
+	changedRecord.intentBinding.terminalPrefixInterruption.terminal.runConclusion = "failure";
+	await writeFile(recordFile, JSON.stringify(changedRecord), { mode: 0o600 });
+	await assert.rejects(new MissionResumeJournal(f.journal.directory)
+		.get(privateOutput.decision.intent.idempotencyKey),
+		/terminal prefix interruption binding is invalid|stored idempotency binding changed/);
+	await writeFile(recordFile, originalRecord, { mode: 0o600 });
+	assert.deepEqual((await prepareAuthenticatedResumeRequest(input)).decision,
+		{ kind: "wait", reason: "dispatch-reserved", idempotencyKey: record?.idempotencyKey });
+	await writeFile(reviewFile, JSON.stringify({ ...receipt, prior: {
+		...receipt.prior, interruption: { ...interruption, prefixSha256: "0".repeat(64) } } }),
+		{ mode: 0o600 });
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...input, readOnly: true }),
+		/terminal-prefix-source-review-invalid/);
+	await writeFile(reviewFile, JSON.stringify(receipt), { mode: 0o600 });
+	await chmod(reviewFile, 0o644);
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...input, readOnly: true }),
+		/terminal-prefix-source-review-invalid/);
+	await chmod(reviewFile, 0o600);
+	const traversal = structuredClone(receipt);
+	traversal.review.codeEvidenceRefs.at(-3)!.path =
+		"scripts/../private-campaign-observer-action.mjs";
+	await writeFile(reviewFile, JSON.stringify(traversal), { mode: 0o600 });
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...input, readOnly: true }),
+		/terminal-prefix-source-review-invalid/);
+	const spoof = structuredClone(receipt);
+	spoof.review.codeEvidenceRefs.at(-2)!.symbol = "main: credential-safe-spoof.mjs";
+	await writeFile(reviewFile, JSON.stringify(spoof), { mode: 0o600 });
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...input, readOnly: true }),
+		/terminal-prefix-source-review-invalid/);
+	for (const role of ["trusted-artifact-runtime-parent",
+		"child-runtime-credential-exclusion"]) {
+		const incomplete = structuredClone(receipt);
+		incomplete.review.codeEvidenceRefs = incomplete.review.codeEvidenceRefs
+			.filter(ref => ref.role !== role);
+		incomplete.review.testEvidenceRefs = incomplete.review.testEvidenceRefs
+			.filter(ref => ref.role !== role);
+		await writeFile(reviewFile, JSON.stringify(incomplete), { mode: 0o600 });
+		await assert.rejects(prepareAuthenticatedResumeRequest({ ...input, readOnly: true }),
+			/terminal-prefix-source-review-invalid/);
+	}
 });
 
 test("reviewed workflow repair releases one tested descriptor and durable reservation", async t => {
@@ -1394,12 +1623,18 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 		providerProbe?: { runId: string; artifactId: string; archiveSha256: string };
 		wrongProviderArchiveEcho?: boolean;
 		resultEnvelopeBytes?: Buffer; wrongResultArchiveEcho?: boolean;
+		resultArchiveBytes?: Buffer; resultArtifactArchiveSha256?: string;
 		wrongResultFileDigest?: boolean;
 		interruptedSourceReviewPrivateFile?: string;
+		terminalPrefixSourceReviewPrivateFile?: string;
 		linkedUnknownDeliveryOldControlCommit?: string;
 		unobservedControlSourceReviewPrivateFile?: string;
 		request?: typeof fetch;
 		prefixOnly?: { runId: string; artifactId: string; raw: string; archiveSha256: string };
+		multipart?: { runId: string; rootArtifactId: string; rootArchiveSha256: string;
+			indexRaw: string; parts: Array<{ artifactId: string; archiveSha256: string;
+				artifactName: string; fileName: string; bytes: Buffer }>;
+			partFault?: "changed-bytes" | "wrong-name" };
 		prefixText?: string; archiveSha256?: string; wrongArchiveEcho?: boolean;
 		sidecarFault?: "missing" | "duplicate" | "tamper" } = {}) {
 	const sourceFile = path.join(f.dir, "source.json");
@@ -1414,12 +1649,26 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 	const resultEnvelopeFile = options.resultEnvelopeBytes ? path.join(f.dir,
 		"private-campaign-outcome.enc.json") : undefined;
 	if (resultEnvelopeFile) await writeFile(resultEnvelopeFile, options.resultEnvelopeBytes!, { mode: 0o600 });
+	const resultArchiveFile = options.resultArchiveBytes ? path.join(f.dir,
+		"private-original-result.zip") : undefined;
+	if (resultArchiveFile) await writeFile(resultArchiveFile, options.resultArchiveBytes!,
+		{ mode: 0o600 });
 	const providerEnvelopeFile = options.providerAvailabilityEnvelopeBytes ? path.join(f.dir,
 		"provider-balance.enc.json") : undefined;
 	if (providerEnvelopeFile)
 		await writeFile(providerEnvelopeFile, options.providerAvailabilityEnvelopeBytes!, { mode: 0o600 });
 	const prefixOnlyFile = options.prefixOnly ? path.join(f.dir, "prefix-only.json") : undefined;
 	if (prefixOnlyFile) await writeFile(prefixOnlyFile, options.prefixOnly!.raw, { mode: 0o600 });
+	const multipartIndexFile = options.multipart ? path.join(f.dir, "multipart-index.enc.json") : undefined;
+	if (multipartIndexFile) await writeFile(multipartIndexFile, options.multipart!.indexRaw,
+		{ mode: 0o600 });
+	const multipartParts = options.multipart ? await Promise.all(options.multipart.parts.map(async (item, index) => {
+		const file = path.join(f.dir, `multipart-part-${index}.bin`);
+		const bytes = Buffer.from(item.bytes);
+		if (options.multipart?.partFault === "changed-bytes" && index === 0) bytes[0] ^= 1;
+		await writeFile(file, bytes, { mode: 0o600 });
+		return { ...item, file, bytes };
+	})) : [];
 	let prefixReference: { name: string; file: string; sha256: string } | undefined;
 	if (options.prefixText !== undefined) {
 		const file = path.join(f.dir, "incremental-control-prefix.json");
@@ -1458,6 +1707,9 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 				options.providerAvailabilityReceiptPrivateFile] : []),
 		...(options.interruptedSourceReviewPrivateFile ?
 			["--interrupted-source-review-private", options.interruptedSourceReviewPrivateFile] : []),
+		...(options.terminalPrefixSourceReviewPrivateFile ?
+			["--terminal-prefix-source-review-private",
+				options.terminalPrefixSourceReviewPrivateFile] : []),
 		...(options.linkedUnknownDeliveryOldControlCommit ?
 			["--linked-unknown-control-commit", options.linkedUnknownDeliveryOldControlCommit] : []),
 		...(options.unobservedControlSourceReviewPrivateFile ?
@@ -1472,7 +1724,8 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 	const lines: unknown[] = [];
 	for await (const line of createInterface({ input: child.stdout, crlfDelay: Infinity })) {
 		const row = JSON.parse(line) as { kind: string; id?: number; url?: string;
-			runId?: string; artifactId?: string; expectedArchiveSha256?: string; name?: string };
+			runId?: string; artifactId?: string; expectedArchiveSha256?: string;
+			expectedArtifactName?: string; name?: string };
 		lines.push(row);
 		if (row.kind === "github-get") {
 			assert.equal(typeof row.url, "string");
@@ -1481,6 +1734,29 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 			child.stdin.write(`${JSON.stringify({ id: row.id, status: response.status,
 				body: JSON.parse(await response.text()) })}\n`);
 		} else if (row.kind === "artifact-file") {
+			if (options.multipart && row.artifactId === options.multipart.rootArtifactId) {
+				assert.equal(row.runId, options.multipart.runId);
+				assert.equal(row.expectedArchiveSha256, options.multipart.rootArchiveSha256);
+				child.stdin.write(`${JSON.stringify({ id: row.id,
+					name: ARTIFACT_PARTITION_MANIFEST_FILE, file: multipartIndexFile,
+					sha256: createHash("sha256").update(options.multipart.indexRaw).digest("hex"),
+					archiveSha256: options.multipart.rootArchiveSha256 })}\n`);
+				continue;
+			}
+			const part = multipartParts.find(item => item.artifactId === row.artifactId);
+			if (part) {
+				assert.equal(row.runId, options.multipart?.runId);
+				assert.equal(row.expectedArtifactName, part.artifactName);
+				assert.equal(row.expectedArchiveSha256, part.archiveSha256);
+				assert.equal(row.name, part.fileName);
+				child.stdin.write(`${JSON.stringify({ id: row.id,
+					name: options.multipart?.partFault === "wrong-name" ?
+						"private-artifact.part-99999999.bin" : part.fileName,
+					file: part.file,
+					sha256: createHash("sha256").update(part.bytes).digest("hex"),
+					archiveSha256: part.archiveSha256 })}\n`);
+				continue;
+			}
 			if (row.name === "provider-balance.enc.json") {
 				assert.equal(row.artifactId, options.providerProbe?.artifactId ?? "9302");
 				assert.equal(row.runId, options.providerProbe?.runId ?? "8002");
@@ -1496,14 +1772,16 @@ async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
 			}
 			if (row.artifactId === "9202") {
 				assert.equal(row.runId, "7002");
-				assert.equal(row.expectedArchiveSha256, "9".repeat(64));
+				assert.equal(row.expectedArchiveSha256,
+					options.resultArtifactArchiveSha256 ?? "9".repeat(64));
 				assert(resultEnvelopeFile && options.resultEnvelopeBytes);
 				child.stdin.write(`${JSON.stringify({ id: row.id,
 					name: "private-campaign-outcome.enc.json", file: resultEnvelopeFile,
 					sha256: options.wrongResultFileDigest ? "0".repeat(64) :
 						createHash("sha256").update(options.resultEnvelopeBytes).digest("hex"),
+					...(resultArchiveFile ? { archiveFile: resultArchiveFile } : {}),
 					archiveSha256: options.wrongResultArchiveEcho ? "0".repeat(64) :
-						"9".repeat(64) })}\n`);
+						options.resultArtifactArchiveSha256 ?? "9".repeat(64) })}\n`);
 				continue;
 			}
 			if (options.prefixOnly && row.runId === options.prefixOnly.runId) {
@@ -1812,6 +2090,65 @@ test("stdio bridge binds a reviewed result-only repair to its separate encrypted
 		decision: { kind: string; intent: { pendingAction: { kind: string } } } };
 	assert.equal(privateResult.decision.kind, "dispatch");
 	assert.equal(privateResult.decision.intent.pendingAction.kind, "reconcile-m07-operation");
+});
+
+test("oversized present RSA result remains a private connector-capacity blocker", async t => {
+	const f = await resultOnlyRepairFixture(t);
+	const oversized = Buffer.alloc(32 * 1024 * 1024 + 1, 65);
+	const bridge = await runStdioBridge(f, {
+		repairPlanPrivateFile: f.input.repairPlanPrivateFile,
+		resultOnlyRepairReviewPrivateFile: f.resultOnlyRepairReviewPrivateFile,
+		resultEnvelopeBytes: oversized });
+	assert.equal(bridge.code, 1);
+	assert(!bridge.stdout.includes("prepared"));
+	assert(!bridge.stdout.includes("connector-capacity"));
+	const diagnostic = JSON.parse(await readFile(bridge.outputPrivate, "utf8")) as {
+		code: string; preparation?: { code: string } };
+	assert.equal(diagnostic.code, "result-envelope-exceeds-connector-capacity");
+	assert.equal(diagnostic.preparation?.code, "result-only-repair-review-invalid");
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+});
+
+test("locally restored original RSA ZIP crosses connector limit only after exact archive verification", async t => {
+	const f = await resultOnlyRepairFixture(t);
+	const member = Buffer.concat([f.envelopeBytes, Buffer.alloc(32 * 1024 * 1024, 32)]);
+	const originalZip = syntheticOriginalResultZip(member);
+	assert(originalZip.length > 32 * 1024 * 1024);
+	assert(exactResultArchiveMember(originalZip).equals(member));
+	const archiveSha256 = createHash("sha256").update(originalZip).digest("hex");
+	const receipt = structuredClone(f.receipt) as unknown as {
+		result: { archiveSha256: string; envelopeSha256: string } };
+	receipt.result.archiveSha256 = archiveSha256;
+	receipt.result.envelopeSha256 = createHash("sha256").update(member).digest("hex");
+	await writeFile(f.resultOnlyRepairReviewPrivateFile, JSON.stringify(receipt), { mode: 0o600 });
+	const request: typeof fetch = async (url, init) => {
+		if (String(url).endsWith("/runs/7002/artifacts?per_page=100")) {
+			const response = await f.request(url, init);
+			const body = await response.json() as { total_count: number;
+				artifacts: Array<{ name: string; digest: string }> };
+			return new Response(JSON.stringify({ ...body, artifacts: body.artifacts.map(row =>
+				row.name === MISSION_ARTIFACT ?
+					{ ...row, digest: `sha256:${archiveSha256}` } : row) }));
+		}
+		return f.request(url, init);
+	};
+	const accepted = await runStdioBridge(f, { request,
+		repairPlanPrivateFile: f.input.repairPlanPrivateFile,
+		resultOnlyRepairReviewPrivateFile: f.resultOnlyRepairReviewPrivateFile,
+		resultEnvelopeBytes: member, resultArchiveBytes: originalZip,
+		resultArtifactArchiveSha256: archiveSha256 });
+	assert.equal(accepted.code, 0, accepted.stderr);
+	assert.equal((accepted.lines.at(-1) as { kind: string }).kind, "prepared");
+	assert(!accepted.stdout.includes("ciphertext_b64"));
+	const damagedZip = Buffer.from(originalZip);
+	damagedZip[damagedZip.length - 1] ^= 1;
+	const refused = await runStdioBridge(f, { readOnly: true, request,
+		repairPlanPrivateFile: f.input.repairPlanPrivateFile,
+		resultOnlyRepairReviewPrivateFile: f.resultOnlyRepairReviewPrivateFile,
+		resultEnvelopeBytes: member, resultArchiveBytes: damagedZip,
+		resultArtifactArchiveSha256: archiveSha256 });
+	assert.equal(refused.code, 1);
+	assert(!refused.stdout.includes("planned-read-only"));
 });
 
 test("stdio bridge rejects a result artifact ZIP or encrypted envelope mismatch", async t => {
@@ -2206,4 +2543,83 @@ test("stdio bridge authenticates the latest carry with two executed runs of ance
 	assert.equal((bridge.lines.at(-1) as { kind: string }).kind, "prepared");
 	assert(!bridge.stdout.includes("Synthetic original task"));
 	assert.equal((await stat(bridge.outputPrivate)).mode & 0o077, 0);
+});
+
+test("stdio bridge reconstructs authenticated multipart carry without exposing bytes", async t => {
+	const f = await fixture(t, { unknownOperation: true,
+		multipartResearchBytes: 17 * 1024 * 1024 });
+	const seedBytes = Buffer.from(f.input.seedEnvelopeB64!, "base64");
+	const seedDigest = createHash("sha256").update(seedBytes).digest("hex");
+	const signed = JSON.parse(seedBytes.toString("utf8")) as { signature_b64: string };
+	const missionKey = Buffer.from(hkdfSync("sha256", Buffer.from(signed.signature_b64, "base64"),
+		Buffer.from(seedDigest, "hex"), "mul-pis-ledger-continuation-v1", 32));
+	const rootArchiveSha256 = "a".repeat(64);
+	const files = Object.fromEntries([
+		[CARRY_FILE_NAME, Buffer.from(JSON.stringify({ envelopeB64: f.sealed.envelopeB64 }))],
+		...Object.entries(f.sealed.sidecars).map(([name, content]) =>
+			[name, Buffer.from(content)] as const)]) as Record<string, Buffer>;
+	const prepared = partitionEncryptedFiles({ source: { repository: MISSION_REPOSITORY,
+		runId: "7002", runAttempt: 1, commit: sourceCommit, event: "workflow_dispatch" },
+		artifactName: CARRY_ARTIFACT_NAME, files });
+	assert(prepared.chunks.length > 1, "the composed connector must fetch multiple real parts");
+	const uploads = prepared.chunks.map((chunk, index) => ({ index: chunk.index,
+		artifactId: String(9902 + index), archiveSha256: "b".repeat(64) }));
+	const manifest = finalizePartitionManifest(prepared, uploads);
+	const indexRaw = sealPartitionManifest({ manifest, missionKey, seedDigest });
+	const multipart = { runId: "7002", rootArtifactId: "9002", rootArchiveSha256,
+		indexRaw, parts: prepared.chunks.map((chunk, index) => ({
+			artifactId: uploads[index]!.artifactId,
+			archiveSha256: uploads[index]!.archiveSha256,
+			artifactName: chunk.artifactName, fileName: chunk.fileName, bytes: chunk.bytes })) };
+	const artifactRows = [{ id: 9002, name: CARRY_ARTIFACT_NAME, expired: false,
+		digest: `sha256:${rootArchiveSha256}`,
+		workflow_run: { id: 7002, head_sha: sourceCommit } },
+		...manifest.chunks.map(chunk => ({ id: Number(chunk.artifactId),
+			name: chunk.artifactName, expired: false, digest: `sha256:${chunk.archiveSha256}`,
+			workflow_run: { id: 7002, head_sha: sourceCommit } }))];
+	const request: typeof fetch = async (url, init) =>
+		String(url).includes("/runs/7002/artifacts?") ?
+			new Response(JSON.stringify({ total_count: artifactRows.length,
+				artifacts: artifactRows })) : f.request(url, init);
+	const accepted = await runStdioBridge(f, { readOnly: true, request, multipart });
+	assert.equal(accepted.code, 0, accepted.stderr);
+	assert.equal((accepted.lines.at(-1) as { kind: string }).kind, "planned-read-only");
+	assert.equal(accepted.lines.filter(row => (row as { kind: string }).kind === "artifact-file")
+		.length, 1 + manifest.chunks.length);
+	assert(!accepted.stdout.includes(indexRaw));
+	assert(!accepted.stdout.includes(f.sealed.envelopeB64));
+	const changed = await runStdioBridge(f, { readOnly: true, request,
+		multipart: { ...multipart, partFault: "changed-bytes" } });
+	assert.equal(changed.code, 1);
+	assert(!changed.stdout.includes("planned-read-only"));
+	const wrongName = await runStdioBridge(f, { readOnly: true, request,
+		multipart: { ...multipart, partFault: "wrong-name" } });
+	assert.equal(wrongName.code, 1);
+	assert(!wrongName.stdout.includes("planned-read-only"));
+	const missingRequest: typeof fetch = async (url, init) =>
+		String(url).includes("/runs/7002/artifacts?") ?
+			new Response(JSON.stringify({ total_count: 1, artifacts: [artifactRows[0]] })) :
+			f.request(url, init);
+	const missing = await runStdioBridge(f, { readOnly: true, request: missingRequest,
+		multipart });
+	assert.equal(missing.code, 1);
+	assert(!missing.stdout.includes("planned-read-only"));
+	for (const invalidRows of [
+		[...artifactRows, artifactRows[1]],
+		artifactRows.map((row, index) => index === 1 ?
+			{ ...row, workflow_run: { id: 7002, head_sha: sha40("0") } } : row),
+		[...artifactRows, { id: 9999,
+			name: `${CARRY_ARTIFACT_NAME}-part-00000001`, expired: false,
+			digest: `sha256:${"c".repeat(64)}`,
+			workflow_run: { id: 7002, head_sha: sourceCommit } }]
+	]) {
+		const invalidRequest: typeof fetch = async (url, init) =>
+			String(url).includes("/runs/7002/artifacts?") ?
+				new Response(JSON.stringify({ total_count: invalidRows.length,
+					artifacts: invalidRows })) : f.request(url, init);
+		const refused = await runStdioBridge(f, { readOnly: true,
+			request: invalidRequest, multipart });
+		assert.equal(refused.code, 1);
+		assert(!refused.stdout.includes("planned-read-only"));
+	}
 });

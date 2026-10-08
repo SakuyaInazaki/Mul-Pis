@@ -56,7 +56,9 @@ export type ResumeJournalRecord = Readonly<{
 		contractId: string; selectedTupleSha256: string; pendingActionSha256: string;
 		actionKind: ResumeIntent["actionKind"]; actionProvenance?: ActionProvenance;
 		terminalInterruption?: ResumeIntent["terminalInterruption"];
+		terminalPrefixInterruption?: ResumeIntent["terminalPrefixInterruption"];
 		interruptedSourceReview?: ResumeIntent["interruptedSourceReview"];
+		terminalPrefixSourceReview?: ResumeIntent["terminalPrefixSourceReview"];
 		workflowRepair?: ResumeIntent["workflowRepair"];
 		linkedUnknownDelivery?: ResumeIntent["linkedUnknownDelivery"] }>;
 	control: TestedControlBinding;
@@ -125,6 +127,17 @@ function provenanceBinding(value: ActionProvenance | undefined): ActionProvenanc
 		return { kind: "current-host-interruption",
 			priorCheckpointSha256: value.priorCheckpointSha256,
 			resultArchiveSha256: value.resultArchiveSha256 };
+	if (value.kind === "current-host-prefix-interruption" &&
+		Object.keys(value).sort().join("|") ===
+		["kind", "priorCheckpointSha256", "prefixArchiveSha256", "prefixSha256",
+			"prefixSequence"].sort().join("|") &&
+		hex64(value.priorCheckpointSha256) && hex64(value.prefixArchiveSha256) &&
+		hex64(value.prefixSha256) && Number.isSafeInteger(value.prefixSequence) &&
+		value.prefixSequence > 0)
+		return { kind: "current-host-prefix-interruption",
+			priorCheckpointSha256: value.priorCheckpointSha256,
+			prefixArchiveSha256: value.prefixArchiveSha256,
+			prefixSha256: value.prefixSha256, prefixSequence: value.prefixSequence };
 	return refuse("invalid action provenance");
 }
 
@@ -153,6 +166,40 @@ function interruptionBinding(value: ResumeIntent["terminalInterruption"],
 		accounting: "unquantified", effects: "unknown-unreconciled", terminationOrigin: "unknown" };
 }
 
+function prefixInterruptionBinding(value: ResumeIntent["terminalPrefixInterruption"],
+	source: ResumeIntent["source"], envelopeSha256: string):
+	ResumeIntent["terminalPrefixInterruption"] {
+	if (value === undefined) return undefined;
+	const terminal = value.terminal;
+	if (Object.keys(value).sort().join("|") !== ["version", "kind", "source",
+		"priorCarrySource", "priorCarryEnvelopeSha256", "prefixArtifactId",
+		"prefixArchiveSha256", "prefixSha256", "prefixSequence", "terminal",
+		"accounting", "effects", "terminationOrigin"].sort().join("|") ||
+		value.version !== 1 || value.kind !== "host-verified-terminal-prefix-interruption" ||
+		value.accounting !== "unquantified" || value.effects !== "unknown-unreconciled" ||
+		value.terminationOrigin !== "unknown" ||
+		!runId(value.prefixArtifactId) || !hex64(value.prefixArchiveSha256) ||
+		!hex64(value.prefixSha256) || !Number.isSafeInteger(value.prefixSequence) ||
+		value.prefixSequence < 1 || value.priorCarryEnvelopeSha256 !== envelopeSha256 ||
+		!runId(value.source?.runId) || value.source.runAttempt !== source.runAttempt ||
+		value.source.runId !== source.runId || value.source.commit !== source.commit ||
+		!runId(value.priorCarrySource?.runId) || value.priorCarrySource.runId === source.runId ||
+		!Number.isSafeInteger(value.priorCarrySource.runAttempt) ||
+		value.priorCarrySource.runAttempt < 1 || !hex40(value.priorCarrySource.commit) ||
+		!terminal || Object.keys(terminal).sort().join("|") !== ["workflowId", "runStatus",
+			"runConclusion", "jobId", "jobName", "jobStatus", "jobConclusion",
+			"jobRunId", "jobRunAttempt", "jobHeadSha", "providerStepStatus",
+			"providerStepConclusion"].sort().join("|") ||
+		!runId(terminal.workflowId) || !runId(terminal.jobId) ||
+		terminal.runStatus !== "completed" || terminal.jobName !== "private-campaign" ||
+		terminal.jobStatus !== "completed" || terminal.providerStepStatus !== "completed" ||
+		terminal.jobRunId !== source.runId || terminal.jobRunAttempt !== source.runAttempt ||
+		terminal.jobHeadSha !== source.commit ||
+		!["cancelled", "timed_out"].includes(terminal.runConclusion))
+		refuse("terminal prefix interruption binding is invalid");
+	return structuredClone(value);
+}
+
 function interruptedSourceReviewBinding(value: ResumeIntent["interruptedSourceReview"],
 	source: ResumeIntent["source"]): ResumeIntent["interruptedSourceReview"] {
 	if (value === undefined) return undefined;
@@ -163,6 +210,20 @@ function interruptedSourceReviewBinding(value: ResumeIntent["interruptedSourceRe
 		value.source.runAttempt !== source.runAttempt ||
 		value.source.commit !== source.commit)
 		refuse("interrupted source review binding is invalid");
+	return { source: { runId: value.source.runId, runAttempt: value.source.runAttempt,
+		commit: value.source.commit }, sourceTree: value.sourceTree,
+		receiptSha256: value.receiptSha256 };
+}
+
+function terminalPrefixSourceReviewBinding(value: ResumeIntent["terminalPrefixSourceReview"],
+	source: ResumeIntent["source"]): ResumeIntent["terminalPrefixSourceReview"] {
+	if (value === undefined) return undefined;
+	if (Object.keys(value).sort().join("|") !== "receiptSha256|source|sourceTree" ||
+		!hex64(value.receiptSha256) || !hex40(value.sourceTree) ||
+		Object.keys(value.source ?? {}).sort().join("|") !== "commit|runAttempt|runId" ||
+		value.source.runId !== source.runId || value.source.runAttempt !== source.runAttempt ||
+		value.source.commit !== source.commit)
+		refuse("terminal prefix source review binding is invalid");
 	return { source: { runId: value.source.runId, runAttempt: value.source.runAttempt,
 		commit: value.source.commit }, sourceTree: value.sourceTree,
 		receiptSha256: value.receiptSha256 };
@@ -222,13 +283,25 @@ function intentBinding(intent: ResumeIntent): ResumeJournalRecord["intentBinding
 	const workflowRepair = repairBinding(intent.workflowRepair);
 	const terminalInterruption = interruptionBinding(intent.terminalInterruption,
 		intent.source, intent.envelopeSha256);
+	const terminalPrefixInterruption = prefixInterruptionBinding(intent.terminalPrefixInterruption,
+		intent.source, intent.envelopeSha256);
 	const interruptedSourceReview = interruptedSourceReviewBinding(intent.interruptedSourceReview,
 		intent.source);
+	const terminalPrefixSourceReview = terminalPrefixSourceReviewBinding(
+		intent.terminalPrefixSourceReview, intent.source);
 	const linkedUnknownDelivery = linkedUnknownDeliveryBinding(intent.linkedUnknownDelivery);
-	if (Boolean(terminalInterruption) !== (actionProvenance?.kind === "current-host-interruption") ||
+	if (terminalInterruption && terminalPrefixInterruption ||
+		Boolean(terminalInterruption) !== (actionProvenance?.kind === "current-host-interruption") ||
+		Boolean(terminalPrefixInterruption) !==
+			(actionProvenance?.kind === "current-host-prefix-interruption") ||
 		Boolean(terminalInterruption) !== Boolean(interruptedSourceReview) ||
+		Boolean(terminalPrefixInterruption) !== Boolean(terminalPrefixSourceReview) ||
 		terminalInterruption && actionProvenance?.kind === "current-host-interruption" &&
-		terminalInterruption.resultArchiveSha256 !== actionProvenance.resultArchiveSha256)
+		terminalInterruption.resultArchiveSha256 !== actionProvenance.resultArchiveSha256 ||
+		terminalPrefixInterruption && actionProvenance?.kind === "current-host-prefix-interruption" &&
+		(terminalPrefixInterruption.prefixArchiveSha256 !== actionProvenance.prefixArchiveSha256 ||
+		terminalPrefixInterruption.prefixSha256 !== actionProvenance.prefixSha256 ||
+		terminalPrefixInterruption.prefixSequence !== actionProvenance.prefixSequence))
 		refuse("interruption action provenance is invalid");
 	if (intent?.version !== 1 || intent.kind !== "fresh-independent-mission-resume" ||
 		!runId(intent.source?.runId) || !Number.isSafeInteger(intent.source.runAttempt) ||
@@ -248,7 +321,9 @@ function intentBinding(intent: ResumeIntent): ResumeJournalRecord["intentBinding
 		selectedTupleSha256: intent.selectedTupleSha256,
 		pendingActionSha256: intent.pendingActionSha256,
 		...(terminalInterruption ? { terminalInterruption } : {}),
+		...(terminalPrefixInterruption ? { terminalPrefixInterruption } : {}),
 		...(interruptedSourceReview ? { interruptedSourceReview } : {}),
+		...(terminalPrefixSourceReview ? { terminalPrefixSourceReview } : {}),
 		...(workflowRepair ? { workflowRepair } : {}),
 		...(linkedUnknownDelivery ? { linkedUnknownDelivery } : {}) }));
 	// A linked request has a new identity even when its scientific action is unchanged.
@@ -258,7 +333,9 @@ function intentBinding(intent: ResumeIntent): ResumeJournalRecord["intentBinding
 		pendingActionSha256: intent.pendingActionSha256, actionKind: intent.actionKind,
 		...(actionProvenance ? { actionProvenance } : {}),
 		...(terminalInterruption ? { terminalInterruption } : {}),
+		...(terminalPrefixInterruption ? { terminalPrefixInterruption } : {}),
 		...(interruptedSourceReview ? { interruptedSourceReview } : {}),
+		...(terminalPrefixSourceReview ? { terminalPrefixSourceReview } : {}),
 		...(workflowRepair ? { workflowRepair } : {}),
 		...(linkedUnknownDelivery ? { linkedUnknownDelivery } : {}) };
 }
@@ -377,8 +454,12 @@ async function readRecord(file: string): Promise<ResumeJournalRecord> {
 	const workflowRepair = repairBinding(bound.workflowRepair);
 	const terminalInterruption = interruptionBinding(bound.terminalInterruption,
 		bound.source, bound.envelopeSha256);
+	const terminalPrefixInterruption = prefixInterruptionBinding(bound.terminalPrefixInterruption,
+		bound.source, bound.envelopeSha256);
 	const interruptedSourceReview = interruptedSourceReviewBinding(bound.interruptedSourceReview,
 		bound.source);
+	const terminalPrefixSourceReview = terminalPrefixSourceReviewBinding(
+		bound.terminalPrefixSourceReview, bound.source);
 	const linkedUnknownDelivery = linkedUnknownDeliveryBinding(bound.linkedUnknownDelivery);
 	if (workflowRepair && (workflowRepair.testedSourceCommit !== value.control.testedSourceCommit ||
 		workflowRepair.testedTree !== value.control.testedTree ||
@@ -395,15 +476,27 @@ async function readRecord(file: string): Promise<ResumeJournalRecord> {
 		(workflowRepair !== undefined && canonical(workflowRepair) !== canonical(bound.workflowRepair)) ||
 		(bound.actionProvenance !== undefined &&
 			canonical(provenanceBinding(bound.actionProvenance)) !== canonical(bound.actionProvenance)) ||
+		terminalInterruption && terminalPrefixInterruption ||
 		Boolean(terminalInterruption) !==
 			(bound.actionProvenance?.kind === "current-host-interruption") ||
+		Boolean(terminalPrefixInterruption) !==
+			(bound.actionProvenance?.kind === "current-host-prefix-interruption") ||
 		Boolean(terminalInterruption) !== Boolean(interruptedSourceReview) ||
+		Boolean(terminalPrefixInterruption) !== Boolean(terminalPrefixSourceReview) ||
 		(interruptedSourceReview !== undefined &&
 			canonical(interruptedSourceReview) !== canonical(bound.interruptedSourceReview)) ||
+		(terminalPrefixSourceReview !== undefined &&
+			canonical(terminalPrefixSourceReview) !== canonical(bound.terminalPrefixSourceReview)) ||
 		(linkedUnknownDelivery !== undefined &&
 			canonical(linkedUnknownDelivery) !== canonical(bound.linkedUnknownDelivery)) ||
 		terminalInterruption && bound.actionProvenance?.kind === "current-host-interruption" &&
-			terminalInterruption.resultArchiveSha256 !== bound.actionProvenance.resultArchiveSha256)
+			terminalInterruption.resultArchiveSha256 !== bound.actionProvenance.resultArchiveSha256 ||
+		terminalPrefixInterruption &&
+			bound.actionProvenance?.kind === "current-host-prefix-interruption" &&
+			(terminalPrefixInterruption.prefixArchiveSha256 !==
+				bound.actionProvenance.prefixArchiveSha256 ||
+			terminalPrefixInterruption.prefixSha256 !== bound.actionProvenance.prefixSha256 ||
+			terminalPrefixInterruption.prefixSequence !== bound.actionProvenance.prefixSequence))
 		refuse("stored private intent binding is invalid");
 	const expected = digest(canonical({ ...(bound.actionProvenance ?
 		{ actionProvenance: bound.actionProvenance } : {}), source: bound.source,
@@ -411,7 +504,9 @@ async function readRecord(file: string): Promise<ResumeJournalRecord> {
 		selectedTupleSha256: bound.selectedTupleSha256,
 		pendingActionSha256: bound.pendingActionSha256,
 		...(terminalInterruption ? { terminalInterruption } : {}),
+		...(terminalPrefixInterruption ? { terminalPrefixInterruption } : {}),
 		...(interruptedSourceReview ? { interruptedSourceReview } : {}),
+		...(terminalPrefixSourceReview ? { terminalPrefixSourceReview } : {}),
 		...(workflowRepair ? { workflowRepair } : {}),
 		...(linkedUnknownDelivery ? { linkedUnknownDelivery } : {}) }));
 	if (expected !== value.idempotencyKey) refuse("stored idempotency binding changed");
@@ -706,7 +801,8 @@ export class MissionResumeJournal {
 						canonical(expectedLinkedAncestry(records, oldLinked, linked.oldControlCommit)) ||
 					["source", "envelopeSha256", "contractId", "selectedTupleSha256",
 						"pendingActionSha256", "actionKind", "actionProvenance",
-						"terminalInterruption", "interruptedSourceReview"].some(field =>
+						"terminalInterruption", "interruptedSourceReview",
+						"terminalPrefixInterruption", "terminalPrefixSourceReview"].some(field =>
 						canonical((privateBinding as unknown as Record<string, unknown>)[field] ?? null) !==
 						canonical((oldLinked!.intentBinding as unknown as Record<string, unknown>)[field] ?? null)))
 					refuse("linked request does not bind the old uncertain attempt");

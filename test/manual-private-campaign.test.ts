@@ -14,6 +14,9 @@ import { HarnessError } from "../src/types.ts";
 import { sealCampaignCarry } from "../src/runner/emergency-carry.ts";
 import { encodeCarrySidecars, decodeCarrySidecars } from "../src/runner/carry-sidecar-codec.ts";
 import { CARRY_SEGMENT_FILE_BYTES } from "../src/runner/carry-sidecar-codec.ts";
+import { encodeHistoricalPrefixSidecars, historicalPrefixSidecarName,
+	PREFIX_SIDECAR_FILE_BYTES, PREFIX_SIDECAR_RAW_BYTES } from "../src/runner/incremental-prefix-sidecar-codec.ts";
+import { MISSION_REPOSITORY } from "../src/runner/signed-mission-ledger.ts";
 import { validatePriorGroundingIndex } from "../src/m07/assessor-grounding.ts";
 import { runOriginalObjectiveLoop } from "../src/m07/objective-progress.ts";
 import { PrivateAssessorDiagnosticError } from "../src/runner/private-assessor-diagnostic.ts";
@@ -365,7 +368,8 @@ test("private history evidence distinguishes the sealed baseline from unquantifi
 	const baseline = { source: { runId: "7001", runAttempt: 1, commit: "a".repeat(40) },
 		resultArtifact: { immutableRef: "synthetic-baseline-result", digestScope: "github-artifact-archive",
 			sha256: "b".repeat(64) } } as any;
-	const gap = { source: { runId: "7002", runAttempt: 1, runNumber: 2, commit: "c".repeat(40) },
+	const gap = { version: 1, kind: "opaque-executed-run-gap",
+		source: { runId: "7002", runAttempt: 1, runNumber: 2, commit: "c".repeat(40) },
 		resultArtifact: { repository: "synthetic/repository", runId: "7002", artifactId: "8002",
 			artifactName: "synthetic-result", digestScope: "github-artifact-archive",
 			archiveSha256: "d".repeat(64) } } as any;
@@ -394,6 +398,18 @@ test("private history evidence distinguishes the sealed baseline from unquantifi
 		resultArtifact: undefined }, [gap], false) as any;
 	assert.equal(expired.baselineCarry.resultArtifact.state, "expired-or-unavailable");
 	assert.equal(expired.opaqueExecutedRuns[0].resultArtifact.artifactSha256, "d".repeat(64));
+	const prefixGap = { version: 2, kind: "opaque-prefix-backed-executed-run-gap",
+		source: gap.source, prefixArtifact: { repository: "synthetic/repository",
+			runId: "7002", artifactId: "8003", artifactName: "synthetic-prefix",
+			digestScope: "github-artifact-archive", archiveSha256: "e".repeat(64) },
+		prefixSequence: 7 } as any;
+	const prefixEvidence = offlineChecks.historicalGapEvidence(baseline, [prefixGap], false) as any;
+	assert.equal(prefixEvidence.opaqueExecutedRuns[0].prefixArtifact.sequence, 7);
+	assert.equal(prefixEvidence.opaqueExecutedRuns[0].prefixArtifact.complete, false);
+	assert.equal(prefixEvidence.opaqueExecutedRuns[0].prefixArtifact.selectionAuthority, false);
+	assert.equal(prefixEvidence.opaqueExecutedRuns[0].resultArtifact, undefined);
+	assert.equal(prefixEvidence.opaqueExecutedRuns[0].accounting, "unquantified");
+	assert.equal(prefixEvidence.opaqueExecutedRuns[0].effectState, "unknown-unreconciled");
 });
 
 test("new campaign has no host time, call-count, iteration or round quota", async () => {
@@ -1532,6 +1548,47 @@ test("driver persists canonical encrypted sidecars before publishing root carry"
 		rename: async () => undefined,
 	});
 	assert.equal(nearLimitWritten, true);
+});
+
+test("driver persists both sealed carry sidecar namespaces before the root", async () => {
+	const source = { runId: "47", runAttempt: 1, runNumber: 47, commit: "a".repeat(40) };
+	const encoded = encodeHistoricalPrefixSidecars({ key: Buffer.alloc(32, 7),
+		seedDigest: "b".repeat(64), source, event: "push",
+		priorCarryEnvelopeSha256: "c".repeat(64), sequence: 4088,
+		artifact: { repository: MISSION_REPOSITORY, artifactId: "19",
+			artifactName: "synthetic-incremental-prefix", runId: source.runId,
+			archiveSha256: "d".repeat(64), digestScope: "github-artifact-archive" },
+		plaintext: Buffer.alloc(PREFIX_SIDECAR_RAW_BYTES + 1, 9) });
+	assert.equal(encoded.sidecars.length, 2);
+	const main = Buffer.alloc(28, 5).toString("base64");
+	const sidecars = Object.fromEntries([
+		["ledger-continuation.part-00000000.enc", main],
+		...encoded.sidecars.map(part => [part.name, part.bytes.toString("base64")])
+	]);
+	const calls: string[] = [];
+	await offlineChecks.writeSealedCarryFiles("/synthetic-output",
+		{ envelopeB64: "synthetic-root", sidecars }, {
+			write: async (target, data, options) => {
+				assert.deepEqual(options, { mode: 0o600, flag: "wx" });
+				if (target.endsWith(".enc")) assert.equal(data, sidecars[path.basename(target)]);
+				calls.push(`write:${path.basename(target)}`);
+			},
+			rename: async (from, to) => { calls.push(`rename:${path.basename(from)}:${path.basename(to)}`); }
+		});
+	assert.deepEqual(calls.slice(0, 3).sort(), Object.keys(sidecars).map(name => `write:${name}`).sort());
+	assert.equal(calls.at(-1),
+		`rename:ledger-continuation.enc.json.${process.pid}.tmp:ledger-continuation.enc.json`);
+	const noWrites: string[] = [];
+	const io = { write: async (target: string) => { noWrites.push(target); },
+		rename: async () => { throw Error("root must not publish"); } };
+	const secondName = historicalPrefixSidecarName(source, 4088, 1);
+	const firstName = historicalPrefixSidecarName(source, 4088, 0);
+	await assert.rejects(offlineChecks.writeSealedCarryFiles("/synthetic-output",
+		{ envelopeB64: "synthetic-root", sidecars: { [secondName]: sidecars[secondName]! } }, io));
+	await assert.rejects(offlineChecks.writeSealedCarryFiles("/synthetic-output",
+		{ envelopeB64: "synthetic-root", sidecars: {
+			[firstName]: Buffer.alloc(PREFIX_SIDECAR_FILE_BYTES + 1).toString("base64") } }, io));
+	assert.deepEqual(noWrites, []);
 });
 
 test("read-only credential probe uses one official model-list request and stores only status", async () => {

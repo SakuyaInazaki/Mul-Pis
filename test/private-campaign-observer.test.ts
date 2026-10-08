@@ -1,17 +1,25 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { constants, createHash, generateKeyPairSync, sign } from "node:crypto";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createAuthenticatedProgressGate, createProgressUploader,
-	launchPrivateCampaignObserver, parsePrivateProgressFrame,
-	privateCampaignChildEnv, PROGRESS_ARTIFACT_ATTEMPT_LIMIT } from "../scripts/private-campaign-observer.ts";
+	launchPrivateCampaignObserver, parsePrivateProgressFrame, readAuthenticatedCommittedPrefix,
+	privateCampaignChildEnv, PREFIX_PUBLICATION_INTERVAL_MS,
+	PREFIX_LOCAL_FREE_RESERVE_BYTES, PROGRESS_ARTIFACT_ATTEMPT_LIMIT } from
+	"../scripts/private-campaign-observer.ts";
 import { PUBLIC_HEARTBEAT_LINE } from "../scripts/private-campaign-heartbeat.ts";
 import { createLiveControlFrameWriter } from "../src/runner/live-control-frame.ts";
+import { IncrementalPrivateCheckpointJournal, INCREMENTAL_CHECKPOINT_FILE,
+	type IncrementalCheckpointSource } from "../src/runner/incremental-private-checkpoint.ts";
 import { MISSION_ARTIFACT, MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY } from
 	"../src/runner/signed-mission-ledger.ts";
+import { authenticateSignedMissionSeed } from "../src/runner/signed-mission-ledger.ts";
+import { ARTIFACT_PARTITION_MANIFEST_FILE, ARTIFACT_PARTITION_PAYLOAD_BYTES,
+	openPartitionManifest, restorePartitionFiles } from
+	"../src/runner/private-artifact-partition.ts";
 import { closeSync, openSync } from "node:fs";
 
 const actionModule = new URL("../scripts/private-campaign-observer-action.mjs", import.meta.url).href;
@@ -44,6 +52,77 @@ async function until(check: () => boolean): Promise<void> {
 		await new Promise(resolve => setTimeout(resolve, 5));
 	}
 	assert.fail("synthetic observer did not reach the expected state");
+}
+
+async function prefixFixture(directory: string) {
+	const { publicKey, privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+	const publicKeyFile = path.join(directory, "public.pem");
+	await writeFile(publicKeyFile, publicKey.export({ type: "spki", format: "pem" }));
+	const expectedSpkiSha256 = createHash("sha256")
+		.update(publicKey.export({ type: "spki", format: "der" })).digest("hex");
+	const payload = { version: 1, kind: "mul-pis-private-mission-ledger", missionId: MISSION_ID,
+		repository: MISSION_REPOSITORY, globalMaxCny: MISSION_TOTAL_CNY,
+		priorCommittedCny: 0, revision: 1,
+		previous: { runId: "8001001", runAttempt: 1, artifactId: "9002001",
+			artifactName: MISSION_ARTIFACT } };
+	const payloadBytes = Buffer.from(JSON.stringify(payload));
+	const signature = sign("sha256", payloadBytes, { key: privateKey,
+		padding: constants.RSA_PKCS1_PSS_PADDING, saltLength: 32 });
+	const seedEnvelopeB64 = Buffer.from(JSON.stringify({ payload_b64: payloadBytes.toString("base64"),
+		signature_b64: signature.toString("base64") })).toString("base64");
+	const seed = await authenticateSignedMissionSeed({ envelopeB64: seedEnvelopeB64,
+		publicKeyFile, expectedSpkiSha256 });
+	const authenticatedMissionKey = seed.derivePrivateKey("mul-pis-ledger-continuation-v1");
+	const source: IncrementalCheckpointSource = { repository: MISSION_REPOSITORY,
+		runId: "12345", runAttempt: 1, commit: "a".repeat(40),
+		event: "workflow_dispatch", priorEnvelopeSha256: "b".repeat(64) };
+	const outputDir = path.join(directory, "results");
+	await mkdir(outputDir, { mode: 0o700 });
+	const journal = new IncrementalPrivateCheckpointJournal({ source, outputDir,
+		authenticatedMissionKey });
+	const writer = await createLiveControlFrameWriter({ seedEnvelopeB64, publicKeyFile,
+		expectedSpkiSha256, source, emitFrame: () => undefined });
+	const snapshot = (count: number) => {
+		const requests = Array.from({ length: count }, (_, index) => ({
+			requestId: `request-${index + 1}`, sessionId: "c".repeat(64),
+			responseReceived: false, inputPayloadBytes: 120, maxOutputTokens: 8192,
+			status: "in-flight" as const, settledCny: null, unknownObservedCny: null,
+			reportedUsage: null }));
+		return { requestAudit: { version: 3 as const, kind: "accounting-only-request-audit" as const,
+			requests, settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: count },
+			hostEffects: { version: 1 as const, kind: "host-effect-prefix-observation" as const,
+				complete: false as const, selectionAuthority: false as const,
+				source: { runId: source.runId, runAttempt: source.runAttempt, commit: source.commit },
+				priorEnvelopeSha256: source.priorEnvelopeSha256, historicalGoalRunIds: [],
+				goals: [], sessions: [], requestIds: requests.map(row => row.requestId) } };
+	};
+	const makeStatus = (stored: { sequence: number; sha256: string },
+		committedCheckpointBoundary: "initial" | "request-reserved" | "control-observed",
+		requestCount = 0) => ({
+		version: 1 as const, kind: "partial-control-observation" as const,
+		partial: true as const, complete: false as const,
+		selectionAuthority: false as const, scientificAcceptance: "unreviewed" as const,
+		accounting: "unquantified" as const,
+		committedCheckpointBoundary, checkpointSha256: stored.sha256,
+		requestCount, responseReceivedCount: 0,
+		goalCount: 0, goalOutcomeCounts: { active: 0, partial: 0, blocked: 0, fulfilled: 0 },
+		taskCount: 0, taskStatusCounts: { running: 0, returned: 0, failed: 0,
+			accepted: 0, rejected: 0, unknown: 0 },
+		operationCount: 0, operationStatusCounts: { prepared: 0, issued: 0,
+			"response-received": 0, "partial-settled": 0,
+			"terminal-response-incomplete": 0, unknown: 0, confirmed: 0,
+			"not-issued": 0 }, observedAt: "2026-10-08T10:00:00.000Z"
+	});
+	const makeFrame = (stored: { sequence: number; sha256: string },
+		boundary: "initial" | "request-reserved" | "control-observed", requestCount = 0) => {
+		const { version: _version, kind: _kind, partial: _partial, complete: _complete,
+			selectionAuthority: _selectionAuthority, scientificAcceptance: _scientificAcceptance,
+			accounting: _accounting, ...fields } = makeStatus(stored, boundary, requestCount);
+		return writer.emit({ sequence: stored.sequence, ...fields });
+	};
+	return { source, outputDir, publicKeyFile, expectedSpkiSha256, seedEnvelopeB64,
+		authenticatedMissionKey, seedDigest: seed.seedDigest, journal, writer, snapshot,
+		makeStatus, makeFrame };
 }
 
 test("child has only one-shot inputs, never Actions runtime or file-command channels", () => {
@@ -150,8 +229,592 @@ test("uploader keeps one latest pending frame, counts ambiguous attempts and nev
 		assert.equal(await readFile(calls[1]!.file, "utf8"), `${frame(4)}\n`);
 		assert.equal(uploader.offer(frame(5), 5), false);
 		assert.equal(uploader.stats().attempts, 2);
-		assert.equal(PROGRESS_ARTIFACT_ATTEMPT_LIMIT, 498);
+		assert.equal(PROGRESS_ARTIFACT_ATTEMPT_LIMIT, 482);
 	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("prefix reader accepts one committed inode and rejects stale, tampered, or symlink bytes", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-prefix-inode-"));
+	try {
+		const f = await prefixFixture(directory);
+		const first = await f.journal.record("initial", f.snapshot(0));
+		const firstBytes = await readFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE));
+		assert.deepEqual(await readAuthenticatedCommittedPrefix({ outputDir: f.outputDir,
+			source: f.source, sequence: first.sequence, checkpointSha256: first.sha256,
+			event: "initial", authenticatedMissionKey: f.authenticatedMissionKey }), firstBytes);
+		const second = await f.journal.record("request-reserved", f.snapshot(1));
+		await assert.rejects(readAuthenticatedCommittedPrefix({ outputDir: f.outputDir,
+			source: f.source, sequence: first.sequence, checkpointSha256: first.sha256,
+			event: "initial", authenticatedMissionKey: f.authenticatedMissionKey }));
+		const secondBytes = await readAuthenticatedCommittedPrefix({ outputDir: f.outputDir,
+			source: f.source, sequence: second.sequence, checkpointSha256: second.sha256,
+			event: "request-reserved", authenticatedMissionKey: f.authenticatedMissionKey });
+		assert.equal(createHash("sha256").update(secondBytes).digest("hex"), second.sha256);
+		await assert.rejects(readAuthenticatedCommittedPrefix({ outputDir: f.outputDir,
+			source: { ...f.source, runId: "12346" }, sequence: second.sequence,
+			checkpointSha256: second.sha256, event: "request-reserved",
+			authenticatedMissionKey: f.authenticatedMissionKey }));
+		const file = path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE);
+		await writeFile(file, "forged private text", { mode: 0o600 });
+		await assert.rejects(readAuthenticatedCommittedPrefix({ outputDir: f.outputDir,
+			source: f.source, sequence: second.sequence, checkpointSha256: second.sha256,
+			event: "request-reserved", authenticatedMissionKey: f.authenticatedMissionKey }));
+		await rm(file);
+		await symlink(path.join(directory, "public.pem"), file);
+		await assert.rejects(readAuthenticatedCommittedPrefix({ outputDir: f.outputDir,
+			source: f.source, sequence: second.sequence, checkpointSha256: second.sha256,
+			event: "request-reserved", authenticatedMissionKey: f.authenticatedMissionKey }));
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("shared uploader prioritizes immutable prefixes, throttles request snapshots, and reserves final slots", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-prefix-upload-"));
+	const calls: Array<{ name: string; file: string; root: string; retention: number;
+		text: string; members: string[]; mode: number }> = [];
+	let now = 0;
+	let fireTimer: (() => void) | undefined;
+	try {
+		const f = await prefixFixture(directory);
+		const first = await f.journal.record("initial", f.snapshot(0));
+		const uploader = createProgressUploader({ directory: path.join(directory, "ciphertext"),
+			runId: "12345", runAttempt: "1", maxAttempts: 3,
+			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
+				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256,
+				now: () => now, scheduleTimer: fire => {
+					fireTimer = fire;
+					return { unref: () => undefined, clear: () => undefined };
+				} },
+			client: async () => ({ uploadArtifact: async (name, files, root, options) => {
+				calls.push({ name, file: files[0]!, root, retention: options.retentionDays,
+					text: await readFile(files[0]!, "utf8"), members: await readdir(root),
+					mode: (await stat(files[0]!)).mode });
+			} }) });
+		assert.equal(uploader.offerPrefix({ source: f.source, sequence: first.sequence,
+			status: f.makeStatus(first, "initial") }), true);
+		assert.equal(uploader.offer(frame(1), 1), true);
+		await until(() => calls.length === 2);
+		assert.equal(calls[0]!.name, "confidential-mission-prefix-12345-1-1");
+		assert.equal(path.basename(calls[0]!.file), INCREMENTAL_CHECKPOINT_FILE);
+		assert.deepEqual(calls[0]!.members, [INCREMENTAL_CHECKPOINT_FILE]);
+		assert.equal(calls[0]!.text,
+			await readFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE), "utf8"));
+		assert.equal(calls[0]!.mode & 0o077, 0);
+		await until(() => !uploader.stats().active);
+		await assert.rejects(readFile(calls[0]!.file));
+		assert.equal(calls[1]!.name, "confidential-campaign-progress-12345-1-2");
+		assert.deepEqual(calls.map(call => call.retention), [1, 1]);
+		const second = await f.journal.record("request-reserved", f.snapshot(1));
+		const secondStatus = f.makeStatus(second, "request-reserved", 1);
+		now = PREFIX_PUBLICATION_INTERVAL_MS - 1;
+		assert.equal(uploader.offerPrefix({ source: f.source, sequence: second.sequence,
+			status: secondStatus }), true);
+		now = PREFIX_PUBLICATION_INTERVAL_MS;
+		assert.equal(uploader.offerPrefix({ source: f.source, sequence: second.sequence,
+			status: secondStatus }), false);
+		assert.ok(fireTimer);
+		fireTimer();
+		await until(() => calls.length === 3);
+		assert.equal(calls[2]!.name, "confidential-mission-prefix-12345-1-2");
+		await until(() => !uploader.stats().active);
+		await assert.rejects(readFile(calls[2]!.file));
+		assert.equal(uploader.stats().attempts, 3);
+		assert.equal(uploader.stats().prefixAttempts, 2);
+		assert.equal(uploader.offer(frame(2), 2), false);
+		assert.equal(uploader.offerPrefix({ source: f.source, sequence: 3,
+			status: secondStatus }), false);
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("one request reservation at minute five uploads at the scheduled deadline without another frame", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-prefix-silent-request-"));
+	let now = 0;
+	let timer: { fire: () => void; delayMs: number; cancelled: boolean; unrefd: boolean } | undefined;
+	const calls: Array<{ name: string; file: string; text: string }> = [];
+	try {
+		const f = await prefixFixture(directory);
+		const initial = await f.journal.record("initial", f.snapshot(0));
+		const uploader = createProgressUploader({ directory: path.join(directory, "ciphertext"),
+			runId: "12345", runAttempt: "1", maxAttempts: 5,
+			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
+				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256,
+				now: () => now,
+				scheduleTimer: (fire, delayMs) => {
+					timer = { fire, delayMs, cancelled: false, unrefd: false };
+					return { unref: () => { timer!.unrefd = true; },
+						clear: () => { timer!.cancelled = true; } };
+				} },
+			client: async () => ({ uploadArtifact: async (name, files) => {
+				calls.push({ name, file: files[0]!, text: await readFile(files[0]!, "utf8") });
+			} }) });
+		assert.equal(uploader.offerPrefix({ source: f.source, sequence: initial.sequence,
+			status: f.makeStatus(initial, "initial") }), true);
+		await until(() => calls.length === 1);
+		assert.equal(calls[0]!.name, "confidential-mission-prefix-12345-1-1");
+		now = 5 * 60 * 1000;
+		const reserved = await f.journal.record("request-reserved", f.snapshot(1));
+		assert.equal(uploader.offerPrefix({ source: f.source, sequence: reserved.sequence,
+			status: f.makeStatus(reserved, "request-reserved", 1) }), true);
+		assert.equal(timer?.delayMs, 15 * 60 * 1000);
+		assert.equal(timer?.unrefd, true);
+		assert.equal(calls.length, 1);
+		// A long provider call emits nothing else. The parent timer still publishes
+		// the latest committed reservation at minute fifteen.
+		now = 15 * 60 * 1000;
+		timer!.fire();
+		await until(() => calls.length === 2);
+		assert.equal(calls[1]!.name, "confidential-mission-prefix-12345-1-2");
+		assert.equal(calls[1]!.text,
+			await readFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE), "utf8"));
+		await until(() => !uploader.stats().active);
+		await assert.rejects(readFile(calls[1]!.file));
+		uploader.stop();
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("timer authenticates latest local sequence when a same-semantic commit emitted no frame", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-prefix-same-semantic-"));
+	let now = 0;
+	let fireTimer: (() => void) | undefined;
+	const calls: Array<{ name: string; file: string; text: string }> = [];
+	try {
+		const f = await prefixFixture(directory);
+		const first = await f.journal.record("initial", f.snapshot(0));
+		const uploader = createProgressUploader({ directory: path.join(directory, "ciphertext"),
+			runId: "12345", runAttempt: "1", maxAttempts: 4,
+			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
+				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256,
+				now: () => now, scheduleTimer: fire => {
+					fireTimer = fire;
+					return { unref: () => undefined, clear: () => undefined };
+				} },
+			client: async () => ({ uploadArtifact: async (name, files) => {
+				calls.push({ name, file: files[0]!, text: await readFile(files[0]!, "utf8") });
+			} }) });
+		assert.equal(uploader.offerPrefix({ source: f.source, sequence: first.sequence,
+			status: f.makeStatus(first, "initial") }), true);
+		await until(() => calls.length === 1);
+		now = 5 * 60 * 1000;
+		const second = await f.journal.record("request-reserved", f.snapshot(1));
+		assert.equal(uploader.offerPrefix({ source: f.source, sequence: second.sequence,
+			status: f.makeStatus(second, "request-reserved", 1) }), true);
+		const third = await f.journal.record("request-reserved", f.snapshot(1));
+		// The status observer coalesces this equal-count commit and emits no FD4 frame.
+		assert.equal(third.sequence, second.sequence + 1);
+		assert.equal(calls.length, 1);
+		assert.ok(fireTimer);
+		now = PREFIX_PUBLICATION_INTERVAL_MS;
+		fireTimer();
+		await until(() => calls.length === 2);
+		assert.equal(calls[1]!.name, "confidential-mission-prefix-12345-1-3");
+		assert.equal(calls[1]!.text,
+			await readFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE), "utf8"));
+		await until(() => !uploader.stats().active);
+		await assert.rejects(readFile(calls[1]!.file));
+		assert.equal(uploader.stats().lastPrefixAttemptedSequence, 3);
+		assert.equal(uploader.stats().lastPrefixSequence, 3);
+		uploader.stop();
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("hundreds of rapid controls coalesce to one later prefix despite shared status pressure", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-prefix-control-burst-"));
+	let now = 0;
+	let fireTimer: (() => void) | undefined;
+	const names: string[] = [];
+	try {
+		const f = await prefixFixture(directory);
+		const first = await f.journal.record("initial", f.snapshot(0));
+		const uploader = createProgressUploader({ directory: path.join(directory, "ciphertext"),
+			runId: "12345", runAttempt: "1", maxAttempts: 4,
+			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
+				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256,
+				now: () => now, scheduleTimer: fire => {
+					fireTimer = fire;
+					return { unref: () => undefined, clear: () => undefined };
+				} },
+			client: async () => ({ uploadArtifact: async name => { names.push(name); } }) });
+		uploader.offerPrefix({ source: f.source, sequence: first.sequence,
+			status: f.makeStatus(first, "initial") });
+		await until(() => names.length === 1);
+		let latest = first;
+		for (let index = 0; index < 200; index++) {
+			latest = await f.journal.record("control-observed", f.snapshot(0));
+			assert.equal(uploader.offerPrefix({ source: f.source, sequence: latest.sequence,
+				status: f.makeStatus(latest, "control-observed") }), true);
+			uploader.offer(frame(latest.sequence), latest.sequence);
+		}
+		await until(() => uploader.stats().statusAttempts === 2);
+		assert.equal(names.filter(name => name.startsWith("confidential-mission-prefix-")).length, 1);
+		assert.equal(uploader.stats().lastPrefixSequence, latest.sequence);
+		assert.ok(fireTimer);
+		now = PREFIX_PUBLICATION_INTERVAL_MS;
+		fireTimer();
+		await until(() => names.includes(`confidential-mission-prefix-12345-1-${latest.sequence}`));
+		assert.deepEqual(names.filter(name => name.startsWith("confidential-mission-prefix-")), [
+			"confidential-mission-prefix-12345-1-1",
+			`confidential-mission-prefix-12345-1-${latest.sequence}`]);
+		assert.equal(uploader.stats().attempts, 4);
+		assert.ok(uploader.stats().attempts <= PROGRESS_ARTIFACT_ATTEMPT_LIMIT);
+		uploader.stop();
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("late multipart prefix survives saturated status share with encrypted manifest last", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-prefix-multipart-reserve-"));
+	let now = 0;
+	let fireTimer: (() => void) | undefined;
+	const uploads: Array<{ name: string; member: string; bytes: Buffer; file: string }> = [];
+	try {
+		const f = await prefixFixture(directory);
+		const first = await f.journal.record("initial", f.snapshot(0));
+		const ciphertextDir = path.join(directory, "ciphertext");
+		const uploader = createProgressUploader({ directory: ciphertextDir,
+			runId: "12345", runAttempt: "1", maxAttempts: 8,
+			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
+				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256,
+				availableBytes: async () => PREFIX_LOCAL_FREE_RESERVE_BYTES + 64n * 1024n * 1024n,
+				now: () => now, scheduleTimer: fire => {
+					fireTimer = fire;
+					return { unref: () => undefined, clear: () => undefined };
+				} },
+			client: async () => ({ uploadArtifact: async (name, files, root) => {
+				const bytes = await readFile(files[0]!);
+				assert.equal(path.dirname(files[0]!), root);
+				uploads.push({ name, member: path.basename(files[0]!), bytes, file: files[0]! });
+				const id = 9000 + uploads.length;
+					const digest = createHash("sha256")
+						.update(`synthetic-archive-${id}`).digest("hex");
+					return { id, digest: uploads.length % 2 ? digest : `sha256:${digest}` };
+			} }) });
+		assert.equal(uploader.offerPrefix({ source: f.source, sequence: first.sequence,
+			status: f.makeStatus(first, "initial") }), true);
+		await until(() => uploader.stats().prefixAttempts === 1);
+		for (let count = 1; count <= 4; count++) {
+			const committed = await f.journal.record("control-observed", f.snapshot(0));
+			assert.equal(uploader.offer(frame(committed.sequence), committed.sequence), true);
+			await until(() => uploader.stats().statusAttempts === count);
+		}
+		assert.equal(uploader.offer(frame(1000), 1000), false);
+		const objectiveCheckpointJson = JSON.stringify({ version: 1,
+			kind: "original-objective-progress", detail: "x".repeat(13 * 1024 * 1024) });
+		const late = await f.journal.record("control-observed", {
+			...f.snapshot(0), objectiveCheckpointJson });
+		const original = await readFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE));
+		assert.ok(original.length > ARTIFACT_PARTITION_PAYLOAD_BYTES);
+		assert.ok(fireTimer);
+		now = PREFIX_PUBLICATION_INTERVAL_MS;
+		fireTimer();
+		const rootName = `confidential-mission-prefix-12345-1-${late.sequence}`;
+		await until(() => uploads.some(row => row.name === rootName));
+		await until(() => !uploader.stats().active);
+		assert.equal(uploader.stats().attempts, 8);
+		assert.equal(uploader.stats().statusAttempts, 4);
+		assert.equal(uploader.stats().prefixAttempts, 4);
+		const root = uploads.find(row => row.name === rootName)!;
+		assert.equal(root.member, ARTIFACT_PARTITION_MANIFEST_FILE);
+		assert.equal(uploads.at(-1)!.name, rootName);
+		const source = { repository: MISSION_REPOSITORY, runId: f.source.runId,
+			runAttempt: f.source.runAttempt, commit: f.source.commit, event: f.source.event } as const;
+		const manifest = openPartitionManifest({ raw: root.bytes.toString("utf8"),
+			missionKey: f.authenticatedMissionKey, seedDigest: f.seedDigest,
+			expectedSource: source, expectedArtifactName: rootName });
+		assert.equal(manifest.chunks.length, 2);
+		const chunkBytes = manifest.chunks.map(chunk => {
+			const uploaded = uploads.find(row => row.name === chunk.artifactName);
+			assert.ok(uploaded);
+			assert.equal(uploaded.member, chunk.fileName);
+			return uploaded.bytes;
+		});
+		const recovered = restorePartitionFiles(manifest, chunkBytes, source, rootName);
+		assert.deepEqual(recovered[INCREMENTAL_CHECKPOINT_FILE], original);
+		assert.deepEqual((await readdir(ciphertextDir)).filter(name =>
+			name.startsWith("confidential-mission-prefix-")), []);
+		for (const upload of uploads.filter(row => row.name.startsWith("confidential-mission-prefix-")))
+			await assert.rejects(readFile(upload.file));
+		uploader.stop();
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("an ambiguous multipart part attempt cannot publish a root index", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-prefix-multipart-fail-"));
+	const names: string[] = [];
+	let partFile: string | undefined;
+	try {
+		const f = await prefixFixture(directory);
+		const objectiveCheckpointJson = JSON.stringify({ version: 1,
+			kind: "original-objective-progress", detail: "x".repeat(13 * 1024 * 1024) });
+		const first = await f.journal.record("initial", {
+			...f.snapshot(0), objectiveCheckpointJson });
+		const uploader = createProgressUploader({ directory: path.join(directory, "ciphertext"),
+			runId: "12345", runAttempt: "1", maxAttempts: 5,
+			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
+				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256,
+				availableBytes: async () => PREFIX_LOCAL_FREE_RESERVE_BYTES + 64n * 1024n * 1024n },
+			client: async () => ({ uploadArtifact: async (name, files) => {
+				names.push(name);
+				partFile = files[0]!;
+				throw new Error("ambiguous multipart upload failure");
+			} }) });
+		assert.equal(uploader.offerPrefix({ source: f.source, sequence: first.sequence,
+			status: f.makeStatus(first, "initial") }), true);
+		await until(() => names.length === 1);
+		await until(() => !uploader.stats().active);
+		assert.deepEqual(names, ["confidential-mission-prefix-12345-1-1-part-00000000"]);
+		assert.equal(uploader.stats().attempts, 1);
+		assert.equal(uploader.stats().lastPrefixAttemptedSequence, first.sequence);
+		assert.ok(partFile);
+		await assert.rejects(readFile(partFile));
+		assert.ok((await readFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE))).length >
+			ARTIFACT_PARTITION_PAYLOAD_BYTES);
+		uploader.stop();
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a replacement before the first read promptly publishes only the newer authenticated commit", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-prefix-race-"));
+	const calls: Array<{ name: string; file: string; text: string }> = [];
+	let releaseClient: () => void = () => undefined;
+	const clientReady = new Promise<void>(resolve => { releaseClient = resolve; });
+	try {
+		const f = await prefixFixture(directory);
+		const first = await f.journal.record("initial", f.snapshot(0));
+		const uploader = createProgressUploader({ directory: path.join(directory, "ciphertext"),
+			runId: "12345", runAttempt: "1", maxAttempts: 2,
+			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
+				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256 },
+			client: async () => { await clientReady; return { uploadArtifact: async (name, files) => {
+				calls.push({ name, file: files[0]!, text: await readFile(files[0]!, "utf8") });
+			} }; } });
+		assert.equal(uploader.offerPrefix({ source: f.source, sequence: first.sequence,
+			status: f.makeStatus(first, "initial") }), true);
+		await until(() => uploader.stats().active);
+		const second = await f.journal.record("request-reserved", f.snapshot(1));
+		releaseClient();
+		await until(() => calls.length === 1);
+		assert.equal(calls[0]!.name, "confidential-mission-prefix-12345-1-2");
+		assert.equal(uploader.stats().attempts, 1);
+		assert.equal(uploader.stats().lastPrefixAttemptedSequence, second.sequence);
+		assert.equal(calls[0]!.text,
+			await readFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE), "utf8"));
+		await until(() => !uploader.stats().active);
+		await assert.rejects(readFile(calls[0]!.file));
+	} finally { releaseClient(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("tampered committed bytes are never offered to the artifact client", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-prefix-tamper-upload-"));
+	let calls = 0;
+	try {
+		const f = await prefixFixture(directory);
+		const stored = await f.journal.record("initial", f.snapshot(0));
+		await writeFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE), "private plaintext",
+			{ mode: 0o600 });
+		const uploader = createProgressUploader({ directory: path.join(directory, "ciphertext"),
+			runId: "12345", runAttempt: "1", maxAttempts: 2,
+			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
+				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256 },
+			client: async () => ({ uploadArtifact: async () => { calls++; } }) });
+		assert.equal(uploader.offerPrefix({ source: f.source, sequence: stored.sequence,
+			status: f.makeStatus(stored, "initial") }), true);
+		await until(() => !uploader.stats().active);
+		assert.equal(calls, 0);
+		assert.equal(uploader.stats().attempts, 0);
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("first-frame fallback rejects a newer valid prefix bound to another run", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-prefix-wrong-source-"));
+	let calls = 0;
+	try {
+		const f = await prefixFixture(directory);
+		const first = await f.journal.record("initial", f.snapshot(0));
+		const otherDir = path.join(directory, "other");
+		await mkdir(otherDir, { mode: 0o700 });
+		const otherSource = { ...f.source, runId: "12346" };
+		const other = new IncrementalPrivateCheckpointJournal({ source: otherSource,
+			outputDir: otherDir, authenticatedMissionKey: f.authenticatedMissionKey });
+		const otherSnapshot = (count: number) => {
+			const snapshot = f.snapshot(count);
+			return { ...snapshot, hostEffects: { ...snapshot.hostEffects,
+				source: { ...snapshot.hostEffects.source, runId: otherSource.runId } } };
+		};
+		await other.record("initial", otherSnapshot(0));
+		await other.record("request-reserved", otherSnapshot(1));
+		await writeFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE),
+			await readFile(path.join(otherDir, INCREMENTAL_CHECKPOINT_FILE)));
+		const uploader = createProgressUploader({ directory: path.join(directory, "ciphertext"),
+			runId: "12345", runAttempt: "1", maxAttempts: 2,
+			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
+				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256 },
+			client: async () => ({ uploadArtifact: async () => { calls++; } }) });
+		assert.equal(uploader.offerPrefix({ source: f.source, sequence: first.sequence,
+			status: f.makeStatus(first, "initial") }), true);
+		await until(() => !uploader.stats().active);
+		assert.equal(calls, 0);
+		assert.equal(uploader.stats().attempts, 0);
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("ambiguous prefix upload consumes its sequence and a later committed snapshot gets a new name", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-prefix-ambiguous-"));
+	const names: string[] = [];
+	const copiedFiles: string[] = [];
+	let now = 0;
+	let fireTimer: (() => void) | undefined;
+	try {
+		const f = await prefixFixture(directory);
+		const first = await f.journal.record("initial", f.snapshot(0));
+		const uploader = createProgressUploader({ directory: path.join(directory, "ciphertext"),
+			runId: "12345", runAttempt: "1", maxAttempts: 2,
+			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
+				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256,
+				now: () => now, scheduleTimer: fire => {
+					fireTimer = fire;
+					return { unref: () => undefined, clear: () => undefined };
+				} },
+			client: async () => ({ uploadArtifact: async (name, files) => {
+				names.push(name);
+				copiedFiles.push(files[0]!);
+				if (names.length === 1) throw new Error("ambiguous artifact result");
+			} }) });
+		assert.equal(uploader.offerPrefix({ source: f.source, sequence: first.sequence,
+			status: f.makeStatus(first, "initial") }), true);
+		await until(() => names.length === 1);
+		await until(() => !uploader.stats().active);
+		await assert.rejects(readFile(copiedFiles[0]!));
+		assert.equal(uploader.offerPrefix({ source: f.source, sequence: first.sequence,
+			status: f.makeStatus(first, "initial") }), false);
+		const second = await f.journal.record("request-reserved", f.snapshot(1));
+		now = PREFIX_PUBLICATION_INTERVAL_MS;
+		assert.equal(uploader.offerPrefix({ source: f.source, sequence: second.sequence,
+			status: f.makeStatus(second, "request-reserved", 1) }), true);
+		assert.ok(fireTimer);
+		fireTimer();
+		await until(() => names.length === 2);
+		await until(() => !uploader.stats().active);
+		await assert.rejects(readFile(copiedFiles[1]!));
+		assert.deepEqual(names, ["confidential-mission-prefix-12345-1-1",
+			"confidential-mission-prefix-12345-1-2"]);
+		assert.equal(uploader.stats().attempts, 2);
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("disk pressure skips only observation and many prefix uploads retain no local copies", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-prefix-disk-floor-"));
+	let now = 0;
+	let fireTimer: (() => void) | undefined;
+	let freeBytes = 0n;
+	let peakLocalCopies = 0;
+	const uploads: Array<{ name: string; text: string; file: string }> = [];
+	try {
+		const f = await prefixFixture(directory);
+		const first = await f.journal.record("initial", f.snapshot(0));
+		const ciphertextDir = path.join(directory, "ciphertext");
+		const uploader = createProgressUploader({ directory: ciphertextDir,
+			runId: "12345", runAttempt: "1", maxAttempts: 8,
+			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
+				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256,
+				now: () => now,
+				availableBytes: async observedDirectory => {
+					assert.equal(observedDirectory, directory);
+					return freeBytes;
+				},
+				scheduleTimer: fire => {
+					fireTimer = fire;
+					return { unref: () => undefined, clear: () => undefined };
+				} },
+			client: async () => ({ uploadArtifact: async (name, files) => {
+				const localCopies = (await readdir(ciphertextDir)).filter(item =>
+					item.startsWith("confidential-mission-prefix-"));
+				peakLocalCopies = Math.max(peakLocalCopies, localCopies.length);
+				uploads.push({ name, text: await readFile(files[0]!, "utf8"), file: files[0]! });
+			} }) });
+		freeBytes = PREFIX_LOCAL_FREE_RESERVE_BYTES +
+			BigInt((await readFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE))).length) - 1n;
+		assert.equal(uploader.offerPrefix({ source: f.source, sequence: first.sequence,
+			status: f.makeStatus(first, "initial") }), true);
+		await until(() => !uploader.stats().active);
+		assert.equal(uploads.length, 0);
+		assert.equal(uploader.stats().attempts, 0);
+		freeBytes = PREFIX_LOCAL_FREE_RESERVE_BYTES + 64n * 1024n * 1024n;
+		for (let index = 0; index < 6; index++) {
+			if (index > 0) await f.journal.record("control-observed", f.snapshot(0));
+			now = (index + 1) * PREFIX_PUBLICATION_INTERVAL_MS;
+			assert.ok(fireTimer);
+			fireTimer();
+			await until(() => uploads.length === index + 1);
+			await until(() => !uploader.stats().active);
+			assert.deepEqual(await readdir(ciphertextDir), []);
+			await assert.rejects(readFile(uploads[index]!.file));
+		}
+		assert.equal(peakLocalCopies, 1);
+		assert.equal(uploader.stats().attempts, 6);
+		assert.equal(uploads.at(-1)!.text,
+			await readFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE), "utf8"));
+		uploader.stop();
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("low observer disk space cannot change the private child's exit", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-prefix-disk-exit-"));
+	const names: string[] = [];
+	try {
+		const f = await prefixFixture(directory);
+		const stored = await f.journal.record("initial", f.snapshot(0));
+		const line = await f.makeFrame(stored, "initial");
+		const synthetic = `const fs=require('node:fs');` +
+			`fs.writeSync(4,${JSON.stringify(`${line}\n`)});` +
+			`setTimeout(() => process.exit(23), 100);`;
+		const code = await launchPrivateCampaignObserver({ inputDir: directory,
+			outputDir: f.outputDir, stdoutFile: path.join(directory, "child-out"),
+			stderrFile: path.join(directory, "child-err"),
+			parentEnv: { ...sourceEnv, MULPIS_MISSION_LEDGER_B64: f.seedEnvelopeB64 },
+			publicKeyFile: f.publicKeyFile, expectedSpkiSha256: f.expectedSpkiSha256,
+			prefixAvailableBytes: async () => 0n,
+			spawnChild: (_command, _args, options) => spawn(process.execPath, ["-e", synthetic], options),
+			client: async () => ({ uploadArtifact: async name => { names.push(name); } }) });
+		assert.equal(code, 23);
+		assert.equal(names.filter(name => name.startsWith("confidential-mission-prefix-")).length, 0);
+		assert.ok((await readFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE))).length > 0);
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a completed immutable prefix remains after an abrupt child kill", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-prefix-kill-"));
+	let running: ReturnType<typeof spawn> | undefined;
+	const calls: Array<{ name: string; text: string }> = [];
+	try {
+		const f = await prefixFixture(directory);
+		const first = await f.journal.record("initial", f.snapshot(0));
+		const line = await f.makeFrame(first, "initial");
+		const synthetic = `const fs=require('node:fs');` +
+			`fs.writeSync(4,${JSON.stringify(`${line}\n`)});` +
+			`setInterval(() => {}, 1000);`;
+		const launched = launchPrivateCampaignObserver({ inputDir: directory,
+			outputDir: f.outputDir, stdoutFile: path.join(directory, "child-out"),
+			stderrFile: path.join(directory, "child-err"),
+			parentEnv: { ...sourceEnv, MULPIS_MISSION_LEDGER_B64: f.seedEnvelopeB64 },
+			publicKeyFile: f.publicKeyFile, expectedSpkiSha256: f.expectedSpkiSha256,
+			spawnChild: (_command, _args, options) => {
+				running = spawn(process.execPath, ["-e", synthetic], options);
+				return running;
+			},
+			client: async () => ({ uploadArtifact: async (name, files) => {
+				calls.push({ name, text: await readFile(files[0]!, "utf8") });
+			} }) });
+		await until(() => calls.some(call => call.name === "confidential-mission-prefix-12345-1-1"));
+		assert.ok(running?.pid);
+		process.kill(running.pid, "SIGKILL");
+		assert.equal(await launched, 137);
+		const prefixText = calls.find(call => call.name === "confidential-mission-prefix-12345-1-1")!.text;
+		assert.equal(prefixText,
+			await readFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE), "utf8"));
+	} finally {
+		if (running?.pid && running.exitCode === null) {
+			try { process.kill(running.pid, "SIGKILL"); } catch { /* Already exited. */ }
+		}
+		await rm(directory, { recursive: true, force: true });
+	}
 });
 
 test("child stdout, stderr and exit remain private; public relay emits only fixed heartbeat", async () => {

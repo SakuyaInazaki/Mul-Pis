@@ -59,6 +59,7 @@ import { CARRY_FILE_NAME, authenticatedCarryAncestry, authenticatedHistoricalCar
 import { reviewPrivateCampaignRestartEffects } from "../src/runner/private-campaign-restart-policy.ts";
 import { sealCampaignCarry, type CampaignCarrySeal } from "../src/runner/emergency-carry.ts";
 import { CARRY_LOGICAL_BYTES, CARRY_SEGMENT_FILE_BYTES, carrySidecarName } from "../src/runner/carry-sidecar-codec.ts";
+import { PREFIX_SIDECAR_FILE_BYTES, historicalPrefixSidecarName } from "../src/runner/incremental-prefix-sidecar-codec.ts";
 import { bindIndependentRestartGoal, canonicalRestartUnknowns, reserveIndependentRestart,
 	type AuthenticatedRestartCarryFacts, type IndependentRestartReservation,
 	type BoundIndependentRestartGoal } from "../src/m07/independent-restart.ts";
@@ -462,7 +463,7 @@ function authenticatedHistoricalCarryFacts(proof: unknown,
 		unknownHeldNano: carriedOrigin?.historicalUnknownHeldNano ?? Math.ceil(proof.priorUnknownHeldCny! * 1_000_000_000) };
 }
 function historicalGapEvidence(facts: AuthenticatedRestartCarryFacts,
-	opaqueGaps: readonly Pick<OpaqueExecutedRunGap, "source" | "resultArtifact">[],
+	opaqueGaps: readonly OpaqueExecutedRunGap[],
 	historyAvailable: boolean,
 	unobservedControls: readonly UnobservedControlDelivery[] = []): Record<string, unknown> {
 	return { version: 1, kind: "untrusted-private-history-gap",
@@ -472,9 +473,16 @@ function historicalGapEvidence(facts: AuthenticatedRestartCarryFacts,
 				digestScope: facts.resultArtifact.digestScope,
 				artifactSha256: facts.resultArtifact.sha256 } : { state: "expired-or-unavailable" } },
 		opaqueExecutedRuns: opaqueGaps.map(gap => ({ source: gap.source,
-			resultArtifact: { immutableArtifactRef: `github-actions://${gap.resultArtifact.repository}/runs/${gap.resultArtifact.runId}/artifacts/${gap.resultArtifact.artifactId}/${gap.resultArtifact.artifactName}`,
+			...(gap.version === 1 ? { resultArtifact: { immutableArtifactRef:
+				`github-actions://${gap.resultArtifact.repository}/runs/${gap.resultArtifact.runId}/artifacts/${gap.resultArtifact.artifactId}/${gap.resultArtifact.artifactName}`,
 				digestScope: gap.resultArtifact.digestScope,
-				artifactSha256: gap.resultArtifact.archiveSha256 },
+				artifactSha256: gap.resultArtifact.archiveSha256 } } : {
+				prefixArtifact: { immutableArtifactRef:
+					`github-actions://${gap.prefixArtifact.repository}/runs/${gap.prefixArtifact.runId}/artifacts/${gap.prefixArtifact.artifactId}/${gap.prefixArtifact.artifactName}`,
+					digestScope: gap.prefixArtifact.digestScope,
+					artifactSha256: gap.prefixArtifact.archiveSha256,
+					sequence: gap.prefixSequence, complete: false,
+					selectionAuthority: false } }),
 			accounting: "unquantified", effectState: "unknown-unreconciled" })),
 		unobservedControlDeliveries: unobservedControls.map(row => ({
 			controlCommit: row.controlCommit, testedSourceCommit: row.testedSourceCommit,
@@ -980,9 +988,9 @@ function recordFinalizationFailure(failures: FinalizationFailureCode[], code: Fi
 class CarrySidecarPersistenceError extends Error {
 	constructor() { super("carry sidecar could not be persisted safely"); }
 }
-function canonicalCarrySidecarBase64(text: unknown): text is string {
+function canonicalCarrySidecarBase64(text: unknown, maximumBytes: number): text is string {
 	if (typeof text !== "string" || text.length === 0 || text.length % 4 !== 0 ||
-		text.length > Math.ceil(CARRY_SEGMENT_FILE_BYTES / 3) * 4) return false;
+		text.length > Math.ceil(maximumBytes / 3) * 4) return false;
 	let padding = false;
 	for (let index = 0; index < text.length; index++) {
 		const char = text.charCodeAt(index);
@@ -993,7 +1001,7 @@ function canonicalCarrySidecarBase64(text: unknown): text is string {
 			char >= 48 && char <= 57 || char === 43 || char === 47)) return false;
 	}
 	const bytes = Buffer.from(text, "base64");
-	return bytes.length >= 28 && bytes.length <= CARRY_SEGMENT_FILE_BYTES &&
+	return bytes.length >= 28 && bytes.length <= maximumBytes &&
 		bytes.toString("base64") === text;
 }
 async function writeSealedCarryFiles(outputDir: string,
@@ -1003,10 +1011,29 @@ async function writeSealedCarryFiles(outputDir: string,
 		{ write: writeFile, rename }): Promise<void> {
 	const sidecars = Object.entries(carry.sidecars ?? {}).sort(([left], [right]) => left.localeCompare(right));
 	const files: Array<{ name: string; text: string }> = [];
-	for (const [index, [name, text]] of sidecars.entries()) {
-		if (path.basename(name) !== name || !/^ledger-continuation\.part-[0-9]{8}\.enc$/.test(name) ||
-			name !== carrySidecarName(index) || !canonicalCarrySidecarBase64(text))
-			throw new CarrySidecarPersistenceError();
+	let mainIndex = 0;
+	const historicalNextIndex = new Map<string, number>();
+	for (const [name, text] of sidecars) {
+		if (path.basename(name) !== name) throw new CarrySidecarPersistenceError();
+		if (/^ledger-continuation\.part-[0-9]{8}\.enc$/.test(name)) {
+			if (name !== carrySidecarName(mainIndex++) ||
+				!canonicalCarrySidecarBase64(text, CARRY_SEGMENT_FILE_BYTES))
+				throw new CarrySidecarPersistenceError();
+		} else {
+			const match = /^ledger-incremental-prefix-([1-9][0-9]{0,17})-([1-9][0-9]*)-([1-9][0-9]*)\.part-([0-9]{8})\.enc$/.exec(name);
+			if (!match) throw new CarrySidecarPersistenceError();
+			const [, runId, attemptText, sequenceText, indexText] = match;
+			const runAttempt = Number(attemptText);
+			const sequence = Number(sequenceText);
+			const index = Number(indexText);
+			const group = `${runId}:${runAttempt}:${sequence}`;
+			const nextIndex = historicalNextIndex.get(group) ?? 0;
+			if (!Number.isSafeInteger(runAttempt) || !Number.isSafeInteger(sequence) ||
+				name !== historicalPrefixSidecarName({ runId, runAttempt }, sequence, index) ||
+				index !== nextIndex || !canonicalCarrySidecarBase64(text, PREFIX_SIDECAR_FILE_BYTES))
+				throw new CarrySidecarPersistenceError();
+			historicalNextIndex.set(group, nextIndex + 1);
+		}
 		files.push({ name, text });
 	}
 	for (const file of files) {

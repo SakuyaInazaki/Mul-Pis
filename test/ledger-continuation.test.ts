@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { deflateRawSync } from "node:zlib";
 import test, { type TestContext } from "node:test";
-import { authenticateLatestTerminalCarry, authenticateLatestTerminalInterruption, authenticatedSupervisorProjection, authenticatedTerminalCarryBindsBundle, authenticatedTerminalInterruptionBindsPriorBundle, authenticatedTerminalInterruptionSupervisorProjection, isAuthenticatedTerminalCarryProof, isAuthenticatedTerminalInterruptionProof, isAuthenticatedIncrementalPrefixObservation, authenticatedIncrementalPrefixBindsPriorBundle, authenticatedAccountingObservation, authenticatedHistoricalOpaqueRunGaps, authenticatedHistoricalCarryOrigin, authenticatedPendingHistoricalEffectSources, authenticatedSelectedTransitions, authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, authenticatedUnknownControlDeliveries, authenticatedTerminalUnknownControlDeliveries, isAuthenticatedPriorCarryProof, isAuthenticatedPredecessorResearchHistory, PredecessorResearchHistoryAccessError, PredecessorResearchHistoryIntegrityError, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, originalObjectiveMatchesSignedBootstrap, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE, retainedTransportDiagnosticWithinBundle } from "../src/runner/ledger-continuation.ts";
+import { authenticateLatestTerminalCarry, authenticateLatestTerminalInterruption, authenticatedSupervisorProjection, authenticatedTerminalCarryBindsBundle, authenticatedTerminalInterruptionBindsPriorBundle, authenticatedTerminalInterruptionSupervisorProjection, isAuthenticatedTerminalCarryProof, isAuthenticatedTerminalInterruptionProof, isAuthenticatedIncrementalPrefixObservation, authenticatedIncrementalPrefixBindsPriorBundle, authenticatedAccountingObservation, authenticatedHistoricalOpaqueRunGaps, authenticatedHistoricalCarryOrigin, authenticatedPendingHistoricalEffectSources, authenticatedSelectedTransitions, authenticatedCarryForwardOrigin, authenticatedHostEffectEvidence, authenticatedPriorCarryBindsAncestor, authenticatedPriorCarryBindsBundle, authenticatedUnknownControlDeliveries, authenticatedTerminalUnknownControlDeliveries, isAuthenticatedPriorCarryProof, isAuthenticatedPredecessorResearchHistory, PredecessorResearchHistoryAccessError, PredecessorResearchHistoryIntegrityError, CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, downloadCarryArtifact, openLedgerContinuation, originalObjectiveMatchesSignedBootstrap, periodicPrefixArtifactName, PeriodicPrefixRecoveryError, sealHistoricalCarryForOfflineTests, REUSABLE_RUN_REQUEST_MESSAGE, retainedTransportDiagnosticWithinBundle } from "../src/runner/ledger-continuation.ts";
 import { INCREMENTAL_CHECKPOINT_FILE, IncrementalPrivateCheckpointJournal } from "../src/runner/incremental-private-checkpoint.ts";
 import type { CarryArtifactPayload, RequestAuditSnapshot } from "../src/runner/ledger-continuation.ts";
 import { DeepSeekCampaignBudget, campaignSessionEffectId, type CampaignAdmissionRejection } from "../src/runner/deepseek-campaign.ts";
@@ -21,6 +21,8 @@ import { sealCampaignCarry } from "../src/runner/emergency-carry.ts";
 import { decodeCarrySidecars, encodeCarrySidecars } from "../src/runner/carry-sidecar-codec.ts";
 import { CARRY_LOGICAL_BYTES } from "../src/runner/carry-sidecar-codec.ts";
 import { workflowRepairState } from "../src/runner/repair-liveness.ts";
+import { isOpenedPartitionManifest,
+	type ArtifactTransportSource } from "../src/runner/private-artifact-partition.ts";
 import { reconcileHistoricalResearchEntries } from "../src/runner/research-history-reconciliation.ts";
 
 const sha = (letter: string) => letter.repeat(40);
@@ -889,6 +891,16 @@ test("latest terminal carry is live-authenticated before supervisor projection",
 		loadCarryArtifact: async () => ({ ...carry, incrementalControlPrefix: "stale-untrusted-prefix" }) });
 	assert.equal(isAuthenticatedTerminalCarryProof(sealedWithStalePrefix.proof), true);
 	assert.equal(sealedWithStalePrefix.proof.envelopeSha256, terminal.proof.envelopeSha256);
+	const withBadOlderPeriodic: typeof fetch = async (url, init) =>
+		String(url).endsWith("/runs/7002/artifacts?per_page=100") ?
+			new Response(JSON.stringify({ total_count: 2, artifacts: [
+				{ id: 9002, name: CARRY_ARTIFACT_NAME, expired: false,
+					workflow_run: { id: 7002, head_sha: sha("b") } },
+				{ id: 9801, name: periodicPrefixArtifactName({ runId: "7002", runAttempt: 1 }, 1),
+					expired: true, digest: "bad", workflow_run: { id: 7002, head_sha: sha("9") } }]
+			})) : common.request(url, init);
+	assert.equal((await authenticateLatestTerminalCarry({ ...common,
+		request: withBadOlderPeriodic })).proof.envelopeSha256, terminal.proof.envelopeSha256);
 	assert.doesNotMatch(JSON.stringify(terminal.proof), /synthetic candidate|Synthetic task/);
 	assert.equal(isAuthenticatedTerminalCarryProof({ ...terminal.proof }), false);
 	assert.equal(authenticatedTerminalCarryBindsBundle(terminal.proof, terminal.privateBundle), true);
@@ -1634,6 +1646,59 @@ test("authenticated workflow history may extend beyond twenty GitHub pages", asy
 		loadCarryArtifact: async () => { throw Error("no executed carry in skipped history"); } });
 	assert.equal(pagesRead, 21);
 	assert.equal(opened.priorCommittedCny, f.payload.priorCommittedCny);
+});
+
+test("latest carry admission enumerates more than one page of observer artifacts exactly", async t => {
+	const f = await fixture(t);
+	const firstOpening = await openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7002, sha("b")), request: github([anchor, first]),
+		loadCarryArtifact: async () => "unused" });
+	const carry = sealHistoricalCarryForOfflineTests(firstOpening, { settledCny: 0,
+		unknownOrInFlightCny: 0, requestAudit: audit(0, 0) }).envelopeB64;
+	const firstDone = { ...first, status: "completed", conclusion: "failure" };
+	const base = github([anchor, firstDone, second]);
+	const artifacts = [
+		...Array.from({ length: 102 }, (_, index) => ({ id: 10_000 + index,
+			name: `confidential-campaign-progress-7002-1-${index + 1}`, expired: false,
+			workflow_run: { id: 7002, head_sha: sha("b") } })),
+		{ id: 9002, name: CARRY_ARTIFACT_NAME, expired: false,
+			workflow_run: { id: 7002, head_sha: sha("b") } },
+	];
+	type Variant = "stable" | "duplicate-id" | "changed-total" | "changed-order" |
+		"changed-initial-page" | "wrong-source";
+	const requestFor = (variant: Variant): typeof fetch => {
+		let pageOneReads = 0;
+		return async (url, init) => {
+			const address = String(url);
+			if (!address.includes("/runs/7002/artifacts?")) return base(url, init);
+			const page = new URL(address).searchParams.get("page");
+			const rows = artifacts.map(item => ({ ...item, workflow_run: { ...item.workflow_run } }));
+			if (variant === "wrong-source") rows.at(-1)!.workflow_run.id = 7003;
+			if (variant === "duplicate-id") rows.at(-1)!.id = rows[0].id;
+			if (variant === "changed-order" && page === "1" && ++pageOneReads === 2)
+				[rows[0], rows[1]] = [rows[1]!, rows[0]!];
+			if (variant === "changed-initial-page" && page === "1")
+				[rows[0], rows[1]] = [rows[1]!, rows[0]!];
+			return new Response(JSON.stringify({
+				total_count: variant === "changed-total" && page === "2" ? rows.length + 1 : rows.length,
+				artifacts: page === "2" ? rows.slice(100) : rows.slice(0, 100),
+			}));
+		};
+	};
+	const open = (variant: Variant) => openLedgerContinuation({ ...f, githubToken: "synthetic-token",
+		current: current(7003, sha("c")), request: requestFor(variant),
+		loadCarryArtifact: async ({ artifactId }) => {
+			assert.equal(artifactId, "9002"); return carry;
+		} });
+	const accepted = await open("stable");
+	assert.equal(accepted.priorCarryProof?.source.runId, "7002");
+	for (const [variant, pattern] of [
+		["duplicate-id", /repeats an artifact ID/],
+		["changed-total", /changed during pagination/],
+		["changed-order", /changed between pagination passes/],
+		["changed-initial-page", /changed during pagination/],
+		["wrong-source", /artifact is unavailable|without an earlier authenticated carry/],
+	] as const) await assert.rejects(open(variant), pattern);
 });
 
 test("encrypted carry retains reviewed native CNY price evidence without account balances", async t => {
@@ -3776,6 +3841,8 @@ test("cancelled executed missing-carry run has a separate terminal proof and kee
 	assert.equal(terminal.proof.gap.source.runId, "7003");
 	assert.equal(terminal.proof.gap.terminal.runConclusion, "cancelled");
 	assert.equal(terminal.proof.gap.terminal.jobConclusion, "cancelled");
+	assert.equal(terminal.proof.gap.kind, "opaque-executed-run-gap");
+	if (terminal.proof.gap.kind !== "opaque-executed-run-gap") throw Error("expected RSA-backed gap");
 	assert.equal(terminal.proof.gap.resultArtifact.artifactId, "9503");
 	assert.equal(terminal.proof.gap.resultArtifact.archiveSha256, "9".repeat(64));
 	assert.equal(terminal.proof.gap.priorCarryEnvelopeSha256, terminal.priorCarryProof.envelopeSha256);
@@ -3832,6 +3899,259 @@ test("cancelled executed missing-carry run has a separate terminal proof and kee
 	const reservedRaw = await readFile(path.join(incrementalDir, INCREMENTAL_CHECKPOINT_FILE), "utf8");
 	await journal.record("request-observed", prefixInput(true));
 	const observedRaw = await readFile(path.join(incrementalDir, INCREMENTAL_CHECKPOINT_FILE), "utf8");
+	await t.test("hard kill before poststeps leaves periodic-only UNKNOWN recovery and fresh admission", async () => {
+		const zip1 = carryZip([[INCREMENTAL_CHECKPOINT_FILE, Buffer.from(reservedRaw)]]);
+		const zip2 = carryZip([[INCREMENTAL_CHECKPOINT_FILE, Buffer.from(observedRaw)]]);
+		const hash = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+		const periodic = (id: number, sequence: number, zip: Buffer) => ({ id,
+			name: periodicPrefixArtifactName(prefixSource, sequence), expired: false,
+			digest: `sha256:${hash(zip)}`, workflow_run: { id: 7003, head_sha: sha("c") } });
+		const firstPeriodic = periodic(9701, 1, zip1), secondPeriodic = periodic(9702, 2, zip2);
+		const noisy = Array.from({ length: 101 }, (_, index) => ({ id: 10_100 + index,
+			name: `confidential-campaign-progress-7003-1-${index + 1}`, expired: false,
+			workflow_run: { id: 7003, head_sha: sha("c") } }));
+		const archives = new Map([[String(firstPeriodic.id), zip1], [String(secondPeriodic.id), zip2]]);
+		const use = (artifacts: object[], options: { rawById?: Map<string, Buffer>; job?: object;
+			ended?: object; includeNext?: boolean; fetched?: string[] } = {}) => {
+			const base = requestFor([anchor, carried, options.ended ?? cancelled,
+				...(options.includeNext ? [next] : [])],
+				{ job: options.job, observed: options.ended });
+			const request: typeof fetch = async (url, init) => {
+				const address = String(url);
+				if (address.includes("/runs/7003/artifacts?")) {
+					const page = new URL(address).searchParams.get("page");
+					const start = page === "2" ? 100 : 0;
+					return new Response(JSON.stringify({ total_count: artifacts.length,
+						artifacts: artifacts.slice(start, start + 100) }));
+				}
+				return base(url, init);
+			};
+			const loadCarryArtifact = async ({ runId, artifactId, expectedArchiveSha256,
+				missionKey, seedDigest, expectedSource, expectedArtifactName }:
+				{ runId: string; artifactId: string; expectedArchiveSha256?: string;
+					missionKey?: Buffer; seedDigest?: string;
+					expectedSource?: ArtifactTransportSource; expectedArtifactName?: string }) => {
+				if (runId !== "7003") return carry;
+				options.fetched?.push(artifactId);
+				const available = options.rawById ?? archives;
+				const bytes = available.get(artifactId);
+				if (!bytes) throw Error("unexpected synthetic artifact");
+				return downloadCarryArtifact({ githubToken: "synthetic-token", artifactId,
+					expectedArchiveSha256, missionKey, seedDigest,
+					expectedSource, expectedArtifactName,
+					request: async (url, init) => {
+						const match = /\/actions\/artifacts\/([1-9][0-9]*)\/zip$/.exec(String(url));
+						if (match) {
+							const archive = available.get(match[1]);
+							if (!archive) throw Error("unexpected synthetic artifact part");
+							return new Response(archive);
+						}
+						return request(url, init);
+					} });
+			};
+			return { ...f, seedEnvelopeB64, githubToken: "synthetic-token", request,
+				loadCarryArtifact };
+		};
+		const rows = [...noisy, firstPeriodic, secondPeriodic];
+		const fetched: string[] = [];
+		const olderExpired = { ...firstPeriodic, expired: true, digest: "bad-old-archive-digest" };
+		const resultless = await authenticateLatestTerminalInterruption({
+			...use([...noisy, olderExpired, secondPeriodic], { fetched }),
+			source: current(7003, sha("c")) });
+		assert.deepEqual(fetched, ["9702"], "only highest sequence archive is downloaded");
+		assert.equal(resultless.proof.gap.kind, "opaque-prefix-backed-executed-run-gap");
+		if (resultless.proof.gap.kind !== "opaque-prefix-backed-executed-run-gap")
+			throw Error("expected prefix-backed gap");
+		assert.equal(resultless.proof.gap.prefixSequence, 2);
+		assert.equal(resultless.proof.gap.prefixArtifact.artifactId, "9702");
+		assert.equal(resultless.proof.gap.accounting, "unquantified");
+		assert.equal(resultless.proof.gap.effects, "unreviewed");
+		assert.equal(resultless.incrementalPrefixObservation?.sequence, 2);
+		assert.equal(resultless.incrementalPrefixObservation?.complete, false);
+		assert.equal(resultless.incrementalPrefixObservation?.selectionAuthority, false);
+		assert.equal(resultless.incrementalPrefixObservation?.accounting, "unquantified");
+		assert.equal(authenticatedIncrementalPrefixBindsPriorBundle(resultless.incrementalPrefixObservation,
+			resultless.priorPrivateBundle), true);
+		assert.equal(resultless.priorPrivateBundle["candidate.cpp"], bundle["candidate.cpp"]);
+		assert.equal(resultless.priorPrivateBundle["objective-checkpoint.json"],
+			bundle["objective-checkpoint.json"]);
+		assert.deepEqual(resultless.priorPrivateBundle, ordinary.priorPrivateBundle);
+		assert.equal(resultless.priorCarryProof.envelopeSha256,
+			resultless.proof.gap.priorCarryEnvelopeSha256);
+		const timedOut = { ...cancelled, conclusion: "timed_out" };
+		const timedJob = { id: 6003, run_id: 7003, run_attempt: 1,
+			head_sha: sha("c"), name: "private-campaign", status: "completed",
+			conclusion: "timed_out", steps: [{ name: "Run private campaign",
+				status: "completed", conclusion: "timed_out" }] };
+		const timeoutRecovery = await authenticateLatestTerminalInterruption({
+			...use(rows, { ended: timedOut, job: timedJob }), source: current(7003, sha("c")) });
+		assert.equal(timeoutRecovery.proof.gap.terminal.runConclusion, "timed_out");
+		assert.equal(timeoutRecovery.proof.gap.kind, "opaque-prefix-backed-executed-run-gap");
+		const fresh = await openLedgerContinuation({ ...use(rows, { includeNext: true }),
+			current: current(7005, sha("e")) });
+		assert.equal(fresh.opaqueExecutedRuns[0]?.kind, "opaque-prefix-backed-executed-run-gap");
+		assert.equal(fresh.priorCarryProof?.source.runId, "7002");
+		assert.equal(fresh.priorPrivateBundle?.["candidate.cpp"], bundle["candidate.cpp"]);
+		assert.equal(fresh.incrementalPrefixObservation?.selectionAuthority, false);
+		assert.equal(fresh.priorSettledCny, ordinary.priorSettledCny);
+		const carriedAfterGap = fresh.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+			unpricedRequestCount: 0, requestAudit: { version: 3,
+				kind: "accounting-only-request-audit", requests: [], settledCny: 0,
+				unknownObservedCny: 0, unpricedRequestCount: 0 } });
+		const historicalParts = Object.keys(carriedAfterGap.sidecars).filter(name =>
+			name.startsWith("ledger-incremental-prefix-"));
+		assert.ok(historicalParts.length > 0);
+		const uploadTemp = await mkdtemp(path.join(os.tmpdir(), "ledger-v2-uploader-"));
+		t.after(async () => rm(uploadTemp, { recursive: true, force: true }));
+		const outputDir = path.join(uploadTemp, "private-campaign-output");
+		await mkdir(outputDir, { mode: 0o700 });
+		await writeFile(path.join(outputDir, CARRY_FILE_NAME),
+			`${JSON.stringify({ envelopeB64: carriedAfterGap.envelopeB64 })}\n`, { mode: 0o600 });
+		for (const [name, bytes] of Object.entries(carriedAfterGap.sidecars))
+			await writeFile(path.join(outputDir, name), bytes, { mode: 0o600 });
+		const uploaded = new Map<string, { name: string; zip: Buffer }>();
+		const fakeClient = { async uploadArtifact(name: string, files: string[]) {
+			const id = String(14_000 + uploaded.size);
+			const zip = carryZip(await Promise.all(files.map(async file =>
+				[path.basename(file), await readFile(file)] as [string, Buffer])));
+			uploaded.set(id, { name, zip });
+			return { id: Number(id), digest: hash(zip) };
+		} };
+		const { uploadFinalCarry } = await import(new URL(
+			"../.github/actions/final-carry-upload/main.mjs", import.meta.url).href);
+		const uploadResult = await uploadFinalCarry({
+			env: { RUNNER_TEMP: uploadTemp, MULPIS_MISSION_LEDGER_B64: seedEnvelopeB64,
+				GITHUB_REPOSITORY: MISSION_REPOSITORY, GITHUB_RUN_ID: "7005",
+				GITHUB_RUN_ATTEMPT: "1", GITHUB_RUN_NUMBER: "4", GITHUB_SHA: sha("e"),
+				GITHUB_EVENT_NAME: "workflow_dispatch" },
+			artifactClient: fakeClient, publicKeyFile: f.publicKeyFile,
+			expectedSpkiSha256: f.expectedSpkiSha256 });
+		assert.equal(uploadResult.multipart, true);
+		assert.equal(uploaded.get(String(uploadResult.rootArtifactId))?.name, CARRY_ARTIFACT_NAME);
+		const carrySource: ArtifactTransportSource = { repository: MISSION_REPOSITORY,
+			runId: "7005", runAttempt: 1, commit: sha("e"), event: "workflow_dispatch" };
+		const actionRows = [...uploaded].map(([id, artifact]) => ({ id: Number(id),
+			name: artifact.name, expired: false,
+			digest: `sha256:${hash(artifact.zip)}`,
+			workflow_run: { id: 7005, head_sha: sha("e") } }));
+		const actionRequest: typeof fetch = async url => {
+			const address = String(url);
+			if (address.includes("/runs/7005/artifacts?"))
+				return new Response(JSON.stringify({ total_count: actionRows.length,
+					artifacts: actionRows }));
+			const match = /\/actions\/artifacts\/([1-9][0-9]*)\/zip$/.exec(address);
+			if (!match) throw Error("unexpected synthetic action read");
+			const archive = uploaded.get(match[1])?.zip;
+			if (!archive) throw Error("missing synthetic action archive");
+			return new Response(archive);
+		};
+		const restoredAction = await downloadCarryArtifact({ githubToken: "synthetic-token",
+			artifactId: String(uploadResult.rootArtifactId),
+			expectedArchiveSha256: hash(uploaded.get(String(uploadResult.rootArtifactId))!.zip),
+			missionKey: authenticatedSeed.derivePrivateKey("mul-pis-ledger-continuation-v1"),
+			seedDigest: authenticatedSeed.seedDigest, expectedSource: carrySource,
+			expectedArtifactName: CARRY_ARTIFACT_NAME, request: actionRequest });
+		if (typeof restoredAction === "string" || !("sidecars" in restoredAction))
+			throw Error("expected multipart restored carry sidecars");
+		assert.equal(isOpenedPartitionManifest(restoredAction.transportIndex), true);
+		for (const name of historicalParts)
+			assert.equal(restoredAction.sidecars[name], carriedAfterGap.sidecars[name]);
+		const successorDone = { ...next, status: "completed", conclusion: "failure" };
+		const later = run(7006, 5, "in_progress", sha("f"));
+		const reopenRequest: typeof fetch = async (url, init) => {
+			const address = String(url);
+			if (address.includes("/runs/7003/artifacts?"))
+				throw Error("historical prefix archive must be carried, not fetched again");
+			if (address.endsWith("/runs/7005/jobs?per_page=100"))
+				return new Response(JSON.stringify({ total_count: 1, jobs: [{ id: 6005,
+					run_id: 7005, run_attempt: 1, head_sha: sha("e"), name: "private-campaign",
+					status: "completed", conclusion: "failure", steps: [{ name: "Run private campaign",
+						status: "completed", conclusion: "failure" }] }] }));
+			if (address.endsWith("/runs/7005/artifacts?per_page=100"))
+				return new Response(JSON.stringify({ total_count: 1, artifacts: [{ id: 9005,
+					name: CARRY_ARTIFACT_NAME, expired: false,
+					workflow_run: { id: 7005, head_sha: sha("e") } }] }));
+			return requestFor([anchor, carried, cancelled, successorDone, later])(url, init);
+		};
+		const reopened = await openLedgerContinuation({ ...f, seedEnvelopeB64,
+			githubToken: "synthetic-token", current: current(7006, sha("f")),
+			request: reopenRequest, loadCarryArtifact: async ({ artifactId }) => {
+				assert.equal(artifactId, "9005"); return carriedAfterGap;
+			} });
+		assert.equal(reopened.opaqueExecutedRuns[0]?.kind, "opaque-prefix-backed-executed-run-gap");
+		assert.equal(reopened.historicalIncrementalPrefixes[0]?.sequence, 2);
+		assert.equal(reopened.priorPrivateBundle?.["candidate.cpp"], bundle["candidate.cpp"]);
+		const shared = { id: 9703, name: CARRY_ARTIFACT_NAME, expired: false,
+			digest: `sha256:${hash(zip2)}`, workflow_run: { id: 7003, head_sha: sha("c") } };
+		const sameCopies = await authenticateLatestTerminalInterruption({
+			...use([...rows, shared], { rawById: new Map([...archives, ["9703", zip2]]) }),
+			source: current(7003, sha("c")) });
+		assert.equal(sameCopies.incrementalPrefixObservation?.artifact.artifactId, "9702");
+		const expiredShared = await authenticateLatestTerminalInterruption({
+			...use([...rows, { ...shared, expired: true }]),
+			source: current(7003, sha("c")) });
+		assert.equal(expiredShared.incrementalPrefixObservation?.artifact.artifactId, "9702");
+		const badSharedZip = carryZip([[INCREMENTAL_CHECKPOINT_FILE, Buffer.from("invalid-aead")]]);
+		const badShared = await authenticateLatestTerminalInterruption({
+			...use([...rows, { ...shared, digest: `sha256:${hash(badSharedZip)}` }],
+				{ rawById: new Map([...archives, ["9703", badSharedZip]]) }),
+			source: current(7003, sha("c")) });
+		assert.equal(badShared.incrementalPrefixObservation?.artifact.artifactId, "9702");
+		const alternateDir = await mkdtemp(path.join(os.tmpdir(), "ledger-prefix-conflict-"));
+		t.after(async () => rm(alternateDir, { recursive: true, force: true }));
+		const other = new IncrementalPrivateCheckpointJournal({ source: prefixSource,
+			outputDir: alternateDir,
+			authenticatedMissionKey: authenticatedSeed.derivePrivateKey("mul-pis-ledger-continuation-v1") });
+		await other.record("request-reserved", prefixInput(false));
+		await other.record("host-effect-observed", prefixInput(true));
+		const conflictRaw = await readFile(path.join(alternateDir, INCREMENTAL_CHECKPOINT_FILE), "utf8");
+		const conflictZip = carryZip([[INCREMENTAL_CHECKPOINT_FILE, Buffer.from(conflictRaw)]]);
+		await assert.rejects(authenticateLatestTerminalInterruption({
+			...use([...rows, { ...shared, digest: `sha256:${hash(conflictZip)}` }],
+				{ rawById: new Map([...archives, ["9703", conflictZip]]) }),
+			source: current(7003, sha("c")) }), (error: unknown) =>
+				error instanceof PeriodicPrefixRecoveryError &&
+				error.reason === "conflicting-highest-sequence");
+		for (const changed of [
+			{ ...secondPeriodic, expired: true },
+			{ ...secondPeriodic, workflow_run: { id: 7003, head_sha: sha("9") } },
+			{ ...secondPeriodic, digest: `sha256:${"0".repeat(64)}` },
+			{ ...secondPeriodic, name: periodicPrefixArtifactName(prefixSource, 3) },
+		]) await assert.rejects(authenticateLatestTerminalInterruption({
+			...use([...noisy, firstPeriodic, changed]), source: current(7003, sha("c")) }),
+			/metadata|archive|digest|sequence|source/);
+		await assert.rejects(authenticateLatestTerminalInterruption({
+			...use([...noisy, firstPeriodic,
+				{ ...secondPeriodic, digest: `sha256:${"0".repeat(64)}` }]),
+			source: current(7003, sha("c")) }), (error: unknown) =>
+				error instanceof PeriodicPrefixRecoveryError && error.stage === "archive" &&
+				error.reason === "unavailable-or-digest-mismatch");
+		const stale = JSON.parse(observedRaw);
+		stale.incrementalControlEnvelope.source.priorEnvelopeSha256 = "f".repeat(64);
+		const staleZip = carryZip([[INCREMENTAL_CHECKPOINT_FILE,
+			Buffer.from(JSON.stringify(stale))]]);
+		await assert.rejects(authenticateLatestTerminalInterruption({
+			...use([...noisy, firstPeriodic,
+				{ ...secondPeriodic, digest: `sha256:${hash(staleZip)}` }],
+				{ rawById: new Map([["9701", zip1], ["9702", staleZip]]) }),
+			source: current(7003, sha("c")) }), (error: unknown) =>
+				error instanceof PeriodicPrefixRecoveryError &&
+				error.stage === "authentication" && error.checkpointStage === "source" &&
+				error.checkpointReason === "binding-mismatch");
+		const extra = carryZip([[INCREMENTAL_CHECKPOINT_FILE, Buffer.from(observedRaw)],
+			["ledger-continuation.part-00000000.enc", Buffer.from("x")]]);
+		await assert.rejects(authenticateLatestTerminalInterruption({
+			...use([...noisy, firstPeriodic,
+				{ ...secondPeriodic, digest: `sha256:${hash(extra)}` }],
+				{ rawById: new Map([["9701", zip1], ["9702", extra]]) }),
+			source: current(7003, sha("c")) }), /archive|prefix/);
+
+	});
+	const resultWithUnusablePeriodic = await authenticateLatestTerminalInterruption({
+		...terminalInput, request: requestFor(runs, { artifacts: [rsa, {
+			id: 9803, name: periodicPrefixArtifactName(prefixSource, 1), expired: true,
+			digest: "bad", workflow_run: { id: 7003, head_sha: sha("9") } }] }) });
+	assert.equal(resultWithUnusablePeriodic.proof.gap.kind, "opaque-executed-run-gap");
 	const prefixArtifact = { id: 9603, name: CARRY_ARTIFACT_NAME, expired: false,
 		digest: `sha256:${"8".repeat(64)}`,
 		workflow_run: { id: 7003, head_sha: sha("c") } };

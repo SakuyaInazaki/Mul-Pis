@@ -11,6 +11,9 @@ import { fileURLToPath } from "node:url";
 import { classifyPendingAction, type PendingActionV1 } from "../m07/objective-progress.ts";
 import { authenticateLatestTerminalCarry, authenticateLatestTerminalInterruption,
 	authenticatedSupervisorProjection, authenticatedTerminalInterruptionSupervisorProjection,
+	authenticatedIncrementalPrefixBindsPriorBundle,
+	authenticatedTerminalInterruptionBindsPriorBundle,
+	isAuthenticatedIncrementalPrefixObservation, isAuthenticatedTerminalInterruptionProof,
 	REUSABLE_RUN_REQUEST_MESSAGE, type CarryArtifactPayload,
 	type AuthenticatedTerminalCarryProof, type CurrentMissionRun,
 	type IncrementalPrefixFailure } from "./ledger-continuation.ts";
@@ -19,11 +22,14 @@ import { MissionResumeJournal, type ResumeJournalRecord,
 import { pendingActionIdentity, planMissionContinuation, type CurrentDerivedActionV1,
 	type CurrentInterruptionActionV1, type TerminalInterruptionEvidenceV1,
 	type FreshIndependentLaunchContractV1, type ResumeDispatchRecord,
+	type TerminalPrefixInterruptionEvidenceV1,
 	type SupervisorDecision, type TerminalCarryEvidenceV1, type MissionStatusV1,
 	type LinkedUnknownDeliveryV1 } from "./mission-supervisor.ts";
 import { validWorkflowRepairState, type WorkflowRepairStateV1 } from "./repair-liveness.ts";
 import { readReviewedInterruptedSourceCapability,
 	type VerifiedInterruptedSourceCapabilityV1 } from "./interrupted-source-review.ts";
+import { readReviewedTerminalPrefixSourceCapability,
+	type VerifiedTerminalPrefixSourceCapabilityV1 } from "./terminal-prefix-source-review.ts";
 import { readReviewedResultOnlyRepairState, isVerifiedResultOnlyRepairState,
 	type VerifiedResultOnlyRepairStateV1 } from "./result-only-repair-review.ts";
 import { isVerifiedUnobservedControlSourceCapability,
@@ -48,6 +54,7 @@ export type HostPreparationRefusal = Readonly<{
 		"control-ref-unavailable" | "control-ref-uninitialized" |
 		"terminal-carry-projection-unavailable" |
 		"interruption-source-review-invalid" |
+		"terminal-prefix-source-review-invalid" |
 		"legacy-action-checkpoint-unavailable" | "control-request-delivery-uncertain" |
 		"workflow-repair-plan-invalid" | "workflow-repair-plan-unrelated" |
 		"workflow-repair-plan-stale" | "workflow-repair-source-unchanged" |
@@ -61,6 +68,7 @@ export type HostPreparationRefusal = Readonly<{
 	stage: "tested-source-ci" | "live-source-ref" | "live-source-commit" |
 		"live-control-ref" | "terminal-carry" | "legacy-action" | "dispatch-journal" |
 		"workflow-repair-plan" | "interruption-source-review" | "result-only-repair-review" |
+		"terminal-prefix-source-review" |
 		"linked-unknown-delivery" | "provider-availability-review";
 	ciRunId?: string;
 	ciStatus?: "requested" | "waiting" | "pending" | "queued" | "in_progress" |
@@ -244,6 +252,8 @@ export type PrepareAuthenticatedResumeInput = Readonly<{
 		expectedArchiveSha256: string }) => Promise<Uint8Array>;
 	/** Host review of the exact interrupted source capability, outside the checkout. */
 	interruptedSourceReviewPrivateFile?: string;
+	/** Private operator review of the exact resultless terminal source and prefix. */
+	terminalPrefixSourceReviewPrivateFile?: string;
 	/** Explicit exact commit of an accepted old ref update with no observed Actions run.
 	 * This requests a distinct, linked fresh intent after authenticated host review. */
 	linkedUnknownDeliveryOldControlCommit?: string;
@@ -559,7 +569,9 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 	let terminalCarry: TerminalCarryEvidenceV1;
 	let pendingAction: PendingActionV1 | undefined;
 	let terminalInterruption: TerminalInterruptionEvidenceV1 | undefined;
+	let terminalPrefixInterruption: TerminalPrefixInterruptionEvidenceV1 | undefined;
 	let currentInterruptionAction: CurrentInterruptionActionV1 | undefined;
+	let currentPrefixInterruptionAction: import("./mission-supervisor.ts").CurrentPrefixInterruptionActionV1 | undefined;
 	let incrementalPrefixFailure: IncrementalPrefixFailure | undefined;
 	let priorPrivateBundle: Readonly<Record<string, string>>;
 	let terminalProof: AuthenticatedTerminalCarryProof | undefined;
@@ -598,22 +610,59 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 			terminal: { runStatus: "completed", jobStatus: "completed",
 				providerStepStatus: "completed" } };
 		const gap = interrupted.proof.gap;
-		terminalInterruption = { version: 1, kind: "host-verified-terminal-interruption",
-			source: { runId: gap.source.runId, runAttempt: gap.source.runAttempt,
-				commit: gap.source.commit },
-			priorCarrySource: terminalCarry.source,
-			priorCarryEnvelopeSha256: gap.priorCarryEnvelopeSha256,
-			resultArtifactId: gap.resultArtifact.artifactId,
-			resultArchiveSha256: gap.resultArtifact.archiveSha256,
-			accounting: "unquantified", effects: "unknown-unreconciled",
-			terminationOrigin: "unknown" };
-		currentInterruptionAction = { version: 1, kind: "current-host-interruption-action",
-			source: terminalInterruption.source,
-			priorCarryEnvelopeSha256: terminalCarry.envelopeSha256,
-			priorCheckpointSha256: projected.checkpointSha256,
-			resultArchiveSha256: terminalInterruption.resultArchiveSha256,
-			action: classifyPendingAction("execution-interrupted",
-				{ unresolvedOperationRefs: [...status.unresolvedOperationRefs] }) };
+		if (gap.kind === "opaque-prefix-backed-executed-run-gap") {
+			const observation = interrupted.incrementalPrefixObservation;
+			if (!isAuthenticatedTerminalInterruptionProof(interrupted.proof) ||
+				!authenticatedTerminalInterruptionBindsPriorBundle(interrupted.proof,
+					interrupted.priorPrivateBundle) ||
+				!observation || !isAuthenticatedIncrementalPrefixObservation(observation) ||
+				!authenticatedIncrementalPrefixBindsPriorBundle(observation,
+					interrupted.priorPrivateBundle) ||
+				observation.source.runId !== gap.source.runId ||
+				observation.source.runAttempt !== gap.source.runAttempt ||
+				observation.source.commit !== gap.source.commit ||
+				observation.artifact.artifactId !== gap.prefixArtifact.artifactId ||
+				observation.artifact.archiveSha256 !== gap.prefixArtifact.archiveSha256 ||
+				observation.sequence !== gap.prefixSequence ||
+				observation.priorCarryEnvelopeSha256 !== terminalCarry.envelopeSha256)
+				refuse("terminal-carry-projection-unavailable", "terminal-carry");
+			terminalPrefixInterruption = { version: 1,
+				kind: "host-verified-terminal-prefix-interruption",
+				source: { runId: gap.source.runId, runAttempt: gap.source.runAttempt,
+					commit: gap.source.commit }, priorCarrySource: terminalCarry.source,
+				priorCarryEnvelopeSha256: gap.priorCarryEnvelopeSha256,
+				prefixArtifactId: gap.prefixArtifact.artifactId,
+				prefixArchiveSha256: gap.prefixArtifact.archiveSha256,
+				prefixSha256: observation.prefixSha256, prefixSequence: observation.sequence,
+				terminal: structuredClone(gap.terminal), accounting: "unquantified",
+				effects: "unknown-unreconciled", terminationOrigin: "unknown" };
+			currentPrefixInterruptionAction = { version: 1,
+				kind: "current-host-prefix-interruption-action",
+				source: terminalPrefixInterruption.source,
+				priorCarryEnvelopeSha256: terminalCarry.envelopeSha256,
+				priorCheckpointSha256: projected.checkpointSha256,
+				prefixArchiveSha256: terminalPrefixInterruption.prefixArchiveSha256,
+				prefixSha256: terminalPrefixInterruption.prefixSha256,
+				prefixSequence: terminalPrefixInterruption.prefixSequence,
+				action: classifyPendingAction("execution-interrupted",
+					{ unresolvedOperationRefs: [...status.unresolvedOperationRefs] }) };
+		} else {
+			terminalInterruption = { version: 1, kind: "host-verified-terminal-interruption",
+				source: { runId: gap.source.runId, runAttempt: gap.source.runAttempt,
+					commit: gap.source.commit }, priorCarrySource: terminalCarry.source,
+				priorCarryEnvelopeSha256: gap.priorCarryEnvelopeSha256,
+				resultArtifactId: gap.resultArtifact.artifactId,
+				resultArchiveSha256: gap.resultArtifact.archiveSha256,
+				accounting: "unquantified", effects: "unknown-unreconciled",
+				terminationOrigin: "unknown" };
+			currentInterruptionAction = { version: 1, kind: "current-host-interruption-action",
+				source: terminalInterruption.source,
+				priorCarryEnvelopeSha256: terminalCarry.envelopeSha256,
+				priorCheckpointSha256: projected.checkpointSha256,
+				resultArchiveSha256: terminalInterruption.resultArchiveSha256,
+				action: classifyPendingAction("execution-interrupted",
+					{ unresolvedOperationRefs: [...status.unresolvedOperationRefs] }) };
+		}
 	}
 	if (authenticatedTerminalCarry && !input.readOnly) {
 		let journalExists = false;
@@ -631,8 +680,9 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 		}
 	}
 	const privateObservation = incrementalPrefixFailure ? { incrementalPrefixFailure } : {};
+	const anyInterruption = Boolean(terminalInterruption || terminalPrefixInterruption);
 	let currentDerivedAction: CurrentDerivedActionV1 | undefined;
-	if (!terminalInterruption && !pendingAction && status.objectiveOutcome === "incomplete" &&
+	if (!anyInterruption && !pendingAction && status.objectiveOutcome === "incomplete" &&
 		status.stopReason === "bounded-run-incomplete" && status.unresolvedOperationRefs.length &&
 		terminalCarry.pendingActionSha256 === null) {
 		const checkpoint = priorPrivateBundle["objective-checkpoint.json"];
@@ -646,8 +696,9 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 			action: classifyPendingAction("bounded-run-incomplete",
 				{ unresolvedOperationRefs: [...status.unresolvedOperationRefs] }) };
 	}
-	const action = currentInterruptionAction?.action ?? pendingAction ?? currentDerivedAction?.action;
-	const workflowRepair = !terminalInterruption && status.stopReason === "workflow-repair-needed" &&
+	const action = currentInterruptionAction?.action ??
+		currentPrefixInterruptionAction?.action ?? pendingAction ?? currentDerivedAction?.action;
+	const workflowRepair = !anyInterruption && status.stopReason === "workflow-repair-needed" &&
 		action?.reasonCode === "workflow-repair-needed";
 	if (input.repairPlanPrivateFile !== undefined && !workflowRepair)
 		refuse("workflow-repair-plan-unrelated", "workflow-repair-plan");
@@ -656,31 +707,41 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 		refuse("result-only-repair-review-invalid", "result-only-repair-review");
 	if (input.interruptedSourceReviewPrivateFile !== undefined && !terminalInterruption)
 		refuse("interruption-source-review-invalid", "interruption-source-review");
+	if (input.terminalPrefixSourceReviewPrivateFile !== undefined && !terminalPrefixInterruption)
+		refuse("terminal-prefix-source-review-invalid", "terminal-prefix-source-review");
 	if (input.providerAvailabilityReceiptPrivateFile !== undefined &&
-		(!status.providerPaymentHold || terminalInterruption || !terminalProof ||
+		(!status.providerPaymentHold || anyInterruption || !terminalProof ||
 			!input.loadProviderAvailabilityEnvelope))
 		refuse("provider-availability-review-unrelated", "provider-availability-review");
 	if (status.providerPaymentHold && !input.providerAvailabilityReceiptPrivateFile)
 		return { decision: planMissionContinuation({ status, terminalCarry, pendingAction,
 			terminalInterruption, currentInterruptionAction,
+			terminalPrefixInterruption, currentPrefixInterruptionAction,
 			dispatchRecord: { state: "not-requested" } }), ...privateObservation };
 	if (!action) return { decision: planMissionContinuation({ status, terminalCarry,
 		pendingAction, terminalInterruption, currentInterruptionAction,
+		terminalPrefixInterruption, currentPrefixInterruptionAction,
 		dispatchRecord: { state: "not-requested" } }), ...privateObservation };
 	if (terminalInterruption && input.interruptedSourceReviewPrivateFile === undefined)
 		return { decision: planMissionContinuation({ status, terminalCarry,
 			pendingAction, terminalInterruption, currentInterruptionAction,
+			dispatchRecord: { state: "not-requested" } }), ...privateObservation };
+	if (terminalPrefixInterruption && input.terminalPrefixSourceReviewPrivateFile === undefined)
+		return { decision: planMissionContinuation({ status, terminalCarry,
+			pendingAction, terminalPrefixInterruption, currentPrefixInterruptionAction,
 			dispatchRecord: { state: "not-requested" } }), ...privateObservation };
 	if (workflowRepair && (input.repairPlanPrivateFile === undefined ||
 		(priorPrivateBundle["repair-state.json"] === undefined &&
 			input.resultOnlyRepairReviewPrivateFile === undefined)))
 		return { decision: planMissionContinuation({ status, terminalCarry,
 			pendingAction, terminalInterruption, currentInterruptionAction,
+			terminalPrefixInterruption, currentPrefixInterruptionAction,
 			dispatchRecord: { state: "not-requested" } }), ...privateObservation };
 	const binding = await readLiveTestedControlBinding(input.githubToken,
 		input.authenticatedHostRead?.request ?? input.request,
 		input.authenticatedHostRead?.kind === "authenticated-host-github-read");
 	let interruptedSourceReview: VerifiedInterruptedSourceCapabilityV1 | undefined;
+	let terminalPrefixSourceReview: VerifiedTerminalPrefixSourceCapabilityV1 | undefined;
 	if (terminalInterruption) {
 		const oldCommit = await githubJson(`https://api.github.com/repos/${REPOSITORY}/git/commits/${terminalInterruption.source.commit}`,
 			input.githubToken, input.authenticatedHostRead?.request ?? input.request ?? fetch,
@@ -699,6 +760,26 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 						"interruption-source-review"), "utf8") });
 		} catch {
 			refuse("interruption-source-review-invalid", "interruption-source-review");
+		}
+	}
+	if (terminalPrefixInterruption) {
+		const oldCommit = await githubJson(`https://api.github.com/repos/${REPOSITORY}/git/commits/${terminalPrefixInterruption.source.commit}`,
+			input.githubToken, input.authenticatedHostRead?.request ?? input.request ?? fetch,
+			"terminal-prefix-source-review");
+		if (!isObject(oldCommit) || oldCommit.sha !== terminalPrefixInterruption.source.commit ||
+			!isObject(oldCommit.tree) || !hex40(oldCommit.tree.sha))
+			refuse("terminal-prefix-source-review-invalid", "terminal-prefix-source-review");
+		try {
+			terminalPrefixSourceReview = await readReviewedTerminalPrefixSourceCapability({
+				privateReceiptFile: input.terminalPrefixSourceReviewPrivateFile!,
+				interruption: terminalPrefixInterruption,
+				interruptedSourceTree: oldCommit.tree.sha,
+				priorCheckpointSha256: terminalCarry.checkpointSha256!,
+				readImmutableSourceFile: async (commit, file) => Buffer.from(
+					await reviewedSourceText(file, commit, input, false,
+						"terminal-prefix-source-review"), "utf8") });
+		} catch {
+			refuse("terminal-prefix-source-review-invalid", "terminal-prefix-source-review");
 		}
 	}
 	let resultOnlyRepair: VerifiedResultOnlyRepairStateV1 | undefined;
@@ -729,7 +810,8 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 	}
 	const launch: FreshIndependentLaunchContractV1 = {
 		version: 1, kind: "verified-fresh-launch-contract",
-		source: terminalInterruption?.source ?? terminalCarry.source,
+		source: terminalInterruption?.source ?? terminalPrefixInterruption?.source ??
+			terminalCarry.source,
 		envelopeSha256: terminalCarry.envelopeSha256,
 		selectedTupleSha256: status.selectedTupleSha256,
 		pendingActionSha256: pendingActionIdentity(action),
@@ -765,6 +847,7 @@ export async function prepareAuthenticatedResumeRequest(input: PrepareAuthentica
 			action, resultOnlyRepair) : undefined;
 	let snapshot = { status, terminalCarry, pendingAction, currentDerivedAction,
 		terminalInterruption, currentInterruptionAction, interruptedSourceReview,
+		terminalPrefixInterruption, currentPrefixInterruptionAction, terminalPrefixSourceReview,
 		freshLaunchContract: launch, workflowRepairPlan, providerAvailabilityProof,
 		dispatchRecord: { state: "not-requested" } as const,
 		linkedUnknownDelivery: undefined as LinkedUnknownDeliveryV1 | undefined };
