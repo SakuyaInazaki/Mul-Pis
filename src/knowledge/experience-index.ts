@@ -3,8 +3,10 @@ import type { KnowledgeRecord, KnowledgeRef, KnowledgeStore } from "./types.ts";
 import { createFileKnowledgeStore } from "./store.ts";
 import { HarnessError } from "../types.ts";
 import path from "node:path";
+import { isKnowledgeRef, validateExperienceDefinition, type ExperienceDefinition, type ExperienceTargetKind } from "./experience-schema.ts";
 
-export type ExperienceTargetKind = "executor" | "improver";
+export { isKnowledgeRef } from "./experience-schema.ts";
+export type { ExperienceTargetKind } from "./experience-schema.ts";
 
 export interface ExperienceApplicability {
 	stage: string;
@@ -38,33 +40,11 @@ export interface ExperienceProvider {
 	select(query: ExperienceQuery): Promise<ExperienceSelection>;
 }
 
-interface ExperienceDefinition {
-	version: 1;
-	targetKind: ExperienceTargetKind;
-	applicableStages: string[];
-	requiredTags: string[];
-	excludedTags: string[];
-	requiredRefs: KnowledgeRef[];
-}
-
-const recordIdPattern = /^[CKEJQDX]\d{3,}$/;
-const storeIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const key = (ref: KnowledgeRef) => `${ref.storeId}/${ref.recordId}@${ref.version}`;
-const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
-const isStrings = (value: unknown): value is string[] => Array.isArray(value) && value.length <= 64 && value.every((item) => typeof item === "string" && !!item.trim() && item.length <= 240);
-
-export function isKnowledgeRef(value: unknown): value is KnowledgeRef {
-	return isObject(value) && typeof value.storeId === "string" && storeIdPattern.test(value.storeId) &&
-		typeof value.recordId === "string" && recordIdPattern.test(value.recordId) &&
-		Number.isSafeInteger(value.version) && (value.version as number) > 0;
-}
+const isStrings = (value: unknown): value is string[] => Array.isArray(value) && value.every((item) => typeof item === "string" && !!item.trim() && item.length <= 240);
 
 function definition(record: KnowledgeRecord): ExperienceDefinition | undefined {
-	const value = record.fields.experience;
-	if (!isObject(value) || value.version !== 1 || (value.targetKind !== "executor" && value.targetKind !== "improver") ||
-		!isStrings(value.applicableStages) || !isStrings(value.requiredTags) || !isStrings(value.excludedTags) ||
-			!Array.isArray(value.requiredRefs) || !value.requiredRefs.every(isKnowledgeRef)) return undefined;
-	return value as unknown as ExperienceDefinition;
+	return validateExperienceDefinition(record.fields.experience).definition;
 }
 
 function contextMatches(record: KnowledgeRecord, ref: KnowledgeRef, query: ExperienceQuery, model: ExperienceDefinition): boolean {

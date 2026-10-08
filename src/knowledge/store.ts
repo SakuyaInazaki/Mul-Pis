@@ -5,6 +5,7 @@ import { HarnessError } from "../types.ts";
 import { nowIso, readTextIfExists, writeFileAtomic } from "../workspace.ts";
 import { buildKnowledgePack } from "./pack.ts";
 import { regenerateKnowledgeViews } from "./views.ts";
+import { validateExperienceDefinition } from "./experience-schema.ts";
 import type {
 	AvailabilityReport,
 	ImpactItem,
@@ -338,6 +339,11 @@ function validateScope(value: unknown, state: ValidationState, issues: Validatio
 	}
 }
 
+function validateExperienceFields(value: Record<string, unknown>, issues: ValidationIssue[], opIndex: number): void {
+	if (!Object.hasOwn(value, "experience")) return;
+	for (const message of validateExperienceDefinition(value.experience).issues) issue(issues, message, opIndex);
+}
+
 function bumpVirtual(entry: VirtualEntry): void {
 	entry.latestVersion += 1;
 	entry.versions.add(entry.latestVersion);
@@ -373,6 +379,7 @@ function validateBatchStructure(batch: ProposalBatch, initial: ValidationState):
 			if (!isNonEmptyString(rawOp.title)) issue(issues, "create.title 必须是非空字符串", opIndex);
 			if (typeof rawOp.body !== "string") issue(issues, "create.body 必须是字符串", opIndex);
 			if (rawOp.fields !== undefined && !isObject(rawOp.fields)) issue(issues, "create.fields 必须是对象", opIndex);
+			else if (isObject(rawOp.fields)) validateExperienceFields(rawOp.fields, issues, opIndex);
 			if (rawOp.evidenceStatus !== undefined && typeof rawOp.evidenceStatus !== "string") issue(issues, "create.evidenceStatus 必须是字符串", opIndex);
 			if (rawOp.usageDecision !== undefined && !USAGE_DECISIONS.includes(rawOp.usageDecision as UsageDecision)) issue(issues, "create.usageDecision 无效", opIndex);
 			if (rawOp.reason !== undefined && typeof rawOp.reason !== "string") issue(issues, "create.reason 必须是字符串", opIndex);
@@ -395,6 +402,7 @@ function validateBatchStructure(batch: ProposalBatch, initial: ValidationState):
 			if (rawOp.title !== undefined && !isNonEmptyString(rawOp.title)) issue(issues, "revise.title 必须是非空字符串", opIndex);
 			if (rawOp.body !== undefined && typeof rawOp.body !== "string") issue(issues, "revise.body 必须是字符串", opIndex);
 			if (rawOp.fields !== undefined && !isObject(rawOp.fields)) issue(issues, "revise.fields 必须是对象", opIndex);
+			else if (isObject(rawOp.fields)) validateExperienceFields(rawOp.fields, issues, opIndex);
 			if (rawOp.evidenceStatus !== undefined && typeof rawOp.evidenceStatus !== "string") issue(issues, "revise.evidenceStatus 必须是字符串", opIndex);
 			validateRefs(rawOp.refs, state, issues, opIndex);
 			validateScope(rawOp.scope, state, issues, opIndex);

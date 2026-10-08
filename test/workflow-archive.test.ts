@@ -7,7 +7,29 @@ import test from "node:test";
 import { archivePrivateM07Task, loadPrivateM07Archive, recordPrivateM04Outcome, M04_KNOWLEDGE_EXPORT_NAME } from "../src/workflow-archive/m07-private.ts";
 import type { CurrentGoal, M07TaskRecord } from "../src/m07/types.ts";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
-import type { KnowledgeRecord } from "../src/knowledge/types.ts";
+import type { KnowledgeRecord, KnowledgeStore } from "../src/knowledge/types.ts";
+
+async function syntheticM04Export(records: KnowledgeRecord[]) {
+	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-diagnostic-"));
+	const workDir = path.join(root, "work"), destination = path.join(root, "returned");
+	await mkdir(workDir);
+	const task = { taskId: "T001", workDir, status: "returned" } as M07TaskRecord;
+	await archivePrivateM07Task({ goal: { runId: "run-example", lifecycle: "active", tasks: [task] } as CurrentGoal,
+		task, destination });
+	const store: KnowledgeStore = createFileKnowledgeStore(path.join(root, "knowledge"));
+	await store.init();
+	const storeId = await store.storeId();
+	store.current = async () => ({ id: "G001", createdAt: "2026-10-06T00:00:00Z",
+		records: records.map(record => ({ id: record.id, version: record.version })), activeLimits: [], proposals: [] });
+	store.get = async (id, version) => records.find(record => record.id === id && record.version === version);
+	store.availability = async (id, version) => ({ id, version: version ?? 1, availability: "usable_conditionally", reasons: [] });
+	return { root, destination, store, storeId };
+}
+
+function syntheticRecord(id: string, runId = "m04-diagnostic"): KnowledgeRecord {
+	return { id, type: id[0] as KnowledgeRecord["type"], version: 1, title: "Synthetic evidence", body: "Synthetic body",
+		fields: {}, refs: [], scope: [], createdAt: "2026-10-06T00:00:00Z", source: { stage: "M04", runId } };
+}
 
 test("private archive retains ten actual reviewed rounds without a count ceiling", async () => {
 	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-many-rounds-"));
@@ -293,8 +315,14 @@ test("M04 export marks missing store or unsafe knowledge incomplete instead of i
 		await archivePrivateM07Task({ goal, task, destination });
 		const missing = await recordPrivateM04Outcome(destination, { state: "completed", runId: "m04-run" });
 		assert.equal(missing.m04?.knowledgeExport?.state, "incomplete");
+		assert.equal(missing.m04?.knowledgeExport?.failureKind, "store-unavailable");
 		assert.equal(missing.knowledgeReuse.trustedAdoption, false);
 		assert.equal(existsSync(path.join(destination, M04_KNOWLEDGE_EXPORT_NAME)), false);
+		const legacy = JSON.parse(await readFile(path.join(destination, "workflow-archive.json"), "utf8"));
+		delete legacy.m04.knowledgeExport.failureKind;
+		await writeFile(path.join(destination, "workflow-archive.json"), JSON.stringify(legacy));
+		assert.equal((await loadPrivateM07Archive(destination)).archive.m04?.knowledgeExport?.state, "incomplete",
+			"older private archives with a reason but no failureKind remain readable");
 		const store = createFileKnowledgeStore(path.join(root, "knowledge"));
 		await store.init();
 		const proposal = await store.submitProposal({ stage: "M04", runId: "m04-run", ops: [
@@ -422,6 +450,144 @@ test("private M04 export retains more than 48 dependencies and all adopted exper
 		assert.equal(exported.adoptedExperienceRefs.length, 49);
 		assert.equal((await loadPrivateM07Archive(destination)).m04Knowledge, path.join(destination, M04_KNOWLEDGE_EXPORT_NAME));
 	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("private M04 export diagnoses a missing dependency with only pinned edge metadata", async t => {
+	const method = syntheticRecord("K001");
+	const harness = await syntheticM04Export([method]);
+	t.after(() => rm(harness.root, { recursive: true, force: true }));
+	const missing = { storeId: harness.storeId, recordId: "E999", version: 1 };
+	method.fields.experience = { version: 1, targetKind: "executor", applicableStages: ["M07"], requiredTags: [],
+		excludedTags: [], requiredRefs: [missing] };
+	const archived = await recordPrivateM04Outcome(harness.destination,
+		{ state: "completed", runId: "m04-diagnostic", snapshotCreated: true }, harness.store);
+	assert.equal(archived.m04?.knowledgeExport?.state, "incomplete");
+	assert.equal(archived.m04?.knowledgeExport?.failureKind, "missing-ref");
+	assert.deepEqual(archived.m04?.knowledgeExport?.edge, {
+		from: { storeId: harness.storeId, recordId: "K001", version: 1 }, to: missing, kind: "required" });
+	assert.deepEqual(archived.m04?.adoptedExperienceRefs, []);
+	assert.equal((await loadPrivateM07Archive(harness.destination)).archive.m04?.knowledgeExport?.failureKind, "missing-ref");
+	assert.equal(existsSync(path.join(harness.destination, M04_KNOWLEDGE_EXPORT_NAME)), false);
+});
+
+test("private M04 export keeps ref and edge when a dependency read throws", async t => {
+	const method = syntheticRecord("K001");
+	const harness = await syntheticM04Export([method]);
+	t.after(() => rm(harness.root, { recursive: true, force: true }));
+	const unreadable = { storeId: harness.storeId, recordId: "E999", version: 1 };
+	method.fields.experience = { version: 1, targetKind: "executor", applicableStages: ["M07"], requiredTags: [],
+		excludedTags: [], requiredRefs: [unreadable] };
+	const priorGet = harness.store.get;
+	harness.store.get = async (id, version) => {
+		if (id === "E999") throw new Error("synthetic private body should never enter the archive");
+		return priorGet(id, version);
+	};
+	const archived = await recordPrivateM04Outcome(harness.destination,
+		{ state: "completed", runId: "m04-diagnostic", snapshotCreated: true }, harness.store);
+	assert.equal(archived.m04?.knowledgeExport?.failureKind, "export-error");
+	assert.deepEqual(archived.m04?.knowledgeExport?.ref, unreadable);
+	assert.deepEqual(archived.m04?.knowledgeExport?.edge, {
+		from: { storeId: harness.storeId, recordId: "K001", version: 1 }, to: unreadable, kind: "required" });
+	assert.doesNotMatch(JSON.stringify(archived.m04?.knowledgeExport), /private body/);
+});
+
+test("private M04 export never echoes hostile extra ref fields and its repaired payload reads", async t => {
+	const method = syntheticRecord("K001"), evidence = syntheticRecord("E001", "prior");
+	const harness = await syntheticM04Export([method, evidence]);
+	t.after(() => rm(harness.root, { recursive: true, force: true }));
+	const exact = { storeId: harness.storeId, recordId: "E001", version: 1 };
+	method.fields.experience = { version: 1, targetKind: "executor", applicableStages: ["M07"], requiredTags: [],
+		excludedTags: [], requiredRefs: [{ ...exact, hiddenNote: "HOSTILE-EXTRA-FIELD" }] };
+	const record = () => recordPrivateM04Outcome(harness.destination,
+		{ state: "completed", runId: "m04-diagnostic", snapshotCreated: true }, harness.store);
+	const rejected = await record();
+	assert.equal(rejected.m04?.knowledgeExport?.failureKind, "malformed-experience");
+	assert.deepEqual(rejected.m04?.knowledgeExport?.ref, { storeId: harness.storeId, recordId: "K001", version: 1 });
+	assert.doesNotMatch(JSON.stringify(rejected.m04?.knowledgeExport), /HOSTILE-EXTRA-FIELD/);
+	assert.equal((await loadPrivateM07Archive(harness.destination)).archive.m04?.knowledgeExport?.failureKind, "malformed-experience");
+	method.fields.experience = { version: 1, targetKind: "executor", applicableStages: ["M07"], requiredTags: [],
+		excludedTags: [], requiredRefs: [exact] };
+	const repaired = await record();
+	assert.equal(repaired.m04?.knowledgeExport?.state, "complete");
+	const loaded = await loadPrivateM07Archive(harness.destination);
+	assert.ok(loaded.m04Knowledge);
+	const document = JSON.parse(await readFile(loaded.m04Knowledge, "utf8"));
+	assert.deepEqual(document.dependencies, [{ from: { storeId: harness.storeId, recordId: "K001", version: 1 },
+		to: exact, kind: "required" }]);
+	for (const ref of [document.dependencies[0].from, document.dependencies[0].to, ...document.records.map((item: { ref: unknown }) => item.ref)])
+		assert.deepEqual(Object.keys(ref).sort(), ["recordId", "storeId", "version"]);
+});
+
+test("private M04 export distinguishes dependency cycle from missing and unsafe records", async t => {
+	const first = syntheticRecord("K001"), second = syntheticRecord("K002");
+	const harness = await syntheticM04Export([first, second]);
+	t.after(() => rm(harness.root, { recursive: true, force: true }));
+	const one = { storeId: harness.storeId, recordId: "K001", version: 1 };
+	const two = { storeId: harness.storeId, recordId: "K002", version: 1 };
+	first.fields.experience = { version: 1, targetKind: "executor", applicableStages: ["M07"], requiredTags: [], excludedTags: [], requiredRefs: [two] };
+	second.fields.experience = { version: 1, targetKind: "executor", applicableStages: ["M07"], requiredTags: [], excludedTags: [], requiredRefs: [one] };
+	const archived = await recordPrivateM04Outcome(harness.destination,
+		{ state: "completed", runId: "m04-diagnostic", snapshotCreated: true }, harness.store);
+	assert.equal(archived.m04?.knowledgeExport?.failureKind, "cycle");
+	assert.deepEqual(archived.m04?.knowledgeExport?.edge, { from: two, to: one, kind: "required" });
+	assert.deepEqual(archived.m04?.adoptedExperienceRefs, []);
+});
+
+test("private M04 export distinguishes malformed experience, unsafe content and physical bytes", async t => {
+	const method = syntheticRecord("K001");
+	const harness = await syntheticM04Export([method]);
+	t.after(() => rm(harness.root, { recursive: true, force: true }));
+	const record = () => recordPrivateM04Outcome(harness.destination,
+		{ state: "completed", runId: "m04-diagnostic", snapshotCreated: true }, harness.store);
+	method.fields.experience = { version: 1, targetKind: "executor", applicableStages: ["M07"], requiredTags: [],
+		excludedTags: [], requiredRefs: ["E001"] };
+	assert.equal((await record()).m04?.knowledgeExport?.failureKind, "malformed-experience");
+	method.fields = {};
+	method.body = "Synthetic password: EXAMPLE-DO-NOT-EXPORT";
+	assert.equal((await record()).m04?.knowledgeExport?.failureKind, "unsafe-record");
+	method.body = "x".repeat(256_100);
+	const byteLimited = await record();
+	assert.equal(byteLimited.m04?.knowledgeExport?.failureKind, "physical-byte-cap");
+	assert.equal(byteLimited.m04?.knowledgeExport?.byteLimit, 256_000);
+	assert.ok((byteLimited.m04?.knowledgeExport?.actualBytes ?? 0) > 256_000);
+	assert.equal(existsSync(path.join(harness.destination, M04_KNOWLEDGE_EXPORT_NAME)), false);
+});
+
+test("private M04 export identifies malformed and unpublished edges and unavailable condition checks", async t => {
+	const method = syntheticRecord("K001");
+	const harness = await syntheticM04Export([method]);
+	t.after(() => rm(harness.root, { recursive: true, force: true }));
+	const record = () => recordPrivateM04Outcome(harness.destination,
+		{ state: "completed", runId: "m04-diagnostic", snapshotCreated: true }, harness.store);
+	method.refs = [{ rel: "checks", target: "synthetic invalid relation target" }];
+	const malformed = (await record()).m04?.knowledgeExport;
+	assert.equal(malformed?.failureKind, "malformed-relation-or-scope");
+	assert.equal(malformed?.relationIndex, 0);
+	assert.doesNotMatch(JSON.stringify(malformed), /synthetic invalid relation target/);
+	method.refs = [{ rel: "checks", target: "E999" }];
+	const unpublished = (await record()).m04?.knowledgeExport;
+	assert.equal(unpublished?.failureKind, "missing-published-target");
+	assert.equal(unpublished?.relationIndex, 0);
+	method.refs = [];
+	harness.store.availability = async () => { throw new Error("synthetic conditional detail must stay private"); };
+	const conditional = (await record()).m04?.knowledgeExport;
+	assert.equal(conditional?.failureKind, "conditional-availability-or-limit");
+	assert.deepEqual(conditional?.ref, { storeId: harness.storeId, recordId: "K001", version: 1 });
+	assert.doesNotMatch(JSON.stringify(conditional), /synthetic conditional detail/);
+});
+
+test("private M04 export accepts over 100 refs and over 64 scopes within its physical byte bound", async t => {
+	const method = syntheticRecord("K001"), evidence = syntheticRecord("E001", "prior"), scope = syntheticRecord("X001", "prior");
+	const harness = await syntheticM04Export([method, evidence, scope]);
+	t.after(() => rm(harness.root, { recursive: true, force: true }));
+	method.refs = Array.from({ length: 101 }, () => ({ rel: "checks", target: "E001" }));
+	method.scope = Array.from({ length: 65 }, () => "X001");
+	const archived = await recordPrivateM04Outcome(harness.destination,
+		{ state: "completed", runId: "m04-diagnostic", snapshotCreated: true }, harness.store);
+	assert.equal(archived.m04?.knowledgeExport?.state, "complete", JSON.stringify(archived.m04?.knowledgeExport));
+	const exported = JSON.parse(await readFile(path.join(harness.destination, M04_KNOWLEDGE_EXPORT_NAME), "utf8"));
+	assert.equal(exported.dependencies.length, 166);
+	assert.ok(Buffer.byteLength(JSON.stringify(exported), "utf8") <= 256_000);
 });
 
 test("private machine feedback retains actionable failed-case diagnostics and explicit measurement semantics", async t => {

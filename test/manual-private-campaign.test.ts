@@ -14,6 +14,7 @@ import { sealCampaignCarry } from "../src/runner/emergency-carry.ts";
 import { encodeCarrySidecars, decodeCarrySidecars } from "../src/runner/carry-sidecar-codec.ts";
 import { CARRY_SEGMENT_FILE_BYTES } from "../src/runner/carry-sidecar-codec.ts";
 import { validatePriorGroundingIndex } from "../src/m07/assessor-grounding.ts";
+import { runOriginalObjectiveLoop } from "../src/m07/objective-progress.ts";
 import { PrivateAssessorDiagnosticError } from "../src/runner/private-assessor-diagnostic.ts";
 
 test("shared-total campaign requires explicit manual admission and signed cumulative ledger", async () => {
@@ -834,6 +835,58 @@ test("follow-on cannot promote byte-identical code on a noisy measured speedup",
 	assert.equal(offlineChecks.chooseFollowOnCandidate(true, true, false, apparentGain), false);
 	assert.equal(offlineChecks.chooseFollowOnCandidate(true, true, true, apparentGain), true);
 	assert.equal(offlineChecks.chooseFollowOnCandidate(true, false, true, apparentGain), false);
+});
+
+test("an unselected completed M04 with incomplete export permits the next independent assessment", async () => {
+	const favorable = { state: "measured", medianRatio: 1.2, minRatio: 1.05 };
+	const promoted = offlineChecks.chooseDurableFollowOnCandidate(true, true, false,
+		favorable, "incomplete");
+	assert.equal(promoted, false, "byte-identical work and incomplete knowledge cannot replace selection");
+	assert.equal(offlineChecks.replaceSelectedM04AfterFollowOn(true, promoted, "completed"), false,
+		"the known merged but unselected M04 cannot overwrite selected knowledge readiness");
+	const priorRef = { storeId: "11111111-1111-4111-8111-111111111111",
+		recordId: "K001", version: 1 };
+	const selected = { status: "completed" as const, transactionState: "merged" as const,
+		repairNeeded: false, evidenceReturned: true,
+		knowledgeExport: { state: "complete" as const, file: "m04-adopted-knowledge.json" },
+		reusableRefs: [priorRef], knowledgeFile: "prior-selected-m04-adopted-knowledge.json" };
+	const unselected = { status: "completed" as const, transactionState: "merged" as const,
+		repairNeeded: false, evidenceReturned: true,
+		knowledgeExport: { state: "incomplete" as const,
+			reason: "synthetic physical or graph export failure" },
+		reusableRefs: [], knowledgeFile: undefined };
+	const active = offlineChecks.selectedM04AfterFollowOn(selected, unselected, true, promoted);
+	assert.deepEqual(active, selected,
+		"production state transition keeps the selected export and pinned refs after unselected M04");
+	const loop = await runOriginalObjectiveLoop({
+		admission: () => active.status === "completed" && active.evidenceReturned &&
+			active.knowledgeExport.state === "complete" ? "admitted" : "bounded-run-incomplete",
+		step: async iteration => iteration === 1 ?
+			{ advanced: true, stopReason: "objective-reassessment-pending" } :
+			{ advanced: false, stopReason: "assessment-failed" },
+	});
+	assert.equal(loop.steps.length, 2, "a second assessor turn follows the unselected export failure");
+	assert.equal(loop.stopReason, "assessment-failed");
+	assert.equal(offlineChecks.chooseDurableFollowOnCandidate(true, true, true,
+		favorable, "incomplete"), false,
+		"even a faster changed source cannot promote without a safe knowledge export");
+	assert.equal(offlineChecks.chooseDurableFollowOnCandidate(true, true, true,
+		favorable, "complete"), true);
+	const safeNew = { ...unselected, knowledgeExport: { state: "complete" as const },
+		reusableRefs: [{ ...priorRef, recordId: "K002" }],
+		knowledgeFile: "new-selected-m04-adopted-knowledge.json" };
+	assert.deepEqual(offlineChecks.selectedM04AfterFollowOn(selected, safeNew, true, true), safeNew,
+		"a promoted, fully exported candidate updates exactly its own pinned refs");
+	assert.equal(offlineChecks.replaceSelectedM04AfterFollowOn(true, true, "completed"), true);
+	assert.equal(offlineChecks.replaceSelectedM04AfterFollowOn(true, false, "failed"), true,
+		"a failed M04 keeps its existing unresolved-effect repair gate");
+	assert.equal(offlineChecks.selectedM04AfterFollowOn(selected,
+		{ ...unselected, status: "failed" }, true, false).status, "failed");
+	const blockedSelected = await runOriginalObjectiveLoop({
+		admission: () => "bounded-run-incomplete", step: async () => {
+			throw Error("a selected incomplete export must block before another model turn");
+		} });
+	assert.equal(blockedSelected.steps.length, 0);
 });
 
 test("an accepted measured candidate stays unselected until M04 and its read/export finish", () => {

@@ -1686,6 +1686,31 @@ function chooseFollowOnCandidate(previousAccepted: boolean, followOnAccepted: bo
 		comparison.medianRatio !== undefined && comparison.medianRatio > 1.03 &&
 		comparison.minRatio !== undefined && comparison.minRatio >= 0.95));
 }
+function chooseDurableFollowOnCandidate(previousAccepted: boolean, followOnAccepted: boolean,
+	sourceChanged: boolean, comparison: { state?: string; medianRatio?: number; minRatio?: number },
+	knowledgeExportState: "complete" | "none" | "incomplete"): boolean {
+	return knowledgeExportState !== "incomplete" &&
+		chooseFollowOnCandidate(previousAccepted, followOnAccepted, sourceChanged, comparison);
+}
+function replaceSelectedM04AfterFollowOn(secondReady: boolean, promoted: boolean,
+	nextM04Status: "completed" | "failed" | "not_run"): boolean {
+	// A completed unselected M04 contributes historical evidence, not the
+	// selected candidate's current knowledge/export authority.
+	return secondReady && (promoted || nextM04Status === "failed");
+}
+type SelectedM04ContinuationState = {
+	status: "completed" | "failed" | "not_run";
+	transactionState?: PortableM04KnowledgeTransactionV1["state"];
+	repairNeeded: boolean; evidenceReturned: boolean;
+	knowledgeExport: { state: "complete" | "none" | "incomplete";
+		file?: string; recordCount?: number; reason?: string };
+	reusableRefs: KnowledgeRef[]; knowledgeFile: string | undefined;
+};
+function selectedM04AfterFollowOn(current: SelectedM04ContinuationState,
+	next: SelectedM04ContinuationState, secondReady: boolean, promoted: boolean):
+	SelectedM04ContinuationState {
+	return replaceSelectedM04AfterFollowOn(secondReady, promoted, next.status) ? next : current;
+}
 function retainPriorSelectionUntilM04Ready(m04: { status: "not_run" | "completed" | "failed";
 	fullSelectedRead: boolean; knowledgeExportState: "complete" | "none" | "incomplete" },
 	previousAccepted: boolean, candidateAccepted: boolean, sourceChanged: boolean,
@@ -3922,7 +3947,7 @@ async function main() {
 			let currentM04TransactionState = m04.transactionState;
 			let currentM04RepairNeeded = m04.repairNeeded === true;
 			let currentM04Read = m04SelectedReadContractSatisfied;
-			let currentKnowledgeExport = knowledgeExport;
+			let currentKnowledgeExport: SelectedM04ContinuationState["knowledgeExport"] = knowledgeExport;
 			let currentReusableRefs = reusableRefs;
 			let currentKnowledgeFile = existsSync(path.join(outputDir, "m04-adopted-knowledge.json")) ?
 				path.join(outputDir, "m04-adopted-knowledge.json") : undefined;
@@ -4217,9 +4242,11 @@ async function main() {
 								[{ name: "latest-attempt-plan.json", file: path.join(outputDir, `${iterationPrefix}-experiment-plan.json`) }] : [])];
 						const sourceChanged = !existsSync(candidate) || !existsSync(nextCandidate) ||
 							!(await readFile(candidate)).equals(await readFile(nextCandidate));
-						const chooseFollowOn = chooseFollowOnCandidate(selectedCandidateSource !== "none",
+						const nextKnowledgeExport = nextArchive.m04?.knowledgeExport ?? { state: "incomplete" as const };
+						const chooseFollowOn = chooseDurableFollowOnCandidate(selectedCandidateSource !== "none",
 							secondFinished.outcome === "fulfilled" && secondReady && nextM04.status === "completed", sourceChanged,
-							comparison as { state?: string; medianRatio?: number; minRatio?: number });
+							comparison as { state?: string; medianRatio?: number; minRatio?: number },
+							nextKnowledgeExport.state);
 						let promoted = false;
 						if (chooseFollowOn && nextArchive.files.some(item => item.name === "candidate.cpp" && item.status === "present") &&
 							nextArchive.files.some(item => item.name === "verification.json" && item.status === "present")) {
@@ -4239,18 +4266,31 @@ async function main() {
 							promoted = true;
 						}
 						followOnSourceChanged = sourceChanged;
-						if (secondReady) {
-							currentM04Status = nextM04.status;
-							currentM04TransactionState = nextM04.transactionState;
-							currentM04RepairNeeded = nextM04.repairNeeded === true;
-							currentM04Read = nextM04.evidenceReturned === true;
-							currentKnowledgeExport = nextArchive.m04?.knowledgeExport ?? { state: "incomplete" };
-							currentReusableRefs = nextM04.evidenceReturned && currentKnowledgeExport.state === "complete" ?
-								(nextM04.adoptedExperienceRefs ?? []).filter(ref => (nextArchive.m04?.adoptedExperienceRefs ?? []).some(exported =>
-									exported.storeId === ref.storeId && exported.recordId === ref.recordId && exported.version === ref.version)) : [];
-							currentKnowledgeFile = existsSync(path.join(nextArchiveDir, "m04-adopted-knowledge.json")) ?
-								path.join(nextArchiveDir, "m04-adopted-knowledge.json") : undefined;
-						}
+						const selectedM04 = selectedM04AfterFollowOn({
+							status: currentM04Status, transactionState: currentM04TransactionState,
+							repairNeeded: currentM04RepairNeeded, evidenceReturned: currentM04Read,
+							knowledgeExport: currentKnowledgeExport, reusableRefs: currentReusableRefs,
+							knowledgeFile: currentKnowledgeFile,
+						}, {
+							status: nextM04.status, transactionState: nextM04.transactionState,
+							repairNeeded: nextM04.repairNeeded === true,
+							evidenceReturned: nextM04.evidenceReturned === true,
+							knowledgeExport: nextKnowledgeExport,
+							reusableRefs: nextM04.evidenceReturned && nextKnowledgeExport.state === "complete" ?
+								(nextM04.adoptedExperienceRefs ?? []).filter(ref =>
+									(nextArchive.m04?.adoptedExperienceRefs ?? []).some(exported =>
+										exported.storeId === ref.storeId && exported.recordId === ref.recordId &&
+										exported.version === ref.version)) : [],
+							knowledgeFile: existsSync(path.join(nextArchiveDir, "m04-adopted-knowledge.json")) ?
+								path.join(nextArchiveDir, "m04-adopted-knowledge.json") : undefined,
+						}, secondReady, promoted);
+						currentM04Status = selectedM04.status;
+						currentM04TransactionState = selectedM04.transactionState;
+						currentM04RepairNeeded = selectedM04.repairNeeded;
+						currentM04Read = selectedM04.evidenceReturned;
+						currentKnowledgeExport = selectedM04.knowledgeExport;
+						currentReusableRefs = selectedM04.reusableRefs;
+						currentKnowledgeFile = selectedM04.knowledgeFile;
 						followOn = { state: "completed", iteration, goalRunId: secondGoal.runId,
 							taskId: secondTask.taskId, m07Outcome: secondFinished.outcome,
 							priorCandidateProvided: true, priorEvidenceProvided: true, adoptedRefsEligible: proposedRefs.length,
@@ -4260,6 +4300,7 @@ async function main() {
 							sourceChanged: followOnSourceChanged,
 							noChangeOutcome: followOnSourceChanged === false ? "identical-source-kept-previous" : null,
 							m04: nextM04,
+							knowledgeExportState: nextKnowledgeExport.state,
 							knowledgeMode: pinnedRefs.length ? "m04-adopted-pinned" : "prior-artifact-only",
 							archiveTransportLayout: "prefixed-flat-index" };
 						followOnAttempts.push(followOn);
@@ -4666,6 +4707,7 @@ export const offlineChecks = { sourceShape, deriveRuntimeCases, m04EvidenceRetur
 	credentialProbe, parseCheckerOutput, compareCandidateTimings,
 	campaignObjectiveStop, taskTelemetry, privateToolTelemetry,
 	chooseForkWinner, chooseFollowOnCandidate, firstM07Accepted, importM04EffectDisposition,
+	chooseDurableFollowOnCandidate, replaceSelectedM04AfterFollowOn, selectedM04AfterFollowOn,
 	retainPriorSelectionUntilM04Ready,
 	selectedGoalBranchSatisfied,
 	archivedM07ImportTarget, fixedPrivateChecks: { diagnostic: CHECKS, registered: REGISTERED_CHECKS },

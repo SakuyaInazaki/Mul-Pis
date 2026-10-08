@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -100,4 +100,19 @@ test("cycles and unknown foreign dependencies fail closed within record bounds",
 	const missing = await createExperienceProvider(store).select(query([ref(storeId, "K003")]));
 	assert.equal(missing.status, "incomplete");
 	assert.match(missing.omitted.map((item) => item.reason).join(" "), /store-not-registered/);
+});
+
+test("a synthetic legacy record missing excludedTags remains unselectable", async t => {
+	const { dir, store, storeId } = await fixture(t);
+	await apply(store, [{ op: "create", type: "K", title: "Legacy experience", body: "Historical record",
+		usageDecision: "adopted", fields: { experience: experience("executor", []) } }]);
+	const file = path.join(dir, "records", "K001", "v1.md");
+	const old = await readFile(file, "utf8");
+	const legacy = old.replace('"excludedTags":[],', "");
+	assert.notEqual(legacy, old, "fixture represents an old stored typed record");
+	await writeFile(file, legacy);
+	const selected = await createExperienceProvider(store).select(query([ref(storeId, "K001")]));
+	assert.equal(selected.status, "incomplete");
+	assert.equal(selected.markdown, "");
+	assert(selected.omitted.some(item => item.reason === "not-an-experience-record"));
 });

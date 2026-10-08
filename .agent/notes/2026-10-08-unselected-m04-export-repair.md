@@ -1,0 +1,7 @@
+# Unselected M04 export and continuation
+
+An objective loop stopped after an accepted but unselected follow-on task completed M04, because that task's knowledge export was incomplete. The runner had overwritten the retained selected candidate's M04/export readiness with the unselected attempt's state. Subsequent assessment admission then treated a historical attempt's incomplete export as a blocker for the selected candidate.
+
+The runner now retains selected M04, export and reusable-reference state after a completed unselected follow-on attempt. A changed candidate cannot be promoted while its M04 knowledge export is incomplete. A failed M04 still enters the existing repair gate. An unselected archive and transaction remain available as untrusted development evidence; unresolved M04 effects retain their reconciliation gate. The original objective remains open until independently supported completion.
+
+M04 proposals that explicitly include a typed experience definition are checked for the required pinned-reference shape before merge, so malformed definitions can receive actionable same-session validation feedback. Freeform knowledge records without that typed field remain valid. Private knowledge export failures now distinguish fixed structural, dependency, cycle, unsafe-content and physical-byte causes without copying record text or credentials. Physical file bounds and live adoption checks remain in force; proposal validation does not itself grant scientific adoption.

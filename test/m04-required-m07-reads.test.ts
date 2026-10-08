@@ -285,6 +285,78 @@ test("a corrected structural draft merges once and retains rejected draft identi
 	assert.equal(result.record.outputs.filter(item => item.label === "M04 知识事务状态").length, 1);
 });
 
+test("M04 rejects a third-operation experience string ref and accepts its same-session pinned correction", async t => {
+	const f = await fixture(t);
+	const storeId = await f.store.storeId();
+	const evidence = await f.store.submitProposal({ stage: "M04", runId: "prior", ops: [
+		{ op: "create", type: "E", title: "Existing evidence", body: "Synthetic pinned input", usageDecision: "adopted" },
+	] });
+	assert.equal(evidence.structurallyValid, true);
+	await f.store.merge(evidence.proposalId);
+	const before = (await f.store.current())!.id;
+	const ops = (requiredRefs: unknown) => [
+		{ op: "create", type: "C", title: "Synthetic observation", body: "Bounded observation" },
+		{ op: "create", type: "J", title: "Synthetic rationale", body: "Bounded rationale" },
+		{ op: "create", type: "K", title: "Reusable method", body: "Synthetic method", usageDecision: "candidate",
+			fields: { experience: { version: 1, targetKind: "executor", applicableStages: ["M07"],
+				requiredTags: [], excludedTags: [], requiredRefs } } },
+	];
+	const response = (requiredRefs: unknown) => `\`\`\`knowledge-proposals\n${JSON.stringify(ops(requiredRefs))}\n\`\`\``;
+	const captured: M04InvalidJudgmentEvent[] = [];
+	const fake = new FakeSessionRunner(({ turnIndex, message }) => {
+		if (turnIndex === 1) {
+			assert.match(message, /\{storeId,recordId,version\}/);
+			assert.match(message, /字符串无效/);
+			return { text: response(["K001@1"]), readReturns: returnedRanges(f.relative) };
+		}
+		assert.equal(captured.length, 1);
+		assert.match(message, /fields\.experience\.requiredRefs\[0\]/);
+		assert.match(message, /\{storeId,recordId,version\}/);
+		return { text: response([{ storeId, recordId: "E001", version: 1 }]), readReturns: [] };
+	});
+	f.ctx.runner = fake;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative,
+		onInvalidJudgment: async event => { captured.push(event); } });
+	assert.deepEqual(result.proposalAttempts.map(item => item.state), ["rejected-draft", "merged"]);
+	assert.equal(captured[0].validation.code, "m04.proposal-structure");
+	const issues = result.proposalAttempts[0].issues;
+	assert(issues.some(issue => issue.opIndex === 2 &&
+		issue.message.includes("fields.experience.requiredRefs[0]") &&
+		issue.message.includes("{storeId,recordId,version}")));
+	assert.notEqual(result.snapshotId, before);
+	assert.deepEqual((await f.store.get("K001"))?.fields.experience, {
+		version: 1, targetKind: "executor", applicableStages: ["M07"], requiredTags: [],
+		excludedTags: [], requiredRefs: [{ storeId, recordId: "E001", version: 1 }],
+	});
+	assert.equal([...fake.sessions.values()].find(item => item.spec.label === "M04-research")?.turns, 2);
+});
+
+test("M04 rejects hostile extra keys in an experience ref without merging", async t => {
+	const f = await fixture(t);
+	const before = (await f.store.current())?.id;
+	const fake = new FakeSessionRunner(({ turnIndex, message }) => {
+		if (turnIndex === 1) return { text: `\`\`\`knowledge-proposals\n${JSON.stringify([{
+			op: "create", type: "K", title: "Synthetic method", body: "Synthetic evidence",
+			fields: { experience: { version: 1, targetKind: "executor", applicableStages: ["M07"],
+				requiredTags: [], excludedTags: [], requiredRefs: [{ storeId: "00000000-0000-4000-8000-000000000000",
+					recordId: "E001", version: 1, secretPayload: "do-not-repeat-this-value" }] } },
+		}])}\n\`\`\``, readReturns: returnedRanges(f.relative) };
+		assert.match(message, /fields\.experience\.requiredRefs\[0\]/);
+		assert.match(message, /only \{storeId,recordId,version\}/);
+		assert.doesNotMatch(message, /do-not-repeat-this-value|secretPayload/);
+		return "Corrected judgment: no supported knowledge proposal.";
+	});
+	f.ctx.runner = fake;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative });
+	assert.deepEqual(result.proposalAttempts.map(item => item.state), ["rejected-draft"]);
+	assert(result.proposalAttempts[0].issues.some(issue => issue.message.includes("fields.experience.requiredRefs[0]")));
+	assert.equal(result.snapshotId, undefined);
+	assert.equal((await f.store.current())?.id, before);
+	assert.equal(await f.store.get("K001"), undefined);
+});
+
 test("repeated malformed proposal changes context without submitting malformed content", async t => {
 	const f = await fixture(t);
 	let firstSessionId: string | undefined;

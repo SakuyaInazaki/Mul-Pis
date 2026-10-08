@@ -136,7 +136,9 @@ test("withdrawn limits remain visible and experience cannot enter M07 generic pa
 	const store = await fixture(t);
 	await apply(store, [
 		{ op: "create", type: "C", title: "tensor deprecated", body: "retired", usageDecision: "adopted" },
-		{ op: "create", type: "C", title: "tensor lesson", body: "method", usageDecision: "adopted", fields: { experience: { version: 1 } } },
+		{ op: "create", type: "C", title: "tensor lesson", body: "method", usageDecision: "adopted",
+			fields: { experience: { version: 1, targetKind: "executor", applicableStages: ["M07"],
+				requiredTags: [], excludedTags: [], requiredRefs: [] } } },
 	]);
 	await apply(store, [{ op: "limit", target: "C001", kind: "withdrawn", reason: "counterexample", authority: "test" }]);
 	const selection = await retrieveKnowledge(store, { purpose: "M04", text: "tensor", maxRecords: 4, maxChars: 5_000 });

@@ -7,7 +7,7 @@ import { chmod, copyFile, lstat, mkdir, readFile, realpath, rename, writeFile } 
 import path from "node:path";
 import type { CurrentGoal, M07TaskRecord } from "../m07/types.ts";
 import { isSafeRelativeOutputPath } from "../m07/expected-output.ts";
-import { isKnowledgeRef } from "../knowledge/experience-index.ts";
+import { isKnowledgeRef, validateExperienceDefinition } from "../knowledge/experience-schema.ts";
 import type { KnowledgeRecord, KnowledgeRef, KnowledgeStore, Limit, Snapshot } from "../knowledge/types.ts";
 import type { DeepSeekRequestViolation } from "../runner/deepseek-request-contract.ts";
 
@@ -17,6 +17,20 @@ const MAX_ARCHIVE_BYTES = 32_000;
 export const M04_KNOWLEDGE_EXPORT_NAME = "m04-adopted-knowledge.json";
 const MAX_REVIEW_TEXT_BYTES = 512_000;
 const MAX_KNOWLEDGE_BYTES = 256_000;
+type KnowledgeExportFailureKind = "store-unavailable" | "snapshot-unavailable" | "missing-ref" |
+	"unsafe-record" | "cycle" | "malformed-relation-or-scope" | "malformed-experience" |
+	"missing-published-target" | "conditional-availability-or-limit" | "physical-byte-cap" |
+	"live-state-changed" | "export-error";
+type KnowledgeExportEdge = { from: KnowledgeRef; to: KnowledgeRef; kind: "required" | "scope" | "relation" };
+type KnowledgeExportStatus = { state: "complete" | "none" | "incomplete"; file?: typeof M04_KNOWLEDGE_EXPORT_NAME;
+	recordCount?: number; reason?: string; /** Present on new incomplete exports; absent in historical archives. */
+	failureKind?: KnowledgeExportFailureKind; ref?: KnowledgeRef; edge?: KnowledgeExportEdge;
+	relationIndex?: number; scopeIndex?: number; limitIndex?: number; byteLimit?: number; actualBytes?: number };
+const KNOWLEDGE_FAILURE_KINDS: ReadonlySet<string> = new Set<KnowledgeExportFailureKind>([
+	"store-unavailable", "snapshot-unavailable", "missing-ref", "unsafe-record", "cycle",
+	"malformed-relation-or-scope", "malformed-experience", "missing-published-target",
+	"conditional-availability-or-limit", "physical-byte-cap", "live-state-changed", "export-error",
+]);
 const REQUEST_CONTRACT_VIOLATIONS: ReadonlySet<string> = new Set([
 	"request-shape", "message-shape", "tool-call-shape", "duplicate-tool-call",
 	"orphan-tool-result", "duplicate-tool-result", "incomplete-tool-results",
@@ -73,7 +87,7 @@ export interface PrivateM07ArchiveV1 {
 		snapshotId?: string;
 		adoptedExperienceRefs?: KnowledgeRef[];
 		transaction?: { file: "m04-transaction.json"; state: "no-proposal" | "rejected-draft" | "merge-intent" | "merged" | "unknown" };
-		knowledgeExport?: { state: "complete" | "none" | "incomplete"; file?: typeof M04_KNOWLEDGE_EXPORT_NAME; recordCount?: number; reason?: string } };
+		knowledgeExport?: KnowledgeExportStatus };
 	knowledgeReuse: { trustedAdoption: false; adoptionPath: "M04"; nextUse: "explicit-candidate-context-only" };
 }
 
@@ -595,14 +609,13 @@ function exportSafe(value: unknown): boolean {
 function experienceDefinition(record: KnowledgeRecord): { requiredRefs: KnowledgeRef[]; targetKind: string; applicableStages: string[]; requiredTags: string[] } | undefined {
 	const value = record.fields.experience;
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-	const definition = value as Record<string, unknown>;
-	if (definition.version !== 1 || (definition.targetKind !== "executor" && definition.targetKind !== "improver") ||
-		!Array.isArray(definition.applicableStages) || !definition.applicableStages.every(item => typeof item === "string" && item.length <= 80) ||
-		!Array.isArray(definition.requiredTags) || !definition.requiredTags.every(item => typeof item === "string" && item.length <= 240) ||
-		!Array.isArray(definition.requiredRefs) ||
-		!definition.requiredRefs.every(isKnowledgeRef)) return undefined;
-	return { requiredRefs: definition.requiredRefs as KnowledgeRef[], targetKind: definition.targetKind,
-		applicableStages: definition.applicableStages as string[], requiredTags: definition.requiredTags as string[] };
+	// Published legacy records can predate excludedTags. This normalization is
+	// export-only; selection still validates the stored value without it.
+	const legacy = value as Record<string, unknown>;
+	const checked = validateExperienceDefinition(legacy.excludedTags === undefined ? { ...legacy, excludedTags: [] } : value);
+	const definition = checked.definition;
+	return definition ? { requiredRefs: definition.requiredRefs, targetKind: definition.targetKind,
+		applicableStages: definition.applicableStages, requiredTags: definition.requiredTags } : undefined;
 }
 
 async function exportM04Knowledge(m04: NonNullable<PrivateM07ArchiveV1["m04"]>, store?: KnowledgeStore): Promise<{
@@ -610,75 +623,129 @@ async function exportM04Knowledge(m04: NonNullable<PrivateM07ArchiveV1["m04"]>, 
 	refs: KnowledgeRef[];
 	payload?: string;
 }> {
-	const incomplete = (reason: string) => ({ status: { state: "incomplete" as const, reason }, refs: [] });
+	const reasons: Record<KnowledgeExportFailureKind, string> = {
+		"store-unavailable": "M04 run identity or knowledge store unavailable",
+		"snapshot-unavailable": "bounded published M04 snapshot unavailable",
+		"missing-ref": "published knowledge reference unavailable",
+		"unsafe-record": "M04 knowledge contains unsafe export content",
+		"cycle": "M04 knowledge dependency cycle",
+		"malformed-relation-or-scope": "M04 knowledge relation or scope is invalid",
+		"malformed-experience": "M04 experience definition is invalid",
+		"missing-published-target": "M04 knowledge target is absent from published snapshot",
+		"conditional-availability-or-limit": "M04 conditional availability or live limits could not be checked",
+		"physical-byte-cap": "M04 knowledge export exceeds physical byte limit",
+		"live-state-changed": "knowledge snapshot or live limits changed during export",
+		"export-error": "M04 knowledge could not be safely exported",
+	};
+	type Failure = KnowledgeExportStatus & { state: "incomplete"; failureKind: KnowledgeExportFailureKind };
+	type FailureDetails = Partial<Pick<KnowledgeExportStatus, "ref" | "edge" | "relationIndex" | "scopeIndex" |
+		"limitIndex" | "byteLimit" | "actualBytes">>;
+	const safeRef = (ref: unknown): KnowledgeRef | undefined => isKnowledgeRef(ref) ?
+		{ storeId: ref.storeId, recordId: ref.recordId, version: ref.version } : undefined;
+	const failure = (failureKind: KnowledgeExportFailureKind, details: FailureDetails = {}): Failure => {
+		const { edge, ref, ...rest } = details;
+		const from = edge && safeRef(edge.from), to = edge && safeRef(edge.to);
+		const safeEdge = from && to && edge && ["required", "scope", "relation"].includes(edge.kind) ?
+			{ from, to, kind: edge.kind } : undefined;
+		return { state: "incomplete", failureKind, reason: reasons[failureKind], ...rest,
+			...(safeRef(ref) ? { ref: safeRef(ref) } : {}), ...(safeEdge ? { edge: safeEdge } : {}) };
+	};
+	const incomplete = (status: Failure) => ({ status, refs: [] });
 	if (m04.state !== "completed") return { status: { state: "none" }, refs: [] };
-	if (!m04.runId || !store) return incomplete("M04 run identity or knowledge store unavailable");
+	if (!m04.runId || !store) return incomplete(failure("store-unavailable"));
 	try {
 		const storeId = await store.storeId();
 		const snapshot = await store.current();
 		if (!snapshot || !/^G\d{3,}$/.test(snapshot.id))
-			return incomplete("bounded published M04 snapshot unavailable");
-		const initialLimits = await store.limits();
+			return incomplete(failure("snapshot-unavailable"));
+		let initialLimits: Limit[];
+		try { initialLimits = await store.limits(); }
+		catch { return incomplete(failure("conditional-availability-or-limit")); }
 		const m04SourceRefs: KnowledgeRef[] = [];
 		for (const item of snapshot.records) {
-			const record = await store.get(item.id, item.version);
-			if (!record) return incomplete("published snapshot record unavailable");
-			if (record.source.stage !== "M04" || record.source.runId !== m04.runId) continue;
-			m04SourceRefs.push({ storeId, recordId: record.id, version: record.version });
+			const ref = safeRef({ storeId, recordId: item.id, version: item.version });
+			try {
+				const record = await store.get(item.id, item.version);
+				if (!record) return incomplete(failure("missing-ref", { ref }));
+				if (record.source.stage !== "M04" || record.source.runId !== m04.runId) continue;
+				m04SourceRefs.push({ storeId, recordId: record.id, version: record.version });
+			} catch { return incomplete(failure("export-error", { ref })); }
 		}
 		const m04LimitTargetRefs: KnowledgeRef[] = [];
-		for (const limit of initialLimits.filter(item => item.since === snapshot.createdAt)) {
+		for (const [limitIndex, limit] of initialLimits.entries()) {
+			if (limit.since !== snapshot.createdAt) continue;
 			const match = /^([CKEJQDX]\d{3,})(?:@(\d+))?$/.exec(limit.target);
-			if (!match) return incomplete("published M04 limit target is invalid");
+			if (!match) return incomplete(failure("malformed-relation-or-scope", { limitIndex }));
 			const published = snapshot.records.find(item => item.id === match[1]);
 			const version = match[2] ? Number(match[2]) : published?.version;
-			if (!version || !Number.isSafeInteger(version) || version < 1) return incomplete("published M04 limit target is unavailable");
+			if (!version || !Number.isSafeInteger(version) || version < 1)
+				return incomplete(failure("missing-published-target", { limitIndex }));
 			const ref = { storeId, recordId: match[1], version };
+			if (!published) return incomplete(failure("missing-published-target", { ref: safeRef(ref), limitIndex }));
 			if (!m04LimitTargetRefs.some(item => refKey(item) === refKey(ref))) m04LimitTargetRefs.push(ref);
 		}
 		if (!m04SourceRefs.length && !m04LimitTargetRefs.length && !m04.snapshotCreated) return { status: { state: "none" }, refs: [] };
 		const records = new Map<string, PrivateM04KnowledgeExportV1["records"][number]>();
 		const dependencies: PrivateM04KnowledgeExportV1["dependencies"] = [];
 		const visiting = new Set<string>();
-		const visit = async (ref: KnowledgeRef): Promise<boolean> => {
+		const visit = async (ref: KnowledgeRef, edge?: KnowledgeExportEdge): Promise<Failure | undefined> => {
 			const identity = refKey(ref);
-			if (records.has(identity)) return true;
-			if (ref.storeId !== storeId) return false;
-			if (visiting.has(identity)) return false;
+			if (records.has(identity)) return undefined;
+			if (ref.storeId !== storeId) return failure("missing-ref", { ref: safeRef(ref), edge });
+			if (visiting.has(identity)) return failure("cycle", { ref: safeRef(ref), edge });
+			const pinned = safeRef(ref);
+			if (!pinned) return failure("malformed-experience", { edge });
 			visiting.add(identity);
-			const record = await store.get(ref.recordId, ref.version);
-			if (!record || record.refs.length > 100 || record.scope.length > 64 || !exportSafe(record)) { visiting.delete(identity); return false; }
-			const availability = await store.availability(ref.recordId, ref.version);
-			const sanitized: KnowledgeRecord = { ...record, source: { stage: record.source.stage, runId: record.source.runId } };
-			if (!exportSafe(sanitized)) { visiting.delete(identity); return false; }
-			const model = record.fields.experience === undefined ? undefined : experienceDefinition(record);
-			if (record.fields.experience !== undefined && !model) { visiting.delete(identity); return false; }
-			const required = model?.requiredRefs ?? [];
-			const scoped: KnowledgeRef[] = [];
-			for (const scopeId of record.scope) {
-				const published = snapshot.records.find(item => item.id === scopeId);
-				if (!published || !/^X\d{3,}$/.test(scopeId)) { visiting.delete(identity); return false; }
-				scoped.push({ storeId, recordId: scopeId, version: published.version });
-			}
-			const related: KnowledgeRef[] = [];
-			for (const relation of record.refs) {
-				const match = /^([CKEJQDX]\d{3,})(?:@(\d+))?$/.exec(relation.target);
-				if (!match) { visiting.delete(identity); return false; }
-				const published = snapshot.records.find(item => item.id === match[1]);
-				const version = match[2] ? Number(match[2]) : published?.version;
-				if (!version || !Number.isSafeInteger(version) || version < 1) { visiting.delete(identity); return false; }
-				related.push({ storeId, recordId: match[1], version });
-			}
-			for (const [kind, refs] of [["required", required], ["scope", scoped], ["relation", related]] as const) for (const child of refs) {
-				dependencies.push({ from: ref, to: child, kind });
-				if (!await visit(child)) { visiting.delete(identity); return false; }
-			}
-			visiting.delete(identity);
-			records.set(identity, { ref, record: sanitized, availabilityAtExport: availability.availability });
-			return true;
+			try {
+				const record = await store.get(ref.recordId, ref.version);
+				if (!record) return failure("missing-ref", { ref: safeRef(ref), edge });
+				const recordBytes = Buffer.byteLength(JSON.stringify(record), "utf8");
+				if (recordBytes > MAX_KNOWLEDGE_BYTES)
+					return failure("physical-byte-cap", { ref: safeRef(ref), edge, byteLimit: MAX_KNOWLEDGE_BYTES, actualBytes: recordBytes });
+				if (!exportSafe(record)) return failure("unsafe-record", { ref: safeRef(ref), edge });
+				let availability: Awaited<ReturnType<KnowledgeStore["availability"]>>;
+				try { availability = await store.availability(ref.recordId, ref.version); }
+				catch { return failure("conditional-availability-or-limit", { ref: safeRef(ref), edge }); }
+				const sanitized: KnowledgeRecord = { ...record, source: { stage: record.source.stage, runId: record.source.runId } };
+				if (!exportSafe(sanitized)) return failure("unsafe-record", { ref: safeRef(ref), edge });
+				const model = record.fields.experience === undefined ? undefined : experienceDefinition(record);
+				if (record.fields.experience !== undefined && !model) return failure("malformed-experience", { ref: safeRef(ref), edge });
+				const required = model?.requiredRefs ?? [];
+				const scoped: KnowledgeRef[] = [];
+				for (const [scopeIndex, scopeId] of record.scope.entries()) {
+					const published = snapshot.records.find(item => item.id === scopeId);
+					if (!/^X\d{3,}$/.test(scopeId)) return failure("malformed-relation-or-scope", { ref: safeRef(ref), edge, scopeIndex });
+					if (!published) return failure("missing-published-target", { ref: safeRef(ref), edge, scopeIndex });
+					scoped.push({ storeId, recordId: scopeId, version: published.version });
+				}
+				const related: KnowledgeRef[] = [];
+				for (const [relationIndex, relation] of record.refs.entries()) {
+					const match = /^([CKEJQDX]\d{3,})(?:@(\d+))?$/.exec(relation.target);
+					if (!match) return failure("malformed-relation-or-scope", { ref: safeRef(ref), edge, relationIndex });
+					const published = snapshot.records.find(item => item.id === match[1]);
+					const version = match[2] ? Number(match[2]) : published?.version;
+					if (!version || !Number.isSafeInteger(version) || version < 1)
+						return failure("missing-published-target", { ref: safeRef(ref), edge, relationIndex });
+					if (!published) return failure("missing-published-target", { ref: safeRef(ref), edge, relationIndex });
+					related.push({ storeId, recordId: match[1], version });
+				}
+				for (const [kind, refs] of [["required", required], ["scope", scoped], ["relation", related]] as const) for (const child of refs) {
+					const target = safeRef(child);
+					if (!target) return failure("malformed-experience", { ref: pinned, edge });
+					const dependency = { from: pinned, to: target, kind };
+					dependencies.push(dependency);
+					const problem = await visit(target, dependency);
+					if (problem) return problem;
+				}
+				records.set(identity, { ref: pinned, record: sanitized, availabilityAtExport: availability.availability });
+				return undefined;
+			} catch { return failure("export-error", { ref: safeRef(ref), edge }); }
+			finally { visiting.delete(identity); }
 		};
-		for (const ref of [...m04SourceRefs, ...m04LimitTargetRefs])
-			if (!await visit(ref)) return incomplete("M04 dependency or limit target unavailable, unsafe, cyclic or over budget");
+		for (const ref of [...m04SourceRefs, ...m04LimitTargetRefs]) {
+			const problem = await visit(ref);
+			if (problem) return incomplete(problem);
+		}
 		const adopted: KnowledgeRef[] = [];
 		for (const ref of m04SourceRefs) {
 			const item = records.get(refKey(ref))!;
@@ -686,11 +753,14 @@ async function exportM04Knowledge(m04: NonNullable<PrivateM07ArchiveV1["m04"]>, 
 			if (!model || item.record.usageDecision !== "adopted" || item.availabilityAtExport !== "usable_conditionally" ||
 				model.targetKind !== "executor" || !model.applicableStages.includes("M07") || item.record.scope.length) continue;
 			if (model.requiredRefs.some(required => records.get(refKey(required))?.availabilityAtExport !== "usable_conditionally")) continue;
-			adopted.push(ref);
+			adopted.push(safeRef(ref)!);
 		}
 		const after = await store.current();
-		if (after?.id !== snapshot.id || JSON.stringify(await store.limits()) !== JSON.stringify(initialLimits))
-			return incomplete("knowledge snapshot or live limits changed during export");
+		let laterLimits: Limit[];
+		try { laterLimits = await store.limits(); }
+		catch { return incomplete(failure("conditional-availability-or-limit")); }
+		if (after?.id !== snapshot.id || JSON.stringify(laterLimits) !== JSON.stringify(initialLimits))
+			return incomplete(failure("live-state-changed"));
 		const document: PrivateM04KnowledgeExportV1 = {
 			version: 1, kind: "m04-published-knowledge-export", m04RunId: m04.runId, storeId,
 			exportedAt: new Date().toISOString(), snapshot,
@@ -700,10 +770,13 @@ async function exportM04Knowledge(m04: NonNullable<PrivateM07ArchiveV1["m04"]>, 
 				restore: "explicit-provenance-and-live-limit-check-required" },
 		};
 		const serialized = `${JSON.stringify(document, null, 2)}\n`;
-		if (Buffer.byteLength(serialized) > MAX_KNOWLEDGE_BYTES || !exportSafe(document)) return incomplete("M04 knowledge export is unsafe or exceeds byte budget");
+		const actualBytes = Buffer.byteLength(serialized, "utf8");
+		if (actualBytes > MAX_KNOWLEDGE_BYTES)
+			return incomplete(failure("physical-byte-cap", { byteLimit: MAX_KNOWLEDGE_BYTES, actualBytes }));
+		if (!exportSafe(document)) return incomplete(failure("unsafe-record"));
 		return { status: { state: "complete", file: M04_KNOWLEDGE_EXPORT_NAME, recordCount: records.size }, refs: adopted, payload: serialized };
 	} catch {
-		return incomplete("M04 knowledge could not be safely exported");
+		return incomplete(failure("export-error"));
 	}
 }
 
@@ -793,6 +866,26 @@ export async function loadPrivateM07Archive(directory: string): Promise<{ archiv
 		archive.knowledgeReuse?.trustedAdoption !== false || archive.knowledgeReuse?.adoptionPath !== "M04" ||
 		!/^T\d{3,}$/.test(archive.taskId) || typeof archive.goalRunId !== "string" || !archive.goalRunId)
 		throw new Error("private M07 archive identity or pending-adoption state is invalid");
+	const diagnostic = archive.m04?.knowledgeExport;
+	if (diagnostic?.failureKind !== undefined) {
+		const exactRef = (ref: unknown) => isKnowledgeRef(ref) &&
+			Object.keys(ref).length === 3 && Object.keys(ref).every(key => ["storeId", "recordId", "version"].includes(key));
+		const edge = diagnostic.edge;
+		if (diagnostic.state !== "incomplete" || !KNOWLEDGE_FAILURE_KINDS.has(diagnostic.failureKind) ||
+			!Object.keys(diagnostic).every(key => ["state", "reason", "failureKind", "ref", "edge", "relationIndex",
+				"scopeIndex", "limitIndex", "byteLimit", "actualBytes"].includes(key)) ||
+			(typeof diagnostic.reason !== "string" || diagnostic.reason.length > 160) ||
+			(diagnostic.ref !== undefined && !exactRef(diagnostic.ref)) ||
+			(edge !== undefined && (!edge || !exactRef(edge.from) || !exactRef(edge.to) ||
+				!["required", "scope", "relation"].includes(edge.kind) ||
+				!Object.keys(edge).every(key => ["from", "to", "kind"].includes(key)))) ||
+			[diagnostic.relationIndex, diagnostic.scopeIndex, diagnostic.limitIndex].some(index =>
+				index !== undefined && (!Number.isSafeInteger(index) || index < 0)) ||
+			(diagnostic.failureKind === "physical-byte-cap" ? diagnostic.byteLimit !== MAX_KNOWLEDGE_BYTES ||
+				!Number.isSafeInteger(diagnostic.actualBytes) || Number(diagnostic.actualBytes) <= MAX_KNOWLEDGE_BYTES :
+				diagnostic.byteLimit !== undefined || diagnostic.actualBytes !== undefined))
+			throw new Error("private M04 knowledge export diagnostic is invalid");
+	}
 	const result: { archive: PrivateM07ArchiveV1; candidate?: string; verification?: string; lesson?: string;
 		roundFiles: Array<{ index: number; candidate?: string; verification?: string; feedback?: string; reviewerReport?: string }>; reviewDecision?: string; m04Knowledge?: string } = { archive, roundFiles: [] };
 	for (const item of FILES) {
