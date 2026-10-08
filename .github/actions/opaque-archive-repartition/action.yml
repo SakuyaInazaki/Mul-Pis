@@ -1,0 +1,5 @@
+name: Repartition opaque Actions archive
+description: Copy one verified encrypted artifact ZIP into connector-sized immutable artifacts
+runs:
+  using: node24
+  main: main.mjs

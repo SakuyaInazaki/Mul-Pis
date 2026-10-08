@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "kind": "mul-pis-opaque-archive-repartition-request",
+  "repository": "SakuyaInazaki/Mul-Pis",
+  "sourceRunId": "37754417178",
+  "sourceArtifactId": "11559085687",
+  "sourceCommit": "48f7b2d938956819fd47a6f942844eb057e78116",
+  "sourceArtifactName": "confidential-campaign-envelope",
+  "archiveBytes": 60333244,
+  "archiveSha256": "f3cfec1b532dd011cf4255af6976dd6cce9aff60db325f3830e740f0093cc7b9"
+}

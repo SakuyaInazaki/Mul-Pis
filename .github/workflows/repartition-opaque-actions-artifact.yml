@@ -1,0 +1,41 @@
+name: Repartition verified opaque Actions artifact
+
+on:
+  push:
+    branches:
+      - run-requests/opaque-artifact-repartition
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: opaque-artifact-repartition-once
+  cancel-in-progress: false
+
+jobs:
+  repartition:
+    if: >-
+      github.repository == 'SakuyaInazaki/Mul-Pis' &&
+      github.actor == 'SakuyaInazaki' &&
+      github.run_attempt == 1 &&
+      github.ref == 'refs/heads/run-requests/opaque-artifact-repartition' &&
+      github.event.head_commit.message == 'Repartition verified opaque artifact'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install pinned artifact runtime
+        run: |
+          npm install --ignore-scripts --no-save --no-package-lock --no-audit --no-fund \
+            @actions/artifact@2.3.2
+      - name: Offline repartition checks
+        run: node --test test/repartition-opaque-actions-artifact.test.ts
+      - name: Verify and repartition opaque artifact ZIP
+        uses: ./.github/actions/opaque-archive-repartition
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
