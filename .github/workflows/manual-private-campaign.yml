@@ -90,6 +90,7 @@ jobs:
             @earendil-works/pi-ai@0.85.1 \
             @earendil-works/pi-agent-core@0.85.1 \
             @earendil-works/pi-coding-agent@0.85.1 \
+            @actions/artifact@2.3.2 \
             typescript@5.9.3 \
             @types/node@26.6.4
           python -m pip install --disable-pip-version-check --no-input 'cryptography==50.0.0'
@@ -107,30 +108,14 @@ jobs:
           python scripts/private_actions_transport.py decode --parent "$RUNNER_TEMP" --github-output "$GITHUB_OUTPUT"
       - name: Run private campaign
         id: campaign
+        uses: ./scripts
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           INPUT_DIR: ${{ steps.decode.outputs.input_dir }}
           MULPIS_MISSION_LEDGER_B64: ${{ secrets.MULPIS_MISSION_LEDGER_B64 }}
           MULPIS_MANUAL_AUTHORIZED: ${{ (github.event_name == 'workflow_dispatch' && inputs.authorize_bounded_run) || (github.event_name == 'push' && github.event.head_commit.message == 'Run confidential workflow') }}
           MULPIS_RUN_REQUEST_BEFORE: ${{ github.event.before }}
-          MULPIS_ACTIONS_PUBLIC_HEARTBEAT_FD: "3"
           GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          umask 077
-          mkdir -m 700 "$RUNNER_TEMP/private-campaign-output"
-          set +e
-          node scripts/manual-private-campaign.ts \
-            --input-dir "$INPUT_DIR" \
-            --output-dir "$RUNNER_TEMP/private-campaign-output" \
-            3>&1 \
-            > "$RUNNER_TEMP/private-campaign-stdout" \
-            2> "$RUNNER_TEMP/private-campaign-stderr"
-          code=$?
-          set -e
-          if [ ! -e "$RUNNER_TEMP/private-campaign-output/campaign-status.json" ]; then
-            printf '{"driver_exit_code":%s,"status":"incomplete"}\n' "$code" > "$RUNNER_TEMP/private-campaign-output/campaign-status.json"
-          fi
-          printf 'driver_exit_code=%s\n' "$code" >> "$GITHUB_OUTPUT"
       - name: Encrypt allowlisted outcome before upload
         if: always() && steps.decode.outcome == 'success'
         env:

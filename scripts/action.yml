@@ -1,0 +1,8 @@
+name: Private campaign observer
+description: Run the private campaign under a trusted artifact observer
+outputs:
+  driver_exit_code:
+    description: Exact driver exit code, or unknown if the observer did not report it
+runs:
+  using: node24
+  main: private-campaign-observer-action.mjs

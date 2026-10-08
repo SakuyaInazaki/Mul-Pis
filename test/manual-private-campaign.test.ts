@@ -1769,3 +1769,19 @@ test("measurement mounts evaluator and immutable reference workers read-only whi
 	assert.ok(execute.includes("--unshare-net") && execute.includes("--clearenv"));
 	assert.deepEqual(execute.slice(-3), ["--", "/work/registered-checker", "--check"]);
 });
+
+test("native worker sandbox arguments hide the trusted observer parent's proc and environment", () => {
+	const args = offlineChecks.sandboxArguments("/work/probe-bin", [],
+		"/tmp/synthetic-worker", true);
+	const program = args.indexOf("--");
+	const sandbox = args.slice(0, program);
+	assert.ok(sandbox.includes("--unshare-pid"));
+	assert.ok(sandbox.includes("--unshare-net"));
+	assert.ok(sandbox.includes("--clearenv"));
+	assert.deepEqual(sandbox.slice(sandbox.indexOf("--proc"), sandbox.indexOf("--proc") + 2),
+		["--proc", "/proc"], "the worker gets its own proc mount");
+	assert.ok(!sandbox.some((value, index) => value === "/proc" &&
+		["--bind", "--ro-bind"].includes(sandbox[index - 1] ?? "")),
+	"the trusted parent's proc tree must never be mounted into the worker");
+	assert.ok(!sandbox.includes("MULPIS_SYNTHETIC_PARENT_SECRET_CANARY"));
+});

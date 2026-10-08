@@ -54,19 +54,14 @@ test("heartbeat is inert without explicit Actions launch context", () => {
 	assert.equal(timers, 0);
 });
 
-test("enabled helper emits through FD3 while stdout and stderr remain private", async () => {
+test("JavaScript action wires the fixed FD3 heartbeat while campaign streams stay private", async () => {
 	const yaml = await readFile(new URL("../.github/workflows/manual-private-campaign.yml", import.meta.url), "utf8");
-	assert.match(yaml, /MULPIS_ACTIONS_PUBLIC_HEARTBEAT_FD: "3"/);
-	const start = yaml.indexOf("node scripts/manual-private-campaign.ts");
-	const end = yaml.indexOf("code=$?", start);
-	assert.ok(start > -1 && end > start);
-	const command = yaml.slice(start, end);
-	const fd3 = command.indexOf("3>&1");
-	const stdout = command.indexOf('> "$RUNNER_TEMP/private-campaign-stdout"');
-	const stderr = command.indexOf('2> "$RUNNER_TEMP/private-campaign-stderr"');
-	assert.ok(fd3 > -1 && stdout > fd3 && stderr > stdout,
-		"FD3 must duplicate public stdout before private stdout/stderr redirection");
-	assert.doesNotMatch(command, /\btee\b|2>&1/);
+	assert.match(yaml, /- name: Run private campaign\n\s+id: campaign\n\s+uses: \.\/scripts/);
+	const action = await readFile(new URL("../scripts/action.yml", import.meta.url), "utf8");
+	assert.match(action, /using: node24/);
+	assert.match(action, /main: private-campaign-observer-action\.mjs/);
+	const shim = await readFile(new URL("../scripts/private-campaign-observer-action.mjs", import.meta.url), "utf8");
+	assert.match(shim, /PUBLIC_HEARTBEAT_LINE/);
 
 	const directory = await mkdtemp(path.join(os.tmpdir(), "mulpis-heartbeat-test-"));
 	try {

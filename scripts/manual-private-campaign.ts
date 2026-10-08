@@ -69,6 +69,9 @@ import { buildUnresolvedHistoricalM04Quarantine, hasFreshOnlyM04QuarantineForLat
 	validateM04TransactionQuarantine, M04_TRANSACTION_QUARANTINE_FILE,
 	type M04TransactionQuarantineV1, type FreshM04QuarantineBoundary } from "../src/runner/m04-quarantine.ts";
 import { startPrivateCampaignHeartbeat } from "./private-campaign-heartbeat.ts";
+import { createLiveControlFrameWriter } from "../src/runner/live-control-frame.ts";
+import { actionsLiveControlFrameSink, bestEffortLiveControlObserver } from
+	"./private-campaign-live-status.ts";
 import { WorkflowRepairNeededError, validWorkflowRepairState,
 	type WorkflowRepairStateV1 } from "../src/runner/repair-liveness.ts";
 import { archivePrivateM07Task, recordPrivateM04Outcome } from "../src/workflow-archive/m07-private.ts";
@@ -2734,6 +2737,14 @@ async function main() {
 		taskId?: string; workRoot?: string;
 		grant?: NonNullable<SessionSpec["toolAuthority"]> }>();
 	const incrementalJournal = missionLedger.createIncrementalControlJournal(outputDir);
+	const liveControl = bestEffortLiveControlObserver({
+		enabled: process.env.GITHUB_ACTIONS === "true" &&
+			process.env.MULPIS_ACTIONS_PRIVATE_PROGRESS_FD === "4",
+		openWriter: () => createLiveControlFrameWriter({ seedEnvelopeB64: ledgerEnvelope,
+			publicKeyFile: path.join(HERE, "campaign-output-public.pem"),
+			source: missionLedger.incrementalControlSource,
+			emitFrame: actionsLiveControlFrameSink() }),
+	});
 	let prefixObjectiveCheckpointFile: string | undefined;
 	let prefixWorkspace: Workspace | undefined;
 	const recordIncrementalPrefix = async (event: IncrementalCheckpointEvent,
@@ -2762,9 +2773,10 @@ async function main() {
 					root: session.grant.root,
 					writableFiles: [...session.grant.writableFiles] } } : {}) })),
 			requestIds: audit.requests.map(row => row.requestId) };
-		await incrementalJournal.record(event, { requestAudit: audit, hostEffects,
+		const committed = await incrementalJournal.record(event, { requestAudit: audit, hostEffects,
 			unobservedControlDeliveries: missionLedger.unobservedControlDeliveries,
 			...(objectiveCheckpointJson === undefined ? {} : { objectiveCheckpointJson }) });
+		liveControl.committed(committed, event, audit, hostEffects);
 	};
 	let campaignCancelled = false;
 	try {

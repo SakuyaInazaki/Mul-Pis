@@ -29,6 +29,7 @@ jobs:
             @earendil-works/pi-ai@0.85.1 \
             @earendil-works/pi-agent-core@0.85.1 \
             @earendil-works/pi-coding-agent@0.85.1 \
+            @actions/artifact@2.3.2 \
             typescript@5.9.3 \
             @types/node@26.6.4
           python -m pip install --disable-pip-version-check --no-input 'cryptography==50.0.0'
@@ -39,3 +40,5 @@ jobs:
           python -m unittest discover -s test -p 'private_actions_transport_test.py'
           python -m unittest discover -s tools/py -p 'test_browser_task.py'
           python -m unittest discover -s tools/py -p 'test_browser_artifacts.py'
+      - name: Exercise synthetic Node 24 live observer artifact path
+        uses: ./.github/actions/live-control-smoke
