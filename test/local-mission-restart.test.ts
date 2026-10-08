@@ -19,12 +19,13 @@ test("a new local process reopens a clean original objective before any model wo
 	await writeFile(ws.problemFile, "Synthetic original task remains open\n");
 	await runInit(ws, createFileKnowledgeStore(ws.knowledgeDir));
 	await writeFile(ws.configFile, JSON.stringify({ roles: { research: "fake/research",
-		execution: "fake/execution" }, concurrency: 1 }));
+		execution: "fake/execution" }, localMission: { evaluatorId: "host:file-sha256" }, concurrency: 1 }));
 	const request = path.join(root, "original.json");
 	await writeFile(request, JSON.stringify({ version: 1,
 		kind: "local-original-objective-request", goal: "Resolve the synthetic task",
 		goalSource: "verbatim-private-input", obligations: [{ id: "answer",
-			description: "Provide verified evidence for the synthetic task" }],
+			description: "Provide verified evidence for the synthetic task",
+			type: "file-sha256", expectedSha256: "0".repeat(64) }],
 		closure: "open-ended" }));
 	const started = spawnSync(process.execPath, ["src/cli.ts", "mission", "start", "--workspace",
 		root, "--runner", "fake", "--original", request], { cwd: path.resolve("."),

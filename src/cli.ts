@@ -38,7 +38,7 @@ import path from "node:path";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { createFileKnowledgeStore } from "./knowledge/store.ts";
-import { FakeSessionRunner } from "./runner/fake.ts";
+import { FakeSessionRunner, createTrustedCliFakeRunner } from "./runner/fake.ts";
 import type { SessionRunner } from "./runner/types.ts";
 import type { StageContext } from "./stages/context.ts";
 import { CONFIG_TEMPLATE, runInit } from "./stages/init.ts";
@@ -101,6 +101,8 @@ function has(args: ParsedArgs, name: string): boolean {
 
 async function makeRunner(kind: string): Promise<SessionRunner> {
 	if (kind === "fake") {
+		const trusted = createTrustedCliFakeRunner();
+		if (trusted) return trusted;
 		return new FakeSessionRunner(({ spec, turnIndex }) => ({
 			text:
 				spec.role === "improver" && spec.label.startsWith("I-workflow-")

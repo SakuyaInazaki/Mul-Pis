@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
+import { registerTrustedLocalMissionEvaluator } from "../src/m07/local-mission-evaluator.ts";
 import { openDefaultLocalMission } from "../src/m07/local-mission.ts";
 import { publicLocalMissionStatus } from "../src/m07/local-original-objective.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
@@ -17,6 +18,16 @@ function lines(bytes: Buffer): number {
 }
 
 test("local mission freezes authored inputs, reviews a bounded reason result, and reopens without replay", async t => {
+	registerTrustedLocalMissionEvaluator({ id: "test:unselected-open-report", version: "1",
+		supportedObligationTypes: ["synthetic-open"],
+		async preflight() { return { available: true }; },
+		async evaluate({ contract, observationOutputDir }) {
+			const name = "observation-unverified.json";
+			await writeFile(path.join(observationOutputDir, name), "{\"verified\":false}\n", { mode: 0o600 });
+			return { checks: contract.obligations.map(item => ({ obligationId: item.id,
+				result: "not_run" as const, evidenceRefs: [name], limitations: ["Unverified report"] })),
+				observations: [{ name, kind: "json" }], limitations: ["Synthetic report only"] };
+		} });
 	const root = await mkdtemp(path.join(os.tmpdir(), "local-mission-workflow-"));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(root);
@@ -83,22 +94,41 @@ test("local mission freezes authored inputs, reviews a bounded reason result, an
 		if (spec.label === "M04-research") {
 			m04Calls++;
 			assert.equal(spec.tools.kind, "read-dir");
-			if (spec.tools.kind === "read-dir") m04ReadRoot = spec.tools.root;
-			return "The negative bounded report is unselected; no original criterion was verified.";
+			if (spec.tools.kind !== "read-dir") throw new Error("M04 read grant missing");
+			const readRoot = spec.tools.root;
+			m04ReadRoot = readRoot;
+			const readReturns: ReadReturnEvent[] = [];
+			async function visit(folder: string): Promise<void> {
+				for (const name of await readdir(folder)) {
+					const file = path.join(folder, name);
+					if ((await stat(file)).isDirectory()) { await visit(file); continue; }
+					const bytes = await readFile(file);
+					if (bytes.length) readReturns.push({ toolName: "m07_evidence_read", status: "returned",
+						path: path.relative(readRoot, file).replaceAll("\\", "/"), requested: {},
+						returned: { kind: "text", startLine: 1, endLine: lines(bytes), truncated: false },
+						at: new Date().toISOString() });
+				}
+			}
+			await visit(readRoot);
+			return { text: "The negative bounded report is unselected; no original criterion was verified.",
+				readReturns };
 		}
 		throw new Error(`unexpected model-free session ${spec.label}`);
 	});
 	const config = { roles: { research: "fake/research", execution: "fake/execution" },
+		localMission: { evaluatorId: "test:unselected-open-report" },
 		concurrency: 1, tools: {} };
 	const mission = openDefaultLocalMission({ workspaceRoot: root, runner, config });
 	const initial = await mission.begin({ version: 1, kind: "local-original-objective-request",
-		goal, goalSource: "verbatim-private-input", obligations: [{ id: "answer", description: obligation }],
+		goal, goalSource: "verbatim-private-input", obligations: [{ id: "answer", description: obligation,
+			type: "synthetic-open" }],
 		closure: "open-ended" });
 	missionId = initial.contract.id;
 	originalContractBytes = await readFile(path.join(ws.agentDir, "missions", missionId,
 		"evidence", "original-objective.json"));
 	assert.deepEqual(initial.contract.inputNames, ["problem.md", "observation.txt"]);
-	assert.deepEqual(initial.contract.obligations, [{ id: "answer", description: obligation }]);
+	assert.deepEqual(initial.contract.obligations, [{ id: "answer", description: obligation,
+		type: "synthetic-open" }]);
 	assert.equal(initial.contract.goal, goal);
 	const final = await mission.run(missionId);
 	assert(assessorCalls >= 2, JSON.stringify({ stopReason: final.stopReason,

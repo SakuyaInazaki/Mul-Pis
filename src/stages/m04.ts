@@ -104,7 +104,7 @@ function checkpointRelative(file: string): boolean {
 		file.split(/[\\/]/).every((part) => part !== "" && part !== "." && part !== "..");
 }
 
-async function requiredM07Reads(root: string, requested: string[] | undefined): Promise<string[]> {
+export async function requiredM07Reads(root: string, requested: string[] | undefined): Promise<string[]> {
 	if (requested === undefined) return [];
 	if (!Array.isArray(requested) || requested.length < 1 ||
 		new Set(requested).size !== requested.length) throw new HarnessError("m04.m07-evidence", "required M07 read paths must be bounded and unique");
@@ -178,7 +178,7 @@ async function m07ValidationCoverage(root: string, required: string[], returned:
 	}));
 }
 
-async function assertFullM07Reads(root: string, required: string[], returned: ReadReturnEvent[]): Promise<void> {
+export async function assertFullM07Reads(root: string, required: string[], returned: ReadReturnEvent[]): Promise<void> {
 	if ((await m07ReadGaps(root, required, returned)).length)
 		throw new HarnessError("m04.m07-evidence", "required selected M07 evidence was not returned to the research session in full");
 }

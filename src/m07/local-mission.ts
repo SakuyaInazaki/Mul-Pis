@@ -8,10 +8,14 @@ import path from "node:path";
 import { createFileKnowledgeStore } from "../knowledge/store.ts";
 import { LocalMissionHost } from "../runner/local-mission-host.ts";
 import type { SessionRunner } from "../runner/types.ts";
-import type { HarnessConfig } from "../types.ts";
+import { HarnessError, type HarnessConfig } from "../types.ts";
 import type { StageContext } from "../stages/context.ts";
 import { Workspace } from "../workspace.ts";
 import { createLocalM07Adapters, LOCAL_M07_MISSION_BINDING_PREFIX } from "./local-m07-adapter.ts";
+import { requireLocalEvaluator } from "./local-evaluator-run.ts";
+import { recordDefaultSelectionReview, recoverDefaultSelectionReview,
+	defaultSelectionEvidenceFiles } from "./local-selection-review.ts";
+import { createM07Controller } from "./controller.ts";
 import { freezeLocalMaterialBundle, readLocalMaterialBundle,
 	type LocalMaterialSelection } from "./local-material-bundle.ts";
 import { createLocalOriginalObjectiveCaller, type LocalObjectiveFrozenEvidence,
@@ -156,6 +160,24 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 			return missing;
 		};
 		return {
+			async verifyCurrentFulfillment(progress) {
+				try {
+					const readContext: StageContext = context ?? { ws,
+						runner: { create: async () => { throw new HarnessError("local.mission.status", "status cannot start a session"); },
+							resume: async () => { throw new HarnessError("local.mission.status", "status cannot resume a session"); } },
+						config: await ws.loadConfig(), store: createFileKnowledgeStore(ws.knowledgeDir) };
+					const review = await recoverDefaultSelectionReview({ ctx: readContext,
+						controller: createM07Controller(readContext), contract: progress.contract,
+						progress, root });
+					if (!review) throw new Error("completed mission has no selected review");
+				} catch (error) {
+					throw new HarnessError("local.mission.current-evidence",
+						`A fulfilled checkpoint was recorded, but its current evidence is invalid: ${(error as Error).message}`);
+				}
+			},
+			async reviewSelection({ ctx, controller, contract, run }) {
+				return recordDefaultSelectionReview({ ctx, controller, contract, run, root });
+			},
 			async currentUnknownOperationIds() {
 				return [...(await LocalMissionHost.status(root)).unresolvedOperationIds];
 			},
@@ -236,6 +258,8 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 					if (!expected || bytes.length !== expected.bytes || sha256(bytes) !== expected.sha256)
 						throw new Error("local mission original input differs from committed host evidence");
 				}
+				const originalIdentities: Array<{ name: string; bytes: number; sha256: string;
+					sourceIdentity?: string }> = [...storedValue.frozenInputs];
 				const materialNames = new Map<string, "host-control" | "supplied-task" |
 					"unselected-evidence">();
 				if (storedValue.materialManifestSha256) {
@@ -244,6 +268,9 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 					if (sha256(manifestBytes) !== storedValue.materialManifestSha256)
 						throw new Error("local mission material manifest differs from committed host evidence");
 					const manifest = await readLocalMaterialBundle(materialRoot);
+					originalIdentities.push(...manifest.items.map(item => ({
+						name: `material-${item.id}`, bytes: item.bytes, sha256: item.sha256,
+						sourceIdentity: item.sourceIdentity })));
 					for (const [index, relative] of manifest.indexFiles.entries()) {
 						const name = `material-index-${index + 1}.md`;
 						original.push({ name, file: path.join(materialRoot, relative) });
@@ -266,16 +293,28 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 				const boundedRunEvidence = await stageBoundedEvidence(progress);
 				for (const names of Object.values(boundedRunEvidence))
 					for (const name of names) original.push({ name, file: path.join(evidenceDir, name) });
+				const selectionReview = progress.selectedArtifacts.length && context ?
+					await recoverDefaultSelectionReview({ ctx: context,
+						controller: createM07Controller(context), contract, progress, root }) : undefined;
+				const selectedEvidenceNames = new Map<string, "selected-evidence" | "host-control">();
+				if (selectionReview && context) for (const item of defaultSelectionEvidenceFiles(context,
+				selectionReview, root)) {
+					original.push(item);
+					selectedEvidenceNames.set(item.name,
+						selectionReview.selectedArtifacts.some(selected => selected.name === item.name) ?
+							"selected-evidence" : "host-control");
+				}
 				const unrepresentedM07RunIds = await unrepresentedM07(progress);
 				for (const runId of await ws.listRuns("MISSION")) {
 					const run = await ws.readRun("MISSION", runId);
 					if (run.status === "running" && run.inputs.some(item => item.path === contractFile))
 						unrepresentedM07RunIds.push(`MISSION:${runId}`);
 				}
-				const capabilityFile = path.join(evidenceDir, `host-capability-${iteration}.txt`);
+				const previousCapabilities = (await readdir(evidenceDir)).filter(name =>
+					/^host-capability-[1-9][0-9]*(?:-[0-9a-f]{16})?\.txt$/.test(name));
 				const hasModel = (role: "research" | "execution") =>
 					Boolean(context?.config.roles[role] ?? context?.config.roles.default);
-				const capabilities = [
+				const hostCapabilities = [
 					{ scope: "local-m07-reason", available: hasModel("research") && hasModel("execution"),
 						description: "Local M07 read-only reasoning with M04 review", limits: ["A returned report is unselected evidence"] },
 					{ scope: "local-m07-execute", available: hasModel("research") && hasModel("execution") &&
@@ -283,14 +322,33 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 						description: "Opt-in trusted local M07 execution with task-root Pi read/write/edit/bash tools",
 						limits: ["Bash is not an OS sandbox and can access same-user files outside the task root; keep unrelated secrets outside this worker environment", "External effects require authorization and host reconciliation"] },
 				];
-				if (await lstat(capabilityFile).catch(() => undefined) === undefined)
-					await saveFrozen(capabilityFile, `${JSON.stringify(capabilities)}\n`);
-				else if (await safeText(capabilityFile) !== `${JSON.stringify(capabilities)}\n`)
-					throw new Error("local mission capability evidence changed");
+				let evaluatorCapabilityGap: string | undefined;
+				{
+					try { await requireLocalEvaluator(contract, context?.config.localMission?.evaluatorId, {
+						frozenOriginalInputs: originalIdentities,
+						capabilities: hostCapabilities }); }
+					catch (error) { evaluatorCapabilityGap = (error as Error).message; }
+				}
+				const capabilities = [
+				{ scope: "local-mission-evaluator", available: !evaluatorCapabilityGap,
+					description: evaluatorCapabilityGap ?? `Trusted host evaluator ${context?.config.localMission?.evaluatorId ?? "unconfigured"}`,
+					limits: ["Evaluator results are observations until M07 review, M04 reads and host selection"] },
+					...hostCapabilities,
+				];
+				const capabilityText = `${JSON.stringify(capabilities)}\n`;
+				const capabilityFile = path.join(evidenceDir,
+					`host-capability-${iteration}-${sha256(Buffer.from(capabilityText)).slice(0, 16)}.txt`);
+				await ensureFrozen(capabilityFile, capabilityText);
+				for (const name of previousCapabilities) if (name !== path.basename(capabilityFile)) {
+					const previousHash = name.match(/-([0-9a-f]{16})\.txt$/)?.[1];
+					if (previousHash && sha256(Buffer.from(await safeText(path.join(evidenceDir, name)))).slice(0, 16) !== previousHash)
+						throw new Error("local mission prior capability observation changed");
+					original.push({ name, file: path.join(evidenceDir, name) });
+				}
 				original.push({ name: path.basename(capabilityFile), file: capabilityFile });
 				const sourceKinds = Object.fromEntries(original.map(item => [item.name,
-					item.name === path.basename(capabilityFile) ? "host-capability" :
-					materialNames.get(item.name) ?? (item.name.startsWith("prior-run-") ?
+					item.name.startsWith("host-capability-") ? "host-capability" :
+					selectedEvidenceNames.get(item.name) ?? materialNames.get(item.name) ?? (item.name.startsWith("prior-run-") ?
 						item.name.includes("-control-") ? "host-control" : "unselected-evidence" :
 						"supplied-task")])) as
 					NonNullable<LocalObjectiveFrozenEvidence["groundingPolicy"]>["sourceKinds"];
@@ -298,18 +356,27 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 					...progress.continuation.unresolvedOperationIds])].sort();
 				const assessmentsDir = path.join(root, "assessments");
 				await mkdir(assessmentsDir, { mode: 0o700, recursive: true });
-				return { contractFile, evidenceRoot: path.join(assessmentsDir,
+				return { contractFile, frozenOriginalInputs: originalIdentities,
+					evidenceRoot: path.join(assessmentsDir,
 					`attempt-${iteration}-${randomUUID()}`), evidence: original,
-					capabilities, selectedArtifacts: [...progress.selectedArtifacts],
+					capabilities, ...(evaluatorCapabilityGap ? { evaluatorCapabilityGap } : {}),
+					...(selectionReview ? { selectionReview } : {}),
+					selectedArtifacts: [...progress.selectedArtifacts],
 					availableArtifacts: [...progress.availableArtifacts], unresolvedOperationIds: unknown,
 					groundingPolicy: { require: true, sourceKinds,
-						legacyOpenDetails: [...progress.continuation.unresolvedDetails],
+						newEvidenceSourceIds: [...selectedEvidenceNames].filter(([, kind]) =>
+							kind === "selected-evidence").map(([name]) => name),
+						legacyOpenDetails: [...(selectionReview ?
+							progress.assessment?.groundedAssessment?.legacyOpenDetails ??
+								progress.continuation.unresolvedDetails :
+							progress.continuation.unresolvedDetails)],
 						previousIssues: progress.assessment?.groundedAssessment?.issues ?? [] },
 					boundedRunEvidence, unrepresentedM07RunIds,
 					evidenceAccess: Object.fromEntries(Object.values(boundedRunEvidence).flat()
 						.map(name => [name, "retrievable" as const])),
 					evidenceRequirements: { requiredNames: original.filter(item =>
-						item.name.startsWith("original-") || materialNames.has(item.name)).map(item => item.name),
+						item.name.startsWith("original-") || materialNames.has(item.name) ||
+						selectedEvidenceNames.has(item.name)).map(item => item.name),
 						instructions: "Read every selected frozen text projection and its coverage index. A binary original remains frozen but is not read by text extraction; check its explicit gap before any claim. Historical reports are unselected until reviewed." } };
 			},
 		};

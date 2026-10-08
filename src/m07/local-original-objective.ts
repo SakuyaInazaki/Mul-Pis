@@ -32,7 +32,7 @@ export interface LocalObjectiveRequestV1 {
 	kind: "local-original-objective-request";
 	goal: string;
 	goalSource: OriginalObjectiveContractV1["goalSource"];
-	obligations: Array<{ id: string; description: string }>;
+	obligations: OriginalObjectiveContractV1["obligations"];
 	closure: OriginalObjectiveContractV1["closure"];
 	userOverrides?: string[];
 	/** Exact user-declared source set; omission uses the legacy workspace text set. */
@@ -55,8 +55,12 @@ export function validateLocalObjectiveRequest(value: unknown): LocalObjectiveReq
 		!prose(value.goal) || !["verbatim-private-input", "user-intent-summary"].includes(
 			String(value.goalSource)) || !["open-ended", "finite-evidence"].includes(
 			String(value.closure)) || !Array.isArray(value.obligations) || !value.obligations.length ||
-		value.obligations.some(item => !record(item) || Object.keys(item).sort().join("|") !==
-			"description|id" || !obligationIdPattern.test(String(item.id)) || !prose(item.description)) ||
+		value.obligations.some(item => !record(item) || Object.keys(item).some(key =>
+			!["description", "id", "type", "expectedSha256"].includes(key)) ||
+			!obligationIdPattern.test(String(item.id)) || !prose(item.description) ||
+			(item.type !== undefined && !obligationIdPattern.test(String(item.type))) ||
+			(item.expectedSha256 !== undefined && (typeof item.expectedSha256 !== "string" ||
+				!/^[0-9a-f]{64}$/.test(item.expectedSha256)))) ||
 		new Set(value.obligations.map(item => item.id)).size !== value.obligations.length ||
 		(value.userOverrides !== undefined && (!Array.isArray(value.userOverrides) ||
 			value.userOverrides.some(item => !prose(item)))) ||
@@ -81,11 +85,15 @@ export function publicLocalMissionStatus(progress: ObjectiveProgressV1) {
 export interface LocalObjectiveFrozenEvidence {
 	contractFile: string;
 	evidence: Array<{ name: string; file: string }>;
+	/** Host-frozen original file identities supplied to evaluator preflight. */
+	frozenOriginalInputs?: Array<{ name: string; bytes: number; sha256: string }>;
 	evidenceRoot: string;
 	capabilities: ObjectiveCapabilityV1[];
 	selectedArtifacts: string[];
 	/** Durable host review receipt. Bare check JSON cannot carry selection authority. */
 	selectionReview?: LocalObjectiveSelectionReviewV1;
+	/** Precise host-observed evaluator capability gap; no assessor call is made. */
+	evaluatorCapabilityGap?: string;
 	availableArtifacts?: string[];
 	unresolvedOperationIds: string[];
 	/** Host census of M07/M04 work not yet represented in boundedRuns. */
@@ -109,6 +117,8 @@ export interface LocalObjectiveHostPort {
 		request: { materials?: readonly LocalMaterialSelection[] }): Promise<{
 			contractFile: string; materialBundleRoot?: string }>;
 	readCheckpoint(): Promise<ObjectiveProgressV1 | undefined>;
+	/** Read-only current-evidence check; never rewrites a historical completion. */
+	verifyCurrentFulfillment(progress: ObjectiveProgressV1): Promise<void>;
 	recordCheckpoint(progress: ObjectiveProgressV1): Promise<void>;
 	/** Recheck trusted local control immediately before any new M07 dispatch. */
 	currentUnknownOperationIds(): Promise<string[]>;
@@ -126,6 +136,8 @@ export interface LocalObjectiveHostPort {
 
 export interface LocalOriginalCheck {
 	obligationId: string; passed: boolean; evidenceRefs: string[];
+	/** New receipts distinguish a failed proposition from one still unknown. */
+	result?: "passed" | "failed" | "unknown";
 }
 
 export interface LocalObjectiveSelectionReviewV1 {
@@ -136,25 +148,36 @@ export interface LocalObjectiveSelectionReviewV1 {
 	m04RunId: string;
 	selectedArtifacts: Array<{ name: string; file: string; sha256: string }>;
 	originalChecks: LocalOriginalCheck[];
+	/** Present for durable default-host reviews; old caller-authored receipts remain readable. */
+	hostEvidence?: { missionId: string; checkpointId: string; evaluatorId: string;
+		evaluatorVersion: string; evaluatorReceiptSha256: string;
+		m04SourceSha256: string; m04CoverageSha256: string;
+		m04TransactionSha256: string; checkpointManifestSha256: string;
+		requiredM07ReadPaths: string[] };
 }
 
 export interface LocalObjectiveAdvanceResult {
 	runId: string; outcome: string; acceptedTaskIds: string[];
 	selectedTaskId?: string; m04RunId?: string;
+	checkpointId?: string; evaluatorReceiptPath?: string;
+	requiredM07ReadPaths?: string[];
 	unresolvedOperationRefs?: string[];
 }
 
 function checkedOriginalChecks(contract: OriginalObjectiveContractV1, selected: readonly string[],
 	checks: readonly LocalOriginalCheck[]): LocalOriginalCheck[] {
 	const original = new Set(contract.obligations.map(item => item.id));
-	if (!Array.isArray(checks) || new Set(checks.map(item => item.obligationId)).size !== checks.length ||
+	if (!Array.isArray(checks) || checks.length !== original.size ||
+		new Set(checks.map(item => item.obligationId)).size !== checks.length ||
 		checks.some(item => !original.has(item.obligationId) || typeof item.passed !== "boolean" ||
+			(item.result !== undefined && (!["passed", "failed", "unknown"].includes(item.result) ||
+				item.passed !== (item.result === "passed"))) ||
 			!Array.isArray(item.evidenceRefs) || new Set(item.evidenceRefs).size !== item.evidenceRefs.length ||
 			item.evidenceRefs.some((ref: string) => !selected.includes(ref)) ||
 			item.passed && !item.evidenceRefs.length))
 		throw new HarnessError("local.objective.review", "original check lacks exact selected evidence or obligation authority");
 	return checks.map(item => ({ obligationId: item.obligationId, passed: item.passed,
-		evidenceRefs: [...item.evidenceRefs] }));
+		...(item.result ? { result: item.result } : {}), evidenceRefs: [...item.evidenceRefs] }));
 }
 
 async function checkedSelectionReview(workspaceRoot: string, contract: OriginalObjectiveContractV1,
@@ -242,6 +265,8 @@ export function createLocalOriginalObjectiveCaller(input: { ws: Workspace;
 		if (!progress || progress.version !== 1 || progress.kind !== "original-objective-progress" ||
 			progress.contract.id !== missionId)
 			throw new HarnessError("local.objective.missing", "local original objective checkpoint is unavailable");
+		if (progress.objectiveOutcome === "fulfilled")
+			await host.verifyCurrentFulfillment(progress);
 		return { host, progress };
 	};
 	const stepCore = async (missionId: string): Promise<{ progress: ObjectiveProgressV1;
@@ -276,6 +301,17 @@ export function createLocalOriginalObjectiveCaller(input: { ws: Workspace;
 		if (previous.boundedRuns.some(row => !frozen.boundedRunEvidence?.[row.runId]?.length ||
 			frozen.boundedRunEvidence[row.runId]!.some(name => !evidenceNames.has(name))))
 			throw new HarnessError("local.objective.history", "prior bounded-run feedback was not frozen for reassessment");
+		if (frozen.evaluatorCapabilityGap) {
+			const held = objectiveProgress(previous.contract, { boundedRuns: previous.boundedRuns,
+				selectedArtifacts: previous.selectedArtifacts,
+				availableArtifacts: frozen.availableArtifacts ?? previous.availableArtifacts,
+				assessment: previous.assessment, assessmentHistory: previous.assessmentHistory,
+				stopReason: "next-task-needs-capability", pendingActionFacts: {
+					evidenceRefs: frozen.evidence.filter(item => item.name.startsWith("host-capability-"))
+						.map(item => item.name) } });
+			await host.recordCheckpoint(held);
+			return { progress: held, advanced: false, stopReason: "next-task-needs-capability" };
+		}
 		if (ctx.signal?.aborted) {
 			const cancelled = objectiveProgress(previous.contract, { boundedRuns: previous.boundedRuns,
 				selectedArtifacts: previous.selectedArtifacts,
@@ -368,6 +404,7 @@ export function createLocalOriginalObjectiveCaller(input: { ws: Workspace;
 						!Array.isArray(result.acceptedTaskIds) ||
 						result.acceptedTaskIds.some(id => typeof id !== "string" || !id) ||
 						(result.m04RunId !== undefined && (typeof result.m04RunId !== "string" || !result.m04RunId)) ||
+						(result.checkpointId !== undefined && (typeof result.checkpointId !== "string" || !result.checkpointId)) ||
 						result.unresolvedOperationRefs !== undefined &&
 							(!Array.isArray(result.unresolvedOperationRefs) ||
 								result.unresolvedOperationRefs.some(id => typeof id !== "string" || !id)) ||

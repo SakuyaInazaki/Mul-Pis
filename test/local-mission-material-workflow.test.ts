@@ -28,7 +28,8 @@ async function fixture(t: TestContext) {
 	await writeFile(projection, projectionBytes);
 	const request = { version: 1 as const, kind: "local-original-objective-request" as const,
 		goal: "Answer the original question using supplied sources", goalSource: "verbatim-private-input" as const,
-		obligations: [{ id: "answer", description: "Support the complete answer" }],
+		obligations: [{ id: "answer", description: "Support the complete answer",
+			type: "file-sha256", expectedSha256: "0".repeat(64) }],
 		closure: "open-ended" as const,
 		materials: [
 			{ kind: "declared-file" as const, label: "Original PDF", path: pdf,
@@ -60,6 +61,7 @@ test("declared binary original and text projection survive the local host withou
 	});
 	const mission = openDefaultLocalMission({ workspaceRoot: f.root, runner,
 		config: { roles: { research: "fake/research", execution: "fake/execution" },
+			localMission: { evaluatorId: "host:file-sha256" },
 			concurrency: 1, tools: {} } });
 	const started = await mission.begin(f.request);
 	assert.deepEqual(started.contract.inputNames, ["Original PDF", "PDF text projection"]);

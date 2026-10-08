@@ -33,6 +33,18 @@ export interface FakeReply {
 
 export type FakeReplyFn = (ctx: FakeReplyContext) => FakeReply | string | Promise<FakeReply | string>;
 
+/** Offline CLI integration can install a scripted runner from trusted process
+ * bootstrap code. Objective JSON and model output cannot select this factory. */
+let trustedCliFakeRunnerFactory: (() => SessionRunner) | undefined;
+export function registerTrustedCliFakeRunnerFactory(factory: () => SessionRunner): void {
+	if (typeof factory !== "function" || trustedCliFakeRunnerFactory)
+		throw new Error("trusted CLI fake runner factory is invalid or already registered");
+	trustedCliFakeRunnerFactory = factory;
+}
+export function createTrustedCliFakeRunner(): SessionRunner | undefined {
+	return trustedCliFakeRunnerFactory?.();
+}
+
 interface FakeSessionState {
 	spec: SessionSpec;
 	ref: SessionRef;

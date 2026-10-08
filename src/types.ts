@@ -35,7 +35,7 @@ export interface ModelSpec {
 export interface HarnessConfig {
 	roles: Partial<Record<Role | "default", string>>;
 	/** Explicit local mission capability. Task-root Pi bash is not an OS sandbox. */
-	localMission?: { execution: "task-root-bash" };
+	localMission?: { execution?: "task-root-bash"; evaluatorId?: string };
 	/** Independent M03 question/evaluation sessions. Repeated models are allowed and remain distinct sessions. */
 	m03Reviewers?: Array<{ id: string; model: string }>;
 	/** Maximum number of independent stage tasks processed at the same time. Engineering default 1. */

@@ -35,7 +35,7 @@ export interface OriginalObjectiveContractV1 {
 	inputNames: string[];
 	/** User directions override conflicting requirements in supplied task material. */
 	userOverrides?: string[];
-	obligations: Array<{ id: string; description: string }>;
+	obligations: Array<{ id: string; description: string; type?: string; expectedSha256?: string }>;
 	/** Open-ended strongest-attainable work cannot be closed by a finite evaluation's checks. */
 	closure: "open-ended" | "finite-evidence";
 }
@@ -388,13 +388,15 @@ export async function runOriginalObjectiveLoop(input: {
 export function createOriginalObjective(input: {
 	goal: string; goalSource: OriginalObjectiveContractV1["goalSource"]; inputNames: string[];
 	userOverrides?: string[];
-	obligations: Array<{ id: string; description: string }>; closure: OriginalObjectiveContractV1["closure"];
+	obligations: OriginalObjectiveContractV1["obligations"]; closure: OriginalObjectiveContractV1["closure"];
 }): OriginalObjectiveContractV1 {
 	if (!nonemptyText(input.goal) || !Array.isArray(input.inputNames) || !input.inputNames.length ||
 		input.inputNames.some(name => !safeInputName(name)) ||
 		new Set(input.inputNames).size !== input.inputNames.length ||
 		!Array.isArray(input.obligations) || !input.obligations.length ||
-		input.obligations.some(item => !safeName(item.id) || !nonemptyText(item.description)) ||
+		input.obligations.some(item => !safeName(item.id) || !nonemptyText(item.description) ||
+			(item.type !== undefined && !safeName(item.type)) ||
+			(item.expectedSha256 !== undefined && !/^[0-9a-f]{64}$/.test(item.expectedSha256))) ||
 		new Set(input.obligations.map(item => item.id)).size !== input.obligations.length ||
 		!["verbatim-private-input", "user-intent-summary"].includes(input.goalSource) ||
 		!["open-ended", "finite-evidence"].includes(input.closure) ||

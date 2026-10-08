@@ -8,8 +8,11 @@ test("local execution capability requires an explicit workspace policy", () => {
 	assert.deepEqual(validateConfig({ ...base,
 		localMission: { execution: "task-root-bash" } }).localMission,
 		{ execution: "task-root-bash" });
+	assert.deepEqual(validateConfig({ ...base,
+		localMission: { evaluatorId: "host:file-sha256" } }).localMission,
+		{ evaluatorId: "host:file-sha256" });
 	for (const policy of [{ execution: "sandboxed" }, { execution: "task-root-bash", extra: true },
-		{ execution: true }, {}])
+		{ execution: true }, {}, { evaluatorId: "../untrusted-module.ts" }])
 		assert.throws(() => validateConfig({ ...base, localMission: policy }),
 			/localMission.execution/);
 });

@@ -4,6 +4,8 @@ import { latestFormalBaseline } from "./controller.ts";
 import type { LocalObjectiveAdapter } from "./local-original-objective.ts";
 import type { CurrentGoal } from "./types.ts";
 import { HarnessError } from "../types.ts";
+import { evaluateLocalM07Task, verifyLocalEvaluatorReceipt } from "./local-evaluator-run.ts";
+import { verifyDefaultM04Evidence } from "./local-selection-review.ts";
 
 export const LOCAL_M07_REASON_SCOPE = "local-m07-reason";
 export const LOCAL_M07_EXECUTE_SCOPE = "local-m07-execute";
@@ -85,9 +87,16 @@ export function createLocalM07Adapter(mode: "reason" | "execute" = "reason"): Lo
 			return { runId: goal.runId, outcome: "unknown", acceptedTaskIds: [],
 				unresolvedOperationRefs: unresolvedRefs(observed, report.taskId) };
 		}
-		await controller.review(goal.runId, { taskId: report.taskId,
+		const evaluatorId = ctx.config.localMission?.evaluatorId;
+		const evaluated = evaluatorId ? await evaluateLocalM07Task({ contract, goal: observed,
+			task: report, evidence: frozen.evidence, evaluatorId,
+			frozenOriginalInputs: frozen.frozenOriginalInputs ?? [],
+			capabilities: frozen.capabilities }) : undefined;
+		const reviewed = await controller.review(goal.runId, evaluated?.review ?? { taskId: report.taskId,
 			artifacts: [report.reportPath],
 			checks: addressed.map(criterion => ({ criterion, result: "not_run", evidence: [] })) });
+		if (evaluated) await verifyLocalEvaluatorReceipt(evaluated.receipt, contract,
+			await controller.status(goal.runId), report);
 		const checkpoint = await controller.checkpoint(goal.runId, { taskIds: [report.taskId] });
 		const manifest = JSON.parse(await readFile(checkpoint.manifestPath, "utf8")) as
 			{ problemFile?: string; rawFiles?: Array<{ name: string; relativePath: string }>;
@@ -105,10 +114,44 @@ export function createLocalM07Adapter(mode: "reason" | "execute" = "reason"): Lo
 				await readFile(path.join(checkpoint.rootDir, actual.relativePath), "utf8") !== expected.content)
 				fail("M07 checkpoint changed the frozen workspace materials");
 		}
-		await input.runM04(ctx, { feedback: { kind: "M07Checkpoint", runId: goal.runId,
-			checkpointId: checkpoint.id }, freshSession: true });
-		return { runId: goal.runId, outcome: "partial", acceptedTaskIds: [],
-			unresolvedOperationRefs: [] };
+		const passed = Boolean(evaluated && reviewed.status === "accepted" &&
+			contract.obligations.filter(item => task.addresses.includes(item.id)).every(item =>
+				evaluated.receipt.checks.some(check => check.obligationId === item.id && check.result === "passed")));
+		const eligible = passed && !goal.exploratory && goal.formalBaseline;
+		const snapshot = JSON.parse(await readFile(checkpoint.goalSnapshotPath, "utf8")) as CurrentGoal;
+		const snapTask = snapshot.tasks.find(item => item.taskId === report.taskId);
+		const m07Outcome = eligible && snapshot.tasks.some(item => item.taskId !== report.taskId &&
+			["rejected", "failed"].includes(item.status)) ? "partial" : eligible ? "fulfilled" : "partial";
+		const requiredM07ReadPaths = evaluated ? [...new Set(["goal.json", "manifest.json", "m04-feedback.md",
+			...(snapTask?.review?.artifacts ?? []).filter(item => item.mediaType === "text")
+				.map(item => path.relative(checkpoint.rootDir, item.path).replaceAll("\\", "/"))])] : undefined;
+		const m04 = await input.runM04(ctx, { feedback: { kind: "M07Checkpoint", runId: goal.runId,
+			checkpointId: checkpoint.id }, freshSession: true,
+			...(requiredM07ReadPaths ? { requiredM07ReadPaths } : {}) });
+		if (evaluated) {
+			const tx = JSON.parse(await readFile(path.join(ctx.ws.runDir("M04", m04.record.runId),
+				"m04-transaction.json"), "utf8")) as { state?: string; m04RunId?: string };
+			if (tx.m04RunId !== m04.record.runId || !["no-proposal", "merged"].includes(tx.state ?? ""))
+				fail("M04 knowledge transaction is unresolved; M07 result cannot be finished");
+			if (eligible) {
+				await verifyDefaultM04Evidence(ctx, { runId: goal.runId, outcome: "fulfilled",
+					acceptedTaskIds: [report.taskId], selectedTaskId: report.taskId,
+					checkpointId: checkpoint.id, m04RunId: m04.record.runId,
+					requiredM07ReadPaths }, checkpoint.rootDir);
+				await controller.plan(goal.runId, goal.plan, { refreshBaseline: true,
+					checkpointId: checkpoint.id, m04RunId: m04.record.runId });
+			}
+			await controller.finish(goal.runId, { outcome: m07Outcome,
+				summary: eligible ? "Host evaluator checks and full independent M04 reading are recorded; mission selection remains a separate host decision." :
+					"Bounded task remains partial or exploratory; evaluator observations do not grant mission selection.",
+				returnPath: "M04", goalChecks: reviewed.review!.checks.map(check => ({ ...check })) });
+		}
+		return { runId: goal.runId, outcome: m07Outcome,
+			acceptedTaskIds: reviewed.status === "accepted" ? [report.taskId] : [],
+			...(eligible ? { selectedTaskId: report.taskId } : {}),
+			m04RunId: m04.record.runId, checkpointId: checkpoint.id,
+			...(evaluated ? { evaluatorReceiptPath: evaluated.receiptFile,
+				requiredM07ReadPaths } : {}), unresolvedOperationRefs: [] };
 	} };
 }
 

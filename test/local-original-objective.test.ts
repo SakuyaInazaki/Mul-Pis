@@ -60,6 +60,9 @@ async function fixture(t: TestContext) {
 					...(bundle ? { materialBundleRoot: path.dirname(bundle.manifestFile) } : {}) };
 			},
 			async readCheckpoint() { return current.progress; },
+			async verifyCurrentFulfillment() {
+				throw new Error("synthetic host has no current-validity authority for fulfillment");
+			},
 			async recordCheckpoint(progress) {
 				current.writes++;
 				if (current.failFinal && current.writes === 4) throw new Error("synthetic final checkpoint write failed");
