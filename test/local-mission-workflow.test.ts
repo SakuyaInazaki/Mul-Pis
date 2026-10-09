@@ -186,7 +186,7 @@ test("default assessor can pass a bounded task check while the original open-end
 		async preflight() { return { available: true }; },
 		async evaluate({ contract, observationOutputDir }) {
 			await writeFile(path.join(observationOutputDir, "observation-bounded.txt"),
-				"The declared bounded check passed; the broader question remains open.\n");
+				"The declared bounded check passed; the broader question remains open.\n", { mode: 0o600 });
 			return { observations: [{ name: "observation-bounded.txt", kind: "text" }],
 				checks: contract.obligations.map(item => ({ obligationId: item.id,
 					result: item.id === "bounded" ? "passed" as const : "unknown" as const,
