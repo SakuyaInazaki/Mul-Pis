@@ -180,6 +180,109 @@ test("local mission freezes authored inputs, reviews a bounded reason result, an
 	assert(!publicStatus.includes("negative, unselected"));
 });
 
+test("default assessor can pass a bounded task check while the original open-ended obligation remains unresolved", async t => {
+	registerTrustedLocalMissionEvaluator({ id: "test:bounded-task-open-goal", version: "1",
+		supportedObligationTypes: ["synthetic-open"],
+		async preflight() { return { available: true }; },
+		async evaluate({ contract, observationOutputDir }) {
+			await writeFile(path.join(observationOutputDir, "observation-bounded.txt"),
+				"The declared bounded check passed; the broader question remains open.\n");
+			return { observations: [{ name: "observation-bounded.txt", kind: "text" }],
+				checks: contract.obligations.map(item => ({ obligationId: item.id,
+					result: item.id === "bounded" ? "passed" as const : "unknown" as const,
+					evidenceRefs: ["observation-bounded.txt"],
+					limitations: ["No result establishes the broader question"] })),
+				limitations: ["The broad obligation remains unverified"] };
+		} });
+	const root = await mkdtemp(path.join(os.tmpdir(), "local-mission-bounded-check-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const ws = new Workspace(root);
+	await mkdir(path.dirname(ws.problemFile), { recursive: true });
+	await writeFile(ws.problemFile, "Check one bounded fact while a broad question remains open.\n");
+	await runInit(ws, createFileKnowledgeStore(ws.knowledgeDir));
+	const bounded = "Verify the declared bounded fact against the supplied observation";
+	const broad = "Find the strongest answer across the open search space";
+	let missionId = "";
+	let prompts = 0;
+	const readAll = async (directory: string, toolName: string): Promise<ReadReturnEvent[]> => {
+		const events: ReadReturnEvent[] = [];
+		const visit = async (folder: string): Promise<void> => {
+			for (const name of await readdir(folder)) {
+				const file = path.join(folder, name);
+				if ((await stat(file)).isDirectory()) { await visit(file); continue; }
+				const bytes = await readFile(file);
+				if (bytes.length) events.push({ toolName, status: "returned",
+					path: path.relative(directory, file).replaceAll("\\", "/"), requested: {},
+					returned: { kind: "text", startLine: 1, endLine: lines(bytes), truncated: false },
+					at: new Date().toISOString() });
+			}
+		};
+		await visit(directory); return events;
+	};
+	const runner = new FakeSessionRunner(async ({ spec, message }) => {
+		if (spec.label.startsWith("local-original-objective-")) {
+			prompts++;
+			assert(message.includes("each selected original obligation becomes a mandatory check"));
+			assert(message.includes("You may choose a strict subset"));
+			assert.equal(spec.tools.kind, "read-dir");
+			if (spec.tools.kind !== "read-dir") throw new Error("assessor read grant missing");
+			const refs = [{ sourceId: "original-problem.txt", startLine: 1, endLine: 1 }];
+			const issues = [
+				{ id: "bounded-issue", claim: "The bounded fact is not yet verified", status: "open",
+					classification: "explicit-requirement", sourceRefs: refs,
+					implication: "A local observation can settle this check" },
+				{ id: "broad-issue", claim: "The broad search remains open", status: "open",
+					classification: "explicit-requirement", sourceRefs: refs,
+					implication: "Finite local evidence cannot close the search" },
+			];
+			return { text: JSON.stringify({ version: 1, decision: "continue",
+				rationale: "Test the bounded fact and retain the broader question as open.",
+				evidenceRefs: ["original-problem.txt"], unresolvedObligations: ["bounded", "broad"],
+				unresolvedDetails: issues.map(item => item.claim), groundedAssessment: { version: 1,
+					kind: "grounded-assessment-proposal", contractId: missionId,
+					missionStatus: "open", issues, legacyOpenDetails: [],
+					nextTask: { objective: "Test only the declared bounded fact",
+						obligationIds: ["bounded"], addresses: ["bounded-issue"],
+						adapterScope: "local-m07-reason",
+						decisionChangingHypothesis: "The local observation can pass the bounded check",
+						expectedEvidence: "A host result for the bounded fact", sourceRefs: refs } } }),
+				readReturns: await readAll(spec.tools.root, "objective_evidence_read") };
+		}
+		if (spec.label.startsWith("M07-")) return "A bounded result with a remaining broad gap.";
+		if (spec.label === "M04-research") {
+			assert.equal(spec.tools.kind, "read-dir");
+			if (spec.tools.kind !== "read-dir") throw new Error("M04 read grant missing");
+			return { text: "The bounded check passed; the broad search stays open.",
+				readReturns: await readAll(spec.tools.root, "m07_evidence_read") };
+		}
+		throw new Error(`unexpected fake session ${spec.label}`);
+	});
+	const mission = openDefaultLocalMission({ workspaceRoot: root, runner,
+		config: { roles: { research: "fake/research", execution: "fake/execution" },
+			localMission: { evaluatorId: "test:bounded-task-open-goal" }, concurrency: 1, tools: {} } });
+	const started = await mission.begin({ version: 1, kind: "local-original-objective-request",
+		goal: "Resolve the original bounded and broad questions", goalSource: "verbatim-private-input",
+		obligations: [{ id: "bounded", description: bounded, type: "synthetic-open" },
+			{ id: "broad", description: broad, type: "synthetic-open" }], closure: "open-ended" });
+	missionId = started.contract.id;
+	const progress = await mission.step(missionId);
+	assert.equal(prompts, 1);
+	assert.equal(progress.objectiveOutcome, "incomplete");
+	assert.deepEqual(progress.assessment?.unresolvedObligations, ["bounded", "broad"]);
+	assert.equal(progress.boundedRuns.length, 1);
+	const goal = JSON.parse(await readFile(path.join(ws.runDir("M07", progress.boundedRuns[0]!.runId),
+		"goal.json"), "utf8")) as { successCriteria: string[]; tasks: Array<{ checks: string[];
+		status: string }> };
+	assert.deepEqual(goal.successCriteria, [bounded]);
+	assert.deepEqual(goal.tasks[0]?.checks, [bounded]);
+	assert.equal(goal.tasks[0]?.status, "accepted");
+	const receipt = JSON.parse(await readFile(path.join(ws.runDir("M07", progress.boundedRuns[0]!.runId),
+		"tasks/T001/work/local-evaluator-receipt.json"), "utf8")) as
+		{ checks: Array<{ obligationId: string; result: string }> };
+	assert.deepEqual(receipt.checks.map(item => [item.obligationId, item.result]),
+		[["bounded", "passed"], ["broad", "unknown"]]);
+});
+
 test("local host repair evidence refuses assessment before the first model prompt", async t => {
 	const root = await mkdtemp(path.join(os.tmpdir(), "local-mission-lock-"));
 	t.after(() => rm(root, { recursive: true, force: true }));

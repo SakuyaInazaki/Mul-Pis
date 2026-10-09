@@ -1,6 +1,6 @@
-import { createReadStream, createWriteStream } from "node:fs";
+import { constants, createReadStream, createWriteStream } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { chmod, copyFile, cp, lstat, mkdir, readFile, readdir, realpath, rmdir, stat, unlink } from "node:fs/promises";
+import { chmod, copyFile, cp, link, lstat, mkdir, open, readFile, readdir, realpath, rename, rmdir, stat, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import { Transform } from "node:stream";
@@ -25,14 +25,300 @@ import { probeProcessIdentity, readCurrentProcessIdentity, type ProcessIdentityV
 import { parseRunDescriptor, type RunDescriptorV1 } from "../runtime/run-descriptor.ts";
 import { parseRoundReview } from "./execution-loop.ts";
 import { openBoundedSession, type EvidenceBindingV1 } from "../context/boundary.ts";
+import type { Workspace } from "../workspace.ts";
+import { failedM04Feedback, resolveM04Baseline, type FormalBaseline } from "./formal-baseline.ts";
+export type { FormalBaseline } from "./formal-baseline.ts";
 
 const STATE = "goal.json";
 const HOST_STOP_KEY = Symbol("m07-host-stop");
 const HOST_STOP_REASONS: ReadonlySet<HostStopReasonKind> = new Set(["request-aborted", "provider-error", "session-shutdown", "no-progress"]);
 const dispatchQueues = new Map<string, Promise<void>>();
 
-/** One M07 task dispatch per goal at a time, including shared benchmark operations. A stale cross-process lock fails closed. */
-async function withGoalDispatch<T>(ctx: StageContext, runId: string, body: () => Promise<T>): Promise<T> {
+type DispatchLock = Readonly<{ version: 1; kind: "m07-goal-dispatch-lock";
+	goalRunId: string; owner: ProcessIdentityV1 }>;
+type RecoveryClaim = Readonly<{ version: 1; kind: "m07-dispatch-recovery-claim";
+	goalRunId: string; sequence: number; owner: ProcessIdentityV1;
+	target: { dev: number; ino: number; owner: ProcessIdentityV1 } }>;
+type RecoveryTerminal = Readonly<{ version: 1; kind: "m07-dispatch-recovery-terminal";
+	goalRunId: string; sequence: number; result: "released" | "aborted" }>;
+const dispatchLockBytes = (lock: DispatchLock): Buffer => Buffer.from(`${JSON.stringify(lock)}\n`, "utf8");
+const sameIdentity = (a: ProcessIdentityV1, b: ProcessIdentityV1): boolean =>
+	a.hostId === b.hostId && a.bootId === b.bootId && a.pid === b.pid &&
+	a.processStartToken === b.processStartToken;
+function validProcessIdentity(value: unknown): value is ProcessIdentityV1 {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const row = value as Record<string, unknown>;
+	return Object.keys(row).sort().join("|") === "bootId|hostId|pid|processStartToken" &&
+		Number.isSafeInteger(row.pid) && Number(row.pid) > 0 &&
+		["hostId", "bootId", "processStartToken"].every(key =>
+			typeof row[key] === "string" && (row[key] as string).length > 0 &&
+			(row[key] as string).length <= 512 && !/[\0\r\n]/.test(row[key] as string));
+}
+async function syncDispatchDirectory(directory: string): Promise<void> {
+	const handle = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+	try { await handle.sync(); } finally { await handle.close(); }
+}
+async function optionalNoFollowBytes(file: string, maximum: number,
+	maximumLinks = 1): Promise<Buffer | undefined> {
+	let handle;
+	try { handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
+	catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+	try {
+		const before = await handle.stat();
+		if (!before.isFile() || before.nlink < 1 || before.nlink > maximumLinks ||
+			(before.mode & 0o777) !== 0o600 ||
+			before.size < 1 || before.size > maximum)
+			throw new HarnessError("m07.concurrent", "recovery claim contains unsafe bytes");
+		const bytes = await handle.readFile();
+		const after = await handle.stat();
+		if (bytes.length !== before.size || before.dev !== after.dev || before.ino !== after.ino ||
+			before.size !== after.size || before.mtimeMs !== after.mtimeMs)
+			throw new HarnessError("m07.concurrent", "recovery claim changed while reading");
+		return bytes;
+	} finally { await handle.close(); }
+}
+async function writePrivateRecord(file: string, value: unknown): Promise<void> {
+	const bytes = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+	if (bytes.length > 4096) throw new HarnessError("m07.concurrent", "recovery claim exceeds byte bound");
+	const handle = await open(file,
+		constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+	try { await handle.writeFile(bytes); await handle.sync(); }
+	finally { await handle.close(); }
+}
+async function readRecoveryClaims(directory: string, runId: string): Promise<Array<{
+	claim: RecoveryClaim; terminal?: RecoveryTerminal }>> {
+	const root = path.join(directory, ".delegate-recovery-claims");
+	let info;
+	try { info = await lstat(root); }
+	catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+	if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o077) !== 0)
+		throw new HarnessError("m07.concurrent", "recovery claim directory is unsafe");
+	const entries = await readdir(root);
+	if (entries.some(name => !/^C[0-9]{6,}$/.test(name) &&
+		!/^\.prepare-[0-9a-f-]{36}$/.test(name)))
+		throw new HarnessError("m07.concurrent", "recovery claim directory has an unknown member");
+	const names = entries.filter(name => /^C[0-9]{6,}$/.test(name))
+		.sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)));
+	const rows: Array<{ claim: RecoveryClaim; terminal?: RecoveryTerminal }> = [];
+	for (const [index, name] of names.entries()) {
+		if (name !== `C${String(index + 1).padStart(6, "0")}`)
+			throw new HarnessError("m07.concurrent", "recovery claim sequence is not contiguous");
+		const claimDir = path.join(root, name);
+		const claimInfo = await lstat(claimDir);
+		if (!claimInfo.isDirectory() || claimInfo.isSymbolicLink() || (claimInfo.mode & 0o077) !== 0)
+			throw new HarnessError("m07.concurrent", "recovery claim is not a private directory");
+		const members = await readdir(claimDir);
+		if (members.some(member => !["owner.json", "terminal.json"].includes(member) &&
+			!/^\.terminal-[0-9a-f-]{36}$/.test(member)))
+			throw new HarnessError("m07.concurrent", "recovery claim has an unknown member");
+		const bytes = await optionalNoFollowBytes(path.join(claimDir, "owner.json"), 4096);
+		if (!bytes) throw new HarnessError("m07.concurrent", "recovery claim owner is missing");
+		let parsed: unknown;
+		try { parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); }
+		catch { throw new HarnessError("m07.concurrent", "recovery claim owner is invalid"); }
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
+			Object.keys(parsed).sort().join("|") !== "goalRunId|kind|owner|sequence|target|version")
+			throw new HarnessError("m07.concurrent", "recovery claim owner is invalid");
+		const row = parsed as Record<string, unknown>;
+		const target = row.target as Record<string, unknown> | undefined;
+		if (row.version !== 1 || row.kind !== "m07-dispatch-recovery-claim" ||
+			row.goalRunId !== runId || row.sequence !== index + 1 || !validProcessIdentity(row.owner) ||
+			!target || typeof target !== "object" || Array.isArray(target) ||
+			Object.keys(target).sort().join("|") !== "dev|ino|owner" ||
+			!Number.isSafeInteger(target.dev) || Number(target.dev) < 0 ||
+			!Number.isSafeInteger(target.ino) || Number(target.ino) < 0 ||
+			!validProcessIdentity(target.owner) ||
+			!bytes.equals(Buffer.from(`${JSON.stringify(row)}\n`, "utf8")))
+			throw new HarnessError("m07.concurrent", "recovery claim owner or target is invalid");
+		const claim = row as RecoveryClaim;
+		const terminalBytes = await optionalNoFollowBytes(path.join(claimDir, "terminal.json"), 4096, 2);
+		let terminal: RecoveryTerminal | undefined;
+		if (terminalBytes) {
+			let value: unknown;
+			try { value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(terminalBytes)); }
+			catch { throw new HarnessError("m07.concurrent", "recovery terminal is invalid"); }
+			if (!value || typeof value !== "object" || Array.isArray(value) ||
+				Object.keys(value).sort().join("|") !== "goalRunId|kind|result|sequence|version")
+				throw new HarnessError("m07.concurrent", "recovery terminal is invalid");
+			const parsedTerminal = value as RecoveryTerminal;
+			if (parsedTerminal.version !== 1 || parsedTerminal.kind !== "m07-dispatch-recovery-terminal" ||
+				parsedTerminal.goalRunId !== runId || parsedTerminal.sequence !== claim.sequence ||
+				!["released", "aborted"].includes(parsedTerminal.result) ||
+				!terminalBytes.equals(Buffer.from(`${JSON.stringify(parsedTerminal)}\n`, "utf8")))
+				throw new HarnessError("m07.concurrent", "recovery terminal identity is invalid");
+			terminal = parsedTerminal;
+		}
+		rows.push({ claim, ...(terminal ? { terminal } : {}) });
+	}
+	return rows;
+}
+async function publishRecoveryClaim(directory: string, claim: RecoveryClaim): Promise<void> {
+	const root = path.join(directory, ".delegate-recovery-claims");
+	try { await mkdir(root, { mode: 0o700 }); await syncDispatchDirectory(directory); }
+	catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+	const rootInfo = await lstat(root);
+	if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink() || (rootInfo.mode & 0o077) !== 0)
+		throw new HarnessError("m07.concurrent", "recovery claim directory is unsafe");
+	const prepared = path.join(root, `.prepare-${randomUUID()}`);
+	await mkdir(prepared, { mode: 0o700 });
+	await writePrivateRecord(path.join(prepared, "owner.json"), claim);
+	await syncDispatchDirectory(prepared);
+	try {
+		await rename(prepared, path.join(root, `C${String(claim.sequence).padStart(6, "0")}`));
+		await syncDispatchDirectory(root);
+	} catch (error) {
+		if (["EEXIST", "ENOTEMPTY"].includes((error as NodeJS.ErrnoException).code ?? ""))
+			throw new HarnessError("m07.concurrent", "another dispatch recovery claimed this goal");
+		throw error;
+	}
+}
+async function writeRecoveryTerminal(directory: string, terminal: RecoveryTerminal): Promise<void> {
+	const root = path.join(directory, ".delegate-recovery-claims",
+		`C${String(terminal.sequence).padStart(6, "0")}`);
+	const temporary = path.join(root, `.terminal-${randomUUID()}`);
+	await writePrivateRecord(temporary, terminal);
+	try {
+		await link(temporary, path.join(root, "terminal.json"));
+		await syncDispatchDirectory(root);
+	} finally {
+		await unlink(temporary);
+		await syncDispatchDirectory(root);
+	}
+}
+async function recoveryPending(directory: string, runId: string): Promise<boolean> {
+	const latest = (await readRecoveryClaims(directory, runId)).at(-1);
+	return !!latest && !latest.terminal;
+}
+async function readDispatchLock(file: string, runId: string): Promise<{ lock: DispatchLock; dev: number; ino: number }> {
+	let handle;
+	try { handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
+	catch { throw new HarnessError("m07.concurrent", "dispatch lock is absent or unsafe; inspect it before recovery"); }
+	try {
+		const before = await handle.stat();
+		if (!before.isFile() || before.nlink < 1 || before.nlink > 2 ||
+			(before.mode & 0o777) !== 0o600 || before.size < 1 || before.size > 2048)
+			throw new HarnessError("m07.concurrent", "legacy or malformed dispatch lock requires manual review");
+		const bytes = await handle.readFile();
+		const after = await handle.stat();
+		if (bytes.length !== before.size || before.dev !== after.dev || before.ino !== after.ino ||
+			before.size !== after.size || before.mtimeMs !== after.mtimeMs)
+			throw new HarnessError("m07.concurrent", "dispatch lock changed while reading");
+		let value: unknown;
+		try { value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); }
+		catch { throw new HarnessError("m07.concurrent", "legacy or malformed dispatch lock requires manual review"); }
+		if (!value || typeof value !== "object" || Array.isArray(value) ||
+			Object.keys(value).sort().join("|") !== "goalRunId|kind|owner|version")
+			throw new HarnessError("m07.concurrent", "legacy or malformed dispatch lock requires manual review");
+		const row = value as Record<string, unknown>;
+		if (row.version !== 1 || row.kind !== "m07-goal-dispatch-lock" ||
+			row.goalRunId !== runId || !validProcessIdentity(row.owner) ||
+			!bytes.equals(dispatchLockBytes(row as DispatchLock)))
+			throw new HarnessError("m07.concurrent", "dispatch lock identity or bytes do not match this goal");
+		return { lock: row as DispatchLock, dev: before.dev, ino: before.ino };
+	} finally { await handle.close(); }
+}
+async function publishDispatchLock(file: string, lock: DispatchLock): Promise<{ dev: number; ino: number }> {
+	const directory = path.dirname(file);
+	const temporary = path.join(directory, `.delegate-lock.prepare-${randomUUID()}`);
+	const handle = await open(temporary,
+		constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+	try { await handle.writeFile(dispatchLockBytes(lock)); await handle.sync(); }
+	finally { await handle.close(); }
+	let published = false;
+	try {
+		// link is exclusive: rename could replace an existing empty legacy directory.
+		await link(temporary, file);
+		published = true;
+		await syncDispatchDirectory(directory);
+		await unlink(temporary);
+		await syncDispatchDirectory(directory);
+		const info = await lstat(file);
+		if (!info.isFile()) throw new HarnessError("m07.concurrent", "published dispatch lock is not a file");
+		return { dev: info.dev, ino: info.ino };
+	} catch (error) {
+		if (!published) await unlink(temporary).catch(() => undefined);
+		if ((error as NodeJS.ErrnoException).code === "EEXIST")
+			throw new HarnessError("m07.concurrent", "another process owns this goal's task dispatch; reconcile the lock separately");
+		throw error;
+	}
+}
+async function releaseDispatchLock(file: string, lock: DispatchLock, inode: { dev: number; ino: number }): Promise<void> {
+	const current = await readDispatchLock(file, lock.goalRunId);
+	if (current.dev !== inode.dev || current.ino !== inode.ino ||
+		!sameIdentity(current.lock.owner, lock.owner))
+		throw new HarnessError("m07.concurrent", "dispatch lock changed before owner release");
+	await unlink(file);
+	await syncDispatchDirectory(path.dirname(file));
+}
+
+/** Exact stale cleanup after an independent death proof. This never resumes a task or model call. */
+export async function recoverM07DispatchLock(input: { ws: Workspace; runId: string;
+	expectedOwner: ProcessIdentityV1; currentIdentity?: () => Promise<ProcessIdentityV1>;
+	verifiedRecoveryOwners?: readonly ProcessIdentityV1[];
+	probePrior?: typeof probeProcessIdentity }): Promise<void> {
+	if (!validProcessIdentity(input.expectedOwner) || !input.runId ||
+		/[/\\\0]/.test(input.runId) || input.runId === "." || input.runId === "..")
+		throw new HarnessError("m07.concurrent", "dispatch recovery identity is invalid");
+	const permittedOwners = [input.expectedOwner, ...(input.verifiedRecoveryOwners ?? [])];
+	if (permittedOwners.some(owner => !validProcessIdentity(owner) ||
+		owner.hostId !== input.expectedOwner.hostId || owner.bootId !== input.expectedOwner.bootId))
+		throw new HarnessError("m07.concurrent", "verified dispatch recovery owner is invalid");
+	const permitted = (owner: ProcessIdentityV1): boolean =>
+		permittedOwners.some(candidate => sameIdentity(candidate, owner));
+	const directory = input.ws.runDir("M07", input.runId);
+	const file = path.join(directory, ".delegate-lock");
+	const current = await (input.currentIdentity ?? readCurrentProcessIdentity)();
+	if (!validProcessIdentity(current) || current.hostId !== input.expectedOwner.hostId ||
+		current.bootId !== input.expectedOwner.bootId)
+		throw new HarnessError("m07.concurrent", "dispatch owner is from another host or boot");
+	const prior = (await readRecoveryClaims(directory, input.runId)).at(-1);
+	let observed: Awaited<ReturnType<typeof readDispatchLock>> | undefined;
+	try { await lstat(file); observed = await readDispatchLock(file, input.runId); }
+	catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+	if (observed && !permitted(observed.lock.owner))
+		throw new HarnessError("m07.concurrent", "dispatch owner differs from the expected attempt or verified recovery chain");
+	if (prior && !prior.terminal) {
+		if (!permitted(prior.claim.target.owner) ||
+			(observed && (prior.claim.target.dev !== observed.dev || prior.claim.target.ino !== observed.ino)))
+			throw new HarnessError("m07.concurrent", "pending recovery claim targets another dispatch lock");
+		if (prior.claim.owner.hostId !== current.hostId || prior.claim.owner.bootId !== current.bootId)
+			throw new HarnessError("m07.concurrent", "recovery claimer is from another host or boot");
+		const priorProbe = await (input.probePrior ?? probeProcessIdentity)(prior.claim.owner);
+		if (priorProbe.status !== "dead" || priorProbe.identityMatch)
+			throw new HarnessError("m07.concurrent", "recovery claimer is live, reused, or uncertain");
+	}
+	if (!observed && (!prior || !permitted(prior.claim.target.owner)))
+		throw new HarnessError("m07.concurrent", "dispatch lock is absent without exact recovery history");
+	if (!observed && prior?.terminal?.result === "released") return;
+	const target = observed ? { dev: observed.dev, ino: observed.ino,
+		owner: observed.lock.owner } : prior!.claim.target;
+	const claim: RecoveryClaim = { version: 1, kind: "m07-dispatch-recovery-claim",
+		goalRunId: input.runId, sequence: (prior?.claim.sequence ?? 0) + 1,
+		owner: current, target };
+	await publishRecoveryClaim(directory, claim);
+	let result: RecoveryTerminal["result"] = "aborted";
+	try {
+		if (!observed) { result = "released"; return; }
+		const probe = await (input.probePrior ?? probeProcessIdentity)(observed.lock.owner);
+		if (probe.status !== "dead" || probe.identityMatch)
+			throw new HarnessError("m07.concurrent", "dispatch owner is live, reused, or uncertain");
+		const again = await readDispatchLock(file, input.runId);
+		if (again.dev !== target.dev || again.ino !== target.ino ||
+			!sameIdentity(again.lock.owner, observed.lock.owner))
+			throw new HarnessError("m07.concurrent", "dispatch lock changed during recovery");
+		await unlink(file);
+		await syncDispatchDirectory(directory);
+		result = "released";
+	} finally {
+		await writeRecoveryTerminal(directory, { version: 1,
+			kind: "m07-dispatch-recovery-terminal", goalRunId: input.runId,
+			sequence: claim.sequence, result });
+	}
+}
+
+/** One M07 dispatch per goal. Lock cleanup never starts a task. */
+async function withGoalDispatch<T>(ctx: StageContext, runId: string, body: () => Promise<T>,
+	processIdentity: () => Promise<ProcessIdentityV1>): Promise<T> {
 	const key = ctx.ws.runDir("M07", runId);
 	const prior = dispatchQueues.get(key) ?? Promise.resolve();
 	let release!: () => void;
@@ -40,17 +326,21 @@ async function withGoalDispatch<T>(ctx: StageContext, runId: string, body: () =>
 	const tail = prior.then(() => turn);
 	dispatchQueues.set(key, tail);
 	await prior;
-	const lockDir = path.join(key, ".delegate-lock");
-	let acquired = false;
+	const lockFile = path.join(key, ".delegate-lock");
+	let acquired: { dev: number; ino: number } | undefined;
+	let lock: DispatchLock | undefined;
 	try {
-		try { await mkdir(lockDir); acquired = true; }
-		catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new HarnessError("m07.concurrent", "another process owns this goal's task dispatch; verify it has stopped before retrying");
-			throw error;
-		}
+		const owner = await processIdentity();
+		if (!validProcessIdentity(owner)) throw new HarnessError("m07.concurrent", "current dispatch owner identity is invalid");
+		lock = { version: 1, kind: "m07-goal-dispatch-lock", goalRunId: runId, owner };
+		if (await recoveryPending(key, runId))
+			throw new HarnessError("m07.concurrent", "dispatch lock recovery is active or incomplete");
+		acquired = await publishDispatchLock(lockFile, lock);
+		if (await recoveryPending(key, runId))
+			throw new HarnessError("m07.concurrent", "dispatch lock recovery is active or incomplete");
 		return await body();
 	} finally {
-		try { if (acquired) await rmdir(lockDir); }
+		try { if (acquired && lock) await releaseDispatchLock(lockFile, lock, acquired); }
 		finally { release(); if (dispatchQueues.get(key) === tail) dispatchQueues.delete(key); }
 	}
 }
@@ -293,39 +583,18 @@ async function verifyFrozenWorkflowMethod(ctx: StageContext, goal: CurrentGoal, 
 	await verifyRequiredKnowledge(ctx.ws.root, [...refs.values()], goal.knowledgeSnapshot, registeredStores);
 }
 
-export interface FormalBaseline { run: StageRunRecord; knowledgeSnapshot?: string }
-
 export async function latestFormalBaseline(ctx: StageContext): Promise<FormalBaseline | undefined> {
-	let run: StageRunRecord | undefined;
-	try { run = await ctx.ws.latestRun("M04"); }
-	catch (error) {
-		if (error instanceof HarnessError && error.code === "run.order") throw new HarnessError("m07.baseline", "无法确定最新正式基线；M04 创建顺序存在歧义，不得回退到任一候选");
-		throw error;
-	}
-	if (!run) return undefined;
-	if (run.status !== "completed") throw new HarnessError("m07.baseline", `最新 M04 运行 ${run.runId} 状态为 ${run.status}，不得回退到更旧基线`);
-	if (run.failures.length) throw new HarnessError("m07.baseline", `最新 M04 运行 ${run.runId} 含未解决失败，不能作为正式基线：${run.failures.join("；")}`);
-	const proposal = run.outputs.find((item) => item.label === "知识提案");
-	const merge = run.outputs.find((item) => item.label === "合入结果");
-	if (proposal && !merge) throw new HarnessError("m07.baseline", `最新 M04 运行 ${run.runId} 产生了知识提案但未成功合入，不能作为正式基线`);
-	let knowledgeSnapshot = run.knowledgeSnapshot;
-	if (merge) {
-		try {
-			const parsed = JSON.parse(await readFile(merge.path, "utf8")) as { snapshot?: { id?: unknown } };
-			if (typeof parsed.snapshot?.id !== "string" || !parsed.snapshot.id) throw new Error("缺少 snapshot.id");
-			knowledgeSnapshot = parsed.snapshot.id;
-		} catch (error) {
-			throw new HarnessError("m07.baseline", `最新 M04 运行 ${run.runId} 的合入结果无法确定知识快照，不能作为正式基线：${(error as Error).message}`);
-		}
-	}
-	return { run, knowledgeSnapshot };
+	return (await resolveM04Baseline(ctx)).baseline;
 }
 
 async function requireCurrentFormalBaseline(ctx: StageContext, goal: CurrentGoal): Promise<void> {
-	if (!goal.formalBaseline) return;
-	const baseline = await latestFormalBaseline(ctx);
-	if (!baseline || baseline.run.runId !== goal.m04BaselineRunId || baseline.knowledgeSnapshot !== goal.knowledgeSnapshot) {
-		throw new HarnessError("m07.baseline", `M07 目标 ${goal.runId} 的正式基线已不是最新可用 M04；先处理最新运行并显式刷新基线`);
+	if (!goal.formalBaseline && !goal.m04BaselineFailures?.length) return;
+	const resolved = await resolveM04Baseline(ctx);
+	const baseline = resolved.baseline;
+	if (JSON.stringify(resolved.failedM04) !== JSON.stringify(goal.m04BaselineFailures ?? []) ||
+		resolved.knowledgeSnapshot !== goal.knowledgeSnapshot ||
+		(baseline?.run.runId ?? null) !== (goal.m04BaselineRunId ?? null)) {
+		throw new HarnessError("m07.baseline", `M07 目标 ${goal.runId} 的正式基线或失败 M04 历史已变化；先处理最新运行并显式刷新基线`);
 	}
 }
 
@@ -499,6 +768,7 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string,
 	const boundary = [
 		section("冻结的当前目标", goal.goal),
 		section("与原问题关系", goal.problemRelation),
+		...(goal.m04BaselineFailures?.length ? [section("Retained failed M04 feedback", failedM04Feedback(goal.m04BaselineFailures))] : []),
 		section("不可变约束", goal.constraints.map((x) => `- ${x}`).join("\n")),
 		section("原目标成功要求（本任务不得改写）", goal.successCriteria.map((x) => `- ${x}`).join("\n")),
 		section("本任务创建时的目标计划", goal.plan),
@@ -539,6 +809,7 @@ async function writeFeedback(ctx: StageContext, goal: CurrentGoal, limits: Proje
 		...(checkpointRoot ? ["- 这是 active 目标的非终态开发 checkpoint；不改变原成功要求，不表示 fulfilled，也不表示 M04 已核验全部证据。", "- 本次 M04 只允许读取本 checkpoint 冻结目录，所有材料路径均相对于该目录。", ""] : []),
 		...(goal.checkpointScope ? [`- 本批已选任务 ${goal.checkpointScope.selectedTaskIds.length}：${goal.checkpointScope.selectedTaskIds.slice(0, 20).join("、") || "无"}${goal.checkpointScope.selectedTaskIds.length > 20 ? "（其余见 manifest.json）" : ""}；未选任务 ${goal.checkpointScope.omittedTaskIds.length}：${goal.checkpointScope.omittedTaskIds.slice(0, 20).join("、") || "无"}${goal.checkpointScope.omittedTaskIds.length > 20 ? "（其余见 manifest.json）" : ""}。未选任务的评审证据未交接，完整任务范围见 manifest.json。`, ""] : []),
 		...(goal.workflowMethod ? [`- 实际装载的 M07 方法：${goal.workflowMethod.versionId}（${goal.workflowMethod.artifact.slot}）；仅作为研究方法，不改变原成功要求或 M04 科学判断。`, ""] : []),
+		...(goal.m04BaselineFailures?.length ? ["## Retained failed M04 feedback", "", failedM04Feedback(goal.m04BaselineFailures), ""] : []),
 		"## 原成功要求", "", ...goal.successCriteria.map((x) => `- ${x}`), "", "## 任务与实际证据", "",
 	];
 	if (goal.workflowMethod?.artifact.slot === "evidence-handoff") lines.push("## 冻结的证据交接方法", "", "以下方法正文曾作为 M07 任务指导；这里保留其版本与内容以供 M04 核对，实际证据与未执行项仍以本包记录为准。", "", goal.workflowMethod.artifact.body, "");
@@ -652,6 +923,7 @@ async function writeBoundedFeedbackIndex(ctx: StageContext, goal: CurrentGoal, m
 		mode === "checkpoint" ? "- 目标仍 active；M07 run 仍 running。本快照不是目标终态，也不证明原成功要求已满足。" : `- 目标终态：${goal.outcome ?? "未知"}；M07 run 终态：${mode === "interrupt" || goal.outcome === "blocked" ? "failed" : "completed"}。目标结果由控制器硬检查确定，本索引不新增科学结论。`,
 		`- 任务总数：${goal.tasks.length}；状态计数：${[...taskCounts].map(([status, count]) => `${status}=${count}`).join("，") || "无任务"}。`,
 		`- 完整控制记录：${STATE}（含任务、工具日志、目标检查、限制及原始引用）；M04 可用 m07_evidence_read 对 goal.json 按 offset/limit 分段实际读取。`,
+		...(goal.m04BaselineFailures?.length ? [`- Retained failed M04 feedback: ${goal.m04BaselineFailures.map(item => `${item.runId}:${item.transactionState}`).join(", ")}; full failure details remain in goal.json, with no adoption from those runs.`] : []),
 		"- 原证据位置：请按 goal.json 的各任务 reportPath、review.frozenReportPath、review.artifacts 与 review.checks.evidence 定位；文件内容未由本包读取。",
 		"- 省略类别：目标与任务长文本、工具日志、检查明细、产物正文、逐项证据清单；没有把这些内容截断后冒充完整反馈。",
 		`- 完整反馈失败类别：${goal.feedbackError?.code ?? "unknown"}；详情见 goal.json 的 feedbackError。`,
@@ -720,7 +992,7 @@ async function freezeCheckpoint(ctx: StageContext, goal: CurrentGoal, limits: Pr
 	await copy(goal.problemSnapshotPath, problemFile, "problem");
 	const rawFiles: Array<{ name: string; relativePath: string }> = [];
 	const skippedRaw: string[] = [];
-	if (existsSync(ctx.ws.rawDir)) {
+	if (goal.checkpointRawScope !== "none" && existsSync(ctx.ws.rawDir)) {
 		const rawNames = (await readdir(ctx.ws.rawDir)).sort();
 		for (const name of rawNames) {
 			const source = path.join(ctx.ws.rawDir, name);
@@ -795,15 +1067,17 @@ async function freezeCheckpoint(ctx: StageContext, goal: CurrentGoal, limits: Pr
 export function createM07Controller(ctx: StageContext, options: { projectionSnapshotLimits?: ProjectionSnapshotLimits; registeredExperienceStores?: ReadonlyMap<string, KnowledgeStore>; processIdentity?: () => Promise<ProcessIdentityV1>; probeProcess?: typeof probeProcessIdentity } = {}): M07Controller {
 	const snapshotLimits = options.projectionSnapshotLimits ?? DEFAULT_PROJECTION_SNAPSHOT_LIMITS;
 	if (!Number.isSafeInteger(snapshotLimits.perMaterialBytes) || !Number.isSafeInteger(snapshotLimits.perCallBytes) || !Number.isSafeInteger(snapshotLimits.perRunBytes) || snapshotLimits.perMaterialBytes <= 0 || snapshotLimits.perCallBytes < snapshotLimits.perMaterialBytes || snapshotLimits.perRunBytes < snapshotLimits.perCallBytes) throw new HarnessError("m07.projection-budget", "invalid projection snapshot limits");
+	const withDispatch = <T>(runId: string, body: () => Promise<T>): Promise<T> =>
+		withGoalDispatch(ctx, runId, body, options.processIdentity ?? readCurrentProcessIdentity);
 	return {
 		async begin(input, beginOptions) {
+			if (beginOptions?.checkpointRawScope !== undefined && !["workspace", "none"].includes(beginOptions.checkpointRawScope)) throw new HarnessError("m07.input", "invalid host checkpoint raw-input scope");
 			nonempty(input.goal, "goal"); nonempty(input.problemRelation, "problemRelation"); nonempty(input.plan, "plan");
 			if (!input.constraints.length || !input.successCriteria.length) throw new HarnessError("m07.input", "constraints 与 successCriteria 必须明确且非空");
 			input.constraints = normalizedUnique(input.constraints, "constraint"); input.successCriteria = normalizedUnique(input.successCriteria, "success criterion");
 			const problem = await ctx.ws.readProblem();
-			let baseline: FormalBaseline | undefined;
-			try { baseline = await latestFormalBaseline(ctx); }
-			catch (error) { if (!input.exploratory) throw error; }
+			const resolved = await resolveM04Baseline(ctx);
+			const baseline = resolved.baseline;
 			if (!baseline && !input.exploratory) throw new HarnessError("m07.baseline", "没有可用的 M04 正式基线；只能显式 exploratory=true 开始探索性 M07，不能声称正式结论");
 			const budget = await activePolicySnapshot(ctx);
 			let workflowMethod: CurrentGoal["workflowMethod"];
@@ -813,20 +1087,22 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				if (!active || active.bundle.executorVersionId !== input.workflowMethodVersionId) throw new HarnessError("m07.workflow-method", "explicit workflow method is not the active H version");
 				const method = await generations.readStrategy(input.workflowMethodVersionId);
 				if (method.kind !== "executor" || !isM07WorkflowStrategy(method.artifact) || !["admitted", "manual-active"].includes(method.state)) throw new HarnessError("m07.workflow-method", "active H is not an admitted or manually bound M07 workflow method");
-				if (active.bundle.knowledgeSnapshot !== baseline?.knowledgeSnapshot) throw new HarnessError("m07.workflow-method", "workflow method and M04 baseline have different knowledge epochs");
+				if (active.bundle.knowledgeSnapshot !== resolved?.knowledgeSnapshot) throw new HarnessError("m07.workflow-method", "workflow method and M04 baseline have different knowledge epochs");
 				workflowMethod = { versionId: method.versionId, artifact: method.artifact, requiredExperienceRefs: method.requiredExperienceRefs, requiredKnowledgeRefs: method.requiredKnowledgeRefs };
 				const frozenRefs = new Map<string, KnowledgeRef>();
 				for (const item of workflowMethod.requiredExperienceRefs) frozenRefs.set(`${item.ref.storeId}/${item.ref.recordId}@${item.ref.version}`, item.ref);
 				for (const ref of workflowMethod.requiredKnowledgeRefs) frozenRefs.set(`${ref.storeId}/${ref.recordId}@${ref.version}`, ref);
-				await verifyRequiredKnowledge(ctx.ws.root, [...frozenRefs.values()], baseline?.knowledgeSnapshot, options.registeredExperienceStores);
+				await verifyRequiredKnowledge(ctx.ws.root, [...frozenRefs.values()], resolved?.knowledgeSnapshot, options.registeredExperienceStores);
 			}
-			const record = await ctx.ws.startRun("M07", [{ label: "原始问题", path: problem.path }], baseline?.knowledgeSnapshot);
+			const knowledgeSnapshot = resolved?.knowledgeSnapshot;
+			const failedM04 = resolved?.failedM04 ?? [];
+			const record = await ctx.ws.startRun("M07", [{ label: "原始问题", path: problem.path }], knowledgeSnapshot);
 			const frozen = path.join(ctx.ws.runDir("M07", record.runId), "problem-snapshot.md");
 			await writeFileAtomic(frozen, problem.content);
 			const exploratory = input.exploratory === true || !baseline;
 			const attemptId = "A001";
 			const descriptor: RunDescriptorV1 = { version: 1, instanceId: process.env.PRE_RSI_RUN_INSTANCE_ID ?? randomUUID(), attemptId, workspaceId: await ctx.store.storeId(), goalRunId: record.runId, codeRevision: process.env.PRE_RSI_CODE_REVISION ?? "unrecorded", controlDir: ctx.ws.runDir("M07", record.runId), process: await (options.processIdentity ?? readCurrentProcessIdentity)() };
-			const goal: CurrentGoal = { version: 1, runId: record.runId, lifecycle: "active", startedAt: record.startedAt, updatedAt: record.startedAt, goal: input.goal.trim(), problemRelation: input.problemRelation.trim(), constraints: input.constraints.map((x) => nonempty(x, "constraint")), successCriteria: input.successCriteria.map((x) => nonempty(x, "success criterion")), plan: input.plan.trim(), exploratory, formalBaseline: !!baseline && !exploratory, problemSnapshotPath: frozen, knowledgeSnapshot: baseline?.knowledgeSnapshot, m04BaselineRunId: baseline?.run.runId, baselineHistory: baseline ? [{ at: record.startedAt, knowledgeSnapshot: baseline.knowledgeSnapshot, m04RunId: baseline.run.runId }] : [], budgetPolicy: budget.policy, budgetPolicyVersionId: budget.versionId, budgetPolicyFrozenAt: record.startedAt, methodBinding: { versionId: workflowMethod?.versionId ?? budget.versionId }, ...(workflowMethod ? { workflowMethod } : {}), ...(beginOptions?.executionContract === "continuous" ? { executionContract: { version: 1 as const, mode: "continuous" as const, frozenAt: record.startedAt } } : {}), executionState: { version: 1, activeAttemptId: attemptId, attempts: [{ version: 1, id: attemptId, state: "running", startedAt: record.startedAt, runDescriptor: descriptor }], operations: [] }, tasks: [], decisions: [], limitations: [] };
+			const goal: CurrentGoal = { version: 1, runId: record.runId, lifecycle: "active", startedAt: record.startedAt, updatedAt: record.startedAt, goal: input.goal.trim(), problemRelation: input.problemRelation.trim(), constraints: input.constraints.map((x) => nonempty(x, "constraint")), successCriteria: input.successCriteria.map((x) => nonempty(x, "success criterion")), plan: input.plan.trim(), exploratory, formalBaseline: !!baseline && !exploratory, problemSnapshotPath: frozen, knowledgeSnapshot, m04BaselineRunId: baseline?.run.runId, checkpointRawScope: beginOptions?.checkpointRawScope ?? "workspace", ...(failedM04.length ? { m04BaselineFailures: failedM04 } : {}), baselineHistory: baseline ? [{ at: record.startedAt, knowledgeSnapshot, m04RunId: baseline.run.runId, ...(failedM04.length ? { failedM04 } : {}) }] : [], budgetPolicy: budget.policy, budgetPolicyVersionId: budget.versionId, budgetPolicyFrozenAt: record.startedAt, methodBinding: { versionId: workflowMethod?.versionId ?? budget.versionId }, ...(workflowMethod ? { workflowMethod } : {}), ...(beginOptions?.executionContract === "continuous" ? { executionContract: { version: 1 as const, mode: "continuous" as const, frozenAt: record.startedAt } } : {}), executionState: { version: 1, activeAttemptId: attemptId, attempts: [{ version: 1, id: attemptId, state: "running", startedAt: record.startedAt, runDescriptor: descriptor }], operations: [] }, tasks: [], decisions: [], limitations: [] };
 			await save(ctx, goal);
 			return goal;
 		},
@@ -834,13 +1110,13 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 		status: (runId) => load(ctx, runId),
 
 		async plan(runId, plan, planOptions) {
-			return withGoalDispatch(ctx, runId, async () => {
+			return withDispatch(runId, async () => {
 			const goal = await load(ctx, runId); requireActive(goal);
 			if (Boolean(planOptions?.checkpointId) !== Boolean(planOptions?.m04RunId)) throw new HarnessError("m07.checkpoint", "refreshBaseline 的 checkpointId 与 m04RunId 必须成对指定");
 			if ((planOptions?.checkpointId || planOptions?.m04RunId) && !planOptions?.refreshBaseline) throw new HarnessError("m07.checkpoint", "checkpoint 消费绑定仅适用于 refreshBaseline");
 			const nextPlan = nonempty(plan, "plan");
 			if (planOptions?.refreshBaseline) {
-				const baseline = await latestFormalBaseline(ctx); if (!baseline) throw new HarnessError("m07.baseline", "没有可用于刷新基线的 M04 运行");
+				const resolved = await resolveM04Baseline(ctx); const baseline = resolved.baseline; if (!baseline) throw new HarnessError("m07.baseline", "没有可用于刷新基线的 M04 运行");
 				if (goal.checkpoints?.length && (!planOptions.checkpointId || !planOptions.m04RunId)) throw new HarnessError("m07.checkpoint", "checkpoint 后刷新基线必须显式绑定 checkpointId 与 M04 runId");
 				if (planOptions.checkpointId && planOptions.m04RunId) {
 					const checkpoint = goal.checkpoints?.find((item) => item.id === planOptions.checkpointId);
@@ -852,7 +1128,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				}
 				if (goal.workflowMethod && baseline.knowledgeSnapshot !== goal.knowledgeSnapshot) throw new HarnessError("m07.workflow-method", "已冻结工作流方法的目标不能热更新知识版本；请新建目标并显式绑定新方法版本");
 				await verifyFrozenWorkflowMethod(ctx, goal, options.registeredExperienceStores);
-				goal.m04BaselineRunId = baseline.run.runId; goal.knowledgeSnapshot = baseline.knowledgeSnapshot; goal.formalBaseline = true; goal.exploratory = false; goal.baselineHistory.push({ at: nowIso(), knowledgeSnapshot: baseline.knowledgeSnapshot, m04RunId: baseline.run.runId });
+				goal.m04BaselineRunId = baseline.run.runId; goal.knowledgeSnapshot = baseline.knowledgeSnapshot; goal.m04BaselineFailures = resolved.failedM04; goal.formalBaseline = true; goal.exploratory = false; goal.baselineHistory.push({ at: nowIso(), knowledgeSnapshot: baseline.knowledgeSnapshot, m04RunId: baseline.run.runId, ...(resolved.failedM04.length ? { failedM04: resolved.failedM04 } : {}) });
 			}
 			goal.plan = nextPlan;
 			await save(ctx, goal); return goal;
@@ -860,7 +1136,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 		},
 
 		async checkpoint(runId, checkpointOptions) {
-			return withGoalDispatch(ctx, runId, async () => {
+			return withDispatch(runId, async () => {
 			const goal = await load(ctx, runId); requireActive(goal);
 			frozenPolicy(goal);
 			if (goal.tasks.some((task) => task.status === "running")) throw new HarnessError("m07.checkpoint", "存在 running 任务，不能冻结非终态反馈");
@@ -873,7 +1149,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 		},
 
 			async delegate(runId, spec, afterPrepared) {
-			return withGoalDispatch(ctx, runId, async () => {
+			return withDispatch(runId, async () => {
 				const goal = await load(ctx, runId); requireActive(goal); nonempty(spec.objective, "task objective");
 				if (spec.context && spec.context.mode !== "fork") throw new HarnessError("m07.branch", "unsupported task context mode");
 				if (spec.mode === "execute" && (goal.executionState?.operations.some((operation) => operation.status === "unknown") || goal.tasks.some((task) => task.mode === "execute" && task.status === "unknown"))) throw new HarnessError("m07.operation-unknown", "仍有外部副作用状态未知；先经宿主控制面对账。只读 check/reason 任务仍可用于核查");
@@ -1200,7 +1476,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 		},
 
 		async review(runId, input) {
-			return withGoalDispatch(ctx, runId, async () => {
+			return withDispatch(runId, async () => {
 			const goal = await load(ctx, runId); requireActive(goal); const task = goal.tasks.find((t) => t.taskId === input.taskId); if (!task) throw new HarnessError("m07.task", `未知任务 ${input.taskId}`);
 			if (goal.decisions.some((d) => d.status === "open" && d.relatedTaskIds.includes(task.taskId))) throw new HarnessError("m07.decision", "该任务关联待用户决定事项，不能采用；不受影响任务仍可继续");
 			if (task.status !== "returned") throw new HarnessError("m07.review", `任务 ${task.taskId} 状态为 ${task.status}，不能评审采用`);
@@ -1275,7 +1551,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 		},
 
 		async selectBranch(runId, input) {
-			return withGoalDispatch(ctx, runId, async () => {
+			return withDispatch(runId, async () => {
 			const goal = await load(ctx, runId); requireActive(goal);
 			if (goal.tasks.some((item) => ["running", "unknown"].includes(item.status)) || goal.executionState?.operations.some((item) => ["prepared", "issued", "unknown"].includes(item.status))) throw new HarnessError("m07.branch", "active tasks or unresolved external operations must settle before branch selection");
 			await requireCurrentFormalBaseline(ctx, goal);
@@ -1296,7 +1572,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 		},
 
 		async decision(runId, input) {
-			return withGoalDispatch(ctx, runId, async () => {
+			return withDispatch(runId, async () => {
 			const goal = await load(ctx, runId); requireActive(goal);
 			for (const id of input.relatedTaskIds) if (!goal.tasks.some((t) => t.taskId === id)) throw new HarnessError("m07.decision", `未知相关任务 ${id}`);
 			if (input.action === "request") goal.decisions.push({ id: `U${String(goal.decisions.length + 1).padStart(3, "0")}`, status: "open", question: nonempty(input.question ?? "", "question"), relatedTaskIds: input.relatedTaskIds, requestedAt: nowIso() });
@@ -1306,7 +1582,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 		},
 
 		async finish(runId, input) {
-			return withGoalDispatch(ctx, runId, async () => {
+			return withDispatch(runId, async () => {
 			const goal = await load(ctx, runId); requireActive(goal);
 			if (goal.executionContract?.mode === "continuous" && input.outcome !== "fulfilled") throw new HarnessError("m07.continuous", "continuous 目标不能由模型以 partial/blocked 或自述 stopReason 收口；只有原成功要求的 fulfilled 硬证据门或受信宿主中断可终结");
 			let invalidBaseline: string | undefined;
@@ -1350,7 +1626,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 		},
 
 		async interrupt(runId, input: InterruptInput, authorization?: typeof HOST_STOP_KEY, hostReceipt?: HostStopReceipt) {
-			return withGoalDispatch(ctx, runId, async () => {
+			return withDispatch(runId, async () => {
 			const goal = await load(ctx, runId); requireActive(goal);
 			if (goal.executionContract?.mode === "continuous" && (authorization !== HOST_STOP_KEY || hostReceipt?.goalRunId !== runId)) throw new HarnessError("m07.continuous", "continuous 目标不接受模型或外部 JSON 的 interrupt；仅受信宿主生命周期事件可归档");
 			if (authorization === HOST_STOP_KEY && hostReceipt?.goalRunId === runId) goal.hostStopReceipt = hostReceipt;
@@ -1428,7 +1704,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			return interruptWithAuthority(runId, { reason: `受信宿主生命周期停止：${input.reasonKind}`, returnPath: "user" }, HOST_STOP_KEY, receipt);
 		},
 		async hostSuspend(runId, input) {
-			return withGoalDispatch(ctx, runId, async () => {
+			return withDispatch(runId, async () => {
 			if (!HOST_STOP_REASONS.has(input.reasonKind)) throw new HarnessError("m07.host-stop", "未知宿主停止事件");
 			if (input.sourceEventId !== undefined && (typeof input.sourceEventId !== "string" || input.sourceEventId.length > 128 || !/^[A-Za-z0-9._:-]+$/.test(input.sourceEventId))) throw new HarnessError("m07.host-stop", "宿主事件 ID 无效");
 			const goal = await load(ctx, runId); requireActive(goal);
@@ -1505,7 +1781,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			return goal;
 		},
 		async hostReconcileOperation(runId, input) {
-			return withGoalDispatch(ctx, runId, async () => {
+			return withDispatch(runId, async () => {
 			const goal = await load(ctx, runId);
 			if (goal.lifecycle !== "active" || !goal.executionState) throw new HarnessError("m07.operation", "目标无可对账的执行状态");
 			const operation = goal.executionState.operations.find((item) => item.id === input.operationId);
@@ -1532,7 +1808,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			});
 		},
 		async hostCreateSuccessor(runId, input) {
-			return withGoalDispatch(ctx, runId, async () => {
+			return withDispatch(runId, async () => {
 			const prior = await load(ctx, runId);
 			if (prior.lifecycle !== "finished" || prior.outcome !== "blocked") throw new HarnessError("m07.successor", "仅旧 blocked 终态可显式建立关联后继；原记录保持只读");
 			frozenPolicy(prior);
@@ -1550,7 +1826,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			const frozen = path.join(ctx.ws.runDir("M07", run.runId), "problem-snapshot.md");
 			await writeFileAtomic(frozen, problem);
 			const newDescriptor: RunDescriptorV1 = { ...descriptor, attemptId: "A001", goalRunId: run.runId, workspaceId: await ctx.store.storeId(), controlDir: ctx.ws.runDir("M07", run.runId) };
-			const successor: CurrentGoal = { version: 1, runId: run.runId, lifecycle: "active", startedAt: run.startedAt, updatedAt: run.startedAt, goal: prior.goal, problemRelation: prior.problemRelation, constraints: [...prior.constraints], successCriteria: [...prior.successCriteria], plan: prior.plan, exploratory: prior.exploratory, formalBaseline: prior.formalBaseline, problemSnapshotPath: frozen, knowledgeSnapshot: prior.knowledgeSnapshot, m04BaselineRunId: prior.m04BaselineRunId, baselineHistory: structuredClone(prior.baselineHistory), budgetPolicy: structuredClone(prior.budgetPolicy), budgetPolicyVersionId: prior.budgetPolicyVersionId, budgetPolicyFrozenAt: prior.budgetPolicyFrozenAt, methodBinding: prior.methodBinding ? structuredClone(prior.methodBinding) : undefined, workflowMethod: prior.workflowMethod ? structuredClone(prior.workflowMethod) : undefined, executionContract: prior.executionContract ? structuredClone(prior.executionContract) : undefined, predecessorGoalRunId: prior.runId, executionState: { version: 1, activeAttemptId: "A001", attempts: [{ version: 1, id: "A001", state: "running", startedAt: run.startedAt, runDescriptor: newDescriptor }], operations: [] }, tasks: [], decisions: structuredClone(prior.decisions), limitations: [`继承旧目标 ${prior.runId} 的冻结义务、K、策略和方法；旧任务及证据仍在原记录，须重新检查后采用。`] };
+			const successor: CurrentGoal = { version: 1, runId: run.runId, lifecycle: "active", startedAt: run.startedAt, updatedAt: run.startedAt, goal: prior.goal, problemRelation: prior.problemRelation, constraints: [...prior.constraints], successCriteria: [...prior.successCriteria], plan: prior.plan, exploratory: prior.exploratory, formalBaseline: prior.formalBaseline, problemSnapshotPath: frozen, knowledgeSnapshot: prior.knowledgeSnapshot, m04BaselineRunId: prior.m04BaselineRunId, checkpointRawScope: prior.checkpointRawScope ?? "workspace", baselineHistory: structuredClone(prior.baselineHistory), ...(prior.m04BaselineFailures ? { m04BaselineFailures: structuredClone(prior.m04BaselineFailures) } : {}), budgetPolicy: structuredClone(prior.budgetPolicy), budgetPolicyVersionId: prior.budgetPolicyVersionId, budgetPolicyFrozenAt: prior.budgetPolicyFrozenAt, methodBinding: prior.methodBinding ? structuredClone(prior.methodBinding) : undefined, workflowMethod: prior.workflowMethod ? structuredClone(prior.workflowMethod) : undefined, executionContract: prior.executionContract ? structuredClone(prior.executionContract) : undefined, predecessorGoalRunId: prior.runId, executionState: { version: 1, activeAttemptId: "A001", attempts: [{ version: 1, id: "A001", state: "running", startedAt: run.startedAt, runDescriptor: newDescriptor }], operations: [] }, tasks: [], decisions: structuredClone(prior.decisions), limitations: [`继承旧目标 ${prior.runId} 的冻结义务、K、策略和方法；旧任务及证据仍在原记录，须重新检查后采用。`] };
 			await save(ctx, successor);
 			run.remarks.push(`显式 successor of ${prior.runId}；旧 blocked goal.json 未修改。新目标保留原成功标准和冻结策略。`);
 			await ctx.ws.writeRun(run);

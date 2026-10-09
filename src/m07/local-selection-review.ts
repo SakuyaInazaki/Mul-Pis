@@ -10,9 +10,10 @@ import { assertFullM07Reads, requiredM07Reads } from "../stages/m04.ts";
 import type { M04KnowledgeTransactionV1 } from "../stages/m04.ts";
 import { HarnessError } from "../types.ts";
 import type { M07Controller, CurrentGoal } from "./types.ts";
-import type { OriginalObjectiveContractV1, ObjectiveProgressV1 } from "./objective-progress.ts";
+import type { MissingSelectionProofV1, OriginalObjectiveContractV1, ObjectiveProgressV1 } from "./objective-progress.ts";
 import type { LocalObjectiveAdvanceResult, LocalObjectiveSelectionReviewV1 } from "./local-original-objective.ts";
-import { readLocalEvaluatorReceipt, verifyLocalEvaluatorReceipt } from "./local-evaluator-run.ts";
+import { readLocalEvaluatorReceipt, verifyLocalEvaluatorReceipt,
+	type LocalEvaluatorReceiptV1 } from "./local-evaluator-run.ts";
 import { trustedLocalMissionEvaluator } from "./local-mission-evaluator.ts";
 
 const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
@@ -25,9 +26,10 @@ function selectedEvidenceName(runId: string, taskId: string, name: string): stri
 	return `${stem.slice(0, 50)}-${identity}${extension}`;
 }
 
-async function regular(file: string): Promise<Buffer> {
+async function regular(file: string, allowEmpty = false): Promise<Buffer> {
 	const info = await lstat(file);
-	if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size < 1 ||
+	if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 ||
+		(allowEmpty ? info.size < 0 : info.size < 1) ||
 		info.size > 8 * 1024 * 1024) throw new HarnessError("local.selection.file", "selection evidence is not a bounded regular file");
 	const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
 	try {
@@ -89,6 +91,89 @@ export async function verifyDefaultM04Evidence(ctx: StageContext,
 	return { sourceBytes, coverageBytes, txBytes };
 }
 
+/** Missing candidate citations are a selection gap, never an invented citation. */
+export function missingCandidateSelectionProof(receipt: LocalEvaluatorReceiptV1): string[] {
+	const passed = receipt.checks.filter(item => item.result === "passed");
+	const candidates = new Set(receipt.candidate.map(item => item.name));
+	const observations = new Set(receipt.observations.map(item => item.name));
+	if (!passed.length || !observations.size || passed.some(item =>
+		!item.evidenceRefs.some(name => observations.has(name)))) return [];
+	return passed.filter(item => !item.evidenceRefs.some(name => candidates.has(name)))
+		.map(item => item.obligationId);
+}
+
+/** Recompute every byte binding on both the first write and the next assessment. */
+export async function computeMissingSelectionProof(input: { ctx: StageContext;
+	controller: M07Controller; contract: OriginalObjectiveContractV1;
+	run: LocalObjectiveAdvanceResult }): Promise<MissingSelectionProofV1> {
+	const { ctx, controller, contract, run } = input;
+	if (!run.selectedTaskId || !run.checkpointId || !run.m04RunId ||
+		!run.requiredM07ReadPaths?.length || run.acceptedTaskIds.length !== 1 ||
+		run.acceptedTaskIds[0] !== run.selectedTaskId)
+		throw new HarnessError("local.selection.gap", "missing-proof input is not one accepted task");
+	const goal = await controller.status(run.runId);
+	const task = goal.tasks.find(item => item.taskId === run.selectedTaskId);
+	if (!task || task.status !== "accepted" || !task.review ||
+		goal.executionState?.operations.some(item =>
+			["prepared", "issued", "unknown"].includes(item.status)))
+		throw new HarnessError("local.selection.gap", "missing-proof task is not settled and formally reviewed");
+	const receiptPath = path.join(task.workDir, "local-evaluator-receipt.json");
+	if (run.evaluatorReceiptPath !== receiptPath)
+		throw new HarnessError("local.selection.gap", "missing-proof receipt path differs from the task");
+	const { receipt, sha256: evaluatorReceiptSha256 } = await readLocalEvaluatorReceipt(receiptPath);
+	const evaluator = trustedLocalMissionEvaluator(ctx.config.localMission?.evaluatorId);
+	if (!evaluator || evaluator.id !== receipt.evaluator.id || evaluator.version !== receipt.evaluator.version)
+		throw new HarnessError("local.selection.gap", "trusted evaluator identity or version changed");
+	await verifyLocalEvaluatorReceipt(receipt, contract, goal, task);
+	const missingCandidateObligationIds = missingCandidateSelectionProof(receipt);
+	if (!missingCandidateObligationIds.length)
+		throw new HarnessError("local.selection.gap", "receipt has no observation-only passed check");
+	const checkpoint = goal.checkpoints?.find(item => item.id === run.checkpointId);
+	if (!checkpoint || checkpoint.feedbackStatus !== "complete" && checkpoint.feedbackStatus !== "indexed")
+		throw new HarnessError("local.selection.gap", "M07 checkpoint is missing");
+	const snapshot = JSON.parse((await regular(checkpoint.goalSnapshotPath)).toString("utf8")) as CurrentGoal;
+	const snapshotTask = snapshot.tasks.find(item => item.taskId === task.taskId);
+	if (snapshot.runId !== goal.runId || !snapshot.formalBaseline || snapshot.exploratory ||
+		snapshotTask?.status !== "accepted")
+		throw new HarnessError("local.selection.gap", "M07 checkpoint did not retain the accepted task");
+	const required = [...new Set(["goal.json", "manifest.json", "m04-feedback.md",
+		...(snapshotTask.review?.artifacts ?? []).filter(item => item.mediaType === "text")
+			.map(item => path.relative(checkpoint.rootDir, item.path).replaceAll("\\", "/"))])];
+	if (JSON.stringify(required) !== JSON.stringify(run.requiredM07ReadPaths))
+		throw new HarnessError("local.selection.gap", "M04 read paths differ from the exact checkpoint");
+	const m04 = await verifyDefaultM04Evidence(ctx, run, checkpoint.rootDir);
+	return { version: 1, kind: "local-selection-proof-gap",
+		reasonCode: "passed-check-missing-candidate-reference",
+		missionId: contract.id, runId: run.runId, taskId: task.taskId,
+		checkpointId: checkpoint.id, m04RunId: run.m04RunId,
+		missingCandidateObligationIds, evaluatorReceiptSha256,
+		checkpointManifestSha256: sha256(await regular(checkpoint.manifestPath)),
+		m04SourceSha256: sha256(m04.sourceBytes),
+		m04CoverageSha256: sha256(m04.coverageBytes),
+		m04TransactionSha256: sha256(m04.txBytes),
+		requiredM07ReadPaths: [...required] };
+}
+
+export async function verifyMissingSelectionProof(input: { ctx: StageContext;
+	controller: M07Controller; contract: OriginalObjectiveContractV1;
+	bounded: ObjectiveProgressV1["boundedRuns"][number] }): Promise<void> {
+	const { bounded } = input;
+	const gap = bounded.selectionProofGap;
+	if (!gap || bounded.selectedTaskId || bounded.outcome !== "partial" ||
+		bounded.acceptedTaskIds?.length !== 1 || bounded.acceptedTaskIds[0] !== gap.taskId ||
+		gap.runId !== bounded.runId || gap.missionId !== input.contract.id)
+		throw new HarnessError("local.selection.gap", "persisted missing-proof run binding is invalid");
+	const computed = await computeMissingSelectionProof({ ...input, run: {
+		runId: gap.runId, outcome: "partial", acceptedTaskIds: [gap.taskId],
+		selectedTaskId: gap.taskId, checkpointId: gap.checkpointId,
+		m04RunId: gap.m04RunId,
+		evaluatorReceiptPath: path.join(input.ctx.ws.runDir("M07", gap.runId),
+			"tasks", gap.taskId, "work", "local-evaluator-receipt.json"),
+		requiredM07ReadPaths: gap.requiredM07ReadPaths } });
+	if (JSON.stringify(computed) !== JSON.stringify(gap))
+		throw new HarnessError("local.selection.gap", "persisted missing-proof bytes differ from M07/M04 evidence");
+}
+
 async function compute(ctx: StageContext, controller: M07Controller,
 	contract: OriginalObjectiveContractV1, run: LocalObjectiveAdvanceResult):
 	Promise<LocalObjectiveSelectionReviewV1 | undefined> {
@@ -134,7 +219,7 @@ async function compute(ctx: StageContext, controller: M07Controller,
 		throw new HarnessError("local.selection.receipt", "M07 review snapshot differs from evaluator receipt");
 	for (const candidate of receipt.candidate) {
 		const reviewed = task.review.artifacts.find(item => item.sourcePath === candidate.sourceFile);
-		if (!reviewed || sha256(await regular(reviewed.path)) !== candidate.sha256)
+		if (!reviewed || sha256(await regular(reviewed.path, candidate.bytes === 0)) !== candidate.sha256)
 			throw new HarnessError("local.selection.bytes", "M07 reviewed candidate differs from evaluator snapshot");
 	}
 	for (const observation of receipt.observations) {
@@ -161,11 +246,13 @@ async function compute(ctx: StageContext, controller: M07Controller,
 		throw new HarnessError("local.selection.checkpoint", "M07 checkpoint does not pin the accepted task");
 	const snapshotTask = snap.tasks.find(item => item.taskId === task.taskId)!;
 	for (const member of [...receipt.candidate.map(item => ({ sourceFile: item.sourceFile,
-		sha256: item.sha256 })), ...receipt.observations.map(item => ({ sourceFile: item.file,
-		sha256: item.sha256 }))]) {
+		sha256: item.sha256, allowEmpty: item.bytes === 0 })),
+		...receipt.observations.map(item => ({ sourceFile: item.file,
+			sha256: item.sha256, allowEmpty: false }))]) {
 		const index = task.review.artifacts.findIndex(item => item.sourcePath === member.sourceFile);
 		const frozen = snapshotTask.review?.artifacts[index];
-		if (index < 0 || !frozen || sha256(await regular(frozen.path)) !== member.sha256)
+		if (index < 0 || !frozen ||
+			sha256(await regular(frozen.path, member.allowEmpty)) !== member.sha256)
 			throw new HarnessError("local.selection.checkpoint", "M04 checkpoint candidate or observation differs from evaluator bytes");
 	}
 	const required = [...new Set(["goal.json", "manifest.json", "m04-feedback.md",

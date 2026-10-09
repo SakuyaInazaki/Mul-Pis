@@ -1,20 +1,24 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { createOriginalObjective, objectiveProgress } from "../src/m07/objective-progress.ts";
 import { reconcileInterruptedLocalMission, reconcileLegacyInterruptedLocalMission,
+	reconcileColdMigratedLocalMission, type ColdMigrationLocalReviewRequestV1,
 	type InterruptedLocalReviewRequestV1, type LegacyInterruptedLocalReviewRequestV1 } from
 	"../src/m07/local-interrupted-reconcile.ts";
 import { fullLocalMissionCensus, LEGACY_SERIAL_AUDIT_SHA256, LEGACY_SERIAL_COMMIT,
 	LEGACY_SERIAL_TREE, verifyLegacySerialSource, type LegacyEffectReviewV1 } from "../src/m07/local-legacy-review.ts";
 import { LOCAL_M07_MISSION_BINDING_PREFIX } from "../src/m07/local-m07-adapter.ts";
+import { openDefaultLocalMission } from "../src/m07/local-mission.ts";
 import { assessorTaskHash, localLineageBytes, localLineageHash, missionLineageFile,
 	recordLocalDispatchLineage } from "../src/m07/local-dispatch-lineage.ts";
-import { LocalMissionHost } from "../src/runner/local-mission-host.ts";
+import { LocalMissionHost, type ColdMigrationObservationV1 } from "../src/runner/local-mission-host.ts";
 import type { ProcessIdentityV1, ProcessProbe } from "../src/runtime/process-identity.ts";
+import { readCurrentProcessIdentity } from "../src/runtime/process-identity.ts";
+import { FakeSessionRunner } from "../src/runner/fake.ts";
 import { Workspace } from "../src/workspace.ts";
 
 const sha = (value: Buffer | string) => createHash("sha256").update(value).digest("hex");
@@ -22,6 +26,9 @@ const p1: ProcessIdentityV1 = { hostId: "local-host", bootId: "local-boot", pid:
 const p2: ProcessIdentityV1 = { ...p1, pid: 1002, processStartToken: "222" };
 const p3: ProcessIdentityV1 = { ...p1, pid: 1003, processStartToken: "333" };
 const p4: ProcessIdentityV1 = { ...p1, pid: 1004, processStartToken: "444" };
+const remote: ProcessIdentityV1 = { hostId: "successor-host", bootId: "successor-boot",
+	pid: 2001, processStartToken: "555" };
+const remoteRetry: ProcessIdentityV1 = { ...remote, pid: 2002, processStartToken: "666" };
 const dead = async (): Promise<ProcessProbe> => ({ status: "dead", identityMatch: false, reason: "synthetic death" });
 const options = { currentIdentity: async () => p3, probePrior: dead };
 test("reviewed legacy source snapshot is self-contained and rejects changed bytes", async t => {
@@ -41,12 +48,20 @@ async function fixture(t: TestContext, link: "committed" | "missing" | "mission-
 	const ws = new Workspace(root);
 	await mkdir(path.join(ws.agentDir, "missions"), { recursive: true, mode: 0o700 });
 	const contract = createOriginalObjective({ goal: "Synthetic objective", goalSource: "user-intent-summary",
-		inputNames: ["problem.md"], obligations: [{ id: "O1", description: "Synthetic check" }],
+		inputNames: ["problem.md"], obligations: [{ id: "O1", description: "Synthetic check",
+			type: "file-sha256", expectedSha256: "0".repeat(64) }],
 		closure: "open-ended" });
 	const missionRoot = path.join(ws.agentDir, "missions", contract.id);
 	const a1 = await LocalMissionHost.begin({ root: missionRoot, missionId: contract.id,
 		attemptId: "A001", codeRevision: "local-harness-v1", currentIdentity: async () => p1 });
-	await a1.recordInitialContract({ attemptId: "A001", bytes: Buffer.from(`${JSON.stringify(contract)}\n`) });
+	const evidenceDir = path.join(missionRoot, "evidence");
+	await mkdir(evidenceDir, { recursive: true, mode: 0o700 });
+	const problemBytes = Buffer.from("Synthetic objective\n");
+	await writeFile(path.join(evidenceDir, "original-objective.json"), `${JSON.stringify(contract, null, 2)}\n`);
+	await writeFile(path.join(evidenceDir, "original-problem.txt"), problemBytes);
+	await a1.recordInitialContract({ attemptId: "A001", bytes: Buffer.from(`${JSON.stringify({
+		...contract, frozenInputs: [{ name: "original-problem.txt", bytes: problemBytes.length,
+			sha256: sha(problemBytes) }] }, null, 2)}\n`) });
 	const initial = objectiveProgress(contract, { boundedRuns: [], selectedArtifacts: [],
 		stopReason: "next-task-pending", pendingActionFacts: {} });
 	const first = await a1.recordCheckpoint({ attemptId: "A001", sequence: 1,
@@ -212,6 +227,39 @@ async function legacyFixture(t: TestContext) {
 		kind: "review-legacy-interrupted-local-dispatch", legacyEffectReviewFile: file,
 		legacyEffectReviewSha256: sha(await readFile(file)) };
 	return { ...f, request, review, reviewFile: file };
+}
+async function coldFixture(t: TestContext) {
+	const f = await legacyFixture(t);
+	const reviewedEffects = structuredClone(f.review);
+	reviewedEffects.childProcess = { kind: "no-detected-lingering-process", processGroupId: null,
+		method: "reviewed-tool-and-process-census" };
+	await writeFile(f.reviewFile, JSON.stringify(reviewedEffects));
+	f.request.legacyEffectReviewSha256 = sha(await readFile(f.reviewFile));
+	const archiveFile = path.join(f.root, "retained-pre-migration-archive.bin");
+	await writeFile(archiveFile, "retained synthetic archive\n");
+	const archiveSha256 = sha(await readFile(archiveFile));
+	const observation: ColdMigrationObservationV1 = { version: 1,
+		kind: "trusted-original-host-terminal-observation", missionId: f.request.missionId,
+		intentId: f.request.intentId, oldAttemptId: f.request.oldAttemptId, oldOwner: p2,
+		oldCheckpoint: { sequence: f.request.checkpointSequence, sha256: f.request.checkpointSha256 },
+		terminal: { messageId: "original-host-exit-001", observedAt: "2026-10-09T20:43:53Z",
+			state: "old-owner-terminal", exitCode: 1 },
+		effectCensus: { messageId: "original-host-scan-002", observedAt: "2026-10-09T21:09:00Z",
+			workspaceCensusSha256: f.review.censusSha256, processGroupId: null, state: "observed-settled" },
+		archive: { sha256: archiveSha256, checkpointSha256: f.request.checkpointSha256 },
+		provenance: "trusted-host-reviewed-contemporaneous-platform-observations",
+		launch: "reviewed-one-shot", autoRestarter: "none-observed",
+		fence: "destination-exclusive-claim",
+		limit: "same-uid-observations-no-cross-host-os-or-permanent-copy-lock-proof" };
+	const observationFile = path.join(f.root, "retained-host-observation.json");
+	await writeFile(observationFile, `${JSON.stringify(observation)}\n`);
+	const request: ColdMigrationLocalReviewRequestV1 = { ...f.request,
+		kind: "review-cold-migrated-local-dispatch", observationFile,
+		observationSha256: sha(await readFile(observationFile)), archiveFile, archiveSha256 };
+	const verifyTrustedObservation = async (value: ColdMigrationObservationV1) => {
+		assert.deepEqual(value, observation);
+	};
+	return { ...f, request, observation, observationFile, archiveFile, verifyTrustedObservation };
 }
 
 test("exact dead-process review records one safe successor checkpoint without erasing history", async t => {
@@ -485,4 +533,135 @@ test("legacy inference rejects competing launchers and incomplete source, owner,
 			assert.equal((await LocalMissionHost.status(f.missionRoot)).latestCheckpoint?.sequence, 3);
 		});
 	}
+});
+
+test("reviewed cold migration publishes one fresh-work V5 successor on another host", async t => {
+	const f = await coldFixture(t);
+	const old = await readFile(path.join(f.missionRoot, "attempts", "A002", "checkpoints", "C00000003.bin"));
+	const input = { workspaceRoot: f.root, request: f.request,
+		currentIdentity: async () => remote, verifyTrustedObservation: f.verifyTrustedObservation,
+		probePrior: async (): Promise<ProcessProbe> => ({ status: "unknown", identityMatch: false,
+			reason: "other host" }) };
+	const completed = await reconcileColdMigratedLocalMission(input);
+	assert.equal(completed.receipt.kind, "local-cold-migration-host-review");
+	assert.equal(completed.receipt.oldAttempt.process.hostId, p2.hostId);
+	assert.equal(completed.receipt.newAttempt.process.hostId, remote.hostId);
+	assert.equal(completed.progress.continuation.pendingAction?.safety, "fresh-work-only");
+	assert.equal(completed.progress.continuation.nextTask, undefined);
+	const status = await LocalMissionHost.status(f.missionRoot);
+	assert.equal(status.latestCheckpoint?.version, 5);
+	assert.equal(status.latestCheckpoint?.coldMigrationReview?.coldMigration.observationSha256,
+		f.request.observationSha256);
+	assert.deepEqual(await reconcileColdMigratedLocalMission(input), completed);
+	assert((await readFile(path.join(f.missionRoot, "attempts", "A002", "checkpoints", "C00000003.bin"))).equals(old));
+	const next = await LocalMissionHost.begin({ root: f.missionRoot, missionId: f.request.missionId,
+		attemptId: "A004", codeRevision: "local-harness-v1",
+		currentIdentity: async () => remoteRetry, probePrior: dead });
+	assert.equal(next.source.attemptId, "A004");
+});
+
+test("cold migration hashes a sparse archive beyond the control-file bound", async t => {
+	const f = await coldFixture(t);
+	await truncate(f.archiveFile, 70 * 1024 * 1024);
+	const archiveSha256 = sha(await readFile(f.archiveFile));
+	const observation = { ...f.observation, archive: { ...f.observation.archive, sha256: archiveSha256 } };
+	await writeFile(f.observationFile, `${JSON.stringify(observation)}\n`);
+	const request = { ...f.request, archiveSha256,
+		observationSha256: sha(await readFile(f.observationFile)) };
+	const result = await reconcileColdMigratedLocalMission({ workspaceRoot: f.root,
+		request, currentIdentity: async () => remote,
+		verifyTrustedObservation: async value => assert.deepEqual(value, observation), dryRun: true });
+	assert.equal(result.receipt.kind, "local-cold-migration-host-review");
+});
+
+test("a V5 reviewed running MISSION is not redispatched by default mission step", async t => {
+	const f = await coldFixture(t);
+	const localOwner = await readCurrentProcessIdentity();
+	const result = await reconcileColdMigratedLocalMission({ workspaceRoot: f.root,
+		request: f.request, currentIdentity: async () => localOwner,
+		verifyTrustedObservation: f.verifyTrustedObservation });
+	assert.equal(result.receipt.newAttempt.process.hostId, localOwner.hostId);
+	let prompts = 0;
+	const runner = new FakeSessionRunner(() => { prompts++; return "Synthetic malformed assessor response"; });
+	const mission = openDefaultLocalMission({ workspaceRoot: f.root, runner,
+		config: { roles: { research: "fake/research", execution: "fake/execution" },
+			localMission: { evaluatorId: "host:file-sha256" }, concurrency: 1 } as any });
+	const stepped = await mission.step(f.request.missionId);
+	assert(prompts > 0, `fresh assessment must begin after V5 review: ${JSON.stringify({
+		stopReason: stepped.stopReason, continuation: stepped.continuation })}`);
+	assert.equal((await LocalMissionHost.status(f.missionRoot)).currentAttempt?.attemptId, "A003");
+	assert.equal((await f.ws.readRun("MISSION", f.request.intentId)).status, "running");
+});
+
+test("cold migration rejects forged or stale origin observations without treating another host as dead", async t => {
+	for (const variant of ["untrusted", "wrong-owner", "wrong-host", "wrong-boot",
+		"wrong-message-ref", "wrong-checkpoint", "wrong-census",
+		"auto-restarter", "changed-archive", "stale-checkpoint", "remote-group-probe",
+		"noncanonical-observation"] as const) await t.test(variant, async t => {
+		const f = await coldFixture(t);
+		let request = f.request;
+		let verify = f.verifyTrustedObservation;
+		if (variant === "untrusted") verify = async () => { throw new Error("source not authenticated"); };
+		if (["wrong-owner", "wrong-host", "wrong-boot", "wrong-message-ref",
+			"wrong-checkpoint", "wrong-census", "auto-restarter"].includes(variant)) {
+			const changed = structuredClone(f.observation);
+			if (variant === "wrong-owner") changed.oldOwner.processStartToken = "other-birth";
+			if (variant === "wrong-host") changed.oldOwner.hostId = "other-original-host";
+			if (variant === "wrong-boot") changed.oldOwner.bootId = "other-original-boot";
+			if (variant === "wrong-message-ref") changed.terminal.messageId = "wrong-platform-message";
+			if (variant === "wrong-checkpoint") changed.oldCheckpoint.sha256 = "0".repeat(64);
+			if (variant === "wrong-census") changed.effectCensus.workspaceCensusSha256 = "0".repeat(64);
+			if (variant === "auto-restarter") (changed as any).autoRestarter = "observed";
+			await writeFile(f.observationFile, `${JSON.stringify(changed)}\n`);
+			request = { ...request, observationSha256: sha(await readFile(f.observationFile)) };
+		}
+		if (variant === "changed-archive") await writeFile(f.archiveFile, "changed archive\n");
+		if (variant === "noncanonical-observation") {
+			await writeFile(f.observationFile, JSON.stringify(f.observation, null, 2));
+			request = { ...request, observationSha256: sha(await readFile(f.observationFile)) };
+		}
+		if (variant === "remote-group-probe") {
+			const review = JSON.parse(await readFile(f.reviewFile, "utf8"));
+			review.childProcess = { kind: "no-detected-lingering-process", processGroupId: 8800,
+				method: "verified-dead-process-group" };
+			await writeFile(f.reviewFile, JSON.stringify(review));
+			request = { ...request, legacyEffectReviewSha256: sha(await readFile(f.reviewFile)) };
+		}
+		if (variant === "stale-checkpoint") request = { ...request, checkpointSha256: "0".repeat(64) };
+		await assert.rejects(reconcileColdMigratedLocalMission({ workspaceRoot: f.root,
+			request, currentIdentity: async () => remote, verifyTrustedObservation: verify,
+			probePrior: async (): Promise<ProcessProbe> => ({ status: "unknown",
+				identityMatch: false, reason: "other host" }), dryRun: true }));
+		assert.equal((await LocalMissionHost.status(f.missionRoot)).latestCheckpoint?.sequence, 3);
+	});
+});
+
+test("cold migration recovers both atomic publication crash windows on the successor host", async t => {
+	for (const at of ["after-prepare", "after-rename"] as const) await t.test(at, async t => {
+		const f = await coldFixture(t);
+		await assert.rejects(reconcileColdMigratedLocalMission({ workspaceRoot: f.root,
+			request: f.request, currentIdentity: async () => remote,
+			verifyTrustedObservation: f.verifyTrustedObservation, testCrashAt: at }), /synthetic crash/);
+		const crashed = await LocalMissionHost.status(f.missionRoot);
+		assert.equal(crashed.latestCheckpoint?.sequence, at === "after-prepare" ? 3 : 4);
+		const resumed = await reconcileColdMigratedLocalMission({ workspaceRoot: f.root,
+			request: f.request, currentIdentity: async () => remoteRetry,
+			verifyTrustedObservation: f.verifyTrustedObservation, probePrior: dead });
+		assert.equal(resumed.receipt.kind, "local-cold-migration-host-review");
+		assert.equal((await LocalMissionHost.status(f.missionRoot)).checkpointReceipts
+			.filter(row => row.coldMigrationReview).length, 1);
+	});
+});
+
+test("two cold successor hosts sharing one mission root admit only one reviewed attempt", async t => {
+	const f = await coldFixture(t);
+	const otherRemote: ProcessIdentityV1 = { ...remote, hostId: "other-successor-host",
+		bootId: "other-successor-boot", pid: 3001 };
+	const outcomes = await Promise.allSettled([remote, otherRemote].map(identity =>
+		reconcileColdMigratedLocalMission({ workspaceRoot: f.root, request: f.request,
+			currentIdentity: async () => identity,
+			verifyTrustedObservation: f.verifyTrustedObservation })));
+	assert.equal(outcomes.filter(item => item.status === "fulfilled").length, 1);
+	assert.equal((await LocalMissionHost.status(f.missionRoot)).checkpointReceipts
+		.filter(row => row.coldMigrationReview).length, 1);
 });

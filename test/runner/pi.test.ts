@@ -397,6 +397,27 @@ test("a read-dir grant confines both tools, rejects PDFs, and records successful
 	assert.deepEqual(handle.readCoverage(), ["note.txt"]);
 });
 
+test("read-dir records an empty text file without a fabricated line range", async t => {
+	const persistDir = await fixture(t);
+	const materialRoot = path.join(persistDir, "materials");
+	await mkdir(materialRoot);
+	await writeFile(path.join(materialRoot, "empty.txt"), "");
+	const stub = stubFactory();
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory }).create(
+		spec(persistDir, { tools: { kind: "read-dir", root: materialRoot, toolName: "m07_evidence_read" } }));
+	const read = stub.calls[0].customTools?.find(tool => tool.name === "m07_evidence_read");
+	assert(read);
+	await read.execute("empty", { path: "empty.txt" }, undefined, undefined, undefined as never);
+	assert.deepEqual(handle.readCoverage(), ["empty.txt"]);
+	const events = handle.readReturnEvents();
+	assert.equal(events.length, 1);
+	const { at, ...event } = events[0]!;
+	assert.ok(Number.isFinite(Date.parse(at)));
+	assert.deepEqual(event, { toolName: "m07_evidence_read", status: "no-content", path: "empty.txt",
+		requested: {}, returned: { kind: "text", truncated: false } });
+	handle.dispose();
+});
+
 test("writes the sidecar next to the SDK path and resume rebuilds from it", async (t) => {
 	const persistDir = await fixture(t);
 	const stub = stubFactory();

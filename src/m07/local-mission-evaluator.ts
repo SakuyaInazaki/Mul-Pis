@@ -5,6 +5,7 @@ import type { ObjectiveCapabilityV1 } from "./objective-progress.ts";
 import { HarnessError } from "../types.ts";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { ProcessIdentityV1 } from "../runtime/process-identity.ts";
 
 export type LocalEvaluationResult = "passed" | "failed" | "not_run" | "unknown";
 export interface LocalEvaluatorCheck {
@@ -40,6 +41,20 @@ export interface LocalEvaluatorObservationDeclaration {
 	name: string;
 	kind: "text" | "json";
 }
+/** The evaluator may inspect its own external operation, but may not write during reconciliation. */
+export interface LocalEvaluationReconcileInput {
+	readonly attemptId: string;
+	readonly missionId: string; readonly runId: string; readonly taskId: string;
+	readonly evaluatorId: string; readonly evaluatorVersion: string;
+	readonly candidate: readonly Readonly<{ name: string; bytes: number; sha256: string }>[];
+	readonly process: Readonly<ProcessIdentityV1>;
+}
+export type LocalEvaluationReconcileResult =
+	| Readonly<{ state: "pending" }>
+	| Readonly<{ state: "settled-failure"; proof: Readonly<{
+		attemptId: string; process: Readonly<ProcessIdentityV1>;
+		operationId: string; childProcesses: readonly Readonly<ProcessIdentityV1>[];
+		settledEffect: "no-effect" | "contained"; evidence: string }> }>;
 export interface LocalMissionEvaluator {
 	readonly id: string;
 	readonly version: string;
@@ -56,6 +71,9 @@ export interface LocalMissionEvaluator {
 		Promise<Readonly<{ checks: readonly Readonly<LocalEvaluatorCheck>[];
 			observations: readonly Readonly<LocalEvaluatorObservationDeclaration>[];
 			limitations: readonly string[] }>>;
+	/** Optional read-only check for an entered call whose return was never journaled. */
+	reconcileEvaluation?(input: Readonly<LocalEvaluationReconcileInput>):
+		Promise<LocalEvaluationReconcileResult>;
 }
 
 const registry = new Map<string, LocalMissionEvaluator>();
@@ -117,7 +135,8 @@ export function registerTrustedLocalMissionEvaluator(evaluator: LocalMissionEval
 		!evaluator.supportedObligationTypes.length ||
 		new Set(evaluator.supportedObligationTypes).size !== evaluator.supportedObligationTypes.length ||
 		evaluator.supportedObligationTypes.some(type => !safeId.test(type)) ||
-		typeof evaluator.preflight !== "function" || typeof evaluator.evaluate !== "function")
+		typeof evaluator.preflight !== "function" || typeof evaluator.evaluate !== "function" ||
+		(evaluator.reconcileEvaluation !== undefined && typeof evaluator.reconcileEvaluation !== "function"))
 		throw new HarnessError("local.evaluator.registry", "trusted evaluator declaration is invalid");
 	validatedTaskInputContract(evaluator.taskInputContract);
 	const existing = registry.get(evaluator.id);

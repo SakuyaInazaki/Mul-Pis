@@ -4,8 +4,9 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import path from "node:path";
-import { LocalMissionHost, type LocalInterruptedReviewV1,
-	type LocalLegacyInterruptedReviewV1 } from "../runner/local-mission-host.ts";
+import { LocalMissionHost, validColdMigrationObservation, type LocalInterruptedReviewV1,
+	type LocalLegacyInterruptedReviewV1, type LocalColdMigrationReviewV1,
+	type ColdMigrationObservationV1 } from "../runner/local-mission-host.ts";
 import { readCurrentProcessIdentity, probeProcessIdentity,
 	type ProcessIdentityV1, type ProcessProbe } from "../runtime/process-identity.ts";
 import { Workspace } from "../workspace.ts";
@@ -39,6 +40,30 @@ async function json<T>(file: string): Promise<{ value: T; sha256: string }> {
 	return { value: JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(value)) as T,
 		sha256: hash(value) };
 }
+/** Stream an archive of any size without making its size a mission policy. */
+async function hashStableArchive(file: string): Promise<string> {
+	const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+	try {
+		const before = await handle.stat();
+		if (!before.isFile() || before.nlink !== 1 || before.size < 1)
+			fail("archive is not regular data");
+		const state = createHash("sha256");
+		const buffer = Buffer.allocUnsafe(1024 * 1024);
+		let offset = 0;
+		while (offset < before.size) {
+			const { bytesRead } = await handle.read(buffer, 0,
+				Math.min(buffer.length, before.size - offset), offset);
+			if (bytesRead < 1) fail("archive changed while read");
+			state.update(buffer.subarray(0, bytesRead));
+			offset += bytesRead;
+		}
+		const after = await handle.stat();
+		if (offset !== before.size || after.dev !== before.dev || after.ino !== before.ino ||
+			after.size !== before.size || after.mtimeMs !== before.mtimeMs)
+			fail("archive changed while read");
+		return state.digest("hex");
+	} finally { await handle.close(); }
+}
 export interface InterruptedLocalReviewRequestV1 {
 	version: 1; kind: "review-interrupted-local-dispatch";
 	missionId: string; intentId: string; oldAttemptId: string;
@@ -52,6 +77,11 @@ export interface LegacyInterruptedLocalReviewRequestV1 extends Omit<InterruptedL
 	kind: "review-legacy-interrupted-local-dispatch";
 	legacyEffectReviewFile: string; legacyEffectReviewSha256: string;
 }
+export interface ColdMigrationLocalReviewRequestV1 extends Omit<LegacyInterruptedLocalReviewRequestV1, "kind"> {
+	kind: "review-cold-migrated-local-dispatch";
+	observationFile: string; observationSha256: string;
+	archiveFile: string; archiveSha256: string;
+}
 interface ProviderProofV1 {
 	version: 1; kind: "m04-sdk-output-max-before-http-review";
 	m04RunId: string; sessionId: string;
@@ -61,30 +91,40 @@ interface ProviderProofV1 {
 	accounting: "preserve-observed-usage";
 }
 async function reconcileCore(input: {
-	workspaceRoot: string; request: InterruptedLocalReviewRequestV1 | LegacyInterruptedLocalReviewRequestV1;
+	workspaceRoot: string; request: InterruptedLocalReviewRequestV1 | LegacyInterruptedLocalReviewRequestV1 |
+		ColdMigrationLocalReviewRequestV1;
 	currentIdentity?: () => Promise<ProcessIdentityV1>;
 	probePrior?: (identity: ProcessIdentityV1) => Promise<ProcessProbe>;
 	probeProcessGroup?: (groupId: number) => Promise<boolean>;
+	verifyTrustedObservation?: (observation: ColdMigrationObservationV1) => Promise<void>;
 	dryRun?: boolean;
 	testCrashAt?: "after-prepare" | "after-rename";
 	testBeforeCommit?: () => Promise<void>;
 }): Promise<{ progress: ObjectiveProgressV1;
-	receipt: LocalInterruptedReviewV1 | LocalLegacyInterruptedReviewV1 }> {
+	receipt: LocalInterruptedReviewV1 | LocalLegacyInterruptedReviewV1 | LocalColdMigrationReviewV1 }> {
 	const request = input.request;
-	const legacy = request?.kind === "review-legacy-interrupted-local-dispatch";
+	const cold = request?.kind === "review-cold-migrated-local-dispatch";
+	const legacy = cold || request?.kind === "review-legacy-interrupted-local-dispatch";
 	if (!request || Object.keys(request).sort().join("|") !== ["version", "kind", "missionId",
 		"intentId", "oldAttemptId", "checkpointSequence", "checkpointSha256", "m07RunId",
 		"taskId", "operationId", "checkpointId", "m04RunId", "providerProofFile",
-		"providerProofSha256", ...(legacy ? ["legacyEffectReviewFile", "legacyEffectReviewSha256"] : [])].sort().join("|") || request.version !== 1 ||
-		!(["review-interrupted-local-dispatch", "review-legacy-interrupted-local-dispatch"] as unknown[]).includes(request.kind) ||
+		"providerProofSha256", ...(legacy ? ["legacyEffectReviewFile", "legacyEffectReviewSha256"] : []),
+		...(cold ? ["observationFile", "observationSha256", "archiveFile", "archiveSha256"] : [])].sort().join("|") || request.version !== 1 ||
+		!(["review-interrupted-local-dispatch", "review-legacy-interrupted-local-dispatch",
+			"review-cold-migrated-local-dispatch"] as unknown[]).includes(request.kind) ||
 		![request.missionId, request.intentId, request.oldAttemptId, request.m07RunId,
 			request.taskId, request.operationId, request.checkpointId, request.m04RunId].every(id) ||
 		!Number.isSafeInteger(request.checkpointSequence) || request.checkpointSequence < 1 ||
 		![request.checkpointSha256, request.providerProofSha256,
-			...(legacy ? [(request as LegacyInterruptedLocalReviewRequestV1).legacyEffectReviewSha256] : [])].every(x =>
+			...(legacy ? [(request as LegacyInterruptedLocalReviewRequestV1).legacyEffectReviewSha256] : []),
+			...(cold ? [(request as ColdMigrationLocalReviewRequestV1).observationSha256,
+				(request as ColdMigrationLocalReviewRequestV1).archiveSha256] : [])].every(x =>
 			typeof x === "string" && /^[0-9a-f]{64}$/.test(x)) ||
 		!path.isAbsolute(request.providerProofFile) ||
-		(legacy && !path.isAbsolute((request as LegacyInterruptedLocalReviewRequestV1).legacyEffectReviewFile)))
+		(legacy && !path.isAbsolute((request as LegacyInterruptedLocalReviewRequestV1).legacyEffectReviewFile)) ||
+		(cold && (!path.isAbsolute((request as ColdMigrationLocalReviewRequestV1).observationFile) ||
+			!path.isAbsolute((request as ColdMigrationLocalReviewRequestV1).archiveFile) ||
+			typeof input.verifyTrustedObservation !== "function")))
 		fail("review request is invalid");
 	const ws = new Workspace(input.workspaceRoot);
 	const root = path.join(ws.agentDir, "missions", request.missionId);
@@ -97,9 +137,10 @@ async function reconcileCore(input: {
 		fail("local mission host has unresolved repair evidence");
 	const committed = status.checkpointReceipts.find(row =>
 		(row.interruptedReview?.intentId === request.intentId ||
-			row.legacyInterruptedReview?.intentId === request.intentId));
+			row.legacyInterruptedReview?.intentId === request.intentId ||
+			row.coldMigrationReview?.intentId === request.intentId));
 	if (committed) {
-		const review = committed.interruptedReview ?? committed.legacyInterruptedReview!;
+		const review = committed.interruptedReview ?? committed.legacyInterruptedReview ?? committed.coldMigrationReview!;
 		if (review.oldCheckpoint.sequence !== request.checkpointSequence ||
 			review.oldCheckpoint.sha256 !== request.checkpointSha256 ||
 			review.missionId !== request.missionId ||
@@ -108,7 +149,8 @@ async function reconcileCore(input: {
 			review.m07.operationId !== request.operationId ||
 			review.m07.checkpointId !== request.checkpointId ||
 			review.m04.runId !== request.m04RunId ||
-			(review.kind === "local-legacy-interruption-host-review") !== legacy)
+			(review.kind === "local-cold-migration-host-review") !== cold ||
+			(review.kind === "local-legacy-interruption-host-review") !== (legacy && !cold))
 			fail("committed review does not match this exact retry");
 		return { progress: JSON.parse((await LocalMissionHost.readCommittedCheckpoint(root,
 			committed.sequence)).toString("utf8")) as ObjectiveProgressV1, receipt: review };
@@ -123,11 +165,35 @@ async function reconcileCore(input: {
 		checkpoint.sequence !== request.checkpointSequence || checkpoint.sha256 !== request.checkpointSha256 ||
 		!status.currentAttempt)
 		fail("old attempt or committed checkpoint is stale, unrecoverable, or already reviewed");
-	const oldProbe = await (input.probePrior ?? probeProcessIdentity)(old.process);
-	if (oldProbe.status !== "dead" || oldProbe.identityMatch ||
-		old.process.hostId !== currentProcess.hostId || old.process.bootId !== currentProcess.bootId ||
-		old.process.pid === currentProcess.pid && old.process.processStartToken === currentProcess.processStartToken)
-		fail("old process death on this host and boot is not verified");
+	let coldObservation: ColdMigrationObservationV1 | undefined;
+	if (cold) {
+		const coldRequest = request as ColdMigrationLocalReviewRequestV1;
+		const observed = await json<ColdMigrationObservationV1>(coldRequest.observationFile);
+		if (observed.sha256 !== coldRequest.observationSha256 ||
+			!validColdMigrationObservation(observed.value) ||
+			observed.sha256 !== hash(Buffer.from(`${JSON.stringify(observed.value)}\n`, "utf8")) ||
+			await hashStableArchive(coldRequest.archiveFile) !== coldRequest.archiveSha256 ||
+			observed.value.archive.sha256 !== coldRequest.archiveSha256 ||
+			observed.value.archive.checkpointSha256 !== checkpoint.sha256 ||
+			observed.value.missionId !== request.missionId || observed.value.intentId !== request.intentId ||
+			observed.value.oldAttemptId !== old.attemptId ||
+			JSON.stringify(observed.value.oldOwner) !== JSON.stringify(old.process) ||
+			observed.value.oldCheckpoint.sequence !== checkpoint.sequence ||
+			observed.value.oldCheckpoint.sha256 !== checkpoint.sha256 ||
+			observed.value.launch !== "reviewed-one-shot" ||
+			observed.value.autoRestarter !== "none-observed" ||
+			observed.value.fence !== "destination-exclusive-claim" ||
+			old.process.hostId === currentProcess.hostId)
+			fail("cold migration observation does not bind the original host and archive");
+		await input.verifyTrustedObservation!(observed.value);
+		coldObservation = observed.value;
+	} else {
+		const oldProbe = await (input.probePrior ?? probeProcessIdentity)(old.process);
+		if (oldProbe.status !== "dead" || oldProbe.identityMatch ||
+			old.process.hostId !== currentProcess.hostId || old.process.bootId !== currentProcess.bootId ||
+			old.process.pid === currentProcess.pid && old.process.processStartToken === currentProcess.processStartToken)
+			fail("old process death on this host and boot is not verified");
+	}
 	const oldBytes = await LocalMissionHost.readCommittedCheckpoint(root, checkpoint.sequence);
 	const progress = JSON.parse(oldBytes.toString("utf8")) as ObjectiveProgressV1;
 	if (progress.version !== 1 || progress.kind !== "original-objective-progress" ||
@@ -157,7 +223,9 @@ async function reconcileCore(input: {
 		const run = await ws.readRun("MISSION", runId);
 		if (run.inputs.some(item => item.path === contractFile) && run.status !== "completed" &&
 			!status.checkpointReceipts.some(row => row.interruptedReview?.intentId === runId ||
-				row.legacyInterruptedReview?.intentId === runId))
+				row.legacyInterruptedReview?.intentId === runId ||
+				row.evaluatorRecoveryReview?.intentId === runId ||
+				row.coldMigrationReview?.intentId === runId))
 			unclosedMissionRuns.push(runId);
 	}
 	if (JSON.stringify(unclosedMissionRuns) !== JSON.stringify([request.intentId]))
@@ -284,6 +352,15 @@ async function reconcileCore(input: {
 			fail("M07 feedback has another M04 knowledge transaction");
 	}
 	const legacyRequest = legacy ? request as LegacyInterruptedLocalReviewRequestV1 : undefined;
+	if (cold) {
+		const declaration = await json<{ childProcess?: { method?: string; processGroupId?: number | null } }>(
+			legacyRequest!.legacyEffectReviewFile);
+		if (declaration.sha256 !== legacyRequest!.legacyEffectReviewSha256 ||
+			declaration.value.childProcess?.method !== "reviewed-tool-and-process-census" ||
+			declaration.value.childProcess.processGroupId !== null ||
+			coldObservation!.effectCensus.processGroupId !== null)
+			fail("cross-host child-process settlement lacks an original-host reviewed census");
+	}
 	const m04Session = legacy ? m04.sessions.find(row => row.id === proof.value.sessionId) : undefined;
 	if (legacy && (m04.sessions.length !== 1 || !m04Session?.file ||
 		!path.isAbsolute(m04Session.file)))
@@ -291,7 +368,10 @@ async function reconcileCore(input: {
 	const legacyEffects = legacyRequest ? await verifyLegacyEffectReview({ ws,
 		file: legacyRequest.legacyEffectReviewFile,
 		sha256: legacyRequest.legacyEffectReviewSha256, intentId: request.intentId, goal, task,
-		m04SessionFile: m04Session!.file!, probeProcessGroup: input.probeProcessGroup }) : undefined;
+		m04SessionFile: m04Session!.file!, probeProcessGroup: cold ? async () => false :
+			input.probeProcessGroup }) : undefined;
+	if (cold && legacyEffects?.censusSha256 !== coldObservation!.effectCensus.workspaceCensusSha256)
+		fail("original-host effect census differs from the retained workspace census");
 	const nextId = `A${String(Number(status.currentAttempt!.attemptId.slice(1)) + 1).padStart(3, "0")}`;
 	const predicted = { version: 1 as const, missionId: request.missionId,
 		attemptId: nextId, predecessorAttemptId: status.currentAttempt!.attemptId,
@@ -310,8 +390,8 @@ async function reconcileCore(input: {
 			result: "failed-no-proposal" as const, lastRequest: "sdk-output-max-guard-before-http" as const,
 			providerProofSha256: proof.sha256 },
 		boundary: "new-work-only-no-old-task-or-session-replay" as const };
-	const review: LocalInterruptedReviewV1 | LocalLegacyInterruptedReviewV1 = legacyEffects ? {
-		...commonReview, kind: "local-legacy-interruption-host-review",
+	const legacyReview: LocalLegacyInterruptedReviewV1 | undefined = legacyEffects ? {
+		...commonReview, kind: "local-legacy-interruption-host-review" as const,
 		historicalExplicitDispatchBinding: false, actualArgvRecorded: false,
 		association: "host-reviewed-inferred", effects: "observed-settled-within-trusted-host-scope",
 		authority: "fresh-follow-up-only",
@@ -334,9 +414,13 @@ async function reconcileCore(input: {
 			toolCallCount: task.toolLog.length,
 			failedToolOrdinals: legacyEffects.failedToolOrdinals,
 			numericExitUnknownOrdinals: legacyEffects.numericExitUnknownOrdinals,
-			trustLimit: "same-uid-reviewed-observations-no-os-noninterference-proof" } } : {
-		...commonReview, kind: "local-interrupted-dispatch-review",
-		lineageSha256: linked!.sha256 };
+			trustLimit: "same-uid-reviewed-observations-no-os-noninterference-proof" as const } } : undefined;
+	const review: LocalInterruptedReviewV1 | LocalLegacyInterruptedReviewV1 | LocalColdMigrationReviewV1 =
+		cold ? { ...legacyReview!, kind: "local-cold-migration-host-review",
+			coldMigration: { observation: coldObservation!,
+				observationSha256: (request as ColdMigrationLocalReviewRequestV1).observationSha256 } } :
+		legacyReview ?? { ...commonReview, kind: "local-interrupted-dispatch-review",
+			lineageSha256: linked!.sha256 };
 	const next = objectiveProgress(progress.contract, {
 		boundedRuns: [...progress.boundedRuns, { runId: goal.runId, outcome: "partial", acceptedTaskIds: [] }],
 		selectedArtifacts: progress.selectedArtifacts, availableArtifacts: progress.availableArtifacts,
@@ -349,15 +433,20 @@ async function reconcileCore(input: {
 	await LocalMissionHost.commitReviewedSuccessor({ root, missionId: request.missionId,
 		bytes: nextBytes, review, currentIdentity: input.currentIdentity,
 		probePrior: input.probePrior, testCrashAt: input.testCrashAt,
+		verifyColdMigrationOrigin: cold ? input.verifyTrustedObservation : undefined,
 		verifyEvidence: async () => {
-			const again = await (input.probePrior ?? probeProcessIdentity)(old.process);
-			if (again.status !== "dead" || again.identityMatch)
-				fail("old process liveness changed before checkpoint commit");
+			if (cold) await input.verifyTrustedObservation!(coldObservation!);
+			else {
+				const again = await (input.probePrior ?? probeProcessIdentity)(old.process);
+				if (again.status !== "dead" || again.identityMatch)
+					fail("old process liveness changed before checkpoint commit");
+			}
 			if (review.kind === "local-interrupted-dispatch-review" &&
 				(await readLocalDispatchLineage({ missionRoot: root, m07Dir,
 					intentId: request.intentId })).sha256 !== review.lineageSha256)
 				fail("dispatch lineage changed before checkpoint commit");
-			if (review.kind === "local-legacy-interruption-host-review") {
+			if (review.kind === "local-legacy-interruption-host-review" ||
+				review.kind === "local-cold-migration-host-review") {
 				for (const file of [missionLineageFile(root, request.intentId),
 					goalLineageFile(m07Dir), missionLineageCommitFile(root, request.intentId)]) {
 					try { await lstat(file); fail("legacy dispatch edge appeared before checkpoint commit"); }
@@ -367,7 +456,8 @@ async function reconcileCore(input: {
 					file: legacyRequest!.legacyEffectReviewFile,
 					sha256: legacyRequest!.legacyEffectReviewSha256,
 					intentId: request.intentId, goal, task,
-					m04SessionFile: m04Session!.file!, probeProcessGroup: input.probeProcessGroup });
+					m04SessionFile: m04Session!.file!, probeProcessGroup: cold ? async () => false :
+						input.probeProcessGroup });
 				if (checked.censusSha256 !== review.associationEvidence.workspaceCensusSha256 ||
 					checked.toolLogSha256 !== review.effectEvidence.toolLogSha256)
 					fail("legacy effect or workspace census changed before checkpoint commit");
@@ -382,12 +472,20 @@ async function reconcileCore(input: {
 				[path.join(m04Dir, "m04-transaction.json"), review.m04.transactionSha256],
 				[path.join(m04Dir, "run.json"), review.m04.runSha256],
 				[request.providerProofFile, review.m04.providerProofSha256],
+				...(cold ? [
+					[(request as ColdMigrationLocalReviewRequestV1).observationFile,
+						(request as ColdMigrationLocalReviewRequestV1).observationSha256],
+					[(request as ColdMigrationLocalReviewRequestV1).archiveFile,
+						(request as ColdMigrationLocalReviewRequestV1).archiveSha256]
+				] as Array<[string, string]> : []),
 				...(review.kind === "local-interrupted-dispatch-review" ? [
 					[missionLineageFile(root, request.intentId), review.lineageSha256],
 					[goalLineageFile(m07Dir), review.lineageSha256],
 				] as Array<[string, string]> : []),
 			];
-			for (const [file, expected] of pinned) if (hash(await bytes(file)) !== expected)
+			for (const [file, expected] of pinned) if (
+				cold && file === (request as ColdMigrationLocalReviewRequestV1).archiveFile ?
+					await hashStableArchive(file) !== expected : hash(await bytes(file)) !== expected)
 				fail("review evidence changed before checkpoint commit");
 		} });
 	return { progress: next, receipt: review };
@@ -412,4 +510,17 @@ export async function reconcileLegacyInterruptedLocalMission(input: {
 	testBeforeCommit?: () => Promise<void>;
 }): Promise<{ progress: ObjectiveProgressV1; receipt: LocalLegacyInterruptedReviewV1 }> {
 	return await reconcileCore(input) as { progress: ObjectiveProgressV1; receipt: LocalLegacyInterruptedReviewV1 };
+}
+/** Host-only cold handoff. The callback must authenticate the retained platform
+ * observations and finite one-shot ownership from a trusted source, not request text. */
+export async function reconcileColdMigratedLocalMission(input: {
+	workspaceRoot: string; request: ColdMigrationLocalReviewRequestV1;
+	currentIdentity?: () => Promise<ProcessIdentityV1>;
+	probePrior?: (identity: ProcessIdentityV1) => Promise<ProcessProbe>;
+	verifyTrustedObservation: (observation: ColdMigrationObservationV1) => Promise<void>;
+	dryRun?: boolean;
+	testCrashAt?: "after-prepare" | "after-rename";
+	testBeforeCommit?: () => Promise<void>;
+}): Promise<{ progress: ObjectiveProgressV1; receipt: LocalColdMigrationReviewV1 }> {
+	return await reconcileCore(input) as { progress: ObjectiveProgressV1; receipt: LocalColdMigrationReviewV1 };
 }

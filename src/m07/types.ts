@@ -229,6 +229,14 @@ export interface UserDecision {
 	resolvedAt?: string;
 }
 
+/** Failed judgments stay negative history; their drafts confer no knowledge authority. */
+export interface M04BaselineFailure {
+	runId: string;
+	transactionState: "no-proposal" | "rejected-draft";
+	failures: string[];
+	remarks: string[];
+}
+
 export interface CurrentGoal {
 	version: 1;
 	runId: string;
@@ -245,7 +253,12 @@ export interface CurrentGoal {
 	problemSnapshotPath: string;
 	knowledgeSnapshot?: string;
 	m04BaselineRunId?: string;
-	baselineHistory: Array<{ at: string; knowledgeSnapshot?: string; m04RunId: string }>;
+	/** Explicitly acknowledged failed suffix, frozen even for an exploratory goal. */
+	m04BaselineFailures?: M04BaselineFailure[];
+	/** Host-selected original material scope; legacy goals retain workspace raw inputs. */
+	checkpointRawScope?: "workspace" | "none";
+	baselineHistory: Array<{ at: string; knowledgeSnapshot?: string; m04RunId: string;
+		failedM04?: M04BaselineFailure[] }>;
 	/** Frozen at begin; later promotion or rollback applies only to a new goal. Optional only for explicit legacy-record detection. */
 	budgetPolicy?: BudgetPolicy;
 	budgetPolicyVersionId?: string;
@@ -280,7 +293,8 @@ export interface CurrentGoal {
 }
 
 export interface M07Controller {
-	begin(input: BeginGoalInput, options?: { executionContract?: "continuous" }): Promise<CurrentGoal>;
+	begin(input: BeginGoalInput, options?: { executionContract?: "continuous";
+		checkpointRawScope?: "workspace" | "none" }): Promise<CurrentGoal>;
 	status(runId: string): Promise<CurrentGoal>;
 	plan(runId: string, plan: string, options?: { refreshBaseline?: boolean; checkpointId?: string; m04RunId?: string }): Promise<CurrentGoal>;
 	checkpoint(runId: string, options?: { taskIds?: string[] }): Promise<M07CheckpointRecord>;

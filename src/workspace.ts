@@ -68,7 +68,7 @@ async function withRunWrite<T>(key: string, body: () => Promise<T>): Promise<T> 
 	}
 }
 
-function latestByStartOrder(records: StageRunRecord[], stage: string): StageRunRecord | undefined {
+export function latestByStartOrder(records: StageRunRecord[], stage: string): StageRunRecord | undefined {
 	if (!records.length) return undefined;
 	const observed = records.map((record) => Date.parse(record.startedAt));
 	if (observed.some((time) => !Number.isFinite(time)) || records.some((record) => record.startSequence !== undefined && (!Number.isSafeInteger(record.startSequence) || record.startSequence < 1))) {

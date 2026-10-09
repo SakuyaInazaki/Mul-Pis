@@ -124,12 +124,22 @@ interface M07ReadGap {
 	relative: string;
 	missingRanges: Array<{ start: number; end: number }>;
 	terminalPageMissing: boolean;
+	emptyFile?: true;
 }
 
 async function m07ReadGaps(root: string, required: string[], returned: ReadReturnEvent[]): Promise<M07ReadGap[]> {
 	const gaps: M07ReadGap[] = [];
 	for (const relative of required) {
-		const content = await readFile(path.join(root, relative), "utf8");
+		const bytes = await readFile(path.join(root, relative));
+		if (bytes.length === 0) {
+			const completeEmptyRead = returned.some(event => event.toolName === "m07_evidence_read" &&
+				event.path === relative && event.status === "no-content" && event.returned.kind === "text" &&
+				event.returned.truncated === false && event.returned.startLine === undefined &&
+				event.returned.endLine === undefined);
+			if (!completeEmptyRead) gaps.push({ relative, missingRanges: [], terminalPageMissing: false, emptyFile: true });
+			continue;
+		}
+		const content = bytes.toString("utf8");
 		const lineCount = content.split(/\r?\n/).length - (content.endsWith("\n") ? 1 : 0);
 		if (lineCount < 1) throw new HarnessError("m04.m07-evidence", "required M07 evidence line count is unavailable");
 		const ranges: Array<{ start: number; end: number }> = [];
@@ -150,7 +160,8 @@ async function m07ReadGaps(root: string, required: string[], returned: ReadRetur
 			nextUnread = Math.max(nextUnread, range.end + 1);
 		}
 		if (nextUnread <= lineCount) missingRanges.push({ start: nextUnread, end: lineCount });
-		if (!completeTerminalPage || missingRanges.length) gaps.push({ relative, missingRanges, terminalPageMissing: !completeTerminalPage });
+		if (!completeTerminalPage || missingRanges.length) gaps.push({ relative, missingRanges,
+			terminalPageMissing: !completeTerminalPage });
 	}
 	return gaps;
 }
@@ -670,8 +681,8 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 								throw new HarnessError("m04.m07-evidence", "required selected M07 evidence was not returned in full because its read tool reported an error");
 							const guidance = ["Your M04 judgement is provisional. The host has not verified full m07_evidence_read returns for every required selected M07 file, so no knowledge proposal can be accepted yet.",
 								"Next missing returned range for each file (one-based lines; the host will recalculate further gaps after your next read):",
-								...gaps.map(gap => `- ${gap.relative}: ${gap.missingRanges.length ? `${gap.missingRanges[0].start}-${gap.missingRanges[0].end}; ${gap.missingRanges.length - 1} further gaps remain` : "all lines returned"}${gap.terminalPageMissing ? "; an untruncated final page is also required" : ""}`),
-								"Use the same read-only session to read the stated next missing range for each file, including an untruncated final page where needed. The host will give further ranges until all are complete. Then reconsider the evidence and return a revised M04 judgement in the required format. A path, summary, malformed response, or earlier proposal is not proof of a complete read. Do not force a knowledge proposal if the evidence does not support one."].join("\n\n");
+								...gaps.map(gap => `- ${gap.relative}: ${gap.emptyFile ? "empty file needs an untruncated no-content text return without a line range" : gap.missingRanges.length ? `${gap.missingRanges[0].start}-${gap.missingRanges[0].end}; ${gap.missingRanges.length - 1} further gaps remain` : "all lines returned"}${gap.terminalPageMissing ? "; an untruncated final page is also required" : ""}`),
+								"Use the same read-only session to read the stated next missing range for each nonempty file, including an untruncated final page where needed. Read an empty file by its exact path and do not invent a line range. The host will give further ranges until all are complete. Then reconsider the evidence and return a revised M04 judgement in the required format. A path, summary, malformed response, or earlier proposal is not proof of a complete read. Do not force a knowledge proposal if the evidence does not support one."].join("\n\n");
 							request = await repairJudgment("unread-m07-evidence", gaps,
 								workflowRepairFingerprint({ gaps }), guidance);
 							continue;

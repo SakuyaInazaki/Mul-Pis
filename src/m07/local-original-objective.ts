@@ -14,6 +14,7 @@ import type { StageContext } from "../stages/context.ts";
 import { HarnessError } from "../types.ts";
 import type { Workspace } from "../workspace.ts";
 import { createM07Controller } from "./controller.ts";
+import type { M04BaselineIdentity } from "./formal-baseline.ts";
 import type { M07Controller } from "./types.ts";
 import { readLocalMaterialBundle, validateLocalMaterialSelections,
 	type LocalMaterialSelection } from "./local-material-bundle.ts";
@@ -85,8 +86,17 @@ export function publicLocalMissionStatus(progress: ObjectiveProgressV1) {
 export interface LocalObjectiveFrozenEvidence {
 	contractFile: string;
 	evidence: Array<{ name: string; file: string }>;
+	/** Host-authorized raw workspace scope for M07 checkpoint snapshots. */
+	checkpointRawScope?: "workspace" | "none";
 	/** Host-frozen original file identities supplied to evaluator preflight. */
 	frozenOriginalInputs?: Array<{ name: string; bytes: number; sha256: string }>;
+	/** Saved-assessment only: exact live inputs and copied evidence checked at dispatch. */
+	retainedInputIdentity?: { problemSha256: string;
+		knowledgeSnapshot: string | null;
+		m04BaselineIdentity: M04BaselineIdentity;
+		rawAuthority: "original-raw" | "declared-materials";
+		raw: Array<{ name: string; sha256: string }>;
+		evidence: Array<{ name: string; sha256: string }> };
 	evidenceRoot: string;
 	capabilities: ObjectiveCapabilityV1[];
 	selectedArtifacts: string[];
@@ -129,6 +139,15 @@ export interface LocalObjectiveHostPort {
 	/** Recheck trusted local control immediately before any new M07 dispatch. */
 	currentUnknownOperationIds(): Promise<string[]>;
 	currentUnrepresentedM07RunIds(progress: ObjectiveProgressV1): Promise<string[]>;
+	/** Default host may settle one exact crashed evaluator dispatch before the unknown gate. */
+	recoverInterruptedEvaluator?(input: { ctx: StageContext; controller: M07Controller;
+		contract: OriginalObjectiveContractV1; progress: ObjectiveProgressV1 }):
+		Promise<ObjectiveProgressV1 | undefined>;
+	/** Default built-in adapter only: prove a held intent issued no M07/provider work. */
+	recoverUnissuedAssessment?(input: { contract: OriginalObjectiveContractV1;
+		progress: ObjectiveProgressV1 }): Promise<{
+		intentId: string; task: ObjectiveNextTaskV1; frozen: LocalObjectiveFrozenEvidence;
+		release(): void } | { busy: true } | undefined>;
 	/** Optional authority path. The host must verify M07 review and M04 evidence first. */
 	reviewSelection?(input: { ctx: StageContext; controller: M07Controller;
 		contract: OriginalObjectiveContractV1;
@@ -167,6 +186,7 @@ export interface LocalObjectiveAdvanceResult {
 	selectedTaskId?: string; m04RunId?: string;
 	checkpointId?: string; evaluatorReceiptPath?: string;
 	requiredM07ReadPaths?: string[];
+	selectionProofGap?: ObjectiveProgressV1["boundedRuns"][number]["selectionProofGap"];
 	unresolvedOperationRefs?: string[];
 }
 
@@ -211,7 +231,7 @@ async function checkedSelectionReview(workspaceRoot: string, contract: OriginalO
 		const handle = await open(item.file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
 		try {
 			const before = await handle.stat();
-			if (!before.isFile() || before.nlink !== 1 || before.size < 1 || before.size > 64 * 1024 * 1024)
+			if (!before.isFile() || before.nlink !== 1 || before.size < 0 || before.size > 64 * 1024 * 1024)
 				throw new HarnessError("local.objective.review", "selected artifact is not a bounded regular file");
 			const bytes = await handle.readFile();
 			const after = await handle.stat();
@@ -276,22 +296,47 @@ export function createLocalOriginalObjectiveCaller(input: { ws: Workspace;
 			await host.verifyCurrentFulfillment(progress);
 		return { host, progress };
 	};
-	const stepCore = async (missionId: string): Promise<{ progress: ObjectiveProgressV1;
+	const stepCoreUnlocked = async (missionId: string): Promise<{ progress: ObjectiveProgressV1;
 		advanced: boolean; stopReason: CurrentObjectiveStopReason }> => {
 		const ctx = requireContext();
 		const { host, progress: previous } = await load(missionId);
+		if (host.recoverInterruptedEvaluator) {
+			const recovered = await host.recoverInterruptedEvaluator({ ctx,
+				controller: input.controller ?? createM07Controller(ctx),
+				contract: previous.contract, progress: previous });
+			if (recovered) {
+				if (recovered.stopReason !== "execution-interrupted" &&
+					recovered.stopReason !== "objective-reassessment-pending")
+					throw new HarnessError("local.objective.recovery", "host recovery returned an invalid control boundary");
+				return { progress: recovered,
+					advanced: recovered.stopReason === "objective-reassessment-pending",
+					stopReason: recovered.stopReason };
+			}
+		}
+		const candidate = await host.recoverUnissuedAssessment?.({ contract: previous.contract,
+			progress: previous });
+		if (candidate && "busy" in candidate)
+			return { progress: previous, advanced: false, stopReason: "execution-interrupted" };
+		const retained = candidate;
+		if (!retained && previous.stopReason === "execution-interrupted" &&
+			previous.continuation.unresolvedOperationIds.length &&
+			!(await host.currentUnknownOperationIds()).length &&
+			!(await host.currentUnrepresentedM07RunIds(previous)).length)
+			return { progress: previous, advanced: false, stopReason: "execution-interrupted" };
+		try {
 		const iteration = previous.assessmentHistory.length + 1;
-		const frozen = await host.freeze({ contract: previous.contract, progress: previous, iteration });
+		const frozen = retained?.frozen ?? await host.freeze({ contract: previous.contract,
+			progress: previous, iteration });
 		if (JSON.stringify(frozen.selectedArtifacts) !== JSON.stringify(previous.selectedArtifacts))
 			throw new HarnessError("local.objective.selection", "host evidence changed selected authority without a reviewed checkpoint");
 		const priorUnknown = previous.continuation.unresolvedOperationIds;
 		const currentUnknown = [...new Set([...frozen.unresolvedOperationIds,
-			...(frozen.unrepresentedM07RunIds ?? [])])];
+			...(frozen.unrepresentedM07RunIds ?? [])])].filter(id => id !== retained?.intentId);
 		if (previous.stopReason === "assessment-validation-pending" &&
 			!frozen.priorDispatchReconciled && !currentUnknown.includes(missionId))
 			currentUnknown.push(missionId);
 		if (priorUnknown.some(id => !currentUnknown.includes(id) &&
-			!frozen.reconciledOperationIds?.includes(id)))
+			!frozen.reconciledOperationIds?.includes(id) && id !== retained?.intentId))
 			throw new HarnessError("local.objective.operations", "previous unknown operation lacks a host reconciliation receipt");
 		if (currentUnknown.length) {
 			const blocked = objectiveProgress(previous.contract, { boundedRuns: previous.boundedRuns,
@@ -309,6 +354,8 @@ export function createLocalOriginalObjectiveCaller(input: { ws: Workspace;
 			frozen.boundedRunEvidence[row.runId]!.some(name => !evidenceNames.has(name))))
 			throw new HarnessError("local.objective.history", "prior bounded-run feedback was not frozen for reassessment");
 		if (frozen.evaluatorCapabilityGap) {
+			if (retained) return { progress: previous, advanced: false,
+				stopReason: "execution-interrupted" };
 			const held = objectiveProgress(previous.contract, { boundedRuns: previous.boundedRuns,
 				selectedArtifacts: previous.selectedArtifacts,
 				availableArtifacts: frozen.availableArtifacts ?? previous.availableArtifacts,
@@ -320,6 +367,8 @@ export function createLocalOriginalObjectiveCaller(input: { ws: Workspace;
 			return { progress: held, advanced: false, stopReason: "next-task-needs-capability" };
 		}
 		if (ctx.signal?.aborted) {
+			if (retained) return { progress: previous, advanced: false,
+				stopReason: "execution-interrupted" };
 			const cancelled = objectiveProgress(previous.contract, { boundedRuns: previous.boundedRuns,
 				selectedArtifacts: previous.selectedArtifacts,
 				assessment: previous.assessment, assessmentHistory: previous.assessmentHistory,
@@ -342,8 +391,9 @@ export function createLocalOriginalObjectiveCaller(input: { ws: Workspace;
 		} else if (selectedArtifacts.length)
 			throw new HarnessError("local.objective.review", "selected checkpoint lacks its host review receipt");
 		const controller = input.controller ?? createM07Controller(ctx);
-		const record = await ws.startRun("MISSION", [{ label: "Frozen original objective",
-			path: frozen.contractFile }]);
+		const record = retained ? await ws.readRun("MISSION", retained.intentId) :
+			await ws.startRun("MISSION", [{ label: "Frozen original objective",
+				path: frozen.contractFile }]);
 		const history = [...previous.assessmentHistory];
 		let bounded = [...previous.boundedRuns];
 		let newUnknownRefs: string[] = [];
@@ -356,9 +406,82 @@ export function createLocalOriginalObjectiveCaller(input: { ws: Workspace;
 				selectedArtifacts: previous.selectedArtifacts, assessment, assessmentHistory: history,
 				stopReason: "assessment-validation-pending", pendingActionFacts: frozen.pendingActionFacts ?? {} }));
 		};
+		const dispatchTask = async (task: ObjectiveNextTaskV1): Promise<LocalObjectiveAdvanceResult> => {
+			const dispatchFrozen = retained?.frozen ?? frozen;
+			const adapter = adapters.find(item => item.scope === task.adapterScope);
+			if (!adapter || !dispatchFrozen.capabilities.some(item =>
+				item.scope === task.adapterScope && item.available))
+				throw new HarnessError("local.objective.adapter", "assessor chose an unavailable local adapter");
+			const freshUnknown = [...new Set([
+				...await host.currentUnknownOperationIds(),
+				...await host.currentUnrepresentedM07RunIds(previous)])];
+			if (freshUnknown.length) {
+				const refs = retained ? [...new Set([retained.intentId, ...freshUnknown])] : freshUnknown;
+				const held = objectiveProgress(previous.contract, {
+					boundedRuns: bounded, selectedArtifacts: previous.selectedArtifacts,
+					assessment: history.at(-1)?.assessment ?? previous.assessment,
+					assessmentHistory: history, stopReason: "execution-interrupted",
+					unresolvedOperationIds: refs,
+					pendingActionFacts: { unresolvedOperationRefs: refs,
+						failedStage: "m07-execution" } });
+				await host.recordCheckpoint(held);
+				throw new LocalObjectiveControlHold(held);
+			}
+			// A retained no-issued assessment keeps its original unresolved intent.
+			// Its host has already committed an identical, current-owner checkpoint.
+			if (!retained) await host.recordCheckpoint(objectiveProgress(previous.contract, {
+				boundedRuns: bounded, selectedArtifacts: previous.selectedArtifacts,
+				assessment: history.at(-1)?.assessment ?? previous.assessment,
+				assessmentHistory: history, stopReason: "execution-interrupted",
+				unresolvedOperationIds: [record.runId],
+				pendingActionFacts: { unresolvedOperationRefs: [record.runId],
+					target: { goalRunId: record.runId }, failedStage: "m07-execution" } }));
+			const result = await adapter.advance({ ctx, controller, runM04,
+				contract: previous.contract, frozen: dispatchFrozen, task,
+				recordDispatchLineage: host.recordDispatchLineage ?
+					(m07RunId, taskId) => host.recordDispatchLineage!({ intentId: record.runId,
+						m07RunId, taskId, assessorTask: task }) : undefined });
+			if (!result || typeof result.runId !== "string" || !result.runId ||
+				typeof result.outcome !== "string" || !result.outcome ||
+				!Array.isArray(result.acceptedTaskIds) ||
+				result.acceptedTaskIds.some(id => typeof id !== "string" || !id) ||
+				(result.m04RunId !== undefined && (typeof result.m04RunId !== "string" || !result.m04RunId)) ||
+				(result.checkpointId !== undefined && (typeof result.checkpointId !== "string" || !result.checkpointId)) ||
+				result.unresolvedOperationRefs !== undefined &&
+					(!Array.isArray(result.unresolvedOperationRefs) ||
+						result.unresolvedOperationRefs.some(id => typeof id !== "string" || !id)) ||
+				(result.selectionProofGap !== undefined &&
+					(result.selectedTaskId !== undefined || result.outcome !== "partial" ||
+					 result.acceptedTaskIds.length !== 1 ||
+					 result.selectionProofGap.runId !== result.runId ||
+					 !/^[0-9a-f]{64}$/.test(result.selectionProofGap.evaluatorReceiptSha256))) ||
+				result.selectedTaskId && !result.acceptedTaskIds.includes(result.selectedTaskId))
+				throw new HarnessError("local.objective.adapter", "local adapter returned invalid reviewed bounded-run facts");
+			bounded = [...bounded, { runId: result.runId, outcome: result.outcome,
+				acceptedTaskIds: result.acceptedTaskIds,
+				...(result.selectionProofGap ? { selectionProofGap: result.selectionProofGap } : {}),
+				...(result.selectedTaskId ? { selectedTaskId: result.selectedTaskId } : {}) }];
+			if (result.outcome === "unknown" || result.unresolvedOperationRefs?.length)
+				newUnknownRefs = [...new Set([...(retained ? [retained.intentId] : []),
+					...(result.unresolvedOperationRefs?.length ? result.unresolvedOperationRefs : [result.runId])])];
+			if (!newUnknownRefs.length && host.reviewSelection) {
+				const review = await host.reviewSelection({ ctx, controller,
+					contract: previous.contract, frozen: dispatchFrozen, run: result });
+				if (review) {
+					const checked = await checkedSelectionReview(ws.root, previous.contract, result, review);
+					selectedArtifacts = checked.selectedArtifacts;
+					originalChecks = checked.originalChecks;
+				}
+			}
+			return result;
+		};
 		let step;
 		try {
-			step = await assessAndAdvanceOriginalObjective({ contract: previous.contract,
+			if (retained) {
+				await dispatchTask(retained.task);
+				step = { assessment: previous.assessment, advanced: true,
+					stopReason: "objective-reassessment-pending" as const };
+			} else step = await assessAndAdvanceOriginalObjective({ contract: previous.contract,
 				contractFile: frozen.contractFile, runner: ctx.runner,
 				sessionSpec: { label: `local-original-objective-${iteration}`, role: "research",
 					model: resolveRoleModel(ctx.config, "research"), persistDir: ws.sessionsDir,
@@ -377,71 +500,13 @@ export function createLocalOriginalObjectiveCaller(input: { ws: Workspace;
 				recordAssessment,
 				recordValidationFailure: host.recordValidationFailure,
 				recordRepairState: host.recordRepairState,
-				advance: async task => {
-					const adapter = adapters.find(item => item.scope === task.adapterScope);
-					if (!adapter || !frozen.capabilities.some(item => item.scope === task.adapterScope && item.available))
-						throw new HarnessError("local.objective.adapter", "assessor chose an unavailable local adapter");
-					const freshUnknown = [...new Set([
-						...await host.currentUnknownOperationIds(),
-						...await host.currentUnrepresentedM07RunIds(previous)])];
-					if (freshUnknown.length) {
-						const held = objectiveProgress(previous.contract, {
-							boundedRuns: bounded, selectedArtifacts: previous.selectedArtifacts,
-							assessment: history.at(-1)?.assessment ?? previous.assessment,
-							assessmentHistory: history, stopReason: "execution-interrupted",
-							unresolvedOperationIds: freshUnknown,
-							pendingActionFacts: { unresolvedOperationRefs: freshUnknown,
-								failedStage: "m07-execution" } });
-						await host.recordCheckpoint(held);
-						throw new LocalObjectiveControlHold(held);
-					}
-					// This exact MISSION run ID is a no-replay control intent. A crash
-					// after this write requires host census of M07/M04 before any retry.
-					await host.recordCheckpoint(objectiveProgress(previous.contract, {
-						boundedRuns: bounded, selectedArtifacts: previous.selectedArtifacts,
-						assessment: history.at(-1)?.assessment ?? previous.assessment,
-						assessmentHistory: history, stopReason: "execution-interrupted",
-						unresolvedOperationIds: [record.runId],
-						pendingActionFacts: { unresolvedOperationRefs: [record.runId],
-							target: { goalRunId: record.runId }, failedStage: "m07-execution" } }));
-					const result = await adapter.advance({ ctx, controller, runM04,
-						contract: previous.contract, frozen, task,
-						recordDispatchLineage: host.recordDispatchLineage ?
-							(m07RunId, taskId) => host.recordDispatchLineage!({ intentId: record.runId,
-								m07RunId, taskId, assessorTask: task }) : undefined });
-					if (!result || typeof result.runId !== "string" || !result.runId ||
-						typeof result.outcome !== "string" || !result.outcome ||
-						!Array.isArray(result.acceptedTaskIds) ||
-						result.acceptedTaskIds.some(id => typeof id !== "string" || !id) ||
-						(result.m04RunId !== undefined && (typeof result.m04RunId !== "string" || !result.m04RunId)) ||
-						(result.checkpointId !== undefined && (typeof result.checkpointId !== "string" || !result.checkpointId)) ||
-						result.unresolvedOperationRefs !== undefined &&
-							(!Array.isArray(result.unresolvedOperationRefs) ||
-								result.unresolvedOperationRefs.some(id => typeof id !== "string" || !id)) ||
-						result.selectedTaskId && !result.acceptedTaskIds.includes(result.selectedTaskId))
-						throw new HarnessError("local.objective.adapter", "local adapter returned invalid reviewed bounded-run facts");
-					bounded = [...bounded, { runId: result.runId, outcome: result.outcome,
-						acceptedTaskIds: result.acceptedTaskIds,
-						...(result.selectedTaskId ? { selectedTaskId: result.selectedTaskId } : {}) }];
-					if (result.outcome === "unknown" || result.unresolvedOperationRefs?.length)
-						newUnknownRefs = result.unresolvedOperationRefs?.length ?
-							[...result.unresolvedOperationRefs] : [result.runId];
-					if (!newUnknownRefs.length && host.reviewSelection) {
-						const review = await host.reviewSelection({ ctx, controller,
-							contract: previous.contract,
-							frozen, run: result });
-						if (review) {
-							const checked = await checkedSelectionReview(ws.root, previous.contract, result, review);
-							selectedArtifacts = checked.selectedArtifacts;
-							originalChecks = checked.originalChecks;
-						}
-					}
-					return result;
-				} });
-			await ws.finishRun(record, step.assessment ? "completed" : "failed");
+				advance: dispatchTask });
+			if (!retained) await ws.finishRun(record, step.assessment ? "completed" : "failed");
 		} catch (error) {
-			record.failures.push("Local objective assessment or bounded dispatch was interrupted");
-			await ws.finishRun(record, "failed").catch(() => undefined);
+			if (!retained) {
+				record.failures.push("Local objective assessment or bounded dispatch was interrupted");
+				await ws.finishRun(record, "failed").catch(() => undefined);
+			}
 			if (error instanceof LocalObjectiveControlHold)
 				return { progress: error.progress, advanced: false, stopReason: "execution-interrupted" };
 			throw error;
@@ -461,7 +526,9 @@ export function createLocalOriginalObjectiveCaller(input: { ws: Workspace;
 				...(newUnknownRefs.length ? { unresolvedOperationRefs: newUnknownRefs } : {}) } });
 		await host.recordCheckpoint(next);
 		return { progress: next, advanced: Boolean(step.advanced), stopReason: effectiveStopReason };
+		} finally { retained?.release(); }
 	};
+	const stepCore = stepCoreUnlocked;
 	return {
 		async begin(value) {
 			const request = validateLocalObjectiveRequest(value);

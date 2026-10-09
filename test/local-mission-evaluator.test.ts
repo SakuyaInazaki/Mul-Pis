@@ -31,6 +31,8 @@ const syntheticTaskContract = {
 				checks: { type: "array", items: { type: "object" } } }, additionalProperties: false },
 		example: { items: ["SyntheticItem"], checks: [] } }],
 };
+const sourceEditContract = { ...syntheticTaskContract,
+	instructions: "Edit only the declared candidate source region and supply task-input.json; preserve all other original source bytes." };
 const lineCount = (text: string) => text.split(/\r?\n/).length - Number(text.endsWith("\n"));
 const selectedCandidate = (names: readonly string[]) => names.find(name =>
 	/^candidate-001-[0-9a-f]{16}\.md$/.test(name));
@@ -84,7 +86,13 @@ async function readEvents(root: string, toolName: string): Promise<ReadReturnEve
 			const file = path.join(dir, name);
 			if ((await stat(file)).isDirectory()) { await visit(file); continue; }
 			const text = await readFile(file, "utf8");
-			if (!text.length) continue;
+			if (!text.length) {
+				events.push({ toolName, status: "no-content",
+					path: path.relative(root, file).replaceAll("\\", "/"),
+					requested: {}, returned: { kind: "text", truncated: false },
+					at: new Date().toISOString() });
+				continue;
+			}
 			events.push({ toolName, status: "returned", path: path.relative(root, file).replaceAll("\\", "/"),
 				requested: {}, returned: { kind: "text", startLine: 1,
 					endLine: lineCount(text), truncated: false }, at: new Date().toISOString() });
@@ -99,6 +107,14 @@ async function finiteFixture(t: TestContext, options: {
 	partialObligations?: boolean; exploratory?: boolean; m04FullRead?: boolean;
 	obligationType?: string; m04SkipObservation?: boolean;
 	expectTaskContract?: boolean; forgeTaskContractAfterAssessment?: boolean;
+	emptyAuxiliary?: boolean;
+	distinctSecondAssessment?: boolean;
+	skipProofGapRead?: boolean;
+	repairSecondAssessment?: boolean; skipRepairFeedbackRead?: boolean;
+	skipCommittedKnowledgeRead?: boolean;
+	seedKnowledge?: boolean; taskContract?: typeof syntheticTaskContract;
+	expectedRepairFeedbackSha256?: string; expectedEditContractSha256?: string;
+	execution?: "task-root-bash";
 } = {}) {
 	const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-finite-"));
 	t.after(() => rm(root, { recursive: true, force: true }));
@@ -107,9 +123,17 @@ async function finiteFixture(t: TestContext, options: {
 	await writeFile(ws.problemFile, "Produce the exact synthetic finite answer.\n");
 	const store = createFileKnowledgeStore(ws.knowledgeDir);
 	await runInit(ws, store);
+	if (options.seedKnowledge) {
+		const receipt = await store.submitProposal({ stage: "M04", runId: "synthetic-retained-knowledge",
+			ops: [{ op: "create", type: "E", title: "Retained synthetic M04 evidence",
+				body: "A synthetic evidence record remains visible to later local tasks.",
+				usageDecision: "adopted" }] });
+		await store.merge(receipt.proposalId);
+	}
 	const config = { roles: { research: "fake/research", execution: "fake/execution" },
 		...(options.evaluatorId === null ? {} : { localMission: {
-			evaluatorId: options.evaluatorId ?? "host:file-sha256" } }), concurrency: 1, tools: {} };
+			evaluatorId: options.evaluatorId ?? "host:file-sha256",
+			...(options.execution ? { execution: options.execution } : {}) } }), concurrency: 1, tools: {} };
 	let missionId = "";
 	let assessorCalls = 0, m04Calls = 0, builderCalls = 0;
 	const runner = new FakeSessionRunner(async ({ spec, message }) => {
@@ -124,6 +148,12 @@ async function finiteFixture(t: TestContext, options: {
 		}
 		if (spec.label.startsWith("M07-")) {
 			builderCalls++;
+			if (options.emptyAuxiliary) {
+				assert.equal(spec.tools.kind, "execution");
+				const deliverable = path.join(spec.tools.root, "deliverable");
+				await mkdir(deliverable);
+				await writeFile(path.join(deliverable, "compile.log"), "", { mode: 0o600 });
+			}
 			if (options.expectTaskContract) {
 				assert.match(message, /Before producing files, read the complete host-evaluator-task-input-/);
 				assert.equal(spec.tools.kind, "read-dir");
@@ -134,7 +164,7 @@ async function finiteFixture(t: TestContext, options: {
 				const delivered = JSON.parse(await readFile(path.join(inputs, name), "utf8")) as {
 					binding: { missionId: string }; contract: unknown };
 				assert.equal(delivered.binding.missionId, missionId);
-				assert.deepEqual(delivered.contract, syntheticTaskContract);
+				assert.deepEqual(delivered.contract, options.taskContract ?? syntheticTaskContract);
 			}
 			return options.candidate ?? answer;
 		}
@@ -142,7 +172,14 @@ async function finiteFixture(t: TestContext, options: {
 			assessorCalls++;
 			assert.equal(spec.tools.kind, "read-dir");
 			if (spec.tools.kind !== "read-dir") throw new Error("assessor lacks frozen evidence");
-			const readReturns = await readEvents(spec.tools.root, "objective_evidence_read");
+			const readReturns = (await readEvents(spec.tools.root, "objective_evidence_read"))
+				.filter(item => !options.skipProofGapRead ||
+					!item.path.startsWith("selection-proof-gap-"))
+				.filter(item => !options.skipRepairFeedbackRead ||
+					!item.path.startsWith("prior-run-1-feedback-"))
+				.filter(item => !options.skipCommittedKnowledgeRead ||
+					!item.path.startsWith("published-knowledge-") ||
+					item.path.endsWith("-index.json"));
 			if (options.forgeTaskContractAfterAssessment && assessorCalls === 1) {
 				const dir = path.join(ws.agentDir, "missions", missionId, "evidence");
 				const name = (await readdir(dir)).find(item => item.startsWith("host-evaluator-task-input-"));
@@ -153,6 +190,81 @@ async function finiteFixture(t: TestContext, options: {
 			const issue = { id: "finite-gap", claim: "Exact answer has not been checked", status: "open",
 				classification: "explicit-requirement", sourceRefs: [{ sourceId: "original-problem.txt",
 					startLine: 1, endLine: 1 }], implication: "A checked candidate can settle this task" };
+			if (options.repairSecondAssessment && assessorCalls >= 2) {
+				const names = await readdir(spec.tools.root);
+				const feedbackName = names.find(item => item.startsWith("prior-run-1-feedback-"));
+				const contractName = names.find(item => item.startsWith("host-evaluator-task-input-2-"));
+				const knowledgeIndexName = names.find(item => item.startsWith("published-knowledge-") &&
+					item.endsWith("-index.json"));
+				assert(feedbackName && contractName, "repair feedback and edit contract must be frozen together");
+				assert(knowledgeIndexName, "the current committed knowledge index must be frozen");
+				const knowledgeIndex = JSON.parse(await readFile(path.join(spec.tools.root,
+					knowledgeIndexName), "utf8")) as { snapshotId: string;
+					records: Array<{ id: string; version: number }>;
+					packSha256: string; parts: Array<{ name: string; sha256: string }> };
+				assert.equal(knowledgeIndex.snapshotId, "G001");
+				assert.deepEqual(knowledgeIndex.records.map(item => `${item.id}@${item.version}`), ["E001@1"]);
+				const assessmentEvidenceRoot = spec.tools.root;
+				const knowledgeParts = await Promise.all(knowledgeIndex.parts.map(async part => {
+					const bytes = await readFile(path.join(assessmentEvidenceRoot, part.name));
+					assert.equal(createHash("sha256").update(bytes).digest("hex"), part.sha256);
+					return bytes;
+				}));
+				assert.equal(createHash("sha256").update(Buffer.concat(knowledgeParts)).digest("hex"),
+					knowledgeIndex.packSha256);
+				assert.match(Buffer.concat(knowledgeParts).toString("utf8"), /Retained synthetic M04 evidence/);
+				assert(readReturns.some(item => item.path === knowledgeIndexName && item.status === "returned"));
+				if (!options.skipCommittedKnowledgeRead)
+					assert(knowledgeIndex.parts.every(part => readReturns.some(item =>
+						item.path === part.name && item.status === "returned")),
+						"the assessor must read the committed knowledge pack before dispatch");
+				assert.equal(createHash("sha256").update(await readFile(path.join(spec.tools.root,
+					feedbackName))).digest("hex"), options.expectedRepairFeedbackSha256);
+				assert.equal(createHash("sha256").update(await readFile(path.join(spec.tools.root,
+					contractName))).digest("hex"), options.expectedEditContractSha256);
+				assert(readReturns.some(item => item.path === contractName && item.status === "returned"),
+					"the assessor must read the edit contract before the next task");
+				if (!options.skipRepairFeedbackRead)
+					assert(readReturns.some(item => item.path === feedbackName && item.status === "returned"),
+						"the assessor must read exact repair feedback before the next task");
+				assert.equal((await store.current())?.id, "G001",
+					"published M04 knowledge must remain visible during repair");
+				return { text: JSON.stringify({ version: 1, decision: "continue",
+					rationale: "The prior rejected task needs corrected source within the declared edit scope.",
+					evidenceRefs: ["original-problem.txt"], unresolvedObligations: ["answer"],
+					unresolvedDetails: [issue.claim], groundedAssessment: {
+						version: 1, kind: "grounded-assessment-proposal", contractId: missionId,
+						missionStatus: "open", issues: [issue], legacyOpenDetails: [issue.claim],
+						nextTask: { objective: "Repair the candidate within the declared source edit scope",
+							obligationIds: ["answer"], addresses: [issue.id],
+							adapterScope: options.execution ? "local-m07-execute" : "local-m07-reason",
+							decisionChangingHypothesis: "The corrected candidate can pass host validation",
+							expectedEvidence: "A source-valid candidate and host evaluator receipt",
+							sourceRefs: [...issue.sourceRefs,
+								...(!options.skipCommittedKnowledgeRead ? [{ sourceId: knowledgeIndex.parts[0]!.name,
+									startLine: 1, endLine: 1 }] : [])] } } }), readReturns };
+			}
+			if (options.distinctSecondAssessment && assessorCalls >= 2) {
+				const gapName = (await readdir(spec.tools.root)).find(item =>
+					item.startsWith("selection-proof-gap-"));
+				assert(gapName, "the missing selection proof must be frozen for the next assessor");
+				if (!options.skipProofGapRead)
+					assert(readReturns.some(item => item.path === gapName && item.status === "returned"),
+						"the next assessor must read the proof gap in full");
+				return { text: JSON.stringify({ version: 1, decision: "continue",
+					rationale: "The host observation did not cite candidate bytes; a distinct task must supply that proof.",
+					evidenceRefs: ["original-problem.txt", gapName],
+					unresolvedObligations: ["answer"], unresolvedDetails: [issue.claim],
+					groundedAssessment: { version: 1, kind: "grounded-assessment-proposal",
+						contractId: missionId, missionStatus: "open", issues: [issue],
+						legacyOpenDetails: [issue.claim], nextTask: {
+							objective: "Independently cite exact candidate bytes for the host observation",
+							obligationIds: ["answer"], addresses: [issue.id],
+							adapterScope: options.execution ? "local-m07-execute" : "local-m07-reason",
+							decisionChangingHypothesis: "Candidate linked observations can establish selection",
+							expectedEvidence: "A passed observation with a candidate citation",
+							sourceRefs: issue.sourceRefs } } }), readReturns };
+			}
 			return { text: JSON.stringify(assessorCalls === 1 ? {
 				version: 1, decision: "continue", rationale: "The exact answer still needs a candidate.",
 				evidenceRefs: ["original-problem.txt"], unresolvedObligations: ["answer"],
@@ -160,7 +272,7 @@ async function finiteFixture(t: TestContext, options: {
 					kind: "grounded-assessment-proposal", contractId: missionId,
 					missionStatus: "open", issues: [issue], legacyOpenDetails: [],
 					nextTask: { objective: "Produce the exact synthetic answer", obligationIds: ["answer"],
-						addresses: [issue.id], adapterScope: "local-m07-reason",
+						addresses: [issue.id], adapterScope: options.execution ? "local-m07-execute" : "local-m07-reason",
 						decisionChangingHypothesis: "An exact result can settle the finite obligation",
 						expectedEvidence: "A digest checked candidate", sourceRefs: issue.sourceRefs } } } : {
 				version: 1, decision: "fulfilled", rationale: "The selected byte-exact result closes the finite requirement.",
@@ -201,6 +313,7 @@ test("default host completes a finite exact-file objective only after evaluator,
 		assessorCalls: f.assessorCalls, m04Calls: f.m04Calls, builderCalls: f.builderCalls }));
 	assert.equal(finished.boundedRuns.length, 1);
 	assert.equal(finished.boundedRuns[0]!.acceptedTaskIds?.length, 1);
+	assert.equal(finished.boundedRuns[0]!.selectionProofGap, undefined);
 	assertExactSelection(finished.selectedArtifacts);
 	assert.equal(f.assessorCalls, 2);
 	assert.equal(f.builderCalls, 1);
@@ -209,6 +322,321 @@ test("default host completes a finite exact-file objective only after evaluator,
 		throw new Error("restart must not prompt"); }), config: f.config });
 	assert.deepEqual(await reopened.status(f.missionId), finished);
 	assert.deepEqual(await reopened.step(f.missionId), finished);
+});
+
+test("the next assessor cannot dispatch a task without reading the frozen selection proof gap", async t => {
+	registerObservationOnlyEvaluator("test:observation-only-unread-gap");
+	const f = await finiteFixture(t, { evaluatorId: "test:observation-only-unread-gap",
+		distinctSecondAssessment: true, skipProofGapRead: true });
+	const first = await f.mission.step(f.missionId);
+	assert.equal(first.boundedRuns.length, 1);
+	const second = await f.mission.step(f.missionId);
+	assert.equal(second.boundedRuns.length, 1);
+	assert.equal(f.builderCalls, 1);
+	assert.equal((await f.ws.listRuns("M07")).length, 1);
+	assert(second.stopReason === "assessment-evidence-unread" ||
+		second.stopReason === "workflow-repair-needed", String(second.stopReason));
+});
+
+function registerObservationOnlyEvaluator(id: string): void {
+	registerTrustedLocalMissionEvaluator({ id, version: "1",
+		supportedObligationTypes: ["file-sha256"],
+		async preflight() { return { available: true }; },
+		async evaluate({ contract, observationOutputDir }) {
+			const name = "observation-exact.json";
+			await writeFile(path.join(observationOutputDir, name), "{\"exact\":true}\n",
+				{ flag: "wx", mode: 0o600 });
+			return { observations: [{ name, kind: "json" as const }], limitations: [],
+				checks: contract.obligations.map(item => ({ obligationId: item.id,
+					result: "passed" as const, evidenceRefs: [name], limitations: [] })) };
+		} });
+}
+
+test("observation-only pass remains unselected and advances to a distinct next task without replay", async t => {
+	registerObservationOnlyEvaluator("test:observation-only-selection-gap");
+	const f = await finiteFixture(t, { evaluatorId: "test:observation-only-selection-gap",
+		distinctSecondAssessment: true });
+	const first = await f.mission.step(f.missionId);
+	assert.equal(first.objectiveOutcome, "incomplete");
+	assert.equal(first.boundedRuns.length, 1);
+	assert.deepEqual(first.selectedArtifacts, []);
+	assert.equal(first.boundedRuns[0]!.selectedTaskId, undefined);
+	assert.equal(first.boundedRuns[0]!.outcome, "partial");
+	assert.deepEqual(first.boundedRuns[0]!.acceptedTaskIds, ["T001"]);
+	const gap = first.boundedRuns[0]!.selectionProofGap;
+	assert(gap);
+	assert.equal(gap.reasonCode, "passed-check-missing-candidate-reference");
+	assert.deepEqual(gap.missingCandidateObligationIds, ["answer"]);
+	assert.match(gap.evaluatorReceiptSha256, /^[0-9a-f]{64}$/);
+	const firstRunId = first.boundedRuns[0]!.runId;
+	const firstGoalFile = path.join(f.ws.runDir("M07", firstRunId), "goal.json");
+	const firstGoalBytes = await readFile(firstGoalFile);
+	const firstGoal = await createM07Controller({ ws: f.ws, runner: f.runner,
+		store: createFileKnowledgeStore(f.ws.knowledgeDir), config: f.config }).status(firstRunId);
+	assert.equal(firstGoal.tasks[0]!.status, "accepted");
+	assert.equal((await f.ws.readRun("M04", gap.m04RunId)).status, "completed");
+	const second = await f.mission.step(f.missionId);
+	assert.equal(second.boundedRuns.length, 2, JSON.stringify({ stopReason: second.stopReason,
+		continuation: second.continuation, assessorCalls: f.assessorCalls,
+		builderCalls: f.builderCalls }));
+	assert.notEqual(second.boundedRuns[1]!.runId, firstRunId);
+	const secondGoal = await createM07Controller({ ws: f.ws, runner: f.runner,
+		store: createFileKnowledgeStore(f.ws.knowledgeDir), config: f.config })
+		.status(second.boundedRuns[1]!.runId);
+	assert.equal(secondGoal.tasks[0]!.objective,
+		"Independently cite exact candidate bytes for the host observation");
+	assert.deepEqual(await readFile(firstGoalFile), firstGoalBytes,
+		"the old accepted M07 run must not be replayed or rewritten");
+	assert.equal(f.assessorCalls, 2);
+	assert.equal(f.builderCalls, 2);
+	assert.equal((await f.ws.listRuns("M07")).length, 2);
+});
+
+test("observation-only proof gap fails closed on receipt, M04 and external-operation tampering", async t => {
+	registerObservationOnlyEvaluator("test:observation-only-tamper");
+	for (const variant of ["receipt", "m04-incomplete", "m04-transaction", "m07-operation"] as const) {
+		await t.test(variant, async sub => {
+			const f = await finiteFixture(sub, { evaluatorId: "test:observation-only-tamper",
+				distinctSecondAssessment: true });
+			const first = await f.mission.step(f.missionId);
+			const gap = first.boundedRuns[0]!.selectionProofGap;
+			assert(gap);
+			if (variant === "receipt") {
+				const file = path.join(f.ws.runDir("M07", gap.runId), "tasks", gap.taskId,
+					"work", "local-evaluator-receipt.json");
+				await writeFile(file, "altered receipt\n");
+			} else if (variant === "m04-incomplete") {
+				const run = await f.ws.readRun("M04", gap.m04RunId);
+				await writeFile(path.join(f.ws.runDir("M04", gap.m04RunId), "run.json"),
+					`${JSON.stringify({ ...run, status: "running" }, null, 2)}\n`);
+			} else if (variant === "m04-transaction") {
+				const file = path.join(f.ws.runDir("M04", gap.m04RunId), "m04-transaction.json");
+				const tx = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+				await writeFile(file, `${JSON.stringify({ ...tx, state: "pending" })}\n`);
+			} else {
+				const file = path.join(f.ws.runDir("M07", gap.runId), "goal.json");
+				const goal = JSON.parse(await readFile(file, "utf8")) as {
+					executionState: { operations: Array<{ status: string }> } };
+				goal.executionState.operations.push({ status: "unknown" });
+				await writeFile(file, `${JSON.stringify(goal, null, 2)}\n`);
+			}
+			await assert.rejects(f.mission.step(f.missionId),
+				/receipt|selection|M04|transaction|operation|evidence|checkpoint|missing-proof/i);
+			assert.equal(f.assessorCalls, 1, "tampered evidence must stop before assessment");
+			assert.equal(f.builderCalls, 1, "tampered evidence must not start another M07 task");
+		});
+	}
+});
+
+test("a rejected task makes exact repair feedback and the edit contract mandatory before another M07 task", async t => {
+	for (const variant of ["complete-repair-read", "missing-feedback-read", "missing-knowledge-read"] as const)
+		await t.test(variant, async sub => {
+			const skipRepairFeedbackRead = variant === "missing-feedback-read";
+			const skipCommittedKnowledgeRead = variant === "missing-knowledge-read";
+			const evaluatorId = `test:source-edit-repair-${variant}`;
+			registerTrustedLocalMissionEvaluator({ id: evaluatorId, version: "1",
+				supportedObligationTypes: ["file-sha256"], taskInputContract: sourceEditContract,
+				async preflight() { return { available: true }; },
+				async evaluate({ contract }) { return { observations: [], limitations: [],
+					checks: contract.obligations.map(item => ({ obligationId: item.id,
+						result: "failed" as const, evidenceRefs: [], limitations: [], schemaErrors: [
+							{ artifact: "task-input.json", path: "$.checks",
+								message: "candidate source edit exceeded the declared scope" }] })) }; } });
+			const options = { evaluatorId, taskContract: sourceEditContract,
+				expectTaskContract: true, repairSecondAssessment: true,
+				skipRepairFeedbackRead, skipCommittedKnowledgeRead, seedKnowledge: true,
+				expectedRepairFeedbackSha256: "", expectedEditContractSha256: "" };
+			const f = await finiteFixture(sub, options);
+			const first = await f.mission.step(f.missionId);
+			assert.equal(first.boundedRuns.length, 1);
+			assert.deepEqual(first.selectedArtifacts, []);
+			const firstRunId = first.boundedRuns[0]!.runId;
+			const firstGoal = await createM07Controller({ ws: f.ws, runner: f.runner,
+				store: createFileKnowledgeStore(f.ws.knowledgeDir), config: f.config }).status(firstRunId);
+			assert.equal(firstGoal.tasks[0]!.status, "rejected");
+			const sourceFeedback = await readFile(path.join(f.ws.runDir("M07", firstRunId),
+				"checkpoints", "C001", "m04-feedback.md"));
+			options.expectedRepairFeedbackSha256 = createHash("sha256").update(sourceFeedback).digest("hex");
+			const missionEvidence = path.join(f.ws.agentDir, "missions", f.missionId, "evidence");
+			const firstContractName = (await readdir(missionEvidence)).find(name =>
+				name.startsWith("host-evaluator-task-input-1-"));
+			assert(firstContractName);
+			options.expectedEditContractSha256 = createHash("sha256")
+				.update(await readFile(path.join(missionEvidence, firstContractName))).digest("hex");
+			const second = await f.mission.step(f.missionId);
+			if (skipRepairFeedbackRead || skipCommittedKnowledgeRead) {
+				assert.equal(second.boundedRuns.length, 1);
+				assert.equal(f.builderCalls, 1);
+				assert.equal((await f.ws.listRuns("M07")).length, 1);
+				assert(second.stopReason === "assessment-evidence-unread" ||
+					second.stopReason === "workflow-repair-needed", String(second.stopReason));
+			} else {
+				assert.equal(second.boundedRuns.length, 2, String(second.stopReason));
+				assert.equal(f.assessorCalls, 2);
+				assert.equal(f.builderCalls, 2);
+				const goal = await createM07Controller({ ws: f.ws, runner: f.runner,
+					store: createFileKnowledgeStore(f.ws.knowledgeDir), config: f.config })
+					.status(second.boundedRuns[1]!.runId);
+				assert(goal.tasks[0]!.objective.startsWith(
+					"Repair the candidate within the declared source edit scope\n"));
+				assert.equal(goal.knowledgeSnapshot, "G001");
+				assert.equal((await createFileKnowledgeStore(f.ws.knowledgeDir).current())?.id, "G001");
+			}
+		});
+});
+
+test("zero-byte auxiliary candidate survives receipt, review, checkpoint and selected-artifact verification", async t => {
+	registerTrustedLocalMissionEvaluator({ id: "test:empty-selected-auxiliary", version: "1",
+		supportedObligationTypes: ["file-sha256"],
+		async preflight() { return { available: true }; },
+		async evaluate({ contract, candidate, observationOutputDir }) {
+			const empty = candidate.find(item => item.sourceFile.endsWith("compile.log"));
+			assert(empty);
+			assert.equal(empty.bytes, 0);
+			assert.equal(empty.sha256, createHash("sha256").update("").digest("hex"));
+			const name = "observation-empty.json";
+			await writeFile(path.join(observationOutputDir, name),
+				`${JSON.stringify({ reportSha256: candidate[0]!.sha256,
+					auxiliarySha256: empty.sha256 })}\n`, { flag: "wx", mode: 0o600 });
+			return { observations: [{ name, kind: "json" as const }], limitations: [],
+				checks: contract.obligations.map(item => ({ obligationId: item.id,
+					result: "passed" as const,
+					evidenceRefs: [candidate[0]!.name, empty.name, name], limitations: [] })) };
+		} });
+	const f = await finiteFixture(t, { evaluatorId: "test:empty-selected-auxiliary",
+		execution: "task-root-bash", emptyAuxiliary: true });
+	const first = await f.mission.step(f.missionId);
+	assert.equal(first.boundedRuns.length, 1);
+	assert.equal(first.boundedRuns[0]!.acceptedTaskIds?.length, 1);
+	assert(first.selectedArtifacts.some(name => name.endsWith(".log")));
+	const reopened = openDefaultLocalMission({ workspaceRoot: f.root,
+		runner: f.runner, config: f.config });
+	assert.deepEqual(await reopened.status(f.missionId), first);
+	const finished = await reopened.step(f.missionId);
+	assert.equal(finished.objectiveOutcome, "fulfilled");
+	assert.equal(finished.assessment?.unreadEvidence.length, 0);
+	assert(finished.selectedArtifacts.some(name => name.endsWith(".log")));
+	assert.equal(f.builderCalls, 1);
+});
+
+test("an empty returned report cannot become a candidate even when an auxiliary file exists", async t => {
+	const f = await finiteFixture(t, { candidate: "", emptyAuxiliary: true,
+		execution: "task-root-bash" });
+	await assert.rejects(f.mission.step(f.missionId), /task report: empty/);
+	assert.equal(f.builderCalls, 1);
+	assert.equal((await f.ws.listRuns("M04")).length, 1);
+});
+
+test("a throwing evaluator leaves its partial observation and holds the committed mission dispatch", async t => {
+	const partialBytes = Buffer.from("partial evaluator measurement before failure\n", "utf8");
+	let preflights = 0, evaluations = 0;
+	registerTrustedLocalMissionEvaluator({ id: "test:partial-observation-throw", version: "1",
+		supportedObligationTypes: ["file-sha256"],
+		async preflight() { preflights++; return { available: true }; },
+		async evaluate({ observationOutputDir }) {
+			evaluations++;
+			await writeFile(path.join(observationOutputDir, "observation-partial.txt"), partialBytes,
+				{ flag: "wx", mode: 0o600 });
+			throw new Error("synthetic evaluator failed after partial observation");
+		} });
+	const f = await finiteFixture(t, { evaluatorId: "test:partial-observation-throw",
+		execution: "task-root-bash" });
+	const initialM04 = (await f.ws.listRuns("M04")).length;
+	await assert.rejects(f.mission.step(f.missionId),
+		/synthetic evaluator failed after partial observation/);
+	assert.equal(f.assessorCalls, 1);
+	assert.equal(f.builderCalls, 1);
+	assert.equal(evaluations, 1);
+	const m07Runs = await f.ws.listRuns("M07");
+	assert.equal(m07Runs.length, 1);
+	const runId = m07Runs[0]!;
+	const goal = await createM07Controller({ ws: f.ws, runner: f.runner,
+		store: createFileKnowledgeStore(f.ws.knowledgeDir), config: f.config }).status(runId);
+	assert.equal(goal.tasks.length, 1);
+	assert.equal(goal.tasks[0]!.status, "returned");
+	assert.equal(goal.executionState?.operations.length, 1);
+	assert.equal(goal.executionState?.operations[0]!.status, "response-received");
+	assert.equal(goal.checkpoints?.length ?? 0, 0, "evaluation did not reach C001");
+	const observation = path.join(path.dirname(goal.tasks[0]!.workDir),
+		"host-evaluator-output", "observation-partial.txt");
+	assert.deepEqual(await readFile(observation), partialBytes);
+	assert.equal((await stat(observation)).mode & 0o777, 0o600);
+	assert.equal((await f.ws.listRuns("M04")).length, initialM04);
+	const missionRuns = await f.ws.listRuns("MISSION");
+	assert.equal(missionRuns.length, 1, "dispatch intent has a durable MISSION run");
+	const intentId = missionRuns[0]!;
+	assert.equal((await f.ws.readRun("MISSION", intentId)).status, "failed");
+	assert.deepEqual((await readMissionCheckpoint(f.root, f.missionId)).continuation
+		.unresolvedOperationIds, [intentId], "the no-replay dispatch intent was committed");
+
+	const held = await f.mission.step(f.missionId);
+	assert.equal(held.objectiveOutcome, "incomplete");
+	assert.equal(held.stopReason, "execution-interrupted");
+	assert.equal(held.boundedRuns.length, 0, "the M07 result was never represented in mission progress");
+	assert(held.continuation.unresolvedOperationIds.includes(runId));
+	assert(held.continuation.unresolvedOperationIds.includes(intentId));
+	assert.equal(f.builderCalls, 1, "the builder was not replayed");
+	assert.equal(evaluations, 1, "the evaluator was not replayed");
+	assert.equal((await f.ws.listRuns("M07")).length, 1);
+	assert.equal((await f.ws.listRuns("M04")).length, initialM04);
+	assert.deepEqual(await readFile(observation), partialBytes,
+		"the unclaimed partial observation bytes remain on disk");
+	assert(preflights >= 2);
+});
+
+test("a preflight-declined evaluator never commits an M07 dispatch intent", async t => {
+	let preflights = 0, evaluations = 0;
+	registerTrustedLocalMissionEvaluator({ id: "test:preflight-declined-before-dispatch", version: "1",
+		supportedObligationTypes: ["file-sha256"],
+		async preflight() { preflights++; return { available: false,
+			reason: "synthetic evaluator unavailable before dispatch" }; },
+		async evaluate() { evaluations++; throw new Error("preflight-declined evaluator must not run"); } });
+	const f = await finiteFixture(t, { evaluatorId: "test:preflight-declined-before-dispatch",
+		execution: "task-root-bash" });
+	const held = await f.mission.step(f.missionId);
+	assert.equal(held.stopReason, "next-task-needs-capability");
+	assert.equal(held.continuation.pendingAction?.kind, "supply-capability");
+	assert.equal(f.assessorCalls, 0);
+	assert.equal(f.builderCalls, 0);
+	assert.equal(evaluations, 0);
+	assert(preflights >= 1);
+	assert.deepEqual(await f.ws.listRuns("M07"), []);
+	assert.deepEqual(await f.ws.listRuns("MISSION"), []);
+});
+
+test("a second preflight decline after the builder returns freezes negative feedback without replay", async t => {
+	let preflights = 0, evaluations = 0;
+	registerTrustedLocalMissionEvaluator({ id: "test:preflight-declined-after-builder", version: "1",
+		supportedObligationTypes: ["file-sha256"],
+		async preflight() { preflights++; return preflights === 1 ? { available: true } :
+			{ available: false, reason: "synthetic capacity changed after assessor" }; },
+		async evaluate() { evaluations++; throw new Error("declined evaluator must not enter evaluate"); } });
+	const f = await finiteFixture(t, { evaluatorId: "test:preflight-declined-after-builder",
+		execution: "task-root-bash" });
+	const baselineM04 = (await f.ws.listRuns("M04")).length;
+	const first = await f.mission.step(f.missionId);
+	assert.equal(first.objectiveOutcome, "incomplete");
+	assert.equal(first.boundedRuns.length, 1);
+	assert.equal(first.boundedRuns[0]!.outcome, "partial");
+	assert.deepEqual(first.boundedRuns[0]!.acceptedTaskIds, []);
+	assert.deepEqual(first.selectedArtifacts, []);
+	assert.equal(f.builderCalls, 1);
+	assert.equal(evaluations, 0);
+	assert.equal((await f.ws.listRuns("M04")).length, baselineM04);
+	const runId = first.boundedRuns[0]!.runId;
+	const goal = await createM07Controller({ ws: f.ws, runner: f.runner,
+		store: createFileKnowledgeStore(f.ws.knowledgeDir), config: f.config }).status(runId);
+	assert.equal(goal.tasks[0]!.status, "rejected");
+	assert.equal(goal.executionState?.operations[0]?.status, "response-received");
+	assert.equal(goal.checkpoints?.length ?? 0, 1);
+	assert.equal(goal.outcome, "partial");
+	assert.equal(goal.tasks[0]!.review?.checks[0]?.result, "not_run");
+	assert(goal.tasks[0]!.review?.failures.some(failure => failure.includes("before its host evaluation")));
+	const second = await f.mission.step(f.missionId);
+	assert.equal(second.stopReason, "next-task-needs-capability");
+	assert.equal(f.builderCalls, 1, "the returned model task was never replayed");
+	assert.equal(evaluations, 0);
+	assert.equal((await f.ws.listRuns("M07")).length, 1);
 });
 
 test("future M07 task receives the exact trusted input shape before model work and keeps it on reopen", async t => {

@@ -92,9 +92,8 @@ test("latest incomplete or failed M04 blocks formal baseline instead of falling 
 	failed.failures.push("知识提案未合入");
 	await f.ws.finishRun(failed, "failed");
 	await assert.rejects(f.controller.begin(begin), /\u6700\u65b0 M04.*failed|\u4e0d得回退/);
-	const exploratory = await f.controller.begin({ ...begin, exploratory: true });
-	assert.equal(exploratory.formalBaseline, false);
-	assert.equal(exploratory.m04BaselineRunId, undefined);
+	await assert.rejects(f.controller.begin({ ...begin, exploratory: true }), /\u6700\u65b0 M04.*failed|\u4e0d得回退/,
+		"explicit exploration cannot clear an unknown knowledge transaction");
 });
 
 test("M04 starts have persisted creation sequence even when wall-clock times tie", async (t) => {

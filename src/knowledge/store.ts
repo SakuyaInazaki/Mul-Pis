@@ -178,7 +178,7 @@ function jsonLine(key: string, value: unknown): string {
 	return `${key}: ${JSON.stringify(value ?? null)}`;
 }
 
-function serialiseRecord(record: KnowledgeRecord): string {
+export function serialiseRecord(record: KnowledgeRecord): string {
 	return [
 		"---",
 		jsonLine("id", record.id),

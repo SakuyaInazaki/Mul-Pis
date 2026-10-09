@@ -341,6 +341,25 @@ export function validatePendingAction(action: PendingActionV1, stopReason: Objec
 	}
 }
 
+/** A passed host observation without a candidate citation is useful but unselected evidence. */
+export interface MissingSelectionProofV1 {
+	version: 1;
+	kind: "local-selection-proof-gap";
+	reasonCode: "passed-check-missing-candidate-reference";
+	missionId: string;
+	runId: string;
+	taskId: string;
+	checkpointId: string;
+	m04RunId: string;
+	missingCandidateObligationIds: string[];
+	evaluatorReceiptSha256: string;
+	checkpointManifestSha256: string;
+	m04SourceSha256: string;
+	m04CoverageSha256: string;
+	m04TransactionSha256: string;
+	requiredM07ReadPaths: string[];
+}
+
 export interface ObjectiveProgressV1 {
 	version: 1;
 	kind: "original-objective-progress";
@@ -353,7 +372,8 @@ export interface ObjectiveProgressV1 {
 	assessmentHistory: Array<{ iteration: number; assessment: NonNullable<ObjectiveProgressV1["assessment"]>;
 		stopReason: ObjectiveStopReason; advanced: boolean }>;
 	boundedRuns: Array<{ runId: string; outcome: string; selectedTaskId?: string;
-		acceptedTaskIds?: string[]; unresolvedOperationIds?: string[] }>;
+		acceptedTaskIds?: string[]; unresolvedOperationIds?: string[];
+		selectionProofGap?: MissingSelectionProofV1 }>;
 	selectedArtifacts: string[];
 	availableArtifacts: string[];
 	continuation: { mode: "explicit-authorized-new-run" | "reconcile-operations-before-new-run";
@@ -769,7 +789,8 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		let text: string;
 		try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
 		catch { throw new HarnessError("m07.objective", "objective evidence is not valid UTF-8 text"); }
-		materials.push({ ...item, lineCount: text.split("\n").length - (text.endsWith("\n") ? 1 : 0),
+		materials.push({ ...item, lineCount: text.length === 0 ? 0 :
+			text.split("\n").length - (text.endsWith("\n") ? 1 : 0),
 			digest: createHash("sha256").update(bytes).digest("hex") });
 	}
 	preSessionStage = "source-registry";
@@ -932,7 +953,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		const priorResolutionSchema = "Each delta resolution is {id,priorRef:{sourceId,startLine,endLine},explanation,evidenceRefs:[{sourceId,startLine,endLine}]}. Copy priorRef exactly from the required prior-grounding-index locator: sourceId is that issue's partName and both line numbers equal its line. Do not use a 'part:line' string. Each evidenceRefs item is a separate span object for newly frozen evidence actually read in this session; do not use string shorthand or infer read credit from a path.";
 		const groundedTaskSchema = "For continue, write ONE task in groundedAssessment.nextTask or groundedAssessmentDelta.nextTask: {objective:string,obligationIds:[original obligation ID strings],addresses:[OPEN grounded issue ID strings],adapterScope:one available registered scope,decisionChangingHypothesis:string,expectedEvidence:string,sourceRefs:[{sourceId,startLine,endLine}]" +
 			(groundingPolicy?.taskSourceBindings ? ",sourceBinding:one exact available entry from task-source-bindings.json" : "") +
-			"}. objective, hypothesis and expectedEvidence must be nonempty. obligationIds must be contained in unresolvedObligations. When binding an unselected attempt, read its listed frozen source, verification, archive and plan completely in this session, and cite source, verification and archive spans in nextTask.sourceRefs. An unselected input is development evidence only and cannot become selected by citation. Omit top-level nextTask; the host derives its full task record from this grounded task after validation. A legacy top-level nextTask is accepted only when its objective and any supplied addresses/scope exactly match the grounded task. For blocked or fulfilled, omit both nextTask objects.";
+			"}. objective, hypothesis and expectedEvidence must be nonempty. obligationIds must be contained in unresolvedObligations. You may choose a strict subset: each selected original obligation becomes a mandatory check for this bounded M07 task, while unselected original obligations remain open in the mission. Select an obligation only when this task's expected evidence could pass its full check. A finite experiment can advance an open-ended original requirement without making that requirement a passing task check; leave it unresolved instead of copying it into the task. Inspect prior rejected-task feedback and check dispositions before reusing a check. When binding an unselected attempt, read its listed frozen source, verification, archive and plan completely in this session, and cite source, verification and archive spans in nextTask.sourceRefs. An unselected input is development evidence only and cannot become selected by citation. Omit top-level nextTask; the host derives its full task record from this grounded task after validation. A legacy top-level nextTask is accepted only when its objective and any supplied addresses/scope exactly match the grounded task. For blocked or fulfilled, omit both nextTask objects.";
 		const groundedReferenceSchema = "Top-level evidenceRefs is an array of exact frozen FILE NAME STRINGS, not source-span objects; it may be [] for continue or blocked. Grounded sourceRefs, resolution evidenceRefs and deliverableReady evidenceRefs are arrays of {sourceId,startLine,endLine} objects for cited lines actually returned in this session. Never put a span object in top-level evidenceRefs or a filename string in a grounded span array.";
 		const deliverableSchema = "Optional deliverableReady is an OBJECT {status:'proposed',ready:boolean,rationale:string,evidenceRefs:[{sourceId,startLine,endLine}],remainingIssueIds:[open issue ID strings]}. List every still-open issue ID in remainingIssueIds. A bare boolean is invalid; omit the field if you have no evidence-backed finding. This proposal never closes the open-ended mission.";
 		const responseSchema = priorIndex ? [
@@ -960,7 +981,8 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			`Closure policy: ${contract.closure}. A bounded child goal and accepted candidate do not alone establish original-goal completion.`,
 			evidenceInstructions ?? "Read all supplied material; the caller identifies the original inputs and the meaning of artifact names.",
 			"# Frozen bounded evidence", "Use objective_evidence_read to read the complete original-objective.json and every listed file below. This list contains the required files. If paginated, read every page including the untruncated end. Required files:",
-			...requiredMaterials.map(item => item.name),
+			...requiredMaterials.map(item => item.lineCount === 0 ?
+				`${item.name} (empty file; read it for exact zero-byte confirmation, with no line citation)` : item.name),
 			...(materials.some(item => item.name === "prior-incomplete-run-control.json") ? [
 				"The prior-incomplete-run-control.json reports only host-observed request counts and unresolved effects from an earlier incomplete run. It does not attest that run's scientific results, select its candidate, or resolve an original obligation. Do not infer absent work or zero charges from missing research files."
 			] : []),
@@ -970,14 +992,18 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				...(checkpointIndex ? ["Read prior-objective-checkpoint-index.json for the byte-exact historical checkpoint part names and order. The host already checks the current selected tuple and unresolved control state. Read historical parts only when they can affect your reasoning, and cite every historical claim using actual returned lines."] : []),
 				...(priorIndex ? [`Read ${priorIndex.indexName} for prior grounding record locators and part filenames.`] : []),
 				...(!retrievableIndex && !priorIndex ?
-					retrievableMaterials.map(item => `Retrievable file: ${item.name}, lines 1-${item.lineCount}.`) : []),
+					retrievableMaterials.map(item => item.lineCount === 0 ?
+						`Retrievable file: ${item.name}, empty (0 bytes; no line citation).` :
+						`Retrievable file: ${item.name}, lines 1-${item.lineCount}.`) : []),
 				"A retrievable file cited in evidenceRefs needs a complete current-session read; a retrievable source span needs its exact cited lines returned in this session. Unread retrievable files have no authority." ] : []),
 			...(grounding ? ["# Grounded assessment requirement",
 				"For sourceRefs cite registered sourceId, startLine, endLine. current-user-overrides line N is override N above. Original problem and inputs are supplied-task material; host capability claims need observed host facts. These classifications annotate claims and cannot erase the original obligation.",
 				...Object.entries(grounding.sources).filter(([name]) => name === "original-objective.json" ||
 					name === "current-user-overrides" || evidenceAccess[name] !== "retrievable" ||
 					!retrievableIndex && !priorIndex)
-					.map(([name, source]) => `${name}: ${source.kind}, lines 1-${source.lineCount}`),
+					.map(([name, source]) => source.lineCount === 0 ?
+						`${name}: ${source.kind}, empty (0 bytes; no line citation)` :
+						`${name}: ${source.kind}, lines 1-${source.lineCount}`),
 				"Issue classes are explicit-requirement (cited user or supplied task requirement), necessary-verification (claimAtRisk), optional-method (cited optionalBasis), and physical-capability-gap (one exact unavailable registered blockedScope ID plus its host capabilityRef). Each new issue needs id, claim, status, classification, sourceRefs and implication. A proposed nextTask must identify an open decision-changing issue and expected evidence. Optional methods or unavailable equipment alone do not force another task.",
 				...(priorIndex ? [
 					`Authenticated prior grounding is in required index ${priorIndex.indexName} and ${priorIndex.partNames.length} retrievable parts. Read the index completely. Use its exact line locators to inspect a prior issue before changing its status. Omitted prior issues and legacy details are retained by the host. New frozen evidence IDs: ${JSON.stringify(grounding.newEvidenceSourceIds ?? [])}.`,
@@ -1005,9 +1031,20 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				return false;
 			}
 		};
+		const verifiedEmpty = new Set<string>();
 		const coverage = (name: string, lines: number): { complete: boolean; score: number; nextRange: string;
 			coveredRanges: Array<[number, number]>; reachedUntruncatedEnd: boolean } => {
 			const returned = handle.readReturnEvents();
+			if (lines === 0) {
+				const exactEmptyRead = returned.some(item => item.toolName === "objective_evidence_read" &&
+					item.path === name && item.status === "no-content" && item.returned.kind === "text" &&
+					item.returned.truncated === false && item.returned.startLine === undefined &&
+					item.returned.endLine === undefined &&
+					(item.requested.offset === undefined || item.requested.offset === 1));
+				const complete = exactEmptyRead && verifiedEmpty.has(name);
+				return { complete, coveredRanges: [], reachedUntruncatedEnd: complete,
+					score: Number(complete), nextRange: `${name}: objective_evidence_read path="${name}" offset=1 limit=1 (verify empty file)` };
+			}
 			const rows = returned.filter(item => item.toolName === "objective_evidence_read" && item.path === name &&
 				item.status === "returned" && item.returned.kind === "text" && item.returned.startLine !== undefined &&
 				item.returned.endLine !== undefined && item.returned.startLine >= 1 &&
@@ -1102,6 +1139,9 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				...(chosenAttemptEvidence ? [chosenAttemptEvidence.source,
 					chosenAttemptEvidence.verification, chosenAttemptEvidence.archive,
 					...(chosenAttemptEvidence.plan ? [chosenAttemptEvidence.plan] : [])] : [])]);
+			verifiedEmpty.clear();
+			for (const item of readMaterials) if (item.lineCount === 0 &&
+				await frozenFileAccessible(item.name, true)) verifiedEmpty.add(item.name);
 			const fileCoverage = readMaterials.map(item => {
 				const read = coverage(item.name, item.lineCount);
 				const requiredSpans = spans.filter(ref => ref.sourceId === item.name);

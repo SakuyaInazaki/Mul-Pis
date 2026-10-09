@@ -8,7 +8,7 @@ import { createM07Controller } from "../src/m07/controller.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 import type { ReadReturnEvent, SessionHandle } from "../src/runner/types.ts";
 import { WorkflowRepairNeededError, type WorkflowRepairStateV1 } from "../src/runner/repair-liveness.ts";
-import { runM04, type M04InvalidJudgmentEvent } from "../src/stages/m04.ts";
+import { assertFullM07Reads, runM04, type M04InvalidJudgmentEvent } from "../src/stages/m04.ts";
 import { runM01 } from "../src/stages/m01.ts";
 import { exportPortableM04Transaction } from "../src/workflow-archive/m04-transaction.ts";
 import type { StageContext } from "../src/stages/context.ts";
@@ -45,6 +45,53 @@ function returnedRanges(relative: string[], terminalTruncated = false): ReadRetu
 		requested: {}, returned: { kind: "text", startLine: 1, endLine: 2,
 			truncated: terminalTruncated && index === 0 }, at: new Date().toISOString() }));
 }
+
+function emptyRead(relative: string): ReadReturnEvent {
+	return { toolName: "m07_evidence_read", status: "no-content", path: relative, requested: {},
+		returned: { kind: "text", truncated: false }, at: new Date().toISOString() };
+}
+
+test("M04 accepts only an exact untruncated no-content text return for empty required evidence", async t => {
+	const f = await fixture(t);
+	const root = f.ws.runDir("M07", f.goal.runId);
+	const relative = f.relative[0];
+	await writeFile(path.join(root, relative), "");
+	const valid = emptyRead(relative);
+	await assertFullM07Reads(root, [relative], [valid]);
+	const invalid: Array<[string, ReadReturnEvent[]]> = [
+		["no read", []],
+		["wrong path", [{ ...valid, path: f.relative[1] }]],
+		["wrong tool", [{ ...valid, toolName: "material_read" }]],
+		["read error", [{ ...valid, status: "error" }]],
+		["truncated return", [{ ...valid, returned: { kind: "text", truncated: true } }]],
+		["binary return", [{ ...valid, returned: { kind: "binary", truncated: false } }]],
+		["fabricated line range", [{ ...valid, returned: { kind: "text", startLine: 1, endLine: 1, truncated: false } }]],
+		["incomplete line range", [{ ...valid, returned: { kind: "text", startLine: 1, truncated: false } }]],
+		["returned without lines", [{ ...valid, status: "returned" }]],
+		["missing truncation proof", [{ ...valid, returned: { kind: "text" } }]],
+	];
+	for (const [reason, events] of invalid) await assert.rejects(
+		assertFullM07Reads(root, [relative], events),
+		(error: unknown) => error instanceof HarnessError && error.code === "m04.m07-evidence", reason);
+});
+
+test("default M04 entry completes when a required frozen file is exactly empty and was read", async t => {
+	const f = await fixture(t);
+	await writeFile(path.join(f.ws.runDir("M07", f.goal.runId), f.relative[0]), "");
+	const fake = new FakeSessionRunner(() => ({ text: "No transferable lesson; no knowledge proposal.",
+		readReturns: [emptyRead(f.relative[0]), ...returnedRanges(f.relative.slice(1))] }));
+	f.ctx.runner = fake;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId }, freshSession: true,
+		requiredM07ReadPaths: f.relative });
+	assert.equal(result.record.status, "completed");
+	assert.equal(result.proposalId, undefined);
+	assert.equal([...fake.sessions.values()].find(item => item.spec.label === "M04-research")?.turns, 1);
+	const coveragePath = result.record.outputs.find(item => item.label === "M07 回流证据实际访问范围")?.path;
+	assert.ok(coveragePath);
+	const coverage = JSON.parse(await readFile(coveragePath, "utf8")) as { returnedRanges: ReadReturnEvent[] };
+	assert.deepEqual(coverage.returnedRanges.map(item => [item.path, item.status]),
+		[[f.relative[0], "no-content"], [f.relative[1], "returned"], [f.relative[2], "returned"]]);
+});
 
 test("M04 can choose no proposal after full selected M07 reads and sees exact paths in its message", async t => {
 	const f = await fixture(t);
