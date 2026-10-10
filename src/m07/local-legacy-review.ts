@@ -93,7 +93,10 @@ export async function verifyLegacySerialSource(archiveFile = path.join(
 	}
 }
 export async function fullLocalMissionCensus(ws: Workspace,
-	scope: { intentId: string; m07RunId: string }): Promise<string> {
+	scope: { intentId: string; m07RunId: string;
+		priorReviewed?: readonly { intentId: string; m07RunId: string }[] }): Promise<string> {
+	const priorIntents = new Set(scope.priorReviewed?.map(row => row.intentId) ?? []);
+	const priorM07Runs = new Set(scope.priorReviewed?.map(row => row.m07RunId) ?? []);
 	const rows: Array<{ stage: string; runId: string; runSha256: string;
 		goalSha256?: string; transactionSha256?: string }> = [];
 	for (const stage of ["MISSION", "M07", "M04"]) {
@@ -117,8 +120,8 @@ export async function fullLocalMissionCensus(ws: Workspace,
 				!["running", "failed", "completed"].includes(runValue.status ?? ""))
 				throw new Error("legacy full-workspace census has an invalid run record");
 			if (runValue.status === "running" &&
-				!(stage === "MISSION" && runId === scope.intentId ||
-					stage === "M07" && runId === scope.m07RunId))
+				!(stage === "MISSION" && (runId === scope.intentId || priorIntents.has(runId)) ||
+					stage === "M07" && (runId === scope.m07RunId || priorM07Runs.has(runId))))
 				throw new Error("legacy full-workspace census has another running stage");
 			const row: (typeof rows)[number] = { stage, runId, runSha256: localLineageHash(run) };
 			if (stage === "M07") {
@@ -162,7 +165,7 @@ async function bytesForCensus(file: string): Promise<Buffer> {
 		return data;
 	} finally { await handle.close(); }
 }
-async function pairedToolTranscript(task: M07TaskRecord): Promise<{
+export async function pairedToolTranscript(task: M07TaskRecord): Promise<{
 	sha256: string; calls: number; results: number; names: string[] }> {
 	const files = [task.session?.file,
 		...(task.executionRounds ?? []).map(round => round.reviewerSession?.file)]

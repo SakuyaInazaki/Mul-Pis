@@ -4,7 +4,7 @@
  * owns the semantics of one bounded M07/M04 task. Neither the assessor nor this
  * caller may turn an unreviewed task into selected scientific authority.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
@@ -20,7 +20,7 @@ import { readLocalMaterialBundle, validateLocalMaterialSelections,
 	type LocalMaterialSelection } from "./local-material-bundle.ts";
 import { assessAndAdvanceOriginalObjective, createOriginalObjective, objectiveProgress,
 	runOriginalObjectiveLoop } from "./objective-progress.ts";
-import type { CurrentObjectiveStopReason, HostPendingActionFactsV1, ObjectiveCapabilityV1,
+import type { CurrentObjectiveStopReason, HostPendingActionFactsV1, ObjectiveCapabilityV1, PendingM04ReviewV1,
 	ObjectiveNextTaskV1, ObjectiveProgressV1, OriginalObjectiveContractV1 } from "./objective-progress.ts";
 
 type AssessorInput = Parameters<typeof assessAndAdvanceOriginalObjective>[0];
@@ -130,9 +130,16 @@ export interface LocalObjectiveHostPort {
 		request: { materials?: readonly LocalMaterialSelection[] }): Promise<{
 			contractFile: string; materialBundleRoot?: string }>;
 	readCheckpoint(): Promise<ObjectiveProgressV1 | undefined>;
+	/** Advance an already reviewed candidate using only its frozen M07 checkpoint. */
+	advancePendingM04Review?(input: { ctx: StageContext; controller: M07Controller;
+		progress: ObjectiveProgressV1 }): Promise<{ progress: ObjectiveProgressV1; advanced: boolean }>;
 	/** Read-only current-evidence check; never rewrites a historical completion. */
 	verifyCurrentFulfillment(progress: ObjectiveProgressV1): Promise<void>;
 	recordCheckpoint(progress: ObjectiveProgressV1): Promise<void>;
+	/** Optional host-only end of a start invocation after its first checkpoint. */
+	releaseCleanStart?(): Promise<void>;
+	/** Optional CLI normal-return owner release after exact checkpoint publication. */
+	releaseCleanReturn?(progress: ObjectiveProgressV1): Promise<void>;
 	/** Future dispatch edge; built-in adapter records it after task ID allocation. */
 	recordDispatchLineage?(input: { intentId: string; m07RunId: string;
 		taskId: string; assessorTask: ObjectiveNextTaskV1 }): Promise<void>;
@@ -184,9 +191,12 @@ export interface LocalObjectiveSelectionReviewV1 {
 export interface LocalObjectiveAdvanceResult {
 	runId: string; outcome: string; acceptedTaskIds: string[];
 	selectedTaskId?: string; m04RunId?: string;
+	/** Failed, settled M04 judgment is negative feedback, never selection authority. */
+	failedM04RunId?: string;
 	checkpointId?: string; evaluatorReceiptPath?: string;
 	requiredM07ReadPaths?: string[];
 	selectionProofGap?: ObjectiveProgressV1["boundedRuns"][number]["selectionProofGap"];
+	pendingM04Review?: PendingM04ReviewV1;
 	unresolvedOperationRefs?: string[];
 }
 
@@ -300,16 +310,32 @@ export function createLocalOriginalObjectiveCaller(input: { ws: Workspace;
 		advanced: boolean; stopReason: CurrentObjectiveStopReason }> => {
 		const ctx = requireContext();
 		const { host, progress: previous } = await load(missionId);
+		if (previous.pendingM04Review) {
+			if (!host.advancePendingM04Review)
+				throw new HarnessError("local.objective.m04", "pending M04 review has no host continuation");
+			const resumed = await host.advancePendingM04Review({ ctx,
+				controller: input.controller ?? createM07Controller(ctx), progress: previous });
+			return { progress: resumed.progress, advanced: resumed.advanced,
+				stopReason: resumed.progress.stopReason as CurrentObjectiveStopReason };
+		}
 		if (host.recoverInterruptedEvaluator) {
 			const recovered = await host.recoverInterruptedEvaluator({ ctx,
 				controller: input.controller ?? createM07Controller(ctx),
 				contract: previous.contract, progress: previous });
 			if (recovered) {
 				if (recovered.stopReason !== "execution-interrupted" &&
-					recovered.stopReason !== "objective-reassessment-pending")
+					recovered.stopReason !== "objective-reassessment-pending" &&
+					recovered.stopReason !== "m04-review-pending")
 					throw new HarnessError("local.objective.recovery", "host recovery returned an invalid control boundary");
+				if (recovered.pendingM04Review && host.advancePendingM04Review) {
+					const resumed = await host.advancePendingM04Review({ ctx,
+						controller: input.controller ?? createM07Controller(ctx), progress: recovered });
+					return { progress: resumed.progress, advanced: resumed.advanced,
+						stopReason: resumed.progress.stopReason as CurrentObjectiveStopReason };
+				}
 				return { progress: recovered,
-					advanced: recovered.stopReason === "objective-reassessment-pending",
+					advanced: recovered.stopReason === "objective-reassessment-pending" ||
+						recovered.stopReason === "m04-review-pending",
 					stopReason: recovered.stopReason };
 			}
 		}
@@ -446,6 +472,9 @@ export function createLocalOriginalObjectiveCaller(input: { ws: Workspace;
 				!Array.isArray(result.acceptedTaskIds) ||
 				result.acceptedTaskIds.some(id => typeof id !== "string" || !id) ||
 				(result.m04RunId !== undefined && (typeof result.m04RunId !== "string" || !result.m04RunId)) ||
+				(result.failedM04RunId !== undefined && (typeof result.failedM04RunId !== "string" ||
+					!result.failedM04RunId || result.m04RunId !== undefined ||
+					result.outcome !== "partial" || result.selectedTaskId !== undefined)) ||
 				(result.checkpointId !== undefined && (typeof result.checkpointId !== "string" || !result.checkpointId)) ||
 				result.unresolvedOperationRefs !== undefined &&
 					(!Array.isArray(result.unresolvedOperationRefs) ||
@@ -455,12 +484,29 @@ export function createLocalOriginalObjectiveCaller(input: { ws: Workspace;
 					 result.acceptedTaskIds.length !== 1 ||
 					 result.selectionProofGap.runId !== result.runId ||
 					 !/^[0-9a-f]{64}$/.test(result.selectionProofGap.evaluatorReceiptSha256))) ||
-				result.selectedTaskId && !result.acceptedTaskIds.includes(result.selectedTaskId))
+				result.selectedTaskId && !result.acceptedTaskIds.includes(result.selectedTaskId) ||
+				result.pendingM04Review && (result.selectedTaskId !== undefined ||
+					result.m04RunId !== undefined || result.acceptedTaskIds.length !== 1 ||
+					result.pendingM04Review.runId !== result.runId ||
+					result.pendingM04Review.taskId !== result.acceptedTaskIds[0]))
 				throw new HarnessError("local.objective.adapter", "local adapter returned invalid reviewed bounded-run facts");
 			bounded = [...bounded, { runId: result.runId, outcome: result.outcome,
 				acceptedTaskIds: result.acceptedTaskIds,
 				...(result.selectionProofGap ? { selectionProofGap: result.selectionProofGap } : {}),
+				...(result.failedM04RunId ? { failedM04RunId: result.failedM04RunId } : {}),
 				...(result.selectedTaskId ? { selectedTaskId: result.selectedTaskId } : {}) }];
+			if (result.pendingM04Review) {
+				const pending = objectiveProgress(previous.contract, { boundedRuns: bounded,
+					selectedArtifacts: previous.selectedArtifacts,
+					availableArtifacts: previous.availableArtifacts,
+					assessment: history.at(-1)?.assessment ?? previous.assessment,
+					assessmentHistory: history, stopReason: "m04-review-pending",
+					pendingM04Review: result.pendingM04Review, nextTaskDispatched: true,
+					pendingActionFacts: { target: { goalRunId: result.runId,
+						taskId: result.pendingM04Review.taskId }, failedStage: "m04-judgment" } });
+				await host.recordCheckpoint(pending);
+				throw new LocalObjectiveControlHold(pending);
+			}
 			if (result.outcome === "unknown" || result.unresolvedOperationRefs?.length)
 				newUnknownRefs = [...new Set([...(retained ? [retained.intentId] : []),
 					...(result.unresolvedOperationRefs?.length ? result.unresolvedOperationRefs : [result.runId])])];
@@ -499,7 +545,17 @@ export function createLocalOriginalObjectiveCaller(input: { ws: Workspace;
 				prepareNextTask: frozen.prepareNextTask,
 				recordAssessment,
 				recordValidationFailure: host.recordValidationFailure,
-				recordRepairState: host.recordRepairState,
+				recordRepairState: host.recordRepairState ?? (async state => {
+					await ws.writeOutput(record, `assessor-repair-${randomUUID()}.json`,
+						JSON.stringify(state, null, 2), "Read-only assessor repair control");
+					await ws.writeRun(record);
+				}),
+				recordTransportFailure: async failure => {
+					await ws.writeOutput(record, `assessor-transport-${randomUUID()}.json`,
+						JSON.stringify(failure, null, 2), "Read-only assessor transport observation");
+					await ws.writeRun(record);
+				},
+				signal: ctx.signal,
 				advance: dispatchTask });
 			if (!retained) await ws.finishRun(record, step.assessment ? "completed" : "failed");
 		} catch (error) {
@@ -507,8 +563,20 @@ export function createLocalOriginalObjectiveCaller(input: { ws: Workspace;
 				record.failures.push("Local objective assessment or bounded dispatch was interrupted");
 				await ws.finishRun(record, "failed").catch(() => undefined);
 			}
-			if (error instanceof LocalObjectiveControlHold)
-				return { progress: error.progress, advanced: false, stopReason: "execution-interrupted" };
+			if (error instanceof LocalObjectiveControlHold) {
+				if (error.progress.pendingM04Review && host.advancePendingM04Review) {
+					// The accepted task is already durable. Give its first M04 review the
+					// same step without repeating the assessor or M07 task; a failed M04
+					// remains pending for a later retry.
+					const resumed = await host.advancePendingM04Review({ ctx,
+						controller: input.controller ?? createM07Controller(ctx), progress: error.progress });
+					return { progress: resumed.progress, advanced: resumed.advanced,
+						stopReason: resumed.progress.stopReason as CurrentObjectiveStopReason };
+				}
+				return { progress: error.progress,
+					advanced: error.progress.stopReason === "m04-review-pending",
+					stopReason: error.progress.stopReason as CurrentObjectiveStopReason };
+			}
 			throw error;
 		}
 		const effectiveStopReason = newUnknownRefs.length ? "execution-interrupted" : step.stopReason;
@@ -558,24 +626,31 @@ export function createLocalOriginalObjectiveCaller(input: { ws: Workspace;
 			const progress = objectiveProgress(contract, { boundedRuns: [], selectedArtifacts: [],
 				stopReason: "next-task-pending", pendingActionFacts: {} });
 			await host.recordCheckpoint(progress);
+			await host.releaseCleanStart?.();
 			return progress;
 		},
 		async status(missionId) { return (await load(missionId)).progress; },
 		async step(missionId) {
 			const current = (await load(missionId)).progress;
-			return current.objectiveOutcome === "fulfilled" ? current : (await stepCore(missionId)).progress;
+			if (current.objectiveOutcome === "fulfilled") return current;
+			const returned = (await stepCore(missionId)).progress;
+			await hostFor(missionId).releaseCleanReturn?.(returned);
+			return returned;
 		},
 		async run(missionId) {
 			const current = (await load(missionId)).progress;
 			if (current.objectiveOutcome === "fulfilled") return current;
 			let latest: ObjectiveProgressV1 | undefined;
-			await runOriginalObjectiveLoop({ admission: () => input.ctx?.signal?.aborted ? "cancelled" : "admitted",
+			await runOriginalObjectiveLoop({ collectSteps: false,
+				admission: () => input.ctx?.signal?.aborted ? "cancelled" : "admitted",
 				step: async () => {
 					const result = await stepCore(missionId);
 					latest = result.progress;
 					return { advanced: result.advanced, stopReason: result.stopReason };
 				} });
-			return latest ?? (await load(missionId)).progress;
+			const returned = latest ?? (await load(missionId)).progress;
+			await hostFor(missionId).releaseCleanReturn?.(returned);
+			return returned;
 		}
 	};
 }

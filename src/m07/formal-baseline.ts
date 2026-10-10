@@ -64,7 +64,7 @@ async function json(file: string, root: string, physicalByteBoundary?: number): 
 	} finally { await handle.close(); }
 }
 
-async function settledFailure(ctx: StageContext, run: StageRunRecord): Promise<M04BaselineFailure> {
+export async function settledM04Failure(ctx: StageContext, run: StageRunRecord): Promise<M04BaselineFailure> {
 	try {
 		const root = ctx.ws.runDir("M04", run.runId);
 		const transactionFile = path.join(root, "m04-transaction.json");
@@ -153,7 +153,7 @@ export async function resolveM04Baseline(ctx: StageContext): Promise<M04Baseline
 		while (runs.length) {
 			const run = latestByStartOrder(runs, "M04")!;
 			if (run.status !== "failed") { baseline = await completedBaseline(run); break; }
-			failedM04.unshift(await settledFailure(ctx, run));
+			failedM04.unshift(await settledM04Failure(ctx, run));
 			runs.splice(runs.indexOf(run), 1);
 		}
 	} catch (error) {

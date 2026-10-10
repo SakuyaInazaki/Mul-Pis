@@ -55,7 +55,7 @@ function reopenedInNewProcess(root: string, missionId: string, action: "status" 
 }
 
 function cliWithTrustedPreload(root: string, action: "start" | "run" | "resume" | "status",
-	argument: string, twoStep = false) {
+	argument: string, twoStep = false, expectedStatus = 0) {
 	const env = { ...process.env };
 	for (const name of Object.keys(env)) if (/KEY|TOKEN|SECRET|PASSWORD/i.test(name)) delete env[name];
 	if (twoStep) env.MULPIS_SYNTHETIC_TWO_STEP = "1";
@@ -66,7 +66,7 @@ function cliWithTrustedPreload(root: string, action: "start" | "run" | "resume" 
 		...(action === "status" ? [] : ["--runner", "fake"]),
 		...(action === "start" ? ["--original", argument] : ["--mission", argument])],
 		{ cwd: repo, env, encoding: "utf8" });
-	assert.equal(child.status, 0, `${action}: ${child.stderr}\n${child.stdout}`);
+	assert.equal(child.status, expectedStatus, `${action}: ${child.stderr}\n${child.stdout}`);
 	return JSON.parse(child.stdout.trim()) as Record<string, unknown>;
 }
 
@@ -139,6 +139,9 @@ async function finiteFixture(t: TestContext, options: {
 	const runner = new FakeSessionRunner(async ({ spec, message }) => {
 		if (spec.label === "M04-research") {
 			m04Calls++;
+			if (spec.tools.kind === "read-dir" &&
+				(options.m04FullRead === false || options.m04SkipObservation) && m04Calls > 5)
+				throw new DOMException("Synthetic stop after intentionally incomplete M04 reads", "AbortError");
 			return spec.tools.kind === "read-dir" ? {
 				text: "Independent synthetic M04 read the frozen review materials; no knowledge proposal.",
 				readReturns: options.m04FullRead === false ? [] :
@@ -170,6 +173,9 @@ async function finiteFixture(t: TestContext, options: {
 		}
 		if (spec.label.startsWith("local-original-objective-")) {
 			assessorCalls++;
+			if ((options.skipProofGapRead || options.skipRepairFeedbackRead ||
+				options.skipCommittedKnowledgeRead) && assessorCalls > 4)
+				throw new DOMException("Synthetic stop after intentionally incomplete read coverage", "AbortError");
 			assert.equal(spec.tools.kind, "read-dir");
 			if (spec.tools.kind !== "read-dir") throw new Error("assessor lacks frozen evidence");
 			const readReturns = (await readEvents(spec.tools.root, "objective_evidence_read"))
@@ -307,6 +313,11 @@ test("default host completes a finite exact-file objective only after evaluator,
 	const first = await f.mission.step(f.missionId);
 	assert.equal(first.objectiveOutcome, "incomplete");
 	assertExactSelection(first.selectedArtifacts);
+	assert.equal(first.stopReason, "objective-reassessment-pending");
+	assert.equal(first.pendingM04Review, undefined);
+	assert.equal(f.assessorCalls, 1);
+	assert.equal(f.builderCalls, 1);
+	assert.equal(f.m04Calls, 2);
 	const finished = await f.mission.step(f.missionId);
 	assert.equal(finished.objectiveOutcome, "fulfilled", JSON.stringify({ stopReason: finished.stopReason,
 		selected: finished.selectedArtifacts, bounded: finished.boundedRuns, assessmentHistory: finished.assessmentHistory,
@@ -334,8 +345,7 @@ test("the next assessor cannot dispatch a task without reading the frozen select
 	assert.equal(second.boundedRuns.length, 1);
 	assert.equal(f.builderCalls, 1);
 	assert.equal((await f.ws.listRuns("M07")).length, 1);
-	assert(second.stopReason === "assessment-evidence-unread" ||
-		second.stopReason === "workflow-repair-needed", String(second.stopReason));
+	assert.equal(second.stopReason, "cancelled");
 });
 
 function registerObservationOnlyEvaluator(id: string): void {
@@ -468,8 +478,7 @@ test("a rejected task makes exact repair feedback and the edit contract mandator
 				assert.equal(second.boundedRuns.length, 1);
 				assert.equal(f.builderCalls, 1);
 				assert.equal((await f.ws.listRuns("M07")).length, 1);
-				assert(second.stopReason === "assessment-evidence-unread" ||
-					second.stopReason === "workflow-repair-needed", String(second.stopReason));
+				assert.equal(second.stopReason, "cancelled");
 			} else {
 				assert.equal(second.boundedRuns.length, 2, String(second.stopReason));
 				assert.equal(f.assessorCalls, 2);
@@ -1062,11 +1071,17 @@ test("tampered selection identity or candidate bytes block restart before any ne
 
 test("missing full M04 read and unresolved knowledge transaction cannot select", async t => {
 	const unread = await finiteFixture(t, { m04FullRead: false });
-	await assert.rejects(unread.mission.step(unread.missionId), /repair strategy made no progress|M04/i);
+	await assert.rejects(unread.mission.step(unread.missionId), error =>
+		error instanceof Error && error.name === "AbortError");
+	const unreadHeld = await unread.mission.status(unread.missionId);
+	assert.equal(unreadHeld.stopReason, "m04-review-pending");
+	assert.deepEqual(unreadHeld.selectedArtifacts, []);
 	assert.deepEqual((await unread.mission.status(unread.missionId)).selectedArtifacts, []);
 	const skippedHostObservation = await finiteFixture(t, { m04SkipObservation: true });
-	await assert.rejects(skippedHostObservation.mission.step(skippedHostObservation.missionId),
-		/repair strategy made no progress|M04/i);
+	await assert.rejects(skippedHostObservation.mission.step(skippedHostObservation.missionId), error =>
+		error instanceof Error && error.name === "AbortError");
+	const skippedHeld = await skippedHostObservation.mission.status(skippedHostObservation.missionId);
+	assert.equal(skippedHeld.stopReason, "m04-review-pending");
 	assert.deepEqual((await skippedHostObservation.mission.status(skippedHostObservation.missionId)).selectedArtifacts, []);
 	const unresolved = await finiteFixture(t);
 	const first = await unresolved.mission.step(unresolved.missionId);
@@ -1357,7 +1372,7 @@ test("fresh CLI resumes dispatch one settled M07/M04 at a time and hold on unkno
 		"local-mission-record-unknown.ts"), root, missionId],
 		{ cwd: repo, env, encoding: "utf8", timeout: 30_000 });
 	assert.equal(injected.status, 0, injected.stderr);
-	const held = cliWithTrustedPreload(root, "resume", missionId, true);
+	const held = cliWithTrustedPreload(root, "resume", missionId, true, 1);
 	const heldCheckpoint = await readMissionCheckpoint(root, missionId);
 	assert.equal(held.stopReason, "execution-interrupted");
 	assert(heldCheckpoint.continuation.unresolvedOperationIds.includes("synthetic-unsettled-effect"));

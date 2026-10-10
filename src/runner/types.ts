@@ -55,6 +55,9 @@ export interface ToolCallRecord {
 	args: Record<string, unknown>;
 	ok: boolean;
 	at: string;
+	/** Exact Pi call binding for host-owned local bash evidence. */
+	toolCallId?: string;
+	hostReceiptPath?: string;
 	error?: string;
 	errorClass?: "harness" | "filesystem" | "tool-error";
 	errorCode?: string;
@@ -193,6 +196,8 @@ export interface ReadReturnEvent {
 	requested: { offset?: number; limit?: number };
 	/** One-based inclusive text lines actually sent to the model. */
 	returned: { startLine?: number; endLine?: number; truncated?: boolean; kind: "text" | "binary" | "unknown" };
+	/** Host-classified error from the exact bytes read by the confined tool. Other errors stay unclassified. */
+	error?: { kind: "offset-beyond-eof"; lineCount: number };
 	at: string;
 }
 
@@ -218,6 +223,8 @@ export interface TransportFailureDiagnostic {
 	httpStatus: number | null;
 	responseStarted: boolean | null;
 	bytesRead: number | null;
+	/** Host observed fetch rejection or response-body read rejection. */
+	transportInterrupted?: true;
 	abortSource: "host-signal" | "handle" | "sdk-signal" | null;
 	/** Exact, allowlisted JSON error values observed on a non-2xx response; never free-form text. */
 	providerErrorCode: string | null;

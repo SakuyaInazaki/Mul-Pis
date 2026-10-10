@@ -11,7 +11,7 @@ import { readObjectiveCheckpointFile } from "../src/m07/objective-checkpoint-sto
 import type { CurrentObjectiveStopReason, ModelObjectiveAssessmentV1,
 	ObjectiveNextTaskV1 } from "../src/m07/objective-progress.ts";
 import { FakeSessionRunner, type FakeReply } from "../src/runner/fake.ts";
-import type { ReadReturnEvent, SessionHandle, SessionSpec } from "../src/runner/types.ts";
+import type { ReadReturnEvent, SessionHandle, SessionSpec, TransportFailureDiagnostic } from "../src/runner/types.ts";
 import type { WorkflowRepairStateV1 } from "../src/runner/repair-liveness.ts";
 import { Workspace } from "../src/workspace.ts";
 import { HarnessError } from "../src/types.ts";
@@ -1894,6 +1894,251 @@ test("invalid fully read assessment obeys real admission before retry and never 
 	assert.equal([...runner.sessions.values()][0].turns, 1);
 });
 
+test("assessor prompt failures use host transport facts for typed holds", async t => {
+	for (const scenario of [
+		{ name: "auth", httpStatus: 401, reason: "unknown" as const,
+			expected: "assessor-auth-unavailable", action: "refresh-auth" },
+		{ name: "request", httpStatus: 400, reason: "input-schema" as const,
+			expected: "assessor-request-rejected", action: "repair-workflow-state" },
+		{ name: "context", httpStatus: 400, reason: "context-window" as const,
+			expected: "output-limit", action: "retry-transport" },
+	] as const) {
+		const f = await fixture(t);
+		let calls = 0, waits = 0;
+		const runner = new FakeSessionRunner(() => {
+			calls++;
+			throw new HarnessError("runner.stop", "synthetic assessor provider failure");
+		});
+		const create = runner.create.bind(runner);
+		runner.create = async spec => {
+			const handle = await create(spec);
+			const diagnostics: TransportFailureDiagnostic[] = [];
+			return { ...handle, transportDiagnostics: () => [...diagnostics],
+				prompt: async message => {
+					try { return await handle.prompt(message); }
+					catch (error) {
+						diagnostics.push({ version: 1, promptIndex: 1, phase: "provider-stream",
+							httpStatus: scenario.httpStatus, responseStarted: true, bytesRead: 0,
+							abortSource: null, providerErrorCode: null, providerErrorType: null,
+							providerErrorReasonClass: scenario.reason,
+							providerRequestId: null, errorCodes: [] });
+						throw error;
+					}
+				} };
+		};
+		const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+			persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+			advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+			waitBeforeTransportRetry: async () => { waits++; },
+			advance: async () => { throw new Error("must not dispatch"); } });
+		assert.equal(result.stopReason, scenario.expected, scenario.name);
+		assert.equal(calls, 1, scenario.name);
+		assert.equal(waits, 0, scenario.name);
+		assert.equal(classifyPendingAction(result.stopReason).kind, scenario.action, scenario.name);
+	}
+});
+
+test("typed Pi no-auth preflight holds the assessor without a transport retry", async t => {
+	for (const [code, expectedCause] of [
+		["runner.auth-preflight", "missing-configured-key"],
+		["runner.auth-store-unavailable", "credential-store-unavailable"],
+	] as const) {
+		const f = await fixture(t);
+		let calls = 0, waits = 0;
+		const failures: Array<{ localAuthCause?: string }> = [];
+		const runner = new FakeSessionRunner(() => {
+			calls++;
+			throw new HarnessError(code, "synthetic local authentication preflight");
+		});
+		const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+			persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+			advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+			recordTransportFailure: async failure => { failures.push(failure); },
+			waitBeforeTransportRetry: async () => { waits++; },
+			advance: async () => { throw new Error("must not dispatch"); } });
+		assert.equal(result.stopReason, "assessor-auth-unavailable");
+		assert.equal(classifyPendingAction(result.stopReason).kind, "refresh-auth");
+		assert.equal(failures[0]?.localAuthCause, expectedCause);
+		assert.equal(calls, 1);
+		assert.equal(waits, 0);
+	}
+});
+
+test("repeated transient assessor streams can recover without a retry-count stop", async t => {
+	const f = await fixture(t);
+	let calls = 0, dispatches = 0;
+	const waits: number[] = [];
+	const runner = new FakeSessionRunner(() => {
+		calls++;
+		if (calls <= 4) throw new HarnessError("runner.stop", "synthetic transient provider stream");
+		return { text: JSON.stringify(assessment("continue")), readReturns: ranges(f) };
+	});
+	const create = runner.create.bind(runner);
+	runner.create = async spec => {
+		const handle = await create(spec);
+		const diagnostics: TransportFailureDiagnostic[] = [];
+		return { ...handle, transportDiagnostics: () => [...diagnostics],
+			prompt: async message => {
+				try { return await handle.prompt(message); }
+				catch (error) {
+					diagnostics.push({ version: 1, promptIndex: 1, phase: "provider-stream",
+						httpStatus: 503, responseStarted: true, bytesRead: 0,
+						abortSource: null, providerErrorCode: null, providerErrorType: "server_error",
+						providerRequestId: null, errorCodes: [] });
+					throw error;
+				}
+			} };
+	};
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		waitBeforeTransportRetry: async number => { waits.push(number); },
+		advance: async () => { dispatches++; } });
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.equal(dispatches, 1);
+	assert.equal(calls, 5);
+	assert.equal(runner.created.length, 5);
+	assert.deepEqual(waits, [1, 2, 3, 4]);
+});
+
+test("HTTP 200 retries only observed transport faults and holds SDK cancellation", async t => {
+	for (const outcome of ["local-invariant", "body-interrupted", "sdk-aborted"] as const) {
+		const interrupted = outcome !== "local-invariant";
+		const sdkAborted = outcome === "sdk-aborted";
+		const f = await fixture(t);
+		let calls = 0, dispatches = 0;
+		const runner = new FakeSessionRunner(() => {
+			calls++;
+			if (calls === 1) throw Object.assign(
+				new HarnessError("runner.model", "synthetic local SDK invariant"),
+				{ cause: Object.assign(new Error("synthetic local cause"), { code: "ECONNRESET" }) });
+			return { text: JSON.stringify(assessment("continue")), readReturns: ranges(f) };
+		});
+		const create = runner.create.bind(runner);
+		runner.create = async spec => {
+			const handle = await create(spec);
+			const diagnostics: TransportFailureDiagnostic[] = [];
+			return { ...handle, transportDiagnostics: () => [...diagnostics],
+				prompt: async message => {
+					try { return await handle.prompt(message); }
+					catch (error) {
+						diagnostics.push({ version: 1, promptIndex: 1, phase: "response-body",
+							httpStatus: 200, responseStarted: true, bytesRead: 4,
+							...(interrupted ? { transportInterrupted: true as const } : {}),
+							abortSource: sdkAborted ? "sdk-signal" : null,
+							providerErrorCode: null, providerErrorType: null,
+							providerRequestId: null, errorCodes: interrupted ? [] : ["ECONNRESET"] });
+						throw error;
+					}
+				} };
+		};
+		const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+			persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+			advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+			waitBeforeTransportRetry: async () => {},
+			advance: async () => { dispatches++; } });
+		assert.equal(result.stopReason, sdkAborted ? "cancelled" :
+			interrupted ? "objective-reassessment-pending" : "assessment-failed");
+		assert.equal(calls, interrupted && !sdkAborted ? 2 : 1);
+		assert.equal(dispatches, interrupted && !sdkAborted ? 1 : 0);
+	}
+});
+
+test("cancellation wording from a provider or model does not certify host cancellation", async t => {
+	const failed = await fixture(t);
+	const thrown = await assessAndAdvanceOriginalObjective({ ...failed,
+		runner: new FakeSessionRunner(() => { throw new Error("cancelled by model prose"); }),
+		persistReceipt: () => failed.ws.writeRun(failed.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { throw new Error("must not dispatch"); } });
+	assert.equal(thrown.stopReason, "assessment-failed");
+	const reported = await fixture(t);
+	let dispatches = 0;
+	const reply = { ...assessment("continue"), rationale: "The model says cancelled." };
+	const result = await assessAndAdvanceOriginalObjective({ ...reported,
+		runner: new FakeSessionRunner(() => ({ text: JSON.stringify(reply), readReturns: ranges(reported) })),
+		persistReceipt: () => reported.ws.writeRun(reported.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { dispatches++; } });
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.equal(dispatches, 1);
+});
+
+test("assessor transport backoff honors cancellation before a new provider prompt", async t => {
+	const f = await fixture(t);
+	const cancellation = new AbortController();
+	let calls = 0, waits = 0;
+	const runner = new FakeSessionRunner(() => {
+		calls++;
+		throw new HarnessError("runner.stop", "synthetic transient provider stream");
+	});
+	const create = runner.create.bind(runner);
+	runner.create = async spec => {
+		const handle = await create(spec);
+		const diagnostics: TransportFailureDiagnostic[] = [];
+		return { ...handle, transportDiagnostics: () => [...diagnostics],
+			prompt: async message => {
+				try { return await handle.prompt(message); }
+				catch (error) {
+					diagnostics.push({ version: 1, promptIndex: 1, phase: "provider-stream",
+						httpStatus: 503, responseStarted: true, bytesRead: 0,
+						abortSource: null, providerErrorCode: null, providerErrorType: "server_error",
+						providerRequestId: null, errorCodes: [] });
+					throw error;
+				}
+			} };
+	};
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => cancellation.signal.aborted ? "cancelled" : "admitted",
+		supportedTaskScopes: ["two-target-existing"], signal: cancellation.signal,
+		waitBeforeTransportRetry: async () => { waits++; cancellation.abort(); },
+		advance: async () => { throw new Error("must not dispatch"); } });
+	assert.equal(result.stopReason, "cancelled");
+	assert.equal(calls, 1);
+	assert.equal(waits, 1);
+	assert.equal(runner.created.length, 1);
+});
+
+test("assessor transport retry suspends if frozen evidence changes during backoff", async t => {
+	const f = await fixture(t);
+	let calls = 0, waits = 0, dispatches = 0;
+	const runner = new FakeSessionRunner(() => {
+		calls++;
+		throw new HarnessError("runner.stop", "synthetic transient provider stream");
+	});
+	const create = runner.create.bind(runner);
+	runner.create = async spec => {
+		const handle = await create(spec);
+		const diagnostics: TransportFailureDiagnostic[] = [];
+		return { ...handle, transportDiagnostics: () => [...diagnostics],
+			prompt: async message => {
+				try { return await handle.prompt(message); }
+				catch (error) {
+					diagnostics.push({ version: 1, promptIndex: 1, phase: "provider-stream",
+						httpStatus: 503, responseStarted: true, bytesRead: 0,
+						abortSource: null, providerErrorCode: null, providerErrorType: "server_error",
+						providerRequestId: null, errorCodes: [] });
+					throw error;
+				}
+			} };
+	};
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		waitBeforeTransportRetry: async () => {
+			waits++;
+			await writeFile(path.join(f.evidenceRoot, "original-problem.txt"),
+				"Tampered frozen evidence while waiting.\n");
+		},
+		advance: async () => { dispatches++; } });
+	assert.equal(result.stopReason, "assessment-evidence-suspended");
+	assert.equal(calls, 1);
+	assert.equal(waits, 1);
+	assert.equal(runner.created.length, 1, "no fresh assessor may see changed evidence");
+	assert.equal(dispatches, 0);
+});
+
 test("repeated invalid assessment class survives wording changes and repairs in a fresh context", async t => {
 	const f = await fixture(t);
 	const repairs: WorkflowRepairStateV1[] = [];
@@ -2417,6 +2662,21 @@ test("the reusable objective loop returns an incomplete no-advance stage to the 
 	assert.equal(extended.steps.length, 71);
 });
 
+test("the default mission can omit redundant in-memory step history across a long run", async () => {
+	const fixtureRounds = 1_000;
+	let calls = 0;
+	const result = await runOriginalObjectiveLoop({ collectSteps: false,
+		admission: () => calls >= fixtureRounds ? "cancelled" : "admitted",
+		step: async () => {
+			calls++;
+			return { advanced: true as const, stopReason: "objective-reassessment-pending" as const,
+				evidenceRefs: [`synthetic-round-${calls}`] };
+		} });
+	assert.equal(calls, fixtureRounds);
+	assert.equal(result.stopReason, "cancelled");
+	assert.deepEqual(result.steps, []);
+});
+
 const availableCapabilities = [
 	{ scope: "two-target-existing" as const, available: true, description: "Two existing bodies", limits: ["CPU only"] },
 	{ scope: "registered-csr-experiment" as const, available: true, description: "Registered model-authored experiments", limits: ["Observed CPU capacity"] },
@@ -2521,7 +2781,7 @@ test("repeated unsupported proposals replace context before a feasible task is c
 		stopReason: result.stopReason }).objectiveOutcome, "incomplete");
 });
 
-test("unchanged unsupported proposal after fresh reread remains repair-needed with no executable next task", async t => {
+test("unchanged unsupported proposal remains open until an explicit output boundary", async t => {
 	const f = await fixture(t);
 	const repairs: WorkflowRepairStateV1[] = [];
 	let calls = 0, dispatches = 0;
@@ -2533,32 +2793,27 @@ test("unchanged unsupported proposal after fresh reread remains repair-needed wi
 		return { text: JSON.stringify(proposal, null, calls === 2 ? 2 : undefined), readReturns: ranges(f) };
 	});
 	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
-		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => calls >= 4 ? "output-limit" : "admitted",
 		supportedTaskScopes: ["two-target-existing"], capabilities: availableCapabilities,
 		recordRepairState: async state => { repairs.push(state); }, advance: async () => { dispatches++; } });
-	assert.equal(result.stopReason, "workflow-repair-needed");
-	assert.equal(calls, 3);
-	assert.equal(runner.created.length, 2);
+	assert.equal(result.stopReason, "output-limit");
+	assert.equal(calls, 4);
+	assert.equal(runner.created.length, 3);
 	assert.equal(dispatches, 0);
 	assert.deepEqual(repairs.map(item => item.strategy),
-		["same-session-feedback", "fresh-context", "workflow-repair-needed"]);
+		["same-session-feedback", "fresh-context", "fresh-context"]);
 	assert.equal(repairs[0].responseFingerprint, repairs[1].responseFingerprint);
 	assert.equal(repairs[1].evidenceFingerprint, repairs[2].evidenceFingerprint);
-	assert.equal(result.assessment?.proposalHistory?.length, 3);
+	assert.equal(result.assessment?.proposalHistory?.length, 4);
 	assert.ok(result.assessment?.nextTask, "stale proposal remains available as assessment context");
 	const checkpoint = objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [],
 		assessment: result.assessment, stopReason: result.stopReason, pendingActionFacts: {} });
 	assert.equal(checkpoint.objectiveOutcome, "incomplete");
-	assert.equal(checkpoint.continuation.nextTask, undefined);
-	assert.equal(checkpoint.continuation.pendingAction?.kind, "repair-workflow-state");
+	assert.equal(checkpoint.continuation.nextTask?.adapterScope, "outside-current-adapter",
+		"an unsupported proposal stays visible as unexecuted context");
+	assert.equal(checkpoint.continuation.pendingAction?.kind, "retry-transport");
 	assert.equal(checkpoint.continuation.pendingAction?.humanRequired, undefined);
-	assert.throws(() => objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [],
-		stopReason: result.stopReason, pendingAction: { ...checkpoint.continuation.pendingAction!, kind: "fresh-m07-task" } }),
-		/required stage repair/);
-	assert.throws(() => objectiveProgress(f.contract, { boundedRuns: [], selectedArtifacts: [],
-		stopReason: result.stopReason, pendingAction: { ...checkpoint.continuation.pendingAction!, humanRequired: true,
-			verifiedHumanBlocker: { kind: "input-unavailable", verifiedBy: "host", evidenceRef: "host-check", exclusiveRequiredAction: true } } }),
-		/workflow repair|human gate/);
 });
 
 test("a changed addressed obligation permits its own fresh repair strategy without a session quota", async t => {
@@ -2589,7 +2844,7 @@ test("a changed addressed obligation permits its own fresh repair strategy witho
 	assert.notEqual(repairs[1].planFingerprint, repairs[2].planFingerprint);
 });
 
-test("cycling unsupported host states receives a fresh strategy even without adjacent identical replies", async t => {
+test("cycling unsupported host states stays open until an explicit output boundary", async t => {
 	const f = await fixture(t);
 	const repairs: WorkflowRepairStateV1[] = [];
 	let calls = 0;
@@ -2600,14 +2855,15 @@ test("cycling unsupported host states receives a fresh strategy even without adj
 		return { text: JSON.stringify(assessment("continue", scope)), readReturns: ranges(f) };
 	});
 	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
-		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted", advanceAdmission: () => "admitted",
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => calls >= 4 ? "output-limit" : "admitted",
 		supportedTaskScopes: ["two-target-existing"], capabilities: availableCapabilities.slice(0, 1),
 		recordRepairState: async state => { repairs.push(state); }, advance: async () => { throw new Error("must not dispatch"); } });
-	assert.equal(result.stopReason, "workflow-repair-needed");
+	assert.equal(result.stopReason, "output-limit");
 	assert.equal(calls, 4);
 	assert.equal(runner.created.length, 2);
 	assert.deepEqual(repairs.map(item => item.strategy),
-		["same-session-feedback", "same-session-feedback", "fresh-context", "workflow-repair-needed"]);
+		["same-session-feedback", "same-session-feedback", "fresh-context"]);
 });
 
 test("current user override accompanies an unchanged legacy frozen contract", async t => {

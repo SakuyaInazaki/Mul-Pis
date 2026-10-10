@@ -45,6 +45,8 @@ test("declared binary original and text projection survive the local host withou
 	let prompts = 0;
 	const runner = new FakeSessionRunner(async ({ spec }) => {
 		prompts++;
+		if (prompts > 4)
+			throw new DOMException("Synthetic stop after material handoff checks", "AbortError");
 		assert.equal(spec.tools.kind, "read-dir");
 		if (spec.tools.kind !== "read-dir") throw new Error("expected read-dir");
 		const names = await readdir(spec.tools.root);
@@ -73,8 +75,10 @@ test("declared binary original and text projection survive the local host withou
 		.equals(f.pdfBytes));
 	assert((await readFile(path.join(materialRoot, manifest.items[1]!.parts[0]!.file)))
 		.equals(f.projectionBytes));
-	await mission.step(started.contract.id);
+	const result = await mission.step(started.contract.id);
 	assert(prompts > 0);
+	assert.equal(result.stopReason, "cancelled");
+	assert.equal(result.objectiveOutcome, "incomplete");
 });
 
 test("changed selected projection or coverage index blocks reassessment before a model call", async t => {

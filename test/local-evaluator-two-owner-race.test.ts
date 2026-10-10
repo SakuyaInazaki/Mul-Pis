@@ -105,9 +105,14 @@ async function startFirst(root: string): Promise<void> {
 async function runOwner(root: string, missionId: string, owner: string, barrier: boolean): Promise<void> {
 	const ws = new Workspace(root);
 	registerEvaluator(root, false);
+	let invalidAssessmentCount = 0;
 	const runner = new FakeSessionRunner(async ({ spec }) => {
-		if (!barrier && spec.label.startsWith("local-original-objective-"))
+		if (!barrier && spec.label.startsWith("local-original-objective-")) {
+			invalidAssessmentCount++;
+			if (invalidAssessmentCount > 4)
+				throw new DOMException("Synthetic stop after invalid reassessment", "AbortError");
 			return "Deliberately invalid fresh assessment";
+		}
 		if (spec.label !== "M04-research")
 			throw new Error(`old builder/evaluator or fresh assessor replayed: ${spec.label}`);
 		await appendFile(path.join(root, "calls.log"), `m04:${owner}\n`);

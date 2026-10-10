@@ -7,8 +7,14 @@ import { link, lstat, mkdir, open, readdir, realpath, rename, unlink } from "nod
 import path from "node:path";
 import { readCurrentProcessIdentity, probeProcessIdentity,
 	type ProcessIdentityV1, type ProcessProbe } from "../runtime/process-identity.ts";
-import type { ObjectiveProgressV1 } from "../m07/objective-progress.ts";
+import { objectiveProgress, type ObjectiveProgressV1 } from "../m07/objective-progress.ts";
 import type { LegacyEffectReviewV1 } from "../m07/local-legacy-review.ts";
+import { hashStableHistoricalFile, pairedHistoricalToolTranscript, validFailedM04EffectReview,
+	type FailedM04EffectReviewV1 } from "../m07/local-failed-m04-effects.ts";
+import { readLocalDispatchLineage } from "../m07/local-dispatch-lineage.ts";
+import { readLocalEvaluatorReceipt, verifyLocalEvaluatorReceipt } from "../m07/local-evaluator-run.ts";
+import type { CurrentGoal } from "../m07/types.ts";
+import type { OriginalObjectiveContractV1 } from "../m07/objective-progress.ts";
 import { assertFullM07Reads, requiredM07Reads } from "../stages/m04.ts";
 
 const CHECKPOINT_BYTES = 64 * 1024 * 1024;
@@ -26,7 +32,7 @@ export type LocalMissionAttempt = Readonly<{
 	codeRevision: string; process: ProcessIdentityV1;
 }>;
 export type LocalCheckpointReceipt = Readonly<{
-	version: 1 | 2 | 3 | 4 | 5; kind: "local-mission-checkpoint"; source: LocalMissionAttempt;
+	version: 1 | 2 | 3 | 4 | 5 | 6; kind: "local-mission-checkpoint"; source: LocalMissionAttempt;
 	sequence: number; previousSha256: string | null; sha256: string; bytes: number;
 	unresolvedOperationIds: readonly string[];
 	/** V2 commits the host review with the successor checkpoint, never with the old attempt. */
@@ -34,6 +40,7 @@ export type LocalCheckpointReceipt = Readonly<{
 	legacyInterruptedReview?: LocalLegacyInterruptedReviewV1;
 	evaluatorRecoveryReview?: LocalEvaluatorRecoveryReviewV1;
 	coldMigrationReview?: LocalColdMigrationReviewV1;
+	failedM04Review?: LocalFailedM04ReviewV1;
 }>;
 export type LocalEvaluatorRecoveryClaimV1 = Readonly<{
 	version: 1; kind: "local-evaluator-recovery-claim"; claimId: string;
@@ -42,6 +49,10 @@ export type LocalEvaluatorRecoveryClaimV1 = Readonly<{
 	/** Each prior owner was proved dead on the same host/boot before replacement. */
 	predecessors: readonly { claimId: string; owner: ProcessIdentityV1 }[];
 }>;
+export type LocalPendingM04ClaimV1 = Readonly<{ version: 1;
+	kind: "local-pending-m04-review-claim"; missionId: string; runId: string;
+	taskId: string; checkpointId: string; evaluatorReceiptSha256: string;
+	owner: ProcessIdentityV1 }>;
 export type LocalEvaluatorRecoveryEvidenceV1 =
 	| Readonly<{ id: string; version: string; phase: "pre-entry-unlocated";
 		orphanMembers: readonly { name: "prepared.json.pending" | "prepared.json" |
@@ -84,6 +95,16 @@ export type LocalInterruptedReviewV1 = Readonly<{
 		runSha256: string; result: "failed-no-proposal";
 		lastRequest: "sdk-output-max-guard-before-http"; providerProofSha256: string };
 	boundary: "new-work-only-no-old-task-or-session-replay";
+}>;
+export type LocalFailedM04ReviewV1 = Readonly<Omit<LocalInterruptedReviewV1,
+	"kind" | "m04"> & {
+	kind: "local-failed-m04-interruption-host-review";
+	evaluatorReceiptSha256: string;
+	effectReview: FailedM04EffectReviewV1;
+	effectReviewSha256: string; effectReviewFileSha256: string;
+	m04: { runId: string; sourceSha256: string; transactionSha256: string;
+		runSha256: string; sessions: Array<{ id: string; fileSha256: string }>;
+		result: "failed-no-proposal" };
 }>;
 export type LocalLegacyInterruptedReviewV1 = Readonly<Omit<LocalInterruptedReviewV1,
 	"kind" | "lineageSha256"> & {
@@ -139,11 +160,16 @@ export type LocalFinalReceipt = Readonly<{
 	intentId: string; checkpointSequence: number; checkpointSha256: string;
 	sha256: string; bytes: number; transportOnly: true;
 }>;
+export type LocalCleanStartReleaseV1 = Readonly<{
+	version: 1; kind: "local-clean-start-release"; source: LocalMissionAttempt;
+	contractSha256: string; checkpointSha256: string;
+}>;
 export type LocalMissionStatus = Readonly<{
 	missionId: string; currentAttempt: LocalMissionAttempt | null;
 	contractReceipt: LocalContractReceipt | null; contractOrphan: boolean;
 	latestCheckpoint: LocalCheckpointReceipt | null;
 	checkpointReceipts: readonly LocalCheckpointReceipt[];
+	cleanStartRelease: LocalCleanStartReleaseV1 | null;
 	unresolvedOperationIds: readonly string[]; interruptedAttemptIds: readonly string[];
 	final: "none" | "reserved" | "attempted-unknown" | "committed";
 	finalReceipt: LocalFinalReceipt | null; finalReceipts: readonly LocalFinalReceipt[];
@@ -196,14 +222,113 @@ function validSource(value: unknown): value is LocalMissionAttempt {
 		validProcess(value.process);
 }
 function same(a: unknown, b: unknown): boolean { return JSON.stringify(a) === JSON.stringify(b); }
+function validCleanStartProgress(bytes: Buffer, contractBytes: Buffer, missionId: string): boolean {
+	try {
+		const progress = JSON.parse(bytes.toString("utf8")) as ObjectiveProgressV1;
+		const stored = JSON.parse(contractBytes.toString("utf8")) as Record<string, unknown>;
+		const { frozenInputs: _frozenInputs, materialManifestSha256: _materialManifestSha256,
+			...contract } = stored;
+		return progress.contract?.id === missionId && same(progress.contract, contract) &&
+			same(progress, objectiveProgress(progress.contract, { boundedRuns: [],
+				selectedArtifacts: [], stopReason: "next-task-pending", pendingActionFacts: {} }));
+	} catch { return false; }
+}
+
+/** A clean start cannot hand off if any mission-bound stage was issued. An
+ * incomplete stage directory also defeats the proof rather than disappearing
+ * from the normal listRuns view. */
+async function cleanStartStagesPristine(root: string, missionId: string): Promise<boolean> {
+	const stages = path.resolve(root, "../../..", "stages");
+	for (const stage of ["MISSION", "M07"] as const) {
+		const directory = path.join(stages, stage);
+		let names: string[];
+		try { names = await readdir(directory); }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			return false;
+		}
+		for (const name of names) {
+			if (!SAFE_ID.test(name)) return false;
+			try {
+				const file = path.join(directory, name, stage === "MISSION" ? "run.json" : "goal.json");
+				const row = await stageJson(file);
+				if (stage === "MISSION" && Array.isArray(row.inputs) &&
+					row.inputs.some((item: unknown) => !!item && typeof item === "object" &&
+						(item as { path?: unknown }).path === path.join(root, "evidence", "original-objective.json")))
+					return false;
+				if (stage === "M07" && typeof row.problemRelation === "string" &&
+					row.problemRelation.startsWith(`Local original objective mission: ${missionId}\n`)) return false;
+			} catch { return false; }
+		}
+	}
+	return true;
+}
+async function cleanStartLocalArtifactsPristine(root: string, contractBytes: Buffer): Promise<boolean> {
+	try {
+		const allowedRoot = new Set(["attempts", "original-contract.json",
+			"original-contract.receipt.json", "clean-start-release.json", "evidence", "materials", ".writer.lock"]);
+		if ((await readdir(root)).some(name => !allowedRoot.has(name))) return false;
+		const stored = JSON.parse(contractBytes.toString("utf8")) as {
+			frozenInputs?: Array<{ name: string; bytes: number; sha256: string }>;
+			materialManifestSha256?: string };
+		if (!Array.isArray(stored.frozenInputs) || !stored.frozenInputs.length) return false;
+		const attempt = path.join(root, "attempts", "A001");
+		if (!same((await readdir(path.join(attempt, "checkpoints"))).sort(),
+			["C00000001.bin", "C00000001.json"])) return false;
+		for (const part of ["operations", "final"])
+			if ((await readdir(path.join(attempt, part))).length) return false;
+		const evidence = path.join(root, "evidence");
+		let evidenceNames: string[];
+		try { await privateDir(evidence); evidenceNames = await readdir(evidence); }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+			evidenceNames = [];
+		}
+		const expected = new Set(["original-objective.json", ...stored.frozenInputs.map(row => row.name)]);
+		if (!same(evidenceNames.sort(), [...expected].sort())) return false;
+		const objective = await privateBytes(path.join(evidence, "original-objective.json"), CHECKPOINT_BYTES);
+		const { frozenInputs: _frozenInputs, materialManifestSha256: _materialManifestSha256,
+			...originalContract } = stored;
+		if (!same(JSON.parse(objective.toString("utf8")), originalContract)) return false;
+		for (const item of stored.frozenInputs) {
+			if (!item || !SAFE_ID.test(item.name) || !Number.isSafeInteger(item.bytes) ||
+				item.bytes < 1 || !HEX64.test(item.sha256)) return false;
+			const bytes = await privateBytes(path.join(evidence, item.name), CHECKPOINT_BYTES);
+			if (bytes.length !== item.bytes || digest(bytes) !== item.sha256) return false;
+		}
+		const materials = path.join(root, "materials");
+		if (!stored.materialManifestSha256) {
+			try { await privateDir(materials); return (await readdir(materials)).length === 0; }
+			catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
+		}
+		await privateDir(materials);
+		const manifestBytes = await privateBytes(path.join(materials, "manifest.json"), CONTROL_BYTES);
+		if (digest(manifestBytes) !== stored.materialManifestSha256) return false;
+		const manifest = JSON.parse(manifestBytes.toString("utf8")) as {
+			indexFiles?: string[]; items?: Array<{ id: string; parts: Array<{ file: string }> }> };
+		if (!Array.isArray(manifest.indexFiles) || !Array.isArray(manifest.items)) return false;
+		const rootNames = new Set(["manifest.json", "files", ...manifest.indexFiles]);
+		if ((await readdir(materials)).some(name => !rootNames.has(name))) return false;
+		const fileRoot = path.join(materials, "files");
+		await privateDir(fileRoot);
+		if (!same((await readdir(fileRoot)).sort(), manifest.items.map(item => item.id).sort())) return false;
+		for (const item of manifest.items) {
+			if (!SAFE_ID.test(item.id) || !Array.isArray(item.parts)) return false;
+			const itemDir = path.join(fileRoot, item.id);
+			await privateDir(itemDir);
+			if (!same((await readdir(itemDir)).sort(),
+				item.parts.map(part => path.basename(part.file)).sort()) ||
+				item.parts.some(part => path.dirname(part.file) !== path.join("files", item.id))) return false;
+		}
+		return true;
+	} catch { return false; }
+}
 function validIds(value: unknown): value is string[] {
 	return Array.isArray(value) && value.every(item => typeof item === "string" && SAFE_ID.test(item)) &&
 		new Set(value).size === value.length && [...value].sort().join("|") === value.join("|");
 }
-function validInterruptedReview(value: unknown): value is LocalInterruptedReviewV1 {
-	if (!exact(value, ["version", "kind", "missionId", "intentId", "missionRunSha256", "lineageSha256", "oldAttempt",
-		"oldCheckpoint", "newAttempt", "m07", "m04", "boundary"]) ||
-		value.version !== 1 || value.kind !== "local-interrupted-dispatch-review" ||
+function validInterruptedCommon(value: Record<string, unknown>): boolean {
+	if (value.version !== 1 ||
 		!validSource(value.oldAttempt) || !validSource(value.newAttempt) ||
 		value.missionId !== value.oldAttempt.missionId || value.missionId !== value.newAttempt.missionId ||
 		!SAFE_ID.test(String(value.intentId)) || !HEX64.test(String(value.missionRunSha256)) ||
@@ -219,14 +344,51 @@ function validInterruptedReview(value: unknown): value is LocalInterruptedReview
 			value.m07.feedbackSha256].every(x =>
 			typeof x === "string" && HEX64.test(x)) ||
 		value.m07.result !== "rejected-with-complete-feedback" || value.m07.effect !== "response-received" ||
+		value.boundary !== "new-work-only-no-old-task-or-session-replay") return false;
+	return true;
+}
+function validInterruptedReview(value: unknown): value is LocalInterruptedReviewV1 {
+	if (!exact(value, ["version", "kind", "missionId", "intentId", "missionRunSha256", "lineageSha256", "oldAttempt",
+		"oldCheckpoint", "newAttempt", "m07", "m04", "boundary"]) ||
+		value.kind !== "local-interrupted-dispatch-review" ||
+		!validInterruptedCommon(value) ||
 		!exact(value.m04, ["runId", "sourceSha256", "transactionSha256", "runSha256",
 			"result", "lastRequest", "providerProofSha256"]) ||
 		typeof value.m04.runId !== "string" || !SAFE_ID.test(value.m04.runId) ||
 		![value.m04.sourceSha256, value.m04.transactionSha256, value.m04.runSha256,
 			value.m04.providerProofSha256].every(x => typeof x === "string" && HEX64.test(x)) ||
 		value.m04.result !== "failed-no-proposal" ||
-		value.m04.lastRequest !== "sdk-output-max-guard-before-http" ||
-		value.boundary !== "new-work-only-no-old-task-or-session-replay") return false;
+		value.m04.lastRequest !== "sdk-output-max-guard-before-http") return false;
+	return true;
+}
+function validFailedM04Review(value: unknown): value is LocalFailedM04ReviewV1 {
+	if (!exact(value, ["version", "kind", "missionId", "intentId", "missionRunSha256",
+		"lineageSha256", "oldAttempt", "oldCheckpoint", "newAttempt", "m07", "m04",
+		"evaluatorReceiptSha256", "effectReview", "effectReviewSha256",
+		"effectReviewFileSha256", "boundary"]) ||
+		value.kind !== "local-failed-m04-interruption-host-review" ||
+		!validInterruptedCommon(value) ||
+		!HEX64.test(String(value.evaluatorReceiptSha256)) ||
+		!HEX64.test(String(value.effectReviewSha256)) ||
+		!HEX64.test(String(value.effectReviewFileSha256)) ||
+		!validFailedM04EffectReview(value.effectReview) ||
+		digest(JSON.stringify(value.effectReview)) !== value.effectReviewSha256 ||
+		!exact(value.m04, ["runId", "sourceSha256", "transactionSha256", "runSha256",
+			"sessions", "result"]) ||
+		value.m04.result !== "failed-no-proposal" ||
+		![value.m04.sourceSha256, value.m04.transactionSha256, value.m04.runSha256]
+			.every(x => typeof x === "string" && HEX64.test(x)) ||
+		!Array.isArray(value.m04.sessions) ||
+		value.effectReview.evaluatorReceiptSha256 !== value.evaluatorReceiptSha256 ||
+		!same(value.effectReview.m04Sessions, value.m04.sessions) ||
+		value.effectReview.m04TransactionSha256 !== value.m04.transactionSha256 ||
+		!same(value.effectReview.scope, { missionId: value.missionId, intentId: value.intentId,
+			oldCheckpointSha256: (value.oldCheckpoint as LocalFailedM04ReviewV1["oldCheckpoint"]).sha256,
+			m07RunId: (value.m07 as LocalFailedM04ReviewV1["m07"]).runId,
+			taskId: (value.m07 as LocalFailedM04ReviewV1["m07"]).taskId,
+			operationId: (value.m07 as LocalFailedM04ReviewV1["m07"]).operationId,
+			checkpointId: (value.m07 as LocalFailedM04ReviewV1["m07"]).checkpointId,
+			m04RunId: value.m04.runId })) return false;
 	return true;
 }
 function validLegacyInterruptedReview(value: unknown): value is LocalLegacyInterruptedReviewV1 {
@@ -449,7 +611,27 @@ function validEvaluatorProgressTransition(oldBytes: Buffer, newBytes: Buffer,
 				same(old.continuation?.pendingAction?.target?.operationRefs, refs)) &&
 			(same(refs, [review.intentId]) ||
 				same(refs, [review.intentId, review.m07.runId].sort())) &&
-			next.stopReason === "objective-reassessment-pending" &&
+				(next.stopReason === "objective-reassessment-pending" ||
+					accepted && next.stopReason === "m04-review-pending" &&
+					!review.m04 && next.pendingM04Review?.version === 1 &&
+					next.pendingM04Review.kind === "accepted-m07-pending-m04-review" &&
+					next.pendingM04Review.runId === review.m07.runId &&
+					next.pendingM04Review.taskId === review.m07.taskId &&
+					next.pendingM04Review.checkpointId === review.m07.checkpointId &&
+					next.pendingM04Review.checkpointManifestSha256 === review.m07.manifestSha256 &&
+					next.pendingM04Review.evaluatorReceiptSha256 ===
+						(review.evaluator.phase === "returned" ? review.evaluator.receiptSha256 : null) &&
+					Array.isArray(next.pendingM04Review.requiredM07ReadPaths) &&
+					same(next.pendingM04Review.requiredM07ReadPaths.slice(0, 3),
+						["goal.json", "manifest.json", "m04-feedback.md"]) &&
+					Array.isArray(next.pendingM04Review.requiredM07ReadSha256) &&
+					next.pendingM04Review.requiredM07ReadSha256.length ===
+						next.pendingM04Review.requiredM07ReadPaths.length &&
+					next.pendingM04Review.requiredM07ReadSha256.every(digest => HEX64.test(digest)) &&
+					same(next.pendingM04Review.requiredM07ReadSha256.slice(0, 3),
+						[review.m07.snapshotSha256, review.m07.manifestSha256,
+							review.m07.feedbackSha256]) &&
+					same(next.pendingM04Review.m04RunIds, [])) &&
 			next.continuation?.mode === "explicit-authorized-new-run" &&
 			next.continuation?.pendingAction?.safety === "fresh-work-only" &&
 			same(next.continuation?.unresolvedOperationIds, []) &&
@@ -465,7 +647,8 @@ function validEvaluatorProgressTransition(oldBytes: Buffer, newBytes: Buffer,
 	} catch { return false; }
 }
 function validReviewedProgressTransition(oldBytes: Buffer, newBytes: Buffer,
-	review: LocalInterruptedReviewV1 | LocalLegacyInterruptedReviewV1 | LocalColdMigrationReviewV1): boolean {
+	review: LocalInterruptedReviewV1 | LocalLegacyInterruptedReviewV1 | LocalColdMigrationReviewV1 |
+		LocalFailedM04ReviewV1): boolean {
 	try {
 		const old = JSON.parse(oldBytes.toString("utf8")) as ObjectiveProgressV1;
 		const next = JSON.parse(newBytes.toString("utf8")) as ObjectiveProgressV1;
@@ -588,7 +771,7 @@ async function orphanEvaluatorBytes(file: string): Promise<Buffer> {
 /** Recheck only fixed layout paths and names bound by the review. Never follow a
  * filename offered by a journal or goal outside its canonical workspace root. */
 async function evaluatorRecoveryEvidence(root: string, review: LocalEvaluatorRecoveryReviewV1,
-	checkpoints: readonly LocalCheckpointReceipt[]): Promise<{ accepted: boolean }> {
+	checkpoints: readonly LocalCheckpointReceipt[], deferGoalTransition = false): Promise<{ accepted: boolean }> {
 	const ws = path.resolve(root, "../../..");
 	const m07 = path.join(ws, "stages", "M07", review.m07.runId);
 	const cp = path.join(m07, "checkpoints", review.m07.checkpointId);
@@ -611,11 +794,16 @@ async function evaluatorRecoveryEvidence(root: string, review: LocalEvaluatorRec
 	}
 	const pinned: Array<[string, string]> = [
 		[path.join(ws, "stages", "MISSION", review.intentId, "run.json"), review.missionRunSha256],
-		[path.join(m07, "goal.json"), review.m07.goalSha256],
 		[path.join(cp, "goal.json"), review.m07.snapshotSha256],
 		[path.join(cp, "manifest.json"), review.m07.manifestSha256],
 		[path.join(cp, "m04-feedback.md"), review.m07.feedbackSha256]
 	];
+	const historicalGoal = await optionalBytes(path.join(root, "evidence",
+		`evaluator-recovery-goal-${review.intentId}.json`), CHECKPOINT_BYTES);
+	if (historicalGoal) {
+		if (digest(historicalGoal) !== review.m07.goalSha256)
+			reject("historical evaluator recovery goal differs");
+	} else pinned.push([path.join(m07, "goal.json"), review.m07.goalSha256]);
 	let m04Coverage: Record<string, any> | undefined;
 	if (review.m04) {
 		const m04 = path.join(ws, "stages", "M04", review.m04.runId);
@@ -653,7 +841,174 @@ async function evaluatorRecoveryEvidence(root: string, review: LocalEvaluatorRec
 		mission.status === "completed" || !Array.isArray(mission.inputs) ||
 		!mission.inputs.some((row: any) => row.path === path.join(root, "evidence", "original-objective.json")))
 		reject("reviewed mission intent is not interrupted");
-	const goal = await stageJson(path.join(m07, "goal.json"));
+	const liveGoalBytes = await stageBytes(path.join(m07, "goal.json"));
+	const goal = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(liveGoalBytes)) as Record<string, any>;
+	if (goal === null || typeof goal !== "object" || Array.isArray(goal))
+		reject("reviewed M07 goal JSON is invalid");
+	if (!deferGoalTransition && historicalGoal &&
+		digest(liveGoalBytes) !== review.m07.goalSha256) {
+		const old = JSON.parse(historicalGoal.toString("utf8")) as Record<string, unknown>;
+		const current = goal as Record<string, unknown>;
+		const mutable = new Set(["updatedAt", "lifecycle", "outcome", "finishSummary", "returnPath",
+			"goalChecks", "feedbackPath", "feedbackStatus", "feedbackError", "limitations",
+			"formalBaseline", "exploratory", "m04BaselineRunId", "knowledgeSnapshot",
+			"m04BaselineFailures", "baselineHistory"]);
+		for (const key of new Set([...Object.keys(old), ...Object.keys(current)]))
+			if (!mutable.has(key) && !same(old[key], current[key]))
+				reject("M07 goal changed outside the reviewed M04 transition");
+		if (old.lifecycle !== "active" || !["active", "finished"].includes(goal.lifecycle) ||
+			!same(goal.limitations, old.limitations))
+			reject("M07 goal is not an authorized M04 transition");
+		const candidates: string[] = [];
+		for (const id of await readdir(path.join(ws, "stages", "M04"))) {
+			const dir = path.join(ws, "stages", "M04", id);
+			let source: any;
+			try { source = await stageJson(path.join(dir, "m07-source.json")); }
+			catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+			if (source.m07RunId === review.m07.runId && source.checkpointId === review.m07.checkpointId &&
+				source.rootDir === cp && source.goalSnapshotPath === path.join(cp, "goal.json") &&
+				source.manifestPath === path.join(cp, "manifest.json") &&
+				source.feedbackBundlePath === path.join(cp, "m04-feedback.md")) {
+				const run = await stageJson(path.join(dir, "run.json"));
+				if (run.status !== "completed") continue;
+				const tx = await stageJson(path.join(dir, "m04-transaction.json"));
+				const coverage = await stageJson(path.join(dir, "m07-coverage.json"));
+				if (tx.m04RunId === id &&
+					["no-proposal", "merged"].includes(tx.state) && coverage.promptOutcome === "returned" &&
+					Array.isArray(coverage.returnedRanges)) {
+					const snapshot = await stageJson(path.join(cp, "goal.json"));
+					const accepted = snapshot.tasks?.find((row: any) => row.taskId === review.m07.taskId);
+					const required = [...new Set(["goal.json", "manifest.json", "m04-feedback.md",
+						...(accepted?.review?.artifacts ?? []).filter((row: any) => row.mediaType === "text")
+							.map((row: any) => path.relative(cp, row.path).replaceAll("\\", "/"))])];
+					await assertFullM07Reads(cp, required, coverage.returnedRanges);
+					candidates.push(id);
+				}
+			}
+		}
+		if (candidates.length !== 1)
+			reject("completed M07 goal lacks one exact M04 checkpoint review");
+		const m04RunId = candidates[0]!;
+		const m04Dir = path.join(ws, "stages", "M04", m04RunId);
+		const transition = await stageJson(path.join(root, "evidence",
+			`evaluator-m04-transition-${review.intentId}.json`));
+		if (!exact(transition, ["version", "kind", "intentId", "m07RunId", "taskId",
+			"checkpointId", "m04RunId", "goalBeforeSha256", "m04RunSha256",
+			"m04SourceSha256", "m04TransactionSha256", "m04CoverageSha256"]) ||
+			transition.version !== 1 || transition.kind !== "local-evaluator-m04-transition" ||
+			transition.intentId !== review.intentId || transition.m07RunId !== review.m07.runId ||
+			transition.taskId !== review.m07.taskId ||
+			transition.checkpointId !== review.m07.checkpointId ||
+			transition.m04RunId !== m04RunId ||
+			transition.goalBeforeSha256 !== review.m07.goalSha256 ||
+			transition.m04RunSha256 !== await stageDigest(path.join(m04Dir, "run.json")) ||
+			transition.m04SourceSha256 !== await stageDigest(path.join(m04Dir, "m07-source.json")) ||
+			transition.m04TransactionSha256 !== await stageDigest(path.join(m04Dir, "m04-transaction.json")) ||
+			transition.m04CoverageSha256 !== await stageDigest(path.join(m04Dir, "m07-coverage.json")))
+			reject("M04 transition witness differs from the completed checkpoint review");
+		if (goal.m04BaselineRunId === old.m04BaselineRunId) {
+			if (!same(goal.knowledgeSnapshot, old.knowledgeSnapshot) ||
+				!same(goal.formalBaseline, old.formalBaseline) ||
+				!same(goal.exploratory, old.exploratory) ||
+				!same(goal.m04BaselineFailures, old.m04BaselineFailures) ||
+				!same(goal.baselineHistory, old.baselineHistory))
+				reject("unchanged M04 baseline gained unreviewed authority");
+		} else {
+			const previousHistory = old.baselineHistory as unknown[] ?? [];
+			const m04Run = await stageJson(path.join(m04Dir, "run.json"));
+			const m04Transaction = await stageJson(path.join(m04Dir, "m04-transaction.json"));
+			const expectedSnapshot = m04Transaction.state === "merged" ?
+				m04Transaction.snapshotId : m04Run.knowledgeSnapshot;
+			const append = goal.baselineHistory?.at(-1);
+			if (goal.m04BaselineRunId !== m04RunId ||
+				goal.formalBaseline !== true || goal.exploratory !== false ||
+				!same(goal.knowledgeSnapshot, expectedSnapshot) ||
+				!same(goal.m04BaselineFailures, []) ||
+				(m04Transaction.state === "merged" &&
+					(typeof expectedSnapshot !== "string" || !expectedSnapshot)) ||
+				!Array.isArray(goal.baselineHistory) ||
+				goal.baselineHistory.length !== previousHistory.length + 1 ||
+				!same(goal.baselineHistory.slice(0, -1), previousHistory) ||
+				!exact(append, expectedSnapshot === undefined ?
+					["at", "m04RunId"] : ["at", "knowledgeSnapshot", "m04RunId"]) ||
+				typeof append.at !== "string" || !Number.isFinite(Date.parse(append.at)) ||
+				append.m04RunId !== m04RunId ||
+				!same(append.knowledgeSnapshot, expectedSnapshot) ||
+				goal.lifecycle === "finished" && goal.outcome !== "fulfilled")
+				reject("refreshed M04 baseline differs from the exact reviewed run");
+		}
+		if (goal.lifecycle === "finished") {
+			const acceptedTask = goal.tasks?.find((row: any) => row.taskId === review.m07.taskId);
+			if (!["fulfilled", "partial"].includes(goal.outcome) ||
+				goal.returnPath !== "M04" || !Array.isArray(goal.goalChecks) ||
+				!same(goal.goalChecks, acceptedTask?.review?.checks) ||
+				!(["complete", "indexed"] as unknown[]).includes(goal.feedbackStatus) ||
+				typeof goal.feedbackPath !== "string" || !inside(m07, goal.feedbackPath) ||
+				goal.finishSummary !== (goal.outcome === "fulfilled" ?
+					"Accepted task received full M04 review; mission selection remains a separate host decision." :
+					"Accepted task remains unselected after M04 review."))
+				reject("M07 finished goal differs from its reviewed M04 decision");
+			await stageBytes(goal.feedbackPath);
+		} else if (!same(goal.goalChecks, old.goalChecks) ||
+			!same(goal.outcome, old.outcome) || !same(goal.feedbackPath, old.feedbackPath))
+			reject("active M07 goal changed completion facts before finishing");
+		const recoveryIndex = checkpoints.findIndex(row =>
+			row.evaluatorRecoveryReview?.intentId === review.intentId);
+		if (recoveryIndex < 0) reject("reviewed M04 transition has no recovery checkpoint");
+		let reviewedSuccessor = false;
+		for (const row of checkpoints.slice(recoveryIndex + 1)) {
+			const successor = JSON.parse((await privateBytes(checkpointPaths(root,
+				row.source.attemptId, row.sequence).bin, CHECKPOINT_BYTES)).toString("utf8")) as ObjectiveProgressV1;
+			const bounded = successor.boundedRuns.find(item => item.runId === review.m07.runId);
+			if (!successor.pendingM04Review && bounded &&
+				same(bounded.acceptedTaskIds, [review.m07.taskId]) &&
+				successor.stopReason === "objective-reassessment-pending") {
+				if (bounded.selectedTaskId) {
+					const selection = await stageJson(path.join(root, "evidence",
+						`selection-review-${review.m07.runId}.json`));
+					const snapshot = await stageJson(path.join(cp, "goal.json"));
+					const accepted = snapshot.tasks?.find((item: any) => item.taskId === review.m07.taskId);
+					const required = [...new Set(["goal.json", "manifest.json", "m04-feedback.md",
+						...(accepted?.review?.artifacts ?? []).filter((item: any) => item.mediaType === "text")
+							.map((item: any) => path.relative(cp, item.path).replaceAll("\\", "/"))])];
+					if (bounded.selectedTaskId !== review.m07.taskId ||
+						review.evaluator.phase !== "returned" ||
+						selection.kind !== "local-objective-selection-review" ||
+						selection.runId !== review.m07.runId ||
+						selection.taskId !== review.m07.taskId ||
+						selection.m04RunId !== m04RunId ||
+						selection.hostEvidence?.missionId !== review.missionId ||
+						selection.hostEvidence?.checkpointId !== review.m07.checkpointId ||
+						selection.hostEvidence?.evaluatorId !== review.evaluator.id ||
+						selection.hostEvidence?.evaluatorVersion !== review.evaluator.version ||
+						selection.hostEvidence?.evaluatorReceiptSha256 !==
+							(review.evaluator.phase === "returned" ? review.evaluator.receiptSha256 : undefined) ||
+						selection.hostEvidence?.checkpointManifestSha256 !== review.m07.manifestSha256 ||
+						!same(selection.hostEvidence?.requiredM07ReadPaths, required) ||
+						selection.hostEvidence?.m04SourceSha256 !== transition.m04SourceSha256 ||
+						selection.hostEvidence?.m04CoverageSha256 !== transition.m04CoverageSha256 ||
+						selection.hostEvidence?.m04TransactionSha256 !== transition.m04TransactionSha256 ||
+						!Array.isArray(selection.selectedArtifacts) ||
+						!selection.selectedArtifacts.every((item: any) =>
+							successor.selectedArtifacts.includes(item.name)))
+						reject("selected recovery successor lacks its exact M04 host review");
+				} else if (bounded.outcome !== "partial")
+					reject("unselected recovery successor has an invalid bounded outcome");
+				reviewedSuccessor = true;
+				break;
+			}
+		}
+		if (!reviewedSuccessor) {
+			const latest = checkpoints.at(-1);
+			if (!latest) reject("reviewed M04 transition has no mission checkpoint");
+			const progress = JSON.parse((await privateBytes(checkpointPaths(root,
+				latest!.source.attemptId, latest!.sequence).bin, CHECKPOINT_BYTES)).toString("utf8")) as ObjectiveProgressV1;
+			const pending = progress.pendingM04Review;
+			if (!pending) reject("M04 goal changed without a reviewed mission successor");
+			if (pending.runId !== review.m07.runId || pending.taskId !== review.m07.taskId)
+				reject("M04 goal changed without the durable pending review checkpoint");
+		}
+	}
 	const task = goal.tasks?.find((row: any) => row.taskId === review.m07.taskId);
 	const operation = goal.executionState?.operations?.find((row: any) => row.id === review.m07.operationId);
 	const checkpoint = goal.checkpoints?.find((row: any) => row.id === review.m07.checkpointId);
@@ -988,6 +1343,59 @@ async function validLegacyStageEvidence(root: string,
 				review.oldAttempt.process)) === true;
 	} catch { return false; }
 }
+/** Only immutable files of the reviewed historical dispatch are checked here.
+ * A later M04 merge or new goal must not invalidate this negative receipt. */
+async function validFailedM04StageEvidence(root: string, review: LocalFailedM04ReviewV1): Promise<boolean> {
+	try {
+		const ws = path.resolve(root, "../../..");
+		const m07 = path.join(ws, "stages", "M07", review.m07.runId);
+		const cp = path.join(m07, "checkpoints", review.m07.checkpointId);
+		const m04 = path.join(ws, "stages", "M04", review.m04.runId);
+		if ((await readLocalDispatchLineage({ missionRoot: root, m07Dir: m07,
+			intentId: review.intentId })).sha256 !== review.lineageSha256) return false;
+		for (const [file, expected] of [
+			[path.join(ws, "stages", "MISSION", review.intentId, "run.json"), review.missionRunSha256],
+			[path.join(m07, "goal.json"), review.m07.goalSha256],
+			[path.join(cp, "goal.json"), review.m07.snapshotSha256],
+			[path.join(cp, "manifest.json"), review.m07.manifestSha256],
+			[path.join(cp, "m04-feedback.md"), review.m07.feedbackSha256],
+			[path.join(m04, "run.json"), review.m04.runSha256],
+			[path.join(m04, "m07-source.json"), review.m04.sourceSha256],
+			[path.join(m04, "m04-transaction.json"), review.m04.transactionSha256]
+		] as Array<[string, string]>) if (await stageDigest(file) !== expected) return false;
+		const run = await stageJson(path.join(m04, "run.json"));
+		const sessions = run.sessions as Array<{ id: string; file: string }> | undefined;
+		if (run.stage !== "M04" || run.runId !== review.m04.runId || run.status !== "failed" ||
+			!Array.isArray(sessions) || sessions.length !== review.m04.sessions.length ||
+			!sessions.length ||
+			!same(await Promise.all(sessions.map(async row => ({ id: row.id,
+				fileSha256: inside(m04, row.file) ? await hashStableHistoricalFile(row.file) : null }))),
+				review.m04.sessions)) return false;
+		const tx = await stageJson(path.join(m04, "m04-transaction.json"));
+		if (tx.version !== 1 || tx.kind !== "m04-knowledge-transaction" ||
+			tx.m04RunId !== review.m04.runId || tx.state !== "no-proposal" ||
+			!Array.isArray(tx.attempts) || tx.attempts.length !== 0) return false;
+		const goal = await stageJson(path.join(m07, "goal.json")) as CurrentGoal;
+		const task = goal.tasks?.find(row => row.taskId === review.m07.taskId);
+		if (!task || task.status !== "rejected" ||
+			digest(JSON.stringify(task.toolLog)) !== review.effectReview.toolLogSha256 ||
+			!task.workDir || !inside(m07, task.workDir) ||
+			await stageDigest(path.join(task.workDir, "local-evaluator-receipt.json")) !==
+				review.evaluatorReceiptSha256) return false;
+		const paired = await pairedHistoricalToolTranscript(task);
+		if (paired.sha256 !== review.effectReview.toolTranscriptCensusSha256 ||
+			paired.calls !== review.effectReview.pairedToolCallCount ||
+			paired.results !== paired.calls || paired.calls !== task.toolLog.length ||
+			!same([...paired.names].sort(), (task.toolLog as Array<{ name: string }>).
+				map(row => row.name).sort())) return false;
+		const evaluator = await readLocalEvaluatorReceipt(path.join(task.workDir,
+			"local-evaluator-receipt.json"));
+		await verifyLocalEvaluatorReceipt(evaluator.receipt,
+			await stageJson(path.join(root, "original-contract.json")) as OriginalObjectiveContractV1,
+			goal, task);
+		return true;
+	} catch { return false; }
+}
 async function json(file: string): Promise<unknown | undefined> {
 	const bytes = await optionalBytes(file, CONTROL_BYTES);
 	if (!bytes) return undefined;
@@ -1031,8 +1439,34 @@ async function publishEvaluatorClaim(root: string, claim: LocalEvaluatorRecovery
 	await syncDir(archive);
 }
 
+async function publishPendingM04Claim(root: string, claim: LocalPendingM04ClaimV1,
+	testCrashAt?: "after-prepare" | "after-rename"): Promise<void> {
+	const archive = path.join(root, "review-abandoned");
+	await privateDir(archive, true);
+	const temporary = path.join(archive, `.pending-m04-claim-prepared-${randomUUID()}`);
+	const bytes = Buffer.from(`${JSON.stringify(claim)}\n`, "utf8");
+	if (bytes.length > CONTROL_BYTES) reject("pending M04 claim exceeds physical file bound");
+	const handle = await open(temporary,
+		constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+	try { await handle.writeFile(bytes); await handle.sync(); }
+	finally { await handle.close(); }
+	await syncDir(archive);
+	if (testCrashAt === "after-prepare")
+		throw new SyntheticReviewCrash("synthetic crash after pending M04 claim preparation");
+	const file = path.join(root, "pending-m04-claim.json");
+	if (await optionalBytes(file, CONTROL_BYTES))
+		reject("pending M04 claim already exists before publication");
+	await rename(temporary, file);
+	await syncDir(root);
+	if (testCrashAt === "after-rename")
+		throw new SyntheticReviewCrash("synthetic crash after pending M04 claim publication");
+	await syncDir(archive);
+}
+
 async function lock<T>(root: string, work: (mutation: () => void) => Promise<T>,
-	review?: { owner: ProcessIdentityV1; intentId: string; oldCheckpointSha256: string }): Promise<T> {
+	review?: { owner: ProcessIdentityV1; intentId: string; oldCheckpointSha256: string },
+	testInitFailureAt?: "before-stat" | "after-open" | "after-write" | "after-sync" |
+		"after-close" | "after-dir-sync"): Promise<T> {
 	const file = path.join(root, ".writer.lock");
 	let handle;
 	try { handle = await open(file,
@@ -1041,27 +1475,49 @@ async function lock<T>(root: string, work: (mutation: () => void) => Promise<T>,
 		if ((error as NodeJS.ErrnoException).code === "EEXIST") reject("writer lock remains; review uncertain prior mutation");
 		throw error;
 	}
-	const identity = await handle.stat();
-	await handle.writeFile(`${JSON.stringify(review ? { version: 2,
-		kind: "review-successor-writer-lock", owner: review.owner,
-		intentId: review.intentId, oldCheckpointSha256: review.oldCheckpointSha256 } :
-		{ pid: process.pid, at: new Date().toISOString() })}\n`);
-	await handle.sync();
-	await handle.close();
-	await syncDir(root);
+	let identity;
+	let handleClosed = false;
 	let mutationStarted = false;
 	let succeeded = false;
 	let simulatedCrash = false;
+	const inject = (phase: typeof testInitFailureAt) => {
+		if (testInitFailureAt === phase)
+			throw new Error(`synthetic writer-lock initialization failure ${phase}`);
+	};
 	try {
+		inject("before-stat");
+		identity = await handle.stat();
+		inject("after-open");
+		await handle.writeFile(`${JSON.stringify(review ? { version: 2,
+			kind: "review-successor-writer-lock", owner: review.owner,
+			intentId: review.intentId, oldCheckpointSha256: review.oldCheckpointSha256 } :
+			{ pid: process.pid, at: new Date().toISOString() })}\n`);
+		inject("after-write");
+		await handle.sync();
+		inject("after-sync");
+		await handle.close();
+		handleClosed = true;
+		inject("after-close");
+		await syncDir(root);
+		inject("after-dir-sync");
 		const result = await work(() => { mutationStarted = true; });
 		succeeded = true;
 		return result;
 	}
 	catch (error) { simulatedCrash = error instanceof SyntheticReviewCrash; throw error; }
 	finally {
+		// A transient stat failure still has an open handle we can authenticate.
+		// If stat remains unavailable, retain the lock rather than remove a path
+		// whose inode cannot be tied to this writer.
+		if (!identity && !handleClosed) {
+			try { identity = await handle.stat(); } catch { /* Fail closed. */ }
+		}
+		// A close failure leaves descriptor lifetime uncertain. If the retry also
+		// fails, retain the lock for review instead of admitting another writer.
+		if (!handleClosed) await handle.close();
 		if (!simulatedCrash && (succeeded || !mutationStarted || review)) {
 			const current = await lstat(file);
-			if (current.dev === identity.dev && current.ino === identity.ino) {
+			if (identity && current.dev === identity.dev && current.ino === identity.ino) {
 				await unlink(file); await syncDir(root);
 			}
 		}
@@ -1108,11 +1564,12 @@ async function scan(root: string, ignoreCurrentLock = false): Promise<Scan> {
 		Number(a.slice(1)) - Number(b.slice(1)));
 	const attempts: LocalMissionAttempt[] = [];
 	const checkpoints: LocalCheckpointReceipt[] = [];
+	const evaluatorReviews: LocalEvaluatorRecoveryReviewV1[] = [];
 	const unknown = new Set<string>();
 	const interruptedAttemptIds: string[] = [];
 	if (rootEntries.some(entry => !["attempts", "original-contract.json",
-		"original-contract.receipt.json", "evidence", "assessments", "materials", "dispatch-links",
-		"review-abandoned", "evaluator-recovery-claim.json",
+		"original-contract.receipt.json", "clean-start-release.json", "evidence", "assessments", "materials", "dispatch-links",
+		"review-abandoned", "evaluator-recovery-claim.json", "pending-m04-claim.json",
 		".writer.lock"].includes(entry)))
 		repairRequired = true;
 	for (const adjunct of ["evidence", "assessments", "materials", "dispatch-links", "review-abandoned"])
@@ -1157,7 +1614,9 @@ async function scan(root: string, ignoreCurrentLock = false): Promise<Scan> {
 				exact(receipt, ["version", "kind", "source", "sequence", "previousSha256",
 					"sha256", "bytes", "unresolvedOperationIds", "evaluatorRecoveryReview"]) && receipt.version === 4 ||
 				exact(receipt, ["version", "kind", "source", "sequence", "previousSha256",
-					"sha256", "bytes", "unresolvedOperationIds", "coldMigrationReview"]) && receipt.version === 5) ||
+					"sha256", "bytes", "unresolvedOperationIds", "coldMigrationReview"]) && receipt.version === 5 ||
+				exact(receipt, ["version", "kind", "source", "sequence", "previousSha256",
+					"sha256", "bytes", "unresolvedOperationIds", "failedM04Review"]) && receipt.version === 6) ||
 				receipt.kind !== "local-mission-checkpoint" ||
 				!same(receipt.source, value) || receipt.sequence !== sequence ||
 				receipt.previousSha256 !== (previous?.sha256 ?? null) ||
@@ -1166,29 +1625,31 @@ async function scan(root: string, ignoreCurrentLock = false): Promise<Scan> {
 				Number(receipt.bytes) > CHECKPOINT_BYTES || !validIds(receipt.unresolvedOperationIds) ||
 				entry !== `C${String(sequence).padStart(8, "0")}.json`)
 				reject("checkpoint receipt sequence or identity is invalid");
-			const review = receipt.version === 2 ? receipt.interruptedReview :
+			const review = receipt.version === 6 ? receipt.failedM04Review : receipt.version === 2 ? receipt.interruptedReview :
 				receipt.version === 3 ? receipt.legacyInterruptedReview :
 				receipt.version === 4 ? receipt.evaluatorRecoveryReview : receipt.coldMigrationReview;
-			if (receipt.version === 2 || receipt.version === 3 || receipt.version === 4 || receipt.version === 5) {
-				if (!(receipt.version === 2 ? validInterruptedReview(review) :
+			if (receipt.version === 2 || receipt.version === 3 || receipt.version === 4 || receipt.version === 5 || receipt.version === 6) {
+				if (!(receipt.version === 6 ? validFailedM04Review(review) : receipt.version === 2 ? validInterruptedReview(review) :
 					receipt.version === 3 ? validLegacyInterruptedReview(review) :
 					receipt.version === 4 ? validEvaluatorRecoveryReview(review) : validColdMigrationReview(review)))
 					reject("interrupted review schema is invalid");
 				const bound = review as LocalInterruptedReviewV1 | LocalLegacyInterruptedReviewV1 |
-					LocalEvaluatorRecoveryReviewV1 | LocalColdMigrationReviewV1;
+					LocalEvaluatorRecoveryReviewV1 | LocalColdMigrationReviewV1 | LocalFailedM04ReviewV1;
 				if (!same(bound.newAttempt, value) || !same(bound.oldAttempt, previous?.source) ||
 					bound.oldCheckpoint.sequence !== previous?.sequence ||
 					bound.oldCheckpoint.sha256 !== previous?.sha256 ||
 					checkpoints.some(row => row.interruptedReview?.intentId === bound.intentId ||
 						row.legacyInterruptedReview?.intentId === bound.intentId ||
 						row.evaluatorRecoveryReview?.intentId === bound.intentId ||
-						row.coldMigrationReview?.intentId === bound.intentId))
+						row.coldMigrationReview?.intentId === bound.intentId ||
+						row.failedM04Review?.intentId === bound.intentId))
 					reject("interrupted review does not bind the preceding checkpoint and successor");
 			}
 			const bytes = await optionalBytes(path.join(checkpointsDir, entry.replace(/\.json$/, ".bin")), CHECKPOINT_BYTES);
 			if (!bytes || bytes.length !== receipt.bytes || digest(bytes) !== receipt.sha256)
 				repairRequired = true;
-			if ((receipt.version === 2 && validInterruptedReview(review) ||
+			if ((receipt.version === 6 && validFailedM04Review(review) ||
+				receipt.version === 2 && validInterruptedReview(review) ||
 				receipt.version === 3 && validLegacyInterruptedReview(review) ||
 				receipt.version === 5 && validColdMigrationReview(review)) && bytes && previous) {
 				const priorBytes = await optionalBytes(checkpointPaths(root, previous.source.attemptId,
@@ -1199,13 +1660,16 @@ async function scan(root: string, ignoreCurrentLock = false): Promise<Scan> {
 			if ((receipt.version === 3 && validLegacyInterruptedReview(review) ||
 				receipt.version === 5 && validColdMigrationReview(review)) &&
 				!await validLegacyStageEvidence(root, review)) repairRequired = true;
+			if (receipt.version === 6 && validFailedM04Review(review) &&
+				!await validFailedM04StageEvidence(root, review)) repairRequired = true;
 			if (receipt.version === 4 && validEvaluatorRecoveryReview(review) && bytes && previous) {
 				try {
-					const evidence = await evaluatorRecoveryEvidence(root, review, checkpoints);
+					const evidence = await evaluatorRecoveryEvidence(root, review, checkpoints, true);
 					const priorBytes = await privateBytes(checkpointPaths(root, previous.source.attemptId,
 						previous.sequence).bin, CHECKPOINT_BYTES);
 					if (!validEvaluatorProgressTransition(priorBytes, bytes, review, evidence.accepted))
 						reject("reviewed evaluator checkpoint changed historical progress");
+					evaluatorReviews.push(review);
 				} catch { repairRequired = true; }
 			}
 			checkpoints.push(receipt as LocalCheckpointReceipt);
@@ -1285,6 +1749,22 @@ async function scan(root: string, ignoreCurrentLock = false): Promise<Scan> {
 			digest(contractRaw) !== contractValue.sha256) repairRequired = true;
 		contractReceipt = contractValue as LocalContractReceipt;
 	}
+	const releaseRaw = await json(path.join(root, "clean-start-release.json"));
+	let cleanStartRelease: LocalCleanStartReleaseV1 | null = null;
+	if (releaseRaw !== undefined) {
+		const first = checkpoints[0];
+		const firstBytes = first && await optionalBytes(checkpointPaths(root, "A001", 1).bin,
+			CHECKPOINT_BYTES);
+		if (!exact(releaseRaw, ["version", "kind", "source", "contractSha256", "checkpointSha256"]) ||
+			releaseRaw.version !== 1 || releaseRaw.kind !== "local-clean-start-release" ||
+			!same(releaseRaw.source, attempts[0]) || !contractReceipt || !first ||
+			first.version !== 1 || first.sequence !== 1 || !same(first.source, attempts[0]) ||
+			releaseRaw.contractSha256 !== contractReceipt.sha256 ||
+			releaseRaw.checkpointSha256 !== first.sha256 || !firstBytes || !contractRaw ||
+			!validCleanStartProgress(firstBytes, contractRaw, attempts[0]!.missionId))
+			reject("clean start release does not bind the committed initial checkpoint");
+		cleanStartRelease = releaseRaw as LocalCleanStartReleaseV1;
+	}
 	const claimRaw = await json(path.join(root, "evaluator-recovery-claim.json"));
 	let evaluatorRecoveryClaim: LocalEvaluatorRecoveryClaimV1 | null = null;
 	if (claimRaw !== undefined) {
@@ -1300,10 +1780,18 @@ async function scan(root: string, ignoreCurrentLock = false): Promise<Scan> {
 			checkpoints.at(-1)?.sha256 !== claimRaw.oldCheckpoint.sha256)) repairRequired = true;
 		evaluatorRecoveryClaim = claimRaw;
 	}
+	// A V4 recovery receipt is first checked against the authenticated prefix.
+	// A later M04 may have advanced the live goal; prove that transition only
+	// after every descendant checkpoint has been parsed and authenticated.
+	for (const review of evaluatorReviews) {
+		try { await evaluatorRecoveryEvidence(root, review, checkpoints); }
+		catch { repairRequired = true; }
+	}
 	return { attempts, intent, attempted,
 		status: { missionId: attempts[0]?.missionId ?? "", currentAttempt: attempts.at(-1) ?? null,
 			contractReceipt, contractOrphan,
 			latestCheckpoint: checkpoints.at(-1) ?? null, checkpointReceipts: checkpoints,
+			cleanStartRelease,
 			unresolvedOperationIds: [...unknown].sort(), interruptedAttemptIds,
 			final: finalState, finalReceipt, finalReceipts, repairRequired, writerLockPresent,
 			preparedReviewPending, evaluatorRecoveryClaim,
@@ -1319,6 +1807,78 @@ export class LocalMissionHost {
 		this.root = root;
 		this.source = source;
 		this.currentIdentity = currentIdentity;
+	}
+	/** One durable owner of the accepted candidate's read-only M04 continuation. */
+	static async claimPendingM04Review(input: { root: string; missionId: string;
+		checkpointSha256: string; runId: string; taskId: string; checkpointId: string;
+		evaluatorReceiptSha256: string;
+		currentIdentity?: () => Promise<ProcessIdentityV1>;
+		probePrior?: (identity: ProcessIdentityV1) => Promise<ProcessProbe>;
+		testCrashAt?: "after-prepare" | "after-rename" }): Promise<LocalPendingM04ClaimV1 | undefined> {
+		if (!path.isAbsolute(input.root) || !SAFE_ID.test(input.missionId) ||
+			![input.runId, input.taskId, input.checkpointId].every(id => SAFE_ID.test(id)) ||
+			!HEX64.test(input.checkpointSha256) || !HEX64.test(input.evaluatorReceiptSha256))
+			reject("pending M04 claim input is invalid");
+		const root = path.resolve(input.root);
+		const owner = await (input.currentIdentity ?? readCurrentProcessIdentity)();
+		if (!validProcess(owner)) reject("pending M04 claimant identity is invalid");
+		return lock(root, async mutation => {
+			const state = await scan(root, true);
+			const latest = state.status.latestCheckpoint;
+			if (state.status.repairRequired || state.status.final !== "none" ||
+				state.status.unresolvedOperationIds.length || !latest ||
+				latest.sha256 !== input.checkpointSha256)
+				reject("pending M04 claim is stale or host effects are unresolved");
+			const progress = JSON.parse((await privateBytes(checkpointPaths(root,
+				latest.source.attemptId, latest.sequence).bin, CHECKPOINT_BYTES)).toString("utf8")) as ObjectiveProgressV1;
+			const pending = progress.pendingM04Review;
+			if (progress.stopReason !== "m04-review-pending" ||
+				progress.contract.id !== input.missionId || !pending ||
+				pending.runId !== input.runId || pending.taskId !== input.taskId ||
+				pending.checkpointId !== input.checkpointId ||
+				pending.evaluatorReceiptSha256 !== input.evaluatorReceiptSha256)
+				reject("pending M04 claim differs from committed review checkpoint");
+			const file = path.join(root, "pending-m04-claim.json");
+			const prior = await json(file) as LocalPendingM04ClaimV1 | undefined;
+			if (prior) {
+				if (prior.version !== 1 || prior.kind !== "local-pending-m04-review-claim" ||
+					!SAFE_ID.test(prior.missionId) || !SAFE_ID.test(prior.runId) ||
+					!SAFE_ID.test(prior.taskId) || !SAFE_ID.test(prior.checkpointId) ||
+					!HEX64.test(prior.evaluatorReceiptSha256) || !validProcess(prior.owner))
+					reject("pending M04 claim is invalid");
+				if (same(prior.owner, owner)) {
+					if (prior.missionId !== input.missionId || prior.runId !== input.runId ||
+						prior.taskId !== input.taskId || prior.checkpointId !== input.checkpointId ||
+						prior.evaluatorReceiptSha256 !== input.evaluatorReceiptSha256)
+						reject("live pending M04 claim belongs to another candidate");
+					return prior as LocalPendingM04ClaimV1;
+				}
+				const probe = await (input.probePrior ?? probeProcessIdentity)(prior.owner);
+				if (probe.status !== "dead" || probe.identityMatch ||
+					prior.owner.hostId !== owner.hostId || prior.owner.bootId !== owner.bootId)
+					return undefined;
+				mutation();
+				await unlink(file); await syncDir(root);
+			}
+			const claim: LocalPendingM04ClaimV1 = { version: 1,
+				kind: "local-pending-m04-review-claim", missionId: input.missionId,
+				runId: input.runId, taskId: input.taskId, checkpointId: input.checkpointId,
+				evaluatorReceiptSha256: input.evaluatorReceiptSha256, owner };
+			mutation();
+			await publishPendingM04Claim(root, claim, input.testCrashAt);
+			return claim;
+		}, { owner, intentId: input.taskId, oldCheckpointSha256: input.checkpointSha256 });
+	}
+	static async releasePendingM04Review(root: string, claim: LocalPendingM04ClaimV1): Promise<void> {
+		if (!path.isAbsolute(root) || claim.kind !== "local-pending-m04-review-claim")
+			reject("pending M04 release is invalid");
+		await lock(path.resolve(root), async mutation => {
+			const file = path.join(path.resolve(root), "pending-m04-claim.json");
+			const current = await json(file);
+			if (!same(current, claim) || !same(claim.owner, await readCurrentProcessIdentity()))
+				reject("pending M04 claim changed before release");
+			mutation(); await unlink(file); await syncDir(path.resolve(root));
+		});
 	}
 
 	/** Serializes all host work that could reach the old evaluator or M04. A
@@ -1447,7 +2007,8 @@ export class LocalMissionHost {
 			(row.interruptedReview?.intentId === input.intentId ||
 				row.legacyInterruptedReview?.intentId === input.intentId ||
 				row.evaluatorRecoveryReview?.intentId === input.intentId ||
-				row.coldMigrationReview?.intentId === input.intentId) &&
+				row.coldMigrationReview?.intentId === input.intentId ||
+				row.failedM04Review?.intentId === input.intentId) &&
 			row.previousSha256 === input.oldCheckpointSha256);
 		if (observed.status.repairRequired || !committed &&
 			observed.status.latestCheckpoint?.sha256 !== input.oldCheckpointSha256)
@@ -1467,7 +2028,10 @@ export class LocalMissionHost {
 
 	static async begin(input: Readonly<{ root: string; missionId: string; attemptId: string;
 		codeRevision: string; currentIdentity?: () => Promise<ProcessIdentityV1>;
-		probePrior?: (identity: ProcessIdentityV1) => Promise<ProcessProbe> }>): Promise<LocalMissionHost> {
+		probePrior?: (identity: ProcessIdentityV1) => Promise<ProcessProbe>;
+		/** Deterministic offline fault injection before any host mutation. */
+		testLockInitFailureAt?: "before-stat" | "after-open" | "after-write" | "after-sync" |
+			"after-close" | "after-dir-sync" }>): Promise<LocalMissionHost> {
 		if (!path.isAbsolute(input.root) || !SAFE_ID.test(input.missionId) ||
 			!validAttemptId(input.attemptId) || !SAFE_ID.test(input.codeRevision))
 			reject("local mission source is invalid");
@@ -1491,6 +2055,10 @@ export class LocalMissionHost {
 			if (observed.status.repairRequired) reject("prior local evidence requires review");
 			if (observed.attempts.length === Number(input.attemptId.slice(1))) {
 				if (!same(observed.status.currentAttempt, source)) reject("attempt identity changed");
+				if (observed.status.cleanStartRelease &&
+					same(observed.status.cleanStartRelease.source, source))
+					reject("clean start owner was released");
+				if (observed.status.final === "committed") reject("final owner was released");
 				return;
 			}
 			if (observed.attempts.length + 1 !== Number(input.attemptId.slice(1)) ||
@@ -1498,11 +2066,23 @@ export class LocalMissionHost {
 				reject("attempt is not the exact successor");
 			if (observed.status.evaluatorRecoveryClaim)
 				reject("active evaluator recovery claim holds mission mutations");
+			if (observed.status.final === "committed" && observed.status.unresolvedOperationIds.length)
+				reject("committed final retains unresolved operations");
 			const prior = observed.status.currentAttempt;
 			if (prior && observed.status.final !== "committed") {
-				const probe = await (input.probePrior ?? probeProcessIdentity)(prior.process);
-				if (probe.status !== "dead" || probe.identityMatch)
-					reject("prior attempt may still be executing");
+				const cleanRelease = observed.status.cleanStartRelease;
+				const cleanHandoff = cleanRelease && prior.attemptId === "A001" &&
+					same(cleanRelease.source, prior) && observed.status.checkpointReceipts.length === 1 &&
+					observed.status.unresolvedOperationIds.length === 0 &&
+					prior.process.hostId === process.hostId && prior.process.bootId === process.bootId &&
+					await cleanStartStagesPristine(root, input.missionId) &&
+					await cleanStartLocalArtifactsPristine(root,
+						await privateBytes(path.join(root, "original-contract.json"), CHECKPOINT_BYTES));
+				if (!cleanHandoff) {
+					const probe = await (input.probePrior ?? probeProcessIdentity)(prior.process);
+					if (probe.status !== "dead" || probe.identityMatch)
+						reject("prior attempt may still be executing");
+				}
 			}
 			mutation();
 			const directory = attemptPath(root, source.attemptId);
@@ -1511,7 +2091,7 @@ export class LocalMissionHost {
 				await mkdir(path.join(directory, part), { mode: 0o700 }); await syncDir(directory);
 			}
 			await onceJson(path.join(directory, "source.json"), source);
-		});
+		}, undefined, input.testLockInitFailureAt);
 		return new LocalMissionHost(root, source, currentIdentity);
 	}
 
@@ -1576,7 +2156,9 @@ export class LocalMissionHost {
 		await this.owned();
 		const value = await lock(this.root, async mutation => {
 			const state = await scan(this.root, true);
-			if (state.status.repairRequired || !same(state.status.currentAttempt, this.source))
+			if (state.status.repairRequired || !same(state.status.currentAttempt, this.source) ||
+				state.status.final === "committed" ||
+				state.status.cleanStartRelease && same(state.status.cleanStartRelease.source, this.source))
 				reject("attempt is not current or prior evidence needs review");
 			if (state.status.evaluatorRecoveryClaim)
 				reject("active evaluator recovery claim holds mission mutations");
@@ -1586,6 +2168,40 @@ export class LocalMissionHost {
 	}
 
 	status(): Promise<LocalMissionStatus> { return LocalMissionHost.status(this.root); }
+
+	/** End the first start-only invocation under the same writer lock used by
+	 * checkpoints. This durable receipt revokes A001 mutation authority before
+	 * another process is allowed to claim A002. */
+	async releaseCleanStart(): Promise<LocalCleanStartReleaseV1> {
+		await this.owned();
+		return lock(this.root, async mutation => {
+			const state = await scan(this.root, true);
+			const first = state.status.latestCheckpoint;
+			if (state.status.repairRequired || state.status.cleanStartRelease ||
+				this.source.attemptId !== "A001" || !same(state.status.currentAttempt, this.source) ||
+				!state.status.contractReceipt || !first || first.sequence !== 1 ||
+				state.status.checkpointReceipts.length !== 1 ||
+				state.status.final !== "none" || state.status.evaluatorRecoveryClaim ||
+				state.status.unresolvedOperationIds.length !== 0 ||
+				!await cleanStartStagesPristine(this.root, this.source.missionId) ||
+				!await cleanStartLocalArtifactsPristine(this.root,
+					await privateBytes(path.join(this.root, "original-contract.json"), CHECKPOINT_BYTES)))
+				reject("clean start release requires an unissued first checkpoint");
+			const bytes = await privateBytes(checkpointPaths(this.root, "A001", 1).bin,
+				CHECKPOINT_BYTES);
+			const contract = await privateBytes(path.join(this.root, "original-contract.json"),
+				CHECKPOINT_BYTES);
+			if (!validCleanStartProgress(bytes, contract, this.source.missionId))
+				reject("clean start release progress is not initial");
+			const receipt: LocalCleanStartReleaseV1 = { version: 1,
+				kind: "local-clean-start-release", source: this.source,
+				contractSha256: state.status.contractReceipt.sha256,
+				checkpointSha256: first.sha256 };
+			mutation();
+			await onceJson(path.join(this.root, "clean-start-release.json"), receipt);
+			return receipt;
+		});
+	}
 	readInitialContract(): Promise<Buffer | undefined> {
 		return LocalMissionHost.readInitialContract(this.root);
 	}
@@ -1656,12 +2272,61 @@ export class LocalMissionHost {
 		});
 	}
 
+	/** A normal CLI return can relinquish this attempt without a new receipt
+	 * format. Reserve the existing one-use final intent under the writer lock,
+	 * then commit an exact copy of the latest checkpoint as transport-only carry.
+	 * Any crash before the final receipt remains fail closed. */
+	async releaseCleanReturn(input: Readonly<{ bytes: Buffer;
+		verifyQuiescent: () => Promise<boolean> }>): Promise<LocalFinalReceipt | undefined> {
+		if (!Buffer.isBuffer(input.bytes) || input.bytes.length < 1 ||
+			input.bytes.length > CHECKPOINT_BYTES || typeof input.verifyQuiescent !== "function")
+			reject("clean return input is invalid");
+		await this.owned();
+		const intent = await lock(this.root, async mutation => {
+			const state = await scan(this.root, true);
+			const checkpoint = state.status.latestCheckpoint;
+			if (state.status.repairRequired || state.status.final !== "none" ||
+				state.status.evaluatorRecoveryClaim || !checkpoint ||
+				!same(state.status.currentAttempt, this.source) ||
+				!same(checkpoint.source, this.source) ||
+				state.status.unresolvedOperationIds.length !== 0 ||
+				checkpoint.unresolvedOperationIds.length !== 0 ||
+				checkpoint.sha256 !== digest(input.bytes) ||
+				checkpoint.bytes !== input.bytes.length ||
+				(await readdir(path.join(attemptPath(this.root, this.source.attemptId), "operations"))).length ||
+				await json(path.join(this.root, "pending-m04-claim.json")) !== undefined)
+				return undefined;
+			let progress: ObjectiveProgressV1;
+			try { progress = JSON.parse(input.bytes.toString("utf8")) as ObjectiveProgressV1; }
+			catch { return undefined; }
+			if (progress.version !== 1 || progress.kind !== "original-objective-progress" ||
+				progress.contract?.id !== this.source.missionId ||
+				progress.continuation?.requiresOperationReconciliation !== false ||
+				!same(progress.continuation?.unresolvedOperationIds, []) ||
+				progress.continuation?.pendingAction?.safety === "no-replay-until-reconciled" ||
+				!await input.verifyQuiescent()) return undefined;
+			const previous = await privateBytes(checkpointPaths(this.root, this.source.attemptId,
+				checkpoint.sequence).bin, CHECKPOINT_BYTES);
+			if (!previous.equals(input.bytes)) return undefined;
+			const value: LocalFinalIntent = { version: 1, kind: "local-mission-final-intent",
+				source: this.source, intentId: `clean-return-${randomUUID()}`,
+				checkpointSequence: checkpoint.sequence, checkpointSha256: checkpoint.sha256,
+				carrySha256: checkpoint.sha256, unresolvedOperationIds: [] };
+			mutation();
+			await onceJson(path.join(attemptPath(this.root, this.source.attemptId),
+				"final", "intent.json"), value);
+			return value;
+		});
+		return intent ? this.commitFinal({ attemptId: this.source.attemptId,
+			intentId: intent.intentId, bytes: input.bytes }) : undefined;
+	}
+
 	/** Build a complete successor off to the side, then publish the attempt and
 	 * its review checkpoint with one directory rename. Before rename there is no
 	 * successor; afterward the progress and receipt are both committed. */
 	static async commitReviewedSuccessor(input: Readonly<{ root: string; missionId: string;
 		bytes: Buffer; review: LocalInterruptedReviewV1 | LocalLegacyInterruptedReviewV1 |
-			LocalEvaluatorRecoveryReviewV1 | LocalColdMigrationReviewV1;
+			LocalEvaluatorRecoveryReviewV1 | LocalColdMigrationReviewV1 | LocalFailedM04ReviewV1;
 		claim?: LocalEvaluatorRecoveryClaimV1;
 		currentIdentity?: () => Promise<ProcessIdentityV1>;
 		probePrior?: (identity: ProcessIdentityV1) => Promise<ProcessProbe>;
@@ -1673,7 +2338,8 @@ export class LocalMissionHost {
 		testCrashAt?: "after-prepare" | "after-rename"; }>): Promise<LocalCheckpointReceipt> {
 		if (!path.isAbsolute(input.root) || !SAFE_ID.test(input.missionId) ||
 			!Buffer.isBuffer(input.bytes) || input.bytes.length < 1 || input.bytes.length > CHECKPOINT_BYTES ||
-			!(validInterruptedReview(input.review) || validLegacyInterruptedReview(input.review) ||
+			!(validInterruptedReview(input.review) || validFailedM04Review(input.review) ||
+				validLegacyInterruptedReview(input.review) ||
 				validEvaluatorRecoveryReview(input.review) || validColdMigrationReview(input.review)) ||
 			(input.review.kind === "local-cold-migration-host-review" &&
 				typeof input.verifyColdMigrationOrigin !== "function") ||
@@ -1707,7 +2373,8 @@ export class LocalMissionHost {
 				state.status.checkpointReceipts.some(row => row.interruptedReview?.intentId === input.review.intentId ||
 					row.legacyInterruptedReview?.intentId === input.review.intentId ||
 					row.evaluatorRecoveryReview?.intentId === input.review.intentId ||
-					row.coldMigrationReview?.intentId === input.review.intentId) ||
+					row.coldMigrationReview?.intentId === input.review.intentId ||
+					row.failedM04Review?.intentId === input.review.intentId) ||
 				nextSource.attemptId !== `A${String(state.attempts.length + 1).padStart(3, "0")}` ||
 				nextSource.predecessorAttemptId !== state.status.currentAttempt?.attemptId ||
 				!same(nextSource.process, current))
@@ -1759,17 +2426,20 @@ export class LocalMissionHost {
 				input.review as LocalEvaluatorRecoveryReviewV1, evaluatorState!.accepted) :
 					validReviewedProgressTransition(priorBytes, input.bytes,
 						input.review as LocalInterruptedReviewV1 | LocalLegacyInterruptedReviewV1 |
-							LocalColdMigrationReviewV1)))
+							LocalColdMigrationReviewV1 | LocalFailedM04ReviewV1)))
 				reject("reviewed successor changes historical progress or replay boundary");
 			const legacy = input.review.kind === "local-legacy-interruption-host-review";
 			const cold = input.review.kind === "local-cold-migration-host-review";
+			const failedM04 = input.review.kind === "local-failed-m04-interruption-host-review";
 			const receipt: LocalCheckpointReceipt = {
-				version: evaluator ? 4 : cold ? 5 : legacy ? 3 : 2, kind: "local-mission-checkpoint", source: nextSource,
+				version: evaluator ? 4 : cold ? 5 : failedM04 ? 6 : legacy ? 3 : 2,
+				kind: "local-mission-checkpoint", source: nextSource,
 				sequence: prior.sequence + 1, previousSha256: prior.sha256,
 				sha256: digest(input.bytes), bytes: input.bytes.length,
 				unresolvedOperationIds: state.status.unresolvedOperationIds,
 				...(evaluator ? { evaluatorRecoveryReview: input.review as LocalEvaluatorRecoveryReviewV1 } :
 				cold ? { coldMigrationReview: input.review as LocalColdMigrationReviewV1 } :
+				failedM04 ? { failedM04Review: input.review as LocalFailedM04ReviewV1 } :
 				legacy ? { legacyInterruptedReview: input.review as LocalLegacyInterruptedReviewV1 } :
 					{ interruptedReview: input.review as LocalInterruptedReviewV1 })
 			};

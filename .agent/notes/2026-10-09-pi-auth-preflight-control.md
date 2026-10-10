@@ -1,0 +1,9 @@
+# Pi authentication preflight control
+
+The local Pi runner now recognizes the installed SDK's exact missing-key preflight when no provider request or prompt message was issued. It replaces the SDK guidance and local documentation paths with a fixed typed error. The original exception text is not copied into public control output. The original SDK remains responsible for deciding whether its configured authentication, including supported custom routes, is present.
+
+The objective assessor classifies this typed local error as `assessor-auth-unavailable` and records the existing `refresh-auth` pending action without transport retry. Mission `run` and `resume` now return a nonzero shell status for failed or suspended control outcomes, while ordinary pending progress and fulfilled outcomes return zero. The JSON public status remains available on either exit path.
+
+Offline focused tests covered the real Pi SDK preflight with zero fetches, the assessor mapping, CLI exit status, and a separate-process fake-run handoff. TypeScript typecheck passed. No provider request was made by these tests.
+
+The next observed failure was earlier than the missing-key check: Pi raised a `ModelsError` while reading its local credential store, with a filesystem ENOENT cause, before any request or assistant message. The runner now records a separate sanitized `credential-store-unavailable` cause for this exact SDK read failure. Pi may load a nested copy of its model package, so the matcher checks the SDK error name, code, exact store-read prefix, and immediate filesystem cause instead of relying on constructor identity. An offline regression exercised the real Pi SDK and a test-owned read-only credential directory with zero fetches. The change does not claim that a key is absent or change the credential location.

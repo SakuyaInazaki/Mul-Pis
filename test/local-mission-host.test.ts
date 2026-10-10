@@ -5,12 +5,25 @@ import os from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { LocalMissionHost } from "../src/runner/local-mission-host.ts";
+import { objectiveProgress, type OriginalObjectiveContractV1 } from "../src/m07/objective-progress.ts";
 import type { ProcessIdentityV1 } from "../src/runtime/process-identity.ts";
 
 const sha = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
 const processOne: ProcessIdentityV1 = { hostId: "synthetic-host", bootId: "synthetic-boot",
 	pid: 1001, processStartToken: "111" };
 const processTwo: ProcessIdentityV1 = { ...processOne, pid: 1002, processStartToken: "222" };
+
+async function recordSyntheticCleanContract(host: LocalMissionHost,
+	contract: OriginalObjectiveContractV1): Promise<void> {
+	const evidence = path.join(host.root, "evidence");
+	await mkdir(evidence, { mode: 0o700 });
+	const problem = Buffer.from("Synthetic frozen problem");
+	await writeFile(path.join(evidence, "original-objective.json"), JSON.stringify(contract), { mode: 0o600 });
+	await writeFile(path.join(evidence, "original-problem.txt"), problem, { mode: 0o600 });
+	await host.recordInitialContract({ attemptId: "A001", bytes: Buffer.from(JSON.stringify({
+		...contract, frozenInputs: [{ name: "original-problem.txt", bytes: problem.length,
+			sha256: sha(problem) }] })) });
+}
 
 async function fixture(t: TestContext) {
 	const parent = await mkdtemp(path.join(os.tmpdir(), "mulpis-local-host-"));
@@ -72,6 +85,25 @@ test("local committed contract, checkpoint and final carry are private and byte-
 	assert.equal((await lstat(f.root)).mode & 0o777, 0o700);
 });
 
+test("writer-lock initialization faults leave no orphan lock before mutation", async t => {
+	for (const phase of ["before-stat", "after-open", "after-write", "after-sync",
+		"after-close", "after-dir-sync"] as const) {
+		const parent = await mkdtemp(path.join(os.tmpdir(), `mulpis-lock-init-${phase}-`));
+		t.after(() => rm(parent, { recursive: true, force: true }));
+		const root = path.join(parent, "mission");
+		const input = { root, missionId: "mission-001", attemptId: "A001",
+			codeRevision: "local-revision-1", currentIdentity: async () => processOne };
+		await assert.rejects(LocalMissionHost.begin({ ...input,
+			testLockInitFailureAt: phase }), /synthetic writer-lock initialization failure/);
+		await assert.rejects(lstat(path.join(root, ".writer.lock")), { code: "ENOENT" }, phase);
+		const before = await LocalMissionHost.status(root);
+		assert.equal(before.repairRequired, false, phase);
+		assert.equal(before.currentAttempt, null, phase);
+		const host = await LocalMissionHost.begin(input);
+		assert.equal((await host.status()).currentAttempt?.attemptId, "A001", phase);
+	}
+});
+
 test("attempt and checkpoint identities advance exactly while UNKNOWN effects persist", async t => {
 	const f = await fixture(t);
 	await f.first.recordInitialContract({ attemptId: "A001", bytes: Buffer.from("contract") });
@@ -101,6 +133,122 @@ test("attempt and checkpoint identities advance exactly while UNKNOWN effects pe
 	await assert.rejects(f.first.recordUnknownOperation({ attemptId: "A001",
 		operationId: "late" }), /not current/);
 	assert.deepEqual(await LocalMissionHost.readLatestCheckpoint(f.root), Buffer.from("checkpoint-two"));
+});
+
+test("explicit clean-start release fences its live owner and permits only a pristine successor", async t => {
+	const parent = await mkdtemp(path.join(os.tmpdir(), "mulpis-clean-start-"));
+	t.after(() => rm(parent, { recursive: true, force: true }));
+	const missionId = "mission-clean";
+	const root = path.join(parent, ".agent", "missions", missionId);
+	await mkdir(path.join(parent, ".agent"), { mode: 0o700 });
+	const contract: OriginalObjectiveContractV1 = { version: 1, kind: "original-objective",
+		id: missionId, createdAt: new Date().toISOString(), goal: "Synthetic task",
+		goalSource: "verbatim-private-input", inputNames: ["problem.md"],
+		obligations: [{ id: "check", description: "Check task" }], closure: "open-ended" };
+	const first = await LocalMissionHost.begin({ root, missionId, attemptId: "A001",
+		codeRevision: "revision-1", currentIdentity: async () => processOne });
+	await recordSyntheticCleanContract(first, contract);
+	const progress = objectiveProgress(contract, { boundedRuns: [], selectedArtifacts: [],
+		stopReason: "next-task-pending", pendingActionFacts: {} });
+	const initial = await first.recordCheckpoint({ attemptId: "A001", sequence: 1,
+		previousSha256: null, bytes: Buffer.from(JSON.stringify(progress)) });
+	await assert.rejects(LocalMissionHost.begin({ root, missionId, attemptId: "A002",
+		codeRevision: "revision-1", currentIdentity: async () => processTwo,
+		probePrior: async () => ({ status: "alive", identityMatch: true, reason: "live owner" }) }),
+		/may still be executing/);
+	const release = await first.releaseCleanStart();
+	assert.equal(release.checkpointSha256, initial.sha256);
+	await assert.rejects(first.recordCheckpoint({ attemptId: "A001", sequence: 2,
+		previousSha256: initial.sha256, bytes: Buffer.from("late") }), /not current/);
+	await assert.rejects(LocalMissionHost.begin({ root, missionId, attemptId: "A001",
+		codeRevision: "revision-1", currentIdentity: async () => processOne }), /was released/);
+	const second = await LocalMissionHost.begin({ root, missionId, attemptId: "A002",
+		codeRevision: "revision-1", currentIdentity: async () => processTwo,
+		probePrior: async () => ({ status: "unknown", identityMatch: false, reason: "pid reused" }) });
+	assert.equal(second.source.attemptId, "A002");
+	const returned = Buffer.from(JSON.stringify(objectiveProgress(contract, { boundedRuns: [],
+		selectedArtifacts: [], stopReason: "assessor-auth-unavailable", pendingActionFacts: {} })));
+	const c2 = await second.recordCheckpoint({ attemptId: "A002", sequence: 2,
+		previousSha256: initial.sha256, bytes: returned });
+	const final = await second.releaseCleanReturn({ bytes: returned, verifyQuiescent: async () => true });
+	assert.equal(final?.checkpointSha256, c2.sha256);
+	assert.deepEqual(await second.readFinal(), returned);
+	await assert.rejects(second.recordUnknownOperation({ attemptId: "A002", operationId: "late" }), /not current/);
+	await assert.rejects(LocalMissionHost.begin({ root, missionId, attemptId: "A002",
+		codeRevision: "revision-1", currentIdentity: async () => processTwo }), /final owner was released/);
+	const third = await LocalMissionHost.begin({ root, missionId, attemptId: "A003",
+		codeRevision: "revision-1", currentIdentity: async () => ({ ...processTwo, pid: 1003 }),
+		probePrior: async () => ({ status: "unknown", identityMatch: false, reason: "pid reused" }) });
+	assert.equal(third.source.attemptId, "A003");
+});
+
+test("clean-start release never covers an unknown operation or mission-bound stage", async t => {
+	for (const poison of ["operation", "stage"] as const) {
+		const parent = await mkdtemp(path.join(os.tmpdir(), `mulpis-clean-${poison}-`));
+		t.after(() => rm(parent, { recursive: true, force: true }));
+		const missionId = `mission-${poison}`;
+		const root = path.join(parent, ".agent", "missions", missionId);
+		await mkdir(path.join(parent, ".agent"), { mode: 0o700 });
+		const contract: OriginalObjectiveContractV1 = { version: 1, kind: "original-objective",
+			id: missionId, createdAt: new Date().toISOString(), goal: "Synthetic task",
+			goalSource: "verbatim-private-input", inputNames: ["problem.md"],
+			obligations: [{ id: "check", description: "Check task" }], closure: "open-ended" };
+		const first = await LocalMissionHost.begin({ root, missionId, attemptId: "A001",
+			codeRevision: "revision-1", currentIdentity: async () => processOne });
+		await recordSyntheticCleanContract(first, contract);
+		await first.recordCheckpoint({ attemptId: "A001", sequence: 1,
+			previousSha256: null, bytes: Buffer.from(JSON.stringify(objectiveProgress(contract,
+				{ boundedRuns: [], selectedArtifacts: [], stopReason: "next-task-pending", pendingActionFacts: {} }))) });
+		await first.releaseCleanStart();
+		if (poison === "operation") {
+			const operationId = "unknown-child";
+			await writeFile(path.join(root, "attempts", "A001", "operations", `${sha(Buffer.from(operationId))}.json`),
+				`${JSON.stringify({ version: 1, kind: "local-mission-unknown-operation", source: first.source,
+					operationId, effects: "unknown-unreconciled", accounting: "unquantified" })}\n`, { mode: 0o600 });
+		} else {
+			const run = path.join(parent, "stages", "MISSION", "issued-run");
+			await mkdir(run, { recursive: true });
+			await writeFile(path.join(run, "run.json"), JSON.stringify({ inputs: [
+				{ path: path.join(root, "evidence", "original-objective.json") }] }));
+		}
+		await assert.rejects(LocalMissionHost.begin({ root, missionId, attemptId: "A002",
+			codeRevision: "revision-1", currentIdentity: async () => processTwo,
+			probePrior: async () => ({ status: "unknown", identityMatch: false, reason: "identity unknown" }) }),
+			/may still be executing/);
+	}
+});
+
+test("ordinary clean return refuses an unresolved operation and leaves the old owner unfenced", async t => {
+	const parent = await mkdtemp(path.join(os.tmpdir(), "mulpis-return-unknown-"));
+	t.after(() => rm(parent, { recursive: true, force: true }));
+	await mkdir(path.join(parent, ".agent"), { mode: 0o700 });
+	const missionId = "mission-return-unknown", root = path.join(parent, ".agent", "missions", missionId);
+	const contract: OriginalObjectiveContractV1 = { version: 1, kind: "original-objective",
+		id: missionId, createdAt: new Date().toISOString(), goal: "Synthetic task",
+		goalSource: "verbatim-private-input", inputNames: ["problem.md"],
+		obligations: [{ id: "check", description: "Check task" }], closure: "open-ended" };
+	const first = await LocalMissionHost.begin({ root, missionId, attemptId: "A001",
+		codeRevision: "revision-1", currentIdentity: async () => processOne });
+	await recordSyntheticCleanContract(first, contract);
+	const initial = await first.recordCheckpoint({ attemptId: "A001", sequence: 1,
+		previousSha256: null, bytes: Buffer.from(JSON.stringify(objectiveProgress(contract,
+			{ boundedRuns: [], selectedArtifacts: [], stopReason: "next-task-pending", pendingActionFacts: {} }))) });
+	await first.releaseCleanStart();
+	const second = await LocalMissionHost.begin({ root, missionId, attemptId: "A002",
+		codeRevision: "revision-1", currentIdentity: async () => processTwo });
+	await second.recordUnknownOperation({ attemptId: "A002", operationId: "unsettled-child" });
+	const held = Buffer.from(JSON.stringify(objectiveProgress(contract, { boundedRuns: [],
+		selectedArtifacts: [], stopReason: "execution-interrupted",
+		unresolvedOperationIds: ["unsettled-child"],
+		pendingActionFacts: { unresolvedOperationRefs: ["unsettled-child"] } })));
+	await second.recordCheckpoint({ attemptId: "A002", sequence: 2,
+		previousSha256: initial.sha256, bytes: held });
+	assert.equal(await second.releaseCleanReturn({ bytes: held, verifyQuiescent: async () => true }), undefined);
+	assert.equal((await second.status()).final, "none");
+	await assert.rejects(LocalMissionHost.begin({ root, missionId, attemptId: "A003",
+		codeRevision: "revision-1", currentIdentity: async () => ({ ...processTwo, pid: 1003 }),
+		probePrior: async () => ({ status: "unknown", identityMatch: false, reason: "pid reused" }) }),
+		/may still be executing/);
 });
 
 test("successor reads exact predecessor carry and checkpoints without replay", async t => {

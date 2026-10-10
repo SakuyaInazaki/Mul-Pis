@@ -3,13 +3,17 @@ import { constants } from "node:fs";
 import { link, lstat, open, readFile, readdir, realpath, unlink } from "node:fs/promises";
 import path from "node:path";
 import { latestFormalBaseline, recoverM07DispatchLock } from "./controller.ts";
-import { captureM04BaselineIdentity } from "./formal-baseline.ts";
+import { captureM04BaselineIdentity, resolveM04Baseline,
+	settledM04Failure } from "./formal-baseline.ts";
 import { resolveExpectedOutputFiles } from "./expected-output.ts";
 import type { LocalObjectiveAdapter, LocalObjectiveAdvanceResult } from "./local-original-objective.ts";
 import type { ObjectiveNextTaskV1, OriginalObjectiveContractV1 } from "./objective-progress.ts";
 import type { CurrentGoal, M07CheckpointRecord, M07Controller, M07TaskRecord, TaskReviewInput } from "./types.ts";
 import type { StageContext } from "../stages/context.ts";
-import { runM04 } from "../stages/m04.ts";
+import { requiredM07Reads, runM04 } from "../stages/m04.ts";
+import { observeManagedProcessGroup, readManagedBashSessionEvidence } from "../runner/managed-bash.ts";
+import { probeProcessIdentity } from "../runtime/process-identity.ts";
+import { inspectM07ManagedOperation } from "./managed-local-failure.ts";
 import type { ProcessIdentityV1 } from "../runtime/process-identity.ts";
 import { HarnessError } from "../types.ts";
 import { evaluateLocalM07Task, readLocalEvaluatorAttempt,
@@ -110,6 +114,53 @@ export type BoundLocalM07Recovery =
 
 const shaFile = async (file: string): Promise<string> =>
 	createHash("sha256").update(await readFile(file)).digest("hex");
+const checkpointReadDigests = async (root: string, paths: string[]): Promise<string[]> =>
+	Promise.all((await requiredM07Reads(root, paths)).map(relative =>
+		shaFile(path.join(root, relative))));
+
+/** A returned local execution is eligible for new work only when every Pi
+ * tool call and managed foreground process has a terminal host observation.
+ * This cannot certify remote or detached effects; the M07 response and review
+ * remain evidence, not a blanket execution-sandbox guarantee. */
+async function settledReturnedLocalExecution(goal: CurrentGoal, taskId: string): Promise<boolean> {
+	const task = goal.tasks.find(item => item.taskId === taskId);
+	const operations = goal.executionState?.operations.filter(item => item.taskId === taskId);
+	if (!task || task.mode !== "execute" || task.executionLoop || !task.session?.id ||
+		!task.session.file || !operations || operations.length !== 1 ||
+		operations[0]?.status !== "response-received") return false;
+	let census: Awaited<ReturnType<typeof inspectM07ManagedOperation>>;
+	try { census = await inspectM07ManagedOperation(goal, operations[0].id); }
+	catch { return false; }
+	if (!census || census.pendingReceiptIds.length ||
+		census.calls.some(item => item.toolResult === "missing" || item.localLifecycle !== "terminal"))
+		return false;
+	const log = task.toolLog as Array<{ name?: string; toolCallId?: string; ok?: boolean }>;
+	if (!Array.isArray(log) || log.length !== census.calls.length ||
+		log.some((item, index) => item.name !== census!.calls[index]?.name ||
+			typeof item.ok !== "boolean" || item.ok !== (census!.calls[index]?.toolResult === "returned") ||
+			(item.name === "bash" && item.toolCallId !== census!.calls[index]?.toolCallId))) return false;
+	let evidence: Awaited<ReturnType<typeof readManagedBashSessionEvidence>>;
+	try { evidence = await readManagedBashSessionEvidence(path.dirname(task.session.file), task.session.id); }
+	catch { return false; }
+	const bashCalls = census.calls.filter(item => item.name === "bash");
+	if (evidence.pendingReceiptIds.length || evidence.receipts.length !== bashCalls.length) return false;
+	for (const call of bashCalls) {
+		const receipt = evidence.receipts.find(item => item.toolCallId === call.toolCallId);
+		if (!receipt || receipt.id !== call.bashReceiptId || receipt.sessionId !== task.session.id ||
+			receipt.cwd !== path.resolve(task.workDir) || receipt.backend !== "managed-posix" ||
+			receipt.spawn !== "observed" || !receipt.processIdentity || !receipt.processExit ||
+			receipt.processExit.abortSource !== "none" || receipt.processExit.signal !== null ||
+			receipt.groupObservation !== "none-observed" || receipt.outputBytesAtExit === null ||
+			receipt.toolOutcome === "unknown" ||
+			(call.toolResult === "returned") !== (receipt.toolOutcome === "returned")) return false;
+		// The receipt's groupObservation was made at shell exit. Re-probe now so
+		// a still-running attributed background process cannot pass this gate.
+		if (await observeManagedProcessGroup(receipt.processGroupId!) !== "none-observed") return false;
+		const probe = await probeProcessIdentity(receipt.processIdentity);
+		if (probe.status !== "dead" || probe.identityMatch) return false;
+	}
+	return true;
+}
 
 /** Continue only the trusted host side of one already returned, linked M07
  * task. The evaluator may enter once only when its prior journal is absent
@@ -283,6 +334,30 @@ export async function recoverBoundLocalM07Task(input: BoundLocalM07RecoveryInput
 			!(["no-proposal", "merged"] as string[]).includes(tx.state ?? ""))
 			return { state: "pending", reason: "evaluator-effects-unknown" };
 		m04RunId = id;
+	} else if (terminal === "returned" && reviewed.status === "accepted") {
+		const receiptFile = path.join(report.workDir, "local-evaluator-receipt.json");
+		const returnedPhase = await readLocalEvaluatorAttempt(evaluation);
+		if (returnedPhase.state !== "returned") fail("accepted evaluator journal is not returned");
+		return { state: "settled", result: { runId, outcome: "partial",
+			acceptedTaskIds: [taskId], checkpointId: checkpoint.id,
+			evaluatorReceiptPath: receiptFile, requiredM07ReadPaths,
+			pendingM04Review: { version: 1, kind: "accepted-m07-pending-m04-review",
+				runId, taskId, checkpointId: checkpoint.id,
+				evaluatorReceiptSha256: await shaFile(receiptFile),
+				checkpointManifestSha256: await shaFile(checkpoint.manifestPath),
+				requiredM07ReadPaths: requiredM07ReadPaths!,
+				requiredM07ReadSha256: await checkpointReadDigests(checkpoint.rootDir,
+					requiredM07ReadPaths!), m04RunIds: [] },
+			unresolvedOperationRefs: [] }, evaluation: {
+			id: returnedPhase.attempt.evaluator.id,
+			version: returnedPhase.attempt.evaluator.version,
+			attemptId: returnedPhase.attempt.attemptId,
+			owner: returnedPhase.attempt.process,
+			terminal: "returned",
+			preparedSha256: await shaFile(path.join(journalRoot, "prepared.json")),
+			enteredSha256: await shaFile(path.join(journalRoot, "entered.json")),
+			terminalSha256: await shaFile(path.join(journalRoot, "returned.json")),
+			receiptSha256: await shaFile(receiptFile) } };
 	} else if (terminal === "returned") {
 		const completed = await (input.runM04 ?? runM04)(ctx, { feedback: { kind: "M07Checkpoint",
 			runId, checkpointId: checkpoint.id }, freshSession: true,
@@ -555,9 +630,72 @@ export function createLocalM07Adapter(mode: "reason" | "execute" = "reason"): Lo
 		const requiredM07ReadPaths = evaluated ? [...new Set(["goal.json", "manifest.json", "m04-feedback.md",
 			...(snapTask?.review?.artifacts ?? []).filter(item => item.mediaType === "text")
 				.map(item => path.relative(checkpoint.rootDir, item.path).replaceAll("\\", "/"))])] : undefined;
-		const m04 = await input.runM04(ctx, { feedback: { kind: "M07Checkpoint", runId: goal.runId,
-			checkpointId: checkpoint.id }, freshSession: true,
-			...(requiredM07ReadPaths ? { requiredM07ReadPaths } : {}) });
+			if (evaluated && reviewed.status === "accepted") {
+				return { runId: goal.runId, outcome: "partial", acceptedTaskIds: [report.taskId],
+					checkpointId: checkpoint.id, evaluatorReceiptPath: evaluated.receiptFile,
+					requiredM07ReadPaths, unresolvedOperationRefs: [],
+					pendingM04Review: { version: 1, kind: "accepted-m07-pending-m04-review",
+						runId: goal.runId, taskId: report.taskId, checkpointId: checkpoint.id,
+						evaluatorReceiptSha256: await shaFile(evaluated.receiptFile),
+						checkpointManifestSha256: await shaFile(checkpoint.manifestPath),
+						requiredM07ReadPaths: requiredM07ReadPaths!,
+						requiredM07ReadSha256: await checkpointReadDigests(checkpoint.rootDir,
+							requiredM07ReadPaths!), m04RunIds: [] } };
+			}
+		const beforeM04 = new Set(await ctx.ws.listRuns("M04"));
+		let m04;
+		try {
+			m04 = await input.runM04(ctx, { feedback: { kind: "M07Checkpoint", runId: goal.runId,
+				checkpointId: checkpoint.id }, freshSession: true,
+				...(requiredM07ReadPaths ? { requiredM07ReadPaths } : {}) });
+		} catch (error) {
+			// This live owner may settle its own returned task. Execute work also
+			// needs a terminal managed local operation and tool-call census. A failed
+			// judgment is retained as negative feedback only after the host proves
+			// the exact no-proposal transaction and absence of an open merge.
+			// An explicit abort is a control decision, even when the default host
+			// has no signal object. Its failed M04 record remains available for later
+			// reconciliation, but this invocation must not dispatch fresh work.
+			if (ctx.signal?.aborted || error instanceof Error && (
+				error.name === "AbortError" ||
+				(error instanceof HarnessError && error.code === "runner.aborted"))) throw error;
+			const added = (await ctx.ws.listRuns("M04")).filter(id => !beforeM04.has(id));
+			if (added.length !== 1 || reviewed.status !== "rejected" ||
+				!observed.executionState || observed.executionState.operations.some(item =>
+					item.taskId !== report.taskId || item.status !== "response-received") ||
+				observed.tasks.length !== 1 || !["accepted", "rejected"].includes(reviewed.status) ||
+				!evaluated || !reviewed.review) throw error;
+			if (mode === "execute" && !await settledReturnedLocalExecution(
+				await controller.status(goal.runId), report.taskId)) throw error;
+			const failed = await ctx.ws.readRun("M04", added[0]!);
+			const source = JSON.parse(await readFile(path.join(ctx.ws.runDir("M04", failed.runId),
+				"m07-source.json"), "utf8")) as { m07RunId?: string; checkpointId?: string;
+				feedbackBundlePath?: string; goalSnapshotPath?: string; manifestPath?: string };
+			if (failed.status !== "failed" ||
+				!failed.inputs.some(item => item.path === checkpoint.feedbackPath) ||
+				!failed.inputs.some(item => item.path === checkpoint.manifestPath) ||
+				source.m07RunId !== goal.runId || source.checkpointId !== checkpoint.id ||
+				source.feedbackBundlePath !== checkpoint.feedbackPath ||
+				source.goalSnapshotPath !== checkpoint.goalSnapshotPath ||
+				source.manifestPath !== checkpoint.manifestPath) throw error;
+			if ((await settledM04Failure(ctx, failed)).transactionState !== "no-proposal") throw error;
+			const resolved = await resolveM04Baseline(ctx);
+			if (resolved.failedM04.at(-1)?.runId !== failed.runId) throw error;
+			const current = await controller.status(goal.runId);
+			if (current.lifecycle !== "active" || current.tasks.length !== 1 ||
+				current.tasks[0]?.taskId !== report.taskId ||
+				!current.executionState || current.executionState.operations.some(item =>
+					item.taskId !== report.taskId || item.status !== "response-received")) throw error;
+			if (mode === "execute" && !await settledReturnedLocalExecution(current, report.taskId)) throw error;
+			await controller.finish(goal.runId, { outcome: "partial", returnPath: "continue",
+				summary: `M04 ${failed.runId} failed before a knowledge proposal; its exact failure remains unselected feedback for the next original-objective assessment.`,
+				goalChecks: reviewed.review.checks.map(check => ({ ...check })) });
+			return { runId: goal.runId, outcome: "partial",
+				acceptedTaskIds: [],
+				failedM04RunId: failed.runId, checkpointId: checkpoint.id,
+				evaluatorReceiptPath: evaluated.receiptFile, requiredM07ReadPaths,
+				unresolvedOperationRefs: [] };
+		}
 		let selectionProofGap;
 		if (evaluated) {
 			const tx = JSON.parse(await readFile(path.join(ctx.ws.runDir("M04", m04.record.runId),

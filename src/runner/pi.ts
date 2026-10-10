@@ -31,8 +31,40 @@ import { assertDeepSeekRequestContract, DeepSeekRequestContractError,
 	type DeepSeekRequestViolation } from "./deepseek-request-contract.ts";
 import type { HostEffectScope } from "./operation-disposition.ts";
 import { certifyRequestNotSent } from "./operation-disposition.ts";
+import { finishManagedBashCall, managedLocalBashOperations, prepareManagedBashCall,
+	type ManagedBashCall } from "./managed-bash.ts";
 
 type OutputTokenField = "max_tokens" | "max_completion_tokens" | "both" | "omitted";
+
+/** Match Pi's own no-auth preflight, not a provider response or a guessed
+ * environment variable. The original guidance may contain local doc paths,
+ * so only a fixed, sanitized cause leaves the runner. */
+function isPiNoApiKeyPreflight(error: unknown, provider: string): boolean {
+	if (!(error instanceof Error) || error.name !== "Error") return false;
+	const display = provider === "unknown" ? "the selected model" : provider;
+	const lines = error.message.split("\n");
+	return lines.length === 5 && lines[0] === `No API key found for ${display}.` &&
+		lines[1] === "" &&
+		lines[2] === "Use /login to log into a provider via OAuth or API key. See:" &&
+		path.basename(lines[3] ?? "") === "providers.md" &&
+		path.basename(lines[4] ?? "") === "models.md" &&
+		path.dirname(lines[3] ?? "") === path.dirname(lines[4] ?? "");
+}
+
+/** Pi's credential storage failed before auth could be checked. This proves
+ * local store unavailability, not that a provider key is absent. */
+function isPiCredentialStoreUnavailable(error: unknown, provider: string): boolean {
+	// Pi can load its own nested copy of pi-ai, so constructor identity is not
+	// stable. Restrict the structural check to Pi's exact store-read wrapper and
+	// an immediate filesystem cause. Never retain the wrapper's path-rich text.
+	if (!(error instanceof Error) || error.name !== "ModelsError") return false;
+	const wrapper = error as Error & { code?: unknown };
+	if (wrapper.code !== "auth" ||
+		!wrapper.message.startsWith(`Credential store read failed for ${provider}: `)) return false;
+	const cause = wrapper.cause as NodeJS.ErrnoException | undefined;
+	return cause instanceof Error && ["ENOENT", "EACCES", "EPERM"].includes(cause.code ?? "") &&
+		["mkdir", "open", "read", "stat", "access"].includes(cause.syscall ?? "");
+}
 
 /** Inspect Pi's final request without changing its provider/context negotiation. */
 function inspectDeepSeekOutputRequest(payload: unknown, expected: { provider: string; id: string;
@@ -64,6 +96,7 @@ class TransportProbe {
 	private httpStatus: number | null = null;
 	private responseStarted: boolean | null = null;
 	private bytesRead: number | null = null;
+	private transportInterrupted = false;
 	private errorCodes: string[] = [];
 	private providerErrorCode: string | null = null;
 	private providerErrorType: string | null = null;
@@ -83,10 +116,34 @@ class TransportProbe {
 		privateSanitize?: (value: string) => string | null) {
 		this.privateSanitize = privateSanitize;
 		this.fetch = async (input, init) => {
+			// An SDK may retry within one stream. Classify only the latest physical
+			// request, so an earlier failed fetch cannot taint a later 200 response.
+			this.dropPendingBody?.(); this.dropPendingBody = undefined;
 			this.phase = "request";
+			this.httpStatus = null;
 			this.responseStarted = false;
+			this.bytesRead = null;
+			this.transportInterrupted = false;
+			this.errorCodes = [];
+			this.providerErrorCode = null;
+			this.providerErrorType = null;
+			this.providerErrorReasonClass = "unknown";
+			this.providerContextOverflow = undefined;
+			this.providerRequestId = null;
+			this.privateProviderError = undefined;
+			this.requestContractViolation = undefined;
+			this.requestContractMessageIndex = undefined;
+			this.wholePromptNotIssued = false;
 			try {
-				const response = await fetchImplementation(input, init);
+				let response: Response;
+				try { response = await fetchImplementation(input, init); }
+				catch (error) {
+					this.captureErrorCodes(error);
+					// Node fetch also rejects for local malformed URLs and request construction.
+					// A code-free TypeError is not proof of a transport interruption.
+					this.transportInterrupted = this.errorCodes.some(code => RETRYABLE_NETWORK_ERROR_CODES.has(code));
+					throw error;
+				}
 				this.responseStarted = true;
 				this.httpStatus = response.status;
 				this.bytesRead = 0;
@@ -119,7 +176,8 @@ class TransportProbe {
 								}
 								controller.enqueue(value);
 							}
-						} catch (error) { clear(); this.dropPendingBody = undefined; this.captureErrorCodes(error); controller.error(error); }
+						} catch (error) { clear(); this.dropPendingBody = undefined; this.transportInterrupted = true;
+							this.captureErrorCodes(error); controller.error(error); }
 					},
 					cancel: (reason) => { clear(); this.dropPendingBody = undefined; return reader.cancel(reason); },
 				});
@@ -178,6 +236,8 @@ class TransportProbe {
 		return this.providerContextOverflow ? { ...this.providerContextOverflow } : undefined;
 	}
 
+	hasTransportObservation(): boolean { return this.phase !== "unknown"; }
+
 	captureErrorCodes(error: unknown): void {
 		const seen = new Set<unknown>();
 		let current: unknown = error;
@@ -200,6 +260,7 @@ class TransportProbe {
 		this.dropPendingBody = undefined;
 		return { version: 1, promptIndex, ...(requestId ? { requestId } : {}), phase: this.phase,
 			httpStatus: this.httpStatus, responseStarted: this.responseStarted, bytesRead: this.bytesRead,
+			...(this.transportInterrupted ? { transportInterrupted: true as const } : {}),
 			abortSource, providerErrorCode: this.providerErrorCode, providerErrorType: this.providerErrorType,
 			providerErrorReasonClass: this.providerErrorReasonClass,
 			...(this.providerContextOverflow ? { providerContextOverflow: { ...this.providerContextOverflow } } : {}),
@@ -286,6 +347,11 @@ const SAFE_ERROR_CODES = new Set([
 	"ECONNRESET", "ECONNREFUSED", "ECONNABORTED", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EPIPE",
 	"UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "UND_ERR_RESPONSE", "UND_ERR_ABORTED",
 ]);
+const RETRYABLE_NETWORK_ERROR_CODES = new Set([
+	"ECONNRESET", "ECONNREFUSED", "ECONNABORTED", "EAI_AGAIN", "ETIMEDOUT", "EHOSTUNREACH",
+	"ENETUNREACH", "EPIPE", "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT",
+	"UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "UND_ERR_RESPONSE",
+]);
 
 const SCRATCH_PREFIX = ".pi-session-";
 const EMPTY_AGENT_DIR = ".empty-agent-dir";
@@ -364,6 +430,15 @@ function imageMimeType(resolved: string): string | undefined {
 	)[extension];
 }
 
+class ReadOffsetBeyondEOFError extends Error {
+	readonly kind = "offset-beyond-eof";
+	readonly lineCount: number;
+	constructor(lineCount: number, offset: number) {
+		super(`Offset ${offset} is beyond end of file (${lineCount} lines total)`);
+		this.lineCount = lineCount;
+	}
+}
+
 async function createMaterialTools(root: string, requestedReadName?: string): Promise<MaterialTools> {
 	const rootReal = await realpath(root);
 	const rootStat = await lstat(rootReal);
@@ -375,7 +450,7 @@ async function createMaterialTools(root: string, requestedReadName?: string): Pr
 	}
 	const readCoverage = new Set<string>();
 	const readReturns: ReadReturnEvent[] = [];
-	const readCapture = new AsyncLocalStorage<{ path?: string }>();
+	const readCapture = new AsyncLocalStorage<{ path?: string; offset?: number; limit?: number }>();
 	const baseRead = createReadToolDefinition(rootReal, {
 		operations: {
 			access: async (requested) => {
@@ -390,6 +465,14 @@ async function createMaterialTools(root: string, requestedReadName?: string): Pr
 				const contents = await readFile(resolved);
 				const captured = readCapture.getStore();
 				if (captured) captured.path = path.relative(rootReal, resolved);
+				if (captured && imageMimeType(resolved) === undefined &&
+					Number.isSafeInteger(captured.offset) && captured.offset! > 0 &&
+					(captured.limit === undefined || Number.isSafeInteger(captured.limit) && captured.limit > 0)) {
+					const text = contents.toString("utf8");
+					const sdkLineCount = text.split("\n").length;
+					if (captured.offset! > sdkLineCount)
+						throw new ReadOffsetBeyondEOFError(sdkLineCount - (text.endsWith("\n") ? 1 : 0), captured.offset!);
+				}
 				return contents;
 			},
 			detectImageMimeType: async (requested) => {
@@ -405,8 +488,9 @@ async function createMaterialTools(root: string, requestedReadName?: string): Pr
 		// Pi normally prefers ctx.cwd over the tool factory cwd. Rebase the
 		// context so relative material paths do not resolve in the empty scratch cwd.
 		execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-			const captured: { path?: string } = {};
 			const requested = params as { path: string; offset?: number; limit?: number };
+			const captured: { path?: string; offset?: number; limit?: number } = {
+				offset: requested.offset, limit: requested.limit };
 			const requestFields = { ...(requested.offset !== undefined ? { offset: requested.offset } : {}), ...(requested.limit !== undefined ? { limit: requested.limit } : {}) };
 			try {
 				const result = await readCapture.run(captured, () => baseRead.execute(
@@ -434,7 +518,11 @@ async function createMaterialTools(root: string, requestedReadName?: string): Pr
 				if (captured.path) readCoverage.add(captured.path);
 				return result;
 			} catch (error) {
-				readReturns.push({ toolName: readName, status: "error", path: captured.path ?? "<unresolved>", requested: requestFields, returned: { kind: "unknown" }, at: new Date().toISOString() });
+				readReturns.push({ toolName: readName, status: "error", path: captured.path ?? "<unresolved>",
+					requested: requestFields, returned: { kind: "unknown" },
+					...(error instanceof ReadOffsetBeyondEOFError && captured.path
+						? { error: { kind: error.kind, lineCount: error.lineCount } } : {}),
+					at: new Date().toISOString() });
 				throw error;
 			}
 		},
@@ -540,10 +628,13 @@ async function createExecutionTools(
 	root: string,
 	requested: Array<"read" | "write" | "edit" | "bash">,
 	log: ToolCallRecord[],
+	receiptDir: string,
+	sessionId: string,
 	isolatedToolEnvironment = false,
 ): Promise<MaterialTools & { cwd: string }> {
 	const cwd = await realpath(root);
 	if (!(await lstat(cwd)).isDirectory()) throw new HarnessError("runner.tools", `execution root is not a directory: ${root}`);
+	const bashCall = new AsyncLocalStorage<ManagedBashCall>();
 	const factories = {
 		read: createReadToolDefinition,
 		write: createWriteToolDefinition,
@@ -557,6 +648,7 @@ async function createExecutionTools(
 		// bash child. This is environment hygiene, not an OS sandbox.
 		const base = (name === "bash" && isolatedToolEnvironment
 			? createBashToolDefinition(cwd, {
+				operations: managedLocalBashOperations(() => bashCall.getStore()),
 				exposeSessionEnvironment: false,
 				spawnHook: (context) => ({ ...context, env: {
 					PATH: process.env.PATH ?? "/usr/bin:/bin",
@@ -570,21 +662,36 @@ async function createExecutionTools(
 			...base,
 			async execute(toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: any, ctx: any) {
 				const args = params ?? {};
+				const receipt = name === "bash" && typeof args.command === "string" ?
+					await prepareManagedBashCall(receiptDir, sessionId, toolCallId, args.command, cwd) : undefined;
 				const safeArgs = name !== "bash" && typeof args.path === "string" && args.path.length <= 240
 					? { path: redactToolLogText(args.path, 240) } : {};
 				const at = new Date().toISOString();
 				try {
-					const result = await base.execute(toolCallId, args, signal, onUpdate, { ...ctx, cwd });
-					log.push({ name, args: safeArgs, ok: true, at });
+					const result = receipt ? await bashCall.run(receipt, () => base.execute(toolCallId, args, signal, onUpdate, { ...ctx, cwd })) :
+						await base.execute(toolCallId, args, signal, onUpdate, { ...ctx, cwd });
+					const isError = (result as { isError?: boolean }).isError === true;
+					if (receipt) await finishManagedBashCall(receipt, isError ? "is-error" : "returned");
+					log.push({ name, args: safeArgs, ok: !isError, at,
+						...(receipt ? { toolCallId, hostReceiptPath: receipt.file } : {}) });
 					if (name === "read" && typeof args.path === "string") {
 						const resolved = path.isAbsolute(args.path) ? path.resolve(args.path) : path.resolve(cwd, args.path);
 						readCoverage.add(path.relative(cwd, resolved));
 					}
 					return result;
 				} catch (error) {
+					if (receipt) {
+						const exit = receipt.receipt.processExit;
+						const kind = exit?.abortSource === "signal" ? "aborted" :
+							exit?.abortSource === "timeout" ? "timeout" :
+							exit?.exitCode !== null && exit?.exitCode !== undefined && exit.exitCode !== 0 ?
+								"nonzero-exit" : "transport-or-tool";
+						await finishManagedBashCall(receipt, "threw", kind).catch(() => undefined);
+					}
 					const code = error instanceof HarnessError && /^runner\.[a-z.-]{1,80}$/.test(error.code)
 						? error.code : (error as NodeJS.ErrnoException | null)?.code;
 					log.push({ name, args: safeArgs, ok: false, at,
+					...(receipt ? { toolCallId, hostReceiptPath: receipt.file } : {}),
 						errorClass: error instanceof HarnessError ? "harness" : "tool-error",
 						...(typeof code === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(code) ? { errorCode: code } : {}) });
 					throw error;
@@ -982,7 +1089,11 @@ export class PiSessionRunner implements SessionRunner {
 			}
 		}
 		if (campaign && (!strict || JSON.stringify(strict) !== JSON.stringify(campaign.strictRequest))) throw new HarnessError("runner.campaign", "campaign request caps are missing or changed");
-		const settingsManager = SettingsManager.inMemory(strict ? { retry: { enabled: false, provider: { maxRetries: 0 } }, compaction: { enabled: false } } : {});
+		const ordinaryAssessor = !strict && spec.role === "research" &&
+			spec.tools.kind === "read-dir" && spec.label.startsWith("local-original-objective-");
+		const settingsManager = SettingsManager.inMemory(strict ?
+			{ retry: { enabled: false, provider: { maxRetries: 0 } }, compaction: { enabled: false } } :
+			ordinaryAssessor ? { retry: { enabled: false, provider: { maxRetries: 0 } } } : {});
 		const loader = new DefaultResourceLoader({
 			cwd,
 			agentDir: emptyAgentDir,
@@ -1010,6 +1121,10 @@ export class PiSessionRunner implements SessionRunner {
 		let currentContextRejectedIds = new Set<string>();
 		let certifiedEffectScope: HostEffectScope | undefined;
 		const transportDiagnostics: TransportFailureDiagnostic[] = [];
+		const ordinaryPromptProbes: Array<{ promptIndex: number; probe: TransportProbe;
+			sdkSignal?: AbortSignal }> = [];
+		const sdkAssessorAborted = (index: number): boolean => !campaign && ordinaryAssessor &&
+			ordinaryPromptProbes.some(row => row.promptIndex === index && row.sdkSignal?.aborted);
 		const providerOutputRequests: Array<{ resolvedMaxTokens: number; outputField: OutputTokenField;
 			outgoingMaxTokens: number | null }> = [];
 		const signal = this.options.signal;
@@ -1023,7 +1138,22 @@ export class PiSessionRunner implements SessionRunner {
 					return typeof member === "function" ? member.bind(target) : member;
 				}
 				return (model: Parameters<ModelRuntime["streamSimple"]>[0], context: Parameters<ModelRuntime["streamSimple"]>[1], options?: Parameters<ModelRuntime["streamSimple"]>[2]) => {
-				if (!strict) return target.streamSimple(model, context, { ...options, maxTokens: model.maxTokens,
+				if (!strict) {
+					const probe = ordinaryAssessor ?
+						new TransportProbe(options?.fetch ?? globalThis.fetch, sanitizePrivateProviderError) : undefined;
+					if (probe) {
+						// A later tool-loop stream supersedes completed earlier streams.
+						ordinaryPromptProbes.length = 0;
+						ordinaryPromptProbes.push({ promptIndex, probe, sdkSignal: options?.signal });
+					}
+					return target.streamSimple(model, context, { ...options, maxTokens: model.maxTokens,
+						...(ordinaryAssessor ? { maxRetries: 0 } : {}),
+						...(probe ? { fetch: probe.fetch,
+							onResponse: async (response: Parameters<NonNullable<NonNullable<Parameters<ModelRuntime["streamSimple"]>[2]>["onResponse"]>>[0],
+								responseModel: typeof model) => {
+								probe.observeResponse(response.status);
+								await options?.onResponse?.(response, responseModel);
+							} } : {}),
 					...(model.provider === "deepseek" && model.api === "openai-completions" ? {
 						onPayload: async (payload: unknown, payloadModel: typeof model) => {
 							const original = await options?.onPayload?.(payload as never, payloadModel as never);
@@ -1034,6 +1164,7 @@ export class PiSessionRunner implements SessionRunner {
 							return inspected.payload;
 						},
 					} : {}) });
+				}
 				const lease = currentLease;
 					const requestIds = currentRequestIds;
 					const contextRejectedIds = currentContextRejectedIds;
@@ -1216,7 +1347,9 @@ export class PiSessionRunner implements SessionRunner {
 			const definitions = customToolsToPi(spec.tools.tools, toolLog);
 			materialTools = { tools: definitions, names: definitions.map((d) => d.name), readCoverage: new Set(), readReturns: [] };
 		} else if (spec.tools.kind === "execution") {
-			const execution = await createExecutionTools(spec.tools.root, spec.tools.tools, toolLog, true);
+			const execution = await createExecutionTools(spec.tools.root, spec.tools.tools, toolLog,
+				path.join(spec.persistDir, "host-execution-receipts", sessionManager.getSessionId()),
+				sessionManager.getSessionId(), true);
 			materialTools = execution;
 			sessionCwd = execution.cwd;
 		}
@@ -1319,9 +1452,9 @@ export class PiSessionRunner implements SessionRunner {
 			prompt: async (text): Promise<AssistantTurn> => {
 				if (disposed) throw new HarnessError("runner.stop", `session ${spec.label} has been disposed`);
 				if (checkpointState.freezing) throw new HarnessError("runner.fork", `session ${spec.label} is being checkpointed`);
-				if (abortedByHandle) throw new HarnessError("runner.stop", `session ${spec.label} was aborted before prompt`);
+				if (abortedByHandle) throw new HarnessError("runner.aborted", `session ${spec.label} was aborted before prompt`);
 				if (promptActive) throw new HarnessError("runner.stop", `session ${spec.label} already has an active prompt`);
-				if (signal?.aborted) throw new HarnessError("runner.stop", `session ${spec.label} was aborted before prompt`);
+				if (signal?.aborted) throw new HarnessError("runner.aborted", `session ${spec.label} was aborted before prompt`);
 				const thisPrompt = promptIndex + 1;
 				currentLease = campaign?.beginPrompt(ref.id, `${thisPrompt}-${randomUUID()}`);
 				currentRequestIds = [];
@@ -1359,9 +1492,9 @@ export class PiSessionRunner implements SessionRunner {
 					await session.prompt(text);
 					if (strict && (strictStreamCalls < 1 || strictStreamCalls !== strictPayloadChecks)) throw new HarnessError("runner.model", "strict request did not verify every provider payload");
 					if (abortPromise) await abortPromise;
-					if (signal?.aborted || abortedByHandle) {
+					if (signal?.aborted || abortedByHandle || sdkAssessorAborted(thisPrompt)) {
 						const detail = abortError ? `; SDK abort failed: ${(abortError as Error).message}` : "";
-						throw new HarnessError("runner.stop", `session ${spec.label} was aborted during prompt${detail}`);
+						throw new HarnessError("runner.aborted", `session ${spec.label} was aborted during prompt${detail}`);
 					}
 					collectUsage();
 					const result = turnResult(promptMessages, spec.label, summarizeUsage(promptEvents), Boolean(campaign));
@@ -1379,17 +1512,25 @@ export class PiSessionRunner implements SessionRunner {
 					promptOutcome = "completed";
 					return result;
 				} catch (error) {
+					if (!campaign) for (const { promptIndex: observedPrompt, probe, sdkSignal } of ordinaryPromptProbes) {
+						if (observedPrompt !== thisPrompt || !probe.hasTransportObservation()) continue;
+						transportDiagnostics.push(probe.failure(thisPrompt,
+							abortedByHandle ? "handle" : signal?.aborted ? "host-signal" :
+								sdkSignal?.aborted ? "sdk-signal" : null));
+					}
 					const lengthStop = campaign && currentLease && !signal?.aborted && !abortedByHandle &&
 						error instanceof HarnessError && error.code === "runner.stop" && /stopReason=length/.test(error.message)
 						? campaign.certifySettledTerminalResponse(currentLease, certifiedEffectScope) : undefined;
 					if (campaign && currentLease) campaign.failPrompt(currentLease);
 					if (abortPromise) await abortPromise;
-					if ((signal?.aborted || abortedByHandle) && !(error instanceof HarnessError && error.code === "runner.stop")) {
+					if ((signal?.aborted || abortedByHandle || sdkAssessorAborted(thisPrompt)) &&
+						!(error instanceof HarnessError && error.code === "runner.aborted")) {
 						promptOutcome = "aborted";
 						const detail = abortError ? `; SDK abort failed: ${(abortError as Error).message}` : "";
-						throw new HarnessError("runner.stop", `session ${spec.label} was aborted during prompt${detail}`);
+						throw new HarnessError("runner.aborted", `session ${spec.label} was aborted during prompt${detail}`);
 					}
-					if (signal?.aborted || abortedByHandle) promptOutcome = "aborted";
+					if (signal?.aborted || abortedByHandle || sdkAssessorAborted(thisPrompt))
+						promptOutcome = "aborted";
 					if (lengthStop) throw lengthStop;
 					const preflight = transportDiagnostics.find((item) => item.promptIndex === thisPrompt &&
 						item.wholePromptNotIssued === true && item.requestContractViolation !== undefined);
@@ -1398,6 +1539,16 @@ export class PiSessionRunner implements SessionRunner {
 						throw certifyRequestNotSent({ requestNotSent: true, noProviderRequestsInPrompt: true,
 							effectScope: certifiedEffectScope, violation: preflight.requestContractViolation,
 							messageIndex: preflight.requestContractMessageIndex ?? null });
+					if (currentRequestIds.length === 0 &&
+						!ordinaryPromptProbes.some(row => row.promptIndex === thisPrompt && row.probe.hasTransportObservation()) &&
+						!sessionManager.getEntries().some(entry => !accounted.has(entry.id) && entry.type === "message")) {
+						if (isPiCredentialStoreUnavailable(error, resolved.model.provider))
+							throw new HarnessError("runner.auth-store-unavailable",
+								"Pi credential store is unavailable before request dispatch");
+						if (isPiNoApiKeyPreflight(error, resolved.model.provider))
+							throw new HarnessError("runner.auth-preflight",
+								"Pi has no configured authentication for the selected provider before request dispatch");
+					}
 					if (campaign && transportDiagnostics.some((item) => item.promptIndex === thisPrompt))
 						throw new HarnessError("runner.stop", `session ${spec.label} provider request failed (redacted transport diagnostics available)`);
 					throw error;
@@ -1427,6 +1578,7 @@ export class PiSessionRunner implements SessionRunner {
 						if (campaign && currentLease) campaign.failPrompt(currentLease);
 						throw error;
 					} finally {
+						ordinaryPromptProbes.length = 0;
 						currentLease = undefined;
 						currentRequestIds = [];
 						currentContextRejectedIds = new Set();

@@ -9,7 +9,8 @@ export type WorkflowRepairFailure =
 	"unread-evidence" | "invalid-assessment" | "blocked-with-capability" |
 	"unsupported-next-task" | "unread-m07-evidence" | "malformed-proposal" |
 	"unavailable-task-source" |
-	"rejected-draft" | "context-handoff-unavailable" | "provider-context-full";
+	"rejected-draft" | "context-handoff-unavailable" | "provider-context-full" |
+	"provider-stream";
 export type WorkflowRepairStrategy = "same-session-feedback" | "fresh-context" |
 	"workflow-repair-needed";
 
@@ -28,7 +29,8 @@ const stages: readonly WorkflowRepairStage[] = ["objective-assessment", "m04-jud
 const failures: readonly WorkflowRepairFailure[] = ["unread-evidence", "invalid-assessment",
 	"blocked-with-capability", "unsupported-next-task", "unread-m07-evidence",
 	"unavailable-task-source",
-	"malformed-proposal", "rejected-draft", "context-handoff-unavailable", "provider-context-full"];
+	"malformed-proposal", "rejected-draft", "context-handoff-unavailable", "provider-context-full",
+	"provider-stream"];
 const strategies: readonly WorkflowRepairStrategy[] = ["same-session-feedback", "fresh-context",
 	"workflow-repair-needed"];
 const digest = /^[0-9a-f]{64}$/;

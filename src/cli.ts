@@ -270,7 +270,8 @@ export async function main(argv: string[]): Promise<number> {
 				obligations: [{ id: "original-task", description: (await ws.readProblem()).content }],
 				closure: "open-ended" }) : undefined;
 		const host = openDefaultLocalMission({ workspaceRoot: ws.root,
-			runner: await makeRunner(flag(args, "runner") ?? "pi"), config: await ws.loadConfig() });
+			runner: await makeRunner(flag(args, "runner") ?? "pi"), config: await ws.loadConfig(),
+			startOnly: action === "start", releaseOnReturn: action === "run" || action === "resume" });
 		if (action === "start") {
 			const progress = await host.begin(request!);
 			console.log(JSON.stringify({ missionId: progress.contract.id }, null, 2));
@@ -279,7 +280,12 @@ export async function main(argv: string[]): Promise<number> {
 		const missionId = flag(args, "mission")!;
 		const progress = action === "run" ? await host.run(missionId) : await host.step(missionId);
 		console.log(JSON.stringify(publicLocalMissionStatus(progress), null, 2));
-		return 0;
+		// A command that stopped on a repair, failed attempt, or suspended effect
+		// must signal that boundary to shell callers. Ordinary pending progress is
+		// still a successful control step, even when the objective is incomplete.
+		return progress.objectiveOutcome === "fulfilled" ||
+			progress.stopReason === "next-task-pending" ||
+			progress.stopReason === "objective-reassessment-pending" ? 0 : 1;
 	}
 	if (command === "improve") {
 		const action = args.positional[1] ?? "status";

@@ -35,11 +35,17 @@ test("a new local process reopens a clean original objective before any model wo
 	const missionRoot = path.join(ws.agentDir, "missions", missionId);
 	assert.equal((await LocalMissionHost.status(missionRoot)).currentAttempt?.attemptId, "A001");
 	let prompts = 0;
-	const runner = new FakeSessionRunner(() => { prompts++; return "Synthetic malformed assessor response"; });
+	const runner = new FakeSessionRunner(() => {
+		prompts++;
+		if (prompts > 4)
+			throw new DOMException("Synthetic stop after cross-process assessor admission", "AbortError");
+		return "Synthetic malformed assessor response";
+	});
 	const mission = openDefaultLocalMission({ workspaceRoot: root, runner,
 		config: await ws.loadConfig() });
 	const result = await mission.step(missionId);
 	assert(prompts > 0, "a clean cross-process boundary admits the fresh read-only assessor");
+	assert.equal(result.stopReason, "cancelled");
 	assert.equal(result.objectiveOutcome, "incomplete");
 	const status = await LocalMissionHost.status(missionRoot);
 	assert.equal(status.currentAttempt?.attemptId, "A002");

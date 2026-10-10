@@ -12,19 +12,21 @@ import type { SessionRunner } from "../runner/types.ts";
 import { probeProcessIdentity, readCurrentProcessIdentity } from "../runtime/process-identity.ts";
 import { HarnessError, type HarnessConfig } from "../types.ts";
 import type { StageContext } from "../stages/context.ts";
-import { runM04 } from "../stages/m04.ts";
+import { requiredM07Reads, runM04 } from "../stages/m04.ts";
 import { Workspace } from "../workspace.ts";
 import { createLocalM07Adapters, LOCAL_M07_MISSION_BINDING_PREFIX,
 	LOCAL_M07_REASON_SCOPE, LOCAL_M07_EXECUTE_SCOPE,
 	recoverBoundLocalM07Task } from "./local-m07-adapter.ts";
-import { requireLocalEvaluator } from "./local-evaluator-run.ts";
+import { readLocalEvaluatorReceipt, requireLocalEvaluator,
+	verifyLocalEvaluatorReceipt } from "./local-evaluator-run.ts";
 import { trustedLocalMissionEvaluator, validatedTaskInputContract,
 	type LocalMissionEvaluator } from "./local-mission-evaluator.ts";
-import { recordDefaultSelectionReview, recoverDefaultSelectionReview,
+import { computeMissingSelectionProof, missingCandidateSelectionProof,
+	recordDefaultSelectionReview, recoverDefaultSelectionReview, verifyDefaultM04Evidence,
 	verifyMissingSelectionProof,
 	defaultSelectionEvidenceFiles } from "./local-selection-review.ts";
 import { createM07Controller } from "./controller.ts";
-import { captureM04BaselineIdentity } from "./formal-baseline.ts";
+import { captureM04BaselineIdentity, settledM04Failure } from "./formal-baseline.ts";
 import { assessorTaskHash, localLineageHash, missionLineageCommitFile,
 	missionLineageFile, readLocalDispatchLineage,
 	recordLocalDispatchLineage } from "./local-dispatch-lineage.ts";
@@ -45,6 +47,22 @@ const safeId = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
 const activeRecoveryClaims = new Set<string>();
 const activeNoIssuedResumes = new Set<string>();
+const activePendingM04Reviews = new Set<string>();
+
+/** Host-owned control feedback, with only reviewed generic error categories in a new prompt. */
+function priorM04ReviewInstruction(runId: string, failures: readonly string[],
+	priorRunIds: readonly string[]): string {
+	const offset = failures.some(line => /line offset beyond end of file/i.test(line));
+	const code = offset ? "m04-read-offset-beyond-eof" : "m04-readonly-judgment-failed";
+	const message = offset ? "line offset beyond end of file" :
+		"The previous read-only M04 judgment failed before an accepted knowledge proposal.";
+	return `Host-reviewed previous M04 failure: ${JSON.stringify({ version: 1,
+		kind: "prior-m04-review-failure", runId, code, message,
+		transactionState: "no-proposal",
+		retainedEvidenceRefs: priorRunIds.map(id => ({ runId: id,
+			run: `M04/${id}/run.json`, transaction: `M04/${id}/m04-transaction.json` })) })}. ` +
+		"This is a fresh read-only judgment over the same frozen M07 checkpoint. Read required M07 evidence again; earlier read coverage cannot count toward this session. No prior proposal or merge is replayed.";
+}
 
 async function safeText(file: string): Promise<string> {
 	const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -105,8 +123,11 @@ async function parseProgress(bytes: Buffer | undefined, missionId: string): Prom
 }
 
 export function openDefaultLocalMission(input: { workspaceRoot: string;
-	runner?: SessionRunner; config?: HarnessConfig }) {
+	runner?: SessionRunner; config?: HarnessConfig; startOnly?: boolean;
+	releaseOnReturn?: boolean }) {
 	const ws = new Workspace(input.workspaceRoot);
+	const releasedStarts = new Set<string>();
+	const releasedReturns = new Set<string>();
 	const rootFor = (missionId: string) => path.join(ws.agentDir, "missions", missionId);
 	const context: StageContext | undefined = input.runner && input.config ?
 		{ ws, runner: input.runner, config: input.config,
@@ -115,7 +136,15 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 		const root = rootFor(missionId);
 		let active: LocalMissionHost | undefined;
 		const writable = async (): Promise<LocalMissionHost> => {
-			if (active) return active;
+			if (releasedStarts.has(missionId) || releasedReturns.has(missionId))
+				throw new HarnessError("local.mission.owner", "local mission start owner was released");
+			if (active) {
+				const state = await active.status();
+				if (!same(state.currentAttempt, active.source) || state.final === "committed" ||
+					state.cleanStartRelease && same(state.cleanStartRelease.source, active.source))
+					throw new HarnessError("local.mission.owner", "local mission start owner was released");
+				return active;
+			}
 			const current = await LocalMissionHost.status(root).catch(error => {
 				if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 				throw error;
@@ -127,7 +156,7 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 			try { active = await LocalMissionHost.begin({ root, missionId,
 				attemptId: source?.attemptId ?? "A001", codeRevision: "local-harness-v1" }); }
 			catch (error) {
-				if (!source || !/attempt identity changed/.test(String(error))) throw error;
+				if (!source || !/attempt identity changed|clean start owner was released|final owner was released/.test(String(error))) throw error;
 				active = await LocalMissionHost.begin({ root, missionId,
 					attemptId: nextId, codeRevision: "local-harness-v1" });
 			}
@@ -167,6 +196,30 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 				for (const [partIndex, part] of textParts(feedback).entries()) {
 					const name = `prior-run-${index + 1}-${controlOnly ? "control" : "feedback"}-${partIndex + 1}.txt`;
 					await ensureFrozen(path.join(evidenceDir, name), part);
+					names.push(name);
+				}
+				for (const failedRunId of [...(bounded.failedM04RunId ? [bounded.failedM04RunId] : []),
+					...(bounded.failedM04RunIds ?? [])]) {
+					if (!context || !checkpoint || controlOnly)
+						throw new Error("failed M04 feedback lacks its complete M07 checkpoint");
+					const m04 = await ws.readRun("M04", failedRunId);
+					const source = JSON.parse(await safeText(path.join(ws.runDir("M04", m04.runId),
+						"m07-source.json"))) as { m07RunId?: string; checkpointId?: string;
+						feedbackBundlePath?: string; goalSnapshotPath?: string; manifestPath?: string };
+					if (source.m07RunId !== bounded.runId || source.checkpointId !== checkpoint.id ||
+						source.feedbackBundlePath !== checkpoint.feedbackPath ||
+						source.goalSnapshotPath !== path.join(path.dirname(checkpoint.feedbackPath), "goal.json") ||
+						source.manifestPath !== path.join(path.dirname(checkpoint.feedbackPath), "manifest.json"))
+						throw new Error("failed M04 feedback differs from its bounded M07 checkpoint");
+					const failure = await settledM04Failure(context, m04);
+					if (failure.transactionState !== "no-proposal")
+						throw new Error("bounded M04 failure is not an exact no-proposal result");
+					const ordinal = names.filter(name => name.includes("-m04-failure-")).length + 1;
+					const name = `prior-run-${index + 1}-m04-failure-${ordinal}.txt`;
+					await ensureFrozen(path.join(evidenceDir, name),
+						`${JSON.stringify({ version: 1, kind: "local-bounded-m04-failure",
+							m07RunId: bounded.runId, checkpointId: checkpoint.id,
+							...failure, selected: false }, null, 2)}\n`);
 					names.push(name);
 				}
 				mapped[bounded.runId] = names;
@@ -434,7 +487,8 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 								!receipts.some(row => row.interruptedReview?.intentId === runId ||
 									row.legacyInterruptedReview?.intentId === runId ||
 									row.evaluatorRecoveryReview?.intentId === runId ||
-									row.coldMigrationReview?.intentId === runId)) return undefined;
+									row.coldMigrationReview?.intentId === runId ||
+									row.failedM04Review?.intentId === runId)) return undefined;
 						} else {
 							const goal = JSON.parse(await safeText(path.join(ws.runDir("M07", runId),
 								"goal.json"))) as { problemRelation?: string };
@@ -652,6 +706,262 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 			};
 		return {
 			recoverUnissuedAssessment,
+			async advancePendingM04Review({ ctx, controller, progress }) {
+				if (ctx.signal?.aborted) return { progress, advanced: false };
+				const pending = progress.pendingM04Review;
+				if (!pending || progress.stopReason !== "m04-review-pending" ||
+					progress.boundedRuns.at(-1)?.runId !== pending.runId ||
+					!same(progress.boundedRuns.at(-1)?.acceptedTaskIds, [pending.taskId]) ||
+					progress.boundedRuns.at(-1)?.selectedTaskId ||
+					!Array.isArray(pending.m04RunIds) ||
+					new Set(pending.m04RunIds).size !== pending.m04RunIds.length)
+					throw new HarnessError("local.mission.m04", "pending review is not an unselected accepted task");
+				if (activePendingM04Reviews.has(root)) return { progress, advanced: false };
+				activePendingM04Reviews.add(root);
+				let claim;
+				try {
+					const initialStatus = await LocalMissionHost.status(root);
+					if (initialStatus.writerLockPresent) {
+						try { await LocalMissionHost.recoverReviewLock({ root,
+							intentId: pending.taskId,
+							oldCheckpointSha256: sha256(checkpointBytes(progress)) }); }
+						catch { return { progress, advanced: false }; }
+					}
+					await writable();
+					const status = await LocalMissionHost.status(root);
+					if (status.repairRequired || status.writerLockPresent || status.unresolvedOperationIds.length ||
+						status.final !== "none" || !status.latestCheckpoint ||
+						status.latestCheckpoint.sha256 !== sha256(checkpointBytes(progress)))
+						return { progress, advanced: false };
+					claim = await LocalMissionHost.claimPendingM04Review({ root, missionId,
+						checkpointSha256: status.latestCheckpoint.sha256,
+						runId: pending.runId, taskId: pending.taskId,
+						checkpointId: pending.checkpointId,
+						evaluatorReceiptSha256: pending.evaluatorReceiptSha256 });
+					if (!claim) return { progress, advanced: false };
+					const goal = await controller.status(pending.runId);
+					const task = goal.tasks.find(row => row.taskId === pending.taskId);
+					const cp = goal.checkpoints?.find(row => row.id === pending.checkpointId);
+					const cpRoot = path.join(ws.runDir("M07", pending.runId), "checkpoints", pending.checkpointId);
+					const verifyPendingReadBytes = async (): Promise<void> => {
+						if (!Array.isArray(pending.requiredM07ReadSha256) ||
+							pending.requiredM07ReadSha256.length !== pending.requiredM07ReadPaths.length ||
+							!same(pending.requiredM07ReadPaths.slice(0, 3),
+								["goal.json", "manifest.json", "m04-feedback.md"]))
+							throw new HarnessError("local.mission.m04", "pending checkpoint read binding is invalid");
+						const safePaths = await requiredM07Reads(cpRoot, pending.requiredM07ReadPaths);
+						const digests = await Promise.all(safePaths.map(async relative =>
+							sha256(await readFile(path.join(cpRoot, relative)))));
+						if (!same(digests, pending.requiredM07ReadSha256))
+							throw new HarnessError("local.mission.m04", "pending checkpoint read bytes changed");
+					};
+					const receiptFile = path.join(ws.runDir("M07", pending.runId), "tasks",
+						pending.taskId, "work", "local-evaluator-receipt.json");
+					const execution = goal.executionState;
+					const returnedOperation = execution?.version === 1 &&
+						(task?.mode === "execute" ? execution.operations.length === 1 &&
+							execution.operations[0]?.version === 1 &&
+							execution.operations[0]?.taskId === pending.taskId &&
+							execution.operations[0]?.status === "response-received" :
+							["reason", "check"].includes(task?.mode ?? "") &&
+							execution.operations.length === 0);
+					const bad = [
+						goal.problemRelation !== `${LOCAL_M07_MISSION_BINDING_PREFIX}${missionId}\n${progress.contract.goal}` && "relation",
+						goal.tasks.length !== 1 && "tasks", (!task || task.status !== "accepted" || !task.review) && "task-review",
+						!returnedOperation && "returned-operation",
+						(!cp || cp.rootDir !== cpRoot || !["complete", "indexed"].includes(cp.feedbackStatus)) && "checkpoint",
+						cp?.manifestPath !== path.join(cpRoot, "manifest.json") && "manifest-path",
+						cp?.feedbackPath !== path.join(cpRoot, "m04-feedback.md") && "feedback-path",
+						cp?.goalSnapshotPath !== path.join(cpRoot, "goal.json") && "snapshot-path",
+						cp && sha256(await readFile(cp.manifestPath)) !== pending.checkpointManifestSha256 && "manifest-hash",
+					].filter(Boolean);
+					if (bad.length) throw new HarnessError("local.mission.m04",
+						`accepted M07 checkpoint changed before M04 retry: ${bad.join(",")}`);
+					if (!cp || !task || !task.review)
+						throw new HarnessError("local.mission.m04", "accepted checkpoint has no reviewed task");
+					await verifyPendingReadBytes();
+					const snapshot = JSON.parse(await safeText(cp.goalSnapshotPath)) as CurrentGoal;
+					const snapTask = snapshot.tasks.find(row => row.taskId === task.taskId);
+					const expectedReads = [...new Set(["goal.json", "manifest.json", "m04-feedback.md",
+						...(snapTask?.review?.artifacts ?? []).filter(row => row.mediaType === "text")
+							.map(row => path.relative(cpRoot, row.path).replaceAll("\\", "/"))])];
+					if (snapshot.runId !== goal.runId || snapTask?.status !== "accepted" ||
+						snapTask.mode !== task.mode || snapshot.executionState?.version !== 1 ||
+						!same(snapshot.executionState.operations, goal.executionState?.operations) ||
+						!same(expectedReads, pending.requiredM07ReadPaths))
+						throw new HarnessError("local.mission.m04", "pending M04 read set differs from frozen accepted task");
+					const evaluator = await readLocalEvaluatorReceipt(receiptFile);
+					if (evaluator.sha256 !== pending.evaluatorReceiptSha256)
+						throw new HarnessError("local.mission.m04", "evaluator receipt changed before M04 retry");
+					await verifyLocalEvaluatorReceipt(evaluator.receipt, progress.contract, goal, task);
+					await captureM04BaselineIdentity(ctx);
+					const matches: string[] = [];
+					for (const id of await ws.listRuns("M04")) {
+						const run = await ws.readRun("M04", id);
+						if (run.status === "running") return { progress, advanced: false };
+						const txFile = path.join(ws.runDir("M04", id), "m04-transaction.json");
+						let tx: { state?: string } | undefined;
+						try { tx = JSON.parse(await safeText(txFile)); }
+						catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+						if (tx && !["no-proposal", "rejected-draft", "merged"].includes(tx.state ?? ""))
+							return { progress, advanced: false };
+						if (!run.inputs.some(row => row.path === cp.feedbackPath || row.path === cp.manifestPath)) continue;
+						if (!run.inputs.some(row => row.path === cp.feedbackPath) ||
+							!run.inputs.some(row => row.path === cp.manifestPath))
+							throw new HarnessError("local.mission.m04", "M04 checkpoint input census is partial");
+						const source = JSON.parse(await safeText(path.join(ws.runDir("M04", id), "m07-source.json"))) as
+							{ m07RunId?: string; checkpointId?: string; feedbackBundlePath?: string;
+								goalSnapshotPath?: string; manifestPath?: string };
+						if (source.m07RunId !== pending.runId || source.checkpointId !== pending.checkpointId ||
+							source.feedbackBundlePath !== cp.feedbackPath ||
+							source.goalSnapshotPath !== cp.goalSnapshotPath || source.manifestPath !== cp.manifestPath)
+							throw new HarnessError("local.mission.m04", "M04 source differs from the pending checkpoint");
+						matches.push(id);
+					}
+					if (pending.m04RunIds.some(id => !matches.includes(id)))
+						throw new HarnessError("local.mission.m04", "M04 review history differs from committed pending state");
+					const extras = matches.filter(id => !pending.m04RunIds.includes(id));
+					if (extras.length > 1)
+						throw new HarnessError("local.mission.m04", "multiple uncommitted M04 attempts have ambiguous order");
+					matches.splice(0, matches.length, ...pending.m04RunIds, ...extras);
+					const completed = matches.at(-1);
+					for (const id of matches) {
+						const run = await ws.readRun("M04", id);
+						if (run.status === "failed") {
+							if ((await settledM04Failure(ctx, run)).transactionState !== "no-proposal")
+								return { progress, advanced: false };
+						} else if (id !== completed || run.status !== "completed")
+							return { progress, advanced: false };
+					}
+					let latestRun = completed ? await ws.readRun("M04", completed) : undefined;
+					if (latestRun?.status !== "completed") {
+						if (!same(matches, pending.m04RunIds)) {
+							const revised = objectiveProgress(progress.contract, { boundedRuns: progress.boundedRuns,
+								selectedArtifacts: progress.selectedArtifacts,
+								availableArtifacts: progress.availableArtifacts,
+								assessment: progress.assessment, assessmentHistory: progress.assessmentHistory,
+								stopReason: "m04-review-pending", pendingM04Review: { ...pending,
+									m04RunIds: matches }, nextTaskDispatched: true,
+								pendingActionFacts: { target: { goalRunId: pending.runId,
+										taskId: pending.taskId }, failedStage: "m04-judgment" } });
+							await this.recordCheckpoint(revised);
+							return { progress: revised, advanced: true };
+						}
+						const before = new Set(await ws.listRuns("M04"));
+						const previousFailure = matches.length ? await ws.readRun("M04", matches.at(-1)!) : undefined;
+						let priorFailureEvidence: { path: string; sha256: string } | undefined;
+						if (previousFailure) {
+							const diagnostic = `${priorM04ReviewInstruction(previousFailure.runId,
+								previousFailure.failures, matches)}\n`;
+							const file = path.join(root, "evidence",
+								`pending-m04-${pending.runId}-${previousFailure.runId}.txt`);
+							await ensureFrozen(file, diagnostic);
+							priorFailureEvidence = { path: file, sha256: sha256(Buffer.from(diagnostic)) };
+						}
+						try {
+							await runM04(ctx, { feedback: { kind: "M07Checkpoint", runId: pending.runId,
+								checkpointId: pending.checkpointId }, freshSession: true,
+								requiredM07ReadPaths: pending.requiredM07ReadPaths,
+								...(priorFailureEvidence ? { priorFailureEvidence } : {}) });
+						} catch (error) {
+							if (ctx.signal?.aborted || error instanceof Error &&
+								(error.name === "AbortError" || error instanceof HarnessError &&
+									error.code === "runner.aborted")) throw error;
+							const added = (await ws.listRuns("M04")).filter(id => !before.has(id));
+							if (added.length !== 1) throw error;
+							const failed = await ws.readRun("M04", added[0]!);
+							if (failed.status !== "failed" ||
+								!failed.inputs.some(row => row.path === cp.feedbackPath) ||
+								!failed.inputs.some(row => row.path === cp.manifestPath) ||
+								(await settledM04Failure(ctx, failed)).transactionState !== "no-proposal")
+								return { progress, advanced: false };
+							return { progress, advanced: true };
+						}
+						const added = (await ws.listRuns("M04")).filter(id => !before.has(id));
+						if (added.length !== 1) throw new HarnessError("local.mission.m04",
+							"M04 review did not create exactly one run");
+						const freshRun = await ws.readRun("M04", added[0]!);
+						if (freshRun.status !== "completed") return { progress, advanced: true };
+						if (!freshRun.inputs.some(row => row.path === cp.feedbackPath) ||
+							!freshRun.inputs.some(row => row.path === cp.manifestPath))
+							throw new HarnessError("local.mission.m04", "M04 checkpoint input census is partial");
+						const freshSource = JSON.parse(await safeText(path.join(ws.runDir("M04", freshRun.runId),
+							"m07-source.json"))) as { m07RunId?: string; checkpointId?: string;
+							feedbackBundlePath?: string; goalSnapshotPath?: string; manifestPath?: string };
+						if (freshSource.m07RunId !== pending.runId ||
+							freshSource.checkpointId !== pending.checkpointId ||
+							freshSource.feedbackBundlePath !== cp.feedbackPath ||
+							freshSource.goalSnapshotPath !== cp.goalSnapshotPath ||
+							freshSource.manifestPath !== cp.manifestPath)
+							throw new HarnessError("local.mission.m04", "M04 source differs from the pending checkpoint");
+						matches.push(freshRun.runId);
+						latestRun = freshRun;
+					}
+					const selectionRun = { runId: pending.runId, outcome: "fulfilled",
+						acceptedTaskIds: [pending.taskId], selectedTaskId: pending.taskId,
+						checkpointId: pending.checkpointId, m04RunId: latestRun.runId,
+						evaluatorReceiptPath: receiptFile,
+						requiredM07ReadPaths: pending.requiredM07ReadPaths };
+					await verifyPendingReadBytes();
+					await verifyDefaultM04Evidence(ctx, selectionRun, cpRoot);
+					const eligible = !goal.exploratory && Boolean(goal.formalBaseline) &&
+						task.review.checks.every(row => row.result === "passed") &&
+						!missingCandidateSelectionProof(evaluator.receipt).length;
+					const gap = !eligible && !goal.exploratory && goal.formalBaseline &&
+						missingCandidateSelectionProof(evaluator.receipt).length ?
+						await computeMissingSelectionProof({ ctx, controller,
+							contract: progress.contract, run: selectionRun }) : undefined;
+					const recovered = status.checkpointReceipts.find(row =>
+						row.evaluatorRecoveryReview?.m07.runId === pending.runId &&
+						row.evaluatorRecoveryReview.m07.taskId === pending.taskId);
+					if (recovered?.evaluatorRecoveryReview) {
+						const review = recovered.evaluatorRecoveryReview;
+						const m04Dir = ws.runDir("M04", latestRun.runId);
+						const transition = { version: 1, kind: "local-evaluator-m04-transition",
+							intentId: review.intentId, m07RunId: pending.runId, taskId: pending.taskId,
+							checkpointId: pending.checkpointId, m04RunId: latestRun.runId,
+							goalBeforeSha256: review.m07.goalSha256,
+							m04RunSha256: sha256(await readFile(path.join(m04Dir, "run.json"))),
+							m04SourceSha256: sha256(await readFile(path.join(m04Dir, "m07-source.json"))),
+							m04TransactionSha256: sha256(await readFile(path.join(m04Dir, "m04-transaction.json"))),
+							m04CoverageSha256: sha256(await readFile(path.join(m04Dir, "m07-coverage.json"))) };
+						await ensureFrozen(path.join(root, "evidence",
+							`evaluator-m04-transition-${review.intentId}.json`),
+							`${JSON.stringify(transition)}\n`);
+					}
+					if (goal.lifecycle === "active") {
+						if (eligible && goal.m04BaselineRunId !== latestRun.runId)
+							await controller.plan(pending.runId, goal.plan, { refreshBaseline: true,
+								checkpointId: pending.checkpointId, m04RunId: latestRun.runId });
+						await controller.finish(pending.runId, { outcome: eligible ? "fulfilled" : "partial",
+							returnPath: "M04", summary: eligible ?
+								"Accepted task received full M04 review; mission selection remains a separate host decision." :
+								"Accepted task remains unselected after M04 review.",
+							goalChecks: task.review.checks.map(row => ({ ...row })) });
+					}
+					const review = eligible ? await recordDefaultSelectionReview({ ctx, controller,
+						contract: progress.contract, run: selectionRun, root }) : undefined;
+					const nextBounded = [...progress.boundedRuns];
+					nextBounded[nextBounded.length - 1] = { ...nextBounded.at(-1)!,
+						outcome: eligible ? "fulfilled" : "partial",
+						...(matches.length > 1 ? { failedM04RunIds: matches.slice(0, -1) } : {}),
+						...(review ? { selectedTaskId: pending.taskId } : {}),
+						...(gap ? { selectionProofGap: gap } : {}) };
+					const next = objectiveProgress(progress.contract, { boundedRuns: nextBounded,
+						selectedArtifacts: review ? review.selectedArtifacts.map(row => row.name) :
+							progress.selectedArtifacts,
+						availableArtifacts: review ? [...new Set([...progress.availableArtifacts,
+							...review.selectedArtifacts.map(row => row.name)])] : progress.availableArtifacts,
+						assessment: progress.assessment, assessmentHistory: progress.assessmentHistory,
+						stopReason: "objective-reassessment-pending", nextTaskDispatched: true,
+						pendingActionFacts: {} });
+					await this.recordCheckpoint(next);
+					return { progress: next, advanced: true };
+				} finally {
+					try { if (claim) await LocalMissionHost.releasePendingM04Review(root, claim); }
+					finally { activePendingM04Reviews.delete(root); }
+				}
+			},
 			async recoverInterruptedEvaluator({ ctx, controller, contract, progress }) {
 				// A prior V4 writer can die after atomic publication but before lock
 				// cleanup. The committed review itself supplies the only lock key.
@@ -693,7 +1003,8 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 					status.checkpointReceipts.some(item => item.evaluatorRecoveryReview?.intentId === intentId ||
 						item.interruptedReview?.intentId === intentId ||
 						item.legacyInterruptedReview?.intentId === intentId ||
-						item.coldMigrationReview?.intentId === intentId)) return undefined;
+						item.coldMigrationReview?.intentId === intentId ||
+						item.failedM04Review?.intentId === intentId)) return undefined;
 				const currentProcess = await readCurrentProcessIdentity();
 				const oldProcess = oldCheckpoint.source.process;
 				const death = await probeProcessIdentity(oldProcess);
@@ -708,7 +1019,8 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 				const reviews = new Set(status.checkpointReceipts.flatMap(item =>
 					[item.interruptedReview?.intentId, item.legacyInterruptedReview?.intentId,
 						item.evaluatorRecoveryReview?.intentId,
-						item.coldMigrationReview?.intentId].filter((id): id is string => !!id)));
+						item.coldMigrationReview?.intentId,
+						item.failedM04Review?.intentId].filter((id): id is string => !!id)));
 				for (const id of missionRuns) {
 					if (id === intentId || reviews.has(id)) continue;
 					const candidate = await ws.readRun("MISSION", id);
@@ -1003,14 +1315,21 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 								"m07-coverage.json")),
 							requiredM07ReadPaths: result.requiredM07ReadPaths ?? [] } } : {}),
 						boundary: "fresh-work-only-no-builder-or-evaluator-replay" };
+					const historicalGoal = await safeText(path.join(m07Root, "goal.json"));
+					if (sha256(Buffer.from(historicalGoal)) !== review.m07.goalSha256)
+						throw new HarnessError("local.mission.recovery", "recovered goal changed before historical freeze");
+					await ensureFrozen(path.join(root, "evidence",
+						`evaluator-recovery-goal-${intentId}.json`), historicalGoal);
 					const successor = objectiveProgress(contract, {
 						boundedRuns: [...progress.boundedRuns, { runId, outcome: "partial",
 							acceptedTaskIds: accepted ? [lineage.taskId] : [] }],
 						selectedArtifacts: progress.selectedArtifacts,
 						availableArtifacts: progress.availableArtifacts,
 						assessment: progress.assessment, assessmentHistory: progress.assessmentHistory,
-						stopReason: "objective-reassessment-pending", nextTaskDispatched: true,
-						pendingActionFacts: {} });
+							stopReason: result.pendingM04Review ? "m04-review-pending" :
+								"objective-reassessment-pending", nextTaskDispatched: true,
+							...(result.pendingM04Review ? { pendingM04Review: result.pendingM04Review } : {}),
+							pendingActionFacts: {} });
 					await LocalMissionHost.commitReviewedSuccessor({ root, missionId,
 						bytes: checkpointBytes(successor), review, claim: claim.claim,
 						verifyEvidence: async () => {
@@ -1018,6 +1337,9 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 							if (rechecked.sha256 !== link.sha256)
 								throw new Error("dispatch link changed before reviewed successor commit");
 						} });
+					// Recovery committed a successor attempt. Any cached writer still
+					// belongs to the predecessor and cannot record the M04 result.
+					active = undefined;
 					return successor;
 				} finally { activeRecoveryClaims.delete(root); }
 			},
@@ -1122,6 +1444,41 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 					sequence: (latest?.sequence ?? 0) + 1,
 					previousSha256: latest?.sha256 ?? null, bytes: checkpointBytes(progress) });
 			},
+			async releaseCleanStart() {
+				if (!input.startOnly) return;
+				const host = await writable();
+				await host.releaseCleanStart();
+				releasedStarts.add(missionId);
+			},
+			async releaseCleanReturn(progress: ObjectiveProgressV1) {
+				if (!input.releaseOnReturn) return;
+				// A held operation or pending review is still owned by this attempt.
+				// Return its recorded control status to the CLI without publishing a
+				// transport final; a later owner must use the existing recovery path.
+				if (progress.continuation.requiresOperationReconciliation || progress.pendingM04Review)
+					return;
+				const host = await writable();
+				const released = await host.releaseCleanReturn({ bytes: checkpointBytes(progress),
+					verifyQuiescent: async () => {
+						if (progress.pendingM04Review) return false;
+						if ((await unrepresentedM07(progress)).length) return false;
+						for (const name of [".merge.lock", ".merge.recovery.lock"]) {
+							try { await lstat(path.join(ws.knowledgeDir, name)); return false; }
+							catch (error) {
+								if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+							}
+						}
+						const missionRuns = await Promise.all((await ws.listRuns("MISSION"))
+							.map(runId => ws.readRun("MISSION", runId)));
+						const latestOwn = missionRuns.filter(run => run.inputs.some(item => item.path === contractFile))
+							.sort((left, right) => (right.startSequence ?? 0) - (left.startSequence ?? 0))[0];
+						if (latestOwn?.status === "running") return false;
+						return true;
+					} });
+				if (!released) throw new HarnessError("local.mission.release-held",
+					"normal mission return was not quiescent; attempt ownership remains held");
+				releasedReturns.add(missionId);
+			},
 			async freeze({ contract, progress, iteration }: { contract: OriginalObjectiveContractV1;
 				progress: ObjectiveProgressV1; iteration: number }): Promise<LocalObjectiveFrozenEvidence> {
 				const stored = await LocalMissionHost.readInitialContract(root);
@@ -1193,11 +1550,15 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 					"goal.json"))) as CurrentGoal;
 				if (goal.tasks.some(task => task.status === "rejected" || task.status === "failed")) {
 					const names = boundedRunEvidence[bounded.runId];
-					if (!names?.length || names.some(name => !name.startsWith(
+					if (!names?.length || names.filter(name => !name.includes("-m04-failure-"))
+						.some(name => !name.startsWith(
 						`prior-run-${progress.boundedRuns.length}-feedback-`)))
 						throw new Error("rejected or failed M07 task has no complete feedback for the next assessor");
 					for (const name of names) repairFeedbackNames.add(name);
 				}
+				if (bounded.failedM04RunId || bounded.failedM04RunIds?.length)
+					for (const name of boundedRunEvidence[bounded.runId] ?? [])
+						if (name.includes("-m04-failure-")) repairFeedbackNames.add(name);
 			}
 			const additional = await publishedAndProofEvidence(progress);
 			const { committedKnowledge, selectionProofGapNames } = additional;
@@ -1218,7 +1579,8 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 					.flatMap(item => item.interruptedReview ? [item.interruptedReview.intentId] :
 						item.legacyInterruptedReview ? [item.legacyInterruptedReview.intentId] :
 						item.evaluatorRecoveryReview ? [item.evaluatorRecoveryReview.intentId] :
-						item.coldMigrationReview ? [item.coldMigrationReview.intentId] : []));
+						item.coldMigrationReview ? [item.coldMigrationReview.intentId] :
+						item.failedM04Review ? [item.failedM04Review.intentId] : []));
 				for (const runId of await ws.listRuns("MISSION")) {
 					const run = await ws.readRun("MISSION", runId);
 					if (run.status === "running" && !reviewedMissionIntents.has(runId) &&
@@ -1302,7 +1664,7 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 						(item.name === committedKnowledge?.indexName ? "host-control" :
 						committedKnowledge?.partNames.includes(item.name) ? "unselected-evidence" :
 						(item.name.startsWith("selection-proof-gap-") ? "host-control" : item.name.startsWith("prior-run-") ?
-						item.name.includes("-control-") ? "host-control" : "unselected-evidence" :
+						item.name.includes("-control-") || item.name.includes("-m04-failure-") ? "host-control" : "unselected-evidence" :
 						"supplied-task"))])) as
 					NonNullable<LocalObjectiveFrozenEvidence["groundingPolicy"]>["sourceKinds"];
 				const unknown = [...new Set([...status.unresolvedOperationIds,

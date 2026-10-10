@@ -2,10 +2,11 @@
  * review of retained control evidence, not a resumption of any old session. */
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open } from "node:fs/promises";
+import { lstat, open, readdir } from "node:fs/promises";
 import path from "node:path";
 import { LocalMissionHost, validColdMigrationObservation, type LocalInterruptedReviewV1,
 	type LocalLegacyInterruptedReviewV1, type LocalColdMigrationReviewV1,
+	type LocalFailedM04ReviewV1,
 	type ColdMigrationObservationV1 } from "../runner/local-mission-host.ts";
 import { readCurrentProcessIdentity, probeProcessIdentity,
 	type ProcessIdentityV1, type ProcessProbe } from "../runtime/process-identity.ts";
@@ -17,6 +18,9 @@ import { assessorTaskHash, goalLineageFile, localLineageHash,
 import { fullLocalMissionCensus, LEGACY_SERIAL_AUDIT_SHA256, LEGACY_SERIAL_COMMIT,
 	LEGACY_SERIAL_TREE, verifyLegacyEffectReview } from "./local-legacy-review.ts";
 import { objectiveProgress, type ObjectiveProgressV1 } from "./objective-progress.ts";
+import { readLocalEvaluatorReceipt, verifyLocalEvaluatorReceipt } from "./local-evaluator-run.ts";
+import { hashStableHistoricalFile, verifyFailedM04EffectReview,
+	type FailedM04EffectReviewV1 } from "./local-failed-m04-effects.ts";
 
 const hash = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");
 const id = (value: unknown): value is string => typeof value === "string" &&
@@ -77,6 +81,11 @@ export interface LegacyInterruptedLocalReviewRequestV1 extends Omit<InterruptedL
 	kind: "review-legacy-interrupted-local-dispatch";
 	legacyEffectReviewFile: string; legacyEffectReviewSha256: string;
 }
+export interface FailedM04LocalReviewRequestV1 extends Omit<InterruptedLocalReviewRequestV1,
+	"kind" | "providerProofFile" | "providerProofSha256"> {
+	kind: "review-failed-m04-local-dispatch";
+	effectReviewFile: string; effectReviewSha256: string;
+}
 export interface ColdMigrationLocalReviewRequestV1 extends Omit<LegacyInterruptedLocalReviewRequestV1, "kind"> {
 	kind: "review-cold-migrated-local-dispatch";
 	observationFile: string; observationSha256: string;
@@ -92,35 +101,42 @@ interface ProviderProofV1 {
 }
 async function reconcileCore(input: {
 	workspaceRoot: string; request: InterruptedLocalReviewRequestV1 | LegacyInterruptedLocalReviewRequestV1 |
-		ColdMigrationLocalReviewRequestV1;
+		ColdMigrationLocalReviewRequestV1 | FailedM04LocalReviewRequestV1;
 	currentIdentity?: () => Promise<ProcessIdentityV1>;
 	probePrior?: (identity: ProcessIdentityV1) => Promise<ProcessProbe>;
 	probeProcessGroup?: (groupId: number) => Promise<boolean>;
 	verifyTrustedObservation?: (observation: ColdMigrationObservationV1) => Promise<void>;
+	verifyTrustedEffects?: (review: FailedM04EffectReviewV1) => Promise<void>;
 	dryRun?: boolean;
 	testCrashAt?: "after-prepare" | "after-rename";
 	testBeforeCommit?: () => Promise<void>;
 }): Promise<{ progress: ObjectiveProgressV1;
-	receipt: LocalInterruptedReviewV1 | LocalLegacyInterruptedReviewV1 | LocalColdMigrationReviewV1 }> {
+	receipt: LocalInterruptedReviewV1 | LocalLegacyInterruptedReviewV1 | LocalColdMigrationReviewV1 |
+		LocalFailedM04ReviewV1 }> {
 	const request = input.request;
 	const cold = request?.kind === "review-cold-migrated-local-dispatch";
 	const legacy = cold || request?.kind === "review-legacy-interrupted-local-dispatch";
+	const failedM04 = request?.kind === "review-failed-m04-local-dispatch";
 	if (!request || Object.keys(request).sort().join("|") !== ["version", "kind", "missionId",
 		"intentId", "oldAttemptId", "checkpointSequence", "checkpointSha256", "m07RunId",
-		"taskId", "operationId", "checkpointId", "m04RunId", "providerProofFile",
-		"providerProofSha256", ...(legacy ? ["legacyEffectReviewFile", "legacyEffectReviewSha256"] : []),
+		"taskId", "operationId", "checkpointId", "m04RunId",
+		...(failedM04 ? ["effectReviewFile", "effectReviewSha256"] :
+			["providerProofFile", "providerProofSha256"]),
+		...(legacy ? ["legacyEffectReviewFile", "legacyEffectReviewSha256"] : []),
 		...(cold ? ["observationFile", "observationSha256", "archiveFile", "archiveSha256"] : [])].sort().join("|") || request.version !== 1 ||
 		!(["review-interrupted-local-dispatch", "review-legacy-interrupted-local-dispatch",
-			"review-cold-migrated-local-dispatch"] as unknown[]).includes(request.kind) ||
+			"review-cold-migrated-local-dispatch", "review-failed-m04-local-dispatch"] as unknown[]).includes(request.kind) ||
 		![request.missionId, request.intentId, request.oldAttemptId, request.m07RunId,
 			request.taskId, request.operationId, request.checkpointId, request.m04RunId].every(id) ||
 		!Number.isSafeInteger(request.checkpointSequence) || request.checkpointSequence < 1 ||
-		![request.checkpointSha256, request.providerProofSha256,
+		![request.checkpointSha256, failedM04 ? request.effectReviewSha256 : request.providerProofSha256,
 			...(legacy ? [(request as LegacyInterruptedLocalReviewRequestV1).legacyEffectReviewSha256] : []),
 			...(cold ? [(request as ColdMigrationLocalReviewRequestV1).observationSha256,
 				(request as ColdMigrationLocalReviewRequestV1).archiveSha256] : [])].every(x =>
 			typeof x === "string" && /^[0-9a-f]{64}$/.test(x)) ||
-		!path.isAbsolute(request.providerProofFile) ||
+		!(failedM04 ? path.isAbsolute(request.effectReviewFile) :
+			path.isAbsolute(request.providerProofFile)) ||
+		(failedM04 && typeof input.verifyTrustedEffects !== "function") ||
 		(legacy && !path.isAbsolute((request as LegacyInterruptedLocalReviewRequestV1).legacyEffectReviewFile)) ||
 		(cold && (!path.isAbsolute((request as ColdMigrationLocalReviewRequestV1).observationFile) ||
 			!path.isAbsolute((request as ColdMigrationLocalReviewRequestV1).archiveFile) ||
@@ -138,9 +154,11 @@ async function reconcileCore(input: {
 	const committed = status.checkpointReceipts.find(row =>
 		(row.interruptedReview?.intentId === request.intentId ||
 			row.legacyInterruptedReview?.intentId === request.intentId ||
-			row.coldMigrationReview?.intentId === request.intentId));
+			row.coldMigrationReview?.intentId === request.intentId ||
+			row.failedM04Review?.intentId === request.intentId));
 	if (committed) {
-		const review = committed.interruptedReview ?? committed.legacyInterruptedReview ?? committed.coldMigrationReview!;
+		const review = committed.interruptedReview ?? committed.legacyInterruptedReview ??
+			committed.coldMigrationReview ?? committed.failedM04Review!;
 		if (review.oldCheckpoint.sequence !== request.checkpointSequence ||
 			review.oldCheckpoint.sha256 !== request.checkpointSha256 ||
 			review.missionId !== request.missionId ||
@@ -150,7 +168,10 @@ async function reconcileCore(input: {
 			review.m07.checkpointId !== request.checkpointId ||
 			review.m04.runId !== request.m04RunId ||
 			(review.kind === "local-cold-migration-host-review") !== cold ||
-			(review.kind === "local-legacy-interruption-host-review") !== (legacy && !cold))
+			(review.kind === "local-legacy-interruption-host-review") !== (legacy && !cold) ||
+			(review.kind === "local-failed-m04-interruption-host-review") !== failedM04 ||
+			failedM04 && (review as LocalFailedM04ReviewV1).effectReviewFileSha256 !==
+				(request as FailedM04LocalReviewRequestV1).effectReviewSha256)
 			fail("committed review does not match this exact retry");
 		return { progress: JSON.parse((await LocalMissionHost.readCommittedCheckpoint(root,
 			committed.sequence)).toString("utf8")) as ObjectiveProgressV1, receipt: review };
@@ -205,6 +226,43 @@ async function reconcileCore(input: {
 		JSON.stringify(progress.continuation.unresolvedOperationIds) !== JSON.stringify([request.intentId]) ||
 		progress.boundedRuns.some(row => row.runId === request.m07RunId))
 		fail("checkpoint has no unique mission-level interrupted dispatch intent");
+	const priorReviewed: Array<{ intentId: string; m07RunId: string }> = [];
+	for (const row of status.checkpointReceipts) {
+		if (row.sequence >= checkpoint.sequence) continue;
+		const review = row.failedM04Review ?? row.interruptedReview ??
+			row.evaluatorRecoveryReview ?? row.legacyInterruptedReview ?? row.coldMigrationReview;
+		if (!review || review.missionId !== request.missionId ||
+			!progress.boundedRuns.some(bounded => bounded.runId === review.m07.runId)) continue;
+		const priorM07Dir = ws.runDir("M07", review.m07.runId);
+		if ("lineageSha256" in review) {
+			const priorLink = await readLocalDispatchLineage({ missionRoot: root,
+				m07Dir: priorM07Dir, intentId: review.intentId }).catch(() =>
+				fail("prior reviewed running stage lacks its committed dispatch edge"));
+			if (priorLink.sha256 !== review.lineageSha256 ||
+				priorLink.lineage.missionId !== request.missionId ||
+				priorLink.lineage.intentId !== review.intentId ||
+				priorLink.lineage.m07RunId !== review.m07.runId)
+				fail("prior reviewed running stage differs from its exact dispatch edge");
+		} else if (review.kind !== "local-legacy-interruption-host-review" &&
+			review.kind !== "local-cold-migration-host-review")
+			fail("prior reviewed running stage has no supported historical proof");
+		if (review.kind === "local-interrupted-dispatch-review") {
+			const priorM04Dir = ws.runDir("M04", review.m04.runId);
+			const priorCp = path.join(priorM07Dir, "checkpoints", review.m07.checkpointId);
+			for (const [file, expected] of [
+				[path.join(ws.runDir("MISSION", review.intentId), "run.json"), review.missionRunSha256],
+				[path.join(priorM07Dir, "goal.json"), review.m07.goalSha256],
+				[path.join(priorCp, "goal.json"), review.m07.snapshotSha256],
+				[path.join(priorCp, "manifest.json"), review.m07.manifestSha256],
+				[path.join(priorCp, "m04-feedback.md"), review.m07.feedbackSha256],
+				[path.join(priorM04Dir, "run.json"), review.m04.runSha256],
+				[path.join(priorM04Dir, "m07-source.json"), review.m04.sourceSha256],
+				[path.join(priorM04Dir, "m04-transaction.json"), review.m04.transactionSha256]
+			] as Array<[string, string]>) if (hash(await bytes(file)) !== expected)
+				fail("prior V2 running stage differs from its committed host receipt");
+		}
+		priorReviewed.push({ intentId: review.intentId, m07RunId: review.m07.runId });
+	}
 	const missionFile = await json<Awaited<ReturnType<typeof ws.readRun>>>(
 		path.join(ws.runDir("MISSION", request.intentId), "run.json"));
 	const mission = missionFile.value;
@@ -225,7 +283,8 @@ async function reconcileCore(input: {
 			!status.checkpointReceipts.some(row => row.interruptedReview?.intentId === runId ||
 				row.legacyInterruptedReview?.intentId === runId ||
 				row.evaluatorRecoveryReview?.intentId === runId ||
-				row.coldMigrationReview?.intentId === runId))
+				row.coldMigrationReview?.intentId === runId ||
+				row.failedM04Review?.intentId === runId))
 			unclosedMissionRuns.push(runId);
 	}
 	if (JSON.stringify(unclosedMissionRuns) !== JSON.stringify([request.intentId]))
@@ -318,7 +377,8 @@ async function reconcileCore(input: {
 	const m04Source = await json<{ m07RunId: string; checkpointId: string;
 		feedbackBundlePath: string; goalSnapshotPath: string; manifestPath: string }>(path.join(m04Dir, "m07-source.json"));
 	const tx = await json<{ version: number; kind: string; m04RunId: string;
-		state: string; attempts: unknown[]; currentProposalId?: string; snapshotId?: string }>(path.join(m04Dir, "m04-transaction.json"));
+		state: string; attempts: unknown[]; currentProposalId?: string;
+		snapshotId?: string; updatedAt?: string }>(path.join(m04Dir, "m04-transaction.json"));
 	if (m04.stage !== "M04" || m04.runId !== request.m04RunId || m04.status !== "failed" ||
 		!m04.inputs.some(row => row.path === selected.feedbackPath) ||
 		!m04.inputs.some(row => row.path === selected.manifestPath) ||
@@ -332,8 +392,31 @@ async function reconcileCore(input: {
 		!Array.isArray(tx.value.attempts) || tx.value.attempts.length !== 0 ||
 		tx.value.currentProposalId !== undefined || tx.value.snapshotId !== undefined)
 		fail("M04 failure, handoff, or no-proposal transaction is not settled");
-	const proof = await json<ProviderProofV1>(request.providerProofFile);
-	if (proof.sha256 !== request.providerProofSha256 || Object.keys(proof.value).sort().join("|") !==
+	const verifyNoKnowledgeWrite = async (): Promise<void> => {
+		const transactionFile = path.join(m04Dir, "m04-transaction.json");
+		if (!m04.finishedAt || !Number.isFinite(Date.parse(m04.finishedAt)) ||
+			m04.outputs.filter(row => row.label === "M04 知识事务状态" &&
+				row.path === transactionFile).length !== 1 ||
+			m04.outputs.some(row => ["知识提案", "合入结果"].includes(row.label)) ||
+			!tx.value.updatedAt || !Number.isFinite(Date.parse(tx.value.updatedAt)))
+			fail("failed M04 lacks an exact terminal no-proposal transaction binding");
+		for (const file of [path.join(m04Dir, "proposal.json"), path.join(m04Dir, "merge.json"),
+			path.join(ws.knowledgeDir, ".merge.lock"),
+			path.join(ws.knowledgeDir, ".merge.recovery.lock")]) {
+			try { await lstat(file); fail("failed M04 has proposal or pending knowledge merge"); }
+			catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+		}
+		for (const name of await readdir(path.join(ws.knowledgeDir, "proposals"))) {
+			if (!/^P\d{4,}\.json$/.test(name)) continue;
+			const draft = (await json<{ stage?: string; runId?: string }>(path.join(
+				ws.knowledgeDir, "proposals", name))).value;
+			if (draft.stage === "M04" && draft.runId === m04.runId)
+				fail("failed M04 has an unaccounted knowledge proposal");
+		}
+	};
+	if (failedM04) await verifyNoKnowledgeWrite();
+	const proof = failedM04 ? undefined : await json<ProviderProofV1>(request.providerProofFile);
+	if (proof && (proof.sha256 !== (request as InterruptedLocalReviewRequestV1).providerProofSha256 || Object.keys(proof.value).sort().join("|") !==
 		["version", "kind", "m04RunId", "sessionId", "error", "lastRequestNotSent",
 			"earlierResponsesSettled", "accounting"].sort().join("|") ||
 		proof.value.version !== 1 || proof.value.kind !== "m04-sdk-output-max-before-http-review" ||
@@ -342,7 +425,7 @@ async function reconcileCore(input: {
 		proof.value.error !== "SDK DeepSeek request lowered or lost the resolved provider output maximum" ||
 		!m04.failures.some(row => row.includes(proof.value.error)) ||
 		proof.value.lastRequestNotSent !== true || proof.value.earlierResponsesSettled !== true ||
-		proof.value.accounting !== "preserve-observed-usage")
+		proof.value.accounting !== "preserve-observed-usage"))
 		fail("the last provider request has no bound before-HTTP proof");
 	// No M04 peer may have merged or kept an unsettled transaction for this checkpoint.
 	for (const runId of await ws.listRuns("M04")) {
@@ -361,7 +444,13 @@ async function reconcileCore(input: {
 			coldObservation!.effectCensus.processGroupId !== null)
 			fail("cross-host child-process settlement lacks an original-host reviewed census");
 	}
-	const m04Session = legacy ? m04.sessions.find(row => row.id === proof.value.sessionId) : undefined;
+	const m04Session = legacy ? m04.sessions.find(row => row.id === proof!.value.sessionId) : undefined;
+	const m04Sessions = failedM04 ? m04.sessions.map(row => ({ id: row.id, file: row.file })) : [];
+	if (failedM04 && (!m04Sessions.length ||
+		new Set(m04Sessions.map(row => row.id)).size !== m04Sessions.length ||
+		m04Sessions.some(row => !id(row.id) || !row.file || !path.isAbsolute(row.file) ||
+			!row.file.startsWith(`${m04Dir}${path.sep}`))))
+		fail("failed M04 session set is missing, ambiguous, or outside the historical run");
 	if (legacy && (m04.sessions.length !== 1 || !m04Session?.file ||
 		!path.isAbsolute(m04Session.file)))
 		fail("legacy M04 response transcript is incomplete");
@@ -370,6 +459,32 @@ async function reconcileCore(input: {
 		sha256: legacyRequest.legacyEffectReviewSha256, intentId: request.intentId, goal, task,
 		m04SessionFile: m04Session!.file!, probeProcessGroup: cold ? async () => false :
 			input.probeProcessGroup }) : undefined;
+	const evaluatorFile = task.workDir ? path.join(task.workDir, "local-evaluator-receipt.json") : "";
+	const evaluator = failedM04 ? await readLocalEvaluatorReceipt(evaluatorFile) : undefined;
+	if (failedM04) {
+		if (!task.workDir || !task.workDir.startsWith(`${path.join(m07Dir, "tasks", task.taskId)}${path.sep}`) ||
+			!task.review || !evaluator || task.review.checks?.length !== task.checks.length ||
+			task.checks.some((criterion, index) => {
+				const obligation = progress.contract.obligations.find(row => row.description === criterion);
+				const formal = evaluator!.receipt.checks.find(row => row.obligationId === obligation?.id);
+				const shown = task.review!.checks[index];
+				return !formal || !shown || shown.criterion !== criterion ||
+					shown.result !== (formal.result === "unknown" ? "not_run" : formal.result);
+			}))
+			fail("formal evaluator receipt is absent or differs from the rejected task review");
+		await verifyLocalEvaluatorReceipt(evaluator!.receipt, progress.contract, goal, task);
+	}
+	const effectsRequest = failedM04 ? request as FailedM04LocalReviewRequestV1 : undefined;
+	const effects = effectsRequest ? await verifyFailedM04EffectReview({ ws,
+		file: effectsRequest.effectReviewFile, sha256: effectsRequest.effectReviewSha256,
+		missionId: request.missionId, intentId: request.intentId,
+		oldCheckpointSha256: request.checkpointSha256, goal, task,
+		operationId: operation.id, checkpointId: selected.id, m04RunId: m04.runId,
+		m04Sessions: m04Sessions as Array<{ id: string; file: string }>,
+		m04TransactionSha256: tx.sha256,
+		priorReviewed,
+		evaluatorReceiptSha256: evaluator!.sha256,
+		verifyTrustedEffects: input.verifyTrustedEffects! }) : undefined;
 	if (cold && legacyEffects?.censusSha256 !== coldObservation!.effectCensus.workspaceCensusSha256)
 		fail("original-host effect census differs from the retained workspace census");
 	const nextId = `A${String(Number(status.currentAttempt!.attemptId.slice(1)) + 1).padStart(3, "0")}`;
@@ -385,13 +500,13 @@ async function reconcileCore(input: {
 			snapshotSha256: snapFile.sha256,
 			manifestSha256: manifestFile.sha256, feedbackSha256: hash(feedback),
 			result: "rejected-with-complete-feedback" as const, effect: "response-received" as const },
-		m04: { runId: m04.runId, sourceSha256: m04Source.sha256,
-			transactionSha256: tx.sha256, runSha256: m04RunFile.sha256,
-			result: "failed-no-proposal" as const, lastRequest: "sdk-output-max-guard-before-http" as const,
-			providerProofSha256: proof.sha256 },
 		boundary: "new-work-only-no-old-task-or-session-replay" as const };
+	const oldM04Review = { runId: m04.runId, sourceSha256: m04Source.sha256,
+		transactionSha256: tx.sha256, runSha256: m04RunFile.sha256,
+		result: "failed-no-proposal" as const, lastRequest: "sdk-output-max-guard-before-http" as const,
+		providerProofSha256: proof?.sha256 ?? "" };
 	const legacyReview: LocalLegacyInterruptedReviewV1 | undefined = legacyEffects ? {
-		...commonReview, kind: "local-legacy-interruption-host-review" as const,
+		...commonReview, m04: oldM04Review, kind: "local-legacy-interruption-host-review" as const,
 		historicalExplicitDispatchBinding: false, actualArgvRecorded: false,
 		association: "host-reviewed-inferred", effects: "observed-settled-within-trusted-host-scope",
 		authority: "fresh-follow-up-only",
@@ -415,11 +530,21 @@ async function reconcileCore(input: {
 			failedToolOrdinals: legacyEffects.failedToolOrdinals,
 			numericExitUnknownOrdinals: legacyEffects.numericExitUnknownOrdinals,
 			trustLimit: "same-uid-reviewed-observations-no-os-noninterference-proof" as const } } : undefined;
-	const review: LocalInterruptedReviewV1 | LocalLegacyInterruptedReviewV1 | LocalColdMigrationReviewV1 =
+	const review: LocalInterruptedReviewV1 | LocalLegacyInterruptedReviewV1 | LocalColdMigrationReviewV1 |
+		LocalFailedM04ReviewV1 = failedM04 ? {
+		...commonReview, kind: "local-failed-m04-interruption-host-review",
+		lineageSha256: linked!.sha256,
+		evaluatorReceiptSha256: evaluator!.sha256,
+		effectReview: effects!.review, effectReviewSha256: hash(Buffer.from(JSON.stringify(effects!.review))),
+		effectReviewFileSha256: effects!.sha256,
+		m04: { runId: m04.runId, sourceSha256: m04Source.sha256,
+			transactionSha256: tx.sha256, runSha256: m04RunFile.sha256,
+			sessions: effects!.review.m04Sessions, result: "failed-no-proposal" }
+	} :
 		cold ? { ...legacyReview!, kind: "local-cold-migration-host-review",
 			coldMigration: { observation: coldObservation!,
 				observationSha256: (request as ColdMigrationLocalReviewRequestV1).observationSha256 } } :
-		legacyReview ?? { ...commonReview, kind: "local-interrupted-dispatch-review",
+		legacyReview ?? { ...commonReview, m04: oldM04Review, kind: "local-interrupted-dispatch-review",
 			lineageSha256: linked!.sha256 };
 	const next = objectiveProgress(progress.contract, {
 		boundedRuns: [...progress.boundedRuns, { runId: goal.runId, outcome: "partial", acceptedTaskIds: [] }],
@@ -441,10 +566,30 @@ async function reconcileCore(input: {
 				if (again.status !== "dead" || again.identityMatch)
 					fail("old process liveness changed before checkpoint commit");
 			}
-			if (review.kind === "local-interrupted-dispatch-review" &&
+			if ((review.kind === "local-interrupted-dispatch-review" ||
+				review.kind === "local-failed-m04-interruption-host-review") &&
 				(await readLocalDispatchLineage({ missionRoot: root, m07Dir,
 					intentId: request.intentId })).sha256 !== review.lineageSha256)
 				fail("dispatch lineage changed before checkpoint commit");
+			if (failedM04) {
+				await verifyNoKnowledgeWrite();
+				const checked = await readLocalEvaluatorReceipt(evaluatorFile);
+				if (checked.sha256 !== evaluator!.sha256)
+					fail("formal evaluator receipt changed before checkpoint commit");
+				await verifyLocalEvaluatorReceipt(checked.receipt, progress.contract, goal, task);
+				const repeated = await verifyFailedM04EffectReview({ ws,
+					file: effectsRequest!.effectReviewFile, sha256: effectsRequest!.effectReviewSha256,
+					missionId: request.missionId, intentId: request.intentId,
+					oldCheckpointSha256: request.checkpointSha256, goal, task,
+					operationId: operation.id, checkpointId: selected.id, m04RunId: m04.runId,
+					m04Sessions: m04Sessions as Array<{ id: string; file: string }>,
+					m04TransactionSha256: tx.sha256,
+					priorReviewed,
+					evaluatorReceiptSha256: checked.sha256,
+					verifyTrustedEffects: input.verifyTrustedEffects! });
+				if (repeated.sha256 !== effects!.sha256)
+					fail("failed M04 effect review changed before checkpoint commit");
+			}
 			if (review.kind === "local-legacy-interruption-host-review" ||
 				review.kind === "local-cold-migration-host-review") {
 				for (const file of [missionLineageFile(root, request.intentId),
@@ -471,19 +616,30 @@ async function reconcileCore(input: {
 				[path.join(m04Dir, "m07-source.json"), review.m04.sourceSha256],
 				[path.join(m04Dir, "m04-transaction.json"), review.m04.transactionSha256],
 				[path.join(m04Dir, "run.json"), review.m04.runSha256],
-				[request.providerProofFile, review.m04.providerProofSha256],
+				...(failedM04 ? [
+					[evaluatorFile, evaluator!.sha256],
+					...m04Sessions.map((row, index) => [row.file!,
+						effects!.review.m04Sessions[index]!.fileSha256] as [string, string]),
+					[effectsRequest!.effectReviewFile, effects!.sha256]
+				] as Array<[string, string]> : [
+					[(request as InterruptedLocalReviewRequestV1).providerProofFile,
+						(request as InterruptedLocalReviewRequestV1).providerProofSha256]
+				] as Array<[string, string]>),
 				...(cold ? [
 					[(request as ColdMigrationLocalReviewRequestV1).observationFile,
 						(request as ColdMigrationLocalReviewRequestV1).observationSha256],
 					[(request as ColdMigrationLocalReviewRequestV1).archiveFile,
 						(request as ColdMigrationLocalReviewRequestV1).archiveSha256]
 				] as Array<[string, string]> : []),
-				...(review.kind === "local-interrupted-dispatch-review" ? [
+				...(review.kind === "local-interrupted-dispatch-review" ||
+					review.kind === "local-failed-m04-interruption-host-review" ? [
 					[missionLineageFile(root, request.intentId), review.lineageSha256],
 					[goalLineageFile(m07Dir), review.lineageSha256],
 				] as Array<[string, string]> : []),
 			];
 			for (const [file, expected] of pinned) if (
+				failedM04 && m04Sessions.some(row => row.file === file) ?
+					await hashStableHistoricalFile(file) !== expected :
 				cold && file === (request as ColdMigrationLocalReviewRequestV1).archiveFile ?
 					await hashStableArchive(file) !== expected : hash(await bytes(file)) !== expected)
 				fail("review evidence changed before checkpoint commit");
@@ -499,6 +655,20 @@ export async function reconcileInterruptedLocalMission(input: {
 	testBeforeCommit?: () => Promise<void>;
 }): Promise<{ progress: ObjectiveProgressV1; receipt: LocalInterruptedReviewV1 }> {
 	return await reconcileCore(input) as { progress: ObjectiveProgressV1; receipt: LocalInterruptedReviewV1 };
+}
+/** The trusted host supplies independent observations for this exact scope.
+ * A caller-controlled JSON declaration alone cannot authorize recovery. */
+export async function reconcileFailedM04LocalMission(input: {
+	workspaceRoot: string; request: FailedM04LocalReviewRequestV1;
+	verifyTrustedEffects: (review: FailedM04EffectReviewV1) => Promise<void>;
+	currentIdentity?: () => Promise<ProcessIdentityV1>;
+	probePrior?: (identity: ProcessIdentityV1) => Promise<ProcessProbe>;
+	dryRun?: boolean;
+	testCrashAt?: "after-prepare" | "after-rename";
+	testBeforeCommit?: () => Promise<void>;
+}): Promise<{ progress: ObjectiveProgressV1; receipt: LocalFailedM04ReviewV1 }> {
+	return await reconcileCore(input) as { progress: ObjectiveProgressV1;
+		receipt: LocalFailedM04ReviewV1 };
 }
 export async function reconcileLegacyInterruptedLocalMission(input: {
 	workspaceRoot: string; request: LegacyInterruptedLocalReviewRequestV1;

@@ -300,7 +300,12 @@ export async function recordDefaultSelectionReview(input: { ctx: StageContext;
 	const review = await compute(input.ctx, input.controller, input.contract, input.run);
 	if (!review) return undefined;
 	const file = path.join(input.root, "evidence", receiptName(review.runId));
-	await writeFile(file, `${JSON.stringify(review, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+	const serialized = `${JSON.stringify(review, null, 2)}\n`;
+	try { await writeFile(file, serialized, { flag: "wx", mode: 0o600 }); }
+	catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST" ||
+			!(await regular(file)).equals(Buffer.from(serialized))) throw error;
+	}
 	return review;
 }
 

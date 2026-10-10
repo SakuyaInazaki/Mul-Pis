@@ -9,6 +9,7 @@
  * through the single serial entry; merging is never a truth certificate.
  */
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { linkedEvidence, openBoundedSession } from "../context/boundary.ts";
 import type { ReadReturnEvent } from "../runner/types.ts";
@@ -44,6 +45,8 @@ export interface M04Options {
 	requiredM07ReadPaths?: string[];
 	/** Host-authored provenance instruction; it cannot authorize a historical proposal. */
 	additionalReadOnlyInstruction?: string;
+	/** Exact private host diagnostic for a distinct fresh review of the same checkpoint. */
+	priorFailureEvidence?: { path: string; sha256: string };
 	/** Private host receipt for evidence-triggered read-only judgment repair. */
 	onRepairState?: (state: WorkflowRepairStateV1) => Promise<void>;
 	/** Private, lossless validation diagnostic; awaited before any further judgment or proposal action. */
@@ -122,6 +125,7 @@ export async function requiredM07Reads(root: string, requested: string[] | undef
 
 interface M07ReadGap {
 	relative: string;
+	lineCount: number;
 	missingRanges: Array<{ start: number; end: number }>;
 	terminalPageMissing: boolean;
 	emptyFile?: true;
@@ -136,7 +140,7 @@ async function m07ReadGaps(root: string, required: string[], returned: ReadRetur
 				event.path === relative && event.status === "no-content" && event.returned.kind === "text" &&
 				event.returned.truncated === false && event.returned.startLine === undefined &&
 				event.returned.endLine === undefined);
-			if (!completeEmptyRead) gaps.push({ relative, missingRanges: [], terminalPageMissing: false, emptyFile: true });
+			if (!completeEmptyRead) gaps.push({ relative, lineCount: 0, missingRanges: [], terminalPageMissing: false, emptyFile: true });
 			continue;
 		}
 		const content = bytes.toString("utf8");
@@ -160,7 +164,7 @@ async function m07ReadGaps(root: string, required: string[], returned: ReadRetur
 			nextUnread = Math.max(nextUnread, range.end + 1);
 		}
 		if (nextUnread <= lineCount) missingRanges.push({ start: nextUnread, end: lineCount });
-		if (!completeTerminalPage || missingRanges.length) gaps.push({ relative, missingRanges,
+		if (!completeTerminalPage || missingRanges.length) gaps.push({ relative, lineCount, missingRanges,
 			terminalPageMissing: !completeTerminalPage });
 	}
 	return gaps;
@@ -379,20 +383,38 @@ async function resolveFeedback(ctx: StageContext, feedback: M04Feedback): Promis
 
 export async function runM04(ctx: StageContext, options: M04Options): Promise<M04Result> {
 	const feedback = await resolveFeedback(ctx, options.feedback);
+	let priorFailureBytes: Buffer | undefined;
+	if (options.priorFailureEvidence) {
+		const { path: file, sha256 } = options.priorFailureEvidence;
+		if (!feedback.m07 || !path.isAbsolute(file) ||
+			!/^[0-9a-f]{64}$/.test(sha256) ||
+			!file.startsWith(`${path.join(ctx.ws.agentDir, "missions")}${path.sep}`))
+			throw new HarnessError("m04.prior-failure", "prior M04 diagnostic is outside its host evidence scope");
+		const info = await lstat(file);
+		if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 ||
+			info.size < 1 || info.size > 64 * 1024)
+			throw new HarnessError("m04.prior-failure", "prior M04 diagnostic is not a bounded regular file");
+		priorFailureBytes = await readFile(file);
+		if (createHash("sha256").update(priorFailureBytes).digest("hex") !== sha256)
+			throw new HarnessError("m04.prior-failure", "prior M04 diagnostic digest changed");
+	}
 	if (options.requiredM07ReadPaths && !feedback.m07)
 		throw new HarnessError("m04.m07-evidence", "required M07 read paths need M07 feedback");
 	const requiredM07Paths = feedback.m07 ? await requiredM07Reads(feedback.m07.rootDir, options.requiredM07ReadPaths) : [];
 	const requiredM07Root = feedback.m07 && requiredM07Paths.length ? await realpath(feedback.m07.rootDir) : undefined;
-	const requiredM07Sizes = new Map(await Promise.all(requiredM07Paths.map(async relative =>
-		[relative, (await stat(path.join(requiredM07Root!, relative))).size] as const)));
+	const requiredM07Bytes = new Map(await Promise.all(requiredM07Paths.map(async relative =>
+		[relative, await readFile(path.join(requiredM07Root!, relative))] as const)));
 	const verifyRequiredM07Bindings = async (): Promise<void> => {
+		if (options.priorFailureEvidence &&
+			!(await readFile(options.priorFailureEvidence.path)).equals(priorFailureBytes!))
+			throw new HarnessError("m04.prior-failure", "prior M04 diagnostic changed during judgment");
 		if (!feedback.m07 || !requiredM07Paths.length) return;
 		await requiredM07Reads(feedback.m07.rootDir, requiredM07Paths);
 		if (await realpath(feedback.m07.rootDir) !== requiredM07Root)
 			throw new HarnessError("m04.m07-evidence", "required M07 evidence root changed during judgment");
 		for (const relative of requiredM07Paths)
-			if ((await stat(path.join(requiredM07Root!, relative))).size !== requiredM07Sizes.get(relative))
-				throw new HarnessError("m04.m07-evidence", "required M07 evidence size changed during judgment");
+			if (!(await readFile(path.join(requiredM07Root!, relative))).equals(requiredM07Bytes.get(relative)!))
+				throw new HarnessError("m04.m07-evidence", "required M07 evidence bytes changed during judgment");
 	};
 	let materials: ProblemMaterials;
 	let problemInputs: InputRef[];
@@ -419,7 +441,9 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 	const continueM01 = feedback.label.startsWith("M07 ") || feedback.m08 ? false : !options.freshSession && !previousM04 && !!m01Session?.file;
 	let mode: M04Result["mode"] = continueM01 ? "continue-m01" : "research-session";
 
-	const record = await ctx.ws.startRun("M04", [...problemInputs, ...feedback.inputs], snapshot?.id);
+	const record = await ctx.ws.startRun("M04", [...problemInputs, ...feedback.inputs,
+		...(options.priorFailureEvidence ? [{ label: "Prior M04 host diagnostic",
+			path: options.priorFailureEvidence.path }] : [])], snapshot?.id);
 	record.remarks.push(mode === "continue-m01" ? "首轮 M04：续接 M01 原会话。" : "新建研究会话，只读取当前知识包、意见与实际产物位置。");
 
 	return withRun(
@@ -429,13 +453,19 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			if (feedback.m07) await ctx.ws.writeOutput(record, "m07-source.json", JSON.stringify({ m07RunId: feedback.m07.runId, rootDir: feedback.m07.rootDir, feedbackBundlePath: feedback.inputs[0].path, ...(feedback.m07.checkpointId ? { checkpointId: feedback.m07.checkpointId, goalSnapshotPath: feedback.m07.goalSnapshotPath, manifestPath: feedback.m07.manifestPath, selectedTaskIds: feedback.m07.selectedTaskIds, omittedTaskIds: feedback.m07.omittedTaskIds } : {}) }, null, 2), "M07 处理来源");
 			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-source.json", JSON.stringify({ m08RunId: feedback.m08.runId, manifestPath: feedback.m08.manifestPath, reviewBundlePath: feedback.inputs[0].path }, null, 2), "M08 处理来源");
 			let knowledgePack: string | undefined;
-			const loadKnowledgePack = async (requireOriginalSnapshot = false): Promise<void> => {
-				if (requireOriginalSnapshot && (await ctx.store.current())?.id !== snapshot?.id)
+			const assertOriginalKnowledgeSnapshot = async (): Promise<void> => {
+				if ((await ctx.store.current())?.id !== snapshot?.id)
 					throw new HarnessError("m04.knowledge", "original knowledge snapshot changed before the fresh M04 handoff");
+			};
+			const loadKnowledgePack = async (requireOriginalSnapshot = false): Promise<void> => {
+				if (requireOriginalSnapshot) await assertOriginalKnowledgeSnapshot();
 				const selection = await retrieveKnowledge(ctx.store, { purpose: options.purpose ?? `M04 处理：${feedback.label}`, text: `${materials.problem}\n${feedback.label}\n${feedback.text}`, maxRecords: 48, maxChars: 60_000 });
 				if (selection.status !== "ready") throw new HarnessError("m04.knowledge", `M04 必需知识未能完整装载：${selection.omitted.map((item) => `${item.ref}:${item.reason}`).join("；")}`);
-				if (requireOriginalSnapshot && (selection.snapshot !== snapshot?.id || (await ctx.store.current())?.id !== snapshot?.id))
-					throw new HarnessError("m04.knowledge", "fresh M04 knowledge selection differs from the original snapshot");
+				if (requireOriginalSnapshot) {
+					if (selection.snapshot !== snapshot?.id)
+						throw new HarnessError("m04.knowledge", "fresh M04 knowledge selection differs from the original snapshot");
+					await assertOriginalKnowledgeSnapshot();
+				}
 				const pack = selection.pack;
 				knowledgePack = pack.markdown;
 				await ctx.ws.writeOutput(record, "knowledge-pack.md", pack.markdown, "提供给研究会话的局部知识包");
@@ -452,7 +482,8 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			const requiredM07Instruction = requiredM07Paths.length ? `\n\n【本轮指定 M07 证据完整读取】\n在判断采用、候选或无提案之前，请用 m07_evidence_read 按以下精确相对路径读取每个文件的全文；大文件须分段读至末尾。只看索引、摘要或文件名不足以满足此要求。完整读取后可以选择不提案，不得为满足流程强行采用。\n${requiredM07Paths.map((item) => `- ${item}`).join("\n")}` : "";
 			const judgmentInstructions = m08DispositionInstruction + m07EvidenceInstruction +
 				m07ExperienceInstruction + requiredM07Instruction +
-				(options.additionalReadOnlyInstruction ? `\n\n${options.additionalReadOnlyInstruction}` : "");
+				(options.additionalReadOnlyInstruction ? `\n\n${options.additionalReadOnlyInstruction}` : "") +
+				(priorFailureBytes ? `\n\n${priorFailureBytes.toString("utf8")}` : "");
 			const finalMessage = message + judgmentInstructions;
 			let freshJudgmentMessage = mode === "research-session" ? finalMessage : undefined;
 			await ctx.ws.writeOutput(record, "message.md", finalMessage, "发送给研究会话的完整消息");
@@ -576,7 +607,6 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 						...(handle.ref.file ? { transcriptPath: handle.ref.file } : {}) });
 				};
 				const observedContextFailures = new Set<string>();
-				const freshStrategyStates = new Set<string>();
 				let currentStrategy: "same-session-feedback" | "fresh-context" = "same-session-feedback";
 				const repairJudgment = async (failure: WorkflowRepairFailure, facts: unknown,
 					responseFingerprint: string | null, guidance: string): Promise<string> => {
@@ -588,22 +618,20 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 						await persistRepair(failure, planFingerprint, responseFingerprint, currentStrategy);
 						return guidance;
 					}
-					// Eligibility belongs to a normalized failure/evidence state, not
-					// a turn or session count. New read/validation progress creates a
-					// different state; returning to an exhausted state exposes a cycle.
-					if (freshStrategyStates.has(failureFingerprint)) {
-						await persistRepair(failure, planFingerprint, responseFingerprint, "workflow-repair-needed");
-						throw new WorkflowRepairNeededError("m04-judgment");
-					}
+					// Repeated failure facts choose a fresh independent read-only
+					// judgment context. They do not establish scientific closure or
+					// make another context unsafe by themselves.
 					// A model context reset can never reconcile or replay a store side effect.
 					if (!["no-proposal", "rejected-draft"].includes(transaction.state) ||
 						transaction.attempts.some(item => item.state !== "rejected-draft"))
 						throw new HarnessError("m04.transaction", "unresolved M04 transaction blocks fresh judgment; retain the exact transaction for reconciliation");
 					await persistRepair(failure, planFingerprint, responseFingerprint, "fresh-context");
-					freshStrategyStates.add(failureFingerprint);
 					let fresh;
 					try {
 						await verifyRequiredM07Bindings();
+						// The message may already be cached from the initial research
+						// session or an earlier repair; CURRENT must still match on every handoff.
+						await assertOriginalKnowledgeSnapshot();
 						if (freshJudgmentMessage === undefined) {
 							// First M04 continuation keeps its original admission behavior.
 							// Only a fresh strategy needs an independently usable pack.
@@ -666,22 +694,27 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 						const newReadEvents = returned.slice(readEventCursor);
 						readEventCursor = returned.length;
 						const gaps = await m07ReadGaps(feedback.m07.rootDir, requiredM07Paths, returned);
-						if (gaps.length) {
-							const readToolError = newReadEvents.some(item => item.toolName === "m07_evidence_read" && item.status === "error" && gaps.some(gap => gap.relative === item.path));
+						const readToolErrors = newReadEvents.filter(item => item.toolName === "m07_evidence_read" &&
+							item.status === "error");
+						const unrecoverableReadToolError = readToolErrors.some(item => {
+							const gap = gaps.find(gap => gap.relative === item.path);
+							return !gap || item.error?.kind !== "offset-beyond-eof" ||
+								item.error.lineCount !== gap.lineCount ||
+								!Number.isSafeInteger(item.requested.offset) || item.requested.offset! <= gap.lineCount;
+						});
+						if (gaps.length || unrecoverableReadToolError) {
 							await captureInvalidJudgment(turn.text, {
 								code: "m04.m07-evidence",
-								message: readToolError
+							message: unrecoverableReadToolError
 									? "required selected M07 evidence was not returned in full because its read tool reported an error"
 									: "required selected M07 evidence was not returned to the research session in full",
-								path: gaps[0].relative, detail: { gaps, readToolErrors: newReadEvents.filter(item =>
-									item.toolName === "m07_evidence_read" && item.status === "error" &&
-									gaps.some(gap => gap.relative === item.path)) },
+							path: gaps[0]?.relative ?? readToolErrors[0]!.path, detail: { gaps, readToolErrors },
 							}, gaps);
-							if (readToolError)
+						if (unrecoverableReadToolError)
 								throw new HarnessError("m04.m07-evidence", "required selected M07 evidence was not returned in full because its read tool reported an error");
 							const guidance = ["Your M04 judgement is provisional. The host has not verified full m07_evidence_read returns for every required selected M07 file, so no knowledge proposal can be accepted yet.",
-								"Next missing returned range for each file (one-based lines; the host will recalculate further gaps after your next read):",
-								...gaps.map(gap => `- ${gap.relative}: ${gap.emptyFile ? "empty file needs an untruncated no-content text return without a line range" : gap.missingRanges.length ? `${gap.missingRanges[0].start}-${gap.missingRanges[0].end}; ${gap.missingRanges.length - 1} further gaps remain` : "all lines returned"}${gap.terminalPageMissing ? "; an untruncated final page is also required" : ""}`),
+							"Next missing returned range for each file (one-based lines; the host will recalculate further gaps after your next read):",
+							...gaps.map(gap => `- ${gap.relative}: ${gap.lineCount} actual lines; ${gap.emptyFile ? "empty file needs an untruncated no-content text return without a line range" : gap.missingRanges.length ? `${gap.missingRanges[0].start}-${gap.missingRanges[0].end}; ${gap.missingRanges.length - 1} further gaps remain` : "all lines returned"}${gap.terminalPageMissing ? "; an untruncated final page is also required" : ""}`),
 								"Use the same read-only session to read the stated next missing range for each nonempty file, including an untruncated final page where needed. Read an empty file by its exact path and do not invent a line range. The host will give further ranges until all are complete. Then reconsider the evidence and return a revised M04 judgement in the required format. A path, summary, malformed response, or earlier proposal is not proof of a complete read. Do not force a knowledge proposal if the evidence does not support one."].join("\n\n");
 							request = await repairJudgment("unread-m07-evidence", gaps,
 								workflowRepairFingerprint({ gaps }), guidance);

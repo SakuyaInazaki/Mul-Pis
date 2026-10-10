@@ -3,8 +3,9 @@ import { copyFile, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { openBoundedSession, type EvidenceBindingV1 } from "../context/boundary.ts";
-import type { SessionRunner, SessionSpec } from "../runner/types.ts";
+import type { SessionRunner, SessionSpec, TransportFailureDiagnostic } from "../runner/types.ts";
 import type { DeepSeekRequestViolation } from "../runner/deepseek-request-contract.ts";
+import { isSettledTerminalResponse } from "../runner/operation-disposition.ts";
 import { workflowRepairFingerprint, workflowRepairState, type WorkflowRepairFailure,
 	type WorkflowRepairStateV1 } from "../runner/repair-liveness.ts";
 import type { StageRunRecord } from "../types.ts";
@@ -23,6 +24,53 @@ const safeName = (value: string) => /^[A-Za-z][A-Za-z0-9._-]{0,79}$/.test(value)
 const safeInputName = (value: string) => /^[A-Za-z0-9][A-Za-z0-9 ._()-]{0,119}$/.test(value);
 const nonemptyText = (value: unknown): value is string =>
 		typeof value === "string" && value.trim().length > 0 && !value.includes("\0");
+
+/** A retry is permitted only for a host-observed transient transport fault in
+ * a read-only assessor. Provider text and a generic thrown message have no
+ * authority to classify a failure as retryable. */
+function assessorPromptFailure(error: unknown, diagnostic?: TransportFailureDiagnostic):
+	"retryable" | "aborted" | "auth" | "context" | "rejected" | "unclassified" {
+	if (error instanceof HarnessError &&
+		["runner.auth-preflight", "runner.auth-store-unavailable"].includes(error.code))
+		return "auth";
+	if (error instanceof HarnessError && error.code === "runner.aborted" ||
+		error instanceof Error && error.name === "AbortError" || diagnostic?.abortSource)
+		return "aborted";
+	if (error instanceof HarnessError && ["runner.request-contract.not-issued",
+		"runner.request-contract"].includes(error.code) || diagnostic?.requestContractViolation)
+		return "rejected";
+	if (diagnostic?.httpStatus === 401 || diagnostic?.httpStatus === 403 ||
+		diagnostic?.providerErrorReasonClass === "insufficient-balance" ||
+		["authentication_error", "permission_error"].includes(diagnostic?.providerErrorType ?? ""))
+		return "auth";
+	if (isSettledTerminalResponse(error) ||
+		error instanceof HarnessError && error.code === "runner.stop" &&
+			/stopReason=length/.test(error.message) ||
+		diagnostic?.providerErrorReasonClass === "context-window")
+		return "context";
+	if (diagnostic?.providerErrorReasonClass === "input-schema" ||
+		diagnostic?.providerErrorReasonClass === "tool-reasoning") return "rejected";
+	const status = diagnostic?.httpStatus ?? null;
+	if (status !== null && status >= 400 && status < 500 &&
+		![408, 425, 429].includes(status)) return "rejected";
+	if (!diagnostic) return "unclassified";
+	if (status === 408 || status === 425 || status === 429 || status !== null && status >= 500 ||
+		diagnostic.transportInterrupted === true &&
+			(status === null || status >= 200 && status < 300))
+		return "retryable";
+	return "unclassified";
+}
+
+async function waitForAssessorRetry(milliseconds: number, signal?: AbortSignal): Promise<void> {
+	if (signal?.aborted) return;
+	await new Promise<void>(resolve => {
+		let timer: ReturnType<typeof setTimeout>;
+		const finish = () => { clearTimeout(timer); signal?.removeEventListener("abort", finish); resolve(); };
+		timer = setTimeout(finish, milliseconds);
+		signal?.addEventListener("abort", finish, { once: true });
+		if (signal?.aborted) finish();
+	});
+}
 
 /** The caller's original mission is separate from any finite M07 child goal. */
 export interface OriginalObjectiveContractV1 {
@@ -75,14 +123,21 @@ export interface ModelObjectiveAssessmentV1 {
 export type HistoricalObjectiveStopReason = "budget-boundary" | "provider-call-limit" |
 	"time-boundary" | "no-progress" | "capability-replan-stalled";
 export type CurrentObjectiveStopReason = "accounting-integrity-error" |
-	"cancelled" | "output-limit" | "assessment-failed" |
+	"cancelled" | "output-limit" | "assessment-failed" | "assessor-auth-unavailable" |
+	"assessor-request-rejected" |
 	"assessment-invalid" | "assessment-evidence-unread" | "assessment-evidence-suspended" | "model-reported-blocked" | "model-closure-unverified" |
 	"original-checks-unverified" | "assessment-validation-pending" | "next-task-pending" | "next-task-needs-capability" |
 	"objective-reassessment-pending" | "dispatch-failed" |
 	"request-contract-invalid" | "workflow-repair-needed" |
 	"execution-interrupted" |
 	"artifact-capacity-boundary" | "m04-evidence-incomplete" | "m04-draft-rejected" |
-	"m04-transaction-unresolved" | "bounded-run-incomplete";
+	"m04-transaction-unresolved" | "m04-review-pending" | "bounded-run-incomplete";
+export interface PendingM04ReviewV1 {
+	version: 1; kind: "accepted-m07-pending-m04-review";
+	runId: string; taskId: string; checkpointId: string;
+	evaluatorReceiptSha256: string; checkpointManifestSha256: string;
+	requiredM07ReadPaths: string[]; requiredM07ReadSha256: string[]; m04RunIds: string[];
+}
 export type ObjectiveStopReason = CurrentObjectiveStopReason | HistoricalObjectiveStopReason;
 const historicalObjectiveStopReasons: readonly HistoricalObjectiveStopReason[] = [
 	"budget-boundary", "provider-call-limit", "time-boundary", "no-progress",
@@ -91,6 +146,7 @@ const historicalObjectiveStopReasons: readonly HistoricalObjectiveStopReason[] =
 
 /** A host plan for the next safe boundary. It is not an assessor verdict or proof of completion. */
 export type PendingActionKindV1 = "retry-readonly-assessment" | "retry-evidence-read" |
+	"retry-m04-review" |
 	"fresh-m07-task" | "repair-rejected-m04" | "repair-request-contract" | "reconcile-m07-operation" |
 	"reconcile-m04-transaction" | "restore-evidence" | "retry-transport" |
 	"reconcile-interrupted-run" |
@@ -154,6 +210,7 @@ const exactControlFields = (value: unknown, allowed: readonly string[]): boolean
 const safeControlRefs = (value: unknown): value is string[] => Array.isArray(value) &&
 	value.every(safeControlRef) && new Set(value).size === value.length;
 const pendingKinds: PendingActionKindV1[] = ["retry-readonly-assessment", "retry-evidence-read",
+	"retry-m04-review",
 	"fresh-m07-task", "repair-rejected-m04", "repair-request-contract",
 	"reconcile-m07-operation", "reconcile-m04-transaction",
 	"reconcile-interrupted-run",
@@ -162,13 +219,14 @@ const pendingSafeties: PendingActionSafetyV1[] = ["same-session-read-only", "fre
 	"no-replay-until-reconciled"];
 const objectiveStopReasons: CurrentObjectiveStopReason[] = [
 	"accounting-integrity-error", "cancelled", "output-limit", "assessment-failed",
+	"assessor-auth-unavailable", "assessor-request-rejected",
 	"assessment-invalid", "assessment-evidence-unread", "assessment-evidence-suspended", "model-reported-blocked",
 	"model-closure-unverified", "original-checks-unverified", "assessment-validation-pending",
 	"next-task-pending", "next-task-needs-capability", "objective-reassessment-pending", "dispatch-failed",
 	"request-contract-invalid", "workflow-repair-needed",
 	"execution-interrupted",
 	"artifact-capacity-boundary", "m04-evidence-incomplete",
-	"m04-draft-rejected", "m04-transaction-unresolved", "bounded-run-incomplete"];
+	"m04-draft-rejected", "m04-transaction-unresolved", "m04-review-pending", "bounded-run-incomplete"];
 export const isCurrentObjectiveStopReason = (value: unknown): value is CurrentObjectiveStopReason =>
 	typeof value === "string" && objectiveStopReasons.some(reason => reason === value);
 const requestViolations: ReadonlySet<string> = new Set(["request-shape", "message-shape",
@@ -230,6 +288,8 @@ export function classifyPendingAction(stopReason: CurrentObjectiveStopReason,
 	} else if (hostFacts.m04TransactionUnresolved || stopReason === "m04-transaction-unresolved") {
 		kind = "reconcile-m04-transaction";
 		safety = "no-replay-until-reconciled";
+	} else if (stopReason === "m04-review-pending") {
+		kind = "retry-m04-review";
 	} else if (hostFacts.unresolvedOperationRefs?.length) {
 		kind = "reconcile-m07-operation";
 		safety = "no-replay-until-reconciled";
@@ -237,6 +297,10 @@ export function classifyPendingAction(stopReason: CurrentObjectiveStopReason,
 		kind = "retry-transport";
 		safety = "no-replay-until-reconciled";
 	} else if (stopReason === "workflow-repair-needed") {
+		kind = "repair-workflow-state";
+	} else if (stopReason === "assessor-auth-unavailable") {
+		kind = "refresh-auth";
+	} else if (stopReason === "assessor-request-rejected") {
 		kind = "repair-workflow-state";
 	} else if (human) {
 		kind = human.kind === "credential-unavailable" ? "refresh-auth" :
@@ -315,8 +379,11 @@ export function validatePendingAction(action: PendingActionV1, stopReason: Objec
 		"assessment-evidence-suspended": "restore-evidence",
 		"m04-evidence-incomplete": "retry-evidence-read",
 		"m04-draft-rejected": "repair-rejected-m04",
+		"m04-review-pending": "retry-m04-review",
 		"request-contract-invalid": "repair-request-contract",
 		"workflow-repair-needed": "repair-workflow-state",
+		"assessor-auth-unavailable": "refresh-auth",
+		"assessor-request-rejected": "repair-workflow-state",
 		"execution-interrupted": "reconcile-interrupted-run",
 		"model-reported-blocked": "retry-readonly-assessment",
 		"model-closure-unverified": "retry-readonly-assessment",
@@ -373,8 +440,11 @@ export interface ObjectiveProgressV1 {
 		stopReason: ObjectiveStopReason; advanced: boolean }>;
 	boundedRuns: Array<{ runId: string; outcome: string; selectedTaskId?: string;
 		acceptedTaskIds?: string[]; unresolvedOperationIds?: string[];
+		failedM04RunId?: string;
+		failedM04RunIds?: string[];
 		selectionProofGap?: MissingSelectionProofV1 }>;
 	selectedArtifacts: string[];
+	pendingM04Review?: PendingM04ReviewV1;
 	availableArtifacts: string[];
 	continuation: { mode: "explicit-authorized-new-run" | "reconcile-operations-before-new-run";
 		unresolvedOperationIds: string[]; unresolvedObligations: string[];
@@ -388,6 +458,8 @@ export interface ObjectiveProgressV1 {
 export async function runOriginalObjectiveLoop(input: {
 	admission: () => "admitted" | CurrentObjectiveStopReason;
 	step: (iteration: number) => Promise<{ advanced: boolean; stopReason: CurrentObjectiveStopReason; evidenceRefs?: string[] }>;
+	/** The default mission caller persists each step and does not need another in-memory history. */
+	collectSteps?: boolean;
 }): Promise<{ stopReason: CurrentObjectiveStopReason; steps: Array<{ iteration: number; advanced: boolean;
 	stopReason: CurrentObjectiveStopReason; evidenceRefs: string[] }> }> {
 	const steps: Array<{ iteration: number; advanced: boolean; stopReason: CurrentObjectiveStopReason; evidenceRefs: string[] }> = [];
@@ -398,9 +470,10 @@ export async function runOriginalObjectiveLoop(input: {
 		const result = await input.step(iteration);
 		if (!isCurrentObjectiveStopReason(result.stopReason))
 			throw new HarnessError("m07.objective", "live objective step returned a retired quota boundary");
-		steps.push({ iteration, advanced: result.advanced, stopReason: result.stopReason,
-			evidenceRefs: [...(result.evidenceRefs ?? [])] });
-		if (!result.advanced || result.stopReason !== "objective-reassessment-pending")
+		if (input.collectSteps !== false)
+			steps.push({ iteration, advanced: result.advanced, stopReason: result.stopReason,
+				evidenceRefs: [...(result.evidenceRefs ?? [])] });
+		if (!result.advanced || !["objective-reassessment-pending", "m04-review-pending"].includes(result.stopReason))
 			return { stopReason: result.stopReason, steps };
 	}
 }
@@ -609,6 +682,7 @@ function parseAssessment(text: string, contract: OriginalObjectiveContractV1, ev
 
 export function objectiveProgress(contract: OriginalObjectiveContractV1, input: {
 	boundedRuns: ObjectiveProgressV1["boundedRuns"]; selectedArtifacts: string[];
+		pendingM04Review?: PendingM04ReviewV1;
 	availableArtifacts?: string[]; unresolvedOperationIds?: string[];
 	assessment?: ObjectiveProgressV1["assessment"];
 	assessmentHistory?: ObjectiveProgressV1["assessmentHistory"];
@@ -641,6 +715,11 @@ export function objectiveProgress(contract: OriginalObjectiveContractV1, input: 
 	const effectiveStopReason = fulfilled ? null : input.pendingActionFacts?.m04TransactionUnresolved ?
 		"m04-transaction-unresolved" : !closureReviewBoundary ? input.stopReason : input.assessment?.decision === "fulfilled" ?
 			contract.closure === "open-ended" ? "model-closure-unverified" : "original-checks-unverified" : input.stopReason;
+	if (Boolean(input.pendingM04Review) !== (effectiveStopReason === "m04-review-pending") ||
+		input.pendingM04Review && (input.boundedRuns.at(-1)?.runId !== input.pendingM04Review.runId ||
+			!input.boundedRuns.at(-1)?.acceptedTaskIds?.includes(input.pendingM04Review.taskId) ||
+			Boolean(input.boundedRuns.at(-1)?.selectedTaskId)))
+		throw new HarnessError("m07.objective", "pending M04 review cannot carry selected authority");
 	if (input.pendingActionFacts && effectiveStopReason && !isCurrentObjectiveStopReason(effectiveStopReason))
 		throw new HarnessError("m07.objective", "retired quota stop cannot mint a new pending action");
 	const pendingAction = effectiveStopReason && (input.pendingAction ??
@@ -652,6 +731,7 @@ export function objectiveProgress(contract: OriginalObjectiveContractV1, input: 
 		...(input.assessment ? { assessment: input.assessment } : {}), boundedRuns: input.boundedRuns,
 		assessmentHistory: input.assessmentHistory ? input.assessmentHistory.map(item => ({ ...item })) : [],
 		selectedArtifacts: [...input.selectedArtifacts], availableArtifacts: [...(input.availableArtifacts ?? input.selectedArtifacts)],
+		...(input.pendingM04Review ? { pendingM04Review: structuredClone(input.pendingM04Review) } : {}),
 		continuation: { mode: input.unresolvedOperationIds?.length ? "reconcile-operations-before-new-run" :
 			"explicit-authorized-new-run", unresolvedOperationIds: [...(input.unresolvedOperationIds ?? [])],
 			unresolvedObligations: unresolved,
@@ -701,6 +781,18 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 	recordValidationFailure?: (diagnostic: ObjectiveAssessmentValidationDiagnosticV1) => Promise<void>;
 	/** Synchronous control observation. A reporting failure must not mask the initiating exception. */
 	recordException?: (stage: ObjectiveAssessmentExceptionStage, error: unknown) => void;
+	/** Private, redacted control observation; must persist before a fresh provider prompt. */
+	recordTransportFailure?: (failure: { version: 1; kind: "assessor-prompt-failure";
+		sessionId: string; sessionGeneration: number;
+		classification: "retryable" | "aborted" | "auth" | "context" | "rejected" | "unclassified";
+		localAuthCause?: "missing-configured-key" | "credential-store-unavailable";
+		diagnostic?: { phase: TransportFailureDiagnostic["phase"]; httpStatus: number | null;
+			transportInterrupted?: true;
+			providerErrorReasonClass: TransportFailureDiagnostic["providerErrorReasonClass"] | null;
+			abortSource: TransportFailureDiagnostic["abortSource"]; errorCodes: string[] } }) => Promise<void>;
+	signal?: AbortSignal;
+	/** Optional offline clock; production uses bounded exponential delay with no retry-count stop. */
+	waitBeforeTransportRetry?: (retryNumber: number) => Promise<void>;
 	advance: (task: ObjectiveNextTaskV1) => Promise<T>;
 }): Promise<{ assessment?: ObjectiveProgressV1["assessment"]; advanced?: T; stopReason: CurrentObjectiveStopReason }> {
 	let preSessionStage: ObjectiveAssessmentExceptionStage = "input-validation";
@@ -1097,18 +1189,86 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		let request = prompt;
 		let sessionGeneration = 1;
 		let assessmentAttempt = 0;
+		let transportRetries = 0;
 		const failedStrategies = new Map<string, Set<WorkflowRepairStateV1["strategy"]>>();
 		const frozenEvidenceIdentity = [{ name: "original-objective.json",
 			digest: createHash("sha256").update(contractBytes).digest("hex") },
 			...materials.map(({ name, digest }) => ({ name, digest }))];
 		const frozenPlan = { prompt, spec, supportedTaskScopes };
 		for (;;) {
+			if (input.signal?.aborted) return { assessment: latestAssessment, stopReason: "cancelled" };
 			let response;
+			let diagnosticCount = 0;
+			try { diagnosticCount = handle.transportDiagnostics?.().length ?? 0; }
+			catch { /* Optional diagnostics cannot prevent an otherwise valid prompt. */ }
 			try { response = await handle.prompt(request); }
 			catch (error) {
 				try { input.recordException?.("prompt", error); } catch { /* Keep the initiating prompt error. */ }
-				const admission = currentObjectiveAdmission(input.advanceAdmission());
-				return { assessment: latestAssessment, stopReason: admission === "admitted" ? "assessment-failed" : admission };
+				let diagnostic: TransportFailureDiagnostic | undefined;
+				try { diagnostic = handle.transportDiagnostics?.().slice(diagnosticCount).at(-1); }
+				catch { /* Unavailable diagnostics cannot authorize a retry. */ }
+				const failure = assessorPromptFailure(error, diagnostic);
+				await input.recordTransportFailure?.({ version: 1, kind: "assessor-prompt-failure",
+					sessionId: handle.ref.id, sessionGeneration, classification: failure,
+					...(error instanceof HarnessError && error.code === "runner.auth-preflight" ?
+						{ localAuthCause: "missing-configured-key" as const } :
+						error instanceof HarnessError && error.code === "runner.auth-store-unavailable" ?
+						{ localAuthCause: "credential-store-unavailable" as const } : {}),
+					...(diagnostic ? { diagnostic: { phase: diagnostic.phase,
+						httpStatus: diagnostic.httpStatus,
+						...(diagnostic.transportInterrupted ? { transportInterrupted: true as const } : {}),
+						providerErrorReasonClass: diagnostic.providerErrorReasonClass ?? null,
+						abortSource: diagnostic.abortSource, errorCodes: [...diagnostic.errorCodes] } } : {}) });
+				const admission = input.signal?.aborted ? "cancelled" :
+					currentObjectiveAdmission(input.advanceAdmission());
+				if (admission !== "admitted") return { assessment: latestAssessment, stopReason: admission };
+				if (failure === "aborted") return { assessment: latestAssessment, stopReason: "cancelled" };
+				if (failure === "auth") return { assessment: latestAssessment,
+					stopReason: "assessor-auth-unavailable" };
+				if (failure === "context") return { assessment: latestAssessment, stopReason: "output-limit" };
+				if (failure === "rejected") return { assessment: latestAssessment,
+					stopReason: "assessor-request-rejected" };
+				if (failure !== "retryable") return { assessment: latestAssessment,
+					stopReason: "assessment-failed" };
+				for (const item of readMaterials) if (!(await frozenFileAccessible(item.name, true)))
+					return { assessment: latestAssessment, stopReason: "assessment-evidence-suspended" };
+				await input.recordRepairState?.(workflowRepairState({ stage: "objective-assessment",
+					failure: "provider-stream", evidenceFingerprint: workflowRepairFingerprint(frozenEvidenceIdentity),
+					planFingerprint: workflowRepairFingerprint(frozenPlan), responseFingerprint: null,
+					strategy: "fresh-context", sessionGeneration: sessionGeneration + 1 }));
+				transportRetries++;
+				if (input.waitBeforeTransportRetry) await input.waitBeforeTransportRetry(transportRetries);
+				else await waitForAssessorRetry(
+					Math.min(200 * 2 ** Math.min(transportRetries - 1, 8), 30_000), input.signal);
+				const afterWait = input.signal?.aborted ? "cancelled" :
+					currentObjectiveAdmission(input.advanceAdmission());
+				if (afterWait !== "admitted") return { assessment: latestAssessment, stopReason: afterWait };
+			// Backoff is an asynchronous boundary. Recheck the bytes immediately before a
+			// new session may read them; the earlier check cannot cover a change in the wait.
+			for (const item of readMaterials) if (!(await frozenFileAccessible(item.name, true)))
+				return { assessment: latestAssessment, stopReason: "assessment-evidence-suspended" };
+				const previous = handle.ref;
+				handle.dispose();
+				try {
+					const fresh = await openAssessor("Retry a read-only assessor after a host-classified transient provider transport failure");
+					if (fresh.ref.id === previous.id || previous.file !== undefined && fresh.ref.file === previous.file ||
+						fresh.transcript().length || fresh.readReturnEvents().length) {
+						fresh.dispose();
+						throw new HarnessError("context.boundary", "fresh assessor reused prior dialogue or read proof");
+					}
+					handle = fresh;
+				} catch (handoffError) {
+					if (handoffError instanceof HarnessError && ["context.capability", "context.boundary",
+						"context.parent", "context.evidence"].includes(handoffError.code))
+						return { assessment: latestAssessment, stopReason: "workflow-repair-needed" };
+					return { assessment: latestAssessment, stopReason: "assessment-failed" };
+				}
+				sessionGeneration++;
+				priorUnreadScore = undefined;
+				readEventCursor = 0;
+				challengedBlocked = false;
+				request = prompt;
+				continue;
 			}
 			assessmentAttempt++;
 			const returned = handle.readReturnEvents();
@@ -1197,8 +1357,10 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				const responseFingerprint = workflowRepairFingerprint(failureFacts);
 				const identity = JSON.stringify({ failure, evidenceFingerprint, planFingerprint, responseFingerprint });
 				const tried = failedStrategies.get(identity) ?? new Set<WorkflowRepairStateV1["strategy"]>();
+				// A repeated model failure is not a scientific or transport stop. Once
+				// same-session feedback fails, keep using genuinely fresh read-only
+				// contexts until an actual admission, provider or host boundary occurs.
 				let strategy: WorkflowRepairStateV1["strategy"] =
-					tried.has("fresh-context") ? "workflow-repair-needed" :
 					tried.has("same-session-feedback") ? "fresh-context" : "same-session-feedback";
 				let unsafeHandoff = false, transientHandoffFailure = false;
 				if (strategy === "fresh-context") {

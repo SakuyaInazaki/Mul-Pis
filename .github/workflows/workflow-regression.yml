@@ -1,10 +1,6 @@
 name: Offline workflow regression
 
 on:
-  push:
-    branches:
-      - main
-      - improve/workflow-learning-reliability
   workflow_dispatch:
 
 permissions:

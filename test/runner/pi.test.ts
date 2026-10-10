@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -15,6 +15,21 @@ import type { CustomToolSpec, SessionSpec, ToolGrant } from "../../src/runner/ty
 import { HarnessError } from "../../src/types.ts";
 import { readTelemetry } from "../../src/dashboard/telemetry.ts";
 import { createConfinedCampaignFileTools } from "../../src/runner/confined-campaign-files.ts";
+import { finishManagedBashCall, prepareManagedBashCall, readManagedBashReceipt,
+	readManagedBashSessionReceipts, readManagedBashSessionEvidence,
+	observeManagedProcessGroup } from "../../src/runner/managed-bash.ts";
+
+test("managed Bash group probe distinguishes missing, present and unreadable groups", async () => {
+	const gone = { platform: "linux" as const, signalGroup: () => {
+		throw Object.assign(new Error("gone"), { code: "ESRCH" }); } };
+	assert.equal(await observeManagedProcessGroup(123, gone), "none-observed");
+	assert.equal(await observeManagedProcessGroup(123, { platform: "linux", signalGroup: () => {
+		throw Object.assign(new Error("unreadable"), { code: "EACCES" }); } }), "unknown");
+	assert.equal(await observeManagedProcessGroup(123, { platform: "linux", signalGroup: () => {
+		throw Object.assign(new Error("occupied"), { code: "EPERM" }); } }), "members-observed");
+});
+import { inspectManagedExecutionSession, inspectSingleForegroundBashFailure,
+	inspectM07ManagedOperation } from "../../src/m07/managed-local-failure.ts";
 
 const MODEL = {
 	id: "offline-model",
@@ -418,6 +433,46 @@ test("read-dir records an empty text file without a fabricated line range", asyn
 	handle.dispose();
 });
 
+test("read-dir classifies only a proved beyond-EOF offset from confined file bytes", async t => {
+	const persistDir = await fixture(t);
+	const materialRoot = path.join(persistDir, "materials");
+	await mkdir(materialRoot);
+	await writeFile(path.join(materialRoot, "row.txt"), Array(424).fill("row").join("\n"));
+	const outsideRoot = path.join(persistDir, "outside.txt");
+	await writeFile(outsideRoot, "outside\n");
+	await symlink(outsideRoot, path.join(materialRoot, "escape.txt"));
+	const stub = stubFactory();
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory }).create(
+		spec(persistDir, { tools: { kind: "read-dir", root: materialRoot, toolName: "m07_evidence_read" } }));
+	const read = stub.calls[0].customTools?.find(tool => tool.name === "m07_evidence_read");
+	assert(read);
+	await assert.rejects(read.execute("overshoot", { path: "row.txt", offset: 695, limit: 700 },
+		undefined, undefined, undefined as never), /beyond end of file/);
+	const eof = handle.readReturnEvents()[0]!;
+	assert.deepEqual({ ...eof, at: undefined }, { toolName: "m07_evidence_read", status: "error",
+		path: "row.txt", requested: { offset: 695, limit: 700 }, returned: { kind: "unknown" },
+		error: { kind: "offset-beyond-eof", lineCount: 424 }, at: undefined });
+	await read.execute("tail", { path: "row.txt", offset: 400, limit: 25 },
+		undefined, undefined, undefined as never);
+	assert.deepEqual(handle.readReturnEvents()[1]?.returned,
+		{ kind: "text", startLine: 400, endLine: 424, truncated: false });
+	await assert.rejects(read.execute("escape", { path: "escape.txt", offset: 695 },
+		undefined, undefined, undefined as never), /outside the granted directory/);
+	assert.equal(handle.readReturnEvents()[2]?.error, undefined);
+	assert.equal(handle.readReturnEvents()[2]?.path, "<unresolved>");
+	const denied = path.join(materialRoot, "denied.txt");
+	await writeFile(denied, "denied\n");
+	await chmod(denied, 0o000);
+	try {
+		await assert.rejects(read.execute("denied", { path: "denied.txt", offset: 695 },
+			undefined, undefined, undefined as never), /EACCES/);
+		assert.equal(handle.readReturnEvents()[3]?.error, undefined);
+	} finally {
+		await chmod(denied, 0o600);
+	}
+	handle.dispose();
+});
+
 test("writes the sidecar next to the SDK path and resume rebuilds from it", async (t) => {
 	const persistDir = await fixture(t);
 	const stub = stubFactory();
@@ -527,6 +582,185 @@ test("local execution bash does not inherit model process credentials", async t 
 	}
 });
 
+test("managed local bash receipts bind real foreground exits to exact Pi calls", async t => {
+	const persistDir = await fixture(t);
+	const root = path.join(persistDir, "work");
+	await mkdir(root);
+	const stub = stubFactory();
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory })
+		.create(spec(persistDir, { tools: { kind: "execution", root, tools: ["bash"] } }));
+	const bash = stub.calls[0].customTools?.find(tool => tool.name === "bash");
+	assert(bash);
+	const goodCommand = "printf head; sleep 0.02; printf tail";
+	const good = await bash.execute("call-success", { command: goodCommand }, undefined, undefined, { cwd: root } as never);
+	assert.match(JSON.stringify(good.content), /headtail/);
+	await assert.rejects(bash.execute("call-failure", { command: "exit 17" }, undefined, undefined,
+		{ cwd: root } as never), /code 17/);
+	const rows = handle.toolLog();
+	assert.deepEqual(rows.map(row => [row.toolCallId, row.ok]), [["call-success", true], ["call-failure", false]]);
+	const first = await readManagedBashReceipt(rows[0].hostReceiptPath!);
+	const second = await readManagedBashReceipt(rows[1].hostReceiptPath!);
+	assert.equal(first.commandSha256, (await import("node:crypto")).createHash("sha256").update(goodCommand).digest("hex"));
+	assert.equal(first.toolCallId, "call-success");
+	assert.equal(first.sessionId, handle.ref.id);
+	assert.equal(first.spawn, "observed");
+	assert(first.pid && first.processGroupId === first.pid);
+	assert.equal(first.processExit?.exitCode, 0);
+	assert.equal(first.toolOutcome, "returned");
+	assert.equal(first.outputBytesAtExit, 8);
+	assert.equal(second.toolCallId, "call-failure");
+	assert.equal(second.processExit?.exitCode, 17);
+	assert.equal(second.toolOutcome, "threw");
+	assert.equal(second.toolErrorKind, "nonzero-exit");
+	assert.equal(second.remoteOrDetachedEffects, "unknown");
+	assert.equal((await readManagedBashSessionReceipts(persistDir, handle.ref.id)).length, 2);
+	handle.dispose();
+});
+
+test("managed bash retains thrown and crash-window uncertainty", async t => {
+	const persistDir = await fixture(t);
+	const root = path.join(persistDir, "work");
+	await mkdir(root);
+	const stub = stubFactory();
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory })
+		.create(spec(persistDir, { tools: { kind: "execution", root, tools: ["bash"] } }));
+	const bash = stub.calls[0].customTools?.find(tool => tool.name === "bash");
+	assert(bash);
+	const abort = new AbortController(); abort.abort();
+	await assert.rejects(bash.execute("call-aborted", { command: "printf impossible" }, abort.signal,
+		undefined, { cwd: root } as never), /Command aborted/);
+	const thrown = await readManagedBashReceipt(handle.toolLog()[0].hostReceiptPath!);
+	assert.equal(thrown.spawn, "not-attempted");
+	assert.equal(thrown.processExit, null);
+	assert.equal(thrown.toolOutcome, "threw");
+	assert.equal(thrown.toolErrorKind, "transport-or-tool");
+	const prepared = await prepareManagedBashCall(path.join(persistDir, "crash-window"),
+		handle.ref.id, "call-crashed", "true", root);
+	assert.equal((await readManagedBashReceipt(prepared.file)).toolOutcome, "unknown");
+	assert.equal((await readManagedBashReceipt(prepared.file)).spawn, "not-attempted");
+	await finishManagedBashCall(prepared, "is-error");
+	assert.equal((await readManagedBashReceipt(prepared.file)).toolOutcome, "is-error");
+	handle.dispose();
+});
+
+test("detached local child leaves remote or detached effects explicitly unknown", async t => {
+	if (process.platform !== "linux") return t.skip("Linux setsid fixture");
+	const persistDir = await fixture(t);
+	const root = path.join(persistDir, "work");
+	await mkdir(root);
+	const stub = stubFactory();
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory })
+		.create(spec(persistDir, { tools: { kind: "execution", root, tools: ["bash"] } }));
+	const bash = stub.calls[0].customTools?.find(tool => tool.name === "bash");
+	assert(bash);
+	const result = await bash.execute("call-detached", { command: "setsid sh -c 'sleep 1; printf late' & printf now" },
+		undefined, undefined, { cwd: root } as never);
+	assert.match(JSON.stringify(result.content), /now/);
+	const receipt = await readManagedBashReceipt(handle.toolLog()[0].hostReceiptPath!);
+	assert.equal(receipt.processExit?.exitCode, 0);
+	assert.equal(receipt.toolOutcome, "returned");
+	assert.equal(receipt.remoteOrDetachedEffects, "unknown");
+	handle.dispose();
+});
+
+test("managed bash recovery reader rejects forged, linked and public receipts", async t => {
+	const persistDir = await fixture(t);
+	const root = path.join(persistDir, "work");
+	await mkdir(root);
+	const sessionId = "verified-session";
+	const directory = path.join(persistDir, "host-execution-receipts", sessionId);
+	const call = await prepareManagedBashCall(directory, sessionId, "call-1", "true", root);
+	assert.equal((await readManagedBashSessionReceipts(persistDir, sessionId)).length, 1);
+	const forged = { ...call.receipt, pid: 42 };
+	await writeFile(call.file, `${JSON.stringify(forged)}\n`);
+	await assert.rejects(readManagedBashSessionReceipts(persistDir, sessionId), /invalid managed bash receipt/);
+	await writeFile(call.file, `${JSON.stringify(call.receipt)}\n`);
+	await (await import("node:fs/promises")).chmod(call.file, 0o644);
+	await assert.rejects(readManagedBashReceipt(call.file), /private regular file/);
+	await (await import("node:fs/promises")).chmod(call.file, 0o600);
+	const link = path.join(persistDir, "receipt-link.json");
+	await symlink(call.file, link);
+	await assert.rejects(readManagedBashReceipt(link), /private regular file/);
+	const orphanId = "11111111-1111-4111-8111-111111111111";
+	await writeFile(path.join(directory, `${orphanId}.json.123.22222222-2222-4222-8222-222222222222.tmp`),
+		"incomplete write");
+	const evidence = await readManagedBashSessionEvidence(persistDir, sessionId);
+	assert.equal(evidence.receipts.length, 1);
+	assert.deepEqual(evidence.pendingReceiptIds, [orphanId]);
+});
+
+test("recovery census pairs a real failed shell with exact Pi call and typed file results", async t => {
+	if (process.platform !== "linux") return t.skip("Linux process birth and group fixture");
+	const persistDir = await fixture(t);
+	const root = path.join(persistDir, "work");
+	await mkdir(root);
+	await writeFile(path.join(root, "input.txt"), "fixture\n");
+	const stub = stubFactory();
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory })
+		.create(spec(persistDir, { tools: { kind: "execution", root, tools: ["bash", "read"] } }));
+	const manager = stub.calls[0].sessionManager!;
+	const bash = stub.calls[0].customTools?.find(tool => tool.name === "bash")!;
+	const command = "sleep 0.03; exit 9";
+	manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "failed-shell", name: "bash",
+		arguments: { command } }] } as never);
+	await assert.rejects(bash.execute("failed-shell", { command }, undefined, undefined,
+		{ cwd: root } as never), /code 9/);
+	const input = { persistDir, sessionId: handle.ref.id, sessionFile: handle.ref.file!, workDir: root };
+	const scoped = await inspectSingleForegroundBashFailure(input);
+	assert.equal(scoped?.exitCode, 9);
+	assert.equal(scoped?.modelResponse, "unknown");
+	assert.equal(scoped?.remoteOrDetachedEffects, "unknown");
+	let census = await inspectManagedExecutionSession(input);
+	const receiptFile = handle.toolLog()[0].hostReceiptPath!;
+	const pendingFile = `${receiptFile}.123.22222222-2222-4222-8222-222222222222.tmp`;
+	await writeFile(pendingFile, "partial replacement");
+	census = await inspectManagedExecutionSession(input);
+	assert.deepEqual(census.pendingReceiptIds, [(await readManagedBashReceipt(receiptFile)).id]);
+	assert.equal(await inspectSingleForegroundBashFailure(input), null);
+	await rm(pendingFile);
+	assert.deepEqual(census.calls.map(row => [row.toolCallId, row.toolResult, row.localLifecycle]),
+		[["failed-shell", "missing", "terminal"]]);
+	manager.appendMessage({ role: "toolResult", toolCallId: "failed-shell", toolName: "bash",
+		isError: true, content: [{ type: "text", text: "failed" }] } as never);
+	const read = stub.calls[0].customTools?.find(tool => tool.name === "read")!;
+	manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "read-file", name: "read",
+		arguments: { path: "input.txt" } }] } as never);
+	await read.execute("read-file", { path: "input.txt" }, undefined, undefined, { cwd: root } as never);
+	census = await inspectManagedExecutionSession(input);
+	assert.equal(census.calls[1].localLifecycle, "unknown");
+	manager.appendMessage({ role: "toolResult", toolCallId: "read-file", toolName: "read",
+		isError: false, content: [{ type: "text", text: "fixture" }] } as never);
+	census = await inspectManagedExecutionSession(input);
+	assert.deepEqual(census.calls.map(row => [row.name, row.toolResult, row.localLifecycle]),
+		[["bash", "is-error", "terminal"], ["read", "returned", "terminal"]]);
+	assert.equal(await inspectSingleForegroundBashFailure(input), null);
+	const goal = { runId: "goal-1", tasks: [{ taskId: "T001", mode: "execute", workDir: root,
+		session: handle.ref }], executionState: { operations: [{ id: "O001", taskId: "T001",
+		status: "unknown" }] } } as unknown as import("../../src/m07/types.ts").CurrentGoal;
+	const bound = await inspectM07ManagedOperation(goal, "O001");
+	assert.equal(bound?.operationId, "O001");
+	assert.equal(bound?.sessionId, handle.ref.id);
+	assert.equal(bound?.calls.length, 2);
+	assert.deepEqual(bound?.pendingReceiptIds, []);
+	const forkedGoal = { ...goal, tasks: [{ ...goal.tasks[0],
+		session: { ...handle.ref, lineageFile: path.join(persistDir, "fork.lineage.json") } }] };
+	assert.equal(await inspectM07ManagedOperation(forkedGoal, "O001"), null);
+	const siblingLineage = handle.ref.file!.replace(/\.jsonl$/, ".lineage.json");
+	await writeFile(siblingLineage, "fork marker");
+	assert.equal(await inspectM07ManagedOperation(goal, "O001"), null);
+	await rm(siblingLineage);
+	goal.executionState!.operations.push({ version: 1, id: "O002", taskId: "T001",
+		status: "unknown", issuedAt: new Date().toISOString() });
+	assert.equal(await inspectM07ManagedOperation(goal, "O001"), null);
+	const link = path.join(persistDir, "session-link.jsonl");
+	await symlink(handle.ref.file!, link);
+	await assert.rejects(inspectManagedExecutionSession({ ...input, sessionFile: link }), /regular file/);
+	const transcript = await readFile(handle.ref.file!, "utf8");
+	await writeFile(handle.ref.file!, transcript.replace(command, "sleep 0.03; exit 8"));
+	await assert.rejects(inspectManagedExecutionSession(input), /command differs/);
+	handle.dispose();
+});
+
 test("confined custom tool logs prove full UTF-8 reads without logging contents or write arguments", async t => {
 	const persistDir = await fixture(t);
 	const work = path.join(persistDir, "confined-work");
@@ -580,7 +814,12 @@ test("abort before prompt sends nothing and abort during prompt reaches the SDK"
 		createSession: beforeStub.factory,
 		signal: beforeController.signal,
 	}).create(spec(beforeDir));
-	await assert.rejects(before.prompt("must not send"), /aborted before prompt/);
+	await assert.rejects(before.prompt("must not send"), (error: unknown) => {
+		assert(error instanceof HarnessError);
+		assert.equal(error.code, "runner.aborted");
+		assert.match(error.message, /aborted before prompt/);
+		return true;
+	});
 	assert.equal(beforeStub.promptCalls, 0);
 
 	const duringDir = await fixture(t);
@@ -605,7 +844,7 @@ test("abort before prompt sends nothing and abort during prompt reaches the SDK"
 	duringController.abort();
 	await assert.rejects(pending, (error: unknown) => {
 		assert(error instanceof HarnessError);
-		assert.equal(error.code, "runner.stop");
+		assert.equal(error.code, "runner.aborted");
 		assert.match(error.message, /aborted during prompt/);
 		assert.match(error.message, /SDK abort failed: offline abort rejection/);
 		return true;
@@ -792,6 +1031,8 @@ test("Pi forks two independent histories from a frozen completed leaf, preservin
 	assert.deepEqual(stub.calls.at(-1)?.resourceLoader?.getExtensions().extensions, []);
 	assert.deepEqual(stub.calls.at(-1)?.resourceLoader?.getSkills().skills, []);
 	const firstFile = await readFile(first.ref.file!, "utf8");
+	await assert.rejects(inspectManagedExecutionSession({ persistDir: childSessions,
+		sessionId: first.ref.id, sessionFile: first.ref.file! }), /forked Pi session/);
 	assert.match(firstFile, /ORIGINAL TOOL PAYLOAD at \/parent\/original\.txt/);
 	assert.match(JSON.stringify(stub.calls.at(-2)?.sessionManager?.buildSessionContext().messages), /ORIGINAL TOOL PAYLOAD at \/parent\/original\.txt/);
 	assert.doesNotMatch(firstFile, /parent later/);

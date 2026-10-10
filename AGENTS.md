@@ -49,7 +49,7 @@
 - Knowledge merge uses a frozen prepared/committed intent and a recovery gate. A verified dead owner on the same host and boot can be taken over with the old lock retained for audit; live, reused PID, unknown or legacy PID-only owners remain fail closed. CURRENT publication and result recovery are reconciled before another merge, preserving negative limits. This does not provide distributed multi-host transactions.
 - M08 reviewers are an explicit caller-provided list; the harness never chooses their count or treats agreement as proof. M09 may deliver only paths allowed by the named M04 run's validated M08 disposition and never publishes, submits, sends, starts another goal, or starts RSI. Requesting full recomputation records the requested and actually executed scope; it does not certify full reproduction.
 - The harness never chooses a model: every role's model comes from the workspace `research.config.json`.
-- Tests must not call real models or the network. Dependencies resolve through `node_modules/` symlinks into `third_party/pi` (ignored by Git); do not run `npm install` against the network without the user's request.
+- Tests must not call real models or the network. Dependencies resolve through `node_modules/` symlinks into `third_party/pi` (ignored by Git); do not run `npm install` against the network without the user's request. For offline verification, invoke the installed tools directly: `node node_modules/typescript/bin/tsc --noEmit -p tsconfig.json` and `node --test --test-concurrency=1 'test/**/*.test.ts'`. Plain `npm` may start its update notifier and request registry access even for a local script. If an npm script is necessary, set `CI=true` and use `npm --offline --no-update-notifier`.
 
 ## Git and release
 

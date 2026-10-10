@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createAgentSession, type CreateAgentSessionOptions, type ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { createAgentSession, ModelRuntime, type CreateAgentSessionOptions } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type AssistantMessage, type Model } from "@earendil-works/pi-ai";
 import { PiSessionRunner } from "../../src/runner/pi.ts";
+import { HarnessError } from "../../src/types.ts";
 import { DeepSeekCampaignBudget } from "../../src/runner/deepseek-campaign.ts";
 import { verifyDeepSeekProviderOutputLimit } from "../../src/runner/deepseek-provider-limits.ts";
 import type { SessionSpec } from "../../src/runner/types.ts";
@@ -17,7 +19,10 @@ const MODEL = { id: "deepseek-flash", name: "Offline DeepSeek", provider: "deeps
 const OUTPUT_LIMIT = await verifyDeepSeekProviderOutputLimit({ apiKey: "synthetic-only", request: async () =>
 	new Response(JSON.stringify({ object: "list", data: [{ id: MODEL.id, object: "model", name: "DeepSeek-V4.1-Flash",
 		max_output_tokens: MODEL.maxTokens, context_window: MODEL.contextWindow }] }), { status: 200 }) });
-type Mode = "http" | "network" | "generic" | "allowlisted" | "input-schema" |
+type Mode = "http" | "network" | "malformed-fetch" | "body-interrupt" | "sdk-abort" |
+	"sdk-prefetch-abort" | "generic" |
+	"local-invariant" | "retry-local-invariant" |
+	"allowlisted" | "input-schema" |
 	"tool-reasoning" | "reasoning-echo" | "malicious" | "oversize" | "malformed" | "absent" |
 	"insufficient-balance" | "balance-echo" | "balance-wrong-status" |
 	"context-overflow" | "context-overflow-inconsistent" | "context-overflow-echo" |
@@ -26,9 +31,30 @@ const VALID_REQUEST_ID = "12345678-1234-1234-1234-123456789abc";
 const CONTEXT_OVERFLOW_SENTENCE = "This model's maximum context length is 1048576 tokens. However, you requested 1078729 tokens (685513 in the messages, 393216 in the completion). Please reduce the length of the messages or completion.";
 
 function factory(mode: Mode): typeof createAgentSession {
+	let fetchCalls = 0;
+	const sdkAbort = new AbortController();
 	const fakeFetch: typeof fetch = async () => {
+		if (mode === "retry-local-invariant" && ++fetchCalls === 1)
+			throw Object.assign(new Error("HIDDEN temporary network failure"), { code: "ECONNRESET" });
 		if (mode === "network") throw new Error("HIDDEN", { cause: Object.assign(new Error("HIDDEN"), { code: "UND_ERR_SOCKET" }) });
+		if (mode === "malformed-fetch") throw new TypeError("synthetic malformed URL");
 		if (mode === "http") return new Response("private provider body", { status: 503 });
+		if (mode === "body-interrupt") return new Response(new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode("partial"));
+				controller.error(new Error("HIDDEN interrupted stream"));
+			},
+		}), { status: 200 });
+		if (mode === "sdk-abort") return new Response(new ReadableStream<Uint8Array>({
+			start(controller) {
+				queueMicrotask(() => {
+					sdkAbort.abort();
+					controller.error(new DOMException("synthetic SDK cancellation", "AbortError"));
+				});
+			},
+		}), { status: 200 });
+		if (mode === "local-invariant" || mode === "retry-local-invariant")
+			return new Response("ordinary provider output", { status: 200 });
 		if (mode === "malformed") return new Response("{not-json HIDDEN", { status: 400,
 			headers: { "content-type": "application/json" } });
 		const error = mode === "allowlisted" ? { code: "context_length_exceeded", type: "invalid_request_error",
@@ -70,11 +96,17 @@ function factory(mode: Mode): typeof createAgentSession {
 			async prompt(text: string) {
 				const user = { role: "user", content: text, timestamp: Date.now() };
 				messages.push(user); manager.appendMessage(user as never);
-				const stream = (options.modelRuntime as ModelRuntime).streamSimple(options.model!, { messages } as never, { fetch: fakeFetch });
+				if (mode === "sdk-prefetch-abort") sdkAbort.abort();
+				const stream = (options.modelRuntime as ModelRuntime).streamSimple(options.model!,
+					{ messages } as never, { fetch: fakeFetch,
+						...(mode === "sdk-abort" || mode === "sdk-prefetch-abort" ?
+							{ signal: sdkAbort.signal } : {}) });
 				for await (const event of stream) {
 					if (event.type !== "error") continue;
 					messages.push(event.error); manager.appendMessage(event.error as never);
 				}
+				if (mode === "local-invariant" || mode === "retry-local-invariant")
+					throw new HarnessError("runner.model", "synthetic local invariant after HTTP 200");
 			},
 			abort() {}, dispose() {},
 		} } as unknown as Awaited<ReturnType<typeof createAgentSession>>;
@@ -91,8 +123,11 @@ function runtime(mode: Mode, observed: { body?: string }): ModelRuntime {
 			const stream = createAssistantMessageEventStream();
 			void (async () => {
 				await options.onPayload?.({ model: MODEL.id, messages: [{ role: "user", content: "hidden" }], max_tokens: MODEL.maxTokens }, model);
-				if (mode !== "generic") {
+				if (mode !== "generic" && mode !== "sdk-prefetch-abort") {
 					try {
+						if (mode === "retry-local-invariant")
+							try { await options.fetch!("https://private.example/secret?key=HIDDEN", {}); }
+							catch { /* Simulate an SDK retry before the final response. */ }
 						const response = await options.fetch!("https://private.example/secret?key=HIDDEN", {});
 						await options.onResponse?.({ status: response.status, headers: {} }, model);
 						observed.body = await response.text();
@@ -109,15 +144,23 @@ function runtime(mode: Mode, observed: { body?: string }): ModelRuntime {
 	} as unknown as ModelRuntime;
 }
 
-async function run(mode: Mode, sanitizePrivateProviderError?: (value: string) => string | null) {
+async function run(mode: Mode, sanitizePrivateProviderError?: (value: string) => string | null,
+	withCampaign = true, ordinaryAssessor = true) {
 	const dir = await mkdtemp(path.join(tmpdir(), "transport-diagnostic-"));
 	const observed: { body?: string } = {};
+	const evidenceRoot = path.join(dir, "evidence");
+	if (!withCampaign && ordinaryAssessor) await mkdir(evidenceRoot);
 	const budget = new DeepSeekCampaignBudget({ model: "deepseek/deepseek-flash:low", endpoint: "https://api.deepseek.com",
 		providerOutputLimit: OUTPUT_LIMIT, outputAccountingMarginTokens: 32,
 		estimatedInputCnyPerMillionTokens: 4, estimatedOutputCnyPerMillionTokens: 16 });
 	const handle = await new PiSessionRunner({ modelRuntime: runtime(mode, observed),
-		createSession: factory(mode), campaignBudget: budget, sanitizePrivateProviderError })
-		.create({ label: mode, role: "execution", model: "deepseek/deepseek-flash:low", systemPrompt: "offline", tools: { kind: "none" }, persistDir: dir } satisfies SessionSpec);
+		createSession: factory(mode), ...(withCampaign ? { campaignBudget: budget } : {}),
+		sanitizePrivateProviderError })
+		.create({ label: !withCampaign && ordinaryAssessor ? "local-original-objective-1" : mode,
+			role: !withCampaign && ordinaryAssessor ? "research" : "execution", model: "deepseek/deepseek-flash:low",
+			systemPrompt: "offline", tools: withCampaign || !ordinaryAssessor ? { kind: "none" } :
+				{ kind: "read-dir", root: evidenceRoot, toolName: "objective_evidence_read" },
+			persistDir: dir } satisfies SessionSpec);
 	try {
 		const checkedHandle = { ...handle };
 		assert.equal(typeof checkedHandle.transportDiagnostics, "function");
@@ -154,6 +197,219 @@ test("HTTP response status and consumed bytes are recorded without private body 
 	assert.equal(result.diagnostics[0].providerErrorType, null);
 	assert.equal(result.observed.body, "private provider body");
 	assert.doesNotMatch(JSON.stringify(result.diagnostics), /HIDDEN|private|terminated/);
+});
+
+test("ordinary Pi sessions expose redacted HTTP 503 and network interruption without a campaign", async () => {
+	const http = await run("http", undefined, false);
+	assert(http.thrown instanceof Error);
+	assert.equal(http.diagnostics.length, 1);
+	assert.equal(http.diagnostics[0].httpStatus, 503);
+	assert.equal(http.diagnostics[0].responseStarted, true);
+	assert.equal(http.diagnostics[0].transportInterrupted, undefined);
+	assert.doesNotMatch(JSON.stringify(http.diagnostics), /HIDDEN|private provider body|private\.example/);
+	const network = await run("network", undefined, false);
+	assert(network.thrown instanceof Error);
+	assert.equal(network.diagnostics.length, 1);
+	assert.equal(network.diagnostics[0].httpStatus, null);
+	assert.equal(network.diagnostics[0].transportInterrupted, true);
+	assert.doesNotMatch(JSON.stringify(network.diagnostics), /HIDDEN|private\.example/);
+	const malformed = await run("malformed-fetch", undefined, false);
+	assert(malformed.thrown instanceof Error);
+	assert.equal(malformed.diagnostics.length, 1);
+	assert.equal(malformed.diagnostics[0].httpStatus, null);
+	assert.equal(malformed.diagnostics[0].transportInterrupted, undefined);
+	assert.deepEqual(malformed.diagnostics[0].errorCodes, []);
+	const body = await run("body-interrupt", undefined, false);
+	assert(body.thrown instanceof Error);
+	assert.equal(body.diagnostics.length, 1);
+	assert.equal(body.diagnostics[0].httpStatus, 200);
+	assert.equal(body.diagnostics[0].transportInterrupted, true);
+	assert.doesNotMatch(JSON.stringify(body.diagnostics), /HIDDEN|private\.example/);
+	const sdkCancelled = await run("sdk-abort", undefined, false);
+	assert(sdkCancelled.thrown instanceof Error);
+	assert.equal(sdkCancelled.diagnostics.length, 1);
+	assert.equal(sdkCancelled.diagnostics[0].httpStatus, 200);
+	assert.equal(sdkCancelled.diagnostics[0].transportInterrupted, true);
+	assert.equal(sdkCancelled.diagnostics[0].abortSource, "sdk-signal");
+	const prefetchAbort = await run("sdk-prefetch-abort", undefined, false);
+	assert(prefetchAbort.thrown instanceof HarnessError);
+	assert.equal(prefetchAbort.thrown.code, "runner.aborted");
+	assert.deepEqual(prefetchAbort.diagnostics, [], "no request means no transport observation");
+	const local = await run("local-invariant", undefined, false);
+	assert(local.thrown instanceof HarnessError);
+	assert.equal(local.thrown.code, "runner.model");
+	assert.equal(local.diagnostics.length, 1);
+	assert.equal(local.diagnostics[0].httpStatus, 200);
+	assert.equal(local.diagnostics[0].transportInterrupted, undefined);
+	const internallyRetried = await run("retry-local-invariant", undefined, false);
+	assert(internallyRetried.thrown instanceof HarnessError);
+	assert.equal(internallyRetried.thrown.code, "runner.model");
+	assert.equal(internallyRetried.diagnostics.length, 1);
+	assert.equal(internallyRetried.diagnostics[0].httpStatus, 200);
+	assert.equal(internallyRetried.diagnostics[0].transportInterrupted, undefined);
+	assert.deepEqual(internallyRetried.diagnostics[0].errorCodes, []);
+});
+
+test("ordinary execution sessions do not acquire the assessor-only transport probe", async () => {
+	const result = await run("http", undefined, false, false);
+	assert(result.thrown instanceof Error);
+	assert.deepEqual(result.diagnostics, []);
+	assert.equal(result.observed.body, "private provider body");
+});
+
+test("default Pi AgentSession and OpenAI SDK report an offline HTTP 503 without a campaign", async t => {
+	const dir = await mkdtemp(path.join(tmpdir(), "ordinary-pi-sdk-503-"));
+	const originalFetch = globalThis.fetch;
+	let handle: Awaited<ReturnType<PiSessionRunner["create"]>> | undefined;
+	let requests = 0;
+	t.after(async () => {
+		handle?.dispose();
+		globalThis.fetch = originalFetch;
+		await rm(dir, { recursive: true, force: true });
+	});
+	const profile = path.join(dir, "profile"), sessions = path.join(dir, "sessions"), evidence = path.join(dir, "evidence");
+	await Promise.all([mkdir(profile), mkdir(sessions), mkdir(evidence)]);
+	await writeFile(path.join(evidence, "original-problem.txt"), "Synthetic original problem.\n");
+	await writeFile(path.join(profile, "models.json"), JSON.stringify({ providers: { deepseek: { models: [{
+		...MODEL, compat: { supportsStore: false, supportsDeveloperRole: false,
+			maxTokensField: "max_tokens", thinkingFormat: "deepseek" },
+	}] } } }));
+	const runtime = await ModelRuntime.create({ modelsPath: path.join(profile, "models.json"),
+		authPath: path.join(profile, "auth.json"), modelsStorePath: path.join(profile, "models-store.json"),
+		allowModelNetwork: false, refreshOnCreate: false });
+	await runtime.setRuntimeApiKey("deepseek", "sk-SYNTHETIC-OFFLINE-ONLY");
+	globalThis.fetch = async input => {
+		assert.equal(input instanceof Request ? input.url : String(input),
+			"https://api.deepseek.com/chat/completions");
+		requests++;
+		return new Response(JSON.stringify({ error: { type: "server_error", message: "HIDDEN offline rejection" } }),
+			{ status: 503, headers: { "content-type": "application/json" } });
+	};
+	handle = await new PiSessionRunner({ modelRuntime: runtime }).create({
+		label: "local-original-objective-1", role: "research", model: "deepseek/deepseek-flash:low",
+		systemPrompt: "Read only synthetic evidence", tools: { kind: "read-dir", root: evidence,
+			toolName: "objective_evidence_read" }, persistDir: sessions,
+	});
+	await assert.rejects(handle.prompt("Assess the synthetic original problem"));
+	assert.equal(requests, 1, "the host owns assessor retries after each physical request");
+	const diagnostic = handle.transportDiagnostics?.().at(-1);
+	assert(diagnostic);
+	assert.equal(diagnostic.httpStatus, 503);
+	assert.equal(diagnostic.responseStarted, true);
+	assert.equal(diagnostic.transportInterrupted, undefined);
+	assert.equal(handle.usageSummary().complete, false, "failed provider usage remains UNKNOWN");
+	assert.doesNotMatch(JSON.stringify(handle.transportDiagnostics?.()),
+		/HIDDEN|SYNTHETIC-OFFLINE|chat\/completions/);
+});
+
+test("default Pi SDK no-auth preflight is a typed local cause with zero provider requests", async t => {
+	const dir = await mkdtemp(path.join(tmpdir(), "ordinary-pi-sdk-no-auth-"));
+	const originalFetch = globalThis.fetch;
+	let handle: Awaited<ReturnType<PiSessionRunner["create"]>> | undefined;
+	let requests = 0;
+	t.after(async () => {
+		handle?.dispose();
+		globalThis.fetch = originalFetch;
+		await rm(dir, { recursive: true, force: true });
+	});
+	const profile = path.join(dir, "profile"), sessions = path.join(dir, "sessions"),
+		evidence = path.join(dir, "evidence");
+	await Promise.all([mkdir(profile), mkdir(sessions), mkdir(evidence)]);
+	await writeFile(path.join(evidence, "original-problem.txt"), "Synthetic original problem.\n");
+	await writeFile(path.join(profile, "models.json"), JSON.stringify({ providers: { deepseek: { models: [{
+		...MODEL, compat: { supportsStore: false, supportsDeveloperRole: false,
+			maxTokensField: "max_tokens", thinkingFormat: "deepseek" },
+	}] } } }));
+	const runtime = await ModelRuntime.create({ modelsPath: path.join(profile, "models.json"),
+		authPath: path.join(profile, "auth.json"), modelsStorePath: path.join(profile, "models-store.json"),
+		allowModelNetwork: false, refreshOnCreate: false });
+	globalThis.fetch = async () => { requests++; throw new Error("unexpected provider request"); };
+	handle = await new PiSessionRunner({ modelRuntime: runtime }).create({
+		label: "local-original-objective-1", role: "research", model: "deepseek/deepseek-flash:low",
+		systemPrompt: "Read only synthetic evidence", tools: { kind: "read-dir", root: evidence,
+			toolName: "objective_evidence_read" }, persistDir: sessions,
+	});
+	await assert.rejects(handle.prompt("Assess the synthetic original problem"), (error: unknown) => {
+		assert(error instanceof HarnessError);
+		assert.equal(error.code, "runner.auth-preflight");
+		assert.doesNotMatch(error.message, /auth\.json|models\.json|\/login|deepseek-flash/);
+		return true;
+	});
+	assert.equal(requests, 0);
+	assert.deepEqual(handle.transcript(), []);
+	assert.deepEqual(handle.transportDiagnostics?.(), []);
+});
+
+test("Pi credential-store read failure retains only a typed local cause before fetch", async t => {
+	const dir = await mkdtemp(path.join(tmpdir(), "ordinary-pi-auth-store-"));
+	const originalFetch = globalThis.fetch;
+	let handle: Awaited<ReturnType<PiSessionRunner["create"]>> | undefined;
+	let requests = 0;
+	t.after(async () => {
+		handle?.dispose(); globalThis.fetch = originalFetch;
+		await rm(dir, { recursive: true, force: true });
+	});
+	const profile = path.join(dir, "profile"), sessions = path.join(dir, "sessions"),
+		evidence = path.join(dir, "evidence");
+	await Promise.all([mkdir(profile), mkdir(sessions), mkdir(evidence)]);
+	const blocked = path.join(profile, "blocked");
+	await mkdir(blocked, { mode: 0o500 });
+	await writeFile(path.join(evidence, "original-problem.txt"), "Synthetic original problem.\n");
+	await writeFile(path.join(profile, "models.json"), JSON.stringify({ providers: { deepseek: { models: [{
+		...MODEL, compat: { supportsStore: false, supportsDeveloperRole: false,
+			maxTokensField: "max_tokens", thinkingFormat: "deepseek" },
+	}] } } }));
+	const runtime = await ModelRuntime.create({ modelsPath: path.join(profile, "models.json"),
+		// The test-owned directory is read-only. Pi's real credential store
+		// fails before any provider request, without touching a default profile.
+		authPath: path.join(blocked, "auth.json"), modelsStorePath: path.join(profile, "models-store.json"),
+		allowModelNetwork: false, refreshOnCreate: false });
+	globalThis.fetch = async () => { requests++; throw new Error("unexpected provider request"); };
+	handle = await new PiSessionRunner({ modelRuntime: runtime }).create({
+		label: "local-original-objective-1", role: "research", model: "deepseek/deepseek-flash:low",
+		systemPrompt: "Read only synthetic evidence", tools: { kind: "read-dir", root: evidence,
+			toolName: "objective_evidence_read" }, persistDir: sessions,
+	});
+	await assert.rejects(handle.prompt("Assess the synthetic original problem"), (error: unknown) => {
+		assert(error instanceof HarnessError);
+		assert(["runner.auth-store-unavailable", "runner.auth-preflight"].includes(error.code));
+		assert.doesNotMatch(error.message, /private|credential\/location|ENOENT|mkdir/);
+		return true;
+	});
+	assert.equal(requests, 0);
+	assert.deepEqual(handle.transcript(), []);
+	assert.deepEqual(handle.transportDiagnostics?.(), []);
+	handle.dispose();
+	const piEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
+	const nestedEntry = path.resolve(path.dirname(piEntry),
+		"../node_modules/@earendil-works/pi-ai/dist/index.js");
+	const nestedAi = await import(pathToFileURL(nestedEntry).href).catch(error => {
+		if ((error as NodeJS.ErrnoException).code !== "ERR_MODULE_NOT_FOUND") throw error;
+		return import("@earendil-works/pi-ai");
+	}) as
+		{ ModelsError: new (code: "auth", message: string, options: { cause: Error }) => Error };
+	const factory = (async (options: CreateAgentSessionOptions = {}) => {
+		const created = await createAgentSession(options);
+		(created.session as unknown as { prompt(text: string): Promise<void> }).prompt = async () => {
+			const cause = Object.assign(new Error("private credential path"), {
+				code: "EACCES", syscall: "open", path: "/private/credential/location" });
+			throw new nestedAi.ModelsError("auth", "Credential store read failed for deepseek", { cause });
+		};
+		return created;
+	}) as typeof createAgentSession;
+	handle = await new PiSessionRunner({ modelRuntime: runtime, createSession: factory }).create({
+		label: "local-original-objective-1", role: "research", model: "deepseek/deepseek-flash:low",
+		systemPrompt: "Read only synthetic evidence", tools: { kind: "read-dir", root: evidence,
+			toolName: "objective_evidence_read" }, persistDir: sessions,
+	});
+	await assert.rejects(handle.prompt("Assess the synthetic original problem"), (error: unknown) => {
+		assert(error instanceof HarnessError);
+		assert.equal(error.code, "runner.auth-store-unavailable");
+		assert.doesNotMatch(error.message, /private|credential\/location|EACCES|open/);
+		return true;
+	});
+	assert.equal(requests, 0);
+	assert.deepEqual(handle.transcript(), []);
 });
 
 test("allowlisted provider code and type are captured without message or param", async () => {

@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -508,12 +509,25 @@ class BalanceProbeTests(unittest.TestCase):
 
     def test_probe_workflow_has_no_custom_admission_quotas(self):
         workflow = (SCRIPT.parent.parent / ".github/workflows/provider-balance-check.yml").read_text()
-        self.assertNotIn("  workflow_dispatch:", workflow)
+        self.assertIn("  workflow_dispatch:", workflow)
         self.assertNotIn("inputs.", workflow)
         for forbidden in ("timeout-minutes:", "max-parallel:", "max-cost:",
                           "max-tokens:", "budget:", "price:"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, workflow)
+
+    def test_repository_workflows_require_explicit_manual_dispatch(self):
+        workflows = sorted((SCRIPT.parent.parent / ".github/workflows").glob("*.y*ml"))
+        self.assertTrue(workflows)
+        for file in workflows:
+            with self.subTest(workflow=file.name):
+                # Require the repository's explicit block form so shorthand or
+                # a newly added automatic event cannot silently escape this check.
+                text = file.read_text()
+                blocks = re.findall(r"(?m)^on:\s*\n((?:[ \t]+[^\n]*\n|\n)*)", text)
+                self.assertEqual(len(blocks), 1)
+                events = re.findall(r"(?m)^  ([A-Za-z_][A-Za-z0-9_-]*):", blocks[0])
+                self.assertEqual(events, ["workflow_dispatch"])
 
     class _Response:
         def __init__(self, body, status=200):

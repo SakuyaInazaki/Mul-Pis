@@ -132,6 +132,7 @@ function registerThrowingEvaluator(root: string, reconcile: boolean, liveChildMs
 }
 
 function createRunner(log: string, assessment: "first" | "second" | "invalid") {
+	let invalidAssessmentCount = 0;
 	return new FakeSessionRunner(async ({ spec }) => {
 		if (spec.label === "M04-research") {
 			if (spec.tools.kind === "read-dir") {
@@ -188,7 +189,12 @@ function createRunner(log: string, assessment: "first" | "second" | "invalid") {
 		}
 		if (spec.label.startsWith("local-original-objective-")) {
 			await appendFile(log, "assessor\n");
-			if (assessment === "invalid") return "Deliberately invalid fresh assessment";
+			if (assessment === "invalid") {
+				invalidAssessmentCount++;
+				if (invalidAssessmentCount > 4)
+					throw new DOMException("Synthetic assessor abort after repeated invalid replies", "AbortError");
+				return "Deliberately invalid fresh assessment";
+			}
 			assert.equal(spec.tools.kind, "read-dir");
 			if (spec.tools.kind !== "read-dir") throw new Error("assessor input is unavailable");
 			const contract = JSON.parse(await readFile(path.join(spec.tools.root,
@@ -644,8 +650,10 @@ if (process.argv[2] === "child-start") {
 		assert.equal(recovered.stopReason, "objective-reassessment-pending");
 		assert.equal(recovered.boundedRuns.length, 1);
 		assert.deepEqual(recovered.selectedArtifacts, []);
+		const committed = await LocalMissionHost.status(missionRoot);
+		assert.equal(committed.checkpointReceipts.at(-2)?.version, 4);
 		assert.deepEqual(await LocalMissionHost.readCommittedCheckpoint(missionRoot,
-			(await LocalMissionHost.status(missionRoot)).latestCheckpoint!.sequence - 1), oldCheckpoint);
+			committed.latestCheckpoint!.sequence - 2), oldCheckpoint);
 		const afterGoal = JSON.parse(await readFile(path.join(ws.runDir("M07", runId), "goal.json"), "utf8")) as
 			{ tasks: Array<{ taskId: string; status: string }> };
 		assert.equal(afterGoal.tasks.length, 1);
@@ -654,6 +662,130 @@ if (process.argv[2] === "child-start") {
 		const calls = (await readFile(log, "utf8")).trim().split("\n");
 		for (const label of ["assessor", "builder", "evaluator", "m04"])
 			assert.equal(calls.filter(item => item === label).length, 1, `${label} was replayed`);
+		const later = await resumed.step(missionId);
+		assert.equal(later.stopReason, "cancelled");
+		assert.equal((await LocalMissionHost.status(missionRoot)).repairRequired, false);
+		const goalFile = path.join(ws.runDir("M07", runId), "goal.json");
+		const tamperedGoal = JSON.parse(await readFile(goalFile, "utf8")) as
+			{ knowledgeSnapshot: unknown };
+		tamperedGoal.knowledgeSnapshot = { forged: true };
+		await writeFile(goalFile, `${JSON.stringify(tamperedGoal, null, 2)}\n`);
+		assert.equal((await LocalMissionHost.status(missionRoot)).repairRequired, true,
+			"an unchanged baseline cannot silently gain a different knowledge snapshot");
+	});
+
+	test("recovered M04 completion survives a host checkpoint interruption without replay", async t => {
+		const localEvaluatorId = "test:empty-auxiliary-m04-checkpoint-interruption";
+		const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-m04-interruption-"));
+		t.after(() => rm(root, { recursive: true, force: true }));
+		const ws = new Workspace(root);
+		await mkdir(path.dirname(ws.problemFile), { recursive: true });
+		await writeFile(ws.problemFile, "Check one synthetic candidate and its auxiliary log.\n");
+		await runInit(ws, createFileKnowledgeStore(ws.knowledgeDir));
+		await writeFile(ws.configFile, JSON.stringify({ roles: { research: "fake/research",
+			execution: "fake/execution" }, concurrency: 1, tools: {},
+			localMission: { evaluatorId: localEvaluatorId, execution: "task-root-bash" } }));
+		await writeFile(path.join(root, "empty-auxiliary-case"), "enabled\n");
+		const first = spawnSync(process.execPath, [import.meta.filename, "child-start", root],
+			{ cwd: path.join(import.meta.dirname, ".."), encoding: "utf8", timeout: 30_000 });
+		assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
+		const missionId = (await readFile(path.join(root, "mission-id.txt"), "utf8")).trim();
+		const missionRoot = path.join(ws.agentDir, "missions", missionId);
+		const [runId] = await ws.listRuns("M07");
+		assert(runId);
+		const goal = JSON.parse(await readFile(path.join(ws.runDir("M07", runId), "goal.json"), "utf8")) as
+			{ tasks: Array<{ workDir: string }> };
+		const taskRoot = path.dirname(goal.tasks[0]!.workDir);
+		const snapshot = path.join(taskRoot, "evaluator-snapshot");
+		await rm(path.join(snapshot, (await readdir(snapshot)).sort()[2]!));
+		await rm(path.join(taskRoot, "host-evaluator-output", "unclaimed.txt"));
+		const log = path.join(root, "calls.log");
+		registerEvaluator(log, false, localEvaluatorId);
+		const config = await ws.loadConfig();
+		const runner = createRunner(log, "invalid");
+		const mission = openDefaultLocalMission({ workspaceRoot: root, runner, config });
+		const record = LocalMissionHost.prototype.recordCheckpoint;
+		let interrupted = false;
+		LocalMissionHost.prototype.recordCheckpoint = async function(input) {
+			const progress = JSON.parse(input.bytes.toString("utf8")) as
+				{ stopReason?: string; boundedRuns?: unknown[] };
+			if (!interrupted && progress.stopReason === "objective-reassessment-pending" &&
+				progress.boundedRuns?.length === 1) {
+				interrupted = true;
+				throw new Error("synthetic post-M04 checkpoint interruption");
+			}
+			return record.call(this, input);
+		};
+		try { await assert.rejects(mission.step(missionId), /synthetic post-M04 checkpoint interruption/); }
+		finally { LocalMissionHost.prototype.recordCheckpoint = record; }
+		assert(interrupted);
+		assert.equal((await LocalMissionHost.status(missionRoot)).repairRequired, false);
+		assert.equal((await mission.status(missionId)).stopReason, "m04-review-pending");
+		const reopened = openDefaultLocalMission({ workspaceRoot: root, runner, config });
+		const selected = await reopened.step(missionId);
+		assert.equal(selected.stopReason, "objective-reassessment-pending");
+		assert.equal((await LocalMissionHost.status(missionRoot)).repairRequired, false);
+		const calls = (await readFile(log, "utf8")).trim().split("\n");
+		for (const label of ["assessor", "builder", "evaluator", "m04"])
+			assert.equal(calls.filter(item => item === label).length, 1, `${label} was replayed`);
+	});
+
+	test("recovered accepted M04 refresh binds its formal baseline to the completed run", async t => {
+		const localEvaluatorId = "test:empty-auxiliary-formal-baseline";
+		const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-m04-baseline-"));
+		t.after(() => rm(root, { recursive: true, force: true }));
+		const ws = new Workspace(root);
+		await mkdir(path.dirname(ws.problemFile), { recursive: true });
+		await writeFile(ws.problemFile, "Check one synthetic candidate and its auxiliary log.\n");
+		await runInit(ws, createFileKnowledgeStore(ws.knowledgeDir));
+		const baseline = await ws.startRun("M04", []);
+		await ws.finishRun(baseline, "completed");
+		await writeFile(ws.configFile, JSON.stringify({ roles: { research: "fake/research",
+			execution: "fake/execution" }, concurrency: 1, tools: {},
+			localMission: { evaluatorId: localEvaluatorId, execution: "task-root-bash" } }));
+		await writeFile(path.join(root, "empty-auxiliary-case"), "enabled\n");
+		const first = spawnSync(process.execPath, [import.meta.filename, "child-start", root],
+			{ cwd: path.join(import.meta.dirname, ".."), encoding: "utf8", timeout: 30_000 });
+		assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
+		const missionId = (await readFile(path.join(root, "mission-id.txt"), "utf8")).trim();
+		const missionRoot = path.join(ws.agentDir, "missions", missionId);
+		const [runId] = await ws.listRuns("M07");
+		assert(runId);
+		const goal = JSON.parse(await readFile(path.join(ws.runDir("M07", runId), "goal.json"), "utf8")) as
+			{ tasks: Array<{ workDir: string }> };
+		const taskRoot = path.dirname(goal.tasks[0]!.workDir);
+		const snapshot = path.join(taskRoot, "evaluator-snapshot");
+		await rm(path.join(snapshot, (await readdir(snapshot)).sort()[2]!));
+		await rm(path.join(taskRoot, "host-evaluator-output", "unclaimed.txt"));
+		const log = path.join(root, "calls.log");
+		registerEvaluator(log, false, localEvaluatorId);
+		const mission = openDefaultLocalMission({ workspaceRoot: root,
+			runner: createRunner(log, "invalid"), config: await ws.loadConfig() });
+		const advanced = await mission.step(missionId);
+		assert.equal(advanced.stopReason, "objective-reassessment-pending");
+		assert(advanced.selectedArtifacts.length > 0);
+		assert.equal((await LocalMissionHost.status(missionRoot)).repairRequired, false);
+		const goalFile = path.join(ws.runDir("M07", runId), "goal.json");
+		const finishedBytes = await readFile(goalFile);
+		const finished = JSON.parse(finishedBytes.toString("utf8")) as {
+			m04BaselineRunId: string; knowledgeSnapshot: unknown;
+			baselineHistory: Array<{ m04RunId: string; knowledgeSnapshot?: unknown }> };
+		assert.notEqual(finished.m04BaselineRunId, baseline.runId);
+		assert.equal(finished.baselineHistory.at(-1)?.m04RunId, finished.m04BaselineRunId);
+		finished.knowledgeSnapshot = "forged-snapshot";
+		finished.baselineHistory.at(-1)!.knowledgeSnapshot = "forged-snapshot";
+		await writeFile(goalFile, `${JSON.stringify(finished, null, 2)}\n`);
+		assert.equal((await LocalMissionHost.status(missionRoot)).repairRequired, true,
+			"matched but forged live/history snapshots must not replace the M04 transaction authority");
+		await writeFile(goalFile, finishedBytes);
+		assert.equal((await LocalMissionHost.status(missionRoot)).repairRequired, false);
+		const selectionFile = path.join(missionRoot, "evidence",
+			`selection-review-${runId}.json`);
+		const selection = JSON.parse(await readFile(selectionFile, "utf8")) as { m04RunId: string };
+		selection.m04RunId = baseline.runId;
+		await writeFile(selectionFile, `${JSON.stringify(selection, null, 2)}\n`);
+		assert.equal((await LocalMissionHost.status(missionRoot)).repairRequired, true,
+			"the selected successor must retain its exact M04 review receipt");
 	});
 
 	test("untrusted snapshot, assessor evidence, and unknown effects block journal-absent recovery", async t => {
@@ -1066,7 +1198,7 @@ if (process.argv[2] === "child-start") {
 					{ stopReason: string; boundedRunCount: number };
 				assert.equal(retried.boundedRunCount, 1);
 				if (crashAt === "after-prepare")
-					assert.equal(retried.stopReason, "workflow-repair-needed",
+					assert.equal(retried.stopReason, "cancelled",
 						"mission.run continued to a fresh assessor after V4 recovery");
 				const final = await LocalMissionHost.status(missionRoot);
 				assert.equal(final.writerLockPresent, false);

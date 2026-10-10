@@ -1,9 +1,6 @@
 name: Bounded confidential campaign
 
 on:
-  push:
-    branches:
-      - run-requests/workflow-learning-reliability
   workflow_dispatch:
     inputs:
       authorize_bounded_run:

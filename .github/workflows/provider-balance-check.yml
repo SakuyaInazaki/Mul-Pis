@@ -2,9 +2,7 @@ name: Confidential provider balance check
 run-name: Confidential provider balance check
 
 on:
-  push:
-    branches:
-      - run-requests/provider-balance-availability
+  workflow_dispatch:
 
 permissions:
   contents: read

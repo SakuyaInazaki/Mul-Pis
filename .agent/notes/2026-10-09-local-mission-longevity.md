@@ -1,0 +1,12 @@
+# Local mission continuity regression and lock repair
+
+This change batch is an offline, synthetic check of the default local mission path. It is not a real DeepSeek long run, does not use a provider, and does not establish a scientific result.
+
+- Added a default `mission.run` fixture with eight distinct bounded M07 reports and eight M04 reviews. The first assessor returns four identical malformed replies before a valid task proposal. An intentional assessor `AbortError` after the eighth round leaves the original open objective incomplete; reopening status does not replay builder or M04 work. Eight is only the test fixture length.
+- Removed the automatic `workflow-repair-needed` outcome caused solely by seeing the same read-only repair fingerprint after one same-session correction and one fresh context. Further identical failures use fresh contexts. Real cancellation, output limits, inaccessible evidence, provider failure, and unsafe context handoff remain stop boundaries. Invalid replies never authorize dispatch or closure.
+- The default mission caller no longer retains a second, unused in-memory copy of every loop step. A direct loop regression exercises one thousand synthetic steps and confirms this optional collection stays empty. The persisted mission checkpoint and evidence history are unchanged by this memory reduction.
+- Moved writer-lock initialization inside its cleanup scope. Six injected failures before host mutation now release the exact lock inode, leave no repair state, and permit an exact retry. Failed or uncertain mutations still retain their lock for review.
+
+A persistent failure of `stat` or `close` on the open lock handle cannot establish exact inode or descriptor lifetime; that path remains fail closed for review. The injected cases represent one-shot failures at stage boundaries, including before the first stat, rather than a claim that all storage failures can be recovered automatically.
+
+Remaining design work: the persisted checkpoint and prior-evidence census grow with the mission. The existing 64 MiB checkpoint transport bound is a physical safety boundary, not a scientific stopping rule. A referenced or partitioned durable history would be needed for arbitrarily long missions. Repeated M04 failures on one accepted checkpoint also put every prior failure ID into each new diagnostic prompt; the underlying stage records remain durable, but prompt growth should be addressed with a verified historical locator.

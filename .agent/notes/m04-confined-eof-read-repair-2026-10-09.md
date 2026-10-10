@@ -1,0 +1,7 @@
+# M04 confined EOF read repair
+
+A required M07 evidence read could request a line offset beyond the real end of a frozen text file. The read tool reported an error, and M04 treated every required-file read error as fatal before its existing same-session missing-range repair. A later successful tail read did not establish that earlier lines had reached the research session.
+
+The confined host reader now attaches a typed `offset-beyond-eof` event only when it has read the resolved file bytes and a safe integer offset exceeds the SDK-visible line count. M04 compares the event's actual line count with its required evidence file, then issues its ordinary same-session prompt naming the actual line count and next missing range. Error events never count as returned lines. Unknown, access, path confinement, and inconsistent EOF errors still stop the run. Required-file bindings compare exact bytes, so a same-size content change cannot license repair or a knowledge proposal.
+
+Offline regressions cover a 424-line file with offset 695 and limit 700, a successful return of lines 400–424, the remaining 1–399 gap, a same-session corrective read and no premature proposal. They also cover a forged EOF count, path escape remaining unclassified, and same-size byte changes. Focused tests and TypeScript checking use installed local dependencies only. This is a controller repair for a known read-argument error, not proof that the model understood or used every returned line; normal coverage, frozen-input, and proposal gates still apply.

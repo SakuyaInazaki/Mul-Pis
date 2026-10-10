@@ -21,13 +21,12 @@ import { validatePriorGroundingIndex } from "../src/m07/assessor-grounding.ts";
 import { runOriginalObjectiveLoop } from "../src/m07/objective-progress.ts";
 import { PrivateAssessorDiagnosticError } from "../src/runner/private-assessor-diagnostic.ts";
 
-test("shared-total campaign requires explicit manual admission and signed cumulative ledger", async () => {
+test("campaign requires explicit manual admission and signed cumulative ledger", async () => {
  const workflow = await readFile(new URL("../.github/workflows/manual-private-campaign.yml", import.meta.url), "utf8");
  const gate = workflow.split("  private-campaign:\n")[1]?.split("    runs-on:")[0] ?? "";
  const triggers = workflow.split(/^on:\s*$/m)[1]?.split(/^permissions:\s*$/m)[0] ?? "";
  assert.deepEqual([...triggers.matchAll(/^  ([A-Za-z_][\w-]*):/gm)].map(match => match[1]),
-  ["push", "workflow_dispatch"]);
- assert.ok(triggers.includes("run-requests/workflow-learning-reliability"));
+  ["workflow_dispatch"]);
  assert.doesNotMatch(triggers, /^\s+- improve\/workflow-learning-reliability\s*$/m);
  assert.ok(gate.includes("github.repository == 'SakuyaInazaki/Mul-Pis'"));
  assert.ok(gate.includes("github.actor == 'SakuyaInazaki'"));

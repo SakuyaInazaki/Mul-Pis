@@ -1,0 +1,9 @@
+# Accepted local M07 review continuation
+
+An accepted local M07 task now reaches a committed pending-review checkpoint before its first M04 judgment. The checkpoint binds the accepted task, frozen M07 checkpoint and exact required file bytes, evaluator receipt, required read set, and ordered M04 attempt history. A failed M04 run with a verified no-proposal knowledge transaction leaves that candidate unselected and schedules a fresh read-only M04 over the same frozen evidence. The fresh reviewer receives a bounded host diagnostic and retained run references for the previous failed attempt. New M04 read coverage is required for selection.
+
+The host claims the pending review under its writer lock, reconciles exact M04 source and input records after interruption, and holds on running or unresolved knowledge effects. Claim publication uses an atomic rename. A dead claim writer may be recovered only with the same pending checkpoint and host process identity proof. Selection and mission checkpoint publication are idempotent across a process restart.
+
+The resumed host also checks the versioned M07 execution state against the frozen checkpoint. Read-only reason tasks retain their authenticated zero-operation shape; execute tasks require the one returned operation for the accepted task. A missing state or missing execute response holds review before another M04.
+
+Offline verification: TypeScript typecheck passed. The local mission workflow, host, evaluator recovery, and interrupted reconcile tests passed (138 tests), including reason and execute candidate retries and selection, process reopen after M04 failure and after selection, pending merge and host abort holds, same-size checkpoint feedback tamper, claim publication crash windows, claim release failure, and missing operation negatives. No model or network was used.
