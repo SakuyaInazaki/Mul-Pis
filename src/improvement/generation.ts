@@ -62,7 +62,7 @@ function boundedStrings(value: unknown, field: string, max = 16): string[] {
  return value;
 }
 export function validateExperienceRequirements(value: unknown, field: string): ExperienceRequirementV1[] {
- if (!Array.isArray(value) || value.length > 40 || !value.every((x) => x && typeof x === "object" && ["executor", "improver"].includes(x.targetKind) && isKnowledgeRef(x.ref))) throw new HarnessError("improvement.generation", `${field} must be at most 40 pinned experience references`);
+ if (!Array.isArray(value) || !value.every((x) => x && typeof x === "object" && ["executor", "improver"].includes(x.targetKind) && isKnowledgeRef(x.ref))) throw new HarnessError("improvement.generation", `${field} must contain valid pinned experience references`);
  const seen = new Set(value.map((x) => `${x.targetKind}:${x.ref.storeId}/${x.ref.recordId}@${x.ref.version}`));
  if (seen.size !== value.length) throw new HarnessError("improvement.generation", `${field} contains duplicate references`);
  return value as ExperienceRequirementV1[];
@@ -86,18 +86,19 @@ export function validateStrategyRecord(input: unknown): StrategyRecordV1 {
  const sourceExperienceRefs = validateExperienceRequirements(item.sourceExperienceRefs ?? [], "sourceExperienceRefs");
  const requiredExperienceRefs = validateExperienceRequirements(item.requiredExperienceRefs ?? [], "requiredExperienceRefs");
  const requiredKnowledgeRefs = item.requiredKnowledgeRefs ?? [];
- if (!Array.isArray(requiredKnowledgeRefs) || requiredKnowledgeRefs.length > 100 || !requiredKnowledgeRefs.every(isKnowledgeRef) || new Set(requiredKnowledgeRefs.map((ref) => `${ref.storeId}/${ref.recordId}@${ref.version}`)).size !== requiredKnowledgeRefs.length) throw new HarnessError("improvement.generation", "requiredKnowledgeRefs must be bounded distinct pinned references");
+ if (!Array.isArray(requiredKnowledgeRefs) || !requiredKnowledgeRefs.every(isKnowledgeRef) || new Set(requiredKnowledgeRefs.map((ref) => `${ref.storeId}/${ref.recordId}@${ref.version}`)).size !== requiredKnowledgeRefs.length) throw new HarnessError("improvement.generation", "requiredKnowledgeRefs must be distinct valid pinned references");
  if (item.dependencyTransition !== undefined) {
   const transition = item.dependencyTransition as Record<string, unknown>;
-  if (!transition || typeof transition !== "object" || Array.isArray(transition) || Object.keys(transition).some((key) => !["version", "decisionRef", "removedRefs", "addedRefs", "evidenceRefs", "revalidationRef", "at"].includes(key)) || transition.version !== 1 || !isKnowledgeRef(transition.decisionRef) || !isKnowledgeRef(transition.revalidationRef) || typeof transition.at !== "string" || !Array.isArray(transition.removedRefs) || !Array.isArray(transition.addedRefs) || !Array.isArray(transition.evidenceRefs) || transition.removedRefs.length + transition.addedRefs.length > 100 || transition.evidenceRefs.length < 1 || transition.evidenceRefs.length > 20 || ![...transition.removedRefs, ...transition.addedRefs, ...transition.evidenceRefs].every(isKnowledgeRef)) throw new HarnessError("improvement.generation", "invalid method dependency transition provenance");
+  if (!transition || typeof transition !== "object" || Array.isArray(transition) || Object.keys(transition).some((key) => !["version", "decisionRef", "removedRefs", "addedRefs", "evidenceRefs", "revalidationRef", "at"].includes(key)) || transition.version !== 1 || !isKnowledgeRef(transition.decisionRef) || !isKnowledgeRef(transition.revalidationRef) || typeof transition.at !== "string" || !Array.isArray(transition.removedRefs) || !Array.isArray(transition.addedRefs) || !Array.isArray(transition.evidenceRefs) || transition.evidenceRefs.length < 1 || ![...transition.removedRefs, ...transition.addedRefs, ...transition.evidenceRefs].every(isKnowledgeRef)) throw new HarnessError("improvement.generation", "invalid method dependency transition provenance");
  }
  return { ...item, artifact: validateStrategy(item.kind as StrategyKind, item.artifact), applicability: boundedStrings(item.applicability, "applicability"), limitations: boundedStrings(item.limitations, "limitations"), sourceExperienceRefs, requiredExperienceRefs, requiredKnowledgeRefs } as StrategyRecordV1;
 }
 export function validateGenerationBundle(input: unknown): GenerationBundleV1 {
  if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.generation", "bundle must be an object");
  const item = input as Record<string, unknown>;
- if (item.version !== 1 || !Array.isArray(item.parents) || item.parents.length > 4 || !item.parents.every((x) => typeof x === "string" && SAFE_ID.test(x)) || !["research-only", "admitted", "manual-active"].includes(String(item.state)) || typeof item.createdAt !== "string" || typeof item.environmentVersion !== "string" || typeof item.protocolVersion !== "string" || !item.modelConfig || typeof item.modelConfig !== "object") throw new HarnessError("improvement.generation", "invalid bundle");
+ if (item.version !== 1 || !Array.isArray(item.parents) || !item.parents.every((x) => typeof x === "string" && SAFE_ID.test(x)) || !["research-only", "admitted", "manual-active"].includes(String(item.state)) || typeof item.createdAt !== "string" || typeof item.environmentVersion !== "string" || typeof item.protocolVersion !== "string" || !item.modelConfig || typeof item.modelConfig !== "object") throw new HarnessError("improvement.generation", "invalid bundle");
  safeId(item.bundleId, "bundleId"); safeId(item.executorVersionId, "executorVersionId"); safeId(item.improverVersionId, "improverVersionId");
+ if ((item.parents as string[]).includes(item.bundleId as string) || new Set(item.parents as string[]).size !== (item.parents as string[]).length) throw new HarnessError("improvement.generation", "bundle parents must be distinct and acyclic");
  if (item.knowledgeSnapshot !== undefined) safeId(item.knowledgeSnapshot, "knowledgeSnapshot");
  const models = item.modelConfig as Record<string, unknown>;
  if (typeof models.improver !== "string" || typeof models.research !== "string" || !Array.isArray(item.allowedCapabilities) || item.allowedCapabilities.some((x: unknown) => !["cpu-probe", "no-tools-model", "m07-evidence-read"].includes(String(x)))) throw new HarnessError("improvement.generation", "invalid bundle model/capabilities");
@@ -133,6 +134,16 @@ export class GenerationStore {
   if (existsSync(this.bundlePath(bundle.bundleId))) throw new HarnessError("improvement.generation", "bundle version already exists");
   const [h, i] = await Promise.all([this.readStrategy(bundle.executorVersionId), this.readStrategy(bundle.improverVersionId)]);
   if (h.kind !== "executor" || i.kind !== "improver") throw new HarnessError("improvement.generation", "bundle strategy kinds are incompatible");
+  const visited = new Set<string>(), visiting = new Set<string>();
+  const verifyParent = async (id: string): Promise<void> => {
+   if (visiting.has(id) || id === bundle.bundleId) throw new HarnessError("improvement.generation", "bundle ancestry contains a cycle");
+   if (visited.has(id)) return;
+   visiting.add(id);
+   const parent = await this.readBundle(id);
+   for (const ancestor of parent.parents) await verifyParent(ancestor);
+   visiting.delete(id); visited.add(id);
+  };
+  for (const parent of bundle.parents) await verifyParent(parent);
   await writeFileAtomic(this.bundlePath(bundle.bundleId), `${JSON.stringify(bundle, null, 2)}\n`); return bundle;
  }
  async readBundle(id: string): Promise<GenerationBundleV1> {

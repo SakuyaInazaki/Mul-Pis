@@ -9,17 +9,23 @@
  * through the single serial entry; merging is never a truth certificate.
  */
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
-import type { ProposalOp } from "../knowledge/types.ts";
+import { linkedEvidence, openBoundedSession } from "../context/boundary.ts";
+import type { ReadReturnEvent } from "../runner/types.ts";
+import type { ProposalOp, ProposalReceipt, ValidationIssue } from "../knowledge/types.ts";
+import { retrieveKnowledge } from "../knowledge/retrieval.ts";
 import { buildM04Message, extractKnowledgeProposals, systemPromptFor } from "../prompts.ts";
 import type { ProblemMaterials } from "../prompts.ts";
 import { HarnessError, type InputRef, type StageRunRecord } from "../types.ts";
-import { readTextIfExists } from "../workspace.ts";
-import { loadProblemMaterials, readOutput, recordSession, relPath, requireCompletedRun, sessionSpec, withRun, type StageContext } from "./context.ts";
+import { readTextIfExists, writeFileAtomic } from "../workspace.ts";
+import { loadProblemMaterials, readOutput, relPath, requireCompletedRun, sessionSpec, withRun, type StageContext } from "./context.ts";
 import { specFileFor } from "./m03.ts";
 import { readFrozenArtifactManifest, type FrozenArtifactManifest } from "./artifacts.ts";
 import { renderPageTool } from "../tools/pagetool.ts";
 import { markFeedbackAssembled } from "../improvement/observations.ts";
+import { workflowRepairFingerprint, workflowRepairState, WorkflowRepairNeededError,
+	type WorkflowRepairFailure, type WorkflowRepairStateV1 } from "../runner/repair-liveness.ts";
 
 export type M04Feedback =
 	| { kind: "M03"; runId?: string }
@@ -35,6 +41,30 @@ export interface M04Options {
 	freshSession?: boolean;
 	/** Purpose string recorded in the knowledge pack. */
 	purpose?: string;
+	/** Optional exact frozen M07 files that must be returned in full before any M04 merge. */
+	requiredM07ReadPaths?: string[];
+	/** Host-authored provenance instruction; it cannot authorize a historical proposal. */
+	additionalReadOnlyInstruction?: string;
+	/** Exact private host diagnostic for a distinct fresh review of the same checkpoint. */
+	priorFailureEvidence?: { path: string; sha256: string };
+	/** Private host receipt for evidence-triggered read-only judgment repair. */
+	onRepairState?: (state: WorkflowRepairStateV1) => Promise<void>;
+	/** Private, lossless validation diagnostic; awaited before any further judgment or proposal action. */
+	onInvalidJudgment?: (event: M04InvalidJudgmentEvent) => Promise<void>;
+}
+
+export interface M04InvalidJudgmentEvent {
+	stage: "m04-judgment";
+	sessionId: string;
+	generation: number;
+	/** Prompt ordinal within this session generation, including valid replies. */
+	attempt: number;
+	rawResponse: string;
+	/** Exact host validation response and any underlying private issue details. */
+	validation: { code: string; message: string; path: string; detail?: unknown };
+	coverage: Array<{ sourceId: string; required: boolean;
+		coveredRanges: Array<{ start: number; end: number }>; complete: boolean }>;
+	transcriptPath?: string;
 }
 
 export interface M04Result {
@@ -43,6 +73,22 @@ export interface M04Result {
 	proposalId?: string;
 	snapshotId?: string;
 	mode: "continue-m01" | "research-session";
+	/** Exact submitted draft identities, including rejected structural drafts. */
+	proposalAttempts: M04KnowledgeTransactionV1["attempts"];
+}
+
+export interface M04KnowledgeTransactionV1 {
+	version: 1;
+	kind: "m04-knowledge-transaction";
+	m04RunId: string;
+	state: "no-proposal" | "rejected-draft" | "merge-intent" | "merged" | "unknown";
+	currentProposalId?: string;
+	/** Present only after the serial merge returned a published snapshot. */
+	snapshotId?: string;
+	attempts: Array<{ ordinal: number; proposalId: string; proposalFile: string;
+		receiptFile: string; structurallyValid: boolean; issues: ValidationIssue[];
+		state: "drafted" | "rejected-draft" | "merge-intent" | "merged" }>;
+	updatedAt: string;
 }
 
 interface ResolvedFeedback {
@@ -59,6 +105,134 @@ const SAFE_CHECKPOINT_ID = /^C\d{3,}$/;
 function checkpointRelative(file: string): boolean {
 	return typeof file === "string" && file.length > 0 && file !== "." && !path.isAbsolute(file) &&
 		file.split(/[\\/]/).every((part) => part !== "" && part !== "." && part !== "..");
+}
+
+export async function requiredM07Reads(root: string, requested: string[] | undefined): Promise<string[]> {
+	if (requested === undefined) return [];
+	if (!Array.isArray(requested) || requested.length < 1 ||
+		new Set(requested).size !== requested.length) throw new HarnessError("m04.m07-evidence", "required M07 read paths must be bounded and unique");
+	const rootReal = await realpath(root);
+	for (const relative of requested) {
+		if (typeof relative !== "string" || relative.length > 240 || !checkpointRelative(relative) ||
+			path.win32.isAbsolute(relative) || relative.includes("\\"))
+			throw new HarnessError("m04.m07-evidence", "required M07 read path is not a safe relative file");
+		const source = path.join(rootReal, relative), info = await lstat(source), resolved = await realpath(source);
+		if (!info.isFile() || info.isSymbolicLink() || !resolved.startsWith(`${rootReal}${path.sep}`))
+			throw new HarnessError("m04.m07-evidence", "required M07 read path is not a frozen regular file");
+	}
+	return requested;
+}
+
+interface M07ReadGap {
+	relative: string;
+	lineCount: number;
+	missingRanges: Array<{ start: number; end: number }>;
+	terminalPageMissing: boolean;
+	emptyFile?: true;
+}
+
+async function m07ReadGaps(root: string, required: string[], returned: ReadReturnEvent[]): Promise<M07ReadGap[]> {
+	const gaps: M07ReadGap[] = [];
+	for (const relative of required) {
+		const bytes = await readFile(path.join(root, relative));
+		if (bytes.length === 0) {
+			const completeEmptyRead = returned.some(event => event.toolName === "m07_evidence_read" &&
+				event.path === relative && event.status === "no-content" && event.returned.kind === "text" &&
+				event.returned.truncated === false && event.returned.startLine === undefined &&
+				event.returned.endLine === undefined);
+			if (!completeEmptyRead) gaps.push({ relative, lineCount: 0, missingRanges: [], terminalPageMissing: false, emptyFile: true });
+			continue;
+		}
+		const content = bytes.toString("utf8");
+		const lineCount = content.split(/\r?\n/).length - (content.endsWith("\n") ? 1 : 0);
+		if (lineCount < 1) throw new HarnessError("m04.m07-evidence", "required M07 evidence line count is unavailable");
+		const ranges: Array<{ start: number; end: number }> = [];
+		let completeTerminalPage = false;
+		for (const event of returned) {
+			if (event.toolName !== "m07_evidence_read" || event.path !== relative ||
+				event.status !== "returned" || event.returned.kind !== "text") continue;
+			const start = event.returned.startLine, end = event.returned.endLine;
+			if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start! < 1 || end! < start! || end! > lineCount) continue;
+			ranges.push({ start: start!, end: end! });
+			if (end === lineCount && event.returned.truncated === false) completeTerminalPage = true;
+		}
+		ranges.sort((a, b) => a.start - b.start || a.end - b.end);
+		let nextUnread = 1;
+		const missingRanges: M07ReadGap["missingRanges"] = [];
+		for (const range of ranges) {
+			if (range.start > nextUnread) missingRanges.push({ start: nextUnread, end: range.start - 1 });
+			nextUnread = Math.max(nextUnread, range.end + 1);
+		}
+		if (nextUnread <= lineCount) missingRanges.push({ start: nextUnread, end: lineCount });
+		if (!completeTerminalPage || missingRanges.length) gaps.push({ relative, lineCount, missingRanges,
+			terminalPageMissing: !completeTerminalPage });
+	}
+	return gaps;
+}
+
+async function m07ValidationCoverage(root: string, required: string[], returned: ReadReturnEvent[],
+	gaps: M07ReadGap[]): Promise<M04InvalidJudgmentEvent["coverage"]> {
+	const incomplete = new Set(gaps.map(gap => gap.relative));
+	return Promise.all(required.map(async relative => {
+		const content = await readFile(path.join(root, relative), "utf8");
+		const lineCount = content.split(/\r?\n/).length - (content.endsWith("\n") ? 1 : 0);
+		const ranges = returned.filter(event => event.toolName === "m07_evidence_read" &&
+			event.path === relative && event.status === "returned" && event.returned.kind === "text")
+			.map(event => ({ start: event.returned.startLine, end: event.returned.endLine }))
+			.filter((range): range is { start: number; end: number } =>
+				Number.isSafeInteger(range.start) && Number.isSafeInteger(range.end) &&
+				range.start! >= 1 && range.end! >= range.start! && range.end! <= lineCount)
+			.sort((a, b) => a.start - b.start || a.end - b.end);
+		const coveredRanges: Array<{ start: number; end: number }> = [];
+		for (const range of ranges) {
+			const last = coveredRanges.at(-1);
+			if (last && range.start <= last.end + 1) last.end = Math.max(last.end, range.end);
+			else coveredRanges.push({ ...range });
+		}
+		return { sourceId: relative, required: true, coveredRanges, complete: !incomplete.has(relative) };
+	}));
+}
+
+export async function assertFullM07Reads(root: string, required: string[], returned: ReadReturnEvent[]): Promise<void> {
+	if ((await m07ReadGaps(root, required, returned)).length)
+		throw new HarnessError("m04.m07-evidence", "required selected M07 evidence was not returned to the research session in full");
+}
+
+/** The private receipt retains every issue verbatim; only safe bounded guidance
+ * enters the next model prompt. Unknown user-chosen field names may be secrets. */
+function structuralIssueFeedback(issues: ValidationIssue[]): string {
+	const errors = issues.filter(item => item.level === "error");
+	const lines = errors.map(item => {
+		const raw = item.message;
+		const safe = !/(?:authorization|bearer|password|passwd|secret|credential|api[_-]?key|access[_-]?token|sk-[A-Za-z0-9_-]{6,})/i.test(raw)
+			? raw : "Issue detail is retained in the private validation receipt; revise the cited operation conservatively.";
+		return `- ${item.opIndex === undefined ? "batch" : `operation ${item.opIndex + 1}`}: ${safe}`;
+	});
+	return lines.join("\n") || "- Structural validation rejected the draft; exact issues are retained in the private receipt.";
+}
+
+/** Parsed proposal order is meaningful; object property order is not. */
+function canonicalProposalValue(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonicalProposalValue);
+	if (value !== null && typeof value === "object") return Object.fromEntries(
+		Object.entries(value).sort(([a], [b]) => a.localeCompare(b))
+			.map(([key, item]) => [key, canonicalProposalValue(item)]));
+	return value;
+}
+
+/** Compare host validation defects, rather than changing scientific draft prose.
+ * Values after the host's colon, record identities and ref array positions are
+ * not structural progress. Only fingerprints of this shape leave the stage. */
+function structuralIssueShape(issues: ValidationIssue[]): unknown {
+	const counts = new Map<string, number>();
+	for (const item of issues.filter(item => item.level === "error")) {
+		const category = item.message.split(/[：:]/, 1)[0]
+			.replace(/\[\d+\]/g, "[]")
+			.replace(/\b[CKEJQDXG]\d{3,}(?:@\d+)?\b/g, "record-id");
+		counts.set(category, (counts.get(category) ?? 0) + 1);
+	}
+	return [...counts].sort(([a], [b]) => a.localeCompare(b))
+		.map(([category, count]) => ({ level: "error", category, count }));
 }
 
 async function resolveM07Checkpoint(ctx: StageContext, runId: string, checkpointId: string): Promise<ResolvedFeedback> {
@@ -209,6 +383,39 @@ async function resolveFeedback(ctx: StageContext, feedback: M04Feedback): Promis
 
 export async function runM04(ctx: StageContext, options: M04Options): Promise<M04Result> {
 	const feedback = await resolveFeedback(ctx, options.feedback);
+	let priorFailureBytes: Buffer | undefined;
+	if (options.priorFailureEvidence) {
+		const { path: file, sha256 } = options.priorFailureEvidence;
+		if (!feedback.m07 || !path.isAbsolute(file) ||
+			!/^[0-9a-f]{64}$/.test(sha256) ||
+			!file.startsWith(`${path.join(ctx.ws.agentDir, "missions")}${path.sep}`))
+			throw new HarnessError("m04.prior-failure", "prior M04 diagnostic is outside its host evidence scope");
+		const info = await lstat(file);
+		if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 ||
+			info.size < 1 || info.size > 64 * 1024)
+			throw new HarnessError("m04.prior-failure", "prior M04 diagnostic is not a bounded regular file");
+		priorFailureBytes = await readFile(file);
+		if (createHash("sha256").update(priorFailureBytes).digest("hex") !== sha256)
+			throw new HarnessError("m04.prior-failure", "prior M04 diagnostic digest changed");
+	}
+	if (options.requiredM07ReadPaths && !feedback.m07)
+		throw new HarnessError("m04.m07-evidence", "required M07 read paths need M07 feedback");
+	const requiredM07Paths = feedback.m07 ? await requiredM07Reads(feedback.m07.rootDir, options.requiredM07ReadPaths) : [];
+	const requiredM07Root = feedback.m07 && requiredM07Paths.length ? await realpath(feedback.m07.rootDir) : undefined;
+	const requiredM07Bytes = new Map(await Promise.all(requiredM07Paths.map(async relative =>
+		[relative, await readFile(path.join(requiredM07Root!, relative))] as const)));
+	const verifyRequiredM07Bindings = async (): Promise<void> => {
+		if (options.priorFailureEvidence &&
+			!(await readFile(options.priorFailureEvidence.path)).equals(priorFailureBytes!))
+			throw new HarnessError("m04.prior-failure", "prior M04 diagnostic changed during judgment");
+		if (!feedback.m07 || !requiredM07Paths.length) return;
+		await requiredM07Reads(feedback.m07.rootDir, requiredM07Paths);
+		if (await realpath(feedback.m07.rootDir) !== requiredM07Root)
+			throw new HarnessError("m04.m07-evidence", "required M07 evidence root changed during judgment");
+		for (const relative of requiredM07Paths)
+			if (!(await readFile(path.join(requiredM07Root!, relative))).equals(requiredM07Bytes.get(relative)!))
+				throw new HarnessError("m04.m07-evidence", "required M07 evidence bytes changed during judgment");
+	};
 	let materials: ProblemMaterials;
 	let problemInputs: InputRef[];
 	if (feedback.m08) {
@@ -232,9 +439,11 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 	const m01 = await ctx.ws.latestCompletedRun("M01");
 	const m01Session = m01?.sessions.find((s) => s.label === "M01");
 	const continueM01 = feedback.label.startsWith("M07 ") || feedback.m08 ? false : !options.freshSession && !previousM04 && !!m01Session?.file;
-	const mode: M04Result["mode"] = continueM01 ? "continue-m01" : "research-session";
+	let mode: M04Result["mode"] = continueM01 ? "continue-m01" : "research-session";
 
-	const record = await ctx.ws.startRun("M04", [...problemInputs, ...feedback.inputs], snapshot?.id);
+	const record = await ctx.ws.startRun("M04", [...problemInputs, ...feedback.inputs,
+		...(options.priorFailureEvidence ? [{ label: "Prior M04 host diagnostic",
+			path: options.priorFailureEvidence.path }] : [])], snapshot?.id);
 	record.remarks.push(mode === "continue-m01" ? "首轮 M04：续接 M01 原会话。" : "新建研究会话，只读取当前知识包、意见与实际产物位置。");
 
 	return withRun(
@@ -244,19 +453,39 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			if (feedback.m07) await ctx.ws.writeOutput(record, "m07-source.json", JSON.stringify({ m07RunId: feedback.m07.runId, rootDir: feedback.m07.rootDir, feedbackBundlePath: feedback.inputs[0].path, ...(feedback.m07.checkpointId ? { checkpointId: feedback.m07.checkpointId, goalSnapshotPath: feedback.m07.goalSnapshotPath, manifestPath: feedback.m07.manifestPath, selectedTaskIds: feedback.m07.selectedTaskIds, omittedTaskIds: feedback.m07.omittedTaskIds } : {}) }, null, 2), "M07 处理来源");
 			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-source.json", JSON.stringify({ m08RunId: feedback.m08.runId, manifestPath: feedback.m08.manifestPath, reviewBundlePath: feedback.inputs[0].path }, null, 2), "M08 处理来源");
 			let knowledgePack: string | undefined;
-			if (mode === "research-session") {
-				const pack = await ctx.store.buildPack({ purpose: options.purpose ?? `M04 处理：${feedback.label}`, includeOpenQuestions: true, types: ["C", "K", "E", "J", "Q", "D", "X"], maxChars: 60_000 });
+			const assertOriginalKnowledgeSnapshot = async (): Promise<void> => {
+				if ((await ctx.store.current())?.id !== snapshot?.id)
+					throw new HarnessError("m04.knowledge", "original knowledge snapshot changed before the fresh M04 handoff");
+			};
+			const loadKnowledgePack = async (requireOriginalSnapshot = false): Promise<void> => {
+				if (requireOriginalSnapshot) await assertOriginalKnowledgeSnapshot();
+				const selection = await retrieveKnowledge(ctx.store, { purpose: options.purpose ?? `M04 处理：${feedback.label}`, text: `${materials.problem}\n${feedback.label}\n${feedback.text}`, maxRecords: 48, maxChars: 60_000 });
+				if (selection.status !== "ready") throw new HarnessError("m04.knowledge", `M04 必需知识未能完整装载：${selection.omitted.map((item) => `${item.ref}:${item.reason}`).join("；")}`);
+				if (requireOriginalSnapshot) {
+					if (selection.snapshot !== snapshot?.id)
+						throw new HarnessError("m04.knowledge", "fresh M04 knowledge selection differs from the original snapshot");
+					await assertOriginalKnowledgeSnapshot();
+				}
+				const pack = selection.pack;
 				knowledgePack = pack.markdown;
 				await ctx.ws.writeOutput(record, "knowledge-pack.md", pack.markdown, "提供给研究会话的局部知识包");
-				if (pack.truncated) record.remarks.push(`知识包按长度截断，未展开：${pack.omitted.join(", ")}`);
-			}
+				await ctx.ws.writeOutput(record, "knowledge-selection.json", JSON.stringify({ snapshot: selection.snapshot, rankedRefs: selection.rankedRefs, omitted: selection.omitted, limitsCheckedAt: selection.limitsCheckedAt }, null, 2), "知识选择与未展开记录");
+				if (pack.truncated) record.remarks.push(`相关知识组未展开：${pack.omitted.join(", ")}`);
+			};
+			if (mode === "research-session") await loadKnowledgePack();
 			const identityContract = `\n\n【知识记录身份契约】\n- 只有上方局部知识包明确列出的 ID 才能直接引用为已有记录；意见、报告或历史正文中的 C001/J001/E001 等字样可能只是叙述标签，不得猜测或映射成知识库 ID。\n- 本批新建记录如需互相引用，每个 create 先声明唯一局部 handle（如 \"handle\":\"$claim\"），后续操作可用 \"refs\":[{\"rel\":\"supports\",\"target\":\"$claim\"}] 或将 decide/limit 的目标写为 $claim。只引用已在同一数组更早创建的 handle；handle 仅在本提案内有效，合入时才分配正式 ID。\n- 局部包可能截断或没有展开相关旧记录。需修订、决定或限制但看不到对应 ID 时，先请求补足相关记录或保留待补证，不得重建重复记录或绕过旧限制。只有确认是全新对象时才用 handle 新建；不伪造 ID。`;
-			const message = (await buildM04Message({ materials, feedbackLabel: feedback.label, feedback: feedback.text, artifactPaths: feedback.artifactPaths, knowledgePack, includeProblem: mode === "research-session" })) + identityContract;
-
+			const message = (await buildM04Message({ materials, feedbackLabel: feedback.label, feedback: feedback.text, artifactPaths: feedback.artifactPaths, knowledgePack: mode === "research-session" ? knowledgePack : undefined, includeProblem: mode === "research-session" })) + identityContract;
 			const allowedM08Paths = feedback.m08?.manifest.entries.map((x) => x.relativePath) ?? [];
 			const m08DispositionInstruction = feedback.m08 ? `\n\n【M08 固定材料访问契约】\n上方审查反馈包只是意见汇总，“实际产物位置”也只是索引；它们不表示你已读取待交付材料。若要给出 ready 或 partial，必须在本会话中用 m08_material_read 按下列精确 relativePath 实际读取每一项准备写入 deliverablePaths 的文件；目录项至少读取其中一个与处置直接相关的真实文件。PDF 文本层不足以核对公式、表格或图时，用 render_pdf_page 渲染相关页。工具会记录实际访问路径，仅在正文里复述或引用路径不算读取。\n可访问的固定材料：${allowedM08Paths.map((p) => `\n- ${p}`).join("")}\n\n本轮必须在处理文末尾输出 m08-disposition JSON 代码块。合法 status 只有 ready、partial、rework、needs_evidence、unresolved。结构示例：{\"m08RunId\":\"${feedback.m08.runId}\",\"status\":\"partial\",\"deliverablePaths\":[\"上述某一精确 relativePath\"],\"limitations\":[\"实际限制\"],\"rationale\":\"非空理由\"}。deliverablePaths 只允许从上述精确相对路径选择。ready/partial 必须至少选择一项；这是用途处置，不是投票或科学认证；无法判断不得写 ready。` : "";
 			const m07EvidenceInstruction = feedback.m07 ? `\n\n【M07 证据按需读取契约】\n上方反馈包中的材料清单是索引，不代表你已读取未内联的证据。需要依赖某项材料时，使用 m07_evidence_read 按清单中的相对路径读取；大文件按 offset/limit 继续读取。工具记录文件访问，但当前覆盖记录只能证明访问过该文件，不能证明读取了全文；除非实际分段读至文件末尾，否则必须把未读范围列为限制。不得把路径存在、清单摘要或一次局部读取写成“已完整核验”。${feedback.m07.checkpointId ? `\n本 checkpoint 仅冻结选定任务的评审证据；选定任务 ${feedback.m07.selectedTaskIds?.length ?? 0} 项、省略任务 ${feedback.m07.omittedTaskIds?.length ?? 0} 项。完整 ID 列表见 checkpoint manifest.json 及 M04 来源记录；省略任务仅保留控制状态，不得把其未提供的证据当作已交接或可读取。` : ""}${feedback.m07.skippedRaw?.length ? `\ncheckpoint 未复制的非文本原始信息：${feedback.m07.skippedRaw.join("、")}；须作为材料缺口，不得推断已核对。` : ""}` : "";
-			const finalMessage = message + m08DispositionInstruction + m07EvidenceInstruction;
+			const m07ExperienceInstruction = feedback.m07 ? `\n\n【M07 候选经验处理】\n如果反馈证据中有 lesson-delta.json，它只是待判断的候选；先用 m07_evidence_read 实际读取相关版本与验证证据，再决定是否提出知识操作。没有充分证据、不可推广或 action=none 时，可不提出任何知识提案；不要为让运行“成功”而强行创建记录。若确有可复用的执行方法经验并决定提出 create/revise，fields.experience 必须使用结构 {"version":1,"targetKind":"executor","applicableStages":["M07"],"requiredTags":[],"excludedTags":[],"requiredRefs":[{"storeId":"本知识库的 UUID","recordId":"K001","version":1}]}。示例中的 storeId 与 recordId 只是字段形状提示，不能原样复制；必须替换为已核实的实际记录身份。requiredRefs 中每项必须是已存在记录的 pinned {storeId,recordId,version} 对象；"K001@1" 等字符串无效。没有必要依赖时使用空数组 []，不得编造依赖。按真实适用条件填写 stages 和 tags。usageDecision=adopted 需要写明本轮独立证据、适用边界和保留限制；仅有 builder 自述或 reviewer ready 不足以采用。candidate 或不提案都是有效结果。即使入库，后续 M07 也必须显式 pinned 引用、通过适用性和生效限制检查；装载不等于忠实使用或收益。` : "";
+			const requiredM07Instruction = requiredM07Paths.length ? `\n\n【本轮指定 M07 证据完整读取】\n在判断采用、候选或无提案之前，请用 m07_evidence_read 按以下精确相对路径读取每个文件的全文；大文件须分段读至末尾。只看索引、摘要或文件名不足以满足此要求。完整读取后可以选择不提案，不得为满足流程强行采用。\n${requiredM07Paths.map((item) => `- ${item}`).join("\n")}` : "";
+			const judgmentInstructions = m08DispositionInstruction + m07EvidenceInstruction +
+				m07ExperienceInstruction + requiredM07Instruction +
+				(options.additionalReadOnlyInstruction ? `\n\n${options.additionalReadOnlyInstruction}` : "") +
+				(priorFailureBytes ? `\n\n${priorFailureBytes.toString("utf8")}` : "");
+			const finalMessage = message + judgmentInstructions;
+			let freshJudgmentMessage = mode === "research-session" ? finalMessage : undefined;
 			await ctx.ws.writeOutput(record, "message.md", finalMessage, "发送给研究会话的完整消息");
 			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-message.md", finalMessage, "发送给 M04 的固定 M08 消息");
 			const m08RenderedPages: string[] = [];
@@ -266,20 +495,279 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 				: feedback.m07
 					? { kind: "read-dir" as const, root: feedback.m07.rootDir, toolName: "m07_evidence_read" }
 					: { kind: "none" as const };
-			const handle =
-				mode === "continue-m01" && m01Session?.file
-					? await ctx.runner.resume({ label: "M01", role: "execution", id: m01Session.id, model: m01Session.model, file: m01Session.file, specFile: specFileFor(m01Session.file) })
-					: await ctx.runner.create(sessionSpec(ctx, "M04-research", "research", systemPromptFor("research"), feedbackTools));
+			const researchSpec = sessionSpec(ctx, "M04-research", "research", systemPromptFor("research"), feedbackTools);
+			let handle = mode === "continue-m01" && m01Session?.file
+				? await openBoundedSession(ctx.runner, record, { mode: "continue", intent: "causal-continuation", reason: "First M04 processing may retain M01 causal reasoning when its original tool boundary is sufficient", evidence: linkedEvidence(record.inputs), parent: { label: "M01", role: "execution", id: m01Session.id, model: m01Session.model, file: m01Session.file, specFile: specFileFor(m01Session.file) }, expectedToolGrantKind: "none" }, () => ctx.ws.writeRun(record))
+				: await openBoundedSession(ctx.runner, record, { mode: "fresh", intent: "independent-judgment", reason: feedback.m07 || feedback.m08 ? "M04 independently judges frozen feedback and actually reads needed evidence without inheriting executor or reviewer history" : "Later M04 reasoning starts from current selected knowledge and explicit feedback rather than unbounded prior dialogue", evidence: linkedEvidence(record.inputs), spec: researchSpec }, () => ctx.ws.writeRun(record));
+			const transactionPath = path.join(ctx.ws.runDir("M04", record.runId), "m04-transaction.json");
+			// The read-only judgement may fail before any proposal reaches the store.
+			const transaction: M04KnowledgeTransactionV1 = { version: 1,
+				kind: "m04-knowledge-transaction", m04RunId: record.runId,
+				state: "no-proposal", attempts: [], updatedAt: new Date().toISOString() };
+			record.outputs.push({ label: "M04 知识事务状态", path: transactionPath });
+			const persistTransaction = async (): Promise<void> => {
+				transaction.updatedAt = new Date().toISOString();
+				const contents = `${JSON.stringify(transaction, null, 2)}\n`;
+				if (Buffer.byteLength(contents, "utf8") > 1_000_000)
+					throw new HarnessError("m04.transaction", "M04 private transaction control file exceeds its physical byte boundary; merge not attempted");
+				await writeFileAtomic(transactionPath, contents);
+				await ctx.ws.writeRun(record);
+			};
+			await persistTransaction();
+			const repairPath = path.join(ctx.ws.runDir("M04", record.runId), "m04-repair-state.json");
+			const evidenceFingerprint = workflowRepairFingerprint({ message: finalMessage,
+				materials, requiredM07Paths, snapshot: snapshot?.id ?? null });
+			let sessionGeneration = 1;
+			let repairOutputRegistered = false;
+			const persistRepair = async (failure: WorkflowRepairFailure,
+				planFingerprint: string, responseFingerprint: string | null,
+				strategy: WorkflowRepairStateV1["strategy"]): Promise<void> => {
+				const state = workflowRepairState({ stage: "m04-judgment", failure,
+					evidenceFingerprint, planFingerprint, responseFingerprint,
+					strategy, sessionGeneration });
+				if (!repairOutputRegistered) {
+					record.outputs.push({ label: "M04 修复状态", path: repairPath });
+					repairOutputRegistered = true;
+				}
+				await writeFileAtomic(repairPath, `${JSON.stringify(state, null, 2)}\n`);
+				await ctx.ws.writeRun(record);
+				await options.onRepairState?.(state);
+			};
+			const requireFrozenM07Bindings = async (): Promise<void> => {
+				try { await verifyRequiredM07Bindings(); }
+				catch (error) {
+					// A known draft/merge intent retains its reconciliation exception;
+					// changed input cannot authorize an equivalent fresh judgment.
+					if (!["no-proposal", "rejected-draft"].includes(transaction.state) ||
+						transaction.attempts.some(item => item.state !== "rejected-draft")) throw error;
+					await persistRepair("context-handoff-unavailable",
+						workflowRepairFingerprint({ category: "frozen-m07-binding-changed" }), null,
+						"workflow-repair-needed");
+					throw new WorkflowRepairNeededError("m04-judgment", error instanceof Error ? error : undefined);
+				}
+			};
+			const submitDraft = async (ops: unknown[]): Promise<ProposalReceipt> => {
+				// Unknown is durable before the single store entry: a crashed submit
+				// cannot masquerade as a known no-proposal outcome.
+				transaction.state = "unknown";
+				delete transaction.currentProposalId;
+				await persistTransaction();
+				const receipt = await ctx.store.submitProposal({ stage: "M04", runId: record.runId,
+					session: handle.ref.label, baseSnapshot: snapshot?.id,
+					ops: ops as ProposalOp[], summary: feedback.label });
+				const proposalFile = path.relative(ctx.ws.root, receipt.file).replaceAll("\\", "/");
+				if (proposalFile.startsWith("../") || path.isAbsolute(proposalFile) ||
+					!(await lstat(receipt.file)).isFile())
+					throw new HarnessError("m04.transaction", "submitted proposal file is outside the private workspace");
+				const ordinal = transaction.attempts.length + 1;
+				const receiptFile = `proposal-validation-${String(ordinal).padStart(4, "0")}.json`;
+				const receiptPath = path.join(ctx.ws.runDir("M04", record.runId), receiptFile);
+				const validation = `${JSON.stringify({ version: 1, kind: "m04-proposal-validation",
+					m04RunId: record.runId, proposalId: receipt.proposalId, proposalFile,
+					structurallyValid: receipt.structurallyValid, issues: receipt.issues }, null, 2)}\n`;
+				if (Buffer.byteLength(validation, "utf8") > 1_000_000)
+					throw new HarnessError("m04.transaction", "M04 private proposal receipt exceeds its physical byte boundary; merge not attempted");
+				await writeFileAtomic(receiptPath, validation);
+			record.outputs.push({ label: `知识提案草案 ${ordinal}`, path: receipt.file },
+				{ label: `知识提案结构校验回执 ${ordinal}`, path: receiptPath });
+			transaction.currentProposalId = receipt.proposalId;
+			transaction.state = "unknown";
+			transaction.attempts.push({ ordinal, proposalId: receipt.proposalId, proposalFile,
+				receiptFile, structurallyValid: receipt.structurallyValid,
+				issues: receipt.issues, state: "drafted" });
+			await persistTransaction();
+			transaction.state = receipt.structurallyValid ? "merge-intent" : "rejected-draft";
+			transaction.attempts.at(-1)!.state = transaction.state;
+			await persistTransaction();
+			return receipt;
+			};
 			let output: string;
 			let m08ReadCoverage: string[] = [];
 			let m08ToolLog: ReturnType<typeof handle.toolLog> = [];
 			let m07ReturnedRanges: ReturnType<NonNullable<typeof handle.readReturnEvents>> = [];
 			let promptSucceeded = false;
+			let extracted: ReturnType<typeof extractKnowledgeProposals> | undefined;
+			let acceptedReceipt: ProposalReceipt | undefined;
+			const rejectedDrafts = new Map<string, ProposalReceipt>();
+			const earlierReadProofs: Array<{ sessionId: string; sessionGeneration: number;
+				filesAccessed: string[]; returnedRanges: ReadReturnEvent[] }> = [];
 			try {
-				recordSession(record, handle);
 				if (feedback.m07) await markFeedbackAssembled(ctx.ws, feedback.m07.runId, feedback.inputs[0].path, record.runId);
-				const turn = await handle.prompt(finalMessage);
-				output = turn.text;
+				let request = finalMessage;
+				let readEventCursor = 0;
+				let promptAttempt = 0;
+				const captureInvalidJudgment = async (rawResponse: string,
+					validation: M04InvalidJudgmentEvent["validation"], gaps: M07ReadGap[] = []): Promise<void> => {
+					if (!options.onInvalidJudgment) return;
+					await options.onInvalidJudgment({ stage: "m04-judgment", sessionId: handle.ref.id,
+						generation: sessionGeneration, attempt: promptAttempt, rawResponse,
+						validation, coverage: feedback.m07 && requiredM07Paths.length
+							? await m07ValidationCoverage(feedback.m07.rootDir, requiredM07Paths,
+								handle.readReturnEvents(), gaps) : [],
+						...(handle.ref.file ? { transcriptPath: handle.ref.file } : {}) });
+				};
+				const observedContextFailures = new Set<string>();
+				let currentStrategy: "same-session-feedback" | "fresh-context" = "same-session-feedback";
+				const repairJudgment = async (failure: WorkflowRepairFailure, facts: unknown,
+					responseFingerprint: string | null, guidance: string): Promise<string> => {
+					const failureFingerprint = workflowRepairFingerprint({ failure, facts });
+					const planFingerprint = workflowRepairFingerprint({ failure, facts, guidance });
+					const repeated = observedContextFailures.has(failureFingerprint);
+					if (!repeated) {
+						observedContextFailures.add(failureFingerprint);
+						await persistRepair(failure, planFingerprint, responseFingerprint, currentStrategy);
+						return guidance;
+					}
+					// Repeated failure facts choose a fresh independent read-only
+					// judgment context. They do not establish scientific closure or
+					// make another context unsafe by themselves.
+					// A model context reset can never reconcile or replay a store side effect.
+					if (!["no-proposal", "rejected-draft"].includes(transaction.state) ||
+						transaction.attempts.some(item => item.state !== "rejected-draft"))
+						throw new HarnessError("m04.transaction", "unresolved M04 transaction blocks fresh judgment; retain the exact transaction for reconciliation");
+					await persistRepair(failure, planFingerprint, responseFingerprint, "fresh-context");
+					let fresh;
+					try {
+						await verifyRequiredM07Bindings();
+						// The message may already be cached from the initial research
+						// session or an earlier repair; CURRENT must still match on every handoff.
+						await assertOriginalKnowledgeSnapshot();
+						if (freshJudgmentMessage === undefined) {
+							// First M04 continuation keeps its original admission behavior.
+							// Only a fresh strategy needs an independently usable pack.
+							await loadKnowledgePack(true);
+							freshJudgmentMessage = (await buildM04Message({ materials,
+								feedbackLabel: feedback.label, feedback: feedback.text,
+								artifactPaths: feedback.artifactPaths, knowledgePack,
+								includeProblem: true })) + identityContract + judgmentInstructions;
+							await ctx.ws.writeOutput(record, "fresh-repair-message.md", freshJudgmentMessage, "新研究会话的固定修复消息");
+						}
+						fresh = await openBoundedSession(ctx.runner, record, {
+							mode: "fresh", intent: "independent-judgment",
+							reason: "Repeated unchanged M04 repair evidence requires a different read-only judgment context; no proposal or merge is replayed",
+							evidence: linkedEvidence(record.inputs),
+							spec: researchSpec,
+						}, () => ctx.ws.writeRun(record));
+						const boundary = record.sessions.at(-1)?.boundary;
+						if (fresh.ref.id === handle.ref.id || fresh.ref.file === handle.ref.file ||
+							fresh.ref.specFile === handle.ref.specFile || fresh.transcript().length ||
+							fresh.readReturnEvents().length || fresh.readCoverage().length ||
+							fresh.ref.role !== researchSpec.role || fresh.ref.model !== researchSpec.model ||
+							boundary?.toolGrantKind !== feedbackTools.kind ||
+							(feedbackTools.kind === "read-dir" && boundary.capability?.root !== feedbackTools.root)) {
+							fresh.dispose();
+							throw new HarnessError("context.boundary", "fresh M04 judgment must have an independent empty session with the frozen model and read-only grant");
+						}
+					} catch (error) {
+						record.failures.push(`Fresh read-only M04 context unavailable: ${(error as Error).message}`);
+						if (!(error instanceof HarnessError) || ![
+							"context.capability", "context.boundary", "context.parent", "context.evidence",
+							"m04.knowledge", "m04.m07-evidence",
+						].includes(error.code)) throw error;
+						await persistRepair("context-handoff-unavailable", planFingerprint, responseFingerprint, "workflow-repair-needed");
+						throw new WorkflowRepairNeededError("m04-judgment", error instanceof Error ? error : undefined);
+					}
+					earlierReadProofs.push({ sessionId: handle.ref.id, sessionGeneration,
+						filesAccessed: handle.readCoverage(), returnedRanges: handle.readReturnEvents() });
+					handle.dispose();
+					handle = fresh;
+					mode = "research-session";
+					sessionGeneration += 1;
+					currentStrategy = "fresh-context";
+					observedContextFailures.clear();
+					observedContextFailures.add(failureFingerprint);
+					readEventCursor = 0;
+					promptAttempt = 0;
+					acceptedReceipt = undefined;
+					extracted = undefined;
+					await persistRepair(failure, planFingerprint, responseFingerprint, "fresh-context");
+					return [freshJudgmentMessage,
+						"The previous read-only judgment context returned unchanged repair evidence. This is a fresh independent M04 judgment over the same frozen inputs and selected knowledge. No prior malformed response or rejected draft is adopted, accepted, or merged. Do not replay any proposal or merge. Read every required M07 file in full again in this session; previous-session returned ranges do not satisfy this session's proof. Scientific judgment remains yours, and no proposal is a valid result.",
+						guidance.replaceAll("same session", "fresh session")].join("\n\n");
+				};
+				for (;;) {
+					promptAttempt += 1;
+					const turn = await handle.prompt(request);
+					if (feedback.m07 && requiredM07Paths.length) {
+						await requireFrozenM07Bindings();
+						const returned = handle.readReturnEvents();
+						const newReadEvents = returned.slice(readEventCursor);
+						readEventCursor = returned.length;
+						const gaps = await m07ReadGaps(feedback.m07.rootDir, requiredM07Paths, returned);
+						const readToolErrors = newReadEvents.filter(item => item.toolName === "m07_evidence_read" &&
+							item.status === "error");
+						const unrecoverableReadToolError = readToolErrors.some(item => {
+							const gap = gaps.find(gap => gap.relative === item.path);
+							return !gap || item.error?.kind !== "offset-beyond-eof" ||
+								item.error.lineCount !== gap.lineCount ||
+								!Number.isSafeInteger(item.requested.offset) || item.requested.offset! <= gap.lineCount;
+						});
+						if (gaps.length || unrecoverableReadToolError) {
+							await captureInvalidJudgment(turn.text, {
+								code: "m04.m07-evidence",
+							message: unrecoverableReadToolError
+									? "required selected M07 evidence was not returned in full because its read tool reported an error"
+									: "required selected M07 evidence was not returned to the research session in full",
+							path: gaps[0]?.relative ?? readToolErrors[0]!.path, detail: { gaps, readToolErrors },
+							}, gaps);
+						if (unrecoverableReadToolError)
+								throw new HarnessError("m04.m07-evidence", "required selected M07 evidence was not returned in full because its read tool reported an error");
+							const guidance = ["Your M04 judgement is provisional. The host has not verified full m07_evidence_read returns for every required selected M07 file, so no knowledge proposal can be accepted yet.",
+							"Next missing returned range for each file (one-based lines; the host will recalculate further gaps after your next read):",
+							...gaps.map(gap => `- ${gap.relative}: ${gap.lineCount} actual lines; ${gap.emptyFile ? "empty file needs an untruncated no-content text return without a line range" : gap.missingRanges.length ? `${gap.missingRanges[0].start}-${gap.missingRanges[0].end}; ${gap.missingRanges.length - 1} further gaps remain` : "all lines returned"}${gap.terminalPageMissing ? "; an untruncated final page is also required" : ""}`),
+								"Use the same read-only session to read the stated next missing range for each nonempty file, including an untruncated final page where needed. Read an empty file by its exact path and do not invent a line range. The host will give further ranges until all are complete. Then reconsider the evidence and return a revised M04 judgement in the required format. A path, summary, malformed response, or earlier proposal is not proof of a complete read. Do not force a knowledge proposal if the evidence does not support one."].join("\n\n");
+							request = await repairJudgment("unread-m07-evidence", gaps,
+								workflowRepairFingerprint({ gaps }), guidance);
+							continue;
+						}
+					}
+					const parsed = extractKnowledgeProposals(turn.text);
+					if (parsed.error) await captureInvalidJudgment(turn.text, {
+						code: parsed.error === "knowledge-proposals 代码块不是 JSON 数组"
+							? "m04.proposal-top-level-not-array" : "m04.proposal-invalid-json",
+						message: parsed.error, path: "knowledge-proposals",
+					});
+					if (parsed.error && !feedback.m08) {
+						const guidance = ["Your last M04 answer contained an explicit knowledge-proposals fenced block, but its contents were not a valid JSON array. No proposal was submitted or merged.",
+							"This is a format repair in the same session over the same frozen evidence. Return a complete revised M04 judgment. If evidence supports a knowledge operation, include exactly one knowledge-proposals fenced block containing a valid JSON array. If it does not, omit that block. Do not treat your earlier malformed block or a file path as an accepted proposal, and do not invent scientific support."].join("\n\n");
+						// Parser messages may quote private model fragments. The control
+						// receipt compares only the structural failure category.
+						const category = parsed.error === "knowledge-proposals 代码块不是 JSON 数组"
+							? "json-top-level-not-array" : "invalid-json-syntax";
+						request = await repairJudgment("malformed-proposal", { category },
+							workflowRepairFingerprint({ category }), guidance);
+						continue;
+					}
+					if (!feedback.m08 && parsed.ops) {
+						const draftFingerprint = workflowRepairFingerprint(canonicalProposalValue(parsed.ops));
+						// Exact ineffective retries reuse the rejected receipt. They are
+						// never resubmitted as new drafts and cannot accumulate intent.
+						const receipt = rejectedDrafts.get(draftFingerprint) ?? await submitDraft(parsed.ops);
+						if (!receipt.structurallyValid) {
+							rejectedDrafts.set(draftFingerprint, receipt);
+							await captureInvalidJudgment(turn.text, {
+								code: "m04.proposal-structure",
+								message: "knowledge proposal draft failed structural validation",
+								path: receipt.file,
+								detail: { proposalId: receipt.proposalId, issues: receipt.issues },
+							});
+							record.remarks.push(`知识提案草案 ${receipt.proposalId} 结构无效；确切问题已保留在私有校验回执；未尝试合入。`);
+							const guidance = ["The host submitted your explicit knowledge-proposals array as a private draft and rejected it on structural validation. No merge or knowledge adoption was attempted.",
+								`Private draft ID: ${receipt.proposalId}. Structural issues (bounded, sensitive values withheld):\n${structuralIssueFeedback(receipt.issues)}`,
+								"Continue in this same session over the same frozen evidence. Return a complete revised M04 judgment and a corrected knowledge-proposals JSON array only if the evidence still supports it; otherwise omit the block. The rejected draft remains historical evidence, not an adopted record. Do not claim it was merged or repeat it unchanged."].join("\n\n");
+							request = await repairJudgment("rejected-draft", {
+								structuralIssues: structuralIssueShape(receipt.issues),
+								requiredReadProof: requiredM07Paths.length ? "full-current-session" : "not-required",
+							},
+								draftFingerprint, guidance);
+							continue;
+						}
+						acceptedReceipt = receipt;
+					}
+					extracted = parsed;
+					output = turn.text;
+					break;
+				}
 				await ctx.ws.writeOutput(record, "processing.md", output, "处理结果");
 				promptSucceeded = true;
 			} finally {
@@ -287,25 +775,33 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 				m08ToolLog = handle.toolLog();
 				m07ReturnedRanges = handle.readReturnEvents?.() ?? [];
 				handle.dispose();
-				if (feedback.m07) await ctx.ws.writeOutput(record, "m07-coverage.json", JSON.stringify({ sessionId: handle.ref.id, promptOutcome: promptSucceeded ? "returned" : "failed", filesAccessed: m08ReadCoverage, returnedRanges: m07ReturnedRanges, completeness: "unknown", semantics: "saved 仅表示固定材料存在；returnedRanges 仅表示工具实际返回模型的内容范围，文件名访问不证明已读全文；不证明模型使用该范围，更不证明使用正确。" }, null, 2), "M07 回流证据实际访问范围");
+				if (feedback.m07) await ctx.ws.writeOutput(record, "m07-coverage.json", JSON.stringify({ sessionId: handle.ref.id, sessionGeneration, promptOutcome: promptSucceeded ? "returned" : "failed", filesAccessed: m08ReadCoverage, returnedRanges: m07ReturnedRanges, earlierSessions: earlierReadProofs, completeness: "unknown", semantics: "saved 仅表示固定材料存在；returnedRanges 仅表示当前会话工具实际返回模型的内容范围，earlierSessions 不抵扣当前会话的全文读取要求；文件名访问不证明已读全文；不证明模型使用该范围，更不证明使用正确。" }, null, 2), "M07 回流证据实际访问范围");
 			}
 			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-coverage.json", JSON.stringify({ files: m08ReadCoverage, renderedPages: m08RenderedPages, tools: m08ToolLog }, null, 2), "M08 处理实际读取范围");
+			await requireFrozenM07Bindings();
+			if (feedback.m07 && requiredM07Paths.length)
+				await assertFullM07Reads(feedback.m07.rootDir, requiredM07Paths, m07ReturnedRanges);
 
-			const result: M04Result = { record, output, mode };
+			const result: M04Result = { record, output, mode, proposalAttempts: [] };
 			if (feedback.m08) {
 				const disposition = await requireDispositionEvidence(parseM08Disposition(output, feedback.m08), feedback.m08.manifest, m08ReadCoverage, m08RenderedPages);
 				await ctx.ws.writeOutput(record, "m08-disposition.json", JSON.stringify(disposition, null, 2), "M08 用途处置");
 				if (disposition.status === "unresolved") record.failures.push(`M08 处置缺失、非法或缺少实际材料访问依据，已保守记录为 unresolved；不能供 M09 收口。${disposition.limitations.join("；")}`);
 			}
-			const extracted = extractKnowledgeProposals(output);
-			if (extracted.error) {
-				record.failures.push(`知识提案未入库：${extracted.error}`);
-			} else if (extracted.ops) {
-				const receipt = await ctx.store.submitProposal({ stage: "M04", runId: record.runId, session: handle.ref.label, baseSnapshot: snapshot?.id, ops: extracted.ops as ProposalOp[], summary: feedback.label });
-				result.proposalId = receipt.proposalId;
-				record.outputs.push({ label: "知识提案", path: receipt.file });
+			if (extracted!.error) {
+				record.failures.push(`知识提案未入库：${extracted!.error}`);
+				transaction.state = "no-proposal";
+				await persistTransaction();
+			} else if (extracted!.ops) {
+				const receipt = acceptedReceipt ?? await submitDraft(extracted!.ops);
 				if (receipt.structurallyValid) {
+					// The durable intent is already written. A merge exception leaves
+					// it unresolved for host reconciliation; never retry implicitly.
 					const merged = await ctx.store.merge(receipt.proposalId);
+					transaction.state = "merged";
+					transaction.snapshotId = merged.snapshot.id;
+					transaction.attempts.at(-1)!.state = "merged";
+					await persistTransaction();
 					result.snapshotId = merged.snapshot.id;
 					await ctx.ws.writeOutput(record, "merge.json", JSON.stringify(merged, null, 2), "合入结果");
 					record.remarks.push(`已经串行合入，快照 ${merged.snapshot.id}；受影响待复核 ${merged.impacts.length} 项；先行生效的限制 ${merged.limitsWrittenFirst.length} 项。合入不是科学认证。`);
@@ -314,8 +810,16 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 					record.failures.push(`知识提案未合入：结构校验未通过：${receipt.issues.filter((i) => i.level === "error").map((i) => i.message).join("；")}`);
 				}
 			} else {
-				record.remarks.push("本轮没有知识提案；处理结果只以文本保存（没有知识变化也可完成）。");
+				if (!transaction.attempts.length) {
+					transaction.state = "no-proposal";
+					await persistTransaction();
+				}
+				record.remarks.push(transaction.attempts.length ?
+					"本轮最终没有可合入的知识提案；结构无效草案与校验回执已保留，未尝试合入。" :
+					"本轮没有知识提案；处理结果只以文本保存（没有知识变化也可完成）。");
 			}
+			result.proposalId = transaction.currentProposalId;
+			result.proposalAttempts = transaction.attempts.map(item => ({ ...item, issues: item.issues.map(issue => ({ ...issue })) }));
 			return result;
 		},
 		() =>

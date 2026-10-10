@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -14,6 +14,22 @@ import { FakeSessionRunner } from "../../src/runner/fake.ts";
 import type { CustomToolSpec, SessionSpec, ToolGrant } from "../../src/runner/types.ts";
 import { HarnessError } from "../../src/types.ts";
 import { readTelemetry } from "../../src/dashboard/telemetry.ts";
+import { createConfinedCampaignFileTools } from "../../src/runner/confined-campaign-files.ts";
+import { finishManagedBashCall, prepareManagedBashCall, readManagedBashReceipt,
+	readManagedBashSessionReceipts, readManagedBashSessionEvidence,
+	observeManagedProcessGroup } from "../../src/runner/managed-bash.ts";
+
+test("managed Bash group probe distinguishes missing, present and unreadable groups", async () => {
+	const gone = { platform: "linux" as const, signalGroup: () => {
+		throw Object.assign(new Error("gone"), { code: "ESRCH" }); } };
+	assert.equal(await observeManagedProcessGroup(123, gone), "none-observed");
+	assert.equal(await observeManagedProcessGroup(123, { platform: "linux", signalGroup: () => {
+		throw Object.assign(new Error("unreadable"), { code: "EACCES" }); } }), "unknown");
+	assert.equal(await observeManagedProcessGroup(123, { platform: "linux", signalGroup: () => {
+		throw Object.assign(new Error("occupied"), { code: "EPERM" }); } }), "members-observed");
+});
+import { inspectManagedExecutionSession, inspectSingleForegroundBashFailure,
+	inspectM07ManagedOperation } from "../../src/m07/managed-local-failure.ts";
 
 const MODEL = {
 	id: "offline-model",
@@ -53,7 +69,7 @@ interface FactoryHarness {
 	abortCalls: number;
 }
 
-function stubFactory(response?: StubResponse | StubResponse[], config: { pruneIntermediate?: boolean; compactionUsage?: StubResponse["usage"]; disposeCounter?: { count: number }; blockSpecWrite?: boolean } = {}): FactoryHarness {
+function stubFactory(response?: StubResponse | StubResponse[], config: { pruneIntermediate?: boolean; compactionUsage?: StubResponse["usage"]; disposeCounter?: { count: number }; blockSpecWrite?: boolean; insertToolResult?: boolean } = {}): FactoryHarness {
 	const calls: CreateAgentSessionOptions[] = [];
 	let promptCalls = 0;
 	let abortCalls = 0;
@@ -110,6 +126,11 @@ function stubFactory(response?: StubResponse | StubResponse[], config: { pruneIn
 				if (index === 0) { messages.push(user); manager.appendMessage(user as never); }
 				messages.push(assistant);
 				manager.appendMessage(assistant as never);
+				if (config.insertToolResult && index === 0) {
+					const toolResult = { role: "toolResult", toolCallId: "t", toolName: "offline", content: [{ type: "text", text: "ORIGINAL TOOL PAYLOAD at /parent/original.txt" }], isError: false, timestamp: Date.now() };
+					messages.push(toolResult);
+					manager.appendMessage(toolResult as never);
+				}
 				if (config.pruneIntermediate && index < responses.length - 1) messages.pop();
 				}
 				if (config.compactionUsage) manager.appendCompaction("offline summary", "offline-entry", 100, undefined, false, config.compactionUsage as never);
@@ -171,7 +192,7 @@ test("a none grant disables every tool", async (t) => {
 	assert.equal(stub.calls[0].sessionManager?.getSessionDir(), persistDir);
 });
 
-test("strict DeepSeek request disables retries and compaction, verifies one capped payload", async (t) => {
+test("strict DeepSeek request rejects a caller output cap and uses the resolved model bound", async (t) => {
 	const persistDir = await fixture(t);
 	const model = { ...MODEL, id: "deepseek-flash", provider: "deepseek", api: "openai-completions", cost: { input: 0.2, output: 0.3, cacheRead: 0.1, cacheWrite: 0.1 } } as Model<"openai-completions">;
 	const seen: Array<{ maxTokens?: number; maxRetries?: number }> = [];
@@ -195,16 +216,19 @@ test("strict DeepSeek request disables retries and compaction, verifies one capp
 	const runner = new PiSessionRunner({ modelRuntime: runtime, createSession: factory });
 	const estimate = await runner.estimateMaxSdkCost("deepseek/deepseek-flash", { maxInputTokens: 200, maxOutputTokens: 20 });
 	assert(estimate && estimate > 0);
-	const handle = await runner.create(spec(persistDir, { model: "deepseek/deepseek-flash", strictRequest: { maxProviderCallsPerPrompt: 1, maxOutputTokens: 20, maxInputPayloadBytes: 500 } }));
+	await assert.rejects(runner.create(spec(persistDir, { model: "deepseek/deepseek-flash",
+		strictRequest: { maxOutputTokens: 20, maxInputPayloadBytes: 500 } })),
+		/strict request requires positive integer caps/);
+	const handle = await runner.create(spec(persistDir, { model: "deepseek/deepseek-flash", strictRequest: { maxInputPayloadBytes: 500 } }));
 	assert.equal(stub.calls[0].settingsManager?.getRetrySettings().enabled, false);
 	assert.equal(stub.calls[0].settingsManager?.getProviderRetrySettings().maxRetries, 0);
 	assert.equal(stub.calls[0].settingsManager?.getCompactionSettings().enabled, false);
 	await handle.prompt("one step");
-	assert.deepEqual(seen, [{ maxTokens: 20, maxRetries: 0 }]);
+	assert.deepEqual(seen, [{ maxTokens: model.maxTokens, maxRetries: 0 }]);
 	handle.dispose();
 });
 
-test("strict research request leaves output length to the model when no cap is supplied", async (t) => {
+test("strict research request explicitly uses the resolved model output bound", async (t) => {
 	const persistDir = await fixture(t);
 	const model = { ...MODEL, id: "deepseek-flash", provider: "deepseek", api: "openai-completions" } as Model<"openai-completions">;
 	const seen: Array<{ maxTokens?: number; maxRetries?: number }> = [];
@@ -212,7 +236,8 @@ test("strict research request leaves output length to the model when no cap is s
 		getModels: () => [model],
 		streamSimple(_model: unknown, _context: unknown, options: { maxTokens?: number; maxRetries?: number; onPayload?: (payload: unknown, model: unknown) => Promise<unknown> }) {
 			seen.push({ maxTokens: options.maxTokens, maxRetries: options.maxRetries });
-			return options.onPayload?.({ model: "deepseek-flash", messages: [{ role: "user", content: "short" }] }, model);
+			return options.onPayload?.({ model: "deepseek-flash", messages: [{ role: "user", content: "short" }],
+				max_tokens: options.maxTokens }, model);
 		},
 	} as unknown as ModelRuntime;
 	const stub = stubFactory();
@@ -226,11 +251,125 @@ test("strict research request leaves output length to the model when no cap is s
 		return created;
 	}) as typeof createAgentSession;
 	const runner = new PiSessionRunner({ modelRuntime: runtime, createSession: factory });
-	const handle = await runner.create(spec(persistDir, { model: "deepseek/deepseek-flash", strictRequest: { maxProviderCallsPerPrompt: 1, maxInputPayloadBytes: 500 } }));
+	const handle = await runner.create(spec(persistDir, { model: "deepseek/deepseek-flash", strictRequest: { maxInputPayloadBytes: 500 } }));
 	await handle.prompt("one step");
-	assert.deepEqual(seen, [{ maxTokens: undefined, maxRetries: 0 }]);
+	assert.deepEqual(seen, [{ maxTokens: model.maxTokens, maxRetries: 0 }]);
 	handle.dispose();
 });
+
+test("ordinary DeepSeek Pi requests explicitly use the resolved output maximum", async t => {
+	const persistDir = await fixture(t);
+	const model = { ...MODEL, id: "deepseek-flash", provider: "deepseek",
+		api: "openai-completions" } as Model<"openai-completions">;
+	const seen: number[] = [];
+	const runtime = { getModels: () => [model],
+		streamSimple(_model: unknown, _context: unknown,
+			options: { maxTokens?: number; onPayload?: (payload: unknown, model: unknown) => Promise<unknown> }) {
+			seen.push(options.maxTokens ?? 0);
+			return options.onPayload?.({ model: "deepseek-flash", max_tokens: options.maxTokens,
+				messages: [{ role: "user", content: "offline" }] }, model);
+		},
+	} as unknown as ModelRuntime;
+	const stub = stubFactory();
+	const factory = (async (options: CreateAgentSessionOptions = {}) => {
+		const created = await stub.factory(options);
+		const original = created.session.prompt.bind(created.session);
+		(created.session as unknown as { prompt: (text: string) => Promise<void> }).prompt = async text => {
+			await (options.modelRuntime as unknown as { streamSimple: (model: unknown, context: unknown,
+				options: unknown) => Promise<unknown> }).streamSimple(model, { messages: [] }, {});
+			await original(text);
+		};
+		return created;
+	}) as typeof createAgentSession;
+	const handle = await new PiSessionRunner({ modelRuntime: runtime, createSession: factory })
+		.create(spec(persistDir, { model: "deepseek/deepseek-flash" }));
+	await handle.prompt("ordinary request");
+	assert.deepEqual(seen, [model.maxTokens]);
+	handle.dispose();
+});
+
+async function runOfflineDeepSeekPayload(t: TestContext, strict: boolean, fields: Record<string, unknown>,
+	requestModelChange: Record<string, unknown> = {}) {
+	const persistDir = await fixture(t);
+	const model = { ...MODEL, id: "deepseek-flash", provider: "deepseek",
+		api: "openai-completions", baseUrl: "https://api.deepseek.com" } as Model<"openai-completions">;
+	let dispatched = 0;
+	let outgoing: unknown;
+	let requestedMaxTokens: number | undefined;
+	const runtime = { getModels: () => [model],
+		async streamSimple(_model: unknown, _context: unknown, options: { maxTokens?: number;
+			onPayload?: (payload: unknown, model: Model<"openai-completions">) => Promise<unknown> }) {
+			requestedMaxTokens = options.maxTokens;
+			outgoing = await options.onPayload?.({ model: model.id,
+				messages: [{ role: "user", content: "offline" }], ...fields },
+				{ ...model, ...requestModelChange });
+			dispatched++;
+		},
+	} as unknown as ModelRuntime;
+	const stub = stubFactory();
+	const factory = (async (options: CreateAgentSessionOptions = {}) => {
+		const created = await stub.factory(options);
+		const original = created.session.prompt.bind(created.session);
+		(created.session as unknown as { prompt: (text: string) => Promise<void> }).prompt = async text => {
+			await (options.modelRuntime as unknown as { streamSimple: (model: unknown, context: unknown,
+				options: unknown) => Promise<unknown> }).streamSimple(model, { messages: [] }, {});
+			await original(text);
+		};
+		return created;
+	}) as typeof createAgentSession;
+	const handle = await new PiSessionRunner({ modelRuntime: runtime, createSession: factory })
+		.create(spec(persistDir, { model: "deepseek/deepseek-flash",
+			...(strict ? { strictRequest: { maxInputPayloadBytes: 1000 } } : {}) }));
+	let error: unknown;
+	try { await handle.prompt("offline request"); }
+	catch (caught) { error = caught; }
+	const observations = handle.providerOutputRequests?.();
+	handle.dispose();
+	return { error, dispatched, outgoing, requestedMaxTokens, observations, resolvedMaxTokens: model.maxTokens };
+}
+
+for (const strict of [false, true]) {
+	test(`${strict ? "strict" : "ordinary"} DeepSeek request keeps Pi's adjusted or omitted output field`, async t => {
+		for (const [name, fields, outputField, outgoingMaxTokens] of [
+			["context-adjusted max_tokens", { max_tokens: 75 }, "max_tokens", 75],
+			["alternate max_completion_tokens", { max_completion_tokens: 60 }, "max_completion_tokens", 60],
+			["omitted", {}, "omitted", null],
+		] as const) {
+			await t.test(name, async subtest => {
+				const run = await runOfflineDeepSeekPayload(subtest, strict, fields);
+				assert.equal(run.error, undefined);
+				assert.equal(run.dispatched, 1);
+				assert.equal(run.requestedMaxTokens, run.resolvedMaxTokens);
+				assert.deepEqual(run.observations, [{ resolvedMaxTokens: run.resolvedMaxTokens,
+					outputField, outgoingMaxTokens }]);
+				assert.equal((run.outgoing as Record<string, unknown>).max_tokens, fields.max_tokens);
+				assert.equal((run.outgoing as Record<string, unknown>).max_completion_tokens, fields.max_completion_tokens);
+			});
+		}
+	});
+
+	test(`${strict ? "strict" : "ordinary"} DeepSeek request rejects unsafe output and identity changes`, async t => {
+		for (const [name, fields, modelChange] of [
+			["fractional", { max_tokens: 1.5 }, {}],
+			["nonfinite", { max_tokens: Infinity }, {}],
+			["nonpositive", { max_tokens: 0 }, {}],
+			["above resolved provider capability", { max_tokens: 1001 }, {}],
+			["conflicting fields", { max_tokens: 75, max_completion_tokens: 60 }, {}],
+			["changed payload model", { model: "other" }, {}],
+			["changed runtime model", { max_tokens: 75 }, { id: "other" }],
+			["changed provider", { max_tokens: 75 }, { provider: "other" }],
+			["changed endpoint", { max_tokens: 75 }, { baseUrl: "https://invalid.example" }],
+		] as const) {
+			await t.test(name, async subtest => {
+				const run = await runOfflineDeepSeekPayload(subtest, strict, fields, modelChange);
+				assert(run.error instanceof Error);
+				assert.match(run.error.message, /DeepSeek provider request|strict request/);
+				assert.equal(run.dispatched, 0);
+				assert.deepEqual(run.observations, []);
+			});
+		}
+	});
+}
 
 test("a read-dir grant confines both tools, rejects PDFs, and records successful reads", async (t) => {
 	const persistDir = await fixture(t);
@@ -271,6 +410,67 @@ test("a read-dir grant confines both tools, rejects PDFs, and records successful
 	);
 	assert.match((result.content[0] as { text: string }).text, /material text/);
 	assert.deepEqual(handle.readCoverage(), ["note.txt"]);
+});
+
+test("read-dir records an empty text file without a fabricated line range", async t => {
+	const persistDir = await fixture(t);
+	const materialRoot = path.join(persistDir, "materials");
+	await mkdir(materialRoot);
+	await writeFile(path.join(materialRoot, "empty.txt"), "");
+	const stub = stubFactory();
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory }).create(
+		spec(persistDir, { tools: { kind: "read-dir", root: materialRoot, toolName: "m07_evidence_read" } }));
+	const read = stub.calls[0].customTools?.find(tool => tool.name === "m07_evidence_read");
+	assert(read);
+	await read.execute("empty", { path: "empty.txt" }, undefined, undefined, undefined as never);
+	assert.deepEqual(handle.readCoverage(), ["empty.txt"]);
+	const events = handle.readReturnEvents();
+	assert.equal(events.length, 1);
+	const { at, ...event } = events[0]!;
+	assert.ok(Number.isFinite(Date.parse(at)));
+	assert.deepEqual(event, { toolName: "m07_evidence_read", status: "no-content", path: "empty.txt",
+		requested: {}, returned: { kind: "text", truncated: false } });
+	handle.dispose();
+});
+
+test("read-dir classifies only a proved beyond-EOF offset from confined file bytes", async t => {
+	const persistDir = await fixture(t);
+	const materialRoot = path.join(persistDir, "materials");
+	await mkdir(materialRoot);
+	await writeFile(path.join(materialRoot, "row.txt"), Array(424).fill("row").join("\n"));
+	const outsideRoot = path.join(persistDir, "outside.txt");
+	await writeFile(outsideRoot, "outside\n");
+	await symlink(outsideRoot, path.join(materialRoot, "escape.txt"));
+	const stub = stubFactory();
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory }).create(
+		spec(persistDir, { tools: { kind: "read-dir", root: materialRoot, toolName: "m07_evidence_read" } }));
+	const read = stub.calls[0].customTools?.find(tool => tool.name === "m07_evidence_read");
+	assert(read);
+	await assert.rejects(read.execute("overshoot", { path: "row.txt", offset: 695, limit: 700 },
+		undefined, undefined, undefined as never), /beyond end of file/);
+	const eof = handle.readReturnEvents()[0]!;
+	assert.deepEqual({ ...eof, at: undefined }, { toolName: "m07_evidence_read", status: "error",
+		path: "row.txt", requested: { offset: 695, limit: 700 }, returned: { kind: "unknown" },
+		error: { kind: "offset-beyond-eof", lineCount: 424 }, at: undefined });
+	await read.execute("tail", { path: "row.txt", offset: 400, limit: 25 },
+		undefined, undefined, undefined as never);
+	assert.deepEqual(handle.readReturnEvents()[1]?.returned,
+		{ kind: "text", startLine: 400, endLine: 424, truncated: false });
+	await assert.rejects(read.execute("escape", { path: "escape.txt", offset: 695 },
+		undefined, undefined, undefined as never), /outside the granted directory/);
+	assert.equal(handle.readReturnEvents()[2]?.error, undefined);
+	assert.equal(handle.readReturnEvents()[2]?.path, "<unresolved>");
+	const denied = path.join(materialRoot, "denied.txt");
+	await writeFile(denied, "denied\n");
+	await chmod(denied, 0o000);
+	try {
+		await assert.rejects(read.execute("denied", { path: "denied.txt", offset: 695 },
+			undefined, undefined, undefined as never), /EACCES/);
+		assert.equal(handle.readReturnEvents()[3]?.error, undefined);
+	} finally {
+		await chmod(denied, 0o600);
+	}
+	handle.dispose();
 });
 
 test("writes the sidecar next to the SDK path and resume rebuilds from it", async (t) => {
@@ -358,6 +558,252 @@ test("execution grants only requested native tools at the execution cwd and logs
 	await assert.rejects(runner.resume(handle.ref), /cannot be resumed/);
 });
 
+test("local execution bash does not inherit model process credentials", async t => {
+	const persistDir = await fixture(t);
+	const executionRoot = path.join(persistDir, "execution");
+	await mkdir(executionRoot);
+	const key = "MULPIS_LOCAL_MISSION_SECRET_CANARY";
+	const before = process.env[key];
+	process.env[key] = "synthetic-private-value";
+	try {
+		const stub = stubFactory();
+		const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME,
+			createSession: stub.factory });
+		await runner.create(spec(persistDir, { tools: { kind: "execution",
+			root: executionRoot, tools: ["bash"] } }));
+		const bash = stub.calls[0].customTools?.find(tool => tool.name === "bash");
+		assert(bash);
+		const output = await bash.execute("canary", { command: "env" }, undefined,
+			undefined, { cwd: executionRoot } as never);
+		assert.doesNotMatch(JSON.stringify(output), /MULPIS_LOCAL_MISSION_SECRET_CANARY|synthetic-private-value/);
+	} finally {
+		if (before === undefined) delete process.env[key];
+		else process.env[key] = before;
+	}
+});
+
+test("managed local bash receipts bind real foreground exits to exact Pi calls", async t => {
+	const persistDir = await fixture(t);
+	const root = path.join(persistDir, "work");
+	await mkdir(root);
+	const stub = stubFactory();
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory })
+		.create(spec(persistDir, { tools: { kind: "execution", root, tools: ["bash"] } }));
+	const bash = stub.calls[0].customTools?.find(tool => tool.name === "bash");
+	assert(bash);
+	const goodCommand = "printf head; sleep 0.02; printf tail";
+	const good = await bash.execute("call-success", { command: goodCommand }, undefined, undefined, { cwd: root } as never);
+	assert.match(JSON.stringify(good.content), /headtail/);
+	await assert.rejects(bash.execute("call-failure", { command: "exit 17" }, undefined, undefined,
+		{ cwd: root } as never), /code 17/);
+	const rows = handle.toolLog();
+	assert.deepEqual(rows.map(row => [row.toolCallId, row.ok]), [["call-success", true], ["call-failure", false]]);
+	const first = await readManagedBashReceipt(rows[0].hostReceiptPath!);
+	const second = await readManagedBashReceipt(rows[1].hostReceiptPath!);
+	assert.equal(first.commandSha256, (await import("node:crypto")).createHash("sha256").update(goodCommand).digest("hex"));
+	assert.equal(first.toolCallId, "call-success");
+	assert.equal(first.sessionId, handle.ref.id);
+	assert.equal(first.spawn, "observed");
+	assert(first.pid && first.processGroupId === first.pid);
+	assert.equal(first.processExit?.exitCode, 0);
+	assert.equal(first.toolOutcome, "returned");
+	assert.equal(first.outputBytesAtExit, 8);
+	assert.equal(second.toolCallId, "call-failure");
+	assert.equal(second.processExit?.exitCode, 17);
+	assert.equal(second.toolOutcome, "threw");
+	assert.equal(second.toolErrorKind, "nonzero-exit");
+	assert.equal(second.remoteOrDetachedEffects, "unknown");
+	assert.equal((await readManagedBashSessionReceipts(persistDir, handle.ref.id)).length, 2);
+	handle.dispose();
+});
+
+test("managed bash retains thrown and crash-window uncertainty", async t => {
+	const persistDir = await fixture(t);
+	const root = path.join(persistDir, "work");
+	await mkdir(root);
+	const stub = stubFactory();
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory })
+		.create(spec(persistDir, { tools: { kind: "execution", root, tools: ["bash"] } }));
+	const bash = stub.calls[0].customTools?.find(tool => tool.name === "bash");
+	assert(bash);
+	const abort = new AbortController(); abort.abort();
+	await assert.rejects(bash.execute("call-aborted", { command: "printf impossible" }, abort.signal,
+		undefined, { cwd: root } as never), /Command aborted/);
+	const thrown = await readManagedBashReceipt(handle.toolLog()[0].hostReceiptPath!);
+	assert.equal(thrown.spawn, "not-attempted");
+	assert.equal(thrown.processExit, null);
+	assert.equal(thrown.toolOutcome, "threw");
+	assert.equal(thrown.toolErrorKind, "transport-or-tool");
+	const prepared = await prepareManagedBashCall(path.join(persistDir, "crash-window"),
+		handle.ref.id, "call-crashed", "true", root);
+	assert.equal((await readManagedBashReceipt(prepared.file)).toolOutcome, "unknown");
+	assert.equal((await readManagedBashReceipt(prepared.file)).spawn, "not-attempted");
+	await finishManagedBashCall(prepared, "is-error");
+	assert.equal((await readManagedBashReceipt(prepared.file)).toolOutcome, "is-error");
+	handle.dispose();
+});
+
+test("detached local child leaves remote or detached effects explicitly unknown", async t => {
+	if (process.platform !== "linux") return t.skip("Linux setsid fixture");
+	const persistDir = await fixture(t);
+	const root = path.join(persistDir, "work");
+	await mkdir(root);
+	const stub = stubFactory();
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory })
+		.create(spec(persistDir, { tools: { kind: "execution", root, tools: ["bash"] } }));
+	const bash = stub.calls[0].customTools?.find(tool => tool.name === "bash");
+	assert(bash);
+	const result = await bash.execute("call-detached", { command: "setsid sh -c 'sleep 1; printf late' & printf now" },
+		undefined, undefined, { cwd: root } as never);
+	assert.match(JSON.stringify(result.content), /now/);
+	const receipt = await readManagedBashReceipt(handle.toolLog()[0].hostReceiptPath!);
+	assert.equal(receipt.processExit?.exitCode, 0);
+	assert.equal(receipt.toolOutcome, "returned");
+	assert.equal(receipt.remoteOrDetachedEffects, "unknown");
+	handle.dispose();
+});
+
+test("managed bash recovery reader rejects forged, linked and public receipts", async t => {
+	const persistDir = await fixture(t);
+	const root = path.join(persistDir, "work");
+	await mkdir(root);
+	const sessionId = "verified-session";
+	const directory = path.join(persistDir, "host-execution-receipts", sessionId);
+	const call = await prepareManagedBashCall(directory, sessionId, "call-1", "true", root);
+	assert.equal((await readManagedBashSessionReceipts(persistDir, sessionId)).length, 1);
+	const forged = { ...call.receipt, pid: 42 };
+	await writeFile(call.file, `${JSON.stringify(forged)}\n`);
+	await assert.rejects(readManagedBashSessionReceipts(persistDir, sessionId), /invalid managed bash receipt/);
+	await writeFile(call.file, `${JSON.stringify(call.receipt)}\n`);
+	await (await import("node:fs/promises")).chmod(call.file, 0o644);
+	await assert.rejects(readManagedBashReceipt(call.file), /private regular file/);
+	await (await import("node:fs/promises")).chmod(call.file, 0o600);
+	const link = path.join(persistDir, "receipt-link.json");
+	await symlink(call.file, link);
+	await assert.rejects(readManagedBashReceipt(link), /private regular file/);
+	const orphanId = "11111111-1111-4111-8111-111111111111";
+	await writeFile(path.join(directory, `${orphanId}.json.123.22222222-2222-4222-8222-222222222222.tmp`),
+		"incomplete write");
+	const evidence = await readManagedBashSessionEvidence(persistDir, sessionId);
+	assert.equal(evidence.receipts.length, 1);
+	assert.deepEqual(evidence.pendingReceiptIds, [orphanId]);
+});
+
+test("recovery census pairs a real failed shell with exact Pi call and typed file results", async t => {
+	if (process.platform !== "linux") return t.skip("Linux process birth and group fixture");
+	const persistDir = await fixture(t);
+	const root = path.join(persistDir, "work");
+	await mkdir(root);
+	await writeFile(path.join(root, "input.txt"), "fixture\n");
+	const stub = stubFactory();
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory })
+		.create(spec(persistDir, { tools: { kind: "execution", root, tools: ["bash", "read"] } }));
+	const manager = stub.calls[0].sessionManager!;
+	const bash = stub.calls[0].customTools?.find(tool => tool.name === "bash")!;
+	const command = "sleep 0.03; exit 9";
+	manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "failed-shell", name: "bash",
+		arguments: { command } }] } as never);
+	await assert.rejects(bash.execute("failed-shell", { command }, undefined, undefined,
+		{ cwd: root } as never), /code 9/);
+	const input = { persistDir, sessionId: handle.ref.id, sessionFile: handle.ref.file!, workDir: root };
+	const scoped = await inspectSingleForegroundBashFailure(input);
+	assert.equal(scoped?.exitCode, 9);
+	assert.equal(scoped?.modelResponse, "unknown");
+	assert.equal(scoped?.remoteOrDetachedEffects, "unknown");
+	let census = await inspectManagedExecutionSession(input);
+	const receiptFile = handle.toolLog()[0].hostReceiptPath!;
+	const pendingFile = `${receiptFile}.123.22222222-2222-4222-8222-222222222222.tmp`;
+	await writeFile(pendingFile, "partial replacement");
+	census = await inspectManagedExecutionSession(input);
+	assert.deepEqual(census.pendingReceiptIds, [(await readManagedBashReceipt(receiptFile)).id]);
+	assert.equal(await inspectSingleForegroundBashFailure(input), null);
+	await rm(pendingFile);
+	assert.deepEqual(census.calls.map(row => [row.toolCallId, row.toolResult, row.localLifecycle]),
+		[["failed-shell", "missing", "terminal"]]);
+	manager.appendMessage({ role: "toolResult", toolCallId: "failed-shell", toolName: "bash",
+		isError: true, content: [{ type: "text", text: "failed" }] } as never);
+	const read = stub.calls[0].customTools?.find(tool => tool.name === "read")!;
+	manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "read-file", name: "read",
+		arguments: { path: "input.txt" } }] } as never);
+	await read.execute("read-file", { path: "input.txt" }, undefined, undefined, { cwd: root } as never);
+	census = await inspectManagedExecutionSession(input);
+	assert.equal(census.calls[1].localLifecycle, "unknown");
+	manager.appendMessage({ role: "toolResult", toolCallId: "read-file", toolName: "read",
+		isError: false, content: [{ type: "text", text: "fixture" }] } as never);
+	census = await inspectManagedExecutionSession(input);
+	assert.deepEqual(census.calls.map(row => [row.name, row.toolResult, row.localLifecycle]),
+		[["bash", "is-error", "terminal"], ["read", "returned", "terminal"]]);
+	assert.equal(await inspectSingleForegroundBashFailure(input), null);
+	const goal = { runId: "goal-1", tasks: [{ taskId: "T001", mode: "execute", workDir: root,
+		session: handle.ref }], executionState: { operations: [{ id: "O001", taskId: "T001",
+		status: "unknown" }] } } as unknown as import("../../src/m07/types.ts").CurrentGoal;
+	const bound = await inspectM07ManagedOperation(goal, "O001");
+	assert.equal(bound?.operationId, "O001");
+	assert.equal(bound?.sessionId, handle.ref.id);
+	assert.equal(bound?.calls.length, 2);
+	assert.deepEqual(bound?.pendingReceiptIds, []);
+	const forkedGoal = { ...goal, tasks: [{ ...goal.tasks[0],
+		session: { ...handle.ref, lineageFile: path.join(persistDir, "fork.lineage.json") } }] };
+	assert.equal(await inspectM07ManagedOperation(forkedGoal, "O001"), null);
+	const siblingLineage = handle.ref.file!.replace(/\.jsonl$/, ".lineage.json");
+	await writeFile(siblingLineage, "fork marker");
+	assert.equal(await inspectM07ManagedOperation(goal, "O001"), null);
+	await rm(siblingLineage);
+	goal.executionState!.operations.push({ version: 1, id: "O002", taskId: "T001",
+		status: "unknown", issuedAt: new Date().toISOString() });
+	assert.equal(await inspectM07ManagedOperation(goal, "O001"), null);
+	const link = path.join(persistDir, "session-link.jsonl");
+	await symlink(handle.ref.file!, link);
+	await assert.rejects(inspectManagedExecutionSession({ ...input, sessionFile: link }), /regular file/);
+	const transcript = await readFile(handle.ref.file!, "utf8");
+	await writeFile(handle.ref.file!, transcript.replace(command, "sleep 0.03; exit 8"));
+	await assert.rejects(inspectManagedExecutionSession(input), /command differs/);
+	handle.dispose();
+});
+
+test("confined custom tool logs prove full UTF-8 reads without logging contents or write arguments", async t => {
+	const persistDir = await fixture(t);
+	const work = path.join(persistDir, "confined-work");
+	await mkdir(work);
+	await writeFile(path.join(work, "source.txt"), "PRIVATE-READ-CONTENT\n", "utf8");
+	const stub = stubFactory();
+	const tools = await createConfinedCampaignFileTools(work, { writableFiles: ["output.txt"] });
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory })
+		.create(spec(persistDir, { tools: { kind: "custom", tools } }));
+	const active = stub.calls[0].customTools ?? [];
+	const read = active.find(tool => tool.name === "read")!;
+	const write = active.find(tool => tool.name === "write")!;
+	await read.execute("read-one", { path: "source.txt" }, undefined, undefined, {} as never);
+	await assert.rejects(read.execute("read-missing", { path: "missing.txt" }, undefined, undefined, {} as never));
+	await write.execute("write-one", { path: "output.txt", content: "PRIVATE-WRITE-CONTENT" }, undefined, undefined, {} as never);
+	const rows = handle.toolLog();
+	assert.deepEqual(rows[0].resultMetadata, { kind: "confined-utf8-read", relativePath: "source.txt",
+		utf8Bytes: Buffer.byteLength("PRIVATE-READ-CONTENT\n", "utf8"), truncated: false });
+	assert.equal(rows[1].errorClass, "filesystem");
+	assert.equal(rows[1].errorCode, "ENOENT");
+	assert.match(rows[1].errorMessage ?? "", /File read failed/);
+	assert.deepEqual(rows[2].args, { path: "output.txt" });
+	assert.doesNotMatch(JSON.stringify(rows), /PRIVATE-READ-CONTENT|PRIVATE-WRITE-CONTENT/);
+	handle.dispose();
+});
+
+test("an arbitrary custom read-named tool cannot claim factory read completeness or log secret args", async t => {
+	const persistDir = await fixture(t);
+	const stub = stubFactory();
+	const arbitrary: CustomToolSpec = { name: "read", description: "synthetic untrusted tool",
+		params: { secret: { type: "string", description: "secret" } },
+		async execute() { return { text: "UNTRUSTED-RESULT" }; } };
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory })
+		.create(spec(persistDir, { tools: { kind: "custom", tools: [arbitrary] } }));
+	await stub.calls[0].customTools![0].execute("arbitrary", { secret: "PRIVATE-ARGUMENT" },
+		undefined, undefined, {} as never);
+	const row = handle.toolLog()[0];
+	assert.equal(row.resultMetadata, undefined);
+	assert.deepEqual(row.args, {});
+	assert.doesNotMatch(JSON.stringify(row), /PRIVATE-ARGUMENT|UNTRUSTED-RESULT/);
+	handle.dispose();
+});
+
 test("abort before prompt sends nothing and abort during prompt reaches the SDK", async (t) => {
 	const beforeDir = await fixture(t);
 	const beforeController = new AbortController();
@@ -368,7 +814,12 @@ test("abort before prompt sends nothing and abort during prompt reaches the SDK"
 		createSession: beforeStub.factory,
 		signal: beforeController.signal,
 	}).create(spec(beforeDir));
-	await assert.rejects(before.prompt("must not send"), /aborted before prompt/);
+	await assert.rejects(before.prompt("must not send"), (error: unknown) => {
+		assert(error instanceof HarnessError);
+		assert.equal(error.code, "runner.aborted");
+		assert.match(error.message, /aborted before prompt/);
+		return true;
+	});
 	assert.equal(beforeStub.promptCalls, 0);
 
 	const duringDir = await fixture(t);
@@ -393,7 +844,7 @@ test("abort before prompt sends nothing and abort during prompt reaches the SDK"
 	duringController.abort();
 	await assert.rejects(pending, (error: unknown) => {
 		assert(error instanceof HarnessError);
-		assert.equal(error.code, "runner.stop");
+		assert.equal(error.code, "runner.aborted");
 		assert.match(error.message, /aborted during prompt/);
 		assert.match(error.message, /SDK abort failed: offline abort rejection/);
 		return true;
@@ -547,6 +998,155 @@ test("method binding survives resume without enabling discovered resources", asy
 	const resumed = await runner.resume(handle.ref);
 	assert.deepEqual(resumed.ref.methodBinding, binding);
 	resumed.dispose();
+});
+
+test("Pi forks two independent histories from a frozen completed leaf, preserving tool payload and excluding later parent turns", async (t) => {
+	const root = await fixture(t);
+	const sessions = path.join(root, "parent-sessions");
+	const childSessions = path.join(root, "child-sessions");
+	const frozen = path.join(root, "frozen-evidence.json");
+	await mkdir(sessions);
+	await mkdir(childSessions);
+	await writeFile(frozen, JSON.stringify({ originalPath: "/parent/original.txt", frozenPath: frozen }));
+	const stub = stubFactory([
+		{ content: [{ type: "toolCall", id: "t", name: "offline", arguments: {} }], stopReason: "toolUse" },
+		{ content: [{ type: "text", text: "finished first" }], stopReason: "stop" },
+	], { insertToolResult: true });
+	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory });
+	const historicalTool: CustomToolSpec = { name: "offline", description: "historical only", params: {}, execute: async () => ({ text: "unused" }) };
+	const parent = await runner.create(spec(sessions, { tools: { kind: "custom", tools: [historicalTool] } }));
+	await parent.prompt("parent first");
+	const checkpoint = await runner.checkpoint(parent, { inputManifest: frozen, runId: "run-1", taskId: "task-1", externalOperationsSettled: true });
+	const parentAtCheckpoint = await readFile(parent.ref.file!, "utf8");
+	await parent.prompt("parent later");
+	const parentBeforeFork = await readFile(parent.ref.file!, "utf8");
+	const childSpec = spec(childSessions, { label: "child", role: "research", tools: { kind: "none" } });
+	const evidenceBindings = [{ version: 1 as const, label: "original tool result binding", path: frozen, status: "frozen-copy" as const, sourceVersion: checkpoint.id }];
+	const first = await runner.fork({ checkpoint, spec: childSpec, evidenceBindings, reason: "competing route one" });
+	const second = await runner.fork({ checkpoint, spec: { ...childSpec, label: "child-two" }, evidenceBindings, reason: "competing route two" });
+	assert.notEqual(first.ref.id, second.ref.id);
+	assert.notEqual(first.ref.file, second.ref.file);
+	assert.notEqual(first.ref.file, parent.ref.file);
+	assert.deepEqual(stub.calls.at(-1)?.tools, []);
+	assert.deepEqual(stub.calls.at(-1)?.resourceLoader?.getExtensions().extensions, []);
+	assert.deepEqual(stub.calls.at(-1)?.resourceLoader?.getSkills().skills, []);
+	const firstFile = await readFile(first.ref.file!, "utf8");
+	await assert.rejects(inspectManagedExecutionSession({ persistDir: childSessions,
+		sessionId: first.ref.id, sessionFile: first.ref.file! }), /forked Pi session/);
+	assert.match(firstFile, /ORIGINAL TOOL PAYLOAD at \/parent\/original\.txt/);
+	assert.match(JSON.stringify(stub.calls.at(-2)?.sessionManager?.buildSessionContext().messages), /ORIGINAL TOOL PAYLOAD at \/parent\/original\.txt/);
+	assert.doesNotMatch(firstFile, /parent later/);
+	assert.match(firstFile, /parent first/);
+	assert.equal(await readFile(parent.ref.file!, "utf8"), parentBeforeFork);
+	assert.notEqual((JSON.parse(firstFile.split("\n")[0]) as { cwd: string }).cwd, (JSON.parse(parentAtCheckpoint.split("\n")[0]) as { cwd: string }).cwd);
+	const lineage = JSON.parse(await readFile(first.ref.lineageFile!, "utf8"));
+	assert.equal(lineage.parent.leafId, checkpoint.leafId);
+	assert.equal(lineage.inheritedUsageBilled, false);
+	assert.deepEqual(lineage.evidenceBindings, evidenceBindings);
+	await first.prompt("first child only");
+	assert.doesNotMatch(await readFile(second.ref.file!, "utf8"), /first child only/);
+	assert.equal(first.usageEvents().filter((event) => event.kind === "assistant").length, 2);
+	first.dispose();
+	const resumedChild = await runner.resume(first.ref);
+	assert.equal(resumedChild.ref.lineageFile, first.ref.lineageFile);
+	resumedChild.dispose();
+	second.dispose();
+	await rm(second.ref.lineageFile!);
+	await assert.rejects(runner.resume(second.ref), /lineage receipt is missing/);
+	parent.dispose();
+});
+
+test("Pi checkpoint and fork fail closed for active, failed, unsettled, missing-evidence and changed-model parents", async (t) => {
+	const root = await fixture(t);
+	const manifest = path.join(root, "frozen.json");
+	await writeFile(manifest, "{}\n");
+	const stub = stubFactory();
+	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory });
+	const parent = await runner.create(spec(root));
+	await assert.rejects(runner.checkpoint(parent, { inputManifest: manifest, runId: "run", externalOperationsSettled: true }), /completed/);
+	await parent.prompt("complete");
+	await assert.rejects(runner.checkpoint(parent, { inputManifest: manifest, runId: "run", externalOperationsSettled: false }), /unknown external operations/);
+	const checkpoint = await runner.checkpoint(parent, { inputManifest: manifest, runId: "run", externalOperationsSettled: true });
+	await assert.rejects(runner.fork({ checkpoint, spec: spec(root, { model: "offline/other" }), evidenceBindings: [], reason: "candidate" }), /cross-model/);
+	await assert.rejects(runner.fork({ checkpoint, spec: spec(root, { tools: { kind: "execution", root, tools: ["bash"] } }), evidenceBindings: [{ version: 1, label: "frozen", path: manifest, status: "frozen-copy", sourceVersion: checkpoint.id }], reason: "candidate" }), /cannot elevate tool authority/);
+	await assert.rejects(runner.fork({ checkpoint, spec: spec(root), evidenceBindings: [{ version: 1, label: "mutable", path: manifest, status: "linked" }], reason: "candidate" }), /frozen-copy/);
+	await writeFile(manifest, "{\"changed\":true}\n");
+	await assert.rejects(runner.fork({ checkpoint, spec: spec(root), evidenceBindings: [{ version: 1, label: "frozen", path: manifest, status: "frozen-copy", sourceVersion: checkpoint.id }], reason: "candidate" }), /manifest is missing or changed/);
+	await writeFile(manifest, "{}\n");
+	await writeFile(parent.ref.specFile!, JSON.stringify(spec(root, { label: "changed" })));
+	await assert.rejects(runner.fork({ checkpoint, spec: spec(root), evidenceBindings: [{ version: 1, label: "frozen", path: manifest, status: "frozen-copy", sourceVersion: checkpoint.id }], reason: "candidate" }), /parent spec changed/);
+	parent.dispose();
+});
+
+test("Pi forks a compaction-aware checkpoint while retaining original JSONL evidence", async (t) => {
+	const root = await fixture(t);
+	const manifest = path.join(root, "manifest.json");
+	await writeFile(manifest, "{}\n");
+	const usage = { input: 4, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 5, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+	const stub = stubFactory(undefined, { compactionUsage: usage });
+	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory });
+	const parent = await runner.create(spec(root));
+	await parent.prompt("full original before compaction");
+	const checkpoint = await runner.checkpoint(parent, { inputManifest: manifest, runId: "run", externalOperationsSettled: true });
+	const child = await runner.fork({ checkpoint, spec: spec(path.join(root, "children")), evidenceBindings: [{ version: 1, label: "frozen", path: manifest, status: "frozen-copy", sourceVersion: checkpoint.id }], reason: "alternate compaction-aware continuation" });
+	const childJsonl = await readFile(child.ref.file!, "utf8");
+	assert.match(childJsonl, /full original before compaction/);
+	assert.match(childJsonl, /"type":"compaction"/);
+	assert.equal(child.usageEvents().length, 0);
+	child.dispose(); parent.dispose();
+});
+
+test("Pi checkpoint refuses a prompt still in flight", async (t) => {
+	const root = await fixture(t);
+	const manifest = path.join(root, "manifest.json");
+	await writeFile(manifest, "{}\n");
+	const stub = stubFactory();
+	let release!: () => void;
+	let started!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const entered = new Promise<void>((resolve) => { started = resolve; });
+	const factory = (async (options: CreateAgentSessionOptions = {}) => {
+		const created = await stub.factory(options);
+		const original = created.session.prompt.bind(created.session);
+		(created.session as unknown as { prompt(text: string): Promise<void> }).prompt = async (text) => { started(); await gate; await original(text); };
+		return created;
+	}) as typeof createAgentSession;
+	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: factory });
+	const handle = await runner.create(spec(root));
+	const inFlight = handle.prompt("waiting");
+	await entered;
+	await assert.rejects(runner.checkpoint(handle, { inputManifest: manifest, runId: "run", externalOperationsSettled: true }), /idle, completed/);
+	release();
+	await inFlight;
+	const checkpoint = await runner.checkpoint(handle, { inputManifest: manifest, runId: "run", externalOperationsSettled: true });
+	assert(checkpoint.leafId);
+	handle.dispose();
+});
+
+test("fake runner mirrors independent checkpoint snapshots and child scratch identity", async (t) => {
+	const root = await fixture(t);
+	const manifest = path.join(root, "manifest.json");
+	await writeFile(manifest, "{}\n");
+	const runner = new FakeSessionRunner(() => "ok");
+	const parent = await runner.create(spec(root));
+	await parent.prompt("ancestor");
+	const checkpoint = await runner.checkpoint(parent, { inputManifest: manifest, runId: "run", externalOperationsSettled: true });
+	await parent.prompt("later parent");
+	const evidenceBindings = [{ version: 1 as const, label: "frozen", path: manifest, status: "frozen-copy" as const, sourceVersion: checkpoint.id }];
+	const a = await runner.fork({ checkpoint, spec: spec(root, { label: "a" }), evidenceBindings, reason: "first option" });
+	const b = await runner.fork({ checkpoint, spec: spec(root, { label: "b" }), evidenceBindings, reason: "second option" });
+	assert.deepEqual(a.transcript(), b.transcript());
+	assert.doesNotMatch(JSON.stringify(a.transcript()), /later parent/);
+	const aLineage = JSON.parse(await readFile(a.ref.lineageFile!, "utf8"));
+	const bLineage = JSON.parse(await readFile(b.ref.lineageFile!, "utf8"));
+	assert.notEqual(aLineage.child.scratch, bLineage.child.scratch);
+	assert.notEqual(aLineage.child.sessionFile, bLineage.child.sessionFile);
+	a.dispose(); b.dispose();
+	const resumed = await runner.resume(a.ref);
+	resumed.dispose();
+	await rm(b.ref.lineageFile!);
+	await assert.rejects(runner.resume(b.ref), /lineage receipt is missing/);
+	parent.dispose();
 });
 
 test("releases SDK session when post-create sidecar write fails", async (t) => {

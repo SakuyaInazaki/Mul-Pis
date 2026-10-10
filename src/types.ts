@@ -6,6 +6,7 @@
  * Nothing here decides models: every role's model comes from the workspace
  * configuration, and the harness refuses to run a stage whose role is unset.
  */
+import type { ContextBoundaryRecordV1 } from "./context/boundary.ts";
 
 /** Roles that a stage session can take. One role can be served by any configured model. */
 export type Role = "execution" | "reviewer" | "research" | "reader" | "checker" | "applicability" | "acquisition" | "improver";
@@ -33,6 +34,8 @@ export interface ModelSpec {
  */
 export interface HarnessConfig {
 	roles: Partial<Record<Role | "default", string>>;
+	/** Explicit local mission capability. Task-root Pi bash is not an OS sandbox. */
+	localMission?: { execution?: "task-root-bash"; evaluatorId?: string };
 	/** Independent M03 question/evaluation sessions. Repeated models are allowed and remain distinct sessions. */
 	m03Reviewers?: Array<{ id: string; model: string }>;
 	/** Maximum number of independent stage tasks processed at the same time. Engineering default 1. */
@@ -76,10 +79,12 @@ export interface StageRunRecord {
 	stage: string;
 	runId: string;
 	startedAt: string;
+	/** Persisted stage-local creation order for newly allocated runs; legacy records omit it. */
+	startSequence?: number;
 	finishedAt?: string;
 	status: RunStatus;
 	inputs: InputRef[];
-	sessions: Array<{ label: string; role: Role; id: string; file?: string; model: string }>;
+	sessions: Array<{ label: string; role: Role; id: string; file?: string; model: string; boundary?: ContextBoundaryRecordV1 }>;
 	outputs: OutputRef[];
 	failures: string[];
 	/** Knowledge snapshot id that was current when the run started, if any. */

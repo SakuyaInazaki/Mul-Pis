@@ -61,14 +61,18 @@ export interface ImprovementHypothesis {
 
 export interface CampaignPlan {
 	version: 1;
-	maxCandidates: number;
-	maxTrialCalls: number;
+	/** Legacy execution quotas: ignored for new runs. */
+	maxCandidates?: number;
+	maxTrialCalls?: number;
 	repetitions: number;
-	maxReadbackChars: number;
-	maxTotalInputTokens: number;
-	maxTotalOutputTokens: number;
-	maxTotalCost: number;
-	timeoutMs: number;
+	/** Historical cumulative readback quota, decoded but ignored in new campaigns. */
+	maxReadbackChars?: number;
+	maxTotalInputTokens?: number;
+	/** Archived plans may include this obsolete field; it has no enforcement effect. */
+	maxTotalOutputTokens?: number;
+	/** Historical spending ceiling, readable but ignored by new campaigns. */
+	maxTotalCost?: number;
+	timeoutMs?: number;
 	caseSetPath?: string;
 }
 
@@ -81,6 +85,11 @@ export interface ImprovementAttempt {
 	status: "proposing" | "screened" | "rejected" | "inconclusive" | "promoted" | "failed";
 	reason?: string;
 	historyConsumed: string[];
+	/** Number of frozen attempt summaries available through history_read. */
+	historyAvailableCount?: number;
+	/** Actual UTF-16 ranges returned by history_read; an index alone is not a read. */
+	historyReadbackRanges?: Array<{ start: number; end: number }>;
+	historySnapshotPath?: string;
 }
 
 export type ImprovementRunStatus = "proposing" | "candidate-ready" | "screened" | "inconclusive" | "promoted" | "rejected" | "failed";
@@ -103,7 +112,7 @@ export interface ImprovementRun {
 	rejectionReason?: string;
 	attempts: ImprovementAttempt[];
 	stopReason?: string;
-	campaignUsage?: { input: number; output: number; cost: number; complete: boolean; usageSettlement: "settled" | "pending-or-unknown"; proposerCalls: number; trialCalls: number; inFlightBudgetMayExceed: true };
+	campaignUsage?: { input: number; output: number; cost: number; complete: boolean; usageSettlement: "settled" | "pending-or-unknown"; proposerCalls: number; trialCalls: number; /** Legacy record field; not emitted for new campaigns. */ inFlightBudgetMayExceed?: true };
 	session?: { id: string; label: string; model: string; file?: string; usageSidecar?: string };
 }
 

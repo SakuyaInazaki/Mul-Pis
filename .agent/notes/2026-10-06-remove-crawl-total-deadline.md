@@ -1,0 +1,7 @@
+# Remove workflow crawl deadline
+
+M05 no longer wraps a Crawl4AI page operation in an overall asyncio deadline or forwards the HTTP fault timeout as a page-navigation deadline. The local Playwright-backed Crawl4AI configuration explicitly requests page_timeout=0; its navigation call forwards this value to Playwright, where zero disables that operation timeout. The HTTP fallback retains connection/read fault detection, and actual cancellation propagates without silently launching fallback work. Robots and access controls remain enabled.
+
+Offline tests use a synthetic crawler slower than the supplied HTTP fault interval, reject any outer wait_for call, verify complete page capture and crawler cleanup, and verify genuine cancellation. They do not establish that every third-party SDK internal operation has no timeout or prove live browser integration. Sources checked: https://github.com/unclecode/crawl4ai/blob/main/crawl4ai/async_crawler_strategy.py and https://playwright.dev/python/docs/api/class-page. No real browser, network page, model, or paid call was used by these tests.
+
+Browser artifact capture also no longer exhausts a cumulative byte allowance across otherwise valid individual files. HTML, text, screenshots and downloads keep their existing individual byte ceilings and provenance checks; actual oversize files generate explicit warnings without poisoning later small captures. Synthetic tests cover ten valid captures/downloads beyond former cumulative totals and a large-file refusal followed by valid small files.

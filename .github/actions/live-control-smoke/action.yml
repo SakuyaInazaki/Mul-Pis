@@ -1,0 +1,5 @@
+name: Synthetic live control observer smoke
+description: Exercise the Node 24 artifact runtime with one synthetic encrypted status frame
+runs:
+  using: node24
+  main: main.mjs

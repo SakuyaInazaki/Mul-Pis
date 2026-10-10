@@ -41,7 +41,7 @@ export function validateMethodPackageV2(input: unknown): MethodPackageV2 {
  const sourceExperienceRefs = validateExperienceRequirements(item.sourceExperienceRefs, "sourceExperienceRefs");
  const requiredExperienceRefs = validateExperienceRequirements(item.requiredExperienceRefs, "requiredExperienceRefs");
  const requiredKnowledgeRefs = item.requiredKnowledgeRefs ?? [];
- if (!Array.isArray(requiredKnowledgeRefs) || requiredKnowledgeRefs.length > 100 || !requiredKnowledgeRefs.every(isKnowledgeRef) || new Set(requiredKnowledgeRefs.map((ref) => `${ref.storeId}/${ref.recordId}@${ref.version}`)).size !== requiredKnowledgeRefs.length) throw new HarnessError("improvement.method-v2", "requiredKnowledgeRefs must be bounded distinct pinned refs");
+ if (!Array.isArray(requiredKnowledgeRefs) || !requiredKnowledgeRefs.every(isKnowledgeRef) || new Set(requiredKnowledgeRefs.map((ref) => `${ref.storeId}/${ref.recordId}@${ref.version}`)).size !== requiredKnowledgeRefs.length) throw new HarnessError("improvement.method-v2", "requiredKnowledgeRefs must be distinct valid pinned refs");
  if (item.dependencyTransition !== undefined) {
   const transition = item.dependencyTransition as Record<string, unknown>;
   if (!transition || transition.version !== 1 || !isKnowledgeRef(transition.decisionRef) || !isKnowledgeRef(transition.revalidationRef) || !Array.isArray(transition.removedRefs) || !Array.isArray(transition.addedRefs) || !Array.isArray(transition.evidenceRefs) || ![...transition.removedRefs, ...transition.addedRefs, ...transition.evidenceRefs].every(isKnowledgeRef) || transition.evidenceRefs.length < 1 || typeof transition.at !== "string") throw new HarnessError("improvement.method-v2", "invalid dependency transition provenance");

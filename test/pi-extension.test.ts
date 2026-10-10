@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -8,7 +8,7 @@ import { createResearchExtension } from "../src/pi/extension.ts";
 import { ResearchService } from "../src/pi/service.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 
-function captureExtension(service: ResearchService, improvementServiceFactory?: (workspaceRoot: string) => any): { tools: Map<string, ToolDefinition>; commands: Map<string, { handler: (args: string, ctx: any) => Promise<void> }>; handlers: Map<string, Array<(event: any, ctx: any) => unknown>> } {
+function captureExtension(service: ResearchService, improvementServiceFactory?: (workspaceRoot: string) => any, researchImprovementServiceFactory?: (workspaceRoot: string) => any): { tools: Map<string, ToolDefinition>; commands: Map<string, { handler: (args: string, ctx: any) => Promise<void> }>; handlers: Map<string, Array<(event: any, ctx: any) => unknown>> } {
 	const tools = new Map<string, ToolDefinition>();
 	const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
 	const handlers = new Map<string, Array<(event: any, ctx: any) => unknown>>();
@@ -17,7 +17,7 @@ function captureExtension(service: ResearchService, improvementServiceFactory?: 
 		registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); },
 		registerCommand(name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) { commands.set(name, command); },
 	} as unknown as ExtensionAPI;
-	createResearchExtension({ service, improvementServiceFactory })(api);
+	createResearchExtension({ service, improvementServiceFactory, researchImprovementServiceFactory })(api);
 	return { tools, commands, handlers };
 }
 
@@ -27,9 +27,28 @@ test("extension registration is inert and exposes bounded tools", async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-extension-"));
 	const service = new ResearchService({ defaultWorkspace: root });
 	const registered = captureExtension(service);
-	assert.deepEqual([...registered.tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_review", "research_stage", "research_status"]);
+	assert.deepEqual([...registered.tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_mission", "research_review", "research_stage", "research_status"]);
 	assert.equal(registered.commands.has("research"), true);
 	assert.equal((await service.status(root)).initialized, false);
+});
+
+test("research_mission routes local controls and returns only a compact status", async () => {
+	const calls: string[] = [];
+	const progress = { contract: { id: "local-id", goal: "private original goal" },
+		objectiveOutcome: "incomplete", stopReason: "next-task-pending", boundedRuns: [],
+		continuation: { unresolvedOperationIds: ["private-operation"],
+			pendingAction: { kind: "reconcile-m07-operation", safety: "no-replay-until-reconciled" } } };
+	const service = { missionStatus: async (id: string) => { calls.push(`status:${id}`); return progress; },
+		missionStart: async () => { calls.push("start"); return progress; },
+		missionAdvance: async (action: string, id: string) => { calls.push(`${action}:${id}`); return progress; } } as unknown as ResearchService;
+	const tool = captureExtension(service).tools.get("research_mission")!;
+	const status = JSON.stringify(await tool.execute("status", { action: "status", missionId: "local-id" },
+		undefined, undefined, toolContext("/workspace")));
+	assert.match(status, /reconcile-m07-operation/);
+	assert.doesNotMatch(status, /private original goal|private-operation/);
+	await tool.execute("step", { action: "step", missionId: "local-id" },
+		undefined, undefined, toolContext("/workspace"));
+	assert.deepEqual(calls, ["status:local-id", "step:local-id"]);
 });
 
 test("research_improve exposes the separate bounded run, status and rollback actions", async () => {
@@ -45,6 +64,113 @@ test("research_improve exposes the separate bounded run, status and rollback act
 	assert.match(JSON.stringify(await tool.execute("r", { action: "run" }, undefined, undefined, toolContext("/workspace"))), /promoted/);
 	assert.match(JSON.stringify(await tool.execute("b", { action: "rollback" }, undefined, undefined, toolContext("/workspace"))), /rollback-i1/);
 	assert.deepEqual(calls, ["status:/workspace", "run:/workspace", "rollback:/workspace"]);
+});
+
+test("research_method_improve workflow-run dispatches the explicit workflow plan", async (t) => {
+	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-workflow-route-"));
+	t.after(() => import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true })));
+	const plan = { version: 1, kind: "m07-evidence-handoff/v1", marker: "workflow-only" };
+	await writeFile(path.join(root, "plan.json"), JSON.stringify(plan));
+	const calls: Array<{ workspace: string; plan: unknown }> = [];
+	const factory = (workspace: string) => ({ runWorkflow: async (input: unknown) => {
+		calls.push({ workspace, plan: input });
+		return { runId: "workflow-offline", status: "research-only", outcome: "completed-no-candidate", stopReason: "no winner", developmentArms: [], protectedArms: [], scientificBenefit: "unverified", budgetAtEnd: { settlement: "settled" } };
+	} });
+	const tool = captureExtension(new ResearchService({ defaultWorkspace: root }), undefined, factory).tools.get("research_method_improve")!;
+	const result = await tool.execute("w", { action: "workflow-run", workspace: root, planPath: "plan.json" }, undefined, undefined, toolContext(root));
+	assert.deepEqual(calls, [{ workspace: root, plan }]);
+	assert.match(JSON.stringify(result), /workflow-offline/);
+	assert.match(JSON.stringify(result), /completed-no-candidate/);
+	await assert.rejects(tool.execute("missing", { action: "workflow-run", workspace: root }, undefined, undefined, toolContext(root)), /requires planPath/);
+});
+
+test("research_delegate passes approved plan, versioned resources, bounded loop, and lesson output to M07", async () => {
+	const seen: unknown[] = [];
+	const service = { delegate: async (_runId: string, task: unknown) => { seen.push(task); return { taskId: "task-offline", status: "returned" }; } } as unknown as ResearchService;
+	const tool = captureExtension(service).tools.get("research_delegate")!;
+	await tool.execute("d", { runId: "goal-offline", objective: "execute approved plan", inputs: ["plan.md", "guide.md"], expectedOutputs: ["lesson.md"], checks: ["evidence recorded"], mode: "execute", planInput: "plan.md", resourceInputs: [{ id: "operator-guide", version: "v2", input: "guide.md" }], executionLoop: { mode: "until-ready" }, lessonDeltaOutput: "lesson.md" }, undefined, undefined, toolContext("/workspace"));
+	assert.deepEqual(seen, [{ objective: "execute approved plan", inputs: ["plan.md", "guide.md"], expectedOutputs: ["lesson.md"], checks: ["evidence recorded"], mode: "execute", planInput: "plan.md", resourceInputs: [{ id: "operator-guide", version: "v2", input: "guide.md" }], executionLoop: { mode: "until-ready" }, lessonDeltaOutput: "lesson.md" }]);
+});
+
+test("research tools dispatch a real same-goal fork and select an accepted branch without exposing session dumps", async () => {
+	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-branch-extension-"));
+	await mkdir(path.join(root, "problem"), { recursive: true });
+	await writeFile(path.join(root, "problem", "problem.md"), "Bounded branch question\n");
+	await writeFile(path.join(root, "research.config.json"), JSON.stringify({ roles: { execution: "fake/execution" }, concurrency: 1 }));
+	const runner = new FakeSessionRunner(async ({ spec }) => {
+		if (spec.tools.kind === "execution") await writeFile(path.join(spec.tools.root, "result.txt"), "candidate output\n");
+		return "candidate completed";
+	});
+	const service = new ResearchService({ defaultWorkspace: root, runnerFactory: () => runner });
+	await service.init(root);
+	const tools = captureExtension(service).tools;
+	const call = (tool: string, params: Record<string, unknown>) => tools.get(tool)!.execute(tool, params, undefined, undefined, toolContext(root));
+	const begin = await call("research_goal", { action: "begin", goal: "Study candidate", problemRelation: "direct", constraints: ["fixed target"], successCriteria: ["checked"], plan: "compare candidates", exploratory: true });
+	const runId = (begin.details as { summary: { runId: string } }).summary.runId;
+	const spec = { runId, objective: "Run candidate", inputs: [], expectedOutputs: ["result.txt"], checks: ["result checked"], mode: "execute" };
+	const parent = await call("research_delegate", spec);
+	const parentTaskId = (parent.details as { summary: { taskId: string } }).summary.taskId;
+	const goal = await service.goalStatus(runId, root) as { tasks: Array<{ taskId: string; branchSource?: { checkpoint: { id: string } }; workDir: string }> };
+	const checkpointId = goal.tasks[0].branchSource?.checkpoint.id;
+	assert.ok(checkpointId, "controller must freeze a real parent checkpoint");
+	const parentEvidence = path.join(goal.tasks[0].workDir, "result.txt");
+	await call("research_review", { runId, taskId: parentTaskId, checks: [{ criterion: "result checked", result: "passed", evidence: [parentEvidence] }], artifacts: [parentEvidence] });
+	const context = { mode: "fork", parentRunId: runId, parentTaskId, checkpointId };
+	const sibling = await call("research_delegate", { ...spec, context });
+	const siblingTaskId = (sibling.details as { summary: { taskId: string } }).summary.taskId;
+	const siblingState = await service.goalStatus(runId, root) as { tasks: Array<{ taskId: string; status: string; executionFailure?: string }> };
+	assert.equal(siblingState.tasks.find((task) => task.taskId === siblingTaskId)?.status, "returned", siblingState.tasks.find((task) => task.taskId === siblingTaskId)?.executionFailure ?? "fork failed");
+	assert.equal(runner.created.length, 2);
+	assert.equal(runner.created[1].label.includes(siblingTaskId), true);
+	const afterFork = await service.goalStatus(runId, root) as { tasks: Array<{ taskId: string; context?: unknown; workDir: string; session?: { lineageFile?: string } }> };
+	assert.deepEqual(afterFork.tasks[1].context, context);
+	const lineageFile = afterFork.tasks[1].session?.lineageFile;
+	assert.ok(lineageFile, "child must carry a committed true-fork receipt");
+	assert.equal((JSON.parse(await readFile(lineageFile, "utf8")) as { checkpoint: { id: string } }).checkpoint.id, checkpointId);
+	const evidence = path.join(afterFork.tasks[1].workDir, "result.txt");
+	await call("research_review", { runId, taskId: siblingTaskId, checks: [{ criterion: "result checked", result: "passed", evidence: [evidence] }], artifacts: [evidence] });
+	const selected = await call("research_goal", { action: "select-branch", runId, parentTaskId, selectedTaskId: siblingTaskId, rationale: "Reviewed candidate passed" });
+	const summary = (selected.details as { summary: { branchSelections: Array<{ selectedTaskId: string }> } }).summary;
+	assert.equal(summary.branchSelections[0].selectedTaskId, siblingTaskId);
+	assert.doesNotMatch(JSON.stringify(selected), /toolLog|sourceSessionFile|snapshotFile|transcript/);
+	const privateGoalPath = path.join(root, "stages", "M07", runId, "goal.json");
+	const privateGoal = JSON.parse(await readFile(privateGoalPath, "utf8"));
+	privateGoal.tasks[0].branchUnavailableReason = "api_key=private-branch-reason";
+	privateGoal.tasks[0].executionFailure = "api_key=private-task-failure";
+	privateGoal.branchSelections[0].rationale = "api_key=private-selection-rationale";
+	await writeFile(privateGoalPath, JSON.stringify(privateGoal));
+	const safeStatus = await call("research_goal", { action: "status", runId });
+	assert.doesNotMatch(JSON.stringify(safeStatus), /private-branch-reason|private-task-failure|private-selection-rationale/);
+	await assert.rejects(call("research_goal", { action: "select-branch", runId, parentTaskId, selectedTaskId: siblingTaskId, rationale: "again" }), /already been frozen/);
+	const secondParent = await call("research_delegate", spec);
+	const secondParentId = (secondParent.details as { summary: { taskId: string } }).summary.taskId;
+	const secondStatus = await service.goalStatus(runId, root) as { tasks: Array<{ taskId: string; workDir: string; branchSource?: { checkpoint: { id: string } } }> };
+	const secondCheckpointId = secondStatus.tasks.find((task) => task.taskId === secondParentId)?.branchSource?.checkpoint.id;
+	assert.ok(secondCheckpointId);
+	const secondParentEvidence = path.join(secondStatus.tasks.find((task) => task.taskId === secondParentId)!.workDir, "result.txt");
+	await call("research_review", { runId, taskId: secondParentId, checks: [{ criterion: "result checked", result: "passed", evidence: [secondParentEvidence] }], artifacts: [secondParentEvidence] });
+	const secondChild = await call("research_delegate", { ...spec, context: { mode: "fork", parentRunId: runId, parentTaskId: secondParentId, checkpointId: secondCheckpointId } });
+	const secondChildId = (secondChild.details as { summary: { taskId: string } }).summary.taskId;
+	const secondChildStatus = await service.goalStatus(runId, root) as { tasks: Array<{ taskId: string; workDir: string }> };
+	const secondEvidence = path.join(secondChildStatus.tasks.find((task) => task.taskId === secondChildId)!.workDir, "result.txt");
+	await call("research_review", { runId, taskId: secondChildId, checks: [{ criterion: "result checked", result: "failed", evidence: [secondEvidence] }], artifacts: [secondEvidence] });
+	const none = await call("research_goal", { action: "select-branch", runId, parentTaskId: secondParentId, rationale: "No candidate passed" });
+	const noneSelection = (none.details as { summary: { branchSelections: Array<{ selectedTaskId?: string }> } }).summary.branchSelections[1];
+	assert.equal(noneSelection.selectedTaskId, undefined);
+});
+
+test("research branch tool schemas reject malformed references before controller dispatch", async () => {
+	let delegates = 0, selections = 0;
+	const service = { delegate: async () => { delegates++; return {}; }, goalAction: async () => { selections++; return {}; } } as unknown as ResearchService;
+	const tools = captureExtension(service).tools;
+	const ctx = toolContext("/workspace");
+	const spec = { runId: "r1", objective: "task", inputs: [], expectedOutputs: ["out.txt"], checks: ["checked"], mode: "execute" };
+	await assert.rejects(tools.get("research_delegate")!.execute("d", { ...spec, context: { mode: "fork", parentRunId: "other", parentTaskId: "T001", checkpointId: "cp" } }, undefined, undefined, ctx), /same-goal/);
+	await assert.rejects(tools.get("research_delegate")!.execute("d", { ...spec, context: { mode: "fork", parentRunId: "r1", parentTaskId: "T001", checkpointId: "cp", extra: "unsafe" } }, undefined, undefined, ctx), /exact same-goal/);
+	await assert.rejects(tools.get("research_goal")!.execute("g", { action: "select-branch", runId: "r1", parentTaskId: "T001", rationale: "" }, undefined, undefined, ctx), /requires runId/);
+	await assert.rejects(tools.get("research_goal")!.execute("g", { action: "select-branch", runId: "r1", parentTaskId: "T001", rationale: "reason", goal: "injected" }, undefined, undefined, ctx), /unrelated fields/);
+	assert.equal(delegates, 0);
+	assert.equal(selections, 0);
 });
 
 test("main-session capability guard blocks side-effect tools from the start", async () => {
@@ -222,7 +348,7 @@ test("Pi DefaultResourceLoader loads the inline extension without prompting or n
 	const loaded = loader.getExtensions();
 	assert.equal(loaded.errors.length, 0);
 	assert.equal(loaded.extensions.length, 1);
-	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_review", "research_stage", "research_status"]);
+	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_mission", "research_review", "research_stage", "research_status"]);
 });
 
 test("Pi DefaultResourceLoader loads the actual extensions/research.ts entrypoint", async () => {
@@ -238,7 +364,7 @@ test("Pi DefaultResourceLoader loads the actual extensions/research.ts entrypoin
 	const loaded = loader.getExtensions();
 	assert.equal(loaded.errors.length, 0);
 	assert.equal(loaded.extensions.length, 1);
-	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_review", "research_stage", "research_status"]);
+	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_mission", "research_review", "research_stage", "research_status"]);
 });
 
 test("research_delegate accepts exact expected output path strings", async () => {

@@ -7,6 +7,8 @@
  * SDK wiring lives in `src/runner/pi.ts`. Tests use `src/runner/fake.ts`.
  */
 import type { Role } from "../types.ts";
+import type { EvidenceBindingV1 } from "../context/boundary.ts";
+import type { DeepSeekRequestViolation } from "./deepseek-request-contract.ts";
 
 /**
  * What a session may touch besides the text it is given.
@@ -53,7 +55,16 @@ export interface ToolCallRecord {
 	args: Record<string, unknown>;
 	ok: boolean;
 	at: string;
+	/** Exact Pi call binding for host-owned local bash evidence. */
+	toolCallId?: string;
+	hostReceiptPath?: string;
 	error?: string;
+	errorClass?: "harness" | "filesystem" | "tool-error";
+	errorCode?: string;
+	/** Bounded, redacted host diagnostic for a failed factory-confined read only. */
+	errorMessage?: string;
+	resultMetadata?: { kind: "confined-utf8-read"; relativePath: string;
+		utf8Bytes: number; truncated: false };
 }
 
 export interface SessionSpec {
@@ -65,12 +76,14 @@ export interface SessionSpec {
 	/** Full system prompt. The runner must use it verbatim and must not append discovered resources. */
 	systemPrompt: string;
 	tools: ToolGrant;
+	/** Controller/runner-derived, persisted authority for audited campaign custom file tools. */
+	toolAuthority?: { version: 1; kind: "confined-campaign-files"; root: string; writableFiles: string[] };
 	/** Directory where the session transcript and its spec are persisted. */
 	persistDir: string;
 	/** Explicit, frozen method identity. It never enables resource discovery. */
 	methodBinding?: { versionId: string; contentId?: string };
-	/** Explicit opt-in for the L5 one-request path. The optional output cap is retained for bounded runner callers. */
-	strictRequest?: { maxProviderCallsPerPrompt: 1; maxOutputTokens?: number; maxInputPayloadBytes: number };
+	/** Opt-in request guard. A campaign reserves actual serialized input bytes; tool-free strict callers may still set a fixed input cap. */
+	strictRequest?: { maxProviderCallsPerPrompt?: number; maxOutputTokens?: number; maxInputPayloadBytes?: number };
 }
 
 /** Enough to reopen a persisted session with the same boundary. */
@@ -84,6 +97,61 @@ export interface SessionRef {
 	/** Persisted `SessionSpec` used to rebuild the identical boundary on resume. */
 	specFile?: string;
 	methodBinding?: SessionSpec["methodBinding"];
+	/** Committed true-fork receipt. Its absence never implies a fork. */
+	lineageFile?: string;
+}
+
+/** A persisted, completed Pi leaf copied before any child may start. */
+export interface SessionCheckpoint {
+	version: 1;
+	id: string;
+	sourceSessionId: string;
+	sourceSessionFile: string;
+	sourceSpecFile: string;
+	/** Runner-owned byte copy of the parent's grant and model spec. */
+	sourceSpecSnapshot: string;
+	snapshotFile: string;
+	leafId: string;
+	model: string;
+	inputManifest: string;
+	/** Runner-owned byte copy of the controller's manifest at checkpoint time. */
+	manifestSnapshot: string;
+	runId: string;
+	taskId?: string;
+	frozenAt: string;
+	snapshotBytes: number;
+}
+
+export interface ForkRequest {
+	checkpoint: SessionCheckpoint;
+	spec: SessionSpec;
+	evidenceBindings: EvidenceBindingV1[];
+	workspaceBinding?: ForkWorkspaceBindingV1;
+	reason: string;
+}
+
+/** Controller-frozen authority for copying one task workspace into an independent branch. */
+export interface ForkWorkspaceBindingV1 {
+	version: 1;
+	parentRoot: string;
+	authorizedChildRootBase: string;
+	childWorkLeaf: string;
+	childRoot: string;
+	ownerMarkerPath: string;
+	frozenEvidenceRoot: string;
+	files: Array<{ sourcePath: string; frozenPath: string; childPath: string; bytes: number }>;
+}
+
+export interface RunnerCapabilities {
+	version: 1;
+	fresh: true;
+	continue: true;
+	persistedLineage: true;
+	forkAtFrozenLeaf: true;
+	grantKinds: ToolGrant["kind"][];
+	modelCompatibility: "exact-model-only";
+	multimodalHistory: "model-dependent";
+	parallelPromptLeases: "single-process";
 }
 
 /** Provider-reported units only. Missing values remain unknown, never inferred from text size. */
@@ -128,6 +196,8 @@ export interface ReadReturnEvent {
 	requested: { offset?: number; limit?: number };
 	/** One-based inclusive text lines actually sent to the model. */
 	returned: { startLine?: number; endLine?: number; truncated?: boolean; kind: "text" | "binary" | "unknown" };
+	/** Host-classified error from the exact bytes read by the confined tool. Other errors stay unclassified. */
+	error?: { kind: "offset-beyond-eof"; lineCount: number };
 	at: string;
 }
 
@@ -142,6 +212,41 @@ export interface AssistantTurn {
 export interface TranscriptMessage {
 	role: "user" | "assistant";
 	text: string;
+}
+
+/** Private, redacted host-observed failure facts for one Pi provider request. Null means unavailable. */
+export interface TransportFailureDiagnostic {
+	version: 1;
+	promptIndex: number;
+	requestId?: string;
+	phase: "request" | "response-body" | "provider-stream" | "unknown";
+	httpStatus: number | null;
+	responseStarted: boolean | null;
+	bytesRead: number | null;
+	/** Host observed fetch rejection or response-body read rejection. */
+	transportInterrupted?: true;
+	abortSource: "host-signal" | "handle" | "sdk-signal" | null;
+	/** Exact, allowlisted JSON error values observed on a non-2xx response; never free-form text. */
+	providerErrorCode: string | null;
+	providerErrorType: string | null;
+	/** Host-classified, bounded cause; unknown when the provider metadata is ambiguous. */
+	providerErrorReasonClass?: "context-window" | "input-schema" | "tool-reasoning" |
+		"insufficient-balance" | "unknown";
+	/** Arithmetic checked from the provider's complete context-limit sentence; no provider text or request ID. */
+	providerContextOverflow?: { contextWindow: number; messagesTokens: number; completionTokens: number;
+		requestedTokens: number; allowedCompletionTokens: number };
+	/** Validated server x-request-id, if it is a UUID or hexadecimal identifier. */
+	providerRequestId: string | null;
+	errorCodes: string[];
+	/** Encrypted private result only. Never copy into a model-facing carry or public log. */
+	privateProviderError?: { code: string | null; type: string | null; message: string | null;
+		param: string | null; numericLimits: Record<string, number> };
+	/** Static request-schema rejection of one attempted payload. */
+	requestContractViolation?: DeepSeekRequestViolation;
+	requestContractMessageIndex?: number | null;
+	attemptedRequestNotSent?: true;
+	/** True only when this entire prompt had no earlier reserved provider request. */
+	wholePromptNotIssued?: true;
 }
 
 export interface SessionHandle {
@@ -163,6 +268,12 @@ export interface SessionHandle {
 	/** New usage events observed through this handle, excluding history before resume. */
 	usageEvents(): UsageEvent[];
 	usageSummary(): UsageSummary;
+	/** Redacted failures from this live handle only; no prompt, body, URL, or raw SDK error text. */
+	transportDiagnostics?(): TransportFailureDiagnostic[];
+	/** Non-secret Pi request negotiation evidence; null means the SDK omitted an output field. */
+	providerOutputRequests?(): Array<{ resolvedMaxTokens: number;
+		outputField: "max_tokens" | "max_completion_tokens" | "both" | "omitted";
+		outgoingMaxTokens: number | null }>;
 	/** Abort the active prompt and prevent further prompts on this handle. */
 	abort(): Promise<void>;
 	/** Every harness-defined or execution tool call made by the model in this session, in order. */
@@ -172,6 +283,13 @@ export interface SessionHandle {
 
 export interface SessionRunner {
 	create(spec: SessionSpec): Promise<SessionHandle>;
+	capabilities?(): RunnerCapabilities;
+	/** Live factory-backed attestation; persisted JSON alone cannot authorize a custom-tool narrowing claim. */
+	attestConfinedGrant?(handle: SessionHandle): Promise<NonNullable<SessionSpec["toolAuthority"]> | undefined>;
+	/** Refuse a live, failed, or unsettled parent and freeze exact source bytes. */
+	checkpoint?(handle: SessionHandle, envelope: { inputManifest: string; runId: string; taskId?: string; externalOperationsSettled: boolean }): Promise<SessionCheckpoint>;
+	/** A new persisted Pi history from the checkpoint leaf, with independent grants. */
+	fork?(request: ForkRequest): Promise<SessionHandle>;
 	/** Worst-case Pi price-table estimate for one bounded text request; absent/undefined fails admission closed. */
 	estimateMaxSdkCost?(modelRaw: string, caps: { maxInputTokens: number; maxOutputTokens: number }): Promise<number | undefined>;
 	/** Reopen a persisted session with the boundary recorded in `ref.specFile`. */

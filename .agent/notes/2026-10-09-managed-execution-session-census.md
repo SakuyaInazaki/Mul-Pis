@@ -1,0 +1,11 @@
+# Managed execution session recovery census
+
+This change adds a read-only verifier for an interrupted Pi execution session. It checks the complete persisted session transcript header, every tool call ID, command or typed file-path hash, and every recorded tool result. Bash calls pair with session-bound managed receipts when available; a missing result or incomplete process receipt remains unknown. Typed read, write and edit calls are included in the same census, with the exact path argument hashed and the Pi result distinguished from a missing result. A separate narrow observation reports a terminal nonzero foreground shell, with model response and remote or detached effects explicitly unknown.
+
+The verifier does not change M07 task or operation status. It does not infer scientific acceptance, external effect completion, or permission to replay a builder from a shell exit. Whole-operation reconciliation still needs a scoped host decision that accounts for all calls and any external effects.
+
+Offline verification: TypeScript typecheck passed; the focused Pi runner suite passed 61 tests. The new test executes a real failed shell through the default Pi execution tool, pairs its exact call and command digest with the persisted transcript, detects a missing typed file result, then verifies a returned typed file result. It rejects extra calls, a linked transcript, and a changed command. No model or network calls were made.
+
+Follow-up portability correction: the receipt schema records that Windows can sync the file but cannot use the POSIX directory-sync and Unix mode checks. Pi's Windows local bash backend remains selected there, with PID and process-group observations unknown. POSIX records still require file and directory sync.
+
+Crash and lineage correction: an interrupted temporary receipt replacement is surfaced as a pending receipt ID while the last committed JSON remains readable. Pending bytes are never treated as a terminal record. The M07 binding reader propagates pending IDs, and the narrow foreground-failure observation refuses them. Forked Pi sessions are refused when either the session record, persisted header, or sibling lineage marker shows ancestry, until inherited calls can be attributed through verified lineage; copied historical calls do not belong to the new M07 operation.

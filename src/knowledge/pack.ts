@@ -38,7 +38,7 @@ function compareRecords(left: KnowledgeRecord, right: KnowledgeRecord): number {
 	return typeOrder(left.type) - typeOrder(right.type) || left.id.localeCompare(right.id) || left.version - right.version;
 }
 
-function renderRecord(record: KnowledgeRecord, availability: AvailabilityReport, limits: Limit[]): string {
+export function renderKnowledgeRecord(record: KnowledgeRecord, availability: AvailabilityReport, limits: Limit[]): string {
 	const reasons = availability.reasons.length ? availability.reasons.join("；") : "无";
 	const activeLimits = limits.filter((limit) => limitApplies(limit, record));
 	const refs = record.refs.length ? record.refs.map((ref) => `${ref.rel} → ${ref.target}`).join("；") : "无";
@@ -97,7 +97,7 @@ export async function buildKnowledgePack(query: PackQuery, state: PackState): Pr
 	const rendered: Array<{ record: KnowledgeRecord; availability: AvailabilityReport; block: string }> = [];
 	for (const record of records) {
 		const availability = await state.availability(record.id, record.version);
-		rendered.push({ record, availability, block: renderRecord(record, availability, state.limits) });
+		rendered.push({ record, availability, block: renderKnowledgeRecord(record, availability, state.limits) });
 	}
 
 	const header = [

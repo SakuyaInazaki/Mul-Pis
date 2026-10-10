@@ -1,0 +1,167 @@
+name: Bounded confidential campaign
+
+on:
+  workflow_dispatch:
+    inputs:
+      authorize_bounded_run:
+        description: "Authorize this paid research run (accounting only; no automatic fee cap)"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: bounded-confidential-campaign-once
+  cancel-in-progress: false
+
+jobs:
+  private-campaign:
+    if: >-
+      github.repository == 'SakuyaInazaki/Mul-Pis' &&
+      github.actor == 'SakuyaInazaki' &&
+      github.run_attempt == 1 &&
+      ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/improve/workflow-learning-reliability' && inputs.authorize_bounded_run == true) ||
+       (github.event_name == 'push' && github.ref == 'refs/heads/run-requests/workflow-learning-reliability' && github.event.head_commit.message == 'Run confidential workflow'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Verify reusable control-branch request and accepted source CI
+        if: github.event_name == 'push'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REQUEST_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          test "$(git show -s --format=%B HEAD)" = 'Run confidential workflow'
+          read -r -a parents <<< "$(git show -s --format=%P HEAD)"
+          test "${#parents[@]}" -ge 1 && test "${#parents[@]}" -le 2
+          source_sha="${parents[0]}"
+          if [ "${#parents[@]}" -eq 1 ]; then
+            test "$REQUEST_BEFORE" = "$source_sha"
+          else
+            test "$REQUEST_BEFORE" = "${parents[1]}"
+          fi
+          test "$(git rev-parse HEAD^{tree})" = "$(git rev-parse "$source_sha"^{tree})"
+          REQUEST_TREE="$(git rev-parse HEAD^{tree})" SOURCE_SHA="$source_sha" node --input-type=module <<'NODE'
+          const headers = { Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+            Accept: 'application/vnd.github+json' };
+          async function json(path) {
+            const response = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/${path}`, { headers });
+            if (!response.ok) process.exit(1);
+            return response.json();
+          }
+          const ref = await json('git/ref/heads/improve/workflow-learning-reliability');
+          const source = ref?.object?.sha;
+          if (source !== process.env.SOURCE_SHA) process.exit(1);
+          const commit = await json(`git/commits/${source}`);
+          if (commit?.tree?.sha !== process.env.REQUEST_TREE) process.exit(1);
+          const url = new URL(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/actions/workflows/workflow-regression.yml/runs`);
+          url.searchParams.set('head_sha', source);
+          url.searchParams.set('per_page', '100');
+          const response = await fetch(url, { headers });
+          if (!response.ok) process.exit(1);
+          const runs = (await response.json()).workflow_runs;
+          if (!Array.isArray(runs) || !runs.some(run => run.head_sha === source &&
+            run.head_branch === 'improve/workflow-learning-reliability' &&
+            run.event === 'push' && run.run_attempt === 1 && run.conclusion === 'success')) process.exit(1);
+          NODE
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install official OS sandbox package before private material is decoded
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+      - name: Install pinned runtime dependencies
+        run: |
+          npm install --ignore-scripts --no-save --no-package-lock --no-audit --no-fund \
+            @earendil-works/pi-ai@0.85.1 \
+            @earendil-works/pi-agent-core@0.85.1 \
+            @earendil-works/pi-coding-agent@0.85.1 \
+            @actions/artifact@2.3.2 \
+            typescript@5.9.3 \
+            @types/node@26.6.4
+          python -m pip install --disable-pip-version-check --no-input 'cryptography==50.0.0'
+      - name: Offline checks before private material is decoded
+        run: |
+          npm run typecheck
+          npm test
+          python -m unittest discover -s test -p 'private_actions_transport_test.py'
+      - name: Decode confidential input without logging it
+        id: decode
+        env:
+          MULPIS_LAB_INPUT_B64: ${{ secrets.MULPIS_LAB_INPUT_B64 }}
+        run: |
+          umask 077
+          python scripts/private_actions_transport.py decode --parent "$RUNNER_TEMP" --github-output "$GITHUB_OUTPUT"
+      - name: Run private campaign
+        id: campaign
+        uses: ./scripts
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          INPUT_DIR: ${{ steps.decode.outputs.input_dir }}
+          MULPIS_MISSION_LEDGER_B64: ${{ secrets.MULPIS_MISSION_LEDGER_B64 }}
+          MULPIS_MANUAL_AUTHORIZED: ${{ (github.event_name == 'workflow_dispatch' && inputs.authorize_bounded_run) || (github.event_name == 'push' && github.event.head_commit.message == 'Run confidential workflow') }}
+          MULPIS_RUN_REQUEST_BEFORE: ${{ github.event.before }}
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Encrypt allowlisted outcome before upload
+        if: always() && steps.decode.outcome == 'success'
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          umask 077
+          mkdir -p -m 700 "$RUNNER_TEMP/private-campaign-output"
+          if [ ! -e "$RUNNER_TEMP/private-campaign-output/campaign-status.json" ]; then
+            printf '{"status":"incomplete"}\n' > "$RUNNER_TEMP/private-campaign-output/campaign-status.json"
+          fi
+          python scripts/private_actions_transport.py encrypt \
+            --results "$RUNNER_TEMP/private-campaign-output" \
+            --public-key scripts/campaign-output-public.pem \
+            --expected-spki-sha256 095541a341d91f128aa9cd1f0c6d34f6b7291fc5d667365ef5a67efd42fd0d23 \
+            --output "$RUNNER_TEMP/private-campaign-outcome.enc.json" \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --commit "$GITHUB_SHA" \
+            --event "$GITHUB_EVENT_NAME"
+      - name: Upload ciphertext only
+        if: always() && steps.decode.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: confidential-campaign-envelope
+          path: ${{ runner.temp }}/private-campaign-outcome.enc.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Locate encrypted mission continuation
+        if: always() && steps.decode.outcome == 'success'
+        id: continuation
+        run: |
+          if [ -f "$RUNNER_TEMP/private-campaign-output/ledger-continuation.enc.json" ] || \
+             [ -s "$RUNNER_TEMP/private-campaign-output/incremental-control-prefix.json" ]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload encrypted mission continuation
+        if: always() && steps.continuation.outputs.available == 'true'
+        uses: ./.github/actions/final-carry-upload
+        env:
+          MULPIS_MISSION_LEDGER_B64: ${{ secrets.MULPIS_MISSION_LEDGER_B64 }}
+      - name: Report generic campaign failure
+        if: always() && steps.campaign.outputs.driver_exit_code != '0'
+        run: |
+          echo 'Private campaign did not complete; inspect the encrypted outcome locally.'
+          exit 1

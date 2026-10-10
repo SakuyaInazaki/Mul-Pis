@@ -1,0 +1,2668 @@
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { createCipheriv, createDecipheriv, createHash, generateKeyPairSync, hkdfSync,
+	randomBytes, sign, constants } from "node:crypto";
+import { once } from "node:events";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { createInterface } from "node:readline";
+import { pathToFileURL } from "node:url";
+import test, { type TestContext } from "node:test";
+import { deflateRawSync } from "node:zlib";
+import { crc32 } from "node:zlib";
+import { createOriginalObjective, objectiveProgress } from "../src/m07/objective-progress.ts";
+import { MissionHostPreparationError, prepareAuthenticatedResumeRequest,
+	type HostReviewedWorkflowRepairPlanV1 } from "../src/runner/mission-host-adapter.ts";
+import { exactResultArchiveMember, privateHostPreparationDiagnostic } from
+	"../scripts/prepare-authenticated-private-resume.ts";
+import { authenticateLatestTerminalCarry, authenticatedSupervisorProjection,
+	authenticatedTerminalUnknownControlDeliveries,
+	CARRY_ARTIFACT_NAME, CARRY_FILE_NAME, openLedgerContinuation, REUSABLE_RUN_REQUEST_MESSAGE,
+	type CurrentMissionRun } from "../src/runner/ledger-continuation.ts";
+import { workflowRepairState, type WorkflowRepairFailure, type WorkflowRepairStage,
+	type WorkflowRepairStrategy } from "../src/runner/repair-liveness.ts";
+import { isVerifiedResultOnlyRepairState, readReviewedResultOnlyRepairState,
+	type ResultOnlyRepairReviewReceiptV1 } from "../src/runner/result-only-repair-review.ts";
+import { decodeCarrySidecars } from "../src/runner/carry-sidecar-codec.ts";
+import { MissionResumeJournal, type TestedControlBinding } from "../src/runner/mission-resume-journal.ts";
+import type { ResumeIntent } from "../src/runner/mission-supervisor.ts";
+import { IncrementalPrivateCheckpointJournal } from "../src/runner/incremental-private-checkpoint.ts";
+import { ARTIFACT_PARTITION_MANIFEST_FILE, finalizePartitionManifest,
+	partitionEncryptedFiles, sealPartitionManifest } from
+	"../src/runner/private-artifact-partition.ts";
+import { MISSION_ID, MISSION_REPOSITORY, MISSION_TOTAL_CNY, MISSION_ARTIFACT } from
+	"../src/runner/signed-mission-ledger.ts";
+import { campaignSessionEffectId } from "../src/runner/deepseek-campaign.ts";
+import { offlineChecks } from "../scripts/manual-private-campaign.ts";
+import { verifyProviderAvailabilityProof, type ProviderAvailabilityReviewReceiptV1 } from
+	"../src/runner/provider-availability-proof.ts";
+
+const sha40 = (letter: string): string => letter.repeat(40);
+function syntheticOriginalResultZip(member: Buffer): Buffer {
+	const name = Buffer.from("private-campaign-outcome.enc.json");
+	const crc = crc32(member);
+	const local = Buffer.alloc(30);
+	local.writeUInt32LE(0x04034b50, 0);
+	local.writeUInt16LE(20, 4);
+	local.writeUInt32LE(crc, 14);
+	local.writeUInt32LE(member.length, 18);
+	local.writeUInt32LE(member.length, 22);
+	local.writeUInt16LE(name.length, 26);
+	const central = Buffer.alloc(46);
+	central.writeUInt32LE(0x02014b50, 0);
+	central.writeUInt16LE(20, 4);
+	central.writeUInt16LE(20, 6);
+	central.writeUInt32LE(crc, 16);
+	central.writeUInt32LE(member.length, 20);
+	central.writeUInt32LE(member.length, 24);
+	central.writeUInt16LE(name.length, 28);
+	const directoryOffset = local.length + name.length + member.length;
+	const eocd = Buffer.alloc(22);
+	eocd.writeUInt32LE(0x06054b50, 0);
+	eocd.writeUInt16LE(1, 8);
+	eocd.writeUInt16LE(1, 10);
+	eocd.writeUInt32LE(central.length + name.length, 12);
+	eocd.writeUInt32LE(directoryOffset, 16);
+	return Buffer.concat([local, name, member, central, name, eocd]);
+}
+const sourceCommit = sha40("b");
+const requestCommit = sha40("f");
+const testedTree = sha40("c");
+const priorControlCommit = sha40("d");
+const sourceRef = "refs/heads/improve/workflow-learning-reliability";
+const controlRef = "refs/heads/run-requests/workflow-learning-reliability";
+const source: CurrentMissionRun = { repository: MISSION_REPOSITORY, runId: "7002",
+	runAttempt: "1", actor: "SakuyaInazaki", event: "workflow_dispatch",
+	ref: sourceRef, sha: sourceCommit, manualAuthorized: "true" };
+const canonicalForJournal = (value: unknown): string => {
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(canonicalForJournal).join(",")}]`;
+	return `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b))
+		.map(([key, part]) => `${JSON.stringify(key)}:${canonicalForJournal(part)}`).join(",")}}`;
+};
+function rekeyIntent(intent: ResumeIntent): ResumeIntent {
+	const { source, envelopeSha256, contractId, selectedTupleSha256,
+		pendingActionSha256, actionProvenance, terminalInterruption,
+		terminalPrefixInterruption, interruptedSourceReview,
+		terminalPrefixSourceReview, workflowRepair, linkedUnknownDelivery } = intent;
+	const bound = { source, envelopeSha256, contractId, selectedTupleSha256,
+		pendingActionSha256,
+		...(actionProvenance ? { actionProvenance } : {}),
+		...(terminalInterruption ? { terminalInterruption } : {}),
+		...(terminalPrefixInterruption ? { terminalPrefixInterruption } : {}),
+		...(interruptedSourceReview ? { interruptedSourceReview } : {}),
+		...(terminalPrefixSourceReview ? { terminalPrefixSourceReview } : {}),
+		...(workflowRepair ? { workflowRepair } : {}),
+		...(linkedUnknownDelivery ? { linkedUnknownDelivery } : {}) };
+	return { ...intent, idempotencyKey: createHash("sha256").update(canonicalForJournal(bound)).digest("hex") };
+}
+
+type LiveState = {
+	sourceTip: string;
+	controlTip: string | null;
+	ciHead: string;
+	ciConclusion: string | null;
+	ciStatus: string;
+	ciRunAttempt: number;
+	ciCount: number;
+	ciRunId: number;
+	sourceTree: string;
+	commitReplySha?: string;
+};
+const reviewedCodePath = "src/stages/m04.ts";
+const reviewedTestPath = "test/m04-required-m07-reads.test.ts";
+const reviewedTestName = "reviewed fresh handoff reads all evidence";
+
+function run(id: number, number: number, status: string, commit: string,
+	conclusion?: string): object {
+	return { id, run_number: number, run_attempt: 1, workflow_id: 91, status,
+		conclusion, head_branch: "improve/workflow-learning-reliability", head_sha: commit,
+		event: "workflow_dispatch", actor: { login: "SakuyaInazaki" } };
+}
+
+async function fixture(t: TestContext, options: { carriedAction?: boolean;
+	unknownOperation?: boolean; controlRequest?: boolean;
+	oldControlSource?: string;
+	largePayload?: boolean; multipartResearchBytes?: number; legacyV3?: boolean;
+	repairStage?: WorkflowRepairStage; repairFailure?: WorkflowRepairFailure;
+	repairActionStage?: WorkflowRepairStage; repairStrategy?: WorkflowRepairStrategy;
+	omitRepairStage?: boolean; omitRepairEvidence?: boolean;
+	resultOnlyRepair?: boolean;
+	provider402?: boolean; fiveUnknownOperations?: boolean;
+	stopReason?: "bounded-run-incomplete" | "assessment-failed" | "workflow-repair-needed" } = {}) {
+	const dir = await mkdtemp(path.join(os.tmpdir(), "mission-host-adapter-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const { publicKey, privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+	const publicKeyFile = path.join(dir, "public.pem");
+	await writeFile(publicKeyFile, publicKey.export({ type: "spki", format: "pem" }));
+	const expectedSpkiSha256 = createHash("sha256")
+		.update(publicKey.export({ type: "spki", format: "der" })).digest("hex");
+	const contract = createOriginalObjective({ goal: "Synthetic original task",
+		goalSource: "user-intent-summary", inputNames: ["input.txt"],
+		obligations: [{ id: "O1", description: "Synthetic check" }], closure: "open-ended" });
+	const operationRefs = options.fiveUnknownOperations ?
+		Array.from({ length: 5 }, (_, index) => `old-goal/O${String(index + 1).padStart(3, "0")}`) :
+		options.unknownOperation ? ["old-goal/O001"] : [];
+	const checkpoint = objectiveProgress(contract, {
+		boundedRuns: operationRefs.length ? [{ runId: "old-goal", outcome: "active",
+			unresolvedOperationIds: operationRefs.map(ref => ref.split("/")[1]!) }] : [],
+		selectedArtifacts: ["candidate.cpp", "verification.json", "workflow-archive.json"],
+		unresolvedOperationIds: operationRefs,
+		stopReason: options.stopReason ?? "bounded-run-incomplete",
+		...(options.carriedAction ? { pendingActionFacts: { unresolvedOperationRefs: operationRefs,
+			...(options.stopReason === "workflow-repair-needed" ? {
+				...(options.omitRepairStage ? {} : { failedStage: options.repairActionStage ?? options.repairStage ?? "m04-judgment" }),
+				...(options.omitRepairEvidence ? {} : { evidenceRefs: ["repair-state.json"] }) } : {}) } } : {}),
+	});
+	const repairState = options.stopReason === "workflow-repair-needed" ? workflowRepairState({
+		stage: options.repairStage ?? "m04-judgment", failure: options.repairFailure ??
+			(options.repairStage === "objective-assessment" ? "unread-evidence" : "unread-m07-evidence"), evidenceFingerprint: "1".repeat(64),
+		planFingerprint: "2".repeat(64), responseFingerprint: "3".repeat(64),
+		strategy: options.repairStrategy ?? "workflow-repair-needed", sessionGeneration: 2 }) : undefined;
+	const bundle = { "original-objective.json": JSON.stringify(contract),
+		"objective-checkpoint.json": JSON.stringify(checkpoint),
+		"candidate.cpp": "synthetic candidate", "verification.json": "{}",
+		"workflow-archive.json": "{}",
+		...(repairState && !options.resultOnlyRepair ?
+			{ "repair-state.json": JSON.stringify(repairState) } : {}) };
+	const payload = { version: 2, kind: "mul-pis-private-mission-ledger", missionId: MISSION_ID,
+		repository: MISSION_REPOSITORY, globalMaxCny: MISSION_TOTAL_CNY,
+		priorCommittedCny: 4.125, revision: 1,
+		previous: { runId: "7001", runAttempt: 1, artifactId: "9001", artifactName: MISSION_ARTIFACT },
+		rootReviewedAnchor: { commit: sha40("a"), artifactSha256: "e".repeat(64),
+			digestScope: "encrypted-result-envelope" },
+		bootstrap: { contractId: contract.id, sourceSha256: "f".repeat(64),
+			format: "deflate-raw-json-v1",
+			filesB64: deflateRawSync(JSON.stringify(bundle)).toString("base64") } };
+	const bytes = Buffer.from(JSON.stringify(payload));
+	const signature = sign("sha256", bytes, { key: privateKey,
+		padding: constants.RSA_PKCS1_PSS_PADDING, saltLength: 32 });
+	const seedEnvelopeB64 = Buffer.from(JSON.stringify({ payload_b64: bytes.toString("base64"),
+		signature_b64: signature.toString("base64") })).toString("base64");
+	const anchor = run(7001, 1, "completed", sha40("a"), "success");
+	const actualSource: CurrentMissionRun = options.controlRequest ? {
+		...source, event: "push", ref: controlRef, sha: requestCommit,
+		before: priorControlCommit } : source;
+	const currentRun = (status: string, conclusion?: string) => options.controlRequest ?
+		{ ...run(7002, 2, status, requestCommit, conclusion),
+			head_branch: "run-requests/workflow-learning-reliability", event: "push",
+			head_commit: { message: REUSABLE_RUN_REQUEST_MESSAGE } } :
+		run(7002, 2, status, sourceCommit, conclusion);
+	const running = currentRun("in_progress");
+	const done = currentRun("completed", "failure");
+	const live: LiveState = { sourceTip: sourceCommit, controlTip: priorControlCommit,
+		ciHead: sourceCommit, ciConclusion: "success", ciStatus: "completed",
+		ciRunAttempt: 1, ciCount: 1, ciRunId: 9003, sourceTree: testedTree };
+	const codePath = options.repairStage === "objective-assessment" ?
+		"src/m07/objective-progress.ts" : reviewedCodePath;
+	const testPath = options.repairStage === "objective-assessment" ?
+		"test/m07-objective-progress.test.ts" : reviewedTestPath;
+	const symbol = options.repairStage === "objective-assessment" ? "objectiveProgress" : "runM04";
+	const reviewEvidence = { codePath, testPath, symbol, testName: reviewedTestName,
+		sourceText: `export async function ${symbol}() { return 'reviewed-handoff'; }\n`,
+		testText: `test(${JSON.stringify(reviewedTestName)}, async () => {});\n` };
+	let terminal = false;
+	const request: typeof fetch = async url => {
+		const address = String(url);
+		let data: unknown;
+		if (address.includes("/workflows/manual-private-campaign.yml/runs?"))
+			data = address.includes(`head_sha=${priorControlCommit}`) ?
+				{ total_count: 0, workflow_runs: [] } :
+				{ total_count: 2, workflow_runs: [terminal ? done : running, anchor] };
+		else if (address.endsWith("/runs/7002")) data = done;
+		else if (address.endsWith("/runs/7002/artifacts?per_page=100"))
+			data = { total_count: options.resultOnlyRepair ? 2 : 1, artifacts: [
+				{ id: 9002, name: CARRY_ARTIFACT_NAME,
+					expired: false, workflow_run: { id: 7002 } },
+				...(options.resultOnlyRepair ? [{ id: 9202, name: MISSION_ARTIFACT,
+					expired: false, digest: `sha256:${"9".repeat(64)}`,
+					workflow_run: { id: 7002, head_sha: options.controlRequest ? requestCommit : sourceCommit } }] : [])] };
+		else if (address.endsWith("/runs/7002/jobs?per_page=100"))
+			data = { total_count: 1, jobs: [{ id: 6002, run_id: 7002,
+				run_attempt: 1, head_sha: options.controlRequest ? requestCommit : sourceCommit,
+				name: "private-campaign",
+				status: "completed", conclusion: "failure",
+				steps: [{ name: "Run bounded private campaign", status: "completed",
+					conclusion: "success" }] }] };
+		else if (address.includes("/git/ref/heads/improve/workflow-learning-reliability"))
+			data = { ref: sourceRef, object: { type: "commit", sha: live.sourceTip } };
+		else if (address.includes("/git/ref/heads/run-requests/workflow-learning-reliability")) {
+			if (live.controlTip === null) return new Response(JSON.stringify({ message: "Not Found" }),
+				{ status: 404 });
+			data = { ref: controlRef, object: { type: "commit", sha: live.controlTip } };
+		} else if (address.includes("/contents/")) {
+			const parsed = new URL(address);
+			const file = parsed.pathname.split("/contents/")[1]!;
+			const content = file === reviewEvidence.codePath ? parsed.searchParams.get("ref") === sourceCommit ?
+				`export async function ${symbol}() { return 'prior-handoff'; }\n` : reviewEvidence.sourceText :
+				file === reviewEvidence.testPath ? reviewEvidence.testText : "";
+			data = { type: "file", path: file, encoding: "base64", size: Buffer.byteLength(content),
+				content: Buffer.from(content).toString("base64") };
+		} else if (address.endsWith(`/git/commits/${priorControlCommit}`))
+			data = { sha: priorControlCommit, tree: { sha: testedTree },
+				message: REUSABLE_RUN_REQUEST_MESSAGE,
+				parents: [{ sha: options.oldControlSource ?? sourceCommit }] };
+		else if (address.includes("/git/commits/"))
+			data = address.endsWith(`/git/commits/${requestCommit}`) ?
+				{ sha: requestCommit, tree: { sha: testedTree },
+					parents: [{ sha: sourceCommit }, { sha: priorControlCommit }] } :
+				{ sha: live.commitReplySha ?? address.split("/git/commits/")[1],
+					tree: { sha: address.endsWith(`/git/commits/${sourceCommit}`) ? testedTree : live.sourceTree }, parents: [] };
+		else if (address.includes("/workflows/workflow-regression.yml/runs?"))
+			data = address.includes(`head_sha=${priorControlCommit}`) ?
+				{ total_count: 0, workflow_runs: [] } :
+				options.oldControlSource && address.includes(`head_sha=${options.oldControlSource}`) ?
+				{ total_count: 1, workflow_runs: [{ id: 9010, run_attempt: 1,
+					head_sha: options.oldControlSource,
+					head_branch: "improve/workflow-learning-reliability", event: "push",
+					status: "completed", conclusion: "success" }] } :
+				{ total_count: live.ciCount, workflow_runs: live.ciCount ? [{ id: live.ciRunId,
+				run_attempt: live.ciRunAttempt, head_sha: live.ciHead,
+				head_branch: "improve/workflow-learning-reliability", event: "push",
+				status: live.ciStatus, conclusion: live.ciConclusion }] : [] };
+		else throw new Error(`unexpected synthetic read: ${address}`);
+		return new Response(JSON.stringify(data), { status: 200 });
+	};
+	const opening = await openLedgerContinuation({ seedEnvelopeB64, publicKeyFile,
+		expectedSpkiSha256, githubToken: "synthetic-token", current: actualSource, request,
+		loadCarryArtifact: async () => "unused" });
+	const requestAudit = options.provider402 ? { version: 3 as const,
+		kind: "accounting-only-request-audit" as const,
+		requests: [{ requestId: "payment-rejected", sessionId: campaignSessionEffectId("payment-session"),
+			inputPayloadBytes: 100, responseReceived: false, status: "unknown" as const,
+			settledCny: null, unknownObservedCny: null, reportedUsage: null }],
+		settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 1 } :
+		{ version: 3 as const, kind: "accounting-only-request-audit" as const,
+			requests: [], settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
+	const diagnostic = options.provider402 ? opening.appendTransportDiagnosticCensus(requestAudit,
+		[{ version: 1, promptIndex: 1, requestId: "payment-rejected", phase: "response-body",
+			httpStatus: 402, responseStarted: true, bytesRead: 162, abortSource: null,
+			providerErrorCode: "invalid_request_error", providerErrorType: null,
+			providerErrorReasonClass: "insufficient-balance", providerRequestId: null,
+			errorCodes: [] }]) : undefined;
+	let sealed = opening.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: options.provider402 ? 1 : 0, requestAudit,
+		...(options.provider402 || options.largePayload || options.multipartResearchBytes ?
+			{ privateBundle: { ...bundle,
+			...(diagnostic ? { "transport-diagnostics.json": diagnostic } : {}),
+			...(options.largePayload ?
+				{ "m04-export.json": randomBytes(1_250_000).toString("base64") } : {}),
+			...(options.multipartResearchBytes ?
+				{ "research-history.json": JSON.stringify({ syntheticPadding:
+					randomBytes(options.multipartResearchBytes).toString("base64") }) } : {}) },
+			bootstrapBinding: opening.priorBootstrapBinding } : {}) });
+	if (options.legacyV3) {
+		const signed = JSON.parse(Buffer.from(seedEnvelopeB64, "base64").toString("utf8")) as {
+			signature_b64: string };
+		const seedDigest = createHash("sha256").update(Buffer.from(seedEnvelopeB64, "base64"))
+			.digest("hex");
+		const key = Buffer.from(hkdfSync("sha256", Buffer.from(signed.signature_b64, "base64"),
+			Buffer.from(seedDigest, "hex"), "mul-pis-ledger-continuation-v1", 32));
+		const v4 = JSON.parse(Buffer.from(sealed.envelopeB64, "base64").toString("utf8")) as {
+			parentDigest: string; nonce: string; ciphertext: string; tag: string };
+		const carrySource = { runId: "7002", runAttempt: 1, runNumber: 2,
+			commit: options.controlRequest ? requestCommit : sourceCommit };
+		const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(v4.nonce, "base64"));
+		decipher.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY, seedDigest,
+			4, v4.parentDigest, carrySource])));
+		decipher.setAuthTag(Buffer.from(v4.tag, "base64"));
+		const manifest = JSON.parse(Buffer.concat([decipher.update(Buffer.from(v4.ciphertext, "base64")),
+			decipher.final()]).toString("utf8")) as unknown;
+		const plaintext = decodeCarrySidecars({ manifest, key, seedDigest,
+			parentDigest: v4.parentDigest, source: carrySource,
+			load: name => Buffer.from(sealed.sidecars[name]!, "base64") });
+		const nonce = randomBytes(12);
+		const cipher = createCipheriv("aes-256-gcm", key, nonce);
+		cipher.setAAD(Buffer.from(JSON.stringify([MISSION_ID, MISSION_REPOSITORY, seedDigest,
+			3, v4.parentDigest, carrySource])));
+		const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+		sealed = { ...sealed, sidecars: {}, envelopeB64: Buffer.from(JSON.stringify({
+			version: 3, parentDigest: v4.parentDigest, nonce: nonce.toString("base64"),
+			ciphertext: ciphertext.toString("base64"),
+			tag: cipher.getAuthTag().toString("base64") })).toString("base64") };
+	}
+	terminal = true;
+	const journal = new MissionResumeJournal(path.join(dir, "journal"));
+	return { dir, journal, live, checkpoint, bundle, repairState, sealed, request, reviewEvidence,
+		input: { source: actualSource, seedEnvelopeB64, publicKeyFile, expectedSpkiSha256,
+			githubToken: "synthetic-token", request, journal,
+			loadCarryArtifact: async () => options.legacyV3 ? sealed.envelopeB64 : sealed } };
+}
+
+async function oldSourceReviewFixture(f: Awaited<ReturnType<typeof fixture>>,
+	oldKey: string, oldControlCommit = requestCommit): Promise<{ file: string; codePath: string; testPath: string;
+		oldSourceCommit: string;
+		codeText: string; testText: string }> {
+	const roles = ["host-native-execution-confinement", "m07-local-tool-grant",
+		"fresh-workspace-store", "session-constraints",
+		"encrypted-output-provider-transport"] as const;
+	const codePath = "src/runner/reviewed-old-source.ts";
+	const testPath = "test/reviewed-old-source.test.ts";
+	const codeText = "export function reviewedOldSource() { return true; }\n";
+	const testText = "test('reviewed old source', () => {});\n";
+	const old = await f.journal.get(oldKey);
+	assert(old);
+	const file = path.join(f.dir, `old-source-review-${oldKey}.json`);
+	await writeFile(file, JSON.stringify({
+		version: 1, kind: "host-reviewed-unobserved-control-source-capability",
+		prior: { oldJournalKey: oldKey,
+			oldAcceptedControl: { commit: oldControlCommit, tree: old.control.testedTree,
+				parents: [...old.control.parents] },
+			oldTestedSource: { commit: old.control.testedSourceCommit,
+				tree: old.control.testedTree },
+			priorCarrySource: old.intentBinding.source,
+			priorCarryEnvelopeSha256: old.intentBinding.envelopeSha256 },
+		review: { kind: "operator-code-review", conclusion: "approved-for-fresh-only-execution",
+			codeEvidenceRefs: roles.map(role => ({ role, path: codePath,
+				symbol: "reviewedOldSource" })),
+			testEvidenceRefs: roles.map(role => ({ role, path: testPath,
+				name: "reviewed old source" })) },
+		grant: { mode: "fresh-only-confined-effects", oldExecution: "unknown-may-run-later",
+			oldAccounting: "unquantified", oldScience: "untrusted-no-adoption",
+			m07Tools: "factory-confined-local", researchAndReviewerSessions: "read-only",
+			state: "fresh-workspace-empty-store-no-resume", outputTransport: "encrypted-fixed",
+			providerInference: "fixed-configured-provider" }
+	}), { mode: 0o600 });
+	return { file, codePath, testPath, oldSourceCommit: old.control.testedSourceCommit,
+		codeText, testText };
+}
+
+async function repairFixture(t: TestContext, options: { unknownOperation?: boolean;
+	repairStage?: WorkflowRepairStage; repairFailure?: WorkflowRepairFailure;
+		repairActionStage?: WorkflowRepairStage; repairStrategy?: WorkflowRepairStrategy;
+		omitRepairStage?: boolean; omitRepairEvidence?: boolean;
+		resultOnlyRepair?: boolean } = {}) {
+	const f = await fixture(t, { carriedAction: true, stopReason: "workflow-repair-needed", ...options });
+	f.live.sourceTip = sha40("e");
+	f.live.sourceTree = sha40("1");
+	f.live.ciHead = f.live.sourceTip;
+	const authenticated = await authenticateLatestTerminalCarry(f.input);
+	const projected = authenticatedSupervisorProjection(authenticated.proof, authenticated.privateBundle)!;
+	const carry = projected.terminalCarry;
+	const bytes = f.bundle["repair-state.json"] ?? JSON.stringify(f.repairState);
+	const plan: HostReviewedWorkflowRepairPlanV1 = {
+		version: 1, kind: "host-reviewed-workflow-repair-plan",
+		prior: { source: { runId: carry.source.runId, runAttempt: carry.source.runAttempt,
+			commit: carry.source.commit }, sourceTree: testedTree,
+			envelopeSha256: carry.envelopeSha256, checkpointSha256: carry.checkpointSha256!,
+			contractId: carry.contractId, selectedTupleSha256: carry.selectedTupleSha256,
+			pendingActionSha256: carry.pendingActionSha256! },
+		repair: { stateSha256: createHash("sha256").update(bytes).digest("hex"), state: JSON.parse(bytes) },
+		replacement: { testedSourceCommit: f.live.sourceTip, testedTree: f.live.sourceTree,
+			successfulCi: { workflow: "workflow-regression.yml", runId: "9003", runAttempt: 1,
+				headCommit: f.live.sourceTip, conclusion: "success" } },
+		review: { kind: "operator-code-review", strategyClass: "evidence-read-handoff",
+			codeEvidenceRefs: [{ path: f.reviewEvidence.codePath,
+				symbol: f.reviewEvidence.symbol }],
+			offlineTests: { command: "npm run typecheck && npm test", conclusion: "passed",
+				sourceCommit: f.live.sourceTip, tree: f.live.sourceTree,
+				testEvidenceRefs: [{ path: f.reviewEvidence.testPath,
+					name: f.reviewEvidence.testName }] } },
+		boundary: "new-isolated-workspace-no-prior-session-resume" };
+	const repairPlanPrivateFile = path.join(f.dir, "operator-reviewed-repair.json");
+	await writeFile(repairPlanPrivateFile, JSON.stringify(plan), { mode: 0o600 });
+	return { ...f, plan, input: { ...f.input, repairPlanPrivateFile } };
+}
+
+async function resultOnlyRepairFixture(t: TestContext) {
+	const f = await repairFixture(t, { unknownOperation: true,
+		repairStage: "objective-assessment", repairFailure: "unread-evidence",
+		resultOnlyRepair: true });
+	assert.equal(f.bundle["repair-state.json"], undefined);
+	const envelopeBytes = Buffer.from(JSON.stringify({
+		format: "mul-pis-private-campaign-v1", key_wrap: "RSA-3072-OAEP-SHA256",
+		content_cipher: "AES-256-GCM", recipient_spki_sha256: "8".repeat(64),
+		metadata: { repository: MISSION_REPOSITORY, run_id: "7002", run_attempt: "1",
+			commit: sourceCommit, event: "workflow_dispatch" },
+		wrapped_key_b64: randomBytes(384).toString("base64"),
+		nonce_b64: randomBytes(12).toString("base64"),
+		ciphertext_b64: randomBytes(32).toString("base64"),
+	}));
+	const receipt: ResultOnlyRepairReviewReceiptV1 = {
+		version: 1, kind: "host-reviewed-result-only-repair-state",
+		prior: { source: f.plan.prior.source, sourceTree: f.plan.prior.sourceTree,
+			carryEnvelopeSha256: f.plan.prior.envelopeSha256,
+			checkpointSha256: f.plan.prior.checkpointSha256,
+			contractId: f.plan.prior.contractId,
+			selectedTupleSha256: f.plan.prior.selectedTupleSha256,
+			pendingActionSha256: f.plan.prior.pendingActionSha256 },
+		result: { artifactId: "9202", archiveSha256: "9".repeat(64),
+			envelopeSha256: createHash("sha256").update(envelopeBytes).digest("hex"),
+			envelopeFile: "private-campaign-outcome.enc.json" },
+		repair: { file: "repair-state.json", bytesUtf8: JSON.stringify(f.repairState),
+			sha256: createHash("sha256").update(JSON.stringify(f.repairState)).digest("hex") },
+		review: { kind: "operator-rsa-decryption-review",
+			conclusion: "control-only-repair-state-reviewed",
+			researchResultUse: "untrusted-no-scientific-adoption" }
+	};
+	const resultOnlyRepairReviewPrivateFile = path.join(f.dir, "result-only-review.json");
+	await writeFile(resultOnlyRepairReviewPrivateFile, JSON.stringify(receipt), { mode: 0o600 });
+	return { ...f, receipt, envelopeBytes, resultOnlyRepairReviewPrivateFile,
+		input: { ...f.input, resultOnlyRepairReviewPrivateFile,
+			loadResultEnvelope: async () => envelopeBytes } };
+}
+
+async function interruptedFixture(t: TestContext) {
+	const f = await fixture(t, { carriedAction: true, unknownOperation: true });
+	const interruptedCommit = sha40("e");
+	const reviewFile = path.join(f.dir, "interrupted-source-review.json");
+	const priorDigest = createHash("sha256").update(Buffer.from(f.sealed.envelopeB64, "base64"))
+		.digest("hex");
+	const reviewFiles = new Map([
+		["src/runner/confined-campaign-files.ts", "createConfinedCampaignFileTools"],
+		["src/m07/objective-progress.ts", "objective_evidence_read"],
+		["src/stages/m04.ts", "m07_evidence_read"],
+		["src/m07/controller.ts", "reviewerSpec"],
+		["scripts/manual-private-campaign.ts",
+			"M07 execution session lacks the live factory-confined file grant mkdtemp createFileKnowledgeStore sandboxArguments checkCandidate"],
+		[".github/workflows/manual-private-campaign.yml", "Upload encrypted mission continuation"],
+		["test/confined-campaign-evidence-read.test.ts", "confined local tools"],
+		["test/m07-objective-progress.test.ts", "objective evidence"],
+		["test/m04-checkpoint.test.ts", "frozen feedback"],
+		["test/m07-execution-loop.test.ts", "fresh reviewer"],
+		["test/manual-private-campaign.test.ts",
+			"read only session fresh state measurement mounts evaluator and immutable reference workers read-only while preserving separate temporary scratch"],
+		["test/private-campaign-workflow-manifest.test.ts", "ciphertext upload"]]);
+	await writeFile(reviewFile, JSON.stringify({ version: 2,
+		kind: "host-reviewed-interrupted-source-capability",
+		prior: { source: { runId: "7003", runAttempt: 1, commit: interruptedCommit },
+			sourceTree: testedTree,
+			priorCarrySource: { runId: "7002", runAttempt: 1, commit: sourceCommit },
+			priorCarryEnvelopeSha256: priorDigest,
+			priorCheckpointSha256: createHash("sha256")
+				.update(f.bundle["objective-checkpoint.json"]).digest("hex"),
+			resultArtifactId: "9103", resultArchiveSha256: "9".repeat(64) },
+		review: { kind: "operator-code-review", conclusion: "approved-for-fresh-only-execution",
+			codeEvidenceRefs: [
+				{ role: "m07-builder-confined-writes", path: "src/runner/confined-campaign-files.ts",
+					symbol: "createConfinedCampaignFileTools" },
+				{ role: "m07-builder-confined-writes", path: "scripts/manual-private-campaign.ts",
+					symbol: "M07 execution session lacks the live factory-confined file grant" },
+				{ role: "objective-assessor-read-only", path: "src/m07/objective-progress.ts",
+					symbol: "objective_evidence_read" },
+				{ role: "m04-reviewer-read-only", path: "src/stages/m04.ts",
+					symbol: "m07_evidence_read" },
+				{ role: "m07-reviewer-read-only", path: "src/m07/controller.ts",
+					symbol: "reviewerSpec" },
+				{ role: "fresh-workspace-store", path: "scripts/manual-private-campaign.ts",
+					symbol: "createFileKnowledgeStore" },
+				{ role: "host-execution-confinement", path: "scripts/manual-private-campaign.ts",
+					symbol: "sandboxArguments" },
+				{ role: "host-execution-confinement", path: "scripts/manual-private-campaign.ts",
+					symbol: "checkCandidate" },
+				{ role: "encrypted-output-provider", path: ".github/workflows/manual-private-campaign.yml",
+					symbol: "Upload encrypted mission continuation" }],
+			testEvidenceRefs: [
+				{ role: "m07-builder-confined-writes", path: "test/confined-campaign-evidence-read.test.ts",
+					name: "confined local tools" },
+				{ role: "objective-assessor-read-only", path: "test/m07-objective-progress.test.ts",
+					name: "objective evidence" },
+				{ role: "m04-reviewer-read-only", path: "test/m04-checkpoint.test.ts",
+					name: "frozen feedback" },
+				{ role: "m07-reviewer-read-only", path: "test/m07-execution-loop.test.ts",
+					name: "fresh reviewer" },
+				{ role: "fresh-workspace-store", path: "test/manual-private-campaign.test.ts",
+					name: "fresh state" },
+				{ role: "host-execution-confinement", path: "test/manual-private-campaign.test.ts",
+					name: "measurement mounts evaluator and immutable reference workers read-only while preserving separate temporary scratch" },
+				{ role: "encrypted-output-provider", path: "test/private-campaign-workflow-manifest.test.ts",
+					name: "ciphertext upload" }] },
+		grant: { mode: "fresh-only-confined-effects", oldResultUse: "untrusted-no-replay-no-adoption",
+			m07BuilderToolGrant: "factory-confined-task-file-writes",
+			objectiveAssessorToolGrant: "read-only", m04ReviewerToolGrant: "read-only",
+			m07ReviewerToolGrant: "read-only",
+			state: "fresh-workspace-empty-store-no-resume", outputTransport: "encrypted-fixed",
+			providerInference: "fixed-configured-provider" } }), { mode: 0o600 });
+	const interruptedRun = { ...run(7003, 3, "completed", interruptedCommit, "cancelled") };
+	const preceding = run(7002, 2, "completed", sourceCommit, "failure");
+	const anchor = run(7001, 1, "completed", sha40("a"), "success");
+	const request: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.includes("/contents/")) {
+			const file = new URL(address).pathname.split("/contents/")[1]!;
+			const body = reviewFiles.get(file);
+			if (body !== undefined) return new Response(JSON.stringify({ type: "file", path: file,
+				encoding: "base64", size: Buffer.byteLength(body),
+				content: Buffer.from(body).toString("base64") }));
+		}
+		if (address.includes("/workflows/manual-private-campaign.yml/runs?"))
+			return new Response(JSON.stringify({ total_count: 3,
+				workflow_runs: [interruptedRun, preceding, anchor] }));
+		if (address.endsWith("/runs/7003"))
+			return new Response(JSON.stringify(interruptedRun));
+		if (address.includes("/runs/7003/jobs?"))
+			return new Response(JSON.stringify({ total_count: 1, jobs: [{ id: 6003,
+				run_id: 7003, run_attempt: 1, head_sha: interruptedCommit,
+				name: "private-campaign", status: "completed", conclusion: "cancelled",
+				steps: [{ name: "Run private campaign", status: "completed",
+					conclusion: "cancelled" }] }] }));
+		if (address.includes("/runs/7003/artifacts?"))
+			return new Response(JSON.stringify({ total_count: 1, artifacts: [{
+				id: 9103, name: MISSION_ARTIFACT, expired: false,
+				digest: `sha256:${"9".repeat(64)}`,
+				workflow_run: { id: 7003, head_sha: interruptedCommit } }] }));
+		return f.request(url, init);
+	};
+	return { ...f, request, reviewFile, input: { ...f.input, source: { ...source, runId: "7003",
+		sha: interruptedCommit }, request,
+		interruptedSourceReviewPrivateFile: reviewFile,
+		loadCarryArtifact: async ({ runId, artifactId }: { runId: string; artifactId: string }) => {
+			assert.equal(runId, "7002"); assert.equal(artifactId, "9002");
+			return f.sealed;
+		} } };
+}
+
+test("cancelled no-carry host bridge plans one fresh isolated request from authenticated prior state", async t => {
+	const f = await interruptedFixture(t);
+	const inspected = await prepareAuthenticatedResumeRequest({ ...f.input, readOnly: true });
+	assert.equal(inspected.decision.kind, "dispatch");
+	if (inspected.decision.kind !== "dispatch") return;
+	assert.equal(inspected.decision.intent.source.runId, "7003");
+	assert.equal(inspected.decision.intent.terminalInterruption?.resultArchiveSha256, "9".repeat(64));
+	assert.equal(inspected.decision.intent.actionKind, "reconcile-interrupted-run");
+	assert.equal(inspected.decision.intent.pendingAction.reasonCode, "execution-interrupted");
+	assert.equal(inspected.decision.intent.actionProvenance?.kind, "current-host-interruption");
+	assert.deepEqual(inspected.decision.intent.quarantinedOperationRefs, ["old-goal/O001"]);
+	assert.equal(inspected.descriptor?.message, REUSABLE_RUN_REQUEST_MESSAGE);
+	assert.equal(inspected.journalKey, undefined);
+	const prepared = await prepareAuthenticatedResumeRequest(f.input);
+	assert.equal(prepared.decision.kind, "dispatch");
+	assert.equal(prepared.journalState, "reserved");
+	assert.equal((await f.journal.get(prepared.journalKey!))?.intentBinding.terminalInterruption?.source.runId,
+		"7003");
+	const repeated = await prepareAuthenticatedResumeRequest(f.input);
+	assert.deepEqual(repeated.decision, { kind: "wait", reason: "dispatch-reserved",
+		idempotencyKey: prepared.journalKey });
+	assert.equal(repeated.descriptor, undefined);
+});
+
+test("failed carry and interruption authentication retain both safe private causes", async t => {
+	const f = await interruptedFixture(t);
+	const request: typeof fetch = async (url, init) => {
+		if (String(url).includes("/runs/7003/artifacts?"))
+			return new Response(JSON.stringify({ total_count: 0, artifacts: [] }));
+		return f.input.request(url, init);
+	};
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...f.input, request }), error => {
+		const diagnostic = privateHostPreparationDiagnostic(error);
+		assert.equal(diagnostic.code, "terminal-authentication-failed");
+		assert.equal((diagnostic.attempts as unknown[]).length, 2);
+		assert(!JSON.stringify(diagnostic).includes("Synthetic original task"));
+		return true;
+	});
+});
+
+test("an interrupted run requires a private review of its own immutable source before dispatch", async t => {
+	const f = await interruptedFixture(t);
+	const { interruptedSourceReviewPrivateFile: _review, ...unreviewed } = f.input;
+	const waiting = await prepareAuthenticatedResumeRequest(unreviewed);
+	assert.deepEqual(waiting.decision,
+		{ kind: "wait", reason: "interruption-source-review-required" });
+	assert.equal(waiting.descriptor, undefined);
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	const raw = JSON.parse(await readFile(f.reviewFile, "utf8"));
+	raw.prior.source.commit = sha40("1");
+	await writeFile(f.reviewFile, JSON.stringify(raw), { mode: 0o600 });
+	await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error => {
+		assert.equal(privateHostPreparationDiagnostic(error).code,
+			"interruption-source-review-invalid");
+		return true;
+	});
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+});
+
+test("resultless periodic prefix needs exact private source review and prepares only a fresh request", async t => {
+	const f = await interruptedFixture(t);
+	const seedDigest = createHash("sha256")
+		.update(Buffer.from(f.input.seedEnvelopeB64!, "base64")).digest("hex");
+	const signed = JSON.parse(Buffer.from(f.input.seedEnvelopeB64!, "base64").toString("utf8")) as {
+		signature_b64: string };
+	const key = Buffer.from(hkdfSync("sha256", Buffer.from(signed.signature_b64, "base64"),
+		Buffer.from(seedDigest, "hex"), "mul-pis-ledger-continuation-v1", 32));
+	const priorEnvelopeSha256 = createHash("sha256")
+		.update(Buffer.from(f.sealed.envelopeB64, "base64")).digest("hex");
+	const oldCommit = sha40("e");
+	const incremental = new IncrementalPrivateCheckpointJournal({
+		source: { repository: MISSION_REPOSITORY, runId: "7003", runAttempt: 1,
+			commit: oldCommit, event: "workflow_dispatch", priorEnvelopeSha256 },
+		outputDir: f.dir, authenticatedMissionKey: key });
+	await incremental.record("initial", { requestAudit: { version: 3,
+		kind: "accounting-only-request-audit", requests: [], settledCny: 0,
+		unknownObservedCny: 0, unpricedRequestCount: 0 },
+		hostEffects: { version: 1, kind: "host-effect-prefix-observation", complete: false,
+			selectionAuthority: false, source: { runId: "7003", runAttempt: 1, commit: oldCommit },
+			priorEnvelopeSha256, historicalGoalRunIds: [], goals: [], sessions: [], requestIds: [] } });
+	const raw = await readFile(path.join(f.dir, "incremental-control-prefix.json"), "utf8");
+	const prefixSha256 = createHash("sha256").update(raw).digest("hex");
+	const archiveSha256 = "8".repeat(64);
+	const originalRequest = f.request;
+	const request: typeof fetch = async (url, init) => {
+		const reviewed = new Map([
+			["scripts/private-campaign-observer.ts",
+				"export async function readAuthenticatedCommittedPrefix() {}\n" +
+				"export function privateCampaignChildEnv() {}"],
+			["scripts/private-campaign-observer-action.mjs",
+				"export async function runPrivateCampaignAction() { spawnObserver(process.execPath); }"],
+			["scripts/action.yml", "runs:\n  using: node24\n  main: private-campaign-observer-action.mjs\n"],
+			["test/private-campaign-observer.test.ts",
+				"test('prefix reader accepts one committed inode', () => {})\n" +
+				"test('local JS action keeps runtime credentials', () => {})\n" +
+				"test('child has only one-shot inputs', () => {})"]]);
+		const file = String(url).includes("/contents/") ?
+			new URL(String(url)).pathname.split("/contents/")[1] : undefined;
+		const content = file ? reviewed.get(file) : undefined;
+		if (file && content !== undefined) {
+			assert.equal(new URL(String(url)).searchParams.get("ref"), oldCommit);
+			return new Response(JSON.stringify({ type: "file", path: file, encoding: "base64",
+				size: Buffer.byteLength(content), content: Buffer.from(content).toString("base64") }));
+		}
+		if (String(url).includes("/runs/7003/artifacts?"))
+			return new Response(JSON.stringify({ total_count: 1, artifacts: [{ id: 9603,
+				name: "confidential-mission-prefix-7003-1-1", expired: false,
+				digest: `sha256:${archiveSha256}`,
+				workflow_run: { id: 7003, head_sha: oldCommit } }] }));
+		return originalRequest(url, init);
+	};
+	const loadCarryArtifact = async ({ runId, artifactId }: { runId: string; artifactId: string }) => {
+		if (runId === "7003") {
+			assert.equal(artifactId, "9603");
+			return { incrementalControlPrefix: raw };
+		}
+		assert.equal(runId, "7002"); assert.equal(artifactId, "9002");
+		return f.sealed;
+	};
+	const withoutReview = { ...f.input, request, loadCarryArtifact,
+		interruptedSourceReviewPrivateFile: undefined };
+	const waiting = await prepareAuthenticatedResumeRequest(withoutReview);
+	assert.deepEqual(waiting.decision,
+		{ kind: "wait", reason: "interruption-source-review-required" });
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	const oldReview = JSON.parse(await readFile(f.reviewFile, "utf8")) as {
+		review: { kind: string; conclusion: string;
+			codeEvidenceRefs: Array<{ role: string; path: string; symbol: string }>;
+			testEvidenceRefs: Array<{ role: string; path: string; name: string }> } };
+	const terminal = { workflowId: "91", runStatus: "completed", runConclusion: "cancelled",
+		jobId: "6003", jobName: "private-campaign", jobStatus: "completed",
+		jobConclusion: "cancelled", jobRunId: "7003", jobRunAttempt: 1,
+		jobHeadSha: oldCommit, providerStepStatus: "completed",
+		providerStepConclusion: "cancelled" };
+	const interruption = { version: 1, kind: "host-verified-terminal-prefix-interruption",
+		source: { runId: "7003", runAttempt: 1, commit: oldCommit },
+		priorCarrySource: { runId: "7002", runAttempt: 1, commit: sourceCommit },
+		priorCarryEnvelopeSha256: priorEnvelopeSha256,
+		prefixArtifactId: "9603", prefixArchiveSha256: archiveSha256,
+		prefixSha256, prefixSequence: 1, terminal, accounting: "unquantified",
+		effects: "unknown-unreconciled", terminationOrigin: "unknown" };
+	const reviewFile = path.join(f.dir, "terminal-prefix-source-review.json");
+	const receipt = { version: 2, kind: "host-reviewed-terminal-prefix-source-capability",
+		prior: { interruption, sourceTree: testedTree,
+			priorCheckpointSha256: createHash("sha256")
+				.update(f.bundle["objective-checkpoint.json"]).digest("hex") },
+		review: { ...oldReview.review,
+			codeEvidenceRefs: [...oldReview.review.codeEvidenceRefs,
+				{ role: "periodic-prefix-transport", path: "scripts/private-campaign-observer.ts",
+					symbol: "readAuthenticatedCommittedPrefix" },
+				{ role: "trusted-artifact-runtime-parent",
+					path: "scripts/private-campaign-observer-action.mjs",
+					symbol: "runPrivateCampaignAction" },
+				{ role: "trusted-artifact-runtime-parent", path: "scripts/action.yml",
+					symbol: "main: private-campaign-observer-action.mjs" },
+				{ role: "child-runtime-credential-exclusion",
+					path: "scripts/private-campaign-observer.ts",
+					symbol: "privateCampaignChildEnv" }],
+			testEvidenceRefs: [...oldReview.review.testEvidenceRefs,
+				{ role: "periodic-prefix-transport",
+					path: "test/private-campaign-observer.test.ts",
+					name: "prefix reader accepts one committed inode" },
+				{ role: "trusted-artifact-runtime-parent",
+					path: "test/private-campaign-observer.test.ts",
+					name: "local JS action keeps runtime credentials" },
+				{ role: "child-runtime-credential-exclusion",
+					path: "test/private-campaign-observer.test.ts",
+					name: "child has only one-shot inputs" }] },
+		grant: { mode: "fresh-only-confined-effects",
+			oldResultUse: "untrusted-no-replay-no-adoption",
+			m07BuilderToolGrant: "factory-confined-task-file-writes",
+			objectiveAssessorToolGrant: "read-only", m04ReviewerToolGrant: "read-only",
+			m07ReviewerToolGrant: "read-only",
+			state: "fresh-workspace-empty-store-no-resume", outputTransport: "encrypted-fixed",
+			providerInference: "fixed-configured-provider" } };
+	await writeFile(reviewFile, JSON.stringify(receipt), { mode: 0o600 });
+	const input = { ...withoutReview, terminalPrefixSourceReviewPrivateFile: reviewFile };
+	for (const field of ["m07BuilderToolGrant", "objectiveAssessorToolGrant",
+		"m04ReviewerToolGrant", "m07ReviewerToolGrant"] as const) {
+		const missing = structuredClone(receipt);
+		delete (missing.grant as Record<string, unknown>)[field];
+		await writeFile(reviewFile, JSON.stringify(missing), { mode: 0o600 });
+		await assert.rejects(prepareAuthenticatedResumeRequest({ ...input, readOnly: true }),
+			/terminal-prefix-source-review-invalid/);
+		const weaker = structuredClone(receipt);
+		(weaker.grant as Record<string, unknown>)[field] = "unrestricted-write";
+		await writeFile(reviewFile, JSON.stringify(weaker), { mode: 0o600 });
+		await assert.rejects(prepareAuthenticatedResumeRequest({ ...input, readOnly: true }),
+			/terminal-prefix-source-review-invalid/);
+	}
+	await writeFile(reviewFile, JSON.stringify({ ...receipt, version: 1,
+		grant: { mode: "fresh-only-confined-effects",
+			oldResultUse: "untrusted-no-replay-no-adoption", m07Tools: "factory-confined-local",
+			assessorAndM04ReviewerSessions: "read-only",
+			state: "fresh-workspace-empty-store-no-resume", outputTransport: "encrypted-fixed",
+			providerInference: "fixed-configured-provider" } }), { mode: 0o600 });
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...input, readOnly: true }),
+		/terminal-prefix-source-review-invalid/);
+	await writeFile(reviewFile, JSON.stringify(receipt), { mode: 0o600 });
+	const planned = await prepareAuthenticatedResumeRequest({ ...input, readOnly: true });
+	assert.equal(planned.decision.kind, "dispatch");
+	if (planned.decision.kind !== "dispatch") return;
+	assert.deepEqual(planned.decision.intent.terminalPrefixInterruption, interruption);
+	assert.equal(planned.decision.intent.terminalInterruption, undefined);
+	assert.equal(planned.decision.intent.actionProvenance?.kind,
+		"current-host-prefix-interruption");
+	assert.equal(planned.decision.intent.boundary,
+		"new-isolated-workspace-no-prior-session-resume");
+	assert.deepEqual(planned.decision.intent.quarantinedOperationRefs, ["old-goal/O001"]);
+	assert.equal(planned.decision.intent.pendingAction.reasonCode, "execution-interrupted");
+	assert(!JSON.stringify(planned.descriptor).includes("prefix"));
+	assert(!JSON.stringify(planned.descriptor).includes("operator"));
+	const bridge = await runStdioBridge(f, { request, terminalPrefixSourceReviewPrivateFile: reviewFile,
+		prefixOnly: { runId: "7003", artifactId: "9603", raw, archiveSha256 } });
+	assert.equal(bridge.code, 0, bridge.stderr);
+	assert.equal((bridge.lines.at(-1) as { kind: string }).kind, "prepared");
+	assert(!bridge.stdout.includes("prefixSha256"));
+	assert(!bridge.stdout.includes("terminal-prefix-source-review"));
+	assert(!bridge.stdout.includes("Synthetic original task"));
+	const privateOutput = JSON.parse(await readFile(bridge.outputPrivate, "utf8")) as {
+		decision: { intent: ResumeIntent } };
+	assert.equal(privateOutput.decision.intent.terminalPrefixInterruption?.prefixSha256,
+		prefixSha256);
+	const record = await f.journal.get(privateOutput.decision.intent.idempotencyKey);
+	assert.deepEqual(record?.intentBinding.terminalPrefixInterruption, interruption);
+	assert.equal(record?.intentBinding.terminalPrefixSourceReview?.source.commit, oldCommit);
+	const recordFile = path.join(f.journal.directory,
+		`${privateOutput.decision.intent.idempotencyKey}.json`);
+	const originalRecord = await readFile(recordFile, "utf8");
+	const changedRecord = JSON.parse(originalRecord) as { intentBinding: {
+		terminalPrefixInterruption: { terminal: { runConclusion: string } } } };
+	changedRecord.intentBinding.terminalPrefixInterruption.terminal.runConclusion = "failure";
+	await writeFile(recordFile, JSON.stringify(changedRecord), { mode: 0o600 });
+	await assert.rejects(new MissionResumeJournal(f.journal.directory)
+		.get(privateOutput.decision.intent.idempotencyKey),
+		/terminal prefix interruption binding is invalid|stored idempotency binding changed/);
+	await writeFile(recordFile, originalRecord, { mode: 0o600 });
+	assert.deepEqual((await prepareAuthenticatedResumeRequest(input)).decision,
+		{ kind: "wait", reason: "dispatch-reserved", idempotencyKey: record?.idempotencyKey });
+	await writeFile(reviewFile, JSON.stringify({ ...receipt, prior: {
+		...receipt.prior, interruption: { ...interruption, prefixSha256: "0".repeat(64) } } }),
+		{ mode: 0o600 });
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...input, readOnly: true }),
+		/terminal-prefix-source-review-invalid/);
+	await writeFile(reviewFile, JSON.stringify(receipt), { mode: 0o600 });
+	await chmod(reviewFile, 0o644);
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...input, readOnly: true }),
+		/terminal-prefix-source-review-invalid/);
+	await chmod(reviewFile, 0o600);
+	const traversal = structuredClone(receipt);
+	traversal.review.codeEvidenceRefs.at(-3)!.path =
+		"scripts/../private-campaign-observer-action.mjs";
+	await writeFile(reviewFile, JSON.stringify(traversal), { mode: 0o600 });
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...input, readOnly: true }),
+		/terminal-prefix-source-review-invalid/);
+	const spoof = structuredClone(receipt);
+	spoof.review.codeEvidenceRefs.at(-2)!.symbol = "main: credential-safe-spoof.mjs";
+	await writeFile(reviewFile, JSON.stringify(spoof), { mode: 0o600 });
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...input, readOnly: true }),
+		/terminal-prefix-source-review-invalid/);
+	for (const role of ["m07-builder-confined-writes", "objective-assessor-read-only",
+		"m04-reviewer-read-only", "m07-reviewer-read-only", "trusted-artifact-runtime-parent",
+		"child-runtime-credential-exclusion"]) {
+		const incomplete = structuredClone(receipt);
+		incomplete.review.codeEvidenceRefs = incomplete.review.codeEvidenceRefs
+			.filter(ref => ref.role !== role);
+		incomplete.review.testEvidenceRefs = incomplete.review.testEvidenceRefs
+			.filter(ref => ref.role !== role);
+		await writeFile(reviewFile, JSON.stringify(incomplete), { mode: 0o600 });
+		await assert.rejects(prepareAuthenticatedResumeRequest({ ...input, readOnly: true }),
+			/terminal-prefix-source-review-invalid/);
+	}
+});
+
+test("reviewed workflow repair releases one tested descriptor and durable reservation", async t => {
+	const f = await repairFixture(t);
+	const first = await prepareAuthenticatedResumeRequest(f.input);
+	assert.equal(first.decision.kind, "dispatch");
+	assert.equal(first.descriptor?.message, REUSABLE_RUN_REQUEST_MESSAGE);
+	assert.equal(first.descriptor?.sourceCommit, f.plan.replacement.testedSourceCommit);
+	assert.equal(first.descriptor?.tree, f.plan.replacement.testedTree);
+	assert.deepEqual(first.descriptor?.parents, [f.live.sourceTip, priorControlCommit]);
+	assert(!JSON.stringify(first.descriptor).includes("repair"));
+	assert(!JSON.stringify(first.descriptor).includes("Synthetic original task"));
+	assert.equal((await f.journal.get(first.journalKey!))?.intentBinding.workflowRepair?.testedSourceCommit,
+		f.plan.replacement.testedSourceCommit);
+	const second = await prepareAuthenticatedResumeRequest({ ...f.input,
+		journal: new MissionResumeJournal(f.journal.directory) });
+	assert.deepEqual(second.decision, { kind: "wait", reason: "dispatch-reserved", idempotencyKey: first.journalKey });
+	assert.equal(second.descriptor, undefined);
+	assert.equal(second.journalKey, first.journalKey);
+	await f.journal.markAttempted(first.journalKey!);
+	const third = await prepareAuthenticatedResumeRequest(f.input);
+	assert.deepEqual(third.decision, { kind: "wait", reason: "dispatch-delivery-unknown", idempotencyKey: first.journalKey });
+});
+
+test("workflow repair missing a private plan remains open without reservation", async t => {
+	const f = await repairFixture(t);
+	const { repairPlanPrivateFile: _file, ...input } = f.input;
+	f.live.ciStatus = "in_progress";
+	f.live.ciConclusion = null;
+	assert.deepEqual(await prepareAuthenticatedResumeRequest(input),
+		{ decision: { kind: "wait", reason: "workflow-repair-plan-required" } });
+	await assert.rejects(stat(f.journal.directory), { code: "ENOENT" });
+});
+
+test("workflow repair refuses stale carry, action, receipt, source tree and CI identities", async t => {
+	const changes: Array<(plan: HostReviewedWorkflowRepairPlanV1) => HostReviewedWorkflowRepairPlanV1> = [
+		plan => ({ ...plan, prior: { ...plan.prior, source: { ...plan.prior.source, runAttempt: 2 } } }),
+		plan => ({ ...plan, prior: { ...plan.prior, envelopeSha256: "4".repeat(64) } }),
+		plan => ({ ...plan, prior: { ...plan.prior, checkpointSha256: "4".repeat(64) } }),
+		plan => ({ ...plan, prior: { ...plan.prior, pendingActionSha256: "4".repeat(64) } }),
+		plan => ({ ...plan, prior: { ...plan.prior, selectedTupleSha256: "4".repeat(64) } }),
+		plan => ({ ...plan, repair: { ...plan.repair, stateSha256: "4".repeat(64) } }),
+		plan => ({ ...plan, repair: { ...plan.repair, state: { ...plan.repair.state, planFingerprint: "4".repeat(64) } } }),
+		plan => ({ ...plan, repair: { ...plan.repair, state: { ...plan.repair.state, stage: "objective-assessment" } } }),
+		plan => ({ ...plan, prior: { ...plan.prior, sourceTree: sha40("2") } }),
+		plan => ({ ...plan, replacement: { ...plan.replacement, testedTree: sha40("2") },
+			review: { ...plan.review, offlineTests: { ...plan.review.offlineTests, tree: sha40("2") } } }),
+		plan => ({ ...plan, replacement: { ...plan.replacement,
+			successfulCi: { ...plan.replacement.successfulCi, runId: "9004" } } }),
+	];
+	for (const change of changes) {
+		const f = await repairFixture(t);
+		await writeFile(f.input.repairPlanPrivateFile, JSON.stringify(change(f.plan)));
+		await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error =>
+			error instanceof MissionHostPreparationError && error.refusal.code === "workflow-repair-plan-stale");
+		await assert.rejects(stat(f.journal.directory), { code: "ENOENT" });
+	}
+});
+
+test("workflow repair refuses the same source or tree and unrelated review evidence", async t => {
+	for (const bad of ["same-source", "same-tree", "same-code", "missing-symbol", "missing-test",
+		"unrelated-code", "unrelated-test", "strategy-failure"] as const) {
+		const f = await repairFixture(t);
+		let plan = f.plan;
+		if (bad === "same-source" || bad === "same-tree") {
+			if (bad === "same-source") f.live.sourceTip = sourceCommit;
+			f.live.sourceTree = testedTree;
+			f.live.ciHead = f.live.sourceTip;
+			plan = { ...plan, replacement: { testedSourceCommit: f.live.sourceTip, testedTree: testedTree,
+				successfulCi: { ...plan.replacement.successfulCi, headCommit: f.live.sourceTip } },
+				review: { ...plan.review, offlineTests: { ...plan.review.offlineTests,
+					sourceCommit: f.live.sourceTip, tree: testedTree } } };
+		} else if (bad === "same-code") f.reviewEvidence.sourceText = "export async function runM04() { return 'prior-handoff'; }\n";
+		else if (bad === "missing-symbol") f.reviewEvidence.sourceText = "export async function unrelated() {}\n";
+		else if (bad === "missing-test") f.reviewEvidence.testText = "test('unrelated', () => {});\n";
+		else if (bad === "unrelated-code") plan = { ...plan, review: { ...plan.review,
+			codeEvidenceRefs: [{ path: "src/runner/mission-host-adapter.ts", symbol: "prepareAuthenticatedResumeRequest" }] } };
+		else if (bad === "unrelated-test") plan = { ...plan, review: { ...plan.review,
+			offlineTests: { ...plan.review.offlineTests,
+				testEvidenceRefs: [{ path: "test/mission-supervisor.test.ts", name: reviewedTestName }] } } };
+		else plan = { ...plan, repair: { ...plan.repair,
+			state: { ...plan.repair.state, failure: "invalid-assessment" } } };
+		await writeFile(f.input.repairPlanPrivateFile, JSON.stringify(plan));
+		await assert.rejects(prepareAuthenticatedResumeRequest(f.input), bad);
+		await assert.rejects(stat(f.journal.directory), { code: "ENOENT" });
+	}
+});
+
+test("workflow repair retains unknown effects and cannot reuse a changed review reservation", async t => {
+	const unknown = await repairFixture(t, { unknownOperation: true });
+	const preserving = await prepareAuthenticatedResumeRequest(unknown.input);
+	assert.equal(preserving.decision.kind, "dispatch");
+	if (preserving.decision.kind === "dispatch") {
+		assert.equal(preserving.decision.intent.pendingAction.kind, "reconcile-m07-operation");
+		assert.deepEqual(preserving.decision.intent.pendingAction.target?.operationRefs,
+			["old-goal/O001"]);
+	}
+	const f = await repairFixture(t);
+	const first = await prepareAuthenticatedResumeRequest(f.input);
+	const changed = { ...f.plan, review: { ...f.plan.review, strategyClass: "fresh-context-handoff" } };
+	await writeFile(f.input.repairPlanPrivateFile, JSON.stringify(changed));
+	await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error =>
+		error instanceof MissionHostPreparationError && error.refusal.code === "control-request-delivery-uncertain");
+	assert.equal((await f.journal.get(first.journalKey!))?.state, "reserved");
+});
+
+test("reviewed result-only repair state permits the carried reconcile action without changing AEAD science", async t => {
+	const f = await resultOnlyRepairFixture(t);
+	const authenticated = await authenticateLatestTerminalCarry(f.input);
+	const branded = await readReviewedResultOnlyRepairState({
+		privateReceiptFile: f.resultOnlyRepairReviewPrivateFile,
+		terminalProof: authenticated.proof, privateBundle: authenticated.privateBundle,
+		terminalSourceTree: testedTree, terminalEvent: "workflow_dispatch",
+		encryptedEnvelopeBytes: f.envelopeBytes });
+	assert.equal(isVerifiedResultOnlyRepairState(branded), true);
+	assert.equal(isVerifiedResultOnlyRepairState({ ...branded }), false);
+	assert.equal(authenticated.privateBundle["repair-state.json"], undefined);
+	const prepared = await prepareAuthenticatedResumeRequest(f.input);
+	assert.equal(prepared.decision.kind, "dispatch");
+	assert.equal(prepared.descriptor?.sourceCommit, f.plan.replacement.testedSourceCommit);
+	if (prepared.decision.kind === "dispatch") {
+		assert.equal(prepared.decision.intent.pendingAction.kind, "reconcile-m07-operation");
+		assert.deepEqual(prepared.decision.intent.pendingAction.target?.operationRefs,
+			["old-goal/O001"]);
+	}
+	assert.equal((await f.journal.get(prepared.journalKey!))?.state, "reserved");
+	assert(!JSON.stringify(prepared.descriptor).includes("repair-state"));
+});
+
+test("result-only review without a receipt waits, and altered artifact, repair and carry are refused", async t => {
+	const f = await resultOnlyRepairFixture(t);
+	const { resultOnlyRepairReviewPrivateFile: _review, ...withoutReview } = f.input;
+	const waiting = await prepareAuthenticatedResumeRequest(withoutReview);
+	assert.deepEqual(waiting.decision,
+		{ kind: "wait", reason: "workflow-repair-plan-required" });
+	assert.equal(waiting.descriptor, undefined);
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	const changes: Array<(receipt: ResultOnlyRepairReviewReceiptV1) => ResultOnlyRepairReviewReceiptV1> = [
+		receipt => ({ ...receipt, prior: { ...receipt.prior,
+			sourceTree: sha40("0") } }),
+		receipt => ({ ...receipt, prior: { ...receipt.prior,
+			carryEnvelopeSha256: "0".repeat(64) } }),
+		receipt => ({ ...receipt, prior: { ...receipt.prior,
+			checkpointSha256: "0".repeat(64) } }),
+		receipt => ({ ...receipt, prior: { ...receipt.prior,
+			pendingActionSha256: "0".repeat(64) } }),
+		receipt => ({ ...receipt, result: { ...receipt.result,
+			artifactId: "9203" } }),
+		receipt => ({ ...receipt, result: { ...receipt.result,
+			archiveSha256: "0".repeat(64) } }),
+		receipt => ({ ...receipt, result: { ...receipt.result,
+			envelopeSha256: "0".repeat(64) } }),
+		receipt => ({ ...receipt, repair: { ...receipt.repair,
+			sha256: "0".repeat(64) } }),
+		receipt => ({ ...receipt, repair: { ...receipt.repair,
+			bytesUtf8: JSON.stringify({ ...f.repairState, stage: "m04-judgment" }) } }),
+	];
+	for (const change of changes) {
+		await writeFile(f.resultOnlyRepairReviewPrivateFile, JSON.stringify(change(f.receipt)));
+		await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error =>
+			error instanceof MissionHostPreparationError &&
+			error.refusal.code === "result-only-repair-review-invalid");
+		assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	}
+});
+
+test("result-only repair requires one live, unexpired result artifact", async t => {
+	for (const fault of ["missing", "expired", "duplicate"] as const) {
+		const f = await resultOnlyRepairFixture(t);
+		const request: typeof fetch = async (url, init) => {
+			if (!String(url).endsWith("/runs/7002/artifacts?per_page=100"))
+				return f.request(url, init);
+			const carry = { id: 9002, name: CARRY_ARTIFACT_NAME,
+				expired: false, workflow_run: { id: 7002 } };
+			const result = { id: 9202, name: MISSION_ARTIFACT,
+				expired: fault === "expired", digest: `sha256:${"9".repeat(64)}`,
+				workflow_run: { id: 7002, head_sha: sourceCommit } };
+			const artifacts = [carry, ...(fault === "missing" ? [] : [result]),
+				...(fault === "duplicate" ? [{ ...result, id: 9203 }] : [])];
+			return new Response(JSON.stringify({ total_count: artifacts.length, artifacts }));
+		};
+		await assert.rejects(prepareAuthenticatedResumeRequest({ ...f.input, request }), error =>
+			error instanceof MissionHostPreparationError &&
+			error.refusal.code === "result-only-repair-result-unavailable");
+		assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	}
+});
+
+test("a changed reviewed repair with its own updated hash cannot bypass the separately reviewed plan", async t => {
+	const f = await resultOnlyRepairFixture(t);
+	const changedBytes = JSON.stringify({ ...f.repairState,
+		planFingerprint: "7".repeat(64) });
+	await writeFile(f.resultOnlyRepairReviewPrivateFile, JSON.stringify({ ...f.receipt,
+		repair: { ...f.receipt.repair, bytesUtf8: changedBytes,
+			sha256: createHash("sha256").update(changedBytes).digest("hex") } }));
+	await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error =>
+		error instanceof MissionHostPreparationError &&
+		error.refusal.code === "workflow-repair-plan-stale");
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+});
+
+test("result-only review rejects nonprivate, linked and repository-local receipts", async t => {
+	for (const fault of ["mode", "symlink", "inside-repo"] as const) {
+		const f = await resultOnlyRepairFixture(t);
+		let receiptFile = f.resultOnlyRepairReviewPrivateFile;
+		if (fault === "mode") await chmod(receiptFile, 0o644);
+		else if (fault === "symlink") {
+			const link = path.join(f.dir, "result-only-link.json");
+			await symlink(receiptFile, link);
+			receiptFile = link;
+		} else receiptFile = path.resolve("src/runner/result-only-repair-review.ts");
+		await assert.rejects(prepareAuthenticatedResumeRequest({ ...f.input,
+			resultOnlyRepairReviewPrivateFile: receiptFile }), error =>
+			error instanceof MissionHostPreparationError &&
+			error.refusal.code === "result-only-repair-review-invalid");
+		assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	}
+});
+
+test("workflow repair rejects nonprivate, symlinked and expanded plan files", async t => {
+	for (const fault of ["mode", "symlink", "inside-repo", "missing-field", "unknown-field", "model-review"] as const) {
+		const f = await repairFixture(t);
+		if (fault === "mode") await chmod(f.input.repairPlanPrivateFile, 0o644);
+		else if (fault === "symlink") {
+			const link = path.join(f.dir, "repair-link.json");
+			await symlink(f.input.repairPlanPrivateFile, link);
+			f.input.repairPlanPrivateFile = link;
+		} else if (fault === "inside-repo") f.input.repairPlanPrivateFile = path.resolve("src/runner/mission-host-adapter.ts");
+		else if (fault === "missing-field") {
+			const { prior: _prior, ...partial } = f.plan;
+			await writeFile(f.input.repairPlanPrivateFile, JSON.stringify(partial));
+		} else await writeFile(f.input.repairPlanPrivateFile, JSON.stringify(fault === "unknown-field" ?
+			{ ...f.plan, scientificTask: "not allowed" } :
+			{ ...f.plan, review: { ...f.plan.review, kind: "model-reviewed" } }));
+		await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error =>
+			error instanceof MissionHostPreparationError && error.refusal.code === "workflow-repair-plan-invalid");
+		await assert.rejects(stat(f.journal.directory), { code: "ENOENT" });
+	}
+});
+
+test("inherited repair telemetry cannot override a different current action stage or strategy", async t => {
+	for (const option of [{ repairActionStage: "objective-assessment" as const },
+		{ repairStrategy: "fresh-context" as const }]) {
+		const f = await repairFixture(t, option);
+		const plan = { ...f.plan, repair: { ...f.plan.repair,
+			state: { ...f.plan.repair.state, strategy: "workflow-repair-needed" } } };
+		await writeFile(f.input.repairPlanPrivateFile, JSON.stringify(plan));
+		await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error =>
+			error instanceof MissionHostPreparationError && error.refusal.code === "workflow-repair-plan-stale");
+		await assert.rejects(stat(f.journal.directory), { code: "ENOENT" });
+	}
+});
+
+test("workflow repair receipt requires the authenticated action stage and evidence reference", async t => {
+	for (const option of [{ omitRepairStage: true }, { omitRepairEvidence: true }]) {
+		const f = await repairFixture(t, option);
+		await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error =>
+			error instanceof MissionHostPreparationError && error.refusal.code === "workflow-repair-plan-stale");
+		await assert.rejects(stat(f.journal.directory), { code: "ENOENT" });
+	}
+});
+
+test("workflow repair review must fit the authenticated stage and failure", async t => {
+	for (const failure of ["invalid-assessment", "malformed-proposal"] as const) {
+		const f = await repairFixture(t, { repairFailure: failure });
+		await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error =>
+			error instanceof MissionHostPreparationError && error.refusal.code === "workflow-repair-review-evidence-invalid");
+		await assert.rejects(stat(f.journal.directory), { code: "ENOENT" });
+	}
+	const f = await repairFixture(t, { repairStage: "objective-assessment" });
+	const plan = { ...f.plan, review: { ...f.plan.review,
+		codeEvidenceRefs: [{ path: "src/m07/objective-progress.ts", symbol: "objectiveProgress" }],
+		offlineTests: { ...f.plan.review.offlineTests,
+			testEvidenceRefs: [{ path: "test/m07-objective-progress.test.ts", name: reviewedTestName }] } } };
+	await writeFile(f.input.repairPlanPrivateFile, JSON.stringify(plan));
+	const request: typeof fetch = async url => {
+		const address = String(url);
+		if (!address.includes("/contents/")) return f.request(url);
+		const parsed = new URL(address);
+		const file = parsed.pathname.split("/contents/")[1]!;
+		const text = file.startsWith("src/") ?
+			`export function objectiveProgress() { return '${parsed.searchParams.get("ref") === sourceCommit ? "prior" : "repaired"}'; }\n` :
+			`test(${JSON.stringify(reviewedTestName)}, () => {});\n`;
+		return new Response(JSON.stringify({ type: "file", path: file, encoding: "base64",
+			size: Buffer.byteLength(text), content: Buffer.from(text).toString("base64") }));
+	};
+	assert.equal((await prepareAuthenticatedResumeRequest({ ...f.input, request })).decision.kind, "dispatch");
+});
+
+test("a physically bounded private repair review may cite more than sixteen relevant facts", async t => {
+	const f = await repairFixture(t);
+	const symbols = Array.from({ length: 17 }, (_, index) => `repairEvidence${index + 1}`);
+	const testNames = Array.from({ length: 17 }, (_, index) => `repair evidence ${index + 1}`);
+	f.reviewEvidence.sourceText += symbols.map(symbol => `export const ${symbol} = true;`).join("\n");
+	f.reviewEvidence.testText += testNames.map(name =>
+		`test(${JSON.stringify(name)}, () => {});`).join("\n");
+	const plan: HostReviewedWorkflowRepairPlanV1 = { ...f.plan, review: { ...f.plan.review,
+		codeEvidenceRefs: [
+			...f.plan.review.codeEvidenceRefs,
+			...symbols.map(symbol => ({ path: reviewedCodePath, symbol }))],
+		offlineTests: { ...f.plan.review.offlineTests,
+			testEvidenceRefs: [
+				...f.plan.review.offlineTests.testEvidenceRefs,
+				...testNames.map(name => ({ path: reviewedTestPath, name }))] } } };
+	await writeFile(f.input.repairPlanPrivateFile, JSON.stringify(plan));
+	const prepared = await prepareAuthenticatedResumeRequest({ ...f.input, readOnly: true });
+	assert.equal(prepared.decision.kind, "dispatch");
+	assert.equal(prepared.descriptor?.message, REUSABLE_RUN_REQUEST_MESSAGE);
+});
+
+test("live authenticated carried action reserves a constant-message empty-tree request", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const result = await prepareAuthenticatedResumeRequest(f.input);
+	assert.equal(result.decision.kind, "dispatch");
+	assert.equal(result.descriptor?.ref, controlRef);
+	assert.equal(result.descriptor?.message, REUSABLE_RUN_REQUEST_MESSAGE);
+	assert.equal(result.descriptor?.tree, testedTree);
+	assert.deepEqual(Object.keys(result.descriptor!).sort(),
+		["expectedBefore", "message", "parents", "previousControlCommit", "ref", "sourceCommit", "tree"]);
+	assert.deepEqual(result.descriptor?.parents, [sourceCommit, priorControlCommit]);
+	assert.equal(result.descriptor?.expectedBefore, priorControlCommit);
+	assert.equal(result.journalKey, result.decision.kind === "dispatch" ?
+		result.decision.intent.idempotencyKey : undefined);
+	assert(!JSON.stringify(result.descriptor).includes("Synthetic original task"));
+	assert(!JSON.stringify(result.descriptor).includes("pendingAction"));
+	const stored = await new MissionResumeJournal(f.journal.directory).get(result.journalKey!);
+	assert.equal(stored?.state, "reserved");
+});
+
+test("accepted old control with no observed run creates a distinct linked private intent", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const old = await prepareAuthenticatedResumeRequest(f.input);
+	assert.equal(old.decision.kind, "dispatch");
+	const review = await oldSourceReviewFixture(f, old.journalKey!);
+	await f.journal.markAttempted(old.journalKey!);
+	f.live.controlTip = requestCommit;
+	f.live.sourceTip = sha40("e");
+	f.live.ciHead = f.live.sourceTip;
+	f.live.ciRunId = 9004;
+	const request: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.includes(`/contents/${review.codePath}?ref=${sourceCommit}`) ||
+			address.includes(`/contents/${review.testPath}?ref=${sourceCommit}`)) {
+			const file = address.includes(review.codePath) ? review.codePath : review.testPath;
+			const body = file === review.codePath ? review.codeText : review.testText;
+			return new Response(JSON.stringify({ type: "file", path: file, encoding: "base64",
+				size: Buffer.byteLength(body), content: Buffer.from(body).toString("base64") }));
+		}
+		if (address.endsWith(`/git/commits/${requestCommit}`))
+			return new Response(JSON.stringify({ sha: requestCommit,
+				tree: { sha: testedTree }, message: REUSABLE_RUN_REQUEST_MESSAGE,
+				parents: [{ sha: sourceCommit }, { sha: priorControlCommit }] }));
+		if (address.includes(`/actions/runs?head_sha=${requestCommit}&per_page=100&page=1`))
+			return new Response(JSON.stringify({ total_count: 0, workflow_runs: [] }));
+		return f.request(url, init);
+	};
+	const linked = await prepareAuthenticatedResumeRequest({ ...f.input, request,
+		linkedUnknownDeliveryOldControlCommit: requestCommit,
+		unobservedControlSourceReviewPrivateFile: review.file });
+	assert.equal(linked.decision.kind, "dispatch");
+	assert.notEqual(linked.journalKey, old.journalKey);
+	assert.equal(linked.descriptor?.expectedBefore, requestCommit);
+	assert.deepEqual(linked.descriptor?.parents, [f.live.sourceTip, requestCommit]);
+	assert.equal((await f.journal.get(old.journalKey!))?.state, "delivery-unknown");
+	assert.equal((await f.journal.get(linked.journalKey!))?.intentBinding.linkedUnknownDelivery?.oldJournalKey,
+		old.journalKey);
+	assert(!JSON.stringify(linked.descriptor).includes(old.journalKey!));
+	assert(!JSON.stringify(linked.descriptor).includes("unknown-unreconciled"));
+	const restarted = new MissionResumeJournal(f.journal.directory);
+	assert.equal((await restarted.unresolvedForRef(controlRef))?.idempotencyKey, linked.journalKey);
+	await restarted.reconcileNotDelivered(linked.journalKey!, {
+		kind: "read-only-not-delivered", controlRef, observedHead: requestCommit,
+		matchingRunCount: 0, pendingDeliveryExcluded: true });
+	assert.equal((await restarted.unresolvedForRef(controlRef))?.idempotencyKey, old.journalKey);
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...f.input, request }),
+		/linked|different binding|uncertain/);
+});
+
+test("linked recovery refuses an observed old Actions run", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const old = await prepareAuthenticatedResumeRequest(f.input);
+	const review = await oldSourceReviewFixture(f, old.journalKey!);
+	await f.journal.markAttempted(old.journalKey!);
+	f.live.controlTip = requestCommit;
+	f.live.sourceTip = sha40("e");
+	f.live.ciHead = f.live.sourceTip;
+	f.live.ciRunId = 9004;
+	const request: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.includes(`/contents/${review.codePath}?ref=${sourceCommit}`) ||
+			address.includes(`/contents/${review.testPath}?ref=${sourceCommit}`)) {
+			const file = address.includes(review.codePath) ? review.codePath : review.testPath;
+			const body = file === review.codePath ? review.codeText : review.testText;
+			return new Response(JSON.stringify({ type: "file", path: file, encoding: "base64",
+				size: Buffer.byteLength(body), content: Buffer.from(body).toString("base64") }));
+		}
+		if (address.endsWith(`/git/commits/${requestCommit}`))
+			return new Response(JSON.stringify({ sha: requestCommit,
+				tree: { sha: testedTree }, message: REUSABLE_RUN_REQUEST_MESSAGE,
+				parents: [{ sha: sourceCommit }, { sha: priorControlCommit }] }));
+		if (address.includes(`/actions/runs?head_sha=${requestCommit}&per_page=100&page=1`))
+			return new Response(JSON.stringify({ total_count: 1,
+				workflow_runs: [{ id: 9910, head_sha: requestCommit }] }));
+		return f.request(url, init);
+	};
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...f.input, request,
+		linkedUnknownDeliveryOldControlCommit: requestCommit,
+		unobservedControlSourceReviewPrivateFile: review.file }), error =>
+		error instanceof MissionHostPreparationError &&
+		error.refusal.code === "linked-unknown-delivery-observed-run");
+	assert.equal((await f.journal.get(old.journalKey!))?.state, "ref-update-attempted");
+});
+
+test("host links two consecutive accepted zero-run control commits in order", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const first = await prepareAuthenticatedResumeRequest(f.input);
+	await f.journal.markAttempted(first.journalKey!);
+	const firstReview = await oldSourceReviewFixture(f, first.journalKey!);
+	const accepted = new Map<string, { tree: string; parents: readonly string[] }>([
+		[requestCommit, { tree: testedTree, parents: [sourceCommit, priorControlCommit] }]
+	]);
+	const reviews = new Map<string, Awaited<ReturnType<typeof oldSourceReviewFixture>>>([
+		[firstReview.oldSourceCommit, firstReview]
+	]);
+	const request: typeof fetch = async (url, init) => {
+		const address = String(url);
+		for (const [commit, review] of reviews) {
+			if (address.includes(`/contents/${review.codePath}?ref=${commit}`) ||
+				address.includes(`/contents/${review.testPath}?ref=${commit}`)) {
+				const file = address.includes(review.codePath) ? review.codePath : review.testPath;
+				const body = file === review.codePath ? review.codeText : review.testText;
+				return new Response(JSON.stringify({ type: "file", path: file,
+					encoding: "base64", size: Buffer.byteLength(body),
+					content: Buffer.from(body).toString("base64") }));
+			}
+		}
+		for (const [commit, fact] of accepted) {
+			if (address.endsWith(`/git/commits/${commit}`))
+				return new Response(JSON.stringify({ sha: commit, tree: { sha: fact.tree },
+					message: REUSABLE_RUN_REQUEST_MESSAGE,
+					parents: fact.parents.map(sha => ({ sha })) }));
+			if (address.includes(`/actions/runs?head_sha=${commit}&per_page=100&page=1`))
+				return new Response(JSON.stringify({ total_count: 0, workflow_runs: [] }));
+		}
+		return f.request(url, init);
+	};
+	f.live.controlTip = requestCommit;
+	f.live.sourceTip = sha40("e");
+	f.live.ciHead = f.live.sourceTip;
+	f.live.ciRunId = 9004;
+	const second = await prepareAuthenticatedResumeRequest({ ...f.input, request,
+		linkedUnknownDeliveryOldControlCommit: requestCommit,
+		unobservedControlSourceReviewPrivateFile: firstReview.file });
+	assert.equal(second.decision.kind, "dispatch");
+	await f.journal.markAttempted(second.journalKey!);
+	const secondControlCommit = sha40("1");
+	accepted.set(secondControlCommit, { tree: testedTree,
+		parents: [f.live.sourceTip, requestCommit] });
+	const secondReview = await oldSourceReviewFixture(f, second.journalKey!, secondControlCommit);
+	reviews.set(secondReview.oldSourceCommit, secondReview);
+	f.live.controlTip = secondControlCommit;
+	f.live.sourceTip = sha40("2");
+	f.live.ciHead = f.live.sourceTip;
+	f.live.ciRunId = 9005;
+	const third = await prepareAuthenticatedResumeRequest({ ...f.input, request,
+		linkedUnknownDeliveryOldControlCommit: secondControlCommit,
+		unobservedControlSourceReviewPrivateFile: secondReview.file });
+	assert.equal(third.decision.kind, "dispatch");
+	if (third.decision.kind !== "dispatch") return;
+	assert.deepEqual(third.decision.intent.linkedUnknownDelivery?.ancestry, [
+		{ oldJournalKey: first.journalKey, oldControlCommit: requestCommit },
+		{ oldJournalKey: second.journalKey, oldControlCommit: secondControlCommit }
+	]);
+	assert.equal((await f.journal.get(first.journalKey!))?.state, "delivery-unknown");
+	assert.equal((await f.journal.get(second.journalKey!))?.state, "delivery-unknown");
+	assert.equal((await f.journal.unresolvedForRef(controlRef))?.idempotencyKey, third.journalKey);
+});
+
+test("authenticated linked successor carry releases its old UNKNOWN dispatch block", async t => {
+	const oldSource = sha40("e");
+	const f = await fixture(t, { carriedAction: true, controlRequest: true,
+		oldControlSource: oldSource });
+	const authenticated = await authenticateLatestTerminalCarry(f.input);
+	assert.deepEqual(authenticatedTerminalUnknownControlDeliveries(authenticated.proof,
+		authenticated.privateBundle)?.map(row => row.controlCommit), [priorControlCommit]);
+	const planned = await prepareAuthenticatedResumeRequest({ ...f.input, readOnly: true });
+	assert.equal(planned.decision.kind, "dispatch");
+	if (planned.decision.kind !== "dispatch") return;
+	const old = rekeyIntent({ ...planned.decision.intent,
+		source: { runId: "7001", runAttempt: 1, commit: sha40("a") } });
+	const oldBinding: TestedControlBinding = { controlRef, message: REUSABLE_RUN_REQUEST_MESSAGE,
+		testedSourceCommit: oldSource, testedTree,
+		successfulCi: { workflow: "workflow-regression.yml", runId: "9010",
+			runAttempt: 1, headCommit: oldSource, conclusion: "success" as const },
+		previousControlCommit: null, expectedBefore: null,
+		parents: [oldSource], sourceRef, sourceRefTip: oldSource };
+	await f.journal.reserve(old, oldBinding);
+	await f.journal.markAttempted(old.idempotencyKey);
+	const linkedUnknownDelivery: NonNullable<ResumeIntent["linkedUnknownDelivery"]> = {
+		version: 1, kind: "host-verified-linked-unknown-delivery",
+		oldJournalKey: old.idempotencyKey, oldControlCommit: priorControlCommit,
+		oldSourceReviewReceiptSha256: createHash("sha256").update("old review").digest("hex"),
+		ancestry: [{ oldJournalKey: old.idempotencyKey, oldControlCommit: priorControlCommit }],
+		oldTestedSourceCommit: oldSource, oldTestedTree: testedTree,
+		liveControlHead: priorControlCommit,
+		census: { kind: "authenticated-complete-actions-run-census", headCommit: priorControlCommit,
+			totalCount: 0, pagesRead: 1,
+			sha256: createHash("sha256").update("old census").digest("hex") },
+		newTestedSourceCommit: sourceCommit, newTestedTree: testedTree,
+		newSuccessfulCi: { workflow: "workflow-regression.yml", runId: "9003",
+			runAttempt: 1, headCommit: sourceCommit, conclusion: "success" },
+		sourceRefTip: sourceCommit,
+		accounting: "unquantified", effects: "unknown-unreconciled" };
+	const linked = rekeyIntent({ ...old, linkedUnknownDelivery });
+	const linkedBinding = { ...oldBinding, testedSourceCommit: sourceCommit,
+		successfulCi: linkedUnknownDelivery.newSuccessfulCi,
+		previousControlCommit: priorControlCommit, expectedBefore: priorControlCommit,
+		parents: [sourceCommit, priorControlCommit], sourceRefTip: sourceCommit };
+	await f.journal.reserve(linked, linkedBinding);
+	await f.journal.markAttempted(linked.idempotencyKey);
+	await f.journal.acknowledge(linked.idempotencyKey, {
+		kind: "read-only-accepted-control", controlRef, controlCommit: requestCommit,
+		tree: testedTree, parents: linkedBinding.parents,
+		message: REUSABLE_RUN_REQUEST_MESSAGE, successorRunId: "7002" });
+	assert.equal((await f.journal.unresolvedForRef(controlRef))?.idempotencyKey, old.idempotencyKey);
+	await f.journal.markUnknownLineageCarried(linked.idempotencyKey, authenticated);
+	assert.equal((await f.journal.get(old.idempotencyKey))?.state, "delivery-unknown");
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	const nextBinding = { ...linkedBinding, previousControlCommit: requestCommit,
+		expectedBefore: requestCommit, parents: [sourceCommit, requestCommit] };
+	const next = await f.journal.reserve(planned.decision.intent, nextBinding);
+	assert.equal(next.state, "reserved");
+	await f.journal.markAttempted(next.idempotencyKey);
+	const secondOldControl = sha40("8"), secondCarrierCommit = sha40("7");
+	const secondSource = sha40("9"), secondTree = sha40("6");
+	const secondCurrent: CurrentMissionRun = { ...f.input.source,
+		runId: "7003", sha: secondCarrierCommit, before: secondOldControl };
+	const priorRun = { ...run(7002, 2, "completed", requestCommit, "failure"),
+		event: "push", head_branch: "run-requests/workflow-learning-reliability",
+		head_commit: { message: REUSABLE_RUN_REQUEST_MESSAGE } };
+	let terminal = false;
+	const secondRequest: typeof fetch = async (url, init) => {
+		const address = String(url);
+		const activeRun = { ...run(7003, 3, terminal ? "completed" : "in_progress",
+			secondCarrierCommit, terminal ? "failure" : undefined),
+			event: "push", head_branch: "run-requests/workflow-learning-reliability",
+			head_commit: { message: REUSABLE_RUN_REQUEST_MESSAGE } };
+		if (address.includes("/workflows/manual-private-campaign.yml/runs?")) {
+			const head = new URL(address).searchParams.get("head_sha");
+			const rows = head === secondOldControl || head === priorControlCommit ? [] :
+				head === requestCommit ? [priorRun] :
+				[activeRun, priorRun, run(7001, 1, "completed", sha40("a"), "success")];
+			return new Response(JSON.stringify({ total_count: rows.length, workflow_runs: rows }));
+		}
+		if (address.endsWith("/git/ref/heads/improve/workflow-learning-reliability"))
+			return new Response(JSON.stringify({ object: { type: "commit", sha: secondSource } }));
+		if (address.endsWith("/git/ref/heads/run-requests/workflow-learning-reliability"))
+			return new Response(JSON.stringify({ object: { type: "commit", sha: secondCarrierCommit } }));
+		const commits = new Map<string, { tree: string; parents: string[]; message?: string }>([
+			[secondCarrierCommit, { tree: secondTree, parents: [secondSource, secondOldControl],
+				message: REUSABLE_RUN_REQUEST_MESSAGE }],
+			[secondOldControl, { tree: testedTree, parents: [sourceCommit, requestCommit],
+				message: REUSABLE_RUN_REQUEST_MESSAGE }],
+			[requestCommit, { tree: testedTree, parents: [sourceCommit, priorControlCommit],
+				message: REUSABLE_RUN_REQUEST_MESSAGE }],
+			[secondSource, { tree: secondTree, parents: [] }]
+		]);
+		for (const [commit, fact] of commits)
+			if (address.endsWith(`/git/commits/${commit}`))
+				return new Response(JSON.stringify({ sha: commit, tree: { sha: fact.tree },
+					parents: fact.parents.map(sha => ({ sha })), message: fact.message }));
+		if (address.includes("/workflows/workflow-regression.yml/runs?")) {
+			const head = new URL(address).searchParams.get("head_sha");
+			return new Response(JSON.stringify({ workflow_runs: [{ head_sha: head,
+				head_branch: "improve/workflow-learning-reliability", event: "push",
+				run_attempt: 1, status: "completed", conclusion: "success" }] }));
+		}
+		if (address.endsWith("/runs/7003")) return new Response(JSON.stringify(activeRun));
+		if (address.endsWith("/runs/7003/artifacts?per_page=100"))
+			return new Response(JSON.stringify({ total_count: 1, artifacts: [{ id: 9003,
+				name: CARRY_ARTIFACT_NAME, expired: false,
+				workflow_run: { id: 7003, head_sha: secondCarrierCommit } }] }));
+		if (address.endsWith("/runs/7003/jobs?per_page=100"))
+			return new Response(JSON.stringify({ total_count: 1, jobs: [{ id: 6003,
+				run_id: 7003, run_attempt: 1, head_sha: secondCarrierCommit,
+				name: "private-campaign", status: "completed", conclusion: "failure",
+				steps: [{ name: "Run bounded private campaign", status: "completed",
+					conclusion: "success" }] }] }));
+		return f.request(url, init);
+	};
+	const secondOpening = await openLedgerContinuation({
+		seedEnvelopeB64: f.input.seedEnvelopeB64,
+		publicKeyFile: f.input.publicKeyFile,
+		expectedSpkiSha256: f.input.expectedSpkiSha256,
+		githubToken: f.input.githubToken, current: secondCurrent,
+		request: secondRequest, loadCarryArtifact: async () => f.sealed });
+	assert.deepEqual(secondOpening.unobservedControlDeliveries.map(row => row.controlCommit),
+		[priorControlCommit, secondOldControl]);
+	const secondCarry = secondOpening.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: { version: 3,
+			kind: "accounting-only-request-audit", requests: [], settledCny: 0,
+			unknownObservedCny: 0, unpricedRequestCount: 0 } });
+	terminal = true;
+	const secondAuthenticated = await authenticateLatestTerminalCarry({
+		seedEnvelopeB64: f.input.seedEnvelopeB64,
+		publicKeyFile: f.input.publicKeyFile,
+		expectedSpkiSha256: f.input.expectedSpkiSha256,
+		githubToken: f.input.githubToken, source: secondCurrent,
+		request: secondRequest, loadCarryArtifact: async ({ runId }) => runId === "7003" ?
+			secondCarry : f.sealed });
+	assert.deepEqual(authenticatedTerminalUnknownControlDeliveries(secondAuthenticated.proof,
+		secondAuthenticated.privateBundle)?.map(row => row.controlCommit),
+		[priorControlCommit, secondOldControl]);
+	await assert.rejects(f.journal.markUnknownLineageCarried(linked.idempotencyKey,
+		secondAuthenticated), /does not seal/);
+	const secondLink: NonNullable<ResumeIntent["linkedUnknownDelivery"]> = {
+		...linkedUnknownDelivery, oldJournalKey: next.idempotencyKey,
+		oldControlCommit: secondOldControl, oldTestedSourceCommit: sourceCommit,
+		oldSourceReviewReceiptSha256: createHash("sha256").update("second review").digest("hex"),
+		ancestry: [{ oldJournalKey: next.idempotencyKey, oldControlCommit: secondOldControl }],
+		liveControlHead: secondOldControl,
+		census: { ...linkedUnknownDelivery.census, headCommit: secondOldControl },
+		newTestedSourceCommit: secondSource, newTestedTree: secondTree,
+		newSuccessfulCi: { workflow: "workflow-regression.yml", runId: "9011",
+			runAttempt: 1, headCommit: secondSource, conclusion: "success" },
+		sourceRefTip: secondSource };
+	const secondLinked = rekeyIntent({ ...planned.decision.intent,
+		linkedUnknownDelivery: secondLink });
+	const secondBinding: TestedControlBinding = { ...nextBinding,
+		testedSourceCommit: secondSource, testedTree: secondTree,
+		successfulCi: secondLink.newSuccessfulCi,
+		previousControlCommit: secondOldControl, expectedBefore: secondOldControl,
+		parents: [secondSource, secondOldControl], sourceRefTip: secondSource };
+	await f.journal.reserve(secondLinked, secondBinding);
+	await f.journal.markAttempted(secondLinked.idempotencyKey);
+	await f.journal.acknowledge(secondLinked.idempotencyKey, {
+		kind: "read-only-accepted-control", controlRef,
+		controlCommit: secondCarrierCommit, tree: secondTree,
+		parents: secondBinding.parents, message: REUSABLE_RUN_REQUEST_MESSAGE,
+		successorRunId: "7003" });
+	assert.equal((await f.journal.unresolvedForRef(controlRef))?.idempotencyKey,
+		next.idempotencyKey);
+	await f.journal.markUnknownLineageCarried(secondLinked.idempotencyKey, secondAuthenticated);
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	const shadow = new MissionResumeJournal(path.join(f.dir, "wrong-lineage-journal"));
+	await shadow.reserve(planned.decision.intent, nextBinding);
+	await shadow.markAttempted(next.idempotencyKey);
+	const wrongOldControl = sha40("0");
+	const wrongLink: NonNullable<ResumeIntent["linkedUnknownDelivery"]> = {
+		...secondLink, oldControlCommit: wrongOldControl, liveControlHead: wrongOldControl,
+		ancestry: [{ oldJournalKey: next.idempotencyKey, oldControlCommit: wrongOldControl }],
+		census: { ...secondLink.census, headCommit: wrongOldControl } };
+	const wrongIntent = rekeyIntent({ ...planned.decision.intent,
+		linkedUnknownDelivery: wrongLink });
+	const wrongBinding: TestedControlBinding = { ...secondBinding,
+		previousControlCommit: wrongOldControl, expectedBefore: wrongOldControl,
+		parents: [secondSource, wrongOldControl] };
+	await shadow.reserve(wrongIntent, wrongBinding);
+	await shadow.markAttempted(wrongIntent.idempotencyKey);
+	await shadow.acknowledge(wrongIntent.idempotencyKey, {
+		kind: "read-only-accepted-control", controlRef,
+		controlCommit: secondCarrierCommit, tree: secondTree,
+		parents: wrongBinding.parents, message: REUSABLE_RUN_REQUEST_MESSAGE,
+		successorRunId: "7003" });
+	await assert.rejects(shadow.markUnknownLineageCarried(wrongIntent.idempotencyKey,
+		secondAuthenticated), /does not seal/);
+});
+
+test("a legacy unknown operation gets a current host decision bound to the exact old checkpoint", async t => {
+	const f = await fixture(t, { unknownOperation: true });
+	const oldBytes = f.bundle["objective-checkpoint.json"];
+	const result = await prepareAuthenticatedResumeRequest(f.input);
+	assert.equal(result.decision.kind, "dispatch");
+	if (result.decision.kind !== "dispatch") return;
+	assert.deepEqual(result.decision.intent.quarantinedOperationRefs, ["old-goal/O001"]);
+	assert.equal(result.decision.intent.actionKind, "reconcile-m07-operation");
+	assert.equal(result.decision.intent.actionProvenance?.kind, "current-host-derived");
+	assert.equal(result.decision.intent.actionProvenance?.kind === "current-host-derived" ?
+		result.decision.intent.actionProvenance.checkpointSha256 : undefined,
+		createHash("sha256").update(oldBytes).digest("hex"));
+	assert.equal(f.bundle["objective-checkpoint.json"], oldBytes);
+	const provenance = (await f.journal.get(result.journalKey!))?.intentBinding.actionProvenance;
+	assert.equal(provenance?.kind === "current-host-derived" ? provenance.checkpointSha256 : undefined,
+		result.decision.intent.actionProvenance?.kind === "current-host-derived" ?
+			result.decision.intent.actionProvenance.checkpointSha256 : undefined);
+});
+
+test("authenticated read-only planning never creates a journal reservation", async t => {
+	const f = await fixture(t, { unknownOperation: true, controlRequest: true });
+	const result = await prepareAuthenticatedResumeRequest({ ...f.input, readOnly: true });
+	assert.equal(result.decision.kind, "dispatch");
+	assert.equal(result.descriptor?.message, REUSABLE_RUN_REQUEST_MESSAGE);
+	assert.equal(result.journalKey, undefined);
+	await assert.rejects(stat(f.journal.directory), { code: "ENOENT" });
+});
+
+test("a completed reusable control request authenticates before preparing its next descriptor", async t => {
+	const f = await fixture(t, { unknownOperation: true, controlRequest: true });
+	const result = await prepareAuthenticatedResumeRequest(f.input);
+	assert.equal(result.decision.kind, "dispatch");
+	if (result.decision.kind !== "dispatch") return;
+	assert.equal(result.decision.intent.source.commit, requestCommit);
+	assert.equal(result.descriptor?.sourceCommit, sourceCommit);
+	assert.deepEqual(result.descriptor?.parents, [sourceCommit, priorControlCommit]);
+	assert.deepEqual(result.decision.intent.quarantinedOperationRefs, ["old-goal/O001"]);
+});
+
+test("missing host reason leaves the carry without a dispatch reservation", async t => {
+	const f = await fixture(t, { stopReason: "assessment-failed" });
+	const result = await prepareAuthenticatedResumeRequest(f.input);
+	assert.equal(result.decision.kind, "restore-evidence");
+	assert.equal(result.descriptor, undefined);
+	assert.equal(result.journalKey, undefined);
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+});
+
+test("stale source and unsuccessful CI reads fail closed before a reservation", async t => {
+	for (const alter of [
+		(state: LiveState) => { state.sourceTip = sha40("e"); },
+		(state: LiveState) => { state.ciHead = sha40("e"); },
+		(state: LiveState) => { state.ciConclusion = "failure"; },
+		(state: LiveState) => { state.ciStatus = "in_progress"; },
+	]) {
+		const f = await fixture(t, { carriedAction: true });
+		alter(f.live);
+		await assert.rejects(prepareAuthenticatedResumeRequest(f.input));
+		assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	}
+});
+
+test("host preparation retains fixed CI-pending, failed, and absent causes privately", async t => {
+	for (const [alter, expected] of [
+		[(state: LiveState) => { state.ciStatus = "in_progress"; state.ciConclusion = null; },
+			"source-ci-pending"],
+		[(state: LiveState) => { state.ciConclusion = "failure"; },
+			"source-ci-completed-without-success"],
+		[(state: LiveState) => { state.ciCount = 0; }, "source-ci-run-absent"],
+	] as const) {
+		const f = await fixture(t, { carriedAction: true });
+		alter(f.live);
+		await assert.rejects(prepareAuthenticatedResumeRequest(f.input), error => {
+			assert(error instanceof MissionHostPreparationError);
+			assert.equal(error.refusal.code, expected);
+			const privateDiagnostic = privateHostPreparationDiagnostic(error);
+			assert.equal(privateDiagnostic.code, expected);
+			assert.equal(privateDiagnostic.stage, "tested-source-ci");
+			if (expected === "source-ci-pending") {
+				assert.equal(privateDiagnostic.ciStatus, "in_progress");
+				assert.equal(privateDiagnostic.ciRunId, "9003");
+				assert.equal(privateDiagnostic.ciConclusion, null);
+			}
+			if (expected === "source-ci-completed-without-success")
+				assert.equal(privateDiagnostic.ciConclusion, "failure");
+			assert.doesNotMatch(JSON.stringify(privateDiagnostic), /Synthetic original task|synthetic candidate/);
+			return true;
+		});
+		assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	}
+});
+
+test("an unbranded claim cannot replace live carry authentication", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const outer = JSON.parse(Buffer.from(f.sealed.envelopeB64, "base64").toString("utf8"));
+	outer.tag = `${outer.tag[0] === "A" ? "B" : "A"}${outer.tag.slice(1)}`;
+	const broken = Buffer.from(JSON.stringify(outer)).toString("base64");
+	const forged = { ...f.input,
+		proof: { kind: "authenticated-terminal-mission-carry" },
+		privateBundle: f.bundle, loadCarryArtifact: async () => broken };
+	await assert.rejects(prepareAuthenticatedResumeRequest(forged));
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+});
+
+test("the live control ref and CI must still match a prior reservation", async t => {
+	for (const alter of [
+		(state: LiveState) => { state.controlTip = sha40("e"); },
+		(state: LiveState) => { state.sourceTip = sha40("e"); state.ciHead = sha40("e"); },
+	]) {
+		const f = await fixture(t, { carriedAction: true });
+		const first = await prepareAuthenticatedResumeRequest(f.input);
+		assert.equal(first.journalState, "reserved");
+		alter(f.live);
+		await assert.rejects(prepareAuthenticatedResumeRequest(f.input));
+		assert.equal((await f.journal.get(first.journalKey!))?.state, "reserved");
+	}
+});
+
+test("a repeated request returns the durable reservation and never replaces an attempted update", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const first = await prepareAuthenticatedResumeRequest(f.input);
+	assert.equal(first.decision.kind, "dispatch");
+	const second = await prepareAuthenticatedResumeRequest(f.input);
+	assert.equal(second.journalKey, first.journalKey);
+	assert.deepEqual(second.decision, { kind: "wait", reason: "dispatch-reserved",
+		idempotencyKey: first.journalKey });
+	assert.equal(second.descriptor, undefined);
+	assert.equal((await f.journal.get(first.journalKey!))?.state, "reserved");
+	await f.journal.markAttempted(first.journalKey!);
+	const third = await prepareAuthenticatedResumeRequest(f.input);
+	assert.equal(third.descriptor, undefined);
+	assert.deepEqual(third.decision, { kind: "wait", reason: "dispatch-delivery-unknown",
+		idempotencyKey: first.journalKey });
+	assert.equal((await f.journal.get(first.journalKey!))?.state, "ref-update-attempted");
+	const stored = await readFile(path.join(f.journal.directory, `${first.journalKey}.json`), "utf8");
+	assert(!stored.includes("Synthetic original task"));
+});
+
+test("reserved descriptor recovery requires the same authenticated journal state", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...f.input,
+		readOnly: true, recoverReservedDescriptor: true }), error =>
+		privateHostPreparationDiagnostic(error).code === "reserved-descriptor-recovery-requires-journal");
+	await assert.rejects(prepareAuthenticatedResumeRequest({ ...f.input,
+		recoverReservedDescriptor: true }), error =>
+		privateHostPreparationDiagnostic(error).code === "reserved-descriptor-missing");
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	const first = await prepareAuthenticatedResumeRequest(f.input);
+	const recovered = await prepareAuthenticatedResumeRequest({ ...f.input,
+		recoverReservedDescriptor: true });
+	assert.deepEqual(recovered.descriptor, first.descriptor);
+	assert.deepEqual(recovered.decision, { kind: "wait", reason: "dispatch-reserved",
+		idempotencyKey: first.journalKey });
+	assert.equal((await f.journal.get(first.journalKey!))?.state, "reserved");
+	await f.journal.markAttempted(first.journalKey!);
+	const uncertain = await prepareAuthenticatedResumeRequest({ ...f.input,
+		recoverReservedDescriptor: true });
+	assert.equal(uncertain.descriptor, undefined);
+	assert.equal(uncertain.decision.kind, "wait");
+	assert.equal((await f.journal.get(first.journalKey!))?.state, "ref-update-attempted");
+});
+
+async function runStdioBridge(f: Awaited<ReturnType<typeof fixture>> |
+	Awaited<ReturnType<typeof interruptedFixture>>,
+	options: { wrongArtifactDigest?: boolean; readOnly?: boolean;
+		outputPrivate?: string; recoverReserved?: boolean;
+		repairPlanPrivateFile?: string;
+		resultOnlyRepairReviewPrivateFile?: string;
+		providerAvailabilityReceiptPrivateFile?: string;
+		providerAvailabilityEnvelopeBytes?: Buffer;
+		providerProbe?: { runId: string; artifactId: string; archiveSha256: string };
+		wrongProviderArchiveEcho?: boolean;
+		resultEnvelopeBytes?: Buffer; wrongResultArchiveEcho?: boolean;
+		resultArchiveBytes?: Buffer; resultArtifactArchiveSha256?: string;
+		wrongResultFileDigest?: boolean;
+		interruptedSourceReviewPrivateFile?: string;
+		terminalPrefixSourceReviewPrivateFile?: string;
+		linkedUnknownDeliveryOldControlCommit?: string;
+		unobservedControlSourceReviewPrivateFile?: string;
+		request?: typeof fetch;
+		prefixOnly?: { runId: string; artifactId: string; raw: string; archiveSha256: string };
+		multipart?: { runId: string; rootArtifactId: string; rootArchiveSha256: string;
+			indexRaw: string; parts: Array<{ artifactId: string; archiveSha256: string;
+				artifactName: string; fileName: string; bytes: Buffer }>;
+			partFault?: "changed-bytes" | "wrong-name" };
+		prefixText?: string; archiveSha256?: string; wrongArchiveEcho?: boolean;
+		sidecarFault?: "missing" | "duplicate" | "tamper" } = {}) {
+	const sourceFile = path.join(f.dir, "source.json");
+	const seedFile = path.join(f.dir, "seed.txt");
+	const artifactFile = path.join(f.dir, "carry.json");
+	const outputPrivate = options.outputPrivate ?? path.join(f.dir, "prepared-private.json");
+	await writeFile(sourceFile, JSON.stringify(f.input.source), { mode: 0o600 });
+	await writeFile(seedFile, f.input.seedEnvelopeB64!, { mode: 0o600 });
+	const artifactBytes = JSON.stringify({ envelopeB64: f.sealed.envelopeB64 });
+	await writeFile(artifactFile, artifactBytes, { mode: 0o600 });
+	const artifactSha256 = createHash("sha256").update(artifactBytes).digest("hex");
+	const resultEnvelopeFile = options.resultEnvelopeBytes ? path.join(f.dir,
+		"private-campaign-outcome.enc.json") : undefined;
+	if (resultEnvelopeFile) await writeFile(resultEnvelopeFile, options.resultEnvelopeBytes!, { mode: 0o600 });
+	const resultArchiveFile = options.resultArchiveBytes ? path.join(f.dir,
+		"private-original-result.zip") : undefined;
+	if (resultArchiveFile) await writeFile(resultArchiveFile, options.resultArchiveBytes!,
+		{ mode: 0o600 });
+	const providerEnvelopeFile = options.providerAvailabilityEnvelopeBytes ? path.join(f.dir,
+		"provider-balance.enc.json") : undefined;
+	if (providerEnvelopeFile)
+		await writeFile(providerEnvelopeFile, options.providerAvailabilityEnvelopeBytes!, { mode: 0o600 });
+	const prefixOnlyFile = options.prefixOnly ? path.join(f.dir, "prefix-only.json") : undefined;
+	if (prefixOnlyFile) await writeFile(prefixOnlyFile, options.prefixOnly!.raw, { mode: 0o600 });
+	const multipartIndexFile = options.multipart ? path.join(f.dir, "multipart-index.enc.json") : undefined;
+	if (multipartIndexFile) await writeFile(multipartIndexFile, options.multipart!.indexRaw,
+		{ mode: 0o600 });
+	const multipartParts = options.multipart ? await Promise.all(options.multipart.parts.map(async (item, index) => {
+		const file = path.join(f.dir, `multipart-part-${index}.bin`);
+		const bytes = Buffer.from(item.bytes);
+		if (options.multipart?.partFault === "changed-bytes" && index === 0) bytes[0] ^= 1;
+		await writeFile(file, bytes, { mode: 0o600 });
+		return { ...item, file, bytes };
+	})) : [];
+	let prefixReference: { name: string; file: string; sha256: string } | undefined;
+	if (options.prefixText !== undefined) {
+		const file = path.join(f.dir, "incremental-control-prefix.json");
+		await writeFile(file, options.prefixText, { mode: 0o600 });
+		prefixReference = { name: "incremental-control-prefix.json", file,
+			sha256: createHash("sha256").update(options.prefixText).digest("hex") };
+	}
+	const sidecarReferences = await Promise.all(Object.entries(f.sealed.sidecars).map(async ([name, value]) => {
+		const file = path.join(f.dir, name);
+		await writeFile(file, value, { mode: 0o600 });
+		return { name, file, sha256: createHash("sha256").update(value).digest("hex") };
+	}));
+	if (options.sidecarFault === "tamper" && sidecarReferences.length) {
+		const first = sidecarReferences[0]!;
+		const ciphertext = Buffer.from(f.sealed.sidecars[first.name]!, "base64");
+		ciphertext[20] ^= 1;
+		const tampered = ciphertext.toString("base64");
+		await writeFile(first.file, tampered);
+		first.sha256 = createHash("sha256").update(tampered).digest("hex");
+	}
+	const script = path.resolve("scripts/prepare-authenticated-private-resume.ts");
+	const wrapper = `import { runPrivateResumeBridge } from ${JSON.stringify(pathToFileURL(script).href)};\n` +
+		`runPrivateResumeBridge(process.argv.slice(1), { expectedSpkiSha256: ` +
+		`${JSON.stringify(f.input.expectedSpkiSha256)} }).catch(() => { ` +
+		`process.stderr.write("private resume preparation failed\\n"); process.exitCode = 1; });`;
+	const child = spawn(process.execPath, ["--input-type=module", "-e", wrapper, "--",
+		"--source", sourceFile, "--seed", seedFile,
+		"--public-key", f.input.publicKeyFile, "--journal-dir", f.journal.directory,
+		"--output-private", outputPrivate, "--connector-stdio",
+		...(options.recoverReserved ? ["--recover-reserved"] : []),
+		...(options.repairPlanPrivateFile ? ["--repair-plan-private", options.repairPlanPrivateFile] : []),
+		...(options.resultOnlyRepairReviewPrivateFile ?
+			["--result-only-repair-review-private", options.resultOnlyRepairReviewPrivateFile] : []),
+		...(options.providerAvailabilityReceiptPrivateFile ?
+			["--provider-availability-receipt-private",
+				options.providerAvailabilityReceiptPrivateFile] : []),
+		...(options.interruptedSourceReviewPrivateFile ?
+			["--interrupted-source-review-private", options.interruptedSourceReviewPrivateFile] : []),
+		...(options.terminalPrefixSourceReviewPrivateFile ?
+			["--terminal-prefix-source-review-private",
+				options.terminalPrefixSourceReviewPrivateFile] : []),
+		...(options.linkedUnknownDeliveryOldControlCommit ?
+			["--linked-unknown-control-commit", options.linkedUnknownDeliveryOldControlCommit] : []),
+		...(options.unobservedControlSourceReviewPrivateFile ?
+			["--unobserved-control-source-review-private",
+				options.unobservedControlSourceReviewPrivateFile] : []),
+		...(options.readOnly ? ["--read-only"] : [])],
+		{ cwd: path.dirname(path.dirname(script)), stdio: ["pipe", "pipe", "pipe"] });
+	let stderr = "";
+	child.stderr.setEncoding("utf8");
+	child.stderr.on("data", chunk => { stderr += String(chunk); });
+	const closed = once(child, "close");
+	const lines: unknown[] = [];
+	for await (const line of createInterface({ input: child.stdout, crlfDelay: Infinity })) {
+		const row = JSON.parse(line) as { kind: string; id?: number; url?: string;
+			runId?: string; artifactId?: string; expectedArchiveSha256?: string;
+			expectedArtifactName?: string; name?: string };
+		lines.push(row);
+		if (row.kind === "github-get") {
+			assert.equal(typeof row.url, "string");
+			assert(row.url!.startsWith(`https://api.github.com/repos/${MISSION_REPOSITORY}/`));
+			const response = await (options.request ?? f.request)(row.url!);
+			child.stdin.write(`${JSON.stringify({ id: row.id, status: response.status,
+				body: JSON.parse(await response.text()) })}\n`);
+		} else if (row.kind === "artifact-file") {
+			if (options.multipart && row.artifactId === options.multipart.rootArtifactId) {
+				assert.equal(row.runId, options.multipart.runId);
+				assert.equal(row.expectedArchiveSha256, options.multipart.rootArchiveSha256);
+				child.stdin.write(`${JSON.stringify({ id: row.id,
+					name: ARTIFACT_PARTITION_MANIFEST_FILE, file: multipartIndexFile,
+					sha256: createHash("sha256").update(options.multipart.indexRaw).digest("hex"),
+					archiveSha256: options.multipart.rootArchiveSha256 })}\n`);
+				continue;
+			}
+			const part = multipartParts.find(item => item.artifactId === row.artifactId);
+			if (part) {
+				assert.equal(row.runId, options.multipart?.runId);
+				assert.equal(row.expectedArtifactName, part.artifactName);
+				assert.equal(row.expectedArchiveSha256, part.archiveSha256);
+				assert.equal(row.name, part.fileName);
+				child.stdin.write(`${JSON.stringify({ id: row.id,
+					name: options.multipart?.partFault === "wrong-name" ?
+						"private-artifact.part-99999999.bin" : part.fileName,
+					file: part.file,
+					sha256: createHash("sha256").update(part.bytes).digest("hex"),
+					archiveSha256: part.archiveSha256 })}\n`);
+				continue;
+			}
+			if (row.name === "provider-balance.enc.json") {
+				assert.equal(row.artifactId, options.providerProbe?.artifactId ?? "9302");
+				assert.equal(row.runId, options.providerProbe?.runId ?? "8002");
+				assert.equal(row.expectedArchiveSha256,
+					options.providerProbe?.archiveSha256 ?? "8".repeat(64));
+				assert(providerEnvelopeFile && options.providerAvailabilityEnvelopeBytes);
+				child.stdin.write(`${JSON.stringify({ id: row.id, name: "provider-balance.enc.json",
+					file: providerEnvelopeFile,
+					sha256: createHash("sha256").update(options.providerAvailabilityEnvelopeBytes).digest("hex"),
+					archiveSha256: options.wrongProviderArchiveEcho ? "0".repeat(64) :
+						options.providerProbe?.archiveSha256 ?? "8".repeat(64) })}\n`);
+				continue;
+			}
+			if (row.artifactId === "9202") {
+				assert.equal(row.runId, "7002");
+				assert.equal(row.expectedArchiveSha256,
+					options.resultArtifactArchiveSha256 ?? "9".repeat(64));
+				assert(resultEnvelopeFile && options.resultEnvelopeBytes);
+				child.stdin.write(`${JSON.stringify({ id: row.id,
+					name: "private-campaign-outcome.enc.json", file: resultEnvelopeFile,
+					sha256: options.wrongResultFileDigest ? "0".repeat(64) :
+						createHash("sha256").update(options.resultEnvelopeBytes).digest("hex"),
+					...(resultArchiveFile ? { archiveFile: resultArchiveFile } : {}),
+					archiveSha256: options.wrongResultArchiveEcho ? "0".repeat(64) :
+						options.resultArtifactArchiveSha256 ?? "9".repeat(64) })}\n`);
+				continue;
+			}
+			if (options.prefixOnly && row.runId === options.prefixOnly.runId) {
+				assert.equal(row.artifactId, options.prefixOnly.artifactId);
+				assert.equal(row.expectedArchiveSha256, options.prefixOnly.archiveSha256);
+				child.stdin.write(`${JSON.stringify({ id: row.id, name: "incremental-control-prefix.json",
+					file: prefixOnlyFile,
+					sha256: createHash("sha256").update(options.prefixOnly.raw).digest("hex"),
+					archiveSha256: options.prefixOnly.archiveSha256 })}\n`);
+				continue;
+			}
+			assert(row.runId === f.input.source.runId || options.prefixOnly && row.runId === "7002");
+			assert.equal(row.artifactId, row.runId === "7003" ? "9003" : "9002");
+			assert.equal(row.expectedArchiveSha256, options.archiveSha256);
+			const sidecars = options.sidecarFault === "missing" ? sidecarReferences.slice(0, -1) :
+				options.sidecarFault === "duplicate" ? [...sidecarReferences, sidecarReferences[0]!] :
+				sidecarReferences;
+			child.stdin.write(`${JSON.stringify({ id: row.id, file: artifactFile,
+				sha256: options.wrongArtifactDigest ? "0".repeat(64) : artifactSha256,
+				...(options.archiveSha256 ? { archiveSha256: options.wrongArchiveEcho ?
+					"0".repeat(64) : options.archiveSha256 } : {}),
+				...(prefixReference ? { prefix: prefixReference } : {}),
+				...(sidecarReferences.length ? { sidecars } : {}) })}\n`);
+		} else assert(["prepared", "planned-read-only", "recovered-reservation", "no-dispatch"].includes(row.kind));
+	}
+	const [code] = await closed;
+	return { code, stderr, lines, stdout: lines.map(row => JSON.stringify(row)).join("\n"),
+		outputPrivate };
+}
+
+async function twoCarryFixture(t: TestContext) {
+	const first = await fixture(t, { carriedAction: true });
+	const source3: CurrentMissionRun = { ...source, runId: "7003", sha: sha40("c") };
+	const anchor = run(7001, 1, "completed", sha40("a"), "success");
+	const done2 = run(7002, 2, "completed", sourceCommit, "failure");
+	let terminal3 = false;
+	const request3: typeof fetch = async url => {
+		const address = String(url);
+		if (address.includes("/workflows/manual-private-campaign.yml/runs?"))
+			return new Response(JSON.stringify({ total_count: 3, workflow_runs: [
+				run(7003, 3, terminal3 ? "completed" : "in_progress", sha40("c"),
+					terminal3 ? "failure" : undefined), done2, anchor] }));
+		if (address.endsWith("/runs/7003"))
+			return new Response(JSON.stringify(run(7003, 3, "completed", sha40("c"), "failure")));
+		if (address.endsWith("/runs/7003/artifacts?per_page=100"))
+			return new Response(JSON.stringify({ total_count: 1, artifacts: [
+				{ id: 9003, name: CARRY_ARTIFACT_NAME, expired: false,
+					workflow_run: { id: 7003 } }] }));
+		if (address.endsWith("/runs/7003/jobs?per_page=100"))
+			return new Response(JSON.stringify({ total_count: 1, jobs: [{ id: 6003,
+				run_id: 7003, run_attempt: 1, head_sha: sha40("c"), name: "private-campaign",
+				status: "completed", conclusion: "failure",
+				steps: [{ name: "Run bounded private campaign", status: "completed",
+					conclusion: "success" }] }] }));
+		return first.request(url);
+	};
+	const opening = await openLedgerContinuation({ seedEnvelopeB64: first.input.seedEnvelopeB64,
+		publicKeyFile: first.input.publicKeyFile,
+		expectedSpkiSha256: first.input.expectedSpkiSha256,
+		githubToken: first.input.githubToken, current: source3, request: request3,
+		loadCarryArtifact: async () => first.sealed });
+	const sealed3 = opening.sealCurrent({ settledCny: 0, unknownObservedCny: 0,
+		unpricedRequestCount: 0, requestAudit: { version: 3,
+			kind: "accounting-only-request-audit", requests: [], settledCny: 0,
+			unknownObservedCny: 0, unpricedRequestCount: 0 } });
+	terminal3 = true;
+	return { ...first, request: request3, sealed: sealed3,
+		input: { ...first.input, source: source3, request: request3,
+			loadCarryArtifact: async () => sealed3 } };
+}
+
+test("stdio bridge authenticates connector reads and prints only a public descriptor", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const bridge = await runStdioBridge(f);
+	assert.equal(bridge.code, 0, bridge.stderr);
+	const final = bridge.lines.at(-1) as { kind: string; descriptor: object };
+	assert.equal(final.kind, "prepared");
+	assert.deepEqual(Object.keys(final).sort(), ["descriptor", "kind"]);
+	assert.deepEqual(Object.keys(final.descriptor).sort(),
+		["expectedBefore", "message", "parents", "previousControlCommit", "ref", "sourceCommit", "tree"]);
+	assert.equal((final.descriptor as { message: string }).message, REUSABLE_RUN_REQUEST_MESSAGE);
+	assert(!bridge.stdout.includes(f.input.seedEnvelopeB64!));
+	assert(!bridge.stdout.includes("synthetic-token"));
+	assert(!bridge.stdout.includes("Synthetic original task"));
+	assert(!bridge.stdout.includes("synthetic candidate"));
+	assert(!bridge.stdout.includes("pendingAction"));
+	const privateResult = JSON.parse(await readFile(bridge.outputPrivate, "utf8")) as {
+		decision: { kind: string }; journalKey: string; descriptor: object };
+	assert.equal(privateResult.decision.kind, "dispatch");
+	assert.deepEqual(privateResult.descriptor, final.descriptor);
+	assert.equal((await stat(bridge.outputPrivate)).mode & 0o077, 0);
+	assert.equal((await new MissionResumeJournal(f.journal.directory)
+		.get(privateResult.journalKey))?.state, "reserved");
+});
+
+test("stdio bridge keeps linked recovery private and refuses missing operator review", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const old = await prepareAuthenticatedResumeRequest(f.input);
+	await f.journal.markAttempted(old.journalKey!);
+	const review = await oldSourceReviewFixture(f, old.journalKey!);
+	f.live.controlTip = requestCommit;
+	f.live.sourceTip = sha40("e");
+	f.live.ciHead = f.live.sourceTip;
+	f.live.ciRunId = 9004;
+	const request: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.includes(`/contents/${review.codePath}?ref=${sourceCommit}`) ||
+			address.includes(`/contents/${review.testPath}?ref=${sourceCommit}`)) {
+			const file = address.includes(review.codePath) ? review.codePath : review.testPath;
+			const body = file === review.codePath ? review.codeText : review.testText;
+			return new Response(JSON.stringify({ type: "file", path: file, encoding: "base64",
+				size: Buffer.byteLength(body), content: Buffer.from(body).toString("base64") }));
+		}
+		if (address.endsWith(`/git/commits/${requestCommit}`))
+			return new Response(JSON.stringify({ sha: requestCommit,
+				tree: { sha: testedTree }, message: REUSABLE_RUN_REQUEST_MESSAGE,
+				parents: [{ sha: sourceCommit }, { sha: priorControlCommit }] }));
+		if (address.includes(`/actions/runs?head_sha=${requestCommit}&per_page=100&page=1`))
+			return new Response(JSON.stringify({ total_count: 0, workflow_runs: [] }));
+		return f.request(url, init);
+	};
+	const invalid = await runStdioBridge(f, { request,
+		outputPrivate: path.join(f.dir, "invalid-linked-private.json"),
+		linkedUnknownDeliveryOldControlCommit: requestCommit,
+		unobservedControlSourceReviewPrivateFile: path.join(f.dir, "missing-review.json") });
+	assert.equal(invalid.code, 1);
+	assert(!invalid.stdout.includes('"kind":"prepared"'));
+	assert.equal((await f.journal.get(old.journalKey!))?.state, "ref-update-attempted");
+	const prepared = await runStdioBridge(f, { request,
+		outputPrivate: path.join(f.dir, "linked-private.json"),
+		linkedUnknownDeliveryOldControlCommit: requestCommit,
+		unobservedControlSourceReviewPrivateFile: review.file });
+	assert.equal(prepared.code, 0, prepared.stderr);
+	const final = prepared.lines.at(-1) as { kind: string; descriptor: Record<string, unknown> };
+	assert.equal(final.kind, "prepared");
+	assert.deepEqual(Object.keys(final.descriptor).sort(),
+		["expectedBefore", "message", "parents", "previousControlCommit", "ref",
+			"sourceCommit", "tree"]);
+	assert(!prepared.stdout.includes(old.journalKey!));
+	assert(!prepared.stdout.includes(review.file));
+	assert(!prepared.stdout.includes("unknown-unreconciled"));
+	const privateResult = JSON.parse(await readFile(prepared.outputPrivate, "utf8")) as {
+		journalKey: string; descriptor: object };
+	assert.notEqual(privateResult.journalKey, old.journalKey);
+	assert.deepEqual(privateResult.descriptor, final.descriptor);
+	const recovered = await runStdioBridge(f, { request, recoverReserved: true,
+		outputPrivate: path.join(f.dir, "linked-recovered-private.json"),
+		linkedUnknownDeliveryOldControlCommit: requestCommit,
+		unobservedControlSourceReviewPrivateFile: review.file });
+	assert.equal(recovered.code, 0, recovered.stderr);
+	assert.deepEqual((recovered.lines.at(-1) as { descriptor: object }).descriptor,
+		final.descriptor);
+});
+
+test("private output collision is diagnosed before any connector read or journal reservation", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const outputPrivate = path.join(f.dir, "prepared-private.json");
+	const firstFailure = '{"kind":"earlier-private-failure"}\n';
+	await writeFile(outputPrivate, firstFailure, { mode: 0o600 });
+	for (const expectedCount of [1, 2]) {
+		const result = await runStdioBridge(f);
+		assert.equal(result.code, 1);
+		assert.deepEqual(result.lines, []);
+		assert.equal(await readFile(outputPrivate, "utf8"), firstFailure);
+		assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+		const names = (await readdir(f.dir)).filter(name =>
+			/^\.prepared-private\.json\.attempt-[0-9a-f-]+\.failure\.json$/.test(name));
+		assert.equal(names.length, expectedCount);
+		for (const name of names) {
+			const diagnostic = JSON.parse(await readFile(path.join(f.dir, name), "utf8"));
+			assert.deepEqual(diagnostic, { version: 1,
+				kind: "private-resume-preparation-diagnostic",
+				code: "private-output-exists", osErrorCode: "EEXIST" });
+			assert.equal((await stat(path.join(f.dir, name))).mode & 0o077, 0);
+		}
+	}
+});
+
+test("stdio bridge recovers a reserved descriptor only before any ref update attempt", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const prepared = await runStdioBridge(f);
+	assert.equal(prepared.code, 0, prepared.stderr);
+	const first = JSON.parse(await readFile(prepared.outputPrivate, "utf8")) as {
+		journalKey: string; descriptor: object };
+	const recovered = await runStdioBridge(f, { recoverReserved: true,
+		outputPrivate: path.join(f.dir, "recovered-private.json") });
+	assert.equal(recovered.code, 0, recovered.stderr);
+	assert.deepEqual(recovered.lines.at(-1), { kind: "recovered-reservation",
+		descriptor: first.descriptor });
+	assert.equal((await f.journal.get(first.journalKey))?.state, "reserved");
+	await f.journal.markAttempted(first.journalKey);
+	const afterAttempt = await runStdioBridge(f, { recoverReserved: true,
+		outputPrivate: path.join(f.dir, "after-attempt-private.json") });
+	assert.equal(afterAttempt.code, 0, afterAttempt.stderr);
+	assert.deepEqual(afterAttempt.lines.at(-1), { kind: "no-dispatch", decisionKind: "wait" });
+});
+
+test("stdio bridge accepts a combined final carry and prefix only with the expected ZIP digest", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const archiveSha256 = "8".repeat(64);
+	const request = f.request;
+	f.request = async (url, init) => {
+		if (String(url).endsWith("/runs/7002/artifacts?per_page=100"))
+			return new Response(JSON.stringify({ total_count: 1, artifacts: [{ id: 9002,
+				name: CARRY_ARTIFACT_NAME, expired: false,
+				digest: `sha256:${archiveSha256}`, workflow_run: { id: 7002, head_sha: sourceCommit } }] }));
+		return request(url, init);
+	};
+	const result = await runStdioBridge(f, { prefixText: '{"status":"incomplete"}',
+		archiveSha256, readOnly: true });
+	assert.equal(result.code, 0, result.stderr);
+	assert.equal((result.lines.at(-1) as { kind: string }).kind, "planned-read-only");
+	const invalid = await runStdioBridge(f, { prefixText: '{"status":"incomplete"}',
+		archiveSha256, wrongArchiveEcho: true, readOnly: true });
+	assert.equal(invalid.code, 1);
+});
+
+test("stdio bridge authenticates a prefix-only interrupted artifact without adopting its research", async t => {
+	const f = await interruptedFixture(t);
+	const signed = JSON.parse(Buffer.from(f.input.seedEnvelopeB64!, "base64").toString("utf8")) as {
+		signature_b64: string };
+	const seedDigest = createHash("sha256")
+		.update(Buffer.from(f.input.seedEnvelopeB64!, "base64")).digest("hex");
+	const key = Buffer.from(hkdfSync("sha256", Buffer.from(signed.signature_b64, "base64"),
+		Buffer.from(seedDigest, "hex"), "mul-pis-ledger-continuation-v1", 32));
+	const priorEnvelopeSha256 = createHash("sha256")
+		.update(Buffer.from(f.sealed.envelopeB64, "base64")).digest("hex");
+	const source = { repository: MISSION_REPOSITORY, runId: "7003", runAttempt: 1,
+		commit: sha40("e"), event: "workflow_dispatch" as const, priorEnvelopeSha256 };
+	const incremental = new IncrementalPrivateCheckpointJournal({ source,
+		outputDir: f.dir, authenticatedMissionKey: key });
+	await incremental.record("initial", { requestAudit: { version: 3,
+		kind: "accounting-only-request-audit", requests: [], settledCny: 0,
+		unknownObservedCny: 0, unpricedRequestCount: 0 },
+		hostEffects: { version: 1, kind: "host-effect-prefix-observation", complete: false,
+			selectionAuthority: false, source: { runId: source.runId,
+				runAttempt: source.runAttempt, commit: source.commit },
+			priorEnvelopeSha256, historicalGoalRunIds: [], goals: [], sessions: [], requestIds: [] } });
+	const raw = await readFile(path.join(f.dir, "incremental-control-prefix.json"), "utf8");
+	const archiveSha256 = "8".repeat(64);
+	const originalRequest = f.request;
+	f.request = async (url, init) => {
+		if (String(url).endsWith("/runs/7003/artifacts?per_page=100"))
+			return new Response(JSON.stringify({ total_count: 2, artifacts: [{ id: 9103,
+				name: MISSION_ARTIFACT, expired: false, digest: `sha256:${"9".repeat(64)}`,
+				workflow_run: { id: 7003, head_sha: sha40("e") } }, { id: 9603,
+				name: CARRY_ARTIFACT_NAME, expired: false, digest: `sha256:${archiveSha256}`,
+				workflow_run: { id: 7003, head_sha: sha40("e") } }] }));
+		return originalRequest(url, init);
+	};
+	const direct = await prepareAuthenticatedResumeRequest({ ...f.input, request: f.request,
+		readOnly: true, loadCarryArtifact: async ({ runId }) => runId === "7003" ?
+			{ incrementalControlPrefix: raw } : f.sealed });
+	assert.equal(direct.decision.kind, "dispatch");
+	const result = await runStdioBridge(f, { readOnly: true,
+		interruptedSourceReviewPrivateFile: f.reviewFile,
+		prefixOnly: { runId: "7003", artifactId: "9603", raw, archiveSha256 } });
+	assert.equal(result.code, 0, `${result.stderr}\n${JSON.stringify(result.lines)}`);
+	assert.equal((result.lines.at(-1) as { kind: string }).kind, "planned-read-only");
+	assert(!result.stdout.includes("incrementalControlEnvelope"));
+	assert(!result.stdout.includes("Synthetic original task"));
+	const discarded = await runStdioBridge(f, {
+		interruptedSourceReviewPrivateFile: f.reviewFile,
+		prefixOnly: { runId: "7003", artifactId: "9603",
+			raw: '{"status":"complete"}', archiveSha256 } });
+	assert.equal(discarded.code, 0, discarded.stderr);
+	assert.equal((discarded.lines.at(-1) as { kind: string }).kind, "prepared");
+	const privateResult = JSON.parse(await readFile(discarded.outputPrivate, "utf8")) as {
+		decision: { kind: string }; incrementalPrefixFailure: {
+			stage: string; reason: string; category: string } };
+	assert.equal(privateResult.decision.kind, "dispatch");
+	assert.equal(privateResult.incrementalPrefixFailure.category,
+		"decode-or-authentication-failed");
+	assert.equal(privateResult.incrementalPrefixFailure.stage, "envelope");
+	assert.equal(privateResult.incrementalPrefixFailure.reason, "invalid-format");
+	assert(!discarded.stdout.includes("invalid-format"));
+});
+
+test("stdio bridge accepts a private reviewed repair without publishing its receipt", async t => {
+	const f = await repairFixture(t);
+	const bridge = await runStdioBridge(f, { repairPlanPrivateFile: f.input.repairPlanPrivateFile });
+	assert.equal(bridge.code, 0, bridge.stderr);
+	assert.equal((bridge.lines.at(-1) as { kind: string }).kind, "prepared");
+	assert(!bridge.stdout.includes("operator-code-review"));
+	assert(!bridge.stdout.includes("reviewedPlanSha256"));
+	assert(!bridge.stdout.includes("repair-state.json"));
+	assert(!bridge.stdout.includes(reviewedTestName));
+	const repeated = await prepareAuthenticatedResumeRequest(f.input);
+	assert.equal(repeated.decision.kind, "wait");
+	assert.equal(repeated.descriptor, undefined);
+});
+
+test("stdio bridge binds a reviewed result-only repair to its separate encrypted result artifact", async t => {
+	const f = await resultOnlyRepairFixture(t);
+	const bridge = await runStdioBridge(f, {
+		repairPlanPrivateFile: f.input.repairPlanPrivateFile,
+		resultOnlyRepairReviewPrivateFile: f.resultOnlyRepairReviewPrivateFile,
+		resultEnvelopeBytes: f.envelopeBytes });
+	assert.equal(bridge.code, 0, bridge.stderr);
+	assert.equal((bridge.lines.at(-1) as { kind: string }).kind, "prepared");
+	assert(bridge.lines.some(row => (row as { artifactId?: string }).artifactId === "9202"));
+	assert(!bridge.stdout.includes("bytesUtf8"));
+	assert(!bridge.stdout.includes("operator-rsa-decryption-review"));
+	assert(!bridge.stdout.includes("old-goal/O001"));
+	const privateResult = JSON.parse(await readFile(bridge.outputPrivate, "utf8")) as {
+		decision: { kind: string; intent: { pendingAction: { kind: string } } } };
+	assert.equal(privateResult.decision.kind, "dispatch");
+	assert.equal(privateResult.decision.intent.pendingAction.kind, "reconcile-m07-operation");
+});
+
+test("oversized present RSA result remains a private connector-capacity blocker", async t => {
+	const f = await resultOnlyRepairFixture(t);
+	const oversized = Buffer.alloc(32 * 1024 * 1024 + 1, 65);
+	const bridge = await runStdioBridge(f, {
+		repairPlanPrivateFile: f.input.repairPlanPrivateFile,
+		resultOnlyRepairReviewPrivateFile: f.resultOnlyRepairReviewPrivateFile,
+		resultEnvelopeBytes: oversized });
+	assert.equal(bridge.code, 1);
+	assert(!bridge.stdout.includes("prepared"));
+	assert(!bridge.stdout.includes("connector-capacity"));
+	const diagnostic = JSON.parse(await readFile(bridge.outputPrivate, "utf8")) as {
+		code: string; preparation?: { code: string } };
+	assert.equal(diagnostic.code, "result-envelope-exceeds-connector-capacity");
+	assert.equal(diagnostic.preparation?.code, "result-only-repair-review-invalid");
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+});
+
+test("locally restored original RSA ZIP crosses connector limit only after exact archive verification", async t => {
+	const f = await resultOnlyRepairFixture(t);
+	const member = Buffer.concat([f.envelopeBytes, Buffer.alloc(32 * 1024 * 1024, 32)]);
+	const originalZip = syntheticOriginalResultZip(member);
+	assert(originalZip.length > 32 * 1024 * 1024);
+	assert(exactResultArchiveMember(originalZip).equals(member));
+	const archiveSha256 = createHash("sha256").update(originalZip).digest("hex");
+	const receipt = structuredClone(f.receipt) as unknown as {
+		result: { archiveSha256: string; envelopeSha256: string } };
+	receipt.result.archiveSha256 = archiveSha256;
+	receipt.result.envelopeSha256 = createHash("sha256").update(member).digest("hex");
+	await writeFile(f.resultOnlyRepairReviewPrivateFile, JSON.stringify(receipt), { mode: 0o600 });
+	const request: typeof fetch = async (url, init) => {
+		if (String(url).endsWith("/runs/7002/artifacts?per_page=100")) {
+			const response = await f.request(url, init);
+			const body = await response.json() as { total_count: number;
+				artifacts: Array<{ name: string; digest: string }> };
+			return new Response(JSON.stringify({ ...body, artifacts: body.artifacts.map(row =>
+				row.name === MISSION_ARTIFACT ?
+					{ ...row, digest: `sha256:${archiveSha256}` } : row) }));
+		}
+		return f.request(url, init);
+	};
+	const accepted = await runStdioBridge(f, { request,
+		repairPlanPrivateFile: f.input.repairPlanPrivateFile,
+		resultOnlyRepairReviewPrivateFile: f.resultOnlyRepairReviewPrivateFile,
+		resultEnvelopeBytes: member, resultArchiveBytes: originalZip,
+		resultArtifactArchiveSha256: archiveSha256 });
+	assert.equal(accepted.code, 0, accepted.stderr);
+	assert.equal((accepted.lines.at(-1) as { kind: string }).kind, "prepared");
+	assert(!accepted.stdout.includes("ciphertext_b64"));
+	const damagedZip = Buffer.from(originalZip);
+	damagedZip[damagedZip.length - 1] ^= 1;
+	const refused = await runStdioBridge(f, { readOnly: true, request,
+		repairPlanPrivateFile: f.input.repairPlanPrivateFile,
+		resultOnlyRepairReviewPrivateFile: f.resultOnlyRepairReviewPrivateFile,
+		resultEnvelopeBytes: member, resultArchiveBytes: damagedZip,
+		resultArtifactArchiveSha256: archiveSha256 });
+	assert.equal(refused.code, 1);
+	assert(!refused.stdout.includes("planned-read-only"));
+});
+
+test("stdio bridge rejects a result artifact ZIP or encrypted envelope mismatch", async t => {
+	for (const failure of ["archive", "file", "receipt-as-envelope"] as const) {
+		const f = await resultOnlyRepairFixture(t);
+		const bridge = await runStdioBridge(f, {
+			repairPlanPrivateFile: f.input.repairPlanPrivateFile,
+			resultOnlyRepairReviewPrivateFile: f.resultOnlyRepairReviewPrivateFile,
+			resultEnvelopeBytes: failure === "receipt-as-envelope" ?
+				Buffer.from(JSON.stringify(f.receipt)) : f.envelopeBytes,
+			wrongResultArchiveEcho: failure === "archive",
+			wrongResultFileDigest: failure === "file" });
+		assert.equal(bridge.code, 1);
+		assert(!bridge.lines.some(row => (row as { kind: string }).kind === "prepared"));
+		const privateFailure = JSON.parse(await readFile(bridge.outputPrivate, "utf8"));
+		assert.equal(privateFailure.kind, "private-resume-preparation-diagnostic");
+		assert.equal(privateFailure.descriptor, undefined);
+		assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	}
+});
+
+test("provider availability review is refused when the authenticated carry has no payment hold", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const receiptFile = path.join(f.dir, "provider-availability-review.json");
+	await writeFile(receiptFile, "{}", { mode: 0o600 });
+	const direct = await assert.rejects(prepareAuthenticatedResumeRequest({ ...f.input,
+		providerAvailabilityReceiptPrivateFile: receiptFile,
+		loadProviderAvailabilityEnvelope: async () => Buffer.from("{}") }), error =>
+		privateHostPreparationDiagnostic(error).code === "provider-availability-review-unrelated");
+	assert.equal(direct, undefined);
+	const bridge = await runStdioBridge(f, { providerAvailabilityReceiptPrivateFile: receiptFile });
+	assert.equal(bridge.code, 1);
+	assert(!bridge.stdout.includes(receiptFile));
+	assert(!bridge.lines.some(row => (row as { kind: string }).kind === "prepared"));
+	const failure = JSON.parse(await readFile(bridge.outputPrivate, "utf8"));
+	assert.equal(failure.code, "provider-availability-review-unrelated");
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+});
+
+test("authenticated current 402 carry waits without a balance receipt or reservation", async t => {
+	const f = await fixture(t, { carriedAction: true, provider402: true,
+		fiveUnknownOperations: true });
+	const authenticated = await authenticateLatestTerminalCarry(f.input);
+	const projected = authenticatedSupervisorProjection(authenticated.proof,
+		authenticated.privateBundle);
+	assert.equal(projected?.status.providerPaymentHold?.evidence, "exact-insufficient-balance");
+	assert.equal(projected?.status.unresolvedOperationRefs.length, 5);
+	const prepared = await prepareAuthenticatedResumeRequest(f.input);
+	assert.deepEqual(prepared.decision, { kind: "wait", reason: "provider-payment-required" });
+	assert.equal(prepared.descriptor, undefined);
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+});
+
+test("fresh source-bound probe releases only the 402 hold and preserves five unknown actions", async t => {
+	const f = await fixture(t, { carriedAction: true, provider402: true,
+		fiveUnknownOperations: true });
+	const authenticated = await authenticateLatestTerminalCarry(f.input);
+	const projected = authenticatedSupervisorProjection(authenticated.proof,
+		authenticated.privateBundle);
+	assert.equal(projected?.status.providerPaymentHold?.evidence, "exact-insufficient-balance");
+	assert.equal(projected?.status.unresolvedOperationRefs.length, 5);
+	const terminalSource = { runId: authenticated.proof.source.runId,
+		runAttempt: authenticated.proof.source.runAttempt,
+		commit: authenticated.proof.source.commit };
+	let probeSource = { runId: "8002", runAttempt: 1, commit: sha40("5") };
+	let artifactId = "9302", jobId = "8202", archiveSha256 = "8".repeat(64);
+	let nonce = "6".repeat(32);
+	const messageFor = (value: string) => `Check provider availability\n\n` +
+		`Terminal-Run-Id: ${terminalSource.runId}\n` +
+		`Terminal-Run-Attempt: ${terminalSource.runAttempt}\n` +
+		`Terminal-Commit: ${terminalSource.commit}\n` +
+		`Terminal-Envelope-SHA256: ${authenticated.proof.envelopeSha256}\n` +
+		`Request-Nonce: ${value}\n`;
+	let probeMessage = messageFor(nonce).slice(0, -1);
+	const envelopeFor = (probe: typeof probeSource) => Buffer.from(JSON.stringify({
+		format: "mul-pis-provider-balance-v1",
+		key_wrap: "RSA-3072-OAEP-SHA256", content_cipher: "AES-256-GCM",
+		recipient_spki_sha256: "095541a341d91f128aa9cd1f0c6d34f6b7291fc5d667365ef5a67efd42fd0d23",
+		metadata: { repository: MISSION_REPOSITORY, run_id: probe.runId,
+			run_attempt: "1", commit: probe.commit, event: "push" },
+		wrapped_key_b64: Buffer.alloc(384, 5).toString("base64"),
+		nonce_b64: Buffer.alloc(12, 6).toString("base64"),
+		ciphertext_b64: Buffer.alloc(100, 7).toString("base64") }));
+	let encrypted = envelopeFor(probeSource);
+	const receiptFor = (): ProviderAvailabilityReviewReceiptV1 => ({
+		version: 1, kind: "host-reviewed-provider-availability",
+		terminal: { source: terminalSource, envelopeSha256: authenticated.proof.envelopeSha256 },
+		probe: { source: probeSource, workflowId: "92", jobId, artifactId,
+			archiveSha256,
+			envelopeSha256: createHash("sha256").update(encrypted).digest("hex"),
+			envelopeFile: "provider-balance.enc.json", testedSourceCommit: sourceCommit,
+			requestNonce: nonce },
+		verdict: { kind: "provider-balance-availability", version: 1,
+			availability: "available" },
+		review: { kind: "operator-rsa-decryption-review", conclusion: "exact-envelope-available" } });
+	let receipt = receiptFor();
+	const receiptFile = path.join(f.dir, "reviewed-provider-availability.json");
+	await writeFile(receiptFile, JSON.stringify(receipt), { mode: 0o600 });
+	const request: typeof fetch = async (url, init) => {
+		const address = String(url);
+		let data: unknown;
+		if (address.endsWith("/actions/workflows/provider-balance-check.yml"))
+			data = { id: 92, name: "Confidential provider balance check",
+				path: ".github/workflows/provider-balance-check.yml", state: "active" };
+		else if (address.endsWith("/git/ref/heads/run-requests/provider-balance-availability"))
+			data = { object: { sha: probeSource.commit } };
+		else if (address.endsWith(`/git/commits/${probeSource.commit}`))
+			data = { sha: probeSource.commit, message: probeMessage,
+				tree: { sha: testedTree }, parents: probeSource.runId === "8002" ?
+					[{ sha: sourceCommit }] : [{ sha: sourceCommit }, { sha: sha40("5") }] };
+		else if (address.endsWith("/actions/jobs/6002"))
+			data = { id: 6002, run_id: 7002, run_attempt: 1, head_sha: sourceCommit,
+				name: "private-campaign", status: "completed",
+				completed_at: "2026-10-08T00:01:00Z" };
+		else if (address.endsWith(`/actions/runs/${probeSource.runId}`))
+			data = { id: Number(probeSource.runId), run_attempt: 1, workflow_id: 92,
+				name: "Confidential provider balance check",
+				display_title: "Confidential provider balance check",
+				head_branch: "run-requests/provider-balance-availability",
+				head_sha: probeSource.commit, event: "push",
+				actor: { login: "SakuyaInazaki" },
+				status: "completed", conclusion: "success",
+				created_at: probeSource.runId === "8002" ?
+					"2026-10-08T00:02:00Z" : "2026-10-08T00:04:00Z" };
+		else if (address.endsWith(`/actions/runs/${probeSource.runId}/jobs?per_page=100`))
+			data = { total_count: 1, jobs: [{ id: Number(jobId),
+				run_id: Number(probeSource.runId), run_attempt: 1,
+				head_sha: probeSource.commit, name: "provider-balance-check",
+				status: "completed", conclusion: "success",
+				started_at: probeSource.runId === "8002" ?
+					"2026-10-08T00:03:00Z" : "2026-10-08T00:05:00Z", steps: [
+					{ name: "Verify exact source and accepted offline CI", status: "completed", conclusion: "success" },
+					{ name: "Check once and seal availability", status: "completed", conclusion: "success" },
+					{ name: "Upload ciphertext only", status: "completed", conclusion: "success" } ] }] };
+		else if (address.endsWith(`/actions/runs/${probeSource.runId}/artifacts?per_page=100`))
+			data = { total_count: 1, artifacts: [{ id: Number(artifactId),
+				name: "confidential-provider-balance-envelope", expired: false,
+				digest: `sha256:${archiveSha256}`,
+				workflow_run: { id: Number(probeSource.runId), head_sha: probeSource.commit } }] };
+		else return f.request(url, init);
+		return new Response(JSON.stringify(data));
+	};
+	const input = { ...f.input, request, providerAvailabilityReceiptPrivateFile: receiptFile,
+		loadProviderAvailabilityEnvelope: async () => encrypted };
+	const noReceipt = await prepareAuthenticatedResumeRequest({ ...f.input, request });
+	assert.deepEqual(noReceipt.decision, { kind: "wait", reason: "provider-payment-required" });
+	assert.equal(noReceipt.descriptor, undefined);
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	const wrongSource = sha40("e");
+	f.live.sourceTip = wrongSource;
+	f.live.ciHead = wrongSource;
+	await assert.rejects(prepareAuthenticatedResumeRequest(input), error =>
+		privateHostPreparationDiagnostic(error).code === "provider-availability-review-invalid");
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	f.live.sourceTip = sourceCommit;
+	f.live.ciHead = sourceCommit;
+	await writeFile(receiptFile, JSON.stringify({ ...receipt, terminal: {
+		...receipt.terminal, source: { ...terminalSource, runId: "7001" } } }));
+	await assert.rejects(prepareAuthenticatedResumeRequest(input), error =>
+		privateHostPreparationDiagnostic(error).code === "provider-availability-review-invalid");
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	await writeFile(receiptFile, JSON.stringify(receipt));
+	probeMessage = `${messageFor(nonce)}Reviewer: available\n`;
+	await assert.rejects(prepareAuthenticatedResumeRequest(input), error => {
+		const diagnostic = privateHostPreparationDiagnostic(error);
+		assert.deepEqual(diagnostic, { code: "provider-availability-review-invalid",
+			stage: "provider-availability-review",
+			providerAvailabilityCause: "live-source-invalid",
+			providerAvailabilityCheck: "request-commit-message" });
+		return true;
+	});
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	const refusedBridge = await runStdioBridge(f, { request,
+		outputPrivate: path.join(f.dir, "refused-provider-private.json"),
+		providerAvailabilityReceiptPrivateFile: receiptFile,
+		providerAvailabilityEnvelopeBytes: encrypted });
+	assert.equal(refusedBridge.code, 1);
+	assert(!refusedBridge.lines.some(row => (row as { kind: string }).kind === "prepared"));
+	assert(!refusedBridge.stdout.includes(receiptFile));
+	assert(!refusedBridge.stdout.includes("Reviewer: available"));
+	assert(!refusedBridge.stdout.includes("live-source-invalid"));
+	assert(!refusedBridge.stdout.includes("request-commit-message"));
+	assert(!refusedBridge.stdout.includes(nonce));
+	assert(!refusedBridge.stderr.includes("Reviewer: available"));
+	const privateRefusal = JSON.parse(await readFile(refusedBridge.outputPrivate, "utf8"));
+	assert.deepEqual(privateRefusal, { version: 1,
+		kind: "private-resume-preparation-diagnostic",
+		code: "provider-availability-review-invalid",
+		stage: "provider-availability-review",
+		providerAvailabilityCause: "live-source-invalid",
+		providerAvailabilityCheck: "request-commit-message" });
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	probeMessage = messageFor(nonce).slice(0, -1);
+	await verifyProviderAvailabilityProof({ privateReceiptFile: receiptFile,
+		terminalSource, terminalEnvelopeSha256: authenticated.proof.envelopeSha256,
+		terminalWorkflowId: authenticated.proof.terminal.workflowId,
+		terminalJobId: authenticated.proof.terminal.jobId,
+		testedSourceCommit: sourceCommit, request, githubToken: "synthetic-token",
+		loadEncryptedEnvelope: async () => encrypted });
+	const planned = await prepareAuthenticatedResumeRequest({ ...input, readOnly: true });
+	assert.equal(planned.decision.kind, "dispatch");
+	if (planned.decision.kind !== "dispatch") throw new Error("expected fresh-only dispatch");
+	assert.deepEqual(planned.decision.intent.pendingAction.target?.operationRefs,
+		projected?.status.unresolvedOperationRefs);
+	const bridge = await runStdioBridge(f, { request,
+		providerAvailabilityReceiptPrivateFile: receiptFile,
+		providerAvailabilityEnvelopeBytes: encrypted });
+	assert.equal(bridge.code, 0, bridge.stderr);
+	assert.equal((bridge.lines.at(-1) as { kind: string }).kind, "prepared");
+	assert(!bridge.stdout.includes(receiptFile));
+	assert(!bridge.stdout.includes(encrypted.toString("utf8")));
+	const saved = JSON.parse(await readFile(bridge.outputPrivate, "utf8")) as {
+		decision: { kind: string; intent: { pendingAction: { target: { operationRefs: string[] } } } } };
+	assert.equal(saved.decision.kind, "dispatch");
+	assert.deepEqual(saved.decision.intent.pendingAction.target.operationRefs,
+		projected?.status.unresolvedOperationRefs);
+	const reserved = await f.journal.unresolvedForRef(controlRef);
+	assert.equal(reserved?.state, "reserved");
+	assert.equal(reserved.providerAvailabilityAudit?.receiptSha256,
+		createHash("sha256").update(JSON.stringify(receipt)).digest("hex"));
+	assert.deepEqual(reserved.providerAvailabilityAudit?.probeSource, probeSource);
+	assert.equal(reserved.providerAvailabilityAudit?.artifactId, "9302");
+	// The first artifact is gone; a new source-bound check may reauthenticate
+	// the still-reserved semantic intent without replacing its first audit.
+	probeSource = { runId: "8003", runAttempt: 1, commit: sha40("7") };
+	artifactId = "9303";
+	jobId = "8203";
+	archiveSha256 = "9".repeat(64);
+	nonce = "a".repeat(32);
+	probeMessage = messageFor(nonce).slice(0, -1);
+	encrypted = envelopeFor(probeSource);
+	receipt = receiptFor();
+	await writeFile(receiptFile, JSON.stringify(receipt));
+	const renewed = await prepareAuthenticatedResumeRequest({ ...input,
+		recoverReservedDescriptor: true });
+	assert.equal(renewed.decision.kind, "wait");
+	assert.deepEqual(renewed.descriptor, bridge.lines.at(-1) &&
+		(bridge.lines.at(-1) as { descriptor: object }).descriptor);
+	const changed = await runStdioBridge(f, { request,
+		outputPrivate: path.join(f.dir, "changed-probe-private.json"),
+		recoverReserved: true,
+		providerAvailabilityReceiptPrivateFile: receiptFile,
+		providerAvailabilityEnvelopeBytes: encrypted,
+		providerProbe: { runId: probeSource.runId, artifactId, archiveSha256 } });
+	assert.equal(changed.code, 0, changed.stderr);
+	assert.equal((changed.lines.at(-1) as { kind: string }).kind, "recovered-reservation");
+	assert.deepEqual((await f.journal.get(reserved.idempotencyKey))?.providerAvailabilityAudit,
+		reserved.providerAvailabilityAudit);
+	await f.journal.markAttempted(reserved.idempotencyKey);
+	const afterAttempt = await prepareAuthenticatedResumeRequest({ ...input,
+		recoverReservedDescriptor: true });
+	assert.deepEqual(afterAttempt.decision, { kind: "wait",
+		reason: "dispatch-delivery-unknown", idempotencyKey: reserved.idempotencyKey });
+	assert.equal(afterAttempt.descriptor, undefined);
+	assert.deepEqual((await f.journal.get(reserved.idempotencyKey))?.providerAvailabilityAudit,
+		reserved.providerAvailabilityAudit);
+	assert.equal((await f.journal.get(reserved.idempotencyKey))?.state, "ref-update-attempted");
+	const done2 = run(7002, 2, "completed", sourceCommit, "failure");
+	const anchor = run(7001, 1, "completed", sha40("a"), "success");
+	const nextSource = { ...f.input.source, runId: "7003", sha: sourceCommit };
+	const nextRequest: typeof fetch = async (url, init) => {
+		if (String(url).includes("/workflows/manual-private-campaign.yml/runs?"))
+			return new Response(JSON.stringify({ total_count: 3,
+				workflow_runs: [run(7003, 3, "in_progress", sourceCommit), done2, anchor] }));
+		return f.request(url, init);
+	};
+	const next = await openLedgerContinuation({ seedEnvelopeB64: f.input.seedEnvelopeB64,
+		publicKeyFile: f.input.publicKeyFile,
+		expectedSpkiSha256: f.input.expectedSpkiSha256,
+		githubToken: "synthetic-token", current: nextSource, request: nextRequest,
+		loadCarryArtifact: async () => f.sealed });
+	assert.equal(next.priorProviderPaymentHold, true);
+	const outputDir = path.join(f.dir, "unavailable-next-run");
+	await mkdir(outputDir, { mode: 0o700 });
+	let balanceReads = 0;
+	await assert.rejects(offlineChecks.checkHeldProviderAvailability({ ledger: next,
+		apiKey: "synthetic-only", outputDir,
+		request: async url => {
+			assert.equal(String(url), "https://api.deepseek.com/user/balance");
+			balanceReads++;
+			return new Response(JSON.stringify({ is_available: false, balance_infos: [] }),
+				{ status: 200 });
+		} }), error => (error as { code?: string }).code === "runner.provider-availability");
+	assert.equal(balanceReads, 1);
+	const observation = JSON.parse(await readFile(path.join(outputDir,
+		"provider-availability-observation.json"), "utf8"));
+	assert.equal(observation.entries.at(-1).availability, "unavailable");
+	const emptyAudit = { version: 3 as const,
+		kind: "accounting-only-request-audit" as const, requests: [],
+		settledCny: 0, unknownObservedCny: 0, unpricedRequestCount: 0 };
+	const sealed3 = next.sealEmergencyCurrent({ settledCny: 0,
+		unknownObservedCny: 0, unpricedRequestCount: 0,
+		requestAudit: emptyAudit }, "effect-review-incomplete");
+	const done3 = run(7003, 3, "completed", sourceCommit, "failure");
+	const fourthSource = { ...f.input.source, runId: "7004", sha: sourceCommit };
+	const fourthRequest: typeof fetch = async (url, init) => {
+		const address = String(url);
+		if (address.includes("/workflows/manual-private-campaign.yml/runs?"))
+			return new Response(JSON.stringify({ total_count: 4,
+				workflow_runs: [run(7004, 4, "in_progress", sourceCommit), done3,
+					done2, anchor] }));
+		if (address.endsWith("/actions/runs/7003/jobs?per_page=100"))
+			return new Response(JSON.stringify({ total_count: 1, jobs: [{ id: 6003,
+				run_id: 7003, run_attempt: 1, head_sha: sourceCommit,
+				name: "private-campaign", status: "completed", conclusion: "failure",
+				steps: [{ name: "Run private campaign", status: "completed",
+					conclusion: "failure" }] }] }));
+		if (address.endsWith("/actions/runs/7003/artifacts?per_page=100"))
+			return new Response(JSON.stringify({ total_count: 1, artifacts: [{ id: 9003,
+				name: CARRY_ARTIFACT_NAME, expired: false,
+				workflow_run: { id: 7003, head_sha: sourceCommit } }] }));
+		return f.request(url, init);
+	};
+	const fourth = await openLedgerContinuation({ seedEnvelopeB64: f.input.seedEnvelopeB64,
+		publicKeyFile: f.input.publicKeyFile,
+		expectedSpkiSha256: f.input.expectedSpkiSha256,
+		githubToken: "synthetic-token", current: fourthSource, request: fourthRequest,
+		loadCarryArtifact: async ({ runId }) => runId === "7003" ? sealed3 : f.sealed });
+	assert.equal(fourth.priorProviderPaymentHold, true);
+	for (const file of ["candidate.cpp", "verification.json", "workflow-archive.json",
+		"objective-checkpoint.json"] as const)
+		assert.equal(fourth.priorPrivateBundle?.[file], f.bundle[file]);
+	assert.deepEqual(JSON.parse(fourth.priorPrivateBundle!["objective-checkpoint.json"]!),
+		f.checkpoint);
+	assert.equal(fourth.priorTransportDiagnosticCensus?.entries.length, 1);
+});
+
+test("stdio bridge refuses an artifact whose private digest changed", async t => {
+	const f = await fixture(t, { carriedAction: true });
+	const bridge = await runStdioBridge(f, { wrongArtifactDigest: true });
+	assert.equal(bridge.code, 1);
+	assert(bridge.lines.some(row => (row as { kind: string }).kind === "artifact-file"));
+	assert(!bridge.lines.some(row => (row as { kind: string }).kind === "prepared"));
+	const privateFailure = JSON.parse(await readFile(bridge.outputPrivate, "utf8"));
+	assert.equal(privateFailure.kind, "private-resume-preparation-diagnostic");
+	assert.equal(privateFailure.descriptor, undefined);
+	assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+});
+
+test("stdio bridge authenticates multiple near-limit ciphertext sidecars without exposing bytes", async t => {
+	const f = await fixture(t, { carriedAction: true, largePayload: true });
+	assert(Object.keys(f.sealed.sidecars).length >= 2);
+	assert(Buffer.from(f.sealed.sidecars["ledger-continuation.part-00000000.enc"]!, "base64")
+		.length > 700_000);
+	const bridge = await runStdioBridge(f);
+	assert.equal(bridge.code, 0, bridge.stderr);
+	assert.equal((bridge.lines.at(-1) as { kind: string }).kind, "prepared");
+	assert(!bridge.stdout.includes(f.sealed.envelopeB64));
+	assert(!bridge.stdout.includes(f.sealed.sidecars["ledger-continuation.part-00000000.enc"]!));
+	assert(!bridge.stderr.includes(f.sealed.sidecars["ledger-continuation.part-00000000.enc"]!));
+});
+
+test("stdio bridge rejects missing, duplicate and tampered ciphertext sidecars", async t => {
+	for (const sidecarFault of ["missing", "duplicate", "tamper"] as const) {
+		const f = await fixture(t, { carriedAction: true, largePayload: true });
+		const bridge = await runStdioBridge(f, { sidecarFault });
+		assert.equal(bridge.code, 1, sidecarFault);
+		assert(!bridge.lines.some(row => (row as { kind: string }).kind === "prepared"));
+		assert(!bridge.stderr.includes(f.sealed.sidecars["ledger-continuation.part-00000000.enc"]!));
+		const privateFailure = JSON.parse(await readFile(bridge.outputPrivate, "utf8"));
+		assert.equal(privateFailure.kind, "private-resume-preparation-diagnostic");
+		assert.equal(privateFailure.descriptor, undefined);
+		assert.equal(await f.journal.unresolvedForRef(controlRef), undefined);
+	}
+});
+
+test("stdio bridge keeps the single-file v3 continuation route", async t => {
+	const f = await fixture(t, { carriedAction: true, legacyV3: true });
+	assert.equal(Object.keys(f.sealed.sidecars).length, 0);
+	const bridge = await runStdioBridge(f);
+	assert.equal(bridge.code, 0, bridge.stderr);
+	assert.equal((bridge.lines.at(-1) as { kind: string }).kind, "prepared");
+});
+
+test("stdio bridge read-only smoke emits a public plan without local writes", async t => {
+	const f = await fixture(t, { unknownOperation: true, controlRequest: true });
+	const bridge = await runStdioBridge(f, { readOnly: true });
+	assert.equal(bridge.code, 0, bridge.stderr);
+	assert.equal((bridge.lines.at(-1) as { kind: string }).kind, "planned-read-only");
+	await assert.rejects(stat(bridge.outputPrivate), { code: "ENOENT" });
+	await assert.rejects(stat(f.journal.directory), { code: "ENOENT" });
+});
+
+test("stdio bridge authenticates the latest carry with two executed runs of ancestry", async t => {
+	const f = await twoCarryFixture(t);
+	const bridge = await runStdioBridge(f);
+	assert.equal(bridge.code, 0, bridge.stderr);
+	assert.deepEqual(bridge.lines.filter(row => (row as { kind: string }).kind === "artifact-file")
+		.map(row => ({ runId: (row as { runId: string }).runId,
+			artifactId: (row as { artifactId: string }).artifactId })),
+		[{ runId: "7003", artifactId: "9003" }]);
+	assert.equal((bridge.lines.at(-1) as { kind: string }).kind, "prepared");
+	assert(!bridge.stdout.includes("Synthetic original task"));
+	assert.equal((await stat(bridge.outputPrivate)).mode & 0o077, 0);
+});
+
+test("stdio bridge reconstructs authenticated multipart carry without exposing bytes", async t => {
+	const f = await fixture(t, { unknownOperation: true,
+		multipartResearchBytes: 17 * 1024 * 1024 });
+	const seedBytes = Buffer.from(f.input.seedEnvelopeB64!, "base64");
+	const seedDigest = createHash("sha256").update(seedBytes).digest("hex");
+	const signed = JSON.parse(seedBytes.toString("utf8")) as { signature_b64: string };
+	const missionKey = Buffer.from(hkdfSync("sha256", Buffer.from(signed.signature_b64, "base64"),
+		Buffer.from(seedDigest, "hex"), "mul-pis-ledger-continuation-v1", 32));
+	const rootArchiveSha256 = "a".repeat(64);
+	const files = Object.fromEntries([
+		[CARRY_FILE_NAME, Buffer.from(JSON.stringify({ envelopeB64: f.sealed.envelopeB64 }))],
+		...Object.entries(f.sealed.sidecars).map(([name, content]) =>
+			[name, Buffer.from(content)] as const)]) as Record<string, Buffer>;
+	const prepared = partitionEncryptedFiles({ source: { repository: MISSION_REPOSITORY,
+		runId: "7002", runAttempt: 1, commit: sourceCommit, event: "workflow_dispatch" },
+		artifactName: CARRY_ARTIFACT_NAME, files });
+	assert(prepared.chunks.length > 1, "the composed connector must fetch multiple real parts");
+	const uploads = prepared.chunks.map((chunk, index) => ({ index: chunk.index,
+		artifactId: String(9902 + index), archiveSha256: "b".repeat(64) }));
+	const manifest = finalizePartitionManifest(prepared, uploads);
+	const indexRaw = sealPartitionManifest({ manifest, missionKey, seedDigest });
+	const multipart = { runId: "7002", rootArtifactId: "9002", rootArchiveSha256,
+		indexRaw, parts: prepared.chunks.map((chunk, index) => ({
+			artifactId: uploads[index]!.artifactId,
+			archiveSha256: uploads[index]!.archiveSha256,
+			artifactName: chunk.artifactName, fileName: chunk.fileName, bytes: chunk.bytes })) };
+	const artifactRows = [{ id: 9002, name: CARRY_ARTIFACT_NAME, expired: false,
+		digest: `sha256:${rootArchiveSha256}`,
+		workflow_run: { id: 7002, head_sha: sourceCommit } },
+		...manifest.chunks.map(chunk => ({ id: Number(chunk.artifactId),
+			name: chunk.artifactName, expired: false, digest: `sha256:${chunk.archiveSha256}`,
+			workflow_run: { id: 7002, head_sha: sourceCommit } }))];
+	const request: typeof fetch = async (url, init) =>
+		String(url).includes("/runs/7002/artifacts?") ?
+			new Response(JSON.stringify({ total_count: artifactRows.length,
+				artifacts: artifactRows })) : f.request(url, init);
+	const accepted = await runStdioBridge(f, { readOnly: true, request, multipart });
+	assert.equal(accepted.code, 0, accepted.stderr);
+	assert.equal((accepted.lines.at(-1) as { kind: string }).kind, "planned-read-only");
+	assert.equal(accepted.lines.filter(row => (row as { kind: string }).kind === "artifact-file")
+		.length, 1 + manifest.chunks.length);
+	assert(!accepted.stdout.includes(indexRaw));
+	assert(!accepted.stdout.includes(f.sealed.envelopeB64));
+	const changed = await runStdioBridge(f, { readOnly: true, request,
+		multipart: { ...multipart, partFault: "changed-bytes" } });
+	assert.equal(changed.code, 1);
+	assert(!changed.stdout.includes("planned-read-only"));
+	const wrongName = await runStdioBridge(f, { readOnly: true, request,
+		multipart: { ...multipart, partFault: "wrong-name" } });
+	assert.equal(wrongName.code, 1);
+	assert(!wrongName.stdout.includes("planned-read-only"));
+	const missingRequest: typeof fetch = async (url, init) =>
+		String(url).includes("/runs/7002/artifacts?") ?
+			new Response(JSON.stringify({ total_count: 1, artifacts: [artifactRows[0]] })) :
+			f.request(url, init);
+	const missing = await runStdioBridge(f, { readOnly: true, request: missingRequest,
+		multipart });
+	assert.equal(missing.code, 1);
+	assert(!missing.stdout.includes("planned-read-only"));
+	for (const invalidRows of [
+		[...artifactRows, artifactRows[1]],
+		artifactRows.map((row, index) => index === 1 ?
+			{ ...row, workflow_run: { id: 7002, head_sha: sha40("0") } } : row),
+		[...artifactRows, { id: 9999,
+			name: `${CARRY_ARTIFACT_NAME}-part-00000001`, expired: false,
+			digest: `sha256:${"c".repeat(64)}`,
+			workflow_run: { id: 7002, head_sha: sourceCommit } }]
+	]) {
+		const invalidRequest: typeof fetch = async (url, init) =>
+			String(url).includes("/runs/7002/artifacts?") ?
+				new Response(JSON.stringify({ total_count: invalidRows.length,
+					artifacts: invalidRows })) : f.request(url, init);
+		const refused = await runStdioBridge(f, { readOnly: true,
+			request: invalidRequest, multipart });
+		assert.equal(refused.code, 1);
+		assert(!refused.stdout.includes("planned-read-only"));
+	}
+});

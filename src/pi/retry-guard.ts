@@ -1,7 +1,6 @@
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { HarnessError } from "../types.ts";
 import type { StageRequest } from "./service.ts";
 import { Workspace } from "../workspace.ts";
 
@@ -101,11 +100,6 @@ export class RetryGuard {
 	private async write(ledger: Ledger): Promise<void> {
 		await mkdir(path.dirname(this.file), { recursive: true });
 		await writeFile(this.file, `${JSON.stringify(ledger, null, 2)}\n`, "utf8");
-	}
-
-	async assertAllowed(fingerprint: string): Promise<void> {
-		const state = (await this.read()).failures.find((entry) => entry.fingerprint === fingerprint);
-		if (state && state.consecutive >= 2) throw new HarnessError("control.retry-loop", "相同研究义务已连续得到同一失败两次；请提供新的证据、修正实际输入/命令或改变处理方案后再试，不能原样盲重试");
 	}
 
 	async success(fingerprint: string): Promise<void> {

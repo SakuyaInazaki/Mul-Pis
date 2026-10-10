@@ -1,4 +1,4 @@
-import type { SessionRef } from "../runner/types.ts";
+import type { SessionCheckpoint, SessionRef } from "../runner/types.ts";
 import type { BudgetPolicy } from "../improvement/policy.ts";
 import type { KnowledgeRef } from "../knowledge/types.ts";
 import type { ExperienceSelection } from "../knowledge/experience-index.ts";
@@ -36,6 +36,48 @@ export interface TaskSpecInput {
 	experienceRefs?: KnowledgeRef[];
 	experienceContextRefs?: KnowledgeRef[];
 	experienceTags?: string[];
+	/** An input path already listed in inputs, frozen for this task's execution. */
+	planInput?: string;
+	/** Explicit versioned external references, each already present in inputs. Never discovered globally. */
+	resourceInputs?: Array<{ id: string; version: string; input: string }>;
+	/** Opt-in reviewed repair in one live execution session. Legacy bounded fields are historical input compatibility only. No process-restart replay. */
+	executionLoop?: { mode: "until-ready" } | { maxRounds: number; deadlineAt: string };
+	/** Expected JSON output carrying a candidate lesson to M04, never an adopted record. */
+	lessonDeltaOutput?: string;
+	/** Explicit competitive continuation from a frozen task leaf. Role remains execution. */
+	context?: { mode: "fork"; parentRunId: string; parentTaskId: string; checkpointId: string };
+}
+
+export interface M07BranchSourceV1 {
+	version: 1;
+	checkpoint: SessionCheckpoint;
+	manifestPath: string;
+	workSnapshotRoot: string;
+	problemSnapshotCopy: string;
+}
+
+export interface M07BranchSelectionV1 {
+	version: 1;
+	parentTaskId: string;
+	selectedTaskId?: string;
+	rationale: string;
+	selectedAt: string;
+	/** Compact controller facts only; complete failures, paths and evidence remain on tasks. */
+	candidates: Array<{ taskId: string; status: M07TaskStatus; checks: Array<{ criterion: string; result: CheckResult }> }>;
+}
+
+export interface M07ExecutionRound {
+	index: number;
+	operationId: string;
+	/** New round records state the real boundary; optional when reading legacy logs. */
+	builderContext?: { mode: "fresh" | "continue" | "fork"; reason: string };
+	builderReportPath: string;
+	reviewerSnapshotPath?: string;
+	reviewerReportPath?: string;
+	reviewerSession?: SessionRef;
+	verdict?: "ready" | "revise" | "replan" | "blocked";
+	feedback?: string;
+	completedAt: string;
 }
 
 export interface TaskCheck {
@@ -91,12 +133,16 @@ export interface M07OperationV1 {
 	version: 1;
 	id: string;
 	taskId: string;
-	status: "prepared" | "issued" | "response-received" | "unknown" | "confirmed" | "not-issued";
+	/** Historical partial-settled receipts remain readable; new execution does not
+	 * create a monetary or call-count local refusal. */
+	status: "prepared" | "issued" | "response-received" | "partial-settled" |
+		"terminal-response-incomplete" | "unknown" | "confirmed" | "not-issued";
 	issuedAt: string;
 	resolvedAt?: string;
 	evidencePath?: string;
 	externalId?: string;
-	observationMethod?: "external-query" | "local-tool-log";
+	observationMethod?: "external-query" | "local-tool-log" | "host-local-admission-rejection" |
+		"host-terminal-response" | "host-request-contract-preflight";
 }
 
 export interface M07AttemptV1 {
@@ -149,6 +195,13 @@ export interface M07TaskRecord extends TaskSpecInput {
 	readCoverage: string[];
 	executionFailure?: string;
 	toolLog: unknown[];
+	executionRounds?: M07ExecutionRound[];
+	loopStopReason?: "ready" | "max-rounds" | "deadline" | "budget-boundary" | "provider-call-limit" |
+		"output-limit" | "replan" | "blocked" | "reviewer-invalid" | "request-contract-invalid";
+	/** Available only after a stable task completed and its evidence was frozen. */
+	branchSource?: M07BranchSourceV1;
+	branchUnavailableReason?: string;
+	planCopy?: string;
 	knowledgeSnapshot?: string;
 	m04BaselineRunId?: string;
 	/** Selection is not proof of faithful use or causal benefit. */
@@ -176,6 +229,14 @@ export interface UserDecision {
 	resolvedAt?: string;
 }
 
+/** Failed judgments stay negative history; their drafts confer no knowledge authority. */
+export interface M04BaselineFailure {
+	runId: string;
+	transactionState: "no-proposal" | "rejected-draft";
+	failures: string[];
+	remarks: string[];
+}
+
 export interface CurrentGoal {
 	version: 1;
 	runId: string;
@@ -192,7 +253,12 @@ export interface CurrentGoal {
 	problemSnapshotPath: string;
 	knowledgeSnapshot?: string;
 	m04BaselineRunId?: string;
-	baselineHistory: Array<{ at: string; knowledgeSnapshot?: string; m04RunId: string }>;
+	/** Explicitly acknowledged failed suffix, frozen even for an exploratory goal. */
+	m04BaselineFailures?: M04BaselineFailure[];
+	/** Host-selected original material scope; legacy goals retain workspace raw inputs. */
+	checkpointRawScope?: "workspace" | "none";
+	baselineHistory: Array<{ at: string; knowledgeSnapshot?: string; m04RunId: string;
+		failedM04?: M04BaselineFailure[] }>;
 	/** Frozen at begin; later promotion or rollback applies only to a new goal. Optional only for explicit legacy-record detection. */
 	budgetPolicy?: BudgetPolicy;
 	budgetPolicyVersionId?: string;
@@ -210,6 +276,7 @@ export interface CurrentGoal {
 	checkpoints?: M07CheckpointRecord[];
 	/** Frozen checkpoint snapshot only; omitted task evidence remains in the live goal, outside M04's read grant. */
 	checkpointScope?: { selectedTaskIds: string[]; omittedTaskIds: string[] };
+	branchSelections?: M07BranchSelectionV1[];
 	/** Controller-frozen method body. Later pointer changes never hot-replace it. */
 	workflowMethod?: { versionId: string; artifact: M07WorkflowStrategyV1; requiredExperienceRefs: ExperienceRequirementV1[]; requiredKnowledgeRefs: KnowledgeRef[] };
 	tasks: M07TaskRecord[];
@@ -226,11 +293,16 @@ export interface CurrentGoal {
 }
 
 export interface M07Controller {
-	begin(input: BeginGoalInput, options?: { executionContract?: "continuous" }): Promise<CurrentGoal>;
+	begin(input: BeginGoalInput, options?: { executionContract?: "continuous";
+		checkpointRawScope?: "workspace" | "none" }): Promise<CurrentGoal>;
 	status(runId: string): Promise<CurrentGoal>;
 	plan(runId: string, plan: string, options?: { refreshBaseline?: boolean; checkpointId?: string; m04RunId?: string }): Promise<CurrentGoal>;
 	checkpoint(runId: string, options?: { taskIds?: string[] }): Promise<M07CheckpointRecord>;
-	delegate(runId: string, task: TaskSpecInput): Promise<M07TaskRecord>;
+	/** Called after the task and prepared operation are saved, before any runner session starts. */
+	delegate(runId: string, task: TaskSpecInput,
+		afterPrepared?: (runId: string, taskId: string) => Promise<void>): Promise<M07TaskRecord>;
+	/** Select among reviewed candidates. No selection is a valid partial/blocked outcome. */
+	selectBranch(runId: string, input: { parentTaskId: string; selectedTaskId?: string; rationale: string }): Promise<CurrentGoal>;
 	review(runId: string, input: TaskReviewInput): Promise<M07TaskRecord>;
 	decision(runId: string, input: DecisionInput): Promise<CurrentGoal>;
 	finish(runId: string, input: FinishInput): Promise<CurrentGoal>;

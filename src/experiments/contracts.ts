@@ -21,32 +21,38 @@ export interface BudgetLease {
 }
 
 export interface BudgetLimits {
-	maxProviderCalls: number;
-	maxInputTokens: number;
-	maxOutputTokens: number;
-	/** Cap on Pi SDK price-table estimates, not a provider invoice. */
-	maxSdkEstimatedCost: number;
-	maxProbeCalls: number;
-	/** Host CPU charged by environment probes; model/provider compute is outside this counter. */
-	maxCpuMillis: number;
-	maxWallMillis: number;
+	/** Historical SDK-estimate display reference. Never an execution cap. */
+	maxSdkEstimatedCost?: number;
+	/** Historical plan fields remain readable, but are never active resource quotas. */
+	maxProviderCalls?: number;
+	maxInputTokens?: number;
+	maxOutputTokens?: number;
+	maxProbeCalls?: number;
+	maxCpuMillis?: number;
+	maxWallMillis?: number;
 }
 
 export interface BudgetStatus {
 	lifecycle: "allocated" | "running" | "closed";
-	limits: BudgetLimits;
-	/** Includes reservations for still-in-flight calls. */
+	/** Historical monetary reference, when supplied. Display only. */
+	limits: Pick<BudgetLimits, "maxSdkEstimatedCost">;
+	/** Observed usage, including a started call awaiting settlement. */
 	committed: { providerCalls: number; inputTokens: number; outputTokens: number; sdkEstimatedCost: number; probeCalls: number; cpuMillis: number };
-	reserved: { inputTokens: number; outputTokens: number; sdkEstimatedCost: number };
-	remaining: { providerCalls: number; inputTokens: number; outputTokens: number; sdkEstimatedCost: number; probeCalls: number; cpuMillis: number; wallMillis: number };
+	/** Input is an accounting estimate, never an enforced token envelope. */
+	reserved: { inputTokens: number; sdkEstimatedCost: number };
+	/** Historical monetary reference less observed/reserved estimates; display only. */
+	remaining: { sdkEstimatedCost?: number };
+	/** Distinguishes a live request from incomplete historical usage. */
+	inFlight: boolean;
+	usageUnknown: boolean;
 	settlement: "settled" | "pending-or-unknown" | "exceeded";
 }
 
 export interface PromptReservation {
 	id: string;
 	leaseId: string;
+	/** Historical API name for a visible-input accounting estimate; not a quota. */
 	maxInputTokens: number;
-	maxOutputTokens: number;
 	maxSdkEstimatedCost: number;
 }
 
@@ -88,9 +94,6 @@ export type ScientificAction =
 	| { kind: "probe"; actionId: string; x: number }
 	| { kind: "submit"; actionId: string; hypothesisId: string; explanation?: string }
 	| { kind: "stop"; actionId: string; reason: string };
-
-/** Admission uses this host-enforced default; planning must reserve every possible step. */
-export const MAX_EXECUTOR_EPISODE_ACTIONS = 3;
 
 /** The model parser and CPU environment must accept exactly the same IDs. */
 export function isScientificActionId(value: unknown): value is string {

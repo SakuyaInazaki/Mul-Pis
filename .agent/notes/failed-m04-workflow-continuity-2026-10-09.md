@@ -1,0 +1,19 @@
+# Failed M04 workflow continuity
+
+The generic M07 baseline resolver previously stopped at every latest failed M04, including a host-recorded read-only judgment with no proposal. A failed scientific judgment must remain historical evidence, but proven absence of knowledge adoption does not require repeating that judgment before a fresh task can begin.
+
+The resolver now checks the consecutive failed suffix against exact host transaction files, rejected-draft validation receipts and draft identities. Unknown or merge-pending transactions, missing or inconsistent evidence, unreconciled store merges and ambiguous run order still block. A prior completed baseline is usable only at the exact current published knowledge epoch. Without a completed baseline the built-in adapter starts an explicitly exploratory goal, using the current knowledge epoch and retaining failed-stage feedback. The failed run and rejected drafts are never adopted or rewritten.
+
+New goals freeze the failed M04 suffix. Task prompts and M04 feedback carry that negative history; an existing goal must explicitly acknowledge a changed suffix before another task. The existing M04 transaction and validation control-file byte boundaries are preserved, without adding a task, model, retry or cost ceiling.
+
+The default mission host can reuse one already admitted assessment only after proving the exact assessment-to-intent checkpoint chain, unchanged original evidence and capabilities, a failed MISSION with the matching independent assessor session, and absence of M07, partial lineage, pending host operations or later M04 work. Re-ownership appends byte-identical progress, preserving the same unresolved intent and failed MISSION bytes until a new bounded result commits. The original assessment and scientific history are not re-prompted or rewritten.
+
+Retained task dispatch checks the live problem and raw inventory against the authenticated original inputs before creating M07. It then verifies the actual prepared task copies against evidence identities captured during host proof, before opening the provider. This catches input drift between the proof, live read and task preparation. Retained tasks receive their authenticated original frozen evidence rather than adding incidental raw files.
+
+The retained input contract also captures the exact M04 run census and resolved baseline identity. Both are rechecked before M07 creation and after the prepared-input reads, so a new M04 with an unchanged knowledge epoch cannot silently change the saved task's authority. Changed context remains an explicit held boundary; automatic invalidation and reassessment are a separate continuation path.
+
+Declared material bundles set a persisted `checkpointRawScope` of `none` on their M07 goal. Every checkpoint, including later recovery, follows that scope and excludes ambient workspace raw files from the task and M04 evidence. Ordinary and legacy goals retain the default `workspace` scope. An offline composition regression verifies a retained declared-material mission with populated ambient raw through M07, checkpoint and fresh M04 without importing those incidental files.
+
+Offline regressions cover the default adapter with only a failed no-proposal M04, rejected-only draft continuity, explicit formal-baseline acknowledgement, unknown and merge-pending states, contradictory proposals, changed validation receipts and unexplained current-knowledge changes. Default composition tests also cover immutable assessment reuse, kill after re-ownership and process restart, parallel callers, unknown operations, orphan or partial dispatch, later M04, source/copy tampering, unknown evidence members, and live or prepared-input drift. The retained unresolved intent is cleared only by a new bounded result.
+
+No live missions, model calls or external services are modified by this source repair.

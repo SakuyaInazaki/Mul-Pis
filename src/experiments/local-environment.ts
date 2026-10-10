@@ -10,6 +10,7 @@ export interface CpuResponseCase {
 	hypotheses: PublicHypothesis[];
 	initialX: number[];
 	allowedProbeX: number[];
+	/** Scientific measurement allowance for this case, not an aggregate workflow quota. */
 	maxProbeCalls: number;
 	tolerance: number;
 	units: { x: string; y: string };
@@ -35,13 +36,14 @@ function matches(h: PublicHypothesis, observations: NumericObservation[], tolera
 export function validateCpuCaseSet(input: unknown): CpuCaseSetV1 {
 	if (!input || typeof input !== "object") throw new Error("case set must be an object");
 	const set = input as CpuCaseSetV1;
-	if (set.version !== 1 || !["development", "admission"].includes(set.split) || !Array.isArray(set.cases) || set.cases.length === 0 || set.cases.length > 32) throw new Error("invalid CPU case set");
+	if (set.version !== 1 || !["development", "admission"].includes(set.split) || !Array.isArray(set.cases) || set.cases.length === 0) throw new Error("invalid CPU case set");
 	const seen = new Set<string>();
 	for (const c of set.cases) {
 		if (!c || c.version !== 1 || typeof c.id !== "string" || !/^[a-zA-Z0-9_-]{1,80}$/.test(c.id) || seen.has(c.id)) throw new Error("invalid or duplicate CPU case id");
 		seen.add(c.id);
-		if (!Array.isArray(c.hypotheses) || c.hypotheses.length < 2 || c.hypotheses.length > 8 || !Array.isArray(c.initialX) || c.initialX.length < 1 || c.initialX.length > 8 || !Array.isArray(c.allowedProbeX) || c.allowedProbeX.length < 1 || c.allowedProbeX.length > 16) throw new Error("invalid CPU case dimensions");
-		if (!Number.isInteger(c.maxProbeCalls) || c.maxProbeCalls < 1 || c.maxProbeCalls > 16 || !finite(c.tolerance) || c.tolerance < 0 || c.tolerance > 1) throw new Error("invalid CPU case limits");
+		// The finite hypothesis domain is part of this bitmask-based CPU experiment.
+		if (!Array.isArray(c.hypotheses) || c.hypotheses.length < 2 || c.hypotheses.length > 8 || !Array.isArray(c.initialX) || c.initialX.length < 1 || !Array.isArray(c.allowedProbeX) || c.allowedProbeX.length < 1) throw new Error("invalid CPU case dimensions");
+		if (!Number.isSafeInteger(c.maxProbeCalls) || c.maxProbeCalls < 1 || !finite(c.tolerance) || c.tolerance < 0 || c.tolerance > 1) throw new Error("invalid CPU case limits");
 		if (!c.units || typeof c.units.x !== "string" || typeof c.units.y !== "string" || c.units.x.length > 40 || c.units.y.length > 40) throw new Error("invalid CPU units");
 		if (![...c.initialX, ...c.allowedProbeX].every((x) => typeof x === "number" && finite(x) && Math.abs(x) <= 1e6)) throw new Error("invalid CPU probe coordinate");
 		const ids = new Set<string>();
@@ -106,7 +108,7 @@ export function createCpuResponseEnvironment(caseInput: CpuResponseCase, budget:
 	const feedback = (s: State, actionId: string, status: DevelopmentFeedback["status"], observations: NumericObservation[] = []): DevelopmentFeedback => ({ version: 1, id: randomUUID(), startId: s.start.id, actionId, status, observations: structuredClone(observations), remainingProbeCalls: c.maxProbeCalls - s.probes, checks: [], evidence: [], visibility: "development" });
 	const begin = (s: State, action: ScientificAction): DevelopmentFeedback | undefined => {
 		const keys = action?.kind === "probe" ? ["kind", "actionId", "x"] : action?.kind === "submit" ? ["kind", "actionId", "hypothesisId", "explanation"] : action?.kind === "stop" ? ["kind", "actionId", "reason"] : [];
-		if (!keys.length || Object.keys(action).some((key) => !keys.includes(key)) || !isScientificActionId(action.actionId) || Buffer.byteLength(JSON.stringify(action), "utf8") > 1024 || (action.kind === "submit" && (typeof action.hypothesisId !== "string" || (action.explanation !== undefined && (typeof action.explanation !== "string" || action.explanation.length > 500)))) || (action.kind === "stop" && (typeof action.reason !== "string" || action.reason.length > 500))) throw new Error("invalid or oversized CPU action");
+		if (!keys.length || Object.keys(action).some((key) => !keys.includes(key)) || !isScientificActionId(action.actionId) || Buffer.byteLength(JSON.stringify(action), "utf8") > 1024 || (action.kind === "submit" && (typeof action.hypothesisId !== "string" || (action.explanation !== undefined && typeof action.explanation !== "string"))) || (action.kind === "stop" && typeof action.reason !== "string")) throw new Error("invalid or oversized CPU action");
 		const prior = s.actions.get(action.actionId);
 		if (prior) {
 			if (JSON.stringify(prior.action) !== JSON.stringify(action)) throw new Error("CPU action id collision");
@@ -150,7 +152,7 @@ export function createCpuResponseEnvironment(caseInput: CpuResponseCase, budget:
 		else if (s.probes >= c.maxProbeCalls) result = feedback(s, action.actionId, "resource-exhausted");
 		else {
 			try { budget.reserveProbe(lease); }
-			catch { result = feedback(s, action.actionId, budget.status(lease).remaining.wallMillis <= 0 ? "timed-out" : "resource-exhausted"); return persist(s, action, result); }
+			catch { result = feedback(s, action.actionId, "resource-exhausted"); return persist(s, action, result); }
 			const cpuStart = process.cpuUsage();
 			const observation: NumericObservation = { x: action.x, y: value(truth, action.x), xUnit: c.units.x, yUnit: c.units.y, source: "probe" };
 			s.probes++;
@@ -165,8 +167,6 @@ export function createCpuResponseEnvironment(caseInput: CpuResponseCase, budget:
 		const s = state(start);
 		const previous = begin(s, action);
 		if (previous) return previous;
-		const budgetStatus = budget.status(lease);
-		if (budgetStatus.settlement !== "settled" || budgetStatus.remaining.wallMillis <= 0 || budgetStatus.remaining.cpuMillis <= 0) return persist(s, action, feedback(s, action.actionId, budgetStatus.remaining.wallMillis <= 0 ? "timed-out" : "resource-exhausted"));
 		const selected = c.hypotheses.find((h) => h.id === action.hypothesisId);
 		const surviving = c.hypotheses.filter((h) => matches(h, s.observations, c.tolerance));
 		const status: DevelopmentFeedback["status"] = s.stopped || !selected || !action.actionId || action.actionId.length > 100 ? "invalid" : !surviving.some((h) => h.id === selected.id) ? "contradicted" : surviving.length === 1 ? "supported-by-observations" : "underdetermined";
@@ -178,7 +178,7 @@ export function createCpuResponseEnvironment(caseInput: CpuResponseCase, budget:
 		const s = state(start);
 		const previous = begin(s, action);
 		if (previous) return previous;
-		if (!action.actionId || action.actionId.length > 100 || typeof action.reason !== "string" || action.reason.length > 500) return persist(s, action, feedback(s, action.actionId, "invalid"));
+		if (!action.actionId || action.actionId.length > 100 || typeof action.reason !== "string") return persist(s, action, feedback(s, action.actionId, "invalid"));
 		s.stopped = true;
 		const result = feedback(s, action.actionId, "stopped");
 		return persist(s, action, result);
@@ -190,7 +190,7 @@ export function createCpuResponseEnvironment(caseInput: CpuResponseCase, budget:
 			catch { checks.push({ name, passed: false }); }
 		};
 		const notApplicable = (name: EnvironmentHealthReport["checks"][number]["name"], detail: string) => checks.push({ name, passed: false, applicability: "not-applicable", detail });
-		const limits = { maxProviderCalls: 1, maxInputTokens: 1, maxOutputTokens: 1, maxSdkEstimatedCost: 1, maxProbeCalls: 100, maxCpuMillis: 1000, maxWallMillis: 1000 };
+		const limits = { maxSdkEstimatedCost: 1 };
 		const labBudget = new SharedBudget(`cpu-health-${randomUUID()}`, limits);
 		const lab = createCpuResponseEnvironment(c, labBudget);
 		const sequence = referenceSequence(initial(), c.maxProbeCalls);
@@ -250,21 +250,15 @@ export function createCpuResponseEnvironment(caseInput: CpuResponseCase, budget:
 			return forked.inputSnapshotId === s.inputSnapshotId && forked.id !== s.id && (await lab.development.runProbe(forked, { kind: "probe", actionId: "p", x: anyProbeX }, labBudget.root)).remainingProbeCalls === c.maxProbeCalls - 1;
 		});
 		await add("resource", async () => {
-			const tight = new SharedBudget(`cpu-health-resource-${randomUUID()}`, { ...limits, maxProbeCalls: 0 });
-			const e = createCpuResponseEnvironment(c, tight).development;
+			const e = createCpuResponseEnvironment({ ...c, maxProbeCalls: 1 }, labBudget).development;
 			const s = await e.prepare("health-resource");
-			return (await e.runProbe(s, { kind: "probe", actionId: "p", x: c.allowedProbeX[0]! }, tight.root)).status === "resource-exhausted";
+			if ((await e.runProbe(s, { kind: "probe", actionId: "permitted", x: anyProbeX }, labBudget.root)).status !== "observed") return false;
+			return (await e.runProbe(s, { kind: "probe", actionId: "extra", x: anyProbeX }, labBudget.root)).status === "resource-exhausted";
 		});
 		await add("invalid-action", async () => {
 			const s = await lab.development.prepare("health-invalid");
 			const outside = Math.max(...c.allowedProbeX) + 1;
 			return (await lab.development.runProbe(s, { kind: "probe", actionId: "invalid", x: outside }, labBudget.root)).status === "invalid";
-		});
-		await add("timeout", async () => {
-			const expired = new SharedBudget(`cpu-health-timeout-${randomUUID()}`, { ...limits, maxWallMillis: 0 });
-			const e = createCpuResponseEnvironment(c, expired).development;
-			const s = await e.prepare("health-timeout");
-			return (await e.runProbe(s, { kind: "probe", actionId: "p", x: c.allowedProbeX[0]! }, expired.root)).status === "timed-out";
 		});
 		return { usable: checks.every((item) => item.passed || item.applicability === "not-applicable"), classification, checks };
 	};
@@ -284,15 +278,6 @@ export function createCpuResponseEnvironment(caseInput: CpuResponseCase, budget:
 				const surviving = c.hypotheses.filter((h) => matches(h, s.observations, c.tolerance));
 				if (surviving.length <= 1) return { status: "premature-stop", quality: "none", evidence: [] };
 				const caseRemaining = Math.max(0, c.maxProbeCalls - s.probes);
-				if (lease) {
-					const own = budget.status(lease), root = budget.status(budget.root);
-					if (own.settlement !== "settled" || root.settlement !== "settled") return { status: "inconclusive", quality: "none", evidence: [] };
-					if (own.remaining.wallMillis <= 0 || root.remaining.wallMillis <= 0 || own.remaining.cpuMillis <= 0 || root.remaining.cpuMillis <= 0) return { status: "resource-exhausted", quality: "none", evidence: [] };
-					if (own.remaining.probeCalls < caseRemaining || root.remaining.probeCalls < caseRemaining) {
-						const affordable = Math.min(caseRemaining, own.remaining.probeCalls, root.remaining.probeCalls);
-						if (referenceSequence(s.observations, caseRemaining) !== undefined && referenceSequence(s.observations, affordable) === undefined) return { status: "resource-exhausted", quality: "none", evidence: [] };
-					}
-				}
 				const canResolve = referenceSequence(s.observations, caseRemaining) !== undefined;
 				return canResolve ? { status: "premature-stop", quality: "none", evidence: [] } : { status: "justified-unknown", quality: "partial", evidence: [] };
 		},

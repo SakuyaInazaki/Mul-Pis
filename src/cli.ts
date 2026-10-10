@@ -22,7 +22,11 @@
  *       --delivery-scope <json> --reproduction <json> [--closure-requested]
  *                                在严格配对的 M08/M04 版本上解释、复核交付副本并记录收口
  *   status                       runs, snapshot, limits
- *   goal status|reconcile|recover|successor  inspect or explicitly reconcile/recover M07 attempts
+ *   goal status|delegate|select-branch|reconcile|recover|successor
+ *                                inspect or control one M07 goal; delegate accepts --task <json>
+ *   mission start [--original <json>]  freeze workspace problem.md or structured user objective
+ *   mission run|resume|status --mission <id>
+ *                                run or inspect one local mission without a GitHub control ref
  *   improve run|status|rollback|export|bind  run a bounded campaign (--plan <json>) or manage a budget method
  *   knowledge pack --purpose <text> [--ids C001,K002] [--terms a,b]
  *   knowledge views              regenerate derived views
@@ -34,7 +38,7 @@ import path from "node:path";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { createFileKnowledgeStore } from "./knowledge/store.ts";
-import { FakeSessionRunner } from "./runner/fake.ts";
+import { FakeSessionRunner, createTrustedCliFakeRunner } from "./runner/fake.ts";
 import type { SessionRunner } from "./runner/types.ts";
 import type { StageContext } from "./stages/context.ts";
 import { CONFIG_TEMPLATE, runInit } from "./stages/init.ts";
@@ -55,8 +59,12 @@ import type { ResearchCampaignPlanV1 } from "./improvement/research-types.ts";
 import { publicResearchRun, publicResearchStatus } from "./improvement/research-public.ts";
 import type { KnowledgeRef } from "./knowledge/types.ts";
 import { createM07Controller } from "./m07/controller.ts";
+import { publicLocalMissionStatus, validateLocalObjectiveRequest } from "./m07/local-original-objective.ts";
+import { openDefaultLocalMission } from "./m07/local-mission.ts";
+import { reconcileInterruptedLocalMission, reconcileLegacyInterruptedLocalMission,
+	type InterruptedLocalReviewRequestV1, type LegacyInterruptedLocalReviewRequestV1 } from "./m07/local-interrupted-reconcile.ts";
 import { summarizeGoalExecution } from "./m07/status.ts";
-import type { CurrentGoal } from "./m07/types.ts";
+import type { CurrentGoal, TaskSpecInput } from "./m07/types.ts";
 import type { RunDescriptorV1 } from "./runtime/run-descriptor.ts";
 
 interface ParsedArgs {
@@ -95,6 +103,8 @@ function has(args: ParsedArgs, name: string): boolean {
 
 async function makeRunner(kind: string): Promise<SessionRunner> {
 	if (kind === "fake") {
+		const trusted = createTrustedCliFakeRunner();
+		if (trusted) return trusted;
 		return new FakeSessionRunner(({ spec, turnIndex }) => ({
 			text:
 				spec.role === "improver" && spec.label.startsWith("I-workflow-")
@@ -110,7 +120,65 @@ async function makeRunner(kind: string): Promise<SessionRunner> {
 }
 
 function usage(): string {
-	return `用法：node src/cli.ts <init|m01|m02|m03|m04|m05|m06|m08|m09|status|knowledge|improve|goal> [选项]\n  --workspace <dir>   工作区（默认当前目录）\n  --runner pi|fake    会话运行器（默认 pi）\n  goal status --run <id>；reconcile --run <id> --operation <id> --evidence <json>；recover --run <id> --attempt <old-id> --descriptor <new-pi-json>；successor --run <id> --descriptor <new-pi-json>\n  improve run|status|rollback|export|bind（旧预算机制实验；run 必须给 --plan <json>）\n  improve research bootstrap --methods <json>；run --plan <json>；workflow run --plan <json>；status|rollback|export|bind\n  research run 研究 CPU H/I；workflow run 显式研究 M07 evidence-handoff 单槽，缺独立 G 时仅留档\n  m08 的 materials/self-checks/reviewers 是显式 JSON 文件\n  m09 的 delivery-scope/reproduction 是显式 JSON 文件；instructions 是预授权的精确 shell 命令，read-only 时应为空；不会自动发布\n详见 src/cli.ts 顶部说明。`;
+	return `用法：node src/cli.ts <init|m01|m02|m03|m04|m05|m06|m08|m09|status|knowledge|improve|goal|mission> [选项]\n  --workspace <dir>   工作区（默认当前目录）\n  --runner pi|fake    会话运行器（默认 pi）\n  mission start [--original <json>]：默认固定工作区 problem.md 原文作为开放目标；JSON 可给出明确义务和有限收口条件\n  mission run|resume|status --mission <id>：执行、继续或只查看一项本地任务；无需 GitHub 参数\n  mission reconcile --mission <id> --review <json>：核对未来版本化双向派发血缘与旧终态，写入仅供新工作使用的 checkpoint\n  mission reconcile-legacy --mission <id> --review <json> [--apply]：默认只读 dry-run；仅在完整旧源代码、串行归属与效果审查通过后，显式 --apply 才写入独立的 legacy 审查 checkpoint\n  goal status --run <id>：只显示控制摘要，不输出原始会话或 toolLog\n  goal delegate --run <id> --task <json> [--runner pi|fake]：执行有界任务；fork 须在 task.context 中给出 mode=fork、同一 parentRunId、parentTaskId、checkpointId，并保持原 objective/inputs/outputs/checks 等义务\n  goal select-branch --run <id> --parent-task <T-id> --rationale <text> [--selected-task <T-id>]：选择已评审接受的候选；省略 selected-task 即明确不选\n  goal reconcile --run <id> --operation <id> --evidence <json>；recover --run <id> --attempt <old-id> --descriptor <new-pi-json>；successor --run <id> --descriptor <new-pi-json>\n  improve run|status|rollback|export|bind（旧预算机制实验；run 必须给 --plan <json>）\n  improve research bootstrap --methods <json>；run --plan <json>；workflow run --plan <json>；status|rollback|export|bind\n  research run 研究 CPU H/I；workflow run 显式研究 M07 evidence-handoff 单槽，缺独立 G 时仅留档\n  m08 的 materials/self-checks/reviewers 是显式 JSON 文件\n  m09 的 delivery-scope/reproduction 是显式 JSON 文件；instructions 是预授权的精确 shell 命令，read-only 时应为空；不会自动发布\n详见 src/cli.ts 顶部说明。`;
+}
+
+function publicGoal(goal: CurrentGoal): Record<string, unknown> {
+	return {
+		runId: goal.runId, lifecycle: goal.lifecycle, outcome: goal.outcome,
+		...summarizeGoalExecution(goal),
+		tasks: goal.tasks.map((task) => ({ taskId: task.taskId, status: task.status, mode: task.mode,
+			context: task.context, branchCheckpointId: task.branchSource?.checkpoint.id,
+			branchUnavailable: Boolean(task.branchUnavailableReason) })),
+		branchSelections: (goal.branchSelections ?? []).map((selection) => ({ parentTaskId: selection.parentTaskId,
+			selectedTaskId: selection.selectedTaskId, candidateCount: selection.candidates.length,
+			candidates: selection.candidates.map((candidate) => ({ taskId: candidate.taskId, status: candidate.status,
+				passedChecks: candidate.checks.filter((check) => check.result === "passed").length,
+				failedChecks: candidate.checks.filter((check) => check.result === "failed").length })) })),
+	};
+}
+
+function strictFlags(args: ParsedArgs, names: string[], counts: number[] = [2]): void {
+	if (!counts.includes(args.positional.length) || [...args.flags].some(([name, values]) => !names.includes(name) || values.length !== 1 || !values[0]?.trim())) throw new HarnessError("cli.goal", "goal 子命令包含多余、重复或空参数");
+}
+
+function missionFlags(args: ParsedArgs, action: string): void {
+	const names = action === "start" ? ["workspace", "runner", "original"] :
+		action === "status" ? ["workspace", "mission"] :
+			["reconcile", "reconcile-legacy"].includes(action) ?
+				["workspace", "mission", "review", ...(action === "reconcile-legacy" ? ["apply"] : [])] :
+				["workspace", "runner", "mission"];
+	if (args.positional.length !== 2 ||
+		!["start", "run", "resume", "status", "reconcile", "reconcile-legacy"].includes(action) ||
+		[...args.flags].some(([name, values]) => !names.includes(name) ||
+			values.length !== 1 || !values[0]?.trim()) ||
+		(action !== "start" && !flag(args, "mission")) ||
+		(["reconcile", "reconcile-legacy"].includes(action) && !flag(args, "review")) ||
+		(action === "reconcile-legacy" && has(args, "apply") && flag(args, "apply") !== "true"))
+		throw new HarnessError("cli.mission", "mission 需要 start [--original <json>] 或 run|resume|status --mission <id>；不接受多余或重复参数");
+	if (action !== "status" && action !== "reconcile" && action !== "reconcile-legacy" &&
+		!["pi", "fake"].includes(flag(args, "runner") ?? "pi"))
+		throw new HarnessError("cli.mission", "mission 的 --runner 仅可为 pi 或 fake");
+}
+
+function taskSpec(value: unknown, runId: string): TaskSpecInput {
+	const object = (item: unknown): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item);
+	const keys = (item: Record<string, unknown>, allowed: string[]) => Object.keys(item).every((key) => allowed.includes(key));
+	const str = (item: unknown) => typeof item === "string" && !!item.trim();
+	const strs = (item: unknown) => Array.isArray(item) && item.every(str);
+	const refs = (item: unknown) => Array.isArray(item) && item.every((ref) => object(ref) && keys(ref, ["storeId", "recordId", "version"]) && str(ref.storeId) && str(ref.recordId) && Number.isInteger(ref.version) && Number(ref.version) > 0);
+	if (!object(value) || !keys(value, ["objective", "inputs", "expectedOutputs", "checks", "mode", "parentTaskId", "supersedesTaskId", "requireIndependentCheck", "knowledgeIds", "experienceRefs", "experienceContextRefs", "experienceTags", "planInput", "resourceInputs", "executionLoop", "lessonDeltaOutput", "context"]) || !str(value.objective) || !strs(value.inputs) || !strs(value.expectedOutputs) || !strs(value.checks) || !["execute", "check", "reason"].includes(String(value.mode))) throw new HarnessError("cli.goal", "--task 不是有界 M07 TaskSpecInput");
+	for (const key of ["parentTaskId", "supersedesTaskId", "planInput", "lessonDeltaOutput"]) if (value[key] !== undefined && !str(value[key])) throw new HarnessError("cli.goal", `--task.${key} 必须是非空字符串`);
+	for (const key of ["knowledgeIds", "experienceTags"]) if (value[key] !== undefined && !strs(value[key])) throw new HarnessError("cli.goal", `--task.${key} 必须是字符串数组`);
+	for (const key of ["experienceRefs", "experienceContextRefs"]) if (value[key] !== undefined && !refs(value[key])) throw new HarnessError("cli.goal", `--task.${key} 必须是固定知识引用数组`);
+	if (value.requireIndependentCheck !== undefined && typeof value.requireIndependentCheck !== "boolean") throw new HarnessError("cli.goal", "--task.requireIndependentCheck 必须是布尔值");
+	if (value.resourceInputs !== undefined && (!Array.isArray(value.resourceInputs) || !value.resourceInputs.every((item: unknown) => object(item) && keys(item, ["id", "version", "input"]) && str(item.id) && str(item.version) && str(item.input)))) throw new HarnessError("cli.goal", "--task.resourceInputs 格式无效");
+	if (value.executionLoop !== undefined && (!object(value.executionLoop) || !(
+		(value.executionLoop.mode === "until-ready" && Object.keys(value.executionLoop).length === 1) ||
+		(keys(value.executionLoop, ["maxRounds", "deadlineAt"]) && Number.isSafeInteger(value.executionLoop.maxRounds) && str(value.executionLoop.deadlineAt))
+	))) throw new HarnessError("cli.goal", "--task.executionLoop 格式无效");
+	if (value.context !== undefined && (!object(value.context) || !keys(value.context, ["mode", "parentRunId", "parentTaskId", "checkpointId"]) || Object.keys(value.context).length !== 4 || value.context.mode !== "fork" || value.context.parentRunId !== runId || !str(value.context.parentTaskId) || !str(value.context.checkpointId))) throw new HarnessError("cli.goal", "--task.context 必须给出同一 goal 的精确 fork checkpoint 引用");
+	return value as unknown as TaskSpecInput;
 }
 
 async function jsonFile<T>(args: ParsedArgs, name: string): Promise<T> {
@@ -158,6 +226,66 @@ export async function main(argv: string[]): Promise<number> {
 		}
 		console.log("限制：running 状态不会自动重跑；M08 completed 不等于科研通过；M09 不发布或关闭 Pi，full-recomputation 请求不等于已完整复现。");
 		return 0;
+	}
+	if (command === "mission") {
+		const action = args.positional[1] ?? "";
+		missionFlags(args, action);
+		if (action === "reconcile") {
+			const request = await jsonFile<InterruptedLocalReviewRequestV1>(args, "review");
+			if (request.missionId !== flag(args, "mission"))
+				throw new HarnessError("cli.mission", "mission review belongs to another mission");
+			const reviewed = await reconcileInterruptedLocalMission({ workspaceRoot: ws.root, request });
+			console.log(JSON.stringify({ ...publicLocalMissionStatus(reviewed.progress),
+				review: { kind: reviewed.receipt.kind, intentId: reviewed.receipt.intentId,
+					oldAttemptId: reviewed.receipt.oldAttempt.attemptId,
+					newAttemptId: reviewed.receipt.newAttempt.attemptId } }, null, 2));
+			return 0;
+		}
+		if (action === "reconcile-legacy") {
+			const request = await jsonFile<LegacyInterruptedLocalReviewRequestV1>(args, "review");
+			if (request.missionId !== flag(args, "mission"))
+				throw new HarnessError("cli.mission", "legacy mission review belongs to another mission");
+			const dryRun = !has(args, "apply");
+			const reviewed = await reconcileLegacyInterruptedLocalMission({ workspaceRoot: ws.root,
+				request, dryRun });
+			console.log(JSON.stringify({ ...publicLocalMissionStatus(reviewed.progress), dryRun,
+				review: { kind: reviewed.receipt.kind, intentId: reviewed.receipt.intentId,
+					oldAttemptId: reviewed.receipt.oldAttempt.attemptId,
+					newAttemptId: reviewed.receipt.newAttempt.attemptId,
+					historicalExplicitDispatchBinding: false,
+					association: reviewed.receipt.association,
+					effectState: reviewed.receipt.effects,
+					authority: reviewed.receipt.authority } }, null, 2));
+			return 0;
+		}
+		if (action === "status") {
+			const host = openDefaultLocalMission({ workspaceRoot: ws.root });
+			console.log(JSON.stringify(publicLocalMissionStatus(await host.status(flag(args, "mission")!)), null, 2));
+			return 0;
+		}
+		const request = action === "start" ? flag(args, "original") ?
+			validateLocalObjectiveRequest(await jsonFile<unknown>(args, "original")) :
+			validateLocalObjectiveRequest({ version: 1, kind: "local-original-objective-request",
+				goal: (await ws.readProblem()).content, goalSource: "verbatim-private-input",
+				obligations: [{ id: "original-task", description: (await ws.readProblem()).content }],
+				closure: "open-ended" }) : undefined;
+		const host = openDefaultLocalMission({ workspaceRoot: ws.root,
+			runner: await makeRunner(flag(args, "runner") ?? "pi"), config: await ws.loadConfig(),
+			startOnly: action === "start", releaseOnReturn: action === "run" || action === "resume" });
+		if (action === "start") {
+			const progress = await host.begin(request!);
+			console.log(JSON.stringify({ missionId: progress.contract.id }, null, 2));
+			return 0;
+		}
+		const missionId = flag(args, "mission")!;
+		const progress = action === "run" ? await host.run(missionId) : await host.step(missionId);
+		console.log(JSON.stringify(publicLocalMissionStatus(progress), null, 2));
+		// A command that stopped on a repair, failed attempt, or suspended effect
+		// must signal that boundary to shell callers. Ordinary pending progress is
+		// still a successful control step, even when the objective is incomplete.
+		return progress.objectiveOutcome === "fulfilled" ||
+			progress.stopReason === "next-task-pending" ||
+			progress.stopReason === "objective-reassessment-pending" ? 0 : 1;
 	}
 	if (command === "improve") {
 		const action = args.positional[1] ?? "status";
@@ -218,21 +346,40 @@ export async function main(argv: string[]): Promise<number> {
 	if (command === "goal") {
 		const action = args.positional[1] ?? "status";
 		const runId = flag(args, "run");
-		if (!runId) throw new HarnessError("cli.goal", "goal 需要 --run <M07 runId>");
+		if (!runId?.trim()) throw new HarnessError("cli.goal", "goal 需要 --run <M07 runId>");
+		if (action === "delegate") {
+			strictFlags(args, ["workspace", "run", "task", "runner"]);
+			const kind = flag(args, "runner") ?? "pi";
+			if (kind !== "pi" && kind !== "fake") throw new HarnessError("cli.goal", "goal delegate 的 --runner 仅可为 pi 或 fake");
+			const task = taskSpec(await jsonFile<unknown>(args, "task"), runId);
+			const controller = createM07Controller({ ws, store, runner: await makeRunner(kind), config: await ws.loadConfig() });
+			const result = await controller.delegate(runId, task);
+			console.log(JSON.stringify({ taskId: result.taskId, status: result.status, mode: result.mode, context: result.context,
+				branchCheckpointId: result.branchSource?.checkpoint.id, branchUnavailable: Boolean(result.branchUnavailableReason) }, null, 2));
+			return 0;
+		}
+		if (action === "select-branch") {
+			strictFlags(args, ["workspace", "run", "parent-task", "selected-task", "rationale"]);
+			const parentTaskId = flag(args, "parent-task"), selectedTaskId = flag(args, "selected-task"), rationale = flag(args, "rationale");
+			if (!parentTaskId || !/^T\d{3,}$/.test(parentTaskId) || (selectedTaskId !== undefined && !/^T\d{3,}$/.test(selectedTaskId)) || !rationale?.trim()) throw new HarnessError("cli.goal", "goal select-branch 需要合法 --parent-task、可选 --selected-task、非空 --rationale");
+			const controller = createM07Controller({ ws, store, runner: new FakeSessionRunner(() => "unused"), config: { roles: {}, concurrency: 1, tools: {} } });
+			console.log(JSON.stringify(publicGoal(await controller.selectBranch(runId, { parentTaskId, ...(selectedTaskId === undefined ? {} : { selectedTaskId }), rationale })), null, 2));
+			return 0;
+		}
 		const controller = createM07Controller({ ws, store, runner: new FakeSessionRunner(() => "unused"), config: { roles: {}, concurrency: 1, tools: {} } });
-		if (action === "status") { console.log(JSON.stringify(await controller.status(runId), null, 2)); return 0; }
+		if (action === "status") { strictFlags(args, ["workspace", "run"], [1, 2]); console.log(JSON.stringify(publicGoal(await controller.status(runId)), null, 2)); return 0; }
 		if (action === "reconcile") {
 			const operationId = flag(args, "operation"), evidencePath = flag(args, "evidence");
 			if (!operationId || !evidencePath) throw new HarnessError("cli.goal", "goal reconcile 需要 --operation 和 --evidence；证据必须是实际外部查询的结构化回执");
-			console.log(JSON.stringify(await controller.hostReconcileOperation(runId, { operationId, evidencePath }), null, 2)); return 0;
+			console.log(JSON.stringify(publicGoal(await controller.hostReconcileOperation(runId, { operationId, evidencePath })), null, 2)); return 0;
 		}
 		if (action === "recover") {
 			const expectedAttemptId = flag(args, "attempt");
 			if (!expectedAttemptId) throw new HarnessError("cli.goal", "goal recover 需要 --attempt 旧 attempt ID 与 --descriptor 新 Pi 进程描述");
-			console.log(JSON.stringify(await controller.hostRecover(runId, { expectedAttemptId, runDescriptor: await jsonFile<RunDescriptorV1>(args, "descriptor") }), null, 2)); return 0;
+			console.log(JSON.stringify(publicGoal(await controller.hostRecover(runId, { expectedAttemptId, runDescriptor: await jsonFile<RunDescriptorV1>(args, "descriptor") })), null, 2)); return 0;
 		}
-		if (action === "successor") { console.log(JSON.stringify(await controller.hostCreateSuccessor(runId, { runDescriptor: await jsonFile<RunDescriptorV1>(args, "descriptor") }), null, 2)); return 0; }
-		throw new HarnessError("cli.goal", "goal 子命令：status | reconcile | recover | successor");
+		if (action === "successor") { console.log(JSON.stringify(publicGoal(await controller.hostCreateSuccessor(runId, { runDescriptor: await jsonFile<RunDescriptorV1>(args, "descriptor") })), null, 2)); return 0; }
+		throw new HarnessError("cli.goal", "goal 子命令：status | delegate | select-branch | reconcile | recover | successor");
 	}
 
 	const config = await ws.loadConfig();

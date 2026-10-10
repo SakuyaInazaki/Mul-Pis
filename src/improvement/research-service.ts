@@ -18,7 +18,7 @@ import { runExecutorEpisode, runExecutorQualityAdmission } from "./executor-eval
 import { GenerationStore, isCpuExecutorStrategy, isM07WorkflowStrategy, type ExperienceRequirementV1, type GenerationBundleV1, type ImproverStrategyV1, type M07WorkflowStrategyV1, type StrategyRecordV1, validateExperienceRequirements, validateStrategy } from "./generation.ts";
 import { advanceKnowledgeEpochInLock, transitionMethodKnowledgeDependenciesInLock } from "./knowledge-epoch.ts";
 import { bindMethodPackageV2, exportMethodPackageV2, readMethodPackageV2 } from "./method-v2.ts";
-import { buildMetaEpisode, loadMetaEpisode, metaEpisodeForModel, metaEpisodePath, type MetaEpisodeV1 } from "./meta-episode.ts";
+import { buildMetaEpisode, loadMetaEpisode, metaEpisodeForModel, metaEpisodePath, writeMetaEpisode, type MetaEpisodeV1 } from "./meta-episode.ts";
 import { runMetaImprovementAdmission, type ProducedSuccessorV1 } from "./meta-eval.ts";
 import { decisionPrompt, fullyReadDevelopmentFeedbackIds, improverSystemPrompt, validateResearchAction, type ResearchCaseViewV1, type ResearchDecisionViewV1, type ResearchInspectionRequestV1, type ResearchInspectionResultV1 } from "./policy-host.ts";
 import { runBoundedModelStep } from "./research-model.ts";
@@ -42,14 +42,13 @@ export async function verifyRequiredExperience(workspaceRoot: string, requiremen
   const requestedRefs = checked.filter((item) => item.targetKind === targetKind).map((item) => item.ref);
   if (!requestedRefs.length) continue;
   const result = await provider.select({ targetKind, applicability: { stage: "method-research", tags: ["cpu-response-identification"] }, requestedRefs,
-   expectedSnapshotId, maxRecords: 100, maxChars: 100_000 });
+   expectedSnapshotId, maxRecords: 1, maxChars: 1, verificationOnly: true });
   if (result.status !== "ready" || result.selected.length !== requestedRefs.length) throw new HarnessError("improvement.experience", "required method experience is unavailable, changed, or not locally registered");
  }
 }
 function combineKnowledgeRefs(...groups: KnowledgeRef[][]): KnowledgeRef[] {
  const refs = new Map<string, KnowledgeRef>();
  for (const ref of groups.flat()) refs.set(`${ref.storeId}/${ref.recordId}@${ref.version}`, ref);
- if (refs.size > 100) throw new HarnessError("improvement.experience", "inherited pinned knowledge references exceed limit");
  return [...refs.values()];
 }
 function combineRequirements(...groups: ExperienceRequirementV1[][]): ExperienceRequirementV1[] {
@@ -170,7 +169,7 @@ export class ResearchImprovementService {
   return bindMethodPackageV2(this.store, packagePath, active, `manual-bind-${RUN_ID()}`); }); }
  async run(input: unknown): Promise<ResearchRunV1> { const plan = validateResearchPlan(input); return this.withMutation(() => this.runUnlocked(plan)); }
  /** Explicit M07 method study. It cannot be reached from normal research or M07 begin. */
- async runWorkflow(input: unknown) { const plan = validateWorkflowPlan(input); return this.withMutation(() => runWorkflowEvidenceHandoff({ ws: this.ws, store: this.store, runner: this.runner, plan })); }
+ async runWorkflow(input: unknown) { const plan = validateWorkflowPlan(input); return this.withMutation(() => runWorkflowEvidenceHandoff({ ws: this.ws, store: this.store, runner: this.runner, plan, registeredExperienceStores: this.registeredExperienceStores })); }
 
  private async runUnlocked(plan: ResearchCampaignPlanV1): Promise<ResearchRunV1> {
   const active = await this.store.active(); if (!active) throw new HarnessError("improvement.generation", "bootstrap a human-seeded research generation first");
@@ -181,7 +180,7 @@ export class ResearchImprovementService {
    developmentCaseSetPath: path.join(dir, "development-cases.private.json"), ...(plan.admissionCaseSetPath ? { admissionCaseSetPath: path.join(dir, "admission-cases.private.json") } : {}),
    status: "running", candidates: [], decisions: [], feedback: [] };
   const save = async () => { run.budgetAtEnd = budget.status(); await writeFileAtomic(statePath, `${JSON.stringify(run, null, 2)}\n`); };
-  const budget = new SharedBudget(id, plan.budget);
+  const budget = new SharedBudget(id, plan.budget ?? {});
   await writeFileAtomic(planPath, `${JSON.stringify({ ...plan, developmentCaseSetPath: "[frozen private copy]", priorDevelopmentFeedbackPath: plan.priorDevelopmentFeedbackPath ? "[checked prior public development handoff]" : undefined, admissionCaseSetPath: plan.admissionCaseSetPath ? "[frozen private copy]" : undefined }, null, 2)}\n`);
   await save();
   try {
@@ -203,23 +202,21 @@ export class ResearchImprovementService {
    const h = await this.store.readStrategy(active.bundle.executorVersionId), i = await this.store.readStrategy(active.bundle.improverVersionId);
    if (!isCpuExecutorStrategy(h.artifact)) throw new HarnessError("improvement.strategy", "CPU research requires an active CPU executor method; the workflow slot is M07-only");
    await this.verifyRequirements([h, i], active.bundle.knowledgeSnapshot);
-   const phases = admission ? await reserveResearchPhases(budget, { kind: plan.experimentKind, outer: plan.outerBudget!, pilot: plan.pilotBudget!, protected: plan.protectedBudget!, branch: plan.metaBranchBudget,
+   const phases = admission ? await reserveResearchPhases(budget, { kind: plan.experimentKind,
     searchReplicates: plan.searchReplicates!, outcomeReplicates: plan.outcomeReplicates!, admissionCases: admission.cases }) : undefined;
-   const pilotLease = phases?.pilot ?? (plan.target === "improver" && plan.pilotBudget ? budget.createLease(budget.root, plan.pilotBudget, { clockMode: "active" }) : undefined);
+   const pilotLease = phases?.pilot ?? (plan.target === "improver" ? budget.createLease(budget.root, undefined, { clockMode: "active" }) : undefined);
    const selected = await this.search({ run, dir, plan, development, bundle: active.bundle, target: plan.target, improver: i, executor: h, budget, lease: phases?.outer ?? budget.root,
     pilotLease, depth: 0, selection, metaEpisodes: loadedMetaEpisodes, save, prefix: "outer", priorFeedback: prior?.feedback ?? [] });
    if (selected.selected) run.selectedCandidateId = selected.selected.id;
    run.developmentTarget = plan.target; run.developmentTerminal = selected.status; run.developmentBudgetAtSelection = budget.status();
    await save();
    const episode = buildMetaEpisode(run, this.ws.root, plan.target, selected.status);
-   const episodeText = `${JSON.stringify(episode, null, 2)}\n`;
-   if (Buffer.byteLength(episodeText, "utf8") > 120_000) throw new HarnessError("improvement.meta-episode", "development episode exceeds fixed readback size");
-   await writeFileAtomic(metaEpisodePath(this.store.root, id), episodeText);
+   await writeMetaEpisode(metaEpisodePath(this.store.root, id), episode);
    run.metaEpisodeIds = [episode.id];
    if (!selected.selected) { run.status = selected.status === "inconclusive" ? "inconclusive" : "research-only"; run.outcome = selected.status === "no-winner" ? "completed-no-candidate" : "search-incomplete"; run.stopReason = selected.stopReason ?? (selected.status === "no-winner" ? "improver explicitly stopped without selecting a development candidate" : "development search ended inconclusively"); return run; }
    await writeFileAtomic(path.join(dir, "selected-before-g.json"), `${JSON.stringify({ selectedCandidateId: selected.selected.id, selectedAt: selected.selectedAt, source: "development", target: plan.target }, null, 2)}\n`);
    if (!admission) { run.status = "research-only"; run.stopReason = "no caller-frozen admission case set; candidate remains research-only"; return run; }
-   if (budget.status().settlement !== "settled") { run.status = "inconclusive"; run.outcome = "search-incomplete"; run.stopReason = "unknown shared budget before protected admission"; return run; }
+   if (budget.status().inFlight) { run.status = "inconclusive"; run.outcome = "search-incomplete"; run.stopReason = "provider request remains in flight before protected admission"; return run; }
    if (plan.experimentKind === "executor-quality") {
     const candidate = await this.store.readStrategy(selected.selected.strategyVersionId);
     const result = await runExecutorQualityAdmission({ caseSet: admission, baseline: { versionId: h.versionId, artifact: h.artifact as ExecutorStrategyV1 }, candidate: { versionId: candidate.versionId, artifact: candidate.artifact as ExecutorStrategyV1 }, runner: this.runner,
@@ -229,7 +226,7 @@ export class ResearchImprovementService {
       await this.verifyRequirements([record, i], active.bundle.knowledgeSnapshot);
      } });
     run.admissionPath = path.join(dir, "executor-quality-admission.private.json"); await writeFileAtomic(run.admissionPath, `${JSON.stringify(result, null, 2)}\n`);
-    if (result.status === "accepted" && budget.status().settlement === "settled") {
+    if (result.status === "accepted" && !budget.status().inFlight) {
      await this.verifyRequirements([candidate, i], active.bundle.knowledgeSnapshot);
      const bundle = await this.store.writeBundle({ bundleId: this.store.newId("bundle"), parents: [active.bundle.bundleId], executorVersionId: candidate.versionId, improverVersionId: i.versionId, knowledgeSnapshot: active.bundle.knowledgeSnapshot,
       environmentVersion: active.bundle.environmentVersion, modelConfig: active.bundle.modelConfig, protocolVersion: active.bundle.protocolVersion, allowedCapabilities: active.bundle.allowedCapabilities, state: "admitted" });
@@ -254,7 +251,7 @@ export class ResearchImprovementService {
       await this.verifyRequirements([record], active.bundle.knowledgeSnapshot);
      } });
     run.admissionPath = path.join(dir, "meta-admission.private.json"); await writeFileAtomic(run.admissionPath, `${JSON.stringify(meta, null, 2)}\n`);
-    if (meta.status === "accepted" && budget.status().settlement === "settled") {
+    if (meta.status === "accepted" && !budget.status().inFlight) {
      const candidate = await this.store.readStrategy(selected.selected.strategyVersionId);
      await this.verifyRequirements([h, candidate], active.bundle.knowledgeSnapshot);
      if (candidate.artifact.body === i.artifact.body) { run.status = "rejected"; run.outcome = "candidate-rejected"; run.stopReason = "sham improver body did not change"; }
@@ -281,7 +278,7 @@ export class ResearchImprovementService {
  private async search(args: { run: ResearchRunV1; dir: string; plan: ResearchCampaignPlanV1; development: CpuCaseSetV1; bundle: GenerationBundleV1; target: "executor" | "improver";
   improver: StrategyRecordV1; executor: StrategyRecordV1; budget: SharedBudget; lease: BudgetLease; pilotLease?: BudgetLease; depth?: number; selection: ResearchDecisionViewV1["experience"]; metaEpisodes?: MetaEpisodeV1[]; save: () => Promise<void>; prefix: string; priorFeedback: DevelopmentFeedback[] }): Promise<SearchResult> {
   const { run, dir, plan, development, budget, lease } = args;
-  type CaseRuntime = { caseId: string; development: DevelopmentEnvironment; start: ExperimentStart; task: PublicTask; feedback: DevelopmentFeedback[]; episodes: Array<{ candidateId: string; episode: import("./executor-eval.ts").ExecutorEpisodeResult; sdkEstimatedCost: number }>; modelCalls: number; probeCalls: number; sdkEstimatedCost: number };
+  type CaseRuntime = { caseId: string; development: DevelopmentEnvironment; start: ExperimentStart; task: PublicTask; feedback: DevelopmentFeedback[]; episodes: Array<{ candidateId: string; episode: import("./executor-eval.ts").ExecutorEpisodeResult; sdkEstimatedCost: number; costComplete: boolean }>; modelCalls: number; probeCalls: number; sdkEstimatedCost: number };
   const cases = new Map<string, CaseRuntime>();
   const visible: Array<DevelopmentFeedback & { caseId: string }> = [];
   for (const c of development.cases) {
@@ -309,7 +306,7 @@ export class ResearchImprovementService {
    for (const versionId of ids) if (!methodRecords.has(versionId)) methodRecords.set(versionId, await this.store.readStrategy(versionId));
   }
   const inspectionResults: ResearchInspectionResultV1[] = [];
-  let readbackChars = 0, inspectActions = 0;
+  let inspectActions = 0;
   let lastActionResult: ResearchDecisionViewV1["lastActionResult"];
   const methodView = (record: StrategyRecordV1, inline: boolean) => ({ versionId: record.versionId, kind: record.kind, utf16Length: record.artifact.body.length, ...(inline ? { body: record.artifact.body } : {}) });
   const caseViews = (): ResearchCaseViewV1[] => [...cases.values()].map((item) => ({ caseId: item.caseId, allowedProbeX: item.task.allowedProbeX, units: item.task.units,
@@ -327,7 +324,7 @@ export class ResearchImprovementService {
     throw new HarnessError("improvement.experience", "selected method experience changed or became unavailable before a new model request");
   };
   const inspect = (action: Extract<import("./policy-host.ts").ResearchActionV1, { kind: "inspect" }>, sessionId: string): ResearchInspectionResultV1 => {
-   if (++inspectActions > (plan.maxInspectActions ?? 4)) throw new HarnessError("improvement.inspect", "inspect action budget exhausted");
+   inspectActions++;
    let request: ResearchInspectionRequestV1;
    let content: string;
    let observedFeedbackId: string | undefined;
@@ -342,7 +339,7 @@ export class ResearchImprovementService {
     else { const record = selectedCase?.episodes[request.index!]; content = record ? JSON.stringify({ caseId: selectedCase!.caseId, candidateId: record.candidateId,
      methodVersionId: record.episode.methodVersionId, status: record.episode.status, selectedHypothesisId: record.episode.selectedHypothesisId,
      modelCalls: record.episode.modelCalls, usedProbeXs: record.episode.usedProbeXs, feedbackIds: record.episode.feedback.map((f) => f.id),
-     feedbackStatuses: record.episode.feedback.map((f) => f.status), sdkEstimatedCost: record.sdkEstimatedCost, costSource: "sdk-estimate",
+     feedbackStatuses: record.episode.feedback.map((f) => f.status), sdkEstimatedCost: record.sdkEstimatedCost, costSource: record.costComplete ? "sdk-estimate" : "unknown",
      failureCategory: record.episode.failure ? "episode-incomplete" : undefined }) : ""; }
    } else {
     request = { object: "development-feedback", start: 0, maxChars: 4_000 };
@@ -350,18 +347,14 @@ export class ResearchImprovementService {
     if (action.evidenceIds.length === 1) observedFeedbackId = action.evidenceIds[0];
    }
    if (!content || content === "undefined") throw new HarnessError("improvement.inspect", "registered development object is unavailable");
-   const remaining = (plan.maxReadbackChars ?? 8_000) - readbackChars;
-   if (remaining < 1) throw new HarnessError("improvement.inspect", "readback character budget exhausted");
-   const start = request.start, end = Math.min(content.length, start + Math.min(request.maxChars, remaining));
+   const start = request.start, end = Math.min(content.length, start + request.maxChars);
    if (start >= content.length) throw new HarnessError("improvement.inspect", "inspect start is past registered object");
    const result: ResearchInspectionResultV1 = { requestId: `${args.prefix}-inspect-${inspectActions}`, object: request.object, ...(observedFeedbackId ? { id: observedFeedbackId } : request.id ? { id: request.id } : {}), ...(request.caseId ? { caseId: request.caseId } : {}),
     start, end, totalChars: content.length, text: content.slice(start, end), requestedBySessionId: sessionId, methodBindingVersionId: args.improver.versionId, branchPrefix: args.prefix };
-   readbackChars += result.text.length;
    return result;
   };
-  for (let index = 0; index < plan.maxDecisions; index++) {
-   if (budget.status(lease).settlement !== "settled" || budget.status(lease).remaining.providerCalls <= 0) return { decisionCount: index, status: "inconclusive", stopReason: "development provider budget became unavailable before a terminal decision" };
-   const candidateCap = args.prefix.startsWith("meta-") ? plan.maxCandidatesPerMetaArm ?? 0 : plan.maxCandidates;
+  for (let index = 0; ; index++) {
+   if (budget.status(lease).inFlight) return { decisionCount: index, status: "inconclusive", stopReason: "development provider request remains in flight before a terminal decision" };
    const view: ResearchDecisionViewV1 = { version: 1, target: args.target, current: { bundleId: args.bundle.bundleId, executorVersionId: args.executor.versionId, improverVersionId: args.improver.versionId }, task,
     methods: { executor: methodView(args.executor, true), improver: methodView(args.improver, true), candidates: [...methodRecords.values()].filter((record) => record.versionId !== args.executor.versionId && record.versionId !== args.improver.versionId).map((record) => methodView(record, false)) },
     cases: caseViews(), inspections: inspectionResults.slice(-3), inspectionWindow: { total: inspectionResults.length, visible: Math.min(3, inspectionResults.length), omitted: Math.max(0, inspectionResults.length - 3) }, readableEvidenceIds: fullyReadDevelopmentFeedbackIds(inspectionResults), metaEpisodes: args.metaEpisodes?.map((episode) => ({ id: episode.id, runId: episode.runId, target: episode.target, terminal: episode.terminal,
@@ -369,14 +362,13 @@ export class ResearchImprovementService {
       predictedObservation: c.hypothesis.predictedObservation, falsifier: c.hypothesis.falsifier, developmentStatus: c.developmentStatus })),
      feedbackIds: episode.feedbackIndex.map((f) => f.id), sdkEstimatedCost: episode.usage.sdkEstimatedCost })),
     feedback: visible.slice(-plan.maxFeedbackItems), feedbackWindow: { total: visible.length, visible: Math.min(plan.maxFeedbackItems, visible.length), omitted: Math.max(0, visible.length - plan.maxFeedbackItems) }, historicalFeedbackIds: args.priorFeedback.map((f) => f.id), experience: args.selection, candidates: localCandidates.map((c) => ({ id: c.id, target: c.kind, hypothesis: c.hypothesis, developmentStatus: c.developmentStatus })), budget: budget.status(lease),
-    remainingActions: { decisions: plan.maxDecisions - index, candidates: Math.max(0, candidateCap - localCandidates.length), inspections: Math.max(0, (plan.maxInspectActions ?? 4) - inspectActions), readbackChars: Math.max(0, (plan.maxReadbackChars ?? 8_000) - readbackChars), finalDecision: index === plan.maxDecisions - 1 },
     ...(lastActionResult ? { lastActionResult } : {}) };
    const record: ResearchDecisionRecordV1 = { index: run.decisions.length + 1, at: nowIso(), processId: process.pid, improverVersionId: args.improver.versionId, branchPrefix: args.prefix, outcome: "proposing",
     visibleFeedbackIds: view.feedback.map((f) => f.id), experienceRefs: view.experience.refs };
    run.decisions.push(record); await args.save();
    let action: ReturnType<typeof validateResearchAction> | undefined;
    let formatError = "";
-   for (let repair = 0; repair <= (plan.schemaRepairAttempts ?? 0); repair++) {
+   for (let repair = 0; ; repair++) {
     try {
      await ensureLiveExperience();
      const response = await runBoundedModelStep({ runner: this.runner, budget, lease, spec: { label: `I-${run.runId}-${args.prefix}-${index}${repair ? `-repair-${repair}` : ""}`, role: "improver", model: args.bundle.modelConfig.improver,
@@ -388,7 +380,6 @@ export class ResearchImprovementService {
      catch (error) { formatError = (error as Error).message; }
     } catch (error) { record.outcome = "inconclusive"; record.reason = (error as Error).message; await args.save(); return { decisionCount: index + 1, status: "inconclusive" }; }
    }
-   if (!action) { record.outcome = "rejected"; record.reason = `schema repair exhausted: ${formatError.slice(0, 240)}`; await args.save(); return { decisionCount: index + 1, status: "inconclusive" }; }
    const decision = record; decision.action = action; decision.outcome = "executed"; await args.save();
    if (action.kind === "inspect") {
     try { const result = inspect(action, record.sessionId!); inspectionResults.push(result); (run.inspections ??= []).push(result); decision.inspectionId = result.requestId; lastActionResult = { kind: "inspect", outcome: "executed", inspectionId: result.requestId }; await args.save(); }
@@ -404,8 +395,7 @@ export class ResearchImprovementService {
     continue;
    }
    if (action.kind === "propose") {
-    const localCap = candidateCap;
-    if (localCandidates.length >= localCap || seenBodies.has(action.body)) { decision.outcome = "rejected"; decision.reason = "local candidate budget exhausted or unchanged/repeated body"; lastActionResult = { kind: "propose", outcome: "rejected", reason: decision.reason }; await args.save(); continue; }
+    if (seenBodies.has(action.body)) { decision.outcome = "rejected"; decision.reason = "unchanged or repeated candidate body"; lastActionResult = { kind: "propose", outcome: "rejected", reason: decision.reason }; await args.save(); continue; }
     seenBodies.add(action.body);
     const artifact = validateStrategy(args.target, { version: 1, kind: args.target === "executor" ? "cpu-numerical-prompt" : "diagnostic-improver-prompt", body: action.body });
     const parentVersionId = args.target === "executor" ? args.executor.versionId : args.improver.versionId;
@@ -434,7 +424,8 @@ export class ResearchImprovementService {
        beforeModelRequest: () => this.verifyRequirements([strategy], args.bundle.knowledgeSnapshot) });
       const selectedCase = cases.get(c.id)!;
       const episodeCost = budget.status(lease).committed.sdkEstimatedCost - costBefore;
-      selectedCase.episodes.push({ candidateId: candidate.id, episode, sdkEstimatedCost: episodeCost }); selectedCase.modelCalls += episode.modelCalls; selectedCase.probeCalls += episode.usedProbeXs.length;
+      const costComplete = !budget.status(lease).usageUnknown;
+      selectedCase.episodes.push({ candidateId: candidate.id, episode, sdkEstimatedCost: episodeCost, costComplete }); selectedCase.modelCalls += episode.modelCalls; selectedCase.probeCalls += episode.usedProbeXs.length;
       selectedCase.sdkEstimatedCost += episodeCost;
       let scientificStatus: import("./research-types.ts").ResearchDevelopmentEpisodeV1["scientificStatus"] = "incomplete";
       if (episode.status === "submitted") scientificStatus = episode.feedback.at(-1)?.status === "supported-by-observations" ? "supported" : episode.feedback.at(-1)?.status === "contradicted" ? "contradicted" : "incomplete";
@@ -442,7 +433,7 @@ export class ResearchImprovementService {
        const stop = await e.protectedEvaluator.evaluateStop(s, lease);
        scientificStatus = stop.status === "justified-unknown" ? "justified-unknown" : stop.status === "premature-stop" ? "premature-stop" : "incomplete";
       }
-      (run.developmentEpisodes ??= []).push({ caseId: c.id, candidateId: candidate.id, episode, sdkEstimatedCost: episodeCost, modelCalls: episode.modelCalls, scientificStatus });
+      (run.developmentEpisodes ??= []).push({ caseId: c.id, candidateId: candidate.id, episode, sdkEstimatedCost: episodeCost, costComplete, modelCalls: episode.modelCalls, scientificStatus });
       for (const f of episode.feedback) { selectedCase.feedback.push(f); visible.push({ ...f, caseId: c.id }); run.feedback.push({ ...f, caseId: c.id }); candidate.developmentEvidence.push(f.id); }
       if (scientificStatus === "supported" || scientificStatus === "justified-unknown") valid++;
       else if (scientificStatus === "contradicted" || scientificStatus === "premature-stop") contradicted++;
@@ -473,6 +464,5 @@ export class ResearchImprovementService {
     return { selected: candidate, selectedAt, decisionCount: index + 1, status: "selected" };
    }
   }
-  return { decisionCount: plan.maxDecisions, status: "inconclusive", stopReason: "development decision budget exhausted before an explicit terminal stop" };
  }
 }

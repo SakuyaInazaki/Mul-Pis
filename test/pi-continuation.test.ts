@@ -89,16 +89,21 @@ test("aborted bound turn does not queue another provider request", async () => {
 	} finally { await h.cleanup(); }
 });
 
-test("repeated empty finals on an unchanged active goal stop with a visible incomplete reason", async () => {
-	const service = { goalStatus: async () => goal("active") } as unknown as ResearchService;
+test("unchanged active goals continue beyond the former empty-round cutoff until persisted completion", async () => {
+	let reads = 0;
+	const service = { goalStatus: async () => (++reads < 7 ? goal("active") : goal("finished", "fulfilled")) } as unknown as ResearchService;
 	const h = await offlineSession(service, { workspace: ".", goalRunId: "g1" });
 	try {
-		h.faux.setResponses([fauxAssistantMessage("checkpoint"), fauxAssistantMessage("checkpoint"), fauxAssistantMessage("checkpoint")]);
+		h.faux.setResponses(Array.from({ length: 7 }, () => fauxAssistantMessage("checkpoint")));
 		await h.session.prompt("continue");
-		assert.equal(h.faux.state.callCount, 3);
+		assert.equal(h.faux.state.callCount, 7);
 		const entries = h.sessionManager.getEntries();
 		assert(entries.some((entry) => entry.type === "custom" && entry.customType === "research_continuation" &&
+			(entry.data as { status?: string }).status === "observed"));
+		assert(!entries.some((entry) => entry.type === "custom" && entry.customType === "research_continuation" &&
 			(entry.data as { reason?: string }).reason === "repeated-empty-agent-rounds-with-unchanged-goal"));
+		assert(entries.some((entry) => entry.type === "custom" && entry.customType === "research_continuation" &&
+			(entry.data as { status?: string }).status === "fulfilled"));
 	} finally { await h.cleanup(); }
 });
 

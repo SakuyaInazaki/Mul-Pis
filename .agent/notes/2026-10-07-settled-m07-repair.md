@@ -1,0 +1,5 @@
+# Known-settled M07 task repair
+
+The private campaign driver now continues a failed execute task that returned no ordinary M07 review when its controller operations are all settled and no task or operation in that goal remains unresolved. It records bounded host failure facts, closes the failed goal as partial, and delegates a fresh linked goal from the original selected-prior inputs with unchanged checks and output obligations. Failed task files and session state are not replayed or adopted. A later repair task with the same settled failure can enter this path. Unknown operations retain the unresolved checkpoint path.
+
+Synthetic focused tests cover a settled failure and linked successor plan, acceptance eligibility, and unknown-operation and unknown-task exclusions. `node --test test/manual-private-campaign.test.ts` passed 42 tests; `git diff --check` passed. `npm run typecheck` was rejected by automatic command review for a possible npm registry request and was not retried or replaced. Full repository verification remains with the coordinating agent.

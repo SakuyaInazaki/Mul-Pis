@@ -24,28 +24,21 @@ export interface ScriptRun {
 	stderr: string;
 	/** Parsed JSON from the last non-empty stdout line, when present. */
 	json?: Record<string, unknown>;
-	timedOut: boolean;
 }
 
-export function runScript(python: string, script: string, args: string[], options: { cwd?: string; timeoutMs?: number; env?: Record<string, string> } = {}): Promise<ScriptRun> {
-	return new Promise((resolve) => {
-		const child = spawn(python, ["-I", script, ...args], { cwd: options.cwd ?? REPO_ROOT, env: { ...process.env, ...(options.env ?? {}) }, stdio: ["ignore", "pipe", "pipe"] });
+export function runScript(python: string, script: string, args: string[], options: { cwd?: string; signal?: AbortSignal; env?: Record<string, string> } = {}): Promise<ScriptRun> {
+	return new Promise((resolve, reject) => {
+		const child = spawn(python, ["-I", script, ...args], { cwd: options.cwd ?? REPO_ROOT, env: { ...process.env, ...(options.env ?? {}) }, signal: options.signal, stdio: ["ignore", "pipe", "pipe"] });
 		let stdout = "";
 		let stderr = "";
-		let timedOut = false;
-		const timer = setTimeout(() => {
-			timedOut = true;
-			child.kill("SIGTERM");
-			setTimeout(() => child.kill("SIGKILL"), 5_000).unref();
-		}, options.timeoutMs ?? 300_000);
 		child.stdout.on("data", (chunk) => (stdout += String(chunk)));
 		child.stderr.on("data", (chunk) => (stderr += String(chunk)));
 		child.on("error", (error) => {
-			clearTimeout(timer);
-			resolve({ code: null, stdout, stderr: `${stderr}\n${error.message}`, timedOut });
+			if (options.signal?.aborted) { reject(options.signal.reason ?? error); return; }
+			resolve({ code: null, stdout, stderr: `${stderr}\n${error.message}` });
 		});
 		child.on("close", (code) => {
-			clearTimeout(timer);
+			if (options.signal?.aborted) { reject(options.signal.reason ?? new Error("Python adapter cancelled")); return; }
 			let json: Record<string, unknown> | undefined;
 			const lines = stdout.split(/\r?\n/).filter((l) => l.trim());
 			for (let i = lines.length - 1; i >= 0; i--) {
@@ -59,7 +52,7 @@ export function runScript(python: string, script: string, args: string[], option
 					/* not JSON, keep looking */
 				}
 			}
-			resolve({ code, stdout, stderr, json, timedOut });
+			resolve({ code, stdout, stderr, json });
 		});
 	});
 }

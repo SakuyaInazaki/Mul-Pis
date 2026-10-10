@@ -15,53 +15,28 @@ class VirtualTimers {
 	tick(): void { for (const callback of [...this.callbacks.values()]) callback(); }
 }
 
-async function setup(t: any, options: { clock: () => number; pause: (now: number) => number; timers: VirtualTimers }) {
+test("a silent child prompt is not ended by a default wall or stall deadline", async (t) => {
 	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-virtual-watchdog-"));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	await mkdir(path.join(root, "problem", "raw"), { recursive: true });
 	await writeFile(path.join(root, "problem", "problem.md"), "problem\n");
 	await writeFile(path.join(root, "research.config.json"), JSON.stringify({ roles: { execution: "fake/model" }, concurrency: 1 }) + "\n");
+	let now = 0;
 	let started!: () => void;
 	const start = new Promise<void>((resolve) => { started = resolve; });
-	const service = new ResearchService({ defaultWorkspace: root, progressIntervalMs: 0, promptTimeoutMs: 0,
-		watchdogNow: options.clock, trustedPauseMs: options.pause, watchdogTimers: options.timers,
+	let release!: () => void;
+	const work = new Promise<void>((resolve) => { release = resolve; });
+	const timers = new VirtualTimers();
+	const service = new ResearchService({ defaultWorkspace: root, progressIntervalMs: 0,
+		watchdogNow: () => now, trustedPauseMs: () => 0, watchdogTimers: timers,
 		onProgress: (progress) => { if (progress.phase === "prompt-start") started(); },
-		runnerFactory: () => new FakeSessionRunner(async () => { await new Promise<void>(() => undefined); return { text: "never", reads: [] }; }) });
+		runnerFactory: () => new FakeSessionRunner(async () => { await work; return { text: "completed after long silence", reads: [] }; }) });
 	await service.init(root);
-	return { service, root, start };
-}
-
-test("default 30-second stall polling detects silence at the real 10-minute limit", async (t) => {
-	let now = 0;
-	const timers = new VirtualTimers();
-	const f = await setup(t, { clock: () => now, pause: () => 0, timers });
-	const pending = f.service.runStage({ stage: "M01", workspace: f.root });
-	await f.start;
-	for (let i = 0; i < 21; i++) { now += 30_000; timers.tick(); }
-	await assert.rejects(pending, /made no progress/);
-});
-
-test("a delayed normal timer does not erase elapsed work time", async (t) => {
-	let now = 0;
-	const timers = new VirtualTimers();
-	const f = await setup(t, { clock: () => now, pause: () => 0, timers });
-	const pending = f.service.runStage({ stage: "M01", workspace: f.root });
-	await f.start;
-	now = 11 * 60_000;
+	const pending = service.runStage({ stage: "M01", workspace: root });
+	await start;
+	now = 3 * 60 * 60_000;
 	timers.tick();
-	await assert.rejects(pending, /made no progress/);
-});
-
-test("only an injected trusted pause offsets watchdog elapsed time", async (t) => {
-	let now = 0;
-	let paused = 0;
-	const timers = new VirtualTimers();
-	const f = await setup(t, { clock: () => now, pause: () => paused, timers });
-	const pending = f.service.runStage({ stage: "M01", workspace: f.root });
-	await f.start;
-	for (let i = 0; i < 10; i++) { now += 30_000; timers.tick(); }
-	paused = 5 * 60_000;
-	for (let i = 0; i < 10; i++) { now += 30_000; timers.tick(); }
-	for (let i = 0; i < 11; i++) { now += 30_000; timers.tick(); }
-	await assert.rejects(pending, /made no progress/);
+	release();
+	const result = await pending;
+	assert.ok(result);
 });

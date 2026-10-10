@@ -1,0 +1,40 @@
+name: Offline workflow regression
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install pinned test dependencies
+        run: |
+          npm install --ignore-scripts --no-save --no-package-lock --no-audit --no-fund \
+            @earendil-works/pi-ai@0.85.1 \
+            @earendil-works/pi-agent-core@0.85.1 \
+            @earendil-works/pi-coding-agent@0.85.1 \
+            @actions/artifact@2.3.2 \
+            typescript@5.9.3 \
+            @types/node@26.6.4
+          python -m pip install --disable-pip-version-check --no-input 'cryptography==50.0.0'
+      - name: Check types and run offline tests
+        run: |
+          npm run typecheck
+          npm test
+          python -m unittest discover -s test -p 'private_actions_transport_test.py'
+          python -m unittest discover -s tools/py -p 'test_browser_task.py'
+          python -m unittest discover -s tools/py -p 'test_browser_artifacts.py'
+      - name: Exercise synthetic Node 24 live observer artifact path
+        uses: ./.github/actions/live-control-smoke

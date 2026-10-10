@@ -1,0 +1,7 @@
+# Local mission evaluator wiring
+
+Implemented a trusted local evaluator registry and finite-objective host selection path on the `754a4f5` baseline. The production `host:file-sha256` evaluator checks only an authored byte digest; the interface supports separately registered obligation types and explicit preflight. Missing capability is reported before assessment. The local M07 adapter freezes candidate bytes, records all four evaluator result states, and uses the existing M07 review/finish controls. A fresh M04 checkpoint review must read required frozen text fully. The host records a mission/task/evaluator/M04-bound selection receipt only after settled transaction and evidence checks. Restart validates the receipt, candidate source and snapshot bytes, M07 review, M04 coverage, and transaction before reassessment.
+
+Added offline FakeSessionRunner coverage for a complete non-CSR finite objective, actual separate-process restart, missing evaluator, evaluator negative states, partial obligations, exploratory and open-ended objectives, identity tampering, candidate mutation, incomplete M04 reads, and unresolved knowledge transaction. No private task input or credentials were added to the repository. No model or candidate execution was used in these tests.
+
+After the test run, remove only the temporary `node_modules` symbolic link at this worktree root. It points to the sibling `Mul-Pis-ab7/node_modules` dependency directory; removing the link does not remove target files, and the link can be recreated if more local tests are needed.

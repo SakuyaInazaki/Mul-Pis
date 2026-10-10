@@ -18,7 +18,7 @@ function values(raw: unknown): { usage?: UsageValues; complete: boolean } {
 	const rawCost = value.cost;
 	const cost = finite(typeof rawCost === "object" && rawCost !== null ? (rawCost as Record<string, unknown>).total : rawCost);
 	if (cost !== undefined) usage.cost = cost;
-	return { usage, complete: FIELDS.every((key) => usage[key] !== undefined) && cost !== undefined };
+	return { usage, complete: FIELDS.every((key) => usage[key] !== undefined) };
 }
 
 /** Convert newly appended entries once; never use the compacted agent-state messages for billing. */
@@ -48,7 +48,7 @@ export function usageEventsFromEntries(entries: readonly SessionEntry[], promptI
 		} else continue;
 		const reported = values(rawUsage);
 		const zeroFailure = kind === "assistant" && (stopReason === "error" || stopReason === "aborted") &&
-			FIELDS.every((key) => reported.usage?.[key] === 0) && reported.usage?.cost === 0;
+			FIELDS.every((key) => reported.usage?.[key] === 0) && (reported.usage?.cost === 0 || reported.usage?.cost === undefined);
 		events.push({
 			entryId: entry.id, kind, promptIndex, at: entry.timestamp,
 			...(provider ? { provider } : {}), ...(model ? { model } : {}),

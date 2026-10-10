@@ -7,7 +7,7 @@ import type { BeginGoalInput, CurrentGoal, DecisionInput, FinishInput, HostStopR
 import { summarizeGoalExecution } from "../m07/status.ts";
 import type { RunDescriptorV1 } from "../runtime/run-descriptor.ts";
 import { createPiSessionRunner } from "../runner/pi.ts";
-import type { SessionHandle, SessionRunner, SessionSpec } from "../runner/types.ts";
+import type { ForkRequest, RunnerCapabilities, SessionCheckpoint, SessionHandle, SessionRunner, SessionSpec } from "../runner/types.ts";
 import { runInit } from "../stages/init.ts";
 import { runM01 } from "../stages/m01.ts";
 import { runM02 } from "../stages/m02.ts";
@@ -22,6 +22,7 @@ import { HarnessError, type StageRunRecord } from "../types.ts";
 import { failureSignature, RetryGuard, stageFingerprint, stageInputVersion, thrownSignature } from "./retry-guard.ts";
 import { Workspace } from "../workspace.ts";
 import { readTrustedPauseMs } from "../runtime/run-descriptor.ts";
+import { openDefaultLocalMission } from "../m07/local-mission.ts";
 
 export type ResearchStage = "M01" | "M02" | "M03" | "M04" | "M05" | "M06" | "M07" | "M08" | "M09";
 export type RunnableStage = Exclude<ResearchStage, "M07">;
@@ -123,8 +124,8 @@ class ProgressRunner implements SessionRunner {
 		report: (progress: ResearchProgress) => void,
 		stage: ResearchStage,
 		heartbeatMs = 15_000,
-		promptTimeoutMs = 60 * 60_000,
-		stallTimeoutMs = 10 * 60_000,
+		promptTimeoutMs = 0,
+		stallTimeoutMs = 0,
 		stallCheckMs = 30_000,
 		now: () => number = Date.now,
 		pauseMs: (now: number) => number = readTrustedPauseMs,
@@ -150,6 +151,31 @@ class ProgressRunner implements SessionRunner {
 	async resume(ref: Parameters<SessionRunner["resume"]>[0]): Promise<SessionHandle> {
 		this.report({ phase: "session-create", stage: this.stage, session: ref.label, message: `${ref.label}：正在续接既有隔离会话` });
 		return this.wrap(await this.inner.resume(ref));
+	}
+
+	async checkpoint(handle: SessionHandle, envelope: { inputManifest: string; runId: string; taskId?: string; externalOperationsSettled: boolean }): Promise<SessionCheckpoint> {
+		if (!this.inner.checkpoint) throw new HarnessError("m07.branch-unsupported", "runner has no stable checkpoint capability");
+		return this.inner.checkpoint(handle, envelope);
+	}
+
+	async fork(request: ForkRequest): Promise<SessionHandle> {
+		if (!this.inner.fork) throw new HarnessError("m07.branch-unsupported", "runner has no true fork capability");
+		this.report({ phase: "session-create", stage: this.stage, session: request.spec.label, message: `${request.spec.label}：正在创建独立候选分支` });
+		return this.wrap(await this.inner.fork(request));
+	}
+
+	capabilities(): RunnerCapabilities {
+		const capabilities = this.inner.capabilities?.();
+		if (!capabilities) throw new HarnessError("m07.branch-unsupported", "runner cannot attest true frozen-leaf branching");
+		return capabilities;
+	}
+
+	attestConfinedGrant(handle: SessionHandle): Promise<NonNullable<SessionSpec["toolAuthority"]> | undefined> {
+		return this.inner.attestConfinedGrant?.(handle) ?? Promise.resolve(undefined);
+	}
+
+	estimateMaxSdkCost(modelRaw: string, caps: { maxInputTokens: number; maxOutputTokens: number }): Promise<number | undefined> {
+		return this.inner.estimateMaxSdkCost?.(modelRaw, caps) ?? Promise.resolve(undefined);
 	}
 
 	private wrap(handle: SessionHandle): SessionHandle {
@@ -230,7 +256,9 @@ class ProgressRunner implements SessionRunner {
 
 export class ResearchService {
 	private readonly options: ResearchServiceOptions;
-	private readonly activeStageOperations = new Map<string, { root: string; runs: Array<{ stage: string; runId: string }> }>();
+	private readonly activeStageOperations = new Map<string, {
+		root: string; runs: Array<{ stage: string; runId: string }>;
+		pendingStarts: Set<Promise<void>>; closing: boolean }>();
 	private readonly activeGoalRuns = new Map<string, { root: string; runIds: Set<string> }>();
 
 	constructor(options: ResearchServiceOptions) {
@@ -288,7 +316,6 @@ export class ResearchService {
 		return this.withMutation(root, async () => {
 			const retryGuard = new RetryGuard(root);
 			const fingerprint = stageFingerprint(request, await stageInputVersion(root, request));
-			await retryGuard.assertAllowed(fingerprint);
 			const ctx = await this.stageContext(root, request.stage, signal);
 			let result: unknown;
 			try { switch (request.stage) {
@@ -361,7 +388,9 @@ export class ResearchService {
 
 	/** Interrupt every exact run registered by this service instance, regardless of Pi cwd. */
 	async interruptAllActive(reason: string, includeActiveGoals = true): Promise<void> {
-		for (const active of [...this.activeStageOperations.values()]) await this.interruptOwned(active, reason);
+		const stages = [...this.activeStageOperations.values()];
+		for (const active of stages) active.closing = true;
+		for (const active of stages) await this.interruptOwned(active, reason);
 		if (includeActiveGoals === false) return;
 		const goals = [...this.activeGoalRuns.values()];
 		let firstError: unknown;
@@ -372,15 +401,21 @@ export class ResearchService {
 		if (firstError) throw firstError;
 	}
 
-	private async interruptOwned(active: { root: string; runs: Array<{ stage: string; runId: string }> }, reason: string): Promise<void> {
+	private async interruptOwned(active: { root: string; runs: Array<{ stage: string; runId: string }>;
+		pendingStarts: Set<Promise<void>>; closing: boolean }, reason: string): Promise<void> {
+		active.closing = true;
+		// A run.json can become visible before startRun returns its record. Wait for
+		// those exact owned starts to register; never infer ownership from a
+		// workspace scan that may include another actor's run.
+		await Promise.all([...active.pendingStarts]);
 		const ws = new Workspace(active.root);
 		for (const owned of active.runs) {
-			const run = await ws.readRun(owned.stage, owned.runId);
-			if (run.status !== "running") continue;
-			run.failures.push(`运行中断（host-shutdown）：${reason}`);
-			run.remarks.push("由拥有本次活动操作的 Pi extension 依照已登记 runId 在正常 session_shutdown 路径记录；未自动重跑。SIGKILL 或进程崩溃不在此保证内。");
-			await ws.finishRun(run, "failed");
-			await ws.writeNote(run, "主 Pi 会话在阶段仍运行时正常关闭；harness 记录中断事实，没有把阶段标为完成，也没有自动重放。 ");
+			const run = await ws.finishRunIfRunning(owned.stage, owned.runId, "failed", persisted => {
+				persisted.failures.push(`运行中断（host-shutdown）：${reason}`);
+				persisted.remarks.push("由拥有本次活动操作的 Pi extension 依照已登记 runId 在正常 session_shutdown 路径记录；未自动重跑。SIGKILL 或进程崩溃不在此保证内。");
+				return persisted;
+			});
+			if (run) await ws.writeNote(run, "主 Pi 会话在阶段仍运行时正常关闭；harness 记录中断事实，没有把阶段标为完成，也没有自动重放。 ");
 		}
 	}
 
@@ -440,7 +475,22 @@ export class ResearchService {
 		return createM07Controller({ ws, store, runner: unavailable, config: { roles: {}, concurrency: 1, tools: {} } }).status(runId);
 	}
 
-	async goalAction(action: "begin" | "plan" | "checkpoint" | "decision" | "finish" | "interrupt", requested: string | undefined, input: BeginGoalInput | { runId: string; plan: string; refreshBaseline?: boolean; checkpointId?: string; m04RunId?: string } | { runId: string; taskIds?: string[] } | ({ runId: string } & DecisionInput) | ({ runId: string } & FinishInput) | ({ runId: string } & InterruptInput), signal?: AbortSignal, authority?: { executionContract: "continuous" }): Promise<unknown> {
+	/** Local original-objective control uses the same workspace and Pi runner as M07. */
+	async missionStatus(missionId: string, requested?: string): Promise<unknown> {
+		return openDefaultLocalMission({ workspaceRoot: this.resolveWorkspace(requested) }).status(missionId);
+	}
+
+	async missionAdvance(action: "step" | "run", missionId: string, requested?: string,
+		signal?: AbortSignal): Promise<unknown> {
+		const root = this.resolveWorkspace(requested);
+		return this.withMutation(root, async () => {
+			const ctx = await this.stageContext(root, "M07", signal);
+			const mission = openDefaultLocalMission({ workspaceRoot: root, runner: ctx.runner, config: ctx.config });
+			return action === "step" ? mission.step(missionId) : mission.run(missionId);
+		}, "M07");
+	}
+
+	async goalAction(action: "begin" | "plan" | "checkpoint" | "decision" | "finish" | "interrupt" | "select-branch", requested: string | undefined, input: BeginGoalInput | { runId: string; plan: string; refreshBaseline?: boolean; checkpointId?: string; m04RunId?: string } | { runId: string; taskIds?: string[] } | ({ runId: string } & DecisionInput) | ({ runId: string } & FinishInput) | ({ runId: string } & InterruptInput) | { runId: string; parentTaskId: string; selectedTaskId?: string; rationale: string }, signal?: AbortSignal, authority?: { executionContract: "continuous" }): Promise<unknown> {
 		const root = this.resolveWorkspace(requested);
 		return this.withMutation(root, async () => {
 			const ctx = await this.nonModelContext(root);
@@ -453,6 +503,7 @@ export class ResearchService {
 			}
 			if (action === "plan") { const value = input as { runId: string; plan: string; refreshBaseline?: boolean; checkpointId?: string; m04RunId?: string }; const result = await controller.plan(value.runId, value.plan, { refreshBaseline: value.refreshBaseline, checkpointId: value.checkpointId, m04RunId: value.m04RunId }); await this.rememberActiveGoal(root, value.runId); return result; }
 			if (action === "checkpoint") { const value = input as { runId: string; taskIds?: string[] }; const result = await controller.checkpoint(value.runId, { taskIds: value.taskIds }); await this.rememberActiveGoal(root, value.runId); return result; }
+			if (action === "select-branch") { const { runId, ...value } = input as { runId: string; parentTaskId: string; selectedTaskId?: string; rationale: string }; const result = await controller.selectBranch(runId, value); await this.rememberActiveGoal(root, runId); return result; }
 			if (action === "decision") { const { runId, ...value } = input as { runId: string } & DecisionInput; const result = await controller.decision(runId, value); await this.rememberActiveGoal(root, runId); return result; }
 			if (action === "interrupt") { const { runId, ...value } = input as { runId: string } & InterruptInput; const result = await controller.interrupt(runId, value); await this.forgetActiveGoal(root, runId); return result; }
 			const { runId, ...value } = input as { runId: string } & FinishInput;
@@ -533,24 +584,35 @@ export class ResearchService {
 	private async stageContext(root: string, stage: ResearchStage, signal?: AbortSignal): Promise<StageContext> {
 		const ws = new Workspace(root);
 		const originalStartRun = ws.startRun.bind(ws);
-		ws.startRun = async (...args) => {
-			const record = await originalStartRun(...args);
-			const key = await canonicalMutationKey(root);
-			this.activeStageOperations.get(key)?.runs.push({ stage: record.stage, runId: record.runId });
-			return record;
+		const key = await canonicalMutationKey(root);
+		const active = this.activeStageOperations.get(key);
+		ws.startRun = (runStage, inputs, knowledgeSnapshot) => {
+			if (active?.closing)
+				return Promise.reject(new HarnessError("run.interrupted", "owned stage operation is shutting down"));
+			const registered = originalStartRun(runStage, inputs, knowledgeSnapshot).then(record => {
+				active?.runs.push({ stage: record.stage, runId: record.runId });
+				return record;
+			});
+			if (active) {
+				const settled = registered.then(() => undefined, () => undefined);
+				active.pendingStarts.add(settled);
+				void settled.then(() => { active.pendingStarts.delete(settled); });
+			}
+			return registered;
 		};
 		if (!existsSync(ws.configFile)) throw new HarnessError("config.missing", `缺少 ${ws.configFile}；请明确配置各角色模型`);
 		const store = createFileKnowledgeStore(ws.knowledgeDir);
 		const base = this.options.runnerFactory?.(signal) ?? createPiSessionRunner({ signal });
-		const runner = new ProgressRunner(base, (progress) => this.options.onProgress?.(progress), stage, this.options.progressIntervalMs ?? 15_000, this.options.promptTimeoutMs ?? 60 * 60_000, this.options.stallTimeoutMs ?? 10 * 60_000, this.options.stallCheckMs ?? 30_000, this.options.watchdogNow ?? Date.now, this.options.trustedPauseMs ?? readTrustedPauseMs, this.options.watchdogTimers);
-		return { ws, store, runner, config: await ws.loadConfig() };
+		const runner = new ProgressRunner(base, (progress) => this.options.onProgress?.(progress), stage, this.options.progressIntervalMs ?? 15_000, this.options.promptTimeoutMs ?? 0, this.options.stallTimeoutMs ?? 0, this.options.stallCheckMs ?? 30_000, this.options.watchdogNow ?? Date.now, this.options.trustedPauseMs ?? readTrustedPauseMs, this.options.watchdogTimers);
+		return { ws, store, runner, config: await ws.loadConfig(), signal };
 	}
 
 	private async withMutation<T>(root: string, operation: () => Promise<T>, stage?: ResearchStage): Promise<T> {
 		const key = await canonicalMutationKey(root);
 		if (activeMutations.has(key)) throw new HarnessError("m07.busy", `工作区已有同步研究操作：${root}`);
 		activeMutations.add(key);
-		if (stage) this.activeStageOperations.set(key, { root: path.resolve(root), runs: [] });
+		if (stage) this.activeStageOperations.set(key, { root: path.resolve(root), runs: [],
+			pendingStarts: new Set(), closing: false });
 		try { return await operation(); } finally { activeMutations.delete(key); this.activeStageOperations.delete(key); }
 	}
 }

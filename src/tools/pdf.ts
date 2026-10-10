@@ -29,7 +29,7 @@ export interface ExtractResult {
 
 export interface ExtractOptions {
 	maxPages?: number;
-	timeoutMs?: number;
+	signal?: AbortSignal;
 }
 
 function popplerBinary(name: string): string | undefined {
@@ -37,30 +37,29 @@ function popplerBinary(name: string): string | undefined {
 	return undefined;
 }
 
-function run(binary: string, args: string[], timeoutMs: number): Promise<{ code: number | null; stderr: string; stdout: string }> {
-	return new Promise((resolve) => {
-		const child = spawn(binary, args, { stdio: ["ignore", "pipe", "pipe"] });
+function run(binary: string, args: string[], signal?: AbortSignal): Promise<{ code: number | null; stderr: string; stdout: string }> {
+	return new Promise((resolve, reject) => {
+		const child = spawn(binary, args, { signal, stdio: ["ignore", "pipe", "pipe"] });
 		let stderr = "";
 		let stdout = "";
-		const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
 		child.stdout.on("data", (c) => (stdout += String(c)));
 		child.stderr.on("data", (c) => (stderr += String(c)));
 		child.on("error", (error) => {
-			clearTimeout(timer);
+			if (signal?.aborted) { reject(signal.reason ?? error); return; }
 			resolve({ code: null, stderr: `${stderr}\n${error.message}`, stdout });
 		});
 		child.on("close", (code) => {
-			clearTimeout(timer);
+			if (signal?.aborted) { reject(signal.reason ?? new Error("PDF operation cancelled")); return; }
 			resolve({ code, stderr, stdout });
 		});
 	});
 }
 
 /** Number of pages via pdfinfo, or null when unavailable. */
-export async function pdfPageCount(pdfPath: string): Promise<number | null> {
+export async function pdfPageCount(pdfPath: string, signal?: AbortSignal): Promise<number | null> {
 	const binary = popplerBinary("pdfinfo");
 	if (!binary) return null;
-	const { code, stdout } = await run(binary, [pdfPath], 60_000);
+	const { code, stdout } = await run(binary, [pdfPath], signal);
 	if (code !== 0) return null;
 	const match = /^Pages:\s+(\d+)/m.exec(stdout);
 	return match ? Number(match[1]) : null;
@@ -89,12 +88,12 @@ export async function extractPdf(pdfPath: string, outDir: string, _tools: ToolsC
 		await writeFileAtomic(path.join(outDir, "extract.json"), `${JSON.stringify(result, null, 2)}\n`);
 		return result;
 	}
-	const total = await pdfPageCount(pdfPath);
+	const total = await pdfPageCount(pdfPath, options.signal);
 	const txtPath = path.join(outDir, "extracted.txt");
 	const args = ["-layout"];
 	if (options.maxPages) args.push("-l", String(options.maxPages));
-	const { code, stderr } = await run(binary, [...args, pdfPath, txtPath], options.timeoutMs ?? 300_000);
-	const version = await run(binary, ["-v"], 10_000);
+	const { code, stderr } = await run(binary, [...args, pdfPath, txtPath], options.signal);
+	const version = await run(binary, ["-v"], options.signal);
 	result.engineVersion = (version.stderr || version.stdout).split(/\r?\n/)[0]?.trim() || null;
 	if (stderr.trim()) result.warnings.push(`pdftotext 诊断：${stderr.trim().split(/\r?\n/)[0].slice(0, 160)}（共 ${stderr.trim().split(/\r?\n/).length} 行）`);
 	if (code !== 0) {
@@ -125,11 +124,11 @@ export interface RenderedPage {
  * repeated requests reuse the file. Kept per page so a 75-page paper costs disk only for the pages
  * a reader actually asks to see.
  */
-export async function renderPdfPage(pdfPath: string, page: number, outDir: string, tools: ToolsConfig): Promise<RenderedPage> {
+export async function renderPdfPage(pdfPath: string, page: number, outDir: string, tools: ToolsConfig, signal?: AbortSignal): Promise<RenderedPage> {
 	const binary = popplerBinary("pdftoppm");
 	if (!binary) throw new HarnessError("pdf.render", "本机没有 pdftoppm（poppler），无法渲染页面");
 	if (!Number.isInteger(page) || page < 1) throw new HarnessError("pdf.render", "页码必须是正整数");
-	const total = await pdfPageCount(pdfPath);
+	const total = await pdfPageCount(pdfPath, signal);
 	if (total !== null && page > total) throw new HarnessError("pdf.render", `页码 ${page} 超出总页数 ${total}`);
 	const dpi = tools.pageImageDpi ?? 110;
 	const pagesDir = path.join(outDir, "pages");
@@ -138,7 +137,7 @@ export async function renderPdfPage(pdfPath: string, page: number, outDir: strin
 	const prefix = path.join(pagesDir, `${stem}-p${String(page).padStart(3, "0")}`);
 	const target = `${prefix}.png`;
 	if (existsSync(target)) return { pdf: pdfPath, page, path: target, dpi, reused: true };
-	const { code, stderr } = await run(binary, ["-png", "-r", String(dpi), "-f", String(page), "-l", String(page), "-singlefile", pdfPath, prefix], 120_000);
+	const { code, stderr } = await run(binary, ["-png", "-r", String(dpi), "-f", String(page), "-l", String(page), "-singlefile", pdfPath, prefix], signal);
 	if (code !== 0 || !existsSync(target)) throw new HarnessError("pdf.render", `pdftoppm 失败（退出码 ${code ?? "null"}）：${stderr.trim().slice(0, 200)}`);
 	return { pdf: pdfPath, page, path: target, dpi, reused: false };
 }

@@ -11,7 +11,7 @@
  *   .agent/sessions/              会话记录与会话边界规格
  *   .agent/notes/                 全项目行为记录
  */
-import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
@@ -34,6 +34,63 @@ export function newRunId(now: Date = new Date()): string {
 	return `${stamp}-${randomBytes(2).toString("hex")}`;
 }
 
+// Stage starts are normally serialized by the service, but direct Workspace
+// callers can start runs concurrently. Serialize allocation within this process
+// and advance a persisted logical sequence rather than ordering by random ID.
+const startRunQueues = new Map<string, Promise<void>>();
+// Every writer for a run in this process shares one terminal transition. A
+// stale stage record must never restore running after host shutdown or replace
+// a failed run with a late completed answer.
+const runWriteQueues = new Map<string, Promise<void>>();
+async function canonicalRunWriteKey(file: string): Promise<string> {
+	let existing = path.resolve(file);
+	const missing: string[] = [];
+	while (!existsSync(existing)) {
+		const parent = path.dirname(existing);
+		if (parent === existing) throw new HarnessError("run.path", "run path has no existing ancestor");
+		missing.unshift(path.basename(existing));
+		existing = parent;
+	}
+	return path.join(await realpath(existing), ...missing);
+}
+
+async function withRunWrite<T>(key: string, body: () => Promise<T>): Promise<T> {
+	const prior = runWriteQueues.get(key) ?? Promise.resolve();
+	let release!: () => void;
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	const tail = prior.then(() => gate);
+	runWriteQueues.set(key, tail);
+	await prior;
+	try { return await body(); }
+	finally {
+		release();
+		if (runWriteQueues.get(key) === tail) runWriteQueues.delete(key);
+	}
+}
+
+export function latestByStartOrder(records: StageRunRecord[], stage: string): StageRunRecord | undefined {
+	if (!records.length) return undefined;
+	const observed = records.map((record) => Date.parse(record.startedAt));
+	if (observed.some((time) => !Number.isFinite(time)) || records.some((record) => record.startSequence !== undefined && (!Number.isSafeInteger(record.startSequence) || record.startSequence < 1))) {
+		throw new HarnessError("run.order", `cannot order ${stage} runs with invalid creation metadata`);
+	}
+	const ordered = records.filter((record) => record.startSequence !== undefined);
+	if (ordered.length) {
+		const latestSequence = ordered.reduce((latest, record) => Math.max(latest, record.startSequence!), 0);
+		const candidates = ordered.filter((record) => record.startSequence === latestSequence);
+		if (candidates.length !== 1) throw new HarnessError("run.order", `cannot determine latest ${stage} run: duplicate creation sequence`);
+		const candidate = candidates[0];
+		if (records.some((record) => record.startSequence === undefined && Date.parse(record.startedAt) >= Date.parse(candidate.startedAt))) {
+			throw new HarnessError("run.order", `cannot determine latest ${stage} run: undated legacy order conflicts with creation sequence`);
+		}
+		return candidate;
+	}
+	const latestTime = observed.reduce((latest, time) => Math.max(latest, time), -Infinity);
+	const candidates = records.filter((_record, index) => observed[index] === latestTime);
+	if (candidates.length !== 1) throw new HarnessError("run.order", `cannot determine latest ${stage} run: legacy creation times are tied`);
+	return candidates[0];
+}
+
 export async function writeFileAtomic(filePath: string, content: string): Promise<void> {
 	await mkdir(path.dirname(filePath), { recursive: true });
 	const tmp = `${filePath}.${process.pid}.${randomBytes(3).toString("hex")}.tmp`;
@@ -46,6 +103,13 @@ export async function readTextIfExists(filePath: string): Promise<string | undef
 		return await readFile(filePath, "utf8");
 	} catch {
 		return undefined;
+	}
+}
+async function readRunTextOrAbsent(filePath: string): Promise<string | undefined> {
+	try { return await readFile(filePath, "utf8"); }
+	catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
 	}
 }
 
@@ -120,34 +184,87 @@ export class Workspace {
 	}
 
 	async startRun(stage: string, inputs: InputRef[], knowledgeSnapshot?: string): Promise<StageRunRecord> {
-		const record: StageRunRecord = {
-			stage,
-			runId: newRunId(),
-			startedAt: nowIso(),
-			status: "running",
-			inputs,
-			sessions: [],
-			outputs: [],
-			failures: [],
-			knowledgeSnapshot,
-			remarks: [],
-		};
-		await this.writeRun(record);
-		return record;
+		const key = `${this.root}\0${stage}`;
+		const prior = startRunQueues.get(key) ?? Promise.resolve();
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const tail = prior.then(() => gate);
+		startRunQueues.set(key, tail);
+		await prior;
+		try {
+			const ids = await this.listRuns(stage);
+			const previous = await Promise.all(ids.map((id) => this.readRun(stage, id)));
+			const priorStarts = previous.map((run) => Date.parse(run.startedAt));
+			if (priorStarts.some((time) => !Number.isFinite(time)) || previous.some((run) => run.startSequence !== undefined && (!Number.isSafeInteger(run.startSequence) || run.startSequence < 1))) throw new HarnessError("run.order", `cannot order existing ${stage} runs with invalid creation metadata`);
+			const startSequence = previous.reduce((latest, run) => Math.max(latest, run.startSequence ?? 0), previous.length) + 1;
+			const startedAt = nowIso();
+			const record: StageRunRecord = {
+				stage,
+				runId: newRunId(new Date(startedAt)),
+				startedAt,
+				startSequence,
+				status: "running",
+				inputs,
+				sessions: [],
+				outputs: [],
+				failures: [],
+				knowledgeSnapshot,
+				remarks: [],
+			};
+			await this.writeRun(record);
+			return record;
+		} finally {
+			release();
+			if (startRunQueues.get(key) === tail) startRunQueues.delete(key);
+		}
 	}
 
 	async writeRun(record: StageRunRecord): Promise<void> {
-		await writeFileAtomic(path.join(this.runDir(record.stage, record.runId), "run.json"), `${JSON.stringify(record, null, 2)}\n`);
+		const file = path.join(this.runDir(record.stage, record.runId), "run.json");
+		await withRunWrite(await canonicalRunWriteKey(file), async () => {
+			const oldText = await readRunTextOrAbsent(file);
+			if (oldText !== undefined) {
+				const old = JSON.parse(oldText) as StageRunRecord;
+				if (old.status !== "running" &&
+					(record.status === "running" || record.status !== old.status))
+					throw new HarnessError("run.interrupted",
+						`${record.stage} 运行 ${record.runId} 已在执行期间被记录为 ${old.status}，不能覆盖为 ${record.status}`);
+			}
+			await writeFileAtomic(file, `${JSON.stringify(record, null, 2)}\n`);
+		});
 	}
 
 	async finishRun(record: StageRunRecord, status: Exclude<StageRunRecord["status"], "running">): Promise<void> {
-		record.status = status;
-		record.finishedAt = nowIso();
-		await this.writeRun(record);
+		const finished = await this.finishRunIfRunning(record.stage, record.runId, status,
+			() => record);
+		if (!finished)
+			throw new HarnessError("run.interrupted",
+				`${record.stage} 运行 ${record.runId} 已经结束，不能覆盖为 ${status}`);
+		Object.assign(record, finished);
+	}
+
+	/** Atomic, owned terminal transition across Workspace instances in this process. */
+	async finishRunIfRunning(stage: string, runId: string,
+		status: Exclude<StageRunRecord["status"], "running">,
+		prepare: (persisted: StageRunRecord) => StageRunRecord): Promise<StageRunRecord | undefined> {
+		const file = path.join(this.runDir(stage, runId), "run.json");
+		return withRunWrite(await canonicalRunWriteKey(file), async () => {
+			const oldText = await readRunTextOrAbsent(file);
+			if (oldText === undefined) throw new HarnessError("run.missing", `找不到 ${stage} 运行 ${runId}`);
+			const old = JSON.parse(oldText) as StageRunRecord;
+			if (old.status !== "running") return undefined;
+			const next = prepare(old);
+			if (next.stage !== stage || next.runId !== runId)
+				throw new HarnessError("run.interrupted", "terminal transition changed the owned run identity");
+			next.status = status;
+			next.finishedAt = nowIso();
+			await writeFileAtomic(file, `${JSON.stringify(next, null, 2)}\n`);
+			return next;
+		});
 	}
 
 	async readRun(stage: string, runId: string): Promise<StageRunRecord> {
-		const text = await readTextIfExists(path.join(this.runDir(stage, runId), "run.json"));
+		const text = await readRunTextOrAbsent(path.join(this.runDir(stage, runId), "run.json"));
 		if (!text) throw new HarnessError("run.missing", `找不到 ${stage} 运行 ${runId}`);
 		return JSON.parse(text) as StageRunRecord;
 	}
@@ -158,11 +275,17 @@ export class Workspace {
 		return (await readdir(dir)).filter((name) => existsSync(path.join(dir, name, "run.json"))).sort();
 	}
 
+	/** Most recently created run, including incomplete or failed runs. Ambiguity fails closed. */
+	async latestRun(stage: string): Promise<StageRunRecord | undefined> {
+		const ids = await this.listRuns(stage);
+		return latestByStartOrder(await Promise.all(ids.map((id) => this.readRun(stage, id))), stage);
+	}
+
 	/** Most recent completed run of a stage, or undefined. */
 	async latestCompletedRun(stage: string): Promise<StageRunRecord | undefined> {
 		const ids = await this.listRuns(stage);
 		const completed = (await Promise.all(ids.map((id) => this.readRun(stage, id)))).filter((record) => record.status === "completed");
-		return completed.sort((left, right) => left.startedAt.localeCompare(right.startedAt) || (left.finishedAt ?? "").localeCompare(right.finishedAt ?? "") || left.runId.localeCompare(right.runId)).at(-1);
+		return latestByStartOrder(completed, stage);
 	}
 
 	async writeOutput(record: StageRunRecord, name: string, content: string, label: string = name): Promise<OutputRef> {

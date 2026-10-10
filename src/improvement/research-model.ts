@@ -26,30 +26,27 @@ export function prepareModelRequest(args: { spec: Omit<SessionSpec, "tools" | "s
  // conservative token reservation for these text-only, no-tools requests.
  const payloadByteCeiling = promptBytes + 2_048;
  const inputTokenCeiling = payloadByteCeiling;
- return { spec: { ...args.spec, tools: { kind: "none" }, strictRequest: { maxProviderCallsPerPrompt: 1, maxInputPayloadBytes: payloadByteCeiling } }, message: args.message, promptBytes, payloadByteCeiling, inputTokenCeiling };
+ return { spec: { ...args.spec, tools: { kind: "none" }, strictRequest: { maxInputPayloadBytes: payloadByteCeiling } }, message: args.message, promptBytes, payloadByteCeiling, inputTokenCeiling };
 }
 export async function runBoundedModelStep(args: {
  runner: SessionRunner; budget: SharedBudget; lease: BudgetLease; spec: Omit<SessionSpec, "tools" | "strictRequest">;
- message: string; timeoutMs: number;
+ message: string; timeoutMs?: number;
 }): Promise<BoundedModelStep> {
  const { runner, budget, lease } = args;
- const before = budget.status(lease);
  const prepared = prepareModelRequest(args);
  const { inputTokenCeiling } = prepared;
- if (inputTokenCeiling > before.remaining.inputTokens) throw new HarnessError("improvement.budget", "prepared input exceeds remaining campaign input budget");
- if (before.remaining.outputTokens < 1 || before.remaining.sdkEstimatedCost <= 0) throw new HarnessError("improvement.budget", "campaign output or cost budget exhausted before request");
- const priced = await runner.estimateMaxSdkCost?.(args.spec.model, { maxInputTokens: 1, maxOutputTokens: 1 });
- if (typeof priced !== "number" || !Number.isFinite(priced) || priced <= 0) throw new HarnessError("improvement.budget", "SDK model price is unavailable");
  const handle = await runner.create(prepared.spec);
  let reservation;
  try { reservation = budget.reserveObservedPrompt(lease, { maxInputTokens: inputTokenCeiling }); }
  catch (error) { handle.dispose(); throw error; }
  let settled = false;
  try {
-  const turn = await timedPrompt(handle, prepared.message, args.timeoutMs);
+  const turn = await timedPrompt(handle, prepared.message);
   const usage = turn.usage ?? handle.usageSummary();
   budget.settlePrompt(reservation, usage); settled = true;
-  if (budget.status(lease).settlement !== "settled" || !usage.complete || !usage.costComplete || usage.reportedEvents < 1) throw new HarnessError("improvement.usage", "provider usage or SDK-estimated cost is incomplete");
+  // Missing provider events make the action unverified; missing price-table
+  // cost alone is recorded by the ledger and does not stop continuation.
+  if (!usage.complete || usage.reportedEvents < 1) throw new HarnessError("improvement.usage", "provider request usage is incomplete");
   return { text: turn.text, sessionId: handle.ref.id, specFile: handle.ref.specFile, usageSidecar: handle.ref.file?.replace(/\.jsonl$/, ".usage.jsonl"), usage };
  } catch (error) {
   if (!settled) {

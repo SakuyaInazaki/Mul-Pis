@@ -1,0 +1,7 @@
+# Terminal missing-carry interruption authentication
+
+The ledger can now authenticate a completed, cancelled provider execution with no carry as an opaque gap when a preceding AEAD carry and one exact encrypted result artifact are present. The gap records the terminal run, job, and provider step; the result artifact ID and GitHub archive digest; and the exact predecessor carry digest. Its whole-run effects remain unreviewed and its fee unquantified. No result content, research selection, or cancellation origin is inferred.
+
+A separate read-only terminal interruption proof exposes the authenticated preceding bundle and a host-only status projection from its checkpoint. It has no latest carry or supervisor dispatch projection. Normal admission accepts a cancelled execution only through the missing-carry opaque-gap branch; a cancelled run with a carry remains blocked. Later carried successors may retain the cancelled gap in authenticated ancestry. On reopen, the host rechecks the historical gap's terminal tuple against live workflow metadata while retaining its archived artifact identity as a historical receipt.
+
+Validation: focused offline ledger tests and the full ledger test file passed. Tests cover the branded proof, prior-bundle binding, unchanged selection, ordinary next-run UNKNOWN carry, a later successor reopening the retained gap, missing or ambiguous artifact, mismatched result or job identity, stale direct run metadata, and cancellation with a carry. No provider call, upload, commit, or push occurred.

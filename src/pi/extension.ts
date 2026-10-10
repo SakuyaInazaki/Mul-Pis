@@ -14,6 +14,7 @@ import { createMainUsageLedger } from "./main-usage.ts";
 import { ImprovementService } from "../improvement/service.ts";
 import { ResearchImprovementService, type ResearchBootstrapInput } from "../improvement/research-service.ts";
 import type { ResearchCampaignPlanV1 } from "../improvement/research-types.ts";
+import type { WorkflowEvidenceHandoffPlanV1 } from "../improvement/workflow-types.ts";
 import { publicResearchRun, publicResearchStatus } from "../improvement/research-public.ts";
 import type { CampaignPlan, ImprovementRunResult, ImprovementStatus } from "../improvement/types.ts";
 import type { ActiveBudgetPointer } from "../improvement/policy.ts";
@@ -33,10 +34,12 @@ function result(value: unknown): ToolResult {
 function compact(value: unknown): Record<string, unknown> {
 	if (!value || typeof value !== "object") return { value };
 	const item = value as Record<string, unknown>;
+	if ("missionId" in item && "objectiveOutcome" in item) return item;
 	if ("workspace" in item && "stages" in item) return item;
 	if ("activeVersionId" in item && "runs" in item) return {
 		activeVersionId: item.activeVersionId, activeProvenance: item.activeProvenance, previousVersionId: item.previousVersionId, runs: item.runs,
 	};
+	if ("runId" in item && "scientificBenefit" in item) return item;
 	if ("run" in item && item.run && typeof item.run === "object") {
 		const run = item.run as Record<string, unknown>;
 		return { runId: run.runId, status: run.status, stopReason: run.stopReason, attempts: run.attempts, campaignUsage: run.campaignUsage, activeVersionId: item.activeVersionId, evaluation: item.evaluation };
@@ -48,17 +51,31 @@ function compact(value: unknown): Record<string, unknown> {
 		goalSnapshotPath: item.goalSnapshotPath,
 	};
 	if ("taskId" in item) return {
-		taskId: item.taskId, status: item.status, workDir: item.workDir, reportPath: item.reportPath,
-		expectedOutputPaths: item.expectedOutputPaths, executionFailure: item.executionFailure,
-		failures: (item.review as Record<string, unknown> | undefined)?.failures,
-		limitations: (item.review as Record<string, unknown> | undefined)?.limitations,
+		taskId: item.taskId, status: item.status,
+		mode: item.mode, context: item.context,
+		branchCheckpointId: (item.branchSource as { checkpoint?: { id?: string } } | undefined)?.checkpoint?.id,
+		branchUnavailable: Boolean(item.branchUnavailableReason),
 	};
 	if ("runId" in item && "lifecycle" in item) return {
 		runId: item.runId, lifecycle: item.lifecycle, outcome: item.outcome, returnPath: item.returnPath,
 		...summarizeGoalExecution(item as unknown as CurrentGoal),
 		feedbackPath: item.feedbackPath, taskCount: Array.isArray(item.tasks) ? item.tasks.length : undefined,
+		tasks: Array.isArray(item.tasks) ? item.tasks.map((task) => {
+			const entry = task as Record<string, unknown>;
+			return { taskId: entry.taskId, status: entry.status, mode: entry.mode, context: entry.context,
+				branchCheckpointId: (entry.branchSource as { checkpoint?: { id?: string } } | undefined)?.checkpoint?.id,
+				branchUnavailable: Boolean(entry.branchUnavailableReason) };
+		}) : [],
+		branchSelections: Array.isArray(item.branchSelections) ? item.branchSelections.map((entry) => {
+			const selection = entry as Record<string, unknown>;
+			const candidates = Array.isArray(selection.candidates) ? selection.candidates as Array<Record<string, unknown>> : [];
+			return { parentTaskId: selection.parentTaskId, selectedTaskId: selection.selectedTaskId,
+				candidateCount: candidates.length, candidates: candidates.map((candidate) => ({ taskId: candidate.taskId, status: candidate.status,
+					passedChecks: Array.isArray(candidate.checks) ? candidate.checks.filter((check) => (check as { result?: string }).result === "passed").length : 0,
+					failedChecks: Array.isArray(candidate.checks) ? candidate.checks.filter((check) => (check as { result?: string }).result === "failed").length : 0 })) };
+		}) : [],
 		openDecisions: Array.isArray(item.decisions) ? item.decisions.filter((entry) => (entry as { status?: string }).status === "open").length : undefined,
-		feedbackStatus: item.feedbackStatus, feedbackError: item.feedbackError, limitations: item.limitations,
+		feedbackStatus: item.feedbackStatus, feedbackErrorCode: (item.feedbackError as { code?: string } | undefined)?.code,
 	};
 	const record = item.record as Record<string, unknown> | undefined;
 	if (record?.stage === "M08") {
@@ -118,11 +135,13 @@ export interface ResearchExtensionOptions {
 	mainAgentStallTimeoutMs?: number;
 	mainAgentStallCheckMs?: number;
 	improvementServiceFactory?: (workspaceRoot: string, signal?: AbortSignal) => Promise<Pick<ImprovementService, "run" | "status" | "rollback"> & Partial<Pick<ImprovementService, "exportMethodPackage" | "bindMethodPackage">>> | Pick<ImprovementService, "run" | "status" | "rollback"> & Partial<Pick<ImprovementService, "exportMethodPackage" | "bindMethodPackage">>;
+	/** Allows an offline extension test to supply a bounded method service without Pi model calls. */
+	researchImprovementServiceFactory?: (workspaceRoot: string, signal?: AbortSignal) => Pick<ResearchImprovementService, "runWorkflow">;
 }
 
 export function createResearchExtension(options: ResearchExtensionOptions = {}) {
 	return function researchExtension(pi: ExtensionAPI): void {
-		const orchestrationTools = new Set(["research_status", "research_init", "research_stage", "research_goal", "research_delegate", "research_review", "research_improve", "research_method_improve"]);
+		const orchestrationTools = new Set(["research_status", "research_init", "research_stage", "research_goal", "research_mission", "research_delegate", "research_review", "research_improve", "research_method_improve"]);
 		const inspectionTools = new Set(["read", "grep", "find", "ls"]);
 		let researchActive = false;
 		let activePiCwd: string | undefined;
@@ -154,7 +173,7 @@ export function createResearchExtension(options: ResearchExtensionOptions = {}) 
 			return new ImprovementService({ workspaceRoot, runner: createPiSessionRunner({ signal }) });
 		};
 
-const mainAgentStallTimeoutMs = options.mainAgentStallTimeoutMs ?? 10 * 60_000;
+const mainAgentStallTimeoutMs = options.mainAgentStallTimeoutMs ?? 0;
 const mainAgentStallCheckMs = options.mainAgentStallCheckMs ?? 1_000;
 let mainAgentWatchdog: NodeJS.Timeout | undefined;
 let mainAgentWatchdogCtx: ExtensionContext | undefined;
@@ -278,14 +297,12 @@ mainAgentWatchdog.unref?.();
 			else emptyRounds = 0;
 			lastControlStamp = controlStamp;
 			successfulToolSinceEnd = false; inspectionSinceEnd = false;
-			if (emptyRounds >= 2) {
-				continuationHalt = "no-progress";
-				continuationEntry("stopped", "repeated-empty-agent-rounds-with-unchanged-goal");
-				return;
+			if (emptyRounds > 0) {
+				continuationEntry("observed", "unchanged-goal-needs-next-action");
 			}
 			continuationHalt = undefined;
 			continuationEntry("queued", "active-goal-not-fulfilled");
-			pi.sendMessage({ customType: "research_continuation", content: `继续同一科研工作流，唯一目标 runId=${boundGoalRunId}，绑定工作区 workspace=${continuationWorkspace(ctx.cwd)}。先调用 research_goal action=status，明确传入此 runId 与 workspace 核对持久状态；后续研究工具也明确传入同一 workspace，再由工作流自主选择下一有界步骤。不得把本回合 final/checkpoint 当作目标 fulfilled，不得开启另一个题目。候选负结果与局部工具限制可由 research_goal action=checkpoint 冻结反馈；若历史评审已超快照容量，可显式提供本轮非空 taskIds 分批冻结，未选任务不是已交接证据。再用 research_stage stage=M04、feedbackStage=M07、feedbackRunId=本 runId、feedbackCheckpointId=所返回 id 回流；M04 完成后如需更新基线，再显式调用 research_goal action=plan、refreshBaseline=true，并传入 checkpointId 与已完成的 m04RunId。真实宿主错误由控制器内部记录。`, display: false }, { triggerTurn: true, deliverAs: "followUp" });
+			pi.sendMessage({ customType: "research_continuation", content: `${emptyRounds > 0 ? "上个回合尚未改变目标状态；请依据已有证据执行下一可行步骤或核验真实阻塞，不要只重复计划。\n" : ""}继续同一科研工作流，唯一目标 runId=${boundGoalRunId}，绑定工作区 workspace=${continuationWorkspace(ctx.cwd)}。先调用 research_goal action=status，明确传入此 runId 与 workspace 核对持久状态；后续研究工具也明确传入同一 workspace，再由工作流自主选择下一有界步骤。不得把本回合 final/checkpoint 当作目标 fulfilled，不得开启另一个题目。候选负结果与局部工具限制可由 research_goal action=checkpoint 冻结反馈；若历史评审已超快照容量，可显式提供本轮非空 taskIds 分批冻结，未选任务不是已交接证据。再用 research_stage stage=M04、feedbackStage=M07、feedbackRunId=本 runId、feedbackCheckpointId=所返回 id 回流；M04 完成后如需更新基线，再显式调用 research_goal action=plan、refreshBaseline=true，并传入 checkpointId 与已完成的 m04RunId。真实宿主错误由控制器内部记录。`, display: false }, { triggerTurn: true, deliverAs: "followUp" });
 		});
 		pi.on("agent_settled", () => { clearMainAgentWatchdog(); });
 		pi.on("session_shutdown", async (event, ctx) => {
@@ -415,11 +432,11 @@ mainAgentWatchdog.unref?.();
 		pi.registerTool({
 			name: "research_method_improve",
 			label: "Bounded Research Method Improvement",
-			description: "Explicitly bootstrap, run, inspect, roll back, or manually transfer versioned H/I prompt strategies in the local CPU method-research environment. This is separate from the budget-policy mechanism-cost protocol; no admission cases means research-only, and no complete M01–M09 or L5 benefit is implied.",
+			description: "Explicitly bootstrap, run, inspect, roll back, or manually transfer versioned H/I prompt strategies. Action run is the CPU method-research campaign; workflow-run explicitly runs the M07 evidence-handoff campaign. Neither is automatic or proof of scientific benefit.",
 			promptSnippet: "Run a caller-bounded H/I method-research campaign only when explicitly authorized",
-			promptGuidelines: ["Use caller-supplied method/plan files with exact provider-call, token and SDK-estimated-cost ceilings.", "Development feedback can guide candidates; protected admission results must not return to proposal prompts."],
+			promptGuidelines: ["Use caller-supplied method/plan files with one total SDK-estimated-cost ceiling. Keep required file-safety and scientific case bounds; do not divide the monetary ceiling among phases or arms.", "Development feedback can guide candidates; protected admission results must not return to proposal prompts."],
 			parameters: Type.Object({
-				action: Type.Union([Type.Literal("bootstrap"), Type.Literal("run"), Type.Literal("status"), Type.Literal("rollback"), Type.Literal("export"), Type.Literal("bind"), Type.Literal("advance-knowledge"), Type.Literal("transition-dependencies")]),
+				action: Type.Union([Type.Literal("bootstrap"), Type.Literal("run"), Type.Literal("workflow-run"), Type.Literal("status"), Type.Literal("rollback"), Type.Literal("export"), Type.Literal("bind"), Type.Literal("advance-knowledge"), Type.Literal("transition-dependencies")]),
 				workspace: Type.Optional(Type.String()),
 				methodsPath: Type.Optional(Type.String()),
 				planPath: Type.Optional(Type.String()),
@@ -431,6 +448,12 @@ mainAgentWatchdog.unref?.();
 			}),
 			executionMode: "sequential",
 			async execute(_id, params, signal, _update, ctx) {
+				if (params.action === "workflow-run") {
+					if (!params.planPath) throw new Error("workflow-run requires planPath");
+					const research = options.researchImprovementServiceFactory?.(workspaceFrom(params.workspace, ctx.cwd), signal) ?? new ResearchImprovementService({ workspaceRoot: workspaceFrom(params.workspace, ctx.cwd), runner: (await import("../runner/pi.ts")).createPiSessionRunner({ signal }) });
+					const run = await research.runWorkflow(JSON.parse(await readFile(path.resolve(ctx.cwd, params.planPath), "utf8")) as WorkflowEvidenceHandoffPlanV1);
+					return result({ runId: run.runId, status: run.status, outcome: run.outcome, stopReason: run.stopReason, selectedCandidateId: run.selectedCandidateId, promotedMethodVersionId: run.promotedMethodVersionId, developmentArmCount: run.developmentArms.length, protectedArmCount: run.protectedArms.length, scientificBenefit: run.scientificBenefit, budget: run.budgetAtEnd });
+				}
 				const { createPiSessionRunner } = await import("../runner/pi.ts");
 				const research = new ResearchImprovementService({ workspaceRoot: workspaceFrom(params.workspace, ctx.cwd), runner: createPiSessionRunner({ signal }) });
 				if (params.action === "bootstrap") {
@@ -525,15 +548,54 @@ mainAgentWatchdog.unref?.();
 		});
 
 		pi.registerTool({
+			name: "research_mission",
+			label: "Local Original Objective",
+			description: "Continue a user-authored original research objective already frozen by the local CLI. Each step uses evidence-grounded assessment and bounded M07/M04 work without GitHub Actions.",
+			promptSnippet: "Inspect or advance a locally persisted original objective",
+			promptGuidelines: ["Use the exact mission ID created from the user's original objective file by the local CLI.", "An M07 task or M04 merge does not by itself prove the original objective fulfilled.", "Unresolved external operations require host reconciliation before fresh execution."],
+			parameters: Type.Object({
+				action: Type.Union([Type.Literal("status"), Type.Literal("step"), Type.Literal("run")]),
+				workspace: Type.Optional(Type.String()),
+				missionId: Type.String(),
+			}),
+			executionMode: "sequential",
+			async execute(_id, params, signal, onUpdate, ctx) {
+				const workspace = workspaceFrom(params.workspace, ctx.cwd);
+				if (continuationEnabled(ctx) && params.action !== "status")
+					throw new Error("The bound M07 continuation must settle before starting a separate local mission action.");
+				let value: unknown;
+				if (params.action === "status") {
+					value = await service.missionStatus(params.missionId, workspace);
+				} else {
+					activeUpdate = onUpdate as typeof activeUpdate;
+					try {
+						value = await service.missionAdvance(params.action, params.missionId, workspace, signal);
+					} finally { activeUpdate = undefined; }
+					researchActive = true; activePiCwd = ctx.cwd;
+				}
+				const checkpoint = value as { contract?: { id?: unknown }; objectiveOutcome?: unknown;
+					stopReason?: unknown; boundedRuns?: unknown[]; continuation?: { unresolvedOperationIds?: unknown[];
+					pendingAction?: { kind?: unknown; safety?: unknown } } };
+				return result({ missionId: checkpoint.contract?.id, objectiveOutcome: checkpoint.objectiveOutcome,
+					stopReason: checkpoint.stopReason, boundedRunCount: checkpoint.boundedRuns?.length ?? 0,
+					unresolvedOperationCount: checkpoint.continuation?.unresolvedOperationIds?.length ?? 0,
+					pendingAction: checkpoint.continuation?.pendingAction ? {
+						kind: checkpoint.continuation.pendingAction.kind,
+						safety: checkpoint.continuation.pendingAction.safety } : undefined });
+			},
+		});
+
+		pi.registerTool({
 			name: "research_goal",
 			label: "Manage Research Goal",
-			description: "Begin, inspect, checkpoint, replan, record an interactive user decision, finish, or interrupt/archive one persisted M07 goal. A checkpoint freezes negative or partial results for exact M04 feedback without ending the goal. In an explicitly continuous session, model-issued non-fulfilled finish and interrupt are forbidden; host faults use the controller-only channel.",
+			description: "Begin, inspect, checkpoint, replan, select a reviewed M07 branch (or explicitly select none), record a decision, finish, or interrupt/archive one persisted goal. Selection never substitutes for review or goal checks. A checkpoint freezes partial results for exact M04 feedback without ending the goal.",
 			promptSnippet: "Manage one explicit M07 goal and its lifecycle",
 			promptGuidelines: ["Use research_goal to keep the user's frozen goal, plan, decisions, outcome, and return path explicit.", "In print/json mode continue bounded work. A continuous goal can finish only when controller-verified success is fulfilled; host interruptions use the internal controller path."],
 			parameters: Type.Object({
-				action: Type.Union([Type.Literal("begin"), Type.Literal("status"), Type.Literal("checkpoint"), Type.Literal("plan"), Type.Literal("decision"), Type.Literal("finish"), Type.Literal("interrupt")]),
+				action: Type.Union([Type.Literal("begin"), Type.Literal("status"), Type.Literal("checkpoint"), Type.Literal("plan"), Type.Literal("select-branch"), Type.Literal("decision"), Type.Literal("finish"), Type.Literal("interrupt")]),
 				workspace: Type.Optional(Type.String()), runId: Type.Optional(Type.String()),
 				taskIds: Type.Optional(Type.Array(Type.String({ description: "For checkpoint only: explicit nonempty M07 task IDs to freeze this batch; omitted means all reviewed tasks" }))),
+				parentTaskId: Type.Optional(Type.String({ description: "For select-branch: exact settled parent task ID" })), selectedTaskId: Type.Optional(Type.String({ description: "For select-branch: accepted sibling task ID; omit to explicitly select none" })), rationale: Type.Optional(Type.String({ description: "For select-branch: concise reason for this selection" })),
 				goal: Type.Optional(Type.String()), problemRelation: Type.Optional(Type.String()), constraints: Type.Optional(Type.Array(Type.String())), successCriteria: Type.Optional(Type.Array(Type.String())), plan: Type.Optional(Type.String()), exploratory: Type.Optional(Type.Boolean()), refreshBaseline: Type.Optional(Type.Boolean()), checkpointId: Type.Optional(Type.String()), m04RunId: Type.Optional(Type.String()), workflowMethodVersionId: Type.Optional(Type.String()),
 				decisionAction: Type.Optional(Type.Union([Type.Literal("request"), Type.Literal("resolve")])), question: Type.Optional(Type.String()), decision: Type.Optional(Type.String()), relatedTaskIds: Type.Optional(Type.Array(Type.String())), reason: Type.Optional(Type.String({ description: "Interrupt/archive reason; required for action=interrupt" })),
 				stopReason: Type.Optional(Type.Union([Type.Literal("resource_exhausted"), Type.Literal("authorization_blocked"), Type.Literal("dependency_unavailable"), Type.Literal("user_stopped")])),
@@ -543,6 +605,11 @@ mainAgentWatchdog.unref?.();
 			executionMode: "sequential",
 			async execute(_id, params, signal, _update, ctx) {
 				const workspace = workspaceFrom(params.workspace, ctx.cwd);
+				if (params.action === "select-branch") {
+					const allowed = new Set(["action", "workspace", "runId", "parentTaskId", "selectedTaskId", "rationale"]);
+					if (Object.keys(params).some((key) => !allowed.has(key))) throw new Error("research_goal select-branch contains unrelated fields");
+					if (typeof params.runId !== "string" || !params.runId.trim() || typeof params.parentTaskId !== "string" || !params.parentTaskId.trim() || typeof params.rationale !== "string" || !params.rationale.trim() || (params.selectedTaskId !== undefined && (typeof params.selectedTaskId !== "string" || !params.selectedTaskId.trim()))) throw new Error("research_goal select-branch requires runId, parentTaskId, nonempty rationale, and optional nonempty selectedTaskId");
+				} else if (params.parentTaskId !== undefined || params.selectedTaskId !== undefined || params.rationale !== undefined) throw new Error("branch selection fields require action=select-branch");
 				const nonInteractive = ctx.mode === "json" || ctx.mode === "print";
 				const continuousModel = continuationEnabled(ctx) && workspace === continuationWorkspace(ctx.cwd);
 				if (params.action === "begin" && continuationEnabled(ctx)) {
@@ -581,6 +648,7 @@ mainAgentWatchdog.unref?.();
 				} else {
 					if (!params.runId) throw new Error(`research_goal ${params.action} requires runId`);
 					if (params.action === "checkpoint") value = await service.goalAction("checkpoint", workspace, { runId: params.runId, taskIds: params.taskIds }, signal);
+					if (params.action === "select-branch") value = await service.goalAction("select-branch", workspace, { runId: params.runId, parentTaskId: params.parentTaskId!, ...(params.selectedTaskId === undefined ? {} : { selectedTaskId: params.selectedTaskId }), rationale: params.rationale! }, signal);
 					if (params.action === "plan") value = await service.goalAction("plan", workspace, { runId: params.runId, plan: params.plan ?? "", refreshBaseline: params.refreshBaseline, checkpointId: params.checkpointId, m04RunId: params.m04RunId }, signal);
 					if (params.action === "decision") value = await service.goalAction("decision", workspace, { runId: params.runId, action: params.decisionAction ?? "request", question: params.question, decision: params.decision, relatedTaskIds: params.relatedTaskIds ?? [] }, signal);
 					if (params.action === "interrupt") value = await service.goalAction("interrupt", workspace, { runId: params.runId, reason: params.reason ?? params.summary ?? "用户/主 Agent 受控中断归档", returnPath: params.returnPath }, signal);
@@ -594,17 +662,27 @@ mainAgentWatchdog.unref?.();
 		pi.registerTool({
 			name: "research_delegate",
 			label: "Delegate Research Task",
-			description: "Run one bounded M07 task in a fresh isolated session and record it as returned. The return is not accepted until research_review checks it.",
+			description: "Run one bounded M07 task in a fresh isolated session, or fork from a settled execute task's frozen checkpoint via context={mode:fork,parentRunId,parentTaskId,checkpointId}. A fork preserves the parent's goal and checks; the controller validates the exact obligations. Every candidate needs research_review before branch selection.",
 			promptSnippet: "Delegate one bounded M07 task with explicit inputs, outputs, and checks",
 			promptGuidelines: ["Use research_delegate only for a bounded task under an existing M07 goal; never describe a returned task as accepted.", "Expected outputs are exact work-dir-relative path strings; put human explanations in objective or report.md, never in a path."],
 			parameters: Type.Object({
 				workspace: Type.Optional(Type.String()), runId: Type.String(), objective: Type.String(), inputs: Type.Array(Type.String()), expectedOutputs: Type.Array(Type.String({ description: "Exact work-dir-relative output path; put explanations in objective or report.md" })), checks: Type.Array(Type.String()), mode: Type.Union([Type.Literal("execute"), Type.Literal("check"), Type.Literal("reason")]), parentTaskId: Type.Optional(Type.String()), supersedesTaskId: Type.Optional(Type.String()), requireIndependentCheck: Type.Optional(Type.Boolean()), knowledgeIds: Type.Optional(Type.Array(Type.String())),
+				planInput: Type.Optional(Type.String({ description: "Exact relative input path containing the approved plan for this task" })),
+				resourceInputs: Type.Optional(Type.Array(Type.Object({ id: Type.String(), version: Type.String(), input: Type.String() }))),
+				executionLoop: Type.Optional(Type.Object({ mode: Type.Literal("until-ready") })),
+				lessonDeltaOutput: Type.Optional(Type.String({ description: "Exact relative output path for the task's lesson delta" })),
 				experienceRefs: Type.Optional(Type.Array(Type.Object({ storeId: Type.String(), recordId: Type.String(), version: Type.Integer() }))),
 				experienceContextRefs: Type.Optional(Type.Array(Type.Object({ storeId: Type.String(), recordId: Type.String(), version: Type.Integer() }))),
 				experienceTags: Type.Optional(Type.Array(Type.String())),
+				context: Type.Optional(Type.Object({ mode: Type.Literal("fork"), parentRunId: Type.String(), parentTaskId: Type.String(), checkpointId: Type.String() }, { additionalProperties: false })),
 			}),
 			executionMode: "sequential",
 			async execute(_id, params, signal, onUpdate, ctx) {
+				if (params.context !== undefined) {
+					if (!params.context || typeof params.context !== "object" || Array.isArray(params.context)) throw new Error("research_delegate fork context must be an exact object");
+					const keys = Object.keys(params.context).sort();
+					if (keys.join(",") !== "checkpointId,mode,parentRunId,parentTaskId" || params.context.mode !== "fork" || typeof params.context.parentRunId !== "string" || !params.context.parentRunId.trim() || typeof params.context.parentTaskId !== "string" || !params.context.parentTaskId.trim() || typeof params.context.checkpointId !== "string" || !params.context.checkpointId.trim() || params.context.parentRunId !== params.runId) throw new Error("research_delegate fork requires exact same-goal parentRunId, parentTaskId, and checkpointId");
+				}
 				activeUpdate = onUpdate as typeof activeUpdate;
 				try { const { workspace, runId, ...task } = params; const value = await service.delegate(runId, task, workspaceFrom(workspace, ctx.cwd), signal); researchActive = true; activePiCwd = ctx.cwd; return result(value); }
 				finally { activeUpdate = undefined; }
@@ -636,7 +714,7 @@ mainAgentWatchdog.unref?.();
 			handler: async (args, ctx) => {
 				const [action = "help", ...rest] = args.trim().split(/\s+/).filter(Boolean);
 				if (action === "help") {
-					ctx.ui.notify("/research status [workspace] 查看状态；/research off 停止向当前主会话追加 P07。", "info");
+					ctx.ui.notify("/research status [workspace] 查看状态；/research off 停止向当前主会话追加 P07。分支：research_delegate.context 传同一目标的 parentRunId、parentTaskId、checkpointId；评审后用 research_goal action=select-branch，省略 selectedTaskId 表示明确不选。", "info");
 					return;
 				}
 				if (action === "off") { researchActive = false; activePiCwd = undefined; ctx.ui.notify("当前主会话已退出研究指导状态。", "info"); return; }

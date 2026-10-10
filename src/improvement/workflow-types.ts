@@ -1,4 +1,6 @@
 import type { BudgetLimits } from "../experiments/contracts.ts";
+import { isKnowledgeRef } from "../knowledge/experience-index.ts";
+import type { KnowledgeRef } from "../knowledge/types.ts";
 import type { BeginGoalInput, TaskSpecInput } from "../m07/types.ts";
 import { HarnessError } from "../types.ts";
 
@@ -26,17 +28,23 @@ export interface WorkflowEvidenceHandoffPlanV1 {
 	admissionCaseSetPath?: string;
 	/** Must not exist and must be disjoint from the live workspace. Never cleaned automatically. */
 	experimentRoot: string;
-	maxDecisions: number;
-	maxCandidates: number;
-	maxInspectActions: number;
-	maxReadbackChars: number;
+	/** Legacy execution quotas; ignored by current runs. */
+	maxDecisions?: number;
+	maxCandidates?: number;
+	maxInspectActions?: number;
+	/** Legacy cumulative readback quota, accepted only for historical plan decoding. */
+	maxReadbackChars?: number;
 	maxFeedbackItems: number;
-	perPromptTimeoutMs: number;
+	perPromptTimeoutMs?: number;
 	budget: BudgetLimits;
 	/** At least two paired, fresh protected executions are needed for admission. */
 	admissionRepetitions: number;
 	/** Prior same-workspace development episodes. Protected results are excluded. */
 	metaEpisodeRunIds?: string[];
+	/** Explicit pinned I experience; omitted means no experience pack. Never selected by search. */
+	experienceRefs?: KnowledgeRef[];
+	experienceMaxRecords?: number;
+	experienceMaxChars?: number;
 }
 export interface WorkflowArmReceiptV1 {
 	caseId: string;
@@ -49,7 +57,7 @@ export interface WorkflowArmReceiptV1 {
 	reportDeliveredToM04?: boolean;
 	feedbackStatus?: string;
 	checkResults: Array<{ criterion: string; passed: boolean }>;
-	usage: { providerCalls: number; inputTokens: number; outputTokens: number; sdkEstimatedCost: number; complete: boolean };
+	usage: { providerCalls: number; inputTokens: number; outputTokens: number; sdkEstimatedCost: number; complete: boolean; costComplete?: boolean };
 	status: "complete" | "inconclusive";
 	reason?: string;
 }
@@ -70,6 +78,8 @@ export interface WorkflowRunV1 {
 	knowledgeSnapshot?: string;
 	developmentSource: WorkflowEvidenceHandoffPlanV1["developmentSource"];
 	decisions: Array<{ index: number; improverVersionId: string; sessionId?: string; action?: string; candidateVersionId?: string; outcome: string }>;
+	/** Observed UTF-8 bytes returned by successful inspect actions; never a spending limit. */
+	inspectionReadbackBytesObserved?: number;
 	candidates: Array<{ versionId: string; parentVersionId: string; producedByImproverVersionId: string; developmentStatus: "untested" | "supported" | "rejected" | "inconclusive"; hypothesis: unknown }>;
 	developmentArms: WorkflowArmReceiptV1[];
 	protectedArms: WorkflowArmReceiptV1[];
@@ -85,31 +95,45 @@ export interface WorkflowRunV1 {
 
 const safeId = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
 function budget(value: unknown): value is BudgetLimits {
-	if (!value || typeof value !== "object") return false;
+	if (value === undefined) return true;
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const b = value as Record<string, unknown>;
-	return Object.keys(b).sort().join(",") === ["maxCpuMillis", "maxInputTokens", "maxOutputTokens", "maxProbeCalls", "maxProviderCalls", "maxSdkEstimatedCost", "maxWallMillis"].sort().join(",") &&
-		["maxCpuMillis", "maxInputTokens", "maxOutputTokens", "maxProviderCalls", "maxWallMillis"].every((key) => Number.isSafeInteger(b[key]) && (b[key] as number) > 0) && b.maxProbeCalls === 0 &&
-		typeof b.maxSdkEstimatedCost === "number" && Number.isFinite(b.maxSdkEstimatedCost) && b.maxSdkEstimatedCost > 0;
+	return Object.keys(b).every((key) => ["maxCpuMillis", "maxInputTokens", "maxOutputTokens", "maxProbeCalls", "maxProviderCalls", "maxSdkEstimatedCost", "maxWallMillis"].includes(key)) &&
+		(b.maxSdkEstimatedCost === undefined || typeof b.maxSdkEstimatedCost === "number" && Number.isFinite(b.maxSdkEstimatedCost) && b.maxSdkEstimatedCost >= 0);
 }
 export function validateWorkflowPlan(input: unknown): WorkflowEvidenceHandoffPlanV1 {
 	if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.workflow-plan", "workflow plan must be an object");
 	const p = input as Record<string, unknown>;
-	const keys = ["version", "kind", "developmentSource", "developmentCaseSetPath", "admissionCaseSetPath", "experimentRoot", "maxDecisions", "maxCandidates", "maxInspectActions", "maxReadbackChars", "maxFeedbackItems", "perPromptTimeoutMs", "budget", "admissionRepetitions", "metaEpisodeRunIds"];
+	const keys = ["version", "kind", "developmentSource", "developmentCaseSetPath", "admissionCaseSetPath", "experimentRoot", "maxDecisions", "maxCandidates", "maxInspectActions", "maxReadbackChars", "maxFeedbackItems", "perPromptTimeoutMs", "budget", "admissionRepetitions", "metaEpisodeRunIds", "experienceRefs", "experienceMaxRecords", "experienceMaxChars"];
 	if (Object.keys(p).some((key) => !keys.includes(key)) || p.version !== 1 || p.kind !== "m07-evidence-handoff/v1") throw new HarnessError("improvement.workflow-plan", "unsupported workflow plan");
 	const src = p.developmentSource as Record<string, unknown> | undefined;
 	if (!src || Object.keys(src).sort().join(",") !== "checkpointId,m04RunId,m07RunId" || !safeId(src.m07RunId) || !safeId(src.checkpointId) || !safeId(src.m04RunId)) throw new HarnessError("improvement.workflow-plan", "development source must pin one M07 checkpoint and its M04 run");
 	for (const key of ["developmentCaseSetPath", "experimentRoot"] as const) if (typeof p[key] !== "string" || !p[key].trim() || p[key].length > 500) throw new HarnessError("improvement.workflow-plan", `${key} is required`);
 	if (p.admissionCaseSetPath !== undefined && (typeof p.admissionCaseSetPath !== "string" || !p.admissionCaseSetPath.trim() || p.admissionCaseSetPath === p.developmentCaseSetPath)) throw new HarnessError("improvement.workflow-plan", "admission cases must be a distinct path");
-	for (const [key, min, max] of [["maxDecisions", 1, 30], ["maxCandidates", 1, 10], ["maxInspectActions", 0, 30], ["maxReadbackChars", 0, 40_000], ["maxFeedbackItems", 1, 24], ["perPromptTimeoutMs", 100, 300_000], ["admissionRepetitions", 2, 10]] as const)
+	for (const [key, min, max] of [["maxFeedbackItems", 1, 24], ["admissionRepetitions", 2, Number.MAX_SAFE_INTEGER]] as const)
 		if (!Number.isSafeInteger(p[key]) || (p[key] as number) < min || (p[key] as number) > max) throw new HarnessError("improvement.workflow-plan", `${key} must be ${min}–${max}`);
-	if ((p.admissionRepetitions as number) % 2 !== 0 || !budget(p.budget)) throw new HarnessError("improvement.workflow-plan", "even paired repetitions and a closed budget are required");
-	if (p.metaEpisodeRunIds !== undefined && (!Array.isArray(p.metaEpisodeRunIds) || p.metaEpisodeRunIds.length > 4 || !p.metaEpisodeRunIds.every(safeId) || new Set(p.metaEpisodeRunIds).size !== p.metaEpisodeRunIds.length)) throw new HarnessError("improvement.workflow-plan", "prior workflow episodes must be at most four distinct run IDs");
-	return p as unknown as WorkflowEvidenceHandoffPlanV1;
+	if (p.maxReadbackChars !== undefined && (!Number.isSafeInteger(p.maxReadbackChars) || (p.maxReadbackChars as number) < 0)) throw new HarnessError("improvement.workflow-plan", "legacy maxReadbackChars must be a nonnegative integer");
+	if ((p.admissionRepetitions as number) % 2 !== 0 || !budget(p.budget)) throw new HarnessError("improvement.workflow-plan", "even paired repetitions and valid historical budget fields are required");
+	if (p.metaEpisodeRunIds !== undefined && (!Array.isArray(p.metaEpisodeRunIds) || !p.metaEpisodeRunIds.every(safeId) || new Set(p.metaEpisodeRunIds).size !== p.metaEpisodeRunIds.length)) throw new HarnessError("improvement.workflow-plan", "prior workflow episodes must be distinct run IDs");
+	if (p.experienceRefs !== undefined) {
+		if (!Array.isArray(p.experienceRefs) || p.experienceRefs.length > 20 || !p.experienceRefs.every(isKnowledgeRef) || new Set(p.experienceRefs.map((ref: KnowledgeRef) => `${ref.storeId}/${ref.recordId}@${ref.version}`)).size !== p.experienceRefs.length) throw new HarnessError("improvement.workflow-plan", "experienceRefs must be at most twenty distinct pinned references");
+	}
+	const refCount = (p.experienceRefs as KnowledgeRef[] | undefined)?.length ?? 0;
+	if (refCount) {
+		if (!Number.isSafeInteger(p.experienceMaxRecords) || (p.experienceMaxRecords as number) < refCount || (p.experienceMaxRecords as number) > 20 || !Number.isSafeInteger(p.experienceMaxChars) || (p.experienceMaxChars as number) < 1 || (p.experienceMaxChars as number) > 12_000) throw new HarnessError("improvement.workflow-plan", "nonempty workflow I experience requires bounded record and character caps");
+	} else if (p.experienceMaxRecords !== undefined || p.experienceMaxChars !== undefined) {
+		if (p.experienceMaxRecords !== 0 || p.experienceMaxChars !== 0) throw new HarnessError("improvement.workflow-plan", "empty workflow I experience must have zero or omitted caps");
+	}
+	const { maxOutputTokens: _legacyOutputLimit, maxProviderCalls: _calls, maxInputTokens: _input,
+		maxProbeCalls: _probes, maxCpuMillis: _cpu, maxWallMillis: _wall, ...activeBudget } = (p.budget ?? {}) as BudgetLimits;
+	const { maxDecisions: _decisions, maxCandidates: _candidates, maxInspectActions: _inspections, maxReadbackChars: _readback,
+		perPromptTimeoutMs: _timeout, ...activePlan } = p;
+	return { ...activePlan, budget: activeBudget } as unknown as WorkflowEvidenceHandoffPlanV1;
 }
 export function validateWorkflowCaseSet(input: unknown, split: WorkflowCaseSetV1["split"]): WorkflowCaseSetV1 {
 	if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.workflow-cases", "case set must be an object");
 	const set = input as Record<string, unknown>;
-	if (Object.keys(set).sort().join(",") !== "cases,split,version" || set.version !== 1 || set.split !== split || !Array.isArray(set.cases) || set.cases.length < 1 || set.cases.length > 4) throw new HarnessError("improvement.workflow-cases", "invalid frozen case set");
+	if (Object.keys(set).sort().join(",") !== "cases,split,version" || set.version !== 1 || set.split !== split || !Array.isArray(set.cases) || set.cases.length < 1) throw new HarnessError("improvement.workflow-cases", "invalid frozen case set");
 	const ids = new Set<string>();
 	for (const raw of set.cases) {
 		const c = raw as Record<string, unknown>;

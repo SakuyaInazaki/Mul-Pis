@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import test, { type TestContext } from "node:test";
 import { ResearchImprovementService } from "../src/improvement/research-service.ts";
-import { GenerationStore } from "../src/improvement/generation.ts";
+import { GenerationStore, validateExperienceRequirements, validateGenerationBundle, validateStrategyRecord } from "../src/improvement/generation.ts";
 import { fullyReadDevelopmentFeedbackIds, validateResearchAction, type ResearchInspectionResultV1 } from "../src/improvement/policy-host.ts";
 import type { ResearchCampaignPlanV1 } from "../src/improvement/research-types.ts";
 import { validateResearchPlan } from "../src/improvement/research-types.ts";
@@ -17,7 +17,7 @@ import { runExecutorQualityAdmission } from "../src/improvement/executor-eval.ts
 import { publicResearchRun, publicResearchStatus } from "../src/improvement/research-public.ts";
 import { validateCpuCaseSet } from "../src/experiments/local-environment.ts";
 import { runMetaImprovementAdmission } from "../src/improvement/meta-eval.ts";
-import { loadMetaEpisode } from "../src/improvement/meta-episode.ts";
+import { buildMetaEpisode, loadMetaEpisode, metaEpisodePath, writeMetaEpisode } from "../src/improvement/meta-episode.ts";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 
 const usage = { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, totalTokens: 150, cost: 0.001 };
@@ -30,16 +30,37 @@ const cpuCase = (split: "development" | "admission", id: string) => ({ version: 
  ], initialX: [0], allowedProbeX: [2], maxProbeCalls: 1, tolerance: 0.01, units: { x: "s", y: "m" } }] });
 const plan = (admissionCaseSetPath?: string): ResearchCampaignPlanV1 => ({ version: 1, experimentKind: "executor-quality", target: "executor", developmentCaseSetPath: "development.json",
  ...(admissionCaseSetPath ? { admissionCaseSetPath, searchReplicates: 1, outcomeReplicates: 2,
-  outerBudget: { maxProviderCalls: 8, maxInputTokens: 160_000, maxOutputTokens: 16_384, maxSdkEstimatedCost: 1, maxProbeCalls: 5, maxCpuMillis: 10_000, maxWallMillis: 60_000 },
-  pilotBudget: { maxProviderCalls: 5, maxInputTokens: 100_000, maxOutputTokens: 10_240, maxSdkEstimatedCost: 1, maxProbeCalls: 3, maxCpuMillis: 10_000, maxWallMillis: 60_000 },
-  protectedBudget: { maxProviderCalls: 12, maxInputTokens: 240_000, maxOutputTokens: 24_576, maxSdkEstimatedCost: 2, maxProbeCalls: 8, maxCpuMillis: 10_000, maxWallMillis: 60_000 } } : {}),
+  outerBudget: { maxProviderCalls: 8, maxInputTokens: 160_000, maxSdkEstimatedCost: 1, maxProbeCalls: 5, maxCpuMillis: 10_000, maxWallMillis: 60_000 },
+  pilotBudget: { maxProviderCalls: 5, maxInputTokens: 100_000, maxSdkEstimatedCost: 1, maxProbeCalls: 3, maxCpuMillis: 10_000, maxWallMillis: 60_000 },
+  protectedBudget: { maxProviderCalls: 12, maxInputTokens: 240_000, maxSdkEstimatedCost: 2, maxProbeCalls: 8, maxCpuMillis: 10_000, maxWallMillis: 60_000 } } : {}),
  maxDecisions: 4, maxCandidates: 2, admissionRepetitions: 2, maxFeedbackItems: 8, perPromptTimeoutMs: 10_000,
- budget: { maxProviderCalls: 80, maxInputTokens: 1_000_000, maxOutputTokens: 200_000, maxSdkEstimatedCost: 10, maxProbeCalls: 80, maxCpuMillis: 100_000, maxWallMillis: 500_000 },
+ budget: { maxProviderCalls: 80, maxInputTokens: 1_000_000, maxSdkEstimatedCost: 10, maxProbeCalls: 80, maxCpuMillis: 100_000, maxWallMillis: 500_000 },
  experienceRefs: [], experienceMaxRecords: 0, experienceMaxChars: 0 });
 
 test("research plans reject obsolete per-request token fields", () => {
  assert.throws(() => validateResearchPlan({ ...plan(), perPromptMaxOutputTokens: 2_048 }), /per-request token quotas have been removed/);
  assert.throws(() => validateResearchPlan({ ...plan(), perPromptMaxInputTokens: 20_000 }), /per-request token quotas have been removed/);
+});
+
+test("legacy method output quota is omitted from active research plan", () => {
+ const original = plan();
+ const validated = validateResearchPlan({ ...original, budget: { ...original.budget, maxOutputTokens: 1 } });
+ assert.equal("maxOutputTokens" in validated.budget, false);
+ assert.equal("maxOutputTokens" in new SharedBudget("legacy", validated.budget).status().limits, false);
+});
+
+test("research plans retain legacy cost references for display and accept no monetary input", () => {
+ const base = plan("admission.json");
+ const active = validateResearchPlan({ ...base, outerBudget: { maxSdkEstimatedCost: 0.001 }, pilotBudget: { maxSdkEstimatedCost: 0 }, protectedBudget: { maxSdkEstimatedCost: 1_000_000 } });
+ assert.deepEqual(active.budget, { maxSdkEstimatedCost: 10 });
+ for (const field of ["outerBudget", "pilotBudget", "protectedBudget", "metaBranchBudget"]) assert.equal(field in active, false);
+ const meta = validateResearchPlan({ ...base, experimentKind: "meta-improvement", target: "improver", metaProtocol: "quality", outerBudget: undefined, pilotBudget: undefined, protectedBudget: undefined, metaBranchBudget: undefined });
+ assert.equal(meta.budget.maxSdkEstimatedCost, 10);
+ assert.equal("metaBranchBudget" in meta, false);
+ const { budget: _legacy, ...withoutBudget } = base;
+ assert.deepEqual(validateResearchPlan(withoutBudget).budget, {});
+ assert.deepEqual(validateResearchPlan({ ...base, budget: {} }).budget, {});
+ assert.throws(() => validateResearchPlan({ ...base, budget: { maxSdkEstimatedCost: Number.POSITIVE_INFINITY } }), /finite/);
 });
 
 function fakeReply(ctx: FakeReplyContext) {
@@ -76,7 +97,7 @@ async function fixture(t: TestContext) {
 test("research-only campaign consumes real CPU feedback, saves an agent H candidate, and leaves active generation unchanged", async (t) => {
  const f = await fixture(t); const before = (await f.service.status()).active!.pointer.bundleId;
  const result = await f.service.run(plan());
- assert.equal(result.status, "research-only", result.stopReason);
+ assert.equal(result.status, "research-only", result.stopReason ?? "");
  assert.ok(result.selectedCandidateId);
  assert.equal((await f.service.status()).active!.pointer.bundleId, before);
  assert.ok(result.feedback.some((x) => x.status === "observed" && x.evidence.length === 1));
@@ -93,9 +114,9 @@ test("documented H plan reaches a complete fake model request with its frozen se
  assert.ok(sample, "RSI documentation includes a JSON plan");
  const documented = validateResearchPlan(JSON.parse(sample[1]));
  const run = await f.service.run({ ...documented, developmentCaseSetPath: "development.json", admissionCaseSetPath: "admission.json" });
- assert.ok(f.runner.created.length > 0, run.stopReason);
- assert.ok(run.selectedCandidateId, run.stopReason);
- assert.notEqual(run.status, "failed", run.stopReason);
+ assert.ok(f.runner.created.length > 0, run.stopReason ?? "");
+ assert.ok(run.selectedCandidateId, run.stopReason ?? "");
+ assert.notEqual(run.status, "failed", run.stopReason ?? "");
  assert.notEqual(run.stopReason?.includes("prepared request needs"), true);
 });
 
@@ -161,7 +182,7 @@ test("meta arms see separate development histories and select successors before 
  const meta: ResearchCampaignPlanV1 = { ...base, experimentKind: "meta-improvement", target: "improver", maxDecisions: 3, maxCandidates: 1, maxCandidatesPerMetaArm: 1,
   metaProtocol: "quality", searchReplicates: 1,
   experienceRefs: [sharedRef], experienceMaxRecords: 1, experienceMaxChars: 2_000,
-  metaBranchBudget: { maxProviderCalls: 7, maxInputTokens: 180_000, maxOutputTokens: 14_336, maxSdkEstimatedCost: 1, maxProbeCalls: 7, maxCpuMillis: 20_000, maxWallMillis: 60_000 } };
+  metaBranchBudget: { maxProviderCalls: 7, maxInputTokens: 180_000, maxSdkEstimatedCost: 1, maxProbeCalls: 7, maxCpuMillis: 20_000, maxWallMillis: 60_000 } };
  const result = await service.run(meta);
  assert.equal(result.status, "promoted", `${result.stopReason}: ${JSON.stringify(result.decisions)}`);
  assert.ok(newArmPrompts.length > 0);
@@ -183,13 +204,13 @@ test("meta arms see separate development histories and select successors before 
  const script = `import { ResearchImprovementService } from ${JSON.stringify(pathToFileURL(path.resolve("src/improvement/research-service.ts")).href)};
 import { FakeSessionRunner } from ${JSON.stringify(pathToFileURL(path.resolve("src/runner/fake.ts")).href)};
 const [root, planRaw] = process.argv.slice(1); const plan = JSON.parse(planRaw);
-const runner = new FakeSessionRunner((ctx) => { const view = JSON.parse(ctx.message.slice(ctx.message.indexOf("\\n") + 1)); return { text: JSON.stringify({ kind: "propose", target: "executor", body: "Probe a fresh disambiguating point before selecting.", hypothesis: { claim: "new I can produce a new H", predictedObservation: "candidate is recorded", falsifier: "candidate cannot be constructed", applicability: ["cpu-response-identification"], motivatingEvidenceIds: [view.feedback[0].id] } }), usage: ${JSON.stringify(usage)} }; });
+const runner = new FakeSessionRunner((ctx) => { const view = JSON.parse(ctx.message.slice(ctx.message.indexOf("\\n") + 1)); return { text: JSON.stringify(view.candidates.length ? { kind: "stop", reason: "development evidence is insufficient" } : { kind: "propose", target: "executor", body: "Probe a fresh disambiguating point before selecting.", hypothesis: { claim: "new I can produce a new H", predictedObservation: "candidate is recorded", falsifier: "candidate cannot be constructed", applicability: ["cpu-response-identification"], motivatingEvidenceIds: [view.feedback[0].id] } }), usage: ${JSON.stringify(usage)} }; });
 const service = new ResearchImprovementService({ workspaceRoot: root, runner }); const active = (await service.status()).active; const run = await service.run(plan);
 process.stdout.write(JSON.stringify({ activeI: active.bundle.improverVersionId, decisionI: run.decisions[0]?.improverVersionId, candidateProducer: run.candidates[0]?.producedByImproverVersionId, origin: run.candidates[0]?.origin, status: run.status, bound: runner.created[0]?.methodBinding?.versionId, loaded: runner.created[0]?.systemPrompt.includes("Prefer general discriminating probes") }));`;
  const child = await execFileAsync(process.execPath, ["--input-type=module", "-e", script, root, JSON.stringify(childPlan)], { cwd: path.resolve("."), maxBuffer: 100_000 });
  const reentered = JSON.parse(child.stdout);
  assert.equal(reentered.activeI, promotedI); assert.equal(reentered.decisionI, promotedI); assert.equal(reentered.candidateProducer, promotedI);
- assert.equal(reentered.bound, promotedI); assert.equal(reentered.loaded, true); assert.equal(reentered.origin, "agent-generated"); assert.equal(reentered.status, "inconclusive", "decision exhaustion cannot be counted as a settled no-winner");
+ assert.equal(reentered.bound, promotedI); assert.equal(reentered.loaded, true); assert.equal(reentered.origin, "agent-generated"); assert.equal(reentered.status, "research-only");
 });
 
 test("meta refuses identical selected H bodies before any protected query", async () => {
@@ -229,10 +250,10 @@ test("one-decision I handoff reads only a matching persisted development world a
  const service = new ResearchImprovementService({ workspaceRoot: f.root, runner });
  const base = plan();
  const one: ResearchCampaignPlanV1 = { ...base, experimentKind: "meta-improvement", target: "improver", priorDevelopmentFeedbackPath: "l5-pilot-synthetic/visible-feedback.json", maxDecisions: 1, maxCandidates: 1,
-  pilotBudget: { maxProviderCalls: 1, maxInputTokens: 20_000, maxOutputTokens: 2_048, maxSdkEstimatedCost: 0.1, maxProbeCalls: 0, maxCpuMillis: 1_000, maxWallMillis: 10_000 },
+  pilotBudget: { maxProviderCalls: 1, maxInputTokens: 20_000, maxSdkEstimatedCost: 0.1, maxProbeCalls: 0, maxCpuMillis: 1_000, maxWallMillis: 10_000 },
   budget: { ...base.budget, maxProviderCalls: 1 } };
  const run = await service.run(one);
- assert.equal(run.status, "research-only", run.stopReason); assert.equal(calls, 1);
+ assert.equal(run.status, "research-only", run.stopReason ?? ""); assert.equal(calls, 1);
  assert.equal(run.priorDevelopmentSource?.feedbackIds[0], "prior-observed");
  assert.equal(Object.hasOwn(publicResearchRun(run), "admissionPath"), false);
  assert.equal(publicResearchStatus(await service.status()).active?.provenance, "human-seed");
@@ -260,7 +281,7 @@ test("I can probe and inspect a second registered case without losing its contro
  });
  const service = new ResearchImprovementService({ workspaceRoot: f.root, runner });
  const run = await service.run({ ...plan(), maxDecisions: 3 });
- assert.equal(run.status, "research-only", run.stopReason);
+ assert.equal(run.status, "research-only", run.stopReason ?? "");
  assert.equal(run.inspections?.length, 1); assert.equal(run.decisions[1].inspectionId, run.inspections?.[0].requestId);
  assert.equal(run.inspections?.[0].methodBindingVersionId, run.frozenBundle.improverVersionId);
 });
@@ -287,16 +308,57 @@ test("same-workspace development MetaEpisode is inspectable and citable without 
   assert.equal(view.metaEpisodes[0].id, `meta:${first.runId}`);
   if (ctx.spec.label.endsWith("-0")) return { text: JSON.stringify({ kind: "inspect", read: { object: "meta-episode", id: `meta:${first.runId}`, start: 0, maxChars: 4_000 } }), usage };
   assert.equal(view.inspections[0].object, "meta-episode"); assert.doesNotMatch(view.inspections[0].text, /truthHypothesisId|protectedQuality|admissionCaseSetPath/);
-  return { text: JSON.stringify({ kind: "propose", target: "executor", body: "Use the observed episode to choose a bounded diagnostic probe.",
+  return { text: JSON.stringify(view.candidates.length ? { kind: "stop", reason: "development evidence is insufficient" } : { kind: "propose", target: "executor", body: "Use the observed episode to choose a bounded diagnostic probe.",
    hypothesis: { claim: "development episode suggests a probe", predictedObservation: "the probe separates responses", falsifier: "it does not separate them", applicability: ["cpu-response-identification"], motivatingEvidenceIds: [`meta:${first.runId}`] } }), usage };
  });
  const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner }).run({ ...plan(), maxDecisions: 2, metaEpisodeRunIds: [first.runId] });
- assert.equal(run.status, "inconclusive", "maxDecisions exhaustion is not a no-winner");
+ assert.equal(run.status, "research-only");
  assert.deepEqual(run.candidates[0].hypothesis.motivatingEvidenceIds, [`meta:${first.runId}`]);
  const episodeFile = path.join(new GenerationStore(f.root).root, "runs", first.runId, "meta-episode.development.json");
  const altered = JSON.parse(await readFile(episodeFile, "utf8")); altered.candidates[0].hypothesis.claim = "protected-evaluator-sentinel";
  await writeFile(episodeFile, JSON.stringify(altered));
  await assert.rejects(loadMetaEpisode(new GenerationStore(f.root).root, f.root, first.runId), /does not match/);
+});
+
+test("large development MetaEpisode retains every feedback row and observation in bounded parts", async (t) => {
+ const f = await fixture(t);
+ const first = await f.service.run(plan());
+ const root = new GenerationStore(f.root).root;
+ const runFile = path.join(root, "runs", first.runId, "run.json");
+ const source = JSON.parse(await readFile(runFile, "utf8")) as typeof first;
+ const original = source.feedback[0]!;
+ for (let i = 0; i < 100; i++) source.feedback.push({ ...original, id: `outer-initial-large-${i}`, observations: Array.from({ length: 35 }, (_, j) => ({ x: j, y: j + i, xUnit: "second", yUnit: "measurement", source: "initial" as const })) });
+ await writeFile(runFile, JSON.stringify(source));
+ const episode = buildMetaEpisode(source, f.root, "executor", "selected");
+ const file = metaEpisodePath(root, first.runId);
+ await writeMetaEpisode(file, episode);
+ const index = JSON.parse(await readFile(file, "utf8")) as { kind: string; parts: Array<{ file: string }> };
+ assert.equal(index.kind, "meta-episode-parts");
+ assert.ok((await stat(file)).size <= 120_000);
+ for (const part of index.parts) assert.ok((await stat(path.join(path.dirname(file), part.file))).size <= 120_000);
+ const restored = await loadMetaEpisode(root, f.root, first.runId);
+ assert.equal(restored.feedbackExcerptCount, restored.feedbackTotal);
+ assert.equal(restored.feedbackExcerpt.find((item) => item.id === "outer-initial-large-99")?.observations.length, 35);
+ const part = path.join(path.dirname(file), index.parts[0]!.file);
+ const originalPart = await readFile(part, "utf8");
+ await writeFile(part, `${originalPart}x`);
+ await assert.rejects(loadMetaEpisode(root, f.root, first.runId), /part/);
+ await writeFile(part, originalPart);
+ await rm(part);
+ await assert.rejects(loadMetaEpisode(root, f.root, first.runId), /ENOENT|part/);
+});
+
+test("generation validation keeps pinned identities and ancestry without count gates", () => {
+ const storeId = "00000000-0000-4000-8000-000000000001";
+ const refs = Array.from({ length: 101 }, (_, i) => ({ storeId, recordId: `K${String(i + 1).padStart(3, "0")}`, version: 1 }));
+ const requirements = refs.map((ref) => ({ targetKind: "improver" as const, ref }));
+ assert.equal(validateExperienceRequirements(requirements, "requiredExperienceRefs").length, 101);
+ assert.equal(validateStrategyRecord({ version: 1, versionId: "I-many", kind: "improver", artifact: { version: 1, kind: "diagnostic-improver-prompt", body: "Use registered evidence." }, origin: "agent-generated", createdAt: "2026-10-06T00:00:00Z", applicability: [], limitations: [], sourceExperienceRefs: requirements, requiredExperienceRefs: requirements, requiredKnowledgeRefs: refs, state: "research-only" }).requiredKnowledgeRefs.length, 101);
+ const bundle = { version: 1, bundleId: "B-next", parents: ["B-one", "B-two", "B-three", "B-four", "B-five"], executorVersionId: "H-one", improverVersionId: "I-one", createdAt: "2026-10-06T00:00:00Z", environmentVersion: "cpu/v1", modelConfig: { research: "fake/research", improver: "fake/improver" }, protocolVersion: "v1", allowedCapabilities: ["no-tools-model"], state: "research-only" };
+ assert.equal(validateGenerationBundle(bundle).parents.length, 5);
+ assert.throws(() => validateGenerationBundle({ ...bundle, parents: ["B-one", "B-one"] }), /distinct/);
+ assert.throws(() => validateGenerationBundle({ ...bundle, parents: ["B-next"] }), /acyclic/);
+ assert.throws(() => validateExperienceRequirements([...requirements, requirements[0]], "requiredExperienceRefs"), /duplicate/);
 });
 
 test("schema repair is explicit, bounded, and debited as another provider request", async (t) => {
@@ -324,7 +386,7 @@ test("development accepts justified unknown as partial scientific validity", asy
   return { text: JSON.stringify({ kind: "stop", reason: "candidate handled bounded uncertainty", selectedCandidateId: view.candidates[0].id }), usage };
  });
  const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner }).run({ ...plan(), maxDecisions: 3 });
- assert.equal(run.status, "research-only", run.stopReason);
+ assert.equal(run.status, "research-only", run.stopReason ?? "");
  assert.ok(run.selectedCandidateId);
  assert.equal(run.candidates[0].developmentStatus, "supported");
  assert.equal(run.developmentEpisodes?.[0].scientificStatus, "justified-unknown");

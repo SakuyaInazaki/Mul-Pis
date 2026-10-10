@@ -1,5 +1,6 @@
-import { appendFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath } from "node:fs/promises";
+import { appendFile, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import {
 	createAgentSession,
@@ -16,14 +17,341 @@ import {
 	type CreateAgentSessionOptions,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "@earendil-works/pi-ai";
+import { Type, createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
 import { parseModelSpec } from "../config.ts";
 import { HarnessError } from "../types.ts";
 import { writeFileAtomic } from "../workspace.ts";
 import { TelemetryWriter } from "../dashboard/telemetry.ts";
-import type { AssistantTurn, CustomToolSpec, ReadReturnEvent, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, TranscriptMessage, UsageEvent } from "./types.ts";
+import type { AssistantTurn, CustomToolSpec, ForkRequest, ForkWorkspaceBindingV1, ReadReturnEvent, RunnerCapabilities, SessionCheckpoint, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, TranscriptMessage, TransportFailureDiagnostic, UsageEvent } from "./types.ts";
 import { summarizeUsage, usageEventsFromEntries } from "./usage.ts";
 import { sampleRunnerResources, sessionClosed, sessionOpened } from "./resource.ts";
+import { DeepSeekCampaignBudget, type PromptLease } from "./deepseek-campaign.ts";
+import { getConfinedCampaignFileGrantDescriptor } from "./confined-campaign-files.ts";
+import { assertDeepSeekRequestContract, DeepSeekRequestContractError,
+	type DeepSeekRequestViolation } from "./deepseek-request-contract.ts";
+import type { HostEffectScope } from "./operation-disposition.ts";
+import { certifyRequestNotSent } from "./operation-disposition.ts";
+import { finishManagedBashCall, managedLocalBashOperations, prepareManagedBashCall,
+	type ManagedBashCall } from "./managed-bash.ts";
+
+type OutputTokenField = "max_tokens" | "max_completion_tokens" | "both" | "omitted";
+
+/** Match Pi's own no-auth preflight, not a provider response or a guessed
+ * environment variable. The original guidance may contain local doc paths,
+ * so only a fixed, sanitized cause leaves the runner. */
+function isPiNoApiKeyPreflight(error: unknown, provider: string): boolean {
+	if (!(error instanceof Error) || error.name !== "Error") return false;
+	const display = provider === "unknown" ? "the selected model" : provider;
+	const lines = error.message.split("\n");
+	return lines.length === 5 && lines[0] === `No API key found for ${display}.` &&
+		lines[1] === "" &&
+		lines[2] === "Use /login to log into a provider via OAuth or API key. See:" &&
+		path.basename(lines[3] ?? "") === "providers.md" &&
+		path.basename(lines[4] ?? "") === "models.md" &&
+		path.dirname(lines[3] ?? "") === path.dirname(lines[4] ?? "");
+}
+
+/** Pi's credential storage failed before auth could be checked. This proves
+ * local store unavailability, not that a provider key is absent. */
+function isPiCredentialStoreUnavailable(error: unknown, provider: string): boolean {
+	// Pi can load its own nested copy of pi-ai, so constructor identity is not
+	// stable. Restrict the structural check to Pi's exact store-read wrapper and
+	// an immediate filesystem cause. Never retain the wrapper's path-rich text.
+	if (!(error instanceof Error) || error.name !== "ModelsError") return false;
+	const wrapper = error as Error & { code?: unknown };
+	if (wrapper.code !== "auth" ||
+		!wrapper.message.startsWith(`Credential store read failed for ${provider}: `)) return false;
+	const cause = wrapper.cause as NodeJS.ErrnoException | undefined;
+	return cause instanceof Error && ["ENOENT", "EACCES", "EPERM"].includes(cause.code ?? "") &&
+		["mkdir", "open", "read", "stat", "access"].includes(cause.syscall ?? "");
+}
+
+/** Inspect Pi's final request without changing its provider/context negotiation. */
+function inspectDeepSeekOutputRequest(payload: unknown, expected: { provider: string; id: string;
+	api: string; baseUrl: string; maxTokens: number }, actual: typeof expected):
+	{ payload: Record<string, unknown>; outputTokens: number; outputField: OutputTokenField } {
+	if (!payload || typeof payload !== "object" || Array.isArray(payload) ||
+		actual.provider !== expected.provider || actual.id !== expected.id ||
+		actual.api !== expected.api || actual.baseUrl !== expected.baseUrl)
+		throw new HarnessError("runner.model", "DeepSeek provider request changed model");
+	const record = payload as Record<string, unknown>;
+	if (record.model !== expected.id || !Number.isSafeInteger(expected.maxTokens) || expected.maxTokens < 1)
+		throw new HarnessError("runner.model", "DeepSeek provider request changed model or resolved output maximum");
+	const hasMax = record.max_tokens !== undefined;
+	const hasCompletionMax = record.max_completion_tokens !== undefined;
+	if ((hasMax && (!Number.isSafeInteger(record.max_tokens) || Number(record.max_tokens) < 1 ||
+		Number(record.max_tokens) > expected.maxTokens)) ||
+		(hasCompletionMax && (!Number.isSafeInteger(record.max_completion_tokens) ||
+			Number(record.max_completion_tokens) < 1 || Number(record.max_completion_tokens) > expected.maxTokens)) ||
+		(hasMax && hasCompletionMax && record.max_tokens !== record.max_completion_tokens))
+		throw new HarnessError("runner.model", "DeepSeek provider request output bound is invalid or exceeds provider maximum");
+	return { payload: record, outputTokens: (record.max_tokens ?? record.max_completion_tokens ?? expected.maxTokens) as number,
+		outputField: hasMax && hasCompletionMax ? "both" : hasMax ? "max_tokens" :
+			hasCompletionMax ? "max_completion_tokens" : "omitted" };
+}
+
+/** Capture only host-observable transport facts. Never retain an Error or response body. */
+class TransportProbe {
+	private phase: TransportFailureDiagnostic["phase"] = "unknown";
+	private httpStatus: number | null = null;
+	private responseStarted: boolean | null = null;
+	private bytesRead: number | null = null;
+	private transportInterrupted = false;
+	private errorCodes: string[] = [];
+	private providerErrorCode: string | null = null;
+	private providerErrorType: string | null = null;
+	private providerErrorReasonClass: NonNullable<TransportFailureDiagnostic["providerErrorReasonClass"]> = "unknown";
+	private providerContextOverflow?: TransportFailureDiagnostic["providerContextOverflow"];
+	private providerRequestId: string | null = null;
+	private privateProviderError?: TransportFailureDiagnostic["privateProviderError"];
+	private requestContractViolation?: DeepSeekRequestViolation;
+	private requestContractMessageIndex?: number | null;
+	private wholePromptNotIssued = false;
+	private readonly privateSanitize?: (value: string) => string | null;
+	private dropPendingBody?: () => void;
+
+	readonly fetch: typeof globalThis.fetch;
+
+	constructor(fetchImplementation: typeof globalThis.fetch = globalThis.fetch,
+		privateSanitize?: (value: string) => string | null) {
+		this.privateSanitize = privateSanitize;
+		this.fetch = async (input, init) => {
+			// An SDK may retry within one stream. Classify only the latest physical
+			// request, so an earlier failed fetch cannot taint a later 200 response.
+			this.dropPendingBody?.(); this.dropPendingBody = undefined;
+			this.phase = "request";
+			this.httpStatus = null;
+			this.responseStarted = false;
+			this.bytesRead = null;
+			this.transportInterrupted = false;
+			this.errorCodes = [];
+			this.providerErrorCode = null;
+			this.providerErrorType = null;
+			this.providerErrorReasonClass = "unknown";
+			this.providerContextOverflow = undefined;
+			this.providerRequestId = null;
+			this.privateProviderError = undefined;
+			this.requestContractViolation = undefined;
+			this.requestContractMessageIndex = undefined;
+			this.wholePromptNotIssued = false;
+			try {
+				let response: Response;
+				try { response = await fetchImplementation(input, init); }
+				catch (error) {
+					this.captureErrorCodes(error);
+					// Node fetch also rejects for local malformed URLs and request construction.
+					// A code-free TypeError is not proof of a transport interruption.
+					this.transportInterrupted = this.errorCodes.some(code => RETRYABLE_NETWORK_ERROR_CODES.has(code));
+					throw error;
+				}
+				this.responseStarted = true;
+				this.httpStatus = response.status;
+				this.bytesRead = 0;
+				this.phase = "response-body";
+				const requestId = response.headers.get("x-request-id");
+				if (requestId && SAFE_REQUEST_ID.test(requestId)) this.providerRequestId = requestId;
+				if (!response.body) return response;
+				// The SDK still receives every original byte. This bounded, pass-through
+				// observation is discarded at EOF/cancel/failure and never enters a receipt.
+				const captureJson = !response.ok && JSON_CONTENT_TYPE.test(response.headers.get("content-type") ?? "");
+				let parts: Uint8Array[] = [];
+				let capturedBytes = 0;
+				let oversized = false;
+				const clear = (): void => { parts = []; capturedBytes = 0; };
+				this.dropPendingBody = clear;
+				const reader = response.body.getReader();
+				const counted = new ReadableStream<Uint8Array>({
+					pull: async (controller) => {
+						try {
+							const { done, value } = await reader.read();
+							if (done) {
+								if (captureJson && !oversized) this.observeErrorJson(Buffer.concat(parts));
+								clear(); this.dropPendingBody = undefined; controller.close();
+							} else {
+								this.bytesRead = (this.bytesRead ?? 0) + value.byteLength;
+								if (captureJson && !oversized) {
+									if (capturedBytes + value.byteLength <= MAX_ERROR_METADATA_JSON_BYTES) {
+										parts.push(Uint8Array.from(value)); capturedBytes += value.byteLength;
+									} else { oversized = true; clear(); }
+								}
+								controller.enqueue(value);
+							}
+						} catch (error) { clear(); this.dropPendingBody = undefined; this.transportInterrupted = true;
+							this.captureErrorCodes(error); controller.error(error); }
+					},
+					cancel: (reason) => { clear(); this.dropPendingBody = undefined; return reader.cancel(reason); },
+				});
+				const wrapped = new Response(counted, { status: response.status, statusText: response.statusText, headers: response.headers });
+				// Fetch responses carry read-only metadata outside ResponseInit. Preserve it for SDK compatibility.
+				for (const key of ["url", "redirected", "type"] as const) Object.defineProperty(wrapped, key, { value: response[key] });
+				return wrapped;
+			} catch (error) {
+				this.captureErrorCodes(error);
+				throw error;
+			}
+		};
+	}
+
+	private observeErrorJson(body: Uint8Array): void {
+		try {
+			const parsed: unknown = JSON.parse(Buffer.from(body).toString("utf8"));
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+			const error = (parsed as { error?: unknown }).error;
+			if (!error || typeof error !== "object" || Array.isArray(error)) return;
+			const { code, type, message, param } = error as {
+				code?: unknown; type?: unknown; message?: unknown; param?: unknown };
+			if (typeof code === "string" && SAFE_PROVIDER_ERROR_CODES.has(code)) this.providerErrorCode = code;
+			if (typeof type === "string" && SAFE_PROVIDER_ERROR_TYPES.has(type)) this.providerErrorType = type;
+			this.providerContextOverflow = this.providerErrorType === "invalid_request_error" ?
+				parseProviderContextOverflow(message) : undefined;
+			this.providerErrorReasonClass = classifyProviderErrorReason(this.httpStatus,
+				this.providerErrorCode, type, message, Boolean(this.providerContextOverflow));
+			if (this.privateSanitize) {
+				const scrub = (value: unknown): string | null => {
+					if (typeof value !== "string") return null;
+					try {
+						const clean = this.privateSanitize!(value);
+						return typeof clean === "string" && !clean.includes("\0") &&
+							Buffer.byteLength(clean, "utf8") <= MAX_PRIVATE_ERROR_FIELD_BYTES ? clean : null;
+					} catch { return null; }
+				};
+				const numericLimits: Record<string, number> = {};
+				for (const key of PRIVATE_ERROR_NUMBER_KEYS) {
+					const value = (error as Record<string, unknown>)[key];
+					if (Number.isSafeInteger(value) && Number(value) >= 0) numericLimits[key] = Number(value);
+				}
+				this.privateProviderError = { code: scrub(code), type: scrub(type),
+					message: scrub(message), param: scrub(param), numericLimits };
+			}
+		} catch { /* Malformed JSON is unavailable metadata, never a provider classification. */ }
+	}
+
+	observeResponse(status: number): void {
+		if (Number.isInteger(status) && status >= 100 && status <= 599) this.httpStatus = status;
+		this.responseStarted = true;
+		if (this.phase === "unknown" || this.phase === "request") this.phase = "provider-stream";
+	}
+
+	contextOverflow(): TransportFailureDiagnostic["providerContextOverflow"] {
+		return this.providerContextOverflow ? { ...this.providerContextOverflow } : undefined;
+	}
+
+	hasTransportObservation(): boolean { return this.phase !== "unknown"; }
+
+	captureErrorCodes(error: unknown): void {
+		const seen = new Set<unknown>();
+		let current: unknown = error;
+		while (current && typeof current === "object" && !seen.has(current)) {
+			seen.add(current);
+			const fields = current as { code?: unknown; cause?: unknown };
+			if (typeof fields.code === "string" && SAFE_ERROR_CODES.has(fields.code) && !this.errorCodes.includes(fields.code)) this.errorCodes.push(fields.code);
+			current = fields.cause;
+		}
+	}
+	captureRequestContractError(error: unknown, wholePromptNotIssued: boolean): void {
+		if (!(error instanceof DeepSeekRequestContractError)) return;
+		this.requestContractViolation = error.violation;
+		this.requestContractMessageIndex = error.messageIndex;
+		this.wholePromptNotIssued = wholePromptNotIssued;
+	}
+
+	failure(promptIndex: number, abortSource: TransportFailureDiagnostic["abortSource"], requestId?: string): TransportFailureDiagnostic {
+		this.dropPendingBody?.();
+		this.dropPendingBody = undefined;
+		return { version: 1, promptIndex, ...(requestId ? { requestId } : {}), phase: this.phase,
+			httpStatus: this.httpStatus, responseStarted: this.responseStarted, bytesRead: this.bytesRead,
+			...(this.transportInterrupted ? { transportInterrupted: true as const } : {}),
+			abortSource, providerErrorCode: this.providerErrorCode, providerErrorType: this.providerErrorType,
+			providerErrorReasonClass: this.providerErrorReasonClass,
+			...(this.providerContextOverflow ? { providerContextOverflow: { ...this.providerContextOverflow } } : {}),
+			providerRequestId: this.providerRequestId, errorCodes: [...this.errorCodes],
+			...(this.privateProviderError ? { privateProviderError: this.privateProviderError } : {}),
+			...(this.requestContractViolation ? { requestContractViolation: this.requestContractViolation,
+				requestContractMessageIndex: this.requestContractMessageIndex ?? null,
+				attemptedRequestNotSent: true as const,
+				...(this.wholePromptNotIssued ? { wholePromptNotIssued: true as const } : {}) } : {}) };
+	}
+}
+
+const MAX_ERROR_METADATA_JSON_BYTES = 8_192;
+const MAX_PRIVATE_ERROR_FIELD_BYTES = 4_000;
+const PRIVATE_ERROR_NUMBER_KEYS = ["max_context_tokens", "context_window", "prompt_tokens",
+	"completion_tokens", "max_tokens", "requested_tokens", "allowed_tokens"] as const;
+const JSON_CONTENT_TYPE = /^application\/(?:json|[a-z0-9.+-]+\+json)(?:\s*;|$)/i;
+const SAFE_REQUEST_ID = /^(?:[0-9a-f]{16,64}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+const SAFE_PROVIDER_ERROR_TYPES = new Set([
+	"invalid_request_error", "authentication_error", "permission_error", "not_found_error", "rate_limit_error", "server_error",
+]);
+const SAFE_PROVIDER_ERROR_CODES = new Set([
+	"invalid_request_error", "invalid_format", "invalid_parameter", "invalid_api_key", "model_not_found",
+	"context_length_exceeded", "rate_limit_exceeded", "insufficient_quota", "content_filter",
+]);
+
+/** Drain only a bounded copy of a rejected response so TransportProbe can
+ * classify it before the SDK receives a response. The original stays intact. */
+async function observeBoundedRejectedResponse(response: Response): Promise<boolean> {
+	if (!response.body) return false;
+	let reader: ReadableStreamDefaultReader<Uint8Array>;
+	try { reader = response.clone().body!.getReader(); }
+	catch { return false; }
+	let bytes = 0;
+	try {
+		for (;;) {
+			const part = await reader.read();
+			if (part.done) return true;
+			bytes += part.value.byteLength;
+			if (bytes > MAX_ERROR_METADATA_JSON_BYTES) {
+				void reader.cancel().catch(() => undefined);
+				return false;
+			}
+		}
+	} catch { return false; }
+}
+
+/** Provider error text is untrusted and may echo a prompt. Use only a documented,
+ * complete error sentence, never a substring match, and discard the text. */
+function classifyProviderErrorReason(status: number | null, code: string | null, type: unknown, message: unknown,
+	contextOverflow: boolean):
+	NonNullable<TransportFailureDiagnostic["providerErrorReasonClass"]> {
+	if (contextOverflow) return "context-window";
+	if (code === "context_length_exceeded") return "context-window";
+	if (code === "invalid_format" || code === "invalid_parameter") return "input-schema";
+	if (status === 402 && code === "invalid_request_error" && type === "unknown_error" &&
+		typeof message === "string" &&
+		/^Insufficient Balance(?: \(request_id: [0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\))?$/.test(message))
+		return "insufficient-balance";
+	if (type === "invalid_request_error" &&
+		message === "The reasoning_content in the thinking mode must be passed back to the API.")
+		return "tool-reasoning";
+	return "unknown";
+}
+
+/** Parse only the provider's complete numeric context rejection. The optional
+ * request UUID is checked as syntax and discarded. No untrusted text escapes. */
+function parseProviderContextOverflow(message: unknown): TransportFailureDiagnostic["providerContextOverflow"] {
+	if (typeof message !== "string" || message.length > 512) return undefined;
+	const match = /^This model's maximum context length is ([1-9]\d{0,15}) tokens\. However, you requested ([1-9]\d{0,15}) tokens \(([1-9]\d{0,15}) in the messages, ([1-9]\d{0,15}) in the completion\)\. Please reduce the length of the messages or completion\.(?: \(request_id: [0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\))?$/.exec(message);
+	if (!match) return undefined;
+	const [contextWindow, requestedTokens, messagesTokens, completionTokens] = match.slice(1, 5).map(Number);
+	if (![contextWindow, requestedTokens, messagesTokens, completionTokens].every(Number.isSafeInteger) ||
+		!Number.isSafeInteger(messagesTokens + completionTokens) ||
+		messagesTokens >= contextWindow || completionTokens > contextWindow ||
+		requestedTokens !== messagesTokens + completionTokens || requestedTokens <= contextWindow)
+		return undefined;
+	const allowedCompletionTokens = contextWindow - messagesTokens;
+	if (allowedCompletionTokens < 1 || completionTokens <= allowedCompletionTokens) return undefined;
+	return { contextWindow, messagesTokens, completionTokens, requestedTokens, allowedCompletionTokens };
+}
+
+const SAFE_ERROR_CODES = new Set([
+	"ECONNRESET", "ECONNREFUSED", "ECONNABORTED", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EPIPE",
+	"UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "UND_ERR_RESPONSE", "UND_ERR_ABORTED",
+]);
+const RETRYABLE_NETWORK_ERROR_CODES = new Set([
+	"ECONNRESET", "ECONNREFUSED", "ECONNABORTED", "EAI_AGAIN", "ETIMEDOUT", "EHOSTUNREACH",
+	"ENETUNREACH", "EPIPE", "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT",
+	"UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "UND_ERR_RESPONSE",
+]);
 
 const SCRATCH_PREFIX = ".pi-session-";
 const EMPTY_AGENT_DIR = ".empty-agent-dir";
@@ -42,6 +370,13 @@ export interface PiSessionRunnerOptions {
 	modelRuntime?: ModelRuntime;
 	createSession?: typeof createAgentSession;
 	signal?: AbortSignal;
+	/** Shared by every builder, reviewer, and resumed handle in one in-process campaign. */
+	campaignBudget?: DeepSeekCampaignBudget;
+	/** Persist the host's private accounting prefix at each physical transport boundary. */
+	onCampaignAccountingBoundary?: (event: "request-reserved" | "request-observed",
+		audit: ReturnType<DeepSeekCampaignBudget["requestAccountingAuditSnapshot"]>) => Promise<void>;
+	/** Only the encrypted private result receives these credential-redacted provider fields. */
+	sanitizePrivateProviderError?: (value: string) => string | null;
 }
 
 interface MaterialTools {
@@ -49,6 +384,16 @@ interface MaterialTools {
 	names: string[];
 	readCoverage: Set<string>;
 	readReturns: ReadReturnEvent[];
+}
+
+interface CheckpointState {
+	ref: SessionRef;
+	spec: SessionSpec;
+	manager: SessionManager;
+	active: boolean;
+	freezing: boolean;
+	completed: boolean;
+	disposed: boolean;
 }
 
 function isInside(root: string, candidate: string): boolean {
@@ -85,6 +430,15 @@ function imageMimeType(resolved: string): string | undefined {
 	)[extension];
 }
 
+class ReadOffsetBeyondEOFError extends Error {
+	readonly kind = "offset-beyond-eof";
+	readonly lineCount: number;
+	constructor(lineCount: number, offset: number) {
+		super(`Offset ${offset} is beyond end of file (${lineCount} lines total)`);
+		this.lineCount = lineCount;
+	}
+}
+
 async function createMaterialTools(root: string, requestedReadName?: string): Promise<MaterialTools> {
 	const rootReal = await realpath(root);
 	const rootStat = await lstat(rootReal);
@@ -96,7 +450,7 @@ async function createMaterialTools(root: string, requestedReadName?: string): Pr
 	}
 	const readCoverage = new Set<string>();
 	const readReturns: ReadReturnEvent[] = [];
-	const readCapture = new AsyncLocalStorage<{ path?: string }>();
+	const readCapture = new AsyncLocalStorage<{ path?: string; offset?: number; limit?: number }>();
 	const baseRead = createReadToolDefinition(rootReal, {
 		operations: {
 			access: async (requested) => {
@@ -111,6 +465,14 @@ async function createMaterialTools(root: string, requestedReadName?: string): Pr
 				const contents = await readFile(resolved);
 				const captured = readCapture.getStore();
 				if (captured) captured.path = path.relative(rootReal, resolved);
+				if (captured && imageMimeType(resolved) === undefined &&
+					Number.isSafeInteger(captured.offset) && captured.offset! > 0 &&
+					(captured.limit === undefined || Number.isSafeInteger(captured.limit) && captured.limit > 0)) {
+					const text = contents.toString("utf8");
+					const sdkLineCount = text.split("\n").length;
+					if (captured.offset! > sdkLineCount)
+						throw new ReadOffsetBeyondEOFError(sdkLineCount - (text.endsWith("\n") ? 1 : 0), captured.offset!);
+				}
 				return contents;
 			},
 			detectImageMimeType: async (requested) => {
@@ -126,8 +488,9 @@ async function createMaterialTools(root: string, requestedReadName?: string): Pr
 		// Pi normally prefers ctx.cwd over the tool factory cwd. Rebase the
 		// context so relative material paths do not resolve in the empty scratch cwd.
 		execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-			const captured: { path?: string } = {};
 			const requested = params as { path: string; offset?: number; limit?: number };
+			const captured: { path?: string; offset?: number; limit?: number } = {
+				offset: requested.offset, limit: requested.limit };
 			const requestFields = { ...(requested.offset !== undefined ? { offset: requested.offset } : {}), ...(requested.limit !== undefined ? { limit: requested.limit } : {}) };
 			try {
 				const result = await readCapture.run(captured, () => baseRead.execute(
@@ -155,7 +518,11 @@ async function createMaterialTools(root: string, requestedReadName?: string): Pr
 				if (captured.path) readCoverage.add(captured.path);
 				return result;
 			} catch (error) {
-				readReturns.push({ toolName: readName, status: "error", path: captured.path ?? "<unresolved>", requested: requestFields, returned: { kind: "unknown" }, at: new Date().toISOString() });
+				readReturns.push({ toolName: readName, status: "error", path: captured.path ?? "<unresolved>",
+					requested: requestFields, returned: { kind: "unknown" },
+					...(error instanceof ReadOffsetBeyondEOFError && captured.path
+						? { error: { kind: error.kind, lineCount: error.lineCount } } : {}),
+					at: new Date().toISOString() });
 				throw error;
 			}
 		},
@@ -186,7 +553,31 @@ async function createMaterialTools(root: string, requestedReadName?: string): Pr
 	return { tools: [materialRead, materialList], names: [readName, LIST_TOOL_NAME], readCoverage, readReturns };
 }
 
+function redactToolLogText(value: string, maxChars: number): string {
+	return value.replace(/Bearer\s+[^\s'"\r\n]+/gi, "Bearer [REDACTED]")
+		.replace(/sk-[A-Za-z0-9_-]{6,}/gi, "[REDACTED]")
+		.replace(/(?:api[_-]?key|password)\s*[:=]\s*[^\s'"\r\n]+/gi, "[REDACTED]")
+		.slice(0, maxChars);
+}
+
 function customToolsToPi(tools: CustomToolSpec[], log: ToolCallRecord[]): ToolDefinition<any, any>[] {
+	const confined = getConfinedCampaignFileGrantDescriptor(tools);
+	const safePath = (args: Record<string, unknown>): Record<string, unknown> =>
+		confined && typeof args.path === "string" && args.path.length <= 240 &&
+		!path.isAbsolute(args.path) && !args.path.split(/[\\/]/).some(segment => !segment || segment === "..")
+			? { path: redactToolLogText(args.path, 240) } : {};
+	const failure = (error: unknown): Pick<ToolCallRecord, "errorClass" | "errorCode" | "errorMessage"> => {
+		const nodeCode = (error as NodeJS.ErrnoException | null)?.code;
+		const fsCode = typeof nodeCode === "string" && ["ENOENT", "EACCES", "EPERM", "EISDIR", "ENOTDIR", "ELOOP"].includes(nodeCode)
+			? nodeCode : undefined;
+		const errorClass = error instanceof HarnessError ? "harness" as const : fsCode ? "filesystem" as const : "tool-error" as const;
+		const errorCode = error instanceof HarnessError && /^runner\.[a-z.-]{1,80}$/.test(error.code)
+			? error.code : fsCode;
+		const rawMessage = error instanceof HarnessError ? error.message :
+			fsCode ? `File read failed (${fsCode})` : "File read failed";
+		const errorMessage = redactToolLogText(rawMessage, 500);
+		return { errorClass, ...(errorCode ? { errorCode } : {}), ...(confined ? { errorMessage } : {}) };
+	};
 	return tools.map((tool) => {
 		const properties: Record<string, any> = {};
 		for (const [name, param] of Object.entries(tool.params)) {
@@ -211,14 +602,20 @@ function customToolsToPi(tools: CustomToolSpec[], log: ToolCallRecord[]): ToolDe
 				const at = new Date().toISOString();
 				try {
 					const result = await tool.execute(args, signal);
-					log.push({ name: tool.name, args, ok: true, at });
+					log.push({ name: tool.name, args: safePath(args), ok: true, at,
+						...(confined && tool.name === "read" && typeof args.path === "string" ?
+							{ resultMetadata: { kind: "confined-utf8-read" as const,
+								relativePath: redactToolLogText(args.path, 240),
+								utf8Bytes: Buffer.byteLength(result.text, "utf8"), truncated: false as const } } : {}) });
 					const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [{ type: "text", text: result.text }];
 					for (const image of result.images ?? []) {
 						content.push({ type: "image", data: (await readFile(image.path)).toString("base64"), mimeType: image.mimeType });
 					}
 					return { content, details: result.details ?? {} };
 				} catch (error) {
-					log.push({ name: tool.name, args, ok: false, at, error: (error as Error).message });
+					const detail = failure(error);
+					log.push({ name: tool.name, args: safePath(args), ok: false, at,
+						...detail, ...(confined && tool.name === "read" ? {} : { errorMessage: undefined }) });
 					throw error;
 				}
 			},
@@ -231,9 +628,13 @@ async function createExecutionTools(
 	root: string,
 	requested: Array<"read" | "write" | "edit" | "bash">,
 	log: ToolCallRecord[],
+	receiptDir: string,
+	sessionId: string,
+	isolatedToolEnvironment = false,
 ): Promise<MaterialTools & { cwd: string }> {
 	const cwd = await realpath(root);
 	if (!(await lstat(cwd)).isDirectory()) throw new HarnessError("runner.tools", `execution root is not a directory: ${root}`);
+	const bashCall = new AsyncLocalStorage<ManagedBashCall>();
 	const factories = {
 		read: createReadToolDefinition,
 		write: createWriteToolDefinition,
@@ -243,22 +644,56 @@ async function createExecutionTools(
 	const names = [...new Set(requested)];
 	const readCoverage = new Set<string>();
 	const tools = names.map((name) => {
-		const base = factories[name](cwd) as ToolDefinition<any, any>;
+		// The model-bearing parent's credential environment must not reach a
+		// bash child. This is environment hygiene, not an OS sandbox.
+		const base = (name === "bash" && isolatedToolEnvironment
+			? createBashToolDefinition(cwd, {
+				operations: managedLocalBashOperations(() => bashCall.getStore()),
+				exposeSessionEnvironment: false,
+				spawnHook: (context) => ({ ...context, env: {
+					PATH: process.env.PATH ?? "/usr/bin:/bin",
+					HOME: cwd,
+					LANG: "C.UTF-8",
+					TMPDIR: process.env.TMPDIR ?? "/tmp",
+				} }),
+			})
+			: factories[name](cwd)) as ToolDefinition<any, any>;
 		return {
 			...base,
 			async execute(toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: any, ctx: any) {
 				const args = params ?? {};
+				const receipt = name === "bash" && typeof args.command === "string" ?
+					await prepareManagedBashCall(receiptDir, sessionId, toolCallId, args.command, cwd) : undefined;
+				const safeArgs = name !== "bash" && typeof args.path === "string" && args.path.length <= 240
+					? { path: redactToolLogText(args.path, 240) } : {};
 				const at = new Date().toISOString();
 				try {
-					const result = await base.execute(toolCallId, args, signal, onUpdate, { ...ctx, cwd });
-					log.push({ name, args, ok: true, at });
+					const result = receipt ? await bashCall.run(receipt, () => base.execute(toolCallId, args, signal, onUpdate, { ...ctx, cwd })) :
+						await base.execute(toolCallId, args, signal, onUpdate, { ...ctx, cwd });
+					const isError = (result as { isError?: boolean }).isError === true;
+					if (receipt) await finishManagedBashCall(receipt, isError ? "is-error" : "returned");
+					log.push({ name, args: safeArgs, ok: !isError, at,
+						...(receipt ? { toolCallId, hostReceiptPath: receipt.file } : {}) });
 					if (name === "read" && typeof args.path === "string") {
 						const resolved = path.isAbsolute(args.path) ? path.resolve(args.path) : path.resolve(cwd, args.path);
 						readCoverage.add(path.relative(cwd, resolved));
 					}
 					return result;
 				} catch (error) {
-					log.push({ name, args, ok: false, at, error: (error as Error).message });
+					if (receipt) {
+						const exit = receipt.receipt.processExit;
+						const kind = exit?.abortSource === "signal" ? "aborted" :
+							exit?.abortSource === "timeout" ? "timeout" :
+							exit?.exitCode !== null && exit?.exitCode !== undefined && exit.exitCode !== 0 ?
+								"nonzero-exit" : "transport-or-tool";
+						await finishManagedBashCall(receipt, "threw", kind).catch(() => undefined);
+					}
+					const code = error instanceof HarnessError && /^runner\.[a-z.-]{1,80}$/.test(error.code)
+						? error.code : (error as NodeJS.ErrnoException | null)?.code;
+					log.push({ name, args: safeArgs, ok: false, at,
+					...(receipt ? { toolCallId, hostReceiptPath: receipt.file } : {}),
+						errorClass: error instanceof HarnessError ? "harness" : "tool-error",
+						...(typeof code === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(code) ? { errorCode: code } : {}) });
 					throw error;
 				}
 			},
@@ -289,7 +724,7 @@ function transcriptOf(messages: readonly unknown[]): TranscriptMessage[] {
 	return transcript;
 }
 
-function turnResult(messages: readonly unknown[], label: string, usage: AssistantTurn["usage"]): AssistantTurn {
+function turnResult(messages: readonly unknown[], label: string, usage: AssistantTurn["usage"], redactProviderError = false): AssistantTurn {
 	const assistants = messages.filter(
 		(message): message is {
 			role: "assistant";
@@ -301,7 +736,7 @@ function turnResult(messages: readonly unknown[], label: string, usage: Assistan
 	const last = assistants.at(-1);
 	if (!last) throw new HarnessError("runner.stop", `session ${label} produced no assistant message`);
 	if (last.stopReason !== "stop") {
-		const detail = last.errorMessage ? `: ${last.errorMessage}` : "";
+		const detail = !redactProviderError && last.errorMessage ? `: ${last.errorMessage}` : "";
 		throw new HarnessError(
 			"runner.stop",
 			`session ${label} did not stop normally (stopReason=${last.stopReason ?? "missing"})${detail}`,
@@ -340,12 +775,80 @@ function parsePersistedSpec(text: string, specFile: string): SessionSpec {
 	return parsed as SessionSpec;
 }
 
+function forkGrantNoBroader(parent: SessionSpec["tools"], child: SessionSpec["tools"], campaignAudited: boolean): boolean {
+	if (child.kind === "none") return true;
+	if (parent.kind !== child.kind) return false;
+	if (child.kind === "read-dir" && parent.kind === "read-dir") {
+		// A generic frozen-read-root authority schema is not yet implemented.
+		// An evidence label alone cannot grant a different directory.
+		return false;
+	}
+	if (child.kind === "custom" && parent.kind === "custom") {
+		if (!campaignAudited) return false;
+		const parentTools = new Map(parent.tools.map((tool) => [tool.name, tool]));
+		return child.tools.every((tool) => JSON.stringify(tool.params) === JSON.stringify(parentTools.get(tool.name)?.params));
+	}
+	if (child.kind === "execution" && parent.kind === "execution") {
+		const parentNames = new Set(parent.tools);
+		return child.tools.every((tool) => parentNames.has(tool));
+	}
+	return false;
+}
+
+async function verifyForkWorkspaceBinding(checkpoint: SessionCheckpoint, binding: ForkWorkspaceBindingV1 | undefined, parentRootRaw: string, childRootRaw: string): Promise<void> {
+	if (!binding || binding.version !== 1 || !Array.isArray(binding.files)) throw new HarnessError("runner.fork", "writable fork requires a controller-frozen workspace binding");
+	let authority: { version?: number; parentRoot?: string; authorizedChildRootBase?: string; childWorkLeaf?: string; frozenEvidenceRoot?: string; files?: Array<{ sourcePath?: string; frozenPath?: string; bytes?: number }> };
+	try {
+		const manifest = JSON.parse(await readFile(checkpoint.manifestSnapshot, "utf8")) as { forkWorkspaceAuthority?: typeof authority };
+		authority = manifest.forkWorkspaceAuthority ?? {};
+	} catch { throw new HarnessError("runner.fork", "checkpoint input manifest lacks a readable workspace authority"); }
+	if (authority.version !== 1 || authority.parentRoot !== binding.parentRoot || authority.authorizedChildRootBase !== binding.authorizedChildRootBase || authority.childWorkLeaf !== binding.childWorkLeaf || authority.frozenEvidenceRoot !== binding.frozenEvidenceRoot ||
+		!Array.isArray(authority.files) || authority.files.length !== binding.files.length || binding.files.some((item, index) => {
+			const source = authority.files?.[index];
+			return source?.sourcePath !== item.sourcePath || source.frozenPath !== item.frozenPath || source.bytes !== item.bytes;
+		})) throw new HarnessError("runner.fork", "workspace binding differs from frozen checkpoint authority");
+	const [parentRoot, base, childRoot, frozenRoot] = await Promise.all([realpath(binding.parentRoot), realpath(binding.authorizedChildRootBase), realpath(binding.childRoot), realpath(binding.frozenEvidenceRoot)]);
+	const parentRelative = path.relative(base, parentRoot).split(path.sep);
+	const childRelative = path.relative(base, childRoot).split(path.sep);
+	const safeTaskSegment = (segment: string): boolean => /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(segment);
+	if (!/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(binding.childWorkLeaf) || parentRelative.length !== 2 || childRelative.length !== 2 ||
+		parentRelative[1] !== binding.childWorkLeaf || childRelative[1] !== binding.childWorkLeaf ||
+		!safeTaskSegment(parentRelative[0]) || !safeTaskSegment(childRelative[0]) || parentRelative[0] === childRelative[0]) throw new HarnessError("runner.fork", "child work root is not a separate task directory under frozen authority");
+	if (parentRoot !== binding.parentRoot || base !== binding.authorizedChildRootBase || childRoot !== binding.childRoot || frozenRoot !== binding.frozenEvidenceRoot ||
+		parentRoot !== await realpath(parentRootRaw) || childRoot !== await realpath(childRootRaw) ||
+		!isInside(base, childRoot) || childRoot === base || isInside(parentRoot, childRoot) || isInside(childRoot, parentRoot) || isInside(frozenRoot, childRoot) || isInside(childRoot, frozenRoot)) throw new HarnessError("runner.fork", "child work root is not independently bound inside the frozen authorized base");
+	if (binding.ownerMarkerPath !== path.join(childRoot, "fork-owner.json") || !(await lstat(binding.ownerMarkerPath)).isFile()) throw new HarnessError("runner.fork", "child work root lacks an ownership marker");
+	let owner: { version?: number; checkpointId?: string; parentRoot?: string; childRoot?: string; childContainer?: string };
+	try { owner = JSON.parse(await readFile(binding.ownerMarkerPath, "utf8")); }
+	catch { throw new HarnessError("runner.fork", "child work root ownership marker is unreadable"); }
+	if (owner.version !== 1 || owner.checkpointId !== checkpoint.id || owner.parentRoot !== parentRoot || owner.childRoot !== childRoot || owner.childContainer !== childRelative[0]) throw new HarnessError("runner.fork", "child work root owner differs from fork checkpoint");
+	for (const item of binding.files) {
+		if (!Number.isSafeInteger(item.bytes) || item.bytes < 0 || !isInside(parentRoot, item.sourcePath) || !isInside(frozenRoot, item.frozenPath) || !isInside(childRoot, item.childPath) ||
+			path.relative(parentRoot, item.sourcePath) !== path.relative(frozenRoot, item.frozenPath) || path.relative(parentRoot, item.sourcePath) !== path.relative(childRoot, item.childPath) ||
+			!(await lstat(item.frozenPath)).isFile() || !(await lstat(item.childPath)).isFile() || (await stat(item.frozenPath)).size !== item.bytes || (await stat(item.childPath)).size !== item.bytes || !(await readFile(item.frozenPath)).equals(await readFile(item.childPath))) throw new HarnessError("runner.fork", "mapped child work file differs from frozen source evidence");
+	}
+}
+
 export class PiSessionRunner implements SessionRunner {
 	private readonly options: PiSessionRunnerOptions;
 	private runtimePromise?: Promise<ModelRuntime>;
+	private readonly checkpointStates = new Map<string, CheckpointState>();
+	private readonly allCheckpointStates = new Set<CheckpointState>();
 
 	constructor(options: PiSessionRunnerOptions = {}) {
 		this.options = options;
+	}
+
+	capabilities(): RunnerCapabilities {
+		return { version: 1, fresh: true, continue: true, persistedLineage: true, forkAtFrozenLeaf: true, grantKinds: ["none", "read-dir", "custom", "execution"], modelCompatibility: "exact-model-only", multimodalHistory: "model-dependent", parallelPromptLeases: "single-process" };
+	}
+
+	async attestConfinedGrant(handle: SessionHandle): Promise<NonNullable<SessionSpec["toolAuthority"]> | undefined> {
+		const state = this.checkpointStates.get(handle.ref.id);
+		if (!this.options.campaignBudget || !state || state.ref !== handle.ref || state.disposed || state.spec.tools.kind !== "custom") return undefined;
+		const approved = getConfinedCampaignFileGrantDescriptor(state.spec.tools.tools);
+		if (!approved || JSON.stringify(state.spec.toolAuthority) !== JSON.stringify(approved)) return undefined;
+		return { ...approved, writableFiles: [...approved.writableFiles] };
 	}
 
 	/** Worst-case Pi price-table estimate for a text-only bounded request; undefined when unpriced. */
@@ -360,6 +863,7 @@ export class PiSessionRunner implements SessionRunner {
 	}
 
 	async create(spec: SessionSpec): Promise<SessionHandle> {
+		if (this.options.campaignBudget) spec = this.options.campaignBudget.boundSpec(spec);
 		await mkdir(spec.persistDir, { recursive: true });
 		const cwd = await mkdtemp(path.join(spec.persistDir, SCRATCH_PREFIX));
 		const sessionManager = SessionManager.create(cwd, spec.persistDir);
@@ -370,6 +874,7 @@ export class PiSessionRunner implements SessionRunner {
 		if (!ref.file || !ref.specFile) {
 			throw new HarnessError("runner.persistence", `session ${ref.label} is missing its file or specFile`);
 		}
+		if (!(await lstat(ref.specFile)).isFile()) throw new HarnessError("runner.persistence", "session spec must be a regular file");
 		let specText: string;
 		try {
 			specText = await readFile(ref.specFile, "utf8");
@@ -377,16 +882,152 @@ export class PiSessionRunner implements SessionRunner {
 			throw new HarnessError("runner.persistence", `cannot read session spec ${ref.specFile}: ${(error as Error).message}`);
 		}
 		const spec = parsePersistedSpec(specText, ref.specFile);
+		if (this.options.campaignBudget) this.options.campaignBudget.boundSpec(spec);
 		if (ref.methodBinding && JSON.stringify(ref.methodBinding) !== JSON.stringify(spec.methodBinding)) {
 			throw new HarnessError("runner.persistence", `session ${ref.label} method binding differs from its persisted spec`);
 		}
 		if (spec.tools.kind === "custom" || spec.tools.kind === "execution" || (spec.tools.kind === "read-dir" && spec.tools.extraTools?.length)) {
 			throw new HarnessError("runner.persistence", `session ${ref.label} used non-resumable tools and cannot be resumed`);
 		}
+		if (!(await lstat(ref.file)).isFile()) throw new HarnessError("runner.persistence", "session transcript must be a regular file");
 		const sessionManager = SessionManager.open(ref.file, spec.persistDir);
+		const forkParent = sessionManager.getHeader()?.parentSession;
+		if (forkParent) {
+			const lineageFile = ref.file.replace(/\.jsonl$/, ".lineage.json");
+			if (ref.lineageFile && ref.lineageFile !== lineageFile) throw new HarnessError("runner.persistence", "fork lineage path differs from its session file");
+			let lineage: { version?: number; state?: string; checkpoint?: { snapshotFile?: string }; child?: { sessionId?: string; sessionFile?: string } };
+			try { if (!(await lstat(lineageFile)).isFile()) throw new Error("lineage receipt is not a regular file"); lineage = JSON.parse(await readFile(lineageFile, "utf8")); }
+			catch { throw new HarnessError("runner.persistence", "fork lineage receipt is missing or unreadable"); }
+			if (lineage.version !== 1 || lineage.state !== "committed" || lineage.checkpoint?.snapshotFile !== forkParent || lineage.child?.sessionId !== sessionManager.getSessionId() || lineage.child?.sessionFile !== ref.file) throw new HarnessError("runner.persistence", "fork lineage receipt is not committed for this session");
+		} else if (ref.lineageFile) throw new HarnessError("runner.persistence", "non-fork session has an unexpected lineage reference");
 		const cwd = sessionManager.getCwd();
 		await this.assertResumeScratch(cwd, spec.persistDir);
-		return this.buildHandle(spec, sessionManager, cwd, false);
+		const handle = await this.buildHandle(spec, sessionManager, cwd, false);
+		if (forkParent) handle.ref.lineageFile = ref.file.replace(/\.jsonl$/, ".lineage.json");
+		return handle;
+	}
+
+	async checkpoint(handle: SessionHandle, envelope: { inputManifest: string; runId: string; taskId?: string; externalOperationsSettled: boolean }): Promise<SessionCheckpoint> {
+		const state = this.checkpointStates.get(handle.ref.id);
+		const peers = [...this.allCheckpointStates].filter((item) => item.ref.file === handle.ref.file);
+		if (!state || state.ref !== handle.ref || state.active || state.freezing || state.disposed || !state.completed || peers.some((item) => item.active || item.freezing)) {
+			throw new HarnessError("runner.fork", "checkpoint requires an idle, completed parent handle owned by this runner");
+		}
+		if (!envelope.externalOperationsSettled) throw new HarnessError("runner.fork", "unknown external operations block checkpoint");
+		if (!envelope.inputManifest.trim() || !envelope.runId.trim()) throw new HarnessError("runner.fork", "checkpoint requires frozen input manifest and run identity");
+		for (const item of peers) item.freezing = true;
+		try {
+			if (!(await lstat(envelope.inputManifest)).isFile()) throw new Error("input manifest is not a regular file");
+			const leafId = state.manager.getLeafId();
+			const terminalMessage = state.manager.getBranch(leafId ?? undefined).filter((entry) => entry.type === "message").at(-1);
+			if (!leafId || !terminalMessage || terminalMessage.type !== "message" || terminalMessage.message.role !== "assistant" || terminalMessage.message.stopReason !== "stop") {
+				throw new HarnessError("runner.fork", "checkpoint leaf is not a normally completed assistant message");
+			}
+			const sourceSessionFile = state.ref.file;
+			const sourceSpecFile = state.ref.specFile;
+			if (!sourceSessionFile || !sourceSpecFile) throw new HarnessError("runner.fork", "parent has no persisted session and spec");
+			if (await readFile(sourceSpecFile, "utf8") !== `${JSON.stringify(state.spec, null, 2)}\n`) throw new HarnessError("runner.fork", "parent persisted spec differs from the active tool and model grant");
+			const id = randomUUID();
+			const snapshotDir = path.join(path.dirname(sourceSessionFile), ".checkpoints");
+			await mkdir(snapshotDir, { recursive: true });
+			const snapshotFile = path.join(snapshotDir, `${id}.jsonl`);
+			const sourceSpecSnapshot = path.join(snapshotDir, `${id}.parent-spec.json`);
+			const manifestSnapshot = path.join(snapshotDir, `${id}.manifest.json`);
+			const before = await stat(sourceSessionFile);
+			await copyFile(sourceSessionFile, snapshotFile);
+			await copyFile(sourceSpecFile, sourceSpecSnapshot);
+			await copyFile(envelope.inputManifest, manifestSnapshot);
+			const after = await stat(sourceSessionFile);
+			const copied = await stat(snapshotFile);
+			if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || copied.size !== before.size) {
+				await rm(snapshotFile, { force: true });
+				throw new HarnessError("runner.fork", "parent file changed while freezing checkpoint");
+			}
+			const snapshot = SessionManager.open(snapshotFile, snapshotDir);
+			if (snapshot.getSessionId() !== state.ref.id || snapshot.getLeafId() !== leafId) {
+				await rm(snapshotFile, { force: true });
+				throw new HarnessError("runner.fork", "persisted parent leaf differs from live completed leaf");
+			}
+			const checkpoint: SessionCheckpoint = { version: 1, id, sourceSessionId: state.ref.id, sourceSessionFile, sourceSpecFile, sourceSpecSnapshot, snapshotFile, leafId, model: state.ref.model, inputManifest: envelope.inputManifest, manifestSnapshot, runId: envelope.runId, ...(envelope.taskId ? { taskId: envelope.taskId } : {}), frozenAt: new Date().toISOString(), snapshotBytes: copied.size };
+			await writeFileAtomic(path.join(snapshotDir, `${id}.checkpoint.json`), `${JSON.stringify(checkpoint, null, 2)}\n`);
+			return checkpoint;
+		} finally { for (const item of peers) item.freezing = false; }
+	}
+
+	async fork(request: ForkRequest): Promise<SessionHandle> {
+		const { checkpoint, evidenceBindings, reason } = request;
+		let spec = request.spec;
+		if (checkpoint.version !== 1 || !reason.trim() || !checkpoint.id || !checkpoint.leafId || !checkpoint.inputManifest || !checkpoint.runId) throw new HarnessError("runner.fork", "invalid checkpoint or fork reason");
+		if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(checkpoint.id) || !path.isAbsolute(checkpoint.sourceSessionFile) || checkpoint.sourceSpecFile !== specFileFor(checkpoint.sourceSessionFile) || checkpoint.snapshotFile !== path.join(path.dirname(checkpoint.sourceSessionFile), ".checkpoints", `${checkpoint.id}.jsonl`) || checkpoint.sourceSpecSnapshot !== path.join(path.dirname(checkpoint.sourceSessionFile), ".checkpoints", `${checkpoint.id}.parent-spec.json`) || checkpoint.manifestSnapshot !== path.join(path.dirname(checkpoint.sourceSessionFile), ".checkpoints", `${checkpoint.id}.manifest.json`)) throw new HarnessError("runner.fork", "checkpoint origin paths are invalid");
+		for (const file of [checkpoint.sourceSessionFile, checkpoint.sourceSpecFile, checkpoint.sourceSpecSnapshot, checkpoint.snapshotFile, checkpoint.manifestSnapshot, checkpoint.inputManifest, path.join(path.dirname(checkpoint.snapshotFile), `${checkpoint.id}.checkpoint.json`)]) {
+			if (!(await lstat(file)).isFile()) throw new HarnessError("runner.fork", `checkpoint path is not a regular file: ${file}`);
+		}
+		if (spec.model !== checkpoint.model) throw new HarnessError("runner.fork", "cross-model fork is not verified; use fresh evidence handoff");
+		if (this.options.campaignBudget) spec = this.options.campaignBudget.boundSpec(spec);
+		const persistedCheckpoint = JSON.parse(await readFile(path.join(path.dirname(checkpoint.snapshotFile), `${checkpoint.id}.checkpoint.json`), "utf8")) as SessionCheckpoint;
+		if (JSON.stringify(persistedCheckpoint) !== JSON.stringify(checkpoint)) throw new HarnessError("runner.fork", "checkpoint receipt differs from persisted source");
+		if (!(await stat(checkpoint.inputManifest)).isFile() || !(await stat(checkpoint.manifestSnapshot)).isFile() || !(await readFile(checkpoint.inputManifest)).equals(await readFile(checkpoint.manifestSnapshot))) throw new HarnessError("runner.fork", "frozen input manifest is missing or changed");
+		if (!(await readFile(checkpoint.sourceSpecFile)).equals(await readFile(checkpoint.sourceSpecSnapshot))) throw new HarnessError("runner.fork", "checkpoint parent spec changed");
+		const snapshotStat = await stat(checkpoint.snapshotFile);
+		if (snapshotStat.size !== checkpoint.snapshotBytes) throw new HarnessError("runner.fork", "checkpoint source bytes changed");
+		const sourceBytes = await readFile(checkpoint.sourceSessionFile);
+		const frozenBytes = await readFile(checkpoint.snapshotFile);
+		if (sourceBytes.length < frozenBytes.length || !sourceBytes.subarray(0, frozenBytes.length).equals(frozenBytes)) throw new HarnessError("runner.fork", "checkpoint source history was changed");
+		const frozen = SessionManager.open(checkpoint.snapshotFile, path.dirname(checkpoint.snapshotFile));
+		if (frozen.getSessionId() !== checkpoint.sourceSessionId || !frozen.getEntry(checkpoint.leafId)) throw new HarnessError("runner.fork", "checkpoint source session or leaf changed");
+		const parentSpec = parsePersistedSpec(await readFile(checkpoint.sourceSpecSnapshot, "utf8"), checkpoint.sourceSpecSnapshot);
+		if (path.dirname(await realpath(checkpoint.sourceSessionFile)) !== await realpath(parentSpec.persistDir)) throw new HarnessError("runner.fork", "checkpoint parent is outside its persisted session directory");
+		if (parentSpec.model !== checkpoint.model) throw new HarnessError("runner.fork", "parent model differs from checkpoint");
+		if (!forkGrantNoBroader(parentSpec.tools, spec.tools, Boolean(this.options.campaignBudget))) throw new HarnessError("runner.fork", "fork cannot elevate tool authority beyond its parent");
+		if (!Array.isArray(evidenceBindings) || evidenceBindings.some((binding) => binding.version !== 1 || binding.status !== "frozen-copy" || !binding.label.trim() || !binding.path.trim() || !binding.sourceVersion?.trim())) throw new HarnessError("runner.fork", "fork requires frozen-copy evidence bindings");
+		if (evidenceBindings.length === 0) throw new HarnessError("runner.fork", "fork requires explicit frozen evidence bindings");
+		for (const binding of evidenceBindings) if (!(await lstat(binding.path)).isFile() && !(await lstat(binding.path)).isDirectory()) throw new HarnessError("runner.fork", "frozen evidence binding must be a regular file or directory");
+		if (spec.tools.kind === "execution") {
+			const root = await realpath(spec.tools.root);
+			if (parentSpec.tools.kind === "execution") {
+				await verifyForkWorkspaceBinding(checkpoint, request.workspaceBinding, parentSpec.tools.root, root);
+			}
+			for (const binding of evidenceBindings) if (isInside(root, await realpath(binding.path))) throw new HarnessError("runner.fork", "frozen evidence cannot be inside child writable root");
+		}
+		if (spec.tools.kind === "custom") {
+			const parentAuthority = parentSpec.toolAuthority;
+			const childAuthority = spec.toolAuthority;
+			if (parentAuthority?.kind !== "confined-campaign-files" || childAuthority?.kind !== "confined-campaign-files" ||
+				!Array.isArray(parentAuthority.writableFiles) || !Array.isArray(childAuthority.writableFiles) ||
+				childAuthority.writableFiles.some((item) => !parentAuthority.writableFiles.includes(item))) throw new HarnessError("runner.fork", "audited custom fork grant lacks a frozen equal-or-narrower write allowlist");
+			const parentRoot = await realpath(parentAuthority.root);
+			const childRoot = await realpath(childAuthority.root);
+			if (parentRoot !== parentAuthority.root || childRoot !== childAuthority.root) throw new HarnessError("runner.fork", "audited custom fork root is not canonical");
+			await verifyForkWorkspaceBinding(checkpoint, request.workspaceBinding, parentRoot, childRoot);
+			for (const binding of evidenceBindings) if (isInside(childRoot, await realpath(binding.path))) throw new HarnessError("runner.fork", "frozen evidence cannot be inside child writable root");
+		}
+		await mkdir(spec.persistDir, { recursive: true });
+		const childScratch = await mkdtemp(path.join(spec.persistDir, SCRATCH_PREFIX));
+		let childFile: string | undefined;
+		let handle: SessionHandle | undefined;
+		try {
+			const manager = SessionManager.open(checkpoint.snapshotFile, spec.persistDir, childScratch);
+			if (manager.getLeafId() !== checkpoint.leafId) throw new HarnessError("runner.fork", "checkpoint snapshot has a different leaf");
+			childFile = manager.createBranchedSession(checkpoint.leafId);
+			if (!childFile || childFile === checkpoint.sourceSessionFile || manager.getSessionId() === checkpoint.sourceSessionId) throw new HarnessError("runner.fork", "Pi did not create an independent branch");
+			const child = SessionManager.open(childFile, spec.persistDir, childScratch);
+			const originalIds = frozen.getBranch(checkpoint.leafId).filter((entry) => entry.type !== "label").map((entry) => entry.id);
+			const copiedIds = child.getBranch(checkpoint.leafId).filter((entry) => entry.type !== "label").map((entry) => entry.id);
+			if (JSON.stringify(originalIds) !== JSON.stringify(copiedIds) || child.getHeader()?.cwd !== childScratch) throw new HarnessError("runner.fork", "Pi branch failed source-path or scratch validation");
+			handle = await this.buildHandle(spec, manager, childScratch, true);
+			const lineageFile = childFile.replace(/\.jsonl$/, ".lineage.json");
+			const lineage = { version: 1, state: "committed", intent: "branch-exploration", checkpoint, parent: { sessionId: checkpoint.sourceSessionId, sessionFile: checkpoint.sourceSessionFile, leafId: checkpoint.leafId, toolGrantKind: parentSpec.tools.kind, toolAuthority: parentSpec.toolAuthority }, child: { sessionId: handle.ref.id, sessionFile: childFile, scratch: childScratch, toolGrantKind: spec.tools.kind, toolAuthority: spec.toolAuthority, ...(spec.tools.kind === "execution" ? { workRoot: spec.tools.root } : {}) }, reason, evidenceBindings, workspaceBinding: request.workspaceBinding, inheritedUsageBilled: false, createdAt: new Date().toISOString() };
+			await writeFileAtomic(lineageFile, `${JSON.stringify(lineage, null, 2)}\n`);
+			handle.ref.lineageFile = lineageFile;
+			return handle;
+		} catch (error) {
+			handle?.dispose();
+			if (childFile) {
+				await Promise.all([rm(childFile, { force: true }), rm(specFileFor(childFile), { force: true }), rm(childFile.replace(/\.jsonl$/, ".lineage.json"), { force: true })]);
+			}
+			await rm(childScratch, { recursive: true, force: true });
+			throw error;
+		}
 	}
 
 	private getRuntime(): Promise<ModelRuntime> {
@@ -432,13 +1073,27 @@ export class PiSessionRunner implements SessionRunner {
 			throw new HarnessError("runner.isolation", `runner agent directory is not empty: ${emptyAgentDir}`);
 		}
 
+		const campaign = this.options.campaignBudget;
+		const onCampaignAccountingBoundary = this.options.onCampaignAccountingBoundary;
+		const checkpointAccounting = async (event: "request-reserved" | "request-observed"): Promise<void> => {
+			if (campaign && onCampaignAccountingBoundary)
+				await onCampaignAccountingBoundary(event, campaign.requestAccountingAuditSnapshot());
+		};
 		const strict = spec.strictRequest;
 		if (strict) {
-			if (spec.tools.kind !== "none" || strict.maxProviderCallsPerPrompt !== 1 || (strict.maxOutputTokens !== undefined && (!Number.isInteger(strict.maxOutputTokens) || strict.maxOutputTokens < 1)) || !Number.isInteger(strict.maxInputPayloadBytes) || strict.maxInputPayloadBytes < 1) {
-				throw new HarnessError("runner.model", "strict request requires no tools and positive integer request caps");
+			if ((!campaign && (spec.tools.kind !== "none" ||
+				strict.maxInputPayloadBytes === undefined || strict.maxOutputTokens !== undefined)) ||
+				(strict.maxOutputTokens !== undefined && (!Number.isInteger(strict.maxOutputTokens) || strict.maxOutputTokens < 1)) ||
+				(strict.maxInputPayloadBytes !== undefined && (!Number.isInteger(strict.maxInputPayloadBytes) || strict.maxInputPayloadBytes < 1))) {
+				throw new HarnessError("runner.model", "strict request requires positive integer caps; tools require a campaign budget");
 			}
 		}
-		const settingsManager = SettingsManager.inMemory(strict ? { retry: { enabled: false, provider: { maxRetries: 0 } }, compaction: { enabled: false } } : {});
+		if (campaign && (!strict || JSON.stringify(strict) !== JSON.stringify(campaign.strictRequest))) throw new HarnessError("runner.campaign", "campaign request caps are missing or changed");
+		const ordinaryAssessor = !strict && spec.role === "research" &&
+			spec.tools.kind === "read-dir" && spec.label.startsWith("local-original-objective-");
+		const settingsManager = SettingsManager.inMemory(strict ?
+			{ retry: { enabled: false, provider: { maxRetries: 0 } }, compaction: { enabled: false } } :
+			ordinaryAssessor ? { retry: { enabled: false, provider: { maxRetries: 0 } } } : {});
 		const loader = new DefaultResourceLoader({
 			cwd,
 			agentDir: emptyAgentDir,
@@ -454,35 +1109,230 @@ export class PiSessionRunner implements SessionRunner {
 		await loader.reload();
 
 		const resolved = await this.resolveModel(spec);
-		if (strict && (resolved.model.provider !== "deepseek" || resolved.model.api !== "openai-completions" || (strict.maxOutputTokens !== undefined && strict.maxOutputTokens > resolved.model.maxTokens))) {
+		campaign?.assertResolved(resolved.model);
+		if (strict && (resolved.model.provider !== "deepseek" || resolved.model.api !== "openai-completions" ||
+			(campaign && strict.maxOutputTokens !== resolved.model.maxTokens))) {
 			throw new HarnessError("runner.model", "strict request currently supports only bounded DeepSeek openai-completions models");
 		}
 		let strictStreamCalls = 0;
 		let strictPayloadChecks = 0;
-		const requestRuntime = strict ? new Proxy(resolved.modelRuntime, {
+		let currentLease: PromptLease | undefined;
+		let currentRequestIds: string[] = [];
+		let currentContextRejectedIds = new Set<string>();
+		let certifiedEffectScope: HostEffectScope | undefined;
+		const transportDiagnostics: TransportFailureDiagnostic[] = [];
+		const ordinaryPromptProbes: Array<{ promptIndex: number; probe: TransportProbe;
+			sdkSignal?: AbortSignal }> = [];
+		const sdkAssessorAborted = (index: number): boolean => !campaign && ordinaryAssessor &&
+			ordinaryPromptProbes.some(row => row.promptIndex === index && row.sdkSignal?.aborted);
+		const providerOutputRequests: Array<{ resolvedMaxTokens: number; outputField: OutputTokenField;
+			outgoingMaxTokens: number | null }> = [];
+		const signal = this.options.signal;
+		const sanitizePrivateProviderError = this.options.sanitizePrivateProviderError;
+		let abortedByHandle = false;
+		let promptIndex = 0;
+		const requestRuntime = new Proxy(resolved.modelRuntime, {
 			get(target, property) {
 				if (property !== "streamSimple") {
 					const member = Reflect.get(target, property, target);
 					return typeof member === "function" ? member.bind(target) : member;
 				}
 				return (model: Parameters<ModelRuntime["streamSimple"]>[0], context: Parameters<ModelRuntime["streamSimple"]>[1], options?: Parameters<ModelRuntime["streamSimple"]>[2]) => {
+				if (!strict) {
+					const probe = ordinaryAssessor ?
+						new TransportProbe(options?.fetch ?? globalThis.fetch, sanitizePrivateProviderError) : undefined;
+					if (probe) {
+						// A later tool-loop stream supersedes completed earlier streams.
+						ordinaryPromptProbes.length = 0;
+						ordinaryPromptProbes.push({ promptIndex, probe, sdkSignal: options?.signal });
+					}
+					return target.streamSimple(model, context, { ...options, maxTokens: model.maxTokens,
+						...(ordinaryAssessor ? { maxRetries: 0 } : {}),
+						...(probe ? { fetch: probe.fetch,
+							onResponse: async (response: Parameters<NonNullable<NonNullable<Parameters<ModelRuntime["streamSimple"]>[2]>["onResponse"]>>[0],
+								responseModel: typeof model) => {
+								probe.observeResponse(response.status);
+								await options?.onResponse?.(response, responseModel);
+							} } : {}),
+					...(model.provider === "deepseek" && model.api === "openai-completions" ? {
+						onPayload: async (payload: unknown, payloadModel: typeof model) => {
+							const original = await options?.onPayload?.(payload as never, payloadModel as never);
+							const inspected = inspectDeepSeekOutputRequest(original ?? payload, model, payloadModel);
+							providerOutputRequests.push({ resolvedMaxTokens: model.maxTokens,
+								outputField: inspected.outputField,
+								outgoingMaxTokens: inspected.outputField === "omitted" ? null : inspected.outputTokens });
+							return inspected.payload;
+						},
+					} : {}) });
+				}
+				const lease = currentLease;
+					const requestIds = currentRequestIds;
+					const contextRejectedIds = currentContextRejectedIds;
+					let requestId: string | undefined;
+					const rawFetch = options?.fetch ?? globalThis.fetch;
+					let probe = campaign ? new TransportProbe(rawFetch,
+						sanitizePrivateProviderError) : undefined;
+					let expectedPayloadSha256: string | undefined;
+					let failureRecorded = false;
+					const recordFailure = (): void => {
+						if (!probe || failureRecorded) return;
+						failureRecorded = true;
+						const abortSource = abortedByHandle ? "handle" : signal?.aborted ? "host-signal" : options?.signal?.aborted ? "sdk-signal" : null;
+						transportDiagnostics.push(probe.failure(promptIndex, abortSource, requestId));
+					};
 					strictStreamCalls++;
-					if (strictStreamCalls > strict.maxProviderCallsPerPrompt || model.provider !== resolved.model.provider || model.id !== resolved.model.id) throw new HarnessError("runner.model", "strict request would exceed one provider call or change model");
-					return target.streamSimple(model, context, {
-						...options, maxRetries: 0, ...(strict.maxOutputTokens === undefined ? {} : { maxTokens: strict.maxOutputTokens }),
+					campaign?.assertResolved(model);
+					if (model.provider !== resolved.model.provider || model.id !== resolved.model.id ||
+						model.api !== resolved.model.api || model.baseUrl !== resolved.model.baseUrl)
+						throw new HarnessError("runner.model", "strict request changed model");
+					const inner = target.streamSimple(model, context, {
+						...options, maxRetries: 0, maxTokens: model.maxTokens,
+						...(probe ? { fetch: async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+							let attempt = init;
+							for (;;) {
+								const response = await probe!.fetch(input, attempt);
+								if (response.status !== 400 || !campaign || !lease || !requestId ||
+									!expectedPayloadSha256 || typeof attempt?.body !== "string") return response;
+								if (!await observeBoundedRejectedResponse(response)) return response;
+								const parsed = probe!.contextOverflow();
+								if (!parsed || parsed.contextWindow !== model.contextWindow ||
+									createHash("sha256").update(attempt.body).digest("hex") !== expectedPayloadSha256)
+									return response;
+								let prior: Record<string, unknown>;
+								try { prior = JSON.parse(attempt.body) as Record<string, unknown>; }
+								catch { return response; }
+								if (!prior || typeof prior !== "object" || Array.isArray(prior) ||
+									(prior.max_tokens === undefined && prior.max_completion_tokens === undefined) ||
+									(prior.max_tokens !== undefined && prior.max_tokens !== parsed.completionTokens) ||
+									(prior.max_completion_tokens !== undefined &&
+										prior.max_completion_tokens !== parsed.completionTokens)) return response;
+								// This provider-declined HTTP request was received even if the
+								// corrected transport later fails local validation. Preserve
+								// its UNKNOWN invoice and numeric rejection immediately.
+								const rejectedId = requestId;
+								const proof = { httpStatus: 400 as const, ...parsed };
+								campaign.recordContextRejected(lease, rejectedId, proof);
+								contextRejectedIds.add(rejectedId);
+								await checkpointAccounting("request-observed");
+								transportDiagnostics.push(probe!.failure(promptIndex, null, rejectedId));
+								failureRecorded = true;
+								const corrected = parsed.allowedCompletionTokens;
+								const next = { ...prior,
+									...(prior.max_tokens === undefined ? {} : { max_tokens: corrected }),
+									...(prior.max_completion_tokens === undefined ? {} :
+										{ max_completion_tokens: corrected }) };
+								const nextBody = JSON.stringify(next);
+								try { assertDeepSeekRequestContract(nextBody,
+									{ sourceMessages: context.messages }); }
+								catch { return response; }
+								const nextBytes = Buffer.byteLength(nextBody, "utf8");
+								if (strict.maxInputPayloadBytes !== undefined &&
+									nextBytes > strict.maxInputPayloadBytes) return response;
+								const retryId = randomUUID();
+								campaign.reserveContextRetry(lease, nextBytes, retryId, corrected, rejectedId, proof);
+								requestIds.push(retryId);
+								providerOutputRequests.push({ resolvedMaxTokens: model.maxTokens,
+									outputField: prior.max_tokens !== undefined && prior.max_completion_tokens !== undefined ? "both" :
+										prior.max_tokens !== undefined ? "max_tokens" : "max_completion_tokens",
+									outgoingMaxTokens: corrected });
+								await checkpointAccounting("request-reserved");
+								void response.body?.cancel().catch(() => undefined);
+								requestId = retryId;
+								expectedPayloadSha256 = createHash("sha256").update(nextBody).digest("hex");
+								probe = new TransportProbe(rawFetch, sanitizePrivateProviderError);
+								failureRecorded = false;
+								attempt = { ...attempt, body: nextBody };
+							}
+						},
+							onResponse: async (response: Parameters<NonNullable<NonNullable<Parameters<ModelRuntime["streamSimple"]>[2]>["onResponse"]>>[0], responseModel: typeof model) => {
+								probe!.observeResponse(response.status);
+								await options?.onResponse?.(response, responseModel);
+							} } : {}),
 						onPayload: async (payload, payloadModel) => {
 							strictPayloadChecks++;
-							if (strictPayloadChecks > 1 || payloadModel.provider !== model.provider || payloadModel.id !== model.id) throw new HarnessError("runner.model", "strict request payload changed model or repeated");
-							const record = payload as Record<string, unknown>;
-							if (strict.maxOutputTokens !== undefined && record.max_tokens !== strict.maxOutputTokens && record.max_completion_tokens !== strict.maxOutputTokens) throw new HarnessError("runner.model", "strict request output cap missing from provider payload");
-							const bytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
-							if (bytes > strict.maxInputPayloadBytes) throw new HarnessError("runner.model", "strict request input payload exceeds reserved byte cap");
-							return payload;
+							campaign?.assertResolved(payloadModel);
+							if (payloadModel.provider !== model.provider || payloadModel.id !== model.id ||
+								payloadModel.api !== model.api || payloadModel.baseUrl !== model.baseUrl)
+								throw new HarnessError("runner.model", "strict request payload changed model");
+							const inspected = inspectDeepSeekOutputRequest(payload, model, payloadModel);
+							const outgoing = inspected.payload;
+							const serialized = JSON.stringify(outgoing);
+							if (typeof serialized !== "string") throw new HarnessError("runner.model", "provider payload could not be serialized for reservation");
+							if (campaign) try { assertDeepSeekRequestContract(serialized,
+								{ sourceMessages: context.messages }); }
+							catch (error) {
+								probe?.captureRequestContractError(error, Boolean(lease) &&
+									currentRequestIds.length === 0 && campaign.requestCount(lease!) === 0);
+								recordFailure(); throw error;
+							}
+							const bytes = Buffer.byteLength(serialized, "utf8");
+							if (strict.maxInputPayloadBytes !== undefined && bytes > strict.maxInputPayloadBytes) throw new HarnessError("runner.model", "strict request input payload exceeds reserved byte cap");
+							const outputObservation = { resolvedMaxTokens: model.maxTokens,
+								outputField: inspected.outputField,
+								outgoingMaxTokens: inspected.outputField === "omitted" ? null : inspected.outputTokens };
+							if (campaign) {
+								if (!lease) throw new HarnessError("runner.campaign", "provider request has no active prompt lease");
+								requestId = randomUUID();
+								campaign.reserve(lease, bytes, requestId, inspected.outputTokens, inspected.outputField);
+								requestIds.push(requestId);
+								providerOutputRequests.push(outputObservation);
+								await checkpointAccounting("request-reserved");
+								expectedPayloadSha256 = createHash("sha256").update(serialized).digest("hex");
+							} else providerOutputRequests.push(outputObservation);
+							return outgoing;
 						},
 					});
+					// A terminal provider event must be accounted for before Pi can begin
+					// the next tool-loop request. Offline test runtimes may use a Promise
+					// instead of the SDK stream; final prompt reconciliation covers those.
+					if (!campaign || !lease || !inner || !(Symbol.asyncIterator in Object(inner))) return inner;
+					const outer = createAssistantMessageEventStream();
+					const emptyUsage: AssistantMessage["usage"] = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+					let latest: AssistantMessage = { role: "assistant", content: [], api: model.api, provider: model.provider,
+						model: model.id, usage: emptyUsage, stopReason: "error", timestamp: Date.now() };
+					const failStream = (error: unknown): void => {
+						probe?.captureErrorCodes(error);
+						recordFailure();
+						campaign.failPrompt(lease);
+						outer.push({ type: "error", reason: "error", error: { ...latest, stopReason: "error", errorMessage: "provider stream failed" } });
+						outer.end();
+					};
+					void (async () => {
+						let terminal = false;
+						for await (const event of inner) {
+							if (event.type === "start") latest = event.partial;
+							if (event.type === "done") {
+								terminal = true;
+								latest = event.message;
+								if (!requestId) throw new HarnessError("runner.campaign", "provider response has no reserved request");
+								const usage = event.message.usage;
+								const hasPricedCost = Number.isFinite(usage?.cost?.total) && (usage?.cost?.total ?? -1) >= 0;
+								const report: UsageEvent = {
+									entryId: `provider-${requestId}`, kind: "assistant", promptIndex: 0, at: new Date().toISOString(),
+									provider: event.message.provider, model: event.message.model, stopReason: event.message.stopReason,
+									usage: { input: usage?.input, output: usage?.output, cacheRead: usage?.cacheRead,
+										cacheWrite: usage?.cacheWrite, totalTokens: usage?.totalTokens, cost: usage?.cost?.total },
+									status: hasPricedCost ? "reported" : "unknown",
+									costSource: hasPricedCost ? "sdk-estimate" : "unknown",
+									costStatus: hasPricedCost ? "priced" : "unknown",
+								};
+								if (event.message.stopReason === "length") campaign.stopAfterTerminalLength(lease, requestId, report);
+								else campaign.settleReported(lease, requestId, report);
+								await checkpointAccounting("request-observed");
+							}
+							if (event.type === "error") { terminal = true; latest = event.error;
+								recordFailure();
+								campaign.failPrompt(lease); }
+							outer.push(event);
+						}
+						if (!terminal) throw new HarnessError("runner.campaign", "provider stream ended without a terminal response");
+						outer.end();
+					})().catch(failStream);
+					return outer;
 				};
 			},
-		}) : resolved.modelRuntime;
+		});
 		const priced = resolved.model.cost.input > 0 && resolved.model.cost.output > 0;
 		let materialTools: MaterialTools = { tools: [], names: [], readCoverage: new Set(), readReturns: [] };
 		const toolLog: ToolCallRecord[] = [];
@@ -497,7 +1347,9 @@ export class PiSessionRunner implements SessionRunner {
 			const definitions = customToolsToPi(spec.tools.tools, toolLog);
 			materialTools = { tools: definitions, names: definitions.map((d) => d.name), readCoverage: new Set(), readReturns: [] };
 		} else if (spec.tools.kind === "execution") {
-			const execution = await createExecutionTools(spec.tools.root, spec.tools.tools, toolLog);
+			const execution = await createExecutionTools(spec.tools.root, spec.tools.tools, toolLog,
+				path.join(spec.persistDir, "host-execution-receipts", sessionManager.getSessionId()),
+				sessionManager.getSessionId(), true);
 			materialTools = execution;
 			sessionCwd = execution.cwd;
 		}
@@ -527,6 +1379,15 @@ export class PiSessionRunner implements SessionRunner {
 				`unsafe active tool set for ${spec.label}: ${active.join(",") || "(empty)"}; expected ${expected.join(",") || "(empty)"}`,
 			);
 		}
+		if (campaign && active.length === expected.length && active.every((name, index) => name === expected[index])) {
+			if (spec.tools.kind === "none" && noTools === "all" && active.length === 0 &&
+				materialTools.tools.length === 0 && materialTools.names.length === 0) certifiedEffectScope = "no-tools";
+			else if (spec.tools.kind === "custom" && noTools === "builtin") {
+				const grant = getConfinedCampaignFileGrantDescriptor(spec.tools.tools);
+				if (grant && JSON.stringify(grant) === JSON.stringify(spec.toolAuthority))
+					certifiedEffectScope = "factory-attested-confined-file-tools";
+			}
+		}
 		const sessionFile = session.sessionFile;
 		if (!sessionFile) {
 			throw new HarnessError("runner.persistence", `Pi did not allocate a session file for ${spec.label}`);
@@ -542,13 +1403,25 @@ export class PiSessionRunner implements SessionRunner {
 			specFile,
 			...(spec.methodBinding ? { methodBinding: spec.methodBinding } : {}),
 		};
+		const checkpointState = { ref, spec, manager: sessionManager, active: false, freezing: false, completed: false, disposed: false };
+		const terminalMessage = sessionManager.getBranch().filter((entry) => entry.type === "message").at(-1);
+		checkpointState.completed = !persistSpec && terminalMessage?.type === "message" && terminalMessage.message.role === "assistant" && terminalMessage.message.stopReason === "stop";
+		this.checkpointStates.set(ref.id, checkpointState);
+		this.allCheckpointStates.add(checkpointState);
 		const usageFile = sessionFile.replace(/\.jsonl$/, ".usage.jsonl");
-		let promptIndex = await readFile(usageFile, "utf8")
-			.then((content) => content.split(/\r?\n/).filter(Boolean).length)
+		const usageRows = await readFile(usageFile, "utf8")
+			.then((content) => content.split(/\r?\n/).filter(Boolean))
 			.catch((error: NodeJS.ErrnoException) => {
-				if (error.code === "ENOENT") return 0;
+				if (error.code === "ENOENT") return [];
 				throw error;
 			});
+		promptIndex = usageRows.length;
+		if (!persistSpec && checkpointState.completed) {
+			let lastLedger: { sessionId?: string; outcome?: string; events?: Array<{ entryId?: string }> } | undefined;
+			try { lastLedger = usageRows.length ? JSON.parse(usageRows.at(-1)!) : undefined; } catch { /* malformed ledger cannot prove completion */ }
+			const lastAssistant = sessionManager.getBranch().filter((entry) => entry.type === "message" && entry.message.role === "assistant").at(-1);
+			checkpointState.completed = Boolean(lastAssistant && lastLedger?.sessionId === ref.id && lastLedger.outcome === "completed" && lastLedger.events?.some((event) => event.entryId === lastAssistant.id));
+		}
 		const workspace = path.basename(spec.persistDir) === "sessions" && path.basename(path.dirname(spec.persistDir)) === ".agent"
 			? path.dirname(path.dirname(spec.persistDir)) : undefined;
 		if (workspace) {
@@ -559,9 +1432,7 @@ export class PiSessionRunner implements SessionRunner {
 				telemetry = started;
 			} catch { await started?.end().catch(() => undefined); }
 		}
-		const signal = this.options.signal;
 		let disposed = false;
-		let abortedByHandle = false;
 		let promptActive = false;
 		let telemetryQueue = Promise.resolve();
 		const queueTelemetry = (operation: () => Promise<void>): Promise<void> => {
@@ -580,16 +1451,22 @@ export class PiSessionRunner implements SessionRunner {
 			setRunContext: ({ stage, runId }) => { void queueTelemetry(async () => { if (!disposed) await telemetry?.setRunContext(stage, runId); }); },
 			prompt: async (text): Promise<AssistantTurn> => {
 				if (disposed) throw new HarnessError("runner.stop", `session ${spec.label} has been disposed`);
-				if (abortedByHandle) throw new HarnessError("runner.stop", `session ${spec.label} was aborted before prompt`);
+				if (checkpointState.freezing) throw new HarnessError("runner.fork", `session ${spec.label} is being checkpointed`);
+				if (abortedByHandle) throw new HarnessError("runner.aborted", `session ${spec.label} was aborted before prompt`);
 				if (promptActive) throw new HarnessError("runner.stop", `session ${spec.label} already has an active prompt`);
-				if (signal?.aborted) throw new HarnessError("runner.stop", `session ${spec.label} was aborted before prompt`);
+				if (signal?.aborted) throw new HarnessError("runner.aborted", `session ${spec.label} was aborted before prompt`);
+				const thisPrompt = promptIndex + 1;
+				currentLease = campaign?.beginPrompt(ref.id, `${thisPrompt}-${randomUUID()}`);
+				currentRequestIds = [];
+				currentContextRejectedIds = new Set();
 				promptActive = true;
+				checkpointState.active = true;
+				checkpointState.completed = false;
 				if (strict) { strictStreamCalls = 0; strictPayloadChecks = 0; }
 				// Do not await telemetry before installing the abort listener: prompt()
 				// must remain synchronously abortable from the caller's next statement.
 				void queueTelemetry(async () => { if (!disposed) await telemetry?.heartbeat("active"); });
-				promptIndex++;
-				const thisPrompt = promptIndex;
+				promptIndex = thisPrompt;
 				const promptEvents: UsageEvent[] = [];
 				const promptMessages: unknown[] = [];
 				const collectUsage = (): void => {
@@ -613,41 +1490,99 @@ export class PiSessionRunner implements SessionRunner {
 				signal?.addEventListener("abort", abortListener, { once: true });
 				try {
 					await session.prompt(text);
-					if (strict && (strictStreamCalls !== 1 || strictPayloadChecks !== 1)) throw new HarnessError("runner.model", "strict request did not verify exactly one provider payload");
+					if (strict && (strictStreamCalls < 1 || strictStreamCalls !== strictPayloadChecks)) throw new HarnessError("runner.model", "strict request did not verify every provider payload");
 					if (abortPromise) await abortPromise;
-					if (signal?.aborted || abortedByHandle) {
+					if (signal?.aborted || abortedByHandle || sdkAssessorAborted(thisPrompt)) {
 						const detail = abortError ? `; SDK abort failed: ${(abortError as Error).message}` : "";
-						throw new HarnessError("runner.stop", `session ${spec.label} was aborted during prompt${detail}`);
+						throw new HarnessError("runner.aborted", `session ${spec.label} was aborted during prompt${detail}`);
 					}
 					collectUsage();
-					const result = turnResult(promptMessages, spec.label, summarizeUsage(promptEvents));
+					const result = turnResult(promptMessages, spec.label, summarizeUsage(promptEvents), Boolean(campaign));
+					if (campaign && currentLease) {
+						const assistants = promptEvents.filter((event) => event.kind === "assistant");
+						const answeredRequestIds = currentRequestIds.filter((requestId) =>
+							!currentContextRejectedIds.has(requestId));
+						if (assistants.length !== answeredRequestIds.length)
+							throw new HarnessError("runner.campaign", "provider request and assistant usage counts differ");
+						campaign.finishPrompt(currentLease, answeredRequestIds.map((requestId, index) => ({
+							requestId, event: assistants[index] ?? { entryId: `missing-${requestId}`,
+								kind: "assistant", promptIndex: thisPrompt, at: new Date().toISOString(),
+								status: "unknown" } })));
+					}
 					promptOutcome = "completed";
 					return result;
 				} catch (error) {
+					if (!campaign) for (const { promptIndex: observedPrompt, probe, sdkSignal } of ordinaryPromptProbes) {
+						if (observedPrompt !== thisPrompt || !probe.hasTransportObservation()) continue;
+						transportDiagnostics.push(probe.failure(thisPrompt,
+							abortedByHandle ? "handle" : signal?.aborted ? "host-signal" :
+								sdkSignal?.aborted ? "sdk-signal" : null));
+					}
+					const lengthStop = campaign && currentLease && !signal?.aborted && !abortedByHandle &&
+						error instanceof HarnessError && error.code === "runner.stop" && /stopReason=length/.test(error.message)
+						? campaign.certifySettledTerminalResponse(currentLease, certifiedEffectScope) : undefined;
+					if (campaign && currentLease) campaign.failPrompt(currentLease);
 					if (abortPromise) await abortPromise;
-					if ((signal?.aborted || abortedByHandle) && !(error instanceof HarnessError && error.code === "runner.stop")) {
+					if ((signal?.aborted || abortedByHandle || sdkAssessorAborted(thisPrompt)) &&
+						!(error instanceof HarnessError && error.code === "runner.aborted")) {
 						promptOutcome = "aborted";
 						const detail = abortError ? `; SDK abort failed: ${(abortError as Error).message}` : "";
-						throw new HarnessError("runner.stop", `session ${spec.label} was aborted during prompt${detail}`);
+						throw new HarnessError("runner.aborted", `session ${spec.label} was aborted during prompt${detail}`);
 					}
-					if (signal?.aborted || abortedByHandle) promptOutcome = "aborted";
+					if (signal?.aborted || abortedByHandle || sdkAssessorAborted(thisPrompt))
+						promptOutcome = "aborted";
+					if (lengthStop) throw lengthStop;
+					const preflight = transportDiagnostics.find((item) => item.promptIndex === thisPrompt &&
+						item.wholePromptNotIssued === true && item.requestContractViolation !== undefined);
+					if (campaign && currentLease && currentRequestIds.length === 0 &&
+						campaign.requestCount(currentLease) === 0 && preflight?.requestContractViolation && certifiedEffectScope)
+						throw certifyRequestNotSent({ requestNotSent: true, noProviderRequestsInPrompt: true,
+							effectScope: certifiedEffectScope, violation: preflight.requestContractViolation,
+							messageIndex: preflight.requestContractMessageIndex ?? null });
+					if (currentRequestIds.length === 0 &&
+						!ordinaryPromptProbes.some(row => row.promptIndex === thisPrompt && row.probe.hasTransportObservation()) &&
+						!sessionManager.getEntries().some(entry => !accounted.has(entry.id) && entry.type === "message")) {
+						if (isPiCredentialStoreUnavailable(error, resolved.model.provider))
+							throw new HarnessError("runner.auth-store-unavailable",
+								"Pi credential store is unavailable before request dispatch");
+						if (isPiNoApiKeyPreflight(error, resolved.model.provider))
+							throw new HarnessError("runner.auth-preflight",
+								"Pi has no configured authentication for the selected provider before request dispatch");
+					}
+					if (campaign && transportDiagnostics.some((item) => item.promptIndex === thisPrompt))
+						throw new HarnessError("runner.stop", `session ${spec.label} provider request failed (redacted transport diagnostics available)`);
 					throw error;
 				} finally {
+				try {
 					collectUsage();
 					if (!promptEvents.some((event) => event.kind === "assistant")) {
 						const unknown: UsageEvent = { entryId: `unobserved-${ref.id}-${thisPrompt}`, kind: "assistant", promptIndex: thisPrompt, at: new Date().toISOString(), status: "unknown", costSource: "unknown", costStatus: "unknown" };
 						promptEvents.push(unknown); usageEvents.push(unknown);
 					}
-				try {
-					await appendFile(usageFile, `${JSON.stringify({ version: 1, sessionId: ref.id, promptIndex: thisPrompt, outcome: promptOutcome, events: promptEvents, summary: summarizeUsage(promptEvents) })}\n`);
+					await appendFile(usageFile, `${JSON.stringify({ version: 1, sessionId: ref.id, promptIndex: thisPrompt, outcome: promptOutcome, requestIds: currentRequestIds, events: promptEvents, summary: summarizeUsage(promptEvents) })}\n`);
+				} catch (error) {
+					if (campaign && currentLease) campaign.failPrompt(currentLease);
+					throw error;
 				} finally {
 					promptActive = false;
+					checkpointState.active = false;
+					checkpointState.completed = promptOutcome === "completed";
 					if (abortListener) signal?.removeEventListener("abort", abortListener);
 					abortListener = undefined;
 					abortPromise = undefined;
 					abortError = undefined;
-					await queueTelemetry(async () => { if (!disposed) await telemetry?.heartbeat("idle", undefined, promptOutcome); });
-					await sampleRunnerResources(spec.persistDir, "prompt-end");
+					try {
+						await queueTelemetry(async () => { if (!disposed) await telemetry?.heartbeat("idle", undefined, promptOutcome); });
+						await sampleRunnerResources(spec.persistDir, "prompt-end");
+					} catch (error) {
+						if (campaign && currentLease) campaign.failPrompt(currentLease);
+						throw error;
+					} finally {
+						ordinaryPromptProbes.length = 0;
+						currentLease = undefined;
+						currentRequestIds = [];
+						currentContextRejectedIds = new Set();
+					}
 				}
 				}
 			},
@@ -656,6 +1591,12 @@ export class PiSessionRunner implements SessionRunner {
 			readReturnEvents: () => [...materialTools.readReturns],
 			usageEvents: () => [...usageEvents],
 			usageSummary: () => summarizeUsage(usageEvents),
+			transportDiagnostics: () => transportDiagnostics.map((item) => ({ ...item,
+				errorCodes: [...item.errorCodes],
+				...(item.providerContextOverflow ? { providerContextOverflow: { ...item.providerContextOverflow } } : {}),
+				...(item.privateProviderError ? { privateProviderError: { ...item.privateProviderError,
+					numericLimits: { ...item.privateProviderError.numericLimits } } } : {}) })),
+			providerOutputRequests: () => providerOutputRequests.map(row => ({ ...row })),
 			toolLog: () => [...toolLog],
 			abort: async () => {
 				if (disposed || abortedByHandle) return;
@@ -667,6 +1608,9 @@ export class PiSessionRunner implements SessionRunner {
 			dispose: () => {
 				if (disposed) return;
 				disposed = true;
+				checkpointState.disposed = true;
+				if (this.checkpointStates.get(ref.id) === checkpointState) this.checkpointStates.delete(ref.id);
+				this.allCheckpointStates.delete(checkpointState);
 				if (abortListener) signal?.removeEventListener("abort", abortListener);
 				abortListener = undefined;
 				try { session.dispose(); }
@@ -679,6 +1623,11 @@ export class PiSessionRunner implements SessionRunner {
 		};
 		} catch (error) {
 			try { session.dispose(); } catch { /* Preserve the construction failure. */ }
+			const failedState = this.checkpointStates.get(session.sessionId);
+			if (failedState?.manager === sessionManager) {
+				this.checkpointStates.delete(session.sessionId);
+				this.allCheckpointStates.delete(failedState);
+			}
 			await telemetry?.end().catch(() => undefined);
 			throw error;
 		}

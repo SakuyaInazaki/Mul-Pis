@@ -12,11 +12,13 @@
 import { existsSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import path from "node:path";
+import { linkedEvidence, openBoundedSession } from "../context/boundary.ts";
 import { buildM06ApplicabilityMessage, buildM06CheckMessage, buildM06ReadMessage, problemBlock, section, systemPromptFor } from "../prompts.ts";
 import { renderPageTool } from "../tools/pagetool.ts";
 import { HarnessError, type InputRef, type StageRunRecord } from "../types.ts";
 import { readTextIfExists } from "../workspace.ts";
-import { loadProblemMaterials, readOutput, recordSession, relPath, sessionSpec, withRun, type StageContext } from "./context.ts";
+import { retrieveKnowledge } from "../knowledge/retrieval.ts";
+import { loadProblemMaterials, readOutput, relPath, sessionSpec, withRun, type StageContext } from "./context.ts";
 
 export interface M06Options {
 	/** Source ids under references/sources (e.g. S001). Empty means every registered source. */
@@ -68,8 +70,10 @@ async function discoverSources(ctx: StageContext, wanted?: string[]): Promise<Ar
 	return sources;
 }
 
-async function buildProjectState(ctx: StageContext, materialsBlock: string, purpose: string): Promise<{ text: string; note: string }> {
-	const pack = await ctx.store.buildPack({ purpose, includeOpenQuestions: true, types: ["C", "K", "Q", "X"], maxChars: 40_000 });
+async function buildProjectState(ctx: StageContext, materialsBlock: string, purpose: string, sourceGoals: string): Promise<{ text: string; note: string }> {
+	const selection = await retrieveKnowledge(ctx.store, { purpose, text: `${materialsBlock}\n${sourceGoals}`, types: ["C", "K", "Q", "X"], maxRecords: 32, maxChars: 40_000 });
+	if (selection.status !== "ready") throw new HarnessError("m06.knowledge", `M06 必需知识未能完整装载：${selection.omitted.map((item) => `${item.ref}:${item.reason}`).join("；")}`);
+	const pack = selection.pack;
 	let extra = "";
 	if (!pack.included.length) {
 		const m01 = await ctx.ws.latestCompletedRun("M01");
@@ -95,7 +99,7 @@ export async function runM06(ctx: StageContext, options: M06Options = {}): Promi
 		ctx,
 		record,
 		async () => {
-			const state = await buildProjectState(ctx, problemBlock(materials), purpose);
+			const state = await buildProjectState(ctx, problemBlock(materials), purpose, `${options.requirements ?? ""}\n${sources.map((source) => `${source.id} ${source.title}`).join("\n")}`);
 			await ctx.ws.writeOutput(record, "project-state.md", state.text, "本批统一使用的当前项目状态");
 			record.remarks.push(`适用性分析统一使用同一项目状态：${state.note}`);
 
@@ -134,9 +138,8 @@ async function processGroup(ctx: StageContext, record: StageRunRecord, group: M0
 			},
 		});
 	try {
-		const reader = await ctx.runner.create(sessionSpec(ctx, `M06-${group.sourceId}-reader`, "reader", systemPromptFor("reader"), { kind: "read-dir", root: group.dir, toolName: "material_read", extraTools: [pageTool()] }));
+		const reader = await openBoundedSession(ctx.runner, record, { mode: "fresh", intent: "new-work", reason: `M06 ${group.sourceId} reading starts with only this registered source and its requirements`, evidence: linkedEvidence([{ label: `来源 ${group.sourceId}`, path: group.dir }]), spec: sessionSpec(ctx, `M06-${group.sourceId}-reader`, "reader", systemPromptFor("reader"), { kind: "read-dir", root: group.dir, toolName: "material_read", extraTools: [pageTool()] }) }, () => ctx.ws.writeRun(record));
 		try {
-			recordSession(record, reader);
 			const turn = await reader.prompt(buildM06ReadMessage({ ...source, requirements: options.requirements, fullText: options.fullText ?? false }));
 			group.reading = turn.text;
 			group.readCoverage = reader.readCoverage();
@@ -148,9 +151,8 @@ async function processGroup(ctx: StageContext, record: StageRunRecord, group: M0
 			throw new HarnessError("m06.read", "阅读会话没有实际读取材料文件，也没有查看任何页面");
 		}
 
-		const checker = await ctx.runner.create(sessionSpec(ctx, `M06-${group.sourceId}-checker`, "checker", systemPromptFor("checker"), { kind: "read-dir", root: group.dir, toolName: "material_read", extraTools: [pageTool()] }));
+		const checker = await openBoundedSession(ctx.runner, record, { mode: "fresh", intent: "independent-judgment", reason: `M06 ${group.sourceId} checking is an independent session given the reader report as explicit data`, evidence: linkedEvidence([{ label: `来源 ${group.sourceId}`, path: group.dir }, ...group.outputs.filter((item) => item.label === `${group.sourceId} 阅读记录`)]), spec: sessionSpec(ctx, `M06-${group.sourceId}-checker`, "checker", systemPromptFor("checker"), { kind: "read-dir", root: group.dir, toolName: "material_read", extraTools: [pageTool()] }) }, () => ctx.ws.writeRun(record));
 		try {
-			recordSession(record, checker);
 			const turn = await checker.prompt(buildM06CheckMessage(source, group.reading));
 			group.check = turn.text;
 			group.checkCoverage = checker.readCoverage();
@@ -159,9 +161,8 @@ async function processGroup(ctx: StageContext, record: StageRunRecord, group: M0
 			checker.dispose();
 		}
 
-		const applicability = await ctx.runner.create(sessionSpec(ctx, `M06-${group.sourceId}-applicability`, "applicability", systemPromptFor("applicability"), { kind: "none" }));
+		const applicability = await openBoundedSession(ctx.runner, record, { mode: "fresh", intent: "independent-judgment", reason: `M06 ${group.sourceId} applicability uses the same frozen batch project state and explicit reading/check reports without inheriting either conversation`, evidence: linkedEvidence([...group.outputs, ...record.outputs.filter((item) => item.label === "本批统一使用的当前项目状态")]), spec: sessionSpec(ctx, `M06-${group.sourceId}-applicability`, "applicability", systemPromptFor("applicability"), { kind: "none" }) }, () => ctx.ws.writeRun(record));
 		try {
-			recordSession(record, applicability);
 			const verified = `${group.reading}\n\n${section("核对记录", group.check)}`;
 			const turn = await applicability.prompt(buildM06ApplicabilityMessage(source, verified, projectState));
 			group.applicability = turn.text;

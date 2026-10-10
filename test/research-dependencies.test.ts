@@ -4,9 +4,10 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { GenerationStore, type ExperienceRequirementV1 } from "../src/improvement/generation.ts";
-import { ResearchImprovementService } from "../src/improvement/research-service.ts";
+import { ResearchImprovementService, verifyRequiredExperience } from "../src/improvement/research-service.ts";
 import type { ResearchCampaignPlanV1 } from "../src/improvement/research-types.ts";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
+import { verifyRequiredKnowledge } from "../src/knowledge/experience-index.ts";
 import type { KnowledgeRef, KnowledgeStore, ProposalBatch } from "../src/knowledge/types.ts";
 import { FakeSessionRunner, type FakeReplyContext } from "../src/runner/fake.ts";
 import { validateResearchAction } from "../src/improvement/policy-host.ts";
@@ -59,6 +60,21 @@ function requirement(storeId: string, targetKind: "executor" | "improver"): Expe
 	return { targetKind, ref };
 }
 
+test("more than one hundred pinned refs are checked by exact store identity without rendering a pack", async (t) => {
+	const root = await mkdtemp(path.join(tmpdir(), "method-many-refs-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const storeId = "00000000-0000-4000-8000-000000000002";
+	const refs = Array.from({ length: 101 }, (_, i) => ({ storeId, recordId: `K${String(i + 1).padStart(3, "0")}`, version: 1 }));
+	const store = { storeId: async () => storeId, current: async () => ({ id: "G001" }), limits: async () => ({}),
+		get: async (id: string, version: number) => refs.some((ref) => ref.recordId === id && ref.version === version) ? { id, type: "K", version, title: id, body: "registered evidence", fields: { experience: { version: 1, targetKind: "improver", applicableStages: ["method-research"], requiredTags: ["cpu-response-identification"], excludedTags: [], requiredRefs: [] } }, refs: [], scope: [], usageDecision: "adopted" } : undefined,
+		availability: async () => ({ availability: "usable_conditionally" }) } as unknown as KnowledgeStore;
+	const registered = new Map<string, KnowledgeStore>([[storeId, store]]);
+	await verifyRequiredExperience(root, refs.map((ref) => ({ targetKind: "improver", ref })), undefined, registered);
+	await verifyRequiredKnowledge(root, refs, undefined, registered);
+	const wrongIdentity = { ...store, storeId: async () => "00000000-0000-4000-8000-000000000003" } as KnowledgeStore;
+	await assert.rejects(verifyRequiredExperience(root, refs.map((ref) => ({ targetKind: "improver", ref })), undefined, new Map([[storeId, wrongIdentity]])), /unavailable|registered|changed/);
+});
+
 /** Trusted test-state construction, not a fake scientific admission. */
 async function activateDependent(f: Awaited<ReturnType<typeof fixture>>, requirements: ExperienceRequirementV1[], kind: "executor" | "improver" = "improver") {
 	const active = (await f.generation.active())!;
@@ -78,7 +94,7 @@ test("active I requirements survive an omitted plan selection and block new call
 	const f = await fixture(t, () => { calls++; return { text: JSON.stringify({ kind: "stop", reason: "more evidence needed" }), usage }; });
 	await activateDependent(f, [requirement(f.storeId, "improver")]);
 	const first = await f.service.run(plan());
-	assert.equal(first.status, "research-only", first.stopReason);
+	assert.equal(first.status, "research-only", first.stopReason ?? "");
 	assert.equal(calls, 1, "live pinned requirements permit a new I child without repeated plan refs");
 	await apply(f.store, [{ op: "limit", target: "K001", kind: "needs_recheck", reason: "依据需要复核", authority: "test-review" }]);
 	const recheck = await f.service.run(plan());
@@ -144,7 +160,7 @@ test("a candidate saying to ignore dependencies still inherits controller-pinned
 	const required = requirement(f.storeId, "improver");
 	await activateDependent(f, [required]);
 	const result = await f.service.run(plan());
-	assert.equal(result.status, "research-only", result.stopReason);
+	assert.equal(result.status, "research-only", result.stopReason ?? "");
 	assert.ok(result.candidates.length > 0 && calls > 3);
 	const candidate = await f.generation.readStrategy(result.candidates[0]!.strategyVersionId);
 	assert.deepEqual(candidate.sourceExperienceRefs, [], "plan omitted explicit selection");
@@ -167,7 +183,7 @@ test("a live limit after the first I reply blocks the next I request in the same
 	});
 	await activateDependent(f, [requirement(f.storeId, "improver")]);
 	const result = await f.service.run(plan());
-	assert.equal(result.status, "inconclusive", result.stopReason);
+	assert.equal(result.status, "inconclusive", result.stopReason ?? "");
 	assert.equal(calls, 1);
 	assert.ok(result.feedback.some((item) => item.status === "observed" && item.observations.some((observation) => observation.source === "probe")));
 });

@@ -1,0 +1,7 @@
+# Repair control-ref independent-restart admission
+
+The first dedicated control-ref request passed its source-tree and offline-CI checks, then failed before any model call because the live restart claim still assumed the old feature branch and historical provider-step title. This batch makes the claim use the already verified current branch and recognizes the historical and current exact provider-step names while retaining job, actor, source SHA, workflow and in-progress status checks.
+
+The failed attempt retained an authenticated v3 continuation with no new provider requests or goal. A narrow carry-forward review can preserve the earlier, reviewed host-effect source and all historical uncertain amounts after verifying the zero-activity v3 chain and exact private-bundle equality to its authenticated legacy parent. The already-sealed first v3 wrapper requires that legacy encrypted carry artifact to be available for one retroactive comparison; if unavailable, recovery fails closed. Later v3 seals carry a source-and-bundle digest so the same unchanged state can remain verifiable without repeatedly retrieving the older artifact. This does not treat a truncated response, an unresolved operation, or scientific work as complete.
+
+Only synthetic offline tests were run in this change batch. No credential, private task text, provider call, workflow dispatch, commit or push was added by the repair.

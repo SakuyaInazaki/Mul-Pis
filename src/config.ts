@@ -82,7 +82,22 @@ export function validateConfig(input: unknown): HarnessConfig {
 		}
 		concurrency = obj.concurrency;
 	}
-	return { roles, ...(m03Reviewers ? { m03Reviewers } : {}), concurrency, tools };
+	let localMission: HarnessConfig["localMission"];
+	if (obj.localMission !== undefined) {
+		const policy = obj.localMission;
+		if (!policy || typeof policy !== "object" || Array.isArray(policy) ||
+			Object.keys(policy).some(key => !["execution", "evaluatorId"].includes(key)) ||
+			!Object.keys(policy).length ||
+			((policy as { execution?: unknown }).execution !== undefined &&
+				(policy as { execution?: unknown }).execution !== "task-root-bash") ||
+			((policy as { evaluatorId?: unknown }).evaluatorId !== undefined &&
+				(typeof (policy as { evaluatorId?: unknown }).evaluatorId !== "string" ||
+					!/^[A-Za-z][A-Za-z0-9._:-]{0,95}$/.test((policy as { evaluatorId: string }).evaluatorId))))
+			throw new HarnessError("config.local-mission", "localMission.execution must be task-root-bash and/or localMission.evaluatorId must be a trusted registry ID");
+		localMission = { ...policy as HarnessConfig["localMission"] };
+	}
+	return { roles, ...(m03Reviewers ? { m03Reviewers } : {}),
+		...(localMission ? { localMission } : {}), concurrency, tools };
 }
 
 export async function loadConfig(path: string): Promise<HarnessConfig> {

@@ -13,6 +13,7 @@ export interface RenderPageToolOptions {
 	/** Directory the PDF must live in and where `pages/` is created. */
 	root: string;
 	tools: ToolsConfig;
+	signal?: AbortSignal;
 	/** Called after each successful render (for coverage records). */
 	onRendered?: (info: { pdf: string; page: number; imagePath: string }) => Promise<void> | void;
 	/** Extra confinement roots (e.g. an M05 work directory) whose PDFs may also be rendered; pages go next to the PDF. */
@@ -42,7 +43,7 @@ export function renderPageTool(options: RenderPageToolOptions): CustomToolSpec {
 			if (!home) throw new HarnessError("tool.path", `只能渲染材料目录内的 PDF：${file}`);
 			if (!resolved.toLowerCase().endsWith(".pdf")) throw new HarnessError("tool.args", "只接受 .pdf 文件");
 			const outDir = options.outputDir ?? (home === roots[0] ? options.root : path.dirname(resolved));
-			const rendered = await renderPdfPage(resolved, page, outDir, options.tools);
+			const rendered = await renderPdfPage(resolved, page, outDir, options.tools, options.signal);
 			await options.onRendered?.({ pdf: resolved, page, imagePath: rendered.path });
 			return {
 				text: `已渲染 ${path.basename(resolved)} 第 ${page} 页（${rendered.dpi} dpi${rendered.reused ? "，复用已有图片" : ""}）：${path.relative(options.root, rendered.path) || rendered.path}。下面是该页图像。`,

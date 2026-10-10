@@ -12,6 +12,7 @@ export interface StageContext {
 	runner: SessionRunner;
 	store: KnowledgeStore;
 	config: HarnessConfig;
+	signal?: AbortSignal;
 }
 
 export async function loadProblemMaterials(ws: Workspace): Promise<{ materials: ProblemMaterials; inputs: InputRef[]; skipped: string[] }> {
