@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -51,7 +51,7 @@ test("a duplicate bare operation ID normalizes only against its unique qualified
 });
 
 test("failed initial task is checkpointed before finish and keeps selected prior artifacts", async t => {
-	const root = await mkdtemp(path.join(tmpdir(), "m07-failed-first-task-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "m07-failed-first-task-")));
 	t.after(async () => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(path.join(root, "workspace"));
 	const runId = "R001";
@@ -114,7 +114,7 @@ test("failed initial task is checkpointed before finish and keeps selected prior
 });
 
 test("failed fork prompt leaves parent evidence intact but cannot select across unknown operation", async t => {
-	const root = await mkdtemp(path.join(tmpdir(), "m07-failed-fork-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "m07-failed-fork-")));
 	t.after(async () => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(root);
 	await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -213,7 +213,7 @@ test("failed fork prompt leaves parent evidence intact but cannot select across 
 });
 
 test("actual cancellation replaces stale reassessment while historical timeout remains readable", async t => {
-	const root = await mkdtemp(path.join(tmpdir(), "m07-stale-boundary-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "m07-stale-boundary-")));
 	t.after(async () => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(path.join(root, "workspace"));
 	const run = await ws.startRun("M07", []);
@@ -259,7 +259,7 @@ test("actual cancellation replaces stale reassessment while historical timeout r
 });
 
 test("salvage keeps a finalized model proposal when only branch artifact names are newly visible", async t => {
-	const root = await mkdtemp(path.join(tmpdir(), "m07-finalized-proposal-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "m07-finalized-proposal-")));
 	t.after(async () => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(path.join(root, "workspace"));
 	const run = await ws.startRun("M07", []);

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, realpath, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -172,7 +172,7 @@ if (process.argv[2] === "first") {
 	await runOwner(process.argv[3]!, process.argv[4]!, process.argv[5]!, process.argv[6] === "barrier");
 } else {
 	test("two fresh owner processes race one returned evaluator recovery", async t => {
-		const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-two-owner-race-"));
+		const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "local-evaluator-two-owner-race-")));
 		t.after(() => process.env.MULPIS_TEST_KEEP_RECOVERY ? Promise.resolve() :
 			rm(root, { recursive: true, force: true }));
 		const ws = new Workspace(root);

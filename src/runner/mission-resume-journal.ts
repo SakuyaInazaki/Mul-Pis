@@ -5,8 +5,8 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, open, readFile, readdir, rename, rm } from "node:fs/promises";
-import { hostname } from "node:os";
 import path from "node:path";
+import { probeProcessIdentity, readCurrentProcessIdentity } from "../runtime/process-identity.ts";
 import { pendingActionIdentity, type ResumeIntent } from "./mission-supervisor.ts";
 import { authenticatedTerminalUnknownControlDeliveries,
 	REUSABLE_RUN_REQUEST_MESSAGE, type AuthenticatedTerminalCarryResult } from "./ledger-continuation.ts";
@@ -583,7 +583,7 @@ function supersededOldKeys(records: readonly ResumeJournalRecord[]): Set<string>
 }
 
 /** Process-local writes are serialized by an exclusive directory lock. A dead
- * owner is identified by Linux boot ID and process birth time before recovery. */
+ * owner is verified by the shared host, boot and process-birth probe. */
 export class MissionResumeJournal {
 	readonly directory: string;
 	constructor(directory: string) { this.directory = directory; }
@@ -592,25 +592,20 @@ export class MissionResumeJournal {
 		return path.join(this.directory, `${key}.json`);
 	}
 	private async owner(): Promise<{ host: string; pid: number; boot: string; start: string }> {
-		const boot = (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
-		const body = await readFile(`/proc/${process.pid}/stat`, "utf8");
-		return { host: hostname(), pid: process.pid, boot,
-			start: body.slice(body.lastIndexOf(") ") + 2).split(" ")[19] };
+		const identity = await readCurrentProcessIdentity();
+		return { host: identity.hostId, pid: identity.pid, boot: identity.bootId,
+			start: identity.processStartToken };
 	}
 	private async ownerAlive(owner: { host: string; pid: number; boot: string; start: string }): Promise<boolean> {
 		if (!Number.isSafeInteger(owner.pid) || owner.pid < 1 || !owner.boot || !owner.start ||
 			!owner.host)
 			refuse("lock owner identity is invalid");
-		if (owner.host !== hostname()) refuse("lock belongs to a different host");
-		if ((await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim() !== owner.boot)
-			return false;
-		try {
-			const body = await readFile(`/proc/${owner.pid}/stat`, "utf8");
-			return body.slice(body.lastIndexOf(") ") + 2).split(" ")[19] === owner.start;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-			throw error;
-		}
+		const current = await readCurrentProcessIdentity();
+		if (owner.host !== current.hostId) refuse("lock belongs to a different host");
+		const probe = await probeProcessIdentity({ hostId: owner.host, pid: owner.pid,
+			bootId: owner.boot, processStartToken: owner.start });
+		if (probe.status === "unknown") refuse("lock owner identity is unknown");
+		return probe.status === "alive";
 	}
 	private async lock<T>(work: () => Promise<T>): Promise<T> {
 		await privateDirectory(this.directory);

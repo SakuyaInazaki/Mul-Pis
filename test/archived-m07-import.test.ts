@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { constants, createHash, generateKeyPairSync, sign } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -97,7 +97,7 @@ function bundleForRejectedM04Transaction(): PrivateContinuationBundle {
 }
 
 async function authenticatedFixture(t: TestContext, bundle: PrivateContinuationBundle) {
-	const directory = await mkdtemp(path.join(tmpdir(), "archived-m07-import-"));
+	const directory = await realpath(await mkdtemp(path.join(tmpdir(), "archived-m07-import-")));
 	t.after(async () => rm(directory, { recursive: true, force: true }));
 	const { publicKey, privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 	const publicKeyFile = path.join(directory, "public.pem");
@@ -787,7 +787,7 @@ test("import M04 effect disposition only continues on known safe failure or comp
 });
 
 test("failed M04 with a submitted proposal blocks assessor dispatch pending reconciliation", async t => {
-	const root = await mkdtemp(path.join(tmpdir(), "m04-import-effects-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "m04-import-effects-")));
 	t.after(async () => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(root);
 	await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -839,7 +839,7 @@ test("failed M04 with a submitted proposal blocks assessor dispatch pending reco
 });
 
 test("throwing M04 leaves proposal effects unknown and fails the archived retry gate closed", async t => {
-	const root = await mkdtemp(path.join(tmpdir(), "m04-import-throw-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "m04-import-throw-")));
 	t.after(async () => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(root);
 	await mkdir(path.dirname(ws.problemFile), { recursive: true });

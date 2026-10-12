@@ -84,6 +84,8 @@ export interface StageRequest {
 
 export interface ResearchServiceOptions {
 	defaultWorkspace: string;
+	/** Host-owned, read-only observation of one unresolved M07 operation. The model never supplies a receipt. */
+	operationReconciler?: (request: HostOperationReconcileRequest, signal?: AbortSignal) => Promise<string | undefined>;
 	onProgress?: (progress: ResearchProgress) => void;
 	/** Periodic progress updates while a model prompt is still running; 0 disables. */
 	progressIntervalMs?: number;
@@ -103,6 +105,13 @@ export interface ResearchServiceOptions {
 		clearTimeout(timer: NodeJS.Timeout): void;
 	};
 	runnerFactory?: (signal: AbortSignal | undefined) => SessionRunner;
+}
+
+export interface HostOperationReconcileRequest {
+	readonly workspace: string;
+	readonly runId: string;
+	readonly operation: Readonly<{ id: string; taskId: string; issuedAt: string }>;
+	readonly task: Readonly<{ taskId: string; workDir: string; reportPath?: string }>;
 }
 
 const activeMutations = new Set<string>();
@@ -554,9 +563,51 @@ export class ResearchService {
 		});
 	}
 
+	/** Ask the configured host observer for a receipt, then apply the existing controller gate. */
+	private async reconcileUnknownOperation(root: string, runId: string, operationId: string,
+		signal?: AbortSignal): Promise<CurrentGoal> {
+		const reconciler = this.options.operationReconciler;
+		if (!reconciler) throw new HarnessError("m07.reconcile-unavailable", "没有配置独立宿主对账能力；未知操作保持阻断");
+		const controller = createM07Controller(await this.nonModelContext(root));
+		const goal = await controller.status(runId);
+		if (goal.lifecycle !== "active" || !goal.executionState)
+			throw new HarnessError("m07.operation", "目标无可对账的执行状态");
+		const operation = goal.executionState.operations.find((item) => item.id === operationId);
+		if (!operation || operation.status !== "unknown")
+			throw new HarnessError("m07.operation", "操作不存在或已完成对账");
+		const task = goal.tasks.find((item) => item.taskId === operation.taskId);
+		if (!task) throw new HarnessError("m07.operation", "未知操作缺少对应任务");
+		const request: HostOperationReconcileRequest = Object.freeze({ workspace: root, runId,
+			operation: Object.freeze({ id: operation.id, taskId: operation.taskId, issuedAt: operation.issuedAt }),
+			task: Object.freeze({ taskId: task.taskId, workDir: task.workDir,
+				...(task.reportPath ? { reportPath: task.reportPath } : {}) }) });
+		const evidencePath = await reconciler(request, signal);
+		return evidencePath ? controller.hostReconcileOperation(runId, { operationId, evidencePath }) : goal;
+	}
+
+	/** Model-callable request, but the observer and receipt are chosen only by the host. */
+	async reconcileOperation(runId: string, operationId: string, requested?: string,
+		signal?: AbortSignal): Promise<CurrentGoal> {
+		const root = this.resolveWorkspace(requested);
+		return this.withMutation(root, () => this.reconcileUnknownOperation(root, runId, operationId, signal));
+	}
+
 	async delegate(runId: string, task: TaskSpecInput, requested?: string, signal?: AbortSignal): Promise<unknown> {
 		const root = this.resolveWorkspace(requested);
 		return this.withMutation(root, async () => {
+			if (task.mode === "execute" && this.options.operationReconciler) {
+				const goal = await createM07Controller(await this.nonModelContext(root)).status(runId);
+				const confirmed: Array<{ operationId: string; taskId: string; evidencePath: string }> = [];
+				for (const operation of goal.executionState?.operations ?? []) {
+					if (operation.status !== "unknown") continue;
+					const reconciled = await this.reconcileUnknownOperation(root, runId, operation.id, signal);
+					const settled = reconciled.executionState?.operations.find((item) => item.id === operation.id);
+					if (settled?.status === "confirmed" && settled.evidencePath)
+						confirmed.push({ operationId: settled.id, taskId: settled.taskId, evidencePath: settled.evidencePath });
+				}
+				if (confirmed.length) throw new HarnessError("m07.operation-confirmed",
+					`先前外部操作已由宿主确认执行；本次未创建新执行任务。请读取对账回执并依据新事实重新决定：${JSON.stringify(confirmed)}`);
+			}
 			const value = await createM07Controller(await this.stageContext(root, "M07", signal)).delegate(runId, task);
 			await this.rememberActiveGoal(root, runId);
 			return value;

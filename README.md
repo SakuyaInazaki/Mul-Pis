@@ -1,8 +1,24 @@
 # Mul-Pis
 
-基于 Pi 的多阶段科研工作流执行与验证框架。
+基于 Pi 的多阶段科研工作流执行与验证框架。M01–M09 承载研究、执行、复核和交付，C/K/E/J/Q/D/X 知识库通过 M04 统一处理采用、纠错、替换和撤回。
 
-实现与边界见 [设计记录](docs/implementation/design.md)；独立预算策略改进入口、显式实验计划、晋级条件和未验证范围见 [首轮改进外环](docs/implementation/rsi.md)。CLI 使用 `node src/cli.ts improve status|run|rollback|export|bind --workspace <dir>`；`run` 需提供 `--plan <json>`。投影筛选本身不会晋级策略。
+## 当前工作与审阅入口
 
-有限的 H/I 科研方法开发使用独立入口：`node src/cli.ts improve research bootstrap --workspace <dir> --methods <json>`。CPU 辨识使用 `improve research run --plan <json>`；显式 M07 证据交接单槽实验使用 `improve research workflow run --plan <json>`。后者只产生本地交接机制证据，真实科学收益与多代 RSI 尚未验证。计划结构、预算与限制见 [RSI 实现说明](docs/implementation/rsi.md)；本次有界 M07 返工、显式资料与经验候选回流见 [工作流增量](docs/implementation/workflow-learning-increment.md)。
-同一入口还提供显式的 `advance-knowledge` 与 `transition-dependencies`，用于在 M04 合入后建立新知识 epoch 或按已采纳决定更新必要科学前提。M07 新目标可显式绑定专用工作流 H 槽位；这些能力的输入和限制见 [RSI 实现说明](docs/implementation/rsi.md)。
+本轮修复覆盖连续目标的执行—复核—返修循环、未知外部操作对账与恢复、知识状态和替换关系展示、M04 证据读取，以及后续新会话的 200k 自动压缩。源码、针对性回归和通用变更记录随本分支发布；具体实验配置与原始运行材料保留在实验工作区。
+
+建议按以下顺序审阅：
+
+1. [本轮修复与验证记录](.agent/notes/2026-10-13-workflow-repair-publication.md)：改动原因、代码位置、验证结果与当前能力范围。
+2. [原始工作流](workflow/v1.0/README.md)与[当前阶段对齐](docs/research/workflow-foundation.md)：研究流程的基础和当前职责。
+3. [实现设计](docs/implementation/design.md)与[上下文边界](docs/implementation/context-boundaries.md)：实际执行、知识和会话机制。
+4. [RSI 实现说明](docs/implementation/rsi.md)：已有方法改进外环、实际可修改范围及后续需要验证的能力。
+
+持续执行、审查返修和知识更新已有局部真实运行观察。完整 M01–M09 验收、知识带来的因果收益和多代架构 RSI 仍需各自的实验依据；离线工程测试与真实实验结果分别记录。
+
+## 方法改进入口
+
+预算策略改进使用 `node src/cli.ts improve status|run|rollback|export|bind --workspace <dir>`；`run` 需提供 `--plan <json>`。候选先经过投影筛选，再由成对准入实验决定是否采用。
+
+执行方法 H 和改进方法 I 使用独立入口：`node src/cli.ts improve research bootstrap --workspace <dir> --methods <json>`。CPU 辨识使用 `improve research run --plan <json>`；M07 证据交接方法实验使用 `improve research workflow run --plan <json>`。当前工作流适配器覆盖局部 reason/check 与证据交接，方法以数据化提示策略保存；工作流源码候选执行与架构自我修改闭环尚未实现。
+
+同一入口提供 `advance-knowledge` 与 `transition-dependencies`，用于在 M04 合入后建立新知识 epoch 或更新有采用依据的必要科学前提。M07 方法在新目标建立时显式绑定和冻结。参数与入口详见 [RSI 实现说明](docs/implementation/rsi.md)。

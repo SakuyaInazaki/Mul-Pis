@@ -2,6 +2,7 @@
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { ResearchService } from "../src/pi/service.ts";
@@ -236,7 +237,7 @@ async function run(): Promise<void> {
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)) {
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const mode = process.argv[2];
   if (mode === "--check") {
     process.stdout.write(JSON.stringify({ check: "offline-preflight", ok: true,

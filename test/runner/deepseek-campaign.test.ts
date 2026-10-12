@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -125,7 +125,7 @@ test("retired call counts do not stop additional accounted provider requests", a
 });
 
 test("audited campaign file tools fork into an independently bound work root without inherited provider charge", async (t) => {
-	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-fork-"));
+	const dir = await realpath(await mkdtemp(path.join(tmpdir(), "deepseek-fork-")));
 	t.after(() => rm(dir, { recursive: true, force: true }));
 	const base = path.join(dir, "tasks");
 	const parentRoot = path.join(base, "T001", "work");
@@ -180,7 +180,7 @@ test("audited campaign file tools fork into an independently bound work root wit
 });
 
 test("controller records a live-attested execution-to-confined-custom narrowing before any prompt", async (t) => {
-	const dir = await mkdtemp(path.join(tmpdir(), "deepseek-boundary-attest-"));
+	const dir = await realpath(await mkdtemp(path.join(tmpdir(), "deepseek-boundary-attest-")));
 	t.after(() => rm(dir, { recursive: true, force: true }));
 	const work = path.join(dir, "work");
 	const sessions = path.join(dir, "sessions");

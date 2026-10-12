@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFile, chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, mkdtemp, realpath, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -390,7 +390,7 @@ async function publishedReturnedFixture(t: TestContext): Promise<{
 	root: string; ws: Workspace; missionId: string; missionRoot: string;
 	journal: string; receiptFile: string; returnedBytes: Buffer;
 	knowledgeIndex: string; knowledgePack: string; checkpointBytes: Buffer; log: string }> {
-	const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-published-recovery-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "local-evaluator-published-recovery-")));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(root);
 	await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -560,7 +560,7 @@ if (process.argv[2] === "child-start") {
 	});
 
 	test("P3 recovers P2's dead delegate lock through the verified recovery claim chain", async t => {
-		const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-third-owner-lock-"));
+		const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "local-evaluator-third-owner-lock-")));
 		t.after(() => rm(root, { recursive: true, force: true }));
 		const ws = new Workspace(root);
 		await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -608,7 +608,7 @@ if (process.argv[2] === "child-start") {
 
 	test("dead returned task resumes host evaluation with an empty auxiliary candidate and no journal", async t => {
 		const localEvaluatorId = "test:empty-auxiliary-positive";
-		const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-empty-auxiliary-"));
+		const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "local-evaluator-empty-auxiliary-")));
 		t.after(() => rm(root, { recursive: true, force: true }));
 		const ws = new Workspace(root);
 		await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -676,7 +676,7 @@ if (process.argv[2] === "child-start") {
 
 	test("recovered M04 completion survives a host checkpoint interruption without replay", async t => {
 		const localEvaluatorId = "test:empty-auxiliary-m04-checkpoint-interruption";
-		const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-m04-interruption-"));
+		const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "local-evaluator-m04-interruption-")));
 		t.after(() => rm(root, { recursive: true, force: true }));
 		const ws = new Workspace(root);
 		await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -732,7 +732,7 @@ if (process.argv[2] === "child-start") {
 
 	test("recovered accepted M04 refresh binds its formal baseline to the completed run", async t => {
 		const localEvaluatorId = "test:empty-auxiliary-formal-baseline";
-		const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-m04-baseline-"));
+		const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "local-evaluator-m04-baseline-")));
 		t.after(() => rm(root, { recursive: true, force: true }));
 		const ws = new Workspace(root);
 		await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -793,7 +793,7 @@ if (process.argv[2] === "child-start") {
 			"foreign-assessor-evidence", "unknown-effect"] as const)
 			await t.test(cause, async t => {
 				const localEvaluatorId = `test:empty-auxiliary-${cause}`;
-				const root = await mkdtemp(path.join(os.tmpdir(), `local-evaluator-empty-negative-${cause}-`));
+				const root = await realpath(await mkdtemp(path.join(os.tmpdir(), `local-evaluator-empty-negative-${cause}-`)));
 				t.after(() => rm(root, { recursive: true, force: true }));
 				const ws = new Workspace(root);
 				await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -855,7 +855,7 @@ if (process.argv[2] === "child-start") {
 	});
 
 	test("a fresh process commits V4 for an exact returned evaluator without replaying the builder or evaluator", async t => {
-		const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-mission-recovery-"));
+		const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "local-evaluator-mission-recovery-")));
 		t.after(() => rm(root, { recursive: true, force: true }));
 		const ws = new Workspace(root);
 		await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -927,7 +927,7 @@ if (process.argv[2] === "child-start") {
 	});
 
 	test("opaque throw stays UNKNOWN until a later owner proves the child is dead, then permits distinct work", async t => {
-		const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-throw-recovery-"));
+		const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "local-evaluator-throw-recovery-")));
 		t.after(() => rm(root, { recursive: true, force: true }));
 		const ws = new Workspace(root);
 		await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -1007,7 +1007,7 @@ if (process.argv[2] === "child-start") {
 	});
 
 	test("an active recovery claim keeps concurrent and child-live checks on the same old checkpoint", async t => {
-		const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-claim-pending-"));
+		const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "local-evaluator-claim-pending-")));
 		t.after(() => rm(root, { recursive: true, force: true }));
 		const ws = new Workspace(root);
 		await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -1074,7 +1074,7 @@ if (process.argv[2] === "child-start") {
 	});
 
 	test("two new processes race one returned journal and only the claimed owner enters M04", async t => {
-		const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-two-process-race-"));
+		const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "local-evaluator-two-process-race-")));
 		t.after(() => rm(root, { recursive: true, force: true }));
 		const ws = new Workspace(root);
 		await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -1152,7 +1152,7 @@ if (process.argv[2] === "child-start") {
 	test("facade retries a dead V4 writer after prepare or after atomic rename", async t => {
 		for (const crashAt of ["after-prepare", "after-rename"] as const) {
 			await t.test(crashAt, async t => {
-				const root = await mkdtemp(path.join(os.tmpdir(), `local-evaluator-${crashAt}-`));
+				const root = await realpath(await mkdtemp(path.join(os.tmpdir(), `local-evaluator-${crashAt}-`)));
 				t.after(() => rm(root, { recursive: true, force: true }));
 				const ws = new Workspace(root);
 				await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -1217,7 +1217,7 @@ if (process.argv[2] === "child-start") {
 	});
 
 	test("a partial pre-entry journal becomes negative V4 evidence without an evaluator call", async t => {
-		const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-pre-entry-orphan-"));
+		const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "local-evaluator-pre-entry-orphan-")));
 		t.after(() => rm(root, { recursive: true, force: true }));
 		const ws = new Workspace(root);
 		await mkdir(path.dirname(ws.problemFile), { recursive: true });

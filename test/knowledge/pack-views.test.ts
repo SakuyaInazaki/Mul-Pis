@@ -46,6 +46,31 @@ test("buildPack honours pinned versions and reports whole-record truncation", as
 	for (const id of pack.omitted) assert(!pack.markdown.includes(`### ${id}@`));
 });
 
+test("closed question displays its structured status above preserved unresolved wording", async (t) => {
+	const { store } = await fixture(t);
+	await apply(store, { stage: "test", runId: "question", ops: [
+		{ op: "create", type: "Q", title: "边界是否成立", body: "这个问题仍未决，等待验证。" },
+	] });
+	const original = await store.get("Q001", 1);
+	await apply(store, { stage: "test", runId: "close", ops: [
+		{ op: "close_q", id: "Q001", closeReason: "shelved", reason: "暂不属于本轮问题" },
+		{ op: "limit", target: "Q001", kind: "needs_recheck", reason: "新证据前不能使用", authority: "test" },
+	] });
+	const current = await store.buildPack({ purpose: "查看问题", ids: ["Q001"], includeOpenQuestions: false });
+	assert.match(current.markdown, /### Q001@2/);
+	assert.match(current.markdown, /本版本问题状态：已关闭（原因：shelved）/);
+	assert.match(current.markdown, /关闭不代表命题已证实/);
+	assert.match(current.markdown, /版本原因：暂不属于本轮问题/);
+	assert.match(current.markdown, /替代版本：Q001@1/);
+	assert.match(current.markdown, /生效限制：needs_recheck:Q001/);
+	assert.match(current.markdown, /这个问题仍未决，等待验证。/);
+	const historical = await store.buildPack({ purpose: "查看原版", ids: ["Q001@1"], includeOpenQuestions: false });
+	assert.match(historical.markdown, /历史版本；当前发布版本 Q001@2/);
+	assert.match(historical.markdown, /本版本问题状态：开放/);
+	assert.match(historical.markdown, /生效限制：needs_recheck:Q001/);
+	assert.deepEqual(await store.get("Q001", 1), original, "closing must not rewrite the original record");
+});
+
 test("regenerateViews rebuilds current understanding, corrections, questions, limits and index", async (t) => {
 	const { dir, store } = await fixture(t);
 	await apply(store, {

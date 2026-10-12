@@ -388,7 +388,7 @@ async function validateCandidateFiles(workDir: string, expectedPaths: string[], 
 		const bytes = await readFile(deltaSource);
 		if (bytes.length > 16_000) throw new Error("candidate lesson-delta.json file exceeds 16,000 bytes");
 		const delta = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
-		if (delta.version !== 1 || !["none", "propose", "amend", "contradict"].includes(String(delta.action)) || !Array.isArray(delta.evidencePaths) || delta.evidencePaths.length > 20 || delta.evidencePaths.some((item) => typeof item !== "string" || !isSafeRelativeOutputPath(item))) throw new Error("candidate delta has invalid schema");
+		if (delta.version !== 1 || !["none", "propose", "amend", "contradict"].includes(String(delta.action)) || !Array.isArray(delta.evidencePaths) || delta.evidencePaths.some((item) => typeof item !== "string" || !isSafeRelativeOutputPath(item))) throw new Error("candidate delta has invalid schema");
 		if (delta.action !== "none" && (typeof delta.observation !== "string" || !delta.observation.trim() || typeof delta.applicability !== "string" || !delta.applicability.trim() || delta.evidencePaths.length === 0)) throw new Error("candidate delta lacks observation, applicability, or evidence");
 		if ((delta.action === "amend" || delta.action === "contradict") && (!delta.priorRef || typeof delta.priorRef !== "object" || typeof (delta.priorRef as Record<string, unknown>).storeId !== "string" || typeof (delta.priorRef as Record<string, unknown>).recordId !== "string" || !Number.isInteger((delta.priorRef as Record<string, unknown>).version))) throw new Error("candidate delta revision lacks a pinned priorRef");
 		const lessonEvidence: string[] = [];
@@ -789,7 +789,7 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string,
 		`历史记录中的轮数 ${task.executionLoop.maxRounds} 和截止时间 ${task.executionLoop.deadlineAt} 仅供审计，不是当前执行限制。同一候选可持续局部修补，直至 reviewer 给出终态判断或发生真实阻断；每轮后由全新只读 reviewer 给出反馈；只有控制器可决定是否再次提示。不得扩大任务义务、替换指南或假称 reviewer 的 ready 是最终采用。`));
 	if (task.lessonDeltaOutput) boundary.push(section("候选经验回流", `将本轮候选经验写入 ${task.lessonDeltaOutput}，JSON 格式为 {"version":1,"action":"none|propose|amend|contradict","observation":"...","hypothesis":"...","applicability":"...","evidencePaths":["本任务 work 内相对路径"]}。none 合法；不确定因果写为假设。仅修正本任务尚未入库的候选时仍用 propose；amend 或 contradict 只用于修订/反驳已存在且已固定身份的知识记录，必须加 "priorRef":{"storeId":"...","recordId":"...","version":1}，不得猜测 ID。此文件是待 M04 处理的候选，不能自称已采纳知识。`));
 	if (task.mode === "execute") boundary.push(section("外部执行与可消耗资源", `本任务控制操作 ID：${operationId ?? "旧目标无操作登记"}。若执行有真实副作用的远端动作，保存实际参数、外部请求/结果 ID、响应和可用的查询方法；在响应丢失后先查询，不能仅凭超时重发。任务级 ID 是恢复索引，只有远端明确支持时才能作为幂等键，不能声称 exactly-once。\n\n如任务涉及真实提交、评测、远程实验或其他可能消耗配额/费用/机会的动作：先用已提供的只读能力或额度接口核对接入和当前状态，并先做本地可完成的语法、类型、编译与兼容性预检。这不禁止任务已授权的真实实验，已授权平台评测/实验产生的结果属于本任务实测证据。每次真实动作都要记录实际结果和资源消耗；失败若仍消耗了资源，同样记录已消耗量、可见剩余量与恢复条件。平台配额不明时如实记录未知，不猜测统一配额。本地命令或客户端成功退出不等于远程实验通过。显式输入和原问题允许使用；若需取得新的外部研究参考资料并用于推理，将具体缺口报回主会话走 M05/M06→M04，不在 execute 任务里通过 bash 另造获取和采用链。`));
-	boundary.push("会话返回只表示任务已返回，不表示成果被主 Agent 接受。请如实列出实际动作、产物、失败、未执行项和限制。");
+	boundary.push("任务义务继承冻结目标、原成功条件和用户约束；局部 objective/checks 不得放宽它们。有界指职责、输入和操作范围，不授权自行添加尝试次数、耗时或费用停止条件。以达成为目标时，持续推进并按结果验收，不能用执行过或记录负结果替代达成。若任务本身是取证或检验，应如实返回其结果，并明确父目标仍未解决的要求。会话返回只表示内部交接，不表示原目标完成；列明实际动作、产物、失败、未执行项和限制。");
 	boundary.push("产物路径规则：expectedOutputs 必须是当前任务工作目录内的精确相对路径；说明写在 objective 或 report.md。所有实际写盘必须落在当前工作目录内，不要写到工作区根目录或绝对路径。");
 	const message = boundary.join("\n\n");
 	if (message.length + systemPromptFor(task.mode === "check" ? "reviewer" : "execution").length > policy.maxPromptChars) { event.projectionStatus = "budget-failed"; throw new HarnessError("context.budget", `M07 控制事实与允许内联内容共 ${message.length} 字符，超过 prompt 预算 ${policy.maxPromptChars}；未静默截断`); }
@@ -1165,8 +1165,9 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 					typeof fields.deadlineAt !== "string" || !Number.isFinite(Date.parse(fields.deadlineAt)))
 					throw new HarnessError("m07.loop", "invalid execution-loop policy");
 			}
+			const continuousExecution = goal.executionContract?.mode === "continuous" && spec.mode === "execute";
 			spec = { ...spec, objective: spec.objective.trim(), inputs: normalizedUnique(spec.inputs, "task input"), expectedOutputs: normalizedUnique(spec.expectedOutputs, "expected output"), checks: normalizedUnique(spec.checks, "task check"),
-				executionLoop: spec.executionLoop ? { mode: "until-ready" } : undefined };
+				executionLoop: continuousExecution || spec.executionLoop ? { mode: "until-ready" } : undefined };
 			let branchParent: M07TaskRecord | undefined;
 			let branchManifest: BranchManifestV1 | undefined;
 			if (spec.context) {
@@ -1196,7 +1197,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				if (spec.planInput !== undefined) spec.planInput = frozenInputSource(spec.planInput);
 				if (spec.resourceInputs !== undefined) spec.resourceInputs = spec.resourceInputs.map((item) =>
 					({ ...item, input: frozenInputSource(item.input) }));
-				if (JSON.stringify(spec.knowledgeIds ?? []) !== JSON.stringify(branchParent.knowledgeIds ?? []) || JSON.stringify(spec.experienceRefs ?? []) !== JSON.stringify(branchParent.experienceRefs ?? []) || JSON.stringify(spec.experienceContextRefs ?? []) !== JSON.stringify(branchParent.experienceContextRefs ?? []) || JSON.stringify(spec.experienceTags ?? []) !== JSON.stringify(branchParent.experienceTags ?? []) || JSON.stringify(spec.resourceInputs ?? []) !== JSON.stringify(branchParent.resourceInputs ?? []) || spec.planInput !== branchParent.planInput || spec.lessonDeltaOutput !== branchParent.lessonDeltaOutput || Boolean(spec.executionLoop) !== Boolean(branchParent.executionLoop)) throw new HarnessError("m07.branch", "fork cannot silently change frozen knowledge applicability, plan, resources, lesson output, or review-loop obligations");
+				if (JSON.stringify(spec.knowledgeIds ?? []) !== JSON.stringify(branchParent.knowledgeIds ?? []) || JSON.stringify(spec.experienceRefs ?? []) !== JSON.stringify(branchParent.experienceRefs ?? []) || JSON.stringify(spec.experienceContextRefs ?? []) !== JSON.stringify(branchParent.experienceContextRefs ?? []) || JSON.stringify(spec.experienceTags ?? []) !== JSON.stringify(branchParent.experienceTags ?? []) || JSON.stringify(spec.resourceInputs ?? []) !== JSON.stringify(branchParent.resourceInputs ?? []) || spec.planInput !== branchParent.planInput || spec.lessonDeltaOutput !== branchParent.lessonDeltaOutput || (!continuousExecution && Boolean(spec.executionLoop) !== Boolean(branchParent.executionLoop))) throw new HarnessError("m07.branch", "fork cannot silently change frozen knowledge applicability, plan, resources, lesson output, or review-loop obligations");
 				if (branchParent.knowledgeSnapshot !== goal.knowledgeSnapshot || branchParent.m04BaselineRunId !== goal.m04BaselineRunId) throw new HarnessError("m07.branch", "goal baseline changed since the source task; establish a new task rather than fork old authority");
 				if (branchManifest.knowledgeSnapshot !== goal.knowledgeSnapshot || branchManifest.m04BaselineRunId !== goal.m04BaselineRunId || branchManifest.problemSourcePath !== goal.problemSnapshotPath) throw new HarnessError("m07.branch", "frozen source manifest no longer matches the goal's inputs and formal baseline");
 				spec = { ...spec, parentTaskId: branchParent.taskId, supersedesTaskId: branchParent.taskId };
@@ -1343,7 +1344,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 						const reviewerRoot = path.join(dir, `round-${index}-snapshot`);
 						const reviewerSnapshotBytes = await snapshotRoundForReviewer(workDir, reviewerRoot);
 						round.reviewerSnapshotPath = reviewerRoot;
-						let reviewerPrompt = `Review only this M07 task round and the copied work-directory snapshot. Goal: ${goal.goal}\nProblem relation: ${goal.problemRelation}\nFrozen goal constraints: ${goal.constraints.join("; ")}\nFrozen success criteria: ${goal.successCriteria.join("; ")}\nGoal plan at task creation: ${goal.plan}\nTask objective: ${spec.objective}\nChecks: ${spec.checks.join("; ")}\nExpected outputs: ${spec.expectedOutputs.join("; ")}\nFrozen plan input: ${task.planCopy ? path.relative(workDir, task.planCopy) : "none"}\nThe builder report follows. Inspect the copied files only as needed. Reply with only JSON {"verdict":"ready|revise|replan|blocked","feedback":"specific evidence-grounded reason"}, without extra prose or code fences. Escape paragraph breaks inside the feedback JSON string as \\n, never raw line breaks inside quotes. Identify decisive checked files, measurements, failures and limitations. Use blocked if a material uncertainty remains. ready only means ready for the controller's separate final review. Do not change the plan or task obligations.\n\n${report}`;
+						let reviewerPrompt = `Review only this M07 task round and the copied work-directory snapshot. Goal: ${goal.goal}\nProblem relation: ${goal.problemRelation}\nFrozen goal constraints: ${goal.constraints.join("; ")}\nFrozen success criteria: ${goal.successCriteria.join("; ")}\nGoal plan at task creation: ${goal.plan}\nTask objective: ${spec.objective}\nChecks: ${spec.checks.join("; ")}\nExpected outputs: ${spec.expectedOutputs.join("; ")}\nFrozen plan input: ${task.planCopy ? path.relative(workDir, task.planCopy) : "none"}\nThe builder report follows. Inspect the copied files only as needed. Reply with only JSON {"verdict":"ready|revise|replan|blocked","feedback":"specific evidence-grounded reason"}, without extra prose or code fences. Escape paragraph breaks inside the feedback JSON string as \\n, never raw line breaks inside quotes. Identify decisive checked files, measurements, failures and limitations. Verify the substantive task objective as well as its checks against the frozen goal and constraints. Completed actions, saved files or exhausted self-imposed attempts do not satisfy an unmet attainment objective. Negative results may satisfy an observation task, but do not establish the parent goal. Use revise while work remains within this task; replan when the task definition conflicts with the frozen obligations or needs a plan change; blocked for an evidenced external impediment. ready requires the task objective and checks to be met and still needs the controller's separate final review. Do not change the plan or task obligations.\n\n${report}`;
 						if (reviewerPrompt.length + systemPromptFor("reviewer").length > policy.maxPromptChars) {
 							const handoff = await freezeBuilderReportForReviewer(report, reviewerRoot, reviewerSnapshotBytes);
 							reviewerPrompt = reviewerPrompt.slice(0, reviewerPrompt.length - report.length) + handoff;
@@ -1767,7 +1768,9 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			} else if (!['suspended', 'recovery-required'].includes(prior.state)) throw new HarnessError("m07.recovery", "旧 attempt 不能恢复");
 			frozenPolicy(goal);
 			await verifyFrozenWorkflowMethod(ctx, goal, options.registeredExperienceStores);
-			await requireCurrentFormalBaseline(ctx, goal);
+			// Recovery only binds a fresh host to the unchanged goal. A later M04 merge
+			// must remain available for an explicit plan(refreshBaseline) in that host;
+			// normal delegation still checks the current formal baseline.
 			const claimsDir = path.join(ctx.ws.runDir("M07", runId), "attempt-claims");
 			await mkdir(claimsDir, { recursive: true });
 			try { await mkdir(path.join(claimsDir, nextId)); }

@@ -647,6 +647,33 @@ test("host suspension keeps the goal open and fresh recovery uses a new attempt"
 	await assert.rejects(controller.hostRecover(goal.runId, { expectedAttemptId: "A001", runDescriptor: nextDescriptor }), /不匹配/);
 });
 
+test("fresh host recovery permits explicit baseline refresh after M04 advanced while suspended", async (t) => {
+	const f = await fixture(t);
+	const goal = await f.controller.begin(begin);
+	const frozenBaseline = goal.m04BaselineRunId;
+	const suspended = await f.controller.hostSuspend(goal.runId, { reasonKind: "provider-error", sourceEventId: "after-m04" });
+	const laterM04 = await f.ws.startRun("M04", [{ label: "later analysis", path: f.ws.problemFile }]);
+	await f.ws.finishRun(laterM04, "completed");
+	const old = suspended.executionState!.attempts[0].runDescriptor;
+	const next = { ...old, instanceId: "new-after-m04", attemptId: "A002",
+		process: { ...old.process, pid: old.process.pid + 1, processStartToken: "new-birth-after-m04" } };
+	const controller = createM07Controller(f.ctx, { probeProcess: async (identity) =>
+		identity.pid === old.process.pid ? { status: "dead", identityMatch: false, reason: "old exited" } :
+		{ status: "alive", identityMatch: true, reason: "new host" } });
+	const recovered = await controller.hostRecover(goal.runId, { expectedAttemptId: "A001", runDescriptor: next });
+	assert.equal(recovered.executionState?.activeAttemptId, "A002");
+	assert.equal(recovered.m04BaselineRunId, frozenBaseline, "recovery must not silently advance the scientific baseline");
+	assert.deepEqual(recovered.successCriteria, goal.successCriteria);
+	await assert.rejects(controller.delegate(goal.runId, { objective: "execute before refresh", inputs: [],
+		expectedOutputs: ["result.txt"], checks: ["check"], mode: "execute" }),
+		(error: unknown) => error instanceof HarnessError && error.code === "m07.baseline");
+	const refreshed = await controller.plan(goal.runId, goal.plan, { refreshBaseline: true });
+	assert.equal(refreshed.m04BaselineRunId, laterM04.runId);
+	const task = await controller.delegate(goal.runId, { objective: "execute after refresh", inputs: [],
+		expectedOutputs: ["result.txt"], checks: ["check"], mode: "execute" });
+	assert.equal(task.status, "returned");
+});
+
 test("lost execute response requires structured external query before another execute", async (t) => {
 	const f = await fixture(t);
 	const goal = await f.controller.begin(begin);

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, realpath, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -116,7 +116,7 @@ async function finiteFixture(t: TestContext, options: {
 	expectedRepairFeedbackSha256?: string; expectedEditContractSha256?: string;
 	execution?: "task-root-bash";
 } = {}) {
-	const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-finite-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "local-evaluator-finite-")));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(root);
 	await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -178,7 +178,7 @@ async function finiteFixture(t: TestContext, options: {
 				throw new DOMException("Synthetic stop after intentionally incomplete read coverage", "AbortError");
 			assert.equal(spec.tools.kind, "read-dir");
 			if (spec.tools.kind !== "read-dir") throw new Error("assessor lacks frozen evidence");
-			const readReturns = (await readEvents(spec.tools.root, "objective_evidence_read"))
+			let readReturns = (await readEvents(spec.tools.root, "objective_evidence_read"))
 				.filter(item => !options.skipProofGapRead ||
 					!item.path.startsWith("selection-proof-gap-"))
 				.filter(item => !options.skipRepairFeedbackRead ||
@@ -186,6 +186,21 @@ async function finiteFixture(t: TestContext, options: {
 				.filter(item => !options.skipCommittedKnowledgeRead ||
 					!item.path.startsWith("published-knowledge-") ||
 					item.path.endsWith("-index.json"));
+			if (options.expectTaskContract) {
+				const iteration = Number(spec.label.match(/-(\d+)$/)?.[1]);
+				const contracts = (await readdir(spec.tools.root)).filter(name =>
+					name.startsWith("host-evaluator-task-input-"));
+				const current = contracts.find(name => name.startsWith(`host-evaluator-task-input-${iteration}-`));
+				if (message.includes("# Frozen bounded evidence"))
+					assert(current && message.includes(current), "the current evaluator task contract must be required");
+				const older = contracts.filter(name => name !== current);
+				for (const name of older) {
+					if (message.includes("# Frozen bounded evidence"))
+						assert(!message.includes(name), "older task contracts must not accumulate in the prompt");
+					assert((await readFile(path.join(spec.tools.root, name))).length > 0);
+				}
+				readReturns = readReturns.filter(item => !older.includes(item.path));
+			}
 			if (options.forgeTaskContractAfterAssessment && assessorCalls === 1) {
 				const dir = path.join(ws.agentDir, "missions", missionId, "evidence");
 				const name = (await readdir(dir)).find(item => item.startsWith("host-evaluator-task-input-"));
@@ -870,7 +885,7 @@ test("partial obligations, exploratory work and open-ended objectives stay open"
 });
 
 test("two open-ended rounds select reviewed local incumbents while global optimality remains unknown", async t => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-two-round-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "local-evaluator-two-round-")));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(root);
 	await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -1098,7 +1113,7 @@ test("missing full M04 read and unresolved knowledge transaction cannot select",
 });
 
 test("a new process recovers selected bytes, M04 evidence and review before finite closure", async t => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-process-restart-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "local-evaluator-process-restart-")));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const env = { ...process.env };
 	for (const name of Object.keys(env)) if (/KEY|TOKEN|SECRET|PASSWORD/i.test(name)) delete env[name];
@@ -1252,7 +1267,7 @@ test("completed host observations reject changed, missing, extra and forged memb
 });
 
 test("real CLI start, run and resume load trusted preloader and select a host-created non-CSR observation", async t => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-cli-preload-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "local-evaluator-cli-preload-")));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(root);
 	await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -1309,7 +1324,7 @@ test("real CLI start, run and resume load trusted preloader and select a host-cr
 });
 
 test("fresh CLI resumes dispatch one settled M07/M04 at a time and hold on unknown effects", async t => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-cli-steps-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "local-evaluator-cli-steps-")));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(root);
 	await mkdir(path.dirname(ws.problemFile), { recursive: true });

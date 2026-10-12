@@ -38,7 +38,7 @@ function compareRecords(left: KnowledgeRecord, right: KnowledgeRecord): number {
 	return typeOrder(left.type) - typeOrder(right.type) || left.id.localeCompare(right.id) || left.version - right.version;
 }
 
-export function renderKnowledgeRecord(record: KnowledgeRecord, availability: AvailabilityReport, limits: Limit[]): string {
+export function renderKnowledgeRecord(record: KnowledgeRecord, availability: AvailabilityReport, limits: Limit[], latestVersion?: number): string {
 	const reasons = availability.reasons.length ? availability.reasons.join("；") : "无";
 	const activeLimits = limits.filter((limit) => limitApplies(limit, record));
 	const refs = record.refs.length ? record.refs.map((ref) => `${ref.rel} → ${ref.target}`).join("；") : "无";
@@ -46,9 +46,21 @@ export function renderKnowledgeRecord(record: KnowledgeRecord, availability: Ava
 	const limitText = activeLimits.length
 		? activeLimits.map((limit) => `${limit.kind}:${limit.target}（${limit.reason}；授权 ${limit.authority}）`).join("；")
 		: "无";
+	const versionText = latestVersion !== undefined && record.version < latestVersion
+		? `- 版本身份：历史版本；当前发布版本 ${record.id}@${latestVersion}。下列状态属于本版本，请查当前版本了解最新状态。`
+		: "- 版本身份：当前发布版本";
+	const questionText = record.type === "Q"
+		? record.qStatus?.open === false
+			? `- 本版本问题状态：已关闭（原因：${record.qStatus.closeReason ?? "未记录"}）；下方正文保留历史措辞，关闭不代表命题已证实。`
+			: "- 本版本问题状态：开放"
+		: undefined;
 	return [
 		`### ${record.id}@${record.version} ${record.title}`,
 		"",
+		versionText,
+		...(questionText ? [questionText] : []),
+		...(record.reason ? [`- 版本原因：${record.reason}`] : []),
+		...(record.supersedes ? [`- 替代版本：${record.supersedes}`] : []),
 		`- 使用决定：${record.usageDecision ?? "未记录"}`,
 		`- 依据状况：${record.evidenceStatus ?? "未记录"}`,
 		`- 当前可用性：${availability.availability}（${reasons}）`,
@@ -94,10 +106,11 @@ export async function buildKnowledgePack(query: PackQuery, state: PackState): Pr
 	}
 
 	const records = [...selected.values()].sort(compareRecords);
+	const latestVersions = new Map(state.latest.map((record) => [record.id, record.version]));
 	const rendered: Array<{ record: KnowledgeRecord; availability: AvailabilityReport; block: string }> = [];
 	for (const record of records) {
 		const availability = await state.availability(record.id, record.version);
-		rendered.push({ record, availability, block: renderKnowledgeRecord(record, availability, state.limits) });
+		rendered.push({ record, availability, block: renderKnowledgeRecord(record, availability, state.limits, latestVersions.get(record.id)) });
 	}
 
 	const header = [

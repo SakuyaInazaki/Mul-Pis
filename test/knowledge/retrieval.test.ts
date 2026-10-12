@@ -92,6 +92,17 @@ test("pinned historical arguments retain premises and warnings whose latest vers
 	assert(selection.rankedRefs.includes("J002@1"), "the original refutation must remain visible");
 });
 
+test("retrieval labels a pinned historical question and the current published version", async (t) => {
+	const store = await fixture(t);
+	await apply(store, [{ op: "create", type: "Q", title: "open question", body: "still unresolved" }]);
+	await apply(store, [{ op: "close_q", id: "Q001", closeReason: "answered", reason: "new evidence settled this scope" }]);
+	const selection = await retrieveKnowledge(store, { purpose: "historical review", text: "", requiredIds: ["Q001@1"], maxRecords: 10, maxChars: 10_000 });
+	assert.equal(selection.status, "ready");
+	assert.match(selection.pack.markdown, /历史版本；当前发布版本 Q001@2/);
+	assert.match(selection.pack.markdown, /本版本问题状态：开放/);
+	assert.match(selection.pack.markdown, /still unresolved/);
+});
+
 test("historical closure still finds an old warning beyond 2,000 tiny versions", async (t) => {
 	const store = await fixture(t);
 	const latest: KnowledgeRecord = {

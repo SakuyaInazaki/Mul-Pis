@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -34,6 +34,9 @@ test("local mission freezes authored inputs, reviews a bounded reason result, an
 		} });
 	const root = await mkdtemp(path.join(os.tmpdir(), "local-mission-workflow-"));
 	t.after(() => rm(root, { recursive: true, force: true }));
+	const canonicalRoot = await realpath(root);
+	const missionRoot = canonicalRoot.startsWith(`/private/var${path.sep}`) ?
+		canonicalRoot.slice("/private".length) : root;
 	const ws = new Workspace(root);
 	await mkdir(ws.rawDir, { recursive: true });
 	const problemBytes = Buffer.from("Synthetic original question remains open.\n", "utf8");
@@ -124,7 +127,7 @@ test("local mission freezes authored inputs, reviews a bounded reason result, an
 	const config = { roles: { research: "fake/research", execution: "fake/execution" },
 		localMission: { evaluatorId: "test:unselected-open-report" },
 		concurrency: 1, tools: {} };
-	const mission = openDefaultLocalMission({ workspaceRoot: root, runner, config });
+	const mission = openDefaultLocalMission({ workspaceRoot: missionRoot, runner, config });
 	const initial = await mission.begin({ version: 1, kind: "local-original-objective-request",
 		goal, goalSource: "verbatim-private-input", obligations: [{ id: "answer", description: obligation,
 			type: "synthetic-open" }],
@@ -174,8 +177,11 @@ test("local mission freezes authored inputs, reviews a bounded reason result, an
 	const feedbackBytes = await readFile(goalRecord.checkpoints.at(-1)!.feedbackPath);
 	assert(feedbackBytes.equals(observedReadBytes[1]!.get("prior-run-1-feedback-1.txt")!));
 	assert.equal(runner.resumed.length, 0, "M04 and both assessors used fresh sessions");
-	const reopened = openDefaultLocalMission({ workspaceRoot: root });
+	const reopened = openDefaultLocalMission({ workspaceRoot: missionRoot });
 	assert.deepEqual(await reopened.status(missionId), final);
+	assert.equal(path.isAbsolute(m04ReadRoot), true);
+	assert.equal(m04ReadRoot.startsWith(`${canonicalRoot}${path.sep}`), true);
+	assert.deepEqual(await openDefaultLocalMission({ workspaceRoot: canonicalRoot }).status(missionId), final);
 	assert.equal((await ws.listRuns("M07")).length, 1, "status never replays a bounded task");
 	const publicStatus = JSON.stringify(publicLocalMissionStatus(final));
 	assert(!publicStatus.includes(goal));

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -11,7 +11,7 @@ import { runInit } from "../src/stages/init.ts";
 import { Workspace } from "../src/workspace.ts";
 
 async function fixture(t: TestContext) {
-	const root = await mkdtemp(path.join(os.tmpdir(), "local-mission-media-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "local-mission-media-")));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(root);
 	await mkdir(ws.rawDir, { recursive: true });

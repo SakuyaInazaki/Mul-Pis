@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -26,14 +26,14 @@ test("CLI help exposes explicit M08/M09 and bounded improvement entrypoints", as
 });
 
 test("CLI improvement status is read-only and works without model configuration", async () => {
-	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-cli-improve-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-cli-improve-")));
 	const result = await capture(() => main(["improve", "status", "--workspace", root]));
 	assert.equal(result.code, 0);
 	assert.deepEqual(JSON.parse(result.output), { runs: [] });
 });
 
 test("CLI status lists M08/M09 and limitations without model config", async () => {
-	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-cli-status-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-cli-status-")));
 	await capture(() => main(["init", "--workspace", root]));
 	const result = await capture(() => main(["status", "--workspace", root]));
 	assert.equal(result.code, 0);
@@ -43,7 +43,7 @@ test("CLI status lists M08/M09 and limitations without model config", async () =
 });
 
 test("CLI goal delegate fork and select-branch use the controller with strict JSON and public control output", async () => {
-	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-cli-branch-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-cli-branch-")));
 	await mkdir(path.join(root, "problem"), { recursive: true });
 	await writeFile(path.join(root, "problem", "problem.md"), "Branch question\n");
 	await writeFile(path.join(root, "research.config.json"), JSON.stringify({ roles: { execution: "fake/execution" }, concurrency: 1 }));
@@ -89,7 +89,7 @@ test("CLI goal delegate fork and select-branch use the controller with strict JS
 });
 
 test("CLI M08 reads explicit JSON inputs and runs the real stage with the fake runner", async () => {
-	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-cli-m08-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-cli-m08-")));
 	await capture(() => main(["init", "--workspace", root]));
 	await mkdir(path.join(root, "problem", "raw"), { recursive: true });
 	await writeFile(path.join(root, "problem", "problem.md"), "CLI 审查问题\n");
@@ -107,7 +107,7 @@ test("CLI M08 reads explicit JSON inputs and runs the real stage with the fake r
 });
 
 test("CLI M09 reaches the real stage and fails closed on the generic fake report", async () => {
-	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-cli-m09-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-cli-m09-")));
 	await capture(() => main(["init", "--workspace", root]));
 	await writeFile(path.join(root, "research.config.json"), `${JSON.stringify({ roles: { execution: "fake/execution", checker: "fake/checker" }, concurrency: 1 })}\n`);
 	const ws = new Workspace(root);

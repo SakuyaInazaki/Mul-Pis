@@ -1079,20 +1079,15 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				"The prior-incomplete-run-control.json reports only host-observed request counts and unresolved effects from an earlier incomplete run. It does not attest that run's scientific results, select its candidate, or resolve an original obligation. Do not infer absent work or zero charges from missing research files."
 			] : []),
 			...(retrievableMaterials.length ? [
-				"Additional frozen history is retrievable on demand. Its locator grants no scientific evidence credit.",
+				"Additional frozen history is retrievable on demand. Use material_list to discover filenames in the granted evidence directory, then objective_evidence_read for relevant files. A filename or locator grants no scientific evidence credit.",
 				...(retrievableIndex ? ["Read prior-research-history-index.json for historical part filenames and byte order."] : []),
 				...(checkpointIndex ? ["Read prior-objective-checkpoint-index.json for the byte-exact historical checkpoint part names and order. The host already checks the current selected tuple and unresolved control state. Read historical parts only when they can affect your reasoning, and cite every historical claim using actual returned lines."] : []),
 				...(priorIndex ? [`Read ${priorIndex.indexName} for prior grounding record locators and part filenames.`] : []),
-				...(!retrievableIndex && !priorIndex ?
-					retrievableMaterials.map(item => item.lineCount === 0 ?
-						`Retrievable file: ${item.name}, empty (0 bytes; no line citation).` :
-						`Retrievable file: ${item.name}, lines 1-${item.lineCount}.`) : []),
 				"A retrievable file cited in evidenceRefs needs a complete current-session read; a retrievable source span needs its exact cited lines returned in this session. Unread retrievable files have no authority." ] : []),
 			...(grounding ? ["# Grounded assessment requirement",
 				"For sourceRefs cite registered sourceId, startLine, endLine. current-user-overrides line N is override N above. Original problem and inputs are supplied-task material; host capability claims need observed host facts. These classifications annotate claims and cannot erase the original obligation.",
 				...Object.entries(grounding.sources).filter(([name]) => name === "original-objective.json" ||
-					name === "current-user-overrides" || evidenceAccess[name] !== "retrievable" ||
-					!retrievableIndex && !priorIndex)
+					name === "current-user-overrides" || evidenceAccess[name] !== "retrievable")
 					.map(([name, source]) => source.lineCount === 0 ?
 						`${name}: ${source.kind}, empty (0 bytes; no line citation)` :
 						`${name}: ${source.kind}, lines 1-${source.lineCount}`),

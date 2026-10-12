@@ -145,14 +145,14 @@ async function wrapperRoundTrip(f: Awaited<ReturnType<typeof fixture>>) {
 	const spki = createPublicKey(pair.publicKey).export({ type: "spki", format: "der" });
 	const script = path.resolve("scripts/private_actions_transport.py");
 	const envelope = path.join(f.dir, "outcome.enc.json");
-	await run("python", [script, "encrypt", "--results", f.outputDir,
+	await run("python3", [script, "encrypt", "--results", f.outputDir,
 		"--public-key", publicKey, "--expected-spki-sha256", sha(spki),
 		"--output", envelope, "--repository", source.repository,
 		"--run-id", source.runId, "--run-attempt", String(source.runAttempt),
 		"--commit", source.commit, "--event", source.event]);
 	const parent = path.join(f.dir, "decrypted");
 	await mkdir(parent, { mode: 0o700 });
-	const { stdout } = await run("python", [script, "decrypt", "--envelope", envelope,
+	const { stdout } = await run("python3", [script, "decrypt", "--envelope", envelope,
 		"--private-key", privateKey, "--parent", parent]);
 	return { envelope: await readFile(envelope),
 		body: await readFile(path.join(stdout.trim(), INCREMENTAL_CHECKPOINT_FILE), "utf8") };

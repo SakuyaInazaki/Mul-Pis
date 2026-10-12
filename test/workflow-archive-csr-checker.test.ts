@@ -7,6 +7,7 @@ import test from "node:test";
 import { buildCsrChecker, CsrValidationError, CSR_EXPERIMENT_LIMITS, getCsrValidationDiagnostic, inspectCsrTaskContract, validateCsrCandidateSource, validateCsrTargetBodies, type CsrExperimentPlan } from "../src/workflow-archive/csr-checker.ts";
 
 // Synthetic source only. Private task inputs and strategy implementations are never fixtures.
+const linuxCompiledOnly = { skip: process.platform !== "linux" ? "compiled checker requires Linux pipe2, prctl, and /proc semantics" : false };
 const task = "Register at most toy_strategy_5; original functions are toy_strategy_1 and toy_strategy_2.";
 const plan: CsrExperimentPlan = {
 	registeredStrategies: ["toy_strategy_1", "toy_strategy_2", "toy_strategy_3"],
@@ -153,7 +154,7 @@ test("checker derives bounded registry and model-authored cases", () => {
 	assert.throws(() => buildCsrChecker(starter(), candidate(), task, { ...plan, cases: [{ ...plan.cases[0], repeats: 500 }] }));
 });
 
-test("independent checker times serial, std::thread, and every registered strategy", async t => {
+test("independent checker times serial, std::thread, and every registered strategy", linuxCompiledOnly, async t => {
 	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
 	const selections = ["serial:0", "std_thread:0", "strategy:1", "strategy:2", "strategy:3"].flatMap(selector =>
 		[1, 2].map(thread => ["--timing", "skew_a", selector, String(thread)]));
@@ -173,7 +174,7 @@ test("independent checker times serial, std::thread, and every registered strate
 	assert.ok(lines.some(line => line.includes("kind=strategy target=3 name=toy_strategy_3")));
 });
 
-test("single-strategy timing selection emits one host record after validation", async t => {
+test("single-strategy timing selection emits one host record after validation", linuxCompiledOnly, async t => {
 	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
 	const result = await compiledCheck(candidate(), ["--timing", "skew_a", "strategy:3", "2"]);
 	assert.equal(result.compile.status, 0, String(result.compile.stderr));
@@ -184,7 +185,7 @@ test("single-strategy timing selection emits one host record after validation", 
 	assert.equal(lines[1], "CSR_CHECK_PASS");
 });
 
-test("checker covers every permitted registered strategy through the task maximum", async t => {
+test("checker covers every permitted registered strategy through the task maximum", linuxCompiledOnly, async t => {
 	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
 	const all: CsrExperimentPlan = { ...plan,
 		registeredStrategies: [...plan.registeredStrategies, "toy_strategy_4", "toy_strategy_5"] };
@@ -198,7 +199,7 @@ test("checker covers every permitted registered strategy through the task maximu
 	assert.match(String(result.runs[0]?.stdout), /kind=strategy target=5 name=toy_strategy_5/);
 });
 
-test("new strategy cannot pass with stale, nonfinite, or unwritten output", async t => {
+test("new strategy cannot pass with stale, nonfinite, or unwritten output", linuxCompiledOnly, async t => {
 	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
 	for (const body of [
 		"static bool ready = false; static std::vector<double> cache; if (!ready) { toy_serial(a, x, y); cache = y; ready = true; } else y = cache;",
@@ -251,7 +252,7 @@ test("central gate preserves originals and rejects benchmark tampering and globa
 	assert.throws(() => buildCsrChecker(starter(), candidate('toy_serial(a, x, y); \\\nstd::exit(0);'), task, plan));
 });
 
-test("helper functions, local preprocessing layouts, comments and main registration edits are supported", async t => {
+test("helper functions, local preprocessing layouts, comments and main registration edits are supported", linuxCompiledOnly, async t => {
 	const helper = 'struct ToyScratch { std::vector<int> index; };\nstatic void toy_helper(const ToyCompressedRows& a, const std::vector<double>& x, std::vector<double>& y) { toy_serial(a, x, y); }\n';
 	const source = candidate('/* } static void toy_strategy_9() {} */\nconst char* label = R"tag({ // } )tag";\n(void)label; ToyScratch scratch; toy_helper(a, x, y);')
 		.replace('// TODO 1:', helper + '// TODO 1:')
@@ -266,7 +267,7 @@ test("helper functions, local preprocessing layouts, comments and main registrat
 	assert.equal(result.run?.stdout, "CSR_CHECK_PASS\n");
 });
 
-test("single-target measurement invokes no other candidate strategy and records setup", async t => {
+test("single-target measurement invokes no other candidate strategy and records setup", linuxCompiledOnly, async t => {
 	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
 	// A deliberately bad third strategy must fail the full gate but cannot contaminate a serial-only measurement.
 	const result = await compiledCheck(candidate('y[0] = std::numeric_limits<double>::infinity();'), ["--check"], plan,
@@ -282,7 +283,7 @@ test("single-target measurement invokes no other candidate strategy and records 
 	}
 });
 
-test("input mutation and output replacement fail independent verification", async t => {
+test("input mutation and output replacement fail independent verification", linuxCompiledOnly, async t => {
 	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
 	for (const body of [
 		'toy_serial(a, x, y); const_cast<ToyCompressedRows&>(a).weights[0] += 1;',
@@ -321,7 +322,7 @@ test("legacy lexical guard supplements its unchanged structural boundary", () =>
 });
 
 
-test("trusted source contains only original code and ignores worker status text as a protocol failure", async t => {
+test("trusted source contains only original code and ignores worker status text as a protocol failure", linuxCompiledOnly, async t => {
 	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
 	const generated = buildCsrChecker(starter(), candidate('const double isolated_only_marker = 1; toy_serial(a, x, y);'), task, plan);
 	assert.doesNotMatch(generated.source, /isolated_only_marker/);
@@ -348,7 +349,7 @@ test("trusted source contains only original code and ignores worker status text 
 	}
 });
 
-test("truncated raw output cannot pass parent-side comparison", async t => {
+test("truncated raw output cannot pass parent-side comparison", linuxCompiledOnly, async t => {
 	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
 	const truncated = '#include <unistd.h>\nint main() { const char ready = 82; write(1, &ready, 1); return 0; }';
 	const result = await compiledCheck(candidate(), ["--check"], plan, [], truncated);
@@ -403,7 +404,7 @@ test("forbidden token and immutable-region diagnostics retain source locations",
 	});
 });
 
-test("host parallel thread-selection and schedule clauses pass with explicit runtime caps", async t => {
+test("host parallel thread-selection and schedule clauses pass with explicit runtime caps", linuxCompiledOnly, async t => {
 	const source = candidate(`
 #ifdef _OPENMP
   const int workers = omp_get_max_threads();
@@ -432,7 +433,7 @@ test("host parallel thread-selection and schedule clauses pass with explicit run
 	assert.equal(result.runs[0].status, 0, String(result.runs[0].stderr));
 });
 
-test("OpenMP runtime cap is installed before worker startup and can coexist with explicit team requests", async t => {
+test("OpenMP runtime cap is installed before worker startup and can coexist with explicit team requests", linuxCompiledOnly, async t => {
 	if (spawnSync("g++", ["--version"]).error) { t.skip("g++ unavailable"); return; }
 	// This is a protocol/resource fixture, not an optimization strategy.
 	const source = candidate(`

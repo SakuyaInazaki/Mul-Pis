@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -43,7 +43,7 @@ async function replacePhase(dir: string, name: string, value: object): Promise<s
 }
 async function fixture(t: TestContext, form: "original" | "later" | "unrelated" = "original",
 	terminal: "returned" | "settled-failure" = "settled-failure", withM04 = false) {
-	const ws = await mkdtemp(path.join(os.tmpdir(), "host-evaluator-review-"));
+	const ws = await realpath(await mkdtemp(path.join(os.tmpdir(), "host-evaluator-review-")));
 	t.after(() => rm(ws, { recursive: true, force: true }));
 	const missionId = "mission-001", intentId = "intent-001", runId = "m07-001";
 	const taskId = "T001", operationId = "O001", checkpointId = "C001";

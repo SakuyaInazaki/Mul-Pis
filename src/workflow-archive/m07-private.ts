@@ -395,7 +395,7 @@ async function lessonState(raw: Buffer, workDir: string): Promise<PrivateM07Arch
 	try { delta = JSON.parse(raw.toString("utf8")) as Record<string, unknown>; }
 	catch { return { state: "invalid" }; }
 	if (delta.version !== 1 || !["none", "propose", "amend", "contradict"].includes(String(delta.action)) ||
-		!Array.isArray(delta.evidencePaths) || delta.evidencePaths.length > 20 ||
+		!Array.isArray(delta.evidencePaths) ||
 		delta.evidencePaths.some(item => typeof item !== "string" || !isSafeRelativeOutputPath(item)))
 		return { state: "invalid" };
 	if (delta.action === "none") return { state: "none" };

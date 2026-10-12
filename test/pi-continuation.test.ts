@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -173,8 +173,8 @@ test("failed fresh recovery never claims or suspends the old goal at shutdown", 
 	const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
 	const api = { on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, registerTool() {}, registerCommand() {}, appendEntry() {} } as unknown as ExtensionAPI;
 	createResearchExtension({ service, continuation: { workspace: "/bound", goalRunId: "g1" } })(api);
-	await assert.rejects(async () => { await handlers.get("session_start")![0]({}, { cwd: "/bound", mode: "json" }); }, /old owner alive/);
-	await handlers.get("session_shutdown")![0]({ reason: "quit" }, { cwd: "/bound", mode: "json" });
+	await assert.rejects(async () => { await handlers.get("session_start")![0]({}, { cwd: "/bound", mode: "rpc" }); }, /old owner alive/);
+	await handlers.get("session_shutdown")![0]({ reason: "quit" }, { cwd: "/bound", mode: "rpc" });
 	assert.deepEqual(calls, ["recover", "cleanup"]);
 });
 
@@ -199,6 +199,35 @@ test("ordinary continuation cannot claim a versioned goal owned by another Pi pr
 	await assert.rejects(async () => { await handlers.get("session_start")![0]({}, { cwd: "/bound", mode: "json" }); }, /不是 M07 运行中 attempt 的宿主/);
 	await handlers.get("session_shutdown")![0]({ reason: "quit" }, { cwd: "/bound", mode: "json" });
 	assert.deepEqual(calls, ["cleanup"]);
+});
+
+test("RPC fresh recovery binds a successor and keeps continuous goal guards", async t => {
+	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-rpc-recovery-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const descriptorFile = path.join(root, "run-descriptor.json");
+	await writeFile(descriptorFile, JSON.stringify({ version: 1, instanceId: "new-instance", attemptId: "pending", workspaceId: "store-1", goalRunId: "g1", codeRevision: "test", controlDir: root, process: { hostId: "test-host", bootId: "test-boot", pid: 999999, processStartToken: "test-start" } }));
+	const previousRecover = process.env.PRE_RSI_RECOVER_GOAL_RUN_ID;
+	const previousDescriptor = process.env.PRE_RSI_RUN_DESCRIPTOR_FILE;
+	process.env.PRE_RSI_RECOVER_GOAL_RUN_ID = "g1";
+	process.env.PRE_RSI_RUN_DESCRIPTOR_FILE = descriptorFile;
+	t.after(() => { if (previousRecover === undefined) delete process.env.PRE_RSI_RECOVER_GOAL_RUN_ID; else process.env.PRE_RSI_RECOVER_GOAL_RUN_ID = previousRecover; if (previousDescriptor === undefined) delete process.env.PRE_RSI_RUN_DESCRIPTOR_FILE; else process.env.PRE_RSI_RUN_DESCRIPTOR_FILE = previousDescriptor; });
+	const recovered: unknown[][] = [];
+	const old = { ...goal("active"), executionState: { version: 1, activeAttemptId: "A001", attempts: [{ id: "A001", state: "suspended" }], operations: [] } } as unknown as CurrentGoal;
+	const service = { goalStatus: async () => old, hostRecover: async (...args: unknown[]) => { recovered.push(args); return old; } } as unknown as ResearchService;
+	const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+	const tools = new Map<string, { execute: (...args: unknown[]) => Promise<unknown> }>();
+	let activeTools = ["read", "bash"];
+	const api = { on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+		registerTool(tool: { name: string; execute: (...args: unknown[]) => Promise<unknown> }) { tools.set(tool.name, tool); }, registerCommand() {}, appendEntry() {},
+		getActiveTools() { return activeTools; }, setActiveTools(names: string[]) { activeTools = names; } } as unknown as ExtensionAPI;
+	createResearchExtension({ service, continuation: { workspace: "/bound", goalRunId: "g1" } })(api);
+	const ctx = { cwd: "/bound", mode: "rpc" };
+	await handlers.get("session_start")![0]({}, ctx);
+	assert.equal(recovered.length, 1);
+	assert.equal((recovered[0][0] as { expectedAttemptId: string }).expectedAttemptId, "A001");
+	assert.equal((JSON.parse(await readFile(descriptorFile, "utf8")) as { attemptId: string }).attemptId, "A002");
+	assert.equal(activeTools.includes("bash"), false);
+	await assert.rejects(tools.get("research_goal")!.execute("finish", { action: "finish", workspace: "/bound", runId: "g1", outcome: "blocked", stopReason: "dependency_unavailable" }, undefined, undefined, ctx), /continuous/);
 });
 
 test("agent end does not queue another turn for an open goal with a suspended attempt", async () => {
@@ -245,6 +274,7 @@ test("only a successful goal begin in the enabled workspace binds a new goal", a
 		on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
 		registerTool(tool: { name: string; execute: (...args: unknown[]) => Promise<unknown> }) { tools.set(tool.name, tool); },
 		registerCommand() {}, appendEntry() {}, sendMessage(message: unknown) { queued.push(message); },
+		getActiveTools() { return []; }, setActiveTools() {},
 	} as unknown as ExtensionAPI;
 	createResearchExtension({ service, continuation: { workspace: "/bound" } })(api);
 	const ctx = { cwd: "/controller", mode: "json" };
@@ -289,7 +319,7 @@ test("public tools pass an exact checkpoint into M04 and an explicit same-goal b
 	} as unknown as ResearchService;
 	const tools = new Map<string, { execute: (...args: unknown[]) => Promise<unknown> }>();
 	const api = { on() {}, registerTool(tool: { name: string; execute: (...args: unknown[]) => Promise<unknown> }) { tools.set(tool.name, tool); },
-		registerCommand() {}, appendEntry() {} } as unknown as ExtensionAPI;
+		registerCommand() {}, appendEntry() {}, getActiveTools() { return []; }, setActiveTools() {} } as unknown as ExtensionAPI;
 	createResearchExtension({ service, continuation: { workspace: "/bound", goalRunId: "g1" } })(api);
 	const ctx = { cwd: "/controller", mode: "json" };
 	const checkpoint = await tools.get("research_goal")!.execute("cp", { action: "checkpoint", workspace: "/bound", runId: "g1", taskIds: ["T001"] }, undefined, undefined, ctx);
@@ -325,7 +355,7 @@ test("public Pi goal tool freezes real M07 contract and scientific failure canno
 		await service.init(root);
 		const tools = new Map<string, { execute: (...args: unknown[]) => Promise<unknown> }>();
 		const api = { on() {}, registerTool(tool: { name: string; execute: (...args: unknown[]) => Promise<unknown> }) { tools.set(tool.name, tool); },
-			registerCommand() {}, appendEntry() {} } as unknown as ExtensionAPI;
+			registerCommand() {}, appendEntry() {}, getActiveTools() { return []; }, setActiveTools() {} } as unknown as ExtensionAPI;
 		createResearchExtension({ service, continuation: { workspace: root } })(api);
 		const tool = tools.get("research_goal")!;
 		const ctx = { cwd: root, mode: "json" };
@@ -356,7 +386,7 @@ test("public Pi checkpoint feeds fixed M04 view and refreshes the same active go
 		await service.init(root);
 		const tools = new Map<string, { execute: (...args: unknown[]) => Promise<unknown> }>();
 		const api = { on() {}, registerTool(tool: { name: string; execute: (...args: unknown[]) => Promise<unknown> }) { tools.set(tool.name, tool); },
-			registerCommand() {}, appendEntry() {} } as unknown as ExtensionAPI;
+			registerCommand() {}, appendEntry() {}, getActiveTools() { return []; }, setActiveTools() {} } as unknown as ExtensionAPI;
 		createResearchExtension({ service, continuation: { workspace: root } })(api);
 		const ctx = { cwd: root, mode: "json" };
 		await tools.get("research_goal")!.execute("begin", { action: "begin", workspace: root, goal: "Keep a fixed objective",

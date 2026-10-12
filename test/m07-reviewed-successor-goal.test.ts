@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -11,7 +11,7 @@ import type { StageContext } from "../src/stages/context.ts";
 import { Workspace } from "../src/workspace.ts";
 
 test("reviewed reject-both goal stays partial while a linked fresh goal repairs and fulfills", async t => {
-	const root = await mkdtemp(path.join(tmpdir(), "m07-reviewed-successor-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "m07-reviewed-successor-")));
 	t.after(async () => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(root);
 	await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -125,7 +125,7 @@ test("reviewed reject-both goal stays partial while a linked fresh goal repairs 
 });
 
 test("no-fork rejected parent can feed a linked accepted goal eligible for M04", async t => {
-	const root = await mkdtemp(path.join(tmpdir(), "m07-no-fork-successor-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "m07-no-fork-successor-")));
 	t.after(async () => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(root);
 	await mkdir(path.dirname(ws.problemFile), { recursive: true });

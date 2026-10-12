@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -10,7 +10,7 @@ import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import type { KnowledgeRecord, KnowledgeStore } from "../src/knowledge/types.ts";
 
 async function syntheticM04Export(records: KnowledgeRecord[]) {
-	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-diagnostic-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-diagnostic-")));
 	const workDir = path.join(root, "work"), destination = path.join(root, "returned");
 	await mkdir(workDir);
 	const task = { taskId: "T001", workDir, status: "returned" } as M07TaskRecord;
@@ -32,7 +32,7 @@ function syntheticRecord(id: string, runId = "m04-diagnostic"): KnowledgeRecord 
 }
 
 test("private archive retains ten actual reviewed rounds without a count ceiling", async () => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-many-rounds-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-many-rounds-")));
 	try {
 		const workDir = path.join(root, "task", "work"), destination = path.join(root, "returned");
 		await mkdir(workDir, { recursive: true });
@@ -49,7 +49,7 @@ test("private archive retains ten actual reviewed rounds without a count ceiling
 });
 
 test("private M07 archive retains bounded artifacts and a pending lesson without adopting it", async () => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-test-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-test-")));
 	try {
 		const workDir = path.join(root, "task", "work"), destination = path.join(root, "returned");
 		await mkdir(workDir, { recursive: true });
@@ -78,7 +78,7 @@ test("private M07 archive retains bounded artifacts and a pending lesson without
 });
 
 test("a merged M04 archive binds the portable snapshot identity exactly", async t => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-m04-snapshot-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-m04-snapshot-")));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const workDir = path.join(root, "task", "work"), destination = path.join(root, "returned");
 	await mkdir(workDir, { recursive: true });
@@ -99,7 +99,7 @@ test("a merged M04 archive binds the portable snapshot identity exactly", async 
 });
 
 test("private M07 archive records missing lesson rather than inventing adoption", async () => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-missing-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-missing-")));
 	try {
 		const workDir = path.join(root, "work"); await mkdir(workDir);
 		await writeFile(path.join(workDir, "candidate.cpp"), "candidate\n");
@@ -113,7 +113,7 @@ test("private M07 archive records missing lesson rather than inventing adoption"
 });
 
 test("private M07 archive rejects a lesson whose evidence is missing or revision ref is unpinned", async () => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-invalid-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-invalid-")));
 	try {
 		const workDir = path.join(root, "work"); await mkdir(workDir);
 		await writeFile(path.join(workDir, "candidate.cpp"), "candidate\n");
@@ -132,7 +132,7 @@ test("private M07 archive rejects a lesson whose evidence is missing or revision
 });
 
 test("private M07 archive keeps each bounded round's source and host verification, plus structured reviewer feedback", async () => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-rounds-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-rounds-")));
 	try {
 		const workDir = path.join(root, "task", "work"), destination = path.join(root, "returned");
 		await mkdir(workDir, { recursive: true });
@@ -178,7 +178,7 @@ test("private M07 archive keeps each bounded round's source and host verificatio
 });
 
 test("private archive retains full long reviewer rationale and explicit controller decision as bounded artifacts", async () => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-review-evidence-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-review-evidence-")));
 	try {
 		const workDir = path.join(root, "task", "work"), destination = path.join(root, "returned");
 		await mkdir(workDir, { recursive: true });
@@ -212,7 +212,7 @@ test("private archive retains full long reviewer rationale and explicit controll
 });
 
 test("private review archive redacts credential values without discarding surrounding rationale", async () => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-review-redaction-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-review-redaction-")));
 	try {
 		const workDir = path.join(root, "task", "work"), destination = path.join(root, "returned");
 		await mkdir(workDir, { recursive: true });
@@ -231,7 +231,7 @@ test("private review archive redacts credential values without discarding surrou
 });
 
 test("review text beyond the private archive hard limit fails visibly instead of reporting a normal exclusion", async () => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-review-limit-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-review-limit-")));
 	try {
 		const workDir = path.join(root, "task", "work"), destination = path.join(root, "returned");
 		await mkdir(workDir, { recursive: true });
@@ -244,7 +244,7 @@ test("review text beyond the private archive hard limit fails visibly instead of
 });
 
 test("private archive rejects malformed trusted numeric measurements rather than copying advisory payloads", async () => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-bad-measurement-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-bad-measurement-")));
 	try {
 		const workDir = path.join(root, "work"), destination = path.join(root, "returned");
 		await mkdir(workDir);
@@ -261,7 +261,7 @@ test("private archive rejects malformed trusted numeric measurements rather than
 });
 
 test("private M04 export carries actual adopted record content, pinned dependencies, limits and snapshot without trusting the external archive", async () => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-knowledge-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-knowledge-")));
 	try {
 		const workDir = path.join(root, "work"), destination = path.join(root, "returned");
 		await mkdir(workDir);
@@ -306,7 +306,7 @@ test("private M04 export carries actual adopted record content, pinned dependenc
 });
 
 test("M04 export marks missing store or unsafe knowledge incomplete instead of inventing adoption", async () => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-incomplete-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-incomplete-")));
 	try {
 		const workDir = path.join(root, "work"), destination = path.join(root, "returned");
 		await mkdir(workDir);
@@ -338,7 +338,7 @@ test("M04 export marks missing store or unsafe knowledge incomplete instead of i
 });
 
 test("M04 export retains candidate, negative and limit-only published outcomes without claiming adoption", async () => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-negative-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-negative-")));
 	try {
 		const workDir = path.join(root, "work"), destination = path.join(root, "returned");
 		await mkdir(workDir);
@@ -388,7 +388,7 @@ test("M04 export retains candidate, negative and limit-only published outcomes w
 });
 
 test("M04 export passes a live adopted experience with required tags to explicit authoritative follow-on selection", async () => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-eligible-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-eligible-")));
 	try {
 		const workDir = path.join(root, "work"), destination = path.join(root, "returned");
 		await mkdir(workDir);
@@ -414,7 +414,7 @@ test("M04 export passes a live adopted experience with required tags to explicit
 });
 
 test("private M04 export retains more than 48 dependencies and all adopted experience refs", async () => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-many-experiences-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "mulpis-archive-many-experiences-")));
 	try {
 		const workDir = path.join(root, "work"), destination = path.join(root, "returned");
 		await mkdir(workDir);
@@ -591,7 +591,7 @@ test("private M04 export accepts over 100 refs and over 64 scopes within its phy
 });
 
 test("private machine feedback retains actionable failed-case diagnostics and explicit measurement semantics", async t => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "machine-feedback-archive-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "machine-feedback-archive-")));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const workDir = path.join(root, "work"), destination = path.join(root, "out");
 	await mkdir(workDir);
@@ -612,7 +612,7 @@ test("private machine feedback retains actionable failed-case diagnostics and ex
 });
 
 test("private archive retains a controller-certified partial-settled budget stop distinctly from an unknown operation", async t => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "partial-settled-archive-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "partial-settled-archive-")));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const taskDir = path.join(root, "T001"), workDir = path.join(taskDir, "work"), destination = path.join(root, "out");
 	await mkdir(workDir, { recursive: true });
@@ -635,7 +635,7 @@ test("private archive retains a controller-certified partial-settled budget stop
 });
 
 test("private archive retains a settled but truncated terminal response without claiming task completion", async t => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "terminal-response-archive-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "terminal-response-archive-")));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const taskDir = path.join(root, "T001"), workDir = path.join(taskDir, "work"), destination = path.join(root, "out");
 	await mkdir(workDir, { recursive: true });
@@ -659,7 +659,7 @@ test("private archive retains a settled but truncated terminal response without 
 });
 
 test("private archive distinguishes host-proven zero-request not-issued from a partial-settled prompt", async t => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "not-issued-archive-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "not-issued-archive-")));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const taskDir = path.join(root, "T001"), workDir = path.join(taskDir, "work"), destination = path.join(root, "out");
 	await mkdir(workDir, { recursive: true });
@@ -683,7 +683,7 @@ test("private archive distinguishes host-proven zero-request not-issued from a p
 });
 
 test("private archive carries only static host request-contract preflight controls and validates them on read", async t => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "request-contract-archive-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "request-contract-archive-")));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const taskDir = path.join(root, "T001"), workDir = path.join(taskDir, "work"), destination = path.join(root, "out");
 	await mkdir(workDir, { recursive: true });

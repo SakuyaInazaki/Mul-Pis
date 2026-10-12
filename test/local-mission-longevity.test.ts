@@ -55,7 +55,7 @@ test("default mission.run preserves an open objective through many fresh bounded
 	const issue = { id: "open-question", claim: "The original question remains unresolved",
 		status: "open", classification: "explicit-requirement", sourceRefs,
 		implication: "A distinct bounded report might supply decision-changing evidence" };
-	const runner = new FakeSessionRunner(async ({ spec }) => {
+	const runner = new FakeSessionRunner(async ({ spec, message }) => {
 		if (spec.label.startsWith("local-original-objective-")) {
 			assessorCalls++;
 			assert.equal(spec.tools.kind, "read-dir");
@@ -67,6 +67,27 @@ test("default mission.run preserves an open objective through many fresh bounded
 			if (iteration > rounds)
 				throw Object.assign(new Error("synthetic intentional assessor abort after bounded rounds"),
 					{ name: "AbortError" });
+			const names = await readdir(spec.tools.root);
+			const currentCapability = names.find(name => name.startsWith(`host-capability-${iteration}-`));
+			assert(currentCapability && message.includes(currentCapability),
+				"the current host capability must be required in this assessment");
+			const olderCapabilities = names.filter(name => /^host-capability-\d+-/.test(name) &&
+				name !== currentCapability);
+			for (const name of olderCapabilities) {
+				assert(!message.includes(name), "old capability names must not accumulate in the prompt");
+				assert((await readFile(path.join(spec.tools.root, name))).length > 0,
+					"old capability evidence remains available on demand");
+			}
+			if (iteration >= 3) {
+				const oldFeedback = names.find(name => name.startsWith("prior-run-1-feedback-"));
+				assert(oldFeedback && !message.includes(oldFeedback),
+					"older feedback stays available without growing the prompt");
+				assert((await readFile(path.join(spec.tools.root, oldFeedback))).length > 0);
+				assert.match(message, /material_list to discover filenames/);
+			}
+			const readReturns = (await readEveryFile(spec.tools.root, "objective_evidence_read"))
+				.filter(event => !olderCapabilities.includes(event.path) &&
+					Number(event.path.match(/^prior-run-(\d+)-feedback-/)?.[1] ?? iteration) >= iteration - 1);
 			const nextTask = {
 				objective: `Investigate independent avenue ${iteration}`,
 				obligationIds: ["answer"], addresses: [issue.id], adapterScope: "local-m07-reason",
@@ -80,7 +101,7 @@ test("default mission.run preserves an open objective through many fresh bounded
 				groundedAssessment: { version: 1, kind: "grounded-assessment-proposal",
 					contractId: missionId, missionStatus: "open", issues: [issue],
 					legacyOpenDetails: iteration === 1 ? [] : [issue.claim], nextTask } }),
-				readReturns: await readEveryFile(spec.tools.root, "objective_evidence_read") };
+				readReturns };
 		}
 		if (spec.label.startsWith("M07-")) return `Distinct synthetic report ${++builderCalls}`;
 		if (spec.label === "M04-research") {

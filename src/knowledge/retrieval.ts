@@ -195,7 +195,7 @@ export async function retrieveKnowledge(store: KnowledgeStore, request: Knowledg
 			if (selected.has(key(record))) continue;
 			let report = reports.get(key(record));
 			if (!report) { report = await store.availability(record.id, record.version); reports.set(key(record), report); }
-			additions.push({ record, report, block: renderKnowledgeRecord(record, report, initialLimits) });
+			additions.push({ record, report, block: renderKnowledgeRecord(record, report, initialLimits, byId.get(record.id)?.version) });
 		}
 		const addedLength = additions.reduce((sum, item) => sum + item.block.length + 1, 0);
 		if (selected.size + additions.length > request.maxRecords || renderedLength + addedLength + omissionLine(omitted).length > request.maxChars) {

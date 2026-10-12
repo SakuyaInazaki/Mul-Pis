@@ -24,6 +24,7 @@ import { writeFileAtomic } from "../workspace.ts";
 import { TelemetryWriter } from "../dashboard/telemetry.ts";
 import type { AssistantTurn, CustomToolSpec, ForkRequest, ForkWorkspaceBindingV1, ReadReturnEvent, RunnerCapabilities, SessionCheckpoint, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, TranscriptMessage, TransportFailureDiagnostic, UsageEvent } from "./types.ts";
 import { summarizeUsage, usageEventsFromEntries } from "./usage.ts";
+import { sessionCompactionPolicy, workflowCompactionExtension, workflowCompactionSettings } from "./compaction.ts";
 import { sampleRunnerResources, sessionClosed, sessionOpened } from "./resource.ts";
 import { DeepSeekCampaignBudget, type PromptLease } from "./deepseek-campaign.ts";
 import { getConfinedCampaignFileGrantDescriptor } from "./confined-campaign-files.ts";
@@ -1094,11 +1095,14 @@ export class PiSessionRunner implements SessionRunner {
 		const settingsManager = SettingsManager.inMemory(strict ?
 			{ retry: { enabled: false, provider: { maxRetries: 0 } }, compaction: { enabled: false } } :
 			ordinaryAssessor ? { retry: { enabled: false, provider: { maxRetries: 0 } } } : {});
+		const resolved = await this.resolveModel(spec);
+		const compactionPolicy = strict ? undefined : sessionCompactionPolicy(sessionManager, persistSpec);
 		const loader = new DefaultResourceLoader({
 			cwd,
 			agentDir: emptyAgentDir,
 			settingsManager,
 			noExtensions: true,
+			extensionFactories: compactionPolicy ? [{ name: "workflow-compaction", factory: workflowCompactionExtension(compactionPolicy) }] : [],
 			noSkills: true,
 			noPromptTemplates: true,
 			noThemes: true,
@@ -1107,8 +1111,7 @@ export class PiSessionRunner implements SessionRunner {
 			appendSystemPromptOverride: () => [],
 		});
 		await loader.reload();
-
-		const resolved = await this.resolveModel(spec);
+		if (compactionPolicy) settingsManager.applyOverrides({ compaction: workflowCompactionSettings(resolved.model.contextWindow, compactionPolicy) });
 		campaign?.assertResolved(resolved.model);
 		if (strict && (resolved.model.provider !== "deepseek" || resolved.model.api !== "openai-completions" ||
 			(campaign && strict.maxOutputTokens !== resolved.model.maxTokens))) {
@@ -1146,7 +1149,7 @@ export class PiSessionRunner implements SessionRunner {
 						ordinaryPromptProbes.length = 0;
 						ordinaryPromptProbes.push({ promptIndex, probe, sdkSignal: options?.signal });
 					}
-					return target.streamSimple(model, context, { ...options, maxTokens: model.maxTokens,
+					return target.streamSimple(model, context, { ...options, maxTokens: options?.maxTokens ?? model.maxTokens,
 						...(ordinaryAssessor ? { maxRetries: 0 } : {}),
 						...(probe ? { fetch: probe.fetch,
 							onResponse: async (response: Parameters<NonNullable<NonNullable<Parameters<ModelRuntime["streamSimple"]>[2]>["onResponse"]>>[0],

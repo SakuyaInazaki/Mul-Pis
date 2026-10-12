@@ -1,0 +1,5 @@
+# Pi research tool loadout correction (2026-10-12)
+
+The main research extension allowed `read`, `grep`, `find`, and `ls` through its tool-call guard, but never enabled the last three in Pi's active tool list. Pi's default list contains `read`, `bash`, `edit`, and `write`, so the research model could see blocked `bash` while the permitted listing/search tools were absent. This was observed in an actual continuation attempt and is reproducible from the local Pi SDK tool API and extension code without replaying private session material.
+
+Change the research activation path to save the current Pi active tools and expose only registered `research_*` orchestration tools plus the four allowed inspection tools. Restore the saved list on `/research off` and normal session reset. Keep the existing tool-call guard, which intentionally applies from session start, and keep the persisted goal and model-role behavior unchanged. The prechange source and tests remain recoverable in Git; no evidence, task record, or private experiment file is removed.

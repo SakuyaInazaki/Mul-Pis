@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -19,9 +19,10 @@ import { PiSessionRunner } from "../src/runner/pi.ts";
 import type { SessionRunner } from "../src/runner/types.ts";
 import type { StageContext } from "../src/stages/context.ts";
 import { Workspace } from "../src/workspace.ts";
+import { archivePrivateM07Task, loadPrivateM07Archive } from "../src/workflow-archive/m07-private.ts";
 
-async function fixture(t: TestContext, reply: FakeReplyFn) {
- const root = await mkdtemp(path.join(tmpdir(), "m07-loop-"));
+async function fixture(t: TestContext, reply: FakeReplyFn, continuous = false) {
+ const root = await realpath(await mkdtemp(path.join(tmpdir(), "m07-loop-")));
  t.after(() => rm(root, { recursive: true, force: true }));
  const ws = new Workspace(root);
  await mkdir(path.join(root, "problem"), { recursive: true });
@@ -31,7 +32,7 @@ async function fixture(t: TestContext, reply: FakeReplyFn) {
  const runner = new FakeSessionRunner(reply);
  const ctx: StageContext = {ws,store,runner,config:{roles:{execution:"fake/execution",reviewer:"fake/reviewer",research:"fake/research"},concurrency:1,tools:{}}};
  const controller = createM07Controller(ctx);
- const goal = await controller.begin({goal:"Evaluate a bounded candidate",problemRelation:"direct",constraints:["keep the plan"],successCriteria:["verified"],plan:"one candidate"});
+ const goal = await controller.begin({goal:"Evaluate a bounded candidate",problemRelation:"direct",constraints:["keep the plan"],successCriteria:["verified"],plan:"one candidate"}, continuous ? {executionContract:"continuous"} : undefined);
  const guide = path.join(root,"guide.md"); await writeFile(guide,"Guide version one\n");
  return {root,ws,store,runner,controller,goal,guide,ctx};
 }
@@ -105,6 +106,86 @@ async function offlineM07PiRunner(invalidRequest: 1 | 2): Promise<{
 	};
 	return { runner, budget, httpRequests: () => httpRequests };
 }
+
+test("continuous execution cannot return on the builder's early finish without reviewer readiness", async t => {
+ let release!: () => void;
+ const gate = new Promise<void>(resolve => { release = resolve; });
+ let continued!: () => void;
+ const enteredRepair = new Promise<void>(resolve => { continued = resolve; });
+ const f = await fixture(t, async ({spec, turnIndex}) => {
+  if (spec.tools.kind === "read-dir") {
+   const actual = await readFile(path.join(spec.tools.root,"result.txt"),"utf8");
+   return JSON.stringify({verdict:actual === "verified result" ? "ready" : "revise",feedback:`Checked result.txt: ${actual}`});
+  }
+  if (spec.tools.kind === "execution") {
+   if (turnIndex === 2) { continued(); await gate; }
+   await writeFile(path.join(spec.tools.root,"result.txt"),turnIndex === 1 ? "incomplete result" : "verified result");
+  }
+  return "Finished; return this task now.";
+ }, true);
+ const pending = f.controller.delegate(f.goal.runId,{objective:"produce a verified result",inputs:[],
+  expectedOutputs:["result.txt"],checks:["result is verified"],mode:"execute"});
+ try {
+  const first = await Promise.race([enteredRepair.then(()=>"repair"),pending.then(()=>"returned")]);
+  assert.equal(first,"repair","a normal builder finish must not bypass the controller review loop");
+  const during = await f.controller.status(f.goal.runId);
+  assert.equal(during.lifecycle,"active");
+  assert.equal(during.tasks[0].status,"running");
+  assert.deepEqual(during.tasks[0].executionLoop,{mode:"until-ready"});
+ } finally { release(); }
+ const task = await pending;
+ assert.equal(task.status,"returned",task.executionFailure);
+ assert.equal(task.loopStopReason,"ready");
+ assert.deepEqual(task.executionRounds?.map(round=>round.verdict),["revise","ready"]);
+ assert.equal(f.runner.created.filter(spec=>spec.tools.kind === "execution").length,1);
+ const result = path.join(task.workDir,"result.txt");
+ const reviewed = await f.controller.review(f.goal.runId,{taskId:task.taskId,artifacts:[result],
+  checks:[{criterion:"result is verified",result:"passed",evidence:[result]}]});
+ assert.equal(reviewed.status,"accepted");
+ assert.equal((await f.controller.status(f.goal.runId)).lifecycle,"active");
+ await assert.rejects(f.controller.finish(f.goal.runId,{outcome:"fulfilled",summary:"premature overall completion",returnPath:"user",
+  goalChecks:[{criterion:"verified",result:"failed",evidence:[result]}]}),/fulfilled/);
+});
+
+test("continuous blocked or replan handoffs preserve evidence without accepting or closing the goal", async t => {
+ for (const verdict of ["replan","blocked"] as const) await t.test(verdict,async t => {
+  const f = await fixture(t, async ({spec}) => {
+   if (spec.tools.kind === "read-dir") return JSON.stringify({verdict,feedback:"The fixed task cannot be completed with its current inputs"});
+   if (spec.tools.kind === "execution") await writeFile(path.join(spec.tools.root,"result.txt"),"retained negative observation");
+   return "Observation retained; target still unmet";
+  },true);
+  const task = await f.controller.delegate(f.goal.runId,{objective:"verify a result",inputs:[],expectedOutputs:["result.txt"],checks:["verified"],mode:"execute"});
+  assert.equal(task.loopStopReason,verdict);
+  const file = path.join(task.workDir,"result.txt");
+  const reviewed = await f.controller.review(f.goal.runId,{taskId:task.taskId,artifacts:[file],checks:[{criterion:"verified",result:"passed",evidence:[file]}]});
+  assert.equal(reviewed.status,"rejected","caller cannot turn an incomplete loop into acceptance");
+  const checkpoint = await f.controller.checkpoint(f.goal.runId);
+  assert.match(await readFile(checkpoint.feedbackPath,"utf8"),/retained negative observation/);
+  assert.equal((await f.controller.status(f.goal.runId)).lifecycle,"active");
+ });
+});
+
+test("continuous fork of a historical single-turn task gains review without rewriting its parent", async t => {
+ const f = await fixture(t,async ({spec}) => {
+  if (spec.tools.kind === "read-dir") return JSON.stringify({verdict:"ready",feedback:"Inspected result.txt"});
+  if (spec.tools.kind === "execution") await writeFile(path.join(spec.tools.root,"result.txt"),"fixed evidence");
+  return "result retained";
+ });
+ const spec = {objective:"produce fixed evidence",inputs:[],expectedOutputs:["result.txt"],checks:["inspected"],mode:"execute" as const};
+ const parent = await f.controller.delegate(f.goal.runId,spec);
+ assert.ok(parent.branchSource,parent.branchUnavailableReason);
+ assert.equal(parent.executionLoop,undefined);
+ // Existing continuous goals can contain tasks created by the old single-turn implementation.
+ const goalFile = path.join(f.ws.runDir("M07",f.goal.runId),"goal.json");
+ const old = JSON.parse(await readFile(goalFile,"utf8"));
+ old.executionContract = {version:1,mode:"continuous",frozenAt:old.createdAt};
+ await writeFile(goalFile,JSON.stringify(old));
+ const fork = await f.controller.delegate(f.goal.runId,{...spec,context:{mode:"fork",parentRunId:f.goal.runId,parentTaskId:parent.taskId,checkpointId:parent.branchSource.checkpoint.id}});
+ assert.equal(fork.status,"returned",fork.executionFailure);
+ assert.deepEqual(fork.executionLoop,{mode:"until-ready"});
+ assert.equal(fork.loopStopReason,"ready");
+ assert.equal((await f.controller.status(f.goal.runId)).tasks[0].executionLoop,undefined);
+});
 
 test("until-ready execution continues past eight rounds without a host deadline", async t => {
  const f = await fixture(t, async ({spec, turnIndex}) => {
@@ -310,7 +391,6 @@ test("final review rejects malformed lesson-delta schema and evidence paths", as
   ["unpinned amendment",JSON.stringify({version:1,action:"amend",observation:"changed",applicability:"bounded",evidencePaths:["result.txt"]}),/pinned priorRef/],
   ["unsafe evidence",JSON.stringify({version:1,action:"propose",observation:"changed",applicability:"bounded",evidencePaths:["../outside.txt"]}),/invalid schema/],
   ["missing evidence",JSON.stringify({version:1,action:"propose",observation:"changed",applicability:"bounded",evidencePaths:["missing.txt"]}),/invalid or missing/],
-  ["too many evidence paths",JSON.stringify({version:1,action:"propose",observation:"changed",applicability:"bounded",evidencePaths:Array(21).fill("result.txt")}),/invalid schema/],
  ];
  for (const [name,delta,reason] of cases) {
   await t.test(name,async t => {
@@ -322,6 +402,29 @@ test("final review rejects malformed lesson-delta schema and evidence paths", as
    assert.match(reviewed.review?.failures.join("; ")??"",reason);
   });
  }
+});
+
+test("24 real lesson evidence files pass delegation, review, and private archive", async t => {
+ const evidencePaths=Array.from({length:24},(_,index)=>`evidence-${String(index+1).padStart(2,"0")}.txt`);
+ const f=await fixture(t,async ({spec})=>{
+  if(spec.tools.kind==="execution"){
+   await writeFile(path.join(spec.tools.root,"result.txt"),"candidate\n");
+   for(const name of evidencePaths) await writeFile(path.join(spec.tools.root,name),`${name}\n`);
+   await writeFile(path.join(spec.tools.root,"lesson-delta.json"),JSON.stringify({version:1,action:"propose",observation:"bounded result",applicability:"this case",evidencePaths}));
+  }
+  return "candidate";
+ });
+ const task=await f.controller.delegate(f.goal.runId,{objective:"candidate",inputs:[],expectedOutputs:["result.txt","lesson-delta.json"],lessonDeltaOutput:"lesson-delta.json",checks:["checked"],mode:"execute"});
+ assert.equal(task.status,"returned");
+ const result=path.join(task.workDir,"result.txt");
+ const reviewed=await f.controller.review(f.goal.runId,{taskId:task.taskId,checks:[{criterion:"checked",result:"passed",evidence:[result]}],artifacts:[result]});
+ assert.equal(reviewed.status,"accepted",reviewed.review?.failures.join("; ")??"");
+ const goal=await f.controller.status(f.goal.runId);
+ const destination=path.join(f.root,"private-archive");
+ const archived=await archivePrivateM07Task({goal,task:goal.tasks.find(item=>item.taskId===task.taskId)!,destination});
+ assert.equal(archived.lesson.state,"pending-m04");
+ assert.deepEqual(archived.lesson.evidencePaths,evidencePaths);
+ assert.deepEqual((await loadPrivateM07Archive(destination)).archive.lesson.evidencePaths,evidencePaths);
 });
 
 test("ready reviewer cannot approve candidate changed afterward", async t => {

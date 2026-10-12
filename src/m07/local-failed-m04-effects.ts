@@ -85,7 +85,7 @@ export async function pairedHistoricalToolTranscript(task: M07TaskRecord): Promi
 			const stream = handle.createReadStream({ autoClose: false });
 			const contentHash = createHash("sha256");
 			let readBytes = 0;
-			stream.on("data", (chunk: Buffer) => { contentHash.update(chunk); readBytes += chunk.length; });
+			stream.on("data", chunk => { contentHash.update(chunk); readBytes += Buffer.byteLength(chunk); });
 			const lines = createInterface({ input: stream, crlfDelay: Infinity });
 			let headerSeen = false;
 			let messageSeen = false;

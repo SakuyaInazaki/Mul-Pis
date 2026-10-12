@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -11,7 +11,7 @@ import type { StageContext } from "../src/stages/context.ts";
 import { Workspace } from "../src/workspace.ts";
 
 async function fixture(t: TestContext, unsafeFile = false, pauseExecution?: () => Promise<void>, extraFiles = 0) {
-	const root = await mkdtemp(path.join(tmpdir(), "m07-branches-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "m07-branches-")));
 	t.after(async () => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(root);
 	await mkdir(path.dirname(ws.problemFile), { recursive: true });

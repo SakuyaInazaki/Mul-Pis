@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, truncate, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -53,7 +53,7 @@ async function fixture(t: TestContext, link: "committed" | "missing" | "mission-
 	mixed = false, oldHost?: ProcessIdentityV1) {
 	const owner1 = oldHost ? { ...p1, hostId: oldHost.hostId, bootId: oldHost.bootId } : p1;
 	const owner2 = oldHost ? { ...p2, hostId: oldHost.hostId, bootId: oldHost.bootId } : p2;
-	const root = await mkdtemp(path.join(os.tmpdir(), "local-interrupted-review-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "local-interrupted-review-")));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(root);
 	await mkdir(path.join(ws.agentDir, "missions"), { recursive: true, mode: 0o700 });

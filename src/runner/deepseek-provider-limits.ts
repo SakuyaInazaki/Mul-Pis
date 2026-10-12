@@ -54,8 +54,9 @@ export async function verifyDeepSeekProviderOutputLimit(input: { apiKey: string;
 	let response: Response;
 	try {
 		response = await (input.request ?? fetch)(MODELS_ENDPOINT, {
-			method: "GET", redirect: "error", cache: "no-store", signal: AbortSignal.timeout(10_000),
-			headers: { Authorization: `Bearer ${input.apiKey}`, Accept: "application/json" },
+			method: "GET", redirect: "error", signal: AbortSignal.timeout(10_000),
+			headers: { Authorization: `Bearer ${input.apiKey}`, Accept: "application/json",
+				"Cache-Control": "no-cache", Pragma: "no-cache" },
 		});
 	} catch { return fail("DeepSeek model-limit verification was unavailable"); }
 	if (!response.ok) fail(`DeepSeek model-limit verification failed with HTTP ${response.status}`);

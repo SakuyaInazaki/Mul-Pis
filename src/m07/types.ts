@@ -40,7 +40,7 @@ export interface TaskSpecInput {
 	planInput?: string;
 	/** Explicit versioned external references, each already present in inputs. Never discovered globally. */
 	resourceInputs?: Array<{ id: string; version: string; input: string }>;
-	/** Opt-in reviewed repair in one live execution session. Legacy bounded fields are historical input compatibility only. No process-restart replay. */
+	/** Continuous goals enforce reviewed repair for execute tasks; opt-in for other goals. Legacy bounded fields are historical input compatibility only. No process-restart replay. */
 	executionLoop?: { mode: "until-ready" } | { maxRounds: number; deadlineAt: string };
 	/** Expected JSON output carrying a candidate lesson to M04, never an adopted record. */
 	lessonDeltaOutput?: string;

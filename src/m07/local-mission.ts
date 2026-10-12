@@ -2,7 +2,7 @@
  * host adapter; this path binds the existing assessor and M07/M04 stages to a
  * private, durable filesystem host without choosing a scientific conclusion. */
 import { createHash, randomUUID } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, realpathSync } from "node:fs";
 import { lstat, mkdir, open, readFile, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { createFileKnowledgeStore, serialiseRecord } from "../knowledge/store.ts";
@@ -125,7 +125,7 @@ async function parseProgress(bytes: Buffer | undefined, missionId: string): Prom
 export function openDefaultLocalMission(input: { workspaceRoot: string;
 	runner?: SessionRunner; config?: HarnessConfig; startOnly?: boolean;
 	releaseOnReturn?: boolean }) {
-	const ws = new Workspace(input.workspaceRoot);
+	const ws = new Workspace(realpathSync(input.workspaceRoot));
 	const releasedStarts = new Set<string>();
 	const releasedReturns = new Set<string>();
 	const rootFor = (missionId: string) => path.join(ws.agentDir, "missions", missionId);
@@ -1699,11 +1699,15 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 					.filter(name => !repairFeedbackNames.has(name))
 					.map(name => [name, "retrievable" as const]).concat(
 						committedKnowledge && !repairFeedbackNames.size ?
-							committedKnowledge.partNames.map(name => [name, "retrievable" as const]) : [])),
+							committedKnowledge.partNames.map(name => [name, "retrievable" as const]) : [],
+						previousCapabilities.filter(name => name !== path.basename(capabilityFile))
+							.map(name => [name, "retrievable" as const]),
+						previousTaskContracts.filter(name => name !== taskContractEvidenceName)
+							.map(name => [name, "retrievable" as const]))),
 					evidenceRequirements: { requiredNames: original.filter(item =>
 						item.name.startsWith("original-") || materialNames.has(item.name) ||
 					repairFeedbackNames.has(item.name) ||
-					(repairFeedbackNames.size > 0 && item.name === taskContractEvidenceName) ||
+						item.name === taskContractEvidenceName ||
 					item.name === committedKnowledge?.indexName ||
 					(repairFeedbackNames.size > 0 && committedKnowledge?.partNames.includes(item.name)) ||
 						selectionProofGapNames.includes(item.name) ||

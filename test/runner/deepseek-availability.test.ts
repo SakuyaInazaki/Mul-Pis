@@ -17,7 +17,8 @@ test("availability is branded only after an actual fixed read-only provider bala
 		assert.equal(String(target), "https://api.deepseek.com/user/balance");
 		assert.equal(init?.method, "GET");
 		assert.equal(init?.redirect, "error");
-		assert.equal(init?.cache, "no-store");
+		assert.equal(new Headers(init?.headers).get("Cache-Control"), "no-cache");
+		assert.equal(new Headers(init?.headers).get("Pragma"), "no-cache");
 		assert.equal(new Headers(init?.headers).get("Authorization"), `Bearer ${KEY}`);
 		assert.equal(new Headers(init?.headers).get("Accept"), "application/json");
 		assert.ok(init?.signal);

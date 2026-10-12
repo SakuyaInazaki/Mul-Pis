@@ -925,27 +925,28 @@ test("merge exception leaves durable merge intent and does not retry in the mode
 	assert.equal([...fake.sessions.values()].find(item => item.spec.label === "M04-research")?.turns, 1);
 });
 
-test("M04 rejects an adopted proposal before merge when a required read tool reports an error", async t => {
+test("M04 repairs a wrong-path read error before accepting any proposal", async t => {
 	const f = await fixture(t);
 	const proposal = `\`\`\`knowledge-proposals\n${JSON.stringify([
 		{ op: "create", type: "K", title: "Synthetic method", body: "Bounded synthetic method", usageDecision: "adopted" },
 	])}\n\`\`\``;
-	const fake = new FakeSessionRunner(({ turnIndex }) => ({ text: proposal,
-		readReturns: turnIndex === 1 ? returnedRanges(f.relative, true) : [{
-			toolName: "m07_evidence_read", status: "error", path: f.relative[0], requested: {},
+	const fake = new FakeSessionRunner(({ turnIndex, message }) => {
+		if (turnIndex === 1) return { text: proposal, readReturns: [{
+			toolName: "m07_evidence_read", status: "error", path: "missing-evidence.txt", requested: {},
 			returned: { kind: "unknown" }, at: new Date().toISOString(),
-		}] }));
+		}] };
+		for (const name of f.relative) assert.ok(message.includes(name));
+		return { text: "No supported proposal after reading the actual frozen files.",
+			readReturns: returnedRanges(f.relative) };
+	});
 	f.ctx.runner = fake;
 	const snapshot = await f.store.current();
-	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId }, freshSession: true,
-		requiredM07ReadPaths: f.relative }), /not returned.*full/);
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId }, freshSession: true,
+		requiredM07ReadPaths: f.relative });
 	assert.equal((await f.store.current())?.id, snapshot?.id);
-	const runs = await f.ws.listRuns("M04");
-	const records = await Promise.all(runs.map(id => f.ws.readRun("M04", id)));
-	const attempt = records.find(record => record.outputs.some(item => item.label === "M07 回流证据实际访问范围"));
-	assert.ok(attempt);
-	assert.equal(attempt.status, "failed");
-	assert.equal(attempt.outputs.some(item => item.label === "知识提案"), false);
+	assert.equal(result.record.status, "completed");
+	assert.equal(result.proposalId, undefined);
+	assert.equal([...fake.sessions.values()].find(item => item.spec.label === "M04-research")?.turns, 2);
 });
 
 test("M04 repairs a typed EOF overshoot in the same session and requires the actual missing lines", async t => {
@@ -989,29 +990,39 @@ test("M04 repairs a typed EOF overshoot in the same session and requires the act
 	assert.equal(coverage.returnedRanges[0].error.kind, "offset-beyond-eof");
 });
 
-test("M04 fails closed on a forged EOF line count instead of prompting repair", async t => {
+test("M04 corrects an inaccurate EOF report using the frozen file's actual line count", async t => {
 	const f = await fixture(t);
-	const fake = new FakeSessionRunner(() => ({ text: "Provisional judgment", readReturns: [{
-		toolName: "m07_evidence_read", status: "error", path: f.relative[0],
-		requested: { offset: 695 }, returned: { kind: "unknown" },
-		error: { kind: "offset-beyond-eof", lineCount: 424 }, at: new Date().toISOString(),
-	}] }));
+	const fake = new FakeSessionRunner(({ turnIndex, message }) => {
+		if (turnIndex === 1) return { text: "Provisional judgment", readReturns: [{
+			toolName: "m07_evidence_read", status: "error", path: f.relative[0],
+			requested: { offset: 695 }, returned: { kind: "unknown" },
+			error: { kind: "offset-beyond-eof", lineCount: 424 }, at: new Date().toISOString(),
+		}] };
+		assert.match(message, /2 actual lines/);
+		assert.doesNotMatch(message, /424 actual lines/);
+		return { text: "No proposal after reading the actual two-line files.",
+			readReturns: returnedRanges(f.relative) };
+	});
 	f.ctx.runner = fake;
-	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
-		freshSession: true, requiredM07ReadPaths: f.relative }), /read tool reported an error/);
-	assert.equal([...fake.sessions.values()][0]?.turns, 1);
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative });
+	assert.equal(result.record.status, "completed");
+	assert.equal(result.proposalId, undefined);
+	assert.equal([...fake.sessions.values()][0]?.turns, 2);
 });
 
-test("M04 stops on an unresolved reader error even after full required returns", async t => {
+test("M04 completes after full required returns despite an extra failed read", async t => {
 	const f = await fixture(t);
-	const fake = new FakeSessionRunner(() => ({ text: "Provisional judgment",
+	const fake = new FakeSessionRunner(() => ({ text: "No supported knowledge proposal.",
 		readReturns: [...returnedRanges(f.relative), {
 			toolName: "m07_evidence_read", status: "error", path: "<unresolved>",
 			requested: { offset: 695 }, returned: { kind: "unknown" }, at: new Date().toISOString(),
 		}] }));
 	f.ctx.runner = fake;
-	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
-		freshSession: true, requiredM07ReadPaths: f.relative }), /read tool reported an error/);
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+		freshSession: true, requiredM07ReadPaths: f.relative });
+	assert.equal(result.record.status, "completed");
+	assert.equal(result.proposalId, undefined);
 	assert.equal([...fake.sessions.values()][0]?.turns, 1);
 });
 

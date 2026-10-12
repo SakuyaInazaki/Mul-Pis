@@ -57,7 +57,8 @@ async function activeGroupMembers(pgid: number): Promise<number[]> {
 
 for (const scenario of ["foreground", "background", "unknown-operation", "result-before-call",
 	"duplicate-call", "orphan-result", "ancestor-session"] as const)
-test(`live returned execute task ${scenario} after failed M04`, async t => {
+test(`live returned execute task ${scenario} after failed M04`,
+	{ skip: scenario === "background" && process.platform !== "linux" ? "background process-group census requires Linux /proc" : false }, async t => {
 	const background = scenario === "background";
 	const evaluatorId = `test:live-execute-m04-${scenario}`;
 	registerTrustedLocalMissionEvaluator({ id: evaluatorId, version: "1",

@@ -594,7 +594,6 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			try {
 				if (feedback.m07) await markFeedbackAssembled(ctx.ws, feedback.m07.runId, feedback.inputs[0].path, record.runId);
 				let request = finalMessage;
-				let readEventCursor = 0;
 				let promptAttempt = 0;
 				const captureInvalidJudgment = async (rawResponse: string,
 					validation: M04InvalidJudgmentEvent["validation"], gaps: M07ReadGap[] = []): Promise<void> => {
@@ -676,7 +675,6 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 					currentStrategy = "fresh-context";
 					observedContextFailures.clear();
 					observedContextFailures.add(failureFingerprint);
-					readEventCursor = 0;
 					promptAttempt = 0;
 					acceptedReceipt = undefined;
 					extracted = undefined;
@@ -691,27 +689,13 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 					if (feedback.m07 && requiredM07Paths.length) {
 						await requireFrozenM07Bindings();
 						const returned = handle.readReturnEvents();
-						const newReadEvents = returned.slice(readEventCursor);
-						readEventCursor = returned.length;
 						const gaps = await m07ReadGaps(feedback.m07.rootDir, requiredM07Paths, returned);
-						const readToolErrors = newReadEvents.filter(item => item.toolName === "m07_evidence_read" &&
-							item.status === "error");
-						const unrecoverableReadToolError = readToolErrors.some(item => {
-							const gap = gaps.find(gap => gap.relative === item.path);
-							return !gap || item.error?.kind !== "offset-beyond-eof" ||
-								item.error.lineCount !== gap.lineCount ||
-								!Number.isSafeInteger(item.requested.offset) || item.requested.offset! <= gap.lineCount;
-						});
-						if (gaps.length || unrecoverableReadToolError) {
+						if (gaps.length) {
 							await captureInvalidJudgment(turn.text, {
 								code: "m04.m07-evidence",
-							message: unrecoverableReadToolError
-									? "required selected M07 evidence was not returned in full because its read tool reported an error"
-									: "required selected M07 evidence was not returned to the research session in full",
-							path: gaps[0]?.relative ?? readToolErrors[0]!.path, detail: { gaps, readToolErrors },
+								message: "required selected M07 evidence was not returned to the research session in full",
+								path: gaps[0]!.relative, detail: { gaps },
 							}, gaps);
-						if (unrecoverableReadToolError)
-								throw new HarnessError("m04.m07-evidence", "required selected M07 evidence was not returned in full because its read tool reported an error");
 							const guidance = ["Your M04 judgement is provisional. The host has not verified full m07_evidence_read returns for every required selected M07 file, so no knowledge proposal can be accepted yet.",
 							"Next missing returned range for each file (one-based lines; the host will recalculate further gaps after your next read):",
 							...gaps.map(gap => `- ${gap.relative}: ${gap.lineCount} actual lines; ${gap.emptyFile ? "empty file needs an untruncated no-content text return without a line range" : gap.missingRanges.length ? `${gap.missingRanges[0].start}-${gap.missingRanges[0].end}; ${gap.missingRanges.length - 1} further gaps remain` : "all lines returned"}${gap.terminalPageMissing ? "; an untruncated final page is also required" : ""}`),

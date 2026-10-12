@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -13,7 +13,7 @@ import { Workspace } from "../src/workspace.ts";
 import { config, retryUnissued, seedUnissued } from "./fixtures/local-mission-unissued-step.ts";
 
 async function fixture(t: TestContext, inChild = false, declaredMaterials = false) {
-	const root = await mkdtemp(path.join(tmpdir(), "mission-unissued-assessment-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "mission-unissued-assessment-")));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const script = path.join(import.meta.dirname, "fixtures", "local-mission-unissued-step.ts");
 	let id: string;

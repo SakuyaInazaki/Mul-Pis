@@ -110,8 +110,9 @@ export async function verifyDeepSeekCnyBilling(input: { apiKey: string; request?
 	let response: Response;
 	try {
 		response = await (input.request ?? fetch)(BALANCE_ENDPOINT, {
-			method: "GET", redirect: "error", cache: "no-store", signal: AbortSignal.timeout(10_000),
-			headers: { Authorization: `Bearer ${input.apiKey}`, Accept: "application/json" },
+			method: "GET", redirect: "error", signal: AbortSignal.timeout(10_000),
+			headers: { Authorization: `Bearer ${input.apiKey}`, Accept: "application/json",
+				"Cache-Control": "no-cache", Pragma: "no-cache" },
 		});
 	} catch { return fail("DeepSeek billing currency verification was unavailable"); }
 	if (!response.ok) fail(`DeepSeek billing currency verification failed with HTTP ${response.status}`);

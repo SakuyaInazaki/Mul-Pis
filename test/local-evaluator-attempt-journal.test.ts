@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -23,7 +23,7 @@ const sha = (bytes: string | Buffer) => createHash("sha256").update(bytes).diges
 
 async function fixture(t: TestContext): Promise<{ input: LocalEvaluatorRunInput; root: string;
 	sessionCalls: { model: number; builder: number } }> {
-	const root = await mkdtemp(path.join(os.tmpdir(), "local-evaluator-journal-"));
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "local-evaluator-journal-")));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(root);
 	await mkdir(path.dirname(ws.problemFile), { recursive: true });

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -8,23 +8,26 @@ import { createResearchExtension } from "../src/pi/extension.ts";
 import { ResearchService } from "../src/pi/service.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 
-function captureExtension(service: ResearchService, improvementServiceFactory?: (workspaceRoot: string) => any, researchImprovementServiceFactory?: (workspaceRoot: string) => any): { tools: Map<string, ToolDefinition>; commands: Map<string, { handler: (args: string, ctx: any) => Promise<void> }>; handlers: Map<string, Array<(event: any, ctx: any) => unknown>> } {
+function captureExtension(service: ResearchService, improvementServiceFactory?: (workspaceRoot: string) => any, researchImprovementServiceFactory?: (workspaceRoot: string) => any, continuation?: { workspace: string }): { tools: Map<string, ToolDefinition>; commands: Map<string, { handler: (args: string, ctx: any) => Promise<void> }>; handlers: Map<string, Array<(event: any, ctx: any) => unknown>>; activeTools: () => string[] } {
 	const tools = new Map<string, ToolDefinition>();
 	const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
 	const handlers = new Map<string, Array<(event: any, ctx: any) => unknown>>();
+	let activeTools = ["read", "bash", "edit", "write"];
 	const api = {
 		on(name: string, handler: (event: any, ctx: any) => unknown) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
-		registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); },
+		registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); activeTools.push(tool.name); },
 		registerCommand(name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) { commands.set(name, command); },
+		getActiveTools() { return [...activeTools]; },
+		setActiveTools(names: string[]) { activeTools = [...names]; },
 	} as unknown as ExtensionAPI;
-	createResearchExtension({ service, improvementServiceFactory, researchImprovementServiceFactory })(api);
-	return { tools, commands, handlers };
+	createResearchExtension({ service, improvementServiceFactory, researchImprovementServiceFactory, continuation })(api);
+	return { tools, commands, handlers, activeTools: () => [...activeTools] };
 }
 
 function toolContext(cwd: string): any { return { cwd }; }
 
 test("extension registration is inert and exposes bounded tools", async () => {
-	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-extension-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-extension-")));
 	const service = new ResearchService({ defaultWorkspace: root });
 	const registered = captureExtension(service);
 	assert.deepEqual([...registered.tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_mission", "research_review", "research_stage", "research_status"]);
@@ -67,7 +70,7 @@ test("research_improve exposes the separate bounded run, status and rollback act
 });
 
 test("research_method_improve workflow-run dispatches the explicit workflow plan", async (t) => {
-	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-workflow-route-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-workflow-route-")));
 	t.after(() => import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true })));
 	const plan = { version: 1, kind: "m07-evidence-handoff/v1", marker: "workflow-only" };
 	await writeFile(path.join(root, "plan.json"), JSON.stringify(plan));
@@ -93,7 +96,7 @@ test("research_delegate passes approved plan, versioned resources, bounded loop,
 });
 
 test("research tools dispatch a real same-goal fork and select an accepted branch without exposing session dumps", async () => {
-	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-branch-extension-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-branch-extension-")));
 	await mkdir(path.join(root, "problem"), { recursive: true });
 	await writeFile(path.join(root, "problem", "problem.md"), "Bounded branch question\n");
 	await writeFile(path.join(root, "research.config.json"), JSON.stringify({ roles: { execution: "fake/execution" }, concurrency: 1 }));
@@ -109,15 +112,27 @@ test("research tools dispatch a real same-goal fork and select an accepted branc
 	const runId = (begin.details as { summary: { runId: string } }).summary.runId;
 	const spec = { runId, objective: "Run candidate", inputs: [], expectedOutputs: ["result.txt"], checks: ["result checked"], mode: "execute" };
 	const parent = await call("research_delegate", spec);
-	const parentTaskId = (parent.details as { summary: { taskId: string } }).summary.taskId;
+	const parentResult = (parent.details as { summary: { taskId: string; status: string; workDir: string; reportPath: string; expectedOutputPaths: string[] } }).summary;
+	const parentTaskId = parentResult.taskId;
+	assert.equal(parentResult.status, "returned");
+	assert.equal(parentResult.expectedOutputPaths[0], path.join(parentResult.workDir, "result.txt"));
+	assert.match(await readFile(parentResult.reportPath, "utf8"), /candidate completed/);
+	assert.equal(await readFile(parentResult.expectedOutputPaths[0], "utf8"), "candidate output\n");
+	assert.doesNotMatch(JSON.stringify(parent), /candidate completed|candidate output|toolLog|sourceSessionFile|snapshotFile|transcript|"session"/);
 	const goal = await service.goalStatus(runId, root) as { tasks: Array<{ taskId: string; branchSource?: { checkpoint: { id: string } }; workDir: string }> };
 	const checkpointId = goal.tasks[0].branchSource?.checkpoint.id;
 	assert.ok(checkpointId, "controller must freeze a real parent checkpoint");
-	const parentEvidence = path.join(goal.tasks[0].workDir, "result.txt");
+	const parentEvidence = parentResult.expectedOutputPaths[0];
 	await call("research_review", { runId, taskId: parentTaskId, checks: [{ criterion: "result checked", result: "passed", evidence: [parentEvidence] }], artifacts: [parentEvidence] });
 	const context = { mode: "fork", parentRunId: runId, parentTaskId, checkpointId };
 	const sibling = await call("research_delegate", { ...spec, context });
-	const siblingTaskId = (sibling.details as { summary: { taskId: string } }).summary.taskId;
+	const siblingResult = (sibling.details as { summary: { taskId: string; status: string; workDir: string; reportPath: string; expectedOutputPaths: string[] } }).summary;
+	const siblingTaskId = siblingResult.taskId;
+	assert.equal(siblingResult.status, "returned");
+	assert.equal(siblingResult.expectedOutputPaths[0], path.join(siblingResult.workDir, "result.txt"));
+	assert.match(await readFile(siblingResult.reportPath, "utf8"), /candidate completed/);
+	assert.equal(await readFile(siblingResult.expectedOutputPaths[0], "utf8"), "candidate output\n");
+	assert.doesNotMatch(JSON.stringify(sibling), /candidate completed|candidate output|toolLog|sourceSessionFile|snapshotFile|transcript|"session"/);
 	const siblingState = await service.goalStatus(runId, root) as { tasks: Array<{ taskId: string; status: string; executionFailure?: string }> };
 	assert.equal(siblingState.tasks.find((task) => task.taskId === siblingTaskId)?.status, "returned", siblingState.tasks.find((task) => task.taskId === siblingTaskId)?.executionFailure ?? "fork failed");
 	assert.equal(runner.created.length, 2);
@@ -127,7 +142,7 @@ test("research tools dispatch a real same-goal fork and select an accepted branc
 	const lineageFile = afterFork.tasks[1].session?.lineageFile;
 	assert.ok(lineageFile, "child must carry a committed true-fork receipt");
 	assert.equal((JSON.parse(await readFile(lineageFile, "utf8")) as { checkpoint: { id: string } }).checkpoint.id, checkpointId);
-	const evidence = path.join(afterFork.tasks[1].workDir, "result.txt");
+	const evidence = siblingResult.expectedOutputPaths[0];
 	await call("research_review", { runId, taskId: siblingTaskId, checks: [{ criterion: "result checked", result: "passed", evidence: [evidence] }], artifacts: [evidence] });
 	const selected = await call("research_goal", { action: "select-branch", runId, parentTaskId, selectedTaskId: siblingTaskId, rationale: "Reviewed candidate passed" });
 	const summary = (selected.details as { summary: { branchSelections: Array<{ selectedTaskId: string }> } }).summary;
@@ -200,7 +215,7 @@ test("main-session capability guard blocks side-effect tools from the start", as
 });
 
 test("status works without model config and does not initialize the workspace", async () => {
-	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-status-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-status-")));
 	const service = new ResearchService({ defaultWorkspace: root });
 	const status = await service.status();
 	assert.equal(status.configPresent, false);
@@ -210,8 +225,8 @@ test("status works without model config and does not initialize the workspace", 
 });
 
 test("tool workspace defaults to each execute ctx.cwd instead of extension construction cwd", async () => {
-	const defaultRoot = await mkdtemp(path.join(tmpdir(), "pre-rsi-default-"));
-	const currentRoot = await mkdtemp(path.join(tmpdir(), "pre-rsi-current-"));
+	const defaultRoot = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-default-")));
+	const currentRoot = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-current-")));
 	const registered = captureExtension(new ResearchService({ defaultWorkspace: defaultRoot }));
 	const output = await registered.tools.get("research_status")!.execute("status", {}, undefined, undefined, toolContext(currentRoot));
 	assert.match(JSON.stringify(output), new RegExp(currentRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -224,15 +239,17 @@ test("tool workspace defaults to each execute ctx.cwd instead of extension const
 });
 
 test("stage tool uses a fresh runner, reports progress, and preserves completion caveat", async () => {
-	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-stage-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-stage-")));
 	await mkdir(path.join(root, "problem", "raw"), { recursive: true });
 	await writeFile(path.join(root, "problem", "problem.md"), "测试问题\n");
-	await writeFile(path.join(root, "research.config.json"), `${JSON.stringify({ roles: { execution: "fake/model" }, concurrency: 1 })}\n`);
+	await writeFile(path.join(root, "research.config.json"), `${JSON.stringify({ roles: { execution: "fake/model", research: "fake/research" }, concurrency: 1 })}\n`);
 	const updates: string[] = [];
 	const service = new ResearchService({
 		defaultWorkspace: root,
 		onProgress: (progress) => updates.push(progress.message),
-		runnerFactory: () => new FakeSessionRunner(() => ({ text: "离线结果", reads: [] })),
+		runnerFactory: () => new FakeSessionRunner(({ spec }) => ({ text: spec.label === "M04-research"
+			? '核对后保留候选。\n\n```knowledge-proposals\n[{"op":"create","type":"Q","title":"待复核问题","body":"仍需更多证据","usageDecision":"candidate"}]\n```'
+			: "离线结果", reads: [] })),
 	});
 	await service.init(root);
 	const registered = captureExtension(service);
@@ -243,10 +260,18 @@ test("stage tool uses a fresh runner, reports progress, and preserves completion
 	assert.equal(run.status, "completed");
 	assert.ok(updates.some((message) => message.includes("M01：正在创建隔离会话")));
 	assert.ok(updates.some((message) => message.includes("完成不等于科学判断已通过")));
+	const feedbackFile = path.join(root, "feedback.md");
+	await writeFile(feedbackFile, "需要记录尚未解决的问题。\n");
+	const m04 = await tool.execute("call-m04", { stage: "M04", workspace: root, feedbackFile, freshSession: true }, undefined, undefined, toolContext(root));
+	const m04Summary = JSON.parse((m04.content[0] as { text: string }).text) as { proposalId?: string; snapshotId?: string; outputs?: Array<{ path: string }> };
+	assert.equal(m04Summary.proposalId, "P0001");
+	assert.equal(m04Summary.snapshotId, "G001");
+	assert.ok(m04Summary.outputs?.some((item) => item.path.endsWith("/P0001.json")));
+	assert.ok(m04Summary.outputs?.some((item) => item.path.endsWith("/merge.json")));
 });
 
 test("research_stage schema invokes the real M08 service path with explicit review inputs", async () => {
-	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-m08-extension-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-m08-extension-")));
 	await mkdir(path.join(root, "problem", "raw"), { recursive: true });
 	await writeFile(path.join(root, "problem", "problem.md"), "需要审查的原问题\n");
 	const artifact = path.join(root, "result.md");
@@ -294,26 +319,49 @@ test("M09 tool result keeps the bounded closure summary", async () => {
 });
 
 test("failed research operation does not activate P07; success, off, and session start control activation", async () => {
-	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-activation-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-activation-")));
 	await mkdir(path.join(root, "problem", "raw"), { recursive: true });
 	await writeFile(path.join(root, "problem", "problem.md"), "问题\n");
 	const service = new ResearchService({ defaultWorkspace: root, runnerFactory: () => new FakeSessionRunner(() => ({ text: "ok", reads: [] })) });
 	await service.init(root);
 	const registered = captureExtension(service);
+	const originalTools = registered.activeTools();
+	assert.deepEqual(originalTools.slice(0, 4), ["read", "bash", "edit", "write"]);
+	assert.equal(originalTools.includes("grep"), false);
 	await assert.rejects(registered.tools.get("research_stage")!.execute("bad", { stage: "M01" }, undefined, undefined, toolContext(root)), /缺少/);
+	assert.deepEqual(registered.activeTools(), originalTools);
 	const before = registered.handlers.get("before_agent_start")![0];
 	assert.equal(await before({ systemPrompt: "base" }, toolContext(root)), undefined);
 	await registered.tools.get("research_goal")!.execute("begin", { action: "begin", goal: "目标", problemRelation: "关系", constraints: ["约束"], successCriteria: ["标准"], plan: "计划", exploratory: true }, undefined, undefined, toolContext(root));
+	assert.deepEqual(registered.activeTools().filter((name) => ["read", "grep", "find", "ls"].includes(name)), ["read", "grep", "find", "ls"]);
+	assert.equal(registered.activeTools().some((name) => ["bash", "edit", "write"].includes(name)), false);
+	assert.equal(registered.activeTools().includes("research_goal"), true);
 	assert.match(JSON.stringify(await before({ systemPrompt: "base" }, toolContext(root))), /P07|研究/);
 	await registered.commands.get("research")!.handler("off", { cwd: root, ui: { notify() {} } });
+	assert.deepEqual(registered.activeTools(), originalTools);
 	assert.equal(await before({ systemPrompt: "base" }, toolContext(root)), undefined);
 	await registered.tools.get("research_goal")!.execute("plan", { action: "plan", runId: (await service.status(root)).stages.M07.latest!.runId, plan: "新计划" }, undefined, undefined, toolContext(root));
+	assert.equal(registered.activeTools().includes("ls"), true);
 	await registered.handlers.get("session_start")![0]({}, toolContext(root));
+	assert.deepEqual(registered.activeTools(), originalTools);
 	assert.equal(await before({ systemPrompt: "base" }, toolContext(root)), undefined);
 });
 
+test("explicit continuation exposes inspection tools before its first model turn", async () => {
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-continuation-tools-")));
+	for (const mode of ["print", "rpc"]) {
+		const registered = captureExtension({} as ResearchService, undefined, undefined, { workspace: root });
+		const originalTools = registered.activeTools();
+		await registered.handlers.get("session_start")![0]({}, { cwd: root, mode });
+		assert.deepEqual(registered.activeTools().filter((name) => ["read", "grep", "find", "ls"].includes(name)), ["read", "grep", "find", "ls"]);
+		assert.equal(registered.activeTools().includes("bash"), false);
+		await registered.commands.get("research")!.handler("off", { cwd: root, ui: { notify() {} } });
+		assert.deepEqual(registered.activeTools(), originalTools);
+	}
+});
+
 test("symlink aliases share the same mutation lock", async () => {
-	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-lock-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-lock-")));
 	const alias = `${root}-alias`;
 	await symlink(root, alias);
 	await mkdir(path.join(root, "problem", "raw"), { recursive: true });
@@ -331,7 +379,7 @@ test("symlink aliases share the same mutation lock", async () => {
 });
 
 test("Pi DefaultResourceLoader loads the inline extension without prompting or network", async () => {
-	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-loader-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-loader-")));
 	const agentDir = path.join(root, "agent");
 	await mkdir(agentDir, { recursive: true });
 	const loader = new DefaultResourceLoader({
@@ -352,7 +400,7 @@ test("Pi DefaultResourceLoader loads the inline extension without prompting or n
 });
 
 test("Pi DefaultResourceLoader loads the actual extensions/research.ts entrypoint", async () => {
-	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-file-loader-"));
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-file-loader-")));
 	const agentDir = path.join(root, "agent");
 	await mkdir(agentDir, { recursive: true });
 	const loader = new DefaultResourceLoader({

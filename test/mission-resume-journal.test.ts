@@ -10,6 +10,7 @@ import { MissionResumeJournal, type TestedControlBinding } from
 	"../src/runner/mission-resume-journal.ts";
 import { pendingActionIdentity, planMissionContinuation, type ResumeIntent,
 	type SupervisorSnapshot } from "../src/runner/mission-supervisor.ts";
+import { readCurrentProcessIdentity } from "../src/runtime/process-identity.ts";
 
 const hash = (s: string): string => createHash("sha256").update(s).digest("hex");
 function canonical(value: unknown): string {
@@ -450,11 +451,25 @@ test("a crashed lock owner is recovered without losing the durable reservation",
 	await journal.reserve(intent, binding());
 	const lock = path.join(journal.directory, ".lock");
 	await mkdir(lock, { mode: 0o700 });
+	const current = await readCurrentProcessIdentity();
 	await writeFile(path.join(lock, "owner.json"), JSON.stringify({ host: os.hostname(), pid: 99999999,
-		boot: (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim(),
+		boot: current.bootId,
 		start: "1" }), { mode: 0o600 });
 	assert.equal((await new MissionResumeJournal(journal.directory).get(intent.idempotencyKey))?.state,
 		"reserved");
+});
+
+test("a reused lock-owner PID remains held for review", async t => {
+	const { journal } = await fixture(t), intent = intentFor();
+	await journal.reserve(intent, binding());
+	const lock = path.join(journal.directory, ".lock");
+	await mkdir(lock, { mode: 0o700 });
+	const current = await readCurrentProcessIdentity();
+	await writeFile(path.join(lock, "owner.json"), JSON.stringify({ host: current.hostId,
+		pid: current.pid, boot: current.bootId, start: `${current.processStartToken}-other` }),
+		{ mode: 0o600 });
+	await assert.rejects(new MissionResumeJournal(journal.directory).get(intent.idempotencyKey),
+		/lock owner identity is unknown/);
 });
 
 test("a lock from a different host fails closed", async t => {

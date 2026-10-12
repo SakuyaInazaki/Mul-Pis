@@ -6,6 +6,7 @@ import test, { type TestContext } from "node:test";
 import {
 	createAgentSession,
 	ModelRuntime,
+	SessionManager,
 	type CreateAgentSessionOptions,
 } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
@@ -175,7 +176,8 @@ test("isolates all discovered resources and preserves the exact system prompt", 
 	assert.deepEqual(loader.getSkills().skills, []);
 	assert.deepEqual(loader.getPrompts().prompts, []);
 	assert.deepEqual(loader.getThemes().themes, []);
-	assert.deepEqual(loader.getExtensions().extensions, []);
+	assert.deepEqual(loader.getExtensions().extensions.map(extension => extension.path), ["<inline:workflow-compaction>"]);
+	assert.equal(loader.getExtensions().extensions[0].tools.size, 0);
 	assert.equal(path.dirname(stub.calls[0].cwd!), persistDir);
 	assert.match(path.basename(stub.calls[0].cwd!), /^\.pi-session-/);
 });
@@ -492,6 +494,39 @@ test("writes the sidecar next to the SDK path and resume rebuilds from it", asyn
 	assert.match(stub.calls[1].resourceLoader?.getSystemPrompt() ?? "", /^persisted boundary\n\n输入信任边界：/);
 	assert.equal(resumed.ref.label, original.label);
 	assert.equal(resumed.ref.model, original.model);
+});
+
+test("resume preserves a new session's compaction policy and leaves legacy sessions unchanged", async t => {
+	const persistDir = await fixture(t);
+	const model = { ...MODEL, contextWindow: 1_048_576 };
+	const runtime = { getModels: () => [model] } as unknown as ModelRuntime;
+	const stub = stubFactory();
+	const runner = new PiSessionRunner({ modelRuntime: runtime, createSession: stub.factory });
+	const fresh = await runner.create(spec(persistDir));
+	await fresh.prompt("new session history");
+	fresh.dispose();
+	const resumed = await runner.resume(fresh.ref);
+	assert.equal(stub.calls.at(-1)?.settingsManager?.getCompactionSettings(model).reserveTokens, 848_576);
+	assert.equal(stub.calls.at(-1)?.sessionManager?.getEntries().filter(entry =>
+		entry.type === "custom" && entry.customType === "workflow_compaction").length, 1);
+	resumed.dispose();
+
+	const scratch = await mkdtemp(path.join(persistDir, ".pi-session-"));
+	const manager = SessionManager.create(scratch, persistDir);
+	const prior = await stub.factory({ sessionManager: manager });
+	await prior.session.prompt("legacy history");
+	prior.session.dispose();
+	const file = manager.getSessionFile()!;
+	const specFile = file.replace(/\.jsonl$/, ".spec.json");
+	const oldSpec = spec(persistDir);
+	await writeFile(specFile, JSON.stringify(oldSpec));
+	const original = await readFile(file, "utf8");
+	const old = await runner.resume({ label: oldSpec.label, role: oldSpec.role,
+		model: oldSpec.model, id: manager.getSessionId(), file, specFile });
+	assert.equal(stub.calls.at(-1)?.settingsManager?.getCompactionSettings(model).reserveTokens, 16_384);
+	assert.deepEqual(stub.calls.at(-1)?.resourceLoader?.getExtensions().extensions, []);
+	assert.equal(await readFile(file, "utf8"), original);
+	old.dispose();
 });
 
 test("prompt reports visible output and rejects a non-stop assistant result", async (t) => {
@@ -990,7 +1025,7 @@ test("method binding survives resume without enabling discovered resources", asy
 	const binding = { versionId: "method-v1", contentId: "approved-package-v1" };
 	const handle = await runner.create(spec(persistDir, { methodBinding: binding }));
 	assert.deepEqual(handle.ref.methodBinding, binding);
-	assert.deepEqual(stub.calls[0].resourceLoader?.getExtensions().extensions, []);
+	assert.deepEqual(stub.calls[0].resourceLoader?.getExtensions().extensions.map(extension => extension.path), ["<inline:workflow-compaction>"]);
 	assert.deepEqual(stub.calls[0].resourceLoader?.getSkills().skills, []);
 	await handle.prompt("first");
 	handle.dispose();
@@ -1028,7 +1063,7 @@ test("Pi forks two independent histories from a frozen completed leaf, preservin
 	assert.notEqual(first.ref.file, second.ref.file);
 	assert.notEqual(first.ref.file, parent.ref.file);
 	assert.deepEqual(stub.calls.at(-1)?.tools, []);
-	assert.deepEqual(stub.calls.at(-1)?.resourceLoader?.getExtensions().extensions, []);
+	assert.deepEqual(stub.calls.at(-1)?.resourceLoader?.getExtensions().extensions.map(extension => extension.path), ["<inline:workflow-compaction>"]);
 	assert.deepEqual(stub.calls.at(-1)?.resourceLoader?.getSkills().skills, []);
 	const firstFile = await readFile(first.ref.file!, "utf8");
 	await assert.rejects(inspectManagedExecutionSession({ persistDir: childSessions,
