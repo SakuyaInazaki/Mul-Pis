@@ -23,6 +23,7 @@ import type { KnowledgeRef, KnowledgeStore } from "../knowledge/types.ts";
 import { GenerationStore, isM07WorkflowStrategy } from "../improvement/generation.ts";
 import { probeProcessIdentity, readCurrentProcessIdentity, type ProcessIdentityV1 } from "../runtime/process-identity.ts";
 import { parseRunDescriptor, type RunDescriptorV1 } from "../runtime/run-descriptor.ts";
+import { verifyDescriptorLoadedSource, verifyLoadedSource } from "../runtime/loaded-source.ts";
 import { parseRoundReview } from "./execution-loop.ts";
 import { openBoundedSession, type EvidenceBindingV1 } from "../context/boundary.ts";
 import type { Workspace } from "../workspace.ts";
@@ -603,6 +604,13 @@ function requireActive(goal: CurrentGoal): void {
 	if (goal.executionState && goal.executionState.attempts.find((attempt) => attempt.id === goal.executionState?.activeAttemptId)?.state !== "running") throw new HarnessError("m07.suspended", `M07 目标 ${goal.runId} 的执行尝试未运行；先经宿主控制面恢复`);
 }
 
+async function requireLoadedAttemptSource(goal: CurrentGoal): Promise<void> {
+	const attempt = goal.executionState?.attempts.find((item) => item.id === goal.executionState?.activeAttemptId);
+	if (!attempt?.runDescriptor.loadedSource) return; // Older attempts had no loaded-source proof.
+	try { await verifyDescriptorLoadedSource(parseRunDescriptor(attempt.runDescriptor), import.meta.url); }
+	catch (error) { throw new HarnessError("m07.source-version", `当前加载的工作流源码与运行中 attempt 不一致：${(error as Error).message}`); }
+}
+
 function nextAttemptId(goal: CurrentGoal): string { return `A${String((goal.executionState?.attempts.length ?? 0) + 1).padStart(3, "0")}`; }
 
 function sameProcess(a: ProcessIdentityV1, b: ProcessIdentityV1): boolean {
@@ -1096,12 +1104,13 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			}
 			const knowledgeSnapshot = resolved?.knowledgeSnapshot;
 			const failedM04 = resolved?.failedM04 ?? [];
+			const loadedSource = await verifyLoadedSource(import.meta.url);
 			const record = await ctx.ws.startRun("M07", [{ label: "原始问题", path: problem.path }], knowledgeSnapshot);
 			const frozen = path.join(ctx.ws.runDir("M07", record.runId), "problem-snapshot.md");
 			await writeFileAtomic(frozen, problem.content);
 			const exploratory = input.exploratory === true || !baseline;
 			const attemptId = "A001";
-			const descriptor: RunDescriptorV1 = { version: 1, instanceId: process.env.PRE_RSI_RUN_INSTANCE_ID ?? randomUUID(), attemptId, workspaceId: await ctx.store.storeId(), goalRunId: record.runId, codeRevision: process.env.PRE_RSI_CODE_REVISION ?? "unrecorded", controlDir: ctx.ws.runDir("M07", record.runId), process: await (options.processIdentity ?? readCurrentProcessIdentity)() };
+			const descriptor: RunDescriptorV1 = { version: 1, instanceId: process.env.PRE_RSI_RUN_INSTANCE_ID ?? randomUUID(), attemptId, workspaceId: await ctx.store.storeId(), goalRunId: record.runId, codeRevision: loadedSource?.sourceCommit ?? process.env.PRE_RSI_CODE_REVISION ?? "unrecorded", ...(loadedSource ? { loadedSource } : {}), controlDir: ctx.ws.runDir("M07", record.runId), process: await (options.processIdentity ?? readCurrentProcessIdentity)() };
 			const goal: CurrentGoal = { version: 1, runId: record.runId, lifecycle: "active", startedAt: record.startedAt, updatedAt: record.startedAt, goal: input.goal.trim(), problemRelation: input.problemRelation.trim(), constraints: input.constraints.map((x) => nonempty(x, "constraint")), successCriteria: input.successCriteria.map((x) => nonempty(x, "success criterion")), plan: input.plan.trim(), exploratory, formalBaseline: !!baseline && !exploratory, problemSnapshotPath: frozen, knowledgeSnapshot, m04BaselineRunId: baseline?.run.runId, checkpointRawScope: beginOptions?.checkpointRawScope ?? "workspace", ...(failedM04.length ? { m04BaselineFailures: failedM04 } : {}), baselineHistory: baseline ? [{ at: record.startedAt, knowledgeSnapshot, m04RunId: baseline.run.runId, ...(failedM04.length ? { failedM04 } : {}) }] : [], budgetPolicy: budget.policy, budgetPolicyVersionId: budget.versionId, budgetPolicyFrozenAt: record.startedAt, methodBinding: { versionId: workflowMethod?.versionId ?? budget.versionId }, ...(workflowMethod ? { workflowMethod } : {}), ...(beginOptions?.executionContract === "continuous" ? { executionContract: { version: 1 as const, mode: "continuous" as const, frozenAt: record.startedAt } } : {}), executionState: { version: 1, activeAttemptId: attemptId, attempts: [{ version: 1, id: attemptId, state: "running", startedAt: record.startedAt, runDescriptor: descriptor }], operations: [] }, tasks: [], decisions: [], limitations: [] };
 			await save(ctx, goal);
 			return goal;
@@ -1151,6 +1160,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			async delegate(runId, spec, afterPrepared) {
 			return withDispatch(runId, async () => {
 				const goal = await load(ctx, runId); requireActive(goal); nonempty(spec.objective, "task objective");
+				await requireLoadedAttemptSource(goal);
 				if (spec.context && spec.context.mode !== "fork") throw new HarnessError("m07.branch", "unsupported task context mode");
 				if (spec.mode === "execute" && (goal.executionState?.operations.some((operation) => operation.status === "unknown") || goal.tasks.some((task) => task.mode === "execute" && task.status === "unknown"))) throw new HarnessError("m07.operation-unknown", "仍有外部副作用状态未知；先经宿主控制面对账。只读 check/reason 任务仍可用于核查");
 				await verifyFrozenWorkflowMethod(ctx, goal, options.registeredExperienceStores, spec);
@@ -1478,7 +1488,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 
 		async review(runId, input) {
 			return withDispatch(runId, async () => {
-			const goal = await load(ctx, runId); requireActive(goal); const task = goal.tasks.find((t) => t.taskId === input.taskId); if (!task) throw new HarnessError("m07.task", `未知任务 ${input.taskId}`);
+			const goal = await load(ctx, runId); requireActive(goal); await requireLoadedAttemptSource(goal); const task = goal.tasks.find((t) => t.taskId === input.taskId); if (!task) throw new HarnessError("m07.task", `未知任务 ${input.taskId}`);
 			if (goal.decisions.some((d) => d.status === "open" && d.relatedTaskIds.includes(task.taskId))) throw new HarnessError("m07.decision", "该任务关联待用户决定事项，不能采用；不受影响任务仍可继续");
 			if (task.status !== "returned") throw new HarnessError("m07.review", `任务 ${task.taskId} 状态为 ${task.status}，不能评审采用`);
 			const taskRoot = await realpath(path.dirname(task.workDir)); const reportReal = task.reportPath ? await realpath(task.reportPath) : undefined;
@@ -1747,6 +1757,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			if (!prior || prior.id !== input.expectedAttemptId) throw new HarnessError("m07.recovery", "恢复所指定的旧 attempt 与持久状态不匹配");
 			const nextId = nextAttemptId(goal);
 			const descriptor = validateRecoveryDescriptor(goal, input.runDescriptor, nextId);
+			await verifyDescriptorLoadedSource(descriptor, import.meta.url);
 			if (descriptor.instanceId === prior.runDescriptor.instanceId || sameProcess(descriptor.process, prior.runDescriptor.process)) throw new HarnessError("m07.recovery", "恢复必须使用新的独立 Pi 进程与实例身份");
 			const newProbe = await (options.probeProcess ?? probeProcessIdentity)(descriptor.process);
 			if (newProbe.status !== "alive" || !newProbe.identityMatch) throw new HarnessError("m07.recovery", "新 Pi 进程身份不可验证，拒绝恢复");
@@ -1819,6 +1830,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			if (prior.knowledgeSnapshot !== (await ctx.store.current())?.id) throw new HarnessError("m07.successor", "原知识快照已不可作为当前基线；先对账，不得悄套新 K");
 			await requireCurrentFormalBaseline(ctx, prior);
 			const descriptor = parseRunDescriptor(input.runDescriptor);
+			await verifyDescriptorLoadedSource(descriptor, import.meta.url);
 			const probe = await (options.probeProcess ?? probeProcessIdentity)(descriptor.process);
 			if (probe.status !== "alive" || !probe.identityMatch) throw new HarnessError("m07.successor", "新进程身份不可验证");
 			if (prior.executionState?.operations.some((item) => item.status === "unknown")) throw new HarnessError("m07.successor", "旧目标有未对账外部动作；先查询确认，不得建立可执行后继");

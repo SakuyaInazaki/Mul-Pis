@@ -7,6 +7,7 @@ import { readFile } from "node:fs/promises";
 import { loadPrompt } from "../prompts.ts";
 import { ResearchService, type ResearchServiceOptions, type StageRequest } from "./service.ts";
 import { parseRunDescriptor, readTrustedPauseMs } from "../runtime/run-descriptor.ts";
+import { verifyDescriptorLoadedSource, verifyLoadedSource } from "../runtime/loaded-source.ts";
 import { readCurrentProcessIdentity } from "../runtime/process-identity.ts";
 import { writeFileAtomic } from "../workspace.ts";
 import { TelemetryWriter } from "../dashboard/telemetry.ts";
@@ -238,6 +239,7 @@ mainAgentWatchdog.unref?.();
 };
 
 		pi.on("session_start", async (_event, ctx) => {
+			await verifyLoadedSource(import.meta.url);
 			await mainUsage.sessionStart(ctx).catch(() => undefined);
 			restoreResearchTools();
 			const requestedGoalRunId = options.continuation?.goalRunId;
@@ -254,6 +256,7 @@ mainAgentWatchdog.unref?.();
 				const old = await service.goalStatus(recoverGoalRunId, continuationWorkspace(ctx.cwd)) as CurrentGoal;
 				if (!old.executionState) throw new Error("旧目标无执行尝试状态；只能显式建立 successor，不能隐式恢复");
 				const descriptor = parseRunDescriptor(JSON.parse(await readFile(descriptorFile, "utf8")));
+				await verifyDescriptorLoadedSource(descriptor, import.meta.url);
 				const expectedAttemptId = old.executionState.activeAttemptId;
 				const nextAttemptId = `A${String(old.executionState.attempts.length + 1).padStart(3, "0")}`;
 				const boundDescriptor = { ...descriptor, goalRunId: recoverGoalRunId, attemptId: nextAttemptId };
@@ -268,6 +271,8 @@ mainAgentWatchdog.unref?.();
 					if (!descriptorFile) throw new Error("版本化目标续跑缺少受信运行描述文件；须使用 fresh host recovery");
 					const descriptor = parseRunDescriptor(JSON.parse(await readFile(descriptorFile, "utf8")));
 					const owner = goal.executionState.attempts.find((item) => item.id === goal.executionState?.activeAttemptId);
+					await verifyDescriptorLoadedSource(descriptor, import.meta.url);
+					if (owner) await verifyDescriptorLoadedSource(owner.runDescriptor, import.meta.url);
 					const actual = await readCurrentProcessIdentity();
 					const sameProcess = (a: typeof actual, b: typeof actual) => a.hostId === b.hostId && a.bootId === b.bootId && a.pid === b.pid && a.processStartToken === b.processStartToken;
 					if (!owner || owner.state !== "running" || descriptor.goalRunId !== requestedGoalRunId ||

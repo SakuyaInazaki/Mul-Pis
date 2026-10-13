@@ -66,6 +66,7 @@ import { reconcileInterruptedLocalMission, reconcileLegacyInterruptedLocalMissio
 import { summarizeGoalExecution } from "./m07/status.ts";
 import type { CurrentGoal, TaskSpecInput } from "./m07/types.ts";
 import type { RunDescriptorV1 } from "./runtime/run-descriptor.ts";
+import { verifyLoadedSource } from "./runtime/loaded-source.ts";
 
 interface ParsedArgs {
 	positional: string[];
@@ -189,6 +190,7 @@ async function jsonFile<T>(args: ParsedArgs, name: string): Promise<T> {
 }
 
 export async function main(argv: string[]): Promise<number> {
+	await verifyLoadedSource(import.meta.url);
 	const args = parseArgs(argv);
 	const command = args.positional[0];
 	if (!command || command === "help" || has(args, "help")) {

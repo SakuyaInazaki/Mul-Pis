@@ -8,6 +8,8 @@ export interface RunDescriptorV1 {
 	workspaceId: string;
 	goalRunId?: string;
 	codeRevision: string;
+	/** Present only when a host launched an explicitly prepared, fixed source tree. */
+	loadedSource?: { sourceRoot: string; sourceCommit: string };
 	controlDir: string;
 	processGroupId?: number;
 	process: ProcessIdentityV1;
@@ -29,6 +31,9 @@ export function parseRunDescriptor(value: unknown): RunDescriptorV1 {
 		!d.process?.hostId || !d.process.bootId || !d.process.processStartToken || !Number.isSafeInteger(d.process.pid) || d.process.pid <= 0) {
 		throw new Error("run descriptor invalid");
 	}
+	if (d.loadedSource && (typeof d.loadedSource.sourceRoot !== "string" || !d.loadedSource.sourceRoot ||
+		!/^([0-9a-f]{40}|[0-9a-f]{64})$/.test(d.loadedSource.sourceCommit) ||
+		d.codeRevision !== d.loadedSource.sourceCommit)) throw new Error("run descriptor loaded source invalid");
 	return d as RunDescriptorV1;
 }
 
