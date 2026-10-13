@@ -262,19 +262,19 @@ mainAgentWatchdog.unref?.();
 				boundGoalRunId = recoverGoalRunId;
 				continuationEntry("recovered", `${expectedAttemptId}->${nextAttemptId}`);
 			} else if (requestedGoalRunId) {
-				const descriptorFile = process.env.PRE_RSI_RUN_DESCRIPTOR_FILE;
-				if (descriptorFile) {
-					const goal = await service.goalStatus(requestedGoalRunId, continuationWorkspace(ctx.cwd)) as CurrentGoal;
-					if (goal.executionState) {
-						const descriptor = parseRunDescriptor(JSON.parse(await readFile(descriptorFile, "utf8")));
-						const owner = goal.executionState.attempts.find((item) => item.id === goal.executionState?.activeAttemptId);
-						const actual = await readCurrentProcessIdentity();
-						const sameProcess = (a: typeof actual, b: typeof actual) => a.hostId === b.hostId && a.bootId === b.bootId && a.pid === b.pid && a.processStartToken === b.processStartToken;
-						if (!owner || owner.state !== "running" || descriptor.goalRunId !== requestedGoalRunId ||
-							descriptor.workspaceId !== owner.runDescriptor.workspaceId || descriptor.instanceId !== owner.runDescriptor.instanceId ||
-							!sameProcess(actual, descriptor.process) || !sameProcess(actual, owner.runDescriptor.process)) {
-							throw new Error("当前 Pi 不是 M07 运行中 attempt 的宿主；须使用 fresh host recovery");
-						}
+				const goal = await service.goalStatus(requestedGoalRunId, continuationWorkspace(ctx.cwd)) as CurrentGoal;
+				if (goal.executionState) {
+					const descriptorFile = process.env.PRE_RSI_RUN_DESCRIPTOR_FILE;
+					if (!descriptorFile) throw new Error("版本化目标续跑缺少受信运行描述文件；须使用 fresh host recovery");
+					const descriptor = parseRunDescriptor(JSON.parse(await readFile(descriptorFile, "utf8")));
+					const owner = goal.executionState.attempts.find((item) => item.id === goal.executionState?.activeAttemptId);
+					const actual = await readCurrentProcessIdentity();
+					const sameProcess = (a: typeof actual, b: typeof actual) => a.hostId === b.hostId && a.bootId === b.bootId && a.pid === b.pid && a.processStartToken === b.processStartToken;
+					if (!owner || owner.state !== "running" || descriptor.goalRunId !== requestedGoalRunId ||
+						descriptor.attemptId !== owner.id || descriptor.codeRevision !== owner.runDescriptor.codeRevision ||
+						descriptor.workspaceId !== owner.runDescriptor.workspaceId || descriptor.instanceId !== owner.runDescriptor.instanceId ||
+						!sameProcess(actual, descriptor.process) || !sameProcess(actual, owner.runDescriptor.process)) {
+						throw new Error("当前 Pi 不是 M07 运行中 attempt 的宿主；须使用 fresh host recovery");
 					}
 				}
 				boundGoalRunId = requestedGoalRunId;

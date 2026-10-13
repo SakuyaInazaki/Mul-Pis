@@ -10,6 +10,7 @@ import { createResearchExtension } from "../src/pi/extension.ts";
 import { ResearchService } from "../src/pi/service.ts";
 import type { CurrentGoal, FinishInput } from "../src/m07/types.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
+import { readCurrentProcessIdentity } from "../src/runtime/process-identity.ts";
 
 function goal(lifecycle: "active" | "finished", outcome?: "fulfilled" | "blocked"): CurrentGoal {
 	return { runId: "g1", lifecycle, outcome, updatedAt: "fixed", tasks: [], decisions: [] } as unknown as CurrentGoal;
@@ -199,6 +200,35 @@ test("ordinary continuation cannot claim a versioned goal owned by another Pi pr
 	await assert.rejects(async () => { await handlers.get("session_start")![0]({}, { cwd: "/bound", mode: "json" }); }, /不是 M07 运行中 attempt 的宿主/);
 	await handlers.get("session_shutdown")![0]({ reason: "quit" }, { cwd: "/bound", mode: "json" });
 	assert.deepEqual(calls, ["cleanup"]);
+});
+
+test("versioned continuation requires the matching attempt descriptor before claiming the goal", async (t) => {
+	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-attempt-binding-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const descriptorFile = path.join(root, "run-descriptor.json");
+	const descriptor = { version: 1, instanceId: "same-instance", attemptId: "A002", workspaceId: "store-1", goalRunId: "g1", codeRevision: "recorded-revision", controlDir: root, process: await readCurrentProcessIdentity() };
+	const previousDescriptor = process.env.PRE_RSI_RUN_DESCRIPTOR_FILE;
+	const previousRecover = process.env.PRE_RSI_RECOVER_GOAL_RUN_ID;
+	delete process.env.PRE_RSI_RECOVER_GOAL_RUN_ID;
+	t.after(() => { if (previousDescriptor === undefined) delete process.env.PRE_RSI_RUN_DESCRIPTOR_FILE; else process.env.PRE_RSI_RUN_DESCRIPTOR_FILE = previousDescriptor; if (previousRecover === undefined) delete process.env.PRE_RSI_RECOVER_GOAL_RUN_ID; else process.env.PRE_RSI_RECOVER_GOAL_RUN_ID = previousRecover; });
+	for (const scenario of ["missing", "old-attempt", "changed-revision", "matching"] as const) await t.test(scenario, async () => {
+		if (scenario === "missing") delete process.env.PRE_RSI_RUN_DESCRIPTOR_FILE;
+		else {
+			process.env.PRE_RSI_RUN_DESCRIPTOR_FILE = descriptorFile;
+			await writeFile(descriptorFile, JSON.stringify({ ...descriptor, ...(scenario === "old-attempt" ? { attemptId: "A001" } : scenario === "changed-revision" ? { codeRevision: "other-revision" } : {}) }));
+		}
+		const stored = { ...goal("active"), executionState: { version: 1, activeAttemptId: "A002", attempts: [{ version: 1, id: "A002", state: "running", runDescriptor: descriptor }], operations: [] } } as unknown as CurrentGoal;
+		const calls: string[] = [];
+		const service = { goalStatus: async () => stored, hostSuspend: async () => { calls.push("suspend"); return stored; }, hostInterrupt: async () => { calls.push("archive"); }, interruptAllActive: async () => { calls.push("cleanup"); } } as unknown as ResearchService;
+		const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+		const api = { on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, registerTool() {}, registerCommand() {}, appendEntry() {}, getActiveTools() { return ["read"]; }, setActiveTools() {} } as unknown as ExtensionAPI;
+		createResearchExtension({ service, continuation: { workspace: root, goalRunId: "g1" } })(api);
+		const start = async () => { await handlers.get("session_start")![0]({}, { cwd: root, mode: "rpc" }); };
+		if (scenario === "matching") await start();
+		else await assert.rejects(start, /运行描述|不是 M07 运行中 attempt 的宿主/);
+		await handlers.get("session_shutdown")![0]({ reason: "quit" }, { cwd: root, mode: "rpc" });
+		assert.deepEqual(calls, scenario === "matching" ? ["suspend", "cleanup"] : ["cleanup"]);
+	});
 });
 
 test("RPC fresh recovery binds a successor and keeps continuous goal guards", async t => {
