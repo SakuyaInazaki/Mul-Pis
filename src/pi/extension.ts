@@ -143,7 +143,7 @@ export interface ResearchExtensionOptions {
 	mainAgentStallCheckMs?: number;
 	improvementServiceFactory?: (workspaceRoot: string, signal?: AbortSignal) => Promise<Pick<ImprovementService, "run" | "status" | "rollback"> & Partial<Pick<ImprovementService, "exportMethodPackage" | "bindMethodPackage">>> | Pick<ImprovementService, "run" | "status" | "rollback"> & Partial<Pick<ImprovementService, "exportMethodPackage" | "bindMethodPackage">>;
 	/** Allows an offline extension test to supply a bounded method service without Pi model calls. */
-	researchImprovementServiceFactory?: (workspaceRoot: string, signal?: AbortSignal) => Pick<ResearchImprovementService, "runWorkflow">;
+	researchImprovementServiceFactory?: (workspaceRoot: string, signal?: AbortSignal) => Pick<ResearchImprovementService, "runWorkflow" | "calibrateWorkflow">;
 }
 
 export function createResearchExtension(options: ResearchExtensionOptions = {}) {
@@ -455,12 +455,12 @@ mainAgentWatchdog.unref?.();
 
 		pi.registerTool({
 			name: "research_method_improve",
-			label: "Bounded Research Method Improvement",
-			description: "Explicitly bootstrap, run, inspect, roll back, or manually transfer versioned H/I prompt strategies. Action run is the CPU method-research campaign; workflow-run explicitly runs the M07 evidence-handoff campaign. Neither is automatic or proof of scientific benefit.",
-			promptSnippet: "Run a caller-bounded H/I method-research campaign only when explicitly authorized",
-			promptGuidelines: ["Use caller-supplied method/plan files with one total SDK-estimated-cost ceiling. Keep required file-safety and scientific case bounds; do not divide the monetary ceiling among phases or arms.", "Development feedback can guide candidates; protected admission results must not return to proposal prompts."],
+			label: "Research Method Improvement",
+			description: "Explicitly bootstrap, run, inspect, roll back, or manually transfer versioned H/I prompt strategies. Action run is the CPU method-research campaign; workflow-run runs M07 evidence-handoff search; workflow-calibrate executes the same method in two fresh M07/M04 arms. Calibration records observations without proposing or promoting a method.",
+			promptSnippet: "Run an explicitly authorized H/I method study or same-method workflow calibration",
+			promptGuidelines: ["Use caller-supplied method and experiment plans. Preserve file-safety boundaries and scientific acceptance checks; record model usage and estimated fees as observations.", "Development feedback can guide candidates; protected admission results must not return to proposal prompts."],
 			parameters: Type.Object({
-				action: Type.Union([Type.Literal("bootstrap"), Type.Literal("run"), Type.Literal("workflow-run"), Type.Literal("status"), Type.Literal("rollback"), Type.Literal("export"), Type.Literal("bind"), Type.Literal("advance-knowledge"), Type.Literal("transition-dependencies")]),
+				action: Type.Union([Type.Literal("bootstrap"), Type.Literal("run"), Type.Literal("workflow-run"), Type.Literal("workflow-calibrate"), Type.Literal("status"), Type.Literal("rollback"), Type.Literal("export"), Type.Literal("bind"), Type.Literal("advance-knowledge"), Type.Literal("transition-dependencies")]),
 				workspace: Type.Optional(Type.String()),
 				methodsPath: Type.Optional(Type.String()),
 				planPath: Type.Optional(Type.String()),
@@ -472,10 +472,15 @@ mainAgentWatchdog.unref?.();
 			}),
 			executionMode: "sequential",
 			async execute(_id, params, signal, _update, ctx) {
-				if (params.action === "workflow-run") {
-					if (!params.planPath) throw new Error("workflow-run requires planPath");
+				if (params.action === "workflow-run" || params.action === "workflow-calibrate") {
+					if (!params.planPath) throw new Error(`${params.action} requires planPath`);
 					const research = options.researchImprovementServiceFactory?.(workspaceFrom(params.workspace, ctx.cwd), signal) ?? new ResearchImprovementService({ workspaceRoot: workspaceFrom(params.workspace, ctx.cwd), runner: (await import("../runner/pi.ts")).createPiSessionRunner({ signal }) });
-					const run = await research.runWorkflow(JSON.parse(await readFile(path.resolve(ctx.cwd, params.planPath), "utf8")) as WorkflowEvidenceHandoffPlanV1);
+					const plan = JSON.parse(await readFile(path.resolve(ctx.cwd, params.planPath), "utf8"));
+					if (params.action === "workflow-calibrate") {
+						const run = await research.calibrateWorkflow(plan);
+						return result({ runId: run.runId, status: run.status, stopReason: run.stopReason, baseline: run.baseline, methodVersionId: run.methodVersionId, pairCount: run.pairs.length, partialArmCount: Number(!!run.partialPair?.armA) + Number(!!run.partialPair?.armA2), pairsWithDifferingChecks: run.pairs.filter((pair) => pair.differences.length > 0).length, pairsWithFailedChecks: run.pairs.filter((pair) => [...pair.armA.checkResults, ...pair.armA2.checkResults].some((check) => !check.passed)).length, scientificBenefit: run.scientificBenefit, budget: run.budgetAtEnd });
+					}
+					const run = await research.runWorkflow(plan as WorkflowEvidenceHandoffPlanV1);
 					return result({ runId: run.runId, status: run.status, outcome: run.outcome, stopReason: run.stopReason, selectedCandidateId: run.selectedCandidateId, promotedMethodVersionId: run.promotedMethodVersionId, developmentArmCount: run.developmentArms.length, protectedArmCount: run.protectedArms.length, scientificBenefit: run.scientificBenefit, budget: run.budgetAtEnd });
 				}
 				const { createPiSessionRunner } = await import("../runner/pi.ts");

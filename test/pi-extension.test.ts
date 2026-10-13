@@ -87,6 +87,34 @@ test("research_method_improve workflow-run dispatches the explicit workflow plan
 	await assert.rejects(tool.execute("missing", { action: "workflow-run", workspace: root }, undefined, undefined, toolContext(root)), /requires planPath/);
 });
 
+test("research_method_improve routes A/A calibration without invoking search or imposing a fee ceiling", async (t) => {
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-aa-route-")));
+	t.after(() => import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true })));
+	const plan = { version: 1, kind: "m07-evidence-handoff-aa/v1", marker: "calibration-only" };
+	await writeFile(path.join(root, "calibration.json"), JSON.stringify(plan));
+	const calls: Array<{ workspace: string; plan: unknown; signal?: AbortSignal }> = [];
+	const signal = new AbortController().signal;
+	const factory = (workspace: string, receivedSignal?: AbortSignal) => ({
+		runWorkflow: async () => { throw new Error("calibration entered candidate search"); },
+		calibrateWorkflow: async (input: unknown) => {
+			calls.push({ workspace, plan: input, signal: receivedSignal });
+			return { runId: "aa-offline", status: "complete", baseline: "builtin", methodVersionId: "builtin-default", pairs: [
+				{ armA: { checkResults: [{ passed: false }] }, armA2: { checkResults: [{ passed: false }] }, differences: [] },
+				{ armA: { checkResults: [{ passed: true }] }, armA2: { checkResults: [{ passed: false }] }, differences: [{ criterion: "evidence" }] },
+			], scientificBenefit: "unverified", budgetAtEnd: { settlement: "settled" } };
+		},
+	});
+	const tool = captureExtension(new ResearchService({ defaultWorkspace: root }), undefined, factory).tools.get("research_method_improve")!;
+	assert.match(JSON.stringify(tool.parameters), /workflow-calibrate/);
+	assert.doesNotMatch(JSON.stringify(tool.promptGuidelines), /cost ceiling|monetary ceiling/i);
+	const value = await tool.execute("aa", { action: "workflow-calibrate", workspace: root, planPath: "calibration.json" }, signal, undefined, toolContext(root));
+	assert.deepEqual(calls, [{ workspace: root, plan, signal }]);
+	assert.match(JSON.stringify(value), /aa-offline/);
+	assert.match(JSON.stringify(value), /unverified/);
+	assert.deepEqual(Object.fromEntries(["pairCount", "partialArmCount", "pairsWithDifferingChecks", "pairsWithFailedChecks"].map((key) => [key, (value.details as any).summary[key]])), { pairCount: 2, partialArmCount: 0, pairsWithDifferingChecks: 1, pairsWithFailedChecks: 2 });
+	await assert.rejects(tool.execute("missing", { action: "workflow-calibrate", workspace: root }, undefined, undefined, toolContext(root)), /requires planPath/);
+});
+
 test("research_delegate passes approved plan, versioned resources, bounded loop, and lesson output to M07", async () => {
 	const seen: unknown[] = [];
 	const service = { delegate: async (_runId: string, task: unknown) => { seen.push(task); return { taskId: "task-offline", status: "returned" }; } } as unknown as ResearchService;

@@ -2,6 +2,7 @@
 import { randomBytes } from "node:crypto";
 import { cp, lstat, mkdir, readFile, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
+import { resolveRoleModel } from "../config.ts";
 import { SharedBudget } from "../experiments/budget.ts";
 import type { BudgetLease } from "../experiments/contracts.ts";
 import { createFileKnowledgeStore } from "../knowledge/store.ts";
@@ -13,13 +14,13 @@ import { runM04 } from "../stages/m04.ts";
 import type { StageContext } from "../stages/context.ts";
 import { HarnessError } from "../types.ts";
 import { nowIso, Workspace, writeFileAtomic } from "../workspace.ts";
-import { GenerationStore, isM07WorkflowStrategy, type M07WorkflowStrategyV1, type StrategyRecordV1, validateStrategy } from "./generation.ts";
+import { GenerationStore, isM07WorkflowStrategy, type GenerationBundleV1, type M07WorkflowStrategyV1, type StrategyRecordV1, validateStrategy } from "./generation.ts";
 import { validateActiveBudgetPointer, validateBudgetPolicy } from "./policy.ts";
 import { buildWorkflowMetaEpisode, loadWorkflowMetaEpisode, metaEpisodeForModel, writeMetaEpisode } from "./meta-episode.ts";
 import { validateResearchHypothesis, type ResearchHypothesisV1 } from "./policy-host.ts";
 import { runBoundedModelStep } from "./research-model.ts";
 import { timedPrompt } from "./admission.ts";
-import { validateWorkflowCaseSet, type WorkflowArmReceiptV1, type WorkflowCaseSetV1, type WorkflowEvidenceHandoffPlanV1, type WorkflowRunV1 } from "./workflow-types.ts";
+import { validateWorkflowCaseSet, type WorkflowArmReceiptV1, type WorkflowCalibrationArmV1, type WorkflowCalibrationPlanV1, type WorkflowCalibrationRunV1, type WorkflowCaseSetV1, type WorkflowEvidenceHandoffPlanV1, type WorkflowRunV1 } from "./workflow-types.ts";
 
 type Action = { kind: "inspect"; object: "method" | "development-feedback" | "meta-episode"; id: string; start: number; maxChars: number } |
 	{ kind: "propose"; target: "executor"; body: string; hypothesis: ResearchHypothesisV1 } |
@@ -205,6 +206,70 @@ async function protectAdmissionInputs(source: Workspace, plan: WorkflowEvidenceH
 	for (const file of protectedInputs) if (await realpath(file) === caseFile) throw new HarnessError("improvement.workflow-g", "protected case file overlaps model-visible input");
 }
 
+async function verifyLiveWorkflowRecords(ws: Workspace, records: StrategyRecordV1[], registeredStores?: ReadonlyMap<string, KnowledgeStore>): Promise<void> {
+	const refs = uniqueRefs(records.flatMap((record) => [...record.requiredKnowledgeRefs, ...record.requiredExperienceRefs.map((item) => item.ref)]));
+	await verifyRequiredKnowledge(ws.root, refs, undefined, registeredStores);
+	const knowledge = createFileKnowledgeStore(ws.knowledgeDir); await knowledge.init();
+	const provider = createExperienceProvider(knowledge, registeredStores);
+	for (const targetKind of ["executor", "improver"] as const) {
+		const requestedRefs = uniqueRefs(records.flatMap((record) => record.requiredExperienceRefs.filter((item) => item.targetKind === targetKind).map((item) => item.ref)));
+		if (!requestedRefs.length) continue;
+		const applicability = targetKind === "executor" ? { stage: "M07", tags: ["evidence-handoff"] } : { stage: "method-research", tags: ["m07-evidence-handoff"] };
+		const selected = await provider.select({ targetKind, applicability, requestedRefs, maxRecords: 1, maxChars: 1, verificationOnly: true });
+		if (selected.status !== "ready" || selected.selected.length !== requestedRefs.length) throw new HarnessError("improvement.experience", `necessary ${targetKind} experience is unavailable or inapplicable`);
+	}
+}
+
+async function assertWorkflowExperimentRoot(ws: Workspace, root: string): Promise<void> {
+	const sourceRoot = await realpath(ws.root);
+	let existing = root;
+	while (!(await stat(existing).catch(() => undefined))) existing = path.dirname(existing);
+	for (let ancestor = path.dirname(root); ancestor !== path.dirname(ancestor); ancestor = path.dirname(ancestor)) {
+		if (await stat(path.join(ancestor, ".workflow-experiment-root.json")).catch(() => undefined)) throw new HarnessError("improvement.workflow-root", "experiment root overlaps an earlier workflow study");
+	}
+	const physicalRoot = path.join(await realpath(existing), path.relative(existing, root));
+	if (nested(physicalRoot, sourceRoot) || nested(sourceRoot, physicalRoot)) throw new HarnessError("improvement.workflow-root", "experiment root must be disjoint from the live workspace");
+}
+
+async function formalWorkflowSource(ws: Workspace, runner: SessionRunner, bundle: GenerationBundleV1) {
+	const currentKnowledge = createFileKnowledgeStore(ws.knowledgeDir); await currentKnowledge.init();
+	const formal = await latestFormalBaseline({ ws, store: currentKnowledge, runner, config: await ws.loadConfig() });
+	const currentSnapshot = (await currentKnowledge.current())?.id;
+	if (!formal || formal.knowledgeSnapshot !== bundle.knowledgeSnapshot || currentSnapshot !== bundle.knowledgeSnapshot) throw new HarnessError("improvement.workflow-baseline", "frozen H/K and the current formal M04 baseline must share one knowledge epoch");
+	const frozenLimits = JSON.stringify(await currentKnowledge.limits());
+	const ensureLiveLimits = async () => {
+		if (JSON.stringify(await currentKnowledge.limits()) !== frozenLimits) throw new HarnessError("improvement.workflow-epoch", "live limits changed during the campaign");
+	};
+	return { currentKnowledge, formalRunId: formal.run.runId, currentSnapshot, frozenLimits, ensureLiveLimits };
+}
+
+async function freezeWorkflowTemplate(args: { ws: Workspace; root: string; runId: string; bundle: GenerationBundleV1; h: StrategyRecordV1; i: StrategyRecordV1; cases: WorkflowCaseSetV1; formalRunId: string; activePolicy: Awaited<ReturnType<typeof activePolicyFiles>>; currentKnowledge: ReturnType<typeof createFileKnowledgeStore>; currentSnapshot?: string; frozenLimits: string; protectedCases?: WorkflowCaseSetV1; checkImproverModel: boolean }): Promise<{ template: Workspace; protectedInputs?: Workspace }> {
+	const { ws, root, runId, bundle, h, i, cases, formalRunId, activePolicy, currentKnowledge, currentSnapshot, frozenLimits, protectedCases, checkImproverModel } = args;
+	await mkdir(root); // exclusive: no arm can overwrite a previous study
+	await writeFileAtomic(path.join(root, ".workflow-experiment-root.json"), `${JSON.stringify({ version: 1, runId, sourceWorkspace: ws.root })}\n`);
+	const template = (await seedArm(ws, path.join(root, "template"), bundle, h, i, cases.cases[0]!, formalRunId, activePolicy)).ws;
+	const frozenConfig = await template.loadConfig();
+	if (resolveRoleModel(frozenConfig, "research") !== bundle.modelConfig.research || checkImproverModel && resolveRoleModel(frozenConfig, "improver") !== bundle.modelConfig.improver) throw new HarnessError("improvement.workflow-baseline", "frozen model configuration differs from the active research bundle");
+	await freezeCaseInputs(ws, template, cases.cases);
+	let protectedInputs: Workspace | undefined;
+	if (protectedCases) {
+		protectedInputs = new Workspace(path.join(root, "protected", "inputs"));
+		await writeFileAtomic(path.join(root, "protected", "cases.json"), `${JSON.stringify(protectedCases, null, 2)}\n`);
+		await freezeCaseInputs(ws, protectedInputs, protectedCases.cases);
+	}
+	// A copied knowledge snapshot must not inherit its producer's unfinished transaction.
+	if ((await readdir(template.knowledgeDir)).includes(".merge.lock")) throw new HarnessError("improvement.workflow-epoch", "unfinished knowledge merge was captured while freezing the research source");
+	for (const file of await readdir(path.join(template.knowledgeDir, "proposals"))) {
+		if (!/^P\d{4,}\.intent\.json$/.test(file)) continue;
+		const intent = await boundedJson(path.join(template.knowledgeDir, "proposals", file), 8 * 1024 * 1024) as { status?: string };
+		if (intent.status !== "committed") throw new HarnessError("improvement.workflow-epoch", "unfinished knowledge merge was captured while freezing the research source");
+	}
+	const templateKnowledge = createFileKnowledgeStore(template.knowledgeDir);
+	if ((await currentKnowledge.current())?.id !== currentSnapshot || (await templateKnowledge.current())?.id !== currentSnapshot || JSON.stringify(await templateKnowledge.limits()) !== frozenLimits) throw new HarnessError("improvement.workflow-epoch", "knowledge changed while freezing the research source");
+	await templateKnowledge.regenerateViews();
+	return { template, protectedInputs };
+}
+
 function assertWorkflowBudgetOpen(budget: SharedBudget, lease: BudgetLease): void {
 	if (budget.status(lease).inFlight)
 		throw new HarnessError("improvement.budget", "workflow provider request remains in flight");
@@ -292,35 +357,84 @@ async function executeArm(args: { source: Workspace; root: string; bundle: NonNu
 	return receipt;
 }
 
+/** A/A is an observation of one frozen method, never a candidate search or admission. */
+export async function calibrateWorkflowEvidenceHandoff(args: { ws: Workspace; store: GenerationStore; runner: SessionRunner; plan: WorkflowCalibrationPlanV1; registeredExperienceStores?: ReadonlyMap<string, KnowledgeStore> }): Promise<WorkflowCalibrationRunV1> {
+	const { ws, store, runner, plan, registeredExperienceStores } = args;
+	const active = await store.active();
+	if (!active) throw new HarnessError("improvement.workflow-calibration", "an active workflow H/I bundle is required");
+	const h = await store.readStrategy(active.bundle.executorVersionId);
+	const i = await store.readStrategy(active.bundle.improverVersionId);
+	if (active.bundle.environmentVersion !== "m07-workflow/v1" || !active.bundle.allowedCapabilities.includes("m07-evidence-read") || active.bundle.allowedCapabilities.includes("cpu-probe") || !isM07WorkflowStrategy(h.artifact) || h.artifact.slot !== "evidence-handoff" || i.artifact.kind !== "diagnostic-improver-prompt") throw new HarnessError("improvement.workflow-calibration", "active bundle must contain the evidence-handoff workflow method");
+	if (plan.baseline === "active-h") await verifyLiveWorkflowRecords(ws, [h], registeredExperienceStores);
+	const root = path.resolve(ws.root, plan.experimentRoot);
+	await assertWorkflowExperimentRoot(ws, root);
+	const runId = id(), dir = path.join(store.root, "workflow-calibrations", runId), budget = new SharedBudget(runId, {});
+	const methodVersionId = plan.baseline === "builtin" ? "builtin-default" : h.versionId;
+	const run: WorkflowCalibrationRunV1 = { version: 1, kind: "m07-evidence-handoff-aa/v1", evidenceScope: "local-handoff-calibration", scientificBenefit: "unverified", runId, startedAt: nowIso(), status: "running", baseline: plan.baseline, baselineBundleId: active.bundle.bundleId, methodVersionId, knowledgeSnapshot: active.bundle.knowledgeSnapshot, pairs: [] };
+	await mkdir(dir, { recursive: true });
+	const save = async () => { run.budgetAtEnd = budget.status(); await writeFileAtomic(path.join(dir, "run.json"), `${JSON.stringify(run, null, 2)}\n`); };
+	await save();
+	try {
+		const { currentKnowledge, formalRunId, currentSnapshot, frozenLimits, ensureLiveLimits } = await formalWorkflowSource(ws, runner, active.bundle);
+		run.formalM04RunId = formalRunId;
+		const cases = await loadCases(path.resolve(ws.root, plan.caseSetPath), "development");
+		await writeFileAtomic(path.join(dir, "plan.json"), `${JSON.stringify(plan, null, 2)}\n`);
+		await writeFileAtomic(path.join(dir, "development-cases.json"), `${JSON.stringify(cases, null, 2)}\n`);
+		const activePolicy = await activePolicyFiles(ws);
+		const { template } = await freezeWorkflowTemplate({ ws, root, runId, bundle: active.bundle, h, i, cases, formalRunId, activePolicy, currentKnowledge, currentSnapshot, frozenLimits, checkImproverModel: false });
+		await ensureLiveLimits();
+		run.sourceWorkspace = template.root;
+		await save();
+		const beforePrompt = async () => {
+			await ensureLiveLimits();
+			if (plan.baseline === "active-h") await verifyLiveWorkflowRecords(ws, [h], registeredExperienceStores);
+			const current = await store.active();
+			if (current?.pointer.bundleId !== active.pointer.bundleId || current.pointer.runId !== active.pointer.runId) throw new HarnessError("improvement.stale-baseline", "active workflow method changed during A/A calibration");
+		};
+		for (let repetition = 0; repetition < plan.repetitions; repetition++) for (const item of cases.cases) {
+			const executionOrder: ["A", "A2"] | ["A2", "A"] = repetition % 2 === 0 ? ["A", "A2"] : ["A2", "A"];
+			run.partialPair = { caseId: item.id, repetition, executionOrder };
+			for (const label of executionOrder) {
+				const receipt = await executeArm({ source: template, root: path.join(root, `calibration-${repetition}-${item.id}-${label}`), bundle: active.bundle, h, i, caseInput: item, arm: label === "A" ? "baseline" : "candidate", builtinBaseline: plan.baseline === "builtin", runner, budget, lease: budget.root, formalRunId, beforePrompt });
+				const calibrationReceipt: WorkflowCalibrationArmV1 = { ...receipt, arm: label };
+				await writeFileAtomic(path.join(dir, `arm-${repetition}-${item.id}-${label}.json`), `${JSON.stringify(calibrationReceipt, null, 2)}\n`);
+				if (label === "A") run.partialPair.armA = calibrationReceipt;
+				else run.partialPair.armA2 = calibrationReceipt;
+				await save();
+				if (receipt.status !== "complete" || !receipt.usage.complete) { run.status = "inconclusive"; run.stopReason = `A/A handoff arm ${label} was incomplete`; return run; }
+			}
+			const armA = run.partialPair.armA!, armA2 = run.partialPair.armA2!;
+			if (armA.methodVersionId !== armA2.methodVersionId || JSON.stringify(armA.methodBinding) !== JSON.stringify(armA2.methodBinding)) throw new HarnessError("improvement.workflow-calibration", "A/A arms did not retain the same method binding");
+			const differences = item.checks.flatMap((check, index) => {
+				const aPassed = armA.checkResults[index]?.passed, a2Passed = armA2.checkResults[index]?.passed;
+				return aPassed !== undefined && a2Passed !== undefined && aPassed !== a2Passed ? [{ criterion: check.criterion, aPassed, a2Passed }] : [];
+			});
+			run.pairs.push({ caseId: item.id, repetition, executionOrder, armA, armA2, differences });
+			delete run.partialPair;
+			await save();
+		}
+		const current = await store.active();
+		if (current?.pointer.bundleId !== active.pointer.bundleId || current.pointer.runId !== active.pointer.runId) { run.status = "inconclusive"; run.stopReason = "active workflow method changed during A/A calibration"; return run; }
+		run.status = "complete";
+		return run;
+	} catch (error) {
+		run.status = error instanceof HarnessError && ["improvement.budget", "improvement.usage", "improvement.timeout", "improvement.workflow-usage", "improvement.experience", "improvement.workflow-epoch", "improvement.stale-baseline"].includes(error.code) ? "inconclusive" : "failed";
+		run.stopReason = (error as Error).message;
+		return run;
+	} finally { run.finishedAt = nowIso(); await save(); }
+}
+
 export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: GenerationStore; runner: SessionRunner; plan: WorkflowEvidenceHandoffPlanV1; registeredExperienceStores?: ReadonlyMap<string, KnowledgeStore> }): Promise<WorkflowRunV1> {
- const { ws, store, runner, plan, registeredExperienceStores } = args;
+	const { ws, store, runner, plan, registeredExperienceStores } = args;
 	const comparisonBaseline = plan.baseline ?? "active-h";
 	const active = await store.active();
 	if (!active) throw new HarnessError("improvement.workflow", "explicit workflow H/I bundle is required");
 	const h = await store.readStrategy(active.bundle.executorVersionId), i = await store.readStrategy(active.bundle.improverVersionId);
 	if (active.bundle.environmentVersion !== "m07-workflow/v1" || !active.bundle.allowedCapabilities.includes("m07-evidence-read") || active.bundle.allowedCapabilities.includes("cpu-probe") || !isM07WorkflowStrategy(h.artifact) || h.artifact.slot !== "evidence-handoff" || i.artifact.kind !== "diagnostic-improver-prompt") throw new HarnessError("improvement.workflow", "active bundle must contain evidence-handoff H and diagnostic I");
-	const verifyLive = async (records: StrategyRecordV1[]) => {
-		const refs = uniqueRefs(records.flatMap((record) => [...record.requiredKnowledgeRefs, ...record.requiredExperienceRefs.map((item) => item.ref)]));
-		await verifyRequiredKnowledge(ws.root, refs, undefined, registeredExperienceStores);
-		const knowledge = createFileKnowledgeStore(ws.knowledgeDir); await knowledge.init();
-		const provider = createExperienceProvider(knowledge, registeredExperienceStores);
-		for (const targetKind of ["executor", "improver"] as const) {
-			const requestedRefs = uniqueRefs(records.flatMap((record) => record.requiredExperienceRefs.filter((item) => item.targetKind === targetKind).map((item) => item.ref)));
-			if (!requestedRefs.length) continue;
-			const applicability = targetKind === "executor" ? { stage: "M07", tags: ["evidence-handoff"] } : { stage: "method-research", tags: ["m07-evidence-handoff"] };
-			const selected = await provider.select({ targetKind, applicability, requestedRefs, maxRecords: 1, maxChars: 1, verificationOnly: true });
-			if (selected.status !== "ready" || selected.selected.length !== requestedRefs.length) throw new HarnessError("improvement.experience", `necessary ${targetKind} experience is unavailable or inapplicable`);
-		}
-	};
+	const verifyLive = (records: StrategyRecordV1[]) => verifyLiveWorkflowRecords(ws, records, registeredExperienceStores);
 	await verifyLive([h, i]);
-	const root = path.resolve(ws.root, plan.experimentRoot), sourceRoot = await realpath(ws.root);
-	let existing = root;
-	while (!(await stat(existing).catch(() => undefined))) existing = path.dirname(existing);
-	for (let ancestor = path.dirname(root); ancestor !== path.dirname(ancestor); ancestor = path.dirname(ancestor)) {
-		if (await stat(path.join(ancestor, ".workflow-experiment-root.json")).catch(() => undefined)) throw new HarnessError("improvement.workflow-root", "experiment root overlaps an earlier workflow study");
-	}
-	const physicalRoot = path.join(await realpath(existing), path.relative(existing, root));
-	if (nested(physicalRoot, sourceRoot) || nested(sourceRoot, physicalRoot)) throw new HarnessError("improvement.workflow-root", "experiment root must be disjoint from the live workspace");
+	const root = path.resolve(ws.root, plan.experimentRoot);
+	await assertWorkflowExperimentRoot(ws, root);
 	const runId = id(), dir = path.join(store.root, "workflow-runs", runId), budget = new SharedBudget(runId, plan.budget ?? {});
 	const run: WorkflowRunV1 = { version: 1, kind: "m07-evidence-handoff/v1", evidenceScope: "local-handoff-mechanism", scientificBenefit: "unverified", runId, startedAt: nowIso(), status: "running", baselineBundleId: active.bundle.bundleId, baselineExecutorVersionId: comparisonBaseline === "builtin" ? "builtin-default" : h.versionId, comparisonBaseline, proposalSeedHVersionId: h.versionId, improverVersionId: i.versionId, knowledgeSnapshot: active.bundle.knowledgeSnapshot, developmentSource: plan.developmentSource, decisions: [], candidates: [], developmentArms: [], protectedArms: [] };
 	await mkdir(dir, { recursive: true });
@@ -328,14 +442,7 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 	await save();
 	try {
 		const source = await loadSource(ws, plan);
-		const currentKnowledge = createFileKnowledgeStore(ws.knowledgeDir); await currentKnowledge.init();
-		const formal = await latestFormalBaseline({ ws, store: currentKnowledge, runner, config: await ws.loadConfig() });
-		const currentSnapshot = (await currentKnowledge.current())?.id;
-		if (!formal || formal.knowledgeSnapshot !== active.bundle.knowledgeSnapshot || currentSnapshot !== active.bundle.knowledgeSnapshot) throw new HarnessError("improvement.workflow-baseline", "frozen H/K and the current formal M04 baseline must share one knowledge epoch before I starts");
-		const frozenLimits = JSON.stringify(await currentKnowledge.limits());
-		const ensureLiveLimits = async () => {
-			if (JSON.stringify(await currentKnowledge.limits()) !== frozenLimits) throw new HarnessError("improvement.workflow-epoch", "live limits changed during the campaign");
-		};
+		const { currentKnowledge, formalRunId, currentSnapshot, frozenLimits, ensureLiveLimits } = await formalWorkflowSource(ws, runner, active.bundle);
 		const requestedExperienceRefs = plan.experienceRefs ?? [];
 		const selectExperience = () => createExperienceProvider(currentKnowledge, registeredExperienceStores).select({ targetKind: "improver", applicability: { stage: "method-research", tags: ["m07-evidence-handoff"] }, requestedRefs: requestedExperienceRefs, maxRecords: plan.experienceMaxRecords || 1, maxChars: plan.experienceMaxChars || 1 });
 		const selectedExperience = await selectExperience();
@@ -350,30 +457,11 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 		const admission = plan.admissionCaseSetPath ? await loadCases(path.resolve(ws.root, plan.admissionCaseSetPath), "admission") : undefined;
 		if (admission?.cases.some((a) => development.cases.some((d) => a.id === d.id || JSON.stringify({ ...a, id: "" }) === JSON.stringify({ ...d, id: "" })))) throw new HarnessError("improvement.workflow-g", "development and protected cases overlap");
 		const activePolicy = await activePolicyFiles(ws);
-		await protectAdmissionInputs(ws, plan, development, admission, formal.run.runId, activePolicy);
+		await protectAdmissionInputs(ws, plan, development, admission, formalRunId, activePolicy);
 		const priorEpisodes = await Promise.all((plan.metaEpisodeRunIds ?? []).map((priorId) => loadWorkflowMetaEpisode(store.root, ws.root, priorId, store)));
-		await mkdir(root); // exclusive: caller receives an error before any arm can overwrite a previous study
-		await writeFileAtomic(path.join(root, ".workflow-experiment-root.json"), `${JSON.stringify({ version: 1, runId, sourceWorkspace: ws.root })}\n`);
-		const template = (await seedArm(ws, path.join(root, "template"), active.bundle, h, i, development.cases[0]!, formal.run.runId, activePolicy)).ws;
-		await freezeCaseInputs(ws, template, development.cases);
-		const protectedInputs = new Workspace(path.join(root, "protected", "inputs"));
-		if (admission) {
-			await writeFileAtomic(path.join(root, "protected", "cases.json"), `${JSON.stringify(admission, null, 2)}\n`);
-			await freezeCaseInputs(ws, protectedInputs, admission.cases);
-			run.protectedFrozenAt = nowIso();
-		}
-		// A snapshot is a research source, not a second owner of the producer's transaction.
-		if ((await readdir(template.knowledgeDir)).includes(".merge.lock")) throw new HarnessError("improvement.workflow-epoch", "unfinished knowledge merge was captured while freezing the research source");
-		const proposalsDir = path.join(template.knowledgeDir, "proposals");
-		for (const file of await readdir(proposalsDir)) {
-			if (!/^P\d{4,}\.intent\.json$/.test(file)) continue;
-			const intent = await boundedJson(path.join(proposalsDir, file), 8 * 1024 * 1024) as { status?: string };
-			if (intent.status !== "committed") throw new HarnessError("improvement.workflow-epoch", "unfinished knowledge merge was captured while freezing the research source");
-		}
-		const templateKnowledge = createFileKnowledgeStore(template.knowledgeDir);
-		if ((await currentKnowledge.current())?.id !== currentSnapshot || (await templateKnowledge.current())?.id !== currentSnapshot || JSON.stringify(await templateKnowledge.limits()) !== frozenLimits) throw new HarnessError("improvement.workflow-epoch", "knowledge changed while freezing the research source");
+		const { template, protectedInputs } = await freezeWorkflowTemplate({ ws, root, runId, bundle: active.bundle, h, i, cases: development, formalRunId, activePolicy, currentKnowledge, currentSnapshot, frozenLimits, protectedCases: admission, checkImproverModel: true });
 		await ensureLiveLimits();
-		await templateKnowledge.regenerateViews();
+		if (admission) run.protectedFrozenAt = nowIso();
 		run.sourceWorkspace = template.root;
 		await save();
 		const beforePrompt = async (records: StrategyRecordV1[]) => { await ensureLiveLimits(); await verifyLive(records); await ensureLiveExperience(); };
@@ -430,7 +518,7 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 				for (const item of development.cases) {
 					const receipts: WorkflowArmReceiptV1[] = [];
 					for (const [arm, method] of [["baseline", h], ["candidate", candidateRecord]] as const) {
-						const receipt = await executeArm({ source: template, root: path.join(root, `development-${candidate.versionId}-${item.id}-${arm}`), bundle: active.bundle, h: method, i, caseInput: item, arm, builtinBaseline: arm === "baseline" && comparisonBaseline === "builtin", runner, budget, lease: budget.root, perPromptTimeoutMs: plan.perPromptTimeoutMs, formalRunId: formal.run.runId, beforePrompt: () => beforePrompt([h, i, candidateRecord]) });
+						const receipt = await executeArm({ source: template, root: path.join(root, `development-${candidate.versionId}-${item.id}-${arm}`), bundle: active.bundle, h: method, i, caseInput: item, arm, builtinBaseline: arm === "baseline" && comparisonBaseline === "builtin", runner, budget, lease: budget.root, perPromptTimeoutMs: plan.perPromptTimeoutMs, formalRunId, beforePrompt: () => beforePrompt([h, i, candidateRecord]) });
 						run.developmentArms.push(receipt); receipts.push(receipt); await save();
 						if (receipt.status !== "complete" || !receipt.usage.complete) break;
 					}
@@ -459,7 +547,7 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 			for (let repeat = 0; repeat < plan.admissionRepetitions; repeat++) for (const item of admission.cases) {
 				const receipts: WorkflowArmReceiptV1[] = [];
 				const order = repeat % 2 === 0 ? [["baseline", h], ["candidate", candidateRecord]] as const : [["candidate", candidateRecord], ["baseline", h]] as const;
-				for (const [arm, method] of order) { const receipt = await executeArm({ source: template, root: path.join(root, `protected-${repeat}-${item.id}-${arm}`), bundle: active.bundle, h: method, i, caseInput: item, arm, builtinBaseline: arm === "baseline" && comparisonBaseline === "builtin", runner, budget, lease: budget.root, perPromptTimeoutMs: plan.perPromptTimeoutMs, formalRunId: formal.run.runId, protectedInputs, beforePrompt: () => beforePrompt([h, i, candidateRecord]) }); run.protectedArms.push(receipt); receipts.push(receipt); await save(); if (receipt.status !== "complete" || !receipt.usage.complete) break; }
+				for (const [arm, method] of order) { const receipt = await executeArm({ source: template, root: path.join(root, `protected-${repeat}-${item.id}-${arm}`), bundle: active.bundle, h: method, i, caseInput: item, arm, builtinBaseline: arm === "baseline" && comparisonBaseline === "builtin", runner, budget, lease: budget.root, perPromptTimeoutMs: plan.perPromptTimeoutMs, formalRunId, protectedInputs, beforePrompt: () => beforePrompt([h, i, candidateRecord]) }); run.protectedArms.push(receipt); receipts.push(receipt); await save(); if (receipt.status !== "complete" || !receipt.usage.complete) break; }
 				if (receipts.some((r) => r.status !== "complete" || !r.usage.complete)) { run.status = "inconclusive"; run.outcome = "search-incomplete"; run.stopReason = "protected arm or usage incomplete"; return run; }
 				const before = receipts.find((r) => r.arm === "baseline")!, after = receipts.find((r) => r.arm === "candidate")!;
 				if (after.checkResults.some((r) => !r.passed) || !before.checkResults.some((r) => !r.passed)) { run.status = "rejected"; run.outcome = "candidate-rejected"; run.stopReason = "protected G found no strict gain or incomplete candidate checks"; return run; }

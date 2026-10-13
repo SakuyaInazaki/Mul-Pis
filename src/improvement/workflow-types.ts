@@ -18,6 +18,15 @@ export interface WorkflowCaseV1 {
 	checks: WorkflowCheckV1[];
 }
 export interface WorkflowCaseSetV1 { version: 1; split: "development" | "admission"; cases: WorkflowCaseV1[] }
+export interface WorkflowCalibrationPlanV1 {
+	version: 1;
+	kind: "m07-evidence-handoff-aa/v1";
+	caseSetPath: string;
+	experimentRoot: string;
+	baseline: "active-h" | "builtin";
+	/** Caller-declared sample size: each repetition executes one fresh A/A pair per case. */
+	repetitions: number;
+}
 export interface WorkflowEvidenceHandoffPlanV1 {
 	version: 1;
 	kind: "m07-evidence-handoff/v1";
@@ -65,6 +74,27 @@ export interface WorkflowArmReceiptV1 {
 	status: "complete" | "inconclusive";
 	reason?: string;
 }
+export type WorkflowCalibrationArmV1 = Omit<WorkflowArmReceiptV1, "arm"> & { arm: "A" | "A2" };
+export interface WorkflowCalibrationRunV1 {
+	version: 1;
+	kind: "m07-evidence-handoff-aa/v1";
+	evidenceScope: "local-handoff-calibration";
+	scientificBenefit: "unverified";
+	runId: string;
+	startedAt: string;
+	finishedAt?: string;
+	status: "running" | "complete" | "inconclusive" | "failed";
+	baseline: "active-h" | "builtin";
+	baselineBundleId: string;
+	methodVersionId: string;
+	knowledgeSnapshot?: string;
+	formalM04RunId?: string;
+	sourceWorkspace?: string;
+	pairs: Array<{ caseId: string; repetition: number; executionOrder: ["A", "A2"] | ["A2", "A"]; armA: WorkflowCalibrationArmV1; armA2: WorkflowCalibrationArmV1; differences: Array<{ criterion: string; aPassed: boolean; a2Passed: boolean }> }>;
+	partialPair?: { caseId: string; repetition: number; executionOrder: ["A", "A2"] | ["A2", "A"]; armA?: WorkflowCalibrationArmV1; armA2?: WorkflowCalibrationArmV1 };
+	budgetAtEnd?: unknown;
+	stopReason?: string;
+}
 export interface WorkflowRunV1 {
 	version: 1;
 	kind: "m07-evidence-handoff/v1";
@@ -104,6 +134,14 @@ export interface WorkflowRunV1 {
 }
 
 const safeId = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
+export function validateWorkflowCalibrationPlan(input: unknown): WorkflowCalibrationPlanV1 {
+	if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.workflow-calibration", "calibration plan must be an object");
+	const p = input as Record<string, unknown>;
+	if (Object.keys(p).sort().join(",") !== "baseline,caseSetPath,experimentRoot,kind,repetitions,version" || p.version !== 1 || p.kind !== "m07-evidence-handoff-aa/v1" || !["active-h", "builtin"].includes(String(p.baseline)) ||
+		typeof p.caseSetPath !== "string" || !p.caseSetPath.trim() || p.caseSetPath.length > 500 || typeof p.experimentRoot !== "string" || !p.experimentRoot.trim() || p.experimentRoot.length > 500 ||
+		!Number.isSafeInteger(p.repetitions) || (p.repetitions as number) < 2 || (p.repetitions as number) % 2 !== 0) throw new HarnessError("improvement.workflow-calibration", "calibration requires a development case path, isolated root, baseline, and caller-declared even repetitions");
+	return p as unknown as WorkflowCalibrationPlanV1;
+}
 function budget(value: unknown): value is BudgetLimits {
 	if (value === undefined) return true;
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;

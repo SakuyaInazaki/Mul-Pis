@@ -66,6 +66,10 @@ M07 可在新目标 begin 时显式指定当前活跃的 `m07-workflow-prompt` H
 
 M07 `evidence-handoff` 另有显式单槽入口：`improve research bootstrap --methods <methods.json>` 可用 `m07-workflow-prompt`、`slot: "evidence-handoff"` 与 `diagnostic-improver-prompt` 建立独立于 CPU 的方法包；`improve research workflow run --plan <plan.json>` 才启动 I。计划结构由 [`WorkflowEvidenceHandoffPlanV1`](../../src/improvement/workflow-types.ts) 定义，需指定真实已冻结的 `developmentSource`（M07 run、checkpoint、处理该包的 M04 run）、开发案例文件、与源工作区及彼此隔离且尚不存在的 `experimentRoot`，以及成对重复数；独立 G 案例文件可省略，此时仅研究留档。H 候选只能改交接槽正文，不能改目标、答案、mandatory checks、工具或 G。正常 M07 begin 不会自行唤醒 I，已冻结目标也不热换 H。
 
+同版本 A/A 校准使用独立入口 `improve research workflow calibrate --plan <plan.json>`，Pi 工具对应 `research_method_improve` 的 `workflow-calibrate` action。它从当前一致的正式 M04/K 和同一方法出发，为每个开发案例建立两个全新 M07/M04 工作区，重复时交替执行 A 与 A2。计划只有 `version: 1`、`kind: "m07-evidence-handoff-aa/v1"`、`caseSetPath`、`experimentRoot`、`baseline: "builtin" | "active-h"` 和调用方指定的偶数 `repetitions`（至少 2）；案例文件使用现有 `split: "development"` 格式。重复数是校准的采样设计，费用按实际使用记录。
+
+校准记录保存在 `workflow-calibrations/`，保留两臂的独立运行标识、相同方法绑定、固定知识与输入、检查结果差异和用量。两个完整执行臂即使得到相同的失败检查，也原样记录；`complete` 仅表示校准链完成，不代表检查全通过或方法产生收益。校准入口不调用 I、不读取 G、不产生候选或改动生产活动方法。任何一臂证据交接或用量不完整，校准返回 `inconclusive`，保留已经形成的记录。
+
 开发材料供 I 检视之前先核对 M07 冻结包与 M04 来源绑定。历史 `developmentSource` 仅提供反馈，不充当新执行臂的形式基线；在任何 I 调用前，控制器要求当前知识快照、冻结 H/K 与最新 completed 形式 M04 基线的知识纪元一致，执行臂复制该形式基线。基线和候选在独立新工作区、固定知识快照、模型配置与检查下执行 M07 委派、review、checkpoint 及 M04 处理；控制器检查冻结报告及 M04 对完整报告的实际接收记录。受保护 G 的案例定义和命名输入在首个 I 调用前固定到控制区；它们不能与共同材料或开发输入重合。I 固定候选后，控制器才把该案例的冻结输入加入对应评测臂，结果不回灌 I。`contains`/`forbids` 是报告文字的机械完整性门，只能称本地交接机制证据，不能声称科学有效或泛化收益；没有独立 G、完整可见调用及工具证据或每臂通过条件时不自动激活。开发及准入案例均由调用方从已有资料准备，不存在系统预写赢家。历史 P3 checkpoint 与处理它的 M04 run 可作 `developmentSource`，但独立 G 与当前形式基线仍须另行冻结；M04/K 可能带历史先验，不能把案例路径隔离称为语义盲测。
 
 计划可显式设置 `baseline: "builtin"`，比较臂使用真实的默认 M07 执行方式，不注入额外 H；省略该字段或选择 `"active-h"` 保留原有的活动 H 基线。提案种子 H、候选的父版本与实际比较基线分别记录，不能把种子方法冒充默认工作流。两臂使用同一来源模板，包括正式 M04、知识、模型配置和活动证据投影策略。准入仍是固定的局部质量检查：每个案例、每次配对中候选全部检查通过，且基线至少一项失败。费用持续记录，不新增费用门槛；这种准入不能被解释为一般平均收益或等质量降本证明。

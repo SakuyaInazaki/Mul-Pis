@@ -23,8 +23,8 @@ import { runMetaImprovementAdmission, type ProducedSuccessorV1 } from "./meta-ev
 import { decisionPrompt, fullyReadDevelopmentFeedbackIds, improverSystemPrompt, validateResearchAction, type ResearchCaseViewV1, type ResearchDecisionViewV1, type ResearchInspectionRequestV1, type ResearchInspectionResultV1 } from "./policy-host.ts";
 import { runBoundedModelStep } from "./research-model.ts";
 import { validateResearchPlan, type ResearchCampaignPlanV1, type ResearchCandidateV1, type ResearchDecisionRecordV1, type ResearchRunV1 } from "./research-types.ts";
-import { runWorkflowEvidenceHandoff } from "./workflow-adapter.ts";
-import { validateWorkflowPlan } from "./workflow-types.ts";
+import { calibrateWorkflowEvidenceHandoff, runWorkflowEvidenceHandoff } from "./workflow-adapter.ts";
+import { validateWorkflowCalibrationPlan, validateWorkflowPlan } from "./workflow-types.ts";
 
 const activeMutations = new Set<string>();
 const RUN_ID = () => `${new Date().toISOString().replace(/[-:.]/g, "")}-${randomBytes(3).toString("hex")}`;
@@ -179,6 +179,8 @@ export class ResearchImprovementService {
  async run(input: unknown): Promise<ResearchRunV1> { const plan = validateResearchPlan(input); return this.withMutation(() => this.runUnlocked(plan)); }
  /** Explicit M07 method study. It cannot be reached from normal research or M07 begin. */
  async runWorkflow(input: unknown) { const plan = validateWorkflowPlan(input); return this.withMutation(() => runWorkflowEvidenceHandoff({ ws: this.ws, store: this.store, runner: this.runner, plan, registeredExperienceStores: this.registeredExperienceStores })); }
+ /** Same-method local A/A observation; it does not search, open G, or activate a method. */
+ async calibrateWorkflow(input: unknown) { const plan = validateWorkflowCalibrationPlan(input); return this.withMutation(() => calibrateWorkflowEvidenceHandoff({ ws: this.ws, store: this.store, runner: this.runner, plan, registeredExperienceStores: this.registeredExperienceStores })); }
 
  private async runUnlocked(plan: ResearchCampaignPlanV1): Promise<ResearchRunV1> {
   const active = await this.store.active(); if (!active) throw new HarnessError("improvement.generation", "bootstrap a human-seeded research generation first");

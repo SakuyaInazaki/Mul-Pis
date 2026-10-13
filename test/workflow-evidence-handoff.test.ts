@@ -166,6 +166,118 @@ async function fixture(t: import("node:test").TestContext, responder?: (ctx: Fak
 	return { parent, root, ws, gen, runner, plan, begun, bundle, knowledge, experienceRef };
 }
 
+test("workflow A/A calibration executes two fresh same-method arms without I, G, or promotion", async (t) => {
+	const f = await fixture(t, (ctx) => {
+		if (ctx.spec.role === "improver") throw new Error("calibration must not call I");
+		return ctx.spec.role === "research" ? "已读冻结报告。" : "同一方法返回的报告没有通过固定检查。";
+	});
+	await writeFile(path.join(f.root, "admission.json"), "invalid protected G on purpose");
+	const pointerBefore = await readFile(path.join(f.gen.root, "active.json"), "utf8");
+	const currentBefore = await readFile(path.join(f.ws.knowledgeDir, "CURRENT"), "utf8");
+	const before = f.runner.created.length;
+	const service = new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner });
+	const result = await service.calibrateWorkflow({ version: 1, kind: "m07-evidence-handoff-aa/v1", caseSetPath: "development.json", experimentRoot: path.join(f.parent, "calibration"), baseline: "active-h", repetitions: 2 });
+	assert.equal(result.status, "complete", result.stopReason ?? "");
+	assert.equal(result.pairs.length, 2);
+	assert.deepEqual(result.pairs.map((pair) => pair.executionOrder), [["A", "A2"], ["A2", "A"]]);
+	assert.ok(result.pairs.every((pair) => pair.differences.length === 0));
+	const arms = result.pairs.flatMap((pair) => [pair.armA, pair.armA2]);
+	assert.equal(new Set(arms.map((arm) => arm.m07RunId)).size, 4);
+	assert.equal(new Set(arms.map((arm) => arm.m04RunId)).size, 4);
+	assert.equal(new Set(arms.map((arm) => arm.workspaceRoot)).size, 4);
+	assert.ok(arms.every((arm) => arm.status === "complete" && arm.checkResults[0]?.passed === false));
+	assert.ok(arms.every((arm) => arm.methodVersionId === f.bundle.executorVersionId && arm.methodBinding?.kind === "injected-h"));
+	assert.ok(f.runner.created.slice(before).every((spec) => spec.role !== "improver"));
+	assert.equal(await readFile(path.join(f.gen.root, "active.json"), "utf8"), pointerBefore);
+	assert.equal(await readFile(path.join(f.ws.knowledgeDir, "CURRENT"), "utf8"), currentBefore);
+	assert.equal(result.scientificBenefit, "unverified");
+	const retained = path.join(f.gen.root, "workflow-calibrations", result.runId);
+	assert.equal(JSON.parse(await readFile(path.join(retained, "plan.json"), "utf8")).caseSetPath, "development.json");
+	assert.equal(JSON.parse(await readFile(path.join(retained, "development-cases.json"), "utf8")).split, "development");
+	assert.equal(JSON.parse(await readFile(path.join(retained, "arm-0-dev-a-A.json"), "utf8")).m07RunId, result.pairs[0]!.armA.m07RunId);
+});
+
+test("workflow A/A builtin arms ignore unused H and I necessary refs", async (t) => {
+	const f = await fixture(t, (ctx) => ctx.spec.role === "improver" ? Promise.reject(new Error("I must not run")) : ctx.spec.role === "research" ? "已处理冻结报告。" : "原始报告");
+	const active = (await f.gen.active())!;
+	const h = await f.gen.readStrategy(active.bundle.executorVersionId);
+	const i = await f.gen.readStrategy(active.bundle.improverVersionId);
+	const unavailable = [{ storeId: await f.knowledge.storeId(), recordId: "K999", version: 1 }];
+	const newH = await f.gen.writeStrategy({ versionId: f.gen.newId("H-unavailable"), kind: "executor", artifact: h.artifact, origin: "human-seed", applicability: ["M07"], limitations: [], requiredKnowledgeRefs: unavailable, state: "manual-active" });
+	const newI = await f.gen.writeStrategy({ versionId: f.gen.newId("I-unavailable"), kind: "improver", artifact: i.artifact, origin: "human-seed", applicability: ["M07"], limitations: [], requiredKnowledgeRefs: unavailable, state: "manual-active" });
+	const bundle = await f.gen.writeBundle({ bundleId: f.gen.newId("bundle"), parents: [active.bundle.bundleId], executorVersionId: newH.versionId, improverVersionId: newI.versionId, knowledgeSnapshot: active.bundle.knowledgeSnapshot, environmentVersion: active.bundle.environmentVersion, modelConfig: active.bundle.modelConfig, protocolVersion: active.bundle.protocolVersion, allowedCapabilities: active.bundle.allowedCapabilities, state: "manual-active" });
+	await f.gen.activate(bundle.bundleId, active.pointer, "external-manual-unverified", "test-unused-refs");
+	await assert.rejects(new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).calibrateWorkflow({ version: 1, kind: "m07-evidence-handoff-aa/v1", caseSetPath: "development.json", experimentRoot: path.join(f.parent, "loaded-h-aa"), baseline: "active-h", repetitions: 2 }), /necessary knowledge/);
+	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).calibrateWorkflow({ version: 1, kind: "m07-evidence-handoff-aa/v1", caseSetPath: "development.json", experimentRoot: path.join(f.parent, "builtin-aa"), baseline: "builtin", repetitions: 2 });
+	assert.equal(run.status, "complete", run.stopReason ?? "");
+	assert.ok(run.pairs.flatMap((pair) => [pair.armA, pair.armA2]).every((arm) => arm.methodVersionId === "builtin-default" && arm.methodBinding?.kind === "builtin"));
+});
+
+test("workflow A/A rejects frozen research model drift before a provider request", async (t) => {
+	const f = await fixture(t);
+	const config = JSON.parse(await readFile(f.ws.configFile, "utf8"));
+	config.roles.research = "fake/changed-research-model";
+	await writeFile(f.ws.configFile, JSON.stringify(config));
+	const before = f.runner.created.length;
+	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).calibrateWorkflow({ version: 1, kind: "m07-evidence-handoff-aa/v1", caseSetPath: "development.json", experimentRoot: path.join(f.parent, "model-drift-aa"), baseline: "active-h", repetitions: 2 });
+	assert.equal(run.status, "failed");
+	assert.match(run.stopReason ?? "", /frozen model configuration differs/);
+	assert.equal(f.runner.created.length, before);
+});
+
+test("workflow A/A records discordance without calling it improvement", async (t) => {
+	const f = await fixture(t, (ctx) => ctx.spec.role === "research" ? "已处理冻结报告。" : ctx.spec.persistDir.includes("-A2") ? "开发证据完整" : "原始报告");
+	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).calibrateWorkflow({ version: 1, kind: "m07-evidence-handoff-aa/v1", caseSetPath: "development.json", experimentRoot: path.join(f.parent, "discordant-aa"), baseline: "active-h", repetitions: 2 });
+	assert.equal(run.status, "complete", run.stopReason ?? "");
+	assert.deepEqual(run.pairs.map((pair) => pair.differences.length), [1, 1]);
+	assert.equal(run.scientificBenefit, "unverified");
+});
+
+test("workflow A/A retains the first arm receipt when the second handoff fails", async (t) => {
+	const f = await fixture(t, (ctx) => {
+		if (ctx.spec.role === "execution" && ctx.spec.persistDir.includes("-A2")) throw new Error("simulated second-arm provider failure");
+		return ctx.spec.role === "research" ? "已读冻结报告。" : "原始报告";
+	});
+	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).calibrateWorkflow({ version: 1, kind: "m07-evidence-handoff-aa/v1", caseSetPath: "development.json", experimentRoot: path.join(f.parent, "incomplete-aa"), baseline: "active-h", repetitions: 2 });
+	assert.equal(run.status, "inconclusive");
+	assert.equal(run.pairs.length, 0);
+	assert.equal(run.partialPair?.armA?.status, "complete");
+	assert.equal(run.partialPair?.armA2?.status, "inconclusive");
+	const retained = path.join(f.gen.root, "workflow-calibrations", run.runId);
+	assert.equal(JSON.parse(await readFile(path.join(retained, "arm-0-dev-a-A.json"), "utf8")).status, "complete");
+	assert.equal(JSON.parse(await readFile(path.join(retained, "arm-0-dev-a-A2.json"), "utf8")).status, "inconclusive");
+	assert.deepEqual(JSON.parse(await readFile(path.join(retained, "run.json"), "utf8")).partialPair, run.partialPair);
+});
+
+test("workflow A/A stops after an incomplete first arm and persists its partial pair", async (t) => {
+	const f = await fixture(t, (ctx) => {
+		if (ctx.spec.role === "execution" && ctx.spec.persistDir.includes("-A")) throw new Error("simulated first-arm provider failure");
+		return ctx.spec.role === "research" ? "已读冻结报告。" : "原始报告";
+	});
+	const before = f.runner.created.length;
+	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).calibrateWorkflow({ version: 1, kind: "m07-evidence-handoff-aa/v1", caseSetPath: "development.json", experimentRoot: path.join(f.parent, "first-incomplete-aa"), baseline: "active-h", repetitions: 2 });
+	assert.equal(run.status, "inconclusive");
+	assert.equal(run.pairs.length, 0);
+	assert.equal(run.partialPair?.armA?.status, "inconclusive");
+	assert.equal(run.partialPair?.armA2, undefined);
+	assert.equal(f.runner.created.slice(before).some((spec) => spec.persistDir.includes("-A2")), false);
+	const retained = path.join(f.gen.root, "workflow-calibrations", run.runId);
+	assert.equal(JSON.parse(await readFile(path.join(retained, "arm-0-dev-a-A.json"), "utf8")).status, "inconclusive");
+	assert.deepEqual(JSON.parse(await readFile(path.join(retained, "run.json"), "utf8")).partialPair, run.partialPair);
+});
+
+test("workflow search rejects frozen improver model drift before I runs", async (t) => {
+	const f = await fixture(t);
+	const config = JSON.parse(await readFile(f.ws.configFile, "utf8"));
+	config.roles.improver = "fake/changed-improver-model";
+	await writeFile(f.ws.configFile, JSON.stringify(config));
+	const before = f.runner.created.length;
+	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).runWorkflow(f.plan);
+	assert.equal(run.status, "failed");
+	assert.match(run.stopReason ?? "", /frozen model configuration differs/);
+	assert.equal(f.runner.created.length, before);
+});
+
 test("workflow I can repeatedly inspect past the old cumulative readback limit", async (t) => {
 	let reads = 0;
 	const f = await fixture(t, (ctx) => {
@@ -464,6 +576,21 @@ test("public CLI bootstrap feeds the explicit workflow entry and fails closed on
 	assert.equal(result.status, "inconclusive", output.at(-1) ?? "");
 	assert.equal(result.outcome, "search-incomplete");
 	assert.equal(result.protectedArms.length, 0);
+});
+
+test("public CLI exposes the independent workflow calibration entry", async (t) => {
+	const f = await fixture(t, undefined, true);
+	const planFile = path.join(f.root, "calibration-plan.json");
+	await writeFile(planFile, JSON.stringify({ version: 1, kind: "m07-evidence-handoff-aa/v1", caseSetPath: "development.json", experimentRoot: path.join(f.parent, "cli-calibration"), baseline: "builtin", repetitions: 2 }));
+	const output: string[] = [];
+	const original = console.log;
+	console.log = (...values: unknown[]) => { output.push(values.map(String).join(" ")); };
+	try { assert.equal(await main(["improve", "research", "workflow", "calibrate", "--workspace", f.root, "--plan", planFile, "--runner", "fake"]), 1); }
+	finally { console.log = original; }
+	const result = JSON.parse(output.at(-1)!) as { kind: string; status: string; pairs: unknown[] };
+	assert.equal(result.kind, "m07-evidence-handoff-aa/v1");
+	assert.equal(result.status, "inconclusive");
+	assert.equal(result.pairs.length, 0);
 });
 
 test("later workflow I can inspect a same-workspace development MetaEpisode without G", async (t) => {
