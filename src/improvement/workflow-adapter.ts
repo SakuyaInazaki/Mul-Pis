@@ -9,6 +9,7 @@ import { createFileKnowledgeStore } from "../knowledge/store.ts";
 import { createExperienceProvider, verifyRequiredKnowledge } from "../knowledge/experience-index.ts";
 import type { KnowledgeStore } from "../knowledge/types.ts";
 import { createM07Controller, latestFormalBaseline } from "../m07/controller.ts";
+import { resolveM04Baseline } from "../m07/formal-baseline.ts";
 import type { SessionHandle, SessionRunner, SessionSpec, UsageSummary } from "../runner/types.ts";
 import { runM04 } from "../stages/m04.ts";
 import type { StageContext } from "../stages/context.ts";
@@ -232,7 +233,7 @@ async function assertWorkflowExperimentRoot(ws: Workspace, root: string): Promis
 }
 
 async function formalWorkflowSource(ws: Workspace, runner: SessionRunner, bundle: GenerationBundleV1) {
-	const currentKnowledge = createFileKnowledgeStore(ws.knowledgeDir); await currentKnowledge.init();
+	const currentKnowledge = createFileKnowledgeStore(ws.knowledgeDir);
 	const formal = await latestFormalBaseline({ ws, store: currentKnowledge, runner, config: await ws.loadConfig() });
 	const currentSnapshot = (await currentKnowledge.current())?.id;
 	if (!formal || formal.knowledgeSnapshot !== bundle.knowledgeSnapshot || currentSnapshot !== bundle.knowledgeSnapshot) throw new HarnessError("improvement.workflow-baseline", "frozen H/K and the current formal M04 baseline must share one knowledge epoch");
@@ -257,17 +258,162 @@ async function freezeWorkflowTemplate(args: { ws: Workspace; root: string; runId
 		await writeFileAtomic(path.join(root, "protected", "cases.json"), `${JSON.stringify(protectedCases, null, 2)}\n`);
 		await freezeCaseInputs(ws, protectedInputs, protectedCases.cases);
 	}
-	// A copied knowledge snapshot must not inherit its producer's unfinished transaction.
-	if ((await readdir(template.knowledgeDir)).includes(".merge.lock")) throw new HarnessError("improvement.workflow-epoch", "unfinished knowledge merge was captured while freezing the research source");
-	for (const file of await readdir(path.join(template.knowledgeDir, "proposals"))) {
-		if (!/^P\d{4,}\.intent\.json$/.test(file)) continue;
-		const intent = await boundedJson(path.join(template.knowledgeDir, "proposals", file), 8 * 1024 * 1024) as { status?: string };
-		if (intent.status !== "committed") throw new HarnessError("improvement.workflow-epoch", "unfinished knowledge merge was captured while freezing the research source");
-	}
+	await assertSettledWorkflowKnowledge(template);
 	const templateKnowledge = createFileKnowledgeStore(template.knowledgeDir);
 	if ((await currentKnowledge.current())?.id !== currentSnapshot || (await templateKnowledge.current())?.id !== currentSnapshot || JSON.stringify(await templateKnowledge.limits()) !== frozenLimits) throw new HarnessError("improvement.workflow-epoch", "knowledge changed while freezing the research source");
 	await templateKnowledge.regenerateViews();
 	return { template, protectedInputs };
+}
+
+/** Prepare the workspace that owns I sessions, candidates and research activation.
+ * The source is read only; ordinary workflow run/calibrate then operate on the returned workspace.
+ */
+export async function prepareWorkflowResearchSource(args: { ws: Workspace; store: GenerationStore; runner: SessionRunner; plan: WorkflowEvidenceHandoffPlanV1; targetRoot: string }) {
+	const { ws, store, runner, plan } = args;
+	const target = new Workspace(path.resolve(ws.root, args.targetRoot));
+	await assertWorkflowExperimentRoot(ws, target.root);
+	const experimentRoot = path.resolve(ws.root, plan.experimentRoot);
+	await assertWorkflowExperimentRoot(ws, experimentRoot);
+	if (nested(target.root, experimentRoot) || nested(experimentRoot, target.root)) throw new HarnessError("improvement.workflow-root", "research source and experiment root must be disjoint");
+	const knowledge = createFileKnowledgeStore(ws.knowledgeDir);
+	const sourceState = async () => {
+		await assertSettledWorkflowKnowledge(ws);
+		if (await lstat(path.join(ws.agentDir, "improvement", "mutation.lock")).catch(() => undefined)) throw new HarnessError("improvement.workflow-source", "finish the active method mutation before preparing a research source");
+		const config = await ws.loadConfig();
+		const baseline = await resolveM04Baseline({ ws, store: knowledge, runner, config });
+		return { active: await store.active(), baseline, m04Runs: await ws.listRuns("M04"), config, policy: await activePolicyFiles(ws), snapshot: await knowledge.current(), limits: await knowledge.limits() };
+	};
+	const before = await sourceState();
+	const active = before.active, formal = before.baseline.baseline;
+	if (!active || !formal || active.bundle.environmentVersion !== "m07-workflow/v1" || active.bundle.knowledgeSnapshot !== before.snapshot?.id || formal.knowledgeSnapshot !== before.snapshot?.id) throw new HarnessError("improvement.workflow-baseline", "research source needs an active workflow bundle and a formal M04 at the current knowledge epoch");
+	await loadSource(ws, plan);
+	const developmentFile = path.resolve(ws.root, plan.developmentCaseSetPath);
+	const admissionFile = plan.admissionCaseSetPath ? path.resolve(ws.root, plan.admissionCaseSetPath) : undefined;
+	const development = await loadCases(developmentFile, "development");
+	const admission = admissionFile ? await loadCases(admissionFile, "admission") : undefined;
+	await protectAdmissionInputs(ws, plan, development, admission, formal.run.runId, before.policy);
+	if (before.config.tools.braveApiKey !== undefined && development.cases.some(item => item.task.inputs.some(input => path.resolve(ws.root, input) === ws.configFile))) throw new HarnessError("improvement.workflow-copy", "explicit config input contains credentials; use a separate credential-free research input");
+	const episodes = await Promise.all((plan.metaEpisodeRunIds ?? []).map(async runId => ({ runId, value: await loadWorkflowMetaEpisode(store.root, ws.root, runId, store) })));
+	await mkdir(target.root); // No existing workspace is overwritten, including an earlier partial preparation.
+	const copied = new Map<string, string>();
+	const directories = new Map<string, string[]>();
+	const copy = async (from: string, to: string, explicitCaseFile = false): Promise<void> => {
+		const info = await lstat(from);
+		if (info.isSymbolicLink() || (!info.isDirectory() && !info.isFile()) || (!explicitCaseFile && !nested(await realpath(ws.root), await realpath(from)))) throw new HarnessError("improvement.workflow-copy", "research source must contain confined plain files");
+		if (info.isDirectory()) {
+			const names = (await readdir(from)).sort(); directories.set(from, names);
+			await mkdir(to, { recursive: true });
+			for (const name of names) await copy(path.join(from, name), path.join(to, name));
+		} else {
+			if (info.size > 8 * 1024 * 1024) throw new HarnessError("improvement.workflow-copy", "research source file exceeds 8 MiB");
+			await mkdir(path.dirname(to), { recursive: true });
+			const existing = await lstat(to).catch(() => undefined);
+			if (existing) {
+				if (!existing.isFile() || existing.isSymbolicLink() || !(await readFile(from)).equals(await readFile(to))) throw new HarnessError("improvement.workflow-copy", "research input collides with different target bytes");
+			} else await cp(from, to, { errorOnExist: true, force: false, dereference: false });
+			copied.set(from, to);
+		}
+	};
+	await copy(ws.problemFile, target.problemFile);
+	if (before.config.tools.braveApiKey === undefined) await copy(ws.configFile, target.configFile);
+	else {
+		const config = structuredClone(before.config);
+		delete config.tools.braveApiKey;
+		await writeFileAtomic(target.configFile, `${JSON.stringify(config, null, 2)}\n`);
+	}
+	if (await lstat(ws.rawDir).catch(() => undefined)) await copy(ws.rawDir, target.rawDir);
+	await copy(ws.knowledgeDir, target.knowledgeDir);
+	const targetStore = new GenerationStore(target.root);
+	for (const item of ["strategies", "bundles", "active.json"]) await copy(path.join(store.root, item), path.join(targetStore.root, item));
+	if (before.policy) for (const file of [before.policy.pointerPath, before.policy.policyPath]) await copy(file, path.join(target.root, path.relative(ws.root, file)));
+	const m04Ids = new Set([formal.run.runId, plan.developmentSource.m04RunId, ...before.baseline.failedM04.map(run => run.runId)]);
+	const checkpoints = new Set<string>();
+	for (const runId of m04Ids) {
+		await copy(ws.runDir("M04", runId), target.runDir("M04", runId));
+		const bindingRef = (await ws.readRun("M04", runId)).outputs.find(item => item.label === "M07 处理来源");
+		if (!bindingRef) continue;
+		if (!nested(ws.runDir("M04", runId), bindingRef.path) || !copied.has(bindingRef.path)) throw new HarnessError("improvement.workflow-source", "M04 source binding must be inside its copied run");
+		const binding = await boundedJson(bindingRef.path, 16_000) as { m07RunId?: string; checkpointId?: string; rootDir?: string };
+		if (![binding.m07RunId, binding.checkpointId].every(value => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value))) throw new HarnessError("improvement.workflow-source", "M04 source must name a frozen checkpoint for independent research");
+		const relative = path.join("stages", "M07", binding.m07RunId!, "checkpoints", binding.checkpointId!);
+		if (binding.rootDir !== path.join(ws.root, relative)) throw new HarnessError("improvement.workflow-source", "M04 checkpoint root differs from its registered identity");
+		checkpoints.add(relative);
+	}
+	for (const relative of checkpoints) await copy(path.join(ws.root, relative), path.join(target.root, relative));
+	for (const input of new Set([...development.cases, ...(admission?.cases ?? [])].flatMap(item => item.task.inputs))) {
+		if (!relativeSafe(input)) throw new HarnessError("improvement.workflow-copy", "case input must be a confined relative file");
+		if (!(await lstat(path.join(ws.root, input))).isFile()) throw new HarnessError("improvement.workflow-copy", "case input must name a file");
+		await copy(path.join(ws.root, input), path.join(target.root, input));
+	}
+	const caseRoot = path.join(targetStore.root, "source");
+	const targetDevelopment = path.join(caseRoot, "development-cases.json"), targetAdmission = path.join(caseRoot, "admission-cases.json");
+	await copy(developmentFile, targetDevelopment, true);
+	if (admissionFile) await copy(admissionFile, targetAdmission, true);
+	if (JSON.stringify(await loadCases(targetDevelopment, "development")) !== JSON.stringify(development) || admission && JSON.stringify(await loadCases(targetAdmission, "admission")) !== JSON.stringify(admission)) throw new HarnessError("improvement.workflow-source", "case definitions changed during preparation");
+	for (const episode of episodes) {
+		const from = path.join(store.root, "workflow-runs", episode.runId), to = path.join(targetStore.root, "workflow-runs", episode.runId);
+		// The controller receipt binds the development episode; no old session or campaign input tree is needed.
+		for (const file of (await readdir(from)).filter(name => name === "run.json" || /^meta-episode\.development(?:\.part-\d+\.txt|\.json)$/.test(name))) await copy(path.join(from, file), path.join(to, file));
+	}
+	for (const [from, names] of directories) if (JSON.stringify((await readdir(from)).sort()) !== JSON.stringify(names)) throw new HarnessError("improvement.workflow-source", "source directory changed during preparation");
+	for (const [from, to] of copied) if (!(await readFile(from)).equals(await readFile(to))) throw new HarnessError("improvement.workflow-source", "source bytes changed during preparation");
+	if (JSON.stringify(await sourceState()) !== JSON.stringify(before)) throw new HarnessError("improvement.workflow-source", "source baseline changed during preparation");
+
+	// Relocate derived control records only. Report text, evidence, knowledge history and method versions retain their bytes.
+	const relocate = (value: unknown): unknown => typeof value === "string" && nested(ws.root, value) ? path.join(target.root, path.relative(ws.root, value)) : Array.isArray(value) ? value.map(relocate) : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).map(([key, item]) => [key, relocate(item)])) : value;
+	for (const runId of m04Ids) {
+		const record = await target.readRun("M04", runId);
+		record.inputs = record.inputs.map(item => ({ ...item, path: relocate(item.path) as string }));
+		record.outputs = record.outputs.map(item => ({ ...item, path: relocate(item.path) as string }));
+		record.sessions = []; // Producer sessions were not copied and must never be resumed from this workspace.
+		await target.writeRun(record);
+		const binding = record.outputs.find(item => item.label === "M07 处理来源");
+		if (binding) {
+			if (!nested(target.runDir("M04", runId), binding.path) || ![...copied.values()].includes(binding.path)) throw new HarnessError("improvement.workflow-source", "M04 source binding must be inside its copied run");
+			await writeFileAtomic(binding.path, `${JSON.stringify(relocate(await boundedJson(binding.path, 16_000)), null, 2)}\n`);
+		}
+	}
+	for (const relative of checkpoints) {
+		const frozenGoalFile = path.join(target.root, relative, "goal.json");
+		const frozenGoal = await boundedJson(frozenGoalFile, 256_000) as Record<string, unknown>;
+		for (const key of ["problemSnapshotPath", "feedbackPath"]) frozenGoal[key] = relocate(frozenGoal[key]);
+		for (const task of frozenGoal.tasks as Array<Record<string, unknown>>) {
+			if (task.reportPath) task.reportPath = relocate(task.reportPath);
+			if (task.review) task.review = relocate(task.review);
+		}
+		await writeFileAtomic(frozenGoalFile, `${JSON.stringify(frozenGoal, null, 2)}\n`);
+	}
+	for (const episode of episodes) {
+		await writeMetaEpisode(path.join(targetStore.root, "workflow-runs", episode.runId, "meta-episode.development.json"), { ...episode.value, workspaceRoot: target.root });
+		await loadWorkflowMetaEpisode(targetStore.root, target.root, episode.runId, targetStore);
+	}
+	const preparedPlan = { ...plan, experimentRoot, developmentCaseSetPath: path.relative(target.root, targetDevelopment), ...(admissionFile ? { admissionCaseSetPath: path.relative(target.root, targetAdmission) } : {}) };
+	await loadSource(target, preparedPlan);
+	const frozen = await formalWorkflowSource(target, runner, active.bundle);
+	await assertSettledWorkflowKnowledge(target);
+	const records = await Promise.all([active.bundle.executorVersionId, active.bundle.improverVersionId].map(versionId => targetStore.readStrategy(versionId)));
+	// No production registered store is carried across: every necessary reference must resolve in the copy.
+	await verifyLiveWorkflowRecords(target, records);
+	if (plan.experienceRefs?.length) {
+		const selected = await createExperienceProvider(frozen.currentKnowledge).select({ targetKind: "improver", applicability: { stage: "method-research", tags: ["m07-evidence-handoff"] }, requestedRefs: plan.experienceRefs, maxRecords: plan.experienceMaxRecords || 1, maxChars: plan.experienceMaxChars || 1 });
+		if (selected.status !== "ready" || selected.selected.length !== plan.experienceRefs.length) throw new HarnessError("improvement.experience", "research source cannot resolve the selected experience independently");
+	}
+	await frozen.currentKnowledge.regenerateViews();
+	const planPath = path.join(targetStore.root, "source-plan.json");
+	await writeFileAtomic(planPath, `${JSON.stringify(preparedPlan, null, 2)}\n`);
+	const receipt = { version: 1, kind: "m07-research-source/v1", preparedAt: nowIso(), sourceWorkspace: ws.root, workspaceRoot: target.root, knowledgeSnapshot: before.snapshot?.id, baselineBundleId: active.bundle.bundleId, formalM04RunId: formal.run.runId, developmentSource: plan.developmentSource, metaEpisodeRunIds: plan.metaEpisodeRunIds ?? [], planPath };
+	await writeFileAtomic(path.join(targetStore.root, "source-snapshot.json"), `${JSON.stringify(receipt, null, 2)}\n`);
+	return { ...receipt, plan: preparedPlan };
+}
+
+async function assertSettledWorkflowKnowledge(ws: Workspace): Promise<void> {
+	const names = await readdir(ws.knowledgeDir);
+	if (names.includes(".merge.lock") || names.includes(".merge.recovery.lock")) throw new HarnessError("improvement.workflow-epoch", "unfinished knowledge merge cannot enter a research source");
+	for (const file of await readdir(path.join(ws.knowledgeDir, "proposals"))) {
+		if (!/^P\d{4,}\.intent\.json$/.test(file)) continue;
+		const intent = await boundedJson(path.join(ws.knowledgeDir, "proposals", file), 8 * 1024 * 1024) as { status?: string };
+		if (intent.status !== "committed") throw new HarnessError("improvement.workflow-epoch", "unfinished knowledge merge cannot enter a research source");
+	}
 }
 
 function assertWorkflowBudgetOpen(budget: SharedBudget, lease: BudgetLease): void {

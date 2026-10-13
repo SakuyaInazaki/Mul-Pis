@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createAuthenticatedProgressGate, createProgressUploader,
-	privateCampaignChildEnv } from "../../../scripts/private-campaign-observer.ts";
+	privateCampaignChildEnv, PREFIX_LOCAL_FREE_RESERVE_BYTES } from "../../../scripts/private-campaign-observer.ts";
 import { runPrivateCampaignAction } from "../../../scripts/private-campaign-observer-action.mjs";
 import { createLiveControlFrameReader } from "../../../src/runner/live-control-frame.ts";
 import { IncrementalPrivateCheckpointJournal, INCREMENTAL_CHECKPOINT_FILE,
@@ -24,6 +24,8 @@ import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID,
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const digest = text => createHash("sha256").update(text).digest("hex");
+// This synthetic transport check uses fixed fixtures; real disk admission has separate observer regressions.
+const syntheticAvailableBytes = async () => PREFIX_LOCAL_FREE_RESERVE_BYTES + 64n * 1024n * 1024n;
 // These bound only this synthetic CI check. They never run in the campaign.
 const bounded = (promise, milliseconds) => {
 	let timer;
@@ -99,7 +101,7 @@ export async function runSyntheticLiveObserverSmoke({ env = process.env, artifac
 	const uploader = createProgressUploader({ directory: path.join(temporary, "ciphertext"),
 		runId: source.runId, runAttempt: String(source.runAttempt), maxAttempts: 2,
 		prefix: { outputDir: prefixOutputDir, publicKeyFile, seedEnvelopeB64,
-			expectedSpkiSha256 },
+			expectedSpkiSha256, availableBytes: syntheticAvailableBytes },
 		client: async () => ({ uploadArtifact: async (name, files, root, options) => {
 			try {
 				assert.equal(options.retentionDays, 1);
@@ -198,7 +200,7 @@ export async function runSyntheticLiveObserverSmoke({ env = process.env, artifac
 		directory: path.join(temporary, "large-prefix-ciphertext"),
 		runId: source.runId, runAttempt: String(source.runAttempt), maxAttempts: 6,
 		prefix: { outputDir: largePrefixDir, publicKeyFile, seedEnvelopeB64,
-			expectedSpkiSha256 },
+			expectedSpkiSha256, availableBytes: syntheticAvailableBytes },
 		client: async () => ({ uploadArtifact: async (name, files, root, options) => {
 			try {
 				const response = await client.uploadArtifact(name, files, root, options);

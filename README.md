@@ -23,6 +23,8 @@
 
 执行方法 H 和改进方法 I 使用独立入口：`node src/cli.ts improve research bootstrap --workspace <dir> --methods <json>`。CPU 辨识使用 `improve research run --plan <json>`；M07 证据交接方法实验使用 `improve research workflow run --plan <json>`。当前工作流适配器覆盖局部 reason/check 与证据交接，方法以数据化提示策略保存；工作流源码候选执行与架构自我修改闭环尚未实现。
 
+研究前可用 `improve research workflow prepare --workspace <source> --plan <json> --output <new-source>` 准备独立研究工作区。它保留知识历史、活动方法版本和指定开发证据，返回副本内的 `planPath`；随后将 `workflow run` 的 `--workspace` 指向副本、`--plan` 指向该文件。改进器会话、候选和晋升记录由副本持有，原工作区后续变化不会进入这轮研究。
+
 同版本对照使用 `improve research workflow calibrate --plan <json>`，或 Pi 工具的 `workflow-calibrate` action。两臂从同一冻结来源执行真实 M07→M04 链路，记录差异与用量；该校准与候选搜索、准入分别保存。
 
 同一入口提供 `advance-knowledge` 与 `transition-dependencies`，用于在 M04 合入后建立新知识 epoch 或更新有采用依据的必要科学前提。M07 方法在新目标建立时显式绑定和冻结。参数与入口详见 [RSI 实现说明](docs/implementation/rsi.md)。

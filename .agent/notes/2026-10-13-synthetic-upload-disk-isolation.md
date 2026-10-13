@@ -1,0 +1,7 @@
+# Isolate synthetic upload checks from host disk capacity
+
+The local Actions smoke supplied a fake artifact client but inherited the production prefix uploader's filesystem free-space probe. Below its two-GiB reserve, the prefix was correctly withheld while the status uploaded; the test waited for a second upload until its timeout. This was reproduced in the full suite and in an isolated smoke run.
+
+The synthetic smoke and ordinary observer fixtures now inject available bytes through the existing test seam. Tests specifically exercising low-space refusal keep their explicit low-space probes and original assertions. Production free-space checks are unchanged. Existing observer tests separately cover a below-reserve refusal and an above-reserve success; the smoke continues to cover authenticated status and prefix transport, multipart restoration, altered ciphertext rejection, and child environment isolation.
+
+The smoke round-trip and tamper regressions pass with the injected space probe; the observer fixture suite passes 24/24. Typecheck passed. The final full offline suite completed with 1,612 tests: 1,596 passed, zero failed and 16 existing platform or local-fixture skips. The initial full run retained three smoke failures; the isolated observer run exposed seven additional disk-dependent fixtures before they were repaired. No external artifact service or model is used by these tests.

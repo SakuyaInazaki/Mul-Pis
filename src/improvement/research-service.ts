@@ -23,7 +23,7 @@ import { runMetaImprovementAdmission, type ProducedSuccessorV1 } from "./meta-ev
 import { decisionPrompt, fullyReadDevelopmentFeedbackIds, improverSystemPrompt, validateResearchAction, type ResearchCaseViewV1, type ResearchDecisionViewV1, type ResearchInspectionRequestV1, type ResearchInspectionResultV1 } from "./policy-host.ts";
 import { runBoundedModelStep } from "./research-model.ts";
 import { validateResearchPlan, type ResearchCampaignPlanV1, type ResearchCandidateV1, type ResearchDecisionRecordV1, type ResearchRunV1 } from "./research-types.ts";
-import { calibrateWorkflowEvidenceHandoff, runWorkflowEvidenceHandoff } from "./workflow-adapter.ts";
+import { calibrateWorkflowEvidenceHandoff, prepareWorkflowResearchSource, runWorkflowEvidenceHandoff } from "./workflow-adapter.ts";
 import { validateWorkflowCalibrationPlan, validateWorkflowPlan } from "./workflow-types.ts";
 
 const activeMutations = new Set<string>();
@@ -177,6 +177,8 @@ export class ResearchImprovementService {
   await verifyRequiredKnowledge(this.ws.root, combineKnowledgeRefs(pkg.requiredKnowledgeRefs, retained.requiredKnowledgeRefs), active.bundle.knowledgeSnapshot, this.registeredExperienceStores);
   return bindMethodPackageV2(this.store, pkg, active, `manual-bind-${RUN_ID()}`); }); }
  async run(input: unknown): Promise<ResearchRunV1> { const plan = validateResearchPlan(input); return this.withMutation(() => this.runUnlocked(plan)); }
+ /** Read-only source preparation; only the new independent workspace is written. */
+ async prepareWorkflowSource(input: unknown, targetRoot: string) { return prepareWorkflowResearchSource({ ws: this.ws, store: this.store, runner: this.runner, plan: validateWorkflowPlan(input), targetRoot }); }
  /** Explicit M07 method study. It cannot be reached from normal research or M07 begin. */
  async runWorkflow(input: unknown) { const plan = validateWorkflowPlan(input); return this.withMutation(() => runWorkflowEvidenceHandoff({ ws: this.ws, store: this.store, runner: this.runner, plan, registeredExperienceStores: this.registeredExperienceStores })); }
  /** Same-method local A/A observation; it does not search, open G, or activate a method. */

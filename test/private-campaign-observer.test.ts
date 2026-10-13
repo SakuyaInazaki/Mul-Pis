@@ -24,6 +24,8 @@ import { closeSync, openSync } from "node:fs";
 
 const actionModule = new URL("../scripts/private-campaign-observer-action.mjs", import.meta.url).href;
 const { runPrivateCampaignAction } = await import(actionModule);
+const syntheticAvailableBytes = async () =>
+	PREFIX_LOCAL_FREE_RESERVE_BYTES + 64n * 1024n * 1024n;
 
 const sourceEnv: NodeJS.ProcessEnv = {
 	GITHUB_REPOSITORY: "SakuyaInazaki/Mul-Pis", GITHUB_RUN_ID: "12345",
@@ -280,6 +282,7 @@ test("shared uploader prioritizes immutable prefixes, throttles request snapshot
 			runId: "12345", runAttempt: "1", maxAttempts: 3,
 			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
 				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256,
+				availableBytes: syntheticAvailableBytes,
 				now: () => now, scheduleTimer: fire => {
 					fireTimer = fire;
 					return { unref: () => undefined, clear: () => undefined };
@@ -337,6 +340,7 @@ test("one request reservation at minute five uploads at the scheduled deadline w
 			runId: "12345", runAttempt: "1", maxAttempts: 5,
 			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
 				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256,
+				availableBytes: syntheticAvailableBytes,
 				now: () => now,
 				scheduleTimer: (fire, delayMs) => {
 					timer = { fire, delayMs, cancelled: false, unrefd: false };
@@ -383,6 +387,7 @@ test("timer authenticates latest local sequence when a same-semantic commit emit
 			runId: "12345", runAttempt: "1", maxAttempts: 4,
 			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
 				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256,
+				availableBytes: syntheticAvailableBytes,
 				now: () => now, scheduleTimer: fire => {
 					fireTimer = fire;
 					return { unref: () => undefined, clear: () => undefined };
@@ -428,6 +433,7 @@ test("hundreds of rapid controls coalesce to one later prefix despite shared sta
 			runId: "12345", runAttempt: "1", maxAttempts: 4,
 			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
 				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256,
+				availableBytes: syntheticAvailableBytes,
 				now: () => now, scheduleTimer: fire => {
 					fireTimer = fire;
 					return { unref: () => undefined, clear: () => undefined };
@@ -472,7 +478,7 @@ test("late multipart prefix survives saturated status share with encrypted manif
 			runId: "12345", runAttempt: "1", maxAttempts: 8,
 			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
 				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256,
-				availableBytes: async () => PREFIX_LOCAL_FREE_RESERVE_BYTES + 64n * 1024n * 1024n,
+				availableBytes: syntheticAvailableBytes,
 				now: () => now, scheduleTimer: fire => {
 					fireTimer = fire;
 					return { unref: () => undefined, clear: () => undefined };
@@ -549,7 +555,7 @@ test("an ambiguous multipart part attempt cannot publish a root index", async ()
 			runId: "12345", runAttempt: "1", maxAttempts: 5,
 			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
 				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256,
-				availableBytes: async () => PREFIX_LOCAL_FREE_RESERVE_BYTES + 64n * 1024n * 1024n },
+				availableBytes: syntheticAvailableBytes },
 			client: async () => ({ uploadArtifact: async (name, files) => {
 				names.push(name);
 				partFile = files[0]!;
@@ -581,7 +587,8 @@ test("a replacement before the first read promptly publishes only the newer auth
 		const uploader = createProgressUploader({ directory: path.join(directory, "ciphertext"),
 			runId: "12345", runAttempt: "1", maxAttempts: 2,
 			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
-				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256 },
+				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256,
+				availableBytes: syntheticAvailableBytes },
 			client: async () => { await clientReady; return { uploadArtifact: async (name, files) => {
 				calls.push({ name, file: files[0]!, text: await readFile(files[0]!, "utf8") });
 			} }; } });
@@ -612,7 +619,8 @@ test("tampered committed bytes are never offered to the artifact client", async 
 		const uploader = createProgressUploader({ directory: path.join(directory, "ciphertext"),
 			runId: "12345", runAttempt: "1", maxAttempts: 2,
 			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
-				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256 },
+				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256,
+				availableBytes: syntheticAvailableBytes },
 			client: async () => ({ uploadArtifact: async () => { calls++; } }) });
 		assert.equal(uploader.offerPrefix({ source: f.source, sequence: stored.sequence,
 			status: f.makeStatus(stored, "initial") }), true);
@@ -668,6 +676,7 @@ test("ambiguous prefix upload consumes its sequence and a later committed snapsh
 			runId: "12345", runAttempt: "1", maxAttempts: 2,
 			prefix: { outputDir: f.outputDir, publicKeyFile: f.publicKeyFile,
 				seedEnvelopeB64: f.seedEnvelopeB64, expectedSpkiSha256: f.expectedSpkiSha256,
+				availableBytes: syntheticAvailableBytes,
 				now: () => now, scheduleTimer: fire => {
 					fireTimer = fire;
 					return { unref: () => undefined, clear: () => undefined };
@@ -795,6 +804,7 @@ test("a completed immutable prefix remains after an abrupt child kill", async ()
 			stderrFile: path.join(directory, "child-err"),
 			parentEnv: { ...sourceEnv, MULPIS_MISSION_LEDGER_B64: f.seedEnvelopeB64 },
 			publicKeyFile: f.publicKeyFile, expectedSpkiSha256: f.expectedSpkiSha256,
+			prefixAvailableBytes: syntheticAvailableBytes,
 			spawnChild: (_command, _args, options) => {
 				running = spawn(process.execPath, ["-e", synthetic], options);
 				return running;

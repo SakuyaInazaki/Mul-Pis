@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -759,4 +759,161 @@ test("a source knowledge transaction cannot be copied into a runnable experiment
 	assert.match(run.stopReason!, /unfinished knowledge merge/);
 	assert.equal(f.runner.created.length, before, "no model starts with a copied pending transaction");
 	assert.equal((await f.knowledge.current())?.id, f.bundle.knowledgeSnapshot);
+});
+
+async function retainedBytes(root: string): Promise<Record<string, string>> {
+	const result: Record<string, string> = {};
+	for (const name of (await readdir(root, { recursive: true })).sort()) {
+		const file = path.join(root, name);
+		if ((await stat(file)).isFile()) result[name] = (await readFile(file)).toString("base64");
+	}
+	return result;
+}
+
+test("independent research source freezes development history and owns I, candidates and activation", async (t) => {
+	const candidateBody = "INDEPENDENT_CANDIDATE_HANDOFF";
+	let researchStarted = false, targetRoot = "";
+	const f = await fixture(t, (ctx) => {
+		if (ctx.spec.role === "improver") {
+			assert.ok(ctx.spec.persistDir.startsWith(`${targetRoot}${path.sep}`));
+			assert.equal(ctx.message.includes("LATER_PRODUCTION"), false);
+			assert.equal(ctx.message.includes("PROTECTED_INPUT"), false);
+			const view = JSON.parse(ctx.message.slice(ctx.message.indexOf("\n") + 1));
+			assert.equal(view.current.bundleId, f.bundle.bundleId);
+			assert.match(view.experience.markdown, /先读取可见证据/);
+			const index = Number(ctx.spec.label.split("-").at(-1));
+			if (index === 0) return JSON.stringify({ kind: "inspect", object: "development-feedback", id: view.developmentSource.id, start: 0, maxChars: 4000 });
+			if (index === 1) {
+				assert.match(view.lastActionResult.text, /已按冻结包处理/);
+				return JSON.stringify({ kind: "propose", target: "executor", body: candidateBody, hypothesis: { claim: "证据交接可核验", predictedObservation: "固定检查通过", falsifier: "固定检查失败", applicability: ["M07"], motivatingEvidenceIds: [view.developmentSource.id] } });
+			}
+			if (index === 2) return JSON.stringify({ kind: "evaluate-development", candidateId: view.methods.candidates[0].versionId });
+			return JSON.stringify({ kind: "stop", reason: "选择已验证的候选", selectedCandidateId: view.methods.candidates[0].versionId });
+		}
+		if (ctx.spec.role === "research") return "已按冻结包处理。";
+		if (researchStarted) assert.equal(ctx.message.includes("LATER_PRODUCTION"), false);
+		return ctx.message.includes(candidateBody) ? ctx.message.includes("holdout-b") ? "保护证据完整" : "开发证据完整" : "原始报告";
+	}, false, true);
+	targetRoot = path.join(f.parent, "research-source");
+	const development = caseOf("development", "dev-a", "开发证据完整");
+	development.cases[0]!.task.inputs = ["development-input.txt"];
+	await writeFile(path.join(f.root, "development.json"), JSON.stringify(development));
+	await writeFile(path.join(f.root, "development-input.txt"), "FROZEN_DEVELOPMENT");
+	const admission = caseOf("admission", "holdout-b", "保护证据完整");
+	admission.cases[0]!.task.inputs = ["holdout.txt"];
+	await writeFile(path.join(f.root, "admission.json"), JSON.stringify(admission));
+	await writeFile(path.join(f.root, "holdout.txt"), "PROTECTED_INPUT");
+	const config = await f.ws.loadConfig();
+	config.tools.braveApiKey = "test-only-placeholder";
+	await writeFile(f.ws.configFile, JSON.stringify(config));
+	// A later formal baseline is distinct from the processed historical development source.
+	const ctx: StageContext = { ws: f.ws, store: f.knowledge, runner: f.runner, config: await f.ws.loadConfig() };
+	const laterCheckpoint = await createM07Controller(ctx).checkpoint(f.begun.runId, { taskIds: ["T001"] });
+	const formal = (await runM04(ctx, { feedback: { kind: "M07Checkpoint", runId: f.begun.runId, checkpointId: laterCheckpoint.id }, freshSession: true })).record;
+	await mkdir(path.join(f.ws.agentDir, "private"), { recursive: true });
+	await writeFile(path.join(f.ws.agentDir, "private", "not-research-input.txt"), "DO_NOT_COPY");
+	const beforePrepare = await retainedBytes(f.root);
+	const service = new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner });
+	const prepared = await service.prepareWorkflowSource({ ...f.plan, experienceRefs: [f.experienceRef!], experienceMaxRecords: 1, experienceMaxChars: 4000 }, targetRoot);
+	assert.deepEqual(await retainedBytes(f.root), beforePrepare, "preparation must leave every production file unchanged");
+	const frozenWs = new Workspace(targetRoot), frozenGen = new GenerationStore(targetRoot);
+	assert.equal(prepared.formalM04RunId, formal.runId);
+	assert.equal((await frozenWs.loadConfig()).tools.braveApiKey, undefined);
+	assert.equal((await createFileKnowledgeStore(frozenWs.knowledgeDir).storeId()), await f.knowledge.storeId());
+	assert.deepEqual(await readFile(path.join(frozenGen.root, "strategies", `${f.bundle.executorVersionId}.json`)), await readFile(path.join(f.gen.root, "strategies", `${f.bundle.executorVersionId}.json`)));
+	assert.equal(await stat(path.join(frozenWs.agentDir, "private")).catch(() => undefined), undefined);
+	assert.equal(await stat(frozenWs.sessionsDir).catch(() => undefined), undefined);
+	assert.equal(await stat(path.join(frozenWs.runDir("M07", f.begun.runId), "goal.json")).catch(() => undefined), undefined);
+	const originalM04 = await f.ws.readRun("M04", f.plan.developmentSource.m04RunId);
+	const copiedM04 = await frozenWs.readRun("M04", f.plan.developmentSource.m04RunId);
+	assert.deepEqual(copiedM04.sessions, []);
+	const sourceProcessing = originalM04.outputs.find(item => item.label === "处理结果")!.path;
+	const frozenProcessing = copiedM04.outputs.find(item => item.label === "处理结果")!.path;
+	assert.deepEqual(await readFile(sourceProcessing), await readFile(frozenProcessing));
+	const sourceBinding = JSON.parse(await readFile(copiedM04.outputs.find(item => item.label === "M07 处理来源")!.path, "utf8"));
+	assert.ok(sourceBinding.rootDir.startsWith(`${targetRoot}${path.sep}`));
+	assert.ok(await stat(sourceBinding.goalSnapshotPath));
+	const formalM04 = await frozenWs.readRun("M04", formal.runId);
+	const formalBinding = JSON.parse(await readFile(formalM04.outputs.find(item => item.label === "M07 处理来源")!.path, "utf8"));
+	assert.notEqual(formalBinding.rootDir, sourceBinding.rootDir);
+	assert.ok(formalBinding.rootDir.startsWith(`${targetRoot}${path.sep}`));
+	for (const file of [formalBinding.goalSnapshotPath, formalBinding.manifestPath, formalBinding.feedbackBundlePath]) assert.ok(await stat(file));
+	await assert.rejects(service.prepareWorkflowSource(f.plan, targetRoot), /EEXIST/);
+
+	// Production changes after preparation cannot enter the frozen research sessions.
+	await writeFile(f.ws.configFile, JSON.stringify({ ...config, roles: { default: "fake/LATER_PRODUCTION" } }));
+	await writeFile(path.join(f.root, "development-input.txt"), "LATER_PRODUCTION");
+	await writeFile(path.join(f.root, "admission.json"), "invalid later production case set");
+	const proposal = await f.knowledge.submitProposal({ stage: "M04", runId: "later-production", ops: [{ op: "create", type: "K", title: "LATER_PRODUCTION", body: "LATER_PRODUCTION", usageDecision: "adopted" }] });
+	await f.knowledge.merge(proposal.proposalId);
+	const beforeResearch = await retainedBytes(f.root);
+	const oldPointer = await readFile(path.join(f.gen.root, "active.json"), "utf8");
+	researchStarted = true;
+	const createdBefore = f.runner.created.length;
+	const run = await new ResearchImprovementService({ workspaceRoot: targetRoot, runner: f.runner }).runWorkflow(prepared.plan);
+	assert.equal(run.status, "promoted", run.stopReason ?? "");
+	assert.equal(run.knowledgeSnapshot, f.bundle.knowledgeSnapshot);
+	assert.notEqual((await f.knowledge.current())?.id, run.knowledgeSnapshot);
+	assert.equal(await readFile(path.join(f.gen.root, "active.json"), "utf8"), oldPointer);
+	assert.deepEqual(await retainedBytes(f.root), beforeResearch, "research must never write through to production");
+	assert.notEqual((await frozenGen.active())!.bundle.bundleId, f.bundle.bundleId);
+	assert.ok(f.runner.created.slice(createdBefore).every(spec => !spec.persistDir.startsWith(`${f.root}${path.sep}`) && spec.model !== "fake/LATER_PRODUCTION"));
+	assert.ok(await frozenGen.readStrategy(run.selectedCandidateId!));
+	assert.equal(await stat(path.join(f.gen.root, "strategies", `${run.selectedCandidateId}.json`)).catch(() => undefined), undefined);
+	assert.equal(await stat(path.join(run.sourceWorkspace!, "holdout.txt")).catch(() => undefined), undefined);
+});
+
+test("workflow prepare CLI relocates a selected development MetaEpisode for the next I session", async (t) => {
+	let priorRunId = "";
+	const f = await fixture(t, ctx => {
+		if (ctx.spec.role !== "improver") return "offline source";
+		const view = JSON.parse(ctx.message.slice(ctx.message.indexOf("\n") + 1));
+		if (!priorRunId) return JSON.stringify({ kind: "stop", reason: "first development pass" });
+		assert.equal(view.metaEpisodes[0].runId, priorRunId);
+		if (!view.lastActionResult) return JSON.stringify({ kind: "inspect", object: "meta-episode", id: `meta:${priorRunId}`, start: 0, maxChars: 4000 });
+		assert.match(view.lastActionResult.text, /"terminal":"no-winner"/);
+		return JSON.stringify({ kind: "stop", reason: "copied development episode read" });
+	});
+	const service = new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner });
+	const first = await service.runWorkflow(f.plan);
+	assert.equal(first.outcome, "completed-no-candidate", first.stopReason);
+	priorRunId = first.runId;
+	const targetRoot = path.join(f.parent, "research-source");
+	const planFile = path.join(f.parent, "prepare-plan.json");
+	await writeFile(planFile, JSON.stringify({ ...f.plan, experimentRoot: path.join(f.parent, "later-arms"), metaEpisodeRunIds: [priorRunId] }));
+	const lines: string[] = [], originalLog = console.log;
+	console.log = (...values: unknown[]) => { lines.push(values.map(String).join(" ")); };
+	try { assert.equal(await main(["improve", "research", "workflow", "prepare", "--workspace", f.root, "--plan", planFile, "--output", targetRoot]), 0); }
+	finally { console.log = originalLog; }
+	const prepared = JSON.parse(lines.at(-1)!);
+	await rm(path.join(f.gen.root, "workflow-runs", first.runId), { recursive: true });
+	const run = await new ResearchImprovementService({ workspaceRoot: targetRoot, runner: f.runner }).runWorkflow(prepared.plan);
+	assert.equal(run.outcome, "completed-no-candidate", run.stopReason);
+	assert.equal(run.decisions[0]?.action, "inspect");
+});
+
+test("research source preparation refuses unresolved knowledge, outside references and overlapping protected inputs", async (t) => {
+	const f = await fixture(t);
+	const service = new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner });
+	await mkdir(path.join(f.ws.knowledgeDir, ".merge.lock"));
+	await assert.rejects(service.prepareWorkflowSource(f.plan, path.join(f.parent, "merge-source")), /unfinished knowledge merge/);
+	await rm(path.join(f.ws.knowledgeDir, ".merge.lock"), { recursive: true });
+	await writeFile(path.join(f.ws.knowledgeDir, "proposals", "P9999.intent.json"), JSON.stringify({ status: "prepared" }));
+	await assert.rejects(service.prepareWorkflowSource(f.plan, path.join(f.parent, "intent-source")), /unfinished knowledge merge/);
+	await rm(path.join(f.ws.knowledgeDir, "proposals", "P9999.intent.json"));
+	await assert.rejects(service.prepareWorkflowSource({ ...f.plan, experienceRefs: [{ storeId: "00000000-0000-4000-8000-000000000001", recordId: "K001", version: 1 }], experienceMaxRecords: 1, experienceMaxChars: 1000 }, path.join(f.parent, "external-source")), /independently/);
+	const development = caseOf("development", "dev-a", "开发证据完整");
+	development.cases[0]!.task.inputs = ["research.config.json"];
+	await writeFile(path.join(f.root, "development.json"), JSON.stringify(development));
+	const plain = await service.prepareWorkflowSource(f.plan, path.join(f.parent, "plain-config-source"));
+	assert.deepEqual(await readFile(new Workspace(plain.workspaceRoot).configFile), await readFile(f.ws.configFile));
+	const config = await f.ws.loadConfig(); config.tools.braveApiKey = "test-only-placeholder";
+	await writeFile(f.ws.configFile, JSON.stringify(config));
+	await assert.rejects(service.prepareWorkflowSource(f.plan, path.join(f.parent, "credential-config-source")), /explicit config input contains credentials/);
+	development.cases[0]!.task.inputs = [];
+	await writeFile(path.join(f.root, "development.json"), JSON.stringify(development));
+	const admission = caseOf("admission", "holdout-b", "保护证据完整");
+	admission.cases[0]!.task.inputs = ["problem/problem.md"];
+	await writeFile(path.join(f.root, "admission.json"), JSON.stringify(admission));
+	await assert.rejects(service.prepareWorkflowSource(f.plan, path.join(f.parent, "overlap-source")), /protected.*(?:overlap|outside common)/);
 });
