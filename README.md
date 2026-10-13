@@ -13,7 +13,8 @@
 1. [本轮修复与验证记录](.agent/notes/2026-10-13-workflow-repair-publication.md)：改动原因、代码位置、验证结果与当前能力范围。
 2. [原始工作流](workflow/v1.0/README.md)与[当前阶段对齐](docs/research/workflow-foundation.md)：研究流程的基础和当前职责。
 3. [实现设计](docs/implementation/design.md)与[上下文边界](docs/implementation/context-boundaries.md)：实际执行、知识和会话机制。
-4. [RSI 实现说明](docs/implementation/rsi.md)：已有方法改进外环、实际可修改范围及后续需要验证的能力。
+4. [RSI 实现说明](docs/implementation/rsi.md)：已有方法改进外环、实际可修改范围及验证范围。
+5. [Training-free RSI研究设计](docs/research/training-free-rsi-2026.md)与[107篇全文阅读目录](docs/research/training-free-rsi-bibliography.md)：文献依据、H/I/K区分与真实实验顺序。
 
 持续执行、审查返修和知识更新已有局部真实运行观察。完整 M01–M09 验收、知识带来的因果收益和多代架构 RSI 仍需各自的实验依据；离线工程测试与真实实验结果分别记录。
 
@@ -21,7 +22,7 @@
 
 预算策略改进使用 `node src/cli.ts improve status|run|rollback|export|bind --workspace <dir>`；`run` 需提供 `--plan <json>`。候选先经过投影筛选，再由成对准入实验决定是否采用。
 
-执行方法 H 和改进方法 I 使用独立入口：`node src/cli.ts improve research bootstrap --workspace <dir> --methods <json>`。CPU 辨识使用 `improve research run --plan <json>`；M07 证据交接方法实验使用 `improve research workflow run --plan <json>`。当前工作流适配器覆盖局部 reason/check 与证据交接，方法以数据化提示策略保存。`improve research workflow compare-sources --plan <json>` 可让两份固定源码在独立进程内完成同方法、同知识的 M07→M04 成对观察；源码候选准入与自动版本切换仍待后续接通。
+执行方法 H 和改进方法 I 使用独立入口：`node src/cli.ts improve research bootstrap --workspace <dir> --methods <json>`。CPU 辨识使用 `improve research run --plan <json>`；M07 证据交接方法实验使用 `improve research workflow run --plan <json>`。历史工作流适配器覆盖局部 reason/check 与证据交接，方法以数据化提示策略保存。`improve research workflow compare-sources --plan <json>` 可让两份固定源码在独立进程内完成同方法、同知识的 M07→M04 成对观察；新增的v2源码研究接口另行支持模型生成源码候选、真实I进程搜索、M04/知识结果独立评价、H源码确认采用，以及共同H/K下的I后代对照与仅I采用。接口见[源码研究实现](docs/implementation/rsi.md#固定权重源码研究路径2026-10-14)；它们目前由受信TypeScript实验驱动调用。
 
 研究前可用 `improve research workflow prepare --workspace <source> --plan <json> --output <new-source>` 准备独立研究工作区。它保留知识历史、活动方法版本和指定开发证据，返回副本内的 `planPath`；随后将 `workflow run` 的 `--workspace` 指向副本、`--plan` 指向该文件。改进器会话、候选和晋升记录由副本持有，原工作区后续变化不会进入这轮研究。
 

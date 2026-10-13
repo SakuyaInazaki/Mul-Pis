@@ -632,9 +632,12 @@ async function createExecutionTools(
 	receiptDir: string,
 	sessionId: string,
 	isolatedToolEnvironment = false,
+	tempDir?: string,
 ): Promise<MaterialTools & { cwd: string }> {
 	const cwd = await realpath(root);
 	if (!(await lstat(cwd)).isDirectory()) throw new HarnessError("runner.tools", `execution root is not a directory: ${root}`);
+	const scratch = tempDir ? await realpath(tempDir) : undefined;
+	if (scratch && (!(await lstat(scratch)).isDirectory() || scratch === cwd || scratch.startsWith(`${cwd}${path.sep}`) || cwd.startsWith(`${scratch}${path.sep}`))) throw new HarnessError("runner.tools", "execution temporary directory must be an existing directory outside formal work");
 	const bashCall = new AsyncLocalStorage<ManagedBashCall>();
 	const factories = {
 		read: createReadToolDefinition,
@@ -655,7 +658,7 @@ async function createExecutionTools(
 					PATH: process.env.PATH ?? "/usr/bin:/bin",
 					HOME: cwd,
 					LANG: "C.UTF-8",
-					TMPDIR: process.env.TMPDIR ?? "/tmp",
+					TMPDIR: scratch ?? process.env.TMPDIR ?? "/tmp",
 				} }),
 			})
 			: factories[name](cwd)) as ToolDefinition<any, any>;
@@ -1352,7 +1355,7 @@ export class PiSessionRunner implements SessionRunner {
 		} else if (spec.tools.kind === "execution") {
 			const execution = await createExecutionTools(spec.tools.root, spec.tools.tools, toolLog,
 				path.join(spec.persistDir, "host-execution-receipts", sessionManager.getSessionId()),
-				sessionManager.getSessionId(), true);
+				sessionManager.getSessionId(), true, spec.tools.tempDir);
 			materialTools = execution;
 			sessionCwd = execution.cwd;
 		}

@@ -178,6 +178,8 @@ test("method binding uses the package bytes that passed dependency checks even i
 	const f = await fixture(t, () => ({ text: JSON.stringify({ kind: "stop", reason: "unused" }), usage }));
 	const active = (await f.generation.active())!;
 	const base = await f.generation.readStrategy(active.bundle.improverVersionId);
+	assert.equal(base.artifact.kind, "diagnostic-improver-prompt");
+	if (base.artifact.kind !== "diagnostic-improver-prompt") throw new Error("fixture requires a prompt method");
 	const foreignId = "00000000-0000-4000-8000-000000000099";
 	const required: ExperienceRequirementV1 = { targetKind: "improver", ref: { storeId: foreignId, recordId: "K001", version: 1 } };
 	const prepared = await f.generation.writeStrategy({ versionId: "I-checked-package", kind: "improver", artifact: { ...base.artifact, body: "Checked package body" }, parentVersionId: base.versionId, origin: "human-seed", applicability: base.applicability, limitations: [], requiredExperienceRefs: [required], state: "manual-active" });
@@ -200,6 +202,8 @@ test("method binding uses the package bytes that passed dependency checks even i
 	const bound = await service.bindMethod(packagePath);
 	assert.equal(changedDuringPrecheck, true);
 	assert.equal(JSON.parse(await readFile(packagePath, "utf8")).artifact.body, "Changed after precheck");
+	assert.equal(bound.strategy.artifact.kind, "diagnostic-improver-prompt");
+	if (bound.strategy.artifact.kind !== "diagnostic-improver-prompt") throw new Error("fixture requires a prompt method");
 	assert.equal(bound.strategy.artifact.body, "Checked package body");
 	assert.deepEqual(bound.strategy.requiredExperienceRefs, [required]);
 	assert.equal((await f.generation.active())?.bundle.bundleId, bound.bundle.bundleId);

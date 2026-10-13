@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, realpath, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, mkdir, readFile, readdir, rm, writeFile, truncate, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -224,6 +224,67 @@ test("reviewer snapshot preserves more than 1,000 small work files", async t => 
  assert.equal(task.loopStopReason,"ready");
  assert.ok(task.executionRounds?.[0].reviewerSnapshotPath);
  assert.ok(task.branchSource,task.branchUnavailableReason ?? "branch evidence was not frozen");
+});
+
+test("formal work above 64 MB freezes byte-exactly while task scratch stays outside review and branch", async t => {
+ const bytes = 64_000_001;
+ let tempDir = "";
+ const f = await fixture(t, async ({spec,message}) => {
+  if (spec.tools.kind === "read-dir") {
+   assert.equal((await stat(path.join(spec.tools.root,"cache","fixture.bin"))).size,bytes);
+   assert.equal((await readFile(path.join(spec.tools.root,"cache","fixture.bin"))).at(-1),0x7a);
+   assert.equal(await readFile(path.join(spec.tools.root,"result.txt"),"utf8"),"checked\n");
+   assert.equal((await readdir(spec.tools.root)).includes("task-scratch"),false);
+   return JSON.stringify({verdict:"ready",feedback:"read the formal output and end of the copied evidence"});
+  }
+  if (spec.tools.kind === "execution") {
+   tempDir = spec.tools.tempDir!;
+   assert.ok(tempDir && !tempDir.startsWith(spec.tools.root));
+   assert.match(message,/TMPDIR/);
+   await mkdir(path.join(spec.tools.root,"cache"));
+   const large = path.join(spec.tools.root,"cache","fixture.bin");
+   await writeFile(large,""); await truncate(large,bytes);
+   const handle = await import("node:fs/promises").then(fs => fs.open(large,"r+"));
+   try { await handle.write(Buffer.from("z"),0,1,bytes-1); } finally { await handle.close(); }
+   await writeFile(path.join(spec.tools.root,"result.txt"),"checked\n");
+   await writeFile(path.join(tempDir,"disposable.bin"),"scratch-only");
+  }
+  return "Builder completed and retained its full report.";
+ });
+ const staleScratch = path.join(f.ws.runDir("M07",f.goal.runId),"task-scratch","T001");
+ await mkdir(staleScratch,{recursive:true});
+ await writeFile(path.join(staleScratch,"leftover.bin"),"prior setup did not persist a task");
+ const task = await f.controller.delegate(f.goal.runId,{objective:"review complete formal evidence",inputs:[],
+  expectedOutputs:["result.txt"],checks:["evidence checked"],mode:"execute",executionLoop:{mode:"until-ready"}});
+ assert.equal(task.status,"returned",task.executionFailure ?? "task failed");
+ assert.equal(task.loopStopReason,"ready");
+ assert.ok(task.branchSource,task.branchUnavailableReason ?? "branch freeze failed");
+ assert.equal((await stat(path.join(task.branchSource!.workSnapshotRoot,"cache","fixture.bin"))).size,bytes);
+ assert.equal((await readFile(path.join(task.branchSource!.workSnapshotRoot,"cache","fixture.bin"))).at(-1),0x7a);
+ assert.equal((await readdir(path.dirname(task.workDir))).includes("task-scratch"),false);
+ assert.equal(await readFile(path.join(tempDir,"disposable.bin"),"utf8"),"scratch-only");
+ assert.notEqual(tempDir,staleScratch);
+ assert.equal(await readFile(path.join(staleScratch,"leftover.bin"),"utf8"),"prior setup did not persist a task");
+});
+
+test("snapshot failure retains the builder round and never reports reviewer readiness", async t => {
+ const f = await fixture(t, async ({spec}) => {
+  if (spec.tools.kind === "read-dir") throw new Error("failed snapshot reached reviewer");
+  if (spec.tools.kind === "execution") {
+   await writeFile(path.join(spec.tools.root,"result.txt"),"candidate\n");
+   await symlink("result.txt",path.join(spec.tools.root,"linked-result.txt"));
+  }
+  return "Full builder report before snapshot failure.";
+ });
+ const task = await f.controller.delegate(f.goal.runId,{objective:"candidate with invalid source",inputs:[],
+  expectedOutputs:["result.txt"],checks:["checked"],mode:"execute",executionLoop:{mode:"until-ready"}});
+ assert.equal(task.status,"failed");
+ assert.match(task.executionFailure ?? "",/symlink or special file/);
+ assert.equal(task.executionRounds?.length,1);
+ assert.equal(await readFile(task.executionRounds![0].builderReportPath,"utf8"),"Full builder report before snapshot failure.");
+ assert.equal(task.executionRounds![0].reviewerSnapshotPath,undefined);
+ assert.equal(task.loopStopReason,undefined);
+ assert.equal((await f.controller.status(f.goal.runId)).executionState?.operations[0].status,"response-received");
 });
 
 test("legacy caller quotas cannot stop a new M07 task or clip a long builder report", async t => {

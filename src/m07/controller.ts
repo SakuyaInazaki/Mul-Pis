@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { chmod, copyFile, cp, link, lstat, mkdir, open, readFile, readdir, realpath, rename, rmdir, stat, unlink } from "node:fs/promises";
+import { chmod, copyFile, cp, link, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rmdir, stat, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { loadPrompt, section, systemPromptFor } from "../prompts.ts";
@@ -410,16 +410,14 @@ async function snapshotRoundForReviewer(workDir: string, destination: string): P
 		const info = await lstat(source);
 		if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) throw new HarnessError("m07.loop-snapshot", "round snapshot contains a symlink or special file");
 		if (info.isFile()) bytes += info.size;
-		if (bytes > 64_000_000) throw new HarnessError("m07.loop-snapshot", "round snapshot exceeds 64 MB");
 		return true;
 	} });
 	return bytes;
 }
 
 /** Preserve a long builder report as exact, readable UTF-8 segments in the reviewer's frozen grant. */
-async function freezeBuilderReportForReviewer(report: string, reviewerRoot: string, snapshotBytes: number): Promise<string> {
+async function freezeBuilderReportForReviewer(report: string, reviewerRoot: string): Promise<string> {
 	const reportBytes = Buffer.byteLength(report, "utf8");
-	if (snapshotBytes + reportBytes > 64_000_000) throw new HarnessError("m07.loop-snapshot", "reviewer snapshot including full builder report exceeds 64 MB");
 	const folder = `.m07-builder-report-${randomUUID()}`;
 	const reportDir = path.join(reviewerRoot, folder);
 	await mkdir(reportDir);
@@ -443,6 +441,8 @@ interface BranchManifestV1 {
 	parentWorkRoot: string;
 	authorizedChildRootBase: string;
 	frozenWorkRoot: string;
+	/** Observed regular-file bytes in the frozen formal work tree. */
+	workBytes?: number;
 	problemSourcePath: string;
 	frozenProblemPath: string;
 	knowledgeSnapshot?: string;
@@ -475,7 +475,6 @@ async function freezeBranchWork(goal: CurrentGoal, task: M07TaskRecord): Promise
 			totalBytes += info.size;
 			files.push({ relativePath: relative, historicalPath: path.join(sourceRoot, relative), frozenPath: path.join(workSnapshotRoot, relative), bytes: info.size });
 		}
-		if (totalBytes > 64_000_000) throw new HarnessError("m07.branch-evidence", "branch evidence exceeds 64 MB");
 		return true;
 	} });
 	const manifestPath = path.join(root, "manifest.json");
@@ -483,12 +482,12 @@ async function freezeBranchWork(goal: CurrentGoal, task: M07TaskRecord): Promise
 		if (!(await readFile(file.historicalPath)).equals(await readFile(file.frozenPath))) throw new HarnessError("m07.branch-evidence", `task work changed during branch evidence freeze: ${file.relativePath}`);
 	}
 	const problemInfo = await lstat(goal.problemSnapshotPath);
-	if (!problemInfo.isFile() || problemInfo.isSymbolicLink() || totalBytes + problemInfo.size > 64_000_000) throw new HarnessError("m07.branch-evidence", "original problem snapshot is not a bounded regular file");
+	if (!problemInfo.isFile() || problemInfo.isSymbolicLink()) throw new HarnessError("m07.branch-evidence", "original problem snapshot is not a regular file");
 	const problemSnapshotCopy = path.join(root, "problem-snapshot.md");
 	await copyFile(goal.problemSnapshotPath, problemSnapshotCopy);
 	if (!(await readFile(goal.problemSnapshotPath)).equals(await readFile(problemSnapshotCopy))) throw new HarnessError("m07.branch-evidence", "original problem snapshot changed while freezing");
 	const authorizedChildRootBase = await realpath(path.dirname(parentTaskDir));
-	const manifest: BranchManifestV1 = { version: 1, parentRunId: goal.runId, parentTaskId: task.taskId, parentWorkRoot: sourceRoot, authorizedChildRootBase, frozenWorkRoot: workSnapshotRoot, problemSourcePath: goal.problemSnapshotPath, frozenProblemPath: problemSnapshotCopy, knowledgeSnapshot: goal.knowledgeSnapshot, m04BaselineRunId: goal.m04BaselineRunId, forkWorkspaceAuthority: { version: 1, parentRoot: sourceRoot, authorizedChildRootBase, childWorkLeaf: path.basename(sourceRoot), frozenEvidenceRoot: workSnapshotRoot, files: files.map((file) => ({ sourcePath: file.historicalPath, frozenPath: file.frozenPath, bytes: file.bytes })) }, files };
+	const manifest: BranchManifestV1 = { version: 1, parentRunId: goal.runId, parentTaskId: task.taskId, parentWorkRoot: sourceRoot, authorizedChildRootBase, frozenWorkRoot: workSnapshotRoot, workBytes: totalBytes, problemSourcePath: goal.problemSnapshotPath, frozenProblemPath: problemSnapshotCopy, knowledgeSnapshot: goal.knowledgeSnapshot, m04BaselineRunId: goal.m04BaselineRunId, forkWorkspaceAuthority: { version: 1, parentRoot: sourceRoot, authorizedChildRootBase, childWorkLeaf: path.basename(sourceRoot), frozenEvidenceRoot: workSnapshotRoot, files: files.map((file) => ({ sourcePath: file.historicalPath, frozenPath: file.frozenPath, bytes: file.bytes })) }, files };
 	await writeFileAtomic(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 	for (const file of files) await chmod(file.frozenPath, 0o444);
 	const directories = [workSnapshotRoot];
@@ -509,7 +508,7 @@ async function loadBranchManifest(source: NonNullable<M07TaskRecord["branchSourc
 		manifest = JSON.parse(bytes.toString("utf8")) as BranchManifestV1;
 	}
 	catch { throw new HarnessError("m07.branch", "frozen parent evidence manifest is unavailable"); }
-	if (manifest.version !== 1 || manifest.parentRunId !== parentRunId || manifest.parentTaskId !== parentTaskId || manifest.authorizedChildRootBase !== path.dirname(path.dirname(manifest.parentWorkRoot)) || manifest.frozenWorkRoot !== source.workSnapshotRoot || manifest.frozenProblemPath !== source.problemSnapshotCopy || !Array.isArray(manifest.files) || manifest.files.some((file) => !Number.isSafeInteger(file.bytes) || file.bytes < 0) || manifest.files.reduce((sum, file) => sum + file.bytes, 0) > 64_000_000) throw new HarnessError("m07.branch", "frozen parent evidence manifest does not match the requested source");
+	if (manifest.version !== 1 || manifest.parentRunId !== parentRunId || manifest.parentTaskId !== parentTaskId || manifest.authorizedChildRootBase !== path.dirname(path.dirname(manifest.parentWorkRoot)) || manifest.frozenWorkRoot !== source.workSnapshotRoot || manifest.frozenProblemPath !== source.problemSnapshotCopy || !Array.isArray(manifest.files) || manifest.files.some((file) => !Number.isSafeInteger(file.bytes) || file.bytes < 0) || (manifest.workBytes !== undefined && manifest.workBytes !== manifest.files.reduce((sum, file) => sum + file.bytes, 0))) throw new HarnessError("m07.branch", "frozen parent evidence manifest does not match the requested source");
 	if (JSON.stringify(manifest.forkWorkspaceAuthority) !== JSON.stringify({ version: 1, parentRoot: manifest.parentWorkRoot, authorizedChildRootBase: manifest.authorizedChildRootBase, childWorkLeaf: path.basename(manifest.parentWorkRoot), frozenEvidenceRoot: manifest.frozenWorkRoot, files: manifest.files.map((file) => ({ sourcePath: file.historicalPath, frozenPath: file.frozenPath, bytes: file.bytes })) })) throw new HarnessError("m07.branch", "fork workspace authority does not match frozen evidence files");
 	if ((await lstat(source.problemSnapshotCopy)).isSymbolicLink() || !(await lstat(source.problemSnapshotCopy)).isFile()) throw new HarnessError("m07.branch", "frozen problem evidence is unavailable");
 	const snapshotRoot = await realpath(source.workSnapshotRoot);
@@ -636,7 +635,7 @@ function uniqueName(index: number, source: string): string {
 	return `${String(index + 1).padStart(3, "0")}-${path.basename(source).replace(/[^a-zA-Z0-9._-]/g, "_")}`;
 }
 
-async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string, task: TaskSpecInput, copies: M07TaskRecord["inputCopies"], knowledgePack: string | undefined, policy: BudgetPolicy, limits: ProjectionSnapshotLimits, operationId?: string): Promise<{ message: string; event: ProjectionEventV1 }> {
+async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string, task: TaskSpecInput, copies: M07TaskRecord["inputCopies"], knowledgePack: string | undefined, policy: BudgetPolicy, limits: ProjectionSnapshotLimits, operationId?: string, tempDir?: string): Promise<{ message: string; event: ProjectionEventV1 }> {
 	const event = await createProjectionObservation(ctx, goal, "task-message", policy, limits, taskId);
 	const planCopy = task.planInput ? copies.find((item) => item.source === task.planInput)?.copy : undefined;
 	const resourceCopies = (task.resourceInputs ?? []).map((item) => ({ ...item, copy: copies.find((copy) => copy.source === item.input)?.copy }));
@@ -691,7 +690,7 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string,
 	if (task.lessonDeltaOutput) boundary.push(section("候选经验回流", `将本轮候选经验写入 ${task.lessonDeltaOutput}，JSON 格式为 {"version":1,"action":"none|propose|amend|contradict","observation":"...","hypothesis":"...","applicability":"...","evidencePaths":["本任务 work 内相对路径"]}。none 合法；不确定因果写为假设。仅修正本任务尚未入库的候选时仍用 propose；amend 或 contradict 只用于修订/反驳已存在且已固定身份的知识记录，必须加 "priorRef":{"storeId":"...","recordId":"...","version":1}，不得猜测 ID。此文件是待 M04 处理的候选，不能自称已采纳知识。`));
 	if (task.mode === "execute") boundary.push(section("外部执行与可消耗资源", `本任务控制操作 ID：${operationId ?? "旧目标无操作登记"}。若执行有真实副作用的远端动作，保存实际参数、外部请求/结果 ID、响应和可用的查询方法；在响应丢失后先查询，不能仅凭超时重发。任务级 ID 是恢复索引，只有远端明确支持时才能作为幂等键，不能声称 exactly-once。\n\n如任务涉及真实提交、评测、远程实验或其他可能消耗配额/费用/机会的动作：先用已提供的只读能力或额度接口核对接入和当前状态，并先做本地可完成的语法、类型、编译与兼容性预检。这不禁止任务已授权的真实实验，已授权平台评测/实验产生的结果属于本任务实测证据。每次真实动作都要记录实际结果和资源消耗；失败若仍消耗了资源，同样记录已消耗量、可见剩余量与恢复条件。平台配额不明时如实记录未知，不猜测统一配额。本地命令或客户端成功退出不等于远程实验通过。显式输入和原问题允许使用；若需取得新的外部研究参考资料并用于推理，将具体缺口报回主会话走 M05/M06→M04，不在 execute 任务里通过 bash 另造获取和采用链。`));
 	boundary.push("任务义务继承冻结目标、原成功条件和用户约束；局部 objective/checks 不得放宽它们。有界指职责、输入和操作范围，不授权自行添加尝试次数、耗时或费用停止条件。以达成为目标时，持续推进并按结果验收，不能用执行过或记录负结果替代达成。若任务本身是取证或检验，应如实返回其结果，并明确父目标仍未解决的要求。会话返回只表示内部交接，不表示原目标完成；列明实际动作、产物、失败、未执行项和限制。");
-	boundary.push("产物路径规则：expectedOutputs 必须是当前任务工作目录内的精确相对路径；说明写在 objective 或 report.md。所有实际写盘必须落在当前工作目录内，不要写到工作区根目录或绝对路径。");
+	boundary.push(tempDir ? `产物路径规则：expectedOutputs 必须是当前任务工作目录内的精确相对路径；说明写在 objective 或 report.md。正式脚本、输入、测量、回执、负结果、复现数据和证据都必须保存在当前 work 目录。临时缓存、下载和浏览器 profile 可写入独立目录 ${tempDir}；bash 的 TMPDIR 指向它。临时目录不属于正式证据，不会进入 reviewer 快照或 branch，也不能作为产物或检查引用。不要写到其他目录。` : "产物路径规则：expectedOutputs 必须是当前任务工作目录内的精确相对路径；说明写在 objective 或 report.md。所有实际写盘必须落在当前工作目录内，不要写到工作区根目录或绝对路径。");
 	const message = boundary.join("\n\n");
 	if (message.length + systemPromptFor(task.mode === "check" ? "reviewer" : "execution").length > policy.maxPromptChars) { event.projectionStatus = "budget-failed"; throw new HarnessError("context.budget", `M07 控制事实与允许内联内容共 ${message.length} 字符，超过 prompt 预算 ${policy.maxPromptChars}；未静默截断`); }
 	event.projectionStatus = "materialized";
@@ -1068,6 +1067,12 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			const dependencies = [spec.parentTaskId, spec.supersedesTaskId].filter(Boolean) as string[];
 			if (goal.decisions.some((d) => d.status === "open" && d.relatedTaskIds.some((id) => dependencies.includes(id)))) throw new HarnessError("m07.decision", "该任务依赖待用户决定事项；可继续不受影响的任务，但不能推进此依赖分支");
 			const id = taskId(goal), dir = path.join(ctx.ws.runDir("M07", runId), "tasks", id), workDir = path.join(dir, "work"), inputsDir = path.join(workDir, "inputs");
+			let tempDir: string | undefined;
+			if (spec.mode === "execute") {
+				const scratchRoot = path.join(ctx.ws.runDir("M07", runId), "task-scratch");
+				await mkdir(scratchRoot, { recursive: true, mode: 0o700 });
+				tempDir = await mkdtemp(path.join(scratchRoot, `${id}-`));
+			}
 			await mkdir(inputsDir, { recursive: true });
 			const copies: M07TaskRecord["inputCopies"] = [];
 			if (branchParent && branchManifest) {
@@ -1108,13 +1113,13 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			};
 			const expectedOutputPaths = spec.expectedOutputs.map((x) => { const resolved = path.resolve(workDir, x); if (!inside(workDir, resolved)) throw new HarnessError("m07.path", `预期产物路径逃逸任务目录：${x}`); return resolved; });
 			const role = spec.mode === "check" ? "reviewer" : "execution";
-			const tools = spec.mode === "execute" ? { kind: "execution" as const, root: workDir, tools: ["read", "write", "edit", "bash"] as Array<"read" | "write" | "edit" | "bash"> } : { kind: "read-dir" as const, root: workDir };
+			const tools = spec.mode === "execute" ? { kind: "execution" as const, root: workDir, tempDir: tempDir!, tools: ["read", "write", "edit", "bash"] as Array<"read" | "write" | "edit" | "bash"> } : { kind: "read-dir" as const, root: workDir };
 			const operationId = spec.mode === "execute" && goal.executionState ? `O${String(goal.executionState.operations.length + 1).padStart(3, "0")}` : undefined;
-			let { message, event } = await taskMessage(ctx, goal, id, spec, copies, pack, policy, snapshotLimits, operationId);
+			let { message, event } = await taskMessage(ctx, goal, id, spec, copies, pack, policy, snapshotLimits, operationId, tempDir);
 			if (branchParent?.branchSource && branchManifest) {
-				message += `\n\n# Frozen competitive branch\nThis is an independently writable candidate for the exact same task and goal obligations. The inherited Pi history is a historical causal record, not permission to reuse its old absolute paths or repeat external actions. Historical work root: ${branchManifest.parentWorkRoot}. Your private work root: ${workDir}. The complete old-path to frozen-evidence and private-copy mapping is in branch-evidence-map.json in your work root. Read original evidence as needed; the manifest and summaries alone do not mean you have read it. Write only in your private work root. Do not modify parent files, other branches, the knowledge store, or original checks. Your result is a candidate until the M07 controller reviews and explicitly selects it; M04 alone decides knowledge adoption.`;
-				if (message.length + systemPromptFor("execution").length > policy.maxPromptChars) throw new HarnessError("context.budget", "branch evidence handoff exceeds the frozen prompt budget");
+				message += `\n\n# Frozen competitive branch\nThis is an independently writable candidate for the exact same task and goal obligations. The inherited Pi history is a historical causal record, not permission to reuse its old absolute paths or repeat external actions. Historical work root: ${branchManifest.parentWorkRoot}. Your private work root: ${workDir}. The complete old-path to frozen-evidence and private-copy mapping is in branch-evidence-map.json in your work root. Read original evidence as needed; the manifest and summaries alone do not mean you have read it. Keep formal work in your private work root and disposable files in your own TMPDIR. Do not modify parent files, other branches, the knowledge store, or original checks. Your result is a candidate until the M07 controller reviews and explicitly selects it; M04 alone decides knowledge adoption.`;
 			}
+			if (message.length + systemPromptFor(role).length > policy.maxPromptChars) throw new HarnessError("context.budget", "task evidence handoff exceeds the frozen prompt budget");
 			await writeFileAtomic(path.join(dir, "message.md"), message);
 			const task: M07TaskRecord = { ...spec, taskId: id, status: "running", createdAt: nowIso(), returnedAt: "", workDir, inputCopies: copies, expectedOutputPaths, readCoverage: [], toolLog: [], knowledgeSnapshot: goal.knowledgeSnapshot, m04BaselineRunId: goal.m04BaselineRunId, experienceSelection, ...(spec.planInput ? { planCopy: copies.find((item) => item.source === spec.planInput)?.copy } : {}) };
 			const operation: M07OperationV1 | undefined = operationId ? { version: 1, id: operationId, taskId: id, status: "prepared", issuedAt: nowIso() } : undefined;
@@ -1168,10 +1173,11 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 						await save(ctx, goal);
 						const reviewerRoot = path.join(dir, `round-${index}-snapshot`);
 						const reviewerSnapshotBytes = await snapshotRoundForReviewer(workDir, reviewerRoot);
+						round.reviewerSnapshotBytes = reviewerSnapshotBytes;
 						round.reviewerSnapshotPath = reviewerRoot;
 						let reviewerPrompt = `Review only this M07 task round and the copied work-directory snapshot. Goal: ${goal.goal}\nProblem relation: ${goal.problemRelation}\nFrozen goal constraints: ${goal.constraints.join("; ")}\nFrozen success criteria: ${goal.successCriteria.join("; ")}\nGoal plan at task creation: ${goal.plan}\nTask objective: ${spec.objective}\nChecks: ${spec.checks.join("; ")}\nExpected outputs: ${spec.expectedOutputs.join("; ")}\nFrozen plan input: ${task.planCopy ? path.relative(workDir, task.planCopy) : "none"}\nThe builder report follows. Inspect the copied files only as needed. Reply with only JSON {"verdict":"ready|revise|replan|blocked","feedback":"specific evidence-grounded reason"}, without extra prose or code fences. Escape paragraph breaks inside the feedback JSON string as \\n, never raw line breaks inside quotes. Identify decisive checked files, measurements, failures and limitations. Verify the substantive task objective as well as its checks against the frozen goal and constraints. Completed actions, saved files or exhausted self-imposed attempts do not satisfy an unmet attainment objective. Negative results may satisfy an observation task, but do not establish the parent goal. Use revise while work remains within this task; replan when the task definition conflicts with the frozen obligations or needs a plan change; blocked for an evidenced external impediment. ready requires the task objective and checks to be met and still needs the controller's separate final review. Do not change the plan or task obligations.\n\n${report}`;
 						if (reviewerPrompt.length + systemPromptFor("reviewer").length > policy.maxPromptChars) {
-							const handoff = await freezeBuilderReportForReviewer(report, reviewerRoot, reviewerSnapshotBytes);
+							const handoff = await freezeBuilderReportForReviewer(report, reviewerRoot);
 							reviewerPrompt = reviewerPrompt.slice(0, reviewerPrompt.length - report.length) + handoff;
 						}
 						if (reviewerPrompt.length + systemPromptFor("reviewer").length > policy.maxPromptChars) throw new HarnessError("context.budget", "reviewer control input exceeds the frozen prompt handoff size");

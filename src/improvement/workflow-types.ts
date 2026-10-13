@@ -20,6 +20,37 @@ export interface WorkflowCaseV1 {
 	checks: WorkflowCheckV1[];
 }
 export interface WorkflowCaseSetV1 { version: 1; split: "development" | "admission"; cases: WorkflowCaseV1[] }
+/** Only this projection may cross the source-arm IPC boundary in v2. */
+export interface WorkflowVisibleCaseV2 {
+	id: string;
+	goal: Omit<BeginGoalInput, "workflowMethodVersionId">;
+	/** Checks in this task are mechanically verifiable delivery obligations. Scientific G is external. */
+	task: TaskSpecInput;
+	/** Model-visible source paths. The adapter freezes these input copies as review artifacts. */
+	requiredEvidence: string[];
+}
+/** The controller owns this object. Its evaluator input is never sent to an arm. */
+export interface WorkflowCaseV2 {
+	version: 2;
+	visible: WorkflowVisibleCaseV2;
+	evaluation: { groundTruth: unknown };
+}
+export interface WorkflowQualityCheckV2 {
+	criterion: string;
+	passed: boolean | null;
+	evidence: string[];
+	reason: string;
+}
+export interface WorkflowOutcomeV2 {
+	version: 2;
+	caseId: string;
+	executionComplete: boolean;
+	checked: boolean;
+	quality: WorkflowQualityCheckV2[];
+	/** Observed execution provider use only; parent semantic evaluator resources are not included. */
+	cost: WorkflowArmReceiptV1["usage"];
+	reason?: string;
+}
 export interface WorkflowCalibrationPlanV1 {
 	version: 1;
 	kind: "m07-evidence-handoff-aa/v1";
@@ -65,19 +96,23 @@ export interface WorkflowEvidenceHandoffPlanV1 {
 	experienceMaxChars?: number;
 }
 export interface WorkflowArmReceiptV1 {
+	protocolVersion?: 1 | 2;
 	loadedSource?: LoadedSourceV1;
 	childPid?: number;
 	caseId: string;
 	arm: "baseline" | "candidate";
 	methodVersionId: string;
 	/** The actual M07 method binding; builtin means no workflow H was injected. */
-	methodBinding?: { kind: "builtin" } | { kind: "injected-h"; versionId: string };
+	methodBinding?: { kind: "builtin" } | { kind: "injected-h"; versionId: string } | { kind: "source-h"; versionId: string; sourceCommit: string };
 	workspaceRoot: string;
 	m07RunId?: string;
 	m04RunId?: string;
 	frozenReportPath?: string;
 	reportDeliveredToM04?: boolean;
 	feedbackStatus?: string;
+	checkpointId?: string;
+	knowledgeBeforeSnapshot?: string;
+	knowledgeAfterSnapshot?: string;
 	checkResults: Array<{ criterion: string; passed: boolean }>;
 	usage: { providerCalls: number; inputTokens: number; outputTokens: number; sdkEstimatedCost: number; complete: boolean; costComplete?: boolean };
 	status: "complete" | "inconclusive";
@@ -220,4 +255,32 @@ export function validateWorkflowCaseSet(input: unknown, split: WorkflowCaseSetV1
 		}
 	}
 	return set as unknown as WorkflowCaseSetV1;
+}
+
+/** Validation belongs to the fixed parent. Only `visible` is ever passed to a selected source. */
+export function validateWorkflowCaseV2(input: unknown): WorkflowCaseV2 {
+	if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.workflow-case-v2", "v2 case must be an object");
+	const c = input as Record<string, unknown>;
+	if (c.version !== 2 || Object.keys(c).sort().join(",") !== "evaluation,version,visible") throw new HarnessError("improvement.workflow-case-v2", "v2 case must separate visible input and parent evaluation");
+	const visible = c.visible as Record<string, unknown> | undefined;
+	const evaluation = c.evaluation as Record<string, unknown> | undefined;
+	if (!visible || Object.keys(visible).sort().join(",") !== "goal,id,requiredEvidence,task" || !safeId(visible.id) ||
+		!evaluation || Object.keys(evaluation).join(",") !== "groundTruth" || evaluation.groundTruth === undefined)
+		throw new HarnessError("improvement.workflow-case-v2", "v2 visible input or private ground truth is incomplete");
+	const goal = visible.goal as Record<string, unknown> | undefined;
+	const task = visible.task as Record<string, unknown> | undefined;
+	if (!goal || typeof goal.goal !== "string" || !goal.goal.trim() || typeof goal.problemRelation !== "string" || !goal.problemRelation.trim() ||
+		typeof goal.plan !== "string" || !goal.plan.trim() || !Array.isArray(goal.constraints) || !goal.constraints.length ||
+		!Array.isArray(goal.successCriteria) || !goal.successCriteria.length || Object.hasOwn(goal, "workflowMethodVersionId") ||
+		!task || !["reason", "check"].includes(String(task.mode)) || typeof task.objective !== "string" || !task.objective.trim() ||
+		!Array.isArray(task.inputs) || !task.inputs.every((x) => typeof x === "string" && x.length > 0 && !path.isAbsolute(x) && !x.includes("..")) ||
+		!Array.isArray(task.expectedOutputs) || task.expectedOutputs.length || task.requireIndependentCheck ||
+		!Array.isArray(task.checks) || task.checks.length !== 1 || task.checks[0] !== "M07 evidence report returned")
+		throw new HarnessError("improvement.workflow-case-v2", "v2 task must carry original obligations with only the fixed mechanical review check");
+	const required = visible.requiredEvidence;
+	if (!Array.isArray(required) || required.length < 1 || required.length > 20 ||
+		!required.every((x) => typeof x === "string" && x.length > 0 && x.length <= 240 && !path.isAbsolute(x) && !x.includes("..") && (task.inputs as string[]).includes(x)) ||
+		new Set(required).size !== required.length || (task.inputs as string[]).length !== required.length)
+		throw new HarnessError("improvement.workflow-case-v2", "required evidence must name distinct model-visible task inputs");
+	return input as WorkflowCaseV2;
 }

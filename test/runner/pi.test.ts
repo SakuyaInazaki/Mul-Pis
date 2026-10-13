@@ -698,6 +698,24 @@ test("detached local child leaves remote or detached effects explicitly unknown"
 	handle.dispose();
 });
 
+test("execution bash uses the controller-provided temporary directory and legacy grants remain usable", async t => {
+	const persistDir = await fixture(t);
+	const root = path.join(persistDir,"work");
+	const tempDir = path.join(persistDir,"scratch");
+	await mkdir(root); await mkdir(tempDir);
+	const stub = stubFactory();
+	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory });
+	const handle = await runner.create(spec(persistDir,{tools:{kind:"execution",root,tools:["bash"],tempDir}}));
+	const bash = stub.calls[0].customTools?.find(tool => tool.name === "bash");
+	assert(bash);
+	const output = await bash.execute("temp-call",{command:"printf '%s' \"$TMPDIR\""},undefined,undefined,{cwd:root} as never);
+	assert.ok(JSON.stringify(output.content).includes(tempDir));
+	handle.dispose();
+	const legacy = await runner.create(spec(path.join(persistDir,"legacy"),{tools:{kind:"execution",root,tools:["bash"]}}));
+	assert.equal(stub.calls[1].customTools?.some(tool => tool.name === "bash"),true);
+	legacy.dispose();
+});
+
 test("managed bash recovery reader rejects forged, linked and public receipts", async t => {
 	const persistDir = await fixture(t);
 	const root = path.join(persistDir, "work");

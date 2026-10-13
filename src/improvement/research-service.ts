@@ -15,7 +15,7 @@ import type { SessionRunner } from "../runner/types.ts";
 import { HarnessError } from "../types.ts";
 import { nowIso, Workspace, writeFileAtomic } from "../workspace.ts";
 import { runExecutorEpisode, runExecutorQualityAdmission } from "./executor-eval.ts";
-import { GenerationStore, isCpuExecutorStrategy, isM07WorkflowStrategy, type ExperienceRequirementV1, type GenerationBundleV1, type ImproverStrategyV1, type M07WorkflowStrategyV1, type ResearchStrategy, type StrategyRecordV1, validateExperienceRequirements, validateStrategy } from "./generation.ts";
+import { GenerationStore, isCpuExecutorStrategy, isM07WorkflowStrategy, isSourceStrategy, type ExperienceRequirementV1, type GenerationBundleV1, type ImproverStrategyV1, type M07WorkflowStrategyV1, type ResearchStrategy, type SourceStrategyV1, type StrategyRecordV1, validateExperienceRequirements, validateStrategy } from "./generation.ts";
 import { advanceKnowledgeEpochInLock, transitionMethodKnowledgeDependenciesInLock } from "./knowledge-epoch.ts";
 import { bindMethodPackageV2, exportMethodPackageV2, readMethodPackageV2 } from "./method-v2.ts";
 import { buildMetaEpisode, loadMetaEpisode, metaEpisodeForModel, metaEpisodePath, writeMetaEpisode, type MetaEpisodeV1 } from "./meta-episode.ts";
@@ -24,29 +24,39 @@ import { decisionPrompt, fullyReadDevelopmentFeedbackIds, improverSystemPrompt, 
 import { runBoundedModelStep } from "./research-model.ts";
 import { validateResearchPlan, type ResearchCampaignPlanV1, type ResearchCandidateV1, type ResearchDecisionRecordV1, type ResearchRunV1 } from "./research-types.ts";
 import { calibrateWorkflowEvidenceHandoff, prepareWorkflowResearchSource, runWorkflowEvidenceHandoff } from "./workflow-adapter.ts";
-import type { WorkflowSourceArmOptions } from "./workflow-source-arm.ts";
+import { assertFirstWorkflowSourceAllowlist, verifyPreparedWorkflowSource, type WorkflowSourceArmOptions } from "./workflow-source-arm.ts";
+import { assertCompleteSourceConfirmation, readConfirmedSourceRun, runWorkflowSourceConfirmation, type WorkflowSourceDeciderV2 } from "./workflow-source-confirmation.ts";
+import { assertOnlyIChange, runWorkflowSourceMetaComparison, type WorkflowSourceMetaInput } from "./workflow-source-meta.ts";
+import { readAdmissibleSourceMetaRun } from "./workflow-source-meta-admission.ts";
+import type { WorkflowTrustedEvaluatorV2 } from "./workflow-result-evaluator.ts";
 import { validateWorkflowCalibrationPlan, validateWorkflowPlan, validateWorkflowSourceComparisonPlan } from "./workflow-types.ts";
 
 const activeMutations = new Set<string>();
 const RUN_ID = () => `${new Date().toISOString().replace(/[-:.]/g, "")}-${randomBytes(3).toString("hex")}`;
+function promptBody(artifact: ResearchStrategy): string {
+ if (isSourceStrategy(artifact)) throw new HarnessError("improvement.strategy", "source methods require the separate source execution path");
+ return artifact.body;
+}
 export interface ResearchServiceOptions { workspaceRoot: string; runner: SessionRunner; registeredExperienceStores?: ReadonlyMap<string, KnowledgeStore> }
-export interface ResearchBootstrapInput { version: 1; executor: ExecutorStrategyV1 | M07WorkflowStrategyV1; improver: ImproverStrategyV1; applicability: string[] }
+export interface ResearchBootstrapInput { version: 1; executor: ExecutorStrategyV1 | M07WorkflowStrategyV1 | SourceStrategyV1; improver: ImproverStrategyV1 | SourceStrategyV1; applicability: string[] }
 type SearchResult = { selected?: ResearchCandidateV1; selectedAt?: string; decisionCount: number; status: "selected" | "no-winner" | "inconclusive"; stopReason?: string };
 
 /** Recheck pinned necessary experience in the destination bundle's actual H environment. */
 export async function verifyRequiredExperience(workspaceRoot: string, requirements: ExperienceRequirementV1[], context: { environmentVersion: string; executorArtifact: ResearchStrategy }, expectedSnapshotId?: string, registeredStores?: ReadonlyMap<string, KnowledgeStore>): Promise<void> {
  const checked = validateExperienceRequirements(requirements, "requiredExperienceRefs");
- const workflowArtifact = context.environmentVersion === "m07-workflow/v1" && isM07WorkflowStrategy(context.executorArtifact) ? context.executorArtifact : undefined;
+ const workflowSlot = context.environmentVersion === "m07-workflow/v1" ?
+  isM07WorkflowStrategy(context.executorArtifact) ? context.executorArtifact.slot :
+  isSourceStrategy(context.executorArtifact) && context.executorArtifact.kind === "source-executor" ? "evidence-handoff" : undefined : undefined;
  const cpu = context.environmentVersion === "cpu-response-identification/v1" && isCpuExecutorStrategy(context.executorArtifact);
- if (!workflowArtifact && !cpu) throw new HarnessError("improvement.experience", "method environment and executor strategy do not match");
+ if (!workflowSlot && !cpu) throw new HarnessError("improvement.experience", "method environment and executor strategy do not match");
  if (!checked.length) return;
  const ws = new Workspace(workspaceRoot), store = createFileKnowledgeStore(ws.knowledgeDir); await store.init();
  const provider = createExperienceProvider(store, registeredStores);
  for (const targetKind of ["executor", "improver"] as const) {
   const requestedRefs = checked.filter((item) => item.targetKind === targetKind).map((item) => item.ref);
   if (!requestedRefs.length) continue;
-  const applicability = workflowArtifact
-   ? targetKind === "executor" ? { stage: "M07", tags: [workflowArtifact.slot] } : { stage: "method-research", tags: [`m07-${workflowArtifact.slot}`] }
+  const applicability = workflowSlot
+   ? targetKind === "executor" ? { stage: "M07", tags: [workflowSlot] } : { stage: "method-research", tags: [`m07-${workflowSlot}`] }
    : { stage: "method-research", tags: ["cpu-response-identification"] };
   const result = await provider.select({ targetKind, applicability, requestedRefs,
    expectedSnapshotId, maxRecords: 1, maxChars: 1, verificationOnly: true });
@@ -62,6 +72,23 @@ function combineRequirements(...groups: ExperienceRequirementV1[][]): Experience
  const byId = new Map<string, ExperienceRequirementV1>();
  for (const item of groups.flat()) byId.set(`${item.targetKind}:${item.ref.storeId}/${item.ref.recordId}@${item.ref.version}`, item);
  return validateExperienceRequirements([...byId.values()], "inherited requiredExperienceRefs");
+}
+
+/** Read-only launch gate: bind a new process only while active H/I and pinned K refs remain live. */
+export async function verifyActiveWorkflowSourceForLaunch(workspaceRoot: string): Promise<{ sourceRoot: string; sourceCommit: string; versionId: string }> {
+ const ws = new Workspace(workspaceRoot), store = new GenerationStore(ws.root), active = await store.active();
+ if (!active || active.bundle.environmentVersion !== "m07-workflow/v1") throw new HarnessError("improvement.source-launch", "active workflow research bundle is required");
+ const [h, i] = await Promise.all([store.readStrategy(active.bundle.executorVersionId), store.readStrategy(active.bundle.improverVersionId)]);
+ if (!isSourceStrategy(h.artifact) || h.artifact.kind !== "source-executor") throw new HarnessError("improvement.source-launch", "active workflow H has no source binding");
+ const knowledge = createFileKnowledgeStore(ws.knowledgeDir); await knowledge.init();
+ if ((await knowledge.current())?.id !== active.bundle.knowledgeSnapshot) throw new HarnessError("improvement.source-launch", "active knowledge epoch changed");
+ await verifyRequiredExperience(ws.root, combineRequirements(h.requiredExperienceRefs, i.requiredExperienceRefs),
+  { environmentVersion: active.bundle.environmentVersion, executorArtifact: h.artifact }, active.bundle.knowledgeSnapshot);
+ await verifyRequiredKnowledge(ws.root, combineKnowledgeRefs(h.requiredKnowledgeRefs, i.requiredKnowledgeRefs), active.bundle.knowledgeSnapshot);
+ for (const record of [h, i]) if (isSourceStrategy(record.artifact)) await verifyPreparedWorkflowSource(record.artifact);
+ if (JSON.stringify((await store.active())?.pointer) !== JSON.stringify(active.pointer) || (await knowledge.current())?.id !== active.bundle.knowledgeSnapshot)
+  throw new HarnessError("improvement.source-launch", "active source or knowledge changed during launch verification");
+ return { sourceRoot: h.artifact.sourceRoot, sourceCommit: h.artifact.sourceCommit, versionId: h.versionId };
 }
 
 async function loadCaseSet(file: string, split: CpuCaseSetV1["split"]): Promise<CpuCaseSetV1> {
@@ -143,8 +170,10 @@ export class ResearchImprovementService {
    if (!input || input.version !== 1 || !Array.isArray(input.applicability) || input.applicability.length > 16 || input.applicability.some((x) => typeof x !== "string" || !x.trim() || x.length > 240)) throw new HarnessError("improvement.bootstrap", "invalid explicit human seed");
    if (await this.store.active()) throw new HarnessError("improvement.bootstrap", "research generation already active");
    const executor = validateStrategy("executor", input.executor), improver = validateStrategy("improver", input.improver);
-   const workflow = isM07WorkflowStrategy(executor);
-   if (workflow && (executor.slot !== "evidence-handoff" || !input.applicability.includes("M07"))) throw new HarnessError("improvement.bootstrap", "workflow bootstrap supports only the M07 evidence-handoff slot");
+   const workflow = isM07WorkflowStrategy(executor) || isSourceStrategy(executor) && executor.kind === "source-executor";
+   if (workflow && (isM07WorkflowStrategy(executor) && executor.slot !== "evidence-handoff" || !input.applicability.includes("M07"))) throw new HarnessError("improvement.bootstrap", "workflow bootstrap supports only the M07 evidence-handoff slot");
+   if (isSourceStrategy(executor)) await verifyPreparedWorkflowSource({ sourceRoot: executor.sourceRoot, sourceCommit: executor.sourceCommit });
+   if (isSourceStrategy(improver)) await verifyPreparedWorkflowSource({ sourceRoot: improver.sourceRoot, sourceCommit: improver.sourceCommit });
    const config = await this.ws.loadConfig();
    const models = { improver: resolveRoleModel(config, "improver"), research: resolveRoleModel(config, "research") };
    const knowledge = createFileKnowledgeStore(this.ws.knowledgeDir); await knowledge.init();
@@ -153,7 +182,8 @@ export class ResearchImprovementService {
    const i = await this.store.writeStrategy({ versionId: this.store.newId("I-human"), kind: "improver", artifact: improver, origin: "human-seed", applicability: input.applicability, limitations: [], state: "manual-active" });
    const bundle = await this.store.writeBundle({ bundleId: this.store.newId("bundle"), parents: [], executorVersionId: h.versionId, improverVersionId: i.versionId, knowledgeSnapshot,
     environmentVersion: workflow ? "m07-workflow/v1" : "cpu-response-identification/v1", modelConfig: models, protocolVersion: "research-protocol/v1", allowedCapabilities: workflow ? ["m07-evidence-read", "no-tools-model"] : ["cpu-probe", "no-tools-model"], state: "manual-active" });
-   await this.store.activate(bundle.bundleId, undefined, "human-seed", `bootstrap-${RUN_ID()}`);
+   if (isSourceStrategy(executor) || isSourceStrategy(improver)) await this.store.activateHumanSourceSeed(bundle.bundleId, `bootstrap-${RUN_ID()}`);
+   else await this.store.activate(bundle.bundleId, undefined, "human-seed", `bootstrap-${RUN_ID()}`);
    return bundle;
   });
  }
@@ -163,6 +193,7 @@ export class ResearchImprovementService {
   const previous = await this.store.readBundle(active.pointer.previousBundleId);
   const [h, i] = await Promise.all([this.store.readStrategy(previous.executorVersionId), this.store.readStrategy(previous.improverVersionId)]);
   await this.verifyRequirements([h, i], previous.knowledgeSnapshot, previous);
+  for (const record of [h, i]) if (isSourceStrategy(record.artifact)) await verifyPreparedWorkflowSource(record.artifact);
   return this.store.rollback();
  }); }
  async exportMethod(versionId: string, outputPath: string) {
@@ -186,6 +217,110 @@ export class ResearchImprovementService {
  async calibrateWorkflow(input: unknown) { const plan = validateWorkflowCalibrationPlan(input); return this.withMutation(() => calibrateWorkflowEvidenceHandoff({ ws: this.ws, store: this.store, runner: this.runner, plan, registeredExperienceStores: this.registeredExperienceStores })); }
  /** Two fixed source versions, identical frozen H/K/cases, fresh processes; observations only. */
  async compareWorkflowSources(input: unknown, sourceRunnerOptions: Pick<WorkflowSourceArmOptions, "runnerKind" | "fakeReplyModule"> = { runnerKind: "pi" }) { const plan = validateWorkflowSourceComparisonPlan(input); return this.withMutation(() => calibrateWorkflowEvidenceHandoff({ ws: this.ws, store: this.store, runner: this.runner, plan, sourceRunnerOptions, registeredExperienceStores: this.registeredExperienceStores })); }
+
+ /** The trusted private driver supplies evaluator and declared decision program before G opens. */
+ async confirmWorkflowSources(input: unknown, control: { evaluator: WorkflowTrustedEvaluatorV2; decider: WorkflowSourceDeciderV2;
+  sourceRunnerOptions?: Pick<WorkflowSourceArmOptions, "runnerKind" | "fakeReplyModule"> }) {
+  if (typeof control?.evaluator !== "function" || typeof control.decider !== "function") throw new HarnessError("improvement.source-confirmation", "trusted parent evaluator and predeclared decider are required");
+  return this.withMutation(async () => {
+   const active = await this.store.active(); if (!active) throw new HarnessError("improvement.source-confirmation", "active research bundle is required");
+   const [h, i] = await Promise.all([this.store.readStrategy(active.bundle.executorVersionId), this.store.readStrategy(active.bundle.improverVersionId)]);
+   const beforePrompt = async () => {
+    const current = await this.store.active();
+    if (JSON.stringify(current?.pointer) !== JSON.stringify(active.pointer)) throw new HarnessError("improvement.stale-baseline", "active research source changed during confirmation");
+    const knowledge = createFileKnowledgeStore(this.ws.knowledgeDir); await knowledge.init();
+    if ((await knowledge.current())?.id !== active.bundle.knowledgeSnapshot) throw new HarnessError("improvement.source-confirmation", "knowledge epoch changed during confirmation");
+    await this.verifyRequirements([h, i], active.bundle.knowledgeSnapshot, active.bundle);
+   };
+   await beforePrompt();
+   return runWorkflowSourceConfirmation({ workspace: this.ws, store: this.store, runner: this.runner, planInput: input,
+    evaluator: control.evaluator, decider: control.decider, sourceRunnerOptions: control.sourceRunnerOptions ?? { runnerKind: "pi" }, beforePrompt });
+  });
+ }
+
+ /** Adoption re-reads the complete protected run; a development run or passed flag cannot enter. */
+ async adoptWorkflowSourceConfirmation(runId: string) {
+  return this.withMutation(async () => {
+   const run = await readConfirmedSourceRun(this.store, runId);
+   await assertCompleteSourceConfirmation(this.store, run);
+   const active = await this.store.active();
+   if (!active || JSON.stringify(active.pointer) !== JSON.stringify(run.baselinePointer) || JSON.stringify(active.bundle) !== JSON.stringify(run.baselineBundle))
+    throw new HarnessError("improvement.stale-baseline", "active generation changed after protected confirmation");
+   const candidate = await this.store.readStrategy(run.plan.selection.candidateVersionId);
+   const retainedI = await this.store.readStrategy(active.bundle.improverVersionId);
+   if (candidate.kind !== "executor" || !isSourceStrategy(candidate.artifact) || candidate.artifact.kind !== "source-executor" ||
+    candidate.artifact.sourceRoot !== run.plan.sources.candidate.sourceRoot || candidate.artifact.sourceCommit !== run.plan.sources.candidate.sourceCommit ||
+    candidate.parentVersionId !== active.bundle.executorVersionId || candidate.origin !== "agent-generated")
+    throw new HarnessError("improvement.source-admission", "candidate source strategy differs from the frozen confirmation selection");
+   await assertFirstWorkflowSourceAllowlist(run.plan.sources.baseline, run.plan.sources.candidate);
+   const knowledge = createFileKnowledgeStore(this.ws.knowledgeDir); await knowledge.init();
+   if ((await knowledge.current())?.id !== active.bundle.knowledgeSnapshot) throw new HarnessError("improvement.source-admission", "knowledge epoch changed after confirmation");
+   await this.verifyRequirements([candidate, retainedI], active.bundle.knowledgeSnapshot, active.bundle);
+   const next = await this.store.writeBundle({ bundleId: this.store.newId("bundle"), parents: [active.bundle.bundleId], executorVersionId: candidate.versionId,
+    improverVersionId: retainedI.versionId, knowledgeSnapshot: active.bundle.knowledgeSnapshot, environmentVersion: active.bundle.environmentVersion,
+    modelConfig: active.bundle.modelConfig, protocolVersion: active.bundle.protocolVersion, allowedCapabilities: active.bundle.allowedCapabilities, state: "admitted" });
+   const pointer = await this.store.activateConfirmedSource(next.bundleId, active.pointer, runId);
+   return { bundle: next, pointer, confirmationRunId: runId };
+  });
+ }
+
+ /** Registered I study: both source I programs search from one frozen H/K/model before offspring G opens. */
+ async compareWorkflowSourceMeta(input: Omit<WorkflowSourceMetaInput, "workspaceRoot" | "runRoot" | "runner" | "beforeOperation">) {
+  return this.withMutation(async () => {
+   const active = await this.store.active(); if (!active) throw new HarnessError("improvement.source-meta", "active bundle is required");
+   const [h, i, candidate] = await Promise.all([this.store.readStrategy(active.bundle.executorVersionId),
+    this.store.readStrategy(active.bundle.improverVersionId), this.store.readStrategy(input.plan.candidate.versionId)]);
+   const beforeOperation = async () => {
+    if (JSON.stringify((await this.store.active())?.pointer) !== JSON.stringify(active.pointer))
+     throw new HarnessError("improvement.stale-baseline", "active generation changed during I comparison");
+    const knowledge = createFileKnowledgeStore(this.ws.knowledgeDir); await knowledge.init();
+    if ((await knowledge.current())?.id !== active.bundle.knowledgeSnapshot)
+     throw new HarnessError("improvement.source-meta", "knowledge epoch changed during I comparison");
+    await this.verifyRequirements([h, i, candidate], active.bundle.knowledgeSnapshot, active.bundle);
+    for (const record of [h, i, candidate]) if (isSourceStrategy(record.artifact)) await verifyPreparedWorkflowSource(record.artifact);
+   };
+   await beforeOperation();
+   const runId = this.store.newId("source-meta");
+   return runWorkflowSourceMetaComparison({ ...input, workspaceRoot: this.ws.root,
+    runRoot: path.join(this.store.root, "source-meta", runId), runner: this.runner, beforeOperation });
+  });
+ }
+
+ /** Read only a service-registered, fully checked I offspring run; H and K are retained verbatim. */
+ async adoptWorkflowSourceMeta(runId: string) {
+  return this.withMutation(async () => {
+   const run = await readAdmissibleSourceMetaRun(this.store, runId);
+   const active = await this.store.active();
+   if (!active || JSON.stringify(active.pointer) !== JSON.stringify(run.activePointer) ||
+    active.bundle.bundleId !== run.plan.baselineBundleId || active.bundle.executorVersionId !== run.plan.baseline.executorVersionId ||
+    active.bundle.improverVersionId !== run.plan.baseline.improverVersionId ||
+    (active.bundle.knowledgeSnapshot ?? null) !== run.plan.baseline.knowledgeSnapshot ||
+    JSON.stringify(active.bundle.modelConfig) !== JSON.stringify(run.plan.baseline.modelConfig))
+    throw new HarnessError("improvement.stale-baseline", "active H/I/K/model differs from the completed I comparison");
+   const [h, oldI, candidateI] = await Promise.all([this.store.readStrategy(active.bundle.executorVersionId),
+    this.store.readStrategy(active.bundle.improverVersionId), this.store.readStrategy(run.plan.candidate.versionId)]);
+   if (!isSourceStrategy(h.artifact) || h.artifact.kind !== "source-executor" || !isSourceStrategy(oldI.artifact) || oldI.artifact.kind !== "source-improver" ||
+    !isSourceStrategy(candidateI.artifact) || candidateI.artifact.kind !== "source-improver" ||
+    candidateI.parentVersionId !== oldI.versionId || candidateI.origin !== "agent-generated" || candidateI.state !== "research-only" ||
+    h.artifact.sourceRoot !== run.plan.baseline.executorSource.sourceRoot || h.artifact.sourceCommit !== run.plan.baseline.executorSource.sourceCommit ||
+    candidateI.artifact.sourceRoot !== run.plan.candidate.source.sourceRoot || candidateI.artifact.sourceCommit !== run.plan.candidate.source.sourceCommit)
+    throw new HarnessError("improvement.source-meta-admission", "active I lineage or common H differs from frozen meta receipt");
+   const frozenCandidate = JSON.parse(await readFile(path.join(this.store.root, "source-meta", runId, "candidate-I-receipt.private.json"), "utf8")) as { parentCommit?: string };
+   if (frozenCandidate.parentCommit !== oldI.artifact.sourceCommit)
+    throw new HarnessError("improvement.source-meta-admission", "candidate I did not descend from active I source");
+   await assertOnlyIChange({ sourceRoot: oldI.artifact.sourceRoot, sourceCommit: oldI.artifact.sourceCommit }, run.plan.candidate.source);
+   const knowledge = createFileKnowledgeStore(this.ws.knowledgeDir); await knowledge.init();
+   if ((await knowledge.current())?.id !== active.bundle.knowledgeSnapshot)
+    throw new HarnessError("improvement.source-meta-admission", "knowledge epoch changed after I comparison");
+   await this.verifyRequirements([h, candidateI], active.bundle.knowledgeSnapshot, active.bundle);
+   const next = await this.store.writeBundle({ bundleId: this.store.newId("bundle"), parents: [active.bundle.bundleId],
+    executorVersionId: h.versionId, improverVersionId: candidateI.versionId, knowledgeSnapshot: active.bundle.knowledgeSnapshot,
+    environmentVersion: active.bundle.environmentVersion, modelConfig: active.bundle.modelConfig,
+    protocolVersion: active.bundle.protocolVersion, allowedCapabilities: active.bundle.allowedCapabilities, state: "admitted" });
+   const pointer = await this.store.activateConfirmedImproverSource(next.bundleId, active.pointer, runId);
+   return { bundle: next, pointer, metaRunId: runId };
+  });
+ }
 
  private async runUnlocked(plan: ResearchCampaignPlanV1): Promise<ResearchRunV1> {
   const active = await this.store.active(); if (!active) throw new HarnessError("improvement.generation", "bootstrap a human-seeded research generation first");
@@ -270,7 +405,7 @@ export class ResearchImprovementService {
     if (meta.status === "accepted" && !budget.status().inFlight) {
      const candidate = await this.store.readStrategy(selected.selected.strategyVersionId);
      await this.verifyRequirements([h, candidate], active.bundle.knowledgeSnapshot, active.bundle);
-     if (candidate.artifact.body === i.artifact.body) { run.status = "rejected"; run.outcome = "candidate-rejected"; run.stopReason = "sham improver body did not change"; }
+     if (promptBody(candidate.artifact) === promptBody(i.artifact)) { run.status = "rejected"; run.outcome = "candidate-rejected"; run.stopReason = "sham improver body did not change"; }
      else { const bundle = await this.store.writeBundle({ bundleId: this.store.newId("bundle"), parents: [active.bundle.bundleId], executorVersionId: h.versionId, improverVersionId: candidate.versionId, knowledgeSnapshot: active.bundle.knowledgeSnapshot,
        environmentVersion: active.bundle.environmentVersion, modelConfig: active.bundle.modelConfig, protocolVersion: active.bundle.protocolVersion, allowedCapabilities: active.bundle.allowedCapabilities, state: "admitted" });
       await this.store.activate(bundle.bundleId, active.pointer, "local-meta-admission", id); run.status = "promoted"; run.outcome = "promoted"; run.stopReason = "local meta successor protocol accepted"; }
@@ -324,12 +459,12 @@ export class ResearchImprovementService {
   const inspectionResults: ResearchInspectionResultV1[] = [];
   let inspectActions = 0;
   let lastActionResult: ResearchDecisionViewV1["lastActionResult"];
-  const methodView = (record: StrategyRecordV1, inline: boolean) => ({ versionId: record.versionId, kind: record.kind, utf16Length: record.artifact.body.length, ...(inline ? { body: record.artifact.body } : {}) });
+  const methodView = (record: StrategyRecordV1, inline: boolean) => ({ versionId: record.versionId, kind: record.kind, utf16Length: promptBody(record.artifact).length, ...(inline ? { body: promptBody(record.artifact) } : {}) });
   const caseViews = (): ResearchCaseViewV1[] => [...cases.values()].map((item) => ({ caseId: item.caseId, allowedProbeX: item.task.allowedProbeX, units: item.task.units,
    initialObservations: item.task.initialObservations, feedbackCount: item.feedback.length, latestFeedbackId: item.feedback.at(-1)?.id, latestStatus: item.feedback.at(-1)?.status,
    episodeCount: item.episodes.length, latestEpisodeStatus: item.episodes.at(-1)?.episode.status, latestEpisodeFailure: item.episodes.at(-1)?.episode.failure ? "episode-incomplete" : undefined,
    modelCalls: item.modelCalls, probeCalls: item.probeCalls, sdkEstimatedCost: item.sdkEstimatedCost }));
-  const seenBodies = new Set<string>([args.target === "executor" ? args.executor.artifact.body : args.improver.artifact.body]);
+  const seenBodies = new Set<string>([promptBody(args.target === "executor" ? args.executor.artifact : args.improver.artifact)]);
   const ensureLiveExperience = async () => {
    await this.verifyRequirements([args.executor, args.improver], args.bundle.knowledgeSnapshot, args.bundle);
    if (!args.selection.refs.length) return;
@@ -348,8 +483,8 @@ export class ResearchImprovementService {
     request = action.read;
     const selectedCase = request.caseId ? cases.get(request.caseId) : undefined;
     if (request.object === "meta-episode") { const selected = args.metaEpisodes?.find((episode) => episode.id === request.id); content = selected ? JSON.stringify(metaEpisodeForModel(selected)) : ""; }
-    else if (request.object === "method") content = methodRecords.get(request.id!)?.artifact.body ?? "";
-    else if (request.object === "compare-methods") content = JSON.stringify({ left: methodRecords.get(request.id!)?.artifact.body, right: methodRecords.get(request.compareToId!)?.artifact.body });
+    else if (request.object === "method") { const record = methodRecords.get(request.id!); content = record ? promptBody(record.artifact) : ""; }
+    else if (request.object === "compare-methods") { const left = methodRecords.get(request.id!), right = methodRecords.get(request.compareToId!); content = JSON.stringify({ left: left ? promptBody(left.artifact) : undefined, right: right ? promptBody(right.artifact) : undefined }); }
     else if (request.object === "case-task") content = JSON.stringify(selectedCase?.task);
     else if (request.object === "development-feedback") { observedFeedbackId = selectedCase?.feedback[request.index!]?.id; content = JSON.stringify(selectedCase?.feedback[request.index!]); }
     else { const record = selectedCase?.episodes[request.index!]; content = record ? JSON.stringify({ caseId: selectedCase!.caseId, candidateId: record.candidateId,

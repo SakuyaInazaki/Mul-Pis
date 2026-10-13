@@ -4,7 +4,7 @@ import { HarnessError } from "../types.ts";
 import { writeFileAtomic } from "../workspace.ts";
 import { isKnowledgeRef } from "../knowledge/experience-index.ts";
 import type { KnowledgeRef } from "../knowledge/types.ts";
-import { GenerationStore, type ActiveGenerationPointerV1, type DependencyTransitionV1, type ExperienceRequirementV1, type GenerationBundleV1, type ResearchStrategy, type StrategyKind, type StrategyRecordV1, validateExperienceRequirements, validateStrategy } from "./generation.ts";
+import { GenerationStore, isSourceStrategy, type ActiveGenerationPointerV1, type DependencyTransitionV1, type ExperienceRequirementV1, type GenerationBundleV1, type ResearchStrategy, type StrategyKind, type StrategyRecordV1, validateExperienceRequirements, validateStrategy } from "./generation.ts";
 
 export interface MethodPackageV2 {
  version: 2;
@@ -55,6 +55,7 @@ export async function readMethodPackageV2(file: string): Promise<MethodPackageV2
 }
 export async function exportMethodPackageV2(store: GenerationStore, strategyVersionId: string, sourceScope: MethodPackageV2["sourceScope"], outputPath: string): Promise<MethodPackageV2> {
  const record = await store.readStrategy(strategyVersionId);
+ if (isSourceStrategy(record.artifact)) throw new HarnessError("improvement.method-v2", "V2 method export carries prompt data only; source methods require a separate reviewed source transfer");
  const pkg: MethodPackageV2 = { version: 2, methodType: record.kind, sourceVersionId: record.versionId, artifact: record.artifact, origin: record.origin, applicability: record.applicability, limitations: record.limitations, sourceExperienceRefs: record.sourceExperienceRefs, requiredExperienceRefs: record.requiredExperienceRefs, requiredKnowledgeRefs: record.requiredKnowledgeRefs, ...(record.dependencyTransition ? { dependencyTransition: record.dependencyTransition } : {}), sourceScope,
   ...(record.parentVersionId ? { parentVersionId: record.parentVersionId } : {}) };
  // Deliberately no case inputs, answers, traces, workspace paths or alleged passed flag.
@@ -64,6 +65,9 @@ export async function exportMethodPackageV2(store: GenerationStore, strategyVers
 /** Calling this is an explicit manual activation, with unverified external provenance. */
 export async function bindMethodPackageV2(store: GenerationStore, checkedPackage: MethodPackageV2, previous: { pointer: ActiveGenerationPointerV1; bundle: GenerationBundleV1 }, runId: string): Promise<{ strategy: StrategyRecordV1; bundle: GenerationBundleV1 }> {
  const pkg = validateMethodPackageV2(checkedPackage);
+ const priorH = await store.readStrategy(previous.bundle.executorVersionId), priorI = await store.readStrategy(previous.bundle.improverVersionId);
+ if (isSourceStrategy(pkg.artifact) || isSourceStrategy(priorH.artifact) || isSourceStrategy(priorI.artifact))
+  throw new HarnessError("improvement.method-v2", "V2 manual import cannot migrate a source H/I bundle; use explicit source seed or protected confirmation");
  const versionId = store.newId(`imported-${pkg.methodType}`);
  const strategy = await store.writeStrategy({ versionId, kind: pkg.methodType, artifact: pkg.artifact, origin: "external-manual-unverified", applicability: pkg.applicability, limitations: pkg.limitations, sourceExperienceRefs: pkg.sourceExperienceRefs, requiredExperienceRefs: pkg.requiredExperienceRefs, requiredKnowledgeRefs: pkg.requiredKnowledgeRefs, ...(pkg.dependencyTransition ? { dependencyTransition: pkg.dependencyTransition } : {}), state: "manual-active" });
  const bundle = await store.writeBundle({ bundleId: store.newId("bundle"), parents: [previous.bundle.bundleId], executorVersionId: pkg.methodType === "executor" ? versionId : previous.bundle.executorVersionId, improverVersionId: pkg.methodType === "improver" ? versionId : previous.bundle.improverVersionId,

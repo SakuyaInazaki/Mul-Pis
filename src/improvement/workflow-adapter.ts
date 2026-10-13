@@ -11,24 +11,29 @@ import type { KnowledgeStore } from "../knowledge/types.ts";
 import { createM07Controller, latestFormalBaseline } from "../m07/controller.ts";
 import { resolveM04Baseline } from "../m07/formal-baseline.ts";
 import type { SessionHandle, SessionRunner, SessionSpec, UsageSummary } from "../runner/types.ts";
+import { summarizeUsage } from "../runner/usage.ts";
 import { runM04 } from "../stages/m04.ts";
 import type { StageContext } from "../stages/context.ts";
 import { HarnessError } from "../types.ts";
 import { nowIso, Workspace, writeFileAtomic } from "../workspace.ts";
-import { GenerationStore, isM07WorkflowStrategy, type GenerationBundleV1, type M07WorkflowStrategyV1, type StrategyRecordV1, validateStrategy } from "./generation.ts";
+import { GenerationStore, isM07WorkflowStrategy, isSourceStrategy, type GenerationBundleV1, type M07WorkflowStrategyV1, type StrategyRecordV1, validateStrategy } from "./generation.ts";
 import { validateActiveBudgetPointer, validateBudgetPolicy } from "./policy.ts";
 import { buildWorkflowMetaEpisode, loadWorkflowMetaEpisode, metaEpisodeForModel, writeMetaEpisode } from "./meta-episode.ts";
 import { validateResearchHypothesis, type ResearchHypothesisV1 } from "./policy-host.ts";
 import { runBoundedModelStep } from "./research-model.ts";
 import { timedPrompt } from "./admission.ts";
 import type { WorkflowSourceArmOptions } from "./workflow-source-arm.ts";
-import { validateWorkflowCaseSet, type WorkflowArmReceiptV1, type WorkflowCalibrationArmV1, type WorkflowCalibrationPlanV1, type WorkflowSourceComparisonPlanV1, type WorkflowCalibrationRunV1, type WorkflowCaseSetV1, type WorkflowEvidenceHandoffPlanV1, type WorkflowRunV1 } from "./workflow-types.ts";
+import { validateWorkflowCaseSet, type WorkflowArmReceiptV1, type WorkflowCalibrationArmV1, type WorkflowCalibrationPlanV1, type WorkflowSourceComparisonPlanV1, type WorkflowCalibrationRunV1, type WorkflowCaseSetV1, type WorkflowVisibleCaseV2, type WorkflowEvidenceHandoffPlanV1, type WorkflowRunV1 } from "./workflow-types.ts";
 
 type Action = { kind: "inspect"; object: "method" | "development-feedback" | "meta-episode"; id: string; start: number; maxChars: number } |
 	{ kind: "propose"; target: "executor"; body: string; hypothesis: ResearchHypothesisV1 } |
 	{ kind: "evaluate-development"; candidateId: string } |
 	{ kind: "stop"; reason: string; selectedCandidateId?: string };
 type Source = { id: string; text: string; m07RunId: string; m04RunId: string };
+function workflowPromptBody(record: StrategyRecordV1): string {
+	if (record.artifact.kind !== "m07-workflow-prompt") throw new HarnessError("improvement.workflow", "prompt workflow search cannot inspect a source method as prompt text");
+	return record.artifact.body;
+}
 /** One workflow-only contract. The CPU improver contract uses a different inspect shape. */
 const WORKFLOW_ACTION_CONTRACT = [
 	'{"kind":"inspect","object":"method|development-feedback|meta-episode","id":"registered-id","start":0,"maxChars":1000}',
@@ -125,7 +130,7 @@ async function activePolicyFiles(source: Workspace): Promise<{ pointerPath: stri
 	if (pointerText !== await readFile(pointerPath, "utf8")) throw new HarnessError("improvement.workflow-copy", "active policy changed while freezing an arm");
 	return { pointerPath, policyPath, pointerText, policyText };
 }
-async function seedArm(source: Workspace, targetRoot: string, bundle: NonNullable<Awaited<ReturnType<GenerationStore["active"]>>>["bundle"], h: StrategyRecordV1, i: StrategyRecordV1, caseInput: WorkflowCaseSetV1["cases"][number], baselineRunId: string, activePolicy: Awaited<ReturnType<typeof activePolicyFiles>>): Promise<StageContext> {
+async function seedArm(source: Workspace, targetRoot: string, bundle: NonNullable<Awaited<ReturnType<GenerationStore["active"]>>>["bundle"], h: StrategyRecordV1, i: StrategyRecordV1, caseInput: WorkflowCaseSetV1["cases"][number] | WorkflowVisibleCaseV2, baselineRunId: string, activePolicy: Awaited<ReturnType<typeof activePolicyFiles>>): Promise<StageContext> {
 	const target = new Workspace(targetRoot);
 	await mkdir(target.root);
 	const copy = async (from: string, to: string): Promise<void> => { await assertPlainTree(from); await cp(from, to, { recursive: true, errorOnExist: true, force: false, dereference: false }); };
@@ -136,13 +141,17 @@ async function seedArm(source: Workspace, targetRoot: string, bundle: NonNullabl
 	await mkdir(path.dirname(target.problemFile), { recursive: true });
 	await cp(source.problemFile, target.problemFile, { errorOnExist: true, force: false });
 	await cp(source.configFile, target.configFile, { errorOnExist: true, force: false });
-	try { await copy(source.rawDir, target.rawDir); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-	for (const item of caseInput.task.inputs) {
+	// A v2 arm receives only the evidence named by this case. Never copy the whole raw tree,
+	// which may also contain other cases or parent-only evaluation material.
+	const isolatedEvidence = "requiredEvidence" in caseInput ? caseInput.requiredEvidence : undefined;
+	if (isolatedEvidence) await mkdir(target.rawDir, { recursive: true });
+	else try { await copy(source.rawDir, target.rawDir); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+	for (const item of isolatedEvidence ?? caseInput.task.inputs) {
 		if (!relativeSafe(item)) throw new HarnessError("improvement.workflow-copy", "task input is not an exact relative file");
 		const from = path.join(source.root, item), to = path.join(target.root, item);
 		const info = await lstat(from);
 		if (!info.isFile() || info.isSymbolicLink() || info.size > 8 * 1024 * 1024 || !nested(await realpath(source.root), await realpath(from))) throw new HarnessError("improvement.workflow-copy", "task input is not a bounded source file");
-		if (item === "problem/problem.md" || item.startsWith("problem/raw/")) continue;
+		if (item === "problem/problem.md" || (!isolatedEvidence && item.startsWith("problem/raw/"))) continue;
 		await mkdir(path.dirname(to), { recursive: true }); await cp(from, to, { errorOnExist: true, force: false });
 	}
 	const knowledgeInfo = await lstat(source.knowledgeDir);
@@ -168,13 +177,15 @@ async function seedArm(source: Workspace, targetRoot: string, bundle: NonNullabl
 	const gen = new GenerationStore(target.root);
 	for (const record of [h, i]) await gen.writeStrategy({ versionId: record.versionId, kind: record.kind, artifact: record.artifact, parentVersionId: record.parentVersionId, origin: record.origin, applicability: record.applicability, limitations: record.limitations, sourceExperienceRefs: record.sourceExperienceRefs, requiredExperienceRefs: record.requiredExperienceRefs, requiredKnowledgeRefs: record.requiredKnowledgeRefs, state: "manual-active" });
 	const armBundle = await gen.writeBundle({ bundleId: bundle.bundleId, parents: [], executorVersionId: h.versionId, improverVersionId: i.versionId, knowledgeSnapshot: bundle.knowledgeSnapshot, environmentVersion: "m07-workflow/v1", modelConfig: bundle.modelConfig, protocolVersion: bundle.protocolVersion, allowedCapabilities: bundle.allowedCapabilities, state: "manual-active" });
-	await gen.activate(armBundle.bundleId, undefined, "external-manual-unverified", `isolated-arm-${id()}`);
+	const armRunId = `isolated-arm-${id()}`;
+	if (isSourceStrategy(h.artifact) || isSourceStrategy(i.artifact)) await gen.activateIsolatedSourceCopy(armBundle.bundleId, armRunId);
+	else await gen.activate(armBundle.bundleId, undefined, "external-manual-unverified", armRunId);
 	const store = createFileKnowledgeStore(target.knowledgeDir); await store.init();
 	return { ws: target, store, runner: undefined as unknown as SessionRunner, config: await target.loadConfig() };
 }
 
 /** Copy only explicitly named, already separated case inputs. */
-async function freezeCaseInputs(source: Workspace, target: Workspace, cases: WorkflowCaseSetV1["cases"]): Promise<void> {
+async function freezeCaseInputs(source: Workspace, target: Workspace, cases: Array<WorkflowCaseSetV1["cases"][number] | WorkflowVisibleCaseV2>): Promise<void> {
 	for (const item of new Set(cases.flatMap((c) => c.task.inputs))) {
 		if (!relativeSafe(item)) throw new HarnessError("improvement.workflow-copy", "case input is not a confined relative file");
 		const from = path.join(source.root, item), to = path.join(target.root, item);
@@ -422,42 +433,60 @@ function assertWorkflowBudgetOpen(budget: SharedBudget, lease: BudgetLease): voi
 		throw new HarnessError("improvement.budget", "workflow provider request remains in flight");
 }
 
-export function createWorkflowMeteredRunner(base: SessionRunner, budget: SharedBudget, lease: BudgetLease, events: UsageSummary[], _legacyTimeoutMs?: number, beforePrompt?: () => Promise<void>, inspectPrompt?: (spec: SessionSpec, message: string) => void, onSettled?: (usage: UsageSummary) => Promise<void>, onFailed?: () => Promise<void>): SessionRunner {
+export function createWorkflowMeteredRunner(base: SessionRunner, budget: SharedBudget, lease: BudgetLease, events: UsageSummary[], _legacyTimeoutMs?: number, beforePrompt?: () => Promise<void>, inspectPrompt?: (spec: SessionSpec, message: string) => void, onSettled?: (usage: UsageSummary) => Promise<void>, onFailed?: (usage: UsageSummary) => Promise<void>): SessionRunner {
 	const wrap = (handle: SessionHandle, spec: SessionSpec): SessionHandle => ({ ...handle, prompt: async (message) => {
 		inspectPrompt?.(spec, message);
 		await beforePrompt?.();
 		assertWorkflowBudgetOpen(budget, lease);
+		const eventStart = handle.usageEvents().length;
 		const reservation = budget.reserveObservedTurn(lease);
 		let settled = false;
 		try {
 			const turn = await timedPrompt(handle, message);
-			const usage = turn.usage ?? handle.usageSummary();
+			const usage = turn.usage ?? summarizeUsage(handle.usageEvents().slice(eventStart));
 			budget.settleObservedTurn(reservation, usage); settled = true; events.push(usage);
 			await onSettled?.(usage);
 			if (!usage.complete || usage.reportedEvents < 1) throw new HarnessError("improvement.workflow-usage", "M07/M04 provider use is incomplete");
 			return turn;
-		} catch (error) { if (!settled) { budget.markObservedTurnUnknown(reservation); await onFailed?.(); } throw error; }
+		} catch (error) {
+			if (!settled) {
+				// Pi records every visible provider response before rejecting a failed tool turn.
+				// Keep those observations, while the unfinished tail remains unknown.
+				const observed = summarizeUsage(handle.usageEvents().slice(eventStart));
+				const usage = { ...observed, unknownEvents: Math.max(1, observed.unknownEvents), complete: false, costComplete: false };
+				budget.settleObservedTurn(reservation, usage); events.push(usage);
+				await onFailed?.(usage);
+			}
+			throw error;
+		}
 	}, setRunContext: handle.setRunContext?.bind(handle), transcript: handle.transcript.bind(handle), readCoverage: handle.readCoverage.bind(handle), readReturnEvents: handle.readReturnEvents.bind(handle), usageEvents: handle.usageEvents.bind(handle), usageSummary: handle.usageSummary.bind(handle), abort: handle.abort.bind(handle), toolLog: handle.toolLog.bind(handle), dispose: handle.dispose.bind(handle) });
 	return { create: async (spec) => wrap(await base.create(spec), spec), resume: async (ref) => { const handle = await base.resume(ref); const spec = JSON.parse(await readFile(ref.specFile!, "utf8")) as SessionSpec; return wrap(handle, spec); }, estimateMaxSdkCost: base.estimateMaxSdkCost?.bind(base) };
 }
 
 export interface WorkflowArmExecutionArgs {
 	source: Workspace; root: string; bundle: GenerationBundleV1; h: StrategyRecordV1; i: StrategyRecordV1;
-	caseInput: WorkflowCaseSetV1["cases"][number]; arm: WorkflowArmReceiptV1["arm"]; builtinBaseline: boolean;
+	caseInput: WorkflowCaseSetV1["cases"][number] | WorkflowVisibleCaseV2; arm: WorkflowArmReceiptV1["arm"]; builtinBaseline: boolean;
 	runner: SessionRunner; budget: SharedBudget; lease: BudgetLease; perPromptTimeoutMs?: number; formalRunId: string;
 	protectedInputs?: Workspace; beforePrompt: () => Promise<void>;
-	onSettled?: (usage: UsageSummary) => Promise<void>; onFailed?: () => Promise<void>;
+	onSettled?: (usage: UsageSummary) => Promise<void>; onFailed?: (usage: UsageSummary) => Promise<void>;
 }
 
 /** The v1 checks inspect the original M07 task report, not M04 judgment quality. */
 export async function executeArm(args: WorkflowArmExecutionArgs): Promise<WorkflowArmReceiptV1> {
-	const binding = args.builtinBaseline ? { kind: "builtin" as const } : { kind: "injected-h" as const, versionId: args.h.versionId };
-	const receipt: WorkflowArmReceiptV1 = { caseId: args.caseInput.id, arm: args.arm, methodVersionId: args.builtinBaseline ? "builtin-default" : args.h.versionId, methodBinding: binding, workspaceRoot: args.root, checkResults: [], usage: { providerCalls: 0, inputTokens: 0, outputTokens: 0, sdkEstimatedCost: 0, complete: false }, status: "inconclusive" };
+	const sourceArtifact = args.h.artifact.kind === "source-executor" ? args.h.artifact : undefined;
+	const sourceH = Boolean(sourceArtifact);
+	const binding = args.builtinBaseline ? { kind: "builtin" as const } : sourceH
+		? { kind: "source-h" as const, versionId: args.h.versionId, sourceCommit: sourceArtifact!.sourceCommit }
+		: { kind: "injected-h" as const, versionId: args.h.versionId };
+	const v2 = !Object.hasOwn(args.caseInput, "checks");
+	const receipt: WorkflowArmReceiptV1 = { protocolVersion: v2 ? 2 : 1, caseId: args.caseInput.id, arm: args.arm, methodVersionId: args.builtinBaseline ? "builtin-default" : args.h.versionId, methodBinding: binding, workspaceRoot: args.root, checkResults: [], usage: { providerCalls: 0, inputTokens: 0, outputTokens: 0, sdkEstimatedCost: 0, complete: false }, status: "inconclusive" };
 	const events: UsageSummary[] = [];
 	try {
 		// Protected files are added only to this fresh evaluation arm, never the development template.
 		const seedCase = args.protectedInputs ? { ...args.caseInput, task: { ...args.caseInput.task, inputs: [] } } : args.caseInput;
 		const ctx = await seedArm(args.source, args.root, args.bundle, args.h, args.i, seedCase, args.formalRunId, await activePolicyFiles(args.source));
+		const knowledgeBeforeSnapshot = (await ctx.store.current())?.id;
+		if (knowledgeBeforeSnapshot) receipt.knowledgeBeforeSnapshot = knowledgeBeforeSnapshot;
 		if (args.protectedInputs) await freezeCaseInputs(args.protectedInputs, ctx.ws, [args.caseInput]);
 		let expectedPolicyVersionId: string | undefined;
 		let observedM07Message = false;
@@ -467,7 +496,7 @@ export async function executeArm(args: WorkflowArmExecutionArgs): Promise<Workfl
 			if (!expectedPolicyVersionId || spec.methodBinding?.versionId !== expectedPolicyVersionId || message.includes("冻结的 M07 方法：")) throw new HarnessError("improvement.workflow-arm", "builtin M07 message or binding contains an injected H");
 		}, args.onSettled, args.onFailed);
 		const controller = createM07Controller(ctx);
-		const goal = await controller.begin(args.builtinBaseline ? args.caseInput.goal : { ...args.caseInput.goal, workflowMethodVersionId: args.h.versionId });
+		const goal = await controller.begin(args.builtinBaseline || sourceH ? args.caseInput.goal : { ...args.caseInput.goal, workflowMethodVersionId: args.h.versionId });
 		expectedPolicyVersionId = goal.budgetPolicyVersionId;
 		if (args.builtinBaseline && (goal.workflowMethod !== undefined || goal.methodBinding?.versionId !== expectedPolicyVersionId)) throw new HarnessError("improvement.workflow-arm", "builtin goal contains an injected H binding");
 		receipt.m07RunId = goal.runId;
@@ -476,9 +505,18 @@ export async function executeArm(args: WorkflowArmExecutionArgs): Promise<Workfl
 		if (task.status !== "returned" || !task.reportPath) throw new HarnessError("improvement.workflow-arm", "M07 task did not return an evidence report");
 		const report = await readFile(task.reportPath, "utf8");
 		if (report.length > 100_000) throw new HarnessError("improvement.workflow-arm", "M07 evidence report exceeds the retained-file size boundary");
-		receipt.checkResults = args.caseInput.checks.map((check) => ({ criterion: check.criterion, passed: check.contains.every((text) => report.includes(text)) && check.forbids.every((text) => !report.includes(text)) }));
-		await controller.review(goal.runId, { taskId: task.taskId, artifacts: [task.reportPath], checks: receipt.checkResults.map((check) => ({ criterion: check.criterion, result: check.passed ? "passed" : "failed", evidence: [task.reportPath!] })) });
+		receipt.checkResults = v2
+			? args.caseInput.task.checks.map((criterion) => ({ criterion, passed: criterion === "M07 evidence report returned" }))
+			: (args.caseInput as WorkflowCaseSetV1["cases"][number]).checks.map((check) => ({ criterion: check.criterion, passed: check.contains.every((text) => report.includes(text)) && check.forbids.every((text) => !report.includes(text)) }));
+		const requiredCopies = v2 ? await Promise.all((args.caseInput as WorkflowVisibleCaseV2).requiredEvidence.map(async (relative) => {
+			const sourceReal = await realpath(path.resolve(ctx.ws.root, relative));
+			const copy = task.inputCopies.find((item) => item.source === sourceReal);
+			if (!copy) throw new HarnessError("improvement.workflow-arm", `required evidence was not copied into the task: ${relative}`);
+			return copy.copy;
+		})) : [];
+		await controller.review(goal.runId, { taskId: task.taskId, artifacts: [task.reportPath, ...requiredCopies], checks: receipt.checkResults.map((check) => ({ criterion: check.criterion, result: check.passed ? "passed" : "failed", evidence: [task.reportPath!] })) });
 		const checkpoint = await controller.checkpoint(goal.runId, { taskIds: [task.taskId] });
+		receipt.checkpointId = checkpoint.id;
 		const m04 = await runM04(ctx, { feedback: { kind: "M07Checkpoint", runId: goal.runId, checkpointId: checkpoint.id }, freshSession: true, purpose: "隔离工作流方法开发：仅处理本臂冻结的 M07 证据" });
 		receipt.m04RunId = m04.record.runId;
 		const sourceRecord = m04.record.outputs.find((x) => x.label === "M07 处理来源");
@@ -488,7 +526,7 @@ export async function executeArm(args: WorkflowArmExecutionArgs): Promise<Workfl
 		const binding = await boundedJson(sourceRecord.path, 16_000) as Record<string, unknown>;
 		if (binding.m07RunId !== goal.runId || binding.checkpointId !== checkpoint.id || binding.rootDir !== checkpoint.rootDir) throw new HarnessError("improvement.workflow-arm", "M04 source does not resolve the exact M07 checkpoint");
 		const frozenGoal = await boundedJson(checkpoint.goalSnapshotPath, 256_000) as { workflowMethod?: { versionId?: string }; tasks?: Array<{ taskId?: string; reportPath?: string }> };
-		if (args.builtinBaseline ? frozenGoal.workflowMethod !== undefined : frozenGoal.workflowMethod?.versionId !== args.h.versionId) throw new HarnessError("improvement.workflow-arm", "M04 did not receive the intended frozen workflow method binding");
+		if (args.builtinBaseline || sourceH ? frozenGoal.workflowMethod !== undefined : frozenGoal.workflowMethod?.versionId !== args.h.versionId) throw new HarnessError("improvement.workflow-arm", "M04 did not receive the intended frozen workflow method binding");
 		const frozenReportPath = frozenGoal.tasks?.find((x) => x.taskId === task.taskId)?.reportPath;
 		if (!frozenReportPath || !nested(await realpath(checkpoint.rootDir), await realpath(frozenReportPath))) throw new HarnessError("improvement.workflow-arm", "frozen report path is outside the checkpoint");
 		if ((await readFile(frozenReportPath, "utf8")) !== report) throw new HarnessError("improvement.workflow-arm", "frozen report differs from the task return");
@@ -504,7 +542,15 @@ export async function executeArm(args: WorkflowArmExecutionArgs): Promise<Workfl
 		if (!receipt.reportDeliveredToM04) throw new HarnessError("improvement.workflow-arm", "M04 did not receive the complete frozen report through inline text or recorded read ranges");
 		const savedGoal = await controller.status(goal.runId);
 		receipt.feedbackStatus = savedGoal.checkpoints?.find((x) => x.id === checkpoint.id)?.feedbackStatus;
-		if (m04.record.status !== "completed" || m04.record.failures.length || !["complete"].includes(String(receipt.feedbackStatus))) throw new HarnessError("improvement.workflow-arm", "M04 or full evidence handoff is incomplete");
+		if (m04.record.status !== "completed" || m04.record.failures.length || !(v2 ? ["complete", "indexed"] : ["complete"]).includes(String(receipt.feedbackStatus))) throw new HarnessError("improvement.workflow-arm", "M04 or full evidence handoff is incomplete");
+		if (v2) {
+			const transactionRef = m04.record.outputs.find((x) => x.label === "M04 知识事务状态");
+			if (!transactionRef) throw new HarnessError("improvement.workflow-arm", "M04 knowledge transaction receipt is missing");
+			const transaction = await boundedJson(transactionRef.path, 256_000) as { m04RunId?: string; state?: string };
+			if (transaction.m04RunId !== m04.record.runId || !["no-proposal", "rejected-draft", "merged"].includes(String(transaction.state))) throw new HarnessError("improvement.workflow-arm", "M04 knowledge transaction is unsettled");
+			const knowledgeAfterSnapshot = (await ctx.store.current())?.id;
+			if (knowledgeAfterSnapshot) receipt.knowledgeAfterSnapshot = knowledgeAfterSnapshot;
+		}
 		assertWorkflowBudgetOpen(args.budget, args.lease);
 		if (args.budget.status(args.lease).inFlight) throw new HarnessError("improvement.workflow-usage", "arm provider request remains in flight");
 		receipt.status = "complete";
@@ -522,7 +568,7 @@ export async function calibrateWorkflowEvidenceHandoff(args: { ws: Workspace; st
 	if (!active) throw new HarnessError("improvement.workflow-calibration", "an active workflow H/I bundle is required");
 	const h = await store.readStrategy(active.bundle.executorVersionId);
 	const i = await store.readStrategy(active.bundle.improverVersionId);
-	if (active.bundle.environmentVersion !== "m07-workflow/v1" || !active.bundle.allowedCapabilities.includes("m07-evidence-read") || active.bundle.allowedCapabilities.includes("cpu-probe") || !isM07WorkflowStrategy(h.artifact) || h.artifact.slot !== "evidence-handoff" || i.artifact.kind !== "diagnostic-improver-prompt") throw new HarnessError("improvement.workflow-calibration", "active bundle must contain the evidence-handoff workflow method");
+	if (active.bundle.environmentVersion !== "m07-workflow/v1" || !active.bundle.allowedCapabilities.includes("m07-evidence-read") || active.bundle.allowedCapabilities.includes("cpu-probe") || !isM07WorkflowStrategy(h.artifact) || h.artifact.kind !== "m07-workflow-prompt" || h.artifact.slot !== "evidence-handoff" || i.artifact.kind !== "diagnostic-improver-prompt") throw new HarnessError("improvement.workflow-calibration", "active bundle must contain the evidence-handoff prompt method");
 	if (plan.baseline === "active-h") await verifyLiveWorkflowRecords(ws, [h], registeredExperienceStores);
 	const root = path.resolve(ws.root, plan.experimentRoot);
 	await assertWorkflowExperimentRoot(ws, root);
@@ -592,7 +638,7 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 	const active = await store.active();
 	if (!active) throw new HarnessError("improvement.workflow", "explicit workflow H/I bundle is required");
 	const h = await store.readStrategy(active.bundle.executorVersionId), i = await store.readStrategy(active.bundle.improverVersionId);
-	if (active.bundle.environmentVersion !== "m07-workflow/v1" || !active.bundle.allowedCapabilities.includes("m07-evidence-read") || active.bundle.allowedCapabilities.includes("cpu-probe") || !isM07WorkflowStrategy(h.artifact) || h.artifact.slot !== "evidence-handoff" || i.artifact.kind !== "diagnostic-improver-prompt") throw new HarnessError("improvement.workflow", "active bundle must contain evidence-handoff H and diagnostic I");
+	if (active.bundle.environmentVersion !== "m07-workflow/v1" || !active.bundle.allowedCapabilities.includes("m07-evidence-read") || active.bundle.allowedCapabilities.includes("cpu-probe") || !isM07WorkflowStrategy(h.artifact) || h.artifact.kind !== "m07-workflow-prompt" || h.artifact.slot !== "evidence-handoff" || i.artifact.kind !== "diagnostic-improver-prompt") throw new HarnessError("improvement.workflow", "active bundle must contain prompt evidence-handoff H and diagnostic I");
 	const verifyLive = (records: StrategyRecordV1[]) => verifyLiveWorkflowRecords(ws, records, registeredExperienceStores);
 	await verifyLive([h, i]);
 	const root = path.resolve(ws.root, plan.experimentRoot);
@@ -657,14 +703,14 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 			decision.action = action.kind; decision.outcome = "executed";
 			if (action.kind === "inspect") {
 				inspectCount++;
-				const content = action.object === "development-feedback" ? source.text : action.object === "meta-episode" ? JSON.stringify(metaEpisodeForModel(priorEpisodes.find((e) => e.id === action.id)!)) : action.id === h.versionId ? h.artifact.body : action.id === i.versionId ? i.artifact.body : candidates.get(action.id)!.artifact.body;
+				const content = action.object === "development-feedback" ? source.text : action.object === "meta-episode" ? JSON.stringify(metaEpisodeForModel(priorEpisodes.find((e) => e.id === action.id)!)) : action.id === h.versionId ? h.artifact.body : action.id === i.versionId ? i.artifact.body : workflowPromptBody(candidates.get(action.id)!);
 				const text = content.slice(action.start, action.start + action.maxChars);
 				if (!text) throw new HarnessError("improvement.workflow-inspect", "requested read range is empty");
 				run.inspectionReadbackBytesObserved = (run.inspectionReadbackBytesObserved ?? 0) + Buffer.byteLength(text, "utf8");
 				lastActionResult = { kind: "inspect", id: action.id, start: action.start, end: action.start + text.length, totalChars: content.length, text }; await save(); continue;
 			}
 			if (action.kind === "propose") {
-				if (action.body === h.artifact.body || [...candidates.values()].some((c) => c.artifact.body === action.body)) { lastActionResult = { kind: "propose", outcome: "rejected", reason: "unchanged or repeated candidate" }; await save(); continue; }
+				if (action.body === h.artifact.body || [...candidates.values()].some((c) => workflowPromptBody(c) === action.body)) { lastActionResult = { kind: "propose", outcome: "rejected", reason: "unchanged or repeated candidate" }; await save(); continue; }
 				await ensureLiveLimits();
 				await ensureLiveExperience();
 				const artifact = validateStrategy("executor", { version: 1, kind: "m07-workflow-prompt", slot: "evidence-handoff", body: action.body }) as M07WorkflowStrategyV1;

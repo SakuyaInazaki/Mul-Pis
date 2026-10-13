@@ -72,6 +72,8 @@ export interface M07ExecutionRound {
 	/** New round records state the real boundary; optional when reading legacy logs. */
 	builderContext?: { mode: "fresh" | "continue" | "fork"; reason: string };
 	builderReportPath: string;
+	/** Observed bytes in the complete formal-work reviewer snapshot. */
+	reviewerSnapshotBytes?: number;
 	reviewerSnapshotPath?: string;
 	reviewerReportPath?: string;
 	reviewerSession?: SessionRef;

@@ -22,7 +22,7 @@ export type ToolGrant =
 	| { kind: "none" }
 	| { kind: "read-dir"; root: string; toolName?: string; extraTools?: CustomToolSpec[] }
 	| { kind: "custom"; tools: CustomToolSpec[] }
-	| { kind: "execution"; root: string; tools: Array<"read" | "write" | "edit" | "bash"> };
+	| { kind: "execution"; root: string; tools: Array<"read" | "write" | "edit" | "bash">; /** Controller-owned disposable directory outside formal work. */ tempDir?: string };
 
 export interface ToolParamSpec {
 	type: "string" | "number" | "boolean" | "string[]";

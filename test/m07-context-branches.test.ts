@@ -81,6 +81,10 @@ test("M07 opens two real fake-runner histories from one frozen task leaf with pr
 	assert.notEqual(first.session?.file, second.session?.file);
 	assert.notEqual(first.workDir, second.workDir);
 	assert.notEqual(first.workDir, parent.workDir);
+	const scratch = f.runner.created.filter(spec => spec.tools.kind === "execution")
+		.map(spec => spec.tools.kind === "execution" ? spec.tools.tempDir : undefined);
+	assert.equal(new Set(scratch).size,3);
+	assert.ok(scratch.every(dir => dir && !dir.startsWith(parent.workDir)));
 	assert.ok(first.session?.lineageFile);
 	assert.ok(second.session?.lineageFile);
 	const firstLineage = JSON.parse(await readFile(first.session!.lineageFile!, "utf8"));

@@ -33,6 +33,13 @@ function result(value: unknown): ToolResult {
 	};
 }
 
+function publicFailure(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	return value.replace(/Bearer\s+[^\s'"\r\n]+/gi, "Bearer [redacted credential]")
+		.replace(/sk-[A-Za-z0-9_-]{6,}/gi, "[redacted credential]")
+		.replace(/\b(?:api[_-]?key|password|secret|token|session[_-]?token|authorization)\s*[:=]\s*[^\s,;]+/gi, "[redacted credential]");
+}
+
 function compact(value: unknown): Record<string, unknown> {
 	if (!value || typeof value !== "object") return { value };
 	const item = value as Record<string, unknown>;
@@ -52,10 +59,15 @@ function compact(value: unknown): Record<string, unknown> {
 		feedbackStatus: item.feedbackStatus, feedbackPath: item.feedbackPath,
 		goalSnapshotPath: item.goalSnapshotPath,
 	};
+	const lastRound = (task: Record<string, unknown>) => Array.isArray(task.executionRounds)
+		? task.executionRounds.at(-1) as Record<string, unknown> | undefined : undefined;
 	if ("taskId" in item) return {
 		taskId: item.taskId, status: item.status,
 		workDir: item.workDir, reportPath: item.reportPath, expectedOutputPaths: item.expectedOutputPaths,
 		mode: item.mode, context: item.context, loopStopReason: item.loopStopReason,
+		executionFailure: publicFailure(item.executionFailure), branchUnavailableReason: publicFailure(item.branchUnavailableReason),
+		lastRound: lastRound(item) && { builderReportPath: lastRound(item)?.builderReportPath,
+			reviewerReportPath: lastRound(item)?.reviewerReportPath, reviewerSnapshotPath: lastRound(item)?.reviewerSnapshotPath },
 		branchCheckpointId: (item.branchSource as { checkpoint?: { id?: string } } | undefined)?.checkpoint?.id,
 		branchUnavailable: Boolean(item.branchUnavailableReason),
 	};
@@ -66,6 +78,9 @@ function compact(value: unknown): Record<string, unknown> {
 		tasks: Array.isArray(item.tasks) ? item.tasks.map((task) => {
 			const entry = task as Record<string, unknown>;
 			return { taskId: entry.taskId, status: entry.status, mode: entry.mode, context: entry.context, loopStopReason: entry.loopStopReason,
+				executionFailure: publicFailure(entry.executionFailure), branchUnavailableReason: publicFailure(entry.branchUnavailableReason),
+				lastRound: lastRound(entry) && { builderReportPath: lastRound(entry)?.builderReportPath,
+					reviewerReportPath: lastRound(entry)?.reviewerReportPath, reviewerSnapshotPath: lastRound(entry)?.reviewerSnapshotPath },
 				branchCheckpointId: (entry.branchSource as { checkpoint?: { id?: string } } | undefined)?.checkpoint?.id,
 				branchUnavailable: Boolean(entry.branchUnavailableReason) };
 		}) : [],

@@ -9,7 +9,7 @@ import { SharedBudget } from "../src/experiments/budget.ts";
 import { createWorkflowMeteredRunner, validateWorkflowAction, workflowDecisionPrompt, workflowImproverSystemPrompt } from "../src/improvement/workflow-adapter.ts";
 import { runBoundedModelStep } from "../src/improvement/research-model.ts";
 import { PiSessionRunner } from "../src/runner/pi.ts";
-import type { SessionHandle, SessionRunner, UsageSummary } from "../src/runner/types.ts";
+import type { SessionHandle, SessionRunner, UsageEvent, UsageSummary } from "../src/runner/types.ts";
 
 const MODEL = { id: "offline-model", name: "Offline model", api: "anthropic-messages", provider: "offline", baseUrl: "https://invalid.example", reasoning: false, input: ["text"], cost: { input: 0.2, output: 0.2, cacheRead: 0.2, cacheWrite: 0.2 }, contextWindow: 100_000, maxTokens: 2_000 } as Model<"anthropic-messages">;
 const RUNTIME = { getModels: () => [MODEL] } as unknown as ModelRuntime;
@@ -59,6 +59,51 @@ test("workflow turn continues with complete provider events and unknown price", 
 	await handle.prompt("second");
 	assert.equal(events.length, 2);
 	assert.equal(budget.status().usageUnknown, true);
+});
+
+test("failed tool turn retains current provider observations without rebilling an earlier turn", async () => {
+	const budget = new SharedBudget("workflow-partial-failure", {});
+	const events: UsageSummary[] = [];
+	const observed: UsageEvent[] = [];
+	let turns = 0;
+	let failedUsage: UsageSummary | undefined;
+	const reported = (entryId: string, input: number, cost: number): UsageEvent => ({
+		entryId, kind: "assistant", promptIndex: turns, at: new Date().toISOString(),
+		usage: { input, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: input + 2, cost },
+		status: "reported", costSource: "sdk-estimate", costStatus: "priced",
+	});
+	const handle: SessionHandle = {
+		ref: { id: "offline-partial", label: "M04-offline", role: "research", model: "offline/offline-model" },
+		prompt: async () => {
+			turns++;
+			if (turns === 1) { observed.push(reported("first", 10, 0.02)); return { text: "first", stopReason: "stop", toolCalls: 0, usage: settledUsage }; }
+			observed.push(reported("second-provider", 20, 0.03), {
+				entryId: "failed-tail", kind: "assistant", promptIndex: turns, at: new Date().toISOString(),
+				status: "unknown", costSource: "unknown", costStatus: "unknown",
+			});
+			throw new Error("tool turn failed after one billed provider response");
+		},
+		transcript: () => [], readCoverage: () => [], readReturnEvents: () => [],
+		usageEvents: () => [...observed], usageSummary: () => ({ ...settledUsage }),
+		abort: async () => undefined, toolLog: () => [], dispose: () => undefined,
+	};
+	const base: SessionRunner = { create: async () => handle, resume: async () => handle };
+	const metered = createWorkflowMeteredRunner(base, budget, budget.root, events, undefined, undefined, undefined, undefined,
+		async usage => { failedUsage = usage; });
+	const session = await metered.create({ ...deadlineSpec, role: "research" });
+	await session.prompt("first");
+	await assert.rejects(session.prompt("second"), /tool turn failed/);
+	assert.equal(events.length, 2);
+	assert.deepEqual(failedUsage, events[1]);
+	assert.equal(events[1]?.reportedEvents, 1);
+	assert.equal(events[1]?.unknownEvents, 1);
+	assert.equal(events[1]?.complete, false);
+	assert.equal(events[1]?.costComplete, false);
+	assert.deepEqual(budget.status().committed, {
+		providerCalls: 2, inputTokens: 30, outputTokens: 7, sdkEstimatedCost: 0.05, probeCalls: 0, cpuMillis: 0,
+	});
+	assert.equal(budget.status().usageUnknown, true);
+	assert.equal(budget.status().inFlight, false);
 });
 
 test("bounded I request ignores legacy elapsed-time quotas", async () => {

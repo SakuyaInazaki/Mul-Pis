@@ -12,10 +12,18 @@ import { nowIso, readTextIfExists, writeFileAtomic } from "../workspace.ts";
 export interface ImproverStrategyV1 { version: 1; kind: "diagnostic-improver-prompt"; body: string }
 /** A workflow method is a separate H capability, never a CPU-case strategy. */
 export interface M07WorkflowStrategyV1 { version: 1; kind: "m07-workflow-prompt"; slot: "research-check" | "evidence-handoff"; body: string }
-export type ResearchStrategy = ExecutorStrategyV1 | M07WorkflowStrategyV1 | ImproverStrategyV1;
+/** A pinned, separately loadable source method, distinct from a prompt body. */
+interface SourceStrategyBaseV1 { version: 1;
+ sourceRoot: string; sourceCommit: string; modulePath: string; exportName: string }
+export type SourceStrategyV1 = (SourceStrategyBaseV1 & { kind: "source-executor" }) |
+ (SourceStrategyBaseV1 & { kind: "source-improver" });
+export type ResearchStrategy = ExecutorStrategyV1 | M07WorkflowStrategyV1 | ImproverStrategyV1 | SourceStrategyV1;
+export function isSourceStrategy(value: ResearchStrategy): value is SourceStrategyV1 { return value.kind === "source-executor" || value.kind === "source-improver"; }
 export function isCpuExecutorStrategy(value: ResearchStrategy): value is ExecutorStrategyV1 { return value.kind === "cpu-numerical-prompt"; }
 export function isM07WorkflowStrategy(value: ResearchStrategy): value is M07WorkflowStrategyV1 { return value.kind === "m07-workflow-prompt"; }
 export type StrategyKind = "executor" | "improver";
+export interface SourceMethodBindingV1 { kind: "executor" | "improver"; versionId: string;
+ sourceRoot: string; sourceCommit: string; modulePath: string; exportName: string }
 export type StrategyOrigin = "human-seed" | "agent-generated" | "external-manual-unverified";
 export interface ExperienceRequirementV1 { targetKind: StrategyKind; ref: KnowledgeRef }
 export interface DependencyTransitionV1 {
@@ -45,7 +53,7 @@ export interface GenerationBundleV1 {
 }
 export interface ActiveGenerationPointerV1 {
  version: 1; bundleId: string; previousBundleId?: string; previousProvenance?: ActiveGenerationPointerV1["provenance"]; activatedAt: string;
-	provenance: "local-executor-admission" | "local-workflow-handoff-admission" | "local-meta-admission" | "human-seed" | "external-manual-unverified" | "knowledge-epoch-advance" | "method-dependency-transition";
+	provenance: "local-executor-admission" | "local-workflow-handoff-admission" | "local-workflow-source-confirmation" | "local-source-improver-confirmation" | "local-meta-admission" | "human-seed" | "external-manual-unverified" | "knowledge-epoch-advance" | "method-dependency-transition";
  runId: string;
 }
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -61,6 +69,26 @@ function boundedStrings(value: unknown, field: string, max = 16): string[] {
  if (!Array.isArray(value) || value.length > max || !value.every((item) => typeof item === "string" && item.trim().length > 0 && item.length <= 240)) throw new HarnessError("improvement.strategy", `${field} must be a bounded string array`);
  return value;
 }
+function sourcePath(value: unknown): string {
+ if (typeof value !== "string" || !value.startsWith("src/") || !value.endsWith(".ts") ||
+  value.includes("\\") || value.split("/").some((part) => !part || part === "." || part === ".."))
+  throw new HarnessError("improvement.strategy", "source modulePath must be a repository-relative TypeScript module");
+ return value;
+}
+function validateSourceArtifact(kind: StrategyKind, value: Record<string, unknown>): SourceStrategyV1 {
+ if (value.kind !== `source-${kind}` || Object.keys(value).some((key) => !["version", "kind", "sourceRoot", "sourceCommit", "modulePath", "exportName"].includes(key)) ||
+  typeof value.sourceRoot !== "string" || !path.isAbsolute(value.sourceRoot) ||
+  path.normalize(value.sourceRoot) !== value.sourceRoot || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(String(value.sourceCommit)) ||
+  typeof value.exportName !== "string" || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(value.exportName))
+  throw new HarnessError("improvement.strategy", "invalid pinned source method");
+ const modulePath = sourcePath(value.modulePath);
+ const required = kind === "executor" ? { path: "src/m07/feedback.ts", exportName: "writeFeedback" }
+  : { path: "src/improvement/workflow-improver-program.ts", exportName: "decideWorkflowImprovement" };
+ if (modulePath !== required.path || value.exportName !== required.exportName)
+  throw new HarnessError("improvement.strategy", "source method entry is outside the reviewed H/I surface");
+ return { version: 1, kind: value.kind, sourceRoot: value.sourceRoot,
+  sourceCommit: value.sourceCommit, modulePath, exportName: value.exportName } as SourceStrategyV1;
+}
 export function validateExperienceRequirements(value: unknown, field: string): ExperienceRequirementV1[] {
  if (!Array.isArray(value) || !value.every((x) => x && typeof x === "object" && ["executor", "improver"].includes(x.targetKind) && isKnowledgeRef(x.ref))) throw new HarnessError("improvement.generation", `${field} must contain valid pinned experience references`);
  const seen = new Set(value.map((x) => `${x.targetKind}:${x.ref.storeId}/${x.ref.recordId}@${x.ref.version}`));
@@ -71,6 +99,7 @@ export function validateStrategy(kind: StrategyKind, input: unknown): ResearchSt
  if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.strategy", "strategy must be an object");
  const value = input as Record<string, unknown>;
  if (value.version !== 1) throw new HarnessError("improvement.strategy", "unsupported strategy schema");
+ if (value.kind === "source-executor" || value.kind === "source-improver") return validateSourceArtifact(kind, value);
  if (kind === "executor" && value.kind === "m07-workflow-prompt") {
   if (Object.keys(value).some((key) => !["version", "kind", "slot", "body"].includes(key)) || !["research-check", "evidence-handoff"].includes(String(value.slot))) throw new HarnessError("improvement.strategy", "invalid M07 workflow method slot");
   return { version: 1, kind: "m07-workflow-prompt", slot: value.slot, body: boundedBody(value.body, "body") } as M07WorkflowStrategyV1;
@@ -107,7 +136,7 @@ export function validateGenerationBundle(input: unknown): GenerationBundleV1 {
 export function validateActiveGenerationPointer(input: unknown): ActiveGenerationPointerV1 {
  if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.generation", "invalid active generation pointer");
  const item = input as Record<string, unknown>;
-	if (item.version !== 1 || typeof item.activatedAt !== "string" || typeof item.runId !== "string" || !["local-executor-admission", "local-workflow-handoff-admission", "local-meta-admission", "human-seed", "external-manual-unverified", "knowledge-epoch-advance", "method-dependency-transition"].includes(String(item.provenance)) || (item.previousProvenance !== undefined && !["local-executor-admission", "local-workflow-handoff-admission", "local-meta-admission", "human-seed", "external-manual-unverified", "knowledge-epoch-advance", "method-dependency-transition"].includes(String(item.previousProvenance)))) throw new HarnessError("improvement.generation", "invalid active generation pointer");
+	if (item.version !== 1 || typeof item.activatedAt !== "string" || typeof item.runId !== "string" || !["local-executor-admission", "local-workflow-handoff-admission", "local-workflow-source-confirmation", "local-source-improver-confirmation", "local-meta-admission", "human-seed", "external-manual-unverified", "knowledge-epoch-advance", "method-dependency-transition"].includes(String(item.provenance)) || (item.previousProvenance !== undefined && !["local-executor-admission", "local-workflow-handoff-admission", "local-workflow-source-confirmation", "local-source-improver-confirmation", "local-meta-admission", "human-seed", "external-manual-unverified", "knowledge-epoch-advance", "method-dependency-transition"].includes(String(item.previousProvenance)))) throw new HarnessError("improvement.generation", "invalid active generation pointer");
  safeId(item.bundleId, "bundleId"); if (item.previousBundleId !== undefined) safeId(item.previousBundleId, "previousBundleId");
  return item as unknown as ActiveGenerationPointerV1;
 }
@@ -150,6 +179,16 @@ export class GenerationStore {
   const text = await readTextIfExists(this.bundlePath(id)); if (!text) throw new HarnessError("improvement.generation", `bundle ${id} does not exist`);
   const bundle = validateGenerationBundle(JSON.parse(text)); if (bundle.bundleId !== id) throw new HarnessError("improvement.generation", "bundle identity mismatch"); return bundle;
  }
+ /** Source H and I are queried independently. An absent binding means the legacy prompt artifact remains in use. */
+ async sourceBindings(bundleId: string): Promise<{ executor?: SourceMethodBindingV1; improver?: SourceMethodBindingV1 }> {
+  const bundle = await this.readBundle(bundleId);
+  const [h, i] = await Promise.all([this.readStrategy(bundle.executorVersionId), this.readStrategy(bundle.improverVersionId)]);
+  const bind = (record: StrategyRecordV1): SourceMethodBindingV1 | undefined => isSourceStrategy(record.artifact)
+   ? { kind: record.kind, versionId: record.versionId, sourceRoot: record.artifact.sourceRoot,
+      sourceCommit: record.artifact.sourceCommit, modulePath: record.artifact.modulePath, exportName: record.artifact.exportName }
+   : undefined;
+  return { ...(bind(h) ? { executor: bind(h) } : {}), ...(bind(i) ? { improver: bind(i) } : {}) };
+ }
  async active(): Promise<{ pointer: ActiveGenerationPointerV1; bundle: GenerationBundleV1 } | undefined> {
   const text = await readTextIfExists(this.pointerPath()); if (!text) return undefined;
   const pointer = validateActiveGenerationPointer(JSON.parse(text)); return { pointer, bundle: await this.readBundle(pointer.bundleId) };
@@ -157,16 +196,85 @@ export class GenerationStore {
  /** The atomic pointer replacement is the activation commit point; caller holds mutation lock. */
  async activate(bundleId: string, previous: ActiveGenerationPointerV1 | undefined, provenance: ActiveGenerationPointerV1["provenance"], runId: string): Promise<ActiveGenerationPointerV1> {
   await this.readBundle(bundleId);
+  const sources = await this.sourceBindings(bundleId);
+  if (sources.executor || sources.improver) throw new HarnessError("improvement.source-admission", "source activation requires an independently verified admission path");
+  return this.activatePointer(bundleId, previous, provenance, runId);
+ }
+ private async activatePointer(bundleId: string, previous: ActiveGenerationPointerV1 | undefined, provenance: ActiveGenerationPointerV1["provenance"], runId: string): Promise<ActiveGenerationPointerV1> {
   const current = (await this.active())?.pointer;
-  if ((current?.bundleId ?? null) !== (previous?.bundleId ?? null) || (current?.runId ?? null) !== (previous?.runId ?? null)) throw new HarnessError("improvement.stale-baseline", "active generation changed during evaluation");
+	if (JSON.stringify(current ?? null) !== JSON.stringify(previous ?? null)) throw new HarnessError("improvement.stale-baseline", "active generation changed during evaluation");
   const pointer: ActiveGenerationPointerV1 = { version: 1, bundleId, ...(previous ? { previousBundleId: previous.bundleId, previousProvenance: previous.provenance } : {}), activatedAt: nowIso(), provenance, runId };
   await writeFileAtomic(this.pointerPath(), `${JSON.stringify(pointer, null, 2)}\n`); return pointer;
+ }
+ /** A complete protected run, not a caller's admitted boolean, authorises this source-only path. */
+ async activateConfirmedSource(bundleId: string, previous: ActiveGenerationPointerV1, confirmationRunId: string): Promise<ActiveGenerationPointerV1> {
+		const { assertCompleteSourceConfirmation, readConfirmedSourceRun } = await import("./workflow-source-confirmation.ts");
+  const run = await readConfirmedSourceRun(this, confirmationRunId);
+		await assertCompleteSourceConfirmation(this, run);
+  const bundle = await this.readBundle(bundleId), source = (await this.sourceBindings(bundleId)).executor;
+  if (run.status !== "complete" || run.decision?.status !== "supported" || !run.finishedAt ||
+   run.baselinePointer.bundleId !== previous.bundleId || run.baselinePointer.runId !== previous.runId ||
+   bundle.parents.length !== 1 || bundle.parents[0] !== previous.bundleId ||
+   bundle.executorVersionId !== run.plan.selection.candidateVersionId ||
+   bundle.improverVersionId !== run.baselineBundle.improverVersionId || bundle.knowledgeSnapshot !== run.baselineBundle.knowledgeSnapshot ||
+   source?.sourceRoot !== run.plan.sources.candidate.sourceRoot || source.sourceCommit !== run.plan.sources.candidate.sourceCommit)
+   throw new HarnessError("improvement.source-admission", "source activation lacks the matching complete confirmation and frozen H/I/K transition");
+  return this.activatePointer(bundleId, previous, "local-workflow-source-confirmation", confirmationRunId);
+ }
+ /** The meta receipt must prove offspring benefit; changing I source alone has no admission meaning. */
+ async activateConfirmedImproverSource(bundleId: string, previous: ActiveGenerationPointerV1, metaRunId: string): Promise<ActiveGenerationPointerV1> {
+  const { readAdmissibleSourceMetaRun } = await import("./workflow-source-meta-admission.ts");
+  const run = await readAdmissibleSourceMetaRun(this, metaRunId);
+  const prior = await this.readBundle(previous.bundleId), next = await this.readBundle(bundleId);
+  const oldBindings = await this.sourceBindings(prior.bundleId), newBindings = await this.sourceBindings(next.bundleId);
+  if (JSON.stringify(run.activePointer) !== JSON.stringify(previous) || run.plan.baselineBundleId !== prior.bundleId ||
+   next.parents.length !== 1 || next.parents[0] !== prior.bundleId ||
+   next.executorVersionId !== prior.executorVersionId || next.improverVersionId !== run.plan.candidate.versionId ||
+   next.knowledgeSnapshot !== prior.knowledgeSnapshot || next.environmentVersion !== prior.environmentVersion ||
+   JSON.stringify(next.modelConfig) !== JSON.stringify(prior.modelConfig) || next.protocolVersion !== prior.protocolVersion ||
+   JSON.stringify(next.allowedCapabilities) !== JSON.stringify(prior.allowedCapabilities) ||
+   oldBindings.executor?.sourceRoot !== newBindings.executor?.sourceRoot || oldBindings.executor?.sourceCommit !== newBindings.executor?.sourceCommit ||
+   newBindings.improver?.sourceRoot !== run.plan.candidate.source.sourceRoot || newBindings.improver?.sourceCommit !== run.plan.candidate.source.sourceCommit)
+   throw new HarnessError("improvement.source-meta-admission", "I activation differs from complete offspring confirmation or frozen H/K/model");
+  return this.activatePointer(bundleId, previous, "local-source-improver-confirmation", metaRunId);
+ }
+ /** Called only after knowledge-epoch's M04 and live-reference checks; H/I source bytes may not migrate. */
+ async activateSourceKnowledgeTransition(bundleId: string, previous: ActiveGenerationPointerV1,
+  provenance: "knowledge-epoch-advance" | "method-dependency-transition", m04RunId: string): Promise<ActiveGenerationPointerV1> {
+  const prior = await this.readBundle(previous.bundleId), next = await this.readBundle(bundleId);
+  const oldSources = await this.sourceBindings(prior.bundleId), newSources = await this.sourceBindings(next.bundleId);
+  const code = (binding: SourceMethodBindingV1 | undefined) => binding &&
+   { sourceRoot: binding.sourceRoot, sourceCommit: binding.sourceCommit, modulePath: binding.modulePath, exportName: binding.exportName };
+  if ((!oldSources.executor && !oldSources.improver) || next.parents.length !== 1 || next.parents[0] !== prior.bundleId ||
+   JSON.stringify(code(oldSources.executor)) !== JSON.stringify(code(newSources.executor)) ||
+   JSON.stringify(code(oldSources.improver)) !== JSON.stringify(code(newSources.improver)) ||
+   next.environmentVersion !== prior.environmentVersion || JSON.stringify(next.modelConfig) !== JSON.stringify(prior.modelConfig) ||
+   next.protocolVersion !== prior.protocolVersion || JSON.stringify(next.allowedCapabilities) !== JSON.stringify(prior.allowedCapabilities))
+   throw new HarnessError("improvement.source-admission", "knowledge transition cannot change active H/I source or execution settings");
+  return this.activatePointer(bundleId, previous, provenance, `${provenance}-${m04RunId}`);
+ }
+ /** Manual initial source is labelled as a human seed and cannot be reported as experimental gain. */
+ async activateHumanSourceSeed(bundleId: string, runId: string): Promise<ActiveGenerationPointerV1> {
+  if (await this.active()) throw new HarnessError("improvement.source-admission", "human source seed is initialisation only");
+  const bundle = await this.readBundle(bundleId), sources = await this.sourceBindings(bundleId);
+  if (!sources.executor && !sources.improver) throw new HarnessError("improvement.source-admission", "human source seed requires a source method");
+  for (const id of [bundle.executorVersionId, bundle.improverVersionId]) {
+   const record = await this.readStrategy(id);
+   if (isSourceStrategy(record.artifact) && record.origin !== "human-seed") throw new HarnessError("improvement.source-admission", "manual seed cannot activate an agent source candidate");
+  }
+  return this.activatePointer(bundleId, undefined, "human-seed", runId);
+ }
+ /** A disposable arm copies frozen strategies verbatim; it makes no admission claim. */
+ async activateIsolatedSourceCopy(bundleId: string, runId: string): Promise<ActiveGenerationPointerV1> {
+  if (await this.active() || !runId.startsWith("isolated-arm-")) throw new HarnessError("improvement.source-admission", "source copy activation is limited to a fresh isolated arm");
+  await this.readBundle(bundleId);
+  return this.activatePointer(bundleId, undefined, "external-manual-unverified", runId);
  }
  async rollback(): Promise<ActiveGenerationPointerV1> {
   const current = (await this.active())?.pointer;
   if (!current?.previousBundleId) throw new HarnessError("improvement.rollback", "no previous research generation");
   await this.readBundle(current.previousBundleId);
-  return this.activate(current.previousBundleId, current, current.previousProvenance ?? "external-manual-unverified", `rollback-${this.newId("research")}`);
+  return this.activatePointer(current.previousBundleId, current, current.previousProvenance ?? "external-manual-unverified", `rollback-${this.newId("research")}`);
  }
  async listBundles(): Promise<string[]> { await mkdir(path.join(this.root, "bundles"), { recursive: true }); return (await readdir(path.join(this.root, "bundles"))).filter((x) => x.endsWith(".json")).map((x) => x.slice(0, -5)); }
 }

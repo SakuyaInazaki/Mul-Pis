@@ -6,7 +6,8 @@ import { createFileKnowledgeStore } from "../knowledge/store.ts";
 import type { KnowledgeStore } from "../knowledge/types.ts";
 import { HarnessError } from "../types.ts";
 import { Workspace } from "../workspace.ts";
-import { GenerationStore, isCpuExecutorStrategy, isM07WorkflowStrategy, type ActiveGenerationPointerV1, type GenerationBundleV1, type StrategyRecordV1 } from "./generation.ts";
+import { GenerationStore, isCpuExecutorStrategy, isM07WorkflowStrategy, isSourceStrategy, type ActiveGenerationPointerV1, type GenerationBundleV1, type StrategyRecordV1 } from "./generation.ts";
+import { verifyPreparedWorkflowSource } from "./workflow-source-arm.ts";
 
 export interface KnowledgeEpochAdvanceArgs {
 	workspaceRoot: string;
@@ -48,9 +49,11 @@ async function verifyMethodRequirements(workspaceRoot: string, records: Strategy
 	const necessary = new Map<string, StrategyRecordV1["requiredKnowledgeRefs"][number]>();
 	const executor = records.find((record) => record.kind === "executor");
 	const workflowArtifact = environmentVersion === "m07-workflow/v1" && executor && isM07WorkflowStrategy(executor.artifact) ? executor.artifact : undefined;
+	const sourceH = environmentVersion === "m07-workflow/v1" && executor && isSourceStrategy(executor.artifact) && executor.artifact.kind === "source-executor";
 	const cpu = environmentVersion === "cpu-response-identification/v1" && executor && isCpuExecutorStrategy(executor.artifact);
-	if (!workflowArtifact && !cpu) throw new HarnessError("improvement.knowledge-epoch", "method environment and executor strategy do not match");
-	const slot = workflowArtifact?.slot;
+	if (!workflowArtifact && !sourceH && !cpu) throw new HarnessError("improvement.knowledge-epoch", "method environment and executor strategy do not match");
+	const slot = workflowArtifact?.slot ?? (sourceH ? "evidence-handoff" : undefined);
+	for (const record of records) if (isSourceStrategy(record.artifact)) await verifyPreparedWorkflowSource(record.artifact);
 	for (const record of records) {
 		for (const targetKind of ["executor", "improver"] as const) {
 			const requestedRefs = record.requiredExperienceRefs.filter((item) => item.targetKind === targetKind).map((item) => item.ref);
@@ -93,7 +96,9 @@ export async function advanceKnowledgeEpochInLock(args: KnowledgeEpochAdvanceArg
 	const stillActive = await args.generationStore.active();
 	if (!stillActive || stillActive.pointer.runId !== active.pointer.runId || stillActive.bundle.bundleId !== active.bundle.bundleId || (await knowledge.current())?.id !== snapshotId) throw new HarnessError("improvement.stale-baseline", "knowledge or active method changed during epoch verification");
 	const bundle = await args.generationStore.writeBundle({ bundleId: args.generationStore.newId("bundle"), parents: [active.bundle.bundleId], executorVersionId: active.bundle.executorVersionId, improverVersionId: active.bundle.improverVersionId, knowledgeSnapshot: snapshotId, environmentVersion: active.bundle.environmentVersion, modelConfig: active.bundle.modelConfig, protocolVersion: active.bundle.protocolVersion, allowedCapabilities: active.bundle.allowedCapabilities, state: active.bundle.state });
-	const pointer = await args.generationStore.activate(bundle.bundleId, active.pointer, "knowledge-epoch-advance", `knowledge-epoch-${args.m04RunId}`);
+	const pointer = [executor, improver].some(record => isSourceStrategy(record.artifact))
+		? await args.generationStore.activateSourceKnowledgeTransition(bundle.bundleId, active.pointer, "knowledge-epoch-advance", args.m04RunId)
+		: await args.generationStore.activate(bundle.bundleId, active.pointer, "knowledge-epoch-advance", `knowledge-epoch-${args.m04RunId}`);
 	return { bundle, pointer, fromSnapshot: active.bundle.knowledgeSnapshot, toSnapshot: snapshotId, m04RunId: args.m04RunId };
 }
 
@@ -165,6 +170,8 @@ export async function transitionMethodKnowledgeDependenciesInLock(args: MethodDe
 	await args.generationStore.writeStrategy({ versionId: newMethodVersionId, kind: old.kind, artifact: old.artifact, parentVersionId: old.versionId, origin: old.origin, applicability: old.applicability, limitations: old.limitations, sourceExperienceRefs: old.sourceExperienceRefs, requiredExperienceRefs: old.requiredExperienceRefs, requiredKnowledgeRefs: nextRefs,
 		dependencyTransition: { version: 1, decisionRef: args.decisionRef, removedRefs: removed, addedRefs: added, evidenceRefs: evidence, revalidationRef: revalidation, at: new Date().toISOString() }, state: "manual-active" });
 	const bundle = await args.generationStore.writeBundle({ bundleId: args.generationStore.newId("bundle"), parents: [active.bundle.bundleId], executorVersionId: old.kind === "executor" ? newMethodVersionId : active.bundle.executorVersionId, improverVersionId: old.kind === "improver" ? newMethodVersionId : active.bundle.improverVersionId, knowledgeSnapshot: current.id, environmentVersion: active.bundle.environmentVersion, modelConfig: active.bundle.modelConfig, protocolVersion: active.bundle.protocolVersion, allowedCapabilities: active.bundle.allowedCapabilities, state: "manual-active" });
-	const pointer = await args.generationStore.activate(bundle.bundleId, active.pointer, "method-dependency-transition", `dependency-transition-${args.m04RunId}`);
+	const pointer = [h, i].some(record => isSourceStrategy(record.artifact))
+		? await args.generationStore.activateSourceKnowledgeTransition(bundle.bundleId, active.pointer, "method-dependency-transition", args.m04RunId)
+		: await args.generationStore.activate(bundle.bundleId, active.pointer, "method-dependency-transition", `dependency-transition-${args.m04RunId}`);
 	return { bundle, pointer, newMethodVersionId };
 }

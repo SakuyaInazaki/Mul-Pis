@@ -123,6 +123,23 @@ test("research_delegate passes approved plan, versioned resources, bounded loop,
 	assert.deepEqual(seen, [{ objective: "execute approved plan", inputs: ["plan.md", "guide.md"], expectedOutputs: ["lesson.md"], checks: ["evidence recorded"], mode: "execute", planInput: "plan.md", resourceInputs: [{ id: "operator-guide", version: "v2", input: "guide.md" }], executionLoop: { mode: "until-ready" }, lessonDeltaOutput: "lesson.md" }]);
 });
 
+test("delegate and goal summaries preserve a failed task cause and its last builder report", async () => {
+	const task = { taskId: "T001", status: "failed", mode: "execute", workDir: "/workspace/work",
+		executionFailure: "round snapshot contains a symlink or special file", branchUnavailableReason: "checkpoint unavailable",
+		executionRounds: [{ builderReportPath: "/workspace/round-1-builder.md" }] };
+	const service = { delegate: async () => task, goalStatus: async () => ({ runId: "G001", lifecycle: "active",
+		tasks: [task], decisions: [], feedbackStatus: "failed" }) } as unknown as ResearchService;
+	const tools = captureExtension(service).tools;
+	const spec = { runId: "G001", objective: "candidate", inputs: [], expectedOutputs: ["result.txt"], checks: ["checked"], mode: "execute" };
+	const delegated = (await tools.get("research_delegate")!.execute("d", spec, undefined, undefined, toolContext("/workspace"))).details as any;
+	assert.equal(delegated.summary.executionFailure,task.executionFailure);
+	assert.equal(delegated.summary.lastRound.builderReportPath,task.executionRounds[0].builderReportPath);
+	const status = (await tools.get("research_goal")!.execute("g",{action:"status",runId:"G001"},undefined,undefined,toolContext("/workspace"))).details as any;
+	assert.equal(status.summary.tasks[0].executionFailure,task.executionFailure);
+	assert.equal(status.summary.tasks[0].branchUnavailableReason,task.branchUnavailableReason);
+	assert.equal(status.summary.tasks[0].lastRound.builderReportPath,task.executionRounds[0].builderReportPath);
+});
+
 test("research tools dispatch a real same-goal fork and select an accepted branch without exposing session dumps", async () => {
 	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-branch-extension-")));
 	await mkdir(path.join(root, "problem"), { recursive: true });

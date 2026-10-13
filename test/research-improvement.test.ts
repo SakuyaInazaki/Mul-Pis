@@ -104,7 +104,10 @@ test("research-only campaign consumes real CPU feedback, saves an agent H candid
  assert.ok(result.decisions.some((x) => x.action?.kind === "probe"));
  const candidate = await new GenerationStore(f.root).readStrategy(result.selectedCandidateId!);
  assert.equal(candidate.origin, "agent-generated");
- assert.ok(f.runner.created.some((x) => x.methodBinding?.versionId === candidate.versionId && x.systemPrompt.includes(candidate.artifact.body)));
+ assert.equal(candidate.artifact.kind, "cpu-numerical-prompt");
+ if (candidate.artifact.kind !== "cpu-numerical-prompt") throw new Error("fixture requires a CPU prompt method");
+ const candidateBody = candidate.artifact.body;
+ assert.ok(f.runner.created.some((x) => x.methodBinding?.versionId === candidate.versionId && x.systemPrompt.includes(candidateBody)));
 });
 
 test("documented H plan reaches a complete fake model request with its frozen seed", async (t) => {
