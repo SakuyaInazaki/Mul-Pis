@@ -772,7 +772,7 @@ test("crash recovery rejects a live or unknown old process and never rewrites ol
 test("review rejects fake completion and requires a relevant independent check report", async (t) => {
 	const f = await fixture(t); const goal = await f.controller.begin(begin);
 	const source = path.join(f.root, "source.txt"); await writeFile(source, "input\n");
-	const task = await f.controller.delegate(goal.runId, { objective: "形成重要结果", inputs: [source], expectedOutputs: ["result.md"], checks: ["关键数值通过"], mode: "reason", requireIndependentCheck: true });
+	const task = await f.controller.delegate(goal.runId, { objective: "形成重要结果", inputs: [source], expectedOutputs: ["result.md"], checks: ["关键数值通过"], mode: "execute", requireIndependentCheck: true });
 	await assert.rejects(f.controller.review(goal.runId, { taskId: task.taskId, artifacts: [], checks: [{ criterion: "关键数值通过", result: "passed", evidence: [] }] }), /空 artifacts/);
 	const artifact = path.join(task.workDir, "result.md"); await writeFile(artifact, "actual result\n");
 	const checker = await f.controller.delegate(goal.runId, { objective: "独立核对重要结果", inputs: [artifact], expectedOutputs: [], checks: ["核对报告已返回"], mode: "check", parentTaskId: task.taskId });
@@ -847,7 +847,7 @@ test("an accepted same-obligation retry chain can fulfill without erasing old fa
 test("supersedes cannot downgrade mode, independent checking, or fixed inputs", async (t) => {
 	const f = await fixture(t); const goal = await f.controller.begin(begin); const input = path.join(f.root, "fixed.txt"); await writeFile(input, "v1\n");
 	const original = await f.controller.delegate(goal.runId, { objective: "固定义务", inputs: [input], expectedOutputs: ["out.txt"], checks: ["输出检查"], mode: "execute", requireIndependentCheck: true });
-	await assert.rejects(f.controller.delegate(goal.runId, { objective: "固定义务", inputs: [input], expectedOutputs: ["out.txt"], checks: ["输出检查"], mode: "reason", requireIndependentCheck: false, supersedesTaskId: original.taskId }), /supersedes 只能替代/);
+	await assert.rejects(f.controller.delegate(goal.runId, { objective: "固定义务", inputs: [input], expectedOutputs: [], checks: ["输出检查"], mode: "reason", requireIndependentCheck: false, supersedesTaskId: original.taskId }), /supersedes 只能替代/);
 	const other = path.join(f.root, "other.txt"); await writeFile(other, "v1\n");
 	await assert.rejects(f.controller.delegate(goal.runId, { objective: "固定义务", inputs: [other], expectedOutputs: ["out.txt"], checks: ["输出检查"], mode: "execute", requireIndependentCheck: true, supersedesTaskId: original.taskId }), /supersedes 只能替代/);
 });
@@ -907,11 +907,21 @@ assert.equal(retried.mode, "execute");
 assert.equal(retried.supersedesTaskId, first.taskId);
 });
 
-test("check mode rejects declared output files", async (t) => {
-const f = await fixture(t);
-const goal = await f.controller.begin(begin);
-await assert.rejects(
-f.controller.delegate(goal.runId, { objective: "read only", inputs: [], expectedOutputs: ["report.md"], checks: ["x"], mode: "check" }),
-/不能声明 expectedOutputs/,
-);
+test("read-only modes reject output files before dispatch and preserve automatic reports", async (t) => {
+	for (const mode of ["check", "reason"] as const) {
+		const f = await fixture(t);
+		const goal = await f.controller.begin(begin);
+		await assert.rejects(
+			f.controller.delegate(goal.runId, { objective: "read only", inputs: [], expectedOutputs: ["report.md"], checks: ["x"], mode }),
+			/不能声明 expectedOutputs/,
+		);
+		assert.equal(f.runner.created.length, 0, "invalid output obligations must not start a session");
+		assert.equal((await f.controller.status(goal.runId)).tasks.length, 0);
+		const task = await f.controller.delegate(goal.runId, { objective: "read only", inputs: [], expectedOutputs: [], checks: ["x"], mode });
+		assert.equal(f.runner.created.at(-1)?.tools.kind, "read-dir");
+		assert.ok(task.reportPath);
+		assert.match(await readFile(task.reportPath, "utf8"), /returned/);
+		const reviewed = await f.controller.review(goal.runId, { taskId: task.taskId, artifacts: [task.reportPath], checks: [{ criterion: "x", result: "passed", evidence: [task.reportPath] }] });
+		assert.equal(reviewed.status, "accepted");
+	}
 });

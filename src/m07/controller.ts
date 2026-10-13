@@ -1211,8 +1211,8 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				if (isSafeRelativeOutputPath(expectedOutput) === false) throw new HarnessError("m07.path", `expectedOutputs 必须是 work 目录内精确相对路径，不得含占位符、通配符、绝对路径、..、多余首尾空白或换行；动态文件名请声明其父目录，并在 objective 或任务报告中说明：${expectedOutput}`);
 			}
 			if (!spec.checks.length) throw new HarnessError("m07.task", "每个任务必须定义至少一项实际检查；推导可用会话报告作为证据");
-			if (spec.mode === "check") {
-				if (spec.expectedOutputs.length > 0) throw new HarnessError("m07.task", "check 模式只读且不写盘，不能声明 expectedOutputs；需要产出文件时请使用 execute 模式");
+			if (spec.mode !== "execute" && spec.expectedOutputs.length > 0) {
+				throw new HarnessError("m07.task", `${spec.mode} 模式只读且不写盘，不能声明 expectedOutputs；使用 expectedOutputs: []，会话结果由控制器自动保存为 reportPath；需要额外文件时请使用 execute 模式`);
 			}
 			if (spec.mode === "execute") {
 				if (spec.expectedOutputs.length === 0) {
