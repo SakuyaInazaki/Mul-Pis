@@ -226,7 +226,7 @@ test("workflow A/A rejects frozen research model drift before a provider request
 });
 
 test("workflow A/A records discordance without calling it improvement", async (t) => {
-	const f = await fixture(t, (ctx) => ctx.spec.role === "research" ? "已处理冻结报告。" : ctx.spec.persistDir.includes("-A2") ? "开发证据完整" : "原始报告");
+	const f = await fixture(t, (ctx) => ctx.spec.role === "research" ? "已处理冻结报告。" : path.basename(path.resolve(ctx.spec.persistDir, "../..")).endsWith("-A2") ? "开发证据完整" : "原始报告");
 	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).calibrateWorkflow({ version: 1, kind: "m07-evidence-handoff-aa/v1", caseSetPath: "development.json", experimentRoot: path.join(f.parent, "discordant-aa"), baseline: "active-h", repetitions: 2 });
 	assert.equal(run.status, "complete", run.stopReason ?? "");
 	assert.deepEqual(run.pairs.map((pair) => pair.differences.length), [1, 1]);
@@ -235,7 +235,7 @@ test("workflow A/A records discordance without calling it improvement", async (t
 
 test("workflow A/A retains the first arm receipt when the second handoff fails", async (t) => {
 	const f = await fixture(t, (ctx) => {
-		if (ctx.spec.role === "execution" && ctx.spec.persistDir.includes("-A2")) throw new Error("simulated second-arm provider failure");
+		if (ctx.spec.role === "execution" && path.basename(path.resolve(ctx.spec.persistDir, "../..")).endsWith("-A2")) throw new Error("simulated second-arm provider failure");
 		return ctx.spec.role === "research" ? "已读冻结报告。" : "原始报告";
 	});
 	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).calibrateWorkflow({ version: 1, kind: "m07-evidence-handoff-aa/v1", caseSetPath: "development.json", experimentRoot: path.join(f.parent, "incomplete-aa"), baseline: "active-h", repetitions: 2 });
@@ -251,7 +251,7 @@ test("workflow A/A retains the first arm receipt when the second handoff fails",
 
 test("workflow A/A stops after an incomplete first arm and persists its partial pair", async (t) => {
 	const f = await fixture(t, (ctx) => {
-		if (ctx.spec.role === "execution" && ctx.spec.persistDir.includes("-A")) throw new Error("simulated first-arm provider failure");
+		if (ctx.spec.role === "execution" && path.basename(path.resolve(ctx.spec.persistDir, "../..")).endsWith("-A")) throw new Error("simulated first-arm provider failure");
 		return ctx.spec.role === "research" ? "已读冻结报告。" : "原始报告";
 	});
 	const before = f.runner.created.length;
@@ -260,7 +260,7 @@ test("workflow A/A stops after an incomplete first arm and persists its partial 
 	assert.equal(run.pairs.length, 0);
 	assert.equal(run.partialPair?.armA?.status, "inconclusive");
 	assert.equal(run.partialPair?.armA2, undefined);
-	assert.equal(f.runner.created.slice(before).some((spec) => spec.persistDir.includes("-A2")), false);
+	assert.equal(f.runner.created.slice(before).some((spec) => path.basename(path.resolve(spec.persistDir, "../..")).endsWith("-A2")), false);
 	const retained = path.join(f.gen.root, "workflow-calibrations", run.runId);
 	assert.equal(JSON.parse(await readFile(path.join(retained, "arm-0-dev-a-A.json"), "utf8")).status, "inconclusive");
 	assert.deepEqual(JSON.parse(await readFile(path.join(retained, "run.json"), "utf8")).partialPair, run.partialPair);

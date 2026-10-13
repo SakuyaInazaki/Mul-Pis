@@ -131,4 +131,30 @@ node scripts/run-workflow-source.ts <new-code-source> <research-workspace> harne
 
 Pi 可使用同一入口的 `pi` 目标，模型取自工作区 `research.config.json` 的 `roles.research`，已有认证配置从启动环境继承。现有宿主恢复流程仍负责提供当前新进程的运行描述，其中 `loadedSource` 应与所选源码快照一致。普通未启用该入口的历史记录保留其原有声明，不补写版本证明。
 
-源码目录的只读权限用于固定宿主部署，不隔离具有改权限能力的同用户进程；共享依赖版本也不由此证明。这一修复为研究提供可追溯的执行版本，未引入源码候选自动修改或架构晋升机制。
+源码目录的只读权限用于固定宿主部署，不隔离具有改权限能力的同用户进程；共享依赖版本也不由此证明。这一入口为研究提供可追溯的执行版本，供下面的独立源码比较复用。
+
+
+## 独立进程源码比较
+
+`improve research workflow compare-sources --workspace <research-workspace> --plan <source-pair-plan.json>` 从两份已准备的源码快照分别启动新进程，复用同一个 M07→M04 执行臂和现有冻结研究数据。计划如下；源码根目录须使用准备回执中的绝对路径，提交须为完整 Git commit：
+
+```json
+{
+  "version": 1,
+  "kind": "m07-source-comparison/v1",
+  "caseSetPath": "cases/development.json",
+  "experimentRoot": "source-comparison-arms",
+  "baseline": "active-h",
+  "repetitions": 2,
+  "sources": {
+    "baseline": { "sourceRoot": "<prepared-baseline-root>", "sourceCommit": "<full-baseline-commit>" },
+    "candidate": { "sourceRoot": "<prepared-candidate-root>", "sourceCommit": "<full-candidate-commit>" }
+  }
+}
+```
+
+两份源码都须包含这一执行臂入口。每个案例交替按 A/A2 和 A2/A 顺序执行：A 是 baseline 源码，A2 是 candidate 源码；二者保持相同 H/I、知识、政策、模型配置和案例，使用独立工作区与会话。`baseline` 字段决定两臂都使用固定 H 或都使用 builtin。每臂回执记录实际 `loadedSource` 和子进程 PID；父进程在每次模型请求前复查原有活动方法与知识限制，并持有用量结算记录。子进程异常或用量未结算不会变成完成结果。CLI 使用 Pi；离线测试的脚本 runner 只能由受信测试代码配置。
+
+该入口保留开发案例观察，不更改活动方法或源码指针。现有 v1 案例检查的是 M07 原报告，不能评价反馈源码改变后的 M04 科学处置，因此其通过结果不能作为源码晋升依据。源码准入还需独立评价 M04 处置与知识写入，再连接活动版本选择；这一批只完成源码分离执行的工程连接。
+
+完整反馈组织现在位于 `src/m07/feedback.ts`；控制器继续拥有目标验收、checkpoint 冻结和溢出索引，M04 继续拥有实际读取检查与知识事务。控制器与反馈模块共用 `src/m07/projection.ts`，没有复制投影实现。抽取保持原行为，为后续窄范围源码候选提供清晰的修改边界。

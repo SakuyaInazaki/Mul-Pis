@@ -1,3 +1,5 @@
+import path from "node:path";
+import type { LoadedSourceV1 } from "../runtime/loaded-source.ts";
 import type { BudgetLimits } from "../experiments/contracts.ts";
 import { isKnowledgeRef } from "../knowledge/experience-index.ts";
 import type { KnowledgeRef } from "../knowledge/types.ts";
@@ -26,6 +28,11 @@ export interface WorkflowCalibrationPlanV1 {
 	baseline: "active-h" | "builtin";
 	/** Caller-declared sample size: each repetition executes one fresh A/A pair per case. */
 	repetitions: number;
+}
+/** Same frozen method and data, two explicitly reviewed source versions; observation only. */
+export interface WorkflowSourceComparisonPlanV1 extends Omit<WorkflowCalibrationPlanV1, "kind"> {
+	kind: "m07-source-comparison/v1";
+	sources: { baseline: LoadedSourceV1; candidate: LoadedSourceV1 };
 }
 export interface WorkflowEvidenceHandoffPlanV1 {
 	version: 1;
@@ -58,6 +65,8 @@ export interface WorkflowEvidenceHandoffPlanV1 {
 	experienceMaxChars?: number;
 }
 export interface WorkflowArmReceiptV1 {
+	loadedSource?: LoadedSourceV1;
+	childPid?: number;
 	caseId: string;
 	arm: "baseline" | "candidate";
 	methodVersionId: string;
@@ -77,8 +86,9 @@ export interface WorkflowArmReceiptV1 {
 export type WorkflowCalibrationArmV1 = Omit<WorkflowArmReceiptV1, "arm"> & { arm: "A" | "A2" };
 export interface WorkflowCalibrationRunV1 {
 	version: 1;
-	kind: "m07-evidence-handoff-aa/v1";
-	evidenceScope: "local-handoff-calibration";
+	kind: "m07-evidence-handoff-aa/v1" | "m07-source-comparison/v1";
+	evidenceScope: "local-handoff-calibration" | "local-source-handoff-observation";
+	sources?: WorkflowSourceComparisonPlanV1["sources"];
 	scientificBenefit: "unverified";
 	runId: string;
 	startedAt: string;
@@ -141,6 +151,17 @@ export function validateWorkflowCalibrationPlan(input: unknown): WorkflowCalibra
 		typeof p.caseSetPath !== "string" || !p.caseSetPath.trim() || p.caseSetPath.length > 500 || typeof p.experimentRoot !== "string" || !p.experimentRoot.trim() || p.experimentRoot.length > 500 ||
 		!Number.isSafeInteger(p.repetitions) || (p.repetitions as number) < 2 || (p.repetitions as number) % 2 !== 0) throw new HarnessError("improvement.workflow-calibration", "calibration requires a development case path, isolated root, baseline, and caller-declared even repetitions");
 	return p as unknown as WorkflowCalibrationPlanV1;
+}
+export function validateWorkflowSourceComparisonPlan(input: unknown): WorkflowSourceComparisonPlanV1 {
+	if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.workflow-source-comparison", "source comparison plan must be an object");
+	const { sources, ...base } = input as Record<string, unknown>;
+	if (base.kind !== "m07-source-comparison/v1") throw new HarnessError("improvement.workflow-source-comparison", "unsupported source comparison protocol");
+	const common = validateWorkflowCalibrationPlan({ ...base, kind: "m07-evidence-handoff-aa/v1" });
+	if (!sources || typeof sources !== "object" || Array.isArray(sources) || Object.keys(sources).sort().join(",") !== "baseline,candidate") throw new HarnessError("improvement.workflow-source-comparison", "source comparison requires baseline and candidate snapshots");
+	for (const source of Object.values(sources)) {
+		if (!source || typeof source !== "object" || Array.isArray(source) || Object.keys(source).sort().join(",") !== "sourceCommit,sourceRoot" || typeof source.sourceRoot !== "string" || !path.isAbsolute(source.sourceRoot) || typeof source.sourceCommit !== "string" || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(source.sourceCommit)) throw new HarnessError("improvement.workflow-source-comparison", "each source must pin a prepared directory and full commit");
+	}
+	return { ...common, kind: "m07-source-comparison/v1", sources: sources as WorkflowSourceComparisonPlanV1["sources"] };
 }
 function budget(value: unknown): value is BudgetLimits {
 	if (value === undefined) return true;

@@ -21,7 +21,8 @@ import { buildWorkflowMetaEpisode, loadWorkflowMetaEpisode, metaEpisodeForModel,
 import { validateResearchHypothesis, type ResearchHypothesisV1 } from "./policy-host.ts";
 import { runBoundedModelStep } from "./research-model.ts";
 import { timedPrompt } from "./admission.ts";
-import { validateWorkflowCaseSet, type WorkflowArmReceiptV1, type WorkflowCalibrationArmV1, type WorkflowCalibrationPlanV1, type WorkflowCalibrationRunV1, type WorkflowCaseSetV1, type WorkflowEvidenceHandoffPlanV1, type WorkflowRunV1 } from "./workflow-types.ts";
+import type { WorkflowSourceArmOptions } from "./workflow-source-arm.ts";
+import { validateWorkflowCaseSet, type WorkflowArmReceiptV1, type WorkflowCalibrationArmV1, type WorkflowCalibrationPlanV1, type WorkflowSourceComparisonPlanV1, type WorkflowCalibrationRunV1, type WorkflowCaseSetV1, type WorkflowEvidenceHandoffPlanV1, type WorkflowRunV1 } from "./workflow-types.ts";
 
 type Action = { kind: "inspect"; object: "method" | "development-feedback" | "meta-episode"; id: string; start: number; maxChars: number } |
 	{ kind: "propose"; target: "executor"; body: string; hypothesis: ResearchHypothesisV1 } |
@@ -421,7 +422,7 @@ function assertWorkflowBudgetOpen(budget: SharedBudget, lease: BudgetLease): voi
 		throw new HarnessError("improvement.budget", "workflow provider request remains in flight");
 }
 
-export function createWorkflowMeteredRunner(base: SessionRunner, budget: SharedBudget, lease: BudgetLease, events: UsageSummary[], _legacyTimeoutMs?: number, beforePrompt?: () => Promise<void>, inspectPrompt?: (spec: SessionSpec, message: string) => void): SessionRunner {
+export function createWorkflowMeteredRunner(base: SessionRunner, budget: SharedBudget, lease: BudgetLease, events: UsageSummary[], _legacyTimeoutMs?: number, beforePrompt?: () => Promise<void>, inspectPrompt?: (spec: SessionSpec, message: string) => void, onSettled?: (usage: UsageSummary) => Promise<void>, onFailed?: () => Promise<void>): SessionRunner {
 	const wrap = (handle: SessionHandle, spec: SessionSpec): SessionHandle => ({ ...handle, prompt: async (message) => {
 		inspectPrompt?.(spec, message);
 		await beforePrompt?.();
@@ -432,14 +433,24 @@ export function createWorkflowMeteredRunner(base: SessionRunner, budget: SharedB
 			const turn = await timedPrompt(handle, message);
 			const usage = turn.usage ?? handle.usageSummary();
 			budget.settleObservedTurn(reservation, usage); settled = true; events.push(usage);
+			await onSettled?.(usage);
 			if (!usage.complete || usage.reportedEvents < 1) throw new HarnessError("improvement.workflow-usage", "M07/M04 provider use is incomplete");
 			return turn;
-		} catch (error) { if (!settled) budget.markObservedTurnUnknown(reservation); throw error; }
+		} catch (error) { if (!settled) { budget.markObservedTurnUnknown(reservation); await onFailed?.(); } throw error; }
 	}, setRunContext: handle.setRunContext?.bind(handle), transcript: handle.transcript.bind(handle), readCoverage: handle.readCoverage.bind(handle), readReturnEvents: handle.readReturnEvents.bind(handle), usageEvents: handle.usageEvents.bind(handle), usageSummary: handle.usageSummary.bind(handle), abort: handle.abort.bind(handle), toolLog: handle.toolLog.bind(handle), dispose: handle.dispose.bind(handle) });
 	return { create: async (spec) => wrap(await base.create(spec), spec), resume: async (ref) => { const handle = await base.resume(ref); const spec = JSON.parse(await readFile(ref.specFile!, "utf8")) as SessionSpec; return wrap(handle, spec); }, estimateMaxSdkCost: base.estimateMaxSdkCost?.bind(base) };
 }
 
-async function executeArm(args: { source: Workspace; root: string; bundle: NonNullable<Awaited<ReturnType<GenerationStore["active"]>>>["bundle"]; h: StrategyRecordV1; i: StrategyRecordV1; caseInput: WorkflowCaseSetV1["cases"][number]; arm: WorkflowArmReceiptV1["arm"]; builtinBaseline: boolean; runner: SessionRunner; budget: SharedBudget; lease: BudgetLease; perPromptTimeoutMs?: number; formalRunId: string; protectedInputs?: Workspace; beforePrompt: () => Promise<void> }): Promise<WorkflowArmReceiptV1> {
+export interface WorkflowArmExecutionArgs {
+	source: Workspace; root: string; bundle: GenerationBundleV1; h: StrategyRecordV1; i: StrategyRecordV1;
+	caseInput: WorkflowCaseSetV1["cases"][number]; arm: WorkflowArmReceiptV1["arm"]; builtinBaseline: boolean;
+	runner: SessionRunner; budget: SharedBudget; lease: BudgetLease; perPromptTimeoutMs?: number; formalRunId: string;
+	protectedInputs?: Workspace; beforePrompt: () => Promise<void>;
+	onSettled?: (usage: UsageSummary) => Promise<void>; onFailed?: () => Promise<void>;
+}
+
+/** The v1 checks inspect the original M07 task report, not M04 judgment quality. */
+export async function executeArm(args: WorkflowArmExecutionArgs): Promise<WorkflowArmReceiptV1> {
 	const binding = args.builtinBaseline ? { kind: "builtin" as const } : { kind: "injected-h" as const, versionId: args.h.versionId };
 	const receipt: WorkflowArmReceiptV1 = { caseId: args.caseInput.id, arm: args.arm, methodVersionId: args.builtinBaseline ? "builtin-default" : args.h.versionId, methodBinding: binding, workspaceRoot: args.root, checkResults: [], usage: { providerCalls: 0, inputTokens: 0, outputTokens: 0, sdkEstimatedCost: 0, complete: false }, status: "inconclusive" };
 	const events: UsageSummary[] = [];
@@ -454,7 +465,7 @@ async function executeArm(args: { source: Workspace; root: string; bundle: NonNu
 			if (!args.builtinBaseline || !spec.label.startsWith("M07-")) return;
 			observedM07Message = true;
 			if (!expectedPolicyVersionId || spec.methodBinding?.versionId !== expectedPolicyVersionId || message.includes("冻结的 M07 方法：")) throw new HarnessError("improvement.workflow-arm", "builtin M07 message or binding contains an injected H");
-		});
+		}, args.onSettled, args.onFailed);
 		const controller = createM07Controller(ctx);
 		const goal = await controller.begin(args.builtinBaseline ? args.caseInput.goal : { ...args.caseInput.goal, workflowMethodVersionId: args.h.versionId });
 		expectedPolicyVersionId = goal.budgetPolicyVersionId;
@@ -503,9 +514,10 @@ async function executeArm(args: { source: Workspace; root: string; bundle: NonNu
 	return receipt;
 }
 
-/** A/A is an observation of one frozen method, never a candidate search or admission. */
-export async function calibrateWorkflowEvidenceHandoff(args: { ws: Workspace; store: GenerationStore; runner: SessionRunner; plan: WorkflowCalibrationPlanV1; registeredExperienceStores?: ReadonlyMap<string, KnowledgeStore> }): Promise<WorkflowCalibrationRunV1> {
+/** Observe fresh paired arms with one frozen method; this path never admits or activates. */
+export async function calibrateWorkflowEvidenceHandoff(args: { ws: Workspace; store: GenerationStore; runner: SessionRunner; plan: WorkflowCalibrationPlanV1 | WorkflowSourceComparisonPlanV1; sourceRunnerOptions?: Pick<WorkflowSourceArmOptions, "runnerKind" | "fakeReplyModule">; registeredExperienceStores?: ReadonlyMap<string, KnowledgeStore> }): Promise<WorkflowCalibrationRunV1> {
 	const { ws, store, runner, plan, registeredExperienceStores } = args;
+	const sourceComparison = plan.kind === "m07-source-comparison/v1" ? plan : undefined;
 	const active = await store.active();
 	if (!active) throw new HarnessError("improvement.workflow-calibration", "an active workflow H/I bundle is required");
 	const h = await store.readStrategy(active.bundle.executorVersionId);
@@ -516,7 +528,7 @@ export async function calibrateWorkflowEvidenceHandoff(args: { ws: Workspace; st
 	await assertWorkflowExperimentRoot(ws, root);
 	const runId = id(), dir = path.join(store.root, "workflow-calibrations", runId), budget = new SharedBudget(runId, {});
 	const methodVersionId = plan.baseline === "builtin" ? "builtin-default" : h.versionId;
-	const run: WorkflowCalibrationRunV1 = { version: 1, kind: "m07-evidence-handoff-aa/v1", evidenceScope: "local-handoff-calibration", scientificBenefit: "unverified", runId, startedAt: nowIso(), status: "running", baseline: plan.baseline, baselineBundleId: active.bundle.bundleId, methodVersionId, knowledgeSnapshot: active.bundle.knowledgeSnapshot, pairs: [] };
+	const run: WorkflowCalibrationRunV1 = { version: 1, kind: plan.kind, evidenceScope: sourceComparison ? "local-source-handoff-observation" : "local-handoff-calibration", ...(sourceComparison ? { sources: sourceComparison.sources } : {}), scientificBenefit: "unverified", runId, startedAt: nowIso(), status: "running", baseline: plan.baseline, baselineBundleId: active.bundle.bundleId, methodVersionId, knowledgeSnapshot: active.bundle.knowledgeSnapshot, pairs: [] };
 	await mkdir(dir, { recursive: true });
 	const save = async () => { run.budgetAtEnd = budget.status(); await writeFileAtomic(path.join(dir, "run.json"), `${JSON.stringify(run, null, 2)}\n`); };
 	await save();
@@ -541,13 +553,17 @@ export async function calibrateWorkflowEvidenceHandoff(args: { ws: Workspace; st
 			const executionOrder: ["A", "A2"] | ["A2", "A"] = repetition % 2 === 0 ? ["A", "A2"] : ["A2", "A"];
 			run.partialPair = { caseId: item.id, repetition, executionOrder };
 			for (const label of executionOrder) {
-				const receipt = await executeArm({ source: template, root: path.join(root, `calibration-${repetition}-${item.id}-${label}`), bundle: active.bundle, h, i, caseInput: item, arm: label === "A" ? "baseline" : "candidate", builtinBaseline: plan.baseline === "builtin", runner, budget, lease: budget.root, formalRunId, beforePrompt });
+				const arm = label === "A" ? "baseline" as const : "candidate" as const;
+				const armRoot = path.join(root, `calibration-${repetition}-${item.id}-${label}`);
+				const receipt = sourceComparison
+					? await (await import("./workflow-source-arm.ts")).executeWorkflowSourceArm(sourceComparison.sources[arm], { sourceWorkspaceRoot: template.root, root: armRoot, bundle: active.bundle, h, i, caseInput: item, arm, builtinBaseline: plan.baseline === "builtin", formalRunId }, { ...args.sourceRunnerOptions, runnerKind: args.sourceRunnerOptions?.runnerKind ?? "pi", budget, lease: budget.root, beforePrompt })
+					: await executeArm({ source: template, root: armRoot, bundle: active.bundle, h, i, caseInput: item, arm, builtinBaseline: plan.baseline === "builtin", runner, budget, lease: budget.root, formalRunId, beforePrompt });
 				const calibrationReceipt: WorkflowCalibrationArmV1 = { ...receipt, arm: label };
 				await writeFileAtomic(path.join(dir, `arm-${repetition}-${item.id}-${label}.json`), `${JSON.stringify(calibrationReceipt, null, 2)}\n`);
 				if (label === "A") run.partialPair.armA = calibrationReceipt;
 				else run.partialPair.armA2 = calibrationReceipt;
 				await save();
-				if (receipt.status !== "complete" || !receipt.usage.complete) { run.status = "inconclusive"; run.stopReason = `A/A handoff arm ${label} was incomplete`; return run; }
+				if (receipt.status !== "complete" || !receipt.usage.complete) { run.status = "inconclusive"; run.stopReason = `paired handoff arm ${label} was incomplete: ${receipt.reason ?? "usage or execution evidence missing"}`; return run; }
 			}
 			const armA = run.partialPair.armA!, armA2 = run.partialPair.armA2!;
 			if (armA.methodVersionId !== armA2.methodVersionId || JSON.stringify(armA.methodBinding) !== JSON.stringify(armA2.methodBinding)) throw new HarnessError("improvement.workflow-calibration", "A/A arms did not retain the same method binding");

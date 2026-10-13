@@ -204,6 +204,9 @@ export function managedLocalBashOperations(call: () => ManagedBashCall | undefin
 				abortSource, observedAt: new Date().toISOString() }, groupObservation, outputBytesAtExit });
 			if ((abortSource as string) === "signal") throw new Error("aborted");
 			if ((abortSource as string) === "timeout") throw new Error(`timeout:${timeout}`);
+			// Pi treats a null exit code as success. A process ended by an
+			// independent signal has no exit code, but its command did not succeed.
+			if (exited.signal !== null) throw new Error(`Command terminated by signal ${exited.signal}`);
 			return { exitCode: exited.code };
 		} finally {
 			clearInterval(outputPoll);

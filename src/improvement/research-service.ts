@@ -24,7 +24,8 @@ import { decisionPrompt, fullyReadDevelopmentFeedbackIds, improverSystemPrompt, 
 import { runBoundedModelStep } from "./research-model.ts";
 import { validateResearchPlan, type ResearchCampaignPlanV1, type ResearchCandidateV1, type ResearchDecisionRecordV1, type ResearchRunV1 } from "./research-types.ts";
 import { calibrateWorkflowEvidenceHandoff, prepareWorkflowResearchSource, runWorkflowEvidenceHandoff } from "./workflow-adapter.ts";
-import { validateWorkflowCalibrationPlan, validateWorkflowPlan } from "./workflow-types.ts";
+import type { WorkflowSourceArmOptions } from "./workflow-source-arm.ts";
+import { validateWorkflowCalibrationPlan, validateWorkflowPlan, validateWorkflowSourceComparisonPlan } from "./workflow-types.ts";
 
 const activeMutations = new Set<string>();
 const RUN_ID = () => `${new Date().toISOString().replace(/[-:.]/g, "")}-${randomBytes(3).toString("hex")}`;
@@ -183,6 +184,8 @@ export class ResearchImprovementService {
  async runWorkflow(input: unknown) { const plan = validateWorkflowPlan(input); return this.withMutation(() => runWorkflowEvidenceHandoff({ ws: this.ws, store: this.store, runner: this.runner, plan, registeredExperienceStores: this.registeredExperienceStores })); }
  /** Same-method local A/A observation; it does not search, open G, or activate a method. */
  async calibrateWorkflow(input: unknown) { const plan = validateWorkflowCalibrationPlan(input); return this.withMutation(() => calibrateWorkflowEvidenceHandoff({ ws: this.ws, store: this.store, runner: this.runner, plan, registeredExperienceStores: this.registeredExperienceStores })); }
+ /** Two fixed source versions, identical frozen H/K/cases, fresh processes; observations only. */
+ async compareWorkflowSources(input: unknown, sourceRunnerOptions: Pick<WorkflowSourceArmOptions, "runnerKind" | "fakeReplyModule"> = { runnerKind: "pi" }) { const plan = validateWorkflowSourceComparisonPlan(input); return this.withMutation(() => calibrateWorkflowEvidenceHandoff({ ws: this.ws, store: this.store, runner: this.runner, plan, sourceRunnerOptions, registeredExperienceStores: this.registeredExperienceStores })); }
 
  private async runUnlocked(plan: ResearchCampaignPlanV1): Promise<ResearchRunV1> {
   const active = await this.store.active(); if (!active) throw new HarnessError("improvement.generation", "bootstrap a human-seeded research generation first");

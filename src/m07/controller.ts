@@ -1,10 +1,7 @@
-import { constants, createReadStream, createWriteStream } from "node:fs";
+import { constants } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { chmod, copyFile, cp, link, lstat, mkdir, open, readFile, readdir, realpath, rename, rmdir, stat, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { StringDecoder } from "node:string_decoder";
-import { Transform } from "node:stream";
-import { pipeline } from "node:stream/promises";
 import path from "node:path";
 import { loadPrompt, section, systemPromptFor } from "../prompts.ts";
 import { HarnessError } from "../types.ts";
@@ -16,7 +13,7 @@ import type { BeginGoalInput, CurrentGoal, DecisionInput, EvidenceFile, FinishIn
 import { requestNotSentDetails, settledTerminalResponseDetails } from "../runner/operation-disposition.ts";
 import type { StageRunRecord } from "../types.ts";
 import { loadActiveBudgetPolicy, projectInline, validateActiveBudgetPointer, validateBudgetPolicy, type BudgetPolicy } from "../improvement/policy.ts";
-import { capturedRunBytes, DEFAULT_PROJECTION_SNAPSHOT_LIMITS, newProjectionEvent, nextProjectionOrdinal, writeProjectionEvent, type ProjectionEventV1, type ProjectionMaterialV1, type ProjectionSnapshotLimits } from "../improvement/observations.ts";
+import { DEFAULT_PROJECTION_SNAPSHOT_LIMITS, writeProjectionEvent, type ProjectionEventV1, type ProjectionSnapshotLimits } from "../improvement/observations.ts";
 import { createExperienceProvider, verifyRequiredKnowledge } from "../knowledge/experience-index.ts";
 import { retrieveKnowledge } from "../knowledge/retrieval.ts";
 import type { KnowledgeRef, KnowledgeStore } from "../knowledge/types.ts";
@@ -28,6 +25,8 @@ import { parseRoundReview } from "./execution-loop.ts";
 import { openBoundedSession, type EvidenceBindingV1 } from "../context/boundary.ts";
 import type { Workspace } from "../workspace.ts";
 import { failedM04Feedback, resolveM04Baseline, type FormalBaseline } from "./formal-baseline.ts";
+import { writeFeedback } from "./feedback.ts";
+import { captureMaterial, copySnapshotBounded, createProjectionObservation, omissionLine, projectionMaterial } from "./projection.ts";
 export type { FormalBaseline } from "./formal-baseline.ts";
 
 const STATE = "goal.json";
@@ -637,112 +636,6 @@ function uniqueName(index: number, source: string): string {
 	return `${String(index + 1).padStart(3, "0")}-${path.basename(source).replace(/[^a-zA-Z0-9._-]/g, "_")}`;
 }
 
-interface TextInventory { text?: string; chars: number; bytes: number; path: string }
-
-/** Count UTF-8 bytes and decoded UTF-16 units without retaining deferred text. */
-async function textInventory(source: string, displayPath: string, retainThroughChars: number): Promise<TextInventory> {
-	const decoder = new StringDecoder("utf8");
-	let chars = 0, bytes = 0;
-	let retained: string[] | undefined = [];
-	const accept = (text: string) => {
-		chars += text.length;
-		if (retained && chars <= retainThroughChars) retained.push(text);
-		else retained = undefined;
-	};
-	for await (const chunk of createReadStream(source)) {
-		const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-		bytes += buffer.length;
-		accept(decoder.write(buffer));
-	}
-	accept(decoder.end());
-	return { text: retained?.join(""), chars, bytes, path: displayPath };
-}
-
-class SnapshotBudgetExceeded extends Error {}
-
-async function copySnapshotBounded(source: string, snapshot: string, maxBytes: number): Promise<number> {
-	await mkdir(path.dirname(snapshot), { recursive: true });
-	let copied = 0;
-	try {
-		await pipeline(createReadStream(source), new Transform({ transform(chunk: Buffer, _encoding, callback) {
-			copied += chunk.length;
-			callback(copied > maxBytes ? new SnapshotBudgetExceeded("projection snapshot budget exceeded") : null, copied > maxBytes ? undefined : chunk);
-		} }), createWriteStream(snapshot, { flags: "wx" }));
-		return copied;
-	} catch (error) {
-		await unlink(snapshot).catch(() => undefined);
-		throw error;
-	}
-}
-
-function omissionLine(item: { chars: number; bytes: number; path: string }, shown: number): string {
-	const shownRange = shown > 0 ? `1–${shown}` : "无（0 字符）";
-	const unreadRange = shown < item.chars ? `${shown + 1}–${item.chars}` : "无";
-	return `- ${item.path}；${item.bytes} bytes / ${item.chars} 字符；已显示字符 ${shownRange}；未显示字符 ${unreadRange}；原文完整保留，可用只读工具按需读取。`;
-}
-
-function projectionMaterial(ctx: StageContext, event: ProjectionEventV1, ordinal: number, role: ProjectionMaterialV1["role"], source: string, type: "text" | "binary"): ProjectionMaterialV1 {
-	const snapshotPath = path.join("projection-materials", event.eventId, `${String(ordinal + 1).padStart(3, "0")}-${path.basename(source)}`);
-	return { ordinal, role, mediaType: type, sourcePath: path.relative(ctx.ws.root, source), snapshotPath, availability: "available", snapshotStatus: "unavailable", laterReadVersion: "unknown", decision: type === "binary" ? "binary" : "unavailable" };
-}
-
-async function captureMaterial(ctx: StageContext, event: ProjectionEventV1, material: ProjectionMaterialV1, source: string, retainThroughChars: number): Promise<TextInventory | undefined> {
-	const snapshot = path.join(ctx.ws.runDir("M07", event.m07RunId), material.snapshotPath!);
-	try {
-		const sourceInfo = await stat(source);
-		const budget = event.captureBudget;
-		const remainingCall = Math.max(0, budget.perCallBytes - budget.usedCallBytes);
-		const remainingRun = Math.max(0, budget.perRunBytes - budget.usedRunBytesAtStart - budget.usedCallBytes);
-		const cap = Math.min(budget.perMaterialBytes, remainingCall, remainingRun);
-		const reason: ProjectionMaterialV1["captureReason"] = sourceInfo.size > budget.perMaterialBytes ? "per-material" : sourceInfo.size > remainingCall ? "per-call" : "per-run";
-		if (sourceInfo.size > cap) {
-			material.snapshotStatus = "budget-exceeded";
-			material.captureReason = reason;
-			material.snapshotPath = undefined;
-			material.utf8Bytes = sourceInfo.size;
-			if (material.mediaType === "binary") return undefined;
-			const inventory = await textInventory(source, material.sourcePath, retainThroughChars);
-			material.utf8Bytes = inventory.bytes;
-			material.utf16CodeUnits = inventory.chars;
-			return inventory;
-		}
-		let captured = 0;
-		try { captured = await copySnapshotBounded(source, snapshot, cap); }
-		catch (error) {
-			if (!(error instanceof SnapshotBudgetExceeded)) throw error;
-			material.snapshotStatus = "budget-exceeded";
-			material.captureReason = cap === budget.perMaterialBytes ? "per-material" : cap === remainingCall ? "per-call" : "per-run";
-			material.snapshotPath = undefined;
-			if (material.mediaType === "binary") { material.utf8Bytes = (await stat(source)).size; return undefined; }
-			const inventory = await textInventory(source, material.sourcePath, retainThroughChars);
-			material.utf8Bytes = inventory.bytes;
-			material.utf16CodeUnits = inventory.chars;
-			return inventory;
-		}
-		budget.usedCallBytes += captured;
-		material.snapshotStatus = "captured";
-		material.utf8Bytes = captured;
-		material.snapshotMtimeMs = (await stat(snapshot)).mtimeMs;
-		if (material.mediaType === "binary") {
-			return undefined;
-		}
-		const inventory = await textInventory(snapshot, material.sourcePath, retainThroughChars);
-		material.utf8Bytes = inventory.bytes;
-		material.utf16CodeUnits = inventory.chars;
-		return inventory;
-	} catch (error) {
-		material.availability = (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unreadable";
-		material.snapshotStatus = "unavailable";
-		material.decision = "unavailable";
-		material.reason = "unavailable";
-		throw error;
-	}
-}
-
-async function createProjectionObservation(ctx: StageContext, goal: CurrentGoal, purpose: ProjectionEventV1["purpose"], policy: BudgetPolicy, limits: ProjectionSnapshotLimits, taskId?: string): Promise<ProjectionEventV1> {
-	return newProjectionEvent({ callOrdinal: await nextProjectionOrdinal(ctx.ws, goal.runId), purpose, m07RunId: goal.runId, taskId, policyVersionId: goal.budgetPolicyVersionId!, policy, methodBinding: goal.methodBinding, tokenMeasurement: { unit: "provider-token", status: "unavailable" }, captureBudget: { ...limits, usedRunBytesAtStart: await capturedRunBytes(ctx.ws, goal.runId), usedCallBytes: 0 }, projectionStatus: "unavailable", deliveryStatus: "not-submitted", materials: [] });
-}
-
 async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string, task: TaskSpecInput, copies: M07TaskRecord["inputCopies"], knowledgePack: string | undefined, policy: BudgetPolicy, limits: ProjectionSnapshotLimits, operationId?: string): Promise<{ message: string; event: ProjectionEventV1 }> {
 	const event = await createProjectionObservation(ctx, goal, "task-message", policy, limits, taskId);
 	const planCopy = task.planInput ? copies.find((item) => item.source === task.planInput)?.copy : undefined;
@@ -804,84 +697,6 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string,
 	event.projectionStatus = "materialized";
 	event.outputPath = path.relative(ctx.ws.runDir("M07", goal.runId), path.join(ctx.ws.runDir("M07", goal.runId), "tasks", taskId, "message.md"));
 	return { message, event };
-	} finally { await writeProjectionEvent(ctx.ws, event); }
-}
-
-async function writeFeedback(ctx: StageContext, goal: CurrentGoal, limits: ProjectionSnapshotLimits, checkpointRoot?: string): Promise<string> {
-	const policy = frozenPolicy(goal);
-	const event = await createProjectionObservation(ctx, goal, "feedback", policy, limits);
-	try {
-	const displayPath = (file: string) => path.relative(checkpointRoot ?? ctx.ws.root, file);
-	const lines = [
-		"# M07 实际执行反馈包", "", `- 目标：${goal.goal}`, `- 与原问题关系：${goal.problemRelation}`, `- 目标结果：${goal.outcome ?? "进行中"}`, `- 返回路径：${goal.returnPath ?? "未选择"}`, `- 正式基线：${goal.formalBaseline ? "是" : "否（探索性）"}`, `- 知识快照：${goal.knowledgeSnapshot ?? "无"}`, `- 冻结预算策略：${goal.budgetPolicyVersionId}（${goal.budgetPolicyFrozenAt}）`, "",
-		...(checkpointRoot ? ["- 这是 active 目标的非终态开发 checkpoint；不改变原成功要求，不表示 fulfilled，也不表示 M04 已核验全部证据。", "- 本次 M04 只允许读取本 checkpoint 冻结目录，所有材料路径均相对于该目录。", ""] : []),
-		...(goal.checkpointScope ? [`- 本批已选任务 ${goal.checkpointScope.selectedTaskIds.length}：${goal.checkpointScope.selectedTaskIds.slice(0, 20).join("、") || "无"}${goal.checkpointScope.selectedTaskIds.length > 20 ? "（其余见 manifest.json）" : ""}；未选任务 ${goal.checkpointScope.omittedTaskIds.length}：${goal.checkpointScope.omittedTaskIds.slice(0, 20).join("、") || "无"}${goal.checkpointScope.omittedTaskIds.length > 20 ? "（其余见 manifest.json）" : ""}。未选任务的评审证据未交接，完整任务范围见 manifest.json。`, ""] : []),
-		...(goal.workflowMethod ? [`- 实际装载的 M07 方法：${goal.workflowMethod.versionId}（${goal.workflowMethod.artifact.slot}）；仅作为研究方法，不改变原成功要求或 M04 科学判断。`, ""] : []),
-		...(goal.m04BaselineFailures?.length ? ["## Retained failed M04 feedback", "", failedM04Feedback(goal.m04BaselineFailures), ""] : []),
-		"## 原成功要求", "", ...goal.successCriteria.map((x) => `- ${x}`), "", "## 任务与实际证据", "",
-	];
-	if (goal.workflowMethod?.artifact.slot === "evidence-handoff") lines.push("## 冻结的证据交接方法", "", "以下方法正文曾作为 M07 任务指导；这里保留其版本与内容以供 M04 核对，实际证据与未执行项仍以本包记录为准。", "", goal.workflowMethod.artifact.body, "");
-	for (const task of goal.tasks) {
-		lines.push(`### ${task.taskId} ${task.objective}`, "", `- 状态：${task.status}`, `- 模式：${task.mode}`, `- 会话报告：${task.reportPath ? displayPath(task.reportPath) : "未产生"}`, `- 实际读取：${task.readCoverage.join("、") || "无可记录读取"}`);
-		if (task.context) lines.push(`- 竞争分支来源：${task.context.parentRunId}/${task.context.parentTaskId}@${task.context.checkpointId}；继承历史不是知识采用，也不代表旧路径在当前分支仍可操作。`);
-		for (const artifact of task.review?.artifacts ?? []) lines.push(`- 产物：${displayPath(artifact.path)}（${artifact.mediaType === "text" ? "文本，纳入下方实际内容" : "二进制，未读取内容"}）`);
-		for (const check of task.review?.checks ?? []) lines.push(`- 检查 ${check.result}：${check.criterion}；证据 ${check.evidence.map(displayPath).join("、") || "无"}`);
-		for (const failure of task.review?.failures ?? []) lines.push(`- 失败：${failure}`);
-		for (const item of task.review?.unexecuted ?? []) lines.push(`- 未执行：${item}`);
-		for (const limitation of task.review?.limitations ?? []) lines.push(`- 限制：${limitation}`);
-		if (task.review?.independentCheck) lines.push(`- 独立检查：${task.review.independentCheck.taskId}；处置：${task.review.independentCheck.disposition}`);
-		if (task.executionFailure) lines.push(`- 执行失败：${task.executionFailure}`);
-		if (task.toolLog.length) lines.push(`- 工具日志：${JSON.stringify(task.toolLog)}`);
-		lines.push("");
-	}
-	if (goal.branchSelections?.length) lines.push("## 竞争分支比较与选择", "", ...goal.branchSelections.flatMap((selection) => [
-		`- 来源 ${selection.parentTaskId}；候选 ${selection.candidates.map((candidate) => `${candidate.taskId}:${candidate.status}[${candidate.checks.map((check) => check.result).join(",") || "no-review"}]`).join("、")}；选择 ${selection.selectedTaskId ?? "无胜者"}。`,
-		`- 理由：${selection.rationale}`, "- 以上只是 M07 候选筛选与已记录 checks；M04 仍须实际读取原证据后自行判断经验是否采用。", "",
-	]));
-	lines.push("## 实际材料清单与预算内内容", "", "清单中的‘已显示’只表示反馈包内联范围；未显示部分没有被本反馈包或后续 M04 自动读取。", "");
-	const materialPaths = new Map<string, { role: ProjectionMaterialV1["role"]; optional: boolean }>();
-	const addMaterial = (file: string, role: ProjectionMaterialV1["role"], optional = false) => { if (!materialPaths.has(file)) materialPaths.set(file, { role, optional }); };
-	for (const task of goal.tasks) {
-		if (task.review) addMaterial(task.review.frozenReportPath, "task-report");
-		else if (task.reportPath) addMaterial(task.reportPath, "task-report", true);
-		for (const artifact of task.review?.artifacts ?? []) addMaterial(artifact.path, "artifact");
-		for (const check of task.review?.checks ?? []) for (const evidence of check.evidence) addMaterial(evidence, "check-evidence");
-		if (task.review?.independentCheck) addMaterial(task.review.independentCheck.report, "independent-check");
-	}
-	let aggregateInline = 0;
-	for (const [materialPath, { role, optional }] of materialPaths) {
-		const relative = path.relative(checkpointRoot ?? ctx.ws.runDir("M07", goal.runId), materialPath);
-		const type = mediaType(materialPath);
-		const materialRecord = projectionMaterial(ctx, event, event.materials.length, role, materialPath, type);
-		event.materials.push(materialRecord);
-		if (optional && !existsSync(materialPath)) {
-			materialRecord.availability = "missing";
-			materialRecord.decision = "unavailable";
-			materialRecord.reason = "unavailable";
-			lines.push(`### ${relative}`, "", `- ${relative}；未复核会话报告已缺失，内容未内联；本次投影不可重放。`, "");
-			continue;
-		}
-		if (type === "binary") { await captureMaterial(ctx, event, materialRecord, materialPath, 0); lines.push(`### ${relative}`, "", `- ${relative}；${materialRecord.utf8Bytes} bytes；二进制；已显示 0 bytes；内容未读。`, ""); continue; }
-		const material = (await captureMaterial(ctx, event, materialRecord, materialPath, Math.min(policy.maxInlineFileChars, policy.maxAggregateInlineChars - aggregateInline)))!;
-		material.path = relative;
-		materialRecord.aggregateBefore = aggregateInline;
-		const projection = projectInline(policy, material.chars, aggregateInline);
-		const canInline = projection.inline;
-		materialRecord.aggregateAfter = projection.nextAggregateChars;
-		materialRecord.decision = canInline ? "inline" : "deferred";
-		materialRecord.reason = projection.reason;
-		lines.push(`### ${relative}`, "", omissionLine(material, canInline ? material.chars : 0), "");
-		if (canInline) { lines.push(material.text!, ""); aggregateInline = projection.nextAggregateChars; }
-		else if (policy.overflowMode === "manifest-and-fail") { event.projectionStatus = "budget-failed"; throw new HarnessError("context.budget", `M07 反馈证据 ${relative} 超出内联预算；冻结原文仍保留，策略要求拒绝生成延后读取包`); }
-	}
-	lines.push("## 原目标验收", "", ...(goal.goalChecks?.map((c) => `- ${c.result}：${c.criterion}；证据 ${c.evidence.map(displayPath).join("、") || "无"}`) ?? ["- 未验收"]), "", "## 用户决定事项", "", ...(goal.decisions.length ? goal.decisions.map((d) => `- ${d.status}：${d.question}${d.decision ? `；决定：${d.decision}` : ""}`) : ["- 无"]), "", "## 总结与限制", "", goal.finishSummary ?? "尚未结束", ...goal.limitations.map((x) => `- ${x}`));
-	const feedback = lines.join("\n");
-	if (feedback.length > policy.maxFeedbackChars) { event.projectionStatus = "budget-failed"; throw new HarnessError("context.budget", `M07 反馈包的控制事实与预算内清单共 ${feedback.length} 字符，超过上限 ${policy.maxFeedbackChars}；未静默截断`); }
-	const target = path.join(checkpointRoot ?? ctx.ws.runDir("M07", goal.runId), "m04-feedback.md");
-	await writeFileAtomic(target, feedback);
-	event.projectionStatus = "materialized";
-	event.outputPath = path.relative(ctx.ws.runDir("M07", goal.runId), target);
-	return target;
 	} finally { await writeProjectionEvent(ctx.ws, event); }
 }
 
@@ -1054,7 +869,7 @@ async function freezeCheckpoint(ctx: StageContext, goal: CurrentGoal, limits: Pr
 	let feedbackPath: string;
 	let feedbackStatus: M07CheckpointRecord["feedbackStatus"];
 	try {
-		feedbackPath = await writeFeedback(ctx, frozen, limits, rootDir);
+		feedbackPath = await writeFeedback(ctx, frozen, frozenPolicy(frozen), limits, rootDir);
 		feedbackStatus = "complete";
 	} catch (error) {
 		if (!isFeedbackControlOverflow(error)) throw error;
@@ -1621,7 +1436,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			goal.lifecycle = "finished"; goal.outcome = input.outcome; goal.finishSummary = nonempty(input.summary, "summary"); goal.returnPath = input.returnPath; goal.limitations.push(...(input.limitations ?? []));
 			if (invalidBaseline) goal.limitations.push(`原正式基线已失效：${invalidBaseline}；本次仅如实记录 ${input.outcome} 并回流，不表示原目标完成。`);
 			try {
-				goal.feedbackPath = await writeFeedback(ctx, goal, snapshotLimits);
+				goal.feedbackPath = await writeFeedback(ctx, goal, frozenPolicy(goal), snapshotLimits);
 				goal.feedbackStatus = "complete";
 				delete goal.feedbackError;
 			} catch (error) {
@@ -1677,7 +1492,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 					goal.feedbackStatus = "control-facts-only";
 					goal.feedbackError = { code: "m07.policy-legacy", summary: "旧目标没有冻结策略；仅归档控制事实和证据位置。" };
 				} else {
-					goal.feedbackPath = await writeFeedback(ctx, goal, snapshotLimits);
+					goal.feedbackPath = await writeFeedback(ctx, goal, frozenPolicy(goal), snapshotLimits);
 					goal.feedbackStatus = "complete";
 					delete goal.feedbackError;
 				}
