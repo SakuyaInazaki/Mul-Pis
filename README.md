@@ -6,6 +6,8 @@
 
 本轮修复覆盖连续目标的执行—复核—返修循环、未知外部操作对账与恢复、知识状态和替换关系展示、M04 证据读取，以及后续新会话的 200k 自动压缩。源码、针对性回归和通用变更记录随本分支发布；具体实验配置与原始运行材料保留在实验工作区。
 
+方法改进的基础修复进一步固定搜索前的评测输入，支持真实默认工作流作为比较基线，并修正方法跨知识纪元、委派和导入时的经验适用性检查。知识继续在原工作区持久积累；独立评测使用冻结副本，实时撤回仍生效。对应记录见[输入冻结](.agent/notes/2026-10-13-workflow-research-input-freeze.md)、[默认基线](.agent/notes/2026-10-13-workflow-builtin-baseline.md)和[方法依赖](.agent/notes/2026-10-13-knowledge-epoch-workflow-experience-scope.md)。
+
 建议按以下顺序审阅：
 
 1. [本轮修复与验证记录](.agent/notes/2026-10-13-workflow-repair-publication.md)：改动原因、代码位置、验证结果与当前能力范围。

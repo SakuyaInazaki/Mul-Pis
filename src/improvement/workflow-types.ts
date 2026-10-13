@@ -21,10 +21,12 @@ export interface WorkflowCaseSetV1 { version: 1; split: "development" | "admissi
 export interface WorkflowEvidenceHandoffPlanV1 {
 	version: 1;
 	kind: "m07-evidence-handoff/v1";
+	/** Comparison arm only; omission preserves the historical injected-H baseline. */
+	baseline?: "active-h" | "builtin";
 	/** A completed real M07 checkpoint and the M04 run that processed it. */
 	developmentSource: { m07RunId: string; checkpointId: string; m04RunId: string };
 	developmentCaseSetPath: string;
-	/** Omission leaves an inspectable research-only run. G is opened only after selection. */
+	/** Omission leaves an inspectable research-only run. The controller freezes G before search; model-visible evaluation starts only after selection. */
 	admissionCaseSetPath?: string;
 	/** Must not exist and must be disjoint from the live workspace. Never cleaned automatically. */
 	experimentRoot: string;
@@ -50,6 +52,8 @@ export interface WorkflowArmReceiptV1 {
 	caseId: string;
 	arm: "baseline" | "candidate";
 	methodVersionId: string;
+	/** The actual M07 method binding; builtin means no workflow H was injected. */
+	methodBinding?: { kind: "builtin" } | { kind: "injected-h"; versionId: string };
 	workspaceRoot: string;
 	m07RunId?: string;
 	m04RunId?: string;
@@ -71,9 +75,13 @@ export interface WorkflowRunV1 {
 	startedAt: string;
 	finishedAt?: string;
 	status: "running" | "research-only" | "rejected" | "inconclusive" | "promoted" | "failed";
-	outcome?: "completed-no-candidate" | "candidate-rejected" | "promoted" | "search-incomplete" | "provider-failed";
+	outcome?: "completed-no-candidate" | "candidate-supported" | "candidate-rejected" | "promoted" | "search-incomplete" | "provider-failed";
 	baselineBundleId: string;
+	/** The actual comparison arm: an H version for active-h, or the builtin-default sentinel. */
 	baselineExecutorVersionId: string;
+	/** Omission on old runs means active-h. */
+	comparisonBaseline?: "active-h" | "builtin";
+	proposalSeedHVersionId?: string;
 	improverVersionId: string;
 	knowledgeSnapshot?: string;
 	developmentSource: WorkflowEvidenceHandoffPlanV1["developmentSource"];
@@ -87,6 +95,8 @@ export interface WorkflowRunV1 {
 	promotedMethodVersionId?: string;
 	selectionReceiptPath?: string;
 	protectedOpenedAt?: string;
+	protectedFrozenAt?: string;
+	sourceWorkspace?: string;
 	stopReason?: string;
 	budgetAtEnd?: unknown;
 	developmentBudgetAtSelection?: unknown;
@@ -104,8 +114,9 @@ function budget(value: unknown): value is BudgetLimits {
 export function validateWorkflowPlan(input: unknown): WorkflowEvidenceHandoffPlanV1 {
 	if (!input || typeof input !== "object" || Array.isArray(input)) throw new HarnessError("improvement.workflow-plan", "workflow plan must be an object");
 	const p = input as Record<string, unknown>;
-	const keys = ["version", "kind", "developmentSource", "developmentCaseSetPath", "admissionCaseSetPath", "experimentRoot", "maxDecisions", "maxCandidates", "maxInspectActions", "maxReadbackChars", "maxFeedbackItems", "perPromptTimeoutMs", "budget", "admissionRepetitions", "metaEpisodeRunIds", "experienceRefs", "experienceMaxRecords", "experienceMaxChars"];
+	const keys = ["version", "kind", "baseline", "developmentSource", "developmentCaseSetPath", "admissionCaseSetPath", "experimentRoot", "maxDecisions", "maxCandidates", "maxInspectActions", "maxReadbackChars", "maxFeedbackItems", "perPromptTimeoutMs", "budget", "admissionRepetitions", "metaEpisodeRunIds", "experienceRefs", "experienceMaxRecords", "experienceMaxChars"];
 	if (Object.keys(p).some((key) => !keys.includes(key)) || p.version !== 1 || p.kind !== "m07-evidence-handoff/v1") throw new HarnessError("improvement.workflow-plan", "unsupported workflow plan");
+	if (p.baseline !== undefined && p.baseline !== "active-h" && p.baseline !== "builtin") throw new HarnessError("improvement.workflow-plan", "baseline must be active-h or builtin");
 	const src = p.developmentSource as Record<string, unknown> | undefined;
 	if (!src || Object.keys(src).sort().join(",") !== "checkpointId,m04RunId,m07RunId" || !safeId(src.m07RunId) || !safeId(src.checkpointId) || !safeId(src.m04RunId)) throw new HarnessError("improvement.workflow-plan", "development source must pin one M07 checkpoint and its M04 run");
 	for (const key of ["developmentCaseSetPath", "experimentRoot"] as const) if (typeof p[key] !== "string" || !p[key].trim() || p[key].length > 500) throw new HarnessError("improvement.workflow-plan", `${key} is required`);

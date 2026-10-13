@@ -16,7 +16,7 @@ import { Workspace } from "../src/workspace.ts";
 
 const usage = { input: 100, output: 20, cacheRead: 0, cacheWrite: 0, totalTokens: 120, cost: 0.001 };
 const goal = { goal: "核对一个固定材料的证据交接", problemRelation: "直接关联", constraints: ["原问题不变"], successCriteria: ["保留原始证据与未执行项"], plan: "单项证据交接", exploratory: false };
-const task = { objective: "交接固定证据", inputs: [], expectedOutputs: [], checks: ["报告包含核查结果"], mode: "reason" as const };
+const task = { objective: "交接固定证据", inputs: [] as string[], expectedOutputs: [], checks: ["报告包含核查结果"], mode: "reason" as const };
 const caseOf = (split: "development" | "admission", id: string, marker: string) => ({ version: 1, split, cases: [{ id, goal: { ...goal, plan: `${goal.plan} ${id}` }, task: { ...task, objective: `${task.objective} ${id}` }, checks: [{ criterion: task.checks[0], contains: [marker], forbids: ["伪造证据"] }] }] });
 const limits = { maxProviderCalls: 40, maxInputTokens: 2_000_000, maxSdkEstimatedCost: 10, maxProbeCalls: 0, maxCpuMillis: 100_000, maxWallMillis: 120_000 };
 
@@ -24,6 +24,106 @@ test("workflow plan accepts omitted monetary references", () => {
 	const p = { version: 1, kind: "m07-evidence-handoff/v1", developmentSource: { m07RunId: "m07", checkpointId: "C001", m04RunId: "m04" }, developmentCaseSetPath: "development.json", experimentRoot: "arms", maxFeedbackItems: 1, admissionRepetitions: 2 };
 	assert.deepEqual(validateWorkflowPlan(p).budget, {});
 	assert.throws(() => validateWorkflowPlan({ ...p, budget: { maxSdkEstimatedCost: Number.POSITIVE_INFINITY } }), /budget/);
+	assert.equal(validateWorkflowPlan({ ...p, baseline: "builtin" }).baseline, "builtin");
+	assert.throws(() => validateWorkflowPlan({ ...p, baseline: "unknown" }), /baseline/);
+});
+
+test("builtin comparison runs a real M07/M04 arm without injecting its proposal-seed H", async (t) => {
+	const seedBody = "UNIQUE_PROPOSAL_SEED_H_BODY_NEVER_IN_BUILTIN_ARM";
+	const candidateBody = "CANDIDATE_H_FOR_EVIDENCE_HANDOFF";
+	let builtinMessages = 0, candidateMessages = 0;
+	const f = await fixture(t, (ctx) => {
+		if (ctx.spec.role === "improver") {
+			const view = JSON.parse(ctx.message.slice(ctx.message.indexOf("\n") + 1));
+			assert.equal(view.current.comparisonBaseline, "builtin");
+			assert.equal(view.current.executorVersionId, "builtin-default");
+			assert.equal(view.current.proposalSeedHVersionId, f.bundle.executorVersionId);
+			assert.equal(view.current.baselineWorkflowHInjected, false);
+			assert.equal(view.methods.executor.role, "proposal-seed-only");
+			const index = Number(ctx.spec.label.split("-").at(-1));
+			if (index === 0) return JSON.stringify({ kind: "propose", target: "executor", body: candidateBody, hypothesis: { claim: "交接字段可核对", predictedObservation: "检查通过", falsifier: "检查失败", applicability: ["M07"], motivatingEvidenceIds: [view.developmentSource.id] } });
+			if (index === 1) return JSON.stringify({ kind: "evaluate-development", candidateId: view.methods.candidates[0].versionId });
+			return JSON.stringify({ kind: "stop", reason: "选择开发候选", selectedCandidateId: view.methods.candidates[0].versionId });
+		}
+		if (ctx.spec.role === "research") return "已处理冻结证据报告。";
+		if (ctx.spec.persistDir.includes(`${path.sep}arms${path.sep}`) && ctx.spec.label.startsWith("M07-") && ctx.spec.role === "execution") {
+			assert.equal(ctx.message.includes(seedBody), false);
+			if (ctx.message.includes(candidateBody)) candidateMessages++;
+			else { builtinMessages++; assert.equal(ctx.message.includes("冻结的 M07 方法："), false); }
+		}
+		return ctx.message.includes(candidateBody) ? ctx.message.includes("holdout-b") ? "保护证据完整" : "开发证据完整" : "原始报告";
+	}, false, false, seedBody);
+	const improvement = path.join(f.ws.agentDir, "improvement");
+	const policy = { version: 1, maxPromptChars: 180_000, maxInlineFileChars: 30_000, maxAggregateInlineChars: 120_000, maxFeedbackChars: 140_000, overflowMode: "manifest-and-defer" };
+	await mkdir(path.join(improvement, "versions", "test-policy"), { recursive: true });
+	await writeFile(path.join(improvement, "versions", "test-policy", "policy.json"), JSON.stringify(policy));
+	await writeFile(path.join(improvement, "active.json"), JSON.stringify({ version: 1, versionId: "test-policy", promotedAt: new Date().toISOString(), runId: "test-policy-run" }));
+	const currentK = (await f.knowledge.current())?.id;
+	const formal = await f.ws.startRun("M04", [{ label: "原问题", path: f.ws.problemFile }], currentK);
+	await f.ws.finishRun(formal, "completed");
+	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).runWorkflow({ ...f.plan, baseline: "builtin" });
+	assert.equal(run.status, "promoted", run.stopReason ?? "");
+	assert.equal(run.comparisonBaseline, "builtin");
+	assert.equal(run.baselineExecutorVersionId, "builtin-default");
+	assert.equal(run.proposalSeedHVersionId, f.bundle.executorVersionId);
+	assert.ok(builtinMessages >= 3 && candidateMessages >= 3);
+	for (const arm of [...run.developmentArms, ...run.protectedArms]) {
+		const stored = await readFile(path.join(new Workspace(arm.workspaceRoot).runDir("M07", arm.m07RunId!), "goal.json"), "utf8");
+		const savedGoal = JSON.parse(stored);
+		assert.deepEqual(savedGoal.budgetPolicy, policy);
+		assert.equal(savedGoal.budgetPolicyVersionId, "test-policy");
+		if (arm.arm === "baseline") {
+			assert.deepEqual(arm.methodBinding, { kind: "builtin" });
+			assert.equal(arm.methodVersionId, "builtin-default");
+			assert.equal(savedGoal.workflowMethod, undefined);
+		} else {
+			assert.deepEqual(arm.methodBinding, { kind: "injected-h", versionId: arm.methodVersionId });
+			assert.equal(savedGoal.workflowMethod.versionId, arm.methodVersionId);
+		}
+	}
+	const selection = JSON.parse(await readFile(run.selectionReceiptPath!, "utf8"));
+	assert.equal(selection.comparisonBaseline, "builtin");
+	assert.equal(selection.proposalSeedHVersionId, f.bundle.executorVersionId);
+	assert.equal(selection.H0, undefined);
+	const episode = JSON.parse(await readFile(path.join(f.gen.root, "workflow-runs", run.runId, "meta-episode.development.json"), "utf8"));
+	assert.equal(episode.current.executorVersionId, "builtin-default");
+	assert.equal(episode.current.proposalSeedHVersionId, f.bundle.executorVersionId);
+	assert.deepEqual(episode.workflowDevelopmentArms.find((arm: { arm: string }) => arm.arm === "baseline").methodBinding, { kind: "builtin" });
+});
+
+test("builtin comparison accepts ordinary prompt text matching a short proposal-seed H body", async (t) => {
+	const candidateBody = "列出可核查的开发证据。";
+	const f = await fixture(t, (ctx) => {
+		if (ctx.spec.role === "improver") {
+			const view = JSON.parse(ctx.message.slice(ctx.message.indexOf("\n") + 1));
+			const index = Number(ctx.spec.label.split("-").at(-1));
+			if (index === 0) return JSON.stringify({ kind: "propose", target: "executor", body: candidateBody, hypothesis: { claim: "证据可核查", predictedObservation: "开发检查通过", falsifier: "开发检查失败", applicability: ["M07"], motivatingEvidenceIds: [view.developmentSource.id] } });
+			if (index === 1) return JSON.stringify({ kind: "evaluate-development", candidateId: view.methods.candidates[0].versionId });
+			return JSON.stringify({ kind: "stop", reason: "选择开发候选", selectedCandidateId: view.methods.candidates[0].versionId });
+		}
+		if (ctx.spec.role === "research") return "已处理冻结证据。";
+		return ctx.message.includes(candidateBody) ? "开发证据完整" : "原始报告";
+	}, false, false, "M07");
+	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).runWorkflow({ ...f.plan, baseline: "builtin", admissionCaseSetPath: undefined });
+	assert.equal(run.status, "research-only", run.stopReason ?? "");
+	assert.equal(run.developmentArms.length, 2);
+	assert.ok(run.developmentArms.every((arm) => arm.status === "complete"), JSON.stringify(run.developmentArms.map((arm) => arm.reason)));
+});
+
+for (const protectedPolicyFile of [".agent/improvement/active.json", ".agent/improvement/versions/test-policy/policy.json"]) test(`protected G input cannot overlap copied ${protectedPolicyFile}`, async (t) => {
+	const f = await fixture(t);
+	const improvement = path.join(f.ws.agentDir, "improvement");
+	await mkdir(path.join(improvement, "versions", "test-policy"), { recursive: true });
+	await writeFile(path.join(improvement, "versions", "test-policy", "policy.json"), JSON.stringify({ version: 1, maxPromptChars: 180_000, maxInlineFileChars: 30_000, maxAggregateInlineChars: 120_000, maxFeedbackChars: 140_000, overflowMode: "manifest-and-defer" }));
+	await writeFile(path.join(improvement, "active.json"), JSON.stringify({ version: 1, versionId: "test-policy", promotedAt: new Date().toISOString(), runId: "test-policy-run" }));
+	const admission = caseOf("admission", "holdout-b", "保护证据完整");
+	admission.cases[0]!.task.inputs = [protectedPolicyFile];
+	await writeFile(path.join(f.root, "admission.json"), JSON.stringify(admission));
+	const before = f.runner.created.length;
+	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).runWorkflow({ ...f.plan, baseline: "builtin" });
+	assert.equal(run.status, "failed");
+	assert.match(run.stopReason ?? "", /protected input.*overlaps/);
+	assert.equal(f.runner.created.length, before);
 });
 
 async function fixture(t: import("node:test").TestContext, responder?: (ctx: FakeReplyContext) => string | Promise<string>, viaCli = false, withExperience = false, executorBody = "列出原始证据、限制和未执行项。") {
@@ -214,7 +314,7 @@ test("workflow I experience plan requires exact pinned refs and positive bounds"
 	assert.throws(() => validateWorkflowPlan({ ...f.plan, experienceRefs: [ref, ref], experienceMaxRecords: 2, experienceMaxChars: 2_000 }), /experienceRefs/);
 });
 
-test("workflow I with no experience refs stops when local K advances between decisions", async (t) => {
+test("workflow research keeps its frozen K when unrelated live knowledge advances", async (t) => {
 	let calls = 0;
 	const f = await fixture(t, async (ctx) => {
 		if (ctx.spec.role !== "improver") return ctx.spec.role === "research" ? "处理冻结证据" : "原始报告";
@@ -226,15 +326,16 @@ test("workflow I with no experience refs stops when local K advances between dec
 		}
 		const view = JSON.parse(ctx.message.slice(ctx.message.indexOf("\n") + 1));
 		assert.deepEqual(view.experience, { markdown: "", refs: [] });
-		return JSON.stringify({ kind: "inspect", object: "method", id: view.current.executorVersionId, start: 0, maxChars: 20 });
+		return JSON.stringify(calls === 1 ? { kind: "inspect", object: "method", id: view.current.executorVersionId, start: 0, maxChars: 20 } : { kind: "stop", reason: "frozen research source inspected" });
 	});
 	const formal = await f.ws.startRun("M04", [{ label: "原问题", path: f.ws.problemFile }], (await f.knowledge.current())?.id);
 	await f.ws.finishRun(formal, "completed");
 	const before = (await f.gen.active())!.bundle.bundleId;
 	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).runWorkflow({ ...f.plan, maxDecisions: 2 });
-	assert.equal(run.status, "inconclusive", run.stopReason ?? "");
-	assert.match(run.stopReason ?? "", /knowledge epoch|live limits/);
-	assert.equal(calls, 1);
+	assert.equal(run.status, "research-only", run.stopReason ?? "");
+	assert.equal(calls, 2);
+	assert.equal((await createFileKnowledgeStore(path.join(f.plan.experimentRoot, "template", ".agent", "knowledge")).current())?.id, f.bundle.knowledgeSnapshot);
+	assert.notEqual((await f.knowledge.current())?.id, f.bundle.knowledgeSnapshot);
 	assert.equal((await f.gen.active())!.bundle.bundleId, before);
 });
 
@@ -383,7 +484,152 @@ test("later workflow I can inspect a same-workspace development MetaEpisode with
 	const first = await service.runWorkflow({ ...f.plan, maxDecisions: 1 });
 	assert.equal(first.outcome, "completed-no-candidate");
 	priorRunId = first.runId;
+	// A pre-baseline-selector episode has no comparison or proposal-seed fields.
+	const firstDir = path.join(f.gen.root, "workflow-runs", first.runId);
+	const oldRun = JSON.parse(await readFile(path.join(firstDir, "run.json"), "utf8"));
+	delete oldRun.comparisonBaseline;
+	delete oldRun.proposalSeedHVersionId;
+	await writeFile(path.join(firstDir, "run.json"), JSON.stringify(oldRun));
+	const oldEpisode = JSON.parse(await readFile(path.join(firstDir, "meta-episode.development.json"), "utf8"));
+	delete oldEpisode.current.comparisonBaseline;
+	delete oldEpisode.current.proposalSeedHVersionId;
+	delete oldEpisode.current.baselineWorkflowHInjected;
+	await writeFile(path.join(firstDir, "meta-episode.development.json"), JSON.stringify(oldEpisode));
 	const second = await service.runWorkflow({ ...f.plan, maxDecisions: 2, experimentRoot: path.join(f.parent, "arms-second"), metaEpisodeRunIds: [first.runId] });
 	assert.equal(second.outcome, "completed-no-candidate", second.stopReason ?? "");
 	assert.equal(second.protectedArms.length, 0);
+});
+
+
+test("protected cases and input bytes are fixed before I and hidden during development", async (t) => {
+	let selected = false;
+	const f = await fixture(t, async (ctx) => {
+		if (ctx.spec.role === "improver") {
+			const view = JSON.parse(ctx.message.slice(ctx.message.indexOf("\n") + 1));
+			assert.equal(ctx.message.includes("ORIGINAL_HOLDOUT"), false);
+			assert.equal(ctx.message.includes("保护证据完整"), false);
+			await assert.rejects(readFile(path.join(f.plan.experimentRoot, "template", "holdout.txt")));
+			const index = Number(ctx.spec.label.split("-").at(-1));
+			if (index === 0) {
+				await writeFile(path.join(f.root, "admission.json"), JSON.stringify(caseOf("admission", "changed-case", "CHANGED_CHECK")));
+				await writeFile(path.join(f.root, "holdout.txt"), "CHANGED_INPUT");
+				return JSON.stringify({ kind: "propose", target: "executor", body: "逐项列出冻结证据来源。", hypothesis: { claim: "可复查", predictedObservation: "检查通过", falsifier: "证据缺失", applicability: ["M07"], motivatingEvidenceIds: [view.developmentSource.id] } });
+			}
+			if (index === 1) return JSON.stringify({ kind: "evaluate-development", candidateId: view.methods.candidates[0].versionId });
+			selected = true;
+			return JSON.stringify({ kind: "stop", reason: "选择候选", selectedCandidateId: view.methods.candidates[0].versionId });
+		}
+		if (ctx.spec.role === "research") return "处理冻结报告";
+		if (!ctx.message.includes("逐项列出冻结证据来源")) return "原始报告";
+		if (ctx.message.includes("holdout-b")) {
+			assert.equal(selected, true);
+			assert.match(ctx.message, /ORIGINAL_HOLDOUT/);
+			assert.equal(ctx.message.includes("CHANGED_INPUT"), false);
+			return "保护证据完整";
+		}
+		return "开发证据完整";
+	});
+	const admission = caseOf("admission", "holdout-b", "保护证据完整");
+	admission.cases[0]!.task.inputs = ["holdout.txt"];
+	await writeFile(path.join(f.root, "admission.json"), JSON.stringify(admission));
+	await writeFile(path.join(f.root, "holdout.txt"), "ORIGINAL_HOLDOUT");
+	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).runWorkflow(f.plan);
+	assert.equal(run.status, "promoted", run.stopReason ?? "");
+	assert.ok(run.protectedArms.every((arm) => arm.caseId === "holdout-b"));
+});
+
+test("protected input colliding with an arm-generated file is never silently replaced", async (t) => {
+	const candidateBody = "逐项核对证据来源。";
+	const f = await fixture(t, (ctx) => {
+		if (ctx.spec.role === "improver") {
+			const view = JSON.parse(ctx.message.slice(ctx.message.indexOf("\n") + 1));
+			const index = Number(ctx.spec.label.split("-").at(-1));
+			if (index === 0) return JSON.stringify({ kind: "propose", target: "executor", body: candidateBody, hypothesis: { claim: "来源可核查", predictedObservation: "开发检查通过", falsifier: "来源缺失", applicability: ["M07"], motivatingEvidenceIds: [view.developmentSource.id] } });
+			if (index === 1) return JSON.stringify({ kind: "evaluate-development", candidateId: view.methods.candidates[0].versionId });
+			return JSON.stringify({ kind: "stop", reason: "选择开发候选", selectedCandidateId: view.methods.candidates[0].versionId });
+		}
+		if (ctx.spec.role === "research") return "处理冻结报告";
+		return ctx.message.includes(candidateBody) ? ctx.message.includes("holdout-b") ? "保护证据完整" : "开发证据完整" : "原始报告";
+	});
+	const admission = caseOf("admission", "holdout-b", "保护证据完整");
+	admission.cases[0]!.task.inputs = [path.relative(f.root, path.join(f.gen.root, "active.json"))];
+	await writeFile(path.join(f.root, "admission.json"), JSON.stringify(admission));
+	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).runWorkflow(f.plan);
+	assert.equal(run.status, "inconclusive", run.stopReason ?? "");
+	assert.equal(run.protectedArms[0]?.status, "inconclusive");
+	assert.match(run.protectedArms[0]?.reason ?? "", /frozen input.*collides/);
+	assert.equal(run.protectedArms[0]?.m07RunId, undefined, "do not execute with substituted protected bytes");
+});
+
+test("protected inputs cannot also be development inputs", async (t) => {
+	const f = await fixture(t);
+	const development = caseOf("development", "dev-a", "开发证据完整");
+	const admission = caseOf("admission", "holdout-b", "保护证据完整");
+	development.cases[0]!.task.inputs = ["shared.txt"];
+	admission.cases[0]!.task.inputs = ["shared.txt"];
+	await writeFile(path.join(f.root, "shared.txt"), "protected material");
+	await writeFile(path.join(f.root, "development.json"), JSON.stringify(development));
+	await writeFile(path.join(f.root, "admission.json"), JSON.stringify(admission));
+	const before = f.runner.created.length;
+	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).runWorkflow(f.plan);
+	assert.equal(run.status, "failed");
+	assert.match(run.stopReason!, /protected.*overlap/);
+	assert.equal(f.runner.created.length, before);
+});
+
+
+for (const change of ["growth", "withdrawal"] as const) test(`protected evaluation preserves live knowledge ${change}`, async (t) => {
+	let changed = false;
+	let protectedCalls = 0;
+	const f = await fixture(t, async (ctx) => {
+		if (ctx.spec.role === "improver") {
+			const view = JSON.parse(ctx.message.slice(ctx.message.indexOf("\n") + 1));
+			const index = Number(ctx.spec.label.split("-").at(-1));
+			if (index === 0) return JSON.stringify({ kind: "propose", target: "executor", body: "逐项列出冻结证据来源。", hypothesis: { claim: "可复查", predictedObservation: "检查通过", falsifier: "证据缺失", applicability: ["M07"], motivatingEvidenceIds: [view.developmentSource.id] } });
+			if (index === 1) return JSON.stringify({ kind: "evaluate-development", candidateId: view.methods.candidates[0].versionId });
+			return JSON.stringify({ kind: "stop", reason: "选择候选", selectedCandidateId: view.methods.candidates[0].versionId });
+		}
+		if (ctx.spec.role === "research") return "处理冻结报告";
+		if (ctx.message.includes("holdout-b")) {
+			protectedCalls++;
+			if (!changed) {
+				changed = true;
+				const proposal = await f.knowledge.submitProposal({ stage: "M04", runId: "live-update", ops: change === "growth"
+					? [{ op: "create", type: "K", title: "无关新知识", body: "继续积累", usageDecision: "candidate" }]
+					: [{ op: "limit", target: "K001", kind: "withdrawn", reason: "离线撤回验证", authority: "test-review" }] });
+				assert.equal(proposal.structurallyValid, true);
+				await f.knowledge.merge(proposal.proposalId);
+			}
+		}
+		if (!ctx.message.includes("逐项列出冻结证据来源")) return "原始报告";
+		return ctx.message.includes("holdout-b") ? "保护证据完整" : "开发证据完整";
+	}, false, true);
+	const before = (await f.gen.active())!.bundle.bundleId;
+	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).runWorkflow({ ...f.plan, experienceRefs: [f.experienceRef!], experienceMaxRecords: 1, experienceMaxChars: 2_000 });
+	assert.equal((await f.gen.active())!.bundle.bundleId, before);
+	if (change === "growth") {
+		assert.equal(run.status, "research-only", run.stopReason ?? "");
+		assert.equal(run.outcome, "candidate-supported");
+		assert.equal(run.protectedArms.length, 4);
+		assert.ok(run.protectedArms.every((arm) => arm.status === "complete"));
+	} else {
+		assert.equal(run.status, "inconclusive", run.stopReason ?? "");
+		assert.equal(protectedCalls, 1, "withdrawal blocks the following M04 and every later arm");
+		assert.equal(run.protectedArms[0]?.m04RunId, undefined);
+		assert.match(run.protectedArms[0]?.reason ?? "", /live limits|experience/);
+	}
+});
+
+
+test("a source knowledge transaction cannot be copied into a runnable experiment", async (t) => {
+	const f = await fixture(t, (ctx) => ctx.spec.role === "improver" ? JSON.stringify({ kind: "stop", reason: "source inspected" }) : "原始材料");
+	const proposal = await f.knowledge.submitProposal({ stage: "M04", runId: "interrupted-source-merge", ops: [{ op: "create", type: "K", title: "未发布知识", body: "事务尚未提交", usageDecision: "candidate" }] });
+	const writer = createFileKnowledgeStore(f.ws.knowledgeDir, { afterPhase: async (phase) => { if (phase === "prepared") throw new Error("simulated interruption before CURRENT publication"); } });
+	await assert.rejects(writer.merge(proposal.proposalId), /simulated interruption/);
+	const before = f.runner.created.length;
+	const run = await new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner }).runWorkflow(f.plan);
+	assert.equal(run.status, "inconclusive", run.stopReason ?? "");
+	assert.match(run.stopReason!, /unfinished knowledge merge/);
+	assert.equal(f.runner.created.length, before, "no model starts with a copied pending transaction");
+	assert.equal((await f.knowledge.current())?.id, f.bundle.knowledgeSnapshot);
 });

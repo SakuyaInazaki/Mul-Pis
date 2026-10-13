@@ -15,7 +15,7 @@ import type { SessionRunner } from "../runner/types.ts";
 import { HarnessError } from "../types.ts";
 import { nowIso, Workspace, writeFileAtomic } from "../workspace.ts";
 import { runExecutorEpisode, runExecutorQualityAdmission } from "./executor-eval.ts";
-import { GenerationStore, isCpuExecutorStrategy, isM07WorkflowStrategy, type ExperienceRequirementV1, type GenerationBundleV1, type ImproverStrategyV1, type M07WorkflowStrategyV1, type StrategyRecordV1, validateExperienceRequirements, validateStrategy } from "./generation.ts";
+import { GenerationStore, isCpuExecutorStrategy, isM07WorkflowStrategy, type ExperienceRequirementV1, type GenerationBundleV1, type ImproverStrategyV1, type M07WorkflowStrategyV1, type ResearchStrategy, type StrategyRecordV1, validateExperienceRequirements, validateStrategy } from "./generation.ts";
 import { advanceKnowledgeEpochInLock, transitionMethodKnowledgeDependenciesInLock } from "./knowledge-epoch.ts";
 import { bindMethodPackageV2, exportMethodPackageV2, readMethodPackageV2 } from "./method-v2.ts";
 import { buildMetaEpisode, loadMetaEpisode, metaEpisodeForModel, metaEpisodePath, writeMetaEpisode, type MetaEpisodeV1 } from "./meta-episode.ts";
@@ -32,16 +32,22 @@ export interface ResearchServiceOptions { workspaceRoot: string; runner: Session
 export interface ResearchBootstrapInput { version: 1; executor: ExecutorStrategyV1 | M07WorkflowStrategyV1; improver: ImproverStrategyV1; applicability: string[] }
 type SearchResult = { selected?: ResearchCandidateV1; selectedAt?: string; decisionCount: number; status: "selected" | "no-winner" | "inconclusive"; stopReason?: string };
 
-/** Recheck pinned necessary experience before every new child invocation and pointer transition. */
-export async function verifyRequiredExperience(workspaceRoot: string, requirements: ExperienceRequirementV1[], expectedSnapshotId?: string, registeredStores?: ReadonlyMap<string, KnowledgeStore>): Promise<void> {
+/** Recheck pinned necessary experience in the destination bundle's actual H environment. */
+export async function verifyRequiredExperience(workspaceRoot: string, requirements: ExperienceRequirementV1[], context: { environmentVersion: string; executorArtifact: ResearchStrategy }, expectedSnapshotId?: string, registeredStores?: ReadonlyMap<string, KnowledgeStore>): Promise<void> {
  const checked = validateExperienceRequirements(requirements, "requiredExperienceRefs");
+ const workflowArtifact = context.environmentVersion === "m07-workflow/v1" && isM07WorkflowStrategy(context.executorArtifact) ? context.executorArtifact : undefined;
+ const cpu = context.environmentVersion === "cpu-response-identification/v1" && isCpuExecutorStrategy(context.executorArtifact);
+ if (!workflowArtifact && !cpu) throw new HarnessError("improvement.experience", "method environment and executor strategy do not match");
  if (!checked.length) return;
  const ws = new Workspace(workspaceRoot), store = createFileKnowledgeStore(ws.knowledgeDir); await store.init();
  const provider = createExperienceProvider(store, registeredStores);
  for (const targetKind of ["executor", "improver"] as const) {
   const requestedRefs = checked.filter((item) => item.targetKind === targetKind).map((item) => item.ref);
   if (!requestedRefs.length) continue;
-  const result = await provider.select({ targetKind, applicability: { stage: "method-research", tags: ["cpu-response-identification"] }, requestedRefs,
+  const applicability = workflowArtifact
+   ? targetKind === "executor" ? { stage: "M07", tags: [workflowArtifact.slot] } : { stage: "method-research", tags: [`m07-${workflowArtifact.slot}`] }
+   : { stage: "method-research", tags: ["cpu-response-identification"] };
+  const result = await provider.select({ targetKind, applicability, requestedRefs,
    expectedSnapshotId, maxRecords: 1, maxChars: 1, verificationOnly: true });
   if (result.status !== "ready" || result.selected.length !== requestedRefs.length) throw new HarnessError("improvement.experience", "required method experience is unavailable, changed, or not locally registered");
  }
@@ -109,8 +115,9 @@ export class ResearchImprovementService {
  private readonly runner: SessionRunner;
  private readonly registeredExperienceStores?: ReadonlyMap<string, KnowledgeStore>;
  constructor(options: ResearchServiceOptions) { this.ws = new Workspace(options.workspaceRoot); this.store = new GenerationStore(this.ws.root); this.runner = options.runner; this.registeredExperienceStores = options.registeredExperienceStores; }
- private async verifyRequirements(records: StrategyRecordV1[], snapshot?: string): Promise<void> {
-  await verifyRequiredExperience(this.ws.root, combineRequirements(...records.map((r) => r.requiredExperienceRefs)), snapshot, this.registeredExperienceStores);
+ private async verifyRequirements(records: StrategyRecordV1[], snapshot: string | undefined, bundle: GenerationBundleV1): Promise<void> {
+  const executor = records.find((record) => record.kind === "executor") ?? await this.store.readStrategy(bundle.executorVersionId);
+  await verifyRequiredExperience(this.ws.root, combineRequirements(...records.map((r) => r.requiredExperienceRefs)), { environmentVersion: bundle.environmentVersion, executorArtifact: executor.artifact }, snapshot, this.registeredExperienceStores);
   await verifyRequiredKnowledge(this.ws.root, combineKnowledgeRefs(...records.map((r) => r.requiredKnowledgeRefs)), snapshot, this.registeredExperienceStores);
  }
  async advanceKnowledgeEpoch(m04RunId: string, expectedActiveBundleId: string) { return this.withMutation(() => advanceKnowledgeEpochInLock({ workspaceRoot: this.ws.root, generationStore: this.store, m04RunId, expectedActiveBundleId, registeredExperienceStores: this.registeredExperienceStores })); }
@@ -154,7 +161,7 @@ export class ResearchImprovementService {
   const active = await this.store.active(); if (!active?.pointer.previousBundleId) throw new HarnessError("improvement.rollback", "no previous research generation");
   const previous = await this.store.readBundle(active.pointer.previousBundleId);
   const [h, i] = await Promise.all([this.store.readStrategy(previous.executorVersionId), this.store.readStrategy(previous.improverVersionId)]);
-  await this.verifyRequirements([h, i], previous.knowledgeSnapshot);
+  await this.verifyRequirements([h, i], previous.knowledgeSnapshot, previous);
   return this.store.rollback();
  }); }
  async exportMethod(versionId: string, outputPath: string) {
@@ -164,9 +171,11 @@ export class ResearchImprovementService {
  }
  async bindMethod(packagePath: string) { return this.withMutation(async () => { const active = await this.store.active(); if (!active) throw new HarnessError("improvement.generation", "bootstrap research generation first");
   const pkg = await readMethodPackageV2(packagePath);
-  await verifyRequiredExperience(this.ws.root, pkg.requiredExperienceRefs, active.bundle.knowledgeSnapshot, this.registeredExperienceStores);
-  await verifyRequiredKnowledge(this.ws.root, pkg.requiredKnowledgeRefs, active.bundle.knowledgeSnapshot, this.registeredExperienceStores);
-  return bindMethodPackageV2(this.store, packagePath, active, `manual-bind-${RUN_ID()}`); }); }
+  const retained = await this.store.readStrategy(pkg.methodType === "executor" ? active.bundle.improverVersionId : active.bundle.executorVersionId);
+  const executorArtifact = pkg.methodType === "executor" ? pkg.artifact : retained.artifact;
+  await verifyRequiredExperience(this.ws.root, combineRequirements(pkg.requiredExperienceRefs, retained.requiredExperienceRefs), { environmentVersion: active.bundle.environmentVersion, executorArtifact }, active.bundle.knowledgeSnapshot, this.registeredExperienceStores);
+  await verifyRequiredKnowledge(this.ws.root, combineKnowledgeRefs(pkg.requiredKnowledgeRefs, retained.requiredKnowledgeRefs), active.bundle.knowledgeSnapshot, this.registeredExperienceStores);
+  return bindMethodPackageV2(this.store, pkg, active, `manual-bind-${RUN_ID()}`); }); }
  async run(input: unknown): Promise<ResearchRunV1> { const plan = validateResearchPlan(input); return this.withMutation(() => this.runUnlocked(plan)); }
  /** Explicit M07 method study. It cannot be reached from normal research or M07 begin. */
  async runWorkflow(input: unknown) { const plan = validateWorkflowPlan(input); return this.withMutation(() => runWorkflowEvidenceHandoff({ ws: this.ws, store: this.store, runner: this.runner, plan, registeredExperienceStores: this.registeredExperienceStores })); }
@@ -201,7 +210,7 @@ export class ResearchImprovementService {
    const loadedMetaEpisodes = await Promise.all((plan.metaEpisodeRunIds ?? []).map((priorRunId) => loadMetaEpisode(this.store.root, this.ws.root, priorRunId)));
    const h = await this.store.readStrategy(active.bundle.executorVersionId), i = await this.store.readStrategy(active.bundle.improverVersionId);
    if (!isCpuExecutorStrategy(h.artifact)) throw new HarnessError("improvement.strategy", "CPU research requires an active CPU executor method; the workflow slot is M07-only");
-   await this.verifyRequirements([h, i], active.bundle.knowledgeSnapshot);
+   await this.verifyRequirements([h, i], active.bundle.knowledgeSnapshot, active.bundle);
    const phases = admission ? await reserveResearchPhases(budget, { kind: plan.experimentKind,
     searchReplicates: plan.searchReplicates!, outcomeReplicates: plan.outcomeReplicates!, admissionCases: admission.cases }) : undefined;
    const pilotLease = phases?.pilot ?? (plan.target === "improver" ? budget.createLease(budget.root, undefined, { clockMode: "active" }) : undefined);
@@ -223,11 +232,11 @@ export class ResearchImprovementService {
      model: active.bundle.modelConfig.research, persistDir: this.ws.sessionsDir, budget, lease: phases!.protected, timeoutMs: plan.perPromptTimeoutMs, repetitions: plan.outcomeReplicates!,
      persistObservation: this.persistObservation(dir, id), beforeModelRequest: async (versionId) => {
       const record = versionId === h.versionId ? h : candidate;
-      await this.verifyRequirements([record, i], active.bundle.knowledgeSnapshot);
+      await this.verifyRequirements([record, i], active.bundle.knowledgeSnapshot, active.bundle);
      } });
     run.admissionPath = path.join(dir, "executor-quality-admission.private.json"); await writeFileAtomic(run.admissionPath, `${JSON.stringify(result, null, 2)}\n`);
     if (result.status === "accepted" && !budget.status().inFlight) {
-     await this.verifyRequirements([candidate, i], active.bundle.knowledgeSnapshot);
+     await this.verifyRequirements([candidate, i], active.bundle.knowledgeSnapshot, active.bundle);
      const bundle = await this.store.writeBundle({ bundleId: this.store.newId("bundle"), parents: [active.bundle.bundleId], executorVersionId: candidate.versionId, improverVersionId: i.versionId, knowledgeSnapshot: active.bundle.knowledgeSnapshot,
       environmentVersion: active.bundle.environmentVersion, modelConfig: active.bundle.modelConfig, protocolVersion: active.bundle.protocolVersion, allowedCapabilities: active.bundle.allowedCapabilities, state: "admitted" });
      await this.store.activate(bundle.bundleId, active.pointer, "local-executor-admission", id); run.status = "promoted"; run.outcome = "promoted"; run.stopReason = "local executor-quality admission accepted";
@@ -248,12 +257,12 @@ export class ResearchImprovementService {
      persistSelection: async (replicates) => { const file = path.join(dir, "meta-selections-before-g.private.json"); await writeFileAtomic(file, `${JSON.stringify({ replicates, at: nowIso() }, null, 2)}\n`); return file; },
      persistObservation: this.persistObservation(dir, id), beforeModelRequest: async (versionId) => {
       const record = await this.store.readStrategy(versionId);
-      await this.verifyRequirements([record], active.bundle.knowledgeSnapshot);
+      await this.verifyRequirements([record], active.bundle.knowledgeSnapshot, active.bundle);
      } });
     run.admissionPath = path.join(dir, "meta-admission.private.json"); await writeFileAtomic(run.admissionPath, `${JSON.stringify(meta, null, 2)}\n`);
     if (meta.status === "accepted" && !budget.status().inFlight) {
      const candidate = await this.store.readStrategy(selected.selected.strategyVersionId);
-     await this.verifyRequirements([h, candidate], active.bundle.knowledgeSnapshot);
+     await this.verifyRequirements([h, candidate], active.bundle.knowledgeSnapshot, active.bundle);
      if (candidate.artifact.body === i.artifact.body) { run.status = "rejected"; run.outcome = "candidate-rejected"; run.stopReason = "sham improver body did not change"; }
      else { const bundle = await this.store.writeBundle({ bundleId: this.store.newId("bundle"), parents: [active.bundle.bundleId], executorVersionId: h.versionId, improverVersionId: candidate.versionId, knowledgeSnapshot: active.bundle.knowledgeSnapshot,
        environmentVersion: active.bundle.environmentVersion, modelConfig: active.bundle.modelConfig, protocolVersion: active.bundle.protocolVersion, allowedCapabilities: active.bundle.allowedCapabilities, state: "admitted" });
@@ -315,7 +324,7 @@ export class ResearchImprovementService {
    modelCalls: item.modelCalls, probeCalls: item.probeCalls, sdkEstimatedCost: item.sdkEstimatedCost }));
   const seenBodies = new Set<string>([args.target === "executor" ? args.executor.artifact.body : args.improver.artifact.body]);
   const ensureLiveExperience = async () => {
-   await this.verifyRequirements([args.executor, args.improver], args.bundle.knowledgeSnapshot);
+   await this.verifyRequirements([args.executor, args.improver], args.bundle.knowledgeSnapshot, args.bundle);
    if (!args.selection.refs.length) return;
    const knowledge = createFileKnowledgeStore(this.ws.knowledgeDir); await knowledge.init();
    const selected = await createExperienceProvider(knowledge, this.registeredExperienceStores).select({ targetKind: args.selection.targetKind ?? args.target, applicability: { stage: "method-research", tags: ["cpu-response-identification"] },
@@ -421,7 +430,7 @@ export class ResearchImprovementService {
       const costBefore = budget.status(lease).committed.sdkEstimatedCost;
       const episode = await runExecutorEpisode({ development: e.development, start: s, method: strategy.artifact as ExecutorStrategyV1, methodVersionId: strategy.versionId,
        runner: this.runner, model: args.bundle.modelConfig.research, persistDir: this.ws.sessionsDir, budget, lease, timeoutMs: plan.perPromptTimeoutMs,
-       beforeModelRequest: () => this.verifyRequirements([strategy], args.bundle.knowledgeSnapshot) });
+       beforeModelRequest: () => this.verifyRequirements([strategy], args.bundle.knowledgeSnapshot, args.bundle) });
       const selectedCase = cases.get(c.id)!;
       const episodeCost = budget.status(lease).committed.sdkEstimatedCost - costBefore;
       const costComplete = !budget.status(lease).usageUnknown;

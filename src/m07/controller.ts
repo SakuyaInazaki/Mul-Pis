@@ -572,7 +572,7 @@ async function verifyFrozenWorkflowMethod(ctx: StageContext, goal: CurrentGoal, 
 			if (!requestedRefs.length) continue;
 			const applicability = targetKind === "executor"
 				? { stage: "M07", tags: [goal.workflowMethod.artifact.slot, task.mode, ...(task.experienceTags ?? [])], contextRefs: task.experienceContextRefs }
-				: { stage: "method-research", tags: ["cpu-response-identification"] };
+				: { stage: "method-research", tags: [`m07-${goal.workflowMethod.artifact.slot}`] };
 			const selection = await provider.select({ targetKind, applicability, requestedRefs, expectedSnapshotId: goal.knowledgeSnapshot, maxRecords: 100, maxChars: 100_000 });
 			if (selection.status !== "ready" || selection.selected.length !== requestedRefs.length) throw new HarnessError("m07.workflow-method", "frozen method necessary experience is unavailable or not applicable to this task");
 		}

@@ -69,10 +69,10 @@ test("more than one hundred pinned refs are checked by exact store identity with
 		get: async (id: string, version: number) => refs.some((ref) => ref.recordId === id && ref.version === version) ? { id, type: "K", version, title: id, body: "registered evidence", fields: { experience: { version: 1, targetKind: "improver", applicableStages: ["method-research"], requiredTags: ["cpu-response-identification"], excludedTags: [], requiredRefs: [] } }, refs: [], scope: [], usageDecision: "adopted" } : undefined,
 		availability: async () => ({ availability: "usable_conditionally" }) } as unknown as KnowledgeStore;
 	const registered = new Map<string, KnowledgeStore>([[storeId, store]]);
-	await verifyRequiredExperience(root, refs.map((ref) => ({ targetKind: "improver", ref })), undefined, registered);
+	await verifyRequiredExperience(root, refs.map((ref) => ({ targetKind: "improver", ref })), { environmentVersion: "cpu-response-identification/v1", executorArtifact: strategy.executor }, undefined, registered);
 	await verifyRequiredKnowledge(root, refs, undefined, registered);
 	const wrongIdentity = { ...store, storeId: async () => "00000000-0000-4000-8000-000000000003" } as KnowledgeStore;
-	await assert.rejects(verifyRequiredExperience(root, refs.map((ref) => ({ targetKind: "improver", ref })), undefined, new Map([[storeId, wrongIdentity]])), /unavailable|registered|changed/);
+	await assert.rejects(verifyRequiredExperience(root, refs.map((ref) => ({ targetKind: "improver", ref })), { environmentVersion: "cpu-response-identification/v1", executorArtifact: strategy.executor }, undefined, new Map([[storeId, wrongIdentity]])), /unavailable|registered|changed/);
 });
 
 /** Trusted test-state construction, not a fake scientific admission. */
@@ -140,6 +140,69 @@ test("V2 import preserves foreign pinned obligations and cannot activate without
 	const before = (await target.generation.active())!.bundle.bundleId;
 	await assert.rejects(target.service.bindMethod(packagePath), /experience|unavailable|registered/i);
 	assert.equal((await target.generation.active())!.bundle.bundleId, before);
+});
+
+test("workflow method bind and rollback use the active workflow scope for inherited H and I experience", async (t) => {
+	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-workflow-deps-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	await writeFile(path.join(root, "research.config.json"), JSON.stringify({ roles: { default: "fake/default", improver: "fake/improver", research: "fake/research" }, concurrency: 1 }));
+	const knowledge = createFileKnowledgeStore(path.join(root, ".agent", "knowledge"));
+	await knowledge.init();
+	await apply(knowledge, [
+		{ op: "create", type: "K", title: "交接检查经验", body: "核查固定交接", usageDecision: "adopted", fields: { experience: { version: 1, targetKind: "executor", applicableStages: ["M07"], requiredTags: ["evidence-handoff"], excludedTags: ["cpu-response-identification"], requiredRefs: [] } } },
+		{ op: "create", type: "K", title: "交接改进经验", body: "核查固定反馈", usageDecision: "adopted", fields: { experience: { version: 1, targetKind: "improver", applicableStages: ["method-research"], requiredTags: ["m07-evidence-handoff"], excludedTags: ["cpu-response-identification"], requiredRefs: [] } } },
+	]);
+	const service = new ResearchImprovementService({ workspaceRoot: root, runner: new FakeSessionRunner(() => "unused") });
+	await service.bootstrap({ version: 1, executor: { version: 1, kind: "m07-workflow-prompt", slot: "evidence-handoff", body: "保留证据与限制" }, improver: strategy.improver, applicability: ["M07"] });
+	const generations = new GenerationStore(root);
+	const original = (await generations.active())!;
+	const h = await generations.readStrategy(original.bundle.executorVersionId);
+	const storeId = await knowledge.storeId();
+	const refs: ExperienceRequirementV1[] = [
+		{ targetKind: "executor", ref: { storeId, recordId: "K001", version: 1 } },
+		{ targetKind: "improver", ref: { storeId, recordId: "K002", version: 1 } },
+	];
+	const dependent = await generations.writeStrategy({ versionId: "H-workflow-dependent", kind: "executor", artifact: h.artifact, parentVersionId: h.versionId, origin: "human-seed", applicability: h.applicability, limitations: [], requiredExperienceRefs: refs, state: "manual-active" });
+	const packagePath = path.join(root, "workflow-method-package.json");
+	await service.exportMethod(dependent.versionId, packagePath);
+	const imported = await service.bindMethod(packagePath);
+	assert.deepEqual(imported.strategy.requiredExperienceRefs, refs);
+	const neutral = await generations.writeBundle({ ...imported.bundle, bundleId: "bundle-workflow-neutral", parents: [imported.bundle.bundleId], executorVersionId: h.versionId });
+	await generations.activate(neutral.bundleId, (await generations.active())!.pointer, "external-manual-unverified", "workflow-neutral");
+	const restored = await service.rollback();
+	assert.equal((await generations.active())?.bundle.executorVersionId, imported.strategy.versionId);
+	assert.equal(restored.bundleId, imported.bundle.bundleId);
+});
+
+test("method binding uses the package bytes that passed dependency checks even if its file changes", async (t) => {
+	const f = await fixture(t, () => ({ text: JSON.stringify({ kind: "stop", reason: "unused" }), usage }));
+	const active = (await f.generation.active())!;
+	const base = await f.generation.readStrategy(active.bundle.improverVersionId);
+	const foreignId = "00000000-0000-4000-8000-000000000099";
+	const required: ExperienceRequirementV1 = { targetKind: "improver", ref: { storeId: foreignId, recordId: "K001", version: 1 } };
+	const prepared = await f.generation.writeStrategy({ versionId: "I-checked-package", kind: "improver", artifact: { ...base.artifact, body: "Checked package body" }, parentVersionId: base.versionId, origin: "human-seed", applicability: base.applicability, limitations: [], requiredExperienceRefs: [required], state: "manual-active" });
+	const packagePath = path.join(f.root, "changing-method-package.json");
+	await f.service.exportMethod(prepared.versionId, packagePath);
+	const original = JSON.parse(await readFile(packagePath, "utf8"));
+	const changed = { ...original, artifact: { ...original.artifact, body: "Changed after precheck" }, requiredExperienceRefs: [] };
+	let changedDuringPrecheck = false;
+	const foreign = {
+		storeId: async () => foreignId,
+		current: async () => ({ id: "G001" }),
+		limits: async () => [],
+		get: async () => {
+			if (!changedDuringPrecheck) { changedDuringPrecheck = true; await writeFile(packagePath, JSON.stringify(changed)); }
+			return { id: "K001", type: "K", version: 1, title: "Registered experience", body: "Conditionally usable", fields: { experience: { version: 1, targetKind: "improver", applicableStages: ["method-research"], requiredTags: ["cpu-response-identification"], excludedTags: [], requiredRefs: [] } }, refs: [], scope: [], usageDecision: "adopted" };
+		},
+		availability: async () => ({ availability: "usable_conditionally" }),
+	} as unknown as KnowledgeStore;
+	const service = new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner, registeredExperienceStores: new Map([[foreignId, foreign]]) });
+	const bound = await service.bindMethod(packagePath);
+	assert.equal(changedDuringPrecheck, true);
+	assert.equal(JSON.parse(await readFile(packagePath, "utf8")).artifact.body, "Changed after precheck");
+	assert.equal(bound.strategy.artifact.body, "Checked package body");
+	assert.deepEqual(bound.strategy.requiredExperienceRefs, [required]);
+	assert.equal((await f.generation.active())?.bundle.bundleId, bound.bundle.bundleId);
 });
 
 test("a candidate saying to ignore dependencies still inherits controller-pinned I requirements", async (t) => {

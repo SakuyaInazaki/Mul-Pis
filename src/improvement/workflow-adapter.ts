@@ -14,6 +14,7 @@ import type { StageContext } from "../stages/context.ts";
 import { HarnessError } from "../types.ts";
 import { nowIso, Workspace, writeFileAtomic } from "../workspace.ts";
 import { GenerationStore, isM07WorkflowStrategy, type M07WorkflowStrategyV1, type StrategyRecordV1, validateStrategy } from "./generation.ts";
+import { validateActiveBudgetPointer, validateBudgetPolicy } from "./policy.ts";
 import { buildWorkflowMetaEpisode, loadWorkflowMetaEpisode, metaEpisodeForModel, writeMetaEpisode } from "./meta-episode.ts";
 import { validateResearchHypothesis, type ResearchHypothesisV1 } from "./policy-host.ts";
 import { runBoundedModelStep } from "./research-model.ts";
@@ -103,7 +104,25 @@ async function assertPlainTree(root: string): Promise<void> {
 		}
 	}
 }
-async function seedArm(source: Workspace, targetRoot: string, bundle: NonNullable<Awaited<ReturnType<GenerationStore["active"]>>>["bundle"], h: StrategyRecordV1, i: StrategyRecordV1, caseInput: WorkflowCaseSetV1["cases"][number], baselineRunId?: string): Promise<StageContext> {
+async function activePolicyFiles(source: Workspace): Promise<{ pointerPath: string; policyPath: string; pointerText: string; policyText: string } | undefined> {
+	const pointerPath = path.join(source.agentDir, "improvement", "active.json");
+	const pointerInfo = await lstat(pointerPath).catch((error: NodeJS.ErrnoException) => {
+		if (error.code === "ENOENT") return undefined;
+		throw error;
+	});
+	if (!pointerInfo) return undefined;
+	if (!pointerInfo.isFile() || pointerInfo.isSymbolicLink() || pointerInfo.size > 16_000 || !nested(await realpath(source.root), await realpath(pointerPath))) throw new HarnessError("improvement.workflow-copy", "active policy pointer is not a confined regular file");
+	const pointerText = await readFile(pointerPath, "utf8");
+	const pointer = validateActiveBudgetPointer(JSON.parse(pointerText));
+	const policyPath = path.join(source.agentDir, "improvement", "versions", pointer.versionId, "policy.json");
+	const policyInfo = await lstat(policyPath);
+	if (!policyInfo.isFile() || policyInfo.isSymbolicLink() || policyInfo.size > 16_000 || !nested(await realpath(source.root), await realpath(policyPath))) throw new HarnessError("improvement.workflow-copy", "active policy version is not a confined regular file");
+	const policyText = await readFile(policyPath, "utf8");
+	validateBudgetPolicy(JSON.parse(policyText));
+	if (pointerText !== await readFile(pointerPath, "utf8")) throw new HarnessError("improvement.workflow-copy", "active policy changed while freezing an arm");
+	return { pointerPath, policyPath, pointerText, policyText };
+}
+async function seedArm(source: Workspace, targetRoot: string, bundle: NonNullable<Awaited<ReturnType<GenerationStore["active"]>>>["bundle"], h: StrategyRecordV1, i: StrategyRecordV1, caseInput: WorkflowCaseSetV1["cases"][number], baselineRunId: string, activePolicy: Awaited<ReturnType<typeof activePolicyFiles>>): Promise<StageContext> {
 	const target = new Workspace(targetRoot);
 	await mkdir(target.root);
 	const copy = async (from: string, to: string): Promise<void> => { await assertPlainTree(from); await cp(from, to, { recursive: true, errorOnExist: true, force: false, dereference: false }); };
@@ -127,7 +146,16 @@ async function seedArm(source: Workspace, targetRoot: string, bundle: NonNullabl
 	if (!knowledgeInfo.isDirectory()) throw new HarnessError("improvement.workflow-copy", "source knowledge store is unavailable");
 	await mkdir(target.agentDir, { recursive: true });
 	await copy(source.knowledgeDir, target.knowledgeDir);
-	const baseline = baselineRunId ? await source.readRun("M04", baselineRunId) : await source.latestCompletedRun("M04");
+	// The no-injected-H arm still uses the source's active evidence-projection policy.
+	// Freeze its pointer and exact version in the template, then copy both to every fresh arm.
+	if (activePolicy) {
+		const pointer = validateActiveBudgetPointer(JSON.parse(activePolicy.pointerText));
+		const targetImprovementDir = path.join(target.agentDir, "improvement");
+		await mkdir(path.join(targetImprovementDir, "versions", pointer.versionId), { recursive: true });
+		await writeFileAtomic(path.join(targetImprovementDir, "versions", pointer.versionId, "policy.json"), activePolicy.policyText);
+		await writeFileAtomic(path.join(targetImprovementDir, "active.json"), activePolicy.pointerText);
+	}
+	const baseline = await source.readRun("M04", baselineRunId);
 	if (!baseline || baseline.status !== "completed" || baseline.failures.length) throw new HarnessError("improvement.workflow-copy", "source requires the exact clean formal M04 baseline");
 	const baselineDir = source.runDir("M04", baseline.runId);
 	await copy(baselineDir, target.runDir("M04", baseline.runId));
@@ -142,28 +170,39 @@ async function seedArm(source: Workspace, targetRoot: string, bundle: NonNullabl
 	return { ws: target, store, runner: undefined as unknown as SessionRunner, config: await target.loadConfig() };
 }
 
-/** Freeze only explicitly named case inputs. An admission input is copied after selection. */
+/** Copy only explicitly named, already separated case inputs. */
 async function freezeCaseInputs(source: Workspace, target: Workspace, cases: WorkflowCaseSetV1["cases"]): Promise<void> {
 	for (const item of new Set(cases.flatMap((c) => c.task.inputs))) {
 		if (!relativeSafe(item)) throw new HarnessError("improvement.workflow-copy", "case input is not a confined relative file");
 		const from = path.join(source.root, item), to = path.join(target.root, item);
 		const info = await lstat(from);
 		if (!info.isFile() || info.isSymbolicLink() || info.size > 8 * 1024 * 1024 || !nested(await realpath(source.root), await realpath(from))) throw new HarnessError("improvement.workflow-copy", "case input is not a bounded source file");
-		if (await stat(to).catch(() => undefined)) continue;
+		const existing = await lstat(to).catch((error: NodeJS.ErrnoException) => {
+			if (error.code === "ENOENT") return undefined;
+			throw error;
+		});
+		if (existing) {
+			if (!existing.isFile() || existing.isSymbolicLink() || !(await readFile(from)).equals(await readFile(to))) throw new HarnessError("improvement.workflow-copy", "frozen input collides with different target bytes");
+			continue;
+		}
 		await mkdir(path.dirname(to), { recursive: true }); await cp(from, to, { errorOnExist: true, force: false });
 	}
 }
 
-/** G's controller-only case file cannot be copied into a model-visible workspace. */
-async function protectAdmissionInputs(source: Workspace, plan: WorkflowEvidenceHandoffPlanV1, development: WorkflowCaseSetV1, admission?: WorkflowCaseSetV1): Promise<void> {
-	if (!plan.admissionCaseSetPath) return;
-	const caseFile = await realpath(path.resolve(source.root, plan.admissionCaseSetPath!));
-	const copiedRoots = [source.problemFile, source.configFile, source.rawDir, source.knowledgeDir, source.runDir("M04", plan.developmentSource.m04RunId)];
-	const allInputs = [...development.cases, ...(admission?.cases ?? [])].flatMap((item) => item.task.inputs.map((file) => path.resolve(source.root, file)));
-	for (const item of [...copiedRoots, ...allInputs]) {
-		const resolved = await realpath(item).catch(() => undefined);
-		if (resolved && nested(resolved, caseFile)) throw new HarnessError("improvement.workflow-g", "protected case file overlaps material copied into a model-visible arm");
+/** Protected definitions and input files must never enter common/development material. */
+async function protectAdmissionInputs(source: Workspace, plan: WorkflowEvidenceHandoffPlanV1, development: WorkflowCaseSetV1, admission: WorkflowCaseSetV1 | undefined, formalRunId: string, activePolicy: Awaited<ReturnType<typeof activePolicyFiles>>): Promise<void> {
+	if (!admission || !plan.admissionCaseSetPath) return;
+	const common = [source.problemFile, source.configFile, source.rawDir, source.knowledgeDir, source.runDir("M04", formalRunId),
+		...(activePolicy ? [activePolicy.pointerPath, activePolicy.policyPath] : []),
+		...development.cases.flatMap((c) => c.task.inputs.map((file) => path.resolve(source.root, file)))];
+	const commonPaths = (await Promise.all(common.map((file) => realpath(file).catch(() => undefined)))).filter((file): file is string => !!file);
+	const protectedInputs = [...new Set(admission.cases.flatMap((c) => c.task.inputs))].map((file) => path.resolve(source.root, file));
+	const caseFile = await realpath(path.resolve(source.root, plan.admissionCaseSetPath));
+	for (const file of [caseFile, ...protectedInputs]) {
+		const resolved = await realpath(file);
+		if (commonPaths.some((common) => nested(common, resolved) || nested(resolved, common))) throw new HarnessError("improvement.workflow-g", `${file === caseFile ? "protected case file" : "protected input"} overlaps common or development inputs`);
 	}
+	for (const file of protectedInputs) if (await realpath(file) === caseFile) throw new HarnessError("improvement.workflow-g", "protected case file overlaps model-visible input");
 }
 
 function assertWorkflowBudgetOpen(budget: SharedBudget, lease: BudgetLease): void {
@@ -171,8 +210,10 @@ function assertWorkflowBudgetOpen(budget: SharedBudget, lease: BudgetLease): voi
 		throw new HarnessError("improvement.budget", "workflow provider request remains in flight");
 }
 
-export function createWorkflowMeteredRunner(base: SessionRunner, budget: SharedBudget, lease: BudgetLease, events: UsageSummary[], _legacyTimeoutMs?: number): SessionRunner {
+export function createWorkflowMeteredRunner(base: SessionRunner, budget: SharedBudget, lease: BudgetLease, events: UsageSummary[], _legacyTimeoutMs?: number, beforePrompt?: () => Promise<void>, inspectPrompt?: (spec: SessionSpec, message: string) => void): SessionRunner {
 	const wrap = (handle: SessionHandle, spec: SessionSpec): SessionHandle => ({ ...handle, prompt: async (message) => {
+		inspectPrompt?.(spec, message);
+		await beforePrompt?.();
 		assertWorkflowBudgetOpen(budget, lease);
 		const reservation = budget.reserveObservedTurn(lease);
 		let settled = false;
@@ -187,16 +228,29 @@ export function createWorkflowMeteredRunner(base: SessionRunner, budget: SharedB
 	return { create: async (spec) => wrap(await base.create(spec), spec), resume: async (ref) => { const handle = await base.resume(ref); const spec = JSON.parse(await readFile(ref.specFile!, "utf8")) as SessionSpec; return wrap(handle, spec); }, estimateMaxSdkCost: base.estimateMaxSdkCost?.bind(base) };
 }
 
-async function executeArm(args: { source: Workspace; root: string; bundle: NonNullable<Awaited<ReturnType<GenerationStore["active"]>>>["bundle"]; h: StrategyRecordV1; i: StrategyRecordV1; caseInput: WorkflowCaseSetV1["cases"][number]; arm: WorkflowArmReceiptV1["arm"]; runner: SessionRunner; budget: SharedBudget; lease: BudgetLease; perPromptTimeoutMs?: number }): Promise<WorkflowArmReceiptV1> {
-	const receipt: WorkflowArmReceiptV1 = { caseId: args.caseInput.id, arm: args.arm, methodVersionId: args.h.versionId, workspaceRoot: args.root, checkResults: [], usage: { providerCalls: 0, inputTokens: 0, outputTokens: 0, sdkEstimatedCost: 0, complete: false }, status: "inconclusive" };
+async function executeArm(args: { source: Workspace; root: string; bundle: NonNullable<Awaited<ReturnType<GenerationStore["active"]>>>["bundle"]; h: StrategyRecordV1; i: StrategyRecordV1; caseInput: WorkflowCaseSetV1["cases"][number]; arm: WorkflowArmReceiptV1["arm"]; builtinBaseline: boolean; runner: SessionRunner; budget: SharedBudget; lease: BudgetLease; perPromptTimeoutMs?: number; formalRunId: string; protectedInputs?: Workspace; beforePrompt: () => Promise<void> }): Promise<WorkflowArmReceiptV1> {
+	const binding = args.builtinBaseline ? { kind: "builtin" as const } : { kind: "injected-h" as const, versionId: args.h.versionId };
+	const receipt: WorkflowArmReceiptV1 = { caseId: args.caseInput.id, arm: args.arm, methodVersionId: args.builtinBaseline ? "builtin-default" : args.h.versionId, methodBinding: binding, workspaceRoot: args.root, checkResults: [], usage: { providerCalls: 0, inputTokens: 0, outputTokens: 0, sdkEstimatedCost: 0, complete: false }, status: "inconclusive" };
 	const events: UsageSummary[] = [];
 	try {
-		const ctx = await seedArm(args.source, args.root, args.bundle, args.h, args.i, args.caseInput);
-		ctx.runner = createWorkflowMeteredRunner(args.runner, args.budget, args.lease, events, args.perPromptTimeoutMs);
+		// Protected files are added only to this fresh evaluation arm, never the development template.
+		const seedCase = args.protectedInputs ? { ...args.caseInput, task: { ...args.caseInput.task, inputs: [] } } : args.caseInput;
+		const ctx = await seedArm(args.source, args.root, args.bundle, args.h, args.i, seedCase, args.formalRunId, await activePolicyFiles(args.source));
+		if (args.protectedInputs) await freezeCaseInputs(args.protectedInputs, ctx.ws, [args.caseInput]);
+		let expectedPolicyVersionId: string | undefined;
+		let observedM07Message = false;
+		ctx.runner = createWorkflowMeteredRunner(args.runner, args.budget, args.lease, events, args.perPromptTimeoutMs, args.beforePrompt, (spec, message) => {
+			if (!args.builtinBaseline || !spec.label.startsWith("M07-")) return;
+			observedM07Message = true;
+			if (!expectedPolicyVersionId || spec.methodBinding?.versionId !== expectedPolicyVersionId || message.includes("冻结的 M07 方法：")) throw new HarnessError("improvement.workflow-arm", "builtin M07 message or binding contains an injected H");
+		});
 		const controller = createM07Controller(ctx);
-		const goal = await controller.begin({ ...args.caseInput.goal, workflowMethodVersionId: args.h.versionId });
+		const goal = await controller.begin(args.builtinBaseline ? args.caseInput.goal : { ...args.caseInput.goal, workflowMethodVersionId: args.h.versionId });
+		expectedPolicyVersionId = goal.budgetPolicyVersionId;
+		if (args.builtinBaseline && (goal.workflowMethod !== undefined || goal.methodBinding?.versionId !== expectedPolicyVersionId)) throw new HarnessError("improvement.workflow-arm", "builtin goal contains an injected H binding");
 		receipt.m07RunId = goal.runId;
 		const task = await controller.delegate(goal.runId, args.caseInput.task);
+		if (args.builtinBaseline && !observedM07Message) throw new HarnessError("improvement.workflow-arm", "builtin M07 task message was not observed");
 		if (task.status !== "returned" || !task.reportPath) throw new HarnessError("improvement.workflow-arm", "M07 task did not return an evidence report");
 		const report = await readFile(task.reportPath, "utf8");
 		if (report.length > 100_000) throw new HarnessError("improvement.workflow-arm", "M07 evidence report exceeds the retained-file size boundary");
@@ -212,12 +266,13 @@ async function executeArm(args: { source: Workspace; root: string; bundle: NonNu
 		const binding = await boundedJson(sourceRecord.path, 16_000) as Record<string, unknown>;
 		if (binding.m07RunId !== goal.runId || binding.checkpointId !== checkpoint.id || binding.rootDir !== checkpoint.rootDir) throw new HarnessError("improvement.workflow-arm", "M04 source does not resolve the exact M07 checkpoint");
 		const frozenGoal = await boundedJson(checkpoint.goalSnapshotPath, 256_000) as { workflowMethod?: { versionId?: string }; tasks?: Array<{ taskId?: string; reportPath?: string }> };
-		if (frozenGoal.workflowMethod?.versionId !== args.h.versionId) throw new HarnessError("improvement.workflow-arm", "M04 did not receive the intended frozen H version");
+		if (args.builtinBaseline ? frozenGoal.workflowMethod !== undefined : frozenGoal.workflowMethod?.versionId !== args.h.versionId) throw new HarnessError("improvement.workflow-arm", "M04 did not receive the intended frozen workflow method binding");
 		const frozenReportPath = frozenGoal.tasks?.find((x) => x.taskId === task.taskId)?.reportPath;
 		if (!frozenReportPath || !nested(await realpath(checkpoint.rootDir), await realpath(frozenReportPath))) throw new HarnessError("improvement.workflow-arm", "frozen report path is outside the checkpoint");
 		if ((await readFile(frozenReportPath, "utf8")) !== report) throw new HarnessError("improvement.workflow-arm", "frozen report differs from the task return");
 		receipt.frozenReportPath = frozenReportPath;
 		const m04Message = await readFile(messageRecord.path, "utf8");
+			if (args.builtinBaseline && m04Message.includes("冻结的证据交接方法")) throw new HarnessError("improvement.workflow-arm", "builtin M04 handoff contains an injected H");
 		const coverage = await boundedJson(coverageRecord.path, 128_000) as { promptOutcome?: string; returnedRanges?: Array<{ path?: string; status?: string; returned?: { startLine?: number; endLine?: number; truncated?: boolean; kind?: string } }> };
 		const relativeReport = path.relative(checkpoint.rootDir, frozenReportPath);
 		const totalLines = report.split(/\r?\n/).length;
@@ -239,19 +294,22 @@ async function executeArm(args: { source: Workspace; root: string; bundle: NonNu
 
 export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: GenerationStore; runner: SessionRunner; plan: WorkflowEvidenceHandoffPlanV1; registeredExperienceStores?: ReadonlyMap<string, KnowledgeStore> }): Promise<WorkflowRunV1> {
  const { ws, store, runner, plan, registeredExperienceStores } = args;
+	const comparisonBaseline = plan.baseline ?? "active-h";
 	const active = await store.active();
 	if (!active) throw new HarnessError("improvement.workflow", "explicit workflow H/I bundle is required");
 	const h = await store.readStrategy(active.bundle.executorVersionId), i = await store.readStrategy(active.bundle.improverVersionId);
 	if (active.bundle.environmentVersion !== "m07-workflow/v1" || !active.bundle.allowedCapabilities.includes("m07-evidence-read") || active.bundle.allowedCapabilities.includes("cpu-probe") || !isM07WorkflowStrategy(h.artifact) || h.artifact.slot !== "evidence-handoff" || i.artifact.kind !== "diagnostic-improver-prompt") throw new HarnessError("improvement.workflow", "active bundle must contain evidence-handoff H and diagnostic I");
 	const verifyLive = async (records: StrategyRecordV1[]) => {
 		const refs = uniqueRefs(records.flatMap((record) => [...record.requiredKnowledgeRefs, ...record.requiredExperienceRefs.map((item) => item.ref)]));
-		await verifyRequiredKnowledge(ws.root, refs, active.bundle.knowledgeSnapshot, registeredExperienceStores);
+		await verifyRequiredKnowledge(ws.root, refs, undefined, registeredExperienceStores);
 		const knowledge = createFileKnowledgeStore(ws.knowledgeDir); await knowledge.init();
 		const provider = createExperienceProvider(knowledge, registeredExperienceStores);
-		const iRefs = uniqueRefs(records.flatMap((record) => record.requiredExperienceRefs.filter((item) => item.targetKind === "improver").map((item) => item.ref)));
-		if (iRefs.length) {
-			const selected = await provider.select({ targetKind: "improver", applicability: { stage: "method-research", tags: ["m07-evidence-handoff"] }, requestedRefs: iRefs, expectedSnapshotId: active.bundle.knowledgeSnapshot, maxRecords: 1, maxChars: 1, verificationOnly: true });
-			if (selected.status !== "ready" || selected.selected.length !== iRefs.length) throw new HarnessError("improvement.workflow", "necessary improver experience is unavailable");
+		for (const targetKind of ["executor", "improver"] as const) {
+			const requestedRefs = uniqueRefs(records.flatMap((record) => record.requiredExperienceRefs.filter((item) => item.targetKind === targetKind).map((item) => item.ref)));
+			if (!requestedRefs.length) continue;
+			const applicability = targetKind === "executor" ? { stage: "M07", tags: ["evidence-handoff"] } : { stage: "method-research", tags: ["m07-evidence-handoff"] };
+			const selected = await provider.select({ targetKind, applicability, requestedRefs, maxRecords: 1, maxChars: 1, verificationOnly: true });
+			if (selected.status !== "ready" || selected.selected.length !== requestedRefs.length) throw new HarnessError("improvement.experience", `necessary ${targetKind} experience is unavailable or inapplicable`);
 		}
 	};
 	await verifyLive([h, i]);
@@ -264,7 +322,7 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 	const physicalRoot = path.join(await realpath(existing), path.relative(existing, root));
 	if (nested(physicalRoot, sourceRoot) || nested(sourceRoot, physicalRoot)) throw new HarnessError("improvement.workflow-root", "experiment root must be disjoint from the live workspace");
 	const runId = id(), dir = path.join(store.root, "workflow-runs", runId), budget = new SharedBudget(runId, plan.budget ?? {});
-	const run: WorkflowRunV1 = { version: 1, kind: "m07-evidence-handoff/v1", evidenceScope: "local-handoff-mechanism", scientificBenefit: "unverified", runId, startedAt: nowIso(), status: "running", baselineBundleId: active.bundle.bundleId, baselineExecutorVersionId: h.versionId, improverVersionId: i.versionId, knowledgeSnapshot: active.bundle.knowledgeSnapshot, developmentSource: plan.developmentSource, decisions: [], candidates: [], developmentArms: [], protectedArms: [] };
+	const run: WorkflowRunV1 = { version: 1, kind: "m07-evidence-handoff/v1", evidenceScope: "local-handoff-mechanism", scientificBenefit: "unverified", runId, startedAt: nowIso(), status: "running", baselineBundleId: active.bundle.bundleId, baselineExecutorVersionId: comparisonBaseline === "builtin" ? "builtin-default" : h.versionId, comparisonBaseline, proposalSeedHVersionId: h.versionId, improverVersionId: i.versionId, knowledgeSnapshot: active.bundle.knowledgeSnapshot, developmentSource: plan.developmentSource, decisions: [], candidates: [], developmentArms: [], protectedArms: [] };
 	await mkdir(dir, { recursive: true });
 	const save = async () => { run.budgetAtEnd = budget.status(); await writeFileAtomic(path.join(dir, "run.json"), `${JSON.stringify(run, null, 2)}\n`); };
 	await save();
@@ -275,11 +333,11 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 		const currentSnapshot = (await currentKnowledge.current())?.id;
 		if (!formal || formal.knowledgeSnapshot !== active.bundle.knowledgeSnapshot || currentSnapshot !== active.bundle.knowledgeSnapshot) throw new HarnessError("improvement.workflow-baseline", "frozen H/K and the current formal M04 baseline must share one knowledge epoch before I starts");
 		const frozenLimits = JSON.stringify(await currentKnowledge.limits());
-		const ensureLiveEpoch = async () => {
-			if ((await currentKnowledge.current())?.id !== currentSnapshot || JSON.stringify(await currentKnowledge.limits()) !== frozenLimits) throw new HarnessError("improvement.workflow-epoch", "workflow knowledge epoch or live limits changed during the campaign");
+		const ensureLiveLimits = async () => {
+			if (JSON.stringify(await currentKnowledge.limits()) !== frozenLimits) throw new HarnessError("improvement.workflow-epoch", "live limits changed during the campaign");
 		};
 		const requestedExperienceRefs = plan.experienceRefs ?? [];
-		const selectExperience = () => createExperienceProvider(currentKnowledge, registeredExperienceStores).select({ targetKind: "improver", applicability: { stage: "method-research", tags: ["m07-evidence-handoff"] }, requestedRefs: requestedExperienceRefs, expectedSnapshotId: active.bundle.knowledgeSnapshot, maxRecords: plan.experienceMaxRecords || 1, maxChars: plan.experienceMaxChars || 1 });
+		const selectExperience = () => createExperienceProvider(currentKnowledge, registeredExperienceStores).select({ targetKind: "improver", applicability: { stage: "method-research", tags: ["m07-evidence-handoff"] }, requestedRefs: requestedExperienceRefs, maxRecords: plan.experienceMaxRecords || 1, maxChars: plan.experienceMaxChars || 1 });
 		const selectedExperience = await selectExperience();
 		if (requestedExperienceRefs.length && (selectedExperience.status !== "ready" || selectedExperience.selected.length !== requestedExperienceRefs.length || !selectedExperience.markdown)) { run.status = "inconclusive"; run.outcome = "search-incomplete"; run.stopReason = "requested workflow I experience was unavailable or incomplete"; return run; }
 		const experience = { markdown: selectedExperience.status === "ready" ? selectedExperience.markdown : "", refs: selectedExperience.selected.map((item) => item.ref), scientificRequiredRefs: selectedExperience.selected.flatMap((item) => item.scientificRequiredRefs) };
@@ -289,12 +347,36 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 			if (selected.status !== "ready" || JSON.stringify(selected.selected.map((item) => item.ref)) !== JSON.stringify(experience.refs) || selected.markdown !== experience.markdown) throw new HarnessError("improvement.experience", "selected workflow I experience changed or became unavailable before a new model request");
 		};
 		const development = await loadCases(path.resolve(ws.root, plan.developmentCaseSetPath), "development");
-		await protectAdmissionInputs(ws, plan, development);
+		const admission = plan.admissionCaseSetPath ? await loadCases(path.resolve(ws.root, plan.admissionCaseSetPath), "admission") : undefined;
+		if (admission?.cases.some((a) => development.cases.some((d) => a.id === d.id || JSON.stringify({ ...a, id: "" }) === JSON.stringify({ ...d, id: "" })))) throw new HarnessError("improvement.workflow-g", "development and protected cases overlap");
+		const activePolicy = await activePolicyFiles(ws);
+		await protectAdmissionInputs(ws, plan, development, admission, formal.run.runId, activePolicy);
 		const priorEpisodes = await Promise.all((plan.metaEpisodeRunIds ?? []).map((priorId) => loadWorkflowMetaEpisode(store.root, ws.root, priorId, store)));
 		await mkdir(root); // exclusive: caller receives an error before any arm can overwrite a previous study
 		await writeFileAtomic(path.join(root, ".workflow-experiment-root.json"), `${JSON.stringify({ version: 1, runId, sourceWorkspace: ws.root })}\n`);
-		const template = (await seedArm(ws, path.join(root, "template"), active.bundle, h, i, development.cases[0]!, formal.run.runId)).ws;
+		const template = (await seedArm(ws, path.join(root, "template"), active.bundle, h, i, development.cases[0]!, formal.run.runId, activePolicy)).ws;
 		await freezeCaseInputs(ws, template, development.cases);
+		const protectedInputs = new Workspace(path.join(root, "protected", "inputs"));
+		if (admission) {
+			await writeFileAtomic(path.join(root, "protected", "cases.json"), `${JSON.stringify(admission, null, 2)}\n`);
+			await freezeCaseInputs(ws, protectedInputs, admission.cases);
+			run.protectedFrozenAt = nowIso();
+		}
+		// A snapshot is a research source, not a second owner of the producer's transaction.
+		if ((await readdir(template.knowledgeDir)).includes(".merge.lock")) throw new HarnessError("improvement.workflow-epoch", "unfinished knowledge merge was captured while freezing the research source");
+		const proposalsDir = path.join(template.knowledgeDir, "proposals");
+		for (const file of await readdir(proposalsDir)) {
+			if (!/^P\d{4,}\.intent\.json$/.test(file)) continue;
+			const intent = await boundedJson(path.join(proposalsDir, file), 8 * 1024 * 1024) as { status?: string };
+			if (intent.status !== "committed") throw new HarnessError("improvement.workflow-epoch", "unfinished knowledge merge was captured while freezing the research source");
+		}
+		const templateKnowledge = createFileKnowledgeStore(template.knowledgeDir);
+		if ((await currentKnowledge.current())?.id !== currentSnapshot || (await templateKnowledge.current())?.id !== currentSnapshot || JSON.stringify(await templateKnowledge.limits()) !== frozenLimits) throw new HarnessError("improvement.workflow-epoch", "knowledge changed while freezing the research source");
+		await ensureLiveLimits();
+		await templateKnowledge.regenerateViews();
+		run.sourceWorkspace = template.root;
+		await save();
+		const beforePrompt = async (records: StrategyRecordV1[]) => { await ensureLiveLimits(); await verifyLive(records); await ensureLiveExperience(); };
 		const freezeDevelopment = async (terminal: "selected" | "no-winner" | "inconclusive") => {
 			run.developmentBudgetAtSelection = budget.status();
 			run.metaEpisodeIds = [`meta:${runId}`];
@@ -306,17 +388,17 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 		let lastActionResult: unknown;
 		let inspectCount = 0;
 		for (let index = 0; ; index++) {
-			await ensureLiveEpoch();
+			await ensureLiveLimits();
 			await verifyLive([h, i]);
 			await ensureLiveExperience();
-			const view = { version: 1, environment: "m07-evidence-handoff/v1", target: "executor", current: { bundleId: active.bundle.bundleId, executorVersionId: h.versionId, improverVersionId: i.versionId, slot: "evidence-handoff" },
-				methods: { executor: { versionId: h.versionId, body: h.artifact.body }, improver: { versionId: i.versionId, body: i.artifact.body }, candidates: [...candidates.values()].map((c) => ({ versionId: c.versionId, developmentStatus: run.candidates.find((item) => item.versionId === c.versionId)?.developmentStatus })) },
+			const view = { version: 1, environment: "m07-evidence-handoff/v1", target: "executor", current: { bundleId: active.bundle.bundleId, executorVersionId: comparisonBaseline === "builtin" ? "builtin-default" : h.versionId, proposalSeedHVersionId: h.versionId, comparisonBaseline, baselineWorkflowHInjected: comparisonBaseline === "active-h", improverVersionId: i.versionId, slot: "evidence-handoff" },
+				methods: { executor: { versionId: h.versionId, body: h.artifact.body, role: comparisonBaseline === "builtin" ? "proposal-seed-only" : "baseline-and-proposal-seed" }, improver: { versionId: i.versionId, body: i.artifact.body }, candidates: [...candidates.values()].map((c) => ({ versionId: c.versionId, developmentStatus: run.candidates.find((item) => item.versionId === c.versionId)?.developmentStatus })) },
 				developmentSource: { id: source.id, m07RunId: source.m07RunId, m04RunId: source.m04RunId, excerpt: source.text.slice(0, 4_000), excerptEnd: Math.min(4_000, source.text.length), totalChars: source.text.length, totalUtf8Bytes: Buffer.byteLength(source.text, "utf8") },
 				metaEpisodes: priorEpisodes.map((episode) => ({ id: episode.id, runId: episode.runId, terminal: episode.terminal, decisionKinds: episode.decisions.map((d) => d.kind ?? "none"), candidateOutcomes: episode.candidates.map((c) => ({ id: c.id, claim: c.hypothesis.claim, developmentStatus: c.developmentStatus })), feedbackIds: episode.feedbackIndex.map((f) => f.id), sdkEstimatedCost: episode.usage.sdkEstimatedCost })),
-				feedback: run.developmentArms.slice(-plan.maxFeedbackItems).map((arm) => ({ caseId: arm.caseId, arm: arm.arm, methodVersionId: arm.methodVersionId, status: arm.status, checkResults: arm.checkResults, reason: arm.reason })),
+				feedback: run.developmentArms.slice(-plan.maxFeedbackItems).map((arm) => ({ caseId: arm.caseId, arm: arm.arm, methodVersionId: arm.methodVersionId, methodBinding: arm.methodBinding, status: arm.status, checkResults: arm.checkResults, reason: arm.reason })),
 				experience: { markdown: experience.markdown, refs: experience.refs }, budget: budget.status(), lastActionResult };
 			const decision = { index: index + 1, improverVersionId: i.versionId, outcome: "proposing" } as WorkflowRunV1["decisions"][number]; run.decisions.push(decision); await save();
-			await ensureLiveEpoch();
+			await ensureLiveLimits();
 			await ensureLiveExperience();
 			const step = await runBoundedModelStep({ runner, budget, lease: budget.root, spec: { label: `I-workflow-${runId}-${index}`, role: "improver", model: active.bundle.modelConfig.improver, systemPrompt: workflowImproverSystemPrompt(i.artifact.body), persistDir: ws.sessionsDir, methodBinding: { versionId: i.versionId } },
 				message: workflowDecisionPrompt(view) });
@@ -333,7 +415,7 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 			}
 			if (action.kind === "propose") {
 				if (action.body === h.artifact.body || [...candidates.values()].some((c) => c.artifact.body === action.body)) { lastActionResult = { kind: "propose", outcome: "rejected", reason: "unchanged or repeated candidate" }; await save(); continue; }
-				await ensureLiveEpoch();
+				await ensureLiveLimits();
 				await ensureLiveExperience();
 				const artifact = validateStrategy("executor", { version: 1, kind: "m07-workflow-prompt", slot: "evidence-handoff", body: action.body }) as M07WorkflowStrategyV1;
 				const candidate = await store.writeStrategy({ versionId: store.newId("H-agent"), kind: "executor", artifact, parentVersionId: h.versionId, origin: "agent-generated", applicability: action.hypothesis.applicability, limitations: [], sourceExperienceRefs: experience.refs.map((ref) => ({ targetKind: "improver" as const, ref })), requiredExperienceRefs: uniqueRequirements([...h.requiredExperienceRefs, ...i.requiredExperienceRefs]), requiredKnowledgeRefs: uniqueRefs([...h.requiredKnowledgeRefs, ...i.requiredKnowledgeRefs, ...experience.scientificRequiredRefs]), state: "research-only" });
@@ -348,7 +430,7 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 				for (const item of development.cases) {
 					const receipts: WorkflowArmReceiptV1[] = [];
 					for (const [arm, method] of [["baseline", h], ["candidate", candidateRecord]] as const) {
-						const receipt = await executeArm({ source: template, root: path.join(root, `development-${candidate.versionId}-${item.id}-${arm}`), bundle: active.bundle, h: method, i, caseInput: item, arm, runner, budget, lease: budget.root, perPromptTimeoutMs: plan.perPromptTimeoutMs });
+						const receipt = await executeArm({ source: template, root: path.join(root, `development-${candidate.versionId}-${item.id}-${arm}`), bundle: active.bundle, h: method, i, caseInput: item, arm, builtinBaseline: arm === "baseline" && comparisonBaseline === "builtin", runner, budget, lease: budget.root, perPromptTimeoutMs: plan.perPromptTimeoutMs, formalRunId: formal.run.runId, beforePrompt: () => beforePrompt([h, i, candidateRecord]) });
 						run.developmentArms.push(receipt); receipts.push(receipt); await save();
 						if (receipt.status !== "complete" || !receipt.usage.complete) break;
 					}
@@ -365,22 +447,19 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 			run.selectedCandidateId = selected.versionId;
 			await freezeDevelopment("selected");
 			run.selectionReceiptPath = path.join(dir, "selection-before-g.json");
-			await writeFileAtomic(run.selectionReceiptPath, `${JSON.stringify({ version: 1, candidateId: selected.versionId, selectedAt: nowIso(), I: i.versionId, H0: h.versionId, K: active.bundle.knowledgeSnapshot }, null, 2)}\n`);
+			await writeFileAtomic(run.selectionReceiptPath, `${JSON.stringify({ version: 1, candidateId: selected.versionId, selectedAt: nowIso(), I: i.versionId, comparisonBaseline, proposalSeedHVersionId: h.versionId, ...(comparisonBaseline === "active-h" ? { H0: h.versionId } : { baselineMethodVersionId: "builtin-default", baselineWorkflowHInjected: false }), K: active.bundle.knowledgeSnapshot }, null, 2)}\n`);
 			await save();
-			if (!plan.admissionCaseSetPath) { assertWorkflowBudgetOpen(budget, budget.root); run.status = "research-only"; run.stopReason = "no caller-frozen protected G set"; return run; }
-			const admission = await loadCases(path.resolve(ws.root, plan.admissionCaseSetPath), "admission");
-			if (admission.cases.some((a) => development.cases.some((d) => a.id === d.id || JSON.stringify({ ...a, id: "" }) === JSON.stringify({ ...d, id: "" })))) throw new HarnessError("improvement.workflow-g", "development and protected cases overlap");
-			await protectAdmissionInputs(ws, plan, development, admission);
-			await freezeCaseInputs(ws, template, admission.cases);
+			if (!admission) { assertWorkflowBudgetOpen(budget, budget.root); run.status = "research-only"; run.stopReason = "no caller-frozen protected G set"; return run; }
+
 			run.protectedOpenedAt = nowIso(); await save();
 			const candidateRecord = candidates.get(selected.versionId)!;
-			await ensureLiveEpoch();
+			await ensureLiveLimits();
 			await verifyLive([h, i, candidateRecord]);
 			await ensureLiveExperience();
 			for (let repeat = 0; repeat < plan.admissionRepetitions; repeat++) for (const item of admission.cases) {
 				const receipts: WorkflowArmReceiptV1[] = [];
 				const order = repeat % 2 === 0 ? [["baseline", h], ["candidate", candidateRecord]] as const : [["candidate", candidateRecord], ["baseline", h]] as const;
-				for (const [arm, method] of order) { const receipt = await executeArm({ source: template, root: path.join(root, `protected-${repeat}-${item.id}-${arm}`), bundle: active.bundle, h: method, i, caseInput: item, arm, runner, budget, lease: budget.root, perPromptTimeoutMs: plan.perPromptTimeoutMs }); run.protectedArms.push(receipt); receipts.push(receipt); await save(); if (receipt.status !== "complete" || !receipt.usage.complete) break; }
+				for (const [arm, method] of order) { const receipt = await executeArm({ source: template, root: path.join(root, `protected-${repeat}-${item.id}-${arm}`), bundle: active.bundle, h: method, i, caseInput: item, arm, builtinBaseline: arm === "baseline" && comparisonBaseline === "builtin", runner, budget, lease: budget.root, perPromptTimeoutMs: plan.perPromptTimeoutMs, formalRunId: formal.run.runId, protectedInputs, beforePrompt: () => beforePrompt([h, i, candidateRecord]) }); run.protectedArms.push(receipt); receipts.push(receipt); await save(); if (receipt.status !== "complete" || !receipt.usage.complete) break; }
 				if (receipts.some((r) => r.status !== "complete" || !r.usage.complete)) { run.status = "inconclusive"; run.outcome = "search-incomplete"; run.stopReason = "protected arm or usage incomplete"; return run; }
 				const before = receipts.find((r) => r.arm === "baseline")!, after = receipts.find((r) => r.arm === "candidate")!;
 				if (after.checkResults.some((r) => !r.passed) || !before.checkResults.some((r) => !r.passed)) { run.status = "rejected"; run.outcome = "candidate-rejected"; run.stopReason = "protected G found no strict gain or incomplete candidate checks"; return run; }
@@ -389,15 +468,17 @@ export async function runWorkflowEvidenceHandoff(args: { ws: Workspace; store: G
 			await verifyLive([h, i, candidateRecord]);
 			const current = await store.active();
 			if (current?.pointer.bundleId !== active.pointer.bundleId || current.pointer.runId !== active.pointer.runId) { run.status = "inconclusive"; run.stopReason = "active generation changed during isolated evaluation"; return run; }
+			if ((await currentKnowledge.current())?.id !== currentSnapshot) { run.status = "research-only"; run.outcome = "candidate-supported"; run.stopReason = "paired checks passed at the frozen knowledge snapshot; live knowledge advanced, so activation requires explicit realignment"; return run; }
 			const admitted = await store.writeStrategy({ versionId: store.newId("H-admitted"), kind: "executor", artifact: candidateRecord.artifact, parentVersionId: candidateRecord.versionId, origin: "agent-generated", applicability: candidateRecord.applicability, limitations: candidateRecord.limitations, sourceExperienceRefs: candidateRecord.sourceExperienceRefs, requiredExperienceRefs: candidateRecord.requiredExperienceRefs, requiredKnowledgeRefs: candidateRecord.requiredKnowledgeRefs, state: "admitted" });
 			const next = await store.writeBundle({ bundleId: store.newId("bundle"), parents: [active.bundle.bundleId], executorVersionId: admitted.versionId, improverVersionId: i.versionId, knowledgeSnapshot: active.bundle.knowledgeSnapshot, environmentVersion: "m07-workflow/v1", modelConfig: active.bundle.modelConfig, protocolVersion: active.bundle.protocolVersion, allowedCapabilities: active.bundle.allowedCapabilities, state: "admitted" });
 			await verifyLive([h, i, candidateRecord, admitted]);
-			await ensureLiveEpoch();
+			await ensureLiveLimits();
 			await ensureLiveExperience();
 			const latest = await store.active();
 			if (latest?.pointer.bundleId !== active.pointer.bundleId || latest.pointer.runId !== active.pointer.runId) { run.status = "inconclusive"; run.stopReason = "active generation changed before workflow promotion"; return run; }
-			await ensureLiveEpoch();
+			await ensureLiveLimits();
 			if (budget.status().inFlight) { run.status = "inconclusive"; run.stopReason = "campaign provider request remains in flight before workflow promotion"; return run; }
+			if ((await currentKnowledge.current())?.id !== currentSnapshot) throw new HarnessError("improvement.workflow-epoch", "knowledge epoch changed before workflow promotion");
 			await store.activate(next.bundleId, active.pointer, "local-workflow-handoff-admission", runId);
 			run.promotedMethodVersionId = admitted.versionId; run.status = "promoted"; run.outcome = "promoted"; run.stopReason = "local evidence-handoff mechanism checks passed in paired isolated arms; scientific benefit remains unverified"; return run;
 		}

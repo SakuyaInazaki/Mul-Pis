@@ -11,14 +11,14 @@ const SAFE_RUN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 export interface MetaEpisodeV1 {
  version: 1; id: string; runId: string; workspaceRoot: string; createdAt: string;
  phase: "development"; target: "executor" | "improver";
- current: { bundleId: string; executorVersionId: string; improverVersionId: string; knowledgeSnapshot?: string; environmentVersion: string; modelConfig: { improver: string; research: string }; protocolVersion: string };
+ current: { bundleId: string; executorVersionId: string; improverVersionId: string; knowledgeSnapshot?: string; environmentVersion: string; modelConfig: { improver: string; research: string }; protocolVersion: string; comparisonBaseline?: "active-h" | "builtin"; proposalSeedHVersionId?: string; baselineWorkflowHInjected?: boolean };
  decisions: Array<{ index: number; improverVersionId: string; kind?: string; outcome: string; feedbackId?: string; reason?: string }>;
  candidates: Array<{ id: string; kind: string; strategyVersionId: string; hypothesis: { claim: string; predictedObservation: string; falsifier: string; motivatingEvidenceIds: string[] }; developmentStatus: string }>;
  feedbackIndex: Array<{ id: string; caseId?: string; status: string; observationCount: number }>;
  feedbackExcerpt: Array<{ id: string; caseId?: string; status: string; observationCount: number; observations: Array<{ x: number; y: number; xUnit: string; yUnit: string; source: string }>; evidenceIds: string[] }>;
  feedbackTotal: number; feedbackExcerptCount: number;
  /** Complete development-only workflow arm observations; never protected G arms. */
- workflowDevelopmentArms?: Array<{ caseId: string; arm: string; methodVersionId: string; status: string; reason?: string; checkResults: Array<{ criterion: string; passed: boolean }>; reportDeliveredToM04?: boolean; feedbackStatus?: string; usage: WorkflowRunV1["developmentArms"][number]["usage"] }>;
+ workflowDevelopmentArms?: Array<{ caseId: string; arm: string; methodVersionId: string; methodBinding?: WorkflowRunV1["developmentArms"][number]["methodBinding"]; status: string; reason?: string; checkResults: Array<{ criterion: string; passed: boolean }>; reportDeliveredToM04?: boolean; feedbackStatus?: string; usage: WorkflowRunV1["developmentArms"][number]["usage"] }>;
  selectedCandidateId?: string; terminal: "selected" | "no-winner" | "inconclusive";
  usage: { providerCalls: number; inputTokens: number; outputTokens: number; sdkEstimatedCost: number; costSource: "sdk-estimate" | "unknown"; settlement: string };
 }
@@ -130,12 +130,12 @@ export function metaEpisodeForModel(episode: MetaEpisodeV1) {
 export function buildWorkflowMetaEpisode(run: WorkflowRunV1, bundle: GenerationBundleV1, workspaceRoot: string, terminal: MetaEpisodeV1["terminal"]): MetaEpisodeV1 {
  const budget = run.developmentBudgetAtSelection as { committed?: { providerCalls?: number; inputTokens?: number; outputTokens?: number; sdkEstimatedCost?: number }; settlement?: string; usageUnknown?: boolean } | undefined;
  return { version: 1, id: `meta:${run.runId}`, runId: run.runId, workspaceRoot: path.resolve(workspaceRoot), createdAt: new Date().toISOString(), phase: "development", target: "executor",
-  current: { bundleId: bundle.bundleId, executorVersionId: run.baselineExecutorVersionId, improverVersionId: run.improverVersionId, knowledgeSnapshot: run.knowledgeSnapshot, environmentVersion: "m07-workflow/v1", modelConfig: bundle.modelConfig, protocolVersion: bundle.protocolVersion },
+  current: { bundleId: bundle.bundleId, executorVersionId: run.baselineExecutorVersionId, ...(run.comparisonBaseline ? { comparisonBaseline: run.comparisonBaseline, proposalSeedHVersionId: run.proposalSeedHVersionId ?? run.baselineExecutorVersionId, baselineWorkflowHInjected: run.comparisonBaseline === "active-h" } : {}), improverVersionId: run.improverVersionId, knowledgeSnapshot: run.knowledgeSnapshot, environmentVersion: "m07-workflow/v1", modelConfig: bundle.modelConfig, protocolVersion: bundle.protocolVersion },
   decisions: run.decisions.map((d) => ({ index: d.index, improverVersionId: d.improverVersionId, kind: d.action, outcome: d.outcome })),
   candidates: run.candidates.map((c) => { const h = c.hypothesis as { claim: string; predictedObservation: string; falsifier: string; motivatingEvidenceIds: string[] }; return { id: c.versionId, kind: "executor", strategyVersionId: c.versionId, hypothesis: { claim: h.claim, predictedObservation: h.predictedObservation, falsifier: h.falsifier, motivatingEvidenceIds: h.motivatingEvidenceIds }, developmentStatus: c.developmentStatus }; }),
   feedbackIndex: run.developmentArms.map((arm, index) => ({ id: `workflow:${run.runId}:${index}`, caseId: arm.caseId, status: arm.status, observationCount: arm.checkResults.length })),
   feedbackExcerpt: [], feedbackTotal: run.developmentArms.length, feedbackExcerptCount: 0,
-  workflowDevelopmentArms: run.developmentArms.map((arm) => ({ caseId: arm.caseId, arm: arm.arm, methodVersionId: arm.methodVersionId, status: arm.status, reason: arm.reason, checkResults: arm.checkResults, reportDeliveredToM04: arm.reportDeliveredToM04, feedbackStatus: arm.feedbackStatus, usage: arm.usage })),
+  workflowDevelopmentArms: run.developmentArms.map((arm) => ({ caseId: arm.caseId, arm: arm.arm, methodVersionId: arm.methodVersionId, ...(arm.methodBinding ? { methodBinding: arm.methodBinding } : {}), status: arm.status, reason: arm.reason, checkResults: arm.checkResults, reportDeliveredToM04: arm.reportDeliveredToM04, feedbackStatus: arm.feedbackStatus, usage: arm.usage })),
   ...(run.selectedCandidateId ? { selectedCandidateId: run.selectedCandidateId } : {}), terminal,
   usage: { providerCalls: budget?.committed?.providerCalls ?? 0, inputTokens: budget?.committed?.inputTokens ?? 0, outputTokens: budget?.committed?.outputTokens ?? 0, sdkEstimatedCost: budget?.committed?.sdkEstimatedCost ?? 0, costSource: budget?.usageUnknown ? "unknown" : "sdk-estimate", settlement: budget?.settlement ?? "unknown" } };
 }

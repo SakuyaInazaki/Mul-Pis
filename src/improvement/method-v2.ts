@@ -62,8 +62,8 @@ export async function exportMethodPackageV2(store: GenerationStore, strategyVers
  return pkg;
 }
 /** Calling this is an explicit manual activation, with unverified external provenance. */
-export async function bindMethodPackageV2(store: GenerationStore, packagePath: string, previous: { pointer: ActiveGenerationPointerV1; bundle: GenerationBundleV1 }, runId: string): Promise<{ strategy: StrategyRecordV1; bundle: GenerationBundleV1 }> {
- const pkg = await readMethodPackageV2(packagePath);
+export async function bindMethodPackageV2(store: GenerationStore, checkedPackage: MethodPackageV2, previous: { pointer: ActiveGenerationPointerV1; bundle: GenerationBundleV1 }, runId: string): Promise<{ strategy: StrategyRecordV1; bundle: GenerationBundleV1 }> {
+ const pkg = validateMethodPackageV2(checkedPackage);
  const versionId = store.newId(`imported-${pkg.methodType}`);
  const strategy = await store.writeStrategy({ versionId, kind: pkg.methodType, artifact: pkg.artifact, origin: "external-manual-unverified", applicability: pkg.applicability, limitations: pkg.limitations, sourceExperienceRefs: pkg.sourceExperienceRefs, requiredExperienceRefs: pkg.requiredExperienceRefs, requiredKnowledgeRefs: pkg.requiredKnowledgeRefs, ...(pkg.dependencyTransition ? { dependencyTransition: pkg.dependencyTransition } : {}), state: "manual-active" });
  const bundle = await store.writeBundle({ bundleId: store.newId("bundle"), parents: [previous.bundle.bundleId], executorVersionId: pkg.methodType === "executor" ? versionId : previous.bundle.executorVersionId, improverVersionId: pkg.methodType === "improver" ? versionId : previous.bundle.improverVersionId,
