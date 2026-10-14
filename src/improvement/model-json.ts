@@ -28,8 +28,16 @@ export function parseSourceHypothesis(text: string): { claim: string; predictedO
 	const value = parseModelJson(text);
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new TypeError("hypothesis must be one JSON object");
 	const item = value as Record<string, unknown>;
-	const fields = ["claim", "predictedObservation", "falsifier"] as const;
-	for (const field of fields)
-		if (typeof item[field] !== "string" || !item[field].trim()) throw new TypeError(`hypothesis ${field} is missing`);
-	return { claim: item.claim as string, predictedObservation: item.predictedObservation as string, falsifier: item.falsifier as string };
+	const field = (name: "claim" | "predictedObservation" | "falsifier"): string => {
+		const part = item[name];
+		if (typeof part === "string" && part.trim()) return part;
+		if (part && typeof part === "object" && !Array.isArray(part) && Object.keys(part).length) {
+			return JSON.stringify(part, (_key, nested) => {
+				if (typeof nested === "number" && !Number.isFinite(nested)) throw new TypeError(`hypothesis ${name} contains a nonfinite number`);
+				return nested;
+			});
+		}
+		throw new TypeError(`hypothesis ${name} is missing or must be a nonempty string or object`);
+	};
+	return { claim: field("claim"), predictedObservation: field("predictedObservation"), falsifier: field("falsifier") };
 }

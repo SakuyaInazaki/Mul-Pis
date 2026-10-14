@@ -67,6 +67,47 @@ test("a fake model edits an isolated source tree and produces a private commit a
  assert.equal(JSON.parse(await readFile(f.receiptPath, "utf8")).sourceCommit, result.sourceCommit);
 });
 
+test("a structured builder hypothesis preserves every nested field without another model turn", async t => {
+ const f = await fixture(t);
+ const claim = { statement: "The handoff can omit relevant evidence", mechanism: { step: "M07 to M04", caveat: "Author report only" } };
+ const predictedObservation = { tasks: [{ taskId: "development-1", observation: "Evidence appears" },
+  { taskId: "development-2", observation: "Source attribution remains" }], expected: { status: "visible", count: 2 } };
+ const raw = ["Candidate edited.", "```json", JSON.stringify({ claim, predictedObservation,
+  falsifier: { condition: "Omission persists", checks: ["report", "knowledge"] } }), "```"].join("\n");
+ let turns = 0;
+ const runner = new FakeSessionRunner(async ctx => {
+  turns++;
+  await ctx.tools.edit({ path: "src/m07/feedback.ts", oldText: "'old'", newText: "'new'" });
+  return { text: raw, usage: { input: 15, output: 10, totalTokens: 25, cost: 0.002 } };
+ });
+ const result = await generateSourceCandidate({ ...f.base, runner });
+ assert.equal(result.status, "committed", result.reason);
+ assert.equal(turns, 1);
+ assert.deepEqual(JSON.parse(result.hypothesis!.claim), claim);
+ assert.deepEqual(JSON.parse(result.hypothesis!.predictedObservation), predictedObservation);
+ assert.deepEqual(JSON.parse(result.hypothesis!.falsifier), { condition: "Omission persists", checks: ["report", "knowledge"] });
+ assert.equal(result.hypothesisRawText, raw);
+ assert.equal(result.usage?.totalTokens, 25);
+ assert.equal(result.engineeringStatus, "passed");
+ assert.equal(JSON.parse(await readFile(f.receiptPath, "utf8")).hypothesisRawText, raw);
+});
+
+test("empty, null, array, and missing hypothesis fields remain rejected", async t => {
+ const invalid = [{}, null, [], "", undefined];
+ for (const value of invalid) {
+  const f = await fixture(t);
+  const runner = new FakeSessionRunner(async ctx => {
+   await ctx.tools.edit({ path: "src/m07/feedback.ts", oldText: "'old'", newText: "'new'" });
+   return JSON.stringify({ claim: value, predictedObservation: "observed", falsifier: "not observed" });
+  });
+  const result = await generateSourceCandidate({ ...f.base, runner });
+  assert.equal(result.status, "rejected", `claim=${String(value)}`);
+  assert.match(result.reason!, /hypothesis claim is missing/);
+  assert.equal(result.sourceCommit, undefined);
+  assert.equal(result.hypothesisRawText, JSON.stringify({ claim: value, predictedObservation: "observed", falsifier: "not observed" }));
+ }
+});
+
 
 test("source builder rejects ambiguous JSON fences and missing hypothesis fields", async t => {
  const ambiguous = await fixture(t);
