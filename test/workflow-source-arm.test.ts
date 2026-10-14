@@ -144,7 +144,7 @@ test("fixed A/B source arms run M07→M04 in separate child processes with one f
  const createV2Reply = async (file: string, includeRead: boolean) => writeFile(file, `import fs from "node:fs"; import path from "node:path";
 export default function reply({spec,message}) {
  if (message.includes(${JSON.stringify(hidden)}) || spec.systemPrompt.includes(${JSON.stringify(hidden)})) throw new Error("private G leaked to model");
- if (spec.role !== "research") return { text: "Correct source fact appears in M07 report, with a limiting condition.", usage: { input:100, output:20, cacheRead:0, cacheWrite:0, totalTokens:120, cost:0.001 } };
+ if (spec.role !== "research") return { text: "# Evidence report\\n\\n## Source fact\\nCorrect source fact appears in M07 report.\\n\\n### Limitation\\nThe observation has a limiting condition.", usage: { input:100, output:20, cacheRead:0, cacheWrite:0, totalTokens:120, cost:0.001 } };
  const goal = JSON.parse(fs.readFileSync(path.join(spec.tools.root,"goal.json"),"utf8"));
  const artifact = goal.tasks[0].review.artifacts[1].path;
  const relative = path.relative(spec.tools.root, artifact);

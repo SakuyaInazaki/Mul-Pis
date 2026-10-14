@@ -41,9 +41,11 @@ function readInFull(relative: string, content: string, message: string, ranges: 
 	const at = message.indexOf(heading);
 	if (content.length > 0 && at >= 0) {
 		const start = at + heading.length;
-		const next = [message.indexOf("\n### ", start), message.indexOf("\n## ", start)]
-			.filter((index) => index >= 0).sort((a, b) => a - b)[0] ?? message.length;
-		if (message.slice(start, next).includes(content)) return true;
+		// The inline artifact can contain its own Markdown headings. Match its
+		// bytes at the body start, after the controller's optional inventory line.
+		const inventoryEnd = message.startsWith(`- ${relative}；`, start) ? message.indexOf("\n\n", start) : -1;
+		const bodyStart = inventoryEnd < 0 ? start : inventoryEnd + 2;
+		if (message.startsWith(content, bodyStart)) return true;
 	}
 	const lines = content.split(/\r?\n/).length - (content.endsWith("\n") ? 1 : 0);
 	if (lines === 0) return ranges.some((event) => event.toolName === "m07_evidence_read" && event.path === relative && event.status === "no-content" && event.returned?.kind === "text" && !event.returned.truncated);
