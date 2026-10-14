@@ -13,6 +13,7 @@ import { prepareWorkflowCodeSource } from "../src/runtime/prepare-source.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 import type { UsageSummary } from "../src/runner/types.ts";
 import { Workspace } from "../src/workspace.ts";
+import { writeControlledSourceImproverSeed } from "./fixtures/source-improver-test-seed.ts";
 
 const usage = (): UsageSummary => ({ input: 2, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 3, cost: 0.001,
  reportedEvents: 1, unknownEvents: 0, complete: true, costComplete: true });
@@ -29,6 +30,8 @@ test("two loaded I sources produce different H descendants before any protected 
  for (const dir of ["extensions", "workflow", "tools"]) { await mkdir(path.join(repo, dir)); await writeFile(path.join(repo, dir, "fixture.txt"), "fixture\n"); }
  await cp(path.resolve("package.json"), path.join(repo, "package.json"));
  await symlink(path.resolve("node_modules"), path.join(repo, "node_modules"), "dir");
+ // The old arm is a fixed protocol fixture; evolvable I strategies are compared elsewhere.
+ await writeControlledSourceImproverSeed(repo);
  const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
  git("init", "-q"); git("config", "user.name", "Offline Fixture"); git("config", "user.email", "fixture@example.invalid");
  git("add", "src", "extensions", "workflow", "tools", "package.json"); git("commit", "-qm", "Meta parent source");

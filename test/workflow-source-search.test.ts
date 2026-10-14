@@ -10,6 +10,7 @@ import { openWorkflowImproverProcess } from "../src/improvement/workflow-improve
 import type { LoadedSourceV1 } from "../src/runtime/loaded-source.ts";
 import type { UsageSummary } from "../src/runner/types.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
+import { writeControlledSourceImproverSeed } from "./fixtures/source-improver-test-seed.ts";
 
 const completeUsage = (): UsageSummary => ({ input: 2, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 3, cost: 0.001,
  reportedEvents: 1, unknownEvents: 0, complete: true, costComplete: true });
@@ -26,6 +27,8 @@ async function fixture(t: test.TestContext) {
  for (const dir of ["extensions", "workflow", "tools"]) { await mkdir(path.join(repo, dir)); await writeFile(path.join(repo, dir, "fixture.txt"), "fixture\n"); }
  await cp(path.resolve("package.json"), path.join(repo, "package.json"));
  await symlink(path.resolve("node_modules"), path.join(repo, "node_modules"), "dir");
+ // Action-order assertions describe this controlled test actor, not the candidate runtime I.
+ await writeControlledSourceImproverSeed(repo);
  const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
  git("init", "-q"); git("config", "user.name", "Offline Fixture"); git("config", "user.email", "fixture@example.invalid");
  git("add", "src", "extensions", "workflow", "tools", "package.json"); git("commit", "-qm", "Seed I source");
@@ -119,6 +122,48 @@ test("one complete JSON fence settles ask-model without a redundant retry", asyn
  assert.deepEqual(result.modelSessions.map(item => item.status), ["returned"]);
  assert.equal(result.actions.filter(item => item.action.kind === "ask-model").length, 1);
  assert.equal(result.actions.find(item => item.action.kind === "propose-source")?.action.kind, "propose-source");
+});
+
+test("asynchronous source-search actions stay pending on disk until their operation settles", async t => {
+ const f = await fixture(t);
+ for (const kind of ["ask-model", "propose-source", "evaluate-development"] as const) {
+  const suffix = `pending-${kind}`;
+  let release!: () => void;
+  let entered!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const runner = new FakeSessionRunner(async () => {
+   if (kind === "ask-model") { entered(); await held; }
+   return { text: JSON.stringify({ brief: "Investigate evidence handoff" }),
+    usage: { input: 4, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 7, cost: 0.002 } };
+  });
+  const base = runArgs(f, f.seed, suffix, runner);
+  const run = runWorkflowSourceSearch({ ...base,
+   proposeSource: async request => {
+    if (kind === "propose-source") { entered(); await held; }
+    return base.proposeSource(request);
+   },
+   evaluateDevelopment: async request => {
+    if (kind === "evaluate-development") { entered(); await held; }
+    return base.evaluateDevelopment(request);
+   } });
+  try {
+   await started;
+   const saved = JSON.parse(await readFile(base.receiptPath, "utf8"));
+   assert.equal(saved.status, "running");
+   assert.equal(saved.actions.at(-1).action.kind, kind);
+   assert.equal(saved.actions.at(-1).outcome, "pending");
+   assert.equal(saved.selectionReceiptPath, undefined);
+  } finally { release(); }
+  const result = await run;
+  assert.equal(result.status, "selected", result.reason);
+  assert.equal(result.actions.find(item => item.action.kind === kind)?.outcome, "completed");
+  assert.equal(JSON.parse(await readFile(base.receiptPath, "utf8")).actions.find((item: { action: { kind: string } }) =>
+   item.action.kind === kind).outcome, "completed");
+  assert.ok(result.actions.every(item => item.outcome !== "pending"));
+  assert.ok(JSON.parse(await readFile(result.selectionReceiptPath!, "utf8")).actions.every((item: { outcome: string }) =>
+   item.outcome !== "pending"));
+ }
 });
 
 test("an I source cannot select an unregistered or unevaluated candidate", async t => {

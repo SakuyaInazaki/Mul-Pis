@@ -31,6 +31,7 @@ export interface SourceCandidateReceipt {
  diff: string; developmentEvidence: Array<{ id: string; frozenPath: string; bytes: number }>;
  hypothesis?: { claim: string; predictedObservation: string; falsifier: string };
  hypothesisRawText?: string;
+ hypothesisCorrectionRawText?: string;
  developmentBrief?: string;
  session?: SessionRef; toolLog?: ToolCallRecord[]; usage?: UsageSummary;
  checks: Array<{ name: string; passed: boolean; exitCode: number | null; output: string }>;
@@ -127,7 +128,7 @@ export async function generateSourceCandidate(input: SourceCandidateInput): Prom
   for (const file of input.writableFiles) await mkdir(path.dirname(path.join(root, file)), { recursive: true });
   const tools = await createConfinedCampaignFileTools(root, { writableFiles: input.writableFiles });
   const session = await input.runner.create({ label: "source-candidate-builder", role: "improver", model: input.model,
-   systemPrompt: "You are editing a research workflow source candidate. Read the frozen development evidence and relevant source. Form your own falsifiable failure hypothesis, then edit only the explicitly writable source files with the granted file tools. Do not change evaluation, controller, runner, verifier, budget, knowledge merge, or usage code. Keep changes minimal and task-independent; do not embed experiment-specific facts or add arbitrary count, cost, time, or output caps. After editing, return JSON with nonempty string claim, predictedObservation, and falsifier fields when possible, for example {\"claim\":\"The handoff can omit relevant evidence\",\"predictedObservation\":\"The revised handoff includes the omitted evidence\",\"falsifier\":\"The omission persists\"}.",
+   systemPrompt: "You are editing a research workflow source candidate. Read the frozen development evidence and relevant source. Form your own falsifiable failure hypothesis, then edit only the explicitly writable source files with the granted file tools. Do not change evaluation, controller, runner, verifier, budget, knowledge merge, or usage code. Keep changes minimal and task-independent; do not embed experiment-specific facts or add arbitrary count, cost, time, or output caps. After editing, your final response must be exactly one raw JSON document or one complete ```json code fence, with no other prose or code fences. The JSON object must contain claim, predictedObservation, and falsifier, each a nonempty string or object. Write the hypothesis yourself; for example {\"claim\":\"The handoff can omit relevant evidence\",\"predictedObservation\":\"The revised handoff includes the omitted evidence\",\"falsifier\":\"The omission persists\"}.",
    tools: { kind: "custom", tools }, persistDir: input.persistDir });
   receipt.session = session.ref;
   const onAbort = () => { void session.abort().catch(() => {}); };
@@ -138,7 +139,14 @@ export async function generateSourceCandidate(input: SourceCandidateInput): Prom
     ...(input.developmentBrief !== undefined ? { developmentBrief: input.developmentBrief } : {}),
     developmentEvidence: receipt.developmentEvidence.map(({ id, frozenPath }) => ({ id, relativePath: path.relative(root, frozenPath) })) }));
    receipt.hypothesisRawText = turn.text;
-   receipt.hypothesis = parseHypothesis(turn.text);
+   try { receipt.hypothesis = parseHypothesis(turn.text); }
+   catch (error) {
+    if (input.signal?.aborted) throw new Error("source candidate cancelled before hypothesis correction");
+    const correction = await session.prompt(`Your hypothesis handoff failed strict format or field validation: ${(error as Error).message}. Correct only the handoff shape. Do not call tools or edit source. Return your own claim, predictedObservation, and falsifier as exactly one raw JSON document or one complete \`\`\`json code fence, with no other prose or code fences. Each field must be a nonempty string or object.`);
+    receipt.hypothesisCorrectionRawText = correction.text;
+    if (input.signal?.aborted) throw new Error("source candidate cancelled during hypothesis correction");
+    receipt.hypothesis = parseHypothesis(correction.text);
+   }
   } finally {
    input.signal?.removeEventListener("abort", onAbort);
    receipt.toolLog = session.toolLog(); receipt.usage = session.usageSummary(); session.dispose();

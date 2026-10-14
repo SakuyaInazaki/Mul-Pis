@@ -41,7 +41,7 @@ export interface WorkflowSourceSearchReceipt {
  baseline: WorkflowSourceSearchInput["baseline"]; editTarget: WorkflowSourceEditTargetV1;
  program: { pid: number; modulePath: string; exportName: string; source: LoadedSourceV1 };
  model: string; developmentIds: string[]; state: WorkflowImproverStateV1;
- actions: Array<{ index: number; action: WorkflowImproverActionV1; outcome: "completed" | "failed"; reason?: string; resultId?: string;
+ actions: Array<{ index: number; action: WorkflowImproverActionV1; outcome: "pending" | "completed" | "failed"; reason?: string; resultId?: string;
   usage?: UsageSummary[]; operationReceiptPath?: string }>;
  modelSessions: Array<{ id: string; session?: SessionRef; usage?: UsageSummary; status: "returned" | "parse-error" | "provider-failed" }>;
  candidates: SourceSearchCandidateV1[]; evaluations: SourceSearchEvaluationV1[];
@@ -164,7 +164,7 @@ export async function runWorkflowSourceSearch(input: WorkflowSourceSearchInput):
    try { action = validateAction(await process.decide(structuredClone(state))); }
    catch (error) { receipt.status = "incomplete"; receipt.reason = `source I decision failed: ${(error as Error).message}`; break; }
    state.lastAction = action;
-   const record: WorkflowSourceSearchReceipt["actions"][number] = { index: receipt.actions.length, action, outcome: "completed" };
+   const record: WorkflowSourceSearchReceipt["actions"][number] = { index: receipt.actions.length, action, outcome: "pending" };
    receipt.actions.push(record);
    await save();
    try {
@@ -262,6 +262,7 @@ export async function runWorkflowSourceSearch(input: WorkflowSourceSearchInput):
      receipt.status = receipt.usage.usageUnknown || !receipt.usage.costComplete ? "incomplete" : action.candidateId ? "selected" : "no-winner";
      receipt.reason = receipt.usage.usageUnknown ? "search usage did not settle completely" :
       !receipt.usage.costComplete ? "search estimated provider cost did not settle completely" : action.reason;
+     record.outcome = "completed";
      if (receipt.status !== "incomplete") {
       const selectionReceiptPath = `${input.receiptPath}.selection.json`;
       await writeFile(selectionReceiptPath, `${JSON.stringify({ version: 1, runId: receipt.runId, source: receipt.source,
@@ -276,6 +277,7 @@ export async function runWorkflowSourceSearch(input: WorkflowSourceSearchInput):
      }
      break;
     }
+    if (record.outcome === "pending") record.outcome = "completed";
    } catch (error) {
     record.outcome = "failed"; record.reason = (error as Error).message;
     state.operationFailures.push({ kind: action.kind, reason: record.reason });

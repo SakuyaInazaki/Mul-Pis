@@ -68,6 +68,108 @@ test("a fake model edits an isolated source tree and produces a private commit a
  assert.equal(JSON.parse(await readFile(f.receiptPath, "utf8")).sourceCommit, result.sourceCommit);
 });
 
+test("builder corrects a prose-plus-raw-JSON handoff in the same session and commits the checked edit", async t => {
+ const f = await fixture(t);
+ const hypothesis = { claim: "The handoff omits evidence", predictedObservation: "The new behavior appears", falsifier: "The omission persists" };
+ const first = `I edited the feedback source.\n${JSON.stringify(hypothesis)}`;
+ let turns = 0;
+ const runner = new FakeSessionRunner(async ctx => {
+  turns++;
+  if (turns === 1) {
+   await ctx.tools.read({ path: ".source-candidate-evidence/D1.txt" });
+   await ctx.tools.edit({ path: "src/m07/feedback.ts", oldText: "'old'", newText: "'new'" });
+   return { text: first, usage: { input: 11, output: 7, cacheRead: 0, cacheWrite: 0, totalTokens: 18, cost: 0.001 } };
+  }
+  assert.equal(turns, 2);
+  assert.match(ctx.message, /expected one complete/);
+  assert.match(ctx.message, /Do not call tools or edit source/);
+  return { text: JSON.stringify(hypothesis), usage: { input: 5, output: 7, cacheRead: 0, cacheWrite: 0, totalTokens: 12, cost: 0.002 } };
+ });
+ const result = await generateSourceCandidate({ ...f.base, runner });
+ assert.equal(result.status, "committed", result.reason);
+ assert.equal(result.engineeringStatus, "passed");
+ assert.equal(turns, 2);
+ assert.equal(runner.created.length, 1);
+ assert.deepEqual(result.hypothesis, hypothesis);
+ assert.equal(result.hypothesisRawText, first);
+ assert.equal(result.hypothesisCorrectionRawText, JSON.stringify(hypothesis));
+ assert.equal(result.usage?.totalTokens, 30);
+ assert.equal(result.usage?.cost, 0.003);
+ assert.equal(result.usage?.reportedEvents, 2);
+ assert.equal(result.usage?.unknownEvents, 0);
+ assert.equal(result.usage?.complete, true);
+ assert.equal(result.usage?.costComplete, true);
+ assert.deepEqual(result.toolLog?.map(item => item.name), ["read", "edit"]);
+ assert.ok(result.sourceCommit);
+ assert.equal(execFileSync("git", ["-C", f.candidateRoot, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), result.sourceCommit);
+ assert.equal(JSON.parse(await readFile(f.receiptPath, "utf8")).hypothesisCorrectionRawText, JSON.stringify(hypothesis));
+});
+
+test("a second invalid handoff or provider error rejects the candidate", async t => {
+ for (const failure of ["invalid", "provider"] as const) {
+  const f = await fixture(t);
+  const first = "Edited source.\n{\"claim\":\"hypothesis\"}";
+  let turns = 0;
+  const runner = new FakeSessionRunner(async ctx => {
+   turns++;
+   if (turns === 1) {
+    await ctx.tools.edit({ path: "src/m07/feedback.ts", oldText: "'old'", newText: "'new'" });
+    return { text: first, usage: { input: 8, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 12, cost: 0.001 } };
+   }
+   assert.equal(turns, 2);
+   if (failure === "provider") throw new Error("offline correction provider failure");
+   return { text: "still no JSON", usage: { input: 3, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 7, cost: 0.002 } };
+  });
+  const result = await generateSourceCandidate({ ...f.base, runner });
+  assert.equal(result.status, "rejected");
+  assert.equal(result.engineeringStatus, "unverified");
+  assert.equal(result.hypothesisRawText, first);
+  assert.equal(result.hypothesisCorrectionRawText, failure === "invalid" ? "still no JSON" : undefined);
+  assert.match(result.reason!, failure === "invalid" ? /expected one complete/ : /offline correction provider failure/);
+  assert.equal(result.usage?.totalTokens, failure === "provider" ? 12 : 19);
+  assert.equal(result.usage?.reportedEvents, failure === "provider" ? 1 : 2);
+  assert.equal(result.usage?.unknownEvents, failure === "provider" ? 1 : 0);
+  assert.equal(result.usage?.complete, failure !== "provider");
+  assert.equal(result.usage?.costComplete, failure !== "provider");
+  assert.equal(result.toolLog?.length, 1);
+  assert.equal(result.sourceCommit, undefined);
+  assert.equal(turns, 2);
+ }
+});
+
+test("cancellation during the hypothesis correction leaves a rejected receipt", async t => {
+ const f = await fixture(t);
+ const controller = new AbortController();
+ let correctionStarted!: () => void;
+ const waiting = new Promise<void>(resolve => { correctionStarted = resolve; });
+ let turns = 0;
+ const runner = new FakeSessionRunner(async ctx => {
+  turns++;
+  if (turns === 1) {
+   await ctx.tools.edit({ path: "src/m07/feedback.ts", oldText: "'old'", newText: "'new'" });
+   return { text: "An edit was made.\n{\"claim\":\"unfenced\"}",
+    usage: { input: 8, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 12, cost: 0.001 } };
+  }
+  correctionStarted();
+  return new Promise<never>(() => {});
+ });
+ const pending = generateSourceCandidate({ ...f.base, runner, signal: controller.signal });
+ await waiting;
+ controller.abort();
+ const result = await pending;
+ assert.equal(result.status, "rejected");
+ assert.match(result.reason!, /aborted|cancelled/);
+ assert.equal(result.hypothesisRawText, "An edit was made.\n{\"claim\":\"unfenced\"}");
+ assert.equal(result.hypothesisCorrectionRawText, undefined);
+ assert.equal(result.engineeringStatus, "unverified");
+ assert.equal(result.usage?.reportedEvents, 1);
+ assert.equal(result.usage?.unknownEvents, 1);
+ assert.equal(result.usage?.complete, false);
+ assert.equal(result.usage?.costComplete, false);
+ assert.equal(result.sourceCommit, undefined);
+ assert.equal(turns, 2);
+});
+
 test("a structured builder hypothesis preserves every nested field without another model turn", async t => {
  const f = await fixture(t);
  const claim = { statement: "The handoff can omit relevant evidence", mechanism: { step: "M07 to M04", caveat: "Author report only" } };
@@ -98,7 +200,7 @@ test("empty, null, array, and missing hypothesis fields remain rejected", async 
  for (const value of invalid) {
   const f = await fixture(t);
   const runner = new FakeSessionRunner(async ctx => {
-   await ctx.tools.edit({ path: "src/m07/feedback.ts", oldText: "'old'", newText: "'new'" });
+   if (ctx.turnIndex === 1) await ctx.tools.edit({ path: "src/m07/feedback.ts", oldText: "'old'", newText: "'new'" });
    return JSON.stringify({ claim: value, predictedObservation: "observed", falsifier: "not observed" });
   });
   const result = await generateSourceCandidate({ ...f.base, runner });
@@ -113,7 +215,7 @@ test("empty, null, array, and missing hypothesis fields remain rejected", async 
 test("source builder rejects ambiguous JSON fences and missing hypothesis fields", async t => {
  const ambiguous = await fixture(t);
  const ambiguousRunner = new FakeSessionRunner(async ctx => {
-  await ctx.tools.edit({ path: "src/m07/feedback.ts", oldText: "'old'", newText: "'new'" });
+  if (ctx.turnIndex === 1) await ctx.tools.edit({ path: "src/m07/feedback.ts", oldText: "'old'", newText: "'new'" });
   return ["A candidate was edited.", "```json", JSON.stringify({ claim: "one", predictedObservation: "two", falsifier: "three" }), "```",
    "```json", JSON.stringify({ claim: "other", predictedObservation: "other", falsifier: "other" }), "```"].join("\n");
  });
@@ -124,7 +226,7 @@ test("source builder rejects ambiguous JSON fences and missing hypothesis fields
 
  const malformed = await fixture(t);
  const malformedRunner = new FakeSessionRunner(async ctx => {
-  await ctx.tools.edit({ path: "src/m07/feedback.ts", oldText: "'old'", newText: "'new'" });
+  if (ctx.turnIndex === 1) await ctx.tools.edit({ path: "src/m07/feedback.ts", oldText: "'old'", newText: "'new'" });
   return ["A candidate was edited.", "```json", JSON.stringify({ claim: "one", predictedObservation: "two" }), "```"].join("\n");
  });
  const rejectedMalformed = await generateSourceCandidate({ ...malformed.base, runner: malformedRunner });
