@@ -115,6 +115,42 @@ test("M04 can choose no proposal after full selected M07 reads and sees exact pa
 	assert.match(message, /完整读取/);
 });
 
+test("empty M04 final answers receive same-session repair before a nonempty no-proposal judgment", async t => {
+	for (const empty of ["", " \n\t "]) await t.test(JSON.stringify(empty), async child => {
+		const f = await fixture(child);
+		const events: M04InvalidJudgmentEvent[] = [];
+		const usage = { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 12, cost: 0.01 };
+		const final = "The frozen evidence supports no reusable knowledge change, so I submit no proposal.";
+		const fake = new FakeSessionRunner(({ turnIndex, message }) => {
+			if (turnIndex === 1) return { text: empty, readReturns: returnedRanges(f.relative), usage };
+			assert.equal(events.length, 1, "the empty original reaches the diagnostic before repair");
+			assert.match(message, /empty or whitespace only/);
+			assert.match(message, /not a completed judgment or a no-proposal decision/);
+			return { text: final, usage };
+		});
+		f.ctx.runner = fake;
+		const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId },
+			freshSession: true, requiredM07ReadPaths: f.relative,
+			onInvalidJudgment: async event => { events.push(event); } });
+		assert.equal(result.record.status, "completed");
+		assert.equal(result.proposalId, undefined);
+		assert.equal(result.output, final);
+		assert.deepEqual(events.map(event => [event.rawResponse, event.validation.code]),
+			[[empty, "m04.empty-response"]]);
+		const session = [...fake.sessions.values()].find(item => item.spec.label === "M04-research")!;
+		assert.equal(fake.created.filter(spec => spec.label === "M04-research").length, 1);
+		assert.equal(session.turns, 2);
+		assert.equal(session.transcript[1]?.text, empty);
+		assert.equal(session.transcript[3]?.text, final);
+		const usageRows = (await readFile(session.ref.file!.replace(/\.jsonl$/, ".usage.jsonl"), "utf8"))
+			.trim().split("\n").map(line => JSON.parse(line) as { promptIndex: number; outcome: string; events: Array<{ usage: typeof usage; status: string }> });
+		assert.deepEqual(usageRows.map(row => [row.promptIndex, row.outcome, row.events[0]?.status]),
+			[[1, "completed", "reported"], [2, "completed", "reported"]]);
+		assert.deepEqual(usageRows.map(row => row.events[0]?.usage), [usage, usage]);
+		assert.equal(await readFile(result.record.outputs.find(item => item.label === "处理结果")!.path, "utf8"), `${final}\n`);
+	});
+});
+
 test("every invalid M04 reply reaches the private callback before another prompt", async t => {
 	const f = await fixture(t);
 	const raw = ["Read proof remains incomplete despite this judgment.",

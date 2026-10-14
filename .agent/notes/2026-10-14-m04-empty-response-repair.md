@@ -1,0 +1,7 @@
+# Require a visible M04 judgment before completion
+
+A real provider response ended normally but contained no visible answer. M04 previously interpreted the empty string as an ordinary no-proposal decision and marked the stage complete. M04 now returns an empty or whitespace-only final answer through its existing judgment repair path. The model receives a specific correction request in the same session; repeated unchanged failure follows the existing fresh-context recovery. A nonempty explanation that supports no knowledge change remains valid.
+
+The original response and reported usage remain in the session transcript and usage ledger. This change does not derive a judgment from private reasoning, invent a knowledge proposal, alter scientific acceptance, or rewrite historical run records. The offline regression checks empty and whitespace-only responses, same-session correction, both usage events, and completion after a genuine textual no-proposal judgment.
+
+Typecheck and the complete offline suite passed: 1661 tests, 1645 passed, 16 skipped, zero failures and cancellations. A fresh real M04 session over the same frozen input produced a visible report, corrected a malformed proposal in the same session, and published a new knowledge snapshot. That real rerun exercised existing proposal repair; the empty-answer branch is verified by offline regressions. Original experiment evidence remains private; only reviewed aggregate outcomes are published.

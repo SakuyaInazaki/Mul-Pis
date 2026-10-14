@@ -705,6 +705,17 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 							continue;
 						}
 					}
+					if (!turn.text.trim()) {
+						await captureInvalidJudgment(turn.text, {
+							code: "m04.empty-response",
+							message: "M04 final response is empty or whitespace only; no judgment was returned",
+							path: "response",
+						});
+						const guidance = "Your last M04 final response was empty or whitespace only. It is not a completed judgment or a no-proposal decision. Continue in this same session over the same frozen evidence and return a nonempty M04 judgment. If the evidence supports no knowledge change, explain that conclusion in text and omit the knowledge-proposals block. Do not invent a proposal to satisfy this format repair.";
+						request = await repairJudgment("empty-judgment", { category: "empty-final-response" },
+							workflowRepairFingerprint({ response: turn.text }), guidance);
+						continue;
+					}
 					const parsed = extractKnowledgeProposals(turn.text);
 					if (parsed.error) await captureInvalidJudgment(turn.text, {
 						code: parsed.error === "knowledge-proposals 代码块不是 JSON 数组"
