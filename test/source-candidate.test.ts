@@ -49,7 +49,8 @@ test("a fake model edits an isolated source tree and produces a private commit a
   assert.equal(JSON.parse(ctx.message).developmentBrief, "Investigate the frozen handoff observation");
   await ctx.tools.read({ path: ".source-candidate-evidence/D1.txt" });
   await ctx.tools.edit({ path: "src/m07/feedback.ts", oldText: "'old'", newText: "'new'" });
-  return { text: ["The feedback handoff deserves a targeted source change.", "```json",
+  return { text: ["The feedback handoff deserves a targeted source change.", "```ts",
+   "export const note = { source: 'M07' };", "```", "```json",
    JSON.stringify({ claim: "A handoff behavior may need revision", predictedObservation: "new behavior appears", falsifier: "old behavior persists", optionalNote: "additional commentary remains compatible" }),
    "```"].join("\n"), usage: { input: 12, output: 8, totalTokens: 20, cost: 0.001 } };
  });
