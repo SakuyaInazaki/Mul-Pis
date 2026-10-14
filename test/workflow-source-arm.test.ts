@@ -222,7 +222,9 @@ export default function reply({spec,message}) {
  const bindingB = { sourceRoot: sourceB.sourceRoot, sourceCommit: sourceB.sourceCommit };
  const search = await runWorkflowSourceSearch({ workspaceRoot: seedData.root, persistDir: path.join(root, "search-sessions"), receiptPath: searchPath,
   signal: new AbortController().signal,
-  source: bindingA, improverVersionId: seedBundle.improverVersionId, runner: new FakeSessionRunner(() => ({
+  source: bindingA, improverVersionId: seedBundle.improverVersionId,
+  editTarget: { kind: "H-executor", objective: "Improve development evidence handoff", writableFiles: ["src/m07/feedback.ts"] },
+  runner: new FakeSessionRunner(() => ({
    text: JSON.stringify({ brief: "Improve evidence handoff." }), usage: { input: 4, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 7, cost: 0.002 } })),
   baseline: { bundleId: seedBundle.bundleId, executorVersionId: seedBundle.executorVersionId, executorSource: bindingA, developmentSetId: "dev-fixture" },
   development: [{ id: "dev-1", text: "The original feedback is long." }],
@@ -298,7 +300,9 @@ export default function reply({spec,message}) {
  await writeFile(evaluationCReceipt, JSON.stringify({ candidateId: "candidate-C", status: "preferred", reason: "offline fixture" }));
  const searchC = await runWorkflowSourceSearch({ workspaceRoot: seedData.root, persistDir: path.join(root, "search-C-sessions"),
   receiptPath: path.join(root, "source-search-C.json"), signal: new AbortController().signal,
-  source: bindingA, improverVersionId: seedBundle.improverVersionId, runner: new FakeSessionRunner(() => ({
+  source: bindingA, improverVersionId: seedBundle.improverVersionId,
+  editTarget: { kind: "H-executor", objective: "Improve development evidence handoff", writableFiles: ["src/m07/feedback.ts"] },
+  runner: new FakeSessionRunner(() => ({
    text: JSON.stringify({ brief: "Improve source H again." }), usage: { input: 4, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 7, cost: 0.002 } })),
   baseline: { bundleId: adopted.bundle.bundleId, executorVersionId: candidate.versionId, executorSource: bindingB, developmentSetId: "dev-fixture-2" },
   development: [{ id: "dev-2", text: "Second-generation development observation." }],

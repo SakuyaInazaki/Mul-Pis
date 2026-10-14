@@ -49,9 +49,11 @@ function runArgs(f: Awaited<ReturnType<typeof fixture>>, source: LoadedSourceV1,
  usage = completeUsage()) {
  return { workspaceRoot: f.workspaceRoot, persistDir: path.join(f.root, `sessions-${suffix}`), receiptPath: path.join(f.root, `search-${suffix}.json`),
   source, improverVersionId: `I-${suffix}`, runner, signal: new AbortController().signal,
+  editTarget: { kind: "H-executor" as const, objective: "Improve development evidence handoff", writableFiles: ["src/m07/feedback.ts"] },
   baseline: { bundleId: `G-${suffix}`, executorVersionId: `H-${suffix}`, executorSource: f.seed, developmentSetId: `D-${suffix}` },
   development: [{ id: "D1", text: "First frozen development observation" }, { id: "D2", text: "Second frozen development observation" }],
-  proposeSource: async (request: { brief: string; model: string; evidence: Array<{ id: string; text: string }> }) => {
+  proposeSource: async (request: { brief: string; model: string; editTarget: { kind: string; writableFiles: string[] }; evidence: Array<{ id: string; text: string }> }) => {
+   assert.ok(request.editTarget.kind && request.editTarget.writableFiles.length === 1);
    assert.ok(request.brief.length > 0); assert.ok(request.evidence.length > 0); assert.equal(request.model, "fake/improver");
    const receiptPath = path.join(f.root, `candidate-${suffix}.json`);
    await writeFile(receiptPath, JSON.stringify({ version: 1, status: "committed", engineeringStatus: "passed",
@@ -88,6 +90,35 @@ test("two actually loaded I source versions choose different development action 
  assert.equal(selection.candidates[0].id, "C-variant");
  assert.equal(selection.evaluations[0].candidateId, "C-variant");
  assert.equal(selection.usage.totals.cost, 0.004);
+});
+
+test("ask-model receives the trusted H or I source-edit target", async t => {
+ const f = await fixture(t);
+ const seen: Array<{ systemPrompt: string; message: Record<string, unknown> }> = [];
+ const runner = new FakeSessionRunner(ctx => {
+  seen.push({ systemPrompt: ctx.spec.systemPrompt, message: JSON.parse(ctx.message) });
+  return { text: JSON.stringify({ brief: "Edit the permitted source module" }), usage: { input: 4, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 7, cost: 0.002 } };
+ });
+ const h = await runWorkflowSourceSearch(runArgs(f, f.seed, "target-H", runner));
+ const i = await runWorkflowSourceSearch({ ...runArgs(f, f.seed, "target-I", runner),
+  editTarget: { kind: "I-improver" as const, objective: "Improve I decisions over H offspring", writableFiles: ["src/improvement/workflow-improver-program.ts"] } });
+ assert.equal(h.status, "selected"); assert.equal(i.status, "selected");
+ assert.equal(seen.length, 2);
+ assert.deepEqual(seen.map(item => item.message.editTarget), [h.editTarget, i.editTarget]);
+ assert.ok(seen[0].systemPrompt.includes("H-executor") && seen[0].systemPrompt.includes("src/m07/feedback.ts"));
+ assert.ok(seen[1].systemPrompt.includes("I-improver") && seen[1].systemPrompt.includes("src/improvement/workflow-improver-program.ts"));
+ assert.deepEqual(JSON.parse(await readFile(i.selectionReceiptPath!, "utf8")).editTarget, i.editTarget);
+});
+
+test("one complete JSON fence settles ask-model without a redundant retry", async t => {
+ const f = await fixture(t);
+ const runner = new FakeSessionRunner(() => ({ text: "Analysis follows.\n```json\n{\"brief\":\"Edit the allowed workflow source\"}\n```",
+  usage: { input: 4, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 7, cost: 0.002 } }));
+ const result = await runWorkflowSourceSearch(runArgs(f, f.seed, "fenced-json", runner));
+ assert.equal(result.status, "selected", result.reason);
+ assert.deepEqual(result.modelSessions.map(item => item.status), ["returned"]);
+ assert.equal(result.actions.filter(item => item.action.kind === "ask-model").length, 1);
+ assert.equal(result.actions.find(item => item.action.kind === "propose-source")?.action.kind, "propose-source");
 });
 
 test("an I source cannot select an unregistered or unevaluated candidate", async t => {

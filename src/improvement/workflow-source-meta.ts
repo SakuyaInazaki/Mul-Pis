@@ -195,6 +195,7 @@ export async function runWorkflowSourceMetaComparison(input: WorkflowSourceMetaI
       receiptPath: searchPath, source, improverVersionId: arm === "old" ? oldI.versionId : newI.versionId,
       baseline: { bundleId: input.plan.baselineBundleId, executorVersionId: baseline.executorVersionId,
        executorSource: baseline.executorSource, developmentSetId: baseline.developmentSetId },
+      editTarget: { kind: "H-executor", objective: "Improve H executor outcomes under the frozen development evaluator; distinguish required quality checks from diagnostic observations", writableFiles: [H_FILE] },
       development: structuredClone(input.development), runner: input.runner, signal: input.signal,
       beforeOperation: input.beforeOperation,
       proposeSource: async request => {

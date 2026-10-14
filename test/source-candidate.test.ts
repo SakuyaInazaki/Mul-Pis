@@ -49,11 +49,13 @@ test("a fake model edits an isolated source tree and produces a private commit a
   assert.equal(JSON.parse(ctx.message).developmentBrief, "Investigate the frozen handoff observation");
   await ctx.tools.read({ path: ".source-candidate-evidence/D1.txt" });
   await ctx.tools.edit({ path: "src/m07/feedback.ts", oldText: "'old'", newText: "'new'" });
-  return { text: JSON.stringify({ claim: "A handoff behavior may need revision", predictedObservation: "new behavior appears", falsifier: "old behavior persists" }),
-   usage: { input: 12, output: 8, totalTokens: 20, cost: 0.001 } };
+  return { text: ["The feedback handoff deserves a targeted source change.", "```json",
+   JSON.stringify({ claim: "A handoff behavior may need revision", predictedObservation: "new behavior appears", falsifier: "old behavior persists", optionalNote: "additional commentary remains compatible" }),
+   "```"].join("\n"), usage: { input: 12, output: 8, totalTokens: 20, cost: 0.001 } };
  });
  const result = await generateSourceCandidate({ ...f.base, runner, developmentBrief: "Investigate the frozen handoff observation" });
  assert.equal(result.status, "committed", result.reason);
+ assert.deepEqual(result.hypothesis, { claim: "A handoff behavior may need revision", predictedObservation: "new behavior appears", falsifier: "old behavior persists" });
  assert.equal(result.engineeringStatus, "passed");
  assert.deepEqual(result.changedFiles, ["src/m07/feedback.ts"]);
  assert.match(result.diff, /'new'/);
@@ -63,6 +65,30 @@ test("a fake model edits an isolated source tree and produces a private commit a
  assert.equal(await readFile(path.join(f.repository, "src/m07/feedback.ts"), "utf8"), "export function writeFeedback() { return 'old'; }\n");
  assert.match(await readFile(path.join(result.snapshot!.sourceRoot, "src/m07/feedback.ts"), "utf8"), /'new'/);
  assert.equal(JSON.parse(await readFile(f.receiptPath, "utf8")).sourceCommit, result.sourceCommit);
+});
+
+
+test("source builder rejects ambiguous JSON fences and missing hypothesis fields", async t => {
+ const ambiguous = await fixture(t);
+ const ambiguousRunner = new FakeSessionRunner(async ctx => {
+  await ctx.tools.edit({ path: "src/m07/feedback.ts", oldText: "'old'", newText: "'new'" });
+  return ["A candidate was edited.", "```json", JSON.stringify({ claim: "one", predictedObservation: "two", falsifier: "three" }), "```",
+   "```json", JSON.stringify({ claim: "other", predictedObservation: "other", falsifier: "other" }), "```"].join("\n");
+ });
+ const rejectedAmbiguous = await generateSourceCandidate({ ...ambiguous.base, runner: ambiguousRunner });
+ assert.equal(rejectedAmbiguous.status, "rejected");
+ assert.match(rejectedAmbiguous.reason!, /one complete/);
+ assert.equal(rejectedAmbiguous.sourceCommit, undefined);
+
+ const malformed = await fixture(t);
+ const malformedRunner = new FakeSessionRunner(async ctx => {
+  await ctx.tools.edit({ path: "src/m07/feedback.ts", oldText: "'old'", newText: "'new'" });
+  return ["A candidate was edited.", "```json", JSON.stringify({ claim: "one", predictedObservation: "two" }), "```"].join("\n");
+ });
+ const rejectedMalformed = await generateSourceCandidate({ ...malformed.base, runner: malformedRunner });
+ assert.equal(rejectedMalformed.status, "rejected");
+ assert.match(rejectedMalformed.reason!, /falsifier is missing/);
+ assert.equal(rejectedMalformed.sourceCommit, undefined);
 });
 
 test("full Git status rejects a control file edit even when the confined grant was narrow", async t => {

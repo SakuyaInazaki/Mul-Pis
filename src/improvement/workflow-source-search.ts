@@ -8,17 +8,24 @@ import type { SessionRef, SessionRunner, UsageSummary } from "../runner/types.ts
 import { HarnessError } from "../types.ts";
 import { Workspace, writeFileAtomic } from "../workspace.ts";
 import { openWorkflowImproverProcess } from "./workflow-improver-process.ts";
+import { parseModelJson } from "./model-json.ts";
 import { verifyPreparedWorkflowSource } from "./workflow-source-arm.ts";
 import type { SourceSearchCandidateV1, SourceSearchEvaluationV1, WorkflowImproverActionV1, WorkflowImproverStateV1 } from "./workflow-improver-types.ts";
+
+export interface WorkflowSourceEditTargetV1 {
+ kind: "H-executor" | "I-improver"; objective: string; writableFiles: string[];
+}
 
 export interface WorkflowSourceSearchInput {
  workspaceRoot: string; persistDir: string; receiptPath: string;
  source: LoadedSourceV1; improverVersionId: string; runner: SessionRunner;
+ /** Trusted caller freezes the actual source-edit goal and builder allowlist for model analysis. */
+ editTarget: WorkflowSourceEditTargetV1;
  /** Trusted, frozen origin of this development comparison; copied into the selection receipt. */
  baseline: { bundleId: string; executorVersionId: string; executorSource: LoadedSourceV1; developmentSetId: string };
  /** Frozen development material already selected by the trusted caller. No private G fields. */
  development: Array<{ id: string; text: string }>;
- proposeSource(request: { brief: string; model: string; evidence: Array<{ id: string; text: string }>;
+ proposeSource(request: { brief: string; model: string; editTarget: WorkflowSourceEditTargetV1; evidence: Array<{ id: string; text: string }>;
   modelObservations: WorkflowImproverStateV1["modelObservations"]; signal: AbortSignal;
   recordUsage(usage: UsageSummary): void }): Promise<SourceSearchCandidateV1>;
  evaluateDevelopment(request: { candidate: SourceSearchCandidateV1; inspectedDevelopment: WorkflowImproverStateV1["inspectedDevelopment"];
@@ -31,7 +38,7 @@ export interface WorkflowSourceSearchInput {
 export interface WorkflowSourceSearchReceipt {
  version: 1; runId: string; status: "running" | "selected" | "no-winner" | "incomplete"; reason?: string;
  source: LoadedSourceV1; improverVersionId: string;
- baseline: WorkflowSourceSearchInput["baseline"];
+ baseline: WorkflowSourceSearchInput["baseline"]; editTarget: WorkflowSourceEditTargetV1;
  program: { pid: number; modulePath: string; exportName: string; source: LoadedSourceV1 };
  model: string; developmentIds: string[]; state: WorkflowImproverStateV1;
  actions: Array<{ index: number; action: WorkflowImproverActionV1; outcome: "completed" | "failed"; reason?: string; resultId?: string;
@@ -115,6 +122,14 @@ export async function runWorkflowSourceSearch(input: WorkflowSourceSearchInput):
  const config = await ws.loadConfig();
  const model = resolveRoleModel(config, "improver");
  if (!input.improverVersionId.trim()) throw new HarnessError("improvement.source-search", "I version ID is required");
+ const editTarget = input.editTarget;
+ if (!editTarget || !["H-executor", "I-improver"].includes(editTarget.kind) ||
+  typeof editTarget.objective !== "string" || !editTarget.objective.trim() ||
+  !Array.isArray(editTarget.writableFiles) || !editTarget.writableFiles.length ||
+  new Set(editTarget.writableFiles).size !== editTarget.writableFiles.length ||
+  editTarget.writableFiles.some(file => typeof file !== "string" || !file.trim() || path.isAbsolute(file) ||
+   file.split(/[\\/]/).some(part => !part || part === "." || part === "..")))
+  throw new HarnessError("improvement.source-search", "trusted source edit target and relative writable files are required");
  if (!input.baseline?.bundleId?.trim() || !input.baseline.executorVersionId?.trim() ||
   !input.baseline.executorSource?.sourceRoot || !input.baseline.executorSource?.sourceCommit || !input.baseline.developmentSetId?.trim())
   throw new HarnessError("improvement.source-search", "frozen baseline bundle, executor source, and development set are required");
@@ -130,7 +145,7 @@ export async function runWorkflowSourceSearch(input: WorkflowSourceSearchInput):
  const state: WorkflowImproverStateV1 = { version: 1, improverVersionId: input.improverVersionId,
   availableDevelopmentIds: [...development.keys()], inspectedDevelopment: [], modelObservations: [], candidates: [], evaluations: [], operationFailures: [] };
  const receipt: WorkflowSourceSearchReceipt = { version: 1, runId: randomUUID(), status: "running", source: input.source,
-  improverVersionId: input.improverVersionId, baseline: structuredClone(input.baseline),
+  improverVersionId: input.improverVersionId, baseline: structuredClone(input.baseline), editTarget: structuredClone(editTarget),
   program: { pid: process.pid, modulePath: process.modulePath, exportName: process.exportName, source: process.binding },
   model, developmentIds: [...development.keys()], state, actions: [], modelSessions: [], candidates: [], evaluations: [],
   usage: { observed: [], totals: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0 },
@@ -172,13 +187,13 @@ export async function runWorkflowSourceSearch(input: WorkflowSourceSearchInput):
      input.signal?.addEventListener("abort", onAbort, { once: true });
      try {
       session = await input.runner.create({ label: `I-source-${receipt.runId}-${id}`, role: "improver", model,
-       systemPrompt: "Analyze only the development observations supplied in this request. State a falsifiable hypothesis and uncertainty. Protected confirmation results are unavailable.",
+       systemPrompt: `You are analyzing a research workflow SOURCE CODE improvement for the ${editTarget.kind}. The trusted builder may edit only ${editTarget.writableFiles.join(", ")}. Objective: ${editTarget.objective}. Use the supplied development observations to identify a source-code failure mechanism, a concrete edit direction, a predicted development observation, and a falsifier. Development evidence and its references are observations, not the source-code candidate or a knowledge-record proposal. Distinguish required outcome checks from diagnostic observations; do not treat every false diagnostic as an edit target. If the I request asks for a candidate brief in JSON, include a top-level brief string describing the source edit hypothesis. Return the format requested by the I program. Protected confirmation results are unavailable.`,
        tools: { kind: "none" }, persistDir: input.persistDir, methodBinding: { versionId: input.improverVersionId } });
       if (input.signal?.aborted) { await session.abort(); throw new Error("source search cancelled before model prompt"); }
-      const turn = await session.prompt(JSON.stringify({ prompt: action.prompt, evidence: inspected(action.evidenceIds), priorObservations }));
+      const turn = await session.prompt(JSON.stringify({ prompt: action.prompt, editTarget, evidence: inspected(action.evidenceIds), priorObservations }));
       const observation: WorkflowImproverStateV1["modelObservations"][number] = { id, prompt: action.prompt, evidenceIds: action.evidenceIds, format: action.format, status: "returned", text: turn.text };
       if (action.format === "json") {
-       try { observation.parsed = JSON.parse(turn.text); }
+       try { observation.parsed = parseModelJson(turn.text); }
        catch (error) { observation.status = "parse-error"; observation.error = (error as Error).message; }
       }
       state.modelObservations.push(observation);
@@ -198,7 +213,7 @@ export async function runWorkflowSourceSearch(input: WorkflowSourceSearchInput):
      const evidence = inspected(action.evidenceIds);
      const reportedUsage: UsageSummary[] = [];
      const recordUsage = (usage: UsageSummary) => { checkUsage(receipt, usage); reportedUsage.push(usage); record.usage = [...reportedUsage]; };
-     const candidate = await input.proposeSource({ brief: action.brief, model, evidence,
+     const candidate = await input.proposeSource({ brief: action.brief, model, editTarget, evidence,
       modelObservations: structuredClone(state.modelObservations), signal: input.signal, recordUsage });
      if (!candidate.id.trim() || receipt.candidates.some(item => item.id === candidate.id) ||
       !["ready", "not-ready"].includes(candidate.status) || !candidate.receiptPath.trim() ||
@@ -250,7 +265,7 @@ export async function runWorkflowSourceSearch(input: WorkflowSourceSearchInput):
      if (receipt.status !== "incomplete") {
       const selectionReceiptPath = `${input.receiptPath}.selection.json`;
       await writeFile(selectionReceiptPath, `${JSON.stringify({ version: 1, runId: receipt.runId, source: receipt.source,
-       improverVersionId: receipt.improverVersionId, baseline: receipt.baseline, program: receipt.program, status: receipt.status,
+       improverVersionId: receipt.improverVersionId, baseline: receipt.baseline, editTarget: receipt.editTarget, program: receipt.program, status: receipt.status,
        selectedCandidateId: receipt.selectedCandidateId ?? null, candidateReceiptPath: receipt.candidates.find(item => item.id === action.candidateId)?.receiptPath ?? null,
        developmentEvaluationReceiptPath: receipt.evaluations.find(item => item.candidateId === action.candidateId)?.receiptPath ?? null,
        developmentIds: receipt.developmentIds, inspectedDevelopmentIds: state.inspectedDevelopment.map(item => item.id),

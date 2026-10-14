@@ -6,6 +6,7 @@ import { prepareWorkflowCodeSource, type WorkflowCodeSnapshot } from "../runtime
 import { createConfinedCampaignFileTools } from "../runner/confined-campaign-files.ts";
 import type { SessionRef, SessionRunner, ToolCallRecord, UsageSummary } from "../runner/types.ts";
 import { HarnessError } from "../types.ts";
+import { parseSourceHypothesis } from "./model-json.ts";
 
 /** This first research surface is deliberately narrow. Expanding it requires a separate control-boundary review. */
 const EDITABLE_SOURCE = new Set(["src/m07/feedback.ts", "src/improvement/workflow-improver-program.ts"]);
@@ -39,13 +40,8 @@ function git(repo: string, args: string[], input?: string): string {
  return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", ...(input === undefined ? {} : { input }) }).trimEnd();
 }
 function parseHypothesis(text: string): SourceCandidateReceipt["hypothesis"] {
- let value: unknown;
- try { value = JSON.parse(text); } catch { throw new HarnessError("improvement.source-candidate", "builder must return a JSON hypothesis"); }
- if (!value || typeof value !== "object" || Array.isArray(value)) throw new HarnessError("improvement.source-candidate", "invalid builder hypothesis");
- const item = value as Record<string, unknown>;
- for (const field of ["claim", "predictedObservation", "falsifier"])
-  if (typeof item[field] !== "string" || !item[field].trim()) throw new HarnessError("improvement.source-candidate", `hypothesis ${field} is missing`);
- return { claim: item.claim as string, predictedObservation: item.predictedObservation as string, falsifier: item.falsifier as string };
+ try { return parseSourceHypothesis(text); }
+ catch (error) { throw new HarnessError("improvement.source-candidate", `builder hypothesis: ${(error as Error).message}`); }
 }
 function changedFiles(repo: string): string[] {
  const raw = execFileSync("git", ["-C", repo, "status", "--porcelain=v1", "-z", "--untracked-files=all"]);
