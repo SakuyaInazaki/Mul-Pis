@@ -1,5 +1,5 @@
-import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, stat, unlink } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { mkdir, open, stat, unlink } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -35,13 +35,19 @@ class SnapshotBudgetExceeded extends Error {}
 export async function copySnapshotBounded(source: string, snapshot: string, maxBytes: number): Promise<number> {
 	await mkdir(path.dirname(snapshot), { recursive: true });
 	let copied = 0;
+	// Acquire exclusive ownership before starting either stream. EEXIST must not remove
+	// a snapshot created by an earlier capture.
+	const target = await open(snapshot, "wx");
 	try {
 		await pipeline(createReadStream(source), new Transform({ transform(chunk: Buffer, _encoding, callback) {
 			copied += chunk.length;
 			callback(copied > maxBytes ? new SnapshotBudgetExceeded("projection snapshot budget exceeded") : null, copied > maxBytes ? undefined : chunk);
-		} }), createWriteStream(snapshot, { flags: "wx" }));
+		} }), target.createWriteStream());
 		return copied;
 	} catch (error) {
+		// pipeline settles after its streams close; only this call's exclusive target
+		// can be a partial snapshot here.
+		await target.close().catch(() => undefined);
 		await unlink(snapshot).catch(() => undefined);
 		throw error;
 	}

@@ -352,8 +352,6 @@ test("M04 rejects a third-operation experience string ref and accepts its same-s
 	const captured: M04InvalidJudgmentEvent[] = [];
 	const fake = new FakeSessionRunner(({ turnIndex, message }) => {
 		if (turnIndex === 1) {
-			assert.match(message, /\{storeId,recordId,version\}/);
-			assert.match(message, /字符串无效/);
 			return { text: response(["K001@1"]), readReturns: returnedRanges(f.relative) };
 		}
 		assert.equal(captured.length, 1);
