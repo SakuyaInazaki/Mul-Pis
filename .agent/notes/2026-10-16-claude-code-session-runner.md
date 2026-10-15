@@ -1,0 +1,54 @@
+# Claude Code session runner
+
+This batch adds `src/runner/claude.ts`, a third `SessionRunner` implementation, so the existing M01–M09 workflow can run with Claude Code as its model substrate. No stage, gate, prompt, artifact, acceptance rule or knowledge path was changed, and `workflow/v1.0/` was not touched. `src/runner/pi.ts` is left unedited so the Pi substrate stays available for differential comparison. The CLI gains `--runner claude` next to `pi` and `fake`; `package.json` declares the two new substrate peers as optional and adds the `@earendil-works/pi-agent-core` peer that `src/pi/extension.ts` already imports.
+
+The user's request on 2026-10-16 was to adapt the workflow so this agent can execute it while keeping the workflow's full functionality, and to keep the workflow process itself unchanged.
+
+## Superseded earlier decision
+
+`docs/implementation/design.md:11` and `docs/research/workflow-foundation.md:16` record that the user had not selected models and that Claude was explicitly not adopted. The user's current request supersedes that decision for this work. It is recorded here as a new entry rather than by editing those lines, so the earlier state stays legible. Model selection remains the user's: the runner refuses any model string whose provider segment is not `claude-code`, and `research.config.json` still decides which role gets which model.
+
+## Changes and reasons
+
+| Area | Resulting behavior | Main implementation |
+|---|---|---|
+| Session substrate | One workflow session is one Claude Agent SDK conversation, continued by resuming its id, which is persisted beside the transcript so another process can reopen the same boundary. Sidecars keep the existing naming: `<session>.spec.json`, `<session>.usage.jsonl`, plus `<session>.conversation`. | `src/runner/claude.ts` |
+| Input isolation | Every turn runs with `settingSources: []` and `strictMcpConfig: true`, so no user or project `CLAUDE.md`, skill, plugin or external MCP server is discovered. `systemPrompt` is passed as a plain string, which replaces the default prompt, so a stage's prompt reaches the model verbatim. Suppression is per turn; the operator's own `~/.claude/CLAUDE.md` is never read, moved or modified. | `src/runner/claude.ts` |
+| Isolation attestation | The session announces its loaded tool set in its init message. The runner compares that set with the grant and raises `runner.isolation` if anything outside the grant was loaded, so the active set must equal the grant rather than merely include it. `attestLoadout` additionally reads the loadout back from a live session for callers that want an end-to-end assertion. | `src/runner/claude.ts` |
+| Tool grants | All four kinds are served. `none` declares an empty built-in base set, so the session has no tools at all. `execution` declares exactly the built-ins the grant names, with `root` as the working directory. `read-dir` and `custom` are served by harness-owned tools registered as an in-process MCP server, so each call executes in this process and is logged with its real outcome. `canUseTool` denies anything outside the grant. | `src/runner/claude.ts` |
+| Read evidence | The confined read tool owns its own pagination, so the returned line range it reports is computed rather than inferred. The line count is derived exactly as `m07ReadGaps` in `src/stages/m04.ts` derives it, a read that reaches the last line reports `truncated: false`, an empty file reports a complete `no-content` read with no line range, and an offset past the end reports the `offset-beyond-eof` error with the file's line count. | `src/runner/claude.ts` |
+| Tool denials | A denial means the model reached outside its grant and was refused, which is the grant working. Denials are recorded in `toolLog()` as failed calls instead of aborting the turn. | `src/runner/claude.ts` |
+| Stop-reason vocabulary | The substrate vocabulary is mapped onto the one the harness already matches: a reply truncated by the output limit raises `runner.stop` with `stopReason=length`, which is what `src/m07/objective-progress.ts:48` tests for. Other abnormal stops raise `runner.stop` with their own reason. | `src/runner/claude.ts` |
+| Usage accounting | Input, output, cache-read, cache-write and the substrate's own cost estimate are recorded per prompt in `<session>.usage.jsonl`. No provider total is exposed, so events stay `status: "unknown"` and `UsageSummary.complete` stays false, keeping totals an explicit lower bound instead of an invented total. | `src/runner/claude.ts` |
+| CLI | `--runner claude` is accepted wherever `pi` and `fake` were, including `mission` and `goal delegate`. `improve research workflow compare-sources` still requires `pi`, because that path depends on provider transport evidence this substrate does not produce. | `src/cli.ts` |
+
+## Capabilities this runner declines
+
+Each fails closed rather than returning something unverified.
+
+- `capabilities`, `checkpoint` and `fork` are absent. `RunnerCapabilities` types its fields as literal `true`, so a runner that cannot yet branch cannot honestly report `false`; omitting the methods makes `src/context/boundary.ts` refuse branch requests. M07 competitive branching is therefore unavailable on this runner. The SDK exposes a session fork primitive, so this is a next increment rather than a permanent limit.
+- `transportDiagnostics`, `providerOutputRequests` and `estimateMaxSdkCost` are absent. The strict-request and campaign accounting paths in `src/runner/pi.ts` inspect real provider HTTP responses, payload bytes and context-overflow replies; this substrate exposes no such transport. Those paths, and any admission that depends on them, must keep using the Pi runner. Synthesizing response objects to satisfy them would be fabricated evidence and was not done.
+- Cross-process `resume` is refused for any grant other than `none`, matching the existing rule that tool-bearing sessions are not resumable.
+
+## Verified and not verified
+
+Offline: `tsc --noEmit` clean, and the existing suite reproduces its pre-change result with the new file and the CLI change present (260 passing, 0 failing, before and after).
+
+Live, per grant kind:
+
+- `none`: the session reported no instruction files and no tools, returned the system-prompt sentinel, made no tool calls, and a second prompt continued the same conversation.
+- `read-dir`: a 12-line file was read in one call, reporting `startLine 1, endLine 12, truncated false`; the M04 gate arithmetic replicated against those events reports no missing ranges and no missing terminal page. An empty file produced a complete `no-content` read that the same arithmetic accepts. A path outside the granted root was refused and the failure was recorded in `toolLog()`.
+- `execution`: a grant of `read` and `write` produced exactly `Read` and `Write` in the session's tool set, two logged calls, and the expected file written inside the granted root.
+- `custom`: shares the in-process MCP path with `read-dir` extra tools and is covered by typecheck, but has no standalone live run yet.
+
+Not verified: no M01–M09 run has been executed on this runner. Stage-level conformance, the M03 three-session relation, cross-process resume, and behaviour under real knowledge packs are untested against the real stages. This batch is wired and spot-checked substrate, not a validated workflow run.
+
+## Environment facts for the next session
+
+- Node 24.22.0 under `~/.local/node` (CI pins Node 24). Claude Code 2.1.301, `@anthropic-ai/claude-agent-sdk` 0.3.301, `zod` 4.6.7.
+- `third_party/` is absent in this checkout, so the arrangement documented in `docs/provenance.md` does not apply here. The user authorized a registry install for this session; dependencies were installed with `--no-save --no-package-lock`.
+- `src/pi/extension.ts:2` imports `@earendil-works/pi-agent-core`, which was missing from `peerDependencies` and is not resolvable as a bare specifier from `src/` under a standard npm layout. It is now declared. This was a pre-existing gap, independent of this batch.
+- `@types/node` must be 22.x. With a newer major, 22 type-level errors appear in test files and in `src/improvement/workflow-source-arm.ts:261`; all disappear on 22.x.
+- `test/incremental-private-checkpoint.test.ts` invokes `python3 scripts/private_actions_transport.py`, which needs the `cryptography` module on the plain `python3` in PATH.
+- Two substrate traps found the hard way, both worth keeping in mind for any future option change. `allowedTools: []` means "no restriction", not "no tools"; the built-in set must be declared through the `tools` option, where `[]` disables all built-ins. And `BUILTIN_TOOL_NAMES` is not exhaustive — narrowing by subtracting it from the grant still left `DesignSync` loaded, which the init-message assertion caught.
+- Two isolation routes were tried and rejected: pointing `CLAUDE_CONFIG_DIR` at a fresh directory suppresses the memory file but loses authentication, and `--bare` suppresses memory discovery but reads neither the keychain nor OAuth, so it requires an API key that is not present.
