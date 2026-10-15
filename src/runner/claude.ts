@@ -37,16 +37,17 @@
  */
 import path from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
-import { appendFile, lstat, mkdir, readFile, readdir, realpath } from "node:fs/promises";
-import { createSdkMcpServer, query, tool } from "@anthropic-ai/claude-agent-sdk";
-import type { Options, PermissionResult, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { appendFile, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
+import { createSdkMcpServer, forkSession, getSessionMessages, query, tool } from "@anthropic-ai/claude-agent-sdk";
+import type { EffortLevel, Options, PermissionResult, SDKMessage, ThinkingConfig } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { parseModelSpec } from "../config.ts";
 import { HarnessError } from "../types.ts";
 import { readTextIfExists, writeFileAtomic } from "../workspace.ts";
 import type {
-	AssistantTurn, CustomToolSpec, ReadReturnEvent, SessionHandle, SessionRef, SessionRunner,
-	SessionSpec, ToolCallRecord, ToolParamSpec, ToolResult, TranscriptMessage, UsageEvent, UsageValues,
+	AssistantTurn, CustomToolSpec, ForkRequest, ReadReturnEvent, RunnerCapabilities, SessionCheckpoint,
+	SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, ToolParamSpec, ToolResult,
+	TranscriptMessage, UsageEvent, UsageValues,
 } from "./types.ts";
 import { summarizeUsage } from "./usage.ts";
 
@@ -377,6 +378,10 @@ interface ClaudeSessionState {
 	sink: ToolSink;
 	turns: number;
 	active: boolean;
+	/** True only after a prompt settled normally; a checkpoint requires it. */
+	completed: boolean;
+	/** Set while a checkpoint freezes this session, which blocks prompts. */
+	freezing: boolean;
 	disposed: boolean;
 }
 
@@ -413,7 +418,7 @@ export class ClaudeSessionRunner implements SessionRunner {
 			spec, ref, conversationId: randomUUID(), started: false,
 			cwd: await this.sessionCwd(spec, id), transcript: [],
 			sink: { toolLog: [], readCoverage: new Set(), readReturns: [] },
-			turns: 0, active: false, disposed: false,
+			turns: 0, active: false, completed: false, freezing: false, disposed: false,
 		});
 		return this.handle(this.states.get(id)!);
 	}
@@ -445,7 +450,8 @@ export class ClaudeSessionRunner implements SessionRunner {
 			spec, ref, conversationId: conversationId.trim(), started: transcript.length > 0,
 			cwd: await this.sessionCwd(spec, ref.id), transcript,
 			sink: { toolLog: [], readCoverage: new Set(), readReturns: [] },
-			turns: transcript.filter((m) => m.role === "user").length, active: false, disposed: false,
+			turns: transcript.filter((m) => m.role === "user").length, active: false,
+			completed: transcript.at(-1)?.role === "assistant", freezing: false, disposed: false,
 		};
 		this.states.set(ref.id, state);
 		return this.handle(state);
@@ -467,12 +473,212 @@ export class ClaudeSessionRunner implements SessionRunner {
 		};
 	}
 
-	private resolveModel(raw: string): { modelId: string } {
+	/**
+	 * Attested only now that frozen-leaf branching is actually implemented. The
+	 * dispatcher in `src/context/boundary.ts` refuses a fork unless every field
+	 * here is true, so this must not be returned by a runner that cannot branch.
+	 */
+	capabilities(): RunnerCapabilities {
+		return {
+			version: 1, fresh: true, continue: true, persistedLineage: true, forkAtFrozenLeaf: true,
+			grantKinds: ["none", "read-dir", "custom", "execution"],
+			modelCompatibility: "exact-model-only", multimodalHistory: "model-dependent",
+			parallelPromptLeases: "single-process",
+		};
+	}
+
+	/**
+	 * Freeze a completed parent leaf. The harness transcript, the parent grant and
+	 * the controller's input manifest are byte-copied, and the substrate leaf is
+	 * recorded privately so a later fork branches exactly here and not from
+	 * whatever the parent went on to do.
+	 */
+	async checkpoint(
+		handle: SessionHandle,
+		envelope: { inputManifest: string; runId: string; taskId?: string; externalOperationsSettled: boolean },
+	): Promise<SessionCheckpoint> {
+		const state = this.states.get(handle.ref.id);
+		if (!state || state.ref !== handle.ref || state.active || state.freezing || state.disposed ||
+			!state.completed || state.transcript.at(-1)?.role !== "assistant")
+			throw new HarnessError("runner.fork", "checkpoint requires an idle completed parent handle");
+		if (!envelope.externalOperationsSettled)
+			throw new HarnessError("runner.fork", "unknown external operations block checkpoint");
+		if (!envelope.runId.trim() || !envelope.inputManifest.trim() || !(await stat(envelope.inputManifest)).isFile())
+			throw new HarnessError("runner.fork", "frozen input manifest is missing");
+		if (!state.started) throw new HarnessError("runner.fork", "checkpoint requires a started conversation");
+		state.freezing = true;
+		try {
+			if (await readFile(state.ref.specFile!, "utf8") !== `${JSON.stringify(state.spec, null, 2)}\n`)
+				throw new HarnessError("runner.fork", "parent persisted spec differs from the active grant");
+			const id = randomUUID();
+			const snapshotDir = path.join(state.spec.persistDir, ".checkpoints");
+			await mkdir(snapshotDir, { recursive: true });
+			const snapshotFile = path.join(snapshotDir, `${id}.jsonl`);
+			const sourceSpecSnapshot = path.join(snapshotDir, `${id}.parent-spec.json`);
+			const manifestSnapshot = path.join(snapshotDir, `${id}.manifest.json`);
+			await copyFile(state.ref.file!, snapshotFile);
+			await copyFile(state.ref.specFile!, sourceSpecSnapshot);
+			await copyFile(envelope.inputManifest, manifestSnapshot);
+
+			// The substrate leaf: the last message of the parent conversation as it
+			// stands now. A later fork slices the transcript up to exactly this uuid.
+			const messages = await getSessionMessages(state.conversationId);
+			const leafMessageUuid = messages.at(-1)?.uuid;
+			if (!leafMessageUuid)
+				throw new HarnessError("runner.fork", "parent conversation has no readable leaf message");
+			await writeFileAtomic(path.join(snapshotDir, `${id}.substrate.json`),
+				`${JSON.stringify({ version: 1, conversationId: state.conversationId, leafMessageUuid }, null, 2)}\n`);
+
+			const checkpoint: SessionCheckpoint = {
+				version: 1, id, sourceSessionId: state.ref.id, sourceSessionFile: state.ref.file!,
+				sourceSpecFile: state.ref.specFile!, sourceSpecSnapshot, snapshotFile,
+				leafId: `${state.ref.id}-assistant-${state.turns}`, model: state.ref.model,
+				inputManifest: envelope.inputManifest, manifestSnapshot, runId: envelope.runId,
+				...(envelope.taskId ? { taskId: envelope.taskId } : {}),
+				frozenAt: new Date().toISOString(), snapshotBytes: (await stat(snapshotFile)).size,
+			};
+			await writeFileAtomic(path.join(snapshotDir, `${id}.checkpoint.json`), `${JSON.stringify(checkpoint, null, 2)}\n`);
+			return checkpoint;
+		} finally {
+			state.freezing = false;
+		}
+	}
+
+	/**
+	 * Branch a new persisted session from a frozen leaf. Everything the receipt
+	 * claims is re-verified against the bytes on disk before the substrate is
+	 * touched, and the child carries a committed lineage receipt in the exact
+	 * shape `src/context/boundary.ts` checks.
+	 */
+	async fork(request: ForkRequest): Promise<SessionHandle> {
+		const { checkpoint, evidenceBindings, reason, spec } = request;
+		if (checkpoint.version !== 1 || !reason.trim() || checkpoint.model !== spec.model)
+			throw new HarnessError("runner.fork", "invalid or cross-model fork");
+		this.resolveModel(spec.model);
+
+		const snapshotDir = path.dirname(checkpoint.snapshotFile);
+		const stored = JSON.parse(await readFile(path.join(snapshotDir, `${checkpoint.id}.checkpoint.json`), "utf8")) as SessionCheckpoint;
+		if (JSON.stringify(stored) !== JSON.stringify(checkpoint) || (await stat(checkpoint.snapshotFile)).size !== checkpoint.snapshotBytes)
+			throw new HarnessError("runner.fork", "checkpoint receipt or snapshot changed");
+		if (!(await readFile(checkpoint.inputManifest)).equals(await readFile(checkpoint.manifestSnapshot)))
+			throw new HarnessError("runner.fork", "frozen manifest changed");
+		if (!(await readFile(checkpoint.sourceSpecFile)).equals(await readFile(checkpoint.sourceSpecSnapshot)))
+			throw new HarnessError("runner.fork", "parent spec changed");
+		const currentSource = await readFile(checkpoint.sourceSessionFile);
+		const snapshotSource = await readFile(checkpoint.snapshotFile);
+		if (currentSource.length < snapshotSource.length || !currentSource.subarray(0, snapshotSource.length).equals(snapshotSource))
+			throw new HarnessError("runner.fork", "checkpoint source history changed");
+
+		const parentSpec = JSON.parse(await readFile(checkpoint.sourceSpecSnapshot, "utf8")) as SessionSpec;
+		if (parentSpec.model !== checkpoint.model)
+			throw new HarnessError("runner.fork", "parent model differs from checkpoint");
+		const parentTools = parentSpec.tools;
+		const childTools = spec.tools;
+		if (childTools.kind !== "none") {
+			if (parentTools.kind !== childTools.kind)
+				throw new HarnessError("runner.fork", "fork cannot elevate tool authority");
+			if (childTools.kind === "custom" || childTools.kind === "read-dir")
+				throw new HarnessError("runner.fork", "fork cannot elevate unaudited custom or frozen read authority");
+			const sourceNames = parentTools.kind === "execution" ? parentTools.tools : [];
+			if (childTools.kind === "execution" && childTools.tools.some((name) => !sourceNames.includes(name)))
+				throw new HarnessError("runner.fork", "fork cannot elevate tool authority");
+		}
+		if (!Array.isArray(evidenceBindings) || evidenceBindings.length === 0 ||
+			evidenceBindings.some((binding) => binding.version !== 1 || binding.status !== "frozen-copy" ||
+				!binding.label.trim() || !binding.path.trim() || !binding.sourceVersion?.trim()))
+			throw new HarnessError("runner.fork", "fork requires frozen evidence bindings");
+		for (const binding of evidenceBindings) await realpath(binding.path);
+		if (childTools.kind === "execution") {
+			const childRoot = await realpath(childTools.root);
+			const overlaps = (a: string, b: string): boolean => a === b || a.startsWith(`${b}${path.sep}`) || b.startsWith(`${a}${path.sep}`);
+			for (const binding of evidenceBindings)
+				if (overlaps(childRoot, await realpath(binding.path)))
+					throw new HarnessError("runner.fork", "frozen evidence must be outside the child writable root");
+		}
+
+		const frozen = (await readFile(checkpoint.snapshotFile, "utf8")).split(/\r?\n/).filter(Boolean)
+			.map((line) => JSON.parse(line) as TranscriptMessage);
+		if (frozen.at(-1)?.role !== "assistant" ||
+			checkpoint.leafId !== `${checkpoint.sourceSessionId}-assistant-${frozen.filter((m) => m.role === "user").length}`)
+			throw new HarnessError("runner.fork", "checkpoint leaf changed");
+
+		const substrate = JSON.parse(await readFile(path.join(snapshotDir, `${checkpoint.id}.substrate.json`), "utf8")) as
+			{ version: number; conversationId: string; leafMessageUuid: string };
+		if (substrate.version !== 1 || !substrate.conversationId || !substrate.leafMessageUuid)
+			throw new HarnessError("runner.fork", "frozen substrate leaf is unreadable");
+
+		await mkdir(spec.persistDir, { recursive: true });
+		const childScratch = await mkdtemp(path.join(spec.persistDir, ".claude-fork-"));
+		const id = `claude-${randomBytes(4).toString("hex")}`;
+		const file = path.join(spec.persistDir, `${spec.label}-${id}.jsonl`);
+		const specFile = file.replace(/\.jsonl$/, ".spec.json");
+		const lineageFile = file.replace(/\.jsonl$/, ".lineage.json");
+		const ref: SessionRef = {
+			label: spec.label, role: spec.role, id, model: spec.model, file, specFile, lineageFile,
+			...(spec.methodBinding ? { methodBinding: spec.methodBinding } : {}),
+		};
+		try {
+			// Branch the substrate transcript at the frozen leaf, so later parent
+			// turns cannot reach the child.
+			const branched = await forkSession(substrate.conversationId, { upToMessageId: substrate.leafMessageUuid });
+			if (!branched.sessionId || branched.sessionId === substrate.conversationId)
+				throw new HarnessError("runner.fork", "substrate did not return an independent branch conversation");
+			await writeFileAtomic(file, `${frozen.map((m) => JSON.stringify(m)).join("\n")}\n`);
+			await writeFileAtomic(specFile, `${JSON.stringify(spec, null, 2)}\n`);
+			await writeFileAtomic(file.replace(/\.jsonl$/, ".conversation"), `${branched.sessionId}\n`);
+			await writeFileAtomic(lineageFile, `${JSON.stringify({
+				version: 1, state: "committed", intent: "branch-exploration", checkpoint,
+				parent: {
+					sessionId: checkpoint.sourceSessionId, sessionFile: checkpoint.sourceSessionFile,
+					leafId: checkpoint.leafId, toolGrantKind: parentTools.kind,
+				},
+				child: {
+					sessionId: id, sessionFile: file, scratch: childScratch, toolGrantKind: childTools.kind,
+					...(childTools.kind === "execution" ? { workRoot: childTools.root } : {}),
+					conversationId: branched.sessionId,
+				},
+				reason, evidenceBindings, workspaceBinding: request.workspaceBinding,
+				inheritedUsageBilled: false, createdAt: new Date().toISOString(),
+			}, null, 2)}\n`);
+			const state: ClaudeSessionState = {
+				spec, ref, conversationId: branched.sessionId, started: true,
+				cwd: await this.sessionCwd(spec, id), transcript: frozen,
+				sink: { toolLog: [], readCoverage: new Set(), readReturns: [] },
+				turns: frozen.filter((m) => m.role === "user").length,
+				active: false, completed: false, freezing: false, disposed: false,
+			};
+			this.states.set(id, state);
+			return this.handle(state);
+		} catch (error) {
+			await Promise.all([
+				rm(file, { force: true }), rm(specFile, { force: true }), rm(lineageFile, { force: true }),
+				rm(file.replace(/\.jsonl$/, ".conversation"), { force: true }),
+				rm(childScratch, { recursive: true, force: true }),
+			]);
+			throw error;
+		}
+	}
+
+	/**
+	 * Resolve a configured `claude-code/<model>[:thinking]` string. Five of the
+	 * seven thinking levels share their vocabulary with the substrate's effort
+	 * levels and map exactly; `off` disables extended thinking. `minimal` has no
+	 * exact equivalent and is refused rather than silently coarsened, so the
+	 * configuration author decides between `off` and `low`.
+	 */
+	private resolveModel(raw: string): { modelId: string; effort?: EffortLevel; thinking?: ThinkingConfig } {
 		const parsed = parseModelSpec(raw);
 		if (parsed.provider !== CLAUDE_CODE_PROVIDER)
 			throw new HarnessError("runner.model", `this runner only serves ${CLAUDE_CODE_PROVIDER}/<model>; the configured value is ${raw}`);
 		if (!parsed.modelId.trim()) throw new HarnessError("runner.model", `model id is empty in ${raw}`);
-		return { modelId: parsed.modelId };
+		const level = parsed.thinkingLevel;
+		if (level === "minimal")
+			throw new HarnessError("runner.model", `thinking level "minimal" has no exact equivalent on this substrate; write "off" or "low" in ${raw}`);
+		return {
+			modelId: parsed.modelId,
+			...(level === "off" ? { thinking: { type: "disabled" as const } } : {}),
+			...(level && level !== "off" ? { effort: level } : {}),
+		};
 	}
 
 	private async sessionCwd(spec: SessionSpec, id: string): Promise<string> {
@@ -496,8 +702,10 @@ export class ClaudeSessionRunner implements SessionRunner {
 				if (disposed || aborted || state.disposed)
 					throw new HarnessError("runner.aborted", `session ${state.ref.label} was aborted or disposed`);
 				if (state.active) throw new HarnessError("runner.aborted", `session ${state.ref.label} is already active`);
-				const { modelId } = this.resolveModel(state.spec.model);
+				if (state.freezing) throw new HarnessError("runner.fork", `session ${state.ref.label} is being checkpointed`);
+				const resolved = this.resolveModel(state.spec.model);
 				state.active = true;
+				state.completed = false;
 				state.transcript.push({ role: "user", text });
 				state.turns += 1;
 				const promptIndex = state.turns;
@@ -518,7 +726,9 @@ export class ClaudeSessionRunner implements SessionRunner {
 						strictMcpConfig: true,
 						// A plain string replaces the default prompt, so the stage's prompt is used verbatim.
 						systemPrompt: state.spec.systemPrompt,
-						model: modelId,
+						model: resolved.modelId,
+						...(resolved.effort ? { effort: resolved.effort } : {}),
+						...(resolved.thinking ? { thinking: resolved.thinking } : {}),
 						allowedTools: grant.allowedTools,
 						tools: grant.tools,
 						cwd: grant.cwd ?? state.cwd,
@@ -617,6 +827,7 @@ export class ClaudeSessionRunner implements SessionRunner {
 					state.transcript.push({ role: "assistant", text: reply });
 					await writeFileAtomic(state.ref.file!, `${state.transcript.map((m) => JSON.stringify(m)).join("\n")}\n`);
 					outcome = "completed";
+					state.completed = true;
 					settled = this.usageEvent(state, promptIndex, usage, stopReason);
 					return {
 						text: reply, stopReason,
