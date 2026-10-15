@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { createFileKnowledgeStore } from "../../src/knowledge/store.ts";
+import { retrieveKnowledge } from "../../src/knowledge/retrieval.ts";
 import type { KnowledgeStore, ProposalBatch } from "../../src/knowledge/types.ts";
 
 async function fixture(t: TestContext): Promise<{ dir: string; store: KnowledgeStore }> {
@@ -46,63 +47,47 @@ test("buildPack honours pinned versions and reports whole-record truncation", as
 	for (const id of pack.omitted) assert(!pack.markdown.includes(`### ${id}@`));
 });
 
-test("closed question displays its structured status above preserved unresolved wording", async (t) => {
+test("both bounded knowledge packs show complete record fields and local store identity without bypassing capacity", async t => {
 	const { store } = await fixture(t);
-	await apply(store, { stage: "test", runId: "question", ops: [
-		{ op: "create", type: "Q", title: "边界是否成立", body: "这个问题仍未决，等待验证。" },
+	const storeId = await store.storeId();
+	await apply(store, { stage: "M04", runId: "evidence", ops: [
+		{ op: "create", type: "E", title: "Measured source", body: "Checked receipt", usageDecision: "adopted" },
 	] });
-	const original = await store.get("Q001", 1);
-	await apply(store, { stage: "test", runId: "close", ops: [
-		{ op: "close_q", id: "Q001", closeReason: "shelved", reason: "暂不属于本轮问题" },
-		{ op: "limit", target: "Q001", kind: "needs_recheck", reason: "新证据前不能使用", authority: "test" },
+	await apply(store, { stage: "M04", runId: "method", ops: [
+		{ op: "create", type: "K", title: "Tensor method", body: "Use only after reading the source receipt", usageDecision: "adopted",
+			fields: { tags: ["numeric", "tensor"], retrieval: { keywords: ["matmul"] }, scientificMetadata: { device: "sample-device", metric: "latency" },
+				experience: { version: 1, targetKind: "executor", applicableStages: ["M07"], requiredTags: ["numeric"], excludedTags: ["stale"], requiredRefs: [{ storeId, recordId: "E001", version: 1 }] } } },
 	] });
-	const current = await store.buildPack({ purpose: "查看问题", ids: ["Q001"], includeOpenQuestions: false });
-	assert.match(current.markdown, /### Q001@2/);
-	assert.match(current.markdown, /本版本问题状态：已关闭（原因：shelved）/);
-	assert.match(current.markdown, /关闭不代表命题已证实/);
-	assert.match(current.markdown, /版本原因：暂不属于本轮问题/);
-	assert.match(current.markdown, /替代版本：Q001@1/);
-	assert.match(current.markdown, /生效限制：needs_recheck:Q001/);
-	assert.match(current.markdown, /这个问题仍未决，等待验证。/);
-	const historical = await store.buildPack({ purpose: "查看原版", ids: ["Q001@1"], includeOpenQuestions: false });
-	assert.match(historical.markdown, /历史版本；当前发布版本 Q001@2/);
-	assert.match(historical.markdown, /本版本问题状态：开放/);
-	assert.match(historical.markdown, /生效限制：needs_recheck:Q001/);
-	assert.deepEqual(await store.get("Q001", 1), original, "closing must not rewrite the original record");
-});
-
-test("regenerateViews rebuilds current understanding, corrections, questions, limits and index", async (t) => {
-	const { dir, store } = await fixture(t);
-	await apply(store, {
-		stage: "test",
-		runId: "seed",
-		ops: [
-			{ op: "create", type: "C", title: "当前认识条目", body: "内容", usageDecision: "candidate" },
-			{ op: "create", type: "K", title: "检查判据", body: "判据", usageDecision: "working_assumption" },
-			{ op: "create", type: "Q", title: "仍开放", body: "问题" },
-		],
-	});
-	await apply(store, {
-		stage: "test",
-		runId: "change",
-		ops: [
-			{ op: "revise", id: "C001", body: "修订内容", reason: "纠正表述" },
-			{ op: "decide", id: "K001", usageDecision: "adopted", reason: "本轮采用" },
-			{ op: "limit", target: "C001@2", kind: "needs_recheck", reason: "待核对", authority: "reviewer" },
-		],
-	});
-	await store.regenerateViews();
-
-	const understanding = await readFile(path.join(dir, "views", "current-understanding.md"), "utf8");
-	const corrections = await readFile(path.join(dir, "views", "corrections.md"), "utf8");
-	const questions = await readFile(path.join(dir, "views", "open-questions.md"), "utf8");
-	const limits = await readFile(path.join(dir, "views", "limits.md"), "utf8");
-	const index = JSON.parse(await readFile(path.join(dir, "_index", "records.json"), "utf8")) as Array<Record<string, unknown>>;
-	assert.match(understanding, /C001@2 当前认识条目 — candidate \/ needs_recheck/);
-	assert.match(understanding, /K001@2 检查判据 — adopted \/ usable_conditionally/);
-	assert.match(corrections, /C001@2.*纠正表述/);
-	assert.match(corrections, /D001@1/);
-	assert.match(questions, /Q001@1 仍开放/);
-	assert.match(limits, /needs_recheck C001@2/);
-	assert(index.some((entry) => entry.id === "C001" && entry.version === 2 && entry.availability === "needs_recheck"));
+	const ordinary = await store.buildPack({ purpose: "M04", ids: ["K001"], includeOpenQuestions: false });
+	const selected = await retrieveKnowledge(store, { purpose: "M04", text: "Tensor method", maxRecords: 2, maxChars: 5_000 });
+	for (const markdown of [ordinary.markdown, selected.pack.markdown]) {
+		assert(markdown.includes("### K001@1"));
+		assert(markdown.includes(`本库 storeId：${storeId}`));
+		assert.match(markdown, /原始记录元数据（fields；非采用判断）/);
+		assert(markdown.includes(`"storeId":"${storeId}","recordId":"E001","version":1`));
+		assert.match(markdown, /"requiredTags":\["numeric"\]/);
+		assert.match(markdown, /"tags":\["numeric","tensor"\]/);
+		assert.match(markdown, /"retrieval":\{"keywords":\["matmul"\]\}/);
+		assert.match(markdown, /"scientificMetadata":\{"device":"sample-device","metric":"latency"\}/);
+	}
+	const ordinaryTight = await store.buildPack({ purpose: "M04", ids: ["K001"], includeOpenQuestions: false, maxChars: 300 });
+	const selectedTight = await retrieveKnowledge(store, { purpose: "M04", text: "Tensor method", maxRecords: 2, maxChars: 300 });
+	assert(ordinaryTight.truncated);
+	assert(!ordinaryTight.markdown.includes("### K001@1"));
+	assert(ordinaryTight.markdown.length <= 300);
+	assert(!selectedTight.pack.markdown.includes("### K001@1"));
+	assert(selectedTight.pack.markdown.length <= 300);
+	const empty = await store.buildPack({ purpose: "M04", types: [], includeOpenQuestions: false });
+	await assert.rejects(store.buildPack({ purpose: "M04", ids: ["K001"], includeOpenQuestions: false, maxChars: empty.markdown.length - 1 }),
+		/knowledge pack header exceeds character budget/);
+	const headerOnly = await store.buildPack({ purpose: "M04", ids: ["K001"], includeOpenQuestions: false, maxChars: empty.markdown.length });
+	assert.equal(headerOnly.markdown, empty.markdown);
+	assert.deepEqual(headerOnly.omitted, ["K001"]);
+	await apply(store, { stage: "M04", runId: "many-methods", ops: Array.from({ length: 40 }, (_, index) => ({
+		op: "create" as const, type: "K" as const, title: `Additional method ${index}`, body: "Unexpanded detail", usageDecision: "candidate" as const,
+	})) });
+	const manyOmitted = await store.buildPack({ purpose: "M04", types: ["K"], includeOpenQuestions: false, maxChars: 200 });
+	assert.equal(manyOmitted.omitted.length, 41);
+	assert.match(manyOmitted.markdown, /未展开 41 项/);
+	assert(manyOmitted.markdown.length <= 200);
 });

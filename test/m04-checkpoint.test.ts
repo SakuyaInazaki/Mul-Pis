@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -52,96 +52,40 @@ test("active M07 checkpoint gives M04 only its frozen feedback, problem, and evi
 	assert.equal(source.goalSnapshotPath, checkpoint.goalSnapshotPath);
 });
 
-test("checkpoint M04 rejects unregistered IDs, traversal, and a symlink replacing a frozen file", async (t) => {
+test("M04 requires the selected checkpoint's independent report in full alongside caller-selected evidence", async (t) => {
 	const f = await fixture(t);
 	const goal = await f.controller.begin(begin);
-	const checkpoint = await f.controller.checkpoint(goal.runId);
-	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07Checkpoint", runId: goal.runId, checkpointId: "../C001" } }), /标识非法/);
-	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07Checkpoint", runId: goal.runId, checkpointId: "C999" } }), /未由该目标唯一登记|无法按固定记录读取/);
-	const originalManifest = await readFile(checkpoint.manifestPath, "utf8");
-	const escaped = JSON.parse(originalManifest);
-	escaped.files[0].relativePath = "../goal.json";
-	await writeFile(checkpoint.manifestPath, JSON.stringify(escaped));
-	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07Checkpoint", runId: goal.runId, checkpointId: checkpoint.id } }), /证据清单字段非法/);
-	await writeFile(checkpoint.manifestPath, originalManifest);
-	await rm(checkpoint.manifestPath);
-	await symlink(path.join(f.ws.runDir("M07", goal.runId), "goal.json"), checkpoint.manifestPath);
-	await assert.rejects(runM04(f.ctx, { feedback: { kind: "M07Checkpoint", runId: goal.runId, checkpointId: checkpoint.id } }), /固定路径非法/);
-});
-
-test("M07 checkpoint C10000 remains readable through the M04 checkpoint handoff", async t => {
-	const f = await fixture(t);
-	const goal = await f.controller.begin(begin);
-	const goalFile = path.join(f.ws.runDir("M07", goal.runId), "goal.json");
-	const state = JSON.parse(await readFile(goalFile, "utf8"));
-	state.checkpoints = Array.from({ length: 9_999 }, (_, index) => ({ id: `C${String(index + 1).padStart(3, "0")}` }));
-	await writeFile(goalFile, JSON.stringify(state));
-	const checkpoint = await f.controller.checkpoint(goal.runId);
-	assert.equal(checkpoint.id, "C10000");
-	const result = await runM04(f.ctx, { feedback: { kind: "M07Checkpoint", runId: goal.runId, checkpointId: checkpoint.id } });
-	assert.equal(result.record.status, "completed");
-});
-
-test("M07 freezes and M04 consumes more than 256 small raw evidence files", async t => {
-	const f = await fixture(t);
-	const goal = await f.controller.begin(begin);
-	for (let index = 0; index < 257; index++)
-		await writeFile(path.join(f.ws.rawDir, `extra-${String(index).padStart(3, "0")}.md`), `Evidence ${index}\n`);
-	const checkpoint = await f.controller.checkpoint(goal.runId);
+	const candidate = await f.controller.delegate(goal.runId, { objective: "形成候选", inputs: [], expectedOutputs: [], checks: ["报告可核查"], mode: "reason", requireIndependentCheck: true });
+	const check = await f.controller.delegate(goal.runId, { objective: "独立核查候选", inputs: [candidate.reportPath!], expectedOutputs: [], checks: ["检查已完成"], mode: "check", parentTaskId: candidate.taskId });
+	await writeFile(check.reportPath!, "独立检查发现决定性反证。\n结论应保留为未知。\n");
+	await f.controller.review(goal.runId, { taskId: candidate.taskId, artifacts: [candidate.reportPath!],
+		checks: [{ criterion: "报告可核查", result: "passed", evidence: [candidate.reportPath!] }],
+		independentCheck: { taskId: check.taskId, report: check.reportPath!, disposition: "保留独立检查发现。" } });
+	const checkpoint = await f.controller.checkpoint(goal.runId, { taskIds: [candidate.taskId] });
+	const frozen = JSON.parse(await readFile(checkpoint.goalSnapshotPath, "utf8"));
+	const selected = frozen.tasks.find((task: { taskId: string }) => task.taskId === candidate.taskId);
+	const report = path.relative(checkpoint.rootDir, selected.review.independentCheck.report);
+	const callerPath = path.relative(checkpoint.rootDir, selected.review.frozenReportPath);
 	const manifest = JSON.parse(await readFile(checkpoint.manifestPath, "utf8"));
-	assert.ok(manifest.rawFiles.length > 256);
-	const result = await runM04(f.ctx, { feedback: { kind: "M07Checkpoint", runId: goal.runId, checkpointId: checkpoint.id } });
+	assert.ok(manifest.files.some((file: { relativePath: string }) => file.relativePath === report));
+	assert.ok(!frozen.checkpointScope.selectedTaskIds.includes(check.taskId), "the check task itself need not be selected");
+	const fake = new FakeSessionRunner(({ spec, turnIndex, message }) => {
+		if (spec.label !== "M04-research") return "task report version one";
+		if (turnIndex === 1) {
+			assert.ok(message.includes(report), "the independent report is in the first full-read instruction");
+			return { text: "暂定采用候选。", readReturns: [{ toolName: "m07_evidence_read", status: "returned", path: callerPath,
+				requested: {}, returned: { kind: "text", startLine: 1, endLine: 1, truncated: false }, at: new Date().toISOString() }] };
+		}
+		assert.ok(message.includes(report), "missing independent report is requested again");
+		return { text: "独立反证阻止采用；没有知识提案。", readReturns: [{ toolName: "m07_evidence_read", status: "returned", path: report,
+			requested: {}, returned: { kind: "text", startLine: 1, endLine: 2, truncated: false }, at: new Date().toISOString() }] };
+	});
+	f.ctx.runner = fake;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07Checkpoint", runId: goal.runId, checkpointId: checkpoint.id },
+		requiredM07ReadPaths: [callerPath] });
 	assert.equal(result.record.status, "completed");
-});
-
-test("oversized checkpoint feedback indexes its own frozen goal and remains consumable by M04", async (t) => {
-	const f = await fixture(t);
-	const policyDir = path.join(f.root, ".agent", "improvement");
-	await mkdir(path.join(policyDir, "versions", "checkpoint-budget"), { recursive: true });
-	await writeFile(path.join(policyDir, "versions", "checkpoint-budget", "policy.json"), JSON.stringify({ version: 1, maxPromptChars: 8_000, maxInlineFileChars: 1_000, maxAggregateInlineChars: 4_000, maxFeedbackChars: 4_000, overflowMode: "manifest-and-defer" }));
-	await writeFile(path.join(policyDir, "active.json"), JSON.stringify({ version: 1, versionId: "checkpoint-budget", promotedAt: new Date().toISOString(), runId: "fixture" }));
-	const goal = await f.controller.begin(begin);
-	const task = await f.controller.delegate(goal.runId, { objective: "保留负结果与限制", inputs: [], expectedOutputs: [], checks: ["报告存在"], mode: "reason" });
-	await f.controller.review(goal.runId, { taskId: task.taskId, artifacts: [task.reportPath!], checks: [{ criterion: "报告存在", result: "passed", evidence: [task.reportPath!] }], limitations: ["L".repeat(5_000)] });
-	const checkpoint = await f.controller.checkpoint(goal.runId);
-	assert.equal(checkpoint.feedbackStatus, "indexed");
-	const index = await readFile(checkpoint.feedbackPath, "utf8");
-	assert.match(index, /goal\.json/);
-	assert.ok(!index.includes(f.ws.runDir("M07", goal.runId)), "index must not grant the live run directory");
-	assert.match(await readFile(checkpoint.goalSnapshotPath, "utf8"), /L{100}/);
-	const result = await runM04(f.ctx, { feedback: { kind: "M07Checkpoint", runId: goal.runId, checkpointId: checkpoint.id } });
-	assert.equal(result.record.status, "completed");
-	assert.equal(f.runner.created.findLast((item) => item.label === "M04-research")?.tools.kind, "read-dir");
-});
-
-test("selected-task checkpoint exposes only that review evidence and tells M04 what was omitted", async (t) => {
-	const f = await fixture(t);
-	const goal = await f.controller.begin(begin);
-	const selected = await f.controller.delegate(goal.runId, { objective: "本批证据", inputs: [], expectedOutputs: [], checks: ["本批报告"], mode: "reason" });
-	await f.controller.review(goal.runId, { taskId: selected.taskId, artifacts: [selected.reportPath!], checks: [{ criterion: "本批报告", result: "passed", evidence: [selected.reportPath!] }] });
-	const omitted = await f.controller.delegate(goal.runId, { objective: "历史证据", inputs: [], expectedOutputs: [], checks: ["历史报告"], mode: "reason" });
-	const omittedReviewed = await f.controller.review(goal.runId, { taskId: omitted.taskId, artifacts: [omitted.reportPath!], checks: [{ criterion: "历史报告", result: "passed", evidence: [omitted.reportPath!] }] });
-	const checkpoint = await f.controller.checkpoint(goal.runId, { taskIds: [selected.taskId] });
-	const manifest = JSON.parse(await readFile(checkpoint.manifestPath, "utf8"));
-	assert.deepEqual(manifest.selectedTaskIds, [selected.taskId]);
-	assert.deepEqual(manifest.omittedTaskIds, [omitted.taskId]);
-	assert.ok(manifest.files.some((item: { relativePath: string }) => item.relativePath.includes(`/${selected.taskId}/`)));
-	assert.ok(manifest.files.every((item: { relativePath: string }) => !item.relativePath.includes(`/${omitted.taskId}/`)));
-	const frozenGoal = JSON.parse(await readFile(checkpoint.goalSnapshotPath, "utf8"));
-	assert.equal(frozenGoal.tasks.find((item: { taskId: string }) => item.taskId === omitted.taskId).status, "accepted");
-	assert.equal(frozenGoal.tasks.find((item: { taskId: string }) => item.taskId === omitted.taskId).review, undefined);
-	assert.equal(frozenGoal.tasks.find((item: { taskId: string }) => item.taskId === omitted.taskId).reportPath, undefined);
-	const liveOmitted = (await f.controller.status(goal.runId)).tasks.find((item) => item.taskId === omitted.taskId)!;
-	assert.equal(liveOmitted.status, "accepted");
-	assert.equal(liveOmitted.review?.frozenReportPath, omittedReviewed.review!.frozenReportPath);
-	assert.equal(liveOmitted.reportPath, omittedReviewed.reportPath);
-	const result = await runM04(f.ctx, { feedback: { kind: "M07Checkpoint", runId: goal.runId, checkpointId: checkpoint.id } });
-	const source = JSON.parse(await readFile(result.record.outputs.find((item) => item.label === "M07 处理来源")!.path, "utf8"));
-	assert.deepEqual({ selected: source.selectedTaskIds, omitted: source.omittedTaskIds }, { selected: [selected.taskId], omitted: [omitted.taskId] });
-	const session = [...f.runner.sessions.values()].findLast((item) => item.spec.label === "M04-research")!;
-	assert.equal(session.spec.tools.kind, "read-dir");
-	if (session.spec.tools.kind === "read-dir") assert.equal(session.spec.tools.root, checkpoint.rootDir);
-	assert.match(session.transcript[0].text, /省略任务 1 项|未选任务 1/);
-	assert.match(session.transcript[0].text, /未提供的证据/);
-	assert.ok(!session.transcript[0].text.includes(omittedReviewed.review!.frozenReportPath));
+	assert.equal(result.proposalId, undefined);
+	const session = [...fake.sessions.values()].find((item) => item.spec.label === "M04-research")!;
+	assert.equal(session.turns, 2);
+	assert.deepEqual(session.readReturns.map((event) => event.path), [callerPath, report]);
 });

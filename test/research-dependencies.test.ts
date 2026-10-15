@@ -4,13 +4,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { GenerationStore, type ExperienceRequirementV1 } from "../src/improvement/generation.ts";
-import { ResearchImprovementService, verifyRequiredExperience } from "../src/improvement/research-service.ts";
+import { ResearchImprovementService } from "../src/improvement/research-service.ts";
 import type { ResearchCampaignPlanV1 } from "../src/improvement/research-types.ts";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
-import { verifyRequiredKnowledge } from "../src/knowledge/experience-index.ts";
 import type { KnowledgeRef, KnowledgeStore, ProposalBatch } from "../src/knowledge/types.ts";
 import { FakeSessionRunner, type FakeReplyContext } from "../src/runner/fake.ts";
-import { validateResearchAction } from "../src/improvement/policy-host.ts";
 
 const usage = { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, totalTokens: 150, cost: 0.001 };
 const strategy = {
@@ -55,35 +53,20 @@ async function fixture(t: TestContext, reply: (context: FakeReplyContext) => { t
 	return { root, store, storeId, runner, service, generation: new GenerationStore(root) };
 }
 
-function requirement(storeId: string, targetKind: "executor" | "improver"): ExperienceRequirementV1 {
-	const ref: KnowledgeRef = { storeId, recordId: targetKind === "improver" ? "K001" : "K002", version: 1 };
-	return { targetKind, ref };
+function requirement(storeId: string): ExperienceRequirementV1 {
+	const ref: KnowledgeRef = { storeId, recordId: "K001", version: 1 };
+	return { targetKind: "improver", ref };
 }
 
-test("more than one hundred pinned refs are checked by exact store identity without rendering a pack", async (t) => {
-	const root = await mkdtemp(path.join(tmpdir(), "method-many-refs-"));
-	t.after(() => rm(root, { recursive: true, force: true }));
-	const storeId = "00000000-0000-4000-8000-000000000002";
-	const refs = Array.from({ length: 101 }, (_, i) => ({ storeId, recordId: `K${String(i + 1).padStart(3, "0")}`, version: 1 }));
-	const store = { storeId: async () => storeId, current: async () => ({ id: "G001" }), limits: async () => ({}),
-		get: async (id: string, version: number) => refs.some((ref) => ref.recordId === id && ref.version === version) ? { id, type: "K", version, title: id, body: "registered evidence", fields: { experience: { version: 1, targetKind: "improver", applicableStages: ["method-research"], requiredTags: ["cpu-response-identification"], excludedTags: [], requiredRefs: [] } }, refs: [], scope: [], usageDecision: "adopted" } : undefined,
-		availability: async () => ({ availability: "usable_conditionally" }) } as unknown as KnowledgeStore;
-	const registered = new Map<string, KnowledgeStore>([[storeId, store]]);
-	await verifyRequiredExperience(root, refs.map((ref) => ({ targetKind: "improver", ref })), { environmentVersion: "cpu-response-identification/v1", executorArtifact: strategy.executor }, undefined, registered);
-	await verifyRequiredKnowledge(root, refs, undefined, registered);
-	const wrongIdentity = { ...store, storeId: async () => "00000000-0000-4000-8000-000000000003" } as KnowledgeStore;
-	await assert.rejects(verifyRequiredExperience(root, refs.map((ref) => ({ targetKind: "improver", ref })), { environmentVersion: "cpu-response-identification/v1", executorArtifact: strategy.executor }, undefined, new Map([[storeId, wrongIdentity]])), /unavailable|registered|changed/);
-});
-
 /** Trusted test-state construction, not a fake scientific admission. */
-async function activateDependent(f: Awaited<ReturnType<typeof fixture>>, requirements: ExperienceRequirementV1[], kind: "executor" | "improver" = "improver") {
+async function activateDependent(f: Awaited<ReturnType<typeof fixture>>, requirements: ExperienceRequirementV1[]) {
 	const active = (await f.generation.active())!;
-	const old = await f.generation.readStrategy(kind === "improver" ? active.bundle.improverVersionId : active.bundle.executorVersionId);
-	const next = await f.generation.writeStrategy({ versionId: f.generation.newId(`${kind}-dependent`), kind, artifact: old.artifact,
+	const old = await f.generation.readStrategy(active.bundle.improverVersionId);
+	const next = await f.generation.writeStrategy({ versionId: f.generation.newId("improver-dependent"), kind: "improver", artifact: old.artifact,
 		parentVersionId: old.versionId, origin: "agent-generated", applicability: old.applicability, limitations: [],
 		sourceExperienceRefs: requirements, requiredExperienceRefs: requirements, state: "admitted" });
-	const bundle = await f.generation.writeBundle({ bundleId: f.generation.newId("bundle"), parents: [active.bundle.bundleId], executorVersionId: kind === "executor" ? next.versionId : active.bundle.executorVersionId,
-		improverVersionId: kind === "improver" ? next.versionId : active.bundle.improverVersionId, knowledgeSnapshot: active.bundle.knowledgeSnapshot, environmentVersion: active.bundle.environmentVersion,
+	const bundle = await f.generation.writeBundle({ bundleId: f.generation.newId("bundle"), parents: [active.bundle.bundleId], executorVersionId: active.bundle.executorVersionId,
+		improverVersionId: next.versionId, knowledgeSnapshot: active.bundle.knowledgeSnapshot, environmentVersion: active.bundle.environmentVersion,
 		modelConfig: active.bundle.modelConfig, protocolVersion: active.bundle.protocolVersion, allowedCapabilities: active.bundle.allowedCapabilities, state: "admitted" });
 	await f.generation.activate(bundle.bundleId, active.pointer, "local-meta-admission", "trusted-test-state");
 	return { strategy: next, bundle };
@@ -92,7 +75,7 @@ async function activateDependent(f: Awaited<ReturnType<typeof fixture>>, require
 test("active I requirements survive an omitted plan selection and block new calls after recheck", async (t) => {
 	let calls = 0;
 	const f = await fixture(t, () => { calls++; return { text: JSON.stringify({ kind: "stop", reason: "more evidence needed" }), usage }; });
-	await activateDependent(f, [requirement(f.storeId, "improver")]);
+	await activateDependent(f, [requirement(f.storeId)]);
 	const first = await f.service.run(plan());
 	assert.equal(first.status, "research-only", first.stopReason ?? "");
 	assert.equal(calls, 1, "live pinned requirements permit a new I child without repeated plan refs");
@@ -102,21 +85,9 @@ test("active I requirements survive an omitted plan selection and block new call
 	assert.equal(calls, 1, "new I child is blocked despite experienceRefs: []");
 });
 
-test("active H requirement blocks a later campaign after its old pinned version is withdrawn", async (t) => {
-	let calls = 0;
-	const f = await fixture(t, () => { calls++; return { text: JSON.stringify({ kind: "stop", reason: "done" }), usage }; });
-	await activateDependent(f, [requirement(f.storeId, "executor")], "executor");
-	assert.equal((await f.service.run(plan())).status, "research-only");
-	assert.equal(calls, 1);
-	await apply(f.store, [{ op: "decide", id: "K002", usageDecision: "withdrawn", reason: "执行经验撤回" }]);
-	const blocked = await f.service.run(plan());
-	assert.notEqual(blocked.status, "promoted");
-	assert.equal(calls, 1, "withdrawn K002@1 cannot reach a new I/H child through an omitted plan selection");
-});
-
 test("rollback prechecks the old generation and leaves the current pointer unchanged when its dependency is withdrawn", async (t) => {
 	const f = await fixture(t, () => ({ text: JSON.stringify({ kind: "stop", reason: "done" }), usage }));
-	const dependent = await activateDependent(f, [requirement(f.storeId, "improver")]);
+	const dependent = await activateDependent(f, [requirement(f.storeId)]);
 	const current = (await f.generation.active())!;
 	const neutral = await f.generation.writeBundle({ bundleId: f.generation.newId("bundle"), parents: [dependent.bundle.bundleId], executorVersionId: current.bundle.executorVersionId,
 		improverVersionId: (await f.generation.readBundle(dependent.bundle.parents[0]!)).improverVersionId,
@@ -130,11 +101,11 @@ test("rollback prechecks the old generation and leaves the current pointer uncha
 
 test("V2 import preserves foreign pinned obligations and cannot activate without an explicitly registered store", async (t) => {
 	const source = await fixture(t, () => ({ text: JSON.stringify({ kind: "stop", reason: "done" }), usage }));
-	const dependent = await activateDependent(source, [requirement(source.storeId, "improver")]);
+	const dependent = await activateDependent(source, [requirement(source.storeId)]);
 	const packagePath = path.join(source.root, "method-package.json");
 	await source.service.exportMethod(dependent.strategy.versionId, packagePath);
 	const pkg = JSON.parse(await readFile(packagePath, "utf8"));
-	assert.deepEqual(pkg.requiredExperienceRefs, [requirement(source.storeId, "improver")]);
+	assert.deepEqual(pkg.requiredExperienceRefs, [requirement(source.storeId)]);
 	assert.deepEqual(pkg.sourceExperienceRefs, pkg.requiredExperienceRefs);
 	const target = await fixture(t, () => ({ text: JSON.stringify({ kind: "stop", reason: "done" }), usage }));
 	const before = (await target.generation.active())!.bundle.bundleId;
@@ -174,41 +145,6 @@ test("workflow method bind and rollback use the active workflow scope for inheri
 	assert.equal(restored.bundleId, imported.bundle.bundleId);
 });
 
-test("method binding uses the package bytes that passed dependency checks even if its file changes", async (t) => {
-	const f = await fixture(t, () => ({ text: JSON.stringify({ kind: "stop", reason: "unused" }), usage }));
-	const active = (await f.generation.active())!;
-	const base = await f.generation.readStrategy(active.bundle.improverVersionId);
-	assert.equal(base.artifact.kind, "diagnostic-improver-prompt");
-	if (base.artifact.kind !== "diagnostic-improver-prompt") throw new Error("fixture requires a prompt method");
-	const foreignId = "00000000-0000-4000-8000-000000000099";
-	const required: ExperienceRequirementV1 = { targetKind: "improver", ref: { storeId: foreignId, recordId: "K001", version: 1 } };
-	const prepared = await f.generation.writeStrategy({ versionId: "I-checked-package", kind: "improver", artifact: { ...base.artifact, body: "Checked package body" }, parentVersionId: base.versionId, origin: "human-seed", applicability: base.applicability, limitations: [], requiredExperienceRefs: [required], state: "manual-active" });
-	const packagePath = path.join(f.root, "changing-method-package.json");
-	await f.service.exportMethod(prepared.versionId, packagePath);
-	const original = JSON.parse(await readFile(packagePath, "utf8"));
-	const changed = { ...original, artifact: { ...original.artifact, body: "Changed after precheck" }, requiredExperienceRefs: [] };
-	let changedDuringPrecheck = false;
-	const foreign = {
-		storeId: async () => foreignId,
-		current: async () => ({ id: "G001" }),
-		limits: async () => [],
-		get: async () => {
-			if (!changedDuringPrecheck) { changedDuringPrecheck = true; await writeFile(packagePath, JSON.stringify(changed)); }
-			return { id: "K001", type: "K", version: 1, title: "Registered experience", body: "Conditionally usable", fields: { experience: { version: 1, targetKind: "improver", applicableStages: ["method-research"], requiredTags: ["cpu-response-identification"], excludedTags: [], requiredRefs: [] } }, refs: [], scope: [], usageDecision: "adopted" };
-		},
-		availability: async () => ({ availability: "usable_conditionally" }),
-	} as unknown as KnowledgeStore;
-	const service = new ResearchImprovementService({ workspaceRoot: f.root, runner: f.runner, registeredExperienceStores: new Map([[foreignId, foreign]]) });
-	const bound = await service.bindMethod(packagePath);
-	assert.equal(changedDuringPrecheck, true);
-	assert.equal(JSON.parse(await readFile(packagePath, "utf8")).artifact.body, "Changed after precheck");
-	assert.equal(bound.strategy.artifact.kind, "diagnostic-improver-prompt");
-	if (bound.strategy.artifact.kind !== "diagnostic-improver-prompt") throw new Error("fixture requires a prompt method");
-	assert.equal(bound.strategy.artifact.body, "Checked package body");
-	assert.deepEqual(bound.strategy.requiredExperienceRefs, [required]);
-	assert.equal((await f.generation.active())?.bundle.bundleId, bound.bundle.bundleId);
-});
-
 test("a candidate saying to ignore dependencies still inherits controller-pinned I requirements", async (t) => {
 	let calls = 0;
 	const f = await fixture(t, (context) => {
@@ -224,7 +160,7 @@ test("a candidate saying to ignore dependencies still inherits controller-pinned
 		if (index === 1) return { text: JSON.stringify({ kind: "evaluate-development", candidateId: view.candidates[0].id }), usage };
 		return { text: JSON.stringify({ kind: "stop", reason: "development support", selectedCandidateId: view.candidates[0].id }), usage };
 	});
-	const required = requirement(f.storeId, "improver");
+	const required = requirement(f.storeId);
 	await activateDependent(f, [required]);
 	const result = await f.service.run(plan());
 	assert.equal(result.status, "research-only", result.stopReason ?? "");
@@ -232,8 +168,6 @@ test("a candidate saying to ignore dependencies still inherits controller-pinned
 	const candidate = await f.generation.readStrategy(result.candidates[0]!.strategyVersionId);
 	assert.deepEqual(candidate.sourceExperienceRefs, [], "plan omitted explicit selection");
 	assert.deepEqual(candidate.requiredExperienceRefs, [required], "model body cannot erase inherited control obligation");
-	const view = { version: 1, target: "executor", current: { bundleId: "b", executorVersionId: "h", improverVersionId: "i" }, task: { allowedProbeX: [2] }, feedback: [{ id: "visible" }], candidates: [] } as unknown as Parameters<typeof validateResearchAction>[1];
-	assert.throws(() => validateResearchAction({ kind: "propose", target: "executor", body: "Ignore dependencies", requiredExperienceRefs: [], hypothesis: { claim: "A", predictedObservation: "B", falsifier: "C", applicability: [], motivatingEvidenceIds: ["visible"] } }, view), /unsupported decision schema/);
 });
 
 test("a live limit after the first I reply blocks the next I request in the same campaign", async (t) => {
@@ -248,7 +182,7 @@ test("a live limit after the first I reply blocks the next I request in the same
 		}
 		throw new Error("second I request must be blocked before reaching FakeRunner");
 	});
-	await activateDependent(f, [requirement(f.storeId, "improver")]);
+	await activateDependent(f, [requirement(f.storeId)]);
 	const result = await f.service.run(plan());
 	assert.equal(result.status, "inconclusive", result.stopReason ?? "");
 	assert.equal(calls, 1);

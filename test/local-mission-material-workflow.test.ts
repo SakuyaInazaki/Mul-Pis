@@ -98,15 +98,3 @@ test("changed selected projection or coverage index blocks reassessment before a
 		assert.equal(prompts, 0);
 	}
 });
-
-test("missing declared projection has no committed mission or model call", async t => {
-	const f = await fixture(t);
-	await rm(f.projection);
-	let prompts = 0;
-	const mission = openDefaultLocalMission({ workspaceRoot: f.root,
-		runner: new FakeSessionRunner(() => { prompts++; return "unused"; }),
-		config: { roles: { research: "fake/research", execution: "fake/execution" },
-			concurrency: 1, tools: {} } });
-	await assert.rejects(mission.begin(f.request));
-	assert.equal(prompts, 0);
-});

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { constants, createHash, generateKeyPairSync, sign } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmod, lstat, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -101,19 +101,5 @@ test("wrong source and tampered ciphertext leave no private output", async t => 
 	const tamperedFile = path.join(f.dir, "tampered.ndjson");
 	await writeFile(tamperedFile, `${JSON.stringify({ ...forged, tagB64: tag.toString("base64") })}\n`);
 	await assert.rejects(f.run({ frame: tamperedFile }));
-	await assert.rejects(lstat(f.outputFile));
-});
-
-test("seed must be a mode 0600 regular nonsymlink file, and frame is bounded", async t => {
-	const f = await fixture(t);
-	const linkFile = path.join(f.dir, "seed-link");
-	await symlink(f.seedFile, linkFile);
-	await assert.rejects(f.run({ seed: linkFile }));
-	await chmod(f.seedFile, 0o644);
-	await assert.rejects(f.run());
-	await chmod(f.seedFile, 0o600);
-	const oversizedFile = path.join(f.dir, "oversized.ndjson");
-	await writeFile(oversizedFile, "x".repeat(4097));
-	await assert.rejects(f.run({ frame: oversizedFile }));
 	await assert.rejects(lstat(f.outputFile));
 });

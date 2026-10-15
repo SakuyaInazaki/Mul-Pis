@@ -2,6 +2,8 @@ import { existsSync } from "node:fs";
 import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { createFileKnowledgeStore } from "../knowledge/store.ts";
+import { discoverLocalM07Experiences, type LocalM07ExperienceDiscovery } from "../knowledge/experience-index.ts";
+import type { KnowledgeRef } from "../knowledge/types.ts";
 import { createM07Controller } from "../m07/controller.ts";
 import type { BeginGoalInput, CurrentGoal, DecisionInput, FinishInput, HostStopReasonKind, InterruptInput, TaskReviewInput, TaskSpecInput } from "../m07/types.ts";
 import { summarizeGoalExecution } from "../m07/status.ts";
@@ -45,6 +47,7 @@ export interface ResearchStatus {
 	configPresent: boolean;
 	knowledgeSnapshot?: string;
 	activeLimits: number;
+	experience?: LocalM07ExperienceDiscovery;
 	stages: Record<ResearchStage, { count: number; latest?: { runId: string; status: string; failures: string[]; goalLifecycle?: CurrentGoal["lifecycle"]; attemptId?: string; attemptState?: ReturnType<typeof summarizeGoalExecution>["attemptState"]; unresolvedOperationIds?: string[]; unresolvedTaskIds?: string[]; goalStateError?: "unreadable" } }>;
 	limitations: string[];
 }
@@ -57,6 +60,7 @@ export interface StageRequest {
 	feedbackStage?: "M03" | "M06" | "M07" | "M08";
 	feedbackRunId?: string;
 	feedbackCheckpointId?: string;
+	requiredM07ReadPaths?: string[];
 	feedbackFile?: string;
 	feedbackLabel?: string;
 	freshSession?: boolean;
@@ -286,7 +290,7 @@ export class ResearchService {
 		});
 	}
 
-	async status(requested?: string): Promise<ResearchStatus> {
+	async status(requested?: string, experience?: { tags: string[]; contextRefs?: KnowledgeRef[]; offset?: number }): Promise<ResearchStatus> {
 		const root = this.resolveWorkspace(requested);
 		const ws = new Workspace(root);
 		const store = createFileKnowledgeStore(ws.knowledgeDir);
@@ -304,12 +308,17 @@ export class ResearchService {
 		}
 		const snapshot = existsSync(ws.knowledgeDir) ? await store.current() : undefined;
 		const limits = existsSync(ws.knowledgeDir) ? (await store.limits()).filter((limit) => !limit.liftedAt) : [];
+		if (experience && !existsSync(ws.knowledgeDir)) throw new HarnessError("experience.discovery", "workspace knowledge store is not initialized");
+		const discovered = experience ? await discoverLocalM07Experiences(store, experience) : undefined;
+		if (discovered && discovered.snapshotId !== snapshot?.id)
+			throw new HarnessError("experience.discovery", "knowledge snapshot changed during status and experience discovery");
 		return {
 			workspace: root,
 			initialized: existsSync(ws.agentDir),
 			configPresent: existsSync(ws.configFile),
 			knowledgeSnapshot: snapshot?.id,
 			activeLimits: limits.length,
+			...(discovered ? { experience: discovered } : {}),
 			stages,
 			limitations: [
 				"断线或进程退出后的 running 任务不会自动重跑。",
@@ -322,6 +331,9 @@ export class ResearchService {
 
 	async runStage(request: StageRequest, signal?: AbortSignal): Promise<unknown> {
 		const root = this.resolveWorkspace(request.workspace);
+		if (request.requiredM07ReadPaths !== undefined &&
+			(request.stage !== "M04" || request.feedbackStage !== "M07" || request.feedbackFile))
+			throw new HarnessError("m04.m07-evidence", "requiredM07ReadPaths applies only to M04 with M07 feedback");
 		return this.withMutation(root, async () => {
 			const retryGuard = new RetryGuard(root);
 			const fingerprint = stageFingerprint(request, await stageInputVersion(root, request));
@@ -345,7 +357,7 @@ export class ResearchService {
 							? { kind: request.feedbackStage, runId: request.feedbackRunId }
 							: undefined;
 					if (!feedback) throw new HarnessError("m07.stage", "M04 需要 feedbackStage 或 feedbackFile");
-					result = await runM04(ctx, { feedback, freshSession: request.freshSession });
+					result = await runM04(ctx, { feedback, freshSession: request.freshSession, requiredM07ReadPaths: request.requiredM07ReadPaths });
 					break;
 				}
 				case "M05": result = await runM05(ctx, { goal: request.goal, noBrowser: request.noBrowser }); break;

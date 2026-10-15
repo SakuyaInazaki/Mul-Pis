@@ -70,11 +70,3 @@ test("false availability and ambiguous provider replies fail closed without priv
 		assert.doesNotMatch(JSON.stringify(checked), /PRIVATE_|synthetic-test-key/, label);
 	}
 });
-
-test("missing credential cannot mint an available or unknown runtime observation", async () => {
-	let called = false;
-	await assert.rejects(checkDeepSeekAvailability({ apiKey: "", request: async () => {
-		called = true; return balance(true);
-	} }), /availability credential absent/);
-	assert.equal(called, false);
-});

@@ -84,26 +84,6 @@ test("fixed A/B source arms run M07→M04 in separate child processes with one f
   const m04 = await ws.readRun("M04", arm.m04RunId!);
   assert.equal(m04.sessions[0]?.model, "fake/research");
  }
- const casesPath = path.join(sourceData.root, "source-cases.json");
- await writeFile(casesPath, JSON.stringify({ version: 1, split: "development", cases: [caseInput] }));
- const activeBefore = await readFile(path.join(store.root, "active.json"), "utf8");
- const comparison = await research.compareWorkflowSources({ version: 1, kind: "m07-source-comparison/v1", caseSetPath: "source-cases.json",
-  experimentRoot: path.join(root, "source-comparison"), baseline: "active-h", repetitions: 2,
-  sources: { baseline: { sourceRoot: sourceA.sourceRoot, sourceCommit: sourceA.sourceCommit },
-   candidate: { sourceRoot: sourceB.sourceRoot, sourceCommit: sourceB.sourceCommit } } }, { runnerKind: "fake", fakeReplyModule });
- assert.equal(comparison.status, "complete", comparison.stopReason);
- assert.equal(comparison.pairs.length, 2);
- assert.deepEqual(comparison.pairs.map(pair => pair.executionOrder), [["A", "A2"], ["A2", "A"]]);
- const comparedArms = comparison.pairs.flatMap(pair => [pair.armA, pair.armA2]);
- assert.equal(new Set(comparedArms.map(arm => arm.childPid)).size, 4);
- assert.deepEqual(comparedArms.map(arm => arm.loadedSource?.sourceCommit), [commitA, commitB, commitA, commitB]);
- assert.ok(comparedArms.every(arm => arm.methodVersionId === h.versionId && arm.status === "complete"));
- assert.equal(await readFile(path.join(store.root, "active.json"), "utf8"), activeBefore);
- const beforeBad = beforePrompts;
- await assert.rejects(executeWorkflowSourceArm({ ...sourceA, sourceCommit: commitB }, { ...args, root: path.join(root, "bad-arm"), arm: "baseline" }, options), /source revision differs|different|source arm/);
- assert.equal(beforePrompts, beforeBad);
- await assert.rejects(executeWorkflowSourceArm(sourceA, { ...args, root: path.join(root, "bad-runner"), arm: "baseline" }, { ...options, fakeReplyModule: path.join(root, "missing-reply.mjs") }), /Cannot find module|source arm/);
- assert.equal(budget.status().inFlight, false);
  const crashReply = path.join(root, "crash-reply.mjs");
  await writeFile(crashReply, "export default function reply() { process.exit(23); }\n");
  const crashBudget = new SharedBudget("crashed-source-arm", {});

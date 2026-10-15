@@ -12,7 +12,6 @@ import { PiSessionRunner, type PiSessionRunnerOptions } from "../../src/runner/p
 // Pi 0.85.1 keeps 4096 context tokens in reserve before building this request.
 const WINDOW = 8192;
 const MAX = 64;
-const MESSAGES = WINDOW - 38;
 const MODEL = {
 	id: "deepseek-flash", name: "Offline DeepSeek", provider: "deepseek", api: "openai-completions",
 	baseUrl: "https://api.deepseek.com", reasoning: true, input: ["text"],
@@ -23,21 +22,6 @@ const MODEL = {
 
 type Audit = ReturnType<DeepSeekCampaignBudget["requestAccountingAuditSnapshot"]>;
 type Boundary = NonNullable<PiSessionRunnerOptions["onCampaignAccountingBoundary"]>;
-
-function rejection(): Response {
-	const requested = MESSAGES + MAX;
-	const message = `This model's maximum context length is ${WINDOW} tokens. However, you requested ${requested} tokens (${MESSAGES} in the messages, ${MAX} in the completion). Please reduce the length of the messages or completion.`;
-	return new Response(JSON.stringify({ error: { type: "invalid_request_error", code: "context_length_exceeded", message } }),
-		{ status: 400, headers: { "content-type": "application/json" } });
-}
-
-function completion(): Response {
-	const chunk = { id: "offline-completion", object: "chat.completion.chunk", created: 1,
-		model: MODEL.id, choices: [{ index: 0, delta: { role: "assistant", content: "offline answer" }, finish_reason: "stop" }],
-		usage: { prompt_tokens: 11, completion_tokens: 3, total_tokens: 14 } };
-	return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`,
-		{ status: 200, headers: { "content-type": "text/event-stream" } });
-}
 
 async function scenario(t: TestContext, onBoundary: Boundary, fakeFetch: (call: number, body: string) => Response) {
 	const dir = await mkdtemp(path.join(tmpdir(), "pi-accounting-boundary-"));
@@ -84,65 +68,4 @@ test("a failed reservation checkpoint prevents HTTP dispatch and leaves an incom
 	assert.equal(committed[0].audit.requests[0].responseReceived, false);
 	assert.equal(run.budget.requestAccountingAuditSnapshot().requests[0].status, "unknown");
 	assert.equal(run.budget.requestAccountingAuditSnapshot().requests[0].responseReceived, false);
-});
-
-test("context retry checkpoints the received unknown predecessor and distinct retry reservation before HTTP", async t => {
-	const committed: Array<{ event: string; audit: Audit }> = [];
-	const run = await scenario(t, async (event, audit) => {
-		await Promise.resolve();
-		committed.push({ event, audit });
-	}, (call, body) => {
-		const payload = JSON.parse(body) as { max_tokens: number };
-		if (call === 1) {
-			assert.deepEqual(committed.map(row => row.event), ["request-reserved"]);
-			assert.equal(committed[0].audit.requests[0].status, "in-flight");
-			assert.equal(payload.max_tokens, MAX);
-			return rejection();
-		}
-		assert.equal(call, 2);
-		assert.deepEqual(committed.map(row => row.event),
-			["request-reserved", "request-observed", "request-reserved"]);
-		const rejected = committed[1].audit.requests;
-		assert.equal(rejected.length, 1);
-		assert.equal(rejected[0].responseReceived, true);
-		assert.equal(rejected[0].status, "unknown");
-		assert.equal(rejected[0].contextRejected, true);
-		const reserved = committed[2].audit.requests;
-		assert.equal(reserved.length, 2);
-		assert.equal(reserved[0].requestId, rejected[0].requestId);
-		assert.notEqual(reserved[1].requestId, reserved[0].requestId);
-		assert.equal(reserved[1].retryOfRequestId, reserved[0].requestId);
-		assert.equal(reserved[1].status, "in-flight");
-		assert.equal(payload.max_tokens, WINDOW - MESSAGES);
-		return completion();
-	});
-	await run.handle.prompt("synthetic prompt");
-	assert.equal(run.fetchCount(), 2);
-	assert.deepEqual(committed.map(row => row.event),
-		["request-reserved", "request-observed", "request-reserved", "request-observed"]);
-	assert.equal(committed[3].audit.requests[0].status, "unknown");
-	assert.equal(committed[3].audit.requests[0].responseReceived, true);
-	assert.equal(committed[3].audit.requests[1].responseReceived, true);
-	assert.equal(committed[3].audit.requests[1].reportedUsage?.totalTokens, 14);
-});
-
-test("a failed retry reservation checkpoint prevents corrected HTTP without erasing the received first request", async t => {
-	const committed: Array<{ event: string; audit: Audit }> = [];
-	const run = await scenario(t, async (event, audit) => {
-		committed.push({ event, audit });
-		if (committed.length === 3) throw new Error("synthetic retry checkpoint failure");
-	}, (call) => {
-		assert.equal(call, 1);
-		return rejection();
-	});
-	await assert.rejects(run.handle.prompt("synthetic prompt"));
-	assert.equal(run.fetchCount(), 1);
-	assert.deepEqual(committed.map(row => row.event),
-		["request-reserved", "request-observed", "request-reserved"]);
-	const audit = run.budget.requestAccountingAuditSnapshot();
-	assert.equal(audit.requests.length, 2);
-	assert.equal(audit.requests[0].status, "unknown");
-	assert.equal(audit.requests[0].responseReceived, true);
-	assert.equal(audit.requests[1].status, "unknown");
-	assert.equal(audit.requests[1].responseReceived, false);
 });

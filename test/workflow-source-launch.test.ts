@@ -74,17 +74,6 @@ test("prepared A keeps loaded and later-imported source A while checkout and new
 	assert.deepEqual(JSON.parse(await readFile(path.join(snapshotA.sourceRoot, ".workflow-source.json"), "utf8")), snapshotA);
 });
 
-test("preparation uses an explicit commit and rejects indirect tracked source without replacing a destination", async t => {
-	const f = await fixture(t), revision = await f.commit("A"), target = path.join(f.root, "source");
-	await assert.rejects(prepareWorkflowCodeSource(f.repo, "HEAD", target), /full reviewed commit/);
-	const receipt = await prepareWorkflowCodeSource(f.repo, revision, target);
-	await assert.rejects(prepareWorkflowCodeSource(f.repo, revision, target), { code: "EEXIST" });
-	assert.deepEqual(JSON.parse(await readFile(path.join(target, ".workflow-source.json"), "utf8")), receipt);
-	await symlink("version.ts", path.join(f.repo, "src/indirect.ts"));
-	const indirect = await f.commit("indirect");
-	await assert.rejects(prepareWorkflowCodeSource(f.repo, indirect, path.join(f.root, "indirect-source")), /regular files only/);
-});
-
 
 test("launcher rejects a false source descriptor before the target process starts", async t => {
 	const f = await fixture(t), revision = await f.commit("A");

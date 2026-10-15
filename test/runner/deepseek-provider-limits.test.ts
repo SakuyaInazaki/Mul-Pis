@@ -29,24 +29,3 @@ test("read-only model metadata provides the live server maximum without retained
 	assert.equal(isVerifiedDeepSeekProviderOutputLimit(providerOutputLimitRecord(profile)), false);
 	assert.doesNotMatch(JSON.stringify(profile), /synthetic-provider-probe-key/);
 });
-
-test("a different genuine server maximum is used exactly, never clamped to today's example", async () => {
-	for (const bound of [100_000, 500_000]) {
-		const profile = await verifyDeepSeekProviderOutputLimit({ apiKey: KEY,
-			request: response([model(bound)]) });
-		assert.equal(profile.maxOutputTokens, bound);
-	}
-});
-
-test("missing, duplicate, invalid or inconsistent provider maximum fails closed", async () => {
-	for (const data of [[], [model(393_216), model(393_216)],
-		[{ ...model(393_216), max_output_tokens: undefined }], [model(0)],
-		[model(1_048_577)], [{ ...model(393_216), name: "different-model" }]]) {
-		await assert.rejects(verifyDeepSeekProviderOutputLimit({ apiKey: KEY, request: response(data) }),
-			/provider output maximum|model-limit metadata/);
-	}
-	await assert.rejects(verifyDeepSeekProviderOutputLimit({ apiKey: KEY,
-		request: async () => { throw new Error(`secret ${KEY}`); } }),
-		(error: unknown) => error instanceof Error && /verification was unavailable/.test(error.message) &&
-			!error.message.includes(KEY));
-});

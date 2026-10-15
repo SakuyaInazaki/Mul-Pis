@@ -2,7 +2,7 @@
 
 ## Scope
 
-- This repository contains the scientific workflow, its research documentation and the executable research harness in `src/`, carried by the Pi agent harness.
+- This repository contains Mul-Pis, the user’s Pi-based operator-optimization workflow, its research documentation and the executable research harness in `src/`.
 - Keep experiment-specific objectives, execution order, platform rules and results in the experiment workspace. Reusable workflow code and repository-wide instructions must express general mechanisms and constraints.
 - Describe runtime and improvement capabilities from the implemented code and observed runs; distinguish engineering checks from real experiment outcomes.
 - The current research-execution layer uses `workflow/v1.0/` as its original baseline. Current stage alignment is recorded in the “当前对齐” section of `docs/research/workflow-foundation.md`; RSI source research uses a separately invoked experiment path; it does not change the M01–M09 stage contract or make M09 start self-improvement.

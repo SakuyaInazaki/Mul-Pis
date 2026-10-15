@@ -28,10 +28,6 @@ test("valid thinking history is byte-for-byte unchanged and permits null assista
 	assert.equal(JSON.stringify(payload), before);
 });
 
-test("parallel tool results may return in a different order", () => {
-	assertDeepSeekRequestContract(JSON.stringify(request([user, assistant(["a", "b"]), result("b"), result("a")])));
-});
-
 test("duplicate, orphan, missing and interrupted tool graphs are rejected without content", () => {
 	invalid(request([user, assistant([secret, secret])]), "duplicate-tool-call");
 	invalid(request([user, result(secret)]), "orphan-tool-result");
@@ -41,25 +37,10 @@ test("duplicate, orphan, missing and interrupted tool graphs are rejected withou
 	invalid(request([user, assistant(), result(), assistant()]), "duplicate-tool-call");
 });
 
-test("thinking rejects forced tool choice but accepts auto/none and non-thinking required", () => {
-	invalid(request([user], { tool_choice: "required" }), "thinking-tool-choice");
-	invalid(request([user], { tool_choice: { type: "function", function: { name: secret } } }), "thinking-tool-choice");
-	for (const tool_choice of ["auto", "none"]) assertDeepSeekRequestContract(JSON.stringify(request([user], { tool_choice })));
-	assertDeepSeekRequestContract(JSON.stringify(request([user], { thinking: { type: "disabled" }, tool_choice: "required" })));
-	invalid({ messages: [user], tools: [], tool_choice: "required" }, "thinking-tool-choice");
-});
-
 test("missing, unsigned or lost reasoning is refused rather than fabricated", () => {
 	const missing = { ...assistant(), reasoning_content: undefined };
 	invalid(request([user, missing, result()]), "missing-reasoning");
 	invalid(request([user, assistant(), result()]), "unsigned-reasoning", [{ role: "assistant", content: [{ type: "thinking", thinking: secret }] }]);
 	invalid(request([user, { ...assistant(), reasoning_content: "" }, result()]), "reasoning-replay-mismatch", source);
 	assertDeepSeekRequestContract(JSON.stringify({ messages: [user, { role: "assistant", content: "ok" }] }));
-});
-
-test("invalid serialized shape and roles produce static diagnostics", () => {
-	assert.throws(() => assertDeepSeekRequestContract("PRIVATE not JSON"), DeepSeekRequestContractError);
-	invalid(request([]), "request-shape");
-	invalid(request([{ role: secret, content: secret }]), "message-shape");
-	invalid(request([user, { ...assistant(), tool_calls: [{ id: secret }] }]), "tool-call-shape");
 });

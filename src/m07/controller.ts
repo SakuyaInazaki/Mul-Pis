@@ -26,6 +26,7 @@ import { openBoundedSession, type EvidenceBindingV1 } from "../context/boundary.
 import type { Workspace } from "../workspace.ts";
 import { failedM04Feedback, resolveM04Baseline, type FormalBaseline } from "./formal-baseline.ts";
 import { writeFeedback } from "./feedback.ts";
+import { publicFailure } from "./public-failure.ts";
 import { captureMaterial, copySnapshotBounded, createProjectionObservation, omissionLine, projectionMaterial } from "./projection.ts";
 export type { FormalBaseline } from "./formal-baseline.ts";
 
@@ -687,7 +688,8 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string,
 	if (task.executionLoop) boundary.push(section("执行返工", "mode" in task.executionLoop ?
 		"同一候选可持续局部修补，直至 reviewer 给出终态判断或发生真实阻断；每轮由全新只读 reviewer 反馈。不得扩大任务义务、替换指南或假称 reviewer 的 ready 是最终采用。" :
 		`历史记录中的轮数 ${task.executionLoop.maxRounds} 和截止时间 ${task.executionLoop.deadlineAt} 仅供审计，不是当前执行限制。同一候选可持续局部修补，直至 reviewer 给出终态判断或发生真实阻断；每轮后由全新只读 reviewer 给出反馈；只有控制器可决定是否再次提示。不得扩大任务义务、替换指南或假称 reviewer 的 ready 是最终采用。`));
-	if (task.lessonDeltaOutput) boundary.push(section("候选经验回流", `将本轮候选经验写入 ${task.lessonDeltaOutput}，JSON 格式为 {"version":1,"action":"none|propose|amend|contradict","observation":"...","hypothesis":"...","applicability":"...","evidencePaths":["本任务 work 内相对路径"]}。none 合法；不确定因果写为假设。仅修正本任务尚未入库的候选时仍用 propose；amend 或 contradict 只用于修订/反驳已存在且已固定身份的知识记录，必须加 "priorRef":{"storeId":"...","recordId":"...","version":1}，不得猜测 ID。此文件是待 M04 处理的候选，不能自称已采纳知识。`));
+	if (task.lessonDeltaOutput) boundary.push(section("候选经验回流", `将本轮候选经验写入 ${task.lessonDeltaOutput}，JSON 格式为 {"version":1,"action":"none|propose|amend|contradict","observation":"...","hypothesis":"...","applicability":"...","evidencePaths":["本任务 work 内相对路径"]}。none 合法；不确定因果写为假设。evidencePaths 应指向支持或反驳观察的确切改动产物与检查、测量或回执；使用旧经验时，说明实际采用、修改或弃用及相应实测。仅修正本任务尚未入库的候选时仍用 propose；amend 或 contradict 只用于修订/反驳已存在且已固定身份的知识记录，必须加 "priorRef":{"storeId":"...","recordId":"...","version":1}，不得猜测 ID。此文件是待 M04 处理的候选，不能自称已采纳知识。`));
+	if (task.mode === "execute") boundary.push(section("候选迭代与已有材料", "进行候选优化时，在本任务已有报告或实验记录中逐次写清优化假设、相对上一候选的实际改动、同口径检查或测量的真实反馈，以及保留、否定或待证的结论；区分当前探索候选和按原目标已验证的最佳产物，无需另建文件。若优化算子，分开记录编译、接口、数值正确性与性能、评分反馈；依据真实测量诊断瓶颈，可在有帮助且可用时使用 profiler，不设固定工具。只对实际通过本题正确性检查的候选按原目标和可比口径比较性能或评分，不把速度当正确性证据。显式输入中已有的脚本或经验可以复用，但先核对当前任务的适用性与完整依赖，在本任务 work 内从输入副本派生，并记录修改及验证；旧输入或旧通过记录本身不代表当前已验证。"));
 	if (task.mode === "execute") boundary.push(section("外部执行与可消耗资源", `本任务控制操作 ID：${operationId ?? "旧目标无操作登记"}。若执行有真实副作用的远端动作，保存实际参数、外部请求/结果 ID、响应和可用的查询方法；在响应丢失后先查询，不能仅凭超时重发。任务级 ID 是恢复索引，只有远端明确支持时才能作为幂等键，不能声称 exactly-once。\n\n如任务涉及真实提交、评测、远程实验或其他可能消耗配额/费用/机会的动作：先用已提供的只读能力或额度接口核对接入和当前状态，并先做本地可完成的语法、类型、编译与兼容性预检。这不禁止任务已授权的真实实验，已授权平台评测/实验产生的结果属于本任务实测证据。每次真实动作都要记录实际结果和资源消耗；失败若仍消耗了资源，同样记录已消耗量、可见剩余量与恢复条件。平台配额不明时如实记录未知，不猜测统一配额。本地命令或客户端成功退出不等于远程实验通过。显式输入和原问题允许使用；若需取得新的外部研究参考资料并用于推理，将具体缺口报回主会话走 M05/M06→M04，不在 execute 任务里通过 bash 另造获取和采用链。`));
 	boundary.push("任务义务继承冻结目标、原成功条件和用户约束；局部 objective/checks 不得放宽它们。有界指职责、输入和操作范围，不授权自行添加尝试次数、耗时或费用停止条件。以达成为目标时，持续推进并按结果验收，不能用执行过或记录负结果替代达成。若任务本身是取证或检验，应如实返回其结果，并明确父目标仍未解决的要求。会话返回只表示内部交接，不表示原目标完成；列明实际动作、产物、失败、未执行项和限制。");
 	boundary.push(tempDir ? `产物路径规则：expectedOutputs 必须是当前任务工作目录内的精确相对路径；说明写在 objective 或 report.md。正式脚本、输入、测量、回执、负结果、复现数据和证据都必须保存在当前 work 目录。临时缓存、下载和浏览器 profile 可写入独立目录 ${tempDir}；bash 的 TMPDIR 指向它。临时目录不属于正式证据，不会进入 reviewer 快照或 branch，也不能作为产物或检查引用。不要写到其他目录。` : "产物路径规则：expectedOutputs 必须是当前任务工作目录内的精确相对路径；说明写在 objective 或 report.md。所有实际写盘必须落在当前工作目录内，不要写到工作区根目录或绝对路径。");
@@ -837,7 +839,9 @@ async function freezeCheckpoint(ctx: StageContext, goal: CurrentGoal, limits: Pr
 		task.expectedOutputPaths = [];
 		task.toolLog = [];
 		delete task.session;
-		delete task.executionFailure;
+		// Keep controller failure facts for selected and omitted tasks, without exposing
+		// live private wording or treating unreviewed work as frozen evidence.
+		task.executionFailure = publicFailure(task.executionFailure);
 		delete task.branchUnavailableReason;
 		delete task.branchSource;
 		delete task.executionRounds;
@@ -1175,7 +1179,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 						const reviewerSnapshotBytes = await snapshotRoundForReviewer(workDir, reviewerRoot);
 						round.reviewerSnapshotBytes = reviewerSnapshotBytes;
 						round.reviewerSnapshotPath = reviewerRoot;
-						let reviewerPrompt = `Review only this M07 task round and the copied work-directory snapshot. Goal: ${goal.goal}\nProblem relation: ${goal.problemRelation}\nFrozen goal constraints: ${goal.constraints.join("; ")}\nFrozen success criteria: ${goal.successCriteria.join("; ")}\nGoal plan at task creation: ${goal.plan}\nTask objective: ${spec.objective}\nChecks: ${spec.checks.join("; ")}\nExpected outputs: ${spec.expectedOutputs.join("; ")}\nFrozen plan input: ${task.planCopy ? path.relative(workDir, task.planCopy) : "none"}\nThe builder report follows. Inspect the copied files only as needed. Reply with only JSON {"verdict":"ready|revise|replan|blocked","feedback":"specific evidence-grounded reason"}, without extra prose or code fences. Escape paragraph breaks inside the feedback JSON string as \\n, never raw line breaks inside quotes. Identify decisive checked files, measurements, failures and limitations. Verify the substantive task objective as well as its checks against the frozen goal and constraints. Completed actions, saved files or exhausted self-imposed attempts do not satisfy an unmet attainment objective. Negative results may satisfy an observation task, but do not establish the parent goal. Use revise while work remains within this task; replan when the task definition conflicts with the frozen obligations or needs a plan change; blocked for an evidenced external impediment. ready requires the task objective and checks to be met and still needs the controller's separate final review. Do not change the plan or task obligations.\n\n${report}`;
+						let reviewerPrompt = `Review only this M07 task round and the copied work-directory snapshot. Goal: ${goal.goal}\nProblem relation: ${goal.problemRelation}\nFrozen goal constraints: ${goal.constraints.join("; ")}\nFrozen success criteria: ${goal.successCriteria.join("; ")}\nGoal plan at task creation: ${goal.plan}\nTask objective: ${spec.objective}\nChecks: ${spec.checks.join("; ")}\nExpected outputs: ${spec.expectedOutputs.join("; ")}\nFrozen plan input: ${task.planCopy ? path.relative(workDir, task.planCopy) : "none"}\nThe builder report follows. Inspect the copied files only as needed. Reply with only JSON {"verdict":"ready|revise|replan|blocked","feedback":"specific evidence-grounded reason"}, without extra prose or code fences. Escape paragraph breaks inside the feedback JSON string as \\n, never raw line breaks inside quotes. Identify decisive checked files, measurements, failures and limitations. For operator optimization, distinguish compilation, interface and numerical correctness from performance or score feedback; compare performance only among candidates actually passing this task's correctness checks under a comparable measurement basis, then assess the choice against the frozen original goal. Ground diagnosis in observed measurements; do not require a particular profiler or metric. Verify the substantive task objective as well as its checks against the frozen goal and constraints. Completed actions, saved files or exhausted self-imposed attempts do not satisfy an unmet attainment objective. Negative results may satisfy an observation task, but do not establish the parent goal. Use revise while work remains within this task; replan when the task definition conflicts with the frozen obligations or needs a plan change; blocked for an evidenced external impediment. ready requires the task objective and checks to be met and still needs the controller's separate final review. Do not change the plan or task obligations.\n\n${report}`;
 						if (reviewerPrompt.length + systemPromptFor("reviewer").length > policy.maxPromptChars) {
 							const handoff = await freezeBuilderReportForReviewer(report, reviewerRoot);
 							reviewerPrompt = reviewerPrompt.slice(0, reviewerPrompt.length - report.length) + handoff;
@@ -1223,7 +1227,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 						transcript.push(`## Round ${index} reviewer\n\n${rawReview}${fileCheckFailure ? `\n\nController file-bound check changed this ready verdict to revise: ${fileCheckFailure}` : ""}`);
 						await save(ctx, goal);
 						if (verdict.verdict === "ready" || verdict.verdict === "replan" || verdict.verdict === "blocked") { task.loopStopReason = verdict.verdict; break; }
-						nextMessage = `Continue only the same frozen task and plan. Fresh reviewer feedback from round ${index}: ${verdict.feedback}\nDo a bounded local repair, report concrete changes and verification. Do not expand scope or silently restart an external action whose outcome is unknown.`;
+						nextMessage = `Continue only the same frozen task and plan. Fresh reviewer feedback from round ${index}: ${verdict.feedback}\nDo a bounded local repair and report concrete changes and verification. Where the task compares candidates, keep the verified best distinct from the current candidate; report the hypothesis, exact change, observed feedback, and whether this attempt is retained, rejected, or still uncertain. Do not repeat a rejected candidate without new evidence. Do not expand scope or silently restart an external action whose outcome is unknown.`;
 					}
 					const reportPath = path.join(dir, "report.md");
 					const renderReport = () => `# M07 execution\n\nStop: ${task.loopStopReason ?? "incomplete"}\n\n${transcript.join("\n\n")}\n`;
@@ -1332,20 +1336,6 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			const artifacts: EvidenceFile[] = []; for (const p of input.artifacts) { const resolved = await confinedExistingFile(ctx, p); if (!inside(taskRoot, resolved) && resolved !== reportReal) throw new HarnessError("m07.review", `成果不属于任务固定目录或会话报告：${p}`); await ensureRoundReviewed(resolved); artifacts.push({ path: await freeze(resolved), sourcePath: resolved, mediaType: mediaType(resolved), readCoverage: mediaType(resolved) === "text" ? "recorded-not-reviewed" : "unread-binary" }); }
 			const checks: TaskCheck[] = []; for (const check of input.checks) { if (!task.checks.includes(check.criterion)) throw new HarnessError("m07.review", `检查不属于任务定义：${check.criterion}`); const evidence = []; for (const p of check.evidence) { const resolved = await confinedExistingFile(ctx, p); if (!inside(taskRoot, resolved) && resolved !== reportReal) throw new HarnessError("m07.review", `检查证据不属于任务固定目录或会话报告：${p}`); await ensureRoundReviewed(resolved); evidence.push(await freeze(resolved)); } if (check.result === "passed" && !evidence.length) throw new HarnessError("m07.review", `通过检查必须有实际文件证据：${check.criterion}`); checks.push({ ...check, evidence }); }
 			if (task.checks.some((criterion) => !checks.some((c) => c.criterion === criterion))) throw new HarnessError("m07.review", "必须逐项记录任务定义的全部 checks");
-			if (task.requireIndependentCheck) {
-				const independent = input.independentCheck; if (!independent) throw new HarnessError("m07.review", "该任务要求独立检查，必须引用独立 check 任务报告并说明对发现的处置");
-				const checkTask = goal.tasks.find((t) => t.taskId === independent.taskId); if (!checkTask || checkTask.mode !== "check" || !["returned", "accepted"].includes(checkTask.status)) throw new HarnessError("m07.review", "独立检查必须是另一个已返回的 check 任务");
-				if (!independent.disposition.trim()) throw new HarnessError("m07.review", "必须显式说明如何处置独立检查发现");
-				independent.report = await confinedExistingFile(ctx, independent.report);
-				if (!checkTask.reportPath || independent.report !== await realpath(checkTask.reportPath)) throw new HarnessError("m07.review", "引用的独立检查报告与 check 任务不一致");
-				independent.report = await freeze(independent.report);
-				for (const artifact of artifacts) {
-					let matchingCopy: M07TaskRecord["inputCopies"][number] | undefined;
-					for (const copy of checkTask.inputCopies) if ((await readFile(copy.copy)).equals(await readFile(artifact.path))) { matchingCopy = copy; break; }
-					if (!matchingCopy) throw new HarnessError("m07.review", `独立 check 未取得当前提交版本的成果：${path.basename(artifact.path)}`);
-					if (artifact.mediaType === "binary") { const relativeCopy = path.relative(checkTask.workDir, matchingCopy.copy); if (!checkTask.readCoverage.includes(relativeCopy)) throw new HarnessError("m07.review", `二进制成果没有独立 check 的真实读取记录：${relativeCopy}`); }
-				}
-			}
 			const failures = [...(input.failures ?? [])], unexecuted = [...(input.unexecuted ?? [])], limitations = input.limitations ?? [];
 			const addExpectedArtifact = async (source: string): Promise<void> => {
 				if (artifacts.some((item) => item.sourcePath === source)) return;
@@ -1375,6 +1365,20 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			}
 			if (candidateFiles.lessonDeltaFailure) failures.push(candidateFiles.lessonDeltaFailure);
 			for (const evidence of candidateFiles.lessonEvidence) await addExpectedArtifact(evidence);
+			if (task.requireIndependentCheck) {
+				const independent = input.independentCheck; if (!independent) throw new HarnessError("m07.review", "该任务要求独立检查，必须引用独立 check 任务报告并说明对发现的处置");
+				const checkTask = goal.tasks.find((t) => t.taskId === independent.taskId); if (!checkTask || checkTask.mode !== "check" || !["returned", "accepted"].includes(checkTask.status)) throw new HarnessError("m07.review", "独立检查必须是另一个已返回的 check 任务");
+				if (!independent.disposition.trim()) throw new HarnessError("m07.review", "必须显式说明如何处置独立检查发现");
+				independent.report = await confinedExistingFile(ctx, independent.report);
+				if (!checkTask.reportPath || independent.report !== await realpath(checkTask.reportPath)) throw new HarnessError("m07.review", "引用的独立检查报告与 check 任务不一致");
+				independent.report = await freeze(independent.report);
+				for (const artifact of artifacts) {
+					let matchingCopy: M07TaskRecord["inputCopies"][number] | undefined;
+					for (const copy of checkTask.inputCopies) if ((await readFile(copy.copy)).equals(await readFile(artifact.path))) { matchingCopy = copy; break; }
+					if (!matchingCopy) throw new HarnessError("m07.review", `独立 check 未取得当前提交版本的成果：${path.basename(artifact.path)}`);
+					if (artifact.mediaType === "binary") { const relativeCopy = path.relative(checkTask.workDir, matchingCopy.copy); if (!checkTask.readCoverage.includes(relativeCopy)) throw new HarnessError("m07.review", `二进制成果没有独立 check 的真实读取记录：${relativeCopy}`); }
+				}
+			}
 			if (task.executionLoop && task.loopStopReason !== "ready") failures.push(`Bounded execution stopped without a ready handoff: ${task.loopStopReason ?? "unknown"}`);
 			const accepted = checks.every((c) => c.result === "passed") && !failures.length && !unexecuted.length;
 			task.status = accepted ? "accepted" : "rejected"; task.review = { at: nowIso(), frozenReportPath, checks, artifacts, failures, unexecuted, limitations, independentCheck: input.independentCheck };
@@ -1429,14 +1433,15 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			if (goal.tasks.some((task) => task.status === "unknown") || goal.executionState?.operations.some((operation) => ["prepared", "issued", "unknown"].includes(operation.status))) throw new HarnessError("m07.finish", "仍有外部动作或任务状态未知；先经宿主控制面对账，不能通过分支筛选隐藏未知结果");
 			if (input.goalChecks.length !== goal.successCriteria.length || goal.successCriteria.some((criterion) => !input.goalChecks.some((c) => c.criterion === criterion))) throw new HarnessError("m07.finish", "必须逐项映射原目标 successCriteria，不能以子任务状态代替目标验收");
 			const chosenBranches = new Map((goal.branchSelections ?? []).map((selection) => [selection.parentTaskId, selection.selectedTaskId]));
-			const acceptedEvidence = new Map<string, string>(); for (const task of goal.tasks.filter((item) => item.status === "accepted" && (item.context ? chosenBranches.get(item.context.parentTaskId) === item.taskId : !chosenBranches.has(item.taskId) || chosenBranches.get(item.taskId) === item.taskId))) { if (task.reportPath && task.review) { const frozen = await realpath(task.review.frozenReportPath); acceptedEvidence.set(frozen, frozen); if (existsSync(task.reportPath)) acceptedEvidence.set(await realpath(task.reportPath), frozen); } for (const artifact of task.review?.artifacts ?? []) { const frozen = await realpath(artifact.path); acceptedEvidence.set(frozen, frozen); if (artifact.sourcePath && existsSync(artifact.sourcePath)) acceptedEvidence.set(await realpath(artifact.sourcePath), frozen); } for (const check of task.review?.checks ?? []) for (const evidence of check.evidence) { const frozen = await realpath(evidence); acceptedEvidence.set(frozen, frozen); } }
-			const canonicalGoalChecks: TaskCheck[] = []; for (const check of input.goalChecks) { const evidence: string[] = []; for (const item of check.evidence) { const resolved = await confinedExistingFile(ctx, item); const frozen = acceptedEvidence.get(resolved); if (input.outcome === "fulfilled" && !frozen) throw new HarnessError("m07.finish", `目标验收证据不来自已接受任务：${item}`); if (frozen && resolved !== frozen && !(await readFile(resolved)).equals(await readFile(frozen))) throw new HarnessError("m07.finish", `已接受成果在验收后发生变化：${item}`); evidence.push(frozen ?? resolved); } canonicalGoalChecks.push({ ...check, evidence }); }
 			const branchParents = new Set(goal.tasks.flatMap((item) => item.context ? [item.context.parentTaskId] : []));
 			if (input.outcome === "fulfilled" && [...branchParents].some((id) => !goal.branchSelections?.some((selection) => selection.parentTaskId === id && selection.selectedTaskId))) throw new HarnessError("m07.finish", "competitive branches require an explicit reviewed winner before fulfilled");
 			const byId = new Map(goal.tasks.map((item) => [item.taskId, item])); const superseded = new Set<string>();
 			for (const accepted of goal.tasks.filter((item) => item.status === "accepted" && (!item.context || goal.branchSelections?.some((selection) => selection.parentTaskId === item.context?.parentTaskId && selection.selectedTaskId === item.taskId)))) { let prior = accepted.supersedesTaskId; while (prior && !superseded.has(prior)) { superseded.add(prior); prior = byId.get(prior)?.supersedesTaskId; } }
 			for (const selection of goal.branchSelections ?? []) if (selection.selectedTaskId) for (const branch of goal.tasks.filter((item) => item.context?.parentTaskId === selection.parentTaskId && item.taskId !== selection.selectedTaskId)) superseded.add(branch.taskId);
 			const effectiveTasks = goal.tasks.filter((item) => !superseded.has(item.taskId));
+			const evidenceTasks = input.outcome === "fulfilled" ? effectiveTasks : goal.tasks;
+			const acceptedEvidence = new Map<string, string>(); for (const task of evidenceTasks.filter((item) => item.status === "accepted" && (item.context ? chosenBranches.get(item.context.parentTaskId) === item.taskId : !chosenBranches.has(item.taskId) || chosenBranches.get(item.taskId) === item.taskId))) { if (task.reportPath && task.review) { const frozen = await realpath(task.review.frozenReportPath); acceptedEvidence.set(frozen, frozen); if (existsSync(task.reportPath)) acceptedEvidence.set(await realpath(task.reportPath), frozen); } for (const artifact of task.review?.artifacts ?? []) { const frozen = await realpath(artifact.path); acceptedEvidence.set(frozen, frozen); if (artifact.sourcePath && existsSync(artifact.sourcePath)) acceptedEvidence.set(await realpath(artifact.sourcePath), frozen); } for (const check of task.review?.checks ?? []) for (const evidence of check.evidence) { const frozen = await realpath(evidence); acceptedEvidence.set(frozen, frozen); } }
+			const canonicalGoalChecks: TaskCheck[] = []; for (const check of input.goalChecks) { const evidence: string[] = []; for (const item of check.evidence) { const resolved = await confinedExistingFile(ctx, item); const frozen = acceptedEvidence.get(resolved); if (input.outcome === "fulfilled" && !frozen) throw new HarnessError("m07.finish", `目标验收证据不来自当前有效且已接受任务：${item}`); if (frozen && resolved !== frozen && !(await readFile(resolved)).equals(await readFile(frozen))) throw new HarnessError("m07.finish", `已接受成果在验收后发生变化：${item}`); evidence.push(frozen ?? resolved); } canonicalGoalChecks.push({ ...check, evidence }); }
 			if (input.outcome === "fulfilled") { if (canonicalGoalChecks.some((c) => c.result !== "passed" || !c.evidence.length)) throw new HarnessError("m07.finish", "fulfilled 要求每项原目标成功标准均通过并有实际文件证据"); if (goal.decisions.some((d) => d.status === "open")) throw new HarnessError("m07.finish", "存在待用户决定事项，不能标记 fulfilled"); if (effectiveTasks.some((t) => t.status !== "accepted")) throw new HarnessError("m07.finish", "存在未接受且未被合法替代的任务，不能标记 fulfilled"); if (!goal.tasks.length) throw new HarnessError("m07.finish", "没有实际任务，不能标记 fulfilled"); }
 			goal.goalChecks = canonicalGoalChecks;
 			goal.lifecycle = "finished"; goal.outcome = input.outcome; goal.finishSummary = nonempty(input.summary, "summary"); goal.returnPath = input.returnPath; goal.limitations.push(...(input.limitations ?? []));
@@ -1583,7 +1588,9 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			const newProbe = await (options.probeProcess ?? probeProcessIdentity)(descriptor.process);
 			if (newProbe.status !== "alive" || !newProbe.identityMatch) throw new HarnessError("m07.recovery", "新 Pi 进程身份不可验证，拒绝恢复");
 			const oldProbe = await (options.probeProcess ?? probeProcessIdentity)(prior.runDescriptor.process);
-			if (oldProbe.status !== "dead" || prior.runDescriptor.process.hostId !== descriptor.process.hostId || prior.runDescriptor.process.bootId !== descriptor.process.bootId) throw new HarnessError("m07.recovery", "旧 attempt 的进程仍存活或身份未知，拒绝并行恢复");
+			// A verified new boot on the same host proves the old process is dead.
+			// The identity probe also rejects remote hosts and reused live PIDs.
+			if (oldProbe.status !== "dead" || prior.runDescriptor.process.hostId !== descriptor.process.hostId) throw new HarnessError("m07.recovery", "旧 attempt 的进程仍存活或身份未知，拒绝并行恢复");
 			if (prior.state === "running") {
 				prior.state = "recovery-required";
 				prior.endedAt = nowIso();

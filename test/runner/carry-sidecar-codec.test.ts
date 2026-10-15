@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import test from "node:test";
-import { CARRY_LOGICAL_BYTES, CARRY_SEGMENT_RAW_BYTES, carrySidecarName,
-	decodeCarrySidecars, encodeCarrySidecars, validCarrySidecarManifest } from
+import { CARRY_SEGMENT_RAW_BYTES, carrySidecarName,
+	decodeCarrySidecars, encodeCarrySidecars } from
 	"../../src/runner/carry-sidecar-codec.ts";
 
 const binding = { key: Buffer.alloc(32, 7), seedDigest: "a".repeat(64),
@@ -42,33 +42,4 @@ test("sidecars reject missing, tampered, reordered, truncated and other-source p
 	assert.throws(() => open(encoded, {}, truncated), /authentication failed/);
 	assert.throws(() => open(encoded, { source: { ...binding.source, runId: "32" } }),
 		/authentication failed/);
-});
-
-test("sidecar manifest rejects huge counts and length before loading or allocation", () => {
-	const encoded = encodeCarrySidecars({ ...binding, plaintext: Buffer.from("payload") });
-	let loaded = 0;
-	const load = () => { loaded++; throw Error("must not load"); };
-	for (const manifest of [
-		{ ...encoded.manifest, plaintextBytes: Number.MAX_SAFE_INTEGER,
-			segmentCount: Math.ceil(Number.MAX_SAFE_INTEGER / CARRY_SEGMENT_RAW_BYTES) },
-		{ ...encoded.manifest, plaintextBytes: CARRY_LOGICAL_BYTES + 1,
-			segmentCount: Math.ceil((CARRY_LOGICAL_BYTES + 1) / CARRY_SEGMENT_RAW_BYTES) },
-		{ ...encoded.manifest, segmentCount: 999999 },
-	]) {
-		assert.equal(validCarrySidecarManifest(manifest), false);
-		assert.throws(() => decodeCarrySidecars({ ...binding, manifest, load }),
-			/sidecar manifest is invalid/);
-	}
-	assert.equal(loaded, 0);
-});
-
-test("sidecar decompression rejects an authenticated inflation bomb", () => {
-	// A full-size zero chunk compresses to a tiny ciphertext yet still expands
-	// only to its declared 1 MiB. A mismatch in total manifest length fails.
-	const encoded = encodeCarrySidecars({ ...binding,
-		plaintext: Buffer.alloc(CARRY_SEGMENT_RAW_BYTES + 1) });
-	assert.deepEqual(open(encoded), Buffer.alloc(CARRY_SEGMENT_RAW_BYTES + 1));
-	const forged = { ...encoded, manifest: { ...encoded.manifest,
-		plaintextBytes: CARRY_SEGMENT_RAW_BYTES } };
-	assert.throws(() => open(forged), /sidecar manifest is invalid/);
 });

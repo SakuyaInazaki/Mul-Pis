@@ -20,6 +20,7 @@ import { publicResearchRun, publicResearchStatus } from "../improvement/research
 import type { CampaignPlan, ImprovementRunResult, ImprovementStatus } from "../improvement/types.ts";
 import type { ActiveBudgetPointer } from "../improvement/policy.ts";
 import type { CurrentGoal } from "../m07/types.ts";
+import { publicFailure } from "../m07/public-failure.ts";
 import { summarizeGoalExecution } from "../m07/status.ts";
 import { workflowCompactionExtension } from "../runner/compaction.ts";
 
@@ -31,13 +32,6 @@ function result(value: unknown): ToolResult {
 		content: [{ type: "text", text: JSON.stringify(summary, null, 2) }],
 		details: { summary },
 	};
-}
-
-function publicFailure(value: unknown): string | undefined {
-	if (typeof value !== "string") return undefined;
-	return value.replace(/Bearer\s+[^\s'"\r\n]+/gi, "Bearer [redacted credential]")
-		.replace(/sk-[A-Za-z0-9_-]{6,}/gi, "[redacted credential]")
-		.replace(/\b(?:api[_-]?key|password|secret|token|session[_-]?token|authorization)\s*[:=]\s*[^\s,;]+/gi, "[redacted credential]");
 }
 
 function compact(value: unknown): Record<string, unknown> {
@@ -57,7 +51,7 @@ function compact(value: unknown): Record<string, unknown> {
 	if ("id" in item && "sourceGoalUpdatedAt" in item && "feedbackStatus" in item) return {
 		checkpointId: item.id, sourceGoalUpdatedAt: item.sourceGoalUpdatedAt,
 		feedbackStatus: item.feedbackStatus, feedbackPath: item.feedbackPath,
-		goalSnapshotPath: item.goalSnapshotPath,
+		goalSnapshotPath: item.goalSnapshotPath, manifestPath: item.manifestPath,
 	};
 	const lastRound = (task: Record<string, unknown>) => Array.isArray(task.executionRounds)
 		? task.executionRounds.at(-1) as Record<string, unknown> | undefined : undefined;
@@ -185,6 +179,7 @@ export function createResearchExtension(options: ResearchExtensionOptions = {}) 
 		let activeUpdate: ((update: ToolResult) => void) | undefined;
 		let controllerTelemetry: TelemetryWriter | undefined;
 		let boundGoalRunId = options.continuation?.goalRunId;
+		let recoveryInitializationFailed = false;
 		let continuationHalt: "request-aborted" | "provider-error" | "no-progress" | "session-shutdown" | undefined;
 		let lastControlStamp: string | undefined;
 		let emptyRounds = 0;
@@ -254,11 +249,13 @@ mainAgentWatchdog.unref?.();
 };
 
 		pi.on("session_start", async (_event, ctx) => {
+			const recoverGoalRunId = process.env.PRE_RSI_RECOVER_GOAL_RUN_ID;
+			recoveryInitializationFailed = Boolean(recoverGoalRunId);
+			try {
 			await verifyLoadedSource(import.meta.url);
 			await mainUsage.sessionStart(ctx).catch(() => undefined);
 			restoreResearchTools();
 			const requestedGoalRunId = options.continuation?.goalRunId;
-			const recoverGoalRunId = process.env.PRE_RSI_RECOVER_GOAL_RUN_ID;
 			// A fresh recovery process owns no goal until the controller accepts its identity.
 			boundGoalRunId = undefined;
 			continuationHalt = undefined; lastControlStamp = undefined; emptyRounds = 0; successfulToolSinceEnd = false; inspectionSinceEnd = false; inspected.clear(); durableToolIds.clear(); pendingInspection.clear();
@@ -306,6 +303,14 @@ mainAgentWatchdog.unref?.();
 				catch { controllerTelemetry = undefined; }
 			}
 			if (continuationEnabled(ctx)) activateResearch(ctx.cwd);
+			recoveryInitializationFailed = false;
+			} catch (error) {
+			if (recoverGoalRunId) {
+				boundGoalRunId = undefined;
+				pi.setActiveTools([]);
+			}
+			throw error;
+			}
 		});
 		pi.on("agent_start", async (_event, ctx) => { await mainUsage.agentStart(ctx).catch(() => undefined); startMainAgentWatchdog(ctx); await controllerTelemetry?.heartbeat("active").catch(() => undefined); });
 		pi.on("agent_end", async (event, ctx) => {
@@ -404,6 +409,10 @@ mainAgentWatchdog.unref?.();
 			}
 		});
 		pi.on("tool_call", (event, ctx) => {
+			if (recoveryInitializationFailed) return {
+				block: true, terminate: true,
+				reason: "恢复宿主初始化失败；当前 Pi 进程未绑定 M07 目标，禁止执行工具。",
+			};
 			noteMainAgentActivity(ctx);
 			if (continuationEnabled(ctx) && inspectionTools.has(event.toolName)) {
 				const key = `${event.toolName}:${JSON.stringify(event.input).slice(0, 1000)}`;
@@ -417,6 +426,12 @@ mainAgentWatchdog.unref?.();
 			};
 		});
 		pi.on("before_agent_start", async (event, ctx) => {
+			if (recoveryInitializationFailed) {
+				pi.setActiveTools([]);
+				ctx.abort();
+				ctx.shutdown();
+				return { systemPrompt: "恢复宿主初始化失败；当前进程未绑定研究目标，停止执行。" };
+			}
 			if (!researchActive || activePiCwd !== ctx.cwd) return;
 			const p07 = await loadPrompt("P07");
 			const nonInteractiveBoundary = nonInteractive(ctx) ? options.continuation
@@ -431,12 +446,14 @@ mainAgentWatchdog.unref?.();
 		pi.registerTool({
 			name: "research_status",
 			label: "Research Status",
-			description: "Read the persisted M01–M09 research status for a workspace without starting or retrying work.",
+			description: "Read persisted M01–M09 status. Optionally discover bounded local executor experience conditionally matching an M07 execute task; explicit delegation still checks experience-pack budgets.",
 			promptSnippet: "Inspect persisted research workflow status without rerunning tasks",
-			promptGuidelines: ["Use research_status before deciding which research stage or M07 action is needed."],
-			parameters: Type.Object({ workspace: Type.Optional(Type.String({ description: "Research workspace; defaults to the current Pi cwd" })) }),
+			promptGuidelines: ["Use research_status before deciding which research stage or M07 action is needed.", "Experience discovery is paged: pass nextOffset as experience.offset to inspect further matches. Compare snapshotId across pages and restart discovery if it changes; explicit delegation rechecks the current conditions and pack budget."],
+			parameters: Type.Object({ workspace: Type.Optional(Type.String({ description: "Research workspace; defaults to the current Pi cwd" })),
+				experience: Type.Optional(Type.Object({ tags: Type.Array(Type.String()), offset: Type.Optional(Type.Integer({ minimum: 0 })),
+					contextRefs: Type.Optional(Type.Array(Type.Object({ storeId: Type.String(), recordId: Type.String(), version: Type.Integer() }))) })) }),
 			executionMode: "sequential",
-			async execute(_id, params, _signal, _update, ctx) { return result(await service.status(workspaceFrom(params.workspace, ctx.cwd))); },
+			async execute(_id, params, _signal, _update, ctx) { return result(await service.status(workspaceFrom(params.workspace, ctx.cwd), params.experience)); },
 		});
 
 		pi.registerTool({
@@ -553,6 +570,7 @@ mainAgentWatchdog.unref?.();
 			promptGuidelines: [
 				"Use research_stage only after research_status confirms the requested stage inputs exist.",
 				"Treat research_stage completion and returned opinions as artifacts to inspect, not automatic acceptance.",
+				"For M04 judgment of a candidate lesson from an M07 checkpoint, select the lesson and its supporting source and receipts by exact relativePath from that checkpoint manifest, then pass requiredM07ReadPaths so the existing full-return evidence gate applies. A path alone is not a read or an adoption decision.",
 			],
 			parameters: Type.Object({
 				stage: Type.Union([Type.Literal("M01"), Type.Literal("M02"), Type.Literal("M03"), Type.Literal("M04"), Type.Literal("M05"), Type.Literal("M06"), Type.Literal("M08"), Type.Literal("M09")]),
@@ -562,6 +580,7 @@ mainAgentWatchdog.unref?.();
 				feedbackStage: Type.Optional(Type.Union([Type.Literal("M03"), Type.Literal("M06"), Type.Literal("M07"), Type.Literal("M08")])),
 				feedbackRunId: Type.Optional(Type.String()),
 				feedbackCheckpointId: Type.Optional(Type.String({ description: "Exact M07 checkpoint ID; only for M04 feedbackStage=M07 with feedbackRunId" })),
+				requiredM07ReadPaths: Type.Optional(Type.Array(Type.String({ description: "M04 with M07 feedback only: exact checkpoint-relative files to return in full to the judgment session" }))),
 				feedbackFile: Type.Optional(Type.String()),
 				feedbackLabel: Type.Optional(Type.String()),
 				freshSession: Type.Optional(Type.Boolean()),
@@ -639,7 +658,7 @@ mainAgentWatchdog.unref?.();
 			label: "Manage Research Goal",
 			description: "Begin, inspect, reconcile an unknown operation through the configured host observer, checkpoint, replan, select a reviewed M07 branch (or explicitly select none), record a decision, finish, or interrupt/archive one persisted goal. Selection never substitutes for review or goal checks. A checkpoint freezes partial results for exact M04 feedback without ending the goal.",
 			promptSnippet: "Manage one explicit M07 goal and its lifecycle",
-			promptGuidelines: ["Use research_goal to keep the user's frozen goal, plan, decisions, outcome, and return path explicit.", "For an unknown external operation, request action=reconcile with operationId. The host observer queries actual state; a read-only analysis or a model claim cannot clear the operation.", "In print/json mode continue bounded work. A continuous goal can finish only when controller-verified success is fulfilled; host interruptions use the internal controller path."],
+			promptGuidelines: ["Use research_goal to keep the user's frozen goal, plan, decisions, outcome, and return path explicit.", "Before checkpointing an operator result, select reviewed tasks containing the chosen source and its matching final receipts, then inspect the returned manifestPath before sending exact requiredM07ReadPaths to M04. A verification-only task may not contain the implementation it checked.", "For an unknown external operation, request action=reconcile with operationId. The host observer queries actual state; a read-only analysis or a model claim cannot clear the operation.", "In print/json mode continue bounded work. A continuous goal can finish only when controller-verified success is fulfilled; host interruptions use the internal controller path."],
 			parameters: Type.Object({
 				action: Type.Union([Type.Literal("begin"), Type.Literal("status"), Type.Literal("reconcile"), Type.Literal("checkpoint"), Type.Literal("plan"), Type.Literal("select-branch"), Type.Literal("decision"), Type.Literal("finish"), Type.Literal("interrupt")]),
 				workspace: Type.Optional(Type.String()), runId: Type.Optional(Type.String()),
@@ -720,7 +739,7 @@ mainAgentWatchdog.unref?.();
 			label: "Delegate Research Task",
 			description: "Run one bounded M07 task in a fresh isolated session, or fork from a settled execute task's frozen checkpoint via context={mode:fork,parentRunId,parentTaskId,checkpointId}. A fork preserves the parent's goal and checks; the controller validates the exact obligations. Continuous execute tasks automatically repair against fresh read-only reviews before returning ready. Every candidate needs research_review before branch selection.",
 			promptSnippet: "Delegate one bounded M07 task with explicit inputs, outputs, and checks",
-			promptGuidelines: ["Use research_delegate only for a bounded task under an existing M07 goal; never describe a returned task as accepted.", "Preserve the original goal, success criteria and user constraints when decomposing work. For an attainment task, checks must verify the required result; do not replace it with a fixed attempt count or merely recording failure. Continuous goals automatically run execute tasks until reviewer readiness; executionLoop opts in for other goals.", "Use expectedOutputs: [] for reason/check; these read-only modes return an automatically saved reportPath. Only execute can create declared output files. Expected outputs are exact work-dir-relative paths; put explanations in objective, never in a path.", "After the final task return, read its reportPath and relevant actual expectedOutputPaths before planning another delegation. An earlier running notification does not replace the final result."],
+			promptGuidelines: ["Use research_delegate only for a bounded task under an existing M07 goal; never describe a returned task as accepted.", "Preserve the original goal, success criteria and user constraints when decomposing work. For an attainment task, checks must verify the required result; do not replace it with a fixed attempt count or merely recording failure. Continuous goals automatically run execute tasks until reviewer readiness; executionLoop opts in for other goals.", "Use expectedOutputs: [] for reason/check; these read-only modes return an automatically saved reportPath. Only execute can create declared output files. Expected outputs are exact work-dir-relative paths; put explanations in objective, never in a path.", "For an operator implementation task, include the selected source and its matching correctness, measurement or platform receipt in expectedOutputs for review and knowledge handoff. For reusable observations, declare a JSON lesson as both lessonDeltaOutput and an expectedOutput, with evidencePaths to those actual files; a candidate lesson is not adopted knowledge.", "Before explicitly selecting a prior executor experience for an execute task, use research_status experience with the task's extra tags and pinned current context refs, inspect its conditionally matching entries, and pass chosen exact refs in experienceRefs and the same tags/context in this task. Discovery does not guarantee the later experience pack fits its budget. No matching or useful experience means no selection; never promote a candidate record by selecting it.", "After the final task return, read its reportPath and relevant actual expectedOutputPaths before planning another delegation. For a failed predecessor, use the controller status and executionFailure to distinguish an execution fault from a scientific negative result. An earlier running notification does not replace the final result."],
 			parameters: Type.Object({
 				workspace: Type.Optional(Type.String()), runId: Type.String(), objective: Type.String(), inputs: Type.Array(Type.String()), expectedOutputs: Type.Array(Type.String({ description: "Execute only: exact work-dir-relative output path. Use an empty array for reason/check; the controller saves their reportPath." })), checks: Type.Array(Type.String()), mode: Type.Union([Type.Literal("execute"), Type.Literal("check"), Type.Literal("reason")]), parentTaskId: Type.Optional(Type.String()), supersedesTaskId: Type.Optional(Type.String()), requireIndependentCheck: Type.Optional(Type.Boolean()), knowledgeIds: Type.Optional(Type.Array(Type.String())),
 				planInput: Type.Optional(Type.String({ description: "Exact relative input path containing the approved plan for this task" })),
@@ -750,7 +769,7 @@ mainAgentWatchdog.unref?.();
 			label: "Review Research Task",
 			description: "Review actual M07 task artifacts and every predefined check. Acceptance requires passed checks with file evidence and no failures or unexecuted items.",
 			promptSnippet: "Review returned M07 task artifacts against predefined checks",
-			promptGuidelines: ["Use research_review only after inspecting actual task artifacts; task reports and external opinions are not themselves acceptance.", "Check the substantive task objective against the original goal and constraints, as well as every predefined check. Record any unmet task obligation as failed or not_run. Accepting an observation does not discharge an unmet parent goal."],
+			promptGuidelines: ["Use research_review only after inspecting actual task artifacts; task reports and external opinions are not themselves acceptance.", "Check the substantive task objective against the original goal and constraints, as well as every predefined check. Record any unmet task obligation as failed or not_run. Accepting an observation does not discharge an unmet parent goal.", "For operator results, inspect the selected source and its matching correctness and performance or platform receipts; a score or a report alone is insufficient for a source-level conclusion. An independent check must receive the final artifacts included in this review."],
 			parameters: Type.Object({
 				workspace: Type.Optional(Type.String()), runId: Type.String(), taskId: Type.String(),
 				checks: Type.Array(Type.Object({ criterion: Type.String(), result: Type.Union([Type.Literal("passed"), Type.Literal("failed"), Type.Literal("not_run")]), evidence: Type.Array(Type.String()) })),

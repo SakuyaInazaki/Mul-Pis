@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { access, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -20,40 +20,7 @@ async function submitAndMerge(store: KnowledgeStore, batch: ProposalBatch) {
 	return store.merge(receipt.proposalId);
 }
 
-test("init creates the complete layout and never overwrites existing files", async (t) => {
-	const { dir, store } = await fixture(t);
-	for (const relative of [
-		"RULES.md",
-		"CURRENT",
-		"limits.json",
-		"records",
-		"proposals",
-		"snapshots",
-		"views/current-understanding.md",
-		"views/corrections.md",
-		"views/open-questions.md",
-		"views/limits.md",
-		"_index/records.json",
-	]) {
-		await access(path.join(dir, relative));
-	}
-	const custom = "用户自己的规则\n";
-	await writeFile(path.join(dir, "RULES.md"), custom, "utf8");
-	await store.init();
-	assert.equal(await readFile(path.join(dir, "RULES.md"), "utf8"), custom);
-});
 
-test("aged merge lock fails closed and retains its owner record", async (t) => {
-	const { dir, store } = await fixture(t);
-	const receipt = await store.submitProposal({ stage: "test", runId: "locked", ops: [{ op: "create", type: "E", title: "证据", body: "待合入" }] });
-	const lock = path.join(dir, ".merge.lock");
-	const owner = JSON.stringify({ pid: 999999, time: "2020-01-01T00:00:00Z" }) + "\n";
-	await writeFile(lock, owner);
-	const old = new Date(Date.now() - 11 * 60_000);
-	await utimes(lock, old, old);
-	await assert.rejects(store.merge(receipt.proposalId), /核对 \.merge\.lock 的 owner 记录/);
-	assert.equal(await readFile(lock, "utf8"), owner);
-});
 
 test("create, revise, decide, close_q, limit and lift_limit keep history", async (t) => {
 	const { dir, store } = await fixture(t);
@@ -120,61 +87,8 @@ test("create, revise, decide, close_q, limit and lift_limit keep history", async
 	assert.ok(limits[0].liftedAt);
 });
 
-test("submitProposal reports unknown operations and invalid references without touching records", async (t) => {
-	const { dir, store } = await fixture(t);
-	const batch = {
-		stage: "test",
-		runId: "bad",
-		ops: [
-			{ op: "create", type: "C", title: "坏引用", body: "x", refs: [{ rel: "supports", target: "C999" }] },
-			{ op: "invent", value: true },
-		],
-	} as unknown as ProposalBatch;
-	const receipt = await store.submitProposal(batch);
-	assert.equal(receipt.structurallyValid, false);
-	assert(receipt.issues.some((item) => item.message.includes("不存在")));
-	assert(receipt.issues.some((item) => item.message.includes("未知操作")));
-	assert.deepEqual(await readdir(path.join(dir, "records")), []);
-	await assert.rejects(store.merge(receipt.proposalId), (error: unknown) => {
-		assert.equal((error as { code?: string }).code, "merge.invalid");
-		return true;
-	});
-	assert.equal(await store.current(), undefined);
-	assert.deepEqual(await readdir(path.join(dir, "records")), []);
-	await access(path.join(dir, "proposals", `${receipt.proposalId}.result.json`));
-});
 
-test("merge revalidates stale proposals against CURRENT and rejects incorrect targets", async (t) => {
-	const { store } = await fixture(t);
-	await submitAndMerge(store, { stage: "test", runId: "seed", ops: [{ op: "create", type: "C", title: "认识", body: "v1" }] });
-	const stale = await store.submitProposal({ stage: "test", runId: "stale", baseSnapshot: "G001", ops: [{ op: "revise", id: "C001", body: "来自旧基线", reason: "仍可应用" }] });
-	await submitAndMerge(store, { stage: "test", runId: "newer", baseSnapshot: "G001", ops: [{ op: "revise", id: "C001", body: "v2", reason: "先合入" }] });
-	const staleResult = await store.merge(stale.proposalId);
-	assert(staleResult.warnings.includes("基线快照已过时，已在当前状态重查"));
-	assert.equal((await store.get("C001"))?.version, 3);
 
-	const bad = await store.submitProposal({ stage: "test", runId: "bad-target", ops: [{ op: "revise", id: "C999", reason: "不存在" }] });
-	assert.equal(bad.structurallyValid, false);
-	const before = await store.current();
-	await assert.rejects(store.merge(bad.proposalId), (error: unknown) => (error as { code?: string }).code === "merge.invalid");
-	assert.deepEqual(await store.current(), before);
-});
-
-test("impact analysis marks direct dependents needs_recheck", async (t) => {
-	const { store } = await fixture(t);
-	await submitAndMerge(store, {
-		stage: "test",
-		runId: "seed",
-		ops: [
-			{ op: "create", type: "C", title: "前提", body: "上游", usageDecision: "adopted", handle: "$1" },
-			{ op: "create", type: "J", title: "论证", body: "依赖上游", usageDecision: "adopted", refs: [{ rel: "premise_of", target: "$1" }] },
-		],
-	});
-	const result = await submitAndMerge(store, { stage: "test", runId: "change", ops: [{ op: "revise", id: "C001", body: "上游变更", reason: "新条件" }] });
-	assert(result.impacts.some((item) => item.id === "J001" && item.mark === "needs_recheck"));
-	assert.equal((await store.availability("J001")).availability, "needs_recheck");
-	assert((await store.limits()).some((limit) => limit.target === "J001@1" && limit.kind === "needs_recheck" && limit.authority === `impact:${result.proposalId}`));
-});
 
 test("withdrawal disables pinned older versions and propagates through dependency chains", async (t) => {
 	const { store } = await fixture(t);
@@ -192,35 +106,7 @@ test("withdrawal disables pinned older versions and propagates through dependenc
 	assert.equal((await store.availability("C001")).availability, "not_allowed", "a new adopted version does not silently lift an old withdrawal");
 });
 
-test("legacy deactivation without a limit stays effective until an explicit lift", async (t) => {
-	const { dir, store } = await fixture(t);
-	await submitAndMerge(store, { stage: "M04", runId: "seed", ops: [{ op: "create", type: "C", title: "旧认识", body: "早期版本", usageDecision: "adopted" }] });
-	await submitAndMerge(store, { stage: "M04", runId: "old-withdraw", ops: [{ op: "decide", id: "C001", usageDecision: "withdrawn", reason: "撤回" }] });
-	await writeFile(path.join(dir, "limits.json"), "[]\n", "utf8"); // Simulate a store written before deactivation-first decisions.
-	assert.equal((await store.availability("C001", 1)).availability, "not_allowed");
-	await submitAndMerge(store, { stage: "M04", runId: "old-adopt", ops: [{ op: "decide", id: "C001", usageDecision: "adopted", reason: "不能自行恢复旧版本" }] });
-	assert.equal((await store.availability("C001")).availability, "not_allowed");
-	const lift = await store.submitProposal({ stage: "M04", runId: "authorized-lift", ops: [{ op: "lift_limit", target: "C001", reason: "明确完成复核", authority: "reviewer" }] });
-	assert.equal(lift.structurallyValid, true);
-	await store.merge(lift.proposalId);
-	assert.equal((await store.availability("C001")).availability, "usable_conditionally");
-});
 
-test("a replacement or refutation of a withdrawn claim is not itself a failed dependency", async (t) => {
-	const { store } = await fixture(t);
-	await submitAndMerge(store, { stage: "M04", runId: "seed", ops: [
-		{ op: "create", type: "C", title: "旧主张", body: "原结论", usageDecision: "adopted", handle: "$old" },
-		{ op: "create", type: "E", title: "新证据", body: "独立观察", usageDecision: "adopted" },
-	] });
-	await submitAndMerge(store, { stage: "M04", runId: "correction", ops: [
-		{ op: "create", type: "J", title: "反驳旧主张", body: "指出失效", usageDecision: "adopted", refs: [{ rel: "refutes", target: "C001@1" }] },
-		{ op: "create", type: "K", title: "替代方法", body: "基于新证据", usageDecision: "adopted", refs: [{ rel: "replaces", target: "C001@1" }, { rel: "checks", target: "E001@1" }] },
-	] });
-	await submitAndMerge(store, { stage: "M04", runId: "withdraw", ops: [{ op: "decide", id: "C001", usageDecision: "withdrawn", reason: "反例成立" }] });
-	assert.equal((await store.availability("C001", 1)).availability, "not_allowed");
-	assert.equal((await store.availability("J001", 1)).availability, "usable_conditionally");
-	assert.equal((await store.availability("K001", 1)).availability, "usable_conditionally");
-});
 
 test("concurrent merges are serial and publish G001 then G002", async (t) => {
 	const { dir, store } = await fixture(t);

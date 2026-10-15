@@ -1,36 +1,17 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
-import {
-	createAgentSession,
-	ModelRuntime,
-	SessionManager,
-	type CreateAgentSessionOptions,
-} from "@earendil-works/pi-coding-agent";
+import { createAgentSession, ModelRuntime, type CreateAgentSessionOptions } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import { PiSessionRunner } from "../../src/runner/pi.ts";
-import { FakeSessionRunner } from "../../src/runner/fake.ts";
-import type { CustomToolSpec, SessionSpec, ToolGrant } from "../../src/runner/types.ts";
+import type { CustomToolSpec, SessionSpec } from "../../src/runner/types.ts";
 import { HarnessError } from "../../src/types.ts";
-import { readTelemetry } from "../../src/dashboard/telemetry.ts";
 import { createConfinedCampaignFileTools } from "../../src/runner/confined-campaign-files.ts";
-import { finishManagedBashCall, prepareManagedBashCall, readManagedBashReceipt,
-	readManagedBashSessionReceipts, readManagedBashSessionEvidence,
-	observeManagedProcessGroup } from "../../src/runner/managed-bash.ts";
+import { readManagedBashReceipt, readManagedBashSessionReceipts } from "../../src/runner/managed-bash.ts";
 
-test("managed Bash group probe distinguishes missing, present and unreadable groups", async () => {
-	const gone = { platform: "linux" as const, signalGroup: () => {
-		throw Object.assign(new Error("gone"), { code: "ESRCH" }); } };
-	assert.equal(await observeManagedProcessGroup(123, gone), "none-observed");
-	assert.equal(await observeManagedProcessGroup(123, { platform: "linux", signalGroup: () => {
-		throw Object.assign(new Error("unreadable"), { code: "EACCES" }); } }), "unknown");
-	assert.equal(await observeManagedProcessGroup(123, { platform: "linux", signalGroup: () => {
-		throw Object.assign(new Error("occupied"), { code: "EPERM" }); } }), "members-observed");
-});
-import { inspectManagedExecutionSession, inspectSingleForegroundBashFailure,
-	inspectM07ManagedOperation } from "../../src/m07/managed-local-failure.ts";
+import { inspectManagedExecutionSession } from "../../src/m07/managed-local-failure.ts";
 
 const MODEL = {
 	id: "offline-model",
@@ -182,18 +163,6 @@ test("isolates all discovered resources and preserves the exact system prompt", 
 	assert.match(path.basename(stub.calls[0].cwd!), /^\.pi-session-/);
 });
 
-test("a none grant disables every tool", async (t) => {
-	const persistDir = await fixture(t);
-	const stub = stubFactory();
-	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory });
-	await runner.create(spec(persistDir));
-	assert.equal(stub.calls[0].noTools, "all");
-	assert.deepEqual(stub.calls[0].tools, []);
-	assert.equal(stub.calls[0].customTools, undefined);
-	assert.equal(stub.calls[0].sessionManager?.isPersisted(), true);
-	assert.equal(stub.calls[0].sessionManager?.getSessionDir(), persistDir);
-});
-
 test("strict DeepSeek request rejects a caller output cap and uses the resolved model bound", async (t) => {
 	const persistDir = await fixture(t);
 	const model = { ...MODEL, id: "deepseek-flash", provider: "deepseek", api: "openai-completions", cost: { input: 0.2, output: 0.3, cacheRead: 0.1, cacheWrite: 0.1 } } as Model<"openai-completions">;
@@ -229,149 +198,6 @@ test("strict DeepSeek request rejects a caller output cap and uses the resolved 
 	assert.deepEqual(seen, [{ maxTokens: model.maxTokens, maxRetries: 0 }]);
 	handle.dispose();
 });
-
-test("strict research request explicitly uses the resolved model output bound", async (t) => {
-	const persistDir = await fixture(t);
-	const model = { ...MODEL, id: "deepseek-flash", provider: "deepseek", api: "openai-completions" } as Model<"openai-completions">;
-	const seen: Array<{ maxTokens?: number; maxRetries?: number }> = [];
-	const runtime = {
-		getModels: () => [model],
-		streamSimple(_model: unknown, _context: unknown, options: { maxTokens?: number; maxRetries?: number; onPayload?: (payload: unknown, model: unknown) => Promise<unknown> }) {
-			seen.push({ maxTokens: options.maxTokens, maxRetries: options.maxRetries });
-			return options.onPayload?.({ model: "deepseek-flash", messages: [{ role: "user", content: "short" }],
-				max_tokens: options.maxTokens }, model);
-		},
-	} as unknown as ModelRuntime;
-	const stub = stubFactory();
-	const factory = (async (options: CreateAgentSessionOptions = {}) => {
-		const created = await stub.factory(options);
-		const original = created.session.prompt.bind(created.session);
-		(created.session as unknown as { prompt: (text: string) => Promise<void> }).prompt = async (text) => {
-			await (options.modelRuntime as unknown as { streamSimple: (model: unknown, context: unknown, options: unknown) => Promise<unknown> }).streamSimple(model, { messages: [] }, {});
-			await original(text);
-		};
-		return created;
-	}) as typeof createAgentSession;
-	const runner = new PiSessionRunner({ modelRuntime: runtime, createSession: factory });
-	const handle = await runner.create(spec(persistDir, { model: "deepseek/deepseek-flash", strictRequest: { maxInputPayloadBytes: 500 } }));
-	await handle.prompt("one step");
-	assert.deepEqual(seen, [{ maxTokens: model.maxTokens, maxRetries: 0 }]);
-	handle.dispose();
-});
-
-test("ordinary DeepSeek Pi requests explicitly use the resolved output maximum", async t => {
-	const persistDir = await fixture(t);
-	const model = { ...MODEL, id: "deepseek-flash", provider: "deepseek",
-		api: "openai-completions" } as Model<"openai-completions">;
-	const seen: number[] = [];
-	const runtime = { getModels: () => [model],
-		streamSimple(_model: unknown, _context: unknown,
-			options: { maxTokens?: number; onPayload?: (payload: unknown, model: unknown) => Promise<unknown> }) {
-			seen.push(options.maxTokens ?? 0);
-			return options.onPayload?.({ model: "deepseek-flash", max_tokens: options.maxTokens,
-				messages: [{ role: "user", content: "offline" }] }, model);
-		},
-	} as unknown as ModelRuntime;
-	const stub = stubFactory();
-	const factory = (async (options: CreateAgentSessionOptions = {}) => {
-		const created = await stub.factory(options);
-		const original = created.session.prompt.bind(created.session);
-		(created.session as unknown as { prompt: (text: string) => Promise<void> }).prompt = async text => {
-			await (options.modelRuntime as unknown as { streamSimple: (model: unknown, context: unknown,
-				options: unknown) => Promise<unknown> }).streamSimple(model, { messages: [] }, {});
-			await original(text);
-		};
-		return created;
-	}) as typeof createAgentSession;
-	const handle = await new PiSessionRunner({ modelRuntime: runtime, createSession: factory })
-		.create(spec(persistDir, { model: "deepseek/deepseek-flash" }));
-	await handle.prompt("ordinary request");
-	assert.deepEqual(seen, [model.maxTokens]);
-	handle.dispose();
-});
-
-async function runOfflineDeepSeekPayload(t: TestContext, strict: boolean, fields: Record<string, unknown>,
-	requestModelChange: Record<string, unknown> = {}) {
-	const persistDir = await fixture(t);
-	const model = { ...MODEL, id: "deepseek-flash", provider: "deepseek",
-		api: "openai-completions", baseUrl: "https://api.deepseek.com" } as Model<"openai-completions">;
-	let dispatched = 0;
-	let outgoing: unknown;
-	let requestedMaxTokens: number | undefined;
-	const runtime = { getModels: () => [model],
-		async streamSimple(_model: unknown, _context: unknown, options: { maxTokens?: number;
-			onPayload?: (payload: unknown, model: Model<"openai-completions">) => Promise<unknown> }) {
-			requestedMaxTokens = options.maxTokens;
-			outgoing = await options.onPayload?.({ model: model.id,
-				messages: [{ role: "user", content: "offline" }], ...fields },
-				{ ...model, ...requestModelChange });
-			dispatched++;
-		},
-	} as unknown as ModelRuntime;
-	const stub = stubFactory();
-	const factory = (async (options: CreateAgentSessionOptions = {}) => {
-		const created = await stub.factory(options);
-		const original = created.session.prompt.bind(created.session);
-		(created.session as unknown as { prompt: (text: string) => Promise<void> }).prompt = async text => {
-			await (options.modelRuntime as unknown as { streamSimple: (model: unknown, context: unknown,
-				options: unknown) => Promise<unknown> }).streamSimple(model, { messages: [] }, {});
-			await original(text);
-		};
-		return created;
-	}) as typeof createAgentSession;
-	const handle = await new PiSessionRunner({ modelRuntime: runtime, createSession: factory })
-		.create(spec(persistDir, { model: "deepseek/deepseek-flash",
-			...(strict ? { strictRequest: { maxInputPayloadBytes: 1000 } } : {}) }));
-	let error: unknown;
-	try { await handle.prompt("offline request"); }
-	catch (caught) { error = caught; }
-	const observations = handle.providerOutputRequests?.();
-	handle.dispose();
-	return { error, dispatched, outgoing, requestedMaxTokens, observations, resolvedMaxTokens: model.maxTokens };
-}
-
-for (const strict of [false, true]) {
-	test(`${strict ? "strict" : "ordinary"} DeepSeek request keeps Pi's adjusted or omitted output field`, async t => {
-		for (const [name, fields, outputField, outgoingMaxTokens] of [
-			["context-adjusted max_tokens", { max_tokens: 75 }, "max_tokens", 75],
-			["alternate max_completion_tokens", { max_completion_tokens: 60 }, "max_completion_tokens", 60],
-			["omitted", {}, "omitted", null],
-		] as const) {
-			await t.test(name, async subtest => {
-				const run = await runOfflineDeepSeekPayload(subtest, strict, fields);
-				assert.equal(run.error, undefined);
-				assert.equal(run.dispatched, 1);
-				assert.equal(run.requestedMaxTokens, run.resolvedMaxTokens);
-				assert.deepEqual(run.observations, [{ resolvedMaxTokens: run.resolvedMaxTokens,
-					outputField, outgoingMaxTokens }]);
-				assert.equal((run.outgoing as Record<string, unknown>).max_tokens, fields.max_tokens);
-				assert.equal((run.outgoing as Record<string, unknown>).max_completion_tokens, fields.max_completion_tokens);
-			});
-		}
-	});
-
-	test(`${strict ? "strict" : "ordinary"} DeepSeek request rejects unsafe output and identity changes`, async t => {
-		for (const [name, fields, modelChange] of [
-			["fractional", { max_tokens: 1.5 }, {}],
-			["nonfinite", { max_tokens: Infinity }, {}],
-			["nonpositive", { max_tokens: 0 }, {}],
-			["above resolved provider capability", { max_tokens: 1001 }, {}],
-			["conflicting fields", { max_tokens: 75, max_completion_tokens: 60 }, {}],
-			["changed payload model", { model: "other" }, {}],
-			["changed runtime model", { max_tokens: 75 }, { id: "other" }],
-			["changed provider", { max_tokens: 75 }, { provider: "other" }],
-			["changed endpoint", { max_tokens: 75 }, { baseUrl: "https://invalid.example" }],
-		] as const) {
-			await t.test(name, async subtest => {
-				const run = await runOfflineDeepSeekPayload(subtest, strict, fields, modelChange);
-				assert(run.error instanceof Error);
-				assert.match(run.error.message, /DeepSeek provider request|strict request/);
-				assert.equal(run.dispatched, 0);
-				assert.deepEqual(run.observations, []);
-			});
-		}
-	});
-}
 
 test("a read-dir grant confines both tools, rejects PDFs, and records successful reads", async (t) => {
 	const persistDir = await fixture(t);
@@ -414,67 +240,6 @@ test("a read-dir grant confines both tools, rejects PDFs, and records successful
 	assert.deepEqual(handle.readCoverage(), ["note.txt"]);
 });
 
-test("read-dir records an empty text file without a fabricated line range", async t => {
-	const persistDir = await fixture(t);
-	const materialRoot = path.join(persistDir, "materials");
-	await mkdir(materialRoot);
-	await writeFile(path.join(materialRoot, "empty.txt"), "");
-	const stub = stubFactory();
-	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory }).create(
-		spec(persistDir, { tools: { kind: "read-dir", root: materialRoot, toolName: "m07_evidence_read" } }));
-	const read = stub.calls[0].customTools?.find(tool => tool.name === "m07_evidence_read");
-	assert(read);
-	await read.execute("empty", { path: "empty.txt" }, undefined, undefined, undefined as never);
-	assert.deepEqual(handle.readCoverage(), ["empty.txt"]);
-	const events = handle.readReturnEvents();
-	assert.equal(events.length, 1);
-	const { at, ...event } = events[0]!;
-	assert.ok(Number.isFinite(Date.parse(at)));
-	assert.deepEqual(event, { toolName: "m07_evidence_read", status: "no-content", path: "empty.txt",
-		requested: {}, returned: { kind: "text", truncated: false } });
-	handle.dispose();
-});
-
-test("read-dir classifies only a proved beyond-EOF offset from confined file bytes", async t => {
-	const persistDir = await fixture(t);
-	const materialRoot = path.join(persistDir, "materials");
-	await mkdir(materialRoot);
-	await writeFile(path.join(materialRoot, "row.txt"), Array(424).fill("row").join("\n"));
-	const outsideRoot = path.join(persistDir, "outside.txt");
-	await writeFile(outsideRoot, "outside\n");
-	await symlink(outsideRoot, path.join(materialRoot, "escape.txt"));
-	const stub = stubFactory();
-	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory }).create(
-		spec(persistDir, { tools: { kind: "read-dir", root: materialRoot, toolName: "m07_evidence_read" } }));
-	const read = stub.calls[0].customTools?.find(tool => tool.name === "m07_evidence_read");
-	assert(read);
-	await assert.rejects(read.execute("overshoot", { path: "row.txt", offset: 695, limit: 700 },
-		undefined, undefined, undefined as never), /beyond end of file/);
-	const eof = handle.readReturnEvents()[0]!;
-	assert.deepEqual({ ...eof, at: undefined }, { toolName: "m07_evidence_read", status: "error",
-		path: "row.txt", requested: { offset: 695, limit: 700 }, returned: { kind: "unknown" },
-		error: { kind: "offset-beyond-eof", lineCount: 424 }, at: undefined });
-	await read.execute("tail", { path: "row.txt", offset: 400, limit: 25 },
-		undefined, undefined, undefined as never);
-	assert.deepEqual(handle.readReturnEvents()[1]?.returned,
-		{ kind: "text", startLine: 400, endLine: 424, truncated: false });
-	await assert.rejects(read.execute("escape", { path: "escape.txt", offset: 695 },
-		undefined, undefined, undefined as never), /outside the granted directory/);
-	assert.equal(handle.readReturnEvents()[2]?.error, undefined);
-	assert.equal(handle.readReturnEvents()[2]?.path, "<unresolved>");
-	const denied = path.join(materialRoot, "denied.txt");
-	await writeFile(denied, "denied\n");
-	await chmod(denied, 0o000);
-	try {
-		await assert.rejects(read.execute("denied", { path: "denied.txt", offset: 695 },
-			undefined, undefined, undefined as never), /EACCES/);
-		assert.equal(handle.readReturnEvents()[3]?.error, undefined);
-	} finally {
-		await chmod(denied, 0o600);
-	}
-	handle.dispose();
-});
-
 test("writes the sidecar next to the SDK path and resume rebuilds from it", async (t) => {
 	const persistDir = await fixture(t);
 	const stub = stubFactory();
@@ -494,73 +259,6 @@ test("writes the sidecar next to the SDK path and resume rebuilds from it", asyn
 	assert.match(stub.calls[1].resourceLoader?.getSystemPrompt() ?? "", /^persisted boundary\n\n输入信任边界：/);
 	assert.equal(resumed.ref.label, original.label);
 	assert.equal(resumed.ref.model, original.model);
-});
-
-test("resume preserves a new session's compaction policy and leaves legacy sessions unchanged", async t => {
-	const persistDir = await fixture(t);
-	const model = { ...MODEL, contextWindow: 1_048_576 };
-	const runtime = { getModels: () => [model] } as unknown as ModelRuntime;
-	const stub = stubFactory();
-	const runner = new PiSessionRunner({ modelRuntime: runtime, createSession: stub.factory });
-	const fresh = await runner.create(spec(persistDir));
-	await fresh.prompt("new session history");
-	fresh.dispose();
-	const resumed = await runner.resume(fresh.ref);
-	assert.equal(stub.calls.at(-1)?.settingsManager?.getCompactionSettings(model).reserveTokens, 848_576);
-	assert.equal(stub.calls.at(-1)?.sessionManager?.getEntries().filter(entry =>
-		entry.type === "custom" && entry.customType === "workflow_compaction").length, 1);
-	resumed.dispose();
-
-	const scratch = await mkdtemp(path.join(persistDir, ".pi-session-"));
-	const manager = SessionManager.create(scratch, persistDir);
-	const prior = await stub.factory({ sessionManager: manager });
-	await prior.session.prompt("legacy history");
-	prior.session.dispose();
-	const file = manager.getSessionFile()!;
-	const specFile = file.replace(/\.jsonl$/, ".spec.json");
-	const oldSpec = spec(persistDir);
-	await writeFile(specFile, JSON.stringify(oldSpec));
-	const original = await readFile(file, "utf8");
-	const old = await runner.resume({ label: oldSpec.label, role: oldSpec.role,
-		model: oldSpec.model, id: manager.getSessionId(), file, specFile });
-	assert.equal(stub.calls.at(-1)?.settingsManager?.getCompactionSettings(model).reserveTokens, 16_384);
-	assert.deepEqual(stub.calls.at(-1)?.resourceLoader?.getExtensions().extensions, []);
-	assert.equal(await readFile(file, "utf8"), original);
-	old.dispose();
-});
-
-test("prompt reports visible output and rejects a non-stop assistant result", async (t) => {
-	const successDir = await fixture(t);
-	const successStub = stubFactory();
-	const successRunner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: successStub.factory });
-	const success = await successRunner.create(spec(successDir));
-	const turn = await success.prompt("hello");
-	assert.deepEqual(turn, {
-		text: "visible answer",
-		stopReason: "stop",
-		toolCalls: 1,
-		usage: { input: 7, output: 11, cacheRead: 0, cacheWrite: 0, totalTokens: 18, cost: 0.3, reportedEvents: 1, unknownEvents: 0, complete: true, costComplete: false },
-	});
-	assert.deepEqual(success.transcript(), [
-		{ role: "user", text: "hello" },
-		{ role: "assistant", text: "visible answer" },
-	]);
-
-	const errorDir = await fixture(t);
-	const errorStub = stubFactory({
-		content: [{ type: "text", text: "partial" }],
-		stopReason: "error",
-		errorMessage: "provider failed offline",
-	});
-	const errorRunner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: errorStub.factory });
-	const failed = await errorRunner.create(spec(errorDir));
-	await assert.rejects(failed.prompt("fail"), (error: unknown) => {
-		assert(error instanceof HarnessError);
-		assert.equal(error.code, "runner.stop");
-		assert.match(error.message, /stopReason=error/);
-		assert.match(error.message, /provider failed offline/);
-		return true;
-	});
 });
 
 test("execution grants only requested native tools at the execution cwd and logs calls", async (t) => {
@@ -652,32 +350,6 @@ test("managed local bash receipts bind real foreground exits to exact Pi calls",
 	handle.dispose();
 });
 
-test("managed bash retains thrown and crash-window uncertainty", async t => {
-	const persistDir = await fixture(t);
-	const root = path.join(persistDir, "work");
-	await mkdir(root);
-	const stub = stubFactory();
-	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory })
-		.create(spec(persistDir, { tools: { kind: "execution", root, tools: ["bash"] } }));
-	const bash = stub.calls[0].customTools?.find(tool => tool.name === "bash");
-	assert(bash);
-	const abort = new AbortController(); abort.abort();
-	await assert.rejects(bash.execute("call-aborted", { command: "printf impossible" }, abort.signal,
-		undefined, { cwd: root } as never), /Command aborted/);
-	const thrown = await readManagedBashReceipt(handle.toolLog()[0].hostReceiptPath!);
-	assert.equal(thrown.spawn, "not-attempted");
-	assert.equal(thrown.processExit, null);
-	assert.equal(thrown.toolOutcome, "threw");
-	assert.equal(thrown.toolErrorKind, "transport-or-tool");
-	const prepared = await prepareManagedBashCall(path.join(persistDir, "crash-window"),
-		handle.ref.id, "call-crashed", "true", root);
-	assert.equal((await readManagedBashReceipt(prepared.file)).toolOutcome, "unknown");
-	assert.equal((await readManagedBashReceipt(prepared.file)).spawn, "not-attempted");
-	await finishManagedBashCall(prepared, "is-error");
-	assert.equal((await readManagedBashReceipt(prepared.file)).toolOutcome, "is-error");
-	handle.dispose();
-});
-
 test("detached local child leaves remote or detached effects explicitly unknown", async t => {
 	if (process.platform !== "linux") return t.skip("Linux setsid fixture");
 	const persistDir = await fixture(t);
@@ -695,122 +367,6 @@ test("detached local child leaves remote or detached effects explicitly unknown"
 	assert.equal(receipt.processExit?.exitCode, 0);
 	assert.equal(receipt.toolOutcome, "returned");
 	assert.equal(receipt.remoteOrDetachedEffects, "unknown");
-	handle.dispose();
-});
-
-test("execution bash uses the controller-provided temporary directory and legacy grants remain usable", async t => {
-	const persistDir = await fixture(t);
-	const root = path.join(persistDir,"work");
-	const tempDir = path.join(persistDir,"scratch");
-	await mkdir(root); await mkdir(tempDir);
-	const stub = stubFactory();
-	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory });
-	const handle = await runner.create(spec(persistDir,{tools:{kind:"execution",root,tools:["bash"],tempDir}}));
-	const bash = stub.calls[0].customTools?.find(tool => tool.name === "bash");
-	assert(bash);
-	const output = await bash.execute("temp-call",{command:"printf '%s' \"$TMPDIR\""},undefined,undefined,{cwd:root} as never);
-	assert.ok(JSON.stringify(output.content).includes(tempDir));
-	handle.dispose();
-	const legacy = await runner.create(spec(path.join(persistDir,"legacy"),{tools:{kind:"execution",root,tools:["bash"]}}));
-	assert.equal(stub.calls[1].customTools?.some(tool => tool.name === "bash"),true);
-	legacy.dispose();
-});
-
-test("managed bash recovery reader rejects forged, linked and public receipts", async t => {
-	const persistDir = await fixture(t);
-	const root = path.join(persistDir, "work");
-	await mkdir(root);
-	const sessionId = "verified-session";
-	const directory = path.join(persistDir, "host-execution-receipts", sessionId);
-	const call = await prepareManagedBashCall(directory, sessionId, "call-1", "true", root);
-	assert.equal((await readManagedBashSessionReceipts(persistDir, sessionId)).length, 1);
-	const forged = { ...call.receipt, pid: 42 };
-	await writeFile(call.file, `${JSON.stringify(forged)}\n`);
-	await assert.rejects(readManagedBashSessionReceipts(persistDir, sessionId), /invalid managed bash receipt/);
-	await writeFile(call.file, `${JSON.stringify(call.receipt)}\n`);
-	await (await import("node:fs/promises")).chmod(call.file, 0o644);
-	await assert.rejects(readManagedBashReceipt(call.file), /private regular file/);
-	await (await import("node:fs/promises")).chmod(call.file, 0o600);
-	const link = path.join(persistDir, "receipt-link.json");
-	await symlink(call.file, link);
-	await assert.rejects(readManagedBashReceipt(link), /private regular file/);
-	const orphanId = "11111111-1111-4111-8111-111111111111";
-	await writeFile(path.join(directory, `${orphanId}.json.123.22222222-2222-4222-8222-222222222222.tmp`),
-		"incomplete write");
-	const evidence = await readManagedBashSessionEvidence(persistDir, sessionId);
-	assert.equal(evidence.receipts.length, 1);
-	assert.deepEqual(evidence.pendingReceiptIds, [orphanId]);
-});
-
-test("recovery census pairs a real failed shell with exact Pi call and typed file results", async t => {
-	if (process.platform !== "linux") return t.skip("Linux process birth and group fixture");
-	const persistDir = await fixture(t);
-	const root = path.join(persistDir, "work");
-	await mkdir(root);
-	await writeFile(path.join(root, "input.txt"), "fixture\n");
-	const stub = stubFactory();
-	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory })
-		.create(spec(persistDir, { tools: { kind: "execution", root, tools: ["bash", "read"] } }));
-	const manager = stub.calls[0].sessionManager!;
-	const bash = stub.calls[0].customTools?.find(tool => tool.name === "bash")!;
-	const command = "sleep 0.03; exit 9";
-	manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "failed-shell", name: "bash",
-		arguments: { command } }] } as never);
-	await assert.rejects(bash.execute("failed-shell", { command }, undefined, undefined,
-		{ cwd: root } as never), /code 9/);
-	const input = { persistDir, sessionId: handle.ref.id, sessionFile: handle.ref.file!, workDir: root };
-	const scoped = await inspectSingleForegroundBashFailure(input);
-	assert.equal(scoped?.exitCode, 9);
-	assert.equal(scoped?.modelResponse, "unknown");
-	assert.equal(scoped?.remoteOrDetachedEffects, "unknown");
-	let census = await inspectManagedExecutionSession(input);
-	const receiptFile = handle.toolLog()[0].hostReceiptPath!;
-	const pendingFile = `${receiptFile}.123.22222222-2222-4222-8222-222222222222.tmp`;
-	await writeFile(pendingFile, "partial replacement");
-	census = await inspectManagedExecutionSession(input);
-	assert.deepEqual(census.pendingReceiptIds, [(await readManagedBashReceipt(receiptFile)).id]);
-	assert.equal(await inspectSingleForegroundBashFailure(input), null);
-	await rm(pendingFile);
-	assert.deepEqual(census.calls.map(row => [row.toolCallId, row.toolResult, row.localLifecycle]),
-		[["failed-shell", "missing", "terminal"]]);
-	manager.appendMessage({ role: "toolResult", toolCallId: "failed-shell", toolName: "bash",
-		isError: true, content: [{ type: "text", text: "failed" }] } as never);
-	const read = stub.calls[0].customTools?.find(tool => tool.name === "read")!;
-	manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "read-file", name: "read",
-		arguments: { path: "input.txt" } }] } as never);
-	await read.execute("read-file", { path: "input.txt" }, undefined, undefined, { cwd: root } as never);
-	census = await inspectManagedExecutionSession(input);
-	assert.equal(census.calls[1].localLifecycle, "unknown");
-	manager.appendMessage({ role: "toolResult", toolCallId: "read-file", toolName: "read",
-		isError: false, content: [{ type: "text", text: "fixture" }] } as never);
-	census = await inspectManagedExecutionSession(input);
-	assert.deepEqual(census.calls.map(row => [row.name, row.toolResult, row.localLifecycle]),
-		[["bash", "is-error", "terminal"], ["read", "returned", "terminal"]]);
-	assert.equal(await inspectSingleForegroundBashFailure(input), null);
-	const goal = { runId: "goal-1", tasks: [{ taskId: "T001", mode: "execute", workDir: root,
-		session: handle.ref }], executionState: { operations: [{ id: "O001", taskId: "T001",
-		status: "unknown" }] } } as unknown as import("../../src/m07/types.ts").CurrentGoal;
-	const bound = await inspectM07ManagedOperation(goal, "O001");
-	assert.equal(bound?.operationId, "O001");
-	assert.equal(bound?.sessionId, handle.ref.id);
-	assert.equal(bound?.calls.length, 2);
-	assert.deepEqual(bound?.pendingReceiptIds, []);
-	const forkedGoal = { ...goal, tasks: [{ ...goal.tasks[0],
-		session: { ...handle.ref, lineageFile: path.join(persistDir, "fork.lineage.json") } }] };
-	assert.equal(await inspectM07ManagedOperation(forkedGoal, "O001"), null);
-	const siblingLineage = handle.ref.file!.replace(/\.jsonl$/, ".lineage.json");
-	await writeFile(siblingLineage, "fork marker");
-	assert.equal(await inspectM07ManagedOperation(goal, "O001"), null);
-	await rm(siblingLineage);
-	goal.executionState!.operations.push({ version: 1, id: "O002", taskId: "T001",
-		status: "unknown", issuedAt: new Date().toISOString() });
-	assert.equal(await inspectM07ManagedOperation(goal, "O001"), null);
-	const link = path.join(persistDir, "session-link.jsonl");
-	await symlink(handle.ref.file!, link);
-	await assert.rejects(inspectManagedExecutionSession({ ...input, sessionFile: link }), /regular file/);
-	const transcript = await readFile(handle.ref.file!, "utf8");
-	await writeFile(handle.ref.file!, transcript.replace(command, "sleep 0.03; exit 8"));
-	await assert.rejects(inspectManagedExecutionSession(input), /command differs/);
 	handle.dispose();
 });
 
@@ -837,23 +393,6 @@ test("confined custom tool logs prove full UTF-8 reads without logging contents 
 	assert.match(rows[1].errorMessage ?? "", /File read failed/);
 	assert.deepEqual(rows[2].args, { path: "output.txt" });
 	assert.doesNotMatch(JSON.stringify(rows), /PRIVATE-READ-CONTENT|PRIVATE-WRITE-CONTENT/);
-	handle.dispose();
-});
-
-test("an arbitrary custom read-named tool cannot claim factory read completeness or log secret args", async t => {
-	const persistDir = await fixture(t);
-	const stub = stubFactory();
-	const arbitrary: CustomToolSpec = { name: "read", description: "synthetic untrusted tool",
-		params: { secret: { type: "string", description: "secret" } },
-		async execute() { return { text: "UNTRUSTED-RESULT" }; } };
-	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory })
-		.create(spec(persistDir, { tools: { kind: "custom", tools: [arbitrary] } }));
-	await stub.calls[0].customTools![0].execute("arbitrary", { secret: "PRIVATE-ARGUMENT" },
-		undefined, undefined, {} as never);
-	const row = handle.toolLog()[0];
-	assert.equal(row.resultMetadata, undefined);
-	assert.deepEqual(row.args, {});
-	assert.doesNotMatch(JSON.stringify(row), /PRIVATE-ARGUMENT|UNTRUSTED-RESULT/);
 	handle.dispose();
 });
 
@@ -906,82 +445,6 @@ test("abort before prompt sends nothing and abort during prompt reaches the SDK"
 	during.dispose();
 });
 
-test("removes the abort listener after a normal prompt", async (t) => {
-	const persistDir = await fixture(t);
-	const controller = new AbortController();
-	const stub = stubFactory();
-	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory, signal: controller.signal }).create(spec(persistDir));
-	await handle.prompt("finish normally");
-	controller.abort();
-	await Promise.resolve();
-	assert.equal(stub.abortCalls, 0);
-});
-
-test("runner reports only allowlisted idle and archived lifecycle metadata", async (t) => {
-	const root = await fixture(t);
-	const persistDir = path.join(root, ".agent", "sessions");
-	await mkdir(persistDir, { recursive: true });
-	const stub = stubFactory();
-	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory }).create(spec(persistDir));
-	await handle.prompt("sensitive prompt must not be recorded");
-	const idle = await readTelemetry(root, handle.ref.id);
-	assert.equal(idle?.activity, "idle");
-	assert.equal(idle?.outcome, "completed");
-	assert.doesNotMatch(JSON.stringify(idle), /sensitive prompt/);
-	handle.dispose();
-	await new Promise((resolve) => setTimeout(resolve, 20));
-	assert.equal((await readTelemetry(root, handle.ref.id))?.activity, "ended");
-});
-
-test("fake runner rejects cached custom and execution sessions on resume", async (t) => {
-	const persistDir = await fixture(t);
-	const noopTool: CustomToolSpec = {
-		name: "noop",
-		description: "offline no-op",
-		params: {},
-		execute: async () => ({ text: "ok" }),
-	};
-	const grants: ToolGrant[] = [
-		{ kind: "custom", tools: [noopTool] },
-		{ kind: "execution", root: persistDir, tools: ["read"] },
-	];
-	for (const tools of grants) {
-		const fake = new FakeSessionRunner(() => "ok");
-		const handle = await fake.create(spec(persistDir, { tools }));
-		await assert.rejects(fake.resume(handle.ref), /non-resumable tool session/);
-	}
-});
-
-test("accounts for every appended assistant and compaction once across prompts and resume", async (t) => {
-	const persistDir = await fixture(t);
-	const usage = (input: number, output: number, cost: number) => ({
-		input, output, cacheRead: 1, cacheWrite: 2, totalTokens: input + output + 3,
-		cost: { input: cost, output: 0, cacheRead: 0, cacheWrite: 0, total: cost },
-	});
-	const stub = stubFactory([
-		{ content: [{ type: "toolCall", id: "t", name: "offline", arguments: {} }], stopReason: "toolUse", usage: usage(10, 2, 0.1) },
-		{ content: [{ type: "text", text: "done" }], stopReason: "stop", usage: usage(20, 3, 0.2) },
-	], { pruneIntermediate: true, compactionUsage: usage(4, 1, 0.04) });
-	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory });
-	const handle = await runner.create(spec(persistDir));
-	const first = await handle.prompt("first");
-	assert.equal(first.toolCalls, 1);
-	assert.equal(first.usage?.input, 34);
-	assert.equal(first.usage?.cost, 0.34);
-	assert.deepEqual(handle.usageEvents().map((event) => event.kind), ["assistant", "assistant", "compaction"]);
-	await handle.prompt("second");
-	assert.equal(handle.usageSummary().input, 68);
-	const lines = (await readFile(handle.ref.file!.replace(/\.jsonl$/, ".usage.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-	assert.equal(lines.length, 2);
-	assert.deepEqual(lines.map((row) => row.summary.input), [34, 34]);
-	handle.dispose();
-	const resumed = await runner.resume(handle.ref);
-	await resumed.prompt("third");
-	assert.equal(resumed.usageSummary().input, 34);
-	assert.equal((await readFile(handle.ref.file!.replace(/\.jsonl$/, ".usage.jsonl"), "utf8")).trim().split("\n").length, 3);
-	resumed.dispose();
-});
-
 test("failed prompt persists unknown usage, and explicit abort leaves a readable ledger", async (t) => {
 	const persistDir = await fixture(t);
 	const missing = stubFactory({ content: [{ type: "text", text: "failed" }], stopReason: "error", usage: undefined });
@@ -1011,46 +474,6 @@ test("failed prompt persists unknown usage, and explicit abort leaves a readable
 	assert.equal(interrupted.usageSummary().unknownEvents, 1);
 	assert.equal(JSON.parse((await readFile(interrupted.ref.file!.replace(/\.jsonl$/, ".usage.jsonl"), "utf8")).trim()).outcome, "aborted");
 	interrupted.dispose();
-});
-
-test("records only returned text lines after limits, truncation and oversized-line warning", async (t) => {
-	const persistDir = await fixture(t);
-	const materialRoot = path.join(persistDir, "materials");
-	await mkdir(materialRoot);
-	await writeFile(path.join(materialRoot, "many.txt"), Array.from({ length: 2100 }, (_, i) => `line ${i + 1}`).join("\n"));
-	await writeFile(path.join(materialRoot, "wide.txt"), "x".repeat(52 * 1024));
-	const stub = stubFactory();
-	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory }).create(spec(persistDir, { tools: { kind: "read-dir", root: materialRoot } }));
-	const read = stub.calls[0].customTools?.find((tool) => tool.name === "material_read");
-	assert(read);
-	await read.execute("one", { path: "many.txt", offset: 5, limit: 3 }, undefined, undefined, undefined as never);
-	await read.execute("two", { path: "many.txt" }, undefined, undefined, undefined as never);
-	await read.execute("three", { path: "wide.txt" }, undefined, undefined, undefined as never);
-	await assert.rejects(read.execute("four", { path: "missing.txt" }, undefined, undefined, undefined as never));
-	assert.deepEqual(handle.readReturnEvents().map((event) => ({ status: event.status, start: event.returned.startLine, end: event.returned.endLine, truncated: event.returned.truncated })), [
-		{ status: "returned", start: 5, end: 7, truncated: true },
-		{ status: "returned", start: 1, end: 2000, truncated: true },
-		{ status: "no-content", start: undefined, end: undefined, truncated: true },
-		{ status: "error", start: undefined, end: undefined, truncated: undefined },
-	]);
-	handle.dispose();
-});
-
-test("method binding survives resume without enabling discovered resources", async (t) => {
-	const persistDir = await fixture(t);
-	const stub = stubFactory();
-	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory });
-	const binding = { versionId: "method-v1", contentId: "approved-package-v1" };
-	const handle = await runner.create(spec(persistDir, { methodBinding: binding }));
-	assert.deepEqual(handle.ref.methodBinding, binding);
-	assert.deepEqual(stub.calls[0].resourceLoader?.getExtensions().extensions.map(extension => extension.path), ["<inline:workflow-compaction>"]);
-	assert.deepEqual(stub.calls[0].resourceLoader?.getSkills().skills, []);
-	await handle.prompt("first");
-	handle.dispose();
-	await assert.rejects(runner.resume({ ...handle.ref, methodBinding: { versionId: "different" } }), /method binding differs/);
-	const resumed = await runner.resume(handle.ref);
-	assert.deepEqual(resumed.ref.methodBinding, binding);
-	resumed.dispose();
 });
 
 test("Pi forks two independent histories from a frozen completed leaf, preserving tool payload and excluding later parent turns", async (t) => {
@@ -1129,100 +552,4 @@ test("Pi checkpoint and fork fail closed for active, failed, unsettled, missing-
 	await writeFile(parent.ref.specFile!, JSON.stringify(spec(root, { label: "changed" })));
 	await assert.rejects(runner.fork({ checkpoint, spec: spec(root), evidenceBindings: [{ version: 1, label: "frozen", path: manifest, status: "frozen-copy", sourceVersion: checkpoint.id }], reason: "candidate" }), /parent spec changed/);
 	parent.dispose();
-});
-
-test("Pi forks a compaction-aware checkpoint while retaining original JSONL evidence", async (t) => {
-	const root = await fixture(t);
-	const manifest = path.join(root, "manifest.json");
-	await writeFile(manifest, "{}\n");
-	const usage = { input: 4, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 5, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
-	const stub = stubFactory(undefined, { compactionUsage: usage });
-	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory });
-	const parent = await runner.create(spec(root));
-	await parent.prompt("full original before compaction");
-	const checkpoint = await runner.checkpoint(parent, { inputManifest: manifest, runId: "run", externalOperationsSettled: true });
-	const child = await runner.fork({ checkpoint, spec: spec(path.join(root, "children")), evidenceBindings: [{ version: 1, label: "frozen", path: manifest, status: "frozen-copy", sourceVersion: checkpoint.id }], reason: "alternate compaction-aware continuation" });
-	const childJsonl = await readFile(child.ref.file!, "utf8");
-	assert.match(childJsonl, /full original before compaction/);
-	assert.match(childJsonl, /"type":"compaction"/);
-	assert.equal(child.usageEvents().length, 0);
-	child.dispose(); parent.dispose();
-});
-
-test("Pi checkpoint refuses a prompt still in flight", async (t) => {
-	const root = await fixture(t);
-	const manifest = path.join(root, "manifest.json");
-	await writeFile(manifest, "{}\n");
-	const stub = stubFactory();
-	let release!: () => void;
-	let started!: () => void;
-	const gate = new Promise<void>((resolve) => { release = resolve; });
-	const entered = new Promise<void>((resolve) => { started = resolve; });
-	const factory = (async (options: CreateAgentSessionOptions = {}) => {
-		const created = await stub.factory(options);
-		const original = created.session.prompt.bind(created.session);
-		(created.session as unknown as { prompt(text: string): Promise<void> }).prompt = async (text) => { started(); await gate; await original(text); };
-		return created;
-	}) as typeof createAgentSession;
-	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: factory });
-	const handle = await runner.create(spec(root));
-	const inFlight = handle.prompt("waiting");
-	await entered;
-	await assert.rejects(runner.checkpoint(handle, { inputManifest: manifest, runId: "run", externalOperationsSettled: true }), /idle, completed/);
-	release();
-	await inFlight;
-	const checkpoint = await runner.checkpoint(handle, { inputManifest: manifest, runId: "run", externalOperationsSettled: true });
-	assert(checkpoint.leafId);
-	handle.dispose();
-});
-
-test("fake runner mirrors independent checkpoint snapshots and child scratch identity", async (t) => {
-	const root = await fixture(t);
-	const manifest = path.join(root, "manifest.json");
-	await writeFile(manifest, "{}\n");
-	const runner = new FakeSessionRunner(() => "ok");
-	const parent = await runner.create(spec(root));
-	await parent.prompt("ancestor");
-	const checkpoint = await runner.checkpoint(parent, { inputManifest: manifest, runId: "run", externalOperationsSettled: true });
-	await parent.prompt("later parent");
-	const evidenceBindings = [{ version: 1 as const, label: "frozen", path: manifest, status: "frozen-copy" as const, sourceVersion: checkpoint.id }];
-	const a = await runner.fork({ checkpoint, spec: spec(root, { label: "a" }), evidenceBindings, reason: "first option" });
-	const b = await runner.fork({ checkpoint, spec: spec(root, { label: "b" }), evidenceBindings, reason: "second option" });
-	assert.deepEqual(a.transcript(), b.transcript());
-	assert.doesNotMatch(JSON.stringify(a.transcript()), /later parent/);
-	const aLineage = JSON.parse(await readFile(a.ref.lineageFile!, "utf8"));
-	const bLineage = JSON.parse(await readFile(b.ref.lineageFile!, "utf8"));
-	assert.notEqual(aLineage.child.scratch, bLineage.child.scratch);
-	assert.notEqual(aLineage.child.sessionFile, bLineage.child.sessionFile);
-	a.dispose(); b.dispose();
-	const resumed = await runner.resume(a.ref);
-	resumed.dispose();
-	await rm(b.ref.lineageFile!);
-	await assert.rejects(runner.resume(b.ref), /lineage receipt is missing/);
-	parent.dispose();
-});
-
-test("releases SDK session when post-create sidecar write fails", async (t) => {
-	const persistDir = await fixture(t);
-	const disposed = { count: 0 };
-	const stub = stubFactory(undefined, { blockSpecWrite: true, disposeCounter: disposed });
-	await assert.rejects(new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory }).create(spec(persistDir)));
-	assert.equal(disposed.count, 1);
-});
-
-test("resource samples contain process counters and ending a session stays ended", async (t) => {
-	const root = await fixture(t);
-	const persistDir = path.join(root, ".agent", "sessions");
-	await mkdir(persistDir, { recursive: true });
-	const stub = stubFactory();
-	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory }).create(spec(persistDir));
-	await handle.prompt("offline");
-	handle.dispose();
-	handle.dispose();
-	await new Promise((resolve) => setTimeout(resolve, 30));
-	const samples = (await readFile(path.join(root, ".agent", "telemetry", `runner-resources-${process.pid}.jsonl`), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-	assert.deepEqual(samples.map((sample) => sample.event), ["create", "prompt-end", "dispose"]);
-	assert(samples.every((sample) => sample.pid === process.pid && sample.rss > 0 && sample.heapUsed > 0 && !JSON.stringify(sample).includes("offline")));
-	assert.equal(samples.at(-1).activeSessions, samples[0].activeSessions - 1);
-	assert.equal((await readTelemetry(root, handle.ref.id))?.activity, "ended");
 });

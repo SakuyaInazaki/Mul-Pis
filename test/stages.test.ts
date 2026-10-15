@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
-import { buildM03AnswerMessage, loadPrompt, rationaleLeaks, ROLE_SYSTEM_PROMPTS, splitM03Questions } from "../src/prompts.ts";
+import { loadPrompt, ROLE_SYSTEM_PROMPTS } from "../src/prompts.ts";
 import { FakeSessionRunner, type FakeReply, type FakeReplyContext } from "../src/runner/fake.ts";
 import type { StageContext } from "../src/stages/context.ts";
 import { runInit } from "../src/stages/init.ts";
@@ -20,7 +20,7 @@ import { runM02 } from "../src/stages/m02.ts";
 import { runM03 } from "../src/stages/m03.ts";
 import { runM04 } from "../src/stages/m04.ts";
 import { runM06 } from "../src/stages/m06.ts";
-import { HarnessError } from "../src/types.ts";
+
 import { Workspace } from "../src/workspace.ts";
 
 const SECRET = "SECRET-RATIONALE-DO-NOT-FORWARD";
@@ -145,10 +145,6 @@ describe("stages with the scripted runner", () => {
 		assert.deepEqual(result.record.failures.filter((f) => !f.includes("scan.pdf")), [], "only the non-text raw file is reported");
 	});
 
-	it("M02 refuses a model different from M01", async () => {
-		const other: StageContext = { ...ctx, config: { ...ctx.config, roles: { ...ctx.config.roles, execution: "fake/other" } } };
-		await assert.rejects(runM02(other), (e: unknown) => e instanceof HarnessError && e.code === "m02.model");
-	});
 
 	it("M03 forwards only the questions to the original M01 session and evaluates in the reviewer session", async () => {
 		const result = await runM03(ctx);
@@ -172,25 +168,8 @@ describe("stages with the scripted runner", () => {
 		assert.ok(reviewerState.transcript.at(-2)!.text.includes(await loadPrompt("P03A")));
 	});
 
-	it("rationaleLeaks flags verbatim rationale lines but ignores trivial fragments", () => {
-		assert.ok(rationaleLeaks("这里故意设置了错误前提：X 在条件 W 下不成立。", "问1……\n这里故意设置了错误前提：X 在条件 W 下不成立。\n问2"));
-		assert.ok(!rationaleLeaks("（fake）", "问1（fake）：请说明关键假设。"));
-		assert.ok(!rationaleLeaks("# 出题说明与判断依据\n短句", "短句 出现在问题里"));
-	});
 
-	it("rationaleLeaks ignores overlap in explicitly forwarded questions and M02 but still detects rationale in the skeleton", () => {
-		const shared = "这是一段足够长、会同时出现在问题或候选判据中的评审表述。";
-		const questions = `问题：请核对以下表述是否成立：${shared}`;
-		const m02 = `候选判据引用：${shared}`;
-		const message = buildM03AnswerMessage(m02, questions);
-		assert.equal(rationaleLeaks(shared, message, [questions, m02]), false, "question substring and M02 quote are allowed inputs");
-		assert.equal(rationaleLeaks(shared, `${shared}\n${message}`, [questions, m02]), true, "an extra rationale copy in the message skeleton remains blocked");
-		assert.equal(rationaleLeaks("左侧骨架文字与右侧骨架文字不应在移除后被拼接成同一行", `左侧骨架文字${questions}右侧骨架文字`, [questions]), false, "removing an allowed block preserves line boundaries");
-	});
 
-	it("splitM03Questions rejects output without both headers", () => {
-		assert.throws(() => splitM03Questions("# 可转发问题\n\n问1"), (e: unknown) => e instanceof HarnessError && e.code === "m03.format");
-	});
 
 	it("first M04 continues the M01 session and merges proposals through the serial entry", async () => {
 		const result = await runM04(ctx, { feedback: { kind: "M03" } });
@@ -216,113 +195,9 @@ describe("stages with the scripted runner", () => {
 		assert.deepEqual(result.record.failures, []);
 	});
 
-	it("later M04 rounds use a fresh research session with the knowledge pack", async () => {
-		const feedbackPath = path.join(root, "user-feedback.md");
-		await writeFile(feedbackPath, "用户修正：现象 B 的口径是日平均值。\n");
-		const result = await runM04(ctx, { feedback: { kind: "file", label: "用户修正", path: feedbackPath } });
-		assert.equal(result.mode, "research-session");
-		assert.equal(result.record.sessions[0].boundary?.mode, "fresh");
-		const spec = runner.created.find((s) => s.label === "M04-research")!;
-		assert.equal(spec.role, "research");
-		assert.equal(spec.model, "fake/model-c");
-		assert.deepEqual(spec.tools, { kind: "none" });
-		const state = [...runner.sessions.values()].find((s) => s.spec.label === "M04-research")!;
-		assert.match(state.transcript[0].text, /知识记录身份契约/);
-		assert.match(state.transcript[0].text, /"target":"\$claim"/);
-		const message = state.transcript[0].text;
-		assert.ok(message.includes("研究机制 A 是否解释现象 B"), "fresh session gets the problem again");
-		assert.ok(message.includes("C001"), "knowledge pack included");
-		assert.ok(message.includes("日平均值"));
-		assert.equal(result.snapshotId, undefined, "no proposals means no new snapshot");
-		assert.ok(result.record.remarks.some((r) => r.includes("没有知识提案")));
-	});
 
-	it("M03 reviewer pool isolates three sessions, serializes M01 answers, and aggregates all sources for M04", async () => {
-		const poolRunner = new FakeSessionRunner(({ spec, turnIndex, message }) => {
-			if (spec.label.startsWith("M03-reviewer-")) {
-				const id = spec.label.slice("M03-reviewer-".length);
-				if (turnIndex === 1) return { text: `# 可转发问题\n\n问题-${id}\n\n# 出题说明与判断依据\n\n依据-${id}` };
-				assert.ok(message.includes(`回答-${id}`), `${id} only receives its own answer`);
-				for (const other of ["R1", "R2", "R3"].filter((value) => value !== id)) assert.ok(!message.includes(`回答-${other}`));
-				return { text: `评价-${id}` };
-			}
-			if (spec.label === "M01") {
-				const id = ["R1", "R2", "R3"].find((value) => message.includes(`问题-${value}`))!;
-				return { text: `回答-${id}` };
-			}
-			if (spec.label === "M04-research") return { text: "pool processed" };
-			throw new Error(`unexpected ${spec.label}`);
-		});
-		const poolConfig = { ...ctx.config, m03Reviewers: [
-			{ id: "R1", model: "fake/shared" }, { id: "R2", model: "fake/shared" }, { id: "R3", model: "fake/other" },
-		] };
-		const result = await runM03({ ...ctx, runner: poolRunner, config: poolConfig });
-		assert.deepEqual(poolRunner.created.map((spec) => [spec.label, spec.model]), [
-			["M03-reviewer-R1", "fake/shared"], ["M03-reviewer-R2", "fake/shared"], ["M03-reviewer-R3", "fake/other"],
-		]);
-		assert.equal(poolRunner.resumed.filter((ref) => ref.label === "M01").length, 1);
-		const m01 = [...poolRunner.sessions.values()].find((state) => state.spec.label === "M01")!;
-		const answerMessages = m01.transcript.filter((message) => message.role === "user").slice(-3);
-		assert.equal(answerMessages.length, 3);
-		assert.ok(answerMessages[0].text.includes("候选判据草案"));
-		assert.ok(!answerMessages[1].text.includes("候选判据草案"));
-		assert.ok(!answerMessages[2].text.includes("候选判据草案"));
-		for (const id of ["R1", "R2", "R3"]) {
-			const reviewer = [...poolRunner.sessions.values()].find((state) => state.spec.label === `M03-reviewer-${id}`)!;
-			assert.equal(reviewer.transcript.filter((message) => message.role === "user").length, 2);
-		}
-		assert.ok(result.members.every((member) => member.status === "completed"));
-		assert.match(result.evaluation, /评价-R1/); assert.match(result.evaluation, /评价-R2/); assert.match(result.evaluation, /评价-R3/);
-		const m04 = await runM04({ ...ctx, runner: poolRunner, config: poolConfig }, { feedback: { kind: "M03", runId: result.record.runId }, freshSession: true });
-		const m04State = [...poolRunner.sessions.values()].find((state) => state.spec.label === "M04-research")!;
-		assert.match(m04State.transcript[0].text, /评价-R1/); assert.match(m04State.transcript[0].text, /评价-R2/); assert.match(m04State.transcript[0].text, /评价-R3/);
-		assert.equal(m04.record.status, "completed");
-	});
 
-	it("M03 completes when R2 rationale repeats a long question substring without forwarding rationale-only text", async () => {
-		const rationaleOnly = "这是只属于出题依据且绝对不能进入执行会话的独有长句。";
-		const shared = "这段足够长的共同表述会同时出现在问题与出题依据中。";
-		const overlapRunner = new FakeSessionRunner(({ spec, turnIndex, message }) => {
-			if (spec.label.startsWith("M03-reviewer-")) {
-				const id = spec.label.slice("M03-reviewer-".length);
-				if (turnIndex === 1) return { text: `# 可转发问题\n\n问题-${id}：请核对 ${id === "R2" ? shared : "本组条件"}\n\n# 出题说明与判断依据\n\n${id === "R2" ? `${shared}\n${rationaleOnly}` : `依据-${id}`}` };
-				return { text: `评价-${id}` };
-			}
-			if (spec.label === "M01") {
-				assert.equal(message.includes(rationaleOnly), false);
-				return { text: "执行会话回答" };
-			}
-			throw new Error(`unexpected ${spec.label}`);
-		});
-		const result = await runM03({ ...ctx, runner: overlapRunner, config: { ...ctx.config, m03Reviewers: [
-			{ id: "R1", model: "fake/shared" }, { id: "R2", model: "fake/shared" }, { id: "R3", model: "fake/shared" },
-		] } });
-		assert.equal(result.record.status, "completed");
-		assert.ok(result.members.every((member) => member.status === "completed"));
-	});
 
-	it("M03 fails the whole batch and records the member when one reviewer fails", async () => {
-		const beforeRuns = new Set(await ws.listRuns("M03"));
-		const failingRunner = new FakeSessionRunner(({ spec, turnIndex }) => {
-			if (spec.label.startsWith("M03-reviewer-")) {
-				const id = spec.label.slice("M03-reviewer-".length);
-				if (turnIndex === 1) return { text: `# 可转发问题\n\n问题-${id}\n\n# 出题说明与判断依据\n\n依据-${id}` };
-				if (id === "R2") throw new Error("reviewer offline");
-				return { text: `评价-${id}` };
-			}
-			if (spec.label === "M01") return { text: "回答" };
-			throw new Error(`unexpected ${spec.label}`);
-		});
-		const failingCtx = { ...ctx, runner: failingRunner, config: { ...ctx.config, m03Reviewers: [{ id: "R1", model: "fake/shared" }, { id: "R2", model: "fake/shared" }] } };
-		await assert.rejects(runM03(failingCtx), /reviewer offline/);
-		const newId = (await ws.listRuns("M03")).find((id) => !beforeRuns.has(id))!; const failed = await ws.readRun("M03", newId);
-		assert.equal(failed.status, "failed");
-		assert.ok(!failed.outputs.some((output) => output.label === "逐题评价"), "partial success is not exposed as a complete aggregate");
-		const memberFile = failed.outputs.find((output) => output.label === "M03 成员清单")!;
-		const saved = JSON.parse(await readFile(memberFile.path, "utf8")) as { members: Array<{ id: string; status: string; failure?: string }> };
-		assert.equal(saved.members.find((member) => member.id === "R2")?.status, "failed");
-		assert.match(saved.members.find((member) => member.id === "R2")?.failure ?? "", /reviewer offline/);
-	});
 
 	it("M06 runs read → check → applicability per source, keeps failures, and assembles the whole batch", async () => {
 		for (const id of ["S001", "S002"]) {

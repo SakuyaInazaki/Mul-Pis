@@ -1,0 +1,9 @@
+# Publish the current operator workflow repairs
+
+The user requested publication of the current workflow changes, with the separate terminal console retained in its own directory. This release includes the operator execution and review prompts, candidate and independent-check evidence handoff, original-goal acceptance, knowledge discovery and counterevidence, same-host reboot recovery, failed recovery startup handling, and removal of redundant tests and unused code. Existing source-improvement changes remain part of the branch history.
+
+The terminal console is preserved under `terminal-console/` as a separate source package based on its original Git revision. Its new files and integration patch were checked against their source; the patch was validated in an independent temporary index. It is not installed into the active operator workflow. A directory-local Git attribute preserves the patch's required context prefixes without treating them as source indentation errors.
+
+Publication includes reviewed general change notes. Private run records, platform submission tools, authentication material, active workspaces, third-party checkouts and local dependencies are excluded. Mixed change notes retain their original bytes privately and publish general mechanism descriptions. The existing operator workflow process and its persistent knowledge store are not restarted or modified by publication.
+
+Validation of the main workflow: offline TypeScript typecheck passed; the complete Node suite finished with 271 tests, 267 passed, 4 Linux-specific skips, and no failures; all 11 Python transport tests passed. These are engineering checks, not a claim of end-to-end task or RSI success. The separate console package received source and patch integrity checks only; its runtime integration remains separate.

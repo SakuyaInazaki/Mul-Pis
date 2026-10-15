@@ -1,0 +1,19 @@
+# Generic goal and delegation contract repair
+
+Scope: preserve the original goal and success criteria when defining, executing and reviewing delegated work. No experiment identifiers, measurements, platform integration or scientific strategy belong in the reusable workflow rules.
+
+Before editing, archive the exact current bytes of AGENTS.md, src/pi/extension.ts, src/m07/controller.ts and docs/implementation/design.md under the local private change archive. Move the experiment-specific rule section from the repository AGENTS.md to its own experiment workspace AGENTS.md. Remove that experiment's recovery example from reusable implementation guidance; original evidence and change notes remain intact. All these text changes are recoverable from the archive and Git.
+
+Audit: the existing continuous-goal finish check requires the original success criteria with accepted evidence. A delegated observation can be valid evidence while the parent goal remains unmet. The defect in guidance is that delegation and review can be expressed as completed actions without preserving the substantive target. Keep the existing statuses, checkpoint/M04 path and until-ready mechanism; clarify the inherited contract at the existing prompt boundaries instead of introducing a new evaluator or experiment-specific gate.
+
+The user clarified that completion-before-return must be runtime behavior. Continuous M07 execute delegation now always selects the existing until-ready loop, including new forks of historical single-turn tasks. The original parent record is retained. Other goal modes and the separately evaluated local-mission adapter keep their existing contracts. Reviewer revise continues the same live builder; ready still requires the existing file checks and final review; replan/blocked remains an explicit internal handoff that cannot pass review or close the goal. Tool summaries expose loopStopReason.
+
+Regression coverage uses synthetic files and offline sessions: an early builder finish stays pending while a failed result is repaired; blocked/replan cannot be accepted even when the caller marks checks passed; a historical single-turn fork gains review without changing its source record. No platform-specific values or scientific strategy are used.
+
+Validation: the initial guidance-only pass passed typecheck and 119 existing offline tests. Runtime changes passed typecheck and 163 offline tests, with one platform-specific skip (164 total). This includes M07, continuous Pi execution, branch compatibility and local-mission integration. A separate read-only source review found no new control-path defect. Whitespace checks passed.
+
+The experiment-scoped recovery prompt contained an obsolete hard-coded work position. Archived its exact bytes before replacing it with state-based recovery of the existing bound goal. No task definitions, candidates, evaluations or knowledge decisions were edited. Live activation waits for the current external operation to settle before a same-goal process recovery.
+
+Live activation: the existing execution reached an internal handoff with no outstanding operations or running research stages. The old process was stopped only after exact identity and independent process-group verification. Its attempt suspended with the original goal still active; the existing recovery entry created a fresh running attempt for the same goal. The new process loaded the repaired controller. Historical tasks, scientific artifacts and knowledge records were retained.
+
+Live verification: the recovered workflow autonomously completed its knowledge-feedback step and started a new execute delegation. The persisted task is running with executionLoop.mode=until-ready and an active execution session. No candidate, experiment order or scientific result was selected by the maintenance agent.

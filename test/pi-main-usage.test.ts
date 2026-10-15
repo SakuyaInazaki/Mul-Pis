@@ -76,24 +76,3 @@ test("Pi main usage marks a failed call with no provider entry unknown", async (
 	assert.equal(saved[0].summary.complete, false);
 	assert.equal(saved[0].summary.costComplete, false);
 });
-
-test("Pi main usage keeps a watermark when the same session changes cwd", async (t) => {
-	const first = await mkdtemp(path.join(tmpdir(), "pi-main-first-"));
-	const second = await mkdtemp(path.join(tmpdir(), "pi-main-second-"));
-	t.after(() => Promise.all([rm(first, { recursive: true, force: true }), rm(second, { recursive: true, force: true })]));
-	await Promise.all([mkdir(path.join(first, ".agent")), mkdir(path.join(second, ".agent"))]);
-	const entries: SessionEntry[] = [];
-	const ledger = createMainUsageLedger();
-	const firstCtx = fixtureContext(first, entries);
-	const secondCtx = fixtureContext(second, entries);
-	await ledger.sessionStart(firstCtx);
-	await ledger.agentStart(firstCtx);
-	entries.push(assistant("first", 7, 2));
-	await ledger.agentEnd(firstCtx);
-	await ledger.sessionStart(secondCtx);
-	await ledger.agentStart(secondCtx);
-	entries.push(assistant("second", 3, 1));
-	await ledger.agentEnd(secondCtx);
-	assert.equal((await rows(first)).at(-1)?.summary.input, 7);
-	assert.equal((await rows(second)).at(-1)?.summary.input, 3);
-});

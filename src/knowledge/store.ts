@@ -238,7 +238,7 @@ function parseRecord(text: string, filePath: string): KnowledgeRecord {
 	};
 }
 
-function parseRecordTarget(value: string): { id: string; version?: number } | undefined {
+export function parseRecordTarget(value: string): { id: string; version?: number } | undefined {
 	const match = /^([CKEJQDX]\d{3,})(?:@(\d+))?$/.exec(value);
 	if (!match) return undefined;
 	return { id: match[1], version: match[2] ? Number(match[2]) : undefined };
@@ -604,6 +604,7 @@ export class FileKnowledgeStore implements KnowledgeStore {
 	async buildPack(query: PackQuery): Promise<KnowledgePack> {
 		const latest = await this.list();
 		return buildKnowledgePack(query, {
+			storeId: await this.storeId(),
 			snapshot: await this.current(),
 			latest,
 			resolve: (id, version) => this.get(id, version),

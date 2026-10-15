@@ -36,6 +36,23 @@ const warningRelations = new Set(["refutes", "limits", "questions", "replaces", 
 const associationRelations = new Set(["supports", "checks"]);
 const ignoredWords = new Set(["the", "and", "for", "with", "from", "this", "that", "are", "was", "were", "have", "has", "not", "run", "task", "source", "result", "status"]);
 
+/** A bare warning target follows only the current version; a pinned target keeps its historical meaning. */
+export function warningPointsToRecord(warning: KnowledgeRecord, target: KnowledgeRecord, latestVersion?: number): boolean {
+	return warning.refs.some((ref) => warningRelations.has(ref.rel) &&
+		(ref.target === `${target.id}@${target.version}` || (ref.target === target.id && latestVersion === target.version)));
+}
+
+/** Reverse edges can live on older published source versions; unpublished files never enter this view. */
+export async function publishedKnowledgeHistory(store: KnowledgeStore, latest: KnowledgeRecord[]): Promise<{ records: KnowledgeRecord[]; error?: string }> {
+	const records: KnowledgeRecord[] = [];
+	for (const record of latest) for (let version = 1; version <= record.version; version++) {
+		const historical = version === record.version ? record : await store.get(record.id, version);
+		if (!historical) return { records: [], error: `historical-premise-unavailable:${record.id}@${version}` };
+		records.push(historical);
+	}
+	return { records };
+}
+
 function terms(text: string): string[] {
 	const found = new Set<string>();
 	// Rank against the whole request. The output pack is bounded separately;
@@ -92,7 +109,7 @@ export async function retrieveKnowledge(store: KnowledgeStore, request: Knowledg
 	const omitted: KnowledgeRetrievalSelection["omitted"] = [];
 	const selected = new Map<string, Item>();
 	const words = terms(request.text);
-	const prefix = `# 局部知识包\n\n- 快照：${snapshot?.id ?? "未发布"}\n- 用途：${request.purpose}\n\n入库不等于科学认证；相关性不是采用许可，当前可用性是实时派生判断。\n\n`;
+	const prefix = `# 局部知识包\n\n- 快照：${snapshot?.id ?? "未发布"}\n- 本库 storeId：${localId}\n- 用途：${request.purpose}\n\n入库不等于科学认证；相关性不是采用许可，当前可用性是实时派生判断。\n\n`;
 	if (prefix.length > request.maxChars) throw new HarnessError("knowledge.retrieve", "knowledge retrieval header exceeds character budget");
 	const omissionLine = (items: KnowledgeRetrievalSelection["omitted"]): string => items.length ? `\n（未展开 ${items.length} 项；请按 ID 补读：${items.slice(0, 20).map((item) => item.ref).join("、")}${items.length > 20 ? " 等" : ""}）\n` : "";
 	let renderedLength = prefix.length;
@@ -108,18 +125,7 @@ export async function retrieveKnowledge(store: KnowledgeStore, request: Knowledg
 	};
 	let publishedHistory: Promise<{ records: KnowledgeRecord[]; error?: string }> | undefined;
 	const historicalRecords = (): Promise<{ records: KnowledgeRecord[]; error?: string }> => {
-		publishedHistory ??= (async () => {
-			// Reverse premise and warning edges live on their source versions. A
-			// revision may remove an edge while the older published version still
-			// matters to a pinned historical target.
-			const records: KnowledgeRecord[] = [];
-			for (const record of latest) for (let version = 1; version <= record.version; version++) {
-				const historical = version === record.version ? record : await store.get(record.id, version);
-				if (!historical) return { records: [], error: `historical-premise-unavailable:${record.id}@${version}` };
-				records.push(historical);
-			}
-			return { records };
-		})();
+		publishedHistory ??= publishedKnowledgeHistory(store, latest);
 		return publishedHistory;
 	};
 	const dependencies = async (record: KnowledgeRecord): Promise<{ targets: string[]; error?: string }> => {
@@ -179,7 +185,7 @@ export async function retrieveKnowledge(store: KnowledgeStore, request: Knowledg
 				members.set(key(record), record);
 				for (const warning of history.records) {
 					if (request.excludeExperience && warning.fields.experience !== undefined) continue;
-					if (warning.refs.some((ref) => warningRelations.has(ref.rel) && targetMatches(ref.target, record))) pending.push(warning);
+					if (warningPointsToRecord(warning, record, byId.get(record.id)?.version)) pending.push(warning);
 				}
 			}
 		}

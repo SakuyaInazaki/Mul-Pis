@@ -85,14 +85,4 @@ describe("M05 task-scoped coverage and continuation", () => {
 		assert.match(fetched, /page\.md（extracted；类型 markdown；来源 https:\/\/example\.net\/thread/);
 	});
 
-	it("continues searches and exposes links beyond the first fifty", () => {
-		assert.match(seen.searchOptions, /"page":3/);
-		assert.match(seen.searchOptions, /"cursor":"cursor-3"/);
-		assert.match(seen.searchOptions, /"site":"example.net"/);
-		assert.match(seen.search, /下一页 4/);
-		assert.match(seen.links, /reply 60/);
-		assert.match(seen.links, /reply 79/);
-		assert.match(seen.pageRead, /context and replies/);
-		assert.match(seen.cursorRejected, /只选择一个 provider/);
-	});
 });

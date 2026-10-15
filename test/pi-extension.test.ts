@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, realpath, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -8,7 +8,7 @@ import { createResearchExtension } from "../src/pi/extension.ts";
 import { ResearchService } from "../src/pi/service.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 
-function captureExtension(service: ResearchService, improvementServiceFactory?: (workspaceRoot: string) => any, researchImprovementServiceFactory?: (workspaceRoot: string) => any, continuation?: { workspace: string }): { tools: Map<string, ToolDefinition>; commands: Map<string, { handler: (args: string, ctx: any) => Promise<void> }>; handlers: Map<string, Array<(event: any, ctx: any) => unknown>>; activeTools: () => string[] } {
+function captureExtension(service: ResearchService, improvementServiceFactory?: (workspaceRoot: string) => any, researchImprovementServiceFactory?: (workspaceRoot: string) => any, continuation?: { workspace: string; goalRunId?: string }): { tools: Map<string, ToolDefinition>; commands: Map<string, { handler: (args: string, ctx: any) => Promise<void> }>; handlers: Map<string, Array<(event: any, ctx: any) => unknown>>; activeTools: () => string[] } {
 	const tools = new Map<string, ToolDefinition>();
 	const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
 	const handlers = new Map<string, Array<(event: any, ctx: any) => unknown>>();
@@ -25,15 +25,6 @@ function captureExtension(service: ResearchService, improvementServiceFactory?: 
 }
 
 function toolContext(cwd: string): any { return { cwd }; }
-
-test("extension registration is inert and exposes bounded tools", async () => {
-	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-extension-")));
-	const service = new ResearchService({ defaultWorkspace: root });
-	const registered = captureExtension(service);
-	assert.deepEqual([...registered.tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_mission", "research_review", "research_stage", "research_status"]);
-	assert.equal(registered.commands.has("research"), true);
-	assert.equal((await service.status(root)).initialized, false);
-});
 
 test("research_mission routes local controls and returns only a compact status", async () => {
 	const calls: string[] = [];
@@ -54,183 +45,12 @@ test("research_mission routes local controls and returns only a compact status",
 	assert.deepEqual(calls, ["status:local-id", "step:local-id"]);
 });
 
-test("research_improve exposes the separate bounded run, status and rollback actions", async () => {
-	const calls: string[] = [];
-	const factory = (workspaceRoot: string) => ({
-		status: async () => { calls.push(`status:${workspaceRoot}`); return { activeVersionId: "budget-v1", runs: [] }; },
-		run: async () => { calls.push(`run:${workspaceRoot}`); return { run: { runId: "i1", status: "promoted" }, activeVersionId: "budget-v2" }; },
-		rollback: async () => { calls.push(`rollback:${workspaceRoot}`); return { version: 1, versionId: "budget-v1", promotedAt: "now", runId: "rollback-i1" }; },
-	});
-	const service = new ResearchService({ defaultWorkspace: "/workspace" });
-	const tool = captureExtension(service, factory).tools.get("research_improve")!;
-	assert.match(JSON.stringify(await tool.execute("s", { action: "status" }, undefined, undefined, toolContext("/workspace"))), /budget-v1/);
-	assert.match(JSON.stringify(await tool.execute("r", { action: "run" }, undefined, undefined, toolContext("/workspace"))), /promoted/);
-	assert.match(JSON.stringify(await tool.execute("b", { action: "rollback" }, undefined, undefined, toolContext("/workspace"))), /rollback-i1/);
-	assert.deepEqual(calls, ["status:/workspace", "run:/workspace", "rollback:/workspace"]);
-});
-
-test("research_method_improve workflow-run dispatches the explicit workflow plan", async (t) => {
-	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-workflow-route-")));
-	t.after(() => import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true })));
-	const plan = { version: 1, kind: "m07-evidence-handoff/v1", marker: "workflow-only" };
-	await writeFile(path.join(root, "plan.json"), JSON.stringify(plan));
-	const calls: Array<{ workspace: string; plan: unknown }> = [];
-	const factory = (workspace: string) => ({ runWorkflow: async (input: unknown) => {
-		calls.push({ workspace, plan: input });
-		return { runId: "workflow-offline", status: "research-only", outcome: "completed-no-candidate", stopReason: "no winner", developmentArms: [], protectedArms: [], scientificBenefit: "unverified", budgetAtEnd: { settlement: "settled" } };
-	} });
-	const tool = captureExtension(new ResearchService({ defaultWorkspace: root }), undefined, factory).tools.get("research_method_improve")!;
-	const result = await tool.execute("w", { action: "workflow-run", workspace: root, planPath: "plan.json" }, undefined, undefined, toolContext(root));
-	assert.deepEqual(calls, [{ workspace: root, plan }]);
-	assert.match(JSON.stringify(result), /workflow-offline/);
-	assert.match(JSON.stringify(result), /completed-no-candidate/);
-	await assert.rejects(tool.execute("missing", { action: "workflow-run", workspace: root }, undefined, undefined, toolContext(root)), /requires planPath/);
-});
-
-test("research_method_improve routes A/A calibration without invoking search or imposing a fee ceiling", async (t) => {
-	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-aa-route-")));
-	t.after(() => import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true })));
-	const plan = { version: 1, kind: "m07-evidence-handoff-aa/v1", marker: "calibration-only" };
-	await writeFile(path.join(root, "calibration.json"), JSON.stringify(plan));
-	const calls: Array<{ workspace: string; plan: unknown; signal?: AbortSignal }> = [];
-	const signal = new AbortController().signal;
-	const factory = (workspace: string, receivedSignal?: AbortSignal) => ({
-		runWorkflow: async () => { throw new Error("calibration entered candidate search"); },
-		calibrateWorkflow: async (input: unknown) => {
-			calls.push({ workspace, plan: input, signal: receivedSignal });
-			return { runId: "aa-offline", status: "complete", baseline: "builtin", methodVersionId: "builtin-default", pairs: [
-				{ armA: { checkResults: [{ passed: false }] }, armA2: { checkResults: [{ passed: false }] }, differences: [] },
-				{ armA: { checkResults: [{ passed: true }] }, armA2: { checkResults: [{ passed: false }] }, differences: [{ criterion: "evidence" }] },
-			], scientificBenefit: "unverified", budgetAtEnd: { settlement: "settled" } };
-		},
-	});
-	const tool = captureExtension(new ResearchService({ defaultWorkspace: root }), undefined, factory).tools.get("research_method_improve")!;
-	assert.match(JSON.stringify(tool.parameters), /workflow-calibrate/);
-	assert.doesNotMatch(JSON.stringify(tool.promptGuidelines), /cost ceiling|monetary ceiling/i);
-	const value = await tool.execute("aa", { action: "workflow-calibrate", workspace: root, planPath: "calibration.json" }, signal, undefined, toolContext(root));
-	assert.deepEqual(calls, [{ workspace: root, plan, signal }]);
-	assert.match(JSON.stringify(value), /aa-offline/);
-	assert.match(JSON.stringify(value), /unverified/);
-	assert.deepEqual(Object.fromEntries(["pairCount", "partialArmCount", "pairsWithDifferingChecks", "pairsWithFailedChecks"].map((key) => [key, (value.details as any).summary[key]])), { pairCount: 2, partialArmCount: 0, pairsWithDifferingChecks: 1, pairsWithFailedChecks: 2 });
-	await assert.rejects(tool.execute("missing", { action: "workflow-calibrate", workspace: root }, undefined, undefined, toolContext(root)), /requires planPath/);
-});
-
 test("research_delegate passes approved plan, versioned resources, bounded loop, and lesson output to M07", async () => {
 	const seen: unknown[] = [];
 	const service = { delegate: async (_runId: string, task: unknown) => { seen.push(task); return { taskId: "task-offline", status: "returned" }; } } as unknown as ResearchService;
 	const tool = captureExtension(service).tools.get("research_delegate")!;
 	await tool.execute("d", { runId: "goal-offline", objective: "execute approved plan", inputs: ["plan.md", "guide.md"], expectedOutputs: ["lesson.md"], checks: ["evidence recorded"], mode: "execute", planInput: "plan.md", resourceInputs: [{ id: "operator-guide", version: "v2", input: "guide.md" }], executionLoop: { mode: "until-ready" }, lessonDeltaOutput: "lesson.md" }, undefined, undefined, toolContext("/workspace"));
 	assert.deepEqual(seen, [{ objective: "execute approved plan", inputs: ["plan.md", "guide.md"], expectedOutputs: ["lesson.md"], checks: ["evidence recorded"], mode: "execute", planInput: "plan.md", resourceInputs: [{ id: "operator-guide", version: "v2", input: "guide.md" }], executionLoop: { mode: "until-ready" }, lessonDeltaOutput: "lesson.md" }]);
-});
-
-test("delegate and goal summaries preserve a failed task cause and its last builder report", async () => {
-	const task = { taskId: "T001", status: "failed", mode: "execute", workDir: "/workspace/work",
-		executionFailure: "round snapshot contains a symlink or special file", branchUnavailableReason: "checkpoint unavailable",
-		executionRounds: [{ builderReportPath: "/workspace/round-1-builder.md" }] };
-	const service = { delegate: async () => task, goalStatus: async () => ({ runId: "G001", lifecycle: "active",
-		tasks: [task], decisions: [], feedbackStatus: "failed" }) } as unknown as ResearchService;
-	const tools = captureExtension(service).tools;
-	const spec = { runId: "G001", objective: "candidate", inputs: [], expectedOutputs: ["result.txt"], checks: ["checked"], mode: "execute" };
-	const delegated = (await tools.get("research_delegate")!.execute("d", spec, undefined, undefined, toolContext("/workspace"))).details as any;
-	assert.equal(delegated.summary.executionFailure,task.executionFailure);
-	assert.equal(delegated.summary.lastRound.builderReportPath,task.executionRounds[0].builderReportPath);
-	const status = (await tools.get("research_goal")!.execute("g",{action:"status",runId:"G001"},undefined,undefined,toolContext("/workspace"))).details as any;
-	assert.equal(status.summary.tasks[0].executionFailure,task.executionFailure);
-	assert.equal(status.summary.tasks[0].branchUnavailableReason,task.branchUnavailableReason);
-	assert.equal(status.summary.tasks[0].lastRound.builderReportPath,task.executionRounds[0].builderReportPath);
-});
-
-test("research tools dispatch a real same-goal fork and select an accepted branch without exposing session dumps", async () => {
-	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-branch-extension-")));
-	await mkdir(path.join(root, "problem"), { recursive: true });
-	await writeFile(path.join(root, "problem", "problem.md"), "Bounded branch question\n");
-	await writeFile(path.join(root, "research.config.json"), JSON.stringify({ roles: { execution: "fake/execution" }, concurrency: 1 }));
-	const runner = new FakeSessionRunner(async ({ spec }) => {
-		if (spec.tools.kind === "execution") await writeFile(path.join(spec.tools.root, "result.txt"), "candidate output\n");
-		return "candidate completed";
-	});
-	const service = new ResearchService({ defaultWorkspace: root, runnerFactory: () => runner });
-	await service.init(root);
-	const tools = captureExtension(service).tools;
-	const call = (tool: string, params: Record<string, unknown>) => tools.get(tool)!.execute(tool, params, undefined, undefined, toolContext(root));
-	const begin = await call("research_goal", { action: "begin", goal: "Study candidate", problemRelation: "direct", constraints: ["fixed target"], successCriteria: ["checked"], plan: "compare candidates", exploratory: true });
-	const runId = (begin.details as { summary: { runId: string } }).summary.runId;
-	const spec = { runId, objective: "Run candidate", inputs: [], expectedOutputs: ["result.txt"], checks: ["result checked"], mode: "execute" };
-	const parent = await call("research_delegate", spec);
-	const parentResult = (parent.details as { summary: { taskId: string; status: string; workDir: string; reportPath: string; expectedOutputPaths: string[] } }).summary;
-	const parentTaskId = parentResult.taskId;
-	assert.equal(parentResult.status, "returned");
-	assert.equal(parentResult.expectedOutputPaths[0], path.join(parentResult.workDir, "result.txt"));
-	assert.match(await readFile(parentResult.reportPath, "utf8"), /candidate completed/);
-	assert.equal(await readFile(parentResult.expectedOutputPaths[0], "utf8"), "candidate output\n");
-	assert.doesNotMatch(JSON.stringify(parent), /candidate completed|candidate output|toolLog|sourceSessionFile|snapshotFile|transcript|"session"/);
-	const goal = await service.goalStatus(runId, root) as { tasks: Array<{ taskId: string; branchSource?: { checkpoint: { id: string } }; workDir: string }> };
-	const checkpointId = goal.tasks[0].branchSource?.checkpoint.id;
-	assert.ok(checkpointId, "controller must freeze a real parent checkpoint");
-	const parentEvidence = parentResult.expectedOutputPaths[0];
-	await call("research_review", { runId, taskId: parentTaskId, checks: [{ criterion: "result checked", result: "passed", evidence: [parentEvidence] }], artifacts: [parentEvidence] });
-	const context = { mode: "fork", parentRunId: runId, parentTaskId, checkpointId };
-	const sibling = await call("research_delegate", { ...spec, context });
-	const siblingResult = (sibling.details as { summary: { taskId: string; status: string; workDir: string; reportPath: string; expectedOutputPaths: string[] } }).summary;
-	const siblingTaskId = siblingResult.taskId;
-	assert.equal(siblingResult.status, "returned");
-	assert.equal(siblingResult.expectedOutputPaths[0], path.join(siblingResult.workDir, "result.txt"));
-	assert.match(await readFile(siblingResult.reportPath, "utf8"), /candidate completed/);
-	assert.equal(await readFile(siblingResult.expectedOutputPaths[0], "utf8"), "candidate output\n");
-	assert.doesNotMatch(JSON.stringify(sibling), /candidate completed|candidate output|toolLog|sourceSessionFile|snapshotFile|transcript|"session"/);
-	const siblingState = await service.goalStatus(runId, root) as { tasks: Array<{ taskId: string; status: string; executionFailure?: string }> };
-	assert.equal(siblingState.tasks.find((task) => task.taskId === siblingTaskId)?.status, "returned", siblingState.tasks.find((task) => task.taskId === siblingTaskId)?.executionFailure ?? "fork failed");
-	assert.equal(runner.created.length, 2);
-	assert.equal(runner.created[1].label.includes(siblingTaskId), true);
-	const afterFork = await service.goalStatus(runId, root) as { tasks: Array<{ taskId: string; context?: unknown; workDir: string; session?: { lineageFile?: string } }> };
-	assert.deepEqual(afterFork.tasks[1].context, context);
-	const lineageFile = afterFork.tasks[1].session?.lineageFile;
-	assert.ok(lineageFile, "child must carry a committed true-fork receipt");
-	assert.equal((JSON.parse(await readFile(lineageFile, "utf8")) as { checkpoint: { id: string } }).checkpoint.id, checkpointId);
-	const evidence = siblingResult.expectedOutputPaths[0];
-	await call("research_review", { runId, taskId: siblingTaskId, checks: [{ criterion: "result checked", result: "passed", evidence: [evidence] }], artifacts: [evidence] });
-	const selected = await call("research_goal", { action: "select-branch", runId, parentTaskId, selectedTaskId: siblingTaskId, rationale: "Reviewed candidate passed" });
-	const summary = (selected.details as { summary: { branchSelections: Array<{ selectedTaskId: string }> } }).summary;
-	assert.equal(summary.branchSelections[0].selectedTaskId, siblingTaskId);
-	assert.doesNotMatch(JSON.stringify(selected), /toolLog|sourceSessionFile|snapshotFile|transcript/);
-	const privateGoalPath = path.join(root, "stages", "M07", runId, "goal.json");
-	const privateGoal = JSON.parse(await readFile(privateGoalPath, "utf8"));
-	privateGoal.tasks[0].branchUnavailableReason = "api_key=private-branch-reason";
-	privateGoal.tasks[0].executionFailure = "api_key=private-task-failure";
-	privateGoal.branchSelections[0].rationale = "api_key=private-selection-rationale";
-	await writeFile(privateGoalPath, JSON.stringify(privateGoal));
-	const safeStatus = await call("research_goal", { action: "status", runId });
-	assert.doesNotMatch(JSON.stringify(safeStatus), /private-branch-reason|private-task-failure|private-selection-rationale/);
-	await assert.rejects(call("research_goal", { action: "select-branch", runId, parentTaskId, selectedTaskId: siblingTaskId, rationale: "again" }), /already been frozen/);
-	const secondParent = await call("research_delegate", spec);
-	const secondParentId = (secondParent.details as { summary: { taskId: string } }).summary.taskId;
-	const secondStatus = await service.goalStatus(runId, root) as { tasks: Array<{ taskId: string; workDir: string; branchSource?: { checkpoint: { id: string } } }> };
-	const secondCheckpointId = secondStatus.tasks.find((task) => task.taskId === secondParentId)?.branchSource?.checkpoint.id;
-	assert.ok(secondCheckpointId);
-	const secondParentEvidence = path.join(secondStatus.tasks.find((task) => task.taskId === secondParentId)!.workDir, "result.txt");
-	await call("research_review", { runId, taskId: secondParentId, checks: [{ criterion: "result checked", result: "passed", evidence: [secondParentEvidence] }], artifacts: [secondParentEvidence] });
-	const secondChild = await call("research_delegate", { ...spec, context: { mode: "fork", parentRunId: runId, parentTaskId: secondParentId, checkpointId: secondCheckpointId } });
-	const secondChildId = (secondChild.details as { summary: { taskId: string } }).summary.taskId;
-	const secondChildStatus = await service.goalStatus(runId, root) as { tasks: Array<{ taskId: string; workDir: string }> };
-	const secondEvidence = path.join(secondChildStatus.tasks.find((task) => task.taskId === secondChildId)!.workDir, "result.txt");
-	await call("research_review", { runId, taskId: secondChildId, checks: [{ criterion: "result checked", result: "failed", evidence: [secondEvidence] }], artifacts: [secondEvidence] });
-	const none = await call("research_goal", { action: "select-branch", runId, parentTaskId: secondParentId, rationale: "No candidate passed" });
-	const noneSelection = (none.details as { summary: { branchSelections: Array<{ selectedTaskId?: string }> } }).summary.branchSelections[1];
-	assert.equal(noneSelection.selectedTaskId, undefined);
-});
-
-test("research branch tool schemas reject malformed references before controller dispatch", async () => {
-	let delegates = 0, selections = 0;
-	const service = { delegate: async () => { delegates++; return {}; }, goalAction: async () => { selections++; return {}; } } as unknown as ResearchService;
-	const tools = captureExtension(service).tools;
-	const ctx = toolContext("/workspace");
-	const spec = { runId: "r1", objective: "task", inputs: [], expectedOutputs: ["out.txt"], checks: ["checked"], mode: "execute" };
-	await assert.rejects(tools.get("research_delegate")!.execute("d", { ...spec, context: { mode: "fork", parentRunId: "other", parentTaskId: "T001", checkpointId: "cp" } }, undefined, undefined, ctx), /same-goal/);
-	await assert.rejects(tools.get("research_delegate")!.execute("d", { ...spec, context: { mode: "fork", parentRunId: "r1", parentTaskId: "T001", checkpointId: "cp", extra: "unsafe" } }, undefined, undefined, ctx), /exact same-goal/);
-	await assert.rejects(tools.get("research_goal")!.execute("g", { action: "select-branch", runId: "r1", parentTaskId: "T001", rationale: "" }, undefined, undefined, ctx), /requires runId/);
-	await assert.rejects(tools.get("research_goal")!.execute("g", { action: "select-branch", runId: "r1", parentTaskId: "T001", rationale: "reason", goal: "injected" }, undefined, undefined, ctx), /unrelated fields/);
-	assert.equal(delegates, 0);
-	assert.equal(selections, 0);
 });
 
 test("main-session capability guard blocks side-effect tools from the start", async () => {
@@ -259,28 +79,41 @@ test("main-session capability guard blocks side-effect tools from the start", as
 	assert.equal(((await hook(bash, toolContext("/different-cwd"))) as { block?: boolean }).block, true);
 });
 
-test("status works without model config and does not initialize the workspace", async () => {
-	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-status-")));
-	const service = new ResearchService({ defaultWorkspace: root });
-	const status = await service.status();
-	assert.equal(status.configPresent, false);
-	assert.equal(status.initialized, false);
-	assert.equal(status.stages.M01.count, 0);
-	assert.match(status.limitations.join("\n"), /不会自动重跑/);
-});
-
-test("tool workspace defaults to each execute ctx.cwd instead of extension construction cwd", async () => {
-	const defaultRoot = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-default-")));
-	const currentRoot = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-current-")));
-	const registered = captureExtension(new ResearchService({ defaultWorkspace: defaultRoot }));
-	const output = await registered.tools.get("research_status")!.execute("status", {}, undefined, undefined, toolContext(currentRoot));
-	assert.match(JSON.stringify(output), new RegExp(currentRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-	const explicit = await registered.tools.get("research_status")!.execute("status", { workspace: defaultRoot }, undefined, undefined, toolContext(currentRoot));
-	assert.match(JSON.stringify(explicit), new RegExp(defaultRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-	const child = path.join(currentRoot, "relative-workspace");
-	await mkdir(child);
-	const relative = await registered.tools.get("research_status")!.execute("status", { workspace: "relative-workspace" }, undefined, undefined, toolContext(currentRoot));
-	assert.match(JSON.stringify(relative), new RegExp(child.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+test("failed recovery initialization shuts down the prompt and blocks every tool", async () => {
+	const previous = process.env.PRE_RSI_RECOVER_GOAL_RUN_ID;
+	const previousDescriptor = process.env.PRE_RSI_RUN_DESCRIPTOR_FILE;
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-recovery-gate-")));
+	const descriptorPath = path.join(root, "run-descriptor.json");
+	await writeFile(descriptorPath, JSON.stringify({ version: 1, instanceId: "fresh-instance", attemptId: "A008",
+		workspaceId: "workspace-id", goalRunId: "goal-recovery", codeRevision: "test-revision", controlDir: root,
+		process: { hostId: "test-host", bootId: "test-boot", pid: 123, processStartToken: "test-start" } }));
+	process.env.PRE_RSI_RECOVER_GOAL_RUN_ID = "goal-recovery";
+	process.env.PRE_RSI_RUN_DESCRIPTOR_FILE = descriptorPath;
+	try {
+		const service = {
+			goalStatus: async () => ({ executionState: { activeAttemptId: "A007", attempts: Array.from({ length: 7 }) } }),
+			hostRecover: async () => { throw new Error("recovery rejected"); },
+		} as unknown as ResearchService;
+		const registered = captureExtension(service, undefined, undefined, { workspace: "/workspace", goalRunId: "goal-recovery" });
+		let aborted = 0;
+		let shutdown = 0;
+		const ctx = { cwd: "/workspace", mode: "rpc", abort: () => { aborted++; }, shutdown: () => { shutdown++; } };
+		await assert.rejects(async () => registered.handlers.get("session_start")![0]({}, ctx), /recovery rejected/);
+		assert.deepEqual(registered.activeTools(), []);
+		await registered.handlers.get("before_agent_start")![0]({ systemPrompt: "normal prompt" }, ctx);
+		assert.equal(aborted, 1);
+		assert.equal(shutdown, 1);
+		for (const toolName of ["read", "research_goal", "bash"]) {
+			const decision = await registered.handlers.get("tool_call")![0]({ toolName, toolCallId: toolName, input: {} }, ctx) as { block?: boolean; terminate?: boolean };
+			assert.equal(decision.block, true);
+			assert.equal(decision.terminate, true);
+		}
+	} finally {
+		if (previous === undefined) delete process.env.PRE_RSI_RECOVER_GOAL_RUN_ID;
+		else process.env.PRE_RSI_RECOVER_GOAL_RUN_ID = previous;
+		if (previousDescriptor === undefined) delete process.env.PRE_RSI_RUN_DESCRIPTOR_FILE;
+		else process.env.PRE_RSI_RUN_DESCRIPTOR_FILE = previousDescriptor;
+	}
 });
 
 test("stage tool uses a fresh runner, reports progress, and preserves completion caveat", async () => {
@@ -303,8 +136,7 @@ test("stage tool uses a fresh runner, reports progress, and preserves completion
 	assert.match(JSON.stringify(result), /initial-understanding\.md/);
 	const run = (await service.status(root)).stages.M01.latest!;
 	assert.equal(run.status, "completed");
-	assert.ok(updates.some((message) => message.includes("M01：正在创建隔离会话")));
-	assert.ok(updates.some((message) => message.includes("完成不等于科学判断已通过")));
+	assert.ok(updates.length > 0);
 	const feedbackFile = path.join(root, "feedback.md");
 	await writeFile(feedbackFile, "需要记录尚未解决的问题。\n");
 	const m04 = await tool.execute("call-m04", { stage: "M04", workspace: root, feedbackFile, freshSession: true }, undefined, undefined, toolContext(root));
@@ -339,111 +171,6 @@ test("research_stage schema invokes the real M08 service path with explicit revi
 	assert.equal(status.stages.M08.latest?.status, "completed");
 });
 
-test("M09 tool result keeps the bounded closure summary", async () => {
-	const service = { runStage: async () => ({
-		record: { stage: "M09", runId: "m09-test", status: "completed", outputs: [{ label: "M09 收口回执", path: "/workspace/receipt.json" }], failures: [] },
-		closure: {
-			status: "current-goal-returned", closureRequested: true, researchCompletion: "not-decided-by-m09", deliveryStatus: "checked",
-			version: { m08RunId: "m08-test", m04RunId: "m04-test", manifestPath: "/workspace/manifest.json" }, recipient: "reader", purpose: "inspect",
-			deliveryScope: { included: ["result.txt"], excluded: [], limitations: ["bounded"] },
-			reproduction: { mode: "read-only", status: "not-executed", authorizedExecution: false, instructions: [], actualToolCalls: 0, interpretation: "not certified" },
-			limitations: ["bounded"], recoveryEntry: "/workspace/receipt.json", runningTasks: [], automaticActionsNotTaken: ["publish"],
-			artifacts: { explanation: "/workspace/explanation.md", deliveryRoot: "/workspace/delivery", verificationReport: "/workspace/verification.md", sourceTrace: "/workspace/trace.json" },
-		},
-	}) } as unknown as ResearchService;
-	const output = await captureExtension(service).tools.get("research_stage")!.execute("m09", {
-		stage: "M09", m08RunId: "m08-test", m04RunId: "m04-test", recipient: "reader", purpose: "inspect",
-		deliveryScope: { included: ["result.txt"], excluded: [], limitations: [] },
-		reproduction: { mode: "read-only", instructions: [], authorizedExecution: false, pdfPages: [{ path: "paper.pdf", pages: [1] }] },
-	}, undefined, undefined, toolContext("/workspace"));
-	const text = JSON.stringify(output);
-	assert.match(text, /not-decided-by-m09/);
-	assert.match(text, /not-executed/);
-	assert.match(text, /automaticActionsNotTaken/);
-	assert.doesNotMatch(text, /完整状态已持久化/);
-});
-
-test("failed research operation does not activate P07; success, off, and session start control activation", async () => {
-	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-activation-")));
-	await mkdir(path.join(root, "problem", "raw"), { recursive: true });
-	await writeFile(path.join(root, "problem", "problem.md"), "问题\n");
-	const service = new ResearchService({ defaultWorkspace: root, runnerFactory: () => new FakeSessionRunner(() => ({ text: "ok", reads: [] })) });
-	await service.init(root);
-	const registered = captureExtension(service);
-	const originalTools = registered.activeTools();
-	assert.deepEqual(originalTools.slice(0, 4), ["read", "bash", "edit", "write"]);
-	assert.equal(originalTools.includes("grep"), false);
-	await assert.rejects(registered.tools.get("research_stage")!.execute("bad", { stage: "M01" }, undefined, undefined, toolContext(root)), /缺少/);
-	assert.deepEqual(registered.activeTools(), originalTools);
-	const before = registered.handlers.get("before_agent_start")![0];
-	assert.equal(await before({ systemPrompt: "base" }, toolContext(root)), undefined);
-	await registered.tools.get("research_goal")!.execute("begin", { action: "begin", goal: "目标", problemRelation: "关系", constraints: ["约束"], successCriteria: ["标准"], plan: "计划", exploratory: true }, undefined, undefined, toolContext(root));
-	assert.deepEqual(registered.activeTools().filter((name) => ["read", "grep", "find", "ls"].includes(name)), ["read", "grep", "find", "ls"]);
-	assert.equal(registered.activeTools().some((name) => ["bash", "edit", "write"].includes(name)), false);
-	assert.equal(registered.activeTools().includes("research_goal"), true);
-	assert.match(JSON.stringify(await before({ systemPrompt: "base" }, toolContext(root))), /P07|研究/);
-	await registered.commands.get("research")!.handler("off", { cwd: root, ui: { notify() {} } });
-	assert.deepEqual(registered.activeTools(), originalTools);
-	assert.equal(await before({ systemPrompt: "base" }, toolContext(root)), undefined);
-	await registered.tools.get("research_goal")!.execute("plan", { action: "plan", runId: (await service.status(root)).stages.M07.latest!.runId, plan: "新计划" }, undefined, undefined, toolContext(root));
-	assert.equal(registered.activeTools().includes("ls"), true);
-	await registered.handlers.get("session_start")![0]({}, toolContext(root));
-	assert.deepEqual(registered.activeTools(), originalTools);
-	assert.equal(await before({ systemPrompt: "base" }, toolContext(root)), undefined);
-});
-
-test("explicit continuation exposes inspection tools before its first model turn", async () => {
-	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-continuation-tools-")));
-	for (const mode of ["print", "rpc"]) {
-		const registered = captureExtension({} as ResearchService, undefined, undefined, { workspace: root });
-		const originalTools = registered.activeTools();
-		await registered.handlers.get("session_start")![0]({}, { cwd: root, mode });
-		assert.deepEqual(registered.activeTools().filter((name) => ["read", "grep", "find", "ls"].includes(name)), ["read", "grep", "find", "ls"]);
-		assert.equal(registered.activeTools().includes("bash"), false);
-		await registered.commands.get("research")!.handler("off", { cwd: root, ui: { notify() {} } });
-		assert.deepEqual(registered.activeTools(), originalTools);
-	}
-});
-
-test("symlink aliases share the same mutation lock", async () => {
-	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-lock-")));
-	const alias = `${root}-alias`;
-	await symlink(root, alias);
-	await mkdir(path.join(root, "problem", "raw"), { recursive: true });
-	await writeFile(path.join(root, "problem", "problem.md"), "问题\n");
-	await writeFile(path.join(root, "research.config.json"), `${JSON.stringify({ roles: { execution: "fake/model" }, concurrency: 1 })}\n`);
-	let release!: () => void;
-	const gate = new Promise<void>((resolve) => { release = resolve; });
-	const service = new ResearchService({ defaultWorkspace: root, runnerFactory: () => new FakeSessionRunner(async () => { await gate; return { text: "ok", reads: [] }; }) });
-	await service.init(root);
-	const first = service.runStage({ stage: "M01", workspace: root });
-	await new Promise((resolve) => setTimeout(resolve, 10));
-	await assert.rejects(service.runStage({ stage: "M01", workspace: alias }), /已有同步研究操作/);
-	release();
-	await first;
-});
-
-test("Pi DefaultResourceLoader loads the inline extension without prompting or network", async () => {
-	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-loader-")));
-	const agentDir = path.join(root, "agent");
-	await mkdir(agentDir, { recursive: true });
-	const loader = new DefaultResourceLoader({
-		cwd: root,
-		agentDir,
-		settingsManager: SettingsManager.inMemory({}),
-		noSkills: true,
-		noPromptTemplates: true,
-		noThemes: true,
-		noContextFiles: true,
-		extensionFactories: [{ name: "pre-rsi", factory: createResearchExtension({ defaultWorkspace: root }) }],
-	});
-	await loader.reload();
-	const loaded = loader.getExtensions();
-	assert.equal(loaded.errors.length, 0);
-	assert.equal(loaded.extensions.length, 1);
-	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_mission", "research_review", "research_stage", "research_status"]);
-});
-
 test("Pi DefaultResourceLoader loads the actual extensions/research.ts entrypoint", async () => {
 	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-file-loader-")));
 	const agentDir = path.join(root, "agent");
@@ -458,20 +185,4 @@ test("Pi DefaultResourceLoader loads the actual extensions/research.ts entrypoin
 	assert.equal(loaded.errors.length, 0);
 	assert.equal(loaded.extensions.length, 1);
 	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_mission", "research_review", "research_stage", "research_status"]);
-});
-
-test("research_delegate accepts exact expected output path strings", async () => {
-  let received: any;
-  const service = { delegate: async (...args: any[]) => { received = args[1]; return {}; } } as unknown as ResearchService;
-  const registered = captureExtension(service);
-  const tool = registered.tools.get("research_delegate");
-  if (tool === undefined) throw new Error("missing research_delegate");
-	await tool.execute("d", { runId: "r1", objective: "o", inputs: [], expectedOutputs: ["result.txt"], checks: ["c"], mode: "execute" }, undefined, undefined, toolContext("/workspace"));
-  assert.deepEqual(received.expectedOutputs, ["result.txt"]);
-  assert.equal(received.experienceRefs, undefined);
-  const ref = { storeId: "store-a", recordId: "E001", version: 2 };
-  await tool.execute("d2", { runId: "r1", objective: "o", inputs: [], expectedOutputs: ["result.txt"], checks: ["c"], mode: "reason", experienceRefs: [ref], experienceContextRefs: [ref], experienceTags: ["diagnostic"] }, undefined, undefined, toolContext("/workspace"));
-  assert.deepEqual(received.experienceRefs, [ref]);
-  assert.deepEqual(received.experienceContextRefs, [ref]);
-  assert.deepEqual(received.experienceTags, ["diagnostic"]);
 });

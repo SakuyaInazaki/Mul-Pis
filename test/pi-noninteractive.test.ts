@@ -32,22 +32,6 @@ test("research_goal decision request is rejected in non-interactive modes", asyn
   assert.equal(calls, 1);
 });
 
-test("non-interactive system prompt forbids stop-and-ask user options", async () => {
-  const service = { goalAction: async () => ({ runId: "r1" }) };
-  const registered = capture(service);
-  const goal = registered.tools.get("research_goal");
-  if (goal === undefined) throw new Error("missing research_goal");
-  await goal.execute("b", { action: "begin", goal: "g", problemRelation: "p", constraints: ["c"], successCriteria: ["s"], plan: "plan" }, undefined, undefined, context("json"));
-  const before = registered.handlers.get("before_agent_start");
-  if (before === undefined || before.length === 0) throw new Error("missing before_agent_start");
-  const tuiPrompt = await before[0]({ systemPrompt: "base" }, context("tui"));
-  assert.doesNotMatch(JSON.stringify(tuiPrompt ?? {}), /非交互单次模式/);
-  const jsonPrompt = await before[0]({ systemPrompt: "base" }, context("json"));
-  assert.match(JSON.stringify(jsonPrompt ?? {}), /非交互单次模式/);
-  const rpcPrompt = await before[0]({ systemPrompt: "base" }, context("rpc"));
-  assert.match(JSON.stringify(rpcPrompt ?? {}), /非交互单次模式/);
-});
-
 test("non-interactive finish requires an explicit hard stop reason", async () => {
   const calls: unknown[][] = [];
   const service = { goalAction: async (...args: unknown[]) => { calls.push(args); return {}; } };

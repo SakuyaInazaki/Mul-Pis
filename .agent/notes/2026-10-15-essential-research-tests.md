@@ -1,0 +1,24 @@
+# Essential research test coverage — 2026-10-15
+
+This deletion batch follows the user's request to continue removing unnecessary tests after the 317-case Node suite was verified. The selection is based on remaining duplicate behavior, not a count target. No production changes, public documentation edits, experiment execution or knowledge changes are included. All named tests are tracked and recoverable from Git HEAD; recover individual blocks rather than restoring entire files over earlier changes.
+
+## Exact deletion targets and retained coverage
+
+- `test/improvement.test.ts`: delete `controller-owned paired local mechanism checks can promote one policy`. The retained duplicate-proposal test invokes the same actual policy admission flow and verifies promotion/active policy; the rejected and missing-usage test retains failed admission behavior. Alternating fresh source arms and complete campaign accounting remain exercised by `workflow-source-arm.test.ts` and `workflow-source-meta.test.ts`.
+- `test/improvement.test.ts`: delete `active pointer remains authoritative if the final run status write was interrupted`. It only rewrites a saved status field after an otherwise completed run. Keep the actual competing mutation/stale active pointer tests, and source adoption/rollback in `workflow-source-arm.test.ts`.
+- `test/workflow-evidence-handoff.test.ts`: delete `explicit workflow adapter runs frozen M07/M04 arms, checks G after selection, and activates only a new H`. The same `runWorkflow` path is run by the retained protected-input freeze and independent research snapshot tests. Actual H-only activation, existing-source stability and rollback are checked in `workflow-source-arm.test.ts`.
+- `test/workflow-source-search.test.ts`: delete `two actually loaded I source versions choose different development action order`. Loaded old/new I processes and different offspring choices are already exercised in `workflow-source-meta.test.ts` and in the final source-arm I admission chain. Remove the now-unused variant I tree creation and returned variant from its fixture; the retained search tests use the original seed or their own failure-specific source.
+- `test/research-dependencies.test.ts`: remove the final synthetic `validateResearchAction` schema call in `a candidate saying to ignore dependencies still inherits controller-pinned I requirements`, and that import. Keep the preceding full model-candidate flow and assertions on the persisted inherited dependency.
+- `test/workflow-source-arm.test.ts`: remove the extra V1 `compareWorkflowSources` replay from `const casesPath` through its `activeBefore` assertion. The initial actual A/B source arms remain; the later V2 confirmation runs two alternating fresh pairs and verifies source-specific admission and activation. Remove the duplicated bad descriptor/missing fake-runner block before `crashReply`; the actual launcher false-descriptor test and real child crash/partial-provider response tests remain.
+
+Cleanup after deletion includes unused imports and helper setup exclusively supporting the removed cases. All editing and static checks finish before the single consolidated validation.
+
+## Dormant fixture options
+
+Remove unused fixture branches that remained after earlier test deletion: `bundleForImport(withPlan)` always uses false, so keep its missing-plan bundle directly; `workflow-evidence-handoff`'s fixture always uses non-CLI bootstrap, so remove `viaCli`, its dead bootstrap branch and CLI import; `activateDependent` and `requirement` in `research-dependencies` are used only for improver dependencies, so drop their executor selector and branches; `proposalUntilDuplicate`, `seedRuntimeProjection`, and source-search `runArgs` always use their default proposal/material sizes/usage, so keep these values locally instead of unused override parameters. These changes reduce test scaffolding without changing retained scenario behavior.
+
+## Consolidated validation — 2026-10-16
+
+All four essential-test cleanup scopes (core, mission, runtime and research) completed before validation. TypeScript typecheck passed. The complete Node suite ran once after the edits: 272 tests, 268 passed, 4 existing Linux-only skips, 0 failed or cancelled, in 116.6 seconds. The previous verified suite had 317 tests; this batch removed 45 more cases and about 2,300 net lines of test code and scaffolding. The Python tests were unchanged in this batch. Static inspection found no TypeScript parse errors, unused imports/top-level helpers or orphan fixture references; `git diff --check` passed.
+
+The retained suite exercises actual mission progression and completion checks, M04 evidence reading and knowledge merge, process recovery with unresolved-operation handling, provider/tool integration and source-version admission/activation/rollback. Further reduction should follow a concrete duplicate or obsolete behavior rather than a numerical target.

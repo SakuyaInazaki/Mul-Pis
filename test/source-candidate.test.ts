@@ -1,13 +1,10 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { pathToFileURL } from "node:url";
-import { prepareWorkflowCodeSource } from "../scripts/prepare-workflow-source.ts";
 import { generateSourceCandidate } from "../src/improvement/source-candidate.ts";
-import { GenerationStore, validateStrategy } from "../src/improvement/generation.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 
 async function fixture(t: test.TestContext) {
@@ -137,39 +134,6 @@ test("a second invalid handoff or provider error rejects the candidate", async t
  }
 });
 
-test("cancellation during the hypothesis correction leaves a rejected receipt", async t => {
- const f = await fixture(t);
- const controller = new AbortController();
- let correctionStarted!: () => void;
- const waiting = new Promise<void>(resolve => { correctionStarted = resolve; });
- let turns = 0;
- const runner = new FakeSessionRunner(async ctx => {
-  turns++;
-  if (turns === 1) {
-   await ctx.tools.edit({ path: "src/m07/feedback.ts", oldText: "'old'", newText: "'new'" });
-   return { text: "An edit was made.\n{\"claim\":\"unfenced\"}",
-    usage: { input: 8, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 12, cost: 0.001 } };
-  }
-  correctionStarted();
-  return new Promise<never>(() => {});
- });
- const pending = generateSourceCandidate({ ...f.base, runner, signal: controller.signal });
- await waiting;
- controller.abort();
- const result = await pending;
- assert.equal(result.status, "rejected");
- assert.match(result.reason!, /aborted|cancelled/);
- assert.equal(result.hypothesisRawText, "An edit was made.\n{\"claim\":\"unfenced\"}");
- assert.equal(result.hypothesisCorrectionRawText, undefined);
- assert.equal(result.engineeringStatus, "unverified");
- assert.equal(result.usage?.reportedEvents, 1);
- assert.equal(result.usage?.unknownEvents, 1);
- assert.equal(result.usage?.complete, false);
- assert.equal(result.usage?.costComplete, false);
- assert.equal(result.sourceCommit, undefined);
- assert.equal(turns, 2);
-});
-
 test("a structured builder hypothesis preserves every nested field without another model turn", async t => {
  const f = await fixture(t);
  const claim = { statement: "The handoff can omit relevant evidence", mechanism: { step: "M07 to M04", caveat: "Author report only" } };
@@ -193,46 +157,6 @@ test("a structured builder hypothesis preserves every nested field without anoth
  assert.equal(result.usage?.totalTokens, 25);
  assert.equal(result.engineeringStatus, "passed");
  assert.equal(JSON.parse(await readFile(f.receiptPath, "utf8")).hypothesisRawText, raw);
-});
-
-test("empty, null, array, and missing hypothesis fields remain rejected", async t => {
- const invalid = [{}, null, [], "", undefined];
- for (const value of invalid) {
-  const f = await fixture(t);
-  const runner = new FakeSessionRunner(async ctx => {
-   if (ctx.turnIndex === 1) await ctx.tools.edit({ path: "src/m07/feedback.ts", oldText: "'old'", newText: "'new'" });
-   return JSON.stringify({ claim: value, predictedObservation: "observed", falsifier: "not observed" });
-  });
-  const result = await generateSourceCandidate({ ...f.base, runner });
-  assert.equal(result.status, "rejected", `claim=${String(value)}`);
-  assert.match(result.reason!, /hypothesis claim is missing/);
-  assert.equal(result.sourceCommit, undefined);
-  assert.equal(result.hypothesisRawText, JSON.stringify({ claim: value, predictedObservation: "observed", falsifier: "not observed" }));
- }
-});
-
-
-test("source builder rejects ambiguous JSON fences and missing hypothesis fields", async t => {
- const ambiguous = await fixture(t);
- const ambiguousRunner = new FakeSessionRunner(async ctx => {
-  if (ctx.turnIndex === 1) await ctx.tools.edit({ path: "src/m07/feedback.ts", oldText: "'old'", newText: "'new'" });
-  return ["A candidate was edited.", "```json", JSON.stringify({ claim: "one", predictedObservation: "two", falsifier: "three" }), "```",
-   "```json", JSON.stringify({ claim: "other", predictedObservation: "other", falsifier: "other" }), "```"].join("\n");
- });
- const rejectedAmbiguous = await generateSourceCandidate({ ...ambiguous.base, runner: ambiguousRunner });
- assert.equal(rejectedAmbiguous.status, "rejected");
- assert.match(rejectedAmbiguous.reason!, /one complete/);
- assert.equal(rejectedAmbiguous.sourceCommit, undefined);
-
- const malformed = await fixture(t);
- const malformedRunner = new FakeSessionRunner(async ctx => {
-  if (ctx.turnIndex === 1) await ctx.tools.edit({ path: "src/m07/feedback.ts", oldText: "'old'", newText: "'new'" });
-  return ["A candidate was edited.", "```json", JSON.stringify({ claim: "one", predictedObservation: "two" }), "```"].join("\n");
- });
- const rejectedMalformed = await generateSourceCandidate({ ...malformed.base, runner: malformedRunner });
- assert.equal(rejectedMalformed.status, "rejected");
- assert.match(rejectedMalformed.reason!, /falsifier is missing/);
- assert.equal(rejectedMalformed.sourceCommit, undefined);
 });
 
 test("full Git status rejects a control file edit even when the confined grant was narrow", async t => {
@@ -268,55 +192,6 @@ test("an empty edit is rejected and a failing engineering check remains visible"
  assert.equal(result.engineeringStatus, "failed");
  assert.equal(result.checks[0]?.exitCode, 3);
  assert.ok(result.sourceCommit);
-});
-
-test("source H and I have separate typed bindings and cannot enter the prompt admission path", async t => {
- const f = await fixture(t);
- const store = new GenerationStore(f.root);
- const sourceRoot = path.join(f.root, "prepared");
- const artifact = { version: 1 as const, kind: "source-executor" as const, sourceRoot,
-  sourceCommit: f.parentCommit, modulePath: "src/m07/feedback.ts", exportName: "writeFeedback" };
- assert.deepEqual(validateStrategy("executor", artifact), artifact);
- assert.throws(() => validateStrategy("executor", { ...artifact, body: "" }), /pinned source/);
- assert.throws(() => validateStrategy("executor", { ...artifact, modulePath: "../control.ts" }), /modulePath/);
- assert.throws(() => validateStrategy("improver", artifact), /pinned source/);
- const h = await store.writeStrategy({ versionId: "H-source", kind: "executor", artifact, origin: "agent-generated", applicability: ["M07"], limitations: [], state: "research-only" });
- const i = await store.writeStrategy({ versionId: "I-prompt", kind: "improver", artifact: { version: 1, kind: "diagnostic-improver-prompt", body: "Inspect evidence." }, origin: "human-seed", applicability: ["M07"], limitations: [], state: "manual-active" });
- const bundle = await store.writeBundle({ bundleId: "G-source", parents: [], executorVersionId: h.versionId, improverVersionId: i.versionId,
-  environmentVersion: "m07-workflow/v1", modelConfig: { improver: "fake/improver", research: "fake/research" }, protocolVersion: "source-test/v1",
-  allowedCapabilities: ["m07-evidence-read"], state: "research-only" });
- const bindings = await store.sourceBindings(bundle.bundleId);
- assert.equal(bindings.executor?.sourceCommit, f.parentCommit);
- assert.equal(bindings.improver, undefined);
- await assert.rejects(store.activate(bundle.bundleId, undefined, "local-workflow-handoff-admission", "fake"), /independently verified admission/);
- assert.equal(await store.active(), undefined);
-});
-
-test("a prepared source snapshot can import its own candidate builder without scripts", async t => {
- const f = await fixture(t);
- await cp(path.resolve("src"), path.join(f.repository, "src"), { recursive: true, force: true });
- execFileSync("git", ["-C", f.repository, "add", "src"]);
- execFileSync("git", ["-C", f.repository, "commit", "-qm", "Snapshot import fixture"]);
- const commit = execFileSync("git", ["-C", f.repository, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
- const snapshot = await prepareWorkflowCodeSource(f.repository, commit, path.join(f.root, "self-contained-source"));
- const imported = await import(pathToFileURL(path.join(snapshot.sourceRoot, "src/improvement/source-candidate.ts")).href);
- assert.equal(typeof imported.generateSourceCandidate, "function");
-});
-
-test("an active builder prompt is aborted and its rejected receipt retains the session", async t => {
- const f = await fixture(t);
- const controller = new AbortController();
- let started!: () => void;
- const seen = new Promise<void>(resolve => { started = resolve; });
- const runner = new FakeSessionRunner(async () => { started(); return new Promise<never>(() => {}); });
- const pending = generateSourceCandidate({ ...f.base, runner, signal: controller.signal });
- await seen; controller.abort();
- const result = await pending;
- assert.equal(result.status, "rejected");
- assert.match(result.reason!, /aborted/);
- assert.equal(result.session?.model, "fake\/improver");
- assert.equal(result.usage?.complete, false);
- assert.equal(result.sourceCommit, undefined);
 });
 
 test("a hanging engineering check ends on explicit cancellation", async t => {

@@ -1,0 +1,13 @@
+# Remaining runtime test cleanup (2026-10-16)
+
+This batch removes only redundant or obsolete test code in the assigned runtime/provider scope. It does not change production code, public documentation, test discovery, skips, or fixtures used by surviving tests. The main agent will run unified typecheck and tests after concurrent edits finish.
+
+Before removal, exact targets and reasons:
+
+- Delete `test/runtime-observer.test.ts` in full. Its sole test starts an independent synthetic worker and synthetic observer, kills the observer itself, and checks that the worker still exists. The only production function it invokes is `readBoundedFileTail`, whose module currently has no production caller. The actual private observer crash → unknown outcome is retained in `test/private-campaign-observer.test.ts`; independent process identity and control are retained in `test/runtime-control.test.ts`.
+- Delete `test/runner/transport-diagnostics.test.ts` case `complete provider context rejection exposes checked token counts without raw text` and its now-unused `run`, `factory`, `runtime`, mode table, output-limit fixture, and related imports. Its diagnostic and redaction assertions are covered by `test/runner/context-capacity-retry.test.ts`, which runs an offline request through the actual Pi SDK and checks the parsed context rejection, retry accounting, and absence of request text in diagnostics. The two surviving tests in `transport-diagnostics` use the actual offline SDK for HTTP 503 and no-auth preflight.
+- Delete `test/runner/deepseek-campaign.test.ts` case `a certified context rejection and its corrected retry remain separate transport observations`, including its now-unused `CONTEXT_PROOF` constant and type import. `test/runner/context-capacity-retry.test.ts` retains the actual two-request Pi retry, linked request IDs, original UNKNOWN usage, reduced output limit, and provider-reported usage. `test/runner/context-capacity-carry.test.ts` retains authenticated carry of the rejected request.
+
+These targets are Git-tracked. The deleted file can be recovered with `git show HEAD:test/runtime-observer.test.ts`; deleted blocks can be recovered from `git diff` or `git show HEAD:<path>`. Restore only the named blocks, because the working tree contains earlier authorized edits. No user source material is removed.
+
+Applied: removed the three named cases, the obsolete observer test file, and declarations used only by the removed provider diagnostic case. The two actual offline SDK diagnostic cases and the campaign ownership, permission, accounting-failure, and request-contract cases remain. A scoped `git diff --check` passed. Tests and typecheck were intentionally not run in this delegated batch.

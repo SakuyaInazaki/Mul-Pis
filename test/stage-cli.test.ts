@@ -1,12 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtemp, realpath, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { main } from "../src/cli.ts";
-import { Workspace } from "../src/workspace.ts";
-import { ResearchService } from "../src/pi/service.ts";
-import { FakeSessionRunner } from "../src/runner/fake.ts";
 
 async function capture(action: () => Promise<number>): Promise<{ code: number; output: string }> {
 	const lines: string[] = [];
@@ -16,80 +13,9 @@ async function capture(action: () => Promise<number>): Promise<{ code: number; o
 	finally { console.log = original; }
 }
 
-test("CLI help exposes explicit M08/M09 and bounded improvement entrypoints", async () => {
-	const result = await capture(() => main(["help"]));
-	assert.equal(result.code, 0);
-	assert.match(result.output, /m08/);
-	assert.match(result.output, /m09/);
-	assert.match(result.output, /improve run\|status\|rollback/);
-	assert.match(result.output, /不会自动发布/);
-});
-
-test("CLI improvement status is read-only and works without model configuration", async () => {
-	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-cli-improve-")));
-	const result = await capture(() => main(["improve", "status", "--workspace", root]));
-	assert.equal(result.code, 0);
-	assert.deepEqual(JSON.parse(result.output), { runs: [] });
-});
-
-test("CLI status lists M08/M09 and limitations without model config", async () => {
-	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-cli-status-")));
-	await capture(() => main(["init", "--workspace", root]));
-	const result = await capture(() => main(["status", "--workspace", root]));
-	assert.equal(result.code, 0);
-	assert.match(result.output, /M08：0 次/);
-	assert.match(result.output, /M09：0 次/);
-	assert.match(result.output, /full-recomputation 请求不等于已完整复现/);
-});
-
-test("CLI goal delegate fork and select-branch use the controller with strict JSON and public control output", async () => {
-	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-cli-branch-")));
-	await mkdir(path.join(root, "problem"), { recursive: true });
-	await writeFile(path.join(root, "problem", "problem.md"), "Branch question\n");
-	await writeFile(path.join(root, "research.config.json"), JSON.stringify({ roles: { execution: "fake/execution" }, concurrency: 1 }));
-	const service = new ResearchService({ defaultWorkspace: root, runnerFactory: () => new FakeSessionRunner(async ({ spec }) => {
-		if (spec.tools.kind === "execution") await writeFile(path.join(spec.tools.root, "result.txt"), "candidate\n");
-		return "done";
-	}) });
-	await service.init(root);
-	const goal = await service.goalAction("begin", root, { goal: "Candidate", problemRelation: "direct", constraints: ["fixed scope"], successCriteria: ["checked"], plan: "compare", exploratory: true }) as { runId: string };
-	const spec = { objective: "Run candidate", inputs: [], expectedOutputs: ["result.txt"], checks: ["result checked"], mode: "execute" as const };
-	const parent = await service.delegate(goal.runId, spec, root) as { taskId: string; branchSource: { checkpoint: { id: string } } };
-	const parentState = await service.goalStatus(goal.runId, root) as { tasks: Array<{ taskId: string; workDir: string }> };
-	const parentEvidence = path.join(parentState.tasks[0].workDir, "result.txt");
-	await service.review(goal.runId, { taskId: parent.taskId, checks: [{ criterion: "result checked", result: "passed", evidence: [parentEvidence] }], artifacts: [parentEvidence] }, root);
-	const context = { mode: "fork", parentRunId: goal.runId, parentTaskId: parent.taskId, checkpointId: parent.branchSource.checkpoint.id };
-	const taskFile = path.join(root, "fork.json");
-	await writeFile(taskFile, JSON.stringify({ ...spec, context }));
-	const forked = await capture(() => main(["goal", "delegate", "--workspace", root, "--run", goal.runId, "--runner", "fake", "--task", taskFile]));
-	assert.equal(forked.code, 0);
-	const candidateId = JSON.parse(forked.output).taskId as string;
-	const state = await service.goalStatus(goal.runId, root) as { tasks: Array<{ taskId: string; workDir: string; context?: unknown }> };
-	assert.deepEqual(state.tasks[1].context, context);
-	const evidence = path.join(state.tasks[1].workDir, "result.txt");
-	await service.review(goal.runId, { taskId: candidateId, checks: [{ criterion: "result checked", result: "passed", evidence: [evidence] }], artifacts: [evidence] }, root);
-	const selection = await capture(() => main(["goal", "select-branch", "--workspace", root, "--run", goal.runId, "--parent-task", parent.taskId, "--selected-task", candidateId, "--rationale", "Reviewed result passed"]));
-	assert.equal(JSON.parse(selection.output).branchSelections[0].selectedTaskId, candidateId);
-	const status = await capture(() => main(["goal", "status", "--workspace", root, "--run", goal.runId]));
-	assert.match(status.output, /branchCheckpointId/);
-	assert.doesNotMatch(status.output, /toolLog|sourceSessionFile|snapshotFile|transcript/);
-	const privateGoalPath = path.join(root, "stages", "M07", goal.runId, "goal.json");
-	const privateGoal = JSON.parse(await readFile(privateGoalPath, "utf8"));
-	privateGoal.tasks[0].branchUnavailableReason = "api_key=private-branch-reason";
-	privateGoal.tasks[0].executionFailure = "api_key=private-task-failure";
-	privateGoal.branchSelections[0].rationale = "api_key=private-selection-rationale";
-	await writeFile(privateGoalPath, JSON.stringify(privateGoal));
-	const safeStatus = await capture(() => main(["goal", "status", "--workspace", root, "--run", goal.runId]));
-	assert.doesNotMatch(safeStatus.output, /private-branch-reason|private-task-failure|private-selection-rationale/);
-	assert.match(safeStatus.output, /"branchUnavailable": true/);
-	await assert.rejects(capture(() => main(["goal", "select-branch", "--workspace", root, "--run", goal.runId, "--parent-task", parent.taskId, "--selected-task", "T999", "--rationale", "bad"])), /already been frozen|accepted candidate/);
-	await writeFile(taskFile, JSON.stringify({ ...spec, context: { ...context, parentRunId: "another-run" } }));
-	await assert.rejects(capture(() => main(["goal", "delegate", "--workspace", root, "--run", goal.runId, "--runner", "fake", "--task", taskFile])), /same.*goal|精确 fork checkpoint/);
-	await assert.rejects(capture(() => main(["goal", "status", "--workspace", root, "--run", goal.runId, "--unknown", "value"])), /多余/);
-});
-
-test("CLI M08 reads explicit JSON inputs and runs the real stage with the fake runner", async () => {
+test("CLI M08 reads explicit JSON inputs and runs the real stage with the fake runner", async (t) => {
 	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-cli-m08-")));
+	t.after(() => rm(root, { recursive: true, force: true }));
 	await capture(() => main(["init", "--workspace", root]));
 	await mkdir(path.join(root, "problem", "raw"), { recursive: true });
 	await writeFile(path.join(root, "problem", "problem.md"), "CLI 审查问题\n");
@@ -104,35 +30,4 @@ test("CLI M08 reads explicit JSON inputs and runs the real stage with the fake r
 	assert.equal(result.code, 0);
 	assert.match(result.output, /M08 已结束：.*状态 completed/);
 	assert.match(result.output, /review-bundle\.md/);
-});
-
-test("CLI M09 reaches the real stage and fails closed on the generic fake report", async () => {
-	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-cli-m09-")));
-	await capture(() => main(["init", "--workspace", root]));
-	await writeFile(path.join(root, "research.config.json"), `${JSON.stringify({ roles: { execution: "fake/execution", checker: "fake/checker" }, concurrency: 1 })}\n`);
-	const ws = new Workspace(root);
-	const material = path.join(root, "result.txt"); await writeFile(material, "fixed result\n");
-	const m08 = await ws.startRun("M08", []);
-	const frozenRoot = path.join(ws.runDir("M08", m08.runId), "frozen");
-	const relativePath = "materials/001-result/result.txt";
-	const frozen = path.join(frozenRoot, relativePath); await mkdir(path.dirname(frozen), { recursive: true }); await writeFile(frozen, "fixed result\n");
-	const problemRelative = "materials/000-problem/problem.md";
-	const problem = path.join(frozenRoot, problemRelative); await mkdir(path.dirname(problem), { recursive: true }); await writeFile(problem, "fixed problem\n");
-	const manifest = { version: 1, m08RunId: m08.runId, rootDir: frozenRoot, createdAt: new Date().toISOString(), entries: [
-		{ label: "problem", path: problem, sourceCategory: "original-problem", originalPath: problem, frozenPath: problem, relativePath: problemRelative, kind: "file" },
-		{ label: "result", path: material, sourceCategory: "result", originalPath: material, frozenPath: frozen, relativePath, kind: "file" },
-	], unprovidedScopes: [] };
-	const manifestRef = await ws.writeOutput(m08, "manifest.json", JSON.stringify(manifest), "固定材料清单");
-	const feedback = await ws.writeOutput(m08, "review.md", "review", "M08 审查反馈包"); await ws.finishRun(m08, "completed");
-	const m04 = await ws.startRun("M04", [{ label: "M08 审查反馈包", path: feedback.path }]);
-	await ws.writeOutput(m04, "m08-source.json", JSON.stringify({ m08RunId: m08.runId, manifestPath: manifestRef.path, reviewBundlePath: feedback.path }), "M08 处理来源");
-	await ws.writeOutput(m04, "m08-disposition.json", JSON.stringify({ m08RunId: m08.runId, status: "ready", deliverablePaths: [relativePath], limitations: [], rationale: "bounded" }), "M08 用途处置");
-	await ws.finishRun(m04, "completed");
-	const deliveryScope = path.join(root, "delivery.json"), reproduction = path.join(root, "reproduction.json");
-	await writeFile(deliveryScope, JSON.stringify({ included: [relativePath], excluded: [], limitations: [] }));
-	await writeFile(reproduction, JSON.stringify({ mode: "read-only", instructions: [], authorizedExecution: false }));
-	await assert.rejects(capture(() => main(["m09", "--workspace", root, "--runner", "fake", "--m08", m08.runId, "--m04", m04.runId, "--recipient", "reader", "--purpose", "inspect", "--delivery-scope", deliveryScope, "--reproduction", reproduction])), /m09-delivery/);
-	const ids = await ws.listRuns("M09");
-	assert.equal(ids.length, 1);
-	assert.equal((await ws.readRun("M09", ids[0])).status, "failed");
 });

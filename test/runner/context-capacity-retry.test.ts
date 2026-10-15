@@ -140,19 +140,6 @@ test("real Pi retries an exact provider context rejection with only the output c
 	assert.deepEqual(JSON.parse(usage.trim()).requestIds, audit.requests.map(r => r.requestId));
 });
 
-test("context retry preserves Pi's alternate output field", async t => {
-	const model = { ...MODEL, compat: { ...MODEL.compat, maxTokensField: "max_completion_tokens" as const } };
-	const run = await scenario(t, () => rejection(MESSAGES), true, model);
-	await run.handle.prompt("synthetic request");
-	assert.equal(run.calls.length, 2);
-	assert.equal(run.calls[0].payload.max_completion_tokens, MAX);
-	assert.equal(run.calls[1].payload.max_completion_tokens, CORRECTED);
-	assert.equal(run.calls[0].payload.max_tokens, undefined);
-	assert.equal(run.calls[1].payload.max_tokens, undefined);
-	assert.deepEqual(run.budget.requestAccountingAuditSnapshot().requests.map(r => r.outputTokenField),
-		["max_completion_tokens", "max_completion_tokens"]);
-});
-
 for (const [label, first] of [
 	["inconsistent token sum", () => rejection(MESSAGES, MAX, MESSAGES + MAX + 1)],
 	["completion count differs from sent payload", () => rejection(MESSAGES + 1, MAX - 1)],

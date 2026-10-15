@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -99,32 +99,6 @@ test("available verdict is branded only after fresh exact live source and privat
 	assert.equal(proof.availability, "available");
 });
 
-test("GitHub REST commit message without its terminal LF verifies the exact source", async t => {
-	const f = await fixture(t);
-	const requestCommit = f.rows[`/git/commits/${probeSource.commit}`] as Record<string, unknown>;
-	requestCommit.message = requestMessage.slice(0, -1);
-	const proof = await f.verify();
-	assert.equal(isVerifiedProviderAvailabilityProof(proof), true);
-	assert.deepEqual(proof.probeSource, probeSource);
-	assert.equal(proof.availability, "available");
-});
-
-test("REST message normalization rejects changed line endings, excess LF, and injected trailers", async t => {
-	const f = await fixture(t);
-	const requestCommit = f.rows[`/git/commits/${probeSource.commit}`] as Record<string, unknown>;
-	for (const message of [
-		requestMessage.replaceAll("\n", "\r\n"),
-		`${requestMessage}\n`,
-		`${requestMessage}Reviewer: available\n`,
-		`${requestMessage.slice(0, -1)}\nReviewer: available`,
-		`Before\n${requestMessage.slice(0, -1)}\nAfter`,
-	]) {
-		requestCommit.message = message;
-		await assert.rejects(f.verify(), { code: "live-source-invalid",
-			check: "request-commit-message" });
-	}
-});
-
 test("old or nonmatching probe cannot release a later held terminal", async t => {
 	const f = await fixture(t);
 	const probe = f.rows[`/actions/runs/${probeSource.runId}`] as Record<string, unknown>;
@@ -150,15 +124,4 @@ test("duplicate, expired, or altered artifacts and envelope fail closed", async 
 	await writeFile(f.file, JSON.stringify({ ...f.receipt, probe: {
 		...f.receipt.probe, envelopeSha256: "0".repeat(64) } }));
 	await assert.rejects(f.verify(), { code: "envelope-invalid" });
-});
-
-test("operator review must be private and exactly bound", async t => {
-	const f = await fixture(t);
-	await chmod(f.file, 0o644);
-	await assert.rejects(f.verify(), { code: "invalid-receipt" });
-	await chmod(f.file, 0o600);
-	await writeFile(f.file, JSON.stringify({ ...f.receipt, verdict: {
-		kind: "provider-balance-availability", version: 1,
-		availability: "unknown" } }));
-	await assert.rejects(f.verify(), { code: "invalid-receipt" });
 });

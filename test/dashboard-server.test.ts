@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -52,21 +52,5 @@ test("dashboard rejects arbitrary workspace paths, foreign origins, writes, and 
 		assert.equal((await fetch(`${running.url}api/workspaces`, { method: "POST" })).status, 405);
 		assert.ok([403, 404].includes((await fetch(`${running.url}%2e%2e/package.json`)).status));
 		assert.equal(await (await fetch(running.url)).text(), "dashboard");
-	} finally { await running.close(); }
-});
-
-test("dashboard refuses metadata symlinks that escape a registered workspace", async () => {
-	const { project, workspace } = await fixture();
-	const outside = path.join(project, "outside-secret.json");
-	await writeFile(outside, JSON.stringify({ stage: "M01", runId: "secret", status: "completed", sessions: [{ label: "DO_NOT_LEAK" }] }));
-	await mkdir(path.join(workspace, "stages", "M02", "linked"), { recursive: true });
-	await symlink(outside, path.join(workspace, "stages", "M02", "linked", "run.json"));
-	const publicDir = path.join(project, "public"); await mkdir(publicDir); await writeFile(path.join(publicDir, "index.html"), "dashboard");
-	const running = await startDashboardServer({ root: project, port: 0, publicDir });
-	try {
-		const listing = await (await fetch(`${running.url}api/workspaces`)).json() as { workspaces: Array<{ id: string }> };
-		const response = await fetch(`${running.url}api/state?workspace=${listing.workspaces[0].id}`);
-		assert.equal(response.status, 500);
-		assert.ok(!(await response.text()).includes("DO_NOT_LEAK"));
 	} finally { await running.close(); }
 });

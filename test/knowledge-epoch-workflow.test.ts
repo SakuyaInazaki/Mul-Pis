@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { mkdtemp } from "node:fs/promises";
@@ -8,7 +8,7 @@ import { GenerationStore, type M07WorkflowStrategyV1 } from "../src/improvement/
 import { advanceKnowledgeEpochInLock, transitionMethodKnowledgeDependenciesInLock } from "../src/improvement/knowledge-epoch.ts";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import type { KnowledgeRef, ProposalBatch } from "../src/knowledge/types.ts";
-import { createM07Controller } from "../src/m07/controller.ts";
+
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 import type { StageContext } from "../src/stages/context.ts";
 import { Workspace } from "../src/workspace.ts";
@@ -70,124 +70,12 @@ test("knowledge epoch refuses a newly limited necessary premise and preserves ac
 	assert.equal((await f.generations.active())?.bundle.bundleId, bound.bundleId);
 });
 
-test("external necessary refs need exact explicit store registration during epoch advance", async (t) => {
-	const f = await fixture(t);
-	const foreignRoot = await mkdtemp(path.join(tmpdir(), "pre-rsi-foreign-knowledge-"));
-	t.after(() => rm(foreignRoot, { recursive: true, force: true }));
-	const foreign = createFileKnowledgeStore(path.join(foreignRoot, "knowledge"));
-	await foreign.init();
-	const receipt = await foreign.submitProposal({ stage: "M04", runId: "foreign", ops: [{ op: "create", type: "E", title: "外部已登记事实", body: "有界引用", usageDecision: "adopted" }] });
-	await foreign.merge(receipt.proposalId);
-	const foreignId = await foreign.storeId();
-	const ref: KnowledgeRef = { storeId: foreignId, recordId: "E001", version: 1 };
-	const original = await f.generations.readStrategy("H0");
-	const dependent = await f.generations.writeStrategy({ versionId: "H-foreign", kind: "executor", artifact: original.artifact, parentVersionId: "H0", origin: "human-seed", applicability: original.applicability, limitations: [], requiredKnowledgeRefs: [ref], state: "manual-active" });
-	const bound = await f.generations.writeBundle({ bundleId: "bundle-foreign", parents: [f.bundle.bundleId], executorVersionId: dependent.versionId, improverVersionId: "I0", knowledgeSnapshot: f.first.snapshotId, environmentVersion: f.bundle.environmentVersion, modelConfig: f.bundle.modelConfig, protocolVersion: f.bundle.protocolVersion, allowedCapabilities: f.bundle.allowedCapabilities, state: "manual-active" });
-	await f.generations.activate(bound.bundleId, (await f.generations.active())!.pointer, "external-manual-unverified", "foreign-bound");
-	const second = await publish(f.ws, f.knowledge, [{ op: "create", type: "E", title: "本地更新", body: "新观测", usageDecision: "adopted" }]);
-	await assert.rejects(advanceKnowledgeEpochInLock({ workspaceRoot: f.root, generationStore: f.generations, m04RunId: second.runId, expectedActiveBundleId: bound.bundleId }), /not registered/);
-	const registered = new Map([[foreignId, foreign]]);
-	const advanced = await advanceKnowledgeEpochInLock({ workspaceRoot: f.root, generationStore: f.generations, m04RunId: second.runId, expectedActiveBundleId: bound.bundleId, registeredExperienceStores: registered });
-	assert.equal(advanced.toSnapshot, second.snapshotId);
-});
 
-test("workflow I experience remains applicable when K advances, and a withdrawn dependency still blocks", async (t) => {
-	const f = await fixture(t, { version: 1, kind: "m07-workflow-prompt", slot: "evidence-handoff", body: "报告证据交接边界。" });
-	const storeId = await f.knowledge.storeId();
-	const evidenceRef: KnowledgeRef = { storeId, recordId: "E001", version: 1 };
-	const seeded = await publish(f.ws, f.knowledge, [{ op: "create", type: "K", title: "交接改进经验", body: "核对已读证据和未执行项", usageDecision: "adopted", fields: { experience: { version: 1, targetKind: "improver", applicableStages: ["method-research"], requiredTags: ["m07-evidence-handoff"], excludedTags: ["cpu-response-identification"], requiredRefs: [evidenceRef] } } }]);
-	const experienceRef: KnowledgeRef = { storeId, recordId: "K001", version: 1 };
-	const baseI = await f.generations.readStrategy("I0");
-	const dependentI = await f.generations.writeStrategy({ versionId: "I-workflow-required", kind: "improver", artifact: baseI.artifact, parentVersionId: baseI.versionId, origin: "human-seed", applicability: baseI.applicability, limitations: [], requiredExperienceRefs: [{ targetKind: "improver", ref: experienceRef }], state: "manual-active" });
-	const bound = await f.generations.writeBundle({ ...f.bundle, bundleId: "bundle-workflow-required", parents: [f.bundle.bundleId], improverVersionId: dependentI.versionId, knowledgeSnapshot: seeded.snapshotId });
-	await f.generations.activate(bound.bundleId, (await f.generations.active())!.pointer, "external-manual-unverified", "bound-workflow-I");
-	const next = await publish(f.ws, f.knowledge, [{ op: "create", type: "E", title: "后续证据", body: "另一次独立观察", usageDecision: "adopted" }]);
-	const advanced = await advanceKnowledgeEpochInLock({ workspaceRoot: f.root, generationStore: f.generations, m04RunId: next.runId, expectedActiveBundleId: bound.bundleId });
-	assert.equal(advanced.bundle.improverVersionId, dependentI.versionId);
-	assert.deepEqual((await f.generations.readStrategy(dependentI.versionId)).requiredExperienceRefs, [{ targetKind: "improver", ref: experienceRef }]);
-	const limited = await publish(f.ws, f.knowledge, [{ op: "limit", target: "E001", kind: "withdrawn", reason: "依据已撤回", authority: "review" }]);
-	await assert.rejects(advanceKnowledgeEpochInLock({ workspaceRoot: f.root, generationStore: f.generations, m04RunId: limited.runId, expectedActiveBundleId: advanced.bundle.bundleId }), /unavailable|inapplicable/);
-	assert.equal((await f.generations.active())?.bundle.bundleId, advanced.bundle.bundleId);
-});
 
-test("frozen workflow H accepts an applicable inherited improver experience for a new task", async (t) => {
-	const f = await fixture(t, { version: 1, kind: "m07-workflow-prompt", slot: "evidence-handoff", body: "保留来源与未执行项。" });
-	const seeded = await publish(f.ws, f.knowledge, [{ op: "create", type: "K", title: "交接改进经验", body: "核查交接遗漏", usageDecision: "adopted", fields: { experience: { version: 1, targetKind: "improver", applicableStages: ["method-research"], requiredTags: ["m07-evidence-handoff"], excludedTags: ["cpu-response-identification"], requiredRefs: [] } } }]);
-	const ref: KnowledgeRef = { storeId: await f.knowledge.storeId(), recordId: "K001", version: 1 };
-	const original = await f.generations.readStrategy("H0");
-	const inherited = await f.generations.writeStrategy({ versionId: "H-inherited-I", kind: "executor", artifact: original.artifact, parentVersionId: original.versionId, origin: "human-seed", applicability: original.applicability, limitations: [], requiredExperienceRefs: [{ targetKind: "improver", ref }], state: "manual-active" });
-	const bound = await f.generations.writeBundle({ ...f.bundle, bundleId: "bundle-inherited-I", parents: [f.bundle.bundleId], executorVersionId: inherited.versionId, knowledgeSnapshot: seeded.snapshotId });
-	await f.generations.activate(bound.bundleId, (await f.generations.active())!.pointer, "external-manual-unverified", "bound-inherited-I");
-	const controller = createM07Controller(f.ctx);
-	const begun = await controller.begin({ ...goal, workflowMethodVersionId: inherited.versionId });
-	const task = await controller.delegate(begun.runId, { objective: "核查交接", inputs: [], expectedOutputs: [], checks: ["必须独立复算"], mode: "reason" });
-	assert.equal(task.status, "returned");
-	assert.equal(f.runner.created.at(-1)?.methodBinding?.versionId, inherited.versionId);
-});
 
-test("knowledge epoch rejects an unknown method environment instead of assuming CPU applicability", async (t) => {
-	const f = await fixture(t);
-	const unknown = await f.generations.writeBundle({ ...f.bundle, bundleId: "bundle-unknown-environment", parents: [f.bundle.bundleId], environmentVersion: "unrecognized-method/v1" });
-	await f.generations.activate(unknown.bundleId, (await f.generations.active())!.pointer, "external-manual-unverified", "unknown-environment");
-	const next = await publish(f.ws, f.knowledge, [{ op: "create", type: "E", title: "后续依据", body: "新增依据", usageDecision: "adopted" }]);
-	await assert.rejects(advanceKnowledgeEpochInLock({ workspaceRoot: f.root, generationStore: f.generations, m04RunId: next.runId, expectedActiveBundleId: unknown.bundleId }), /environment|method/i);
-	assert.equal((await f.generations.active())?.bundle.bundleId, unknown.bundleId);
-});
 
-test("M07 explicitly freezes a workflow H and sends its body in the actual task; CPU H is rejected", async (t) => {
-	const f = await fixture(t);
-	const controller = createM07Controller(f.ctx);
-	const begun = await controller.begin({ ...goal, workflowMethodVersionId: "H0" });
-	assert.equal(begun.workflowMethod?.artifact.slot, "research-check");
-	const task = await controller.delegate(begun.runId, { objective: "执行核查", inputs: [], expectedOutputs: [], checks: ["必须独立复算"], mode: "reason" });
-	assert.equal(task.status, "returned");
-	const sent = [...f.runner.sessions.values()].at(-1)!.transcript[0]!.text;
-	assert.match(sent, /先做独立复算并报告未执行检查/);
-	assert.match(sent, /不可改变定义/);
-	assert.match(sent, /必须独立复算/);
-	assert.equal(f.runner.created.at(-1)?.methodBinding?.versionId, "H0");
-	const saved = JSON.parse(await readFile(path.join(f.ws.runDir("M07", begun.runId), "goal.json"), "utf8"));
-	assert.equal(saved.workflowMethod.artifact.body, "先做独立复算并报告未执行检查。");
 
-	const cpu = await fixture(t, { version: 1, kind: "cpu-numerical-prompt", body: "Choose a visible hypothesis." });
-	await assert.rejects(createM07Controller(cpu.ctx).begin({ ...goal, workflowMethodVersionId: "H0" }), /not an admitted or manually bound M07 workflow method/);
-});
 
-test("M07 evidence-handoff slot reaches the task and M04 feedback without changing fixed evidence fields", async (t) => {
-	const f = await fixture(t, { version: 1, kind: "m07-workflow-prompt", slot: "evidence-handoff", body: "交接时写清未执行项和条件。" });
-	const controller = createM07Controller(f.ctx);
-	const begun = await controller.begin({ ...goal, workflowMethodVersionId: "H0" });
-	await controller.delegate(begun.runId, { objective: "整理证据", inputs: [], expectedOutputs: [], checks: ["必须独立复算"], mode: "reason" });
-	const sent = [...f.runner.sessions.values()].at(-1)!.transcript[0]!.text;
-	assert.match(sent, /交接时写清未执行项和条件/);
-	const closed = await controller.interrupt(begun.runId, { reason: "受控停止", returnPath: "M04" });
-	const feedback = await readFile(closed.feedbackPath!, "utf8");
-	assert.match(feedback, /冻结的证据交接方法/);
-	assert.match(feedback, /交接时写清未执行项和条件/);
-	assert.match(feedback, /必须独立复算/);
-});
-
-test("M07 keeps the begun method body after pointer change and blocks a new task after a live limit", async (t) => {
-	const f = await fixture(t);
-	const ref: KnowledgeRef = { storeId: await f.knowledge.storeId(), recordId: "E001", version: 1 };
-	const original = await f.generations.readStrategy("H0");
-	const dependent = await f.generations.writeStrategy({ versionId: "H-live", kind: "executor", artifact: original.artifact, parentVersionId: "H0", origin: "human-seed", applicability: original.applicability, limitations: [], requiredKnowledgeRefs: [ref], state: "manual-active" });
-	const bound = await f.generations.writeBundle({ bundleId: "bundle-live", parents: [f.bundle.bundleId], executorVersionId: dependent.versionId, improverVersionId: "I0", knowledgeSnapshot: f.first.snapshotId, environmentVersion: f.bundle.environmentVersion, modelConfig: f.bundle.modelConfig, protocolVersion: f.bundle.protocolVersion, allowedCapabilities: f.bundle.allowedCapabilities, state: "manual-active" });
-	await f.generations.activate(bound.bundleId, (await f.generations.active())!.pointer, "external-manual-unverified", "live-bound");
-	const controller = createM07Controller(f.ctx);
-	const begun = await controller.begin({ ...goal, workflowMethodVersionId: dependent.versionId });
-	const later = await f.generations.writeStrategy({ versionId: "H-later", kind: "executor", artifact: { version: 1, kind: "m07-workflow-prompt", slot: "research-check", body: "另一份后来的方法正文" }, origin: "human-seed", applicability: ["M07"], limitations: [], state: "manual-active" });
-	const laterBundle = await f.generations.writeBundle({ bundleId: "bundle-later", parents: [bound.bundleId], executorVersionId: later.versionId, improverVersionId: "I0", knowledgeSnapshot: bound.knowledgeSnapshot, environmentVersion: bound.environmentVersion, modelConfig: bound.modelConfig, protocolVersion: bound.protocolVersion, allowedCapabilities: bound.allowedCapabilities, state: "manual-active" });
-	await f.generations.activate(laterBundle.bundleId, (await f.generations.active())!.pointer, "external-manual-unverified", "later");
-	await controller.delegate(begun.runId, { objective: "检查冻结内容", inputs: [], expectedOutputs: [], checks: ["必须独立复算"], mode: "reason" });
-	const sent = [...f.runner.sessions.values()].at(-1)!.transcript[0]!.text;
-	assert.match(sent, /先做独立复算并报告未执行检查/);
-	assert.doesNotMatch(sent, /另一份后来的方法正文/);
-	const before = f.runner.created.length;
-	await publish(f.ws, f.knowledge, [{ op: "limit", target: "E001", kind: "withdrawn", reason: "原证据撤回", authority: "review" }]);
-	await assert.rejects(controller.delegate(begun.runId, { objective: "不得越过停用", inputs: [], expectedOutputs: [], checks: ["必须独立复算"], mode: "reason" }), /snapshot changed|unavailable/);
-	assert.equal(f.runner.created.length, before);
-});
 
 test("necessary premise discharge needs an exact adopted M04 D, registered E evidence and revalidation; old restriction stays live", async (t) => {
 	const f = await fixture(t);

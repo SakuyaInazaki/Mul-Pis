@@ -8,8 +8,10 @@ import type {
 	Snapshot,
 } from "./types.ts";
 import { RECORD_TYPES } from "./types.ts";
+import { HarnessError } from "../types.ts";
 
 export interface PackState {
+	storeId: string;
 	snapshot?: Snapshot;
 	latest: KnowledgeRecord[];
 	resolve(id: string, version?: number): Promise<KnowledgeRecord | undefined>;
@@ -66,6 +68,7 @@ export function renderKnowledgeRecord(record: KnowledgeRecord, availability: Ava
 		`- 当前可用性：${availability.availability}（${reasons}）`,
 		`- 生效限制：${limitText}`,
 		`- 情境：${scope}`,
+		`- 原始记录元数据（fields；非采用判断）：${JSON.stringify(record.fields)}`,
 		`- 关系：${refs}`,
 		"",
 		record.body.trim(),
@@ -117,11 +120,14 @@ export async function buildKnowledgePack(query: PackQuery, state: PackState): Pr
 		"# 局部知识包",
 		"",
 		`- 快照：${state.snapshot?.id ?? "未发布"}`,
+		`- 本库 storeId：${state.storeId}`,
 		`- 用途：${query.purpose}`,
 		"",
 		"入库不等于科学认证；当前可用性是派生判断",
 		"",
 	].join("\n");
+	if (query.maxChars !== undefined && header.length > query.maxChars)
+		throw new HarnessError("knowledge.pack", "knowledge pack header exceeds character budget");
 
 	const kept = [...rendered];
 	const omitted: string[] = [];
@@ -133,14 +139,22 @@ export async function buildKnowledgePack(query: PackQuery, state: PackState): Pr
 		}
 		return groups.join("\n");
 	};
-	const truncationLine = (): string => (omitted.length ? `\n（已按长度截断，未展开：${omitted.join("、")}）\n` : "");
-	let markdown = `${header}${renderBody()}${truncationLine()}`;
+	const renderMarkdown = (): string => {
+		const base = `${header}${renderBody()}`;
+		if (!omitted.length) return base;
+		const detailed = `\n（已按长度截断，未展开：${omitted.join("、")}）\n`;
+		if (query.maxChars === undefined || base.length + detailed.length <= query.maxChars) return base + detailed;
+		const compact = `\n（未展开 ${omitted.length} 项）\n`;
+		if (base.length + compact.length <= query.maxChars || kept.length) return base + compact;
+		return base;
+	};
+	let markdown = renderMarkdown();
 	if (query.maxChars !== undefined) {
 		while (kept.length && markdown.length > query.maxChars) {
 			const removed = kept.pop();
 			if (!removed) break;
 			omitted.unshift(removed.record.id);
-			markdown = `${header}${renderBody()}${truncationLine()}`;
+			markdown = renderMarkdown();
 		}
 	}
 

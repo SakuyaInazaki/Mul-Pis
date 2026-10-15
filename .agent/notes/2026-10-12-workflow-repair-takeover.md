@@ -1,0 +1,9 @@
+# Workflow repair baseline and offline verification
+
+This repair batch used a separate worktree and retained the original checkout and its uncommitted changes. The supplied handoff and its earlier test totals were treated as historical evidence. Verification for this batch used local dependencies and offline suites. The scope was concrete workflow defects and removal of redundant or obstructive code; no new orchestration platform was added.
+
+The installed TypeScript and Node type definitions exposed a `RequestInit.cache` declaration mismatch in three Node-only metadata requests. Those requests now send equivalent no-cache headers supported by the installed transport, with a focused availability regression. A transcript stream callback now uses its inferred type and counts UTF-8 bytes, preserving the existing file-size check.
+
+Other repairs in this batch let M04 request missing evidence ranges after a correctable read failure, reduce repeated historical context in the default objective assessor, canonicalize newly recorded mission roots, reuse the shared process identity probe in the resume journal, and make offline fixtures portable across macOS path aliases. Linux-only compiled evaluator and process-census tests declare their platform requirement. The manual M01 smoke entry decodes its local file URL before comparison. The corresponding focused notes describe each change.
+
+After the source and tests in this group were frozen, the full offline Node suite passed with 1,546 passed, 16 skipped and zero failed; TypeScript typecheck and whitespace checks passed. Python transport and browser test suites also passed, 35 tests combined. A later evidence-path count repair passed its focused M07/archive tests and typecheck, but was not part of that full-suite run. These are offline engineering checks; they do not establish real-model reliability or scientific benefit.

@@ -32,6 +32,10 @@ export async function resolveExpectedOutputFiles(workDir: string, expectedPaths:
 			result.push({ declared, files: [], error: "预期产物未实际提交：" + path.relative(workDir, declared) });
 			continue;
 		}
+		if ((await lstat(declared)).isSymbolicLink()) {
+			result.push({ declared, files: [], error: "预期产物含链接或特殊文件：" + path.relative(workDir, declared) });
+			continue;
+		}
 		const actual = await realpath(declared);
 		if (inside(workReal, actual) === false) {
 			result.push({ declared, files: [], error: "预期产物不在任务目录：" + path.relative(workDir, declared) });
@@ -43,16 +47,30 @@ export async function resolveExpectedOutputFiles(workDir: string, expectedPaths:
 			continue;
 		}
 		if (stat.isDirectory()) {
-			const entries = await readdir(actual, { withFileTypes: true });
 			const files: string[] = [];
-			for (const entry of entries) {
-				if (entry.isFile() === false) continue;
-				const child = path.join(actual, entry.name);
-				const childReal = await realpath(child);
-				if (inside(workReal, childReal) === false) continue;
-				files.push(childReal);
+			const pending = [actual];
+			let error: string | undefined;
+			while (pending.length && !error) {
+				const directory = pending.pop()!;
+				for (const entry of await readdir(directory, { withFileTypes: true })) {
+					const child = path.join(directory, entry.name);
+					const childStat = await lstat(child);
+					if (!childStat.isFile() && !childStat.isDirectory()) {
+						error = "预期产物含链接或特殊文件：" + path.relative(workDir, child);
+						break;
+					}
+					const childReal = await realpath(child);
+					if (!inside(workReal, childReal) || !inside(actual, childReal)) {
+						error = "预期产物不在声明目录：" + path.relative(workDir, child);
+						break;
+					}
+					if (childStat.isDirectory()) pending.push(childReal);
+					else files.push(childReal);
+				}
 			}
-			if (files.length === 0) result.push({ declared, files: [], error: "预期产物目录为空：" + path.relative(workDir, declared) });
+			files.sort();
+			if (error) result.push({ declared, files: [], error });
+			else if (files.length === 0) result.push({ declared, files: [], error: "预期产物目录为空：" + path.relative(workDir, declared) });
 			else result.push({ declared, files });
 			continue;
 		}

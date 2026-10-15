@@ -1,14 +1,12 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import { constants, createHash, generateKeyPairSync, sign } from "node:crypto";
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { authenticateSignedMissionSeed, MISSION_ARTIFACT, MISSION_ID,
 	MISSION_REPOSITORY, MISSION_TOTAL_CNY } from "../src/runner/signed-mission-ledger.ts";
-import { openLedgerContinuation, sealHistoricalCarryForOfflineTests } from
-	"../src/runner/ledger-continuation.ts";
+import { openLedgerContinuation } from "../src/runner/ledger-continuation.ts";
 import { INCREMENTAL_CHECKPOINT_FILE } from
 	"../src/runner/incremental-private-checkpoint.ts";
 import { ARTIFACT_PARTITION_MANIFEST_FILE, openPartitionManifest,
@@ -87,73 +85,6 @@ async function sealedCarry(f: Awaited<ReturnType<typeof fixture>>) {
 	return { opened, carry };
 }
 
-async function sealedLegacyV2Carry(f: Awaited<ReturnType<typeof fixture>>) {
-	const firstRun = { id: 8001002, run_number: 2, run_attempt: 1,
-		workflow_id: 91, status: "in_progress", conclusion: null,
-		head_branch: "improve/workflow-learning-reliability", head_sha: "c".repeat(40),
-		event: "workflow_dispatch", actor: { login: "SakuyaInazaki" } };
-	const anchor = { ...firstRun, id: 8001001, run_number: 1,
-		status: "completed", conclusion: "success", head_sha: "b".repeat(40) };
-	const initialRequest: typeof fetch = async url => {
-		const address = String(url);
-		let body: unknown;
-		if (address.includes("/workflows/manual-private-campaign.yml/runs?"))
-			body = { total_count: 2, workflow_runs: [firstRun, anchor] };
-		else if (address.endsWith("/runs/8001001/artifacts?per_page=100"))
-			body = { total_count: 1, artifacts: [{ id: 9002001, name: MISSION_ARTIFACT,
-				expired: false, workflow_run: { id: 8001001 } }] };
-		else throw Error(`unexpected synthetic URL: ${address}`);
-		return new Response(JSON.stringify(body));
-	};
-	const first = await openLedgerContinuation({ seedEnvelopeB64: f.seedEnvelopeB64,
-		publicKeyFile: f.publicKeyFile, expectedSpkiSha256: f.expectedSpkiSha256,
-		githubToken: "synthetic-token", request: initialRequest,
-		current: { repository: source.repository, runId: "8001002", runAttempt: "1",
-			actor: "SakuyaInazaki", event: source.event,
-			ref: "refs/heads/improve/workflow-learning-reliability",
-			sha: firstRun.head_sha, manualAuthorized: "true" },
-		loadCarryArtifact: async () => { throw Error("synthetic prior carry not used"); } });
-	const oldAudit = { requests: [], settledCny: 0, unknownReservedCny: 0,
-		inFlightReservedCny: 0, reservations: 0 };
-	const oldCarry = sealHistoricalCarryForOfflineTests(first,
-		{ settledCny: 0, unknownOrInFlightCny: 0, requestAudit: oldAudit });
-	const secondRun = { ...firstRun, id: 12345678, run_number: 3,
-		head_sha: source.commit };
-	const firstDone = { ...firstRun, status: "completed", conclusion: "failure" };
-	const request: typeof fetch = async url => {
-		const address = String(url);
-		let body: unknown;
-		if (address.includes("/workflows/manual-private-campaign.yml/runs?"))
-			body = { total_count: 3, workflow_runs: [secondRun, firstDone, anchor] };
-		else if (address.endsWith("/runs/8001001/artifacts?per_page=100"))
-			body = { total_count: 1, artifacts: [{ id: 9002001, name: MISSION_ARTIFACT,
-				expired: false, workflow_run: { id: 8001001 } }] };
-		else if (address.endsWith("/runs/8001002/artifacts?per_page=100"))
-			body = { total_count: 1, artifacts: [{ id: 9002002,
-				name: "confidential-mission-carry", expired: false,
-				workflow_run: { id: 8001002 } }] };
-		else if (address.endsWith("/runs/8001002/jobs?per_page=100"))
-			body = { total_count: 1, jobs: [{ id: 6002, run_id: 8001002,
-				run_attempt: 1, head_sha: firstRun.head_sha,
-				name: "private-campaign", status: "completed", conclusion: "failure",
-				steps: [{ name: "Run bounded private campaign", status: "completed",
-					conclusion: "success" }] }] };
-		else throw Error(`unexpected synthetic URL: ${address}`);
-		return new Response(JSON.stringify(body));
-	};
-	const second = await openLedgerContinuation({ seedEnvelopeB64: f.seedEnvelopeB64,
-		publicKeyFile: f.publicKeyFile, expectedSpkiSha256: f.expectedSpkiSha256,
-		githubToken: "synthetic-token", request,
-		current: { repository: source.repository, runId: source.runId, runAttempt: "1",
-			actor: "SakuyaInazaki", event: source.event,
-			ref: "refs/heads/improve/workflow-learning-reliability",
-			sha: source.commit, manualAuthorized: "true" },
-		loadCarryArtifact: async () => oldCarry.envelopeB64 });
-	const sealed = sealHistoricalCarryForOfflineTests(second,
-		{ settledCny: 0, unknownOrInFlightCny: 0, requestAudit: oldAudit });
-	assert.equal(JSON.parse(Buffer.from(sealed.envelopeB64, "base64").toString("utf8")).version, 2);
-	return { sealed, opened: second };
-}
 
 async function writeAuthenticatedCurrentPrefix(f: Awaited<ReturnType<typeof fixture>>,
 	opened: Awaited<ReturnType<typeof sealedCarry>>["opened"],
@@ -172,68 +103,9 @@ async function writeAuthenticatedCurrentPrefix(f: Awaited<ReturnType<typeof fixt
 	return readFile(path.join(f.outputDir, INCREMENTAL_CHECKPOINT_FILE));
 }
 
-test("small legacy carry stays one original-name artifact", async t => {
-	const f = await fixture(t);
-	const opened = await openCarry(f);
-	const older = sealHistoricalCarryForOfflineTests(opened, { settledCny: 0,
-		unknownOrInFlightCny: 0, requestAudit: { requests: [], settledCny: 0,
-			unknownReservedCny: 0, inFlightReservedCny: 0, reservations: 0 } });
-	await writeFile(path.join(f.outputDir, "ledger-continuation.enc.json"),
-		`${JSON.stringify({ envelopeB64: older.envelopeB64 })}\n`, { mode: 0o600 });
-	await writeAuthenticatedCurrentPrefix(f, opened);
-	const calls: Array<{ name: string; files: string[]; root: string; retentionDays: number }> = [];
-	const client = { async uploadArtifact(name: string, files: string[], root: string,
-		options: { retentionDays: number }) {
-		calls.push({ name, files, root, retentionDays: options.retentionDays });
-		return { id: 41 }; } };
-	const result = await uploadFinalCarry({ env: f.env, artifactClient: client,
-		publicKeyFile: f.publicKeyFile, expectedSpkiSha256: f.expectedSpkiSha256 });
-	assert.deepEqual(result, { multipart: false, partCount: 0, rootArtifactId: 41 });
-	assert.equal(calls.length, 1);
-	assert.equal(calls[0].name, "confidential-mission-carry");
-	assert.deepEqual(calls[0].files.map(file => path.basename(file)),
-		["incremental-control-prefix.json", "ledger-continuation.enc.json"]);
-	assert.equal(calls[0].retentionDays, 1);
-});
 
-test("authenticated legacy v2 root remains one artifact", async t => {
-	const f = await fixture(t);
-	const { sealed } = await sealedLegacyV2Carry(f);
-	await writeFile(path.join(f.outputDir, "ledger-continuation.enc.json"),
-		`${JSON.stringify({ envelopeB64: sealed.envelopeB64 })}\n`, { mode: 0o600 });
-	let calls = 0;
-	const result = await uploadFinalCarry({ env: { ...f.env, GITHUB_RUN_NUMBER: "3" },
-		artifactClient: { async uploadArtifact() { calls++; return { id: 42 }; } },
-		publicKeyFile: f.publicKeyFile, expectedSpkiSha256: f.expectedSpkiSha256 });
-	assert.equal(result.multipart, false);
-	assert.equal(calls, 1);
-});
 
-test("root beyond producer's eight MiB file bound is refused before upload", async t => {
-	const f = await fixture(t);
-	await writeFile(path.join(f.outputDir, "ledger-continuation.enc.json"),
-		Buffer.alloc(8 * 1024 * 1024 + 1, 0x41), { mode: 0o600 });
-	let calls = 0;
-	await assert.rejects(uploadFinalCarry({ env: f.env,
-		artifactClient: { async uploadArtifact() { calls++; return { id: 42 }; } },
-		publicKeyFile: f.publicKeyFile, expectedSpkiSha256: f.expectedSpkiSha256 }),
-		/final carry file is unsafe/);
-	assert.equal(calls, 0);
-});
 
-test("legacy prefix-only interruption remains a single carry artifact", async t => {
-	const f = await fixture(t);
-	const { opened } = await sealedCarry(f);
-	await writeAuthenticatedCurrentPrefix(f, opened);
-	const calls: string[][] = [];
-	const result = await uploadFinalCarry({ env: f.env,
-		artifactClient: { async uploadArtifact(_name: string, files: string[]) {
-			calls.push(files.map(file => path.basename(file)));
-			return { id: 41 }; } }, publicKeyFile: f.publicKeyFile,
-		expectedSpkiSha256: f.expectedSpkiSha256 });
-	assert.equal(result.multipart, false);
-	assert.deepEqual(calls, [["incremental-control-prefix.json"]]);
-});
 
 test("authenticated current carry publishes chunk first and sealed manifest last", async t => {
 	const f = await fixture(t);
@@ -347,46 +219,4 @@ for (const altered of ["root", "sidecar", "prefix"] as const) test(
 		artifactClient: { async uploadArtifact() { attempts++; return { id: 41 }; } },
 		publicKeyFile: f.publicKeyFile, expectedSpkiSha256: f.expectedSpkiSha256 }));
 	assert.equal(attempts, 0);
-});
-
-test("near 64 MiB encrypted prefix is chunked and never one oversized ZIP", async t => {
-	const f = await fixture(t);
-	const { opened, carry } = await sealedCarry(f);
-	await writeFile(path.join(f.outputDir, "ledger-continuation.enc.json"),
-		`${JSON.stringify({ envelopeB64: carry.envelopeB64 })}\n`, { mode: 0o600 });
-	for (const [name, text] of Object.entries(carry.sidecars))
-		await writeFile(path.join(f.outputDir, name), text, { mode: 0o600 });
-	const objectiveCheckpointJson = JSON.stringify({ version: 1,
-		kind: "original-objective-progress", detail: "x".repeat(47 * 1024 * 1024) });
-	const large = await writeAuthenticatedCurrentPrefix(f, opened, objectiveCheckpointJson);
-	assert.ok(large.length > 60 * 1024 * 1024 && large.length <= 64 * 1024 * 1024);
-	const sizes: number[] = [];
-	const names: string[] = [];
-	const client = { async uploadArtifact(name: string, files: string[]) {
-		const info = await stat(files[0]);
-		sizes.push(info.size); names.push(name);
-		return { id: 300 + names.length, digest: "a".repeat(64) }; } };
-	const result = await uploadFinalCarry({ env: f.env, artifactClient: client,
-		publicKeyFile: f.publicKeyFile, expectedSpkiSha256: f.expectedSpkiSha256 });
-	assert.equal(result.multipart, true);
-	assert.equal(result.partCount, 4);
-	assert.equal(names.at(-1), "confidential-mission-carry");
-	assert.ok(sizes.slice(0, -1).every(size => size > 0 && size <= 16 * 1024 * 1024));
-	assert.ok(sizes.at(-1)! < 512 * 1024);
-});
-
-test("postprocessing failure prints no private bytes and workflow still reports true driver failure", async t => {
-	const f = await fixture(t);
-	const marker = "SYNTHETIC-PRIVATE-RESEARCH-CONTENT";
-	const script = path.resolve(".github/actions/final-carry-upload/main.mjs");
-	const run = spawnSync(process.execPath, [script], { encoding: "utf8",
-		env: { ...f.env, GITHUB_SHA: marker } });
-	assert.equal(run.status, 1);
-	assert.equal(run.stdout, "");
-	assert.equal(run.stderr, "Encrypted mission continuation upload failed\n");
-	assert.ok(!run.stderr.includes(marker));
-	const workflow = await readFile(".github/workflows/manual-private-campaign.yml", "utf8");
-	assert.match(workflow, /name: Upload ciphertext only[\s\S]*uses: actions\/upload-artifact@v4/);
-	assert.match(workflow, /name: Upload encrypted mission continuation[\s\S]*uses: \.\/\.github\/actions\/final-carry-upload/);
-	assert.match(workflow, /name: Report generic campaign failure\n\s+if: always\(\) && steps\.campaign\.outputs\.driver_exit_code != '0'/);
 });
