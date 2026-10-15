@@ -727,6 +727,10 @@ export class ClaudeSessionRunner implements SessionRunner {
 						// A plain string replaces the default prompt, so the stage's prompt is used verbatim.
 						systemPrompt: state.spec.systemPrompt,
 						model: resolved.modelId,
+						// A supplied title skips the substrate's automatic title generation, which
+						// would otherwise be a second, unaccounted model call carrying this
+						// stage's message. On resume the persisted title already wins.
+						title: `${state.spec.label} ${state.ref.id}`,
 						...(resolved.effort ? { effort: resolved.effort } : {}),
 						...(resolved.thinking ? { thinking: resolved.thinking } : {}),
 						allowedTools: grant.allowedTools,
