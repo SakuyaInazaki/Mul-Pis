@@ -425,7 +425,13 @@ export class ClaudeSessionRunner implements SessionRunner {
 
 	async resume(ref: SessionRef): Promise<SessionHandle> {
 		const live = this.states.get(ref.id);
-		if (live) {
+		// A disposed session stays in the live map, so a later legitimate resume
+		// used to receive a handle over a state already marked disposed and every
+		// prompt on it failed with `runner.aborted`. Dropping it here lets the
+		// persisted path below rebuild the session from its own spec, transcript
+		// and conversation id, which is the same path a fresh process takes.
+		if (live?.disposed) this.states.delete(ref.id);
+		else if (live) {
 			if (live.ref.file !== ref.file || live.ref.specFile !== ref.specFile)
 				throw new HarnessError("runner.persistence", `session ${ref.id} persisted paths differ from the live record`);
 			if (ref.methodBinding && JSON.stringify(ref.methodBinding) !== JSON.stringify(live.spec.methodBinding))
