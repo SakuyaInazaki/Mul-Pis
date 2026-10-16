@@ -752,6 +752,12 @@ export class ClaudeSessionRunner implements SessionRunner {
 					let result: Record<string, unknown> | undefined;
 					let activeTools: string[] | undefined;
 					const builtinCalls = new Map<string, { name: string; args: Record<string, unknown>; at: string }>();
+					// A turn that reaches the substrate's output-token boundary is continued
+					// automatically, and `result.result` then carries only the LAST segment.
+					// The stage must receive the model's whole answer, so every segment is
+					// accumulated and joined whenever such a continuation actually happened.
+					const assistantTexts: string[] = [];
+					let outputLimitContinuations = 0;
 					for await (const message of query({ prompt: text, options }) as AsyncIterable<SDKMessage>) {
 						const envelope = message as unknown as Record<string, unknown>;
 						if (envelope.type === "result") { result = envelope; continue; }
@@ -773,6 +779,7 @@ export class ClaudeSessionRunner implements SessionRunner {
 						if (envelope.type === "assistant") {
 							const content = (envelope.message as { content?: unknown[] } | undefined)?.content ?? [];
 							for (const block of content as Array<Record<string, unknown>>) {
+								if (block.type === "text" && typeof block.text === "string") assistantTexts.push(block.text);
 								if (block.type !== "tool_use" || typeof block.name !== "string") continue;
 								if (block.name.startsWith(`mcp__${HARNESS_SERVER}__`)) continue;
 								builtinCalls.set(String(block.id), {
@@ -782,6 +789,14 @@ export class ClaudeSessionRunner implements SessionRunner {
 							}
 						} else if (envelope.type === "user") {
 							const content = (envelope.message as { content?: unknown[] } | undefined)?.content ?? [];
+							// The substrate announces an output-boundary continuation as a user
+							// turn. Count it so the segments above are joined instead of the
+							// stage receiving only the tail of a long answer.
+							const raw = (envelope.message as { content?: unknown } | undefined)?.content;
+							const notice = typeof raw === "string" ? raw
+								: (content as Array<Record<string, unknown>>)
+									.map((b) => (typeof b?.text === "string" ? b.text : "")).join("");
+							if (notice.startsWith("Output token limit hit")) outputLimitContinuations += 1;
 							for (const block of content as Array<Record<string, unknown>>) {
 								if (block.type !== "tool_result") continue;
 								const call = builtinCalls.get(String(block.tool_use_id));
@@ -824,7 +839,10 @@ export class ClaudeSessionRunner implements SessionRunner {
 					}
 					if (result.is_error === true || stopReason !== "stop")
 						throw new HarnessError("runner.stop", `session ${state.ref.label} did not stop normally (stopReason=${stopReason})`);
-					const reply = result.result;
+					const joined = assistantTexts.join("");
+					const reply = outputLimitContinuations > 0 && joined.trim() ? joined : result.result;
+					if (outputLimitContinuations > 0)
+						console.error(`[runner] session ${state.ref.label}: joined ${assistantTexts.length} answer segment(s) across ${outputLimitContinuations} output-boundary continuation(s)`);
 					if (typeof reply !== "string")
 						throw new HarnessError("runner.stop", `session ${state.ref.label} returned no assistant text (stopReason=${stopReason})`);
 
