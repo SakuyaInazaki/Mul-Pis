@@ -5,6 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { open, readdir, rename, mkdir, unlink, lstat } from "node:fs/promises";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { createLocalBashOperations, getShellConfig, type BashOperations } from "@earendil-works/pi-coding-agent";
 import { readCurrentProcessIdentity, type ProcessIdentityV1 } from "../runtime/process-identity.ts";
 
@@ -112,7 +113,8 @@ export async function observeManagedProcessGroup(pgid: number, dependencies: {
 
 /** The caller supplies the exact Pi call context. Pi still owns formatting and
  * nonzero exit handling; this backend owns only execution and evidence. */
-export function managedLocalBashOperations(call: () => ManagedBashCall | undefined): BashOperations {
+export function managedLocalBashOperations(call: () => ManagedBashCall | undefined,
+	dependencies: { terminationGraceMs?: number } = {}): BashOperations {
 	const fallback = createLocalBashOperations();
 	return { exec: async (command, cwd, { onData, signal, timeout, env }) => {
 		const current = call();
@@ -181,20 +183,37 @@ export function managedLocalBashOperations(call: () => ManagedBashCall | undefin
 		}
 		let abortSource: "none" | "signal" | "timeout" = "none";
 		let timer: NodeJS.Timeout | undefined;
-		const killGroup = (source: "signal" | "timeout") => {
+		let termination: Promise<void> | undefined;
+		const terminateGroup = (source: "signal" | "timeout") => {
 			if (abortSource !== "none") return;
 			abortSource = source;
-			if (pid !== null) {
-				try { process.kill(-pid, "SIGKILL"); }
-				catch { try { child.kill("SIGKILL"); } catch { /* exit races */ } }
-			}
+			const signalGroup = (endingSignal: NodeJS.Signals) => {
+				if (pid !== null) {
+					try { process.kill(-pid, endingSignal); return; }
+					catch { /* group may already have exited */ }
+				}
+				try { child.kill(endingSignal); } catch { /* exit races */ }
+			};
+			signalGroup("SIGTERM");
+			termination = (async () => {
+				if (pid === null) return;
+				const deadline = performance.now() + (dependencies.terminationGraceMs ?? 20_000);
+				while (await observeManagedProcessGroup(pid) !== "none-observed" && performance.now() < deadline)
+					await delay(Math.max(1, Math.min(50, deadline - performance.now())));
+				if (await observeManagedProcessGroup(pid) !== "none-observed") signalGroup("SIGKILL");
+			})();
 		};
-		const abort = () => killGroup("signal");
+		const abort = () => terminateGroup("signal");
 		if (signal) signal.addEventListener("abort", abort, { once: true });
 		if (signal?.aborted) abort();
-		if (timeout !== undefined) timer = setTimeout(() => killGroup("timeout"), timeout * 1000);
+		if (timeout !== undefined) timer = setTimeout(() => terminateGroup("timeout"), timeout * 1000);
 		try {
 			const exited = await exitPromise;
+			if (timer) clearTimeout(timer);
+			if (signal) signal.removeEventListener("abort", abort);
+			// The shell can exit while descendants in its group are still cleaning up.
+			// Keep the escalation alive and wait for it before observing the group.
+			if (termination) await termination;
 			clearInterval(outputPoll);
 			await pendingPump;
 			const outputBytesAtExit = (await output.stat()).size;

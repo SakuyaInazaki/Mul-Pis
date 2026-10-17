@@ -34,6 +34,46 @@ async function fixture(t: TestContext, reply: FakeReplyFn, continuous = false) {
  return {root,ws,store,runner,controller,goal,guide,ctx};
 }
 
+test("host constraint additions affect only future task and reviewer messages", async t => {
+ const added = "retain the newly supplied boundary";
+ const f = await fixture(t, async ({spec}) => {
+  if (spec.label.includes("reviewer")) return JSON.stringify({verdict:"ready",feedback:"checked result"});
+  if (spec.tools.kind === "execution") await writeFile(path.join(spec.tools.root,"result.txt"),"checked result");
+  return "done";
+ });
+ const first = await f.controller.delegate(f.goal.runId,{objective:"record earlier task",inputs:[],expectedOutputs:[],checks:["recorded"],mode:"reason"});
+ const oldMessage = [...f.runner.sessions.values()].at(-1)!.transcript[0].text;
+ assert.doesNotMatch(oldMessage,/retain the newly supplied boundary/);
+ const originalCriteria = [...f.goal.successCriteria];
+ const supplemented = await f.controller.hostAddConstraints(f.goal.runId,{sourceEventId:"user-event-1",constraints:[added,added]});
+ assert.deepEqual(supplemented.constraints,["keep the plan",added]);
+ assert.deepEqual(supplemented.successCriteria,originalCriteria);
+ assert.equal(supplemented.constraintAdditions?.[0].sourceEventId,"user-event-1");
+ assert.ok(supplemented.constraintAdditions?.[0].recordedAt);
+ const recordedAt = supplemented.constraintAdditions?.[0].recordedAt;
+ const replay = await f.controller.hostAddConstraints(f.goal.runId,{sourceEventId:"user-event-1",constraints:[added]});
+ assert.equal(replay.constraintAdditions?.length,1);
+ assert.equal(replay.constraintAdditions?.[0].recordedAt,recordedAt);
+ await assert.rejects(f.controller.hostAddConstraints(f.goal.runId,{sourceEventId:"user-event-1",constraints:["conflicting boundary"]}),/sourceEventId/);
+ const next = await f.controller.delegate(f.goal.runId,{objective:"check later task",inputs:[],expectedOutputs:["result.txt"],checks:["checked"],mode:"execute",executionLoop:{mode:"until-ready"}});
+ assert.equal(next.status,"returned");
+ const sent = [...f.runner.sessions.values()].filter(session=>session.spec.tools.kind === "execution" || session.spec.label.includes("reviewer"));
+ assert.equal(sent.length,2);
+ for (const session of sent) assert.match(session.transcript[0].text,/retain the newly supplied boundary/);
+ assert.equal([...f.runner.sessions.values()][0].transcript[0].text,oldMessage);
+ assert.equal((await f.controller.status(f.goal.runId)).tasks.find(task=>task.taskId === first.taskId)?.taskId,first.taskId);
+
+ const statePath = path.join(f.ws.runDir("M07",f.goal.runId),"goal.json");
+ const raw = JSON.parse(await readFile(statePath,"utf8"));
+ raw.tasks[0].status = "running";
+ await writeFile(statePath,JSON.stringify(raw));
+ await assert.rejects(f.controller.hostAddConstraints(f.goal.runId,{sourceEventId:"user-event-2",constraints:["another boundary"]}),/running/);
+ raw.tasks[0].status = first.status;
+ raw.executionState.operations[0].status = "unknown";
+ await writeFile(statePath,JSON.stringify(raw));
+ await assert.rejects(f.controller.hostAddConstraints(f.goal.runId,{sourceEventId:"user-event-2",constraints:["another boundary"]}),/未决外部操作/);
+});
+
 test("continuous execution cannot return on the builder's early finish without reviewer readiness", async t => {
  let release!: () => void;
  const gate = new Promise<void>(resolve => { release = resolve; });

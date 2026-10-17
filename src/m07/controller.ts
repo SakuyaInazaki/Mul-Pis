@@ -689,10 +689,10 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string,
 		"同一候选可持续局部修补，直至 reviewer 给出终态判断或发生真实阻断；每轮由全新只读 reviewer 反馈。不得扩大任务义务、替换指南或假称 reviewer 的 ready 是最终采用。" :
 		`历史记录中的轮数 ${task.executionLoop.maxRounds} 和截止时间 ${task.executionLoop.deadlineAt} 仅供审计，不是当前执行限制。同一候选可持续局部修补，直至 reviewer 给出终态判断或发生真实阻断；每轮后由全新只读 reviewer 给出反馈；只有控制器可决定是否再次提示。不得扩大任务义务、替换指南或假称 reviewer 的 ready 是最终采用。`));
 	if (task.lessonDeltaOutput) boundary.push(section("候选经验回流", `将本轮候选经验写入 ${task.lessonDeltaOutput}，JSON 格式为 {"version":1,"action":"none|propose|amend|contradict","observation":"...","hypothesis":"...","applicability":"...","evidencePaths":["本任务 work 内相对路径"]}。none 合法；不确定因果写为假设。evidencePaths 应指向支持或反驳观察的确切改动产物与检查、测量或回执；使用旧经验时，说明实际采用、修改或弃用及相应实测。仅修正本任务尚未入库的候选时仍用 propose；amend 或 contradict 只用于修订/反驳已存在且已固定身份的知识记录，必须加 "priorRef":{"storeId":"...","recordId":"...","version":1}，不得猜测 ID。此文件是待 M04 处理的候选，不能自称已采纳知识。`));
-	if (task.mode === "execute") boundary.push(section("候选迭代与已有材料", "进行候选优化时，在本任务已有报告或实验记录中逐次写清优化假设、相对上一候选的实际改动、同口径检查或测量的真实反馈，以及保留、否定或待证的结论；区分当前探索候选和按原目标已验证的最佳产物，无需另建文件。若优化算子，分开记录编译、接口、数值正确性与性能、评分反馈；依据真实测量诊断瓶颈，可在有帮助且可用时使用 profiler，不设固定工具。只对实际通过本题正确性检查的候选按原目标和可比口径比较性能或评分，不把速度当正确性证据。显式输入中已有的脚本或经验可以复用，但先核对当前任务的适用性与完整依赖，在本任务 work 内从输入副本派生，并记录修改及验证；旧输入或旧通过记录本身不代表当前已验证。"));
+	if (task.mode === "execute") boundary.push(section("候选迭代与已有材料", "进行候选优化时，在本任务已有报告或实验记录中逐次写清优化假设、相对上一候选的实际改动、同口径检查或测量的真实反馈，以及保留、否定或待证的结论；区分当前探索候选和按原目标已验证的最佳产物，无需另建文件。若优化算子，分开记录编译、接口、数值正确性与性能、评分反馈；依据真实测量诊断瓶颈，可在有帮助且可用时使用 profiler，不设固定工具。只对实际通过本题正确性检查的候选按原目标和可比口径比较性能或评分，不把速度当正确性证据。显式输入中已有的脚本或经验可以复用，但先核对当前任务的适用性与完整依赖，在本任务 work 内从输入副本派生，并记录修改及验证；旧输入或旧通过记录本身不代表当前已验证。编号输入副本不保持原多文件脚本的相对依赖路径；复用时仅从显式输入在 work 内按原相对关系派生可运行副本。若报模块不存在，先核对解析出的路径与实际文件名。"));
 	if (task.mode === "execute") boundary.push(section("外部执行与可消耗资源", `本任务控制操作 ID：${operationId ?? "旧目标无操作登记"}。若执行有真实副作用的远端动作，保存实际参数、外部请求/结果 ID、响应和可用的查询方法；在响应丢失后先查询，不能仅凭超时重发。任务级 ID 是恢复索引，只有远端明确支持时才能作为幂等键，不能声称 exactly-once。\n\n如任务涉及真实提交、评测、远程实验或其他可能消耗配额/费用/机会的动作：先用已提供的只读能力或额度接口核对接入和当前状态，并先做本地可完成的语法、类型、编译与兼容性预检。这不禁止任务已授权的真实实验，已授权平台评测/实验产生的结果属于本任务实测证据。每次真实动作都要记录实际结果和资源消耗；失败若仍消耗了资源，同样记录已消耗量、可见剩余量与恢复条件。平台配额不明时如实记录未知，不猜测统一配额。本地命令或客户端成功退出不等于远程实验通过。显式输入和原问题允许使用；若需取得新的外部研究参考资料并用于推理，将具体缺口报回主会话走 M05/M06→M04，不在 execute 任务里通过 bash 另造获取和采用链。`));
 	boundary.push("任务义务继承冻结目标、原成功条件和用户约束；局部 objective/checks 不得放宽它们。有界指职责、输入和操作范围，不授权自行添加尝试次数、耗时或费用停止条件。以达成为目标时，持续推进并按结果验收，不能用执行过或记录负结果替代达成。若任务本身是取证或检验，应如实返回其结果，并明确父目标仍未解决的要求。会话返回只表示内部交接，不表示原目标完成；列明实际动作、产物、失败、未执行项和限制。");
-	boundary.push(tempDir ? `产物路径规则：expectedOutputs 必须是当前任务工作目录内的精确相对路径；说明写在 objective 或 report.md。正式脚本、输入、测量、回执、负结果、复现数据和证据都必须保存在当前 work 目录。临时缓存、下载和浏览器 profile 可写入独立目录 ${tempDir}；bash 的 TMPDIR 指向它。临时目录不属于正式证据，不会进入 reviewer 快照或 branch，也不能作为产物或检查引用。不要写到其他目录。` : "产物路径规则：expectedOutputs 必须是当前任务工作目录内的精确相对路径；说明写在 objective 或 report.md。所有实际写盘必须落在当前工作目录内，不要写到工作区根目录或绝对路径。");
+	boundary.push(tempDir ? `产物路径规则：expectedOutputs 必须是当前任务工作目录内的精确相对路径；说明写在 objective 或 report.md。正式脚本、输入、测量、回执、负结果、复现数据和证据都必须保存在当前 work 目录。已落盘的原始查询、评测和实验回执须原样保留；派生汇总与后续查询另存并引用原文件。若已有原始记录被覆盖，如实报告缺失；摘要、计数或重新查询不能冒充恢复。临时缓存、下载和浏览器 profile 可写入独立目录 ${tempDir}；bash 的 TMPDIR 指向它。临时目录不属于正式证据，不会进入 reviewer 快照或 branch，也不能作为产物或检查引用。不要写到其他目录。` : "产物路径规则：expectedOutputs 必须是当前任务工作目录内的精确相对路径；说明写在 objective 或 report.md。所有实际写盘必须落在当前工作目录内，不要写到工作区根目录或绝对路径。已落盘的原始查询、评测和实验回执须原样保留；派生汇总与后续查询另存并引用原文件。若已有原始记录被覆盖，如实报告缺失；摘要、计数或重新查询不能冒充恢复。");
 	const message = boundary.join("\n\n");
 	if (message.length + systemPromptFor(task.mode === "check" ? "reviewer" : "execution").length > policy.maxPromptChars) { event.projectionStatus = "budget-failed"; throw new HarnessError("context.budget", `M07 控制事实与允许内联内容共 ${message.length} 字符，超过 prompt 预算 ${policy.maxPromptChars}；未静默截断`); }
 	event.projectionStatus = "materialized";
@@ -935,6 +935,33 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 		},
 
 		status: (runId) => load(ctx, runId),
+
+		async hostAddConstraints(runId, input) {
+			return withDispatch(runId, async () => {
+				const goal = await load(ctx, runId);
+				if (goal.lifecycle !== "active") throw new HarnessError("m07.constraints", "只能向 active 目标补充用户约束");
+				if (goal.tasks.some((task) => task.status === "running") ||
+					goal.executionState?.operations.some((operation) => operation.status === "issued" || operation.status === "unknown"))
+					throw new HarnessError("m07.constraints", "存在 running 任务或未决外部操作；先完成或对账后再补充约束");
+				const sourceEventId = nonempty(input.sourceEventId, "sourceEventId");
+				if (sourceEventId.length > 128 || !/^[A-Za-z0-9._:-]+$/.test(sourceEventId))
+					throw new HarnessError("m07.input", "sourceEventId 必须是至多 128 字符的稳定事件标识");
+				if (!Array.isArray(input.constraints) || !input.constraints.length)
+					throw new HarnessError("m07.input", "补充约束不能为空");
+				const constraints = [...new Set(input.constraints.map((value) => nonempty(value, "constraint")))];
+				const previous = goal.constraintAdditions?.find((event) => event.sourceEventId === sourceEventId);
+				if (previous) {
+					if (!sameStrings([...previous.constraints].sort(), [...constraints].sort()))
+						throw new HarnessError("m07.constraints", "sourceEventId 已用于不同的约束内容");
+					return goal;
+				}
+				const known = new Set(goal.constraints);
+				for (const constraint of constraints) if (!known.has(constraint)) { goal.constraints.push(constraint); known.add(constraint); }
+				goal.constraintAdditions = [...(goal.constraintAdditions ?? []), { sourceEventId, constraints, recordedAt: nowIso() }];
+				await save(ctx, goal);
+				return goal;
+			});
+		},
 
 		async plan(runId, plan, planOptions) {
 			return withDispatch(runId, async () => {
@@ -1670,6 +1697,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			await writeFileAtomic(frozen, problem);
 			const newDescriptor: RunDescriptorV1 = { ...descriptor, attemptId: "A001", goalRunId: run.runId, workspaceId: await ctx.store.storeId(), controlDir: ctx.ws.runDir("M07", run.runId) };
 			const successor: CurrentGoal = { version: 1, runId: run.runId, lifecycle: "active", startedAt: run.startedAt, updatedAt: run.startedAt, goal: prior.goal, problemRelation: prior.problemRelation, constraints: [...prior.constraints], successCriteria: [...prior.successCriteria], plan: prior.plan, exploratory: prior.exploratory, formalBaseline: prior.formalBaseline, problemSnapshotPath: frozen, knowledgeSnapshot: prior.knowledgeSnapshot, m04BaselineRunId: prior.m04BaselineRunId, checkpointRawScope: prior.checkpointRawScope ?? "workspace", baselineHistory: structuredClone(prior.baselineHistory), ...(prior.m04BaselineFailures ? { m04BaselineFailures: structuredClone(prior.m04BaselineFailures) } : {}), budgetPolicy: structuredClone(prior.budgetPolicy), budgetPolicyVersionId: prior.budgetPolicyVersionId, budgetPolicyFrozenAt: prior.budgetPolicyFrozenAt, methodBinding: prior.methodBinding ? structuredClone(prior.methodBinding) : undefined, workflowMethod: prior.workflowMethod ? structuredClone(prior.workflowMethod) : undefined, executionContract: prior.executionContract ? structuredClone(prior.executionContract) : undefined, predecessorGoalRunId: prior.runId, executionState: { version: 1, activeAttemptId: "A001", attempts: [{ version: 1, id: "A001", state: "running", startedAt: run.startedAt, runDescriptor: newDescriptor }], operations: [] }, tasks: [], decisions: structuredClone(prior.decisions), limitations: [`继承旧目标 ${prior.runId} 的冻结义务、K、策略和方法；旧任务及证据仍在原记录，须重新检查后采用。`] };
+			if (prior.constraintAdditions) successor.constraintAdditions = structuredClone(prior.constraintAdditions);
 			await save(ctx, successor);
 			run.remarks.push(`显式 successor of ${prior.runId}；旧 blocked goal.json 未修改。新目标保留原成功标准和冻结策略。`);
 			await ctx.ws.writeRun(run);

@@ -647,6 +647,21 @@ async function createExecutionTools(
 	};
 	const names = [...new Set(requested)];
 	const readCoverage = new Set<string>();
+	// This is the model-facing execution contract. Pi's underlying bash tool
+	// still accepts seconds; the adapter converts explicit milliseconds below.
+	const bashParameters = Type.Object({
+		command: Type.String({ description: "Shell command to execute" }),
+		timeoutMs: Type.Optional(Type.Number({ description: "Optional timeout in milliseconds; no default timeout" })),
+	});
+	const bashArgsForPi = (args: Record<string, unknown>): Record<string, unknown> => {
+		if (Object.hasOwn(args, "timeout"))
+			throw new HarnessError("runner.bash-timeout", "bash timeout has ambiguous units; use timeoutMs in milliseconds and retry the command");
+		if (args.timeoutMs === undefined) return args;
+		if (typeof args.timeoutMs !== "number" || !Number.isFinite(args.timeoutMs) || args.timeoutMs <= 0 || args.timeoutMs > 2_147_483_647)
+			throw new HarnessError("runner.bash-timeout", "bash timeoutMs must be a positive number of milliseconds within the supported timer range");
+		const { timeoutMs, ...rest } = args;
+		return { ...rest, timeout: timeoutMs / 1000 };
+	};
 	const tools = names.map((name) => {
 		// The model-bearing parent's credential environment must not reach a
 		// bash child. This is environment hygiene, not an OS sandbox.
@@ -664,6 +679,10 @@ async function createExecutionTools(
 			: factories[name](cwd)) as ToolDefinition<any, any>;
 		return {
 			...base,
+			...(name === "bash" ? {
+				parameters: bashParameters,
+				description: "Execute a bash command in the current working directory. Returns stdout and stderr. Output may be truncated. Optional timeoutMs is in milliseconds; no default timeout.",
+			} : {}),
 			async execute(toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: any, ctx: any) {
 				const args = params ?? {};
 				const receipt = name === "bash" && typeof args.command === "string" ?
@@ -672,8 +691,9 @@ async function createExecutionTools(
 					? { path: redactToolLogText(args.path, 240) } : {};
 				const at = new Date().toISOString();
 				try {
-					const result = receipt ? await bashCall.run(receipt, () => base.execute(toolCallId, args, signal, onUpdate, { ...ctx, cwd })) :
-						await base.execute(toolCallId, args, signal, onUpdate, { ...ctx, cwd });
+					const executionArgs = name === "bash" ? bashArgsForPi(args) : args;
+					const result = receipt ? await bashCall.run(receipt, () => base.execute(toolCallId, executionArgs, signal, onUpdate, { ...ctx, cwd })) :
+						await base.execute(toolCallId, executionArgs, signal, onUpdate, { ...ctx, cwd });
 					const isError = (result as { isError?: boolean }).isError === true;
 					if (receipt) await finishManagedBashCall(receipt, isError ? "is-error" : "returned");
 					log.push({ name, args: safeArgs, ok: !isError, at,

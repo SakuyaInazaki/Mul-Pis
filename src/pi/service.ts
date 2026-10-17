@@ -534,6 +534,15 @@ export class ResearchService {
 		});
 	}
 
+	/** Trusted host constraint supplement; not registered as a model tool. */
+	async hostAddConstraints(input: { workspace: string; runId: string; sourceEventId: string; constraints: string[] }): Promise<CurrentGoal> {
+		const root = this.resolveWorkspace(input.workspace);
+		return this.withMutation(root, async () =>
+			createM07Controller(await this.nonModelContext(root)).hostAddConstraints(input.runId, {
+				sourceEventId: input.sourceEventId, constraints: input.constraints,
+			}));
+	}
+
 	/** Host-owned lifecycle stop. This is not registered as a model tool. */
 	async hostInterrupt(input: { workspace: string; runId: string; reasonKind: HostStopReasonKind; sourceEventId?: string }): Promise<unknown> {
 		const root = this.resolveWorkspace(input.workspace);

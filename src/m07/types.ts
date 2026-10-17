@@ -248,6 +248,8 @@ export interface CurrentGoal {
 	goal: string;
 	problemRelation: string;
 	constraints: string[];
+	/** Host-supplied additions; earlier task and checkpoint snapshots remain unchanged. */
+	constraintAdditions?: Array<{ sourceEventId: string; constraints: string[]; recordedAt: string }>;
 	successCriteria: string[];
 	plan: string;
 	exploratory: boolean;
@@ -298,6 +300,8 @@ export interface M07Controller {
 	begin(input: BeginGoalInput, options?: { executionContract?: "continuous";
 		checkpointRawScope?: "workspace" | "none" }): Promise<CurrentGoal>;
 	status(runId: string): Promise<CurrentGoal>;
+	/** Trusted host only; never exposed through the model-facing research_goal tool. */
+	hostAddConstraints(runId: string, input: { sourceEventId: string; constraints: string[] }): Promise<CurrentGoal>;
 	plan(runId: string, plan: string, options?: { refreshBaseline?: boolean; checkpointId?: string; m04RunId?: string }): Promise<CurrentGoal>;
 	checkpoint(runId: string, options?: { taskIds?: string[] }): Promise<M07CheckpointRecord>;
 	/** Called after the task and prepared operation are saved, before any runner session starts. */

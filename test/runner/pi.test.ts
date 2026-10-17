@@ -350,6 +350,31 @@ test("managed local bash receipts bind real foreground exits to exact Pi calls",
 	handle.dispose();
 });
 
+test("execution bash exposes milliseconds, times out in milliseconds, and rejects legacy timeout before spawn", async t => {
+	const persistDir = await fixture(t);
+	const root = path.join(persistDir, "work");
+	await mkdir(root);
+	const stub = stubFactory();
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory })
+		.create(spec(persistDir, { tools: { kind: "execution", root, tools: ["bash"] } }));
+	const bash = stub.calls[0].customTools?.find(tool => tool.name === "bash");
+	assert(bash);
+	const properties = (bash.parameters as { properties: Record<string, unknown> }).properties;
+	assert.deepEqual(Object.keys(properties).sort(), ["command", "timeoutMs"]);
+	assert.match(bash.description, /timeoutMs.*milliseconds/);
+	await assert.rejects(bash.execute("millisecond-timeout", { command: "exec sleep 5", timeoutMs: 50 },
+		undefined, undefined, { cwd: root } as never), /Command timed out after 0\.05 seconds/);
+	const timedOut = await readManagedBashReceipt(handle.toolLog()[0].hostReceiptPath!);
+	assert.equal(timedOut.processExit?.abortSource, "timeout");
+	assert.equal(timedOut.toolErrorKind, "timeout");
+	await assert.rejects(bash.execute("legacy-timeout", { command: "touch should-not-exist", timeout: 30_000 },
+		undefined, undefined, { cwd: root } as never), /use timeoutMs in milliseconds and retry/);
+	const rejected = await readManagedBashReceipt(handle.toolLog()[1].hostReceiptPath!);
+	assert.equal(rejected.spawn, "not-attempted");
+	await assert.rejects(readFile(path.join(root, "should-not-exist")), { code: "ENOENT" });
+	handle.dispose();
+});
+
 test("detached local child leaves remote or detached effects explicitly unknown", async t => {
 	if (process.platform !== "linux") return t.skip("Linux setsid fixture");
 	const persistDir = await fixture(t);
