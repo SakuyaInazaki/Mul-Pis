@@ -80,6 +80,9 @@ export interface ExecutionSandbox {
 /** Stage backends may allow only their fresh output directory, keeping source and journal read-only. */
 export async function createMacOSWriteSandboxProfile(input: {
 	writableRoots: string[]; protectedPaths?: string[]; cwd: string;
+	/** Measurement and correctness runs are offline by contract: a candidate
+	 * that can reach the network can fetch a result instead of computing one. */
+	denyNetwork?: boolean;
 }): Promise<string | undefined> {
 	if (process.platform !== "darwin") return undefined;
 	if (!input.writableRoots.length) throw new HarnessError("runner.sandbox", "write sandbox needs an allowed directory");
@@ -91,6 +94,7 @@ export async function createMacOSWriteSandboxProfile(input: {
 		return resolved;
 	}));
 	const profile = `(version 1)\n(allow default)\n(deny signal)\n(deny file-link)\n(deny file-write*)\n` +
+		(input.denyNetwork ? `(deny network*)\n` : "") +
 		`(allow file-write* ${roots.map(root => `(subpath ${quote(root)})`).join(" ")})\n` +
 		`(allow file-write-data (literal "/dev/null"))\n` +
 		protectedPaths.map(root => `(deny file-write* (subpath ${quote(root)}))`).join("\n");
