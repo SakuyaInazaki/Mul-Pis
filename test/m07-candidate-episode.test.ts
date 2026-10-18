@@ -12,10 +12,11 @@ import type { CandidateExecutionBackend } from "../src/m07/candidate-runner.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 import type { StageContext } from "../src/stages/context.ts";
 import { Workspace } from "../src/workspace.ts";
-import { HarnessError } from "../src/types.ts";
+import { HarnessError, type HarnessConfig } from "../src/types.ts";
 import type { ToolCallRecord } from "../src/runner/types.ts";
 
-async function setup(reply: ConstructorParameters<typeof FakeSessionRunner>[0], verifier: CandidateVerifier, backend?: CandidateExecutionBackend) {
+async function setup(reply: ConstructorParameters<typeof FakeSessionRunner>[0], verifier: CandidateVerifier,
+	backend?: CandidateExecutionBackend, searchBudget?: HarnessConfig["searchBudget"]) {
 	const root = await mkdtemp(path.join(tmpdir(), "m07-episode-"));
 	const ws = new Workspace(root);
 	await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -24,7 +25,7 @@ async function setup(reply: ConstructorParameters<typeof FakeSessionRunner>[0], 
 	const baseline = await ws.startRun("M04", [{ label: "problem", path: ws.problemFile }]);
 	await ws.finishRun(baseline, "completed");
 	const runner = new FakeSessionRunner(reply);
-	const ctx: StageContext = { ws, store, runner, config: { roles: { execution: "fake/execution", reviewer: "fake/reviewer", research: "fake/research" }, concurrency: 1, tools: {} } };
+	const ctx: StageContext = { ws, store, runner, config: { roles: { execution: "fake/execution", reviewer: "fake/reviewer", research: "fake/research" }, concurrency: 1, tools: {}, ...(searchBudget ? { searchBudget } : {}) } };
 	const controller = createM07Controller(ctx, { candidateVerifier: verifier, ...(backend ? { candidateExecutionBackend: backend } : {}) });
 	const goal = await controller.begin({ goal: "Correct and optimize operator", problemRelation: "direct", constraints: ["same interface"], successCriteria: ["original criterion"], plan: "test candidates" },
 		{ candidateVerification: { id: verifier.id, verifierVersion: verifier.version }, ...(backend ? { executionContract: "continuous" as const } : {}) });
@@ -49,18 +50,26 @@ test("a numerical failure can be repaired inside one builder session without fre
 		if (spec.tools.kind !== "execution") return "report";
 		await writeFile(path.join(spec.tools.root, "kernel.py"), "broken");
 		await writeFile(path.join(spec.tools.root, "receipt.json"), '{"status":"failed"}');
-		const first = JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: "check numerical mismatch", changeKind: "repair", intent: "diagnostic" })).text) as { candidateId: string; observation: { correctness: string } };
+		const first = JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: "check numerical mismatch", changeKind: "repair", strategy: "repair", location: "kernel.py", intent: "diagnostic" })).text) as { candidateId: string; observation: { correctness: string } };
 		assert.equal(first.observation.correctness, "failed");
+		await assert.rejects(tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"],
+			hypothesis: "edit a site that does not exist", changeKind: "repair", strategy: "repair",
+			location: "kernel.py:missing_symbol", intent: "solution" }), /declared location/,
+			"a declared edit site that is absent from the source costs no host evaluation");
+		await assert.rejects(tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"],
+			hypothesis: "search parameters before a correct seed", changeKind: "parameters",
+			strategy: "numerical-parameters", location: "kernel.py", intent: "solution" }),
+			/verified-correct/, "parameter search needs a verified-correct structure first");
 		await writeFile(path.join(spec.tools.root, "kernel.py"), "repaired");
 		await writeFile(path.join(spec.tools.root, "receipt.json"), '{"status":"passed"}');
-		const second = JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: "repair mismatch", changeKind: "repair", intent: "diagnostic", parentCandidateId: first.candidateId })).text) as { candidateId: string; observation: { correctness: string } };
+		const second = JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: "repair mismatch", changeKind: "repair", strategy: "repair", location: "kernel.py", intent: "diagnostic", parentCandidateId: first.candidateId })).text) as { candidateId: string; observation: { correctness: string } };
 		assert.equal(second.observation.correctness, finalFinding === "incorrect" ? "failed" : "passed");
 		await copyFile(path.join(spec.tools.root, "kernel.py"), path.join(spec.tools.root, "selected.py"));
 		await copyFile(path.join(spec.tools.root, "receipt.json"), path.join(spec.tools.root, "selected-receipt.json"));
 		return "Repaired candidate is ready for task review.";
 	}, verifier);
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
-	const task = await harness.controller.delegate(harness.goal.runId, { objective: "repair and evaluate", mode: "execute", inputs: [], expectedOutputs: ["selected.py", "selected-receipt.json"], checks: ["candidate checked"], executionLoop: { mode: "candidate-episode" }, candidate: { sourcePaths: ["selected.py"], receiptPaths: ["selected-receipt.json"] } });
+	const task = await harness.controller.delegate(harness.goal.runId, { objective: "repair and evaluate", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["selected.py", "selected-receipt.json"], checks: ["candidate checked"], executionLoop: { mode: "candidate-episode" }, candidate: { sourcePaths: ["selected.py"], receiptPaths: ["selected-receipt.json"] } });
 	assert.equal(task.status, "returned", task.executionFailure);
 	assert.deepEqual(task.episode?.candidates.map(item => item.observation.correctness), ["failed", "passed"]);
 	assert.deepEqual(task.episode?.candidates.map(item => item.intent), ["diagnostic", "diagnostic"]);
@@ -84,7 +93,7 @@ test("a numerical failure can be repaired inside one builder session without fre
 		["goal-failed", /original goal criterion is not met/],
 	] as const) {
 		finalFinding = finding;
-		const next = await harness.controller.delegate(harness.goal.runId, { objective: "review diagnostic evidence as a final solution", mode: "execute", inputs: [],
+		const next = await harness.controller.delegate(harness.goal.runId, { objective: "review diagnostic evidence as a final solution", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [],
 			expectedOutputs: ["selected.py", "selected-receipt.json"], checks: ["candidate checked"], executionLoop: { mode: "candidate-episode" },
 			candidate: { sourcePaths: ["selected.py"], receiptPaths: ["selected-receipt.json"] } });
 		assert.equal(next.status, "returned", next.executionFailure);
@@ -149,7 +158,7 @@ test("controller grants the host execution cascade to a running episode and revi
 			await writeFile(path.join(spec.tools.root, "kernel.py"), "candidate source");
 			const result = JSON.parse((await tools.candidate_run({ runId: "trial1", sourcePaths: ["kernel.py"],
 				protocolId: "fixture-protocol", configJson: "{}", hypothesis: "verify and measure",
-				changeKind: "structure", intent: "solution" })).text) as { status: string; evaluation?: string };
+				changeKind: "structure", strategy: "tiling", location: "kernel.py", intent: "solution" })).text) as { status: string; evaluation?: string };
 			assert.equal(result.status, "pending");
 			assert.equal(result.evaluation, undefined);
 			return "The original judge ID is pending; this model turn returned normally.";
@@ -167,7 +176,7 @@ test("controller grants the host execution cascade to a running episode and revi
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
 	assert.equal(harness.goal.executionContract?.mode, "continuous");
 	assert.ok(harness.goal.executionState?.activeAttemptId, "the goal has a live runtime attempt");
-	const task = await harness.controller.delegate(harness.goal.runId, { objective: "run scoped candidate pipeline", mode: "execute",
+	const task = await harness.controller.delegate(harness.goal.runId, { objective: "run scoped candidate pipeline", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" },
 		inputs: [], expectedOutputs: ["kernel.py"], checks: ["candidate was observed"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(task.status, "returned", task.executionFailure);
 	assert.deepEqual(calls, ["contract", "compile", "judge", "query:judge"]);
@@ -192,7 +201,8 @@ test("a failed candidate freeze retains its bytes and later candidates use unuse
 		const workRoot = spec.tools.root;
 		const episodeRoot = path.join(path.dirname(workRoot), "episode");
 		const evaluate = (hypothesis: string) => tools.candidate_evaluate({ sourcePaths: ["kernel.py"],
-			receiptPaths: ["receipt.json"], hypothesis, changeKind: "structure", intent: "solution" });
+			receiptPaths: ["receipt.json"], hypothesis, changeKind: "structure", strategy: "tiling",
+			location: "kernel.py", intent: "solution" });
 		await writeFile(path.join(workRoot, "kernel.py"), "first frozen source");
 		await assert.rejects(evaluate("missing receipt"), /ENOENT/);
 		const failedSource = path.join(episodeRoot, "C001", "sources", "000-kernel.py");
@@ -211,7 +221,7 @@ test("a failed candidate freeze retains its bytes and later candidates use unuse
 	}, verifier);
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
 	const task = await harness.controller.delegate(harness.goal.runId, { objective: "retain failed freeze and evaluate successors",
-		mode: "execute", inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["complete candidates recorded"],
+		mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["complete candidates recorded"],
 		executionLoop: { mode: "candidate-episode" } });
 	assert.equal(task.status, "returned", task.executionFailure);
 	assert.deepEqual(task.episode?.candidates.map(item => item.id), ["C002", "C003"]);
@@ -236,11 +246,13 @@ test("a slower correct exploration parent can lead to a faster child without reg
 	const harness = await setup(async ({ spec, tools }) => {
 		if (spec.tools.kind !== "execution") return "report";
 		const workRoot = spec.tools.root;
+		let strategyIndex = 0;
+		const strategies = ["tiling", "fusion", "pipeline", "reordering", "vectorization", "memory-layout"];
 		const evaluate = async (label: string, latency: number, basis: string, parentCandidateId?: string, subject?: string,
 			intent: "solution" | "diagnostic" = "solution") => {
 			await writeFile(path.join(workRoot, "kernel.py"), label);
 			await writeFile(path.join(workRoot, "receipt.json"), JSON.stringify({ latency, basis, subject }));
-			return JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: label, changeKind: "structure", intent, ...(parentCandidateId ? { parentCandidateId } : {}) })).text) as { candidateId: string;
+			return JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: label, changeKind: "structure", strategy: strategies[strategyIndex++ % strategies.length], location: "kernel.py", intent, ...(parentCandidateId ? { parentCandidateId } : {}) })).text) as { candidateId: string;
 				incumbents: Array<{ candidateId: string; subjectId?: string; metric: { basisId: string } }>;
 				searchBrief: { focus: { basisId?: string }; readLeads: { args: { section: string; basisId?: string } } } };
 		};
@@ -264,11 +276,19 @@ test("a slower correct exploration parent can lead to a faster child without reg
 		return "All six actual receipt observations were recorded.";
 	}, verifier);
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
-	const task = await harness.controller.delegate(harness.goal.runId, { objective: "explore valid candidates", subjectId: "operator", mode: "execute", inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["candidate history recorded"], executionLoop: { mode: "candidate-episode" } });
+	const task = await harness.controller.delegate(harness.goal.runId, { objective: "explore valid candidates", subjectId: "operator", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["candidate history recorded"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(task.status, "returned", task.executionFailure);
 	assert.equal(task.episode?.currentCandidateId, "C006");
 	assert.equal(task.episode?.candidates[1].parentCandidateId, "C001");
 	assert.equal(task.episode?.candidates.length, 6, "foreign observation remains in the original history");
+	assert.deepEqual(task.episode?.candidates.map(item => item.policy?.guard),
+		["keep", "keep", "revert", "accept", "accept", "keep"],
+		"the host decides every candidate's guard state deterministically");
+	assert.deepEqual(task.episode?.candidates.map(item => item.policy?.phase),
+		["bootstrap", "tuning", "tuning", "tuning", "bootstrap", "tuning"],
+		"bootstrap ends per subject, so the foreign subject starts its own");
+	assert.equal(task.episode?.candidates[2].policy?.requiredFix.length, 1,
+		"a regression names exactly one must-fix item");
 	assert.deepEqual(task.episode?.incumbents.map(item => [item.subjectId, item.metric.basisId, item.candidateId]),
 		[["operator", "A", "C006"], ["operator", "B", "C004"]]);
 	const reviewed = await harness.controller.review(harness.goal.runId, { taskId: task.taskId, artifacts: [task.reportPath!], checks: [{ criterion: "candidate history recorded", result: "passed", evidence: [task.reportPath!] }] });
@@ -295,7 +315,8 @@ test("repeated-source feedback uses frozen bytes and unique external results wit
 			await writeFile(path.join(workRoot, file), source);
 			await writeFile(path.join(workRoot, "receipt.json"), JSON.stringify({ id, score }));
 			return JSON.parse((await tools.candidate_evaluate({ sourcePaths: [file], receiptPaths: ["receipt.json"],
-				hypothesis: "inspect retained observations", changeKind: "parameters", intent: "solution" })).text);
+				hypothesis: "inspect retained observations", changeKind: "structure", strategy: "fusion",
+				location: file, intent: "solution" })).text);
 		};
 		await evaluate("first.py", "original", "result-one", 90);
 		const repeated = await evaluate("renamed.py", "original", "result-two", 92);
@@ -322,7 +343,7 @@ test("repeated-source feedback uses frozen bytes and unique external results wit
 	}, verifier);
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
 	const task = await harness.controller.delegate(harness.goal.runId, { objective: "inspect repeated measurements", subjectId: "operator",
-		mode: "execute", inputs: [], expectedOutputs: ["changed.py", "receipt.json"], checks: ["evidence retained"], executionLoop: { mode: "candidate-episode" } });
+		mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const }, inputs: [], expectedOutputs: ["changed.py", "receipt.json"], checks: ["evidence retained"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(task.status, "returned", task.executionFailure);
 	assert.equal(calls, 4, "archive reads reuse the four original verifier calls");
 });
@@ -344,18 +365,22 @@ test("a later task can retrieve a near miss and derive from an exact frozen pare
 		if (taskNumber === 1) {
 			await writeFile(path.join(workRoot, "kernel.py"), "broken");
 			await writeFile(path.join(workRoot, "receipt.json"), JSON.stringify({ status: "failed" }));
-			await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: "near miss", changeKind: "repair", intent: "diagnostic" });
+			await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: "near miss", changeKind: "repair", strategy: "repair", location: "kernel.py", intent: "diagnostic" });
 			await writeFile(path.join(workRoot, "kernel.py"), "slow correct");
 			await writeFile(path.join(workRoot, "receipt.json"), JSON.stringify({ status: "passed", latency: 10, basis: "A" }));
-			await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: "safe baseline", changeKind: "structure", intent: "solution" });
+			await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: "safe baseline", changeKind: "structure", strategy: "memory-layout", location: "kernel.py", intent: "solution" });
 			return "Recorded a negative and a valid baseline.";
 		}
 		if (taskNumber === 3) {
+			let repeatIndex = 0;
 			const evaluate = async (source: string) => {
 				await writeFile(path.join(workRoot, "kernel.py"), source);
 				await writeFile(path.join(workRoot, "receipt.json"), JSON.stringify({ status: "passed", latency: 10, basis: "A" }));
+				repeatIndex++;
 				return JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"],
-					hypothesis: source, changeKind: "structure", intent: "solution" })).text) as {
+					hypothesis: source, changeKind: "structure",
+					strategy: (["pipeline", "fusion", "vectorization", "reordering"] as const)[repeatIndex % 4],
+					location: "kernel.py", intent: "solution" })).text) as {
 					candidateRef: string; identicalSourceRefs: string[]; sourceRepetition: string | null };
 			};
 			const firstForOtherSubject = await evaluate("slow correct");
@@ -388,7 +413,8 @@ test("a later task can retrieve a near miss and derive from an exact frozen pare
 		await writeFile(path.join(workRoot, "kernel.py"), "faster correct");
 		await writeFile(path.join(workRoot, "receipt.json"), JSON.stringify({ status: "passed", latency: 8, basis: "A" }));
 		const first = JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"],
-			hypothesis: "a structural edit improves A", changeKind: "structure", intent: "solution", parentCandidateId: "T001/C002",
+			hypothesis: "a structural edit improves A", changeKind: "structure", strategy: "reordering",
+			location: "kernel.py", intent: "solution", parentCandidateId: "T001/C002",
 			conditions: ["basis A", "same evaluation target"], changeSummary: "replace slow path" })).text) as {
 			candidateRef: string; parentRef: { taskId: string; candidateId: string };
 			parentComparison: { comparableMetrics: Array<{ parentValue: number; candidateValue: number; improved: boolean }> };
@@ -398,7 +424,8 @@ test("a later task can retrieve a near miss and derive from an exact frozen pare
 		assert.deepEqual(first.parentComparison.comparableMetrics.map(item => [item.parentValue, item.candidateValue, item.improved]), [[10, 8, true]]);
 		await writeFile(path.join(workRoot, "receipt.json"), JSON.stringify({ status: "passed", latency: 1, basis: "B" }));
 		const second = JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"],
-			hypothesis: "measure another basis", changeKind: "parameters", intent: "solution", parentCandidateId: "T002/C001" })).text) as { identicalSourceRefs: string[]; sourceRepetition: string };
+			hypothesis: "measure another basis", changeKind: "parameters", strategy: "numerical-parameters",
+			location: "kernel.py", intent: "solution", parentCandidateId: "T002/C001" })).text) as { identicalSourceRefs: string[]; sourceRepetition: string };
 		assert.ok(second.identicalSourceRefs.includes("T002/C001"), "equal bytes are recorded without rejecting a new receipt");
 		assert.equal(second.sourceRepetition, "duplicate_code");
 		const updated = JSON.parse((await tools.candidate_list({})).text) as { globalBest: Array<{ candidateRef: string; metric: { basisId: string } }> };
@@ -406,10 +433,10 @@ test("a later task can retrieve a near miss and derive from an exact frozen pare
 		return "A new candidate improved A; B remains separate.";
 	}, verifier);
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
-	const first = await harness.controller.delegate(harness.goal.runId, { objective: "find baseline and near miss", subjectId: "operator", mode: "execute", inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["candidate history recorded"], executionLoop: { mode: "candidate-episode" } });
+	const first = await harness.controller.delegate(harness.goal.runId, { objective: "find baseline and near miss", subjectId: "operator", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["candidate history recorded"], executionLoop: { mode: "candidate-episode" } });
 	const firstReview = await harness.controller.review(harness.goal.runId, { taskId: first.taskId, artifacts: [first.reportPath!], checks: [{ criterion: "candidate history recorded", result: "passed", evidence: [first.reportPath!] }] });
 	assert.equal(firstReview.status, "accepted");
-	const second = await harness.controller.delegate(harness.goal.runId, { objective: "continue from prior candidate", subjectId: "operator", mode: "execute", inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["candidate history recorded"], executionLoop: { mode: "candidate-episode" } });
+	const second = await harness.controller.delegate(harness.goal.runId, { objective: "continue from prior candidate", subjectId: "operator", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["candidate history recorded"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(second.status, "returned", second.executionFailure);
 	assert.deepEqual(second.episode?.checkouts?.map(item => item.candidateRef), ["T001/C001", "T001/C002"]);
 	assert.deepEqual(second.episode?.candidates[0].conditions, ["basis A", "same evaluation target"]);
@@ -420,7 +447,7 @@ test("a later task can retrieve a near miss and derive from an exact frozen pare
 	const frozenGoal = JSON.parse(await readFile(checkpoint.goalSnapshotPath, "utf8")) as { tasks: Array<{ episode?: { candidates: Array<{ parentRef?: { taskId: string; candidateId: string }; observationPath: string }> } }> };
 	assert.deepEqual(frozenGoal.tasks[1].episode?.candidates[0].parentRef, { taskId: "T001", candidateId: "C002" });
 	assert.ok(frozenGoal.tasks[1].episode?.candidates[0].observationPath.startsWith(checkpoint.rootDir));
-	const third = await harness.controller.delegate(harness.goal.runId, { objective: "try the same bytes on another subject", subjectId: "another-operator", mode: "execute", inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["candidate history recorded"], executionLoop: { mode: "candidate-episode" } });
+	const third = await harness.controller.delegate(harness.goal.runId, { objective: "try the same bytes on another subject", subjectId: "another-operator", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["candidate history recorded"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(third.status, "returned", third.executionFailure);
 });
 
@@ -451,7 +478,8 @@ test("checkout preserves a frozen multi-file candidate's relative imports in an 
 			await writeFile(path.join(root, "include/common.mjs"), "export const value = 41;\n");
 			await writeFile(path.join(root, "receipts.json"), '{"status":"passed"}\n');
 			await tools.candidate_evaluate({ sourcePaths: ["src/kernel.mjs", "include/common.mjs"], receiptPaths: ["receipts.json"],
-				hypothesis: "same relative import tree", changeKind: "structure", intent: "solution" });
+				hypothesis: "same relative import tree", changeKind: "structure", strategy: "fusion",
+				location: "src/kernel.mjs", intent: "solution" });
 			return "Frozen two-file candidate.";
 		}
 		if (invocation === 2) {
@@ -479,7 +507,8 @@ test("checkout preserves a frozen multi-file candidate's relative imports in an 
 		if (invocation === 2) {
 			const result = JSON.parse((await tools.candidate_run({ runId: "second-generation", sourcePaths: checkout.sourcePaths,
 				protocolId: "fixture", configJson: "{}", hypothesis: "same linked code through host runner",
-				changeKind: "structure", intent: "solution", parentCandidateId: "T001/C001" })).text) as { status: string; evaluation?: string };
+				changeKind: "structure", strategy: "fusion", location: checkout.sourcePaths[0],
+				intent: "solution", parentCandidateId: "T001/C001" })).text) as { status: string; evaluation?: string };
 			assert.equal(result.status, "completed");
 			assert.ok(result.evaluation);
 		}
@@ -494,17 +523,17 @@ test("checkout preserves a frozen multi-file candidate's relative imports in an 
 		return "Checked out the original executable file layout.";
 	}, verifier, backend);
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
-	const first = await harness.controller.delegate(harness.goal.runId, { objective: "freeze linked files", mode: "execute", inputs: [],
+	const first = await harness.controller.delegate(harness.goal.runId, { objective: "freeze linked files", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [],
 		expectedOutputs: ["src/kernel.mjs", "include/common.mjs", "receipts.json"], checks: ["candidate recorded"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(first.status, "returned", first.executionFailure);
 	await harness.controller.review(harness.goal.runId, { taskId: first.taskId, artifacts: [first.reportPath!],
 		checks: [{ criterion: "candidate recorded", result: "passed", evidence: [first.reportPath!] }] });
-	const second = await harness.controller.delegate(harness.goal.runId, { objective: "reuse linked files", mode: "execute", inputs: [],
+	const second = await harness.controller.delegate(harness.goal.runId, { objective: "reuse linked files", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [],
 		expectedOutputs: ["checkout.md"], checks: ["layout restored"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(second.status, "returned", second.executionFailure);
 	await harness.controller.review(harness.goal.runId, { taskId: second.taskId, artifacts: [second.reportPath!],
 		checks: [{ criterion: "layout restored", result: "passed", evidence: [second.reportPath!] }] });
-	const third = await harness.controller.delegate(harness.goal.runId, { objective: "restore second-generation linked files", mode: "execute", inputs: [],
+	const third = await harness.controller.delegate(harness.goal.runId, { objective: "restore second-generation linked files", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [],
 		expectedOutputs: ["checkout2.md"], checks: ["layout stable"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(third.status, "returned", third.executionFailure);
 	const retained = await harness.controller.status(harness.goal.runId);
@@ -541,7 +570,8 @@ test("large case and diagnostic feedback is indexed while candidate_read retains
 		await writeFile(path.join(spec.tools.root, "kernel.py"), "candidate");
 		await writeFile(path.join(spec.tools.root, "receipt.json"), receipt);
 		const result = await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"],
-			hypothesis: "inspect a large negative result", changeKind: "repair", intent: "solution" });
+			hypothesis: "inspect a large negative result", changeKind: "repair", strategy: "repair",
+			location: "kernel.py", intent: "solution" });
 		assert.ok(result.text.length < 22000, "immediate feedback must not repeat the raw receipt or all case bodies");
 		const projected = JSON.parse(result.text);
 		assert.equal(projected.observation.correctness, "failed");
@@ -599,7 +629,7 @@ test("large case and diagnostic feedback is indexed while candidate_read retains
 		return "Read the full negative evidence through the existing range tool.";
 	}, verifier);
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
-	const task = await harness.controller.delegate(harness.goal.runId, { objective: "inspect original large feedback", mode: "execute", inputs: [],
+	const task = await harness.controller.delegate(harness.goal.runId, { objective: "inspect original large feedback", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [],
 		expectedOutputs: ["kernel.py", "receipt.json"], checks: ["candidate recorded"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(task.status, "returned", task.executionFailure);
 	assert.equal(calls, 1, "paging evidence must not trigger another host evaluation");
@@ -631,7 +661,8 @@ test("unqueryable candidate results hand control back after queued tools settle,
 			await writeFile(path.join(spec.tools.root, "kernel.txt"), toolName === "candidate_sweep" ? "tile={{tile}}\n" : "original candidate bytes");
 			if (builderTurns > 1) return "A separately authorized task can continue after host reconciliation.";
 			const request = { runId: "original-run", sourcePaths: ["kernel.txt"], protocolId: "original-protocol",
-				configJson: "{}", hypothesis: "measure original candidate", changeKind: "structure", intent: "solution",
+				configJson: "{}", hypothesis: "measure original candidate", changeKind: "structure",
+				strategy: "tiling", location: "kernel.txt", intent: "solution",
 				...(toolName === "candidate_sweep" ? { domainsJson: '{"tile":[1,2]}' } : {}) };
 			try {
 				// Both wrappers are entered before the internally serialized backend runs.
@@ -661,7 +692,8 @@ test("unqueryable candidate results hand control back after queued tools settle,
 			}, dispose: () => { disposed = true; handle.dispose(); } };
 		};
 		const taskSpec = { objective: "measure candidate", mode: "execute" as const, inputs: [], expectedOutputs: ["kernel.txt"],
-			checks: ["candidate recorded"], executionLoop: { mode: "candidate-episode" as const } };
+			checks: ["candidate recorded"], executionLoop: { mode: "candidate-episode" as const },
+		subjectProfile: { implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const } };
 		const failed = await harness.controller.delegate(harness.goal.runId, taskSpec);
 		await toolsSettled;
 		assert.deepEqual(toolOutcomes, ["fulfilled", "rejected"]);
@@ -737,7 +769,8 @@ test("host reconciliation queries a failed task's original candidate ID and unlo
 		if (builderTurns === 1) {
 			await writeFile(path.join(spec.tools.root, "kernel.txt"), "original candidate bytes");
 			const result = JSON.parse((await tools.candidate_run({ runId: "original-run", sourcePaths: ["kernel.txt"], protocolId: "original-protocol",
-				configJson: "{}", hypothesis: "measure original candidate", changeKind: "structure", intent: "solution" })).text);
+				configJson: "{}", hypothesis: "measure original candidate", changeKind: "structure",
+				strategy: "tiling", location: "kernel.txt", intent: "solution" })).text);
 			assert.equal(result.status, "pending");
 			throw new Error("builder session lost after submission");
 		}
@@ -748,7 +781,8 @@ test("host reconciliation queries a failed task's original candidate ID and unlo
 	}, verifier, backend);
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
 	const taskSpec = { objective: "measure candidate", mode: "execute" as const, inputs: [], expectedOutputs: ["kernel.txt"],
-		checks: ["candidate recorded"], executionLoop: { mode: "candidate-episode" as const } };
+		checks: ["candidate recorded"], executionLoop: { mode: "candidate-episode" as const },
+		subjectProfile: { implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const } };
 	const failed = await harness.controller.delegate(harness.goal.runId, taskSpec);
 	assert.equal(failed.status, "failed");
 	assert.match(failed.executionFailure!, /builder session lost/);
@@ -784,4 +818,52 @@ test("host reconciliation queries a failed task's original candidate ID and unlo
 	assert.equal(next.status, "returned", next.executionFailure);
 	assert.equal(next.taskId, "T002");
 	assert.equal(builderTurns, 2); assert.equal(submissions, 1); assert.equal(queries, 2);
+});
+
+test("a spent search budget stops the task deterministically and records the boundary", async t => {
+	const verifier: CandidateVerifier = { id: "host:budget", version: "1", async verifyTask() {
+		return { sourceBinding: "verified", correctness: "passed", stage: "performance",
+			metrics: [{ name: "latency", value: 10, unit: "ms", basisId: "b", direction: "lower" }], limitations: [] };
+	} };
+	let refusal = "";
+	const harness = await setup(async ({ spec, tools }) => {
+		if (spec.tools.kind !== "execution") return "report";
+		const workRoot = spec.tools.root;
+		const evaluate = async (label: string, strategy: string) => {
+			await writeFile(path.join(workRoot, "kernel.py"), label);
+			await writeFile(path.join(workRoot, "receipt.json"), '{"status":"passed"}');
+			return JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"],
+				hypothesis: label, changeKind: "structure", strategy, location: "kernel.py", intent: "solution" })).text) as {
+				budget: { evaluations: number; remaining: number; stop?: string } };
+		};
+		const first = await evaluate("one", "tiling");
+		assert.equal(first.budget.remaining, 1);
+		const second = await evaluate("two", "fusion");
+		assert.equal(second.budget.stop, "task-evaluation-budget");
+		try { await evaluate("three", "pipeline"); }
+		catch (error) { refusal = (error as Error).message; }
+		return "Budget boundary reached; reporting the verified best candidate.";
+	}, verifier, undefined, { version: 1, evaluationsPerTask: 2, repairEvaluationsPerTask: 2,
+		parameterEvaluationsPerTask: 1, maxBranchesPerCheckpoint: 2, reviewRoundsPerTask: 12,
+		routeLimits: { repairDepth: 3, stagnation: 8, directionChange: 3 } });
+	t.after(() => rm(harness.root, { recursive: true, force: true }));
+	const task = await harness.controller.delegate(harness.goal.runId, { objective: "bounded search", subjectId: "operator",
+		mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["budget respected"],
+		executionLoop: { mode: "candidate-episode" } });
+	assert.equal(task.status, "returned", task.executionFailure);
+	assert.equal(task.episode?.candidates.length, 2, "the refused third evaluation never reached the verifier");
+	assert.match(refusal, /evaluation budget/);
+	assert.equal(task.loopStopReason, "budget-boundary");
+	assert.equal(task.episode?.budget?.stop, "task-evaluation-budget");
+});
+
+test("with a bound verifier an execute task cannot fall back to a reviewer-gated loop", async t => {
+	const verifier: CandidateVerifier = { id: "host:loop-choice", version: "1", async verifyTask() {
+		return { sourceBinding: "verified", correctness: "passed", stage: "performance", metrics: [], limitations: [] };
+	} };
+	const harness = await setup(async () => "report", verifier);
+	t.after(() => rm(harness.root, { recursive: true, force: true }));
+	await assert.rejects(harness.controller.delegate(harness.goal.runId, { objective: "reviewer gated",
+		mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const }, inputs: [], expectedOutputs: ["kernel.py"], checks: ["checked"],
+		executionLoop: { mode: "until-ready" } }), /deterministic verifier/);
 });

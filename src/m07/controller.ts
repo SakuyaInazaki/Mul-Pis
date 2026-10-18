@@ -21,13 +21,14 @@ import { GenerationStore, isM07WorkflowStrategy } from "../improvement/generatio
 import { probeProcessIdentity, readCurrentProcessIdentity, type ProcessIdentityV1 } from "../runtime/process-identity.ts";
 import { parseRunDescriptor, type RunDescriptorV1 } from "../runtime/run-descriptor.ts";
 import { verifyDescriptorLoadedSource, verifyLoadedSource } from "../runtime/loaded-source.ts";
-import { parseRoundReview } from "./execution-loop.ts";
+import { runUntilReadyRounds } from "./execution-loop.ts";
 import { openBoundedSession, type EvidenceBindingV1 } from "../context/boundary.ts";
 import type { SessionHandle, ToolGrant } from "../runner/types.ts";
 import type { Workspace } from "../workspace.ts";
 import { failedM04Feedback, resolveM04Baseline, type FormalBaseline } from "./formal-baseline.ts";
 import { writeFeedback } from "./feedback.ts";
 import { candidateObservation, requireCandidateVerifier, type CandidateVerifier, type FrozenCandidateFile } from "./candidate-evaluation.ts";
+import { candidateBudgetLedger, DEFAULT_SEARCH_BUDGET } from "./candidate-policy.ts";
 import { createCandidateEpisodeTool } from "./candidate-episode.ts";
 import { createCandidateExecutionTools, pendingCandidateExecutions, type CandidateExecutionBackend } from "./candidate-runner.ts";
 import { createCandidateArchiveTools } from "./candidate-archive.ts";
@@ -352,6 +353,33 @@ async function withGoalDispatch<T>(ctx: StageContext, runId: string, body: () =>
 		finally { release(); if (dispatchQueues.get(key) === tail) dispatchQueues.delete(key); }
 	}
 }
+/** Declared facts only: the harness checks their shape, never their truth. */
+function validateSubjectProfile(profile: TaskSpecInput["subjectProfile"]): TaskSpecInput["subjectProfile"] {
+	if (profile === undefined) return undefined;
+	if (!profile || typeof profile !== "object" || Array.isArray(profile) ||
+		Object.keys(profile).some((key) => !["implementationSpace", "rationale", "baselineStrength", "endToEndShare", "headroom"].includes(key)) ||
+		!["vendor-library", "dsl-or-ir", "handwritten-low-level"].includes(profile.implementationSpace) ||
+		!["vendor-library", "framework-default", "none"].includes(profile.baselineStrength) ||
+		typeof profile.rationale !== "string" || !profile.rationale.trim() || profile.rationale.length > 1000)
+		throw new HarnessError("m07.subject-profile", "subjectProfile needs implementationSpace, a nonempty rationale under 1000 characters, and baselineStrength");
+	if (profile.endToEndShare !== undefined && (typeof profile.endToEndShare !== "number" ||
+		!Number.isFinite(profile.endToEndShare) || profile.endToEndShare < 0 || profile.endToEndShare > 1))
+		throw new HarnessError("m07.subject-profile", "subjectProfile.endToEndShare must be a measured share in 0-1");
+	if (profile.headroom !== undefined && (!profile.headroom || typeof profile.headroom !== "object" ||
+		Array.isArray(profile.headroom) ||
+		Object.keys(profile.headroom).some((key) => !["kind", "value", "source"].includes(key)) ||
+		!["roofline-ratio", "sol-gap", "measured-reference", "unknown"].includes(profile.headroom.kind) ||
+		typeof profile.headroom.source !== "string" || !profile.headroom.source.trim() ||
+		profile.headroom.source.length > 400 ||
+		(profile.headroom.value !== undefined && (typeof profile.headroom.value !== "number" || !Number.isFinite(profile.headroom.value)))))
+		throw new HarnessError("m07.subject-profile", "subjectProfile.headroom needs a kind, a stated source, and a finite value when it claims one");
+	return { implementationSpace: profile.implementationSpace, rationale: profile.rationale.trim(),
+		baselineStrength: profile.baselineStrength,
+		...(profile.endToEndShare === undefined ? {} : { endToEndShare: profile.endToEndShare }),
+		...(profile.headroom ? { headroom: { kind: profile.headroom.kind, source: profile.headroom.source.trim(),
+			...(profile.headroom.value === undefined ? {} : { value: profile.headroom.value }) } } : {}) };
+}
+
 function nonempty(value: string, label: string): string {
 	if (!value?.trim()) throw new HarnessError("m07.input", `${label} 不能为空`);
 	return value.trim();
@@ -697,7 +725,7 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string,
 		section("预期产物", task.expectedOutputs.map((x) => `- ${x}`).join("\n") || "无"),
 		section("待检查事项", task.checks.map((x) => `- ${x}`).join("\n") || "无"),
 	];
-	if (task.executionLoop && "mode" in task.executionLoop && task.executionLoop.mode === "candidate-episode") boundary.push(section("候选实验热循环", "在同一执行会话中，可对已有评测的源码与原始回执反复调用 candidate_evaluate，立即取得宿主只读核验事实。每次填写 sourcePaths、receiptPaths、hypothesis、changeKind（repair/structure/parameters）、intent（solution/diagnostic）；可填写条件、实际改动摘要和 parentCandidateId（本轮 Cxxx 或同目标历史 Txxx/Cxxx）。这些是模型声明的适用与血缘，不是宿主证明的因果。candidate_list 列出同目标历史候选与同口径最佳，candidate_read 读取冻结证据，candidate_checkout 复制历史源码作下一工作点；原回执只属历史，改动后要取得新评测回执。上述核验与归档工具处理已有结果。宿主另外提供 candidate_run 时，通过它冻结并执行新候选，按工具声明配置后端；pending 使用原 runId 与 resume 查询。已有回执仍用 candidate_evaluate。执行者确定有限数值参数域后，可用 candidate_sweep 枚举该域并保留每项结果；工具不决定结构、搜索宽度或停止条件。没有执行后端时，按任务已有授权工具执行并保存原始回执。当前探索父代可为较慢或近似正确候选；只有源码绑定且正确性通过的同口径测量可更新对应最佳，不同 basis 不作高低比较。编译/数值负反馈可在本会话修复再测，无需等另一个 reviewer 轮次。最终报告返回规划层，原任务检查、研究评审与原目标验收仍独立进行。用户约束和成功标准不可修订；目标计划、局部路线假设及候选父代可随证据调整。"));
+	if (task.executionLoop && "mode" in task.executionLoop && task.executionLoop.mode === "candidate-episode") boundary.push(section("候选实验热循环", "在同一执行会话中，可对已有评测的源码与原始回执反复调用 candidate_evaluate，立即取得宿主只读核验事实。每次填写 sourcePaths、receiptPaths、hypothesis、changeKind（repair/structure/parameters）、strategy（枚举策略）、location（精确改动位置）、intent（solution/diagnostic）；可填写条件、实际改动摘要和 parentCandidateId（本轮 Cxxx 或同目标历史 Txxx/Cxxx）。一个候选只做一个策略、一处位置；位置必须真的出现在提交的源码里。这些是模型声明的适用与血缘，不是宿主证明的因果。宿主对每次核验给出确定性判决（guard：reject/keep/accept/revert；分层有界分数；lane 与 bootstrap/tuning 相位）与搜索状态（停滞计数与信号、禁令方向、repair-in-place/restructure/replan 路线、父代选项、策略菜单与各策略成绩），判决与路线不接受协商；停滞期内重复被禁的「改动类别+策略+位置」必须显式给出 newEvidence。bootstrap 相位（该工作对象尚无通过核验的正确候选）只允许修复与结构改动，数值参数候选必须在 tuning 相位并声明已验证正确的父候选。candidate_list 列出同目标历史候选与同口径最佳，candidate_read 读取冻结证据，candidate_checkout 复制历史源码作下一工作点；原回执只属历史，改动后要取得新评测回执。上述核验与归档工具处理已有结果。宿主另外提供 candidate_run 时，通过它冻结并执行新候选，按工具声明配置后端；pending 使用原 runId 与 resume 查询。已有回执仍用 candidate_evaluate。执行者确定有限数值参数域后，可用 candidate_sweep 枚举该域并保留每项结果；工具不决定结构、搜索宽度或停止条件。没有执行后端时，按任务已有授权工具执行并保存原始回执。当前探索父代可为较慢或近似正确候选；只有源码绑定且正确性通过的同口径测量可更新对应最佳，不同 basis 不作高低比较。编译/数值负反馈可在本会话修复再测，无需等另一个 reviewer 轮次。最终报告返回规划层，原任务检查、研究评审与原目标验收仍独立进行。用户约束和成功标准不可修订；目标计划、局部路线假设及候选父代可随证据调整。"));
 	if (task.executionLoop && (!("mode" in task.executionLoop) || task.executionLoop.mode !== "candidate-episode")) boundary.push(section("执行返工", "mode" in task.executionLoop ?
 		"同一候选可持续局部修补，直至 reviewer 给出终态判断或发生真实阻断；每轮由全新只读 reviewer 反馈。不得扩大任务义务、替换指南或假称 reviewer 的 ready 是最终采用。" :
 		`历史记录中的轮数 ${task.executionLoop.maxRounds} 和截止时间 ${task.executionLoop.deadlineAt} 仅供审计，不是当前执行限制。同一候选可持续局部修补，直至 reviewer 给出终态判断或发生真实阻断；每轮后由全新只读 reviewer 给出反馈；只有控制器可决定是否再次提示。不得扩大任务义务、替换指南或假称 reviewer 的 ready 是最终采用。`));
@@ -994,7 +1022,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			const exploratory = input.exploratory === true || !baseline;
 			const attemptId = "A001";
 			const descriptor: RunDescriptorV1 = { version: 1, instanceId: process.env.PRE_RSI_RUN_INSTANCE_ID ?? randomUUID(), attemptId, workspaceId: await ctx.store.storeId(), goalRunId: record.runId, codeRevision: loadedSource?.sourceCommit ?? process.env.PRE_RSI_CODE_REVISION ?? "unrecorded", ...(loadedSource ? { loadedSource } : {}), controlDir: ctx.ws.runDir("M07", record.runId), process: await (options.processIdentity ?? readCurrentProcessIdentity)() };
-			const goal: CurrentGoal = { version: 1, runId: record.runId, lifecycle: "active", startedAt: record.startedAt, updatedAt: record.startedAt, goal: input.goal.trim(), problemRelation: input.problemRelation.trim(), constraints: input.constraints.map((x) => nonempty(x, "constraint")), successCriteria: input.successCriteria.map((x) => nonempty(x, "success criterion")), plan: input.plan.trim(), exploratory, formalBaseline: !!baseline && !exploratory, problemSnapshotPath: frozen, knowledgeSnapshot, m04BaselineRunId: baseline?.run.runId, checkpointRawScope: beginOptions?.checkpointRawScope ?? "workspace", ...(beginOptions?.candidateVerification ? { candidateVerification: { version: 1 as const, id: beginOptions.candidateVerification.id, verifierVersion: beginOptions.candidateVerification.verifierVersion, goalAdmission: beginOptions.candidateVerification.goalAdmission === true, boundAt: record.startedAt, firstTaskIndex: 0 } } : {}), ...(failedM04.length ? { m04BaselineFailures: failedM04 } : {}), baselineHistory: baseline ? [{ at: record.startedAt, knowledgeSnapshot, m04RunId: baseline.run.runId, ...(failedM04.length ? { failedM04 } : {}) }] : [], budgetPolicy: budget.policy, budgetPolicyVersionId: budget.versionId, budgetPolicyFrozenAt: record.startedAt, methodBinding: { versionId: workflowMethod?.versionId ?? budget.versionId }, ...(workflowMethod ? { workflowMethod } : {}), ...(beginOptions?.executionContract === "continuous" ? { executionContract: { version: 1 as const, mode: "continuous" as const, frozenAt: record.startedAt } } : {}), executionState: { version: 1, activeAttemptId: attemptId, attempts: [{ version: 1, id: attemptId, state: "running", startedAt: record.startedAt, runDescriptor: descriptor }], operations: [] }, tasks: [], decisions: [], limitations: [] };
+			const goal: CurrentGoal = { version: 1, runId: record.runId, lifecycle: "active", startedAt: record.startedAt, updatedAt: record.startedAt, goal: input.goal.trim(), problemRelation: input.problemRelation.trim(), constraints: input.constraints.map((x) => nonempty(x, "constraint")), successCriteria: input.successCriteria.map((x) => nonempty(x, "success criterion")), plan: input.plan.trim(), exploratory, formalBaseline: !!baseline && !exploratory, problemSnapshotPath: frozen, knowledgeSnapshot, m04BaselineRunId: baseline?.run.runId, checkpointRawScope: beginOptions?.checkpointRawScope ?? "workspace", ...(beginOptions?.candidateVerification ? { candidateVerification: { version: 1 as const, id: beginOptions.candidateVerification.id, verifierVersion: beginOptions.candidateVerification.verifierVersion, goalAdmission: beginOptions.candidateVerification.goalAdmission === true, boundAt: record.startedAt, firstTaskIndex: 0 } } : {}), ...(failedM04.length ? { m04BaselineFailures: failedM04 } : {}), baselineHistory: baseline ? [{ at: record.startedAt, knowledgeSnapshot, m04RunId: baseline.run.runId, ...(failedM04.length ? { failedM04 } : {}) }] : [], budgetPolicy: budget.policy, searchBudget: ctx.config.searchBudget ?? DEFAULT_SEARCH_BUDGET, budgetPolicyVersionId: budget.versionId, budgetPolicyFrozenAt: record.startedAt, methodBinding: { versionId: workflowMethod?.versionId ?? budget.versionId }, ...(workflowMethod ? { workflowMethod } : {}), ...(beginOptions?.executionContract === "continuous" ? { executionContract: { version: 1 as const, mode: "continuous" as const, frozenAt: record.startedAt } } : {}), executionState: { version: 1, activeAttemptId: attemptId, attempts: [{ version: 1, id: attemptId, state: "running", startedAt: record.startedAt, runDescriptor: descriptor }], operations: [] }, tasks: [], decisions: [], limitations: [] };
 			await save(ctx, goal);
 			return goal;
 		},
@@ -1106,14 +1134,24 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				const loop = spec.executionLoop as unknown;
 				if (!loop || typeof loop !== "object" || Array.isArray(loop)) throw new HarnessError("m07.loop", "invalid execution-loop policy");
 				const fields = loop as Record<string, unknown>;
-				if (["until-ready", "candidate-episode"].includes(String(fields.mode)) ? Object.keys(fields).length !== 1 :
-					Object.keys(fields).length !== 2 || !Number.isSafeInteger(fields.maxRounds) || Number(fields.maxRounds) < 1 ||
-					typeof fields.deadlineAt !== "string" || !Number.isFinite(Date.parse(fields.deadlineAt)))
+				const named = ["until-ready", "candidate-episode"].includes(String(fields.mode));
+				const extra = Object.keys(fields).filter(key => !["mode", "maxRounds", "deadlineAt"].includes(key));
+				if (extra.length || (named ? false : !("maxRounds" in fields) || !("deadlineAt" in fields)) ||
+					(fields.maxRounds !== undefined && (!Number.isSafeInteger(fields.maxRounds) || Number(fields.maxRounds) < 1)) ||
+					(fields.deadlineAt !== undefined && (typeof fields.deadlineAt !== "string" || !Number.isFinite(Date.parse(fields.deadlineAt)))))
 					throw new HarnessError("m07.loop", "invalid execution-loop policy");
 			}
 			spec = { ...spec, objective: spec.objective.trim(), inputs: normalizedUnique(spec.inputs, "task input"), expectedOutputs: normalizedUnique(spec.expectedOutputs, "expected output"), checks: normalizedUnique(spec.checks, "task check"),
-				executionLoop: spec.executionLoop ? { mode: "mode" in spec.executionLoop ? spec.executionLoop.mode : "until-ready" } : undefined };
+				executionLoop: spec.executionLoop ? { mode: "mode" in spec.executionLoop ? spec.executionLoop.mode : "until-ready",
+					...(spec.executionLoop.maxRounds === undefined ? {} : { maxRounds: spec.executionLoop.maxRounds }),
+					...(spec.executionLoop.deadlineAt === undefined ? {} : { deadlineAt: spec.executionLoop.deadlineAt }) } : undefined };
 			if (spec.subjectId !== undefined) spec.subjectId = nonempty(spec.subjectId, "task subjectId");
+			spec.subjectProfile = validateSubjectProfile(spec.subjectProfile);
+			// Under a bound verifier an execute task produces candidates, and the basis
+			// requires the abstraction-layer decision and the headroom record before
+			// spending a search budget on it.
+			if (spec.mode === "execute" && goal.candidateVerification && !spec.subjectProfile)
+				throw new HarnessError("m07.subject-profile", "an execute task under a bound candidate verifier must declare subjectProfile: the implementation space with its rationale and the baseline strength it competes against");
 			let branchParent: M07TaskRecord | undefined;
 			let branchManifest: BranchManifestV1 | undefined;
 			if (spec.context) {
@@ -1124,6 +1162,9 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				if (!branchParent || branchParent.mode !== "execute" || branchParent.context || !["returned", "accepted", "rejected"].includes(branchParent.status) || !branchParent.branchSource || branchParent.branchSource.checkpoint.id !== reference.checkpointId) throw new HarnessError("m07.branch", "parent is not a settled, frozen execute task at the requested checkpoint");
 				if (branchParent.branchSource.checkpoint.runId !== runId || branchParent.branchSource.checkpoint.taskId !== branchParent.taskId || branchParent.branchSource.checkpoint.inputManifest !== branchParent.branchSource.manifestPath) throw new HarnessError("m07.branch", "checkpoint receipt does not bind this run, task, and evidence manifest");
 				if (goal.branchSelections?.some((item) => item.parentTaskId === reference.parentTaskId)) throw new HarnessError("m07.branch", "branch selection is frozen; no later candidate may join this comparison");
+					const siblings = goal.tasks.filter((item) => item.context?.parentTaskId === reference.parentTaskId).length;
+					const branchLimit = (goal.searchBudget ?? DEFAULT_SEARCH_BUDGET).maxBranchesPerCheckpoint;
+					if (siblings >= branchLimit) throw new HarnessError("m07.branch", `the frozen search budget allows ${branchLimit} competing branches from one checkpoint; select among the existing ones instead of widening further`);
 				if (spec.mode !== "execute" || spec.objective !== branchParent.objective || spec.subjectId !== branchParent.subjectId || !sameStrings(spec.checks, branchParent.checks) || !sameStrings(spec.expectedOutputs, branchParent.expectedOutputs) || Boolean(spec.requireIndependentCheck) !== Boolean(branchParent.requireIndependentCheck) || !sameStrings(spec.inputs, branchParent.inputs) || (spec.parentTaskId && spec.parentTaskId !== branchParent.taskId) || (spec.supersedesTaskId && spec.supersedesTaskId !== branchParent.taskId)) throw new HarnessError("m07.branch", "fork candidates must retain the parent's subject, objective, inputs, outputs, checks, execute mode, and independent-check obligation");
 					if (Boolean(spec.candidate) !== Boolean(branchParent.candidate) ||
 						(spec.candidate && branchParent.candidate &&
@@ -1156,6 +1197,8 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			if (spec.executionLoop) {
 				if (spec.mode !== "execute" || !("mode" in spec.executionLoop) || !["until-ready", "candidate-episode"].includes(spec.executionLoop.mode))
 					throw new HarnessError("m07.loop", "new executionLoop requires execute mode and a supported policy");
+				if (spec.executionLoop.mode === "until-ready" && goal.candidateVerification)
+					throw new HarnessError("m07.loop", "a host candidate verifier is bound to this goal: execute tasks use candidate-episode so acceptance stays with the deterministic verifier instead of a reviewer session");
 				if (spec.executionLoop.mode === "candidate-episode" && spec.context)
 					throw new HarnessError("m07.episode", "candidate episode requires a fresh task, not a historical session fork");
 				if (spec.executionLoop.mode === "candidate-episode" && (!goal.candidateVerification || goal.tasks.length < goal.candidateVerification.firstTaskIndex))
@@ -1369,88 +1412,20 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				}
 				task.session = handle.ref; await save(ctx, goal);
 				if (spec.executionLoop && "mode" in spec.executionLoop && spec.executionLoop.mode === "until-ready") {
-					const transcript: string[] = [];
-					task.executionRounds = [];
-					let nextMessage = message;
-					for (let index = 1; ; index++) {
-						if (!Number.isSafeInteger(index)) throw new HarnessError("m07.loop", "round identity overflow");
-						const currentOperation: M07OperationV1 = index === 1 ? operation! : { version: 1, id: `O${String(goal.executionState!.operations.length + 1).padStart(3, "0")}`, taskId: id, status: "prepared", issuedAt: nowIso() };
-						activeOperation = currentOperation;
-						if (index > 1) { goal.executionState!.operations.push(currentOperation); await save(ctx, goal); }
-						await verifyDispatchKnowledge();
-						if (index === 1) { event.deliveryStatus = "submitted"; event.providerUsageSessionId = handle.ref.id; await writeProjectionEvent(ctx.ws, event); }
-						currentOperation.status = "issued"; await save(ctx, goal);
-						promptIssued = true;
-						const report = (await handle.prompt(nextMessage)).text;
-						currentOperation.status = "response-received";
-						await verifyFrozenInputs();
-						if (task.experienceSelection) task.experienceSelection.loadedAt = nowIso();
-						const builderReportPath = path.join(dir, `round-${index}-builder.md`);
-						await writeFileAtomic(builderReportPath, report);
-						const round: NonNullable<M07TaskRecord["executionRounds"]>[number] = { index, operationId: currentOperation.id, builderContext: index === 1 ? branchParent ? { mode: "fork", reason: `same task explored from ${branchParent.branchSource!.checkpoint.id}` } : { mode: "fresh", reason: "new M07 task" } : { mode: "continue", reason: "same builder repairs the same frozen task in its live session" }, builderReportPath, completedAt: nowIso() };
-						task.executionRounds.push(round);
-						transcript.push(`## Round ${index} builder\n\n${report}`);
-						await save(ctx, goal);
-						const reviewerRoot = path.join(dir, `round-${index}-snapshot`);
-						const reviewerSnapshotBytes = await snapshotRoundForReviewer(workDir, reviewerRoot);
-						round.reviewerSnapshotBytes = reviewerSnapshotBytes;
-						round.reviewerSnapshotPath = reviewerRoot;
-						let reviewerPrompt = `Review only this M07 task round and the copied work-directory snapshot. Goal: ${goal.goal}\nProblem relation: ${goal.problemRelation}\nFrozen goal constraints: ${goal.constraints.join("; ")}\nFrozen success criteria: ${goal.successCriteria.join("; ")}\nGoal plan at task creation: ${goal.plan}\nTask objective: ${spec.objective}\nChecks: ${spec.checks.join("; ")}\nExpected outputs: ${spec.expectedOutputs.join("; ")}\nFrozen plan input: ${task.planCopy ? path.relative(workDir, task.planCopy) : "none"}\n${pack ? `The builder's frozen knowledge and selected experience follow. Check relevant records' scope, availability and limits; selection and loading do not establish scientific truth or task success.\n\n${pack}\n\n` : ""}The builder report follows. Inspect the copied files only as needed. Before asserting that a field or block is absent, inspect the exact file and its complete relevant field or object range; if that cannot be done, report the gap as unverified. Reply with only JSON {"verdict":"ready|revise|replan|blocked","feedback":"specific evidence-grounded reason"}, without extra prose or code fences. Escape paragraph breaks inside the feedback JSON string as \\n, never raw line breaks inside quotes. Identify decisive checked files, measurements, failures and limitations. For operator optimization, distinguish compilation, interface and numerical correctness from performance or score feedback; compare performance only among candidates actually passing this task's correctness checks under a comparable measurement basis, then assess the choice against the frozen original goal. Ground diagnosis in observed measurements; do not require a particular profiler or metric. The goal plan, task objective and builder hypotheses are proposals to evaluate under the frozen goal, user constraints and success criteria; do not promote them into independent user requirements or evidence of impossibility. Verify the substantive task objective as well as its checks against the frozen goal and constraints. Completed actions, saved files or exhausted self-imposed attempts do not satisfy an unmet attainment objective. A local negative result may satisfy an observation task but does not prove the parent goal impossible or exhaust untested routes. Use revise while work remains within this task; replan when the task definition conflicts with frozen obligations, needs a plan change, or claims route exhaustion beyond its evidence; blocked for an evidenced external impediment. ready requires the task objective and checks to be met and still needs the controller's separate final review. Keep the original goal and authorized task scope; use replan for conflicts instead of silently changing obligations.\n\n${report}`;
-						reviewerPrompt = `The authorized task deliverable and the parent goal are separate. A documented negative experiment can be ready for a diagnostic or bounded-attempt task when its own objective and checks are met; it does not pass an unmet original goal criterion. Do not demand another submission, evaluation, or new kernel beyond this task's authorization or exhausted external quota. If this task itself required attainment and failed, use replan instead of revise demanding unauthorized work.\n\n${reviewerPrompt}`;
-						if (reviewerPrompt.length + systemPromptFor("reviewer").length > policy.maxPromptChars) {
-							const handoff = await freezeBuilderReportForReviewer(report, reviewerRoot);
-							round.builderReportHandoffDir = handoff.folder;
-							reviewerPrompt = reviewerPrompt.slice(0, reviewerPrompt.length - report.length) + handoff.message;
-						}
-						if (reviewerPrompt.length + systemPromptFor("reviewer").length > policy.maxPromptChars) throw new HarnessError("context.budget", "reviewer control input exceeds the frozen prompt handoff size");
-						const reviewerSpec = sessionSpec(ctx, `M07-${id}-round-${index}-reviewer`, "reviewer", systemPromptFor("reviewer"), { kind: "read-dir", root: reviewerRoot });
-						if (goal.methodBinding) reviewerSpec.methodBinding = goal.methodBinding;
-						const reviewRunRecord = await ctx.ws.readRun("M07", runId);
-						const reviewer = await openBoundedSession(ctx.runner, reviewRunRecord, { mode: "fresh", intent: "independent-judgment", reason: `M07 round ${index} reviewer must independently inspect the frozen candidate snapshot`, evidence: [{ version: 1, label: `M07 ${id} round ${index} snapshot`, path: reviewerRoot, status: "frozen-copy", sourceVersion: `${runId}/${id}/round-${index}` }], spec: reviewerSpec }, () => ctx.ws.writeRun(reviewRunRecord));
-						round.reviewerSession = reviewer.ref;
-						await save(ctx, goal);
-						let rawReview!: string;
-						let verdict!: ReturnType<typeof parseRoundReview>;
-						try {
-							let request = reviewerPrompt;
-							for (let attempt = 1; ; attempt++) {
-								if (!Number.isSafeInteger(attempt)) throw new HarnessError("m07.loop-review", "reviewer attempt identity overflow");
-								await verifyDispatchKnowledge();
-								rawReview = (await reviewer.prompt(request)).text;
-								if (Buffer.byteLength(rawReview, "utf8") > 512_000)
-									throw new HarnessError("m07.file-size", "reviewer report file exceeds 512,000 UTF-8 bytes");
-								const attemptPath = path.join(dir, `round-${index}-reviewer-attempt-${attempt}.md`);
-								await writeFileAtomic(attemptPath, rawReview);
-								try { verdict = parseRoundReview(rawReview); break; }
-								catch (error) {
-									if (!(error instanceof HarnessError) || error.code !== "m07.loop-review") throw error;
-									transcript.push(`## Round ${index} reviewer attempt ${attempt}\n\nInvalid structured verdict; see ${path.basename(attemptPath)}. ${error.message}`);
-									request = `Your preceding response was not a usable structured verdict: ${error.message}. Continue in this SAME independent read-only reviewer session against the SAME frozen round snapshot and unchanged task checks. Inspect the files as needed, then return only strict JSON {"verdict":"ready|revise|replan|blocked","feedback":"specific evidence-grounded reason"}. Do not infer ready from malformed text, change task obligations, or request builder work before a valid verdict.`;
-								}
-							}
-						} finally { task.toolLog.push(...reviewer.toolLog().map((entry) => ({ ...entry, reviewerSessionId: reviewer.ref.id }))); reviewer.dispose(); }
-						const reviewerReportPath = path.join(dir, `round-${index}-reviewer.md`);
-						await writeFileAtomic(reviewerReportPath, rawReview);
-						round.reviewerReportPath = reviewerReportPath;
-						let fileCheckFailure: string | undefined;
-						if (verdict.verdict === "ready") {
+					const loopBounds = spec.executionLoop && "mode" in spec.executionLoop ? spec.executionLoop : undefined;
+					await runUntilReadyRounds({ ctx, goal, task, spec, policy, runId, taskId: id, dir, workDir, message,
+						maxRounds: loopBounds?.maxRounds ?? (goal.searchBudget ?? DEFAULT_SEARCH_BUDGET).reviewRoundsPerTask,
+						...(loopBounds?.deadlineAt ? { deadlineAt: loopBounds.deadlineAt } : {}),
+						...(pack ? { pack } : {}), handle, operation: operation!, event,
+						...(branchParent ? { branchParent } : {}),
+						save: () => save(ctx, goal), verifyDispatchKnowledge, verifyFrozenInputs,
+						setActiveOperation: (next) => { activeOperation = next; },
+						markPromptIssued: () => { promptIssued = true; },
+						validateReadyFiles: async (reviewerRoot) => {
 							const candidate = await validateCandidateFiles(reviewerRoot, spec.expectedOutputs.map((item) => path.join(reviewerRoot, item)), spec.lessonDeltaOutput);
-							const fileFailures = [...candidate.expectedOutputs.flatMap((item) => item.error ? [item.error] : []), ...(candidate.lessonDeltaFailure ? [candidate.lessonDeltaFailure] : [])];
-							if (fileFailures.length) {
-								fileCheckFailure = fileFailures.join("; ");
-								verdict = { verdict: "revise" as const, feedback: `Reviewer reported ready, but the controller's final-review file checks failed: ${fileCheckFailure}. Repair the same candidate and let a fresh reviewer inspect it.` };
-							}
-						}
-						round.verdict = verdict.verdict; round.feedback = verdict.feedback;
-						transcript.push(`## Round ${index} reviewer\n\n${rawReview}${fileCheckFailure ? `\n\nController file-bound check changed this ready verdict to revise: ${fileCheckFailure}` : ""}`);
-						await save(ctx, goal);
-						if (verdict.verdict === "ready" || verdict.verdict === "replan" || verdict.verdict === "blocked") { task.loopStopReason = verdict.verdict; break; }
-						nextMessage = `Continue the same authorized task under the original goal, user constraints and success criteria. The recorded plan and route hypotheses may be revised in light of evidence; they are not additional user requirements. Fresh reviewer feedback from round ${index}: ${verdict.feedback}\nAddress the observed gap within this task, then report concrete changes and verification. Repair an actual implementation or numerical defect; if the evidence instead calls for a different structure or plan outside this task, explain that need and return replan rather than repeating parameter changes. Where the task compares candidates, keep the verified best distinct from the current exploration point; report the hypothesis, exact change, observed feedback, and whether this attempt is retained, rejected, or still uncertain. Do not repeat a rejected candidate without new evidence. Do not expand scope or silently restart an external action whose outcome is unknown.`;
-					}
-					const reportPath = path.join(dir, "report.md");
-					const renderReport = () => `# M07 execution\n\nStop: ${task.loopStopReason ?? "incomplete"}\n\n${transcript.join("\n\n")}\n`;
-					await writeFileAtomic(reportPath, renderReport());
-					task.reportPath = reportPath; task.status = "returned";
+							const failures = [...candidate.expectedOutputs.flatMap((item) => item.error ? [item.error] : []), ...(candidate.lessonDeltaFailure ? [candidate.lessonDeltaFailure] : [])];
+							return failures.length ? failures.join("; ") : undefined;
+						} });
 				} else {
 					await verifyDispatchKnowledge();
 					event.deliveryStatus = "submitted"; event.providerUsageSessionId = handle.ref.id; await writeProjectionEvent(ctx.ws, event);
@@ -1473,6 +1448,8 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 					if (task.experienceSelection) task.experienceSelection.loadedAt = nowIso();
 					const reportPath = path.join(dir, "report.md"); await writeFileAtomic(reportPath, report);
 					task.reportPath = reportPath; task.status = "returned";
+					// A spent search budget is a recorded control fact, not a model claim.
+					if (task.episode?.budget?.stop) task.loopStopReason = "budget-boundary";
 				}
 			} catch (error) {
 				if (hostRecoveryAbort) await hostRecoveryAbort;

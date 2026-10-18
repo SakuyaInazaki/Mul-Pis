@@ -210,3 +210,20 @@ test("M07 rechecks the live knowledge epoch after session setup and before dispa
  assert.equal((await f.controller.status(f.goal.runId)).executionState?.operations[0].status,"not-issued");
  assert.equal(modelCalls,0);
 });
+
+test("the until-ready loop stops at its frozen round bound instead of revising forever", async t => {
+ let rounds = 0;
+ const f = await fixture(t, async ({spec}) => {
+  if (spec.label.includes("reviewer")) return JSON.stringify({verdict:"revise",feedback:"keep going"});
+  if (spec.tools.kind === "execution") { rounds++; await writeFile(path.join(spec.tools.root,"result.txt"),`attempt ${rounds}`); }
+  return "another attempt";
+ });
+ const task = await f.controller.delegate(f.goal.runId,{objective:"bounded rounds",inputs:[],expectedOutputs:["result.txt"],checks:["bounded"],mode:"execute",executionLoop:{mode:"until-ready",maxRounds:2}});
+ assert.equal(task.status,"returned");
+ assert.equal(rounds,2,"the builder is prompted exactly twice");
+ assert.equal(task.loopStopReason,"max-rounds");
+ assert.equal(task.executionRounds?.length,2);
+ const past = await f.controller.delegate(f.goal.runId,{objective:"expired deadline",inputs:[],expectedOutputs:["result.txt"],checks:["bounded"],mode:"execute",executionLoop:{mode:"until-ready",maxRounds:5,deadlineAt:new Date(Date.now()-1000).toISOString()}});
+ assert.equal(past.loopStopReason,"deadline","an expired deadline stops the loop before a new round is issued");
+ assert.equal(past.executionRounds?.length,0);
+});

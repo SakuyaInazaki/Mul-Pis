@@ -6,6 +6,7 @@
  * Nothing here decides models: every role's model comes from the workspace
  * configuration, and the harness refuses to run a stage whose role is unset.
  */
+import type { SearchBudgetPolicyV1 } from "./m07/candidate-policy.ts";
 import type { ContextBoundaryRecordV1 } from "./context/boundary.ts";
 
 /** Roles that a stage session can take. One role can be served by any configured model. */
@@ -38,6 +39,9 @@ export interface HarnessConfig {
 	localMission?: { execution?: "task-root-bash"; evaluatorId?: string };
 	/** Independent M03 question/evaluation sessions. Repeated models are allowed and remain distinct sessions. */
 	m03Reviewers?: Array<{ id: string; model: string }>;
+	/** Frozen per-task M07 search budget. Absent means the harness defaults; every
+	 * number must be re-measured on this project before it is trusted. */
+	searchBudget?: SearchBudgetPolicyV1;
 	/** Maximum number of independent stage tasks processed at the same time. Engineering default 1. */
 	concurrency: number;
 	/** External tool endpoints for M05. Absent entries disable the corresponding provider. */

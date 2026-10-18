@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { HarnessError, ROLES, THINKING_LEVELS, type HarnessConfig, type ModelSpec, type Role, type ThinkingLevel } from "./types.ts";
+import { validateSearchBudget } from "./m07/candidate-policy.ts";
 
 export const CONFIG_FILE = "research.config.json";
 
@@ -96,8 +97,9 @@ export function validateConfig(input: unknown): HarnessConfig {
 			throw new HarnessError("config.local-mission", "localMission.execution must be task-root-bash and/or localMission.evaluatorId must be a trusted registry ID");
 		localMission = { ...policy as HarnessConfig["localMission"] };
 	}
+	const searchBudget = obj.searchBudget === undefined ? undefined : validateSearchBudget(obj.searchBudget);
 	return { roles, ...(m03Reviewers ? { m03Reviewers } : {}),
-		...(localMission ? { localMission } : {}), concurrency, tools };
+		...(localMission ? { localMission } : {}), ...(searchBudget ? { searchBudget } : {}), concurrency, tools };
 }
 
 export async function loadConfig(path: string): Promise<HarnessConfig> {

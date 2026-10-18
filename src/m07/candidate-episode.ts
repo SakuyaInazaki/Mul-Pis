@@ -8,6 +8,10 @@ import { candidateObservation, type CandidateVerifier, type FrozenCandidateFile 
 import { availableCandidateByRef, candidateArchive, candidateSearchSnapshot, candidateSubjectId, globalCandidateBest, identicalSourceRefs } from "./candidate-archive.ts";
 import { candidateSearchBrief, candidateSearchFocus } from "./candidate-search.ts";
 import { compareCandidateObservations, projectCandidateFeedback, summarizeCandidateDiagnostics } from "./candidate-diagnostics.ts";
+import { CANDIDATE_STRATEGIES, candidateSearchState, candidateStrategyMenu, candidateStrategyStats,
+	candidateBudgetLedger, decideCandidate, DEFAULT_SEARCH_BUDGET, requireAllowedAction,
+	requireBudget, requireUnbannedDirection,
+	type CandidateChangeKind, type CandidateStrategy } from "./candidate-policy.ts";
 import { isSafeRelativeOutputPath } from "./expected-output.ts";
 import type { CandidateObservationV1, CurrentGoal, M07TaskRecord } from "./types.ts";
 
@@ -40,8 +44,27 @@ export function createCandidateEpisodeTool(input: {
 			throw new HarnessError("m07.candidate", "conditions must be concise declared applicability statements");
 		if (args.changeSummary !== undefined && (typeof args.changeSummary !== "string" || !args.changeSummary.trim() || args.changeSummary.length > 4000))
 			throw new HarnessError("m07.candidate", "changeSummary must describe the declared edit");
+		if (!CANDIDATE_STRATEGIES.includes(args.strategy as CandidateStrategy))
+			throw new HarnessError("m07.candidate-action", `strategy must be one of: ${CANDIDATE_STRATEGIES.join(", ")}`);
+		if (typeof args.location !== "string" || !args.location.trim() || args.location.length > 300)
+			throw new HarnessError("m07.candidate-action", "location must name the exact declared edit site, for example kernel.c or kernel.c:tile_loop");
+		if (args.newEvidence !== undefined && (typeof args.newEvidence !== "string" || !args.newEvidence.trim() || args.newEvidence.length > 1000))
+			throw new HarnessError("m07.candidate-action", "newEvidence must state what changed since the banned direction was measured");
+		const action = { changeKind: args.changeKind as CandidateChangeKind,
+			strategy: args.strategy as CandidateStrategy, location: args.location.trim() };
+		const locationFile = action.location.includes(":") ? action.location.slice(0, action.location.indexOf(":")) : action.location;
+		const locationDetail = action.location.slice(locationFile.length + 1);
+		// A host runner evaluates frozen copies, so the declared site may name the
+		// original file while the submitted path carries the runner's prefix.
+		const locationSource = sourcePaths.find(item => item === locationFile || item.endsWith(`/${locationFile}`));
+		if (!locationSource)
+			throw new HarnessError("m07.candidate-action", `location must name one declared source file: ${sourcePaths.join(", ")}`);
 		const episode = task.episode;
 		if (!episode) throw new HarnessError("m07.candidate", "candidate episode was not initialized");
+		// Stage order and stall bans are checked before any host work, so a blocked
+		// action costs nothing and the refusal text is the same every time.
+		const priorArchive = candidateArchive(goal, task.taskId);
+		const priorState = candidateSearchState(priorArchive, { subjectId: task.subjectId, taskId: task.taskId });
 		const parentCandidateId = args.parentCandidateId;
 		let parentRef: { taskId: string; candidateId: string } | undefined;
 		let parentObservation: CandidateObservationV1 | undefined;
@@ -62,6 +85,15 @@ export function createCandidateEpisodeTool(input: {
 				parentSubjectId = parent.subjectId;
 			}
 		}
+		requireAllowedAction({ ...action, phase: priorState.phase,
+			parentVerifiedCorrect: parentObservation?.sourceBinding === "verified" &&
+				parentObservation.correctness === "passed" });
+		requireUnbannedDirection(priorState, action, args.newEvidence as string | undefined);
+		const searchBudget = goal.searchBudget ?? DEFAULT_SEARCH_BUDGET;
+		requireBudget(candidateBudgetLedger(priorArchive, { taskId: task.taskId,
+			subjectId: task.subjectId, policy: searchBudget }),
+			{ changeKind: action.changeKind, lane: action.changeKind === "repair" ||
+				priorState.phase === "bootstrap" ? "repair" : "optimization" });
 		const episodeRoot = path.join(path.dirname(task.workDir), "episode");
 		await mkdir(episodeRoot, { recursive: true });
 		let nextNumber = episode.candidates.reduce((max, candidate) =>
@@ -99,6 +131,19 @@ export function createCandidateEpisodeTool(input: {
 		};
 		const sources = await frozen(sourcePaths, "sources");
 		const receipts = await frozen(receiptPaths, "receipts");
+		// Cheap static check before any host cost: the declared edit site must
+		// actually exist in the frozen source it names.
+		if (locationDetail) {
+			const file = sources.find(item => item.declaredPath === locationSource)!;
+			const text = (await readFile(file.frozenPath)).toString("utf8");
+			const lines = /^\d+(?:-\d+)?$/.test(locationDetail)
+				? locationDetail.split("-").map(Number) : undefined;
+			const present = lines
+				? lines.every(line => line >= 1 && line <= text.split("\n").length) && (lines[1] ?? lines[0]) >= lines[0]
+				: text.includes(locationDetail);
+			if (!present) throw new HarnessError("m07.candidate-action",
+				`the declared location ${action.location} is not in the submitted source; name an existing symbol or line range`);
+		}
 		const identicalRefs = await identicalSourceRefs(goal, task.taskId, sources.map(file => file.frozenPath));
 		const lastRef = episode.candidates.at(-1)?.id;
 		let result: Awaited<ReturnType<CandidateVerifier["verifyTask"]>>;
@@ -128,11 +173,14 @@ export function createCandidateEpisodeTool(input: {
 			{ parentSubjectId, candidateSubjectId: task.subjectId }) : undefined;
 		const diagnosticSummary = summarizeCandidateDiagnostics(observation, parentComparison, parentObservation);
 		const observationPath = path.join(root, "observation.json");
-		const observationText = `${JSON.stringify({ version: 1, id, parentCandidateId, parentRef,
+		const observationFacts = { version: 1, id, parentCandidateId, parentRef,
 			identicalSourceRefs: identicalRefs, sourceRepetition, sourcePaths, receiptPaths, hypothesis: args.hypothesis,
-			conditions: args.conditions, changeSummary: args.changeSummary, changeKind: args.changeKind,
-			intent: args.intent, parentComparison, diagnosticSummary, observation }, null, 2)}\n`;
-		await writeFileAtomic(observationPath, observationText);
+			conditions: args.conditions, changeSummary: args.changeSummary, changeKind: action.changeKind,
+			strategy: action.strategy, location: action.location, newEvidence: args.newEvidence,
+			intent: args.intent, parentComparison, diagnosticSummary, observation };
+		// The frozen record must exist before the archive snapshot reads it, so the
+		// new candidate takes part in byte grouping exactly as every earlier one.
+		await writeFileAtomic(observationPath, `${JSON.stringify(observationFacts, null, 2)}\n`);
 		episode.candidates.push({ id, ...(parentCandidateId ? { parentCandidateId } : {}),
 			...(parentRef ? { parentRef } : {}), ...(identicalRefs.length ? { identicalSourceRefs: identicalRefs } : {}),
 			...(sourceRepetition ? { sourceRepetition } : {}),
@@ -140,14 +188,34 @@ export function createCandidateEpisodeTool(input: {
 			...(args.conditions ? { conditions: args.conditions as string[] } : {}),
 			...(args.changeSummary ? { changeSummary: args.changeSummary as string } : {}),
 			...(parentComparison ? { parentComparison } : {}),
-			changeKind: args.changeKind as "repair" | "structure" | "parameters", intent: args.intent as "solution" | "diagnostic", observation, observationPath });
+			changeKind: action.changeKind, strategy: action.strategy, location: action.location,
+			...(args.newEvidence ? { newEvidence: args.newEvidence as string } : {}),
+			intent: args.intent as "solution" | "diagnostic", observation, observationPath });
 		episode.currentCandidateId = id;
 		const searchSnapshot = await candidateSearchSnapshot(goal, task.taskId);
+		const record = episode.candidates.at(-1)!;
+		// The judgement compares this observation with the goal's earlier readable
+		// candidates only; the new row itself is never its own incumbent or seed.
+		const decision = decideCandidate({ observation, diagnostics: diagnosticSummary,
+			changeKind: record.changeKind, intent: record.intent, subjectId: currentSubjectId,
+			taskId: task.taskId, ...(parentRef ? { parentTaskId: parentRef.taskId } : {}),
+			history: searchSnapshot.available.filter(entry => entry.ref !== `${task.taskId}/${id}`) });
+		record.policy = decision;
+		// The snapshot entry was built before the judgement existed; the stall state
+		// must see this candidate's own guard, lane and failure signature.
+		const archived = searchSnapshot.available.find(entry => entry.ref === `${task.taskId}/${id}`);
+		if (archived) archived.policy = decision;
+		episode.search = candidateSearchState(searchSnapshot.available, { subjectId: currentSubjectId,
+			taskId: task.taskId, limits: searchBudget.routeLimits });
+		episode.budget = candidateBudgetLedger(searchSnapshot.available, { taskId: task.taskId,
+			subjectId: currentSubjectId, policy: searchBudget });
 		// Derive the local display from the same readable, subject-isolated evidence as
 		// candidate_list. Historical candidates remain intact even if a file is missing.
 		episode.incumbents = globalCandidateBest(searchSnapshot.available.filter(entry => entry.taskId === task.taskId))
 			.map(best => ({ candidateId: best.candidateRef.slice(task.taskId.length + 1), metric: best.metric,
 				...(best.subjectId ? { subjectId: best.subjectId } : {}) }));
+		const observationText = `${JSON.stringify({ ...observationFacts, decision }, null, 2)}\n`;
+		await writeFileAtomic(observationPath, observationText);
 		await input.save();
 		const searchBrief = candidateSearchBrief(searchSnapshot.facts, searchSnapshot.available,
 			candidateSearchFocus(searchSnapshot.available, task.subjectId));
@@ -175,13 +243,25 @@ export function createCandidateEpisodeTool(input: {
 				read: { tool: "candidate_read", args: { candidateRef: `${task.taskId}/${id}`, kind: "observation", offset: 0, limit: 6000 } },
 				message: "Case rows retain measurements within display space and prioritize failed/unknown cases. Parent case deltas show negative/unknown cases and regressions first. Diagnostic indexes show a first entry per category before others within display space. Counts include omitted entries. JSON paths refer to the full frozen observation; diagnostic fieldPath refers to its original receipt (candidate_read kind:receipt, fileIndex:receiptIndex). Use returned nextOffset to continue file reads. A preview/index is not full reading or causal interpretation; all original facts and parent comparisons are retained." },
 			currentCandidateId: episode.currentCandidateId, incumbents: episode.incumbents,
+			search: episode.search, budget: episode.budget,
+			strategyStats: candidateStrategyStats(searchSnapshot.available, currentSubjectId),
+			nextStrategyMenu: candidateStrategyMenu({ phase: episode.search.phase, route: episode.search.route,
+				seed: `${goal.runId}|${task.taskId}|${episode.candidates.length}` }),
+			decision: { guard: decision.guard, status: decision.status, branch: decision.branch,
+				lane: decision.lane, phase: decision.phase,
+				score: decision.score, tier: decision.tier, updatesBest: decision.updatesBest,
+				seedRef: decision.seedRef ?? null, seedSpeedup: decision.seedSpeedup ?? null,
+				incumbentComparison: decision.incumbentComparison.slice(0, 4),
+				omittedIncumbentComparisons: Math.max(0, decision.incumbentComparison.length - 4),
+				requiredFix: decision.requiredFix, advisory: decision.advisory, reasons: decision.reasons,
+				message: "The guard state, admission status, branch decision, score and best-so-far pointer are deterministic host decisions over the frozen observations; they are not negotiable and do not need a model verdict. keep advances the best; accept keeps a correct working point without advancing it; revert means continue from the named verified candidate instead of this source; reject means the result could not be bound or judged at all. The score is a bounded ranking signal over this goal's candidates, not a goal acceptance." },
 			message: observation.sourceBinding === "unknown" || observation.correctness === "unknown"
 				? "Existing result is unknown. Inspect or reconcile its original operation and receipt before considering any new side effect; do not infer that resubmission is safe."
 				: "This records an existing evaluation only. Parent, conditions and change summary are model declarations, not host-proven causality. Equal source bytes are planning facts, not a rejection. A negative finding can guide repair, but does not satisfy the original goal; exploration parent and verified incumbent remain separate." }) };
 	};
 	return {
 		name: "candidate_evaluate",
-		description: "Freeze candidate source and original receipt files already in this task's work directory, then obtain immediate trusted host observations. This tool never submits, compiles or reruns a candidate.",
+		description: "Freeze candidate source and original receipt files already in this task's work directory, then obtain immediate trusted host observations and the host's deterministic judgement. One candidate declares one strategy at one location. This tool never submits, compiles or reruns a candidate.",
 		params: {
 			sourcePaths: { type: "string[]", description: "Exact relative source file paths in this task work directory" },
 			receiptPaths: { type: "string[]", description: "Exact relative original platform receipt file paths" },
@@ -191,6 +271,9 @@ export function createCandidateEpisodeTool(input: {
 			parentCandidateId: { type: "string", description: "Earlier local Cxxx or exact same-goal Txxx/Cxxx candidate reference, if declared as parent", optional: true },
 			conditions: { type: "string[]", description: "Optional model-declared applicability or prerequisites; not host-verified causal facts", optional: true },
 			changeSummary: { type: "string", description: "Optional model-declared description of the actual source change", optional: true },
+			strategy: { type: "string", description: `One enumerated optimization strategy: ${CANDIDATE_STRATEGIES.join(", ")}` },
+			location: { type: "string", description: "The exact edit site: one declared source path, optionally with :symbol or :line or :from-to inside it" },
+			newEvidence: { type: "string", description: "Only when repeating a banned direction after a stall: what measured evidence changed since", optional: true },
 		},
 		execute(args) {
 			const current = tail.then(() => run(args));

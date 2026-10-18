@@ -186,7 +186,8 @@ def verify_goal(criteria, observations):
 		if (spec.tools.kind === "execution") {
 			await writeFile(path.join(spec.tools.root, "candidate.py"), candidate);
 			const result = await tools.candidate_run({ runId: "local-goal-test", sourcePaths: ["candidate.py"],
-				protocolId: "numeric-tree-test-v1", hypothesis: "check the original target", changeKind: "repair", intent: "solution" });
+				protocolId: "numeric-tree-test-v1", hypothesis: "check the original target", changeKind: "repair",
+				strategy: "repair", location: "candidate.py", intent: "solution" });
 			assert.match(result.text, /completed/);
 		}
 		return "Frozen local candidate evidence returned";
@@ -196,7 +197,7 @@ def verify_goal(criteria, observations):
 	const goal = await controller.begin({ goal: "Original local operator target", problemRelation: "direct", constraints: ["same task"],
 		successCriteria: ["original target"], plan: "measure" },
 		{ candidateVerification: { id: h.verifier.id, verifierVersion: h.verifier.version, goalAdmission: false }, executionContract: "continuous" });
-	const task = await controller.delegate(goal.runId, { mode: "execute", objective: "evaluate one local candidate", subjectId: "numeric-tree",
+	const task = await controller.delegate(goal.runId, { mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, objective: "evaluate one local candidate", subjectId: "numeric-tree",
 		inputs: [], expectedOutputs: ["candidate.py"], checks: ["measurement retained"], executionLoop: { mode: "candidate-episode" } });
 	const accepted = await controller.review(goal.runId, { taskId: task.taskId, artifacts: [task.reportPath!],
 		checks: [{ criterion: "measurement retained", result: "passed", evidence: [task.reportPath!] }] });

@@ -6,6 +6,7 @@ import type { ExperienceRequirementV1, M07WorkflowStrategyV1 } from "../improvem
 import type { RunDescriptorV1 } from "../runtime/run-descriptor.ts";
 import type { KnowledgeRetrievalContext } from "../knowledge/retrieval.ts";
 import type { CandidateComparisonV1, CandidatePerformanceEvidenceV1 } from "./candidate-diagnostics.ts";
+import type { CandidatePolicyDecisionV1, CandidateSearchStateV1, CandidateStrategy, SearchBudgetLedgerV1, SearchBudgetPolicyV1 } from "./candidate-policy.ts";
 import type { KnowledgeAccessEvent } from "./execution-knowledge.ts";
 
 export type M07TaskMode = "execute" | "check" | "reason";
@@ -25,10 +26,29 @@ export interface BeginGoalInput {
 	workflowMethodVersionId?: string;
 }
 
+/** Declared, never host-proven: where this work object is being implemented and
+ * what is already known about its headroom. The harness records it so a
+ * trajectory can answer "why this abstraction layer" and "why spend here"; the
+ * numbers stay model or host declarations with their own stated source. */
+export interface SubjectProfileV1 {
+	implementationSpace: "vendor-library" | "dsl-or-ir" | "handwritten-low-level";
+	/** Why this layer rather than the ones above or below it. */
+	rationale: string;
+	/** How strong the implementation being competed against already is. */
+	baselineStrength: "vendor-library" | "framework-default" | "none";
+	/** Share of end-to-end runtime, in [0, 1], when it has been measured. */
+	endToEndShare?: number;
+	/** Remaining headroom and where that estimate comes from. */
+	headroom?: { kind: "roofline-ratio" | "sol-gap" | "measured-reference" | "unknown";
+		value?: number; source: string };
+}
+
 export interface TaskSpecInput {
 	objective: string;
 	/** Actual object of this task's work; input materials do not change this identity. */
 	subjectId?: string;
+	/** Required for a candidate-producing execute task under a bound verifier. */
+	subjectProfile?: SubjectProfileV1;
 	inputs: string[];
 	expectedOutputs: string[];
 	checks: string[];
@@ -48,7 +68,9 @@ export interface TaskSpecInput {
 	/** Explicit versioned external references, each already present in inputs. Never discovered globally. */
 	resourceInputs?: Array<{ id: string; version: string; input: string }>;
 	/** Explicit task execution mode: legacy fresh-reviewer repair or same-session candidate feedback. Continuous goals do not imply a mode. Legacy bounded fields map to opt-in until-ready. No process-restart replay. */
-	executionLoop?: { mode: "until-ready" | "candidate-episode" } | { maxRounds: number; deadlineAt: string };
+	/** The legacy `{maxRounds, deadlineAt}` form means until-ready with those bounds. */
+	executionLoop?: { mode: "until-ready" | "candidate-episode"; maxRounds?: number; deadlineAt?: string } |
+		{ maxRounds: number; deadlineAt: string };
 	/** Expected JSON output carrying a candidate lesson to M04, never an adopted record. */
 	lessonDeltaOutput?: string;
 	/** Explicit competitive continuation from a frozen task leaf. Role remains execution. */
@@ -153,9 +175,16 @@ export interface M07EpisodeCandidateV1 {
 	/** Mechanical same-basis comparison with the declared parent; never an acceptance decision. */
 	parentComparison?: CandidateComparisonV1;
 	changeKind: "repair" | "structure" | "parameters";
+	/** One enumerated optimization strategy and one exact edit site per candidate. */
+	strategy?: CandidateStrategy;
+	location?: string;
+	/** Model-declared reason for repeating a banned direction; not a host fact. */
+	newEvidence?: string;
 	intent: "solution" | "diagnostic";
 	observation: CandidateObservationV1;
 	observationPath: string;
+	/** Deterministic host judgement of this observation; never a model claim. */
+	policy?: CandidatePolicyDecisionV1;
 }
 
 export interface M07CandidateEpisodeV1 {
@@ -167,6 +196,10 @@ export interface M07CandidateEpisodeV1 {
 	currentCandidateId?: string;
 	/** Readable, verified local best per subject and exact metric identity; historical rows may omit subjectId. */
 	incumbents: Array<{ candidateId: string; metric: CandidateMetricV1; subjectId?: string }>;
+	/** Deterministic stall, route and parent facts recomputed after each evaluation. */
+	search?: CandidateSearchStateV1;
+	/** Spend of this task's frozen search budget, in host evaluations. */
+	budget?: SearchBudgetLedgerV1;
 }
 
 export interface M07BranchSourceV1 {
@@ -395,6 +428,9 @@ export interface CurrentGoal {
 		failedM04?: M04BaselineFailure[] }>;
 	/** Frozen at begin; later promotion or rollback applies only to a new goal. Optional only for explicit legacy-record detection. */
 	budgetPolicy?: BudgetPolicy;
+	/** Frozen per-task search budget for this goal; later config changes do not
+	 * move it, exactly like the evidence-handoff policy snapshot. */
+	searchBudget?: SearchBudgetPolicyV1;
 	budgetPolicyVersionId?: string;
 	budgetPolicyFrozenAt?: string;
 	/** Explicit method identity loaded when this goal began; later pointer changes do not rewrite it. */
