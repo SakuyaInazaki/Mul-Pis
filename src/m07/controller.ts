@@ -31,6 +31,7 @@ import { candidateObservation, requireCandidateVerifier, type CandidateVerifier,
 import { candidateBudgetLedger, DEFAULT_SEARCH_BUDGET, operatorCategoryBudget, OPERATOR_CATEGORIES,
 	type SearchBudgetPolicyV1 } from "./candidate-policy.ts";
 import { distillEpisode, episodeRestartMessage, writeEpisodeRecord } from "./episode-record.ts";
+import { openSearchEventLog } from "./search-state/index.ts";
 import { createCandidateEpisodeTool } from "./candidate-episode.ts";
 import { createCandidateExecutionTools, pendingCandidateExecutions, type CandidateExecutionBackend } from "./candidate-runner.ts";
 import { candidateArchive, candidateSubjectId, createCandidateArchiveTools } from "./candidate-archive.ts";
@@ -1425,7 +1426,9 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				if (tools.kind !== "execution") throw new HarnessError("m07.episode", "candidate episode requires execution tools");
 				const verifier = requireCandidateVerifier(options.candidateVerifier, goal.candidateVerification);
 				const evaluationTool = createCandidateEpisodeTool({ goal, task, verifier, store: ctx.store,
-					priorRoot: path.join(ctx.ws.knowledgeDir, "prior"), save: () => save(ctx, goal) });
+					priorRoot: path.join(ctx.ws.knowledgeDir, "prior"),
+					searchEventLogFile: path.join(ctx.ws.runDir("M07", runId), "search-events.jsonl"),
+					save: () => save(ctx, goal) });
 				tools.extraTools = [evaluationTool,
 					...(options.candidateExecutionBackend && operationId ? createCandidateExecutionTools({
 						goalRunId: runId, taskId: id, operationId, subjectId: task.subjectId, workDir,
@@ -1561,6 +1564,14 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 						() => ctx.ws.writeRun(restartRun));
 					task.session = handle.ref;
 					await save(ctx, goal);
+					await openSearchEventLog(path.join(ctx.ws.runDir("M07", runId), "search-events.jsonl"))
+						.append({ runId, taskId: id, kind: "episode-restarted", round: episodeRecord.episode,
+							counters: { afterCandidates: episodeRecord.observed.candidates,
+								failureSignatures: episodeRecord.failureSignatures.length,
+								rejectedDirections: episodeRecord.rejectedDirections.length },
+							detail: { recordPath, previousSessionId, newSessionId: handle.ref.id,
+								...(episodeRecord.bestCandidateFamily ? { bestCandidate: episodeRecord.bestCandidateFamily.candidateRef } : {}) } })
+						.catch(() => undefined);
 					builderMessage = episodeRestartMessage(message, episodeRecord);
 					}
 					if (operation) operation.status = "response-received";
@@ -2144,7 +2155,9 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			if (task?.episode && options.candidateExecutionBackend && pendingBefore.some(item => item.queryAvailable)) {
 				const verifier = requireCandidateVerifier(options.candidateVerifier, goal.candidateVerification);
 				const evaluationTool = createCandidateEpisodeTool({ goal, task, verifier, store: ctx.store,
-					priorRoot: path.join(ctx.ws.knowledgeDir, "prior"), save: () => save(ctx, goal) });
+					priorRoot: path.join(ctx.ws.knowledgeDir, "prior"),
+					searchEventLogFile: path.join(ctx.ws.runDir("M07", runId), "search-events.jsonl"),
+					save: () => save(ctx, goal) });
 				const recoveryTools = createCandidateExecutionTools({ ...journalInput, workDir: task.workDir,
 					subjectId: task.subjectId, backend: options.candidateExecutionBackend, queryOnly: true,
 					evaluate: args => evaluationTool.execute(args) });

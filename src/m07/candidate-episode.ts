@@ -8,6 +8,7 @@ import { candidateObservation, type CandidateVerifier, type FrozenCandidateFile 
 import { availableCandidateByRef, candidateArchive, candidateSearchSnapshot, candidateSubjectId, globalCandidateBest, identicalSourceRefs } from "./candidate-archive.ts";
 import { candidateSearchBrief, candidateSearchFocus } from "./candidate-search.ts";
 import { assembleInjection, type InjectionPhase } from "../knowledge/injection.ts";
+import { openSearchEventLog } from "./search-state/index.ts";
 import type { KnowledgeStore } from "../knowledge/types.ts";
 import type { CandidateDiagnosticSummaryV1 } from "./candidate-diagnostics.ts";
 import { compareCandidateObservations, projectCandidateFeedback, summarizeCandidateDiagnostics } from "./candidate-diagnostics.ts";
@@ -46,9 +47,12 @@ export function createCandidateEpisodeTool(input: {
 	/** Frozen knowledge the round-by-round assembly reads; absent disables it. */
 	store?: KnowledgeStore;
 	priorRoot?: string;
+	/** Append-only search log; absent means this host records no search events. */
+	searchEventLogFile?: string;
 	save: () => Promise<void>;
 }): CustomToolSpec {
 	let tail: Promise<void> = Promise.resolve();
+	const events = input.searchEventLogFile ? openSearchEventLog(input.searchEventLogFile) : undefined;
 	const run = async (args: Record<string, unknown>): Promise<{ text: string }> => {
 		const { goal, task, verifier } = input;
 		const stringPaths = (value: unknown, label: string): string[] => {
@@ -274,6 +278,35 @@ export function createCandidateEpisodeTool(input: {
 		const observationText = `${JSON.stringify({ ...observationFacts, decision }, null, 2)}\n`;
 		await writeFileAtomic(observationPath, observationText);
 		await input.save();
+		// The console's judgement, stall and budget views read this log, so the
+		// host writes what it decided, not what the session reported.
+		if (events) {
+			const candidateFacts = { id, ...(parentRef ? { parentId: `${parentRef.taskId}/${parentRef.candidateId}` } : {}),
+				...(currentSubjectId ? { subjectId: currentSubjectId } : {}), score: decision.score,
+				isBuggy: observation.correctness !== "passed", pathRef: observationPath,
+				stage: diagnosticSummary.stage, status: decision.status };
+			await events.append({ runId: goal.runId, taskId: task.taskId, kind: "verdict",
+				round: episode.candidates.length, candidate: candidateFacts,
+				verdict: { decision: decision.guard, reason: decision.reasons[0] ?? decision.tier },
+				detail: { lane: decision.lane, phase: decision.phase, tier: decision.tier,
+					updatesBest: decision.updatesBest, ...(injection ? { injectionPhase: injection.phase } : {}),
+					...(decision.hostVerdict ? { hostFaster: decision.hostVerdict.faster,
+						hostSlower: decision.hostVerdict.slower, hostTie: decision.hostVerdict.tie,
+						hostExcluded: decision.hostVerdict.excluded } : {}) } }).catch(() => undefined);
+			if (episode.search.forcedDirectionChange) await events.append({ runId: goal.runId, taskId: task.taskId,
+				kind: "stall", round: episode.candidates.length,
+				counters: { stagnation: episode.search.stagnation, repairDepth: episode.search.repairDepth,
+					bannedDirections: episode.search.bannedDirections.length },
+				detail: { route: episode.search.route, signals: episode.search.signals.join(",") } }).catch(() => undefined);
+			await events.append({ runId: goal.runId, taskId: task.taskId, kind: "budget",
+				round: episode.candidates.length,
+				counters: { evaluations: episode.budget.evaluations, remaining: episode.budget.remaining,
+					repair: episode.budget.repair, optimization: episode.budget.optimization,
+					parameters: episode.budget.parameters, rejected: episode.budget.rejected,
+					...(episode.budget.categoryCap === undefined ? {} : { categoryCap: episode.budget.categoryCap }) },
+				detail: { ...(episode.budget.stop ? { stop: episode.budget.stop } : {}),
+					...(episode.budget.category ? { category: episode.budget.category } : {}) } }).catch(() => undefined);
+		}
 		const searchBrief = candidateSearchBrief(searchSnapshot.facts, searchSnapshot.available,
 			candidateSearchFocus(searchSnapshot.available, task.subjectId));
 		return { text: JSON.stringify({ candidateId: id, candidateRef: `${task.taskId}/${id}`, searchBrief,
