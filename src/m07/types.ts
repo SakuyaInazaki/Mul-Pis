@@ -112,16 +112,57 @@ export interface CandidateDiagnosticV1 {
 	caseId?: string;
 }
 
+/** The host's own ruling on one candidate/baseline pair, at the noise scale it
+ * measured. A search layer that re-derives "faster" from raw medians picks
+ * candidates out of noise; these verdicts are the only admissible answer to
+ * "is it actually faster", and they are facts, not negotiable opinions. */
+export interface CandidatePerformanceVerdictV1 {
+	/** Baseline denominator this verdict is about; a ratio never transfers to another. */
+	baseline: string;
+	tier?: string;
+	verdict: "faster" | "slower" | "tie" | "quarantined";
+	/** Paired candidate/baseline ratio median; below 1 means the candidate is faster. */
+	pairedRatioMedian: number;
+	/** Host threshold derived from the measured dispersion, not a fixed constant. */
+	minimumImprovementThreshold: number;
+	/** End-to-end admissibility, when the case was measured end to end. */
+	endToEndAdmissible?: boolean;
+	/** Whether an independent remeasurement agreed with the ruling. */
+	confirmed?: boolean;
+}
+
+/** Host aggregate per baseline. Coverage and magnitude stay separate numbers,
+ * ratios use geometric mean or median, and failures stay in the denominator. */
+export interface CandidateAggregateV1 {
+	baseline: string;
+	declaredCases: number;
+	decidableCases: number;
+	fasterCases: number;
+	successRate?: number;
+	geometricMeanSpeedupAllDecidable?: number;
+	medianSpeedupAllDecidable?: number;
+	geometricMeanSpeedupFasterOnly?: number;
+}
+
 export interface CandidateCaseObservationV1 {
 	caseId: string;
 	status: string;
 	correctness: "passed" | "failed" | "unknown";
+	/** Kernel-level or end-to-end case, when the host distinguishes them. */
+	scope?: "kernel" | "end-to-end";
 	/** Diagnostic measurements only. Goal promotion uses top-level metrics. */
 	metrics: CandidateMetricV1[];
 	/** Platform references such as baselines or hardware bounds, never candidate gains. */
 	referenceMeasurements?: Array<Pick<CandidateMetricV1, "name" | "value" | "unit" | "basisId">>;
 	/** Optional profiler facts normalized by the host, with original receipt locations. */
 	performance?: CandidatePerformanceEvidenceV1;
+	/** False when the host refuses to rank on this case at all. */
+	performanceDecidable?: boolean;
+	performanceUndecidableReason?: string;
+	/** Host rulings for this case; absent when the host issues none. */
+	verdicts?: CandidatePerformanceVerdictV1[];
+	/** Rank agreement across measurement rounds; unstable ordering is not a win. */
+	orderingStability?: { kendallTauBMedian?: number; pairwiseFlipRate?: number };
 }
 
 export interface CandidateExternalEvaluationV1 {
@@ -134,6 +175,10 @@ export interface CandidateExternalEvaluationV1 {
 	receiptIndex: number;
 	cases: CandidateCaseObservationV1[];
 	diagnostics: CandidateDiagnosticV1[];
+	/** Host aggregates for this evaluation, never recomputed downstream. */
+	aggregate?: CandidateAggregateV1[];
+	/** Exact host reasons why no performance comparison is admissible. */
+	measurementNotComparable?: string[];
 }
 
 export interface CandidateExecutionFactsV1 {

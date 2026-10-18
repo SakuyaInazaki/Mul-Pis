@@ -50,6 +50,7 @@ interface LocalDecision {
 interface LocalCase {
 	caseId: string;
 	scope?: "kernel" | "end-to-end";
+	orderingStability?: { kendallTauBMedian?: number; pairwiseFlipRate?: number };
 	passed: boolean;
 	degenerate?: boolean;
 	performanceDecidable?: boolean;
@@ -95,6 +96,9 @@ interface LocalReceipt {
 	correctnessPassed?: boolean;
 	measurementComparable?: boolean | null;
 	measurementNotComparable?: string[];
+	aggregate?: Record<string, { declaredCases: number; decidableCases: number; fasterCases: number;
+		successRate?: number | null; geometricMeanSpeedupAllDecidable?: number | null;
+		medianSpeedupAllDecidable?: number | null; geometricMeanSpeedupFasterOnly?: number | null }>;
 	integrity?: LocalIntegrity;
 	error?: string;
 	api?: { unresolvedCalls?: unknown[] };
@@ -407,7 +411,22 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 					const caseBasis = basisFor(row.caseId, receipt.timingExecution === timingExecution ? "ip2" : "case");
 					const pairedBaselines = Object.entries(receipt.timingExecution === timingExecution ? row.baselines ?? {} : {}).filter(([, value]) =>
 						validSamples(value.pairedCandidateToBaselineRatios) && value.pairedCandidateToBaselineRatios.every(ratio => ratio > 0));
+					// The host's own rulings travel with the case: a later layer must not
+					// re-derive "faster" from medians at a different noise scale.
+					const verdicts = Object.entries(row.decisions ?? {})
+						.filter(([, value]) => value && ["faster", "slower", "tie", "quarantined"].includes(value.verdict) &&
+							Number.isFinite(value.pairedRatioMedian) && Number.isFinite(value.minimumImprovementThreshold))
+						.map(([name, value]) => ({ baseline: name, ...(value.tier ? { tier: value.tier } : {}),
+							verdict: value.verdict, pairedRatioMedian: value.pairedRatioMedian,
+							minimumImprovementThreshold: value.minimumImprovementThreshold,
+							...(value.endToEndAdmissible === undefined ? {} : { endToEndAdmissible: value.endToEndAdmissible }),
+							...(value.confirmed === undefined ? {} : { confirmed: value.confirmed }) }));
 					const item: CandidateCaseObservationV1 = { caseId: row.caseId, status: inconclusive ? "inconclusive" : row.passed ? "passed" : "failed",
+						...(row.scope ? { scope: row.scope } : {}),
+						...(row.performanceDecidable === undefined ? {} : { performanceDecidable: row.performanceDecidable }),
+						...(row.performanceUndecidableReason ? { performanceUndecidableReason: row.performanceUndecidableReason } : {}),
+						...(verdicts.length ? { verdicts } : {}),
+						...(row.orderingStability ? { orderingStability: row.orderingStability } : {}),
 						correctness: inconclusive && !baselineIncomparable ? "unknown" : row.passed ? "passed" : "failed",
 						metrics: comparable && samples.length ? [metric("elapsed", median(samples), caseBasis),
 							...pairedBaselines.map(([name, value]) => ({ name: `candidate/baseline:${name}`, value: median(value.pairedCandidateToBaselineRatios!),
@@ -476,10 +495,22 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 				}
 				// Per-case measurements remain separately comparable; no invented aggregate or acceptance threshold.
 				const metrics = correctness === "passed" ? cases.flatMap(item => item.metrics.map(value => ({ ...value, name: `${value.name}:${item.caseId}` }))) : [];
+				// The host already reported rate, faster-only and whole-set numbers;
+				// carrying them forward keeps a later layer from inventing its own.
+				const aggregate = Object.entries(receipt.aggregate ?? {})
+					.filter(([, value]) => value && Number.isSafeInteger(value.declaredCases) && Number.isSafeInteger(value.decidableCases))
+					.map(([baseline, value]) => ({ baseline, declaredCases: value.declaredCases, decidableCases: value.decidableCases,
+						fasterCases: Number.isSafeInteger(value.fasterCases) ? value.fasterCases : 0,
+						...(typeof value.successRate === "number" ? { successRate: value.successRate } : {}),
+						...(typeof value.geometricMeanSpeedupAllDecidable === "number" ? { geometricMeanSpeedupAllDecidable: value.geometricMeanSpeedupAllDecidable } : {}),
+						...(typeof value.medianSpeedupAllDecidable === "number" ? { medianSpeedupAllDecidable: value.medianSpeedupAllDecidable } : {}),
+						...(typeof value.geometricMeanSpeedupFasterOnly === "number" ? { geometricMeanSpeedupFasterOnly: value.geometricMeanSpeedupFasterOnly } : {}) }));
 				return { sourceBinding: "verified", correctness, stage: inconclusive ? `${receipt.stage}:inconclusive` : receipt.stage,
 					metrics, limitations, executionFacts: { evaluations: [{ externalId: receipt.identity.runId,
 						subjectId, status: inconclusive ? "inconclusive" : receipt.passed ? "passed" : "failed",
-						terminal: true, capturedAt: receipt.capturedAt, receiptIndex, cases, diagnostics }] } };
+						terminal: true, capturedAt: receipt.capturedAt, receiptIndex, cases, diagnostics,
+						...(aggregate.length ? { aggregate } : {}),
+						...(receipt.measurementNotComparable?.length ? { measurementNotComparable: receipt.measurementNotComparable } : {}) }] } };
 			} catch (error) { return unknown((error as Error).message); }
 		},
 		...(goalCapability.configured ? { async verifyGoal({ goal, acceptedEvidencePaths }) {

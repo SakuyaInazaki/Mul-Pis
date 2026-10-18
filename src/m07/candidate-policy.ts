@@ -53,6 +53,26 @@ export type CandidateStatus = "unverified" | "verified" | "admissible" | "promot
  * evidence instead of disappearing from the lineage. */
 export type CandidateBranchDecision = "continue" | "merge" | "archive" | "abandon";
 
+/** What the host itself ruled about this candidate's speed, summarised across
+ * the terminal evaluation's cases. Nothing here is derived from raw medians. */
+export interface CandidateHostVerdictSummaryV1 {
+	/** Cases the host ruled on, by its own ruling. */
+	faster: number;
+	slower: number;
+	tie: number;
+	/** Quarantined or declared undecidable: never used to choose between candidates. */
+	excluded: number;
+	/** An end-to-end case the host refused to admit blocks promotion outright. */
+	endToEndBlocked: boolean;
+	/** Exact host reasons why no comparison is admissible at all. */
+	notComparable: string[];
+	/** Worst and best paired ratio among decided cases, candidate over baseline. */
+	worstRatio?: number;
+	bestRatio?: number;
+	/** Named baselines the rulings are against; a ratio never transfers. */
+	baselines: string[];
+}
+
 export interface CandidatePolicyDecisionV1 {
 	version: 1;
 	lane: CandidateLane;
@@ -69,6 +89,8 @@ export interface CandidatePolicyDecisionV1 {
 	seedRef?: string;
 	seedSpeedup?: number;
 	incumbentComparison: CandidateIncumbentComparisonV1[];
+	/** Present when the host issued rulings; it then decides, not the metrics. */
+	hostVerdict?: CandidateHostVerdictSummaryV1;
 	/** Does this candidate change the best-so-far pointer? Only a KEEP does. */
 	updatesBest: boolean;
 	/** Stable identity of an observed failure: stage plus the first witness
@@ -159,6 +181,48 @@ function scoreOf(tier: CandidateScoreTier, passRatio: number, seedSpeedup?: numb
 	}
 }
 
+/** Summarise the host's own rulings over one observation's terminal cases.
+ * A case the host quarantined or declared undecidable is counted apart and
+ * never contributes to a comparison, exactly as the host intended. */
+export function hostVerdictSummary(observation: CandidateObservationV1,
+	subjectId?: string): CandidateHostVerdictSummaryV1 | undefined {
+	const evaluations = (observation.executionFacts?.evaluations ?? [])
+		.filter(item => item.terminal && (!subjectId || item.subjectId === subjectId));
+	if (!evaluations.length) return undefined;
+	const summary: CandidateHostVerdictSummaryV1 = { faster: 0, slower: 0, tie: 0, excluded: 0,
+		endToEndBlocked: false, notComparable: [], baselines: [] };
+	let ruled = false;
+	const ratios: number[] = [];
+	for (const evaluation of evaluations) {
+		for (const reason of evaluation.measurementNotComparable ?? [])
+			if (!summary.notComparable.includes(reason)) summary.notComparable.push(reason);
+		for (const item of evaluation.cases) {
+			const verdicts = item.verdicts ?? [];
+			if (!verdicts.length) {
+				if (item.performanceDecidable === false) { ruled = true; summary.excluded++; }
+				continue;
+			}
+			ruled = true;
+			for (const verdict of verdicts) {
+				if (!summary.baselines.includes(verdict.baseline)) summary.baselines.push(verdict.baseline);
+				// An unconfirmed ruling and an undecidable case are the same thing here:
+				// the host did not establish a difference, so it cannot select.
+				const usable = item.performanceDecidable !== false && verdict.confirmed !== false &&
+					verdict.verdict !== "quarantined";
+				if (!usable) { summary.excluded++; continue; }
+				if (Number.isFinite(verdict.pairedRatioMedian)) ratios.push(verdict.pairedRatioMedian);
+				if (verdict.verdict === "faster") summary.faster++;
+				else if (verdict.verdict === "slower") summary.slower++;
+				else summary.tie++;
+				if (item.scope === "end-to-end" && verdict.endToEndAdmissible === false) summary.endToEndBlocked = true;
+			}
+		}
+	}
+	if (!ruled && !summary.notComparable.length) return undefined;
+	if (ratios.length) { summary.worstRatio = Math.max(...ratios); summary.bestRatio = Math.min(...ratios); }
+	return summary;
+}
+
 export interface CandidateDecisionInput {
 	observation: CandidateObservationV1;
 	diagnostics: Pick<CandidateDiagnosticSummaryV1, "stage" | "cases" | "diagnosticLocations">;
@@ -208,7 +272,10 @@ export function decideCandidate(input: CandidateDecisionInput): CandidatePolicyD
 		observation.correctness === "failed" ? (input.diagnostics.stage === "compile-failure" ? "compile-failure" :
 			cases.passed > 0 ? "near-miss" : "incorrect") :
 		seedSpeedup === undefined ? "correct-unmeasured" : "correct-measured";
-	const incumbentComparison = unverified || observation.correctness !== "passed" || !attributable ? [] :
+	const hostVerdict = unverified || observation.correctness !== "passed" || !attributable ? undefined :
+		hostVerdictSummary(observation, input.subjectId);
+	// Metric comparison stays as the fallback for hosts that issue no rulings.
+	const incumbentComparison = unverified || observation.correctness !== "passed" || !attributable || hostVerdict ? [] :
 		compareWithIncumbent(observation, input.history, input.subjectId, margin);
 	let guard: CandidateGuard;
 	if (unverified) {
@@ -229,6 +296,27 @@ export function decideCandidate(input: CandidateDecisionInput): CandidatePolicyD
 	} else if (!attributable) {
 		guard = "accept";
 		reasons.push("The host could not bind this observation to one work object, so it is a working point only; declare the task subjectId to let the best-so-far pointer advance.");
+	} else if (hostVerdict) {
+		// The host measured the noise scale and ruled; the search layer obeys the
+		// ruling instead of re-deciding on medians it cannot interpret.
+		const baselines = hostVerdict.baselines.join(", ") || "the declared baselines";
+		if (hostVerdict.slower > 0) {
+			guard = "revert";
+			reasons.push(`Host ruled this candidate slower on ${hostVerdict.slower} case(s) against ${baselines}; a ruling beyond the measured noise threshold is a regression.`);
+			requiredFix.push("Return to the verified incumbent; this source lost against its own baseline at the host's noise scale.");
+		} else if (hostVerdict.endToEndBlocked) {
+			guard = "accept";
+			reasons.push("Host refused end-to-end admission, so the baseline is kept and the best-so-far does not move, however good the kernel-level numbers look.");
+			advisory.push("A kernel win that does not survive end to end is evidence, not a delivery; find where the gain is lost before trying again.");
+		} else if (hostVerdict.faster > 0) {
+			guard = "keep";
+			reasons.push(`Host ruled this candidate faster on ${hostVerdict.faster} case(s) against ${baselines}${hostVerdict.bestRatio === undefined ? "" : `, best paired ratio ${hostVerdict.bestRatio.toFixed(4)}`}; best-so-far advances.`);
+		} else {
+			guard = "accept";
+			reasons.push(hostVerdict.tie > 0
+				? `Host ruled ${hostVerdict.tie} case(s) a tie within the measured noise threshold: correct and usable as a working point, but not shown faster.`
+				: `Host issued no admissible ruling (${hostVerdict.excluded} case(s) excluded${hostVerdict.notComparable.length ? `; ${hostVerdict.notComparable.join("; ")}` : ""}); correct, but nothing here can move the best.`);
+		}
 	} else if (!incumbentComparison.length) {
 		guard = phase === "bootstrap" ? "keep" : "accept";
 		reasons.push(phase === "bootstrap"
@@ -260,7 +348,7 @@ export function decideCandidate(input: CandidateDecisionInput): CandidatePolicyD
 	return { version: 1, lane, phase, guard, status, branch, score: scoreOf(tier, passRatio, seedSpeedup), tier,
 		...(failureSignature ? { failureSignature } : {}),
 		...(seed ? { seedRef: seed.ref } : {}), ...(seedSpeedup === undefined ? {} : { seedSpeedup }),
-		incumbentComparison, updatesBest: guard === "keep",
+		incumbentComparison, ...(hostVerdict ? { hostVerdict } : {}), updatesBest: guard === "keep",
 		requiredFix: requiredFix.slice(0, 1), advisory: advisory.slice(0, 1), reasons };
 }
 

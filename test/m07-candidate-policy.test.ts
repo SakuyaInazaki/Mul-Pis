@@ -348,3 +348,60 @@ test("the search account reports coverage and magnitude as separate columns", ()
 	assert.equal(summary.tasks[0].evaluations, 3);
 	assert.ok(summary.evaluationsPerVerifiedSubject !== undefined && summary.evaluationsPerVerifiedSubject > 1);
 });
+
+function ruled(options: { verdict?: "faster" | "slower" | "tie" | "quarantined"; latency?: number;
+	scope?: "kernel" | "end-to-end"; endToEndAdmissible?: boolean; decidable?: boolean;
+	confirmed?: boolean; notComparable?: string[] } = {}): CandidateObservationV1 {
+	const value = observation({ latency: options.latency ?? 5 });
+	const evaluation = value.executionFacts!.evaluations[0];
+	const item = evaluation.cases[0];
+	item.scope = options.scope ?? "kernel";
+	if (options.decidable !== undefined) item.performanceDecidable = options.decidable;
+	if (options.verdict) item.verdicts = [{ baseline: "vendor", tier: "vendor-library", verdict: options.verdict,
+		pairedRatioMedian: options.verdict === "faster" ? 0.6 : options.verdict === "slower" ? 1.4 : 1.0,
+		minimumImprovementThreshold: 1.02,
+		...(options.endToEndAdmissible === undefined ? {} : { endToEndAdmissible: options.endToEndAdmissible }),
+		...(options.confirmed === undefined ? {} : { confirmed: options.confirmed }) }];
+	if (options.notComparable) evaluation.measurementNotComparable = options.notComparable;
+	return value;
+}
+
+test("a host ruling decides the guard, and raw medians no longer get a vote", () => {
+	// The incumbent looks slower by raw metric, but the host ruled a tie.
+	const history = [entry("C001", { latency: 10 })];
+	const tie = decide({ observation: ruled({ verdict: "tie", latency: 9.4 }), history });
+	assert.equal(tie.guard, "accept", "within the measured noise threshold nothing is promoted");
+	assert.equal(tie.updatesBest, false);
+	assert.equal(tie.incumbentComparison.length, 0, "metric comparison is not used once the host has ruled");
+	assert.equal(tie.hostVerdict?.tie, 1);
+
+	const faster = decide({ observation: ruled({ verdict: "faster", latency: 9.9 }), history });
+	assert.equal(faster.guard, "keep");
+	assert.equal(faster.status, "promoted");
+	assert.equal(faster.hostVerdict?.bestRatio, 0.6);
+
+	const slower = decide({ observation: ruled({ verdict: "slower", latency: 1 }), history });
+	assert.equal(slower.guard, "revert", "a host-ruled regression outranks a flattering median");
+	assert.match(slower.requiredFix[0], /verified incumbent/);
+});
+
+test("quarantined, unconfirmed or undecidable rulings never select a candidate", () => {
+	const history = [entry("C001", { latency: 10 })];
+	for (const observationValue of [ruled({ verdict: "quarantined", latency: 1 }),
+		ruled({ verdict: "faster", latency: 1, confirmed: false }),
+		ruled({ verdict: "faster", latency: 1, decidable: false })]) {
+		const decision = decide({ observation: observationValue, history });
+		assert.equal(decision.guard, "accept");
+		assert.equal(decision.updatesBest, false);
+		assert.equal(decision.hostVerdict?.excluded, 1);
+		assert.equal(decision.hostVerdict?.faster, 0);
+	}
+	const blocked = decide({ observation: ruled({ verdict: "faster", scope: "end-to-end",
+		endToEndAdmissible: false, latency: 1 }), history });
+	assert.equal(blocked.guard, "accept", "a kernel win that fails end-to-end admission keeps the baseline");
+	assert.equal(blocked.hostVerdict?.endToEndBlocked, true);
+	const incomparable = decide({ observation: ruled({ latency: 1, decidable: false,
+		notComparable: ["baseline failed"] }), history });
+	assert.equal(incomparable.guard, "accept");
+	assert.deepEqual(incomparable.hostVerdict?.notComparable, ["baseline failed"]);
+});
