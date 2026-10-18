@@ -17,6 +17,7 @@ import { textReadCoverage } from "../runner/read-coverage.ts";
 import type { KnowledgeStore, ProposalOp, ProposalReceipt, Snapshot, ValidationIssue } from "../knowledge/types.ts";
 import { renderKnowledgeIndexRecord } from "../knowledge/pack.ts";
 import { retrieveKnowledge, validateKnowledgeRetrievalContext } from "../knowledge/retrieval.ts";
+import { assembleInjection } from "../knowledge/injection.ts";
 import { publishedArtifact, publishedArtifactCatalogue, textArtifact } from "../m07/execution-knowledge.ts";
 import { buildM04Message, extractKnowledgeProposals, systemPromptFor } from "../prompts.ts";
 import type { ProblemMaterials } from "../prompts.ts";
@@ -786,18 +787,24 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			};
 			const loadKnowledgePack = async (requireOriginalSnapshot = false): Promise<void> => {
 				if (requireOriginalSnapshot) await assertOriginalKnowledgeSnapshot();
-				const selection = await retrieveKnowledge(ctx.store, { purpose: options.purpose ?? `M04 处理：${feedback.label}`, text: `${materials.problem}\n${feedback.label}\n${feedback.text}`, maxRecords: 48, maxChars: 60_000 });
+				// The judgment phase is the broadest plan in the assembly table and
+				// still an order of magnitude below the old fixed 48/60000 pack: the
+				// session can page the whole catalogue with its own knowledge tools.
+				const injection = await assembleInjection({ store: ctx.store, phase: "judgment",
+					purpose: options.purpose ?? `M04 处理：${feedback.label}`,
+					text: `${materials.problem}\n${feedback.label}\n${feedback.text}`,
+					priorRoot: path.join(ctx.ws.knowledgeDir, "prior") });
+				const selection = injection.selection;
 				if (selection.status !== "ready") throw new HarnessError("m04.knowledge", `M04 必需知识未能完整装载：${selection.omitted.map((item) => `${item.ref}:${item.reason}`).join("；")}`);
 				if (requireOriginalSnapshot) {
 					if (selection.snapshot !== snapshot?.id)
 						throw new HarnessError("m04.knowledge", "fresh M04 knowledge selection differs from the original snapshot");
 					await assertOriginalKnowledgeSnapshot();
 				}
-				const pack = selection.pack;
-				knowledgePack = pack.markdown;
-				await ctx.ws.writeOutput(record, "knowledge-pack.md", pack.markdown, "提供给研究会话的局部知识包");
-				await ctx.ws.writeOutput(record, "knowledge-selection.json", JSON.stringify({ snapshot: selection.snapshot, rankedRefs: selection.rankedRefs, omitted: selection.omitted, limitsCheckedAt: selection.limitsCheckedAt }, null, 2), "知识选择与未展开记录");
-				if (pack.truncated) record.remarks.push(`相关知识组未展开：${pack.omitted.join(", ")}`);
+				knowledgePack = injection.markdown;
+				await ctx.ws.writeOutput(record, "knowledge-pack.md", injection.markdown, "提供给研究会话的局部知识包");
+				await ctx.ws.writeOutput(record, "knowledge-selection.json", JSON.stringify({ snapshot: selection.snapshot, rankedRefs: selection.rankedRefs, omitted: selection.omitted, limitsCheckedAt: selection.limitsCheckedAt, injection: injection.receipt }, null, 2), "知识选择与未展开记录");
+				if (injection.receipt.omitted.length) record.remarks.push(`本轮按阶段上限未展开 ${injection.receipt.omitted.length} 项；可在会话内用 knowledge_select / knowledge_read 补读。`);
 			};
 			if (mode === "research-session") await loadKnowledgePack();
 			const knowledgeReadCalls: KnowledgeReadCall[] = [];

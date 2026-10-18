@@ -20,7 +20,8 @@ import { buildM06ApplicabilityMessage, buildM06CheckMessage, buildM06ReadMessage
 import { renderPageTool } from "../tools/pagetool.ts";
 import { HarnessError, type InputRef, type StageRunRecord } from "../types.ts";
 import { readTextIfExists } from "../workspace.ts";
-import { retrieveKnowledge } from "../knowledge/retrieval.ts";
+import { assembleInjection } from "../knowledge/injection.ts";
+import { extractSourceKnowledge, extractionReport, sourceExtractionInstruction, type ReadingDepth, type SourceExtraction } from "./source-knowledge.ts";
 import { loadProblemMaterials, readOutput, relPath, sessionSpec, withRun, type StageContext } from "./context.ts";
 import { freezeStageArtifacts } from "./artifacts.ts";
 
@@ -47,6 +48,14 @@ export interface M06Group {
 	check?: string;
 	checkCoverage: string[];
 	applicability?: string;
+	/** Declared reading depth (L1 pattern triage → L4 compiler/library source). */
+	depth?: ReadingDepth;
+	depthReason?: string;
+	/** `inconclusive` when the source produced no structurally valid card. That
+	 * is a recorded outcome, not a failure: a deep pass often only rules a
+	 * direction out. */
+	conclusion?: "actionable" | "inconclusive";
+	extraction?: { accepted: number; rejected: number; issues: string[] };
 	outputs: Array<{ label: string; path: string }>;
 }
 
@@ -75,9 +84,15 @@ async function discoverSources(ctx: StageContext, wanted?: string[]): Promise<Ar
 }
 
 async function buildProjectState(ctx: StageContext, materialsBlock: string, purpose: string, sourceGoals: string): Promise<{ text: string; note: string }> {
-	const selection = await retrieveKnowledge(ctx.store, { purpose, text: `${materialsBlock}\n${sourceGoals}`, types: ["C", "K", "Q", "X"], maxRecords: 32, maxChars: 40_000 });
+	// One phase plan instead of a stage-local pack size: applicability compares a
+	// source against the project's current conditions, so it sees contracts,
+	// cases, rules and the negative layer, bounded by the table.
+	const injection = await assembleInjection({ store: ctx.store, phase: "applicability", purpose,
+		text: `${materialsBlock}\n${sourceGoals}`, types: ["C", "K", "Q", "X"],
+		priorRoot: path.join(ctx.ws.knowledgeDir, "prior") });
+	const selection = injection.selection;
 	if (selection.status !== "ready") throw new HarnessError("m06.knowledge", `M06 必需知识未能完整装载：${selection.omitted.map((item) => `${item.ref}:${item.reason}`).join("；")}`);
-	const pack = selection.pack;
+	const pack = { snapshot: selection.snapshot, included: injection.receipt.injectedRefs, markdown: injection.markdown };
 	let extra = "";
 	if (!pack.included.length) {
 		const m01 = await ctx.ws.latestCompletedRun("M01");
@@ -202,9 +217,10 @@ async function processGroup(ctx: StageContext, record: StageRunRecord, group: M0
 		const applicability = await openBoundedSession(ctx.runner, record, { mode: "fresh", intent: "independent-judgment", reason: `M06 ${group.sourceId} applicability uses the same frozen batch project state and explicit reading/check reports without inheriting either conversation`, evidence: linkedEvidence([...group.outputs, ...record.outputs.filter((item) => item.label === "本批统一使用的当前项目状态")]), spec: sessionSpec(ctx, `M06-${group.sourceId}-applicability`, "applicability", systemPromptFor("applicability"), { kind: "none" }) }, () => ctx.ws.writeRun(record));
 		try {
 			const verified = `${group.reading}\n\n${section("核对记录", group.check)}`;
-			const turn = await applicability.prompt(buildM06ApplicabilityMessage(source, verified, projectState));
+			const turn = await applicability.prompt(`${buildM06ApplicabilityMessage(source, verified, projectState)}\n\n${sourceExtractionInstruction(group.sourceId)}`);
 			group.applicability = turn.text;
 			group.outputs.push(await ctx.ws.writeOutput(record, `frozen/reports/${group.sourceId}/applicability.md`, turn.text, `${group.sourceId} 适用性分析`));
+			await recordExtraction(ctx, record, group, extractSourceKnowledge(turn.text));
 		} finally {
 			applicability.dispose();
 		}
@@ -215,14 +231,32 @@ async function processGroup(ctx: StageContext, record: StageRunRecord, group: M0
 	}
 }
 
+/** Freeze the structurally validated extraction next to the prose report. The
+ * harness checks structure and records the outcome; adoption stays with M04. */
+async function recordExtraction(ctx: StageContext, record: StageRunRecord, group: M06Group, extraction: SourceExtraction): Promise<void> {
+	const report = extractionReport(group.sourceId, extraction);
+	if (extraction.depth) group.depth = extraction.depth;
+	if (extraction.depthReason) group.depthReason = extraction.depthReason;
+	group.conclusion = extraction.conclusion;
+	group.extraction = { accepted: report.accepted.length, rejected: report.rejected.length,
+		issues: [...extraction.issues, ...report.rejected.flatMap((item) => item.issues.map((issue) => `卡片 ${item.ordinal}：${issue}`))] };
+	group.outputs.push(await ctx.ws.writeOutput(record, `frozen/reports/${group.sourceId}/extraction.json`,
+		JSON.stringify(report, null, 2), `${group.sourceId} 结构化抽取（宿主校验结果）`));
+	for (const issue of extraction.issues) record.remarks.push(`${group.sourceId} 抽取说明：${issue}`);
+	if (report.rejected.length) record.remarks.push(`${group.sourceId} 有 ${report.rejected.length} 张卡片未通过结构校验，已记录原因，不进入提案。`);
+}
+
 function renderBatchSummary(ctx: StageContext, groups: M06Group[], fullText: boolean): string {
 	const lines: string[] = ["# M06 整批汇总", "", "本汇总只是把各资料组的实际产物放在一起交给 M04；所有建议均待 M04 处理，入库前不构成项目认识。", "",
-		`- 登记文本全文读取核验：${fullText ? "已请求；完成组的冻结登记文本均有实际返回范围证据" : "未请求"}。此项不认证 PDF 未提取内容或未取得页面。`, ""];
+		`- 登记文本全文读取核验：${fullText ? "已请求；完成组的冻结登记文本均有实际返回范围证据" : "未请求"}。此项不认证 PDF 未提取内容或未取得页面。`,
+		"- 结构化抽取只做结构校验：通过校验的卡片是候选，入库仍由 M04 按证据决定；inconclusive 表示本来源未产出可执行化结论，是如实结果而不是失败。", ""];
 	for (const g of groups) {
 		lines.push(`## ${g.sourceId}：${g.title}`, "", `- 状态：${g.status === "completed" ? "完成" : `失败：${g.failure}`}`);
 		lines.push(`- 阅读实际读取文件：${g.readCoverage.length ? g.readCoverage.join("、") : "无"}`);
 		lines.push(`- 查看过的 PDF 页面：${g.renderedPages.length ? g.renderedPages.join("、") : "无"}`);
 		lines.push(`- 核对实际读取文件：${g.checkCoverage.length ? g.checkCoverage.join("、") : "无"}`);
+		lines.push(`- 阅读深度：${g.depth ?? "未声明"}${g.depthReason ? `（升级理由：${g.depthReason}）` : ""}`);
+		lines.push(`- 结构化抽取：${g.conclusion ?? "未运行"}；通过校验 ${g.extraction?.accepted ?? 0} 张、未通过 ${g.extraction?.rejected ?? 0} 张${g.extraction?.issues.length ? `；说明：${g.extraction.issues.join("；")}` : ""}`);
 		for (const o of g.outputs) lines.push(`- ${o.label}：${relPath(ctx, o.path)}`);
 		if (g.applicability) {
 			lines.push("", "### 适用性分析与处理建议", "", g.applicability.trim());

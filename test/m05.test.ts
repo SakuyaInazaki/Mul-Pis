@@ -91,7 +91,7 @@ describe("M05 acquisition stage", () => {
 		const registered = await t.register_source({ title: "Paper A on mechanism A", kind: "paper", files: [pdfPath], obtained_range: "全文", relevance: "直接讨论机制 A 的条件", identifier: "10.1000/xyz", url: "https://example.org/a", authors: "Ann", version: "2025" });
 		seen.registered = registered.text;
 		seen.index = (await t.list_sources({})).text;
-		return "## 本轮知识需求与检索式\n\nmechanism A explains B\n\n## 已取得并登记\n\n- S001：全文；优先阅读\n\n## 线索但未取得\n\n无\n\n## 未解决缺口与续查建议\n\n无\n\n## 资源边界与未覆盖\n\n无\n\n## 本轮实际读到的内容\n\nextracted.md 开头一行";
+		return "## 本轮知识需求与检索式\n\nmechanism A explains B\n\n## 已取得并登记\n\n- S001：全文；优先阅读\n\n## 线索但未取得\n\n无\n\n## 未解决缺口与续查建议\n\n无\n\n## 资源边界与未覆盖\n\n无\n\n## 可执行化产出\n\n- 硬数值约束：UB 上限 196352 字节（extracted.md 第 2 页）\n\n## 本轮实际读到的内容\n\nextracted.md 开头一行";
 	}
 
 	before(async () => {
@@ -152,6 +152,9 @@ describe("M05 acquisition stage", () => {
 		assert.ok(result.toolLog.some((c) => c.name === "read_work_file" && !c.ok), "refused call is logged as failed");
 		const report = await readFile(result.record.outputs.find((o) => o.label === "获取报告")!.path, "utf8");
 		assert.ok(report.includes("## 已取得并登记"));
+		// The acquisition report must name what can become a runnable example, an
+		// exact signature or a hard numeric constraint; prose alone is not a product.
+		assert.ok(report.includes("## 可执行化产出"));
 		assert.ok(result.record.remarks.some((r) => r.includes("m06 --source S001")));
 	});
 
