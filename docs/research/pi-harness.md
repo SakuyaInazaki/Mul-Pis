@@ -60,7 +60,7 @@ SDK 的 `createAgentSession()` 默认使用 `DefaultResourceLoader` 做标准发
 
 ### 3.3 会话恢复、压缩与分支摘要
 
-resume、fork、clone、tree navigation 会带入所选 active branch；compaction 用 LLM 摘要替代较旧 active context，branch summary 也会把摘要注入目标分支。摘要是有损输入，不等于原材料。JSONL 中历史仍在，也不意味着模型当前完整可见。[当前 Sessions](https://pi.dev/docs/latest/sessions) [当前 Compaction](https://pi.dev/docs/latest/compaction) [固定 session 上下文构建规则](https://github.com/earendil-works/pi/blob/e4c75a73222ae2c72abb5f5314fa35ee8effc508/packages/coding-agent/docs/session-format.md#L334-L370) [固定 Sessions 文档：resume/fork/clone](https://github.com/earendil-works/pi/blob/e4c75a73222ae2c72abb5f5314fa35ee8effc508/packages/coding-agent/docs/sessions.md#L118-L139)
+resume、fork、clone、tree navigation 会带入所选 active branch；compaction 用 LLM 摘要替代较旧 active context，branch summary 也会把摘要注入目标分支（本工作流的会话改用 `src/runner/compaction.ts` 的确定性悬崖压缩替换这一步，只删除与截断、不调用模型；branch summary 仍是 Pi 的摘要路径）。摘要是有损输入，不等于原材料。JSONL 中历史仍在，也不意味着模型当前完整可见。[当前 Sessions](https://pi.dev/docs/latest/sessions) [当前 Compaction](https://pi.dev/docs/latest/compaction) [固定 session 上下文构建规则](https://github.com/earendil-works/pi/blob/e4c75a73222ae2c72abb5f5314fa35ee8effc508/packages/coding-agent/docs/session-format.md#L334-L370) [固定 Sessions 文档：resume/fork/clone](https://github.com/earendil-works/pi/blob/e4c75a73222ae2c72abb5f5314fa35ee8effc508/packages/coding-agent/docs/sessions.md#L118-L139)
 
 因此，M01/P01 的初始输入隔离和 M06 阅读会话都不能仅凭“fresh session”认定成立。M02 虽使用相同模型的新独立会话，但本来就必须显式接收 M01 完整产出；这里隔离的是未授权历史与自动发现资源，不是隔断 M01→M02 的交接。需要控制的是资源发现、显式提示、工具、cwd、环境变量和 session 来源；M06 还须以实际论文、网页或代码为验收对象，记录实际阅读范围，不能用 compaction 或子任务摘要替代原材料核对。
 

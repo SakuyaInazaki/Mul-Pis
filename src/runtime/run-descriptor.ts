@@ -18,7 +18,9 @@ export interface RunDescriptorV1 {
 export interface TrustedControlStateV1 {
 	version: 1;
 	instanceId: string;
-	state: "running" | "paused" | "stopping" | "stopped";
+	/** Only states a live controller actually writes. A stopped process cannot
+	 * record its own stop, so there is no "stopped" value to misread as evidence. */
+	state: "running" | "paused" | "stopping";
 	updatedAt: string;
 	totalPausedMs: number;
 	pauseStartedAt?: number;
