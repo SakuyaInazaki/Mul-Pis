@@ -9,3 +9,9 @@ export { validateOptimizationCard, readOptimizationCard, optimizationDirectionSi
 	type OptimizationCard, type OptimizationCardKind, type OptimizationMethod, type BottleneckSignature } from "./optimization-card.ts";
 export { evaluateCardAdmission, collectExistingCards, DEFAULT_ADMISSION_POLICY,
 	type AdmissionDecision, type AdmissionPolicy } from "./admission.ts";
+export { decideMethods, renderMethodMenu, DEFAULT_DECISION_POLICY, type MethodDecision } from "./decision-table.ts";
+export { assembleInjection, planInjection, INJECTION_PLANS, type InjectionPhase, type InjectionPlan,
+	type InjectionResult, type InjectionReceiptV1 } from "./injection.ts";
+export { loadPriorLibrary, selectPrior, PRIOR_LAYERS, type PriorLayer, type PriorLibrary } from "./prior-library.ts";
+export { checkCandidate, checkApiSymbols, checkHardConstraints, collectApiContracts,
+	type StaticCheckReport, type StaticFinding } from "./static-checks.ts";
