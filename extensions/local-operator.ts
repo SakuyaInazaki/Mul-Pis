@@ -20,7 +20,6 @@ export default createResearchExtension({
 	candidateExecutionBackend: backend,
 	candidateVerifier: verifier,
 	...(continuationWorkspace ? {
-		newSessionCompaction: process.env.PRE_RSI_NEW_SESSION_COMPACTION === "200000",
 		continuation: { workspace: continuationWorkspace,
 			...(continuationGoalRunId ? { goalRunId: continuationGoalRunId } : {}) },
 	} : {}),

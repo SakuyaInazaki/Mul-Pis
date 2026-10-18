@@ -26,7 +26,7 @@ import { writeFileAtomic } from "../workspace.ts";
 import { TelemetryWriter } from "../dashboard/telemetry.ts";
 import type { AssistantTurn, CustomToolSpec, ForkRequest, ForkWorkspaceBindingV1, ReadReturnEvent, RunnerCapabilities, SessionCheckpoint, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, TranscriptMessage, TransportFailureDiagnostic, UsageEvent } from "./types.ts";
 import { summarizeUsage, usageEventsFromEntries } from "./usage.ts";
-import { sessionCompactionPolicy, workflowCompactionExtension, workflowCompactionSettings } from "./compaction.ts";
+import { compactionPolicyFromEnvironment, sessionCompactionPolicy, workflowCompactionExtension, workflowCompactionSettings } from "./compaction.ts";
 import { sampleRunnerResources, sessionClosed, sessionOpened } from "./resource.ts";
 import { DeepSeekCampaignBudget, type PromptLease } from "./deepseek-campaign.ts";
 import { getConfinedCampaignFileGrantDescriptor } from "./confined-campaign-files.ts";
@@ -1180,13 +1180,15 @@ export class PiSessionRunner implements SessionRunner {
 			{ retry: { enabled: false, provider: { maxRetries: 0 } }, compaction: { enabled: false } } :
 			ordinaryAssessor ? { retry: { enabled: false, provider: { maxRetries: 0 } } } : {});
 		const resolved = await this.resolveModel(spec);
-		const compactionPolicy = strict ? undefined : sessionCompactionPolicy(sessionManager, persistSpec);
+		const compactionPolicy = strict ? undefined : sessionCompactionPolicy(sessionManager, persistSpec, compactionPolicyFromEnvironment());
+		const compactionDigest = { file: path.join(spec.persistDir, `${sessionManager.getSessionId()}.compaction.jsonl`),
+			sessionId: sessionManager.getSessionId() };
 		const loader = new DefaultResourceLoader({
 			cwd,
 			agentDir: emptyAgentDir,
 			settingsManager,
 			noExtensions: true,
-			extensionFactories: compactionPolicy ? [{ name: "workflow-compaction", factory: workflowCompactionExtension(compactionPolicy) }] : [],
+			extensionFactories: compactionPolicy ? [{ name: "workflow-compaction", factory: workflowCompactionExtension(compactionPolicy, () => compactionDigest) }] : [],
 			noSkills: true,
 			noPromptTemplates: true,
 			noThemes: true,
