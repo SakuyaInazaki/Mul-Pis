@@ -23,6 +23,8 @@ export interface ConsoleLimitsV1 {
 	staleHeartbeatMs: number;
 	/** Number of trailing tool-log entries projected into the tree. */
 	toolLogWindow: number;
+	/** Number of trailing assessor transport observations read for the audit. */
+	transportObservationWindow: number;
 }
 
 export const DEFAULT_CONSOLE_LIMITS: ConsoleLimitsV1 = {
@@ -30,6 +32,7 @@ export const DEFAULT_CONSOLE_LIMITS: ConsoleLimitsV1 = {
 	maxPreviewBytes: 65_536,
 	staleHeartbeatMs: 20_000,
 	toolLogWindow: 100,
+	transportObservationWindow: 200,
 };
 
 const RANGES: Record<keyof ConsoleLimitsV1, { min: number; max: number }> = {
@@ -37,6 +40,7 @@ const RANGES: Record<keyof ConsoleLimitsV1, { min: number; max: number }> = {
 	maxPreviewBytes: { min: 1024, max: 8 * 1024 * 1024 },
 	staleHeartbeatMs: { min: 1_000, max: 3_600_000 },
 	toolLogWindow: { min: 1, max: 10_000 },
+	transportObservationWindow: { min: 1, max: 10_000 },
 };
 
 export const CONSOLE_LIMITS_FILE = path.join(".agent", "console-limits.json");

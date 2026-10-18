@@ -22,7 +22,7 @@ npm run console -- status --workspace <dir> --json
 npm run audit -- --workspace <dir> [--json]       # 判决分布、失败分账、预算与反馈密度
 ```
 
-审计投影只做计数，全部由持久控制记录确定性派生：任务与候选判决分布、每个候选停在哪一级验证门、引擎驳回 agent 自述候选的计数、基础设施失败与策略失败分账、token 与计费合计及其完整性、反馈密度与改动类别分布。字段说明见[终端控制台设计](terminal-console/docs/implementation/terminal-console-design.md)。
+审计投影只做计数，全部由持久控制记录确定性派生：任务与候选判决分布、每个候选停在哪一级验证门、引擎驳回 agent 自述候选的计数、基础设施失败与策略失败分账、运行层自己标注的工具与传输失败分类及未判定占比、候选的 guard/晋级状态/分支决策/车道/相位/排名分、搜索停滞与路线、搜索预算的用量与停止原因、token 与计费合计及其完整性、反馈密度与改动类别分布。字段说明见[终端控制台设计](terminal-console/docs/implementation/terminal-console-design.md)。
 
 ## 当前工作与审阅入口
 

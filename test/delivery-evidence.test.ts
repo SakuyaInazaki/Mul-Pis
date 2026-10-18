@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
-import { assertDeliversHistoricalBest, collectDeliveryEvidence, renderDeliveryEvidence } from "../src/stages/delivery-evidence.ts";
+import { assertDeliversHistoricalBest, assertNoRecordedRegression, collectDeliveryEvidence, renderDeliveryEvidence } from "../src/stages/delivery-evidence.ts";
 import { HarnessError } from "../src/types.ts";
 import { Workspace } from "../src/workspace.ts";
 import { writeCandidateGoal } from "./helpers/candidate-goal.ts";
@@ -76,4 +76,57 @@ test("a metric with no reference measurement is disclosed as having no denominat
 	assert.equal(evidence.measurement.metricsWithReference, 0);
 	assert.equal(evidence.measurement.metricsWithoutReference, 1);
 	assert.ok(evidence.limitations.some(item => item.includes("没有分母")));
+});
+
+const hostReceipt = (verdict: "faster" | "tie" | "slower" | "quarantined", scope: "kernel" | "end-to-end") => ({
+	externalId: "E002", measurementNotComparable: verdict === "slower" && scope === "end-to-end"
+		? ["an end-to-end case is slower than its baseline beyond the frozen noise margin"] : [],
+	cases: [{ caseId: "case1", scope, performanceDecidable: true,
+		decisions: { torch: { tier: "library", verdict, pairedRatioMedian: verdict === "faster" ? 0.5 : 1.4,
+			minimumImprovementThreshold: 1.01, ...(scope === "end-to-end" ? { endToEndAdmissible: verdict !== "slower" } : {}) } } },
+		{ caseId: "case2", scope: "kernel", performanceDecidable: false, performanceUndecidableReason: "below the minimum measurable duration" }],
+	aggregate: { torch: { declaredCases: 2, decidableCases: 1, fasterCases: verdict === "faster" ? 1 : 0,
+		successRate: verdict === "faster" ? 0.5 : 0, geometricMeanSpeedupAllDecidable: verdict === "faster" ? 2 : 0.71,
+		medianSpeedupAllDecidable: verdict === "faster" ? 2 : 0.71,
+		geometricMeanSpeedupFasterOnly: verdict === "faster" ? 2 : null } },
+});
+
+test("the delivery reports the host's own verdicts and aggregates instead of recomputing them", async (t) => {
+	const f = await fixture(t);
+	await writeCandidateGoal(f.ws, "g", "S1", [{ ...CANDIDATES[1], receipt: hostReceipt("faster", "end-to-end") }]);
+	await writeFile(path.join(f.delivery, "shipped.txt"), "fast kernel\n");
+	const evidence = await collectDeliveryEvidence(f.ws, f.delivery);
+	assert.equal(evidence.hostDecision.baselines.length, 1);
+	const row = evidence.hostDecision.baselines[0];
+	assert.deepEqual([row.name, row.faster, row.tie, row.slower, row.quarantined, row.endToEndRegressions], ["torch", 1, 0, 0, 0, 0]);
+	// The three aggregates are the host's, read back unchanged.
+	assert.deepEqual([row.successRate, row.geometricMeanSpeedupFasterOnly, row.geometricMeanSpeedupAllDecidable], [0.5, 2, 2]);
+	assert.equal(evidence.hostDecision.decidableCases, 1);
+	assert.equal(evidence.hostDecision.undecidableCases, 1);
+	assert.ok(evidence.limitations.some(item => item.includes("不可裁决")));
+	assertNoRecordedRegression(evidence);
+	const rendered = renderDeliveryEvidence(evidence).join("\n");
+	assert.match(rendered, /逐 baseline 判定（torch）：更快 1、持平 0、更慢 0、熔断 0/);
+	assert.match(rendered, /交付层不自造聚合/);
+});
+
+test("a recorded end-to-end regression refuses the delivery", async (t) => {
+	const f = await fixture(t);
+	await writeCandidateGoal(f.ws, "g", "S1", [{ ...CANDIDATES[1], receipt: hostReceipt("slower", "end-to-end") }]);
+	await writeFile(path.join(f.delivery, "shipped.txt"), "fast kernel\n");
+	const evidence = await collectDeliveryEvidence(f.ws, f.delivery);
+	assert.equal(evidence.hostDecision.baselines[0].endToEndRegressions, 1);
+	assert.ok(evidence.hostDecision.notComparable.length);
+	assert.throws(() => assertNoRecordedRegression(evidence),
+		(error: unknown) => error instanceof HarnessError && error.code === "m09.recorded-regression" && /端到端用例慢于基线/.test(error.message));
+});
+
+test("a receipt from a backend without host decisions is counted, not guessed at", async (t) => {
+	const f = await fixture(t);
+	await writeCandidateGoal(f.ws, "g", "S1", [CANDIDATES[1]]);
+	await writeFile(path.join(f.delivery, "shipped.txt"), "fast kernel\n");
+	const evidence = await collectDeliveryEvidence(f.ws, f.delivery);
+	assert.deepEqual(evidence.hostDecision.baselines, []);
+	assert.equal(evidence.hostDecision.receiptsWithoutDecisions, 1);
+	assertNoRecordedRegression(evidence);
 });
