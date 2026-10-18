@@ -133,7 +133,32 @@ limitations 里固定会出现：运行环境与精度策略、baseline tier、�
 脚本里的 `TIGHTER` 表写明每个阈值哪个方向算更严，**往松的方向改直接拒绝**，有效值写进收据。
 需要为某块真实硬件重新标定某个默认值时，改的是那张表（走评审），不是某个任务自己的配置。
 
-## 8 这套机制没有解决的事
+## 8 平台档案绑定、静态门禁与评估缓存
+
+宿主可以再绑三样东西。三者都是宿主配置，模型都碰不到。
+
+**平台档案（`platformProfilePath` + `platformDtype`）**：绑定后，计时协议、容差与用例表由
+`src/platform/profile.ts` 的探测事实决定，契约只能与之一致：
+
+- `SPEC.timing` 必须等于档案的 warmup/repeats，`minimumSampleSeconds` 不得低于档案的最小运行时长；
+- `SPEC.cases` 的 id 与顺序必须等于档案用例表，迭代/认证归属一致，且**每个用例声明输入的数值叶子数
+  必须等于用例表的 `elements`**；
+- 容差模式可用 `platform-three-region`：首筛 `mean(e) < τ_d` 且 `max(e) < 10·τ_d`（τ_d 由 dtype 尾数位推导），
+  没过的逐元素按参考值分正常区 / 小值区 / 相消区，正常区有错即判错，另两区与同精度 `golden` 比错误计数（≤2）。
+  三区边界与比值 2 没有校准依据，收据里原样保留以便之后用真机数据校准；
+- 协议版本进入每个 metric 的 `basisId`，两个协议版本的数字不可能被当成同一基准；
+- 档案协议若低于评测器冻结的 warmup≥10 / repeats≥30 下限，绑定直接拒绝。
+
+**知识卡片门禁（`knowledgeCardsPath`）**：contract 阶段在调用 Python 之前跑 `checkCandidate`，
+命中已发布签名表之外的同命名空间调用就地驳回，findings 带 witness 与最接近的合法签名，级联短路，
+不启编译器也不碰设备。`inconclusive` 只记录不阻断。
+
+**评估缓存（`evaluationCacheDir`）**：键是候选 AST 规范化后的哈希 + 契约摘要 + 平台 chip/toolchain +
+协议版本 + 用例集 id + 后端身份 + 阶段 id。命中就把历史回执整棵拷回本次目录，summary 标明是 replay，
+**不得当成第二次独立测量**。`evaluationProfile()` 给出本地驳回数、最接近签名命中率、缓存命中/未命中、
+以及「真正执行掉的墙钟」与「replay 顶掉的墙钟」。设备租约只包住 measurement 阶段。
+
+## 9 这套机制没有解决的事
 
 - 不是操作系统沙箱：worker 的写隔离在 macOS 用 `sandbox-exec`，其他平台必须由宿主提供真实隔离前缀，
   没有无隔离兜底；但同 UID 的进程边界不等于强隔离。
