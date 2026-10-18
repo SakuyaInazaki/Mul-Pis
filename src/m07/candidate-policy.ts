@@ -222,7 +222,9 @@ export function decideCandidate(input: CandidateDecisionInput): CandidatePolicyD
 		requiredFix.push(location
 			? `Repair the ${location.category} failure first; the exact receipt field is ${location.fieldPath}.`
 			: "Repair the observed correctness failure before any further optimization.");
-		const fallback = globalCandidateBest(subjectHistory(input.history, input.subjectId))[0];
+		// Only this work object's own verified best is a safe fallback; another
+		// object's best says nothing about this one.
+		const fallback = attributable ? globalCandidateBest(subjectHistory(input.history, input.subjectId))[0] : undefined;
 		if (fallback) advisory.push(`Continue from the verified ${fallback.candidateRef}, not from this failing source.`);
 	} else if (!attributable) {
 		guard = "accept";
