@@ -94,9 +94,11 @@ test("profiler output becomes one deterministic label appended after the origina
 	const gate = createPlatformGate({ profile: parsePlatformProfile(profileFixture()), root, receiptFile });
 	assert.equal(await gate.observe("bash", "all good"), undefined);
 	const note = await gate.observe("bash", "mte2_ratio: 0.63\nvector_ratio: 0.26");
-	assert.match(note ?? "", /bottleneck transfer/);
+	assert.match(note?.text ?? "", /bottleneck transfer/);
+	assert.deepEqual(note?.classes, []);
+	assert.deepEqual((await gate.observe("bash", "device is busy or unavailable"))?.classes, ["infrastructure"]);
 	const rows = await receipts(receiptFile);
-	assert.deepEqual(rows.map(row => row.kind), ["diagnosis"]);
+	assert.deepEqual(rows.map(row => row.kind), ["diagnosis", "diagnosis"]);
 	assert.equal(rows[0].bottleneck, "transfer");
 });
 

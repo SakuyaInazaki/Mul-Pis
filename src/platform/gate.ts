@@ -48,7 +48,15 @@ export interface PlatformGate {
 	/** Hold the device for exactly the commands that use it. */
 	withDevice<T>(command: string, run: () => Promise<T>): Promise<T>;
 	/** Mechanical reading appended after tool output; undefined when nothing matched. */
-	observe(toolName: string, text: string): Promise<string | undefined>;
+	observe(toolName: string, text: string): Promise<PlatformObservation | undefined>;
+}
+
+export interface PlatformObservation {
+	/** Block appended after the original output, which is never modified. */
+	text: string;
+	/** Failure classes the profile recognised, so the caller can tell an
+	 * environment fault from the candidate's own failure. */
+	classes: Array<"syntax" | "hardware" | "numeric" | "infrastructure">;
 }
 
 export interface PlatformGateOptions {
@@ -129,7 +137,8 @@ export function createPlatformGate(options: PlatformGateOptions): PlatformGate {
 			if (!hasPlatformDiagnosis(diagnosis)) return undefined;
 			await receipt({ kind: "diagnosis", toolName, classes: diagnosis.classes.map(entry => `${entry.class}:${entry.id}`),
 				...(diagnosis.bottleneck ? { bottleneck: diagnosis.bottleneck.label } : {}) });
-			return describePlatformDiagnosis(profile, diagnosis);
+			return { text: describePlatformDiagnosis(profile, diagnosis),
+				classes: diagnosis.classes.map(entry => entry.class) };
 		},
 	};
 }

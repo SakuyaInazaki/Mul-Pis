@@ -7,6 +7,7 @@ import { createAgentSession, ModelRuntime, type CreateAgentSessionOptions } from
 import type { Model } from "@earendil-works/pi-ai";
 import { PiSessionRunner } from "../../src/runner/pi.ts";
 import type { PlatformReceiptV1 } from "../../src/platform/gate.ts";
+import type { ToolCallRecord } from "../../src/runner/types.ts";
 import { profileFixture } from "../platform/profile-fixture.ts";
 
 const MODEL = {
@@ -42,8 +43,9 @@ inQueue.DeQue(local);
 int tailLength = total % tileLength;
 `;
 
-async function boundSession(t: TestContext): Promise<{ work: string; persistDir: string;
-	tools: Map<string, NonNullable<CreateAgentSessionOptions["customTools"]>[number]>; receiptFile: string }> {
+async function boundSession(t: TestContext, deadlineAt?: string): Promise<{ work: string; persistDir: string;
+	tools: Map<string, NonNullable<CreateAgentSessionOptions["customTools"]>[number]>; receiptFile: string;
+	toolLog: () => ToolCallRecord[]; sessionFile: string }> {
 	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-platform-exec-"));
 	const work = path.join(root, "work");
 	const persistDir = path.join(root, "sessions");
@@ -63,9 +65,11 @@ async function boundSession(t: TestContext): Promise<{ work: string; persistDir:
 	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory });
 	const handle = await runner.create({ label: "platform", role: "execution", model: "offline/offline-model:high",
 		systemPrompt: "work on the kernel", tools: { kind: "execution", root: work, tools: ["read", "write", "edit", "bash"] },
-		persistDir });
+		persistDir, ...(deadlineAt ? { runDeadline: deadlineAt } : {}) });
 	const tools = new Map((stub.calls[0].customTools ?? []).map(tool => [tool.name, tool]));
-	return { work, persistDir, tools, receiptFile: path.join(persistDir, `${handle.ref.id}.platform.jsonl`) };
+	assert(handle.ref.file);
+	return { work, persistDir, tools, receiptFile: path.join(persistDir, `${handle.ref.id}.platform.jsonl`),
+		toolLog: () => handle.toolLog(), sessionFile: handle.ref.file };
 }
 
 async function receipts(file: string): Promise<PlatformReceiptV1[]> {
@@ -141,4 +145,53 @@ test("toolchain output is answered mechanically and device commands hold the dev
 	const kinds = (await receipts(session.receiptFile)).map(row => row.kind);
 	assert.deepEqual(kinds.filter(kind => kind === "device-lease").length, 1);
 	assert.deepEqual(kinds.filter(kind => kind === "diagnosis").length, 2);
+});
+
+test("failures are split between the harness and the candidate, and the run budget rides along", async t => {
+	const session = await boundSession(t, new Date(Date.now() + 95 * 60_000).toISOString());
+	const bash = session.tools.get("bash");
+	const write = session.tools.get("write");
+	assert(bash && write);
+	const context = { cwd: session.work } as never;
+	const visible = (result: unknown): string => {
+		const content = (result as { content?: Array<{ type: string; text?: string }> }).content ?? [];
+		return content.filter(item => item.type === "text").map(item => item.text ?? "").join("\n");
+	};
+
+	// Every tool result states the remaining wall-clock; the prompt prefix stays stable.
+	assert.match(visible(await bash.execute("f1", { command: "echo work" }, undefined, undefined, context)),
+		/Run budget: 1h3[0-9]m of wall-clock left\. Keep the best measured version saved and submittable/);
+
+	// Pi's bash tool throws on a non-zero exit, so these land on the error path.
+	await assert.rejects(bash.execute("f2", { command: "exit 3" }, undefined, undefined, context), /exited with code 3/);
+	await assert.rejects(bash.execute("f3", { command: "echo 'device is busy or unavailable' && exit 1" },
+		undefined, undefined, context), /class infrastructure: device-unavailable/);
+	await assert.rejects(write.execute("f4", { path: "kernel/a.cpp", content: "void Launch() { SetBlockDim(1); }" },
+		undefined, undefined, context));
+	assert.deepEqual(session.toolLog().map(row => [row.name, row.ok, row.failureClass, row.failureReason]), [
+		["bash", true, undefined, undefined],
+		["bash", false, "policy", "nonzero-exit"],
+		// The profile recognised an environment fault in the output, so the candidate is not blamed.
+		["bash", false, "infrastructure", "platform-reported-environment-fault"],
+		["write", false, "policy", "platform-contract-violation"],
+	]);
+});
+
+test("each session records the harness it ran under as an experiment variable", async t => {
+	const deadline = new Date(Date.now() + 60_000).toISOString();
+	const previousRevision = process.env.PRE_RSI_CODE_REVISION;
+	process.env.PRE_RSI_CODE_REVISION = "f".repeat(40);
+	t.after(() => {
+		if (previousRevision === undefined) delete process.env.PRE_RSI_CODE_REVISION;
+		else process.env.PRE_RSI_CODE_REVISION = previousRevision;
+	});
+	const session = await boundSession(t, deadline);
+	const receipt = JSON.parse(await readFile(session.sessionFile.replace(/\.jsonl$/, ".harness.json"), "utf8")) as Record<string, unknown>;
+	assert.equal(receipt.version, 1);
+	assert.equal(receipt.codeRevision, "f".repeat(40));
+	assert.equal(receipt.model, "offline/offline-model:high");
+	assert.equal(receipt.toolGrant, "execution");
+	assert.equal(receipt.platformProfile, "device-a");
+	assert.equal(receipt.runDeadline, deadline);
+	assert.deepEqual(receipt.compaction, { thresholdTokens: 200_000, keepRecentTokens: 20_000 });
 });

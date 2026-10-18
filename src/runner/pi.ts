@@ -27,7 +27,8 @@ import { TelemetryWriter } from "../dashboard/telemetry.ts";
 import type { AssistantTurn, CustomToolSpec, ForkRequest, ForkWorkspaceBindingV1, ReadReturnEvent, RunnerCapabilities, SessionCheckpoint, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, TranscriptMessage, TransportFailureDiagnostic, UsageEvent } from "./types.ts";
 import { summarizeUsage, usageEventsFromEntries } from "./usage.ts";
 import { compactionPolicyFromEnvironment, sessionCompactionPolicy, workflowCompactionExtension, workflowCompactionSettings } from "./compaction.ts";
-import { platformGateFromEnvironment, type PlatformGate } from "../platform/gate.ts";
+import { platformGateFromEnvironment, type PlatformGate, type PlatformObservation } from "../platform/gate.ts";
+import { classifyToolFailure, classifyTransportFailure, remainingWallClockNote, runDeadlineFromEnvironment } from "./failure-class.ts";
 import { sampleRunnerResources, sessionClosed, sessionOpened } from "./resource.ts";
 import { DeepSeekCampaignBudget, type PromptLease } from "./deepseek-campaign.ts";
 import { getConfinedCampaignFileGrantDescriptor } from "./confined-campaign-files.ts";
@@ -263,7 +264,7 @@ class TransportProbe {
 	failure(promptIndex: number, abortSource: TransportFailureDiagnostic["abortSource"], requestId?: string): TransportFailureDiagnostic {
 		this.dropPendingBody?.();
 		this.dropPendingBody = undefined;
-		return { version: 1, promptIndex, ...(requestId ? { requestId } : {}), phase: this.phase,
+		const diagnostic: TransportFailureDiagnostic = { version: 1, promptIndex, ...(requestId ? { requestId } : {}), phase: this.phase,
 			httpStatus: this.httpStatus, responseStarted: this.responseStarted, bytesRead: this.bytesRead,
 			...(this.transportInterrupted ? { transportInterrupted: true as const } : {}),
 			abortSource, providerErrorCode: this.providerErrorCode, providerErrorType: this.providerErrorType,
@@ -275,6 +276,8 @@ class TransportProbe {
 				requestContractMessageIndex: this.requestContractMessageIndex ?? null,
 				attemptedRequestNotSent: true as const,
 				...(this.wholePromptNotIssued ? { wholePromptNotIssued: true as const } : {}) } : {}) };
+		const judgement = classifyTransportFailure(diagnostic);
+		return { ...diagnostic, failureClass: judgement.class, failureReason: judgement.reason };
 	}
 }
 
@@ -705,6 +708,7 @@ async function createExecutionTools(
 	isolatedToolEnvironment = false,
 	tempDir?: string,
 	platform?: { gate: PlatformGate; turn: () => number },
+	runDeadline?: string,
 ): Promise<MaterialTools & { cwd: string }> {
 	const cwd = await realpath(root);
 	if (!(await lstat(cwd)).isDirectory()) throw new HarnessError("runner.tools", `execution root is not a directory: ${root}`);
@@ -786,19 +790,29 @@ async function createExecutionTools(
 						base.execute(toolCallId, executionArgs, signal, onUpdate, { ...ctx, cwd });
 					let result = platform && name === "bash" && typeof args.command === "string"
 						? await platform.gate.withDevice(args.command, runTool) : await runTool();
-					if (platform) {
-						const observed = name === "bash" ? await platform.gate.observe(name, visibleText((result as { content?: unknown }).content)) : undefined;
-						const appended = [platformNote, observed].filter((item): item is string => Boolean(item));
-						if (appended.length) {
-							const content = (result as { content?: unknown }).content;
-							result = { ...result, content: [...(Array.isArray(content) ? content : []),
-								{ type: "text", text: appended.join("\n\n") }] } as typeof result;
-						}
+					let observed: PlatformObservation | undefined;
+					if (platform && name === "bash")
+						observed = await platform.gate.observe(name, visibleText((result as { content?: unknown }).content));
+					// The remaining wall-clock belongs in the tool result, not in the
+					// prompt prefix, where a per-turn value would void the prefix cache.
+					const budgetNote = runDeadline ? remainingWallClockNote(runDeadline, Date.now()) : undefined;
+					const appended = [platformNote, observed?.text, budgetNote].filter((item): item is string => Boolean(item));
+					if (appended.length) {
+						const content = (result as { content?: unknown }).content;
+						result = { ...result, content: [...(Array.isArray(content) ? content : []),
+							{ type: "text", text: appended.join("\n\n") }] } as typeof result;
 					}
 					const isError = (result as { isError?: boolean }).isError === true;
+					const failure = isError ? classifyToolFailure({ name,
+						...(receipt?.receipt.processExit ? { exit: { exitCode: receipt.receipt.processExit.exitCode ?? null,
+							abortSource: receipt.receipt.processExit.abortSource === "timeout" ? "timeout" as const :
+								receipt.receipt.processExit.abortSource === "signal" ? "signal" as const : null } } : {}),
+						...(observed?.classes.length ? { platformClass: observed.classes.includes("infrastructure")
+							? "infrastructure" as const : observed.classes[0] } : {}) }) : undefined;
 					if (receipt) await finishManagedBashCall(receipt, isError ? "is-error" : "returned");
 					log.push({ name, args: safeArgs, ok: !isError, at,
-						...(receipt ? { toolCallId, hostReceiptPath: receipt.file } : {}) });
+						...(receipt ? { toolCallId, hostReceiptPath: receipt.file } : {}),
+						...(failure ? { failureClass: failure.class, failureReason: failure.reason } : {}) });
 					if (name === "read" && typeof args.path === "string") {
 						const resolved = path.isAbsolute(args.path) ? path.resolve(args.path) : path.resolve(cwd, args.path);
 						readCoverage.add(path.relative(cwd, resolved));
@@ -815,10 +829,27 @@ async function createExecutionTools(
 					}
 					const code = error instanceof HarnessError && /^runner\.[a-z.-]{1,80}$/.test(error.code)
 						? error.code : (error as NodeJS.ErrnoException | null)?.code;
+					const safeCode = typeof code === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(code) ? code : undefined;
+					const exit = receipt?.receipt.processExit;
+					// A failed command is where routed hints matter most, and Pi carries
+					// the command output in the thrown error.
+					const thrownObservation = platform && name === "bash" && error instanceof Error
+						? await platform.gate.observe(name, error.message) : undefined;
+					const thrownFailure = classifyToolFailure({ name,
+						errorClass: error instanceof HarnessError ? "harness" : "tool-error",
+						...(safeCode ? { errorCode: safeCode } : {}),
+						...(exit ? { exit: { exitCode: exit.exitCode ?? null,
+							abortSource: exit.abortSource === "timeout" ? "timeout" as const :
+								exit.abortSource === "signal" ? "signal" as const : null } } : {}),
+						...(thrownObservation?.classes.length ? { platformClass: thrownObservation.classes.includes("infrastructure")
+							? "infrastructure" as const : thrownObservation.classes[0] } : {}) });
 					log.push({ name, args: safeArgs, ok: false, at,
 					...(receipt ? { toolCallId, hostReceiptPath: receipt.file } : {}),
 						errorClass: error instanceof HarnessError ? "harness" : "tool-error",
-						...(typeof code === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(code) ? { errorCode: code } : {}) });
+						...(safeCode ? { errorCode: safeCode } : {}),
+						failureClass: thrownFailure.class, failureReason: thrownFailure.reason });
+					if (thrownObservation && error instanceof Error && !(error instanceof HarnessError))
+						throw new Error(`${error.message}\n\n${thrownObservation.text}`, { cause: error });
 					if (name === "bash" && process.platform === "darwin" && sandbox && error instanceof Error &&
 						/^\/bin\/bash: cannot create temp file for here document: Operation not permitted\r?$/m.test(error.message)) {
 						throw new Error(`${error.message}\n\nmacOS system Bash here-documents can ignore TMPDIR and fail after cd into a read-only directory; keep the shell in task writable cwd ${JSON.stringify(cwd)} or scratch ${JSON.stringify(scratch ?? cwd)} and read external files by absolute path.`, { cause: error });
@@ -1469,6 +1500,7 @@ export class PiSessionRunner implements SessionRunner {
 			},
 		});
 		const priced = resolved.model.cost.input > 0 && resolved.model.cost.output > 0;
+		let platformProfileId: string | undefined;
 		let materialTools: MaterialTools = { tools: [], names: [], readCoverage: new Set(), readReturns: [] };
 		const toolLog: ToolCallRecord[] = [];
 		let sessionCwd = cwd;
@@ -1486,10 +1518,12 @@ export class PiSessionRunner implements SessionRunner {
 			const gate = await platformGateFromEnvironment({ root: await realpath(spec.tools.root),
 				receiptFile: path.join(spec.persistDir, `${sessionManager.getSessionId()}.platform.jsonl`),
 				sessionId: sessionManager.getSessionId() });
+			platformProfileId = gate?.profile.id;
 			const execution = await createExecutionTools(spec.tools.root, spec.tools.tools, toolLog,
 				path.join(spec.persistDir, "host-execution-receipts", sessionManager.getSessionId()),
 				sessionManager.getSessionId(), true, spec.tools.tempDir,
-				gate ? { gate, turn: () => promptIndex } : undefined);
+				gate ? { gate, turn: () => promptIndex } : undefined,
+				spec.runDeadline ?? runDeadlineFromEnvironment());
 			materialTools = execution;
 			if (spec.tools.extraTools?.length) {
 				const extra = customToolsToPi(spec.tools.extraTools, toolLog);
@@ -1541,6 +1575,18 @@ export class PiSessionRunner implements SessionRunner {
 		}
 		const specFile = specFileFor(sessionFile);
 		if (persistSpec) await writeFileAtomic(specFile, `${JSON.stringify(spec, null, 2)}\n`);
+		// The harness is an experiment variable: the same model scores differently
+		// under different harness versions, so every session records the one it ran
+		// under next to its transcript.
+		if (persistSpec) await writeFileAtomic(sessionFile.replace(/\.jsonl$/, ".harness.json"),
+			`${JSON.stringify({ version: 1, recordedAt: new Date().toISOString(),
+				codeRevision: process.env.PRE_RSI_CODE_REVISION ?? null,
+				sourceRoot: process.env.PRE_RSI_SOURCE_ROOT ?? null,
+				model: spec.model, toolGrant: spec.tools.kind,
+				compaction: compactionPolicy ? { thresholdTokens: compactionPolicy.thresholdTokens,
+					keepRecentTokens: compactionPolicy.keepRecentTokens } : null,
+				platformProfile: platformProfileId ?? null,
+				runDeadline: spec.runDeadline ?? runDeadlineFromEnvironment() ?? null }, null, 2)}\n`);
 		const ref: SessionRef = {
 			label: spec.label,
 			role: spec.role,
