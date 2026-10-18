@@ -24,7 +24,7 @@ import { parseModelSpec } from "../config.ts";
 import { HarnessError } from "../types.ts";
 import { writeFileAtomic } from "../workspace.ts";
 import { TelemetryWriter } from "../dashboard/telemetry.ts";
-import type { AssistantTurn, CustomToolSpec, ForkRequest, ForkWorkspaceBindingV1, ReadReturnEvent, RunnerCapabilities, SessionCheckpoint, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, TranscriptMessage, TransportFailureDiagnostic, UsageEvent } from "./types.ts";
+import type { AssistantTurn, CustomToolSpec, ForkRequest, ForkWorkspaceBindingV1, ProviderRequestViolation, ReadReturnEvent, RunnerCapabilities, SessionCheckpoint, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, TranscriptMessage, TransportFailureDiagnostic, UsageEvent } from "./types.ts";
 import { summarizeUsage, usageEventsFromEntries } from "./usage.ts";
 import { compactionPolicyFromEnvironment, sessionCompactionPolicy, workflowCompactionExtension, workflowCompactionSettings } from "./compaction.ts";
 import { platformGateFromEnvironment, type PlatformGate, type PlatformObservation } from "../platform/gate.ts";
@@ -32,15 +32,15 @@ import { classifyToolFailure, classifyTransportFailure, remainingWallClockNote, 
 import { sampleRunnerResources, sessionClosed, sessionOpened } from "./resource.ts";
 import { DeepSeekCampaignBudget, type PromptLease } from "./deepseek-campaign.ts";
 import { getConfinedCampaignFileGrantDescriptor } from "./confined-campaign-files.ts";
-import { assertDeepSeekRequestContract, DeepSeekRequestContractError,
-	type DeepSeekRequestViolation } from "./deepseek-request-contract.ts";
+import { inspectCompletionsOutputRequest, providerRequestContract, ProviderRequestContractError,
+	type OutputTokenField } from "./provider-contract.ts";
+import "./provider-contracts.ts";
 import type { HostEffectScope } from "./operation-disposition.ts";
 import { certifyRequestNotSent } from "./operation-disposition.ts";
 import { finishManagedBashCall, managedLocalBashOperations, prepareManagedBashCall,
 	type ManagedBashCall } from "./managed-bash.ts";
 import { createExecutionSandbox } from "./execution-sandbox.ts";
 
-type OutputTokenField = "max_tokens" | "max_completion_tokens" | "both" | "omitted";
 
 /** Match Pi's own no-auth preflight, not a provider response or a guessed
  * environment variable. The original guidance may contain local doc paths,
@@ -72,30 +72,6 @@ function isPiCredentialStoreUnavailable(error: unknown, provider: string): boole
 		["mkdir", "open", "read", "stat", "access"].includes(cause.syscall ?? "");
 }
 
-/** Inspect Pi's final request without changing its provider/context negotiation. */
-function inspectDeepSeekOutputRequest(payload: unknown, expected: { provider: string; id: string;
-	api: string; baseUrl: string; maxTokens: number }, actual: typeof expected):
-	{ payload: Record<string, unknown>; outputTokens: number; outputField: OutputTokenField } {
-	if (!payload || typeof payload !== "object" || Array.isArray(payload) ||
-		actual.provider !== expected.provider || actual.id !== expected.id ||
-		actual.api !== expected.api || actual.baseUrl !== expected.baseUrl)
-		throw new HarnessError("runner.model", "DeepSeek provider request changed model");
-	const record = payload as Record<string, unknown>;
-	if (record.model !== expected.id || !Number.isSafeInteger(expected.maxTokens) || expected.maxTokens < 1)
-		throw new HarnessError("runner.model", "DeepSeek provider request changed model or resolved output maximum");
-	const hasMax = record.max_tokens !== undefined;
-	const hasCompletionMax = record.max_completion_tokens !== undefined;
-	if ((hasMax && (!Number.isSafeInteger(record.max_tokens) || Number(record.max_tokens) < 1 ||
-		Number(record.max_tokens) > expected.maxTokens)) ||
-		(hasCompletionMax && (!Number.isSafeInteger(record.max_completion_tokens) ||
-			Number(record.max_completion_tokens) < 1 || Number(record.max_completion_tokens) > expected.maxTokens)) ||
-		(hasMax && hasCompletionMax && record.max_tokens !== record.max_completion_tokens))
-		throw new HarnessError("runner.model", "DeepSeek provider request output bound is invalid or exceeds provider maximum");
-	return { payload: record, outputTokens: (record.max_tokens ?? record.max_completion_tokens ?? expected.maxTokens) as number,
-		outputField: hasMax && hasCompletionMax ? "both" : hasMax ? "max_tokens" :
-			hasCompletionMax ? "max_completion_tokens" : "omitted" };
-}
-
 /** Capture only host-observable transport facts. Never retain an Error or response body. */
 class TransportProbe {
 	private phase: TransportFailureDiagnostic["phase"] = "unknown";
@@ -110,7 +86,7 @@ class TransportProbe {
 	private providerContextOverflow?: TransportFailureDiagnostic["providerContextOverflow"];
 	private providerRequestId: string | null = null;
 	private privateProviderError?: TransportFailureDiagnostic["privateProviderError"];
-	private requestContractViolation?: DeepSeekRequestViolation;
+	private requestContractViolation?: ProviderRequestViolation;
 	private requestContractMessageIndex?: number | null;
 	private wholePromptNotIssued = false;
 	private readonly privateSanitize?: (value: string) => string | null;
@@ -255,7 +231,7 @@ class TransportProbe {
 		}
 	}
 	captureRequestContractError(error: unknown, wholePromptNotIssued: boolean): void {
-		if (!(error instanceof DeepSeekRequestContractError)) return;
+		if (!(error instanceof ProviderRequestContractError)) return;
 		this.requestContractViolation = error.violation;
 		this.requestContractMessageIndex = error.messageIndex;
 		this.wholePromptNotIssued = wholePromptNotIssued;
@@ -1276,9 +1252,11 @@ export class PiSessionRunner implements SessionRunner {
 		await loader.reload();
 		if (compactionPolicy) settingsManager.applyOverrides({ compaction: workflowCompactionSettings(resolved.model.contextWindow, compactionPolicy) });
 		campaign?.assertResolved(resolved.model);
-		if (strict && (resolved.model.provider !== "deepseek" || resolved.model.api !== "openai-completions" ||
-			(campaign && strict.maxOutputTokens !== resolved.model.maxTokens))) {
-			throw new HarnessError("runner.model", "strict request currently supports only bounded DeepSeek openai-completions models");
+		// A strict request is refused unless this provider has a registered static
+		// request contract; the runner core never names a vendor.
+		const requestContract = providerRequestContract(resolved.model.provider, resolved.model.api);
+		if (strict && (!requestContract || (campaign && strict.maxOutputTokens !== resolved.model.maxTokens))) {
+			throw new HarnessError("runner.model", "strict request requires a registered provider request contract and a bounded output maximum");
 		}
 		let strictStreamCalls = 0;
 		let strictPayloadChecks = 0;
@@ -1320,10 +1298,10 @@ export class PiSessionRunner implements SessionRunner {
 								probe.observeResponse(response.status);
 								await options?.onResponse?.(response, responseModel);
 							} } : {}),
-					...(model.provider === "deepseek" && model.api === "openai-completions" ? {
+					...(requestContract ? {
 						onPayload: async (payload: unknown, payloadModel: typeof model) => {
 							const original = await options?.onPayload?.(payload as never, payloadModel as never);
-							const inspected = inspectDeepSeekOutputRequest(original ?? payload, model, payloadModel);
+							const inspected = inspectCompletionsOutputRequest(original ?? payload, model, payloadModel);
 							providerOutputRequests.push({ resolvedMaxTokens: model.maxTokens,
 								outputField: inspected.outputField,
 								outgoingMaxTokens: inspected.outputField === "omitted" ? null : inspected.outputTokens });
@@ -1388,7 +1366,7 @@ export class PiSessionRunner implements SessionRunner {
 									...(prior.max_completion_tokens === undefined ? {} :
 										{ max_completion_tokens: corrected }) };
 								const nextBody = JSON.stringify(next);
-								try { assertDeepSeekRequestContract(nextBody,
+								try { requestContract?.assertRequest(nextBody,
 									{ sourceMessages: context.messages }); }
 								catch { return response; }
 								const nextBytes = Buffer.byteLength(nextBody, "utf8");
@@ -1420,11 +1398,11 @@ export class PiSessionRunner implements SessionRunner {
 							if (payloadModel.provider !== model.provider || payloadModel.id !== model.id ||
 								payloadModel.api !== model.api || payloadModel.baseUrl !== model.baseUrl)
 								throw new HarnessError("runner.model", "strict request payload changed model");
-							const inspected = inspectDeepSeekOutputRequest(payload, model, payloadModel);
+							const inspected = inspectCompletionsOutputRequest(payload, model, payloadModel);
 							const outgoing = inspected.payload;
 							const serialized = JSON.stringify(outgoing);
 							if (typeof serialized !== "string") throw new HarnessError("runner.model", "provider payload could not be serialized for reservation");
-							if (campaign) try { assertDeepSeekRequestContract(serialized,
+							if (campaign) try { requestContract?.assertRequest(serialized,
 								{ sourceMessages: context.messages }); }
 							catch (error) {
 								probe?.captureRequestContractError(error, Boolean(lease) &&
