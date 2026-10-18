@@ -11,7 +11,7 @@ import { evaluateCandidate } from "./evaluator.ts";
 import { readProjectionEvents, replayability } from "./observations.ts";
 import { readMethodPackage, type MethodPackageV1 } from "./method.ts";
 import { DEFAULT_BUDGET_POLICY, loadActiveBudgetPolicy, validateActiveBudgetPointer, validateBudgetPolicy, type ActiveBudgetPointer, type BudgetPolicy } from "./policy.ts";
-import type { AnonymousRunSample, CampaignPlan, ImprovementAttempt, ImprovementHypothesis, ImprovementProtocol, ImprovementRun, ImprovementRunResult, ImprovementStatus } from "./types.ts";
+import type { AnonymousRunSample, CampaignPlan, ImprovementAdmissionRate, ImprovementAttempt, ImprovementHypothesis, ImprovementProtocol, ImprovementRun, ImprovementRunResult, ImprovementStatus } from "./types.ts";
 
 export interface ImprovementServiceOptions {
  workspaceRoot: string;
@@ -270,13 +270,22 @@ export class ImprovementService {
 		const pointer = await this.readPointer();
 		const runsDir = path.join(improvementRoot(this.root), "runs");
 		const runs: ImprovementStatus["runs"] = [];
+		const admissionRate: ImprovementAdmissionRate = { attempts: 0, promoted: 0, rejected: 0, inconclusive: 0, other: 0, rate: null };
 		if (existsSync(runsDir)) for (const name of (await readdir(runsDir)).sort()) {
 			const text = await readTextIfExists(path.join(runsDir, name, "run.json")); if (!text) continue;
 			const value = JSON.parse(text) as ImprovementRun;
 			const effectiveStatus = pointer?.runId === value.runId ? "promoted" as const : value.status;
 			runs.push({ runId: value.runId, status: effectiveStatus, startedAt: value.startedAt, finishedAt: value.finishedAt ?? (effectiveStatus === "promoted" ? pointer?.promotedAt : undefined) });
+			for (const attempt of value.attempts ?? []) {
+				admissionRate.attempts++;
+				if (attempt.status === "promoted") admissionRate.promoted++;
+				else if (attempt.status === "rejected") admissionRate.rejected++;
+				else if (attempt.status === "inconclusive") admissionRate.inconclusive++;
+				else admissionRate.other++;
+			}
 		}
-		return { activeVersionId: pointer?.versionId, activeProvenance: pointer ? pointer.provenance ?? "legacy-projection-only" : undefined, previousVersionId: pointer?.previousVersionId, runs };
+		admissionRate.rate = admissionRate.attempts ? admissionRate.promoted / admissionRate.attempts : null;
+		return { activeVersionId: pointer?.versionId, activeProvenance: pointer ? pointer.provenance ?? "legacy-projection-only" : undefined, previousVersionId: pointer?.previousVersionId, runs, admissionRate };
 	}
 
 	async rollback(): Promise<ActiveBudgetPointer> { return this.withMutation(() => this.rollbackUnlocked()); }

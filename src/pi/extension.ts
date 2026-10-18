@@ -10,7 +10,7 @@ import { parseRunDescriptor, readTrustedPauseMs } from "../runtime/run-descripto
 import { verifyDescriptorLoadedSource, verifyLoadedSource } from "../runtime/loaded-source.ts";
 import { readCurrentProcessIdentity } from "../runtime/process-identity.ts";
 import { writeFileAtomic } from "../workspace.ts";
-import { TelemetryWriter } from "../dashboard/telemetry.ts";
+import { TelemetryWriter } from "../telemetry.ts";
 import { createMainUsageLedger } from "./main-usage.ts";
 import { ImprovementService } from "../improvement/service.ts";
 import { ResearchImprovementService, type ResearchBootstrapInput } from "../improvement/research-service.ts";

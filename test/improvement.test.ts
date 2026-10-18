@@ -8,6 +8,7 @@ import test, { type TestContext } from "node:test";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { createM07Controller } from "../src/m07/controller.ts";
 import { ImprovementService } from "../src/improvement/service.ts";
+import { pairedStatistics } from "../src/improvement/admission.ts";
 import { DEFAULT_BUDGET_POLICY, loadActiveBudgetPolicy } from "../src/improvement/policy.ts";
 import type { CampaignPlan } from "../src/improvement/types.ts";
 import { FakeSessionRunner, type FakeReplyContext } from "../src/runner/fake.ts";
@@ -170,4 +171,42 @@ test("promotion compares active pointer with frozen baseline before commit", asy
  root = f.root; await seedRuntimeProjection(f); const cases = await caseFile(f.root);
  await assert.rejects(f.service.run(plan(cases)), (error: unknown) => (error as {code?: string}).code === "improvement.stale-baseline");
  assert.equal((await f.service.status()).activeVersionId, "external-version");
+});
+
+test("the exact sign test excludes ties and reports the n it is based on", () => {
+ assert.deepEqual(pairedStatistics([]), { n: 0, candidateCheaper: 0, candidateCostlier: 0, tied: 0, signTestTwoSidedP: null });
+ assert.deepEqual(pairedStatistics([0, 0]), { n: 0, candidateCheaper: 0, candidateCostlier: 0, tied: 2, signTestTwoSidedP: null });
+ // Five one-directional pairs: 2 * (1/2^5) = 0.0625.
+ const oneSided = pairedStatistics([-1, -2, -3, -4, -5]);
+ assert.deepEqual([oneSided.n, oneSided.candidateCheaper, oneSided.candidateCostlier, oneSided.tied], [5, 5, 0, 0]);
+ assert.equal(oneSided.signTestTwoSidedP, 0.0625);
+ // One reversal in six: 2 * (1 + 6) / 2^6 = 0.21875; ties stay out of n.
+ const mixed = pairedStatistics([-1, -1, -1, -1, -1, 2, 0]);
+ assert.deepEqual([mixed.n, mixed.candidateCheaper, mixed.candidateCostlier, mixed.tied], [6, 5, 1, 1]);
+ assert.equal(mixed.signTestTwoSidedP, 0.21875);
+ assert.equal(pairedStatistics([-1, 1]).signTestTwoSidedP, 1);
+});
+
+test("admission records the model, token budget, headroom and paired statistic, and status reports the write-back rate", async (t) => {
+ const f = await fixture(t, campaignReply); await seedRuntimeProjection(f); const cases = await caseFile(f.root);
+ const promoted = await f.service.run(plan(cases));
+ assert.equal(promoted.run.status, "promoted");
+ const admission = JSON.parse(await readFile(promoted.run.admissionPath!, "utf8")) as {
+  model: string; baselineTokens: number; candidateTokens: number;
+  headroom: { cases: number; triggeredCases: number; untriggeredCaseIds: string[] };
+  paired: { n: number; candidateCheaper: number; candidateCostlier: number; tied: number; signTestTwoSidedP: number | null };
+ };
+ assert.equal(admission.model, "fake/user-selected-research");
+ // Two arms x two repetitions, each arm reporting 100 input and 50 output tokens.
+ assert.equal(admission.baselineTokens, 300);
+ assert.ok(admission.candidateTokens > 0);
+ assert.deepEqual(admission.headroom, { cases: 1, triggeredCases: 1, untriggeredCaseIds: [] });
+ assert.equal(admission.paired.n, 2);
+ assert.equal(admission.paired.candidateCheaper, 2);
+ assert.equal(admission.paired.candidateCostlier, 0);
+ assert.equal(admission.paired.signTestTwoSidedP, 0.5);
+ const status = await f.service.status();
+ assert.equal(status.admissionRate.promoted, 1);
+ assert.equal(status.admissionRate.attempts, status.admissionRate.promoted + status.admissionRate.rejected + status.admissionRate.inconclusive + status.admissionRate.other);
+ assert.equal(status.admissionRate.rate, status.admissionRate.promoted / status.admissionRate.attempts);
 });

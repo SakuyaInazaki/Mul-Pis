@@ -23,7 +23,7 @@ import { Type, createAssistantMessageEventStream, type AssistantMessage } from "
 import { parseModelSpec } from "../config.ts";
 import { HarnessError } from "../types.ts";
 import { writeFileAtomic } from "../workspace.ts";
-import { TelemetryWriter } from "../dashboard/telemetry.ts";
+import { TelemetryWriter } from "../telemetry.ts";
 import type { AssistantTurn, CustomToolSpec, ForkRequest, ForkWorkspaceBindingV1, ReadReturnEvent, RunnerCapabilities, SessionCheckpoint, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, TranscriptMessage, TransportFailureDiagnostic, UsageEvent } from "./types.ts";
 import { summarizeUsage, usageEventsFromEntries } from "./usage.ts";
 import { sessionCompactionPolicy, workflowCompactionExtension, workflowCompactionSettings } from "./compaction.ts";

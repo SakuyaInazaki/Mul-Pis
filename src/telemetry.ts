@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
-import { writeFileAtomic } from "../workspace.ts";
+import { writeFileAtomic } from "./workspace.ts";
 
 export type TelemetryActivity = "active" | "idle" | "ended";
 

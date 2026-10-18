@@ -1,4 +1,5 @@
 import path from "node:path";
+import { renderWorkflowAudit } from "./audit.ts";
 import type { ConsoleStatus, WorkflowNode, WorkflowSnapshot } from "./model.ts";
 
 const STATE: Record<ConsoleStatus, string> = {
@@ -161,6 +162,8 @@ export function nodeDetails(snapshot: WorkflowSnapshot, node?: WorkflowNode): st
 			lines.push(`目标结果：${goalOutcome(snapshot.goal.outcome)}`);
 			addGoalHistory(lines, snapshot.goal);
 		}
+		lines.push("审计投影（判决、失败分账与预算；全部由控制记录确定性派生）：");
+		for (const line of renderWorkflowAudit(snapshot.audit)) lines.push(`  ${line}`);
 		return lines;
 	}
 
@@ -221,6 +224,11 @@ export function nodeOverview(snapshot: WorkflowSnapshot, node?: WorkflowNode): s
 			lines.push(`目标结果：${goalOutcome(snapshot.goal.outcome)}`);
 			addGoalSummary(lines, snapshot.goal);
 		}
+		const audit = snapshot.audit;
+		lines.push(`候选判决：通过 ${audit.judgement.verifiedPassed}、失败 ${audit.judgement.verifiedFailed}、未判定 ${audit.judgement.unjudged}（共 ${audit.judgement.candidates}）`,
+			`引擎驳回 agent 自述：${audit.selfAccepted.hostRefused + audit.selfAccepted.hostUnjudged}/${audit.selfAccepted.declaredByAgent}`,
+			`失败分账：基础设施 ${audit.failures.infrastructure}、策略 ${audit.failures.policy}`,
+			`累计计费：${audit.budget.cost}${audit.budget.costComplete ? "" : "（下界）"}，完整审计按 v 阅读`);
 		return lines;
 	}
 	const lines = [`节点：${nodeIdentity(node)}`, `状态：${statusLabel(node)}`];

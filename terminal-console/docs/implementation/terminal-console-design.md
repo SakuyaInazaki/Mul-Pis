@@ -15,12 +15,12 @@ npm run console -- --workspace /path/to/workspace
 要启动由控制台持有的 Pi 主会话并交给它初始任务，可运行：
 
 ```sh
-npm run console -- start --workspace /path/to/workspace --model provider/model --prompt-file /path/to/task.txt
+npm run console -- start --workspace /path/to/workspace --prompt-file /path/to/task.txt
 ```
 
-`provider/model` 是用户明确指定的主会话模型；研究阶段各角色仍由工作区 `research.config.json` 决定。`--prompt-file` 中的文本作为初始主会话任务。交互界面里也可用 `:start provider/model`，随后输入初始任务。每个工作区同时只允许一个已核验的控制台宿主；离开界面不会停止运行宿主。控制台不会自动创建 M07 目标，主 Pi 仍通过 `research_goal begin` 建立目标。
+主会话模型取工作区 `research.config.json` 的 research 角色；harness 不替用户选模型，命令行上没有模型参数。`--prompt-file` 中的文本作为初始主会话任务。交互界面里也可用 `:start`，随后输入初始任务。每个工作区同时只允许一个已核验的控制台宿主；离开界面不会停止运行宿主。控制台不会自动创建 M07 目标，主 Pi 仍通过 `research_goal begin` 建立目标。
 
-`start --detach` 在宿主就绪后返回；随后用 `attach --workspace /path/to/workspace` 重连。普通 Pi 或旧 stdio 启动器的运行记录仍可观察，但不能中途接管其输入管道。已有目标的恢复须使用 `recover --workspace DIR --goal ID --old-descriptor FILE --model provider/model`，并由原有控制器核验旧进程、冻结状态和未决操作。
+`start --detach` 在宿主就绪后返回；随后用 `attach --workspace /path/to/workspace` 重连。普通 Pi 或旧 stdio 启动器的运行记录仍可观察，但不能中途接管其输入管道。已有目标的恢复须使用 `recover --workspace DIR --goal ID --old-descriptor FILE`，并由原有控制器核验旧进程、冻结状态和未决操作。
 
 ## 画面和按键
 
@@ -74,6 +74,30 @@ M07 目标与 M04 回流可能跨越多次运行。控制台以持久 runId、ta
 
 M07 目标概况包含已保存的 M04 基线、知识快照、反馈形式、checkpoint 数和待决定事项；最新 checkpoint 的纳入/省略任务数来自对应冻结记录。`v` 的节点完整记录保留基线历史、checkpoint 范围和反馈路径。完整反馈、索引反馈、仅控制事实和待修复反馈分别显示；缺少冻结范围时显示未知，不推断全部任务已经反馈、M04 已经完整读取或知识已经合入。
 
+## 审计投影
+
+执行树一次只展示一个节点。要回答「这个候选为什么被拒」和「预算花在哪」，控制台另外给一份跨节点的审计投影：根节点概况里有摘要，根节点的 `v` 完整记录里有全部字段，命令行上是
+
+```sh
+npm run console -- audit --workspace /path/to/workspace        # 文本
+npm run console -- audit --workspace /path/to/workspace --json # 结构化
+```
+
+审计覆盖工作区里**每一个可读的 M07 目标**，不只是当前选中的那一个；全部数字由 `goal.json`、冻结候选观测和会话用量 sidecar 确定性派生，不读取报告正文、回执内容或模型文本。字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| 任务判决 | 任务状态分布（执行中/已返回/已接受/未接受/失败/未知） |
+| 候选判决 | 冻结候选观测的宿主核验结果：通过、失败、未判定，以及未判定占比 |
+| 停在哪一级验证门 | 每个候选观测由 `summarizeCandidateDiagnostics` 确定性归类后停在的那一级：源码未绑定、未终态、编译失败、数值失败、运行失败、混合失败、正确性失败、正确未测量、正确已测量 |
+| 引擎与 agent 自述的差 | agent 声明了候选的任务数，以及其中宿主核验通过、判失败、未判定各多少，控制器另行驳回多少 |
+| 失败分账 | 基础设施失败（源码未绑定、未终态外部操作、执行失败）与策略失败（编译/数值/运行/正确性失败、复核失败）分列，另有未分类一栏 |
+| 预算 | 会话数、输入/输出/缓存 token、计费合计，以及记录是否完整 |
+| 反馈密度 | 每个宿主核验通过需要多少候选；每百万 token 产出多少候选观测 |
+| 改动类别 / 候选意图 / 性能画像证据 | 候选 `changeKind`、`intent` 与画像可用性（unavailable / partial / derived）的分布 |
+
+没有分母时显示「无分母」，不显示 0 也不编造比值。用量记录不完整时，预算是已读记录的**下界**并明确标注。未判定候选既不算失败也不算通过，不进入最佳与搜索前沿；它的占比本身是 harness 健康指标。审计只做计数，不判断科研质量，也不声称某个已测量候选真的更快。
+
 ## 控制命令
 
 交互界面按 `:` 后输入：
@@ -87,7 +111,7 @@ M07 目标概况包含已保存的 M04 基线、知识快照、反馈形式、ch
 | `:continue 指令` | 对同一目标提交语义等待后的继续输入。 |
 | `:condition /path/to/receipt.json \| 指令` | 用条件证据回执尝试解除依赖或授权等待。 |
 | `:wait /path/to/condition.json` | 向当前目标提交含恢复条件的等待请求。 |
-| `:recover 目标ID 旧attempt provider/model` | 启动新 Pi 进程并让控制器核验旧尝试及恢复条件。 |
+| `:recover 目标ID 旧attempt` | 启动新 Pi 进程并让控制器核验旧尝试及恢复条件。 |
 | `:pause` / `:resume` | 暂停 / 继续已核验进程。 |
 | `:abort` / `:stop` | 通过界面二次选择取消当前轮或正在执行的结构化工作流动作 / 停止进程。 |
 | `:hosts` / `:help` | 选择宿主 / 查看帮助。 |
