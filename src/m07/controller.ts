@@ -21,7 +21,7 @@ import { GenerationStore, isM07WorkflowStrategy } from "../improvement/generatio
 import { probeProcessIdentity, readCurrentProcessIdentity, type ProcessIdentityV1 } from "../runtime/process-identity.ts";
 import { parseRunDescriptor, type RunDescriptorV1 } from "../runtime/run-descriptor.ts";
 import { verifyDescriptorLoadedSource, verifyLoadedSource } from "../runtime/loaded-source.ts";
-import { parseRoundReview } from "./execution-loop.ts";
+import { runUntilReadyRounds } from "./execution-loop.ts";
 import { openBoundedSession, type EvidenceBindingV1 } from "../context/boundary.ts";
 import type { SessionHandle, ToolGrant } from "../runner/types.ts";
 import type { Workspace } from "../workspace.ts";
@@ -1372,88 +1372,17 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				}
 				task.session = handle.ref; await save(ctx, goal);
 				if (spec.executionLoop && "mode" in spec.executionLoop && spec.executionLoop.mode === "until-ready") {
-					const transcript: string[] = [];
-					task.executionRounds = [];
-					let nextMessage = message;
-					for (let index = 1; ; index++) {
-						if (!Number.isSafeInteger(index)) throw new HarnessError("m07.loop", "round identity overflow");
-						const currentOperation: M07OperationV1 = index === 1 ? operation! : { version: 1, id: `O${String(goal.executionState!.operations.length + 1).padStart(3, "0")}`, taskId: id, status: "prepared", issuedAt: nowIso() };
-						activeOperation = currentOperation;
-						if (index > 1) { goal.executionState!.operations.push(currentOperation); await save(ctx, goal); }
-						await verifyDispatchKnowledge();
-						if (index === 1) { event.deliveryStatus = "submitted"; event.providerUsageSessionId = handle.ref.id; await writeProjectionEvent(ctx.ws, event); }
-						currentOperation.status = "issued"; await save(ctx, goal);
-						promptIssued = true;
-						const report = (await handle.prompt(nextMessage)).text;
-						currentOperation.status = "response-received";
-						await verifyFrozenInputs();
-						if (task.experienceSelection) task.experienceSelection.loadedAt = nowIso();
-						const builderReportPath = path.join(dir, `round-${index}-builder.md`);
-						await writeFileAtomic(builderReportPath, report);
-						const round: NonNullable<M07TaskRecord["executionRounds"]>[number] = { index, operationId: currentOperation.id, builderContext: index === 1 ? branchParent ? { mode: "fork", reason: `same task explored from ${branchParent.branchSource!.checkpoint.id}` } : { mode: "fresh", reason: "new M07 task" } : { mode: "continue", reason: "same builder repairs the same frozen task in its live session" }, builderReportPath, completedAt: nowIso() };
-						task.executionRounds.push(round);
-						transcript.push(`## Round ${index} builder\n\n${report}`);
-						await save(ctx, goal);
-						const reviewerRoot = path.join(dir, `round-${index}-snapshot`);
-						const reviewerSnapshotBytes = await snapshotRoundForReviewer(workDir, reviewerRoot);
-						round.reviewerSnapshotBytes = reviewerSnapshotBytes;
-						round.reviewerSnapshotPath = reviewerRoot;
-						let reviewerPrompt = `Review only this M07 task round and the copied work-directory snapshot. Goal: ${goal.goal}\nProblem relation: ${goal.problemRelation}\nFrozen goal constraints: ${goal.constraints.join("; ")}\nFrozen success criteria: ${goal.successCriteria.join("; ")}\nGoal plan at task creation: ${goal.plan}\nTask objective: ${spec.objective}\nChecks: ${spec.checks.join("; ")}\nExpected outputs: ${spec.expectedOutputs.join("; ")}\nFrozen plan input: ${task.planCopy ? path.relative(workDir, task.planCopy) : "none"}\n${pack ? `The builder's frozen knowledge and selected experience follow. Check relevant records' scope, availability and limits; selection and loading do not establish scientific truth or task success.\n\n${pack}\n\n` : ""}The builder report follows. Inspect the copied files only as needed. Before asserting that a field or block is absent, inspect the exact file and its complete relevant field or object range; if that cannot be done, report the gap as unverified. Reply with only JSON {"verdict":"ready|revise|replan|blocked","feedback":"specific evidence-grounded reason"}, without extra prose or code fences. Escape paragraph breaks inside the feedback JSON string as \\n, never raw line breaks inside quotes. Identify decisive checked files, measurements, failures and limitations. For operator optimization, distinguish compilation, interface and numerical correctness from performance or score feedback; compare performance only among candidates actually passing this task's correctness checks under a comparable measurement basis, then assess the choice against the frozen original goal. Ground diagnosis in observed measurements; do not require a particular profiler or metric. The goal plan, task objective and builder hypotheses are proposals to evaluate under the frozen goal, user constraints and success criteria; do not promote them into independent user requirements or evidence of impossibility. Verify the substantive task objective as well as its checks against the frozen goal and constraints. Completed actions, saved files or exhausted self-imposed attempts do not satisfy an unmet attainment objective. A local negative result may satisfy an observation task but does not prove the parent goal impossible or exhaust untested routes. Use revise while work remains within this task; replan when the task definition conflicts with frozen obligations, needs a plan change, or claims route exhaustion beyond its evidence; blocked for an evidenced external impediment. ready requires the task objective and checks to be met and still needs the controller's separate final review. Keep the original goal and authorized task scope; use replan for conflicts instead of silently changing obligations.\n\n${report}`;
-						reviewerPrompt = `The authorized task deliverable and the parent goal are separate. A documented negative experiment can be ready for a diagnostic or bounded-attempt task when its own objective and checks are met; it does not pass an unmet original goal criterion. Do not demand another submission, evaluation, or new kernel beyond this task's authorization or exhausted external quota. If this task itself required attainment and failed, use replan instead of revise demanding unauthorized work.\n\n${reviewerPrompt}`;
-						if (reviewerPrompt.length + systemPromptFor("reviewer").length > policy.maxPromptChars) {
-							const handoff = await freezeBuilderReportForReviewer(report, reviewerRoot);
-							round.builderReportHandoffDir = handoff.folder;
-							reviewerPrompt = reviewerPrompt.slice(0, reviewerPrompt.length - report.length) + handoff.message;
-						}
-						if (reviewerPrompt.length + systemPromptFor("reviewer").length > policy.maxPromptChars) throw new HarnessError("context.budget", "reviewer control input exceeds the frozen prompt handoff size");
-						const reviewerSpec = sessionSpec(ctx, `M07-${id}-round-${index}-reviewer`, "reviewer", systemPromptFor("reviewer"), { kind: "read-dir", root: reviewerRoot });
-						if (goal.methodBinding) reviewerSpec.methodBinding = goal.methodBinding;
-						const reviewRunRecord = await ctx.ws.readRun("M07", runId);
-						const reviewer = await openBoundedSession(ctx.runner, reviewRunRecord, { mode: "fresh", intent: "independent-judgment", reason: `M07 round ${index} reviewer must independently inspect the frozen candidate snapshot`, evidence: [{ version: 1, label: `M07 ${id} round ${index} snapshot`, path: reviewerRoot, status: "frozen-copy", sourceVersion: `${runId}/${id}/round-${index}` }], spec: reviewerSpec }, () => ctx.ws.writeRun(reviewRunRecord));
-						round.reviewerSession = reviewer.ref;
-						await save(ctx, goal);
-						let rawReview!: string;
-						let verdict!: ReturnType<typeof parseRoundReview>;
-						try {
-							let request = reviewerPrompt;
-							for (let attempt = 1; ; attempt++) {
-								if (!Number.isSafeInteger(attempt)) throw new HarnessError("m07.loop-review", "reviewer attempt identity overflow");
-								await verifyDispatchKnowledge();
-								rawReview = (await reviewer.prompt(request)).text;
-								if (Buffer.byteLength(rawReview, "utf8") > 512_000)
-									throw new HarnessError("m07.file-size", "reviewer report file exceeds 512,000 UTF-8 bytes");
-								const attemptPath = path.join(dir, `round-${index}-reviewer-attempt-${attempt}.md`);
-								await writeFileAtomic(attemptPath, rawReview);
-								try { verdict = parseRoundReview(rawReview); break; }
-								catch (error) {
-									if (!(error instanceof HarnessError) || error.code !== "m07.loop-review") throw error;
-									transcript.push(`## Round ${index} reviewer attempt ${attempt}\n\nInvalid structured verdict; see ${path.basename(attemptPath)}. ${error.message}`);
-									request = `Your preceding response was not a usable structured verdict: ${error.message}. Continue in this SAME independent read-only reviewer session against the SAME frozen round snapshot and unchanged task checks. Inspect the files as needed, then return only strict JSON {"verdict":"ready|revise|replan|blocked","feedback":"specific evidence-grounded reason"}. Do not infer ready from malformed text, change task obligations, or request builder work before a valid verdict.`;
-								}
-							}
-						} finally { task.toolLog.push(...reviewer.toolLog().map((entry) => ({ ...entry, reviewerSessionId: reviewer.ref.id }))); reviewer.dispose(); }
-						const reviewerReportPath = path.join(dir, `round-${index}-reviewer.md`);
-						await writeFileAtomic(reviewerReportPath, rawReview);
-						round.reviewerReportPath = reviewerReportPath;
-						let fileCheckFailure: string | undefined;
-						if (verdict.verdict === "ready") {
+					await runUntilReadyRounds({ ctx, goal, task, spec, policy, runId, taskId: id, dir, workDir, message,
+						...(pack ? { pack } : {}), handle, operation: operation!, event,
+						...(branchParent ? { branchParent } : {}),
+						save: () => save(ctx, goal), verifyDispatchKnowledge, verifyFrozenInputs,
+						setActiveOperation: (next) => { activeOperation = next; },
+						markPromptIssued: () => { promptIssued = true; },
+						validateReadyFiles: async (reviewerRoot) => {
 							const candidate = await validateCandidateFiles(reviewerRoot, spec.expectedOutputs.map((item) => path.join(reviewerRoot, item)), spec.lessonDeltaOutput);
-							const fileFailures = [...candidate.expectedOutputs.flatMap((item) => item.error ? [item.error] : []), ...(candidate.lessonDeltaFailure ? [candidate.lessonDeltaFailure] : [])];
-							if (fileFailures.length) {
-								fileCheckFailure = fileFailures.join("; ");
-								verdict = { verdict: "revise" as const, feedback: `Reviewer reported ready, but the controller's final-review file checks failed: ${fileCheckFailure}. Repair the same candidate and let a fresh reviewer inspect it.` };
-							}
-						}
-						round.verdict = verdict.verdict; round.feedback = verdict.feedback;
-						transcript.push(`## Round ${index} reviewer\n\n${rawReview}${fileCheckFailure ? `\n\nController file-bound check changed this ready verdict to revise: ${fileCheckFailure}` : ""}`);
-						await save(ctx, goal);
-						if (verdict.verdict === "ready" || verdict.verdict === "replan" || verdict.verdict === "blocked") { task.loopStopReason = verdict.verdict; break; }
-						nextMessage = `Continue the same authorized task under the original goal, user constraints and success criteria. The recorded plan and route hypotheses may be revised in light of evidence; they are not additional user requirements. Fresh reviewer feedback from round ${index}: ${verdict.feedback}\nAddress the observed gap within this task, then report concrete changes and verification. Repair an actual implementation or numerical defect; if the evidence instead calls for a different structure or plan outside this task, explain that need and return replan rather than repeating parameter changes. Where the task compares candidates, keep the verified best distinct from the current exploration point; report the hypothesis, exact change, observed feedback, and whether this attempt is retained, rejected, or still uncertain. Do not repeat a rejected candidate without new evidence. Do not expand scope or silently restart an external action whose outcome is unknown.`;
-					}
-					const reportPath = path.join(dir, "report.md");
-					const renderReport = () => `# M07 execution\n\nStop: ${task.loopStopReason ?? "incomplete"}\n\n${transcript.join("\n\n")}\n`;
-					await writeFileAtomic(reportPath, renderReport());
-					task.reportPath = reportPath; task.status = "returned";
+							const failures = [...candidate.expectedOutputs.flatMap((item) => item.error ? [item.error] : []), ...(candidate.lessonDeltaFailure ? [candidate.lessonDeltaFailure] : [])];
+							return failures.length ? failures.join("; ") : undefined;
+						} });
 				} else {
 					await verifyDispatchKnowledge();
 					event.deliveryStatus = "submitted"; event.providerUsageSessionId = handle.ref.id; await writeProjectionEvent(ctx.ws, event);
