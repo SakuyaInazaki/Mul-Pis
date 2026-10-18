@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { main } from "../src/cli.ts";
+import { readCurrentProcessIdentity } from "../src/runtime/process-identity.ts";
 
 async function capture(action: () => Promise<number>): Promise<{ code: number; output: string }> {
 	const lines: string[] = [];
@@ -30,4 +31,35 @@ test("CLI M08 reads explicit JSON inputs and runs the real stage with the fake r
 	assert.equal(result.code, 0);
 	assert.match(result.output, /M08 已结束：.*状态 completed/);
 	assert.match(result.output, /review-bundle\.md/);
+});
+
+test("a CLI mutation takes the same workspace ownership as the extension service", async (t) => {
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-cli-owner-")));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	await capture(() => main(["init", "--workspace", root]));
+	await mkdir(path.join(root, "problem", "raw"), { recursive: true });
+	await writeFile(path.join(root, "problem", "problem.md"), "问题\n");
+	await writeFile(path.join(root, "research.config.json"), `${JSON.stringify({ roles: { execution: "fake/execution" }, concurrency: 1 })}\n`);
+	const ownerDir = path.join(root, ".agent", "console");
+	await mkdir(ownerDir, { recursive: true, mode: 0o700 });
+	const identity = await readCurrentProcessIdentity();
+	await writeFile(path.join(ownerDir, "owner.lock"), `${JSON.stringify({ version: 1, kind: "mutation",
+		process: { ...identity, processStartToken: `${identity.processStartToken}-other` } })}\n`, { mode: 0o600 });
+	await assert.rejects(main(["m01", "--workspace", root, "--runner", "fake"]), /already owned|owner is unknown/);
+	const readOnly = await capture(() => main(["status", "--workspace", root]));
+	assert.equal(readOnly.code, 0, "a read-only command never needs the mutation lock");
+});
+
+test("the CLI refuses a host candidate configuration it cannot trust", async (t) => {
+	const root = await realpath(await mkdtemp(path.join(tmpdir(), "pre-rsi-cli-host-")));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const previous = process.env.PRE_RSI_LOCAL_OPERATOR_CONFIG;
+	t.after(() => { if (previous === undefined) delete process.env.PRE_RSI_LOCAL_OPERATOR_CONFIG; else process.env.PRE_RSI_LOCAL_OPERATOR_CONFIG = previous; });
+	await capture(() => main(["init", "--workspace", root]));
+	await writeFile(path.join(root, "research.config.json"), `${JSON.stringify({ roles: { execution: "fake/execution" }, concurrency: 1 })}\n`);
+	process.env.PRE_RSI_LOCAL_OPERATOR_CONFIG = "relative/host.json";
+	const task = path.join(root, "task.json");
+	await writeFile(task, `${JSON.stringify({ objective: "x", inputs: [], expectedOutputs: ["a.txt"], checks: ["c"], mode: "execute" })}\n`);
+	await assert.rejects(main(["goal", "delegate", "--workspace", root, "--run", "M07-0001", "--task", task, "--runner", "fake"]),
+		/absolute host-owned configuration/);
 });

@@ -38,6 +38,10 @@ import path from "node:path";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { createFileKnowledgeStore } from "./knowledge/store.ts";
+import { withWorkspaceMutationOwnership } from "./console/ownership.ts";
+import { createLocalOperatorBackend, type LocalOperatorBackendOptions } from "./m07/local-operator-backend.ts";
+import type { CandidateVerifier } from "./m07/candidate-evaluation.ts";
+import type { CandidateExecutionBackend } from "./m07/candidate-runner.ts";
 import { FakeSessionRunner, createTrustedCliFakeRunner } from "./runner/fake.ts";
 import type { SessionRunner } from "./runner/types.ts";
 import type { StageContext } from "./stages/context.ts";
@@ -189,6 +193,25 @@ async function jsonFile<T>(args: ParsedArgs, name: string): Promise<T> {
 	catch (error) { throw new HarnessError("cli.input", `无法读取 --${name}：${(error as Error).message}`); }
 }
 
+/** The host candidate binding the local-operator extension uses. A CLI
+ * delegation is then verified by the same deterministic host, instead of
+ * silently falling back to model self-reports. */
+async function localOperatorHost(): Promise<{ candidateVerifier?: CandidateVerifier;
+	candidateExecutionBackend?: CandidateExecutionBackend }> {
+	const configurationPath = process.env.PRE_RSI_LOCAL_OPERATOR_CONFIG;
+	if (!configurationPath) return {};
+	if (!path.isAbsolute(configurationPath))
+		throw new HarnessError("cli.goal", "PRE_RSI_LOCAL_OPERATOR_CONFIG must be an absolute host-owned configuration file path");
+	const configuration = JSON.parse(await readFile(configurationPath, "utf8")) as LocalOperatorBackendOptions;
+	const { backend, verifier } = await createLocalOperatorBackend(configuration);
+	return { candidateVerifier: verifier, candidateExecutionBackend: backend };
+}
+
+/** Commands that only read the workspace; everything else takes the same
+ * cross-process mutation ownership the Pi extension service takes, so a
+ * standalone CLI cannot race a console or another CLI in one workspace. */
+const READ_ONLY_COMMANDS: ReadonlySet<string> = new Set(["status"]);
+
 export async function main(argv: string[]): Promise<number> {
 	await verifyLoadedSource(import.meta.url);
 	const args = parseArgs(argv);
@@ -199,6 +222,15 @@ export async function main(argv: string[]): Promise<number> {
 	}
 	const ws = new Workspace(flag(args, "workspace") ?? process.cwd());
 	const store = createFileKnowledgeStore(ws.knowledgeDir);
+	const readOnly = READ_ONLY_COMMANDS.has(command) ||
+		(command === "goal" && (args.positional[1] ?? "status") === "status") ||
+		(command === "knowledge" && args.positional[1] === "pack") ||
+		(command === "mission" && ["status", "reconcile-status"].includes(args.positional[1] ?? ""));
+	return readOnly ? runCliCommand(args, ws, store, command)
+		: withWorkspaceMutationOwnership(ws.root, () => runCliCommand(args, ws, store, command));
+}
+
+async function runCliCommand(args: ParsedArgs, ws: Workspace, store: ReturnType<typeof createFileKnowledgeStore>, command: string): Promise<number> {
 
 	if (command === "init") {
 		const result = await runInit(ws, store);
@@ -364,7 +396,8 @@ export async function main(argv: string[]): Promise<number> {
 			const kind = flag(args, "runner") ?? "pi";
 			if (kind !== "pi" && kind !== "fake") throw new HarnessError("cli.goal", "goal delegate 的 --runner 仅可为 pi 或 fake");
 			const task = taskSpec(await jsonFile<unknown>(args, "task"), runId);
-			const controller = createM07Controller({ ws, store, runner: await makeRunner(kind), config: await ws.loadConfig() });
+			const controller = createM07Controller({ ws, store, runner: await makeRunner(kind), config: await ws.loadConfig() },
+				await localOperatorHost());
 			const result = await controller.delegate(runId, task);
 			console.log(JSON.stringify({ taskId: result.taskId, status: result.status, mode: result.mode, context: result.context,
 				branchCheckpointId: result.branchSource?.checkpoint.id, branchUnavailable: Boolean(result.branchUnavailableReason) }, null, 2));
