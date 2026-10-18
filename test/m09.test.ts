@@ -9,6 +9,7 @@ import type { StageContext } from "../src/stages/context.ts";
 import { runM09, type M09Options } from "../src/stages/m09.ts";
 import { HarnessError } from "../src/types.ts";
 import { Workspace } from "../src/workspace.ts";
+import { writeCandidateGoal } from "./helpers/candidate-goal.ts";
 
 const gate = (name: string, scope: string[], evidence: string[]) => `\n\n\`\`\`${name}\n${JSON.stringify({ status: "checked", scope, unresolved: [], evidence })}\n\`\`\``;
 
@@ -58,4 +59,26 @@ test("M09 rejects stale knowledge state and proposal-processing failures", async
 	await assert.rejects(runM09(stale.ctx, stale.options), (error: unknown) => error instanceof HarnessError && error.code === "m09.knowledge-changed");
 	const failed = await fixture(t); failed.m04.failures.push("知识提案未合入：结构校验未通过"); await failed.ws.writeRun(failed.m04);
 	await assert.rejects(runM09(failed.ctx, failed.options), (error: unknown) => error instanceof HarnessError && error.code === "m09.m04-proposal");
+});
+
+test("M09 refuses a delivery whose candidate is not the historical best, and records the comparison", async (t) => {
+	const superseded = await fixture(t);
+	// The delivered material is byte-identical to the slower archived candidate.
+	await writeCandidateGoal(superseded.ws, "g", "S1", [
+		{ id: "C001", source: "fixed result\n", value: 2, externalId: "E001" },
+		{ id: "C002", source: "faster result\n", value: 1, externalId: "E002" },
+	]);
+	await assert.rejects(runM09(superseded.ctx, superseded.options),
+		(error: unknown) => error instanceof HarnessError && error.code === "m09.superseded-delivery");
+
+	const best = await fixture(t);
+	await writeCandidateGoal(best.ws, "g", "S1", [
+		{ id: "C001", source: "slower result\n", value: 2, externalId: "E001" },
+		{ id: "C002", source: "fixed result\n", value: 1, externalId: "E002" },
+	]);
+	const result = await runM09(best.ctx, best.options);
+	assert.equal(result.closure.deliveryStatus, "checked");
+	assert.deepEqual(result.closure.deliveryEvidence.deliveredCandidateRefs, ["g/T001/C002"]);
+	assert.equal(result.closure.deliveryEvidence.best[0].delivered, true);
+	assert.equal(result.closure.deliveryEvidence.measurement.metricsWithReference, 1);
 });
