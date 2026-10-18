@@ -1,20 +1,14 @@
-import { HarnessError } from "../types.ts";
+import { ProviderRequestContractError, registerProviderRequestContract } from "./provider-contract.ts";
+import type { ProviderRequestViolation } from "./types.ts";
 
-export type DeepSeekRequestViolation =
-	"request-shape" | "message-shape" | "tool-call-shape" | "duplicate-tool-call"
-	| "orphan-tool-result" | "duplicate-tool-result" | "incomplete-tool-results"
-	| "thinking-tool-choice" | "missing-reasoning" | "unsigned-reasoning" | "reasoning-replay-mismatch";
+/** The violations are generic; this alias keeps the vendor-specific call sites readable. */
+export type DeepSeekRequestViolation = ProviderRequestViolation;
 
 /** Static, host-side diagnostics only. Never retain input objects, tool IDs or text. */
-export class DeepSeekRequestContractError extends HarnessError {
-	readonly issued = false;
-	readonly violation: DeepSeekRequestViolation;
-	readonly messageIndex: number | null;
+export class DeepSeekRequestContractError extends ProviderRequestContractError {
 	constructor(violation: DeepSeekRequestViolation, messageIndex: number | null = null) {
-		super("runner.deepseek-request-contract", `DeepSeek request not issued: ${violation}. Repair the request history or provider adapter before retrying; do not discard history or fabricate reasoning/tool results.`);
+		super("runner.deepseek-request-contract", `DeepSeek request not issued: ${violation}. Repair the request history or provider adapter before retrying; do not discard history or fabricate reasoning/tool results.`, violation, messageIndex);
 		this.name = "DeepSeekRequestContractError";
-		this.violation = violation;
-		this.messageIndex = messageIndex;
 	}
 }
 
@@ -105,3 +99,8 @@ export function assertDeepSeekRequestContract(
 		}
 	}
 }
+
+registerProviderRequestContract({
+	provider: "deepseek", api: "openai-completions",
+	assertRequest: (payload, options) => { assertDeepSeekRequestContract(payload, options); },
+});

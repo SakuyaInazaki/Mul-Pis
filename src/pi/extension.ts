@@ -24,7 +24,7 @@ import { publicFailure } from "../m07/public-failure.ts";
 import { summarizeGoalExecution } from "../m07/status.ts";
 import { candidateSearchSnapshot } from "../m07/candidate-archive.ts";
 import { candidateSearchBrief, candidateSearchFocus, scopedRepeatedSourceObservations, scopedSearchLeads } from "../m07/candidate-search.ts";
-import { workflowCompactionExtension } from "../runner/compaction.ts";
+import { compactionPolicyFromEnvironment, workflowCompactionExtension } from "../runner/compaction.ts";
 import { registerConsoleWorkflowBridge, bindConsoleDescriptorToGoal } from "./console-bridge.ts";
 
 type ToolResult = AgentToolResult<Record<string, unknown>>;
@@ -252,8 +252,6 @@ export interface ResearchExtensionOptions {
 	candidateGoalAdmission?: ResearchServiceOptions["candidateGoalAdmission"];
 	/** Explicit noninteractive controller session; never inferred from an active workspace goal. */
 	continuation?: { workspace: string; goalRunId?: string };
-	/** Launcher already configured a fresh, isolated profile with the 200k trigger. */
-	newSessionCompaction?: boolean;
 	mainAgentStallTimeoutMs?: number;
 	mainAgentStallCheckMs?: number;
 	improvementServiceFactory?: (workspaceRoot: string, signal?: AbortSignal) => Promise<Pick<ImprovementService, "run" | "status" | "rollback"> & Partial<Pick<ImprovementService, "exportMethodPackage" | "bindMethodPackage">>> | Pick<ImprovementService, "run" | "status" | "rollback"> & Partial<Pick<ImprovementService, "exportMethodPackage" | "bindMethodPackage">>;
@@ -263,7 +261,12 @@ export interface ResearchExtensionOptions {
 
 export function createResearchExtension(options: ResearchExtensionOptions = {}) {
 	return function researchExtension(pi: ExtensionAPI): void {
-		if (options.newSessionCompaction) workflowCompactionExtension()(pi);
+		// Cliff compaction is unconditional: a long controller session that never
+		// compacts stops at the context window, and compacting with a model rewrite
+		// would put invented text into the controller's own history.
+		workflowCompactionExtension(compactionPolicyFromEnvironment(),
+			() => options.continuation ? { file: path.join(options.continuation.workspace, ".agent", "sessions",
+				`main-${process.pid}.compaction.jsonl`) } : undefined)(pi);
 		const orchestrationTools = new Set(["research_status", "research_init", "research_stage", "research_goal", "research_mission", "research_delegate", "research_review", "research_improve", "research_method_improve"]);
 		const inspectionTools = new Set(["read", "grep", "find", "ls"]);
 		let researchActive = false;
@@ -982,6 +985,5 @@ mainAgentWatchdog.unref?.();
 const continuationWorkspaceEnv = process.env.PRE_RSI_CONTINUATION_WORKSPACE;
 const continuationGoalEnv = process.env.PRE_RSI_CONTINUATION_GOAL_RUN_ID;
 export default createResearchExtension(continuationWorkspaceEnv ? {
-	newSessionCompaction: process.env.PRE_RSI_NEW_SESSION_COMPACTION === "200000",
 	continuation: { workspace: continuationWorkspaceEnv, ...(continuationGoalEnv ? { goalRunId: continuationGoalEnv } : {}) },
 } : {});

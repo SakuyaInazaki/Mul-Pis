@@ -8,7 +8,7 @@
  */
 import type { Role } from "../types.ts";
 import type { EvidenceBindingV1 } from "../context/boundary.ts";
-import type { DeepSeekRequestViolation } from "./deepseek-request-contract.ts";
+import type { FailureClass } from "./failure-class.ts";
 
 /**
  * What a session may touch besides the text it is given.
@@ -26,6 +26,17 @@ export type ToolGrant =
 	| { kind: "execution"; root: string; tools: Array<"read" | "write" | "edit" | "bash">;
 		/** Host-owned feedback tools whose closures exist only in this live execution. */ extraTools?: CustomToolSpec[];
 		/** Controller-owned disposable directory outside formal work. */ tempDir?: string };
+
+/**
+ * Static reasons a serialized provider request is refused before it is sent.
+ * The list is provider-independent: every chat API with tool calls and reasoning
+ * can violate these, and the generic runner interface must not depend on one
+ * vendor's module to describe its own diagnostics.
+ */
+export type ProviderRequestViolation =
+	"request-shape" | "message-shape" | "tool-call-shape" | "duplicate-tool-call"
+	| "orphan-tool-result" | "duplicate-tool-result" | "incomplete-tool-results"
+	| "thinking-tool-choice" | "missing-reasoning" | "unsigned-reasoning" | "reasoning-replay-mismatch";
 
 export interface ToolParamSpec {
 	type: "string" | "number" | "boolean" | "string[]";
@@ -66,6 +77,9 @@ export interface ToolCallRecord {
 	errorCode?: string;
 	/** Bounded, redacted host diagnostic for a failed factory-confined read only. */
 	errorMessage?: string;
+	/** Infrastructure, policy or unjudged. Absent on a successful call. */
+	failureClass?: FailureClass;
+	failureReason?: string;
 	resultMetadata?: { kind: "confined-utf8-read"; relativePath: string;
 		utf8Bytes: number; truncated: false };
 }
@@ -87,6 +101,9 @@ export interface SessionSpec {
 	methodBinding?: { versionId: string; contentId?: string };
 	/** Opt-in request guard. A campaign reserves actual serialized input bytes; tool-free strict callers may still set a fixed input cap. */
 	strictRequest?: { maxProviderCallsPerPrompt?: number; maxOutputTokens?: number; maxInputPayloadBytes?: number };
+	/** Wall-clock end of the run this session belongs to, stated to the model in tool
+	 * results so a run does not end with nothing saved. Never placed in the prompt prefix. */
+	runDeadline?: string;
 }
 
 /** Enough to reopen a persisted session with the same boundary. */
@@ -247,11 +264,14 @@ export interface TransportFailureDiagnostic {
 	privateProviderError?: { code: string | null; type: string | null; message: string | null;
 		param: string | null; numericLimits: Record<string, number> };
 	/** Static request-schema rejection of one attempted payload. */
-	requestContractViolation?: DeepSeekRequestViolation;
+	requestContractViolation?: ProviderRequestViolation;
 	requestContractMessageIndex?: number | null;
 	attemptedRequestNotSent?: true;
 	/** True only when this entire prompt had no earlier reserved provider request. */
 	wholePromptNotIssued?: true;
+	/** Whether this failure belongs to the harness, the strategy, or to nobody yet. */
+	failureClass?: FailureClass;
+	failureReason?: string;
 }
 
 export interface SessionHandle {
