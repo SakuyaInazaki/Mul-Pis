@@ -614,3 +614,70 @@ export function requireBudget(ledger: SearchBudgetLedgerV1, action: { changeKind
 		throw new HarnessError("m07.candidate-budget",
 			"the repair sub-budget for this task is spent; a defect this persistent needs a different structure or a new plan, not another patch");
 }
+
+export interface CandidateSearchSummaryV1 {
+	version: 1;
+	/** One row per work object. Coverage and magnitude stay separate columns:
+	 * the basis shows closed-loop search buys correctness coverage, not speed,
+	 * and reporting one as the other is the most common misattribution. */
+	subjects: Array<{ subjectId: string; candidates: number; verifiedCorrect: number; promoted: number;
+		seedRef?: string; bestRef?: string; bestSpeedup?: number }>;
+	coverage: { subjects: number; withVerifiedCorrect: number; withImprovedBest: number };
+	magnitude: { measuredSubjects: number; minSpeedup?: number; medianSpeedup?: number; maxSpeedup?: number };
+	guards: { reject: number; keep: number; accept: number; revert: number; unjudged: number };
+	lanes: { repair: number; optimization: number };
+	/** Evaluations spent per work object that reached a verified-correct candidate. */
+	evaluationsPerVerifiedSubject?: number;
+	tasks: Array<{ taskId: string; evaluations: number; remaining: number; stop?: SearchBudgetStop;
+		stagnation: number; signals: CandidateStallSignal[]; bannedDirections: number }>;
+}
+
+/** Deterministic search account for the M04 handoff and the console. */
+export function summarizeCandidateSearch(history: readonly CandidateArchiveEntry[],
+	policy: SearchBudgetPolicyV1 = DEFAULT_SEARCH_BUDGET): CandidateSearchSummaryV1 {
+	const guards = { reject: 0, keep: 0, accept: 0, revert: 0, unjudged: 0 };
+	const lanes = { repair: 0, optimization: 0 };
+	const subjectIds: string[] = [];
+	for (const entry of history) {
+		if (entry.policy) { guards[entry.policy.guard]++; lanes[entry.policy.lane]++; }
+		else guards.unjudged++;
+		const subjectId = candidateSubjectId(entry.subjectId, entry.observation);
+		if (subjectId && !subjectIds.includes(subjectId)) subjectIds.push(subjectId);
+	}
+	const subjects = subjectIds.map(subjectId => {
+		const scoped = subjectHistory(history, subjectId);
+		const seed = scoped.find(entry => entry.observation.sourceBinding === "verified" &&
+			entry.observation.correctness === "passed");
+		const best = [...scoped].filter(entry => entry.policy?.seedSpeedup !== undefined)
+			.sort((left, right) => (right.policy!.seedSpeedup ?? 0) - (left.policy!.seedSpeedup ?? 0))[0];
+		return { subjectId, candidates: scoped.length,
+			verifiedCorrect: scoped.filter(entry => entry.observation.sourceBinding === "verified" &&
+				entry.observation.correctness === "passed").length,
+			promoted: scoped.filter(entry => entry.policy?.status === "promoted").length,
+			...(seed ? { seedRef: seed.ref } : {}),
+			...(best ? { bestRef: best.ref, bestSpeedup: best.policy!.seedSpeedup } : {}) };
+	});
+	const speedups = subjects.map(item => item.bestSpeedup).filter((value): value is number => value !== undefined)
+		.sort((left, right) => left - right);
+	const middle = Math.floor(speedups.length / 2);
+	const withVerifiedCorrect = subjects.filter(item => item.verifiedCorrect > 0).length;
+	const taskIds: string[] = [];
+	for (const entry of history) if (!taskIds.includes(entry.taskId)) taskIds.push(entry.taskId);
+	const tasks = taskIds.map(taskId => {
+		const subjectId = history.find(entry => entry.taskId === taskId)?.subjectId;
+		const ledger = candidateBudgetLedger(history, { taskId, subjectId, policy });
+		const state = candidateSearchState(history, { subjectId, taskId, limits: policy.routeLimits });
+		return { taskId, evaluations: ledger.evaluations, remaining: ledger.remaining,
+			...(ledger.stop ? { stop: ledger.stop } : {}), stagnation: state.stagnation,
+			signals: state.signals, bannedDirections: state.bannedDirections.length };
+	});
+	return { version: 1, subjects,
+		coverage: { subjects: subjects.length, withVerifiedCorrect,
+			withImprovedBest: subjects.filter(item => (item.bestSpeedup ?? 0) > 1).length },
+		magnitude: { measuredSubjects: speedups.length,
+			...(speedups.length ? { minSpeedup: speedups[0], maxSpeedup: speedups.at(-1)!,
+				medianSpeedup: speedups.length % 2 ? speedups[middle] : speedups[middle - 1] / 2 + speedups[middle] / 2 } : {}) },
+		guards, lanes,
+		...(withVerifiedCorrect ? { evaluationsPerVerifiedSubject: history.length / withVerifiedCorrect } : {}),
+		tasks };
+}

@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { candidateBudgetLedger, candidatePhase, candidateSearchState, candidateStrategyMenu,
 	candidateStrategyStats, decideCandidate, DEFAULT_SEARCH_BUDGET, requireAllowedAction, requireBudget,
-	requireUnbannedDirection, validateSearchBudget, type CandidateChangeKind } from "../src/m07/candidate-policy.ts";
+	requireUnbannedDirection, summarizeCandidateSearch, validateSearchBudget,
+	type CandidateChangeKind } from "../src/m07/candidate-policy.ts";
 import type { CandidateArchiveEntry } from "../src/m07/candidate-archive.ts";
 import type { CandidateDiagnosticSummaryV1 } from "../src/m07/candidate-diagnostics.ts";
 import type { CandidateMetricV1, CandidateObservationV1 } from "../src/m07/types.ts";
@@ -325,4 +326,25 @@ test("the three admission levels and the branch decision follow the host evidenc
 		changeKind: "structure", intent: "solution", subjectId: "a", history,
 		taskId: "T002", parentTaskId: "T001" });
 	assert.equal(merged.branch, "merge", "promoting another task's lineage merges that branch");
+});
+
+test("the search account reports coverage and magnitude as separate columns", () => {
+	const fast = judged("C002", "keep");
+	fast.policy!.seedSpeedup = 1.6;
+	fast.policy!.status = "promoted";
+	const other = entry("C003", { latency: 5 });
+	other.subjectId = "b";
+	other.observation.executionFacts!.evaluations[0].subjectId = "b";
+	other.policy = { ...fast.policy!, seedSpeedup: undefined, status: "verified", guard: "revert" };
+	const summary = summarizeCandidateSearch([judged("C001", "keep"), fast, other]);
+	assert.equal(summary.coverage.subjects, 2);
+	assert.equal(summary.coverage.withVerifiedCorrect, 2);
+	assert.equal(summary.coverage.withImprovedBest, 1, "only one object actually got faster than its seed");
+	assert.equal(summary.magnitude.measuredSubjects, 1);
+	assert.equal(summary.magnitude.medianSpeedup, 1.6);
+	assert.equal(summary.guards.keep, 2);
+	assert.equal(summary.guards.revert, 1);
+	assert.equal(summary.tasks[0].taskId, "T001");
+	assert.equal(summary.tasks[0].evaluations, 3);
+	assert.ok(summary.evaluationsPerVerifiedSubject !== undefined && summary.evaluationsPerVerifiedSubject > 1);
 });

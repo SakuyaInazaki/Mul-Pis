@@ -10,6 +10,7 @@ import { writeProjectionEvent, type ProjectionMaterialV1, type ProjectionSnapsho
 import { failedM04Feedback } from "./formal-baseline.ts";
 import { captureMaterial, createProjectionObservation, omissionLine, projectionMaterial } from "./projection.ts";
 import { candidateArchive, globalCandidateBest } from "./candidate-archive.ts";
+import { DEFAULT_SEARCH_BUDGET, summarizeCandidateSearch } from "./candidate-policy.ts";
 
 const knowledgeContentLabel = {
 	index: "检索索引（不含正文）",
@@ -81,6 +82,18 @@ export async function writeFeedback(ctx: StageContext, goal: CurrentGoal, policy
 	}
 	const latestCandidate = goal.tasks.filter(task => task.candidate || task.episode?.candidates.length).at(-1);
 	if (latestCandidate) lines.push("## 候选探索与已验证最佳", "", `- 当前探索工作点：${latestCandidate.taskId}${latestCandidate.episode?.currentCandidateId ? `/${latestCandidate.episode.currentCandidateId}` : ""}；不自动替换已验证最佳。`);
+	if (archivedCandidates.length) {
+		const summary = summarizeCandidateSearch(archivedCandidates, goal.searchBudget ?? DEFAULT_SEARCH_BUDGET);
+		lines.push("## 搜索账本（覆盖面与幅度分列）", "",
+			`- 覆盖面：工作对象 ${summary.coverage.subjects} 个，其中取得正确性已验证候选 ${summary.coverage.withVerifiedCorrect} 个，相对该对象首个正确种子有实测提升 ${summary.coverage.withImprovedBest} 个。覆盖面不是幅度。`,
+			`- 幅度：有同口径可比测量的对象 ${summary.magnitude.measuredSubjects} 个${summary.magnitude.measuredSubjects ? `；相对种子的最好加速比 最小 ${summary.magnitude.minSpeedup!.toFixed(3)}、中位 ${summary.magnitude.medianSpeedup!.toFixed(3)}、最大 ${summary.magnitude.maxSpeedup!.toFixed(3)}` : ""}。这是候选级观测，不是端到端收益。`,
+			`- 判决分布：keep ${summary.guards.keep}、accept ${summary.guards.accept}、revert ${summary.guards.revert}、reject ${summary.guards.reject}、未判决 ${summary.guards.unjudged}；回路分布：修复 ${summary.lanes.repair}、优化 ${summary.lanes.optimization}。`,
+			...(summary.evaluationsPerVerifiedSubject === undefined ? [] :
+				[`- 每取得一个正确性已验证对象的平均评测次数：${summary.evaluationsPerVerifiedSubject.toFixed(2)}（预算单位是一次宿主评测，失败与前置拒绝同样计入）。`]),
+			...summary.subjects.map(item => `- 对象 ${item.subjectId}：候选 ${item.candidates}、已验证正确 ${item.verifiedCorrect}、晋升 ${item.promoted}；种子 ${item.seedRef ?? "无"}；相对种子最好 ${item.bestRef ?? "无"}${item.bestSpeedup === undefined ? "" : `（${item.bestSpeedup.toFixed(3)}×）`}。`),
+			...summary.tasks.map(item => `- 任务 ${item.taskId} 预算：已用 ${item.evaluations}、剩余 ${item.remaining}${item.stop ? `、停止原因 ${item.stop}` : ""}；停滞计数 ${item.stagnation}；停滞信号 ${item.signals.join("、") || "无"}；禁令方向 ${item.bannedDirections}。`),
+			"");
+	}
 	const best = globalCandidateBest(archivedCandidates);
 	if (latestCandidate) lines.push(...(best.length ? best.map(({ candidateRef, metric, subjectId }) => `- 同口径正确性已验证的最佳观测：${candidateRef}；对象=${subjectId}；${metric.name}=${metric.value} ${metric.unit}；basis=${metric.basisId}；方向 ${metric.direction}；任务状态仍见上文。`) : ["- 尚无对象与口径明确、正确性通过的性能观测。"]), "");
 	if (goal.branchSelections?.length) lines.push("## 竞争分支比较与选择", "", ...goal.branchSelections.flatMap((selection) => [
