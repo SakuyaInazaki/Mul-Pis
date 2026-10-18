@@ -842,7 +842,7 @@ test("a spent search budget stops the task deterministically and records the bou
 		catch (error) { refusal = (error as Error).message; }
 		return "Budget boundary reached; reporting the verified best candidate.";
 	}, verifier, undefined, { version: 1, evaluationsPerTask: 2, repairEvaluationsPerTask: 2,
-		parameterEvaluationsPerTask: 1, maxBranchesPerCheckpoint: 2,
+		parameterEvaluationsPerTask: 1, maxBranchesPerCheckpoint: 2, reviewRoundsPerTask: 12,
 		routeLimits: { repairDepth: 3, stagnation: 8, directionChange: 3 } });
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
 	const task = await harness.controller.delegate(harness.goal.runId, { objective: "bounded search", subjectId: "operator",
@@ -853,4 +853,15 @@ test("a spent search budget stops the task deterministically and records the bou
 	assert.match(refusal, /evaluation budget/);
 	assert.equal(task.loopStopReason, "budget-boundary");
 	assert.equal(task.episode?.budget?.stop, "task-evaluation-budget");
+});
+
+test("with a bound verifier an execute task cannot fall back to a reviewer-gated loop", async t => {
+	const verifier: CandidateVerifier = { id: "host:loop-choice", version: "1", async verifyTask() {
+		return { sourceBinding: "verified", correctness: "passed", stage: "performance", metrics: [], limitations: [] };
+	} };
+	const harness = await setup(async () => "report", verifier);
+	t.after(() => rm(harness.root, { recursive: true, force: true }));
+	await assert.rejects(harness.controller.delegate(harness.goal.runId, { objective: "reviewer gated",
+		mode: "execute", inputs: [], expectedOutputs: ["kernel.py"], checks: ["checked"],
+		executionLoop: { mode: "until-ready" } }), /deterministic verifier/);
 });

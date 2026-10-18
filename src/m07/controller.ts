@@ -1106,13 +1106,17 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				const loop = spec.executionLoop as unknown;
 				if (!loop || typeof loop !== "object" || Array.isArray(loop)) throw new HarnessError("m07.loop", "invalid execution-loop policy");
 				const fields = loop as Record<string, unknown>;
-				if (["until-ready", "candidate-episode"].includes(String(fields.mode)) ? Object.keys(fields).length !== 1 :
-					Object.keys(fields).length !== 2 || !Number.isSafeInteger(fields.maxRounds) || Number(fields.maxRounds) < 1 ||
-					typeof fields.deadlineAt !== "string" || !Number.isFinite(Date.parse(fields.deadlineAt)))
+				const named = ["until-ready", "candidate-episode"].includes(String(fields.mode));
+				const extra = Object.keys(fields).filter(key => !["mode", "maxRounds", "deadlineAt"].includes(key));
+				if (extra.length || (named ? false : !("maxRounds" in fields) || !("deadlineAt" in fields)) ||
+					(fields.maxRounds !== undefined && (!Number.isSafeInteger(fields.maxRounds) || Number(fields.maxRounds) < 1)) ||
+					(fields.deadlineAt !== undefined && (typeof fields.deadlineAt !== "string" || !Number.isFinite(Date.parse(fields.deadlineAt)))))
 					throw new HarnessError("m07.loop", "invalid execution-loop policy");
 			}
 			spec = { ...spec, objective: spec.objective.trim(), inputs: normalizedUnique(spec.inputs, "task input"), expectedOutputs: normalizedUnique(spec.expectedOutputs, "expected output"), checks: normalizedUnique(spec.checks, "task check"),
-				executionLoop: spec.executionLoop ? { mode: "mode" in spec.executionLoop ? spec.executionLoop.mode : "until-ready" } : undefined };
+				executionLoop: spec.executionLoop ? { mode: "mode" in spec.executionLoop ? spec.executionLoop.mode : "until-ready",
+					...(spec.executionLoop.maxRounds === undefined ? {} : { maxRounds: spec.executionLoop.maxRounds }),
+					...(spec.executionLoop.deadlineAt === undefined ? {} : { deadlineAt: spec.executionLoop.deadlineAt }) } : undefined };
 			if (spec.subjectId !== undefined) spec.subjectId = nonempty(spec.subjectId, "task subjectId");
 			let branchParent: M07TaskRecord | undefined;
 			let branchManifest: BranchManifestV1 | undefined;
@@ -1159,6 +1163,8 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			if (spec.executionLoop) {
 				if (spec.mode !== "execute" || !("mode" in spec.executionLoop) || !["until-ready", "candidate-episode"].includes(spec.executionLoop.mode))
 					throw new HarnessError("m07.loop", "new executionLoop requires execute mode and a supported policy");
+				if (spec.executionLoop.mode === "until-ready" && goal.candidateVerification)
+					throw new HarnessError("m07.loop", "a host candidate verifier is bound to this goal: execute tasks use candidate-episode so acceptance stays with the deterministic verifier instead of a reviewer session");
 				if (spec.executionLoop.mode === "candidate-episode" && spec.context)
 					throw new HarnessError("m07.episode", "candidate episode requires a fresh task, not a historical session fork");
 				if (spec.executionLoop.mode === "candidate-episode" && (!goal.candidateVerification || goal.tasks.length < goal.candidateVerification.firstTaskIndex))
@@ -1372,7 +1378,10 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				}
 				task.session = handle.ref; await save(ctx, goal);
 				if (spec.executionLoop && "mode" in spec.executionLoop && spec.executionLoop.mode === "until-ready") {
+					const loopBounds = spec.executionLoop && "mode" in spec.executionLoop ? spec.executionLoop : undefined;
 					await runUntilReadyRounds({ ctx, goal, task, spec, policy, runId, taskId: id, dir, workDir, message,
+						maxRounds: loopBounds?.maxRounds ?? (goal.searchBudget ?? DEFAULT_SEARCH_BUDGET).reviewRoundsPerTask,
+						...(loopBounds?.deadlineAt ? { deadlineAt: loopBounds.deadlineAt } : {}),
 						...(pack ? { pack } : {}), handle, operation: operation!, event,
 						...(branchParent ? { branchParent } : {}),
 						save: () => save(ctx, goal), verifyDispatchKnowledge, verifyFrozenInputs,

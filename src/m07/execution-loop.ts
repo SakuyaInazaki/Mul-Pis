@@ -64,6 +64,9 @@ export interface UntilReadyLoopInput {
 	workDir: string;
 	message: string;
 	pack?: string;
+	/** Frozen upper bound on rounds; the task returns for replanning at the bound. */
+	maxRounds: number;
+	deadlineAt?: string;
 	handle: SessionHandle;
 	operation: M07OperationV1;
 	event: ProjectionEventV1;
@@ -117,6 +120,12 @@ export async function runUntilReadyRounds(input: UntilReadyLoopInput): Promise<v
 	let nextMessage = input.message;
 	for (let index = 1; ; index++) {
 		if (!Number.isSafeInteger(index)) throw new HarnessError("m07.loop", "round identity overflow");
+		// Hard bounds, checked before a round is issued: a task that keeps revising
+		// has to hand control back to the planner instead of running forever.
+		if (index > input.maxRounds) { input.task.loopStopReason = "max-rounds"; break; }
+		if (input.deadlineAt !== undefined && Date.now() >= Date.parse(input.deadlineAt)) {
+			input.task.loopStopReason = "deadline"; break;
+		}
 		const currentOperation: M07OperationV1 = index === 1 ? input.operation : { version: 1, id: `O${String(input.goal.executionState!.operations.length + 1).padStart(3, "0")}`, taskId: input.taskId, status: "prepared", issuedAt: nowIso() };
 		input.setActiveOperation(currentOperation);
 		if (index > 1) { input.goal.executionState!.operations.push(currentOperation); await input.save(); }

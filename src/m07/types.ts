@@ -49,7 +49,9 @@ export interface TaskSpecInput {
 	/** Explicit versioned external references, each already present in inputs. Never discovered globally. */
 	resourceInputs?: Array<{ id: string; version: string; input: string }>;
 	/** Explicit task execution mode: legacy fresh-reviewer repair or same-session candidate feedback. Continuous goals do not imply a mode. Legacy bounded fields map to opt-in until-ready. No process-restart replay. */
-	executionLoop?: { mode: "until-ready" | "candidate-episode" } | { maxRounds: number; deadlineAt: string };
+	/** The legacy `{maxRounds, deadlineAt}` form means until-ready with those bounds. */
+	executionLoop?: { mode: "until-ready" | "candidate-episode"; maxRounds?: number; deadlineAt?: string } |
+		{ maxRounds: number; deadlineAt: string };
 	/** Expected JSON output carrying a candidate lesson to M04, never an adopted record. */
 	lessonDeltaOutput?: string;
 	/** Explicit competitive continuation from a frozen task leaf. Role remains execution. */
