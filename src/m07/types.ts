@@ -6,7 +6,7 @@ import type { ExperienceRequirementV1, M07WorkflowStrategyV1 } from "../improvem
 import type { RunDescriptorV1 } from "../runtime/run-descriptor.ts";
 import type { KnowledgeRetrievalContext } from "../knowledge/retrieval.ts";
 import type { CandidateComparisonV1, CandidatePerformanceEvidenceV1 } from "./candidate-diagnostics.ts";
-import type { CandidatePolicyDecisionV1, CandidateSearchStateV1, CandidateStrategy } from "./candidate-policy.ts";
+import type { CandidatePolicyDecisionV1, CandidateSearchStateV1, CandidateStrategy, SearchBudgetLedgerV1, SearchBudgetPolicyV1 } from "./candidate-policy.ts";
 import type { KnowledgeAccessEvent } from "./execution-knowledge.ts";
 
 export type M07TaskMode = "execute" | "check" | "reason";
@@ -177,6 +177,8 @@ export interface M07CandidateEpisodeV1 {
 	incumbents: Array<{ candidateId: string; metric: CandidateMetricV1; subjectId?: string }>;
 	/** Deterministic stall, route and parent facts recomputed after each evaluation. */
 	search?: CandidateSearchStateV1;
+	/** Spend of this task's frozen search budget, in host evaluations. */
+	budget?: SearchBudgetLedgerV1;
 }
 
 export interface M07BranchSourceV1 {
@@ -405,6 +407,9 @@ export interface CurrentGoal {
 		failedM04?: M04BaselineFailure[] }>;
 	/** Frozen at begin; later promotion or rollback applies only to a new goal. Optional only for explicit legacy-record detection. */
 	budgetPolicy?: BudgetPolicy;
+	/** Frozen per-task search budget for this goal; later config changes do not
+	 * move it, exactly like the evidence-handoff policy snapshot. */
+	searchBudget?: SearchBudgetPolicyV1;
 	budgetPolicyVersionId?: string;
 	budgetPolicyFrozenAt?: string;
 	/** Explicit method identity loaded when this goal began; later pointer changes do not rewrite it. */

@@ -12,10 +12,11 @@ import type { CandidateExecutionBackend } from "../src/m07/candidate-runner.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 import type { StageContext } from "../src/stages/context.ts";
 import { Workspace } from "../src/workspace.ts";
-import { HarnessError } from "../src/types.ts";
+import { HarnessError, type HarnessConfig } from "../src/types.ts";
 import type { ToolCallRecord } from "../src/runner/types.ts";
 
-async function setup(reply: ConstructorParameters<typeof FakeSessionRunner>[0], verifier: CandidateVerifier, backend?: CandidateExecutionBackend) {
+async function setup(reply: ConstructorParameters<typeof FakeSessionRunner>[0], verifier: CandidateVerifier,
+	backend?: CandidateExecutionBackend, searchBudget?: HarnessConfig["searchBudget"]) {
 	const root = await mkdtemp(path.join(tmpdir(), "m07-episode-"));
 	const ws = new Workspace(root);
 	await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -24,7 +25,7 @@ async function setup(reply: ConstructorParameters<typeof FakeSessionRunner>[0], 
 	const baseline = await ws.startRun("M04", [{ label: "problem", path: ws.problemFile }]);
 	await ws.finishRun(baseline, "completed");
 	const runner = new FakeSessionRunner(reply);
-	const ctx: StageContext = { ws, store, runner, config: { roles: { execution: "fake/execution", reviewer: "fake/reviewer", research: "fake/research" }, concurrency: 1, tools: {} } };
+	const ctx: StageContext = { ws, store, runner, config: { roles: { execution: "fake/execution", reviewer: "fake/reviewer", research: "fake/research" }, concurrency: 1, tools: {}, ...(searchBudget ? { searchBudget } : {}) } };
 	const controller = createM07Controller(ctx, { candidateVerifier: verifier, ...(backend ? { candidateExecutionBackend: backend } : {}) });
 	const goal = await controller.begin({ goal: "Correct and optimize operator", problemRelation: "direct", constraints: ["same interface"], successCriteria: ["original criterion"], plan: "test candidates" },
 		{ candidateVerification: { id: verifier.id, verifierVersion: verifier.version }, ...(backend ? { executionContract: "continuous" as const } : {}) });
@@ -815,4 +816,41 @@ test("host reconciliation queries a failed task's original candidate ID and unlo
 	assert.equal(next.status, "returned", next.executionFailure);
 	assert.equal(next.taskId, "T002");
 	assert.equal(builderTurns, 2); assert.equal(submissions, 1); assert.equal(queries, 2);
+});
+
+test("a spent search budget stops the task deterministically and records the boundary", async t => {
+	const verifier: CandidateVerifier = { id: "host:budget", version: "1", async verifyTask() {
+		return { sourceBinding: "verified", correctness: "passed", stage: "performance",
+			metrics: [{ name: "latency", value: 10, unit: "ms", basisId: "b", direction: "lower" }], limitations: [] };
+	} };
+	let refusal = "";
+	const harness = await setup(async ({ spec, tools }) => {
+		if (spec.tools.kind !== "execution") return "report";
+		const workRoot = spec.tools.root;
+		const evaluate = async (label: string, strategy: string) => {
+			await writeFile(path.join(workRoot, "kernel.py"), label);
+			await writeFile(path.join(workRoot, "receipt.json"), '{"status":"passed"}');
+			return JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"],
+				hypothesis: label, changeKind: "structure", strategy, location: "kernel.py", intent: "solution" })).text) as {
+				budget: { evaluations: number; remaining: number; stop?: string } };
+		};
+		const first = await evaluate("one", "tiling");
+		assert.equal(first.budget.remaining, 1);
+		const second = await evaluate("two", "fusion");
+		assert.equal(second.budget.stop, "task-evaluation-budget");
+		try { await evaluate("three", "pipeline"); }
+		catch (error) { refusal = (error as Error).message; }
+		return "Budget boundary reached; reporting the verified best candidate.";
+	}, verifier, undefined, { version: 1, evaluationsPerTask: 2, repairEvaluationsPerTask: 2,
+		parameterEvaluationsPerTask: 1, maxBranchesPerCheckpoint: 2,
+		routeLimits: { repairDepth: 3, stagnation: 8, directionChange: 3 } });
+	t.after(() => rm(harness.root, { recursive: true, force: true }));
+	const task = await harness.controller.delegate(harness.goal.runId, { objective: "bounded search", subjectId: "operator",
+		mode: "execute", inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["budget respected"],
+		executionLoop: { mode: "candidate-episode" } });
+	assert.equal(task.status, "returned", task.executionFailure);
+	assert.equal(task.episode?.candidates.length, 2, "the refused third evaluation never reached the verifier");
+	assert.match(refusal, /evaluation budget/);
+	assert.equal(task.loopStopReason, "budget-boundary");
+	assert.equal(task.episode?.budget?.stop, "task-evaluation-budget");
 });

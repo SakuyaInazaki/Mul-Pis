@@ -460,3 +460,135 @@ export function requireUnbannedDirection(state: CandidateSearchStateV1, action: 
 	throw new HarnessError("m07.candidate-direction",
 		`the search is stalled and ${action.changeKind}/${action.strategy} at ${action.location} already produced no measured gain (${banned.candidateRef}: ${banned.reason}); declare a different direction, or pass newEvidence stating what changed since`);
 }
+
+export interface SearchBudgetPolicyV1 {
+	version: 1;
+	/** One unit is one host evaluation of one candidate: compile, correctness and
+	 * measurement together. Failed and unjudged evaluations occupy a unit too. */
+	evaluationsPerTask: number;
+	/** Sub-budget for the repair loop, so a defect cannot eat the optimization budget. */
+	repairEvaluationsPerTask: number;
+	/** Numerical parameter search is capped well below the structural budget. */
+	parameterEvaluationsPerTask: number;
+	/** Width knob: competing frozen branches allowed from one checkpoint. */
+	maxBranchesPerCheckpoint: number;
+	routeLimits: CandidateRouteLimitsV1;
+}
+
+/** Depth defaults follow the Ascend evidence (at least 15 evaluations per
+ * operator, narrow and deep); the split and the width knob are this project's
+ * starting point and must be re-measured locally before being trusted. */
+export const DEFAULT_SEARCH_BUDGET: SearchBudgetPolicyV1 = Object.freeze({
+	version: 1, evaluationsPerTask: 24, repairEvaluationsPerTask: 10,
+	parameterEvaluationsPerTask: 5, maxBranchesPerCheckpoint: 3,
+	routeLimits: DEFAULT_ROUTE_LIMITS,
+});
+
+export type SearchBudgetStop = "task-evaluation-budget" | "repair-budget" |
+	"parameter-budget" | "stagnation-limit";
+
+export interface SearchBudgetLedgerV1 {
+	version: 1;
+	evaluations: number;
+	repair: number;
+	optimization: number;
+	parameters: number;
+	/** Pre-check rejects: they cost a host call, so they are accounted for. */
+	rejected: number;
+	remaining: number;
+	remainingRepair: number;
+	remainingParameters: number;
+	/** Set once this task may not spend another evaluation of that kind. */
+	stop?: SearchBudgetStop;
+	message: string;
+}
+
+export function validateSearchBudget(input: unknown): SearchBudgetPolicyV1 {
+	if (!input || typeof input !== "object" || Array.isArray(input))
+		throw new HarnessError("m07.search-budget", "searchBudget must be a JSON object");
+	const value = input as Record<string, unknown>;
+	const known = new Set(["version", "evaluationsPerTask", "repairEvaluationsPerTask",
+		"parameterEvaluationsPerTask", "maxBranchesPerCheckpoint", "routeLimits"]);
+	const unknown = Object.keys(value).filter(key => !known.has(key));
+	if (unknown.length) throw new HarnessError("m07.search-budget", `searchBudget has unknown fields: ${unknown.join(", ")}`);
+	if (value.version !== undefined && value.version !== 1)
+		throw new HarnessError("m07.search-budget", "searchBudget.version must be 1");
+	const integer = (key: string, fallback: number, min: number, max: number): number => {
+		const item = value[key];
+		if (item === undefined) return fallback;
+		if (typeof item !== "number" || !Number.isInteger(item) || item < min || item > max)
+			throw new HarnessError("m07.search-budget", `searchBudget.${key} must be an integer in ${min}-${max}`);
+		return item;
+	};
+	const limits = value.routeLimits === undefined ? DEFAULT_ROUTE_LIMITS : (() => {
+		if (!value.routeLimits || typeof value.routeLimits !== "object" || Array.isArray(value.routeLimits))
+			throw new HarnessError("m07.search-budget", "searchBudget.routeLimits must be a JSON object");
+		const rows = value.routeLimits as Record<string, unknown>;
+		const unknownLimits = Object.keys(rows).filter(key => !["repairDepth", "stagnation", "directionChange"].includes(key));
+		if (unknownLimits.length) throw new HarnessError("m07.search-budget", `searchBudget.routeLimits has unknown fields: ${unknownLimits.join(", ")}`);
+		const limit = (key: keyof CandidateRouteLimitsV1): number => {
+			const item = rows[key];
+			if (item === undefined) return DEFAULT_ROUTE_LIMITS[key];
+			if (typeof item !== "number" || !Number.isInteger(item) || item < 1 || item > 1000)
+				throw new HarnessError("m07.search-budget", `searchBudget.routeLimits.${key} must be an integer in 1-1000`);
+			return item;
+		};
+		return { repairDepth: limit("repairDepth"), stagnation: limit("stagnation"), directionChange: limit("directionChange") };
+	})();
+	const policy: SearchBudgetPolicyV1 = { version: 1,
+		evaluationsPerTask: integer("evaluationsPerTask", DEFAULT_SEARCH_BUDGET.evaluationsPerTask, 1, 100_000),
+		repairEvaluationsPerTask: integer("repairEvaluationsPerTask", DEFAULT_SEARCH_BUDGET.repairEvaluationsPerTask, 1, 100_000),
+		parameterEvaluationsPerTask: integer("parameterEvaluationsPerTask", DEFAULT_SEARCH_BUDGET.parameterEvaluationsPerTask, 0, 100_000),
+		maxBranchesPerCheckpoint: integer("maxBranchesPerCheckpoint", DEFAULT_SEARCH_BUDGET.maxBranchesPerCheckpoint, 1, 1000),
+		routeLimits: limits };
+	if (policy.repairEvaluationsPerTask > policy.evaluationsPerTask ||
+		policy.parameterEvaluationsPerTask > policy.evaluationsPerTask)
+		throw new HarnessError("m07.search-budget", "sub-budgets cannot exceed searchBudget.evaluationsPerTask");
+	if (policy.routeLimits.directionChange > policy.routeLimits.stagnation)
+		throw new HarnessError("m07.search-budget", "routeLimits.directionChange cannot exceed routeLimits.stagnation");
+	return policy;
+}
+
+/** Spend is measured in evaluations, not money or wall clock, so the unit does
+ * not drift when the model changes. */
+export function candidateBudgetLedger(history: readonly CandidateArchiveEntry[],
+	input: { taskId: string; subjectId?: string; policy: SearchBudgetPolicyV1 }): SearchBudgetLedgerV1 {
+	const plan = history.filter(entry => entry.taskId === input.taskId);
+	let repair = 0, optimization = 0, parameters = 0, rejected = 0;
+	for (const entry of plan) {
+		if (entry.changeKind === "parameters") parameters++;
+		if (entry.policy?.lane === "repair" || entry.changeKind === "repair") repair++;
+		else optimization++;
+		if (entry.policy?.guard === "reject") rejected++;
+	}
+	const state = candidateSearchState(history, { subjectId: input.subjectId, taskId: input.taskId,
+		limits: input.policy.routeLimits });
+	const remaining = Math.max(0, input.policy.evaluationsPerTask - plan.length);
+	const remainingRepair = Math.max(0, input.policy.repairEvaluationsPerTask - repair);
+	const remainingParameters = Math.max(0, input.policy.parameterEvaluationsPerTask - parameters);
+	const stop: SearchBudgetStop | undefined = !remaining ? "task-evaluation-budget" :
+		state.stagnation >= input.policy.routeLimits.stagnation ? "stagnation-limit" : undefined;
+	return { version: 1, evaluations: plan.length, repair, optimization, parameters, rejected,
+		remaining, remainingRepair, remainingParameters, ...(stop ? { stop } : {}),
+		message: stop
+			? "This task may not spend another evaluation. Report the verified best candidate and the evidence; the controller records the budget boundary and the planner decides what comes next."
+			: "Every host evaluation spends one unit, including failed and unjudged ones. Repair and parameter sub-budgets are separate from the structural one." };
+}
+
+/** Refuse an evaluation the frozen budget does not cover. The session cannot
+ * negotiate this; only a new task under a new plan restores a budget. */
+export function requireBudget(ledger: SearchBudgetLedgerV1, action: { changeKind: CandidateChangeKind;
+	lane: CandidateLane }): void {
+	if (ledger.stop === "task-evaluation-budget")
+		throw new HarnessError("m07.candidate-budget",
+			`this task has spent its ${ledger.evaluations} evaluation budget; report the verified best candidate and return to the planner instead of evaluating again`);
+	if (ledger.stop === "stagnation-limit")
+		throw new HarnessError("m07.candidate-budget",
+			"this task reached its stagnation limit without a new best; report the verified best candidate and return to the planner for a different plan");
+	if (action.changeKind === "parameters" && !ledger.remainingParameters)
+		throw new HarnessError("m07.candidate-budget",
+			"the numerical parameter sub-budget for this task is spent; change the structure or return to the planner rather than searching more parameters");
+	if (action.lane === "repair" && !ledger.remainingRepair)
+		throw new HarnessError("m07.candidate-budget",
+			"the repair sub-budget for this task is spent; a defect this persistent needs a different structure or a new plan, not another patch");
+}

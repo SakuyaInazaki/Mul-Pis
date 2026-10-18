@@ -9,7 +9,8 @@ import { availableCandidateByRef, candidateArchive, candidateSearchSnapshot, can
 import { candidateSearchBrief, candidateSearchFocus } from "./candidate-search.ts";
 import { compareCandidateObservations, projectCandidateFeedback, summarizeCandidateDiagnostics } from "./candidate-diagnostics.ts";
 import { CANDIDATE_STRATEGIES, candidateSearchState, candidateStrategyMenu, candidateStrategyStats,
-	decideCandidate, requireAllowedAction, requireUnbannedDirection,
+	candidateBudgetLedger, decideCandidate, DEFAULT_SEARCH_BUDGET, requireAllowedAction,
+	requireBudget, requireUnbannedDirection,
 	type CandidateChangeKind, type CandidateStrategy } from "./candidate-policy.ts";
 import { isSafeRelativeOutputPath } from "./expected-output.ts";
 import type { CandidateObservationV1, CurrentGoal, M07TaskRecord } from "./types.ts";
@@ -88,6 +89,11 @@ export function createCandidateEpisodeTool(input: {
 			parentVerifiedCorrect: parentObservation?.sourceBinding === "verified" &&
 				parentObservation.correctness === "passed" });
 		requireUnbannedDirection(priorState, action, args.newEvidence as string | undefined);
+		const searchBudget = goal.searchBudget ?? DEFAULT_SEARCH_BUDGET;
+		requireBudget(candidateBudgetLedger(priorArchive, { taskId: task.taskId,
+			subjectId: task.subjectId, policy: searchBudget }),
+			{ changeKind: action.changeKind, lane: action.changeKind === "repair" ||
+				priorState.phase === "bootstrap" ? "repair" : "optimization" });
 		const episodeRoot = path.join(path.dirname(task.workDir), "episode");
 		await mkdir(episodeRoot, { recursive: true });
 		let nextNumber = episode.candidates.reduce((max, candidate) =>
@@ -198,7 +204,10 @@ export function createCandidateEpisodeTool(input: {
 		// must see this candidate's own guard, lane and failure signature.
 		const archived = searchSnapshot.available.find(entry => entry.ref === `${task.taskId}/${id}`);
 		if (archived) archived.policy = decision;
-		episode.search = candidateSearchState(searchSnapshot.available, { subjectId: currentSubjectId, taskId: task.taskId });
+		episode.search = candidateSearchState(searchSnapshot.available, { subjectId: currentSubjectId,
+			taskId: task.taskId, limits: searchBudget.routeLimits });
+		episode.budget = candidateBudgetLedger(searchSnapshot.available, { taskId: task.taskId,
+			subjectId: currentSubjectId, policy: searchBudget });
 		// Derive the local display from the same readable, subject-isolated evidence as
 		// candidate_list. Historical candidates remain intact even if a file is missing.
 		episode.incumbents = globalCandidateBest(searchSnapshot.available.filter(entry => entry.taskId === task.taskId))
@@ -233,7 +242,7 @@ export function createCandidateEpisodeTool(input: {
 				read: { tool: "candidate_read", args: { candidateRef: `${task.taskId}/${id}`, kind: "observation", offset: 0, limit: 6000 } },
 				message: "Case rows retain measurements within display space and prioritize failed/unknown cases. Parent case deltas show negative/unknown cases and regressions first. Diagnostic indexes show a first entry per category before others within display space. Counts include omitted entries. JSON paths refer to the full frozen observation; diagnostic fieldPath refers to its original receipt (candidate_read kind:receipt, fileIndex:receiptIndex). Use returned nextOffset to continue file reads. A preview/index is not full reading or causal interpretation; all original facts and parent comparisons are retained." },
 			currentCandidateId: episode.currentCandidateId, incumbents: episode.incumbents,
-			search: episode.search,
+			search: episode.search, budget: episode.budget,
 			strategyStats: candidateStrategyStats(searchSnapshot.available, currentSubjectId),
 			nextStrategyMenu: candidateStrategyMenu({ phase: episode.search.phase, route: episode.search.route,
 				seed: `${goal.runId}|${task.taskId}|${episode.candidates.length}` }),
