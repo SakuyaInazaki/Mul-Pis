@@ -1,4 +1,5 @@
 import type { CandidateCaseObservationV1, CandidateMetricV1, CandidateObservationV1 } from "./types.ts";
+import { describeProfileBottleneck, interpretProfileBottleneck, type ProfileBottleneckV1 } from "./profile-bottleneck.ts";
 
 /** Values are normalized by a trusted host, with a field path into one frozen
  * original receipt. This is optional because most platforms expose no profile. */
@@ -138,6 +139,10 @@ export interface CandidateProfileInterpretationV1 {
 		dram: { receiptIndex: number; fieldPath: string; sourceLocation?: string } };
 	/** One falsifiable next experiment; the model still chooses the optimization. */
 	nextExperiment?: string;
+	/** Fixed-threshold reading of the supplied counters and bounds. Raw counters
+	 * stay below in `counters`; this is the form that belongs in a prompt. */
+	bottleneck?: ProfileBottleneckV1;
+	bottleneckSummary?: string;
 	counters: Array<MeasuredPerformanceQuantityV1 & { name: string; unit: string; sourceLocation?: string }>;
 	warnings: string[];
 }
@@ -213,6 +218,8 @@ function profileCase(subjectId: string, caseId: string,
 		warnings.push("Observed elapsed is below the supplied theoretical lower bound; inspect normalization and measurement basis.");
 	if (computeFraction !== undefined && computeFraction > 1 || memoryFraction !== undefined && memoryFraction > 1)
 		warnings.push("Observed attainment exceeds a supplied peak; inspect host-normalized quantities and their basis.");
+	const bottleneck = performance.counters?.length || rooflineBound !== undefined ?
+		interpretProfileBottleneck(performance, rooflineBound) : undefined;
 	return { subjectId, caseId, basisId: performance.basisId, evidenceKind,
 		...(elapsed !== undefined ? { elapsedSeconds: elapsed } : {}),
 		...(intensity !== undefined ? { arithmeticIntensityOperationsPerByte: intensity } : {}),
@@ -234,6 +241,7 @@ function profileCase(subjectId: string, caseId: string,
 		}) } : {}),
 		...(counterContrast ? { counterContrast } : {}),
 		...(nextExperiment ? { nextExperiment } : {}),
+		...(bottleneck ? { bottleneck, bottleneckSummary: describeProfileBottleneck(bottleneck) } : {}),
 		counters: performance.counters?.map(counter => ({ ...counter })) ?? [], warnings };
 }
 
