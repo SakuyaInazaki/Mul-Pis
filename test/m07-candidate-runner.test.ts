@@ -102,32 +102,32 @@ test("finite numeric sweep materializes every combination without score pruning 
 	const h = await setup(t, backend);
 	await writeFile(path.join(h.workDir, "kernel.txt"), "b={{BLOCK}} w={{WARPS}}\n");
 	const args = { ...request, runId: "sweep", domainsJson: '{"BLOCK":[16,32],"WARPS":[2,4]}' };
-	const first = JSON.parse((await h.tools().candidate_sweep.execute(args)).text);
+	const first = JSON.parse((await h.tools().candidate_run.execute(args)).text);
 	assert.equal(first.total, 4); assert.equal(first.completed, 1);
 	assert.deepEqual(first.resultsPage.rows.map((row: { parameters: unknown; status: string }) =>
 		[row.parameters, row.status]), [[{ BLOCK: 16, WARPS: 4 }, "pending"], [{ BLOCK: 16, WARPS: 2 }, "completed"]]);
 	assert.deepEqual(first.resultsPage.rows[1].readCandidate,
-		{ tool: "candidate_read", args: { candidateRef: "T001/C001" } },
-		"a sweep result gives the exact archive reference accepted by candidate_read");
-	const readOnly = JSON.parse((await h.tools().candidate_sweep.execute({ runId: "sweep", resultOffset: 1,
+		{ tool: "candidate_archive", args: { action: "read", candidateRef: "T001/C001" } },
+		"a sweep result gives the exact archive reference accepted by candidate_archive");
+	const readOnly = JSON.parse((await h.tools().candidate_run.execute({ runId: "sweep", resultOffset: 1,
 		resultLimit: 1 })).text);
 	assert.equal(readOnly.resultsPage.total, 2);
 	assert.deepEqual(readOnly.resultsPage.rows.map((row: { parameters: unknown }) => row.parameters),
 		[{ BLOCK: 16, WARPS: 2 }]);
 	assert.equal(values.length, 2, "paging an existing sweep without resume cannot execute a combination");
 	await writeFile(path.join(h.workDir, "kernel.txt"), "not the frozen template");
-	const recovery = createCandidateExecutionTools({ ...h.options, queryOnly: true }).find(tool => tool.name === "candidate_sweep")!;
+	const recovery = createCandidateExecutionTools({ ...h.options, queryOnly: true }).find(tool => tool.name === "candidate_run")!;
 	const reconciled = JSON.parse((await recovery.execute({ runId: "sweep", resume: true })).text);
 	assert.equal(reconciled.completed, 2);
 	assert.deepEqual(reconciled.resultsPage.rows[0].lastStage,
 		{ id: "judge", status: "failed" }, "a failed stage remains visible by parameter combination");
 	assert.equal(values.length, 2, "host reconciliation queries the original ID but cannot start unexecuted combinations");
 	assert.equal(queries, 1);
-	const resumed = JSON.parse((await h.tools().candidate_sweep.execute({ runId: "sweep", resume: true })).text);
+	const resumed = JSON.parse((await h.tools().candidate_run.execute({ runId: "sweep", resume: true })).text);
 	assert.equal(resumed.completed, 4); assert.equal(resumed.status, "completed"); assert.equal(queries, 1);
 	assert.deepEqual(resumed.readArchive, [
-		{ tool: "candidate_list", args: { section: "global-best" } },
-		{ tool: "candidate_list", args: { section: "search-leads" } },
+		{ tool: "candidate_archive", args: { action: "list", section: "global-best" } },
+		{ tool: "candidate_archive", args: { action: "list", section: "search-leads" } },
 	]);
 	assert.deepEqual(values, ["b=16 w=2\n", "b=16 w=4\n", "b=32 w=2\n", "b=32 w=4\n"]);
 	assert.equal(resumed.resultsPage.total, 4);
@@ -138,11 +138,11 @@ test("finite numeric sweep materializes every combination without score pruning 
 		[{ BLOCK: 16, WARPS: 4 }, "protocol-v1", path.join(".candidate-runs", "sweep", "materialized", "2", "kernel.txt")],
 		[{ BLOCK: 16, WARPS: 2 }, "protocol-v1", path.join(".candidate-runs", "sweep", "materialized", "1", "kernel.txt")],
 	]);
-	const older = JSON.parse((await h.tools().candidate_sweep.execute({ runId: "sweep", resultOffset: 2,
+	const older = JSON.parse((await h.tools().candidate_run.execute({ runId: "sweep", resultOffset: 2,
 		resultLimit: 1 })).text);
 	assert.equal(older.resultsPage.nextOffset, 3);
 	assert.deepEqual(older.resultsPage.rows[0].parameters, { BLOCK: 16, WARPS: 4 });
-	await h.tools().candidate_sweep.execute({ runId: "sweep", resume: true });
+	await h.tools().candidate_run.execute({ runId: "sweep", resume: true });
 	assert.equal(values.length, 4);
 });
 
@@ -161,7 +161,7 @@ test("host configuration help is visible and unsupported protocols reject before
 		stages: [{ id: "contract", checks: ["contract"], mode: "local" }], async executeStage() { calls++; return { status: "passed", receiptPaths: [] }; } };
 	const h = await setup(t, backend);
 	assert.match(h.tools().candidate_run.params.configJson.description, /dtype must be fp32/);
-	assert.match(h.tools().candidate_sweep.description, /protocol-v1/);
+	assert.match(h.tools().candidate_run.description, /protocol-v1/);
 	await assert.rejects(h.tools().candidate_run.execute({ ...request, protocolId: "weaker-checks" }), /unsupported protocolId/);
 	assert.equal(calls, 0);
 });
@@ -243,4 +243,81 @@ test("background execution stays off unless the host enables it, and a restarted
 	assert.equal(afterRestart.status, "completed");
 	assert.equal(afterRestart.runId, "run1");
 	await assert.rejects(h.tools().candidate_run.execute({ runId: "never-started", collect: true }), /unknown runId/);
+});
+
+test("one execution tool covers single candidates and declared parameter sweeps without blurring them", async t => {
+	const values: string[] = [];
+	const backend: CandidateExecutionBackend = { id: "merged-fixture", version: "1",
+		stages: [{ id: "measure", checks: ["compile", "correctness", "measurement"], mode: "local" }],
+		async executeStage(ctx) {
+			values.push(await readFile(ctx.sources[0].absolutePath, "utf8"));
+			return { status: "passed", receiptPaths: [await receipt(ctx, { ok: true })] };
+		} };
+	const h = await setup(t, backend);
+	const tools = h.tools();
+	assert.deepEqual(Object.keys(tools), ["candidate_run"]);
+	await writeFile(path.join(h.workDir, "kernel.txt"), "tile={{TILE}}\n");
+
+	const sweep = JSON.parse((await tools.candidate_run.execute({ ...request, runId: "swept",
+		domainsJson: '{"TILE":[8,16]}' })).text);
+	assert.equal(sweep.total, 2);
+	assert.deepEqual(values, ["tile=8\n", "tile=16\n"]);
+	// The same runId keeps its kind: paging a sweep is still a sweep, with no execution.
+	const paged = JSON.parse((await tools.candidate_run.execute({ runId: "swept", resultLimit: 1 })).text);
+	assert.equal(paged.resultsPage.rows.length, 1);
+	assert.equal(values.length, 2);
+
+	await writeFile(path.join(h.workDir, "kernel.txt"), "plain candidate\n");
+	const single = JSON.parse((await tools.candidate_run.execute({ ...request, runId: "single" })).text);
+	assert.equal(single.status, "completed");
+	assert.equal(single.total, undefined, "a single candidate is not reported as a sweep");
+	// A run already recorded as one candidate cannot be reinterpreted as a sweep, and
+	// sweep-only paging is refused on it rather than silently ignored.
+	await assert.rejects(tools.candidate_run.execute({ ...request, runId: "single", domainsJson: '{"TILE":[8]}' }),
+		/already a single candidate run/);
+	await assert.rejects(tools.candidate_run.execute({ runId: "single", resultOffset: 1 }),
+		/page a parameter sweep's results/);
+	assert.equal(values.length, 3);
+});
+
+test("the host evaluation pool is bounded and refuses work instead of growing a backlog", async t => {
+	let release!: () => void;
+	const held = new Promise<void>(resolve => { release = resolve; });
+	const started: string[] = [];
+	const backend: CandidateExecutionBackend = { id: "pool-fixture", version: "1",
+		stages: [{ id: "measure", checks: ["compile", "correctness", "measurement"], mode: "local" }],
+		async executeStage(ctx) {
+			started.push(ctx.runId);
+			if (ctx.runId === "run1") await held;
+			return { status: "passed", receiptPaths: [await receipt(ctx, { ok: true })] };
+		} };
+	const h = await setup(t, backend);
+	let drain: (() => Promise<void>) | undefined;
+	h.options.backgroundRuns = { register: fn => { drain = fn; }, max: 8 };
+	h.options.evaluationPool = { capacity: 2 };
+	const tools = h.tools();
+
+	const first = JSON.parse((await tools.candidate_run.execute({ ...request, background: true })).text);
+	assert.equal(first.evaluationPool.running + first.evaluationPool.queued, 1);
+	// Wait until the first run actually holds the backend, so the queue state below
+	// is the one the host is really in.
+	while (!started.length) await new Promise(resolve => { setImmediate(resolve); });
+	await tools.candidate_run.execute({ ...request, runId: "run2", background: true });
+	await tools.candidate_run.execute({ ...request, runId: "run3", background: true });
+	const listed = JSON.parse((await tools.candidate_run.execute({ collect: true })).text);
+	assert.equal(listed.evaluationPool.queued, 2, "two submissions wait while the first holds the device");
+	// Capacity is the backpressure signal: the fourth is refused, not queued.
+	await assert.rejects(tools.candidate_run.execute({ ...request, runId: "run4", background: true }),
+		/evaluation queue is full \(2 waiting, capacity 2\); collect a finished run/);
+	assert.deepEqual(started, ["run1"], "nothing else touched the backend while the first run held it");
+
+	release();
+	assert(drain);
+	await drain();
+	assert.deepEqual(started, ["run1", "run2", "run3"], "accepted work still runs in submission order");
+	const after = JSON.parse((await tools.candidate_run.execute({ collect: true })).text);
+	assert.deepEqual([after.evaluationPool.running, after.evaluationPool.queued, after.evaluationPool.rejected],
+		[0, 0, 1]);
+	assert.equal(after.evaluationPool.maxQueued, 2);
+	assert.equal(JSON.parse((await tools.candidate_run.execute({ runId: "run3", collect: true })).text).status, "completed");
 });
