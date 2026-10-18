@@ -19,7 +19,8 @@
 import { renderOptimizationCard, readOptimizationCard, type OptimizationCardKind } from "./optimization-card.ts";
 import { decideMethods, renderMethodMenu, type DecisionMetric, type DecisionPolicy, type MethodDecision } from "./decision-table.ts";
 import { loadPriorLibrary, selectPrior, type PriorLayer, type PriorSelection } from "./prior-library.ts";
-import { renderSelectedKnowledgeRecord, retrieveKnowledge, type KnowledgeRetrievalContext, type KnowledgeRetrievalSelection } from "./retrieval.ts";
+import { RETRIEVAL_FEATURE_KEYS, RETRIEVAL_SCALAR_KEYS, renderSelectedKnowledgeRecord, retrieveKnowledge,
+	type KnowledgeRetrievalContext, type KnowledgeRetrievalSelection } from "./retrieval.ts";
 import type { BottleneckSignature } from "./optimization-card.ts";
 import type { KnowledgeRecord, KnowledgeStore, RecordType } from "./types.ts";
 
@@ -112,6 +113,9 @@ export interface InjectionRequest {
 	metrics?: readonly DecisionMetric[];
 	canonicalFamily?: string;
 	operatorCategory?: string;
+	/** Exact compiler/runtime error symbols seen this round. Rule cards keyed by
+	 * a matching signature are looked up deterministically, not ranked. */
+	errorSignatures?: readonly string[];
 	decisionPolicy?: DecisionPolicy;
 	plan?: InjectionPlan;
 }
@@ -123,6 +127,49 @@ export interface InjectionResult {
 	prior: PriorSelection;
 	decision?: MethodDecision;
 	receipt: InjectionReceiptV1;
+}
+
+/** Normalised containment either way: a compiler prints more than the symbol. */
+function matchesSignature(signature: string, observed: readonly string[] | undefined): boolean {
+	if (!observed?.length) return false;
+	const left = signature.toLocaleLowerCase();
+	return observed.some((item) => {
+		const right = item.toLocaleLowerCase();
+		return !!right.trim() && (right.includes(left) || left.includes(right));
+	});
+}
+
+/** Reciprocal rank fusion of two routes: the lexical ranking retrieval already
+ * produced, and a structured-key ranking over the cards' declared operator
+ * category, structure family, bottleneck and applicability. Neither route alone
+ * is enough: lexical retrieval misses a card written in other words, and key
+ * matching alone would rank every card of the family identically. */
+function fuseRanking(refs: readonly string[], cards: Map<string, NonNullable<ReturnType<typeof readOptimizationCard>>>,
+	request: InjectionRequest, required: ReadonlySet<string>): string[] {
+	const context = request.context ?? {};
+	const structured = refs.filter((ref) => cards.has(ref)).map((ref) => {
+		const card = cards.get(ref)!;
+		let score = 0;
+		if (request.bottleneck && card.bottleneck === request.bottleneck) score += 3;
+		if (request.canonicalFamily && card.canonicalFamily === request.canonicalFamily) score += 3;
+		if (request.operatorCategory && card.operatorCategory === request.operatorCategory) score += 2;
+		for (const key of RETRIEVAL_SCALAR_KEYS)
+			if (context[key] !== undefined && card.applicability[key] === context[key]) score += 1;
+		for (const key of RETRIEVAL_FEATURE_KEYS) {
+			const observed = new Set(context[key] ?? []);
+			for (const label of card.applicability[key] ?? []) if (observed.has(label)) score += 1;
+		}
+		if (card.kind === "rule" && matchesSignature(card.errorSignature, request.errorSignatures)) score += 4;
+		return { ref, score };
+	}).filter((item) => item.score > 0)
+		.sort((left, right) => right.score - left.score || left.ref.localeCompare(right.ref));
+	const structuredRank = new Map(structured.map((item, index) => [item.ref, index]));
+	const fused = refs.map((ref, index) => ({ ref,
+		score: 1 / (60 + index) + (structuredRank.has(ref) ? 1 / (60 + structuredRank.get(ref)!) : 0),
+		order: index }));
+	fused.sort((left, right) => Number(required.has(right.ref)) - Number(required.has(left.ref)) ||
+		right.score - left.score || left.order - right.order);
+	return fused.map((item) => item.ref);
 }
 
 const HEADER = "本包按阶段装配，条数与字符都有上限；未展开的条目仍在库中，可用 knowledge_select / knowledge_read 按 ID 补读。入库不等于科学认证，装载不等于采用。";
@@ -145,30 +192,66 @@ export async function assembleInjection(request: InjectionRequest): Promise<Inje
 			maxEntries: plan.priorEntries, maxChars: plan.priorChars })
 		: { markdown: "", included: [], omitted: [] };
 
+	const omitted: InjectionReceiptV1["omitted"] = [...selection.omitted];
 	const required = new Set(selection.rankedRefs.filter((ref) =>
 		(request.requiredIds ?? []).some((item) => item === ref || item === ref.split("@")[0])));
+	// Cards are indexed over the whole published catalogue, not only over the
+	// lexical hits: a rule keyed by an error signature seen this round must be
+	// found by its exact symbol even when the round's text never mentions it.
+	const cardsByRef = new Map<string, NonNullable<ReturnType<typeof readOptimizationCard>>>();
+	for (const record of await request.store.list()) {
+		const card = readOptimizationCard(record.fields);
+		if (card) cardsByRef.set(`${record.id}@${record.version}`, card);
+	}
+	for (const ref of selection.rankedRefs) {
+		if (cardsByRef.has(ref)) continue;
+		const [id, version] = ref.split("@");
+		const record = await request.store.get(id, Number(version));
+		const card = record && readOptimizationCard(record.fields);
+		if (card) cardsByRef.set(ref, card);
+	}
+	const lookedUp: string[] = [];
+	for (const [ref, card] of cardsByRef) {
+		if (card.kind !== "rule" || !matchesSignature(card.errorSignature, request.errorSignatures)) continue;
+		const [id, version] = ref.split("@");
+		if ((await request.store.availability(id, Number(version))).availability === "not_allowed") {
+			omitted.push({ ref, reason: "rule-lookup:not-allowed" });
+			continue;
+		}
+		required.add(ref);
+		lookedUp.push(ref);
+	}
+	const ordered = fuseRanking([...new Set([...selection.rankedRefs, ...lookedUp])], cardsByRef, request, required);
 	const kinds = new Set<OptimizationCardKind>(plan.kinds);
-	const omitted: InjectionReceiptV1["omitted"] = [...selection.omitted];
 	const injectedRefs: string[] = [];
 	const cardRefs: string[] = [];
 	const blocks: string[] = [];
 	let used = HEADER.length;
-	const cardsForMenu: Array<{ ref: string; card: NonNullable<ReturnType<typeof readOptimizationCard>> }> = [];
-	for (const ref of selection.rankedRefs) {
+	// The menu sees every published card the retrieval reached, not only the ones
+	// this phase renders: a ruled-out direction must mask even when its card is
+	// not part of the prompt.
+	const cardsForMenu = [...cardsByRef].map(([ref, card]) => ({ ref, card }));
+	for (const ref of ordered) {
 		const [id, version] = ref.split("@");
 		const record: KnowledgeRecord | undefined = await request.store.get(id, Number(version));
 		if (!record) { omitted.push({ ref, reason: "record-unavailable" }); continue; }
-		const card = readOptimizationCard(record.fields);
-		if (card) cardsForMenu.push({ ref, card });
+		const card = cardsByRef.get(ref);
 		const mandatory = required.has(ref);
+		const report = await request.store.availability(record.id, record.version);
 		if (!mandatory) {
+			// A withdrawn or suspended entry is not injected as usable knowledge.
+			// It remains readable by ID: relevance is not authority, and neither is
+			// silence about a live limit.
+			if (report.availability === "not_allowed") { omitted.push({ ref, reason: "not-allowed" }); continue; }
 			if (card && !kinds.has(card.kind)) { omitted.push({ ref, reason: `phase-filter:${card.kind}` }); continue; }
 			if (!card && !plan.allowNarrative) { omitted.push({ ref, reason: "phase-filter:narrative" }); continue; }
 			if (injectedRefs.length >= plan.maxRecords) { omitted.push({ ref, reason: "over-record-budget" }); continue; }
 		}
-		const block = card ? renderOptimizationCard(ref, card)
-			: renderSelectedKnowledgeRecord(record, await request.store.availability(record.id, record.version),
-				selection.limits, record.version, plan.view, context);
+		const active = selection.limits.filter((limit) => !limit.liftedAt &&
+			(limit.target === record.id || limit.target === ref));
+		const block = card
+			? `${renderOptimizationCard(ref, card)}- 当前可用性：${report.availability}${report.reasons.length ? `（${report.reasons.join("；")}）` : ""}；生效限制：${active.length ? active.map((limit) => `${limit.kind}:${limit.target}`).join("、") : "无"}\n`
+			: renderSelectedKnowledgeRecord(record, report, selection.limits, record.version, plan.view, context);
 		if (!mandatory && used + block.length > plan.maxChars) { omitted.push({ ref, reason: "over-char-budget" }); continue; }
 		used += block.length;
 		blocks.push(block);

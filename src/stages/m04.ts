@@ -18,6 +18,7 @@ import type { KnowledgeStore, ProposalOp, ProposalReceipt, Snapshot, ValidationI
 import { renderKnowledgeIndexRecord } from "../knowledge/pack.ts";
 import { retrieveKnowledge, validateKnowledgeRetrievalContext } from "../knowledge/retrieval.ts";
 import { assembleInjection } from "../knowledge/injection.ts";
+import { collectFailureObservations, failureRuleDrafts, renderFailureRuleDrafts } from "../knowledge/rule-mining.ts";
 import { publishedArtifact, publishedArtifactCatalogue, textArtifact } from "../m07/execution-knowledge.ts";
 import { buildM04Message, extractKnowledgeProposals, systemPromptFor } from "../prompts.ts";
 import type { ProblemMaterials } from "../prompts.ts";
@@ -832,7 +833,17 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			const lessonInstruction = feedback.m07 && (lessonEvidence.paths.length || lessonEvidence.unavailable.length) ? `\n\n【候选经验冻结依赖】\n若提案拟采用本批 M07 候选经验，须在本会话读取以下已冻结候选与其声明的证据；文本需分段读至末尾，二进制需实际打开并说明可核验范围。候选或无提案不要求为流程而通读。${lessonEvidence.paths.map((item) => `\n- ${item}`).join("")}${lessonEvidence.unavailable.map((item) => `\n- 无法从冻结材料核验：${item}`).join("")}` : "";
 			const m06EvidenceInstruction = feedback.m06 ? `\n\n【M06 来源与核对记录】\n整批摘要仅是线索。需据 M06 提案时，使用 m06_evidence_read 实际读取本次授权的来源文本及对应 reading/check 记录；清单和路径不表示已经核验。${feedback.m06.legacy ? "这是历史运行材料的本次读取副本，当前原材料版本未证实与旧阅读时同版；原报告保留，但其版本不确定的主张须明确限制。" : "这是 M06 当次冻结的来源与报告。"}按来源条件、实际取得范围与缺口判断，不把未读材料或摘要推断当作原文证据。可访问相对路径：${feedback.artifactPaths.map((item) => `\n- ${item}`).join("")}` : "";
 			const requiredM07Instruction = requiredM07Paths.length ? `\n\n【本轮指定 M07 证据完整读取】\n在判断采用、候选或无提案之前，请用 m07_evidence_read 按以下精确相对路径读取每个文件的全文；大文件须分段读至末尾。只看索引、摘要或文件名不足以满足此要求。完整读取后可以选择不提案，不得为满足流程强行采用。\n${requiredM07Paths.map((item) => `- ${item}`).join("\n")}` : "";
-			const judgmentInstructions = m08DispositionInstruction + m06EvidenceInstruction + m07EvidenceInstruction +
+			// Repeated failures are counted by the host, not recalled by the model:
+			// a rule earns its place by having happened in several sources.
+			let failureRuleInstruction = "";
+			const failureRoot = feedback.m07?.rootDir ?? feedback.m06?.rootDir;
+			if (failureRoot) {
+				const drafts = failureRuleDrafts(await collectFailureObservations(failureRoot));
+				await ctx.ws.writeOutput(record, "failure-rule-drafts.json", JSON.stringify(drafts, null, 2), "宿主统计的重复失败签名");
+				const rendered = renderFailureRuleDrafts(drafts);
+				if (rendered) failureRuleInstruction = `\n\n${rendered}`;
+			}
+			const judgmentInstructions = m08DispositionInstruction + m06EvidenceInstruction + m07EvidenceInstruction + failureRuleInstruction +
 				m07ExperienceInstruction + lessonInstruction + requiredM07Instruction +
 				(options.additionalReadOnlyInstruction ? `\n\n${options.additionalReadOnlyInstruction}` : "") +
 				(priorFailureBytes ? `\n\n${priorFailureBytes.toString("utf8")}` : "");

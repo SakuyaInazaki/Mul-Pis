@@ -156,3 +156,40 @@ test("required records are never dropped by a phase filter or a budget", async (
 	assert.equal(result.receipt.phase, "performance-tuning");
 	assert.equal(result.receipt.snapshot, (await store.current())?.id);
 });
+
+test("an error signature looks a rule up exactly, and structured keys fuse with lexical ranking", async (t) => {
+	const { store } = await storeWithCards(t);
+	// The round's text never mentions the rule; its exact symbol does the work.
+	const compile = await assembleInjection({ store, phase: "compile-fix", purpose: "修编译",
+		text: "候选无法通过编译", context,
+		errorSignatures: ["kernel.cpp:12:5: error: no member named 'Softmax' in namespace 'AscendC'"] });
+	assert.ok(compile.markdown.includes("[rule]"));
+	assert.ok(compile.receipt.cardRefs.some((ref) => compile.markdown.includes(ref)));
+
+	// A withdrawn rule is not looked up: live limits still decide.
+	const rule = (await store.list()).find((record) => record.title.includes("Softmax"))!;
+	const receipt = await store.submitProposal({ stage: "M04", runId: "r2",
+		ops: [{ op: "decide", id: rule.id, usageDecision: "withdrawn", reason: "CANN 版本更新后该符号已存在" }] });
+	await store.merge(receipt.proposalId);
+	const after = await assembleInjection({ store, phase: "compile-fix", purpose: "修编译",
+		text: "候选无法通过编译", context,
+		errorSignatures: ["error: no member named 'Softmax' in namespace 'AscendC'"] });
+	assert.ok(after.receipt.omitted.some((item) => item.reason === "rule-lookup:not-allowed"));
+	assert.ok(!after.markdown.includes("[rule]"));
+});
+
+test("structured key matches lift a card that the lexical route ranks low", async (t) => {
+	const { store } = await storeWithCards(t);
+	const tuning = await assembleInjection({ store, phase: "performance-tuning", purpose: "调优",
+		text: "layernorm", context, bottleneck: "memory_bound", canonicalFamily: "layernorm",
+		operatorCategory: "normalization", plan: planInjection("performance-tuning", { maxRecords: 1 }) });
+	// Both the case and the avoid card match lexically; the structured route puts
+	// the one that matches family, category and bottleneck first.
+	assert.equal(tuning.receipt.injectedRefs.length, 1);
+	assert.equal(tuning.receipt.cardRefs.length, 1);
+	assert.ok(tuning.markdown.includes("[case]") || tuning.markdown.includes("[avoid]"));
+	// The menu still masks the ruled-out direction even when its card did not fit
+	// into this phase's one-record budget.
+	assert.equal(tuning.receipt.methodMenu?.status, "table");
+	assert.ok(tuning.receipt.methodMenu?.masked.includes("fusion"));
+});

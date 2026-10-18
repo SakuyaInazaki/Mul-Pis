@@ -15,3 +15,5 @@ export { assembleInjection, planInjection, INJECTION_PLANS, type InjectionPhase,
 export { loadPriorLibrary, selectPrior, PRIOR_LAYERS, type PriorLayer, type PriorLibrary } from "./prior-library.ts";
 export { checkCandidate, checkApiSymbols, checkHardConstraints, collectApiContracts,
 	type StaticCheckReport, type StaticFinding } from "./static-checks.ts";
+export { collectFailureObservations, failureRuleDrafts, mineFailureRules, renderFailureRuleDrafts,
+	type FailureObservation, type FailureRuleDraftsV1, type MinedRule } from "./rule-mining.ts";
