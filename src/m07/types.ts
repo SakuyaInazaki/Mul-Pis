@@ -6,7 +6,7 @@ import type { ExperienceRequirementV1, M07WorkflowStrategyV1 } from "../improvem
 import type { RunDescriptorV1 } from "../runtime/run-descriptor.ts";
 import type { KnowledgeRetrievalContext } from "../knowledge/retrieval.ts";
 import type { CandidateComparisonV1, CandidatePerformanceEvidenceV1 } from "./candidate-diagnostics.ts";
-import type { CandidatePolicyDecisionV1 } from "./candidate-policy.ts";
+import type { CandidatePolicyDecisionV1, CandidateSearchStateV1 } from "./candidate-policy.ts";
 import type { KnowledgeAccessEvent } from "./execution-knowledge.ts";
 
 export type M07TaskMode = "execute" | "check" | "reason";
@@ -170,6 +170,8 @@ export interface M07CandidateEpisodeV1 {
 	currentCandidateId?: string;
 	/** Readable, verified local best per subject and exact metric identity; historical rows may omit subjectId. */
 	incumbents: Array<{ candidateId: string; metric: CandidateMetricV1; subjectId?: string }>;
+	/** Deterministic stall, route and parent facts recomputed after each evaluation. */
+	search?: CandidateSearchStateV1;
 }
 
 export interface M07BranchSourceV1 {

@@ -60,6 +60,9 @@ export interface CandidatePolicyDecisionV1 {
 	incumbentComparison: CandidateIncumbentComparisonV1[];
 	/** Does this candidate change the best-so-far pointer? Only a KEEP does. */
 	updatesBest: boolean;
+	/** Stable identity of an observed failure: stage plus the first witness
+	 * location. Equal signatures across rounds are what "no progress" means. */
+	failureSignature?: string;
 	/** At most one must-fix item and one suggestion, by design. */
 	requiredFix: string[];
 	advisory: string[];
@@ -230,7 +233,11 @@ export function decideCandidate(input: CandidateDecisionInput): CandidatePolicyD
 	}
 	if (input.intent === "diagnostic" && guard === "revert" && observation.correctness === "failed")
 		advisory.push("A declared diagnostic candidate may fail by design; its evidence is kept, but it still cannot become the incumbent.");
+	const firstLocation = input.diagnostics.diagnosticLocations[0];
+	const failureSignature = observation.correctness === "passed" ? undefined :
+		`${input.diagnostics.stage}|${firstLocation ? `${firstLocation.category}:${firstLocation.fieldPath}` : "no-location"}`;
 	return { version: 1, lane, phase, guard, score: scoreOf(tier, passRatio, seedSpeedup), tier,
+		...(failureSignature ? { failureSignature } : {}),
 		...(seed ? { seedRef: seed.ref } : {}), ...(seedSpeedup === undefined ? {} : { seedSpeedup }),
 		incumbentComparison, updatesBest: guard === "keep",
 		requiredFix: requiredFix.slice(0, 1), advisory: advisory.slice(0, 1), reasons };
@@ -250,4 +257,99 @@ export function requireAllowedAction(input: { changeKind: CandidateChangeKind; s
 		throw new HarnessError("m07.candidate-phase", "numerical parameter search needs a verified-correct candidate first: stay in bootstrap with repair or structure changes");
 	if (input.changeKind === "parameters" && !input.parentVerifiedCorrect)
 		throw new HarnessError("m07.candidate-phase", "a parameters candidate must declare a verified-correct parent candidate; search parameters only on a settled structure");
+}
+
+export type CandidateStallSignal = "duplicate_code" | "code_cycle" | "no_progress" |
+	"category_oscillation" | "stagnation";
+/** Where the next step belongs, by observed failure class and depth. A route is
+ * an instruction to the session, never an automatic task or goal end. */
+export type CandidateRoute = "continue" | "repair-in-place" | "restructure" | "replan";
+
+export interface CandidateRouteLimitsV1 {
+	/** Consecutive repair-lane steps on one defect before the structure must change. */
+	repairDepth: number;
+	/** Consecutive counted steps without a keep before the plan must change. */
+	stagnation: number;
+	/** Counted steps without a keep that force a different declared direction. */
+	directionChange: number;
+}
+
+/** Three-level fallback from the basis: debug at most 3, rewrite under the same
+ * plan at most 5, then return to planning. */
+export const DEFAULT_ROUTE_LIMITS: CandidateRouteLimitsV1 = Object.freeze({
+	repairDepth: 3, stagnation: 8, directionChange: 3 });
+
+export interface CandidateSearchStateV1 {
+	version: 1;
+	phase: CandidatePhase;
+	/** Counted steps since the last keep. Pre-check rejects never count. */
+	stagnation: number;
+	repairDepth: number;
+	signals: CandidateStallSignal[];
+	forcedDirectionChange: boolean;
+	route: CandidateRoute;
+	/** Declared directions that produced no measured gain; retry needs new evidence. */
+	bannedDirections: Array<{ changeKind: CandidateChangeKind; candidateRef: string; reason: string }>;
+	/** Deterministic options, in order. The session still picks and justifies one. */
+	recommendedParents: Array<{ candidateRef: string; why: string }>;
+	message: string;
+}
+
+const COUNTED: ReadonlySet<CandidateGuard> = new Set(["keep", "accept", "revert"]);
+
+/** Recompute the search state from the recorded decisions of one work object.
+ * Pure: the same archive always yields the same signals, route and bans. */
+export function candidateSearchState(history: readonly CandidateArchiveEntry[], subjectId?: string,
+	limits: CandidateRouteLimitsV1 = DEFAULT_ROUTE_LIMITS): CandidateSearchStateV1 {
+	const scoped = subjectHistory(history, subjectId);
+	const counted = scoped.filter(entry => entry.policy && COUNTED.has(entry.policy.guard));
+	const lastKeep = counted.map(entry => entry.policy!.guard).lastIndexOf("keep");
+	const trailing = counted.slice(lastKeep + 1);
+	const stagnation = trailing.length;
+	let repairDepth = 0;
+	for (const entry of [...trailing].reverse()) {
+		if (entry.policy!.lane !== "repair") break;
+		repairDepth++;
+	}
+	const signals: CandidateStallSignal[] = [];
+	const latest = counted.at(-1);
+	if (latest?.sourceRepetition) signals.push(latest.sourceRepetition);
+	const signatures = trailing.map(entry => entry.policy!.failureSignature).filter(Boolean);
+	if (signatures.length >= 3 && new Set(signatures.slice(-3)).size === 1) signals.push("no_progress");
+	const window = counted.slice(-5).map(entry => entry.policy!.failureSignature ?? "correct");
+	let changes = 0;
+	for (let index = 1; index < window.length; index++) if (window[index] !== window[index - 1]) changes++;
+	if (window.length >= 5 && changes >= 3) signals.push("category_oscillation");
+	if (stagnation >= limits.directionChange) signals.push("stagnation");
+	const forcedDirectionChange = signals.length > 0;
+	const lastGuard = latest?.policy?.guard;
+	const route: CandidateRoute = stagnation >= limits.stagnation ? "replan" :
+		repairDepth >= limits.repairDepth ? "restructure" :
+		lastGuard === "revert" ? "repair-in-place" :
+		forcedDirectionChange ? "restructure" : "continue";
+	const bannedDirections = trailing.slice(-5).map(entry => ({
+		changeKind: entry.changeKind ?? "structure" as CandidateChangeKind, candidateRef: entry.ref,
+		reason: entry.policy!.guard === "revert"
+			? "regressed or failed against the verified incumbent"
+			: "measured no gain beyond the noise margin" }));
+	const best = globalCandidateBest(scoped);
+	const recommendedParents: Array<{ candidateRef: string; why: string }> = [];
+	for (const item of best) if (!recommendedParents.some(parent => parent.candidateRef === item.candidateRef))
+		recommendedParents.push({ candidateRef: item.candidateRef,
+			why: `verified best on ${item.metric.name} (${item.metric.basisId})` });
+	const workingPoint = [...counted].reverse().find(entry => entry.policy!.guard === "accept");
+	if (workingPoint && !recommendedParents.some(parent => parent.candidateRef === workingPoint.ref))
+		recommendedParents.push({ candidateRef: workingPoint.ref,
+			why: "correct working point that did not advance the best; useful for a step that pays off later" });
+	if (forcedDirectionChange) {
+		const alternative = [...scoped].reverse().find(entry => entry.policy?.guard === "keep" &&
+			!recommendedParents.some(parent => parent.candidateRef === entry.ref));
+		if (alternative) recommendedParents.push({ candidateRef: alternative.ref,
+			why: "earlier verified lineage, available when the current one has stalled" });
+	}
+	return { version: 1, phase: candidatePhase(history, subjectId), stagnation, repairDepth, signals,
+		forcedDirectionChange, route, bannedDirections, recommendedParents: recommendedParents.slice(0, 4),
+		message: forcedDirectionChange
+			? "The host detected a stall. The next candidate must declare a different direction than the listed ones, or cite new evidence for repeating one; repeating a banned direction unchanged is not a search step."
+			: "No stall signal. Keep the declared direction while it still produces measured gain." };
 }

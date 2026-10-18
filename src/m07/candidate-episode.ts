@@ -8,7 +8,7 @@ import { candidateObservation, type CandidateVerifier, type FrozenCandidateFile 
 import { availableCandidateByRef, candidateArchive, candidateSearchSnapshot, candidateSubjectId, globalCandidateBest, identicalSourceRefs } from "./candidate-archive.ts";
 import { candidateSearchBrief, candidateSearchFocus } from "./candidate-search.ts";
 import { compareCandidateObservations, projectCandidateFeedback, summarizeCandidateDiagnostics } from "./candidate-diagnostics.ts";
-import { decideCandidate } from "./candidate-policy.ts";
+import { candidateSearchState, decideCandidate } from "./candidate-policy.ts";
 import { isSafeRelativeOutputPath } from "./expected-output.ts";
 import type { CandidateObservationV1, CurrentGoal, M07TaskRecord } from "./types.ts";
 
@@ -153,6 +153,11 @@ export function createCandidateEpisodeTool(input: {
 			changeKind: record.changeKind, intent: record.intent, subjectId: currentSubjectId,
 			history: searchSnapshot.available.filter(entry => entry.ref !== `${task.taskId}/${id}`) });
 		record.policy = decision;
+		// The snapshot entry was built before the judgement existed; the stall state
+		// must see this candidate's own guard, lane and failure signature.
+		const archived = searchSnapshot.available.find(entry => entry.ref === `${task.taskId}/${id}`);
+		if (archived) archived.policy = decision;
+		episode.search = candidateSearchState(searchSnapshot.available, currentSubjectId);
 		// Derive the local display from the same readable, subject-isolated evidence as
 		// candidate_list. Historical candidates remain intact even if a file is missing.
 		episode.incumbents = globalCandidateBest(searchSnapshot.available.filter(entry => entry.taskId === task.taskId))
@@ -187,6 +192,7 @@ export function createCandidateEpisodeTool(input: {
 				read: { tool: "candidate_read", args: { candidateRef: `${task.taskId}/${id}`, kind: "observation", offset: 0, limit: 6000 } },
 				message: "Case rows retain measurements within display space and prioritize failed/unknown cases. Parent case deltas show negative/unknown cases and regressions first. Diagnostic indexes show a first entry per category before others within display space. Counts include omitted entries. JSON paths refer to the full frozen observation; diagnostic fieldPath refers to its original receipt (candidate_read kind:receipt, fileIndex:receiptIndex). Use returned nextOffset to continue file reads. A preview/index is not full reading or causal interpretation; all original facts and parent comparisons are retained." },
 			currentCandidateId: episode.currentCandidateId, incumbents: episode.incumbents,
+			search: episode.search,
 			decision: { guard: decision.guard, lane: decision.lane, phase: decision.phase,
 				score: decision.score, tier: decision.tier, updatesBest: decision.updatesBest,
 				seedRef: decision.seedRef ?? null, seedSpeedup: decision.seedSpeedup ?? null,
