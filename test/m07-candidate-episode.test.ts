@@ -7,6 +7,7 @@ import test from "node:test";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { createM07Controller } from "../src/m07/controller.ts";
 import { candidateSearchSnapshot } from "../src/m07/candidate-archive.ts";
+import { episodeInjectionPhase } from "../src/m07/candidate-episode.ts";
 import type { CandidateVerifier } from "../src/m07/candidate-evaluation.ts";
 import type { CandidateExecutionBackend } from "../src/m07/candidate-runner.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
@@ -866,4 +867,59 @@ test("with a bound verifier an execute task cannot fall back to a reviewer-gated
 	await assert.rejects(harness.controller.delegate(harness.goal.runId, { objective: "reviewer gated",
 		mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const }, inputs: [], expectedOutputs: ["kernel.py"], checks: ["checked"],
 		executionLoop: { mode: "until-ready" } }), /deterministic verifier/);
+});
+
+test("each round assembles knowledge for the phase the host observed", async t => {
+	const verifier: CandidateVerifier = { id: "host:phase", version: "1", async verifyTask({ sources }) {
+		const broken = (await readFile(sources[0].frozenPath, "utf8")).includes("broken");
+		return { sourceBinding: "verified", correctness: broken ? "failed" : "passed",
+			stage: broken ? "numerical" : "performance",
+			metrics: broken ? [] : [{ name: "latency", value: 4, unit: "ms", basisId: "b", direction: "lower" }],
+			limitations: [] };
+	} };
+	const phases: string[] = [];
+	const harness = await setup(async ({ spec, tools }) => {
+		if (spec.tools.kind !== "execution") return "report";
+		const workRoot = spec.tools.root;
+		const evaluate = async (source: string, strategy: string) => {
+			await writeFile(path.join(workRoot, "kernel.py"), source);
+			await writeFile(path.join(workRoot, "receipt.json"), '{"status":"ok"}');
+			const result = JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"],
+				receiptPaths: ["receipt.json"], hypothesis: source, changeKind: source.includes("broken") ? "repair" : "structure",
+				strategy, location: "kernel.py", intent: "solution" })).text) as {
+				injection: { phase: string; status: string; chars: number; knowledge: string } };
+			phases.push(result.injection.phase);
+			assert.equal(result.injection.status, "ready");
+			return result;
+		};
+		await evaluate("broken candidate", "repair");
+		await evaluate("working candidate", "tiling");
+		return "Two rounds, two phases.";
+	}, verifier);
+	t.after(() => rm(harness.root, { recursive: true, force: true }));
+	const task = await harness.controller.delegate(harness.goal.runId, { objective: "phase injection",
+		subjectId: "operator", mode: "execute", inputs: [], expectedOutputs: ["kernel.py", "receipt.json"],
+		checks: ["rounds recorded"], executionLoop: { mode: "candidate-episode" },
+		subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" } });
+	assert.equal(task.status, "returned", task.executionFailure);
+	assert.deepEqual(phases, ["correctness-fix", "performance-tuning"],
+		"a numerical failure gets correctness material, a correct candidate gets tuning material");
+	assert.deepEqual(task.episode?.candidates.map(item => item.injection?.phase),
+		["correctness-fix", "performance-tuning"], "the pairing of injection and result is recorded per candidate");
+});
+
+test("the injection phase follows the host stage and the deterministic route", () => {
+	const phase = (stage: Parameters<typeof episodeInjectionPhase>[0]["stage"],
+		guard: Parameters<typeof episodeInjectionPhase>[0]["guard"],
+		route: Parameters<typeof episodeInjectionPhase>[0]["route"] = "continue") =>
+		episodeInjectionPhase({ stage, guard, route });
+	assert.equal(phase("compile-failure", "revert"), "compile-fix");
+	assert.equal(phase("numerical-failure", "revert"), "correctness-fix");
+	assert.equal(phase("runtime-failure", "revert"), "correctness-fix");
+	assert.equal(phase("correct-measured", "keep"), "performance-tuning");
+	assert.equal(phase("correct-unmeasured", "accept"), "performance-tuning");
+	assert.equal(phase("source-unverified", "reject"), "compile-fix");
+	assert.equal(phase("correct-measured", "accept", "restructure"), "mutation",
+		"a forced rewrite gets guardrails, not examples");
+	assert.equal(phase("numerical-failure", "revert", "replan"), "mutation");
 });

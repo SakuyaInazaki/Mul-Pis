@@ -7,20 +7,45 @@ import { writeFileAtomic } from "../workspace.ts";
 import { candidateObservation, type CandidateVerifier, type FrozenCandidateFile } from "./candidate-evaluation.ts";
 import { availableCandidateByRef, candidateArchive, candidateSearchSnapshot, candidateSubjectId, globalCandidateBest, identicalSourceRefs } from "./candidate-archive.ts";
 import { candidateSearchBrief, candidateSearchFocus } from "./candidate-search.ts";
+import { assembleInjection, type InjectionPhase } from "../knowledge/injection.ts";
+import type { KnowledgeStore } from "../knowledge/types.ts";
+import type { CandidateDiagnosticSummaryV1 } from "./candidate-diagnostics.ts";
 import { compareCandidateObservations, projectCandidateFeedback, summarizeCandidateDiagnostics } from "./candidate-diagnostics.ts";
 import { CANDIDATE_STRATEGIES, candidateSearchState, candidateStrategyMenu, candidateStrategyStats,
 	candidateBudgetLedger, decideCandidate, DEFAULT_SEARCH_BUDGET, requireAllowedAction,
 	requireBudget, requireUnbannedDirection,
-	type CandidateChangeKind, type CandidateStrategy } from "./candidate-policy.ts";
+	type CandidateChangeKind, type CandidateGuard, type CandidateRoute,
+	type CandidateStrategy } from "./candidate-policy.ts";
 import { isSafeRelativeOutputPath } from "./expected-output.ts";
 import type { CandidateObservationV1, CurrentGoal, M07TaskRecord } from "./types.ts";
 
 const within = (root: string, file: string) => file === root || file.startsWith(root + path.sep);
 
+/** Which knowledge assembly this round needs, from host facts only: what the
+ * host observed, and whether the deterministic route calls for a rewrite. The
+ * phases are the knowledge layer's own, so the hot loop and the stage layer
+ * stay on one table instead of two mechanisms. */
+export function episodeInjectionPhase(input: { stage: CandidateDiagnosticSummaryV1["stage"];
+	guard: CandidateGuard; route: CandidateRoute }): InjectionPhase {
+	if (input.route === "restructure" || input.route === "replan") return "mutation";
+	if (input.guard === "reject") return "compile-fix";
+	switch (input.stage) {
+		case "compile-failure": return "compile-fix";
+		case "numerical-failure":
+		case "correctness-failure":
+		case "mixed-failure":
+		case "runtime-failure": return "correctness-fix";
+		default: return input.guard === "revert" ? "correctness-fix" : "performance-tuning";
+	}
+}
+
 export function createCandidateEpisodeTool(input: {
 	goal: CurrentGoal;
 	task: M07TaskRecord;
 	verifier: CandidateVerifier;
+	/** Frozen knowledge the round-by-round assembly reads; absent disables it. */
+	store?: KnowledgeStore;
+	priorRoot?: string;
 	save: () => Promise<void>;
 }): CustomToolSpec {
 	let tail: Promise<void> = Promise.resolve();
@@ -209,6 +234,36 @@ export function createCandidateEpisodeTool(input: {
 			taskId: task.taskId, limits: searchBudget.routeLimits });
 		episode.budget = candidateBudgetLedger(searchSnapshot.available, { taskId: task.taskId,
 			subjectId: currentSubjectId, policy: searchBudget });
+		// Every round assembles its own knowledge by phase: guardrails for a
+		// rewrite, rules for a compile failure, patterns for a numerical one,
+		// tiling only while tuning. The assembly reads the goal's frozen
+		// snapshot; a moved snapshot yields no injection rather than a silent
+		// mix of epochs.
+		const injectionPhase = episodeInjectionPhase({ stage: diagnosticSummary.stage,
+			guard: decision.guard, route: episode.search.route });
+		let injection: { phase: InjectionPhase; markdown: string; refs: string[]; chars: number;
+			omitted: number; status: "ready" | "snapshot-changed" | "unavailable" } | undefined;
+		if (input.store) {
+			try {
+				const assembled = await assembleInjection({ store: input.store, phase: injectionPhase,
+					purpose: `M07 候选 episode：${injectionPhase}`,
+					text: [args.hypothesis, diagnosticSummary.stage, ...decision.requiredFix,
+						...diagnosticSummary.diagnosticLocations.slice(0, 3).map(item => `${item.category} ${item.fieldPath}`)].join("\n"),
+					context: { ...task.knowledgeContext, stage: injectionPhase,
+						// Directions already tried are a deterministic mask, not a hint.
+						appliedTransforms: [...new Set([...(task.knowledgeContext?.appliedTransforms ?? []),
+							...episode.candidates.map(item => item.strategy).filter((item): item is CandidateStrategy => Boolean(item))])],
+						...(decision.failureSignature ? { symptoms: [decision.failureSignature] } : {}) },
+					...(decision.failureSignature ? { errorSignatures: [decision.failureSignature] } : {}),
+					excludeExperience: true, ...(input.priorRoot ? { priorRoot: input.priorRoot } : {}) });
+				injection = assembled.selection.snapshot !== goal.knowledgeSnapshot
+					? { phase: injectionPhase, markdown: "", refs: [], chars: 0, omitted: 0, status: "snapshot-changed" }
+					: { phase: injectionPhase, markdown: assembled.markdown, refs: assembled.receipt.injectedRefs,
+						chars: assembled.receipt.chars, omitted: assembled.receipt.omitted.length, status: "ready" };
+			} catch { injection = { phase: injectionPhase, markdown: "", refs: [], chars: 0, omitted: 0, status: "unavailable" }; }
+			record.injection = { phase: injectionPhase, status: injection.status,
+				refs: injection.refs.slice(0, 12), chars: injection.chars };
+		}
 		// Derive the local display from the same readable, subject-isolated evidence as
 		// candidate_list. Historical candidates remain intact even if a file is missing.
 		episode.incumbents = globalCandidateBest(searchSnapshot.available.filter(entry => entry.taskId === task.taskId))
@@ -244,6 +299,10 @@ export function createCandidateEpisodeTool(input: {
 				message: "Case rows retain measurements within display space and prioritize failed/unknown cases. Parent case deltas show negative/unknown cases and regressions first. Diagnostic indexes show a first entry per category before others within display space. Counts include omitted entries. JSON paths refer to the full frozen observation; diagnostic fieldPath refers to its original receipt (candidate_read kind:receipt, fileIndex:receiptIndex). Use returned nextOffset to continue file reads. A preview/index is not full reading or causal interpretation; all original facts and parent comparisons are retained." },
 			currentCandidateId: episode.currentCandidateId, incumbents: episode.incumbents,
 			search: episode.search, budget: episode.budget,
+			...(injection ? { injection: { phase: injection.phase, status: injection.status,
+				chars: injection.chars, refs: injection.refs.slice(0, 12), omitted: injection.omitted,
+				knowledge: injection.markdown,
+				message: "Assembled for this round's phase from the goal's frozen knowledge snapshot. A mutation round gets constraints rather than examples, a tuning round only tiling material. Selection is not adoption, and a card is not proof that its evidence was read." } } : {}),
 			strategyStats: candidateStrategyStats(searchSnapshot.available, currentSubjectId),
 			nextStrategyMenu: candidateStrategyMenu({ phase: episode.search.phase, route: episode.search.route,
 				seed: `${goal.runId}|${task.taskId}|${episode.candidates.length}` }),

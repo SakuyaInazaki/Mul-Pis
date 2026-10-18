@@ -1354,7 +1354,8 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				task.episode = { version: 1, candidates: [], incumbents: [] };
 				if (tools.kind !== "execution") throw new HarnessError("m07.episode", "candidate episode requires execution tools");
 				const verifier = requireCandidateVerifier(options.candidateVerifier, goal.candidateVerification);
-				const evaluationTool = createCandidateEpisodeTool({ goal, task, verifier, save: () => save(ctx, goal) });
+				const evaluationTool = createCandidateEpisodeTool({ goal, task, verifier, store: ctx.store,
+					priorRoot: path.join(ctx.ws.knowledgeDir, "prior"), save: () => save(ctx, goal) });
 				tools.extraTools = [evaluationTool,
 					...(options.candidateExecutionBackend && operationId ? createCandidateExecutionTools({
 						goalRunId: runId, taskId: id, operationId, subjectId: task.subjectId, workDir,
@@ -2028,7 +2029,8 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			if (typeof evidence.externalId === "string") operation.externalId = evidence.externalId;
 			if (task?.episode && options.candidateExecutionBackend && pendingBefore.some(item => item.queryAvailable)) {
 				const verifier = requireCandidateVerifier(options.candidateVerifier, goal.candidateVerification);
-				const evaluationTool = createCandidateEpisodeTool({ goal, task, verifier, save: () => save(ctx, goal) });
+				const evaluationTool = createCandidateEpisodeTool({ goal, task, verifier, store: ctx.store,
+					priorRoot: path.join(ctx.ws.knowledgeDir, "prior"), save: () => save(ctx, goal) });
 				const recoveryTools = createCandidateExecutionTools({ ...journalInput, workDir: task.workDir,
 					subjectId: task.subjectId, backend: options.candidateExecutionBackend, queryOnly: true,
 					evaluate: args => evaluationTool.execute(args) });

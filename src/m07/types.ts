@@ -230,6 +230,11 @@ export interface M07EpisodeCandidateV1 {
 	observationPath: string;
 	/** Deterministic host judgement of this observation; never a model claim. */
 	policy?: CandidatePolicyDecisionV1;
+	/** What the host assembled for the round that followed this observation.
+	 * Records the pairing of injected knowledge with the next result; selection
+	 * is not adoption and a listed ref is not proof of reading. */
+	injection?: { phase: string; status: "ready" | "snapshot-changed" | "unavailable";
+		refs: string[]; chars: number };
 }
 
 export interface M07CandidateEpisodeV1 {
