@@ -146,6 +146,8 @@ const judged = (id: string, guard: "keep" | "accept" | "revert" | "reject", opti
 		correctness: guard === "revert" && options.failureSignature ? "failed" : "passed" });
 	row.sourceRepetition = options.sourceRepetition;
 	row.policy = { version: 1, lane: options.lane ?? "optimization", phase: "tuning", guard,
+		status: guard === "keep" ? "promoted" : guard === "accept" ? "admissible" : guard === "revert" ? "verified" : "unverified",
+		branch: guard === "reject" ? "abandon" : guard === "revert" ? "archive" : "continue",
 		score: 0.5, tier: "correct-measured", incumbentComparison: [], updatesBest: guard === "keep",
 		...(options.failureSignature ? { failureSignature: options.failureSignature } : {}),
 		requiredFix: [], advisory: [], reasons: [] };
@@ -303,4 +305,24 @@ test("search budget validation rejects unknown fields and impossible sub-budgets
 	assert.equal(validateSearchBudget({}).evaluationsPerTask, DEFAULT_SEARCH_BUDGET.evaluationsPerTask);
 	assert.ok(DEFAULT_SEARCH_BUDGET.evaluationsPerTask >= 15,
 		"the Ascend evidence needs at least fifteen evaluations per operator");
+});
+
+test("the three admission levels and the branch decision follow the host evidence", () => {
+	const history = [entry("C001", { latency: 10 })];
+	const promoted = decide({ observation: observation({ latency: 8 }), history });
+	assert.equal(promoted.status, "promoted");
+	assert.equal(promoted.branch, "continue");
+	const admissible = decide({ observation: observation({ latency: 10.05 }), history });
+	assert.equal(admissible.status, "admissible", "correct and usable, but not better than the incumbent");
+	assert.equal(admissible.branch, "continue", "an unpromoted but verified node may still be a parent");
+	const verified = decide({ observation: observation({ latency: 12 }), history });
+	assert.equal(verified.status, "verified");
+	assert.equal(verified.branch, "archive", "a regression is archived, not deleted, and can be revived");
+	const unverified = decide({ observation: observation({ latency: 3, sourceBinding: "unknown" }), history });
+	assert.equal(unverified.status, "unverified");
+	assert.equal(unverified.branch, "abandon");
+	const merged = decideCandidate({ observation: observation({ latency: 7 }), diagnostics: diagnostics(),
+		changeKind: "structure", intent: "solution", subjectId: "a", history,
+		taskId: "T002", parentTaskId: "T001" });
+	assert.equal(merged.branch, "merge", "promoting another task's lineage merges that branch");
 });

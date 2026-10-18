@@ -44,11 +44,22 @@ export interface CandidateIncumbentComparisonV1 {
 	regressed: boolean;
 }
 
+/** Three admission levels plus the pre-verification floor. A candidate climbs
+ * them only on host evidence: correct, then usable as a working point, then
+ * strictly better than the incumbent on the comparable aggregate. */
+export type CandidateStatus = "unverified" | "verified" | "admissible" | "promoted";
+/** What may still be derived from this candidate. Verification and promotion
+ * stay separate from this choice, so an archived node can be revived by new
+ * evidence instead of disappearing from the lineage. */
+export type CandidateBranchDecision = "continue" | "merge" | "archive" | "abandon";
+
 export interface CandidatePolicyDecisionV1 {
 	version: 1;
 	lane: CandidateLane;
 	phase: CandidatePhase;
 	guard: CandidateGuard;
+	status: CandidateStatus;
+	branch: CandidateBranchDecision;
 	/** Layered and bounded in [0, 1]: a near miss outranks a wrong result and
 	 * never reaches a correct one. Ranking only; archives keep the raw values. */
 	score: number;
@@ -156,6 +167,10 @@ export interface CandidateDecisionInput {
 	subjectId?: string;
 	/** Same-goal candidates recorded before this one, in archive order. */
 	history: readonly CandidateArchiveEntry[];
+	/** Task of this candidate and of its declared parent, when there is one: a
+	 * promoted candidate derived from another task merges that branch's result. */
+	taskId?: string;
+	parentTaskId?: string;
 	noiseMargin?: number;
 }
 
@@ -236,7 +251,11 @@ export function decideCandidate(input: CandidateDecisionInput): CandidatePolicyD
 	const firstLocation = input.diagnostics.diagnosticLocations[0];
 	const failureSignature = observation.correctness === "passed" ? undefined :
 		`${input.diagnostics.stage}|${firstLocation ? `${firstLocation.category}:${firstLocation.fieldPath}` : "no-location"}`;
-	return { version: 1, lane, phase, guard, score: scoreOf(tier, passRatio, seedSpeedup), tier,
+	const status: CandidateStatus = guard === "reject" ? "unverified" : guard === "keep" ? "promoted" :
+		guard === "accept" ? "admissible" : "verified";
+	const branch: CandidateBranchDecision = guard === "reject" ? "abandon" : guard === "revert" ? "archive" :
+		guard === "keep" && input.parentTaskId && input.taskId && input.parentTaskId !== input.taskId ? "merge" : "continue";
+	return { version: 1, lane, phase, guard, status, branch, score: scoreOf(tier, passRatio, seedSpeedup), tier,
 		...(failureSignature ? { failureSignature } : {}),
 		...(seed ? { seedRef: seed.ref } : {}), ...(seedSpeedup === undefined ? {} : { seedSpeedup }),
 		incumbentComparison, updatesBest: guard === "keep",

@@ -198,6 +198,7 @@ export function createCandidateEpisodeTool(input: {
 		// candidates only; the new row itself is never its own incumbent or seed.
 		const decision = decideCandidate({ observation, diagnostics: diagnosticSummary,
 			changeKind: record.changeKind, intent: record.intent, subjectId: currentSubjectId,
+			taskId: task.taskId, ...(parentRef ? { parentTaskId: parentRef.taskId } : {}),
 			history: searchSnapshot.available.filter(entry => entry.ref !== `${task.taskId}/${id}`) });
 		record.policy = decision;
 		// The snapshot entry was built before the judgement existed; the stall state
@@ -246,13 +247,14 @@ export function createCandidateEpisodeTool(input: {
 			strategyStats: candidateStrategyStats(searchSnapshot.available, currentSubjectId),
 			nextStrategyMenu: candidateStrategyMenu({ phase: episode.search.phase, route: episode.search.route,
 				seed: `${goal.runId}|${task.taskId}|${episode.candidates.length}` }),
-			decision: { guard: decision.guard, lane: decision.lane, phase: decision.phase,
+			decision: { guard: decision.guard, status: decision.status, branch: decision.branch,
+				lane: decision.lane, phase: decision.phase,
 				score: decision.score, tier: decision.tier, updatesBest: decision.updatesBest,
 				seedRef: decision.seedRef ?? null, seedSpeedup: decision.seedSpeedup ?? null,
 				incumbentComparison: decision.incumbentComparison.slice(0, 4),
 				omittedIncumbentComparisons: Math.max(0, decision.incumbentComparison.length - 4),
 				requiredFix: decision.requiredFix, advisory: decision.advisory, reasons: decision.reasons,
-				message: "The guard state, score and best-so-far pointer are deterministic host decisions over the frozen observations; they are not negotiable and do not need a model verdict. keep advances the best; accept keeps a correct working point without advancing it; revert means continue from the named verified candidate instead of this source; reject means the result could not be bound or judged at all. The score is a bounded ranking signal over this goal's candidates, not a goal acceptance." },
+				message: "The guard state, admission status, branch decision, score and best-so-far pointer are deterministic host decisions over the frozen observations; they are not negotiable and do not need a model verdict. keep advances the best; accept keeps a correct working point without advancing it; revert means continue from the named verified candidate instead of this source; reject means the result could not be bound or judged at all. The score is a bounded ranking signal over this goal's candidates, not a goal acceptance." },
 			message: observation.sourceBinding === "unknown" || observation.correctness === "unknown"
 				? "Existing result is unknown. Inspect or reconcile its original operation and receipt before considering any new side effect; do not infer that resubmission is safe."
 				: "This records an existing evaluation only. Parent, conditions and change summary are model declarations, not host-proven causality. Equal source bytes are planning facts, not a rejection. A negative finding can guide repair, but does not satisfy the original goal; exploration parent and verified incumbent remain separate." }) };
