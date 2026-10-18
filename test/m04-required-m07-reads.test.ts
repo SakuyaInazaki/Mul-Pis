@@ -67,6 +67,95 @@ test("M04 can choose no proposal after full selected M07 reads and sees exact pa
 	assert.match(message, /完整读取/);
 });
 
+test("M04 does not accept a text return for genuinely binary frozen lesson evidence", async t => {
+	const f = await fixture(t);
+	const runDir = f.ws.runDir("M07", f.goal.runId);
+	const goalPath = path.join(runDir, "goal.json");
+	const goal = JSON.parse(await readFile(goalPath, "utf8"));
+	const task = goal.tasks[0];
+	task.lessonDeltaOutput = "lesson-delta.json";
+	const sourceNames = ["candidate.cpp", "verification.json", "lesson-delta.json"];
+	task.review = { artifacts: f.relative.map((relative, index) => ({
+		path: path.join(runDir, relative), sourcePath: path.join(task.workDir, sourceNames[index]), mediaType: "text", readCoverage: "recorded-not-reviewed" })),
+		checks: [], failures: [], unexecuted: [], limitations: [], frozenReportPath: path.join(runDir, f.relative[0]) };
+	await writeFile(path.join(runDir, f.relative[0]), Buffer.from([0, 1, 2, 65]));
+	const lessonText = JSON.stringify({
+		version: 1, action: "propose", observation: "Measured locally", applicability: "Only under the observed condition",
+		evidencePaths: ["candidate.cpp", "verification.json"] });
+	await writeFile(path.join(runDir, f.relative[2]), lessonText);
+	await writeFile(goalPath, JSON.stringify(goal));
+	const proposal = `\`\`\`knowledge-proposals\n${JSON.stringify([{
+		op: "create", type: "K", title: "Candidate method", body: "Apply conditionally", usageDecision: "adopted",
+		fields: { experience: { version: 1, targetKind: "executor", applicableStages: ["M07"], requiredTags: [], excludedTags: [], requiredRefs: [] } },
+	}])}\n\`\`\``;
+	const invalid: M04InvalidJudgmentEvent[] = [];
+	const runner = new FakeSessionRunner(({ spec, turnIndex, message }) => {
+		if (spec.label !== "M04-research") return "unused";
+		if (turnIndex === 1) return { text: proposal, readReturns: [
+			{ toolName: "m07_evidence_read", status: "returned", path: f.relative[0], requested: {},
+				returned: { kind: "text", startLine: 1, endLine: 1, truncated: false }, at: new Date().toISOString() },
+			...returnedRanges([f.relative[1]]),
+			{ toolName: "m07_evidence_read", status: "returned", path: f.relative[2],
+				requested: { textOffset: 0, textLimit: lessonText.length }, returned: { kind: "text",
+					textOffset: 0, textEnd: lessonText.length, textTotal: lessonText.length, truncated: false }, at: new Date().toISOString() },
+		] satisfies ReadReturnEvent[] };
+		assert.match(message, /candidate\.cpp|verification\.json/);
+		return "Evidence has not been read in this session; retain as candidate with no proposal.";
+	});
+	f.ctx.runner = runner;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId }, freshSession: true,
+		onInvalidJudgment: async event => { invalid.push(event); } });
+	assert.equal(result.proposalId, undefined);
+	assert.equal(result.record.status, "completed");
+	assert.equal([...runner.sessions.values()].find((item) => item.spec.label === "M04-research")!.turns, 2);
+	assert.equal(invalid[0]?.validation.code, "m04.m07-lesson-evidence");
+	assert.equal(invalid[0]?.validation.path, f.relative[0]);
+});
+
+test("M04 requires complete returned text for frozen .src and unknown suffix lesson evidence", async t => {
+	const f = await fixture(t);
+	const runDir = f.ws.runDir("M07", f.goal.runId);
+	const goalPath = path.join(runDir, "goal.json");
+	const goal = JSON.parse(await readFile(goalPath, "utf8"));
+	const task = goal.tasks[0];
+	const source = "tasks/T001/review-snapshot/004-candidate.src";
+	const unknown = "tasks/T001/review-snapshot/005-candidate.dsl";
+	for (const relative of [source, unknown]) await writeFile(path.join(runDir, relative), "first\nsecond\n");
+	task.lessonDeltaOutput = "lesson-delta.json";
+	task.review = { artifacts: [
+		{ path: path.join(runDir, source), sourcePath: path.join(task.workDir, "candidate.src"), mediaType: "binary", readCoverage: "unread-binary" },
+		{ path: path.join(runDir, unknown), sourcePath: path.join(task.workDir, "candidate.dsl"), mediaType: "binary", readCoverage: "unread-binary" },
+		{ path: path.join(runDir, f.relative[2]), sourcePath: path.join(task.workDir, "lesson-delta.json"), mediaType: "text", readCoverage: "recorded-not-reviewed" },
+	], checks: [], failures: [], unexecuted: [], limitations: [], frozenReportPath: path.join(runDir, f.relative[1]) };
+	const lessonText = JSON.stringify({ version: 1, action: "propose", observation: "Frozen result",
+		applicability: "Only this observed context", evidencePaths: ["candidate.src", "candidate.dsl"] });
+	await writeFile(path.join(runDir, f.relative[2]), lessonText);
+	await writeFile(goalPath, JSON.stringify(goal));
+	const textLine = (relative: string, complete: boolean): ReadReturnEvent => ({ toolName: "m07_evidence_read",
+		status: "returned", path: relative, requested: {}, returned: { kind: "text", startLine: 1,
+			endLine: complete ? 2 : 1, truncated: !complete }, at: new Date().toISOString() });
+	const lessonRead: ReadReturnEvent = { toolName: "m07_evidence_read", status: "returned", path: f.relative[2],
+		requested: { textOffset: 0, textLimit: lessonText.length }, returned: { kind: "text", textOffset: 0,
+			textEnd: lessonText.length, textTotal: lessonText.length, truncated: false }, at: new Date().toISOString() };
+	const proposal = `\`\`\`knowledge-proposals\n${JSON.stringify([{
+		op: "create", type: "K", title: "Frozen candidate lesson", body: "Use only after reviewing the source and context",
+		usageDecision: "adopted", fields: { experience: { version: 1, targetKind: "executor",
+			applicableStages: ["M07"], requiredTags: [], excludedTags: [], requiredRefs: [] } },
+	}])}\n\`\`\``;
+	const invalid: M04InvalidJudgmentEvent[] = [];
+	const runner = new FakeSessionRunner(({ spec, turnIndex }) => spec.label === "M04-research" ? {
+		text: proposal, readReturns: [textLine(source, turnIndex > 1), textLine(unknown, turnIndex > 1), lessonRead],
+	} : "unused");
+	f.ctx.runner = runner;
+	const result = await runM04(f.ctx, { feedback: { kind: "M07", runId: f.goal.runId }, freshSession: true,
+		onInvalidJudgment: async event => { invalid.push(event); } });
+	assert.equal(invalid[0]?.validation.code, "m04.m07-lesson-evidence");
+	assert.deepEqual(new Set(invalid[0]?.coverage.filter(item => !item.complete).map(item => item.sourceId)),
+		new Set([source, unknown]));
+	assert.equal([...runner.sessions.values()].find(item => item.spec.label === "M04-research")?.turns, 2);
+	assert.ok(result.proposalId, "the same trusted text reads may satisfy adoption once both files reach their ends");
+});
+
 
 
 

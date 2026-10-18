@@ -163,8 +163,9 @@ export class FakeSessionRunner implements SessionRunner {
 		if (childTools.kind !== "none") {
 			if (parentTools.kind !== childTools.kind) throw new Error("fake runner: fork cannot elevate tool authority");
 			if (childTools.kind === "custom" || childTools.kind === "read-dir") throw new Error("fake runner: fork cannot elevate unaudited custom or frozen read authority");
-			const sourceNames = parentTools.kind === "read-dir" ? ["material_read", "material_list", ...(parentTools.extraTools ?? []).map((tool) => tool.name)] : parentTools.kind === "execution" ? parentTools.tools : parentTools.kind === "custom" ? parentTools.tools.map((tool) => tool.name) : [];
+			const sourceNames = parentTools.kind === "read-dir" ? ["material_read", "material_list", ...(parentTools.extraTools ?? []).map((tool) => tool.name)] : parentTools.kind === "execution" ? [...parentTools.tools, ...(parentTools.extraTools ?? []).map(tool => tool.name)] : parentTools.kind === "custom" ? parentTools.tools.map((tool) => tool.name) : [];
 			const targetNames: string[] = childTools.kind === "execution" ? childTools.tools : [];
+			if (childTools.kind === "execution" && childTools.extraTools?.length) throw new Error("fake runner: live task feedback closures cannot be inherited by fork");
 			if (targetNames.some((name) => !sourceNames.includes(name))) throw new Error("fake runner: fork cannot elevate tool authority");
 		}
 		if (!Array.isArray(evidenceBindings) || evidenceBindings.length === 0 || evidenceBindings.some((binding) => binding.version !== 1 || binding.status !== "frozen-copy" || !binding.label.trim() || !binding.path.trim() || !binding.sourceVersion?.trim())) throw new Error("fake runner: fork requires frozen evidence bindings");
@@ -226,7 +227,7 @@ export class FakeSessionRunner implements SessionRunner {
 				let replyUsage: UsageValues | undefined;
 				try {
 				const tools: FakeReplyContext["tools"] = {};
-				const granted = state.spec.tools.kind === "custom" ? state.spec.tools.tools : state.spec.tools.kind === "read-dir" ? (state.spec.tools.extraTools ?? []) : [];
+				const granted = state.spec.tools.kind === "custom" ? state.spec.tools.tools : state.spec.tools.kind === "read-dir" || state.spec.tools.kind === "execution" ? (state.spec.tools.extraTools ?? []) : [];
 				{
 					for (const tool of granted) {
 						tools[tool.name] = async (args) => {

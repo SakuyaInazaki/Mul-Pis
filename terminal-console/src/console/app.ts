@@ -3,7 +3,7 @@ import path from "node:path";
 import { WorkflowReader, discoverWorkflowWorkspaces, type ReadOptions } from "./read-model.ts";
 import { listConsoles, sendConsoleRequest, startConsole } from "./client.ts";
 import type { ConsoleCommand, ConsoleEvent, ConsoleRecord } from "./protocol.ts";
-import { defaultCollapsed, renderFrame, hitTest, visibleNodes, knowledgeRecords, type ConsoleFrame, type ConsoleView } from "./render.ts";
+import { workflowFocus, renderFrame, hitTest, visibleNodes, knowledgeRecords, type ConsoleFrame, type ConsoleView } from "./render.ts";
 import { nodeOverview, nodeDetails } from "./overview.ts";
 import { WorkflowKnowledgeReader } from "./knowledge.ts";
 import { VisibleSessionReader } from "./session-output.ts";
@@ -24,15 +24,12 @@ const HELP = [
 	"w 选择工作区；h 选择宿主；i 输入任务（忙时排入下一轮）",
 	"o 打开主会话完整可见回复；Esc 返回概况",
 	"p 暂停/继续 Pi 进程；x 中断/停止；q 离开，研究继续",
-	"", ":start provider/model    创建工作流主会话，随后输入初始任务",
+	"", ":start                   使用工作区 research 角色模型创建主会话",
 	":stage M01              在同一宿主执行指定工作流阶段",
-	":workflow /path.json    提交 stage / checkpoint / plan / decision 动作",
+	":workflow /path.json    提交 begin / stage / checkpoint / plan / decision 动作",
 	":checkpoint             冻结当前目标的反馈 checkpoint",
 	":steer 指令              下一个可接收边界引导",
-	":continue 指令           解除语义等待并继续同一目标",
-	":condition /回执.json | 指令   提交等待条件证据并继续",
-	":wait /条件.json         空闲时进入有明确恢复条件的等待",
-	":recover 目标ID 旧attempt 模型    在新 Pi 进程恢复目标",
+	":recover 目标ID 旧attempt   在新 Pi 进程核验并恢复目标",
 	":pause  :resume  :abort  :stop  :help",
 	"输入时 Ctrl+V 预览待发送全文，Esc 返回继续编辑。",
 	"Esc 关闭菜单或取消输入。所有回执与实际任务结果分别显示。",
@@ -46,7 +43,7 @@ export async function runConsoleApp(options: { workspace?: string; root?: string
 	let readingMode: "document" | "main" | undefined, documentState: { file: string; title: string; offsets: number[]; index: number; page?: DocumentPage } | undefined;
 	let lastFrame: ConsoleFrame | undefined;
 	let readOptions = options.read ?? {}, eventCursor = 0, lastHostPoll = 0, closing = false, refreshing = false, commandBusy = false;
-	let mainBusy = false, followOutput = false, outputTail = "", lastLines: string[] = [], paste = false, pasteBuffer = "", pasteOverflow = false, inputMode = "message", startModel = "", keyBuffer = "";
+	let mainBusy = false, followOutput = false, outputTail = "", lastLines: string[] = [], paste = false, pasteBuffer = "", pasteOverflow = false, inputMode = "message", keyBuffer = "";
 	let escapeTimer: ReturnType<typeof setTimeout> | undefined;
 	let connectionError: string | undefined;
 	let popupAction: ((index: number) => void | Promise<void>) | undefined;
@@ -183,10 +180,8 @@ export async function runConsoleApp(options: { workspace?: string; root?: string
 				const source = reader, snapshot = await source.read({ ...readOptions });
 				if (revision !== navigationRevision || source !== reader) { refreshAgain = true; return; }
 				view.snapshot = snapshot;
-				if (!view.selectedId || !view.snapshot.nodes.some(n => n.id === view.selectedId)) {
-					view.selectedId = view.snapshot.nodes.find(n => n.status === "running" && n.kind === "task")?.id ?? view.snapshot.nodes.find(n => n.kind === "run")?.id;
-					view.collapsed = defaultCollapsed(view.snapshot);
-				}
+				const focus = workflowFocus(view.snapshot, view.selectedId, view.collapsed);
+				view.selectedId = focus.selectedId; view.collapsed = focus.collapsed;
 				await preview();
 			}
 			if (view.mode === "knowledge" && Date.now() - lastKnowledgePoll >= 5_000) await loadKnowledge(knowledgeSnapshotId);
@@ -202,7 +197,7 @@ export async function runConsoleApp(options: { workspace?: string; root?: string
 					view.connected = record.state === "running"; view.hostState = object(object(data.control).storedDeclaration).state;
 					view.controlTarget = `${record.goalRunId ?? record.instanceId} / ${record.attemptId ?? "未绑定"}`;
 					mainBusy = Boolean(data.busy);
-					view.hostLabel = `宿主 ${record.instanceId} · ${record.state}`;
+						view.hostLabel = `宿主 ${record.instanceId} · ${record.state} · ${record.source.mode} ${record.source.revision.slice(0, 12)}${record.source.dirty ? "+dirty" : ""}`;
 					const ev = await sendConsoleRequest(record, { command: "events", since: eventCursor });
 					if (!stillCurrent()) return;
 					const e = object(ev.data);
@@ -226,7 +221,7 @@ export async function runConsoleApp(options: { workspace?: string; root?: string
 		finally { refreshing = false; draw(); if (refreshAgain && !closing) { refreshAgain = false; void refresh(); } }
 	}
 	async function request(command: ConsoleCommand, extra: Record<string, unknown> = {}) {
-		if (!record) throw new Error("当前工作区没有连接的宿主；使用 :start provider/model 启动");
+			if (!record) throw new Error("当前工作区没有连接的宿主；使用 :start 启动");
 		const result = await sendConsoleRequest(record, { command, ...(record.goalRunId ? { goalRunId: record.goalRunId } : {}), ...(record.attemptId ? { attemptId: record.attemptId } : {}), ...extra });
 		if (!result.ok) throw new Error(result.error ?? "控制请求被拒绝");
 		view.lastError = undefined;
@@ -236,7 +231,7 @@ export async function runConsoleApp(options: { workspace?: string; root?: string
 	async function chooseHost() {
 		if (!workspace) return;
 		const records = await listConsoles(workspace);
-		if (!records.length) { view.notice = "没有登记的运行宿主，使用 :start provider/model"; return; }
+		if (!records.length) { view.notice = "没有登记的运行宿主，使用 :start"; return; }
 		openPopup("连接运行宿主", records.map(r => `${r.instanceId} · ${r.state} · ${r.startedAt}`), async index => { record = records[index]; eventCursor = 0; lastHostPoll = 0; outputTail = ""; view.mainModel = undefined; view.mainState = undefined; view.notice = undefined; view.lastError = undefined; closePopup(); await refresh(); });
 	}
 	async function selectWorkspace(root: string) {
@@ -260,14 +255,14 @@ export async function runConsoleApp(options: { workspace?: string; root?: string
 	async function doCommand(text: string) {
 		const [cmd, ...parts] = text.trim().replace(/^:/, "").split(/\s+/); const rest = parts.join(" ");
 		if (["help", "?", ""].includes(cmd)) { openPopup("工作流控制台 · 帮助", HELP); return; }
-		if (cmd === "start") { if (!rest) throw new Error("用法：:start provider/model"); startModel = rest; input("start", `初始任务 · ${rest}`); return; }
+		if (cmd === "start") { if (rest) throw new Error("用法：:start；模型由工作区配置确定"); input("start", "初始任务"); return; }
 		if (cmd === "recover") {
-			if (parts.length !== 3 || !workspace || !/^[A-Za-z0-9_-]+$/.test(parts[0])) throw new Error("用法：:recover <目标ID> <旧attempt> <provider/model>");
-			const [goalRunId, attemptId, model] = parts;
+			if (parts.length !== 2 || !workspace || !/^[A-Za-z0-9_-]+$/.test(parts[0])) throw new Error("用法：:recover <目标ID> <旧attempt>");
+			const [goalRunId, attemptId] = parts;
 			const goal = object(JSON.parse(await readFile(path.join(workspace, "stages", "M07", goalRunId, "goal.json"), "utf8")));
 			const old = object((goal.executionState?.attempts ?? []).find((a: any) => a.id === attemptId));
 			if (goal.executionState?.activeAttemptId !== attemptId || !old.runDescriptor?.controlDir) throw new Error("旧 attempt 不匹配或缺少受信描述文件");
-			record = await startConsole({ workspace, goalRunId, recover: true, oldDescriptorFile: path.join(old.runDescriptor.controlDir, "run-descriptor.json"), piArgs: ["--model", model] });
+			record = await startConsole({ workspace, goalRunId, recover: true, oldDescriptorFile: path.join(old.runDescriptor.controlDir, "run-descriptor.json") });
 			lastHostPoll = 0; log("已启动新恢复宿主；等待控制器核验"); return;
 		}
 		if (cmd === "knowledge") { await showKnowledge(); return; }
@@ -276,9 +271,6 @@ export async function runConsoleApp(options: { workspace?: string; root?: string
 		if (cmd === "workflow") { await request("workflow", { action: JSON.parse(await readFile(path.resolve(rest), "utf8")) }); return; }
 		if (cmd === "checkpoint") { if (!record?.goalRunId) throw new Error("当前宿主尚未绑定目标"); await request("workflow", { action: { kind: "checkpoint", runId: record.goalRunId } }); return; }
 		if (cmd === "steer") { await request("steer", { message: rest }); return; }
-		if (cmd === "continue") { await request("resume_goal", { message: rest }); return; }
-		if (cmd === "condition") { const separator = rest.indexOf("|"); if (separator < 1) throw new Error("用法：:condition /回执.json | 后续指令"); await request("resume_condition", { evidencePath: path.resolve(rest.slice(0, separator).trim()), message: rest.slice(separator + 1).trim() }); return; }
-		if (cmd === "wait") { if (!record?.goalRunId) throw new Error("当前宿主尚未绑定目标"); const condition = JSON.parse(await readFile(path.resolve(rest), "utf8")); await request("prompt", { message: `[[wait-goal:${record.goalRunId}]] ${JSON.stringify(condition)}` }); return; }
 		if (cmd === "pause" || cmd === "resume") { await request(cmd); return; }
 		if (cmd === "abort" || cmd === "stop") { openPopup(cmd === "abort" ? "中断当前轮" : "停止当前运行", [`目标：${record?.goalRunId ?? record?.instanceId ?? "未连接"}`, cmd === "abort" ? "当前 M07 尝试可能被挂起，未决操作保留。" : "向核验后的 Pi 进程组发送停止信号。", "执行", "返回"], async i => { closePopup(); if (i === 2) await request(cmd); }); view.popup!.selected = 2; return; }
 		throw new Error(`未知命令 ${cmd}；:help 查看帮助`);
@@ -293,7 +285,7 @@ export async function runConsoleApp(options: { workspace?: string; root?: string
 			if (inputMode === "command") await doCommand(text);
 			else if (inputMode === "start") {
 				if (!workspace) throw new Error("请先选择工作区");
-				record = await startConsole({ workspace, prompt: text, piArgs: ["--model", startModel] }); lastHostPoll = 0; log("工作流主会话已启动");
+				record = await startConsole({ workspace, prompt: text }); lastHostPoll = 0; log("工作流主会话已启动");
 			} else {
 				await request(mainBusy ? "follow_up" : "prompt", { message: text });
 			}

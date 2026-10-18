@@ -6,7 +6,7 @@ export const TEXT_EXTENSIONS = new Set([
 ".xml", ".html", ".htm",
 ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
 ".py", ".rs", ".go", ".java",
-".c", ".cc", ".cpp", ".h", ".hpp",
+".c", ".cc", ".cpp", ".h", ".hpp", ".cu", ".cuh", ".src",
 ".sh", ".zsh", ".fish", ".sql", ".tex",
 ]);
 

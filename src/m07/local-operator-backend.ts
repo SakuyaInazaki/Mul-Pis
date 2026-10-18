@@ -1,0 +1,483 @@
+/** Concrete task-contract Python evaluator. Host configuration, never model-selected commands. */
+import { execFile } from "node:child_process";
+import { isDeepStrictEqual } from "node:util";
+import { promisify } from "node:util";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { createMacOSWriteSandboxProfile } from "../runner/execution-sandbox.ts";
+import { createCandidateCommandBackend } from "./candidate-command-backend.ts";
+import type { CandidateExecutionBackend } from "./candidate-runner.ts";
+import type { CandidateVerifier, FrozenCandidateFile } from "./candidate-evaluation.ts";
+import type { CandidateCaseObservationV1, CandidateDiagnosticV1, CandidateMetricV1 } from "./types.ts";
+import { captureNcuProfile, exportNcuReportCsv, parseNcuRawCsv } from "./candidate-performance.ts";
+
+export interface LocalOperatorBackendOptions {
+	id: string;
+	version: string;
+	protocolId: string;
+	/** Exact subject authorized by this host's fixed task contract, never model-selected. */
+	subjectId: string;
+	pythonExecutable: string;
+	/** Trusted task module; SPEC/reference/baselines define the science. Optional
+	 * compile_candidate(source_path, build_dir) and bind_compiled(candidate, build_dir)
+	 * compile once and bind the frozen products for correctness and measurement.
+	 * An optional classify_candidate_call(source, AST node, usage) can classify
+	 * task-specific call shapes (usage: call, callback or metaclass). It must
+	 * return {allowed: bool, reason: nonempty string}; approved shapes still
+	 * require isolated runtime checks. */
+	contractPath: string;
+	/** Non-macOS hosts must supply an actual isolation command, never an empty fallback.
+	 * The host is responsible for this prefix's policy. macOS uses the built-in write sandbox. */
+	workerIsolationPrefix?: readonly [string, ...string[]];
+	/** Host-selected runtime variables shared by independent workers and profiler capture.
+	 * HOME and TMPDIR remain private to each worker scratch directory. */
+	workerEnvironment?: Record<string, string>;
+	/** Optional real NCU capture, additional to unprofiled timing. Never chosen by candidate config. */
+	profiling?: { caseId: string; launchId?: string; timeoutMs: number };
+}
+
+interface LocalCase {
+	caseId: string;
+	passed: boolean;
+	correctnessFromPreviousStage?: boolean;
+	failureRole?: string;
+	samplesSeconds?: number[];
+	comparisons?: unknown[];
+	error?: string;
+	measurementError?: string;
+	baselines?: Record<string, { samplesSeconds: number[]; comparisons: unknown[]; pairedCandidateToBaselineRatios?: number[] }>;
+}
+interface LocalReceipt {
+	version: number;
+	kind: string;
+	identity: { goalRunId: string; taskId: string; operationId: string; runId: string; subjectId?: string };
+	protocolId: string;
+	stage: string;
+	capturedAt: string;
+	contractSource?: string;
+	compilationScope?: "python-only" | "task-native-and-python";
+	nativeCompilation?: { passed: boolean; diagnostics: string; artifacts?: string[]; retainedArtifacts?: string[] };
+	parameterValidation?: { valid: boolean; reason: string };
+	timingProtocol?: { repeats: number };
+	timingExecution?: string;
+	passed: boolean;
+	inconclusive?: boolean;
+	correctnessPassed?: boolean;
+	measurementComparable?: boolean | null;
+	error?: string;
+	api?: { unresolvedCalls?: unknown[] };
+	caseDescriptors?: Array<Record<string, unknown> & { id: string }>;
+	cases?: LocalCase[];
+	profile?: { caseId: string; status: string; reason: string; csvPath?: string; reportPath?: string; launchId?: string };
+}
+interface BoundJournal {
+	kind: string;
+	subjectId?: string;
+	goalRunId: string;
+	taskId: string;
+	operationId: string;
+	runId: string;
+	backend: { id: string; version: string };
+	sources: Array<{ frozenPath: string }>;
+	stages: Array<{ stage: { id: string }; status: string; receiptSnapshots?: Array<{ originalPath: string; frozenPath: string }> }>;
+}
+const script = fileURLToPath(new URL("../../scripts/local-operator-stage.py", import.meta.url));
+const runHostCommand = promisify(execFile);
+const stages = ["contract", "compile", "correctness", "measurement"] as const;
+const timingExecution = "interleaved-persistent-v2";
+const median = (values: number[]) => { const sorted = [...values].sort((a, b) => a - b), i = Math.floor(sorted.length / 2);
+	return sorted.length % 2 ? sorted[i] : (sorted[i - 1] + sorted[i]) / 2; };
+const safeId = (value: string) => /^[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(value);
+const inside = (root: string, file: string) => file.startsWith(root + path.sep);
+
+/** Returns both existing host bindings; no service/controller protocol is added. */
+export async function createLocalOperatorBackend(options: LocalOperatorBackendOptions): Promise<{
+	backend: CandidateExecutionBackend; verifier: CandidateVerifier;
+}> {
+	for (const value of [options.pythonExecutable, options.contractPath]) if (!path.isAbsolute(value)) throw new Error("local operator host paths must be absolute");
+	if (!/^[A-Za-z][A-Za-z0-9._:-]{0,95}$/u.test(options.id) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(options.version) ||
+		!options.protocolId || options.protocolId.length > 160) throw new Error("invalid local operator host identity");
+	if (`${options.id}:${options.version}:${options.protocolId}`.length > 170 || options.protocolId.includes("\0"))
+		throw new Error("local operator measurement basis must leave space for exact task case identity");
+	if (typeof options.subjectId !== "string" || !options.subjectId.trim() || options.subjectId.length > 128 || options.subjectId.includes("\0"))
+		throw new Error("local operator host configuration requires an explicit subjectId of at most 128 characters");
+	const subjectId = options.subjectId;
+	if (options.workerIsolationPrefix && (!path.isAbsolute(options.workerIsolationPrefix[0]) || options.workerIsolationPrefix.some(value => !value || value.includes("\0"))))
+		throw new Error("worker isolation prefix must be a fixed absolute host executable and arguments");
+	if (options.workerEnvironment !== undefined && (!options.workerEnvironment || typeof options.workerEnvironment !== "object" ||
+		Array.isArray(options.workerEnvironment) || Object.entries(options.workerEnvironment).some(([name, value]) =>
+			!(/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name)) || name === "HOME" || name === "TMPDIR" ||
+			typeof value !== "string" || value.includes("\0"))))
+		throw new Error("workerEnvironment must be a host-owned string map without HOME or TMPDIR overrides");
+	const workerEnvironment = { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8", ...options.workerEnvironment };
+	if (options.profiling && (!options.profiling.caseId || !Number.isFinite(options.profiling.timeoutMs) || options.profiling.timeoutMs <= 0))
+		throw new Error("profiling needs an explicit caseId and positive capture timeout");
+	const contractPath = await realpath(options.contractPath);
+	await realpath(options.pythonExecutable); // Validate the host entrypoint without discarding a virtualenv symlink.
+	const python = options.pythonExecutable;
+	const contractSource = await readFile(contractPath, "utf8");
+	const assertContract = async () => { if (await readFile(contractPath, "utf8") !== contractSource) throw new Error("host operator contract changed; bind a new version before executing"); };
+	const capabilityScratch = await mkdtemp(path.join(tmpdir(), "local-operator-capability-"));
+	const capabilityOutput = await (async () => {
+		try { return await runHostCommand(python, ["-I", script, "--goal-capability", contractPath],
+			{ timeout: 30_000, maxBuffer: 1_000_000,
+				env: { ...workerEnvironment, HOME: capabilityScratch, TMPDIR: capabilityScratch } }); }
+		finally { await rm(capabilityScratch, { recursive: true, force: true }); }
+	})();
+	await assertContract();
+	const goalCapability = JSON.parse(capabilityOutput.stdout) as { configured?: unknown; workerTimeoutSeconds?: unknown; workerOutputBytes?: unknown };
+	if (typeof goalCapability.configured !== "boolean" || typeof goalCapability.workerTimeoutSeconds !== "number" ||
+		!Number.isFinite(goalCapability.workerTimeoutSeconds) || goalCapability.workerTimeoutSeconds <= 0 ||
+		!Number.isSafeInteger(goalCapability.workerOutputBytes) || (goalCapability.workerOutputBytes as number) <= 0)
+		throw new Error("host operator goal capability is invalid");
+	const goalTimeoutSeconds = goalCapability.workerTimeoutSeconds;
+	const goalOutputBytes = goalCapability.workerOutputBytes as number;
+	const basisFor = (scope: string, kind = "case") => JSON.stringify([options.id, options.version, options.protocolId, subjectId, kind, scope]);
+	if (basisFor("x".repeat(80), "profile").length > 256)
+		throw new Error("local host measurement identity including subjectId must fit the 256-character basis contract with an 80-character case id; choose concise host identity fields");
+	const backend: CandidateExecutionBackend = {
+		id: options.id, version: options.version, protocolIds: [options.protocolId],
+		configurationHelp: `Host-bound subjectId: ${JSON.stringify(subjectId)}. One Python candidate module. The host task contract fixes case shapes/distributions/seeds, reference, allowed APIs, kernel symbol, tolerance, synchronization and named baselines; optional classify_candidate_call may approve exact task-owned call shapes for isolated runtime validation, and optional compile_candidate runs its real native compiler before correctness. Original-goal host verification: ${goalCapability.configured ? "configured by verify_goal" : "unconfigured; a continuous candidate goal cannot be fulfilled through this entry"}. configJson may contain only parameters; the trusted contract can reject a tuple before compilation. No model-selected subject, commands or validation rules.`,
+		stages: stages.map(id => ({ id, mode: "local", checks: [id] })),
+		async validateRequest(request) {
+			await assertContract();
+			if (request.subjectId !== subjectId) throw new Error("candidate task subjectId does not match the host-bound local operator subject");
+			if (request.protocolId !== options.protocolId || request.sourcePaths.length !== 1 || Object.keys(request.config).some(key => key !== "parameters"))
+				throw new Error("local operator request must use its bound protocol, one source, and no evaluation overrides");
+		},
+		async executeStage(ctx) {
+			if (ctx.subjectId !== subjectId) throw new Error("candidate execution subjectId does not match the host-bound local operator subject");
+			await assertContract();
+			await mkdir(ctx.outputDir, { recursive: true });
+			// Reuse exact compile-stage snapshots, never discover candidate-written
+			// artifacts or silently recompile during correctness or measurement.
+			const compiledInputs: Array<{ file: string; frozenPath: string }> = [];
+			let compiledBuildDir: string | undefined;
+			if (ctx.stage.id === "correctness" || ctx.stage.id === "measurement") {
+				const journal = await authority(ctx.workDir, ctx);
+				const compiled = journal.stages[1];
+				if (compiled?.stage.id !== "compile" || compiled.status !== "passed") throw new Error("artifact loading requires the passed compile journal");
+				const snapshots = compiled.receiptSnapshots ?? [];
+				const evaluations = snapshots.filter(item => path.basename(item.originalPath) === "evaluation.json");
+				if (evaluations.length !== 1) throw new Error("compile receipt must be uniquely bound");
+				const receipt = JSON.parse(await readFile(evaluations[0].frozenPath, "utf8")) as LocalReceipt;
+				if (receipt.contractSource !== contractSource || receipt.protocolId !== options.protocolId || receipt.identity.runId !== ctx.runId || !receipt.passed)
+					throw new Error("compile artifacts belong to a different contract/run");
+				if (receipt.compilationScope === "task-native-and-python") {
+					const native = receipt.nativeCompilation;
+					if (!native?.passed || !native.artifacts?.length || native.artifacts.length !== native.retainedArtifacts?.length)
+						throw new Error("native compiler omitted its successful artifact manifest");
+					compiledBuildDir = await mkdtemp(path.join(ctx.outputDir, "compiled-inputs-"));
+					for (const [index, relative] of native.artifacts.entries()) {
+						if (path.isAbsolute(relative) || relative.split(/[\\/]/u).some(part => !part || part === "." || part === "..")) throw new Error("invalid compiled artifact tree path");
+						const bound = snapshots.filter(item => path.resolve(ctx.workDir, item.originalPath) === native.retainedArtifacts![index]);
+						if (bound.length !== 1) throw new Error("compiled artifact lacks a unique frozen stage receipt");
+						const file = path.join(compiledBuildDir, relative);
+						await mkdir(path.dirname(file), { recursive: true });
+						await copyFile(bound[0].frozenPath, file);
+						compiledInputs.push({ file, frozenPath: bound[0].frozenPath });
+					}
+				}
+			}
+			const assertCompiledInputs = async () => {
+				for (const item of compiledInputs) if (!(await readFile(item.file)).equals(await readFile(item.frozenPath)))
+					throw new Error("native compile artifact changed during execution");
+			};
+			await assertCompiledInputs();
+			const scratchRoot = await mkdtemp(path.join(ctx.outputDir, "workers-"));
+			const logsRoot = await mkdtemp(path.join(ctx.outputDir, "worker-logs-"));
+			const profile = options.workerIsolationPrefix ? undefined : await createMacOSWriteSandboxProfile({ writableRoots: [scratchRoot], cwd: scratchRoot });
+			const commandPrefix = options.workerIsolationPrefix ? [...options.workerIsolationPrefix] : profile ? ["/usr/bin/sandbox-exec", "-p", profile] : undefined;
+			if (!commandPrefix) throw new Error("local operator workers require an available write isolation mechanism; no unsandboxed fallback");
+			const workerOptions = path.join(ctx.outputDir, `worker-options-${path.basename(scratchRoot)}.json`);
+			await writeFile(workerOptions, JSON.stringify({ scratchRoot, logsRoot, commandPrefix, compiledBuildDir,
+				workerEnvironment }), { flag: "wx" });
+			const command = { argv: [python, "-I", script, contractPath, workerOptions] as [string, ...string[]],
+				cwd: ctx.outputDir, env: { ...workerEnvironment, HOME: scratchRoot, TMPDIR: scratchRoot } };
+			const adapter = createCandidateCommandBackend({ id: options.id, version: options.version,
+				stages: stages.map(id => ({ id, mode: "local", checks: [id], execute: command })) });
+			const result = await adapter.executeStage(ctx);
+			const retainLogs = async (directory: string): Promise<void> => {
+				for (const entry of await readdir(directory, { withFileTypes: true })) {
+					const file = path.join(directory, entry.name);
+					if (entry.isDirectory()) await retainLogs(file);
+					else if (entry.isFile()) result.receiptPaths.push(path.relative(ctx.workDir, file));
+				}
+			};
+			await retainLogs(logsRoot);
+			result.receiptPaths.push(...compiledInputs.map(item => path.relative(ctx.workDir, item.file)));
+			await assertContract();
+			if (options.profiling && ctx.stage.id === "measurement" && result.status === "passed") {
+				const receiptPath = path.join(ctx.workDir, result.evaluationReceiptPaths![0]);
+				const receipt = JSON.parse(await readFile(receiptPath, "utf8")) as LocalReceipt;
+				const descriptor = receipt.caseDescriptors?.find(item => item.id === options.profiling!.caseId);
+				if (!descriptor) throw new Error("host profiler case is absent from the task contract");
+				const profileDir = await mkdtemp(path.join(path.dirname(receiptPath), "profile-"));
+				const input = path.join(profileDir, "input.json");
+				await writeFile(input, JSON.stringify({ case: descriptor, measure: true, compiledBuildDir }), { flag: "wx" });
+				const invocation = [...commandPrefix, python, "-I", script, "--worker", contractPath, ctx.sources[0].frozenPath, "candidate", "--worker-input", input];
+				const capture = await captureNcuProfile({ executable: invocation[0], argv: invocation.slice(1), cwd: scratchRoot,
+					environment: { ...workerEnvironment, HOME: scratchRoot, TMPDIR: scratchRoot },
+					reportBase: path.join(profileDir, "capture"), timeoutMs: options.profiling.timeoutMs, signal: ctx.signal });
+				receipt.profile = { caseId: descriptor.id, status: capture.status, reason: capture.reason,
+					...(options.profiling.launchId ? { launchId: options.profiling.launchId } : {}) };
+				const captureLog = path.join(profileDir, "capture.json");
+				await writeFile(captureLog, JSON.stringify(capture), { flag: "wx" });
+				result.receiptPaths.push(path.relative(ctx.workDir, captureLog), path.relative(ctx.workDir, input));
+				if (capture.reportPath) {
+					const csv = path.join(profileDir, "raw.csv");
+					const exported = await exportNcuReportCsv(capture.reportPath, csv);
+					result.receiptPaths.push(path.relative(ctx.workDir, capture.reportPath));
+					receipt.profile.reportPath = path.relative(ctx.workDir, capture.reportPath);
+					if (exported.status === "exported") {
+						receipt.profile.csvPath = path.relative(ctx.workDir, csv);
+						result.receiptPaths.push(receipt.profile.csvPath);
+						result.evaluationReceiptPaths!.push(receipt.profile.csvPath);
+					} else receipt.profile.reason += `; ${exported.reason}`;
+				}
+				await writeFile(receiptPath, JSON.stringify(receipt, null, 2) + "\n");
+				await assertContract();
+			}
+			await assertCompiledInputs();
+			return result;
+		},
+	};
+
+	async function authority(taskWork: string, identity: LocalReceipt["identity"]): Promise<BoundJournal> {
+		const { runId, taskId, goalRunId, operationId } = identity;
+		if (identity.subjectId !== subjectId) throw new Error("local receipt subject differs from the host-bound subject");
+		if (![runId, taskId, operationId, goalRunId].every(safeId)) throw new Error("invalid original local execution identity");
+		const root = await realpath(path.join(path.dirname(taskWork), "candidate-runs"));
+		const files = [path.join(root, runId, "journal.json")];
+		const sweep = /^(.*)--([1-9]\d*)$/u.exec(runId);
+		if (sweep && safeId(sweep[1])) files.push(path.join(root, sweep[1], "runs", sweep[2], "journal.json"));
+		for (const file of files) {
+			let journal: BoundJournal;
+			try { if (!inside(root, await realpath(file))) continue; journal = JSON.parse(await readFile(file, "utf8")); }
+			catch { continue; }
+			if (journal.kind === "candidate" && journal.runId === runId && journal.goalRunId === goalRunId && journal.taskId === taskId &&
+				journal.operationId === operationId && journal.subjectId === subjectId && journal.backend.id === options.id && journal.backend.version === options.version) return journal;
+		}
+		throw new Error("no exact host local execution journal");
+	}
+	const verifier: CandidateVerifier = {
+		id: options.id, version: options.version,
+		async verifyTask({ goal, task, sources, receipts }) {
+			const unknown = (reason: string) => ({ sourceBinding: "unknown" as const, correctness: "unknown" as const,
+				stage: "local-evidence-unavailable", metrics: [], limitations: [reason.slice(0, 1800)] });
+			try {
+				if (task.subjectId !== subjectId) return unknown("task subjectId differs from the host-bound local operator subject");
+				await assertContract();
+				let receipt: LocalReceipt | undefined, receiptIndex = -1;
+				for (let index = 0; index < receipts.length; index++) {
+					try {
+						const parsed = JSON.parse(await readFile(receipts[index].frozenPath, "utf8")) as LocalReceipt;
+						if (parsed.kind === "local-operator-evaluation") { if (receipt) throw new Error("multiple evaluation receipts"); receipt = parsed; receiptIndex = index; }
+					} catch (error) { if (!(error instanceof SyntaxError)) throw error; }
+				}
+				if (!receipt || receipt.version !== 1 || receipt.protocolId !== options.protocolId || receipt.contractSource !== contractSource ||
+					receipt.identity.goalRunId !== goal.runId || receipt.identity.taskId !== task.taskId || receipt.identity.subjectId !== task.subjectId)
+					return unknown("receipt is not bound to this goal/task, source contract or protocol");
+				if (receipt.timingExecution !== undefined && receipt.timingExecution !== timingExecution)
+					return unknown("measurement receipt declares an unrecognized timing execution protocol");
+				const journal = await authority(task.workDir, receipt.identity);
+				const stageIndex = stages.findIndex(stage => stage === receipt!.stage);
+				if (stageIndex < 0 || journal.stages[stageIndex]?.stage.id !== receipt.stage ||
+					journal.stages[stageIndex].status !== (receipt.passed ? "passed" : "failed") ||
+					journal.stages.slice(0, stageIndex).some((item, index) => item.stage.id !== stages[index] || item.status !== "passed"))
+					return unknown("receipt did not pass through the declared host cascade");
+				const frozen = journal.stages[stageIndex].receiptSnapshots ?? [];
+				for (const file of receipts) if (!await Promise.all(frozen.map(async item => (await readFile(item.frozenPath)).equals(await readFile(file.frozenPath)))).then(matches => matches.some(Boolean)))
+					return unknown("candidate receipt differs from the original host-journal stage bytes");
+				if (sources.length !== journal.sources.length || !await Promise.all(sources.map(async (source, index) =>
+					(await readFile(source.frozenPath)).equals(await readFile(journal.sources[index].frozenPath)))).then(matches => matches.every(Boolean)))
+					return unknown("candidate source differs from the host-executed snapshot");
+				if (receipt.stage === "measurement" && receipt.cases?.some(row => row.correctnessFromPreviousStage)) {
+					const prior = journal.stages[2]?.receiptSnapshots?.filter(item => path.basename(item.originalPath) === "evaluation.json") ?? [];
+					if (prior.length !== 1) return unknown("baseline-failure correctness lacks its unique preceding receipt");
+					const priorReceipt = JSON.parse(await readFile(prior[0].frozenPath, "utf8")) as LocalReceipt;
+					if (priorReceipt.stage !== "correctness" || !priorReceipt.passed || priorReceipt.contractSource !== contractSource ||
+						priorReceipt.identity.runId !== receipt.identity.runId ||
+						receipt.cases.some(row => row.correctnessFromPreviousStage &&
+							!priorReceipt.cases?.some(earlier => earlier.caseId === row.caseId && earlier.passed)))
+						return unknown("baseline-failure correctness is not supported by the passed predecessor");
+				}
+				const basis = basisFor("", "evaluation");
+				const inconclusive = Boolean(receipt.inconclusive);
+				const scientific = ["correctness", "measurement"].includes(receipt.stage);
+				const baselineIncomparable = receipt.stage === "measurement" && receipt.correctnessPassed === true && receipt.measurementComparable === false;
+				const correctness = baselineIncomparable ? "passed" as const : !scientific || inconclusive ? "unknown" as const : receipt.passed ? "passed" as const : "failed" as const;
+				const cases: CandidateCaseObservationV1[] = [], diagnostics: CandidateDiagnosticV1[] = [];
+				const metric = (name: string, value: number, basisId = basis): CandidateMetricV1 => ({ name, value, unit: "s", basisId, direction: "lower" });
+				const validSamples = (values: unknown): values is number[] => Array.isArray(values) &&
+					Number.isSafeInteger(receipt!.timingProtocol?.repeats) && values.length === receipt!.timingProtocol!.repeats && values.length > 0 &&
+					values.every(value => typeof value === "number" && Number.isFinite(value) && value > 0);
+				for (const [index, row] of (receipt.cases ?? []).entries()) {
+					const samples = validSamples(row.samplesSeconds) ? row.samplesSeconds : [];
+					const comparable = receipt.stage === "measurement" && receipt.measurementComparable === true && !inconclusive;
+					// ip2 is the compact basis token for interleaved-persistent-v2.
+					// It fits the existing 256-character basis envelope even at the
+					// previously permitted maximum case/host identity lengths.
+					const caseBasis = basisFor(row.caseId, receipt.timingExecution === timingExecution ? "ip2" : "case");
+					const pairedBaselines = Object.entries(receipt.timingExecution === timingExecution ? row.baselines ?? {} : {}).filter(([, value]) =>
+						validSamples(value.pairedCandidateToBaselineRatios) && value.pairedCandidateToBaselineRatios.every(ratio => ratio > 0));
+					const item: CandidateCaseObservationV1 = { caseId: row.caseId, status: inconclusive ? "inconclusive" : row.passed ? "passed" : "failed",
+						correctness: inconclusive && !baselineIncomparable ? "unknown" : row.passed ? "passed" : "failed",
+						metrics: comparable && samples.length ? [metric("elapsed", median(samples), caseBasis),
+							...pairedBaselines.map(([name, value]) => ({ name: `candidate/baseline:${name}`, value: median(value.pairedCandidateToBaselineRatios!),
+								unit: "ratio", basisId: caseBasis, direction: "lower" as const }))] : [],
+						referenceMeasurements: Object.entries(row.baselines ?? {}).filter(([, value]) => validSamples(value.samplesSeconds) &&
+							value.comparisons.length === value.samplesSeconds.length && value.comparisons.every(item => (item as { passed?: boolean })?.passed === true))
+							.map(([name, value]) => ({ name, value: median(value.samplesSeconds), unit: "s", basisId: caseBasis })) };
+					if (samples.length) item.performance = { basisId: caseBasis,
+						elapsedSeconds: { value: median(samples), receiptIndex, fieldPath: `cases[${index}].samplesSeconds:median` },
+						timingSamplesSeconds: { values: samples, receiptIndex, fieldPath: `cases[${index}].samplesSeconds` },
+						...(pairedBaselines.length ? { pairedBaselineRatios: pairedBaselines.map(([name, value]) => ({ name,
+							values: value.pairedCandidateToBaselineRatios!, receiptIndex,
+							fieldPath: `cases[${index}].baselines[${JSON.stringify(name)}].pairedCandidateToBaselineRatios` })) } : {}) };
+					if (!row.passed || inconclusive) {
+						const numericalFailure = row.comparisons?.some(value => (value as { passed?: unknown })?.passed === false) === true;
+						const category: CandidateDiagnosticV1["category"] = row.error
+							? row.failureRole === "candidate" ? "runtime" : "unknown"
+							: numericalFailure ? "numerical" : "unknown";
+						diagnostics.push({ category, caseId: row.caseId, fieldPath: `cases[${index}]`, rawText: JSON.stringify(row) });
+					}
+					cases.push(item);
+				}
+				const limitations = [receipt.compilationScope === "task-native-and-python"
+					? "Task-contract finite numeric JSON evaluation. Native artifacts from compile_candidate are frozen and supplied to bind_compiled before candidate/no-op execution; compiler diagnostics and artifact bytes remain in stage receipts. Device kernel participation remains task-specific."
+					: "Task-contract Python evaluation; finite numeric JSON outputs. Compile means Python bytecode validation only; no native compiler was bound.",
+					"Timing is synchronized by the task function. Measurement rounds use serial alternating independent persistent workers and named task baselines; host/device isolation, clocks and suitability of task cases are not inferred from a passing result.",
+					"No-op sensitivity establishes only that at least one declared case detects replacement; it does not prove all computation runs in a particular device kernel."];
+				if (receipt.api?.unresolvedCalls?.length) limitations.push("Some API calls lack a task-selected mechanically resolvable signature; inspect the raw API diagnostic.");
+				if (receipt.nativeCompilation && !receipt.nativeCompilation.passed) diagnostics.push({ category: "compile", fieldPath: "nativeCompilation", rawText: JSON.stringify(receipt.nativeCompilation) });
+				if (receipt.parameterValidation?.valid === false) diagnostics.push({ category: "unknown", fieldPath: "parameterValidation",
+					rawText: JSON.stringify(receipt.parameterValidation) });
+				if (receipt.error || inconclusive) diagnostics.push({ category: receipt.stage === "compile" ? "compile" : "unknown",
+						fieldPath: receipt.error ? "error" : "inconclusive", rawText: receipt.error ?? (baselineIncomparable ? "Candidate outputs passed, but candidate timing or a task baseline lacks complete valid measurements; no performance comparison or incumbent promotion." : "Task cases did not completely establish no-op sensitivity or a declared API signature could not be checked.") });
+				if (receipt.profile) {
+					const profile = receipt.profile;
+					const csvOriginal = profile.csvPath ? frozen.filter(file => path.resolve(task.workDir, profile.csvPath!) === file.originalPath) : [];
+					const evaluationOriginal = frozen.find(file => path.basename(file.originalPath) === "evaluation.json");
+					const csvPath = profile.csvPath && path.resolve(task.workDir, profile.csvPath);
+					const evaluationDirectory = evaluationOriginal && path.dirname(path.resolve(task.workDir, evaluationOriginal.originalPath));
+					let csvIndex = -1;
+					if (profile.status === "captured" && csvOriginal.length === 1 && csvPath && evaluationDirectory && inside(evaluationDirectory, csvPath) &&
+						path.basename(path.dirname(csvPath)).startsWith("profile-") && path.basename(csvPath) === "raw.csv") {
+						const bytes = await readFile(csvOriginal[0].frozenPath);
+						const matches = await Promise.all(receipts.map(async file => bytes.equals(await readFile(file.frozenPath))));
+						if (matches.filter(Boolean).length === 1) csvIndex = matches.indexOf(true);
+					}
+					if (csvIndex >= 0) {
+						const parsed = parseNcuRawCsv(await readFile(receipts[csvIndex].frozenPath, "utf8"), { basisId: basisFor(profile.caseId, "profile"), receiptIndex: csvIndex,
+							...(profile.launchId ? { launchId: profile.launchId } : {}) });
+						const item = cases.find(row => row.caseId === profile.caseId);
+						if (item?.correctness === "passed" && parsed.status === "parsed" && parsed.evidence && item.performance)
+							item.performance.profiledLaunch = parsed.evidence;
+						if (item?.correctness === "passed" && parsed.status === "parsed" && parsed.evidence)
+							limitations.push("Structured NCU performance describes the selected instrumented launch, a different basis from unprofiled invocation timing; unprofiled samples and baselines remain in the evaluation receipt and case metrics.");
+						limitations.push(`NCU capture/import: ${parsed.status}; ${parsed.reason}`.slice(0, 1800));
+					} else limitations.push(`NCU capture: ${profile.status}; ${profile.reason}`.slice(0, 1800));
+				}
+				// Per-case measurements remain separately comparable; no invented aggregate or acceptance threshold.
+				const metrics = correctness === "passed" ? cases.flatMap(item => item.metrics.map(value => ({ ...value, name: `${value.name}:${item.caseId}` }))) : [];
+				return { sourceBinding: "verified", correctness, stage: inconclusive ? `${receipt.stage}:inconclusive` : receipt.stage,
+					metrics, limitations, executionFacts: { evaluations: [{ externalId: receipt.identity.runId,
+						subjectId, status: inconclusive ? "inconclusive" : receipt.passed ? "passed" : "failed",
+						terminal: true, capturedAt: receipt.capturedAt, receiptIndex, cases, diagnostics }] } };
+			} catch (error) { return unknown((error as Error).message); }
+		},
+		...(goalCapability.configured ? { async verifyGoal({ goal, acceptedEvidencePaths }) {
+			await assertContract();
+			const accepted = new Set(await Promise.all(acceptedEvidencePaths.map(item => realpath(item))));
+			const eligible = new Set<string>();
+			const observations: Array<{ taskId: string; observationPath: string; observation: Awaited<ReturnType<CandidateVerifier["verifyTask"]>>;
+				receipt: LocalReceipt }> = [];
+			const seen = new Set<string>();
+			for (const task of goal.tasks.filter(item => item.status === "accepted" && item.subjectId === subjectId)) {
+				const candidates = [
+					...(task.candidateObservation && task.candidate ? [{ observation: task.candidateObservation,
+						observationPath: task.candidateObservation.observationPath, sourcePaths: task.candidate.sourcePaths,
+						receiptPaths: task.candidate.receiptPaths }] : []),
+					...(task.episode?.candidates ?? []).map(item => ({ observation: item.observation, observationPath: item.observationPath,
+						sourcePaths: item.sourcePaths, receiptPaths: item.receiptPaths })),
+				];
+				for (const candidate of candidates) {
+					const observationPath = await realpath(candidate.observationPath);
+					if (!accepted.has(observationPath) || seen.has(observationPath)) continue;
+					seen.add(observationPath);
+					const recorded = JSON.parse(await readFile(observationPath, "utf8")) as Record<string, unknown>;
+					const sourceFiles = candidate.observation.sourceFiles, receiptFiles = candidate.observation.receiptFiles;
+					const expectedFiles = (files: readonly string[], declared: readonly string[]): FrozenCandidateFile[] => {
+						if (files.length !== declared.length) throw new Error("candidate declaration differs from frozen file count");
+						return files.map((file, index) => {
+							const originalPath = path.resolve(task.workDir, declared[index]);
+							if (!inside(task.workDir, originalPath)) throw new Error("candidate original file escaped its task work directory");
+							return { declaredPath: declared[index], originalPath, frozenPath: file };
+						});
+					};
+					const episode = recorded.sourceFilesRelativeToObservationDir === true;
+					if (episode && (!isDeepStrictEqual(recorded.sourcePaths, candidate.sourcePaths) ||
+						!isDeepStrictEqual(recorded.receiptPaths, candidate.receiptPaths)))
+						throw new Error("accepted episode declaration differs from its frozen observation");
+					const portable = episode ? recorded.observation as Record<string, unknown> : recorded;
+					const { observationPath: _storedPath, ...stored } = candidate.observation as typeof candidate.observation & { observationPath?: string };
+					const normalized = episode && portable && Array.isArray(portable.sourceFiles) && Array.isArray(portable.receiptFiles) ? {
+						...portable,
+						sourceFiles: (portable.sourceFiles as string[]).map(file => path.join(path.dirname(observationPath), file)),
+						receiptFiles: (portable.receiptFiles as string[]).map(file => path.join(path.dirname(observationPath), file)),
+					} : portable;
+					if (!isDeepStrictEqual(normalized, stored) || stored.verifier.id !== options.id || stored.verifier.version !== options.version)
+						throw new Error("accepted candidate observation differs from its frozen source/receipt references");
+					const checked = await verifier.verifyTask({ goal, task, sources: expectedFiles(sourceFiles, candidate.sourcePaths),
+						receipts: expectedFiles(receiptFiles, candidate.receiptPaths) });
+					if (checked.sourceBinding !== "verified" || checked.correctness !== candidate.observation.correctness ||
+						checked.stage !== candidate.observation.stage || !isDeepStrictEqual(checked.metrics, candidate.observation.metrics) ||
+						!isDeepStrictEqual(checked.executionFacts, candidate.observation.executionFacts))
+						throw new Error("accepted candidate did not reproduce its frozen host verification");
+					eligible.add(observationPath);
+					for (const file of [...sourceFiles, ...receiptFiles]) {
+						const resolved = await realpath(file);
+						if (accepted.has(resolved)) eligible.add(resolved);
+					}
+					const evaluationReceipts: LocalReceipt[] = [];
+					for (const file of receiptFiles) {
+						try {
+							const value = JSON.parse(await readFile(file, "utf8")) as LocalReceipt;
+							if (value.kind === "local-operator-evaluation") evaluationReceipts.push(value);
+						} catch (error) { if (!(error instanceof SyntaxError)) throw error; }
+					}
+					if (evaluationReceipts.length !== 1) throw new Error("accepted candidate lacks one exact local evaluation receipt");
+					observations.push({ taskId: task.taskId, observationPath, observation: checked, receipt: evaluationReceipts[0] });
+				}
+			}
+			if (!observations.length) throw new Error("no accepted candidate has reverified frozen local operator evidence");
+			const root = await mkdtemp(path.join(path.dirname(goal.problemSnapshotPath), "goal-verification-"));
+			const scratchRoot = await mkdtemp(path.join(root, "workers-"));
+			const logsRoot = await mkdtemp(path.join(root, "worker-logs-"));
+			const profile = options.workerIsolationPrefix ? undefined : await createMacOSWriteSandboxProfile({ writableRoots: [scratchRoot], cwd: scratchRoot });
+			const commandPrefix = options.workerIsolationPrefix ? [...options.workerIsolationPrefix] : profile ? ["/usr/bin/sandbox-exec", "-p", profile] : undefined;
+			if (!commandPrefix) throw new Error("local operator goal verification requires the bound worker write isolation");
+			const workerOptions = path.join(root, "worker-options.json"), request = path.join(root, "request.json");
+			await writeFile(workerOptions, JSON.stringify({ scratchRoot, logsRoot, commandPrefix,
+				workerEnvironment }), { flag: "wx" });
+			await writeFile(request, JSON.stringify({ criteria: goal.successCriteria, observations }), { flag: "wx" });
+			const output = await runHostCommand(python, ["-I", script, "--verify-goal", contractPath, workerOptions, request],
+				{ cwd: root, timeout: Math.min(2_147_483_647, Math.ceil(goalTimeoutSeconds * 1000) + 10_000),
+					maxBuffer: goalOutputBytes + 1_000_000,
+					env: { ...workerEnvironment, HOME: scratchRoot, TMPDIR: scratchRoot } });
+			await assertContract();
+			const result = JSON.parse(output.stdout) as { checks?: unknown; limitations?: unknown };
+			if (!Array.isArray(result.checks) || !Array.isArray(result.limitations) ||
+				result.checks.some((check: unknown) => !check || typeof check !== "object" ||
+					!goal.successCriteria.includes((check as { criterion?: string }).criterion ?? "") ||
+					!Array.isArray((check as { evidence?: unknown }).evidence) ||
+					(check as { evidence: unknown[] }).evidence.some(item => typeof item !== "string" || !eligible.has(item))))
+				throw new Error("host verify_goal returned a criterion or evidence outside accepted reverified observations");
+			return result as Awaited<ReturnType<NonNullable<CandidateVerifier["verifyGoal"]>>>;
+		} } : {}),
+	};
+	return { backend, verifier };
+}

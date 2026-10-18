@@ -4,10 +4,11 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "test": "node --test --test-concurrency=1 'test/**/*.test.ts'",
+    "test": "node --test --test-concurrency=1 'test/**/*.test.ts' 'terminal-console/test/**/*.test.ts'",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "harness": "node src/cli.ts",
     "dashboard": "node src/dashboard/cli.ts",
+	"console": "node terminal-console/src/console/cli.ts",
     "deepseek:smoke": "node scripts/manual-deepseek-smoke.ts",
     "deepseek:local": "node scripts/run-deepseek-local.ts",
     "workflow:control": "node scripts/workflow-control.ts"

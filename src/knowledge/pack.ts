@@ -40,10 +40,36 @@ function compareRecords(left: KnowledgeRecord, right: KnowledgeRecord): number {
 	return typeOrder(left.type) - typeOrder(right.type) || left.id.localeCompare(right.id) || left.version - right.version;
 }
 
+/** Discovery only: keep identity, dependency edges and live restrictions visible;
+ * bodies and structured fields must be read explicitly before claiming coverage. */
+export function renderKnowledgeIndexRecord(record: KnowledgeRecord, availability: AvailabilityReport, limits: Limit[], latestVersion?: number): string {
+	const retrieval = record.fields.retrieval;
+	const context = retrieval && typeof retrieval === "object" && !Array.isArray(retrieval) ? (retrieval as Record<string, unknown>).context : undefined;
+	const boundaryFields = ["conditions", "reusable_when", "avoid_when", "do_not_apply_when", "limitations", "risk"]
+		.filter(name => typeof record.fields[name] === "string" && String(record.fields[name]).trim());
+	const activeLimits = limits.filter(limit => limitApplies(limit, record));
+	const limitIndex = new Map<string, { kind: Limit["kind"]; target: string; count: number }>();
+	for (const limit of activeLimits) {
+		const key = JSON.stringify([limit.kind, limit.target]);
+		const row = limitIndex.get(key);
+		if (row) row.count++;
+		else limitIndex.set(key, { kind: limit.kind, target: limit.target, count: 1 });
+	}
+	return [`### ${record.id}@${record.version} ${record.title}`,
+		`- 使用决定：${record.usageDecision ?? "未记录"}；当前可用性：${availability.availability}；原因 ${availability.reasons.length} 条（按 ID 补读）`,
+		`- 依据状况：${record.evidenceStatus ?? "未记录"}${record.qStatus ? `；问题状态：${JSON.stringify(record.qStatus)}` : ""}`,
+		`- 情境：${record.scope.join("、") || "默认情境"}；关系：${JSON.stringify(record.refs)}`,
+		...(boundaryFields.length ? [`- 正文另有条件/反例字段待读：${boundaryFields.join("、")}`] : []),
+		`- 生效限制定位（${activeLimits.length} 条）：${JSON.stringify([...limitIndex.values()])}`,
+		...(context === undefined ? [] : [`- 明确检索前提（不是来源情境）：${JSON.stringify(context)}`]),
+		...(latestVersion && latestVersion !== record.version ? [`- 历史版本；本次快照最新为 ${record.id}@${latestVersion}`] : []),
+		"- 本项仅为发现索引；应用前须按 ID 读取正文、完整原因及实时限制，并核对必要依赖、反驳与明确前提。所引用证据尚未读取。", ""].join("\n");
+}
+
 export function renderKnowledgeRecord(record: KnowledgeRecord, availability: AvailabilityReport, limits: Limit[], latestVersion?: number): string {
 	const reasons = availability.reasons.length ? availability.reasons.join("；") : "无";
 	const activeLimits = limits.filter((limit) => limitApplies(limit, record));
-	const refs = record.refs.length ? record.refs.map((ref) => `${ref.rel} → ${ref.target}`).join("；") : "无";
+	const refs = record.refs.length ? record.refs.map((ref) => `${ref.rel} → ${ref.target}${ref.inputRole ? `（输入作用：${ref.inputRole}）` : ""}`).join("；") : "无";
 	const scope = record.scope.length ? record.scope.join("、") : "默认情境";
 	const limitText = activeLimits.length
 		? activeLimits.map((limit) => `${limit.kind}:${limit.target}（${limit.reason}；授权 ${limit.authority}）`).join("；")

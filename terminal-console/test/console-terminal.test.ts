@@ -118,7 +118,8 @@ test("CLI rejects malformed and contradictory control arguments before execution
 	const root = await mkdtemp(path.join(tmpdir(), "console-terminal-cli-"));
 	try {
 		await writeFile(path.join(root, "research.config.json"), "{}\n");
-		await assert.rejects(main(["start", "--workspace", root, "--model", "provider/model", "--prompt-file", "task.txt", "--goal", "G1"]), /已有目标请使用 recover/);
+		await assert.rejects(main(["start", "--workspace", root, "--prompt-file", "task.txt", "--goal", "G1"]), /已有目标请使用 recover/);
+		assert.throws(() => parseConsoleArgs(["start", "--model", "provider/model"]), /未知选项/);
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -131,7 +132,7 @@ test("once and JSON status read actual persisted runs without changing workspace
 		await writeFile(runFile, `${JSON.stringify({ stage: "M01", runId: "R001", status: "completed", startedAt: "2026-10-14T00:00:00Z", finishedAt: "2026-10-14T00:01:00Z", inputs: [], sessions: [], outputs: [], failures: [], remarks: [] })}\n`);
 		const before = (await readdir(root, { recursive: true })).sort();
 		const original = await readFile(runFile, "utf8");
-		const cli = path.resolve("src/console/cli.ts");
+		const cli = path.resolve("terminal-console/src/console/cli.ts");
 		const once = await run(process.execPath, [cli, "--workspace", root, "--once"], { cwd: path.resolve("."), maxBuffer: 1_000_000 });
 		assert.match(once.stdout, /M01/);
 		assert.match(once.stdout, /R001/);

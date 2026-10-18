@@ -4,6 +4,8 @@ import path from "node:path";
 import { createFileKnowledgeStore } from "../knowledge/store.ts";
 import type { M04KnowledgeTransactionV1 } from "../stages/m04.ts";
 import type { StageRunRecord } from "../types.ts";
+import type { ReadReturnEvent } from "../runner/types.ts";
+import { textReadCoverage } from "../runner/read-coverage.ts";
 import { Workspace } from "../workspace.ts";
 import type { WorkflowArmReceiptV1, WorkflowCaseV2, WorkflowOutcomeV2, WorkflowQualityCheckV2 } from "./workflow-types.ts";
 
@@ -33,8 +35,7 @@ function output(run: StageRunRecord, root: string, label: string): string {
 	if (!item || !inside(root, item.path)) throw new Error(`M04 output ${label} is missing or escapes its run`);
 	return item.path;
 }
-interface ReturnRange { toolName?: string; path?: string; status?: string; returned?: { kind?: string; startLine?: number; endLine?: number; truncated?: boolean } }
-function readInFull(relative: string, content: string, message: string, ranges: ReturnRange[]): boolean {
+function readInFull(relative: string, content: string, message: string, ranges: ReadReturnEvent[]): boolean {
 	// A report paraphrase, or even a full quote elsewhere in the prompt, is not an
 	// original-evidence read. The inline bytes must occur in this artifact's section.
 	const heading = `### ${relative}\n\n`;
@@ -47,15 +48,7 @@ function readInFull(relative: string, content: string, message: string, ranges: 
 		const bodyStart = inventoryEnd < 0 ? start : inventoryEnd + 2;
 		if (message.startsWith(content, bodyStart)) return true;
 	}
-	const lines = content.split(/\r?\n/).length - (content.endsWith("\n") ? 1 : 0);
-	if (lines === 0) return ranges.some((event) => event.toolName === "m07_evidence_read" && event.path === relative && event.status === "no-content" && event.returned?.kind === "text" && !event.returned.truncated);
-	const spans = ranges.filter((event) => event.toolName === "m07_evidence_read" && event.path === relative && event.status === "returned" && event.returned?.kind === "text" && event.returned.truncated === false &&
-		Number.isSafeInteger(event.returned.startLine) && Number.isSafeInteger(event.returned.endLine) && event.returned.startLine! >= 1 && event.returned.endLine! >= event.returned.startLine! && event.returned.endLine! <= lines)
-		.map((event) => ({ start: event.returned!.startLine!, end: event.returned!.endLine!, terminal: event.returned!.endLine === lines && event.returned!.truncated === false }))
-		.sort((a, b) => a.start - b.start);
-	let covered = 0;
-	for (const span of spans) if (span.start <= covered + 1) covered = Math.max(covered, span.end);
-	return covered >= lines && spans.some((span) => span.terminal);
+	return textReadCoverage(content, relative, ranges, "m07_evidence_read").complete;
 }
 const check = (criterion: string, passed: boolean, evidence: string[], reason: string): WorkflowQualityCheckV2 => ({ criterion, passed, evidence, reason });
 
@@ -99,7 +92,7 @@ export async function evaluateWorkflowOutcomeV2(caseInput: WorkflowCaseV2, recei
 		result.quality.push(check("M04 transaction and knowledge state settled", settled, [transactionPath, ws.knowledgeDir],
 			settled ? "M04 completed and the published knowledge pointer matches the settled transaction" : "M04 or its knowledge transition is incomplete or differs from the frozen baseline"));
 		const coverageFile = output(m04, m04Root, "M07 回流证据实际访问范围");
-		const coverage = JSON.parse(await boundedText(coverageFile, 128_000)) as { promptOutcome?: string; returnedRanges?: ReturnRange[] };
+		const coverage = JSON.parse(await boundedText(coverageFile, 128_000)) as { promptOutcome?: string; returnedRanges?: ReadReturnEvent[] };
 		const messageFile = output(m04, m04Root, "发送给研究会话的完整消息");
 		const message = await boundedText(messageFile, 8 * 1024 * 1024);
 		const relativeReport = path.relative(checkpointRoot, reportPath);

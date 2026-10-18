@@ -6,9 +6,32 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_FRAME_BYTES, type ConsoleRecord, type ConsoleRequest, type ConsoleResponse } from "./protocol.ts";
 import type { ConsoleHostOptions } from "./host.ts";
-import { probeProcessIdentity } from "../runtime/process-identity.ts";
+import { probeProcessIdentity } from "../../../src/runtime/process-identity.ts";
+import { assertRecoverableConsoleHostExtension, configuredConsoleModel, resolveConsoleHostExtension, resolveConsoleSource, type ConsoleSource } from "./source.ts";
 
-export interface StartConsoleOptions { workspace: string; prompt?: string; piArgs?: string[]; goalRunId?: string; oldDescriptorFile?: string; recover?: boolean }
+export interface StartConsoleOptions { workspace: string; prompt?: string; goalRunId?: string; oldDescriptorFile?: string; recover?: boolean; hostExtensionFile?: string }
+export async function resolveConsoleStartExtension(workspace: string, source: ConsoleSource, requested?: string, oldDescriptorFile?: string): Promise<string> {
+	if (!oldDescriptorFile) return resolveConsoleHostExtension(source, requested);
+	const oldFile = await realpath(oldDescriptorFile);
+	const oldControlDir = path.dirname(oldFile);
+	const instanceId = path.basename(oldControlDir);
+	const instancesDir = path.join(workspace, ".agent", "console", "instances");
+	if (path.basename(oldFile) !== "run-descriptor.json" || path.dirname(oldControlDir) !== instancesDir || !/^[a-f0-9-]{36}$/.test(instanceId)) {
+		const selected = await resolveConsoleHostExtension(source, requested);
+		assertRecoverableConsoleHostExtension(source, selected);
+		return selected;
+	}
+	const oldRecord = JSON.parse(await readFile(path.join(oldControlDir, "instance.json"), "utf8")) as ConsoleRecord;
+	if (oldRecord.version !== 1 || oldRecord.instanceId !== instanceId || oldRecord.workspace !== workspace ||
+		oldRecord.controlDir !== oldControlDir || oldRecord.descriptorFile !== oldFile || JSON.stringify(oldRecord.source) !== JSON.stringify(source))
+		throw new Error("old console record does not match the recovery source and descriptor");
+	if (oldRecord.hostExtensionFile !== undefined && typeof oldRecord.hostExtensionFile !== "string") throw new Error("old console host extension path is invalid");
+	const inherited = await resolveConsoleHostExtension(source, oldRecord.hostExtensionFile);
+	if (requested && await resolveConsoleHostExtension(source, requested) !== inherited)
+		throw new Error("recovery must reuse the old console host extension entry");
+	assertRecoverableConsoleHostExtension(source, inherited);
+	return inherited;
+}
 function expectedSocketPath(instanceId: string): string { return path.join("/tmp", `prsi-console-${process.getuid?.() ?? "user"}-${instanceId}`, "rpc.sock"); }
 async function verifyConnection(record: ConsoleRecord): Promise<void> {
 	if (!/^[a-f0-9-]{36}$/.test(record.instanceId) || record.socketPath !== expectedSocketPath(record.instanceId)) throw new Error("console record has an unexpected socket path");
@@ -39,6 +62,9 @@ export async function listConsoles(workspace: string): Promise<ConsoleRecord[]> 
 export async function startConsole(options: StartConsoleOptions): Promise<ConsoleRecord> {
 	if (Boolean(options.goalRunId) !== Boolean(options.recover) || Boolean(options.goalRunId) !== Boolean(options.oldDescriptorFile)) throw new Error("existing goal requires goalRunId, oldDescriptorFile and recover together");
 	const workspace = await realpath(options.workspace);
+	const source = await resolveConsoleSource(workspace);
+	const model = await configuredConsoleModel(workspace);
+	const hostExtensionFile = await resolveConsoleStartExtension(workspace, source, options.hostExtensionFile, options.oldDescriptorFile);
 	const instanceId = randomUUID();
 	const controlDir = path.join(workspace, ".agent", "console", "instances", instanceId);
 	const socketPath = expectedSocketPath(instanceId);
@@ -47,7 +73,7 @@ export async function startConsole(options: StartConsoleOptions): Promise<Consol
 	await chmod(controlDir, 0o700);
 	await mkdir(socketDirectory, { mode: 0o700 });
 	await chmod(socketDirectory, 0o700);
-	const config: ConsoleHostOptions = { workspace, instanceId, controlDir, socketPath, recordFile: path.join(controlDir, "instance.json"), ...(options.prompt ? { prompt: options.prompt } : {}), ...(options.piArgs ? { piArgs: options.piArgs } : {}), ...(options.goalRunId ? { goalRunId: options.goalRunId } : {}), ...(options.oldDescriptorFile ? { oldDescriptorFile: options.oldDescriptorFile } : {}), ...(options.recover ? { recover: true } : {}) };
+	const config: ConsoleHostOptions = { workspace, instanceId, controlDir, socketPath, recordFile: path.join(controlDir, "instance.json"), source, model, hostExtensionFile, ...(options.prompt ? { prompt: options.prompt } : {}), ...(options.goalRunId ? { goalRunId: options.goalRunId } : {}), ...(options.oldDescriptorFile ? { oldDescriptorFile: options.oldDescriptorFile } : {}), ...(options.recover ? { recover: true } : {}) };
 	const configFile = path.join(controlDir, "host-options.json");
 	await writeFile(configFile, `${JSON.stringify(config)}\n`, { mode: 0o600, flag: "wx" });
 	const host = spawn(process.execPath, [fileURLToPath(new URL("./host.ts", import.meta.url)), configFile], { cwd: workspace, detached: true, stdio: "ignore" });

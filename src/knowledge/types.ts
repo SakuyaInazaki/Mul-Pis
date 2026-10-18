@@ -145,6 +145,8 @@ export type ProposalOp =
 			target: string;
 			reason: string;
 			authority: string;
+			/** Exact authority of the existing limit to lift; omission lifts every active limit on target. */
+			limitAuthority?: string;
 	  }
 	| {
 			op: "close_q";

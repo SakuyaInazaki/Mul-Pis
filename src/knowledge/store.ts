@@ -6,6 +6,7 @@ import { nowIso, readTextIfExists, writeFileAtomic } from "../workspace.ts";
 import { buildKnowledgePack } from "./pack.ts";
 import { regenerateKnowledgeViews } from "./views.ts";
 import { validateExperienceDefinition } from "./experience-schema.ts";
+import { isNecessaryPremise } from "./relations.ts";
 import type {
 	AvailabilityReport,
 	ImpactItem,
@@ -35,8 +36,6 @@ const USAGE_DECISIONS: readonly UsageDecision[] = ["candidate", "working_assumpt
 const CLOSE_REASONS: readonly QCloseReason[] = ["answered", "not_valid", "duplicate", "out_of_scope", "shelved"];
 const LIMIT_KINDS: readonly Limit["kind"][] = ["suspended", "withdrawn", "needs_recheck"];
 const INPUT_ROLES = ["condition", "local_assumption", "temporary_assumption", "definition", "data", "adopted_result"] as const;
-// Negative relations and version lineage are not necessary-premise edges.
-const IMPACT_RELATIONS: readonly RelType[] = ["premise_of", "supports", "checks", "applies_in"];
 const LOCK_STALE_MS = 10 * 60 * 1000;
 
 interface MergeIntentV1 {
@@ -98,7 +97,8 @@ interface VirtualEntry {
 
 interface ValidationState {
 	entries: Map<string, VirtualEntry>;
-	activeLimitTargets: string[];
+	activeLimits: Array<{ target: string; authority: string }>;
+	historicalDecisionLifted: Set<string>;
 }
 
 interface PlannedIds {
@@ -365,7 +365,7 @@ function validateBatchStructure(batch: ProposalBatch, initial: ValidationState):
 		return issues;
 	}
 
-	const state: ValidationState = { entries: cloneVirtualEntries(initial.entries), activeLimitTargets: [...initial.activeLimitTargets] };
+	const state: ValidationState = { entries: cloneVirtualEntries(initial.entries), activeLimits: initial.activeLimits.map((limit) => ({ ...limit })), historicalDecisionLifted: new Set(initial.historicalDecisionLifted) };
 	for (const [opIndex, rawOp] of rawBatch.ops.entries()) {
 		if (!isObject(rawOp) || typeof rawOp.op !== "string") {
 			issue(issues, "操作必须是含 op 的对象", opIndex);
@@ -418,7 +418,15 @@ function validateBatchStructure(batch: ProposalBatch, initial: ValidationState):
 			if (!USAGE_DECISIONS.includes(rawOp.usageDecision as UsageDecision)) issue(issues, "decide.usageDecision 无效", opIndex);
 			if (!isNonEmptyString(rawOp.reason)) issue(issues, "decide.reason 必须是非空字符串", opIndex);
 			if (rawOp.context !== undefined && typeof rawOp.context !== "string") issue(issues, "decide.context 必须是字符串", opIndex);
-			if (target) bumpVirtual(target);
+			if (target) {
+				bumpVirtual(target);
+				if (["suspended", "withdrawn", "replaced"].includes(String(rawOp.usageDecision)) && isNonEmptyString(rawOp.id)) {
+					state.activeLimits.push({ target: rawOp.id, authority: `decision:${batch.id}` });
+					if (!state.historicalDecisionLifted.has(rawOp.id) && !state.activeLimits.some((limit) => limit.target === rawOp.id && limit.authority === `historical-decision:${rawOp.id}`)) {
+						state.activeLimits.push({ target: rawOp.id, authority: `historical-decision:${rawOp.id}` });
+					}
+				}
+			}
 			continue;
 		}
 
@@ -445,20 +453,26 @@ function validateBatchStructure(batch: ProposalBatch, initial: ValidationState):
 			if (!LIMIT_KINDS.includes(rawOp.kind as Limit["kind"])) issue(issues, "limit.kind 无效", opIndex);
 			if (!isNonEmptyString(rawOp.reason)) issue(issues, "limit.reason 必须是非空字符串", opIndex);
 			if (!isNonEmptyString(rawOp.authority)) issue(issues, "limit.authority 必须是非空字符串", opIndex);
-			if (isNonEmptyString(rawOp.target)) state.activeLimitTargets.push(rawOp.target);
+			if (isNonEmptyString(rawOp.target) && isNonEmptyString(rawOp.authority)) state.activeLimits.push({ target: rawOp.target, authority: rawOp.authority });
 			continue;
 		}
 
 		if (rawOp.op === "lift_limit") {
-			const extras = unknownFields(rawOp, ["op", "target", "reason", "authority"]);
+			const extras = unknownFields(rawOp, ["op", "target", "reason", "authority", "limitAuthority"]);
 			if (extras.length) issue(issues, `lift_limit 含未知字段：${extras.join(", ")}`, opIndex);
 			validateTarget(rawOp.target, state, true, issues, opIndex, "lift_limit.target");
 			if (!isNonEmptyString(rawOp.reason)) issue(issues, "lift_limit.reason 必须是非空字符串", opIndex);
 			if (!isNonEmptyString(rawOp.authority)) issue(issues, "lift_limit.authority 必须是非空字符串", opIndex);
-			if (isNonEmptyString(rawOp.target)) {
-				const found = state.activeLimitTargets.some((target) => target === rawOp.target);
-				if (!found) issue(issues, `lift_limit 没有匹配的生效限制：${rawOp.target}`, opIndex);
-				state.activeLimitTargets = state.activeLimitTargets.filter((target) => target !== rawOp.target);
+			if (rawOp.limitAuthority !== undefined && !isNonEmptyString(rawOp.limitAuthority)) issue(issues, "lift_limit.limitAuthority 必须是非空字符串", opIndex);
+			const historicalHandleSelector = isNonEmptyString(rawOp.target) && rawOp.target.startsWith("$") && rawOp.limitAuthority === `historical-decision:${rawOp.target}`;
+			if (historicalHandleSelector) issue(issues, "lift_limit 的历史停用来源须在正式 ID 分配后选择；本批 handle 可使用省略 limitAuthority 的整目标解除", opIndex);
+			if (isNonEmptyString(rawOp.target) && !historicalHandleSelector && (rawOp.limitAuthority === undefined || isNonEmptyString(rawOp.limitAuthority))) {
+				const matches = (limit: { target: string; authority: string }) => limit.target === rawOp.target && (rawOp.limitAuthority === undefined || limit.authority === rawOp.limitAuthority);
+				if (!state.activeLimits.some(matches)) issue(issues, `lift_limit 没有匹配的生效限制：${rawOp.target}${rawOp.limitAuthority === undefined ? "" : `（来源 ${rawOp.limitAuthority}）`}`, opIndex);
+				else {
+					if (state.activeLimits.some((limit) => matches(limit) && limit.authority === `historical-decision:${rawOp.target}`)) state.historicalDecisionLifted.add(rawOp.target);
+					state.activeLimits = state.activeLimits.filter((limit) => !matches(limit));
+				}
 			}
 			continue;
 		}
@@ -671,6 +685,7 @@ export class FileKnowledgeStore implements KnowledgeStore {
 			const mergeTime = nowIso();
 			const originalLimits = await this.limits();
 			const nextLimits = originalLimits.map((limit) => ({ ...limit }));
+			const deactivatedInBatch = new Set<string>();
 			const limitsWrittenFirst: string[] = [];
 			const applied: Array<{ opIndex: number; result: string }> = [];
 			const changedTargets: ChangedTarget[] = [];
@@ -691,17 +706,18 @@ export class FileKnowledgeStore implements KnowledgeStore {
 					nextLimits.push(limit);
 					limitsWrittenFirst.push(activeLimitLabel(limit));
 					changedTargets.push({ id: target, allVersions: true });
+					deactivatedInBatch.add(target);
 				} else if (op.op === "lift_limit") {
 					const target = resolveHandle(op.target, plannedIds.handles);
 					let lifted = 0;
 					for (const limit of nextLimits) {
-						if (!limit.liftedAt && limit.target === target) {
+						if (!limit.liftedAt && limit.target === target && (op.limitAuthority === undefined || limit.authority === op.limitAuthority)) {
 							limit.liftedAt = mergeTime;
 							limit.liftReason = op.reason;
 							lifted += 1;
 						}
 					}
-					if (parseRecordTarget(target)?.version === undefined && await this.historicalDeactivation(target)) {
+					if (parseRecordTarget(target)?.version === undefined && (op.limitAuthority === undefined || op.limitAuthority === `historical-decision:${target}`) && (deactivatedInBatch.has(target) || await this.historicalDeactivation(target))) {
 						const marker = nextLimits.find((limit) => limit.target === target && limit.authority === `historical-decision:${target}`);
 						if (marker) { marker.liftedAt = mergeTime; marker.liftReason = op.reason; }
 						else nextLimits.push({ target, kind: "withdrawn", reason: "历史停用决定需显式解除", authority: `historical-decision:${target}`, since: mergeTime, liftedAt: mergeTime, liftReason: op.reason });
@@ -710,6 +726,7 @@ export class FileKnowledgeStore implements KnowledgeStore {
 				}
 			}
 			const latest = new Map((await this.list()).map((record) => [record.id, record]));
+			const historicalLatest = new Map(latest);
 			const recordsToWrite: Array<{ opIndex: number; record: KnowledgeRecord }> = [];
 			for (const [opIndex, op] of proposal.ops.entries()) {
 				if (op.op === "limit" || op.op === "lift_limit") continue;
@@ -818,7 +835,10 @@ export class FileKnowledgeStore implements KnowledgeStore {
 
 			const historical = await this.allRecordVersions();
 			const allVersions = new Map([...historical, ...recordsToWrite.map((item) => item.record)].map((record) => [`${record.id}@${record.version}`, record]));
-			const impacts = this.findImpacts([...allVersions.values()], changedTargets);
+			const impactAnalysis = this.findImpacts([...allVersions.values()], changedTargets, latest,
+				new Set(recordsToWrite.map(({ record }) => `${record.id}@${record.version}`)), historicalLatest, await this.storeId());
+			const { impacts } = impactAnalysis;
+			warnings.push(...impactAnalysis.warnings);
 			for (const impact of impacts) {
 				const target = `${impact.id}@${impact.version}`;
 				if (nextLimits.some((limit) => !limit.liftedAt && limit.kind === "needs_recheck" && limit.target === target)) continue;
@@ -975,9 +995,10 @@ export class FileKnowledgeStore implements KnowledgeStore {
 			entries.set(id, { type: latest.type, versions, latestVersion: publishedVersion, qOpen: latest.type === "Q" ? latest.qStatus?.open !== false : undefined });
 		}
 		const limits = await this.limits();
-		const activeLimitTargets = limits.filter((limit) => !limit.liftedAt).map((limit) => limit.target);
-		for (const id of entries.keys()) if (await this.historicalDeactivation(id) && !limits.some((limit) => limit.target === id && limit.authority === `historical-decision:${id}` && !!limit.liftedAt)) activeLimitTargets.push(id);
-		return { entries, activeLimitTargets };
+		const activeLimits = limits.filter((limit) => !limit.liftedAt).map((limit) => ({ target: limit.target, authority: limit.authority }));
+		const historicalDecisionLifted = new Set([...entries.keys()].filter((id) => limits.some((limit) => limit.target === id && limit.authority === `historical-decision:${id}` && !!limit.liftedAt)));
+		for (const id of entries.keys()) if (await this.historicalDeactivation(id) && !historicalDecisionLifted.has(id)) activeLimits.push({ target: id, authority: `historical-decision:${id}` });
+		return { entries, activeLimits, historicalDecisionLifted };
 	}
 
 	/** Every published version (1..published) of every published record. */
@@ -1066,32 +1087,91 @@ export class FileKnowledgeStore implements KnowledgeStore {
 		return Boolean(target && target.id === record.id && (target.version === undefined || target.version === record.version));
 	}
 
-	private findImpacts(records: KnowledgeRecord[], changed: ChangedTarget[]): ImpactItem[] {
+	private findImpacts(records: KnowledgeRecord[], changed: ChangedTarget[], latest: Map<string, KnowledgeRecord>,
+		writtenVersions: ReadonlySet<string>, historicalLatest: Map<string, KnowledgeRecord>, localStoreId: string): { impacts: ImpactItem[]; warnings: string[] } {
 		const impacts: ImpactItem[] = [];
 		const seen = new Set<string>();
 		const reached = new Set<string>();
+		const allChanged = [...changed];
+		const byVersion = new Map(records.map((record) => [`${record.id}@${record.version}`, record]));
+		const referenced = (target: string, owner: KnowledgeRecord): KnowledgeRecord | undefined => {
+			const parsed = parseRecordTarget(target);
+			if (!parsed) return undefined;
+			if (parsed.version !== undefined) return byVersion.get(`${parsed.id}@${parsed.version}`);
+			return (writtenVersions.has(`${owner.id}@${owner.version}`) ? latest : historicalLatest).get(parsed.id);
+		};
+		const matches = (target: string, owner: KnowledgeRecord, frontier: ChangedTarget[]): boolean => {
+			const parsed = parseRecordTarget(target);
+			if (!parsed) return false;
+			// Newly written bare refs see the version this merge publishes; prior
+			// bare refs retain conservative version-change review. Old explicit pins
+			// also retain their existing review semantics.
+			const version = parsed.version ?? (writtenVersions.has(`${owner.id}@${owner.version}`)
+				? latest.get(parsed.id)?.version : undefined);
+			return frontier.some((item) => item.id === parsed.id &&
+				(item.allVersions || version === undefined || version === item.version));
+		};
+		const changedRecord = (record: KnowledgeRecord, frontier: ChangedTarget[]): boolean =>
+			frontier.some((item) => item.id === record.id && (item.allVersions || item.version === record.version));
 		let frontier = changed;
 		while (frontier.length) {
 			const next: ChangedTarget[] = [];
-			for (const record of records) for (const ref of record.refs) {
-				if (!IMPACT_RELATIONS.includes(ref.rel)) continue;
-				const target = parseRecordTarget(ref.target);
-				if (!target) continue;
-				if (!frontier.some((item) => item.id === target.id && (item.allVersions || target.version === undefined || target.version === item.version))) continue;
-				const via = `${ref.rel} ${ref.target}`;
-				const key = `${record.id}@${record.version}|${via}`;
-				if (seen.has(key)) continue;
+			const add = (record: KnowledgeRecord, via: string): void => {
+				const identity = `${record.id}@${record.version}`;
+				const key = `${identity}|${via}`;
+				if (seen.has(key)) return;
 				seen.add(key);
 				impacts.push({ id: record.id, version: record.version, via, mark: "needs_recheck" });
-				const recordVersion = `${record.id}@${record.version}`;
-				if (!reached.has(recordVersion)) {
-					reached.add(recordVersion);
+				if (!reached.has(identity)) {
+					reached.add(identity);
 					next.push({ id: record.id, version: record.version, allVersions: false });
 				}
+			};
+			for (const record of records) {
+				for (const target of [...record.scope, ...record.refs.filter((ref) => ref.rel === "applies_in").map((ref) => ref.target)])
+					if (matches(target, record, frontier)) add(record, `applies_in ${target}`);
+				for (const ref of record.refs) {
+					if (!isNecessaryPremise(ref)) continue;
+					const input = referenced(ref.target, record);
+					if (record.type === "J" && input && matches(ref.target, record, frontier))
+						add(record, `premise_of ${ref.target}`);
+					else if ((record.type === "C" || record.type === "E") && input?.type === "J" && changedRecord(record, frontier))
+						add(input, `premise_of ${record.id}@${record.version}`);
+				}
+				const experience = record.fields.experience === undefined ? undefined : validateExperienceDefinition(record.fields.experience).definition;
+				for (const required of experience?.requiredRefs ?? []) {
+					if (required.storeId !== localStoreId) continue;
+					const target = `${required.recordId}@${required.version}`;
+					if (matches(target, record, frontier)) add(record, `requiredRefs ${target}`);
+				}
+				if (record.type === "J" && changedRecord(record, frontier)) for (const ref of record.refs) {
+					const claim = ref.rel === "supports" ? referenced(ref.target, record) : undefined;
+					if (claim && (claim.type === "C" || claim.type === "K")) add(claim, `supports ${record.id}@${record.version}`);
+				}
 			}
+			allChanged.push(...next);
 			frontier = next;
 		}
-		return impacts.sort((left, right) => left.id.localeCompare(right.id) || left.via.localeCompare(right.via));
+		const relationWarnings = new Set<string>();
+		for (const record of records) for (const ref of record.refs) {
+			if (ref.rel === "premise_of" && !isNecessaryPremise(ref)) {
+				if (record.type === "J" ? matches(ref.target, record, allChanged) : changedRecord(record, allChanged))
+					relationWarnings.add(`论证局部输入待复核：${record.id}@${record.version} premise_of ${ref.target}（${ref.inputRole}）；不按项目已采用事实传播`);
+				continue;
+			}
+			if (ref.rel !== "supports" && ref.rel !== "checks") continue;
+			const target = referenced(ref.target, record);
+			if (!target) continue;
+			const targetChanged = matches(ref.target, record, allChanged);
+			const sourceChanged = changedRecord(record, allChanged);
+			const supportedClaim = record.type === "J" && ref.rel === "supports" && (target.type === "C" || target.type === "K");
+			if (targetChanged || sourceChanged && !supportedClaim)
+				relationWarnings.add(`关系待复核：${record.id}@${record.version} ${ref.rel} ${ref.target}（${ref.target.includes("@") ? "固定" : writtenVersions.has(`${record.id}@${record.version}`) ? "合入后" : "合入前"}目标 ${target.id}@${target.version}）；关联端在本次合入中变化或受限，不能据此判定记录本体失效`);
+		}
+		return {
+			impacts: impacts.sort((left, right) => left.id.localeCompare(right.id) || left.version - right.version || left.via.localeCompare(right.via)),
+			warnings: [...relationWarnings].sort(),
+		};
 	}
 
 	private async acquireLock(): Promise<void> {

@@ -15,14 +15,17 @@ import type { DeepSeekRequestViolation } from "./deepseek-request-contract.ts";
  * - `none`: pure reasoning, no tools at all (M01, M02, M03 answering, first M04).
  * - `read-dir`: a read-only file tool restricted to one directory (M06 material reading,
  *   later M04 rounds reading the knowledge pack directory). Nothing outside `root` is reachable.
- * - `execution`: selected Pi-native file/shell tools with `root` as their cwd. This is capability
- *   selection, not an OS sandbox; in particular, bash retains the current process permissions.
+ * - `execution`: selected Pi-native file/shell tools with `root` as their cwd. On macOS,
+ *   new execution sessions confine model-facing writes to work/TMPDIR through sandbox-exec;
+ *   this is a write boundary, not general process or network isolation.
  */
 export type ToolGrant =
 	| { kind: "none" }
 	| { kind: "read-dir"; root: string; toolName?: string; extraTools?: CustomToolSpec[] }
 	| { kind: "custom"; tools: CustomToolSpec[] }
-	| { kind: "execution"; root: string; tools: Array<"read" | "write" | "edit" | "bash">; /** Controller-owned disposable directory outside formal work. */ tempDir?: string };
+	| { kind: "execution"; root: string; tools: Array<"read" | "write" | "edit" | "bash">;
+		/** Host-owned feedback tools whose closures exist only in this live execution. */ extraTools?: CustomToolSpec[];
+		/** Controller-owned disposable directory outside formal work. */ tempDir?: string };
 
 export interface ToolParamSpec {
 	type: "string" | "number" | "boolean" | "string[]";
@@ -193,9 +196,11 @@ export interface ReadReturnEvent {
 	status: "returned" | "no-content" | "error";
 	/** Granted-root-relative path. */
 	path: string;
-	requested: { offset?: number; limit?: number };
-	/** One-based inclusive text lines actually sent to the model. */
-	returned: { startLine?: number; endLine?: number; truncated?: boolean; kind: "text" | "binary" | "unknown" };
+	requested: { offset?: number; limit?: number; textOffset?: number; textLimit?: number };
+	/** Legacy lines are one-based inclusive. Text offsets are zero-based,
+	 * half-open UTF-16 ranges of the exact file text actually returned. */
+	returned: { startLine?: number; endLine?: number; textOffset?: number; textEnd?: number; textTotal?: number;
+		truncated?: boolean; kind: "text" | "binary" | "unknown" };
 	/** Host-classified error from the exact bytes read by the confined tool. Other errors stay unclassified. */
 	error?: { kind: "offset-beyond-eof"; lineCount: number };
 	at: string;

@@ -40,7 +40,10 @@ export async function collectProjectionHistory(workspace: Workspace): Promise<{ 
   const events = await readProjectionEvents(workspace, id);
   if (!events.length) { legacyRunsWithoutEvents++; continue; }
   for (const event of events) {
-   if (!replayability(event).replayable || (event.purpose === "task-message" && event.deliveryStatus !== "submitted")) { unreplayableEvents++; continue; }
+   // The policy screen replays file caps only, not the surrounding task-message
+   // length. A prompt-limited projection is auditable but not a faithful sample
+   // for that narrower replay.
+   if (!replayability(event).replayable || (event.purpose === "task-message" && (event.deliveryStatus !== "submitted" || Boolean(event.taskPromptDeferredOrdinals?.length)))) { unreplayableEvents++; continue; }
    const texts = event.materials.filter((item) => item.mediaType === "text");
    const sizes = texts.map((item) => item.utf16CodeUnits!);
    samples.push({ eventId: event.eventId, purpose: event.purpose, policyVersionId: event.policyVersionId,

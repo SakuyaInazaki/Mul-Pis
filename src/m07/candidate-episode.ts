@@ -1,0 +1,201 @@
+/** One live builder session can inspect many already-run candidate evaluations. */
+import { copyFile, lstat, mkdir, readFile, realpath } from "node:fs/promises";
+import path from "node:path";
+import type { CustomToolSpec } from "../runner/types.ts";
+import { HarnessError } from "../types.ts";
+import { writeFileAtomic } from "../workspace.ts";
+import { candidateObservation, type CandidateVerifier, type FrozenCandidateFile } from "./candidate-evaluation.ts";
+import { availableCandidateByRef, candidateArchive, candidateSearchSnapshot, candidateSubjectId, globalCandidateBest, identicalSourceRefs } from "./candidate-archive.ts";
+import { candidateSearchBrief, candidateSearchFocus } from "./candidate-search.ts";
+import { compareCandidateObservations, projectCandidateFeedback, summarizeCandidateDiagnostics } from "./candidate-diagnostics.ts";
+import { isSafeRelativeOutputPath } from "./expected-output.ts";
+import type { CandidateObservationV1, CurrentGoal, M07TaskRecord } from "./types.ts";
+
+const within = (root: string, file: string) => file === root || file.startsWith(root + path.sep);
+
+export function createCandidateEpisodeTool(input: {
+	goal: CurrentGoal;
+	task: M07TaskRecord;
+	verifier: CandidateVerifier;
+	save: () => Promise<void>;
+}): CustomToolSpec {
+	let tail: Promise<void> = Promise.resolve();
+	const run = async (args: Record<string, unknown>): Promise<{ text: string }> => {
+		const { goal, task, verifier } = input;
+		const stringPaths = (value: unknown, label: string): string[] => {
+			if (!Array.isArray(value) || value.length === 0 || value.some(item => typeof item !== "string" || !isSafeRelativeOutputPath(item) || item === ".") || new Set(value).size !== value.length)
+				throw new HarnessError("m07.candidate", `${label} must contain distinct exact relative file paths`);
+			return value as string[];
+		};
+		const sourcePaths = stringPaths(args.sourcePaths, "sourcePaths");
+		const receiptPaths = stringPaths(args.receiptPaths, "receiptPaths");
+		if (new Set([...sourcePaths, ...receiptPaths]).size !== sourcePaths.length + receiptPaths.length)
+			throw new HarnessError("m07.candidate", "source and receipt paths must be distinct");
+		if (typeof args.hypothesis !== "string" || !args.hypothesis.trim() || args.hypothesis.length > 4000 ||
+			!["repair", "structure", "parameters"].includes(String(args.changeKind)) ||
+			!["solution", "diagnostic"].includes(String(args.intent)))
+			throw new HarnessError("m07.candidate", "hypothesis, changeKind and intent are required");
+		if (args.conditions !== undefined && (!Array.isArray(args.conditions) || args.conditions.length > 32 ||
+			args.conditions.some(item => typeof item !== "string" || !item.trim() || item.length > 1000)))
+			throw new HarnessError("m07.candidate", "conditions must be concise declared applicability statements");
+		if (args.changeSummary !== undefined && (typeof args.changeSummary !== "string" || !args.changeSummary.trim() || args.changeSummary.length > 4000))
+			throw new HarnessError("m07.candidate", "changeSummary must describe the declared edit");
+		const episode = task.episode;
+		if (!episode) throw new HarnessError("m07.candidate", "candidate episode was not initialized");
+		const parentCandidateId = args.parentCandidateId;
+		let parentRef: { taskId: string; candidateId: string } | undefined;
+		let parentObservation: CandidateObservationV1 | undefined;
+		let parentSubjectId: string | undefined;
+		if (parentCandidateId !== undefined) {
+			if (typeof parentCandidateId !== "string") throw new HarnessError("m07.candidate", "parentCandidateId must be an exact candidate reference");
+			if (/^C\d{3,}$/.test(parentCandidateId)) {
+				if (!episode.candidates.some(item => item.id === parentCandidateId))
+					throw new HarnessError("m07.candidate", "local parentCandidateId must name an earlier candidate in this episode");
+				parentRef = { taskId: task.taskId, candidateId: parentCandidateId };
+				const parent = await availableCandidateByRef(goal, `${task.taskId}/${parentCandidateId}`, task.taskId);
+				parentObservation = parent.observation;
+				parentSubjectId = parent.subjectId;
+			} else {
+				const parent = await availableCandidateByRef(goal, parentCandidateId, task.taskId);
+				parentRef = { taskId: parent.taskId, candidateId: parent.candidateId };
+				parentObservation = parent.observation;
+				parentSubjectId = parent.subjectId;
+			}
+		}
+		const episodeRoot = path.join(path.dirname(task.workDir), "episode");
+		await mkdir(episodeRoot, { recursive: true });
+		let nextNumber = episode.candidates.reduce((max, candidate) =>
+			Math.max(max, Number(candidate.id.slice(1))), 0) + 1;
+		const { id, root } = await (async () => {
+			for (;;) {
+				if (!Number.isSafeInteger(nextNumber)) throw new HarnessError("m07.candidate", "candidate identity overflow");
+				const id = `C${String(nextNumber).padStart(3, "0")}`;
+				const root = path.join(episodeRoot, id);
+				try { await mkdir(root); return { id, root }; }
+				catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+					nextNumber++;
+				}
+			}
+		})();
+		const workRoot = await realpath(task.workDir);
+		const frozen = async (declared: string[], kind: "sources" | "receipts"): Promise<FrozenCandidateFile[]> => {
+			const files: FrozenCandidateFile[] = [];
+			for (let index = 0; index < declared.length; index++) {
+				const declaredPath = declared[index];
+				const source = path.resolve(workRoot, declaredPath);
+				if (!within(workRoot, source)) throw new HarnessError("m07.candidate", "candidate path escaped work directory");
+				const info = await lstat(source);
+				if (!info.isFile() || info.isSymbolicLink()) throw new HarnessError("m07.candidate", `candidate path is not a regular file: ${declaredPath}`);
+				const originalPath = await realpath(source);
+				if (!within(workRoot, originalPath)) throw new HarnessError("m07.candidate", "candidate path escaped work directory");
+				const target = path.join(root, kind, `${String(index).padStart(3, "0")}-${path.basename(source)}`);
+				await mkdir(path.dirname(target), { recursive: true });
+				await copyFile(originalPath, target);
+				if (!(await readFile(originalPath)).equals(await readFile(target))) throw new HarnessError("m07.candidate", "candidate file changed while freezing evidence");
+				files.push({ declaredPath, originalPath, frozenPath: await realpath(target) });
+			}
+			return files;
+		};
+		const sources = await frozen(sourcePaths, "sources");
+		const receipts = await frozen(receiptPaths, "receipts");
+		const identicalRefs = await identicalSourceRefs(goal, task.taskId, sources.map(file => file.frozenPath));
+		const lastRef = episode.candidates.at(-1)?.id;
+		let result: Awaited<ReturnType<CandidateVerifier["verifyTask"]>>;
+		const evaluationTask = structuredClone(task);
+		evaluationTask.candidate = { sourcePaths, receiptPaths,
+			changeKind: args.changeKind as "repair" | "structure" | "parameters",
+			intent: args.intent as "solution" | "diagnostic" };
+		try { result = await verifier.verifyTask({ goal: structuredClone(goal), task: evaluationTask, sources, receipts }); }
+		catch (error) { result = { sourceBinding: "unknown", correctness: "unknown", stage: "verification-unavailable", metrics: [], limitations: [`Host candidate verification failed: ${(error as Error).message}`] }; }
+		for (const file of [...sources, ...receipts])
+			if (!(await readFile(file.originalPath)).equals(await readFile(file.frozenPath)))
+				throw new HarnessError("m07.candidate", "candidate source or receipt changed during verification");
+		let observation: CandidateObservationV1;
+		try { observation = candidateObservation(result, verifier, goal, task, sources, receipts); }
+		catch (error) { observation = candidateObservation({ sourceBinding: "unknown", correctness: "unknown",
+			stage: "verification-unavailable", metrics: [],
+			limitations: [`Host candidate observation is unusable: ${(error as Error).message}`] },
+			verifier, goal, task, sources, receipts); }
+		const currentSubjectId = candidateSubjectId(task.subjectId, observation);
+		const historical = new Map(candidateArchive(goal, task.taskId).map(entry => [entry.ref, entry]));
+		const sourceRepetition = lastRef && identicalRefs.includes(`${task.taskId}/${lastRef}`) ? "duplicate_code" :
+			currentSubjectId && identicalRefs.some(ref => {
+				const entry = historical.get(ref);
+				return entry && candidateSubjectId(entry.subjectId, entry.observation) === currentSubjectId;
+			}) ? "code_cycle" : undefined;
+		const parentComparison = parentObservation ? compareCandidateObservations(parentObservation, observation,
+			{ parentSubjectId, candidateSubjectId: task.subjectId }) : undefined;
+		const diagnosticSummary = summarizeCandidateDiagnostics(observation, parentComparison, parentObservation);
+		const observationPath = path.join(root, "observation.json");
+		const observationText = `${JSON.stringify({ version: 1, id, parentCandidateId, parentRef,
+			identicalSourceRefs: identicalRefs, sourceRepetition, sourcePaths, receiptPaths, hypothesis: args.hypothesis,
+			conditions: args.conditions, changeSummary: args.changeSummary, changeKind: args.changeKind,
+			intent: args.intent, parentComparison, diagnosticSummary, observation }, null, 2)}\n`;
+		await writeFileAtomic(observationPath, observationText);
+		episode.candidates.push({ id, ...(parentCandidateId ? { parentCandidateId } : {}),
+			...(parentRef ? { parentRef } : {}), ...(identicalRefs.length ? { identicalSourceRefs: identicalRefs } : {}),
+			...(sourceRepetition ? { sourceRepetition } : {}),
+			sourcePaths, receiptPaths, hypothesis: args.hypothesis as string,
+			...(args.conditions ? { conditions: args.conditions as string[] } : {}),
+			...(args.changeSummary ? { changeSummary: args.changeSummary as string } : {}),
+			...(parentComparison ? { parentComparison } : {}),
+			changeKind: args.changeKind as "repair" | "structure" | "parameters", intent: args.intent as "solution" | "diagnostic", observation, observationPath });
+		episode.currentCandidateId = id;
+		const searchSnapshot = await candidateSearchSnapshot(goal, task.taskId);
+		// Derive the local display from the same readable, subject-isolated evidence as
+		// candidate_list. Historical candidates remain intact even if a file is missing.
+		episode.incumbents = globalCandidateBest(searchSnapshot.available.filter(entry => entry.taskId === task.taskId))
+			.map(best => ({ candidateId: best.candidateRef.slice(task.taskId.length + 1), metric: best.metric,
+				...(best.subjectId ? { subjectId: best.subjectId } : {}) }));
+		await input.save();
+		const searchBrief = candidateSearchBrief(searchSnapshot.facts, searchSnapshot.available,
+			candidateSearchFocus(searchSnapshot.available, task.subjectId));
+		return { text: JSON.stringify({ candidateId: id, candidateRef: `${task.taskId}/${id}`, searchBrief,
+			parentCandidateId: parentCandidateId ?? null,
+			parentRef: parentRef ?? null, ...projectCandidateFeedback(observation, parentComparison),
+			diagnosticSummary: { stage: diagnosticSummary.stage, hostStage: diagnosticSummary.hostStage,
+				terminalEvaluations: diagnosticSummary.terminalEvaluations,
+				nonterminalEvaluations: diagnosticSummary.nonterminalEvaluations,
+				cases: diagnosticSummary.cases, diagnostics: diagnosticSummary.diagnostics,
+				parentMeasuredChange: diagnosticSummary.parentMeasuredChange,
+				profilerInterpretation: diagnosticSummary.profilerInterpretation,
+				diagnosticLocations: diagnosticSummary.diagnosticLocations.slice(0, 6),
+				omittedDiagnosticLocations: Math.max(0, diagnosticSummary.diagnosticLocations.length - 6),
+				profileInterpretations: diagnosticSummary.profileInterpretations.slice(0, 3).map(({ counters, ...profile }) => ({
+					...profile, counterCount: counters.length, counters: counters.slice(0, 3), omittedCounters: Math.max(0, counters.length - 3) })),
+				omittedProfileInterpretations: Math.max(0, diagnosticSummary.profileInterpretations.length - 3),
+				referenceContrastCount: diagnosticSummary.referenceContrasts.length,
+				timingComparisons: diagnosticSummary.timingComparisons.slice(0, 3),
+				omittedTimingComparisons: Math.max(0, diagnosticSummary.timingComparisons.length - 3),
+				inspection: diagnosticSummary.inspection },
+			identicalSourceRefs: identicalRefs, sourceRepetition: sourceRepetition ?? null,
+			projection: { kind: "indexed", fullObservationPath: observationPath,
+				fullObservationChars: observationText.length, units: "utf16",
+				read: { tool: "candidate_read", args: { candidateRef: `${task.taskId}/${id}`, kind: "observation", offset: 0, limit: 6000 } },
+				message: "Case rows retain measurements within display space and prioritize failed/unknown cases. Parent case deltas show negative/unknown cases and regressions first. Diagnostic indexes show a first entry per category before others within display space. Counts include omitted entries. JSON paths refer to the full frozen observation; diagnostic fieldPath refers to its original receipt (candidate_read kind:receipt, fileIndex:receiptIndex). Use returned nextOffset to continue file reads. A preview/index is not full reading or causal interpretation; all original facts and parent comparisons are retained." },
+			currentCandidateId: episode.currentCandidateId, incumbents: episode.incumbents,
+			message: observation.sourceBinding === "unknown" || observation.correctness === "unknown"
+				? "Existing result is unknown. Inspect or reconcile its original operation and receipt before considering any new side effect; do not infer that resubmission is safe."
+				: "This records an existing evaluation only. Parent, conditions and change summary are model declarations, not host-proven causality. Equal source bytes are planning facts, not a rejection. A negative finding can guide repair, but does not satisfy the original goal; exploration parent and verified incumbent remain separate." }) };
+	};
+	return {
+		name: "candidate_evaluate",
+		description: "Freeze candidate source and original receipt files already in this task's work directory, then obtain immediate trusted host observations. This tool never submits, compiles or reruns a candidate.",
+		params: {
+			sourcePaths: { type: "string[]", description: "Exact relative source file paths in this task work directory" },
+			receiptPaths: { type: "string[]", description: "Exact relative original platform receipt file paths" },
+			hypothesis: { type: "string", description: "What this candidate tests or changes" },
+			changeKind: { type: "string", description: "repair, structure, or parameters" },
+			intent: { type: "string", description: "solution or diagnostic" },
+			parentCandidateId: { type: "string", description: "Earlier local Cxxx or exact same-goal Txxx/Cxxx candidate reference, if declared as parent", optional: true },
+			conditions: { type: "string[]", description: "Optional model-declared applicability or prerequisites; not host-verified causal facts", optional: true },
+			changeSummary: { type: "string", description: "Optional model-declared description of the actual source change", optional: true },
+		},
+		execute(args) {
+			const current = tail.then(() => run(args));
+			tail = current.then(() => undefined, () => undefined);
+			return current;
+		},
+	};
+}

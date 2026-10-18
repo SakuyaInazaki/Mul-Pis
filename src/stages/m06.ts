@@ -10,15 +10,19 @@
  * material directory; the applicability session gets no tools.
  */
 import { existsSync } from "node:fs";
-import { readdir, stat } from "node:fs/promises";
+import { lstat, readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { linkedEvidence, openBoundedSession } from "../context/boundary.ts";
+import type { ReadReturnEvent } from "../runner/types.ts";
+import { textReadCoverage } from "../runner/read-coverage.ts";
+import { isTextFile } from "../media.ts";
 import { buildM06ApplicabilityMessage, buildM06CheckMessage, buildM06ReadMessage, problemBlock, section, systemPromptFor } from "../prompts.ts";
 import { renderPageTool } from "../tools/pagetool.ts";
 import { HarnessError, type InputRef, type StageRunRecord } from "../types.ts";
 import { readTextIfExists } from "../workspace.ts";
 import { retrieveKnowledge } from "../knowledge/retrieval.ts";
 import { loadProblemMaterials, readOutput, relPath, sessionSpec, withRun, type StageContext } from "./context.ts";
+import { freezeStageArtifacts } from "./artifacts.ts";
 
 export interface M06Options {
 	/** Source ids under references/sources (e.g. S001). Empty means every registered source. */
@@ -103,7 +107,10 @@ export async function runM06(ctx: StageContext, options: M06Options = {}): Promi
 			await ctx.ws.writeOutput(record, "project-state.md", state.text, "本批统一使用的当前项目状态");
 			record.remarks.push(`适用性分析统一使用同一项目状态：${state.note}`);
 
-			const groups: M06Group[] = sources.map((s) => ({ sourceId: s.id, title: s.title, dir: s.dir, status: "failed", readCoverage: [], renderedPages: [], checkCoverage: [], outputs: [] }));
+			const frozen = await freezeStageArtifacts(path.join(ctx.ws.runDir("M06", record.runId), "frozen"),
+				sources.map((source) => ({ label: source.id, path: source.dir, sourceCategory: "registered-source" })), "M06", record.runId);
+			const groups: M06Group[] = sources.map((s, index) => ({ sourceId: s.id, title: s.title,
+				dir: frozen.entries[index]!.frozenPath, status: "failed", readCoverage: [], renderedPages: [], checkCoverage: [], outputs: [] }));
 			const limit = Math.max(1, ctx.config.concurrency);
 			let next = 0;
 			const worker = async (): Promise<void> => {
@@ -116,7 +123,7 @@ export async function runM06(ctx: StageContext, options: M06Options = {}): Promi
 
 			const failed = groups.filter((g) => g.status === "failed");
 			for (const g of failed) record.failures.push(`资料组 ${g.sourceId} 未完成：${g.failure}`);
-			const summary = renderBatchSummary(ctx, groups);
+			const summary = renderBatchSummary(ctx, groups, options.fullText ?? false);
 			const summaryRef = await ctx.ws.writeOutput(record, "batch-summary.md", summary, "整批汇总");
 			await ctx.ws.writeOutput(record, "batch.json", JSON.stringify(groups.map(({ reading, check, applicability, ...rest }) => rest), null, 2), "整批结构化结果");
 			record.remarks.push(`共 ${groups.length} 组，完成 ${groups.length - failed.length} 组，失败 ${failed.length} 组；整批一起交给 M04（m04 --from M06）。`);
@@ -124,6 +131,34 @@ export async function runM06(ctx: StageContext, options: M06Options = {}): Promi
 		},
 		() => "按来源分组，每组依次运行阅读、核对、适用性三个独立会话；阅读与核对会话只持有限定在材料目录的只读工具；适用性会话使用同一份项目状态。失败组保留实际范围；整批汇总后交给 M04，不逐篇先处理。",
 	);
+}
+
+/** `fullText` certifies the obtained UTF-8 text, not unseen PDF pages or images. */
+async function assertFullRegisteredTextReads(root: string, returned: ReadReturnEvent[]): Promise<void> {
+	const texts: string[] = [];
+	let hasPdf = false;
+	const visit = async (dir: string): Promise<void> => {
+		for (const name of (await readdir(dir)).sort()) {
+			const file = path.join(dir, name);
+			const info = await lstat(file);
+			if (info.isSymbolicLink()) throw new HarnessError("m06.full-text", `登记来源包含符号链接：${file}`);
+			if (info.isDirectory()) await visit(file);
+			else if (info.isFile()) {
+				if (path.extname(file).toLowerCase() === ".pdf") hasPdf = true;
+				if (isTextFile(file)) texts.push(path.relative(root, file));
+			}
+		}
+	};
+	await visit(root);
+	if (hasPdf && !texts.some((file) => file !== "source.md"))
+		throw new HarnessError("m06.full-text", "PDF 来源没有可核验的登记文本层；不能声称全文文本已读");
+	if (!texts.length) throw new HarnessError("m06.full-text", "登记来源没有可核验的文本文件");
+	const missing: string[] = [];
+	for (const relative of texts) {
+		const content = await readFile(path.join(root, relative), "utf8");
+		if (!textReadCoverage(content, relative, returned, "material_read").complete) missing.push(relative);
+	}
+	if (missing.length) throw new HarnessError("m06.full-text", `登记文本未完整返回阅读会话：${missing.join("、")}`);
 }
 
 async function processGroup(ctx: StageContext, record: StageRunRecord, group: M06Group, options: M06Options, projectState: string): Promise<void> {
@@ -143,7 +178,10 @@ async function processGroup(ctx: StageContext, record: StageRunRecord, group: M0
 			const turn = await reader.prompt(buildM06ReadMessage({ ...source, requirements: options.requirements, fullText: options.fullText ?? false }));
 			group.reading = turn.text;
 			group.readCoverage = reader.readCoverage();
-			group.outputs.push(await ctx.ws.writeOutput(record, `${group.sourceId}/reading.md`, turn.text, `${group.sourceId} 阅读记录`));
+			const returned = reader.readReturnEvents();
+			group.outputs.push(await ctx.ws.writeOutput(record, `frozen/reports/${group.sourceId}/reading.md`, turn.text, `${group.sourceId} 阅读记录`));
+			group.outputs.push(await ctx.ws.writeOutput(record, `frozen/reports/${group.sourceId}/reading-coverage.json`, JSON.stringify({ filesAccessed: group.readCoverage, returnedRanges: returned }, null, 2), `${group.sourceId} 阅读实际返回范围`));
+			if (options.fullText) await assertFullRegisteredTextReads(group.dir, returned);
 		} finally {
 			reader.dispose();
 		}
@@ -156,7 +194,7 @@ async function processGroup(ctx: StageContext, record: StageRunRecord, group: M0
 			const turn = await checker.prompt(buildM06CheckMessage(source, group.reading));
 			group.check = turn.text;
 			group.checkCoverage = checker.readCoverage();
-			group.outputs.push(await ctx.ws.writeOutput(record, `${group.sourceId}/check.md`, turn.text, `${group.sourceId} 核对记录`));
+			group.outputs.push(await ctx.ws.writeOutput(record, `frozen/reports/${group.sourceId}/check.md`, turn.text, `${group.sourceId} 核对记录`));
 		} finally {
 			checker.dispose();
 		}
@@ -166,7 +204,7 @@ async function processGroup(ctx: StageContext, record: StageRunRecord, group: M0
 			const verified = `${group.reading}\n\n${section("核对记录", group.check)}`;
 			const turn = await applicability.prompt(buildM06ApplicabilityMessage(source, verified, projectState));
 			group.applicability = turn.text;
-			group.outputs.push(await ctx.ws.writeOutput(record, `${group.sourceId}/applicability.md`, turn.text, `${group.sourceId} 适用性分析`));
+			group.outputs.push(await ctx.ws.writeOutput(record, `frozen/reports/${group.sourceId}/applicability.md`, turn.text, `${group.sourceId} 适用性分析`));
 		} finally {
 			applicability.dispose();
 		}
@@ -177,8 +215,9 @@ async function processGroup(ctx: StageContext, record: StageRunRecord, group: M0
 	}
 }
 
-function renderBatchSummary(ctx: StageContext, groups: M06Group[]): string {
-	const lines: string[] = ["# M06 整批汇总", "", "本汇总只是把各资料组的实际产物放在一起交给 M04；所有建议均待 M04 处理，入库前不构成项目认识。", ""];
+function renderBatchSummary(ctx: StageContext, groups: M06Group[], fullText: boolean): string {
+	const lines: string[] = ["# M06 整批汇总", "", "本汇总只是把各资料组的实际产物放在一起交给 M04；所有建议均待 M04 处理，入库前不构成项目认识。", "",
+		`- 登记文本全文读取核验：${fullText ? "已请求；完成组的冻结登记文本均有实际返回范围证据" : "未请求"}。此项不认证 PDF 未提取内容或未取得页面。`, ""];
 	for (const g of groups) {
 		lines.push(`## ${g.sourceId}：${g.title}`, "", `- 状态：${g.status === "completed" ? "完成" : `失败：${g.failure}`}`);
 		lines.push(`- 阅读实际读取文件：${g.readCoverage.length ? g.readCoverage.join("、") : "无"}`);

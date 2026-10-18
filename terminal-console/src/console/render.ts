@@ -35,6 +35,18 @@ export interface ConsoleView {
 export interface HitTarget { x: number; y: number; width: number; height: number; action: "stage" | "knowledge" | "node" | "node-toggle" | "knowledge-record" | "kind" | "tree" | "detail" | "runs" | "snapshots" | "documents" | "popup" | "reader" | "reader-close" | "key" | "detail-scroll" | "reader-scroll" | "popup-scroll"; value?: string }
 export interface ConsoleFrame { lines: string[]; targets: HitTarget[]; detailRows: number; detailLines: number; readerRows: number; readerLines: number; popupRows: number; popupLines: number; popupOffset: number }
 export function defaultCollapsed(snapshot: WorkflowSnapshot): Set<string> { return new Set(snapshot.nodes.filter(n => (n.kind === "task" || n.kind === "session") && n.status !== "running").map(n => n.id)); }
+/** Choose the persisted active task once; later refreshes keep the reader's selection and folds. */
+export function workflowFocus(snapshot: WorkflowSnapshot, selectedId?: string, collapsed?: Set<string>): { selectedId?: string; collapsed: Set<string> } {
+	const byId = new Map(snapshot.nodes.map(node => [node.id, node]));
+	if (selectedId && byId.has(selectedId)) return { selectedId, collapsed: collapsed ?? defaultCollapsed(snapshot) };
+	const current = snapshot.goal?.currentTaskId ? snapshot.nodes.find(node => node.kind === "task" &&
+		node.runId === snapshot.goal?.id && node.taskId === snapshot.goal?.currentTaskId) : undefined;
+	const selected = current ?? snapshot.nodes.find(node => node.kind === "task" && node.status === "running") ??
+		snapshot.nodes.find(node => node.kind === "run");
+	const folds = defaultCollapsed(snapshot);
+	for (let node = selected; node?.parentId; node = byId.get(node.parentId)) folds.delete(node.parentId);
+	return { selectedId: selected?.id, collapsed: folds };
+}
 export function visibleNodes(snapshot: WorkflowSnapshot | undefined, collapsed: Set<string>, query = ""): Array<{ node: WorkflowNode; depth: number }> {
 	if (!snapshot) return [];
 	let nodes = snapshot.nodes.filter(n => n.kind !== "stage");
@@ -62,13 +74,26 @@ export function hitTest(frame: ConsoleFrame, x: number, y: number): HitTarget | 
 
 interface TreeLine extends Line { id: string; first: boolean; toggle?: number; stateAt?: number; stateText?: string; stateTone?: Tone }
 function selectedTone(tone: Tone): Tone { return tone === "green" ? "selectedGreen" : tone === "red" ? "selectedRed" : tone === "yellow" ? "selectedYellow" : "selectedDim"; }
-function knowledgeTone(status: string): Tone { return status === "adopted" ? "green" : ["withdrawn", "replaced"].includes(status) ? "dim" : status === "suspended" ? "yellow" : "plain"; }
+function knowledgeAvailabilityLabel(value: string | undefined): string {
+	switch (value) {
+		case "usable_conditionally": return "有条件可用";
+		case "exploratory_only": return "仅供探索";
+		case "needs_recheck": return "需复查";
+		case "not_allowed": return "不可使用";
+		case "unrecorded": return "当前未发布";
+		default: return "实时状态未核";
+	}
+}
+function knowledgeTone(availability: string | undefined): Tone {
+	return availability === "usable_conditionally" ? "green" : availability === "not_allowed" ? "red" :
+		availability === "needs_recheck" || availability === "exploratory_only" ? "yellow" : "dim";
+}
 function identityInTree(n: WorkflowNode): string { return n.kind === "run" ? `${n.stage ?? "工作流"} 阶段运行` : n.kind === "session" ? n.label || "会话" : nodeIdentity(n); }
 function readingLines(raw: string[], width: number, overview = false): Line[] {
 	return raw.flatMap(line => line.split(/\r?\n/).flatMap(text => {
 		const tone: Tone = /^(?:节点：|任务标题：|目标标题：|#{1,3} |正文：|限制明细：|完整记录元数据：)/.test(text) ? "heading"
 			: overview && /^(?:阶段：|运行：|会话：|开始：|结束：|最近心跳：)/.test(text) ? "dim"
-			: /^当前生效限制：/.test(text) && !text.endsWith("无") ? "yellow" : "plain";
+			: /^本记录直接限制：/.test(text) && !text.endsWith("无") ? "yellow" : "plain";
 		return wrap(text.replace(/\t/g, "    "), width).map(text => ({ text, tone }));
 	}));
 }
@@ -131,7 +156,8 @@ export function renderFrame(view: ConsoleView, width: number, height: number, co
 			let count = 0;
 			if (knowledge) {
 				if (view.knowledgeKind === "限制") { append("limits", "现行限制", `${view.knowledge?.limits.filter(l => !l.liftedAt).length ?? 0} 生效`, "yellow"); count = 1; }
-				else { const records = knowledgeRecords(view); count = records.length; for (const r of records) append(r.id, `${r.id} @${r.version}`, knowledgeStatusLabel(r.status), knowledgeTone(r.status)); }
+				else { const records = knowledgeRecords(view); count = records.length; for (const r of records) append(r.id, `${r.id} @${r.version}`,
+					`${knowledgeStatusLabel(r.status)} · ${knowledgeAvailabilityLabel(r.availability?.availability)}`, knowledgeTone(r.availability?.availability)); }
 			} else {
 				const visible = visibleNodes(snap, view.collapsed, view.query), children = new Set(snap?.nodes.map(n => n.parentId)), last: boolean[] = [];
 				count = visible.length;

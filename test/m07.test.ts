@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { createM07Controller } from "../src/m07/controller.ts";
+import { readProjectionEvents, replayability } from "../src/improvement/observations.ts";
 
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 
@@ -91,20 +92,62 @@ test("M07 loads only explicitly selected pinned experience and does not claim it
 
 test("delegate is fresh and returned is not accepted; retry is a new retained task", async (t) => {
 	const f = await fixture(t); const goal = await f.controller.begin(begin);
-	const input = path.join(f.root, "input.txt"); await writeFile(input, "fixed input\n");
-	const first = await f.controller.delegate(goal.runId, { objective: "运行局部实验", inputs: [input], expectedOutputs: ["result.txt"], checks: ["结果文件存在且口径正确"], mode: "execute" });
+	const input = path.join(f.root, "input.cu"); await writeFile(input, "fixed input\n");
+	const header = path.join(f.root, "input.cuh"); await writeFile(header, "CUDA-HEADER-MARKER\n");
+	const first = await f.controller.delegate(goal.runId, { objective: "运行局部实验", inputs: [input, header], expectedOutputs: ["result.txt"], checks: ["结果文件存在且口径正确"], mode: "execute" });
 	const executionMessage = [...f.runner.sessions.values()].at(-1)!.transcript[0].text;
 	assert.match(executionMessage, /先做本地可完成的语法、类型、编译与兼容性预检/);
 	assert.match(executionMessage, /M05\/M06→M04/);
 	assert.match(executionMessage, /fixed input/);
-	assert.match(executionMessage, /inputs\/001-input\.txt/);
+	assert.match(executionMessage, /inputs\/001-input\.cu/);
+	assert.match(executionMessage, /inputs\/002-input\.cuh/);
+	assert.match(executionMessage, /CUDA-HEADER-MARKER/, "CUDA source and header text are exposed under the ordinary input budget");
+	assert.ok(executionMessage.indexOf("【外部执行与可消耗资源】") < executionMessage.indexOf("【本任务】"),
+		"stable execution controls precede changing task material");
 	assert.equal(first.status, "returned");
 	assert.equal(f.runner.created.at(-1)?.tools.kind, "execution");
-	assert.equal(first.inputCopies.length, 1);
+	assert.equal(first.inputCopies.length, 2);
+	assert.ok(first.inputCopies.every(copy => copy.mediaType === "text"));
 	await assert.rejects(f.controller.finish(goal.runId, { outcome: "fulfilled", summary: "不能成立", returnPath: "M08", goalChecks: begin.successCriteria.map((criterion) => ({ criterion, result: "not_run", evidence: [] })) }), /fulfilled/);
-	const retried = await f.controller.delegate(goal.runId, { objective: "运行局部实验", inputs: [input], expectedOutputs: ["result.txt"], checks: ["结果文件存在且口径正确"], mode: "execute", parentTaskId: first.taskId, supersedesTaskId: first.taskId });
+	const retried = await f.controller.delegate(goal.runId, { objective: "运行局部实验", inputs: [input, header], expectedOutputs: ["result.txt"], checks: ["结果文件存在且口径正确"], mode: "execute", parentTaskId: first.taskId, supersedesTaskId: first.taskId });
 	assert.notEqual(retried.taskId, first.taskId);
+	const retryMessage = [...f.runner.sessions.values()].at(-1)!.transcript[0].text;
+	assert.equal(retryMessage.split("【本任务创建时的目标计划】")[0], executionMessage.split("【本任务创建时的目标计划】")[0],
+		"new task paths and operation IDs do not break the reusable control prefix");
 	assert.equal((await f.controller.status(goal.runId)).tasks.length, 2);
+});
+
+test("prompt capacity defers whole inputs and a failed pre-dispatch retry archives its old work", async (t) => {
+	const f = await fixture(t);
+	await activateBudget(f.root, { version: 1, maxPromptChars: 12_000, maxInlineFileChars: 11_000, maxAggregateInlineChars: 11_000, maxFeedbackChars: 4_000, overflowMode: "manifest-and-defer" });
+	const goal = await f.controller.begin(begin);
+	const oldInput = path.join(f.root, "old.txt");
+	const nextInput = path.join(f.root, "next.txt");
+	const lateInput = path.join(f.root, "late.txt");
+	await writeFile(oldInput, "old-only-input\n");
+	await writeFile(nextInput, "NEXT-UNIQUE-" + "x".repeat(10_900));
+	await writeFile(lateInput, "LATE-UNIQUE-" + "y".repeat(2_000));
+	await assert.rejects(f.controller.delegate(goal.runId, { objective: "unlaunchable " + "z".repeat(15_000), inputs: [oldInput], expectedOutputs: [], checks: ["recorded"], mode: "reason" }), /prompt 预算/);
+	assert.equal((await f.controller.status(goal.runId)).tasks.length, 0);
+	const task = await f.controller.delegate(goal.runId, { objective: "read the frozen input", inputs: [nextInput, lateInput], expectedOutputs: [], checks: ["recorded"], mode: "reason" });
+	assert.equal(task.taskId, "T001");
+	const message = await readFile(path.join(f.ws.runDir("M07", goal.runId), "tasks", "T001", "message.md"), "utf8");
+	assert.match(message, /next\.txt/);
+	assert.match(message, /已显示字符 无（0 字符）/);
+	assert.doesNotMatch(message, /NEXT-UNIQUE-/);
+	assert.doesNotMatch(message, /LATE-UNIQUE-/);
+	assert.deepEqual(await readdir(path.join(task.workDir, "inputs")), ["001-next.txt", "002-late.txt"]);
+	const archiveRoot = path.join(f.ws.runDir("M07", goal.runId), "undispatched-task-attempts");
+	const archived = (await readdir(archiveRoot)).find((name) => /^T001-[0-9a-f-]+$/.test(name));
+	assert.ok(archived);
+	assert.equal(await readFile(path.join(archiveRoot, archived, "work", "inputs", "001-old.txt"), "utf8"), "old-only-input\n");
+	assert.equal(JSON.parse(await readFile(path.join(archiveRoot, `${archived}.json`), "utf8")).status, "not-dispatched");
+	const event = (await readProjectionEvents(f.ws, goal.runId)).findLast((entry) => entry.purpose === "task-message" && entry.projectionStatus === "materialized");
+	assert.ok(event);
+	assert.equal(event.materials[0].decision, "deferred");
+	assert.equal(event.materials[1].decision, "deferred", "the later file must not be silently re-inlined after the larger file is omitted");
+	assert.deepEqual(event.taskPromptDeferredOrdinals, [0, 1]);
+	assert.equal(replayability(event).replayable, true);
 });
 
 

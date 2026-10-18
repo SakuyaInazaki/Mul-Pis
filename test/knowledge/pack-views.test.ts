@@ -4,8 +4,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { createFileKnowledgeStore } from "../../src/knowledge/store.ts";
+import { renderKnowledgeIndexRecord, renderKnowledgeRecord } from "../../src/knowledge/pack.ts";
 import { retrieveKnowledge } from "../../src/knowledge/retrieval.ts";
-import type { KnowledgeStore, ProposalBatch } from "../../src/knowledge/types.ts";
+import type { KnowledgeStore, ProposalBatch, KnowledgeRecord, Limit } from "../../src/knowledge/types.ts";
 
 async function fixture(t: TestContext): Promise<{ dir: string; store: KnowledgeStore }> {
 	const dir = await mkdtemp(path.join(tmpdir(), "pre-rsi-pack-"));
@@ -90,4 +91,24 @@ test("both bounded knowledge packs show complete record fields and local store i
 	assert.equal(manyOmitted.omitted.length, 41);
 	assert.match(manyOmitted.markdown, /未展开 41 项/);
 	assert(manyOmitted.markdown.length <= 200);
+});
+
+
+test("discovery indexes locate restrictions without repeating long reasons across historical versions", () => {
+	const record: KnowledgeRecord = { id: "K001", version: 1, type: "K", title: "Conditional method", body: "Original method body",
+		fields: { retrieval: { context: { backend: "sample", appliedTransforms: ["staging"] } } },
+		refs: [{ rel: "applies_in", target: "X001" }], scope: ["X001"], usageDecision: "adopted",
+		createdAt: "2026-10-18T00:00:00Z", source: { stage: "M04", runId: "test" } };
+	const reason = "COMPLETE-RESTRICTION-REASON ".repeat(500);
+	const limits: Limit[] = [{ target: "K001", kind: "needs_recheck", reason, authority: "M04", since: record.createdAt }];
+	const report = { id: record.id, version: 1, availability: "needs_recheck" as const, reasons: [reason] };
+	const index = Array.from({ length: 20 }, (_, i) => renderKnowledgeIndexRecord({ ...record, version: i + 1 },
+		{ ...report, version: i + 1 }, limits, 20)).join("\n");
+	assert.doesNotMatch(index, /COMPLETE-RESTRICTION-REASON|Original method body/);
+	assert.match(index, /"kind":"needs_recheck","target":"K001","count":1/);
+	assert.match(index, /"rel":"applies_in","target":"X001"/);
+	assert.match(index, /"appliedTransforms":\["staging"\]/);
+	assert.match(index, /K001@20/);
+	assert.ok(index.length < reason.length * 2, "historical discovery must not repeat each full restriction reason");
+	assert.ok(renderKnowledgeRecord(record, report, limits, 20).includes(reason), "full record rendering still exposes complete restriction reasons");
 });

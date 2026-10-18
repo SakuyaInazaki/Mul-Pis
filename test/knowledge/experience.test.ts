@@ -53,7 +53,15 @@ test("bounded selection keeps pinned evidence, argument and context together; li
 	const revoked = await provider.select(query([selected]));
 	assert.equal(revoked.status, "incomplete");
 	assert.equal(revoked.markdown, "");
-	assert.match(revoked.omitted.map((item) => item.reason).join(" "), /availability:not_allowed/);
+	assert(revoked.omitted.some((item) => item.ref.recordId === "K001" && item.reason === "availability:needs_recheck"),
+		"the withdrawn required input first restricts the selected root");
+	assert.equal((await store.availability("E001", 1)).availability, "not_allowed", "the pinned input remains withdrawn");
+	await apply(store, [{ op: "lift_limit", target: "K001@1", reason: "Test the independent dependency gate", authority: "M04" }]);
+	const stillRevoked = await provider.select(query([selected]));
+	assert.equal(stillRevoked.status, "incomplete");
+	assert.equal(stillRevoked.markdown, "");
+	assert(stillRevoked.omitted.some((item) => item.ref.recordId === "E001" && item.reason === "availability:not_allowed"),
+		"lifting the derived root limit cannot make its withdrawn required input reusable");
 	assert.equal((await store.get("E001", 1))?.body, "测量仅在给定环境成立", "withdrawn evidence remains readable for historical review");
 });
 
@@ -77,9 +85,17 @@ test("versioned X scope matches only its pinned version through experience depen
 	assert.equal((await provider.select(withContext("K001", []))).status, "incomplete");
 	await apply(store, [{ op: "revise", id: "X001", body: "后续情境", reason: "条件变化" }]);
 	assert.equal((await provider.select(withContext("K001", [ref(storeId, "X001", 2)]))).status, "incomplete");
-	const bareScope = await provider.select(withContext("K002", [ref(storeId, "X001", 2), ref(storeId, "X001", 999)]));
-	assert.equal(bareScope.status, "ready", "bare X scope still accepts a live pinned version");
+	const currentContexts = [ref(storeId, "X001", 2), ref(storeId, "X001", 999)];
+	const pendingRecheck = await provider.select(withContext("K002", currentContexts));
+	assert.equal(pendingRecheck.status, "incomplete", "matching a new context does not clear the dependent experience's live recheck limit");
+	assert(pendingRecheck.omitted.some(item => item.ref.recordId === "K002" && item.reason === "availability:needs_recheck"));
+	assert.equal(pendingRecheck.markdown, "");
+	await apply(store, [{ op: "lift_limit", target: "K002@1", reason: "M04 已重新核对该方法在 X001@2 中的适用性", authority: "M04" }]);
+	const bareScope = await provider.select(withContext("K002", currentContexts));
+	assert.equal(bareScope.status, "ready", "after explicit revalidation, bare X scope accepts the checked live pinned version");
 	assert.deepEqual(bareScope.selected[0].dependencyRefs, [ref(storeId, "X001", 2)], "dependency list contains only the actually checked context");
+	assert.equal((await store.availability("K001", 1)).availability, "needs_recheck", "revalidating the bare-scope method does not clear another method's limit");
+	assert.equal((await provider.select(withContext("K001", [ref(storeId, "X001", 2)]))).status, "incomplete", "a new context still cannot replace an explicitly pinned premise");
 });
 
 

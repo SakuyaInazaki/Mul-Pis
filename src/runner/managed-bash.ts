@@ -114,7 +114,7 @@ export async function observeManagedProcessGroup(pgid: number, dependencies: {
 /** The caller supplies the exact Pi call context. Pi still owns formatting and
  * nonzero exit handling; this backend owns only execution and evidence. */
 export function managedLocalBashOperations(call: () => ManagedBashCall | undefined,
-	dependencies: { terminationGraceMs?: number } = {}): BashOperations {
+	dependencies: { terminationGraceMs?: number; sandboxProfile?: string } = {}): BashOperations {
 	const fallback = createLocalBashOperations();
 	return { exec: async (command, cwd, { onData, signal, timeout, env }) => {
 		const current = call();
@@ -142,7 +142,9 @@ export function managedLocalBashOperations(call: () => ManagedBashCall | undefin
 		catch (error) { await output.close(); throw error; }
 		let child;
 		try {
-			child = spawn(shell.shell, stdin ? shell.args : [...shell.args, command], {
+			const shellArgs = stdin ? shell.args : [...shell.args, command];
+			child = spawn(dependencies.sandboxProfile ? "/usr/bin/sandbox-exec" : shell.shell,
+				dependencies.sandboxProfile ? ["-p", dependencies.sandboxProfile, shell.shell, ...shellArgs] : shellArgs, {
 				cwd, env, detached: true, stdio: [stdin ? "pipe" : "ignore", output.fd, output.fd], windowsHide: true,
 			});
 		} catch (error) { await output.close(); throw error; }

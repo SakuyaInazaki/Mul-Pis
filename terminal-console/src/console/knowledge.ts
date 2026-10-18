@@ -1,6 +1,7 @@
 import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
-import type { Limit, RecordType, Snapshot } from "../knowledge/types.ts";
+import { createFileKnowledgeStore, parseRecordTarget } from "../../../src/knowledge/store.ts";
+import type { AvailabilityReport, Limit, RecordType, Snapshot } from "../../../src/knowledge/types.ts";
 
 const RECORD_ID = /^[CKEJQDX]\d{3,}$/;
 const SNAPSHOT_ID = /^G\d{3,}$/;
@@ -17,6 +18,7 @@ export interface KnowledgeRecordView {
   /** All stored metadata and the unabridged body, ready for a plain text viewer. */
   lines: string[];
   activeLimits: Limit[];
+  availability?: AvailabilityReport;
 }
 
 export interface KnowledgeView {
@@ -36,6 +38,18 @@ function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function validLimit(value: unknown): value is Limit {
+  if (!object(value) || typeof value.target !== "string") return false;
+  const target = parseRecordTarget(value.target);
+  if (!target || target.version !== undefined && (!Number.isSafeInteger(target.version) || target.version < 1) ||
+      !["suspended", "withdrawn", "needs_recheck"].includes(String(value.kind)) ||
+      typeof value.reason !== "string" || !value.reason.trim() ||
+      typeof value.authority !== "string" || !value.authority.trim() ||
+      typeof value.since !== "string" || !value.since.trim()) return false;
+  return (value.liftedAt === undefined || typeof value.liftedAt === "string" && !!value.liftedAt.trim()) &&
+    (value.liftReason === undefined || typeof value.liftReason === "string" && !!value.liftReason.trim());
+}
+
 function inside(root: string, target: string): boolean {
   const relative = path.relative(root, target);
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
@@ -49,7 +63,7 @@ export function knowledgeStatusLabel(status: string): string {
   switch (status) {
     case "candidate": return "候选";
     case "working_assumption": return "工作假设";
-    case "adopted": return "已采用";
+    case "adopted": return "历史采用";
     case "suspended": return "暂停使用";
     case "withdrawn": return "已撤回";
     case "replaced": return "已替代";
@@ -163,13 +177,20 @@ export class WorkflowKnowledgeReader {
       if (errorCode(error) !== "ENOENT") throw error;
       warnings.push("知识库 store-id.json 不存在");
     }
+    let liveLimitsVerified = false;
     try {
-      const limits = await this.json(knowledge, path.join(knowledge, "limits.json"));
-      if (!Array.isArray(limits) || !limits.every(object)) throw new Error("知识库 limits.json 结构错误");
-      view.limits = limits as unknown as Limit[];
+      const limitsFile = path.join(knowledge, "limits.json");
+      const source = await this.text(knowledge, limitsFile);
+      let limits: unknown;
+      try { limits = JSON.parse(source) as unknown; }
+      catch { warnings.push("知识库 limits.json 无法解析，实时可用性不可核验"); }
+      if (limits !== undefined) {
+        if (!Array.isArray(limits) || !limits.every(validLimit)) warnings.push("知识库 limits.json 结构错误，实时可用性不可核验");
+        else { view.limits = limits; liveLimitsVerified = true; }
+      }
     } catch (error) {
       if (errorCode(error) !== "ENOENT") throw error;
-      warnings.push("知识库 limits.json 不存在");
+      warnings.push("知识库 limits.json 不存在，实时可用性不可核验");
     }
     if (!selected) return view;
     if (!view.snapshots.some(item => item.id === selected)) {
@@ -181,6 +202,19 @@ export class WorkflowKnowledgeReader {
     if (!object(raw) || raw.id !== selected || !Array.isArray(raw.records) || !Array.isArray(raw.activeLimits)) throw new Error(`知识快照结构错误：${selected}`);
     view.snapshot = snapshot;
     view.snapshotActiveLimits = snapshot.activeLimits;
+    const store = createFileKnowledgeStore(knowledge);
+    let liveVersions: Map<string, number> | undefined;
+    if (current) {
+      try {
+        const live = await this.json(knowledge, path.join(snapshotsDir, `${current}.json`));
+        if (!object(live) || live.id !== current || !Array.isArray(live.records) ||
+            !live.records.every(ref => object(ref) && typeof ref.id === "string" && RECORD_ID.test(ref.id) &&
+              typeof ref.version === "number" && Number.isSafeInteger(ref.version) && ref.version > 0)) throw new Error("CURRENT 快照结构不可用于实时可用性核验");
+        const refs = live.records as Array<{ id: string; version: number }>;
+        liveVersions = new Map(refs.map(ref => [ref.id, ref.version]));
+        if (liveVersions.size !== live.records.length) throw new Error("CURRENT 快照存在重复记录引用");
+      } catch (error) { warnings.push(`实时知识快照不可核验：${error instanceof Error ? error.message : String(error)}`); }
+    }
     const seen = new Set<string>();
     for (const ref of snapshot.records) {
       if (!object(ref) || typeof ref.id !== "string" || !RECORD_ID.test(ref.id) || !Number.isSafeInteger(ref.version) || ref.version < 1 || seen.has(ref.id)) throw new Error(`知识快照 ${selected} 含无效或重复记录引用`);
@@ -202,11 +236,33 @@ export class WorkflowKnowledgeReader {
       const { metadata, body } = parsed;
       const activeLimits = view.limits.filter(limit => !limit.liftedAt && (limit.target === ref.id || limit.target === `${ref.id}@${ref.version}`));
       const status = typeof metadata.usageDecision === "string" ? metadata.usageDecision : "未记录";
+      let availability: AvailabilityReport | undefined;
+      if (liveVersions && liveLimitsVerified) try {
+        const publishedVersion = liveVersions.get(ref.id);
+        if (publishedVersion !== undefined) {
+          // availability() may inspect prior decisions. Confine each published
+          // version before letting the shared read-only store inspect history.
+          const recordDir = path.join(knowledge, "records", ref.id);
+          const realRecordDir = await realpath(recordDir);
+          if (!inside(knowledge, realRecordDir) || !(await stat(realRecordDir)).isDirectory())
+            throw new Error("已发布记录目录越界或不是目录");
+          const names = (await readdir(recordDir)).filter(name => /^v[1-9]\d*\.md$/u.test(name) &&
+            Number(name.slice(1, -3)) <= publishedVersion);
+          if (names.length !== publishedVersion) throw new Error("已发布历史版本不完整");
+          for (let version = 1; version <= publishedVersion; version++) {
+            if (!names.includes(`v${version}.md`)) throw new Error("已发布历史版本不连续");
+            await this.confined(knowledge, path.join(recordDir, `v${version}.md`));
+          }
+        }
+        availability = await store.availability(ref.id, ref.version);
+      } catch (error) { warnings.push(`${ref.id}@${ref.version} 实时可用性不可核验：${error instanceof Error ? error.message : String(error)}`); }
       const lines = [
         `${ref.id}@${ref.version} ${String(metadata.title)}`,
         `历史使用决定：${knowledgeStatusLabel(status)}（${status}）`,
         `依据状况：${typeof metadata.evidenceStatus === "string" ? metadata.evidenceStatus : "未记录"}`,
-        `当前生效限制：${activeLimits.length ? `${activeLimits.length} 条；${activeLimits.map(l => `${l.target} ${knowledgeStatusLabel(l.kind)}`).join("、")}（完整理由见正文后的限制明细）` : "无"}`,
+        `本记录直接限制：${!liveLimitsVerified ? "不可核验" : activeLimits.length ? `${activeLimits.length} 条；${activeLimits.map(l => `${l.target} ${knowledgeStatusLabel(l.kind)}`).join("、")}（完整理由见正文后的限制明细）` : "无"}`,
+        `当前单记录可用性：${availability?.availability ?? "不可核验"}${availability?.reasons.length ? `；${availability.reasons.join("；")}` : ""}`,
+        "必要依赖闭包与反证适用性须通过知识选择/读取入口核对；单记录可用性不证明整组可应用。",
         "",
         "正文：",
         ...body.split("\n"),
@@ -215,7 +271,8 @@ export class WorkflowKnowledgeReader {
         "完整记录元数据：",
         ...Object.entries(metadata).flatMap(([key, value]) => formatField(key, value)),
       ];
-      view.records.push({ id: ref.id, version: ref.version, kind: metadata.type as RecordType, title: metadata.title as string, status, body, metadata, lines, activeLimits });
+      view.records.push({ id: ref.id, version: ref.version, kind: metadata.type as RecordType, title: metadata.title as string, status, body, metadata, lines, activeLimits,
+        ...(availability ? { availability } : {}) });
     }
     return view;
   }

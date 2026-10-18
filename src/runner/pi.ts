@@ -1,4 +1,5 @@
-import { appendFile, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
+import { access, appendFile, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
+import { constants } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
@@ -15,6 +16,7 @@ import {
 	SettingsManager,
 	type AgentSession,
 	type CreateAgentSessionOptions,
+	type ReadToolDetails,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type, createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
@@ -34,6 +36,7 @@ import type { HostEffectScope } from "./operation-disposition.ts";
 import { certifyRequestNotSent } from "./operation-disposition.ts";
 import { finishManagedBashCall, managedLocalBashOperations, prepareManagedBashCall,
 	type ManagedBashCall } from "./managed-bash.ts";
+import { createExecutionSandbox } from "./execution-sandbox.ts";
 
 type OutputTokenField = "max_tokens" | "max_completion_tokens" | "both" | "omitted";
 
@@ -482,23 +485,67 @@ async function createMaterialTools(root: string, requestedReadName?: string): Pr
 			},
 		},
 	});
-	const materialRead: typeof baseRead = {
-		...baseRead,
+	const materialReadSchema = Type.Object({ ...baseRead.parameters.properties,
+		textOffset: Type.Optional(Type.Number({ description: "Zero-based UTF-16 file offset; incompatible with line offset/limit" })),
+		textLimit: Type.Optional(Type.Number({ description: "UTF-16 page size from 2 to 16000, default 16000; incompatible with line offset/limit" })),
+	});
+	type MaterialReadDetails = ReadToolDetails & { textRange?: ReadReturnEvent["returned"] };
+	// The native read renderers interpret offsets as line numbers and do not
+	// render textRange. Keep the SDK's generic tool rendering for this extended
+	// schema instead: it displays the real arguments and UTF-16 response header.
+	const materialRead = {
 		name: readName,
 		label: readName,
+		description: `${baseRead.description} For long single lines use this same tool with textOffset/textLimit instead of offset/limit: zero-based UTF-16 file offsets, default and maximum page size 16000. Follow the returned next textOffset until end; the two paging modes cannot be combined.`,
+		promptSnippet: baseRead.promptSnippet,
+		promptGuidelines: baseRead.promptGuidelines,
+		constrainedSampling: baseRead.constrainedSampling,
+		parameters: materialReadSchema,
 		// Pi normally prefers ctx.cwd over the tool factory cwd. Rebase the
 		// context so relative material paths do not resolve in the empty scratch cwd.
 		execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-			const requested = params as { path: string; offset?: number; limit?: number };
+			const requested = params;
 			const captured: { path?: string; offset?: number; limit?: number } = {
 				offset: requested.offset, limit: requested.limit };
-			const requestFields = { ...(requested.offset !== undefined ? { offset: requested.offset } : {}), ...(requested.limit !== undefined ? { limit: requested.limit } : {}) };
+			const requestFields = { ...(requested.offset !== undefined ? { offset: requested.offset } : {}), ...(requested.limit !== undefined ? { limit: requested.limit } : {}),
+				...(requested.textOffset !== undefined ? { textOffset: requested.textOffset } : {}), ...(requested.textLimit !== undefined ? { textLimit: requested.textLimit } : {}) };
 			try {
+				if (requested.textOffset !== undefined || requested.textLimit !== undefined) {
+					if (requested.offset !== undefined || requested.limit !== undefined)
+						throw new Error("textOffset/textLimit cannot be combined with line offset/limit");
+					const start = requested.textOffset ?? 0, limit = requested.textLimit ?? 16000;
+					if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(limit) || limit < 2 || limit > 16000)
+						throw new Error("textOffset must be a nonnegative integer; textLimit must be an integer from 2 to 16000");
+					if (signal?.aborted) throw new Error("Read aborted");
+					const resolved = await resolveConfinedPath(rootReal, requested.path);
+					captured.path = path.relative(rootReal, resolved);
+					rejectPdf(resolved);
+					if (!(await lstat(resolved)).isFile()) throw new Error(`${readName} accepts files only`);
+					if (imageMimeType(resolved)) throw new Error("textOffset/textLimit accepts text files only; omit them to read an image");
+					const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(await readFile(resolved));
+					if (signal?.aborted) throw new Error("Read aborted");
+					if (start > text.length) throw new Error(`textOffset ${start} is beyond end of text (${text.length} UTF-16 units)`);
+					const splitsPair = (offset: number) => offset > 0 && offset < text.length &&
+						text.charCodeAt(offset - 1) >= 0xd800 && text.charCodeAt(offset - 1) <= 0xdbff &&
+						text.charCodeAt(offset) >= 0xdc00 && text.charCodeAt(offset) <= 0xdfff;
+					if (splitsPair(start)) throw new Error("textOffset must not split a UTF-16 surrogate pair");
+					let end = Math.min(text.length, start + limit);
+					if (splitsPair(end)) end--;
+					const range = { kind: "text" as const, textOffset: start, textEnd: end, textTotal: text.length, truncated: end < text.length };
+					readReturns.push({ toolName: readName, status: end > start ? "returned" : "no-content", path: captured.path,
+						requested: requestFields, returned: range, at: new Date().toISOString() });
+					readCoverage.add(captured.path);
+					return { content: [{ type: "text", text: `UTF-16 ${start}-${end}/${text.length}; ${end < text.length ? `next textOffset=${end}` : "end"}.\n${text.slice(start, end)}` }],
+						details: { textRange: range } };
+				}
 				const result = await readCapture.run(captured, () => baseRead.execute(
 					toolCallId, params, signal, onUpdate, { ...ctx, cwd: rootReal },
 				));
 				const binary = result.content.some((block) => block.type === "image") || (captured.path !== undefined && imageMimeType(captured.path) !== undefined);
-				const truncation = (result.details as { truncation?: { outputLines?: number; truncated?: boolean; firstLineExceedsLimit?: boolean } } | undefined)?.truncation;
+				const truncation = result.details?.truncation;
+				if (truncation?.firstLineExceedsLimit) {
+					result.content = [{ type: "text", text: `This line exceeds the line reader's byte limit. Read the exact file with ${readName}(${JSON.stringify({ path: requested.path, textOffset: 0, textLimit: 16000 })}); follow next textOffset until end. Do not combine textOffset/textLimit with line offset/limit.` }];
+				}
 				const startLine = requested.offset ? Math.max(1, requested.offset) : 1;
 				const output = result.content.find((block): block is { type: "text"; text: string } => block.type === "text" && typeof block.text === "string")?.text ?? "";
 				const limitedNote = requested.limit !== undefined && /\n\n\[\d+ more lines in file\. Use offset=\d+ to continue\.\]$/.test(output);
@@ -527,7 +574,7 @@ async function createMaterialTools(root: string, requestedReadName?: string): Pr
 				throw error;
 			}
 		},
-	};
+	} satisfies ToolDefinition<typeof materialReadSchema, MaterialReadDetails | undefined>;
 	const materialList: ToolDefinition<any, any> = {
 		name: LIST_TOOL_NAME,
 		label: LIST_TOOL_NAME,
@@ -638,11 +685,18 @@ async function createExecutionTools(
 	if (!(await lstat(cwd)).isDirectory()) throw new HarnessError("runner.tools", `execution root is not a directory: ${root}`);
 	const scratch = tempDir ? await realpath(tempDir) : undefined;
 	if (scratch && (!(await lstat(scratch)).isDirectory() || scratch === cwd || scratch.startsWith(`${cwd}${path.sep}`) || cwd.startsWith(`${scratch}${path.sep}`))) throw new HarnessError("runner.tools", "execution temporary directory must be an existing directory outside formal work");
+	const sandbox = await createExecutionSandbox(cwd, scratch);
 	const bashCall = new AsyncLocalStorage<ManagedBashCall>();
 	const factories = {
 		read: createReadToolDefinition,
-		write: createWriteToolDefinition,
-		edit: createEditToolDefinition,
+		write: (root: string) => createWriteToolDefinition(root, sandbox ? { operations: {
+			mkdir: directory => sandbox.mkdir(directory), writeFile: (file, content) => sandbox.writeFile(file, content),
+		} } : undefined),
+		edit: (root: string) => createEditToolDefinition(root, sandbox ? { operations: {
+			readFile: async requested => { await sandbox.file(requested, "edit"); return readFile(requested); },
+			access: async requested => { await access(await sandbox.file(requested, "edit"), constants.R_OK | constants.W_OK); },
+			writeFile: (file, content) => sandbox.writeFile(file, content),
+		} } : undefined),
 		bash: createBashToolDefinition,
 	};
 	const names = [...new Set(requested)];
@@ -667,13 +721,13 @@ async function createExecutionTools(
 		// bash child. This is environment hygiene, not an OS sandbox.
 		const base = (name === "bash" && isolatedToolEnvironment
 			? createBashToolDefinition(cwd, {
-				operations: managedLocalBashOperations(() => bashCall.getStore()),
+				operations: managedLocalBashOperations(() => bashCall.getStore(), { sandboxProfile: sandbox?.profile }),
 				exposeSessionEnvironment: false,
 				spawnHook: (context) => ({ ...context, env: {
 					PATH: process.env.PATH ?? "/usr/bin:/bin",
 					HOME: cwd,
 					LANG: "C.UTF-8",
-					TMPDIR: scratch ?? process.env.TMPDIR ?? "/tmp",
+					TMPDIR: scratch ?? cwd,
 				} }),
 			})
 			: factories[name](cwd)) as ToolDefinition<any, any>;
@@ -691,6 +745,7 @@ async function createExecutionTools(
 					? { path: redactToolLogText(args.path, 240) } : {};
 				const at = new Date().toISOString();
 				try {
+					if (sandbox && (name === "write" || name === "edit")) await sandbox.file(args.path as string, name);
 					const executionArgs = name === "bash" ? bashArgsForPi(args) : args;
 					const result = receipt ? await bashCall.run(receipt, () => base.execute(toolCallId, executionArgs, signal, onUpdate, { ...ctx, cwd })) :
 						await base.execute(toolCallId, executionArgs, signal, onUpdate, { ...ctx, cwd });
@@ -718,6 +773,10 @@ async function createExecutionTools(
 					...(receipt ? { toolCallId, hostReceiptPath: receipt.file } : {}),
 						errorClass: error instanceof HarnessError ? "harness" : "tool-error",
 						...(typeof code === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(code) ? { errorCode: code } : {}) });
+					if (name === "bash" && process.platform === "darwin" && sandbox && error instanceof Error &&
+						/^\/bin\/bash: cannot create temp file for here document: Operation not permitted\r?$/m.test(error.message)) {
+						throw new Error(`${error.message}\n\nmacOS system Bash here-documents can ignore TMPDIR and fail after cd into a read-only directory; keep the shell in task writable cwd ${JSON.stringify(cwd)} or scratch ${JSON.stringify(scratch ?? cwd)} and read external files by absolute path.`, { cause: error });
+					}
 					throw error;
 				}
 			},
@@ -813,6 +872,8 @@ function forkGrantNoBroader(parent: SessionSpec["tools"], child: SessionSpec["to
 		return child.tools.every((tool) => JSON.stringify(tool.params) === JSON.stringify(parentTools.get(tool.name)?.params));
 	}
 	if (child.kind === "execution" && parent.kind === "execution") {
+		// Host closures are bound to one live task; a historical grant cannot recreate them.
+		if (child.extraTools?.length) return false;
 		const parentNames = new Set(parent.tools);
 		return child.tools.every((tool) => parentNames.has(tool));
 	}
@@ -1377,6 +1438,13 @@ export class PiSessionRunner implements SessionRunner {
 				path.join(spec.persistDir, "host-execution-receipts", sessionManager.getSessionId()),
 				sessionManager.getSessionId(), true, spec.tools.tempDir);
 			materialTools = execution;
+			if (spec.tools.extraTools?.length) {
+				const extra = customToolsToPi(spec.tools.extraTools, toolLog);
+				const names = [...execution.names, ...extra.map(tool => tool.name)];
+				if (new Set(names).size !== names.length)
+					throw new HarnessError("runner.tools", "execution feedback tools must have distinct names");
+				materialTools = { ...execution, tools: [...execution.tools, ...extra], names };
+			}
 			sessionCwd = execution.cwd;
 		}
 		const noTools = spec.tools.kind === "none" ? "all" : "builtin";

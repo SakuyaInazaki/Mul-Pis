@@ -128,9 +128,11 @@ export default function reply({spec,message}) {
  const goal = JSON.parse(fs.readFileSync(path.join(spec.tools.root,"goal.json"),"utf8"));
  const artifact = goal.tasks[0].review.artifacts[1].path;
  const relative = path.relative(spec.tools.root, artifact);
- const lines = fs.readFileSync(artifact,"utf8").trimEnd().split(/\\r?\\n/).length;
+ const originalText = fs.readFileSync(artifact,"utf8");
+ const pages = [];
+ for(let start=0;start<originalText.length;start+=16000) { const end=Math.min(originalText.length,start+16000); pages.push({toolName:"m07_evidence_read",status:"returned",path:relative,requested:{textOffset:start,textLimit:16000},returned:{kind:"text",textOffset:start,textEnd:end,textTotal:originalText.length,truncated:end<originalText.length},at:new Date().toISOString()}); }
  return { text: "M04 records no proposal after reviewing the source.",
-  readReturns: ${includeRead ? `[{ toolName:"m07_evidence_read",status:"returned",path:relative,requested:{},returned:{kind:"text",startLine:1,endLine:lines,truncated:false},at:new Date().toISOString() }]` : "[]"},
+  readReturns: ${includeRead ? "pages" : "[]"},
   usage: { input:100, output:20, cacheRead:0, cacheWrite:0, totalTokens:120, cost:0.001 } };
 }\n`);
  const v2Reply = path.join(root, "v2-reply.mjs"); await createV2Reply(v2Reply, true);

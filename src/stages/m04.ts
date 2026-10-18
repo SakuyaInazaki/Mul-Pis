@@ -12,16 +12,20 @@ import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { linkedEvidence, openBoundedSession } from "../context/boundary.ts";
-import type { ReadReturnEvent } from "../runner/types.ts";
-import type { ProposalOp, ProposalReceipt, ValidationIssue } from "../knowledge/types.ts";
-import { retrieveKnowledge } from "../knowledge/retrieval.ts";
+import type { CustomToolSpec, ReadReturnEvent } from "../runner/types.ts";
+import { textReadCoverage } from "../runner/read-coverage.ts";
+import type { KnowledgeStore, ProposalOp, ProposalReceipt, Snapshot, ValidationIssue } from "../knowledge/types.ts";
+import { renderKnowledgeIndexRecord } from "../knowledge/pack.ts";
+import { retrieveKnowledge, validateKnowledgeRetrievalContext } from "../knowledge/retrieval.ts";
+import { publishedArtifact, publishedArtifactCatalogue, textArtifact } from "../m07/execution-knowledge.ts";
 import { buildM04Message, extractKnowledgeProposals, systemPromptFor } from "../prompts.ts";
 import type { ProblemMaterials } from "../prompts.ts";
 import { HarnessError, type InputRef, type StageRunRecord } from "../types.ts";
 import { readTextIfExists, writeFileAtomic } from "../workspace.ts";
 import { loadProblemMaterials, readOutput, relPath, requireCompletedRun, sessionSpec, withRun, type StageContext } from "./context.ts";
 import { specFileFor } from "./m03.ts";
-import { readFrozenArtifactManifest, type FrozenArtifactManifest } from "./artifacts.ts";
+import { freezeStageArtifacts, readFrozenArtifactManifest, readStageArtifactManifest,
+	type ArtifactSelection, type FrozenArtifactManifest } from "./artifacts.ts";
 import { renderPageTool } from "../tools/pagetool.ts";
 import { markFeedbackAssembled } from "../improvement/observations.ts";
 import { workflowRepairFingerprint, workflowRepairState, WorkflowRepairNeededError,
@@ -63,7 +67,9 @@ export interface M04InvalidJudgmentEvent {
 	/** Exact host validation response and any underlying private issue details. */
 	validation: { code: string; message: string; path: string; detail?: unknown };
 	coverage: Array<{ sourceId: string; required: boolean;
-		coveredRanges: Array<{ start: number; end: number }>; complete: boolean }>;
+		coveredRanges: Array<{ start: number; end: number }>;
+		/** Zero-based half-open UTF-16 coverage, including converted legacy lines. */
+		coveredTextRanges?: Array<{ start: number; end: number }>; complete: boolean }>;
 	transcriptPath?: string;
 }
 
@@ -97,11 +103,238 @@ interface ResolvedFeedback {
 	inputs: InputRef[];
 	artifactPaths: string[];
 	m08?: { runId: string; manifest: FrozenArtifactManifest; manifestPath: string };
+	m06?: { runId: string; rootDir: string; manifestPath: string;
+		legacy?: { selections: ArtifactSelection[]; gaps: string[] } };
 	m07?: { runId: string; rootDir: string; checkpointId?: string; goalSnapshotPath?: string; manifestPath?: string; frozenMaterials?: ProblemMaterials; frozenProblemInputs?: InputRef[]; skippedRaw?: string[]; selectedTaskIds?: string[]; omittedTaskIds?: string[] };
 }
 
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const SAFE_CHECKPOINT_ID = /^C\d{3,}$/;
+const KNOWLEDGE_ID = /^[CKEJQDX]\d{3,}$/;
+
+interface KnowledgeReadCall {
+	id: string; requestedVersion?: number; version?: number; offset: number; limit: number;
+	end?: number; total?: number; status: string; at: string;
+	sessionId: string; sessionGeneration: number;
+}
+
+interface KnowledgeSelectCall {
+	query: string; context?: ReturnType<typeof validateKnowledgeRetrievalContext>;
+	offset: number; limit: number; returnedRefs: string[]; total?: number;
+	status: "requested" | "returned" | "failed"; at: string;
+	sessionId: string; sessionGeneration: number;
+}
+
+interface KnowledgeArtifactCall {
+	id: string; requestedVersion?: number; version?: number; artifact?: string; list?: boolean; source?: string;
+	offset: number; limit: number; end?: number; total?: number; contentKind?: "artifact" | "artifact-index"; status: string; at: string;
+	sessionId: string; sessionGeneration: number;
+}
+
+/** Discover published identities after a new diagnostic appears in the M04
+ * session. Record ordinals stay stable when live restriction text changes. */
+function m04KnowledgeSelectTool(store: KnowledgeStore, snapshot: Snapshot, calls: KnowledgeSelectCall[],
+	owner: () => { sessionId: string; sessionGeneration: number }): CustomToolSpec {
+	return {
+		name: "knowledge_select",
+		description: "按新发现的错误符号、瓶颈或结构检索本次 M04 冻结快照。按记录序号分页返回发现索引及明确 ID；正文、必要依赖和反驳须另用 knowledge_read 读取。",
+		params: {
+			query: { type: "string", description: "具体错误符号、瓶颈症状、结构签名或待查问题" },
+			contextJson: { type: "string", description: "可选的显式适用情境 JSON 对象：stage/backend/toolchain/dtype/layout 为非空字符串；structure/appliedTransforms/symptoms 为字符串数组，每项非空。未知值省略，不添加其他字段。", optional: true },
+			offset: { type: "number", description: "可选，结果记录序号起点，首项为 0", optional: true },
+			limit: { type: "number", description: "可选，本页最多返回的记录数，最大 100", optional: true },
+		},
+		async execute(args) {
+			const query = args.query, offset = args.offset ?? 0, limit = args.limit ?? 12;
+			if (typeof query !== "string" || !query.trim() || !Number.isSafeInteger(offset) || (offset as number) < 0 ||
+				!Number.isSafeInteger(limit) || (limit as number) < 1 || (limit as number) > 100 ||
+				(args.contextJson !== undefined && typeof args.contextJson !== "string"))
+				throw new HarnessError("m04.knowledge-select", "invalid query, explicit context or record page range");
+			let context: ReturnType<typeof validateKnowledgeRetrievalContext>;
+			try { context = args.contextJson === undefined ? undefined : validateKnowledgeRetrievalContext(JSON.parse(args.contextJson as string)); }
+			catch { throw new HarnessError("m04.knowledge-select", "contextJson must be a JSON object: stage/backend/toolchain/dtype/layout must be nonempty strings; structure/appliedTransforms/symptoms must be string[] with nonempty string entries; omit unknown values and do not add other fields"); }
+			const request: KnowledgeSelectCall = { query, ...(context ? { context } : {}), offset: offset as number,
+				limit: limit as number, returnedRefs: [], status: "requested", at: new Date().toISOString(), ...owner() };
+			calls.push(request);
+			try {
+				if ((await store.current())?.id !== snapshot.id) throw new HarnessError("m04.knowledge-select", "knowledge snapshot changed during M04 selection");
+				const selection = await retrieveKnowledge(store, { purpose: "M04 会话内知识再检索", text: query,
+					...(context ? { context } : {}), view: "refs",
+					maxRecords: Math.max(1, snapshot.records.reduce((total, item) => total + item.version, 0)),
+					maxChars: Number.MAX_SAFE_INTEGER });
+				const refs = selection.rankedRefs;
+				request.total = refs.length;
+				if ((offset as number) > refs.length)
+					throw new HarnessError("m04.knowledge-select", `record offset ${offset} exceeds selection length ${refs.length}`);
+				const end = Math.min(refs.length, (offset as number) + (limit as number));
+				const pageRefs = refs.slice(offset as number, end);
+				const latest = new Map(snapshot.records.map(item => [item.id, item.version]));
+				const blocks: string[] = [];
+				for (const ref of pageRefs) {
+					const match = /^([CKEJQDX]\d{3,})@(\d+)$/u.exec(ref);
+					if (!match) throw new HarnessError("m04.knowledge-select", `invalid published record reference ${ref}`);
+					const record = await store.get(match[1], Number(match[2]));
+					if (!record) throw new HarnessError("m04.knowledge-select", `published record unavailable: ${ref}`);
+					const availability = await store.availability(record.id, record.version);
+					blocks.push(renderKnowledgeIndexRecord(record, availability, selection.limits, latest.get(record.id)));
+				}
+				if (selection.snapshot !== snapshot.id || (await store.current())?.id !== snapshot.id ||
+					JSON.stringify(await store.limits()) !== JSON.stringify(selection.limits))
+					throw new HarnessError("m04.knowledge-select", "knowledge snapshot or live limits changed during M04 selection; retry");
+				request.returnedRefs = pageRefs;
+				request.status = "returned";
+				const notice = `知识发现索引；快照 ${snapshot.id}；记录序号 ${offset}-${end}/${refs.length}；${end < refs.length ? `下一页 offset=${end}` : "已到末尾"}。本页引用 ${JSON.stringify(pageRefs)}。必要依赖、反驳和实时限制只作发现；正文及证据尚未读取，使用前逐条 knowledge_read。`;
+				return { text: `${notice}\n- 检索状态：${selection.status}；未纳入 ${selection.omitted.length} 项${selection.omitted.length ? `（原因：${JSON.stringify(selection.omitted.slice(0, 20))}${selection.omitted.length > 20 ? " 等" : ""}）` : ""}\n\n${blocks.join("\n")}`,
+					details: { snapshot: snapshot.id, offset, end, total: refs.length, returnedRefs: pageRefs, status: selection.status } };
+			} catch (error) { request.status = "failed"; throw error; }
+		},
+	};
+}
+
+/** Read a published record by ID without making an omitted pack entry into an adoption decision. */
+function m04KnowledgeReadTool(store: KnowledgeStore, snapshot: Snapshot, calls: KnowledgeReadCall[],
+	owner: () => { sessionId: string; sessionGeneration: number }): CustomToolSpec {
+	const published = new Map(snapshot.records.map((record) => [record.id, record.version]));
+	return {
+		name: "knowledge_read",
+		description: "按 ID 分页读取本次 M04 知识快照中的原始记录、版本、实时可用性、限制和依赖警告。记录存在不等于可采用。",
+		params: {
+			id: { type: "string", description: "记录 ID，如 C001；历史版本用独立 version 参数" },
+			version: { type: "number", description: "可选历史版本；默认本次快照发布版本", optional: true },
+			offset: { type: "number", description: "可选，渲染文本的 UTF-16 字符起点，首段为 0", optional: true },
+			limit: { type: "number", description: "可选，本页最多返回的 UTF-16 字符数，最大 12000", optional: true },
+		},
+		async execute(args) {
+			const id = args.id, version = args.version, offset = args.offset ?? 0, limit = args.limit ?? 6000;
+			if (typeof id !== "string" || !KNOWLEDGE_ID.test(id) ||
+				(version !== undefined && (!Number.isSafeInteger(version) || (version as number) < 1)) ||
+				!Number.isSafeInteger(offset) || (offset as number) < 0 ||
+				!Number.isSafeInteger(limit) || (limit as number) < 1 || (limit as number) > 12000)
+				throw new HarnessError("m04.knowledge-read", "invalid knowledge ID, version or page range");
+			const request: KnowledgeReadCall = { id, ...(version === undefined ? {} : { requestedVersion: version as number }), offset: offset as number, limit: limit as number, status: "requested", at: new Date().toISOString(), ...owner() };
+			calls.push(request);
+			try {
+				if ((await store.current())?.id !== snapshot.id) throw new HarnessError("m04.knowledge-read", "knowledge snapshot changed during M04 reading");
+				const selectedVersion = version === undefined ? published.get(id) : version as number;
+				if (!selectedVersion || selectedVersion > (published.get(id) ?? 0)) {
+					request.status = "not-in-snapshot";
+					return { text: `${id}${version === undefined ? "" : `@${version}`} 未在本次 M04 知识快照发布；不能推断其内容或采用状态。` };
+				}
+				const record = await store.get(id, selectedVersion);
+				if (!record) throw new HarnessError("m04.knowledge-read", `published record unavailable: ${id}@${selectedVersion}`);
+				request.version = selectedVersion;
+				const selection = await retrieveKnowledge(store, {
+					purpose: "M04 按 ID 补读的必要依赖与警告", text: "", requiredIds: [`${id}@${selectedVersion}`],
+					view: "index", onlyRequired: true,
+					maxRecords: Math.max(1, snapshot.records.reduce((total, item) => total + item.version, 0)),
+					maxChars: Number.MAX_SAFE_INTEGER,
+				});
+				const beforeLimits = selection.limits;
+				const availability = await store.availability(id, selectedVersion);
+				const selectedRefs = new Set([`${id}@${selectedVersion}`, ...selection.rankedRefs]);
+				const liveLimits = beforeLimits.filter(item => !item.liftedAt && [...selectedRefs].some(ref =>
+					item.target === ref || item.target === ref.split("@")[0]));
+				const safety = [`【每页实时状态与依赖警告；不分页】`,
+					`- 当前记录：${id}@${selectedVersion}；可用性：${availability.availability}；${availability.reasons.join("；")}`,
+					`- 生效限制：${JSON.stringify(liveLimits)}`,
+					`- 依赖与警告选择：${selection.status}；未展开：${JSON.stringify(selection.omitted)}`,
+					...selection.pack.included.map(item => `- ${item.id}@${item.version}：${item.availability}`),
+					"- 以上是必要依赖、反驳与限制索引，不表示它们的正文或证据已读；需按 ID 补读，不构成采用许可。",
+				].join("\n");
+				// Paging covers only immutable original content. A live-limit change
+				// must not shift the next offset or hide its warning behind that offset.
+				const { body, ...metadata } = record;
+				const content = [`# 知识原始记录 ${id}@${selectedVersion}`, `- 本次快照：${snapshot.id}`,
+					`- 原始元数据：${JSON.stringify(metadata)}`, "", body].join("\n");
+				request.total = content.length;
+				if (selection.snapshot !== snapshot.id || (await store.current())?.id !== snapshot.id || JSON.stringify(await store.limits()) !== JSON.stringify(beforeLimits))
+					throw new HarnessError("m04.knowledge-read", "knowledge snapshot or live limits changed during M04 reading; retry");
+				if ((offset as number) > content.length) {
+					request.status = "out-of-range";
+					return { text: `${safety}\n\n知识记录 ${id}@${selectedVersion} 共 ${content.length} 个 UTF-16 字符；所请求 offset=${offset} 超出末尾，请从有效范围补读。` };
+				}
+				const end = Math.min(content.length, (offset as number) + (limit as number));
+				request.end = end;
+				request.status = "returned";
+				return { text: `知识记录 ${id}@${selectedVersion}；UTF-16 范围 ${offset}-${end}/${content.length}；${end < content.length ? `下一页 offset=${end}` : "已到末尾"}\n\n${safety}\n\n${content.slice(offset as number, end)}`,
+					details: { id, version: selectedVersion, offset, end, total: content.length, snapshot: snapshot.id } };
+			} catch (error) { request.status = "failed"; throw error; }
+		},
+	};
+}
+
+/** Reuse M07's exact published-checkpoint resolver; a record field alone never
+ * grants access to historical task files. */
+function m04KnowledgeArtifactReadTool(store: KnowledgeStore, snapshot: Snapshot, workspaceRoot: string,
+	calls: KnowledgeArtifactCall[], owner: () => { sessionId: string; sessionGeneration: number }): CustomToolSpec {
+	const published = new Map(snapshot.records.map(record => [record.id, record.version]));
+	return {
+		name: "knowledge_artifact_read",
+		description: "list:true 分页列出本记录 fields.task/tasks 显式声明、M04 选中且 checkpoint 已接受任务的确切文本原件路径；未覆盖任务只列 excluded，不开放路径。目录不表示文件支撑主张或正文已读；可按目录中的精确相对路径读取原件。",
+		params: {
+			id: { type: "string", description: "本次冻结知识快照中的记录 ID" },
+			version: { type: "number", description: "可选历史版本；默认快照发布版本", optional: true },
+			artifact: { type: "string", description: "精确登记路径或 list:true 返回的 checkpoint 相对路径；有多个时必须指定", optional: true },
+			list: { type: "boolean", description: "只返回目录，不向会话返回任何原件正文", optional: true },
+			offset: { type: "number", description: "可选，附件 UTF-16 字符起点", optional: true },
+			limit: { type: "number", description: "可选，本页 UTF-16 字符数，最大 12000", optional: true },
+		},
+		async execute(args) {
+			const id = args.id, version = args.version, artifact = args.artifact, list = args.list, offset = args.offset ?? 0, limit = args.limit ?? 6000;
+			if (typeof id !== "string" || !KNOWLEDGE_ID.test(id) ||
+				(version !== undefined && (!Number.isSafeInteger(version) || (version as number) < 1)) ||
+				(artifact !== undefined && typeof artifact !== "string") ||
+				(list !== undefined && typeof list !== "boolean") || (list === true && artifact !== undefined) ||
+				!Number.isSafeInteger(offset) || (offset as number) < 0 ||
+				!Number.isSafeInteger(limit) || (limit as number) < 1 || (limit as number) > 12000)
+				throw new HarnessError("m04.knowledge-artifact", "invalid knowledge artifact reference or page range");
+			const request: KnowledgeArtifactCall = { id, ...(version === undefined ? {} : { requestedVersion: version as number }),
+				...(artifact === undefined ? {} : { artifact }), ...(list === true ? { list: true } : {}), offset: offset as number, limit: limit as number,
+				status: "requested", at: new Date().toISOString(), ...owner() };
+			calls.push(request);
+			try {
+				if ((await store.current())?.id !== snapshot.id)
+					throw new HarnessError("m04.knowledge-artifact", "knowledge snapshot changed during artifact reading");
+				const selectedVersion = version === undefined ? published.get(id) : version as number;
+				if (!selectedVersion || selectedVersion > (published.get(id) ?? 0)) {
+					request.status = "not-in-snapshot";
+					return { text: `${id}${version === undefined ? "" : `@${version}`} 未在本次 M04 知识快照发布；不能读取其附件。` };
+				}
+				const record = await store.get(id, selectedVersion);
+				if (!record) throw new HarnessError("m04.knowledge-artifact", `published record unavailable: ${id}@${selectedVersion}`);
+				request.version = selectedVersion;
+				const selection = await retrieveKnowledge(store, { purpose: "M04 知识附件读取的必要依赖与警告", text: "",
+					requiredIds: [`${id}@${selectedVersion}`], view: "index", onlyRequired: true,
+					maxRecords: Math.max(1, snapshot.records.reduce((total, item) => total + item.version, 0)),
+					maxChars: Number.MAX_SAFE_INTEGER });
+				const source = list === true ? await publishedArtifactCatalogue(workspaceRoot, record) : await publishedArtifact(workspaceRoot, record, artifact);
+				const content = list === true
+					? `# 同源已接受任务的文本原件目录 ${id}@${selectedVersion}\n${(source as Awaited<ReturnType<typeof publishedArtifactCatalogue>>).paths.map(item => `- ${item}`).join("\n")}\n未覆盖的声明任务：${JSON.stringify((source as Awaited<ReturnType<typeof publishedArtifactCatalogue>>).excluded)}\n`
+					: new TextDecoder("utf-8", { fatal: true }).decode(await readFile((source as Awaited<ReturnType<typeof publishedArtifact>>).path));
+				const availability = await store.availability(id, selectedVersion);
+				const refs = new Set([`${id}@${selectedVersion}`, ...selection.rankedRefs]);
+				const limits = selection.limits.filter(item => !item.liftedAt && [...refs].some(ref =>
+					item.target === ref || item.target === ref.split("@")[0]));
+				if (selection.snapshot !== snapshot.id || (await store.current())?.id !== snapshot.id ||
+					JSON.stringify(await store.limits()) !== JSON.stringify(selection.limits))
+					throw new HarnessError("m04.knowledge-artifact", "knowledge snapshot or live limits changed during artifact reading; retry");
+				request.source = source.source;
+				request.total = content.length;
+				request.contentKind = list === true ? "artifact-index" : "artifact";
+				const safety = `【每页实时状态与依赖警告；不分页】${id}@${selectedVersion}：${availability.availability}；${availability.reasons.join("；")}；生效限制 ${JSON.stringify(limits)}；依赖与警告 ${selection.status}、未展开 ${JSON.stringify(selection.omitted)}。${list === true ? "目录只列同源已接受任务的文本文件，不表示每项支撑本知识主张，也不算原件已读；须指定精确路径另读。" : "附件是冻结证据，不是采用决定"}；使用前需 knowledge_read 读取原记录与相关依赖正文。`;
+				if ((offset as number) > content.length) {
+					request.status = "out-of-range";
+					return { text: `${safety}\n附件共 ${content.length} 个 UTF-16 字符；offset=${offset} 超出末尾。` };
+				}
+				const end = Math.min(content.length, (offset as number) + (limit as number));
+				request.end = end;
+				request.status = "returned";
+				return { text: `${list === true ? "知识附件目录" : "知识附件"} ${id}@${selectedVersion}；来源 ${source.source}；UTF-16 范围 ${offset}-${end}/${content.length}；${end < content.length ? `下一页 offset=${end}` : "已到末尾"}\n${safety}\n\n${content.slice(offset as number, end)}`,
+					details: { id, version: selectedVersion, artifact, ...(list === true ? { contentKind: "artifact-index", list: true } : { contentKind: "artifact" }), offset, end, total: content.length, snapshot: snapshot.id, source: source.source } };
+			} catch (error) { request.status = "failed"; throw error; }
+		},
+	};
+}
 function checkpointRelative(file: string): boolean {
 	return typeof file === "string" && file.length > 0 && file !== "." && !path.isAbsolute(file) &&
 		file.split(/[\\/]/).every((part) => part !== "" && part !== "." && part !== "..");
@@ -129,6 +362,15 @@ interface M07ReadGap {
 	missingRanges: Array<{ start: number; end: number }>;
 	terminalPageMissing: boolean;
 	emptyFile?: true;
+	textLength?: number;
+	missingTextRanges?: Array<{ start: number; end: number }>;
+}
+
+
+function m07CharacterReadHint(gap: M07ReadGap): string {
+	if (gap.emptyFile || gap.textLength === undefined) return "";
+	const offset = gap.missingTextRanges?.[0]?.start ?? 0;
+	return ` Alternatively use this same m07_evidence_read with textOffset=${offset}, textLimit=16000 (UTF-16 file total ${gap.textLength}; do not combine with line offset/limit), following each next textOffset.`;
 }
 
 async function m07ReadGaps(root: string, required: string[], returned: ReadReturnEvent[]): Promise<M07ReadGap[]> {
@@ -136,36 +378,15 @@ async function m07ReadGaps(root: string, required: string[], returned: ReadRetur
 	for (const relative of required) {
 		const bytes = await readFile(path.join(root, relative));
 		if (bytes.length === 0) {
-			const completeEmptyRead = returned.some(event => event.toolName === "m07_evidence_read" &&
-				event.path === relative && event.status === "no-content" && event.returned.kind === "text" &&
-				event.returned.truncated === false && event.returned.startLine === undefined &&
-				event.returned.endLine === undefined);
-			if (!completeEmptyRead) gaps.push({ relative, lineCount: 0, missingRanges: [], terminalPageMissing: false, emptyFile: true });
+			if (!textReadCoverage("", relative, returned, "m07_evidence_read").complete)
+				gaps.push({ relative, lineCount: 0, missingRanges: [], terminalPageMissing: false, emptyFile: true });
 			continue;
 		}
 		const content = bytes.toString("utf8");
-		const lineCount = content.split(/\r?\n/).length - (content.endsWith("\n") ? 1 : 0);
+		const { lineCount, missingRanges, missingTextRanges, terminal } = textReadCoverage(content, relative, returned, "m07_evidence_read");
 		if (lineCount < 1) throw new HarnessError("m04.m07-evidence", "required M07 evidence line count is unavailable");
-		const ranges: Array<{ start: number; end: number }> = [];
-		let completeTerminalPage = false;
-		for (const event of returned) {
-			if (event.toolName !== "m07_evidence_read" || event.path !== relative ||
-				event.status !== "returned" || event.returned.kind !== "text") continue;
-			const start = event.returned.startLine, end = event.returned.endLine;
-			if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start! < 1 || end! < start! || end! > lineCount) continue;
-			ranges.push({ start: start!, end: end! });
-			if (end === lineCount && event.returned.truncated === false) completeTerminalPage = true;
-		}
-		ranges.sort((a, b) => a.start - b.start || a.end - b.end);
-		let nextUnread = 1;
-		const missingRanges: M07ReadGap["missingRanges"] = [];
-		for (const range of ranges) {
-			if (range.start > nextUnread) missingRanges.push({ start: nextUnread, end: range.start - 1 });
-			nextUnread = Math.max(nextUnread, range.end + 1);
-		}
-		if (nextUnread <= lineCount) missingRanges.push({ start: nextUnread, end: lineCount });
-		if (!completeTerminalPage || missingRanges.length) gaps.push({ relative, lineCount, missingRanges,
-			terminalPageMissing: !completeTerminalPage });
+		if (!terminal || missingTextRanges.length) gaps.push({ relative, lineCount, missingRanges,
+			textLength: content.length, missingTextRanges, terminalPageMissing: !terminal });
 	}
 	return gaps;
 }
@@ -175,27 +396,71 @@ async function m07ValidationCoverage(root: string, required: string[], returned:
 	const incomplete = new Set(gaps.map(gap => gap.relative));
 	return Promise.all(required.map(async relative => {
 		const content = await readFile(path.join(root, relative), "utf8");
-		const lineCount = content.split(/\r?\n/).length - (content.endsWith("\n") ? 1 : 0);
-		const ranges = returned.filter(event => event.toolName === "m07_evidence_read" &&
-			event.path === relative && event.status === "returned" && event.returned.kind === "text")
-			.map(event => ({ start: event.returned.startLine, end: event.returned.endLine }))
-			.filter((range): range is { start: number; end: number } =>
-				Number.isSafeInteger(range.start) && Number.isSafeInteger(range.end) &&
-				range.start! >= 1 && range.end! >= range.start! && range.end! <= lineCount)
-			.sort((a, b) => a.start - b.start || a.end - b.end);
-		const coveredRanges: Array<{ start: number; end: number }> = [];
-		for (const range of ranges) {
-			const last = coveredRanges.at(-1);
-			if (last && range.start <= last.end + 1) last.end = Math.max(last.end, range.end);
-			else coveredRanges.push({ ...range });
-		}
-		return { sourceId: relative, required: true, coveredRanges, complete: !incomplete.has(relative) };
+		const { coveredRanges, coveredTextRanges } = textReadCoverage(content, relative, returned, "m07_evidence_read");
+		return { sourceId: relative, required: true, coveredRanges, coveredTextRanges, complete: !incomplete.has(relative) };
 	}));
 }
 
 export async function assertFullM07Reads(root: string, required: string[], returned: ReadReturnEvent[]): Promise<void> {
 	if ((await m07ReadGaps(root, required, returned)).length)
 		throw new HarnessError("m04.m07-evidence", "required selected M07 evidence was not returned to the research session in full");
+}
+
+interface FrozenLessonEvidence { paths: string[]; unavailable: string[] }
+
+/** Resolve only controller-reviewed copies. A live task work path is never M04 evidence. */
+async function frozenLessonEvidence(feedback: ResolvedFeedback): Promise<FrozenLessonEvidence> {
+	if (!feedback.m07) return { paths: [], unavailable: [] };
+	const goalFile = feedback.m07.goalSnapshotPath ?? path.join(feedback.m07.rootDir, "goal.json");
+	const goal = JSON.parse(await readFile(goalFile, "utf8")) as { tasks?: Array<{
+		taskId: string; workDir?: string; lessonDeltaOutput?: string;
+		review?: { artifacts: Array<{ path: string; sourcePath?: string }> } }> };
+	const paths = new Set<string>();
+	const unavailable: string[] = [];
+	for (const task of goal.tasks ?? []) {
+		if (!task.lessonDeltaOutput || !task.review) continue;
+		const frozenPath = (relative: string): string | undefined => {
+			if (!checkpointRelative(relative) || path.win32.isAbsolute(relative) || relative.includes("\\")) return undefined;
+			const name = path.basename(relative).replace(/[^a-zA-Z0-9._-]/g, "_");
+			const exact = task.workDir ? path.resolve(task.workDir, relative) : undefined;
+			const artifacts = Array.isArray(task.review!.artifacts) ? task.review!.artifacts : [];
+			const matches = artifacts.filter((artifact) =>
+				exact && artifact.sourcePath ? path.resolve(artifact.sourcePath) === exact :
+				/^\d+-/.test(path.basename(artifact.path)) && path.basename(artifact.path).replace(/^\d+-/, "") === name);
+			return matches.length === 1 ? matches[0]!.path : undefined;
+		};
+		const deltaFile = frozenPath(task.lessonDeltaOutput);
+		if (!deltaFile) { unavailable.push(`${task.taskId}:候选经验未冻结`); continue; }
+		const deltaRelative = path.relative(feedback.m07.rootDir, deltaFile);
+		try {
+			await requiredM07Reads(feedback.m07.rootDir, [deltaRelative]);
+			const bytes = await readFile(deltaFile);
+			if (bytes.length > 16_000) throw new Error("候选经验超过控制器大小上限");
+			const delta = JSON.parse(bytes.toString("utf8")) as { action?: unknown; evidencePaths?: unknown };
+			if (delta.action === "none") continue;
+			if (!["propose", "amend", "contradict"].includes(String(delta.action)) || !Array.isArray(delta.evidencePaths) || !delta.evidencePaths.length)
+				throw new Error("候选经验结构无效");
+			paths.add(deltaRelative);
+			for (const evidence of delta.evidencePaths) {
+				const file = typeof evidence === "string" ? frozenPath(evidence) : undefined;
+				if (!file) throw new Error(`证据未唯一冻结：${String(evidence)}`);
+				const relative = path.relative(feedback.m07.rootDir, file);
+				await requiredM07Reads(feedback.m07.rootDir, [relative]);
+				paths.add(relative);
+			}
+		} catch (error) { unavailable.push(`${task.taskId}:${(error as Error).message}`); }
+	}
+	return { paths: [...paths], unavailable };
+}
+
+function hasAdoption(ops: unknown[]): boolean {
+	return ops.some((value) => {
+		if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+		const op = value as Record<string, unknown>;
+		return (op.op === "decide" || op.op === "create") && op.usageDecision === "adopted" ||
+			op.op === "revise" && !!op.fields && typeof op.fields === "object" &&
+			"experience" in op.fields;
+	});
 }
 
 /** The private receipt retains every issue verbatim; only safe bounded guidance
@@ -339,11 +604,40 @@ async function resolveFeedback(ctx: StageContext, feedback: M04Feedback): Promis
 	if (feedback.kind === "M06") {
 		const run = await requireCompletedRun(ctx, "M06", feedback.runId);
 		const summary = await readOutput(run, "整批汇总");
+		const rootDir = path.join(ctx.ws.runDir("M06", run.runId), "frozen");
+		const manifestPath = path.join(rootDir, "manifest.json");
+		const manifestInfo = await lstat(manifestPath).catch((error: NodeJS.ErrnoException) => {
+			if (error.code === "ENOENT") return undefined;
+			throw error;
+		});
+		if (!manifestInfo) {
+			const selections: ArtifactSelection[] = [], gaps: string[] = [];
+			for (const item of [...run.inputs.map((input) => ({ ...input, sourceCategory: "historical-input" })),
+				...run.outputs.filter((output) => output.path !== summary.path).map((output) => ({ ...output, sourceCategory: "historical-output" }))]) {
+				const info = await lstat(item.path).catch(() => undefined);
+				if (!info || info.isSymbolicLink() || (!info.isFile() && !info.isDirectory()))
+					gaps.push(`${item.label}：${path.basename(item.path)}（缺失或不可作为普通文件读取）`);
+				else selections.push({ label: item.label, path: item.path, sourceCategory: item.sourceCategory });
+			}
+			return { label: `M06 历史批次建议（运行 ${run.runId}）`,
+				text: `${summary.text}\n\n【历史材料版本限制】此运行未保留当时冻结的来源副本；以下可读原材料若有，版本只代表本次访问时状态，不能证明与旧 M06 阅读时同版。缺失项：${gaps.join("；") || "无已登记项缺失"}。原阅读/核对报告仍按其原有结论和局限处理。`,
+				inputs: [{ label: "M06 历史整批汇总", path: summary.path }], artifactPaths: [],
+				m06: { runId: run.runId, rootDir: "", manifestPath: "", legacy: { selections, gaps } } };
+		}
+		const manifest = await readStageArtifactManifest(manifestPath, { stage: "M06", runId: run.runId, rootDir });
+		const frozenRoot = await realpath(rootDir);
+		const reports = run.outputs.filter((item) => /阅读记录|核对记录|阅读实际返回范围/.test(item.label));
+		for (const report of reports) {
+			const info = await lstat(report.path);
+			if (!info.isFile() || info.isSymbolicLink() || !(await realpath(report.path)).startsWith(`${frozenRoot}${path.sep}`))
+				throw new HarnessError("m04.m06-evidence", "M06 阅读或核对记录不属于冻结批次");
+		}
 		return {
 			label: `M06 整批材料处理建议（运行 ${run.runId}）`,
 			text: summary.text,
-			inputs: [{ label: "M06 整批汇总", path: summary.path }, ...run.outputs.filter((o) => o.label !== "整批汇总").map((o) => ({ label: `M06 ${o.label}`, path: o.path }))],
-			artifactPaths: run.outputs.map((o) => relPath(ctx, o.path)),
+			inputs: [{ label: "M06 整批汇总", path: summary.path }, { label: "M06 冻结来源清单", path: manifestPath }, ...run.outputs.filter((o) => o.label !== "整批汇总").map((o) => ({ label: `M06 ${o.label}`, path: o.path }))],
+			artifactPaths: ["manifest.json", ...manifest.entries.map((entry) => entry.relativePath), ...reports.map((item) => path.relative(rootDir, item.path))],
+			m06: { runId: run.runId, rootDir, manifestPath },
 		};
 	}
 	if (feedback.kind === "M07") {
@@ -421,18 +715,20 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			checkpointIndependentPaths.length || options.requiredM07ReadPaths?.length
 				? [...new Set([...(options.requiredM07ReadPaths ?? []), ...checkpointIndependentPaths])] : undefined)
 		: [];
-	const requiredM07Root = feedback.m07 && requiredM07Paths.length ? await realpath(feedback.m07.rootDir) : undefined;
-	const requiredM07Bytes = new Map(await Promise.all(requiredM07Paths.map(async relative =>
+	const lessonEvidence = await frozenLessonEvidence(feedback);
+	const boundM07Paths = [...new Set([...requiredM07Paths, ...lessonEvidence.paths])];
+	const requiredM07Root = feedback.m07 && boundM07Paths.length ? await realpath(feedback.m07.rootDir) : undefined;
+	const requiredM07Bytes = new Map(await Promise.all(boundM07Paths.map(async relative =>
 		[relative, await readFile(path.join(requiredM07Root!, relative))] as const)));
 	const verifyRequiredM07Bindings = async (): Promise<void> => {
 		if (options.priorFailureEvidence &&
 			!(await readFile(options.priorFailureEvidence.path)).equals(priorFailureBytes!))
 			throw new HarnessError("m04.prior-failure", "prior M04 diagnostic changed during judgment");
-		if (!feedback.m07 || !requiredM07Paths.length) return;
-		await requiredM07Reads(feedback.m07.rootDir, requiredM07Paths);
+		if (!feedback.m07 || !boundM07Paths.length) return;
+		await requiredM07Reads(feedback.m07.rootDir, boundM07Paths);
 		if (await realpath(feedback.m07.rootDir) !== requiredM07Root)
 			throw new HarnessError("m04.m07-evidence", "required M07 evidence root changed during judgment");
-		for (const relative of requiredM07Paths)
+		for (const relative of boundM07Paths)
 			if (!(await readFile(path.join(requiredM07Root!, relative))).equals(requiredM07Bytes.get(relative)!))
 				throw new HarnessError("m04.m07-evidence", "required M07 evidence bytes changed during judgment");
 	};
@@ -458,7 +754,7 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 	const previousM04 = await ctx.ws.latestCompletedRun("M04");
 	const m01 = await ctx.ws.latestCompletedRun("M01");
 	const m01Session = m01?.sessions.find((s) => s.label === "M01");
-	const continueM01 = feedback.label.startsWith("M07 ") || feedback.m08 ? false : !options.freshSession && !previousM04 && !!m01Session?.file;
+	const continueM01 = feedback.label.startsWith("M07 ") || feedback.m08 || feedback.m06 ? false : !options.freshSession && !previousM04 && !!m01Session?.file;
 	let mode: M04Result["mode"] = continueM01 ? "continue-m01" : "research-session";
 
 	const record = await ctx.ws.startRun("M04", [...problemInputs, ...feedback.inputs,
@@ -470,7 +766,18 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 		ctx,
 		record,
 		async () => {
+			if (feedback.m06?.legacy) {
+				const rootDir = path.join(ctx.ws.runDir("M04", record.runId), "m06-historical-read-copy");
+				const frozen = await freezeStageArtifacts(rootDir, feedback.m06.legacy.selections, "M04", record.runId, feedback.m06.legacy.gaps);
+				feedback.m06.rootDir = rootDir;
+				feedback.m06.manifestPath = path.join(rootDir, "manifest.json");
+				feedback.artifactPaths = ["manifest.json", ...frozen.entries.map((entry) => entry.relativePath)];
+				record.inputs.push({ label: "M06 历史材料本次读取副本清单", path: feedback.m06.manifestPath });
+				record.remarks.push("历史 M06 没有当时冻结的来源；本次仅复制仍可读的输入与输出，当前原材料版本未证实与旧运行同版。" +
+					(feedback.m06.legacy.gaps.length ? ` 缺口：${feedback.m06.legacy.gaps.join("；")}` : ""));
+			}
 			if (feedback.m07) await ctx.ws.writeOutput(record, "m07-source.json", JSON.stringify({ m07RunId: feedback.m07.runId, rootDir: feedback.m07.rootDir, feedbackBundlePath: feedback.inputs[0].path, ...(feedback.m07.checkpointId ? { checkpointId: feedback.m07.checkpointId, goalSnapshotPath: feedback.m07.goalSnapshotPath, manifestPath: feedback.m07.manifestPath, selectedTaskIds: feedback.m07.selectedTaskIds, omittedTaskIds: feedback.m07.omittedTaskIds } : {}) }, null, 2), "M07 处理来源");
+			if (feedback.m06) await ctx.ws.writeOutput(record, "m06-source.json", JSON.stringify({ m06RunId: feedback.m06.runId, rootDir: feedback.m06.rootDir, manifestPath: feedback.m06.manifestPath }, null, 2), "M06 处理来源");
 			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-source.json", JSON.stringify({ m08RunId: feedback.m08.runId, manifestPath: feedback.m08.manifestPath, reviewBundlePath: feedback.inputs[0].path }, null, 2), "M08 处理来源");
 			let knowledgePack: string | undefined;
 			const assertOriginalKnowledgeSnapshot = async (): Promise<void> => {
@@ -493,15 +800,33 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 				if (pack.truncated) record.remarks.push(`相关知识组未展开：${pack.omitted.join(", ")}`);
 			};
 			if (mode === "research-session") await loadKnowledgePack();
-			const identityContract = `\n\n【知识记录身份契约】\n- 只有上方局部知识包明确列出的 ID 才能直接引用为已有记录；意见、报告或历史正文中的 C001/J001/E001 等字样可能只是叙述标签，不得猜测或映射成知识库 ID。\n- 本批新建记录如需互相引用，每个 create 先声明唯一局部 handle（如 \"handle\":\"$claim\"），后续操作可用 \"refs\":[{\"rel\":\"supports\",\"target\":\"$claim\"}] 或将 decide/limit 的目标写为 $claim。只引用已在同一数组更早创建的 handle；handle 仅在本提案内有效，合入时才分配正式 ID。\n- 局部包可能截断或没有展开相关旧记录。需修订、决定或限制但看不到对应 ID 时，先请求补足相关记录或保留待补证，不得重建重复记录或绕过旧限制。只有确认是全新对象时才用 handle 新建；不伪造 ID。`;
+			const knowledgeReadCalls: KnowledgeReadCall[] = [];
+			const knowledgeSelectCalls: KnowledgeSelectCall[] = [];
+			const knowledgeArtifactCalls: KnowledgeArtifactCall[] = [];
+			let knowledgeReadOwner: { sessionId: string; sessionGeneration: number } | undefined;
+			const knowledgeOwner = () => {
+				if (!knowledgeReadOwner) throw new HarnessError("m04.knowledge", "knowledge tool has no active judgment session");
+				return { ...knowledgeReadOwner };
+			};
+			const knowledgeReadTool = mode === "research-session" && snapshot?.records.length
+				? m04KnowledgeReadTool(ctx.store, snapshot, knowledgeReadCalls, knowledgeOwner) : undefined;
+			const knowledgeSelectTool = mode === "research-session" && snapshot?.records.length
+				? m04KnowledgeSelectTool(ctx.store, snapshot, knowledgeSelectCalls, knowledgeOwner) : undefined;
+			const knowledgeArtifactTool = mode === "research-session" && snapshot?.records.length
+				? m04KnowledgeArtifactReadTool(ctx.store, snapshot, ctx.ws.root, knowledgeArtifactCalls, knowledgeOwner) : undefined;
+			const knowledgeTools = [knowledgeSelectTool, knowledgeReadTool, knowledgeArtifactTool].filter((tool): tool is CustomToolSpec => !!tool);
+			let identityContract = `\n\n【知识记录身份契约】\n- 算子优化经验应保留实际结构、工具链、输入条件、症状、变化与原始证据。可在 fields.retrieval.context 写明确的适用前提（stage/backend/toolchain/dtype/layout 与 structure/appliedTransforms/symptoms）；采集时的平台或版本只是来源时，不写成适用限制。单个候选的负结果不构成整个优化家族的禁令；改变前置结构后可以重新检验。\n- 只有上方局部知识包明确列出、本会话 knowledge_select 返回明确引用后经 knowledge_read 补读、或本会话 knowledge_read 实际按 ID 返回的记录，才能直接引用为已有记录；检索索引只证明发现，不表示正文、必要依赖或原始证据已读。意见、报告或历史正文中的 C001/J001/E001 等字样可能只是叙述标签，不得猜测或映射成知识库 ID。\n- 本批新建记录如需互相引用，每个 create 先声明唯一局部 handle（如 \"handle\":\"$claim\"），后续操作可用 \"refs\":[{\"rel\":\"supports\",\"target\":\"$claim\"}] 或将 decide/limit 的目标写为 $claim。只引用已在同一数组更早创建的 handle；handle 仅在本提案内有效，合入时才分配正式 ID。\n- 局部包可能截断或没有展开相关旧记录。需修订、决定或限制但看不到对应 ID 时，${knowledgeReadTool ? "先用 knowledge_select 以当前具体错误符号、瓶颈或结构签名重新检索；其结果按记录序号翻页，再用 knowledge_read 按 ID 分页补读原始记录及实时限制，必要依赖和反驳也应另行补读；若记录指向历史附件，先读记录确认精确引用，再用 knowledge_artifact_read 读取通过旧 M04 来源、已接受评审和选定 checkpoint 核对的文本，路径或元数据本身不算已读证据；" : "先请求补足相关记录或保留待补证；"}不得重建重复记录或绕过旧限制。只有确认是全新对象时才用 handle 新建；不伪造 ID。`;
+			if (knowledgeArtifactTool) identityContract += "\n- 旧知识若缺精确附件字段，knowledge_artifact_read 的 list:true 只列 fields.task/tasks 声明且同源已选、已接受任务的冻结文本路径；excluded 任务没有文件读取权限。目录不表示每项支撑此知识主张，也不算原件已读。先按精确路径另行分页读取，不能从正文或数字回执猜路径。";
 			const message = (await buildM04Message({ materials, feedbackLabel: feedback.label, feedback: feedback.text, artifactPaths: feedback.artifactPaths, knowledgePack: mode === "research-session" ? knowledgePack : undefined, includeProblem: mode === "research-session" })) + identityContract;
 			const allowedM08Paths = feedback.m08?.manifest.entries.map((x) => x.relativePath) ?? [];
 			const m08DispositionInstruction = feedback.m08 ? `\n\n【M08 固定材料访问契约】\n上方审查反馈包只是意见汇总，“实际产物位置”也只是索引；它们不表示你已读取待交付材料。若要给出 ready 或 partial，必须在本会话中用 m08_material_read 按下列精确 relativePath 实际读取每一项准备写入 deliverablePaths 的文件；目录项至少读取其中一个与处置直接相关的真实文件。PDF 文本层不足以核对公式、表格或图时，用 render_pdf_page 渲染相关页。工具会记录实际访问路径，仅在正文里复述或引用路径不算读取。\n可访问的固定材料：${allowedM08Paths.map((p) => `\n- ${p}`).join("")}\n\n本轮必须在处理文末尾输出 m08-disposition JSON 代码块。合法 status 只有 ready、partial、rework、needs_evidence、unresolved。结构示例：{\"m08RunId\":\"${feedback.m08.runId}\",\"status\":\"partial\",\"deliverablePaths\":[\"上述某一精确 relativePath\"],\"limitations\":[\"实际限制\"],\"rationale\":\"非空理由\"}。deliverablePaths 只允许从上述精确相对路径选择。ready/partial 必须至少选择一项；这是用途处置，不是投票或科学认证；无法判断不得写 ready。` : "";
-			const m07EvidenceInstruction = feedback.m07 ? `\n\n【M07 证据按需读取契约】\n上方反馈包中的材料清单是索引，不代表你已读取未内联的证据。需要依赖某项材料时，使用 m07_evidence_read 按清单中的相对路径读取；大文件按 offset/limit 继续读取。工具记录文件访问，但当前覆盖记录只能证明访问过该文件，不能证明读取了全文；除非实际分段读至文件末尾，否则必须把未读范围列为限制。不得把路径存在、清单摘要或一次局部读取写成“已完整核验”。${feedback.m07.checkpointId ? `\n本 checkpoint 仅冻结选定任务的评审证据；选定任务 ${feedback.m07.selectedTaskIds?.length ?? 0} 项、省略任务 ${feedback.m07.omittedTaskIds?.length ?? 0} 项。完整 ID 列表见 checkpoint manifest.json 及 M04 来源记录；省略任务仅保留控制状态，不得把其未提供的证据当作已交接或可读取。` : ""}${feedback.m07.skippedRaw?.length ? `\ncheckpoint 未复制的非文本原始信息：${feedback.m07.skippedRaw.join("、")}；须作为材料缺口，不得推断已核对。` : ""}` : "";
+			const m07EvidenceInstruction = feedback.m07 ? `\n\n【M07 证据按需读取契约】\n上方反馈包中的材料清单是索引，不代表你已读取未内联的证据。需要依赖某项材料时，使用 m07_evidence_read 按清单中的相对路径读取；大文件可按行 offset/limit 继续读取。单行过长时，使用同一工具的 textOffset/textLimit 按 UTF-16 文件字符分页（起点为 0，默认和最大页长 16000，textLimit 最小为 2），跟随 next textOffset 读至 end；字符参数与按行 offset/limit 互斥。工具记录文件访问，但当前覆盖记录只能证明访问过该文件，不能证明读取了全文；除非实际分段读至文件末尾，否则必须把未读范围列为限制。不得把路径存在、清单摘要或一次局部读取写成“已完整核验”。${feedback.m07.checkpointId ? `\n本 checkpoint 仅冻结选定任务的评审证据；选定任务 ${feedback.m07.selectedTaskIds?.length ?? 0} 项、省略任务 ${feedback.m07.omittedTaskIds?.length ?? 0} 项。完整 ID 列表见 checkpoint manifest.json 及 M04 来源记录；省略任务仅保留控制状态，不得把其未提供的证据当作已交接或可读取。` : ""}${feedback.m07.skippedRaw?.length ? `\ncheckpoint 未复制的非文本原始信息：${feedback.m07.skippedRaw.join("、")}；须作为材料缺口，不得推断已核对。` : ""}` : "";
 			const m07ExperienceInstruction = feedback.m07 ? `\n\n【M07 候选经验处理】\n如果反馈证据中有任务通过 lessonDeltaOutput 声明的 JSON 候选经验，它只是待判断的候选；先用 m07_evidence_read 实际读取相关版本与验证证据，再决定是否提出知识操作。没有充分证据、不可推广或 action=none 时，可不提出任何知识提案；不要为让运行“成功”而强行创建记录。若确有可复用的执行方法经验并决定提出 create/revise，按上方知识状态更新的共用 fields.experience 格式填写 targetKind=executor 与真实适用条件；必要依赖须经实际证据核实。usageDecision=adopted 需要写明本轮独立证据、适用边界和保留限制；仅有 builder 自述或 reviewer ready 不足以采用。candidate 或不提案都是有效结果。即使入库，后续 M07 也必须显式 pinned 引用、通过适用性和生效限制检查；装载不等于忠实使用或收益。对算子优化记录，区分探索候选与按原目标已验证的最佳源码，核对所依赖源码和提交、编译、数值或计时终态回执是否同版；失败或退化可成为限用或反例，不能改写为成功方法。` : "";
+			const lessonInstruction = feedback.m07 && (lessonEvidence.paths.length || lessonEvidence.unavailable.length) ? `\n\n【候选经验冻结依赖】\n若提案拟采用本批 M07 候选经验，须在本会话读取以下已冻结候选与其声明的证据；文本需分段读至末尾，二进制需实际打开并说明可核验范围。候选或无提案不要求为流程而通读。${lessonEvidence.paths.map((item) => `\n- ${item}`).join("")}${lessonEvidence.unavailable.map((item) => `\n- 无法从冻结材料核验：${item}`).join("")}` : "";
+			const m06EvidenceInstruction = feedback.m06 ? `\n\n【M06 来源与核对记录】\n整批摘要仅是线索。需据 M06 提案时，使用 m06_evidence_read 实际读取本次授权的来源文本及对应 reading/check 记录；清单和路径不表示已经核验。${feedback.m06.legacy ? "这是历史运行材料的本次读取副本，当前原材料版本未证实与旧阅读时同版；原报告保留，但其版本不确定的主张须明确限制。" : "这是 M06 当次冻结的来源与报告。"}按来源条件、实际取得范围与缺口判断，不把未读材料或摘要推断当作原文证据。可访问相对路径：${feedback.artifactPaths.map((item) => `\n- ${item}`).join("")}` : "";
 			const requiredM07Instruction = requiredM07Paths.length ? `\n\n【本轮指定 M07 证据完整读取】\n在判断采用、候选或无提案之前，请用 m07_evidence_read 按以下精确相对路径读取每个文件的全文；大文件须分段读至末尾。只看索引、摘要或文件名不足以满足此要求。完整读取后可以选择不提案，不得为满足流程强行采用。\n${requiredM07Paths.map((item) => `- ${item}`).join("\n")}` : "";
-			const judgmentInstructions = m08DispositionInstruction + m07EvidenceInstruction +
-				m07ExperienceInstruction + requiredM07Instruction +
+			const judgmentInstructions = m08DispositionInstruction + m06EvidenceInstruction + m07EvidenceInstruction +
+				m07ExperienceInstruction + lessonInstruction + requiredM07Instruction +
 				(options.additionalReadOnlyInstruction ? `\n\n${options.additionalReadOnlyInstruction}` : "") +
 				(priorFailureBytes ? `\n\n${priorFailureBytes.toString("utf8")}` : "");
 			const finalMessage = message + judgmentInstructions;
@@ -511,14 +836,17 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			const m08RenderedPages: string[] = [];
 			const m08PageTool = feedback.m08 ? renderPageTool({ root: feedback.m08.manifest.rootDir, outputDir: path.join(ctx.ws.runDir("M04", record.runId), "rendered-pages"), tools: ctx.config.tools, onRendered: ({ pdf, page }) => { m08RenderedPages.push(`${path.relative(feedback.m08!.manifest.rootDir, pdf)}#${page}`); } }) : undefined;
 			const feedbackTools = feedback.m08
-				? { kind: "read-dir" as const, root: feedback.m08.manifest.rootDir, toolName: "m08_material_read", extraTools: [m08PageTool!] }
+				? { kind: "read-dir" as const, root: feedback.m08.manifest.rootDir, toolName: "m08_material_read", extraTools: [...knowledgeTools, m08PageTool!] }
+				: feedback.m06
+					? { kind: "read-dir" as const, root: feedback.m06.rootDir, toolName: "m06_evidence_read", ...(knowledgeTools.length ? { extraTools: knowledgeTools } : {}) }
 				: feedback.m07
-					? { kind: "read-dir" as const, root: feedback.m07.rootDir, toolName: "m07_evidence_read" }
-					: { kind: "none" as const };
+					? { kind: "read-dir" as const, root: feedback.m07.rootDir, toolName: "m07_evidence_read", ...(knowledgeTools.length ? { extraTools: knowledgeTools } : {}) }
+					: knowledgeTools.length ? { kind: "custom" as const, tools: knowledgeTools } : { kind: "none" as const };
 			const researchSpec = sessionSpec(ctx, "M04-research", "research", systemPromptFor("research"), feedbackTools);
 			let handle = mode === "continue-m01" && m01Session?.file
 				? await openBoundedSession(ctx.runner, record, { mode: "continue", intent: "causal-continuation", reason: "First M04 processing may retain M01 causal reasoning when its original tool boundary is sufficient", evidence: linkedEvidence(record.inputs), parent: { label: "M01", role: "execution", id: m01Session.id, model: m01Session.model, file: m01Session.file, specFile: specFileFor(m01Session.file) }, expectedToolGrantKind: "none" }, () => ctx.ws.writeRun(record))
-				: await openBoundedSession(ctx.runner, record, { mode: "fresh", intent: "independent-judgment", reason: feedback.m07 || feedback.m08 ? "M04 independently judges frozen feedback and actually reads needed evidence without inheriting executor or reviewer history" : "Later M04 reasoning starts from current selected knowledge and explicit feedback rather than unbounded prior dialogue", evidence: linkedEvidence(record.inputs), spec: researchSpec }, () => ctx.ws.writeRun(record));
+				: await openBoundedSession(ctx.runner, record, { mode: "fresh", intent: "independent-judgment", reason: feedback.m06 || feedback.m07 || feedback.m08 ? "M04 independently judges frozen feedback and actually reads needed evidence without inheriting executor or reviewer history" : "Later M04 reasoning starts from current selected knowledge and explicit feedback rather than unbounded prior dialogue", evidence: linkedEvidence(record.inputs), spec: researchSpec }, () => ctx.ws.writeRun(record));
+			knowledgeReadOwner = { sessionId: handle.ref.id, sessionGeneration: 1 };
 			const transactionPath = path.join(ctx.ws.runDir("M04", record.runId), "m04-transaction.json");
 			// The read-only judgement may fail before any proposal reaches the store.
 			const transaction: M04KnowledgeTransactionV1 = { version: 1,
@@ -616,12 +944,13 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 				let request = finalMessage;
 				let promptAttempt = 0;
 				const captureInvalidJudgment = async (rawResponse: string,
-					validation: M04InvalidJudgmentEvent["validation"], gaps: M07ReadGap[] = []): Promise<void> => {
+					validation: M04InvalidJudgmentEvent["validation"], gaps: M07ReadGap[] = [],
+					coveragePaths = requiredM07Paths): Promise<void> => {
 					if (!options.onInvalidJudgment) return;
 					await options.onInvalidJudgment({ stage: "m04-judgment", sessionId: handle.ref.id,
 						generation: sessionGeneration, attempt: promptAttempt, rawResponse,
-						validation, coverage: feedback.m07 && requiredM07Paths.length
-							? await m07ValidationCoverage(feedback.m07.rootDir, requiredM07Paths,
+						validation, coverage: feedback.m07 && coveragePaths.length
+							? await m07ValidationCoverage(feedback.m07.rootDir, coveragePaths,
 								handle.readReturnEvents(), gaps) : [],
 						...(handle.ref.file ? { transcriptPath: handle.ref.file } : {}) });
 				};
@@ -692,6 +1021,7 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 					handle = fresh;
 					mode = "research-session";
 					sessionGeneration += 1;
+					knowledgeReadOwner = { sessionId: handle.ref.id, sessionGeneration };
 					currentStrategy = "fresh-context";
 					observedContextFailures.clear();
 					observedContextFailures.add(failureFingerprint);
@@ -718,7 +1048,7 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 							}, gaps);
 							const guidance = ["Your M04 judgement is provisional. The host has not verified full m07_evidence_read returns for every required selected M07 file, so no knowledge proposal can be accepted yet.",
 							"Next missing returned range for each file (one-based lines; the host will recalculate further gaps after your next read):",
-							...gaps.map(gap => `- ${gap.relative}: ${gap.lineCount} actual lines; ${gap.emptyFile ? "empty file needs an untruncated no-content text return without a line range" : gap.missingRanges.length ? `${gap.missingRanges[0].start}-${gap.missingRanges[0].end}; ${gap.missingRanges.length - 1} further gaps remain` : "all lines returned"}${gap.terminalPageMissing ? "; an untruncated final page is also required" : ""}`),
+							...gaps.map(gap => `- ${gap.relative}: ${gap.lineCount} actual lines; ${gap.emptyFile ? "empty file needs an untruncated no-content text return without a line range" : gap.missingRanges.length ? `${gap.missingRanges[0].start}-${gap.missingRanges[0].end}; ${gap.missingRanges.length - 1} further gaps remain` : "all lines returned"}${gap.terminalPageMissing ? "; an untruncated final page is also required" : ""}${m07CharacterReadHint(gap)}`),
 								"Use the same read-only session to read the stated next missing range for each nonempty file, including an untruncated final page where needed. Read an empty file by its exact path and do not invent a line range. The host will give further ranges until all are complete. Then reconsider the evidence and return a revised M04 judgement in the required format. A path, summary, malformed response, or earlier proposal is not proof of a complete read. Do not force a knowledge proposal if the evidence does not support one."].join("\n\n");
 							request = await repairJudgment("unread-m07-evidence", gaps,
 								workflowRepairFingerprint({ gaps }), guidance);
@@ -754,6 +1084,33 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 						continue;
 					}
 					if (!feedback.m08 && parsed.ops) {
+						if (feedback.m07 && hasAdoption(parsed.ops) &&
+							(lessonEvidence.paths.length || lessonEvidence.unavailable.length)) {
+							await verifyRequiredM07Bindings();
+							const returned = handle.readReturnEvents();
+							// Classify frozen bytes; only returned text ranges can then prove reading.
+							const textPaths = lessonEvidence.paths.filter(item => textArtifact(requiredM07Bytes.get(item)!));
+							const gaps = await m07ReadGaps(feedback.m07.rootDir, textPaths, returned);
+							const textSet = new Set(textPaths);
+							const unreadBinary = lessonEvidence.paths.filter((item) => !textSet.has(item) &&
+								!returned.some((event) => event.toolName === "m07_evidence_read" &&
+									event.path === item && event.status === "returned" && event.returned.kind === "binary"));
+							if (lessonEvidence.unavailable.length || gaps.length || unreadBinary.length) {
+								await captureInvalidJudgment(turn.text, { code: "m04.m07-lesson-evidence",
+									message: "candidate lesson adoption lacks frozen and actually returned evidence",
+									path: lessonEvidence.unavailable[0] ?? gaps[0]?.relative ?? unreadBinary[0]!,
+									detail: { unavailable: lessonEvidence.unavailable, gaps, unreadBinary } },
+									gaps, textPaths);
+								const guidance = ["Your M07 candidate-lesson adoption is provisional; no draft or merge was attempted.",
+									...lessonEvidence.unavailable.map((item) => `- Frozen dependency unavailable: ${item}. Keep this lesson candidate or omit it; do not claim adopted.`),
+									...gaps.map((gap) => `- Read ${gap.relative} in full; next missing lines: ${gap.missingRanges[0] ? `${gap.missingRanges[0].start}-${gap.missingRanges[0].end}` : "untruncated final page"}.${m07CharacterReadHint(gap)}`),
+									...unreadBinary.map((item) => `- Open frozen binary evidence ${item} and state the part actually inspected.`),
+									"Return a revised judgment. Candidate or no proposal is valid when evidence cannot support adoption."].join("\n");
+								request = await repairJudgment("unread-m07-evidence", { unavailable: lessonEvidence.unavailable, gaps, unreadBinary },
+									workflowRepairFingerprint({ unavailable: lessonEvidence.unavailable, gaps, unreadBinary }), guidance);
+								continue;
+							}
+						}
 						const draftFingerprint = workflowRepairFingerprint(canonicalProposalValue(parsed.ops));
 						// Exact ineffective retries reuse the rejected receipt. They are
 						// never resubmitted as new drafts and cannot accumulate intent.
@@ -790,7 +1147,11 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 				m08ToolLog = handle.toolLog();
 				m07ReturnedRanges = handle.readReturnEvents?.() ?? [];
 				handle.dispose();
+				if (feedback.m06) await ctx.ws.writeOutput(record, "m06-coverage.json", JSON.stringify({ sessionId: handle.ref.id, filesAccessed: m08ReadCoverage, returnedRanges: m07ReturnedRanges, semantics: "仅证明冻结材料实际返回范围，不证明科学判断正确或已使用。" }, null, 2), "M06 冻结材料实际读取范围");
 				if (feedback.m07) await ctx.ws.writeOutput(record, "m07-coverage.json", JSON.stringify({ sessionId: handle.ref.id, sessionGeneration, promptOutcome: promptSucceeded ? "returned" : "failed", filesAccessed: m08ReadCoverage, returnedRanges: m07ReturnedRanges, earlierSessions: earlierReadProofs, completeness: "unknown", semantics: "saved 仅表示固定材料存在；returnedRanges 仅表示当前会话工具实际返回模型的内容范围，earlierSessions 不抵扣当前会话的全文读取要求；文件名访问不证明已读全文；不证明模型使用该范围，更不证明使用正确。" }, null, 2), "M07 回流证据实际访问范围");
+				if (knowledgeReadTool) await ctx.ws.writeOutput(record, "knowledge-read-log.json", JSON.stringify({ snapshot: snapshot!.id, finalSessionId: handle.ref.id, calls: knowledgeReadCalls, semantics: "每次调用单独记录所属会话、实际记录版本与正文返回范围；跨会话调用不互相抵扣。每页另附实时状态及依赖警告索引；返回不证明模型实际使用、依赖正文已读或科学判断正确。" }, null, 2), "知识按 ID 补读范围");
+				if (knowledgeSelectTool) await ctx.ws.writeOutput(record, "knowledge-select-log.json", JSON.stringify({ snapshot: snapshot!.id, finalSessionId: handle.ref.id, calls: knowledgeSelectCalls, semantics: "每次会话内检索记录原查询、显式情境、当前页实际返回引用及所属会话代次；索引返回不表示记录正文、依赖或原始证据已读，也不构成采用许可。" }, null, 2), "知识会话内检索范围");
+				if (knowledgeArtifactTool) await ctx.ws.writeOutput(record, "knowledge-artifact-read-log.json", JSON.stringify({ snapshot: snapshot!.id, finalSessionId: handle.ref.id, calls: knowledgeArtifactCalls, semantics: "list:true 仅记录同源已接受任务的目录页，不计为附件正文已读；精确 artifact 路径调用记录实际文本页、来源、范围及会话代次。返回不证明附件全文已读、证据独立核验或知识采用。" }, null, 2), "知识历史附件实际读取范围");
 			}
 			if (feedback.m08) await ctx.ws.writeOutput(record, "m08-coverage.json", JSON.stringify({ files: m08ReadCoverage, renderedPages: m08RenderedPages, tools: m08ToolLog }, null, 2), "M08 处理实际读取范围");
 			await requireFrozenM07Bindings();

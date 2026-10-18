@@ -4,6 +4,9 @@ import type { KnowledgeRef } from "../knowledge/types.ts";
 import type { ExperienceSelection } from "../knowledge/experience-index.ts";
 import type { ExperienceRequirementV1, M07WorkflowStrategyV1 } from "../improvement/generation.ts";
 import type { RunDescriptorV1 } from "../runtime/run-descriptor.ts";
+import type { KnowledgeRetrievalContext } from "../knowledge/retrieval.ts";
+import type { CandidateComparisonV1, CandidatePerformanceEvidenceV1 } from "./candidate-diagnostics.ts";
+import type { KnowledgeAccessEvent } from "./execution-knowledge.ts";
 
 export type M07TaskMode = "execute" | "check" | "reason";
 export type M07TaskStatus = "running" | "returned" | "failed" | "accepted" | "rejected" | "unknown";
@@ -24,6 +27,8 @@ export interface BeginGoalInput {
 
 export interface TaskSpecInput {
 	objective: string;
+	/** Actual object of this task's work; input materials do not change this identity. */
+	subjectId?: string;
 	inputs: string[];
 	expectedOutputs: string[];
 	checks: string[];
@@ -36,16 +41,132 @@ export interface TaskSpecInput {
 	experienceRefs?: KnowledgeRef[];
 	experienceContextRefs?: KnowledgeRef[];
 	experienceTags?: string[];
+	/** Applicability hints for automatic knowledge roots; explicit references remain visible. */
+	knowledgeContext?: KnowledgeRetrievalContext;
 	/** An input path already listed in inputs, frozen for this task's execution. */
 	planInput?: string;
 	/** Explicit versioned external references, each already present in inputs. Never discovered globally. */
 	resourceInputs?: Array<{ id: string; version: string; input: string }>;
-	/** Continuous goals enforce reviewed repair for execute tasks; opt-in for other goals. Legacy bounded fields are historical input compatibility only. No process-restart replay. */
-	executionLoop?: { mode: "until-ready" } | { maxRounds: number; deadlineAt: string };
+	/** Explicit task execution mode: legacy fresh-reviewer repair or same-session candidate feedback. Continuous goals do not imply a mode. Legacy bounded fields map to opt-in until-ready. No process-restart replay. */
+	executionLoop?: { mode: "until-ready" | "candidate-episode" } | { maxRounds: number; deadlineAt: string };
 	/** Expected JSON output carrying a candidate lesson to M04, never an adopted record. */
 	lessonDeltaOutput?: string;
 	/** Explicit competitive continuation from a frozen task leaf. Role remains execution. */
 	context?: { mode: "fork"; parentRunId: string; parentTaskId: string; checkpointId: string };
+	/** Optional candidate declaration; only a trusted host verifier judges its result. */
+	candidate?: { sourcePaths: string[]; receiptPaths: string[];
+		parentTaskId?: string; changeKind?: "repair" | "structure" | "parameters";
+		intent?: "solution" | "diagnostic" };
+}
+
+/** Optional host-only task admission. Throw to reject before dispatch creates task files or starts a session. */
+export type TaskAdmission = (input: { goal: Readonly<CurrentGoal>; task: Readonly<TaskSpecInput>; workspace: string }) => void | Promise<void>;
+
+export interface CandidateVerificationBindingV1 {
+	version: 1;
+	id: string;
+	verifierVersion: string;
+	boundAt: string;
+	/** Earlier tasks retain their original review semantics. */
+	firstTaskIndex: number;
+	/** Explicit host capability; receipt verification alone never grants whole-goal admission. */
+	goalAdmission: boolean;
+}
+
+export interface CandidateMetricV1 {
+	name: string;
+	value: number;
+	unit: string;
+	basisId: string;
+	direction: "higher" | "lower";
+}
+
+/** Verifier-read facts about an existing external evaluation. IDs and field paths
+ * refer to original evidence; this record does not authorize another execution. */
+export interface CandidateDiagnosticV1 {
+	category: "compile" | "numerical" | "runtime" | "unknown";
+	fieldPath: string;
+	rawText: string;
+	caseId?: string;
+}
+
+export interface CandidateCaseObservationV1 {
+	caseId: string;
+	status: string;
+	correctness: "passed" | "failed" | "unknown";
+	/** Diagnostic measurements only. Goal promotion uses top-level metrics. */
+	metrics: CandidateMetricV1[];
+	/** Platform references such as baselines or hardware bounds, never candidate gains. */
+	referenceMeasurements?: Array<Pick<CandidateMetricV1, "name" | "value" | "unit" | "basisId">>;
+	/** Optional profiler facts normalized by the host, with original receipt locations. */
+	performance?: CandidatePerformanceEvidenceV1;
+}
+
+export interface CandidateExternalEvaluationV1 {
+	externalId: string;
+	subjectId: string;
+	status: string;
+	terminal: boolean;
+	capturedAt: string;
+	/** Index into CandidateObservationV1.receiptFiles. */
+	receiptIndex: number;
+	cases: CandidateCaseObservationV1[];
+	diagnostics: CandidateDiagnosticV1[];
+}
+
+export interface CandidateExecutionFactsV1 {
+	evaluations: CandidateExternalEvaluationV1[];
+}
+
+export interface CandidateObservationV1 {
+	version: 1;
+	kind: "candidate-observation";
+	verifier: { id: string; version: string };
+	sourceBinding: "verified" | "unknown";
+	correctness: "passed" | "failed" | "unknown";
+	stage: string;
+	checks: Array<{ criterion: string; result: CheckResult }>;
+	/** Candidate-level observations only; fulfilled still requires separate verifyGoal. */
+	goalChecks: Array<{ criterion: string; result: CheckResult }>;
+	metrics: CandidateMetricV1[];
+	/** Host-verified raw evaluation facts; absent for legacy or incapable verifiers. */
+	executionFacts?: CandidateExecutionFactsV1;
+	limitations: string[];
+	sourceFiles: string[];
+	receiptFiles: string[];
+}
+
+export interface M07EpisodeCandidateV1 {
+	id: string;
+	parentCandidateId?: string;
+	/** Declared derivation from an exact candidate in this goal; not proof of causal reuse. */
+	parentRef?: { taskId: string; candidateId: string };
+	/** Exact source-byte matches in this goal; a planning fact, not an automatic rejection. */
+	identicalSourceRefs?: string[];
+	sourceRepetition?: "duplicate_code" | "code_cycle";
+	sourcePaths: string[];
+	receiptPaths: string[];
+	hypothesis: string;
+	/** Model-declared applicability and edit description; neither is a host-proven causal claim. */
+	conditions?: string[];
+	changeSummary?: string;
+	/** Mechanical same-basis comparison with the declared parent; never an acceptance decision. */
+	parentComparison?: CandidateComparisonV1;
+	changeKind: "repair" | "structure" | "parameters";
+	intent: "solution" | "diagnostic";
+	observation: CandidateObservationV1;
+	observationPath: string;
+}
+
+export interface M07CandidateEpisodeV1 {
+	version: 1;
+	candidates: M07EpisodeCandidateV1[];
+	/** Working copies of frozen same-goal candidates, never a new evaluation or adopted fact. */
+	checkouts?: Array<{ candidateRef: string }>;
+	/** The last evaluated candidate is the exploration point, whether successful or not. */
+	currentCandidateId?: string;
+	/** Readable, verified local best per subject and exact metric identity; historical rows may omit subjectId. */
+	incumbents: Array<{ candidateId: string; metric: CandidateMetricV1; subjectId?: string }>;
 }
 
 export interface M07BranchSourceV1 {
@@ -75,6 +196,8 @@ export interface M07ExecutionRound {
 	/** Observed bytes in the complete formal-work reviewer snapshot. */
 	reviewerSnapshotBytes?: number;
 	reviewerSnapshotPath?: string;
+	/** Host-created report segments, excluded from candidate-output comparison. */
+	builderReportHandoffDir?: string;
 	reviewerReportPath?: string;
 	reviewerSession?: SessionRef;
 	verdict?: "ready" | "revise" | "replan" | "blocked";
@@ -203,6 +326,11 @@ export interface M07TaskRecord extends TaskSpecInput {
 	/** Available only after a stable task completed and its evidence was frozen. */
 	branchSource?: M07BranchSourceV1;
 	branchUnavailableReason?: string;
+	/** Result of a host-only read of frozen source and original platform receipts. */
+	candidateObservation?: CandidateObservationV1 & { observationPath: string };
+	episode?: M07CandidateEpisodeV1;
+	/** Per-call read-only knowledge access, frozen into review evidence. */
+	knowledgeAccess?: KnowledgeAccessEvent[];
 	planCopy?: string;
 	knowledgeSnapshot?: string;
 	m04BaselineRunId?: string;
@@ -261,6 +389,8 @@ export interface CurrentGoal {
 	m04BaselineFailures?: M04BaselineFailure[];
 	/** Host-selected original material scope; legacy goals retain workspace raw inputs. */
 	checkpointRawScope?: "workspace" | "none";
+	/** Optional host-only verifier binding; absent for ordinary and historical goals. */
+	candidateVerification?: CandidateVerificationBindingV1;
 	baselineHistory: Array<{ at: string; knowledgeSnapshot?: string; m04RunId: string;
 		failedM04?: M04BaselineFailure[] }>;
 	/** Frozen at begin; later promotion or rollback applies only to a new goal. Optional only for explicit legacy-record detection. */
@@ -298,10 +428,13 @@ export interface CurrentGoal {
 
 export interface M07Controller {
 	begin(input: BeginGoalInput, options?: { executionContract?: "continuous";
-		checkpointRawScope?: "workspace" | "none" }): Promise<CurrentGoal>;
+		checkpointRawScope?: "workspace" | "none";
+		candidateVerification?: { id: string; verifierVersion: string; goalAdmission?: boolean } }): Promise<CurrentGoal>;
 	status(runId: string): Promise<CurrentGoal>;
 	/** Trusted host only; never exposed through the model-facing research_goal tool. */
 	hostAddConstraints(runId: string, input: { sourceEventId: string; constraints: string[] }): Promise<CurrentGoal>;
+	/** Trusted host only. Binding never reinterprets existing tasks. */
+	hostBindCandidateVerifier(runId: string, options?: { goalAdmission?: boolean }): Promise<CurrentGoal>;
 	plan(runId: string, plan: string, options?: { refreshBaseline?: boolean; checkpointId?: string; m04RunId?: string }): Promise<CurrentGoal>;
 	checkpoint(runId: string, options?: { taskIds?: string[] }): Promise<M07CheckpointRecord>;
 	/** Called after the task and prepared operation are saved, before any runner session starts. */

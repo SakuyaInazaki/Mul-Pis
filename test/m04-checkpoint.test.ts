@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, open, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -88,4 +88,36 @@ test("M04 requires the selected checkpoint's independent report in full alongsid
 	const session = [...fake.sessions.values()].find((item) => item.spec.label === "M04-research")!;
 	assert.equal(session.turns, 2);
 	assert.deepEqual(session.readReturns.map((event) => event.path), [callerPath, report]);
+});
+
+test("a long experiment can hand off all reviewed evidence without a batch-size search limit", async (t) => {
+	const f = await fixture(t);
+	const goal = await f.controller.begin(begin);
+	const task = await f.controller.delegate(goal.runId, { objective: "retain complete measured evidence", inputs: [], expectedOutputs: [], checks: ["report recorded"], mode: "reason" });
+	const evidence = path.join(task.workDir, "measurements.bin");
+	const bytes = 65 * 1024 * 1024;
+	const marker = Buffer.from("final measured case");
+	const source = await open(evidence, "wx");
+	try { await source.truncate(bytes); await source.write(marker, 0, marker.length, bytes - marker.length); }
+	finally { await source.close(); }
+	await f.controller.review(goal.runId, { taskId: task.taskId, artifacts: [evidence], checks: [{ criterion: "report recorded", result: "passed", evidence: [task.reportPath!] }] });
+	const checkpoint = await f.controller.checkpoint(goal.runId, { taskIds: [task.taskId] });
+	const manifest = JSON.parse(await readFile(checkpoint.manifestPath, "utf8"));
+	const item = manifest.files.find((file: { bytes: number }) => file.bytes === bytes);
+	assert.ok(item, "the entire large artifact remains in the registered evidence set");
+	const frozen = path.join(checkpoint.rootDir, item.relativePath);
+	assert.equal((await stat(frozen)).size, bytes);
+	const copy = await open(frozen, "r");
+	try {
+		const actual = Buffer.alloc(marker.length);
+		await copy.read(actual, 0, actual.length, bytes - actual.length);
+		assert.deepEqual(actual, marker);
+	} finally { await copy.close(); }
+	const result = await runM04(f.ctx, { feedback: { kind: "M07Checkpoint", runId: goal.runId, checkpointId: checkpoint.id } });
+	assert.equal(result.record.status, "completed");
+	const tools = f.runner.created.findLast(spec => spec.label === "M04-research")!.tools;
+	assert.equal(tools.kind, "read-dir");
+	if (tools.kind === "read-dir") assert.equal(tools.root, checkpoint.rootDir);
+	assert.equal((await f.controller.status(goal.runId)).lifecycle, "active");
+	assert.equal((await stat(evidence)).size, bytes, "original evidence is retained");
 });

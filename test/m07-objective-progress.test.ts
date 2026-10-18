@@ -109,13 +109,24 @@ function groundedReply(f: Awaited<ReturnType<typeof fixture>>, decision: "contin
 
 test("grounded live proposal needs full frozen reads before its decision-changing task dispatches", async t => {
 	const f = await fixture(t);
+	const longText = "\ufeff" + "registered constraint ".repeat(3200) + "\n";
+	await writeFile(f.evidence.find(item => item.name === "second-text.txt")!.file, longText);
+	const pages: ReadReturnEvent[] = [];
+	for (let start = 0; start < longText.length; start += 16000) {
+		const end = Math.min(longText.length, start + 16000);
+		pages.push({ toolName: "objective_evidence_read", status: "returned", path: "second-text.txt",
+			requested: { textOffset: start, textLimit: 16000 },
+			returned: { kind: "text", textOffset: start, textEnd: end, textTotal: longText.length,
+				truncated: end < longText.length }, at: new Date().toISOString() });
+	}
 	let turns = 0, dispatched = 0;
 	const runner = new FakeSessionRunner(({ message }) => {
 		turns++;
 		if (turns === 1) assert.match(message, /groundedAssessment|Grounded assessment/);
+		else assert.match(message, new RegExp(`textOffset=${(turns - 1) * 16000}`));
+		assert.ok(turns <= pages.length, "progressive character reads must retain their current session");
 		return { text: JSON.stringify(groundedReply(f, "continue", "explicit-requirement")),
-			readReturns: turns === 1 ? ranges(f, ["second-text.txt"]) : ranges(f, ["original-objective.json",
-				"original-problem.txt", "original-source.cpp", "candidate.cpp", "verification.json"]) };
+			readReturns: [...(turns === 1 ? ranges(f, ["second-text.txt"]) : []), pages[turns - 1]!] };
 	});
 	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
 		userOverrides: ["Deliver the strongest supported strategy"],
@@ -125,11 +136,37 @@ test("grounded live proposal needs full frozen reads before its decision-changin
 		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
 		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
 		advance: async () => { dispatched++; return "advanced"; } });
-	assert.equal(turns, 2);
+	assert.equal(turns, pages.length);
+	assert.equal(runner.sessions.size, 1, "partial-line read progress must not trigger a fresh context");
 	assert.equal(dispatched, 1);
 	assert.equal(result.stopReason, "objective-reassessment-pending");
 	assert.deepEqual(result.assessment?.unreadEvidence, []);
 	assert.equal(result.assessment?.groundedAssessment?.missionStatus, "open");
+});
+
+test("optional issue classification cannot block an unresolved original obligation with available capability", async t => {
+	const f = await fixture(t);
+	let turns = 0, dispatched = 0;
+	const runner = new FakeSessionRunner(() => {
+		turns++;
+		return { text: JSON.stringify(groundedReply(f, turns === 1 ? "blocked" : "continue",
+			turns === 1 ? "optional-method" : "explicit-requirement")),
+			readReturns: turns === 1 ? ranges(f) : [] };
+	});
+	const result = await assessAndAdvanceOriginalObjective({ ...f, runner,
+		userOverrides: ["Deliver the strongest supported strategy"],
+		groundingPolicy: { require: true, sourceKinds: groundingKinds,
+			legacyOpenDetails: ["Preserved old detail"] },
+		capabilities: [{ scope: "two-target-existing", available: true,
+			description: "Synthetic runner", limits: [] }],
+		persistReceipt: () => f.ws.writeRun(f.runRecord), assessmentAdmission: "admitted",
+		advanceAdmission: () => "admitted", supportedTaskScopes: ["two-target-existing"],
+		advance: async () => { dispatched++; return "advanced"; } });
+	assert.equal(turns, 2);
+	assert.equal(dispatched, 1);
+	assert.equal(result.stopReason, "objective-reassessment-pending");
+	assert.deepEqual(result.assessment?.proposalHistory?.map(item => item.decision), ["blocked", "continue"]);
+	assert.deepEqual(result.assessment?.unresolvedObligations, ["original-task"]);
 });
 
 

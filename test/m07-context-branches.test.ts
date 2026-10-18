@@ -6,11 +6,12 @@ import test, { type TestContext } from "node:test";
 import { offlineChecks } from "../scripts/manual-private-campaign.ts";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { createM07Controller } from "../src/m07/controller.ts";
+import type { CandidateVerifier } from "../src/m07/candidate-evaluation.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 import type { StageContext } from "../src/stages/context.ts";
 import { Workspace } from "../src/workspace.ts";
 
-async function fixture(t: TestContext, unsafeFile = false, pauseExecution?: () => Promise<void>) {
+async function fixture(t: TestContext, unsafeFile = false, pauseExecution?: () => Promise<void>, candidateVerifier?: CandidateVerifier) {
 	const root = await realpath(await mkdtemp(path.join(tmpdir(), "m07-branches-")));
 	t.after(async () => rm(root, { recursive: true, force: true }));
 	const ws = new Workspace(root);
@@ -28,13 +29,15 @@ async function fixture(t: TestContext, unsafeFile = false, pauseExecution?: () =
 				await writeFile(candidate, "seed\n");
 			}
 			else await writeFile(candidate, `${spec.label}\n`);
+			if (candidateVerifier) await writeFile(path.join(spec.tools.root, "receipt.json"), '{"accepted":true}\n');
 			if (unsafeFile) await writeFile(path.join(spec.tools.root, ".env"), "PRIVATE=not-for-branch\n");
 		}
 		return `${spec.label} report`;
 	});
 	const ctx: StageContext = { ws, store, runner, config: { roles: { execution: "fake/execution", reviewer: "fake/reviewer" }, concurrency: 1, tools: {} } };
-	const controller = createM07Controller(ctx);
-	const goal = await controller.begin({ goal: "Compare candidates", problemRelation: "Direct experiment", constraints: ["Keep the question fixed"], successCriteria: ["Candidate checked"], plan: "Run two frozen branches" });
+	const controller = createM07Controller(ctx, candidateVerifier ? { candidateVerifier } : {});
+	const goal = await controller.begin({ goal: "Compare candidates", problemRelation: "Direct experiment", constraints: ["Keep the question fixed"], successCriteria: ["Candidate checked"], plan: "Run two frozen branches" },
+		candidateVerifier ? { candidateVerification: { id: candidateVerifier.id, verifierVersion: candidateVerifier.version, goalAdmission: false } } : undefined);
 	return { root, ws, store, runner, controller, goal };
 }
 
@@ -91,7 +94,7 @@ test("M07 branch candidates remain review-gated and selection cannot bypass orig
 	const parent = await f.controller.delegate(f.goal.runId, taskSpec);
 	await f.controller.review(f.goal.runId, { taskId: parent.taskId, checks: [{ criterion: taskSpec.checks[0], result: "failed", evidence: [] }], artifacts: [path.join(parent.workDir, "candidate.txt")] });
 	const context = { mode: "fork" as const, parentRunId: f.goal.runId, parentTaskId: parent.taskId, checkpointId: parent.branchSource!.checkpoint.id };
-	await assert.rejects(f.controller.delegate(f.goal.runId, { ...taskSpec, checks: ["weakened"], context }), /retain the parent's objective/);
+	await assert.rejects(f.controller.delegate(f.goal.runId, { ...taskSpec, checks: ["weakened"], context }), /retain the parent's subject, objective/);
 	await assert.rejects(f.controller.delegate(f.goal.runId, { ...taskSpec, experienceTags: ["different-applicability"], context }), /frozen knowledge applicability/);
 	await assert.rejects(f.controller.delegate(f.goal.runId, { ...taskSpec, experienceContextRefs: [{ storeId: "different", recordId: "X001", version: 1 }], context }), /frozen knowledge applicability/);
 	await assert.rejects(f.controller.delegate(f.goal.runId, { ...taskSpec, context: { ...context, checkpointId: "wrong" } }), /settled, frozen/);
@@ -119,4 +122,69 @@ test("M07 branch candidates remain review-gated and selection cannot bypass orig
 	const completed = await f.controller.finish(f.goal.runId, { outcome: "fulfilled", summary: "One checked candidate selected", returnPath: "M04", goalChecks: [{ criterion: "Candidate checked", result: "passed", evidence: [reviewed.review!.frozenReportPath] }] });
 	assert.equal(completed.outcome, "fulfilled");
 	assert.equal(completed.tasks.find((item) => item.taskId === rejected.taskId)?.status, "rejected");
+});
+
+test("M07 can abandon a reviewed branch family and finish from a separate accepted route", async (t) => {
+	const f = await fixture(t);
+	const parent = await f.controller.delegate(f.goal.runId, taskSpec);
+	await f.controller.review(f.goal.runId, { taskId: parent.taskId,
+		checks: [{ criterion: taskSpec.checks[0], result: "failed", evidence: [] }],
+		artifacts: [path.join(parent.workDir, "candidate.txt")] });
+	const context = { mode: "fork" as const, parentRunId: f.goal.runId, parentTaskId: parent.taskId,
+		checkpointId: parent.branchSource!.checkpoint.id };
+	const branch = await f.controller.delegate(f.goal.runId, { ...taskSpec, context });
+	const reviewedBranch = await f.controller.review(f.goal.runId, { taskId: branch.taskId,
+		checks: [{ criterion: taskSpec.checks[0], result: "passed", evidence: [path.join(branch.workDir, "candidate.txt")] }],
+		artifacts: [path.join(branch.workDir, "candidate.txt")] });
+	assert.equal(reviewedBranch.status, "accepted");
+	const later = await f.controller.delegate(f.goal.runId, { ...taskSpec, objective: "Implement independent route" });
+	const reviewedLater = await f.controller.review(f.goal.runId, { taskId: later.taskId,
+		checks: [{ criterion: taskSpec.checks[0], result: "passed", evidence: [path.join(later.workDir, "candidate.txt")] }],
+		artifacts: [path.join(later.workDir, "candidate.txt")] });
+	assert.equal(reviewedLater.status, "accepted");
+	const claim = (evidence: string) => ({ outcome: "fulfilled" as const, summary: "Original criterion met on another route",
+		returnPath: "M04" as const, goalChecks: [{ criterion: "Candidate checked", result: "passed" as const, evidence: [evidence] }] });
+	await assert.rejects(f.controller.finish(f.goal.runId, claim(reviewedLater.review!.frozenReportPath)),
+		/competitive branches require an explicit selection or rejection/);
+	const chosen = await f.controller.selectBranch(f.goal.runId, { parentTaskId: parent.taskId,
+		rationale: "Neither frozen branch is used for the original goal" });
+	assert.equal(chosen.branchSelections?.[0]?.selectedTaskId, undefined);
+	await assert.rejects(f.controller.finish(f.goal.runId, claim(reviewedBranch.review!.frozenReportPath)),
+		/目标验收证据不来自当前有效且已接受任务/);
+	const finished = await f.controller.finish(f.goal.runId, claim(reviewedLater.review!.frozenReportPath));
+	assert.equal(finished.outcome, "fulfilled");
+	assert.equal(finished.branchSelections?.[0]?.selectedTaskId, undefined);
+});
+
+test("an abandoned verified candidate cannot satisfy the goal's candidate qualification", async (t) => {
+	const verifier: CandidateVerifier = { id: "host:abandoned-branch", version: "1",
+		async verifyTask() { return { sourceBinding: "verified", correctness: "passed", stage: "performance",
+			checks: [], metrics: [], limitations: [] }; } };
+	const f = await fixture(t, false, undefined, verifier);
+	const candidateSpec = { ...taskSpec, expectedOutputs: ["candidate.txt", "receipt.json"],
+		candidate: { sourcePaths: ["candidate.txt"], receiptPaths: ["receipt.json"] } };
+	const parent = await f.controller.delegate(f.goal.runId, candidateSpec);
+	assert.equal((await f.controller.review(f.goal.runId, { taskId: parent.taskId,
+		checks: [{ criterion: taskSpec.checks[0], result: "failed", evidence: [] }], artifacts: [] })).status, "rejected");
+	const context = { mode: "fork" as const, parentRunId: f.goal.runId, parentTaskId: parent.taskId,
+		checkpointId: parent.branchSource!.checkpoint.id };
+	const branch = await f.controller.delegate(f.goal.runId, { ...candidateSpec, context });
+	const reviewedBranch = await f.controller.review(f.goal.runId, { taskId: branch.taskId,
+		checks: [{ criterion: taskSpec.checks[0], result: "passed", evidence: [branch.reportPath!] }], artifacts: [] });
+	assert.equal(reviewedBranch.status, "accepted");
+	assert.equal(reviewedBranch.candidateObservation?.sourceBinding, "verified");
+	await f.controller.selectBranch(f.goal.runId, { parentTaskId: parent.taskId,
+		rationale: "Abandon this comparison after review" });
+	const independent = await f.controller.delegate(f.goal.runId, { ...taskSpec, objective: "Independent noncandidate study" });
+	const reviewedIndependent = await f.controller.review(f.goal.runId, { taskId: independent.taskId,
+		checks: [{ criterion: taskSpec.checks[0], result: "passed", evidence: [independent.reportPath!] }], artifacts: [independent.reportPath!] });
+	assert.equal(reviewedIndependent.status, "accepted");
+	const claim = { outcome: "fulfilled" as const, summary: "Original criterion supported", returnPath: "M04" as const,
+		goalChecks: [{ criterion: "Candidate checked", result: "passed" as const,
+			evidence: [reviewedIndependent.review!.frozenReportPath] }] };
+	await assert.rejects(f.controller.finish(f.goal.runId, claim), /no accepted candidate has host-verified source and correctness/);
+	const active = await f.controller.delegate(f.goal.runId, { ...candidateSpec, objective: "Independent verified candidate" });
+	assert.equal((await f.controller.review(f.goal.runId, { taskId: active.taskId,
+		checks: [{ criterion: taskSpec.checks[0], result: "passed", evidence: [active.reportPath!] }], artifacts: [] })).status, "accepted");
+	assert.equal((await f.controller.finish(f.goal.runId, claim)).outcome, "fulfilled");
 });

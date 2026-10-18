@@ -2,7 +2,7 @@ import path from "node:path";
 import type { ConsoleStatus, WorkflowNode, WorkflowSnapshot } from "./model.ts";
 
 const STATE: Record<ConsoleStatus, string> = {
-	pending: "未启动", running: "执行中", waiting: "等待外部条件", suspended: "已挂起",
+	pending: "未启动", running: "执行中", waiting: "等待", suspended: "已挂起",
 	stale: "心跳过期", returned: "已返回，待审查", accepted: "已接受", rejected: "未接受",
 	failed: "失败", unknown: "状态未知", completed: "已完成", blocked: "已阻塞",
 };
@@ -14,6 +14,7 @@ export function statusLabel(node: WorkflowNode): string {
 	if (node.kind === "run" && node.status === "completed") return "运行已结束";
 	if (node.kind === "task" && node.status === "returned") return "任务已返回，待审查";
 	if (node.kind === "task" && node.status === "accepted") return "任务已接受";
+	if (node.kind === "execution" && node.status === "completed") return "执行阶段已结束";
 	return STATE[node.status] ?? node.status;
 }
 
@@ -28,8 +29,17 @@ function taskObjective(node: WorkflowNode): string {
 export function nodeIdentity(node: WorkflowNode): string {
 	switch (node.kind) {
 		case "stage": return node.stage ?? node.label;
+		case "mission": return `原目标 · ${node.missionId ?? node.id}`;
+		case "attempt": return node.label;
+		case "assessment": return node.label;
 		case "run": return `${node.stage ?? "运行"}运行 · ${node.runId ?? node.id}`;
 		case "task": return node.taskId ? `任务 ${node.taskId}` : `任务 ${node.id}`;
+		case "candidate": return node.label;
+		case "execution": return node.label;
+		case "round": return node.label;
+		case "evaluation": return node.label;
+		case "review": return node.label;
+		case "checkpoint": return node.label;
 		case "session": return `${node.label || "会话"} · ${node.sessionId ?? node.id}`;
 		case "group": {
 			const sourceId = node.id.startsWith("group:") ? node.id.split(":").slice(2).join(":") : "";
@@ -164,15 +174,11 @@ export function nodeDetails(snapshot: WorkflowSnapshot, node?: WorkflowNode): st
 		if (goal.attemptId) lines.push(`执行尝试：${goal.attemptId}${goal.attemptState ? ` · ${goal.attemptState}` : ""}`);
 		lines.push(`目标检查：${goal.checks.total} 项（通过 ${goal.checks.passed}、失败 ${goal.checks.failed}、未运行 ${goal.checks.notRun}）`);
 		lines.push(`委派任务：${goal.tasks.total} 项（执行中 ${goal.tasks.running}、已返回 ${goal.tasks.returned}、已接受 ${goal.tasks.accepted}、未接受 ${goal.tasks.rejected}、失败 ${goal.tasks.failed}、未知 ${goal.tasks.unknown}）`);
-		if (goal.waiting) {
-			lines.push(`等待原因：${goal.waiting.reason}`);
-			lines.push(`恢复条件：${goal.waiting.recoveryCondition}`);
-			lines.push(`下一步：${goal.waiting.nextAction}`);
-		}
 	}
 	if (node.stage) lines.push(`阶段：${node.stage}`);
 	if (node.runId) lines.push(`运行：${node.runId}`);
 	if (node.taskId) lines.push(`任务 ID：${node.taskId}`);
+	if (node.missionId) lines.push(`原目标 ID：${node.missionId}`);
 	if (node.sessionId) lines.push(`会话：${node.sessionId}`);
 	if (node.model) lines.push(`模型：${node.model}`);
 	if (node.startedAt) lines.push(`开始：${node.startedAt}`);
@@ -230,6 +236,8 @@ export function nodeOverview(snapshot: WorkflowSnapshot, node?: WorkflowNode): s
 	}
 	if (node.stage && node.kind !== "run") lines.push(`阶段：${node.stage}`);
 	if (node.runId && node.kind !== "run") lines.push(`运行：${node.runId}`);
+	if (node.kind === "task" && snapshot.goal && node.runId === snapshot.goal.id && node.taskId === snapshot.goal.currentTaskId && snapshot.goal.attemptId)
+		lines.push(`当前执行尝试：${snapshot.goal.attemptId}${snapshot.goal.attemptState ? ` · ${snapshot.goal.attemptState}` : ""}`);
 	if (node.sessionId) lines.push(`会话：${node.sessionId}`);
 	if (node.model) lines.push(`模型：${node.model}`);
 	if (node.startedAt) lines.push(`开始：${node.startedAt}`);

@@ -18,14 +18,19 @@ async function fixture(t: TestContext) {
 
 test("a pending lift never drops an active restriction before CURRENT", async (t) => {
 	const { dir, store } = await fixture(t);
-	const limited = await store.submitProposal({ stage: "test", runId: "limit", ops: [{ op: "limit", target: "C001", kind: "suspended", reason: "uncertain", authority: "test" }] });
+	const limited = await store.submitProposal({ stage: "test", runId: "limit", ops: [
+		{ op: "limit", target: "C001", kind: "needs_recheck", reason: "derived", authority: "impact:old" },
+		{ op: "limit", target: "C001", kind: "suspended", reason: "independent", authority: "test" },
+	] });
 	await store.merge(limited.proposalId);
-	const lift = await store.submitProposal({ stage: "test", runId: "lift", ops: [{ op: "lift_limit", target: "C001", reason: "resolved", authority: "test" }] });
+	const lift = await store.submitProposal({ stage: "test", runId: "lift", ops: [{ op: "lift_limit", target: "C001", limitAuthority: "impact:old", reason: "impact resolved", authority: "test" }] });
 	const broken = createFileKnowledgeStore(dir, { afterPhase: (phase) => { if (phase === "records") throw new Error("power loss"); } });
 	await assert.rejects(broken.merge(lift.proposalId), /power loss/);
-	assert((await store.limits()).some((limit) => limit.target === "C001" && !limit.liftedAt));
+	assert((await store.limits()).some((limit) => limit.target === "C001" && limit.authority === "impact:old" && !limit.liftedAt));
 	await store.merge(lift.proposalId);
-	assert((await store.limits()).every((limit) => limit.target !== "C001" || !!limit.liftedAt));
+	assert((await store.limits()).some((limit) => limit.target === "C001" && limit.authority === "impact:old" && !!limit.liftedAt));
+	assert((await store.limits()).some((limit) => limit.target === "C001" && limit.authority === "test" && !limit.liftedAt));
+	assert.equal((await store.availability("C001")).availability, "not_allowed");
 });
 
 const localIdentity: ProcessIdentityV1 = { hostId: "test-host", bootId: "test-boot", pid: 42001, processStartToken: "start-1" };

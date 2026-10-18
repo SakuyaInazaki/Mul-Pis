@@ -1,17 +1,18 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { createAgentSession, ModelRuntime, type CreateAgentSessionOptions } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import { PiSessionRunner } from "../../src/runner/pi.ts";
-import type { CustomToolSpec, SessionSpec } from "../../src/runner/types.ts";
+import type { CustomToolSpec, ReadReturnEvent, SessionSpec } from "../../src/runner/types.ts";
 import { HarnessError } from "../../src/types.ts";
 import { createConfinedCampaignFileTools } from "../../src/runner/confined-campaign-files.ts";
 import { readManagedBashReceipt, readManagedBashSessionReceipts } from "../../src/runner/managed-bash.ts";
 
 import { inspectManagedExecutionSession } from "../../src/m07/managed-local-failure.ts";
+import { assertFullM07Reads } from "../../src/stages/m04.ts";
 
 const MODEL = {
 	id: "offline-model",
@@ -240,6 +241,63 @@ test("a read-dir grant confines both tools, rejects PDFs, and records successful
 	assert.deepEqual(handle.readCoverage(), ["note.txt"]);
 });
 
+test("confined character pages recover an oversized JSON line and M04 requires every mixed-mode range", async t => {
+	const persistDir = await fixture(t), materialRoot = path.join(persistDir, "long-materials");
+	await mkdir(materialRoot);
+	// Position a surrogate pair across the first default page boundary.
+	const prefix = "header\r\n", jsonPrefix = '{"returnedText":"';
+	const text = prefix + jsonPrefix + "a".repeat(16000 - jsonPrefix.length - 1) + "🙂" + "证据".repeat(26000) + '"}\nfooter\n';
+	await writeFile(path.join(materialRoot, "access.json"), text);
+	await writeFile(path.join(materialRoot, "empty.txt"), "");
+	await writeFile(path.join(materialRoot, "paper.pdf"), "not text evidence");
+	await writeFile(path.join(materialRoot, "image.png"), "not text evidence");
+	const outside = path.join(persistDir, "outside.txt"); await writeFile(outside, "outside");
+	await symlink(outside, path.join(materialRoot, "escape.txt"));
+	const stub = stubFactory(), runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory });
+	const handle = await runner.create(spec(persistDir, { role: "reader", tools: { kind: "read-dir", root: materialRoot, toolName: "m07_evidence_read" } }));
+	t.after(() => handle.dispose());
+	const read = stub.calls[0].customTools!.find(tool => tool.name === "m07_evidence_read")!;
+	const invoke = (args: Record<string, unknown>) => read.execute("read", { path: "access.json", ...args }, undefined, undefined, undefined as never);
+	await invoke({ offset: 1, limit: 1 });
+	const blocked = await invoke({ offset: 2, limit: 1 });
+	const blockedText = (blocked.content[0] as { text: string }).text;
+	assert.match(blockedText, /m07_evidence_read.*textOffset/);
+	assert.doesNotMatch(blockedText, /Use bash|sed -n/);
+	assert.equal(handle.readReturnEvents().at(-1)!.status, "no-content");
+	await assert.rejects(assertFullM07Reads(materialRoot, ["access.json"], handle.readReturnEvents()), /not returned.*in full/);
+	let offset = prefix.length, assembled = prefix;
+	const characterEvents: ReadReturnEvent[] = [];
+	while (offset < text.length) {
+		const result = await invoke({ textOffset: offset });
+		const page = (result.content[0] as { text: string }).text;
+		const range = handle.readReturnEvents().at(-1)!;
+		characterEvents.push(range);
+		assert.equal(range.returned.textOffset, offset);
+		assert.equal(range.returned.textTotal, text.length);
+		const end = range.returned.textEnd!;
+		assert.ok(end > offset && end - offset <= 16000);
+		if (characterEvents.length === 1) assert.equal(end - offset, 15999, "a character page never splits a surrogate pair");
+		assert.equal(page.slice(page.indexOf("\n") + 1), text.slice(offset, end));
+		assert.ok(Buffer.byteLength(page, "utf8") < 50 * 1024);
+		assert.match(page, end < text.length ? new RegExp(`next textOffset=${end}`) : /; end\./);
+		assembled += page.slice(page.indexOf("\n") + 1); offset = end;
+	}
+	assert.equal(assembled, text);
+	const events = handle.readReturnEvents();
+	await assert.rejects(assertFullM07Reads(materialRoot, ["access.json"], events.filter(event => event !== characterEvents[1])), /not returned.*in full/);
+	await assert.rejects(assertFullM07Reads(materialRoot, ["access.json"], characterEvents), /not returned.*in full/,
+		"character pages do not silently credit the legacy header line");
+	await assert.rejects(assertFullM07Reads(materialRoot, ["access.json"], events.map(event => ({ ...event,
+		returned: { ...event.returned, truncated: true } }))), /not returned.*in full/, "full coverage also needs an actual terminal page");
+	await assertFullM07Reads(materialRoot, ["access.json"], events);
+	await invoke({ path: "empty.txt", textOffset: 0 });
+	await assertFullM07Reads(materialRoot, ["empty.txt"], handle.readReturnEvents());
+	for (const args of [{ path: "escape.txt", textOffset: 0 }, { path: "../outside.txt", textOffset: 0 },
+		{ path: "paper.pdf", textOffset: 0 }, { path: "image.png", textOffset: 0 }, { path: ".", textOffset: 0 },
+		{ offset: 1, textOffset: 0 }, { limit: 1, textLimit: 2 }, { textOffset: -1 }, { textLimit: 16001 }, { textLimit: 1 },
+		{ textOffset: text.indexOf("🙂") + 1 }]) await assert.rejects(invoke(args));
+});
+
 test("writes the sidecar next to the SDK path and resume rebuilds from it", async (t) => {
 	const persistDir = await fixture(t);
 	const stub = stubFactory();
@@ -289,6 +347,80 @@ test("execution grants only requested native tools at the execution cwd and logs
 		{ name: "write", ok: true },
 	]);
 	await assert.rejects(runner.resume(handle.ref), /cannot be resumed/);
+});
+
+test("new macOS execution sessions confine bash and native writes while host files stay writable", async t => {
+	if (process.platform !== "darwin") return t.skip("native macOS sandbox-exec boundary");
+	const persistDir = await fixture(t);
+	const work = path.join(persistDir, "work"), scratch = path.join(persistDir, "scratch");
+	await mkdir(work); await mkdir(scratch);
+	await mkdir(path.join(work, "inputs")); await mkdir(path.join(work, ".candidate-runs"));
+	const outside = path.join(persistDir, "outside.txt");
+	await writeFile(outside, "host-only\n");
+	await writeFile(path.join(work, "inputs", "frozen.txt"), "frozen\n");
+	await symlink(outside, path.join(work, "escape.txt"));
+	const stub = stubFactory();
+	const handle = await new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory })
+		.create(spec(persistDir, { tools: { kind: "execution", root: work, tempDir: scratch,
+			tools: ["read", "write", "edit", "bash"] } }));
+	const active = stub.calls[0].customTools ?? [];
+	const tool = (name: string) => { const found = active.find(item => item.name === name); assert(found); return found; };
+	await tool("write").execute("write-local", { path: "local.txt", content: "local\n" }, undefined, undefined, { cwd: work } as never);
+	await tool("edit").execute("edit-local", { path: "local.txt", edits: [{ oldText: "local", newText: "changed" }] },
+		undefined, undefined, { cwd: work } as never);
+	assert.equal(await readFile(path.join(work, "local.txt"), "utf8"), "changed\n");
+	await tool("read").execute("read-authorized", { path: outside }, undefined, undefined, { cwd: work } as never);
+	for (const file of [outside, "escape.txt", "inputs/frozen.txt", ".candidate-runs/host.json"])
+		await assert.rejects(tool("write").execute(`write-denied-${file}`, { path: file, content: "bad" },
+			undefined, undefined, { cwd: work } as never));
+	await assert.rejects(tool("edit").execute("edit-denied", { path: outside,
+		edits: [{ oldText: "host-only", newText: "bad" }] }, undefined, undefined, { cwd: work } as never));
+	assert.equal(await readFile(outside, "utf8"), "host-only\n");
+	await tool("bash").execute("bash-local", { command: 'printf safe > local-bash.txt; printf discarded >/dev/null; printf temp > "$TMPDIR"/local-temp.txt' },
+		undefined, undefined, { cwd: work } as never);
+	assert.equal(await readFile(path.join(work, "local-bash.txt"), "utf8"), "safe");
+	assert.equal(await readFile(path.join(scratch, "local-temp.txt"), "utf8"), "temp");
+	const heredoc = "cat <<'TASK_HEREDOC'\nfixture heredoc body\nTASK_HEREDOC";
+	const canonicalWork = await realpath(work), canonicalScratch = await realpath(scratch);
+	await assert.rejects(tool("bash").execute("bash-readonly-heredoc", {
+		command: `cd ${JSON.stringify(persistDir)}; ${heredoc}`,
+	}, undefined, undefined, { cwd: work } as never), error => {
+		assert(error instanceof Error);
+		assert.match(error.message, /\/bin\/bash: cannot create temp file for here document: Operation not permitted/);
+		assert.match(error.message, /macOS system Bash here-documents can ignore TMPDIR/);
+		assert(error.message.includes(JSON.stringify(canonicalWork)));
+		assert(error.message.includes(JSON.stringify(canonicalScratch)));
+		assert(error.cause instanceof Error, "the actual shell error remains the cause");
+		return true;
+	});
+	const recoveredHeredoc = await tool("bash").execute("bash-task-heredoc", { command: heredoc },
+		undefined, undefined, { cwd: work } as never);
+	assert.match(JSON.stringify(recoveredHeredoc), /fixture heredoc body/);
+	await assert.rejects(tool("bash").execute("bash-outside", { command: `printf bad > ${JSON.stringify(outside)}` },
+		undefined, undefined, { cwd: work } as never), error => {
+			assert(error instanceof Error);
+			assert.doesNotMatch(error.message, /macOS system Bash here-documents can ignore TMPDIR/,
+				"ordinary write denial is not diagnosed as a here-document issue");
+			return true;
+		});
+	await assert.rejects(tool("bash").execute("bash-child", { command: `/bin/sh -c 'printf bad > ${outside}'` },
+		undefined, undefined, { cwd: work } as never));
+	await assert.rejects(tool("bash").execute("bash-protected", { command: "printf bad > .candidate-runs/host.json" },
+		undefined, undefined, { cwd: work } as never));
+	await assert.rejects(tool("bash").execute("bash-hardlink", { command: `ln ${JSON.stringify(outside)} hardlink.txt` },
+		undefined, undefined, { cwd: work } as never));
+	assert.equal(await readFile(outside, "utf8"), "host-only\n");
+	await writeFile(path.join(work, ".candidate-runs", "host.json"), "host can still write\n");
+	assert.equal(await readFile(path.join(work, ".candidate-runs", "host.json"), "utf8"), "host can still write\n");
+	handle.dispose();
+
+	const inheritedWork = path.join(persistDir, "inherited-work");
+	await mkdir(inheritedWork);
+	await link(outside, path.join(inheritedWork, "inherited-link.txt"));
+	await assert.rejects(new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stubFactory().factory })
+		.create(spec(persistDir, { tools: { kind: "execution", root: inheritedWork, tools: ["bash"] } })),
+		/hard-linked file/);
+	assert.equal(await readFile(outside, "utf8"), "host-only\n");
 });
 
 test("local execution bash does not inherit model process credentials", async t => {

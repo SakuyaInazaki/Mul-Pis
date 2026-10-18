@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -106,4 +106,73 @@ test("confirmed host reconciliation returns before a new execute task; wrong or 
 	assert.equal(settled.executionState!.operations[0].status, "confirmed");
 	assert.equal(settled.tasks[0].status, "failed");
 	assert.match(await readFile(settled.executionState!.operations[0].evidencePath!, "utf8"), /independent-remote-id/);
+});
+
+test("configured candidate feedback is available through ordinary service delegation", async t => {
+	const root = await mkdtemp(path.join(tmpdir(), "operator-host-feedback-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	await mkdir(path.join(root, "problem"), { recursive: true });
+	await writeFile(path.join(root, "problem", "problem.md"), "Optimize an operator\n");
+	await writeFile(path.join(root, "research.config.json"), JSON.stringify({
+		roles: { execution: "fake/execution", reviewer: "fake/reviewer" }, concurrency: 1, tools: {} }));
+	let actualTools: string[] = [];
+	const runner = new FakeSessionRunner(async ({ spec }) => {
+		if (spec.tools.kind === "execution") {
+			actualTools = spec.tools.extraTools?.map(tool => tool.name) ?? [];
+			await writeFile(path.join(spec.tools.root, "result.txt"), "evidence");
+		}
+		return "done";
+	});
+	const service = new ResearchService({ defaultWorkspace: root, runnerFactory: () => runner,
+		candidateVerifier: { id: "host:configured", version: "1", async verifyTask() {
+			throw new Error("an empty episode must not run an evaluation");
+		} } });
+	await service.init(root);
+	const status = await service.status(root);
+	assert.equal(status.candidateFeedback?.configured, true);
+	const goal = await service.goalAction("begin", root, { goal: "Optimize", problemRelation: "direct",
+		constraints: ["Preserve the original operator semantics"], successCriteria: ["original target"], plan: "explore", exploratory: true }) as CurrentGoal;
+	const task = await service.delegate(goal.runId, execute, root) as CurrentGoal["tasks"][number];
+	assert.equal(task.status, "returned");
+	assert.deepEqual(task.executionLoop, { mode: "candidate-episode" });
+	for (const name of ["candidate_evaluate", "candidate_list", "candidate_read", "candidate_checkout", "knowledge_select", "knowledge_read"])
+		assert.ok(actualTools.includes(name), `${name} must reach the real execution grant`);
+	assert.equal(runner.created.length, 1, "ordinary feedback episodes do not launch a report reviewer after every experiment");
+});
+
+test("host task admission rejects an off-subject delegate before task files or runner and admits the current subject", async t => {
+	const root = await mkdtemp(path.join(tmpdir(), "operator-task-admission-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	await mkdir(path.join(root, "problem"), { recursive: true });
+	await writeFile(path.join(root, "problem", "problem.md"), "Optimize the authorized subject\n");
+	await writeFile(path.join(root, "research.config.json"), JSON.stringify({
+		roles: { execution: "fake/execution", reviewer: "fake/reviewer" }, concurrency: 1, tools: {} }));
+	const runner = new FakeSessionRunner(async ({ spec }) => {
+		if (spec.tools.kind === "execution") await writeFile(path.join(spec.tools.root, "result.txt"), "evidence");
+		return "done";
+	});
+	const admitted: string[] = [];
+	const service = new ResearchService({ defaultWorkspace: root, runnerFactory: () => runner,
+		taskAdmission: async ({ goal, task, workspace }) => {
+			assert.equal(workspace, root);
+			assert.equal(goal.lifecycle, "active");
+			admitted.push(task.subjectId ?? "missing");
+			if (task.subjectId !== "subject:current") throw new Error("subject outside the authorized current scope");
+		} });
+	await service.init(root);
+	assert.equal((await service.status(root)).taskAdmissionConfigured, true);
+	const goal = await service.goalAction("begin", root, { goal: "Optimize", problemRelation: "direct",
+		constraints: ["Work on the current subject"], successCriteria: ["original target"],
+		plan: "evaluate the current subject", exploratory: true }) as CurrentGoal;
+	await assert.rejects(service.delegate(goal.runId, { ...execute, subjectId: "subject:other" }, root),
+		/subject outside the authorized current scope/);
+	assert.deepEqual(admitted, ["subject:other"]);
+	assert.equal(runner.created.length, 0);
+	assert.equal((await service.goalStatus(goal.runId, root) as CurrentGoal).tasks.length, 0);
+	await assert.rejects(stat(path.join(root, "stages", "M07", goal.runId, "tasks", "T001")), { code: "ENOENT" });
+	const task = await service.delegate(goal.runId, { ...execute, subjectId: "subject:current" }, root) as CurrentGoal["tasks"][number];
+	assert.equal(task.status, "returned");
+	assert.equal(task.taskId, "T001");
+	assert.equal(task.subjectId, "subject:current");
+	assert.equal(runner.created.length, 1);
 });

@@ -6,6 +6,7 @@ import { openBoundedSession, type EvidenceBindingV1 } from "../context/boundary.
 import type { SessionRunner, SessionSpec, TransportFailureDiagnostic } from "../runner/types.ts";
 import type { DeepSeekRequestViolation } from "../runner/deepseek-request-contract.ts";
 import { isSettledTerminalResponse } from "../runner/operation-disposition.ts";
+import { textReadCoverage } from "../runner/read-coverage.ts";
 import { workflowRepairFingerprint, workflowRepairState, type WorkflowRepairFailure,
 	type WorkflowRepairStateV1 } from "../runner/repair-liveness.ts";
 import type { StageRunRecord } from "../types.ts";
@@ -879,7 +880,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		const bytes = await readFile(item.file);
 		if (bytes.length > MAX_EVIDENCE_BYTES) throw new HarnessError("m07.objective", "objective evidence is not a bounded regular file");
 		let text: string;
-		try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+		try { text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); }
 		catch { throw new HarnessError("m07.objective", "objective evidence is not valid UTF-8 text"); }
 		materials.push({ ...item, lineCount: text.length === 0 ? 0 :
 			text.split("\n").length - (text.endsWith("\n") ? 1 : 0),
@@ -1072,7 +1073,7 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 				`${item.scope}: ${item.available ? "available" : "unavailable"}; ${item.description}; limits: ${item.limits.join("; ")}`),
 			`Closure policy: ${contract.closure}. A bounded child goal and accepted candidate do not alone establish original-goal completion.`,
 			evidenceInstructions ?? "Read all supplied material; the caller identifies the original inputs and the meaning of artifact names.",
-			"# Frozen bounded evidence", "Use objective_evidence_read to read the complete original-objective.json and every listed file below. This list contains the required files. If paginated, read every page including the untruncated end. Required files:",
+			"# Frozen bounded evidence", "Use objective_evidence_read to read the complete original-objective.json and every listed file below. This list contains the required files. If paginated, read every page including the untruncated end. Oversized lines can be read with textOffset/textLimit instead of offset/limit; follow next textOffset. Required files:",
 			...requiredMaterials.map(item => item.lineCount === 0 ?
 				`${item.name} (empty file; read it for exact zero-byte confirmation, with no line citation)` : item.name),
 			...(materials.some(item => item.name === "prior-incomplete-run-control.json") ? [
@@ -1119,42 +1120,24 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			}
 		};
 		const verifiedEmpty = new Set<string>();
-		const coverage = (name: string, lines: number): { complete: boolean; score: number; nextRange: string;
-			coveredRanges: Array<[number, number]>; reachedUntruncatedEnd: boolean } => {
+		const coverage = async (name: string) => {
+			const content = await readFile(path.join(evidenceRoot, name), "utf8");
 			const returned = handle.readReturnEvents();
-			if (lines === 0) {
-				const exactEmptyRead = returned.some(item => item.toolName === "objective_evidence_read" &&
-					item.path === name && item.status === "no-content" && item.returned.kind === "text" &&
-					item.returned.truncated === false && item.returned.startLine === undefined &&
-					item.returned.endLine === undefined &&
-					(item.requested.offset === undefined || item.requested.offset === 1));
-				const complete = exactEmptyRead && verifiedEmpty.has(name);
-				return { complete, coveredRanges: [], reachedUntruncatedEnd: complete,
-					score: Number(complete), nextRange: `${name}: objective_evidence_read path="${name}" offset=1 limit=1 (verify empty file)` };
-			}
-			const rows = returned.filter(item => item.toolName === "objective_evidence_read" && item.path === name &&
-				item.status === "returned" && item.returned.kind === "text" && item.returned.startLine !== undefined &&
-				item.returned.endLine !== undefined && item.returned.startLine >= 1 &&
-				item.returned.endLine >= item.returned.startLine && item.returned.endLine <= lines);
-			const covered = new Set<number>();
-			for (const row of rows) for (let line = row.returned.startLine!; line <= row.returned.endLine! && line <= lines; line++) covered.add(line);
-			const reachedUntruncatedEnd = rows.some(item => item.returned.endLine === lines && item.returned.truncated === false);
-			const coveredRanges: Array<[number, number]> = [];
-			for (const line of [...covered].sort((a, b) => a - b)) {
-				const last = coveredRanges.at(-1);
-				if (last && last[1] + 1 === line) last[1] = line;
-				else coveredRanges.push([line, line]);
-			}
-			let start = 1;
-			while (start <= lines && covered.has(start)) start++;
-			let end = start;
-			while (end < lines && !covered.has(end + 1)) end++;
-			const offset = start <= lines ? start : Math.max(1, lines);
-			const limit = start <= lines ? end - start + 1 : 1;
-			return { complete: reachedUntruncatedEnd && covered.size === lines,
-				coveredRanges, reachedUntruncatedEnd,
-				score: covered.size + Number(reachedUntruncatedEnd),
-				nextRange: `${name}: objective_evidence_read path="${name}" offset=${offset} limit=${limit}${start > lines ? " (request the untruncated final page)" : ""}` };
+			const read = textReadCoverage(content, name, returned, "objective_evidence_read");
+			const complete = read.complete && (content.length > 0 || verifiedEmpty.has(name));
+			const coveredRanges = read.coveredRanges.map(range => [range.start, range.end] as [number, number]);
+			// A character page can make real progress within one oversized line.
+			const score = read.coveredTextRanges.reduce((sum, range) => sum + range.end - range.start, 0) + Number(read.terminal);
+			const offset = read.missingTextRanges[0]?.start ?? 0;
+			const nextRange = content.length === 0 ?
+				`${name}: objective_evidence_read path="${name}" offset=1 limit=1 (verify empty file)` :
+				`${name}: objective_evidence_read path="${name}" textOffset=${offset} textLimit=16000; follow next textOffset until end (do not combine with line offset/limit)`;
+			// Legacy citations keep their untruncated-line proof. Exact character
+			// pages may jointly cover a cited line without requiring unrelated text.
+			const citationRead = textReadCoverage(content, name, returned.filter(event =>
+				event.returned.textOffset !== undefined || event.returned.truncated === false), "objective_evidence_read");
+			return { complete, coveredRanges, coveredTextRanges: read.coveredTextRanges, reachedUntruncatedEnd: read.terminal, score, nextRange,
+				citationRanges: citationRead.coveredRanges.map(range => [range.start, range.end] as [number, number]) };
 		};
 		const readMaterials = [{ name: "original-objective.json", lineCount: contractText.split("\n").length - (contractText.endsWith("\n") ? 1 : 0) }, ...materials];
 		const citedSpans = (assessment?: ModelObjectiveAssessmentV1): GroundingSpan[] => {
@@ -1297,35 +1280,21 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			verifiedEmpty.clear();
 			for (const item of readMaterials) if (item.lineCount === 0 &&
 				await frozenFileAccessible(item.name, true)) verifiedEmpty.add(item.name);
-			const fileCoverage = readMaterials.map(item => {
-				const read = coverage(item.name, item.lineCount);
+			const fileCoverage = await Promise.all(readMaterials.map(async item => {
+				const read = await coverage(item.name);
 				const requiredSpans = spans.filter(ref => ref.sourceId === item.name);
 				const wholeFile = fullRequired.has(item.name);
-				const untruncatedRanges: Array<[number, number]> = [];
-				for (const event of returned.filter(event => event.toolName === "objective_evidence_read" &&
-					event.path === item.name && event.status === "returned" && event.returned.kind === "text" &&
-					event.returned.truncated === false && event.returned.startLine !== undefined &&
-					event.returned.endLine !== undefined && event.returned.startLine >= 1 &&
-					event.returned.endLine <= item.lineCount))
-					untruncatedRanges.push([event.returned.startLine!, event.returned.endLine!]);
-				untruncatedRanges.sort((a, b) => a[0] - b[0]);
-				const mergedRanges: Array<[number, number]> = [];
-				for (const range of untruncatedRanges) {
-					const prior = mergedRanges.at(-1);
-					if (prior && prior[1] + 1 >= range[0]) prior[1] = Math.max(prior[1], range[1]);
-					else mergedRanges.push([...range]);
-				}
+				const mergedRanges = read.citationRanges;
 				const missingSpan = requiredSpans.find(ref => !mergedRanges.some(range =>
 					range[0] <= ref.startLine && range[1] >= ref.endLine));
 				const needed = wholeFile || requiredSpans.length > 0;
 				const satisfied = wholeFile ? read.complete : !missingSpan;
-				const spanScore = requiredSpans.reduce((sum, ref) => sum + mergedRanges.reduce((covered, range) =>
-					covered + Math.max(0, Math.min(range[1], ref.endLine) - Math.max(range[0], ref.startLine) + 1), 0), 0);
+
 				return { name: item.name, ...read, wholeFile, needed, satisfied,
-					score: wholeFile ? read.score : spanScore,
+					score: needed ? read.score : 0,
 					nextRange: wholeFile || !missingSpan ? read.nextRange :
-						`${item.name}: objective_evidence_read path="${item.name}" offset=${missingSpan.startLine} limit=${missingSpan.endLine - missingSpan.startLine + 1} (cited span)` };
-			});
+						`${item.name}: objective_evidence_read path="${item.name}" offset=${missingSpan.startLine} limit=${missingSpan.endLine - missingSpan.startLine + 1} (cited span; for an oversized line use textOffset/textLimit and read the complete cited line)` };
+			}));
 			const evidenceRead = fileCoverage.filter(item => item.complete).map(item => item.name);
 			const unreadEvidence = fileCoverage.filter(item => item.needed && !item.satisfied).map(item => item.name);
 			const unreadScore = fileCoverage.reduce((sum, item) => sum + item.score, 0);
@@ -1343,9 +1312,9 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			const repairFailure = async (failure: WorkflowRepairFailure, failureFacts: unknown):
 				Promise<"same-session-feedback" | "fresh-context" | CurrentObjectiveStopReason> => {
 				const evidenceFingerprint = workflowRepairFingerprint({ frozen: frozenEvidenceIdentity,
-					coverage: fileCoverage.filter(item => item.needed).map(({ name, coveredRanges,
+					coverage: fileCoverage.filter(item => item.needed).map(({ name, coveredRanges, coveredTextRanges,
 						reachedUntruncatedEnd, wholeFile }) =>
-						({ name, coveredRanges, reachedUntruncatedEnd, wholeFile })) });
+						({ name, coveredRanges, coveredTextRanges, reachedUntruncatedEnd, wholeFile })) });
 				const planFingerprint = workflowRepairFingerprint({ frozen: frozenPlan, failureFacts });
 				// Host failure facts are canonical: timestamps, duplicate reads, JSON
 				// whitespace and unsupported rationale wording cannot create progress.
@@ -1478,12 +1447,13 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 			}
 			if (parsed.decision === "blocked") {
 				const available = capabilities?.filter(item => item.available && supportedTaskScopes.includes(item.scope)) ?? [];
-				const actionable = parsed.groundedAssessment?.issues.some(item => item.status === "open" &&
-					(item.classification === "explicit-requirement" || item.classification === "necessary-verification"));
-				if (!available.length || parsed.groundedAssessment && !actionable)
+				// An issue's model-authored classification cannot discharge an unresolved
+				// obligation in the frozen original contract. Only the host's lack of
+				// available supported execution capability permits this blocked stop.
+				if (!available.length)
 					return { assessment, stopReason: "model-reported-blocked" };
 				await recordRejectedReply({ code: "m07.objective-control",
-					message: "blocked verdict still has an available actionable capability",
+					message: "blocked verdict leaves an original obligation unresolved while supported execution capability is available",
 					path: "$.decision" });
 				const admission = currentObjectiveAdmission(input.advanceAdmission());
 				if (admission !== "admitted") return { assessment, stopReason: admission };

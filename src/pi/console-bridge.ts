@@ -7,10 +7,12 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { readCurrentProcessIdentity } from "../runtime/process-identity.ts";
 import { parseRunDescriptor, type RunDescriptorV1 } from "../runtime/run-descriptor.ts";
 import type { ResearchService, StageRequest } from "./service.ts";
-import type { CurrentGoal } from "../m07/types.ts";
+import type { BeginGoalInput, CurrentGoal } from "../m07/types.ts";
 
 export type ConsoleWorkflowAction =
 	| { kind: "stage"; request: Omit<StageRequest, "workspace"> }
+	| { kind: "begin"; input: BeginGoalInput }
+	| { kind: "mission"; action: "status" | "step" | "run"; missionId: string }
 	| { kind: "status"; runId?: string }
 	| { kind: "checkpoint"; runId: string; taskIds?: string[] }
 	| { kind: "plan"; runId: string; plan: string; refreshBaseline?: boolean; checkpointId?: string; m04RunId?: string }
@@ -45,10 +47,10 @@ export interface ConsoleWorkflowCancelResponse {
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const STAGES = new Set(["M01", "M02", "M03", "M04", "M05", "M06", "M08", "M09"]);
-const STAGE_KEYS = new Set(["stage", "m01RunId", "m02RunId", "feedbackStage", "feedbackRunId", "feedbackCheckpointId", "feedbackFile", "feedbackLabel", "freshSession", "goal", "noBrowser", "sources", "fullText", "reprocessAll", "requirements", "processFeedback", "materials", "selfChecks", "reviewers", "unprovidedScopes", "previousRunId", "changeSummary", "affectedScope", "m08RunId", "m04RunId", "recipient", "purpose", "deliveryScope", "reproduction", "closureRequested"]);
+const STAGE_KEYS = new Set(["stage", "m01RunId", "m02RunId", "feedbackStage", "feedbackRunId", "feedbackCheckpointId", "requiredM07ReadPaths", "feedbackFile", "feedbackLabel", "freshSession", "goal", "noBrowser", "sources", "fullText", "requirements", "processFeedback", "materials", "selfChecks", "reviewers", "unprovidedScopes", "previousRunId", "changeSummary", "affectedScope", "m08RunId", "m04RunId", "recipient", "purpose", "deliveryScope", "reproduction", "closureRequested"]);
 const STRING_STAGE_KEYS = ["m01RunId", "m02RunId", "feedbackRunId", "feedbackCheckpointId", "feedbackFile", "feedbackLabel", "goal", "requirements", "previousRunId", "changeSummary", "affectedScope", "m08RunId", "m04RunId", "recipient", "purpose"] as const;
-const BOOL_STAGE_KEYS = ["freshSession", "noBrowser", "fullText", "reprocessAll", "processFeedback", "closureRequested"] as const;
-const STRING_ARRAY_STAGE_KEYS = ["sources", "unprovidedScopes"] as const;
+const BOOL_STAGE_KEYS = ["freshSession", "noBrowser", "fullText", "processFeedback", "closureRequested"] as const;
+const STRING_ARRAY_STAGE_KEYS = ["sources", "unprovidedScopes", "requiredM07ReadPaths"] as const;
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
 const string = (value: unknown): value is string => typeof value === "string" && value.length > 0;
 const stringArray = (value: unknown): value is string[] => Array.isArray(value) && value.every(string);
@@ -59,6 +61,13 @@ function fields(value: Record<string, unknown>, allowed: readonly string[]): voi
 
 function parseAction(value: unknown): ConsoleWorkflowAction {
 	if (!object(value) || !string(value.kind)) throw new Error("invalid workflow action");
+	if (value.kind === "mission") {
+		fields(value, ["kind", "action", "missionId"]);
+		if (!["status", "step", "run"].includes(String(value.action)) || typeof value.missionId !== "string" ||
+			!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.missionId))
+			throw new Error("invalid mission request");
+		return value as unknown as ConsoleWorkflowAction;
+	}
 	if (value.kind === "stage") {
 		fields(value, ["kind", "request"]);
 		if (!object(value.request)) throw new Error("stage request missing");
@@ -102,6 +111,16 @@ function parseAction(value: unknown): ConsoleWorkflowAction {
 		}
 		return { kind: "stage", request: request as unknown as Omit<StageRequest, "workspace"> };
 	}
+	if (value.kind === "begin") {
+		fields(value, ["kind", "input"]);
+		if (!object(value.input)) throw new Error("begin input missing");
+		fields(value.input, ["goal", "problemRelation", "constraints", "successCriteria", "plan", "exploratory", "workflowMethodVersionId"]);
+		for (const key of ["goal", "problemRelation", "plan"] as const) if (!string(value.input[key])) throw new Error(`invalid begin ${key}`);
+		for (const key of ["constraints", "successCriteria"] as const) if (!stringArray(value.input[key])) throw new Error(`invalid begin ${key}`);
+		if (value.input.exploratory !== undefined && typeof value.input.exploratory !== "boolean") throw new Error("invalid begin exploratory");
+		if (value.input.workflowMethodVersionId !== undefined && !string(value.input.workflowMethodVersionId)) throw new Error("invalid begin workflowMethodVersionId");
+		return { kind: "begin", input: value.input as unknown as BeginGoalInput };
+	}
 	if (value.kind === "status") { fields(value, ["kind", "runId"]); if (value.runId !== undefined && !string(value.runId)) throw new Error("invalid runId"); return value as ConsoleWorkflowAction; }
 	if (value.kind === "checkpoint") { fields(value, ["kind", "runId", "taskIds"]); if (!string(value.runId) || (value.taskIds !== undefined && !stringArray(value.taskIds))) throw new Error("invalid checkpoint"); return value as ConsoleWorkflowAction; }
 	if (value.kind === "plan") { fields(value, ["kind", "runId", "plan", "refreshBaseline", "checkpointId", "m04RunId"]); if (!string(value.runId) || !string(value.plan) || (value.refreshBaseline !== undefined && typeof value.refreshBaseline !== "boolean") || (value.checkpointId !== undefined && !string(value.checkpointId)) || (value.m04RunId !== undefined && !string(value.m04RunId))) throw new Error("invalid plan"); return value as ConsoleWorkflowAction; }
@@ -118,11 +137,16 @@ export function parseConsoleWorkflowRequest(value: unknown): ConsoleWorkflowRequ
 
 function metadata(value: unknown, kind: ConsoleWorkflowAction["kind"]): Record<string, unknown> {
 	if (!object(value)) return { kind };
+	if (kind === "mission") {
+		const contract = object(value.contract) ? value.contract : undefined;
+		return { kind, missionId: contract?.id, objectiveOutcome: value.objectiveOutcome,
+			stopReason: value.stopReason, boundedRunCount: Array.isArray(value.boundedRuns) ? value.boundedRuns.length : 0 };
+	}
 	const record = object(value.record) ? value.record : object(value.stage) && object(value.stage.record) ? value.stage.record : undefined;
 	const result: Record<string, unknown> = { kind };
 	if (record) for (const key of ["runId", "stage", "status"] as const) if (typeof record[key] === "string") result[key] = record[key];
 	if (kind === "checkpoint") for (const key of ["id", "feedbackStatus", "feedbackPath", "manifestPath"] as const) if (typeof value[key] === "string") result[key] = value[key];
-	if (["status", "plan", "decision"].includes(kind)) for (const key of ["runId", "lifecycle", "outcome", "feedbackStatus", "updatedAt"] as const) if (typeof value[key] === "string") result[key] = value[key];
+	if (["begin", "status", "plan", "decision"].includes(kind)) for (const key of ["runId", "lifecycle", "outcome", "feedbackStatus", "updatedAt"] as const) if (typeof value[key] === "string") result[key] = value[key];
 	if (kind === "status") {
 		for (const key of ["initialized", "configPresent"] as const) if (typeof value[key] === "boolean") result[key] = value[key];
 		for (const key of ["knowledgeSnapshot", "activeLimits"] as const) if (typeof value[key] === "string" || typeof value[key] === "number") result[key] = value[key];
@@ -166,15 +190,19 @@ export async function bindConsoleDescriptorToGoal(goal: CurrentGoal, options: { 
 	const attempt = goal.executionState?.attempts.find((item) => item.id === goal.executionState?.activeAttemptId);
 	const target = attempt?.runDescriptor;
 	const current = await (options.processIdentity ?? readCurrentProcessIdentity)();
-	if (!target || goal.runId !== target.goalRunId || descriptor.controlDir !== controlDir || descriptor.instanceId !== target.instanceId || target.attemptId !== attempt?.id ||
+	if (!target || goal.runId !== target.goalRunId || descriptor.controlDir !== controlDir || descriptor.instanceId !== target.instanceId ||
+		descriptor.codeRevision !== target.codeRevision || target.attemptId !== attempt?.id ||
 		descriptor.process.hostId !== current.hostId || descriptor.process.bootId !== current.bootId || descriptor.process.pid !== current.pid || descriptor.process.processStartToken !== current.processStartToken ||
 		target.process.hostId !== current.hostId || target.process.bootId !== current.bootId || target.process.pid !== current.pid || target.process.processStartToken !== current.processStartToken) throw new Error("new goal does not belong to this console process");
 	if (descriptor.goalRunId && descriptor.goalRunId !== goal.runId && descriptor.goalRunId !== options.previousGoalRunId) throw new Error("console descriptor is already bound to another goal");
-	const updated: RunDescriptorV1 = { ...descriptor, goalRunId: goal.runId, attemptId: target.attemptId };
+	const updated: RunDescriptorV1 = { ...descriptor, goalRunId: goal.runId, attemptId: target.attemptId, workspaceId: target.workspaceId };
 	await writePrivateJson(file, updated);
 }
 
-export function registerConsoleWorkflowBridge(pi: ExtensionAPI, options: { service: Pick<ResearchService, "runStage" | "status" | "goalStatus" | "goalAction">; getBoundGoalRunId: () => string | undefined; controlDir?: string; descriptorFile?: string; processIdentity?: typeof readCurrentProcessIdentity }): void {
+export function registerConsoleWorkflowBridge(pi: ExtensionAPI, options: { service: Pick<ResearchService, "runStage" | "status" | "goalStatus" | "goalAction"> & Partial<Pick<ResearchService, "missionStatus" | "missionAdvance">>; getBoundGoalRunId: () => string | undefined;
+	beginGoal?: (input: BeginGoalInput, workspace: string, signal: AbortSignal) => Promise<CurrentGoal>;
+	beforeMutation?: (workspace: string) => void;
+	controlDir?: string; descriptorFile?: string; processIdentity?: typeof readCurrentProcessIdentity }): void {
 	const controlDir = options.controlDir ?? process.env.MUL_PIS_CONSOLE_CONTROL_DIR;
 	const descriptorFile = options.descriptorFile ?? process.env.PRE_RSI_RUN_DESCRIPTOR_FILE;
 	if (!controlDir || !descriptorFile || !path.isAbsolute(controlDir) || path.resolve(path.dirname(descriptorFile)) !== path.resolve(controlDir) || !secureDirectory(controlDir) || !existsSync(descriptorFile)) return;
@@ -212,10 +240,26 @@ export function registerConsoleWorkflowBridge(pi: ExtensionAPI, options: { servi
 				if (!ctx.isIdle()) throw new Error("Pi session is busy");
 				execution.request = request;
 				const action = request.action;
+				if (action.kind !== "status" && !(action.kind === "mission" && action.action === "status"))
+					options.beforeMutation?.(request.workspace);
 				let value: unknown;
 				if (action.kind === "stage") {
 					if (action.request.feedbackStage === "M07" && action.request.feedbackRunId !== bound) throw new Error("M07 feedback must use the bound goal");
 					value = await options.service.runStage({ ...action.request, workspace: request.workspace }, execution.abort.signal);
+				} else if (action.kind === "begin") {
+					if (!options.beginGoal) throw new Error("console goal begin is unavailable in this source");
+					if (bound && (await options.service.goalStatus(bound, request.workspace) as CurrentGoal).lifecycle !== "finished")
+						throw new Error("bound M07 goal is still active; continue that goal before beginning another");
+					value = await options.beginGoal(action.input, request.workspace, execution.abort.signal);
+				} else if (action.kind === "mission") {
+					if (action.action === "status") {
+						if (!options.service.missionStatus) throw new Error("mission status is unavailable");
+						value = await options.service.missionStatus(action.missionId, request.workspace);
+					} else {
+						if (bound) throw new Error("bound M07 continuation must settle before a separate mission action");
+						if (!options.service.missionAdvance) throw new Error("mission advance is unavailable");
+						value = await options.service.missionAdvance(action.action, action.missionId, request.workspace, execution.abort.signal);
+					}
 				} else if (action.kind === "status") {
 					if (bound && action.runId && action.runId !== bound) throw new Error("status runId is not bound");
 					value = action.runId ? await options.service.goalStatus(action.runId, request.workspace) : await options.service.status(request.workspace);

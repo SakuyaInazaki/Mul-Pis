@@ -5,7 +5,10 @@ import { createFileKnowledgeStore } from "../knowledge/store.ts";
 import { discoverLocalM07Experiences, type LocalM07ExperienceDiscovery } from "../knowledge/experience-index.ts";
 import type { KnowledgeRef } from "../knowledge/types.ts";
 import { createM07Controller } from "../m07/controller.ts";
-import type { BeginGoalInput, CurrentGoal, DecisionInput, FinishInput, HostStopReasonKind, InterruptInput, TaskReviewInput, TaskSpecInput } from "../m07/types.ts";
+import type { CandidateVerifier } from "../m07/candidate-evaluation.ts";
+import { pendingCandidateExecutions, type CandidateExecutionBackend } from "../m07/candidate-runner.ts";
+import { withWorkspaceMutationOwnership } from "../console/ownership.ts";
+import type { BeginGoalInput, CurrentGoal, DecisionInput, FinishInput, HostStopReasonKind, InterruptInput, TaskAdmission, TaskReviewInput, TaskSpecInput } from "../m07/types.ts";
 import { summarizeGoalExecution } from "../m07/status.ts";
 import type { RunDescriptorV1 } from "../runtime/run-descriptor.ts";
 import { createPiSessionRunner } from "../runner/pi.ts";
@@ -47,6 +50,10 @@ export interface ResearchStatus {
 	configPresent: boolean;
 	knowledgeSnapshot?: string;
 	activeLimits: number;
+	taskAdmissionConfigured: boolean;
+	candidateExecution?: { id: string; version: string; stages: CandidateExecutionBackend["stages"] };
+	candidateFeedback?: { configured: boolean; verifier?: { id: string; version: string };
+		defaultExecuteMode: "candidate-episode" | "ordinary"; objectiveGoalChecks: boolean; wholeGoalAdmission: boolean };
 	experience?: LocalM07ExperienceDiscovery;
 	stages: Record<ResearchStage, { count: number; latest?: { runId: string; status: string; failures: string[]; goalLifecycle?: CurrentGoal["lifecycle"]; attemptId?: string; attemptState?: ReturnType<typeof summarizeGoalExecution>["attemptState"]; unresolvedOperationIds?: string[]; unresolvedTaskIds?: string[]; goalStateError?: "unreadable" } }>;
 	limitations: string[];
@@ -88,6 +95,14 @@ export interface StageRequest {
 
 export interface ResearchServiceOptions {
 	defaultWorkspace: string;
+	/** Optional host-only per-task admission before any M07 task files or runner session exist. */
+	taskAdmission?: TaskAdmission;
+	/** Read-only candidate verification configured by the host, never by a model. */
+	candidateVerifier?: CandidateVerifier;
+	/** Host-selected executable evaluation stages; mission details stay in the backend. */
+	candidateExecutionBackend?: CandidateExecutionBackend;
+	/** Explicitly require this verifier to decide every original goal criterion. */
+	candidateGoalAdmission?: boolean;
 	/** Host-owned, read-only observation of one unresolved M07 operation. The model never supplies a receipt. */
 	operationReconciler?: (request: HostOperationReconcileRequest, signal?: AbortSignal) => Promise<string | undefined>;
 	onProgress?: (progress: ResearchProgress) => void;
@@ -318,6 +333,17 @@ export class ResearchService {
 			configPresent: existsSync(ws.configFile),
 			knowledgeSnapshot: snapshot?.id,
 			activeLimits: limits.length,
+			taskAdmissionConfigured: Boolean(this.options.taskAdmission),
+			...(this.options.candidateExecutionBackend ? { candidateExecution: {
+				id: this.options.candidateExecutionBackend.id, version: this.options.candidateExecutionBackend.version,
+				stages: structuredClone(this.options.candidateExecutionBackend.stages),
+			} } : {}),
+			candidateFeedback: { configured: Boolean(this.options.candidateVerifier),
+				...(this.options.candidateVerifier ? { verifier: { id: this.options.candidateVerifier.id,
+					version: this.options.candidateVerifier.version } } : {}),
+				defaultExecuteMode: this.options.candidateVerifier ? "candidate-episode" : "ordinary",
+				objectiveGoalChecks: Boolean(this.options.candidateVerifier?.verifyGoal),
+				wholeGoalAdmission: this.options.candidateGoalAdmission ?? false },
 			...(discovered ? { experience: discovered } : {}),
 			stages,
 			limitations: [
@@ -515,9 +541,12 @@ export class ResearchService {
 		const root = this.resolveWorkspace(requested);
 		return this.withMutation(root, async () => {
 			const ctx = await this.nonModelContext(root);
-			const controller = createM07Controller(ctx);
+			const controller = createM07Controller(ctx, { candidateVerifier: this.options.candidateVerifier });
 			if (action === "begin") {
-				const value = await controller.begin(input as BeginGoalInput, authority);
+				const verifier = this.options.candidateVerifier;
+				const value = await controller.begin(input as BeginGoalInput, { ...authority,
+					...(verifier ? { candidateVerification: { id: verifier.id, verifierVersion: verifier.version,
+						goalAdmission: this.options.candidateGoalAdmission ?? false } } : {}) });
 				const runId = (value as { runId?: unknown } | undefined)?.runId;
 				if (typeof runId === "string" && runId) await this.rememberActiveGoal(root, runId);
 				return value;
@@ -541,6 +570,14 @@ export class ResearchService {
 			createM07Controller(await this.nonModelContext(root)).hostAddConstraints(input.runId, {
 				sourceEventId: input.sourceEventId, constraints: input.constraints,
 			}));
+	}
+
+	/** Activate receipt verification for future tasks at a settled goal boundary. */
+	async hostBindCandidateVerifier(input: { workspace: string; runId: string; goalAdmission?: boolean }): Promise<CurrentGoal> {
+		const root = this.resolveWorkspace(input.workspace);
+		return this.withMutation(root, async () => createM07Controller(await this.nonModelContext(root),
+			{ candidateVerifier: this.options.candidateVerifier }).hostBindCandidateVerifier(input.runId,
+				{ goalAdmission: input.goalAdmission ?? this.options.candidateGoalAdmission ?? false }));
 	}
 
 	/** Host-owned lifecycle stop. This is not registered as a model tool. */
@@ -589,12 +626,16 @@ export class ResearchService {
 		signal?: AbortSignal): Promise<CurrentGoal> {
 		const reconciler = this.options.operationReconciler;
 		if (!reconciler) throw new HarnessError("m07.reconcile-unavailable", "没有配置独立宿主对账能力；未知操作保持阻断");
-		const controller = createM07Controller(await this.nonModelContext(root));
+		const controller = createM07Controller({ ...await this.nonModelContext(root), signal }, {
+			candidateVerifier: this.options.candidateVerifier, candidateExecutionBackend: this.options.candidateExecutionBackend });
 		const goal = await controller.status(runId);
 		if (goal.lifecycle !== "active" || !goal.executionState)
 			throw new HarnessError("m07.operation", "目标无可对账的执行状态");
 		const operation = goal.executionState.operations.find((item) => item.id === operationId);
-		if (!operation || operation.status !== "unknown")
+		if (!operation) throw new HarnessError("m07.operation", "操作不存在或已完成对账");
+		const pending = await pendingCandidateExecutions({ journalDir: path.join(root, "stages", "M07", runId, "tasks", operation.taskId, "candidate-runs"),
+			goalRunId: runId, taskId: operation.taskId, operationId, backend: this.options.candidateExecutionBackend });
+		if (operation.status !== "unknown" && !(operation.status === "confirmed" && pending.length))
 			throw new HarnessError("m07.operation", "操作不存在或已完成对账");
 		const task = goal.tasks.find((item) => item.taskId === operation.taskId);
 		if (!task) throw new HarnessError("m07.operation", "未知操作缺少对应任务");
@@ -620,7 +661,12 @@ export class ResearchService {
 				const goal = await createM07Controller(await this.nonModelContext(root)).status(runId);
 				const confirmed: Array<{ operationId: string; taskId: string; evidencePath: string }> = [];
 				for (const operation of goal.executionState?.operations ?? []) {
-					if (operation.status !== "unknown") continue;
+					if (operation.status !== "unknown") {
+						if (operation.status !== "confirmed" || !(await pendingCandidateExecutions({
+							journalDir: path.join(root, "stages", "M07", runId, "tasks", operation.taskId, "candidate-runs"),
+							goalRunId: runId, taskId: operation.taskId, operationId: operation.id,
+							backend: this.options.candidateExecutionBackend })).length) continue;
+					}
 					const reconciled = await this.reconcileUnknownOperation(root, runId, operation.id, signal);
 					const settled = reconciled.executionState?.operations.find((item) => item.id === operation.id);
 					if (settled?.status === "confirmed" && settled.evidencePath)
@@ -629,7 +675,18 @@ export class ResearchService {
 				if (confirmed.length) throw new HarnessError("m07.operation-confirmed",
 					`先前外部操作已由宿主确认执行；本次未创建新执行任务。请读取对账回执并依据新事实重新决定：${JSON.stringify(confirmed)}`);
 			}
-			const value = await createM07Controller(await this.stageContext(root, "M07", signal)).delegate(runId, task);
+			if (task.mode === "execute" && this.options.candidateVerifier) {
+				const controller = createM07Controller(await this.nonModelContext(root),
+					{ candidateVerifier: this.options.candidateVerifier });
+				const goal = await controller.status(runId);
+				if (!goal.candidateVerification) await controller.hostBindCandidateVerifier(runId,
+					{ goalAdmission: this.options.candidateGoalAdmission ?? false });
+				// A configured operator host makes feedback available in the normal path.
+				// Explicit repair modes and frozen-context forks retain their own contract.
+				if (!task.executionLoop && !task.context) task = { ...task, executionLoop: { mode: "candidate-episode" } };
+			}
+			const value = await createM07Controller(await this.stageContext(root, "M07", signal),
+				{ candidateVerifier: this.options.candidateVerifier, candidateExecutionBackend: this.options.candidateExecutionBackend, taskAdmission: this.options.taskAdmission }).delegate(runId, task);
 			await this.rememberActiveGoal(root, runId);
 			return value;
 		});
@@ -638,7 +695,8 @@ export class ResearchService {
 	async review(runId: string, review: TaskReviewInput, requested?: string, signal?: AbortSignal): Promise<unknown> {
 		const root = this.resolveWorkspace(requested);
 		return this.withMutation(root, async () => {
-			const value = await createM07Controller(await this.nonModelContext(root)).review(runId, review);
+			const value = await createM07Controller(await this.nonModelContext(root),
+				{ candidateVerifier: this.options.candidateVerifier }).review(runId, review);
 			await this.rememberActiveGoal(root, runId);
 			return value;
 		});
@@ -685,7 +743,8 @@ export class ResearchService {
 		activeMutations.add(key);
 		if (stage) this.activeStageOperations.set(key, { root: path.resolve(root), runs: [],
 			pendingStarts: new Set(), closing: false });
-		try { return await operation(); } finally { activeMutations.delete(key); this.activeStageOperations.delete(key); }
+		try { return await withWorkspaceMutationOwnership(root, operation); }
+		finally { activeMutations.delete(key); this.activeStageOperations.delete(key); }
 	}
 }
 

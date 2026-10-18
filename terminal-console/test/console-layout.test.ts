@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { hitTest, renderFrame, type ConsoleFrame, type ConsoleView } from "../src/console/render.ts";
+import { hitTest, renderFrame, visibleNodes, workflowFocus, type ConsoleFrame, type ConsoleView } from "../src/console/render.ts";
+import { nodeOverview } from "../src/console/overview.ts";
 import { textWidth } from "../src/console/terminal.ts";
 import type { WorkflowNode, WorkflowSnapshot } from "../src/console/model.ts";
 
@@ -86,6 +87,30 @@ test("a short terminal keeps selected identity and full state together without c
 	assert.equal(track[0]?.value, "T001");
 	assert.equal(track.at(-1)?.value, "T080", "clicking the bottom of the tree track must reach the final node");
 	assert.match(renderFrame({ ...base, selectedId: track.at(-1)?.value }, 120, 30, false).lines.join("\n"), /T080/);
+});
+
+test("first frame follows the persisted running task through old attempts and keeps manual focus on refresh", () => {
+	const run: WorkflowNode = { ...node("run:M07:g"), kind: "run", taskId: undefined, status: "running", runId: "g" };
+	const attempts: WorkflowNode[] = Array.from({ length: 13 }, (_, i) => ({ ...node(`attempt:g:A${String(i + 1).padStart(3, "0")}`, "unknown"),
+		kind: "attempt", taskId: undefined, parentId: run.id, runId: "g" }));
+	const history: WorkflowNode[] = Array.from({ length: 208 }, (_, i) => ({ ...node(`task:g:T${String(i + 1).padStart(3, "0")}`, "accepted"),
+		taskId: `T${String(i + 1).padStart(3, "0")}`, parentId: run.id, runId: "g" }));
+	const active: WorkflowNode = { ...node("task:g:T209", "stale"), taskId: "T209", parentId: history.at(-1)!.id, runId: "g" };
+	const snap = snapshot([run, ...attempts, ...history, active]);
+	snap.goal = { id: "g", title: "目标", lifecycle: "active", attemptId: "A013", attemptState: "running", currentTaskId: "T209",
+		openDecisions: 0, checks: { total: 0, passed: 0, failed: 0, notRun: 0 },
+		tasks: { total: 209, running: 1, returned: 0, accepted: 208, rejected: 0, failed: 0, unknown: 0 }, stateRefs: [] };
+	const initial = workflowFocus(snap);
+	assert.equal(initial.selectedId, active.id);
+	assert(!initial.collapsed.has(history.at(-1)!.id), "the active task's accepted parent must open");
+	assert(visibleNodes(snap, initial.collapsed).some(item => item.node.id === active.id));
+	const preview = nodeOverview(snap, active);
+	assert.match(preview.join("\n"), /当前执行尝试：A013/);
+	assert.match(renderFrame(view({ snapshot: snap, selectedId: initial.selectedId, collapsed: initial.collapsed, preview }), 120, 24, false).lines.join("\n"), /T209/);
+	const manualFolds = new Set([history.at(-1)!.id]);
+	const afterRefresh = workflowFocus(snap, history[0].id, manualFolds);
+	assert.equal(afterRefresh.selectedId, history[0].id);
+	assert.equal(afterRefresh.collapsed, manualFolds, "a refresh must not reopen user-folded branches");
 });
 
 test("the complete end of a long title and overview stays reachable by scrolling", () => {

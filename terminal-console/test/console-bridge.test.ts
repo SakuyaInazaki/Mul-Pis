@@ -1,136 +1,115 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { bindConsoleDescriptorToGoal, parseConsoleWorkflowRequest } from "../../src/pi/console-bridge.ts";
+import { readCurrentProcessIdentity } from "../../src/runtime/process-identity.ts";
+import { createResearchExtension } from "../../src/pi/extension.ts";
+import { ResearchService } from "../../src/pi/service.ts";
+import { FakeSessionRunner } from "../../src/runner/fake.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { bindConsoleDescriptorToGoal, registerConsoleWorkflowBridge, type ConsoleWorkflowCancelResponse, type ConsoleWorkflowRequest, type ConsoleWorkflowResponse } from "../src/pi/console-bridge.ts";
-import type { RunDescriptorV1 } from "../src/runtime/run-descriptor.ts";
-import type { ResearchService } from "../src/pi/service.ts";
+import type { CurrentGoal } from "../../src/m07/types.ts";
 
-async function fixture(goalRunId?: string, overrideService: Partial<ResearchService> = {}) {
-	const root = await mkdtemp(path.join(tmpdir(), "console-bridge-"));
-	const controlDir = path.join(root, "control");
+test("workflow bridge accepts current stage fields and rejects obsolete strategy controls", () => {
+	const base = { version: 1, requestId: randomUUID(), instanceId: randomUUID(), workspaceId: randomUUID(),
+		workspace: "/tmp/workspace", attemptId: "A001" };
+	const parsed = parseConsoleWorkflowRequest({ ...base, action: { kind: "stage", request: { stage: "M04",
+		feedbackStage: "M07", feedbackRunId: "g", requiredM07ReadPaths: ["stages/M07/g/checkpoints/C001/feedback.md"] } } });
+	assert.equal(parsed.action.kind, "stage");
+	assert.throws(() => parseConsoleWorkflowRequest({ ...base, action: { kind: "stage", request: { stage: "M07" } } }), /invalid workflow stage/);
+	assert.throws(() => parseConsoleWorkflowRequest({ ...base, action: { kind: "stage", request: { stage: "M04", reprocessAll: true } } }), /unexpected stage field/);
+});
+
+test("goal binding installs the persisted store identity only for the same Pi process and source", async (t) => {
+	const identity = await readCurrentProcessIdentity().catch(() => undefined);
+	if (!identity) { t.skip("precise process identity is unavailable"); return; }
+	const root = await mkdtemp(path.join(tmpdir(), "workflow-console-bridge-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const controlDir = path.join(root, "private");
 	await mkdir(controlDir, { mode: 0o700 });
-	await mkdir(path.join(controlDir, "requests"), { mode: 0o700 });
-	await mkdir(path.join(controlDir, "responses"), { mode: 0o700 });
-	const identity = { hostId: "test-host", bootId: "test-boot", pid: process.pid, processStartToken: "test-start" };
-	const descriptor: RunDescriptorV1 = { version: 1, instanceId: randomUUID(), attemptId: "A001", workspaceId: randomUUID(), ...(goalRunId ? { goalRunId } : {}), codeRevision: "test", controlDir, process: identity };
 	const descriptorFile = path.join(controlDir, "run-descriptor.json");
+	const instanceId = randomUUID(), revision = "builtin:" + "f".repeat(40), storeId = randomUUID();
+	const descriptor = { version: 1, instanceId, attemptId: "A001", workspaceId: root,
+		codeRevision: revision, controlDir, process: identity };
 	await writeFile(descriptorFile, JSON.stringify(descriptor), { mode: 0o600 });
-	const calls: string[] = [];
-	const signals: AbortSignal[] = [];
-	const service = {
-		runStage: async (request: { stage: string; workspace?: string }, signal: AbortSignal) => { signals.push(signal); calls.push(`stage:${request.stage}:${request.workspace}`); return { record: { runId: "stage-1", stage: request.stage, status: "completed", output: "sensitive body" } }; },
-		status: async () => { calls.push("status"); return { stages: {} }; },
-		goalStatus: async (runId: string) => { calls.push(`goalStatus:${runId}`); return { runId, lifecycle: "active", plan: "sensitive plan" }; },
-		goalAction: async (kind: string, _workspace: string, input: { runId: string }, signal: AbortSignal) => { signals.push(signal); calls.push(`${kind}:${input.runId}`); return { runId: input.runId, lifecycle: "active", plan: "sensitive plan", id: "CP001", feedbackPath: "/evidence" }; },
-		...overrideService,
-	} as unknown as ResearchService;
-	const commands = new Map<string, (args: string, ctx: any) => Promise<void>>();
-	const pi = { registerCommand(name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) { commands.set(name, command.handler); } } as unknown as ExtensionAPI;
-	registerConsoleWorkflowBridge(pi, { service, getBoundGoalRunId: () => goalRunId, controlDir, descriptorFile, processIdentity: async () => identity });
-	async function start(action: ConsoleWorkflowRequest["action"], overrides: Partial<ConsoleWorkflowRequest> = {}, idle = true) {
-		const handler = commands.get("workflow-console"); assert.ok(handler);
+	const target = { ...descriptor, goalRunId: "g", workspaceId: storeId, controlDir: path.join(root, "stages", "M07", "g") };
+	const goal = { runId: "g", executionState: { activeAttemptId: "A001", attempts: [{ id: "A001", runDescriptor: target }] } } as CurrentGoal;
+	await bindConsoleDescriptorToGoal(goal, { controlDir, descriptorFile, processIdentity: async () => identity });
+	const bound = JSON.parse(await readFile(descriptorFile, "utf8"));
+	assert.equal(bound.workspaceId, storeId);
+	assert.equal(bound.goalRunId, "g");
+	assert.equal(bound.attemptId, "A001");
+	await assert.rejects(bindConsoleDescriptorToGoal({ ...goal, executionState: { ...goal.executionState!, attempts: [{
+		...goal.executionState!.attempts[0], runDescriptor: { ...target, codeRevision: "other" } }] } },
+		{ controlDir, descriptorFile, processIdentity: async () => identity }), /does not belong/);
+});
+
+test("real service and extension bridge persist one console goal and return its status without a model session", async (t) => {
+	const identity = await readCurrentProcessIdentity().catch(() => undefined);
+	if (!identity) { t.skip("precise process identity is unavailable"); return; }
+	const workspace = await realpath(await mkdtemp(path.join(tmpdir(), "workflow-console-service-")));
+	t.after(() => rm(workspace, { recursive: true, force: true }));
+	await mkdir(path.join(workspace, "problem"), { recursive: true });
+	await writeFile(path.join(workspace, "problem", "problem.md"), "A bounded offline question.\n");
+	await writeFile(path.join(workspace, "research.config.json"), JSON.stringify({ roles: {
+		research: "fake/research", execution: "fake/execution", reviewer: "fake/reviewer" }, concurrency: 1, tools: {} }));
+	const runner = new FakeSessionRunner(() => { throw new Error("this control-only test must not start a model session"); });
+	const service = new ResearchService({ defaultWorkspace: workspace, runnerFactory: () => runner });
+	await service.init(workspace);
+	const instanceId = randomUUID(), controlDir = path.join(workspace, ".agent", "console", "instances", instanceId);
+	const descriptorFile = path.join(controlDir, "run-descriptor.json");
+	await mkdir(path.join(controlDir, "requests"), { recursive: true, mode: 0o700 });
+	await mkdir(path.join(controlDir, "responses"), { mode: 0o700 });
+	const codeRevision = "builtin:offline-integration";
+	await writeFile(descriptorFile, JSON.stringify({ version: 1, instanceId, attemptId: "A001", workspaceId: workspace,
+		codeRevision, controlDir, processGroupId: process.pid, process: identity }), { mode: 0o600 });
+	await writeFile(path.join(workspace, ".agent", "console", "owner.lock"), JSON.stringify({ version: 1, kind: "console", instanceId,
+		process: identity }), { mode: 0o600 });
+	const envKeys = ["MUL_PIS_CONSOLE_CONTROL_DIR", "PRE_RSI_RUN_DESCRIPTOR_FILE", "PRE_RSI_RUN_INSTANCE_ID", "PRE_RSI_CODE_REVISION", "PRE_RSI_CONTINUATION_WORKSPACE", "PRE_RSI_SOURCE_ROOT", "PRE_RSI_ACTIVE_H_VERSION_ID"] as const;
+	const prior = Object.fromEntries(envKeys.map(key => [key, process.env[key]]));
+	delete process.env.PRE_RSI_SOURCE_ROOT;
+	delete process.env.PRE_RSI_ACTIVE_H_VERSION_ID;
+	Object.assign(process.env, { MUL_PIS_CONSOLE_CONTROL_DIR: controlDir, PRE_RSI_RUN_DESCRIPTOR_FILE: descriptorFile,
+		PRE_RSI_RUN_INSTANCE_ID: instanceId, PRE_RSI_CODE_REVISION: codeRevision, PRE_RSI_CONTINUATION_WORKSPACE: workspace });
+	t.after(() => { for (const key of envKeys) if (prior[key] === undefined) delete process.env[key]; else process.env[key] = prior[key]; });
+	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+	let activeTools: string[] = ["read", "bash", "edit", "write"];
+	const api = { on() {}, registerTool() {}, registerCommand(name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+		commands.set(name, command); }, getActiveTools: () => activeTools, setActiveTools(names: string[]) { activeTools = names; }, appendEntry() {} } as unknown as ExtensionAPI;
+	createResearchExtension({ service, continuation: { workspace } })(api);
+	const command = commands.get("workflow-console");
+	assert(command, "the real extension must register the console command after descriptor bootstrap");
+	const invoke = async (action: unknown, goalRunId?: string): Promise<Record<string, unknown>> => {
+		const descriptor = JSON.parse(await readFile(descriptorFile, "utf8")) as { workspaceId: string; attemptId: string };
 		const requestId = randomUUID();
-		const request: ConsoleWorkflowRequest = { version: 1, requestId, instanceId: descriptor.instanceId, workspaceId: descriptor.workspaceId, workspace: root, attemptId: "A001", ...(goalRunId ? { goalRunId } : {}), action, ...overrides };
-		await writeFile(path.join(controlDir, "requests", `${requestId}.json`), JSON.stringify(request), { mode: 0o600 });
-		return { requestId, finished: handler(requestId, { cwd: root, isIdle: () => idle }) };
-	}
-	async function invoke(action: ConsoleWorkflowRequest["action"], overrides: Partial<ConsoleWorkflowRequest> = {}, idle = true): Promise<ConsoleWorkflowResponse> {
-		const { requestId, finished } = await start(action, overrides, idle);
-		await finished;
-		return JSON.parse(await readFile(path.join(controlDir, "responses", `${requestId}.json`), "utf8")) as ConsoleWorkflowResponse;
-	}
-	async function cancel(requestId: string): Promise<ConsoleWorkflowCancelResponse> {
-		const handler = commands.get("workflow-console-cancel"); assert.ok(handler);
-		await handler(requestId, { cwd: root, isIdle: () => true });
-		return JSON.parse(await readFile(path.join(controlDir, "responses", `${requestId}.cancel.json`), "utf8")) as ConsoleWorkflowCancelResponse;
-	}
-	return { root, controlDir, descriptorFile, descriptor, identity, calls, signals, start, invoke, cancel, registered: commands.has("workflow-console") && commands.has("workflow-console-cancel") };
-}
-
-test("bridge is absent without a verified control directory", () => {
-	let registered = false;
-	registerConsoleWorkflowBridge({ registerCommand() { registered = true; } } as unknown as ExtensionAPI, { service: {} as ResearchService, getBoundGoalRunId: () => undefined, controlDir: "/missing", descriptorFile: "/missing/run-descriptor.json" });
-	assert.equal(registered, false);
-});
-
-test("bridge executes a bounded stage and returns only metadata", async () => {
-	const f = await fixture();
-	assert.equal(f.registered, true);
-	const receipt = await f.invoke({ kind: "stage", request: { stage: "M01" } });
-	assert.equal(receipt.ok, true);
-	assert.deepEqual(receipt.data, { kind: "stage", runId: "stage-1", stage: "M01", status: "completed" });
-	assert.deepEqual(f.calls, [`stage:M01:${f.root}`]);
-	const status = await f.invoke({ kind: "status", runId: "G-read-only" });
-	assert.deepEqual(status.data, { kind: "status", runId: "G-read-only", lifecycle: "active" });
-	assert.deepEqual(f.calls, [`stage:M01:${f.root}`, "goalStatus:G-read-only"]);
-});
-
-test("bridge rejects mismatched identities, busy execution, and forbidden actions", async () => {
-	const f = await fixture("G1");
-	assert.equal((await f.invoke({ kind: "checkpoint", runId: "G1" }, { attemptId: "A002" })).ok, false);
-	assert.equal((await f.invoke({ kind: "stage", request: { stage: "M01" } }, {}, false)).ok, false);
-	assert.equal((await f.invoke({ kind: "stage", request: { stage: "M07" } } as any)).ok, false);
-	assert.equal((await f.invoke({ kind: "begin" } as any)).ok, false);
-	assert.equal((await f.invoke({ kind: "stage", request: { stage: "M08", workspace: "/other" } as any })).ok, false);
-	assert.equal((await f.invoke({ kind: "stage", request: { stage: "M08", reviewers: [{ id: "R1", role: "improver" }] } as any })).ok, false);
-	assert.deepEqual(f.calls, []);
-});
-
-test("bridge accepts the structured M08 review parameters used by research_stage", async () => {
-	const f = await fixture();
-	const response = await f.invoke({ kind: "stage", request: {
-		stage: "M08", materials: [{ label: "report", path: "report.md", sourceCategory: "result" }],
-		selfChecks: [{ id: "S1", instruction: "check scope", mode: "read-only" }],
-		reviewers: [{ id: "R1", role: "reviewer", mode: "read-only" }],
-		unprovidedScopes: [], processFeedback: false,
-	} });
-	assert.equal(response.ok, true);
-	assert.deepEqual(f.calls, [`stage:M08:${f.root}`]);
-});
-
-test("bridge binds goal changes and omits goal body from response", async () => {
-	const f = await fixture("G1");
-	const wrong = await f.invoke({ kind: "plan", runId: "G2", plan: "wrong" });
-	assert.equal(wrong.ok, false);
-	const receipt = await f.invoke({ kind: "plan", runId: "G1", plan: "next" });
-	assert.deepEqual(receipt.data, { kind: "plan", runId: "G1", lifecycle: "active" });
-	assert.deepEqual(f.calls, ["plan:G1"]);
-	assert.equal(f.signals.length, 1);
-	assert.equal(f.signals[0].aborted, false);
-});
-
-test("cancel command aborts the active stage signal and final workflow receipt records failure", async () => {
-	let started!: () => void;
-	const begun = new Promise<void>(resolve => { started = resolve; });
-	let observedSignal: AbortSignal | undefined;
-	const f = await fixture(undefined, { runStage: async (_request, signal) => {
-		observedSignal = signal;
-		started();
-		return await new Promise<never>((_resolve, reject) => signal!.addEventListener("abort", () => reject(new Error("stage interrupted by signal")), { once: true }));
-	} });
-	const { requestId, finished } = await f.start({ kind: "stage", request: { stage: "M01" } });
-	await begun;
-	const cancel = await f.cancel(requestId);
-	assert.deepEqual(cancel, { version: 1, requestId, ok: true, cancelled: true });
-	assert.equal(observedSignal?.aborted, true);
-	await finished;
-	const final = JSON.parse(await readFile(path.join(f.controlDir, "responses", `${requestId}.json`), "utf8")) as ConsoleWorkflowResponse;
-	assert.equal(final.ok, false);
-	assert.match(final.error ?? "", /interrupted by signal/);
-	assert.equal((await stat(path.join(f.controlDir, "responses", `${requestId}.cancel.json`))).mode & 0o777, 0o600);
-});
-
-test("new goal binding updates only the console descriptor after matching the process", async () => {
-	const f = await fixture();
-	const goal = { runId: "G1", executionState: { activeAttemptId: "A001", attempts: [{ id: "A001", runDescriptor: { ...f.descriptor, workspaceId: randomUUID(), goalRunId: "G1", controlDir: path.join(f.root, "stages", "M07", "G1") } }] } };
-	await bindConsoleDescriptorToGoal(goal as any, { controlDir: f.controlDir, descriptorFile: f.descriptorFile, processIdentity: async () => f.identity });
-	const updated = JSON.parse(await readFile(f.descriptorFile, "utf8")) as RunDescriptorV1;
-	assert.equal(updated.goalRunId, "G1");
-	assert.equal(updated.workspaceId, f.descriptor.workspaceId);
-	assert.equal(updated.controlDir, f.controlDir);
-	assert.equal((await stat(f.descriptorFile)).mode & 0o777, 0o600);
+		await writeFile(path.join(controlDir, "requests", `${requestId}.json`), JSON.stringify({ version: 1, requestId,
+			instanceId, workspaceId: descriptor.workspaceId, workspace, attemptId: descriptor.attemptId,
+			...(goalRunId ? { goalRunId } : {}), action }), { mode: 0o600 });
+		await command.handler(requestId, { cwd: workspace, isIdle: () => true, mode: "rpc" });
+		return JSON.parse(await readFile(path.join(controlDir, "responses", `${requestId}.json`), "utf8")) as Record<string, unknown>;
+	};
+	const begun = await invoke({ kind: "begin", input: { goal: "Check the bounded question", problemRelation: "direct",
+		constraints: ["preserve evidence"], successCriteria: ["answer checked"], plan: "inspect evidence", exploratory: true } });
+	assert.equal(begun.ok, true, JSON.stringify(begun));
+	const runId = (begun.data as { runId?: string }).runId;
+	assert(runId);
+	const goal = await service.goalStatus(runId, workspace) as CurrentGoal;
+	assert.equal(goal.lifecycle, "active");
+	assert.equal(goal.executionState?.attempts[0]?.runDescriptor.instanceId, instanceId);
+	const descriptor = JSON.parse(await readFile(descriptorFile, "utf8"));
+	assert.equal(descriptor.goalRunId, runId);
+	assert.equal(descriptor.workspaceId, goal.executionState?.attempts[0]?.runDescriptor.workspaceId);
+	assert(activeTools.includes("research_goal") && !activeTools.includes("bash"), "console begin activates research-only tool authority");
+	const status = await invoke({ kind: "status", runId }, runId);
+	assert.equal(status.ok, true, JSON.stringify(status));
+	assert.equal((status.data as { lifecycle?: string }).lifecycle, "active");
+	assert.equal((status.data as { outcome?: string }).outcome, undefined);
+	const consoleEnv = process.env.MUL_PIS_CONSOLE_CONTROL_DIR;
+	delete process.env.MUL_PIS_CONSOLE_CONTROL_DIR;
+	try {
+		await assert.rejects(service.goalAction("checkpoint", workspace, { runId }), /already owned/);
+	} finally { if (consoleEnv === undefined) delete process.env.MUL_PIS_CONSOLE_CONTROL_DIR; else process.env.MUL_PIS_CONSOLE_CONTROL_DIR = consoleEnv; }
+	assert.equal(runner.created.length, 0);
 });

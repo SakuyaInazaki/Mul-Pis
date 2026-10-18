@@ -18,13 +18,14 @@ import { FakeSessionRunner, type FakeReplyFn } from "../src/runner/fake.ts";
 import type { StageContext } from "../src/stages/context.ts";
 import { Workspace } from "../src/workspace.ts";
 
-async function fixture(t: TestContext, reply: FakeReplyFn, continuous = false) {
+async function fixture(t: TestContext, reply: FakeReplyFn, continuous = false, prepareStore?: (store: ReturnType<typeof createFileKnowledgeStore>) => Promise<void>) {
  const root = await realpath(await mkdtemp(path.join(tmpdir(), "m07-loop-")));
  t.after(() => rm(root, { recursive: true, force: true }));
  const ws = new Workspace(root);
  await mkdir(path.join(root, "problem"), { recursive: true });
  await writeFile(ws.problemFile, "bounded research problem\n");
  const store = createFileKnowledgeStore(ws.knowledgeDir); await store.init();
+ if (prepareStore) await prepareStore(store);
  const baseline = await ws.startRun("M04", [{label:"problem",path:ws.problemFile}]); await ws.finishRun(baseline,"completed");
  const runner = new FakeSessionRunner(reply);
  const ctx: StageContext = {ws,store,runner,config:{roles:{execution:"fake/execution",reviewer:"fake/reviewer",research:"fake/research"},concurrency:1,tools:{}}};
@@ -74,44 +75,26 @@ test("host constraint additions affect only future task and reviewer messages", 
  await assert.rejects(f.controller.hostAddConstraints(f.goal.runId,{sourceEventId:"user-event-2",constraints:["another boundary"]}),/未决外部操作/);
 });
 
-test("continuous execution cannot return on the builder's early finish without reviewer readiness", async t => {
- let release!: () => void;
- const gate = new Promise<void>(resolve => { release = resolve; });
- let continued!: () => void;
- const enteredRepair = new Promise<void>(resolve => { continued = resolve; });
- const f = await fixture(t, async ({spec, turnIndex}) => {
-  if (spec.tools.kind === "read-dir") {
-   const actual = await readFile(path.join(spec.tools.root,"result.txt"),"utf8");
-   return JSON.stringify({verdict:actual === "verified result" ? "ready" : "revise",feedback:`Checked result.txt: ${actual}`});
-  }
-  if (spec.tools.kind === "execution") {
-   if (turnIndex === 2) { continued(); await gate; }
-   await writeFile(path.join(spec.tools.root,"result.txt"),turnIndex === 1 ? "incomplete result" : "verified result");
-  }
-  return "Finished; return this task now.";
+test("continuous execute returns a negative task result without an implicit reviewer and keeps the goal active", async t => {
+ const f = await fixture(t, async ({spec}) => {
+  if (spec.tools.kind === "execution") await writeFile(path.join(spec.tools.root,"result.txt"),"incomplete result");
+  return "The candidate did not meet the original check.";
  }, true);
- const pending = f.controller.delegate(f.goal.runId,{objective:"produce a verified result",inputs:[],
+ const task = await f.controller.delegate(f.goal.runId,{objective:"produce a verified result",inputs:[],
   expectedOutputs:["result.txt"],checks:["result is verified"],mode:"execute"});
- try {
-  const first = await Promise.race([enteredRepair.then(()=>"repair"),pending.then(()=>"returned")]);
-  assert.equal(first,"repair","a normal builder finish must not bypass the controller review loop");
-  const during = await f.controller.status(f.goal.runId);
-  assert.equal(during.lifecycle,"active");
-  assert.equal(during.tasks[0].status,"running");
-  assert.deepEqual(during.tasks[0].executionLoop,{mode:"until-ready"});
- } finally { release(); }
- const task = await pending;
  assert.equal(task.status,"returned",task.executionFailure);
- assert.equal(task.loopStopReason,"ready");
- assert.deepEqual(task.executionRounds?.map(round=>round.verdict),["revise","ready"]);
- assert.equal(f.runner.created.filter(spec=>spec.tools.kind === "execution").length,1);
+ assert.equal(task.executionLoop,undefined);
+ assert.equal(task.executionRounds,undefined);
+ assert.equal(f.runner.created.filter(spec=>spec.role === "reviewer").length,0);
  const result = path.join(task.workDir,"result.txt");
  const reviewed = await f.controller.review(f.goal.runId,{taskId:task.taskId,artifacts:[result],
-  checks:[{criterion:"result is verified",result:"passed",evidence:[result]}]});
- assert.equal(reviewed.status,"accepted");
+  checks:[{criterion:"result is verified",result:"failed",evidence:[result]}]});
+ assert.equal(reviewed.status,"rejected");
  assert.equal((await f.controller.status(f.goal.runId)).lifecycle,"active");
+ await assert.rejects(f.controller.finish(f.goal.runId,{outcome:"partial",summary:"negative task fact",returnPath:"continue",
+  goalChecks:[{criterion:"verified",result:"not_run",evidence:[]}]}),/continuous/);
  await assert.rejects(f.controller.finish(f.goal.runId,{outcome:"fulfilled",summary:"premature overall completion",returnPath:"user",
-  goalChecks:[{criterion:"verified",result:"failed",evidence:[result]}]}),/fulfilled/);
+  goalChecks:[{criterion:"verified",result:"failed",evidence:[]}]}),/fulfilled/);
 });
 
 
@@ -144,6 +127,54 @@ test("opt-in M07 repair keeps one builder, creates fresh reviewers, and preserve
  assert.ok(reviewed.review?.artifacts.some(a=>a.sourcePath === path.join(task.workDir,"delta.json")));
  const checkpoint=await f.controller.checkpoint(f.goal.runId);
  assert.match(await readFile(checkpoint.feedbackPath,"utf8"),/delta\.json|candidate/i);
+});
+
+test("fresh reviewer receives the builder's frozen knowledge and root output remains reviewable", async t => {
+ const premise = "Measured cases cover only the observed conditions; impossibility of the target remains unproved.";
+ const f = await fixture(t, async ({spec}) => {
+  if (spec.label.includes("reviewer")) return JSON.stringify({verdict:"ready",feedback:"checked the scoped evidence"});
+  if (spec.tools.kind === "execution") await writeFile(path.join(spec.tools.root,"result.txt"),"local observation");
+  return "This local observation closes the route.";
+ }, false, async store => {
+  const proposal = await store.submitProposal({stage:"M04",runId:"review-context",ops:[
+   {op:"create",type:"Q",title:"Target scope limit",body:premise,usageDecision:"adopted"},
+   {op:"create",type:"K",title:"Scoped executor method",body:"Use only after checking its limits",usageDecision:"adopted",fields:{experience:{version:1,targetKind:"executor",applicableStages:["M07"],requiredTags:["execute"],excludedTags:[],requiredRefs:[]}}},
+  ]});
+  assert.equal(proposal.structurallyValid,true);
+  await store.merge(proposal.proposalId);
+ });
+ const storeId = await f.store.storeId();
+ const task = await f.controller.delegate(f.goal.runId,{objective:"inspect a local observation",inputs:[],knowledgeIds:["Q001@1"],experienceRefs:[{storeId,recordId:"K001",version:1}],expectedOutputs:["."],checks:["observation recorded"],mode:"execute",executionLoop:{mode:"until-ready"}});
+ assert.equal(task.status,"returned",task.executionFailure);
+ const builder = [...f.runner.sessions.values()].find(session=>session.spec.tools.kind === "execution")!;
+ assert.match(builder.transcript[0].text,/Measured cases cover only the observed conditions/);
+ const reviewer = [...f.runner.sessions.values()].find(session=>session.spec.label.includes("round-1-reviewer"))!;
+ assert.equal(reviewer.spec.tools.kind,"read-dir");
+ const prompt = reviewer.transcript[0].text;
+ assert.match(prompt,/Q001@1/);
+ assert.match(prompt,/K001@1/);
+ assert.match(prompt,/"requiredTags":\["execute"\]/);
+ assert.match(prompt,/Measured cases cover only the observed conditions/);
+ assert.match(prompt,/快照：/);
+ assert.match(prompt,/A documented negative experiment can be ready for a diagnostic or bounded-attempt task/);
+ assert.match(prompt,/Do not demand another submission, evaluation, or new kernel beyond this task's authorization/);
+ const result = path.join(task.workDir,"result.txt");
+ const reviewed = await f.controller.review(f.goal.runId,{taskId:task.taskId,artifacts:[result],checks:[{criterion:"observation recorded",result:"passed",evidence:[result]}]});
+ assert.equal(reviewed.status,"accepted",reviewed.review?.failures.join("; "));
+});
+
+test("long builder report handoff is not counted as a root candidate output", async t => {
+ const f = await fixture(t, async ({spec}) => {
+  if (spec.label.includes("reviewer")) return JSON.stringify({verdict:"ready",feedback:"read frozen handoff and result"});
+  if (spec.tools.kind === "execution") await writeFile(path.join(spec.tools.root,"result.txt"),"actual candidate");
+  return "R".repeat(190_000);
+ });
+ const task = await f.controller.delegate(f.goal.runId,{objective:"inspect the actual output",inputs:[],expectedOutputs:["."],checks:["actual output exists"],mode:"execute",executionLoop:{mode:"until-ready"}});
+ assert.equal(task.status,"returned",task.executionFailure);
+ assert.ok(task.executionRounds?.[0].builderReportHandoffDir);
+ const result = path.join(task.workDir,"result.txt");
+ const reviewed = await f.controller.review(f.goal.runId,{taskId:task.taskId,artifacts:[result],checks:[{criterion:"actual output exists",result:"passed",evidence:[result]}]});
+ assert.equal(reviewed.status,"accepted",reviewed.review?.failures.join("; "));
 });
 
 

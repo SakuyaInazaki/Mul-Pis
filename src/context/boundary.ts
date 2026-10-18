@@ -47,7 +47,7 @@ export function linkedEvidence(inputs: readonly InputRef[]): EvidenceBindingV1[]
 
 function capabilityReceipt(grant: ToolGrant): NonNullable<ContextBoundaryRecordV1["capability"]> {
 	if (grant.kind === "none") return { kind: "none" };
-	if (grant.kind === "execution") return { kind: "execution", root: grant.root, toolNames: [...grant.tools].sort() };
+	if (grant.kind === "execution") return { kind: "execution", root: grant.root, toolNames: [...grant.tools, ...(grant.extraTools ?? []).map(tool => tool.name)].sort() };
 	if (grant.kind === "read-dir") return { kind: "read-dir", root: grant.root, toolNames: [grant.toolName ?? "material_read", "material_list", ...(grant.extraTools ?? []).map((item) => item.name)].sort() };
 	return { kind: "custom", toolNames: grant.tools.map((item) => item.name).sort() };
 }

@@ -41,8 +41,9 @@ test("non-interactive finish requires an explicit hard stop reason", async () =>
   const finish = { action: "finish", runId: "r1", outcome: "partial", summary: "s", returnPath: "user", goalChecks: [] };
   await assert.rejects(goal.execute("f", finish, undefined, undefined, context("json")), /硬停止|stopReason|非交互/);
   await assert.rejects(goal.execute("f", finish, undefined, undefined, context("rpc")), /硬停止|stopReason|非交互/);
+  await assert.rejects(goal.execute("f", { ...finish, stopReason: "resource_exhausted" }, undefined, undefined, context("json")), /resource_exhausted/);
   assert.equal(calls.length, 0);
-  await goal.execute("f", { ...finish, stopReason: "resource_exhausted" }, undefined, undefined, context("json"));
+  await goal.execute("f", { ...finish, stopReason: "dependency_unavailable" }, undefined, undefined, context("json"));
   assert.equal(calls.length, 1);
   await goal.execute("f", finish, undefined, undefined, context("tui"));
   assert.equal(calls.length, 2);

@@ -50,6 +50,8 @@ export interface ProjectionEventV1 {
 	deliveryStatus: "not-submitted" | "submitted" | "assembled-for-m04";
 	assembledBy?: { stage: "M04"; runId: string };
 	outputPath?: string;
+	/** Text material ordinals kept deferred when total prompt space forced whole-file omission. */
+	taskPromptDeferredOrdinals?: number[];
 	materials: ProjectionMaterialV1[];
 }
 
@@ -153,6 +155,8 @@ export async function markFeedbackAssembled(ws: Workspace, m07RunId: string, fee
 
 export function replayability(event: ProjectionEventV1): { replayable: boolean; reason?: string } {
 	if (event.projectionStatus !== "materialized") return { replayable: false, reason: `projection-${event.projectionStatus}` };
+	const forced = event.taskPromptDeferredOrdinals ?? [];
+	if (forced.length && (event.purpose !== "task-message" || new Set(forced).size !== forced.length || forced.some(ordinal => !Number.isSafeInteger(ordinal) || ordinal < 0 || ordinal >= event.materials.length || event.materials[ordinal].mediaType !== "text"))) return { replayable: false, reason: "invalid-prompt-deferrals" };
 	let aggregate = 0;
 	for (const [index, material] of event.materials.entries()) {
 		if (material.ordinal !== index) return { replayable: false, reason: "material-order" };
@@ -160,7 +164,9 @@ export function replayability(event: ProjectionEventV1): { replayable: boolean; 
 		if (!Number.isSafeInteger(material.utf8Bytes) || material.utf8Bytes! < 0) return { replayable: false, reason: "bytes-unavailable" };
 		if (material.mediaType === "binary") continue;
 		if (!Number.isSafeInteger(material.utf16CodeUnits) || material.utf16CodeUnits! < 0) return { replayable: false, reason: "utf16-unavailable" };
-		const expected = projectInline(event.policy, material.utf16CodeUnits!, aggregate);
+		const projected = projectInline(event.policy, material.utf16CodeUnits!, aggregate);
+		if (forced.includes(index) && !projected.inline) return { replayable: false, reason: "redundant-prompt-deferral" };
+		const expected = forced.includes(index) ? { inline: false, nextAggregateChars: aggregate, reason: "overflow-mode" } : projected;
 		if (material.aggregateBefore !== aggregate || material.aggregateAfter !== expected.nextAggregateChars || material.decision !== (expected.inline ? "inline" : "deferred") || material.reason !== expected.reason) return { replayable: false, reason: "projection-mismatch" };
 		aggregate = expected.nextAggregateChars;
 	}
