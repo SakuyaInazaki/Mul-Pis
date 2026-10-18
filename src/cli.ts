@@ -39,6 +39,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { createFileKnowledgeStore } from "./knowledge/store.ts";
 import { withWorkspaceMutationOwnership } from "./console/ownership.ts";
+import { loadStageSpec, stageSpecNotice, type M08StageSpecV1, type M09StageSpecV1 } from "./stage-spec.ts";
 import { createLocalOperatorBackend, type LocalOperatorBackendOptions } from "./m07/local-operator-backend.ts";
 import type { CandidateVerifier } from "./m07/candidate-evaluation.ts";
 import type { CandidateExecutionBackend } from "./m07/candidate-runner.ts";
@@ -125,7 +126,7 @@ async function makeRunner(kind: string): Promise<SessionRunner> {
 }
 
 function usage(): string {
-	return `用法：node src/cli.ts <init|m01|m02|m03|m04|m05|m06|m08|m09|status|knowledge|improve|goal|mission> [选项]\n  --workspace <dir>   工作区（默认当前目录）\n  --runner pi|fake    会话运行器（默认 pi）\n  mission start [--original <json>]：默认固定工作区 problem.md 原文作为开放目标；JSON 可给出明确义务和有限收口条件\n  mission run|resume|status --mission <id>：执行、继续或只查看一项本地任务；无需 GitHub 参数\n  mission reconcile --mission <id> --review <json>：核对未来版本化双向派发血缘与旧终态，写入仅供新工作使用的 checkpoint\n  mission reconcile-legacy --mission <id> --review <json> [--apply]：默认只读 dry-run；仅在完整旧源代码、串行归属与效果审查通过后，显式 --apply 才写入独立的 legacy 审查 checkpoint\n  goal status --run <id>：只显示控制摘要，不输出原始会话或 toolLog\n  goal delegate --run <id> --task <json> [--runner pi|fake]：执行有界任务；fork 须在 task.context 中给出 mode=fork、同一 parentRunId、parentTaskId、checkpointId，并保持原 objective/inputs/outputs/checks 等义务\n  goal select-branch --run <id> --parent-task <T-id> --rationale <text> [--selected-task <T-id>]：选择已评审接受的候选；省略 selected-task 即明确不选\n  goal reconcile --run <id> --operation <id> --evidence <json>；recover --run <id> --attempt <old-id> --descriptor <new-pi-json>；successor --run <id> --descriptor <new-pi-json>\n  improve run|status|rollback|export|bind（旧预算机制实验；run 必须给 --plan <json>）\n  improve research bootstrap --methods <json>；run --plan <json>；workflow run|calibrate|compare-sources --plan <json>；workflow prepare --plan <json> --output <new-workspace>；status|rollback|export|bind\n  research run 研究 CPU H/I；workflow run 显式研究 M07 evidence-handoff 单槽；workflow calibrate 仅执行同版本 A/A 校准\n  m08 的 materials/self-checks/reviewers 是显式 JSON 文件\n  m09 的 delivery-scope/reproduction 是显式 JSON 文件；instructions 是预授权的精确 shell 命令，read-only 时应为空；不会自动发布\n详见 src/cli.ts 顶部说明。`;
+	return `用法：node src/cli.ts <init|m01|m02|m03|m04|m05|m06|m08|m09|status|knowledge|improve|goal|mission> [选项]\n  --workspace <dir>   工作区（默认当前目录）\n  --runner pi|fake    会话运行器（默认 pi）\n  mission start [--original <json>]：默认固定工作区 problem.md 原文作为开放目标；JSON 可给出明确义务和有限收口条件\n  mission run|resume|status --mission <id>：执行、继续或只查看一项本地任务；无需 GitHub 参数\n  mission reconcile --mission <id> --review <json>：核对未来版本化双向派发血缘与旧终态，写入仅供新工作使用的 checkpoint\n  mission reconcile-legacy --mission <id> --review <json> [--apply]：默认只读 dry-run；仅在完整旧源代码、串行归属与效果审查通过后，显式 --apply 才写入独立的 legacy 审查 checkpoint\n  m08|m09 --spec <json>：一份声明式规格即可运行该阶段，含来源、许可与 oracle 强度；省略时沿用原有分项参数\n  goal status --run <id>：只显示控制摘要，不输出原始会话或 toolLog\n  goal delegate --run <id> --task <json> [--runner pi|fake]：执行有界任务；fork 须在 task.context 中给出 mode=fork、同一 parentRunId、parentTaskId、checkpointId，并保持原 objective/inputs/outputs/checks 等义务\n  goal select-branch --run <id> --parent-task <T-id> --rationale <text> [--selected-task <T-id>]：选择已评审接受的候选；省略 selected-task 即明确不选\n  goal reconcile --run <id> --operation <id> --evidence <json>；recover --run <id> --attempt <old-id> --descriptor <new-pi-json>；successor --run <id> --descriptor <new-pi-json>\n  improve run|status|rollback|export|bind（旧预算机制实验；run 必须给 --plan <json>）\n  improve research bootstrap --methods <json>；run --plan <json>；workflow run|calibrate|compare-sources --plan <json>；workflow prepare --plan <json> --output <new-workspace>；status|rollback|export|bind\n  research run 研究 CPU H/I；workflow run 显式研究 M07 evidence-handoff 单槽；workflow calibrate 仅执行同版本 A/A 校准\n  m08 的 materials/self-checks/reviewers 是显式 JSON 文件\n  m09 的 delivery-scope/reproduction 是显式 JSON 文件；instructions 是预授权的精确 shell 命令，read-only 时应为空；不会自动发布\n详见 src/cli.ts 顶部说明。`;
 }
 
 function publicGoal(goal: CurrentGoal): Record<string, unknown> {
@@ -477,13 +478,18 @@ async function runCliCommand(args: ParsedArgs, ws: Workspace, store: ReturnType<
 			return 0;
 		}
 		case "m08": {
-			const materials = await jsonFile<M08Options["materials"]>(args, "materials");
-			const selfChecks = await jsonFile<M08Options["selfChecks"]>(args, "self-checks");
-			const reviewers = await jsonFile<M08Options["reviewers"]>(args, "reviewers");
+			const specFile = flag(args, "spec");
+			const spec = specFile ? await loadStageSpec(specFile, "M08") as M08StageSpecV1 : undefined;
+			if (spec) console.log(stageSpecNotice(spec));
+			const materials = spec?.materials ?? await jsonFile<M08Options["materials"]>(args, "materials");
+			const selfChecks = spec?.selfChecks ?? await jsonFile<M08Options["selfChecks"]>(args, "self-checks");
+			const reviewers = spec?.reviewers ?? await jsonFile<M08Options["reviewers"]>(args, "reviewers");
 			const r = await runM08(ctx, {
 				materials, selfChecks, reviewers,
-				unprovidedScopes: flag(args, "unprovided-scopes") ? await jsonFile<string[]>(args, "unprovided-scopes") : undefined,
-				previousRunId: flag(args, "previous"), changeSummary: flag(args, "change-summary"), affectedScope: flag(args, "affected-scope"),
+				unprovidedScopes: spec?.unprovidedScopes ?? (flag(args, "unprovided-scopes") ? await jsonFile<string[]>(args, "unprovided-scopes") : undefined),
+				previousRunId: spec?.previousRunId ?? flag(args, "previous"),
+				changeSummary: spec?.changeSummary ?? flag(args, "change-summary"),
+				affectedScope: spec?.affectedScope ?? flag(args, "affected-scope"),
 			});
 			console.log(`M08 已结束：运行 ${r.record.runId}，状态 ${r.record.status}\n固定材料：${r.manifest.entries.length} 项\n审查反馈：${r.bundlePath ?? "未生成"}`);
 			printFailures(r.record.failures);
@@ -496,13 +502,17 @@ async function runCliCommand(args: ParsedArgs, ws: Workspace, store: ReturnType<
 			return 0;
 		}
 		case "m09": {
-			const m08RunId = flag(args, "m08"), m04RunId = flag(args, "m04"), recipient = flag(args, "recipient"), purpose = flag(args, "purpose");
-			if (!m08RunId || !m04RunId || !recipient || !purpose) throw new HarnessError("cli.m09", "m09 需要 --m08、--m04、--recipient 与 --purpose");
+			const specFile = flag(args, "spec");
+			const spec = specFile ? await loadStageSpec(specFile, "M09") as M09StageSpecV1 : undefined;
+			if (spec) console.log(stageSpecNotice(spec));
+			const m08RunId = spec?.m08RunId ?? flag(args, "m08"), m04RunId = spec?.m04RunId ?? flag(args, "m04");
+			const recipient = spec?.recipient ?? flag(args, "recipient"), purpose = spec?.purpose ?? flag(args, "purpose");
+			if (!m08RunId || !m04RunId || !recipient || !purpose) throw new HarnessError("cli.m09", "m09 需要 --spec，或 --m08、--m04、--recipient 与 --purpose");
 			const r = await runM09(ctx, {
 				m08RunId, m04RunId, recipient, purpose,
-				deliveryScope: await jsonFile<M09Options["deliveryScope"]>(args, "delivery-scope"),
-				reproduction: await jsonFile<M09Options["reproduction"]>(args, "reproduction"),
-				closureRequested: has(args, "closure-requested"),
+				deliveryScope: spec?.deliveryScope ?? await jsonFile<M09Options["deliveryScope"]>(args, "delivery-scope"),
+				reproduction: spec?.reproduction ?? await jsonFile<M09Options["reproduction"]>(args, "reproduction"),
+				closureRequested: spec?.closureRequested ?? has(args, "closure-requested"),
 			});
 			console.log(`M09 已结束：运行 ${r.record.runId}，状态 ${r.record.status}\n收口回执：${r.record.outputs.find((o) => o.label === "M09 收口回执")?.path ?? "未生成"}\n未执行发布、投稿、外发或下一目标启动；完整复算请求不等于已完整复现。`);
 			printFailures(r.record.failures);
