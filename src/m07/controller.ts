@@ -32,7 +32,9 @@ import { candidateBudgetLedger, DEFAULT_SEARCH_BUDGET } from "./candidate-policy
 import { distillEpisode, episodeRestartMessage, writeEpisodeRecord } from "./episode-record.ts";
 import { createCandidateEpisodeTool } from "./candidate-episode.ts";
 import { createCandidateExecutionTools, pendingCandidateExecutions, type CandidateExecutionBackend } from "./candidate-runner.ts";
-import { candidateArchive, createCandidateArchiveTools } from "./candidate-archive.ts";
+import { candidateArchive, candidateSubjectId, createCandidateArchiveTools } from "./candidate-archive.ts";
+import { loadPlatformProfile } from "../platform/profile.ts";
+import { DEFAULT_HISTORY_DEPTH, layoutPrompt, type PromptLayoutReceiptV1, type PromptSectionKind, type PromptSectionV1 } from "./prompt-layout.ts";
 import { createExecutionKnowledgeTools } from "./execution-knowledge.ts";
 import { INJECTION_PLANS } from "../knowledge/injection.ts";
 import { publicFailure } from "./public-failure.ts";
@@ -672,7 +674,41 @@ function uniqueName(index: number, source: string): string {
 	return `${String(index + 1).padStart(3, "0")}-${path.basename(source).replace(/[^a-zA-Z0-9._-]/g, "_")}`;
 }
 
-async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string, task: TaskSpecInput, copies: M07TaskRecord["inputCopies"], knowledgePack: string | undefined, policy: BudgetPolicy, limits: ProjectionSnapshotLimits, operationId?: string, tempDir?: string, reservedSuffixChars = 0): Promise<{ message: string; event: ProjectionEventV1 }> {
+/** The host's own platform facts, when a profile is configured. Chip,
+ * toolchain, capacities and timing protocol are static for a run, so they
+ * belong in the stable part of the prompt rather than in each round's text. */
+async function platformSection(): Promise<PromptSectionV1 | undefined> {
+	const file = process.env.PRE_RSI_PLATFORM_PROFILE;
+	if (!file) return undefined;
+	try {
+		const profile = await loadPlatformProfile(file);
+		const capacities = Object.entries(profile.capacities).slice(0, 12)
+			.map(([name, value]) => `- ${name}: ${value.value}${value.unit ? ` ${value.unit}` : ""}`).join("\n");
+		return { key: "platform", kind: "hardware",
+			text: section("目标硬件与工具链", [`档案 ${profile.id}；芯片 ${profile.chip}；工具链 ${profile.toolchain}`,
+				capacities ? `容量上限：\n${capacities}` : "",
+				profile.timing ? `计时协议 ${profile.timing.protocolVersion}：warmup ${profile.timing.warmup}、repeats ${profile.timing.repeats}、最小运行 ${profile.timing.minRuntimeMs}ms` : "",
+				"以上是宿主档案登记的事实，不是性能保证；任何加速比都必须标注基线类别与硬件型号。",
+			].filter(Boolean).join("\n")) };
+	} catch { return undefined; }
+}
+
+/** One bounded line per earlier candidate on this work object: what was tried,
+ * where, and what the host ruled. This is the prompt's history section, and it
+ * is the only history the next round carries. */
+function recentCandidateHistory(goal: CurrentGoal, subjectId?: string): PromptSectionV1[] {
+	const rows = candidateArchive(goal).filter(entry =>
+		!subjectId || candidateSubjectId(entry.subjectId, entry.observation) === subjectId);
+	return rows.map((entry) => ({ key: entry.ref, kind: "history" as const,
+		text: section(`历史候选 ${entry.ref}`, [
+			`改动类别 ${entry.changeKind ?? "未标注"}；策略 ${entry.strategy ?? "未标注"}；位置 ${entry.location ?? "未标注"}`,
+			`宿主判决 ${entry.policy?.guard ?? "未判决"}；准入状态 ${entry.policy?.status ?? "未知"}；分数 ${entry.policy?.score ?? "未知"}`,
+			entry.policy?.failureSignature ? `失败签名 ${entry.policy.failureSignature}` : "",
+			entry.hypothesis ? `假设 ${entry.hypothesis.slice(0, 200)}` : "",
+		].filter(Boolean).join("\n")) }));
+}
+
+async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string, task: TaskSpecInput, copies: M07TaskRecord["inputCopies"], knowledgePack: string | undefined, policy: BudgetPolicy, limits: ProjectionSnapshotLimits, operationId?: string, tempDir?: string, reservedSuffixChars = 0): Promise<{ message: string; event: ProjectionEventV1; layout: PromptLayoutReceiptV1 }> {
 	const event = await createProjectionObservation(ctx, goal, "task-message", policy, limits, taskId);
 	const planCopy = task.planInput ? copies.find((item) => item.source === task.planInput)?.copy : undefined;
 	const resourceCopies = (task.resourceInputs ?? []).map((item) => ({ ...item, copy: copies.find((copy) => copy.source === item.input)?.copy }));
@@ -739,6 +775,21 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string,
 	taskDetails.push(tempDir ? `产物路径规则：expectedOutputs 必须是当前任务工作目录内的精确相对路径；说明写在 objective 或 report.md。正式脚本、输入、测量、回执、负结果、复现数据和证据都必须保存在当前 work 目录。已落盘的原始查询、评测和实验回执须原样保留；派生汇总与后续查询另存并引用原文件。若已有原始记录被覆盖，如实报告缺失；摘要、计数或重新查询不能冒充恢复。临时缓存、下载和浏览器 profile 可写入独立目录 ${tempDir}；bash 的 TMPDIR 指向它。临时目录不属于正式证据，不会进入 reviewer 快照或 branch，也不能作为产物或检查引用。不要写到其他目录。` : "产物路径规则：expectedOutputs 必须是当前任务工作目录内的精确相对路径；说明写在 objective 或 report.md。所有实际写盘必须落在当前工作目录内，不要写到工作区根目录或绝对路径。已落盘的原始查询、评测和实验回执须原样保留；派生汇总与后续查询另存并引用原文件。若已有原始记录被覆盖，如实报告缺失；摘要、计数或重新查询不能冒充恢复。");
 	if (knowledgePack) boundary.push(section("本任务局部知识包", knowledgePack));
 	boundary.push(...taskDetails);
+	// Static instructions first, then hardware, knowledge, bounded history and
+	// finally this round's dynamic material. The order is fixed so two rounds
+	// that differ only in feedback share a byte-identical prefix.
+	const historySections = recentCandidateHistory(goal, task.subjectId);
+	const hardware = await platformSection();
+	const layout = layoutPrompt([
+		...(hardware ? [hardware] : []),
+		...boundary.map((text, index) => ({ key: `boundary-${index}`,
+			kind: (text.startsWith("【本任务局部知识包】") ? "knowledge" :
+				text.startsWith("【目标硬件与工具链】") ? "hardware" : "instruction") as PromptSectionKind, text })),
+		...historySections,
+	], { historyDepth: ctx.config.promptLayout?.historyDepth ?? DEFAULT_HISTORY_DEPTH });
+	const orderedBoundary = layout.text ? layout.text.split("\n\n") : [];
+	boundary.length = 0;
+	boundary.push(...orderedBoundary);
 	const inputBlockStart = boundary.findIndex((part) => part.startsWith("【输入预算与读取清单】\n"));
 	let inputBlockLength = 1 + actualInputs.length;
 	const systemChars = systemPromptFor(task.mode === "check" ? "reviewer" : "execution").length;
@@ -771,7 +822,7 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string,
 	if (forced.length) event.taskPromptDeferredOrdinals = forced;
 	event.projectionStatus = "materialized";
 	event.outputPath = path.relative(ctx.ws.runDir("M07", goal.runId), path.join(ctx.ws.runDir("M07", goal.runId), "tasks", taskId, "message.md"));
-	return { message, event };
+	return { message, event, layout: layout.receipt };
 	} finally { await writeProjectionEvent(ctx.ws, event); }
 }
 
@@ -1341,11 +1392,11 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			const tools: ToolGrant = spec.mode === "execute" ? { kind: "execution", root: workDir, tempDir: tempDir!, tools: ["read", "write", "edit", "bash"] } : { kind: "read-dir", root: workDir };
 			const operationId = spec.mode === "execute" && goal.executionState ? `O${String(goal.executionState.operations.length + 1).padStart(3, "0")}` : undefined;
 			const branchSuffix = branchParent?.branchSource && branchManifest ? `\n\n# Frozen competitive branch\nThis is an independently writable candidate for the exact same task and goal obligations. The inherited Pi history is a historical causal record, not permission to reuse its old absolute paths or repeat external actions. Historical work root: ${branchManifest.parentWorkRoot}. Your private work root: ${workDir}. The complete old-path to frozen-evidence and private-copy mapping is in branch-evidence-map.json in your work root. Read original evidence as needed; the manifest and summaries alone do not mean you have read it. Keep formal work in your private work root and disposable files in your own TMPDIR. Do not modify parent files, other branches, the knowledge store, or original checks. Your result is a candidate until the M07 controller reviews and explicitly selects it; M04 alone decides knowledge adoption.` : "";
-			let { message, event } = await taskMessage(ctx, goal, id, spec, copies, pack, policy, snapshotLimits, operationId, tempDir, branchSuffix.length);
+			let { message, event, layout } = await taskMessage(ctx, goal, id, spec, copies, pack, policy, snapshotLimits, operationId, tempDir, branchSuffix.length);
 			message += branchSuffix;
 			if (message.length + systemPromptFor(role).length > policy.maxPromptChars) throw new HarnessError("context.budget", "task evidence handoff exceeds the frozen prompt budget");
 			await writeFileAtomic(path.join(dir, "message.md"), message);
-			const task: M07TaskRecord = { ...spec, taskId: id, status: "running", createdAt: nowIso(), returnedAt: "", workDir, inputCopies: copies, expectedOutputPaths, readCoverage: [], toolLog: [], knowledgeSnapshot: goal.knowledgeSnapshot, m04BaselineRunId: goal.m04BaselineRunId, experienceSelection, ...(spec.planInput ? { planCopy: copies.find((item) => item.source === spec.planInput)?.copy } : {}) };
+			const task: M07TaskRecord = { ...spec, taskId: id, status: "running", createdAt: nowIso(), returnedAt: "", promptLayout: layout, workDir, inputCopies: copies, expectedOutputPaths, readCoverage: [], toolLog: [], knowledgeSnapshot: goal.knowledgeSnapshot, m04BaselineRunId: goal.m04BaselineRunId, experienceSelection, ...(spec.planInput ? { planCopy: copies.find((item) => item.source === spec.planInput)?.copy } : {}) };
 			let handle: SessionHandle | undefined;
 			// Read coverage of sessions closed at an episode boundary stays part of
 			// this task's record; a restart must not erase what was read.

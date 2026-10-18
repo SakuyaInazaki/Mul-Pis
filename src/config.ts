@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { HarnessError, ROLES, THINKING_LEVELS, type HarnessConfig, type ModelSpec, type Role, type ThinkingLevel } from "./types.ts";
 import { validateSearchBudget } from "./m07/candidate-policy.ts";
+import { validateHistoryDepth } from "./m07/prompt-layout.ts";
 
 export const CONFIG_FILE = "research.config.json";
 
@@ -98,8 +99,18 @@ export function validateConfig(input: unknown): HarnessConfig {
 		localMission = { ...policy as HarnessConfig["localMission"] };
 	}
 	const searchBudget = obj.searchBudget === undefined ? undefined : validateSearchBudget(obj.searchBudget);
+	let promptLayout: HarnessConfig["promptLayout"];
+	if (obj.promptLayout !== undefined) {
+		const value = obj.promptLayout;
+		if (!value || typeof value !== "object" || Array.isArray(value) ||
+			Object.keys(value).some((key) => key !== "historyDepth"))
+			throw new HarnessError("config.prompt-layout", "promptLayout 只接受 historyDepth");
+		try { promptLayout = { historyDepth: validateHistoryDepth((value as { historyDepth?: unknown }).historyDepth) }; }
+		catch (error) { throw new HarnessError("config.prompt-layout", (error as Error).message); }
+	}
 	return { roles, ...(m03Reviewers ? { m03Reviewers } : {}),
-		...(localMission ? { localMission } : {}), ...(searchBudget ? { searchBudget } : {}), concurrency, tools };
+		...(localMission ? { localMission } : {}), ...(searchBudget ? { searchBudget } : {}),
+		...(promptLayout ? { promptLayout } : {}), concurrency, tools };
 }
 
 export async function loadConfig(path: string): Promise<HarnessConfig> {

@@ -7,6 +7,7 @@ import type { RunDescriptorV1 } from "../runtime/run-descriptor.ts";
 import type { KnowledgeRetrievalContext } from "../knowledge/retrieval.ts";
 import type { CandidateComparisonV1, CandidatePerformanceEvidenceV1 } from "./candidate-diagnostics.ts";
 import type { CandidatePolicyDecisionV1, CandidateSearchStateV1, CandidateStrategy, SearchBudgetLedgerV1, SearchBudgetPolicyV1 } from "./candidate-policy.ts";
+import type { PromptLayoutReceiptV1 } from "./prompt-layout.ts";
 import type { KnowledgeAccessEvent } from "./execution-knowledge.ts";
 
 export type M07TaskMode = "execute" | "check" | "reason";
@@ -394,6 +395,8 @@ export interface EvidenceFile {
 }
 
 export interface M07TaskRecord extends TaskSpecInput {
+	/** How this task's prompt was laid out and how deep its history went. */
+	promptLayout?: PromptLayoutReceiptV1;
 	taskId: string;
 	status: M07TaskStatus;
 	createdAt: string;

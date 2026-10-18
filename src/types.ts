@@ -42,6 +42,9 @@ export interface HarnessConfig {
 	/** Frozen per-task M07 search budget. Absent means the harness defaults; every
 	 * number must be re-measured on this project before it is trusted. */
 	searchBudget?: SearchBudgetPolicyV1;
+	/** Prompt assembly knobs. historyDepth is how many earlier candidates the
+	 * task prompt carries; its value is a local scan result, not a paper's. */
+	promptLayout?: { historyDepth: number };
 	/** Maximum number of independent stage tasks processed at the same time. Engineering default 1. */
 	concurrency: number;
 	/** External tool endpoints for M05. Absent entries disable the corresponding provider. */
