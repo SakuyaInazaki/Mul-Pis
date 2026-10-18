@@ -65,6 +65,12 @@ M07 投影事件在 `taskMessage` 和 `writeFeedback` 的真实决策点逐调�
 - 关系带含义（premise_of/supports/refutes/limits/questions/checks/handles/replaces/splits/applies_in/located_in），只在拥有方写入。
 - 提案 → 结构校验 → 在当前状态复查 → 先写限制 → 应用 → 影响分析只传播 `needs_recheck` → 发布快照 `G###` → 移动 `CURRENT`。任一步结构非法则整批拒绝，不留半发布状态。
 - 入库、关闭 Q、采用决定都不是科学认证；视图与索引只由记录派生。
+- 结构化优化知识卡（`fields.optimization`）与七类记录正交：记录说「项目相信什么、凭什么」，卡片说「这一招怎么改、在什么条件下成立、什么时候不能用」。五种 kind：`case`（带 diff、硬约束、profile 证据与宿主实测的具体案例）、`avoid`（被否方向、损失幅度、profile 理由与停止条件）、`rule`（按错误签名的一句硬规则）、`contract`（API 签名或带本地出处的数值约束）、`when`（瓶颈 → 允许方法集与屏蔽规则）。检索键（算子类别、结构族、瓶颈、backend/toolchain/dtype/layout、structure/appliedTransforms/symptoms）必填，backend 与 toolchain 不得省略；字段拼错按未知字段整批拒绝，不静默放行。
+- 写回门禁与结构校验并列在串行合入内执行，拒绝带回执：正例需宿主实测 ≥1.05× 且正确性已验证，负例需实测退化 ≥1.20× 或至少 3 次尝试且成功率 <30%，两者之间是噪声带不入库；少于 3 次重复的计时不作依据；标为 few-shot 范例的卡另要求 ≥2.0×。门禁另含独立于效果信号的反作弊过滤（回落厂商库、跳过计算、verifier 形如模型自述）、同方向去重（更强者要求 revise 替换而不是新建近重复）、按结构族的容量上限（默认 24，拒绝时给出最弱可淘汰条目），credit 计数由宿主按实际注入与采纳维护，提案不得自填。阈值是显式旋钮，来自文献默认值，不是本项目已标定的常数。
+- 注入按阶段相位装配（`src/knowledge/injection.ts`）：bootstrap / mutation / compile-fix / correctness-fix / performance-tuning / review / acquisition / applicability / judgment 各自规定先验层位、可见卡片种类、条数与字符上限，并产出注入回执（哪些条目进过哪个提示）；注入不改写知识库。
+- 冻结分层先验 `.agent/knowledge/prior/L0…L5/*.md`（编程模型 / 模式指南 / 硬件约束 / tiling 策略 / API 参考 / 已验证范例）是固定前提，每条声明 backend、toolchain 与本地出处；情境冲突的条目在装配时硬过滤丢弃，不降权保留。
+- when 知识走确定性决策表（`src/knowledge/decision-table.ts`）：瓶颈签名 + 已应用变换 + 饱和指标 + 负层排除 → 允许方法集，每项理由引用指标值或条目 ID；编译失败与数值错误阶段不给性能方向。
+- 生成后、编译前的零设备成本检查（`src/knowledge/static-checks.ts`）由 `contract` 卡驱动：已登记命名空间内的未知 API 本地驳回并给出最接近签名，数值预算按 at_most/at_least/multiple_of/equals 核对并返回 witness；未覆盖的命名空间记为 uncovered，不作判定。
 - 知识库首次明确访问时懒写稳定 `storeId`，不批量迁移旧工作区，旧 C001 等 ID 不变。跨库经验引用须由调用方明确注册外库并固定 `{storeId, recordId, version}`，同名 ID 不互认，也不自动写入或合并外库。
 - 显式经验选择只从现有记录生成有界视图。`fields.experience` 可声明目标、适用阶段与标签、必要的 pinned `requiredRefs`；选择时检查情境和 live availability，循环、缺失、跨库错版本、撤回或容量不足都拒绝完整装载。H/I 策略版本区分 `sourceExperienceRefs`（生成时实际装载的来源）、旧版本保守继承的 `requiredExperienceRefs` 与结构化科学前提 `requiredKnowledgeRefs`。新参考不自动成为必要前提，旧 required 不自动降级；候选正文和新计划省略引用都不能清除必要项。新的 I/H 请求、激活、回退与 V2 导入重查 live 状态，外库需服务显式注册。普通 `refs` 还可表达反例、冲突、替换与历史；声明依赖的结构完整性不证明科学前提已被穷举。
 - 停用决定和限制约束该 ID 的所有旧版本；必要依赖受影响时向后传递 `needs_recheck`，明确授权解除才能恢复新使用。旧记录保留可追溯只读；运行中已冻结的包不热替换，但新调用重新检查 live 限制。实验观察先作为事实与模型诊断分列保存，是否形成新的 K/C/E 等记录仍走 M04 提案与合入。

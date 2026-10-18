@@ -6,6 +6,8 @@ import { nowIso, readTextIfExists, writeFileAtomic } from "../workspace.ts";
 import { buildKnowledgePack } from "./pack.ts";
 import { regenerateKnowledgeViews } from "./views.ts";
 import { validateExperienceDefinition } from "./experience-schema.ts";
+import { validateOptimizationCard } from "./optimization-card.ts";
+import { collectExistingCards, evaluateCardAdmission, DEFAULT_ADMISSION_POLICY, type AdmissionPolicy } from "./admission.ts";
 import { isNecessaryPremise } from "./relations.ts";
 import type {
 	AvailabilityReport,
@@ -344,6 +346,13 @@ function validateExperienceFields(value: Record<string, unknown>, issues: Valida
 	for (const message of validateExperienceDefinition(value.experience).issues) issue(issues, message, opIndex);
 }
 
+/** Structured optimization cards are validated wherever `fields` is accepted;
+ * the admission gate below then decides whether the card may be published. */
+function validateCardFields(value: Record<string, unknown>, issues: ValidationIssue[], opIndex: number): void {
+	if (!Object.hasOwn(value, "optimization")) return;
+	for (const message of validateOptimizationCard(value.optimization).issues) issue(issues, message, opIndex);
+}
+
 function bumpVirtual(entry: VirtualEntry): void {
 	entry.latestVersion += 1;
 	entry.versions.add(entry.latestVersion);
@@ -379,7 +388,10 @@ function validateBatchStructure(batch: ProposalBatch, initial: ValidationState):
 			if (!isNonEmptyString(rawOp.title)) issue(issues, "create.title 必须是非空字符串", opIndex);
 			if (typeof rawOp.body !== "string") issue(issues, "create.body 必须是字符串", opIndex);
 			if (rawOp.fields !== undefined && !isObject(rawOp.fields)) issue(issues, "create.fields 必须是对象", opIndex);
-			else if (isObject(rawOp.fields)) validateExperienceFields(rawOp.fields, issues, opIndex);
+			else if (isObject(rawOp.fields)) {
+				validateExperienceFields(rawOp.fields, issues, opIndex);
+				validateCardFields(rawOp.fields, issues, opIndex);
+			}
 			if (rawOp.evidenceStatus !== undefined && typeof rawOp.evidenceStatus !== "string") issue(issues, "create.evidenceStatus 必须是字符串", opIndex);
 			if (rawOp.usageDecision !== undefined && !USAGE_DECISIONS.includes(rawOp.usageDecision as UsageDecision)) issue(issues, "create.usageDecision 无效", opIndex);
 			if (rawOp.reason !== undefined && typeof rawOp.reason !== "string") issue(issues, "create.reason 必须是字符串", opIndex);
@@ -402,7 +414,10 @@ function validateBatchStructure(batch: ProposalBatch, initial: ValidationState):
 			if (rawOp.title !== undefined && !isNonEmptyString(rawOp.title)) issue(issues, "revise.title 必须是非空字符串", opIndex);
 			if (rawOp.body !== undefined && typeof rawOp.body !== "string") issue(issues, "revise.body 必须是字符串", opIndex);
 			if (rawOp.fields !== undefined && !isObject(rawOp.fields)) issue(issues, "revise.fields 必须是对象", opIndex);
-			else if (isObject(rawOp.fields)) validateExperienceFields(rawOp.fields, issues, opIndex);
+			else if (isObject(rawOp.fields)) {
+				validateExperienceFields(rawOp.fields, issues, opIndex);
+				validateCardFields(rawOp.fields, issues, opIndex);
+			}
 			if (rawOp.evidenceStatus !== undefined && typeof rawOp.evidenceStatus !== "string") issue(issues, "revise.evidenceStatus 必须是字符串", opIndex);
 			validateRefs(rawOp.refs, state, issues, opIndex);
 			validateScope(rawOp.scope, state, issues, opIndex);
@@ -489,10 +504,33 @@ export class FileKnowledgeStore implements KnowledgeStore {
 	private heldLock?: MergeLockOwnerV1;
 	private heldLockFile?: { dev: number; ino: number };
 	private readonly recovery: KnowledgeStoreRecoveryOptions;
+	private readonly admissionPolicy: AdmissionPolicy;
 
-	constructor(dir: string, recovery: KnowledgeStoreRecoveryOptions = {}) {
+	constructor(dir: string, recovery: KnowledgeStoreRecoveryOptions = {}, admissionPolicy: AdmissionPolicy = DEFAULT_ADMISSION_POLICY) {
 		this.dir = path.resolve(dir);
 		this.recovery = recovery;
+		this.admissionPolicy = admissionPolicy;
+	}
+
+	/** Deterministic write-back gate for structured optimization cards. It runs
+	 * on the current state, next to the structural check, so no caller can merge
+	 * an unanchored, duplicate or over-capacity card by taking another path. */
+	private async applyAdmissionGate(proposal: ProposalBatch, issues: ValidationIssue[]): Promise<void> {
+		const carrying = proposal.ops.map((op, opIndex) => ({ op, opIndex })).filter(({ op }) =>
+			(op.op === "create" || op.op === "revise") && isObject(op.fields) && Object.hasOwn(op.fields, "optimization"));
+		if (!carrying.length) return;
+		const activeTargets = new Set((await this.limits()).filter((limit) => !limit.liftedAt).map((limit) => limit.target));
+		const existing = collectExistingCards(await this.list(), activeTargets);
+		for (const { op, opIndex } of carrying) {
+			if (op.op !== "create" && op.op !== "revise") continue;
+			const card = validateOptimizationCard((op.fields as Record<string, unknown>).optimization).card;
+			if (!card) continue;
+			const decision = evaluateCardAdmission({ card, existing, policy: this.admissionPolicy,
+				...(op.op === "revise" ? { revisingId: op.id } : {}) });
+			if (decision.verdict === "admit") continue;
+			const detail = [...decision.reasons, ...(decision.evictionCandidates?.length ? [`可淘汰候选：${decision.evictionCandidates.join("、")}`] : [])].join("；");
+			issue(issues, decision.verdict === "replace" ? `知识写回门禁：应替换已有条目而不是新建。${detail}` : `知识写回门禁拒绝入库。${detail}`, opIndex);
+		}
 	}
 
 	async init(): Promise<void> {
@@ -674,6 +712,7 @@ export class FileKnowledgeStore implements KnowledgeStore {
 			const state = await this.validationState();
 			const issues = validateBatchStructure(proposal, state);
 			await this.validateBaseSnapshot(proposal, issues, true);
+			await this.applyAdmissionGate(proposal, issues);
 			const errors = issues.filter((item) => item.level === "error");
 			if (errors.length) {
 				await writeFileAtomic(resultFile, `${JSON.stringify({ proposalId, rejected: true, rejectedAt: nowIso(), issues }, null, 2)}\n`);
@@ -1274,6 +1313,6 @@ export class FileKnowledgeStore implements KnowledgeStore {
 	}
 }
 
-export function createFileKnowledgeStore(dir: string, recovery?: KnowledgeStoreRecoveryOptions): KnowledgeStore {
-	return new FileKnowledgeStore(dir, recovery);
+export function createFileKnowledgeStore(dir: string, recovery?: KnowledgeStoreRecoveryOptions, admissionPolicy?: AdmissionPolicy): KnowledgeStore {
+	return new FileKnowledgeStore(dir, recovery, admissionPolicy);
 }

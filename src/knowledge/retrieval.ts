@@ -70,11 +70,19 @@ const ignoredWords = new Set(["the", "and", "for", "with", "from", "this", "that
 // These short connective words alone do not identify a scientific mechanism.
 // Exact API/error tokens and more specific Chinese terms remain searchable.
 const ignoredHanWords = new Set(["是否", "条件"]);
-const scalarContextKeys = ["stage", "backend", "toolchain", "dtype", "layout"] as const;
-const featureContextKeys = ["structure", "appliedTransforms", "symptoms"] as const;
+export const RETRIEVAL_SCALAR_KEYS = ["stage", "backend", "toolchain", "dtype", "layout"] as const;
+export const RETRIEVAL_FEATURE_KEYS = ["structure", "appliedTransforms", "symptoms"] as const;
+const scalarContextKeys = RETRIEVAL_SCALAR_KEYS;
+const featureContextKeys = RETRIEVAL_FEATURE_KEYS;
 const contextKeys = new Set<string>([...scalarContextKeys, ...featureContextKeys]);
 const contextLabel = (value: unknown): value is string => typeof value === "string" &&
 	value.trim().length > 0 && !/[\u0000-\u001f\u007f]/u.test(value);
+
+/** Non-throwing shape check, shared with card validation so both sides accept
+ * exactly the same labels. */
+export function isKnowledgeRetrievalContext(value: unknown): value is KnowledgeRetrievalContext {
+	return isRetrievalContext(value);
+}
 
 function isRetrievalContext(value: unknown): value is KnowledgeRetrievalContext {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;

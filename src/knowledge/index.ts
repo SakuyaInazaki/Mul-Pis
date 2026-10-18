@@ -4,3 +4,8 @@ export { buildKnowledgePack, type PackState } from "./pack.ts";
 export { retrieveKnowledge, type KnowledgeRetrievalRequest, type KnowledgeRetrievalSelection } from "./retrieval.ts";
 export { regenerateKnowledgeViews, type ViewState } from "./views.ts";
 export { createExperienceProvider, isKnowledgeRef, type ExperienceProvider, type ExperienceQuery, type ExperienceSelection } from "./experience-index.ts";
+export { validateOptimizationCard, readOptimizationCard, optimizationDirectionSignature, renderOptimizationCard,
+	OPTIMIZATION_METHODS, BOTTLENECK_SIGNATURES, OPTIMIZATION_CARD_KINDS,
+	type OptimizationCard, type OptimizationCardKind, type OptimizationMethod, type BottleneckSignature } from "./optimization-card.ts";
+export { evaluateCardAdmission, collectExistingCards, DEFAULT_ADMISSION_POLICY,
+	type AdmissionDecision, type AdmissionPolicy } from "./admission.ts";
