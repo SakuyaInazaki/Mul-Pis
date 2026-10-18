@@ -27,6 +27,7 @@ import { TelemetryWriter } from "../dashboard/telemetry.ts";
 import type { AssistantTurn, CustomToolSpec, ForkRequest, ForkWorkspaceBindingV1, ReadReturnEvent, RunnerCapabilities, SessionCheckpoint, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, TranscriptMessage, TransportFailureDiagnostic, UsageEvent } from "./types.ts";
 import { summarizeUsage, usageEventsFromEntries } from "./usage.ts";
 import { compactionPolicyFromEnvironment, sessionCompactionPolicy, workflowCompactionExtension, workflowCompactionSettings } from "./compaction.ts";
+import { platformGateFromEnvironment, type PlatformGate } from "../platform/gate.ts";
 import { sampleRunnerResources, sessionClosed, sessionOpened } from "./resource.ts";
 import { DeepSeekCampaignBudget, type PromptLease } from "./deepseek-campaign.ts";
 import { getConfinedCampaignFileGrantDescriptor } from "./confined-campaign-files.ts";
@@ -672,6 +673,29 @@ function customToolsToPi(tools: CustomToolSpec[], log: ToolCallRecord[]): ToolDe
 	});
 }
 
+/** Replay the edit tool's replacements so the contract sees the file it would produce. */
+function appliedEdits(original: string, edits: unknown): string {
+	if (!Array.isArray(edits)) return original;
+	let text = original;
+	for (const item of edits) {
+		const edit = item as { oldText?: unknown; newText?: unknown };
+		if (typeof edit?.oldText !== "string" || typeof edit.newText !== "string") continue;
+		const index = text.indexOf(edit.oldText);
+		if (index < 0) continue; // The edit tool itself rejects a non-matching replacement.
+		text = text.slice(0, index) + edit.newText + text.slice(index + edit.oldText.length);
+	}
+	return text;
+}
+
+async function currentText(file: string): Promise<string> {
+	try {
+		return await readFile(file, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+		throw error;
+	}
+}
+
 async function createExecutionTools(
 	root: string,
 	requested: Array<"read" | "write" | "edit" | "bash">,
@@ -680,6 +704,7 @@ async function createExecutionTools(
 	sessionId: string,
 	isolatedToolEnvironment = false,
 	tempDir?: string,
+	platform?: { gate: PlatformGate; turn: () => number },
 ): Promise<MaterialTools & { cwd: string }> {
 	const cwd = await realpath(root);
 	if (!(await lstat(cwd)).isDirectory()) throw new HarnessError("runner.tools", `execution root is not a directory: ${root}`);
@@ -746,9 +771,30 @@ async function createExecutionTools(
 				const at = new Date().toISOString();
 				try {
 					if (sandbox && (name === "write" || name === "edit")) await sandbox.file(args.path as string, name);
+					// The platform contract is decided before the bytes land, so a
+					// candidate that cannot be legal never reaches the device queue.
+					let platformNote: string | undefined;
+					if (platform && (name === "write" || name === "edit") && typeof args.path === "string") {
+						const target = path.isAbsolute(args.path) ? path.resolve(args.path) : path.resolve(cwd, args.path);
+						const proposed = name === "write" ? String(args.content ?? "") : appliedEdits(await currentText(target), args.edits);
+						const verdict = await platform.gate.checkWrite(target, proposed, platform.turn());
+						if (verdict.rejected) throw new HarnessError("runner.platform-contract", verdict.rejected);
+						platformNote = verdict.warning;
+					}
 					const executionArgs = name === "bash" ? bashArgsForPi(args) : args;
-					const result = receipt ? await bashCall.run(receipt, () => base.execute(toolCallId, executionArgs, signal, onUpdate, { ...ctx, cwd })) :
-						await base.execute(toolCallId, executionArgs, signal, onUpdate, { ...ctx, cwd });
+					const runTool = () => receipt ? bashCall.run(receipt, () => base.execute(toolCallId, executionArgs, signal, onUpdate, { ...ctx, cwd })) :
+						base.execute(toolCallId, executionArgs, signal, onUpdate, { ...ctx, cwd });
+					let result = platform && name === "bash" && typeof args.command === "string"
+						? await platform.gate.withDevice(args.command, runTool) : await runTool();
+					if (platform) {
+						const observed = name === "bash" ? await platform.gate.observe(name, visibleText((result as { content?: unknown }).content)) : undefined;
+						const appended = [platformNote, observed].filter((item): item is string => Boolean(item));
+						if (appended.length) {
+							const content = (result as { content?: unknown }).content;
+							result = { ...result, content: [...(Array.isArray(content) ? content : []),
+								{ type: "text", text: appended.join("\n\n") }] } as typeof result;
+						}
+					}
 					const isError = (result as { isError?: boolean }).isError === true;
 					if (receipt) await finishManagedBashCall(receipt, isError ? "is-error" : "returned");
 					log.push({ name, args: safeArgs, ok: !isError, at,
@@ -1436,9 +1482,14 @@ export class PiSessionRunner implements SessionRunner {
 			const definitions = customToolsToPi(spec.tools.tools, toolLog);
 			materialTools = { tools: definitions, names: definitions.map((d) => d.name), readCoverage: new Set(), readReturns: [] };
 		} else if (spec.tools.kind === "execution") {
+			// The gate reports paths relative to the same resolved root the tools use.
+			const gate = await platformGateFromEnvironment({ root: await realpath(spec.tools.root),
+				receiptFile: path.join(spec.persistDir, `${sessionManager.getSessionId()}.platform.jsonl`),
+				sessionId: sessionManager.getSessionId() });
 			const execution = await createExecutionTools(spec.tools.root, spec.tools.tools, toolLog,
 				path.join(spec.persistDir, "host-execution-receipts", sessionManager.getSessionId()),
-				sessionManager.getSessionId(), true, spec.tools.tempDir);
+				sessionManager.getSessionId(), true, spec.tools.tempDir,
+				gate ? { gate, turn: () => promptIndex } : undefined);
 			materialTools = execution;
 			if (spec.tools.extraTools?.length) {
 				const extra = customToolsToPi(spec.tools.extraTools, toolLog);
