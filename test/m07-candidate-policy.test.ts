@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { candidatePhase, candidateSearchState, decideCandidate, requireAllowedAction,
+import { candidatePhase, candidateSearchState, candidateStrategyMenu, candidateStrategyStats,
+	decideCandidate, requireAllowedAction, requireUnbannedDirection,
 	type CandidateChangeKind } from "../src/m07/candidate-policy.ts";
 import type { CandidateArchiveEntry } from "../src/m07/candidate-archive.ts";
 import type { CandidateDiagnosticSummaryV1 } from "../src/m07/candidate-diagnostics.ts";
@@ -153,18 +154,18 @@ const judged = (id: string, guard: "keep" | "accept" | "revert" | "reject", opti
 
 test("stall counting ignores pre-check rejects and restarts at every keep", () => {
 	const state = candidateSearchState([judged("C001", "keep"), judged("C002", "accept"),
-		judged("C003", "reject"), judged("C004", "accept")], "a");
+		judged("C003", "reject"), judged("C004", "accept")], { subjectId: "a" });
 	assert.equal(state.stagnation, 2, "two counted steps since the last keep; the reject is not a step");
 	assert.equal(state.signals.includes("stagnation"), false);
 	assert.equal(state.route, "continue");
 	assert.equal(state.forcedDirectionChange, false);
-	const reset = candidateSearchState([judged("C001", "accept"), judged("C002", "keep")], "a");
+	const reset = candidateSearchState([judged("C001", "accept"), judged("C002", "keep")], { subjectId: "a" });
 	assert.equal(reset.stagnation, 0);
 });
 
 test("three counted steps without a keep force a direction change and ban the stalled ones", () => {
 	const state = candidateSearchState([judged("C001", "keep"), judged("C002", "accept"),
-		judged("C003", "accept"), judged("C004", "accept")], "a");
+		judged("C003", "accept"), judged("C004", "accept")], { subjectId: "a" });
 	assert.deepEqual(state.signals, ["stagnation"]);
 	assert.equal(state.forcedDirectionChange, true);
 	assert.equal(state.route, "restructure");
@@ -177,16 +178,16 @@ test("the same failure signature three times in a row is no progress, and oscill
 	const repeated = candidateSearchState([judged("C001", "keep"),
 		judged("C002", "revert", { failureSignature: "numerical-failure|numerical:cases[0]" }),
 		judged("C003", "revert", { failureSignature: "numerical-failure|numerical:cases[0]" }),
-		judged("C004", "revert", { failureSignature: "numerical-failure|numerical:cases[0]" })], "a");
+		judged("C004", "revert", { failureSignature: "numerical-failure|numerical:cases[0]" })], { subjectId: "a" });
 	assert.ok(repeated.signals.includes("no_progress"));
 	const oscillating = candidateSearchState([judged("C001", "revert", { failureSignature: "compile-failure|none" }),
 		judged("C002", "revert", { failureSignature: "numerical-failure|a" }),
 		judged("C003", "revert", { failureSignature: "runtime-failure|b" }),
 		judged("C004", "revert", { failureSignature: "compile-failure|none" }),
-		judged("C005", "revert", { failureSignature: "numerical-failure|a" })], "a");
+		judged("C005", "revert", { failureSignature: "numerical-failure|a" })], { subjectId: "a" });
 	assert.ok(oscillating.signals.includes("category_oscillation"));
 	const duplicate = candidateSearchState([judged("C001", "keep"),
-		judged("C002", "accept", { sourceRepetition: "duplicate_code" })], "a");
+		judged("C002", "accept", { sourceRepetition: "duplicate_code" })], { subjectId: "a" });
 	assert.deepEqual(duplicate.signals, ["duplicate_code"]);
 	assert.equal(duplicate.forcedDirectionChange, true);
 });
@@ -194,10 +195,57 @@ test("the same failure signature three times in a row is no progress, and oscill
 test("repair depth escalates to a structural change and long stagnation returns to planning", () => {
 	const repairing = (count: number) => candidateSearchState([judged("C001", "keep"),
 		...Array.from({ length: count }, (_, index) => judged(`C10${index}`, "revert",
-			{ lane: "repair", changeKind: "repair", failureSignature: `stage|${index}` }))], "a");
+			{ lane: "repair", changeKind: "repair", failureSignature: `stage|${index}` }))], { subjectId: "a" });
 	assert.equal(repairing(2).route, "repair-in-place", "a bounded repair loop stays in place");
 	assert.equal(repairing(3).route, "restructure", "three repair steps on one defect is the debug limit");
 	const exhausted = candidateSearchState([judged("C001", "keep"),
-		...Array.from({ length: 8 }, (_, index) => judged(`C20${index}`, "accept"))], "a");
+		...Array.from({ length: 8 }, (_, index) => judged(`C20${index}`, "accept"))], { subjectId: "a" });
 	assert.equal(exhausted.route, "replan", "debug plus rewrite limits exhausted: the plan itself must change");
+});
+
+test("per-strategy outcomes stay visible so a low-success strategy is not silently dropped", () => {
+	const row = (id: string, strategy: string, guard: "keep" | "accept" | "revert", score: number) => {
+		const item = judged(id, guard);
+		item.strategy = strategy as CandidateArchiveEntry["strategy"];
+		item.policy!.score = score;
+		return item;
+	};
+	const stats = candidateStrategyStats([row("C001", "tiling", "revert", 0.2),
+		row("C002", "tiling", "revert", 0.2), row("C003", "tiling", "keep", 0.9),
+		row("C004", "fusion", "accept", 0.5)], "a");
+	assert.deepEqual(stats.map(item => [item.strategy, item.attempts, item.keeps, item.reverts, item.bestScore]),
+		[["tiling", 3, 1, 2, 0.9], ["fusion", 1, 0, 0, 0.5]]);
+});
+
+test("the strategy menu is replayable, phase aware and never leaves fewer than two structural options", () => {
+	const first = candidateStrategyMenu({ phase: "tuning", route: "continue", seed: "goal|T001|3" });
+	const again = candidateStrategyMenu({ phase: "tuning", route: "continue", seed: "goal|T001|3" });
+	assert.deepEqual(first, again, "the same seed replays the same menu");
+	const later = candidateStrategyMenu({ phase: "tuning", route: "continue", seed: "goal|T001|4" });
+	assert.notDeepEqual(first.offered, later.offered, "a later step withholds a different subset");
+	for (const seed of ["a", "b", "c", "d", "e", "f"]) {
+		const menu = candidateStrategyMenu({ phase: "bootstrap", route: "continue", seed });
+		assert.ok(menu.offered.filter(item => !["repair", "numerical-parameters"].includes(item)).length >= 2);
+		assert.equal(menu.offered.includes("numerical-parameters"), false, "parameter search is not offered in bootstrap");
+		assert.ok(menu.withheld.length > 0, "a dropout actually withholds part of the menu");
+	}
+	assert.deepEqual(candidateStrategyMenu({ phase: "tuning", route: "repair-in-place", seed: "x" }).offered, ["repair"]);
+});
+
+test("a banned direction needs declared new evidence, and only while the search is stalled", () => {
+	const stalled = candidateSearchState([judged("C001", "keep"),
+		...["C002", "C003", "C004"].map(id => {
+			const row = judged(id, "accept");
+			row.strategy = "tiling";
+			row.location = "kernel.c:inner_loop";
+			return row;
+		})], { subjectId: "a" });
+	const action = { changeKind: "structure" as CandidateChangeKind, strategy: "tiling" as const,
+		location: "kernel.c:inner_loop" };
+	assert.throws(() => requireUnbannedDirection(stalled, action), (error: unknown) =>
+		error instanceof HarnessError && error.code === "m07.candidate-direction");
+	requireUnbannedDirection(stalled, action, "the profiler now shows the loop is memory bound, not occupancy bound");
+	requireUnbannedDirection(stalled, { ...action, location: "kernel.c:epilogue" });
+	const healthy = candidateSearchState([judged("C001", "keep")], { subjectId: "a" });
+	requireUnbannedDirection(healthy, action);
 });

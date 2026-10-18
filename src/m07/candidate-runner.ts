@@ -71,6 +71,8 @@ export interface CandidateExecutionToolOptions {
 type Request = {
 	sourcePaths: string[]; config: Record<string, unknown>; protocolId: string;
 	hypothesis: string; changeKind: "repair" | "structure" | "parameters"; intent: "solution" | "diagnostic";
+	/** Forwarded unchanged to candidate_evaluate, which owns their validation. */
+	strategy?: string; location?: string; newEvidence?: string;
 	parentCandidateId?: string; conditions?: string[]; changeSummary?: string;
 };
 type StageEntry = { attempts?: number; receiptSnapshots?: Array<{ originalPath: string; frozenPath: string; evaluationPath: string }>; stage: CandidateExecutionStage; status: "running" | CandidateExecutionStageResult["status"];
@@ -110,7 +112,10 @@ function requestFrom(args: Record<string, unknown>): Request {
 		hypothesis: args.hypothesis, changeKind: args.changeKind as Request["changeKind"], intent: args.intent as Request["intent"],
 		...(args.parentCandidateId !== undefined ? { parentCandidateId: args.parentCandidateId as string } : {}),
 		...(args.conditions !== undefined ? { conditions: args.conditions as string[] } : {}),
-		...(args.changeSummary !== undefined ? { changeSummary: args.changeSummary as string } : {}) };
+		...(args.changeSummary !== undefined ? { changeSummary: args.changeSummary as string } : {}),
+		...(args.strategy !== undefined ? { strategy: args.strategy as string } : {}),
+		...(args.location !== undefined ? { location: args.location as string } : {}),
+		...(args.newEvidence !== undefined ? { newEvidence: args.newEvidence as string } : {}) };
 }
 async function regular(root: string, relative: string): Promise<string> {
 	if (!isSafeRelativeOutputPath(relative) || relative === ".") return fail("invalid evidence path");
@@ -428,7 +433,7 @@ export function createCandidateExecutionTools(options: CandidateExecutionToolOpt
 		let manifest = await readJson<SweepJournal>(file);
 		if (!manifest) {
 			if (args.resume === true || options.queryOnly) fail("unknown sweep runId");
-			const request = requestFrom({ ...args, changeKind: "parameters" });
+			const request = requestFrom({ ...args, changeKind: "parameters", strategy: "numerical-parameters" });
 			validateProtocol(request.protocolId);
 			await options.backend.validateRequest?.({ protocolId: request.protocolId, sourcePaths: [...request.sourcePaths], config: structuredClone(request.config), subjectId: options.subjectId });
 			const raw = objectJson(args.domainsJson, "domainsJson"), domains: Record<string, number[]> = {};
@@ -503,6 +508,9 @@ export function createCandidateExecutionTools(options: CandidateExecutionToolOpt
 		parentCandidateId: { type: "string", optional: true, description: "Optional exact local Cxxx or archived Txxx/Cxxx parent" },
 		conditions: { type: "string[]", optional: true, description: "Declared applicability, not a host-proven conclusion" },
 		changeSummary: { type: "string", optional: true, description: "Declared source change" },
+		strategy: { type: "string", optional: true, description: "New run: the one enumerated optimization strategy candidate_evaluate requires" },
+		location: { type: "string", optional: true, description: "New run: the one exact edit site candidate_evaluate requires" },
+		newEvidence: { type: "string", optional: true, description: "Only when repeating a direction the host banned after a stall" },
 	};
 	return [{ name: "candidate_run", description: "Execute the host-bound backend against frozen source bytes with durable stage intent, then call existing candidate_evaluate. Unknown external operations require original-ID query; no automatic retry." + backendHelp, params: common, execute: serial(runOne) },
 		{ name: "candidate_sweep", description: "Materialize and evaluate every combination of explicitly declared finite numeric template parameters through the same host backend, without a model call for each number. An existing runId without resume reads paged parameter-to-candidate results without execution. No fixed search width or score pruning." + backendHelp, params: { ...common,

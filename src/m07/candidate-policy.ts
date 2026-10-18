@@ -289,7 +289,8 @@ export interface CandidateSearchStateV1 {
 	forcedDirectionChange: boolean;
 	route: CandidateRoute;
 	/** Declared directions that produced no measured gain; retry needs new evidence. */
-	bannedDirections: Array<{ changeKind: CandidateChangeKind; candidateRef: string; reason: string }>;
+	bannedDirections: Array<{ changeKind: CandidateChangeKind; strategy?: CandidateStrategy;
+		location?: string; candidateRef: string; reason: string }>;
 	/** Deterministic options, in order. The session still picks and justifies one. */
 	recommendedParents: Array<{ candidateRef: string; why: string }>;
 	message: string;
@@ -298,11 +299,18 @@ export interface CandidateSearchStateV1 {
 const COUNTED: ReadonlySet<CandidateGuard> = new Set(["keep", "accept", "revert"]);
 
 /** Recompute the search state from the recorded decisions of one work object.
- * Pure: the same archive always yields the same signals, route and bans. */
-export function candidateSearchState(history: readonly CandidateArchiveEntry[], subjectId?: string,
-	limits: CandidateRouteLimitsV1 = DEFAULT_ROUTE_LIMITS): CandidateSearchStateV1 {
+ * Pure: the same archive always yields the same signals, route and bans.
+ *
+ * Stall counters and bans are scoped to one task, because a task is one plan and
+ * the basis resets these counters whenever the plan changes. The phase, the
+ * incumbent and the parent options stay goal-wide for the same work object. */
+export function candidateSearchState(history: readonly CandidateArchiveEntry[],
+	options: { subjectId?: string; taskId?: string; limits?: CandidateRouteLimitsV1 } = {}): CandidateSearchStateV1 {
+	const subjectId = options.subjectId;
+	const limits = options.limits ?? DEFAULT_ROUTE_LIMITS;
 	const scoped = subjectHistory(history, subjectId);
-	const counted = scoped.filter(entry => entry.policy && COUNTED.has(entry.policy.guard));
+	const plan = options.taskId ? scoped.filter(entry => entry.taskId === options.taskId) : scoped;
+	const counted = plan.filter(entry => entry.policy && COUNTED.has(entry.policy.guard));
 	const lastKeep = counted.map(entry => entry.policy!.guard).lastIndexOf("keep");
 	const trailing = counted.slice(lastKeep + 1);
 	const stagnation = trailing.length;
@@ -328,7 +336,9 @@ export function candidateSearchState(history: readonly CandidateArchiveEntry[], 
 		lastGuard === "revert" ? "repair-in-place" :
 		forcedDirectionChange ? "restructure" : "continue";
 	const bannedDirections = trailing.slice(-5).map(entry => ({
-		changeKind: entry.changeKind ?? "structure" as CandidateChangeKind, candidateRef: entry.ref,
+		changeKind: entry.changeKind ?? "structure" as CandidateChangeKind,
+		...(entry.strategy ? { strategy: entry.strategy } : {}),
+		...(entry.location ? { location: entry.location } : {}), candidateRef: entry.ref,
 		reason: entry.policy!.guard === "revert"
 			? "regressed or failed against the verified incumbent"
 			: "measured no gain beyond the noise margin" }));
@@ -352,4 +362,101 @@ export function candidateSearchState(history: readonly CandidateArchiveEntry[], 
 		message: forcedDirectionChange
 			? "The host detected a stall. The next candidate must declare a different direction than the listed ones, or cite new evidence for repeating one; repeating a banned direction unchanged is not a search step."
 			: "No stall signal. Keep the declared direction while it still produces measured gain." };
+}
+
+export interface CandidateActionV1 {
+	changeKind: CandidateChangeKind;
+	strategy: CandidateStrategy;
+	/** Exact declared edit site: one declared source path, optionally with a
+	 * symbol or line range inside it. One candidate changes one place. */
+	location: string;
+}
+
+export interface CandidateStrategyStatV1 {
+	strategy: CandidateStrategy;
+	attempts: number;
+	keeps: number;
+	accepts: number;
+	reverts: number;
+	rejects: number;
+	bestScore: number;
+}
+
+/** Per-strategy outcomes for this work object: a high-risk strategy with a low
+ * success rate can still produce the eventual best, so the counts stay visible
+ * instead of being collapsed into one preference. */
+export function candidateStrategyStats(history: readonly CandidateArchiveEntry[],
+	subjectId?: string): CandidateStrategyStatV1[] {
+	const stats = new Map<CandidateStrategy, CandidateStrategyStatV1>();
+	for (const entry of subjectHistory(history, subjectId)) {
+		if (!entry.strategy || !entry.policy) continue;
+		const stat = stats.get(entry.strategy) ?? { strategy: entry.strategy, attempts: 0,
+			keeps: 0, accepts: 0, reverts: 0, rejects: 0, bestScore: 0 };
+		stat.attempts++;
+		if (entry.policy.guard === "keep") stat.keeps++;
+		else if (entry.policy.guard === "accept") stat.accepts++;
+		else if (entry.policy.guard === "revert") stat.reverts++;
+		else stat.rejects++;
+		stat.bestScore = Math.max(stat.bestScore, entry.policy.score);
+		stats.set(entry.strategy, stat);
+	}
+	return [...stats.values()].sort((left, right) => right.bestScore - left.bestScore ||
+		left.strategy.localeCompare(right.strategy));
+}
+
+/** Deterministic 32-bit mix, so a menu can be replayed from the archive alone. */
+function mix(seed: string): number {
+	let hash = 0x811c9dc5;
+	for (let index = 0; index < seed.length; index++) {
+		hash ^= seed.charCodeAt(index);
+		hash = Math.imul(hash, 0x01000193) >>> 0;
+	}
+	return hash;
+}
+
+export interface CandidateStrategyMenuV1 {
+	offered: CandidateStrategy[];
+	withheld: CandidateStrategy[];
+	note: string;
+}
+
+/** The suggestion list for the next candidate: the strategies allowed by the
+ * current phase and route, with a deterministic subset withheld to keep the
+ * search from collapsing onto one direction. Withholding shapes the suggestion,
+ * it does not forbid a justified choice; bans and the phase gate do that. */
+export function candidateStrategyMenu(input: { phase: CandidatePhase; route: CandidateRoute;
+	seed: string; dropout?: number }): CandidateStrategyMenuV1 {
+	const allowed = input.route === "repair-in-place" ? (["repair"] as CandidateStrategy[]) :
+		CANDIDATE_STRATEGIES.filter(strategy => strategy !== "numerical-parameters" || input.phase === "tuning");
+	const structural = allowed.filter(strategy => STRUCTURAL_STRATEGIES.has(strategy));
+	const dropout = input.dropout ?? 0.7;
+	const offered: CandidateStrategy[] = [];
+	const withheld: CandidateStrategy[] = [];
+	let state = mix(input.seed);
+	for (const strategy of allowed) {
+		state = Math.imul(state ^ mix(strategy), 0x01000193) >>> 0;
+		const drop = structural.includes(strategy) && state / 0x100000000 < dropout;
+		(drop ? withheld : offered).push(strategy);
+	}
+	// Never leave the session without real structural room to move.
+	const minimum = Math.min(2, structural.length);
+	while (offered.filter(strategy => structural.includes(strategy)).length < minimum && withheld.length) {
+		const restored = withheld.shift()!;
+		offered.splice(allowed.indexOf(restored), 0, restored);
+	}
+	return { offered, withheld,
+		note: "A withheld strategy is a diversity nudge for this step, not a prohibition: choose it anyway when the evidence points there, and say why. Banned directions and the phase gate are the hard rules." };
+}
+
+/** Refuse a direction the host already measured as fruitless, unless the caller
+ * declares what new evidence changed since. */
+export function requireUnbannedDirection(state: CandidateSearchStateV1, action: CandidateActionV1,
+	newEvidence?: string): void {
+	if (!state.forcedDirectionChange) return;
+	const banned = state.bannedDirections.find(item => item.changeKind === action.changeKind &&
+		item.strategy === action.strategy && item.location === action.location);
+	if (!banned) return;
+	if (newEvidence?.trim()) return;
+	throw new HarnessError("m07.candidate-direction",
+		`the search is stalled and ${action.changeKind}/${action.strategy} at ${action.location} already produced no measured gain (${banned.candidateRef}: ${banned.reason}); declare a different direction, or pass newEvidence stating what changed since`);
 }

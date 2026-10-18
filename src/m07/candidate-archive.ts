@@ -7,7 +7,7 @@ import { HarnessError } from "../types.ts";
 import { isSafeRelativeOutputPath } from "./expected-output.ts";
 import type { CandidateMetricV1, CandidateObservationV1, CurrentGoal, M07TaskRecord } from "./types.ts";
 import type { CandidateComparisonV1 } from "./candidate-diagnostics.ts";
-import type { CandidatePolicyDecisionV1 } from "./candidate-policy.ts";
+import type { CandidatePolicyDecisionV1, CandidateStrategy } from "./candidate-policy.ts";
 import { analyzeCandidateSearch, candidateSearchBrief, candidateSearchFocus, scopedRepeatedSourceObservations, scopedSearchLeads } from "./candidate-search.ts";
 
 export interface CandidateArchiveEntry {
@@ -18,6 +18,8 @@ export interface CandidateArchiveEntry {
 	taskStatus: M07TaskRecord["status"];
 	intent: "solution" | "diagnostic";
 	changeKind?: "repair" | "structure" | "parameters";
+	strategy?: CandidateStrategy;
+	location?: string;
 	hypothesis?: string;
 	conditions?: string[];
 	changeSummary?: string;
@@ -88,6 +90,7 @@ export function candidateArchive(goal: CurrentGoal, currentTaskId?: string): Can
 		for (const candidate of task.episode?.candidates ?? []) entries.push({
 			ref: `${task.taskId}/${candidate.id}`, taskId: task.taskId, subjectId: task.subjectId, candidateId: candidate.id,
 			taskStatus: task.status, intent: candidate.intent, changeKind: candidate.changeKind,
+			strategy: candidate.strategy, location: candidate.location,
 			hypothesis: candidate.hypothesis, conditions: candidate.conditions,
 			changeSummary: candidate.changeSummary, parentRef: candidate.parentRef ??
 				(candidate.parentCandidateId && /^C\d{3,}$/.test(candidate.parentCandidateId) ?

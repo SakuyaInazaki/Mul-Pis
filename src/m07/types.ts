@@ -6,7 +6,7 @@ import type { ExperienceRequirementV1, M07WorkflowStrategyV1 } from "../improvem
 import type { RunDescriptorV1 } from "../runtime/run-descriptor.ts";
 import type { KnowledgeRetrievalContext } from "../knowledge/retrieval.ts";
 import type { CandidateComparisonV1, CandidatePerformanceEvidenceV1 } from "./candidate-diagnostics.ts";
-import type { CandidatePolicyDecisionV1, CandidateSearchStateV1 } from "./candidate-policy.ts";
+import type { CandidatePolicyDecisionV1, CandidateSearchStateV1, CandidateStrategy } from "./candidate-policy.ts";
 import type { KnowledgeAccessEvent } from "./execution-knowledge.ts";
 
 export type M07TaskMode = "execute" | "check" | "reason";
@@ -154,6 +154,11 @@ export interface M07EpisodeCandidateV1 {
 	/** Mechanical same-basis comparison with the declared parent; never an acceptance decision. */
 	parentComparison?: CandidateComparisonV1;
 	changeKind: "repair" | "structure" | "parameters";
+	/** One enumerated optimization strategy and one exact edit site per candidate. */
+	strategy?: CandidateStrategy;
+	location?: string;
+	/** Model-declared reason for repeating a banned direction; not a host fact. */
+	newEvidence?: string;
 	intent: "solution" | "diagnostic";
 	observation: CandidateObservationV1;
 	observationPath: string;

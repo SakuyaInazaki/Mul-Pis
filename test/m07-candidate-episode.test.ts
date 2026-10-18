@@ -49,11 +49,19 @@ test("a numerical failure can be repaired inside one builder session without fre
 		if (spec.tools.kind !== "execution") return "report";
 		await writeFile(path.join(spec.tools.root, "kernel.py"), "broken");
 		await writeFile(path.join(spec.tools.root, "receipt.json"), '{"status":"failed"}');
-		const first = JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: "check numerical mismatch", changeKind: "repair", intent: "diagnostic" })).text) as { candidateId: string; observation: { correctness: string } };
+		const first = JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: "check numerical mismatch", changeKind: "repair", strategy: "repair", location: "kernel.py", intent: "diagnostic" })).text) as { candidateId: string; observation: { correctness: string } };
 		assert.equal(first.observation.correctness, "failed");
+		await assert.rejects(tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"],
+			hypothesis: "edit a site that does not exist", changeKind: "repair", strategy: "repair",
+			location: "kernel.py:missing_symbol", intent: "solution" }), /declared location/,
+			"a declared edit site that is absent from the source costs no host evaluation");
+		await assert.rejects(tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"],
+			hypothesis: "search parameters before a correct seed", changeKind: "parameters",
+			strategy: "numerical-parameters", location: "kernel.py", intent: "solution" }),
+			/verified-correct/, "parameter search needs a verified-correct structure first");
 		await writeFile(path.join(spec.tools.root, "kernel.py"), "repaired");
 		await writeFile(path.join(spec.tools.root, "receipt.json"), '{"status":"passed"}');
-		const second = JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: "repair mismatch", changeKind: "repair", intent: "diagnostic", parentCandidateId: first.candidateId })).text) as { candidateId: string; observation: { correctness: string } };
+		const second = JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: "repair mismatch", changeKind: "repair", strategy: "repair", location: "kernel.py", intent: "diagnostic", parentCandidateId: first.candidateId })).text) as { candidateId: string; observation: { correctness: string } };
 		assert.equal(second.observation.correctness, finalFinding === "incorrect" ? "failed" : "passed");
 		await copyFile(path.join(spec.tools.root, "kernel.py"), path.join(spec.tools.root, "selected.py"));
 		await copyFile(path.join(spec.tools.root, "receipt.json"), path.join(spec.tools.root, "selected-receipt.json"));
@@ -149,7 +157,7 @@ test("controller grants the host execution cascade to a running episode and revi
 			await writeFile(path.join(spec.tools.root, "kernel.py"), "candidate source");
 			const result = JSON.parse((await tools.candidate_run({ runId: "trial1", sourcePaths: ["kernel.py"],
 				protocolId: "fixture-protocol", configJson: "{}", hypothesis: "verify and measure",
-				changeKind: "structure", intent: "solution" })).text) as { status: string; evaluation?: string };
+				changeKind: "structure", strategy: "tiling", location: "kernel.py", intent: "solution" })).text) as { status: string; evaluation?: string };
 			assert.equal(result.status, "pending");
 			assert.equal(result.evaluation, undefined);
 			return "The original judge ID is pending; this model turn returned normally.";
@@ -192,7 +200,8 @@ test("a failed candidate freeze retains its bytes and later candidates use unuse
 		const workRoot = spec.tools.root;
 		const episodeRoot = path.join(path.dirname(workRoot), "episode");
 		const evaluate = (hypothesis: string) => tools.candidate_evaluate({ sourcePaths: ["kernel.py"],
-			receiptPaths: ["receipt.json"], hypothesis, changeKind: "structure", intent: "solution" });
+			receiptPaths: ["receipt.json"], hypothesis, changeKind: "structure", strategy: "tiling",
+			location: "kernel.py", intent: "solution" });
 		await writeFile(path.join(workRoot, "kernel.py"), "first frozen source");
 		await assert.rejects(evaluate("missing receipt"), /ENOENT/);
 		const failedSource = path.join(episodeRoot, "C001", "sources", "000-kernel.py");
@@ -236,11 +245,13 @@ test("a slower correct exploration parent can lead to a faster child without reg
 	const harness = await setup(async ({ spec, tools }) => {
 		if (spec.tools.kind !== "execution") return "report";
 		const workRoot = spec.tools.root;
+		let strategyIndex = 0;
+		const strategies = ["tiling", "fusion", "pipeline", "reordering", "vectorization", "memory-layout"];
 		const evaluate = async (label: string, latency: number, basis: string, parentCandidateId?: string, subject?: string,
 			intent: "solution" | "diagnostic" = "solution") => {
 			await writeFile(path.join(workRoot, "kernel.py"), label);
 			await writeFile(path.join(workRoot, "receipt.json"), JSON.stringify({ latency, basis, subject }));
-			return JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: label, changeKind: "structure", intent, ...(parentCandidateId ? { parentCandidateId } : {}) })).text) as { candidateId: string;
+			return JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: label, changeKind: "structure", strategy: strategies[strategyIndex++ % strategies.length], location: "kernel.py", intent, ...(parentCandidateId ? { parentCandidateId } : {}) })).text) as { candidateId: string;
 				incumbents: Array<{ candidateId: string; subjectId?: string; metric: { basisId: string } }>;
 				searchBrief: { focus: { basisId?: string }; readLeads: { args: { section: string; basisId?: string } } } };
 		};
@@ -303,7 +314,8 @@ test("repeated-source feedback uses frozen bytes and unique external results wit
 			await writeFile(path.join(workRoot, file), source);
 			await writeFile(path.join(workRoot, "receipt.json"), JSON.stringify({ id, score }));
 			return JSON.parse((await tools.candidate_evaluate({ sourcePaths: [file], receiptPaths: ["receipt.json"],
-				hypothesis: "inspect retained observations", changeKind: "parameters", intent: "solution" })).text);
+				hypothesis: "inspect retained observations", changeKind: "structure", strategy: "fusion",
+				location: file, intent: "solution" })).text);
 		};
 		await evaluate("first.py", "original", "result-one", 90);
 		const repeated = await evaluate("renamed.py", "original", "result-two", 92);
@@ -352,18 +364,22 @@ test("a later task can retrieve a near miss and derive from an exact frozen pare
 		if (taskNumber === 1) {
 			await writeFile(path.join(workRoot, "kernel.py"), "broken");
 			await writeFile(path.join(workRoot, "receipt.json"), JSON.stringify({ status: "failed" }));
-			await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: "near miss", changeKind: "repair", intent: "diagnostic" });
+			await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: "near miss", changeKind: "repair", strategy: "repair", location: "kernel.py", intent: "diagnostic" });
 			await writeFile(path.join(workRoot, "kernel.py"), "slow correct");
 			await writeFile(path.join(workRoot, "receipt.json"), JSON.stringify({ status: "passed", latency: 10, basis: "A" }));
-			await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: "safe baseline", changeKind: "structure", intent: "solution" });
+			await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], hypothesis: "safe baseline", changeKind: "structure", strategy: "memory-layout", location: "kernel.py", intent: "solution" });
 			return "Recorded a negative and a valid baseline.";
 		}
 		if (taskNumber === 3) {
+			let repeatIndex = 0;
 			const evaluate = async (source: string) => {
 				await writeFile(path.join(workRoot, "kernel.py"), source);
 				await writeFile(path.join(workRoot, "receipt.json"), JSON.stringify({ status: "passed", latency: 10, basis: "A" }));
+				repeatIndex++;
 				return JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"],
-					hypothesis: source, changeKind: "structure", intent: "solution" })).text) as {
+					hypothesis: source, changeKind: "structure",
+					strategy: (["pipeline", "fusion", "vectorization", "reordering"] as const)[repeatIndex % 4],
+					location: "kernel.py", intent: "solution" })).text) as {
 					candidateRef: string; identicalSourceRefs: string[]; sourceRepetition: string | null };
 			};
 			const firstForOtherSubject = await evaluate("slow correct");
@@ -396,7 +412,8 @@ test("a later task can retrieve a near miss and derive from an exact frozen pare
 		await writeFile(path.join(workRoot, "kernel.py"), "faster correct");
 		await writeFile(path.join(workRoot, "receipt.json"), JSON.stringify({ status: "passed", latency: 8, basis: "A" }));
 		const first = JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"],
-			hypothesis: "a structural edit improves A", changeKind: "structure", intent: "solution", parentCandidateId: "T001/C002",
+			hypothesis: "a structural edit improves A", changeKind: "structure", strategy: "reordering",
+			location: "kernel.py", intent: "solution", parentCandidateId: "T001/C002",
 			conditions: ["basis A", "same evaluation target"], changeSummary: "replace slow path" })).text) as {
 			candidateRef: string; parentRef: { taskId: string; candidateId: string };
 			parentComparison: { comparableMetrics: Array<{ parentValue: number; candidateValue: number; improved: boolean }> };
@@ -406,7 +423,8 @@ test("a later task can retrieve a near miss and derive from an exact frozen pare
 		assert.deepEqual(first.parentComparison.comparableMetrics.map(item => [item.parentValue, item.candidateValue, item.improved]), [[10, 8, true]]);
 		await writeFile(path.join(workRoot, "receipt.json"), JSON.stringify({ status: "passed", latency: 1, basis: "B" }));
 		const second = JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"],
-			hypothesis: "measure another basis", changeKind: "parameters", intent: "solution", parentCandidateId: "T002/C001" })).text) as { identicalSourceRefs: string[]; sourceRepetition: string };
+			hypothesis: "measure another basis", changeKind: "parameters", strategy: "numerical-parameters",
+			location: "kernel.py", intent: "solution", parentCandidateId: "T002/C001" })).text) as { identicalSourceRefs: string[]; sourceRepetition: string };
 		assert.ok(second.identicalSourceRefs.includes("T002/C001"), "equal bytes are recorded without rejecting a new receipt");
 		assert.equal(second.sourceRepetition, "duplicate_code");
 		const updated = JSON.parse((await tools.candidate_list({})).text) as { globalBest: Array<{ candidateRef: string; metric: { basisId: string } }> };
@@ -459,7 +477,8 @@ test("checkout preserves a frozen multi-file candidate's relative imports in an 
 			await writeFile(path.join(root, "include/common.mjs"), "export const value = 41;\n");
 			await writeFile(path.join(root, "receipts.json"), '{"status":"passed"}\n');
 			await tools.candidate_evaluate({ sourcePaths: ["src/kernel.mjs", "include/common.mjs"], receiptPaths: ["receipts.json"],
-				hypothesis: "same relative import tree", changeKind: "structure", intent: "solution" });
+				hypothesis: "same relative import tree", changeKind: "structure", strategy: "fusion",
+				location: "src/kernel.mjs", intent: "solution" });
 			return "Frozen two-file candidate.";
 		}
 		if (invocation === 2) {
@@ -487,7 +506,8 @@ test("checkout preserves a frozen multi-file candidate's relative imports in an 
 		if (invocation === 2) {
 			const result = JSON.parse((await tools.candidate_run({ runId: "second-generation", sourcePaths: checkout.sourcePaths,
 				protocolId: "fixture", configJson: "{}", hypothesis: "same linked code through host runner",
-				changeKind: "structure", intent: "solution", parentCandidateId: "T001/C001" })).text) as { status: string; evaluation?: string };
+				changeKind: "structure", strategy: "fusion", location: checkout.sourcePaths[0],
+				intent: "solution", parentCandidateId: "T001/C001" })).text) as { status: string; evaluation?: string };
 			assert.equal(result.status, "completed");
 			assert.ok(result.evaluation);
 		}
@@ -549,7 +569,8 @@ test("large case and diagnostic feedback is indexed while candidate_read retains
 		await writeFile(path.join(spec.tools.root, "kernel.py"), "candidate");
 		await writeFile(path.join(spec.tools.root, "receipt.json"), receipt);
 		const result = await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"],
-			hypothesis: "inspect a large negative result", changeKind: "repair", intent: "solution" });
+			hypothesis: "inspect a large negative result", changeKind: "repair", strategy: "repair",
+			location: "kernel.py", intent: "solution" });
 		assert.ok(result.text.length < 22000, "immediate feedback must not repeat the raw receipt or all case bodies");
 		const projected = JSON.parse(result.text);
 		assert.equal(projected.observation.correctness, "failed");
@@ -639,7 +660,8 @@ test("unqueryable candidate results hand control back after queued tools settle,
 			await writeFile(path.join(spec.tools.root, "kernel.txt"), toolName === "candidate_sweep" ? "tile={{tile}}\n" : "original candidate bytes");
 			if (builderTurns > 1) return "A separately authorized task can continue after host reconciliation.";
 			const request = { runId: "original-run", sourcePaths: ["kernel.txt"], protocolId: "original-protocol",
-				configJson: "{}", hypothesis: "measure original candidate", changeKind: "structure", intent: "solution",
+				configJson: "{}", hypothesis: "measure original candidate", changeKind: "structure",
+				strategy: "tiling", location: "kernel.txt", intent: "solution",
 				...(toolName === "candidate_sweep" ? { domainsJson: '{"tile":[1,2]}' } : {}) };
 			try {
 				// Both wrappers are entered before the internally serialized backend runs.
@@ -745,7 +767,8 @@ test("host reconciliation queries a failed task's original candidate ID and unlo
 		if (builderTurns === 1) {
 			await writeFile(path.join(spec.tools.root, "kernel.txt"), "original candidate bytes");
 			const result = JSON.parse((await tools.candidate_run({ runId: "original-run", sourcePaths: ["kernel.txt"], protocolId: "original-protocol",
-				configJson: "{}", hypothesis: "measure original candidate", changeKind: "structure", intent: "solution" })).text);
+				configJson: "{}", hypothesis: "measure original candidate", changeKind: "structure",
+				strategy: "tiling", location: "kernel.txt", intent: "solution" })).text);
 			assert.equal(result.status, "pending");
 			throw new Error("builder session lost after submission");
 		}

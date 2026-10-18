@@ -147,7 +147,8 @@ def verify_goal(criteria, observations):
 		if (spec.tools.kind === "execution") {
 			await writeFile(path.join(spec.tools.root, "candidate.py"), candidate);
 			const result = await tools.candidate_run({ runId: "local-goal-test", sourcePaths: ["candidate.py"],
-				protocolId: "numeric-tree-test-v1", hypothesis: "check the original target", changeKind: "repair", intent: "solution" });
+				protocolId: "numeric-tree-test-v1", hypothesis: "check the original target", changeKind: "repair",
+				strategy: "repair", location: "candidate.py", intent: "solution" });
 			assert.match(result.text, /completed/);
 		}
 		return "Frozen local candidate evidence returned";
