@@ -845,7 +845,7 @@ test("a spent search budget stops the task deterministically and records the bou
 		catch (error) { refusal = (error as Error).message; }
 		return "Budget boundary reached; reporting the verified best candidate.";
 	}, verifier, undefined, { version: 1, evaluationsPerTask: 2, repairEvaluationsPerTask: 2,
-		parameterEvaluationsPerTask: 1, maxBranchesPerCheckpoint: 2, reviewRoundsPerTask: 12,
+		parameterEvaluationsPerTask: 1, maxBranchesPerCheckpoint: 2, reviewRoundsPerTask: 12, episodeRestartEvaluations: 0,
 		routeLimits: { repairDepth: 3, stagnation: 8, directionChange: 3 } });
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
 	const task = await harness.controller.delegate(harness.goal.runId, { objective: "bounded search", subjectId: "operator",
@@ -922,4 +922,60 @@ test("the injection phase follows the host stage and the deterministic route", (
 	assert.equal(phase("correct-measured", "accept", "restructure"), "mutation",
 		"a forced rewrite gets guardrails, not examples");
 	assert.equal(phase("numerical-failure", "revert", "replan"), "mutation");
+});
+
+test("an episode boundary distils what was established and restarts on a clean context", async t => {
+	const verifier: CandidateVerifier = { id: "host:restart", version: "1", async verifyTask({ sources }) {
+		const text = await readFile(sources[0].frozenPath, "utf8");
+		return text.includes("broken")
+			? { sourceBinding: "verified", correctness: "failed", stage: "numerical", metrics: [], limitations: [] }
+			: { sourceBinding: "verified", correctness: "passed", stage: "performance",
+				metrics: [{ name: "latency", value: text.length, unit: "ms", basisId: "b", direction: "lower" }], limitations: [] };
+	} };
+	const restartMessages: string[] = [];
+	const harness = await setup(async ({ spec, tools, message }) => {
+		if (spec.tools.kind !== "execution") return "report";
+		if (message.startsWith("# Episode")) restartMessages.push(message);
+		const workRoot = spec.tools.root;
+		const evaluate = async (source: string, strategy: string) => {
+			await writeFile(path.join(workRoot, "kernel.py"), source);
+			await writeFile(path.join(workRoot, "receipt.json"), '{"status":"ok"}');
+			await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"],
+				hypothesis: source, changeKind: source.includes("broken") ? "repair" : "structure",
+				strategy, location: "kernel.py", intent: "solution" });
+		};
+		if (restartMessages.length) { await evaluate("third candidate", "fusion"); return "Continued after the restart."; }
+		await evaluate("broken candidate", "repair");
+		await evaluate("working candidate", "tiling");
+		return "Two candidates in the first session.";
+	}, verifier, undefined, { version: 1, evaluationsPerTask: 6, repairEvaluationsPerTask: 6,
+		parameterEvaluationsPerTask: 2, maxBranchesPerCheckpoint: 2, reviewRoundsPerTask: 12,
+		episodeRestartEvaluations: 2,
+		routeLimits: { repairDepth: 3, stagnation: 8, directionChange: 3 } });
+	t.after(() => rm(harness.root, { recursive: true, force: true }));
+	const task = await harness.controller.delegate(harness.goal.runId, { objective: "bounded episode",
+		subjectId: "operator", mode: "execute", inputs: [], expectedOutputs: ["kernel.py", "receipt.json"],
+		checks: ["candidates recorded"], executionLoop: { mode: "candidate-episode" },
+		subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" } });
+	assert.equal(task.status, "returned", task.executionFailure);
+	assert.equal(task.episode?.restarts?.length, 1, "one boundary was crossed");
+	assert.equal(task.episode?.candidates.length, 3);
+	assert.equal(restartMessages.length, 1);
+	const record = JSON.parse(await readFile(task.episode!.restarts![0].recordPath, "utf8")) as {
+		kind: string; episode: number; failureSignatures: string[]; observed: { candidates: number };
+		bestCandidateFamily?: { candidateRef: string } };
+	assert.equal(record.kind, "m07-episode-record");
+	assert.equal(record.episode, 1);
+	assert.equal(record.observed.candidates, 2);
+	assert.equal(record.failureSignatures.length, 1,
+		"the host failure signature of the failed candidate survives the restart, deduplicated");
+	assert.match(record.failureSignatures[0], /failure\|/);
+	assert.equal(record.bestCandidateFamily?.candidateRef, "T001/C002");
+	assert.match(restartMessages[0], /# Episode 1 restart/);
+	assert.match(restartMessages[0], /T001\/C002/);
+	assert.ok(!restartMessages[0].includes("broken candidate"),
+		"the restart carries the distilled record, not the previous transcript");
+	const sessions = harness.runner.created.filter(spec => spec.label.includes("episode-1"));
+	assert.equal(sessions.length, 1, "the restart opened its own session");
+	assert.notEqual(task.session?.id, task.episode?.restarts?.[0].previousSessionId);
 });

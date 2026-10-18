@@ -250,6 +250,9 @@ export interface M07CandidateEpisodeV1 {
 	search?: CandidateSearchStateV1;
 	/** Spend of this task's frozen search budget, in host evaluations. */
 	budget?: SearchBudgetLedgerV1;
+	/** Episode boundaries where the context was cleared and a distilled record
+	 * carried forward. The complete transcript stays in the session log. */
+	restarts?: Array<{ at: string; recordPath: string; afterCandidates: number; previousSessionId: string }>;
 }
 
 export interface M07BranchSourceV1 {

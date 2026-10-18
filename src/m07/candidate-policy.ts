@@ -583,6 +583,10 @@ export interface SearchBudgetPolicyV1 {
 	maxBranchesPerCheckpoint: number;
 	/** Hard bound on until-ready builder/reviewer rounds for one task. */
 	reviewRoundsPerTask: number;
+	/** Evaluations between candidate-episode boundary restarts; 0 disables them.
+	 * The basis measures the restart as better in ten of fifteen trials but does
+	 * not separate distillation from clearing the context, so this is an option. */
+	episodeRestartEvaluations: number;
 	routeLimits: CandidateRouteLimitsV1;
 }
 
@@ -592,6 +596,7 @@ export interface SearchBudgetPolicyV1 {
 export const DEFAULT_SEARCH_BUDGET: SearchBudgetPolicyV1 = Object.freeze({
 	version: 1, evaluationsPerTask: 24, repairEvaluationsPerTask: 10,
 	parameterEvaluationsPerTask: 5, maxBranchesPerCheckpoint: 3, reviewRoundsPerTask: 12,
+	episodeRestartEvaluations: 8,
 	routeLimits: DEFAULT_ROUTE_LIMITS,
 });
 
@@ -619,7 +624,8 @@ export function validateSearchBudget(input: unknown): SearchBudgetPolicyV1 {
 		throw new HarnessError("m07.search-budget", "searchBudget must be a JSON object");
 	const value = input as Record<string, unknown>;
 	const known = new Set(["version", "evaluationsPerTask", "repairEvaluationsPerTask",
-		"parameterEvaluationsPerTask", "maxBranchesPerCheckpoint", "reviewRoundsPerTask", "routeLimits"]);
+		"parameterEvaluationsPerTask", "maxBranchesPerCheckpoint", "reviewRoundsPerTask",
+		"episodeRestartEvaluations", "routeLimits"]);
 	const unknown = Object.keys(value).filter(key => !known.has(key));
 	if (unknown.length) throw new HarnessError("m07.search-budget", `searchBudget has unknown fields: ${unknown.join(", ")}`);
 	if (value.version !== undefined && value.version !== 1)
@@ -652,6 +658,7 @@ export function validateSearchBudget(input: unknown): SearchBudgetPolicyV1 {
 		parameterEvaluationsPerTask: integer("parameterEvaluationsPerTask", DEFAULT_SEARCH_BUDGET.parameterEvaluationsPerTask, 0, 100_000),
 		maxBranchesPerCheckpoint: integer("maxBranchesPerCheckpoint", DEFAULT_SEARCH_BUDGET.maxBranchesPerCheckpoint, 1, 1000),
 		reviewRoundsPerTask: integer("reviewRoundsPerTask", DEFAULT_SEARCH_BUDGET.reviewRoundsPerTask, 1, 10_000),
+		episodeRestartEvaluations: integer("episodeRestartEvaluations", DEFAULT_SEARCH_BUDGET.episodeRestartEvaluations, 0, 10_000),
 		routeLimits: limits };
 	if (policy.repairEvaluationsPerTask > policy.evaluationsPerTask ||
 		policy.parameterEvaluationsPerTask > policy.evaluationsPerTask)

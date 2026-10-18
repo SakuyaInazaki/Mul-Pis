@@ -23,7 +23,7 @@ export interface EvidenceBindingV1 {
 export interface ContextBoundaryRecordV1 {
 	version: 1;
 	mode: "fresh" | "continue" | "fork";
-	intent: "new-work" | "independent-judgment" | "causal-continuation" | "branch-exploration";
+	intent: "new-work" | "independent-judgment" | "causal-continuation" | "branch-exploration" | "episodic-restart";
 	reason: string;
 	actorRole: Role;
 	model: string;
@@ -37,7 +37,7 @@ export interface ContextBoundaryRecordV1 {
 }
 
 export type ContextBoundaryRequest =
-	| { mode: "fresh"; intent: "new-work" | "independent-judgment"; reason: string; evidence: EvidenceBindingV1[]; spec: SessionSpec }
+	| { mode: "fresh"; intent: "new-work" | "independent-judgment" | "episodic-restart"; reason: string; evidence: EvidenceBindingV1[]; spec: SessionSpec }
 	| { mode: "continue"; intent: "causal-continuation"; reason: string; evidence: EvidenceBindingV1[]; parent: SessionRef; expectedToolGrantKind: ToolGrant["kind"] }
 	| { mode: "fork"; intent: "branch-exploration"; reason: string; evidence: EvidenceBindingV1[]; checkpoint: SessionCheckpoint; spec: SessionSpec; workspaceBinding?: ForkWorkspaceBindingV1 };
 
@@ -54,8 +54,13 @@ function capabilityReceipt(grant: ToolGrant): NonNullable<ContextBoundaryRecordV
 
 function validate(request: ContextBoundaryRequest): void {
 	if (!request.reason.trim()) throw new HarnessError("context.boundary", "session boundary requires an explicit reason");
-	const allowedIntent = request.mode === "fresh" ? ["new-work", "independent-judgment"] : request.mode === "continue" ? ["causal-continuation"] : ["branch-exploration"];
+	const allowedIntent = request.mode === "fresh" ? ["new-work", "independent-judgment", "episodic-restart"] : request.mode === "continue" ? ["causal-continuation"] : ["branch-exploration"];
 	if (!allowedIntent.includes(request.intent)) throw new HarnessError("context.boundary", "context intent conflicts with the requested history boundary");
+	// A restart clears a live context on purpose: it is only admissible when the
+	// distilled record that replaces that context is itself frozen evidence.
+	if (request.intent === "episodic-restart" &&
+		!request.evidence.some((item) => item.status === "frozen-copy" && /episode record/i.test(item.label)))
+		throw new HarnessError("context.boundary", "an episodic restart requires the frozen episode record it carries forward");
 	if (!Array.isArray(request.evidence) || request.evidence.some((item) => item.version !== 1 || !item.label.trim() || !item.path.trim() || !["linked", "index", "frozen-copy"].includes(item.status) || (item.status === "frozen-copy" && !item.sourceVersion?.trim()))) {
 		throw new HarnessError("context.evidence", "session evidence bindings are invalid");
 	}

@@ -29,9 +29,10 @@ import { failedM04Feedback, resolveM04Baseline, type FormalBaseline } from "./fo
 import { writeFeedback } from "./feedback.ts";
 import { candidateObservation, requireCandidateVerifier, type CandidateVerifier, type FrozenCandidateFile } from "./candidate-evaluation.ts";
 import { candidateBudgetLedger, DEFAULT_SEARCH_BUDGET } from "./candidate-policy.ts";
+import { distillEpisode, episodeRestartMessage, writeEpisodeRecord } from "./episode-record.ts";
 import { createCandidateEpisodeTool } from "./candidate-episode.ts";
 import { createCandidateExecutionTools, pendingCandidateExecutions, type CandidateExecutionBackend } from "./candidate-runner.ts";
-import { createCandidateArchiveTools } from "./candidate-archive.ts";
+import { candidateArchive, createCandidateArchiveTools } from "./candidate-archive.ts";
 import { createExecutionKnowledgeTools } from "./execution-knowledge.ts";
 import { INJECTION_PLANS } from "../knowledge/injection.ts";
 import { publicFailure } from "./public-failure.ts";
@@ -1346,6 +1347,9 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			await writeFileAtomic(path.join(dir, "message.md"), message);
 			const task: M07TaskRecord = { ...spec, taskId: id, status: "running", createdAt: nowIso(), returnedAt: "", workDir, inputCopies: copies, expectedOutputPaths, readCoverage: [], toolLog: [], knowledgeSnapshot: goal.knowledgeSnapshot, m04BaselineRunId: goal.m04BaselineRunId, experienceSelection, ...(spec.planInput ? { planCopy: copies.find((item) => item.source === spec.planInput)?.copy } : {}) };
 			let handle: SessionHandle | undefined;
+			// Read coverage of sessions closed at an episode boundary stays part of
+			// this task's record; a restart must not erase what was read.
+			const carriedCoverage: M07TaskRecord["readCoverage"] = [];
 			let hostRecoveryReason: HarnessError | undefined;
 			let hostRecoveryAbort: Promise<void> | undefined;
 			let hostRecoveryAbortError: string | undefined;
@@ -1438,6 +1442,11 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 					promptIssued = true;
 					let report: string;
 					let builderMessage = message;
+					const searchBudget = goal.searchBudget ?? DEFAULT_SEARCH_BUDGET;
+					// Outer loop: episode boundaries. The builder keeps its live session
+					// until the configured number of evaluations has passed, then the
+					// host distils what that session established and starts it clean.
+					for (;;) {
 					for (;;) {
 						report = (await handle.prompt(builderMessage)).text;
 						if (hostRecoveryReason) throw hostRecoveryReason;
@@ -1448,6 +1457,41 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 						if (pending.some(item => !item.queryAvailable))
 							throw new HarnessError("m07.candidate-execution-unresolved", `候选副作用仍未知且不能按原 ID 查询；必须宿主对账，不能重交：${JSON.stringify(pending)}`);
 						builderMessage = `The preceding builder turn ended while these exact candidate evaluations remain pending or unknown: ${JSON.stringify(pending)}. Continue in THIS SAME live session. Call the indicated existing tool with its original runId and resume:true to query the original external ID; do not create a new run, resubmit, or treat submitted/confirmed as a terminal judge result. Keep the original goal and checks. A pending evaluation is not a goal stop; after terminal results are verified, report the actual evidence.`;
+					}
+					const episode = task.episode;
+					if (!episode || !searchBudget.episodeRestartEvaluations) break;
+					const evaluatedBefore = episode.restarts?.at(-1)?.afterCandidates ?? 0;
+					if (episode.candidates.length - evaluatedBefore < searchBudget.episodeRestartEvaluations) break;
+					const ledger = candidateBudgetLedger(candidateArchive(goal, id),
+						{ taskId: id, subjectId: task.subjectId, policy: searchBudget });
+					// A spent or stalled task hands control back instead of restarting.
+					if (ledger.stop || !ledger.remaining) break;
+					const episodeRecord = await distillEpisode({ runId, taskId: id,
+						episode: (episode.restarts?.length ?? 0) + 1, at: nowIso(),
+						...(task.subjectId ? { subjectId: task.subjectId } : {}),
+						history: candidateArchive(goal, id),
+						compactionLog: path.join(ctx.ws.sessionsDir, `${handle.ref.id}.compaction.jsonl`),
+						platformLog: path.join(ctx.ws.sessionsDir, `${handle.ref.id}.platform.jsonl`) });
+					const recordPath = await writeEpisodeRecord(ctx.ws.root, episodeRecord);
+					carriedCoverage.push(...handle.readCoverage());
+					task.toolLog.push(...handle.toolLog());
+					const previousSessionId = handle.ref.id;
+					handle.dispose();
+					(episode.restarts ??= []).push({ at: episodeRecord.at, recordPath,
+						afterCandidates: episode.candidates.length, previousSessionId });
+					await save(ctx, goal);
+					const restartRun = await ctx.ws.readRun("M07", runId);
+					const restartSpec = sessionSpec(ctx, `M07-${id}-episode-${episodeRecord.episode}`, role, systemPromptFor(role), tools);
+					if (goal.methodBinding) restartSpec.methodBinding = goal.methodBinding;
+					if (taskDeadline) restartSpec.runDeadline = taskDeadline;
+					handle = await openBoundedSession(ctx.runner, restartRun, { mode: "fresh", intent: "episodic-restart",
+						reason: `M07 ${id} episode ${episodeRecord.episode} boundary: the previous context was cleared and this distilled record carries its established facts forward`,
+						evidence: [{ version: 1, label: `M07 ${id} episode record E${episodeRecord.episode}`, path: recordPath,
+							status: "frozen-copy", sourceVersion: `${runId}/${id}` }], spec: restartSpec },
+						() => ctx.ws.writeRun(restartRun));
+					task.session = handle.ref;
+					await save(ctx, goal);
+					builderMessage = episodeRestartMessage(message, episodeRecord);
 					}
 					if (operation) operation.status = "response-received";
 					if (task.experienceSelection) task.experienceSelection.loadedAt = nowIso();
