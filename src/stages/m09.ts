@@ -19,7 +19,7 @@ import type { CustomToolSpec, ToolGrant } from "../runner/types.ts";
 import { loadPrompt } from "../prompts.ts";
 import { requireCompletedRun, sessionSpec, withRun, type StageContext } from "./context.ts";
 import { readFrozenArtifactManifest, type FrozenArtifactManifest } from "./artifacts.ts";
-import { assertDeliversHistoricalBest, collectDeliveryEvidence, renderDeliveryEvidence, type DeliveryEvidenceV1 } from "./delivery-evidence.ts";
+import { assertDeliversHistoricalBest, assertNoRecordedRegression, collectDeliveryEvidence, renderDeliveryEvidence, type DeliveryEvidenceV1 } from "./delivery-evidence.ts";
 
 export type ReproductionMode = "read-only" | "specified-checks" | "full-recomputation";
 
@@ -401,6 +401,7 @@ export async function runM09(ctx: StageContext, options: M09Options): Promise<M0
 		const deliveryEvidence = await collectDeliveryEvidence(ctx.ws, deliveryRoot);
 		await ctx.ws.writeOutput(record, "delivery-evidence.json", JSON.stringify(deliveryEvidence, null, 2), "交付候选对照与测量口径披露");
 		assertDeliversHistoricalBest(deliveryEvidence);
+		assertNoRecordedRegression(deliveryEvidence);
 
 		const m04Text = await Promise.all(m04.outputs.map(async (item) => `\n## ${item.label}\n${await readFile(item.path, "utf8")}`));
 		const p09 = await loadPrompt("P09");

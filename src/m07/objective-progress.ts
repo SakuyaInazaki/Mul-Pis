@@ -790,7 +790,10 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 		diagnostic?: { phase: TransportFailureDiagnostic["phase"]; httpStatus: number | null;
 			transportInterrupted?: true;
 			providerErrorReasonClass: TransportFailureDiagnostic["providerErrorReasonClass"] | null;
-			abortSource: TransportFailureDiagnostic["abortSource"]; errorCodes: string[] } }) => Promise<void>;
+			abortSource: TransportFailureDiagnostic["abortSource"]; errorCodes: string[];
+			/** Harness, strategy or nobody yet; the observation layer counts these. */
+			failureClass?: TransportFailureDiagnostic["failureClass"];
+			failureReason?: string } }) => Promise<void>;
 	signal?: AbortSignal;
 	/** Optional offline clock; production uses bounded exponential delay with no retry-count stop. */
 	waitBeforeTransportRetry?: (retryNumber: number) => Promise<void>;
@@ -1196,7 +1199,9 @@ export async function assessAndAdvanceOriginalObjective<T>(input: {
 						httpStatus: diagnostic.httpStatus,
 						...(diagnostic.transportInterrupted ? { transportInterrupted: true as const } : {}),
 						providerErrorReasonClass: diagnostic.providerErrorReasonClass ?? null,
-						abortSource: diagnostic.abortSource, errorCodes: [...diagnostic.errorCodes] } } : {}) });
+						abortSource: diagnostic.abortSource, errorCodes: [...diagnostic.errorCodes],
+						...(diagnostic.failureClass ? { failureClass: diagnostic.failureClass } : {}),
+						...(diagnostic.failureReason ? { failureReason: diagnostic.failureReason } : {}) } } : {}) });
 				const admission = input.signal?.aborted ? "cancelled" :
 					currentObjectiveAdmission(input.advanceAdmission());
 				if (admission !== "admitted") return { assessment: latestAssessment, stopReason: admission };

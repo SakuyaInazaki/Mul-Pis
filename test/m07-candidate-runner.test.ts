@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createCandidateExecutionTools, pendingCandidateExecutions, type CandidateExecutionBackend, type CandidateExecutionContext, type CandidateExecutionToolOptions } from "../src/m07/candidate-runner.ts";
+import { readSearchEvents, rebuildSearchState, searchStateSummary } from "../src/m07/search-state/index.ts";
 
 async function setup(t: { after(fn: () => Promise<void>): void }, backend: CandidateExecutionBackend, evaluate?: CandidateExecutionToolOptions["evaluate"]) {
 	const root = await mkdtemp(path.join(tmpdir(), "candidate-runner-"));
@@ -175,4 +176,71 @@ test("host request validation rejects before any run journal or side effect", as
 	await assert.rejects(readFile(path.join(h.root, "candidate-runs/run1/journal.json")), { code: "ENOENT" });
 	assert.equal(calls, 0);
 	assert.equal(JSON.parse((await h.tools().candidate_run.execute(request)).text).status, "completed");
+});
+
+test("a background run returns at once, keeps executing, and is collected by the same runId", async t => {
+	let release!: () => void;
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	const started: string[] = [];
+	const backend: CandidateExecutionBackend = { id: "slow-fixture", version: "1",
+		stages: [{ id: "measure", checks: ["compile", "correctness", "measurement"], mode: "local" }],
+		async executeStage(ctx) {
+			started.push(ctx.runId);
+			if (ctx.runId === "run1") await gate;
+			return { status: "passed", receiptPaths: [await receipt(ctx, { ok: ctx.runId })] };
+		} };
+	const h = await setup(t, backend);
+	let drain: (() => Promise<void>) | undefined;
+	h.options.backgroundRuns = { register: fn => { drain = fn; } };
+	h.options.searchEventLogFile = path.join(h.root, "search-events.jsonl");
+	const tools = h.tools();
+
+	const submitted = JSON.parse((await tools.candidate_run.execute({ ...request, background: true })).text);
+	assert.equal(submitted.state, "running");
+	assert.deepEqual(submitted.collect, { tool: "candidate_run", args: { runId: "run1", collect: true } });
+	// The model is free while the host keeps working: a second candidate is submitted
+	// before the first one has produced anything.
+	const second = JSON.parse((await tools.candidate_run.execute({ ...request, runId: "run2", background: true })).text);
+	assert.equal(second.outstanding, 2);
+	const listed = JSON.parse((await tools.candidate_run.execute({ collect: true })).text);
+	assert.deepEqual(listed.jobs.map((job: { runId: string; state: string }) => [job.runId, job.state]),
+		[["run1", "running"], ["run2", "running"]]);
+	const pendingCollect = JSON.parse((await tools.candidate_run.execute({ runId: "run1", collect: true })).text);
+	assert.equal(pendingCollect.state, "running");
+	assert.match(pendingCollect.message, /Still running/);
+	await assert.rejects(tools.candidate_run.execute({ ...request, background: true }), /still running; collect it before/);
+
+	release();
+	assert(drain);
+	await drain();
+	assert.deepEqual(started, ["run1", "run2"], "the host still executes candidates one at a time");
+	const collected = JSON.parse((await tools.candidate_run.execute({ runId: "run1", collect: true })).text);
+	assert.equal(collected.status, "completed");
+	assert.equal(JSON.parse((await tools.candidate_run.execute({ runId: "run2", collect: true })).text).status, "completed");
+
+	const { events, skipped } = await readSearchEvents(h.options.searchEventLogFile);
+	assert.equal(skipped, 0);
+	const state = rebuildSearchState("goal", events);
+	assert.deepEqual(state.candidates.map(item => [item.id, item.isBuggy]), [["run1", false], ["run2", false]]);
+	assert.deepEqual(state.candidates[0].stages.map(stage => `${stage.stage}:${stage.status}`), ["measure:passed"]);
+	assert.equal(state.candidates[0].subjectId, "subject");
+	assert.match(String(state.candidates[0].pathRef), /candidate-runs\/run1\/journal\.json$/);
+	assert.equal(searchStateSummary(state).background.outstanding, 0);
+	assert.deepEqual(events.filter(event => event.kind === "background-queued").map(event => event.candidate?.id), ["run1", "run2"]);
+	assert.deepEqual(events.filter(event => event.kind === "background-settled").map(event => event.candidate?.id), ["run1", "run2"]);
+});
+
+test("background execution stays off unless the host enables it, and a restarted session collects from the journal", async t => {
+	const backend: CandidateExecutionBackend = { id: "plain-fixture", version: "1",
+		stages: [{ id: "measure", checks: ["compile", "correctness", "measurement"], mode: "local" }],
+		async executeStage(ctx) { return { status: "passed", receiptPaths: [await receipt(ctx, { ok: true })] }; } };
+	const h = await setup(t, backend);
+	await assert.rejects(h.tools().candidate_run.execute({ ...request, background: true }),
+		/did not enable background candidate runs/);
+	assert.equal(JSON.parse((await h.tools().candidate_run.execute(request)).text).status, "completed");
+	// A new tool instance has no job registry; collect falls back to the durable journal.
+	const afterRestart = JSON.parse((await h.tools().candidate_run.execute({ runId: "run1", collect: true })).text);
+	assert.equal(afterRestart.status, "completed");
+	assert.equal(afterRestart.runId, "run1");
+	await assert.rejects(h.tools().candidate_run.execute({ runId: "never-started", collect: true }), /unknown runId/);
 });

@@ -29,6 +29,8 @@ import { summarizeUsage, usageEventsFromEntries } from "./usage.ts";
 import { compactionPolicyFromEnvironment, sessionCompactionPolicy, workflowCompactionExtension, workflowCompactionSettings } from "./compaction.ts";
 import { platformGateFromEnvironment, type PlatformGate, type PlatformObservation } from "../platform/gate.ts";
 import { classifyToolFailure, classifyTransportFailure, remainingWallClockNote, runDeadlineFromEnvironment } from "./failure-class.ts";
+import { summarizeToolCalls } from "./tool-usage.ts";
+import { experimentArmFromEnvironment } from "./experiment-arm.ts";
 import { sampleRunnerResources, sessionClosed, sessionOpened } from "./resource.ts";
 import { DeepSeekCampaignBudget, type PromptLease } from "./deepseek-campaign.ts";
 import { getConfinedCampaignFileGrantDescriptor } from "./confined-campaign-files.ts";
@@ -1564,6 +1566,7 @@ export class PiSessionRunner implements SessionRunner {
 				compaction: compactionPolicy ? { thresholdTokens: compactionPolicy.thresholdTokens,
 					keepRecentTokens: compactionPolicy.keepRecentTokens } : null,
 				platformProfile: platformProfileId ?? null,
+				experimentArm: experimentArmFromEnvironment(),
 				runDeadline: spec.runDeadline ?? runDeadlineFromEnvironment() ?? null }, null, 2)}\n`);
 		const ref: SessionRef = {
 			label: spec.label,
@@ -1769,6 +1772,7 @@ export class PiSessionRunner implements SessionRunner {
 					numericLimits: { ...item.privateProviderError.numericLimits } } } : {}) })),
 			providerOutputRequests: () => providerOutputRequests.map(row => ({ ...row })),
 			toolLog: () => [...toolLog],
+			toolUsage: () => summarizeToolCalls(toolLog),
 			abort: async () => {
 				if (disposed || abortedByHandle) return;
 				abortedByHandle = true;
