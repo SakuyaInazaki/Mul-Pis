@@ -3,7 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
-import { DEFAULT_ADMISSION_POLICY, collectExistingCards, evaluateCardAdmission, type ExistingCard } from "../../src/knowledge/admission.ts";
+import { DEFAULT_ADMISSION_POLICY, collectExistingCards, evaluateCardAdmission, readAdmissionReceipts,
+	summarizeAdmissionRate, type ExistingCard } from "../../src/knowledge/admission.ts";
 import { optimizationDirectionSignature, renderOptimizationCard, validateOptimizationCard,
 	type OptimizationCard, type OptimizationCaseCard } from "../../src/knowledge/optimization-card.ts";
 import { createFileKnowledgeStore } from "../../src/knowledge/store.ts";
@@ -16,7 +17,7 @@ const measurement = (speedup: number, extra: Record<string, unknown> = {}) => ({
 
 const caseCard = (extra: Record<string, unknown> = {}): Record<string, unknown> => ({
 	version: 1, kind: "case", operatorCategory: "normalization", canonicalFamily: "layernorm",
-	bottleneck: "memory_bound", applicability: { backend: "ascend-c", toolchain: "CANN-8.0", dtype: "float16" },
+	bottleneck: "memory_bound", applicability: { backend: "ascend-c", toolchain: "CANN-8.0", dtype: "float16", structure: ["2d-rowwise"] },
 	provenance: { kind: "harness-run", detail: "M07/20261018T000000Z-a1/T001" },
 	method: "memory_coalescing",
 	diff: { summary: "把两次标量搬运合并成一次连续搬运", before: "copy(a); copy(b);", after: "copy_contiguous(a,b);" },
@@ -108,7 +109,7 @@ test("admission deduplicates by direction and bounds a family's capacity", () =>
 	assert.equal(duplicate.verdict, "reject");
 	assert.match(duplicate.reasons.join(";"), /近重复/);
 	// Same method, different dtype is a different entry, not a duplicate.
-	const otherDtype = valid(caseCard({ applicability: { backend: "ascend-c", toolchain: "CANN-8.0", dtype: "float32" } }));
+	const otherDtype = valid(caseCard({ applicability: { backend: "ascend-c", toolchain: "CANN-8.0", dtype: "float32", structure: ["2d-rowwise"] } }));
 	assert.equal(evaluateCardAdmission({ card: otherDtype, existing: [existing(strong)] }).verdict, "admit");
 	const full = Array.from({ length: 3 }, (_, index) => existing(valid(caseCard({
 		method: (["tiling", "fusion", "vectorization"] as const)[index], measurement: measurement(1.3 + index / 10) })),
@@ -128,12 +129,12 @@ test("renderOptimizationCard keeps metadata, rationale and artifact separate", (
 	assert.match(text, /1\.400×/);
 });
 
-async function fixture(t: TestContext): Promise<{ store: KnowledgeStore }> {
+async function fixture(t: TestContext): Promise<{ store: KnowledgeStore; dir: string }> {
 	const dir = await mkdtemp(path.join(tmpdir(), "pre-rsi-cards-"));
 	t.after(async () => rm(dir, { recursive: true, force: true }));
 	const store = createFileKnowledgeStore(dir);
 	await store.init();
-	return { store };
+	return { store, dir };
 }
 
 test("the store gate rejects an unanchored card and publishes an anchored one", async (t) => {
@@ -152,4 +153,26 @@ test("the store gate rejects an unanchored card and publishes an anchored one", 
 	const duplicate = await store.submitProposal({ stage: "M04", runId: "r3", ops: [{ op: "create", type: "C",
 		title: "重复条目", body: "", fields: { optimization: caseCard({ measurement: measurement(1.1) }) } }] });
 	await assert.rejects(store.merge(duplicate.proposalId), /近重复/);
+});
+
+test("the gate freezes its verdicts so the admission rate can be read back", async (t) => {
+	const { store, dir } = await fixture(t);
+	const propose = async (runId: string, card: Record<string, unknown>, title: string) => {
+		const receipt = await store.submitProposal({ stage: "M04", runId,
+			ops: [{ op: "create", type: "C", title, body: "", usageDecision: "adopted", fields: { optimization: card } }] });
+		await store.merge(receipt.proposalId).catch(() => undefined);
+	};
+	await propose("r1", caseCard(), "入库");
+	await propose("r2", caseCard({ measurement: measurement(1.01) }), "噪声");
+	await propose("r3", caseCard({ method: "tiling", measurement: measurement(1.4, { verifier: "model self-report" }) }), "自述");
+	const receipts = await readAdmissionReceipts(dir);
+	assert.equal(receipts.length, 3);
+	const summary = summarizeAdmissionRate(receipts);
+	assert.deepEqual([summary.proposed, summary.admitted, summary.rejected], [3, 1, 2]);
+	assert.ok(summary.rate < 1, "a store that admits everything has no gate");
+	const selfReported = receipts.find((item) => item.decisions[0].checks.antiCheat === false)!;
+	assert.equal(selfReported.decisions[0].verdict, "reject");
+	const noisy = receipts.find((item) => item.decisions[0].checks.thresholds === false)!;
+	assert.equal(noisy.decisions[0].checks.antiCheat, true);
+	assert.ok(receipts.every((item) => item.decisions[0].signature.includes("layernorm")));
 });

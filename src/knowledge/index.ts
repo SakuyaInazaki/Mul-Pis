@@ -7,8 +7,8 @@ export { createExperienceProvider, isKnowledgeRef, type ExperienceProvider, type
 export { validateOptimizationCard, readOptimizationCard, optimizationDirectionSignature, renderOptimizationCard,
 	OPTIMIZATION_METHODS, BOTTLENECK_SIGNATURES, OPTIMIZATION_CARD_KINDS,
 	type OptimizationCard, type OptimizationCardKind, type OptimizationMethod, type BottleneckSignature } from "./optimization-card.ts";
-export { evaluateCardAdmission, collectExistingCards, DEFAULT_ADMISSION_POLICY,
-	type AdmissionDecision, type AdmissionPolicy } from "./admission.ts";
+export { evaluateCardAdmission, collectExistingCards, readAdmissionReceipts, summarizeAdmissionRate,
+	DEFAULT_ADMISSION_POLICY, type AdmissionDecision, type AdmissionPolicy, type AdmissionReceiptV1 } from "./admission.ts";
 export { decideMethods, renderMethodMenu, DEFAULT_DECISION_POLICY, type MethodDecision } from "./decision-table.ts";
 export { assembleInjection, planInjection, INJECTION_PLANS, type InjectionPhase, type InjectionPlan,
 	type InjectionResult, type InjectionReceiptV1 } from "./injection.ts";
@@ -17,3 +17,5 @@ export { checkCandidate, checkApiSymbols, checkHardConstraints, collectApiContra
 	type StaticCheckReport, type StaticFinding } from "./static-checks.ts";
 export { collectFailureObservations, failureRuleDrafts, mineFailureRules, renderFailureRuleDrafts,
 	type FailureObservation, type FailureRuleDraftsV1, type MinedRule } from "./rule-mining.ts";
+export { assertStableKnowledge, recordDependencyIndex, resolveSnapshotRecord, selectKnowledgePage,
+	type SelectionPage } from "./session-tools.ts";

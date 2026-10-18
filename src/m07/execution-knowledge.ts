@@ -2,7 +2,8 @@
  * The files here are call evidence, not a second knowledge/selection store. */
 import { mkdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
-import { RETRIEVAL_SCALAR_KEYS, renderSelectedKnowledgeRecord, retrieveKnowledge, validateKnowledgeRetrievalContext, type KnowledgeRetrievalContext } from "../knowledge/retrieval.ts";
+import { RETRIEVAL_SCALAR_KEYS, validateKnowledgeRetrievalContext, type KnowledgeRetrievalContext } from "../knowledge/retrieval.ts";
+import { recordDependencyIndex, renderOriginalRecord, selectKnowledgePage } from "../knowledge/session-tools.ts";
 import { readOptimizationCard, type OptimizationCard } from "../knowledge/optimization-card.ts";
 import { checkCandidate, type ConstraintObservation } from "../knowledge/static-checks.ts";
 import type { KnowledgeStore, Limit, Snapshot } from "../knowledge/types.ts";
@@ -231,14 +232,14 @@ export function createExecutionKnowledgeTools(options: ExecutionKnowledgeOptions
 		if (JSON.stringify(await store.limits()) !== JSON.stringify(limits))
 			throw new HarnessError("m07.knowledge", "live knowledge limits changed while reading; retry against their current state");
 	};
-	const index = async (args: Record<string, unknown>, required: string[], onlyRequired = false, view: "refs" | "index" = "refs") => {
+	// One record's required dependencies and reverse warnings, shared with M04
+	// through src/knowledge/session-tools.ts. Paging controls the response, so no
+	// fixed top-k/body pack is imposed on changing stages.
+	const index = async (args: Record<string, unknown>, required: string[]) => {
 		const current = await snapshot();
 		const explicitContext = { ...initialContext, ...context(args) };
-		// Index all matching published records/dependency history. Paging controls
-		// the response, so no fixed top-k/body pack is imposed on changing stages.
-		const result = await retrieveKnowledge(store, { purpose: "M07 execution knowledge access", text: typeof args.text === "string" ? args.text : "",
-			requiredIds: [...new Set([...requiredIds, ...required])], context: Object.keys(explicitContext).length ? explicitContext : undefined, excludeExperience: true, view, onlyRequired,
-			maxRecords: Math.max(1, (current?.records ?? []).reduce((total, item) => total + item.version, 0)), maxChars: Number.MAX_SAFE_INTEGER });
+		const result = await recordDependencyIndex(store, current, required[0], "M07 execution knowledge access",
+			Object.keys(explicitContext).length ? explicitContext : undefined, "refs");
 		await stable(result.limits);
 		return result;
 	};
@@ -346,23 +347,14 @@ export function createExecutionKnowledgeTools(options: ExecutionKnowledgeOptions
 			if (!Number.isSafeInteger(offset) || Number(offset) < 0 || !Number.isSafeInteger(limit) || Number(limit) < 1 || Number(limit) > 100)
 				throw new HarnessError("m07.knowledge", "invalid knowledge record page range");
 			const view = args.format === "index" ? "index" : "brief";
-			const selection = await index(args, (args.requiredIds ?? []) as string[], false, "refs");
-			const refs = selection.rankedRefs;
-			if (Number(offset) > refs.length) throw new HarnessError("m07.knowledge", `record offset ${offset} exceeds selection length ${refs.length}`);
-			const end = Math.min(refs.length, Number(offset) + Number(limit));
-			const returnedRefs = refs.slice(Number(offset), end);
-			const published = new Map((await snapshot())?.records.map(item => [item.id, item.version]) ?? []);
 			const explicitContext = { ...initialContext, ...context(args) };
-			const blocks: string[] = [];
-			for (const ref of returnedRefs) {
-				const match = refPattern.exec(ref);
-				if (!match?.[2]) throw new HarnessError("m07.knowledge", `invalid published record reference ${ref}`);
-				const record = await store.get(match[1], Number(match[2]));
-				if (!record) throw new HarnessError("m07.knowledge", `published knowledge record unavailable: ${ref}`);
-				const availability = await store.availability(record.id, record.version);
-				blocks.push(renderSelectedKnowledgeRecord(record, availability, selection.limits, published.get(record.id), view,
-					Object.keys(explicitContext).length ? explicitContext : undefined));
-			}
+			const page = await selectKnowledgePage(store, { purpose: "M07 execution knowledge access",
+				text: typeof args.text === "string" ? args.text : "", snapshot: await snapshot(),
+				...(Object.keys(explicitContext).length ? { context: explicitContext } : {}),
+				requiredIds: [...requiredIds, ...((args.requiredIds ?? []) as string[])], excludeExperience: true,
+				offset: Number(offset), limit: Number(limit), view, scope: "m07.knowledge" });
+			const selection = page.selection;
+			const refs = page.refs, end = page.end, returnedRefs = page.returnedRefs, blocks = page.blocks;
 			const activeLimits = liveSafety(selection).activeLimits;
 			const limitKinds = { suspended: 0, withdrawn: 0, needs_recheck: 0 };
 			for (const limit of activeLimits) limitKinds[limit.kind]++;
@@ -380,7 +372,7 @@ export function createExecutionKnowledgeTools(options: ExecutionKnowledgeOptions
 		params: { ref: { type: "string", description: "Record ID or pinned ID, e.g. K001@1, from the frozen snapshot" }, ...contextParams, ...rangeParams },
 		execute: audited("read", async args => {
 			const target = await resolve(args.ref);
-			const selection = await index(args, [target.ref], true);
+			const selection = await index(args, [target.ref]);
 			// Incomplete applicability is not a ban on inspecting an already published
 			// original. Preserve the failed closure and its omissions, without admitting use.
 			const selectedRefs = [...new Set([target.ref, ...selection.rankedRefs])];
@@ -401,9 +393,7 @@ export function createExecutionKnowledgeTools(options: ExecutionKnowledgeOptions
 				? (retrieval as Record<string, unknown>).context : undefined;
 			// Keep the paged original independent of query context and live state;
 			// otherwise changing either between calls silently shifts later offsets.
-			const { body, ...metadata } = target.record;
-			const content = [`# Original knowledge record ${target.ref}`,
-				`Original metadata: ${JSON.stringify(metadata)}`, "", body].join("\n");
+			const content = renderOriginalRecord(target.record, `# Original knowledge record ${target.ref}`);
 			return { content, selectedRefs, limits: selection.limits, contentKind: "record",
 				safety: { ...restrictions, currentRecord: { ref: target.ref, availability,
 					scope: target.record.scope, refs: target.record.refs, retrievalContext: declaredContext },
@@ -421,7 +411,7 @@ export function createExecutionKnowledgeTools(options: ExecutionKnowledgeOptions
 			if (args.list !== undefined && typeof args.list !== "boolean") throw new HarnessError("m07.knowledge", "list must be boolean");
 			if (args.list === true && args.artifact !== undefined) throw new HarnessError("m07.knowledge", "list cannot be combined with artifact");
 			const target = await resolve(args.ref);
-			const selection = await index({}, [target.ref], true);
+			const selection = await index({}, [target.ref]);
 			if (args.list === true) {
 				const catalogue = await publishedArtifactCatalogue(options.workspaceRoot!, target.record);
 				await stable(selection.limits);

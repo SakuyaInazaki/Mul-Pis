@@ -6,8 +6,9 @@ import { nowIso, readTextIfExists, writeFileAtomic } from "../workspace.ts";
 import { buildKnowledgePack } from "./pack.ts";
 import { regenerateKnowledgeViews } from "./views.ts";
 import { validateExperienceDefinition } from "./experience-schema.ts";
-import { validateOptimizationCard } from "./optimization-card.ts";
-import { collectExistingCards, evaluateCardAdmission, DEFAULT_ADMISSION_POLICY, type AdmissionPolicy } from "./admission.ts";
+import { optimizationDirectionSignature, validateOptimizationCard } from "./optimization-card.ts";
+import { collectExistingCards, evaluateCardAdmission, DEFAULT_ADMISSION_POLICY,
+	type AdmissionPolicy, type AdmissionReceiptV1 } from "./admission.ts";
 import { isNecessaryPremise } from "./relations.ts";
 import type {
 	AvailabilityReport,
@@ -521,16 +522,24 @@ export class FileKnowledgeStore implements KnowledgeStore {
 		if (!carrying.length) return;
 		const activeTargets = new Set((await this.limits()).filter((limit) => !limit.liftedAt).map((limit) => limit.target));
 		const existing = collectExistingCards(await this.list(), activeTargets);
+		const receipt: AdmissionReceiptV1 = { version: 1, kind: "knowledge-admission",
+			proposalId: proposal.id ?? "unassigned", at: nowIso(), policy: this.admissionPolicy, decisions: [] };
 		for (const { op, opIndex } of carrying) {
 			if (op.op !== "create" && op.op !== "revise") continue;
 			const card = validateOptimizationCard((op.fields as Record<string, unknown>).optimization).card;
 			if (!card) continue;
 			const decision = evaluateCardAdmission({ card, existing, policy: this.admissionPolicy,
 				...(op.op === "revise" ? { revisingId: op.id } : {}) });
+			receipt.decisions.push({ opIndex, cardKind: card.kind, signature: optimizationDirectionSignature(card),
+				verdict: decision.verdict, checks: decision.checks, reasons: decision.reasons });
 			if (decision.verdict === "admit") continue;
 			const detail = [...decision.reasons, ...(decision.evictionCandidates?.length ? [`可淘汰候选：${decision.evictionCandidates.join("、")}`] : [])].join("；");
 			issue(issues, decision.verdict === "replace" ? `知识写回门禁：应替换已有条目而不是新建。${detail}` : `知识写回门禁拒绝入库。${detail}`, opIndex);
 		}
+		// The gate's own verdicts are evidence: without them the admission rate is
+		// an assertion rather than something the project can read back.
+		if (receipt.decisions.length && proposal.id)
+			await writeFileAtomic(path.join(this.dir, "proposals", `${proposal.id}.admission.json`), `${JSON.stringify(receipt, null, 2)}\n`);
 	}
 
 	async init(): Promise<void> {

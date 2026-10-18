@@ -274,6 +274,8 @@ export function validateOptimizationCard(value: unknown): { card?: OptimizationC
 		if (typeof value.provenance.kind !== "string" || !OPTIMIZATION_PROVENANCE_KINDS.includes(value.provenance.kind as OptimizationProvenanceKind))
 			issues.push(`fields.optimization.provenance.kind 必须是 ${OPTIMIZATION_PROVENANCE_KINDS.join(" | ")}`);
 		if (!text(value.provenance.detail, SHORT_FIELD_LIMIT)) issues.push("fields.optimization.provenance.detail 必须写明确切来源（运行/任务、rewind 步骤、厂商路径或来源 ID）");
+		else if (value.provenance.kind === "harness-run" && !/(?:M0\d|T\d{3,}|\d{8}T\d{6}Z)/u.test(String(value.provenance.detail)))
+			issues.push("provenance.kind=\"harness-run\" 时 detail 必须含确切轨迹标识（运行 ID 或任务 ID），否则无法回溯来源轨迹");
 	}
 	if (value.credit !== undefined) {
 		if (!isObject(value.credit)) issues.push("fields.optimization.credit 必须是对象");
@@ -297,6 +299,11 @@ function methodList(value: unknown, label: string, issues: string[]): void {
 
 function validateKindFields(kind: OptimizationCardKind, value: Record<string, unknown>, issues: string[]): void {
 	if (kind === "case") {
+		// An example is dtype- and shape-specific: copying one across dtypes or
+		// ranks is exactly how a tiling constant silently becomes a buffer overrun.
+		const applicability = isKnowledgeRetrievalContext(value.applicability) ? value.applicability : undefined;
+		if (applicability && !applicability.dtype) issues.push("案例卡的 applicability.dtype 必填：跨 dtype 照抄 tiling 是最常见的静默失效");
+		if (applicability && !applicability.structure?.length) issues.push("案例卡的 applicability.structure 必填：至少写明 rank 或形状结构假设（如 2d-rowwise）");
 		if (typeof value.method !== "string" || !OPTIMIZATION_METHODS.includes(value.method as OptimizationMethod))
 			issues.push(`fields.optimization.method 必须是合法动作空间之一：${OPTIMIZATION_METHODS.join(" | ")}`);
 		if (!isObject(value.diff)) issues.push("fields.optimization.diff 必须是对象，含 summary 与 path 或 before/after");

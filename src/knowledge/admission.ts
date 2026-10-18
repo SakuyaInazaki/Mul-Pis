@@ -12,6 +12,8 @@
  * calibrated project constants. They are meant to be scanned on this project's
  * own baseline and the result recorded; see docs/implementation/design.md.
  */
+import { readFile, readdir } from "node:fs/promises";
+import path from "node:path";
 import { optimizationDirectionSignature, readOptimizationCard, type OptimizationCard } from "./optimization-card.ts";
 import type { KnowledgeRecord } from "./types.ts";
 
@@ -58,8 +60,19 @@ export interface ExistingCard {
 
 export type AdmissionVerdict = "admit" | "replace" | "reject";
 
+/** Which gate each card passed, recorded per decision so an admitted entry can
+ * later be shown to have been through the anti-cheat and threshold checks and
+ * not merely to have been structurally legal. */
+export interface AdmissionChecks {
+	antiCheat: boolean;
+	thresholds: boolean;
+	notDuplicate: boolean;
+	withinCapacity: boolean;
+}
+
 export interface AdmissionDecision {
 	verdict: AdmissionVerdict;
+	checks: AdmissionChecks;
 	/** For `replace`: the existing record this card must revise instead of duplicating. */
 	replaces?: string;
 	/** For `reject` by capacity: the weakest existing entries, named so the
@@ -164,31 +177,75 @@ export interface AdmissionRequest {
 export function evaluateCardAdmission(request: AdmissionRequest): AdmissionDecision {
 	const policy = request.policy ?? DEFAULT_ADMISSION_POLICY;
 	const card = request.card;
-	const reasons = [...creditIssues(card), ...antiCheatReasons(card), ...measurementReasons(card, policy),
-		...positiveReasons(card, policy), ...negativeReasons(card, policy)];
-	if (reasons.length) return { verdict: "reject", reasons };
+	const checks: AdmissionChecks = { antiCheat: true, thresholds: true, notDuplicate: true, withinCapacity: true };
+	const cheating = [...creditIssues(card), ...antiCheatReasons(card)];
+	const thresholds = [...measurementReasons(card, policy), ...positiveReasons(card, policy), ...negativeReasons(card, policy)];
+	checks.antiCheat = !cheating.length;
+	checks.thresholds = !thresholds.length;
+	if (cheating.length || thresholds.length) return { verdict: "reject", checks, reasons: [...cheating, ...thresholds] };
 
 	const signature = optimizationDirectionSignature(card);
 	const duplicates = request.existing.filter(item => optimizationDirectionSignature(item.card) === signature &&
 		item.id !== request.revisingId);
 	if (duplicates.length) {
+		checks.notDuplicate = false;
 		const strongest = duplicates.reduce((best, item) => strength(item.card) >= strength(best.card) ? item : best);
 		if (strength(card) > strength(strongest.card))
-			return { verdict: "replace", replaces: strongest.ref,
+			return { verdict: "replace", checks, replaces: strongest.ref,
 				reasons: [`已有同方向条目 ${strongest.ref}，本卡证据更强；用 revise ${strongest.id} 替换，不要新建近重复条目`] };
-		return { verdict: "reject", replaces: strongest.ref,
+		return { verdict: "reject", checks, replaces: strongest.ref,
 			reasons: [`已有同方向条目 ${strongest.ref} 且证据不弱于本卡；近重复条目会占满检索结果，不入库`] };
 	}
 
 	const family = request.existing.filter(item => item.card.canonicalFamily === card.canonicalFamily &&
 		item.card.kind === card.kind && item.id !== request.revisingId);
 	if (!request.revisingId && family.length >= policy.familyCapacity) {
+		checks.withinCapacity = false;
 		const candidates = evictionOrder(family).slice(0, 3);
-		return { verdict: "reject", evictionCandidates: candidates,
+		return { verdict: "reject", checks, evictionCandidates: candidates,
 			reasons: [`结构族 ${card.canonicalFamily} 的 ${card.kind} 条目已达容量上限 ${policy.familyCapacity}；先按证据显式停用或修订最弱条目再提新卡`,
 				...(candidates.length ? [`按采纳与注入计数最弱的候选：${candidates.join("、")}`] : ["没有可淘汰条目：现存条目都是负例或处于生效限制下"])] };
 	}
-	return { verdict: "admit", reasons: [] };
+	return { verdict: "admit", checks, reasons: [] };
+}
+
+export interface AdmissionReceiptV1 {
+	version: 1;
+	kind: "knowledge-admission";
+	proposalId: string;
+	at: string;
+	policy: AdmissionPolicy;
+	decisions: Array<{ opIndex: number; cardKind: OptimizationCard["kind"]; signature: string;
+		verdict: AdmissionVerdict; checks: AdmissionChecks; reasons: string[] }>;
+}
+
+/** The admission rate is the point of the gate: a store that admits everything
+ * it is offered has no gate, whatever its thresholds say. */
+export function summarizeAdmissionRate(receipts: readonly AdmissionReceiptV1[]): {
+	proposed: number; admitted: number; rejected: number; replaced: number; rate: number } {
+	const decisions = receipts.flatMap((receipt) => receipt.decisions);
+	const admitted = decisions.filter((item) => item.verdict === "admit").length;
+	const replaced = decisions.filter((item) => item.verdict === "replace").length;
+	return { proposed: decisions.length, admitted, replaced,
+		rejected: decisions.length - admitted - replaced,
+		rate: decisions.length ? admitted / decisions.length : 0 };
+}
+
+/** Read every frozen admission receipt under a store directory. Unreadable or
+ * foreign files are skipped, never guessed into decisions. */
+export async function readAdmissionReceipts(storeDir: string): Promise<AdmissionReceiptV1[]> {
+	const dir = path.join(storeDir, "proposals");
+	let names: string[];
+	try { names = (await readdir(dir)).filter((name) => /^P\d{4,}\.admission\.json$/u.test(name)).sort(); }
+	catch { return []; }
+	const receipts: AdmissionReceiptV1[] = [];
+	for (const name of names) {
+		try {
+			const parsed = JSON.parse(await readFile(path.join(dir, name), "utf8")) as AdmissionReceiptV1;
+			if (parsed.version === 1 && parsed.kind === "knowledge-admission" && Array.isArray(parsed.decisions)) receipts.push(parsed);
+		} catch { continue; }
+	}
+	return receipts;
 }
 
 /** Collect the published cards a gate needs, with their protection state. */

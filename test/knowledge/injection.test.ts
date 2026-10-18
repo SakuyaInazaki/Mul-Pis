@@ -10,7 +10,7 @@ import { validateOptimizationCard, type OptimizationCard } from "../../src/knowl
 import { createFileKnowledgeStore } from "../../src/knowledge/store.ts";
 import type { KnowledgeStore, ProposalOp } from "../../src/knowledge/types.ts";
 
-const context = { backend: "ascend-c", toolchain: "CANN-8.0", dtype: "float16" };
+const context = { backend: "ascend-c", toolchain: "CANN-8.0", dtype: "float16", structure: ["2d-rowwise"] };
 
 function card(raw: Record<string, unknown>): OptimizationCard {
 	const result = validateOptimizationCard(raw);
