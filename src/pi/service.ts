@@ -714,8 +714,15 @@ export class ResearchService {
 	private async stageContext(root: string, stage: ResearchStage, signal?: AbortSignal): Promise<StageContext> {
 		const ws = new Workspace(root);
 		const originalStartRun = ws.startRun.bind(ws);
+		const originalWriteRun = ws.writeRun.bind(ws);
 		const key = await canonicalMutationKey(root);
 		const active = this.activeStageOperations.get(key);
+		// Once shutdown owns this operation, a still-running write (a session
+		// boundary receipt, for example) must fail as a shutdown, not as an
+		// attempt to revive a record the host just marked failed.
+		ws.writeRun = (record) => active?.closing && record.status === "running"
+			? Promise.reject(new HarnessError("run.interrupted", "owned stage operation is shutting down"))
+			: originalWriteRun(record);
 		ws.startRun = (runStage, inputs, knowledgeSnapshot) => {
 			if (active?.closing)
 				return Promise.reject(new HarnessError("run.interrupted", "owned stage operation is shutting down"));
