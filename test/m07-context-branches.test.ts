@@ -162,6 +162,8 @@ test("an abandoned verified candidate cannot satisfy the goal's candidate qualif
 			checks: [], metrics: [], limitations: [] }; } };
 	const f = await fixture(t, false, undefined, verifier);
 	const candidateSpec = { ...taskSpec, expectedOutputs: ["candidate.txt", "receipt.json"],
+		subjectProfile: { implementationSpace: "handwritten-low-level" as const, rationale: "test fixture",
+			baselineStrength: "none" as const },
 		candidate: { sourcePaths: ["candidate.txt"], receiptPaths: ["receipt.json"] } };
 	const parent = await f.controller.delegate(f.goal.runId, candidateSpec);
 	assert.equal((await f.controller.review(f.goal.runId, { taskId: parent.taskId,
@@ -175,7 +177,9 @@ test("an abandoned verified candidate cannot satisfy the goal's candidate qualif
 	assert.equal(reviewedBranch.candidateObservation?.sourceBinding, "verified");
 	await f.controller.selectBranch(f.goal.runId, { parentTaskId: parent.taskId,
 		rationale: "Abandon this comparison after review" });
-	const independent = await f.controller.delegate(f.goal.runId, { ...taskSpec, objective: "Independent noncandidate study" });
+	const independent = await f.controller.delegate(f.goal.runId, { ...taskSpec, objective: "Independent noncandidate study",
+		subjectProfile: { implementationSpace: "handwritten-low-level" as const, rationale: "test fixture",
+			baselineStrength: "none" as const } });
 	const reviewedIndependent = await f.controller.review(f.goal.runId, { taskId: independent.taskId,
 		checks: [{ criterion: taskSpec.checks[0], result: "passed", evidence: [independent.reportPath!] }], artifacts: [independent.reportPath!] });
 	assert.equal(reviewedIndependent.status, "accepted");

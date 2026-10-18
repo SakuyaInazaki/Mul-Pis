@@ -352,6 +352,33 @@ async function withGoalDispatch<T>(ctx: StageContext, runId: string, body: () =>
 		finally { release(); if (dispatchQueues.get(key) === tail) dispatchQueues.delete(key); }
 	}
 }
+/** Declared facts only: the harness checks their shape, never their truth. */
+function validateSubjectProfile(profile: TaskSpecInput["subjectProfile"]): TaskSpecInput["subjectProfile"] {
+	if (profile === undefined) return undefined;
+	if (!profile || typeof profile !== "object" || Array.isArray(profile) ||
+		Object.keys(profile).some((key) => !["implementationSpace", "rationale", "baselineStrength", "endToEndShare", "headroom"].includes(key)) ||
+		!["vendor-library", "dsl-or-ir", "handwritten-low-level"].includes(profile.implementationSpace) ||
+		!["vendor-library", "framework-default", "none"].includes(profile.baselineStrength) ||
+		typeof profile.rationale !== "string" || !profile.rationale.trim() || profile.rationale.length > 1000)
+		throw new HarnessError("m07.subject-profile", "subjectProfile needs implementationSpace, a nonempty rationale under 1000 characters, and baselineStrength");
+	if (profile.endToEndShare !== undefined && (typeof profile.endToEndShare !== "number" ||
+		!Number.isFinite(profile.endToEndShare) || profile.endToEndShare < 0 || profile.endToEndShare > 1))
+		throw new HarnessError("m07.subject-profile", "subjectProfile.endToEndShare must be a measured share in 0-1");
+	if (profile.headroom !== undefined && (!profile.headroom || typeof profile.headroom !== "object" ||
+		Array.isArray(profile.headroom) ||
+		Object.keys(profile.headroom).some((key) => !["kind", "value", "source"].includes(key)) ||
+		!["roofline-ratio", "sol-gap", "measured-reference", "unknown"].includes(profile.headroom.kind) ||
+		typeof profile.headroom.source !== "string" || !profile.headroom.source.trim() ||
+		profile.headroom.source.length > 400 ||
+		(profile.headroom.value !== undefined && (typeof profile.headroom.value !== "number" || !Number.isFinite(profile.headroom.value)))))
+		throw new HarnessError("m07.subject-profile", "subjectProfile.headroom needs a kind, a stated source, and a finite value when it claims one");
+	return { implementationSpace: profile.implementationSpace, rationale: profile.rationale.trim(),
+		baselineStrength: profile.baselineStrength,
+		...(profile.endToEndShare === undefined ? {} : { endToEndShare: profile.endToEndShare }),
+		...(profile.headroom ? { headroom: { kind: profile.headroom.kind, source: profile.headroom.source.trim(),
+			...(profile.headroom.value === undefined ? {} : { value: profile.headroom.value }) } } : {}) };
+}
+
 function nonempty(value: string, label: string): string {
 	if (!value?.trim()) throw new HarnessError("m07.input", `${label} 不能为空`);
 	return value.trim();
@@ -1118,6 +1145,12 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 					...(spec.executionLoop.maxRounds === undefined ? {} : { maxRounds: spec.executionLoop.maxRounds }),
 					...(spec.executionLoop.deadlineAt === undefined ? {} : { deadlineAt: spec.executionLoop.deadlineAt }) } : undefined };
 			if (spec.subjectId !== undefined) spec.subjectId = nonempty(spec.subjectId, "task subjectId");
+			spec.subjectProfile = validateSubjectProfile(spec.subjectProfile);
+			// Under a bound verifier an execute task produces candidates, and the basis
+			// requires the abstraction-layer decision and the headroom record before
+			// spending a search budget on it.
+			if (spec.mode === "execute" && goal.candidateVerification && !spec.subjectProfile)
+				throw new HarnessError("m07.subject-profile", "an execute task under a bound candidate verifier must declare subjectProfile: the implementation space with its rationale and the baseline strength it competes against");
 			let branchParent: M07TaskRecord | undefined;
 			let branchManifest: BranchManifestV1 | undefined;
 			if (spec.context) {

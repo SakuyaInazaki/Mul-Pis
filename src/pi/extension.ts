@@ -914,6 +914,17 @@ mainAgentWatchdog.unref?.();
 					structure: Type.Optional(Type.Array(Type.String())), appliedTransforms: Type.Optional(Type.Array(Type.String())),
 					symptoms: Type.Optional(Type.Array(Type.String())),
 				}, { additionalProperties: false })),
+				subjectProfile: Type.Optional(Type.Object({
+					implementationSpace: Type.Union([Type.Literal("vendor-library"), Type.Literal("dsl-or-ir"), Type.Literal("handwritten-low-level")],
+						{ description: "Where this work object is implemented; writing low level by default is a decision that needs its own reason" }),
+					rationale: Type.String({ description: "Why this layer rather than the one above or below" }),
+					baselineStrength: Type.Union([Type.Literal("vendor-library"), Type.Literal("framework-default"), Type.Literal("none")]),
+					endToEndShare: Type.Optional(Type.Number({ description: "Measured share of end-to-end runtime, 0-1" })),
+					headroom: Type.Optional(Type.Object({
+						kind: Type.Union([Type.Literal("roofline-ratio"), Type.Literal("sol-gap"), Type.Literal("measured-reference"), Type.Literal("unknown")]),
+						value: Type.Optional(Type.Number()), source: Type.String({ description: "Where this estimate comes from" }),
+					}, { additionalProperties: false })),
+				}, { description: "Required for an execute task under a bound candidate verifier; declared facts, not host-proven ones.", additionalProperties: false })),
 				lessonDeltaOutput: Type.Optional(Type.String({ description: "Exact relative output path for the task's lesson delta" })),
 				candidate: Type.Optional(Type.Object({
 					sourcePaths: Type.Array(Type.String()), receiptPaths: Type.Array(Type.String()),

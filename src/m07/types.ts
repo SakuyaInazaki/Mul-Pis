@@ -26,10 +26,29 @@ export interface BeginGoalInput {
 	workflowMethodVersionId?: string;
 }
 
+/** Declared, never host-proven: where this work object is being implemented and
+ * what is already known about its headroom. The harness records it so a
+ * trajectory can answer "why this abstraction layer" and "why spend here"; the
+ * numbers stay model or host declarations with their own stated source. */
+export interface SubjectProfileV1 {
+	implementationSpace: "vendor-library" | "dsl-or-ir" | "handwritten-low-level";
+	/** Why this layer rather than the ones above or below it. */
+	rationale: string;
+	/** How strong the implementation being competed against already is. */
+	baselineStrength: "vendor-library" | "framework-default" | "none";
+	/** Share of end-to-end runtime, in [0, 1], when it has been measured. */
+	endToEndShare?: number;
+	/** Remaining headroom and where that estimate comes from. */
+	headroom?: { kind: "roofline-ratio" | "sol-gap" | "measured-reference" | "unknown";
+		value?: number; source: string };
+}
+
 export interface TaskSpecInput {
 	objective: string;
 	/** Actual object of this task's work; input materials do not change this identity. */
 	subjectId?: string;
+	/** Required for a candidate-producing execute task under a bound verifier. */
+	subjectProfile?: SubjectProfileV1;
 	inputs: string[];
 	expectedOutputs: string[];
 	checks: string[];
