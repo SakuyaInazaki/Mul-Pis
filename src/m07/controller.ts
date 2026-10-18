@@ -1350,6 +1350,9 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			let hostRecoveryAbort: Promise<void> | undefined;
 			let hostRecoveryAbortError: string | undefined;
 			let activeCandidateCalls = 0;
+			// Background candidate runs outlive the tool call that started them, so the
+			// host keeps their drain and awaits it before the prompt can stop.
+			let drainBackgroundRuns: (() => Promise<void>) | undefined;
 			if (spec.executionLoop && "mode" in spec.executionLoop && spec.executionLoop.mode === "candidate-episode") {
 				task.episode = { version: 1, candidates: [], incumbents: [] };
 				if (tools.kind !== "execution") throw new HarnessError("m07.episode", "candidate episode requires execution tools");
@@ -1359,6 +1362,8 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 					...(options.candidateExecutionBackend && operationId ? createCandidateExecutionTools({
 						goalRunId: runId, taskId: id, operationId, subjectId: task.subjectId, workDir,
 						journalDir: path.join(dir, "candidate-runs"), backend: options.candidateExecutionBackend,
+						searchEventLogFile: path.join(ctx.ws.runDir("M07", runId), "search-events.jsonl"),
+						backgroundRuns: { register: drain => { drainBackgroundRuns = drain; } },
 						evaluate: args => evaluationTool.execute(args),
 					}).map(tool => ({ ...tool, execute: async (args: Record<string, unknown>, signal?: AbortSignal) => {
 						if (hostRecoveryReason) throw hostRecoveryReason;
@@ -1369,6 +1374,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 							// The runner serializes candidate execution internally. Wait for every
 							// queued wrapper, including rejected calls, before stopping the prompt.
 							if (!activeCandidateCalls && !hostRecoveryReason) {
+								await drainBackgroundRuns?.();
 								const pending = await pendingCandidateExecutions({ journalDir: path.join(dir, "candidate-runs"),
 									goalRunId: runId, taskId: id, operationId, backend: options.candidateExecutionBackend });
 								if (!activeCandidateCalls && !hostRecoveryReason && pending.some(item => !item.queryAvailable)) {

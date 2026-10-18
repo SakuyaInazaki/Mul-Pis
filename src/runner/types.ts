@@ -9,6 +9,7 @@
 import type { Role } from "../types.ts";
 import type { EvidenceBindingV1 } from "../context/boundary.ts";
 import type { FailureClass } from "./failure-class.ts";
+import type { ToolUsageSummaryV1 } from "./tool-usage.ts";
 
 /**
  * What a session may touch besides the text it is given.
@@ -303,6 +304,9 @@ export interface SessionHandle {
 	abort(): Promise<void>;
 	/** Every harness-defined or execution tool call made by the model in this session, in order. */
 	toolLog(): ToolCallRecord[];
+	/** Shape of this session's tool use: call counts, failure classes, and how often
+	 * a code change was actually evaluated rather than followed by more editing. */
+	toolUsage?(): ToolUsageSummaryV1;
 	dispose(): void;
 }
 

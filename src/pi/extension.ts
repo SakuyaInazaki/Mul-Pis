@@ -25,6 +25,7 @@ import { summarizeGoalExecution } from "../m07/status.ts";
 import { candidateSearchSnapshot } from "../m07/candidate-archive.ts";
 import { candidateSearchBrief, candidateSearchFocus, scopedRepeatedSourceObservations, scopedSearchLeads } from "../m07/candidate-search.ts";
 import { compactionPolicyFromEnvironment, workflowCompactionExtension } from "../runner/compaction.ts";
+import { collectWarmStartLeads, describeWarmStartLeads } from "../m07/search-state/index.ts";
 import { registerConsoleWorkflowBridge, bindConsoleDescriptorToGoal } from "./console-bridge.ts";
 
 type ToolResult = AgentToolResult<Record<string, unknown>>;
@@ -267,7 +268,9 @@ export function createResearchExtension(options: ResearchExtensionOptions = {}) 
 		workflowCompactionExtension(compactionPolicyFromEnvironment(),
 			() => options.continuation ? { file: path.join(options.continuation.workspace, ".agent", "sessions",
 				`main-${process.pid}.compaction.jsonl`) } : undefined)(pi);
-		const orchestrationTools = new Set(["research_status", "research_init", "research_stage", "research_goal", "research_mission", "research_delegate", "research_review", "research_improve", "research_method_improve"]);
+		// Seven orchestration tools, each with one job: a surface that keeps growing
+// dilutes tool choice more than it adds capability.
+		const orchestrationTools = new Set(["research_status", "research_stage", "research_goal", "research_mission", "research_delegate", "research_review", "research_improve"]);
 		const inspectionTools = new Set(["read", "grep", "find", "ls"]);
 		let researchActive = false;
 		let activePiCwd: string | undefined;
@@ -583,33 +586,117 @@ mainAgentWatchdog.unref?.();
 		pi.registerTool({
 			name: "research_status",
 			label: "Research Status",
-			description: "Read persisted M01–M09 status. Optionally discover bounded local executor experience conditionally matching an M07 execute task; explicit delegation still checks experience-pack budgets.",
+			description: "Read persisted M01–M09 status. Optionally discover bounded local executor experience conditionally matching an M07 execute task; explicit delegation still checks experience-pack budgets. Optionally list earlier runs' best verified candidates for the same work object, with the evidence paths behind them.",
 			promptSnippet: "Inspect persisted research workflow status without rerunning tasks",
-			promptGuidelines: ["Use research_status before deciding which research stage or M07 action is needed.", "Experience discovery is paged: pass nextOffset as experience.offset to inspect further matches. Compare snapshotId across pages and restart discovery if it changes; explicit delegation rechecks the current conditions and pack budget."],
+			promptGuidelines: ["Use research_status before deciding which research stage or M07 action is needed.", "Experience discovery is paged: pass nextOffset as experience.offset to inspect further matches. Compare snapshotId across pages and restart discovery if it changes; explicit delegation rechecks the current conditions and pack budget.", "priorRuns returns earlier runs' best verified candidates as starting points, not as current results: a measurement from another chip or toolchain is reported as not comparable and must be re-measured before it is quoted."],
 			parameters: Type.Object({ workspace: Type.Optional(Type.String({ description: "Research workspace; defaults to the current Pi cwd" })),
 				experience: Type.Optional(Type.Object({ tags: Type.Array(Type.String()), offset: Type.Optional(Type.Integer({ minimum: 0 })),
-					contextRefs: Type.Optional(Type.Array(Type.Object({ storeId: Type.String(), recordId: Type.String(), version: Type.Integer() }))) })) }),
+					contextRefs: Type.Optional(Type.Array(Type.Object({ storeId: Type.String(), recordId: Type.String(), version: Type.Integer() }))) })),
+				priorRuns: Type.Optional(Type.Object({
+					subjectId: Type.Optional(Type.String({ description: "Only earlier candidates for this exact work object" })),
+					chip: Type.Optional(Type.String({ description: "Current chip; leads from another chip are marked not comparable" })),
+					toolchain: Type.Optional(Type.String({ description: "Current toolchain version" })),
+					excludeRunId: Type.Optional(Type.String({ description: "The goal being planned now; its own history is not a prior run" })),
+					includeIncomparable: Type.Optional(Type.Boolean({ description: "Report leads from another or an unrecorded platform instead of dropping them" })),
+					limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+				}, { additionalProperties: false })) }),
 			executionMode: "sequential",
-			async execute(_id, params, _signal, _update, ctx) { return result(await service.status(workspaceFrom(params.workspace, ctx.cwd), params.experience)); },
+			async execute(_id, params, _signal, _update, ctx) {
+				const workspace = workspaceFrom(params.workspace, ctx.cwd);
+				const status = await service.status(workspace, params.experience);
+				if (!params.priorRuns) return result(status);
+				const query = params.priorRuns;
+				const priorRuns = await collectWarmStartLeads({ m07Dir: path.join(workspace, "stages", "M07"),
+					...(query.subjectId ? { subjectId: query.subjectId } : {}),
+					...(query.excludeRunId ? { excludeRunId: query.excludeRunId } : {}),
+					...(query.chip && query.toolchain ? { platform: { chip: query.chip, toolchain: query.toolchain } } : {}),
+					...(query.includeIncomparable ? { includeIncomparable: true } : {}),
+					...(query.limit ? { limit: query.limit } : {}) });
+				return result({ ...status, priorRuns: { ...priorRuns, summary: describeWarmStartLeads(priorRuns) } });
+			},
 		});
+
+		type MethodImproveParams = { action: string; workspace?: string; methodsPath?: string; planPath?: string;
+			versionId?: string; outputPath?: string; packagePath?: string; m04RunId?: string;
+			expectedActiveBundleId?: string; methodVersionId?: string;
+			decisionRef?: { storeId: string; recordId: string; version: number } };
+		/** The method track of research_improve; kept whole so the merged tool stays readable. */
+		const methodImprove = async (params: MethodImproveParams, signal: AbortSignal | undefined,
+			ctx: { cwd: string }): Promise<ReturnType<typeof result>> => {
+			if (params.action === "workflow-run" || params.action === "workflow-calibrate") {
+				if (!params.planPath) throw new Error(`${params.action} requires planPath`);
+				const research = options.researchImprovementServiceFactory?.(workspaceFrom(params.workspace, ctx.cwd), signal) ?? new ResearchImprovementService({ workspaceRoot: workspaceFrom(params.workspace, ctx.cwd), runner: (await import("../runner/pi.ts")).createPiSessionRunner({ signal }) });
+				const plan = JSON.parse(await readFile(path.resolve(ctx.cwd, params.planPath), "utf8"));
+				if (params.action === "workflow-calibrate") {
+					const run = await research.calibrateWorkflow(plan);
+					return result({ runId: run.runId, status: run.status, stopReason: run.stopReason, baseline: run.baseline, methodVersionId: run.methodVersionId, pairCount: run.pairs.length, partialArmCount: Number(!!run.partialPair?.armA) + Number(!!run.partialPair?.armA2), pairsWithDifferingChecks: run.pairs.filter((pair) => pair.differences.length > 0).length, pairsWithFailedChecks: run.pairs.filter((pair) => [...pair.armA.checkResults, ...pair.armA2.checkResults].some((check) => !check.passed)).length, scientificBenefit: run.scientificBenefit, budget: run.budgetAtEnd });
+				}
+				const run = await research.runWorkflow(plan as WorkflowEvidenceHandoffPlanV1);
+				return result({ runId: run.runId, status: run.status, outcome: run.outcome, stopReason: run.stopReason, selectedCandidateId: run.selectedCandidateId, promotedMethodVersionId: run.promotedMethodVersionId, developmentArmCount: run.developmentArms.length, protectedArmCount: run.protectedArms.length, scientificBenefit: run.scientificBenefit, budget: run.budgetAtEnd });
+			}
+			const { createPiSessionRunner } = await import("../runner/pi.ts");
+			const research = new ResearchImprovementService({ workspaceRoot: workspaceFrom(params.workspace, ctx.cwd), runner: createPiSessionRunner({ signal }) });
+			if (params.action === "bootstrap") {
+				if (!params.methodsPath) throw new Error("bootstrap requires methodsPath");
+				return result(await research.bootstrap(JSON.parse(await readFile(path.resolve(ctx.cwd, params.methodsPath), "utf8")) as ResearchBootstrapInput));
+			}
+			if (params.action === "run") {
+				if (!params.planPath) throw new Error("run requires planPath");
+				return result(publicResearchRun(await research.run(JSON.parse(await readFile(path.resolve(ctx.cwd, params.planPath), "utf8")) as ResearchCampaignPlanV1)));
+			}
+			if (params.action === "status") return result(publicResearchStatus(await research.status()));
+			if (params.action === "advance-knowledge") {
+				if (!params.m04RunId || !params.expectedActiveBundleId) throw new Error("advance-knowledge requires m04RunId and expectedActiveBundleId");
+				const changed = await research.advanceKnowledgeEpoch(params.m04RunId, params.expectedActiveBundleId);
+				return result({ bundleId: changed.bundle.bundleId, active: publicResearchStatus(await research.status()).active, toSnapshot: changed.toSnapshot });
+			}
+			if (params.action === "transition-dependencies") {
+				if (!params.m04RunId || !params.expectedActiveBundleId || !params.methodVersionId || !params.decisionRef) throw new Error("transition-dependencies requires m04RunId, expectedActiveBundleId, methodVersionId and decisionRef");
+				const changed = await research.transitionKnowledgeDependencies(params.m04RunId, params.expectedActiveBundleId, params.methodVersionId, params.decisionRef);
+				return result({ bundleId: changed.bundle.bundleId, newMethodVersionId: changed.newMethodVersionId, active: publicResearchStatus(await research.status()).active });
+			}
+			if (params.action === "rollback") return result(await research.rollback());
+			if (params.action === "export") {
+				if (!params.versionId || !params.outputPath) throw new Error("export requires versionId and outputPath");
+				return result(await research.exportMethod(params.versionId, path.resolve(ctx.cwd, params.outputPath)));
+			}
+			if (!params.packagePath) throw new Error("bind requires packagePath");
+			return result(await research.bindMethod(path.resolve(ctx.cwd, params.packagePath)));
+		};
 
 		pi.registerTool({
 			name: "research_improve",
 			label: "Improve Research Harness Budget Policy",
-			description: "Run an explicit bounded campaign, inspect/roll back a policy, or manually export/bind a method package. Projection screening alone never promotes; only complete local paired mechanism admission can promote, without proving broad scientific benefit.",
-			promptSnippet: "Operate the separate bounded budget-policy improvement loop",
-			promptGuidelines: ["Run requires a caller-authorized planPath with candidate and resource limits; without cases, it screens only.", "Treat local mechanism admission as narrow evidence, not complete scientific workflow benefit."],
+			description: "Operate one improvement study. track=budget runs the bounded budget-policy campaign; track=method bootstraps, runs, inspects, rolls back or transfers versioned H/I prompt strategies, including the M07 evidence-handoff search and same-method calibration. Projection screening alone never promotes; only complete local paired mechanism admission can promote, without proving broad scientific benefit.",
+			promptSnippet: "Operate one explicitly authorized improvement study on a named track",
+			promptGuidelines: ["Run requires a caller-authorized planPath with candidate and resource limits; without cases, it screens only.", "Treat local mechanism admission as narrow evidence, not complete scientific workflow benefit.", "track=method uses caller-supplied method and experiment plans and keeps development feedback out of protected admission; calibration records observations without proposing or promoting a method."],
 			parameters: Type.Object({
-				action: Type.Union([Type.Literal("run"), Type.Literal("status"), Type.Literal("rollback"), Type.Literal("export"), Type.Literal("bind")]),
+				track: Type.Optional(Type.Union([Type.Literal("budget"), Type.Literal("method")], { description: "budget (default) is the bounded budget-policy loop; method is the versioned H/I method study" })),
+				action: Type.Union([Type.Literal("run"), Type.Literal("status"), Type.Literal("rollback"), Type.Literal("export"), Type.Literal("bind"),
+					Type.Literal("bootstrap"), Type.Literal("workflow-run"), Type.Literal("workflow-calibrate"),
+					Type.Literal("advance-knowledge"), Type.Literal("transition-dependencies")]),
 				planPath: Type.Optional(Type.String()),
 				packagePath: Type.Optional(Type.String()),
 				versionId: Type.Optional(Type.String()),
 				applicability: Type.Optional(Type.String()),
 				outputPath: Type.Optional(Type.String()),
+				methodsPath: Type.Optional(Type.String({ description: "track=method bootstrap only" })),
+				m04RunId: Type.Optional(Type.String({ description: "track=method knowledge transitions only" })),
+				expectedActiveBundleId: Type.Optional(Type.String({ description: "track=method knowledge transitions only" })),
+				methodVersionId: Type.Optional(Type.String({ description: "track=method transition-dependencies only" })),
+				decisionRef: Type.Optional(Type.Object({ storeId: Type.String(), recordId: Type.String(), version: Type.Number() })),
 				workspace: Type.Optional(Type.String({ description: "Research workspace; defaults to current Pi cwd" })),
 			}),
 			executionMode: "sequential",
 			async execute(_id, params, signal, _update, ctx) {
+				const methodActions = new Set(["bootstrap", "workflow-run", "workflow-calibrate", "advance-knowledge", "transition-dependencies"]);
+				const track = params.track ?? "budget";
+				if (track === "budget" && methodActions.has(params.action))
+					throw new Error(`action ${params.action} belongs to track=method`);
+				if (track === "method") return methodImprove(params, signal, ctx);
+				if (params.methodsPath !== undefined || params.m04RunId !== undefined || params.expectedActiveBundleId !== undefined ||
+					params.methodVersionId !== undefined || params.decisionRef !== undefined)
+					throw new Error("methodsPath, m04RunId, expectedActiveBundleId, methodVersionId and decisionRef require track=method");
 				const bounded = await improvementService(workspaceFrom(params.workspace, ctx.cwd), signal);
 				let value: ImprovementRunResult | ImprovementStatus | ActiveBudgetPointer | unknown;
 				if (params.action === "run") {
@@ -628,89 +715,18 @@ mainAgentWatchdog.unref?.();
 		});
 
 		pi.registerTool({
-			name: "research_method_improve",
-			label: "Research Method Improvement",
-			description: "Explicitly bootstrap, run, inspect, roll back, or manually transfer versioned H/I prompt strategies. Action run is the CPU method-research campaign; workflow-run runs M07 evidence-handoff search; workflow-calibrate executes the same method in two fresh M07/M04 arms. Calibration records observations without proposing or promoting a method.",
-			promptSnippet: "Run an explicitly authorized H/I method study or same-method workflow calibration",
-			promptGuidelines: ["Use caller-supplied method and experiment plans. Preserve file-safety boundaries and scientific acceptance checks; record model usage and estimated fees as observations.", "Development feedback can guide candidates; protected admission results must not return to proposal prompts."],
-			parameters: Type.Object({
-				action: Type.Union([Type.Literal("bootstrap"), Type.Literal("run"), Type.Literal("workflow-run"), Type.Literal("workflow-calibrate"), Type.Literal("status"), Type.Literal("rollback"), Type.Literal("export"), Type.Literal("bind"), Type.Literal("advance-knowledge"), Type.Literal("transition-dependencies")]),
-				workspace: Type.Optional(Type.String()),
-				methodsPath: Type.Optional(Type.String()),
-				planPath: Type.Optional(Type.String()),
-				versionId: Type.Optional(Type.String()),
-				outputPath: Type.Optional(Type.String()),
-				packagePath: Type.Optional(Type.String()),
-				m04RunId: Type.Optional(Type.String()), expectedActiveBundleId: Type.Optional(Type.String()), methodVersionId: Type.Optional(Type.String()),
-				decisionRef: Type.Optional(Type.Object({ storeId: Type.String(), recordId: Type.String(), version: Type.Number() })),
-			}),
-			executionMode: "sequential",
-			async execute(_id, params, signal, _update, ctx) {
-				if (params.action === "workflow-run" || params.action === "workflow-calibrate") {
-					if (!params.planPath) throw new Error(`${params.action} requires planPath`);
-					const research = options.researchImprovementServiceFactory?.(workspaceFrom(params.workspace, ctx.cwd), signal) ?? new ResearchImprovementService({ workspaceRoot: workspaceFrom(params.workspace, ctx.cwd), runner: (await import("../runner/pi.ts")).createPiSessionRunner({ signal }) });
-					const plan = JSON.parse(await readFile(path.resolve(ctx.cwd, params.planPath), "utf8"));
-					if (params.action === "workflow-calibrate") {
-						const run = await research.calibrateWorkflow(plan);
-						return result({ runId: run.runId, status: run.status, stopReason: run.stopReason, baseline: run.baseline, methodVersionId: run.methodVersionId, pairCount: run.pairs.length, partialArmCount: Number(!!run.partialPair?.armA) + Number(!!run.partialPair?.armA2), pairsWithDifferingChecks: run.pairs.filter((pair) => pair.differences.length > 0).length, pairsWithFailedChecks: run.pairs.filter((pair) => [...pair.armA.checkResults, ...pair.armA2.checkResults].some((check) => !check.passed)).length, scientificBenefit: run.scientificBenefit, budget: run.budgetAtEnd });
-					}
-					const run = await research.runWorkflow(plan as WorkflowEvidenceHandoffPlanV1);
-					return result({ runId: run.runId, status: run.status, outcome: run.outcome, stopReason: run.stopReason, selectedCandidateId: run.selectedCandidateId, promotedMethodVersionId: run.promotedMethodVersionId, developmentArmCount: run.developmentArms.length, protectedArmCount: run.protectedArms.length, scientificBenefit: run.scientificBenefit, budget: run.budgetAtEnd });
-				}
-				const { createPiSessionRunner } = await import("../runner/pi.ts");
-				const research = new ResearchImprovementService({ workspaceRoot: workspaceFrom(params.workspace, ctx.cwd), runner: createPiSessionRunner({ signal }) });
-				if (params.action === "bootstrap") {
-					if (!params.methodsPath) throw new Error("bootstrap requires methodsPath");
-					return result(await research.bootstrap(JSON.parse(await readFile(path.resolve(ctx.cwd, params.methodsPath), "utf8")) as ResearchBootstrapInput));
-				}
-				if (params.action === "run") {
-					if (!params.planPath) throw new Error("run requires planPath");
-					return result(publicResearchRun(await research.run(JSON.parse(await readFile(path.resolve(ctx.cwd, params.planPath), "utf8")) as ResearchCampaignPlanV1)));
-				}
-				if (params.action === "status") return result(publicResearchStatus(await research.status()));
-				if (params.action === "advance-knowledge") {
-					if (!params.m04RunId || !params.expectedActiveBundleId) throw new Error("advance-knowledge requires m04RunId and expectedActiveBundleId");
-					const changed = await research.advanceKnowledgeEpoch(params.m04RunId, params.expectedActiveBundleId);
-					return result({ bundleId: changed.bundle.bundleId, active: publicResearchStatus(await research.status()).active, toSnapshot: changed.toSnapshot });
-				}
-				if (params.action === "transition-dependencies") {
-					if (!params.m04RunId || !params.expectedActiveBundleId || !params.methodVersionId || !params.decisionRef) throw new Error("transition-dependencies requires m04RunId, expectedActiveBundleId, methodVersionId and decisionRef");
-					const changed = await research.transitionKnowledgeDependencies(params.m04RunId, params.expectedActiveBundleId, params.methodVersionId, params.decisionRef);
-					return result({ bundleId: changed.bundle.bundleId, newMethodVersionId: changed.newMethodVersionId, active: publicResearchStatus(await research.status()).active });
-				}
-				if (params.action === "rollback") return result(await research.rollback());
-				if (params.action === "export") {
-					if (!params.versionId || !params.outputPath) throw new Error("export requires versionId and outputPath");
-					return result(await research.exportMethod(params.versionId, path.resolve(ctx.cwd, params.outputPath)));
-				}
-				if (!params.packagePath) throw new Error("bind requires packagePath");
-				return result(await research.bindMethod(path.resolve(ctx.cwd, params.packagePath)));
-			},
-		});
-
-		pi.registerTool({
-			name: "research_init",
-			label: "Initialize Research Workspace",
-			description: "Initialize the explicit workspace layout. Does not create research.config.json or choose models.",
-			promptSnippet: "Initialize an explicitly selected research workspace",
-			promptGuidelines: ["Use research_init only when the user asked to initialize the selected research workspace."],
-			parameters: Type.Object({ workspace: Type.String({ description: "Explicit research workspace path" }) }),
-			executionMode: "sequential",
-			async execute(_id, params, _signal, _update, ctx) { return result(await service.init(workspaceFrom(params.workspace, ctx.cwd))); },
-		});
-
-		pi.registerTool({
 			name: "research_stage",
 			label: "Run Research Stage",
-			description: "Run one existing M01–M06, M08, or M09 stage. M03/M06/M08 feedback is transferred to M04 only when processFeedback is explicitly true and its whole batch completed. M09 requires an exact M08/M04 pair and never publishes.",
+			description: "Prepare the workspace layout (stage=init) or run one existing M01–M06, M08, or M09 stage. M03/M06/M08 feedback is transferred to M04 only when processFeedback is explicitly true and its whole batch completed. M09 requires an exact M08/M04 pair and never publishes.",
 			promptSnippet: "Run one isolated research stage with explicit inputs and optional complete feedback transfer",
 			promptGuidelines: [
 				"Use research_stage only after research_status confirms the requested stage inputs exist.",
+				"stage=init only prepares the explicitly selected workspace layout. It does not create research.config.json and does not choose models.",
 				"Treat research_stage completion and returned opinions as artifacts to inspect, not automatic acceptance.",
 				"For M04 judgment of a candidate lesson from an M07 checkpoint, select the lesson and its supporting source and receipts by exact relativePath from that checkpoint manifest, then pass requiredM07ReadPaths so the existing full-return evidence gate applies. A path alone is not a read or an adoption decision.",
 			],
 			parameters: Type.Object({
-				stage: Type.Union([Type.Literal("M01"), Type.Literal("M02"), Type.Literal("M03"), Type.Literal("M04"), Type.Literal("M05"), Type.Literal("M06"), Type.Literal("M08"), Type.Literal("M09")]),
+				stage: Type.Union([Type.Literal("init"), Type.Literal("M01"), Type.Literal("M02"), Type.Literal("M03"), Type.Literal("M04"), Type.Literal("M05"), Type.Literal("M06"), Type.Literal("M08"), Type.Literal("M09")]),
 				workspace: Type.Optional(Type.String({ description: "Research workspace; defaults to current Pi cwd" })),
 				m01RunId: Type.Optional(Type.String()),
 				m02RunId: Type.Optional(Type.String()),
@@ -743,6 +759,7 @@ mainAgentWatchdog.unref?.();
 			}),
 			executionMode: "sequential",
 			async execute(_id, params, signal, onUpdate, ctx) {
+				if (params.stage === "init") return result(await service.init(workspaceFrom(params.workspace, ctx.cwd)));
 				activeUpdate = onUpdate as typeof activeUpdate;
 				try {
 					const value = await service.runStage({ ...params, workspace: workspaceFrom(params.workspace, ctx.cwd), sources: strings(params.sources) } as StageRequest, signal);
