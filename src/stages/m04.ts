@@ -5,8 +5,10 @@
  * session does the substantive judgement. The first round may continue the M01
  * session; later rounds use a fresh research session that only receives the
  * current knowledge pack, the feedback and the artifact locations. One feedback
- * batch is the minimal unit. Proposals are validated structurally and merged
- * through the single serial entry; merging is never a truth certificate.
+ * batch is the minimal unit. Proposals are validated structurally, structured
+ * optimization cards additionally pass the deterministic admission gate, and
+ * everything merges through the single serial entry; merging is never a truth
+ * certificate.
  */
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
