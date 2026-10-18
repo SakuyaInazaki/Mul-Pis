@@ -14,3 +14,7 @@ AGENTS.md still said that M07–M09 run synchronously and implement no detached 
 ## Verification
 
 Both statements were checked against `src/m07/candidate-runner.ts` (background registration, drain, refusal when not enabled) and `src/runner/experiment-arm.ts`. This is a documentation-only change.
+
+## Follow-up after W4 round three
+
+W4 then folded `candidate_sweep` into `candidate_run`, which runs a sweep when the call declares a parameter domain. The AGENTS.md sentence now names only `candidate_run`. No other tracked file outside the notes still uses the retired names `candidate_sweep`, `candidate_list`, `candidate_read` or `candidate_checkout`.
