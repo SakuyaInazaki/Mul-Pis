@@ -22,6 +22,8 @@ import { renderPageTool } from "../tools/pagetool.ts";
 import { HarnessError, type StageRunRecord } from "../types.ts";
 import { writeFileAtomic } from "../workspace.ts";
 import { loadProblemMaterials, relPath, sessionSpec, withRun, type StageContext } from "./context.ts";
+import { assembleInjection } from "../knowledge/injection.ts";
+import { CARD_HEADING, acquisitionDeliverableInstruction } from "./source-knowledge.ts";
 
 export interface M05Options {
 	/** 本轮知识需求 (the placeholder of P05). Defaults to a generic gap-driven goal. */
@@ -409,8 +411,14 @@ export async function runM05(ctx: StageContext, options: M05Options = {}): Promi
 				},
 			];
 
-			const pack = await ctx.store.buildPack({ purpose: `M05 知识获取：${goal.slice(0, 60)}`, includeOpenQuestions: true, types: ["C", "K", "Q", "X"], maxChars: 30_000 });
-			const message = await buildM05Message({ goal, problem: problemBlock(materials), knowledgePack: pack.included.length ? pack.markdown : undefined, indexText: indexBefore, providerNames: backend.providers.map((p) => p.name), toolNames: tools.map((t) => t.name) });
+			// Acquisition needs to know what is already settled and what is missing,
+			// not the whole store: the phase plan bounds it and the deliverable
+			// instruction states the only three product forms that are worth having.
+			const injection = await assembleInjection({ store: ctx.store, phase: "acquisition",
+				purpose: `M05 知识获取：${goal.slice(0, 60)}`, text: `${goal}\n${problemBlock(materials)}`,
+				types: ["C", "K", "Q", "X"], priorRoot: path.join(ctx.ws.knowledgeDir, "prior") });
+			await ctx.ws.writeOutput(record, "knowledge-injection.json", JSON.stringify(injection.receipt, null, 2), "本轮知识注入回执");
+			const message = `${await buildM05Message({ goal, problem: problemBlock(materials), knowledgePack: injection.receipt.injectedRefs.length || injection.receipt.priorFiles.length ? injection.markdown : undefined, indexText: indexBefore, providerNames: backend.providers.map((p) => p.name), toolNames: tools.map((t) => t.name) })}\n\n${acquisitionDeliverableInstruction()}`;
 			await ctx.ws.writeOutput(record, "message.md", message, "发送给获取会话的完整消息");
 			const handle = await openBoundedSession(ctx.runner, record, { mode: "fresh", intent: "new-work", reason: "A new M05 acquisition run receives only its declared research need and explicit project materials", evidence: linkedEvidence(record.inputs), spec: sessionSpec(ctx, "M05", "acquisition", systemPromptFor("acquisition"), { kind: "custom", tools }) }, () => ctx.ws.writeRun(record));
 			let report: string;
@@ -424,7 +432,7 @@ export async function runM05(ctx: StageContext, options: M05Options = {}): Promi
 			}
 			await ctx.ws.writeOutput(record, "acquisition-report.md", report, "获取报告");
 			if (existsSync(toolLogPath)) record.outputs.push({ label: "工具调用记录", path: toolLogPath });
-			for (const header of ["## 已取得并登记", "## 未解决缺口"]) {
+			for (const header of ["## 已取得并登记", "## 未解决缺口", CARD_HEADING]) {
 				if (!report.includes(header)) record.failures.push(`获取报告缺少小节“${header}”，需人工核对报告与检索记录`);
 			}
 			if (!toolLog.length) record.remarks.push("会话没有调用任何工具；报告内容未经检索或抓取，只能视为说明。");

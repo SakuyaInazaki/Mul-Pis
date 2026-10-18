@@ -32,6 +32,7 @@ import { createCandidateEpisodeTool } from "./candidate-episode.ts";
 import { createCandidateExecutionTools, pendingCandidateExecutions, type CandidateExecutionBackend } from "./candidate-runner.ts";
 import { createCandidateArchiveTools } from "./candidate-archive.ts";
 import { createExecutionKnowledgeTools } from "./execution-knowledge.ts";
+import { INJECTION_PLANS } from "../knowledge/injection.ts";
 import { publicFailure } from "./public-failure.ts";
 import { captureMaterial, copySnapshotBounded, createProjectionObservation, omissionLine, projectionMaterial } from "./projection.ts";
 export type { FormalBaseline } from "./formal-baseline.ts";
@@ -1260,7 +1261,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			// This is the task's first reading list. Goal-wide obligations stay in
 			// the task prompt; adding them all to retrieval dilutes the local topic.
 			// Later knowledge_select can search the entire frozen catalogue again.
-			const knowledgeRequest = { purpose: candidateEpisode ? "M07 候选执行" : "M07 任务执行", text: [spec.objective, ...spec.checks].join("\n"), requiredIds: spec.knowledgeIds ?? [], context: spec.knowledgeContext, maxRecords: candidateEpisode ? Number.MAX_SAFE_INTEGER : 24, maxChars: 60_000, excludeExperience: true, ...(candidateEpisode ? { view: "brief" as const } : {}) };
+			const knowledgeRequest = { purpose: candidateEpisode ? "M07 候选执行" : "M07 任务执行", text: [spec.objective, ...spec.checks].join("\n"), requiredIds: spec.knowledgeIds ?? [], context: spec.knowledgeContext, maxRecords: candidateEpisode ? Number.MAX_SAFE_INTEGER : INJECTION_PLANS.bootstrap.maxRecords, maxChars: candidateEpisode ? 60_000 : INJECTION_PLANS.bootstrap.maxChars, excludeExperience: true, ...(candidateEpisode ? { view: "brief" as const } : {}) };
 			const initialRetrieval = await retrieveKnowledge(ctx.store, knowledgeRequest);
 			// A large required dependency/warning closure may be valid yet too large for
 			// the initial brief. Validate the complete index before dispatch, then show
@@ -1337,7 +1338,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 						}
 					} })) : []),
 					...createCandidateArchiveTools({ goal, task, save: () => save(ctx, goal) }),
-					...createExecutionKnowledgeTools({ store: ctx.store, workspaceRoot: ctx.ws.root, expectedSnapshot: goal.knowledgeSnapshot,
+					...createExecutionKnowledgeTools({ store: ctx.store, workspaceRoot: ctx.ws.root, candidateRoot: workDir, expectedSnapshot: goal.knowledgeSnapshot,
 						requiredIds: task.knowledgeIds ?? [], context: task.knowledgeContext, archiveDir: path.join(dir, "knowledge-access"),
 						beforeAccess: () => requireCurrentFormalBaseline(ctx, goal),
 						onAccess: async event => { (task.knowledgeAccess ??= []).push(event); await save(ctx, goal); } })];

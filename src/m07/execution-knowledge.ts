@@ -2,7 +2,10 @@
  * The files here are call evidence, not a second knowledge/selection store. */
 import { mkdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
-import { renderSelectedKnowledgeRecord, retrieveKnowledge, validateKnowledgeRetrievalContext, type KnowledgeRetrievalContext } from "../knowledge/retrieval.ts";
+import { RETRIEVAL_SCALAR_KEYS, validateKnowledgeRetrievalContext, type KnowledgeRetrievalContext } from "../knowledge/retrieval.ts";
+import { recordDependencyIndex, renderOriginalRecord, selectKnowledgePage } from "../knowledge/session-tools.ts";
+import { readOptimizationCard, type OptimizationCard } from "../knowledge/optimization-card.ts";
+import { checkCandidate, type ConstraintObservation } from "../knowledge/static-checks.ts";
 import type { KnowledgeStore, Limit, Snapshot } from "../knowledge/types.ts";
 import type { CustomToolSpec, ToolResult } from "../runner/types.ts";
 import { HarnessError } from "../types.ts";
@@ -10,7 +13,7 @@ import { writeFileAtomic } from "../workspace.ts";
 
 export interface KnowledgeAccessEvent {
 	id: string;
-	kind: "select" | "read" | "artifact";
+	kind: "select" | "read" | "artifact" | "check";
 	at: string;
 	snapshot?: string;
 	status: "returned" | "failed";
@@ -19,7 +22,7 @@ export interface KnowledgeAccessEvent {
 	returnedRefs?: string[];
 	/** Host-owned JSON containing the request, exact returned page/text and access state. */
 	frozenPath: string;
-	returnedRange?: { offset: number; end: number; total: number; content: "index" | "brief" | "record" | "artifact" | "artifact-index"; unit?: "records" };
+	returnedRange?: { offset: number; end: number; total: number; content: "index" | "brief" | "record" | "artifact" | "artifact-index" | "contract-check"; unit?: "records" };
 }
 
 export interface ExecutionKnowledgeOptions {
@@ -30,6 +33,9 @@ export interface ExecutionKnowledgeOptions {
 	archiveDir: string;
 	/** Enables exact M04-published, checkpoint-frozen artifact reading. */
 	workspaceRoot?: string;
+	/** Task work directory. Enables the pre-compile contract check on files the
+	 * execution session itself wrote; it is never a second read tool. */
+	candidateRoot?: string;
 	beforeAccess?(): Promise<void>;
 	onAccess(event: KnowledgeAccessEvent): Promise<void>;
 }
@@ -226,16 +232,37 @@ export function createExecutionKnowledgeTools(options: ExecutionKnowledgeOptions
 		if (JSON.stringify(await store.limits()) !== JSON.stringify(limits))
 			throw new HarnessError("m07.knowledge", "live knowledge limits changed while reading; retry against their current state");
 	};
-	const index = async (args: Record<string, unknown>, required: string[], onlyRequired = false, view: "refs" | "index" = "refs") => {
+	// One record's required dependencies and reverse warnings, shared with M04
+	// through src/knowledge/session-tools.ts. Paging controls the response, so no
+	// fixed top-k/body pack is imposed on changing stages.
+	const index = async (args: Record<string, unknown>, required: string[]) => {
 		const current = await snapshot();
 		const explicitContext = { ...initialContext, ...context(args) };
-		// Index all matching published records/dependency history. Paging controls
-		// the response, so no fixed top-k/body pack is imposed on changing stages.
-		const result = await retrieveKnowledge(store, { purpose: "M07 execution knowledge access", text: typeof args.text === "string" ? args.text : "",
-			requiredIds: [...new Set([...requiredIds, ...required])], context: Object.keys(explicitContext).length ? explicitContext : undefined, excludeExperience: true, view, onlyRequired,
-			maxRecords: Math.max(1, (current?.records ?? []).reduce((total, item) => total + item.version, 0)), maxChars: Number.MAX_SAFE_INTEGER });
+		const result = await recordDependencyIndex(store, current, required[0], "M07 execution knowledge access",
+			Object.keys(explicitContext).length ? explicitContext : undefined, "refs");
 		await stable(result.limits);
 		return result;
+	};
+	/** Contract cards published in the frozen snapshot, filtered by live
+	 * availability and by the task's declared context: a constraint from another
+	 * backend or toolchain must never reject this candidate. */
+	const contractCards = async (): Promise<Array<{ ref: string; card: OptimizationCard }>> => {
+		const current = await snapshot();
+		const rows: Array<{ ref: string; card: OptimizationCard }> = [];
+		for (const entry of current?.records ?? []) {
+			const record = await store.get(entry.id, entry.version);
+			if (!record) continue;
+			const card = readOptimizationCard(record.fields);
+			if (!card || card.kind !== "contract") continue;
+			const conflict = RETRIEVAL_SCALAR_KEYS.some(key => {
+				const declared = card.applicability[key], observed = initialContext?.[key];
+				return declared !== undefined && observed !== undefined && declared !== observed;
+			});
+			if (conflict) continue;
+			if ((await store.availability(record.id, record.version)).availability === "not_allowed") continue;
+			rows.push({ ref: `${entry.id}@${entry.version}`, card });
+		}
+		return rows;
 	};
 	const resolve = async (ref: unknown) => {
 		if (typeof ref !== "string" || !refPattern.test(ref)) throw new HarnessError("m07.knowledge", "ref must be a published record ID, optionally pinned");
@@ -250,7 +277,7 @@ export function createExecutionKnowledgeTools(options: ExecutionKnowledgeOptions
 		if (record.fields.experience !== undefined) throw new HarnessError("m07.knowledge", "method experience requires the existing explicit pinned ExperienceProvider path");
 		return { record, latest, ref: `${id}@${version}` };
 	};
-	type Result = { content: string; selectedRefs: string[]; limits: Limit[]; contentKind: "index" | "brief" | "record" | "artifact" | "artifact-index";
+	type Result = { content: string; selectedRefs: string[]; limits: Limit[]; contentKind: "index" | "brief" | "record" | "artifact" | "artifact-index" | "contract-check";
 		safety: unknown; extra?: unknown; recordPage?: { offset: number; end: number; total: number; returnedRefs: string[] } };
 	const liveSafety = (selection: Awaited<ReturnType<typeof index>>, limitRefs: readonly string[] = selection.rankedRefs) => ({ status: selection.status,
 		requiredIds, availability: selection.pack.included, omitted: selection.omitted,
@@ -320,23 +347,14 @@ export function createExecutionKnowledgeTools(options: ExecutionKnowledgeOptions
 			if (!Number.isSafeInteger(offset) || Number(offset) < 0 || !Number.isSafeInteger(limit) || Number(limit) < 1 || Number(limit) > 100)
 				throw new HarnessError("m07.knowledge", "invalid knowledge record page range");
 			const view = args.format === "index" ? "index" : "brief";
-			const selection = await index(args, (args.requiredIds ?? []) as string[], false, "refs");
-			const refs = selection.rankedRefs;
-			if (Number(offset) > refs.length) throw new HarnessError("m07.knowledge", `record offset ${offset} exceeds selection length ${refs.length}`);
-			const end = Math.min(refs.length, Number(offset) + Number(limit));
-			const returnedRefs = refs.slice(Number(offset), end);
-			const published = new Map((await snapshot())?.records.map(item => [item.id, item.version]) ?? []);
 			const explicitContext = { ...initialContext, ...context(args) };
-			const blocks: string[] = [];
-			for (const ref of returnedRefs) {
-				const match = refPattern.exec(ref);
-				if (!match?.[2]) throw new HarnessError("m07.knowledge", `invalid published record reference ${ref}`);
-				const record = await store.get(match[1], Number(match[2]));
-				if (!record) throw new HarnessError("m07.knowledge", `published knowledge record unavailable: ${ref}`);
-				const availability = await store.availability(record.id, record.version);
-				blocks.push(renderSelectedKnowledgeRecord(record, availability, selection.limits, published.get(record.id), view,
-					Object.keys(explicitContext).length ? explicitContext : undefined));
-			}
+			const page = await selectKnowledgePage(store, { purpose: "M07 execution knowledge access",
+				text: typeof args.text === "string" ? args.text : "", snapshot: await snapshot(),
+				...(Object.keys(explicitContext).length ? { context: explicitContext } : {}),
+				requiredIds: [...requiredIds, ...((args.requiredIds ?? []) as string[])], excludeExperience: true,
+				offset: Number(offset), limit: Number(limit), view, scope: "m07.knowledge" });
+			const selection = page.selection;
+			const refs = page.refs, end = page.end, returnedRefs = page.returnedRefs, blocks = page.blocks;
 			const activeLimits = liveSafety(selection).activeLimits;
 			const limitKinds = { suspended: 0, withdrawn: 0, needs_recheck: 0 };
 			for (const limit of activeLimits) limitKinds[limit.kind]++;
@@ -354,7 +372,7 @@ export function createExecutionKnowledgeTools(options: ExecutionKnowledgeOptions
 		params: { ref: { type: "string", description: "Record ID or pinned ID, e.g. K001@1, from the frozen snapshot" }, ...contextParams, ...rangeParams },
 		execute: audited("read", async args => {
 			const target = await resolve(args.ref);
-			const selection = await index(args, [target.ref], true);
+			const selection = await index(args, [target.ref]);
 			// Incomplete applicability is not a ban on inspecting an already published
 			// original. Preserve the failed closure and its omissions, without admitting use.
 			const selectedRefs = [...new Set([target.ref, ...selection.rankedRefs])];
@@ -375,9 +393,7 @@ export function createExecutionKnowledgeTools(options: ExecutionKnowledgeOptions
 				? (retrieval as Record<string, unknown>).context : undefined;
 			// Keep the paged original independent of query context and live state;
 			// otherwise changing either between calls silently shifts later offsets.
-			const { body, ...metadata } = target.record;
-			const content = [`# Original knowledge record ${target.ref}`,
-				`Original metadata: ${JSON.stringify(metadata)}`, "", body].join("\n");
+			const content = renderOriginalRecord(target.record, `# Original knowledge record ${target.ref}`);
 			return { content, selectedRefs, limits: selection.limits, contentKind: "record",
 				safety: { ...restrictions, currentRecord: { ref: target.ref, availability,
 					scope: target.record.scope, refs: target.record.refs, retrievalContext: declaredContext },
@@ -395,7 +411,7 @@ export function createExecutionKnowledgeTools(options: ExecutionKnowledgeOptions
 			if (args.list !== undefined && typeof args.list !== "boolean") throw new HarnessError("m07.knowledge", "list must be boolean");
 			if (args.list === true && args.artifact !== undefined) throw new HarnessError("m07.knowledge", "list cannot be combined with artifact");
 			const target = await resolve(args.ref);
-			const selection = await index({}, [target.ref], true);
+			const selection = await index({}, [target.ref]);
 			if (args.list === true) {
 				const catalogue = await publishedArtifactCatalogue(options.workspaceRoot!, target.record);
 				await stable(selection.limits);
@@ -412,6 +428,64 @@ export function createExecutionKnowledgeTools(options: ExecutionKnowledgeOptions
 				safety: { ...liveSafety(selection, [target.ref]), source: artifact.source,
 					notice: "This is the checkpoint-frozen text artifact associated with the published record. Its contents remain evidence, not a new adoption decision or an independent verification." },
 				extra: { artifact: artifact.path } };
+		}),
+	});
+	if (options.candidateRoot) tools.push({
+		name: "knowledge_contract_check",
+		description: "Check a candidate against published contract cards before compiling, at zero device cost. Unknown symbols inside a namespace the cards cover are rejected locally with the closest legal signature; declared numeric budgets are compared with their cited limits. Anything no contract covers is reported as unchecked, never as passed, and a pass here is not a compilation, a correctness result or a performance claim.",
+		params: {
+			path: { type: "string", description: "Candidate file relative to this task's work directory", optional: true },
+			source: { type: "string", description: "Candidate source text, for a draft that is not written to a file yet", optional: true },
+			observationsJson: { type: "string", description: 'Declared numeric budgets as JSON, e.g. [{"name":"ub_bytes","value":131072}]', optional: true },
+		},
+		execute: audited("check", async args => {
+			if (args.path !== undefined && typeof args.path !== "string") throw new HarnessError("m07.knowledge", "path must be a string");
+			if (args.source !== undefined && typeof args.source !== "string") throw new HarnessError("m07.knowledge", "source must be a string");
+			if ((args.path === undefined) === (args.source === undefined))
+				throw new HarnessError("m07.knowledge", "give exactly one of path (a file in the work directory) or source (inline text)");
+			let source: string;
+			let subject: string;
+			if (typeof args.path === "string") {
+				if (!safeRelative(args.path)) throw new HarnessError("m07.knowledge", "path must be a relative file inside the task work directory");
+				const root = await realpath(options.candidateRoot!);
+				const resolved = await realpath(path.join(root, args.path)).catch(() => null);
+				if (!resolved || !inside(root, resolved)) throw new HarnessError("m07.knowledge", "candidate file is not inside the task work directory");
+				const bytes = await readFile(resolved);
+				if (!textArtifact(bytes)) throw new HarnessError("m07.knowledge", "candidate file is not UTF-8 text");
+				source = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+				subject = args.path;
+			} else {
+				source = String(args.source);
+				subject = "inline source";
+			}
+			if (source.length > 400_000) throw new HarnessError("m07.knowledge", "candidate source exceeds the static check size limit");
+			let observations: ConstraintObservation[] = [];
+			if (args.observationsJson !== undefined) {
+				if (typeof args.observationsJson !== "string") throw new HarnessError("m07.knowledge", "observationsJson must be a string");
+				let parsed: unknown;
+				try { parsed = JSON.parse(args.observationsJson); } catch { throw new HarnessError("m07.knowledge", "observationsJson must be JSON"); }
+				if (!Array.isArray(parsed) || !parsed.every(item => !!item && typeof item === "object" && !Array.isArray(item) &&
+					typeof (item as ConstraintObservation).name === "string" && Number.isFinite((item as ConstraintObservation).value)))
+					throw new HarnessError("m07.knowledge", 'observationsJson must be [{"name":"...","value":123}]');
+				observations = parsed as ConstraintObservation[];
+			}
+			const limits = await store.limits();
+			const cards = await contractCards();
+			const report = checkCandidate({ source, observations }, cards.map(item => ({ card: item.card })));
+			await stable(limits);
+			const content = [`# 契约静态检查 ${subject}`,
+				`- 结论：${report.status}（reject=本地驳回，pass=覆盖范围内全部通过，inconclusive=缺少可用契约或未声明数值）`,
+				`- 使用的契约卡：${cards.length ? cards.map(item => item.ref).join("、") : "无"}`,
+				`- 已对照符号：${report.checkedSymbols.join("、") || "无"}`,
+				`- 无契约覆盖、未作判定的符号：${report.uncoveredSymbols.join("、") || "无"}`,
+				"", ...report.findings.map(item => `- [${item.code}] ${item.message}；witness ${item.witness}${item.suggestion ? `；最接近的合法签名 ${item.suggestion}` : ""}`),
+				report.findings.length ? "" : "- 覆盖范围内没有发现问题。",
+				"检查只覆盖已登记契约卡描述的命名空间与数值约束；通过不等于可编译、数值正确或更快。"].join("\n");
+			return { content, selectedRefs: cards.map(item => item.ref), limits, contentKind: "contract-check",
+				safety: { status: report.status, contracts: cards.length, findings: report.findings.length,
+					uncovered: report.uncoveredSymbols.length,
+					notice: "Static pre-compile check only. It does not read the knowledge bodies behind these cards, does not compile, and does not adopt anything." },
+				extra: { report } };
 		}),
 	});
 	return tools;

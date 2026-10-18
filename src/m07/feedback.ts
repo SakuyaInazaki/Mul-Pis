@@ -17,6 +17,7 @@ const knowledgeContentLabel = {
 	record: "记录正文",
 	"artifact-index": "同源任务原件目录（不含原件正文）",
 	artifact: "同源任务原件",
+	"contract-check": "契约静态检查结果（不含知识正文）",
 } as const;
 
 function knowledgeAccessLine(access: NonNullable<CurrentGoal["tasks"][number]["knowledgeAccess"]>[number], displayPath: (file: string) => string): string {
