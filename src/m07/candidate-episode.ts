@@ -8,6 +8,7 @@ import { candidateObservation, type CandidateVerifier, type FrozenCandidateFile 
 import { availableCandidateByRef, candidateArchive, candidateSearchSnapshot, candidateSubjectId, globalCandidateBest, identicalSourceRefs } from "./candidate-archive.ts";
 import { candidateSearchBrief, candidateSearchFocus } from "./candidate-search.ts";
 import { compareCandidateObservations, projectCandidateFeedback, summarizeCandidateDiagnostics } from "./candidate-diagnostics.ts";
+import { decideCandidate } from "./candidate-policy.ts";
 import { isSafeRelativeOutputPath } from "./expected-output.ts";
 import type { CandidateObservationV1, CurrentGoal, M07TaskRecord } from "./types.ts";
 
@@ -128,11 +129,13 @@ export function createCandidateEpisodeTool(input: {
 			{ parentSubjectId, candidateSubjectId: task.subjectId }) : undefined;
 		const diagnosticSummary = summarizeCandidateDiagnostics(observation, parentComparison, parentObservation);
 		const observationPath = path.join(root, "observation.json");
-		const observationText = `${JSON.stringify({ version: 1, id, parentCandidateId, parentRef,
+		const observationFacts = { version: 1, id, parentCandidateId, parentRef,
 			identicalSourceRefs: identicalRefs, sourceRepetition, sourcePaths, receiptPaths, hypothesis: args.hypothesis,
 			conditions: args.conditions, changeSummary: args.changeSummary, changeKind: args.changeKind,
-			intent: args.intent, parentComparison, diagnosticSummary, observation }, null, 2)}\n`;
-		await writeFileAtomic(observationPath, observationText);
+			intent: args.intent, parentComparison, diagnosticSummary, observation };
+		// The frozen record must exist before the archive snapshot reads it, so the
+		// new candidate takes part in byte grouping exactly as every earlier one.
+		await writeFileAtomic(observationPath, `${JSON.stringify(observationFacts, null, 2)}\n`);
 		episode.candidates.push({ id, ...(parentCandidateId ? { parentCandidateId } : {}),
 			...(parentRef ? { parentRef } : {}), ...(identicalRefs.length ? { identicalSourceRefs: identicalRefs } : {}),
 			...(sourceRepetition ? { sourceRepetition } : {}),
@@ -143,11 +146,20 @@ export function createCandidateEpisodeTool(input: {
 			changeKind: args.changeKind as "repair" | "structure" | "parameters", intent: args.intent as "solution" | "diagnostic", observation, observationPath });
 		episode.currentCandidateId = id;
 		const searchSnapshot = await candidateSearchSnapshot(goal, task.taskId);
+		const record = episode.candidates.at(-1)!;
+		// The judgement compares this observation with the goal's earlier readable
+		// candidates only; the new row itself is never its own incumbent or seed.
+		const decision = decideCandidate({ observation, diagnostics: diagnosticSummary,
+			changeKind: record.changeKind, intent: record.intent, subjectId: currentSubjectId,
+			history: searchSnapshot.available.filter(entry => entry.ref !== `${task.taskId}/${id}`) });
+		record.policy = decision;
 		// Derive the local display from the same readable, subject-isolated evidence as
 		// candidate_list. Historical candidates remain intact even if a file is missing.
 		episode.incumbents = globalCandidateBest(searchSnapshot.available.filter(entry => entry.taskId === task.taskId))
 			.map(best => ({ candidateId: best.candidateRef.slice(task.taskId.length + 1), metric: best.metric,
 				...(best.subjectId ? { subjectId: best.subjectId } : {}) }));
+		const observationText = `${JSON.stringify({ ...observationFacts, decision }, null, 2)}\n`;
+		await writeFileAtomic(observationPath, observationText);
 		await input.save();
 		const searchBrief = candidateSearchBrief(searchSnapshot.facts, searchSnapshot.available,
 			candidateSearchFocus(searchSnapshot.available, task.subjectId));
@@ -175,6 +187,13 @@ export function createCandidateEpisodeTool(input: {
 				read: { tool: "candidate_read", args: { candidateRef: `${task.taskId}/${id}`, kind: "observation", offset: 0, limit: 6000 } },
 				message: "Case rows retain measurements within display space and prioritize failed/unknown cases. Parent case deltas show negative/unknown cases and regressions first. Diagnostic indexes show a first entry per category before others within display space. Counts include omitted entries. JSON paths refer to the full frozen observation; diagnostic fieldPath refers to its original receipt (candidate_read kind:receipt, fileIndex:receiptIndex). Use returned nextOffset to continue file reads. A preview/index is not full reading or causal interpretation; all original facts and parent comparisons are retained." },
 			currentCandidateId: episode.currentCandidateId, incumbents: episode.incumbents,
+			decision: { guard: decision.guard, lane: decision.lane, phase: decision.phase,
+				score: decision.score, tier: decision.tier, updatesBest: decision.updatesBest,
+				seedRef: decision.seedRef ?? null, seedSpeedup: decision.seedSpeedup ?? null,
+				incumbentComparison: decision.incumbentComparison.slice(0, 4),
+				omittedIncumbentComparisons: Math.max(0, decision.incumbentComparison.length - 4),
+				requiredFix: decision.requiredFix, advisory: decision.advisory, reasons: decision.reasons,
+				message: "The guard state, score and best-so-far pointer are deterministic host decisions over the frozen observations; they are not negotiable and do not need a model verdict. keep advances the best; accept keeps a correct working point without advancing it; revert means continue from the named verified candidate instead of this source; reject means the result could not be bound or judged at all. The score is a bounded ranking signal over this goal's candidates, not a goal acceptance." },
 			message: observation.sourceBinding === "unknown" || observation.correctness === "unknown"
 				? "Existing result is unknown. Inspect or reconcile its original operation and receipt before considering any new side effect; do not infer that resubmission is safe."
 				: "This records an existing evaluation only. Parent, conditions and change summary are model declarations, not host-proven causality. Equal source bytes are planning facts, not a rejection. A negative finding can guide repair, but does not satisfy the original goal; exploration parent and verified incumbent remain separate." }) };

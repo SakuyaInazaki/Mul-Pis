@@ -6,6 +6,7 @@ import type { ExperienceRequirementV1, M07WorkflowStrategyV1 } from "../improvem
 import type { RunDescriptorV1 } from "../runtime/run-descriptor.ts";
 import type { KnowledgeRetrievalContext } from "../knowledge/retrieval.ts";
 import type { CandidateComparisonV1, CandidatePerformanceEvidenceV1 } from "./candidate-diagnostics.ts";
+import type { CandidatePolicyDecisionV1 } from "./candidate-policy.ts";
 import type { KnowledgeAccessEvent } from "./execution-knowledge.ts";
 
 export type M07TaskMode = "execute" | "check" | "reason";
@@ -156,6 +157,8 @@ export interface M07EpisodeCandidateV1 {
 	intent: "solution" | "diagnostic";
 	observation: CandidateObservationV1;
 	observationPath: string;
+	/** Deterministic host judgement of this observation; never a model claim. */
+	policy?: CandidatePolicyDecisionV1;
 }
 
 export interface M07CandidateEpisodeV1 {

@@ -269,6 +269,14 @@ test("a slower correct exploration parent can lead to a faster child without reg
 	assert.equal(task.episode?.currentCandidateId, "C006");
 	assert.equal(task.episode?.candidates[1].parentCandidateId, "C001");
 	assert.equal(task.episode?.candidates.length, 6, "foreign observation remains in the original history");
+	assert.deepEqual(task.episode?.candidates.map(item => item.policy?.guard),
+		["keep", "keep", "revert", "accept", "accept", "keep"],
+		"the host decides every candidate's guard state deterministically");
+	assert.deepEqual(task.episode?.candidates.map(item => item.policy?.phase),
+		["bootstrap", "tuning", "tuning", "tuning", "bootstrap", "tuning"],
+		"bootstrap ends per subject, so the foreign subject starts its own");
+	assert.equal(task.episode?.candidates[2].policy?.requiredFix.length, 1,
+		"a regression names exactly one must-fix item");
 	assert.deepEqual(task.episode?.incumbents.map(item => [item.subjectId, item.metric.basisId, item.candidateId]),
 		[["operator", "A", "C006"], ["operator", "B", "C004"]]);
 	const reviewed = await harness.controller.review(harness.goal.runId, { taskId: task.taskId, artifacts: [task.reportPath!], checks: [{ criterion: "candidate history recorded", result: "passed", evidence: [task.reportPath!] }] });
