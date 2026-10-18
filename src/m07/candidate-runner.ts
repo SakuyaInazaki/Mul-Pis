@@ -5,6 +5,7 @@ import type { CustomToolSpec, ToolResult } from "../runner/types.ts";
 import { HarnessError } from "../types.ts";
 import { writeFileAtomic } from "../workspace.ts";
 import { isSafeRelativeOutputPath } from "./expected-output.ts";
+import { createEvaluationQueue, type EvaluationQueue } from "./evaluation-queue.ts";
 import { openSearchEventLog, type SearchEventInput } from "./search-state/index.ts";
 
 export type CandidateExecutionCheck = "contract" | "compile" | "correctness" | "measurement";
@@ -75,6 +76,13 @@ export interface CandidateExecutionToolOptions {
 	 * the controller reasoning about an operation nobody is waiting for.
 	 */
 	backgroundRuns?: { register(drain: () => Promise<void>): void; max?: number };
+	/**
+	 * Host evaluation pool. Generation happens in the model session; this is the
+	 * other side of that boundary. Concurrency above one means two candidates may
+	 * touch the device at once, which is a measurement-fidelity decision for the
+	 * host, not a default.
+	 */
+	evaluationPool?: { concurrency?: number; capacity?: number };
 	evaluate(args: Record<string, unknown>): Promise<ToolResult>;
 }
 type Request = {
@@ -154,7 +162,7 @@ export interface PendingCandidateExecution {
 	externalId?: string;
 	stageId?: string;
 	queryAvailable: boolean;
-	resume: { tool: "candidate_run" | "candidate_sweep"; runId: string; resume: true };
+	resume: { tool: "candidate_run"; runId: string; resume: true };
 }
 /** Read only known journal slots; never parse model source files named journal.json. */
 export async function pendingCandidateExecutions(input: {
@@ -183,7 +191,7 @@ export async function pendingCandidateExecutions(input: {
 		const journal = await readJson<Journal | SweepJournal>(file);
 		if (journal?.kind === "candidate") await inspect(file, { tool: "candidate_run", runId: entry.name, resume: true });
 		else if (journal?.kind === "sweep") for (const child of await directories(path.join(root, "runs")))
-			await inspect(path.join(root, "runs", child.name, "journal.json"), { tool: "candidate_sweep", runId: entry.name, resume: true });
+			await inspect(path.join(root, "runs", child.name, "journal.json"), { tool: "candidate_run", runId: entry.name, resume: true });
 	}
 	return pending;
 }
@@ -226,11 +234,11 @@ export function createCandidateExecutionTools(options: CandidateExecutionToolOpt
 		try { await events.append({ ...event, runId: options.goalRunId, taskId: options.taskId }); }
 		catch (error) { eventLogError = (error as Error).message; }
 	};
-	let tail: Promise<void> = Promise.resolve();
+	const pool: EvaluationQueue = createEvaluationQueue({
+		...(options.evaluationPool?.concurrency !== undefined ? { concurrency: options.evaluationPool.concurrency } : {}),
+		...(options.evaluationPool?.capacity !== undefined ? { capacity: options.evaluationPool.capacity } : {}) });
 	const serial = (run: (args: Record<string, unknown>, signal?: AbortSignal) => Promise<ToolResult>) =>
-		(args: Record<string, unknown>, signal?: AbortSignal) => {
-			const next = tail.then(() => run(args, signal)); tail = next.then(() => undefined, () => undefined); return next;
-		};
+		(args: Record<string, unknown>, signal?: AbortSignal) => pool.submit(() => run(args, signal));
 	async function roots() {
 		const work = await realpath(options.workDir);
 		await mkdir(options.journalDir, { recursive: true });
@@ -400,8 +408,8 @@ export function createCandidateExecutionTools(options: CandidateExecutionToolOpt
 	}
 	async function sweep(args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult> {
 		const readArchive = [
-			{ tool: "candidate_list", args: { section: "global-best" } },
-			{ tool: "candidate_list", args: { section: "search-leads" } },
+			{ tool: "candidate_archive", args: { action: "list", section: "global-best" } },
+			{ tool: "candidate_archive", args: { action: "list", section: "search-leads" } },
 		];
 		const resultOffset = args.resultOffset ?? 0, resultLimit = args.resultLimit ?? 10;
 		if (!Number.isSafeInteger(resultOffset) || Number(resultOffset) < 0 ||
@@ -453,7 +461,7 @@ export function createCandidateExecutionTools(options: CandidateExecutionToolOpt
 					...(stage ? { lastStage: { id: stage.stage.id, status: stage.status,
 						performedChecks: stage.result?.performedChecks, summary: stage.result?.summary,
 						error: stage.error } } : {}),
-					...(candidateRef ? { candidateRef, readCandidate: { tool: "candidate_read", args: { candidateRef } } } : {}),
+					...(candidateRef ? { candidateRef, readCandidate: { tool: "candidate_archive", args: { action: "read", candidateRef } } } : {}),
 					...(observation ? { sourceBinding: observation.sourceBinding, correctness: observation.correctness,
 						metricCount: Array.isArray(observation.metrics) ? observation.metrics.length : undefined } : {}),
 					...(child.evaluationError ? { evaluationError: child.evaluationError } : {}) });
@@ -525,7 +533,7 @@ export function createCandidateExecutionTools(options: CandidateExecutionToolOpt
 		return { text: JSON.stringify({ runId, total: manifest.total, completed: manifest.nextIndex, journalPath: file,
 			status: manifest.nextIndex === manifest.total ? "completed" : "incomplete", last: last?.text,
 			resultsPage: await resultsPage(manifest), readArchive,
-			message: "last is the most recently executed combination, not the best result. resultsPage links each recorded parameter vector to its candidateRef when evaluation produced one; candidate_read can inspect that exact frozen candidate. Page older combinations with resultOffset/resultLimit and omit resume for a read-only view. Use readArchive to inspect verified bests by subject/basis and case-local leads. All declared combinations remain recorded; no performance pruning or goal-wide budget. Resume this runId to query any unresolved original ID and continue unstarted combinations. Stages without verifiable evaluation receipts remain execution evidence only." }) };
+			message: "last is the most recently executed combination, not the best result. resultsPage links each recorded parameter vector to its candidateRef when evaluation produced one; candidate_archive action=read can inspect that exact frozen candidate. Page older combinations with resultOffset/resultLimit and omit resume for a read-only view. Use readArchive to inspect verified bests by subject/basis and case-local leads. All declared combinations remain recorded; no performance pruning or goal-wide budget. Resume this runId to query any unresolved original ID and continue unstarted combinations. Stages without verifiable evaluation receipts remain execution evidence only." }) };
 	}
 	type BackgroundJob = { runId: string; tool: string; startedAt: string; promise: Promise<ToolResult>;
 		/** Resolves only after the outcome has also been recorded. */
@@ -538,6 +546,7 @@ export function createCandidateExecutionTools(options: CandidateExecutionToolOpt
 		// Settled or rejected, every background run is awaited: a prompt must not end
 		// while the host is still producing side effects nobody is waiting for.
 		while (outstanding().length) await Promise.allSettled(outstanding().map(job => job.completion));
+		await pool.drain();
 	};
 	options.backgroundRuns?.register(drain);
 	const jobView = (job: BackgroundJob) => ({ runId: job.runId, tool: job.tool, startedAt: job.startedAt,
@@ -550,6 +559,9 @@ export function createCandidateExecutionTools(options: CandidateExecutionToolOpt
 		const existing = jobs.get(runId);
 		if (existing && !existing.settled) fail(`background run ${runId} is still running; collect it before submitting it again`);
 		if (outstanding().length >= maxBackground) fail(`at most ${maxBackground} background runs may be outstanding; collect one first`);
+		// Backpressure belongs on the submission, not on the collection: a caller that
+		// learns the queue is full can go on with something else.
+		pool.assertCapacity();
 		const promise = serial(run)({ ...args, background: undefined, collect: undefined }, signal);
 		const completion = promise.then(
 			result => { job.settled = { at: new Date().toISOString(), result }; },
@@ -561,18 +573,20 @@ export function createCandidateExecutionTools(options: CandidateExecutionToolOpt
 		jobs.set(runId, job);
 		void record({ kind: "background-queued", candidate: { id: runId,
 			...(options.subjectId ? { subjectId: options.subjectId } : {}), status: "queued" },
-			detail: { tool, outstanding: outstanding().length } });
+			detail: { tool, outstanding: outstanding().length, queued: pool.stats().queued, running: pool.stats().running } });
 		// Settled jobs are kept so a later collect is idempotent; the oldest are pruned.
 		for (const [key, value] of [...jobs.entries()].slice(0, Math.max(0, jobs.size - 32)))
 			if (value.settled) jobs.delete(key);
 		return { text: JSON.stringify({ runId, state: "running", outstanding: outstanding().length,
+			evaluationPool: pool.stats(),
 			collect: { tool, args: { runId, collect: true } },
 			message: "The host is executing this run. Keep working on other candidates, then collect this runId. Nothing is resubmitted by collecting." }) };
 	};
 	const collectBackground = async (args: Record<string, unknown>, signal: AbortSignal | undefined,
 		run: (args: Record<string, unknown>, signal?: AbortSignal) => Promise<ToolResult>): Promise<ToolResult> => {
 		if (args.runId === undefined)
-			return { text: JSON.stringify({ jobs: [...jobs.values()].map(jobView), outstanding: outstanding().length }) };
+			return { text: JSON.stringify({ jobs: [...jobs.values()].map(jobView), outstanding: outstanding().length,
+				evaluationPool: pool.stats() }) };
 		const runId = identity(args.runId);
 		const job = jobs.get(runId);
 		// Without a live job this is an ordinary read of the durable journal, which is
@@ -612,9 +626,27 @@ export function createCandidateExecutionTools(options: CandidateExecutionToolOpt
 		background: { type: "boolean", optional: true, description: "Submit and return immediately; the host keeps executing while you work on another candidate. Collect the same runId later." },
 		collect: { type: "boolean", optional: true, description: "Report a background run submitted in this session, returning its result once finished; omit runId to list background runs. Collecting never resubmits." },
 	};
-	return [{ name: "candidate_run", description: "Execute the host-bound backend against frozen source bytes with durable stage intent, then call existing candidate_evaluate. Unknown external operations require original-ID query; no automatic retry." + backendHelp, params: common, execute: withBackground("candidate_run", runOne) },
-		{ name: "candidate_sweep", description: "Materialize and evaluate every combination of explicitly declared finite numeric template parameters through the same host backend, without a model call for each number. An existing runId without resume reads paged parameter-to-candidate results without execution. No fixed search width or score pruning." + backendHelp, params: { ...common,
-			domainsJson: { type: "string", optional: true, description: "New sweep: JSON object mapping placeholder names to explicit finite numeric arrays" },
-			resultOffset: { type: "number", optional: true, description: "Read-only result page offset in newest-first order, default 0" },
-			resultLimit: { type: "number", optional: true, description: "Result page length, default 10, at most 100; this does not limit the sweep" } }, execute: withBackground("candidate_sweep", sweep) }];
+	/**
+	 * One execution tool. A run with declared finite numeric domains is a sweep of
+	 * that one declared space, executed by the host without a model call per
+	 * number; everything else is one candidate. The route is decided by the
+	 * durable journal, so resuming never has to be told which kind it was.
+	 */
+	async function runOrSweep(args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult> {
+		const runId = identity(args.runId);
+		const { journals } = await roots();
+		const existing = await readJson<Journal | SweepJournal>(path.join(journals, runId, "journal.json"));
+		if (existing?.kind === "sweep" || (!existing && args.domainsJson !== undefined)) return sweep(args, signal);
+		if (args.domainsJson !== undefined) fail("runId is already a single candidate run; use a new runId for a parameter sweep");
+		if (args.resultOffset !== undefined || args.resultLimit !== undefined)
+			fail("resultOffset/resultLimit page a parameter sweep's results; this runId is a single candidate run");
+		return runOne(args, signal);
+	}
+	return [{ name: "candidate_run",
+		description: "Execute the host-bound backend against frozen source bytes with durable stage intent, then call existing candidate_evaluate. Declaring domainsJson makes this one run a sweep: the host materializes and evaluates every combination of the declared finite numeric template parameters, with {{PARAMETER}} placeholders in the sources and no model call per number; an existing sweep runId without resume reads its paged parameter-to-candidate results without executing. Unknown external operations require original-ID query; no automatic retry, no fixed search width and no score pruning." + backendHelp,
+		params: { ...common,
+			domainsJson: { type: "string", optional: true, description: "New sweep: JSON object mapping {{PARAMETER}} placeholder names to explicit finite numeric arrays" },
+			resultOffset: { type: "number", optional: true, description: "Sweep only: read-only result page offset in newest-first order, default 0" },
+			resultLimit: { type: "number", optional: true, description: "Sweep only: result page length, default 10, at most 100; this does not limit the sweep" } },
+		execute: withBackground("candidate_run", runOrSweep) }];
 }

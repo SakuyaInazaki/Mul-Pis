@@ -35,11 +35,11 @@ export interface ToolUsageSummaryV1 {
 const MUTATING = new Set(["write", "edit", "multi_edit", "apply_patch"]);
 /** Host tools that actually run or verify a candidate, by prefix. */
 const EVALUATION_PREFIX = "candidate_";
-const EVALUATION_EXACT = new Set(["candidate_run", "candidate_sweep", "candidate_evaluate"]);
+const EVALUATION_EXACT = new Set(["candidate_run", "candidate_evaluate"]);
 
 function isEvaluation(name: string): boolean {
-	return EVALUATION_EXACT.has(name) || (name.startsWith(EVALUATION_PREFIX) && !name.startsWith("candidate_list") &&
-		!name.startsWith("candidate_read") && !name.startsWith("candidate_checkout"));
+	// Reading the archive is not an evaluation, whichever action it uses.
+	return EVALUATION_EXACT.has(name) || (name.startsWith(EVALUATION_PREFIX) && !name.startsWith("candidate_archive"));
 }
 
 export function summarizeToolCalls(records: readonly ToolCallRecord[]): ToolUsageSummaryV1 {

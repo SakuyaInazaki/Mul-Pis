@@ -12,7 +12,7 @@ test("tool accounting shows the surface actually used and whether changes were m
 		call("read"), call("write"), call("edit"), call("candidate_run"),
 		call("write"), call("write"), call("candidate_evaluate"),
 		call("bash", false, "policy"), call("bash", false, "infrastructure"),
-		call("candidate_list"), call("write"),
+		call("candidate_archive"), call("write"),
 	]);
 	assert.equal(summary.calls, 11);
 	assert.equal(summary.distinctTools, 7);

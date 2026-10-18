@@ -150,7 +150,7 @@ test("local task backend executes real reference/no-op/baseline workers and free
 	assert.match(mislabeled.limitations!.join(" "), /host-bound local operator subject/);
 	assert.equal(observed.executionFacts!.evaluations[0].subjectId, "numeric-tree");
 	await writeFile(path.join(h.workDir, "candidate.py"), candidate.replace("math.sqrt(x)", "math.sqrt(x) + {{OFFSET}}"));
-	const swept = JSON.parse((await h.tools[1].execute({ runId: "parameters", sourcePaths: ["candidate.py"],
+	const swept = JSON.parse((await h.tools[0].execute({ runId: "parameters", sourcePaths: ["candidate.py"],
 		protocolId: "numeric-tree-test-v1", hypothesis: "enumerate declared toy offsets", intent: "solution", domainsJson: '{"OFFSET":[0,1]}' })).text);
 	assert.equal(swept.status, "completed"); assert.equal(swept.completed, 2);
 	assert.deepEqual(h.observations.slice(-2).map(item => item.correctness), ["passed", "failed"]);

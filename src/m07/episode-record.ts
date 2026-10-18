@@ -144,7 +144,7 @@ export function episodeRestartMessage(taskMessage: string, record: EpisodeRecord
 		"",
 		`- Candidates evaluated so far: ${record.observed.candidates} (promoted ${record.observed.promoted}, reverted ${record.observed.reverted}, pre-check rejected ${record.observed.excluded}).`,
 		...(record.bestCandidateFamily
-			? [`- Verified best: ${record.bestCandidateFamily.candidateRef}${record.bestCandidateFamily.strategy ? ` via ${record.bestCandidateFamily.strategy}` : ""}; ${record.bestCandidateFamily.metric}. Retrieve it with candidate_checkout rather than rewriting it from memory.`]
+			? [`- Verified best: ${record.bestCandidateFamily.candidateRef}${record.bestCandidateFamily.strategy ? ` via ${record.bestCandidateFamily.strategy}` : ""}; ${record.bestCandidateFamily.metric}. Retrieve it with candidate_archive action=checkout rather than rewriting it from memory.`]
 			: ["- No verified best yet: this subject is still in bootstrap."]),
 		...(record.phasePredicates.length ? [`- State: ${record.phasePredicates.join("; ")}.`] : []),
 		...(record.failureSignatures.length ? [`- Failure signatures already seen: ${record.failureSignatures.join(" | ")}.`] : []),

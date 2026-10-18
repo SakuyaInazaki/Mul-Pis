@@ -63,7 +63,7 @@ decides what the next task should start from.
 
 ## Background candidate runs
 
-`candidate_run` and `candidate_sweep` accept `background: true` and `collect: true` when the host enables
+`candidate_run` (which also runs a declared parameter sweep) accepts `background: true` and `collect: true` when the host enables
 them (`backgroundRuns` in `createCandidateExecutionTools`). A background submission returns at once, so the
 model keeps working while the host executes; the host still runs candidates one at a time, so no backend
 gains concurrency it was not written for. `collect` reports the job and returns its result once finished, and
@@ -75,6 +75,19 @@ waiting for.
 
 Queue and settle events go into the same log, so `searchStateSummary(...).background.outstanding` answers
 "did anything stay unfinished" after a crash.
+
+## The host evaluation pool
+
+Generation happens in the model session and evaluation happens in the host, so the two are joined by a
+bounded queue (`src/m07/evaluation-queue.ts`) rather than by one pipeline. Concurrency defaults to one,
+because a device measured by two processes at once produces numbers that cannot be compared; raising it is a
+fidelity decision for whoever knows the machine. Capacity defaults to eight, and a full queue refuses the
+submission instead of growing — that refusal is the backpressure signal, delivered at submission time so a
+caller that will not wait can do something else.
+
+The queue reports what the backlog looks like: accepted, refused, completed and failed counts, how many are
+running and waiting, the deepest the queue has been (the compile backlog in one number) and how long
+submissions waited. Background submissions and the collect listing carry those statistics.
 
 ## Tool-call accounting
 

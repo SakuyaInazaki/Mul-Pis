@@ -426,9 +426,9 @@ export function candidateSearchBrief(facts: CandidateSearchFactsV1, entries: rea
 		}),
 		repeatedSourceObservationCount: repeated.length,
 		omittedRepeatedSourceObservations: Math.max(0, repeated.length - 3),
-		readRepeatedSourceObservations: { tool: "candidate_list",
-			args: { section: "repeated-source", ...focus, offset: 0, limit: 50 } },
-		readLeads: { tool: "candidate_list", args: { section: "search-leads", ...focus, offset: 0, limit: 50 } },
+		readRepeatedSourceObservations: { tool: "candidate_archive",
+			args: { action: "list", section: "repeated-source", ...focus, offset: 0, limit: 50 } },
+		readLeads: { tool: "candidate_archive", args: { action: "list", section: "search-leads", ...focus, offset: 0, limit: 50 } },
 		message: "These are per-case measured frontier leads, not a whole-goal ranking or required next parent. Shared candidate refs may bind one external measurement. Repeated-source count is the number of deduplicated usable external evaluation IDs; min/median/max describe retained readings only. Different IDs do not establish independent physical trials, noise, or benefit. Full context mappings and readings are available through readRepeatedSourceObservations. Diagnostic refs include negative results and diagnostic-intent experiments even when correct. The legacy solutionParentEligible flag means host-bound and overall correct regardless of intent; it does not establish the original goal. Inspect frozen evidence and choose the next hypothesis yourself." };
 }
 

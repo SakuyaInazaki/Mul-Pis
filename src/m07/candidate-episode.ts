@@ -316,7 +316,7 @@ export function createCandidateEpisodeTool(input: {
 				: undefined;
 		}
 		// Derive the local display from the same readable, subject-isolated evidence as
-		// candidate_list. Historical candidates remain intact even if a file is missing.
+		// candidate_archive. Historical candidates remain intact even if a file is missing.
 		episode.incumbents = globalCandidateBest(searchSnapshot.available.filter(entry => entry.taskId === task.taskId))
 			.map(best => ({ candidateId: best.candidateRef.slice(task.taskId.length + 1), metric: best.metric,
 				...(best.subjectId ? { subjectId: best.subjectId } : {}) }));
@@ -375,8 +375,8 @@ export function createCandidateEpisodeTool(input: {
 			identicalSourceRefs: identicalRefs, sourceRepetition: sourceRepetition ?? null,
 			projection: { kind: "indexed", fullObservationPath: observationPath,
 				fullObservationChars: observationText.length, units: "utf16",
-				read: { tool: "candidate_read", args: { candidateRef: `${task.taskId}/${id}`, kind: "observation", offset: 0, limit: 6000 } },
-				message: "Case rows retain measurements within display space and prioritize failed/unknown cases. Parent case deltas show negative/unknown cases and regressions first. Diagnostic indexes show a first entry per category before others within display space. Counts include omitted entries. JSON paths refer to the full frozen observation; diagnostic fieldPath refers to its original receipt (candidate_read kind:receipt, fileIndex:receiptIndex). Use returned nextOffset to continue file reads. A preview/index is not full reading or causal interpretation; all original facts and parent comparisons are retained." },
+				read: { tool: "candidate_archive", args: { action: "read", candidateRef: `${task.taskId}/${id}`, kind: "observation", offset: 0, limit: 6000 } },
+				message: "Case rows retain measurements within display space and prioritize failed/unknown cases. Parent case deltas show negative/unknown cases and regressions first. Diagnostic indexes show a first entry per category before others within display space. Counts include omitted entries. JSON paths refer to the full frozen observation; diagnostic fieldPath refers to its original receipt (candidate_archive action=read kind:receipt, fileIndex:receiptIndex). Use returned nextOffset to continue file reads. A preview/index is not full reading or causal interpretation; all original facts and parent comparisons are retained." },
 			currentCandidateId: episode.currentCandidateId, incumbents: episode.incumbents,
 			search: episode.search, budget: episode.budget,
 			...(injection ? { injection: { phase: injection.phase, status: injection.status,

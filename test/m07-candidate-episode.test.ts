@@ -6,11 +6,12 @@ import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { createM07Controller } from "../src/m07/controller.ts";
-import { candidateSearchSnapshot } from "../src/m07/candidate-archive.ts";
+import { candidateSearchSnapshot, createCandidateArchiveTools } from "../src/m07/candidate-archive.ts";
 import { episodeInjectionPhase } from "../src/m07/candidate-episode.ts";
 import { readSearchEvents } from "../src/m07/search-state/index.ts";
 import type { CandidateVerifier } from "../src/m07/candidate-evaluation.ts";
 import type { CandidateExecutionBackend } from "../src/m07/candidate-runner.ts";
+import type { CurrentGoal } from "../src/m07/types.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 import type { StageContext } from "../src/stages/context.ts";
 import { Workspace } from "../src/workspace.ts";
@@ -217,7 +218,7 @@ test("a failed candidate freeze retains its bytes and later candidates use unuse
 		const third = JSON.parse((await evaluate("next complete candidate")).text) as { candidateId: string };
 		assert.equal(third.candidateId, "C003");
 		assert.equal(await readFile(failedSource, "utf8"), "first frozen source");
-		const archive = JSON.parse((await tools.candidate_list({})).text) as { candidates: Array<{ candidateRef: string }> };
+		const archive = JSON.parse((await tools.candidate_archive({})).text) as { candidates: Array<{ candidateRef: string }> };
 		assert.deepEqual(archive.candidates.map(item => item.candidateRef), ["T001/C002", "T001/C003"]);
 		return "The failed freeze was retained; two complete candidates were recorded.";
 	}, verifier);
@@ -271,9 +272,9 @@ test("a slower correct exploration parent can lead to a faster child without reg
 		assert.deepEqual(diagnostic.incumbents.map(item => [item.subjectId, item.metric.basisId, item.candidateId]),
 			[["operator", "A", "C006"], ["operator", "B", "C004"]],
 			"a verified correct diagnostic experiment improves the local incumbent despite its intent label");
-		const leadPage = JSON.parse((await tools.candidate_list({ section: "search-leads" })).text) as { total: number; rows: unknown[] };
+		const leadPage = JSON.parse((await tools.candidate_archive({ section: "search-leads" })).text) as { total: number; rows: unknown[] };
 		assert.equal(leadPage.total, 0, "top-level metrics alone do not fabricate case-level Pareto evidence");
-		const restored = JSON.parse((await tools.candidate_checkout({ candidateRef: `T001/${slow.candidateId}` })).text) as { sourcePaths: string[] };
+		const restored = JSON.parse((await tools.candidate_archive({ action: "checkout", candidateRef: `T001/${slow.candidateId}` })).text) as { sourcePaths: string[] };
 		assert.equal(await readFile(path.join(workRoot, restored.sourcePaths[0]), "utf8"), "slow valid parent");
 		return "All six actual receipt observations were recorded.";
 	}, verifier);
@@ -326,18 +327,18 @@ test("repeated-source feedback uses frozen bytes and unique external results wit
 		assert.equal(repeated.searchBrief.repeatedSourceObservations[0].measurements, undefined, "immediate feedback is a summary");
 		await evaluate("renamed.py", "original", "result-two", 92);
 		await evaluate("changed.py", "changed!", "result-three", 99);
-		const page = JSON.parse((await tools.candidate_list({ ...repeated.searchBrief.readRepeatedSourceObservations.args, limit: 1 })).text);
+		const page = JSON.parse((await tools.candidate_archive({ ...repeated.searchBrief.readRepeatedSourceObservations.args, limit: 1 })).text);
 		assert.equal(page.section, "repeated-source");
 		assert.equal(page.total, 2);
 		assert.equal(page.nextOffset, 1);
 		assert.deepEqual([page.rows[0].sourceGroupRef, page.rows[0].count, page.rows[0].min, page.rows[0].median, page.rows[0].max],
 			["T001/C001", 2, 90, 91, 92]);
 		assert.deepEqual(page.rows[0].measurements[1].candidateRefs, ["T001/C002", "T001/C003"]);
-		const next = JSON.parse((await tools.candidate_list({ section: "repeated-source", offset: page.nextOffset, limit: 1 })).text);
+		const next = JSON.parse((await tools.candidate_archive({ section: "repeated-source", offset: page.nextOffset, limit: 1 })).text);
 		assert.equal(next.rows[0].scope, "case");
 		assert.equal(next.nextOffset, null);
-		assert.equal(JSON.parse((await tools.candidate_list({ section: "repeated-source", basisId: "missing" })).text).total, 0);
-		const all = JSON.parse((await tools.candidate_list({})).text);
+		assert.equal(JSON.parse((await tools.candidate_archive({ section: "repeated-source", basisId: "missing" })).text).total, 0);
+		const all = JSON.parse((await tools.candidate_archive({})).text);
 		assert.deepEqual(all.candidates.map((item: { sourceGroupRef: string }) => item.sourceGroupRef),
 			["T001/C001", "T001/C001", "T001/C001", "T001/C004"]);
 		assert.equal(all.globalBest[0].metric.value, 99, "descriptive repetitions do not change the score criterion or best");
@@ -393,24 +394,24 @@ test("a later task can retrieve a near miss and derive from an exact frozen pare
 			assert.equal((await evaluate("slow correct")).sourceRepetition, "duplicate_code", "the immediately repeated source remains a duplicate");
 			return "Cross-subject bytes and same-subject repetition were distinguished.";
 		}
-		const list = JSON.parse((await tools.candidate_list({})).text) as { candidates: Array<{ candidateRef: string }>; globalBest: Array<{ candidateRef: string; metric: { basisId: string } }> };
+		const list = JSON.parse((await tools.candidate_archive({})).text) as { candidates: Array<{ candidateRef: string }>; globalBest: Array<{ candidateRef: string; metric: { basisId: string } }> };
 		assert.deepEqual(list.candidates.map(item => item.candidateRef), ["T001/C001", "T001/C002"]);
 		assert.deepEqual(list.globalBest.map(item => [item.metric.basisId, item.candidateRef]), [["A", "T001/C002"]]);
-		const secondPage = JSON.parse((await tools.candidate_list({ offset: 1, limit: 1 })).text) as { total: number; candidates: Array<{ candidateRef: string }>; nextOffset: number | null };
+		const secondPage = JSON.parse((await tools.candidate_archive({ offset: 1, limit: 1 })).text) as { total: number; candidates: Array<{ candidateRef: string }>; nextOffset: number | null };
 		assert.equal(secondPage.total, 2);
 		assert.deepEqual(secondPage.candidates.map(item => item.candidateRef), ["T001/C002"]);
 		assert.equal(secondPage.nextOffset, null);
-		const nearMiss = JSON.parse((await tools.candidate_read({ candidateRef: "T001/C001" })).text) as { sources: Array<{ fileIndex: number; bytes: number }>; observation: { correctness: string } };
+		const nearMiss = JSON.parse((await tools.candidate_archive({ action: "read", candidateRef: "T001/C001" })).text) as { sources: Array<{ fileIndex: number; bytes: number }>; observation: { correctness: string } };
 		assert.equal(nearMiss.observation.correctness, "failed");
 		assert.equal(nearMiss.sources[0].fileIndex, 0);
-		const nearMissSource = JSON.parse((await tools.candidate_read({ candidateRef: "T001/C001", kind: "source", fileIndex: 0, offset: 0, limit: 3 })).text) as { text: string; nextOffset: number };
+		const nearMissSource = JSON.parse((await tools.candidate_archive({ action: "read", candidateRef: "T001/C001", kind: "source", fileIndex: 0, offset: 0, limit: 3 })).text) as { text: string; nextOffset: number };
 		assert.equal(nearMissSource.text, "bro");
-		const nearMissRemainder = JSON.parse((await tools.candidate_read({ candidateRef: "T001/C001", kind: "source", fileIndex: 0, offset: nearMissSource.nextOffset })).text) as { text: string };
+		const nearMissRemainder = JSON.parse((await tools.candidate_archive({ action: "read", candidateRef: "T001/C001", kind: "source", fileIndex: 0, offset: nearMissSource.nextOffset })).text) as { text: string };
 		assert.equal(nearMissSource.text + nearMissRemainder.text, "broken");
-		const nearMissCopy = JSON.parse((await tools.candidate_checkout({ candidateRef: "T001/C001" })).text) as { sourcePaths: string[]; receiptPaths: string[] };
+		const nearMissCopy = JSON.parse((await tools.candidate_archive({ action: "checkout", candidateRef: "T001/C001" })).text) as { sourcePaths: string[]; receiptPaths: string[] };
 		assert.equal(await readFile(path.join(workRoot, nearMissCopy.sourcePaths[0]), "utf8"), "broken");
 		assert.equal(JSON.parse(await readFile(path.join(workRoot, nearMissCopy.receiptPaths[0]), "utf8")).status, "failed");
-		const baselineCopy = JSON.parse((await tools.candidate_checkout({ candidateRef: "T001/C002" })).text) as { sourcePaths: string[] };
+		const baselineCopy = JSON.parse((await tools.candidate_archive({ action: "checkout", candidateRef: "T001/C002" })).text) as { sourcePaths: string[] };
 		assert.equal(await readFile(path.join(workRoot, baselineCopy.sourcePaths[0]), "utf8"), "slow correct");
 		await writeFile(path.join(workRoot, "kernel.py"), "faster correct");
 		await writeFile(path.join(workRoot, "receipt.json"), JSON.stringify({ status: "passed", latency: 8, basis: "A" }));
@@ -430,7 +431,7 @@ test("a later task can retrieve a near miss and derive from an exact frozen pare
 			location: "kernel.py", intent: "solution", parentCandidateId: "T002/C001" })).text) as { identicalSourceRefs: string[]; sourceRepetition: string };
 		assert.ok(second.identicalSourceRefs.includes("T002/C001"), "equal bytes are recorded without rejecting a new receipt");
 		assert.equal(second.sourceRepetition, "duplicate_code");
-		const updated = JSON.parse((await tools.candidate_list({})).text) as { globalBest: Array<{ candidateRef: string; metric: { basisId: string } }> };
+		const updated = JSON.parse((await tools.candidate_archive({})).text) as { globalBest: Array<{ candidateRef: string; metric: { basisId: string } }> };
 		assert.deepEqual(updated.globalBest.map(item => [item.metric.basisId, item.candidateRef]), [["A", "T002/C001"], ["B", "T002/C002"]]);
 		return "A new candidate improved A; B remains separate.";
 	}, verifier);
@@ -489,14 +490,14 @@ test("checkout preserves a frozen multi-file candidate's relative imports in an 
 			const link = path.join(root, "candidate-checkouts");
 			try {
 				await symlink(outside, link, "dir");
-				await assert.rejects(tools.candidate_checkout({ candidateRef: "T001/C001" }), /checkout directory is not a real directory/);
+				await assert.rejects(tools.candidate_archive({ action: "checkout", candidateRef: "T001/C001" }), /checkout directory is not a real directory/);
 				assert.deepEqual(await readdir(outside), []);
 			} finally {
 				await rm(link, { force: true });
 				await rm(outside, { recursive: true, force: true });
 			}
 		}
-		const checkout = JSON.parse((await tools.candidate_checkout({ candidateRef: invocation === 3 ? "T002/C001" : "T001/C001" })).text) as {
+		const checkout = JSON.parse((await tools.candidate_archive({ action: "checkout", candidateRef: invocation === 3 ? "T002/C001" : "T001/C001" })).text) as {
 			sourcePaths: string[]; receiptPaths: string[];
 		};
 		const kernel = checkout.sourcePaths.find(file => file.endsWith("/sources/src/kernel.mjs"));
@@ -548,7 +549,7 @@ test("checkout preserves a frozen multi-file candidate's relative imports in an 
 		["T001/C001", "T002/C001"]);
 });
 
-test("large case and diagnostic feedback is indexed while candidate_read retains every original fact", async t => {
+test("large case and diagnostic feedback is indexed while candidate_archive action=read retains every original fact", async t => {
 	const rawText = `compiler output\n${"line with details\n".repeat(5000)}TAIL: original diagnostic evidence`;
 	const facts = { evaluations: [{ externalId: "existing-42", subjectId: "operator", status: "WrongAnswer", terminal: true,
 		capturedAt: "2026-10-18T00:00:00Z", receiptIndex: 0,
@@ -590,7 +591,7 @@ test("large case and diagnostic feedback is indexed while candidate_read retains
 		assert.equal(projected.searchBrief.independentLeadCount, 499);
 		assert.equal(projected.searchBrief.leads[0].bindings[0].solutionParentEligible, false,
 			"a passed case in a failed candidate is diagnostic, not a solved parent");
-		const focusedLeads = JSON.parse((await tools.candidate_list(projected.searchBrief.readLeads.args)).text);
+		const focusedLeads = JSON.parse((await tools.candidate_archive(projected.searchBrief.readLeads.args)).text);
 		assert.equal(focusedLeads.total, 499);
 		assert.equal(focusedLeads.rows[0].candidateRefs[0], projected.candidateRef);
 		const evaluation = projected.observation.executionFacts.evaluations[0];
@@ -606,7 +607,7 @@ test("large case and diagnostic feedback is indexed while candidate_read retains
 		const readAll = async (kind: string) => {
 			let offset = 0, joined = "";
 			while (true) {
-				const page = JSON.parse((await tools.candidate_read({ candidateRef: projected.candidateRef, kind, offset, limit: 12000 })).text);
+				const page = JSON.parse((await tools.candidate_archive({ action: "read", candidateRef: projected.candidateRef, kind, offset, limit: 12000 })).text);
 				assert.equal(page.returnedRange.offset, offset);
 				joined += page.text;
 				if (page.nextOffset === null) { assert.equal(joined.length, page.returnedRange.total); break; }
@@ -618,13 +619,13 @@ test("large case and diagnostic feedback is indexed while candidate_read retains
 		assert.equal(complete.length, projected.projection.fullObservationChars);
 		assert.deepEqual(JSON.parse(complete).observation.executionFacts, facts);
 		assert.equal(JSON.parse(complete).diagnosticSummary.diagnosticLocations.length, 30);
-		const search = JSON.parse((await tools.candidate_list({ section: "case-frontiers", limit: 1 })).text);
+		const search = JSON.parse((await tools.candidate_archive({ section: "case-frontiers", limit: 1 })).text);
 		assert.equal(search.search.caseFrontierCount, 499);
 		assert.equal(search.total, 499);
 		assert.equal(search.rows.length, 1);
 		assert.equal(search.nextOffset, 1);
 		assert.equal(search.rows[0].frontierCount, 1);
-		const members = JSON.parse((await tools.candidate_list({ section: "case-members", caseIndex: 0, limit: 1 })).text);
+		const members = JSON.parse((await tools.candidate_archive({ section: "case-members", caseIndex: 0, limit: 1 })).text);
 		assert.equal(members.total, 1);
 		assert.equal(members.rows[0].candidateRef, projected.candidateRef);
 		assert.equal(await readAll("receipt"), receipt, "original receipt is independently readable without truncation");
@@ -639,7 +640,7 @@ test("large case and diagnostic feedback is indexed while candidate_read retains
 });
 
 test("unqueryable candidate results hand control back after queued tools settle, retaining evidence for host reconciliation", { timeout: 10_000 }, async t => {
-	for (const toolName of ["candidate_run", "candidate_sweep"] as const) await t.test(toolName, async t => {
+	for (const toolName of ["candidate_run", "candidate_run-sweep"] as const) await t.test(toolName, async t => {
 		let submissions = 0, aborts = 0, builderTurns = 0, backendActive = false, disposed = false;
 		let toolOutcomes: string[] = [];
 		let finishTools!: () => void;
@@ -660,16 +661,16 @@ test("unqueryable candidate results hand control back after queued tools settle,
 		const harness = await setup(async ({ spec, tools }) => {
 			if (spec.tools.kind !== "execution") return "report";
 			builderTurns++;
-			await writeFile(path.join(spec.tools.root, "kernel.txt"), toolName === "candidate_sweep" ? "tile={{tile}}\n" : "original candidate bytes");
+			await writeFile(path.join(spec.tools.root, "kernel.txt"), toolName === "candidate_run-sweep" ? "tile={{tile}}\n" : "original candidate bytes");
 			if (builderTurns > 1) return "A separately authorized task can continue after host reconciliation.";
 			const request = { runId: "original-run", sourcePaths: ["kernel.txt"], protocolId: "original-protocol",
 				configJson: "{}", hypothesis: "measure original candidate", changeKind: "structure",
 				strategy: "tiling", location: "kernel.txt", intent: "solution",
-				...(toolName === "candidate_sweep" ? { domainsJson: '{"tile":[1,2]}' } : {}) };
+				...(toolName === "candidate_run-sweep" ? { domainsJson: '{"tile":[1,2]}' } : {}) };
 			try {
 				// Both wrappers are entered before the internally serialized backend runs.
 				// The second call rejects after the first returns its unknown result.
-				const results = await Promise.allSettled([tools[toolName](request),
+				const results = await Promise.allSettled([tools.candidate_run(request),
 					tools.candidate_run({ ...request, runId: "queued-new-run" })]);
 				toolOutcomes = results.map(result => result.status);
 			} finally { finishTools(); }
@@ -682,7 +683,7 @@ test("unqueryable candidate results hand control back after queued tools settle,
 			return { ...handle, prompt: async (message: string) => {
 				try { return await handle.prompt(message); }
 				catch (error) {
-					if (toolName === "candidate_sweep" && aborts) throw new HarnessError("runner.aborted",
+					if (toolName === "candidate_run-sweep" && aborts) throw new HarnessError("runner.aborted",
 						"session fixture was aborted during prompt; SDK abort failed: fixture SDK abort failure");
 					throw error;
 				}
@@ -708,14 +709,15 @@ test("unqueryable candidate results hand control back after queued tools settle,
 		const toolLog = failed.toolLog.filter((call): call is Pick<ToolCallRecord, "name" | "ok"> =>
 			typeof call === "object" && call !== null && "name" in call && typeof call.name === "string" &&
 			"ok" in call && typeof call.ok === "boolean");
-		assert.equal(toolLog.filter(call => call.name === toolName && call.ok).length, 1);
+		// Both variants are the same tool now; the sweep is a run with declared domains.
+		assert.equal(toolLog.filter(call => call.name === "candidate_run" && call.ok).length, 1);
 		assert.ok(toolLog.some(call => call.name === "candidate_run" && !call.ok), "the queued rejection remains logged");
 		const goal = await harness.controller.status(harness.goal.runId);
 		const operationId = goal.executionState!.operations[0].id;
 		assert.equal(goal.executionState!.operations[0].status, "unknown");
 		assert.equal(goal.lifecycle, "active", "a child recovery boundary must not stop the original goal");
 		const journalPath = path.join(harness.ws.runDir("M07", goal.runId), "tasks", failed.taskId, "candidate-runs", "original-run",
-			...(toolName === "candidate_sweep" ? ["runs", "1"] : []), "journal.json");
+			...(toolName === "candidate_run-sweep" ? ["runs", "1"] : []), "journal.json");
 		const journal = JSON.parse(await readFile(journalPath, "utf8"));
 		assert.equal(journal.state, "unknown"); assert.equal(journal.stages[0].externalId, undefined);
 		const receiptPath = journal.stages[0].receiptSnapshots[0].frozenPath as string;
@@ -776,7 +778,7 @@ test("host reconciliation queries a failed task's original candidate ID and unlo
 			assert.equal(result.status, "pending");
 			throw new Error("builder session lost after submission");
 		}
-		const archived = JSON.parse((await tools.candidate_list({})).text);
+		const archived = JSON.parse((await tools.candidate_archive({})).text);
 		assert.ok(JSON.stringify(archived).includes("T001/C001"), "a new task can reuse the host-recovered candidate");
 		await writeFile(path.join(spec.tools.root, "next.md"), "Inspected the recovered candidate without resubmission.\n");
 		return "Continue from the verified historical evidence.";
@@ -1031,4 +1033,33 @@ test("the host records its verdict, stall, budget and restart events for the con
 	const restarted = events.find(event => event.kind === "episode-restarted")!;
 	assert.equal(restarted.counters?.afterCandidates, 2);
 	assert.equal(restarted.detail?.recordPath, task.episode!.restarts![0].recordPath);
+});
+
+test("the archive is one tool whose actions keep their separate contracts", async t => {
+	const root = await mkdtemp(path.join(tmpdir(), "candidate-archive-actions-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const workDir = path.join(root, "work");
+	await mkdir(workDir, { recursive: true });
+	const goal = { runId: "G1", tasks: [] } as unknown as CurrentGoal;
+	const task = { taskId: "T001", status: "accepted", workDir } as unknown as CurrentGoal["tasks"][number];
+	const tools = createCandidateArchiveTools({ goal, task, save: async () => {} });
+	assert.deepEqual(tools.map((tool: { name: string }) => tool.name), ["candidate_archive"]);
+	const archive = tools[0];
+
+	// list is the default action and needs no candidateRef.
+	const listed = JSON.parse((await archive.execute({})).text) as { candidates: unknown[] };
+	assert.deepEqual(listed.candidates, []);
+	await assert.rejects(archive.execute({ action: "inspect" }), /action must be list, read or checkout/);
+	// A parameter belonging to another action is refused instead of ignored.
+	await assert.rejects(archive.execute({ action: "read", candidateRef: "T001/C001", section: "global-best" }),
+		/require action=list/);
+	await assert.rejects(archive.execute({ action: "checkout", candidateRef: "T001/C001", kind: "source" }),
+		/require action=read/);
+	await assert.rejects(archive.execute({ section: "global-best", candidateRef: "T001/C001" }),
+		/candidateRef requires action=read or action=checkout/);
+	await assert.rejects(archive.execute({ action: "checkout", candidateRef: "T001/C001", limit: 10 }),
+		/offset and limit require action=list or action=read/);
+	// Each action still enforces its own contract on a reference that does not exist.
+	await assert.rejects(archive.execute({ action: "read", candidateRef: "not-a-ref" }), /exact same-goal task\/candidate reference/);
+	await assert.rejects(archive.execute({ action: "checkout", candidateRef: "T001/C001" }), /unavailable in this goal/);
 });
