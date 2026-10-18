@@ -9,12 +9,40 @@ import { availableCandidateByRef, candidateArchive, candidateSearchSnapshot, can
 import { candidateSearchBrief, candidateSearchFocus } from "./candidate-search.ts";
 import { assembleInjection, type InjectionPhase } from "../knowledge/injection.ts";
 import { openSearchEventLog } from "./search-state/index.ts";
+import type { MethodDecision } from "../knowledge/decision-table.ts";
+import type { BottleneckSignature } from "../knowledge/optimization-card.ts";
+
+/** Translate the host's own diagnosis into the knowledge layer's signature.
+ * An undiagnosed round stays `unknown`, which the decision table never masks. */
+function bottleneckSignature(summary: CandidateDiagnosticSummaryV1): BottleneckSignature {
+	if (summary.stage === "compile-failure") return "compile_failure";
+	if (summary.stage === "numerical-failure") return "numerical_error";
+	// The first interpreted profile is the host's own reading; several
+	// interpretations never vote, the earliest decided one is used.
+	switch (summary.profileInterpretations.find(item => item.bottleneck)?.bottleneck?.label) {
+		case "compute": return "compute_bound";
+		case "bandwidth": return "memory_bound";
+		case "latency": return "latency_bound";
+		default: return "unknown";
+	}
+}
+
+/** The menu recorded by the previous round, rebuilt in the shape the gate wants. */
+function storedMethodDecision(episode: NonNullable<M07TaskRecord["episode"]>): MethodDecision | undefined {
+	const stored = episode.methodDecision;
+	if (!stored) return undefined;
+	return { status: stored.status,
+		allowed: stored.allowed.map((method): MethodDecision["allowed"][number] =>
+			({ method, reason: "offered by the published decision table", sourceRefs: [] })),
+		masked: stored.masked.map((item): MethodDecision["masked"][number] =>
+			({ method: item.method, reason: item.reason, sourceRefs: [...item.sourceRefs] })) };
+}
 import type { KnowledgeStore } from "../knowledge/types.ts";
 import type { CandidateDiagnosticSummaryV1 } from "./candidate-diagnostics.ts";
 import { compareCandidateObservations, projectCandidateFeedback, summarizeCandidateDiagnostics } from "./candidate-diagnostics.ts";
 import { CANDIDATE_STRATEGIES, candidateSearchState, candidateStrategyMenu, candidateStrategyStats,
 	candidateBudgetLedger, decideCandidate, DEFAULT_SEARCH_BUDGET, requireAllowedAction,
-	requireBudget, requireUnbannedDirection,
+	requireAllowedMethod, requireBudget, requireUnbannedDirection,
 	type CandidateChangeKind, type CandidateGuard, type CandidateRoute,
 	type CandidateStrategy } from "./candidate-policy.ts";
 import { isSafeRelativeOutputPath } from "./expected-output.ts";
@@ -118,6 +146,7 @@ export function createCandidateEpisodeTool(input: {
 			parentVerifiedCorrect: parentObservation?.sourceBinding === "verified" &&
 				parentObservation.correctness === "passed" });
 		requireUnbannedDirection(priorState, action, args.newEvidence as string | undefined);
+		requireAllowedMethod(storedMethodDecision(episode), action.strategy);
 		const searchBudget = goal.searchBudget ?? DEFAULT_SEARCH_BUDGET;
 		requireBudget(candidateBudgetLedger(priorArchive, { taskId: task.taskId,
 			subjectId: task.subjectId, policy: searchBudget,
@@ -249,6 +278,7 @@ export function createCandidateEpisodeTool(input: {
 			guard: decision.guard, route: episode.search.route });
 		let injection: { phase: InjectionPhase; markdown: string; refs: string[]; chars: number;
 			omitted: number; status: "ready" | "snapshot-changed" | "unavailable" } | undefined;
+		let methodDecision: MethodDecision | undefined;
 		if (input.store) {
 			try {
 				const assembled = await assembleInjection({ store: input.store, phase: injectionPhase,
@@ -261,7 +291,14 @@ export function createCandidateEpisodeTool(input: {
 							...episode.candidates.map(item => item.strategy).filter((item): item is CandidateStrategy => Boolean(item))])],
 						...(decision.failureSignature ? { symptoms: [decision.failureSignature] } : {}) },
 					...(decision.failureSignature ? { errorSignatures: [decision.failureSignature] } : {}),
+					// The same host diagnosis that chose the phase also drives the
+					// deterministic method menu, so one round has one decision.
+					bottleneck: bottleneckSignature(diagnosticSummary),
+					...(((fraction) => fraction === undefined ? {} : { metrics: [{ metric: "speed-of-light", value: fraction }] })(
+						diagnosticSummary.profileInterpretations.find(item => item.bottleneck?.speedOfLightFraction !== undefined)?.bottleneck?.speedOfLightFraction)),
+					...(task.subjectProfile ? { operatorCategory: task.subjectProfile.operatorCategory } : {}),
 					excludeExperience: true, ...(input.priorRoot ? { priorRoot: input.priorRoot } : {}) });
+				methodDecision = assembled.decision;
 				injection = assembled.selection.snapshot !== goal.knowledgeSnapshot
 					? { phase: injectionPhase, markdown: "", refs: [], chars: 0, omitted: 0, status: "snapshot-changed" }
 					: { phase: injectionPhase, markdown: assembled.markdown, refs: assembled.receipt.injectedRefs,
@@ -269,6 +306,14 @@ export function createCandidateEpisodeTool(input: {
 			} catch { injection = { phase: injectionPhase, markdown: "", refs: [], chars: 0, omitted: 0, status: "unavailable" }; }
 			record.injection = { phase: injectionPhase, status: injection.status,
 				refs: injection.refs.slice(0, 12), chars: injection.chars };
+			// The menu this round's evidence allows is the action space the next
+			// round is held to; it is a host decision, not a suggestion.
+			episode.methodDecision = methodDecision && methodDecision.status !== "blocked"
+				? { status: methodDecision.status,
+					allowed: methodDecision.allowed.map(item => item.method),
+					masked: methodDecision.masked.map(item => ({ method: item.method, reason: item.reason,
+						sourceRefs: item.sourceRefs.slice(0, 4) })) }
+				: undefined;
 		}
 		// Derive the local display from the same readable, subject-isolated evidence as
 		// candidate_list. Historical candidates remain intact even if a file is missing.
@@ -341,6 +386,8 @@ export function createCandidateEpisodeTool(input: {
 			strategyStats: candidateStrategyStats(searchSnapshot.available, currentSubjectId),
 			nextStrategyMenu: candidateStrategyMenu({ phase: episode.search.phase, route: episode.search.route,
 				seed: `${goal.runId}|${task.taskId}|${episode.candidates.length}` }),
+			...(episode.methodDecision ? { methodDecision: { ...episode.methodDecision,
+				message: "Deterministic menu from the published decision table and this round's own measurements. A strategy whose every method is masked is refused on the next candidate; a method the table says nothing about stays available." } } : {}),
 			decision: { guard: decision.guard, status: decision.status, branch: decision.branch,
 				lane: decision.lane, phase: decision.phase,
 				score: decision.score, tier: decision.tier, updatesBest: decision.updatesBest,

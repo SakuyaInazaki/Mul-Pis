@@ -52,6 +52,8 @@ CLI 与 Pi 扩展两条入口的保护现在对等：除只读命令（`status`�
 
 预算还按算子类别分配：elementwise/激活类 6 次、norm-reduce 24 次、fusion 20 次为默认准入；matmul、卷积/池化、attention、排序索引、broadcast 默认不准入，必须在 `subjectProfile.categoryJustification` 写明理由才能派发，类别上限与任务预算取较小值。整张表可由 `searchBudget.categoryBudgets` 覆盖。
 
+每轮装配同时产出 W3 决策表的方法菜单：候选策略按固定映射对应到优化方法（如 pipeline → pipeline_reorder/double_buffer，numerical-parameters → launch_config，repair 与 instruction-selection 无对应方法），下一个候选若其全部对应方法都被**有出处的**规则或测量屏蔽，则在宿主开销之前被拒；仅因「本候选已用过该方向」而屏蔽的只影响建议，重复方向另由停滞禁令管。
+
 控制器把判决、停滞、预算与边界重启四类事件补写进 W4 的追加式搜索事件日志，控制台据此渲染判决与停滞视图；写日志失败不改变任何评测结论。后台候选执行默认关闭，需要时在调用处显式给出并发上限。
 
 M07 的搜索预算按「一次宿主评测（编译＋正确性＋测量）」计量，而不是按钱或墙钟，换模型不会让口径漂移。`begin` 时从 `research.config.json` 的 `searchBudget` 冻结一份到目标上（缺省用 harness 默认：每任务 24 次评测、修复子预算 10 次、数值参数子预算 5 次、同一 checkpoint 最多 3 条竞争分支，停滞上限等路线阈值同上）；缺省深度按昇腾证据取「单算子不少于 15 次评测」，但所有数字都必须在本项目重测后才可信。失败、回归和前置拒绝同样占一个预算位，否则失败会变成免费重试。超出任务预算、修复子预算、参数子预算或停滞上限时，`candidate_evaluate` 在任何宿主开销之前确定性拒绝并说明该报告哪个已验证最佳候选；任务返回时控制器记录 `loopStopReason = budget-boundary`。预算只约束单个任务（＝一个计划）：重新规划后的新任务有新的预算，这不是目标级的费用上限，也不改变成功标准。

@@ -9,6 +9,7 @@ import type { CandidateComparisonV1, CandidatePerformanceEvidenceV1 } from "./ca
 import type { CandidatePolicyDecisionV1, CandidateSearchStateV1, CandidateStrategy, SearchBudgetLedgerV1, SearchBudgetPolicyV1 } from "./candidate-policy.ts";
 import type { PromptLayoutReceiptV1 } from "./prompt-layout.ts";
 import type { OperatorCategory } from "./candidate-policy.ts";
+import type { OptimizationMethod } from "../knowledge/optimization-card.ts";
 import type { KnowledgeAccessEvent } from "./execution-knowledge.ts";
 
 export type M07TaskMode = "execute" | "check" | "reason";
@@ -257,6 +258,11 @@ export interface M07CandidateEpisodeV1 {
 	search?: CandidateSearchStateV1;
 	/** Spend of this task's frozen search budget, in host evaluations. */
 	budget?: SearchBudgetLedgerV1;
+	/** The method menu the last round's evidence allowed. The next candidate is
+	 * held to it: a strategy whose every method was masked is refused. */
+	methodDecision?: { status: "table" | "default-menu";
+		allowed: OptimizationMethod[];
+		masked: Array<{ method: OptimizationMethod; reason: string; sourceRefs: string[] }> };
 	/** Episode boundaries where the context was cleared and a distilled record
 	 * carried forward. The complete transcript stays in the session log. */
 	restarts?: Array<{ at: string; recordPath: string; afterCandidates: number; previousSessionId: string }>;

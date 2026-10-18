@@ -8,6 +8,8 @@
 import { candidateSubjectId, globalCandidateBest, type CandidateArchiveEntry } from "./candidate-archive.ts";
 import type { CandidateDiagnosticSummaryV1 } from "./candidate-diagnostics.ts";
 import { HarnessError } from "../types.ts";
+import type { MethodDecision } from "../knowledge/decision-table.ts";
+import type { OptimizationMethod } from "../knowledge/optimization-card.ts";
 import type { CandidateMetricV1, CandidateObservationV1 } from "./types.ts";
 
 export type CandidateChangeKind = "repair" | "structure" | "parameters";
@@ -471,6 +473,41 @@ export function candidateSearchState(history: readonly CandidateArchiveEntry[],
 		message: forcedDirectionChange
 			? "The host detected a stall. The next candidate must declare a different direction than the listed ones, or cite new evidence for repeating one; repeating a banned direction unchanged is not a search step."
 			: "No stall signal. Keep the declared direction while it still produces measured gain." };
+}
+
+/** How a declared candidate strategy maps onto the knowledge layer's
+ * optimization methods. The two vocabularies exist for different reasons -
+ * one names what the session is allowed to declare, the other what published
+ * cards reason about - so the mapping is explicit and conservative: a strategy
+ * with no method equivalent is one the decision table cannot mask. */
+export const STRATEGY_METHODS: Readonly<Record<CandidateStrategy, readonly OptimizationMethod[]>> = Object.freeze({
+	tiling: ["tiling"],
+	vectorization: ["vectorization"],
+	fusion: ["fusion"],
+	pipeline: ["pipeline_reorder", "double_buffer"],
+	reordering: ["pipeline_reorder"],
+	"memory-layout": ["layout_change", "memory_coalescing", "buffer_reuse"],
+	"instruction-selection": [],
+	"other-structure": ["algorithm_change"],
+	"numerical-parameters": ["launch_config"],
+	repair: [],
+});
+
+/** Refuse a strategy whose every method a published rule or a measurement
+ * masked for this round. Two deliberate limits: a strategy the table says
+ * nothing about stays available, because a missing rule is not a prohibition;
+ * and a mask whose only ground is "this candidate already applied it" only
+ * shapes the suggestion, because repeating a direction at a different site is
+ * legitimate and repetition already has its own stall-driven ban. */
+export function requireAllowedMethod(decision: MethodDecision | undefined, strategy: CandidateStrategy): void {
+	if (!decision || decision.status === "blocked") return;
+	const methods = STRATEGY_METHODS[strategy];
+	if (!methods.length) return;
+	const grounded = decision.masked.filter(item => methods.includes(item.method) && item.sourceRefs.length > 0);
+	if (grounded.length !== methods.length) return;
+	const reason = grounded[0];
+	throw new HarnessError("m07.candidate-method",
+		`the decision table masked ${strategy} this round: ${reason.reason} (${reason.sourceRefs.join(", ")}). Choose an offered method, or bring the evidence that changes the rule.`);
 }
 
 export interface CandidateActionV1 {

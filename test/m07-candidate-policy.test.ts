@@ -3,7 +3,7 @@ import test from "node:test";
 import { candidateBudgetLedger, candidatePhase, candidateSearchState, candidateStrategyMenu,
 	candidateStrategyStats, decideCandidate, DEFAULT_SEARCH_BUDGET, requireAllowedAction, requireBudget,
 	requireUnbannedDirection, summarizeCandidateSearch, validateSearchBudget,
-	DEFAULT_CATEGORY_BUDGETS, operatorCategoryBudget,
+	DEFAULT_CATEGORY_BUDGETS, operatorCategoryBudget, requireAllowedMethod, STRATEGY_METHODS,
 	type CandidateChangeKind } from "../src/m07/candidate-policy.ts";
 import type { CandidateArchiveEntry } from "../src/m07/candidate-archive.ts";
 import type { CandidateDiagnosticSummaryV1 } from "../src/m07/candidate-diagnostics.ts";
@@ -441,4 +441,27 @@ test("a configured category budget is validated like every other frozen number",
 		/unknown categories/);
 	assert.throws(() => validateSearchBudget({ categoryBudgets: { matmul: { evaluations: 0, admitted: true } } }),
 		/evaluations integer/);
+});
+
+test("a strategy whose every method the decision table masked is refused", () => {
+	const masked = (methods: string[]) => ({ status: "table" as const, allowed: [],
+		masked: methods.map(method => ({ method: method as "tiling", reason: "resource already saturated",
+			sourceRefs: ["K001@1"] })) });
+	assert.throws(() => requireAllowedMethod(masked(["tiling"]), "tiling"), (error: unknown) =>
+		error instanceof HarnessError && error.code === "m07.candidate-method");
+	// pipeline maps onto two methods; masking one of them leaves it available.
+	requireAllowedMethod(masked(["pipeline_reorder"]), "pipeline");
+	assert.throws(() => requireAllowedMethod(masked(["pipeline_reorder", "double_buffer"]), "pipeline"),
+		/masked pipeline/);
+	// repair and instruction-selection have no method equivalent, so the table
+	// has nothing to say about them.
+	requireAllowedMethod(masked(["tiling", "fusion"]), "repair");
+	requireAllowedMethod(masked(["tiling", "fusion"]), "instruction-selection");
+	requireAllowedMethod(undefined, "tiling");
+	requireAllowedMethod({ status: "blocked", allowed: [], masked: [] }, "tiling");
+	// A mask with no published ground only shapes the suggestion: repeating a
+	// direction at another site is legitimate, and repetition has its own ban.
+	requireAllowedMethod({ status: "table", allowed: [],
+		masked: [{ method: "tiling", reason: "already applied to this candidate", sourceRefs: [] }] }, "tiling");
+	assert.deepEqual(STRATEGY_METHODS["memory-layout"], ["layout_change", "memory_coalescing", "buffer_reuse"]);
 });
