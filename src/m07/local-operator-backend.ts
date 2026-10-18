@@ -9,10 +9,19 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createMacOSWriteSandboxProfile } from "../runner/execution-sandbox.ts";
 import { createCandidateCommandBackend } from "./candidate-command-backend.ts";
-import type { CandidateExecutionBackend } from "./candidate-runner.ts";
+import type { CandidateExecutionBackend, CandidateExecutionContext,
+	CandidateExecutionStageResult } from "./candidate-runner.ts";
 import type { CandidateVerifier, FrozenCandidateFile } from "./candidate-evaluation.ts";
 import type { CandidateCaseObservationV1, CandidateDiagnosticV1, CandidateMetricV1 } from "./types.ts";
 import { captureNcuProfile, exportNcuReportCsv, parseNcuRawCsv } from "./candidate-performance.ts";
+import { loadPlatformProfile, type PlatformProfileV1 } from "../platform/profile.ts";
+import { diagnosePlatformOutput } from "../platform/diagnostics.ts";
+import { acquireDeviceLease } from "../platform/device-lease.ts";
+import { derivePlatformTaskBinding, describePlatformTaskBinding,
+	type PlatformTaskBindingV1 } from "./platform-task-contract.ts";
+import { EvaluationCache, evaluationCacheKey, type EvaluationCacheKeyParts } from "./evaluation-cache.ts";
+import { checkCandidate, type StaticCheckReport } from "../knowledge/static-checks.ts";
+import { validateOptimizationCard, type OptimizationCard } from "../knowledge/optimization-card.ts";
 
 export interface LocalOperatorBackendOptions {
 	id: string;
@@ -37,6 +46,20 @@ export interface LocalOperatorBackendOptions {
 	workerEnvironment?: Record<string, string>;
 	/** Optional real NCU capture, additional to unprofiled timing. Never chosen by candidate config. */
 	profiling?: { caseId: string; launchId?: string; timeoutMs: number };
+	/** Host-probed platform profile. When present it, not the task contract,
+	 * fixes the timing protocol, the dtype tolerance and the case table; the
+	 * contract may only agree with it. */
+	platformProfilePath?: string;
+	/** Which declared dtype the derived tolerance comes from. */
+	platformDtype?: string;
+	/** Cases the candidate may iterate on; the rest of the table certifies. */
+	platformPublicCases?: number;
+	/** Frozen published knowledge cards. Their API signatures and hard numeric
+	 * constraints become a pre-compile gate rather than a tool the session may
+	 * remember to call. */
+	knowledgeCardsPath?: string;
+	/** Directory for replaying identical evaluations instead of re-measuring. */
+	evaluationCacheDir?: string;
 }
 
 interface LocalDecision {
@@ -88,6 +111,8 @@ interface LocalReceipt {
 	timingProtocol?: { repeats: number; warmup: number; minimumSampleSeconds: number };
 	timingExecution?: string;
 	measurementEnvironment?: { environmentId: string; clockPolicy: string; precision: string; cacheState: "cold" | "warm" };
+	platformBinding?: { profileId: string; chip: string; toolchain: string; protocolVersion: string;
+		latencySource: string; metricSource: string; unalignedFraction: number };
 	baselineTiers?: Record<string, string>;
 	hiddenVariants?: string[];
 	passed: boolean;
@@ -114,6 +139,23 @@ interface BoundJournal {
 	stages: Array<{ stage: { id: string }; status: string; receiptSnapshots?: Array<{ originalPath: string; frozenPath: string }> }>;
 }
 const script = fileURLToPath(new URL("../../scripts/local-operator-stage.py", import.meta.url));
+
+/** Host-frozen published cards. An entry the card schema rejects is dropped
+ * rather than guessed at: a gate built on a malformed card would reject real
+ * candidates for the wrong reason. */
+function parseKnowledgeCards(value: unknown): Array<{ ref: string; card: OptimizationCard }> {
+	if (!Array.isArray(value)) throw new Error("knowledge cards file must contain an array");
+	const cards: Array<{ ref: string; card: OptimizationCard }> = [];
+	for (const [index, item] of value.entries()) {
+		if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(`knowledge card ${index} is not an object`);
+		const entry = item as { ref?: unknown; card?: unknown };
+		if (typeof entry.ref !== "string" || !entry.ref.trim()) throw new Error(`knowledge card ${index} has no ref`);
+		const parsed = validateOptimizationCard(entry.card);
+		if (!parsed.card) throw new Error(`knowledge card ${entry.ref} is invalid: ${parsed.issues.join("; ")}`);
+		cards.push({ ref: entry.ref, card: parsed.card });
+	}
+	return cards;
+}
 const runHostCommand = promisify(execFile);
 const stages = ["contract", "compile", "correctness", "measurement"] as const;
 const timingExecution = "interleaved-persistent-v2";
@@ -157,12 +199,24 @@ export interface LocalOperatorCertificationV1 {
 	limitation: string;
 }
 
+export interface LocalOperatorEvaluationProfileV1 {
+	version: 1;
+	kind: "local-operator-evaluation-profile";
+	/** Hallucinated APIs rejected locally, and how often a nearest legal
+	 * signature could be offered with the rejection. */
+	apiGate: { rejected: number; checked: number; suggested: number; nearestSignatureRate: number | null };
+	cache?: { hits: number; misses: number; storedEntries: number; entriesOnDisk: number;
+		executedMsByStage: Record<string, number>; replacedMsByStage: Record<string, number> };
+	platform?: { profileId: string; protocolVersion: string };
+}
+
 /** Returns the host bindings plus the audit and certification entry points; no
  * service/controller protocol is added. */
 export async function createLocalOperatorBackend(options: LocalOperatorBackendOptions): Promise<{
 	backend: CandidateExecutionBackend; verifier: CandidateVerifier;
 	auditChecks(): Promise<LocalOperatorMutationReportV1>;
 	certifyCandidate(sourcePath: string): Promise<LocalOperatorCertificationV1>;
+	evaluationProfile(): Promise<LocalOperatorEvaluationProfileV1>;
 }> {
 	for (const value of [options.pythonExecutable, options.contractPath]) if (!path.isAbsolute(value)) throw new Error("local operator host paths must be absolute");
 	if (!/^[A-Za-z][A-Za-z0-9._:-]{0,95}$/u.test(options.id) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(options.version) ||
@@ -188,9 +242,34 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 	const contractSource = await readFile(contractPath, "utf8");
 	const contractDigest = createHash("sha256").update(Buffer.from(contractSource, "utf8")).digest("hex");
 	const assertContract = async () => { if (await readFile(contractPath, "utf8") !== contractSource) throw new Error("host operator contract changed; bind a new version before executing"); };
+	// The platform profile, when the host supplies one, is the measurement
+	// contract: the binding below is what the evaluator enforces, and the task
+	// contract is only allowed to agree with it.
+	const platformProfile = options.platformProfilePath === undefined ? undefined :
+		await loadPlatformProfile(options.platformProfilePath);
+	if (platformProfile && !options.platformDtype)
+		throw new Error("a bound platform profile needs an explicit platformDtype for its tolerance");
+	const platformBinding = platformProfile ?
+		derivePlatformTaskBinding(platformProfile, { dtype: options.platformDtype!,
+			...(options.platformPublicCases === undefined ? {} : { publicCases: options.platformPublicCases }) }) : undefined;
+	// A published card's API signatures and hard numeric budgets are a local,
+	// zero-device rejection. Frozen once here, they cannot drift mid-run, and
+	// they are a gate rather than a tool the session may remember to call.
+	const knowledgeCards = options.knowledgeCardsPath === undefined ? undefined :
+		parseKnowledgeCards(JSON.parse(await readFile(options.knowledgeCardsPath, "utf8")));
+	const cache = options.evaluationCacheDir === undefined ? undefined :
+		new EvaluationCache(options.evaluationCacheDir);
+	if (cache) await mkdir(options.evaluationCacheDir!, { recursive: true });
+	const gateCounters = { rejected: 0, checked: 0, suggested: 0 };
 	const capabilityScratch = await mkdtemp(path.join(tmpdir(), "local-operator-capability-"));
 	const capabilityOutput = await (async () => {
-		try { return await runHostCommand(python, ["-I", script, "--goal-capability", contractPath],
+		try {
+			// The binding reaches validation even here: a contract that declares a
+			// platform tolerance cannot be loaded without the profile behind it.
+			if (platformBinding) await writeFile(path.join(capabilityScratch, "worker-options.json"),
+				JSON.stringify({ platformBinding }), { flag: "wx" });
+			return await runHostCommand(python, ["-I", script, "--goal-capability", contractPath,
+				...(platformBinding ? [path.join(capabilityScratch, "worker-options.json")] : [])],
 			{ timeout: 30_000, maxBuffer: 1_000_000,
 				env: { ...workerEnvironment, HOME: capabilityScratch, TMPDIR: capabilityScratch } }); }
 		finally { await rm(capabilityScratch, { recursive: true, force: true }); }
@@ -210,7 +289,10 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 	// A measured number is only comparable within the environment that produced
 	// it, so the declared environment identity is part of every basis.
 	const environmentId = goalCapability.measurementEnvironment.environmentId;
-	const basisFor = (scope: string, kind = "case") => JSON.stringify([options.id, options.version, options.protocolId, subjectId, kind, scope, environmentId]);
+	// A latency only compares with another latency taken under the same
+	// protocol version, so that version is part of the basis itself.
+	const protocolScope = platformBinding ? `${options.protocolId}@${platformBinding.protocolVersion}` : options.protocolId;
+	const basisFor = (scope: string, kind = "case") => JSON.stringify([options.id, options.version, protocolScope, subjectId, kind, scope, environmentId]);
 	if (basisFor("x".repeat(80), "profile").length > 256)
 		throw new Error("local host measurement identity including subjectId and declared environment must fit the 256-character basis contract with an 80-character case id; choose concise host identity fields");
 	const backend: CandidateExecutionBackend = {
@@ -227,6 +309,39 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 			if (ctx.subjectId !== subjectId) throw new Error("candidate execution subjectId does not match the host-bound local operator subject");
 			await assertContract();
 			await mkdir(ctx.outputDir, { recursive: true });
+			const startedAtMs = Date.now();
+			const receiptIdentity = { goalRunId: ctx.goalRunId, taskId: ctx.taskId, operationId: ctx.operationId,
+				runId: ctx.runId, subjectId };
+			// A published signature table rejects a hallucinated API here, before
+			// a compiler is started: the local rejection costs nothing, and the
+			// finding carries the nearest legal signature with it.
+			if (ctx.stage.id === "contract" && knowledgeCards?.length) {
+				const source = await readFile(ctx.sources[0].frozenPath, "utf8");
+				const report = checkCandidate({ source }, knowledgeCards);
+				gateCounters.checked += report.checkedSymbols.length;
+				if (report.status === "reject") {
+					gateCounters.rejected++;
+					gateCounters.suggested += report.findings.filter(item => item.suggestion).length;
+					return writeGateRejection(ctx, receiptIdentity, report);
+				}
+			}
+			// An identical candidate, contract, platform and protocol has already
+			// been evaluated: replay that receipt rather than spend the device
+			// again. The entry is marked, so no statistic counts it twice.
+			const cacheParts = cache ? await cacheKeyFor(ctx) : undefined;
+			const cacheKey = cacheParts && evaluationCacheKey(cacheParts);
+			if (cache && cacheKey) {
+				const entry = await cache.read(cacheKey);
+				if (entry) {
+					const restored = await cache.restore(entry, ctx.outputDir);
+					return { status: entry.status,
+						summary: `${entry.summary} (replayed from an identical evaluation recorded ${entry.capturedAt})`,
+						receiptPaths: restored.map(file => path.relative(ctx.workDir, file)),
+						evaluationReceiptPaths: entry.evaluationReceiptNames.map(name =>
+							path.relative(ctx.workDir, path.join(ctx.outputDir, name))),
+						...(entry.performedChecks ? { performedChecks: entry.performedChecks } : {}) };
+				}
+			}
 			// Reuse exact compile-stage snapshots, never discover candidate-written
 			// artifacts or silently recompile during correctness or measurement.
 			const compiledInputs: Array<{ file: string; frozenPath: string }> = [];
@@ -269,12 +384,23 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 			if (!commandPrefix) throw new Error("local operator workers require an available write isolation mechanism; no unsandboxed fallback");
 			const workerOptions = path.join(ctx.outputDir, `worker-options-${path.basename(scratchRoot)}.json`);
 			await writeFile(workerOptions, JSON.stringify({ scratchRoot, logsRoot, commandPrefix, compiledBuildDir,
-				workerEnvironment }), { flag: "wx" });
+				workerEnvironment, platformBinding }), { flag: "wx" });
 			const command = { argv: [python, "-I", script, contractPath, workerOptions] as [string, ...string[]],
 				cwd: ctx.outputDir, env: { ...workerEnvironment, HOME: scratchRoot, TMPDIR: scratchRoot } };
 			const adapter = createCandidateCommandBackend({ id: options.id, version: options.version,
 				stages: stages.map(id => ({ id, mode: "local", checks: [id], execute: command })) });
-			const result = await adapter.executeStage(ctx);
+			// Only the timing stage needs a quiet machine. Holding the device for
+			// import, compilation and correctness as well would serialize the
+			// expensive part of the run for no gain in measurement fidelity.
+			const lease = ctx.stage.id === "measurement" && platformProfile?.deviceSerialization ?
+				await acquireDeviceLease({ file: path.resolve(ctx.workDir, platformProfile.deviceSerialization.leaseFile),
+					platformId: platformProfile.id, purpose: `measurement ${ctx.runId}`,
+					timeoutMs: platformProfile.deviceSerialization.timeoutMs }) : undefined;
+			const result = await (async () => {
+				try { return await adapter.executeStage(ctx); }
+				finally { if (lease) await lease.release(); }
+			})();
+			cache?.recordExecution(ctx.stage.id, Date.now() - startedAtMs);
 			const retainLogs = async (directory: string): Promise<void> => {
 				for (const entry of await readdir(directory, { withFileTypes: true })) {
 					const file = path.join(directory, entry.name);
@@ -321,9 +447,70 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 				await assertContract();
 			}
 			await assertCompiledInputs();
+			if (cache && cacheKey && cacheParts) {
+				// Everything this stage produced, including its nested worker logs,
+				// keeps its place under the output directory. A partial entry would
+				// replay a stage whose own evidence is missing, so an entry is only
+				// stored when every receipt belongs to this stage's tree.
+				const root = path.resolve(ctx.outputDir);
+				const within = (relative: string): string | undefined => {
+					const file = path.resolve(ctx.workDir, relative);
+					const inside = path.relative(root, file);
+					return inside && !inside.startsWith("..") && !path.isAbsolute(inside) ? inside : undefined;
+				};
+				const names = result.receiptPaths.map(relative => ({ name: within(relative),
+					file: path.resolve(ctx.workDir, relative) }));
+				const evaluations = (result.evaluationReceiptPaths ?? []).map(within);
+				if (names.length && evaluations.length && names.every(item => item.name !== undefined) &&
+					evaluations.every(name => name !== undefined))
+					await cache.store(cacheKey, cacheParts, { status: result.status === "passed" ? "passed" : "failed",
+						summary: result.summary ?? ctx.stage.id, ...(result.performedChecks ? { performedChecks: result.performedChecks } : {}),
+						receipts: names as Array<{ name: string; file: string }>,
+						evaluationNames: evaluations as string[], runId: ctx.runId });
+			}
 			return result;
 		},
 	};
+
+	/** The cache key's source digest is the parsed program, so a comment or a
+	 * reformat does not look like new work. The contract supplies it, because
+	 * the contract is what would actually run. */
+	async function normalizedSourceDigest(file: string): Promise<string> {
+		const output = await runHostCommand(python, ["-I", script, "--normalize-source", file],
+			{ timeout: 30_000, maxBuffer: 1_000_000, env: { ...workerEnvironment, HOME: tmpdir(), TMPDIR: tmpdir() } });
+		const parsed = JSON.parse(output.stdout) as { sha256?: unknown };
+		if (typeof parsed.sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(parsed.sha256))
+			throw new Error("source normalization did not return a digest");
+		return parsed.sha256;
+	}
+
+	async function cacheKeyFor(ctx: CandidateExecutionContext): Promise<EvaluationCacheKeyParts> {
+		return { backendId: options.id, backendVersion: options.version, protocolId: options.protocolId,
+			subjectId, stageId: ctx.stage.id,
+			sourceDigest: await normalizedSourceDigest(ctx.sources[0].frozenPath),
+			contractDigest,
+			platformKey: platformBinding ? `${platformBinding.chip}/${platformBinding.toolchain}` : "unbound",
+			protocolVersion: platformBinding?.protocolVersion ?? "unversioned",
+			caseSetId: platformBinding ? platformBinding.cases.map(item => item.id).join(",") : "contract" };
+	}
+
+	/** A gate rejection is a real stage result with its own frozen receipt, so
+	 * the cascade stops here and the findings reach the next round as evidence. */
+	async function writeGateRejection(ctx: CandidateExecutionContext, identity: LocalReceipt["identity"],
+		report: StaticCheckReport): Promise<CandidateExecutionStageResult> {
+		const receipt: LocalReceipt & { knowledgeGate: StaticCheckReport } = {
+			version: 1, kind: "local-operator-evaluation", identity, protocolId: options.protocolId,
+			stage: ctx.stage.id, capturedAt: new Date().toISOString(), contractSha256: contractDigest,
+			passed: false, inconclusive: false,
+			error: `published API contract rejected this candidate before compilation: ${report.findings.map(item => item.witness).join(", ")}`,
+			knowledgeGate: report,
+		};
+		const file = path.join(ctx.outputDir, "evaluation.json");
+		await writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx" });
+		const relative = path.relative(ctx.workDir, file);
+		return { status: "failed", summary: `${ctx.stage.id}: rejected by the published API contract before compilation`,
+			receiptPaths: [relative], evaluationReceiptPaths: [relative], performedChecks: ctx.stage.checks };
+	}
 
 	async function authority(taskWork: string, identity: LocalReceipt["identity"]): Promise<BoundJournal> {
 		const { runId, taskId, goalRunId, operationId } = identity;
@@ -437,6 +624,9 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 					: "Task-contract Python evaluation; finite numeric JSON outputs. Compile means Python bytecode validation only; no native compiler was bound.",
 					"Timing is synchronized by the task function. Measurement rounds use serial alternating independent persistent workers and named task baselines; host/device isolation, clocks and suitability of task cases are not inferred from a passing result.",
 					"No-op sensitivity and replaced-API call counts establish that the declared kernel is reached and that the library entry points it replaces were not called; they do not prove what share of device time runs inside it."];
+				if (platformBinding) limitations.push(...describePlatformTaskBinding(platformBinding).map(item => item.slice(0, 1800)));
+				if (receipt.platformBinding && receipt.platformBinding.protocolVersion !== platformBinding?.protocolVersion)
+					return unknown("receipt was produced under a different platform measurement protocol version");
 				if (environment) limitations.push(`Numbers hold only for declared environment ${environment.environmentId} (clocks: ${environment.clockPolicy}; cache state: ${environment.cacheState}; precision policy: ${environment.precision}); they cannot be quoted for another machine, toolchain or precision policy.`.slice(0, 1800));
 				if (receipt.baselineTiers) limitations.push(`Baseline denominators by declared tier: ${Object.entries(receipt.baselineTiers).map(([name, tier]) => `${name}=${tier}`).join(", ")}. A ratio against one tier does not transfer to another.`.slice(0, 1800));
 				if (receipt.hiddenVariants?.length) limitations.push(`Correctness was judged on the declared values and the host value-only variants ${receipt.hiddenVariants.join(", ")}; variants the reference or a known-correct baseline could not evaluate were dropped rather than charged to the candidate.`.slice(0, 1800));
@@ -444,6 +634,17 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 				if (receipt.measurementNotComparable?.length) limitations.push(`No performance comparison: ${receipt.measurementNotComparable.join("; ")}.`.slice(0, 1800));
 				if (receipt.cases?.some(row => row.performanceDecidable === false))
 					limitations.push(`Cases excluded from performance selection: ${receipt.cases.filter(row => row.performanceDecidable === false).map(row => `${row.caseId}${row.performanceUndecidableReason ? ` (${row.performanceUndecidableReason})` : ""}`).join("; ")}.`.slice(0, 1800));
+				if (platformProfile && diagnostics.length) {
+					// Cold-start failures are not one bucket: the published split is
+					// three quarters syntax-level, a fifth hardware-level and a few
+					// percent numeric, and each routes somewhere different.
+					const diagnosis = diagnosePlatformOutput(platformProfile, diagnostics.map(item => item.rawText).join("\n"));
+					const counts = new Map<string, number>();
+					for (const item of diagnosis.classes) counts.set(item.class, (counts.get(item.class) ?? 0) + 1);
+					if (counts.size) limitations.push(`Platform failure classes: ${[...counts].map(([name, value]) => `${name}=${value}`).join(", ")}.`.slice(0, 1800));
+					for (const hint of diagnosis.symbolHints)
+						limitations.push(`Rejected symbol ${hint.used}; nearest legal signatures: ${hint.nearest.join(", ") || "none in the probed surface"}.`.slice(0, 1800));
+				}
 				if (receipt.api?.unresolvedCalls?.length) limitations.push("Some API calls lack a task-selected mechanically resolvable signature; inspect the raw API diagnostic.");
 				if (receipt.nativeCompilation && !receipt.nativeCompilation.passed) diagnostics.push({ category: "compile", fieldPath: "nativeCompilation", rawText: JSON.stringify(receipt.nativeCompilation) });
 				if (receipt.parameterValidation?.valid === false) diagnostics.push({ category: "unknown", fieldPath: "parameterValidation",
@@ -555,7 +756,7 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 			if (!commandPrefix) throw new Error("local operator goal verification requires the bound worker write isolation");
 			const workerOptions = path.join(root, "worker-options.json"), request = path.join(root, "request.json");
 			await writeFile(workerOptions, JSON.stringify({ scratchRoot, logsRoot, commandPrefix,
-				workerEnvironment }), { flag: "wx" });
+				workerEnvironment, platformBinding }), { flag: "wx" });
 			await writeFile(request, JSON.stringify({ criteria: goal.successCriteria, observations }), { flag: "wx" });
 			const output = await runHostCommand(python, ["-I", script, "--verify-goal", contractPath, workerOptions, request],
 				{ cwd: root, timeout: Math.min(2_147_483_647, Math.ceil(goalTimeoutSeconds * 1000) + 10_000),
@@ -586,7 +787,7 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 				profile ? ["/usr/bin/sandbox-exec", "-p", profile] : undefined;
 			if (!commandPrefix) throw new Error(`${label} requires the bound worker write isolation`);
 			const workerOptions = path.join(root, "worker-options.json");
-			await writeFile(workerOptions, JSON.stringify({ scratchRoot, logsRoot, commandPrefix, workerEnvironment }), { flag: "wx" });
+			await writeFile(workerOptions, JSON.stringify({ scratchRoot, logsRoot, commandPrefix, workerEnvironment, platformBinding }), { flag: "wx" });
 			const output = await runHostCommand(python, ["-I", script, prefix, contractPath, workerOptions, ...extra],
 				{ cwd: root, timeout: Math.min(2_147_483_647, Math.ceil(goalTimeoutSeconds * 1000) + 600_000),
 					maxBuffer: goalOutputBytes + 1_000_000,
@@ -617,5 +818,14 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 			throw new Error("certification returned a report for another contract");
 		return report;
 	}
-	return { backend, verifier, auditChecks, certifyCandidate };
+	/** What this host actually spent and what it avoided spending. Without it a
+	 * run cannot answer where its device time went or how much was replayed. */
+	async function evaluationProfile(): Promise<LocalOperatorEvaluationProfileV1> {
+		return { version: 1, kind: "local-operator-evaluation-profile",
+			apiGate: { ...gateCounters, nearestSignatureRate: gateCounters.rejected ? gateCounters.suggested / gateCounters.rejected : null },
+			cache: cache ? { ...cache.stats, entriesOnDisk: await cache.size() } : undefined,
+			platform: platformBinding ? { profileId: platformBinding.profileId,
+				protocolVersion: platformBinding.protocolVersion } : undefined };
+	}
+	return { backend, verifier, auditChecks, certifyCandidate, evaluationProfile };
 }
