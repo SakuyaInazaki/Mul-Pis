@@ -14,6 +14,8 @@ export interface CandidateFixture {
 	externalId: string;
 	/** Omit the same-basis reference measurement: the metric then has no denominator. */
 	withoutReference?: boolean;
+	/** Replace the frozen receipt body, e.g. with host performance decisions. */
+	receipt?: Record<string, unknown>;
 }
 
 /** Writes stages/M07/<runId>/{run.json,goal.json} plus the frozen evidence files. */
@@ -31,7 +33,7 @@ export async function writeCandidateGoal(ws: Workspace, runId: string, subjectId
 		const receipt = path.join(frozenDir, `${candidate.id}-receipt.json`);
 		const observationPath = path.join(frozenDir, `${candidate.id}-observation.json`);
 		await writeFile(source, candidate.source);
-		await writeFile(receipt, JSON.stringify({ externalId: candidate.externalId }));
+		await writeFile(receipt, JSON.stringify(candidate.receipt ?? { externalId: candidate.externalId }));
 		const observation = {
 			version: 1, kind: "candidate-observation", verifier: { id: "host", version: "1" },
 			sourceBinding: "verified", correctness: "passed", stage: "measurement",

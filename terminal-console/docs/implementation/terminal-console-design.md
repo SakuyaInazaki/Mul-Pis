@@ -92,9 +92,15 @@ npm run console -- audit --workspace /path/to/workspace --json # 结构化
 | 停在哪一级验证门 | 每个候选观测由 `summarizeCandidateDiagnostics` 确定性归类后停在的那一级：源码未绑定、未终态、编译失败、数值失败、运行失败、混合失败、正确性失败、正确未测量、正确已测量 |
 | 引擎与 agent 自述的差 | agent 声明了候选的任务数，以及其中宿主核验通过、判失败、未判定各多少，控制器另行驳回多少 |
 | 失败分账 | 基础设施失败（源码未绑定、未终态外部操作、执行失败）与策略失败（编译/数值/运行/正确性失败、复核失败）分列，另有未分类一栏 |
+| 运行层分类的失败 | 直接读回运行层自己的判定：工具调用的 `failureClass`/`failureReason` 来自任务工具日志，传输失败来自运行记录里的「Read-only assessor transport observation」。界面**不重新分类**；没有标记的旧记录单列为「未记录分类」。未判定占比是 harness 健康指标 |
+| 候选 guard 判决 / 晋级状态 / 分支决策 / 车道与相位 / 评分 | 读回 `episode.candidates[].policy` 的 `guard`（reject/keep/accept/revert）、`status`（unverified/verified/admissible/promoted）、`branch`（continue/merge/archive/abandon）、`lane`、`phase`、`score` 与「是否更新最佳指针」。没有判定记录的候选单列，不并入任何分布 |
+| 搜索状态 | 读回 `episode.search`：最大停滞、强制换向次数、禁用方向条数、路线与停滞信号分布 |
+| 搜索预算 | 读回 `episode.budget`：已用评估数（含前置驳回）、最小剩余、停止原因分布 |
 | 预算 | 会话数、输入/输出/缓存 token、计费合计，以及记录是否完整 |
 | 反馈密度 | 每个宿主核验通过需要多少候选；每百万 token 产出多少候选观测 |
 | 改动类别 / 候选意图 / 性能画像证据 | 候选 `changeKind`、`intent` 与画像可用性（unavailable / partial / derived）的分布 |
+
+逐节点视图同样接上了这些字段：候选节点列出它的宿主判决（guard、状态、分支、车道、相位、排名分与档位、是否更新最佳、对位最佳比较、失败签名、必须修复与建议），候选实验节点列出搜索状态与搜索预算的完整文字。
 
 没有分母时显示「无分母」，不显示 0 也不编造比值。用量记录不完整时，预算是已读记录的**下界**并明确标注。未判定候选既不算失败也不算通过，不进入最佳与搜索前沿；它的占比本身是 harness 健康指标。审计只做计数，不判断科研质量，也不声称某个已测量候选真的更快。
 

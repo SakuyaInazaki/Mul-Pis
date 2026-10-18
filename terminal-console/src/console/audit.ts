@@ -24,10 +24,36 @@ const GATES: ReadonlyArray<CandidateDiagnosticSummaryV1["stage"]> = ["source-unv
 const INFRASTRUCTURE_GATES: ReadonlySet<string> = new Set(["source-unverified", "pending-or-unknown"]);
 const SUCCESS_GATES: ReadonlySet<string> = new Set(["correct-measured", "correct-unmeasured"]);
 
+/** One persisted assessor transport observation, already classified by the runner. */
+export interface AuditTransportObservation {
+	failureClass?: string;
+	failureReason?: string;
+}
+
 export interface AuditGoalInput {
 	runId: string;
 	tasks: readonly M07TaskRecord[];
+	/** Transport observations recorded under this run, newest last. */
+	transport?: readonly AuditTransportObservation[];
+	/** True when the reader stopped short of every recorded observation. */
+	transportTruncated?: boolean;
 }
+
+const GUARDS = ["reject", "keep", "accept", "revert"] as const;
+const STATUSES = ["unverified", "verified", "admissible", "promoted"] as const;
+const BRANCHES = ["continue", "merge", "archive", "abandon"] as const;
+const LANES = ["repair", "optimization"] as const;
+const PHASES = ["bootstrap", "tuning"] as const;
+const ROUTES = ["continue", "repair-in-place", "restructure", "replan"] as const;
+
+const asObject = (value: unknown): Record<string, unknown> | undefined =>
+	value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+const median = (values: readonly number[]): number | null => {
+	if (!values.length) return null;
+	const sorted = [...values].sort((a, b) => a - b);
+	const middle = sorted.length >> 1;
+	return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+};
 
 class Tally {
 	private readonly counts = new Map<string, number>();
@@ -44,6 +70,15 @@ interface Accumulators {
 	changeKinds: Tally;
 	intents: Tally;
 	profilerEvidence: Tally;
+	guards: Tally;
+	statuses: Tally;
+	branches: Tally;
+	lanes: Tally;
+	phases: Tally;
+	routes: Tally;
+	signals: Tally;
+	stops: Tally;
+	reasons: Tally;
 }
 
 function countObservation(audit: WorkflowAuditV1, totals: Accumulators, observation: CandidateObservationV1): void {
@@ -71,14 +106,34 @@ export function buildWorkflowAudit(goals: readonly AuditGoalInput[], nodes: read
 		selfAccepted: { declaredByAgent: 0, hostPassed: 0, hostRefused: 0, hostUnjudged: 0, controllerRejected: 0 },
 		judgement: { candidates: 0, verifiedPassed: 0, verifiedFailed: 0, unjudged: 0 },
 		failures: { infrastructure: 0, policy: 0, unclassified: 0 },
+		classifiedFailures: { tools: { infrastructure: 0, policy: 0, unjudged: 0, unrecorded: 0 },
+			transport: { infrastructure: 0, policy: 0, unjudged: 0, unrecorded: 0 },
+			unjudgedShare: null, reasons: [], truncated: false },
+		policy: { guards: [], statuses: [], branches: [], lanes: [], phases: [],
+			updatesBest: 0, scored: 0, scoreMedian: null, scoreMax: null, undecided: 0 },
+		search: { tasks: 0, maxStagnation: 0, forcedDirectionChanges: 0, routes: [], signals: [], bannedDirections: 0 },
+		searchBudget: { tasks: 0, evaluations: 0, rejected: 0, remaining: null, stops: [] },
 		budget: { sessions: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0,
 			usageComplete: true, costComplete: true, unknownEvents: 0 },
 		profile: { changeKinds: [], intents: [], profilerEvidence: [],
 			candidatesPerVerifiedPass: null, candidatesPerMillionTokens: null },
 		notes: [],
 	};
-	const totals: Accumulators = { gates: new Tally(), changeKinds: new Tally(), intents: new Tally(), profilerEvidence: new Tally() };
-	for (const goal of goals) for (const task of goal.tasks) {
+	const totals: Accumulators = { gates: new Tally(), changeKinds: new Tally(), intents: new Tally(),
+		profilerEvidence: new Tally(), guards: new Tally(), statuses: new Tally(), branches: new Tally(),
+		lanes: new Tally(), phases: new Tally(), routes: new Tally(), signals: new Tally(),
+		stops: new Tally(), reasons: new Tally() };
+	const scores: number[] = [];
+	for (const goal of goals) {
+	audit.classifiedFailures.truncated ||= goal.transportTruncated === true;
+	for (const observation of goal.transport ?? []) {
+		const failureClass = observation.failureClass;
+		if (failureClass === "infrastructure" || failureClass === "policy" || failureClass === "unjudged")
+			audit.classifiedFailures.transport[failureClass]++;
+		else audit.classifiedFailures.transport.unrecorded++;
+		if (observation.failureReason) totals.reasons.add(observation.failureReason);
+	}
+	for (const task of goal.tasks) {
 		audit.tasks.total++;
 		if (task.status === "running") audit.tasks.running++;
 		else if (task.status === "returned") audit.tasks.returned++;
@@ -102,12 +157,51 @@ export function buildWorkflowAudit(goals: readonly AuditGoalInput[], nodes: read
 			countObservation(audit, totals, candidate.observation);
 			totals.changeKinds.add(candidate.changeKind);
 			totals.intents.add(candidate.intent);
+			const policy = candidate.policy;
+			if (!policy) { audit.policy.undecided++; continue; }
+			totals.guards.add(policy.guard);
+			totals.statuses.add(policy.status);
+			totals.branches.add(policy.branch);
+			totals.lanes.add(policy.lane);
+			totals.phases.add(policy.phase);
+			if (policy.updatesBest) audit.policy.updatesBest++;
+			if (Number.isFinite(policy.score)) scores.push(policy.score);
+		}
+		const search = task.episode?.search;
+		if (search) {
+			audit.search.tasks++;
+			audit.search.maxStagnation = Math.max(audit.search.maxStagnation, search.stagnation);
+			if (search.forcedDirectionChange) audit.search.forcedDirectionChanges++;
+			totals.routes.add(search.route);
+			for (const signal of search.signals) totals.signals.add(signal);
+			audit.search.bannedDirections += search.bannedDirections.length;
+		}
+		const budget = task.episode?.budget;
+		if (budget) {
+			audit.searchBudget.tasks++;
+			audit.searchBudget.evaluations += budget.evaluations;
+			audit.searchBudget.rejected += budget.rejected;
+			audit.searchBudget.remaining = Math.min(audit.searchBudget.remaining ?? budget.remaining, budget.remaining);
+			if (budget.stop) totals.stops.add(budget.stop);
+		}
+		// Tool calls carry the runner's own failure class; the audit counts them,
+		// it never reclassifies a failure the runner already judged.
+		for (const raw of task.toolLog) {
+			const entry = asObject(raw);
+			if (!entry || entry.ok !== false) continue;
+			const failureClass = entry.failureClass;
+			if (failureClass === "infrastructure" || failureClass === "policy" || failureClass === "unjudged")
+				audit.classifiedFailures.tools[failureClass]++;
+			else audit.classifiedFailures.tools.unrecorded++;
+			const reason = typeof entry.failureReason === "string" ? entry.failureReason : undefined;
+			if (reason) totals.reasons.add(reason);
 		}
 		// A final declared candidate that reuses an episode observation is already
 		// counted above; only an independently frozen one adds a judgement.
 		const final = task.candidateObservation;
 		if (final && !(task.episode?.candidates ?? []).some(item => item.observationPath === final.observationPath))
 			countObservation(audit, totals, final);
+	}
 	}
 	for (const node of nodes) {
 		if (node.kind !== "session" || !node.usage) continue;
@@ -122,6 +216,22 @@ export function buildWorkflowAudit(goals: readonly AuditGoalInput[], nodes: read
 		audit.budget.costComplete &&= node.usage.costComplete;
 	}
 	audit.gates = totals.gates.rows(GATES).map(row => ({ gate: row.name, count: row.count }));
+	audit.policy.guards = totals.guards.rows(GUARDS).map(row => ({ guard: row.name, count: row.count }));
+	audit.policy.statuses = totals.statuses.rows(STATUSES).map(row => ({ status: row.name, count: row.count }));
+	audit.policy.branches = totals.branches.rows(BRANCHES).map(row => ({ branch: row.name, count: row.count }));
+	audit.policy.lanes = totals.lanes.rows(LANES).map(row => ({ lane: row.name, count: row.count }));
+	audit.policy.phases = totals.phases.rows(PHASES).map(row => ({ phase: row.name, count: row.count }));
+	audit.policy.scored = scores.length;
+	audit.policy.scoreMedian = median(scores);
+	audit.policy.scoreMax = scores.length ? Math.max(...scores) : null;
+	audit.search.routes = totals.routes.rows(ROUTES).map(row => ({ route: row.name, count: row.count }));
+	audit.search.signals = totals.signals.rows().map(row => ({ signal: row.name, count: row.count }));
+	audit.searchBudget.stops = totals.stops.rows().map(row => ({ stop: row.name, count: row.count }));
+	audit.classifiedFailures.reasons = totals.reasons.rows().map(row => ({ reason: row.name, count: row.count }));
+	const classified = audit.classifiedFailures;
+	const judged = classified.tools.infrastructure + classified.tools.policy + classified.tools.unjudged +
+		classified.transport.infrastructure + classified.transport.policy + classified.transport.unjudged;
+	classified.unjudgedShare = judged ? (classified.tools.unjudged + classified.transport.unjudged) / judged : null;
 	audit.profile.changeKinds = totals.changeKinds.rows().map(row => ({ changeKind: row.name, count: row.count }));
 	audit.profile.intents = totals.intents.rows().map(row => ({ intent: row.name, count: row.count }));
 	audit.profile.profilerEvidence = totals.profilerEvidence.rows().map(row => ({ evidence: row.name, count: row.count }));
@@ -136,6 +246,12 @@ export function buildWorkflowAudit(goals: readonly AuditGoalInput[], nodes: read
 	if (!audit.judgement.candidates)
 		audit.notes.push("本工作区还没有冻结候选观测；判决分布与反馈密度暂无分母。");
 	audit.notes.push("失败分账按确定性规则计：源码未绑定与未终态外部操作记为基础设施失败，编译/数值/运行/正确性失败与复核失败记为策略失败。");
+	if (classified.tools.unrecorded || classified.transport.unrecorded)
+		audit.notes.push("有失败记录没有带运行层的分类标记（旧记录或未分类路径）；它们单列为「未记录分类」，不并入任何一类。");
+	if (classified.truncated)
+		audit.notes.push("传输观测超出读取窗口，只统计了最近的一段；可在 .agent/console-limits.json 调大 transportObservationWindow。");
+	if (audit.policy.undecided)
+		audit.notes.push("有候选没有宿主判定记录；它们不进入 guard、状态、分支与评分分布。");
 	return audit;
 }
 
@@ -153,6 +269,15 @@ export function renderWorkflowAudit(audit: WorkflowAuditV1): string[] {
 		`失败分账：基础设施 ${audit.failures.infrastructure}、策略 ${audit.failures.policy}、未分类 ${audit.failures.unclassified}`,
 		`预算：会话 ${audit.budget.sessions}、输入 ${audit.budget.input}、输出 ${audit.budget.output}、缓存读取 ${audit.budget.cacheRead}、缓存写入 ${audit.budget.cacheWrite}、计费 ${audit.budget.cost}${audit.budget.usageComplete && audit.budget.costComplete ? "" : "（记录不完整，为下界）"}；未知用量事件 ${audit.budget.unknownEvents}`,
 		`反馈密度：每个宿主核验通过需 ${ratio(audit.profile.candidatesPerVerifiedPass)} 个候选；每百万 token 产出 ${ratio(audit.profile.candidatesPerMillionTokens)} 个候选观测`,
+		`运行层分类的失败：工具调用——基础设施 ${audit.classifiedFailures.tools.infrastructure}、策略 ${audit.classifiedFailures.tools.policy}、未判定 ${audit.classifiedFailures.tools.unjudged}、未记录分类 ${audit.classifiedFailures.tools.unrecorded}；传输——基础设施 ${audit.classifiedFailures.transport.infrastructure}、策略 ${audit.classifiedFailures.transport.policy}、未判定 ${audit.classifiedFailures.transport.unjudged}、未记录分类 ${audit.classifiedFailures.transport.unrecorded}；未判定占比 ${audit.classifiedFailures.unjudgedShare === null ? "无分母" : `${(audit.classifiedFailures.unjudgedShare * 100).toFixed(1)}%`}`,
+		`失败原因分布：${audit.classifiedFailures.reasons.length ? audit.classifiedFailures.reasons.map(row => `${row.reason} ${row.count}`).join("、") : "暂无"}`,
+		`候选 guard 判决：${audit.policy.guards.length ? audit.policy.guards.map(row => `${row.guard} ${row.count}`).join("、") : "暂无"}（更新最佳 ${audit.policy.updatesBest} 次，无判定 ${audit.policy.undecided} 个）`,
+		`候选晋级状态：${audit.policy.statuses.length ? audit.policy.statuses.map(row => `${row.status} ${row.count}`).join("、") : "暂无"}`,
+		`分支决策：${audit.policy.branches.length ? audit.policy.branches.map(row => `${row.branch} ${row.count}`).join("、") : "暂无"}`,
+		`车道与相位：${audit.policy.lanes.map(row => `${row.lane} ${row.count}`).join("、") || "暂无"}；${audit.policy.phases.map(row => `${row.phase} ${row.count}`).join("、") || "暂无"}`,
+		`候选评分：已评分 ${audit.policy.scored} 个，中位数 ${ratio(audit.policy.scoreMedian)}，最高 ${ratio(audit.policy.scoreMax)}（排名用，不是收益）`,
+		`搜索状态：登记 ${audit.search.tasks} 个任务，最大停滞 ${audit.search.maxStagnation}，强制换向 ${audit.search.forcedDirectionChanges} 次，禁用方向 ${audit.search.bannedDirections} 条；路线 ${audit.search.routes.map(row => `${row.route} ${row.count}`).join("、") || "暂无"}；停滞信号 ${audit.search.signals.map(row => `${row.signal} ${row.count}`).join("、") || "暂无"}`,
+		`搜索预算：登记 ${audit.searchBudget.tasks} 个任务，已用评估 ${audit.searchBudget.evaluations}（其中前置驳回 ${audit.searchBudget.rejected}），最小剩余 ${audit.searchBudget.remaining === null ? "未登记" : audit.searchBudget.remaining}；停止原因 ${audit.searchBudget.stops.map(row => `${row.stop} ${row.count}`).join("、") || "无"}`,
 		`改动类别分布：${audit.profile.changeKinds.length ? audit.profile.changeKinds.map(row => `${row.changeKind} ${row.count}`).join("、") : "暂无"}`,
 		`候选意图分布：${audit.profile.intents.length ? audit.profile.intents.map(row => `${row.intent} ${row.count}`).join("、") : "暂无"}`,
 		`性能画像证据：${audit.profile.profilerEvidence.length ? audit.profile.profilerEvidence.map(row => `${row.evidence} ${row.count}`).join("、") : "暂无"}`,

@@ -10,7 +10,7 @@ import type { StageRunRecord } from "../../../src/types.ts";
 import type { ObjectiveProgressV1 } from "../../../src/m07/objective-progress.ts";
 import { openDefaultLocalMission } from "../../../src/m07/local-mission.ts";
 import type { ConsoleRef, ConsoleStatus, WorkflowNode, WorkflowSnapshot } from "./model.ts";
-import { buildWorkflowAudit, type AuditGoalInput } from "./audit.ts";
+import { buildWorkflowAudit, type AuditGoalInput, type AuditTransportObservation } from "./audit.ts";
 import { DEFAULT_CONSOLE_LIMITS, loadConsoleLimits, type ConsoleLimitsV1 } from "./limits.ts";
 
 export type { WorkflowSnapshot, WorkflowNode } from "./model.ts";
@@ -224,9 +224,26 @@ export class WorkflowReader {
     for (const run of runs) {
       if (run.stage !== "M07") continue;
       const goal = await this.json(path.join(this.workspace, "stages", "M07", run.runId, "goal.json")) as CurrentGoal | undefined;
-      if (goal?.runId === run.runId && Array.isArray(goal.tasks)) goals.push({ runId: run.runId, tasks: goal.tasks });
+      if (goal?.runId === run.runId && Array.isArray(goal.tasks))
+        goals.push({ runId: run.runId, tasks: goal.tasks, ...await this.transportObservations(run) });
     }
     return goals;
+  }
+
+  /** Assessor transport failures are persisted as run outputs. Their class is
+   * the runner's own judgement; this only reads it back, newest window first. */
+  private async transportObservations(run: StageRunRecord): Promise<{ transport: AuditTransportObservation[]; transportTruncated: boolean }> {
+    const files = (run.outputs ?? []).filter(output => output.label === "Read-only assessor transport observation");
+    const window = files.slice(-this.limits.transportObservationWindow);
+    const transport: AuditTransportObservation[] = [];
+    for (const output of window) {
+      const record = obj(await this.json(output.path));
+      if (!record) continue;
+      const diagnostic = obj(record.diagnostic);
+      transport.push({ ...(str(diagnostic?.failureClass) ? { failureClass: str(diagnostic?.failureClass)! } : {}),
+        ...(str(diagnostic?.failureReason) ? { failureReason: str(diagnostic?.failureReason)! } : {}) });
+    }
+    return { transport, transportTruncated: files.length > window.length };
   }
 
   private runNode(run: StageRunRecord): WorkflowNode {
@@ -491,6 +508,12 @@ export class WorkflowReader {
         status: t.status === "running" ? taskStatus : episode.candidates.length ? "returned" : "pending",
         stage: "M07", runId: run.runId, taskId: t.taskId,
         detail: [`已冻结候选：${episode.candidates.length}`, `当前探索点：${episode.currentCandidateId ?? "无"}`,
+          ...(episode.search ? [`搜索状态：路线 ${episode.search.route} · 相位 ${episode.search.phase} · 停滞 ${episode.search.stagnation} · 修复深度 ${episode.search.repairDepth}${episode.search.forcedDirectionChange ? " · 已强制换向" : ""}`,
+            `停滞信号：${episode.search.signals.join("、") || "无"}；禁用方向 ${episode.search.bannedDirections.length} 条${episode.search.bannedDirections.length ? `（${episode.search.bannedDirections.map(item => `${item.changeKind}${item.strategy ? `/${item.strategy}` : ""}${item.location ? `@${item.location}` : ""} ← ${item.candidateRef}`).slice(0, 5).join("、")}）` : ""}`,
+            ...(episode.search.recommendedParents.length ? [`建议父候选：${episode.search.recommendedParents.map(item => `${item.candidateRef}（${item.why}）`).join("、")}`] : []),
+            episode.search.message] : []),
+          ...(episode.budget ? [`搜索预算：已用评估 ${episode.budget.evaluations}（修复 ${episode.budget.repair}、优化 ${episode.budget.optimization}、参数 ${episode.budget.parameters}、前置驳回 ${episode.budget.rejected}）· 剩余 ${episode.budget.remaining}${episode.budget.stop ? ` · 已停止：${episode.budget.stop}` : ""}`,
+            episode.budget.message] : []),
           ...incumbentRows.map(item => `本 episode 局部最佳：${item.candidateId} · 对象 ${item.subjectId} · ${item.metric.name}=${item.metric.value} ${item.metric.unit}（${item.metric.basisId}）`),
           "局部最佳不代表整个目标的历史最佳、任务接受或原目标达标；任务状态另见父节点"].map(clean),
         outputRefs: incumbentRows.map(item => ({ label: `局部最佳 ${item.candidateId} 的冻结观测`, path: byId.get(item.candidateId)!.observationPath })),
@@ -507,6 +530,17 @@ export class WorkflowReader {
           kind: "candidate", status: observation.correctness === "passed" ? "returned" : observation.correctness === "failed" ? "failed" : "unknown",
           stage: "M07", runId: run.runId, taskId: t.taskId,
           detail: [`假设：${candidate.hypothesis}`, `改动类别：${candidate.changeKind}`, `候选意图：${candidate.intent}`,
+            ...(candidate.policy ? [
+              `宿主判决：${candidate.policy.guard} · 状态 ${candidate.policy.status} · 分支 ${candidate.policy.branch} · 车道 ${candidate.policy.lane} · 相位 ${candidate.policy.phase}`,
+              `排名分：${candidate.policy.score}（${candidate.policy.tier}）；${candidate.policy.updatesBest ? "更新了最佳指针" : "未更新最佳指针"}${candidate.policy.seedSpeedup === undefined ? "" : `；相对种子 ${candidate.policy.seedRef ?? "未记录"} 的最坏同口径比 ${candidate.policy.seedSpeedup}`}`,
+              ...(candidate.policy.failureSignature ? [`失败签名：${candidate.policy.failureSignature}（同签名重复出现即「无进展」）`] : []),
+              ...candidate.policy.incumbentComparison.map(item => `对位最佳比较：${item.name}（${item.basisId}，${item.unit}）候选 ${item.candidateValue} 对 ${item.incumbentRef} 的 ${item.incumbentValue}，相对增益 ${item.relativeGain}${item.improved ? "，改善" : item.regressed ? "，回退" : "，在噪声内"}`),
+              ...candidate.policy.requiredFix.map(item => `必须修复：${item}`),
+              ...candidate.policy.advisory.map(item => `建议：${item}`),
+              ...candidate.policy.reasons.map(item => `判决依据：${item}`),
+              "判决由宿主确定性代码给出，不是模型自述；它只说明搜索状态如何变化，不等于科学结论。"] : ["本候选没有宿主判决记录"]),
+            ...(candidate.strategy ? [`声明策略：${candidate.strategy}${candidate.location ? ` @ ${candidate.location}` : ""}`] : []),
+            ...(candidate.newEvidence ? [`重复禁用方向的声明理由：${candidate.newEvidence}（模型声明，不是宿主事实）`] : []),
             ...(!availableCandidateRefs.has(`${t.taskId}/${candidate.id}`) ? ["冻结证据当前不可读取；以下路径为历史登记，不参与当前最佳和搜索前沿。"] : []),
             `父候选：${parentRef ? `${parentRef.taskId}/${parentRef.candidateId}` : candidate.parentCandidateId ?? "无"}`,
             ...(parentRef && parentRef.taskId !== t.taskId ? ["跨任务血缘为候选声明；本节点保留在当前任务实验下"] : []),
