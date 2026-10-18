@@ -31,8 +31,10 @@
  *   knowledge pack --purpose <text> [--ids C001,K002] [--terms a,b]
  *   knowledge views              regenerate derived views
  *
- * Global options: --workspace <dir> (default: cwd), --runner pi|fake (default pi).
+ * Global options: --workspace <dir> (default: cwd), --runner pi|claude|fake (default pi).
  * The fake runner is for dry runs and tests; it echoes a fixed reply and never calls a model.
+ * The claude runner uses the Claude Code CLI; it serves `claude-code/<model>` roles and declines
+ * the grants and branch operations it cannot evidence. See `src/runner/claude.ts`.
  */
 import path from "node:path";
 import { readFile } from "node:fs/promises";
@@ -116,12 +118,16 @@ async function makeRunner(kind: string): Promise<SessionRunner> {
 			reads: spec.tools.kind === "read-dir" ? ["source.md"] : [],
 		}));
 	}
+	if (kind === "claude") {
+		const mod = await import("./runner/claude.ts");
+		return mod.createClaudeSessionRunner();
+	}
 	const mod = await import("./runner/pi.ts");
 	return mod.createPiSessionRunner();
 }
 
 function usage(): string {
-	return `用法：node src/cli.ts <init|m01|m02|m03|m04|m05|m06|m08|m09|status|knowledge|improve|goal|mission> [选项]\n  --workspace <dir>   工作区（默认当前目录）\n  --runner pi|fake    会话运行器（默认 pi）\n  mission start [--original <json>]：默认固定工作区 problem.md 原文作为开放目标；JSON 可给出明确义务和有限收口条件\n  mission run|resume|status --mission <id>：执行、继续或只查看一项本地任务；无需 GitHub 参数\n  mission reconcile --mission <id> --review <json>：核对未来版本化双向派发血缘与旧终态，写入仅供新工作使用的 checkpoint\n  mission reconcile-legacy --mission <id> --review <json> [--apply]：默认只读 dry-run；仅在完整旧源代码、串行归属与效果审查通过后，显式 --apply 才写入独立的 legacy 审查 checkpoint\n  goal status --run <id>：只显示控制摘要，不输出原始会话或 toolLog\n  goal delegate --run <id> --task <json> [--runner pi|fake]：执行有界任务；fork 须在 task.context 中给出 mode=fork、同一 parentRunId、parentTaskId、checkpointId，并保持原 objective/inputs/outputs/checks 等义务\n  goal select-branch --run <id> --parent-task <T-id> --rationale <text> [--selected-task <T-id>]：选择已评审接受的候选；省略 selected-task 即明确不选\n  goal reconcile --run <id> --operation <id> --evidence <json>；recover --run <id> --attempt <old-id> --descriptor <new-pi-json>；successor --run <id> --descriptor <new-pi-json>\n  improve run|status|rollback|export|bind（旧预算机制实验；run 必须给 --plan <json>）\n  improve research bootstrap --methods <json>；run --plan <json>；workflow run|calibrate|compare-sources --plan <json>；workflow prepare --plan <json> --output <new-workspace>；status|rollback|export|bind\n  research run 研究 CPU H/I；workflow run 显式研究 M07 evidence-handoff 单槽；workflow calibrate 仅执行同版本 A/A 校准\n  m08 的 materials/self-checks/reviewers 是显式 JSON 文件\n  m09 的 delivery-scope/reproduction 是显式 JSON 文件；instructions 是预授权的精确 shell 命令，read-only 时应为空；不会自动发布\n详见 src/cli.ts 顶部说明。`;
+	return `用法：node src/cli.ts <init|m01|m02|m03|m04|m05|m06|m08|m09|status|knowledge|improve|goal|mission> [选项]\n  --workspace <dir>   工作区（默认当前目录）\n  --runner pi|claude|fake  会话运行器（默认 pi）；claude 使用 Claude Code CLI，角色模型须写 claude-code/<model>\n  mission start [--original <json>]：默认固定工作区 problem.md 原文作为开放目标；JSON 可给出明确义务和有限收口条件\n  mission run|resume|status --mission <id>：执行、继续或只查看一项本地任务；无需 GitHub 参数\n  mission reconcile --mission <id> --review <json>：核对未来版本化双向派发血缘与旧终态，写入仅供新工作使用的 checkpoint\n  mission reconcile-legacy --mission <id> --review <json> [--apply]：默认只读 dry-run；仅在完整旧源代码、串行归属与效果审查通过后，显式 --apply 才写入独立的 legacy 审查 checkpoint\n  goal status --run <id>：只显示控制摘要，不输出原始会话或 toolLog\n  goal delegate --run <id> --task <json> [--runner pi|fake]：执行有界任务；fork 须在 task.context 中给出 mode=fork、同一 parentRunId、parentTaskId、checkpointId，并保持原 objective/inputs/outputs/checks 等义务\n  goal select-branch --run <id> --parent-task <T-id> --rationale <text> [--selected-task <T-id>]：选择已评审接受的候选；省略 selected-task 即明确不选\n  goal reconcile --run <id> --operation <id> --evidence <json>；recover --run <id> --attempt <old-id> --descriptor <new-pi-json>；successor --run <id> --descriptor <new-pi-json>\n  improve run|status|rollback|export|bind（旧预算机制实验；run 必须给 --plan <json>）\n  improve research bootstrap --methods <json>；run --plan <json>；workflow run|calibrate|compare-sources --plan <json>；workflow prepare --plan <json> --output <new-workspace>；status|rollback|export|bind\n  research run 研究 CPU H/I；workflow run 显式研究 M07 evidence-handoff 单槽；workflow calibrate 仅执行同版本 A/A 校准\n  m08 的 materials/self-checks/reviewers 是显式 JSON 文件\n  m09 的 delivery-scope/reproduction 是显式 JSON 文件；instructions 是预授权的精确 shell 命令，read-only 时应为空；不会自动发布\n详见 src/cli.ts 顶部说明。`;
 }
 
 function publicGoal(goal: CurrentGoal): Record<string, unknown> {
@@ -158,8 +164,8 @@ function missionFlags(args: ParsedArgs, action: string): void {
 		(action === "reconcile-legacy" && has(args, "apply") && flag(args, "apply") !== "true"))
 		throw new HarnessError("cli.mission", "mission 需要 start [--original <json>] 或 run|resume|status --mission <id>；不接受多余或重复参数");
 	if (action !== "status" && action !== "reconcile" && action !== "reconcile-legacy" &&
-		!["pi", "fake"].includes(flag(args, "runner") ?? "pi"))
-		throw new HarnessError("cli.mission", "mission 的 --runner 仅可为 pi 或 fake");
+		!["pi", "claude", "fake"].includes(flag(args, "runner") ?? "pi"))
+		throw new HarnessError("cli.mission", "mission 的 --runner 仅可为 pi、claude 或 fake");
 }
 
 function taskSpec(value: unknown, runId: string): TaskSpecInput {
@@ -362,7 +368,7 @@ export async function main(argv: string[]): Promise<number> {
 		if (action === "delegate") {
 			strictFlags(args, ["workspace", "run", "task", "runner"]);
 			const kind = flag(args, "runner") ?? "pi";
-			if (kind !== "pi" && kind !== "fake") throw new HarnessError("cli.goal", "goal delegate 的 --runner 仅可为 pi 或 fake");
+			if (kind !== "pi" && kind !== "claude" && kind !== "fake") throw new HarnessError("cli.goal", "goal delegate 的 --runner 仅可为 pi、claude 或 fake");
 			const task = taskSpec(await jsonFile<unknown>(args, "task"), runId);
 			const controller = createM07Controller({ ws, store, runner: await makeRunner(kind), config: await ws.loadConfig() });
 			const result = await controller.delegate(runId, task);
