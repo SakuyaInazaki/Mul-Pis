@@ -1,6 +1,7 @@
 /** Workspace-local original-objective entry point. GitHub transport is an optional
  * host adapter; this path binds the existing assessor and M07/M04 stages to a
  * private, durable filesystem host without choosing a scientific conclusion. */
+import { harnessCodeRevision } from "./harness-revision.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { constants, realpathSync } from "node:fs";
 import { lstat, mkdir, open, readFile, readdir, realpath } from "node:fs/promises";
@@ -153,12 +154,13 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 			const nextId = source ? `A${String(attemptNumber(source.attemptId) + 1).padStart(3, "0")}` : "A001";
 			// The host authenticates same-process reuse and checks a dead predecessor before
 			// admitting any new attempt. A failed probe leaves prior effects UNKNOWN.
+			const codeRevision = await harnessCodeRevision();
 			try { active = await LocalMissionHost.begin({ root, missionId,
-				attemptId: source?.attemptId ?? "A001", codeRevision: "local-harness-v1" }); }
+				attemptId: source?.attemptId ?? "A001", codeRevision }); }
 			catch (error) {
 				if (!source || !/attempt identity changed|clean start owner was released|final owner was released/.test(String(error))) throw error;
 				active = await LocalMissionHost.begin({ root, missionId,
-					attemptId: nextId, codeRevision: "local-harness-v1" });
+					attemptId: nextId, codeRevision });
 			}
 			return active;
 		};
@@ -1288,7 +1290,7 @@ export function openDefaultLocalMission(input: { workspaceRoot: string;
 						newAttempt: { version: 1, missionId,
 							attemptId: `A${String(attemptNumber(status.currentAttempt!.attemptId) + 1).padStart(3, "0")}`,
 							predecessorAttemptId: status.currentAttempt!.attemptId,
-							codeRevision: "local-harness-v1", process: currentProcess },
+							codeRevision: await harnessCodeRevision(), process: currentProcess },
 						m07: { runId, taskId: lineage.taskId, operationId: operation.id,
 							checkpointId: result.checkpointId,
 							goalSha256: await fileHash(path.join(m07Root, "goal.json")),
