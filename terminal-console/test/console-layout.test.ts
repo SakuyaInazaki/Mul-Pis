@@ -4,6 +4,7 @@ import { hitTest, renderFrame, visibleNodes, workflowFocus, type ConsoleFrame, t
 import { nodeOverview } from "../src/console/overview.ts";
 import { textWidth } from "../src/console/terminal.ts";
 import type { WorkflowNode, WorkflowSnapshot } from "../src/console/model.ts";
+import { emptyAudit } from "./helpers/snapshot.ts";
 
 const SIZES: Array<[number, number]> = [[36, 16], [48, 16], [80, 18], [85, 24], [86, 24], [120, 40], [200, 55]];
 const LONG_WORKSPACE = "非常长的研究工作区名称".repeat(12) + "工作区末尾标记";
@@ -17,7 +18,7 @@ function node(id: string, status: WorkflowNode["status"] = "running"): WorkflowN
 function snapshot(nodes: WorkflowNode[] = [node("T01")]): WorkflowSnapshot {
 	return {
 		workspace: { root: "/test", label: LONG_WORKSPACE }, generatedAt: "2026-10-15T00:00:00Z",
-		currentStage: "M07", currentRunId: LONG_RUN, nodes, events: [], runs: [], knowledge: {}, warnings: [],
+		currentStage: "M07", currentRunId: LONG_RUN, nodes, events: [], runs: [], knowledge: {}, audit: emptyAudit(), warnings: [],
 	};
 }
 

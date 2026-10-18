@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { nodeDetails, nodeIdentity, nodeOverview, statusLabel } from "../src/console/overview.ts";
 import type { WorkflowNode, WorkflowSnapshot } from "../src/console/model.ts";
+import { emptyAudit } from "./helpers/snapshot.ts";
 
 function makeNode(overrides: Partial<WorkflowNode> = {}): WorkflowNode {
 	return { id: "task:g:T001", label: "T001 · 验证完整的科学目标及其限制", kind: "task", status: "returned",
@@ -11,7 +12,7 @@ function makeSnapshot(node: WorkflowNode): WorkflowSnapshot {
 	return { workspace: { root: "/work", label: "work" }, generatedAt: "2026-10-14T00:00:00Z", nodes: [node], events: [], runs: [],
 		goal: { id: "g", title: "完整目标：探明 A 是否成立，保留所有边界条件", lifecycle: "finished", outcome: "incomplete",
 			checks: { total: 2, passed: 1, failed: 1, notRun: 0 }, tasks: { total: 1, running: 0, returned: 1, accepted: 0, rejected: 0, failed: 0, unknown: 0 }, openDecisions: 0, stateRefs: [] },
-		knowledge: {}, warnings: [] };
+		knowledge: {}, audit: emptyAudit(), warnings: [] };
 }
 
 test("overview keeps the recorded first title line while details retain full text and file names", () => {

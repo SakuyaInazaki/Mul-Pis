@@ -31,7 +31,7 @@ test("goal binding installs the persisted store identity only for the same Pi pr
 	await mkdir(controlDir, { mode: 0o700 });
 	const descriptorFile = path.join(controlDir, "run-descriptor.json");
 	const instanceId = randomUUID(), revision = "builtin:" + "f".repeat(40), storeId = randomUUID();
-	const descriptor = { version: 1, instanceId, attemptId: "A001", workspaceId: root,
+	const descriptor = { version: 1 as const, instanceId, attemptId: "A001", workspaceId: root,
 		codeRevision: revision, controlDir, process: identity };
 	await writeFile(descriptorFile, JSON.stringify(descriptor), { mode: 0o600 });
 	const target = { ...descriptor, goalRunId: "g", workspaceId: storeId, controlDir: path.join(root, "stages", "M07", "g") };

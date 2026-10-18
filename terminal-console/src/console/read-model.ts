@@ -10,6 +10,7 @@ import type { StageRunRecord } from "../../../src/types.ts";
 import type { ObjectiveProgressV1 } from "../../../src/m07/objective-progress.ts";
 import { openDefaultLocalMission } from "../../../src/m07/local-mission.ts";
 import type { ConsoleRef, ConsoleStatus, WorkflowNode, WorkflowSnapshot } from "./model.ts";
+import { buildWorkflowAudit, type AuditGoalInput } from "./audit.ts";
 
 export type { WorkflowSnapshot, WorkflowNode } from "./model.ts";
 export interface ReadOptions { goalRunId?: string; missionId?: string; stage?: string; runId?: string; now?: number }
@@ -178,7 +179,7 @@ export class WorkflowReader {
       nodes, events: [], runs: runs.map(r => ({ stage: r.stage, runId: r.runId,
         status: r.status === "running" && !freshFor(r) ? "unknown" : r.status,
         startedAt: r.startedAt, finishedAt: r.finishedAt, sessions: r.sessions?.length ?? 0, outputs: r.outputs?.length ?? 0, knowledgeSnapshot: r.knowledgeSnapshot })),
-      knowledge: { frozen: selected?.knowledgeSnapshot }, warnings,
+      knowledge: { frozen: selected?.knowledgeSnapshot }, audit: buildWorkflowAudit([], [], new Date(now).toISOString()), warnings,
     };
     const currentFile = path.join(this.workspace, ".agent", "knowledge", "CURRENT");
     try { const safe = await this.confined(currentFile); if (safe) snapshot.knowledge.current = (await readFile(safe, "utf8")).trim() || undefined; } catch { /* no publication yet */ }
@@ -206,10 +207,24 @@ export class WorkflowReader {
     if (!options.stage || options.stage === "M07" || options.missionId)
       await this.addMissions(snapshot, runs, telemetry, now, options.missionId);
     await this.addUsage(snapshot);
+    snapshot.audit = buildWorkflowAudit(await this.auditGoals(runs), snapshot.nodes, snapshot.generatedAt);
     snapshot.events.sort((a, b) => a.at.localeCompare(b.at));
     snapshot.events = snapshot.events.slice(-120);
     this.last = snapshot;
     return snapshot;
+  }
+
+  /** Every readable M07 goal in this workspace, not only the selected one: an
+   * audit that only covered the current selection could not answer "how often
+   * did the engine refuse what the agent accepted" across the whole run. */
+  private async auditGoals(runs: readonly StageRunRecord[]): Promise<AuditGoalInput[]> {
+    const goals: AuditGoalInput[] = [];
+    for (const run of runs) {
+      if (run.stage !== "M07") continue;
+      const goal = await this.json(path.join(this.workspace, "stages", "M07", run.runId, "goal.json")) as CurrentGoal | undefined;
+      if (goal?.runId === run.runId && Array.isArray(goal.tasks)) goals.push({ runId: run.runId, tasks: goal.tasks });
+    }
+    return goals;
   }
 
   private runNode(run: StageRunRecord): WorkflowNode {
