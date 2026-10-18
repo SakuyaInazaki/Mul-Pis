@@ -42,6 +42,18 @@ M07 先冻结原问题副本、目标关系、约束、成功要求、计划、�
 
 CLI 与 Pi 扩展两条入口的保护现在对等：除只读命令（`status`、`goal status`、`knowledge pack`、`mission status`/`reconcile-status`）外，CLI 的每个命令都先取得与 service 相同的跨进程工作区 mutation 所有权，另一个控制台或另一个 CLI 正在持有时直接拒绝；`goal delegate` 也按同一个 `PRE_RSI_LOCAL_OPERATOR_CONFIG` 绑定宿主候选核验器与执行后端，不再静默退回模型自报。
 
+宿主自己给出性能判定时（逐用例逐 baseline 的 faster/slower/tie/quarantined、随实测离散度自适应的门槛、端到端准入标记与复测确认），候选取舍改为消费这些判定而不是比较中位数：ruled slower 回退，端到端不予准入只作工作点并保留基线，ruled faster 推进最佳，tie 或无可裁决保留为工作点；quarantined、未确认复测与宿主声明不可裁决的用例单列为 excluded，永远不参与选择。没有判定的宿主仍走噪声余量比较。宿主的 aggregate（成功率、仅成功样本几何平均、全集几何平均与中位）随观测原样带下来，不在下游重新聚合。
+
+候选 episode 的每一轮按相位装配知识：强制重写走 mutation（只给护栏不给范例），编译失败走 compile-fix，数值或运行失败走 correctness-fix，已正确则走 performance-tuning；检索键是本轮失败签名与已用过的策略，装配回执记在候选上以便做「注入—结果」配对。相位只由宿主事实决定。
+
+`searchBudget.episodeRestartEvaluations`（默认 8，0 关闭）到达时，控制器在 episode 边界把本段轨迹蒸馏成有界记录（有效参数、边界要求、相位谓词、数值约束、失败签名、已验证最佳及其策略族、已被否的方向），落盘到 `.agent/context/episodes/`，然后以 `episodic-restart` 边界开新会话，首条消息只有任务说明加这份记录；完整转录留在原会话日志里。上下文边界拒绝没有携带该冻结记录的重启。
+
+任务提示词按固定布局组装：指令 → 硬件档案 → 知识 → 有界历史 → 本轮动态材料，kind 内保持调用方顺序，因此只有反馈不同的两轮共享逐字相同的前缀。历史深度由 `research.config.json` 的 `promptLayout.historyDepth` 决定（默认 4），逐节字符数与被丢弃的历史条数记在任务的 `promptLayout` 回执里。
+
+预算还按算子类别分配：elementwise/激活类 6 次、norm-reduce 24 次、fusion 20 次为默认准入；matmul、卷积/池化、attention、排序索引、broadcast 默认不准入，必须在 `subjectProfile.categoryJustification` 写明理由才能派发，类别上限与任务预算取较小值。整张表可由 `searchBudget.categoryBudgets` 覆盖。
+
+控制器把判决、停滞、预算与边界重启四类事件补写进 W4 的追加式搜索事件日志，控制台据此渲染判决与停滞视图；写日志失败不改变任何评测结论。后台候选执行默认关闭，需要时在调用处显式给出并发上限。
+
 M07 的搜索预算按「一次宿主评测（编译＋正确性＋测量）」计量，而不是按钱或墙钟，换模型不会让口径漂移。`begin` 时从 `research.config.json` 的 `searchBudget` 冻结一份到目标上（缺省用 harness 默认：每任务 24 次评测、修复子预算 10 次、数值参数子预算 5 次、同一 checkpoint 最多 3 条竞争分支，停滞上限等路线阈值同上）；缺省深度按昇腾证据取「单算子不少于 15 次评测」，但所有数字都必须在本项目重测后才可信。失败、回归和前置拒绝同样占一个预算位，否则失败会变成免费重试。超出任务预算、修复子预算、参数子预算或停滞上限时，`candidate_evaluate` 在任何宿主开销之前确定性拒绝并说明该报告哪个已验证最佳候选；任务返回时控制器记录 `loopStopReason = budget-boundary`。预算只约束单个任务（＝一个计划）：重新规划后的新任务有新的预算，这不是目标级的费用上限，也不改变成功标准。
 
 任务失败、拒绝、工具日志和未执行项一直保留。返工任务只有在 objective、checks、expectedOutputs、mode、独立检查要求及输入材料版本保持同一义务时才能声明 `supersedesTaskId`；不能借替代降级执行模式、取消独立检查或更换输入。沿递归替代链的新任务被接受后，链上旧失败才不再阻止 fulfilled，但历史不会删除。结束目标时必须逐项映射原始 successCriteria；fulfilled 要求每项原目标标准 passed 且有来自已接受任务的固定文件证据、没有开放用户决定、至少有一个实际任务，并且每个当前有效任务义务均已 accepted；历史上已被合法替代的失败任务仍保持原状态。
