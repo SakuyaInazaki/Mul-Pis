@@ -1397,6 +1397,10 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				const verifyFrozenInputs = async (): Promise<void> => { for (const input of frozenInputBytes) if (!(await readFile(input.copy)).equals(input.bytes)) throw new HarnessError("m07.plan-input", "builder changed a frozen plan or versioned resource copy; stop this task and review the evidence"); };
 				const session = sessionSpec(ctx, `M07-${id}`, role, systemPromptFor(role), tools);
 				if (goal.methodBinding) session.methodBinding = goal.methodBinding;
+				// The task's own frozen deadline reaches the session as an observed fact
+				// in tool results, never as prompt prefix and never as a stop condition.
+				const taskDeadline = spec.executionLoop && "mode" in spec.executionLoop ? spec.executionLoop.deadlineAt : undefined;
+				if (taskDeadline) session.runDeadline = taskDeadline;
 				const runRecord = await ctx.ws.readRun("M07", runId);
 				if (branchParent?.branchSource && branchManifest) {
 					const checkpoint = branchParent.branchSource.checkpoint;

@@ -227,3 +227,20 @@ test("the until-ready loop stops at its frozen round bound instead of revising f
  assert.equal(past.loopStopReason,"deadline","an expired deadline stops the loop before a new round is issued");
  assert.equal(past.executionRounds?.length,0);
 });
+
+test("a task deadline reaches the builder and reviewer sessions as an observed fact", async t => {
+ const deadlineAt = new Date(Date.now() + 3_600_000).toISOString();
+ const f = await fixture(t, async ({spec}) => {
+  if (spec.label.includes("reviewer")) return JSON.stringify({verdict:"ready",feedback:"checked"});
+  if (spec.tools.kind === "execution") await writeFile(path.join(spec.tools.root,"result.txt"),"done");
+  return "done";
+ });
+ const task = await f.controller.delegate(f.goal.runId,{objective:"deadline is observable",inputs:[],expectedOutputs:["result.txt"],checks:["checked"],mode:"execute",executionLoop:{mode:"until-ready",maxRounds:2,deadlineAt}});
+ assert.equal(task.status,"returned");
+ const specs = f.runner.created.filter(spec => spec.label.startsWith("M07-"));
+ assert.ok(specs.length >= 2, "builder and reviewer sessions were both created");
+ for (const spec of specs) assert.equal(spec.runDeadline, deadlineAt);
+ const noDeadline = await f.controller.delegate(f.goal.runId,{objective:"no deadline",inputs:[],expectedOutputs:["result.txt"],checks:["checked"],mode:"execute",executionLoop:{mode:"until-ready"}});
+ assert.equal(noDeadline.status,"returned");
+ assert.equal(f.runner.created.at(-1)!.runDeadline, undefined, "no deadline means no invented horizon");
+});

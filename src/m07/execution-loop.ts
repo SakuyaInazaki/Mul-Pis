@@ -157,6 +157,9 @@ export async function runUntilReadyRounds(input: UntilReadyLoopInput): Promise<v
 		if (reviewerPrompt.length + systemPromptFor("reviewer").length > input.policy.maxPromptChars) throw new HarnessError("context.budget", "reviewer control input exceeds the frozen prompt handoff size");
 		const reviewerSpec = sessionSpec(input.ctx, `M07-${input.taskId}-round-${index}-reviewer`, "reviewer", systemPromptFor("reviewer"), { kind: "read-dir", root: reviewerRoot });
 		if (input.goal.methodBinding) reviewerSpec.methodBinding = input.goal.methodBinding;
+		// The reviewer shares the task's wall-clock horizon so a long review does
+		// not run past the deadline the builder was working against.
+		if (input.deadlineAt) reviewerSpec.runDeadline = input.deadlineAt;
 		const reviewRunRecord = await input.ctx.ws.readRun("M07", input.runId);
 		const reviewer = await openBoundedSession(input.ctx.runner, reviewRunRecord, { mode: "fresh", intent: "independent-judgment", reason: `M07 round ${index} reviewer must independently inspect the frozen candidate snapshot`, evidence: [{ version: 1, label: `M07 ${input.taskId} round ${index} snapshot`, path: reviewerRoot, status: "frozen-copy", sourceVersion: `${input.runId}/${input.taskId}/round-${index}` }], spec: reviewerSpec }, () => input.ctx.ws.writeRun(reviewRunRecord));
 		round.reviewerSession = reviewer.ref;
