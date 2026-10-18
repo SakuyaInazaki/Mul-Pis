@@ -117,4 +117,15 @@ export interface ImprovementRun {
 }
 
 export interface ImprovementRunResult { run: ImprovementRun; evaluation?: ImprovementEvaluation; activeVersionId?: string }
-export interface ImprovementStatus { activeVersionId?: string; activeProvenance?: "local-mechanism-admission" | "legacy-projection-only" | "external-manual-unverified"; previousVersionId?: string; runs: Array<{ runId: string; status: ImprovementRunStatus; startedAt: string; finishedAt?: string }> }
+/** Observed write-back rate of this layer. A gate whose rate is 100% is not a
+ * gate; the number is reported so that it can be checked rather than assumed. */
+export interface ImprovementAdmissionRate {
+	attempts: number;
+	promoted: number;
+	rejected: number;
+	inconclusive: number;
+	other: number;
+	/** promoted / attempts; null when nothing has been attempted yet. */
+	rate: number | null;
+}
+export interface ImprovementStatus { activeVersionId?: string; activeProvenance?: "local-mechanism-admission" | "legacy-projection-only" | "external-manual-unverified"; previousVersionId?: string; runs: Array<{ runId: string; status: ImprovementRunStatus; startedAt: string; finishedAt?: string }>; admissionRate: ImprovementAdmissionRate }
