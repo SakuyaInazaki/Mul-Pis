@@ -36,7 +36,7 @@
 | `src/tools/search.ts` | 各 provider 实际页大小多 ≤50；Brave 前 10 offset 页/每页 ≤20、GitHub 搜索可访问前 1,000、Crossref offset 近 10,000 后转 cursor。 | 一部分是供应商 API 窗口；不可因本地无时间/次数限额宣称全网穷举。 |
 | `src/knowledge/retrieval.ts`、`experience-index.ts`、M04–M07 调用者 | 一般知识包 ≤500 条/1,000,000 字符；M05 30,000 字符、M06 32/40,000、M07 24/60,000；experience 显示包仍有字符/条数窗口，M07 默认 24/24,000；精确继承引用验证不再以 100 条为门槛；历史扫描 2,000 版本和排名首 24,000 字符/96 词截断已移除。 | 有省略元数据与 ID/range 补读路径。只有已实际读到的内容可支持科研判断；知识 live limits 仍核查。 |
 | `src/improvement/admission.ts`、`research-service.ts`、`workflow-adapter.ts` | case 文件 ≤2 MB、material ≤200,000 字符/合计 ≤1,000,000；研究先前反馈保留文件边界，完整 MetaEpisode 可用每份 ≤120 KB 的无损分片读取；模板单文件 8 MiB，旧 12 层深度门槛移除；研究/工作流 inspect 单次 ≤4,000 字符，机制实验按登记材料范围读取；旧累计计划回读 40,000 字符上限已移除。 | 保留文件/上下文容量与可续读窗口；旧尝试可通过冻结分页历史工具读取；M04 源文不再截取首 8,000 字符，反馈行/观察记录不再只保留首 40/16 项。历史资料超额不得伪称已完整读取。 |
-| `src/dashboard/server.ts`、`runtime/bounded-file-tail.ts` | 面板单次 JSON ≤2 MiB，否则 413；控制台单文件尾一次 1–65,536 字节。 | **只影响观察窗口**，不裁剪科研原始文件。 |
+| `terminal-console/src/console/limits.ts`、`runtime/bounded-file-tail.ts` | 控制台观察窗口：单份控制记录 ≤40 MB、单文件尾一次 ≤65,536 字节、心跳 20 秒、工具记录末 100 条；四项都可由工作区 `.agent/console-limits.json` 覆盖。 | **只影响观察窗口**，不裁剪科研原始文件。 |
 
 ## 适配器、实验范围与不可混淆的次数
 

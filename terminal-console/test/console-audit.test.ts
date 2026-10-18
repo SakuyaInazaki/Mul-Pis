@@ -104,3 +104,31 @@ test("the reader audits every readable goal, not only the selected one", async t
 	assert.equal(snapshot.audit.selfAccepted.hostRefused, 2);
 	assert.equal(snapshot.audit.tasks.rejected, 2);
 });
+
+test("workspace console limits replace the built-in observation window", async t => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "console-limits-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	await writeFile(path.join(root, "research.config.json"), "{}\n");
+	await mkdir(path.join(root, ".agent"), { recursive: true });
+	await mkdir(path.join(root, "stages/M07/g"), { recursive: true });
+	const startedAt = "2026-01-01T00:00:00Z";
+	await writeFile(path.join(root, "stages/M07/g/run.json"), JSON.stringify({ stage: "M07", runId: "g",
+		status: "running", startedAt, inputs: [], sessions: [], outputs: [], failures: [], remarks: [] }));
+	await writeFile(path.join(root, "stages/M07/g/goal.json"), JSON.stringify({ runId: "g", lifecycle: "active",
+		goal: "目标", decisions: [], goalChecks: [], tasks: [] }));
+	await mkdir(path.join(root, ".agent/telemetry"), { recursive: true });
+	await writeFile(path.join(root, ".agent/telemetry/t.json"), JSON.stringify({ version: 1, id: "s1", kind: "controller",
+		label: "主会话", activity: "active", stage: "M07", runId: "g", startedAt, lastSeenAt: startedAt, tools: [] }));
+	const now = Date.parse(startedAt) + 60_000;
+
+	// Default 20 s window: a 60 s old heartbeat is stale, so the live state is unknown.
+	assert.equal((await new WorkflowReader(root).read({ now })).nodes.find(node => node.id === "run:M07:g")?.status, "unknown");
+
+	await writeFile(path.join(root, ".agent/console-limits.json"), JSON.stringify({ version: 1, staleHeartbeatMs: 120_000 }));
+	assert.equal((await new WorkflowReader(root).read({ now })).nodes.find(node => node.id === "run:M07:g")?.status, "running");
+
+	await writeFile(path.join(root, ".agent/console-limits.json"), JSON.stringify({ staleHeartbeatMs: 10 }));
+	await assert.rejects(new WorkflowReader(root).read({ now }), /staleHeartbeatMs/);
+	await writeFile(path.join(root, ".agent/console-limits.json"), JSON.stringify({ unknownField: 1 }));
+	await assert.rejects(new WorkflowReader(root).read({ now }), /未知字段/);
+});
