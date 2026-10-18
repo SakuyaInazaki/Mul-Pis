@@ -468,3 +468,46 @@ test("an incomplete dependency cycle does not block original reading or hide roo
 	assert.deepEqual(await f.store.limits(), limits);
 	assert.equal((await f.store.current())!.id, frozenSnapshot);
 });
+
+test("the contract check rejects an unknown API and an over-budget tile before any compile", async t => {
+	const contract = {
+		version: 1, kind: "contract", operatorCategory: "normalization", canonicalFamily: "layernorm",
+		bottleneck: "compile_failure", applicability: { backend: "ascend-c", toolchain: "CANN-8.0" },
+		provenance: { kind: "external-source", detail: "S007 头文件" },
+		api: "AscendC::Add", signature: "void Add(LocalTensor<T>&, const LocalTensor<T>&, int32_t)",
+		constraints: [{ name: "ub_bytes", unit: "bytes", limit: 196352, comparison: "at_most", source: "S007" }],
+		source: "S007",
+	};
+	const foreign = { ...contract, applicability: { backend: "cuda", toolchain: "12.4" }, api: "cuda::Mul",
+		signature: "void Mul(float*, const float*, int)", constraints: [] };
+	const f = await setup(t, [
+		{ op: "create", type: "K", title: "Add 契约", body: "签名来自本地头文件副本", usageDecision: "adopted", fields: { optimization: contract } },
+		{ op: "create", type: "K", title: "别的后端契约", body: "不适用于本任务", usageDecision: "adopted", fields: { optimization: foreign } },
+	]);
+	const work = path.join(f.root, "work");
+	await mkdir(work, { recursive: true });
+	await writeFile(path.join(work, "kernel.cpp"), "AscendC::Add(dst, src, n);\nAscendC::Softmax(dst, src);\n");
+	const tools = f.makeTools({ candidateRoot: work, context: { backend: "ascend-c", toolchain: "CANN-8.0" } });
+	const rejected = await tools.knowledge_contract_check.execute({ path: "kernel.cpp",
+		observationsJson: JSON.stringify([{ name: "ub_bytes", value: 262144 }]) });
+	assert.match(rejected.text, /结论：reject/);
+	assert.match(rejected.text, /AscendC::Softmax/);
+	assert.match(rejected.text, /最接近的合法签名 void Add/);
+	assert.match(rejected.text, /ub_bytes=262144bytes/);
+	// The other backend's contract card is never used to judge this candidate.
+	assert.doesNotMatch(rejected.text, /cuda::Mul/);
+	const event = f.events.at(-1)!;
+	assert.equal(event.kind, "check");
+	assert.equal(event.status, "returned");
+	assert.equal(event.returnedRange?.content, "contract-check");
+	assert.deepEqual(event.selectedRefs, ["K001@1"]);
+	const frozen = JSON.parse(await readFile(event.frozenPath, "utf8")) as { safety: { status: string; findings: number } };
+	assert.equal(frozen.safety.status, "reject");
+	assert.equal(frozen.safety.findings, 2);
+
+	const passing = await tools.knowledge_contract_check.execute({ source: "AscendC::Add(a, b, c);",
+		observationsJson: JSON.stringify([{ name: "ub_bytes", value: 1024 }]) });
+	assert.match(passing.text, /结论：pass/);
+	await assert.rejects(tools.knowledge_contract_check.execute({ path: "../escape.cpp" }), /work directory/);
+	await assert.rejects(tools.knowledge_contract_check.execute({}), /exactly one/);
+});

@@ -70,7 +70,7 @@ M07 投影事件在 `taskMessage` 和 `writeFeedback` 的真实决策点逐调�
 - 注入按阶段相位装配（`src/knowledge/injection.ts`）：bootstrap / mutation / compile-fix / correctness-fix / performance-tuning / review / acquisition / applicability / judgment 各自规定先验层位、可见卡片种类、条数与字符上限，并产出注入回执（哪些条目进过哪个提示）；注入不改写知识库。
 - 冻结分层先验 `.agent/knowledge/prior/L0…L5/*.md`（编程模型 / 模式指南 / 硬件约束 / tiling 策略 / API 参考 / 已验证范例）是固定前提，每条声明 backend、toolchain 与本地出处；情境冲突的条目在装配时硬过滤丢弃，不降权保留。
 - when 知识走确定性决策表（`src/knowledge/decision-table.ts`）：瓶颈签名 + 已应用变换 + 饱和指标 + 负层排除 → 允许方法集，每项理由引用指标值或条目 ID；编译失败与数值错误阶段不给性能方向。
-- 生成后、编译前的零设备成本检查（`src/knowledge/static-checks.ts`）由 `contract` 卡驱动：已登记命名空间内的未知 API 本地驳回并给出最接近签名，数值预算按 at_most/at_least/multiple_of/equals 核对并返回 witness；未覆盖的命名空间记为 uncovered，不作判定。
+- 生成后、编译前的零设备成本检查（`src/knowledge/static-checks.ts`）由 `contract` 卡驱动：已登记命名空间内的未知 API 本地驳回并给出最接近签名，数值预算按 at_most/at_least/multiple_of/equals 核对并返回 witness；未覆盖的命名空间记为 uncovered，不作判定。M07 执行会话另有 `knowledge_contract_check` 工具在编译前调用该检查，调用本身作为知识访问事件冻结存档；检查通过不等于可编译、数值正确或更快。
 - 知识库首次明确访问时懒写稳定 `storeId`，不批量迁移旧工作区，旧 C001 等 ID 不变。跨库经验引用须由调用方明确注册外库并固定 `{storeId, recordId, version}`，同名 ID 不互认，也不自动写入或合并外库。
 - 显式经验选择只从现有记录生成有界视图。`fields.experience` 可声明目标、适用阶段与标签、必要的 pinned `requiredRefs`；选择时检查情境和 live availability，循环、缺失、跨库错版本、撤回或容量不足都拒绝完整装载。H/I 策略版本区分 `sourceExperienceRefs`（生成时实际装载的来源）、旧版本保守继承的 `requiredExperienceRefs` 与结构化科学前提 `requiredKnowledgeRefs`。新参考不自动成为必要前提，旧 required 不自动降级；候选正文和新计划省略引用都不能清除必要项。新的 I/H 请求、激活、回退与 V2 导入重查 live 状态，外库需服务显式注册。普通 `refs` 还可表达反例、冲突、替换与历史；声明依赖的结构完整性不证明科学前提已被穷举。
 - 停用决定和限制约束该 ID 的所有旧版本；必要依赖受影响时向后传递 `needs_recheck`，明确授权解除才能恢复新使用。旧记录保留可追溯只读；运行中已冻结的包不热替换，但新调用重新检查 live 限制。实验观察先作为事实与模型诊断分列保存，是否形成新的 K/C/E 等记录仍走 M04 提案与合入。

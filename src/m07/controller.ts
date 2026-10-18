@@ -1337,7 +1337,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 						}
 					} })) : []),
 					...createCandidateArchiveTools({ goal, task, save: () => save(ctx, goal) }),
-					...createExecutionKnowledgeTools({ store: ctx.store, workspaceRoot: ctx.ws.root, expectedSnapshot: goal.knowledgeSnapshot,
+					...createExecutionKnowledgeTools({ store: ctx.store, workspaceRoot: ctx.ws.root, candidateRoot: workDir, expectedSnapshot: goal.knowledgeSnapshot,
 						requiredIds: task.knowledgeIds ?? [], context: task.knowledgeContext, archiveDir: path.join(dir, "knowledge-access"),
 						beforeAccess: () => requireCurrentFormalBaseline(ctx, goal),
 						onAccess: async event => { (task.knowledgeAccess ??= []).push(event); await save(ctx, goal); } })];
