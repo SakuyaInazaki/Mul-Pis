@@ -1,9 +1,8 @@
 import { HarnessError } from "../types.ts";
+import type { ProviderRequestViolation } from "./types.ts";
 
-export type DeepSeekRequestViolation =
-	"request-shape" | "message-shape" | "tool-call-shape" | "duplicate-tool-call"
-	| "orphan-tool-result" | "duplicate-tool-result" | "incomplete-tool-results"
-	| "thinking-tool-choice" | "missing-reasoning" | "unsigned-reasoning" | "reasoning-replay-mismatch";
+/** The violations are generic; this alias keeps the vendor-specific call sites readable. */
+export type DeepSeekRequestViolation = ProviderRequestViolation;
 
 /** Static, host-side diagnostics only. Never retain input objects, tool IDs or text. */
 export class DeepSeekRequestContractError extends HarnessError {
