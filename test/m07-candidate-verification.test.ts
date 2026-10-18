@@ -57,7 +57,7 @@ test("host candidate findings override self-report while full goal verification 
 	const ctx: StageContext = { ws, store, runner, config: { roles: { execution: "fake/execution", reviewer: "fake/reviewer", research: "fake/research" }, concurrency: 1, tools: {} } };
 	const controller = createM07Controller(ctx, { candidateVerifier: verifier });
 	const goal = await controller.begin({ goal: "Original operator target", problemRelation: "direct", constraints: ["same task"], successCriteria: ["correctness", "reach original target"], plan: "explore" }, { candidateVerification: { id: verifier.id, verifierVersion: verifier.version, goalAdmission: true } });
-	const spec = (parentTaskId?: string, intent: "solution" | "diagnostic" = "solution") => ({ objective: "evaluate one candidate", subjectId: "original-operator", mode: "execute" as const, subjectProfile: { implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json", "lesson.json"], lessonDeltaOutput: "lesson.json", checks: [intent === "diagnostic" ? "failure recorded" : "candidate checked"], candidate: { sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], intent, ...(parentTaskId ? { parentTaskId, changeKind: "structure" as const } : {}) } });
+	const spec = (parentTaskId?: string, intent: "solution" | "diagnostic" = "solution") => ({ objective: "evaluate one candidate", subjectId: "original-operator", mode: "execute" as const, subjectProfile: { operatorCategory: "norm-reduce" as const, implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json", "lesson.json"], lessonDeltaOutput: "lesson.json", checks: [intent === "diagnostic" ? "failure recorded" : "candidate checked"], candidate: { sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"], intent, ...(parentTaskId ? { parentTaskId, changeKind: "structure" as const } : {}) } });
 	const first = await controller.delegate(goal.runId, spec(undefined, "diagnostic"));
 	const negative = await controller.review(goal.runId, { taskId: first.taskId, artifacts: [], checks: [{ criterion: "failure recorded", result: "passed", evidence: [first.reportPath!] }] });
 	assert.equal(negative.status, "accepted", "a verified negative can complete a diagnostic task");
@@ -157,7 +157,7 @@ test("partial host goal admission retains failed exploration without hiding unme
 	assert.equal(rejected.status, "rejected");
 	assert.equal(rejected.candidateObservation, undefined);
 	rejectedEvidence = rejected.review!.frozenReportPath;
-	const candidate = await controller.delegate(goal.runId, { objective: "measure a different successful route", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" },
+	const candidate = await controller.delegate(goal.runId, { objective: "measure a different successful route", mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" },
 		inputs: [], expectedOutputs: ["kernel.txt", "receipt.json"], checks: ["candidate checked"],
 		candidate: { sourcePaths: ["kernel.txt"], receiptPaths: ["receipt.json"] } });
 	const accepted = await controller.review(goal.runId, { taskId: candidate.taskId, artifacts: [],
@@ -237,12 +237,12 @@ test("host binding on an active ordinary goal applies only to later candidate ta
 	const normal = await controller.review(goal.runId, { taskId: earlier.taskId, artifacts: [earlier.reportPath!], checks: [{ criterion: "diagnosis captured", result: "passed", evidence: [earlier.reportPath!] }] });
 	assert.equal(normal.status, "accepted");
 	assert.equal(normal.candidateObservation, undefined);
-	const later = await controller.delegate(goal.runId, { objective: "later measured candidate", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["source.txt", "receipt.txt"], checks: ["candidate checked"], candidate: { sourcePaths: ["source.txt"], receiptPaths: ["receipt.txt"] } });
+	const later = await controller.delegate(goal.runId, { objective: "later measured candidate", mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["source.txt", "receipt.txt"], checks: ["candidate checked"], candidate: { sourcePaths: ["source.txt"], receiptPaths: ["receipt.txt"] } });
 	const assessed = await controller.review(goal.runId, { taskId: later.taskId, artifacts: [], checks: [{ criterion: "candidate checked", result: "passed", evidence: [later.reportPath!] }] });
 	assert.equal(assessed.status, "rejected", "host-known contrary finding defeats a model-passed check");
 	assert.equal(assessed.review?.checks[0].result, "failed");
 	assert.equal(assessed.candidateObservation?.verifier.id, verifier.id);
-	const successor = await controller.delegate(goal.runId, { objective: "later measured candidate", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["source.txt", "receipt.txt"], checks: ["candidate checked"], candidate: { sourcePaths: ["source.txt"], receiptPaths: ["receipt.txt"], parentTaskId: later.taskId, changeKind: "repair" } });
+	const successor = await controller.delegate(goal.runId, { objective: "later measured candidate", mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["source.txt", "receipt.txt"], checks: ["candidate checked"], candidate: { sourcePaths: ["source.txt"], receiptPaths: ["receipt.txt"], parentTaskId: later.taskId, changeKind: "repair" } });
 	const accepted = await controller.review(goal.runId, { taskId: successor.taskId, artifacts: [], checks: [{ criterion: "candidate checked", result: "passed", evidence: [successor.reportPath!] }] });
 	assert.equal(accepted.status, "accepted");
 	const finished = await controller.finish(goal.runId, { outcome: "fulfilled", summary: "original checks complete", returnPath: "M04", goalChecks: [{ criterion: "original criterion", result: "passed", evidence: [accepted.reportPath!] }] });
@@ -279,7 +279,7 @@ test("objective host checks override claimed success without taking over scienti
 	const goal = await controller.begin({ goal: "Original goal", problemRelation: "direct", constraints: ["Preserve the original operator semantics"],
 		successCriteria: ["original score threshold", "scientific evidence considered"], plan: "optimize" },
 		{ candidateVerification: { id: verifier.id, verifierVersion: verifier.version, goalAdmission: false }, executionContract: "continuous" });
-	const task = await controller.delegate(goal.runId, { mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, objective: "measure", inputs: [],
+	const task = await controller.delegate(goal.runId, { mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, objective: "measure", inputs: [],
 		expectedOutputs: ["kernel.txt", "receipt.json"], checks: ["measurement retained"],
 		candidate: { sourcePaths: ["kernel.txt"], receiptPaths: ["receipt.json"], intent: "diagnostic" } });
 	const accepted = await controller.review(goal.runId, { taskId: task.taskId, artifacts: [],
@@ -321,18 +321,28 @@ test("a candidate task must declare where it is implemented and what baseline it
 		expectedOutputs: ["kernel.c"], checks: ["recorded"] };
 	await assert.rejects(controller.delegate(goal.runId, base), /subjectProfile/);
 	await assert.rejects(controller.delegate(goal.runId, { ...base, subjectProfile: {
-		implementationSpace: "handwritten-low-level", rationale: "   ", baselineStrength: "none" } }), /rationale/);
+		operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "   ", baselineStrength: "none" } }), /rationale/);
 	await assert.rejects(controller.delegate(goal.runId, { ...base, subjectProfile: {
-		implementationSpace: "handwritten-low-level", rationale: "no vendor kernel exists", baselineStrength: "none",
+		operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "no vendor kernel exists", baselineStrength: "none",
 		endToEndShare: 1.4 } }), /endToEndShare/);
 	await assert.rejects(controller.delegate(goal.runId, { ...base, subjectProfile: {
-		implementationSpace: "handwritten-low-level", rationale: "no vendor kernel exists", baselineStrength: "none",
+		operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "no vendor kernel exists", baselineStrength: "none",
 		headroom: { kind: "roofline-ratio", value: 0.4, source: "" } } }), /headroom/);
 	const task = await controller.delegate(goal.runId, { ...base, subjectProfile: {
-		implementationSpace: "dsl-or-ir", rationale: "a DSL gives a correct baseline before any low-level rewrite",
+		operatorCategory: "norm-reduce", implementationSpace: "dsl-or-ir", rationale: "a DSL gives a correct baseline before any low-level rewrite",
 		baselineStrength: "framework-default", endToEndShare: 0.42,
 		headroom: { kind: "sol-gap", value: 0.55, source: "host profiler run 2026-10-18" } } });
 	assert.equal(task.subjectProfile?.implementationSpace, "dsl-or-ir");
+	await assert.rejects(controller.delegate(goal.runId, { ...base, subjectProfile: {
+		operatorCategory: "matmul", implementationSpace: "handwritten-low-level",
+		rationale: "hand written", baselineStrength: "vendor-library" } }),
+		/not in the default optimization queue/);
+	const justified = await controller.delegate(goal.runId, { ...base, subjectProfile: {
+		operatorCategory: "matmul", implementationSpace: "handwritten-low-level",
+		rationale: "hand written", baselineStrength: "vendor-library",
+		categoryJustification: "this platform ships no vendor matmul for this dtype" } });
+	assert.equal(justified.subjectProfile?.operatorCategory, "matmul");
+	assert.match(justified.subjectProfile!.categoryJustification!, /no vendor matmul/);
 	assert.equal(task.subjectProfile?.endToEndShare, 0.42);
 	assert.equal(task.subjectProfile?.headroom?.source, "host profiler run 2026-10-18");
 });

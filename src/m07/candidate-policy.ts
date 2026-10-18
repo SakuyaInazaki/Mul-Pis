@@ -570,6 +570,47 @@ export function requireUnbannedDirection(state: CandidateSearchStateV1, action: 
 		`the search is stalled and ${action.changeKind}/${action.strategy} at ${action.location} already produced no measured gain (${banned.candidateRef}: ${banned.reason}); declare a different direction, or pass newEvidence stating what changed since`);
 }
 
+/** Operator classes the basis separates by expected yield. The names are
+ * categories of work, not benchmark levels: the evidence is that yield tracks
+ * what the operator is, not how a suite labels its difficulty. */
+export const OPERATOR_CATEGORIES = ["elementwise-activation", "norm-reduce", "fusion", "matmul",
+	"convolution-pooling", "attention", "sorting-indexing", "broadcast", "other"] as const;
+export type OperatorCategory = typeof OPERATOR_CATEGORIES[number];
+
+export interface OperatorCategoryBudgetV1 {
+	/** Hard cap on host evaluations for a task on this category. */
+	evaluations: number;
+	/** False means the category does not enter the optimization queue without a
+	 * written reason: the basis measures these as near-certain losses against a
+	 * mature vendor implementation. */
+	admitted: boolean;
+	/** Why this cap, in one line, so a trajectory can be read later. */
+	note: string;
+}
+
+/** Defaults from the Ascend category map: elementwise and activation classes
+ * finish in about one round; norm/reduce fusion is the largest yield area;
+ * matmul roughly ties or loses to the vendor library; convolution, pooling,
+ * attention, sorting and broadcast are near-certain losses today. Every number
+ * is a starting point to be re-measured on this project. */
+export const DEFAULT_CATEGORY_BUDGETS: Record<OperatorCategory, OperatorCategoryBudgetV1> = Object.freeze({
+	"elementwise-activation": { evaluations: 6, admitted: true, note: "one round is usually enough; stop early rather than polishing" },
+	"norm-reduce": { evaluations: 24, admitted: true, note: "largest measured yield area, especially fused" },
+	fusion: { evaluations: 20, admitted: true, note: "about half of attempts are feasible and they need several rounds" },
+	matmul: { evaluations: 6, admitted: false, note: "ties or loses against a mature vendor library; needs a written reason" },
+	"convolution-pooling": { evaluations: 4, admitted: false, note: "near-certain loss against the vendor library today" },
+	attention: { evaluations: 4, admitted: false, note: "no measured wins in the reviewed evidence" },
+	"sorting-indexing": { evaluations: 4, admitted: false, note: "no measured wins in the reviewed evidence" },
+	broadcast: { evaluations: 4, admitted: false, note: "no measured wins in the reviewed evidence" },
+	other: { evaluations: 24, admitted: true, note: "unclassified work object; the task budget applies unchanged" },
+});
+
+export function operatorCategoryBudget(policy: SearchBudgetPolicyV1,
+	category: OperatorCategory | undefined): OperatorCategoryBudgetV1 {
+	return (category && (policy.categoryBudgets ?? DEFAULT_CATEGORY_BUDGETS)[category]) ??
+		DEFAULT_CATEGORY_BUDGETS.other;
+}
+
 export interface SearchBudgetPolicyV1 {
 	version: 1;
 	/** One unit is one host evaluation of one candidate: compile, correctness and
@@ -587,6 +628,8 @@ export interface SearchBudgetPolicyV1 {
 	 * The basis measures the restart as better in ten of fifteen trials but does
 	 * not separate distillation from clearing the context, so this is an option. */
 	episodeRestartEvaluations: number;
+	/** Per-category caps and admission. Absent means the harness defaults. */
+	categoryBudgets?: Record<OperatorCategory, OperatorCategoryBudgetV1>;
 	routeLimits: CandidateRouteLimitsV1;
 }
 
@@ -611,6 +654,9 @@ export interface SearchBudgetLedgerV1 {
 	parameters: number;
 	/** Pre-check rejects: they cost a host call, so they are accounted for. */
 	rejected: number;
+	/** Declared operator category and the cap it imposes, when one is declared. */
+	category?: OperatorCategory;
+	categoryCap?: number;
 	remaining: number;
 	remainingRepair: number;
 	remainingParameters: number;
@@ -625,7 +671,7 @@ export function validateSearchBudget(input: unknown): SearchBudgetPolicyV1 {
 	const value = input as Record<string, unknown>;
 	const known = new Set(["version", "evaluationsPerTask", "repairEvaluationsPerTask",
 		"parameterEvaluationsPerTask", "maxBranchesPerCheckpoint", "reviewRoundsPerTask",
-		"episodeRestartEvaluations", "routeLimits"]);
+		"episodeRestartEvaluations", "categoryBudgets", "routeLimits"]);
 	const unknown = Object.keys(value).filter(key => !known.has(key));
 	if (unknown.length) throw new HarnessError("m07.search-budget", `searchBudget has unknown fields: ${unknown.join(", ")}`);
 	if (value.version !== undefined && value.version !== 1)
@@ -660,6 +706,28 @@ export function validateSearchBudget(input: unknown): SearchBudgetPolicyV1 {
 		reviewRoundsPerTask: integer("reviewRoundsPerTask", DEFAULT_SEARCH_BUDGET.reviewRoundsPerTask, 1, 10_000),
 		episodeRestartEvaluations: integer("episodeRestartEvaluations", DEFAULT_SEARCH_BUDGET.episodeRestartEvaluations, 0, 10_000),
 		routeLimits: limits };
+	if (value.categoryBudgets !== undefined) {
+		if (!value.categoryBudgets || typeof value.categoryBudgets !== "object" || Array.isArray(value.categoryBudgets))
+			throw new HarnessError("m07.search-budget", "searchBudget.categoryBudgets must be a JSON object");
+		const rows = value.categoryBudgets as Record<string, unknown>;
+		const unknownCategories = Object.keys(rows).filter(key => !(OPERATOR_CATEGORIES as readonly string[]).includes(key));
+		if (unknownCategories.length) throw new HarnessError("m07.search-budget", `searchBudget.categoryBudgets has unknown categories: ${unknownCategories.join(", ")}`);
+		const budgets = { ...DEFAULT_CATEGORY_BUDGETS };
+		for (const category of OPERATOR_CATEGORIES) {
+			const row = rows[category];
+			if (row === undefined) continue;
+			if (!row || typeof row !== "object" || Array.isArray(row)) throw new HarnessError("m07.search-budget", `searchBudget.categoryBudgets.${category} must be a JSON object`);
+			const item = row as Record<string, unknown>;
+			if (Object.keys(item).some(key => !["evaluations", "admitted", "note"].includes(key)) ||
+				typeof item.evaluations !== "number" || !Number.isInteger(item.evaluations) ||
+				item.evaluations < 1 || item.evaluations > 100_000 || typeof item.admitted !== "boolean" ||
+				(item.note !== undefined && (typeof item.note !== "string" || !item.note.trim())))
+				throw new HarnessError("m07.search-budget", `searchBudget.categoryBudgets.${category} needs an evaluations integer and an admitted flag`);
+			budgets[category] = { evaluations: item.evaluations, admitted: item.admitted,
+				note: typeof item.note === "string" ? item.note.trim() : DEFAULT_CATEGORY_BUDGETS[category].note };
+		}
+		policy.categoryBudgets = budgets;
+	}
 	if (policy.repairEvaluationsPerTask > policy.evaluationsPerTask ||
 		policy.parameterEvaluationsPerTask > policy.evaluationsPerTask)
 		throw new HarnessError("m07.search-budget", "sub-budgets cannot exceed searchBudget.evaluationsPerTask");
@@ -671,7 +739,8 @@ export function validateSearchBudget(input: unknown): SearchBudgetPolicyV1 {
 /** Spend is measured in evaluations, not money or wall clock, so the unit does
  * not drift when the model changes. */
 export function candidateBudgetLedger(history: readonly CandidateArchiveEntry[],
-	input: { taskId: string; subjectId?: string; policy: SearchBudgetPolicyV1 }): SearchBudgetLedgerV1 {
+	input: { taskId: string; subjectId?: string; policy: SearchBudgetPolicyV1;
+		category?: OperatorCategory }): SearchBudgetLedgerV1 {
 	const plan = history.filter(entry => entry.taskId === input.taskId);
 	let repair = 0, optimization = 0, parameters = 0, rejected = 0;
 	for (const entry of plan) {
@@ -682,12 +751,16 @@ export function candidateBudgetLedger(history: readonly CandidateArchiveEntry[],
 	}
 	const state = candidateSearchState(history, { subjectId: input.subjectId, taskId: input.taskId,
 		limits: input.policy.routeLimits });
-	const remaining = Math.max(0, input.policy.evaluationsPerTask - plan.length);
+	// A category the basis measures as a near-certain loss gets a smaller cap, so
+	// the budget cannot quietly be spent where it has never paid off.
+	const categoryCap = operatorCategoryBudget(input.policy, input.category).evaluations;
+	const remaining = Math.max(0, Math.min(input.policy.evaluationsPerTask, categoryCap) - plan.length);
 	const remainingRepair = Math.max(0, input.policy.repairEvaluationsPerTask - repair);
 	const remainingParameters = Math.max(0, input.policy.parameterEvaluationsPerTask - parameters);
 	const stop: SearchBudgetStop | undefined = !remaining ? "task-evaluation-budget" :
 		state.stagnation >= input.policy.routeLimits.stagnation ? "stagnation-limit" : undefined;
 	return { version: 1, evaluations: plan.length, repair, optimization, parameters, rejected,
+		...(input.category ? { category: input.category, categoryCap } : {}),
 		remaining, remainingRepair, remainingParameters, ...(stop ? { stop } : {}),
 		message: stop
 			? "This task may not spend another evaluation. Report the verified best candidate and the evidence; the controller records the budget boundary and the planner decides what comes next."

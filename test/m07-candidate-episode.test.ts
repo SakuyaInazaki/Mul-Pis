@@ -70,7 +70,7 @@ test("a numerical failure can be repaired inside one builder session without fre
 		return "Repaired candidate is ready for task review.";
 	}, verifier);
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
-	const task = await harness.controller.delegate(harness.goal.runId, { objective: "repair and evaluate", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["selected.py", "selected-receipt.json"], checks: ["candidate checked"], executionLoop: { mode: "candidate-episode" }, candidate: { sourcePaths: ["selected.py"], receiptPaths: ["selected-receipt.json"] } });
+	const task = await harness.controller.delegate(harness.goal.runId, { objective: "repair and evaluate", mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["selected.py", "selected-receipt.json"], checks: ["candidate checked"], executionLoop: { mode: "candidate-episode" }, candidate: { sourcePaths: ["selected.py"], receiptPaths: ["selected-receipt.json"] } });
 	assert.equal(task.status, "returned", task.executionFailure);
 	assert.deepEqual(task.episode?.candidates.map(item => item.observation.correctness), ["failed", "passed"]);
 	assert.deepEqual(task.episode?.candidates.map(item => item.intent), ["diagnostic", "diagnostic"]);
@@ -94,7 +94,7 @@ test("a numerical failure can be repaired inside one builder session without fre
 		["goal-failed", /original goal criterion is not met/],
 	] as const) {
 		finalFinding = finding;
-		const next = await harness.controller.delegate(harness.goal.runId, { objective: "review diagnostic evidence as a final solution", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [],
+		const next = await harness.controller.delegate(harness.goal.runId, { objective: "review diagnostic evidence as a final solution", mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [],
 			expectedOutputs: ["selected.py", "selected-receipt.json"], checks: ["candidate checked"], executionLoop: { mode: "candidate-episode" },
 			candidate: { sourcePaths: ["selected.py"], receiptPaths: ["selected-receipt.json"] } });
 		assert.equal(next.status, "returned", next.executionFailure);
@@ -177,7 +177,7 @@ test("controller grants the host execution cascade to a running episode and revi
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
 	assert.equal(harness.goal.executionContract?.mode, "continuous");
 	assert.ok(harness.goal.executionState?.activeAttemptId, "the goal has a live runtime attempt");
-	const task = await harness.controller.delegate(harness.goal.runId, { objective: "run scoped candidate pipeline", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" },
+	const task = await harness.controller.delegate(harness.goal.runId, { objective: "run scoped candidate pipeline", mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" },
 		inputs: [], expectedOutputs: ["kernel.py"], checks: ["candidate was observed"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(task.status, "returned", task.executionFailure);
 	assert.deepEqual(calls, ["contract", "compile", "judge", "query:judge"]);
@@ -222,7 +222,7 @@ test("a failed candidate freeze retains its bytes and later candidates use unuse
 	}, verifier);
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
 	const task = await harness.controller.delegate(harness.goal.runId, { objective: "retain failed freeze and evaluate successors",
-		mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["complete candidates recorded"],
+		mode: "execute", subjectProfile: { operatorCategory: "norm-reduce" as const, implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["complete candidates recorded"],
 		executionLoop: { mode: "candidate-episode" } });
 	assert.equal(task.status, "returned", task.executionFailure);
 	assert.deepEqual(task.episode?.candidates.map(item => item.id), ["C002", "C003"]);
@@ -277,7 +277,7 @@ test("a slower correct exploration parent can lead to a faster child without reg
 		return "All six actual receipt observations were recorded.";
 	}, verifier);
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
-	const task = await harness.controller.delegate(harness.goal.runId, { objective: "explore valid candidates", subjectId: "operator", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["candidate history recorded"], executionLoop: { mode: "candidate-episode" } });
+	const task = await harness.controller.delegate(harness.goal.runId, { objective: "explore valid candidates", subjectId: "operator", mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["candidate history recorded"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(task.status, "returned", task.executionFailure);
 	assert.equal(task.episode?.currentCandidateId, "C006");
 	assert.equal(task.episode?.candidates[1].parentCandidateId, "C001");
@@ -344,7 +344,7 @@ test("repeated-source feedback uses frozen bytes and unique external results wit
 	}, verifier);
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
 	const task = await harness.controller.delegate(harness.goal.runId, { objective: "inspect repeated measurements", subjectId: "operator",
-		mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const }, inputs: [], expectedOutputs: ["changed.py", "receipt.json"], checks: ["evidence retained"], executionLoop: { mode: "candidate-episode" } });
+		mode: "execute", subjectProfile: { operatorCategory: "norm-reduce" as const, implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const }, inputs: [], expectedOutputs: ["changed.py", "receipt.json"], checks: ["evidence retained"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(task.status, "returned", task.executionFailure);
 	assert.equal(calls, 4, "archive reads reuse the four original verifier calls");
 });
@@ -434,10 +434,10 @@ test("a later task can retrieve a near miss and derive from an exact frozen pare
 		return "A new candidate improved A; B remains separate.";
 	}, verifier);
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
-	const first = await harness.controller.delegate(harness.goal.runId, { objective: "find baseline and near miss", subjectId: "operator", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["candidate history recorded"], executionLoop: { mode: "candidate-episode" } });
+	const first = await harness.controller.delegate(harness.goal.runId, { objective: "find baseline and near miss", subjectId: "operator", mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["candidate history recorded"], executionLoop: { mode: "candidate-episode" } });
 	const firstReview = await harness.controller.review(harness.goal.runId, { taskId: first.taskId, artifacts: [first.reportPath!], checks: [{ criterion: "candidate history recorded", result: "passed", evidence: [first.reportPath!] }] });
 	assert.equal(firstReview.status, "accepted");
-	const second = await harness.controller.delegate(harness.goal.runId, { objective: "continue from prior candidate", subjectId: "operator", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["candidate history recorded"], executionLoop: { mode: "candidate-episode" } });
+	const second = await harness.controller.delegate(harness.goal.runId, { objective: "continue from prior candidate", subjectId: "operator", mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["candidate history recorded"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(second.status, "returned", second.executionFailure);
 	assert.deepEqual(second.episode?.checkouts?.map(item => item.candidateRef), ["T001/C001", "T001/C002"]);
 	assert.deepEqual(second.episode?.candidates[0].conditions, ["basis A", "same evaluation target"]);
@@ -448,7 +448,7 @@ test("a later task can retrieve a near miss and derive from an exact frozen pare
 	const frozenGoal = JSON.parse(await readFile(checkpoint.goalSnapshotPath, "utf8")) as { tasks: Array<{ episode?: { candidates: Array<{ parentRef?: { taskId: string; candidateId: string }; observationPath: string }> } }> };
 	assert.deepEqual(frozenGoal.tasks[1].episode?.candidates[0].parentRef, { taskId: "T001", candidateId: "C002" });
 	assert.ok(frozenGoal.tasks[1].episode?.candidates[0].observationPath.startsWith(checkpoint.rootDir));
-	const third = await harness.controller.delegate(harness.goal.runId, { objective: "try the same bytes on another subject", subjectId: "another-operator", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["candidate history recorded"], executionLoop: { mode: "candidate-episode" } });
+	const third = await harness.controller.delegate(harness.goal.runId, { objective: "try the same bytes on another subject", subjectId: "another-operator", mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["candidate history recorded"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(third.status, "returned", third.executionFailure);
 });
 
@@ -524,17 +524,17 @@ test("checkout preserves a frozen multi-file candidate's relative imports in an 
 		return "Checked out the original executable file layout.";
 	}, verifier, backend);
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
-	const first = await harness.controller.delegate(harness.goal.runId, { objective: "freeze linked files", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [],
+	const first = await harness.controller.delegate(harness.goal.runId, { objective: "freeze linked files", mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [],
 		expectedOutputs: ["src/kernel.mjs", "include/common.mjs", "receipts.json"], checks: ["candidate recorded"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(first.status, "returned", first.executionFailure);
 	await harness.controller.review(harness.goal.runId, { taskId: first.taskId, artifacts: [first.reportPath!],
 		checks: [{ criterion: "candidate recorded", result: "passed", evidence: [first.reportPath!] }] });
-	const second = await harness.controller.delegate(harness.goal.runId, { objective: "reuse linked files", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [],
+	const second = await harness.controller.delegate(harness.goal.runId, { objective: "reuse linked files", mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [],
 		expectedOutputs: ["checkout.md"], checks: ["layout restored"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(second.status, "returned", second.executionFailure);
 	await harness.controller.review(harness.goal.runId, { taskId: second.taskId, artifacts: [second.reportPath!],
 		checks: [{ criterion: "layout restored", result: "passed", evidence: [second.reportPath!] }] });
-	const third = await harness.controller.delegate(harness.goal.runId, { objective: "restore second-generation linked files", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [],
+	const third = await harness.controller.delegate(harness.goal.runId, { objective: "restore second-generation linked files", mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [],
 		expectedOutputs: ["checkout2.md"], checks: ["layout stable"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(third.status, "returned", third.executionFailure);
 	const retained = await harness.controller.status(harness.goal.runId);
@@ -630,7 +630,7 @@ test("large case and diagnostic feedback is indexed while candidate_read retains
 		return "Read the full negative evidence through the existing range tool.";
 	}, verifier);
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
-	const task = await harness.controller.delegate(harness.goal.runId, { objective: "inspect original large feedback", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [],
+	const task = await harness.controller.delegate(harness.goal.runId, { objective: "inspect original large feedback", mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [],
 		expectedOutputs: ["kernel.py", "receipt.json"], checks: ["candidate recorded"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(task.status, "returned", task.executionFailure);
 	assert.equal(calls, 1, "paging evidence must not trigger another host evaluation");
@@ -694,7 +694,7 @@ test("unqueryable candidate results hand control back after queued tools settle,
 		};
 		const taskSpec = { objective: "measure candidate", mode: "execute" as const, inputs: [], expectedOutputs: ["kernel.txt"],
 			checks: ["candidate recorded"], executionLoop: { mode: "candidate-episode" as const },
-		subjectProfile: { implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const } };
+		subjectProfile: { operatorCategory: "norm-reduce" as const, implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const } };
 		const failed = await harness.controller.delegate(harness.goal.runId, taskSpec);
 		await toolsSettled;
 		assert.deepEqual(toolOutcomes, ["fulfilled", "rejected"]);
@@ -783,7 +783,7 @@ test("host reconciliation queries a failed task's original candidate ID and unlo
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
 	const taskSpec = { objective: "measure candidate", mode: "execute" as const, inputs: [], expectedOutputs: ["kernel.txt"],
 		checks: ["candidate recorded"], executionLoop: { mode: "candidate-episode" as const },
-		subjectProfile: { implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const } };
+		subjectProfile: { operatorCategory: "norm-reduce" as const, implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const } };
 	const failed = await harness.controller.delegate(harness.goal.runId, taskSpec);
 	assert.equal(failed.status, "failed");
 	assert.match(failed.executionFailure!, /builder session lost/);
@@ -849,7 +849,7 @@ test("a spent search budget stops the task deterministically and records the bou
 		routeLimits: { repairDepth: 3, stagnation: 8, directionChange: 3 } });
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
 	const task = await harness.controller.delegate(harness.goal.runId, { objective: "bounded search", subjectId: "operator",
-		mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["budget respected"],
+		mode: "execute", subjectProfile: { operatorCategory: "norm-reduce" as const, implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["budget respected"],
 		executionLoop: { mode: "candidate-episode" } });
 	assert.equal(task.status, "returned", task.executionFailure);
 	assert.equal(task.episode?.candidates.length, 2, "the refused third evaluation never reached the verifier");
@@ -865,7 +865,7 @@ test("with a bound verifier an execute task cannot fall back to a reviewer-gated
 	const harness = await setup(async () => "report", verifier);
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
 	await assert.rejects(harness.controller.delegate(harness.goal.runId, { objective: "reviewer gated",
-		mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const }, inputs: [], expectedOutputs: ["kernel.py"], checks: ["checked"],
+		mode: "execute", subjectProfile: { operatorCategory: "norm-reduce" as const, implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const }, inputs: [], expectedOutputs: ["kernel.py"], checks: ["checked"],
 		executionLoop: { mode: "until-ready" } }), /deterministic verifier/);
 });
 
@@ -900,7 +900,7 @@ test("each round assembles knowledge for the phase the host observed", async t =
 	const task = await harness.controller.delegate(harness.goal.runId, { objective: "phase injection",
 		subjectId: "operator", mode: "execute", inputs: [], expectedOutputs: ["kernel.py", "receipt.json"],
 		checks: ["rounds recorded"], executionLoop: { mode: "candidate-episode" },
-		subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" } });
+		subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" } });
 	assert.equal(task.status, "returned", task.executionFailure);
 	assert.deepEqual(phases, ["correctness-fix", "performance-tuning"],
 		"a numerical failure gets correctness material, a correct candidate gets tuning material");
@@ -956,7 +956,7 @@ test("an episode boundary distils what was established and restarts on a clean c
 	const task = await harness.controller.delegate(harness.goal.runId, { objective: "bounded episode",
 		subjectId: "operator", mode: "execute", inputs: [], expectedOutputs: ["kernel.py", "receipt.json"],
 		checks: ["candidates recorded"], executionLoop: { mode: "candidate-episode" },
-		subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" } });
+		subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" } });
 	assert.equal(task.status, "returned", task.executionFailure);
 	assert.equal(task.episode?.restarts?.length, 1, "one boundary was crossed");
 	assert.equal(task.episode?.candidates.length, 3);

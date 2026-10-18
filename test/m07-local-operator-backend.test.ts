@@ -197,7 +197,7 @@ def verify_goal(criteria, observations):
 	const goal = await controller.begin({ goal: "Original local operator target", problemRelation: "direct", constraints: ["same task"],
 		successCriteria: ["original target"], plan: "measure" },
 		{ candidateVerification: { id: h.verifier.id, verifierVersion: h.verifier.version, goalAdmission: false }, executionContract: "continuous" });
-	const task = await controller.delegate(goal.runId, { mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, objective: "evaluate one local candidate", subjectId: "numeric-tree",
+	const task = await controller.delegate(goal.runId, { mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, objective: "evaluate one local candidate", subjectId: "numeric-tree",
 		inputs: [], expectedOutputs: ["candidate.py"], checks: ["measurement retained"], executionLoop: { mode: "candidate-episode" } });
 	const accepted = await controller.review(goal.runId, { taskId: task.taskId, artifacts: [task.reportPath!],
 		checks: [{ criterion: "measurement retained", result: "passed", evidence: [task.reportPath!] }] });

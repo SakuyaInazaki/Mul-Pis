@@ -9,7 +9,7 @@ import type { CurrentGoal, TaskSpecInput } from "../src/m07/types.ts";
 
 const execute: TaskSpecInput = { objective: "one authorized external action", inputs: [],
 	expectedOutputs: ["result.txt"], checks: ["observe result"], mode: "execute",
-	subjectProfile: { implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const } };
+	subjectProfile: { operatorCategory: "norm-reduce" as const, implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const } };
 
 async function failedGoal(t: TestContext) {
 	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-host-reconcile-"));

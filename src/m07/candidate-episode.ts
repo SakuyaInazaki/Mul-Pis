@@ -116,7 +116,8 @@ export function createCandidateEpisodeTool(input: {
 		requireUnbannedDirection(priorState, action, args.newEvidence as string | undefined);
 		const searchBudget = goal.searchBudget ?? DEFAULT_SEARCH_BUDGET;
 		requireBudget(candidateBudgetLedger(priorArchive, { taskId: task.taskId,
-			subjectId: task.subjectId, policy: searchBudget }),
+			subjectId: task.subjectId, policy: searchBudget,
+			...(task.subjectProfile ? { category: task.subjectProfile.operatorCategory } : {}) }),
 			{ changeKind: action.changeKind, lane: action.changeKind === "repair" ||
 				priorState.phase === "bootstrap" ? "repair" : "optimization" });
 		const episodeRoot = path.join(path.dirname(task.workDir), "episode");
@@ -233,7 +234,8 @@ export function createCandidateEpisodeTool(input: {
 		episode.search = candidateSearchState(searchSnapshot.available, { subjectId: currentSubjectId,
 			taskId: task.taskId, limits: searchBudget.routeLimits });
 		episode.budget = candidateBudgetLedger(searchSnapshot.available, { taskId: task.taskId,
-			subjectId: currentSubjectId, policy: searchBudget });
+			subjectId: currentSubjectId, policy: searchBudget,
+			...(task.subjectProfile ? { category: task.subjectProfile.operatorCategory } : {}) });
 		// Every round assembles its own knowledge by phase: guardrails for a
 		// rewrite, rules for a compile failure, patterns for a numerical one,
 		// tiling only while tuning. The assembly reads the goal's frozen

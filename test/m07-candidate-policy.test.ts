@@ -3,6 +3,7 @@ import test from "node:test";
 import { candidateBudgetLedger, candidatePhase, candidateSearchState, candidateStrategyMenu,
 	candidateStrategyStats, decideCandidate, DEFAULT_SEARCH_BUDGET, requireAllowedAction, requireBudget,
 	requireUnbannedDirection, summarizeCandidateSearch, validateSearchBudget,
+	DEFAULT_CATEGORY_BUDGETS, operatorCategoryBudget,
 	type CandidateChangeKind } from "../src/m07/candidate-policy.ts";
 import type { CandidateArchiveEntry } from "../src/m07/candidate-archive.ts";
 import type { CandidateDiagnosticSummaryV1 } from "../src/m07/candidate-diagnostics.ts";
@@ -404,4 +405,40 @@ test("quarantined, unconfirmed or undecidable rulings never select a candidate",
 		notComparable: ["baseline failed"] }), history });
 	assert.equal(incomparable.guard, "accept");
 	assert.deepEqual(incomparable.hostVerdict?.notComparable, ["baseline failed"]);
+});
+
+test("operator category caps the task budget and keeps losing classes out of the queue by default", () => {
+	const policy = validateSearchBudget({});
+	assert.equal(operatorCategoryBudget(policy, "norm-reduce").admitted, true);
+	assert.equal(operatorCategoryBudget(policy, "elementwise-activation").evaluations, 6,
+		"an elementwise operator finishes in about one round");
+	for (const category of ["matmul", "convolution-pooling", "attention", "sorting-indexing", "broadcast"] as const)
+		assert.equal(operatorCategoryBudget(policy, category).admitted, false,
+			`${category} is a measured near-certain loss and needs a written reason`);
+	assert.equal(operatorCategoryBudget(policy, undefined).evaluations,
+		operatorCategoryBudget(policy, "other").evaluations, "an undeclared category falls back to the task budget");
+
+	const spent = [judged("C001", "keep"), judged("C002", "accept"), judged("C003", "accept"),
+		judged("C004", "accept"), judged("C005", "accept"), judged("C006", "accept")];
+	const capped = candidateBudgetLedger(spent, { taskId: "T001", subjectId: "a", policy,
+		category: "elementwise-activation" });
+	assert.equal(capped.categoryCap, 6);
+	assert.equal(capped.remaining, 0);
+	assert.equal(capped.stop, "task-evaluation-budget", "the category cap stops the task, not just the global one");
+	const uncapped = candidateBudgetLedger(spent, { taskId: "T001", subjectId: "a", policy,
+		category: "norm-reduce" });
+	assert.ok(uncapped.remaining > 0, "the largest yield area keeps the full task budget");
+});
+
+test("a configured category budget is validated like every other frozen number", () => {
+	const policy = validateSearchBudget({ categoryBudgets: { matmul: { evaluations: 12, admitted: true,
+		note: "this project has no vendor matmul" } } });
+	assert.equal(operatorCategoryBudget(policy, "matmul").admitted, true);
+	assert.equal(operatorCategoryBudget(policy, "matmul").evaluations, 12);
+	assert.equal(operatorCategoryBudget(policy, "norm-reduce").evaluations,
+		DEFAULT_CATEGORY_BUDGETS["norm-reduce"].evaluations, "untouched categories keep their defaults");
+	assert.throws(() => validateSearchBudget({ categoryBudgets: { gemm: { evaluations: 4, admitted: true } } }),
+		/unknown categories/);
+	assert.throws(() => validateSearchBudget({ categoryBudgets: { matmul: { evaluations: 0, admitted: true } } }),
+		/evaluations integer/);
 });

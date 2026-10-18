@@ -8,6 +8,7 @@ import type { KnowledgeRetrievalContext } from "../knowledge/retrieval.ts";
 import type { CandidateComparisonV1, CandidatePerformanceEvidenceV1 } from "./candidate-diagnostics.ts";
 import type { CandidatePolicyDecisionV1, CandidateSearchStateV1, CandidateStrategy, SearchBudgetLedgerV1, SearchBudgetPolicyV1 } from "./candidate-policy.ts";
 import type { PromptLayoutReceiptV1 } from "./prompt-layout.ts";
+import type { OperatorCategory } from "./candidate-policy.ts";
 import type { KnowledgeAccessEvent } from "./execution-knowledge.ts";
 
 export type M07TaskMode = "execute" | "check" | "reason";
@@ -32,6 +33,11 @@ export interface BeginGoalInput {
  * trajectory can answer "why this abstraction layer" and "why spend here"; the
  * numbers stay model or host declarations with their own stated source. */
 export interface SubjectProfileV1 {
+	/** Operator class, which is what expected yield actually tracks. A class the
+	 * evidence shows as a near-certain loss needs categoryJustification. */
+	operatorCategory: OperatorCategory;
+	/** Required when the declared category is not admitted by default. */
+	categoryJustification?: string;
 	implementationSpace: "vendor-library" | "dsl-or-ir" | "handwritten-low-level";
 	/** Why this layer rather than the ones above or below it. */
 	rationale: string;

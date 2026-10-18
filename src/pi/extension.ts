@@ -918,6 +918,10 @@ mainAgentWatchdog.unref?.();
 					symptoms: Type.Optional(Type.Array(Type.String())),
 				}, { additionalProperties: false })),
 				subjectProfile: Type.Optional(Type.Object({
+					operatorCategory: Type.Union(["elementwise-activation", "norm-reduce", "fusion", "matmul",
+						"convolution-pooling", "attention", "sorting-indexing", "broadcast", "other"].map(value => Type.Literal(value)),
+						{ description: "Operator class; matmul, convolution-pooling, attention, sorting-indexing and broadcast are not in the default optimization queue" }),
+					categoryJustification: Type.Optional(Type.String({ description: "Required to work on a category that is not admitted by default" })),
 					implementationSpace: Type.Union([Type.Literal("vendor-library"), Type.Literal("dsl-or-ir"), Type.Literal("handwritten-low-level")],
 						{ description: "Where this work object is implemented; writing low level by default is a decision that needs its own reason" }),
 					rationale: Type.String({ description: "Why this layer rather than the one above or below" }),

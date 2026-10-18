@@ -28,7 +28,8 @@ import type { Workspace } from "../workspace.ts";
 import { failedM04Feedback, resolveM04Baseline, type FormalBaseline } from "./formal-baseline.ts";
 import { writeFeedback } from "./feedback.ts";
 import { candidateObservation, requireCandidateVerifier, type CandidateVerifier, type FrozenCandidateFile } from "./candidate-evaluation.ts";
-import { candidateBudgetLedger, DEFAULT_SEARCH_BUDGET } from "./candidate-policy.ts";
+import { candidateBudgetLedger, DEFAULT_SEARCH_BUDGET, operatorCategoryBudget, OPERATOR_CATEGORIES,
+	type SearchBudgetPolicyV1 } from "./candidate-policy.ts";
 import { distillEpisode, episodeRestartMessage, writeEpisodeRecord } from "./episode-record.ts";
 import { createCandidateEpisodeTool } from "./candidate-episode.ts";
 import { createCandidateExecutionTools, pendingCandidateExecutions, type CandidateExecutionBackend } from "./candidate-runner.ts";
@@ -357,10 +358,11 @@ async function withGoalDispatch<T>(ctx: StageContext, runId: string, body: () =>
 	}
 }
 /** Declared facts only: the harness checks their shape, never their truth. */
-function validateSubjectProfile(profile: TaskSpecInput["subjectProfile"]): TaskSpecInput["subjectProfile"] {
+function validateSubjectProfile(profile: TaskSpecInput["subjectProfile"], budget: SearchBudgetPolicyV1): TaskSpecInput["subjectProfile"] {
 	if (profile === undefined) return undefined;
 	if (!profile || typeof profile !== "object" || Array.isArray(profile) ||
-		Object.keys(profile).some((key) => !["implementationSpace", "rationale", "baselineStrength", "endToEndShare", "headroom"].includes(key)) ||
+		Object.keys(profile).some((key) => !["operatorCategory", "categoryJustification", "implementationSpace", "rationale", "baselineStrength", "endToEndShare", "headroom"].includes(key)) ||
+		!(OPERATOR_CATEGORIES as readonly string[]).includes(profile.operatorCategory) ||
 		!["vendor-library", "dsl-or-ir", "handwritten-low-level"].includes(profile.implementationSpace) ||
 		!["vendor-library", "framework-default", "none"].includes(profile.baselineStrength) ||
 		typeof profile.rationale !== "string" || !profile.rationale.trim() || profile.rationale.length > 1000)
@@ -376,7 +378,17 @@ function validateSubjectProfile(profile: TaskSpecInput["subjectProfile"]): TaskS
 		profile.headroom.source.length > 400 ||
 		(profile.headroom.value !== undefined && (typeof profile.headroom.value !== "number" || !Number.isFinite(profile.headroom.value)))))
 		throw new HarnessError("m07.subject-profile", "subjectProfile.headroom needs a kind, a stated source, and a finite value when it claims one");
-	return { implementationSpace: profile.implementationSpace, rationale: profile.rationale.trim(),
+	// A category the evidence measures as a near-certain loss may still be worked
+	// on, but only with a written reason that stays in the trajectory.
+	const admitted = operatorCategoryBudget(budget, profile.operatorCategory).admitted;
+	if (!admitted && (typeof profile.categoryJustification !== "string" || !profile.categoryJustification.trim()))
+		throw new HarnessError("m07.subject-profile", `operator category ${profile.operatorCategory} is not in the default optimization queue: ${operatorCategoryBudget(budget, profile.operatorCategory).note}. Declare categoryJustification to work on it anyway.`);
+	if (profile.categoryJustification !== undefined && (typeof profile.categoryJustification !== "string" ||
+		!profile.categoryJustification.trim() || profile.categoryJustification.length > 1000))
+		throw new HarnessError("m07.subject-profile", "subjectProfile.categoryJustification must be a nonempty reason under 1000 characters");
+	return { operatorCategory: profile.operatorCategory,
+		...(profile.categoryJustification ? { categoryJustification: profile.categoryJustification.trim() } : {}),
+		implementationSpace: profile.implementationSpace, rationale: profile.rationale.trim(),
 		baselineStrength: profile.baselineStrength,
 		...(profile.endToEndShare === undefined ? {} : { endToEndShare: profile.endToEndShare }),
 		...(profile.headroom ? { headroom: { kind: profile.headroom.kind, source: profile.headroom.source.trim(),
@@ -1198,7 +1210,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 					...(spec.executionLoop.maxRounds === undefined ? {} : { maxRounds: spec.executionLoop.maxRounds }),
 					...(spec.executionLoop.deadlineAt === undefined ? {} : { deadlineAt: spec.executionLoop.deadlineAt }) } : undefined };
 			if (spec.subjectId !== undefined) spec.subjectId = nonempty(spec.subjectId, "task subjectId");
-			spec.subjectProfile = validateSubjectProfile(spec.subjectProfile);
+			spec.subjectProfile = validateSubjectProfile(spec.subjectProfile, goal.searchBudget ?? DEFAULT_SEARCH_BUDGET);
 			// Under a bound verifier an execute task produces candidates, and the basis
 			// requires the abstraction-layer decision and the headroom record before
 			// spending a search budget on it.
@@ -1514,7 +1526,8 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 					const evaluatedBefore = episode.restarts?.at(-1)?.afterCandidates ?? 0;
 					if (episode.candidates.length - evaluatedBefore < searchBudget.episodeRestartEvaluations) break;
 					const ledger = candidateBudgetLedger(candidateArchive(goal, id),
-						{ taskId: id, subjectId: task.subjectId, policy: searchBudget });
+						{ taskId: id, subjectId: task.subjectId, policy: searchBudget,
+							...(task.subjectProfile ? { category: task.subjectProfile.operatorCategory } : {}) });
 					// A spent or stalled task hands control back instead of restarting.
 					if (ledger.stop || !ledger.remaining) break;
 					const episodeRecord = await distillEpisode({ runId, taskId: id,

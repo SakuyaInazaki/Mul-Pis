@@ -48,6 +48,7 @@ export async function writeFeedback(ctx: StageContext, goal: CurrentGoal, policy
 	if (goal.workflowMethod?.artifact.slot === "evidence-handoff") lines.push("## 冻结的证据交接方法", "", "以下方法正文曾作为 M07 任务指导；这里保留其版本与内容以供 M04 核对，实际证据与未执行项仍以本包记录为准。", "", goal.workflowMethod.artifact.body, "");
 	for (const task of goal.tasks) {
 		lines.push(`### ${task.taskId} ${task.objective}`, "", `- 状态：${task.status}`, `- 模式：${task.mode}`, `- 会话报告：${task.reportPath ? displayPath(task.reportPath) : "未产生"}`, `- 实际读取：${task.readCoverage.join("、") || "无可记录读取"}`);
+		if (task.subjectProfile) lines.push(`- 工作对象类别：${task.subjectProfile.operatorCategory}${task.subjectProfile.categoryJustification ? `（默认不进优化队列，声明理由：${task.subjectProfile.categoryJustification}）` : ""}；该类别的预算上限与期望收益按冻结的 searchBudget 分配。`);
 		if (task.subjectProfile) lines.push(`- 工作对象声明：实现空间 ${task.subjectProfile.implementationSpace}（理由：${task.subjectProfile.rationale}）；对照基线强度 ${task.subjectProfile.baselineStrength}；端到端占比 ${task.subjectProfile.endToEndShare ?? "未测"}；headroom ${task.subjectProfile.headroom ? `${task.subjectProfile.headroom.kind}=${task.subjectProfile.headroom.value ?? "未给值"}（来源：${task.subjectProfile.headroom.source}）` : "未声明"}。以上是声明事实，不是宿主证明。`);
 		if (task.candidate) lines.push(`- 候选血统：${task.candidate.parentTaskId ?? "起点"}；改动类别：${task.candidate.changeKind ?? "未标注"}；源码 ${task.candidate.sourcePaths.join("、")}；平台原回执 ${task.candidate.receiptPaths.join("、")}。`);
 		if (task.candidateObservation) {

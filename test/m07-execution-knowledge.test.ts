@@ -303,7 +303,7 @@ test("episode receives an initial brief and preserves actual knowledge calls thr
 	const controller = createM07Controller(ctx, { candidateVerifier: verifier });
 	const goal = await controller.begin({ goal: "repair knowledge", problemRelation: "direct", constraints: ["Preserve the original operator contract"], successCriteria: ["original criterion"], plan: "inspect knowledge" },
 		{ candidateVerification: { id: verifier.id, verifierVersion: verifier.version } });
-	const task = await controller.delegate(goal.runId, { objective: "read relevant repair knowledge", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["knowledge-review.txt"], checks: ["read original knowledge"], knowledgeIds: ["K001"], knowledgeContext: { backend: "test-backend" }, executionLoop: { mode: "candidate-episode" } });
+	const task = await controller.delegate(goal.runId, { objective: "read relevant repair knowledge", mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["knowledge-review.txt"], checks: ["read original knowledge"], knowledgeIds: ["K001"], knowledgeContext: { backend: "test-backend" }, executionLoop: { mode: "candidate-episode" } });
 	assert.equal(task.knowledgeAccess?.length, 2);
 	const reviewed = await controller.review(goal.runId, { taskId: task.taskId, artifacts: [task.reportPath!], checks: [{ criterion: "read original knowledge", result: "passed", evidence: [task.reportPath!] }] });
 	assert.equal(reviewed.status, "accepted");
@@ -354,7 +354,7 @@ test("a valid large required knowledge group uses a paged episode preview withou
 	const controller = createM07Controller(ctx, { candidateVerifier: verifier });
 	const goal = await controller.begin({ goal: "inspect required knowledge", problemRelation: "direct", constraints: ["preserve original conditions"], successCriteria: ["original criterion"], plan: "inspect" },
 		{ candidateVerification: { id: verifier.id, verifierVersion: verifier.version } });
-	const task = await controller.delegate(goal.runId, { objective: "read required knowledge", mode: "execute", subjectProfile: { implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["knowledge-review.txt"],
+	const task = await controller.delegate(goal.runId, { objective: "read required knowledge", mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["knowledge-review.txt"],
 		checks: ["read original knowledge"], knowledgeIds: ["K001"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(task.status, "returned");
 	assert.equal(task.knowledgeAccess?.length, 2);
