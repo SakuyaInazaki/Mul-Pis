@@ -84,6 +84,11 @@ TIGHTER = {
 FAULT_FAMILIES = ("arithmetic", "precision", "synchronization", "boundary", "control")
 
 
+def platform_binding():
+    """The host-derived measurement contract, when the host bound a profile."""
+    return (WORKER_OPTIONS or {}).get("platformBinding")
+
+
 def decision_policy(spec):
     """Effective thresholds for this contract, defaults included."""
     declared = spec.get("decisionPolicy", {})
@@ -176,6 +181,19 @@ def compare(actual, expected, atol, rtol):
             "boundingBox": [{"depth": depth, "firstIndex": low, "lastIndex": high}
                             for depth, (low, high) in sorted(box.items())],
             "errors": errors, "omittedErrors": total - len(errors)}
+
+
+def numeric_leaves(value):
+    """Count the numbers a case actually measures, booleans excluded."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return 1
+    if isinstance(value, list):
+        return sum(numeric_leaves(item) for item in value)
+    if isinstance(value, dict):
+        return sum(numeric_leaves(item) for item in value.values())
+    return 0
 
 
 def leaf_magnitude(value):
@@ -328,6 +346,29 @@ def validate(contract):
             not math.isfinite(timing["minimumSampleSeconds"]) or timing["minimumSampleSeconds"] < MINIMUM_SAMPLE_SECONDS_FLOOR:
         raise ValueError(f"task must declare timing.minimumSampleSeconds >= {MINIMUM_SAMPLE_SECONDS_FLOOR}; "
                          "shorter work cannot decide between candidates")
+    binding = platform_binding()
+    if binding:
+        # The profile is the measurement contract; the task may only agree.
+        if timing["warmup"] != binding["timing"]["warmup"] or timing["repeats"] != binding["timing"]["repeats"]:
+            raise ValueError("SPEC.timing must equal the bound platform protocol "
+                             f"(warmup {binding['timing']['warmup']}, repeats {binding['timing']['repeats']})")
+        if timing["minimumSampleSeconds"] < binding["timing"]["minimumSampleSeconds"]:
+            raise ValueError("SPEC.timing.minimumSampleSeconds is below the platform's own minimum runtime")
+        declared_ids = [case["id"] for case in cases]
+        bound_ids = [case["id"] for case in binding["cases"]]
+        if declared_ids != bound_ids:
+            raise ValueError("SPEC.cases must be exactly the platform case table, in order; "
+                             f"bound ids: {bound_ids}")
+        for case, bound in zip(cases, binding["cases"]):
+            if case.get("set", "iteration") != bound["set"]:
+                raise ValueError(f"case {case['id']} must stay in its bound {bound['set']} set")
+            # The case table states what is measured. A contract that declares a
+            # smaller input than the table measures something else under the
+            # same name, which is how a shape-specialised result travels.
+            measured = numeric_leaves(case["input"])
+            if measured != bound["elements"]:
+                raise ValueError(f"case {case['id']} declares {measured} elements but the platform case "
+                                 f"table binds {bound['elements']}")
     declared = spec.get("decisionPolicy", {})
     if not isinstance(declared, dict) or any(name not in DECISION_DEFAULTS for name in declared):
         raise ValueError(f"SPEC.decisionPolicy may only override {sorted(DECISION_DEFAULTS)}")
@@ -344,8 +385,14 @@ def validate(contract):
         raise ValueError("task must explicitly choose a positive workerOutputBytes for each worker output")
     tolerance = spec.get("tolerance", {})
     mode = tolerance.get("mode")
-    if mode not in ("fixed", "reference-repeat", "reference-error"):
-        raise ValueError("tolerance mode must be fixed, reference-repeat or reference-error")
+    if mode not in ("fixed", "reference-repeat", "reference-error", "platform-three-region"):
+        raise ValueError("tolerance mode must be fixed, reference-repeat, reference-error or platform-three-region")
+    if mode == "platform-three-region":
+        if not platform_binding():
+            raise ValueError("platform-three-region tolerance needs a host-bound platform profile")
+        if not callable(getattr(contract, "golden", None)):
+            raise ValueError("platform-three-region needs a same-precision golden to count errors against "
+                             "outside the normal region")
     for name in (["atol", "rtol"] if mode == "fixed" else ["rtol", "sigmaMultiplier"]):
         if type(tolerance.get(name)) not in (int, float) or not math.isfinite(tolerance[name]) or tolerance[name] < 0:
             raise ValueError(f"explicit finite nonnegative tolerance.{name} is required")
@@ -712,7 +759,12 @@ def run_worker(contract_path, source_path, role, case, *, timeout, output_bytes,
     logs = {"stdout": (log_dir / "stdout.json").open("wb"), "stderr": (log_dir / "stderr.txt").open("wb")}
     counts = {"stdout": 0, "stderr": 0}
     payload = json.dumps(case if role == "goal" else {"case": case, "repeats": repeats, "measure": measure,
-                          "compiledBuildDir": WORKER_OPTIONS.get("compiledBuildDir")}, allow_nan=False).encode()
+                          "compiledBuildDir": WORKER_OPTIONS.get("compiledBuildDir"),
+                          # The worker validates the same contract the controller
+                          # did, so it needs the same host binding to validate it
+                          # against; otherwise it would judge by the task's own
+                          # numbers in a run the host had already bound.
+                          "platformBinding": WORKER_OPTIONS.get("platformBinding")}, allow_nan=False).encode()
     sent = 0
     for name, stream in streams.items():
         os.set_blocking(stream.fileno(), False)
@@ -883,6 +935,7 @@ def measure_workers(contract_path, source_path, case, contract, *, timeout, outp
             session = sessions[role]
             child = session["child"]
             payload = (json.dumps({"case": case, "compiledBuildDir": WORKER_OPTIONS.get("compiledBuildDir"),
+                                   "platformBinding": WORKER_OPTIONS.get("platformBinding"),
                                    **request}, allow_nan=False) + "\n").encode()
             sent = 0
             os.set_blocking(child.stdin.fileno(), False)
@@ -1019,6 +1072,8 @@ def calibrate(contract_path, source_path, contract, case, *, timeout, output_byt
     reference = reference_result["outputs"]
     expected = reference[0]
     golden = None
+    if tolerance["mode"] == "platform-three-region":
+        golden = run_worker(contract_path, source_path, "golden", case, timeout=timeout, output_bytes=output_bytes)["outputs"][0]
     if tolerance["mode"] == "reference-error":
         golden = run_worker(contract_path, source_path, "golden", case, timeout=timeout, output_bytes=output_bytes)["outputs"][0]
         expected = golden
@@ -1030,6 +1085,16 @@ def calibrate(contract_path, source_path, contract, case, *, timeout, output_byt
         max(observed) + tolerance["sigmaMultiplier"] * statistics.pstdev(observed)
     magnitude = leaf_magnitude(expected)
     ratio = None if atol <= 0 else (magnitude / atol if magnitude is not None else 0.0)
+    if tolerance["mode"] == "platform-three-region":
+        bound = platform_binding()["tolerance"]
+        # Relative first screen from the dtype's mantissa width, not an absolute
+        # bound: an absolute one is what lets a near-zero output pass as correct.
+        calibration = {"mode": tolerance["mode"], "atol": 0.0, "rtol": bound["mantissaRelative"],
+                       "referenceMaxAbsoluteErrors": observed, "referenceMeanMagnitude": magnitude,
+                       "magnitudeToAtol": None, "toleranceAdequate": True,
+                       "platformTolerance": dict(bound)}
+        return {"expected": expected, "calibration": calibration, "logs": reference_result["workerLogs"],
+                "goldenExpected": golden, "referenceError": max(observed)}
     calibration = {"mode": tolerance["mode"], "atol": atol, "rtol": tolerance["rtol"],
                    "referenceMaxAbsoluteErrors": observed, "referenceMeanMagnitude": magnitude,
                    "magnitudeToAtol": ratio,
@@ -1041,6 +1106,93 @@ def calibrate(contract_path, source_path, contract, case, *, timeout, output_byt
         calibration["goldenReferenceError"] = reference_error
     return {"expected": expected, "calibration": calibration, "logs": reference_result["workerLogs"],
             "goldenExpected": golden, "referenceError": max(observed) if golden is not None else None}
+
+
+def region_counts(actual, expected, bound, magnitude):
+    """Split every mismatching leaf into the three published regions.
+
+    A failure where the reference carries real signal is simply wrong. Where the
+    reference sits under the dtype's noise floor, or is a near-zero left by
+    cancellation between much larger intermediates, elementwise relative error
+    is not a meaningful quantity, so those leaves are only counted and compared
+    against the same-precision golden instead of being judged directly.
+    """
+    counts = {"normal": 0, "smallValue": 0, "cancellation": 0}
+    total = {"normal": 0, "smallValue": 0, "cancellation": 0}
+    relative = []
+
+    def region(value):
+        if abs(value) < bound["smallValueFloor"]:
+            return "smallValue"
+        if magnitude is not None and magnitude > 0 and abs(value) < bound["cancellationFraction"] * magnitude:
+            return "cancellation"
+        return "normal"
+
+    def visit(a, b):
+        if isinstance(b, dict):
+            for key in b:
+                visit(a[key], b[key])
+        elif isinstance(b, list):
+            for left, right in zip(a, b):
+                visit(left, right)
+        elif not isinstance(b, bool):
+            name = region(b)
+            total[name] += 1
+            error = abs(a - b) / (abs(b) + 1e-7)
+            relative.append(error)
+            if error >= bound["mantissaRelative"] * bound["firstScreenMaxMultiplier"]:
+                counts[name] += 1
+
+    visit(actual, expected)
+    mean = statistics.fmean(relative) if relative else 0.0
+    return {"counts": counts, "elements": total, "meanRelative": mean,
+            "maxRelative": max(relative) if relative else 0.0}
+
+
+def three_region_verdict(candidate_output, expected, golden, bound, magnitude):
+    """CANN Bench screen first, then the region split on whatever failed it."""
+    screen = region_counts(candidate_output, expected, bound, magnitude)
+    first_screen = screen["meanRelative"] < bound["mantissaRelative"] and \
+        screen["maxRelative"] < bound["firstScreenMaxMultiplier"] * bound["mantissaRelative"]
+    verdict = {"firstScreenPassed": first_screen, "meanRelative": screen["meanRelative"],
+               "maxRelative": screen["maxRelative"], "regions": screen["counts"],
+               "regionElements": screen["elements"]}
+    if first_screen:
+        verdict["passed"] = True
+        return verdict
+    if screen["counts"]["normal"]:
+        # A failure in the normal region is simply wrong; no fallback applies.
+        verdict["passed"] = False
+        verdict["reason"] = "errors fall in the normal region"
+        return verdict
+    reference = region_counts(golden, expected, bound, magnitude)["counts"]
+    ratios = {}
+    for name in ("smallValue", "cancellation"):
+        ratios[name] = screen["counts"][name] / max(reference[name], 1)
+    verdict["goldenRegionCounts"] = reference
+    verdict["goldenErrorRatios"] = ratios
+    verdict["passed"] = all(value <= bound["goldenErrorRatio"] for value in ratios.values())
+    if not verdict["passed"]:
+        verdict["reason"] = "small-value or cancellation errors exceed the golden ratio"
+    return verdict
+
+
+def verdict_for(case, comparison, calibrated, actual_output):
+    """One pass/fail for one output, under whichever oracle this case declares.
+
+    The structural witness from `compare` is always produced first: a shape or
+    key mismatch is a failure under every oracle, and the region split below
+    assumes the two trees line up.
+    """
+    calibration = calibrated["calibration"]
+    if calibration["mode"] != "platform-three-region":
+        passed, matched = oracle_verdict(case, comparison)
+        return passed, matched, None
+    if any(item["kind"] != "numerical" for item in comparison["errors"]):
+        return False, None, {"passed": False, "reason": "output structure or type differs"}
+    region = three_region_verdict(actual_output, calibrated["expected"], calibrated["goldenExpected"],
+                                  calibration["platformTolerance"], calibration["referenceMeanMagnitude"])
+    return region["passed"], None, region
 
 
 def oracle_verdict(case, comparison):
@@ -1102,7 +1254,7 @@ def check_case(contract_path, source_path, contract, case, *, timeout, output_by
                     unavailable[name] = str(error)
                     continue
                 checked = compare(observed, calibrated["expected"], calibration["atol"], calibration["rtol"])
-                validity[name] = oracle_verdict(variant["case"], checked)[0]
+                validity[name] = verdict_for(variant["case"], checked, calibrated, observed)[0]
             entry["validityGate"] = validity
             if unavailable:
                 entry["validityGateUnavailable"] = unavailable
@@ -1120,9 +1272,13 @@ def check_case(contract_path, source_path, contract, case, *, timeout, output_by
         entry["determinism"] = {"repeats": len(outputs),
                                 "identical": all(item == outputs[0] for item in outputs)}
         comparisons = [compare(item, calibrated["expected"], calibration["atol"], calibration["rtol"]) for item in outputs]
-        verdicts = [oracle_verdict(variant["case"], item) for item in comparisons]
+        verdicts = [verdict_for(variant["case"], item, calibrated, outputs[index])
+                    for index, item in enumerate(comparisons)]
         entry["comparisons"] = comparisons
         entry["matchedRatios"] = [item[1] for item in verdicts if item[1] is not None]
+        regions = [item[2] for item in verdicts if item[2] is not None]
+        if regions:
+            entry["threeRegion"] = regions[0]
         rho = error_ratio(comparisons[0], calibrated["referenceError"])
         if rho is not None:
             entry["referenceErrorRatio"] = rho
@@ -1140,7 +1296,8 @@ def check_case(contract_path, source_path, contract, case, *, timeout, output_by
                                      timeout=timeout, output_bytes=output_bytes)
             entry["noopLogs"] = noop_result["workerLogs"]
             entry["noop"] = compare(noop_result["outputs"][0], calibrated["expected"], calibration["atol"], calibration["rtol"])
-            entry["noopSensitive"] = not oracle_verdict(variant["case"], entry["noop"])[0]
+            entry["noopSensitive"] = not verdict_for(variant["case"], entry["noop"], calibrated,
+                                                     noop_result["outputs"][0])[0]
         except Exception as error:
             # An unavailable ghost replay is an unfinished check, never a pass.
             entry["noop"] = {"passed": None, "inconclusive": True, "error": str(error)}
@@ -1215,7 +1372,11 @@ def measure_case(contract_path, source_path, contract, case, *, timeout, output_
     row["candidateLogs"] = actual["workerLogs"]
     comparisons = [compare(item, calibrated["expected"], calibration["atol"], calibration["rtol"]) for item in actual["outputs"]]
     row["comparisons"] = comparisons
-    row["passed"] = all(oracle_verdict(case, item)[0] for item in comparisons)
+    measured_verdicts = [verdict_for(case, item, calibrated, actual["outputs"][index])
+                         for index, item in enumerate(comparisons)]
+    row["passed"] = all(item[0] for item in measured_verdicts)
+    if measured_verdicts and measured_verdicts[0][2] is not None:
+        row["threeRegion"] = measured_verdicts[0][2]
     row["samplesSeconds"] = actual["samplesSeconds"]
     valid_samples = lambda values: isinstance(values, list) and len(values) == spec["timing"]["repeats"] and \
         all(type(value) in (int, float) and math.isfinite(value) and value > 0 for value in values)
@@ -1239,7 +1400,9 @@ def measure_case(contract_path, source_path, contract, case, *, timeout, output_
         row["baselines"][name] = {"samplesSeconds": samples, "comparisons": checked,
                                   "workerLogs": baseline["workerLogs"], "measurementError": measurement_error,
                                   "pairedCandidateToBaselineRatios": ratios}
-        if measurement_error or not samples_valid or not all(oracle_verdict(case, item)[0] for item in checked):
+        if measurement_error or not samples_valid or \
+                not all(verdict_for(case, item, calibrated, baseline["outputs"][index])[0]
+                        for index, item in enumerate(checked)):
             row["baselineValid"] = False
             continue
         if ratios is not None:
@@ -1478,17 +1641,23 @@ def main():
     if sys.argv[1] == "--worker-loop":
         for line in sys.stdin:
             payload = json.loads(line)
+            if payload.get("platformBinding"):
+                WORKER_OPTIONS = {"platformBinding": payload["platformBinding"]}
             with contextlib.redirect_stdout(sys.stderr):
                 result = worker(sys.argv[2], sys.argv[3], sys.argv[4], payload)
             print(json.dumps(result, allow_nan=False), flush=True)
         return
     if sys.argv[1] == "--worker":
         payload = json.loads(pathlib.Path(sys.argv[6]).read_text()) if len(sys.argv) > 6 and sys.argv[5] == "--worker-input" else json.load(sys.stdin)
+        if isinstance(payload, dict) and payload.get("platformBinding"):
+            WORKER_OPTIONS = {"platformBinding": payload["platformBinding"]}
         with contextlib.redirect_stdout(sys.stderr):
             result = worker(sys.argv[2], sys.argv[3], sys.argv[4], payload)
         print(json.dumps(result, allow_nan=False))
         return
     if sys.argv[1] == "--goal-capability":
+        if len(sys.argv) > 3:
+            WORKER_OPTIONS = json.loads(pathlib.Path(sys.argv[3]).read_text())
         contract = load(str(pathlib.Path(sys.argv[2]).resolve()), "trusted_operator_contract")
         spec = validate(contract)
         value = getattr(contract, "verify_goal", None)
@@ -1497,6 +1666,13 @@ def main():
         print(json.dumps({"configured": callable(value), "workerTimeoutSeconds": spec["workerTimeoutSeconds"],
                           "workerOutputBytes": spec["workerOutputBytes"],
                           "measurementEnvironment": spec["measurementEnvironment"]}))
+        return
+    if sys.argv[1] == "--normalize-source":
+        # Hash the parsed program, not the file: comments and formatting change
+        # the bytes without changing what would be evaluated, and re-measuring
+        # those is the waste this key exists to avoid.
+        tree = ast.parse(pathlib.Path(sys.argv[2]).read_text())
+        print(json.dumps({"sha256": hashlib.sha256(ast.dump(tree).encode()).hexdigest()}))
         return
     if sys.argv[1] == "--case-input":
         # The host needs the exact declared input to profile one case, but that
@@ -1628,6 +1804,15 @@ def main():
         receipt["certificationCases"] = sum(1 for case in spec["cases"] if case.get("set") == "certification")
         receipt["timingProtocol"] = spec["timing"]
         receipt["measurementEnvironment"] = spec["measurementEnvironment"]
+        if platform_binding():
+            binding = platform_binding()
+            receipt["platformBinding"] = {"profileId": binding["profileId"], "chip": binding["chip"],
+                                          "toolchain": binding["toolchain"],
+                                          "protocolVersion": binding["protocolVersion"],
+                                          "latencySource": binding["timing"]["latencySource"],
+                                          "metricSource": binding["timing"]["metricSource"],
+                                          "tolerance": binding["tolerance"],
+                                          "unalignedFraction": binding["unalignedFraction"]}
         receipt["baselineTiers"] = spec["baselineTiers"]
         receipt["hiddenVariants"] = [name for name, _ in PERTURBATIONS]
         if stage == "measurement":

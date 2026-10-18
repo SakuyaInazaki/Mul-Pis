@@ -7,6 +7,8 @@
  * host-normalized quantities; nothing is inferred, ranked or recommended by a
  * model, and no value is invented when its inputs are absent. */
 import type { CandidatePerformanceEvidenceV1 } from "./candidate-diagnostics.ts";
+import { classifyBottleneck } from "../platform/diagnostics.ts";
+import type { PlatformProfileV1 } from "../platform/profile.ts";
 
 /** Fixed thresholds, stated once so a reader can check every label by hand. */
 export const BOTTLENECK_THRESHOLD_PERCENT = 30;
@@ -19,8 +21,9 @@ const COMBINED_THROUGHPUT = "gpu__compute_memory_throughput.avg.pct_of_peak_sust
 
 export interface ProfileBottleneckV1 {
 	/** `compute`/`bandwidth`/`latency` follow the published three-throughput
-	 * rule; `unclassified` means the required counters were not supplied. */
-	label: "compute" | "bandwidth" | "latency" | "unclassified";
+	 * rule; `unclassified` means the required counters were not supplied.
+	 * A bound platform profile replaces this with its own declared label. */
+	label: string;
 	/** The exact counters and bounds the label was read from. */
 	evidence: Array<{ name: string; value: number; unit: string; sourceLocation?: string }>;
 	reason: string;
@@ -32,6 +35,11 @@ export interface ProfileBottleneckV1 {
 	saturated?: boolean;
 	/** Counters supplied but outside this layer's fixed vocabulary. */
 	uninterpretedCounters: string[];
+	/** Ordered action classes the platform profile attaches to its label. The
+	 * harness offers them; it does not pick one. */
+	actions?: string[];
+	/** Which profile decided the label, when one did. */
+	platformId?: string;
 }
 
 const percent = (performance: CandidatePerformanceEvidenceV1, name: string): { value: number; unit: string; sourceLocation?: string } | undefined => {
@@ -43,7 +51,7 @@ const percent = (performance: CandidatePerformanceEvidenceV1, name: string): { v
 /** Classify one case's normalized profile evidence. The caller decides whether
  * the result is worth showing; this function never chooses an optimization. */
 export function interpretProfileBottleneck(performance: CandidatePerformanceEvidenceV1,
-	rooflineLowerBoundSeconds?: number): ProfileBottleneckV1 {
+	rooflineLowerBoundSeconds?: number, profile?: PlatformProfileV1): ProfileBottleneckV1 {
 	const compute = percent(performance, COMPUTE_THROUGHPUT);
 	const memory = percent(performance, MEMORY_THROUGHPUT);
 	const combined = percent(performance, COMBINED_THROUGHPUT);
@@ -68,11 +76,21 @@ export function interpretProfileBottleneck(performance: CandidatePerformanceEvid
 			reason = `Memory throughput ${memoryObserved}% is at or above ${BOTTLENECK_THRESHOLD_PERCENT}% while compute throughput ${compute.value}% is not.`;
 		}
 	}
+	// A bound platform profile states its own labels and the actions each one
+	// implies. Its declared rule wins over the generic one: the thresholds were
+	// probed on that chip, and the label carries an action list with it.
+	const declared = profile && classifyBottleneck(profile,
+		Object.fromEntries((performance.counters ?? []).map(counter => [counter.name, counter.value])));
+	if (declared) {
+		label = declared.label;
+		reason = `Platform ${profile!.id} declares this label for the supplied counters.`;
+	}
 	const elapsed = performance.elapsedSeconds?.value;
 	const bounded = rooflineLowerBoundSeconds !== undefined && rooflineLowerBoundSeconds > 0 &&
 		elapsed !== undefined && elapsed > 0 && Number.isFinite(elapsed / rooflineLowerBoundSeconds);
 	const fraction = bounded ? Math.min(1, rooflineLowerBoundSeconds! / elapsed!) : undefined;
 	return { label, evidence, reason,
+		...(declared ? { actions: declared.actions, platformId: profile!.id } : {}),
 		...(fraction !== undefined ? { speedOfLightFraction: fraction,
 			headroomFactor: Math.max(1, elapsed! / rooflineLowerBoundSeconds!),
 			saturated: fraction >= SATURATION_FRACTION } : {}),
@@ -98,6 +116,8 @@ export function describeProfileBottleneck(bottleneck: ProfileBottleneckV1): stri
 			` Read from ${bottleneck.evidence.map(item => `${item.name}=${item.value}${item.unit}`).join(", ")}.` : ""}`];
 	if (bottleneck.speedOfLightFraction !== undefined && where.length)
 		parts.push(`Headroom: ${(bottleneck.speedOfLightFraction * 100).toFixed(1)}% of the supplied theoretical bound attained, remaining factor ${bottleneck.headroomFactor!.toFixed(2)}×${bottleneck.saturated ? " (at or above the saturation threshold)" : ""}.`);
+	if (bottleneck.actions?.length)
+		parts.push(`Action classes this platform attaches to the label, in order: ${bottleneck.actions.join(", ")}.`);
 	if (bottleneck.uninterpretedCounters.length)
 		parts.push(`Supplied but not interpreted by this rule: ${bottleneck.uninterpretedCounters.join(", ")}.`);
 	return parts.join(" ").slice(0, PROFILE_SUMMARY_LIMIT);
