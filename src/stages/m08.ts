@@ -6,6 +6,8 @@ import { renderPageTool } from "../tools/pagetool.ts";
 import { HarnessError, type Role, type StageRunRecord } from "../types.ts";
 import { sessionSpec, withRun, type StageContext } from "./context.ts";
 import { freezeArtifacts, type ArtifactSelection, type FrozenArtifactManifest } from "./artifacts.ts";
+import { parseAntiCheatPolicy, renderAntiCheatFindings, scanAntiCheat,
+	type AntiCheatPolicyInput, type AntiCheatReportV1 } from "./review-policy.ts";
 
 export type M08ReviewMode = "read-only" | "execute";
 export interface M08Task { id: string; instruction: string; mode?: M08ReviewMode }
@@ -18,9 +20,18 @@ export interface M08Options {
 	previousRunId?: string;
 	changeSummary?: string;
 	affectedScope?: string;
+	/** Caller-declared rejection patterns, checked by the host over the frozen
+	 * material before any session starts. */
+	antiCheat?: AntiCheatPolicyInput;
+	/** Certification material: frozen outside every session's tool root and used
+	 * only by M09's pre-delivery host rerun. Its value depends on the reviewed
+	 * work never having seen it, so neither its contents nor its file names
+	 * reach a session. */
+	certification?: { materials: ArtifactSelection[]; notes?: string };
 }
 export interface M08MemberResult { id: string; role: Role | "selfcheck"; status: "completed" | "failed"; report?: string; coverage: string[]; renderedPages: string[]; failure?: string }
-export interface M08Result { record: StageRunRecord; manifest: FrozenArtifactManifest; selfChecks: M08MemberResult[]; reviews: M08MemberResult[]; bundlePath?: string }
+export interface M08Result { record: StageRunRecord; manifest: FrozenArtifactManifest; selfChecks: M08MemberResult[]; reviews: M08MemberResult[]; bundlePath?: string;
+	antiCheat: AntiCheatReportV1; certification?: { manifest: FrozenArtifactManifest; rootDir: string; fileCount: number } }
 
 function validate(options: M08Options): void {
 	if (!options.materials.length) throw new HarnessError("m08.materials", "M08 必须显式选择至少一项成果材料");
@@ -35,6 +46,9 @@ function validate(options: M08Options): void {
 
 export async function runM08(ctx: StageContext, options: M08Options): Promise<M08Result> {
 	validate(options);
+	// Validate the declared policy here as well as in the spec loader: every
+	// entry point must get the same rejection rules.
+	const antiCheatPolicy = parseAntiCheatPolicy(options.antiCheat);
 	if (options.previousRunId) await ctx.ws.readRun("M08", options.previousRunId);
 	const selectedMaterials = options.materials.map((item) => ({ ...item, path: path.isAbsolute(item.path) ? path.resolve(item.path) : path.resolve(ctx.ws.root, item.path) }));
 	const problem = await ctx.ws.readProblem();
@@ -60,16 +74,40 @@ export async function runM08(ctx: StageContext, options: M08Options): Promise<M0
 		const gaps = [...(options.unprovidedScopes ?? []), ...raw.skipped.map((x) => `必要原始信息未提供（非文本）：${x}`)];
 		const manifest = await freezeArtifacts(staging, [...generated, ...selectedMaterials], gaps, record.runId);
 		const manifestRef = await ctx.ws.writeOutput(record, "manifest.json", JSON.stringify(manifest, null, 2), "固定材料清单");
+		// What constitutes rejection is declared by the caller and decided here,
+		// before any session sees the material: a reviewer's opinion cannot undo a
+		// blocked pattern, and a missing required one is equally a rejection.
+		const antiCheat = await scanAntiCheat(manifest.rootDir, `M08 ${record.runId} 固定材料`, antiCheatPolicy);
+		await ctx.ws.writeOutput(record, "anti-cheat.json", JSON.stringify(antiCheat, null, 2), "反作弊模式检查");
+		if (antiCheat.verdict === "reject")
+			throw new HarnessError("m08.anti-cheat", `固定材料命中调用方声明的拒绝模式，本批不进入自查与外审：${renderAntiCheatFindings(antiCheat)}`);
+		if (antiCheat.verdict === "not-declared") record.remarks.push("本轮规格未声明反作弊模式；没有做模式级检查，不等于材料已通过检查。");
+		// Certification material is frozen beside the review root, never inside it.
+		// M09 is the only stage that opens it, and only after the sessions ended.
+		let certification: M08Result["certification"];
+		if (options.certification) {
+			if (!options.certification.materials.length) throw new HarnessError("m08.certification", "声明 certification 时必须至少给出一项认证用材料");
+			const resolved = options.certification.materials.map((item) => ({ ...item,
+				path: path.isAbsolute(item.path) ? path.resolve(item.path) : path.resolve(ctx.ws.root, item.path) }));
+			const certificationManifest = await freezeArtifacts(path.join(runDir, "certification"), resolved, [], record.runId);
+			await ctx.ws.writeOutput(record, "certification-manifest.json", JSON.stringify({ ...certificationManifest,
+				notes: options.certification.notes, visibility: "hidden-from-sessions" }, null, 2), "认证材料清单");
+			certification = { manifest: certificationManifest, rootDir: certificationManifest.rootDir, fileCount: certificationManifest.entries.length };
+			record.remarks.push(`另固定 ${certification.fileCount} 项认证用材料；它们不在任何自查、外审或整理会话的工具根内，只供 M09 交付前由宿主重跑使用。`);
+		}
+		const hiddenNotice = certification
+			? `\n\n本轮另有 ${certification.fileCount} 项认证用材料不在你的可读范围内，只在交付前由宿主独立重跑时使用。不要尝试读取或推断其内容，也不要按它可能包含什么来调整结论；它们的缺席不是材料缺口。`
+			: "";
 		record.remarks.push("本轮重新复制全部选定材料；未生成文件哈希，且不会静默沿用旧审查材料。");
 		if (options.previousRunId) await ctx.ws.writeOutput(record, "recheck.json", JSON.stringify({ previousRunId: options.previousRunId, changeSummary: options.changeSummary, affectedScope: options.affectedScope }, null, 2), "复审追踪");
 
-		const selfChecks = await mapLimit(options.selfChecks, ctx.config.concurrency, async (task) => runMember(ctx, record, manifest, task.id, "selfcheck", task.mode ?? "read-only", await selfMessage(task, manifest)));
+		const selfChecks = await mapLimit(options.selfChecks, ctx.config.concurrency, async (task) => runMember(ctx, record, manifest, task.id, "selfcheck", task.mode ?? "read-only", `${await selfMessage(task, manifest)}${hiddenNotice}`));
 		const selfFailures = selfChecks.filter((x) => x.status === "failed");
 		if (selfFailures.length) {
 			await writeAggregate(ctx, record, manifest, selfChecks, [], options.reviewers.map((x) => x.id));
 			throw new HarnessError("m08.selfcheck-failed", `自查未全部成功：${selfFailures.map((x) => x.id).join("、")}；外审未启动`);
 		}
-		const reviewJobs = await Promise.all(options.reviewers.map(async (reviewer) => ({ reviewer, message: await reviewMessage(reviewer.id, manifest) })));
+		const reviewJobs = await Promise.all(options.reviewers.map(async (reviewer) => ({ reviewer, message: `${await reviewMessage(reviewer.id, manifest)}${hiddenNotice}` })));
 		const reviews = await mapLimit(reviewJobs, ctx.config.concurrency, ({ reviewer, message }) => runMember(ctx, record, manifest, reviewer.id, reviewer.role, reviewer.mode ?? "read-only", message));
 		const failed = reviews.filter((x) => x.status === "failed");
 		if (failed.length) { await writeAggregate(ctx, record, manifest, selfChecks, reviews, []); throw new HarnessError("m08.review-failed", `选定外审未全部成功：${failed.map((x) => x.id).join("、")}；本批不能完成或进入 M04`); }
@@ -77,7 +115,7 @@ export async function runM08(ctx: StageContext, options: M08Options): Promise<M0
 		const bundleRef = await ctx.ws.writeOutput(record, "review-bundle.md", bundle, "M08 审查反馈包");
 		await ctx.ws.writeOutput(record, "review-bundle.json", JSON.stringify({ m08RunId: record.runId, manifestPath: manifestRef.path, previousRunId: options.previousRunId, changeSummary: options.changeSummary, affectedScope: options.affectedScope, selfChecks, reviews }, null, 2), "M08 审查反馈结构");
 		record.remarks.push("完成只表示选定自查与外审全部返回；不表示科研通过，不投票，也不自动进入下一阶段。");
-		return { record, manifest, selfChecks, reviews, bundlePath: bundleRef.path };
+		return { record, manifest, selfChecks, reviews, bundlePath: bundleRef.path, antiCheat, ...(certification ? { certification } : {}) };
 	}, () => "固定原问题、必要原始信息、当前知识快照和调用方显式选定的成果材料；自查全部成功后才让每名外审在独立新会话读取同一版本；保存完整报告、实际读取范围、失败与未提供范围。完成不等于科研通过。" );
 }
 

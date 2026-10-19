@@ -490,6 +490,8 @@ async function runCliCommand(args: ParsedArgs, ws: Workspace, store: ReturnType<
 				previousRunId: spec?.previousRunId ?? flag(args, "previous"),
 				changeSummary: spec?.changeSummary ?? flag(args, "change-summary"),
 				affectedScope: spec?.affectedScope ?? flag(args, "affected-scope"),
+				antiCheat: spec?.antiCheat,
+				certification: spec?.certification,
 			});
 			console.log(`M08 已结束：运行 ${r.record.runId}，状态 ${r.record.status}\n固定材料：${r.manifest.entries.length} 项\n审查反馈：${r.bundlePath ?? "未生成"}`);
 			printFailures(r.record.failures);
@@ -513,6 +515,8 @@ async function runCliCommand(args: ParsedArgs, ws: Workspace, store: ReturnType<
 				deliveryScope: spec?.deliveryScope ?? await jsonFile<M09Options["deliveryScope"]>(args, "delivery-scope"),
 				reproduction: spec?.reproduction ?? await jsonFile<M09Options["reproduction"]>(args, "reproduction"),
 				closureRequested: spec?.closureRequested ?? has(args, "closure-requested"),
+				antiCheat: spec?.antiCheat,
+				certification: spec?.certification,
 			});
 			console.log(`M09 已结束：运行 ${r.record.runId}，状态 ${r.record.status}\n收口回执：${r.record.outputs.find((o) => o.label === "M09 收口回执")?.path ?? "未生成"}\n未执行发布、投稿、外发或下一目标启动；完整复算请求不等于已完整复现。`);
 			printFailures(r.record.failures);

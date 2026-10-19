@@ -9,6 +9,7 @@
  * a spec selects and documents work, it does not grant anything. */
 import { readFile } from "node:fs/promises";
 import { HarnessError } from "./types.ts";
+import { parseAntiCheatPolicy, parseCertificationSpec } from "./stages/review-policy.ts";
 import type { M08Options } from "./stages/m08.ts";
 import type { M09Options } from "./stages/m09.ts";
 
@@ -37,6 +38,10 @@ export interface M08StageSpecV1 {
 	previousRunId?: string;
 	changeSummary?: string;
 	affectedScope?: string;
+	/** What constitutes rejection, checked over the frozen material. */
+	antiCheat?: M08Options["antiCheat"];
+	/** Material the review sessions must not see, kept for M09's host rerun. */
+	certification?: M08Options["certification"];
 }
 
 export interface M09StageSpecV1 {
@@ -50,6 +55,9 @@ export interface M09StageSpecV1 {
 	deliveryScope?: M09Options["deliveryScope"];
 	reproduction?: M09Options["reproduction"];
 	closureRequested?: boolean;
+	antiCheat?: M09Options["antiCheat"];
+	/** Pre-delivery certification: host-only commands plus caller-declared tolerances. */
+	certification?: M09Options["certification"];
 }
 
 export type StageSpecV1 = M08StageSpecV1 | M09StageSpecV1;
@@ -74,6 +82,16 @@ const text = (value: unknown, label: string, max = 400): string => {
 	return value.trim();
 };
 
+/** Certification material is an ordinary artifact selection plus a note; the
+ * stage freezes it outside every session's tool root. */
+function certificationMaterials(value: unknown): NonNullable<M08Options["certification"]> {
+	if (!object(value) || Object.keys(value).some(key => !["materials", "notes"].includes(key)) ||
+		!Array.isArray(value.materials) || !value.materials.length)
+		throw new HarnessError("stage.spec", "certification needs a nonempty materials array and an optional notes string");
+	return { materials: value.materials as NonNullable<M08Options["certification"]>["materials"],
+		...(value.notes === undefined ? {} : { notes: text(value.notes, "certification.notes", 2000) }) };
+}
+
 /** Parse one declarative spec. Stage-specific option shapes are validated by
  * the stages themselves; this checks the envelope and the fields a spec owns. */
 export function parseStageSpec(value: unknown): StageSpecV1 {
@@ -82,7 +100,7 @@ export function parseStageSpec(value: unknown): StageSpecV1 {
 	const declared = provenance(value.provenance);
 	if (value.stage === "M08") {
 		const known = ["version", "stage", "provenance", "materials", "selfChecks", "reviewers",
-			"unprovidedScopes", "previousRunId", "changeSummary", "affectedScope"];
+			"unprovidedScopes", "previousRunId", "changeSummary", "affectedScope", "antiCheat", "certification"];
 		const unknown = Object.keys(value).filter(key => !known.includes(key));
 		if (unknown.length) throw new HarnessError("stage.spec", `M08 spec has unknown fields: ${unknown.join(", ")}`);
 		if (!Array.isArray(value.materials) || !value.materials.length || !Array.isArray(value.selfChecks) ||
@@ -98,10 +116,12 @@ export function parseStageSpec(value: unknown): StageSpecV1 {
 			...(value.unprovidedScopes ? { unprovidedScopes: value.unprovidedScopes as string[] } : {}),
 			...(value.previousRunId === undefined ? {} : { previousRunId: text(value.previousRunId, "previousRunId") }),
 			...(value.changeSummary === undefined ? {} : { changeSummary: text(value.changeSummary, "changeSummary", 2000) }),
-			...(value.affectedScope === undefined ? {} : { affectedScope: text(value.affectedScope, "affectedScope", 2000) }) };
+			...(value.affectedScope === undefined ? {} : { affectedScope: text(value.affectedScope, "affectedScope", 2000) }),
+			...(value.antiCheat === undefined ? {} : { antiCheat: parseAntiCheatPolicy(value.antiCheat) }),
+			...(value.certification === undefined ? {} : { certification: certificationMaterials(value.certification) }) };
 	}
 	const known = ["version", "stage", "provenance", "m08RunId", "m04RunId", "recipient", "purpose",
-		"deliveryScope", "reproduction", "closureRequested"];
+		"deliveryScope", "reproduction", "closureRequested", "antiCheat", "certification"];
 	const unknown = Object.keys(value).filter(key => !known.includes(key));
 	if (unknown.length) throw new HarnessError("stage.spec", `M09 spec has unknown fields: ${unknown.join(", ")}`);
 	if (value.closureRequested !== undefined && typeof value.closureRequested !== "boolean")
@@ -111,7 +131,9 @@ export function parseStageSpec(value: unknown): StageSpecV1 {
 		recipient: text(value.recipient, "recipient"), purpose: text(value.purpose, "purpose", 2000),
 		...(value.deliveryScope === undefined ? {} : { deliveryScope: value.deliveryScope as M09Options["deliveryScope"] }),
 		...(value.reproduction === undefined ? {} : { reproduction: value.reproduction as M09Options["reproduction"] }),
-		...(value.closureRequested === undefined ? {} : { closureRequested: value.closureRequested }) };
+		...(value.closureRequested === undefined ? {} : { closureRequested: value.closureRequested }),
+		...(value.antiCheat === undefined ? {} : { antiCheat: parseAntiCheatPolicy(value.antiCheat) }),
+		...(value.certification === undefined ? {} : { certification: parseCertificationSpec(value.certification) }) };
 }
 
 export async function loadStageSpec(file: string, stage: "M08" | "M09"): Promise<StageSpecV1> {
