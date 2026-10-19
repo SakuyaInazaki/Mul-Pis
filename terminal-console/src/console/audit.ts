@@ -112,7 +112,6 @@ export function buildWorkflowAudit(goals: readonly AuditGoalInput[], nodes: read
 		policy: { guards: [], statuses: [], branches: [], lanes: [], phases: [],
 			updatesBest: 0, scored: 0, scoreMedian: null, scoreMax: null, undecided: 0 },
 		search: { tasks: 0, maxStagnation: 0, forcedDirectionChanges: 0, routes: [], signals: [], bannedDirections: 0 },
-		searchBudget: { tasks: 0, evaluations: 0, rejected: 0, remaining: null, stops: [] },
 		budget: { sessions: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0,
 			usageComplete: true, costComplete: true, unknownEvents: 0 },
 		profile: { changeKinds: [], intents: [], profilerEvidence: [],
@@ -176,14 +175,6 @@ export function buildWorkflowAudit(goals: readonly AuditGoalInput[], nodes: read
 			for (const signal of search.signals) totals.signals.add(signal);
 			audit.search.bannedDirections += search.bannedDirections.length;
 		}
-		const budget = task.episode?.budget;
-		if (budget) {
-			audit.searchBudget.tasks++;
-			audit.searchBudget.evaluations += budget.evaluations;
-			audit.searchBudget.rejected += budget.rejected;
-			audit.searchBudget.remaining = Math.min(audit.searchBudget.remaining ?? budget.remaining, budget.remaining);
-			if (budget.stop) totals.stops.add(budget.stop);
-		}
 		// Tool calls carry the runner's own failure class; the audit counts them,
 		// it never reclassifies a failure the runner already judged.
 		for (const raw of task.toolLog) {
@@ -226,7 +217,6 @@ export function buildWorkflowAudit(goals: readonly AuditGoalInput[], nodes: read
 	audit.policy.scoreMax = scores.length ? Math.max(...scores) : null;
 	audit.search.routes = totals.routes.rows(ROUTES).map(row => ({ route: row.name, count: row.count }));
 	audit.search.signals = totals.signals.rows().map(row => ({ signal: row.name, count: row.count }));
-	audit.searchBudget.stops = totals.stops.rows().map(row => ({ stop: row.name, count: row.count }));
 	audit.classifiedFailures.reasons = totals.reasons.rows().map(row => ({ reason: row.name, count: row.count }));
 	const classified = audit.classifiedFailures;
 	const judged = classified.tools.infrastructure + classified.tools.policy + classified.tools.unjudged +
@@ -277,7 +267,6 @@ export function renderWorkflowAudit(audit: WorkflowAuditV1): string[] {
 		`车道与相位：${audit.policy.lanes.map(row => `${row.lane} ${row.count}`).join("、") || "暂无"}；${audit.policy.phases.map(row => `${row.phase} ${row.count}`).join("、") || "暂无"}`,
 		`候选评分：已评分 ${audit.policy.scored} 个，中位数 ${ratio(audit.policy.scoreMedian)}，最高 ${ratio(audit.policy.scoreMax)}（排名用，不是收益）`,
 		`搜索状态：登记 ${audit.search.tasks} 个任务，最大停滞 ${audit.search.maxStagnation}，强制换向 ${audit.search.forcedDirectionChanges} 次，禁用方向 ${audit.search.bannedDirections} 条；路线 ${audit.search.routes.map(row => `${row.route} ${row.count}`).join("、") || "暂无"}；停滞信号 ${audit.search.signals.map(row => `${row.signal} ${row.count}`).join("、") || "暂无"}`,
-		`搜索预算：登记 ${audit.searchBudget.tasks} 个任务，已用评估 ${audit.searchBudget.evaluations}（其中前置驳回 ${audit.searchBudget.rejected}），最小剩余 ${audit.searchBudget.remaining === null ? "未登记" : audit.searchBudget.remaining}；停止原因 ${audit.searchBudget.stops.map(row => `${row.stop} ${row.count}`).join("、") || "无"}`,
 		`改动类别分布：${audit.profile.changeKinds.length ? audit.profile.changeKinds.map(row => `${row.changeKind} ${row.count}`).join("、") : "暂无"}`,
 		`候选意图分布：${audit.profile.intents.length ? audit.profile.intents.map(row => `${row.intent} ${row.count}`).join("、") : "暂无"}`,
 		`性能画像证据：${audit.profile.profilerEvidence.length ? audit.profile.profilerEvidence.map(row => `${row.evidence} ${row.count}`).join("、") : "暂无"}`,

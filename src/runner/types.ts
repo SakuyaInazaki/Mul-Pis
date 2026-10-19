@@ -102,9 +102,6 @@ export interface SessionSpec {
 	methodBinding?: { versionId: string; contentId?: string };
 	/** Opt-in request guard. A campaign reserves actual serialized input bytes; tool-free strict callers may still set a fixed input cap. */
 	strictRequest?: { maxProviderCallsPerPrompt?: number; maxOutputTokens?: number; maxInputPayloadBytes?: number };
-	/** Wall-clock end of the run this session belongs to, stated to the model in tool
-	 * results so a run does not end with nothing saved. Never placed in the prompt prefix. */
-	runDeadline?: string;
 }
 
 /** Enough to reopen a persisted session with the same boundary. */

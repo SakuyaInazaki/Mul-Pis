@@ -26,8 +26,11 @@ export type CandidateStrategy = typeof CANDIDATE_STRATEGIES[number];
 
 const STRUCTURAL_STRATEGIES: ReadonlySet<CandidateStrategy> = new Set(CANDIDATE_STRATEGIES.slice(0, 8));
 
-/** Relative difference that still counts as the same measurement. Raise it on a
- * platform with noisier timing; it is a frozen policy field, not a constant. */
+/** Fallback relative difference that still counts as the same measurement, used
+ * only when neither the host nor the caller states one. It is deliberately a
+ * neutral placeholder rather than any platform's measured dispersion: a host
+ * that rules on its own noise scale overrides it entirely, and a caller that
+ * knows its measurement spread should pass noiseMargin. */
 export const DEFAULT_NOISE_MARGIN = 0.01;
 /** The score's performance term saturates at this speedup over the seed. */
 const SCORE_SATURATION_SPEEDUP = 2;
@@ -385,8 +388,9 @@ export interface CandidateRouteLimitsV1 {
 	directionChange: number;
 }
 
-/** Three-level fallback from the basis: debug at most 3, rewrite under the same
- * plan at most 5, then return to planning. */
+/** Three-level fallback: debug a few times, rewrite under the same plan, then
+ * return to planning. These counts shape which direction the next step takes;
+ * they never end a task, and they carry no platform's thresholds. */
 export const DEFAULT_ROUTE_LIMITS: CandidateRouteLimitsV1 = Object.freeze({
 	repairDepth: 3, stagnation: 8, directionChange: 3 });
 
@@ -607,220 +611,12 @@ export function requireUnbannedDirection(state: CandidateSearchStateV1, action: 
 		`the search is stalled and ${action.changeKind}/${action.strategy} at ${action.location} already produced no measured gain (${banned.candidateRef}: ${banned.reason}); declare a different direction, or pass newEvidence stating what changed since`);
 }
 
-/** Operator classes the basis separates by expected yield. The names are
- * categories of work, not benchmark levels: the evidence is that yield tracks
- * what the operator is, not how a suite labels its difficulty. */
+/** Operator classes the basis separates by expected yield. Recorded with the
+ * task so a trajectory says what kind of work it was; the harness attaches no
+ * budget or admission rule to the label. */
 export const OPERATOR_CATEGORIES = ["elementwise-activation", "norm-reduce", "fusion", "matmul",
 	"convolution-pooling", "attention", "sorting-indexing", "broadcast", "other"] as const;
 export type OperatorCategory = typeof OPERATOR_CATEGORIES[number];
-
-export interface OperatorCategoryBudgetV1 {
-	/** Hard cap on host evaluations for a task on this category. */
-	evaluations: number;
-	/** False means the category does not enter the optimization queue without a
-	 * written reason: the basis measures these as near-certain losses against a
-	 * mature vendor implementation. */
-	admitted: boolean;
-	/** Why this cap, in one line, so a trajectory can be read later. */
-	note: string;
-}
-
-/** Defaults from the Ascend category map: elementwise and activation classes
- * finish in about one round; norm/reduce fusion is the largest yield area;
- * matmul roughly ties or loses to the vendor library; convolution, pooling,
- * attention, sorting and broadcast are near-certain losses today. Every number
- * is a starting point to be re-measured on this project. */
-export const DEFAULT_CATEGORY_BUDGETS: Record<OperatorCategory, OperatorCategoryBudgetV1> = Object.freeze({
-	"elementwise-activation": { evaluations: 6, admitted: true, note: "one round is usually enough; stop early rather than polishing" },
-	"norm-reduce": { evaluations: 24, admitted: true, note: "largest measured yield area, especially fused" },
-	fusion: { evaluations: 20, admitted: true, note: "about half of attempts are feasible and they need several rounds" },
-	matmul: { evaluations: 6, admitted: false, note: "ties or loses against a mature vendor library; needs a written reason" },
-	"convolution-pooling": { evaluations: 4, admitted: false, note: "near-certain loss against the vendor library today" },
-	attention: { evaluations: 4, admitted: false, note: "no measured wins in the reviewed evidence" },
-	"sorting-indexing": { evaluations: 4, admitted: false, note: "no measured wins in the reviewed evidence" },
-	broadcast: { evaluations: 4, admitted: false, note: "no measured wins in the reviewed evidence" },
-	other: { evaluations: 24, admitted: true, note: "unclassified work object; the task budget applies unchanged" },
-});
-
-export function operatorCategoryBudget(policy: SearchBudgetPolicyV1,
-	category: OperatorCategory | undefined): OperatorCategoryBudgetV1 {
-	return (category && (policy.categoryBudgets ?? DEFAULT_CATEGORY_BUDGETS)[category]) ??
-		DEFAULT_CATEGORY_BUDGETS.other;
-}
-
-export interface SearchBudgetPolicyV1 {
-	version: 1;
-	/** One unit is one host evaluation of one candidate: compile, correctness and
-	 * measurement together. Failed and unjudged evaluations occupy a unit too. */
-	evaluationsPerTask: number;
-	/** Sub-budget for the repair loop, so a defect cannot eat the optimization budget. */
-	repairEvaluationsPerTask: number;
-	/** Numerical parameter search is capped well below the structural budget. */
-	parameterEvaluationsPerTask: number;
-	/** Width knob: competing frozen branches allowed from one checkpoint. */
-	maxBranchesPerCheckpoint: number;
-	/** Hard bound on until-ready builder/reviewer rounds for one task. */
-	reviewRoundsPerTask: number;
-	/** Evaluations between candidate-episode boundary restarts; 0 disables them.
-	 * The basis measures the restart as better in ten of fifteen trials but does
-	 * not separate distillation from clearing the context, so this is an option. */
-	episodeRestartEvaluations: number;
-	/** Per-category caps and admission. Absent means the harness defaults. */
-	categoryBudgets?: Record<OperatorCategory, OperatorCategoryBudgetV1>;
-	routeLimits: CandidateRouteLimitsV1;
-}
-
-/** Depth defaults follow the Ascend evidence (at least 15 evaluations per
- * operator, narrow and deep); the split and the width knob are this project's
- * starting point and must be re-measured locally before being trusted. */
-export const DEFAULT_SEARCH_BUDGET: SearchBudgetPolicyV1 = Object.freeze({
-	version: 1, evaluationsPerTask: 24, repairEvaluationsPerTask: 10,
-	parameterEvaluationsPerTask: 5, maxBranchesPerCheckpoint: 3, reviewRoundsPerTask: 12,
-	episodeRestartEvaluations: 8,
-	routeLimits: DEFAULT_ROUTE_LIMITS,
-});
-
-export type SearchBudgetStop = "task-evaluation-budget" | "repair-budget" |
-	"parameter-budget" | "stagnation-limit";
-
-export interface SearchBudgetLedgerV1 {
-	version: 1;
-	evaluations: number;
-	repair: number;
-	optimization: number;
-	parameters: number;
-	/** Pre-check rejects: they cost a host call, so they are accounted for. */
-	rejected: number;
-	/** Declared operator category and the cap it imposes, when one is declared. */
-	category?: OperatorCategory;
-	categoryCap?: number;
-	remaining: number;
-	remainingRepair: number;
-	remainingParameters: number;
-	/** Set once this task may not spend another evaluation of that kind. */
-	stop?: SearchBudgetStop;
-	message: string;
-}
-
-export function validateSearchBudget(input: unknown): SearchBudgetPolicyV1 {
-	if (!input || typeof input !== "object" || Array.isArray(input))
-		throw new HarnessError("m07.search-budget", "searchBudget must be a JSON object");
-	const value = input as Record<string, unknown>;
-	const known = new Set(["version", "evaluationsPerTask", "repairEvaluationsPerTask",
-		"parameterEvaluationsPerTask", "maxBranchesPerCheckpoint", "reviewRoundsPerTask",
-		"episodeRestartEvaluations", "categoryBudgets", "routeLimits"]);
-	const unknown = Object.keys(value).filter(key => !known.has(key));
-	if (unknown.length) throw new HarnessError("m07.search-budget", `searchBudget has unknown fields: ${unknown.join(", ")}`);
-	if (value.version !== undefined && value.version !== 1)
-		throw new HarnessError("m07.search-budget", "searchBudget.version must be 1");
-	const integer = (key: string, fallback: number, min: number, max: number): number => {
-		const item = value[key];
-		if (item === undefined) return fallback;
-		if (typeof item !== "number" || !Number.isInteger(item) || item < min || item > max)
-			throw new HarnessError("m07.search-budget", `searchBudget.${key} must be an integer in ${min}-${max}`);
-		return item;
-	};
-	const limits = value.routeLimits === undefined ? DEFAULT_ROUTE_LIMITS : (() => {
-		if (!value.routeLimits || typeof value.routeLimits !== "object" || Array.isArray(value.routeLimits))
-			throw new HarnessError("m07.search-budget", "searchBudget.routeLimits must be a JSON object");
-		const rows = value.routeLimits as Record<string, unknown>;
-		const unknownLimits = Object.keys(rows).filter(key => !["repairDepth", "stagnation", "directionChange"].includes(key));
-		if (unknownLimits.length) throw new HarnessError("m07.search-budget", `searchBudget.routeLimits has unknown fields: ${unknownLimits.join(", ")}`);
-		const limit = (key: keyof CandidateRouteLimitsV1): number => {
-			const item = rows[key];
-			if (item === undefined) return DEFAULT_ROUTE_LIMITS[key];
-			if (typeof item !== "number" || !Number.isInteger(item) || item < 1 || item > 1000)
-				throw new HarnessError("m07.search-budget", `searchBudget.routeLimits.${key} must be an integer in 1-1000`);
-			return item;
-		};
-		return { repairDepth: limit("repairDepth"), stagnation: limit("stagnation"), directionChange: limit("directionChange") };
-	})();
-	const policy: SearchBudgetPolicyV1 = { version: 1,
-		evaluationsPerTask: integer("evaluationsPerTask", DEFAULT_SEARCH_BUDGET.evaluationsPerTask, 1, 100_000),
-		repairEvaluationsPerTask: integer("repairEvaluationsPerTask", DEFAULT_SEARCH_BUDGET.repairEvaluationsPerTask, 1, 100_000),
-		parameterEvaluationsPerTask: integer("parameterEvaluationsPerTask", DEFAULT_SEARCH_BUDGET.parameterEvaluationsPerTask, 0, 100_000),
-		maxBranchesPerCheckpoint: integer("maxBranchesPerCheckpoint", DEFAULT_SEARCH_BUDGET.maxBranchesPerCheckpoint, 1, 1000),
-		reviewRoundsPerTask: integer("reviewRoundsPerTask", DEFAULT_SEARCH_BUDGET.reviewRoundsPerTask, 1, 10_000),
-		episodeRestartEvaluations: integer("episodeRestartEvaluations", DEFAULT_SEARCH_BUDGET.episodeRestartEvaluations, 0, 10_000),
-		routeLimits: limits };
-	if (value.categoryBudgets !== undefined) {
-		if (!value.categoryBudgets || typeof value.categoryBudgets !== "object" || Array.isArray(value.categoryBudgets))
-			throw new HarnessError("m07.search-budget", "searchBudget.categoryBudgets must be a JSON object");
-		const rows = value.categoryBudgets as Record<string, unknown>;
-		const unknownCategories = Object.keys(rows).filter(key => !(OPERATOR_CATEGORIES as readonly string[]).includes(key));
-		if (unknownCategories.length) throw new HarnessError("m07.search-budget", `searchBudget.categoryBudgets has unknown categories: ${unknownCategories.join(", ")}`);
-		const budgets = { ...DEFAULT_CATEGORY_BUDGETS };
-		for (const category of OPERATOR_CATEGORIES) {
-			const row = rows[category];
-			if (row === undefined) continue;
-			if (!row || typeof row !== "object" || Array.isArray(row)) throw new HarnessError("m07.search-budget", `searchBudget.categoryBudgets.${category} must be a JSON object`);
-			const item = row as Record<string, unknown>;
-			if (Object.keys(item).some(key => !["evaluations", "admitted", "note"].includes(key)) ||
-				typeof item.evaluations !== "number" || !Number.isInteger(item.evaluations) ||
-				item.evaluations < 1 || item.evaluations > 100_000 || typeof item.admitted !== "boolean" ||
-				(item.note !== undefined && (typeof item.note !== "string" || !item.note.trim())))
-				throw new HarnessError("m07.search-budget", `searchBudget.categoryBudgets.${category} needs an evaluations integer and an admitted flag`);
-			budgets[category] = { evaluations: item.evaluations, admitted: item.admitted,
-				note: typeof item.note === "string" ? item.note.trim() : DEFAULT_CATEGORY_BUDGETS[category].note };
-		}
-		policy.categoryBudgets = budgets;
-	}
-	if (policy.repairEvaluationsPerTask > policy.evaluationsPerTask ||
-		policy.parameterEvaluationsPerTask > policy.evaluationsPerTask)
-		throw new HarnessError("m07.search-budget", "sub-budgets cannot exceed searchBudget.evaluationsPerTask");
-	if (policy.routeLimits.directionChange > policy.routeLimits.stagnation)
-		throw new HarnessError("m07.search-budget", "routeLimits.directionChange cannot exceed routeLimits.stagnation");
-	return policy;
-}
-
-/** Spend is measured in evaluations, not money or wall clock, so the unit does
- * not drift when the model changes. */
-export function candidateBudgetLedger(history: readonly CandidateArchiveEntry[],
-	input: { taskId: string; subjectId?: string; policy: SearchBudgetPolicyV1;
-		category?: OperatorCategory }): SearchBudgetLedgerV1 {
-	const plan = history.filter(entry => entry.taskId === input.taskId);
-	let repair = 0, optimization = 0, parameters = 0, rejected = 0;
-	for (const entry of plan) {
-		if (entry.changeKind === "parameters") parameters++;
-		if (entry.policy?.lane === "repair" || entry.changeKind === "repair") repair++;
-		else optimization++;
-		if (entry.policy?.guard === "reject") rejected++;
-	}
-	const state = candidateSearchState(history, { subjectId: input.subjectId, taskId: input.taskId,
-		limits: input.policy.routeLimits });
-	// A category the basis measures as a near-certain loss gets a smaller cap, so
-	// the budget cannot quietly be spent where it has never paid off.
-	const categoryCap = operatorCategoryBudget(input.policy, input.category).evaluations;
-	const remaining = Math.max(0, Math.min(input.policy.evaluationsPerTask, categoryCap) - plan.length);
-	const remainingRepair = Math.max(0, input.policy.repairEvaluationsPerTask - repair);
-	const remainingParameters = Math.max(0, input.policy.parameterEvaluationsPerTask - parameters);
-	const stop: SearchBudgetStop | undefined = !remaining ? "task-evaluation-budget" :
-		state.stagnation >= input.policy.routeLimits.stagnation ? "stagnation-limit" : undefined;
-	return { version: 1, evaluations: plan.length, repair, optimization, parameters, rejected,
-		...(input.category ? { category: input.category, categoryCap } : {}),
-		remaining, remainingRepair, remainingParameters, ...(stop ? { stop } : {}),
-		message: stop
-			? "This task may not spend another evaluation. Report the verified best candidate and the evidence; the controller records the budget boundary and the planner decides what comes next."
-			: "Every host evaluation spends one unit, including failed and unjudged ones. Repair and parameter sub-budgets are separate from the structural one." };
-}
-
-/** Refuse an evaluation the frozen budget does not cover. The session cannot
- * negotiate this; only a new task under a new plan restores a budget. */
-export function requireBudget(ledger: SearchBudgetLedgerV1, action: { changeKind: CandidateChangeKind;
-	lane: CandidateLane }): void {
-	if (ledger.stop === "task-evaluation-budget")
-		throw new HarnessError("m07.candidate-budget",
-			`this task has spent its ${ledger.evaluations} evaluation budget; report the verified best candidate and return to the planner instead of evaluating again`);
-	if (ledger.stop === "stagnation-limit")
-		throw new HarnessError("m07.candidate-budget",
-			"this task reached its stagnation limit without a new best; report the verified best candidate and return to the planner for a different plan");
-	if (action.changeKind === "parameters" && !ledger.remainingParameters)
-		throw new HarnessError("m07.candidate-budget",
-			"the numerical parameter sub-budget for this task is spent; change the structure or return to the planner rather than searching more parameters");
-	if (action.lane === "repair" && !ledger.remainingRepair)
-		throw new HarnessError("m07.candidate-budget",
-			"the repair sub-budget for this task is spent; a defect this persistent needs a different structure or a new plan, not another patch");
-}
 
 export interface CandidateSearchSummaryV1 {
 	version: 1;
@@ -833,15 +629,16 @@ export interface CandidateSearchSummaryV1 {
 	magnitude: { measuredSubjects: number; minSpeedup?: number; medianSpeedup?: number; maxSpeedup?: number };
 	guards: { reject: number; keep: number; accept: number; revert: number; unjudged: number };
 	lanes: { repair: number; optimization: number };
-	/** Evaluations spent per work object that reached a verified-correct candidate. */
+	/** Evaluations spent per work object that reached a verified-correct candidate.
+	 * An observation of how the search went, never a limit on how far it may go. */
 	evaluationsPerVerifiedSubject?: number;
-	tasks: Array<{ taskId: string; evaluations: number; remaining: number; stop?: SearchBudgetStop;
-		stagnation: number; signals: CandidateStallSignal[]; bannedDirections: number }>;
+	tasks: Array<{ taskId: string; evaluations: number; stagnation: number;
+		signals: CandidateStallSignal[]; bannedDirections: number }>;
 }
 
 /** Deterministic search account for the M04 handoff and the console. */
 export function summarizeCandidateSearch(history: readonly CandidateArchiveEntry[],
-	policy: SearchBudgetPolicyV1 = DEFAULT_SEARCH_BUDGET): CandidateSearchSummaryV1 {
+	limits: CandidateRouteLimitsV1 = DEFAULT_ROUTE_LIMITS): CandidateSearchSummaryV1 {
 	const guards = { reject: 0, keep: 0, accept: 0, revert: 0, unjudged: 0 };
 	const lanes = { repair: 0, optimization: 0 };
 	const subjectIds: string[] = [];
@@ -872,11 +669,10 @@ export function summarizeCandidateSearch(history: readonly CandidateArchiveEntry
 	for (const entry of history) if (!taskIds.includes(entry.taskId)) taskIds.push(entry.taskId);
 	const tasks = taskIds.map(taskId => {
 		const subjectId = history.find(entry => entry.taskId === taskId)?.subjectId;
-		const ledger = candidateBudgetLedger(history, { taskId, subjectId, policy });
-		const state = candidateSearchState(history, { subjectId, taskId, limits: policy.routeLimits });
-		return { taskId, evaluations: ledger.evaluations, remaining: ledger.remaining,
-			...(ledger.stop ? { stop: ledger.stop } : {}), stagnation: state.stagnation,
-			signals: state.signals, bannedDirections: state.bannedDirections.length };
+		const state = candidateSearchState(history, { subjectId, taskId, limits });
+		return { taskId, evaluations: history.filter(entry => entry.taskId === taskId).length,
+			stagnation: state.stagnation, signals: state.signals,
+			bannedDirections: state.bannedDirections.length };
 	});
 	return { version: 1, subjects,
 		coverage: { subjects: subjects.length, withVerifiedCorrect,

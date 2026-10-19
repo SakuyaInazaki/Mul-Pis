@@ -109,28 +109,3 @@ export function tallyFailures(judgements: readonly FailureJudgementV1[]): Failur
 	return tally;
 }
 
-/**
- * Remaining wall-clock for the run, stated in tool results rather than in the
- * prompt prefix: a value that changes every turn at the front of the context
- * invalidates the provider's prefix cache for the whole session, and a timeout
- * with no saved version is one of the largest sources of a zero score.
- */
-export function remainingWallClockNote(deadlineAt: string, now: number): string | undefined {
-	const deadline = Date.parse(deadlineAt);
-	if (!Number.isFinite(deadline)) return undefined;
-	const remainingMs = deadline - now;
-	if (remainingMs <= 0) return "Run deadline passed. Stop optimising and make sure the best version so far is saved and submittable.";
-	const minutes = Math.floor(remainingMs / 60_000);
-	const hours = Math.floor(minutes / 60);
-	const left = hours > 0 ? `${hours}h${String(minutes % 60).padStart(2, "0")}m` : `${minutes}m`;
-	return `Run budget: ${left} of wall-clock left. Keep the best measured version saved and submittable; do not spend the remainder on an unverified rewrite.`;
-}
-
-/** Host-owned deadline for this run; a model-facing shell never sees it. */
-export function runDeadlineFromEnvironment(env: NodeJS.ProcessEnv = process.env): string | undefined {
-	const value = env.PRE_RSI_RUN_DEADLINE;
-	if (!value) return undefined;
-	if (!Number.isFinite(Date.parse(value)))
-		throw new Error("PRE_RSI_RUN_DEADLINE must be an ISO timestamp");
-	return value;
-}

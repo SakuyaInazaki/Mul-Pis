@@ -17,6 +17,10 @@ import { candidateSearchState, subjectHistory } from "./candidate-policy.ts";
 import { globalCandidateBest } from "./candidate-archive.ts";
 import type { CandidateStrategy } from "./candidate-policy.ts";
 
+/** Evaluations between boundary restarts when the workspace configures none.
+ * A cadence for clearing context, not a limit on how many may be run. */
+export const DEFAULT_EPISODE_RESTART_EVALUATIONS = 8;
+
 const MAX_ITEMS = 8;
 const MAX_TEXT = 300;
 

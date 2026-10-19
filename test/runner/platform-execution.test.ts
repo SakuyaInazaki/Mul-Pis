@@ -43,7 +43,7 @@ inQueue.DeQue(local);
 int tailLength = total % tileLength;
 `;
 
-async function boundSession(t: TestContext, deadlineAt?: string): Promise<{ work: string; persistDir: string;
+async function boundSession(t: TestContext): Promise<{ work: string; persistDir: string;
 	tools: Map<string, NonNullable<CreateAgentSessionOptions["customTools"]>[number]>; receiptFile: string;
 	toolLog: () => ToolCallRecord[]; sessionFile: string }> {
 	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-platform-exec-"));
@@ -65,7 +65,7 @@ async function boundSession(t: TestContext, deadlineAt?: string): Promise<{ work
 	const runner = new PiSessionRunner({ modelRuntime: MODEL_RUNTIME, createSession: stub.factory });
 	const handle = await runner.create({ label: "platform", role: "execution", model: "offline/offline-model:high",
 		systemPrompt: "work on the kernel", tools: { kind: "execution", root: work, tools: ["read", "write", "edit", "bash"] },
-		persistDir, ...(deadlineAt ? { runDeadline: deadlineAt } : {}) });
+		persistDir });
 	const tools = new Map((stub.calls[0].customTools ?? []).map(tool => [tool.name, tool]));
 	assert(handle.ref.file);
 	return { work, persistDir, tools, receiptFile: path.join(persistDir, `${handle.ref.id}.platform.jsonl`),
@@ -147,20 +147,13 @@ test("toolchain output is answered mechanically and device commands hold the dev
 	assert.deepEqual(kinds.filter(kind => kind === "diagnosis").length, 2);
 });
 
-test("failures are split between the harness and the candidate, and the run budget rides along", async t => {
-	const session = await boundSession(t, new Date(Date.now() + 95 * 60_000).toISOString());
+test("failures are split between the harness and the candidate", async t => {
+	const session = await boundSession(t);
 	const bash = session.tools.get("bash");
 	const write = session.tools.get("write");
 	assert(bash && write);
 	const context = { cwd: session.work } as never;
-	const visible = (result: unknown): string => {
-		const content = (result as { content?: Array<{ type: string; text?: string }> }).content ?? [];
-		return content.filter(item => item.type === "text").map(item => item.text ?? "").join("\n");
-	};
-
-	// Every tool result states the remaining wall-clock; the prompt prefix stays stable.
-	assert.match(visible(await bash.execute("f1", { command: "echo work" }, undefined, undefined, context)),
-		/Run budget: 1h3[0-9]m of wall-clock left\. Keep the best measured version saved and submittable/);
+	await bash.execute("f1", { command: "echo work" }, undefined, undefined, context);
 
 	// Pi's bash tool throws on a non-zero exit, so these land on the error path.
 	await assert.rejects(bash.execute("f2", { command: "exit 3" }, undefined, undefined, context), /exited with code 3/);
@@ -185,13 +178,12 @@ test("each session records the harness it ran under as an experiment variable", 
 		if (previousRevision === undefined) delete process.env.PRE_RSI_CODE_REVISION;
 		else process.env.PRE_RSI_CODE_REVISION = previousRevision;
 	});
-	const session = await boundSession(t, deadline);
+	const session = await boundSession(t);
 	const receipt = JSON.parse(await readFile(session.sessionFile.replace(/\.jsonl$/, ".harness.json"), "utf8")) as Record<string, unknown>;
 	assert.equal(receipt.version, 1);
 	assert.equal(receipt.codeRevision, "f".repeat(40));
 	assert.equal(receipt.model, "offline/offline-model:high");
 	assert.equal(receipt.toolGrant, "execution");
 	assert.equal(receipt.platformProfile, "device-a");
-	assert.equal(receipt.runDeadline, deadline);
 	assert.deepEqual(receipt.compaction, { thresholdTokens: 200_000, keepRecentTokens: 20_000 });
 });

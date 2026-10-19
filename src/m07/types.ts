@@ -6,7 +6,7 @@ import type { ExperienceRequirementV1, M07WorkflowStrategyV1 } from "../improvem
 import type { RunDescriptorV1 } from "../runtime/run-descriptor.ts";
 import type { KnowledgeRetrievalContext } from "../knowledge/retrieval.ts";
 import type { CandidateComparisonV1, CandidatePerformanceEvidenceV1 } from "./candidate-diagnostics.ts";
-import type { CandidatePolicyDecisionV1, CandidateSearchStateV1, CandidateStrategy, SearchBudgetLedgerV1, SearchBudgetPolicyV1 } from "./candidate-policy.ts";
+import type { CandidatePolicyDecisionV1, CandidateSearchStateV1, CandidateStrategy } from "./candidate-policy.ts";
 import type { PromptLayoutReceiptV1 } from "./prompt-layout.ts";
 import type { OperatorCategory } from "./candidate-policy.ts";
 import type { OptimizationMethod } from "../knowledge/optimization-card.ts";
@@ -34,11 +34,9 @@ export interface BeginGoalInput {
  * trajectory can answer "why this abstraction layer" and "why spend here"; the
  * numbers stay model or host declarations with their own stated source. */
 export interface SubjectProfileV1 {
-	/** Operator class, which is what expected yield actually tracks. A class the
-	 * evidence shows as a near-certain loss needs categoryJustification. */
+	/** Operator class, recorded so a trajectory says what kind of work this was.
+	 * It carries no budget and no admission rule. */
 	operatorCategory: OperatorCategory;
-	/** Required when the declared category is not admitted by default. */
-	categoryJustification?: string;
 	implementationSpace: "vendor-library" | "dsl-or-ir" | "handwritten-low-level";
 	/** Why this layer rather than the ones above or below it. */
 	rationale: string;
@@ -76,9 +74,9 @@ export interface TaskSpecInput {
 	/** Explicit versioned external references, each already present in inputs. Never discovered globally. */
 	resourceInputs?: Array<{ id: string; version: string; input: string }>;
 	/** Explicit task execution mode: legacy fresh-reviewer repair or same-session candidate feedback. Continuous goals do not imply a mode. Legacy bounded fields map to opt-in until-ready. No process-restart replay. */
-	/** The legacy `{maxRounds, deadlineAt}` form means until-ready with those bounds. */
-	executionLoop?: { mode: "until-ready" | "candidate-episode"; maxRounds?: number; deadlineAt?: string } |
-		{ maxRounds: number; deadlineAt: string };
+	/** Historical records may carry `{maxRounds, deadlineAt}`. Those numbers are
+	 * decoded for audit and normalized away: nothing bounds a loop by count. */
+	executionLoop?: { mode: "until-ready" | "candidate-episode" } | { maxRounds: number; deadlineAt: string };
 	/** Expected JSON output carrying a candidate lesson to M04, never an adopted record. */
 	lessonDeltaOutput?: string;
 	/** Explicit competitive continuation from a frozen task leaf. Role remains execution. */
@@ -256,8 +254,6 @@ export interface M07CandidateEpisodeV1 {
 	incumbents: Array<{ candidateId: string; metric: CandidateMetricV1; subjectId?: string }>;
 	/** Deterministic stall, route and parent facts recomputed after each evaluation. */
 	search?: CandidateSearchStateV1;
-	/** Spend of this task's frozen search budget, in host evaluations. */
-	budget?: SearchBudgetLedgerV1;
 	/** The method menu the last round's evidence allowed. The next candidate is
 	 * held to it: a strategy whose every method was masked is refused. */
 	methodDecision?: { status: "table" | "default-menu";
@@ -496,9 +492,6 @@ export interface CurrentGoal {
 		failedM04?: M04BaselineFailure[] }>;
 	/** Frozen at begin; later promotion or rollback applies only to a new goal. Optional only for explicit legacy-record detection. */
 	budgetPolicy?: BudgetPolicy;
-	/** Frozen per-task search budget for this goal; later config changes do not
-	 * move it, exactly like the evidence-handoff policy snapshot. */
-	searchBudget?: SearchBudgetPolicyV1;
 	budgetPolicyVersionId?: string;
 	budgetPolicyFrozenAt?: string;
 	/** Explicit method identity loaded when this goal began; later pointer changes do not rewrite it. */

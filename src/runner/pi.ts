@@ -28,7 +28,7 @@ import type { AssistantTurn, CustomToolSpec, ForkRequest, ForkWorkspaceBindingV1
 import { summarizeUsage, usageEventsFromEntries } from "./usage.ts";
 import { compactionPolicyFromEnvironment, sessionCompactionPolicy, workflowCompactionExtension, workflowCompactionSettings } from "./compaction.ts";
 import { platformGateFromEnvironment, type PlatformGate, type PlatformObservation } from "../platform/gate.ts";
-import { classifyToolFailure, classifyTransportFailure, remainingWallClockNote, runDeadlineFromEnvironment } from "./failure-class.ts";
+import { classifyToolFailure, classifyTransportFailure } from "./failure-class.ts";
 import { summarizeToolCalls } from "./tool-usage.ts";
 import { experimentArmFromEnvironment } from "./experiment-arm.ts";
 import { sampleRunnerResources, sessionClosed, sessionOpened } from "./resource.ts";
@@ -686,7 +686,6 @@ async function createExecutionTools(
 	isolatedToolEnvironment = false,
 	tempDir?: string,
 	platform?: { gate: PlatformGate; turn: () => number },
-	runDeadline?: string,
 ): Promise<MaterialTools & { cwd: string }> {
 	const cwd = await realpath(root);
 	if (!(await lstat(cwd)).isDirectory()) throw new HarnessError("runner.tools", `execution root is not a directory: ${root}`);
@@ -771,10 +770,7 @@ async function createExecutionTools(
 					let observed: PlatformObservation | undefined;
 					if (platform && name === "bash")
 						observed = await platform.gate.observe(name, visibleText((result as { content?: unknown }).content));
-					// The remaining wall-clock belongs in the tool result, not in the
-					// prompt prefix, where a per-turn value would void the prefix cache.
-					const budgetNote = runDeadline ? remainingWallClockNote(runDeadline, Date.now()) : undefined;
-					const appended = [platformNote, observed?.text, budgetNote].filter((item): item is string => Boolean(item));
+					const appended = [platformNote, observed?.text].filter((item): item is string => Boolean(item));
 					if (appended.length) {
 						const content = (result as { content?: unknown }).content;
 						result = { ...result, content: [...(Array.isArray(content) ? content : []),
@@ -1502,8 +1498,7 @@ export class PiSessionRunner implements SessionRunner {
 			const execution = await createExecutionTools(spec.tools.root, spec.tools.tools, toolLog,
 				path.join(spec.persistDir, "host-execution-receipts", sessionManager.getSessionId()),
 				sessionManager.getSessionId(), true, spec.tools.tempDir,
-				gate ? { gate, turn: () => promptIndex } : undefined,
-				spec.runDeadline ?? runDeadlineFromEnvironment());
+				gate ? { gate, turn: () => promptIndex } : undefined);
 			materialTools = execution;
 			if (spec.tools.extraTools?.length) {
 				const extra = customToolsToPi(spec.tools.extraTools, toolLog);
@@ -1566,8 +1561,7 @@ export class PiSessionRunner implements SessionRunner {
 				compaction: compactionPolicy ? { thresholdTokens: compactionPolicy.thresholdTokens,
 					keepRecentTokens: compactionPolicy.keepRecentTokens } : null,
 				platformProfile: platformProfileId ?? null,
-				experimentArm: experimentArmFromEnvironment(),
-				runDeadline: spec.runDeadline ?? runDeadlineFromEnvironment() ?? null }, null, 2)}\n`);
+				experimentArm: experimentArmFromEnvironment() }, null, 2)}\n`);
 		const ref: SessionRef = {
 			label: spec.label,
 			role: spec.role,
