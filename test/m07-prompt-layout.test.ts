@@ -8,13 +8,14 @@ const section = (key: string, kind: PromptSectionV1["kind"], text = key): Prompt
 
 test("the layout is static to dynamic, and history keeps the caller's own order", () => {
 	const mixed: PromptSectionV1[] = [section("round", "dynamic"), section("h1", "history"),
-		section("rules", "instruction"), section("cards", "knowledge"), section("h2", "history")];
+		section("rules", "instruction"), section("cards", "knowledge"), section("h2", "history"),
+		section("known", "understanding")];
 	const laid = layoutPrompt(mixed, { historyDepth: 4 });
 	assert.deepEqual(laid.receipt.sections.map(item => item.key),
-		["rules", "cards", "h1", "h2", "round"],
-		"kinds are reordered; within history the caller's oldest-to-newest order is preserved");
-	assert.deepEqual(PROMPT_SECTION_ORDER, ["instruction", "knowledge", "history", "dynamic"]);
-	const sameSectionsOtherOrder = layoutPrompt([mixed[2], mixed[1], mixed[4], mixed[3], mixed[0]],
+		["rules", "known", "cards", "h1", "h2", "round"],
+		"the task's own understanding sits right after the instructions; within history the caller's order is kept");
+	assert.deepEqual(PROMPT_SECTION_ORDER, ["instruction", "understanding", "knowledge", "history", "dynamic"]);
+	const sameSectionsOtherOrder = layoutPrompt([mixed[2], mixed[5], mixed[1], mixed[4], mixed[3], mixed[0]],
 		{ historyDepth: 4 });
 	assert.equal(sameSectionsOtherOrder.text, laid.text, "the same sections always produce the same bytes");
 });

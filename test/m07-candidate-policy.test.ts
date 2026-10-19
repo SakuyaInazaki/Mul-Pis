@@ -1,9 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { candidateBudgetLedger, candidatePhase, candidateSearchState, candidateStrategyMenu,
-	candidateStrategyStats, decideCandidate, DEFAULT_SEARCH_BUDGET, requireAllowedAction, requireBudget,
-	requireUnbannedDirection, summarizeCandidateSearch, validateSearchBudget,
-	DEFAULT_CATEGORY_BUDGETS, operatorCategoryBudget, requireAllowedMethod, STRATEGY_METHODS,
+import { candidatePhase, candidateSearchState, candidateStrategyMenu, candidateStrategyStats,
+	decideCandidate, requireAllowedAction, requireAllowedMethod, requireUnbannedDirection,
+	summarizeCandidateSearch, STRATEGY_METHODS,
 	type CandidateChangeKind } from "../src/m07/candidate-policy.ts";
 import type { CandidateArchiveEntry } from "../src/m07/candidate-archive.ts";
 import type { CandidateDiagnosticSummaryV1 } from "../src/m07/candidate-diagnostics.ts";
@@ -254,61 +253,6 @@ test("a banned direction needs declared new evidence, and only while the search 
 	requireUnbannedDirection(healthy, action);
 });
 
-test("every host evaluation spends one unit, including failures and pre-check rejects", () => {
-	const policy = validateSearchBudget({ evaluationsPerTask: 5, repairEvaluationsPerTask: 2,
-		parameterEvaluationsPerTask: 1 });
-	const rows = [judged("C001", "keep", { lane: "optimization" }),
-		judged("C002", "revert", { lane: "repair", changeKind: "repair", failureSignature: "a" }),
-		judged("C003", "reject", { lane: "repair", changeKind: "repair" })];
-	const ledger = candidateBudgetLedger(rows, { taskId: "T001", subjectId: "a", policy });
-	assert.equal(ledger.evaluations, 3);
-	assert.equal(ledger.repair, 2);
-	assert.equal(ledger.optimization, 1);
-	assert.equal(ledger.rejected, 1, "a pre-check reject still consumed a host call");
-	assert.equal(ledger.remaining, 2);
-	assert.equal(ledger.remainingRepair, 0);
-	assert.equal(ledger.stop, undefined);
-	assert.throws(() => requireBudget(ledger, { changeKind: "repair", lane: "repair" }), (error: unknown) =>
-		error instanceof HarnessError && error.code === "m07.candidate-budget");
-	requireBudget(ledger, { changeKind: "structure", lane: "optimization" });
-});
-
-test("the task budget, the parameter sub-budget and the stagnation limit each stop further evaluation", () => {
-	const policy = validateSearchBudget({ evaluationsPerTask: 3, repairEvaluationsPerTask: 3,
-		parameterEvaluationsPerTask: 1, routeLimits: { stagnation: 2, directionChange: 2 } });
-	const spent = candidateBudgetLedger([judged("C001", "keep"), judged("C002", "keep"), judged("C003", "keep")],
-		{ taskId: "T001", subjectId: "a", policy });
-	assert.equal(spent.stop, "task-evaluation-budget");
-	assert.throws(() => requireBudget(spent, { changeKind: "structure", lane: "optimization" }), /evaluation budget/);
-
-	const parameters = judged("C002", "accept");
-	parameters.changeKind = "parameters";
-	const parameterLedger = candidateBudgetLedger([judged("C001", "keep"), parameters],
-		{ taskId: "T001", subjectId: "a", policy });
-	assert.equal(parameterLedger.remainingParameters, 0);
-	assert.throws(() => requireBudget(parameterLedger, { changeKind: "parameters", lane: "optimization" }),
-		/parameter sub-budget/);
-
-	const roomy = validateSearchBudget({ evaluationsPerTask: 10, repairEvaluationsPerTask: 10,
-		parameterEvaluationsPerTask: 10, routeLimits: { stagnation: 2, directionChange: 2 } });
-	const stalled = candidateBudgetLedger([judged("C001", "keep"), judged("C002", "accept"), judged("C003", "accept")],
-		{ taskId: "T001", subjectId: "a", policy: roomy });
-	assert.equal(stalled.stop, "stagnation-limit");
-	assert.throws(() => requireBudget(stalled, { changeKind: "structure", lane: "optimization" }), /stagnation limit/);
-});
-
-test("search budget validation rejects unknown fields and impossible sub-budgets", () => {
-	assert.throws(() => validateSearchBudget({ evaluations: 10 }), /unknown fields/);
-	assert.throws(() => validateSearchBudget({ evaluationsPerTask: 0 }), /integer in 1-100000/);
-	assert.throws(() => validateSearchBudget({ evaluationsPerTask: 5, repairEvaluationsPerTask: 6 }),
-		/cannot exceed/);
-	assert.throws(() => validateSearchBudget({ routeLimits: { stagnation: 2, directionChange: 3 } }),
-		/directionChange cannot exceed/);
-	assert.equal(validateSearchBudget({}).evaluationsPerTask, DEFAULT_SEARCH_BUDGET.evaluationsPerTask);
-	assert.ok(DEFAULT_SEARCH_BUDGET.evaluationsPerTask >= 15,
-		"the Ascend evidence needs at least fifteen evaluations per operator");
-});
-
 test("the three admission levels and the branch decision follow the host evidence", () => {
 	const history = [entry("C001", { latency: 10 })];
 	const promoted = decide({ observation: observation({ latency: 8 }), history });
@@ -405,42 +349,6 @@ test("quarantined, unconfirmed or undecidable rulings never select a candidate",
 		notComparable: ["baseline failed"] }), history });
 	assert.equal(incomparable.guard, "accept");
 	assert.deepEqual(incomparable.hostVerdict?.notComparable, ["baseline failed"]);
-});
-
-test("operator category caps the task budget and keeps losing classes out of the queue by default", () => {
-	const policy = validateSearchBudget({});
-	assert.equal(operatorCategoryBudget(policy, "norm-reduce").admitted, true);
-	assert.equal(operatorCategoryBudget(policy, "elementwise-activation").evaluations, 6,
-		"an elementwise operator finishes in about one round");
-	for (const category of ["matmul", "convolution-pooling", "attention", "sorting-indexing", "broadcast"] as const)
-		assert.equal(operatorCategoryBudget(policy, category).admitted, false,
-			`${category} is a measured near-certain loss and needs a written reason`);
-	assert.equal(operatorCategoryBudget(policy, undefined).evaluations,
-		operatorCategoryBudget(policy, "other").evaluations, "an undeclared category falls back to the task budget");
-
-	const spent = [judged("C001", "keep"), judged("C002", "accept"), judged("C003", "accept"),
-		judged("C004", "accept"), judged("C005", "accept"), judged("C006", "accept")];
-	const capped = candidateBudgetLedger(spent, { taskId: "T001", subjectId: "a", policy,
-		category: "elementwise-activation" });
-	assert.equal(capped.categoryCap, 6);
-	assert.equal(capped.remaining, 0);
-	assert.equal(capped.stop, "task-evaluation-budget", "the category cap stops the task, not just the global one");
-	const uncapped = candidateBudgetLedger(spent, { taskId: "T001", subjectId: "a", policy,
-		category: "norm-reduce" });
-	assert.ok(uncapped.remaining > 0, "the largest yield area keeps the full task budget");
-});
-
-test("a configured category budget is validated like every other frozen number", () => {
-	const policy = validateSearchBudget({ categoryBudgets: { matmul: { evaluations: 12, admitted: true,
-		note: "this project has no vendor matmul" } } });
-	assert.equal(operatorCategoryBudget(policy, "matmul").admitted, true);
-	assert.equal(operatorCategoryBudget(policy, "matmul").evaluations, 12);
-	assert.equal(operatorCategoryBudget(policy, "norm-reduce").evaluations,
-		DEFAULT_CATEGORY_BUDGETS["norm-reduce"].evaluations, "untouched categories keep their defaults");
-	assert.throws(() => validateSearchBudget({ categoryBudgets: { gemm: { evaluations: 4, admitted: true } } }),
-		/unknown categories/);
-	assert.throws(() => validateSearchBudget({ categoryBudgets: { matmul: { evaluations: 0, admitted: true } } }),
-		/evaluations integer/);
 });
 
 test("a strategy whose every method the decision table masked is refused", () => {

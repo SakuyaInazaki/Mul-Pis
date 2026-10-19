@@ -512,8 +512,6 @@ export class WorkflowReader {
             `停滞信号：${episode.search.signals.join("、") || "无"}；禁用方向 ${episode.search.bannedDirections.length} 条${episode.search.bannedDirections.length ? `（${episode.search.bannedDirections.map(item => `${item.changeKind}${item.strategy ? `/${item.strategy}` : ""}${item.location ? `@${item.location}` : ""} ← ${item.candidateRef}`).slice(0, 5).join("、")}）` : ""}`,
             ...(episode.search.recommendedParents.length ? [`建议父候选：${episode.search.recommendedParents.map(item => `${item.candidateRef}（${item.why}）`).join("、")}`] : []),
             episode.search.message] : []),
-          ...(episode.budget ? [`搜索预算：已用评估 ${episode.budget.evaluations}（修复 ${episode.budget.repair}、优化 ${episode.budget.optimization}、参数 ${episode.budget.parameters}、前置驳回 ${episode.budget.rejected}）· 剩余 ${episode.budget.remaining}${episode.budget.stop ? ` · 已停止：${episode.budget.stop}` : ""}`,
-            episode.budget.message] : []),
           ...incumbentRows.map(item => `本 episode 局部最佳：${item.candidateId} · 对象 ${item.subjectId} · ${item.metric.name}=${item.metric.value} ${item.metric.unit}（${item.metric.basisId}）`),
           "局部最佳不代表整个目标的历史最佳、任务接受或原目标达标；任务状态另见父节点"].map(clean),
         outputRefs: incumbentRows.map(item => ({ label: `局部最佳 ${item.candidateId} 的冻结观测`, path: byId.get(item.candidateId)!.observationPath })),

@@ -19,7 +19,7 @@ import { HarnessError, type HarnessConfig } from "../src/types.ts";
 import type { ToolCallRecord } from "../src/runner/types.ts";
 
 async function setup(reply: ConstructorParameters<typeof FakeSessionRunner>[0], verifier: CandidateVerifier,
-	backend?: CandidateExecutionBackend, searchBudget?: HarnessConfig["searchBudget"]) {
+	backend?: CandidateExecutionBackend, episodeRestart?: HarnessConfig["episodeRestart"]) {
 	const root = await mkdtemp(path.join(tmpdir(), "m07-episode-"));
 	const ws = new Workspace(root);
 	await mkdir(path.dirname(ws.problemFile), { recursive: true });
@@ -28,7 +28,7 @@ async function setup(reply: ConstructorParameters<typeof FakeSessionRunner>[0], 
 	const baseline = await ws.startRun("M04", [{ label: "problem", path: ws.problemFile }]);
 	await ws.finishRun(baseline, "completed");
 	const runner = new FakeSessionRunner(reply);
-	const ctx: StageContext = { ws, store, runner, config: { roles: { execution: "fake/execution", reviewer: "fake/reviewer", research: "fake/research" }, concurrency: 1, tools: {}, ...(searchBudget ? { searchBudget } : {}) } };
+	const ctx: StageContext = { ws, store, runner, config: { roles: { execution: "fake/execution", reviewer: "fake/reviewer", research: "fake/research" }, concurrency: 1, tools: {}, ...(episodeRestart ? { episodeRestart } : {}) } };
 	const controller = createM07Controller(ctx, { candidateVerifier: verifier, ...(backend ? { candidateExecutionBackend: backend } : {}) });
 	const goal = await controller.begin({ goal: "Correct and optimize operator", problemRelation: "direct", constraints: ["same interface"], successCriteria: ["original criterion"], plan: "test candidates" },
 		{ candidateVerification: { id: verifier.id, verifierVersion: verifier.version }, ...(backend ? { executionContract: "continuous" as const } : {}) });
@@ -824,43 +824,6 @@ test("host reconciliation queries a failed task's original candidate ID and unlo
 	assert.equal(builderTurns, 2); assert.equal(submissions, 1); assert.equal(queries, 2);
 });
 
-test("a spent search budget stops the task deterministically and records the boundary", async t => {
-	const verifier: CandidateVerifier = { id: "host:budget", version: "1", async verifyTask() {
-		return { sourceBinding: "verified", correctness: "passed", stage: "performance",
-			metrics: [{ name: "latency", value: 10, unit: "ms", basisId: "b", direction: "lower" }], limitations: [] };
-	} };
-	let refusal = "";
-	const harness = await setup(async ({ spec, tools }) => {
-		if (spec.tools.kind !== "execution") return "report";
-		const workRoot = spec.tools.root;
-		const evaluate = async (label: string, strategy: string) => {
-			await writeFile(path.join(workRoot, "kernel.py"), label);
-			await writeFile(path.join(workRoot, "receipt.json"), '{"status":"passed"}');
-			return JSON.parse((await tools.candidate_evaluate({ sourcePaths: ["kernel.py"], receiptPaths: ["receipt.json"],
-				hypothesis: label, changeKind: "structure", strategy, location: "kernel.py", intent: "solution" })).text) as {
-				budget: { evaluations: number; remaining: number; stop?: string } };
-		};
-		const first = await evaluate("one", "tiling");
-		assert.equal(first.budget.remaining, 1);
-		const second = await evaluate("two", "fusion");
-		assert.equal(second.budget.stop, "task-evaluation-budget");
-		try { await evaluate("three", "pipeline"); }
-		catch (error) { refusal = (error as Error).message; }
-		return "Budget boundary reached; reporting the verified best candidate.";
-	}, verifier, undefined, { version: 1, evaluationsPerTask: 2, repairEvaluationsPerTask: 2,
-		parameterEvaluationsPerTask: 1, maxBranchesPerCheckpoint: 2, reviewRoundsPerTask: 12, episodeRestartEvaluations: 0,
-		routeLimits: { repairDepth: 3, stagnation: 8, directionChange: 3 } });
-	t.after(() => rm(harness.root, { recursive: true, force: true }));
-	const task = await harness.controller.delegate(harness.goal.runId, { objective: "bounded search", subjectId: "operator",
-		mode: "execute", subjectProfile: { operatorCategory: "norm-reduce" as const, implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const }, inputs: [], expectedOutputs: ["kernel.py", "receipt.json"], checks: ["budget respected"],
-		executionLoop: { mode: "candidate-episode" } });
-	assert.equal(task.status, "returned", task.executionFailure);
-	assert.equal(task.episode?.candidates.length, 2, "the refused third evaluation never reached the verifier");
-	assert.match(refusal, /evaluation budget/);
-	assert.equal(task.loopStopReason, "budget-boundary");
-	assert.equal(task.episode?.budget?.stop, "task-evaluation-budget");
-});
-
 test("with a bound verifier an execute task cannot fall back to a reviewer-gated loop", async t => {
 	const verifier: CandidateVerifier = { id: "host:loop-choice", version: "1", async verifyTask() {
 		return { sourceBinding: "verified", correctness: "passed", stage: "performance", metrics: [], limitations: [] };
@@ -951,10 +914,7 @@ test("an episode boundary distils what was established and restarts on a clean c
 		await evaluate("broken candidate", "repair");
 		await evaluate("working candidate", "tiling");
 		return "Two candidates in the first session.";
-	}, verifier, undefined, { version: 1, evaluationsPerTask: 6, repairEvaluationsPerTask: 6,
-		parameterEvaluationsPerTask: 2, maxBranchesPerCheckpoint: 2, reviewRoundsPerTask: 12,
-		episodeRestartEvaluations: 2,
-		routeLimits: { repairDepth: 3, stagnation: 8, directionChange: 3 } });
+	}, verifier, undefined, { evaluations: 2 });
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
 	const task = await harness.controller.delegate(harness.goal.runId, { objective: "bounded episode",
 		subjectId: "operator", mode: "execute", inputs: [], expectedOutputs: ["kernel.py", "receipt.json"],
@@ -983,7 +943,7 @@ test("an episode boundary distils what was established and restarts on a clean c
 	assert.notEqual(task.session?.id, task.episode?.restarts?.[0].previousSessionId);
 });
 
-test("the host records its verdict, stall, budget and restart events for the console", async t => {
+test("the host records its verdict, stall and restart events for the console", async t => {
 	const verifier: CandidateVerifier = { id: "host:events", version: "1", async verifyTask({ sources }) {
 		const text = await readFile(sources[0].frozenPath, "utf8");
 		return { sourceBinding: "verified", correctness: "passed", stage: "performance",
@@ -996,8 +956,10 @@ test("the host records its verdict, stall, budget and restart events for the con
 		if (spec.tools.kind !== "execution") return "report";
 		const workRoot = spec.tools.root;
 		// Each candidate is strictly faster than the last, so every verdict is a
-		// keep and no stall or ban interferes with what this test observes.
-		for (let index = 0; index < 2; index++) {
+		// keep and no stall or ban interferes with what this test observes. The
+		// builder stops evaluating after four, which is what ends the episode
+		// loop now that nothing bounds it from outside.
+		for (let index = 0; index < 2 && round < 4; index++) {
 			round++;
 			await writeFile(path.join(workRoot, "kernel.py"), `candidate ${"x".repeat(Math.max(1, 20 - round))}`);
 			await writeFile(path.join(workRoot, "receipt.json"), '{"status":"ok"}');
@@ -1006,9 +968,7 @@ test("the host records its verdict, stall, budget and restart events for the con
 				strategy: strategies[(round - 1) % strategies.length], location: "kernel.py", intent: "solution" });
 		}
 		return `Rounds through ${round} recorded.`;
-	}, verifier, undefined, { version: 1, evaluationsPerTask: 4, repairEvaluationsPerTask: 4,
-		parameterEvaluationsPerTask: 2, maxBranchesPerCheckpoint: 2, reviewRoundsPerTask: 12,
-		episodeRestartEvaluations: 2, routeLimits: { repairDepth: 3, stagnation: 8, directionChange: 3 } });
+	}, verifier, undefined, { evaluations: 2 });
 	t.after(() => rm(harness.root, { recursive: true, force: true }));
 	const task = await harness.controller.delegate(harness.goal.runId, { objective: "record search events",
 		subjectId: "operator", mode: "execute", inputs: [], expectedOutputs: ["kernel.py", "receipt.json"],
@@ -1019,17 +979,13 @@ test("the host records its verdict, stall, budget and restart events for the con
 	const { events } = await readSearchEvents(path.join(harness.ws.runDir("M07", harness.goal.runId), "search-events.jsonl"));
 	const kinds = events.map(event => event.kind);
 	assert.equal(kinds.filter(kind => kind === "verdict").length, task.episode!.candidates.length);
-	assert.equal(kinds.filter(kind => kind === "budget").length, task.episode!.candidates.length);
-	assert.equal(kinds.filter(kind => kind === "episode-restarted").length, 1,
-		"one boundary was crossed before the budget stopped the task");
+	assert.equal(kinds.filter(kind => kind === "episode-restarted").length, 2,
+		"a boundary was crossed after each pair of evaluations, until the builder stopped evaluating");
 	const verdicts = events.filter(event => event.kind === "verdict");
 	assert.deepEqual(verdicts.map(event => event.verdict?.decision),
 		task.episode!.candidates.map(item => item.policy?.guard));
 	assert.equal(verdicts[0].candidate?.id, "C001");
 	assert.equal(typeof verdicts[0].candidate?.score, "number");
-	const budget = events.filter(event => event.kind === "budget").at(-1)!;
-	assert.equal(budget.counters?.evaluations, task.episode!.candidates.length);
-	assert.equal(budget.detail?.category, "norm-reduce");
 	const restarted = events.find(event => event.kind === "episode-restarted")!;
 	assert.equal(restarted.counters?.afterCandidates, 2);
 	assert.equal(restarted.detail?.recordPath, task.episode!.restarts![0].recordPath);

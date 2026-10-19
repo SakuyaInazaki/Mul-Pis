@@ -82,14 +82,6 @@ export interface WorkflowAuditV1 {
 		signals: Array<{ signal: string; count: number }>;
 		bannedDirections: number;
 	};
-	/** Frozen per-task search budget and what has been spent of it. */
-	searchBudget: {
-		tasks: number;
-		evaluations: number;
-		rejected: number;
-		remaining: number | null;
-		stops: Array<{ stop: string; count: number }>;
-	};
 	budget: { sessions: number; input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; usageComplete: boolean; costComplete: boolean; unknownEvents: number };
 	profile: {
 		changeKinds: Array<{ changeKind: string; count: number }>;

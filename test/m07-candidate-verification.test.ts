@@ -333,16 +333,6 @@ test("a candidate task must declare where it is implemented and what baseline it
 		baselineStrength: "framework-default", endToEndShare: 0.42,
 		headroom: { kind: "sol-gap", value: 0.55, source: "host profiler run 2026-10-18" } } });
 	assert.equal(task.subjectProfile?.implementationSpace, "dsl-or-ir");
-	await assert.rejects(controller.delegate(goal.runId, { ...base, subjectProfile: {
-		operatorCategory: "matmul", implementationSpace: "handwritten-low-level",
-		rationale: "hand written", baselineStrength: "vendor-library" } }),
-		/not in the default optimization queue/);
-	const justified = await controller.delegate(goal.runId, { ...base, subjectProfile: {
-		operatorCategory: "matmul", implementationSpace: "handwritten-low-level",
-		rationale: "hand written", baselineStrength: "vendor-library",
-		categoryJustification: "this platform ships no vendor matmul for this dtype" } });
-	assert.equal(justified.subjectProfile?.operatorCategory, "matmul");
-	assert.match(justified.subjectProfile!.categoryJustification!, /no vendor matmul/);
 	assert.equal(task.subjectProfile?.endToEndShare, 0.42);
 	assert.equal(task.subjectProfile?.headroom?.source, "host profiler run 2026-10-18");
 });

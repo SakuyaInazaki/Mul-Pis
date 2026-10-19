@@ -14,6 +14,7 @@ import { mkdir, readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { linkedEvidence, openBoundedSession } from "../context/boundary.ts";
 import { buildM05Message, problemBlock, systemPromptFor } from "../prompts.ts";
+import { latestUnderstanding, understandingBlock } from "../understanding.ts";
 import { listSources, readIndex, registerSource, SearchLog, type SourceFile, type SourceKind } from "../references.ts";
 import type { CustomToolSpec, ToolCallRecord } from "../runner/types.ts";
 import type { AcquisitionBackend } from "../tools/backend.ts";
@@ -418,7 +419,9 @@ export async function runM05(ctx: StageContext, options: M05Options = {}): Promi
 				purpose: `M05 知识获取：${goal.slice(0, 60)}`, text: `${goal}\n${problemBlock(materials)}`,
 				types: ["C", "K", "Q", "X"], priorRoot: path.join(ctx.ws.knowledgeDir, "prior") });
 			await ctx.ws.writeOutput(record, "knowledge-injection.json", JSON.stringify(injection.receipt, null, 2), "本轮知识注入回执");
-			const message = `${await buildM05Message({ goal, problem: problemBlock(materials), knowledgePack: injection.receipt.injectedRefs.length || injection.receipt.priorFiles.length ? injection.markdown : undefined, indexText: indexBefore, providerNames: backend.providers.map((p) => p.name), toolNames: tools.map((t) => t.name) })}\n\n${acquisitionDeliverableInstruction()}`;
+			const understandingSource = await latestUnderstanding(ctx.ws);
+			const message = `${await buildM05Message({ goal, problem: problemBlock(materials),
+				...(understandingSource ? { understanding: understandingBlock(understandingSource, ctx.ws.root) } : {}), knowledgePack: injection.receipt.injectedRefs.length || injection.receipt.priorFiles.length ? injection.markdown : undefined, indexText: indexBefore, providerNames: backend.providers.map((p) => p.name), toolNames: tools.map((t) => t.name) })}\n\n${acquisitionDeliverableInstruction()}`;
 			await ctx.ws.writeOutput(record, "message.md", message, "发送给获取会话的完整消息");
 			const handle = await openBoundedSession(ctx.runner, record, { mode: "fresh", intent: "new-work", reason: "A new M05 acquisition run receives only its declared research need and explicit project materials", evidence: linkedEvidence(record.inputs), spec: sessionSpec(ctx, "M05", "acquisition", systemPromptFor("acquisition"), { kind: "custom", tools }) }, () => ctx.ws.writeRun(record));
 			let report: string;

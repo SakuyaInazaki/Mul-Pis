@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyToolFailure, classifyTransportFailure, remainingWallClockNote, runDeadlineFromEnvironment,
+import { classifyToolFailure, classifyTransportFailure,
 	tallyFailures } from "../../src/runner/failure-class.ts";
 
 test("a command that ran and failed is the candidate's result; a broken environment is not", () => {
@@ -54,13 +54,3 @@ test("the unjudged share is reported rather than folded into either side", () =>
 	]), { infrastructure: 1, policy: 1, unjudged: 2, unjudgedShare: 0.5 });
 });
 
-test("remaining wall-clock reads as time left and turns into a save instruction at the end", () => {
-	const now = Date.parse("2026-10-18T12:00:00.000Z");
-	assert.match(remainingWallClockNote("2026-10-18T14:30:00.000Z", now) ?? "", /^Run budget: 2h30m of wall-clock left\./);
-	assert.match(remainingWallClockNote("2026-10-18T12:07:00.000Z", now) ?? "", /^Run budget: 7m of wall-clock left\./);
-	assert.match(remainingWallClockNote("2026-10-18T11:30:00.000Z", now) ?? "", /^Run deadline passed\./);
-	assert.equal(remainingWallClockNote("not a time", now), undefined);
-	assert.equal(runDeadlineFromEnvironment({}), undefined);
-	assert.equal(runDeadlineFromEnvironment({ PRE_RSI_RUN_DEADLINE: "2026-10-18T14:30:00.000Z" }), "2026-10-18T14:30:00.000Z");
-	assert.throws(() => runDeadlineFromEnvironment({ PRE_RSI_RUN_DEADLINE: "soon" }), /must be an ISO timestamp/);
-});

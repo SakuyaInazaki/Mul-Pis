@@ -151,8 +151,6 @@ test("audit reads back the host policy decisions, search state and budget", () =
 		search: { version: 1, phase: "tuning", stagnation: 3, repairDepth: 1, signals: ["no_progress", "stagnation"],
 			forcedDirectionChange: true, route: "restructure", bannedDirections: [{ changeKind: "parameters",
 				candidateRef: "T001/c2", reason: "no measured gain" }], recommendedParents: [], message: "换一个结构" },
-		budget: { version: 1, evaluations: 7, repair: 2, optimization: 4, parameters: 1, rejected: 1,
-			remaining: 5, remainingRepair: 3, remainingParameters: 2, stop: "repair-budget", message: "修复预算已用尽" },
 	} })] as M07TaskRecord[] }];
 
 	const audit = buildWorkflowAudit(goals, [], "2026-01-01T00:00:00Z");
@@ -167,12 +165,9 @@ test("audit reads back the host policy decisions, search state and budget", () =
 	assert.deepEqual(audit.search, { tasks: 1, maxStagnation: 3, forcedDirectionChanges: 1,
 		routes: [{ route: "restructure", count: 1 }],
 		signals: [{ signal: "no_progress", count: 1 }, { signal: "stagnation", count: 1 }], bannedDirections: 1 });
-	assert.deepEqual(audit.searchBudget, { tasks: 1, evaluations: 7, rejected: 1, remaining: 5,
-		stops: [{ stop: "repair-budget", count: 1 }] });
 	const rendered = renderWorkflowAudit(audit).join("\n");
 	assert.match(rendered, /候选 guard 判决：keep 1、accept 1/);
 	assert.match(rendered, /最大停滞 3/);
-	assert.match(rendered, /已用评估 7/);
 });
 
 test("audit counts the runner's own failure classes and never reclassifies them", () => {

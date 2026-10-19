@@ -28,13 +28,13 @@ import type { Workspace } from "../workspace.ts";
 import { failedM04Feedback, resolveM04Baseline, type FormalBaseline } from "./formal-baseline.ts";
 import { writeFeedback } from "./feedback.ts";
 import { candidateObservation, requireCandidateVerifier, type CandidateVerifier, type FrozenCandidateFile } from "./candidate-evaluation.ts";
-import { candidateBudgetLedger, DEFAULT_SEARCH_BUDGET, operatorCategoryBudget, OPERATOR_CATEGORIES,
-	type SearchBudgetPolicyV1 } from "./candidate-policy.ts";
-import { distillEpisode, episodeRestartMessage, writeEpisodeRecord } from "./episode-record.ts";
+import { OPERATOR_CATEGORIES } from "./candidate-policy.ts";
+import { DEFAULT_EPISODE_RESTART_EVALUATIONS, distillEpisode, episodeRestartMessage, writeEpisodeRecord } from "./episode-record.ts";
 import { openSearchEventLog } from "./search-state/index.ts";
 import { createCandidateEpisodeTool } from "./candidate-episode.ts";
 import { createCandidateExecutionTools, pendingCandidateExecutions, type CandidateExecutionBackend } from "./candidate-runner.ts";
 import { candidateArchive, candidateSubjectId, createCandidateArchiveTools } from "./candidate-archive.ts";
+import { freezeUnderstanding, latestUnderstanding } from "../understanding.ts";
 import { DEFAULT_HISTORY_DEPTH, layoutPrompt, type PromptLayoutReceiptV1, type PromptSectionKind, type PromptSectionV1 } from "./prompt-layout.ts";
 import { createExecutionKnowledgeTools } from "./execution-knowledge.ts";
 import { INJECTION_PLANS } from "../knowledge/injection.ts";
@@ -358,10 +358,10 @@ async function withGoalDispatch<T>(ctx: StageContext, runId: string, body: () =>
 	}
 }
 /** Declared facts only: the harness checks their shape, never their truth. */
-function validateSubjectProfile(profile: TaskSpecInput["subjectProfile"], budget: SearchBudgetPolicyV1): TaskSpecInput["subjectProfile"] {
+function validateSubjectProfile(profile: TaskSpecInput["subjectProfile"]): TaskSpecInput["subjectProfile"] {
 	if (profile === undefined) return undefined;
 	if (!profile || typeof profile !== "object" || Array.isArray(profile) ||
-		Object.keys(profile).some((key) => !["operatorCategory", "categoryJustification", "implementationSpace", "rationale", "baselineStrength", "endToEndShare", "headroom"].includes(key)) ||
+		Object.keys(profile).some((key) => !["operatorCategory", "implementationSpace", "rationale", "baselineStrength", "endToEndShare", "headroom"].includes(key)) ||
 		!(OPERATOR_CATEGORIES as readonly string[]).includes(profile.operatorCategory) ||
 		!["vendor-library", "dsl-or-ir", "handwritten-low-level"].includes(profile.implementationSpace) ||
 		!["vendor-library", "framework-default", "none"].includes(profile.baselineStrength) ||
@@ -378,16 +378,7 @@ function validateSubjectProfile(profile: TaskSpecInput["subjectProfile"], budget
 		profile.headroom.source.length > 400 ||
 		(profile.headroom.value !== undefined && (typeof profile.headroom.value !== "number" || !Number.isFinite(profile.headroom.value)))))
 		throw new HarnessError("m07.subject-profile", "subjectProfile.headroom needs a kind, a stated source, and a finite value when it claims one");
-	// A category the evidence measures as a near-certain loss may still be worked
-	// on, but only with a written reason that stays in the trajectory.
-	const admitted = operatorCategoryBudget(budget, profile.operatorCategory).admitted;
-	if (!admitted && (typeof profile.categoryJustification !== "string" || !profile.categoryJustification.trim()))
-		throw new HarnessError("m07.subject-profile", `operator category ${profile.operatorCategory} is not in the default optimization queue: ${operatorCategoryBudget(budget, profile.operatorCategory).note}. Declare categoryJustification to work on it anyway.`);
-	if (profile.categoryJustification !== undefined && (typeof profile.categoryJustification !== "string" ||
-		!profile.categoryJustification.trim() || profile.categoryJustification.length > 1000))
-		throw new HarnessError("m07.subject-profile", "subjectProfile.categoryJustification must be a nonempty reason under 1000 characters");
 	return { operatorCategory: profile.operatorCategory,
-		...(profile.categoryJustification ? { categoryJustification: profile.categoryJustification.trim() } : {}),
 		implementationSpace: profile.implementationSpace, rationale: profile.rationale.trim(),
 		baselineStrength: profile.baselineStrength,
 		...(profile.endToEndShare === undefined ? {} : { endToEndShare: profile.endToEndShare }),
@@ -771,10 +762,20 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string,
 	// Static instructions first, then hardware, knowledge, bounded history and
 	// finally this round's dynamic material. The order is fixed so two rounds
 	// that differ only in feedback share a byte-identical prefix.
+	const inputBlockIndex = boundary.findIndex((part) => part.startsWith("【输入预算与读取清单】\n"));
 	const historySections = recentCandidateHistory(goal, task.subjectId);
+	// Frozen at begin, read here: the same bytes in the same place every round.
+	const understanding = goal.understanding
+		? await readTextIfExists(goal.understanding.snapshotPath)
+		: undefined;
 	const layout = layoutPrompt([
+		...(understanding?.trim() ? [{ key: "understanding", kind: "understanding" as PromptSectionKind,
+			text: understanding.trim() }] : []),
+		// The frozen contract is instruction; this task's own inputs and details
+		// are dynamic, so the stable prefix ends before them.
 		...boundary.map((text, index) => ({ key: `boundary-${index}`,
-			kind: (text.startsWith("【本任务局部知识包】") ? "knowledge" : "instruction") as PromptSectionKind, text })),
+			kind: (text.startsWith("【本任务局部知识包】") ? "knowledge" :
+				index >= inputBlockIndex ? "dynamic" : "instruction") as PromptSectionKind, text })),
 		...historySections,
 	], { historyDepth: ctx.config.promptLayout?.historyDepth ?? DEFAULT_HISTORY_DEPTH });
 	const orderedBoundary = layout.text ? layout.text.split("\n\n") : [];
@@ -1061,10 +1062,17 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			const record = await ctx.ws.startRun("M07", [{ label: "原始问题", path: problem.path }], knowledgeSnapshot);
 			const frozen = path.join(ctx.ws.runDir("M07", record.runId), "problem-snapshot.md");
 			await writeFileAtomic(frozen, problem.content);
+			// The model's own understanding of the task is frozen once, here, so
+			// every task prompt under this goal carries the same bytes early.
+			const understandingSource = await latestUnderstanding(ctx.ws);
+			const understanding = understandingSource
+				? await freezeUnderstanding(ctx.ws, understandingSource,
+					path.join(ctx.ws.runDir("M07", record.runId), "understanding-snapshot.md"))
+				: undefined;
 			const exploratory = input.exploratory === true || !baseline;
 			const attemptId = "A001";
 			const descriptor: RunDescriptorV1 = { version: 1, instanceId: process.env.PRE_RSI_RUN_INSTANCE_ID ?? randomUUID(), attemptId, workspaceId: await ctx.store.storeId(), goalRunId: record.runId, codeRevision: loadedSource?.sourceCommit ?? process.env.PRE_RSI_CODE_REVISION ?? "unrecorded", ...(loadedSource ? { loadedSource } : {}), controlDir: ctx.ws.runDir("M07", record.runId), process: await (options.processIdentity ?? readCurrentProcessIdentity)() };
-			const goal: CurrentGoal = { version: 1, runId: record.runId, lifecycle: "active", startedAt: record.startedAt, updatedAt: record.startedAt, goal: input.goal.trim(), problemRelation: input.problemRelation.trim(), constraints: input.constraints.map((x) => nonempty(x, "constraint")), successCriteria: input.successCriteria.map((x) => nonempty(x, "success criterion")), plan: input.plan.trim(), exploratory, formalBaseline: !!baseline && !exploratory, problemSnapshotPath: frozen, knowledgeSnapshot, m04BaselineRunId: baseline?.run.runId, checkpointRawScope: beginOptions?.checkpointRawScope ?? "workspace", ...(beginOptions?.candidateVerification ? { candidateVerification: { version: 1 as const, id: beginOptions.candidateVerification.id, verifierVersion: beginOptions.candidateVerification.verifierVersion, goalAdmission: beginOptions.candidateVerification.goalAdmission === true, boundAt: record.startedAt, firstTaskIndex: 0 } } : {}), ...(failedM04.length ? { m04BaselineFailures: failedM04 } : {}), baselineHistory: baseline ? [{ at: record.startedAt, knowledgeSnapshot, m04RunId: baseline.run.runId, ...(failedM04.length ? { failedM04 } : {}) }] : [], budgetPolicy: budget.policy, searchBudget: ctx.config.searchBudget ?? DEFAULT_SEARCH_BUDGET, budgetPolicyVersionId: budget.versionId, budgetPolicyFrozenAt: record.startedAt, methodBinding: { versionId: workflowMethod?.versionId ?? budget.versionId }, ...(workflowMethod ? { workflowMethod } : {}), ...(beginOptions?.executionContract === "continuous" ? { executionContract: { version: 1 as const, mode: "continuous" as const, frozenAt: record.startedAt } } : {}), executionState: { version: 1, activeAttemptId: attemptId, attempts: [{ version: 1, id: attemptId, state: "running", startedAt: record.startedAt, runDescriptor: descriptor }], operations: [] }, tasks: [], decisions: [], limitations: [] };
+			const goal: CurrentGoal = { version: 1, runId: record.runId, lifecycle: "active", startedAt: record.startedAt, updatedAt: record.startedAt, goal: input.goal.trim(), problemRelation: input.problemRelation.trim(), constraints: input.constraints.map((x) => nonempty(x, "constraint")), successCriteria: input.successCriteria.map((x) => nonempty(x, "success criterion")), plan: input.plan.trim(), exploratory, formalBaseline: !!baseline && !exploratory, problemSnapshotPath: frozen, ...(understanding ? { understanding } : {}), knowledgeSnapshot, m04BaselineRunId: baseline?.run.runId, checkpointRawScope: beginOptions?.checkpointRawScope ?? "workspace", ...(beginOptions?.candidateVerification ? { candidateVerification: { version: 1 as const, id: beginOptions.candidateVerification.id, verifierVersion: beginOptions.candidateVerification.verifierVersion, goalAdmission: beginOptions.candidateVerification.goalAdmission === true, boundAt: record.startedAt, firstTaskIndex: 0 } } : {}), ...(failedM04.length ? { m04BaselineFailures: failedM04 } : {}), baselineHistory: baseline ? [{ at: record.startedAt, knowledgeSnapshot, m04RunId: baseline.run.runId, ...(failedM04.length ? { failedM04 } : {}) }] : [], budgetPolicy: budget.policy, budgetPolicyVersionId: budget.versionId, budgetPolicyFrozenAt: record.startedAt, methodBinding: { versionId: workflowMethod?.versionId ?? budget.versionId }, ...(workflowMethod ? { workflowMethod } : {}), ...(beginOptions?.executionContract === "continuous" ? { executionContract: { version: 1 as const, mode: "continuous" as const, frozenAt: record.startedAt } } : {}), executionState: { version: 1, activeAttemptId: attemptId, attempts: [{ version: 1, id: attemptId, state: "running", startedAt: record.startedAt, runDescriptor: descriptor }], operations: [] }, tasks: [], decisions: [], limitations: [] };
 			await save(ctx, goal);
 			return goal;
 		},
@@ -1176,19 +1184,15 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				const loop = spec.executionLoop as unknown;
 				if (!loop || typeof loop !== "object" || Array.isArray(loop)) throw new HarnessError("m07.loop", "invalid execution-loop policy");
 				const fields = loop as Record<string, unknown>;
-				const named = ["until-ready", "candidate-episode"].includes(String(fields.mode));
-				const extra = Object.keys(fields).filter(key => !["mode", "maxRounds", "deadlineAt"].includes(key));
-				if (extra.length || (named ? false : !("maxRounds" in fields) || !("deadlineAt" in fields)) ||
-					(fields.maxRounds !== undefined && (!Number.isSafeInteger(fields.maxRounds) || Number(fields.maxRounds) < 1)) ||
-					(fields.deadlineAt !== undefined && (typeof fields.deadlineAt !== "string" || !Number.isFinite(Date.parse(fields.deadlineAt)))))
+				if (["until-ready", "candidate-episode"].includes(String(fields.mode)) ? Object.keys(fields).length !== 1 :
+					Object.keys(fields).length !== 2 || !Number.isSafeInteger(fields.maxRounds) || Number(fields.maxRounds) < 1 ||
+					typeof fields.deadlineAt !== "string" || !Number.isFinite(Date.parse(fields.deadlineAt)))
 					throw new HarnessError("m07.loop", "invalid execution-loop policy");
 			}
 			spec = { ...spec, objective: spec.objective.trim(), inputs: normalizedUnique(spec.inputs, "task input"), expectedOutputs: normalizedUnique(spec.expectedOutputs, "expected output"), checks: normalizedUnique(spec.checks, "task check"),
-				executionLoop: spec.executionLoop ? { mode: "mode" in spec.executionLoop ? spec.executionLoop.mode : "until-ready",
-					...(spec.executionLoop.maxRounds === undefined ? {} : { maxRounds: spec.executionLoop.maxRounds }),
-					...(spec.executionLoop.deadlineAt === undefined ? {} : { deadlineAt: spec.executionLoop.deadlineAt }) } : undefined };
+				executionLoop: spec.executionLoop ? { mode: "mode" in spec.executionLoop ? spec.executionLoop.mode : "until-ready" } : undefined };
 			if (spec.subjectId !== undefined) spec.subjectId = nonempty(spec.subjectId, "task subjectId");
-			spec.subjectProfile = validateSubjectProfile(spec.subjectProfile, goal.searchBudget ?? DEFAULT_SEARCH_BUDGET);
+			spec.subjectProfile = validateSubjectProfile(spec.subjectProfile);
 			// Under a bound verifier an execute task produces candidates, and the basis
 			// requires the abstraction-layer decision and the headroom record before
 			// spending a search budget on it.
@@ -1204,9 +1208,6 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				if (!branchParent || branchParent.mode !== "execute" || branchParent.context || !["returned", "accepted", "rejected"].includes(branchParent.status) || !branchParent.branchSource || branchParent.branchSource.checkpoint.id !== reference.checkpointId) throw new HarnessError("m07.branch", "parent is not a settled, frozen execute task at the requested checkpoint");
 				if (branchParent.branchSource.checkpoint.runId !== runId || branchParent.branchSource.checkpoint.taskId !== branchParent.taskId || branchParent.branchSource.checkpoint.inputManifest !== branchParent.branchSource.manifestPath) throw new HarnessError("m07.branch", "checkpoint receipt does not bind this run, task, and evidence manifest");
 				if (goal.branchSelections?.some((item) => item.parentTaskId === reference.parentTaskId)) throw new HarnessError("m07.branch", "branch selection is frozen; no later candidate may join this comparison");
-					const siblings = goal.tasks.filter((item) => item.context?.parentTaskId === reference.parentTaskId).length;
-					const branchLimit = (goal.searchBudget ?? DEFAULT_SEARCH_BUDGET).maxBranchesPerCheckpoint;
-					if (siblings >= branchLimit) throw new HarnessError("m07.branch", `the frozen search budget allows ${branchLimit} competing branches from one checkpoint; select among the existing ones instead of widening further`);
 				if (spec.mode !== "execute" || spec.objective !== branchParent.objective || spec.subjectId !== branchParent.subjectId || !sameStrings(spec.checks, branchParent.checks) || !sameStrings(spec.expectedOutputs, branchParent.expectedOutputs) || Boolean(spec.requireIndependentCheck) !== Boolean(branchParent.requireIndependentCheck) || !sameStrings(spec.inputs, branchParent.inputs) || (spec.parentTaskId && spec.parentTaskId !== branchParent.taskId) || (spec.supersedesTaskId && spec.supersedesTaskId !== branchParent.taskId)) throw new HarnessError("m07.branch", "fork candidates must retain the parent's subject, objective, inputs, outputs, checks, execute mode, and independent-check obligation");
 					if (Boolean(spec.candidate) !== Boolean(branchParent.candidate) ||
 						(spec.candidate && branchParent.candidate &&
@@ -1451,10 +1452,6 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				const verifyFrozenInputs = async (): Promise<void> => { for (const input of frozenInputBytes) if (!(await readFile(input.copy)).equals(input.bytes)) throw new HarnessError("m07.plan-input", "builder changed a frozen plan or versioned resource copy; stop this task and review the evidence"); };
 				const session = sessionSpec(ctx, `M07-${id}`, role, systemPromptFor(role), tools);
 				if (goal.methodBinding) session.methodBinding = goal.methodBinding;
-				// The task's own frozen deadline reaches the session as an observed fact
-				// in tool results, never as prompt prefix and never as a stop condition.
-				const taskDeadline = spec.executionLoop && "mode" in spec.executionLoop ? spec.executionLoop.deadlineAt : undefined;
-				if (taskDeadline) session.runDeadline = taskDeadline;
 				const runRecord = await ctx.ws.readRun("M07", runId);
 				if (branchParent?.branchSource && branchManifest) {
 					const checkpoint = branchParent.branchSource.checkpoint;
@@ -1470,10 +1467,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 				}
 				task.session = handle.ref; await save(ctx, goal);
 				if (spec.executionLoop && "mode" in spec.executionLoop && spec.executionLoop.mode === "until-ready") {
-					const loopBounds = spec.executionLoop && "mode" in spec.executionLoop ? spec.executionLoop : undefined;
 					await runUntilReadyRounds({ ctx, goal, task, spec, policy, runId, taskId: id, dir, workDir, message,
-						maxRounds: loopBounds?.maxRounds ?? (goal.searchBudget ?? DEFAULT_SEARCH_BUDGET).reviewRoundsPerTask,
-						...(loopBounds?.deadlineAt ? { deadlineAt: loopBounds.deadlineAt } : {}),
 						...(pack ? { pack } : {}), handle, operation: operation!, event,
 						...(branchParent ? { branchParent } : {}),
 						save: () => save(ctx, goal), verifyDispatchKnowledge, verifyFrozenInputs,
@@ -1491,10 +1485,14 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 					promptIssued = true;
 					let report: string;
 					let builderMessage = message;
-					const searchBudget = goal.searchBudget ?? DEFAULT_SEARCH_BUDGET;
 					// Outer loop: episode boundaries. The builder keeps its live session
 					// until the configured number of evaluations has passed, then the
 					// host distils what that session established and starts it clean.
+					// This clears context; it never ends the task or the search. The
+					// loop therefore ends when a turn adds fewer new candidates than
+					// the cadence - that is, when the builder stops evaluating - and
+					// not on any count of rounds or spend.
+					const restartEvery = ctx.config.episodeRestart?.evaluations ?? DEFAULT_EPISODE_RESTART_EVALUATIONS;
 					for (;;) {
 					for (;;) {
 						report = (await handle.prompt(builderMessage)).text;
@@ -1508,14 +1506,9 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 						builderMessage = `The preceding builder turn ended while these exact candidate evaluations remain pending or unknown: ${JSON.stringify(pending)}. Continue in THIS SAME live session. Call the indicated existing tool with its original runId and resume:true to query the original external ID; do not create a new run, resubmit, or treat submitted/confirmed as a terminal judge result. Keep the original goal and checks. A pending evaluation is not a goal stop; after terminal results are verified, report the actual evidence.`;
 					}
 					const episode = task.episode;
-					if (!episode || !searchBudget.episodeRestartEvaluations) break;
+					if (!episode || !restartEvery) break;
 					const evaluatedBefore = episode.restarts?.at(-1)?.afterCandidates ?? 0;
-					if (episode.candidates.length - evaluatedBefore < searchBudget.episodeRestartEvaluations) break;
-					const ledger = candidateBudgetLedger(candidateArchive(goal, id),
-						{ taskId: id, subjectId: task.subjectId, policy: searchBudget,
-							...(task.subjectProfile ? { category: task.subjectProfile.operatorCategory } : {}) });
-					// A spent or stalled task hands control back instead of restarting.
-					if (ledger.stop || !ledger.remaining) break;
+					if (episode.candidates.length - evaluatedBefore < restartEvery) break;
 					const episodeRecord = await distillEpisode({ runId, taskId: id,
 						episode: (episode.restarts?.length ?? 0) + 1, at: nowIso(),
 						...(task.subjectId ? { subjectId: task.subjectId } : {}),
@@ -1532,7 +1525,6 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 					const restartRun = await ctx.ws.readRun("M07", runId);
 					const restartSpec = sessionSpec(ctx, `M07-${id}-episode-${episodeRecord.episode}`, role, systemPromptFor(role), tools);
 					if (goal.methodBinding) restartSpec.methodBinding = goal.methodBinding;
-					if (taskDeadline) restartSpec.runDeadline = taskDeadline;
 					handle = await openBoundedSession(ctx.runner, restartRun, { mode: "fresh", intent: "episodic-restart",
 						reason: `M07 ${id} episode ${episodeRecord.episode} boundary: the previous context was cleared and this distilled record carries its established facts forward`,
 						evidence: [{ version: 1, label: `M07 ${id} episode record E${episodeRecord.episode}`, path: recordPath,
@@ -1554,8 +1546,6 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 					if (task.experienceSelection) task.experienceSelection.loadedAt = nowIso();
 					const reportPath = path.join(dir, "report.md"); await writeFileAtomic(reportPath, report);
 					task.reportPath = reportPath; task.status = "returned";
-					// A spent search budget is a recorded control fact, not a model claim.
-					if (task.episode?.budget?.stop) task.loopStopReason = "budget-boundary";
 				}
 			} catch (error) {
 				if (hostRecoveryAbort) await hostRecoveryAbort;

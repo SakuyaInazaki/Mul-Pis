@@ -41,8 +41,7 @@ import type { KnowledgeStore } from "../knowledge/types.ts";
 import type { CandidateDiagnosticSummaryV1 } from "./candidate-diagnostics.ts";
 import { compareCandidateObservations, projectCandidateFeedback, summarizeCandidateDiagnostics } from "./candidate-diagnostics.ts";
 import { CANDIDATE_STRATEGIES, candidateSearchState, candidateStrategyMenu, candidateStrategyStats,
-	candidateBudgetLedger, decideCandidate, DEFAULT_SEARCH_BUDGET, requireAllowedAction,
-	requireAllowedMethod, requireBudget, requireUnbannedDirection,
+	decideCandidate, requireAllowedAction, requireAllowedMethod, requireUnbannedDirection,
 	type CandidateChangeKind, type CandidateGuard, type CandidateRoute,
 	type CandidateStrategy } from "./candidate-policy.ts";
 import { isSafeRelativeOutputPath } from "./expected-output.ts";
@@ -147,12 +146,6 @@ export function createCandidateEpisodeTool(input: {
 				parentObservation.correctness === "passed" });
 		requireUnbannedDirection(priorState, action, args.newEvidence as string | undefined);
 		requireAllowedMethod(storedMethodDecision(episode), action.strategy);
-		const searchBudget = goal.searchBudget ?? DEFAULT_SEARCH_BUDGET;
-		requireBudget(candidateBudgetLedger(priorArchive, { taskId: task.taskId,
-			subjectId: task.subjectId, policy: searchBudget,
-			...(task.subjectProfile ? { category: task.subjectProfile.operatorCategory } : {}) }),
-			{ changeKind: action.changeKind, lane: action.changeKind === "repair" ||
-				priorState.phase === "bootstrap" ? "repair" : "optimization" });
 		const episodeRoot = path.join(path.dirname(task.workDir), "episode");
 		await mkdir(episodeRoot, { recursive: true });
 		let nextNumber = episode.candidates.reduce((max, candidate) =>
@@ -265,10 +258,7 @@ export function createCandidateEpisodeTool(input: {
 		const archived = searchSnapshot.available.find(entry => entry.ref === `${task.taskId}/${id}`);
 		if (archived) archived.policy = decision;
 		episode.search = candidateSearchState(searchSnapshot.available, { subjectId: currentSubjectId,
-			taskId: task.taskId, limits: searchBudget.routeLimits });
-		episode.budget = candidateBudgetLedger(searchSnapshot.available, { taskId: task.taskId,
-			subjectId: currentSubjectId, policy: searchBudget,
-			...(task.subjectProfile ? { category: task.subjectProfile.operatorCategory } : {}) });
+			taskId: task.taskId });
 		// Every round assembles its own knowledge by phase: guardrails for a
 		// rewrite, rules for a compile failure, patterns for a numerical one,
 		// tiling only while tuning. The assembly reads the goal's frozen
@@ -343,14 +333,6 @@ export function createCandidateEpisodeTool(input: {
 				counters: { stagnation: episode.search.stagnation, repairDepth: episode.search.repairDepth,
 					bannedDirections: episode.search.bannedDirections.length },
 				detail: { route: episode.search.route, signals: episode.search.signals.join(",") } }).catch(() => undefined);
-			await events.append({ runId: goal.runId, taskId: task.taskId, kind: "budget",
-				round: episode.candidates.length,
-				counters: { evaluations: episode.budget.evaluations, remaining: episode.budget.remaining,
-					repair: episode.budget.repair, optimization: episode.budget.optimization,
-					parameters: episode.budget.parameters, rejected: episode.budget.rejected,
-					...(episode.budget.categoryCap === undefined ? {} : { categoryCap: episode.budget.categoryCap }) },
-				detail: { ...(episode.budget.stop ? { stop: episode.budget.stop } : {}),
-					...(episode.budget.category ? { category: episode.budget.category } : {}) } }).catch(() => undefined);
 		}
 		const searchBrief = candidateSearchBrief(searchSnapshot.facts, searchSnapshot.available,
 			candidateSearchFocus(searchSnapshot.available, task.subjectId));
@@ -378,7 +360,7 @@ export function createCandidateEpisodeTool(input: {
 				read: { tool: "candidate_archive", args: { action: "read", candidateRef: `${task.taskId}/${id}`, kind: "observation", offset: 0, limit: 6000 } },
 				message: "Case rows retain measurements within display space and prioritize failed/unknown cases. Parent case deltas show negative/unknown cases and regressions first. Diagnostic indexes show a first entry per category before others within display space. Counts include omitted entries. JSON paths refer to the full frozen observation; diagnostic fieldPath refers to its original receipt (candidate_archive action=read kind:receipt, fileIndex:receiptIndex). Use returned nextOffset to continue file reads. A preview/index is not full reading or causal interpretation; all original facts and parent comparisons are retained." },
 			currentCandidateId: episode.currentCandidateId, incumbents: episode.incumbents,
-			search: episode.search, budget: episode.budget,
+			search: episode.search,
 			...(injection ? { injection: { phase: injection.phase, status: injection.status,
 				chars: injection.chars, refs: injection.refs.slice(0, 12), omitted: injection.omitted,
 				knowledge: injection.markdown,

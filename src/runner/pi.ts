@@ -27,7 +27,7 @@ import { TelemetryWriter } from "../telemetry.ts";
 import type { AssistantTurn, CustomToolSpec, ForkRequest, ForkWorkspaceBindingV1, ProviderRequestViolation, ReadReturnEvent, RunnerCapabilities, SessionCheckpoint, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, TranscriptMessage, TransportFailureDiagnostic, UsageEvent } from "./types.ts";
 import { summarizeUsage, usageEventsFromEntries } from "./usage.ts";
 import { compactionPolicyFromEnvironment, sessionCompactionPolicy, workflowCompactionExtension, workflowCompactionSettings } from "./compaction.ts";
-import { classifyToolFailure, classifyTransportFailure, remainingWallClockNote, runDeadlineFromEnvironment } from "./failure-class.ts";
+import { classifyToolFailure, classifyTransportFailure } from "./failure-class.ts";
 import { summarizeToolCalls } from "./tool-usage.ts";
 import { experimentArmFromEnvironment } from "./experiment-arm.ts";
 import { sampleRunnerResources, sessionClosed, sessionOpened } from "./resource.ts";
@@ -655,7 +655,6 @@ async function createExecutionTools(
 	sessionId: string,
 	isolatedToolEnvironment = false,
 	tempDir?: string,
-	runDeadline?: string,
 ): Promise<MaterialTools & { cwd: string }> {
 	const cwd = await realpath(root);
 	if (!(await lstat(cwd)).isDirectory()) throw new HarnessError("runner.tools", `execution root is not a directory: ${root}`);
@@ -725,16 +724,7 @@ async function createExecutionTools(
 					const executionArgs = name === "bash" ? bashArgsForPi(args) : args;
 					const runTool = () => receipt ? bashCall.run(receipt, () => base.execute(toolCallId, executionArgs, signal, onUpdate, { ...ctx, cwd })) :
 						base.execute(toolCallId, executionArgs, signal, onUpdate, { ...ctx, cwd });
-					let result = await runTool();
-					// The remaining wall-clock belongs in the tool result, not in the
-					// prompt prefix, where a per-turn value would void the prefix cache.
-					const budgetNote = runDeadline ? remainingWallClockNote(runDeadline, Date.now()) : undefined;
-					const appended = [budgetNote].filter((item): item is string => Boolean(item));
-					if (appended.length) {
-						const content = (result as { content?: unknown }).content;
-						result = { ...result, content: [...(Array.isArray(content) ? content : []),
-							{ type: "text", text: appended.join("\n\n") }] } as typeof result;
-					}
+					const result = await runTool();
 					const isError = (result as { isError?: boolean }).isError === true;
 					const failure = isError ? classifyToolFailure({ name,
 						...(receipt?.receipt.processExit ? { exit: { exitCode: receipt.receipt.processExit.exitCode ?? null,
@@ -1274,8 +1264,7 @@ export class PiSessionRunner implements SessionRunner {
 		} else if (spec.tools.kind === "execution") {
 			const execution = await createExecutionTools(spec.tools.root, spec.tools.tools, toolLog,
 				path.join(spec.persistDir, "host-execution-receipts", sessionManager.getSessionId()),
-				sessionManager.getSessionId(), true, spec.tools.tempDir,
-				spec.runDeadline ?? runDeadlineFromEnvironment());
+				sessionManager.getSessionId(), true, spec.tools.tempDir);
 			materialTools = execution;
 			if (spec.tools.extraTools?.length) {
 				const extra = customToolsToPi(spec.tools.extraTools, toolLog);
@@ -1335,8 +1324,8 @@ export class PiSessionRunner implements SessionRunner {
 				model: spec.model, toolGrant: spec.tools.kind,
 				compaction: compactionPolicy ? { thresholdTokens: compactionPolicy.thresholdTokens,
 					keepRecentTokens: compactionPolicy.keepRecentTokens } : null,
-				experimentArm: experimentArmFromEnvironment(),
-				runDeadline: spec.runDeadline ?? runDeadlineFromEnvironment() ?? null }, null, 2)}\n`);
+				experimentArm: experimentArmFromEnvironment() }, null, 2)}
+`);
 		const ref: SessionRef = {
 			label: spec.label,
 			role: spec.role,
