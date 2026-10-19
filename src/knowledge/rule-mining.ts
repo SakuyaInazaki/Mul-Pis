@@ -7,8 +7,9 @@ import path from "node:path";
  * The cheapest knowledge asset in the evidence is an offline failure-rule list:
  * one short imperative sentence per repeated failure, kept only when the same
  * failure occurred at least three times. It beat same-length official API
- * documentation in every model tested, and on Ascend it was the one component
- * that raised the success rate and lowered the cost at the same time.
+ * documentation in every model tested, and on a backend the models had little
+ * prior knowledge of it was the one component in its ablation that raised the
+ * success rate and lowered the cost at the same time.
  *
  * The counting must be deterministic, because the whole point is that a rule is
  * kept for having happened repeatedly, not for sounding plausible. This module

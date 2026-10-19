@@ -6,12 +6,12 @@ import test from "node:test";
 import { collectFailureObservations, extractErrorSignatures, failureRuleDrafts, mineFailureRules,
 	normalizeErrorSignature, renderFailureRuleDrafts } from "../../src/knowledge/rule-mining.ts";
 
-const compileLog = (file: string) => `building ${file}\n${file}:12:5: error: no member named 'Softmax' in namespace 'AscendC'\n1 error generated.\n`;
+const compileLog = (file: string) => `building ${file}\n${file}:12:5: error: no member named 'Scale' in namespace 'BackendA'\n1 error generated.\n`;
 
 test("signatures drop file locations, addresses and long numbers but keep the symbol", () => {
-	const signature = normalizeErrorSignature("kernel.cpp:12:5: error: no member named 'Softmax' in namespace 'AscendC' at 0x7ffee1a2");
-	assert.equal(signature, "error: no member named 'Softmax' in namespace 'AscendC' at 0x…");
-	assert.deepEqual(extractErrorSignatures(compileLog("a.cpp")), ["error: no member named 'Softmax' in namespace 'AscendC'"]);
+	const signature = normalizeErrorSignature("kernel.cpp:12:5: error: no member named 'Scale' in namespace 'BackendA' at 0x7ffee1a2");
+	assert.equal(signature, "error: no member named 'Scale' in namespace 'BackendA' at 0x…");
+	assert.deepEqual(extractErrorSignatures(compileLog("a.cpp")), ["error: no member named 'Scale' in namespace 'BackendA'"]);
 	// A line with no failure marker is not a signature, and a very short one is dropped.
 	assert.deepEqual(extractErrorSignatures("compiled successfully\nerror: x"), []);
 });

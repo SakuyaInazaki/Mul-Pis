@@ -10,7 +10,7 @@
  * automatic write-back: this library is the stable part of the knowledge, the
  * store holds what the project learned afterwards. Every entry must declare the
  * backend and toolchain it holds for and cite a local source, because a
- * constraint copied from the wrong chip or the wrong CANN version fails
+ * constraint copied from another device or another toolchain version fails
  * silently and is the hardest failure to diagnose.
  */
 import { readFile, readdir } from "node:fs/promises";

@@ -12,22 +12,22 @@ import { Workspace } from "../src/workspace.ts";
 
 const contractCard = {
 	version: 1, kind: "contract", operatorCategory: "normalization", canonicalFamily: "layernorm",
-	bottleneck: "compile_failure", applicability: { backend: "ascend-c", toolchain: "CANN-8.0" },
+	bottleneck: "compile_failure", applicability: { backend: "backend-a", toolchain: "toolchain-1.2" },
 	provenance: { kind: "external-source", detail: "S001 第 3 节" },
-	api: "AscendC::Add", signature: "void Add(LocalTensor<T>&, const LocalTensor<T>&, int32_t)",
-	constraints: [{ name: "ub_bytes", unit: "bytes", limit: 196352, comparison: "at_most", source: "S001" }],
+	api: "BackendA::Add", signature: "void Add(Tensor&, const Tensor&, int32_t)",
+	constraints: [{ name: "buffer_bytes", unit: "bytes", limit: 196352, comparison: "at_most", source: "S001" }],
 	source: "S001",
 };
 
 const block = (value: unknown): string => "```knowledge-card\n" + JSON.stringify(value, null, 2) + "\n```";
 
 test("source extraction keeps validated cards, rejects unanchored ones and records the depth", () => {
-	const text = ["适用性：支持", "## 阅读深度", "深度：L2", "升级理由：需与本项目 msprof 结果对照才能判断搬运占比",
+	const text = ["适用性：支持", "## 阅读深度", "深度：L2", "升级理由：需与本项目的实测 profile 结果对照才能判断搬运占比",
 		"## 可执行化产出", block(contractCard),
 		block({ ...contractCard, source: "https://example.invalid/doc" })].join("\n\n");
 	const extraction = extractSourceKnowledge(text);
 	assert.equal(extraction.depth, "L2");
-	assert.match(extraction.depthReason ?? "", /msprof/);
+	assert.match(extraction.depthReason ?? "", /实测 profile/);
 	assert.equal(extraction.conclusion, "actionable");
 	assert.equal(extraction.cards.filter((item) => item.card).length, 1);
 	assert.match(extraction.cards.find((item) => !item.card)!.issues.join(";"), /本地出处/);
