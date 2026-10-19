@@ -41,6 +41,36 @@ class MeasurementWorkerFailure(WorkerFailure):
         self.role = role
 
 
+class WorkerDeadline(WorkerFailure):
+    """The host stopped a worker at its deadline.
+
+    This says nothing about the candidate: an honest worker on a loaded machine
+    and a hung one both end here. Recording it as a candidate failure would make
+    the agent rewrite correct code against machine noise, so a deadline is kept
+    apart from every judgement and the role that hit it is carried along.
+    """
+
+    def __init__(self, role, message):
+        super().__init__(message)
+        self.role = role
+
+
+# Per-role deadlines, bound from the contract before any worker starts. A task
+# that knows one of its own baselines can hang gives that role a tighter
+# deadline instead of shortening everything, which is what turns honest work
+# under load into a false timeout.
+ROLE_TIMEOUTS = {}
+
+
+def bind_role_timeouts(spec):
+    global ROLE_TIMEOUTS
+    ROLE_TIMEOUTS = dict(spec.get("workerTimeoutSecondsByRole") or {})
+
+
+def role_deadline(role, fallback):
+    return ROLE_TIMEOUTS.get(role, fallback)
+
+
 TIMING_EXECUTION = "interleaved-persistent-v2"
 # Frozen measurement protocol floors. These are host code, not task
 # configuration: a contract may be stricter but never looser.
@@ -610,6 +640,20 @@ def validate(contract):
         raise ValueError("task must explicitly choose a positive workerTimeoutSeconds for each execution")
     if type(spec.get("workerOutputBytes")) is not int or spec["workerOutputBytes"] < 1:
         raise ValueError("task must explicitly choose a positive workerOutputBytes for each worker output")
+    by_role = spec.get("workerTimeoutSecondsByRole")
+    if by_role is not None:
+        roles = {"reference", "golden", "candidate", "noop", "instrumented", "compile", "goal"} | \
+            {"baseline:" + name for name in contract.baselines}
+        if not isinstance(by_role, dict) or any(role not in roles for role in by_role):
+            raise ValueError(f"SPEC.workerTimeoutSecondsByRole may only name actual worker roles: {sorted(roles)}")
+        for role, value in by_role.items():
+            # Tighter only: a role may be stopped sooner than the task-wide
+            # deadline, never later. A longer one would hide a hang behind the
+            # role that is most likely to be hung.
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0 or \
+                    value > spec["workerTimeoutSeconds"]:
+                raise ValueError(f"workerTimeoutSecondsByRole.{role} must be positive and at most "
+                                 f"the task-wide workerTimeoutSeconds")
     tolerance = spec.get("tolerance", {})
     mode = tolerance.get("mode")
     if mode not in ("fixed", "reference-repeat", "reference-error"):
@@ -960,6 +1004,7 @@ def worker(contract_path, source_path, role, request):
 def run_worker(contract_path, source_path, role, case, *, timeout, output_bytes, repeats=1, measure=False):
     if not WORKER_OPTIONS:
         raise ValueError("worker write isolation was not bound by the host")
+    timeout = role_deadline(role, timeout)
     scratch = tempfile.mkdtemp(prefix=role.replace(":", "-") + "-", dir=WORKER_OPTIONS["scratchRoot"])
     command = WORKER_OPTIONS["commandPrefix"] + [sys.executable, "-I", str(pathlib.Path(__file__).resolve()), "--worker", contract_path, source_path, role]
     log_dir = pathlib.Path(tempfile.mkdtemp(prefix=role.replace(":", "-") + "-", dir=WORKER_OPTIONS["logsRoot"]))
@@ -1052,7 +1097,7 @@ def run_worker(contract_path, source_path, role, case, *, timeout, output_bytes,
             log.close()
         signal.signal(signal.SIGTERM, previous)
     if timed_out:
-        raise WorkerFailure(f"{role} worker timed out after task-declared {timeout}s; original process group killed; original stdout/stderr retained at {log_dir}")
+        raise WorkerDeadline(role, f"{role} worker timed out after task-declared {timeout}s; original process group killed; original stdout/stderr retained at {log_dir}")
     if exceeded:
         raise WorkerFailure(f"{role} worker exceeded task-declared {output_bytes} output bytes; process group killed; raw output retained at {log_dir}")
     if dangling:
@@ -1152,6 +1197,9 @@ def measure_workers(contract_path, source_path, case, contract, *, timeout, outp
                 os.set_blocking(stream.fileno(), False)
                 selector.register(stream, selectors.EVENT_READ, (role, name))
 
+        def deadline_for(name):
+            return role_deadline(name, timeout)
+
         def transact(role, request):
             session = sessions[role]
             child = session["child"]
@@ -1160,10 +1208,12 @@ def measure_workers(contract_path, source_path, case, contract, *, timeout, outp
             sent = 0
             os.set_blocking(child.stdin.fileno(), False)
             selector.register(child.stdin, selectors.EVENT_WRITE, (role, "stdin"))
-            deadline = time.monotonic() + timeout
+            deadline = time.monotonic() + deadline_for(role)
             while True:
                 if time.monotonic() >= deadline:
-                    raise MeasurementWorkerFailure(role, f"{role} measured worker timed out after task-declared {timeout}s; raw streams: {session['logs']}")
+                    # Same separation as the one-shot path: a deadline is the
+                    # host stopping a worker, not a verdict on the candidate.
+                    raise WorkerDeadline(role, f"{role} measured worker timed out after its deadline of {deadline_for(role)}s; raw streams: {session['logs']}")
                 if child.poll() is not None and not session["buffer"].endswith(b"\n"):
                     raise MeasurementWorkerFailure(role, f"{role} measured worker exited ({child.returncode}); raw streams: {session['logs']}")
                 for key, _ in selector.select(min(0.05, max(0, deadline - time.monotonic()))):
@@ -1257,7 +1307,7 @@ def measure_workers(contract_path, source_path, case, contract, *, timeout, outp
                           "measurementError": sessions[role].get("measurementError")}
                    for role in roles}, "order": order_log}
     except Exception as error:
-        if isinstance(error, MeasurementWorkerFailure):
+        if isinstance(error, (MeasurementWorkerFailure, WorkerDeadline)):
             raise
         raise MeasurementWorkerFailure(active_role, str(error)) from error
     finally:
@@ -1606,6 +1656,7 @@ def task_audit(contract_path, contract):
     and a reference that disagrees with its own higher-precision golden is not
     adjudicable. These are properties of the problem, so they are checked once."""
     spec = contract.SPEC
+    bind_role_timeouts(spec)
     policy = decision_policy(spec)
     timeout, output_bytes = spec["workerTimeoutSeconds"], spec["workerOutputBytes"]
     rows = []
@@ -1661,6 +1712,7 @@ def task_audit(contract_path, contract):
 
 def correctness(contract_path, source_path, contract, measure=False, cases=None):
     spec = contract.SPEC
+    bind_role_timeouts(spec)
     policy = decision_policy(spec)
     timeout = spec["workerTimeoutSeconds"]
     output_bytes = spec["workerOutputBytes"]
@@ -1670,17 +1722,26 @@ def correctness(contract_path, source_path, contract, measure=False, cases=None)
             row = measure_case(contract_path, source_path, contract, case, timeout=timeout, output_bytes=output_bytes, policy=policy) \
                 if measure else check_case(contract_path, source_path, contract, case, timeout=timeout, output_bytes=output_bytes, policy=policy)
         except Exception as error:
+            deadline = isinstance(error, WorkerDeadline)
             row = {"caseId": case["id"], "scope": case["scope"], "axes": case["axes"], "passed": False,
                    "error": str(error),
-                   "failureRole": error.role if isinstance(error, MeasurementWorkerFailure) else
+                   "failureRole": f"timeout:{error.role}" if deadline else
+                                  error.role if isinstance(error, MeasurementWorkerFailure) else
                                   ("measurement" if measure else "candidate")}
+            if deadline:
+                # The host stopped a worker at its deadline. An honest worker on
+                # a loaded machine ends here too, so this case decides nothing
+                # rather than being charged to the candidate.
+                row["inconclusive"] = True
+                row["noopComplete"] = False
             if measure:
                 row["measurementValid"] = False
                 row["baselineValid"] = False
                 row["performanceDecidable"] = False
-                if isinstance(error, MeasurementWorkerFailure) and error.role.startswith("baseline:"):
-                    # A failed named baseline is unavailable performance evidence,
-                    # not a candidate error; the passed predecessor correctness
+                if deadline or (isinstance(error, MeasurementWorkerFailure) and error.role.startswith("baseline:")):
+                    # A failed named baseline, or any worker the host stopped at
+                    # its deadline, is unavailable performance evidence rather
+                    # than a candidate error; the passed predecessor correctness
                     # stage is rechecked by the host journal verifier.
                     row["passed"] = True
                     row["correctnessFromPreviousStage"] = True
@@ -1880,6 +1941,7 @@ def main():
         request = json.loads(pathlib.Path(sys.argv[4]).read_text())
         contract = load(contract_path, "trusted_operator_contract")
         spec = validate(contract)
+        bind_role_timeouts(spec)
         if not callable(getattr(contract, "verify_goal", None)):
             raise ValueError("host contract has no verify_goal; goal verification is unconfigured")
         result = run_worker(contract_path, "", "goal", request, timeout=spec["workerTimeoutSeconds"],
