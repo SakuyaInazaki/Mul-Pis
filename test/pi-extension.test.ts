@@ -8,7 +8,6 @@ import { createResearchExtension } from "../src/pi/extension.ts";
 import { ResearchService } from "../src/pi/service.ts";
 import { FakeSessionRunner } from "../src/runner/fake.ts";
 import type { CurrentGoal } from "../src/m07/types.ts";
-import { openSearchEventLog } from "../src/m07/search-state/index.ts";
 
 function captureExtension(service: ResearchService, improvementServiceFactory?: (workspaceRoot: string) => any, researchImprovementServiceFactory?: (workspaceRoot: string) => any, continuation?: { workspace: string; goalRunId?: string }): { tools: Map<string, ToolDefinition>; commands: Map<string, { handler: (args: string, ctx: any) => Promise<void> }>; handlers: Map<string, Array<(event: any, ctx: any) => unknown>>; activeTools: () => string[] } {
 	const tools = new Map<string, ToolDefinition>();
@@ -332,7 +331,7 @@ test("one improvement tool routes both tracks and refuses a cross-track action",
 		/require track=method/);
 });
 
-test("research_status can list earlier runs' best candidates and never reuses another platform's number", async t => {
+test("research_status can list earlier runs' best candidates as starting points", async t => {
 	const workspace = await mkdtemp(path.join(tmpdir(), "pre-rsi-prior-runs-"));
 	t.after(async () => { await rm(workspace, { recursive: true, force: true }); });
 	const runDir = path.join(workspace, "stages", "M07", "20261017T090000Z-aaaa");
@@ -348,22 +347,17 @@ test("research_status can list earlier runs' best candidates and never reuses an
 			episode: { version: 1, incumbents: [], candidates: [{ id: "C001", intent: "solution",
 				sourcePaths: ["kernel.cpp"], receiptPaths: ["receipt.json"], observation,
 				observationPath: "/frozen/observation.json" }] } }] }));
-	const log = openSearchEventLog(path.join(runDir, "search-events.jsonl"), { writer: "historic" });
-	await log.append({ runId: "20261017T090000Z-aaaa", kind: "task-started", taskId: "T001",
-		platform: { id: "device-a", chip: "Device A", toolchain: "Toolchain 8.3" } });
-
 	const service = { status: async () => ({ workspace, stages: {} }) } as unknown as ResearchService;
 	const registered = captureExtension(service);
 	const status = registered.tools.get("research_status")!;
 	const plain = JSON.parse(((await status.execute("s1", {}, undefined, undefined, toolContext(workspace))) as { content: Array<{ text: string }> }).content[0].text);
 	assert.equal(plain.priorRuns, undefined);
-	const matched = JSON.parse(((await status.execute("s2", { priorRuns: { subjectId: "gemm", chip: "Device A", toolchain: "Toolchain 8.3" } },
+	const matched = JSON.parse(((await status.execute("s2", { priorRuns: { subjectId: "gemm" } },
 		undefined, undefined, toolContext(workspace))) as { content: Array<{ text: string }> }).content[0].text);
-	assert.deepEqual(matched.priorRuns.leads.map((lead: { candidateRef: string; comparable: boolean }) => [lead.candidateRef, lead.comparable]),
-		[["T001/C001", true]]);
+	assert.deepEqual(matched.priorRuns.leads.map((lead: { candidateRef: string }) => lead.candidateRef), ["T001/C001"]);
 	assert.match(matched.priorRuns.summary[0], /latency=4ms/);
-	const other = JSON.parse(((await status.execute("s3", { priorRuns: { chip: "Device B", toolchain: "Toolchain 9.0" } },
+	assert.match(matched.priorRuns.summary[0], /re-measure under the current conditions before quoting it/);
+	const other = JSON.parse(((await status.execute("s3", { priorRuns: { subjectId: "softmax" } },
 		undefined, undefined, toolContext(workspace))) as { content: Array<{ text: string }> }).content[0].text);
 	assert.deepEqual(other.priorRuns.leads, []);
-	assert.equal(other.priorRuns.incomparableDropped, 1);
 });

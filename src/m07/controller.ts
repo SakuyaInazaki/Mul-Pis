@@ -35,7 +35,6 @@ import { openSearchEventLog } from "./search-state/index.ts";
 import { createCandidateEpisodeTool } from "./candidate-episode.ts";
 import { createCandidateExecutionTools, pendingCandidateExecutions, type CandidateExecutionBackend } from "./candidate-runner.ts";
 import { candidateArchive, candidateSubjectId, createCandidateArchiveTools } from "./candidate-archive.ts";
-import { loadPlatformProfile } from "../platform/profile.ts";
 import { DEFAULT_HISTORY_DEPTH, layoutPrompt, type PromptLayoutReceiptV1, type PromptSectionKind, type PromptSectionV1 } from "./prompt-layout.ts";
 import { createExecutionKnowledgeTools } from "./execution-knowledge.ts";
 import { INJECTION_PLANS } from "../knowledge/injection.ts";
@@ -687,25 +686,6 @@ function uniqueName(index: number, source: string): string {
 	return `${String(index + 1).padStart(3, "0")}-${path.basename(source).replace(/[^a-zA-Z0-9._-]/g, "_")}`;
 }
 
-/** The host's own platform facts, when a profile is configured. Chip,
- * toolchain, capacities and timing protocol are static for a run, so they
- * belong in the stable part of the prompt rather than in each round's text. */
-async function platformSection(): Promise<PromptSectionV1 | undefined> {
-	const file = process.env.PRE_RSI_PLATFORM_PROFILE;
-	if (!file) return undefined;
-	try {
-		const profile = await loadPlatformProfile(file);
-		const capacities = Object.entries(profile.capacities).slice(0, 12)
-			.map(([name, value]) => `- ${name}: ${value.value}${value.unit ? ` ${value.unit}` : ""}`).join("\n");
-		return { key: "platform", kind: "hardware",
-			text: section("目标硬件与工具链", [`档案 ${profile.id}；芯片 ${profile.chip}；工具链 ${profile.toolchain}`,
-				capacities ? `容量上限：\n${capacities}` : "",
-				profile.timing ? `计时协议 ${profile.timing.protocolVersion}：warmup ${profile.timing.warmup}、repeats ${profile.timing.repeats}、最小运行 ${profile.timing.minRuntimeMs}ms` : "",
-				"以上是宿主档案登记的事实，不是性能保证；任何加速比都必须标注基线类别与硬件型号。",
-			].filter(Boolean).join("\n")) };
-	} catch { return undefined; }
-}
-
 /** One bounded line per earlier candidate on this work object: what was tried,
  * where, and what the host ruled. This is the prompt's history section, and it
  * is the only history the next round carries. */
@@ -792,12 +772,9 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string,
 	// finally this round's dynamic material. The order is fixed so two rounds
 	// that differ only in feedback share a byte-identical prefix.
 	const historySections = recentCandidateHistory(goal, task.subjectId);
-	const hardware = await platformSection();
 	const layout = layoutPrompt([
-		...(hardware ? [hardware] : []),
 		...boundary.map((text, index) => ({ key: `boundary-${index}`,
-			kind: (text.startsWith("【本任务局部知识包】") ? "knowledge" :
-				text.startsWith("【目标硬件与工具链】") ? "hardware" : "instruction") as PromptSectionKind, text })),
+			kind: (text.startsWith("【本任务局部知识包】") ? "knowledge" : "instruction") as PromptSectionKind, text })),
 		...historySections,
 	], { historyDepth: ctx.config.promptLayout?.historyDepth ?? DEFAULT_HISTORY_DEPTH });
 	const orderedBoundary = layout.text ? layout.text.split("\n\n") : [];
@@ -1543,8 +1520,7 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 						episode: (episode.restarts?.length ?? 0) + 1, at: nowIso(),
 						...(task.subjectId ? { subjectId: task.subjectId } : {}),
 						history: candidateArchive(goal, id),
-						compactionLog: path.join(ctx.ws.sessionsDir, `${handle.ref.id}.compaction.jsonl`),
-						platformLog: path.join(ctx.ws.sessionsDir, `${handle.ref.id}.platform.jsonl`) });
+						compactionLog: path.join(ctx.ws.sessionsDir, `${handle.ref.id}.compaction.jsonl`) });
 					const recordPath = await writeEpisodeRecord(ctx.ws.root, episodeRecord);
 					carriedCoverage.push(...handle.readCoverage());
 					task.toolLog.push(...handle.toolLog());

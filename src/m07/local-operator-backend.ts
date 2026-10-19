@@ -14,11 +14,6 @@ import type { CandidateExecutionBackend, CandidateExecutionContext,
 import type { CandidateVerifier, FrozenCandidateFile } from "./candidate-evaluation.ts";
 import type { CandidateCaseObservationV1, CandidateDiagnosticV1, CandidateMetricV1 } from "./types.ts";
 import { captureNcuProfile, exportNcuReportCsv, parseNcuRawCsv } from "./candidate-performance.ts";
-import { loadPlatformProfile, type PlatformProfileV1 } from "../platform/profile.ts";
-import { diagnosePlatformOutput } from "../platform/diagnostics.ts";
-import { acquireDeviceLease } from "../platform/device-lease.ts";
-import { derivePlatformTaskBinding, describePlatformTaskBinding,
-	type PlatformTaskBindingV1 } from "./platform-task-contract.ts";
 import { EvaluationCache, evaluationCacheKey, type EvaluationCacheKeyParts } from "./evaluation-cache.ts";
 import { checkCandidate, type StaticCheckReport } from "../knowledge/static-checks.ts";
 import { validateOptimizationCard, type OptimizationCard } from "../knowledge/optimization-card.ts";
@@ -46,14 +41,6 @@ export interface LocalOperatorBackendOptions {
 	workerEnvironment?: Record<string, string>;
 	/** Optional real NCU capture, additional to unprofiled timing. Never chosen by candidate config. */
 	profiling?: { caseId: string; launchId?: string; timeoutMs: number };
-	/** Host-probed platform profile. When present it, not the task contract,
-	 * fixes the timing protocol, the dtype tolerance and the case table; the
-	 * contract may only agree with it. */
-	platformProfilePath?: string;
-	/** Which declared dtype the derived tolerance comes from. */
-	platformDtype?: string;
-	/** Cases the candidate may iterate on; the rest of the table certifies. */
-	platformPublicCases?: number;
 	/** Frozen published knowledge cards. Their API signatures and hard numeric
 	 * constraints become a pre-compile gate rather than a tool the session may
 	 * remember to call. */
@@ -112,8 +99,6 @@ interface LocalReceipt {
 	timingProtocol?: { repeats: number; warmup: number; minimumSampleSeconds: number };
 	timingExecution?: string;
 	measurementEnvironment?: { environmentId: string; clockPolicy: string; precision: string; cacheState: "cold" | "warm" };
-	platformBinding?: { profileId: string; chip: string; toolchain: string; protocolVersion: string;
-		latencySource: string; metricSource: string; unalignedFraction: number };
 	baselineTiers?: Record<string, string>;
 	hiddenVariants?: string[];
 	passed: boolean;
@@ -211,7 +196,6 @@ export interface LocalOperatorEvaluationProfileV1 {
 	apiGate: { rejected: number; checked: number; suggested: number; nearestSignatureRate: number | null };
 	cache?: { hits: number; misses: number; storedEntries: number; entriesOnDisk: number;
 		executedMsByStage: Record<string, number>; replacedMsByStage: Record<string, number> };
-	platform?: { profileId: string; protocolVersion: string };
 }
 
 /** Returns the host bindings plus the audit and certification entry points; no
@@ -246,16 +230,6 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 	const contractSource = await readFile(contractPath, "utf8");
 	const contractDigest = createHash("sha256").update(Buffer.from(contractSource, "utf8")).digest("hex");
 	const assertContract = async () => { if (await readFile(contractPath, "utf8") !== contractSource) throw new Error("host operator contract changed; bind a new version before executing"); };
-	// The platform profile, when the host supplies one, is the measurement
-	// contract: the binding below is what the evaluator enforces, and the task
-	// contract is only allowed to agree with it.
-	const platformProfile = options.platformProfilePath === undefined ? undefined :
-		await loadPlatformProfile(options.platformProfilePath);
-	if (platformProfile && !options.platformDtype)
-		throw new Error("a bound platform profile needs an explicit platformDtype for its tolerance");
-	const platformBinding = platformProfile ?
-		derivePlatformTaskBinding(platformProfile, { dtype: options.platformDtype!,
-			...(options.platformPublicCases === undefined ? {} : { publicCases: options.platformPublicCases }) }) : undefined;
 	// A published card's API signatures and hard numeric budgets are a local,
 	// zero-device rejection. Frozen once here, they cannot drift mid-run, and
 	// they are a gate rather than a tool the session may remember to call.
@@ -268,12 +242,7 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 	const capabilityScratch = await mkdtemp(path.join(tmpdir(), "local-operator-capability-"));
 	const capabilityOutput = await (async () => {
 		try {
-			// The binding reaches validation even here: a contract that declares a
-			// platform tolerance cannot be loaded without the profile behind it.
-			if (platformBinding) await writeFile(path.join(capabilityScratch, "worker-options.json"),
-				JSON.stringify({ platformBinding }), { flag: "wx" });
-			return await runHostCommand(python, ["-I", script, "--goal-capability", contractPath,
-				...(platformBinding ? [path.join(capabilityScratch, "worker-options.json")] : [])],
+			return await runHostCommand(python, ["-I", script, "--goal-capability", contractPath],
 			{ timeout: 30_000, maxBuffer: 1_000_000,
 				env: { ...workerEnvironment, HOME: capabilityScratch, TMPDIR: capabilityScratch } }); }
 		finally { await rm(capabilityScratch, { recursive: true, force: true }); }
@@ -293,9 +262,7 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 	// A measured number is only comparable within the environment that produced
 	// it, so the declared environment identity is part of every basis.
 	const environmentId = goalCapability.measurementEnvironment.environmentId;
-	// A latency only compares with another latency taken under the same
-	// protocol version, so that version is part of the basis itself.
-	const protocolScope = platformBinding ? `${options.protocolId}@${platformBinding.protocolVersion}` : options.protocolId;
+	const protocolScope = options.protocolId;
 	const basisFor = (scope: string, kind = "case") => JSON.stringify([options.id, options.version, protocolScope, subjectId, kind, scope, environmentId]);
 	if (basisFor("x".repeat(80), "profile").length > 256)
 		throw new Error("local host measurement identity including subjectId and declared environment must fit the 256-character basis contract with an 80-character case id; choose concise host identity fields");
@@ -329,7 +296,7 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 					return writeGateRejection(ctx, receiptIdentity, report);
 				}
 			}
-			// An identical candidate, contract, platform and protocol has already
+			// An identical candidate, contract and protocol has already
 			// been evaluated: replay that receipt rather than spend the device
 			// again. The entry is marked, so no statistic counts it twice.
 			const cacheParts = cache ? await cacheKeyFor(ctx) : undefined;
@@ -388,22 +355,12 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 			if (!commandPrefix) throw new Error("local operator workers require an available write isolation mechanism; no unsandboxed fallback");
 			const workerOptions = path.join(ctx.outputDir, `worker-options-${path.basename(scratchRoot)}.json`);
 			await writeFile(workerOptions, JSON.stringify({ scratchRoot, logsRoot, commandPrefix, compiledBuildDir,
-				workerEnvironment, platformBinding }), { flag: "wx" });
+				workerEnvironment }), { flag: "wx" });
 			const command = { argv: [python, "-I", script, contractPath, workerOptions] as [string, ...string[]],
 				cwd: ctx.outputDir, env: { ...workerEnvironment, HOME: scratchRoot, TMPDIR: scratchRoot } };
 			const adapter = createCandidateCommandBackend({ id: options.id, version: options.version,
 				stages: stages.map(id => ({ id, mode: "local", checks: [id], execute: command })) });
-			// Only the timing stage needs a quiet machine. Holding the device for
-			// import, compilation and correctness as well would serialize the
-			// expensive part of the run for no gain in measurement fidelity.
-			const lease = ctx.stage.id === "measurement" && platformProfile?.deviceSerialization ?
-				await acquireDeviceLease({ file: path.resolve(ctx.workDir, platformProfile.deviceSerialization.leaseFile),
-					platformId: platformProfile.id, purpose: `measurement ${ctx.runId}`,
-					timeoutMs: platformProfile.deviceSerialization.timeoutMs }) : undefined;
-			const result = await (async () => {
-				try { return await adapter.executeStage(ctx); }
-				finally { if (lease) await lease.release(); }
-			})();
+			const result = await adapter.executeStage(ctx);
 			cache?.recordExecution(ctx.stage.id, Date.now() - startedAtMs);
 			const retainLogs = async (directory: string): Promise<void> => {
 				for (const entry of await readdir(directory, { withFileTypes: true })) {
@@ -493,9 +450,7 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 			subjectId, stageId: ctx.stage.id,
 			sourceDigest: await normalizedSourceDigest(ctx.sources[0].frozenPath),
 			contractDigest,
-			platformKey: platformBinding ? `${platformBinding.chip}/${platformBinding.toolchain}` : "unbound",
-			protocolVersion: platformBinding?.protocolVersion ?? "unversioned",
-			caseSetId: platformBinding ? platformBinding.cases.map(item => item.id).join(",") : "contract" };
+			caseSetId: "contract" };
 	}
 
 	/** A gate rejection is a real stage result with its own frozen receipt, so
@@ -643,9 +598,6 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 					: "Task-contract Python evaluation; finite numeric JSON outputs. Compile means Python bytecode validation only; no native compiler was bound.",
 					"Timing is synchronized by the task function. Measurement rounds use serial alternating independent persistent workers and named task baselines; host/device isolation, clocks and suitability of task cases are not inferred from a passing result.",
 					"No-op sensitivity and replaced-API call counts establish that the declared kernel is reached and that the library entry points it replaces were not called; they do not prove what share of device time runs inside it."];
-				if (platformBinding) limitations.push(...describePlatformTaskBinding(platformBinding).map(item => item.slice(0, 1800)));
-				if (receipt.platformBinding && receipt.platformBinding.protocolVersion !== platformBinding?.protocolVersion)
-					return unknown("receipt was produced under a different platform measurement protocol version");
 				if (environment) limitations.push(`Numbers hold only for declared environment ${environment.environmentId} (clocks: ${environment.clockPolicy}; cache state: ${environment.cacheState}; precision policy: ${environment.precision}); they cannot be quoted for another machine, toolchain or precision policy.`.slice(0, 1800));
 				if (receipt.baselineTiers) limitations.push(`Baseline denominators by declared tier: ${Object.entries(receipt.baselineTiers).map(([name, tier]) => `${name}=${tier}`).join(", ")}. A ratio against one tier does not transfer to another.`.slice(0, 1800));
 				if (receipt.hiddenVariants?.length) limitations.push(`Correctness was judged on the declared values and the host value-only variants ${receipt.hiddenVariants.join(", ")}; variants the reference or a known-correct baseline could not evaluate were dropped rather than charged to the candidate.`.slice(0, 1800));
@@ -653,17 +605,6 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 				if (receipt.measurementNotComparable?.length) limitations.push(`No performance comparison: ${receipt.measurementNotComparable.join("; ")}.`.slice(0, 1800));
 				if (receipt.cases?.some(row => row.performanceDecidable === false))
 					limitations.push(`Cases excluded from performance selection: ${receipt.cases.filter(row => row.performanceDecidable === false).map(row => `${row.caseId}${row.performanceUndecidableReason ? ` (${row.performanceUndecidableReason})` : ""}`).join("; ")}.`.slice(0, 1800));
-				if (platformProfile && diagnostics.length) {
-					// Cold-start failures are not one bucket: the published split is
-					// three quarters syntax-level, a fifth hardware-level and a few
-					// percent numeric, and each routes somewhere different.
-					const diagnosis = diagnosePlatformOutput(platformProfile, diagnostics.map(item => item.rawText).join("\n"));
-					const counts = new Map<string, number>();
-					for (const item of diagnosis.classes) counts.set(item.class, (counts.get(item.class) ?? 0) + 1);
-					if (counts.size) limitations.push(`Platform failure classes: ${[...counts].map(([name, value]) => `${name}=${value}`).join(", ")}.`.slice(0, 1800));
-					for (const hint of diagnosis.symbolHints)
-						limitations.push(`Rejected symbol ${hint.used}; nearest legal signatures: ${hint.nearest.join(", ") || "none in the probed surface"}.`.slice(0, 1800));
-				}
 				if (receipt.api?.unresolvedCalls?.length) limitations.push("Some API calls lack a task-selected mechanically resolvable signature; inspect the raw API diagnostic.");
 				if (receipt.nativeCompilation && !receipt.nativeCompilation.passed) diagnostics.push({ category: "compile", fieldPath: "nativeCompilation", rawText: JSON.stringify(receipt.nativeCompilation) });
 				if (receipt.parameterValidation?.valid === false) diagnostics.push({ category: "unknown", fieldPath: "parameterValidation",
@@ -787,7 +728,7 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 			if (!commandPrefix) throw new Error("local operator goal verification requires the bound worker write isolation");
 			const workerOptions = path.join(root, "worker-options.json"), request = path.join(root, "request.json");
 			await writeFile(workerOptions, JSON.stringify({ scratchRoot, logsRoot, commandPrefix,
-				workerEnvironment, platformBinding }), { flag: "wx" });
+				workerEnvironment }), { flag: "wx" });
 			await writeFile(request, JSON.stringify({ criteria: goal.successCriteria, observations }), { flag: "wx" });
 			const output = await runHostCommand(python, ["-I", script, "--verify-goal", contractPath, workerOptions, request],
 				{ cwd: root, timeout: Math.min(2_147_483_647, Math.ceil(goalTimeoutSeconds * 1000) + 10_000),
@@ -818,7 +759,7 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 				profile ? ["/usr/bin/sandbox-exec", "-p", profile] : undefined;
 			if (!commandPrefix) throw new Error(`${label} requires the bound worker write isolation`);
 			const workerOptions = path.join(root, "worker-options.json");
-			await writeFile(workerOptions, JSON.stringify({ scratchRoot, logsRoot, commandPrefix, workerEnvironment, platformBinding }), { flag: "wx" });
+			await writeFile(workerOptions, JSON.stringify({ scratchRoot, logsRoot, commandPrefix, workerEnvironment }), { flag: "wx" });
 			const output = await runHostCommand(python, ["-I", script, prefix, contractPath, workerOptions, ...extra],
 				{ cwd: root, timeout: Math.min(2_147_483_647, Math.ceil(goalTimeoutSeconds * 1000) + 600_000),
 					maxBuffer: goalOutputBytes + 1_000_000,
@@ -855,8 +796,7 @@ export async function createLocalOperatorBackend(options: LocalOperatorBackendOp
 		return { version: 1, kind: "local-operator-evaluation-profile",
 			apiGate: { ...gateCounters, nearestSignatureRate: gateCounters.rejected ? gateCounters.suggested / gateCounters.rejected : null },
 			cache: cache ? { ...cache.stats, entriesOnDisk: await cache.size() } : undefined,
-			platform: platformBinding ? { profileId: platformBinding.profileId,
-				protocolVersion: platformBinding.protocolVersion } : undefined };
+		};
 	}
 	return { backend, verifier, auditChecks, certifyCandidate, evaluationProfile };
 }

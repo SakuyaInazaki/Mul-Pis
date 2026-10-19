@@ -4,12 +4,12 @@
  * Nearly all of the wall clock in this workflow is the evaluator, not the
  * model: import and compilation dominate, correctness is next, and the timing
  * loop itself is the smallest part. Re-running a candidate the host has already
- * evaluated, byte for byte, on the same platform and protocol, buys nothing.
+ * evaluated, byte for byte, under the same contract and protocol, buys nothing.
  *
  * The key is the whole reason this is safe. It covers the normalized source,
- * the contract, the case set, the platform chip and toolchain and the protocol
- * version, so a replayed receipt cannot describe a different machine, a
- * different case table or a different measurement protocol. A replayed stage is
+ * the backend and its version, the protocol, the subject, the stage, the
+ * contract digest and the case set, so a replayed receipt cannot describe a
+ * different contract, case table or stage. A replayed stage is
  * marked as such: it is evidence that this code was evaluated, never a second
  * independent measurement to average in.
  */
@@ -28,10 +28,6 @@ export interface EvaluationCacheKeyParts {
 	/** Digest of the candidate after the contract's own AST normalization. */
 	sourceDigest: string;
 	contractDigest: string;
-	/** Chip and toolchain, so a receipt from another machine cannot be reused. */
-	platformKey: string;
-	/** Measurement protocol version, so a receipt from another protocol cannot. */
-	protocolVersion: string;
 	caseSetId: string;
 }
 
@@ -75,7 +71,7 @@ function storable(name: string): boolean {
 export function evaluationCacheKey(parts: EvaluationCacheKeyParts): string {
 	return createHash("sha256").update(JSON.stringify([
 		parts.backendId, parts.backendVersion, parts.protocolId, parts.subjectId, parts.stageId,
-		parts.sourceDigest, parts.contractDigest, parts.platformKey, parts.protocolVersion, parts.caseSetId,
+		parts.sourceDigest, parts.contractDigest, parts.caseSetId,
 	])).digest("hex");
 }
 

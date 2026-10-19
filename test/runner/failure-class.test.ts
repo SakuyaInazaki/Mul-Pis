@@ -10,15 +10,8 @@ test("a command that ran and failed is the candidate's result; a broken environm
 		{ class: "infrastructure", reason: "tool-timeout", retryable: true });
 	assert.deepEqual(classifyToolFailure({ name: "bash", errorCode: "ECONNRESET" }),
 		{ class: "infrastructure", reason: "ECONNRESET", retryable: true });
-	assert.deepEqual(classifyToolFailure({ name: "bash", errorCode: "platform.device-lease" }),
-		{ class: "infrastructure", reason: "platform.device-lease", retryable: true });
-	assert.deepEqual(classifyToolFailure({ name: "write", errorCode: "runner.platform-contract" }),
-		{ class: "policy", reason: "platform-contract-violation", retryable: false });
-	// The platform profile's own reading of the output decides before anything else.
-	assert.deepEqual(classifyToolFailure({ name: "bash", exit: { exitCode: 1, abortSource: null }, platformClass: "infrastructure" }),
-		{ class: "infrastructure", reason: "platform-reported-environment-fault", retryable: true });
-	assert.deepEqual(classifyToolFailure({ name: "bash", exit: { exitCode: 1, abortSource: null }, platformClass: "syntax" }),
-		{ class: "policy", reason: "candidate-syntax", retryable: false });
+	assert.deepEqual(classifyToolFailure({ name: "bash", errorCode: "runner.sandbox" }),
+		{ class: "infrastructure", reason: "runner.sandbox", retryable: true });
 });
 
 test("anything the closed list does not cover stays unjudged and is never retried", () => {

@@ -52,8 +52,6 @@ export interface SearchEventV1 {
 	candidate?: SearchCandidateFactsV1;
 	verdict?: { decision: "accept" | "keep" | "reject" | "revert"; reason?: string };
 	counters?: Record<string, number>;
-	/** A measurement is only comparable within one chip and toolchain. */
-	platform?: { id: string; chip: string; toolchain: string };
 	detail?: Record<string, string | number | boolean>;
 }
 
@@ -158,8 +156,6 @@ export function openSearchEventLog(file: string, options: SearchEventLogOptions 
 					...(input.verdict ? { verdict: { decision: input.verdict.decision,
 						...(short(input.verdict.reason, 400) ? { reason: short(input.verdict.reason, 400)! } : {}) } } : {}),
 					...(counters(input.counters) ? { counters: counters(input.counters)! } : {}),
-					...(input.platform ? { platform: { id: short(input.platform.id, 96) ?? "unknown",
-						chip: short(input.platform.chip, 128) ?? "unknown", toolchain: short(input.platform.toolchain, 128) ?? "unknown" } } : {}),
 					...(boundedDetail(input.detail) ? { detail: boundedDetail(input.detail)! } : {}),
 				};
 				let line = `${JSON.stringify(event)}\n`;

@@ -8,8 +8,7 @@ import { EvaluationCache, evaluationCacheKey,
 
 const parts: EvaluationCacheKeyParts = { backendId: "local-test", backendVersion: "1",
 	protocolId: "numeric-tree-test-v1", subjectId: "numeric-tree", stageId: "measurement",
-	sourceDigest: "a".repeat(64), contractDigest: "b".repeat(64), platformKey: "device-a/cann-8",
-	protocolVersion: "device-a-timing-1", caseSetId: "c1,c2" };
+	sourceDigest: "a".repeat(64), contractDigest: "b".repeat(64), caseSetId: "c1,c2" };
 
 async function workspace(t: { after(fn: () => Promise<void>): void }): Promise<string> {
 	const root = await mkdtemp(path.join(tmpdir(), "evaluation-cache-"));

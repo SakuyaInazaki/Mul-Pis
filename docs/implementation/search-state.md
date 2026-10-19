@@ -26,15 +26,14 @@ Event kinds: `task-started`, `task-finished`, `candidate-submitted`, `candidate-
   table: `pathRef` points at the durable journal or observation, so the log stays small and the evidence stays
   where it was written.
 - `verdict` — the host's deterministic decision (`accept` / `keep` / `reject` / `revert`).
-- `platform` — chip and toolchain, because a measurement only means something on the machine that produced it.
 
 Reading is tolerant by contract: a crash-truncated final line, or a line of a foreign shape, is counted in
 `skipped` and never guessed at.
 
 ## The state
 
-`rebuildSearchState(runId, events)` folds the ordered events into candidates, tasks, counters, rounds, stalls
-and the platforms seen. It is pure, so the same log always produces the same state: a console can redraw the
+`rebuildSearchState(runId, events)` folds the ordered events into candidates, tasks, counters, rounds and
+stalls. It is pure, so the same log always produces the same state: a console can redraw the
 whole tree, a restarted process can continue from the log alone, and an audit can be repeated without the
 writer being present. Events belonging to another run in the same file are ignored rather than merged.
 
@@ -44,16 +43,16 @@ unknown, not average — and candidates the host marked buggy are excluded unles
 
 ## Warm start across runs
 
-`collectWarmStartLeads({ m07Dir, subjectId, platform, … })` scans recent run directories, reads each
+`collectWarmStartLeads({ m07Dir, subjectId, … })` scans recent run directories, reads each
 `goal.json`, and uses the existing archive functions to find the best verified candidate per work object and
 metric. It returns leads: the candidate reference, the metric that made it best, and the exact paths to its
 frozen observation, sources and work directory.
 
-Three rules keep a lead from becoming a false result:
+Two rules keep a lead from becoming a false result:
 
-- A lead from another chip or toolchain, or from a run that never recorded its platform, is marked
-  `comparable: false` and dropped unless `includeIncomparable` is set. `describeWarmStartLeads` spells this
-  out in the text the model reads.
+- Every lead says, in the text the model reads, that it is an earlier run's number and must be re-measured
+  under the current conditions before it is quoted. The machine, the inputs and the baseline may all have
+  moved since.
 - The scan is bounded (25 runs, 8 leads by default) and ordered newest-first, so a warm start cannot become a
   new source of latency.
 - An unreadable or foreign run directory is counted in `skippedRuns`, never fatal.

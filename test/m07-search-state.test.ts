@@ -55,8 +55,7 @@ test("the state is a function of the events, including the candidate tree", asyn
 	const log = openSearchEventLog(file, { writer: "alpha" });
 	await log.append({ runId: "R1", kind: "task-started", taskId: "T001", round: 1 });
 	await log.append({ runId: "R1", kind: "candidate-submitted", taskId: "T001", round: 1,
-		candidate: { id: "C001", subjectId: "gemm", pathRef: "runs/C001/journal.json" },
-		platform: { id: "device-a", chip: "Device A", toolchain: "Toolchain 8.3" } });
+		candidate: { id: "C001", subjectId: "gemm", pathRef: "runs/C001/journal.json" } });
 	await log.append({ runId: "R1", kind: "candidate-stage", taskId: "T001", round: 1,
 		candidate: { id: "C001", stage: "compile", status: "passed" } });
 	await log.append({ runId: "R1", kind: "candidate-evaluated", taskId: "T001", round: 1,
@@ -79,7 +78,6 @@ test("the state is a function of the events, including the candidate tree", asyn
 	assert.equal(state.rounds, 3);
 	assert.equal(state.stalls, 1);
 	assert.deepEqual(state.counters, { candidates: 2, infrastructureFailures: 0 });
-	assert.deepEqual(state.platforms, [{ id: "device-a", chip: "Device A", toolchain: "Toolchain 8.3" }]);
 	const first = searchCandidate(state, "C001");
 	assert.equal(first?.score, 0.6);
 	assert.equal(first?.verdict?.decision, "keep");

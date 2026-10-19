@@ -28,9 +28,7 @@ const INFRASTRUCTURE_ERROR_CODES = new Set([
 	"ENOSPC", "EMFILE", "ENFILE", "EAGAIN", "EBUSY",
 ]);
 
-const INFRASTRUCTURE_HARNESS_CODES = new Set([
-	"runner.device-lease", "platform.device-lease", "runner.sandbox", "runner.sandbox-path",
-]);
+const INFRASTRUCTURE_HARNESS_CODES = new Set(["runner.sandbox", "runner.sandbox-path"]);
 
 const INFRASTRUCTURE_PROVIDER_CODES = new Set(["rate_limit_exceeded", "server_error"]);
 
@@ -42,20 +40,13 @@ export interface ToolFailureInput {
 	errorClass?: "harness" | "filesystem" | "tool-error";
 	/** Managed process outcome when the host owned the child. */
 	exit?: { exitCode: number | null; abortSource?: "signal" | "timeout" | null };
-	/** Failure class decided by the platform profile from the tool's own output. */
-	platformClass?: "syntax" | "hardware" | "numeric" | "infrastructure";
 }
 
 export function classifyToolFailure(input: ToolFailureInput): FailureJudgementV1 {
-	if (input.platformClass === "infrastructure")
-		return { class: "infrastructure", reason: "platform-reported-environment-fault", retryable: true };
-	if (input.platformClass) return { class: "policy", reason: `candidate-${input.platformClass}`, retryable: false };
 	if (input.exit?.abortSource === "timeout") return { class: "infrastructure", reason: "tool-timeout", retryable: true };
 	if (input.exit?.abortSource === "signal") return { class: "unjudged", reason: "tool-killed", retryable: false };
 	if (input.errorCode && INFRASTRUCTURE_HARNESS_CODES.has(input.errorCode))
 		return { class: "infrastructure", reason: input.errorCode, retryable: true };
-	if (input.errorCode === "runner.platform-contract")
-		return { class: "policy", reason: "platform-contract-violation", retryable: false };
 	if (input.errorCode && INFRASTRUCTURE_ERROR_CODES.has(input.errorCode))
 		return { class: "infrastructure", reason: input.errorCode, retryable: true };
 	// A command that ran and returned a non-zero status is the candidate's own

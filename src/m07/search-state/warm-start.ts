@@ -8,16 +8,14 @@
  * metric that made it best, and the exact paths to its frozen evidence — never
  * a claim that the old result still holds.
  *
- * A measurement only means something on the chip and toolchain that produced
- * it, so a lead from a different platform is reported as not comparable rather
- * than silently reused, and a lead from a run that never recorded its platform
- * is reported as unknown.
+ * An earlier run's number is a starting point, not a current result: the
+ * machine, the inputs and the baseline may all have moved since, so every lead
+ * says so and the caller re-measures before quoting anything.
  */
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { candidateArchive, globalCandidateBest } from "../candidate-archive.ts";
 import type { CandidateMetricV1, CurrentGoal } from "../types.ts";
-import { readSearchEvents } from "./events.ts";
 
 export interface WarmStartLeadV1 {
 	runId: string;
@@ -31,9 +29,6 @@ export interface WarmStartLeadV1 {
 	/** Task work directory the candidate was produced in. */
 	workDir: string;
 	sourcePaths: string[];
-	platform?: { id: string; chip: string; toolchain: string };
-	/** False when the platform differs from the requested one or was never recorded. */
-	comparable: boolean;
 }
 
 export interface WarmStartQueryV1 {
@@ -42,10 +37,6 @@ export interface WarmStartQueryV1 {
 	/** The run being planned now; its own history is not a prior run. */
 	excludeRunId?: string;
 	subjectId?: string;
-	/** Current target platform; leads from another chip or toolchain are marked incomparable. */
-	platform?: { chip: string; toolchain: string };
-	/** Report leads that are not comparable instead of dropping them. */
-	includeIncomparable?: boolean;
 	limit?: number;
 	maxRuns?: number;
 }
@@ -55,8 +46,6 @@ export interface WarmStartResultV1 {
 	scannedRuns: number;
 	/** Runs whose goal file was absent, unreadable or of a foreign shape. */
 	skippedRuns: number;
-	/** Leads dropped because they came from another platform or an unrecorded one. */
-	incomparableDropped: number;
 }
 
 const DEFAULT_LIMIT = 8;
@@ -75,12 +64,6 @@ async function readGoal(file: string): Promise<CurrentGoal | undefined> {
 	return goal as CurrentGoal;
 }
 
-async function runPlatform(runDir: string): Promise<{ id: string; chip: string; toolchain: string } | undefined> {
-	const { events } = await readSearchEvents(path.join(runDir, "search-events.jsonl"));
-	for (let index = events.length - 1; index >= 0; index--) if (events[index].platform) return events[index].platform;
-	return undefined;
-}
-
 /**
  * Scan recent runs for their best verified candidates. Newest runs first, with
  * an explicit bound: a warm start that walks an unbounded history is a new
@@ -91,12 +74,11 @@ export async function collectWarmStartLeads(query: WarmStartQueryV1): Promise<Wa
 	const maxRuns = Math.max(1, query.maxRuns ?? DEFAULT_MAX_RUNS);
 	let names: string[];
 	try { names = (await readdir(query.m07Dir, { withFileTypes: true })).filter(entry => entry.isDirectory()).map(entry => entry.name); }
-	catch { return { leads: [], scannedRuns: 0, skippedRuns: 0, incomparableDropped: 0 }; }
+	catch { return { leads: [], scannedRuns: 0, skippedRuns: 0 }; }
 	const runIds = names.filter(name => name !== query.excludeRunId).sort().reverse().slice(0, maxRuns);
 	const leads: WarmStartLeadV1[] = [];
 	let scannedRuns = 0;
 	let skippedRuns = 0;
-	let incomparableDropped = 0;
 	for (const runId of runIds) {
 		const runDir = path.join(query.m07Dir, runId);
 		const goal = await readGoal(path.join(runDir, "goal.json"));
@@ -106,36 +88,29 @@ export async function collectWarmStartLeads(query: WarmStartQueryV1): Promise<Wa
 		try { entries = candidateArchive(goal); }
 		catch { skippedRuns++; continue; }
 		if (!entries.length) continue;
-		const platform = await runPlatform(runDir);
-		const comparable = Boolean(platform && query.platform &&
-			platform.chip === query.platform.chip && platform.toolchain === query.platform.toolchain) ||
-			(!query.platform && platform !== undefined);
 		const byRef = new Map(entries.map(entry => [entry.ref, entry]));
 		for (const best of globalCandidateBest(entries)) {
 			const entry = byRef.get(best.candidateRef);
 			if (!entry) continue;
 			if (query.subjectId && entry.subjectId !== query.subjectId) continue;
-			if (!comparable && !query.includeIncomparable) { incomparableDropped++; continue; }
 			leads.push({
 				runId: goal.runId, taskId: entry.taskId, candidateRef: entry.ref,
 				...(entry.subjectId ? { subjectId: entry.subjectId } : {}),
 				metric: best.metric, correctness: entry.observation.correctness,
 				observationPath: entry.observationPath, workDir: entry.workDir,
 				sourcePaths: [...entry.sourcePaths],
-				...(platform ? { platform } : {}), comparable,
 			});
-			if (leads.length >= limit) return { leads, scannedRuns, skippedRuns, incomparableDropped };
+			if (leads.length >= limit) return { leads, scannedRuns, skippedRuns };
 		}
 	}
-	return { leads, scannedRuns, skippedRuns, incomparableDropped };
+	return { leads, scannedRuns, skippedRuns };
 }
 
-/** One line per lead, including why it may not be reusable. */
+/** One line per lead, with the caveat that makes it a starting point. */
 export function describeWarmStartLeads(result: WarmStartResultV1): string[] {
 	return result.leads.map(lead =>
 		`${lead.candidateRef} from run ${lead.runId} task ${lead.taskId}` +
 		`${lead.subjectId ? ` subject ${lead.subjectId}` : ""}: ${lead.metric.name}=${lead.metric.value}${lead.metric.unit}` +
 		` (${lead.metric.direction} is better, basis ${lead.metric.basisId}, correctness ${lead.correctness})` +
-		`${lead.platform ? ` on ${lead.platform.chip}/${lead.platform.toolchain}` : " with no recorded platform"}` +
-		`${lead.comparable ? "" : " — NOT comparable to the current platform; re-measure before using the number"}`);
+		" — an earlier run's number; re-measure under the current conditions before quoting it");
 }

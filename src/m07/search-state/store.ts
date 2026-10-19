@@ -44,7 +44,6 @@ export interface SearchStateV1 {
 	stalls: number;
 	backgroundQueued: number;
 	backgroundSettled: number;
-	platforms: Array<{ id: string; chip: string; toolchain: string }>;
 	events: number;
 }
 
@@ -69,16 +68,14 @@ function applyCandidate(target: SearchCandidateNodeV1, facts: SearchCandidateFac
 export function rebuildSearchState(runId: string, events: readonly SearchEventV1[]): SearchStateV1 {
 	const candidates = new Map<string, SearchCandidateNodeV1>();
 	const tasks = new Map<string, SearchTaskNodeV1>();
-	const platforms = new Map<string, { id: string; chip: string; toolchain: string }>();
 	const counters: Record<string, number> = {};
 	const state: SearchStateV1 = { runId, candidates: [], tasks: [], counters, rounds: 0, stalls: 0,
-		backgroundQueued: 0, backgroundSettled: 0, platforms: [], events: 0 };
+		backgroundQueued: 0, backgroundSettled: 0, events: 0 };
 	for (const event of events) {
 		if (event.runId !== runId) continue;
 		state.events++;
 		if (event.round !== undefined && event.round > state.rounds) state.rounds = event.round;
 		if (event.counters) for (const [key, value] of Object.entries(event.counters)) counters[key] = value;
-		if (event.platform) platforms.set(`${event.platform.id}\0${event.platform.chip}\0${event.platform.toolchain}`, event.platform);
 		if (event.kind === "stall") state.stalls++;
 		if (event.kind === "background-queued") state.backgroundQueued++;
 		if (event.kind === "background-settled") state.backgroundSettled++;
@@ -101,7 +98,6 @@ export function rebuildSearchState(runId: string, events: readonly SearchEventV1
 	}
 	state.candidates = [...candidates.values()];
 	state.tasks = [...tasks.values()];
-	state.platforms = [...platforms.values()];
 	return state;
 }
 
@@ -159,7 +155,6 @@ export function searchStateSummary(state: SearchStateV1): {
 	runId: string; rounds: number; stalls: number; events: number;
 	candidates: number; buggy: number; scored: number; tasks: number;
 	background: { queued: number; settled: number; outstanding: number };
-	platforms: Array<{ id: string; chip: string; toolchain: string }>;
 	counters: Record<string, number>;
 } {
 	return {
@@ -170,6 +165,6 @@ export function searchStateSummary(state: SearchStateV1): {
 		tasks: state.tasks.length,
 		background: { queued: state.backgroundQueued, settled: state.backgroundSettled,
 			outstanding: Math.max(0, state.backgroundQueued - state.backgroundSettled) },
-		platforms: state.platforms, counters: state.counters,
+		counters: state.counters,
 	};
 }

@@ -11,11 +11,11 @@
  * numbers a later history-depth scan needs; this module does not choose a
  * depth, it only applies and records the configured one. */
 
-export type PromptSectionKind = "instruction" | "hardware" | "knowledge" | "history" | "dynamic";
+export type PromptSectionKind = "instruction" | "knowledge" | "history" | "dynamic";
 
 /** Fixed order. Static first, dynamic last; never reordered by content. */
 export const PROMPT_SECTION_ORDER: readonly PromptSectionKind[] =
-	["instruction", "hardware", "knowledge", "history", "dynamic"];
+	["instruction", "knowledge", "history", "dynamic"];
 
 export interface PromptSectionV1 {
 	key: string;

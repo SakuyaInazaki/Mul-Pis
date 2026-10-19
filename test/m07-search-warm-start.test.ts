@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
-import { collectWarmStartLeads, describeWarmStartLeads, openSearchEventLog } from "../src/m07/search-state/index.ts";
+import { collectWarmStartLeads, describeWarmStartLeads } from "../src/m07/search-state/index.ts";
 
 function candidate(id: string, latency: number, subjectId: string): Record<string, unknown> {
 	return {
@@ -20,8 +20,7 @@ function candidate(id: string, latency: number, subjectId: string): Record<strin
 	};
 }
 
-async function priorRun(m07Dir: string, runId: string, options: { subjectId: string; latencies: number[];
-	platform?: { id: string; chip: string; toolchain: string } }): Promise<void> {
+async function priorRun(m07Dir: string, runId: string, options: { subjectId: string; latencies: number[] }): Promise<void> {
 	const runDir = path.join(m07Dir, runId);
 	await mkdir(runDir, { recursive: true });
 	const goal = { version: 1, runId, status: "finished", tasks: [{
@@ -31,10 +30,6 @@ async function priorRun(m07Dir: string, runId: string, options: { subjectId: str
 			candidates: options.latencies.map((latency, index) => candidate(`C00${index + 1}`, latency, options.subjectId)) },
 	}] };
 	await writeFile(path.join(runDir, "goal.json"), `${JSON.stringify(goal, null, 2)}\n`);
-	if (options.platform) {
-		const log = openSearchEventLog(path.join(runDir, "search-events.jsonl"), { writer: "historic" });
-		await log.append({ runId, kind: "task-started", taskId: "T001", platform: options.platform });
-	}
 }
 
 async function workspace(t: TestContext): Promise<string> {
@@ -45,14 +40,11 @@ async function workspace(t: TestContext): Promise<string> {
 	return m07Dir;
 }
 
-const DEVICE_A = { id: "device-a", chip: "Device A rev 2", toolchain: "Toolchain 8.3" };
-
 test("a new run finds the best verified candidate of earlier runs with its evidence paths", async t => {
 	const m07Dir = await workspace(t);
-	await priorRun(m07Dir, "20261017T090000Z-aaaa", { subjectId: "gemm", latencies: [9, 4], platform: DEVICE_A });
-	await priorRun(m07Dir, "20261018T090000Z-bbbb", { subjectId: "softmax", latencies: [7], platform: DEVICE_A });
-	const result = await collectWarmStartLeads({ m07Dir, excludeRunId: "20261018T120000Z-current",
-		platform: { chip: DEVICE_A.chip, toolchain: DEVICE_A.toolchain } });
+	await priorRun(m07Dir, "20261017T090000Z-aaaa", { subjectId: "gemm", latencies: [9, 4] });
+	await priorRun(m07Dir, "20261018T090000Z-bbbb", { subjectId: "softmax", latencies: [7] });
+	const result = await collectWarmStartLeads({ m07Dir, excludeRunId: "20261018T120000Z-current" });
 	assert.equal(result.scannedRuns, 2);
 	assert.equal(result.skippedRuns, 0);
 	// Newest run first, and only the best candidate per subject and metric.
@@ -62,47 +54,37 @@ test("a new run finds the best verified candidate of earlier runs with its evide
 	]);
 	assert.equal(result.leads[1].observationPath, "/frozen/observation.json");
 	assert.deepEqual(result.leads[1].sourcePaths, ["kernel.cpp"]);
-	assert.equal(result.leads[1].comparable, true);
-	assert.match(describeWarmStartLeads(result)[1], /T001\/C002 from run 20261017T090000Z-aaaa task T001 subject gemm: latency=4ms \(lower is better, basis basis:gemm, correctness passed\)/);
+	assert.match(describeWarmStartLeads(result)[1], /T001\/C002 from run 20261017T090000Z-aaaa task T001 subject gemm: latency=4ms \(lower is better, basis basis:gemm, correctness passed\) — an earlier run's number; re-measure under the current conditions before quoting it/);
 
-	const onlyGemm = await collectWarmStartLeads({ m07Dir, subjectId: "gemm",
-		platform: { chip: DEVICE_A.chip, toolchain: DEVICE_A.toolchain } });
+	const onlyGemm = await collectWarmStartLeads({ m07Dir, subjectId: "gemm" });
 	assert.deepEqual(onlyGemm.leads.map(lead => lead.candidateRef), ["T001/C002"]);
-	const bounded = await collectWarmStartLeads({ m07Dir, limit: 1,
-		platform: { chip: DEVICE_A.chip, toolchain: DEVICE_A.toolchain } });
+	const bounded = await collectWarmStartLeads({ m07Dir, limit: 1 });
 	assert.equal(bounded.leads.length, 1);
 	// The run being planned is not its own prior run.
-	assert.equal((await collectWarmStartLeads({ m07Dir, excludeRunId: "20261018T090000Z-bbbb",
-		platform: { chip: DEVICE_A.chip, toolchain: DEVICE_A.toolchain } })).leads.every(lead => lead.runId !== "20261018T090000Z-bbbb"), true);
+	assert.equal((await collectWarmStartLeads({ m07Dir, excludeRunId: "20261018T090000Z-bbbb" })).leads.every(lead => lead.runId !== "20261018T090000Z-bbbb"), true);
 });
 
-test("a measurement from another platform is never quietly reused", async t => {
+test("an earlier run's number is offered as a starting point, never as a current result", async t => {
 	const m07Dir = await workspace(t);
-	await priorRun(m07Dir, "20261017T090000Z-aaaa", { subjectId: "gemm", latencies: [4],
-		platform: { id: "device-b", chip: "Device B", toolchain: "Toolchain 9.0" } });
-	await priorRun(m07Dir, "20261016T090000Z-cccc", { subjectId: "gemm", latencies: [3] });
-	const strict = await collectWarmStartLeads({ m07Dir, platform: { chip: DEVICE_A.chip, toolchain: DEVICE_A.toolchain } });
-	assert.deepEqual(strict.leads, []);
-	assert.equal(strict.incomparableDropped, 2);
-	const shown = await collectWarmStartLeads({ m07Dir, includeIncomparable: true,
-		platform: { chip: DEVICE_A.chip, toolchain: DEVICE_A.toolchain } });
-	assert.deepEqual(shown.leads.map(lead => [lead.runId, lead.comparable]), [
-		["20261017T090000Z-aaaa", false], ["20261016T090000Z-cccc", false]]);
-	const described = describeWarmStartLeads(shown);
-	assert.match(described[0], /on Device B\/Toolchain 9\.0 — NOT comparable/);
-	assert.match(described[1], /with no recorded platform — NOT comparable/);
+	await priorRun(m07Dir, "20261017T090000Z-aaaa", { subjectId: "gemm", latencies: [4] });
+	const result = await collectWarmStartLeads({ m07Dir });
+	assert.deepEqual(result.leads.map(lead => lead.candidateRef), ["T001/C002".replace("C002", "C001")]);
+	// The lead carries the evidence paths and the caveat; it never carries a claim
+	// that the old measurement still holds.
+	assert.equal(result.leads[0].observationPath, "/frozen/observation.json");
+	assert.match(describeWarmStartLeads(result)[0], /re-measure under the current conditions before quoting it/);
 });
 
 test("unreadable or foreign run directories are counted, not fatal", async t => {
 	const m07Dir = await workspace(t);
-	await priorRun(m07Dir, "20261017T090000Z-aaaa", { subjectId: "gemm", latencies: [4], platform: DEVICE_A });
+	await priorRun(m07Dir, "20261017T090000Z-aaaa", { subjectId: "gemm", latencies: [4] });
 	await mkdir(path.join(m07Dir, "20261017T100000Z-dddd"), { recursive: true });
 	await writeFile(path.join(m07Dir, "20261017T100000Z-dddd", "goal.json"), "{ broken");
 	await mkdir(path.join(m07Dir, "20261017T110000Z-eeee"), { recursive: true });
-	const result = await collectWarmStartLeads({ m07Dir, platform: { chip: DEVICE_A.chip, toolchain: DEVICE_A.toolchain } });
+	const result = await collectWarmStartLeads({ m07Dir });
 	assert.equal(result.scannedRuns, 1);
 	assert.equal(result.skippedRuns, 2);
 	assert.equal(result.leads.length, 1);
 	assert.deepEqual(await collectWarmStartLeads({ m07Dir: path.join(m07Dir, "absent") }),
-		{ leads: [], scannedRuns: 0, skippedRuns: 0, incomparableDropped: 0 });
+		{ leads: [], scannedRuns: 0, skippedRuns: 0 });
 });
