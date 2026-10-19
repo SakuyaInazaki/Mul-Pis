@@ -472,10 +472,10 @@ test("an incomplete dependency cycle does not block original reading or hide roo
 test("the contract check rejects an unknown API and an over-budget tile before any compile", async t => {
 	const contract = {
 		version: 1, kind: "contract", operatorCategory: "normalization", canonicalFamily: "layernorm",
-		bottleneck: "compile_failure", applicability: { backend: "ascend-c", toolchain: "CANN-8.0" },
+		bottleneck: "compile_failure", applicability: { backend: "backend-a", toolchain: "toolchain-1.2" },
 		provenance: { kind: "external-source", detail: "S007 头文件" },
-		api: "AscendC::Add", signature: "void Add(LocalTensor<T>&, const LocalTensor<T>&, int32_t)",
-		constraints: [{ name: "ub_bytes", unit: "bytes", limit: 196352, comparison: "at_most", source: "S007" }],
+		api: "BackendA::Add", signature: "void Add(Tensor&, const Tensor&, int32_t)",
+		constraints: [{ name: "buffer_bytes", unit: "bytes", limit: 196352, comparison: "at_most", source: "S007" }],
 		source: "S007",
 	};
 	const foreign = { ...contract, applicability: { backend: "cuda", toolchain: "12.4" }, api: "cuda::Mul",
@@ -486,14 +486,14 @@ test("the contract check rejects an unknown API and an over-budget tile before a
 	]);
 	const work = path.join(f.root, "work");
 	await mkdir(work, { recursive: true });
-	await writeFile(path.join(work, "kernel.cpp"), "AscendC::Add(dst, src, n);\nAscendC::Softmax(dst, src);\n");
-	const tools = f.makeTools({ candidateRoot: work, context: { backend: "ascend-c", toolchain: "CANN-8.0" } });
+	await writeFile(path.join(work, "kernel.cpp"), "BackendA::Add(dst, src, n);\nBackendA::Scale(dst, src);\n");
+	const tools = f.makeTools({ candidateRoot: work, context: { backend: "backend-a", toolchain: "toolchain-1.2" } });
 	const rejected = await tools.knowledge_contract_check.execute({ path: "kernel.cpp",
-		observationsJson: JSON.stringify([{ name: "ub_bytes", value: 262144 }]) });
+		observationsJson: JSON.stringify([{ name: "buffer_bytes", value: 262144 }]) });
 	assert.match(rejected.text, /结论：reject/);
-	assert.match(rejected.text, /AscendC::Softmax/);
+	assert.match(rejected.text, /BackendA::Scale/);
 	assert.match(rejected.text, /最接近的合法签名 void Add/);
-	assert.match(rejected.text, /ub_bytes=262144bytes/);
+	assert.match(rejected.text, /buffer_bytes=262144bytes/);
 	// The other backend's contract card is never used to judge this candidate.
 	assert.doesNotMatch(rejected.text, /cuda::Mul/);
 	const event = f.events.at(-1)!;
@@ -505,8 +505,8 @@ test("the contract check rejects an unknown API and an over-budget tile before a
 	assert.equal(frozen.safety.status, "reject");
 	assert.equal(frozen.safety.findings, 2);
 
-	const passing = await tools.knowledge_contract_check.execute({ source: "AscendC::Add(a, b, c);",
-		observationsJson: JSON.stringify([{ name: "ub_bytes", value: 1024 }]) });
+	const passing = await tools.knowledge_contract_check.execute({ source: "BackendA::Add(a, b, c);",
+		observationsJson: JSON.stringify([{ name: "buffer_bytes", value: 1024 }]) });
 	assert.match(passing.text, /结论：pass/);
 	await assert.rejects(tools.knowledge_contract_check.execute({ path: "../escape.cpp" }), /work directory/);
 	await assert.rejects(tools.knowledge_contract_check.execute({}), /exactly one/);

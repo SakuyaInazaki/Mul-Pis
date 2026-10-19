@@ -39,7 +39,7 @@ export interface StaticCheckReport {
 	uncoveredSymbols: string[];
 }
 
-/** Qualified call sites: `AscendC::Softmax(...)`, `tl.argmax(...)`, `ub.alloc(...)`. */
+/** Qualified call sites: `Ns::Symbol(...)`, `mod.symbol(...)`, `buf.alloc(...)`. */
 const CALL_PATTERN = /\b([A-Za-z_][A-Za-z0-9_]*)(?:::|\.)([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^;{}()]*>)?\s*\(/gu;
 
 export function collectApiContracts(cards: ReadonlyArray<{ card: OptimizationCard }>): ApiContract[] {

@@ -17,7 +17,7 @@ const measurement = (speedup: number, extra: Record<string, unknown> = {}) => ({
 
 const caseCard = (extra: Record<string, unknown> = {}): Record<string, unknown> => ({
 	version: 1, kind: "case", operatorCategory: "normalization", canonicalFamily: "layernorm",
-	bottleneck: "memory_bound", applicability: { backend: "ascend-c", toolchain: "CANN-8.0", dtype: "float16", structure: ["2d-rowwise"] },
+	bottleneck: "memory_bound", applicability: { backend: "backend-a", toolchain: "toolchain-1.2", dtype: "float16", structure: ["2d-rowwise"] },
 	provenance: { kind: "harness-run", detail: "M07/20261018T000000Z-a1/T001" },
 	method: "memory_coalescing",
 	diff: { summary: "把两次标量搬运合并成一次连续搬运", before: "copy(a); copy(b);", after: "copy_contiguous(a,b);" },
@@ -26,7 +26,7 @@ const caseCard = (extra: Record<string, unknown> = {}): Record<string, unknown> 
 	profileEvidence: [{ metric: "aiv_mte2_ratio", value: 0.81 }],
 	reusableWhen: "同一 dtype 且尾块可整除时",
 	avoidWhen: "尾块需要掩码时不可直接套用，会越界",
-	constraints: [{ name: "ub_bytes", unit: "bytes", limit: 196352, comparison: "at_most", source: "S003" }],
+	constraints: [{ name: "buffer_bytes", unit: "bytes", limit: 196352, comparison: "at_most", source: "S003" }],
 	measurement: measurement(1.4), ...extra,
 });
 
@@ -50,20 +50,20 @@ test("a case card must carry a diff, hard constraints, an avoid condition and a 
 	// A misspelled field never passes silently as unknown metadata.
 	assert.match(validateOptimizationCard(caseCard({ avoid_when: "x" })).issues.join(";"), /不接受的字段/);
 	// Hardware numbers need a local citation, not a URL or an absolute path.
-	assert.match(validateOptimizationCard(caseCard({ constraints: [{ name: "ub_bytes", unit: "bytes", limit: 1, comparison: "at_most", source: "https://example.invalid/doc" }] })).issues.join(";"), /本地出处/);
+	assert.match(validateOptimizationCard(caseCard({ constraints: [{ name: "buffer_bytes", unit: "bytes", limit: 1, comparison: "at_most", source: "https://example.invalid/doc" }] })).issues.join(";"), /本地出处/);
 	assert.match(validateOptimizationCard({ ...caseCard(), applicability: { dtype: "float16" } }).issues.join(";"), /backend/);
 });
 
 test("avoid, rule, contract and when cards each need their own anchor", () => {
 	const base = { version: 1, operatorCategory: "normalization", canonicalFamily: "layernorm", bottleneck: "memory_bound",
-		applicability: { backend: "ascend-c", toolchain: "CANN-8.0" }, provenance: { kind: "harness-run", detail: "M07/run" } };
-	valid({ ...base, kind: "avoid", excludedDirection: "fusion", profileReason: "融合后 UB 超限，MTE2 反而上升",
-		stopCondition: "若 UB 预算提高到 256KB 可重试", attempts: 4, successes: 0 });
+		applicability: { backend: "backend-a", toolchain: "toolchain-1.2" }, provenance: { kind: "harness-run", detail: "M07/run" } };
+	valid({ ...base, kind: "avoid", excludedDirection: "fusion", profileReason: "融合后 缓冲超限，MTE2 反而上升",
+		stopCondition: "若 缓冲预算提高一倍后可重试", attempts: 4, successes: 0 });
 	assert.match(validateOptimizationCard({ ...base, kind: "avoid", excludedDirection: "fusion",
 		profileReason: "直觉", stopCondition: "无", attempts: 1, successes: 0 }).issues.join(";"), /实测退化|3 次/);
-	valid({ ...base, kind: "rule", errorSignature: "no member named 'Softmax'", ruleText: "You cannot call AscendC::Softmax; it does not exist in this CANN version",
+	valid({ ...base, kind: "rule", errorSignature: "no member named 'Scale'", ruleText: "You cannot call BackendA::Scale; it does not exist in this toolchain version",
 		frequency: 4, evidence: ["stages/M07/run/compile.log"] });
-	valid({ ...base, kind: "contract", api: "AscendC::Add", signature: "void Add(LocalTensor<T>&, const LocalTensor<T>&, const LocalTensor<T>&, int32_t)",
+	valid({ ...base, kind: "contract", api: "BackendA::Add", signature: "void Add(Tensor&, const Tensor&, const Tensor&, int32_t)",
 		constraints: [], source: "S007" });
 	assert.match(validateOptimizationCard({ ...base, kind: "contract", constraints: [], source: "S007" }).issues.join(";"), /api\+signature|硬约束/);
 	valid({ ...base, kind: "when", allowedMethods: ["tiling", "double_buffer"],
@@ -109,7 +109,7 @@ test("admission deduplicates by direction and bounds a family's capacity", () =>
 	assert.equal(duplicate.verdict, "reject");
 	assert.match(duplicate.reasons.join(";"), /近重复/);
 	// Same method, different dtype is a different entry, not a duplicate.
-	const otherDtype = valid(caseCard({ applicability: { backend: "ascend-c", toolchain: "CANN-8.0", dtype: "float32", structure: ["2d-rowwise"] } }));
+	const otherDtype = valid(caseCard({ applicability: { backend: "backend-a", toolchain: "toolchain-1.2", dtype: "float32", structure: ["2d-rowwise"] } }));
 	assert.equal(evaluateCardAdmission({ card: otherDtype, existing: [existing(strong)] }).verdict, "admit");
 	const full = Array.from({ length: 3 }, (_, index) => existing(valid(caseCard({
 		method: (["tiling", "fusion", "vectorization"] as const)[index], measurement: measurement(1.3 + index / 10) })),

@@ -10,7 +10,7 @@ import { validateOptimizationCard, type OptimizationCard } from "../../src/knowl
 import { createFileKnowledgeStore } from "../../src/knowledge/store.ts";
 import type { KnowledgeStore, ProposalOp } from "../../src/knowledge/types.ts";
 
-const context = { backend: "ascend-c", toolchain: "CANN-8.0", dtype: "float16", structure: ["2d-rowwise"] };
+const context = { backend: "backend-a", toolchain: "toolchain-1.2", dtype: "float16", structure: ["2d-rowwise"] };
 
 function card(raw: Record<string, unknown>): OptimizationCard {
 	const result = validateOptimizationCard(raw);
@@ -27,12 +27,12 @@ const caseCard = (method: string, speedup = 1.4, extra: Record<string, unknown> 
 	rootMechanism: "非连续搬运触发额外事务", causalChain: `${method} → aiv_mte2_ratio 下降 → 延迟下降`,
 	profileEvidence: [{ metric: "aiv_mte2_ratio", value: 0.81 }],
 	reusableWhen: "同 dtype 且尾块可整除", avoidWhen: "尾块需要掩码时不可套用",
-	constraints: [{ name: "ub_bytes", unit: "bytes", limit: 196352, comparison: "at_most", source: "S003" }],
+	constraints: [{ name: "buffer_bytes", unit: "bytes", limit: 196352, comparison: "at_most", source: "S003" }],
 	measurement: { baselineMs: 10, candidateMs: 10 / speedup, speedup, repeats: 5, correctness: "verified",
 		verifier: "candidate-performance", evidence: ["stages/M07/run/timing.json"] }, ...extra });
 
 const avoidCard = (method: string) => card({ ...base, kind: "avoid", bottleneck: "memory_bound",
-	excludedDirection: method, profileReason: "融合后 UB 超限，MTE2 反升", stopCondition: "UB 预算提高到 256KB 可重试",
+	excludedDirection: method, profileReason: "融合后 缓冲超限，MTE2 反升", stopCondition: "缓冲预算提高一倍后可重试",
 	attempts: 4, successes: 0 });
 
 const whenCard = () => card({ ...base, kind: "when", bottleneck: "memory_bound",
@@ -40,7 +40,7 @@ const whenCard = () => card({ ...base, kind: "when", bottleneck: "memory_bound",
 	maskWhen: [{ metric: "aiv_vec_ratio", atLeast: 0.75, masks: ["vectorization"] }], evidence: ["S003"] });
 
 const ruleCard = () => card({ ...base, kind: "rule", bottleneck: "compile_failure",
-	errorSignature: "no member named 'Softmax'", ruleText: "You cannot call AscendC::Softmax in this CANN version",
+	errorSignature: "no member named 'Scale'", ruleText: "You cannot call BackendA::Scale in this toolchain version",
 	frequency: 4, evidence: ["stages/M07/run/compile.log"] });
 
 test("the decision table ranks measured methods first and names why each one is allowed", () => {
@@ -88,15 +88,15 @@ test("the frozen prior is layered, hard filtered by backend and bounded", async 
 		await writeFile(path.join(root, layer, name),
 			`---\n${Object.entries(metadata).map(([key, value]) => `${key}: ${JSON.stringify(value)}`).join("\n")}\n---\n${body}\n`);
 	};
-	await write("L2", "ub.md", { layer: "L2", title: "UB 容量", applicability: { backend: "ascend-c", toolchain: "CANN-8.0" }, source: "S003" }, "UB 上限按芯片型号从实机读取。");
+	await write("L2", "ub.md", { layer: "L2", title: "缓冲容量", applicability: { backend: "backend-a", toolchain: "toolchain-1.2" }, source: "S003" }, "缓冲上限按设备型号从实机读取。");
 	await write("L2", "other-backend.md", { layer: "L2", title: "别的后端", applicability: { backend: "cuda", toolchain: "12.4" }, source: "S004" }, "不适用。");
-	await write("L3", "tiling.md", { layer: "L3", title: "tiling 公式", applicability: { backend: "ascend-c", toolchain: "CANN-8.0" }, source: "docs/tiling.md" }, "tileLength = AlignUp(...)");
-	await write("L2", "broken.md", { layer: "L2", title: "缺出处", applicability: { backend: "ascend-c", toolchain: "CANN-8.0" }, source: "https://example.invalid/x" }, "没有本地出处。");
+	await write("L3", "tiling.md", { layer: "L3", title: "tiling 公式", applicability: { backend: "backend-a", toolchain: "toolchain-1.2" }, source: "docs/tiling.md" }, "tileLength = AlignUp(...)");
+	await write("L2", "broken.md", { layer: "L2", title: "缺出处", applicability: { backend: "backend-a", toolchain: "toolchain-1.2" }, source: "https://example.invalid/x" }, "没有本地出处。");
 	const library = await loadPriorLibrary(root);
 	assert.equal(library.entries.length, 3);
 	assert.match(library.rejected[0].reason, /source/);
 	const selection = selectPrior(library, { layers: ["L2", "L3"], context, maxEntries: 5, maxChars: 10_000 });
-	assert.deepEqual(selection.included.map((item) => item.title), ["UB 容量", "tiling 公式"]);
+	assert.deepEqual(selection.included.map((item) => item.title), ["缓冲容量", "tiling 公式"]);
 	assert.ok(selection.omitted.some((item) => item.reason.includes("情境不匹配")));
 	const tiny = selectPrior(library, { layers: ["L2", "L3"], context, maxEntries: 1, maxChars: 10_000 });
 	assert.equal(tiny.included.length, 1);
@@ -113,7 +113,7 @@ async function storeWithCards(t: TestContext): Promise<{ store: KnowledgeStore; 
 			fields: { optimization: caseCard("memory_coalescing", 1.8) as unknown as Record<string, unknown> } },
 		{ op: "create", type: "C", title: "融合负例", body: "融合在该形状下退化", usageDecision: "adopted",
 			fields: { optimization: avoidCard("fusion") as unknown as Record<string, unknown> } },
-		{ op: "create", type: "K", title: "Softmax 幻觉 API 规则", body: "编译失败规则", usageDecision: "adopted",
+		{ op: "create", type: "K", title: "幻觉 API 规则", body: "编译失败规则", usageDecision: "adopted",
 			fields: { optimization: ruleCard() as unknown as Record<string, unknown> } },
 		{ op: "create", type: "C", title: "纯叙述记录", body: "layernorm 的一般性讨论，没有结构化卡片", usageDecision: "adopted" },
 	];
@@ -162,18 +162,18 @@ test("an error signature looks a rule up exactly, and structured keys fuse with 
 	// The round's text never mentions the rule; its exact symbol does the work.
 	const compile = await assembleInjection({ store, phase: "compile-fix", purpose: "修编译",
 		text: "候选无法通过编译", context,
-		errorSignatures: ["kernel.cpp:12:5: error: no member named 'Softmax' in namespace 'AscendC'"] });
+		errorSignatures: ["kernel.cpp:12:5: error: no member named 'Scale' in namespace 'BackendA'"] });
 	assert.ok(compile.markdown.includes("[rule]"));
 	assert.ok(compile.receipt.cardRefs.some((ref) => compile.markdown.includes(ref)));
 
 	// A withdrawn rule is not looked up: live limits still decide.
-	const rule = (await store.list()).find((record) => record.title.includes("Softmax"))!;
+	const rule = (await store.list()).find((record) => record.title.includes("幻觉 API"))!;
 	const receipt = await store.submitProposal({ stage: "M04", runId: "r2",
-		ops: [{ op: "decide", id: rule.id, usageDecision: "withdrawn", reason: "CANN 版本更新后该符号已存在" }] });
+		ops: [{ op: "decide", id: rule.id, usageDecision: "withdrawn", reason: "工具链版本更新后该符号已存在" }] });
 	await store.merge(receipt.proposalId);
 	const after = await assembleInjection({ store, phase: "compile-fix", purpose: "修编译",
 		text: "候选无法通过编译", context,
-		errorSignatures: ["error: no member named 'Softmax' in namespace 'AscendC'"] });
+		errorSignatures: ["error: no member named 'Scale' in namespace 'BackendA'"] });
 	assert.ok(after.receipt.omitted.some((item) => item.reason === "rule-lookup:not-allowed"));
 	assert.ok(!after.markdown.includes("[rule]"));
 });
