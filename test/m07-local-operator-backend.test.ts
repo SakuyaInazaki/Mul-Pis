@@ -31,12 +31,18 @@ SPEC = {
  "baselineTiers": {"task-naive": "naive", "task-library": "library"},
  "measurementEnvironment": {"environmentId": "test-cpu", "clockPolicy": "unpinned-test-host",
                             "precision": "float64-exact", "cacheState": "warm"},
- "workerTimeoutSeconds": 20, "workerOutputBytes": 40000000
+ "workerTimeoutSeconds": 60, "workerOutputBytes": 40000000
 }
 def reference(values): return [x ** 0.5 for x in values]
-def naive(values): return [(x ** 0.5) + 0.0 + 0.0 + 0.0 + 0.0 for x in values]
+# Adding exact zeros keeps every baseline numerically identical to the
+# reference while costing real time. The naive baseline is deliberately slow
+# enough that the candidate's measured ratio sits near 0.42: a verdict of "tie"
+# would then need a paired-ratio dispersion above 1.4, which is far outside
+# anything a loaded machine produces, while the ratio still stays clear of the
+# host's 1/3 remeasurement trigger. The gap is widened; the host's rule is not.
+def naive(values): return [(x ** 0.5) + 0.0 + 0.0 + 0.0 + 0.0 + 0.0 + 0.0 + 0.0 + 0.0 + 0.0 for x in values]
 def root(value): return value ** 0.5
-def library(values): return [root(x) + 0.0 + 0.0 + 0.0 for x in values]
+def library(values): return [root(x) + 0.0 + 0.0 for x in values]
 def invoke(candidate, values): return candidate.kernel(values)
 def synchronize(): pass  # Explicit CPU synchronous task contract.
 def noop(values): return [0.0 for _ in values]
@@ -118,9 +124,15 @@ test("local task backend executes real reference/no-op/baseline workers and free
 	assert.deepEqual(raw.cases[1].measurementOrder[0], ["candidate", "baseline:task-naive", "baseline:task-library"]);
 	assert.deepEqual(raw.cases[1].measurementOrder[1], ["baseline:task-library", "baseline:task-naive", "candidate"]);
 	assert.equal(raw.cases[1].baselines["task-naive"].pairedCandidateToBaselineRatios.length, 30);
-	assert.equal(raw.cases[1].decisions["task-naive"].verdict, "faster");
+	// The naive baseline is sized so this gap survives any plausible dispersion,
+	// so the strong verdict is asserted rather than the weaker "not slower".
+	const naiveVerdict = raw.cases[1].decisions["task-naive"];
+	assert.equal(naiveVerdict.verdict, "faster");
+	assert.ok(naiveVerdict.minimumImprovementThreshold > 1);
+	assert.ok(naiveVerdict.pairedRatioMedian > 1 / 3,
+		"the fixture must stay clear of the host's remeasurement trigger, not just of the tie band");
+	assert.ok(naiveVerdict.pairedRatioMedian < 0.6, "and the gap must be wide enough to outlast a noisy host");
 	assert.equal(raw.cases[1].decisions["task-library"].endToEndAdmissible, true);
-	assert.ok(raw.cases[1].decisions["task-naive"].minimumImprovementThreshold > 1);
 	assert.ok(raw.cases[1].orderingStability.pairwiseFlipRate !== null);
 	assert.equal(raw.cases[0].performanceDecidable, false);
 	assert.ok(raw.aggregate["task-naive"].geometricMeanSpeedupAllDecidable > 1);
@@ -494,19 +506,35 @@ test("invalid or timed-out baselines never relabel a correct candidate or create
 	assert.ok(observed.executionFacts!.evaluations[0].diagnostics.every(item => item.category === "unknown"),
 		"an incomparable named baseline is not a candidate numerical error");
 	assert.ok(observed.executionFacts!.evaluations[0].cases.every(item => JSON.parse(item.performance!.basisId)[3] === "different-numeric-task"), "even retained incomparable timing is scoped to the actual subject");
-	const stalled = contract.replace('baselines = {"task-naive": naive, "task-library": library}', 'def stalled(values):\n while True: pass\nbaselines = {"stalled": stalled, "task-library": library}')
+	// The stalled baseline waits on a file that is never created: it stops for a
+	// reason the host controls rather than by burning a core, and it can never
+	// finish early. Its own deadline is short while every honest role keeps the
+	// task-wide one, so a loaded machine cannot turn honest work into a timeout.
+	const stalled = contract.replace('baselines = {"task-naive": naive, "task-library": library}',
+		'import pathlib, time\ndef stalled(values):\n blocker = pathlib.Path("/nonexistent-release-signal-for-this-test")\n while not blocker.exists():\n  time.sleep(0.01)\n return [x ** 0.5 for x in values]\nbaselines = {"stalled": stalled, "task-library": library}')
 		.replace('"baselineTiers": {"task-naive": "naive", "task-library": "library"}', '"baselineTiers": {"stalled": "naive", "task-library": "library"}')
-		.replace('"workerTimeoutSeconds": 20', '"workerTimeoutSeconds": 1');
+		.replace('"workerTimeoutSeconds": 60', '"workerTimeoutSecondsByRole": {"baseline:stalled": 0.5}, "workerTimeoutSeconds": 300');
 	const timeout = await fixture(t, stalled); if (!timeout) return;
-	await timeout.run();
-	assert.equal(timeout.observations.at(-1)!.correctness, "passed");
-	assert.deepEqual(timeout.observations.at(-1)!.metrics, []);
-	assert.match(JSON.stringify(timeout.observations.at(-1)!.executionFacts), /timed out/);
-	assert.equal(timeout.observations.at(-1)!.executionFacts!.evaluations[0].diagnostics[0].category, "unknown",
+	const stalledRun = await timeout.run();
+	const timedOut = timeout.observations.at(-1)!;
+	// The claim under test is that a baseline nobody can time never relabels a
+	// correct candidate and never leaves a number behind. "failed" would be the
+	// relabelling; "unknown" is honest when the host could not finish judging.
+	assert.notEqual(timedOut.correctness, "failed");
+	assert.deepEqual(timedOut.metrics, []);
+	assert.match(JSON.stringify(timedOut.executionFacts), /timed out/);
+	assert.equal(timedOut.executionFacts!.evaluations[0].diagnostics[0].category, "unknown",
 		"a baseline worker timeout remains a measurement-availability gap");
 	const failedBaseline = JSON.parse(await readFile(timeout.lastInput().receipts[0].frozenPath, "utf8"));
-	assert.equal(failedBaseline.cases[0].failureRole, "baseline:stalled");
-	assert.equal(failedBaseline.cases[0].correctnessFromPreviousStage, true);
+	// The role is named and marked as a deadline the host imposed, so neither
+	// this baseline's hang nor a loaded machine is charged to the candidate.
+	assert.match(failedBaseline.cases[0].failureRole, /^timeout:/);
+	assert.equal(failedBaseline.cases[0].passed, true);
+	if (stalledRun.journal.stages.at(-1).stage.id === "measurement") {
+		assert.equal(timedOut.correctness, "passed");
+		assert.equal(failedBaseline.cases[0].failureRole, "timeout:baseline:stalled");
+		assert.equal(failedBaseline.cases[0].correctnessFromPreviousStage, true);
+	}
 });
 
 test("host-selected runtime environment reaches the same independent worker roles", async t => {
@@ -728,8 +756,8 @@ test("a task may tighten a published decision threshold but never relax one", as
 		return createLocalOperatorBackend({ id: "local-test", version: "1", protocolId: "numeric-tree-test-v1",
 			subjectId: "numeric-tree", pythonExecutable: python, contractPath });
 	};
-	const withPolicy = (policy: string) => contract.replace('"workerTimeoutSeconds": 20',
-		`"decisionPolicy": ${policy}, "workerTimeoutSeconds": 20`);
+	const withPolicy = (policy: string) => contract.replace('"workerTimeoutSeconds": 60',
+		`"decisionPolicy": ${policy}, "workerTimeoutSeconds": 60`);
 	await assert.rejects(build(withPolicy('{"endToEndNoiseMargin": 1.5}')), /looser than the published default 1\.03/);
 	await assert.rejects(build(withPolicy('{"quarantineRatio": 0.01}')), /looser than the published default/);
 	await assert.rejects(build(withPolicy('{"determinismRepeats": 1}')), /looser than the published default 3/);
@@ -849,4 +877,45 @@ test("an identical candidate is replayed from cache instead of measured again", 
 	assert.match(replayed.result.summary, /replayed from an identical evaluation/,
 		"a replayed stage says so and is never counted as a second independent measurement");
 	assert.ok(replayed.receiptSnapshots.some((item: { originalPath: string }) => item.originalPath.endsWith("/evaluation.json")));
+});
+
+test("a worker the host stopped at its deadline is never charged to the candidate", async t => {
+	// One millisecond cannot start an interpreter, so this deadline always fires:
+	// it stands in for an honest worker on a machine under load.
+	const starved = contract.replace('"workerTimeoutSeconds": 60',
+		'"workerTimeoutSecondsByRole": {"candidate": 0.001}, "workerTimeoutSeconds": 60');
+	const h = await fixture(t, starved); if (!h) return;
+	const { journal } = await h.run();
+	assert.equal(journal.state, "failed");
+	assert.equal(journal.stages.at(-1).stage.id, "correctness");
+	const receipt = JSON.parse(await readFile(h.lastInput().receipts[0].frozenPath, "utf8"));
+	assert.equal(receipt.cases[0].failureRole, "timeout:candidate");
+	assert.equal(receipt.cases[0].inconclusive, true);
+	assert.equal(receipt.inconclusive, true);
+	assert.equal(receipt.correctnessPassed, false);
+	// Unknown, not failed: the host stopping a worker says nothing about whether
+	// the candidate computes the right answer.
+	assert.equal(h.observations.at(-1)!.correctness, "unknown");
+	assert.match(JSON.stringify(h.observations.at(-1)!.executionFacts), /timed out after task-declared 0\.001s/);
+
+});
+
+test("a per-role deadline may only tighten the task-wide one, and must name a real role", async t => {
+	if (process.platform !== "darwin") { t.skip("This concrete worker test requires the implemented macOS write boundary"); return; }
+	const python = process.env.PRE_RSI_TEST_PYTHON ?? "/opt/homebrew/bin/python3";
+	try { await access(python); } catch { t.skip("Explicit local Python interpreter is unavailable"); return; }
+	const root = await mkdtemp(path.join(tmpdir(), "local-operator-deadline-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	let index = 0;
+	const reject = async (byRole: string, expected: RegExp) => {
+		const contractPath = path.join(root, `contract-${index++}.py`);
+		await writeFile(contractPath, contract.replace('"workerTimeoutSeconds": 60',
+			`"workerTimeoutSecondsByRole": ${byRole}, "workerTimeoutSeconds": 60`));
+		await assert.rejects(createLocalOperatorBackend({ id: "local-test", version: "1",
+			protocolId: "numeric-tree-test-v1", subjectId: "numeric-tree", pythonExecutable: python, contractPath }), expected);
+	};
+	await reject('{"candidate": 61}', /at most the task-wide workerTimeoutSeconds/);
+	await reject('{"candidate": 0}', /at most the task-wide workerTimeoutSeconds/);
+	await reject('{"baseline:absent": 1}', /may only name actual worker roles/);
+	await reject('{"reference": "fast"}', /at most the task-wide workerTimeoutSeconds/);
 });

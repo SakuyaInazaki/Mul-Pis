@@ -26,6 +26,7 @@
 | `baselineTiers` | 为每个具名 baseline 标 `naive` / `expert` / `library` / `compiler` |
 | `measurementEnvironment` | `environmentId`、`clockPolicy`、`precision`、`cacheState`（`cold` / `warm`） |
 | `workerTimeoutSeconds`、`workerOutputBytes` | 每个 worker 的执行与输出上限 |
+| `workerTimeoutSecondsByRole` | 可选，按角色给**更紧**的截止时间（角色名含 `baseline:<名字>`）；值必须为正且不超过 `workerTimeoutSeconds` |
 
 模块级函数：`reference`、`invoke`、`synchronize`、`noop` 必需；`baselines` 是具名真实可调用实现的字典；
 可选 `prepare`、`normalize`、`golden`、`compile_candidate` + `bind_compiled`、`validate_parameters`、
@@ -146,7 +147,17 @@ limitations 里固定会出现：运行环境与精度策略、baseline tier、�
 **不得当成第二次独立测量**。`evaluationProfile()` 给出本地驳回数、最接近签名命中率、缓存命中/未命中、
 以及「真正执行掉的墙钟」与「replay 顶掉的墙钟」。设备租约只包住 measurement 阶段。
 
-## 9 这套机制没有解决的事
+## 9 截止时间不是判决
+
+宿主在截止时间掐掉一个 worker，说明不了候选算得对不对：满载机器上的诚实 worker 和真的挂死的 worker
+都会走到这里。所以超时单独成类——`failureRole` 记成 `timeout:<角色>`，该用例标 inconclusive，
+测量阶段按「性能证据不可用」处理（保留前一阶段已确立的正确性），观测结论是 `unknown` 而不是 `failed`。
+
+一个任务若知道自己某个 baseline 可能挂死，就用 `workerTimeoutSecondsByRole` 单独给那个角色更紧的
+截止时间，而不是把全局超时压短——压短全局会让诚实工作在负载下看起来像挂死，这正是把基础设施失败
+和策略失败混在一起的那条路。
+
+## 10 这套机制没有解决的事
 
 - 不是操作系统沙箱：worker 的写隔离在 macOS 用 `sandbox-exec`，其他平台必须由宿主提供真实隔离前缀，
   没有无隔离兜底；但同 UID 的进程边界不等于强隔离。
