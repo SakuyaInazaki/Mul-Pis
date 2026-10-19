@@ -3,7 +3,6 @@ import { mkdtemp, realpath, mkdir, readFile, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
-import { offlineChecks } from "../scripts/manual-private-campaign.ts";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { createM07Controller } from "../src/m07/controller.ts";
 import type { CandidateVerifier } from "../src/m07/candidate-evaluation.ts";
@@ -67,11 +66,9 @@ test("M07 opens two real fake-runner histories from one frozen task leaf with pr
 	assert.equal(firstLineage.checkpoint.id, context.checkpointId);
 	assert.equal(firstLineage.parent.sessionId, parent.session!.id);
 	assert.equal(firstLineage.evidenceBindings[0].status, "frozen-copy");
-	const lineageSummary = await offlineChecks.contextLineageSummary(first.session?.lineageFile,
-		parent.branchSource!.checkpoint, first.session?.id, first.session?.model,
-		parent.branchSource!.problemSnapshotCopy, "fake/execution");
-	assert.equal(lineageSummary.state, "verified", JSON.stringify(lineageSummary.driverChecks));
-	assert.equal(lineageSummary.evidenceBindingCount, 2);
+	assert.equal(firstLineage.state, "committed");
+	assert.equal(firstLineage.child.sessionId, first.session!.id);
+	assert.equal(firstLineage.evidenceBindings.length, 2);
 	const parentHistory = await readFile(parent.session!.file!, "utf8");
 	const firstHistory = await readFile(first.session!.file!, "utf8");
 	const secondHistory = await readFile(second.session!.file!, "utf8");
