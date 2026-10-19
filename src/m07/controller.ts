@@ -1511,7 +1511,10 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 					// Outer loop: episode boundaries. The builder keeps its live session
 					// until the configured number of evaluations has passed, then the
 					// host distils what that session established and starts it clean.
-					// This clears context; it never ends the task or the search.
+					// This clears context; it never ends the task or the search. The
+					// loop therefore ends when a turn adds fewer new candidates than
+					// the cadence - that is, when the builder stops evaluating - and
+					// not on any count of rounds or spend.
 					const restartEvery = ctx.config.episodeRestart?.evaluations ?? DEFAULT_EPISODE_RESTART_EVALUATIONS;
 					for (;;) {
 					for (;;) {

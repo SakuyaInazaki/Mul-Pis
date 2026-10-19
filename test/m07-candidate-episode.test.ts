@@ -943,7 +943,7 @@ test("an episode boundary distils what was established and restarts on a clean c
 	assert.notEqual(task.session?.id, task.episode?.restarts?.[0].previousSessionId);
 });
 
-test("the host records its verdict, stall, budget and restart events for the console", async t => {
+test("the host records its verdict, stall and restart events for the console", async t => {
 	const verifier: CandidateVerifier = { id: "host:events", version: "1", async verifyTask({ sources }) {
 		const text = await readFile(sources[0].frozenPath, "utf8");
 		return { sourceBinding: "verified", correctness: "passed", stage: "performance",
@@ -956,8 +956,10 @@ test("the host records its verdict, stall, budget and restart events for the con
 		if (spec.tools.kind !== "execution") return "report";
 		const workRoot = spec.tools.root;
 		// Each candidate is strictly faster than the last, so every verdict is a
-		// keep and no stall or ban interferes with what this test observes.
-		for (let index = 0; index < 2; index++) {
+		// keep and no stall or ban interferes with what this test observes. The
+		// builder stops evaluating after four, which is what ends the episode
+		// loop now that nothing bounds it from outside.
+		for (let index = 0; index < 2 && round < 4; index++) {
 			round++;
 			await writeFile(path.join(workRoot, "kernel.py"), `candidate ${"x".repeat(Math.max(1, 20 - round))}`);
 			await writeFile(path.join(workRoot, "receipt.json"), '{"status":"ok"}');
@@ -977,17 +979,13 @@ test("the host records its verdict, stall, budget and restart events for the con
 	const { events } = await readSearchEvents(path.join(harness.ws.runDir("M07", harness.goal.runId), "search-events.jsonl"));
 	const kinds = events.map(event => event.kind);
 	assert.equal(kinds.filter(kind => kind === "verdict").length, task.episode!.candidates.length);
-	assert.equal(kinds.filter(kind => kind === "budget").length, task.episode!.candidates.length);
-	assert.equal(kinds.filter(kind => kind === "episode-restarted").length, 1,
-		"one boundary was crossed before the budget stopped the task");
+	assert.equal(kinds.filter(kind => kind === "episode-restarted").length, 2,
+		"a boundary was crossed after each pair of evaluations, until the builder stopped evaluating");
 	const verdicts = events.filter(event => event.kind === "verdict");
 	assert.deepEqual(verdicts.map(event => event.verdict?.decision),
 		task.episode!.candidates.map(item => item.policy?.guard));
 	assert.equal(verdicts[0].candidate?.id, "C001");
 	assert.equal(typeof verdicts[0].candidate?.score, "number");
-	const budget = events.filter(event => event.kind === "budget").at(-1)!;
-	assert.equal(budget.counters?.evaluations, task.episode!.candidates.length);
-	assert.equal(budget.detail?.category, "norm-reduce");
 	const restarted = events.find(event => event.kind === "episode-restarted")!;
 	assert.equal(restarted.counters?.afterCandidates, 2);
 	assert.equal(restarted.detail?.recordPath, task.episode!.restarts![0].recordPath);
