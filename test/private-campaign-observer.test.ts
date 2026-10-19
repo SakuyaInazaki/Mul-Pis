@@ -48,7 +48,9 @@ function frame(sequence: number) {
 		tagB64: Buffer.alloc(16).toString("base64") });
 }
 async function until(check: () => boolean): Promise<void> {
-	for (let i = 0; i < 100; i++) {
+	// 500ms was enough for this file alone but not under a loaded full-suite run
+	// on a shared machine; the condition itself is what the test asserts.
+	for (let i = 0; i < 1000; i++) {
 		if (check()) return;
 		await new Promise(resolve => setTimeout(resolve, 5));
 	}

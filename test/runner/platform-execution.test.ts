@@ -49,7 +49,10 @@ async function boundSession(t: TestContext, deadlineAt?: string): Promise<{ work
 	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-platform-exec-"));
 	const work = path.join(root, "work");
 	const persistDir = path.join(root, "sessions");
-	await Promise.all([mkdir(work), mkdir(persistDir), mkdir(path.join(work, "kernel"), { recursive: true })]);
+	// `work` is also created by the recursive call below; racing a non-recursive
+	// mkdir against it fails with EEXIST once the suite runs in a different order.
+	await Promise.all([mkdir(work, { recursive: true }), mkdir(persistDir, { recursive: true }),
+		mkdir(path.join(work, "kernel"), { recursive: true })]);
 	const raw = profileFixture();
 	(raw.deviceSerialization as { leaseFile: string }).leaseFile = path.join(root, "device.lease");
 	const profileFile = path.join(root, "platform-profile.json");

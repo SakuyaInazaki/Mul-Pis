@@ -28,3 +28,13 @@
 - `test/knowledge/retrieval.test.ts` 是 0cf09d3 原有文件，按指示不动，等用户决定。
 - `src/m07/candidate-performance.ts` 的 ncu/msprof CSV 导入是 0cf09d3 原有的通用能力，按本轮说明保留；
   `candidate-policy.ts`、`platform-task-contract.ts` 里的平台内容属其他环节的清理范围。
+
+## 附：两处测试稳定性修复（非本环节文件，各一行）
+
+全量跑在两次不同的运行里分别暴露了两个与改动无关的不稳定点，单独跑都通过，按「提交前全量 0 失败」
+一并修掉，改动各一行：
+
+- `test/runner/platform-execution.test.ts`：fixture 用 `Promise.all` 同时建 `work` 与 `work/kernel`，
+  递归的那次先建出 `work` 时非递归的 `mkdir(work)` 报 EEXIST；改为同样递归。
+- `test/private-campaign-observer.test.ts`：`until()` 的轮询预算只有 100×5ms，满载时不足；放宽到
+  1000 次，判据本身不变。
