@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { nodeOverview } from "./overview.ts";
+import { renderWorkflowAudit } from "./audit.ts";
 import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -15,6 +16,7 @@ export const HELP = `MUL-PIS 工作流终端控制台
   npm run console -- [--workspace DIR]       打开工作区选择器/交互界面
   npm run console -- --workspace DIR --once  输出一次真实工作流状态
   npm run console -- status --workspace DIR --json
+  npm run console -- audit --workspace DIR [--json]
   npm run console -- start --workspace DIR --prompt-file FILE [--host-extension FILE]
   npm run console -- attach --workspace DIR [--instance ID]
   npm run console -- send --workspace DIR --message-file FILE [--delivery prompt|steer|follow_up]
@@ -41,7 +43,7 @@ export const HELP = `MUL-PIS 工作流终端控制台
 
 const BOOL = new Set(["help", "once", "json", "detach"]);
 const VALUE = new Set(["workspace", "root", "instance", "goal", "mission", "stage", "run", "width", "height", "prompt-file", "message-file", "delivery", "action-file", "old-descriptor", "host-extension"]);
-const COMMANDS = new Set(["open", "status", "start", "attach", "send", "workflow", "pause", "resume", "abort", "stop", "recover"]);
+const COMMANDS = new Set(["open", "status", "audit", "start", "attach", "send", "workflow", "pause", "resume", "abort", "stop", "recover"]);
 export function parseConsoleArgs(argv: string[]): { command: string; flags: Map<string, string> } {
 	let command = "open", positional = false; const flags = new Map<string, string>();
 	for (let i = 0; i < argv.length; i++) {
@@ -60,7 +62,8 @@ export function parseConsoleArgs(argv: string[]): { command: string; flags: Map<
 	for (const key of ["goal", "run"]) if (flags.has(key) && !/^[A-Za-z0-9_-]+$/.test(flags.get(key)!)) throw new Error(`--${key} 不是有效运行 ID`);
 	if (flags.has("mission") && !/^[0-9a-f-]{36}$/i.test(flags.get("mission")!)) throw new Error("--mission 不是有效原目标 ID");
 	for (const key of ["width", "height"]) if (flags.has(key) && !/^[1-9]\d{0,3}$/.test(flags.get(key)!)) throw new Error(`--${key} 必须是正整数`);
-	if ((flags.has("once") || flags.has("json")) && !["open", "status"].includes(command)) throw new Error("--once / --json 仅用于查看状态");
+	if (flags.has("once") && !["open", "status"].includes(command)) throw new Error("--once 仅用于查看状态");
+	if (flags.has("json") && !["open", "status", "audit"].includes(command)) throw new Error("--json 仅用于查看状态或审计");
 	if (flags.has("host-extension") && !["start", "recover"].includes(command)) throw new Error("--host-extension 仅用于 start 或 recover");
 	return { command, flags };
 }
@@ -83,6 +86,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 	if (command === "open" && !f.has("once") && !f.has("json")) { await runConsoleApp({ workspace, root: f.get("root"), read }); return; }
 	if (!workspace) throw new Error("此命令需要 --workspace DIR");
 	if (!(await stat(path.join(workspace, "research.config.json"))).isFile()) throw new Error("指定目录不是已配置的工作流工作区");
+	if (command === "audit") {
+		const snapshot = await new WorkflowReader(workspace).read(read);
+		if (f.has("json")) { process.stdout.write(JSON.stringify(snapshot.audit, null, 2) + "\n"); return; }
+		process.stdout.write(renderWorkflowAudit(snapshot.audit).join("\n") + "\n"); return;
+	}
 	if (command === "status" || f.has("once") || f.has("json")) {
 		const reader = new WorkflowReader(workspace), snapshot = await reader.read(read);
 		if (f.has("json")) { process.stdout.write(JSON.stringify(snapshot, null, 2) + "\n"); return; }

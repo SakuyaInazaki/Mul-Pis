@@ -8,7 +8,8 @@ import { FakeSessionRunner } from "../src/runner/fake.ts";
 import type { CurrentGoal, TaskSpecInput } from "../src/m07/types.ts";
 
 const execute: TaskSpecInput = { objective: "one authorized external action", inputs: [],
-	expectedOutputs: ["result.txt"], checks: ["observe result"], mode: "execute" };
+	expectedOutputs: ["result.txt"], checks: ["observe result"], mode: "execute",
+	subjectProfile: { operatorCategory: "norm-reduce" as const, implementationSpace: "handwritten-low-level" as const, rationale: "test fixture", baselineStrength: "none" as const } };
 
 async function failedGoal(t: TestContext) {
 	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-host-reconcile-"));
@@ -135,7 +136,7 @@ test("configured candidate feedback is available through ordinary service delega
 	const task = await service.delegate(goal.runId, execute, root) as CurrentGoal["tasks"][number];
 	assert.equal(task.status, "returned");
 	assert.deepEqual(task.executionLoop, { mode: "candidate-episode" });
-	for (const name of ["candidate_evaluate", "candidate_list", "candidate_read", "candidate_checkout", "knowledge_select", "knowledge_read"])
+	for (const name of ["candidate_evaluate", "candidate_archive", "knowledge_select", "knowledge_read"])
 		assert.ok(actualTools.includes(name), `${name} must reach the real execution grant`);
 	assert.equal(runner.created.length, 1, "ordinary feedback episodes do not launch a report reviewer after every experiment");
 });

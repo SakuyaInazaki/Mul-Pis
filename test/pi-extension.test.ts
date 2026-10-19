@@ -175,7 +175,7 @@ test("main-session capability guard blocks side-effect tools from the start", as
 	assert.equal(((await hook(bash, toolContext("/workspace"))) as { block?: boolean }).block, true);
 	await registered.tools.get("research_status")!.execute("status", {}, undefined, undefined, toolContext("/workspace"));
 	assert.equal(((await hook(bash, toolContext("/workspace"))) as { block?: boolean }).block, true);
-	await registered.tools.get("research_init")!.execute("init", { workspace: "/workspace" }, undefined, undefined, toolContext("/workspace"));
+	await registered.tools.get("research_stage")!.execute("init", { stage: "init", workspace: "/workspace" }, undefined, undefined, toolContext("/workspace"));
 	assert.equal(((await hook(bash, toolContext("/workspace"))) as { block?: boolean }).block, true);
 	await registered.tools.get("research_goal")!.execute("begin", { action: "begin", goal: "g", problemRelation: "p", constraints: [], successCriteria: [], plan: "p" }, undefined, undefined, toolContext("/workspace"));
 	const blocked = await hook(bash, toolContext("/workspace")) as { block?: boolean; reason?: string };
@@ -294,5 +294,70 @@ test("Pi DefaultResourceLoader loads the actual extensions/research.ts entrypoin
 	const loaded = loader.getExtensions();
 	assert.equal(loaded.errors.length, 0);
 	assert.equal(loaded.extensions.length, 1);
-	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_init", "research_method_improve", "research_mission", "research_review", "research_stage", "research_status"]);
+	assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(), ["research_delegate", "research_goal", "research_improve", "research_mission", "research_review", "research_stage", "research_status"]);
+});
+
+test("one improvement tool routes both tracks and refuses a cross-track action", async t => {
+	const workspace = await mkdtemp(path.join(tmpdir(), "pre-rsi-improve-track-"));
+	t.after(async () => { await rm(workspace, { recursive: true, force: true }); });
+	const calls: string[] = [];
+	const service = {
+		status: async () => ({ workspace, stages: {} }),
+	} as unknown as ResearchService;
+	const registered = captureExtension(service, () => ({
+		run: async () => { calls.push("budget-run"); return { runId: "B1" }; },
+		status: async () => { calls.push("budget-status"); return { active: null }; },
+		rollback: async () => ({}),
+	}), () => ({
+		runWorkflow: async () => { calls.push("method-workflow-run"); return { runId: "M1", status: "completed",
+			developmentArms: [], protectedArms: [] }; },
+		calibrateWorkflow: async () => { calls.push("method-calibrate"); return { runId: "M2", status: "completed",
+			pairs: [] }; },
+	}));
+	const improve = registered.tools.get("research_improve")!;
+	assert.equal(registered.tools.has("research_method_improve"), false);
+	assert.equal(registered.tools.has("research_init"), false);
+
+	await improve.execute("i1", { action: "status" }, undefined, undefined, toolContext(workspace));
+	const plan = path.join(workspace, "plan.json");
+	await writeFile(plan, JSON.stringify({ version: 1, kind: "m07-evidence-handoff-aa/v1" }));
+	await improve.execute("i2", { track: "method", action: "workflow-run", planPath: plan }, undefined, undefined, toolContext(workspace));
+	await improve.execute("i3", { track: "method", action: "workflow-calibrate", planPath: plan }, undefined, undefined, toolContext(workspace));
+	assert.deepEqual(calls, ["budget-status", "method-workflow-run", "method-calibrate"]);
+	// A method action on the budget track is refused rather than silently reinterpreted.
+	await assert.rejects(improve.execute("i4", { action: "workflow-run", planPath: plan }, undefined, undefined, toolContext(workspace)),
+		/belongs to track=method/);
+	await assert.rejects(improve.execute("i5", { action: "status", methodsPath: plan }, undefined, undefined, toolContext(workspace)),
+		/require track=method/);
+});
+
+test("research_status can list earlier runs' best candidates as starting points", async t => {
+	const workspace = await mkdtemp(path.join(tmpdir(), "pre-rsi-prior-runs-"));
+	t.after(async () => { await rm(workspace, { recursive: true, force: true }); });
+	const runDir = path.join(workspace, "stages", "M07", "20261017T090000Z-aaaa");
+	await mkdir(runDir, { recursive: true });
+	const observation = { version: 1, kind: "candidate-observation", verifier: { id: "host:test", version: "1" },
+		sourceBinding: "verified", correctness: "passed", stage: "measurement", checks: [], goalChecks: [],
+		metrics: [{ name: "latency", value: 4, unit: "ms", basisId: "basis:gemm", direction: "lower" }],
+		limitations: [], sourceFiles: ["/frozen/kernel.cpp"], receiptFiles: ["/frozen/receipt.json"],
+		executionFacts: { evaluations: [{ externalId: "E1", subjectId: "gemm", status: "Completed", terminal: true,
+			capturedAt: "2026-10-17T09:00:00.000Z", receiptIndex: 0, cases: [], diagnostics: [] }] } };
+	await writeFile(path.join(runDir, "goal.json"), JSON.stringify({ version: 1, runId: "20261017T090000Z-aaaa",
+		tasks: [{ taskId: "T001", status: "accepted", workDir: path.join(runDir, "work"), subjectId: "gemm",
+			episode: { version: 1, incumbents: [], candidates: [{ id: "C001", intent: "solution",
+				sourcePaths: ["kernel.cpp"], receiptPaths: ["receipt.json"], observation,
+				observationPath: "/frozen/observation.json" }] } }] }));
+	const service = { status: async () => ({ workspace, stages: {} }) } as unknown as ResearchService;
+	const registered = captureExtension(service);
+	const status = registered.tools.get("research_status")!;
+	const plain = JSON.parse(((await status.execute("s1", {}, undefined, undefined, toolContext(workspace))) as { content: Array<{ text: string }> }).content[0].text);
+	assert.equal(plain.priorRuns, undefined);
+	const matched = JSON.parse(((await status.execute("s2", { priorRuns: { subjectId: "gemm" } },
+		undefined, undefined, toolContext(workspace))) as { content: Array<{ text: string }> }).content[0].text);
+	assert.deepEqual(matched.priorRuns.leads.map((lead: { candidateRef: string }) => lead.candidateRef), ["T001/C001"]);
+	assert.match(matched.priorRuns.summary[0], /latency=4ms/);
+	assert.match(matched.priorRuns.summary[0], /re-measure under the current conditions before quoting it/);
+	const other = JSON.parse(((await status.execute("s3", { priorRuns: { subjectId: "softmax" } },
+		undefined, undefined, toolContext(workspace))) as { content: Array<{ text: string }> }).content[0].text);
+	assert.deepEqual(other.priorRuns.leads, []);
 });

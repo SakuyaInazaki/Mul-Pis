@@ -43,6 +43,19 @@ export interface AdmissionResult {
  baselineCost: number;
  candidateCost: number;
  costSource: "sdk-estimate";
+ /** Budget stated in tokens as well as in estimated cost: a paired comparison
+  * whose unit is wall clock or round count is not comparable across arms. */
+ baselineTokens: number;
+ candidateTokens: number;
+ /** The model these arms ran on. A result obtained on another model is not
+  * transferable: the same mechanism reverses direction between models. */
+ model: string;
+ /** Cases whose projection decisions actually differ between the two policies.
+  * An untriggered case has no headroom for this mechanism and can only measure
+  * noise, so it is reported but excluded from the decision. */
+ headroom: { cases: number; triggeredCases: number; untriggeredCaseIds: string[] };
+ /** Paired statistics over the triggered cases, with the n they are based on. */
+ paired: { n: number; candidateCheaper: number; candidateCostlier: number; tied: number; signTestTwoSidedP: number | null };
  trialCalls: number;
  /** Observed UTF-16 code units returned through readback; never an allowance. */
  readbackChars: number;
@@ -134,14 +147,15 @@ export async function runAdmission(args: {
  baselineVersionId: string; candidateVersionId: string; plan: CampaignPlan;
 }): Promise<AdmissionResult> {
  const { runner, config, persistDir, caseSet, baseline, candidate, plan } = args;
- const result: AdmissionResult = { version: 1, scope: "local-mechanism-projection-readback", status: "inconclusive", reason: "not evaluated", caseSetSplit: caseSet.split, queryCount: 0, results: [], baselineCost: 0, candidateCost: 0, costSource: "sdk-estimate", trialCalls: 0, readbackChars: 0, readbackUtf8Bytes: 0 };
- if (caseSet.split === "admission" && (plan.repetitions < 2 || plan.repetitions % 2 !== 0)) { result.reason = "admission requires at least two even-order repetitions"; return result; }
  const model = resolveRoleModel(config, "research");
+ const result: AdmissionResult = { version: 1, scope: "local-mechanism-projection-readback", status: "inconclusive", reason: "not evaluated", caseSetSplit: caseSet.split, queryCount: 0, results: [], baselineCost: 0, candidateCost: 0, costSource: "sdk-estimate", baselineTokens: 0, candidateTokens: 0, model, headroom: { cases: caseSet.cases.length, triggeredCases: 0, untriggeredCaseIds: [] }, paired: { n: 0, candidateCheaper: 0, candidateCostlier: 0, tied: 0, signTestTwoSidedP: null }, trialCalls: 0, readbackChars: 0, readbackUtf8Bytes: 0 };
+ if (caseSet.split === "admission" && (plan.repetitions < 2 || plan.repetitions % 2 !== 0)) { result.reason = "admission requires at least two even-order repetitions"; return result; }
  let anyTriggered = false;
  for (const item of caseSet.cases) {
   const baseDecisions = projection(baseline, item.materials).decisions, candidateDecisions = projection(candidate, item.materials).decisions;
   const triggered = baseDecisions.some((d, i) => d !== candidateDecisions[i]);
   anyTriggered ||= triggered;
+  if (triggered) result.headroom.triggeredCases++; else result.headroom.untriggeredCaseIds.push(item.id);
   for (let repeatIndex = 0; repeatIndex < plan.repetitions; repeatIndex++) {
    const order = repeatIndex % 2 === 0 ? "baseline-first" : "candidate-first";
    const arms: Array<"baseline" | "candidate"> = order === "baseline-first" ? ["baseline", "candidate"] : ["candidate", "baseline"];
@@ -186,21 +200,49 @@ export async function runAdmission(args: {
    } catch (error) { armResult.failure = (error as Error).message; }
    finally { observeUsage(); if (armResult.failure) armResult.usage.complete = false; if (!armResult.usage.complete) armResult.usage.usageSettlement = "pending-or-unknown"; handle.dispose(); result.results.push(armResult); result.queryCount++; }
    if (armResult.failure || !armResult.usage.complete) { result.reason = armResult.failure ?? "incomplete provider usage or SDK cost estimate"; return result; }
-   if (arm === "baseline") result.baselineCost += armResult.usage.cost; else result.candidateCost += armResult.usage.cost;
+   if (arm === "baseline") { result.baselineCost += armResult.usage.cost; result.baselineTokens += armResult.usage.input + armResult.usage.output; }
+   else { result.candidateCost += armResult.usage.cost; result.candidateTokens += armResult.usage.input + armResult.usage.output; }
   }
   }
  }
  if (!anyTriggered) { result.reason = "candidate projection did not trigger in any registered case"; return result; }
  if (result.results.length !== caseSet.cases.length * plan.repetitions * 2) { result.reason = "incomplete paired cases"; return result; }
  if (result.results.some((r) => !r.passed)) { result.status = "rejected"; result.reason = "pre-registered mechanical hard checks failed"; return result; }
- const pairDeltas: number[] = [];
- for (const item of caseSet.cases) for (let repeatIndex = 0; repeatIndex < plan.repetitions; repeatIndex++) {
-  const pair = result.results.filter((r) => r.caseId === item.id && r.repeatIndex === repeatIndex);
-  if (pair.length !== 2) { result.reason = "incomplete paired repetitions"; return result; }
-  pairDeltas.push(pair.find((r) => r.arm === "candidate")!.usage.cost - pair.find((r) => r.arm === "baseline")!.usage.cost);
+ // Only a case whose projection decisions differ between the two policies can
+ // carry a mechanism effect. An untriggered case runs the identical prompt in
+ // both arms, so its cost difference is run-to-run noise and must not decide.
+ const decisive: number[] = [];
+ for (const item of caseSet.cases) {
+  const triggered = !result.headroom.untriggeredCaseIds.includes(item.id);
+  for (let repeatIndex = 0; repeatIndex < plan.repetitions; repeatIndex++) {
+   const pair = result.results.filter((r) => r.caseId === item.id && r.repeatIndex === repeatIndex);
+   if (pair.length !== 2) { result.reason = "incomplete paired repetitions"; return result; }
+   const delta = pair.find((r) => r.arm === "candidate")!.usage.cost - pair.find((r) => r.arm === "baseline")!.usage.cost;
+   if (triggered) decisive.push(delta);
+  }
  }
- if (pairDeltas.some((delta) => delta > 0)) { result.status = pairDeltas.some((delta) => delta < 0) ? "inconclusive" : "rejected"; result.reason = "candidate cost increased in at least one registered pair"; return result; }
- if (!(result.candidateCost < result.baselineCost)) { result.status = "rejected"; result.reason = "candidate did not reduce observed SDK-estimated cost"; return result; }
- result.status = "accepted"; result.reason = "all local mechanical checks passed and observed SDK-estimated cost decreased";
+ result.paired = pairedStatistics(decisive);
+ if (!decisive.length) { result.reason = "no triggered case carried a paired observation"; return result; }
+ if (decisive.some((delta) => delta > 0)) { result.status = decisive.some((delta) => delta < 0) ? "inconclusive" : "rejected"; result.reason = "candidate cost increased in at least one triggered pair"; return result; }
+ if (!(result.paired.candidateCheaper > 0)) { result.status = "rejected"; result.reason = "no triggered pair reduced the observed SDK-estimated cost"; return result; }
+ result.status = "accepted";
+ result.reason = `all local mechanical checks passed; observed SDK-estimated cost decreased in ${result.paired.candidateCheaper} of ${result.paired.n + result.paired.tied} triggered pairs (two-sided sign test p=${result.paired.signTestTwoSidedP ?? "n/a"})`;
  return result;
+}
+
+/** Exact two-sided sign test over paired deltas. Ties carry no direction and
+ * are excluded from n, as the test itself requires. Integer arithmetic only. */
+export function pairedStatistics(deltas: readonly number[]): AdmissionResult["paired"] {
+ const candidateCheaper = deltas.filter((delta) => delta < 0).length;
+ const candidateCostlier = deltas.filter((delta) => delta > 0).length;
+ const tied = deltas.length - candidateCheaper - candidateCostlier;
+ const n = candidateCheaper + candidateCostlier;
+ if (!n) return { n: 0, candidateCheaper, candidateCostlier, tied, signTestTwoSidedP: null };
+ const k = Math.min(candidateCheaper, candidateCostlier);
+ let tail = 0, binomial = 1;
+ for (let i = 0; i <= k; i++) {
+  if (i > 0) binomial = binomial * (n - i + 1) / i;
+  tail += binomial;
+ }
+ return { n, candidateCheaper, candidateCostlier, tied, signTestTwoSidedP: Math.min(1, 2 * tail / 2 ** n) };
 }

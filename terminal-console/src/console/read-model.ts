@@ -5,18 +5,17 @@ import type { CandidateMetricV1, CandidateObservationV1, CurrentGoal, M07TaskRec
 import { candidateSearchSnapshot, globalCandidateBest, type CandidateArchiveEntry } from "../../../src/m07/candidate-archive.ts";
 import { candidateSearchBrief, candidateSearchFocus } from "../../../src/m07/candidate-search.ts";
 import { summarizeCandidateDiagnostics, type CandidateComparisonV1 } from "../../../src/m07/candidate-diagnostics.ts";
-import type { SessionTelemetry } from "../../../src/dashboard/telemetry.ts";
+import type { SessionTelemetry } from "../../../src/telemetry.ts";
 import type { StageRunRecord } from "../../../src/types.ts";
 import type { ObjectiveProgressV1 } from "../../../src/m07/objective-progress.ts";
 import { openDefaultLocalMission } from "../../../src/m07/local-mission.ts";
 import type { ConsoleRef, ConsoleStatus, WorkflowNode, WorkflowSnapshot } from "./model.ts";
+import { buildWorkflowAudit, type AuditGoalInput, type AuditTransportObservation } from "./audit.ts";
+import { DEFAULT_CONSOLE_LIMITS, loadConsoleLimits, type ConsoleLimitsV1 } from "./limits.ts";
 
 export type { WorkflowSnapshot, WorkflowNode } from "./model.ts";
 export interface ReadOptions { goalRunId?: string; missionId?: string; stage?: string; runId?: string; now?: number }
 const STAGES = Array.from({ length: 9 }, (_, i) => `M${String(i + 1).padStart(2, "0")}`);
-const MAX_JSON = 40_000_000;
-const MAX_PREVIEW = 65_536;
-const STALE_MS = 20_000;
 type Cached = { mtimeMs: number; size: number; data: unknown };
 type CheckpointProjection = { runId?: string; updatedAt?: string; selectedTaskIds?: string[]; omittedTaskIds?: string[] };
 type CachedCheckpoint = { mtimeMs: number; size: number; data?: CheckpointProjection };
@@ -75,6 +74,9 @@ export class WorkflowReader {
   private cache = new Map<string, Cached>();
   private checkpointCache = new Map<string, CachedCheckpoint>();
   private last?: WorkflowSnapshot;
+  /** Replaced by the workspace's own file on the first read; the defaults only
+   * apply until then, and a malformed override is an error, not a fallback. */
+  private limits: ConsoleLimitsV1 = { ...DEFAULT_CONSOLE_LIMITS };
   constructor(workspace: string) { this.workspace = path.resolve(workspace); }
 
   private async json(file: string): Promise<unknown | undefined> {
@@ -82,7 +84,7 @@ export class WorkflowReader {
       const safe = await this.confined(file);
       if (!safe) return undefined;
       const s = await stat(safe);
-      if (!s.isFile() || s.size > MAX_JSON) return undefined;
+      if (!s.isFile() || s.size > this.limits.maxJsonBytes) return undefined;
       const prior = this.cache.get(safe);
       if (prior && prior.mtimeMs === s.mtimeMs && prior.size === s.size) return prior.data;
       const data: unknown = JSON.parse(await readFile(safe, "utf8"));
@@ -96,7 +98,7 @@ export class WorkflowReader {
       const safe = await this.confined(file);
       if (!safe) return undefined;
       const s = await stat(safe);
-      if (!s.isFile() || s.size > MAX_JSON) return undefined;
+      if (!s.isFile() || s.size > this.limits.maxJsonBytes) return undefined;
       const prior = this.checkpointCache.get(safe);
       if (prior && prior.mtimeMs === s.mtimeMs && prior.size === s.size) return prior.data;
       const parsed = obj(JSON.parse(await readFile(safe, "utf8")));
@@ -123,6 +125,7 @@ export class WorkflowReader {
 
   async read(options: ReadOptions = {}): Promise<WorkflowSnapshot> {
     const now = options.now ?? Date.now(), warnings: string[] = [];
+    this.limits = await loadConsoleLimits(this.workspace);
     const nodes: WorkflowNode[] = STAGES.map(stage => ({ id: `stage:${stage}`, label: stage, kind: "stage", status: "pending", stage, detail: [], outputRefs: [], artifactRefs: [], checks: [] }));
     const runs: StageRunRecord[] = [];
     for (const stage of STAGES) {
@@ -134,7 +137,7 @@ export class WorkflowReader {
         if (r && r.stage === stage && r.runId === ent.name && str(r.startedAt) && ["running", "completed", "failed"].includes(String(r.status))) runs.push(run as StageRunRecord);
         else if (existsSync(path.join(dir, ent.name, "run.json"))) {
           const size = await stat(path.join(dir, ent.name, "run.json")).then(x => x.size).catch(() => 0);
-          warnings.push(`${stage}/${ent.name} 的 run.json ${size > MAX_JSON ? `超过 ${MAX_JSON} 字节读取上限` : "不可读取或格式异常"}`);
+          warnings.push(`${stage}/${ent.name} 的 run.json ${size > this.limits.maxJsonBytes ? `超过 ${this.limits.maxJsonBytes} 字节读取上限` : "不可读取或格式异常"}`);
         }
       }
     }
@@ -146,7 +149,7 @@ export class WorkflowReader {
       const goal = obj(await this.json(path.join(this.workspace, "stages", "M07", run.runId, "goal.json")));
       goalSessionIds.set(run.runId, new Set(arr(goal?.tasks).map(x => str(obj(obj(x)?.session)?.id)).filter((x): x is string => Boolean(x))));
     }
-    const freshFor = (r: StageRunRecord) => telemetry.some(t => ((t.stage === r.stage && t.runId === r.runId) || (r.stage === "M07" && goalSessionIds.get(r.runId)?.has(t.id))) && t.activity !== "ended" && now - Date.parse(t.lastSeenAt) <= STALE_MS);
+    const freshFor = (r: StageRunRecord) => telemetry.some(t => ((t.stage === r.stage && t.runId === r.runId) || (r.stage === "M07" && goalSessionIds.get(r.runId)?.has(t.id))) && t.activity !== "ended" && now - Date.parse(t.lastSeenAt) <= this.limits.staleHeartbeatMs);
     const activeGoals: StageRunRecord[] = [];
     for (const run of runs.filter(r => r.stage === "M07" && r.status === "running")) {
       const goal = obj(await this.json(path.join(this.workspace, "stages", "M07", run.runId, "goal.json")));
@@ -159,7 +162,7 @@ export class WorkflowReader {
     else if (options.stage && options.runId) selected = runs.find(r => r.stage === options.stage && r.runId === options.runId);
     else if (options.stage) selected = runs.filter(r => r.stage === options.stage).at(-1);
     else {
-      const fresh = telemetry.filter(t => t.stage && t.runId && t.activity === "active" && now - Date.parse(t.lastSeenAt) <= STALE_MS)
+      const fresh = telemetry.filter(t => t.stage && t.runId && t.activity === "active" && now - Date.parse(t.lastSeenAt) <= this.limits.staleHeartbeatMs)
         .sort((a, b) => a.lastSeenAt.localeCompare(b.lastSeenAt));
       const current = fresh.at(-1);
       selected = current ? runs.find(r => r.stage === current.stage && r.runId === current.runId) : undefined;
@@ -178,7 +181,7 @@ export class WorkflowReader {
       nodes, events: [], runs: runs.map(r => ({ stage: r.stage, runId: r.runId,
         status: r.status === "running" && !freshFor(r) ? "unknown" : r.status,
         startedAt: r.startedAt, finishedAt: r.finishedAt, sessions: r.sessions?.length ?? 0, outputs: r.outputs?.length ?? 0, knowledgeSnapshot: r.knowledgeSnapshot })),
-      knowledge: { frozen: selected?.knowledgeSnapshot }, warnings,
+      knowledge: { frozen: selected?.knowledgeSnapshot }, audit: buildWorkflowAudit([], [], new Date(now).toISOString()), warnings,
     };
     const currentFile = path.join(this.workspace, ".agent", "knowledge", "CURRENT");
     try { const safe = await this.confined(currentFile); if (safe) snapshot.knowledge.current = (await readFile(safe, "utf8")).trim() || undefined; } catch { /* no publication yet */ }
@@ -206,10 +209,41 @@ export class WorkflowReader {
     if (!options.stage || options.stage === "M07" || options.missionId)
       await this.addMissions(snapshot, runs, telemetry, now, options.missionId);
     await this.addUsage(snapshot);
+    snapshot.audit = buildWorkflowAudit(await this.auditGoals(runs), snapshot.nodes, snapshot.generatedAt);
     snapshot.events.sort((a, b) => a.at.localeCompare(b.at));
     snapshot.events = snapshot.events.slice(-120);
     this.last = snapshot;
     return snapshot;
+  }
+
+  /** Every readable M07 goal in this workspace, not only the selected one: an
+   * audit that only covered the current selection could not answer "how often
+   * did the engine refuse what the agent accepted" across the whole run. */
+  private async auditGoals(runs: readonly StageRunRecord[]): Promise<AuditGoalInput[]> {
+    const goals: AuditGoalInput[] = [];
+    for (const run of runs) {
+      if (run.stage !== "M07") continue;
+      const goal = await this.json(path.join(this.workspace, "stages", "M07", run.runId, "goal.json")) as CurrentGoal | undefined;
+      if (goal?.runId === run.runId && Array.isArray(goal.tasks))
+        goals.push({ runId: run.runId, tasks: goal.tasks, ...await this.transportObservations(run) });
+    }
+    return goals;
+  }
+
+  /** Assessor transport failures are persisted as run outputs. Their class is
+   * the runner's own judgement; this only reads it back, newest window first. */
+  private async transportObservations(run: StageRunRecord): Promise<{ transport: AuditTransportObservation[]; transportTruncated: boolean }> {
+    const files = (run.outputs ?? []).filter(output => output.label === "Read-only assessor transport observation");
+    const window = files.slice(-this.limits.transportObservationWindow);
+    const transport: AuditTransportObservation[] = [];
+    for (const output of window) {
+      const record = obj(await this.json(output.path));
+      if (!record) continue;
+      const diagnostic = obj(record.diagnostic);
+      transport.push({ ...(str(diagnostic?.failureClass) ? { failureClass: str(diagnostic?.failureClass)! } : {}),
+        ...(str(diagnostic?.failureReason) ? { failureReason: str(diagnostic?.failureReason)! } : {}) });
+    }
+    return { transport, transportTruncated: files.length > window.length };
   }
 
   private runNode(run: StageRunRecord): WorkflowNode {
@@ -219,7 +253,7 @@ export class WorkflowReader {
       outputRefs: visible, artifactRefs: visible, checks: [] };
   }
   private sessionNode(run: StageRunRecord, s: { id: string; label: string; model: string; file?: string }, telemetry: SessionTelemetry | undefined, now: number, parentId: string): WorkflowNode {
-    const stale = telemetry && telemetry.activity !== "ended" && now - Date.parse(telemetry.lastSeenAt) > STALE_MS;
+    const stale = telemetry && telemetry.activity !== "ended" && now - Date.parse(telemetry.lastSeenAt) > this.limits.staleHeartbeatMs;
     const status: ConsoleStatus = telemetry?.activity === "ended" ? telemetry.outcome === "failed" ? "failed" : telemetry.outcome === "aborted" ? "unknown" : "completed"
       : stale ? "stale" : telemetry?.activity === "active" ? "running" : telemetry?.activity === "idle" ? "waiting" : "unknown";
     return { id: `session:${s.id}`, parentId, label: clean(s.label), kind: "session", status, stage: run.stage, runId: run.runId, sessionId: s.id, model: s.model,
@@ -242,7 +276,7 @@ export class WorkflowReader {
     const goal = await this.json(file) as CurrentGoal | undefined;
     if (!goal || goal.runId !== run.runId || !Array.isArray(goal.tasks)) {
       const size = await stat(file).then(x => x.size).catch(() => 0);
-      snap.warnings.push(`M07/${run.runId} goal.json ${size > MAX_JSON ? `超过 ${MAX_JSON} 字节读取上限` : "不可读取或格式异常"}`); return;
+      snap.warnings.push(`M07/${run.runId} goal.json ${size > this.limits.maxJsonBytes ? `超过 ${this.limits.maxJsonBytes} 字节读取上限` : "不可读取或格式异常"}`); return;
     }
     const execution = goal.executionState;
     const attempt = execution?.attempts.find(a => a.id === execution.activeAttemptId);
@@ -279,7 +313,7 @@ export class WorkflowReader {
     runNode.detail.push(`目标：${clean(goal.goal)}`, `生命周期：${goal.lifecycle}`, `执行尝试：${attempt?.state ?? "未记录"}`);
     if (attempt?.state === "suspended") runNode.status = "suspended";
     else if (attempt?.state === "recovery-required") runNode.status = "blocked";
-    else if (goal.lifecycle === "active" && runNode.status === "running" && (!attempt || attempt.state === "running") && !telemetry.some(x => ((x.stage === "M07" && x.runId === run.runId) || goal.tasks.some(t => t.session?.id === x.id)) && x.activity !== "ended" && now - Date.parse(x.lastSeenAt) <= STALE_MS)) {
+    else if (goal.lifecycle === "active" && runNode.status === "running" && (!attempt || attempt.state === "running") && !telemetry.some(x => ((x.stage === "M07" && x.runId === run.runId) || goal.tasks.some(t => t.session?.id === x.id)) && x.activity !== "ended" && now - Date.parse(x.lastSeenAt) <= this.limits.staleHeartbeatMs)) {
       runNode.status = "unknown"; snap.warnings.push("M07 记录仍为 active，但没有新鲜心跳；当前执行状态未知");
     }
     for (const saved of execution?.attempts ?? []) {
@@ -438,7 +472,7 @@ export class WorkflowReader {
     if (t.branchSource?.manifestPath) artifactRefs.push({ label: "候选冻结清单", path: t.branchSource.manifestPath });
     if (t.candidateObservation?.observationPath) artifactRefs.push({ label: "候选核验观测", path: t.candidateObservation.observationPath });
     const sessionTelemetry = t.session ? telemetry.find(x => x.id === t.session!.id) : undefined;
-    const fresh = sessionTelemetry && sessionTelemetry.activity !== "ended" && now - Date.parse(sessionTelemetry.lastSeenAt) <= STALE_MS;
+    const fresh = sessionTelemetry && sessionTelemetry.activity !== "ended" && now - Date.parse(sessionTelemetry.lastSeenAt) <= this.limits.staleHeartbeatMs;
     const taskStatus: ConsoleStatus = t.status === "running" && !fresh ? sessionTelemetry && sessionTelemetry.activity !== "ended" ? "stale" : "unknown" : t.status;
     const reviewedChecks = checkRows(t.review?.checks);
     const declaredChecks = [...new Set(arr(t.checks).filter((criterion): criterion is string => typeof criterion === "string"))];
@@ -474,6 +508,10 @@ export class WorkflowReader {
         status: t.status === "running" ? taskStatus : episode.candidates.length ? "returned" : "pending",
         stage: "M07", runId: run.runId, taskId: t.taskId,
         detail: [`已冻结候选：${episode.candidates.length}`, `当前探索点：${episode.currentCandidateId ?? "无"}`,
+          ...(episode.search ? [`搜索状态：路线 ${episode.search.route} · 相位 ${episode.search.phase} · 停滞 ${episode.search.stagnation} · 修复深度 ${episode.search.repairDepth}${episode.search.forcedDirectionChange ? " · 已强制换向" : ""}`,
+            `停滞信号：${episode.search.signals.join("、") || "无"}；禁用方向 ${episode.search.bannedDirections.length} 条${episode.search.bannedDirections.length ? `（${episode.search.bannedDirections.map(item => `${item.changeKind}${item.strategy ? `/${item.strategy}` : ""}${item.location ? `@${item.location}` : ""} ← ${item.candidateRef}`).slice(0, 5).join("、")}）` : ""}`,
+            ...(episode.search.recommendedParents.length ? [`建议父候选：${episode.search.recommendedParents.map(item => `${item.candidateRef}（${item.why}）`).join("、")}`] : []),
+            episode.search.message] : []),
           ...incumbentRows.map(item => `本 episode 局部最佳：${item.candidateId} · 对象 ${item.subjectId} · ${item.metric.name}=${item.metric.value} ${item.metric.unit}（${item.metric.basisId}）`),
           "局部最佳不代表整个目标的历史最佳、任务接受或原目标达标；任务状态另见父节点"].map(clean),
         outputRefs: incumbentRows.map(item => ({ label: `局部最佳 ${item.candidateId} 的冻结观测`, path: byId.get(item.candidateId)!.observationPath })),
@@ -490,6 +528,17 @@ export class WorkflowReader {
           kind: "candidate", status: observation.correctness === "passed" ? "returned" : observation.correctness === "failed" ? "failed" : "unknown",
           stage: "M07", runId: run.runId, taskId: t.taskId,
           detail: [`假设：${candidate.hypothesis}`, `改动类别：${candidate.changeKind}`, `候选意图：${candidate.intent}`,
+            ...(candidate.policy ? [
+              `宿主判决：${candidate.policy.guard} · 状态 ${candidate.policy.status} · 分支 ${candidate.policy.branch} · 车道 ${candidate.policy.lane} · 相位 ${candidate.policy.phase}`,
+              `排名分：${candidate.policy.score}（${candidate.policy.tier}）；${candidate.policy.updatesBest ? "更新了最佳指针" : "未更新最佳指针"}${candidate.policy.seedSpeedup === undefined ? "" : `；相对种子 ${candidate.policy.seedRef ?? "未记录"} 的最坏同口径比 ${candidate.policy.seedSpeedup}`}`,
+              ...(candidate.policy.failureSignature ? [`失败签名：${candidate.policy.failureSignature}（同签名重复出现即「无进展」）`] : []),
+              ...candidate.policy.incumbentComparison.map(item => `对位最佳比较：${item.name}（${item.basisId}，${item.unit}）候选 ${item.candidateValue} 对 ${item.incumbentRef} 的 ${item.incumbentValue}，相对增益 ${item.relativeGain}${item.improved ? "，改善" : item.regressed ? "，回退" : "，在噪声内"}`),
+              ...candidate.policy.requiredFix.map(item => `必须修复：${item}`),
+              ...candidate.policy.advisory.map(item => `建议：${item}`),
+              ...candidate.policy.reasons.map(item => `判决依据：${item}`),
+              "判决由宿主确定性代码给出，不是模型自述；它只说明搜索状态如何变化，不等于科学结论。"] : ["本候选没有宿主判决记录"]),
+            ...(candidate.strategy ? [`声明策略：${candidate.strategy}${candidate.location ? ` @ ${candidate.location}` : ""}`] : []),
+            ...(candidate.newEvidence ? [`重复禁用方向的声明理由：${candidate.newEvidence}（模型声明，不是宿主事实）`] : []),
             ...(!availableCandidateRefs.has(`${t.taskId}/${candidate.id}`) ? ["冻结证据当前不可读取；以下路径为历史登记，不参与当前最佳和搜索前沿。"] : []),
             `父候选：${parentRef ? `${parentRef.taskId}/${parentRef.candidateId}` : candidate.parentCandidateId ?? "无"}`,
             ...(parentRef && parentRef.taskId !== t.taskId ? ["跨任务血缘为候选声明；本节点保留在当前任务实验下"] : []),
@@ -552,8 +601,8 @@ export class WorkflowReader {
       artifactRefs, checks: checkRows(t.review.checks) });
     // Tool log entries are control records; a tool event is never represented as concurrent work.
     const toolLog = t.toolLog ?? [];
-    const offset = Math.max(0, toolLog.length - 100);
-    if (offset) snap.nodes.find(n => n.id === id)?.detail.push(`工具记录共 ${toolLog.length} 条；树中显示末 100 条，完整记录以目标控制文件为准`);
+    const offset = Math.max(0, toolLog.length - this.limits.toolLogWindow);
+    if (offset) snap.nodes.find(n => n.id === id)?.detail.push(`工具记录共 ${toolLog.length} 条；树中显示末 ${this.limits.toolLogWindow} 条，完整记录以目标控制文件为准`);
     for (const [i, raw] of toolLog.slice(offset).entries()) {
       const row = obj(raw); if (!row) continue;
       const name = str(row.toolName) ?? str(row.name) ?? str(row.tool) ?? "工具";
@@ -727,7 +776,7 @@ export class WorkflowReader {
       if (!output) continue;
       const file = await this.confined(output.path.replace(/\.jsonl$/, ".usage.jsonl"));
       if (!file) continue;
-      const truncated = (await stat(file)).size > MAX_PREVIEW;
+      const truncated = (await stat(file)).size > this.limits.maxPreviewBytes;
       const raw = await this.tail(file);
       const rows = raw.split(/\r?\n/).map(line => { try { return obj(JSON.parse(line)); } catch { return undefined; } }).filter((x): x is Record<string, unknown> => Boolean(x));
       const unique = new Map<string, Record<string, unknown>>();
@@ -781,7 +830,7 @@ export class WorkflowReader {
     } catch { return undefined; }
   }
   private async tail(file: string): Promise<string> {
-    const s = await stat(file); const size = Math.min(MAX_PREVIEW, s.size);
+    const s = await stat(file); const size = Math.min(this.limits.maxPreviewBytes, s.size);
     const handle = await open(file, "r");
     try {
       const buffer = Buffer.alloc(size); await handle.read(buffer, 0, size, s.size - size);

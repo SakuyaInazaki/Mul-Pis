@@ -5,8 +5,10 @@
  * session does the substantive judgement. The first round may continue the M01
  * session; later rounds use a fresh research session that only receives the
  * current knowledge pack, the feedback and the artifact locations. One feedback
- * batch is the minimal unit. Proposals are validated structurally and merged
- * through the single serial entry; merging is never a truth certificate.
+ * batch is the minimal unit. Proposals are validated structurally, structured
+ * optimization cards additionally pass the deterministic admission gate, and
+ * everything merges through the single serial entry; merging is never a truth
+ * certificate.
  */
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -15,8 +17,11 @@ import { linkedEvidence, openBoundedSession } from "../context/boundary.ts";
 import type { CustomToolSpec, ReadReturnEvent } from "../runner/types.ts";
 import { textReadCoverage } from "../runner/read-coverage.ts";
 import type { KnowledgeStore, ProposalOp, ProposalReceipt, Snapshot, ValidationIssue } from "../knowledge/types.ts";
-import { renderKnowledgeIndexRecord } from "../knowledge/pack.ts";
-import { retrieveKnowledge, validateKnowledgeRetrievalContext } from "../knowledge/retrieval.ts";
+import { validateKnowledgeRetrievalContext } from "../knowledge/retrieval.ts";
+import { assembleInjection } from "../knowledge/injection.ts";
+import { activeLimitsFor, assertStableKnowledge, characterRange, recordDependencyIndex, renderOriginalRecord,
+	resolveSnapshotRecord, selectKnowledgePage } from "../knowledge/session-tools.ts";
+import { collectFailureObservations, failureRuleDrafts, renderFailureRuleDrafts } from "../knowledge/rule-mining.ts";
 import { publishedArtifact, publishedArtifactCatalogue, textArtifact } from "../m07/execution-knowledge.ts";
 import { buildM04Message, extractKnowledgeProposals, systemPromptFor } from "../prompts.ts";
 import type { ProblemMaterials } from "../prompts.ts";
@@ -157,35 +162,15 @@ function m04KnowledgeSelectTool(store: KnowledgeStore, snapshot: Snapshot, calls
 				limit: limit as number, returnedRefs: [], status: "requested", at: new Date().toISOString(), ...owner() };
 			calls.push(request);
 			try {
-				if ((await store.current())?.id !== snapshot.id) throw new HarnessError("m04.knowledge-select", "knowledge snapshot changed during M04 selection");
-				const selection = await retrieveKnowledge(store, { purpose: "M04 会话内知识再检索", text: query,
-					...(context ? { context } : {}), view: "refs",
-					maxRecords: Math.max(1, snapshot.records.reduce((total, item) => total + item.version, 0)),
-					maxChars: Number.MAX_SAFE_INTEGER });
-				const refs = selection.rankedRefs;
-				request.total = refs.length;
-				if ((offset as number) > refs.length)
-					throw new HarnessError("m04.knowledge-select", `record offset ${offset} exceeds selection length ${refs.length}`);
-				const end = Math.min(refs.length, (offset as number) + (limit as number));
-				const pageRefs = refs.slice(offset as number, end);
-				const latest = new Map(snapshot.records.map(item => [item.id, item.version]));
-				const blocks: string[] = [];
-				for (const ref of pageRefs) {
-					const match = /^([CKEJQDX]\d{3,})@(\d+)$/u.exec(ref);
-					if (!match) throw new HarnessError("m04.knowledge-select", `invalid published record reference ${ref}`);
-					const record = await store.get(match[1], Number(match[2]));
-					if (!record) throw new HarnessError("m04.knowledge-select", `published record unavailable: ${ref}`);
-					const availability = await store.availability(record.id, record.version);
-					blocks.push(renderKnowledgeIndexRecord(record, availability, selection.limits, latest.get(record.id)));
-				}
-				if (selection.snapshot !== snapshot.id || (await store.current())?.id !== snapshot.id ||
-					JSON.stringify(await store.limits()) !== JSON.stringify(selection.limits))
-					throw new HarnessError("m04.knowledge-select", "knowledge snapshot or live limits changed during M04 selection; retry");
-				request.returnedRefs = pageRefs;
+				const page = await selectKnowledgePage(store, { purpose: "M04 会话内知识再检索", text: query,
+					snapshot, ...(context ? { context } : {}), offset: offset as number, limit: limit as number,
+					view: "index", scope: "m04.knowledge-select" });
+				request.total = page.total;
+				request.returnedRefs = page.returnedRefs;
 				request.status = "returned";
-				const notice = `知识发现索引；快照 ${snapshot.id}；记录序号 ${offset}-${end}/${refs.length}；${end < refs.length ? `下一页 offset=${end}` : "已到末尾"}。本页引用 ${JSON.stringify(pageRefs)}。必要依赖、反驳和实时限制只作发现；正文及证据尚未读取，使用前逐条 knowledge_read。`;
-				return { text: `${notice}\n- 检索状态：${selection.status}；未纳入 ${selection.omitted.length} 项${selection.omitted.length ? `（原因：${JSON.stringify(selection.omitted.slice(0, 20))}${selection.omitted.length > 20 ? " 等" : ""}）` : ""}\n\n${blocks.join("\n")}`,
-					details: { snapshot: snapshot.id, offset, end, total: refs.length, returnedRefs: pageRefs, status: selection.status } };
+				const notice = `知识发现索引；快照 ${snapshot.id}；记录序号 ${page.offset}-${page.end}/${page.total}；${page.end < page.total ? `下一页 offset=${page.end}` : "已到末尾"}。本页引用 ${JSON.stringify(page.returnedRefs)}。必要依赖、反驳和实时限制只作发现；正文及证据尚未读取，使用前逐条 knowledge_read。`;
+				return { text: `${notice}\n- 检索状态：${page.selection.status}；未纳入 ${page.selection.omitted.length} 项${page.selection.omitted.length ? `（原因：${JSON.stringify(page.selection.omitted.slice(0, 20))}${page.selection.omitted.length > 20 ? " 等" : ""}）` : ""}\n\n${page.blocks.join("\n")}`,
+					details: { snapshot: snapshot.id, offset: page.offset, end: page.end, total: page.total, returnedRefs: page.returnedRefs, status: page.selection.status } };
 			} catch (error) { request.status = "failed"; throw error; }
 		},
 	};
@@ -214,28 +199,17 @@ function m04KnowledgeReadTool(store: KnowledgeStore, snapshot: Snapshot, calls: 
 			const request: KnowledgeReadCall = { id, ...(version === undefined ? {} : { requestedVersion: version as number }), offset: offset as number, limit: limit as number, status: "requested", at: new Date().toISOString(), ...owner() };
 			calls.push(request);
 			try {
-				if ((await store.current())?.id !== snapshot.id) throw new HarnessError("m04.knowledge-read", "knowledge snapshot changed during M04 reading");
-				const selectedVersion = version === undefined ? published.get(id) : version as number;
-				if (!selectedVersion || selectedVersion > (published.get(id) ?? 0)) {
+				const resolution = await resolveSnapshotRecord(store, snapshot, id, version as number | undefined, "m04.knowledge-read");
+				if (resolution.status === "not-in-snapshot") {
 					request.status = "not-in-snapshot";
 					return { text: `${id}${version === undefined ? "" : `@${version}`} 未在本次 M04 知识快照发布；不能推断其内容或采用状态。` };
 				}
-				const record = await store.get(id, selectedVersion);
-				if (!record) throw new HarnessError("m04.knowledge-read", `published record unavailable: ${id}@${selectedVersion}`);
-				request.version = selectedVersion;
-				const selection = await retrieveKnowledge(store, {
-					purpose: "M04 按 ID 补读的必要依赖与警告", text: "", requiredIds: [`${id}@${selectedVersion}`],
-					view: "index", onlyRequired: true,
-					maxRecords: Math.max(1, snapshot.records.reduce((total, item) => total + item.version, 0)),
-					maxChars: Number.MAX_SAFE_INTEGER,
-				});
-				const beforeLimits = selection.limits;
-				const availability = await store.availability(id, selectedVersion);
-				const selectedRefs = new Set([`${id}@${selectedVersion}`, ...selection.rankedRefs]);
-				const liveLimits = beforeLimits.filter(item => !item.liftedAt && [...selectedRefs].some(ref =>
-					item.target === ref || item.target === ref.split("@")[0]));
+				const { record, ref, availability } = resolution.resolved;
+				request.version = resolution.resolved.version;
+				const selection = await recordDependencyIndex(store, snapshot, ref, "M04 按 ID 补读的必要依赖与警告");
+				const liveLimits = activeLimitsFor(selection.limits, [ref, ...selection.rankedRefs]);
 				const safety = [`【每页实时状态与依赖警告；不分页】`,
-					`- 当前记录：${id}@${selectedVersion}；可用性：${availability.availability}；${availability.reasons.join("；")}`,
+					`- 当前记录：${ref}；可用性：${availability.availability}；${availability.reasons.join("；")}`,
 					`- 生效限制：${JSON.stringify(liveLimits)}`,
 					`- 依赖与警告选择：${selection.status}；未展开：${JSON.stringify(selection.omitted)}`,
 					...selection.pack.included.map(item => `- ${item.id}@${item.version}：${item.availability}`),
@@ -243,21 +217,18 @@ function m04KnowledgeReadTool(store: KnowledgeStore, snapshot: Snapshot, calls: 
 				].join("\n");
 				// Paging covers only immutable original content. A live-limit change
 				// must not shift the next offset or hide its warning behind that offset.
-				const { body, ...metadata } = record;
-				const content = [`# 知识原始记录 ${id}@${selectedVersion}`, `- 本次快照：${snapshot.id}`,
-					`- 原始元数据：${JSON.stringify(metadata)}`, "", body].join("\n");
+				const content = renderOriginalRecord(record, `# 知识原始记录 ${ref}`, [`- 本次快照：${snapshot.id}`]);
 				request.total = content.length;
-				if (selection.snapshot !== snapshot.id || (await store.current())?.id !== snapshot.id || JSON.stringify(await store.limits()) !== JSON.stringify(beforeLimits))
-					throw new HarnessError("m04.knowledge-read", "knowledge snapshot or live limits changed during M04 reading; retry");
-				if ((offset as number) > content.length) {
+				await assertStableKnowledge(store, snapshot.id, selection.limits, "m04.knowledge-read");
+				const range = characterRange(content, offset as number, limit as number);
+				if (!range) {
 					request.status = "out-of-range";
-					return { text: `${safety}\n\n知识记录 ${id}@${selectedVersion} 共 ${content.length} 个 UTF-16 字符；所请求 offset=${offset} 超出末尾，请从有效范围补读。` };
+					return { text: `${safety}\n\n知识记录 ${ref} 共 ${content.length} 个 UTF-16 字符；所请求 offset=${offset} 超出末尾，请从有效范围补读。` };
 				}
-				const end = Math.min(content.length, (offset as number) + (limit as number));
-				request.end = end;
+				request.end = range.end;
 				request.status = "returned";
-				return { text: `知识记录 ${id}@${selectedVersion}；UTF-16 范围 ${offset}-${end}/${content.length}；${end < content.length ? `下一页 offset=${end}` : "已到末尾"}\n\n${safety}\n\n${content.slice(offset as number, end)}`,
-					details: { id, version: selectedVersion, offset, end, total: content.length, snapshot: snapshot.id } };
+				return { text: `知识记录 ${ref}；UTF-16 范围 ${range.offset}-${range.end}/${range.total}；${range.end < range.total ? `下一页 offset=${range.end}` : "已到末尾"}\n\n${safety}\n\n${content.slice(range.offset, range.end)}`,
+					details: { id, version: resolution.resolved.version, offset: range.offset, end: range.end, total: range.total, snapshot: snapshot.id } };
 			} catch (error) { request.status = "failed"; throw error; }
 		},
 	};
@@ -293,44 +264,33 @@ function m04KnowledgeArtifactReadTool(store: KnowledgeStore, snapshot: Snapshot,
 				status: "requested", at: new Date().toISOString(), ...owner() };
 			calls.push(request);
 			try {
-				if ((await store.current())?.id !== snapshot.id)
-					throw new HarnessError("m04.knowledge-artifact", "knowledge snapshot changed during artifact reading");
-				const selectedVersion = version === undefined ? published.get(id) : version as number;
-				if (!selectedVersion || selectedVersion > (published.get(id) ?? 0)) {
+				const resolution = await resolveSnapshotRecord(store, snapshot, id, version as number | undefined, "m04.knowledge-artifact");
+				if (resolution.status === "not-in-snapshot") {
 					request.status = "not-in-snapshot";
 					return { text: `${id}${version === undefined ? "" : `@${version}`} 未在本次 M04 知识快照发布；不能读取其附件。` };
 				}
-				const record = await store.get(id, selectedVersion);
-				if (!record) throw new HarnessError("m04.knowledge-artifact", `published record unavailable: ${id}@${selectedVersion}`);
-				request.version = selectedVersion;
-				const selection = await retrieveKnowledge(store, { purpose: "M04 知识附件读取的必要依赖与警告", text: "",
-					requiredIds: [`${id}@${selectedVersion}`], view: "index", onlyRequired: true,
-					maxRecords: Math.max(1, snapshot.records.reduce((total, item) => total + item.version, 0)),
-					maxChars: Number.MAX_SAFE_INTEGER });
+				const { record, ref, availability } = resolution.resolved;
+				request.version = resolution.resolved.version;
+				const selection = await recordDependencyIndex(store, snapshot, ref, "M04 知识附件读取的必要依赖与警告");
 				const source = list === true ? await publishedArtifactCatalogue(workspaceRoot, record) : await publishedArtifact(workspaceRoot, record, artifact);
 				const content = list === true
-					? `# 同源已接受任务的文本原件目录 ${id}@${selectedVersion}\n${(source as Awaited<ReturnType<typeof publishedArtifactCatalogue>>).paths.map(item => `- ${item}`).join("\n")}\n未覆盖的声明任务：${JSON.stringify((source as Awaited<ReturnType<typeof publishedArtifactCatalogue>>).excluded)}\n`
+					? `# 同源已接受任务的文本原件目录 ${ref}\n${(source as Awaited<ReturnType<typeof publishedArtifactCatalogue>>).paths.map(item => `- ${item}`).join("\n")}\n未覆盖的声明任务：${JSON.stringify((source as Awaited<ReturnType<typeof publishedArtifactCatalogue>>).excluded)}\n`
 					: new TextDecoder("utf-8", { fatal: true }).decode(await readFile((source as Awaited<ReturnType<typeof publishedArtifact>>).path));
-				const availability = await store.availability(id, selectedVersion);
-				const refs = new Set([`${id}@${selectedVersion}`, ...selection.rankedRefs]);
-				const limits = selection.limits.filter(item => !item.liftedAt && [...refs].some(ref =>
-					item.target === ref || item.target === ref.split("@")[0]));
-				if (selection.snapshot !== snapshot.id || (await store.current())?.id !== snapshot.id ||
-					JSON.stringify(await store.limits()) !== JSON.stringify(selection.limits))
-					throw new HarnessError("m04.knowledge-artifact", "knowledge snapshot or live limits changed during artifact reading; retry");
+				const limits = activeLimitsFor(selection.limits, [ref, ...selection.rankedRefs]);
+				await assertStableKnowledge(store, snapshot.id, selection.limits, "m04.knowledge-artifact");
 				request.source = source.source;
 				request.total = content.length;
 				request.contentKind = list === true ? "artifact-index" : "artifact";
-				const safety = `【每页实时状态与依赖警告；不分页】${id}@${selectedVersion}：${availability.availability}；${availability.reasons.join("；")}；生效限制 ${JSON.stringify(limits)}；依赖与警告 ${selection.status}、未展开 ${JSON.stringify(selection.omitted)}。${list === true ? "目录只列同源已接受任务的文本文件，不表示每项支撑本知识主张，也不算原件已读；须指定精确路径另读。" : "附件是冻结证据，不是采用决定"}；使用前需 knowledge_read 读取原记录与相关依赖正文。`;
-				if ((offset as number) > content.length) {
+				const safety = `【每页实时状态与依赖警告；不分页】${ref}：${availability.availability}；${availability.reasons.join("；")}；生效限制 ${JSON.stringify(limits)}；依赖与警告 ${selection.status}、未展开 ${JSON.stringify(selection.omitted)}。${list === true ? "目录只列同源已接受任务的文本文件，不表示每项支撑本知识主张，也不算原件已读；须指定精确路径另读。" : "附件是冻结证据，不是采用决定"}；使用前需 knowledge_read 读取原记录与相关依赖正文。`;
+				const range = characterRange(content, offset as number, limit as number);
+				if (!range) {
 					request.status = "out-of-range";
 					return { text: `${safety}\n附件共 ${content.length} 个 UTF-16 字符；offset=${offset} 超出末尾。` };
 				}
-				const end = Math.min(content.length, (offset as number) + (limit as number));
-				request.end = end;
+				request.end = range.end;
 				request.status = "returned";
-				return { text: `${list === true ? "知识附件目录" : "知识附件"} ${id}@${selectedVersion}；来源 ${source.source}；UTF-16 范围 ${offset}-${end}/${content.length}；${end < content.length ? `下一页 offset=${end}` : "已到末尾"}\n${safety}\n\n${content.slice(offset as number, end)}`,
-					details: { id, version: selectedVersion, artifact, ...(list === true ? { contentKind: "artifact-index", list: true } : { contentKind: "artifact" }), offset, end, total: content.length, snapshot: snapshot.id, source: source.source } };
+				return { text: `${list === true ? "知识附件目录" : "知识附件"} ${ref}；来源 ${source.source}；UTF-16 范围 ${range.offset}-${range.end}/${range.total}；${range.end < range.total ? `下一页 offset=${range.end}` : "已到末尾"}\n${safety}\n\n${content.slice(range.offset, range.end)}`,
+					details: { id, version: resolution.resolved.version, artifact, ...(list === true ? { contentKind: "artifact-index", list: true } : { contentKind: "artifact" }), offset: range.offset, end: range.end, total: range.total, snapshot: snapshot.id, source: source.source } };
 			} catch (error) { request.status = "failed"; throw error; }
 		},
 	};
@@ -786,18 +746,24 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			};
 			const loadKnowledgePack = async (requireOriginalSnapshot = false): Promise<void> => {
 				if (requireOriginalSnapshot) await assertOriginalKnowledgeSnapshot();
-				const selection = await retrieveKnowledge(ctx.store, { purpose: options.purpose ?? `M04 处理：${feedback.label}`, text: `${materials.problem}\n${feedback.label}\n${feedback.text}`, maxRecords: 48, maxChars: 60_000 });
+				// The judgment phase is the broadest plan in the assembly table and
+				// still an order of magnitude below the old fixed 48/60000 pack: the
+				// session can page the whole catalogue with its own knowledge tools.
+				const injection = await assembleInjection({ store: ctx.store, phase: "judgment",
+					purpose: options.purpose ?? `M04 处理：${feedback.label}`,
+					text: `${materials.problem}\n${feedback.label}\n${feedback.text}`,
+					priorRoot: path.join(ctx.ws.knowledgeDir, "prior") });
+				const selection = injection.selection;
 				if (selection.status !== "ready") throw new HarnessError("m04.knowledge", `M04 必需知识未能完整装载：${selection.omitted.map((item) => `${item.ref}:${item.reason}`).join("；")}`);
 				if (requireOriginalSnapshot) {
 					if (selection.snapshot !== snapshot?.id)
 						throw new HarnessError("m04.knowledge", "fresh M04 knowledge selection differs from the original snapshot");
 					await assertOriginalKnowledgeSnapshot();
 				}
-				const pack = selection.pack;
-				knowledgePack = pack.markdown;
-				await ctx.ws.writeOutput(record, "knowledge-pack.md", pack.markdown, "提供给研究会话的局部知识包");
-				await ctx.ws.writeOutput(record, "knowledge-selection.json", JSON.stringify({ snapshot: selection.snapshot, rankedRefs: selection.rankedRefs, omitted: selection.omitted, limitsCheckedAt: selection.limitsCheckedAt }, null, 2), "知识选择与未展开记录");
-				if (pack.truncated) record.remarks.push(`相关知识组未展开：${pack.omitted.join(", ")}`);
+				knowledgePack = injection.markdown;
+				await ctx.ws.writeOutput(record, "knowledge-pack.md", injection.markdown, "提供给研究会话的局部知识包");
+				await ctx.ws.writeOutput(record, "knowledge-selection.json", JSON.stringify({ snapshot: selection.snapshot, rankedRefs: selection.rankedRefs, omitted: selection.omitted, limitsCheckedAt: selection.limitsCheckedAt, injection: injection.receipt }, null, 2), "知识选择与未展开记录");
+				if (injection.receipt.omitted.length) record.remarks.push(`本轮按阶段上限未展开 ${injection.receipt.omitted.length} 项；可在会话内用 knowledge_select / knowledge_read 补读。`);
 			};
 			if (mode === "research-session") await loadKnowledgePack();
 			const knowledgeReadCalls: KnowledgeReadCall[] = [];
@@ -825,7 +791,17 @@ export async function runM04(ctx: StageContext, options: M04Options): Promise<M0
 			const lessonInstruction = feedback.m07 && (lessonEvidence.paths.length || lessonEvidence.unavailable.length) ? `\n\n【候选经验冻结依赖】\n若提案拟采用本批 M07 候选经验，须在本会话读取以下已冻结候选与其声明的证据；文本需分段读至末尾，二进制需实际打开并说明可核验范围。候选或无提案不要求为流程而通读。${lessonEvidence.paths.map((item) => `\n- ${item}`).join("")}${lessonEvidence.unavailable.map((item) => `\n- 无法从冻结材料核验：${item}`).join("")}` : "";
 			const m06EvidenceInstruction = feedback.m06 ? `\n\n【M06 来源与核对记录】\n整批摘要仅是线索。需据 M06 提案时，使用 m06_evidence_read 实际读取本次授权的来源文本及对应 reading/check 记录；清单和路径不表示已经核验。${feedback.m06.legacy ? "这是历史运行材料的本次读取副本，当前原材料版本未证实与旧阅读时同版；原报告保留，但其版本不确定的主张须明确限制。" : "这是 M06 当次冻结的来源与报告。"}按来源条件、实际取得范围与缺口判断，不把未读材料或摘要推断当作原文证据。可访问相对路径：${feedback.artifactPaths.map((item) => `\n- ${item}`).join("")}` : "";
 			const requiredM07Instruction = requiredM07Paths.length ? `\n\n【本轮指定 M07 证据完整读取】\n在判断采用、候选或无提案之前，请用 m07_evidence_read 按以下精确相对路径读取每个文件的全文；大文件须分段读至末尾。只看索引、摘要或文件名不足以满足此要求。完整读取后可以选择不提案，不得为满足流程强行采用。\n${requiredM07Paths.map((item) => `- ${item}`).join("\n")}` : "";
-			const judgmentInstructions = m08DispositionInstruction + m06EvidenceInstruction + m07EvidenceInstruction +
+			// Repeated failures are counted by the host, not recalled by the model:
+			// a rule earns its place by having happened in several sources.
+			let failureRuleInstruction = "";
+			const failureRoot = feedback.m07?.rootDir ?? feedback.m06?.rootDir;
+			if (failureRoot) {
+				const drafts = failureRuleDrafts(await collectFailureObservations(failureRoot));
+				await ctx.ws.writeOutput(record, "failure-rule-drafts.json", JSON.stringify(drafts, null, 2), "宿主统计的重复失败签名");
+				const rendered = renderFailureRuleDrafts(drafts);
+				if (rendered) failureRuleInstruction = `\n\n${rendered}`;
+			}
+			const judgmentInstructions = m08DispositionInstruction + m06EvidenceInstruction + m07EvidenceInstruction + failureRuleInstruction +
 				m07ExperienceInstruction + lessonInstruction + requiredM07Instruction +
 				(options.additionalReadOnlyInstruction ? `\n\n${options.additionalReadOnlyInstruction}` : "") +
 				(priorFailureBytes ? `\n\n${priorFailureBytes.toString("utf8")}` : "");

@@ -5,6 +5,8 @@ import type { CustomToolSpec, ToolResult } from "../runner/types.ts";
 import { HarnessError } from "../types.ts";
 import { writeFileAtomic } from "../workspace.ts";
 import { isSafeRelativeOutputPath } from "./expected-output.ts";
+import { createEvaluationQueue, type EvaluationQueue } from "./evaluation-queue.ts";
+import { openSearchEventLog, type SearchEventInput } from "./search-state/index.ts";
 
 export type CandidateExecutionCheck = "contract" | "compile" | "correctness" | "measurement";
 export interface CandidateExecutionStage {
@@ -66,11 +68,28 @@ export interface CandidateExecutionToolOptions {
 	backend: CandidateExecutionBackend;
 	/** Host recovery queries original IDs only; never executes unstarted stages or sweep combinations. */
 	queryOnly?: boolean;
+	/** Append-only search log for this goal run. Absent means the search records nothing. */
+	searchEventLogFile?: string;
+	/**
+	 * Opt-in background execution. The host receives a drain function and must await
+	 * it before ending a prompt, because a run that outlives the prompt would leave
+	 * the controller reasoning about an operation nobody is waiting for.
+	 */
+	backgroundRuns?: { register(drain: () => Promise<void>): void; max?: number };
+	/**
+	 * Host evaluation pool. Generation happens in the model session; this is the
+	 * other side of that boundary. Concurrency above one means two candidates may
+	 * touch the device at once, which is a measurement-fidelity decision for the
+	 * host, not a default.
+	 */
+	evaluationPool?: { concurrency?: number; capacity?: number };
 	evaluate(args: Record<string, unknown>): Promise<ToolResult>;
 }
 type Request = {
 	sourcePaths: string[]; config: Record<string, unknown>; protocolId: string;
 	hypothesis: string; changeKind: "repair" | "structure" | "parameters"; intent: "solution" | "diagnostic";
+	/** Forwarded unchanged to candidate_evaluate, which owns their validation. */
+	strategy?: string; location?: string; newEvidence?: string;
 	parentCandidateId?: string; conditions?: string[]; changeSummary?: string;
 };
 type StageEntry = { attempts?: number; receiptSnapshots?: Array<{ originalPath: string; frozenPath: string; evaluationPath: string }>; stage: CandidateExecutionStage; status: "running" | CandidateExecutionStageResult["status"];
@@ -110,7 +129,10 @@ function requestFrom(args: Record<string, unknown>): Request {
 		hypothesis: args.hypothesis, changeKind: args.changeKind as Request["changeKind"], intent: args.intent as Request["intent"],
 		...(args.parentCandidateId !== undefined ? { parentCandidateId: args.parentCandidateId as string } : {}),
 		...(args.conditions !== undefined ? { conditions: args.conditions as string[] } : {}),
-		...(args.changeSummary !== undefined ? { changeSummary: args.changeSummary as string } : {}) };
+		...(args.changeSummary !== undefined ? { changeSummary: args.changeSummary as string } : {}),
+		...(args.strategy !== undefined ? { strategy: args.strategy as string } : {}),
+		...(args.location !== undefined ? { location: args.location as string } : {}),
+		...(args.newEvidence !== undefined ? { newEvidence: args.newEvidence as string } : {}) };
 }
 async function regular(root: string, relative: string): Promise<string> {
 	if (!isSafeRelativeOutputPath(relative) || relative === ".") return fail("invalid evidence path");
@@ -140,7 +162,7 @@ export interface PendingCandidateExecution {
 	externalId?: string;
 	stageId?: string;
 	queryAvailable: boolean;
-	resume: { tool: "candidate_run" | "candidate_sweep"; runId: string; resume: true };
+	resume: { tool: "candidate_run"; runId: string; resume: true };
 }
 /** Read only known journal slots; never parse model source files named journal.json. */
 export async function pendingCandidateExecutions(input: {
@@ -169,7 +191,7 @@ export async function pendingCandidateExecutions(input: {
 		const journal = await readJson<Journal | SweepJournal>(file);
 		if (journal?.kind === "candidate") await inspect(file, { tool: "candidate_run", runId: entry.name, resume: true });
 		else if (journal?.kind === "sweep") for (const child of await directories(path.join(root, "runs")))
-			await inspect(path.join(root, "runs", child.name, "journal.json"), { tool: "candidate_sweep", runId: entry.name, resume: true });
+			await inspect(path.join(root, "runs", child.name, "journal.json"), { tool: "candidate_run", runId: entry.name, resume: true });
 	}
 	return pending;
 }
@@ -203,11 +225,20 @@ export function createCandidateExecutionTools(options: CandidateExecutionToolOpt
 	function validateProtocol(protocolId: string) {
 		if (protocolIds && !protocolIds.includes(protocolId)) fail(`unsupported protocolId: ${protocolId}; use ${protocolIds.join(", ")}`);
 	}
-	let tail: Promise<void> = Promise.resolve();
+	const events = options.searchEventLogFile ? openSearchEventLog(options.searchEventLogFile) : undefined;
+	let eventLogError: string | undefined;
+	/** A log that cannot be written is reported to the model, never silently dropped,
+	 * and never fails the execution it was only describing. */
+	const record = async (event: Omit<SearchEventInput, "runId">): Promise<void> => {
+		if (!events) return;
+		try { await events.append({ ...event, runId: options.goalRunId, taskId: options.taskId }); }
+		catch (error) { eventLogError = (error as Error).message; }
+	};
+	const pool: EvaluationQueue = createEvaluationQueue({
+		...(options.evaluationPool?.concurrency !== undefined ? { concurrency: options.evaluationPool.concurrency } : {}),
+		...(options.evaluationPool?.capacity !== undefined ? { capacity: options.evaluationPool.capacity } : {}) });
 	const serial = (run: (args: Record<string, unknown>, signal?: AbortSignal) => Promise<ToolResult>) =>
-		(args: Record<string, unknown>, signal?: AbortSignal) => {
-			const next = tail.then(() => run(args, signal)); tail = next.then(() => undefined, () => undefined); return next;
-		};
+		(args: Record<string, unknown>, signal?: AbortSignal) => pool.submit(() => run(args, signal));
 	async function roots() {
 		const work = await realpath(options.workDir);
 		await mkdir(options.journalDir, { recursive: true });
@@ -251,6 +282,7 @@ export function createCandidateExecutionTools(options: CandidateExecutionToolOpt
 	}
 	function projection(journal: Journal, file: string): ToolResult {
 		return { text: JSON.stringify({ runId: journal.runId, status: journal.state, journalPath: file,
+			...(eventLogError ? { eventLogError } : {}),
 			backend: journal.backend, unsupportedChecks: checks.filter(check => !journal.backend.stages.some(stage => stage.checks.includes(check))),
 			stages: journal.stages.map(entry => ({ stage: entry.stage, status: entry.status, attempts: entry.attempts,
 				externalId: entry.externalId, performedChecks: entry.result?.performedChecks,
@@ -281,6 +313,11 @@ export function createCandidateExecutionTools(options: CandidateExecutionToolOpt
 				operationId: options.operationId, ...(options.subjectId ? { subjectId: options.subjectId } : {}), backend: backendIdentity,
 				request, sources, stages: [], state: "prepared", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
 			await save(file, journal);
+			await record({ kind: "candidate-submitted", candidate: { id: runId, pathRef: file,
+				...(request.parentCandidateId ? { parentId: request.parentCandidateId } : {}),
+				...(options.subjectId ? { subjectId: options.subjectId } : {}), status: "prepared" },
+				detail: { changeKind: request.changeKind, intent: request.intent,
+					...(request.strategy ? { strategy: request.strategy } : {}) } });
 		}
 		const active = journal;
 		for (let index = 0; index < backendIdentity.stages.length; index++) {
@@ -338,6 +375,9 @@ export function createCandidateExecutionTools(options: CandidateExecutionToolOpt
 				current.status = "unknown"; current.error = (error as Error).message; active.state = "unknown";
 				await save(file, active); return projection(active, file);
 			}
+			await record({ kind: "candidate-stage", candidate: { id: runId, stage: stage.id, status: current.status,
+				...(options.subjectId ? { subjectId: options.subjectId } : {}) },
+				...(current.externalId ? { detail: { externalId: current.externalId } } : {}) });
 			if (current.status !== "passed") break;
 		}
 		if (active.stages.length === backendIdentity.stages.length && active.stages.every(stage => stage.status === "passed")) active.state = "completed";
@@ -360,12 +400,16 @@ export function createCandidateExecutionTools(options: CandidateExecutionToolOpt
 			} catch (error) { active.evaluationError = (error as Error).message; }
 			await save(file, active);
 		}
+		await record({ kind: "candidate-evaluated", candidate: { id: runId, pathRef: file, status: active.state,
+			isBuggy: active.state !== "completed" || Boolean(active.evaluationError),
+			...(options.subjectId ? { subjectId: options.subjectId } : {}) },
+			...(active.evaluationError ? { detail: { evaluationError: active.evaluationError } } : {}) });
 		return projection(active, file);
 	}
 	async function sweep(args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult> {
 		const readArchive = [
-			{ tool: "candidate_list", args: { section: "global-best" } },
-			{ tool: "candidate_list", args: { section: "search-leads" } },
+			{ tool: "candidate_archive", args: { action: "list", section: "global-best" } },
+			{ tool: "candidate_archive", args: { action: "list", section: "search-leads" } },
 		];
 		const resultOffset = args.resultOffset ?? 0, resultLimit = args.resultLimit ?? 10;
 		if (!Number.isSafeInteger(resultOffset) || Number(resultOffset) < 0 ||
@@ -417,7 +461,7 @@ export function createCandidateExecutionTools(options: CandidateExecutionToolOpt
 					...(stage ? { lastStage: { id: stage.stage.id, status: stage.status,
 						performedChecks: stage.result?.performedChecks, summary: stage.result?.summary,
 						error: stage.error } } : {}),
-					...(candidateRef ? { candidateRef, readCandidate: { tool: "candidate_read", args: { candidateRef } } } : {}),
+					...(candidateRef ? { candidateRef, readCandidate: { tool: "candidate_archive", args: { action: "read", candidateRef } } } : {}),
 					...(observation ? { sourceBinding: observation.sourceBinding, correctness: observation.correctness,
 						metricCount: Array.isArray(observation.metrics) ? observation.metrics.length : undefined } : {}),
 					...(child.evaluationError ? { evaluationError: child.evaluationError } : {}) });
@@ -428,7 +472,7 @@ export function createCandidateExecutionTools(options: CandidateExecutionToolOpt
 		let manifest = await readJson<SweepJournal>(file);
 		if (!manifest) {
 			if (args.resume === true || options.queryOnly) fail("unknown sweep runId");
-			const request = requestFrom({ ...args, changeKind: "parameters" });
+			const request = requestFrom({ ...args, changeKind: "parameters", strategy: "numerical-parameters" });
 			validateProtocol(request.protocolId);
 			await options.backend.validateRequest?.({ protocolId: request.protocolId, sourcePaths: [...request.sourcePaths], config: structuredClone(request.config), subjectId: options.subjectId });
 			const raw = objectJson(args.domainsJson, "domainsJson"), domains: Record<string, number[]> = {};
@@ -489,8 +533,81 @@ export function createCandidateExecutionTools(options: CandidateExecutionToolOpt
 		return { text: JSON.stringify({ runId, total: manifest.total, completed: manifest.nextIndex, journalPath: file,
 			status: manifest.nextIndex === manifest.total ? "completed" : "incomplete", last: last?.text,
 			resultsPage: await resultsPage(manifest), readArchive,
-			message: "last is the most recently executed combination, not the best result. resultsPage links each recorded parameter vector to its candidateRef when evaluation produced one; candidate_read can inspect that exact frozen candidate. Page older combinations with resultOffset/resultLimit and omit resume for a read-only view. Use readArchive to inspect verified bests by subject/basis and case-local leads. All declared combinations remain recorded; no performance pruning or goal-wide budget. Resume this runId to query any unresolved original ID and continue unstarted combinations. Stages without verifiable evaluation receipts remain execution evidence only." }) };
+			message: "last is the most recently executed combination, not the best result. resultsPage links each recorded parameter vector to its candidateRef when evaluation produced one; candidate_archive action=read can inspect that exact frozen candidate. Page older combinations with resultOffset/resultLimit and omit resume for a read-only view. Use readArchive to inspect verified bests by subject/basis and case-local leads. All declared combinations remain recorded; no performance pruning or goal-wide budget. Resume this runId to query any unresolved original ID and continue unstarted combinations. Stages without verifiable evaluation receipts remain execution evidence only." }) };
 	}
+	type BackgroundJob = { runId: string; tool: string; startedAt: string; promise: Promise<ToolResult>;
+		/** Resolves only after the outcome has also been recorded. */
+		completion: Promise<void>;
+		settled?: { at: string; result?: ToolResult; error?: string } };
+	const jobs = new Map<string, BackgroundJob>();
+	const maxBackground = Math.max(1, options.backgroundRuns?.max ?? 4);
+	const outstanding = () => [...jobs.values()].filter(job => !job.settled);
+	const drain = async (): Promise<void> => {
+		// Settled or rejected, every background run is awaited: a prompt must not end
+		// while the host is still producing side effects nobody is waiting for.
+		while (outstanding().length) await Promise.allSettled(outstanding().map(job => job.completion));
+		await pool.drain();
+	};
+	options.backgroundRuns?.register(drain);
+	const jobView = (job: BackgroundJob) => ({ runId: job.runId, tool: job.tool, startedAt: job.startedAt,
+		state: job.settled ? (job.settled.error ? "failed" : "settled") : "running",
+		...(job.settled ? { finishedAt: job.settled.at, ...(job.settled.error ? { error: job.settled.error } : {}) } : {}) });
+	const startBackground = (tool: string, args: Record<string, unknown>, signal: AbortSignal | undefined,
+		run: (args: Record<string, unknown>, signal?: AbortSignal) => Promise<ToolResult>): ToolResult => {
+		if (!options.backgroundRuns) fail("this host did not enable background candidate runs");
+		const runId = identity(args.runId);
+		const existing = jobs.get(runId);
+		if (existing && !existing.settled) fail(`background run ${runId} is still running; collect it before submitting it again`);
+		if (outstanding().length >= maxBackground) fail(`at most ${maxBackground} background runs may be outstanding; collect one first`);
+		// Backpressure belongs on the submission, not on the collection: a caller that
+		// learns the queue is full can go on with something else.
+		pool.assertCapacity();
+		const promise = serial(run)({ ...args, background: undefined, collect: undefined }, signal);
+		const completion = promise.then(
+			result => { job.settled = { at: new Date().toISOString(), result }; },
+			error => { job.settled = { at: new Date().toISOString(), error: (error as Error).message }; },
+		).then(() => record({ kind: "background-settled", candidate: { id: runId, status: job.settled?.error ? "failed" : "settled",
+			...(job.settled?.error ? { isBuggy: true } : {}) },
+			...(job.settled?.error ? { detail: { error: job.settled.error } } : {}) }));
+		const job: BackgroundJob = { runId, tool, startedAt: new Date().toISOString(), promise, completion };
+		jobs.set(runId, job);
+		void record({ kind: "background-queued", candidate: { id: runId,
+			...(options.subjectId ? { subjectId: options.subjectId } : {}), status: "queued" },
+			detail: { tool, outstanding: outstanding().length, queued: pool.stats().queued, running: pool.stats().running } });
+		// Settled jobs are kept so a later collect is idempotent; the oldest are pruned.
+		for (const [key, value] of [...jobs.entries()].slice(0, Math.max(0, jobs.size - 32)))
+			if (value.settled) jobs.delete(key);
+		return { text: JSON.stringify({ runId, state: "running", outstanding: outstanding().length,
+			evaluationPool: pool.stats(),
+			collect: { tool, args: { runId, collect: true } },
+			message: "The host is executing this run. Keep working on other candidates, then collect this runId. Nothing is resubmitted by collecting." }) };
+	};
+	const collectBackground = async (args: Record<string, unknown>, signal: AbortSignal | undefined,
+		run: (args: Record<string, unknown>, signal?: AbortSignal) => Promise<ToolResult>): Promise<ToolResult> => {
+		if (args.runId === undefined)
+			return { text: JSON.stringify({ jobs: [...jobs.values()].map(jobView), outstanding: outstanding().length,
+				evaluationPool: pool.stats() }) };
+		const runId = identity(args.runId);
+		const job = jobs.get(runId);
+		// Without a live job this is an ordinary read of the durable journal, which is
+		// also what a restarted process sees. Collect never starts anything.
+		if (!job) {
+			const { journals } = await roots();
+			try { await lstat(path.join(journals, runId)); }
+			catch { fail(`unknown runId ${runId}: nothing was submitted in this session and no execution journal exists`); }
+			return serial(run)({ runId }, signal);
+		}
+		if (!job.settled) return { text: JSON.stringify({ ...jobView(job), outstanding: outstanding().length,
+			message: "Still running. Collect again later; the journal keeps the durable state either way." }) };
+		if (job.settled.error) fail(`background run ${runId} failed: ${job.settled.error}`);
+		return job.settled.result!;
+	};
+	const withBackground = (tool: string, run: (args: Record<string, unknown>, signal?: AbortSignal) => Promise<ToolResult>) =>
+		async (args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult> => {
+			if (args.collect === true) return collectBackground(args, signal, run);
+			if (args.background === true) return startBackground(tool, args, signal, run);
+			return serial(run)(args, signal);
+		};
 	const common: CustomToolSpec["params"] = {
 		runId: { type: "string", description: "Unique task-local execution identity; reuse with resume:true to query, never to resubmit" },
 		resume: { type: "boolean", optional: true, description: "Query the existing original external ID and continue only unstarted stages/combinations" },
@@ -503,10 +620,33 @@ export function createCandidateExecutionTools(options: CandidateExecutionToolOpt
 		parentCandidateId: { type: "string", optional: true, description: "Optional exact local Cxxx or archived Txxx/Cxxx parent" },
 		conditions: { type: "string[]", optional: true, description: "Declared applicability, not a host-proven conclusion" },
 		changeSummary: { type: "string", optional: true, description: "Declared source change" },
+		strategy: { type: "string", optional: true, description: "New run: the one enumerated optimization strategy candidate_evaluate requires" },
+		location: { type: "string", optional: true, description: "New run: the one exact edit site candidate_evaluate requires" },
+		newEvidence: { type: "string", optional: true, description: "Only when repeating a direction the host banned after a stall" },
+		background: { type: "boolean", optional: true, description: "Submit and return immediately; the host keeps executing while you work on another candidate. Collect the same runId later." },
+		collect: { type: "boolean", optional: true, description: "Report a background run submitted in this session, returning its result once finished; omit runId to list background runs. Collecting never resubmits." },
 	};
-	return [{ name: "candidate_run", description: "Execute the host-bound backend against frozen source bytes with durable stage intent, then call existing candidate_evaluate. Unknown external operations require original-ID query; no automatic retry." + backendHelp, params: common, execute: serial(runOne) },
-		{ name: "candidate_sweep", description: "Materialize and evaluate every combination of explicitly declared finite numeric template parameters through the same host backend, without a model call for each number. An existing runId without resume reads paged parameter-to-candidate results without execution. No fixed search width or score pruning." + backendHelp, params: { ...common,
-			domainsJson: { type: "string", optional: true, description: "New sweep: JSON object mapping placeholder names to explicit finite numeric arrays" },
-			resultOffset: { type: "number", optional: true, description: "Read-only result page offset in newest-first order, default 0" },
-			resultLimit: { type: "number", optional: true, description: "Result page length, default 10, at most 100; this does not limit the sweep" } }, execute: serial(sweep) }];
+	/**
+	 * One execution tool. A run with declared finite numeric domains is a sweep of
+	 * that one declared space, executed by the host without a model call per
+	 * number; everything else is one candidate. The route is decided by the
+	 * durable journal, so resuming never has to be told which kind it was.
+	 */
+	async function runOrSweep(args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult> {
+		const runId = identity(args.runId);
+		const { journals } = await roots();
+		const existing = await readJson<Journal | SweepJournal>(path.join(journals, runId, "journal.json"));
+		if (existing?.kind === "sweep" || (!existing && args.domainsJson !== undefined)) return sweep(args, signal);
+		if (args.domainsJson !== undefined) fail("runId is already a single candidate run; use a new runId for a parameter sweep");
+		if (args.resultOffset !== undefined || args.resultLimit !== undefined)
+			fail("resultOffset/resultLimit page a parameter sweep's results; this runId is a single candidate run");
+		return runOne(args, signal);
+	}
+	return [{ name: "candidate_run",
+		description: "Execute the host-bound backend against frozen source bytes with durable stage intent, then call existing candidate_evaluate. Declaring domainsJson makes this one run a sweep: the host materializes and evaluates every combination of the declared finite numeric template parameters, with {{PARAMETER}} placeholders in the sources and no model call per number; an existing sweep runId without resume reads its paged parameter-to-candidate results without executing. Unknown external operations require original-ID query; no automatic retry, no fixed search width and no score pruning." + backendHelp,
+		params: { ...common,
+			domainsJson: { type: "string", optional: true, description: "New sweep: JSON object mapping {{PARAMETER}} placeholder names to explicit finite numeric arrays" },
+			resultOffset: { type: "number", optional: true, description: "Sweep only: read-only result page offset in newest-first order, default 0" },
+			resultLimit: { type: "number", optional: true, description: "Sweep only: result page length, default 10, at most 100; this does not limit the sweep" } },
+		execute: withBackground("candidate_run", runOrSweep) }];
 }

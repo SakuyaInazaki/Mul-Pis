@@ -190,7 +190,7 @@ test("strict DeepSeek request rejects a caller output cap and uses the resolved 
 	assert(estimate && estimate > 0);
 	await assert.rejects(runner.create(spec(persistDir, { model: "deepseek/deepseek-flash",
 		strictRequest: { maxOutputTokens: 20, maxInputPayloadBytes: 500 } })),
-		/strict request requires positive integer caps/);
+		/strict request requires a positive integer input payload cap and no tools/);
 	const handle = await runner.create(spec(persistDir, { model: "deepseek/deepseek-flash", strictRequest: { maxInputPayloadBytes: 500 } }));
 	assert.equal(stub.calls[0].settingsManager?.getRetrySettings().enabled, false);
 	assert.equal(stub.calls[0].settingsManager?.getProviderRetrySettings().maxRetries, 0);

@@ -7,6 +7,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { readTextIfExists, writeFileAtomic } from "../workspace.ts";
 import type { AssistantTurn, ForkRequest, ReadReturnEvent, RunnerCapabilities, SessionCheckpoint, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, ToolResult, TranscriptMessage, UsageEvent, UsageValues } from "./types.ts";
+import { summarizeToolCalls } from "./tool-usage.ts";
 import { summarizeUsage } from "./usage.ts";
 
 export interface FakeReplyContext {
@@ -278,6 +279,7 @@ export class FakeSessionRunner implements SessionRunner {
 			usageEvents: () => [...usageEvents],
 			usageSummary: () => summarizeUsage(usageEvents),
 			toolLog: () => [...state.toolLog],
+			toolUsage: () => summarizeToolCalls(state.toolLog),
 			abort: async () => { aborted = true; rejectActive?.(new Error(`session ${state.ref.label} was aborted`)); },
 			dispose: () => { if (disposed) return; disposed = true; state.disposed = true; rejectActive?.(new Error(`session ${state.ref.label} was disposed`)); },
 		};

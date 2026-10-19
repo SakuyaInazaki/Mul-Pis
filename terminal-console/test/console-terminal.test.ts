@@ -10,13 +10,14 @@ import { hitTest, renderConsole, renderFrame, visibleNodes, type ConsoleView } f
 import { parseMouse } from "../src/console/input.ts";
 import { main, parseConsoleArgs } from "../src/console/cli.ts";
 import type { WorkflowNode, WorkflowSnapshot } from "../src/console/model.ts";
+import { emptyAudit } from "./helpers/snapshot.ts";
 
 const run = promisify(execFile);
 function node(id: string, parentId?: string): WorkflowNode {
 	return { id, ...(parentId ? { parentId } : {}), label: id, kind: "task", status: "running", detail: [], outputRefs: [], artifactRefs: [], checks: [] };
 }
 function snapshot(nodes: WorkflowNode[]): WorkflowSnapshot {
-	return { workspace: { root: "/test", label: "工作区" }, generatedAt: "2026-10-14T00:00:00Z", currentStage: "M07", nodes, events: [], runs: [], knowledge: {}, warnings: [] };
+	return { workspace: { root: "/test", label: "工作区" }, generatedAt: "2026-10-14T00:00:00Z", currentStage: "M07", nodes, events: [], runs: [], knowledge: {}, audit: emptyAudit(), warnings: [] };
 }
 function view(snap: WorkflowSnapshot, overrides: Partial<ConsoleView> = {}): ConsoleView {
 	return { snapshot: snap, selectedId: snap.nodes[0]?.id, collapsed: new Set(), preview: [], previewOffset: 0, focus: "tree", connected: false, hostLabel: "只读快照", recent: [], ...overrides };
@@ -109,7 +110,9 @@ test("long detail, reader, and popup text is reachable through row offsets", () 
 
 test("CLI rejects malformed and contradictory control arguments before execution", async () => {
 	assert.throws(() => parseConsoleArgs(["start", "--once"]), /--once/);
-	assert.throws(() => parseConsoleArgs(["workflow", "--json"]), /--once \/ --json/);
+	assert.throws(() => parseConsoleArgs(["workflow", "--json"]), /--json 仅用于查看状态或审计/);
+	assert.throws(() => parseConsoleArgs(["audit", "--once"]), /--once 仅用于查看状态/);
+	assert.equal(parseConsoleArgs(["audit", "--workspace", "/a", "--json"]).command, "audit");
 	assert.throws(() => parseConsoleArgs(["status", "--stage", "M00"]), /M01–M09/);
 	assert.throws(() => parseConsoleArgs(["status", "--run", "R001"]), /同时指定 --stage/);
 	assert.throws(() => parseConsoleArgs(["status", "--goal", "G001", "--stage", "M07"]), /不可混用/);

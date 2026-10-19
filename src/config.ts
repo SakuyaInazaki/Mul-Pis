@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { HarnessError, ROLES, THINKING_LEVELS, type HarnessConfig, type ModelSpec, type Role, type ThinkingLevel } from "./types.ts";
+import { validateHistoryDepth } from "./m07/prompt-layout.ts";
 
 export const CONFIG_FILE = "research.config.json";
 
@@ -96,8 +97,30 @@ export function validateConfig(input: unknown): HarnessConfig {
 			throw new HarnessError("config.local-mission", "localMission.execution must be task-root-bash and/or localMission.evaluatorId must be a trusted registry ID");
 		localMission = { ...policy as HarnessConfig["localMission"] };
 	}
+	let episodeRestart: HarnessConfig["episodeRestart"];
+	if (obj.episodeRestart !== undefined) {
+		const value = obj.episodeRestart;
+		if (!value || typeof value !== "object" || Array.isArray(value) ||
+			Object.keys(value).some((key) => key !== "evaluations") ||
+			typeof (value as { evaluations?: unknown }).evaluations !== "number" ||
+			!Number.isInteger((value as { evaluations: number }).evaluations) ||
+			(value as { evaluations: number }).evaluations < 0 || (value as { evaluations: number }).evaluations > 10_000)
+			throw new HarnessError("config.episode-restart", "episodeRestart.evaluations 必须是 0–10000 的整数；0 表示不在 episode 边界重启");
+		episodeRestart = { evaluations: (value as { evaluations: number }).evaluations };
+	}
+	let promptLayout: HarnessConfig["promptLayout"];
+	if (obj.promptLayout !== undefined) {
+		const value = obj.promptLayout;
+		if (!value || typeof value !== "object" || Array.isArray(value) ||
+			Object.keys(value).some((key) => key !== "historyDepth"))
+			throw new HarnessError("config.prompt-layout", "promptLayout 只接受 historyDepth");
+		try { promptLayout = { historyDepth: validateHistoryDepth((value as { historyDepth?: unknown }).historyDepth) }; }
+		catch (error) { throw new HarnessError("config.prompt-layout", (error as Error).message); }
+	}
 	return { roles, ...(m03Reviewers ? { m03Reviewers } : {}),
-		...(localMission ? { localMission } : {}), concurrency, tools };
+		...(localMission ? { localMission } : {}),
+		...(promptLayout ? { promptLayout } : {}),
+		...(episodeRestart ? { episodeRestart } : {}), concurrency, tools };
 }
 
 export async function loadConfig(path: string): Promise<HarnessConfig> {

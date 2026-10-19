@@ -303,7 +303,7 @@ test("episode receives an initial brief and preserves actual knowledge calls thr
 	const controller = createM07Controller(ctx, { candidateVerifier: verifier });
 	const goal = await controller.begin({ goal: "repair knowledge", problemRelation: "direct", constraints: ["Preserve the original operator contract"], successCriteria: ["original criterion"], plan: "inspect knowledge" },
 		{ candidateVerification: { id: verifier.id, verifierVersion: verifier.version } });
-	const task = await controller.delegate(goal.runId, { objective: "read relevant repair knowledge", mode: "execute", inputs: [], expectedOutputs: ["knowledge-review.txt"], checks: ["read original knowledge"], knowledgeIds: ["K001"], knowledgeContext: { backend: "test-backend" }, executionLoop: { mode: "candidate-episode" } });
+	const task = await controller.delegate(goal.runId, { objective: "read relevant repair knowledge", mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["knowledge-review.txt"], checks: ["read original knowledge"], knowledgeIds: ["K001"], knowledgeContext: { backend: "test-backend" }, executionLoop: { mode: "candidate-episode" } });
 	assert.equal(task.knowledgeAccess?.length, 2);
 	const reviewed = await controller.review(goal.runId, { taskId: task.taskId, artifacts: [task.reportPath!], checks: [{ criterion: "read original knowledge", result: "passed", evidence: [task.reportPath!] }] });
 	assert.equal(reviewed.status, "accepted");
@@ -354,7 +354,7 @@ test("a valid large required knowledge group uses a paged episode preview withou
 	const controller = createM07Controller(ctx, { candidateVerifier: verifier });
 	const goal = await controller.begin({ goal: "inspect required knowledge", problemRelation: "direct", constraints: ["preserve original conditions"], successCriteria: ["original criterion"], plan: "inspect" },
 		{ candidateVerification: { id: verifier.id, verifierVersion: verifier.version } });
-	const task = await controller.delegate(goal.runId, { objective: "read required knowledge", mode: "execute", inputs: [], expectedOutputs: ["knowledge-review.txt"],
+	const task = await controller.delegate(goal.runId, { objective: "read required knowledge", mode: "execute", subjectProfile: { operatorCategory: "norm-reduce", implementationSpace: "handwritten-low-level", rationale: "test fixture", baselineStrength: "none" }, inputs: [], expectedOutputs: ["knowledge-review.txt"],
 		checks: ["read original knowledge"], knowledgeIds: ["K001"], executionLoop: { mode: "candidate-episode" } });
 	assert.equal(task.status, "returned");
 	assert.equal(task.knowledgeAccess?.length, 2);
@@ -467,4 +467,47 @@ test("an incomplete dependency cycle does not block original reading or hide roo
 	assert.match(nextResult.text, /RELATED-RESTRICTION-MUST-REMAIN/);
 	assert.deepEqual(await f.store.limits(), limits);
 	assert.equal((await f.store.current())!.id, frozenSnapshot);
+});
+
+test("the contract check rejects an unknown API and an over-budget tile before any compile", async t => {
+	const contract = {
+		version: 1, kind: "contract", operatorCategory: "normalization", canonicalFamily: "layernorm",
+		bottleneck: "compile_failure", applicability: { backend: "backend-a", toolchain: "toolchain-1.2" },
+		provenance: { kind: "external-source", detail: "S007 头文件" },
+		api: "BackendA::Add", signature: "void Add(Tensor&, const Tensor&, int32_t)",
+		constraints: [{ name: "buffer_bytes", unit: "bytes", limit: 196352, comparison: "at_most", source: "S007" }],
+		source: "S007",
+	};
+	const foreign = { ...contract, applicability: { backend: "cuda", toolchain: "12.4" }, api: "cuda::Mul",
+		signature: "void Mul(float*, const float*, int)", constraints: [] };
+	const f = await setup(t, [
+		{ op: "create", type: "K", title: "Add 契约", body: "签名来自本地头文件副本", usageDecision: "adopted", fields: { optimization: contract } },
+		{ op: "create", type: "K", title: "别的后端契约", body: "不适用于本任务", usageDecision: "adopted", fields: { optimization: foreign } },
+	]);
+	const work = path.join(f.root, "work");
+	await mkdir(work, { recursive: true });
+	await writeFile(path.join(work, "kernel.cpp"), "BackendA::Add(dst, src, n);\nBackendA::Scale(dst, src);\n");
+	const tools = f.makeTools({ candidateRoot: work, context: { backend: "backend-a", toolchain: "toolchain-1.2" } });
+	const rejected = await tools.knowledge_contract_check.execute({ path: "kernel.cpp",
+		observationsJson: JSON.stringify([{ name: "buffer_bytes", value: 262144 }]) });
+	assert.match(rejected.text, /结论：reject/);
+	assert.match(rejected.text, /BackendA::Scale/);
+	assert.match(rejected.text, /最接近的合法签名 void Add/);
+	assert.match(rejected.text, /buffer_bytes=262144bytes/);
+	// The other backend's contract card is never used to judge this candidate.
+	assert.doesNotMatch(rejected.text, /cuda::Mul/);
+	const event = f.events.at(-1)!;
+	assert.equal(event.kind, "check");
+	assert.equal(event.status, "returned");
+	assert.equal(event.returnedRange?.content, "contract-check");
+	assert.deepEqual(event.selectedRefs, ["K001@1"]);
+	const frozen = JSON.parse(await readFile(event.frozenPath, "utf8")) as { safety: { status: string; findings: number } };
+	assert.equal(frozen.safety.status, "reject");
+	assert.equal(frozen.safety.findings, 2);
+
+	const passing = await tools.knowledge_contract_check.execute({ source: "BackendA::Add(a, b, c);",
+		observationsJson: JSON.stringify([{ name: "buffer_bytes", value: 1024 }]) });
+	assert.match(passing.text, /结论：pass/);
+	await assert.rejects(tools.knowledge_contract_check.execute({ path: "../escape.cpp" }), /work directory/);
+	await assert.rejects(tools.knowledge_contract_check.execute({}), /exactly one/);
 });

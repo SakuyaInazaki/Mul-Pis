@@ -18,7 +18,7 @@ M07 普通 `finish` 仍先执行原目标的成功标准、已接受证据、未
 
 提议的假设文字及模型明确停止的理由只校验结构、类型和非空，不再受旧版单字段 2,000 字符限制；历史 `maxReadbackChars` 计划字段只解码丢弃。案例文件和材料自身的字节边界、已登记材料的读取范围边界仍保留。
 
-自动晋级还需要调用方提供 `split: "admission"` 的私有机制案例集。控制器在提议前固定案例集，不把检查器答案送进 improver 或受测会话；每个案例、每次重复、每个策略臂都新建无工具的独立研究会话，从投影变化点重新求解，延后读取只从该次固定案例文本取回。准入至少要求两次偶数重复，基线/候选先后顺序交替；全部预设硬检查通过、每一配对中候选估计成本不增加，且总体严格降低，才允许原子晋级。混合增损、失败、准入双臂 provider usage 或 SDK 估价不完整、或案例未跑完均不能晋级。`development` 案例仅供开发观察，不能授权自动晋级。此实验只验证局部“投影—按需读回”机制，不能称整套 M01–M09 科研任务已成对重跑。
+自动晋级还需要调用方提供 `split: "admission"` 的私有机制案例集。控制器在提议前固定案例集，不把检查器答案送进 improver 或受测会话；每个案例、每次重复、每个策略臂都新建无工具的独立研究会话，从投影变化点重新求解，延后读取只从该次固定案例文本取回。准入至少要求两次偶数重复，基线/候选先后顺序交替；全部预设硬检查通过、每一配对中候选估计成本不增加，且至少一个配对严格降低，才允许原子晋级。**判定只采用有 headroom 的案例**：两条策略投影决策完全相同的案例，两臂跑的是同一段提示，它的成本差只能是噪声，因此记录在 `headroom.untriggeredCaseIds` 里但不参与判定；一个触发案例都没有时结论为未定。准入回执同时记录：本次实验用的模型标识（同一机制在不同模型上方向可能相反，换模型必须重跑，旧结论不可外推）、以 **token** 为单位的双臂预算（`baselineTokens` / `candidateTokens`，与 SDK 估算成本并列；只用墙钟或轮数的预算不可比），以及成对统计量 `paired`：方向一致的配对数 n、候选更省/更贵/持平的配对数，和在 n 上做的**精确双侧符号检验** p 值（持平配对按检验要求排除在 n 之外）。p 值只描述这批配对的方向一致程度，不是科研收益的证据。混合增损、失败、准入双臂 provider usage 或 SDK 估价不完整、或案例未跑完均不能晋级。`development` 案例仅供开发观察，不能授权自动晋级。此实验只验证局部“投影—按需读回”机制，不能称整套 M01–M09 科研任务已成对重跑。
 
 campaign 的观测账目只覆盖它启动的提议、两臂及读回调用，包括失败与 SDK 可见的重试；不执行总费用上限、阶段拆分额度、或前后置金额耗尽停机。provider token usage 与字符代理分列；成本是同一模型本地价表下的 SDK 估算。缺少 usage、价格或失败后仍可能在途的调用记为未知，绝不当作免费；提议会话账目不完整仍可继续机制实验，但准入双臂必须有完整可比较的费用证据才能晋级。子会话另有 `<session>.usage.jsonl`；主 Pi 编排使用私有 `.agent/telemetry/pi-main-usage-<sessionId>.jsonl`，标记 `pi-main-orchestration`，只追加 SDK 可见的会话条目，缺 usage 或价格时标记未知。主账写入是 best-effort，失败不阻断主会话；CLI 运行没有该主账。主 Pi 会话可能跨多个工作区，历史归属不能保证精确，因此不能把两个账目相加当作 campaign 或项目总账。SDK 未报告的隐藏重试、外部实验资源、Codex 人工研发与审查时间及 provider 实际账单仍不在可验证总账内。
 
@@ -29,6 +29,7 @@ campaign 的观测账目只覆盖它启动的提议、两臂及读回调用，�
 - `run` 读取工作区 `research.config.json` 的 `roles.improver`；准入案例还需 `roles.research`。harness 不替用户选择模型。
 - 无 `caseSetPath` 时只做投影筛选，正常结束为无准入证据的状态，不会晋级。
 - 案例集结构及校验规则见 [`MechanismCaseSet` 与 `validateCaseSet`](../../src/improvement/admission.ts)；`checker` 是控制器私有的准入检查定义，不送给受测会话。
+- `status` 另外汇总 `admissionRate`：历史全部候选尝试数与其中晋级、驳回、未定的数量及晋级率。门禁的意义在于入库率明显低于 100%，这个数字公开出来才能核对。
 
 一个通用的准入计划结构如下。`repetitions` 指定成对实验的重复数；`caseSetPath` 可选，相对工作区根目录，指向调用方自己准备的私有案例集。旧计划中的 `maxTotalCost`、`maxTotalOutputTokens` 及其他累计执行额度仅供兼容读取，新请求不以这些字段截断或停止。调用量、token 与 SDK 估算费用仍按可见实际记录。
 
@@ -68,7 +69,7 @@ M07 可在新目标 begin 时显式指定当前活跃的 `m07-workflow-prompt` H
 
 M07 `evidence-handoff` 另有显式单槽入口：`improve research bootstrap --methods <methods.json>` 可用 `m07-workflow-prompt`、`slot: "evidence-handoff"` 与 `diagnostic-improver-prompt` 建立独立于 CPU 的方法包；`improve research workflow run --plan <plan.json>` 才启动 I。计划结构由 [`WorkflowEvidenceHandoffPlanV1`](../../src/improvement/workflow-types.ts) 定义，需指定真实已冻结的 `developmentSource`（M07 run、checkpoint、处理该包的 M04 run）、开发案例文件、与源工作区及彼此隔离且尚不存在的 `experimentRoot`，以及成对重复数；独立 G 案例文件可省略，此时仅研究留档。H 候选只能改交接槽正文，不能改目标、答案、mandatory checks、工具或 G。正常 M07 begin 不会自行唤醒 I，已冻结目标也不热换 H。
 
-同版本 A/A 校准使用独立入口 `improve research workflow calibrate --plan <plan.json>`，Pi 工具对应 `research_method_improve` 的 `workflow-calibrate` action。它从当前一致的正式 M04/K 和同一方法出发，为每个开发案例建立两个全新 M07/M04 工作区，重复时交替执行 A 与 A2。计划只有 `version: 1`、`kind: "m07-evidence-handoff-aa/v1"`、`caseSetPath`、`experimentRoot`、`baseline: "builtin" | "active-h"` 和调用方指定的偶数 `repetitions`（至少 2）；案例文件使用现有 `split: "development"` 格式。重复数是校准的采样设计，费用按实际使用记录。
+同版本 A/A 校准使用独立入口 `improve research workflow calibrate --plan <plan.json>`，Pi 工具对应 `research_improve` 在 `track=method` 下的 `workflow-calibrate` action。它从当前一致的正式 M04/K 和同一方法出发，为每个开发案例建立两个全新 M07/M04 工作区，重复时交替执行 A 与 A2。计划只有 `version: 1`、`kind: "m07-evidence-handoff-aa/v1"`、`caseSetPath`、`experimentRoot`、`baseline: "builtin" | "active-h"` 和调用方指定的偶数 `repetitions`（至少 2）；案例文件使用现有 `split: "development"` 格式。重复数是校准的采样设计，费用按实际使用记录。
 
 校准记录保存在 `workflow-calibrations/`，保留两臂的独立运行标识、相同方法绑定、固定知识与输入、检查结果差异和用量。两个完整执行臂即使得到相同的失败检查，也原样记录；`complete` 仅表示校准链完成，不代表检查全通过或方法产生收益。校准入口不调用 I、不读取 G、不产生候选或改动生产活动方法。任何一臂证据交接或用量不完整，校准返回 `inconclusive`，保留已经形成的记录。
 

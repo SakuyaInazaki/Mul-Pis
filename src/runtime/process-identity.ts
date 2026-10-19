@@ -19,11 +19,45 @@ export interface ProcessProbe {
 	reason: string;
 }
 
+/**
+ * These probes decide whether a crashed owner may be taken over, so a probe
+ * that merely ran out of time must not look like a different answer. Two things
+ * keep that from happening: the budget is generous and retried once, because a
+ * loaded machine can take seconds to start a helper process, and values that
+ * cannot change while this process lives are read once and remembered.
+ */
+const PROBE_TIMEOUT_MS = 15_000;
+const TRANSIENT_SPAWN_CODES = new Set(["ETIMEDOUT", "EAGAIN", "ENOMEM", "EMFILE", "ENFILE", "EINTR"]);
+
+function transientSpawnFailure(error: unknown): boolean {
+	const code = (error as NodeJS.ErrnoException | null)?.code;
+	const killed = (error as { killed?: boolean } | null)?.killed === true;
+	return killed || (typeof code === "string" && TRANSIENT_SPAWN_CODES.has(code));
+}
+
+/** Run a host probe command, retrying once when the first attempt only ran out
+ * of resources. A real failure is reported as itself. */
+async function probeCommand(file: string, args: string[]): Promise<string> {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			const { stdout } = await execFileAsync(file, args, { timeout: PROBE_TIMEOUT_MS });
+			return stdout.trim();
+		} catch (error) {
+			if (attempt >= 1 || !transientSpawnFailure(error)) throw error;
+		}
+	}
+}
+
+/** The boot identity cannot change while this process runs. */
+let bootIdOnce: Promise<string> | undefined;
+
 async function bootId(): Promise<string> {
 	if (process.platform === "linux") return (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
 	if (process.platform === "darwin") {
-		const { stdout } = await execFileAsync("sysctl", ["-n", "kern.boottime"], { timeout: 2_000 });
-		return stdout.trim();
+		const pending = bootIdOnce ?? probeCommand("sysctl", ["-n", "kern.boottime"]);
+		bootIdOnce = pending;
+		try { return await pending; }
+		catch (error) { if (bootIdOnce === pending) bootIdOnce = undefined; throw error; }
 	}
 	throw new Error("boot identity is unavailable on this platform");
 }
@@ -52,8 +86,7 @@ async function startToken(pid: number): Promise<string> {
 		// libproc's proc_bsdinfo has microsecond birth fields. `ps lstart` only has
 		// second resolution and is insufficient for a PID-reuse control decision.
 		const code = `import ctypes,struct,sys\nlib=ctypes.CDLL('/usr/lib/libproc.dylib')\nlib.proc_pidinfo.argtypes=[ctypes.c_int,ctypes.c_int,ctypes.c_uint64,ctypes.c_void_p,ctypes.c_int]\nb=ctypes.create_string_buffer(136)\nn=lib.proc_pidinfo(int(sys.argv[1]),3,0,b,136)\nif n!=136 or struct.unpack_from('=I',b.raw,12)[0]!=int(sys.argv[1]): sys.exit(2)\ns,u=struct.unpack_from('=QQ',b.raw,120)\nif s<=0 or u>=1000000: sys.exit(3)\nprint(f'{s}:{u}')`;
-		const { stdout } = await execFileAsync("python3", ["-c", code, String(pid)], { timeout: 2_000 });
-		const token = stdout.trim();
+		const token = await probeCommand("python3", ["-c", code, String(pid)]);
 		if (!/^\d+:\d+$/.test(token)) throw new Error("precise process start unavailable");
 		return token;
 	}
@@ -79,11 +112,41 @@ async function linuxZombieGroupState(pid: number, start: string): Promise<"dead"
 		? "dead" : "alive";
 }
 
+/** Our own birth cannot change and our own pid cannot be reused while we run,
+ * so the answer is computed once. Every later recovery decision in this process
+ * then costs nothing and cannot disagree with an earlier one. */
+let selfIdentityOnce: Promise<ProcessIdentityV1> | undefined;
+
 export async function readCurrentProcessIdentity(pid = process.pid): Promise<ProcessIdentityV1> {
 	if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("invalid process pid");
-	const [boot, birth] = await Promise.all([bootId(), startToken(pid)]);
-	if (!boot || !birth) throw new Error("process identity unavailable");
+	if (pid !== process.pid) return readIdentity(pid);
+	const pending = selfIdentityOnce ?? readIdentity(pid);
+	selfIdentityOnce = pending;
+	try { return await pending; }
+	catch (error) { if (selfIdentityOnce === pending) selfIdentityOnce = undefined; throw error; }
+}
+
+async function readIdentity(pid: number): Promise<ProcessIdentityV1> {
+	const [boot, birth] = await Promise.all([
+		bootId().catch((error: unknown) => {
+			throw new Error(`process identity unavailable: boot identity failed (${describeProbeFailure(error)})`, { cause: error });
+		}),
+		startToken(pid).catch((error: unknown) => {
+			throw new Error(`process identity unavailable: birth token for pid ${pid} failed (${describeProbeFailure(error)})`, { cause: error });
+		}),
+	]);
+	if (!boot || !birth) throw new Error("process identity unavailable: an empty probe answer is not an identity");
 	return { hostId: os.hostname(), bootId: boot, pid, processStartToken: birth };
+}
+
+/** Bounded, single-line reason why a host probe failed; never its output or argv. */
+function describeProbeFailure(error: unknown): string {
+	const failure = error as { killed?: boolean; code?: unknown; message?: unknown } | null;
+	if (failure?.killed === true) return `timed out after ${PROBE_TIMEOUT_MS} ms`;
+	if (typeof failure?.code === "string") return failure.code;
+	if (typeof failure?.code === "number") return `exit ${failure.code}`;
+	return typeof failure?.message === "string" && failure.message
+		? failure.message.replace(/\s+/g, " ").slice(0, 120) : "unknown probe failure";
 }
 
 /** Unknown includes reused PIDs, remote hosts, insufficient permissions and probe failures. */
@@ -103,7 +166,9 @@ export async function probeProcessIdentity(identity: ProcessIdentityV1): Promise
 	}
 	try {
 		const observed = process.platform === "linux" ? await linuxStat(identity.pid) : null;
-		const currentStart = observed?.startToken ?? await startToken(identity.pid);
+		// Probing ourselves needs no new helper process: our own birth was already read.
+		const currentStart = observed?.startToken ??
+			(identity.pid === process.pid ? (await readCurrentProcessIdentity()).processStartToken : await startToken(identity.pid));
 		if (currentStart !== identity.processStartToken) return { status: "unknown", identityMatch: false, reason: "pid reused or identity changed" };
 		if (observed?.state === "Z") {
 			const group = await linuxZombieGroupState(identity.pid, currentStart);

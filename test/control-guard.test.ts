@@ -36,11 +36,15 @@ test("normal shutdown marks only the owned active run failed and late completion
 	await writeFile(path.join(root, "problem", "problem.md"), "problem\n");
 	await writeFile(path.join(root, "research.config.json"), `${JSON.stringify({ roles: { execution: "fake/model" }, concurrency: 1 })}\n`);
 	let release!: () => void;
+	let promptStarted!: () => void;
 	const blocked = new Promise<void>((resolve) => { release = resolve; });
-	const service = new ResearchService({ defaultWorkspace: path.join(root, "different-pi-cwd"), runnerFactory: () => new FakeSessionRunner(async () => { await blocked; return "late answer"; }) });
+	// Shutdown must race only the terminal write, never a session-boundary write
+	// that is still legitimately recording a running run.
+	const prompting = new Promise<void>((resolve) => { promptStarted = resolve; });
+	const service = new ResearchService({ defaultWorkspace: path.join(root, "different-pi-cwd"), runnerFactory: () => new FakeSessionRunner(async () => { promptStarted(); await blocked; return "late answer"; }) });
 	await service.init(root);
 	const pending = service.runStage({ stage: "M01", workspace: root });
-	while ((await service.status(root)).stages.M01.count === 0) await new Promise((resolve) => setTimeout(resolve, 2));
+	await prompting;
 	const ws = new Workspace(root);
 	const foreign = await ws.startRun("M01", []);
 	await service.interruptAllActive("test shutdown");
@@ -51,6 +55,31 @@ test("normal shutdown marks only the owned active run failed and late completion
 	assert.equal(owned.status, "failed");
 	assert.match(owned.failures.join("\n"), /host-shutdown/);
 	assert.equal((await ws.readRun("M01", foreign.runId)).status, "running");
+});
+
+test("a still-running write during shutdown reports the shutdown, not a revived record", async () => {
+	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-shutdown-write-"));
+	await mkdir(path.join(root, "problem", "raw"), { recursive: true });
+	await writeFile(path.join(root, "problem", "problem.md"), "problem\n");
+	await writeFile(path.join(root, "research.config.json"), `${JSON.stringify({ roles: { execution: "fake/model" }, concurrency: 1 })}\n`);
+	let shutdownDone!: () => void;
+	const shutdown = new Promise<void>((resolve) => { shutdownDone = resolve; });
+	let service!: ResearchService;
+	// The session boundary receipt is written while the run is still running. If
+	// shutdown already owns the operation, that write must fail as a shutdown.
+	service = new ResearchService({ defaultWorkspace: root, runnerFactory: () => new FakeSessionRunner(async () => {
+		await service.interruptAllActive("test shutdown");
+		shutdownDone();
+		return "answer after shutdown";
+	}) });
+	await service.init(root);
+	await assert.rejects(service.runStage({ stage: "M01", workspace: root }), /shutting down|不能覆盖为/);
+	await shutdown;
+	const ws = new Workspace(root);
+	const records = await Promise.all((await ws.listRuns("M01")).map((runId) => ws.readRun("M01", runId)));
+	assert.equal(records.length, 1);
+	assert.equal(records[0].status, "failed");
+	assert.match(records[0].failures.join("\n"), /host-shutdown/);
 });
 
 test("corrupt persisted run state is never treated as a fresh record by a late writer", async () => {

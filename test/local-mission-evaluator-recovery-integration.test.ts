@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFile, chmod, mkdir, mkdtemp, realpath, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -17,6 +17,31 @@ import { probeProcessIdentity } from "../src/runtime/process-identity.ts";
 import type { ReadReturnEvent } from "../src/runner/types.ts";
 import { runInit } from "../src/stages/init.ts";
 import { Workspace } from "../src/workspace.ts";
+
+
+/** Barriers in this test are files written by another process. Waiting for one
+ * is bounded by the wall clock rather than by an iteration count, so a loaded
+ * machine only makes the wait longer, never turns it into a wrong answer. When
+ * the writer is a child process, its exit ends the wait immediately: there is
+ * nothing left to wait for, and its status is the diagnosis. */
+const BARRIER_TIMEOUT_MS = 120_000;
+
+async function waitForBarrier(file: string, options: { child?: ChildProcess; timeoutMs?: number } = {}): Promise<Buffer> {
+	const timeoutMs = options.timeoutMs ?? BARRIER_TIMEOUT_MS;
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		try { return await readFile(file); }
+		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+		const child = options.child;
+		if (child && (child.exitCode !== null || child.signalCode !== null)) {
+			// The child may have written the barrier just before exiting.
+			try { return await readFile(file); } catch { /* still absent */ }
+			throw new Error(`child exited (code ${child.exitCode}, signal ${child.signalCode}) before ${path.basename(file)} appeared`);
+		}
+		if (Date.now() >= deadline) throw new Error(`${path.basename(file)} did not appear within ${timeoutMs} ms`);
+		await delay(10);
+	}
+}
 
 const evaluatorId = "test:durable-return-recovery";
 const throwingEvaluatorId = "test:durable-throw-recovery";
@@ -90,13 +115,7 @@ function registerThrowingEvaluator(root: string, reconcile: boolean, liveChildMs
 				const child = spawn(process.execPath, ["--input-type=module", "-e", code],
 					{ detached: true, stdio: "ignore" });
 				child.unref();
-				let observed = false;
-				for (let index = 0; index < 100; index++) {
-					try { observed = Boolean(await readFile(path.join(root, "owned-child.json"))); }
-					catch { await delay(20); }
-					if (observed) break;
-				}
-				assert(observed, "owned evaluator child did not publish its process identity");
+				await waitForBarrier(path.join(root, "owned-child.json"), { child });
 			} else {
 				const child = spawnSync(process.execPath, ["--input-type=module", "-e",
 					`import { readCurrentProcessIdentity } from ${JSON.stringify(identityModule)}; process.stdout.write(JSON.stringify(await readCurrentProcessIdentity()));`],
@@ -111,13 +130,7 @@ function registerThrowingEvaluator(root: string, reconcile: boolean, liveChildMs
 			try {
 				await readFile(path.join(root, "pause-reconcile"));
 				await writeFile(path.join(root, "reconcile-entered"), "entered\n");
-				let released = false;
-				for (let index = 0; index < 400; index++) {
-					try { released = Boolean(await readFile(path.join(root, "release-reconcile"))); }
-					catch { await delay(10); }
-					if (released) break;
-				}
-				assert(released, "synthetic reconciliation barrier was never released");
+				await waitForBarrier(path.join(root, "release-reconcile"));
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 			}
@@ -140,13 +153,7 @@ function createRunner(log: string, assessment: "first" | "second" | "invalid") {
 				try {
 					await readFile(path.join(root, "m04-pause"));
 					await writeFile(path.join(root, "m04-entered"), String(process.pid));
-					let released = false;
-					for (let index = 0; index < 1000; index++) {
-						try { released = Boolean(await readFile(path.join(root, "m04-release"))); }
-						catch { await delay(10); }
-						if (released) break;
-					}
-					assert(released, "synthetic M04 barrier was never released");
+					await waitForBarrier(path.join(root, "m04-release"));
 				} catch (error) {
 					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 				}
@@ -376,14 +383,7 @@ async function childHoldRecoveryClaim(root: string, missionId: string): Promise<
 		oldCheckpointSha256: status.latestCheckpoint.sha256 });
 	assert.equal(claim.state, "claimed");
 	await writeFile(path.join(root, "claim-held"), "held\n");
-	for (let index = 0; index < 3000; index++) {
-		try { await readFile(path.join(root, "release-claim")); return; }
-		catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		}
-		await delay(10);
-	}
-	throw new Error("synthetic recovery claim was not released");
+	await waitForBarrier(path.join(root, "release-claim"));
 }
 
 async function publishedReturnedFixture(t: TestContext): Promise<{
@@ -472,13 +472,11 @@ if (process.argv[2] === "child-start") {
 		let output = "";
 		recover.stdout?.on("data", chunk => { output += String(chunk); });
 		recover.stderr?.on("data", chunk => { output += String(chunk); });
-		let atM04 = false;
-		for (let index = 0; index < 400; index++) {
-			try { atM04 = Boolean(await readFile(path.join(f.root, "m04-entered"))); }
-			catch { await delay(10); }
-			if (atM04) break;
+		try { await waitForBarrier(path.join(f.root, "m04-entered"), { child: recover }); }
+		catch (error) {
+			recover.kill();
+			assert.fail(`receipt recovery did not enter M04: ${(error as Error).message}; child output: ${output.trim() || "(none captured)"}`);
 		}
-		if (!atM04) { recover.kill(); assert.fail(`receipt recovery did not enter M04: ${output}`); }
 		const receipt = JSON.parse(await readFile(f.receiptFile, "utf8")) as
 			{ checks: Array<{ result: string; schemaErrors?: unknown[] }> };
 		assert.equal(receipt.checks[0]?.result, "passed");

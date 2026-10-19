@@ -46,3 +46,23 @@ test("a continue operation rejects a different session returned under the same r
 	await assert.rejects(openBoundedSession(runner, run, { mode: "continue", intent: "causal-continuation", reason: "must be same session", evidence: [], parent: first.ref, expectedToolGrantKind: "none" }, async () => {}), /exact persisted parent/);
 	assert.equal(run.sessions.length, 1);
 });
+
+test("an episodic restart must carry the frozen episode record that replaces the cleared context", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "boundary-restart-"));
+	const run = record();
+	const runner = new FakeSessionRunner(() => "ok");
+	const spec: SessionSpec = { label: "M07-T001-episode-1", role: "execution", model: "fake/execution",
+		systemPrompt: "system", persistDir: path.join(root, "sessions"), tools: { kind: "none" } };
+	await assert.rejects(openBoundedSession(runner, run, { mode: "fresh", intent: "episodic-restart",
+		reason: "boundary without its record", evidence: [], spec }, async () => {}),
+		/episodic restart requires the frozen episode record/);
+	const recordFile = path.join(root, "E1.json");
+	await writeFile(recordFile, "{}\n");
+	const handle = await openBoundedSession(runner, run, { mode: "fresh", intent: "episodic-restart",
+		reason: "boundary carrying its record", evidence: [{ version: 1, label: "M07 T001 episode record E1",
+			path: recordFile, status: "frozen-copy", sourceVersion: "M07-0001/T001" }], spec },
+		async () => {});
+	assert.ok(handle.ref.id);
+	assert.equal(run.sessions.at(-1)?.boundary?.intent, "episodic-restart");
+	handle.dispose();
+});

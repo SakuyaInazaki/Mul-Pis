@@ -1,3 +1,4 @@
+import { harnessCodeRevision, LEGACY_LOCAL_HARNESS_REVISION } from "../src/m07/harness-revision.ts";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
@@ -399,4 +400,22 @@ test("default mission chooses a distinct task after V6 negative feedback", async
 	const m07Runs = await f.ws.listRuns("M07");
 	assert(m07Runs.some(runId => runId !== f.request.m07RunId),
 		"fresh assessment must dispatch a distinct M07 run");
+});
+
+test("the harness revision comes from the loaded source instead of a literal", async () => {
+	const previous = process.env.PRE_RSI_CODE_REVISION;
+	try {
+		process.env.PRE_RSI_CODE_REVISION = "revision-under-test";
+		assert.equal(await harnessCodeRevision(), "revision-under-test");
+		process.env.PRE_RSI_CODE_REVISION = "not a safe id";
+		assert.equal(await harnessCodeRevision(), "unrecorded",
+			"an unusable value becomes unrecorded rather than a different comparable revision");
+		delete process.env.PRE_RSI_CODE_REVISION;
+		assert.equal(await harnessCodeRevision(), "unrecorded");
+		assert.equal(LEGACY_LOCAL_HARNESS_REVISION, "local-harness-v1",
+			"old attempt records stay recognizable");
+	} finally {
+		if (previous === undefined) delete process.env.PRE_RSI_CODE_REVISION;
+		else process.env.PRE_RSI_CODE_REVISION = previous;
+	}
 });

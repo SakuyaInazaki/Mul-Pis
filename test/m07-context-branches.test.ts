@@ -3,7 +3,6 @@ import { mkdtemp, realpath, mkdir, readFile, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
-import { offlineChecks } from "../scripts/manual-private-campaign.ts";
 import { createFileKnowledgeStore } from "../src/knowledge/store.ts";
 import { createM07Controller } from "../src/m07/controller.ts";
 import type { CandidateVerifier } from "../src/m07/candidate-evaluation.ts";
@@ -67,11 +66,9 @@ test("M07 opens two real fake-runner histories from one frozen task leaf with pr
 	assert.equal(firstLineage.checkpoint.id, context.checkpointId);
 	assert.equal(firstLineage.parent.sessionId, parent.session!.id);
 	assert.equal(firstLineage.evidenceBindings[0].status, "frozen-copy");
-	const lineageSummary = await offlineChecks.contextLineageSummary(first.session?.lineageFile,
-		parent.branchSource!.checkpoint, first.session?.id, first.session?.model,
-		parent.branchSource!.problemSnapshotCopy, "fake/execution");
-	assert.equal(lineageSummary.state, "verified", JSON.stringify(lineageSummary.driverChecks));
-	assert.equal(lineageSummary.evidenceBindingCount, 2);
+	assert.equal(firstLineage.state, "committed");
+	assert.equal(firstLineage.child.sessionId, first.session!.id);
+	assert.equal(firstLineage.evidenceBindings.length, 2);
 	const parentHistory = await readFile(parent.session!.file!, "utf8");
 	const firstHistory = await readFile(first.session!.file!, "utf8");
 	const secondHistory = await readFile(second.session!.file!, "utf8");
@@ -162,6 +159,8 @@ test("an abandoned verified candidate cannot satisfy the goal's candidate qualif
 			checks: [], metrics: [], limitations: [] }; } };
 	const f = await fixture(t, false, undefined, verifier);
 	const candidateSpec = { ...taskSpec, expectedOutputs: ["candidate.txt", "receipt.json"],
+		subjectProfile: { operatorCategory: "norm-reduce" as const, implementationSpace: "handwritten-low-level" as const, rationale: "test fixture",
+			baselineStrength: "none" as const },
 		candidate: { sourcePaths: ["candidate.txt"], receiptPaths: ["receipt.json"] } };
 	const parent = await f.controller.delegate(f.goal.runId, candidateSpec);
 	assert.equal((await f.controller.review(f.goal.runId, { taskId: parent.taskId,
@@ -175,7 +174,9 @@ test("an abandoned verified candidate cannot satisfy the goal's candidate qualif
 	assert.equal(reviewedBranch.candidateObservation?.sourceBinding, "verified");
 	await f.controller.selectBranch(f.goal.runId, { parentTaskId: parent.taskId,
 		rationale: "Abandon this comparison after review" });
-	const independent = await f.controller.delegate(f.goal.runId, { ...taskSpec, objective: "Independent noncandidate study" });
+	const independent = await f.controller.delegate(f.goal.runId, { ...taskSpec, objective: "Independent noncandidate study",
+		subjectProfile: { operatorCategory: "norm-reduce" as const, implementationSpace: "handwritten-low-level" as const, rationale: "test fixture",
+			baselineStrength: "none" as const } });
 	const reviewedIndependent = await f.controller.review(f.goal.runId, { taskId: independent.taskId,
 		checks: [{ criterion: taskSpec.checks[0], result: "passed", evidence: [independent.reportPath!] }], artifacts: [independent.reportPath!] });
 	assert.equal(reviewedIndependent.status, "accepted");

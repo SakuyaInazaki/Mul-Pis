@@ -18,6 +18,31 @@ test("process probe rejects changed birth token and other host", async () => {
 	assert.equal((await probeProcessIdentity({ ...identity, hostId: "other-host" })).status, "unknown");
 });
 
+test("repeated recovery decisions reuse this process's own identity instead of re-probing it", async () => {
+	// Every recovery gate reads the current identity. When each read spawned a
+	// helper process with a short timeout, a loaded machine could turn a live
+	// owner into "unknown" and refuse a legitimate takeover. The answer cannot
+	// change while this process runs, so it is read once.
+	const started = Date.now();
+	const identities = await Promise.all(Array.from({ length: 200 }, () => readCurrentProcessIdentity()));
+	const probes = await Promise.all(identities.map(item => probeProcessIdentity(item)));
+	assert.equal(new Set(identities.map(item => JSON.stringify(item))).size, 1,
+		"one process has one identity; two different answers would make recovery decisions disagree");
+	assert.deepEqual([...new Set(probes.map(item => `${item.status}:${item.reason}`))], ["alive:identity verified"]);
+	assert.equal(identities[0].pid, process.pid);
+	// Generous, but far below what 200 helper spawns would cost even unloaded.
+	assert.ok(Date.now() - started < 10_000, `self identity took ${Date.now() - started} ms for 200 reads`);
+});
+
+test("an unreadable identity says which probe failed and why", async () => {
+	// A pid that cannot exist: the birth-token probe must fail, and the failure
+	// has to name itself. A bare "unavailable" is what made a timing flake
+	// impossible to diagnose.
+	await assert.rejects(readCurrentProcessIdentity(2_147_483_646), (error: Error) =>
+		/process identity unavailable: birth token for pid 2147483646 failed \(.+\)/.test(error.message));
+	await assert.rejects(readCurrentProcessIdentity(0), /invalid process pid/);
+});
+
 test("actual workflow-control reports stored declaration separately and refuses reused PID", async (t) => {
 	const root = await mkdtemp(path.join(tmpdir(), "pre-rsi-control-"));
 	t.after(() => rm(root, { recursive: true, force: true }));

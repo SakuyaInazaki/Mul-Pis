@@ -1,5 +1,6 @@
 /** Exact, host-owned reconciliation of a dead local mission dispatch. This is a
  * review of retained control evidence, not a resumption of any old session. */
+import { harnessCodeRevision, LEGACY_LOCAL_HARNESS_REVISION } from "./harness-revision.ts";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, readdir } from "node:fs/promises";
@@ -270,7 +271,7 @@ async function reconcileCore(input: {
 	if (mission.runId !== request.intentId || mission.stage !== "MISSION" ||
 		!mission.inputs.some(item => item.path === contractFile) ||
 		mission.status === "completed") fail("mission intent is not the interrupted run");
-	if (legacy && (old.codeRevision !== "local-harness-v1" ||
+	if (legacy && (old.codeRevision !== LEGACY_LOCAL_HARNESS_REVISION ||
 		!Array.isArray(mission.sessions) || mission.sessions.some(row =>
 			row.role !== "research" || !row.label?.startsWith("local-original-objective-"))))
 		fail("legacy source loader or default serial MISSION launcher is not verified");
@@ -490,7 +491,7 @@ async function reconcileCore(input: {
 	const nextId = `A${String(Number(status.currentAttempt!.attemptId.slice(1)) + 1).padStart(3, "0")}`;
 	const predicted = { version: 1 as const, missionId: request.missionId,
 		attemptId: nextId, predecessorAttemptId: status.currentAttempt!.attemptId,
-		codeRevision: "local-harness-v1", process: currentProcess };
+		codeRevision: await harnessCodeRevision(), process: currentProcess };
 	const commonReview = { version: 1 as const, missionId: request.missionId,
 		intentId: request.intentId, missionRunSha256: missionFile.sha256, oldAttempt: old,
 		oldCheckpoint: { sequence: checkpoint.sequence, sha256: checkpoint.sha256 },

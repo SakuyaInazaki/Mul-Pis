@@ -319,3 +319,44 @@ test("same-obligation retry keeps history but fulfills only from the current acc
 	assert.deepEqual(done.tasks.map((item) => item.status), ["rejected", "rejected", "accepted", "accepted"]);
 	assert.deepEqual(done.tasks.slice(0, 2).map((item) => item.review?.failures), [["首轮失败"], ["二轮失败"]]);
 });
+
+test("the frozen understanding rides at the front of every task prompt under one goal", async (t) => {
+	const f = await fixture(t);
+	const m01 = await f.ws.startRun("M01", []);
+	await f.ws.writeOutput(m01, "initial-understanding.md", "机制 A 的当前认识：第一点、第二点。\n", "初始认识");
+	await f.ws.finishRun(m01, "completed");
+	const m03 = await f.ws.startRun("M03", []);
+	await f.ws.writeOutput(m03, "evaluation.md", "质询：第二点缺少可定位证据。\n", "逐题评价");
+	await f.ws.finishRun(m03, "completed");
+	const goal = await f.controller.begin(begin);
+	assert.equal(goal.understanding?.m01RunId, m01.runId);
+	assert.equal(goal.understanding?.m03RunId, m03.runId);
+	const first = await f.controller.delegate(goal.runId, { objective: "读取材料", inputs: [],
+		expectedOutputs: [], checks: ["读过材料"], mode: "reason" });
+	const second = await f.controller.delegate(goal.runId, { objective: "再读一次", inputs: [],
+		expectedOutputs: [], checks: ["读过材料"], mode: "reason" });
+	const messageOf = async (taskId: string) =>
+		readFile(path.join(f.ws.runDir("M07", goal.runId), "tasks", taskId, "message.md"), "utf8");
+	const firstMessage = await messageOf(first.taskId);
+	assert.match(firstMessage, /【本任务的已有认识（M01 初始认识，冻结自目标开始时）】/);
+	assert.match(firstMessage, /机制 A 的当前认识：第一点、第二点。/);
+	assert.match(firstMessage, /【对该认识的质询与评价要点（M03）】/);
+	assert.match(firstMessage, /第二点缺少可定位证据/);
+	const understandingAt = (text: string) => text.indexOf("【本任务的已有认识");
+	assert.ok(understandingAt(firstMessage) > 0);
+	assert.ok(understandingAt(firstMessage) < firstMessage.indexOf("【待检查事项】"),
+		"it sits before this round's own material");
+	// A later M01 run must not move the bytes this goal already froze.
+	const later = await f.ws.startRun("M01", []);
+	await f.ws.writeOutput(later, "initial-understanding.md", "后来的认识，与本目标无关。\n", "初始认识");
+	await f.ws.finishRun(later, "completed");
+	const third = await f.controller.delegate(goal.runId, { objective: "第三次", inputs: [],
+		expectedOutputs: [], checks: ["读过材料"], mode: "reason" });
+	const secondMessage = await messageOf(second.taskId), thirdMessage = await messageOf(third.taskId);
+	const block = (text: string) => text.slice(understandingAt(text), text.indexOf("【待检查事项】"));
+	assert.equal(block(secondMessage), block(firstMessage), "the prefix stays byte-identical between rounds");
+	assert.equal(block(thirdMessage), block(firstMessage));
+	assert.ok(!thirdMessage.includes("后来的认识"));
+	assert.deepEqual(third.promptLayout?.sections.filter(item => item.kind === "understanding")
+		.map(item => item.key), ["understanding"], "the layout receipt records it");
+});

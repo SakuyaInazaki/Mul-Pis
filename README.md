@@ -2,6 +2,28 @@
 
 Mul-Pis 是基于 Pi 的算子优化工作流及其执行与验证框架。M01–M09 承载研究、执行、复核和交付，C/K/E/J/Q/D/X 知识库通过 M04 统一处理采用、纠错、替换和撤回。
 
+## 本地环境与校验
+
+Node.js ≥ 22（直接运行 TypeScript，不做构建），只需两条命令即可复核本仓库：
+
+```sh
+npm install                 # 只装 devDependencies 与类型；运行期依赖按 peerDependencies 由宿主提供
+npm run typecheck           # tsc --noEmit，覆盖 src、extensions、terminal-console 与全部测试
+npm test                    # 离线测试：不调真实模型，不联网，只用临时目录
+```
+
+`@earendil-works/pi-ai` 与 `@earendil-works/pi-coding-agent` 固定在 0.85.1，由宿主环境提供；`@types/node` 与 `typescript` 在 devDependencies 中锁定具体版本，因为类型检查结论随版本变化。部分执行测试需要可用的 `python3`，可用 `PRE_RSI_TEST_PYTHON` 指定解释器；少数测试只在 Linux 上运行。
+
+## 观察与审计
+
+```sh
+npm run console -- --workspace <dir>              # 终端执行树界面
+npm run console -- status --workspace <dir> --json
+npm run audit -- --workspace <dir> [--json]       # 判决分布、失败分账、预算与反馈密度
+```
+
+审计投影只做计数，全部由持久控制记录确定性派生：任务与候选判决分布、每个候选停在哪一级验证门、引擎驳回 agent 自述候选的计数、基础设施失败与策略失败分账、运行层自己标注的工具与传输失败分类及未判定占比、候选的 guard/晋级状态/分支决策/车道/相位/排名分、搜索停滞与路线、搜索预算的用量与停止原因、token 与计费合计及其完整性、反馈密度与改动类别分布。字段说明见[终端控制台设计](terminal-console/docs/implementation/terminal-console-design.md)。
+
 ## 当前工作与审阅入口
 
 本轮修复覆盖连续目标的执行—复核—返修循环、未知外部操作对账与恢复、知识状态和替换关系展示、M04 证据读取，以及后续新会话的 200k 自动压缩。源码、针对性回归和通用变更记录随本分支发布；具体实验配置与原始运行材料保留在实验工作区。

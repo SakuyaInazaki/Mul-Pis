@@ -14,5 +14,5 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/**/*.ts", "extensions/**/*.ts", "terminal-console/src/console/**/*.ts", "test/**/*.ts", "scripts/manual-private-campaign.ts"]
+  "include": ["src/**/*.ts", "extensions/**/*.ts", "terminal-console/src/console/**/*.ts", "terminal-console/test/**/*.ts", "test/**/*.ts"]
 }

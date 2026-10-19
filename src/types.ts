@@ -38,6 +38,12 @@ export interface HarnessConfig {
 	localMission?: { execution?: "task-root-bash"; evaluatorId?: string };
 	/** Independent M03 question/evaluation sessions. Repeated models are allowed and remain distinct sessions. */
 	m03Reviewers?: Array<{ id: string; model: string }>;
+	/** Evaluations between candidate-episode boundary restarts; 0 disables them.
+	 * A cadence for clearing context, never a limit on how much work may be done. */
+	episodeRestart?: { evaluations: number };
+	/** Prompt assembly knobs. historyDepth is how many earlier candidates the
+	 * task prompt carries; its value is a local scan result, not a paper's. */
+	promptLayout?: { historyDepth: number };
 	/** Maximum number of independent stage tasks processed at the same time. Engineering default 1. */
 	concurrency: number;
 	/** External tool endpoints for M05. Absent entries disable the corresponding provider. */

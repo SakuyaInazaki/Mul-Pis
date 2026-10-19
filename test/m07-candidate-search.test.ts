@@ -183,7 +183,7 @@ test("exact-source repeated observations describe distinct IDs without changing 
 	assert(overall.measurements.length === 2 && perCase.measurements.length === 3,
 		"the full facts retain exact measurement provenance for the paged view");
 	assert.deepEqual(brief.readRepeatedSourceObservations.args,
-		{ section: "repeated-source", subjectId: "a", offset: 0, limit: 50 });
+		{ action: "list", section: "repeated-source", subjectId: "a", offset: 0, limit: 50 });
 	assert(scopedRepeatedSourceObservations(facts, { subjectId: "a", basisId: "latency-basis" }, entries)
 		.every(item => item.subjectId === "a" && item.metric.basisId === "latency-basis"));
 	assert.deepEqual(scopedRepeatedSourceObservations(facts, { basisId: "absent-basis" }, entries), []);
@@ -276,7 +276,7 @@ test("shared external observations keep candidate refs without gaining independe
 		{ subjectId: "a", basisId: "other-device" }).map(item => item.candidateRefs), [["T001/C004"]],
 		"an explicit basis still filters exactly");
 	assert.deepEqual(candidateSearchBrief(facts, [first, rebound, competitor, otherBasis], focus)
-		.readLeads.args, { section: "search-leads", subjectId: "a", offset: 0, limit: 50 });
+		.readLeads.args, { action: "list", section: "search-leads", subjectId: "a", offset: 0, limit: 50 });
 	const fresh = entry("C005", 2, 2, { externalId: "SID-new", basisId: "fresh-basis" });
 	const lateRebound = entry("C006", 5, 8, { externalId: "SID158939" });
 	lateRebound.observation.verifier.version = "4";

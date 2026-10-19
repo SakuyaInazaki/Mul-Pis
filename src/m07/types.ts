@@ -6,6 +6,11 @@ import type { ExperienceRequirementV1, M07WorkflowStrategyV1 } from "../improvem
 import type { RunDescriptorV1 } from "../runtime/run-descriptor.ts";
 import type { KnowledgeRetrievalContext } from "../knowledge/retrieval.ts";
 import type { CandidateComparisonV1, CandidatePerformanceEvidenceV1 } from "./candidate-diagnostics.ts";
+import type { CandidatePolicyDecisionV1, CandidateSearchStateV1, CandidateStrategy } from "./candidate-policy.ts";
+import type { PromptLayoutReceiptV1 } from "./prompt-layout.ts";
+import type { OperatorCategory } from "./candidate-policy.ts";
+import type { OptimizationMethod } from "../knowledge/optimization-card.ts";
+import type { FrozenUnderstandingV1 } from "../understanding.ts";
 import type { KnowledgeAccessEvent } from "./execution-knowledge.ts";
 
 export type M07TaskMode = "execute" | "check" | "reason";
@@ -25,10 +30,32 @@ export interface BeginGoalInput {
 	workflowMethodVersionId?: string;
 }
 
+/** Declared, never host-proven: where this work object is being implemented and
+ * what is already known about its headroom. The harness records it so a
+ * trajectory can answer "why this abstraction layer" and "why spend here"; the
+ * numbers stay model or host declarations with their own stated source. */
+export interface SubjectProfileV1 {
+	/** Operator class, recorded so a trajectory says what kind of work this was.
+	 * It carries no budget and no admission rule. */
+	operatorCategory: OperatorCategory;
+	implementationSpace: "vendor-library" | "dsl-or-ir" | "handwritten-low-level";
+	/** Why this layer rather than the ones above or below it. */
+	rationale: string;
+	/** How strong the implementation being competed against already is. */
+	baselineStrength: "vendor-library" | "framework-default" | "none";
+	/** Share of end-to-end runtime, in [0, 1], when it has been measured. */
+	endToEndShare?: number;
+	/** Remaining headroom and where that estimate comes from. */
+	headroom?: { kind: "roofline-ratio" | "sol-gap" | "measured-reference" | "unknown";
+		value?: number; source: string };
+}
+
 export interface TaskSpecInput {
 	objective: string;
 	/** Actual object of this task's work; input materials do not change this identity. */
 	subjectId?: string;
+	/** Required for a candidate-producing execute task under a bound verifier. */
+	subjectProfile?: SubjectProfileV1;
 	inputs: string[];
 	expectedOutputs: string[];
 	checks: string[];
@@ -48,6 +75,8 @@ export interface TaskSpecInput {
 	/** Explicit versioned external references, each already present in inputs. Never discovered globally. */
 	resourceInputs?: Array<{ id: string; version: string; input: string }>;
 	/** Explicit task execution mode: legacy fresh-reviewer repair or same-session candidate feedback. Continuous goals do not imply a mode. Legacy bounded fields map to opt-in until-ready. No process-restart replay. */
+	/** Historical records may carry `{maxRounds, deadlineAt}`. Those numbers are
+	 * decoded for audit and normalized away: nothing bounds a loop by count. */
 	executionLoop?: { mode: "until-ready" | "candidate-episode" } | { maxRounds: number; deadlineAt: string };
 	/** Expected JSON output carrying a candidate lesson to M04, never an adopted record. */
 	lessonDeltaOutput?: string;
@@ -90,16 +119,57 @@ export interface CandidateDiagnosticV1 {
 	caseId?: string;
 }
 
+/** The host's own ruling on one candidate/baseline pair, at the noise scale it
+ * measured. A search layer that re-derives "faster" from raw medians picks
+ * candidates out of noise; these verdicts are the only admissible answer to
+ * "is it actually faster", and they are facts, not negotiable opinions. */
+export interface CandidatePerformanceVerdictV1 {
+	/** Baseline denominator this verdict is about; a ratio never transfers to another. */
+	baseline: string;
+	tier?: string;
+	verdict: "faster" | "slower" | "tie" | "quarantined";
+	/** Paired candidate/baseline ratio median; below 1 means the candidate is faster. */
+	pairedRatioMedian: number;
+	/** Host threshold derived from the measured dispersion, not a fixed constant. */
+	minimumImprovementThreshold: number;
+	/** End-to-end admissibility, when the case was measured end to end. */
+	endToEndAdmissible?: boolean;
+	/** Whether an independent remeasurement agreed with the ruling. */
+	confirmed?: boolean;
+}
+
+/** Host aggregate per baseline. Coverage and magnitude stay separate numbers,
+ * ratios use geometric mean or median, and failures stay in the denominator. */
+export interface CandidateAggregateV1 {
+	baseline: string;
+	declaredCases: number;
+	decidableCases: number;
+	fasterCases: number;
+	successRate?: number;
+	geometricMeanSpeedupAllDecidable?: number;
+	medianSpeedupAllDecidable?: number;
+	geometricMeanSpeedupFasterOnly?: number;
+}
+
 export interface CandidateCaseObservationV1 {
 	caseId: string;
 	status: string;
 	correctness: "passed" | "failed" | "unknown";
+	/** Kernel-level or end-to-end case, when the host distinguishes them. */
+	scope?: "kernel" | "end-to-end";
 	/** Diagnostic measurements only. Goal promotion uses top-level metrics. */
 	metrics: CandidateMetricV1[];
 	/** Platform references such as baselines or hardware bounds, never candidate gains. */
 	referenceMeasurements?: Array<Pick<CandidateMetricV1, "name" | "value" | "unit" | "basisId">>;
 	/** Optional profiler facts normalized by the host, with original receipt locations. */
 	performance?: CandidatePerformanceEvidenceV1;
+	/** False when the host refuses to rank on this case at all. */
+	performanceDecidable?: boolean;
+	performanceUndecidableReason?: string;
+	/** Host rulings for this case; absent when the host issues none. */
+	verdicts?: CandidatePerformanceVerdictV1[];
+	/** Rank agreement across measurement rounds; unstable ordering is not a win. */
+	orderingStability?: { kendallTauBMedian?: number; pairwiseFlipRate?: number };
 }
 
 export interface CandidateExternalEvaluationV1 {
@@ -112,6 +182,10 @@ export interface CandidateExternalEvaluationV1 {
 	receiptIndex: number;
 	cases: CandidateCaseObservationV1[];
 	diagnostics: CandidateDiagnosticV1[];
+	/** Host aggregates for this evaluation, never recomputed downstream. */
+	aggregate?: CandidateAggregateV1[];
+	/** Exact host reasons why no performance comparison is admissible. */
+	measurementNotComparable?: string[];
 }
 
 export interface CandidateExecutionFactsV1 {
@@ -153,9 +227,21 @@ export interface M07EpisodeCandidateV1 {
 	/** Mechanical same-basis comparison with the declared parent; never an acceptance decision. */
 	parentComparison?: CandidateComparisonV1;
 	changeKind: "repair" | "structure" | "parameters";
+	/** One enumerated optimization strategy and one exact edit site per candidate. */
+	strategy?: CandidateStrategy;
+	location?: string;
+	/** Model-declared reason for repeating a banned direction; not a host fact. */
+	newEvidence?: string;
 	intent: "solution" | "diagnostic";
 	observation: CandidateObservationV1;
 	observationPath: string;
+	/** Deterministic host judgement of this observation; never a model claim. */
+	policy?: CandidatePolicyDecisionV1;
+	/** What the host assembled for the round that followed this observation.
+	 * Records the pairing of injected knowledge with the next result; selection
+	 * is not adoption and a listed ref is not proof of reading. */
+	injection?: { phase: string; status: "ready" | "snapshot-changed" | "unavailable";
+		refs: string[]; chars: number };
 }
 
 export interface M07CandidateEpisodeV1 {
@@ -167,6 +253,16 @@ export interface M07CandidateEpisodeV1 {
 	currentCandidateId?: string;
 	/** Readable, verified local best per subject and exact metric identity; historical rows may omit subjectId. */
 	incumbents: Array<{ candidateId: string; metric: CandidateMetricV1; subjectId?: string }>;
+	/** Deterministic stall, route and parent facts recomputed after each evaluation. */
+	search?: CandidateSearchStateV1;
+	/** The method menu the last round's evidence allowed. The next candidate is
+	 * held to it: a strategy whose every method was masked is refused. */
+	methodDecision?: { status: "table" | "default-menu";
+		allowed: OptimizationMethod[];
+		masked: Array<{ method: OptimizationMethod; reason: string; sourceRefs: string[] }> };
+	/** Episode boundaries where the context was cleared and a distilled record
+	 * carried forward. The complete transcript stays in the session log. */
+	restarts?: Array<{ at: string; recordPath: string; afterCandidates: number; previousSessionId: string }>;
 }
 
 export interface M07BranchSourceV1 {
@@ -308,6 +404,8 @@ export interface EvidenceFile {
 }
 
 export interface M07TaskRecord extends TaskSpecInput {
+	/** How this task's prompt was laid out and how deep its history went. */
+	promptLayout?: PromptLayoutReceiptV1;
 	taskId: string;
 	status: M07TaskStatus;
 	createdAt: string;
@@ -383,6 +481,9 @@ export interface CurrentGoal {
 	exploratory: boolean;
 	formalBaseline: boolean;
 	problemSnapshotPath: string;
+	/** Frozen M01 understanding, with M03's challenge when one exists. Every task
+	 * prompt under this goal carries the same bytes near its front. */
+	understanding?: FrozenUnderstandingV1;
 	knowledgeSnapshot?: string;
 	m04BaselineRunId?: string;
 	/** Explicitly acknowledged failed suffix, frozen even for an exploratory goal. */

@@ -23,22 +23,24 @@ import { Type, createAssistantMessageEventStream, type AssistantMessage } from "
 import { parseModelSpec } from "../config.ts";
 import { HarnessError } from "../types.ts";
 import { writeFileAtomic } from "../workspace.ts";
-import { TelemetryWriter } from "../dashboard/telemetry.ts";
-import type { AssistantTurn, CustomToolSpec, ForkRequest, ForkWorkspaceBindingV1, ReadReturnEvent, RunnerCapabilities, SessionCheckpoint, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, TranscriptMessage, TransportFailureDiagnostic, UsageEvent } from "./types.ts";
+import { TelemetryWriter } from "../telemetry.ts";
+import type { AssistantTurn, CustomToolSpec, ForkRequest, ForkWorkspaceBindingV1, ProviderRequestViolation, ReadReturnEvent, RunnerCapabilities, SessionCheckpoint, SessionHandle, SessionRef, SessionRunner, SessionSpec, ToolCallRecord, TranscriptMessage, TransportFailureDiagnostic, UsageEvent } from "./types.ts";
 import { summarizeUsage, usageEventsFromEntries } from "./usage.ts";
-import { sessionCompactionPolicy, workflowCompactionExtension, workflowCompactionSettings } from "./compaction.ts";
+import { compactionPolicyFromEnvironment, sessionCompactionPolicy, workflowCompactionExtension, workflowCompactionSettings } from "./compaction.ts";
+import { classifyToolFailure, classifyTransportFailure } from "./failure-class.ts";
+import { summarizeToolCalls } from "./tool-usage.ts";
+import { experimentArmFromEnvironment } from "./experiment-arm.ts";
 import { sampleRunnerResources, sessionClosed, sessionOpened } from "./resource.ts";
-import { DeepSeekCampaignBudget, type PromptLease } from "./deepseek-campaign.ts";
 import { getConfinedCampaignFileGrantDescriptor } from "./confined-campaign-files.ts";
-import { assertDeepSeekRequestContract, DeepSeekRequestContractError,
-	type DeepSeekRequestViolation } from "./deepseek-request-contract.ts";
+import { inspectCompletionsOutputRequest, providerRequestContract, ProviderRequestContractError,
+	type OutputTokenField } from "./provider-contract.ts";
+import "./provider-contracts.ts";
 import type { HostEffectScope } from "./operation-disposition.ts";
 import { certifyRequestNotSent } from "./operation-disposition.ts";
 import { finishManagedBashCall, managedLocalBashOperations, prepareManagedBashCall,
 	type ManagedBashCall } from "./managed-bash.ts";
 import { createExecutionSandbox } from "./execution-sandbox.ts";
 
-type OutputTokenField = "max_tokens" | "max_completion_tokens" | "both" | "omitted";
 
 /** Match Pi's own no-auth preflight, not a provider response or a guessed
  * environment variable. The original guidance may contain local doc paths,
@@ -70,30 +72,6 @@ function isPiCredentialStoreUnavailable(error: unknown, provider: string): boole
 		["mkdir", "open", "read", "stat", "access"].includes(cause.syscall ?? "");
 }
 
-/** Inspect Pi's final request without changing its provider/context negotiation. */
-function inspectDeepSeekOutputRequest(payload: unknown, expected: { provider: string; id: string;
-	api: string; baseUrl: string; maxTokens: number }, actual: typeof expected):
-	{ payload: Record<string, unknown>; outputTokens: number; outputField: OutputTokenField } {
-	if (!payload || typeof payload !== "object" || Array.isArray(payload) ||
-		actual.provider !== expected.provider || actual.id !== expected.id ||
-		actual.api !== expected.api || actual.baseUrl !== expected.baseUrl)
-		throw new HarnessError("runner.model", "DeepSeek provider request changed model");
-	const record = payload as Record<string, unknown>;
-	if (record.model !== expected.id || !Number.isSafeInteger(expected.maxTokens) || expected.maxTokens < 1)
-		throw new HarnessError("runner.model", "DeepSeek provider request changed model or resolved output maximum");
-	const hasMax = record.max_tokens !== undefined;
-	const hasCompletionMax = record.max_completion_tokens !== undefined;
-	if ((hasMax && (!Number.isSafeInteger(record.max_tokens) || Number(record.max_tokens) < 1 ||
-		Number(record.max_tokens) > expected.maxTokens)) ||
-		(hasCompletionMax && (!Number.isSafeInteger(record.max_completion_tokens) ||
-			Number(record.max_completion_tokens) < 1 || Number(record.max_completion_tokens) > expected.maxTokens)) ||
-		(hasMax && hasCompletionMax && record.max_tokens !== record.max_completion_tokens))
-		throw new HarnessError("runner.model", "DeepSeek provider request output bound is invalid or exceeds provider maximum");
-	return { payload: record, outputTokens: (record.max_tokens ?? record.max_completion_tokens ?? expected.maxTokens) as number,
-		outputField: hasMax && hasCompletionMax ? "both" : hasMax ? "max_tokens" :
-			hasCompletionMax ? "max_completion_tokens" : "omitted" };
-}
-
 /** Capture only host-observable transport facts. Never retain an Error or response body. */
 class TransportProbe {
 	private phase: TransportFailureDiagnostic["phase"] = "unknown";
@@ -108,7 +86,7 @@ class TransportProbe {
 	private providerContextOverflow?: TransportFailureDiagnostic["providerContextOverflow"];
 	private providerRequestId: string | null = null;
 	private privateProviderError?: TransportFailureDiagnostic["privateProviderError"];
-	private requestContractViolation?: DeepSeekRequestViolation;
+	private requestContractViolation?: ProviderRequestViolation;
 	private requestContractMessageIndex?: number | null;
 	private wholePromptNotIssued = false;
 	private readonly privateSanitize?: (value: string) => string | null;
@@ -253,7 +231,7 @@ class TransportProbe {
 		}
 	}
 	captureRequestContractError(error: unknown, wholePromptNotIssued: boolean): void {
-		if (!(error instanceof DeepSeekRequestContractError)) return;
+		if (!(error instanceof ProviderRequestContractError)) return;
 		this.requestContractViolation = error.violation;
 		this.requestContractMessageIndex = error.messageIndex;
 		this.wholePromptNotIssued = wholePromptNotIssued;
@@ -262,7 +240,7 @@ class TransportProbe {
 	failure(promptIndex: number, abortSource: TransportFailureDiagnostic["abortSource"], requestId?: string): TransportFailureDiagnostic {
 		this.dropPendingBody?.();
 		this.dropPendingBody = undefined;
-		return { version: 1, promptIndex, ...(requestId ? { requestId } : {}), phase: this.phase,
+		const diagnostic: TransportFailureDiagnostic = { version: 1, promptIndex, ...(requestId ? { requestId } : {}), phase: this.phase,
 			httpStatus: this.httpStatus, responseStarted: this.responseStarted, bytesRead: this.bytesRead,
 			...(this.transportInterrupted ? { transportInterrupted: true as const } : {}),
 			abortSource, providerErrorCode: this.providerErrorCode, providerErrorType: this.providerErrorType,
@@ -274,6 +252,8 @@ class TransportProbe {
 				requestContractMessageIndex: this.requestContractMessageIndex ?? null,
 				attemptedRequestNotSent: true as const,
 				...(this.wholePromptNotIssued ? { wholePromptNotIssued: true as const } : {}) } : {}) };
+		const judgement = classifyTransportFailure(diagnostic);
+		return { ...diagnostic, failureClass: judgement.class, failureReason: judgement.reason };
 	}
 }
 
@@ -374,11 +354,6 @@ export interface PiSessionRunnerOptions {
 	modelRuntime?: ModelRuntime;
 	createSession?: typeof createAgentSession;
 	signal?: AbortSignal;
-	/** Shared by every builder, reviewer, and resumed handle in one in-process campaign. */
-	campaignBudget?: DeepSeekCampaignBudget;
-	/** Persist the host's private accounting prefix at each physical transport boundary. */
-	onCampaignAccountingBoundary?: (event: "request-reserved" | "request-observed",
-		audit: ReturnType<DeepSeekCampaignBudget["requestAccountingAuditSnapshot"]>) => Promise<void>;
 	/** Only the encrypted private result receives these credential-redacted provider fields. */
 	sanitizePrivateProviderError?: (value: string) => string | null;
 }
@@ -747,12 +722,18 @@ async function createExecutionTools(
 				try {
 					if (sandbox && (name === "write" || name === "edit")) await sandbox.file(args.path as string, name);
 					const executionArgs = name === "bash" ? bashArgsForPi(args) : args;
-					const result = receipt ? await bashCall.run(receipt, () => base.execute(toolCallId, executionArgs, signal, onUpdate, { ...ctx, cwd })) :
-						await base.execute(toolCallId, executionArgs, signal, onUpdate, { ...ctx, cwd });
+					const runTool = () => receipt ? bashCall.run(receipt, () => base.execute(toolCallId, executionArgs, signal, onUpdate, { ...ctx, cwd })) :
+						base.execute(toolCallId, executionArgs, signal, onUpdate, { ...ctx, cwd });
+					const result = await runTool();
 					const isError = (result as { isError?: boolean }).isError === true;
+					const failure = isError ? classifyToolFailure({ name,
+						...(receipt?.receipt.processExit ? { exit: { exitCode: receipt.receipt.processExit.exitCode ?? null,
+							abortSource: receipt.receipt.processExit.abortSource === "timeout" ? "timeout" as const :
+								receipt.receipt.processExit.abortSource === "signal" ? "signal" as const : null } } : {}) }) : undefined;
 					if (receipt) await finishManagedBashCall(receipt, isError ? "is-error" : "returned");
 					log.push({ name, args: safeArgs, ok: !isError, at,
-						...(receipt ? { toolCallId, hostReceiptPath: receipt.file } : {}) });
+						...(receipt ? { toolCallId, hostReceiptPath: receipt.file } : {}),
+						...(failure ? { failureClass: failure.class, failureReason: failure.reason } : {}) });
 					if (name === "read" && typeof args.path === "string") {
 						const resolved = path.isAbsolute(args.path) ? path.resolve(args.path) : path.resolve(cwd, args.path);
 						readCoverage.add(path.relative(cwd, resolved));
@@ -769,10 +750,19 @@ async function createExecutionTools(
 					}
 					const code = error instanceof HarnessError && /^runner\.[a-z.-]{1,80}$/.test(error.code)
 						? error.code : (error as NodeJS.ErrnoException | null)?.code;
+					const safeCode = typeof code === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(code) ? code : undefined;
+					const exit = receipt?.receipt.processExit;
+					const thrownFailure = classifyToolFailure({ name,
+						errorClass: error instanceof HarnessError ? "harness" : "tool-error",
+						...(safeCode ? { errorCode: safeCode } : {}),
+						...(exit ? { exit: { exitCode: exit.exitCode ?? null,
+							abortSource: exit.abortSource === "timeout" ? "timeout" as const :
+								exit.abortSource === "signal" ? "signal" as const : null } } : {}) });
 					log.push({ name, args: safeArgs, ok: false, at,
 					...(receipt ? { toolCallId, hostReceiptPath: receipt.file } : {}),
 						errorClass: error instanceof HarnessError ? "harness" : "tool-error",
-						...(typeof code === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(code) ? { errorCode: code } : {}) });
+						...(safeCode ? { errorCode: safeCode } : {}),
+						failureClass: thrownFailure.class, failureReason: thrownFailure.reason });
 					if (name === "bash" && process.platform === "darwin" && sandbox && error instanceof Error &&
 						/^\/bin\/bash: cannot create temp file for here document: Operation not permitted\r?$/m.test(error.message)) {
 						throw new Error(`${error.message}\n\nmacOS system Bash here-documents can ignore TMPDIR and fail after cd into a read-only directory; keep the shell in task writable cwd ${JSON.stringify(cwd)} or scratch ${JSON.stringify(scratch ?? cwd)} and read external files by absolute path.`, { cause: error });
@@ -858,7 +848,7 @@ function parsePersistedSpec(text: string, specFile: string): SessionSpec {
 	return parsed as SessionSpec;
 }
 
-function forkGrantNoBroader(parent: SessionSpec["tools"], child: SessionSpec["tools"], campaignAudited: boolean): boolean {
+function forkGrantNoBroader(parent: SessionSpec["tools"], child: SessionSpec["tools"]): boolean {
 	if (child.kind === "none") return true;
 	if (parent.kind !== child.kind) return false;
 	if (child.kind === "read-dir" && parent.kind === "read-dir") {
@@ -867,9 +857,9 @@ function forkGrantNoBroader(parent: SessionSpec["tools"], child: SessionSpec["to
 		return false;
 	}
 	if (child.kind === "custom" && parent.kind === "custom") {
-		if (!campaignAudited) return false;
-		const parentTools = new Map(parent.tools.map((tool) => [tool.name, tool]));
-		return child.tools.every((tool) => JSON.stringify(tool.params) === JSON.stringify(parentTools.get(tool.name)?.params));
+		// A custom grant is a set of host closures bound to one live session; a
+		// persisted spec cannot prove the child's tools are the same closures.
+		return false;
 	}
 	if (child.kind === "execution" && parent.kind === "execution") {
 		// Host closures are bound to one live task; a historical grant cannot recreate them.
@@ -930,7 +920,7 @@ export class PiSessionRunner implements SessionRunner {
 
 	async attestConfinedGrant(handle: SessionHandle): Promise<NonNullable<SessionSpec["toolAuthority"]> | undefined> {
 		const state = this.checkpointStates.get(handle.ref.id);
-		if (!this.options.campaignBudget || !state || state.ref !== handle.ref || state.disposed || state.spec.tools.kind !== "custom") return undefined;
+		if (!state || state.ref !== handle.ref || state.disposed || state.spec.tools.kind !== "custom") return undefined;
 		const approved = getConfinedCampaignFileGrantDescriptor(state.spec.tools.tools);
 		if (!approved || JSON.stringify(state.spec.toolAuthority) !== JSON.stringify(approved)) return undefined;
 		return { ...approved, writableFiles: [...approved.writableFiles] };
@@ -948,7 +938,6 @@ export class PiSessionRunner implements SessionRunner {
 	}
 
 	async create(spec: SessionSpec): Promise<SessionHandle> {
-		if (this.options.campaignBudget) spec = this.options.campaignBudget.boundSpec(spec);
 		await mkdir(spec.persistDir, { recursive: true });
 		const cwd = await mkdtemp(path.join(spec.persistDir, SCRATCH_PREFIX));
 		const sessionManager = SessionManager.create(cwd, spec.persistDir);
@@ -967,7 +956,6 @@ export class PiSessionRunner implements SessionRunner {
 			throw new HarnessError("runner.persistence", `cannot read session spec ${ref.specFile}: ${(error as Error).message}`);
 		}
 		const spec = parsePersistedSpec(specText, ref.specFile);
-		if (this.options.campaignBudget) this.options.campaignBudget.boundSpec(spec);
 		if (ref.methodBinding && JSON.stringify(ref.methodBinding) !== JSON.stringify(spec.methodBinding)) {
 			throw new HarnessError("runner.persistence", `session ${ref.label} method binding differs from its persisted spec`);
 		}
@@ -1048,7 +1036,6 @@ export class PiSessionRunner implements SessionRunner {
 			if (!(await lstat(file)).isFile()) throw new HarnessError("runner.fork", `checkpoint path is not a regular file: ${file}`);
 		}
 		if (spec.model !== checkpoint.model) throw new HarnessError("runner.fork", "cross-model fork is not verified; use fresh evidence handoff");
-		if (this.options.campaignBudget) spec = this.options.campaignBudget.boundSpec(spec);
 		const persistedCheckpoint = JSON.parse(await readFile(path.join(path.dirname(checkpoint.snapshotFile), `${checkpoint.id}.checkpoint.json`), "utf8")) as SessionCheckpoint;
 		if (JSON.stringify(persistedCheckpoint) !== JSON.stringify(checkpoint)) throw new HarnessError("runner.fork", "checkpoint receipt differs from persisted source");
 		if (!(await stat(checkpoint.inputManifest)).isFile() || !(await stat(checkpoint.manifestSnapshot)).isFile() || !(await readFile(checkpoint.inputManifest)).equals(await readFile(checkpoint.manifestSnapshot))) throw new HarnessError("runner.fork", "frozen input manifest is missing or changed");
@@ -1063,7 +1050,7 @@ export class PiSessionRunner implements SessionRunner {
 		const parentSpec = parsePersistedSpec(await readFile(checkpoint.sourceSpecSnapshot, "utf8"), checkpoint.sourceSpecSnapshot);
 		if (path.dirname(await realpath(checkpoint.sourceSessionFile)) !== await realpath(parentSpec.persistDir)) throw new HarnessError("runner.fork", "checkpoint parent is outside its persisted session directory");
 		if (parentSpec.model !== checkpoint.model) throw new HarnessError("runner.fork", "parent model differs from checkpoint");
-		if (!forkGrantNoBroader(parentSpec.tools, spec.tools, Boolean(this.options.campaignBudget))) throw new HarnessError("runner.fork", "fork cannot elevate tool authority beyond its parent");
+		if (!forkGrantNoBroader(parentSpec.tools, spec.tools)) throw new HarnessError("runner.fork", "fork cannot elevate tool authority beyond its parent");
 		if (!Array.isArray(evidenceBindings) || evidenceBindings.some((binding) => binding.version !== 1 || binding.status !== "frozen-copy" || !binding.label.trim() || !binding.path.trim() || !binding.sourceVersion?.trim())) throw new HarnessError("runner.fork", "fork requires frozen-copy evidence bindings");
 		if (evidenceBindings.length === 0) throw new HarnessError("runner.fork", "fork requires explicit frozen evidence bindings");
 		for (const binding of evidenceBindings) if (!(await lstat(binding.path)).isFile() && !(await lstat(binding.path)).isDirectory()) throw new HarnessError("runner.fork", "frozen evidence binding must be a regular file or directory");
@@ -1073,18 +1060,6 @@ export class PiSessionRunner implements SessionRunner {
 				await verifyForkWorkspaceBinding(checkpoint, request.workspaceBinding, parentSpec.tools.root, root);
 			}
 			for (const binding of evidenceBindings) if (isInside(root, await realpath(binding.path))) throw new HarnessError("runner.fork", "frozen evidence cannot be inside child writable root");
-		}
-		if (spec.tools.kind === "custom") {
-			const parentAuthority = parentSpec.toolAuthority;
-			const childAuthority = spec.toolAuthority;
-			if (parentAuthority?.kind !== "confined-campaign-files" || childAuthority?.kind !== "confined-campaign-files" ||
-				!Array.isArray(parentAuthority.writableFiles) || !Array.isArray(childAuthority.writableFiles) ||
-				childAuthority.writableFiles.some((item) => !parentAuthority.writableFiles.includes(item))) throw new HarnessError("runner.fork", "audited custom fork grant lacks a frozen equal-or-narrower write allowlist");
-			const parentRoot = await realpath(parentAuthority.root);
-			const childRoot = await realpath(childAuthority.root);
-			if (parentRoot !== parentAuthority.root || childRoot !== childAuthority.root) throw new HarnessError("runner.fork", "audited custom fork root is not canonical");
-			await verifyForkWorkspaceBinding(checkpoint, request.workspaceBinding, parentRoot, childRoot);
-			for (const binding of evidenceBindings) if (isInside(childRoot, await realpath(binding.path))) throw new HarnessError("runner.fork", "frozen evidence cannot be inside child writable root");
 		}
 		await mkdir(spec.persistDir, { recursive: true });
 		const childScratch = await mkdtemp(path.join(spec.persistDir, SCRATCH_PREFIX));
@@ -1158,35 +1133,30 @@ export class PiSessionRunner implements SessionRunner {
 			throw new HarnessError("runner.isolation", `runner agent directory is not empty: ${emptyAgentDir}`);
 		}
 
-		const campaign = this.options.campaignBudget;
-		const onCampaignAccountingBoundary = this.options.onCampaignAccountingBoundary;
-		const checkpointAccounting = async (event: "request-reserved" | "request-observed"): Promise<void> => {
-			if (campaign && onCampaignAccountingBoundary)
-				await onCampaignAccountingBoundary(event, campaign.requestAccountingAuditSnapshot());
-		};
 		const strict = spec.strictRequest;
 		if (strict) {
-			if ((!campaign && (spec.tools.kind !== "none" ||
-				strict.maxInputPayloadBytes === undefined || strict.maxOutputTokens !== undefined)) ||
-				(strict.maxOutputTokens !== undefined && (!Number.isInteger(strict.maxOutputTokens) || strict.maxOutputTokens < 1)) ||
-				(strict.maxInputPayloadBytes !== undefined && (!Number.isInteger(strict.maxInputPayloadBytes) || strict.maxInputPayloadBytes < 1))) {
-				throw new HarnessError("runner.model", "strict request requires positive integer caps; tools require a campaign budget");
+			// A strict request is a payload-bounded, tool-free probe: it declares an
+			// input byte cap, never an output-token cap, and never carries tools.
+			if (spec.tools.kind !== "none" || strict.maxInputPayloadBytes === undefined || strict.maxOutputTokens !== undefined ||
+				!Number.isInteger(strict.maxInputPayloadBytes) || strict.maxInputPayloadBytes < 1) {
+				throw new HarnessError("runner.model", "strict request requires a positive integer input payload cap and no tools");
 			}
 		}
-		if (campaign && (!strict || JSON.stringify(strict) !== JSON.stringify(campaign.strictRequest))) throw new HarnessError("runner.campaign", "campaign request caps are missing or changed");
 		const ordinaryAssessor = !strict && spec.role === "research" &&
 			spec.tools.kind === "read-dir" && spec.label.startsWith("local-original-objective-");
 		const settingsManager = SettingsManager.inMemory(strict ?
 			{ retry: { enabled: false, provider: { maxRetries: 0 } }, compaction: { enabled: false } } :
 			ordinaryAssessor ? { retry: { enabled: false, provider: { maxRetries: 0 } } } : {});
 		const resolved = await this.resolveModel(spec);
-		const compactionPolicy = strict ? undefined : sessionCompactionPolicy(sessionManager, persistSpec);
+		const compactionPolicy = strict ? undefined : sessionCompactionPolicy(sessionManager, persistSpec, compactionPolicyFromEnvironment());
+		const compactionDigest = { file: path.join(spec.persistDir, `${sessionManager.getSessionId()}.compaction.jsonl`),
+			sessionId: sessionManager.getSessionId() };
 		const loader = new DefaultResourceLoader({
 			cwd,
 			agentDir: emptyAgentDir,
 			settingsManager,
 			noExtensions: true,
-			extensionFactories: compactionPolicy ? [{ name: "workflow-compaction", factory: workflowCompactionExtension(compactionPolicy) }] : [],
+			extensionFactories: compactionPolicy ? [{ name: "workflow-compaction", factory: workflowCompactionExtension(compactionPolicy, () => compactionDigest) }] : [],
 			noSkills: true,
 			noPromptTemplates: true,
 			noThemes: true,
@@ -1196,21 +1166,21 @@ export class PiSessionRunner implements SessionRunner {
 		});
 		await loader.reload();
 		if (compactionPolicy) settingsManager.applyOverrides({ compaction: workflowCompactionSettings(resolved.model.contextWindow, compactionPolicy) });
-		campaign?.assertResolved(resolved.model);
-		if (strict && (resolved.model.provider !== "deepseek" || resolved.model.api !== "openai-completions" ||
-			(campaign && strict.maxOutputTokens !== resolved.model.maxTokens))) {
-			throw new HarnessError("runner.model", "strict request currently supports only bounded DeepSeek openai-completions models");
+		// A strict request is refused unless this provider has a registered static
+		// request contract; the runner core never names a vendor.
+		const requestContract = providerRequestContract(resolved.model.provider, resolved.model.api);
+		if (strict && !requestContract) {
+			throw new HarnessError("runner.model", "strict request requires a registered provider request contract and a bounded output maximum");
 		}
 		let strictStreamCalls = 0;
 		let strictPayloadChecks = 0;
-		let currentLease: PromptLease | undefined;
 		let currentRequestIds: string[] = [];
 		let currentContextRejectedIds = new Set<string>();
 		let certifiedEffectScope: HostEffectScope | undefined;
 		const transportDiagnostics: TransportFailureDiagnostic[] = [];
 		const ordinaryPromptProbes: Array<{ promptIndex: number; probe: TransportProbe;
 			sdkSignal?: AbortSignal }> = [];
-		const sdkAssessorAborted = (index: number): boolean => !campaign && ordinaryAssessor &&
+		const sdkAssessorAborted = (index: number): boolean => ordinaryAssessor &&
 			ordinaryPromptProbes.some(row => row.promptIndex === index && row.sdkSignal?.aborted);
 		const providerOutputRequests: Array<{ resolvedMaxTokens: number; outputField: OutputTokenField;
 			outgoingMaxTokens: number | null }> = [];
@@ -1241,10 +1211,10 @@ export class PiSessionRunner implements SessionRunner {
 								probe.observeResponse(response.status);
 								await options?.onResponse?.(response, responseModel);
 							} } : {}),
-					...(model.provider === "deepseek" && model.api === "openai-completions" ? {
+					...(requestContract ? {
 						onPayload: async (payload: unknown, payloadModel: typeof model) => {
 							const original = await options?.onPayload?.(payload as never, payloadModel as never);
-							const inspected = inspectDeepSeekOutputRequest(original ?? payload, model, payloadModel);
+							const inspected = inspectCompletionsOutputRequest(original ?? payload, model, payloadModel);
 							providerOutputRequests.push({ resolvedMaxTokens: model.maxTokens,
 								outputField: inspected.outputField,
 								outgoingMaxTokens: inspected.outputField === "omitted" ? null : inspected.outputTokens });
@@ -1252,171 +1222,29 @@ export class PiSessionRunner implements SessionRunner {
 						},
 					} : {}) });
 				}
-				const lease = currentLease;
-					const requestIds = currentRequestIds;
-					const contextRejectedIds = currentContextRejectedIds;
-					let requestId: string | undefined;
-					const rawFetch = options?.fetch ?? globalThis.fetch;
-					let probe = campaign ? new TransportProbe(rawFetch,
-						sanitizePrivateProviderError) : undefined;
-					let expectedPayloadSha256: string | undefined;
-					let failureRecorded = false;
-					const recordFailure = (): void => {
-						if (!probe || failureRecorded) return;
-						failureRecorded = true;
-						const abortSource = abortedByHandle ? "handle" : signal?.aborted ? "host-signal" : options?.signal?.aborted ? "sdk-signal" : null;
-						transportDiagnostics.push(probe.failure(promptIndex, abortSource, requestId));
-					};
-					strictStreamCalls++;
-					campaign?.assertResolved(model);
+				strictStreamCalls++;
 					if (model.provider !== resolved.model.provider || model.id !== resolved.model.id ||
 						model.api !== resolved.model.api || model.baseUrl !== resolved.model.baseUrl)
 						throw new HarnessError("runner.model", "strict request changed model");
-					const inner = target.streamSimple(model, context, {
+					return target.streamSimple(model, context, {
 						...options, maxRetries: 0, maxTokens: model.maxTokens,
-						...(probe ? { fetch: async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
-							let attempt = init;
-							for (;;) {
-								const response = await probe!.fetch(input, attempt);
-								if (response.status !== 400 || !campaign || !lease || !requestId ||
-									!expectedPayloadSha256 || typeof attempt?.body !== "string") return response;
-								if (!await observeBoundedRejectedResponse(response)) return response;
-								const parsed = probe!.contextOverflow();
-								if (!parsed || parsed.contextWindow !== model.contextWindow ||
-									createHash("sha256").update(attempt.body).digest("hex") !== expectedPayloadSha256)
-									return response;
-								let prior: Record<string, unknown>;
-								try { prior = JSON.parse(attempt.body) as Record<string, unknown>; }
-								catch { return response; }
-								if (!prior || typeof prior !== "object" || Array.isArray(prior) ||
-									(prior.max_tokens === undefined && prior.max_completion_tokens === undefined) ||
-									(prior.max_tokens !== undefined && prior.max_tokens !== parsed.completionTokens) ||
-									(prior.max_completion_tokens !== undefined &&
-										prior.max_completion_tokens !== parsed.completionTokens)) return response;
-								// This provider-declined HTTP request was received even if the
-								// corrected transport later fails local validation. Preserve
-								// its UNKNOWN invoice and numeric rejection immediately.
-								const rejectedId = requestId;
-								const proof = { httpStatus: 400 as const, ...parsed };
-								campaign.recordContextRejected(lease, rejectedId, proof);
-								contextRejectedIds.add(rejectedId);
-								await checkpointAccounting("request-observed");
-								transportDiagnostics.push(probe!.failure(promptIndex, null, rejectedId));
-								failureRecorded = true;
-								const corrected = parsed.allowedCompletionTokens;
-								const next = { ...prior,
-									...(prior.max_tokens === undefined ? {} : { max_tokens: corrected }),
-									...(prior.max_completion_tokens === undefined ? {} :
-										{ max_completion_tokens: corrected }) };
-								const nextBody = JSON.stringify(next);
-								try { assertDeepSeekRequestContract(nextBody,
-									{ sourceMessages: context.messages }); }
-								catch { return response; }
-								const nextBytes = Buffer.byteLength(nextBody, "utf8");
-								if (strict.maxInputPayloadBytes !== undefined &&
-									nextBytes > strict.maxInputPayloadBytes) return response;
-								const retryId = randomUUID();
-								campaign.reserveContextRetry(lease, nextBytes, retryId, corrected, rejectedId, proof);
-								requestIds.push(retryId);
-								providerOutputRequests.push({ resolvedMaxTokens: model.maxTokens,
-									outputField: prior.max_tokens !== undefined && prior.max_completion_tokens !== undefined ? "both" :
-										prior.max_tokens !== undefined ? "max_tokens" : "max_completion_tokens",
-									outgoingMaxTokens: corrected });
-								await checkpointAccounting("request-reserved");
-								void response.body?.cancel().catch(() => undefined);
-								requestId = retryId;
-								expectedPayloadSha256 = createHash("sha256").update(nextBody).digest("hex");
-								probe = new TransportProbe(rawFetch, sanitizePrivateProviderError);
-								failureRecorded = false;
-								attempt = { ...attempt, body: nextBody };
-							}
-						},
-							onResponse: async (response: Parameters<NonNullable<NonNullable<Parameters<ModelRuntime["streamSimple"]>[2]>["onResponse"]>>[0], responseModel: typeof model) => {
-								probe!.observeResponse(response.status);
-								await options?.onResponse?.(response, responseModel);
-							} } : {}),
 						onPayload: async (payload, payloadModel) => {
 							strictPayloadChecks++;
-							campaign?.assertResolved(payloadModel);
 							if (payloadModel.provider !== model.provider || payloadModel.id !== model.id ||
 								payloadModel.api !== model.api || payloadModel.baseUrl !== model.baseUrl)
 								throw new HarnessError("runner.model", "strict request payload changed model");
-							const inspected = inspectDeepSeekOutputRequest(payload, model, payloadModel);
+							const inspected = inspectCompletionsOutputRequest(payload, model, payloadModel);
 							const outgoing = inspected.payload;
 							const serialized = JSON.stringify(outgoing);
-							if (typeof serialized !== "string") throw new HarnessError("runner.model", "provider payload could not be serialized for reservation");
-							if (campaign) try { assertDeepSeekRequestContract(serialized,
-								{ sourceMessages: context.messages }); }
-							catch (error) {
-								probe?.captureRequestContractError(error, Boolean(lease) &&
-									currentRequestIds.length === 0 && campaign.requestCount(lease!) === 0);
-								recordFailure(); throw error;
-							}
+							if (typeof serialized !== "string") throw new HarnessError("runner.model", "provider payload could not be serialized for inspection");
 							const bytes = Buffer.byteLength(serialized, "utf8");
-							if (strict.maxInputPayloadBytes !== undefined && bytes > strict.maxInputPayloadBytes) throw new HarnessError("runner.model", "strict request input payload exceeds reserved byte cap");
-							const outputObservation = { resolvedMaxTokens: model.maxTokens,
+							if (strict.maxInputPayloadBytes !== undefined && bytes > strict.maxInputPayloadBytes) throw new HarnessError("runner.model", "strict request input payload exceeds its byte cap");
+							providerOutputRequests.push({ resolvedMaxTokens: model.maxTokens,
 								outputField: inspected.outputField,
-								outgoingMaxTokens: inspected.outputField === "omitted" ? null : inspected.outputTokens };
-							if (campaign) {
-								if (!lease) throw new HarnessError("runner.campaign", "provider request has no active prompt lease");
-								requestId = randomUUID();
-								campaign.reserve(lease, bytes, requestId, inspected.outputTokens, inspected.outputField);
-								requestIds.push(requestId);
-								providerOutputRequests.push(outputObservation);
-								await checkpointAccounting("request-reserved");
-								expectedPayloadSha256 = createHash("sha256").update(serialized).digest("hex");
-							} else providerOutputRequests.push(outputObservation);
+								outgoingMaxTokens: inspected.outputField === "omitted" ? null : inspected.outputTokens });
 							return outgoing;
 						},
 					});
-					// A terminal provider event must be accounted for before Pi can begin
-					// the next tool-loop request. Offline test runtimes may use a Promise
-					// instead of the SDK stream; final prompt reconciliation covers those.
-					if (!campaign || !lease || !inner || !(Symbol.asyncIterator in Object(inner))) return inner;
-					const outer = createAssistantMessageEventStream();
-					const emptyUsage: AssistantMessage["usage"] = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
-					let latest: AssistantMessage = { role: "assistant", content: [], api: model.api, provider: model.provider,
-						model: model.id, usage: emptyUsage, stopReason: "error", timestamp: Date.now() };
-					const failStream = (error: unknown): void => {
-						probe?.captureErrorCodes(error);
-						recordFailure();
-						campaign.failPrompt(lease);
-						outer.push({ type: "error", reason: "error", error: { ...latest, stopReason: "error", errorMessage: "provider stream failed" } });
-						outer.end();
-					};
-					void (async () => {
-						let terminal = false;
-						for await (const event of inner) {
-							if (event.type === "start") latest = event.partial;
-							if (event.type === "done") {
-								terminal = true;
-								latest = event.message;
-								if (!requestId) throw new HarnessError("runner.campaign", "provider response has no reserved request");
-								const usage = event.message.usage;
-								const hasPricedCost = Number.isFinite(usage?.cost?.total) && (usage?.cost?.total ?? -1) >= 0;
-								const report: UsageEvent = {
-									entryId: `provider-${requestId}`, kind: "assistant", promptIndex: 0, at: new Date().toISOString(),
-									provider: event.message.provider, model: event.message.model, stopReason: event.message.stopReason,
-									usage: { input: usage?.input, output: usage?.output, cacheRead: usage?.cacheRead,
-										cacheWrite: usage?.cacheWrite, totalTokens: usage?.totalTokens, cost: usage?.cost?.total },
-									status: hasPricedCost ? "reported" : "unknown",
-									costSource: hasPricedCost ? "sdk-estimate" : "unknown",
-									costStatus: hasPricedCost ? "priced" : "unknown",
-								};
-								if (event.message.stopReason === "length") campaign.stopAfterTerminalLength(lease, requestId, report);
-								else campaign.settleReported(lease, requestId, report);
-								await checkpointAccounting("request-observed");
-							}
-							if (event.type === "error") { terminal = true; latest = event.error;
-								recordFailure();
-								campaign.failPrompt(lease); }
-							outer.push(event);
-						}
-						if (!terminal) throw new HarnessError("runner.campaign", "provider stream ended without a terminal response");
-						outer.end();
-					})().catch(failStream);
-					return outer;
 				};
 			},
 		});
@@ -1473,14 +1301,12 @@ export class PiSessionRunner implements SessionRunner {
 				`unsafe active tool set for ${spec.label}: ${active.join(",") || "(empty)"}; expected ${expected.join(",") || "(empty)"}`,
 			);
 		}
-		if (campaign && active.length === expected.length && active.every((name, index) => name === expected[index])) {
-			if (spec.tools.kind === "none" && noTools === "all" && active.length === 0 &&
-				materialTools.tools.length === 0 && materialTools.names.length === 0) certifiedEffectScope = "no-tools";
-			else if (spec.tools.kind === "custom" && noTools === "builtin") {
-				const grant = getConfinedCampaignFileGrantDescriptor(spec.tools.tools);
-				if (grant && JSON.stringify(grant) === JSON.stringify(spec.toolAuthority))
-					certifiedEffectScope = "factory-attested-confined-file-tools";
-			}
+		if (spec.tools.kind === "none" && noTools === "all" && active.length === 0 &&
+			materialTools.tools.length === 0 && materialTools.names.length === 0) certifiedEffectScope = "no-tools";
+		else if (spec.tools.kind === "custom" && noTools === "builtin") {
+			const grant = getConfinedCampaignFileGrantDescriptor(spec.tools.tools);
+			if (grant && JSON.stringify(grant) === JSON.stringify(spec.toolAuthority))
+				certifiedEffectScope = "factory-attested-confined-file-tools";
 		}
 		const sessionFile = session.sessionFile;
 		if (!sessionFile) {
@@ -1488,6 +1314,18 @@ export class PiSessionRunner implements SessionRunner {
 		}
 		const specFile = specFileFor(sessionFile);
 		if (persistSpec) await writeFileAtomic(specFile, `${JSON.stringify(spec, null, 2)}\n`);
+		// The harness is an experiment variable: the same model scores differently
+		// under different harness versions, so every session records the one it ran
+		// under next to its transcript.
+		if (persistSpec) await writeFileAtomic(sessionFile.replace(/\.jsonl$/, ".harness.json"),
+			`${JSON.stringify({ version: 1, recordedAt: new Date().toISOString(),
+				codeRevision: process.env.PRE_RSI_CODE_REVISION ?? null,
+				sourceRoot: process.env.PRE_RSI_SOURCE_ROOT ?? null,
+				model: spec.model, toolGrant: spec.tools.kind,
+				compaction: compactionPolicy ? { thresholdTokens: compactionPolicy.thresholdTokens,
+					keepRecentTokens: compactionPolicy.keepRecentTokens } : null,
+				experimentArm: experimentArmFromEnvironment() }, null, 2)}
+`);
 		const ref: SessionRef = {
 			label: spec.label,
 			role: spec.role,
@@ -1550,7 +1388,6 @@ export class PiSessionRunner implements SessionRunner {
 				if (promptActive) throw new HarnessError("runner.stop", `session ${spec.label} already has an active prompt`);
 				if (signal?.aborted) throw new HarnessError("runner.aborted", `session ${spec.label} was aborted before prompt`);
 				const thisPrompt = promptIndex + 1;
-				currentLease = campaign?.beginPrompt(ref.id, `${thisPrompt}-${randomUUID()}`);
 				currentRequestIds = [];
 				currentContextRejectedIds = new Set();
 				promptActive = true;
@@ -1591,31 +1428,16 @@ export class PiSessionRunner implements SessionRunner {
 						throw new HarnessError("runner.aborted", `session ${spec.label} was aborted during prompt${detail}`);
 					}
 					collectUsage();
-					const result = turnResult(promptMessages, spec.label, summarizeUsage(promptEvents), Boolean(campaign));
-					if (campaign && currentLease) {
-						const assistants = promptEvents.filter((event) => event.kind === "assistant");
-						const answeredRequestIds = currentRequestIds.filter((requestId) =>
-							!currentContextRejectedIds.has(requestId));
-						if (assistants.length !== answeredRequestIds.length)
-							throw new HarnessError("runner.campaign", "provider request and assistant usage counts differ");
-						campaign.finishPrompt(currentLease, answeredRequestIds.map((requestId, index) => ({
-							requestId, event: assistants[index] ?? { entryId: `missing-${requestId}`,
-								kind: "assistant", promptIndex: thisPrompt, at: new Date().toISOString(),
-								status: "unknown" } })));
-					}
+					const result = turnResult(promptMessages, spec.label, summarizeUsage(promptEvents), false);
 					promptOutcome = "completed";
 					return result;
 				} catch (error) {
-					if (!campaign) for (const { promptIndex: observedPrompt, probe, sdkSignal } of ordinaryPromptProbes) {
+					for (const { promptIndex: observedPrompt, probe, sdkSignal } of ordinaryPromptProbes) {
 						if (observedPrompt !== thisPrompt || !probe.hasTransportObservation()) continue;
 						transportDiagnostics.push(probe.failure(thisPrompt,
 							abortedByHandle ? "handle" : signal?.aborted ? "host-signal" :
 								sdkSignal?.aborted ? "sdk-signal" : null));
 					}
-					const lengthStop = campaign && currentLease && !signal?.aborted && !abortedByHandle &&
-						error instanceof HarnessError && error.code === "runner.stop" && /stopReason=length/.test(error.message)
-						? campaign.certifySettledTerminalResponse(currentLease, certifiedEffectScope) : undefined;
-					if (campaign && currentLease) campaign.failPrompt(currentLease);
 					if (abortPromise) await abortPromise;
 					if ((signal?.aborted || abortedByHandle || sdkAssessorAborted(thisPrompt)) &&
 						!(error instanceof HarnessError && error.code === "runner.aborted")) {
@@ -1625,14 +1447,6 @@ export class PiSessionRunner implements SessionRunner {
 					}
 					if (signal?.aborted || abortedByHandle || sdkAssessorAborted(thisPrompt))
 						promptOutcome = "aborted";
-					if (lengthStop) throw lengthStop;
-					const preflight = transportDiagnostics.find((item) => item.promptIndex === thisPrompt &&
-						item.wholePromptNotIssued === true && item.requestContractViolation !== undefined);
-					if (campaign && currentLease && currentRequestIds.length === 0 &&
-						campaign.requestCount(currentLease) === 0 && preflight?.requestContractViolation && certifiedEffectScope)
-						throw certifyRequestNotSent({ requestNotSent: true, noProviderRequestsInPrompt: true,
-							effectScope: certifiedEffectScope, violation: preflight.requestContractViolation,
-							messageIndex: preflight.requestContractMessageIndex ?? null });
 					if (currentRequestIds.length === 0 &&
 						!ordinaryPromptProbes.some(row => row.promptIndex === thisPrompt && row.probe.hasTransportObservation()) &&
 						!sessionManager.getEntries().some(entry => !accounted.has(entry.id) && entry.type === "message")) {
@@ -1643,8 +1457,6 @@ export class PiSessionRunner implements SessionRunner {
 							throw new HarnessError("runner.auth-preflight",
 								"Pi has no configured authentication for the selected provider before request dispatch");
 					}
-					if (campaign && transportDiagnostics.some((item) => item.promptIndex === thisPrompt))
-						throw new HarnessError("runner.stop", `session ${spec.label} provider request failed (redacted transport diagnostics available)`);
 					throw error;
 				} finally {
 				try {
@@ -1654,9 +1466,6 @@ export class PiSessionRunner implements SessionRunner {
 						promptEvents.push(unknown); usageEvents.push(unknown);
 					}
 					await appendFile(usageFile, `${JSON.stringify({ version: 1, sessionId: ref.id, promptIndex: thisPrompt, outcome: promptOutcome, requestIds: currentRequestIds, events: promptEvents, summary: summarizeUsage(promptEvents) })}\n`);
-				} catch (error) {
-					if (campaign && currentLease) campaign.failPrompt(currentLease);
-					throw error;
 				} finally {
 					promptActive = false;
 					checkpointState.active = false;
@@ -1668,12 +1477,8 @@ export class PiSessionRunner implements SessionRunner {
 					try {
 						await queueTelemetry(async () => { if (!disposed) await telemetry?.heartbeat("idle", undefined, promptOutcome); });
 						await sampleRunnerResources(spec.persistDir, "prompt-end");
-					} catch (error) {
-						if (campaign && currentLease) campaign.failPrompt(currentLease);
-						throw error;
 					} finally {
 						ordinaryPromptProbes.length = 0;
-						currentLease = undefined;
 						currentRequestIds = [];
 						currentContextRejectedIds = new Set();
 					}
@@ -1692,6 +1497,7 @@ export class PiSessionRunner implements SessionRunner {
 					numericLimits: { ...item.privateProviderError.numericLimits } } } : {}) })),
 			providerOutputRequests: () => providerOutputRequests.map(row => ({ ...row })),
 			toolLog: () => [...toolLog],
+			toolUsage: () => summarizeToolCalls(toolLog),
 			abort: async () => {
 				if (disposed || abortedByHandle) return;
 				abortedByHandle = true;
