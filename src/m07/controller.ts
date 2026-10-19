@@ -35,6 +35,7 @@ import { createCandidateEpisodeTool } from "./candidate-episode.ts";
 import { createCandidateExecutionTools, pendingCandidateExecutions, type CandidateExecutionBackend } from "./candidate-runner.ts";
 import { candidateArchive, candidateSubjectId, createCandidateArchiveTools } from "./candidate-archive.ts";
 import { loadPlatformProfile } from "../platform/profile.ts";
+import { freezeUnderstanding, latestUnderstanding } from "../understanding.ts";
 import { DEFAULT_HISTORY_DEPTH, layoutPrompt, type PromptLayoutReceiptV1, type PromptSectionKind, type PromptSectionV1 } from "./prompt-layout.ts";
 import { createExecutionKnowledgeTools } from "./execution-knowledge.ts";
 import { INJECTION_PLANS } from "../knowledge/injection.ts";
@@ -781,13 +782,23 @@ async function taskMessage(ctx: StageContext, goal: CurrentGoal, taskId: string,
 	// Static instructions first, then hardware, knowledge, bounded history and
 	// finally this round's dynamic material. The order is fixed so two rounds
 	// that differ only in feedback share a byte-identical prefix.
+	const inputBlockIndex = boundary.findIndex((part) => part.startsWith("【输入预算与读取清单】\n"));
 	const historySections = recentCandidateHistory(goal, task.subjectId);
 	const hardware = await platformSection();
+	// Frozen at begin, read here: the same bytes in the same place every round.
+	const understanding = goal.understanding
+		? await readTextIfExists(goal.understanding.snapshotPath)
+		: undefined;
 	const layout = layoutPrompt([
+		...(understanding?.trim() ? [{ key: "understanding", kind: "understanding" as PromptSectionKind,
+			text: understanding.trim() }] : []),
 		...(hardware ? [hardware] : []),
+		// The frozen contract is instruction; this task's own inputs and details
+		// are dynamic, so the stable prefix ends before them.
 		...boundary.map((text, index) => ({ key: `boundary-${index}`,
 			kind: (text.startsWith("【本任务局部知识包】") ? "knowledge" :
-				text.startsWith("【目标硬件与工具链】") ? "hardware" : "instruction") as PromptSectionKind, text })),
+				text.startsWith("【目标硬件与工具链】") ? "hardware" :
+				index >= inputBlockIndex ? "dynamic" : "instruction") as PromptSectionKind, text })),
 		...historySections,
 	], { historyDepth: ctx.config.promptLayout?.historyDepth ?? DEFAULT_HISTORY_DEPTH });
 	const orderedBoundary = layout.text ? layout.text.split("\n\n") : [];
@@ -1074,10 +1085,17 @@ export function createM07Controller(ctx: StageContext, options: { projectionSnap
 			const record = await ctx.ws.startRun("M07", [{ label: "原始问题", path: problem.path }], knowledgeSnapshot);
 			const frozen = path.join(ctx.ws.runDir("M07", record.runId), "problem-snapshot.md");
 			await writeFileAtomic(frozen, problem.content);
+			// The model's own understanding of the task is frozen once, here, so
+			// every task prompt under this goal carries the same bytes early.
+			const understandingSource = await latestUnderstanding(ctx.ws);
+			const understanding = understandingSource
+				? await freezeUnderstanding(ctx.ws, understandingSource,
+					path.join(ctx.ws.runDir("M07", record.runId), "understanding-snapshot.md"))
+				: undefined;
 			const exploratory = input.exploratory === true || !baseline;
 			const attemptId = "A001";
 			const descriptor: RunDescriptorV1 = { version: 1, instanceId: process.env.PRE_RSI_RUN_INSTANCE_ID ?? randomUUID(), attemptId, workspaceId: await ctx.store.storeId(), goalRunId: record.runId, codeRevision: loadedSource?.sourceCommit ?? process.env.PRE_RSI_CODE_REVISION ?? "unrecorded", ...(loadedSource ? { loadedSource } : {}), controlDir: ctx.ws.runDir("M07", record.runId), process: await (options.processIdentity ?? readCurrentProcessIdentity)() };
-			const goal: CurrentGoal = { version: 1, runId: record.runId, lifecycle: "active", startedAt: record.startedAt, updatedAt: record.startedAt, goal: input.goal.trim(), problemRelation: input.problemRelation.trim(), constraints: input.constraints.map((x) => nonempty(x, "constraint")), successCriteria: input.successCriteria.map((x) => nonempty(x, "success criterion")), plan: input.plan.trim(), exploratory, formalBaseline: !!baseline && !exploratory, problemSnapshotPath: frozen, knowledgeSnapshot, m04BaselineRunId: baseline?.run.runId, checkpointRawScope: beginOptions?.checkpointRawScope ?? "workspace", ...(beginOptions?.candidateVerification ? { candidateVerification: { version: 1 as const, id: beginOptions.candidateVerification.id, verifierVersion: beginOptions.candidateVerification.verifierVersion, goalAdmission: beginOptions.candidateVerification.goalAdmission === true, boundAt: record.startedAt, firstTaskIndex: 0 } } : {}), ...(failedM04.length ? { m04BaselineFailures: failedM04 } : {}), baselineHistory: baseline ? [{ at: record.startedAt, knowledgeSnapshot, m04RunId: baseline.run.runId, ...(failedM04.length ? { failedM04 } : {}) }] : [], budgetPolicy: budget.policy, budgetPolicyVersionId: budget.versionId, budgetPolicyFrozenAt: record.startedAt, methodBinding: { versionId: workflowMethod?.versionId ?? budget.versionId }, ...(workflowMethod ? { workflowMethod } : {}), ...(beginOptions?.executionContract === "continuous" ? { executionContract: { version: 1 as const, mode: "continuous" as const, frozenAt: record.startedAt } } : {}), executionState: { version: 1, activeAttemptId: attemptId, attempts: [{ version: 1, id: attemptId, state: "running", startedAt: record.startedAt, runDescriptor: descriptor }], operations: [] }, tasks: [], decisions: [], limitations: [] };
+			const goal: CurrentGoal = { version: 1, runId: record.runId, lifecycle: "active", startedAt: record.startedAt, updatedAt: record.startedAt, goal: input.goal.trim(), problemRelation: input.problemRelation.trim(), constraints: input.constraints.map((x) => nonempty(x, "constraint")), successCriteria: input.successCriteria.map((x) => nonempty(x, "success criterion")), plan: input.plan.trim(), exploratory, formalBaseline: !!baseline && !exploratory, problemSnapshotPath: frozen, ...(understanding ? { understanding } : {}), knowledgeSnapshot, m04BaselineRunId: baseline?.run.runId, checkpointRawScope: beginOptions?.checkpointRawScope ?? "workspace", ...(beginOptions?.candidateVerification ? { candidateVerification: { version: 1 as const, id: beginOptions.candidateVerification.id, verifierVersion: beginOptions.candidateVerification.verifierVersion, goalAdmission: beginOptions.candidateVerification.goalAdmission === true, boundAt: record.startedAt, firstTaskIndex: 0 } } : {}), ...(failedM04.length ? { m04BaselineFailures: failedM04 } : {}), baselineHistory: baseline ? [{ at: record.startedAt, knowledgeSnapshot, m04RunId: baseline.run.runId, ...(failedM04.length ? { failedM04 } : {}) }] : [], budgetPolicy: budget.policy, budgetPolicyVersionId: budget.versionId, budgetPolicyFrozenAt: record.startedAt, methodBinding: { versionId: workflowMethod?.versionId ?? budget.versionId }, ...(workflowMethod ? { workflowMethod } : {}), ...(beginOptions?.executionContract === "continuous" ? { executionContract: { version: 1 as const, mode: "continuous" as const, frozenAt: record.startedAt } } : {}), executionState: { version: 1, activeAttemptId: attemptId, attempts: [{ version: 1, id: attemptId, state: "running", startedAt: record.startedAt, runDescriptor: descriptor }], operations: [] }, tasks: [], decisions: [], limitations: [] };
 			await save(ctx, goal);
 			return goal;
 		},

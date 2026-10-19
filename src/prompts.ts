@@ -150,6 +150,9 @@ export async function buildM04Message(input: {
 export async function buildM05Message(input: {
 	goal: string;
 	problem: string;
+	/** Frozen M01 understanding and M03 challenge, placed before the protocol:
+	 * what to go looking for depends on what is already understood. */
+	understanding?: string;
 	knowledgePack?: string;
 	indexText?: string;
 	providerNames: string[];
@@ -177,6 +180,7 @@ export async function buildM05Message(input: {
 		await loadPrompt("P05"),
 		"---",
 		section("本轮目标（P05 中“要了解的背景或需要澄清的问题”）", input.goal),
+		input.understanding ?? "",
 		input.problem,
 		input.knowledgePack ? section("当前知识状态（局部知识包）", input.knowledgePack) : "",
 		section("已有来源索引（references/INDEX.md）", input.indexText?.trim() || "（尚无登记来源）"),

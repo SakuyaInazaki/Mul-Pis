@@ -10,6 +10,7 @@ import type { CandidatePolicyDecisionV1, CandidateSearchStateV1, CandidateStrate
 import type { PromptLayoutReceiptV1 } from "./prompt-layout.ts";
 import type { OperatorCategory } from "./candidate-policy.ts";
 import type { OptimizationMethod } from "../knowledge/optimization-card.ts";
+import type { FrozenUnderstandingV1 } from "../understanding.ts";
 import type { KnowledgeAccessEvent } from "./execution-knowledge.ts";
 
 export type M07TaskMode = "execute" | "check" | "reason";
@@ -480,6 +481,9 @@ export interface CurrentGoal {
 	exploratory: boolean;
 	formalBaseline: boolean;
 	problemSnapshotPath: string;
+	/** Frozen M01 understanding, with M03's challenge when one exists. Every task
+	 * prompt under this goal carries the same bytes near its front. */
+	understanding?: FrozenUnderstandingV1;
 	knowledgeSnapshot?: string;
 	m04BaselineRunId?: string;
 	/** Explicitly acknowledged failed suffix, frozen even for an exploratory goal. */
